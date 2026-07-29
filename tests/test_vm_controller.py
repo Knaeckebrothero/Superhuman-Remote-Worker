@@ -2492,3 +2492,92 @@ class TestDeletePurgeIntent:
             await controller.http_delete(request)
 
         do_delete.assert_awaited_once_with("job-1", purge_disk=True)
+
+
+class TestGcRootdisks:
+    """Layer 3 of the rootdisk GC — the orphan net for disks whose entity row
+    the orchestrator no longer knows (a dev DB reset, a deleted row). Off by
+    default: it cannot consult the DB, so it cannot tell a leaked disk from a
+    long-suspended session's workspace."""
+
+    def _dv(self, name: str, age_h: float):
+        from datetime import datetime, timedelta, timezone
+
+        ts = datetime.now(timezone.utc) - timedelta(hours=age_h)
+        return {
+            "metadata": {
+                "name": name,
+                "labels": {"srw.io/rootdisk": "true"},
+                "creationTimestamp": ts.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            }
+        }
+
+    def _wire(self, controller, dvs, vm_names):
+        def _list(**kwargs):
+            if kwargs.get("plural") == CDI_PLURAL:
+                return {"items": dvs}
+            return {"items": [{"metadata": {"name": n}} for n in vm_names]}
+
+        controller.k8s_client.list_namespaced_custom_object.side_effect = _list
+
+    @pytest.mark.asyncio
+    async def test_old_orphan_is_deleted(self, controller):
+        self._wire(controller, [self._dv("agent-vm-j1-rootdisk", 100)], [])
+        with patch("vm.controller.controller.VM_ROOTDISK_ORPHAN_HOURS", 72):
+            await controller._gc_rootdisks()
+
+        deletes = _calls_for(
+            controller.k8s_client.delete_namespaced_custom_object, CDI_PLURAL
+        )
+        assert [c.kwargs["name"] for c in deletes] == ["agent-vm-j1-rootdisk"]
+
+    @pytest.mark.asyncio
+    async def test_disk_with_a_live_vm_is_spared(self, controller):
+        """A recovery in flight: the disk is old, but its VM is back."""
+        self._wire(controller, [self._dv("agent-vm-j1-rootdisk", 100)], ["agent-vm-j1"])
+        with patch("vm.controller.controller.VM_ROOTDISK_ORPHAN_HOURS", 72):
+            await controller._gc_rootdisks()
+
+        assert not _calls_for(
+            controller.k8s_client.delete_namespaced_custom_object, CDI_PLURAL
+        )
+
+    @pytest.mark.asyncio
+    async def test_young_orphan_is_spared(self, controller):
+        """A kept disk is SUPPOSED to outlive its VM during a recovery."""
+        self._wire(controller, [self._dv("agent-vm-j1-rootdisk", 1)], [])
+        with patch("vm.controller.controller.VM_ROOTDISK_ORPHAN_HOURS", 72):
+            await controller._gc_rootdisks()
+
+        assert not _calls_for(
+            controller.k8s_client.delete_namespaced_custom_object, CDI_PLURAL
+        )
+
+    @pytest.mark.asyncio
+    async def test_vm_list_failure_deletes_nothing(self, controller):
+        """Without the VM list every disk looks orphaned — bail, don't guess."""
+
+        def _list(**kwargs):
+            if kwargs.get("plural") == CDI_PLURAL:
+                return {"items": [self._dv("agent-vm-j1-rootdisk", 100)]}
+            raise _FakeApiException(status=500)
+
+        controller.k8s_client.list_namespaced_custom_object.side_effect = _list
+        with patch("vm.controller.controller.VM_ROOTDISK_ORPHAN_HOURS", 72):
+            await controller._gc_rootdisks()
+
+        assert not _calls_for(
+            controller.k8s_client.delete_namespaced_custom_object, CDI_PLURAL
+        )
+
+    @pytest.mark.asyncio
+    async def test_create_does_not_run_it_when_disabled(self, controller):
+        controller._gc_rootdisks_safe = AsyncMock()
+        controller.k8s_client.get_namespaced_custom_object.side_effect = _dv_phase(None)
+        with (
+            patch("vm.controller.controller.VM_PERSISTENT_ROOTDISK", True),
+            patch("vm.controller.controller.VM_ROOTDISK_GC_ENABLED", False),
+        ):
+            await controller._do_create(SAMPLE_JOB_CONFIG)
+
+        controller._gc_rootdisks_safe.assert_not_called()

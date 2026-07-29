@@ -1153,7 +1153,9 @@ class TestReapOrphans:
         provisioner.list_vms = AsyncMock(return_value=[self._vm(age_hours=0.01)])
         assert await mgr.reap_orphans() == 0
         provisioner.delete_vm.assert_not_called()
-        db.acquire.assert_not_called()  # age gate fires before any DB work
+        # Age gate fires before the orphan decision's DB work. (db.acquire is
+        # no longer untouched: the kept-disk sweep shares this tick.)
+        self._conn(db).fetchval.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_spares_vm_with_live_row(self, monkeypatch):
@@ -1229,3 +1231,78 @@ class TestReapOrphans:
         report = await rec.tick()
         assert report["vm"]["orphans_reaped"] == 1
         provisioner.delete_vm.assert_awaited_once_with(self.ORPHAN_ID)
+
+
+class TestKeptDiskSweep:
+    """Layer 2 of the rootdisk GC (D4): a job that was crash-recovered and then
+    went terminal without a live VM still holds 20 Gi. The terminal delete
+    covers the normal path; this covers the one where no delete ever ran.
+
+    Jobs ONLY. A thread's terminal status is 'ended', which is also exactly the
+    state a suspended-but-resumable session sits in — sweeping those would
+    delete the disk of every idle session a user meant to come back to.
+    """
+
+    def _mgr_with_kept(self, rows):
+        mgr, provisioner, _, _, db = _make_manager()
+        conn = AsyncMock()
+        conn.fetch = AsyncMock(return_value=rows)
+        db.acquire = MagicMock()
+        db.acquire.return_value.__aenter__ = AsyncMock(return_value=conn)
+        db.acquire.return_value.__aexit__ = AsyncMock(return_value=False)
+        db.merge_vm_context = AsyncMock(return_value=True)
+        provisioner.list_vms = AsyncMock(return_value=[])
+        return mgr, provisioner, db
+
+    @pytest.mark.asyncio
+    async def test_terminal_job_kept_disk_is_purged(self):
+        mgr, provisioner, db = self._mgr_with_kept([{"id": "job-1"}])
+
+        purged = await mgr.purge_kept_disks()
+
+        assert purged == 1
+        provisioner.delete_vm.assert_awaited_once_with("job-1", purge_disk=True)
+
+    @pytest.mark.asyncio
+    async def test_purge_clears_the_marker(self):
+        """Otherwise the sweep re-purges the same job on every tick forever."""
+        mgr, _, db = self._mgr_with_kept([{"id": "job-1"}])
+
+        await mgr.purge_kept_disks()
+
+        db.merge_vm_context.assert_awaited_with("job-1", {"rootdisk": None})
+
+    @pytest.mark.asyncio
+    async def test_marker_survives_a_failed_delete(self):
+        """A delete that did not happen must stay on the worklist."""
+        mgr, provisioner, db = self._mgr_with_kept([{"id": "job-1"}])
+        provisioner.delete_vm = AsyncMock(return_value=False)
+
+        purged = await mgr.purge_kept_disks()
+
+        assert purged == 0
+        db.merge_vm_context.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_nothing_to_do_is_silent(self):
+        mgr, provisioner, _ = self._mgr_with_kept([])
+        assert await mgr.purge_kept_disks() == 0
+        provisioner.delete_vm.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_db_error_purges_nothing(self):
+        """Unknown is not the same as terminal — never delete on a failed read."""
+        mgr, provisioner, db = self._mgr_with_kept([])
+        db.acquire = MagicMock(side_effect=RuntimeError("db down"))
+
+        assert await mgr.purge_kept_disks() == 0
+        provisioner.delete_vm.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_orphan_sweep_runs_it(self):
+        """It rides the lifecycle tick rather than adding a second scheduler."""
+        mgr, provisioner, _ = self._mgr_with_kept([{"id": "job-1"}])
+
+        await mgr.reap_orphans()
+
+        provisioner.delete_vm.assert_awaited_once_with("job-1", purge_disk=True)
