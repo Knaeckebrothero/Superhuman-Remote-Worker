@@ -194,7 +194,7 @@ _STATUS_LINE = re.compile(r"^status:.*$", re.MULTILINE)
 # _rewrite_status outcomes. All three can hand back byte-identical markdown, so
 # the returned text alone cannot tell them apart — which is exactly how an
 # idempotent re-close came to be logged as malformed frontmatter
-# (docs/issues/backlog_close_mislabels_idempotent_reclose.md).
+# (docs/done/backlog_close_mislabels_idempotent_reclose.md).
 _REWRITTEN = "rewritten"  # the status line changed (or one was inserted)
 _ALREADY_SET = "already_set"  # the line was found and already holds the target
 _NOT_REWRITABLE = "not_rewritable"  # no frontmatter, or no closing `---`
