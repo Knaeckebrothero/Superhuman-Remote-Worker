@@ -40,6 +40,13 @@ The project page has tabs:
   also grants matching access to the project's git repositories.
 - **Loop** — configure and monitor continuous project improvement. Route setup,
   campaign, budget, and control questions to the focused project-loops guide.
+- **Centurion** — the project's standing officer. Provision him here (assign a
+  slot roster: named worker allocations with count, model, and workspace),
+  watch his status (next wake, queued events, pages used, digest), open his
+  log (his session transcript), open or rejoin the **conference** (an
+  interactive session wearing his identity — while it is open his background
+  loop holds), or retire him. He supervises jobs, owns the backlog, and pages
+  only when something genuinely needs the user.
 - **Settings** — rename, default agent config, memory sharing across jobs,
   cloud storage folder and its read-only toggle, archive/delete. Workspace
   network access is admin-controlled.
