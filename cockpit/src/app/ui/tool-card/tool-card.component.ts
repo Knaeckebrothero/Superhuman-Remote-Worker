@@ -24,6 +24,13 @@ export function canvasToolCardContext(
     current: CanvasState | null,
 ): CanvasToolCardContext {
     if (!current?.source || current.status === 'cleared') return 'unavailable';
+    // Content identity first: the revision advances for reasons that leave the
+    // stage unchanged — re-binding a Canvas to a rebuilt workspace bumps it
+    // while presenting byte-identical content — and calling that "replaced"
+    // would be wrong. Fall back to the revision when either side lacks a hash.
+    if (action?.sourceVersion && current.source_version) {
+        return action.sourceVersion === current.source_version ? 'current' : 'replaced';
+    }
     if (action?.presentationRevision === undefined) return 'currentStage';
     return action.presentationRevision === current.presentation_revision ? 'current' : 'replaced';
 }

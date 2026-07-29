@@ -297,6 +297,7 @@ function buildResult(
 
 interface CanvasResultMetadata {
     readonly revision?: number;
+    readonly sourceVersion?: string;
     readonly presentation: CanvasPresentationSummary;
 }
 
@@ -313,12 +314,15 @@ function parseCanvasResultMetadata(
     if (n.tool !== 'set_canvas' || n.status !== 'ok') return undefined;
     const result = n.result ?? '';
     let revision: number | undefined;
+    let sourceVersion: string | undefined;
     let parsedTitle = '';
     let parsedSourceType: unknown;
     try {
         const parsed = JSON.parse(result) as Record<string, unknown>;
         const value = parsed['presentation_revision'];
         if (typeof value === 'number' && Number.isSafeInteger(value) && value >= 0) revision = value;
+        const version = parsed['source_version'];
+        if (typeof version === 'string' && version) sourceVersion = version;
         if (typeof parsed['title'] === 'string') parsedTitle = parsed['title'];
         const source = parsed['source'];
         if (source && typeof source === 'object' && !Array.isArray(source)) {
@@ -336,6 +340,7 @@ function parseCanvasResultMetadata(
     );
     return {
         revision,
+        ...(sourceVersion ? {sourceVersion} : {}),
         presentation: {
             sourceKind: canvasPresentationKind(parsedSourceType ?? args['source_type']),
             ...(title ? {title} : {}),
@@ -345,9 +350,11 @@ function parseCanvasResultMetadata(
 
 function canvasAction(metadata: CanvasResultMetadata | undefined): ToolCardView['action'] {
     if (!metadata) return undefined;
-    return metadata.revision === undefined
-        ? {kind: 'open_canvas'}
-        : {kind: 'open_canvas', presentationRevision: metadata.revision};
+    return {
+        kind: 'open_canvas',
+        ...(metadata.revision === undefined ? {} : {presentationRevision: metadata.revision}),
+        ...(metadata.sourceVersion ? {sourceVersion: metadata.sourceVersion} : {}),
+    };
 }
 
 function buildDetails(n: NormalizedToolCall): ToolDetail[] {

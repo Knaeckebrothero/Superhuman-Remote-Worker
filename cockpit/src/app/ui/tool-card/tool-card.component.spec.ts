@@ -52,6 +52,36 @@ describe('set_canvas tool-card context', () => {
       .toBe('unavailable');
   });
 
+  it('follows content identity over the revision when both are known', () => {
+    // Re-binding a Canvas to a rebuilt workspace bumps the revision while
+    // presenting byte-identical content. Comparing revisions alone made that
+    // card claim it had been replaced.
+    const hashed: ToolCardAction = {
+      kind: 'open_canvas',
+      presentationRevision: 5,
+      sourceVersion: 'sha256:5',
+    };
+    const repinned = {...state(6), source_version: 'sha256:5'};
+    expect(canvasToolCardContext(hashed, repinned)).toBe('current');
+
+    // A genuinely different presentation is still replaced, even at the same
+    // revision number.
+    const different = {...state(5), source_version: 'sha256:other'};
+    expect(canvasToolCardContext(hashed, different)).toBe('replaced');
+  });
+
+  it('falls back to the revision when either side lacks a content hash', () => {
+    const hashed: ToolCardAction = {
+      kind: 'open_canvas',
+      presentationRevision: 5,
+      sourceVersion: 'sha256:5',
+    };
+    expect(canvasToolCardContext(hashed, {...state(5), source_version: null}))
+      .toBe('current');
+    expect(canvasToolCardContext(hashed, {...state(9), source_version: null}))
+      .toBe('replaced');
+  });
+
   it('contains no restorable URL and always denotes opening the current stage', () => {
     expect(canvasToolCardContext({kind: 'open_canvas'}, state(8))).toBe('currentStage');
     expect(Object.keys(action)).toEqual(['kind', 'presentationRevision']);

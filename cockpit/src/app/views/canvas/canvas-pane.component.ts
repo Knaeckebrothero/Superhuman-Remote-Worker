@@ -30,6 +30,7 @@ import {
 } from './canvas-renderers.component';
 import {
   canvasSourceKey,
+  declaredCanvasRenderer,
   selectCanvasChromeState,
   selectCanvasRenderer,
 } from './canvas-rendering';
@@ -146,7 +147,9 @@ export function browserOpenErrorKey(code: string | null): string {
           <app-badge tone="warning" size="xs">{{ 'canvas.untrusted' | transloco }}</app-badge>
           <app-badge tone="neutral" size="xs">{{ sourceKindLabel() }}</app-badge>
           <span>{{ rendererLabel() }}</span>
-          @if (lastSyncedAt(); as syncedAt) {
+          @if (snapshotBacked()) {
+            <app-badge tone="neutral" size="xs">{{ 'canvas.offline.badge' | transloco }}</app-badge>
+          } @else if (lastSyncedAt(); as syncedAt) {
             <time [attr.datetime]="syncedAt | date:'yyyy-MM-ddTHH:mm:ssXXX'"
                   [title]="syncedAt | date:'medium'">
               {{ 'canvas.lastSynced' | transloco }} {{ syncedAt | date:'short' }}
@@ -203,6 +206,19 @@ export function browserOpenErrorKey(code: string | null): string {
       <div class="canvas-announcement" aria-live="polite" aria-atomic="true">
         {{ statusText() }}
       </div>
+
+      @if (snapshotBacked()) {
+        <div class="canvas-offline-notice" role="status">
+          <app-icon size="sm">bedtime</app-icon>
+          <span>
+            @if (snapshotCapturedAt(); as capturedAt) {
+              {{ 'canvas.offline.body' | transloco:{date: (capturedAt | date:'medium')} }}
+            } @else {
+              {{ 'canvas.offline.bodyUndated' | transloco }}
+            }
+          </span>
+        </div>
+      }
 
       @if (resetStatus() !== 'idle') {
         <div class="canvas-reset-notice"
@@ -484,9 +500,25 @@ export class CanvasPaneComponent {
     }
     return this.transloco.translate('canvas.noSource');
   });
-  readonly rendererLabel = computed(() =>
-    this.transloco.translate(`canvas.renderer.${this.effectiveRenderer()}`),
-  );
+  /**
+   * Label the source for what it is, not for what happens to be mounted.
+   *
+   * `effectiveRenderer()` drives what the template renders and correctly falls
+   * back to `'unsupported'` when there is nothing to draw. Reusing it as the
+   * chip label made a sleeping workspace claim the document was unsupported.
+   * An active edit session still wins, because then the mounted renderer IS
+   * what the user is working in.
+   */
+  readonly rendererLabel = computed(() => {
+    const editing = this.editor.hasSession() && (this.editor.dirty() || this.editor.conflict());
+    const declared = declaredCanvasRenderer(this.state());
+    const renderer = editing || declared === 'unsupported'
+      ? this.effectiveRenderer()
+      : declared;
+    return this.transloco.translate(`canvas.renderer.${renderer}`);
+  });
+  readonly snapshotBacked = computed(() => this.state()?.content_origin === 'snapshot');
+  readonly snapshotCapturedAt = computed(() => this.state()?.content_captured_at ?? null);
   readonly isLiveAppSource = computed(() => this.chromeState()?.source?.type === 'workspace_app');
   readonly sourceKindLabel = computed(() => {
     const type = this.chromeState()?.source?.type;

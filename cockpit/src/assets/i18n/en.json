@@ -283,6 +283,11 @@
           "body": "Your edits remain in this browser. Check the connection and try again."
         }
       }
+    },
+    "offline": {
+      "badge": "Workspace asleep",
+      "body": "Workspace is asleep — showing the version presented on {{date}}. It becomes editable again when the session resumes.",
+      "bodyUndated": "Workspace is asleep — showing the last version presented. It becomes editable again when the session resumes."
     }
   },
   "common": {

@@ -102,6 +102,23 @@ h2 {
   border: 0;
 }
 
+// A suspended workspace is normal and reversible, so this reads as
+// information rather than a fault: no warning tint, no action to take.
+.canvas-offline-notice {
+  position: relative;
+  z-index: 4;
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  font-size: 12px;
+  line-height: 1.4;
+  color: var(--text-secondary);
+  background: var(--surface-2);
+  border-bottom: 1px solid var(--border);
+}
+
 .canvas-reset-notice {
   position: relative;
   z-index: 4;

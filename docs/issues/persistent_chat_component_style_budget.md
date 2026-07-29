@@ -100,6 +100,54 @@ Step 1 (move to file): ~30 min, fully mechanical.
 Step 2 (split components): ~1 day per sub-component split if done carefully — five splits ≈ one engineering week including review.
 Step 3 (budget revert): trivial.
 
+## Interim escape hatch — global partial (2026-07-28)
+
+Until Step 2 lands, new chat styling goes into a **global partial** under
+`cockpit/src/styles/` (`@use`d from `styles.scss`) rather than into this
+component. First use: `src/styles/_chat-queued.scss` for the stalled-send
+affordances (see `docs/features/session_reliability_and_transport_simplification.md`).
+That kept the component's compiled SCSS byte-identical; inlining the same
+~35 lines had pushed it 443 bytes over the 36 kB warning, which would have
+been bump number five.
+
+**Gotcha that cost two attempts — read before using this hatch.** A global
+partial silently loses the cascade to a component rule it is trying to
+override. Angular's emulated encapsulation rewrites component selectors with
+an `[_ngcontent-…]` attribute, so
+
+```
+.message-user.queued .avatar-icon          /* in the component: reads as (0,3,0) */
+.message-user.queued[_ngcontent-ng-cNNN] .avatar-icon[_ngcontent-ng-cNNN]   /* actually (0,5,0) */
+```
+
+A plain global `.message-user.stalled .avatar-icon` is (0,3,0) and loses.
+Worse, an *equal*-specificity global rule also loses: Angular injects the
+component `<style>` after the global sheet, so ties go to the component.
+Beating it needed `.message.message-user.queued.stalled .avatar .avatar-icon`
+— (0,6,0), with the `.avatar` step that looks redundant but is load-bearing.
+
+Rule of thumb: **add roughly one extra class per encapsulation attribute** —
++1 for a host selector, +2 for a descendant one. Prefer stacking classes the
+element already carries over `!important`.
+
+**Neither `ng build` nor unit tests catch this.** The template compiles, the
+selector exists in `document.styleSheets`, the element matches it, the design
+tokens resolve — and `getComputedStyle` still returns the component's value.
+Only a browser against the running app shows it (here: `opacity: 0.65`
+instead of 1, `--text-secondary` instead of `--danger`). Budget a
+computed-style assertion into any k3d check that touches cross-file CSS:
+
+```js
+getComputedStyle(el).color                       // the truth
+[...document.styleSheets].flatMap(s => { try { return [...s.cssRules] } catch { return [] } })
+  .filter(r => r.selectorText?.includes('avatar-icon'))
+  .map(r => r.selectorText + ' { ' + r.style.cssText + ' }')   // shows the [_ngcontent] rewrite
+```
+
+This hatch is a stopgap, not a resolution — it relocates bytes without
+splitting the component, and each use adds a specificity wart that Step 2
+should delete.
+
 ## Related
 
 - `docs/features/dynamic_canvas.md` added a sibling panel under
