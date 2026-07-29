@@ -811,6 +811,21 @@ class PersistentSession:
                 desired if isinstance(desired, dict) else {}
             )
 
+        # Contacts projection (docs/features/contacts_registry.md): read-only
+        # discovery files; DB is truth, sends authorize server-side. Unlike
+        # the ordinary catalog skills above, these OVERWRITE on every deploy
+        # (no exists() skip) — the workspace copy is regenerated, not
+        # user-editable content preserved across resumes.
+        contacts_files = self.config.extra.get("_resolved_contacts", {}).get(
+            "files", {}
+        )
+        for ws_path, content in contacts_files.items():
+            parent_dir = str(Path(ws_path).parent)
+            if parent_dir and parent_dir != ".":
+                self.workspace_manager.backend.mkdir(parent_dir)
+            self.workspace_manager.write_file(ws_path, content)
+            logger.debug(f"Deployed contact file to workspace: {ws_path}")
+
     @staticmethod
     def _skill_file_digest(content: str) -> str:
         return hashlib.sha256(content.encode("utf-8")).hexdigest()
