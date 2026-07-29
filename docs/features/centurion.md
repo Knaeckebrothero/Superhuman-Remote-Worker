@@ -31,7 +31,7 @@ related:
 
 > Every project can have a **Centurion**: one persistent agent that never terminates. It holds a *responsibility* instead of a goal: it owns the project's backlog, schedules and supervises worker jobs, notices when things wedge, asks the user or makes recorded assumptions, and pages the user when it genuinely needs them. The user is the **Legatus** — sets intent, makes the calls only a human can make. The centurion of the user's **default project** bears the title **Primus Pilus** — first among centurions; today a designation, later a command (§9).
 
-**Status:** Design v2 (research-hardened). Filed 2026-07-28 from the consolidated officer notes (`Officers.md`); hardened the same day by a five-agent research fan-out — three codebase planners/verifiers, two web researchers (prior art: Letta sleep-time agents, LangGraph ambient agents, Devin/Cursor/Factory, OpenClaw heartbeat, SRE/PagerDuty, Vending-Bench and governance-decay literature). No core decision was refuted; the research added a guardrail layer and corrected several mechanism-level assumptions. Anchored build plan: [[centurion_implementation_notes]].
+**Status:** Design v2 (research-hardened). Filed 2026-07-28 from the consolidated officer notes (`Officers.md`); hardened the same day by a five-agent research fan-out — three codebase planners/verifiers, two web researchers (prior art: Letta sleep-time agents, LangGraph ambient agents, Devin/Cursor/Factory, OpenClaw heartbeat, SRE/PagerDuty, Vending-Bench and governance-decay literature). No core decision was refuted; the research added a guardrail layer and corrected several mechanism-level assumptions. Interaction surface (the conference model, §2) settled 2026-07-29. Anchored build plan: [[centurion_implementation_notes]].
 **Scope:** v1 = exactly one centurion on one project, full backlog + job-creation authority, sleep-loop architecture. The wider legion (Tesserarius/Optio as separate agents, centuries, model tiering) and the Primus Pilus command extension are explicitly parked — see [Deferred](#9-deferred--the-legion).
 
 ---
@@ -82,9 +82,17 @@ Three distinct outputs, in the ambient-agent triad vocabulary, each with a diffe
 
 A manager's function is turning one vague sentence into clarifying questions and declared assumptions. The rule takes two inputs (Devin's empirically validated pattern — its self-rated confidence correlates 2× with merged-PR success): **ask when confidence is low AND stakes are high; otherwise assume, record, proceed.** Every assumption is a ledger entry carrying `{confidence, stakes, evidence refs (job ids / audit timestamps), response window, default}`. Entries are **bi-temporal — superseded, never deleted** (`active → confirmed | overturned | superseded`), so the history explains past decisions made under old assumptions, and the Legatus can review low-confidence entries first. An overturned assumption is a normal wake event and a memory-extraction trigger, not a crisis.
 
-### One mind, one timeline
+### One mind at a time — the log and the conference
 
-Exactly one authoritative session per centurion. User messages arrive as wake events *into that loop*; he answers mid-loop and goes back to sleep. His conversational replies and his orchestration actions interleave in one thread — visible in the cockpit as the **officer's log**. Multiple *projects* each having their own centurion is not a conflict — scopes are disjoint. The hazard is multiple concurrent sessions sharing *one* centurion's identity; that is deferred (split-brain risk).
+A centurion has one *identity* but two *embodiments*, never active at once:
+
+**The log** — his background session: the sleep-loop, his timeline, where sitreps, decisions, and micro-standups accrue. Quick fire-and-forget notes ("FYI — the demo moved to Tuesday") are typed straight into it and arrive as wake events in his loop. You read the log to watch him work.
+
+**The conference** — how you actually *talk* to him: a **separate interactive session wearing his identity**. Because everything that *is* him lives in project-scoped stores (§5) and conversations are ephemeral by design, a session created with his persona and the project binding simply *is* him — same charter injected, same KB, same assumptions ledger, same memories. A conference session may have a workspace or VM: with the Legatus present, walking the code together beats screenshots — the machine serves *shared understanding*. The klug-und-faul constraint binds the autonomous embodiment structurally; in conference it is a persona norm — demonstrate, explore, explain; what leaves the room is updated intent (charter, backlog, KB) and dispatched jobs, not the officer's own commits.
+
+**Serial, not concurrent.** While a conference is open, the background loop is **held** (§4): events *and his timer* queue durably in the outbox, and on conference end he wakes exactly once with the **session brief** plus everything that queued. This is the single-writer rule that makes two embodiments one mind: intent changes made in conference land in the stores *before* the background loop acts again, so it can never act on stale direction. Action-level conflicts were already bounded — both embodiments act through the same orchestrator API on the same DB, and capacity is enforced server-side — the serial hold closes the remaining surface: divergent intent. If the hold ever chafes, concurrent mode is a one-flag relaxation; deferred. The background officer never carries the conversation transcript — he gets the minutes, which is also the cheaper context.
+
+Multiple *projects* each having their own centurion is not a conflict — scopes are disjoint. Concurrent sessions sharing one centurion's identity remain deferred.
 
 ### Naming and hierarchy
 
@@ -113,7 +121,9 @@ This settles the old open question "OpenAI und GLM subscriptions could be the of
 
 `sleep(minutes, reason)` is a **real registered tool** (category `core`, exempt from workspace gating), following the freeze-request seam precedent: executing it stores a sleep request on the ToolContext; the turn loop **peeks the flag after the tool batch completes and ends the turn** instead of calling the LLM again (`TurnResult.ended_by_sleep`). Bounds come from config (`sleep_min_minutes`/`sleep_max_minutes`, defaults ~5/60); the agent chooses within them — long when waiting on a 40-hour job, short after dispatching something risky.
 
-The transport consumes the request into a **wake deadline** that replaces the idle-timeout arm of the input wait: on expiry it **synthesizes a `[timer wake]` input item (`role='event'`) instead of raising the terminal `IdleTimeoutError`**. If a turn ends *without* a sleep call (plain text — answering the user), the implicit deadline is `sleep_max`: an officer session never parks indefinitely and never idle-archives. The deadline is **DB-authoritative from day one** (mirrored into thread metadata) — the durable-execution consensus (Temporal/Restate: timers belong to the durable layer), and the watchdog reads it anyway. Anything arriving on the input queue wakes him before the deadline.
+**The timer is external and durable.** The sleep tool *files a wake-up call with the orchestrator*: it upserts a pending `timer` row in the event outbox with a `fire_at` timestamp — Postgres-persisted, so a pod crash or node downtime never loses the schedule; the next pod picks up the timer where it was. The drain claims due timer rows and injects the `[timer wake]` exactly like any other event (the in-house precedent is the automations cron dispatcher: `next_run_at` + claim-due-rows). This is the full durable-execution consensus (Temporal/Restate: timers belong to the durable layer, both storage *and* firing), and it buys three things at once: crash-safe resume, a **uniform conference hold** (the timer is just another outbox row the drain defers — no agent-local timer to suppress), and free participation in debounce/coalescing/urgency like every other wake source. If a turn ends *without* a sleep call (plain text — answering the user), **the watchdog files `sleep_max` on his behalf** — an officer session never parks indefinitely and never idle-archives, and absent a filing the system is lazy for him too. Anything arriving on the input queue still wakes him before the timer.
+
+What stays agent-side is only a **backstop**: the input wait keeps a long, clearly-labeled timeout (~max(2×`sleep_max`, 2h)) that synthesizes a `[backstop wake]` — insurance for the one partial failure external timers can't cover (orchestrator timer path broken while the API is up). The terminal `IdleTimeoutError` is still never raised for officers. The trade-offs are honest and small: wake timing gains sweeper-tick granularity (irrelevant at 5–60 min sleeps), and the orchestrator dependency is not new — his hands are the orchestrator API already; a wake without an orchestrator could do nothing anyway.
 
 Two corrections from the code (load-bearing):
 
@@ -124,13 +134,14 @@ Two corrections from the code (load-bearing):
 
 | Source | Mechanism |
 |---|---|
-| Timer (sleep deadline / implicit `sleep_max`) | Officer branch of the input wait; deadline mirrored in thread metadata |
+| Timer (sleep deadline / implicit `sleep_max`) | **Orchestrator-fired**: pending `timer` outbox row with `fire_at`, claimed by the drain like any other event; sleep tool files it, watchdog files `sleep_max` when no filing exists; agent keeps only a long labeled backstop |
 | User message | Existing thread input path (`POST /api/persistent/threads/{id}/input`) |
 | Job transition — completed / failed / cancelled / pending_review / **paused** — any job in his project | Event outbox enqueue at the completion hooks + cancel/approve/escalate/pause endpoints |
 | Sudo / VM-upgrade request opened for a job in his project | Enqueue in the sudo-gate pending path |
 | Fleet events — agents offline, orphaned jobs recovered | Enqueue from the stale-agent sweep (`fleet` source, all officers) |
 | Loop turn concluded (officer-scheduled project) | The `officer` scheduling branch (§7) |
 | Respawn / boot | Synthetic wake at session attach (the loop bootstrap) |
+| **Conference ended** | Conference-end hook: one `conference` wake carrying the session brief + everything held during the meeting |
 | **Reflection** (new) | Accumulated event-weight threshold (~1–2/day) with a daily floor, plus one after every context compaction |
 
 **Reflection wakes** carry no new events. Their instruction is the maintenance cadence that makes "KB gardener" real (Letta sleep-time agents; Stanford generative-agents reflection): distill the interval into insight notes (with evidence refs), garden the KB (merge/supersede/expire per §5), review open assumptions and the drift question ("do recent decisions still serve the charge? report drift candidates"), refresh the current-state brief, and ask one *generated* focal question ("what is the most important question about this project right now?"). The post-compaction reflection doubles as re-grounding — governance-decay research shows compaction silently strips in-context constraints; the pinned charter (§5) prevents the constraint loss, the reflection wake re-orients the working state.
@@ -147,6 +158,10 @@ The existing `session_wake` machinery is a **jobs-row outbox**: keyed on `jobs.c
 - **Global throttle** distinct from per-source debounce: a minimum interval between officer wakes overall, so N misbehaving sources can't each claim their own wake. Late events land in the next sitrep — nothing is lost, because the sitrep is snapshot-diff based, not event based.
 - **Urgency is never downgraded** when coalescing: the batch inherits the max urgency of its members.
 - Officer-created jobs would otherwise fire *both* outboxes on completion; the legacy jobs-outbox delivery is suppressed for officer threads (it enqueues into the event outbox instead of injecting its own message). `paused` is **not** added to the legacy outbox's terminal set — officer paused-wakes ride the event outbox only.
+
+### The conference hold
+
+While a conference (§2) is open for the project, the background officer is **held**, and with the external timer the hold is **uniform**: every wake path — events *and* his timer — routes through the orchestrator's drain, which simply defers held threads (rows stay pending, timers included). A hold notice injected at conference start covers the one residual agent-local path (the long backstop timeout — if it fires mid-conference, the persona rule is "standing hold, no brief yet → sleep"), and a light mechanical fence on job actions from the held thread stays as belt-and-suspenders. Ending the conference generates the **session brief** via the existing teardown machinery (memory extraction + session summarizer), releases the hold, and enqueues a `conference` wake — the brief plus every event and timer that queued during the meeting, coalesced into one sitrep. Workers are unaffected by the hold: jobs keep running; only scheduling judgment waits, and the Legatus is present for anything urgent.
 
 ### The sitrep — wake message as computed delta
 
@@ -182,8 +197,8 @@ Officer sessions are ordinary persistent sessions with exemptions, not a new kin
 
 Dumb code, not LLM (new leader-gated `officer_watchdog` sweeper, ~60s):
 
-- **Liveness** via the existing agent-binding + readiness probe; **turn-activity** via the newest ai/tool row in `thread_messages` (not `threads.last_activity`, which every durable notice bumps).
-- Overdue (`> sleep_max + grace`) with a live pod → force-inject an overdue wake. Injection failed, agent gone, or thread `suspended` → respawn (idle-pool first, else dedicated pod), rate-limited to one attempt per thread per N minutes; page the Legatus on repeated failure.
+- **Liveness** via the existing agent-binding + readiness probe; **turn-activity** via the newest ai/tool row in `thread_messages` (not `threads.last_activity`, which every durable notice bumps). **Timer duty**: the watchdog files the implicit `sleep_max` wake when an unheld officer has no pending timer row, and treats a timer row overdue past `fire_at + grace` with a live pod as a delivery failure.
+- Delivery failure with a live pod → force-inject an overdue wake. Injection failed, agent gone, or thread `suspended` → respawn (idle-pool first, else dedicated pod), rate-limited to one attempt per thread per N minutes; page the Legatus on repeated failure.
 - **`suspended` is the officer's most common down-state, not crashes** — deploys drain-suspend parked sessions; the watchdog's respawn-from-suspended is the routine path (rainbow-deploy survival is a tested requirement, not an edge case).
 - **Retirement is explicit.** "Never terminates" needs an off switch that isn't a crash: deliberately ending an officer thread also writes `officer.enabled=false`, so the watchdog stands down. A *crash*-`ended` officer whose flag is still true is **paged, not auto-resurrected** (default; see Decisions pending, §10). Watchdog scope is `active` + `suspended` only.
 
@@ -225,7 +240,7 @@ The centurion is the KB's **gardener** — which repairs the Resavio audit's "ph
 | **Episodic memory** | RecallStore, project-scoped — extraction already runs in sessions (every 5 turns + pre-compaction + teardown) | Add an **importance score at extraction time** (generative-agents' load-bearing variable — it keeps "the demo is Thursday" retrievable over 300 routine wake summaries). Scored on the aux-LLM side, not officer turns. Overturned assumptions and Legatus overrides are explicit extraction triggers |
 | **Jobs / fleet** | The `jobs` and `agents` tables, read through sitreps and tools | Never mirrored into notes — the DB is the truth, the sitrep is the view |
 
-His conversation stays an ordinary compacting session. The stores are the safety net, not the working memory: any wake after any compaction (or a fresh respawn) reconstructs from charter + sitrep + KB search.
+His conversation stays an ordinary compacting session. The stores are the safety net, not the working memory: any wake after any compaction (or a fresh respawn) reconstructs from charter + sitrep + KB search. The same project-keyed routing is what makes conference embodiments (§2) nearly free — the only thread-keyed officer state is the sleep deadline and the sitrep watermark, and both belong to the background loop.
 
 ## 6. Authority — capacity and budget, not a permission matrix
 
@@ -265,15 +280,16 @@ The mechanical loop auto-creates the next job on completion, with `loop_plan` fo
 One centurion. One project as the first command — the Primus Pilus title attaches later, when a centurion sits on the user's default project and there is more than one centurion for the title to mean anything. Build slices (ordered; step-level anchors, schema sketches, and per-slice risks in [[centurion_implementation_notes]]):
 
 1. **S1 — Officer substrate**: `OfficerConfig` (parsed in both loader paths; **denormalized into thread metadata** for SQL visibility); exemptions (attention-sleep, both `awaiting_user` flips, orphaned-`ended` sweep, `"ready"` NATS mirror); retirement semantics (`officer.enabled=false` on deliberate end); `officer_watchdog` sweeper (liveness, overdue force-inject, rate-limited respawn from `suspended`, page on repeated failure); boot self-wake at session attach (the loop bootstrap).
-2. **S2 — Sleep tool**: registered `core` tool + ToolContext request/peek/consume; turn-loop break + `TurnResult.ended_by_sleep`; deadline branch in the input wait (timeout → synthesized timer wake, never `IdleTimeoutError`); DB-mirrored deadline.
+2. **S2 — Sleep tool + external timer**: registered `core` tool + ToolContext request/peek/consume; turn-loop break + `TurnResult.ended_by_sleep`; the tool files the wake-up call with the orchestrator (pending `timer` outbox row with `fire_at`); officer branch of the input wait reduces to a long labeled backstop (never `IdleTimeoutError`); watchdog files implicit `sleep_max` when no timer is pending.
 3. **S3 — Event outbox + sitrep**: `session_wake_events` migration (insert-dedup, claim/debounce/GC); refactored delivery helpers + `notify_officer` / `notify_all_officers`; drain that coalesces per thread into one sitrep; `orchestrator/services/sitrep.py` (cross-DB, per-section degradation, snapshot-diff fingerprints, watermark-on-live-delivery-only); legacy-outbox double-wake suppression.
 4. **S4 — Wake call sites**: completion hooks, cancel/approve/escalate/pause endpoints, sudo-gate pending path + VM-upgrade insert, stale-agent sweep fleet events.
 5. **S5 — Toolset + authority**: enable the `orchestrator` category; `notify_user` tool + thread-scoped endpoint into NotificationService (three-output contract + page budget); steer + stuck/fleet wrappers; capacity enforcement in `POST /api/jobs` (advisory lock, actionable 409); officer loop guard (action budget, repeated-action fingerprint, daily token ceiling).
 6. **S6 — Expert config + persona**: `config/experts/centurion.yaml` (`none` backend, officer block, orchestrator + kb toolset, codex-proxy catalog model); charge-not-goal persona (standing questions, ask-or-assume with confidence/stakes, communication contract, routing procedure, effort scaling, write selectivity, micro-standup).
 7. **S7 — Charter + KB types**: vector migration for `charter` + `report` note types (three lockstep code sites); dedicated unconditional charter-injection block; charter template (intent skeleton, block ownership); provenance labeling for worker-authored notes.
 8. **S8 — Scheduling mode `officer`**: CHECK migrations, advance-branch, sweeper heal guard, start-endpoint skip-first-spawn, guarded conversion endpoint.
+9. **S9 — Conference surface**: conference sessions (a normal interactive session created with the centurion expert + project binding — identity attaches via the project-scoped stores; workspace tier user-selected at creation); the conference hold + session-brief wake; one-open-conference-per-project guard; cockpit routing (single-select project picker → the conference, replacing the legacy multi-project tap-in; officer badge; event-collapse rendering of the log; project-page Centurion enable/disable toggle → provision/retire).
 
-Sequencing: S1+S2 first (agent-side substrate), S3 before S4 (call sites need the outbox), S5–S7 parallelizable, S8 last (needs an officer to wake). Cockpit work in v1 is minimal: the officer thread renders in the existing session UI — that *is* the officer's log. A badge, the fleet view, and a Legatus-facing "needs you" inbox (the validated ambient-agent UX) are polish, not gates.
+Sequencing: S1+S2 first (agent-side substrate), S3 before S4 (call sites need the outbox), S5–S7 parallelizable, S8 last (needs an officer to wake), S9's brief-wake rides on S3 while its cockpit half can land anytime. Cockpit work in v1 is otherwise minimal: the officer thread renders in the existing session UI — that *is* the officer's log. The fleet view and a Legatus-facing "needs you" inbox (the validated ambient-agent UX) are polish, not gates.
 
 ### Acceptance scenarios (the doc's definition of "works")
 
@@ -284,6 +300,7 @@ Sequencing: S1+S2 first (agent-side substrate), S3 before S4 (call sites need th
 5. **Idle capacity.** Backlog non-empty, capacity free → the sitrep flags it mechanically → he pulls the next ticket and schedules it, unprompted.
 6. **Quiet operation.** Nothing wrong → timer wakes conclude in "sleep(max)" at warm-cache cost, no pages, and the daily digest still arrives ("all quiet").
 7. **Hollow completion.** A worker reports `completed` but the deliverable is absent or wrong. The centurion treats the status as a claim — verifies via critic/recon/artifact before closing the backlog ticket, and reopens or re-dispatches on failure.
+8. **Conference.** The Legatus opens a conference, walks the centurion through a pivot in the shared workspace, and ends the session. The background officer's next wake carries the session brief; his subsequent scheduling reflects the new direction with no re-explanation — and no event that arrived mid-conference is lost.
 
 ### Prerequisite (Phase 0) — resolved
 
@@ -296,7 +313,7 @@ Parked deliberately, revisited when scale demands (the notes' own staffing rule 
 - **Primus Pilus command extension.** The centurion of the user's default project, extended beyond the title: authority to create and manage entire projects — each with its own centurion — and to delegate work across officers. The growth path for every cross-project concern (fleet health, infra outages, portfolio prioritization): they route up to the Pilus, not into per-project scope creep. Requires a first-class "default project" notion (§10) and an officer-to-officer messaging path.
 - **Century structure** (Tesserarius / Optio as separate agents). In v1 the three command functions are sections of one centurion's prompt.
 - **Model tiering** (small-model line centuries, top-tier command; Caesar/Centurion fine-tunes) — a compute-economics story, orthogonal to autonomy.
-- **Multi-officer staffing per project**; **concurrent user-facing sessions sharing one centurion's identity** (split-brain); **fleet view UI** (the Warlords-Britannia overview); **Legatus "needs you" inbox**; **officer envelope budgets** (with headless-budgets); **`LifecycleEvent` bus** (automations v0.5 — wake call sites migrate onto it mechanically when it lands); **session permission-gate wake source** (needs a pg trigger or agent-side hook; sitrep pending-count covers v1).
+- **Multi-officer staffing per project**; **concurrent embodiments** (a live conference while the background loop keeps acting — a one-flag relaxation of the serial hold) and **multi-user conferences**; **fleet view UI** (the Warlords-Britannia overview); **Legatus "needs you" inbox**; **officer envelope budgets** (with headless-budgets); **`LifecycleEvent` bus** (automations v0.5 — wake call sites migrate onto it mechanically when it lands); **session permission-gate wake source** (needs a pg trigger or agent-side hook; sitrep pending-count covers v1).
 
 ## 10. Open questions & decisions pending
 
@@ -313,7 +330,7 @@ Parked deliberately, revisited when scale demands (the notes' own staffing rule 
 6. **"Default project" definition** — needed only when the Primus Pilus designation gains behavior. Candidates: a flag on `projects`, or `users.settings`.
 7. **Reflection-wake trigger tuning** — event-weight threshold and daily floor; start at ~1–2/day and calibrate.
 
-*(Closed by research: sleep-deadline durability — DB-authoritative from day one; sitrep cost shape — tiered fingerprints, ~8 queries, 300–900 tokens; recon-job ergonomics — curator shape + `report` note type, no new expert.)*
+*(Closed: sleep-timer durability — orchestrator-owned durable timer rows in the event outbox, firing included, not just storage (user decision 07-29); sitrep cost shape — tiered fingerprints, ~8 queries, 300–900 tokens; recon-job ergonomics — curator shape + `report` note type, no new expert.)*
 
 ## 11. Decision log
 
@@ -324,6 +341,8 @@ Parked deliberately, revisited when scale demands (the notes' own staffing rule 
 - **2026-07-28:** Job creation and full backlog authority from v1, bounded by capacity + budget rather than a per-action permission matrix. A manager without scheduling authority is a dashboard. (User decision.)
 - **2026-07-28:** One authoritative loop per centurion; user messages are wake events into it. Shared-identity multi-session deferred. (Recommendation, accepted.)
 - **2026-07-28:** Naming hierarchy settled: per-project officer = **Centurion**; the default project's centurion bears the title **Primus Pilus** (designation now, command extension later); the user is the **Legatus**. Projects are centuries. Code uses `officer`. (User decision.)
+- **2026-07-29:** **Timer wakes are orchestrator-fired and Postgres-durable** (user decision): the sleep tool files a pending `timer` outbox row with `fire_at`; the drain fires it like any other event; the watchdog files implicit `sleep_max`; the agent keeps only a long labeled backstop. Rationale: a pod crash or node downtime must not lose the schedule — the next pod picks up the timer where it was. Bonus: the conference hold becomes uniform across all wake paths, and timers inherit debounce/coalescing/urgency. Supersedes the agent-local deadline + metadata mirror from the 07-28 hardening.
+- **2026-07-29:** Interaction surface settled (user design): you talk to a centurion in a **conference** — a separate interactive session wearing his identity through the project-scoped stores, with a workspace/VM allowed for shared code walkthroughs. The background loop is **held** during the conference (events durable-queue; scheduling actions mechanically fenced) and wakes once afterward with the session brief. Serial embodiments, single writer; quick notes may still be typed into the log as wake events. Supersedes the 07-28 one-loop note insofar as user *conversations* move out of the background thread; the log remains his timeline. Cockpit: the legacy multi-project session tap-in narrows to a single-select picker that routes to the conference; the project page owns Centurion enable/disable. (User design; hold-as-default refinement accepted.)
 - **2026-07-28 (research hardening):** Five-agent fan-out integrated. Added: event-outbox table (the existing session-wake outbox is job-keyed and cannot carry officer wakes), reflection wakes, charter block structure with split write authority and governance pinning, KB provenance boundary, officer loop guard, three-output notify contract with page budget, job-spec template, completed-is-a-claim verification, DB-authoritative sleep deadline, cache-aligned cadence, retirement semantics. Corrected: lazy loop start (respawn wake = bootstrap), `updated_at`/progress/token data sources (audit DB), sweeper-heal conflict, double-wake suppression, Phase 0 already fixed. No core decision refuted.
 
 ## 12. Prior art (compact)

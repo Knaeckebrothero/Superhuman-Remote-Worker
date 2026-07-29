@@ -1426,6 +1426,19 @@ codexProxy:
   # `latest` makes pod restarts silently change behavior. Overlays may override.
   image: docker.io/eceasy/cli-proxy-api:v7.2.61
   storageSize: "1Gi"
+  # Upstream retries INSIDE the proxy. Default is 0, which gives the whole stack
+  # zero tolerance for a dropped upstream stream: one `408 stream disconnected
+  # before completion` flips the (single) auth entry to `status: error`, so the
+  # agent's own retries then all bounce off an instant `503 auth_unavailable`,
+  # exhaust in ~31s, and freeze the job for a 30-60min backoff pause. Absorbing
+  # the drop here is upstream of every one of those consequences.
+  # Incident: 2026-07-29 job d251e513 (docs/issues/, memory).
+  requestRetry: 3
+  # Body-level request/response logging to the pod log. OFF by default: it emits
+  # full prompts AND auth headers. Flip to true only while actively catching an
+  # upstream error the status endpoint won't explain, then flip it back.
+  requestLog: false
+  debug: false
   # The proxy buffers the full request/response body in memory (Go), so a
   # single multimodal turn (e.g. several multi-MB images base64-inflated to
   # ~30MB each, plus the response) can spike well past a tight limit. The old

@@ -34,10 +34,14 @@ Real registered tool + ToolContext flag (NOT a pre-dispatch sentinel — a real 
 4. `persistent_graph.py` — `TurnResult.ended_by_sleep: bool = False`; after the tool-batch `for` (between :2276 and :2277): `if tool_context and tool_context.peek_officer_sleep(): break`; return carries `ended_by_sleep=True`. Guard `tool_context=None` (tests build callbacks without one).
 5. Optional belt: `persistent_app.py:4400–4409` `_loop_permission_check` early-APPROVE for `sleep` (side-effect-free) so it works outside `autonomous` mode.
 
-### Wake deadline (decided)
+### Wake timing — external durable timer (decided 07-29)
 
 - `_loop_get_user_input` `src/api/persistent_app.py:3924–3999`: today `asyncio.wait_for(queue.get(), idle_timeout_minutes*60)` :3974–3978; on timeout broadcasts `session.idle_timeout` + **raises `IdleTimeoutError`** :3996 → `_loop_completion_handler` :4976 (idle branch :4990–4996) → `_handle_idle_archive` :6340 → `_terminate_session("idle_timeout")` :2102 (writes `'ended'` :2212–2213). **Idle timeout is terminal; officer branch replaces it.**
-- Officer branch (gated `officer.enabled`): consume sleep request → deadline `now + clamp(minutes, sleep_min, sleep_max)`; **no request → `sleep_max`** (implicit); `wait_for(queue.get(), remaining)`; on timeout **return** `{"content": "[timer wake] slept N min (reason…)", "role": "event"}` — never raise. Mirror deadline into thread metadata (DB-authoritative; watchdog reads it). Module global cleared in `_terminate_session` (:2267 area).
+- **The timer is orchestrator-fired and PG-durable** (user decision — pod crash / node downtime must not lose the schedule; next pod picks up where it was). Mechanics:
+  - On turn park with a pending sleep request, the transport consumes it and **files the wake**: `POST /api/persistent/threads/{tid}/officer/wake {fire_at, reason}` (internal-key) → upsert of the `timer` outbox row (`source='timer'`, fixed `dedup_key='timer'`, `ON CONFLICT (uq_swe_pending) DO UPDATE SET fire_at` — the one source with update-not-ignore semantics). The tool itself stays a pure flag-setter.
+  - The event drain claims due rows via `fire_at <= now()` and injects `[timer wake]` like any other event. In-house precedent: `orchestrator/services/cron_dispatcher.py` (`cron_dispatcher_loop` :63 tick, `_process_one_due_automation` :120 — `next_run_at` + FOR UPDATE SKIP LOCKED claim).
+  - **Implicit `sleep_max`**: the transport files nothing when the turn ends without a sleep call; the **watchdog files the default** — unheld officer thread with no pending `timer` row and last ai/tool activity > `sleep_max` → upsert `timer` row `fire_at=now()`. This rule also covers transport-POST failures uniformly.
+  - Agent-side the officer branch reduces to a **backstop**: `wait_for(queue.get(), max(2*sleep_max, 2h))`; on timeout **return** `{"content": "[backstop wake] orchestrator timer overdue", "role": "event"}` — never raise. No local deadline arithmetic, no module global, nothing to clear on terminate. Covers the partial failure "drain/watchdog broken, API up"; persona rule for a backstop landing during a held conference: standing hold + no brief yet → sleep.
 - Skip both `awaiting_user` flips when officer: input-park `should_flip` :3952–3963 and sudo-gate flip `_loop_permission_check` :4478–4482. Eager/polite: neither auto-continues (modes only control the flip); polite+officer contradictory → officer bypasses both regardless of mode.
 - Suppress the per-park `"ready"` NATS mirror for officers (`emit_session_event` :310–321 or broadcast site :3937; `_NOTIFICATION_METHODS` :257–266 → `session.waiting` SSE via `orchestrator/services/nats_bridge.py:819–826`) — else ~48 feed events/day.
 
@@ -56,7 +60,7 @@ Real registered tool + ToolContext flag (NOT a pre-dispatch sentinel — a real 
 
 - **The loop starts lazily** — only on first REST input (`handle_api_input` → `_ensure_persistent_loop_started("rest_input")` :2663) or WS attach (:2838). A respawned pod restores the session (`_attach_session` :1430 → `_restore_session_messages` **:5124** (def; called :2080) → status active :2083 → loop primitives :2090) and then parks with **no running loop**. Durable wakes restore as history rows (:5075–5087), not queue input.
 - **Boot self-wake** (loop bootstrap + doc's respawn wake in one): end of `_attach_session` (after :2097), if officer → `_ensure_persistent_loop_started("officer_boot")` + `_accept_user_input("[wake: session started/restarted]…", role="event")`. Covers dedicated boot (lifespan :1041) and pool attach (`POST /session/attach` :2413).
-- New `orchestrator/services/officer_watchdog.py`, leader-gated beside `main.py:7459–7461`, ~60s tick: select officer threads status IN (`active`,`suspended`); liveness via `session_wake._resolve_live_agent` (:313–351) + `probe_ready` (`services/session_lifecycle.py:77`); **turn-activity via `MAX(created_at) FROM thread_messages WHERE role IN ('ai','tool')`** — NOT `threads.last_activity` (bumped by every row incl. durable notices, `postgres.py:6252–6261`). Overdue > `sleep_max + grace` → force-inject `[watchdog] overdue wake` direct to pod `/api/input` (the `_inject_live` pattern; deliberately bypasses the orchestrator turn lock :24024). Inject failed / agent offline / `suspended` → respawn via `_reprovision` split (idle pool `_find_idle_persistent_agent` :3167 / dedicated pod :23383–23386; `main.py:23292–23400`), **rate-limited one attempt per thread per N min**; page owner via NotificationService on repeated failure. Env: `OFFICER_WATCHDOG_INTERVAL_S`, `OFFICER_WAKE_GRACE_MINUTES`.
+- New `orchestrator/services/officer_watchdog.py`, leader-gated beside `main.py:7459–7461`, ~60s tick: select officer threads status IN (`active`,`suspended`); liveness via `session_wake._resolve_live_agent` (:313–351) + `probe_ready` (`services/session_lifecycle.py:77`); **turn-activity via `MAX(created_at) FROM thread_messages WHERE role IN ('ai','tool')`** — NOT `threads.last_activity` (bumped by every row incl. durable notices, `postgres.py:6252–6261`). Two timer duties (07-29): **file the implicit `sleep_max` timer** (upsert `timer` row `fire_at=now()`) when an unheld officer has no pending `timer` row and turn-activity is older than `sleep_max`; and treat a pending `timer` overdue past `fire_at + grace` with a live pod as a **delivery failure** → force-inject `[watchdog] overdue wake` direct to pod `/api/input` (the `_inject_live` pattern; deliberately bypasses the orchestrator turn lock :24024). Inject failed / agent offline / `suspended` → respawn via `_reprovision` split (idle pool `_find_idle_persistent_agent` :3167 / dedicated pod :23383–23386; `main.py:23292–23400`), **rate-limited one attempt per thread per N min**; page owner via NotificationService on repeated failure. Env: `OFFICER_WATCHDOG_INTERVAL_S`, `OFFICER_WAKE_GRACE_MINUTES`.
 - **Deploys drain-suspend parked sessions** (drain intent `persistent_app.py:491–529`) — `suspended` is the officer's routine down-state; respawn-from-suspended is the common path.
 - **Retirement**: `end_thread` `main.py:23062` additionally writes `officer.enabled=false` so the watchdog stands down. Crash-`ended` (`_terminate_session("loop_crash")` :2212–2213/:5003) with flag still true → **page, don't auto-resurrect** (pending Legatus confirmation).
 
@@ -81,15 +85,17 @@ CREATE TABLE session_wake_events (
     id BIGSERIAL PRIMARY KEY,
     thread_id uuid NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
     project_id uuid,
-    source text NOT NULL,      -- 'job_transition'|'sudo_request'|'fleet'|'loop'|'respawn'
+    source text NOT NULL,      -- 'job_transition'|'sudo_request'|'fleet'|'loop'|'respawn'|'conference'
     dedup_key text NOT NULL,   -- '<job8>:<status>' | 'sudo:<id>' | 'fleet:<step>'
     payload jsonb NOT NULL DEFAULT '{}'::jsonb,
     state text NOT NULL DEFAULT 'pending' CHECK (state IN ('pending','sending','sent','dead')),
     attempts int NOT NULL DEFAULT 0,
+    fire_at timestamptz,               -- NULL = fire on next drain; future = durable timer (source='timer')
     claimed_at timestamptz, sent_at timestamptz,
     created_at timestamptz NOT NULL DEFAULT now()
 );
 CREATE UNIQUE INDEX uq_swe_pending ON session_wake_events (thread_id, source, dedup_key) WHERE state='pending';
+-- claim predicate adds: AND (fire_at IS NULL OR fire_at <= now()); source='timer' upserts fire_at ON CONFLICT (others DO NOTHING)
 CREATE INDEX idx_swe_claim ON session_wake_events (created_at) WHERE state IN ('pending','sending');
 CREATE INDEX idx_swe_debounce ON session_wake_events (thread_id, source, sent_at) WHERE state='sent';
 ```
@@ -155,9 +161,20 @@ Same migration: extend `project_loop_scheduling_known` CHECK with `'officer'` (`
 - **Sweeper** (`project_loop_sweeper.py:119`): stage-sweep (:130–131 → `_sweep_stage` :182) **keep** — safety net; heal (:160–179 → `_heal_wedged_loop` :326; `HEAL_GRACE_SECONDS=600` :84; restore `heal_project_loop_stage` `postgres.py:13007–13031`) **must skip officer** — else all-terminal stage restored → barrier re-fires → duplicate wake every ~10 min forever. Guard both the legacy pointer-adopt :134 and heal :164 branches.
 - **Start/convert**: `start_project_loop` (routers :74) always spawns `roles[0]` :194 — for officer skip first spawn, write empty pointers, require officer thread (400 otherwise). Conversion endpoint `POST /api/projects/{id}/loop/scheduling`: editor+; require officer thread; reject mid-flight campaign; guarded UPDATE (extend `_PROJECT_LOOP_UPDATABLE_FIELDS` `postgres.py:12873–12895` with superseding comment, or dedicated raw-SQL method).
 
+## S9 — Conference surface
+
+The conference (feature doc §2) is a **normal interactive session wearing the officer's identity** — nearly everything attaches for free because officer state is project-keyed:
+
+- **Creation**: standard session-create with `expert=centurion` + the project bound; `config_override` sets `conference: true` and may override the workspace backend (centurion.yaml defaults to `none`; a conference can pick a workspace/VM tier — the existing tier machinery). `officer.enabled` stays **false** on the conference thread: no sleep tool, no watchdog, normal idle-archive — it's an ordinary session with his persona and stores.
+- **Identity attach**: charter/KB/backlog/RecallStore all key on project (`persistent_session.py:1097`/`:2026–2037`; charter block from S7). **Gate the charter-injection block on (project + (officer.enabled OR conference flag)), not `officer.enabled` alone** — conferences must get the charter. Delegation + kb toolsets come from the centurion expert config.
+- **The hold**: on conference create, stamp the background officer thread's metadata (e.g. `officer.hold = 'conference:<conf_thread_id>'`) and inject a live `[conference started — stand by]` notice. With the external timer the hold is uniform: (a) the event drain skips held threads entirely — event AND `timer` rows stay `pending`; the watchdog also skips filing the implicit-`sleep_max` timer for held threads; (b) a light **mechanical fence** — job-mutation endpoints reject requests attributed to a held officer thread with a legible 409 ("conference in progress") — stays as belt-and-suspenders. The only agent-local wake left is the long backstop (~2h+); if it fires mid-conference the standing hold notice covers it (persona: hold + no brief yet → sleep). Conferences are hours, not weeks, so post-compaction amnesia of the hold is a non-issue in practice.
+- **Conference end** (archive or idle): existing teardown extractors (`persistent_app.py:6267`/`:6364`) + session summarizer produce the **brief**; clear the hold; `enqueue_session_wake_event(officer_thread, source='conference', dedup_key=conf_thread_id, payload={brief})`; kick the drain — the brief coalesces with everything held.
+- **One-open-conference-per-project guard**: creation checks for an existing active conference thread for the project (metadata query) → reattach instead of duplicating (single-writer rule).
+- **Cockpit**: single-select project picker (narrowing the legacy `metadata.project_ids` multi-tap-in, superseded per `postgres.py:5752`) routes "Talk to the centurion" → open/create the conference; officer badge on his log thread; event-role collapse rendering (`role='event'` rows + `[SITREP]` bracket tag); project page: Centurion enable/disable → provision (create officer thread + stamp metadata) / retire (`end_thread` + `officer.enabled=false`).
+
 ## Sequencing & risks (merged)
 
-**Order**: S1+S2 (agent substrate) → S3 (outbox+sitrep) → S4/S5/S6/S7 parallel → S8 last. Capacity (S5) is independent after S1's metadata stamp.
+**Order**: S1+S2 (agent substrate) → S3 (outbox+sitrep) → S4/S5/S6/S7 parallel → S8 last; S9's brief-wake needs S3, its cockpit half is independent. Capacity (S5) is independent after S1's metadata stamp.
 
 **Top risks**:
 1. Double-wake officer-created jobs (both outboxes) — closed by the `_deliver` suppression; without it every delegation costs two turns per completion.
@@ -171,5 +188,6 @@ Same migration: extend `project_loop_scheduling_known` CHECK with `'officer'` (`
 9. Capacity TOCTOU on parallel tool calls — advisory xact lock.
 10. Officer resurrect-vs-retire — `officer.enabled=false` on deliberate end; crash-ended paged (pending decision).
 11. pgvector warn-only KB write = silent data loss for officer notes — consider hard-fail (or retry) when `officer.enabled`.
+12. Timer partial failures (07-29 external-timer model) — transport crashes before filing the wake → no `timer` row exists, which is exactly the watchdog's cue to file `sleep_max`; orchestrator timer path (drain/watchdog) broken while the API is up → the agent-side backstop (max(2×`sleep_max`, 2h)) preserves liveness with a distinctly-labeled `[backstop wake]`.
 
 **Test matrix (minimum)**: sleep-tool turn-break unit; officer input-wait deadline/synthesis (pattern `test_attention_sleep_phase5.py:147`); loader parse both paths; sweeper-exclusion SQL; watchdog decision matrix; outbox enqueue-dedup/claim/debounce/grouping; officer completion → exactly one `[SITREP]` turn (and no `[JOB_FINISHED]`); officer loop advance leaves pointers empty across two sweeper ticks (no heal, no double wake); capacity 409 at cap; sitrep sections survive audit-DB outage; regression: `test_idle_timeout.py`, `test_attention_sleep_phase5.py`, `test_headless_polite_phase6.py` untouched green.

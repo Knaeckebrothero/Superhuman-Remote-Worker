@@ -14686,6 +14686,7 @@ async def complete_job(
                     LLM_OUTAGE_RESET_WINDOW_SECONDS,
                     llm_outage_backoff_seconds,
                     llm_outage_fingerprint,
+                    llm_outage_repeat_key,
                 )
 
                 _now = datetime.now(timezone.utc)
@@ -14694,6 +14695,7 @@ async def complete_job(
                     now=_now,
                     reset_window_seconds=LLM_OUTAGE_RESET_WINDOW_SECONDS,
                     fingerprint=llm_outage_fingerprint(_lfd),
+                    repeat_key=llm_outage_repeat_key(_lfd),
                 )
                 _attempt = _adv["attempt"]
                 _ra = _lfd.get("retry_after_seconds")

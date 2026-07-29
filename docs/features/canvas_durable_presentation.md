@@ -20,9 +20,10 @@ related:
 
 # Canvas Durable Presentation — surviving workspace death
 
-**Status:** IMPLEMENTED 2026-07-28 — Parts 1 and 2 plus the §6 UI fix are
-built, unit-covered, and exercised on k3d against live Garage. §12 records what
-was and was not confirmed on the cluster.
+**Status:** IMPLEMENTED — Parts 1 and 2 plus the §6 UI fix built and
+unit-covered 2026-07-28; the §11.1 chart auto-default landed and was confirmed
+live 2026-07-29. All of it exercised on k3d against live Garage. §12 records
+what was and was **not** confirmed on the cluster.
 **Parent:** `docs/features/dynamic_canvas.md` (authority for Canvas
 architecture). This document **amends** that authority: §1 changes one of its
 founding constraints and must be accepted or rejected explicitly.
@@ -74,7 +75,7 @@ content-addressed archive with restore history.
 - **No new endpoint, no new origin, no new auth path.** The existing
   content route serves snapshot bytes under the existing owner check and the
   existing response headers, including the locked `sandbox` CSP for HTML
-  renderers (`routers/canvases.py:1111-1116`).
+  renderers (`routers/canvases.py:1161-1165`).
 
 ### What changes, and what it obliges us to
 
@@ -91,12 +92,14 @@ content-addressed archive with restore history.
    with an object delete, and a failed object delete leaves an orphan. Bounded
    remediation in §4.5.
 4. **Canvas durability now depends on the object store being configured.**
-   Every shipped overlay has one — bundled Garage under Tilt
-   (`deployment/values-tilt.yaml:48`), external MinIO on the dev cluster
-   (`deployment/values-experimental.yaml:248`) — but the chart's own defaults
-   leave `s3.endpoint` empty and `garage.enabled: false`
-   (`helm/values.yaml:1656`, `:1681`), and there the feature is inert and
-   behavior is exactly today's. See §11.1.
+   Every shipped overlay has one — the bundled Garage under Tilt, external
+   MinIO on the dev cluster (`deployment/values-experimental.yaml:249`). The
+   chart's own default was `garage.enabled: false`, which meant a consumer who
+   configured nothing got a Canvas that silently never remembered anything;
+   §11.1 records how that was closed (`garage.enabled` is now tri-state,
+   defaulting to auto). It stays inert only where an operator explicitly opts
+   out of object storage, and the orchestrator warns at startup when that
+   happens.
 5. **A new class of staleness exists.** A user can be looking at bytes whose
    source file was deleted or rewritten in the workspace hours ago. This is the
    intended behavior, but it must be labelled in the UI every time, never
@@ -574,8 +577,7 @@ S3-touching backend tests use a stubbed `SnapshotService`, not a live bucket.
 20. A `set_canvas` tool card does not read "replaced" after a re-pin of the
     same presentation.
 
-**Live verification (manual, k3d — `garage.enabled: true` via
-`values-tilt.yaml`)**
+**Live verification (manual, k3d — bundled Garage, auto-enabled per §11.1)**
 
 21. Create a session → `set_canvas` on a markdown file → confirm live render →
     force the workspace to suspend → confirm `kubectl get pods -l ...` shows no
@@ -704,13 +706,23 @@ no PVC — the same shape as the `b1758f38` post-mortem.
 **Not confirmed live, and why:**
 
 - **The genuine suspend → S3 → restore leg of criterion 13.** Workspace
-  suspension is broken on this k3d deployment for an unrelated reason:
-  `/run/secrets/vm-ssh-key` is mounted mode `0444`, which OpenSSH refuses
-  ("UNPROTECTED PRIVATE KEY FILE"), so `capture_vm_snapshot` fails and
-  `suspend_thread_workspace` keeps the workspace alive. Substituted workspace
-  pod deletion plus re-provision, which produces the same generation rotation —
-  the mechanism the re-pin actually keys on. **The environment bug is worth its
-  own fix; canvas durability does not depend on it.**
+  suspension fails on the k3d dev stack: `/run/secrets/vm-ssh-key` is mounted
+  `0444`, OpenSSH refuses it, `capture_vm_snapshot` fails, and
+  `suspend_thread_workspace` keeps the workspace alive instead. This is a
+  **known, already-triaged, dev-only** issue —
+  `docs/issues/dev_snapshot_ssh_key_perms_0444.md`, filed 2026-06-22 and
+  re-confirmed live here on 2026-07-28/29. It is dev-only because OpenSSH runs
+  its permission check **only when the key is owned by the uid running ssh**:
+  the dev image runs as root (uid 0 == the key's owner, check fires), while
+  prod runs as non-root `srw` (uid ≠ owner, check skipped). Do not "fix" it by
+  lowering `defaultMode` to `0400` — that breaks prod, where non-root cannot
+  read a root-owned `0400` file.
+
+  Substituted workspace pod deletion plus re-provision, which produces the same
+  generation rotation the re-pin actually keys on. **Canvas durability does not
+  depend on that issue**, and prod's suspend → restore path is unaffected —
+  which is also what `b1758f38` in §2.2 demonstrates, since that thread really
+  did restore from S3.
 - **Criterion 14 (changed bytes → `source_changed`).** The live attempt was
   invalid: `workspace_container.status` had already flipped to `deleted`, so the
   read failed as unavailable before any hash comparison. Covered by
@@ -724,6 +736,17 @@ restoring reads as unreadable, so that would have stranded the Canvas on its
 stored copy until the next publish or a process restart. The guard now records
 an attempt only for a definitive content mismatch; unreadable stays retryable
 (`_maybe_repin`, `routers/canvases.py`).
+
+**Chart auto-default, verified on the same cluster (2026-07-29):** after the
+§11.1 change, Tilt re-ran helm (release revision 30) with `garage.enabled`
+absent from the values entirely — `helm get values` shows no `garage` key — and
+the auto path resolved it. `srw-config` carries
+`S3_ENDPOINT=http://srw-garage:3900`, the Garage StatefulSet and Service are
+still owned by the release and were **not** recreated (18h pod uptime, as the
+byte-identical render predicted), and the orchestrator logs "Snapshot service
+ready" rather than the new disabled-warning. A put/get/verify/delete round-trip
+through `SnapshotService` under the exact `canvas/<thread>/main/<sha>` key
+scheme succeeded against live Garage.
 
 **Known behavior, per §1 obligation 1:** presenting a live app or shared browser
 after a file leaves that file's stored copy in place until the Canvas is cleared

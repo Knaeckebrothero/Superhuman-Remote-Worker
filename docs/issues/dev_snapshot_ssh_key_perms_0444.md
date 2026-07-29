@@ -6,6 +6,7 @@ tags:
   - dev-only
 related:
   - "[[agent_lifecycle_management]]"
+  - "[[canvas_durable_presentation]]"
 ---
 
 # Workspace snapshot/IDE SSH fails in local dev — `0444` key "too open" (root container only)
@@ -89,3 +90,20 @@ non-root (conflicts with Tilt's `/app` sync).
   ended/terminal workspaces that are never evicted — so this ERROR burst is
   amplified by that leak. Evicting dead records (the ide_settings fix) shrinks
   the burst even while this dev key-perms fix stays deferred.
+- Re-confirmed again 2026-07-28 from a different angle, which adds one concrete
+  cost to the "is dev snapshotting worth it?" question. While verifying
+  `docs/features/canvas_durable_presentation.md` on k3d, an explicit
+  `POST /api/agents/threads/{id}/suspend` returned 200 but did nothing: the tar
+  failed on this exact `0444` warning, `suspend_thread_workspace` returned
+  `False`, and the fallback kept the workspace pod alive
+  (`main.py:_suspend_thread_resources`). So on dev the bug does not merely lose
+  snapshots — **it makes suspend a silent no-op**, which in turn means the
+  suspend → S3 → restore path cannot be exercised locally at all. That blocked
+  one acceptance criterion there (canvas doc §12, criterion 13), which was
+  closed by substituting pod deletion + re-provision.
+
+  If a future session picks this up, the stage-copy fix below is still the
+  right shape, and completing a real suspend → restore cycle on k3d would
+  double as the missing canvas verification. Priority is unchanged: **prod is
+  not affected**, so this stays a local-dev quality-of-life fix, not a
+  data-loss bug.

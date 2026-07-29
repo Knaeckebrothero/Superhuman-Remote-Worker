@@ -25,6 +25,7 @@ from src.graph import (
     _check_empty_response_streak,
     _check_no_tool_call_streak,
     _is_output_truncated,
+    initial_error_freeze_fields,
 )
 
 
@@ -1242,3 +1243,45 @@ class TestCooldownWithinPauseBudget:
     def test_budget_default_is_12h(self):
         # Fused with the orchestrator's LLM_OUTAGE_CEILING_SECONDS (2026-07-15).
         assert _COOLDOWN_MAX_PAUSE_SECONDS == 43_200
+
+
+class TestInitialErrorFreezeFields:
+    """The FIRST error of a retry ladder is often the cause; the last, a symptom.
+
+    Incident 2026-07-29 (job d251e513): a 408 upstream stream drop flipped the
+    Codex proxy's sole auth entry to `status: error`, so retries 2-6 returned
+    `503 auth_unavailable` and overwrote the only useful evidence. The freeze
+    named a phantom auth failure and sent operators to re-auth a healthy token.
+    """
+
+    HEAD = "Error code: 408 - stream disconnected before completion"
+    TAIL = "Error code: 503 - auth_unavailable: no auth available"
+
+    def test_differing_head_is_carried(self):
+        out = initial_error_freeze_fields(
+            self.HEAD, "transient", self.TAIL, "auth_unavailable"
+        )
+        assert out["initial_error_summary"] == self.HEAD
+        assert out["initial_classification"] == "transient"
+
+    def test_identical_head_and_tail_adds_nothing(self):
+        # The common single-cause case must not duplicate error_summary.
+        assert (
+            initial_error_freeze_fields(self.TAIL, "transient", self.TAIL, "transient")
+            == {}
+        )
+
+    def test_same_text_different_classification_is_carried(self):
+        out = initial_error_freeze_fields(
+            self.TAIL, "transient", self.TAIL, "rate_limit"
+        )
+        assert out["initial_classification"] == "transient"
+
+    def test_no_head_recorded_adds_nothing(self):
+        assert initial_error_freeze_fields(None, None, self.TAIL, "transient") == {}
+
+    def test_summary_is_truncated(self):
+        out = initial_error_freeze_fields(
+            "x" * 900, "transient", self.TAIL, "transient"
+        )
+        assert len(out["initial_error_summary"]) == 500

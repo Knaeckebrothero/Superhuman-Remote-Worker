@@ -363,10 +363,19 @@ helm_resource(
 )
 
 # -----------------------------------------------------------------------------
-# Object store: the bundled single-node Garage (garage.enabled=true in
-# deployment/values-tilt.yaml) now provides S3 for local dev — the same path
-# self-hosters get. The chart deploys Garage + an idempotent bootstrap Job and
-# auto-wires both seams (snapshots + virtual tier) to it, so there is no separate
-# fixture to apply here. The old MinIO manifest (deployment/tilt-minio.yaml) was
-# removed; for a pure no-store smoke test set virtualWorkspace.rclone.type=memory.
+# Object store: the bundled single-node Garage provides S3 for local dev — the
+# same path self-hosters get. The chart deploys Garage + an idempotent bootstrap
+# Job and auto-wires both seams (snapshots + virtual tier) to it, so there is no
+# separate fixture to apply here. The old MinIO manifest
+# (deployment/tilt-minio.yaml) was removed.
+#
+# Nothing here enables it: `garage.enabled` defaults to auto (run the bundled
+# store unless `s3.endpoint` is set), and deployment/values-tilt.yaml keeps that
+# input blank rather than forcing the flag on — so local dev resolves the store
+# exactly the way a fresh `helm install` does. Canvas durability depends on this
+# being wired (docs/features/canvas_durable_presentation.md §11.1); if the
+# orchestrator logs "Snapshot service disabled" at startup, a stale
+# deployment/values-local.yaml is setting s3.endpoint.
+#
+# For a pure no-store smoke test set virtualWorkspace.rclone.type=memory.
 # -----------------------------------------------------------------------------
