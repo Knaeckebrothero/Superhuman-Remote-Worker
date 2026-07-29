@@ -307,6 +307,21 @@ async def _ensure_nats_client():
         return None
 
 
+def _officer_cfg():
+    """Return this session's OfficerConfig when officer.enabled, else None.
+
+    Centurion sessions (docs/features/centurion.md): the flag decides the
+    officer branches in the input wait, the natural-pause flips, the boot
+    self-wake, and the ready-mirror suppression.
+    """
+    if _session is None:
+        return None
+    cfg = getattr(_session.config, "officer", None)
+    # Strict `is True`: tests wire sessions with MagicMock configs, and a
+    # truthy Mock attribute must not flip a normal session into officer mode.
+    return cfg if getattr(cfg, "enabled", False) is True else None
+
+
 async def emit_session_event(method: str, params: dict) -> None:
     """Publish a notification event to ``session.events.{oid}.{tid}`` on NATS.
 
@@ -318,6 +333,12 @@ async def emit_session_event(method: str, params: dict) -> None:
     and won't see flat ones — better to log a warning than silently no-op).
     """
     if method not in _NOTIFICATION_METHODS:
+        return
+    if method == "ready" and _officer_cfg() is not None:
+        # An officer parks after every wake (~48×/day on timer alone).
+        # Mirroring each park into the SSE notification feed as
+        # session.waiting is pure spam (centurion.md §4); WS subscribers
+        # watching the log still receive the plain "ready" broadcast.
         return
     tid = _os.environ.get("SESSION_BOUND_THREAD_ID", "")
     if not tid:
@@ -2096,6 +2117,24 @@ async def _attach_session(
     # out-of-band thread.status='ended'. Cancelled by _terminate_session.
     _start_watchdogs()
 
+    # Officer boot self-wake (centurion.md §4): the loop starts LAZILY on
+    # first input / WS attach, so a freshly booted or respawned officer would
+    # otherwise park forever with restored history and no running loop. This
+    # wake IS the bootstrap, and it makes any durable notices restored above
+    # readable in the very first turn. Gated on the loop not already running:
+    # a re-attach (e.g. a retried /session/attach POST) must not inject a
+    # second boot wake — the k3d smoke produced exactly that duplicate.
+    if _officer_cfg() is not None and (_loop_task is None or _loop_task.done()):
+        _ensure_persistent_loop_started("officer_boot")
+        await _accept_user_input(
+            "[wake: session started/restarted] You are the project officer "
+            "coming back online after a start or restart. Reorient from your "
+            "charter and knowledge base; recent orchestrator notices (if any) "
+            "are in your history above. A fresh sitrep arrives with the next "
+            "orchestrator wake. If nothing needs you now, file a sleep.",
+            role="event",
+        )
+
     logger.info(f"Session attached: thread={_thread_id} events_epoch={_events_epoch}")
 
 
@@ -3074,6 +3113,31 @@ def _unsubscribe(client_id: str) -> None:
     _subscribers.pop(client_id, None)
 
 
+async def _file_officer_wake(minutes: int, reason: str) -> None:
+    """File the officer's durable timer wake with the orchestrator.
+
+    Fire-and-forget from the park path. Failure is deliberately non-fatal:
+    when no ``timer`` row exists the officer watchdog files ``sleep_max`` on
+    the officer's behalf, and the local backstop covers the rest
+    (centurion.md §4).
+    """
+    try:
+        if _orchestrator_client is None or _thread_id is None:
+            return
+        ok = await _orchestrator_client.file_officer_wake(_thread_id, minutes, reason)
+        if not ok:
+            logger.warning(
+                "Officer wake filing rejected for thread %s "
+                "(watchdog will file sleep_max)",
+                _thread_id,
+            )
+    except Exception as e:
+        logger.warning(
+            "Officer wake filing failed (non-fatal — watchdog files sleep_max): %s",
+            e,
+        )
+
+
 async def _safe_set_thread_status(status: str) -> None:
     """Best-effort wrapper around _update_thread_status for fire-and-forget
     Phase 5 transitions (awaiting_user / active revert). A transient failure
@@ -3944,13 +4008,21 @@ async def _loop_get_user_input() -> str:
     # review-heavy "see every step" workflow and wants notification + an
     # explicit reply gate after each completed turn. Idempotent on the
     # orchestrator side: repeated writes preserve awaiting_user_since.
+    officer_cfg = _officer_cfg()
+
     headless_mode = "eager"
     if _session is not None:
         headless_cfg = getattr(_session.config, "headless", None)
         if headless_cfg is not None:
             headless_mode = getattr(headless_cfg, "mode", "eager") or "eager"
+    # Officer sessions never flip to awaiting_user — sleeping is not "awaiting
+    # a user", and the flip would arm the attention-sleep sweeper + orphan
+    # reclassification against a thread the officer watchdog owns
+    # (centurion.md §4). Officer also overrides polite mode: an explicit
+    # reply gate after each turn contradicts autonomous cycling.
     should_flip = (
-        _session is not None
+        officer_cfg is None
+        and _session is not None
         and _session.turn_count > 0
         and _orchestrator_client is not None
         and _thread_id is not None
@@ -3970,6 +4042,51 @@ async def _loop_get_user_input() -> str:
     try:
         if _session is None:
             return await queue.get()
+
+        if officer_cfg is not None:
+            # Officer park (centurion.md §4). The primary wake is the
+            # orchestrator's Postgres-durable timer: consume the sleep tool's
+            # parked request and FILE the wake-up call; when no request was
+            # made (turn ended in plain text) file nothing — the officer
+            # watchdog files sleep_max on our behalf. The local wait is only
+            # a long, labeled backstop for the one failure external timers
+            # can't cover: timer path down while the API is up. Never raises
+            # IdleTimeoutError — an officer session never idle-archives.
+            sleep_req = None
+            if _session.tool_context is not None:
+                sleep_req = _session.tool_context.consume_officer_sleep()
+            if sleep_req is not None:
+                minutes = max(
+                    officer_cfg.sleep_min_minutes,
+                    min(
+                        int(sleep_req.get("minutes") or 0),
+                        officer_cfg.sleep_max_minutes,
+                    ),
+                )
+                asyncio.create_task(
+                    _file_officer_wake(minutes, sleep_req.get("reason") or ""),
+                    name="officer-file-wake",
+                )
+            try:
+                return await asyncio.wait_for(
+                    queue.get(), timeout=officer_cfg.backstop_seconds
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Officer backstop wake fired for thread %s — the "
+                    "orchestrator's durable timer never delivered",
+                    _thread_id,
+                )
+                return {
+                    "content": (
+                        "[backstop wake] The orchestrator's durable timer did "
+                        "not fire in time — its wake path may be degraded. "
+                        "Check the situation via your tools; if a conference "
+                        "hold is standing and no brief has arrived yet, go "
+                        "back to sleep."
+                    ),
+                    "role": "event",
+                }
 
         idle_timeout_minutes = _session.config.interactive.idle_timeout_minutes
         if idle_timeout_minutes and idle_timeout_minutes > 0:
@@ -4475,7 +4592,14 @@ async def _loop_permission_check(
     # Phase 5: sudo gate hit untethered is the second natural-pause site.
     # Flip the thread so the attention-sleep watchdog can fire after the
     # configured TTL. Idempotent against the _loop_get_user_input write.
-    if not _subscribers and _orchestrator_client is not None and _thread_id is not None:
+    # Officer sessions never flip (centurion.md §4) — their pending gate
+    # surfaces via the sitrep instead.
+    if (
+        _officer_cfg() is None
+        and not _subscribers
+        and _orchestrator_client is not None
+        and _thread_id is not None
+    ):
         asyncio.create_task(
             _safe_set_thread_status("awaiting_user"),
             name="phase5-flip-awaiting-user-sudo",

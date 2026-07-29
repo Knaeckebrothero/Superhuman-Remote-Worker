@@ -912,6 +912,31 @@ class OrchestratorClient:
             logger.warning(f"Thread status update failed (non-fatal): {e}")
             return False
 
+    async def file_officer_wake(
+        self, thread_id: str, minutes: int, reason: str
+    ) -> bool:
+        """File an officer session's durable timer wake (centurion.md §4).
+
+        The orchestrator upserts the pending ``timer`` outbox row
+        (``fire_at = now + minutes``); its wake drain injects the timer wake
+        when due. Failure is non-fatal — the officer watchdog files
+        ``sleep_max`` whenever no timer row is pending.
+
+        Returns:
+            True if the orchestrator accepted the filing.
+        """
+        if not self._client:
+            return False
+        url = f"{self.orchestrator_url}/api/agents/threads/{thread_id}/officer/wake"
+        try:
+            r = await self._client.post(
+                url, json={"minutes": int(minutes), "reason": reason or ""}
+            )
+            return r.status_code in (200, 201)
+        except Exception as e:
+            logger.warning(f"Officer wake filing failed (non-fatal): {e}")
+            return False
+
     async def suspend_thread(self, thread_id: str) -> bool:
         """Request a clean drain-suspend of a thread (drift-drain path).
 

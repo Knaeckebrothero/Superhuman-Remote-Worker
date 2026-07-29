@@ -423,9 +423,14 @@ def load_tools(tool_names: List[str], context: ToolContext) -> List[Any]:
     if "core" in tools_by_category:
         from .core.todo import TODO_TOOLS_METADATA
         from .core.upgrade import WORKSPACE_UPGRADE_TOOLS_METADATA
+        from .core.officer import OFFICER_TOOLS_METADATA
 
         requested = set(tools_by_category["core"])
-        needs_workspace = requested - set(WORKSPACE_UPGRADE_TOOLS_METADATA)
+        needs_workspace = (
+            requested
+            - set(WORKSPACE_UPGRADE_TOOLS_METADATA)
+            - set(OFFICER_TOOLS_METADATA)
+        )
         if needs_workspace and not context.has_workspace():
             raise ValueError("Core tools require workspace_manager in ToolContext")
         if requested & set(TODO_TOOLS_METADATA) and not context.has_todo():

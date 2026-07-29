@@ -299,7 +299,15 @@ def _maybe_estimate_reasoning_tokens(turn_metrics: dict, reasoning_text: str) ->
         return
     if not reasoning_text:
         return
-    est = count_text_tokens(reasoning_text, turn_metrics.get("model"))
+    try:
+        est = count_text_tokens(reasoning_text, turn_metrics.get("model"))
+    except Exception as e:  # noqa: BLE001
+        # Metrics are best-effort and must never kill a turn: tiktoken lazily
+        # downloads its BPE vocab, which hard-fails on offline/split-DNS
+        # clusters (found by the centurion k3d smoke — every turn with
+        # captured reasoning died here).
+        logger.debug("reasoning-token estimate skipped (non-fatal): %s", e)
+        return
     if est > 0:
         # Reasoning is a subset of output_tokens; our tiktoken estimate uses a
         # different tokenizer than the model, so clamp it so the UI never shows
@@ -331,6 +339,10 @@ class TurnResult:
     # calls are neither run nor refused — the durable pending request resumes
     # them once the user answers.
     awaiting_permission: bool = False
+    # True when an officer session's sleep tool ended the turn after its tool
+    # batch (centurion.md §4). The transport consumes the parked sleep request
+    # and files the durable wake with the orchestrator.
+    ended_by_sleep: bool = False
 
 
 class PermissionOutcome(str, Enum):
@@ -1259,6 +1271,7 @@ async def _execute_turn(
                 e,
             )
 
+    ended_by_sleep = False
     while True:
         # Check for interrupt before LLM call
         if callbacks.check_interrupt():
@@ -2268,6 +2281,17 @@ async def _execute_turn(
                 ):
                     await callbacks.on_workspace_upgrade_needed(freeze_req)
 
+        # Officer sleep: the sleep tool parked a wake request — end the turn
+        # after the batch instead of paying another LLM iteration. Peek only;
+        # the transport consumes the request at park time and files the
+        # durable wake with the orchestrator (centurion.md §4). The isinstance
+        # guard keeps MagicMock tool_contexts in tests from tripping it.
+        if tool_context is not None:
+            _peek_sleep = getattr(tool_context, "peek_officer_sleep", None)
+            if callable(_peek_sleep) and isinstance(_peek_sleep(), dict):
+                ended_by_sleep = True
+                break
+
         # Continue the inner loop — LLM sees tool results on next iteration
 
     return TurnResult(
@@ -2275,4 +2299,5 @@ async def _execute_turn(
         messages_added=messages_added,
         tool_calls_made=tool_calls_made,
         metrics=turn_metrics,
+        ended_by_sleep=ended_by_sleep,
     )

@@ -57,6 +57,7 @@ import asyncio
 import json
 import logging
 import os
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 import httpx
@@ -655,6 +656,7 @@ async def session_wake_sweeper_loop(db: Any, shutdown_event: asyncio.Event) -> N
         VISIBILITY_TIMEOUT_SECONDS,
         MAX_ATTEMPTS,
     )
+    gc_countdown = _OFFICER_GC_EVERY_TICKS
     while not shutdown_event.is_set():
         try:
             sent = await drain_pending_wakes(db)
@@ -663,6 +665,28 @@ async def session_wake_sweeper_loop(db: Any, shutdown_event: asyncio.Event) -> N
         except Exception:
             logger.exception("Session wake sweeper tick raised; will retry next tick")
 
+        # Officer event outbox (centurion.md §4): same claim discipline,
+        # separate table — timers become due here, events retry here.
+        try:
+            sent = await drain_pending_event_wakes(db)
+            if sent:
+                logger.info("Session wake sweeper delivered %d officer wake(s)", sent)
+        except Exception:
+            logger.exception("Officer wake sweeper tick raised; will retry next tick")
+
+        gc_countdown -= 1
+        if gc_countdown <= 0:
+            gc_countdown = _OFFICER_GC_EVERY_TICKS
+            try:
+                pruned = await db.gc_session_wake_events(
+                    sent_retention_seconds=_OFFICER_SENT_RETENTION_SECONDS,
+                    dead_retention_seconds=_OFFICER_DEAD_RETENTION_SECONDS,
+                )
+                if pruned:
+                    logger.info("Officer wake GC pruned %d row(s)", pruned)
+            except Exception:
+                logger.exception("Officer wake GC raised (non-fatal)")
+
         try:
             await asyncio.wait_for(shutdown_event.wait(), timeout=TICK_SECONDS)
             break
@@ -670,3 +694,243 @@ async def session_wake_sweeper_loop(db: Any, shutdown_event: asyncio.Event) -> N
             pass
 
     logger.info("Session wake sweeper stopped")
+
+
+# --------------------------------------------------------------------------
+# Officer event outbox (centurion) — enqueue, timers, drain
+# --------------------------------------------------------------------------
+#
+# The jobs-row outbox above is keyed to jobs.created_by_thread_id and four
+# terminal statuses; officer sessions need wakes for non-job events and for
+# their own durable sleep timer, so those ride session_wake_events (migration
+# 0074, docs/features/centurion.md §4). Delivery reuses the exact same
+# primitives (_resolve_live_agent / _inject_live) and the same
+# claim-commit-send discipline. Rendering here is deliberately minimal — the
+# S3 sitrep service (orchestrator/services/sitrep.py) replaces
+# _format_officer_wake with the full computed delta.
+
+_OFFICER_CLAIM_BATCH = 20
+_OFFICER_MAX_ATTEMPTS = 60  # transient-retry budget; watchdog respawn can take a while
+_OFFICER_GC_EVERY_TICKS = 20
+_OFFICER_SENT_RETENTION_SECONDS = 3600  # MUST exceed the largest debounce window
+_OFFICER_DEAD_RETENTION_SECONDS = 7 * 24 * 3600
+
+# Per-source debounce (seconds). Timers/respawn/conference are scheduled or
+# one-shot — never debounced. Everything else is a wake-rate guard: suppressed
+# rows stay pending and coalesce into the next allowed wake, so nothing is
+# lost (centurion.md §4).
+OFFICER_DEBOUNCE_BY_SOURCE: dict[str, int] = {
+    "timer": 0,
+    "respawn": 0,
+    "conference": 0,
+    "job_transition": 300,
+    "sudo_request": 300,
+    "loop": 300,
+    "fleet": 600,
+}
+
+
+async def file_officer_timer(
+    db: Any, thread_id: str, minutes: int, reason: str
+) -> bool:
+    """File (or re-file) the officer's durable sleep timer.
+
+    One pending timer per thread — a new sleep replaces it (upsert on the
+    pending unique index). The drain claims it once ``fire_at`` is reached.
+    Never raises.
+    """
+    try:
+        fire_at = datetime.now(timezone.utc) + timedelta(minutes=int(minutes))
+        return await db.enqueue_session_wake_event(
+            str(thread_id),
+            source="timer",
+            dedup_key="timer",
+            payload={"minutes": int(minutes), "reason": reason or ""},
+            fire_at=fire_at,
+        )
+    except Exception:
+        logger.exception(
+            "officer wake: filing timer failed for thread %s", str(thread_id)[:8]
+        )
+        return False
+
+
+async def notify_officer(
+    db: Any,
+    project_id: str,
+    *,
+    source: str,
+    dedup_key: str,
+    payload: Optional[dict[str, Any]] = None,
+) -> bool:
+    """Enqueue a wake for the officer commanding ``project_id``.
+
+    No-op (False) when the project has no enabled officer. Never raises — a
+    transition path must not fail because a wake could not be enqueued.
+    """
+    try:
+        officer = await db.get_officer_thread_for_project(str(project_id))
+        if not officer:
+            return False
+        return await db.enqueue_session_wake_event(
+            str(officer["id"]),
+            source=source,
+            dedup_key=dedup_key,
+            payload=payload or {},
+            project_id=str(project_id),
+        )
+    except Exception:
+        logger.exception(
+            "officer wake: enqueue failed for project %s (%s)",
+            str(project_id)[:8],
+            source,
+        )
+        return False
+
+
+async def notify_all_officers(
+    db: Any,
+    *,
+    source: str,
+    dedup_key: str,
+    payload: Optional[dict[str, Any]] = None,
+) -> int:
+    """Enqueue a fleet-scoped wake for every enabled officer. Never raises."""
+    enqueued = 0
+    try:
+        for officer in await db.list_officer_threads():
+            ok = await db.enqueue_session_wake_event(
+                str(officer["id"]),
+                source=source,
+                dedup_key=dedup_key,
+                payload=payload or {},
+                project_id=(
+                    str(officer["project_id"]) if officer.get("project_id") else None
+                ),
+            )
+            enqueued += 1 if ok else 0
+    except Exception:
+        logger.exception("officer wake: fleet enqueue failed (%s)", source)
+    return enqueued
+
+
+def kick_event_drain(db: Any) -> None:
+    """Fire-and-forget the officer event drain after an enqueue commits.
+
+    Latency optimization only — the sweeper re-claims anything this misses.
+    """
+
+    async def _run() -> None:
+        try:
+            await drain_pending_event_wakes(db)
+        except Exception:
+            logger.exception("officer wake: opportunistic drain raised (non-fatal)")
+
+    try:
+        asyncio.create_task(_run(), name="officer-wake-drain")
+    except RuntimeError:
+        pass
+
+
+def _format_officer_wake(rows: list[dict[str, Any]]) -> str:
+    """Render one coalesced wake message for a batch of claimed rows.
+
+    Minimal v1 rendering — S3's sitrep service replaces this with the full
+    computed delta. Keeps the ``[SITREP]`` bracket so the cockpit match and
+    the persona instructions stay stable across that upgrade.
+    """
+    lines = [f"[SITREP] Wake — {len(rows)} reason(s):"]
+    for row in rows:
+        payload = _as_dict(row.get("payload"))
+        source = str(row.get("source") or "event")
+        if source == "timer":
+            minutes = payload.get("minutes")
+            reason = payload.get("reason") or ""
+            desc = f"timer: slept ~{minutes} min"
+            if reason:
+                desc += f" (reason: {_truncate(str(reason), 160)})"
+        else:
+            detail = payload.get("summary") or payload.get("status") or ""
+            desc = f"{source}: {row.get('dedup_key')}"
+            if detail:
+                desc += f" — {_truncate(str(detail), 200)}"
+        lines.append(f"- {desc}")
+    lines.append(
+        "Assess with your tools, act within your authority, then file a sleep."
+    )
+    return "\n".join(lines)
+
+
+async def drain_pending_event_wakes(
+    db: Any, *, limit: int = _OFFICER_CLAIM_BATCH
+) -> int:
+    """Claim due officer wake events and deliver one coalesced wake per thread.
+
+    Same claim-commit-send discipline as :func:`drain_pending_wakes`. Delivery
+    outcomes per thread batch:
+
+    * live inject accepted → finish the rows.
+    * agent live but inject refused/failed → RELEASE for retry — a running
+      officer never re-reads thread_messages, so a durable write would be
+      invisible to him until the next restart.
+    * no live agent → durable transcript write + finish; the watchdog's
+      respawn boot-wake makes the restored notice readable
+      (centurion_implementation_notes.md, risk 5).
+    """
+    try:
+        claimed = await db.claim_pending_session_wake_events(
+            limit=limit,
+            visibility_timeout_seconds=VISIBILITY_TIMEOUT_SECONDS,
+            debounce_seconds_by_source=OFFICER_DEBOUNCE_BY_SOURCE,
+        )
+    except Exception:
+        logger.exception("officer wake: claim failed")
+        return 0
+    if not claimed:
+        return 0
+
+    by_thread: dict[str, list[dict[str, Any]]] = {}
+    for row in claimed:
+        by_thread.setdefault(str(row["thread_id"]), []).append(row)
+
+    delivered = 0
+    for thread_id, rows in by_thread.items():
+        ids = [int(r["id"]) for r in rows]
+        try:
+            thread = await db.get_thread(thread_id)
+            if thread is None:
+                await db.finish_session_wake_events(ids)
+                continue
+            text = _format_officer_wake(rows)
+            agent = await _resolve_live_agent(db, thread)
+            if agent is not None:
+                if await _inject_live(agent, text):
+                    await db.finish_session_wake_events(ids)
+                    delivered += 1
+                else:
+                    await db.release_session_wake_events(
+                        ids, max_attempts=_OFFICER_MAX_ATTEMPTS
+                    )
+                continue
+            # No live agent: durable notice + finish. The officer watchdog
+            # owns getting the pod back; its boot self-wake surfaces this.
+            try:
+                await db.save_thread_message(
+                    thread_id=thread_id, role="event", content=text
+                )
+                await db.finish_session_wake_events(ids)
+            except Exception:
+                await db.release_session_wake_events(
+                    ids, max_attempts=_OFFICER_MAX_ATTEMPTS
+                )
+        except Exception:
+            logger.exception(
+                "officer wake: delivery failed for thread %s", thread_id[:8]
+            )
+            try:
+                await db.release_session_wake_events(
+                    ids, max_attempts=_OFFICER_MAX_ATTEMPTS
+                )
+            except Exception:
+                logger.exception("officer wake: release failed (rows stay claimed)")
+    return delivered

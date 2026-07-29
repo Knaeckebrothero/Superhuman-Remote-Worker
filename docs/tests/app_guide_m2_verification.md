@@ -9,6 +9,15 @@
 > reported. This is not yet live evidence. Independent acceptance is defined in
 > [App Guide M2 live acceptance — tester-agent handoff](app_guide_m2_live_acceptance_handoff.md).
 
+> **Live acceptance attempted (2026-07-28): verdict BLOCKED.** See [App Guide M2
+> live acceptance results 2026-07-28](app_guide_m2_live_acceptance_results_2026-07-28.md).
+> The rollout-control, endpoint-admission, dependency-failure, and rollback
+> gates passed on a local k3d target. The live email matrix, changed-state
+> before-action cell, mixed-deployment cell, and MCP-token admission rows had no
+> available fixtures, and the three-repeat model matrix could not run on the
+> intended release route. The status above therefore stands: M2 is not complete
+> and both defaults remain off.
+
 This record separates offline contract evidence, model behavior, and deployed
 runtime evidence. A green deterministic fixture is not a substitute for a
 real authenticated endpoint, persistent session, or operation.
