@@ -3,7 +3,8 @@ import {FormsModule} from '@angular/forms';
 import {TranslocoPipe} from '@jsverse/transloco';
 import {AppIconComponent} from '../../ui/icon';
 import {AppTooltipDirective} from '../../ui/tooltip';
-import {readConfigPath, resolveMatrixForModel, SettingsMode} from './agent-settings.types';
+import {pinResolvedValue, readConfigPath, resolveMatrixForModel, SettingsMode} from './agent-settings.types';
+import {PinOnInteractDirective} from './pin-on-interact.directive';
 import {reasoningOptionsForModel} from './reasoning-options';
 import {UserService} from '../../core/services/user.service';
 import {ModelService} from '../../core/services/model.service';
@@ -15,7 +16,7 @@ import {ModelService} from '../../core/services/model.service';
 @Component({
   selector: 'app-advanced-accordion',
   standalone: true,
-    imports: [FormsModule, TranslocoPipe, AppIconComponent, AppTooltipDirective],
+    imports: [FormsModule, TranslocoPipe, AppIconComponent, AppTooltipDirective, PinOnInteractDirective],
   template: `
     <div class="advanced-container">
       <!-- Inference Parameters -->
@@ -38,6 +39,7 @@ import {ModelService} from '../../core/services/model.service';
                   <div class="field-control">
                     <select class="form-input"
                       [ngModel]="strategicReasoning() ?? resolvedStrategicReasoning()"
+                  appPinOnInteract (pin)="pinValue(strategicReasoning, resolvedStrategicReasoning())"
                       (ngModelChange)="onStrategicReasoningChange($event)"
                       [disabled]="disabled()">
                       @for (opt of strategicReasoningOptions(); track opt.value) {
@@ -90,6 +92,7 @@ import {ModelService} from '../../core/services/model.service';
                   <div class="field-control">
                     <select class="form-input"
                       [ngModel]="tacticalReasoning() ?? resolvedTacticalReasoning()"
+                  appPinOnInteract (pin)="pinValue(tacticalReasoning, resolvedTacticalReasoning())"
                       (ngModelChange)="onTacticalReasoningChange($event)"
                       [disabled]="disabled()">
                       @for (opt of tacticalReasoningOptions(); track opt.value) {
@@ -387,6 +390,7 @@ import {ModelService} from '../../core/services/model.service';
               <div class="field-control">
                 <select class="form-input"
                   [ngModel]="workspaceBackend() ?? resolvedWorkspaceBackend()"
+                  appPinOnInteract (pin)="pinValue(workspaceBackend, resolvedWorkspaceBackend())"
                   (ngModelChange)="workspaceBackend.set($event); emitChange()"
                   [disabled]="disabled()">
                   <option value="sandbox">{{ 'advanced.options.container' | transloco }}</option>
@@ -483,6 +487,7 @@ import {ModelService} from '../../core/services/model.service';
               <div class="field-control">
                 <select class="form-input"
                   [ngModel]="shellMode() ?? resolvedShellMode()"
+                  appPinOnInteract (pin)="pinValue(shellMode, resolvedShellMode())"
                   (ngModelChange)="shellMode.set($event); emitChange()"
                   [disabled]="disabled() || isLiteBackend()">
                   <option value="stateless">{{ 'advanced.options.stateless' | transloco }}</option>
@@ -522,6 +527,7 @@ import {ModelService} from '../../core/services/model.service';
               <div class="field-control">
                 <select class="form-input"
                   [ngModel]="sudoAction() ?? resolvedSudoAction()"
+                  appPinOnInteract (pin)="pinValue(sudoAction, resolvedSudoAction())"
                   (ngModelChange)="sudoAction.set($event); emitChange()"
                   [disabled]="disabled() || isLiteBackend()">
                   <option value="freeze">{{ 'advanced.options.sudoFreeze' | transloco }}</option>
@@ -1105,6 +1111,14 @@ export class AdvancedAccordionComponent {
   }
 
   emitChange(): void { this.change.emit(); }
+
+  /** Commit a displayed-but-inherited value on deliberate interaction.
+   *  See PinOnInteractDirective — a <select> emits no change event when the
+   *  option already showing is re-picked, so without this the resolved default
+   *  is the one value the form cannot express. */
+  pinValue<T>(target: {(): T | null; set(value: T | null): void}, resolved: T): void {
+    if (pinResolvedValue(target, resolved)) this.emitChange();
+  }
 
   clampTemp(value: number): number {
     return Math.round(Math.min(2, Math.max(0, value)) * 10) / 10;

@@ -1,6 +1,6 @@
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest';
 import {Injector, runInInjectionContext, signal} from '@angular/core';
-import {HttpClient} from '@angular/common/http';
+import {HttpClient, HttpErrorResponse} from '@angular/common/http';
 import {Router} from '@angular/router';
 import {of, throwError} from 'rxjs';
 import {SessionsPageComponent} from './sessions-page.component';
@@ -230,12 +230,20 @@ describe('SessionsPageComponent', () => {
     // =========================================================================
 
     describe('createSession()', () => {
-        it('should navigate to _creating route with create body', async () => {
+        // The dialog creates the thread itself and only then navigates. It used
+        // to hand the body to a `_creating` route and dismiss, so a rejected
+        // config cleared the fields and bounced back with nothing to correct.
+        const postedBody = () => mockHttp.post.mock.calls[0][1];
+
+        it('should POST the create body before navigating', async () => {
             await component.createSession();
 
+            expect(mockHttp.post).toHaveBeenCalledWith(
+                expect.stringContaining('/persistent/threads'),
+                expect.any(Object),
+            );
             expect(mockRouter.navigate).toHaveBeenCalledWith(
-                ['/sessions', '_creating'],
-                expect.objectContaining({state: expect.objectContaining({createBody: expect.any(Object)})})
+                ['/sessions', 'new-thread-123'],
             );
         });
 
@@ -246,10 +254,9 @@ describe('SessionsPageComponent', () => {
 
             await component.createSession();
 
-            const state = mockRouter.navigate.mock.calls[0][1].state;
-            expect(state.createBody.title).toBe('My Session');
-            expect(state.createBody.config_name).toBe('developer');
-            expect(state.createBody.permission_mode).toBe('autonomous');
+            expect(postedBody().title).toBe('My Session');
+            expect(postedBody().config_name).toBe('developer');
+            expect(postedBody().permission_mode).toBe('autonomous');
         });
 
         it('should use "Untitled Session" when title is empty', async () => {
@@ -257,8 +264,7 @@ describe('SessionsPageComponent', () => {
 
             await component.createSession();
 
-            const state = mockRouter.navigate.mock.calls[0][1].state;
-            expect(state.createBody.title).toBe('Untitled Session');
+            expect(postedBody().title).toBe('Untitled Session');
         });
 
         it('should include model when specified', async () => {
@@ -266,8 +272,7 @@ describe('SessionsPageComponent', () => {
 
             await component.createSession();
 
-            const state = mockRouter.navigate.mock.calls[0][1].state;
-            expect(state.createBody.model).toBe('gpt-5.4');
+            expect(postedBody().model).toBe('gpt-5.4');
         });
 
         it('should NOT include model when empty', async () => {
@@ -275,8 +280,7 @@ describe('SessionsPageComponent', () => {
 
             await component.createSession();
 
-            const state = mockRouter.navigate.mock.calls[0][1].state;
-            expect(state.createBody.model).toBeUndefined();
+            expect(postedBody().model).toBeUndefined();
         });
 
         it('should include project_ids when selected', async () => {
@@ -284,17 +288,7 @@ describe('SessionsPageComponent', () => {
 
             await component.createSession();
 
-            const state = mockRouter.navigate.mock.calls[0][1].state;
-            expect(state.createBody.project_ids).toEqual(['proj-1', 'proj-2']);
-        });
-
-        it('should navigate to _creating route', async () => {
-            await component.createSession();
-
-            expect(mockRouter.navigate).toHaveBeenCalledWith(
-                ['/sessions', '_creating'],
-                expect.any(Object)
-            );
+            expect(postedBody().project_ids).toEqual(['proj-1', 'proj-2']);
         });
 
         it('should reset form state after creation', async () => {
@@ -318,10 +312,27 @@ describe('SessionsPageComponent', () => {
             expect(component.creating()).toBe(false);
         });
 
-        it('should not make an HTTP POST (deferred to chat view)', async () => {
+        it('keeps the dialog and its selections when the server rejects the config', async () => {
+            mockHttp.post.mockReturnValueOnce(
+                throwError(() => new HttpErrorResponse({
+                    status: 400,
+                    error: {detail: 'Lite session backends cannot attach repository connectors'},
+                })),
+            );
+            component.newTitle = 'Keep me';
+            component.selectedProjectIds.set(['proj-1']);
+            component.showCreate = true;
+
             await component.createSession();
 
-            expect(mockHttp.post).not.toHaveBeenCalled();
+            expect(component.showCreate).toBe(true);
+            expect(component.newTitle).toBe('Keep me');
+            expect(component.selectedProjectIds()).toEqual(['proj-1']);
+            expect(component.creating()).toBe(false);
+            expect(mockRouter.navigate).not.toHaveBeenCalled();
+            // Surfaced in-dialog (this harness stubs ErrorMessageService to echo
+            // the fallback key; detail extraction is covered in its own spec).
+            expect(component.createError()).toBeTruthy();
         });
     });
 

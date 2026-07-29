@@ -508,6 +508,7 @@
       "permissionAutoAccept": "Auto-accept",
       "permissionAutonomous": "Autonomous",
       "creating": "Creating...",
+      "failed": "The session could not be created. Adjust the settings below and try again.",
       "create": "Create",
       "cancel": "Cancel",
       "expertLabel": "Expert",

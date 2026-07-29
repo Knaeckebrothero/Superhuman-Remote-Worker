@@ -134,11 +134,26 @@ describe('ExecutionGroupComponent live mode', () => {
     });
   });
 
-  it('selecting the resolved narration value clears the pin', () => {
+  // Selecting the resolved value is a choice, not a retraction — it now pins.
+  // Live mode leans on this: PATCHing the value you can see is the only way to
+  // state "keep this one" against an expert edit landing underneath you.
+  it('selecting the resolved narration value pins it', () => {
     const component = createExecutionGroup('live');
     stubInput(component, 'config', {interactive: {narration_mode: 'auto'}});
     component.onNarrationModeChange('silent');
     component.onNarrationModeChange('auto');
+
+    expect(component.narrationMode()).toBe('auto');
+    expect(component.getOverrides()).toEqual({
+      interactive: {narration_mode: 'auto'},
+    });
+  });
+
+  it('resetAll is what clears a pin back to inherit', () => {
+    const component = createExecutionGroup('live');
+    stubInput(component, 'config', {interactive: {narration_mode: 'auto'}});
+    component.onNarrationModeChange('auto');
+    component.resetAll();
 
     expect(component.narrationMode()).toBeNull();
     expect(component.getOverrides()).toEqual({});

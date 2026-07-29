@@ -32,13 +32,35 @@ describe('ExecutionGroupComponent image quality', () => {
     expect(c.getOverrides()['image_quality']).toBe('high');
   });
 
-  it('clears the override when set back to the resolved default', () => {
+  // Choosing a value is intent, even when that value happens to be the one
+  // already resolved. Collapsing it back to "inherit" made the displayed
+  // default the one option the form could not express, and left the user
+  // unable to pin against a later change to the expert/account layer. Only the
+  // reset control clears an override now.
+  it('pins the resolved default when it is explicitly selected', () => {
     const c = createComponent();
     c.onImageQualityChange('economy');
     expect(c.imageQuality()).toBe('economy');
     c.onImageQualityChange('standard'); // equals the resolved default
+    expect(c.imageQuality()).toBe('standard');
+    expect(c.getOverrides()['image_quality']).toBe('standard');
+  });
+
+  it('pins the resolved default when the user interacts without changing it', () => {
+    const c = createComponent();
     expect(c.imageQuality()).toBeNull();
-    expect(c.getOverrides()['image_quality']).toBeUndefined();
+    // What PinOnInteractDirective's (pin) output triggers: a native <select>
+    // fires no change event when the shown option is re-picked.
+    c.pinValue(c.imageQuality, c.resolvedImageQuality());
+    expect(c.imageQuality()).toBe('standard');
+    expect(c.getOverrides()['image_quality']).toBe('standard');
+  });
+
+  it('pinning never overwrites a value the user already chose', () => {
+    const c = createComponent();
+    c.onImageQualityChange('high');
+    c.pinValue(c.imageQuality, c.resolvedImageQuality());
+    expect(c.imageQuality()).toBe('high');
   });
 
   it('counts toward modifiedCount and clears on resetAll', () => {

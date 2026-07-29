@@ -8,6 +8,7 @@ import {AgentSettingsComponent} from '../../views/agent-settings/agent-settings.
 import {resolveEffectiveModels} from '../../views/agent-settings/agent-settings.types';
 import {ModelService} from '../../core/services/model.service';
 import {CapabilitiesService} from '../../core/services/capabilities.service';
+import {ErrorMessageService} from '../../core/services/error-message.service';
 import {SidebarToggleComponent} from '../../shell/sidebar-toggle/sidebar-toggle.component';
 import {TranslocoPipe} from '@jsverse/transloco';
 import {AppButtonComponent} from '../../ui/button';
@@ -178,6 +179,16 @@ interface ExpertDetail extends Expert {
           [gatedCapabilities]="capabilities.grants() ?? null"
         />
 
+        <!-- A rejected config is correctable, so the error lands here and the
+             form keeps every selection instead of unmounting into the chat
+             view and bouncing back to the sessions list. -->
+        @if (createError()) {
+          <div class="create-error" role="alert">
+            <app-icon size="md">error</app-icon>
+            <span>{{ createError() }}</span>
+          </div>
+        }
+
         <!-- Footer -->
         <div class="form-actions">
           <app-button variant="secondary" (clicked)="cancel()" [disabled]="creating()">
@@ -234,6 +245,19 @@ interface ExpertDetail extends Expert {
     app-agent-settings {
       display: block;
     }
+    .create-error {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 10px 14px;
+      margin-top: 16px;
+      border-radius: var(--radius-control);
+      background: var(--danger-tint);
+      border: 1px solid var(--danger-tint);
+      color: var(--danger-color);
+      font-size: 13px;
+    }
+
     .field-hint {
       display: block;
       margin-top: 4px;
@@ -351,12 +375,16 @@ export class SessionCreateComponent implements OnInit {
   private readonly router = inject(Router);
   private readonly userService = inject(UserService);
   private readonly modelService = inject(ModelService);
+  private readonly errorMessages = inject(ErrorMessageService);
   readonly capabilities = inject(CapabilitiesService);
 
   @ViewChild(AgentSettingsComponent) agentSettings!: AgentSettingsComponent;
 
   title = '';
   readonly creating = signal(false);
+  /** Server rejection of the submitted config, rendered in-form so the user
+   *  can correct it without losing the rest of their selections. */
+  readonly createError = signal<string | null>(null);
   readonly projects = signal<Project[]>([]);
   readonly selectedProjectIds = signal<Set<string>>(new Set());
   readonly selectedProjects = computed(() =>
@@ -398,7 +426,15 @@ export class SessionCreateComponent implements OnInit {
     this.modelService.load();
     this.loadExperts();
     this.loadDatasourcesList();
-    this.http.get<ExpertDetail>(`${environment.apiUrl}/experts/session_base?type=session`).subscribe({
+    // account_defaults: the session account layer (notably workspace.backend,
+    // `virtual` by default — NOT session_base's `sandbox`) has to be in the
+    // resolved config the form renders, or controls keyed off it disagree with
+    // what create_thread resolves. That mismatch is what made the datasource
+    // picker offer clone-based repository connectors on a lite tier and 400
+    // every create.
+    this.http.get<ExpertDetail>(
+      `${environment.apiUrl}/experts/session_base?type=session&account_defaults=true`,
+    ).subscribe({
       next: (d) => {
         if (d?.config) {
           this.frameworkDefaults.set(d.config);
@@ -505,7 +541,9 @@ export class SessionCreateComponent implements OnInit {
 
   private fetchExpertDetail(expertId: string): void {
     this.loadingExpert.set(true);
-    this.http.get<ExpertDetail>(`${environment.apiUrl}/experts/${expertId}`).subscribe({
+    this.http.get<ExpertDetail>(
+      `${environment.apiUrl}/experts/${expertId}?account_defaults=true`,
+    ).subscribe({
       next: (detail) => {
         this.expertDetail.set(detail);
         if (detail?.config) this.agentSettings?.prefillFromConfig(detail.config);
@@ -565,8 +603,28 @@ export class SessionCreateComponent implements OnInit {
       body['protected_cloud'] = true;
     }
 
-    // Navigate immediately to chat view with spinner, create thread in background
-    this.router.navigate(['/sessions', '_creating'], {state: {createBody: body}});
+    // Create BEFORE navigating. The form used to hand the body to the chat
+    // route and unmount, so a rejected config destroyed every selection and
+    // dumped the user back on /sessions with nothing to correct. The POST is
+    // fast (tens of ms — it returns as soon as the thread row exists; the slow
+    // part is provisioning, which happens after); paying that here buys a
+    // recoverable failure. On success we route to the real thread id and the
+    // chat view runs its normal connect, showing the setup progress.
+    this.createError.set(null);
+    try {
+      const resp = await firstValueFrom(
+        this.http.post<{thread_id: string}>(
+          `${environment.apiUrl}/persistent/threads`,
+          body,
+        ),
+      );
+      await this.router.navigate(['/sessions', resp.thread_id]);
+    } catch (err) {
+      this.createError.set(
+        this.errorMessages.translate(err, 'sessions.create.failed'),
+      );
+      this.creating.set(false);
+    }
   }
 
   cancel(): void {
