@@ -185,6 +185,11 @@ interface Project {
               <div class="session-meta" (click)="openSession(thread)">
                 <span class="session-id" title="Session ID">{{ thread.id.slice(0, 8) }}</span>
                 <span class="session-config">{{ thread.config_name | titlecase }}</span>
+                @if (officerBadge(thread); as ob) {
+                  <span class="session-officer-badge" [attr.data-kind]="ob">{{
+                    ob === 'centurion' ? 'Centurion' : 'Conference'
+                  }}</span>
+                }
                 <span class="meta-item">{{ thread.total_turns || 0 }} {{ ((thread.total_turns || 0) === 1 ? 'sessions.turnsOne' : 'sessions.turnsMany') | transloco }}</span>
                 <span class="meta-item">{{ thread.last_activity | translocoDate:{dateStyle:'short', timeStyle:'short'} }}</span>
               </div>
@@ -439,6 +444,17 @@ interface Project {
       min-width: 0;
     }
 
+    .session-officer-badge {
+      font-size: 10px;
+      padding: 1px 6px;
+      border-radius: var(--radius-tag);
+      border: 1px solid color-mix(in srgb, var(--accent, #6366f1) 45%, transparent);
+      color: var(--accent, #6366f1);
+      white-space: nowrap;
+    }
+    .session-officer-badge[data-kind='conference'] {
+      border-style: dashed;
+    }
     .session-config {
       font-size: 10px;
       padding: 1px 6px;
@@ -683,6 +699,25 @@ export class SessionsPageComponent implements OnInit {
      * threads it just navigates. No POST to /resume — the user opts in to
      * spinning the agent back up via the resume card or the dedicated icon.
      */
+    /**
+     * 'centurion' for a standing officer thread, 'conference' for his
+     * interactive embodiment, null otherwise (centurion.md S9). Reads the
+     * denormalized officer block from thread metadata; lists that omit
+     * metadata simply show no badge.
+     */
+    officerBadge(thread: Thread): 'centurion' | 'conference' | null {
+        const metadata = thread.metadata as
+            | {config_override?: {officer?: {enabled?: unknown; conference?: unknown}}}
+            | undefined;
+        const officer = metadata?.config_override?.officer;
+        if (!officer) return null;
+        if (officer.enabled === true || officer.enabled === 'true') return 'centurion';
+        if (officer.conference === true || officer.conference === 'true') {
+            return 'conference';
+        }
+        return null;
+    }
+
     openSession(thread: Thread): void {
         this.router.navigate(['/sessions', thread.id]);
     }
