@@ -30,6 +30,18 @@ tags:
 workspace:
   backend: none
 
+# The officer's OWN brain is deliberately NOT pinned here: catalogs differ per
+# deployment (k3d has no codex-proxy), and a model absent from the catalog
+# would brick every officer on that cluster. Set it at provision — the
+# Centurion tab's "Officer's own model" picker, or `model` in the create-thread
+# body — which lands in the thread's config_override.llm.model and outranks
+# every default. The intended brain is the SUBSCRIPTION model via codex-proxy
+# (centurion.md §3, e.g. gpt-5.6-sol): his cadence is ~48 warm-cache wakes/day,
+# a rounding error against measured surplus — and his judgment steers models
+# far stronger than any default. Leaving this unset means the account/base
+# default, which on most clusters is a small local model: fine for smoke
+# tests, wrong for a real command.
+
 # Officer cadence defaults; enabled stays false here (see header). The thread
 # override that provisions an officer flips enabled and may tighten bounds.
 # A slot roster (typed worker allocations) is also set per thread, e.g.
