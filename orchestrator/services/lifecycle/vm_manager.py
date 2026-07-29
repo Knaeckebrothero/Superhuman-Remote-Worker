@@ -505,6 +505,8 @@ class VMInstanceManager:
         """
         if not self._provisioner_available() or self._db is None:
             return 0
+        # Rides the same tick rather than adding a second scheduler.
+        await self.purge_kept_disks()
         try:
             vms = await self._provisioner.list_vms()
         except Exception:
@@ -552,6 +554,61 @@ class VMInstanceManager:
             except Exception:
                 logger.exception("Orphan VM delete failed: %s", entity_id)
         return reaped
+
+    async def purge_kept_disks(self) -> int:
+        """Reclaim rootdisks kept for a recovery that is never coming.
+
+        Layer 2 of the rootdisk GC (docs/features/vm_persistent_rootdisk.md
+        D4). The normal lifecycle is covered by layer 1: a terminal
+        release/delete purges the disk with its VM. This catches the gap —
+        a job that was crash-recovered (disk kept) and then cancelled or
+        failed *without* a live VM, so no delete ever ran and 20 Gi sits
+        there indefinitely.
+
+        **Jobs only, deliberately.** A thread's terminal status is ``ended``,
+        which is also exactly the state a suspended-but-resumable session sits
+        in — a kept disk there is the session's workspace waiting for a resume,
+        not a leak. Session disks are reclaimed by ``release_thread_vm`` on an
+        explicit end.
+
+        The marker is cleared only after a delete the provisioner accepted, so
+        a failed purge stays on the worklist instead of being silently
+        forgotten. A DB error reclaims nothing: unknown is not terminal.
+        """
+        if not self._provisioner_available() or self._db is None:
+            return 0
+        try:
+            async with self._db.acquire() as conn:
+                rows = await conn.fetch(
+                    """
+                    SELECT id::text AS id
+                    FROM jobs
+                    WHERE status = ANY($1::text[])
+                      AND context->'vm'->>'rootdisk' = 'kept'
+                    LIMIT 100
+                    """,
+                    list(_TERMINAL_JOB_STATUSES),
+                )
+        except Exception:
+            logger.exception("Kept-disk sweep: query failed")
+            return 0
+
+        purged = 0
+        for row in rows or []:
+            job_id = row["id"] if isinstance(row, dict) else row.get("id")
+            if not job_id:
+                continue
+            try:
+                # Idempotent: a VM that is already gone 404s, which the
+                # provisioner treats as success, and the disk still goes.
+                if not await self._provisioner.delete_vm(job_id, purge_disk=True):
+                    continue
+                await self._db.merge_vm_context(job_id, {"rootdisk": None})
+                purged += 1
+                logger.info("Kept rootdisk reclaimed for terminal job %s", job_id)
+            except Exception:
+                logger.exception("Kept-disk purge failed for job %s", job_id)
+        return purged
 
     # -------------------------------------------------------------------------
     # Internals

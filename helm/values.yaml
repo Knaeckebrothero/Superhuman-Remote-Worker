@@ -1926,6 +1926,12 @@ vmController:
   # clone is skipped entirely. Off = today's templated (VM-owned) disk.
   persistentRootdisk:
     enabled: false
+    # Orphan backstop for disks whose entity row the orchestrator no longer
+    # knows (a DB reset). OFF by default: the controller has no DB, so it
+    # cannot tell a leaked disk from a long-suspended session's workspace.
+    gc:
+      enabled: false
+      orphanHours: 72
   # -- SSH public key injected into the VM's authorized_keys (cloud-init).
   # The matching private key lives in the chart's vm-ssh-key secret and is
   # mounted into orchestrator/agent pods. Required for HTTP/lifecycle mode

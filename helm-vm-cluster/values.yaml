@@ -120,6 +120,12 @@ vmController:
   # clone is skipped entirely. Off = today's templated (VM-owned) disk.
   persistentRootdisk:
     enabled: false
+    # Orphan backstop for disks whose entity row the orchestrator no longer
+    # knows (a DB reset). OFF by default: the controller has no DB, so it
+    # cannot tell a leaked disk from a long-suspended session's workspace.
+    gc:
+      enabled: false
+      orphanHours: 72
   service:
     port: 8080
   resources:

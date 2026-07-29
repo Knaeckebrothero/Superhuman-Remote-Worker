@@ -73,6 +73,10 @@ spec:
             # Persistent rootdisks (docs/features/vm_persistent_rootdisk.md)
             - name: VM_PERSISTENT_ROOTDISK
               value: {{ .Values.vmController.persistentRootdisk.enabled | default false | quote }}
+            - name: VM_ROOTDISK_GC_ENABLED
+              value: {{ .Values.vmController.persistentRootdisk.gc.enabled | default false | quote }}
+            - name: VM_ROOTDISK_ORPHAN_HOURS
+              value: {{ .Values.vmController.persistentRootdisk.gc.orphanHours | default 72 | quote }}
             - name: HEADSCALE_URL
               valueFrom:
                 configMapKeyRef:

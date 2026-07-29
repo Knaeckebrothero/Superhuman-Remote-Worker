@@ -100,6 +100,18 @@ VM_GOLDEN_GC_MIN_AGE_MINUTES = int(os.environ.get("VM_GOLDEN_GC_MIN_AGE_MINUTES"
 VM_PERSISTENT_ROOTDISK = os.environ.get(
     "VM_PERSISTENT_ROOTDISK", "false"
 ).strip().lower() in ("1", "true", "yes")
+# Orphan backstop for rootdisks whose entity the orchestrator no longer knows
+# (a dev DB reset, a deleted row) — the orchestrator's own kept-disk sweep
+# cannot see those. OFF by default on purpose: the controller has no DB, so it
+# cannot tell a leaked disk from the workspace of a session that has been
+# suspended for a long weekend. Enable it only where sessions are short-lived
+# or capacity is tight.
+VM_ROOTDISK_GC_ENABLED = os.environ.get(
+    "VM_ROOTDISK_GC_ENABLED", "false"
+).strip().lower() in ("1", "true", "yes")
+# Generous: a kept disk is *supposed* to outlive its VM while a recovery is in
+# flight. No VM for this long means nobody is coming back for it.
+VM_ROOTDISK_ORPHAN_HOURS = int(os.environ.get("VM_ROOTDISK_ORPHAN_HOURS", "72"))
 
 # Transport selection: nats | http | both. Defaults to nats so existing
 # deployment-vms/ Fleet bundles keep working without overrides.
@@ -390,6 +402,11 @@ class VMController:
         # one younger than the min age. Fire-and-forget so it can't delay create.
         if VM_GOLDEN_IMAGE_ENABLED and VM_GOLDEN_GC_ENABLED and golden_name:
             asyncio.create_task(self._gc_goldens_safe(image))
+
+        # Same fire-and-forget hook for orphaned rootdisks (opt-in — see
+        # VM_ROOTDISK_GC_ENABLED).
+        if VM_PERSISTENT_ROOTDISK and VM_ROOTDISK_GC_ENABLED:
+            asyncio.create_task(self._gc_rootdisks_safe())
 
         return {
             "job_id": job_id,
@@ -806,6 +823,78 @@ class VMController:
                 raise
             log.info("rootdisk %s already exists — adopting", name)
         return name
+
+    async def _gc_rootdisks_safe(self) -> None:
+        """Non-fatal wrapper around _gc_rootdisks for fire-and-forget scheduling."""
+        try:
+            await self._gc_rootdisks()
+        except Exception:
+            log.exception("rootdisk GC pass failed")
+
+    async def _gc_rootdisks(self) -> None:
+        """Delete orphaned rootdisk DataVolumes — no VirtualMachine, older than
+        VM_ROOTDISK_ORPHAN_HOURS.
+
+        Layer 3 of the rootdisk GC (docs/features/vm_persistent_rootdisk.md D4),
+        and the only layer that can reach a disk whose entity row is gone from
+        the orchestrator's DB entirely.
+
+        Bails without deleting anything if the VM list fails: without it every
+        disk looks orphaned, and this is a destructive sweep.
+        """
+        from kubernetes.client.exceptions import ApiException
+
+        try:
+            resp = await asyncio.to_thread(
+                self.k8s_client.list_namespaced_custom_object,
+                group=CDI_GROUP,
+                version=CDI_VERSION,
+                namespace=VM_NAMESPACE,
+                plural=CDI_PLURAL,
+                label_selector="srw.io/rootdisk",
+            )
+        except ApiException as e:
+            log.debug("rootdisk GC list failed: %s", e)
+            return
+        disks = resp.get("items", [])
+        if not disks:
+            return
+
+        try:
+            vms = await asyncio.to_thread(
+                self.k8s_client.list_namespaced_custom_object,
+                group=KUBEVIRT_GROUP,
+                version=KUBEVIRT_VERSION,
+                namespace=VM_NAMESPACE,
+                plural=KUBEVIRT_PLURAL,
+            )
+        except ApiException as e:
+            log.debug("rootdisk GC VM list failed — skipping GC this pass: %s", e)
+            return
+        live = {
+            (vm.get("metadata") or {}).get("name")
+            for vm in vms.get("items", [])
+            if (vm.get("metadata") or {}).get("name")
+        }
+
+        max_age_minutes = VM_ROOTDISK_ORPHAN_HOURS * 60
+        for dv in disks:
+            name = (dv.get("metadata") or {}).get("name", "")
+            if not name.endswith("-rootdisk"):
+                continue
+            if name[: -len("-rootdisk")] in live:
+                continue  # its VM is back — a recovery in flight
+            if _age_minutes(dv) < max_age_minutes:
+                continue
+            try:
+                await self._delete_dv(name)
+                log.warning(
+                    "rootdisk GC: deleted orphan %s (no VM for >%dh)",
+                    name,
+                    VM_ROOTDISK_ORPHAN_HOURS,
+                )
+            except Exception as e:
+                log.warning("rootdisk GC: delete %s failed: %s", name, e)
 
     async def _gc_goldens_safe(self, image: str) -> None:
         """Non-fatal wrapper around _gc_goldens for fire-and-forget scheduling."""
