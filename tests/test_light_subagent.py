@@ -328,3 +328,93 @@ class TestWallClockDeadline:
             "x", "", tools=[echo_tool], llm=llm, max_iterations=1
         )
         assert out == "partial finding"
+
+
+class _FlakyLLM:
+    """Fake LLM raising scripted errors before returning scripted messages."""
+
+    def __init__(self, outcomes):
+        self._outcomes = list(outcomes)
+        self.call_count = 0
+
+    async def ainvoke(self, messages):
+        self.call_count += 1
+        outcome = self._outcomes.pop(0) if self._outcomes else AIMessage(content="done")
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+
+class _Status(Exception):
+    """Provider error carrying an HTTP status, like the openai/anthropic SDKs."""
+
+    def __init__(self, status_code, message=""):
+        super().__init__(message or f"Error code: {status_code}")
+        self.status_code = status_code
+
+
+class TestReaderLLMRetry:
+    """Readers had NO retry, so one transient blip killed a whole fan-out.
+
+    Both readers of critic job 37c418d2 died on a single 408 stream-disconnect:
+    the parent execute node's classify+retry never covered them, because a light
+    reader is a graph-less in-process harness.
+    docs/issues/llm_retry_and_fallback_reimplemented_per_call_site.md
+    """
+
+    @pytest.mark.asyncio
+    async def test_transient_stream_disconnect_is_retried(self):
+        llm = _FlakyLLM(
+            [
+                _Status(408, "stream error: stream disconnected before completion"),
+                AIMessage(content="the finding"),
+            ]
+        )
+        out = await run_light_subagent("x", "", tools=[], llm=llm, timeout_seconds=30)
+        assert out == "the finding"
+        assert llm.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_permanent_error_is_not_retried(self):
+        # No wait fixes a bad model name; burning the reader's budget is worse
+        # than surfacing it to spawn_subagent's handler immediately.
+        llm = _FlakyLLM([Exception("model gpt-x does not exist")])
+        with pytest.raises(Exception, match="does not exist"):
+            await run_light_subagent("x", "", tools=[], llm=llm, timeout_seconds=30)
+        assert llm.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_wall_clock_timeout_is_never_retried(self):
+        # asyncio.TimeoutError IS the deadline. Retrying it would silently break
+        # the contract that a reader self-terminates before the parent's
+        # delegation batch watchdog discards the whole fan-out.
+        llm = _FlakyLLM([asyncio.TimeoutError(), AIMessage(content="partial result")])
+        out = await run_light_subagent("x", "", tools=[], llm=llm, timeout_seconds=30)
+        # Exactly 2 calls: the timed-out turn, then the forced synthesis. A third
+        # would mean the deadline got retried as if it were a transient blip.
+        assert llm.call_count == 2
+        assert out == "partial result"
+
+    @pytest.mark.asyncio
+    async def test_retry_budget_is_bounded_not_infinite(self):
+        llm = _FlakyLLM([_Status(503), _Status(503), _Status(503)])
+        with pytest.raises(_Status):
+            await run_light_subagent("x", "", tools=[], llm=llm, timeout_seconds=30)
+        assert llm.call_count == 2  # max_attempts=2, then it gives up
+
+
+class TestFailedResultHeader:
+    """A failure used to be announced as '[subagent done]' + an error body."""
+
+    def test_failure_header_says_failed(self):
+        from src.tools.delegation.spawn_subagent import _format_result
+
+        out = _format_result("auditor", "check the thing", "Error: boom", failed=True)
+        assert out.startswith("[subagent failed] — role: auditor")
+        assert "[subagent done]" not in out
+
+    def test_success_header_unchanged(self):
+        from src.tools.delegation.spawn_subagent import _format_result
+
+        out = _format_result("auditor", "check the thing", "the finding")
+        assert out.startswith("[subagent done] — role: auditor")

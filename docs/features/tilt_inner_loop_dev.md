@@ -542,6 +542,52 @@ matching test logs).
    together eat ~15–25 GB. Add a "Cleanup" section to the README
    troubleshooting (`ctlptl delete registry ctlptl-registry`, `docker
    system prune --filter label=app=tilt`).
+9. **A killed `helm upgrade` wedges the whole loop with a stale
+   `pending-upgrade` release.** Symptom: every deploy fails with
+   `Error: UPGRADE FAILED: another operation (install/upgrade/rollback)
+   is in progress`, and **restarting Tilt does not help** — the lock is
+   a release Secret in the cluster, not process state. Helm writes its
+   release Secret as `pending-upgrade` *before* applying and flips it to
+   `deployed` only at the very end, so any interruption in between
+   leaves the lock set forever. Tilt interrupts that window routinely:
+   it kills the apply subprocess when a superseding build arrives, on
+   Ctrl-C, and at the `k8s_upsert_timeout_secs` deadline. Diagnosed
+   2026-07-29, when back-to-back deploys 17 s apart left revision 6
+   pending; the tell was that the live orchestrator was already running
+   revision 6's image (so the apply had fully succeeded) while
+   `srw-garage-bootstrap` still sat there `Completed` despite carrying
+   `hook-delete-policy: hook-succeeded` — Helm deletes succeeded hooks
+   immediately after the hook phase, so its survival pins the death to
+   the gap between "hook done" and "write deployed status". This was the
+   second instance of the same class; the `update_settings(
+   k8s_upsert_timeout_secs=180)` at the top of the Tiltfile was added
+   for the first one (a `pending-install`), and raising a timeout only
+   narrows the window rather than closing it. **Now handled
+   automatically**: `scripts/tilt-helm-apply.sh` replaces the
+   `helm_resource` extension's apply helper with the identical `helm
+   upgrade --install` invocation plus a preflight that drops a stale
+   pending revision's Secret first. The previous revision stays
+   `deployed` and becomes the head again, and `--take-ownership` (always
+   passed) re-adopts whatever the killed run had already applied — so
+   nothing is uninstalled. The preflight only fires once the pending
+   revision has been untouched for `SRW_HELM_STALE_AFTER` seconds
+   (default 60) so it cannot stomp a genuinely running helm; that guard
+   is load-bearing, since a healthy deploy is legitimately
+   `pending-upgrade` for its first few seconds. To clear one by hand:
+   `kubectl -n srw delete secret sh.helm.release.v1.srw.v<N>`.
+10. **`tilt trigger srw` uninstalls the release — it is not a redeploy.**
+    `k8s_custom_deploy` runs `delete_cmd` first on a Force Update, and
+    that is `helm uninstall`. Triggering the resource therefore does a
+    full uninstall + reinstall: the revision counter resets to 1 and
+    every workload restarts. Learned the hard way on 2026-07-29 while
+    recovering from gotcha 9. It is *survivable* by design — PVCs are
+    StatefulSet-managed and the chart's generated-key Secret is
+    `resource-policy: keep`, which `--take-ownership` reclaims so
+    encryption and Garage keys do not rotate (verified: all PVC bind
+    ages and the `srw` Secret's timestamp were preserved, Postgres kept
+    all rows) — but it costs a multi-minute full-stack restart for
+    nothing. To redeploy without uninstalling, touch a watched file and
+    let the normal watch fire, or run the apply script directly.
 
 ## Out of scope (future work)
 

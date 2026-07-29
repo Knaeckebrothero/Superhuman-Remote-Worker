@@ -16,12 +16,14 @@
 # Scope (Slice 1): orchestrator only. Cockpit/agent/mcp follow in later slices.
 # =============================================================================
 
-load('ext://helm_resource', 'helm_resource')
-
 # The full chart's first Helm install can exceed Tilt's 30-second custom-deploy
 # default even on a healthy local k3d cluster. Let Helm finish recording the
 # release instead of killing it after resources have already been applied and
 # leaving a `pending-install` revision behind.
+#
+# This only narrows the window — Tilt still kills the apply on a superseding
+# build or a Ctrl-C, which strands the release the same way. Closing it is
+# scripts/tilt-helm-apply.sh's preflight; see the `srw` resource below.
 update_settings(k8s_upsert_timeout_secs=180)
 
 # -----------------------------------------------------------------------------
@@ -168,8 +170,8 @@ docker_build(
 #   1. file save under src/, config/, agent.py, or requirements.txt
 #   2. docker_build rebuilds srw-agent:tilt-<hash>
 #   3. push to localhost:5005 (k3d pulls via srw-registry:5000)
-#   4. helm_resource re-renders the srw-config ConfigMap with the new
-#      PERSISTENT_AGENT_IMAGE tag
+#   4. the `srw` custom deploy re-renders the srw-config ConfigMap with the
+#      new PERSISTENT_AGENT_IMAGE tag
 #   5. Stakater Reloader (already running in cluster; chart's orchestrator
 #      Deployment carries `reloader.stakater.com/auto: "true"`) detects the
 #      ConfigMap change and rolls the orchestrator
@@ -331,35 +333,60 @@ local(
 #                                            IfNotPresent + prewarm disabled +
 #                                            cockpit envJs mountPath redirect
 #
-# image_keys auto-substitutes the Tilt-built images for all runtime components,
-# including the dynamically-spawned workspace image.
+# The image list below auto-substitutes the Tilt-built images for all runtime
+# components, including the dynamically-spawned workspace image.
+#
+# This is a hand-rolled k8s_custom_deploy rather than the `helm_resource`
+# extension. The extension's apply helper is a plain `helm upgrade --install`,
+# and Tilt kills that subprocess whenever it cancels an in-flight deploy — a
+# superseding build, a Ctrl-C, or the k8s_upsert_timeout_secs deadline above.
+# Helm writes its release secret as `pending-upgrade` before applying and flips
+# it to `deployed` only at the end, so a killed helm wedges every later upgrade
+# with "another operation (install/upgrade/rollback) is in progress" until
+# someone clears the lock by hand — restarting Tilt does not help, because the
+# lock lives in the cluster. scripts/tilt-helm-apply.sh runs the identical helm
+# command with a preflight that clears a stale pending revision first. See
+# docs/features/tilt_inner_loop_dev.md "Risks and known gotchas".
 # -----------------------------------------------------------------------------
-helm_resource(
+# (image name, chart repository key, chart tag key)
+_srw_images = [
+    ('srw-orchestrator', 'image.orchestrator.repository', 'image.orchestrator.tag'),
+    ('srw-cockpit', 'image.cockpit.repository', 'image.cockpit.tag'),
+    ('srw-agent', 'image.agent.repository', 'image.agent.tag'),
+    ('srw-mcp', 'image.mcp.repository', 'image.mcp.tag'),
+    ('srw-workspace', 'image.workspace.repository', 'image.workspace.tag'),
+]
+
+# Tilt fills in TILT_IMAGE_<i> (the freshly built+pushed ref) per image_deps
+# entry; these tell the apply script which chart keys each half maps to.
+_srw_helm_env = {
+    'CHART': './helm',
+    'RELEASE_NAME': 'srw',
+    'NAMESPACE': 'srw',
+    'TILT_IMAGE_COUNT': '%s' % len(_srw_images),
+}
+for i in range(len(_srw_images)):
+    _srw_helm_env['TILT_IMAGE_KEY_REPO_%s' % i] = _srw_images[i][1]
+    _srw_helm_env['TILT_IMAGE_KEY_TAG_%s' % i] = _srw_images[i][2]
+
+k8s_custom_deploy(
     'srw',
-    chart='./helm',
-    namespace='srw',
-    flags=[
-        # A custom-deploy Force Update runs the extension's delete helper first.
-        # The chart-managed Secret is resource-policy=keep; reclaim that same
-        # object on reinstall so generated encryption/Garage keys do not rotate.
+    apply_cmd=[
+        os.path.abspath('scripts/tilt-helm-apply.sh'),
+        # A custom-deploy Force Update (including `tilt trigger srw`) runs
+        # delete_cmd first. The chart-managed Secret is resource-policy=keep;
+        # reclaim that same object on reinstall so generated encryption/Garage
+        # keys do not rotate.
         '--take-ownership',
         '--values=deployment/values-local.yaml',
         '--values=deployment/values-tilt.yaml',
     ],
-    image_deps=[
-        'srw-orchestrator',
-        'srw-cockpit',
-        'srw-agent',
-        'srw-mcp',
-        'srw-workspace',
-    ],
-    image_keys=[
-        ('image.orchestrator.repository', 'image.orchestrator.tag'),
-        ('image.cockpit.repository', 'image.cockpit.tag'),
-        ('image.agent.repository', 'image.agent.tag'),
-        ('image.mcp.repository', 'image.mcp.tag'),
-        ('image.workspace.repository', 'image.workspace.tag'),
-    ],
+    apply_env=_srw_helm_env,
+    delete_cmd=['helm', 'uninstall', '--namespace', 'srw', 'srw'],
+    # Chart/values edits do not trigger a redeploy on their own — same as the
+    # `helm_resource` default this replaced. Image rebuilds drive the loop.
+    deps=[],
+    image_deps=[img[0] for img in _srw_images],
 )
 
 # -----------------------------------------------------------------------------
