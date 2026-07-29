@@ -1192,3 +1192,65 @@ class TestVmSuspendRidesThePersistentRootdisk:
         await svc.restore_thread_workspace("tid-vm")
 
         svc._extract_snapshot.assert_awaited_once()
+
+
+class TestVmJobSuspendRidesThePersistentRootdisk:
+    """The job half of the same dead gate. A VM-backed job's idle suspension
+    refused for exactly the reason a session's did — the capture SSHes from the
+    orchestrator and a VM is only on the tailnet — so VM jobs never suspended
+    either. Kept symmetric with the session path deliberately."""
+
+    def _vm_job(self):
+        return {
+            "id": "job-vm-1",
+            "status": "paused",
+            # No workspace_container: jobs only get that key from
+            # container-provisioning paths, so for a job its absence really
+            # does mean VM tier (unlike threads — see _thread_is_vm_tier).
+            "context": {"vm": {"status": "ready", "ssh_host": "100.64.1.9"}},
+        }
+
+    @pytest.mark.asyncio
+    async def test_suspend_keeps_the_rootdisk(self, monkeypatch):
+        monkeypatch.setenv("VM_PERSISTENT_ROOTDISK", "true")
+        svc, vm_prov = make_vm_service()
+        svc._db.get_job = AsyncMock(return_value=self._vm_job())
+        svc._vm_provisioner.delete_vm = AsyncMock(return_value=True)
+
+        ok = await svc.suspend_workspace("job-vm-1")
+
+        assert ok is True
+        svc._vm_provisioner.delete_vm.assert_awaited_once_with(
+            "job-vm-1", purge_disk=False
+        )
+
+    @pytest.mark.asyncio
+    async def test_unreachable_snapshot_no_longer_blocks_suspend(self, monkeypatch):
+        monkeypatch.setenv("VM_PERSISTENT_ROOTDISK", "true")
+        svc, _ = make_vm_service()
+        svc._db.get_job = AsyncMock(return_value=self._vm_job())
+        svc._vm_provisioner.delete_vm = AsyncMock(return_value=True)
+        svc._snapshot_service.capture_vm_snapshot = AsyncMock(return_value=False)
+
+        assert await svc.suspend_workspace("job-vm-1") is True
+
+    @pytest.mark.asyncio
+    async def test_flag_off_stays_fail_closed(self, monkeypatch):
+        monkeypatch.setenv("VM_PERSISTENT_ROOTDISK", "false")
+        svc, _ = make_vm_service()
+        svc._db.get_job = AsyncMock(return_value=self._vm_job())
+        svc._vm_provisioner.delete_vm = AsyncMock(return_value=True)
+        svc._snapshot_service.capture_vm_snapshot = AsyncMock(return_value=False)
+
+        assert await svc.suspend_workspace("job-vm-1") is False
+        svc._vm_provisioner.delete_vm.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_pod_job_stays_fail_closed(self, monkeypatch):
+        monkeypatch.setenv("VM_PERSISTENT_ROOTDISK", "true")
+        svc, _ = make_vm_service()
+        svc._db.get_job = AsyncMock(return_value=make_job())
+        svc._snapshot_service.capture_vm_snapshot = AsyncMock(return_value=False)
+
+        assert await svc.suspend_workspace(make_job()["id"]) is False
+        svc._container_provisioner.delete_workspace.assert_not_awaited()

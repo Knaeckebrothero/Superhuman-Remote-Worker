@@ -230,18 +230,32 @@ class WorkspaceSuspensionService:
                 ssh_port=int(ssh_port),
                 source_type=source_type,
             )
+            # Same reasoning as the thread path below: with a persistent
+            # rootdisk the disk carries the workspace across the teardown, so a
+            # capture that can never succeed for a VM stops being a
+            # precondition. A pod has no disk to keep and stays fail-closed.
+            disk_survives_teardown = (
+                source_type == "vm" and vm_persistent_rootdisk_enabled()
+            )
+
             if not ok:
-                logger.warning(
-                    "Snapshot capture failed for job %s — keeping workspace alive",
+                if not disk_survives_teardown:
+                    logger.warning(
+                        "Snapshot capture failed for job %s — keeping workspace alive",
+                        job_id,
+                    )
+                    if ws_ctx:
+                        await self._db.merge_workspace_container_context(
+                            job_id, {"status": "ready"}
+                        )
+                    elif vm_ctx:
+                        await self._db.merge_vm_context(job_id, {"status": "ready"})
+                    return False
+                logger.info(
+                    "Snapshot capture unavailable for job %s — suspending anyway; "
+                    "the persistent rootdisk carries the workspace across teardown",
                     job_id,
                 )
-                if ws_ctx:
-                    await self._db.merge_workspace_container_context(
-                        job_id, {"status": "ready"}
-                    )
-                elif vm_ctx:
-                    await self._db.merge_vm_context(job_id, {"status": "ready"})
-                return False
 
             # Tear down based on provisioner type
             suspended_ctx: dict[str, Any] = {
@@ -250,7 +264,11 @@ class WorkspaceSuspensionService:
             }
 
             if vm_ctx and self._vm_provisioner and self._vm_provisioner.is_available:
-                await self._vm_provisioner.delete_vm(job_id)
+                await self._vm_provisioner.delete_vm(
+                    job_id, purge_disk=not disk_survives_teardown
+                )
+                if disk_survives_teardown:
+                    suspended_ctx["rootdisk"] = "kept"
                 await self._db.merge_vm_context(job_id, suspended_ctx)
             else:
                 # K8s container (default)
