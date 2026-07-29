@@ -103,10 +103,16 @@ class NotificationService:
         recipient_email: str | None = None,
         recipient_name: str | None = None,
         sudo_request_id: str | None = None,
+        bypass_quiet_hours: bool = False,
     ) -> dict[str, Any]:
         """Dispatch notification to all enabled channels.
 
-        Respects user channel preferences and quiet hours.
+        Respects user channel preferences and quiet hours —
+        ``bypass_quiet_hours=True`` skips only the quiet-hours queueing
+        (officer *pages*: 'action needed from you NOW' is the one urgency the
+        notify contract lets through at night, centurion.md §6; same doctrine
+        as the bespoke no-quiet-hours system alerts in this module). Channel
+        preferences still apply.
 
         Returns:
             Dict with channel results, e.g.::
@@ -128,7 +134,7 @@ class NotificationService:
         user_settings = await self._get_user_settings(user_id)
 
         # Check quiet hours
-        if self._is_in_quiet_hours(user_settings):
+        if not bypass_quiet_hours and self._is_in_quiet_hours(user_settings):
             # Queue for digest delivery when quiet hours end
             await self._queue_notification(
                 user_id=user_id,

@@ -5374,6 +5374,33 @@ class PostgresDB:
                 max_attempts,
             )
 
+    async def defer_session_wake_events(
+        self, event_ids: List[int], *, fire_at: datetime
+    ) -> None:
+        """Return claimed officer wake rows to pending with a future fire_at.
+
+        Unlike :meth:`release_session_wake_events` this burns no attempts —
+        it is a *deliberate reschedule*, not a delivery failure. Two users:
+        the daily-token-ceiling brake (defer everything to the budget reset)
+        and any future hold-style deferral. The claim query's
+        ``fire_at <= now()`` predicate keeps the rows invisible until then.
+        """
+        if not event_ids:
+            return
+        async with self.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE session_wake_events
+                   SET state = 'pending',
+                       claimed_at = NULL,
+                       fire_at = $2
+                 WHERE id = ANY($1::bigint[])
+                   AND state = 'sending'
+                """,
+                event_ids,
+                fire_at,
+            )
+
     async def gc_session_wake_events(
         self,
         *,
@@ -13337,6 +13364,38 @@ class PostgresDB:
                 f"UPDATE project_loops SET {', '.join(sets)} "
                 f"WHERE id = ${len(params)} RETURNING *",
                 *params,
+            )
+        return self._project_loop_row_to_dict(row) if row else None
+
+    async def convert_project_loop_to_officer(
+        self, loop_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """Flip a live loop to ``scheduling='officer'`` (centurion.md §7/S8).
+
+        ``scheduling`` is deliberately absent from
+        ``_PROJECT_LOOP_UPDATABLE_FIELDS`` — flipping a live loop's mode
+        mid-campaign would orphan the campaign cursor. This dedicated method
+        is the ONE sanctioned writer, and it carries its guards in the WHERE
+        clause so a raced campaign start can't slip between check and write:
+        active (running|paused) row, no in-flight campaign, not already
+        officer. Returns the updated row, or None when a guard failed (the
+        caller re-reads to produce a specific error).
+
+        An in-flight TURN is fine — on completion the advance hook hits the
+        officer branch, which clears the pointers and wakes the officer.
+        """
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                UPDATE project_loops
+                SET scheduling = 'officer', updated_at = now()
+                WHERE id = $1
+                  AND status IN ('running', 'paused')
+                  AND scheduling <> 'officer'
+                  AND campaign IS NULL
+                RETURNING *
+                """,
+                UUID(loop_id),
             )
         return self._project_loop_row_to_dict(row) if row else None
 

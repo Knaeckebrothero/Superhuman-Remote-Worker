@@ -165,6 +165,7 @@ from services.session_wake import (  # noqa: E402
     kick_event_drain as _kick_officer_event_drain,
     maybe_wake_session,
     notify_all_officers,
+    notify_officer,
     session_wake_sweeper_loop,
 )
 from services.stale_verification_sweeper import (  # noqa: E402
@@ -14230,6 +14231,47 @@ async def _advance_loop_member(
         else None
     )
 
+    if (loop.get("scheduling") or "standard") == "officer":
+        # Officer-scheduled century (centurion.md §7): judgment replaces the
+        # mechanical advance. The per-member merge/retro and user-question
+        # notify above already ran; from here the standard path would
+        # decrement iterations, evaluate stop reasons, park on cooldown and
+        # rotate — all skipped: the officer decides what runs next from
+        # backlog + sitrep + charter. The barrier claim above makes this
+        # exactly-once per turn; empty stage pointers are the officer loop's
+        # steady state (the sweeper's heal skips officer loops for the same
+        # reason). The completed job itself already woke the officer via
+        # maybe_wake_session's officer leg — this event marks the TURN
+        # concluding, and the drain coalesces both into one sitrep.
+        await postgres_db.update_project_loop(
+            loop_id,
+            consecutive_failures=consecutive,
+            last_error=last_error,
+            current_job_id=None,
+            current_stage_jobs=[],
+        )
+        await notify_officer(
+            postgres_db,
+            str(loop.get("project_id") or (ctx or {}).get("project_id") or ""),
+            source="loop",
+            dedup_key=f"{loop_id[:8]}:{int(loop.get('seq_index') or 0)}",
+            payload={
+                "loop_id": loop_id,
+                "turn_all_failed": all_failed,
+                "consecutive_failures": consecutive,
+                "note": (
+                    "loop turn concluded — scheduling='officer': the next "
+                    "dispatch is yours (nothing was auto-created)"
+                ),
+            },
+        )
+        _kick_officer_event_drain(postgres_db)
+        actions.append(
+            f"project loop {str(loop_id)[:8]} turn concluded — "
+            f"officer-scheduled, no auto-advance"
+        )
+        return
+
     remaining = loop.get("remaining_iterations")
     next_remaining = (remaining - 1) if remaining is not None else None
 
@@ -20485,6 +20527,9 @@ async def _dispatch_officer_page(
         thread_id=thread_id,
         recipient_email=user.get("email"),
         recipient_name=user.get("display_name") or "Legatus",
+        # A page is the one urgency that crosses quiet hours (centurion.md
+        # §6): it is budgeted, and everything digest-worthy already waits.
+        bypass_quiet_hours=True,
     )
     return not results.get("error")
 
