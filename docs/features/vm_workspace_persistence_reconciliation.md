@@ -23,8 +23,8 @@ implemented (`vm_persistent_rootdisk.md` Phases 0-2 + the session extension,
 flag-gated OFF, live gate owed). Recommendation 2 remains unbuilt and is now
 correctly off the critical path.
 
-Recommendation 3's networking probe is **still owed**, but it no longer blocks
-anything: it scopes the delegated-capture slice, which is no longer urgent.
+Recommendation 3's networking probe is **DONE — and it resolves in favour of
+the design's own architecture.** See "Networking probe: answered" below.
 
 ## The two designs
 
@@ -115,12 +115,28 @@ controller-side path the design already specifies needs neither.
 
 **3. Verify one networking assumption before either.**
 
-VMIs carry pod IPs on the VM cluster's pod network (e.g. `10.42.225.80`) and the
-controller runs in that same cluster. If KubeVirt's masquerade binding forwards
-port 22, the controller can capture over the pod network with **no tailnet
-involvement at all** — which is what "tar + upload from agent node" assumes. If
-it cannot, delegated capture needs the controller on the tailnet, which is a
-different size of job. One `kubectl exec` from the controller pod settles it.
+VMIs carry pod IPs on the VM cluster's pod network and the controller runs in
+that same cluster. If KubeVirt's masquerade binding forwards port 22, the
+controller can capture over the pod network with **no tailnet involvement at
+all** — which is what "tar + upload from agent node" assumes. If it cannot,
+delegated capture needs the controller on the tailnet, which is a different size
+of job.
+
+### Networking probe: ANSWERED 2026-07-29 — it can
+
+From inside the running vm-controller pod on the dev VM cluster, against a live
+VMI's pod IP:
+
+```
+10.42.225.106:22 REACHABLE  banner=b'SSH-2.0-OpenSSH_9.6p1 Ubuntu-3ubuntu13.1'
+```
+
+KubeVirt's masquerade binding does forward port 22, and the controller reaches
+it directly. **Delegated capture needs no tailnet and no orchestrator
+involvement** — it is a contained change inside the VM cluster, exactly as
+`vm_snapshots_and_ide.md` assumed when it wrote "tar + upload from agent node".
+That removes the one thing that could have made the delegated-capture slice
+expensive.
 
 ## What to do with the docs
 
@@ -170,3 +186,37 @@ reverse order is harmless.
 3. Cancel it → VM, DV and PVC all gone; the golden is untouched.
 4. Flip the orchestrator flag; suspend a VM session and resume it — the VM is
    deleted, the DV is not, and the workspace comes back with no S3 extract.
+
+## Live-gate run log
+
+**2026-07-29, attempt 1 — controller flag on, FAILED at step 1, rolled back.**
+
+Flipping `vmController.persistentRootdisk.enabled: true` on the dev vm-cluster
+(`f4fd08e2`) broke every VM create at the CDI admission webhook:
+
+```
+DataVolume "agent-vm-a43bfb73-...-rootdisk" is invalid:
+  spec.source.pvc.namespace: Required value
+```
+
+A **templated** DataVolume may omit `spec.source.pvc.namespace` — CDI defaults
+it from the owning VM. A **standalone** one may not. `_apply_clone_source`
+omits it deliberately (same namespace → no cross-namespace clone RBAC) and that
+reasoning still holds; the value simply has to be *stated* once the disk is
+lifted out of the VM. Fixed in `daec8704`, normalised in `_ensure_rootdisk` so
+the templated path stays byte-identical with the flag off.
+
+**Why no unit test caught it, and what was done instead.** The controller's k8s
+client is a `MagicMock` that accepts any body, so manifest *shape* is only ever
+validated by a real API server. 149 controller tests passed against an invalid
+manifest. `TestRootdiskCloneSourceNamespace` now pins the shape the API demands
+— the next best thing to an integration test, and the general lesson for
+anything else built against this mock.
+
+**The flag was rolled back rather than left on while CI built** (`61ce7dbe`): a
+real `developer` job was processing on a VM at the time, and a crash recovery in
+that window would have tried to create a VM, hit the 422, and failed live work.
+The dispatcher itself behaved correctly — it treats a 422 as fatal and fails the
+job fast instead of looping (`Dispatcher: job ... VM parked ... — failing job`).
+
+Cost of the window: one throwaway probe job. Nothing else affected.
