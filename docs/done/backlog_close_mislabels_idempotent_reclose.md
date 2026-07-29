@@ -12,6 +12,28 @@ related:
 
 # Re-closing an already-closed backlog ticket logs a wrong cause and a false "mirror did not land"
 
+**Status:** FIXED 2026-07-29 — committed on `develop` in `2362d2ce`.
+**Not pushed and not deployed** (the owner pushes). `_rewrite_status` now
+returns `(markdown, outcome)` naming the branch it took, so the guard can tell
+the three byte-identical returns apart: `_ALREADY_SET` (a well-formed line
+already at the target) logs at debug, skips the Gitea write, and returns True;
+`_NOT_REWRITABLE` (no frontmatter, or no closing `---`) keeps the existing
+warning and False. `main.py`'s caller warning is unchanged and still reads
+correctly for the two cases that now reach it.
+**Verification:** unit level only, which is the whole of this change — three
+tests, one per outcome, in `tests/test_project_backlog.py::
+TestCloseBacklogTicket`, each assertion proved non-vacuous by inversion, plus
+two behavioural mutations: folding case 3 back into the no-op branch (the
+pre-fix behaviour) fails the two re-close tests while the unterminated-
+frontmatter test stays green, and folding case 2 into case 3 fails only that
+test. Nothing to smoke on k3d beyond this — the fix moves one log line and one
+bool. At the deployed INFO level a successful re-close is now simply quiet,
+which is what this issue asked for; the debug line is there for anyone who
+turns it up.
+**Severity:** low — logging-only, no state consequence (see below).
+**Component:** `orchestrator/services/project_backlog.py` (`_rewrite_status`,
+`close_backlog_ticket`).
+
 **Filed:** 2026-07-28, from the final re-review of the project-backlog pipeline.
 Line numbers are develop @ 2026-07-28. Logging-only — **no state consequence.**
 

@@ -1324,7 +1324,7 @@ class TestCloseBacklogTicket:
         block to rewrite it inside, so this stays a genuine no-op: warn, no
         write, False. Only the missing-frontmatter case was covered before,
         which is how these three came to be conflated
-        (docs/issues/backlog_close_mislabels_idempotent_reclose.md)."""
+        (docs/done/backlog_close_mislabels_idempotent_reclose.md)."""
         import logging
         from unittest.mock import AsyncMock, MagicMock
 
