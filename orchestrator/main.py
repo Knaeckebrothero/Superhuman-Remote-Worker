@@ -157,6 +157,8 @@ from routers import project_loops_router  # noqa: E402
 from routers import product_capabilities_router  # noqa: E402
 from routers import shared_browser_router  # noqa: E402
 from routers.sessions import router as sessions_router  # noqa: E402
+from routers.contacts import project_router as contacts_project_router  # noqa: E402
+from routers.contacts import router as contacts_router  # noqa: E402
 from services.cron_dispatcher import cron_dispatcher_loop  # noqa: E402
 from services.project_loop_sweeper import project_loop_sweeper_loop  # noqa: E402
 from services.session_wake import (  # noqa: E402
@@ -8136,6 +8138,8 @@ app.include_router(project_loops_router)
 app.include_router(product_capabilities_router)
 app.include_router(shared_browser_router)
 app.include_router(sessions_router)
+app.include_router(contacts_router)
+app.include_router(contacts_project_router)
 
 
 @app.get("/api/tables")
