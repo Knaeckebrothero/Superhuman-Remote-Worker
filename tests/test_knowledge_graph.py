@@ -56,7 +56,7 @@ class TestConstants:
     """Tests for module-level constant sets."""
 
     def test_note_types_count(self):
-        assert len(NOTE_TYPES) == 13
+        assert len(NOTE_TYPES) == 15
 
     def test_note_types_members(self):
         expected = {
@@ -73,6 +73,9 @@ class TestConstants:
             "feature",
             "issue",
             "idea",
+            # Officer types (centurion.md §5, vector/0015)
+            "charter",
+            "report",
         }
         assert NOTE_TYPES == expected
 
