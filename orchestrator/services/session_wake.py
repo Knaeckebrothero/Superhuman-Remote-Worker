@@ -796,6 +796,106 @@ def _officer_job_dedup_key(job_id: Any, status: Any) -> str:
     return f"{str(job_id)[:8]}:{status}"
 
 
+def _officer_daily_ceiling(thread: dict[str, Any]) -> int:
+    """The thread's ``officer.daily_token_ceiling`` (0 = disabled)."""
+    metadata = _as_dict(thread.get("metadata"))
+    officer = _as_dict(_as_dict(metadata.get("config_override")).get("officer"))
+    try:
+        return max(0, int(officer.get("daily_token_ceiling") or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _next_utc_midnight(now: datetime) -> datetime:
+    return (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+
+
+async def _officer_ceiling_deferral(
+    db: Any, thread: dict[str, Any], *, usage_ledger: Any = None
+) -> Optional[datetime]:
+    """Daily-token-ceiling brake (centurion.md §4, the third loop-guard layer).
+
+    Returns the UTC budget reset to defer the officer's autonomous wakes to
+    when today's session tokens (``usage_events`` rows with
+    ``ref_id=thread_id``, materialized from the audit DB) have reached
+    ``officer.daily_token_ceiling`` — or None to deliver normally.
+
+    Fail-OPEN on every error: metering being down must never brick wakes.
+    The brake only touches the drain — direct Legatus input bypasses it, so
+    a ceilinged officer still answers his commander immediately. The ledger
+    lags live usage by one materializer poll, which is fine for a daily cap.
+    """
+    ceiling = _officer_daily_ceiling(thread)
+    if ceiling <= 0:
+        return None
+    try:
+        if usage_ledger is None:
+            import main as orchestrator_main
+
+            usage_ledger = getattr(orchestrator_main, "usage_ledger", None)
+        if usage_ledger is None or not getattr(usage_ledger, "is_available", False):
+            return None
+        now = datetime.now(timezone.utc)
+        day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        usage = await usage_ledger.query_usage(
+            from_ts=day_start, to_ts=now, ref_id=str(thread["id"])
+        )
+        tokens = sum(
+            item.get("quantity") or 0
+            for item in usage.get("by_category") or []
+            if item.get("unit") == "tokens"
+        )
+        if tokens >= ceiling:
+            return _next_utc_midnight(now)
+    except Exception:
+        logger.warning("officer wake: ceiling check failed (fail-open)", exc_info=True)
+    return None
+
+
+async def _note_ceiling_breach(
+    db: Any, thread_id: str, thread: dict[str, Any], deferred_to: datetime
+) -> None:
+    """One day-stamped digest entry when the ceiling brake engages.
+
+    The notify contract's 'force-sleep + digest notice': the Legatus learns
+    the officer went quiet from the digest, not from silence. Idempotent per
+    UTC day via ``officer_state.ceiling_notice``.
+    """
+    try:
+        state = _as_dict(_as_dict(thread.get("metadata")).get("officer_state"))
+        today = datetime.now(timezone.utc).date().isoformat()
+        if state.get("ceiling_notice") == today:
+            return
+        digest = state.get("digest") or []
+        if not isinstance(digest, list):
+            digest = []
+        digest = (
+            digest
+            + [
+                {
+                    "at": datetime.now(timezone.utc).isoformat(),
+                    "subject": "Daily token ceiling reached",
+                    "message": (
+                        "The officer's daily token ceiling was reached; his "
+                        "autonomous wakes are deferred until "
+                        f"{deferred_to.strftime('%Y-%m-%d %H:%M UTC')}. Your "
+                        "messages still reach him immediately."
+                    ),
+                }
+            ]
+        )[-50:]
+        await db.merge_thread_officer_state(
+            thread_id, {"digest": digest, "ceiling_notice": today}
+        )
+        logger.warning(
+            "officer %s: daily token ceiling reached — wakes deferred to %s",
+            thread_id[:8],
+            deferred_to.isoformat(),
+        )
+    except Exception:
+        logger.exception("officer wake: ceiling notice failed (non-fatal)")
+
+
 async def _notify_project_officer_of_job(db: Any, job_id: str, status: str) -> bool:
     """Enqueue an officer wake for a job transition, by project. Never raises."""
     try:
@@ -995,6 +1095,15 @@ async def drain_pending_event_wakes(
             thread = await db.get_thread(thread_id)
             if thread is None:
                 await db.finish_session_wake_events(ids)
+                continue
+            # Daily-token-ceiling brake: defer (not release — no attempts
+            # burned) everything to the UTC budget reset and note it once in
+            # the digest. Timers ride along, so the watchdog sees a pending
+            # timer and files nothing new.
+            deferred_to = await _officer_ceiling_deferral(db, thread)
+            if deferred_to is not None:
+                await db.defer_session_wake_events(ids, fire_at=deferred_to)
+                await _note_ceiling_breach(db, thread_id, thread, deferred_to)
                 continue
             # Full computed-delta sitrep (services/sitrep.py); the minimal
             # reason-list renderer is the fallback so a formatter failure can

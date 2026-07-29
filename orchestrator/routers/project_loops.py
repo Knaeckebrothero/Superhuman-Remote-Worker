@@ -61,10 +61,14 @@ class ProjectLoopStart(BaseModel):
     # Blank/None = default sandbox; "vm" gives every role a root VM.
     workspace_backend: str | None = Field(None, max_length=20)
     # Scheduling mode: 'standard' (default — the role_sequence stage list,
-    # one stage per turn) or 'campaign' (the checkpoint critic may expand the
-    # execution slot into a multi-stage campaign via a filed plan). Start-time
-    # only. docs/features/loop_unified_engine.md.
-    scheduling: str = Field("standard", pattern="^(standard|campaign)$")
+    # one stage per turn), 'campaign' (the checkpoint critic may expand the
+    # execution slot into a multi-stage campaign via a filed plan), or
+    # 'officer' (centurion.md §7 — no mechanical advance: each concluded turn
+    # wakes the project's centurion, who decides what runs next; requires an
+    # enabled officer thread; role_sequence and iteration budgets are ignored).
+    # Start-time only; a live loop converts via POST .../loop/scheduling.
+    # docs/features/loop_unified_engine.md.
+    scheduling: str = Field("standard", pattern="^(standard|campaign|officer)$")
     # Optional per-loop campaign guardrail overrides ({max_stages,
     # max_extensions, abort_failures}); values above the config hard ceilings
     # are rejected, not clamped — fail loud at start.
@@ -91,8 +95,15 @@ async def start_project_loop(
     caller = await require_approved_user(request, postgres_db)
     await require_project_member(request, postgres_db, project_id, min_role="editor")
 
-    # Budget: at least one stop axis must be set (hard floor under runaway).
-    if body.max_iterations is None and body.run_until is None:
+    # Budget: at least one stop axis must be set (hard floor under runaway) —
+    # except officer scheduling, which is naturally unbounded: the centurion
+    # and his budgets are the brake, not an iteration count (0075 relaxes the
+    # DB CHECK the same way).
+    if (
+        body.scheduling != "officer"
+        and body.max_iterations is None
+        and body.run_until is None
+    ):
         raise HTTPException(
             status_code=400,
             detail="Set max_iterations and/or run_until — a loop cannot be "
@@ -159,6 +170,18 @@ async def start_project_loop(
 
         await _check_vm_permission(caller, job_needs_vm=True)
 
+    # Officer scheduling needs someone to wake: an enabled centurion thread
+    # on the project. Fail loud at start — an officer loop with no officer
+    # would conclude turns into a void.
+    if body.scheduling == "officer":
+        officer = await postgres_db.get_officer_thread_for_project(project_id)
+        if not officer:
+            raise HTTPException(
+                status_code=400,
+                detail="scheduling='officer' requires an enabled centurion on "
+                "this project — provision one first.",
+            )
+
     if await postgres_db.get_active_project_loop(project_id):
         raise HTTPException(
             status_code=409,
@@ -185,6 +208,28 @@ async def start_project_loop(
         scheduling=body.scheduling,
         campaign_caps=campaign_caps,
     )
+
+    if body.scheduling == "officer":
+        # No first spawn: empty stage pointers are the officer loop's steady
+        # state. Wake the centurion instead — the loop now exists and every
+        # dispatch is his call.
+        from services.session_wake import kick_event_drain, notify_officer
+
+        await notify_officer(
+            postgres_db,
+            project_id,
+            source="loop",
+            dedup_key=f"started:{str(loop['id'])[:8]}",
+            payload={
+                "loop_id": str(loop["id"]),
+                "note": (
+                    "officer-scheduled loop started — nothing was spawned; "
+                    "dispatch from the backlog when ready"
+                ),
+            },
+        )
+        kick_event_drain(postgres_db)
+        return loop
 
     # Spawn the first stage (1 job for a single-role entry, N concurrent jobs
     # for a fan-out) and point the loop at it. If the spawn fails, mark the loop
@@ -272,6 +317,79 @@ async def resume_project_loop(request: Request, project_id: str) -> dict[str, An
         return loop
     resumed = await _resume_project_loop(str(loop["id"]))
     return resumed or loop
+
+
+class ProjectLoopScheduling(BaseModel):
+    """Body for ``POST /api/projects/{project_id}/loop/scheduling``."""
+
+    scheduling: str = Field(..., pattern="^officer$")
+
+
+@router.post("/{project_id}/loop/scheduling")
+async def convert_project_loop_scheduling(
+    request: Request, project_id: str, body: ProjectLoopScheduling
+) -> dict[str, Any]:
+    """Convert the live loop to officer scheduling (centurion.md §7/S8).
+
+    ``scheduling`` is start-time-only everywhere else; this is the one
+    sanctioned mutation, and v1 converts in ONE direction (→ officer) — going
+    back means stopping the loop and starting a fresh standard one, which
+    re-establishes an iteration budget. Guards (atomic, in the UPDATE's WHERE
+    via ``convert_project_loop_to_officer``): active loop, no in-flight
+    campaign (flipping mid-campaign orphans the campaign cursor), not already
+    officer; plus an enabled centurion on the project. An in-flight TURN is
+    fine — its completion hits the officer branch and wakes him.
+    """
+    from main import postgres_db  # late import: avoid circular
+    from services.session_wake import kick_event_drain, notify_officer
+
+    await require_approved_user(request, postgres_db)
+    await require_project_member(request, postgres_db, project_id, min_role="editor")
+
+    officer = await postgres_db.get_officer_thread_for_project(project_id)
+    if not officer:
+        raise HTTPException(
+            status_code=400,
+            detail="scheduling='officer' requires an enabled centurion on "
+            "this project — provision one first.",
+        )
+
+    loop = await postgres_db.get_active_project_loop(project_id)
+    if not loop:
+        raise HTTPException(status_code=404, detail="No active loop for this project")
+
+    updated = await postgres_db.convert_project_loop_to_officer(str(loop["id"]))
+    if not updated:
+        # The guarded UPDATE matched nothing — re-read for a specific reason.
+        current = await postgres_db.get_project_loop(str(loop["id"])) or loop
+        if (current.get("scheduling") or "standard") == "officer":
+            return current  # idempotent: already converted
+        if current.get("campaign"):
+            raise HTTPException(
+                status_code=409,
+                detail="Loop has an in-flight campaign — let it conclude (or "
+                "stop the loop) before converting to officer scheduling.",
+            )
+        raise HTTPException(
+            status_code=409,
+            detail="Loop is not in a convertible state (must be running or paused).",
+        )
+
+    await notify_officer(
+        postgres_db,
+        project_id,
+        source="loop",
+        dedup_key=f"converted:{str(loop['id'])[:8]}",
+        payload={
+            "loop_id": str(loop["id"]),
+            "note": (
+                "loop converted to officer scheduling — no further "
+                "auto-advance; dispatch is yours from the next concluded turn"
+            ),
+        },
+    )
+    kick_event_drain(postgres_db)
+    return updated
 
 
 @router.post("/{project_id}/loop/stop")

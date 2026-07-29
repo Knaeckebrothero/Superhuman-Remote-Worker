@@ -131,6 +131,17 @@ async def _sweep_tick(db: Any, advance_fn: AdvanceFn) -> int:
             recovered += await _sweep_stage(db, loop, stage_ids, advance_fn)
             continue
 
+        if (loop.get("scheduling") or "standard") == "officer":
+            # Officer-scheduled century (centurion.md §7): empty pointers are
+            # the STEADY STATE, not a torn advance. The heal below would
+            # restore an all-terminal stage, the barrier would re-fire, and
+            # the officer would be duplicate-woken every tick, forever. The
+            # stage-sweep above still applies while a turn is genuinely in
+            # flight (missed hook → advance → officer branch, exactly-once
+            # by the barrier); everything after this line is mechanical
+            # advance recovery, which officer loops don't have.
+            continue
+
         cur = loop.get("current_job_id")
         if cur:
             # Transitional (a pre-0063 writer raced the deploy): a width-1
