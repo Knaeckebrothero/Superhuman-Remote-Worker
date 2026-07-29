@@ -82,9 +82,11 @@ sys.modules.setdefault("nats", _mock_nats)
 # NOW import the controller — the mocked modules make this succeed
 # ---------------------------------------------------------------------------
 from vm.controller.controller import (  # noqa: E402
+    CDI_PLURAL,
     KUBEVIRT_GROUP,
     KUBEVIRT_PLURAL,
     KUBEVIRT_VERSION,
+    VM_NAMESPACE,
     VMController,
 )
 
@@ -836,7 +838,11 @@ class TestHandleDelete:
         msg = make_nats_msg({"job_id": job_id})
         await controller.handle_delete(msg)
 
-        kw = controller.k8s_client.delete_namespaced_custom_object.call_args[1]
+        # A terminal delete now touches two resources (VM, then the rootdisk
+        # DataVolume) — pick out the VM call.
+        kw = _calls_for(
+            controller.k8s_client.delete_namespaced_custom_object, KUBEVIRT_PLURAL
+        )[0].kwargs
         assert kw["name"] == f"agent-vm-{job_id}"
         assert kw["group"] == "kubevirt.io"
         assert kw["version"] == "v1"
@@ -864,7 +870,15 @@ class TestHandleDelete:
         await controller_no_headscale.handle_delete(msg)
 
         controller_no_headscale.headscale.delete_node.assert_not_awaited()
-        controller_no_headscale.k8s_client.delete_namespaced_custom_object.assert_called_once()
+        assert (
+            len(
+                _calls_for(
+                    controller_no_headscale.k8s_client.delete_namespaced_custom_object,
+                    KUBEVIRT_PLURAL,
+                )
+            )
+            == 1
+        )
 
     @pytest.mark.asyncio
     async def test_delete_vm_already_gone_404(self, controller):
@@ -947,7 +961,9 @@ class TestHandleDelete:
         msg = make_nats_msg({"job_id": "hs-fail-ok"})
         await controller.handle_delete(msg)
 
-        controller.k8s_client.delete_namespaced_custom_object.assert_called_once()
+        assert _calls_for(
+            controller.k8s_client.delete_namespaced_custom_object, KUBEVIRT_PLURAL
+        )
         payload = json.loads(controller.nc.publish.call_args[0][1].decode())
         assert payload["status"] == "deleted"
 
@@ -958,7 +974,9 @@ class TestHandleDelete:
         msg = make_nats_msg({"job_id": job_id})
         await controller.handle_delete(msg)
 
-        kw = controller.k8s_client.delete_namespaced_custom_object.call_args[1]
+        kw = _calls_for(
+            controller.k8s_client.delete_namespaced_custom_object, KUBEVIRT_PLURAL
+        )[0].kwargs
         assert kw["name"] == f"agent-vm-{job_id}"
 
 
@@ -1677,7 +1695,16 @@ class TestEdgeCases:
         await controller.handle_delete(make_nats_msg({"job_id": job_id}))
 
         controller.k8s_client.create_namespaced_custom_object.assert_called_once()
-        controller.k8s_client.delete_namespaced_custom_object.assert_called_once()
+        # VM object once; the second delete call is the rootdisk purge.
+        assert (
+            len(
+                _calls_for(
+                    controller.k8s_client.delete_namespaced_custom_object,
+                    KUBEVIRT_PLURAL,
+                )
+            )
+            == 1
+        )
 
         # Last status should be "deleted"
         last_payload = json.loads(controller.nc.publish.call_args[0][1].decode())
@@ -2149,3 +2176,319 @@ class TestDoCreateGoldenIntegration:
         src = body["spec"]["dataVolumeTemplates"][0]["spec"]["source"]
         assert "registry" in src
         assert "pvc" not in src
+
+
+# =============================================================================
+# Tests: persistent rootdisk — Phase 0
+# (docs/features/vm_persistent_rootdisk.md D1 + D2's controller half)
+# =============================================================================
+
+from vm.controller.controller import _rootdisk_name  # noqa: E402
+
+
+def _calls_for(mock, plural: str) -> list:
+    """Filter a k8s CustomObjectsApi mock's calls down to one resource kind.
+
+    ``k8s_client`` is one MagicMock serving both VirtualMachines and
+    DataVolumes, so every assertion has to say which it means.
+    """
+    return [c for c in mock.call_args_list if c.kwargs.get("plural") == plural]
+
+
+def _dv_create_body(controller) -> dict:
+    calls = _calls_for(
+        controller.k8s_client.create_namespaced_custom_object, CDI_PLURAL
+    )
+    assert calls, "no DataVolume was created"
+    return calls[-1].kwargs["body"]
+
+
+def _vm_create_body(controller) -> dict:
+    calls = _calls_for(
+        controller.k8s_client.create_namespaced_custom_object, KUBEVIRT_PLURAL
+    )
+    assert calls, "no VirtualMachine was created"
+    return calls[-1].kwargs["body"]
+
+
+def _dv_phase(phase: str | None):
+    """side_effect for get_namespaced_custom_object: one DV in ``phase``.
+
+    ``None`` means 404 (absent).
+    """
+
+    def _get(**kwargs):
+        if phase is None:
+            raise _FakeApiException(status=404)
+        return {"metadata": {"name": kwargs.get("name")}, "status": {"phase": phase}}
+
+    return _get
+
+
+class TestRootdiskName:
+    """The standalone DV keeps the exact name the VM template already uses,
+    so ``volumes[].dataVolume.name`` needs no change."""
+
+    def test_matches_template_name(self):
+        assert _rootdisk_name("abc-123") == "agent-vm-abc-123-rootdisk"
+
+    def test_is_entity_agnostic(self):
+        # The controller never learns whether an id is a job or a thread; VM
+        # names are agent-vm-<id> for both, so rootdisks are too.
+        assert _rootdisk_name("thread-uuid") == "agent-vm-thread-uuid-rootdisk"
+
+
+class TestPersistentRootdiskDisabled:
+    """Flag OFF → today's rendering, byte-identical. No DV, no extra calls."""
+
+    @pytest.mark.asyncio
+    async def test_manifest_keeps_data_volume_templates(self, controller):
+        with patch("vm.controller.controller.VM_PERSISTENT_ROOTDISK", False):
+            await controller._do_create(SAMPLE_JOB_CONFIG)
+        body = _vm_create_body(controller)
+        assert "dataVolumeTemplates" in body["spec"]
+        assert not _calls_for(
+            controller.k8s_client.create_namespaced_custom_object, CDI_PLURAL
+        )
+
+
+class TestPersistentRootdiskEnabled:
+    """Flag ON → the rootdisk becomes a standalone DataVolume the VM does not
+    own, so it survives VM deletion and is reattached by name on recreate."""
+
+    @pytest.mark.asyncio
+    async def test_data_volume_templates_popped_volumes_untouched(self, controller):
+        controller.k8s_client.get_namespaced_custom_object.side_effect = _dv_phase(None)
+        with patch("vm.controller.controller.VM_PERSISTENT_ROOTDISK", True):
+            await controller._do_create(SAMPLE_JOB_CONFIG)
+
+        body = _vm_create_body(controller)
+        assert "dataVolumeTemplates" not in body["spec"]
+        # The by-name reference is the whole trick — it must be untouched.
+        volumes = body["spec"]["template"]["spec"]["volumes"]
+        rootvol = next(v for v in volumes if v["name"] == "rootdisk")
+        assert rootvol["dataVolume"]["name"] == _rootdisk_name(
+            SAMPLE_JOB_CONFIG["job_id"]
+        )
+
+    @pytest.mark.asyncio
+    async def test_standalone_dv_created_with_the_template_spec(self, controller):
+        controller.k8s_client.get_namespaced_custom_object.side_effect = _dv_phase(None)
+        with patch("vm.controller.controller.VM_PERSISTENT_ROOTDISK", True):
+            await controller._do_create(SAMPLE_JOB_CONFIG)
+
+        dv = _dv_create_body(controller)
+        assert dv["kind"] == "DataVolume"
+        assert dv["metadata"]["name"] == _rootdisk_name(SAMPLE_JOB_CONFIG["job_id"])
+        assert dv["metadata"]["namespace"] == VM_NAMESPACE
+        # Labels drive the GC sweep and the orphan backstop.
+        assert dv["metadata"]["labels"]["srw.io/rootdisk"] == "true"
+        assert dv["metadata"]["labels"]["job-id"] == SAMPLE_JOB_CONFIG["job_id"]
+        # Spec is the template's own — same size, storage class, source.
+        assert dv["spec"]["storage"]["storageClassName"]
+        assert "registry" in dv["spec"]["source"]
+        # No bind.immediate: the clone target must stay WaitForFirstConsumer so
+        # it binds on the VM's node (same rule as the golden work).
+        annotations = dv["metadata"].get("annotations", {})
+        assert "cdi.kubevirt.io/storage.bind.immediate.requested" not in annotations
+
+    @pytest.mark.asyncio
+    async def test_golden_clone_source_carries_into_the_standalone_dv(self, controller):
+        """Ordering guard: the clone mutation must be applied BEFORE the pop,
+        or a golden-enabled create would silently import from the registry."""
+        controller._golden_state_nowait = AsyncMock(
+            return_value=("agent-vm-golden-abc123def456", None)
+        )
+        controller.k8s_client.get_namespaced_custom_object.side_effect = _dv_phase(None)
+        with (
+            patch("vm.controller.controller.VM_GOLDEN_IMAGE_ENABLED", True),
+            patch("vm.controller.controller.VM_GOLDEN_GC_ENABLED", False),
+            patch("vm.controller.controller.VM_PERSISTENT_ROOTDISK", True),
+        ):
+            await controller._do_create(SAMPLE_JOB_CONFIG)
+
+        dv = _dv_create_body(controller)
+        assert dv["spec"]["source"] == {"pvc": {"name": "agent-vm-golden-abc123def456"}}
+        assert dv["spec"]["storage"]["volumeMode"] == "Filesystem"
+
+    @pytest.mark.asyncio
+    async def test_succeeded_rootdisk_is_reattached_without_a_clone(self, controller):
+        """The recovery path: disk already exists → skip creation entirely."""
+        controller.k8s_client.get_namespaced_custom_object.side_effect = _dv_phase(
+            "Succeeded"
+        )
+        with patch("vm.controller.controller.VM_PERSISTENT_ROOTDISK", True):
+            await controller._do_create(SAMPLE_JOB_CONFIG)
+
+        assert not _calls_for(
+            controller.k8s_client.create_namespaced_custom_object, CDI_PLURAL
+        )
+        # ...and the VM still gets built, pointing at the existing disk.
+        body = _vm_create_body(controller)
+        assert "dataVolumeTemplates" not in body["spec"]
+
+    @pytest.mark.asyncio
+    async def test_failed_rootdisk_is_deleted_and_recreated(self, controller):
+        controller.k8s_client.get_namespaced_custom_object.side_effect = _dv_phase(
+            "Failed"
+        )
+        with patch("vm.controller.controller.VM_PERSISTENT_ROOTDISK", True):
+            await controller._do_create(SAMPLE_JOB_CONFIG)
+
+        deletes = _calls_for(
+            controller.k8s_client.delete_namespaced_custom_object, CDI_PLURAL
+        )
+        assert [c.kwargs["name"] for c in deletes] == [
+            _rootdisk_name(SAMPLE_JOB_CONFIG["job_id"])
+        ]
+        assert _calls_for(
+            controller.k8s_client.create_namespaced_custom_object, CDI_PLURAL
+        )
+
+    @pytest.mark.asyncio
+    async def test_in_progress_rootdisk_is_adopted(self, controller):
+        """A racing create is already building it; KubeVirt gates VMI start on
+        DV readiness, so adopting is safe and a second create would 409."""
+        controller.k8s_client.get_namespaced_custom_object.side_effect = _dv_phase(
+            "CloneScheduled"
+        )
+        with patch("vm.controller.controller.VM_PERSISTENT_ROOTDISK", True):
+            await controller._do_create(SAMPLE_JOB_CONFIG)
+
+        assert not _calls_for(
+            controller.k8s_client.create_namespaced_custom_object, CDI_PLURAL
+        )
+        assert not _calls_for(
+            controller.k8s_client.delete_namespaced_custom_object, CDI_PLURAL
+        )
+        assert _vm_create_body(controller)
+
+    @pytest.mark.asyncio
+    async def test_dv_create_409_is_adopted(self, controller):
+        controller.k8s_client.get_namespaced_custom_object.side_effect = _dv_phase(None)
+
+        def _create(**kwargs):
+            if kwargs.get("plural") == CDI_PLURAL:
+                raise _FakeApiException(status=409, body="already exists")
+            return MagicMock()
+
+        controller.k8s_client.create_namespaced_custom_object.side_effect = _create
+        with patch("vm.controller.controller.VM_PERSISTENT_ROOTDISK", True):
+            result = await controller._do_create(SAMPLE_JOB_CONFIG)
+
+        assert result["status"] == "created"
+
+    @pytest.mark.asyncio
+    async def test_dv_create_failure_fails_the_create_loudly(self, controller):
+        """No silent fallback to the templated disk — that would quietly
+        reintroduce the cascade-delete this feature exists to remove."""
+        controller.k8s_client.get_namespaced_custom_object.side_effect = _dv_phase(None)
+
+        def _create(**kwargs):
+            if kwargs.get("plural") == CDI_PLURAL:
+                raise _FakeApiException(status=500, body="quota exceeded")
+            return MagicMock()
+
+        controller.k8s_client.create_namespaced_custom_object.side_effect = _create
+        with patch("vm.controller.controller.VM_PERSISTENT_ROOTDISK", True):
+            with pytest.raises(_FakeApiException):
+                await controller._do_create(SAMPLE_JOB_CONFIG)
+
+        assert not _calls_for(
+            controller.k8s_client.create_namespaced_custom_object, KUBEVIRT_PLURAL
+        )
+
+    @pytest.mark.asyncio
+    async def test_template_without_data_volume_templates_refuses(self, controller):
+        controller.template_text = SAMPLE_TEMPLATE.replace(
+            "  dataVolumeTemplates:", "  x-dataVolumeTemplates:"
+        )
+        with patch("vm.controller.controller.VM_PERSISTENT_ROOTDISK", True):
+            with pytest.raises(RuntimeError, match="no dataVolumeTemplates"):
+                await controller._do_create(SAMPLE_JOB_CONFIG)
+
+
+class TestDeletePurgeIntent:
+    """``purge_disk`` decides whether a delete is terminal (disk + Headscale
+    node go) or a recreate is expected (both are kept — D2/D3)."""
+
+    @pytest.mark.asyncio
+    async def test_default_purges_disk_and_headscale_node(self, controller):
+        """An orchestrator that never sends the field gets today's semantics."""
+        result = await controller._do_delete("job-1")
+
+        deletes = _calls_for(
+            controller.k8s_client.delete_namespaced_custom_object, CDI_PLURAL
+        )
+        assert [c.kwargs["name"] for c in deletes] == [_rootdisk_name("job-1")]
+        controller.headscale.delete_node.assert_awaited_once_with("job-1")
+        assert result["rootdisk"] == "purged"
+
+    @pytest.mark.asyncio
+    async def test_keep_leaves_disk_and_headscale_node(self, controller):
+        """The recovery case. The node must stay: the reused disk still holds
+        /var/lib/tailscale state for it, so deleting it would leave the
+        recovered VM reconnecting as a dead node."""
+        result = await controller._do_delete("job-1", purge_disk=False)
+
+        assert not _calls_for(
+            controller.k8s_client.delete_namespaced_custom_object, CDI_PLURAL
+        )
+        controller.headscale.delete_node.assert_not_awaited()
+        assert result["rootdisk"] == "kept"
+        # The VM object itself still goes.
+        assert _calls_for(
+            controller.k8s_client.delete_namespaced_custom_object, KUBEVIRT_PLURAL
+        )
+
+    @pytest.mark.asyncio
+    async def test_purge_failure_is_non_fatal(self, controller):
+        def _delete(**kwargs):
+            if kwargs.get("plural") == CDI_PLURAL:
+                raise _FakeApiException(status=500, body="boom")
+            return MagicMock()
+
+        controller.k8s_client.delete_namespaced_custom_object.side_effect = _delete
+        result = await controller._do_delete("job-1")
+        assert result["status"] == "deleted"
+
+    @pytest.mark.asyncio
+    async def test_handle_delete_passes_purge_intent_through(self, controller):
+        msg = make_nats_msg({"job_id": "job-1", "purge_disk": False})
+        await controller.handle_delete(msg)
+
+        assert not _calls_for(
+            controller.k8s_client.delete_namespaced_custom_object, CDI_PLURAL
+        )
+        payload = json.loads(controller.nc.publish.call_args[0][1].decode())
+        assert payload["rootdisk"] == "kept"
+
+    @pytest.mark.asyncio
+    async def test_handle_delete_defaults_to_purge(self, controller):
+        await controller.handle_delete(make_nats_msg({"job_id": "job-1"}))
+        payload = json.loads(controller.nc.publish.call_args[0][1].decode())
+        assert payload["rootdisk"] == "purged"
+
+    @pytest.mark.asyncio
+    async def test_http_delete_reads_purge_disk_query_param(self, controller):
+        request = MagicMock()
+        request.match_info = {"job_id": "job-1"}
+        request.query = {"purge_disk": "false"}
+
+        with patch.object(controller, "_do_delete", AsyncMock()) as do_delete:
+            do_delete.return_value = {"job_id": "job-1", "status": "deleted"}
+            await controller.http_delete(request)
+
+        do_delete.assert_awaited_once_with("job-1", purge_disk=False)
+
+    @pytest.mark.asyncio
+    async def test_http_delete_defaults_to_purge(self, controller):
+        request = MagicMock()
+        request.match_info = {"job_id": "job-1"}
+        request.query = {}
+
+        with patch.object(controller, "_do_delete", AsyncMock()) as do_delete:
+            do_delete.return_value = {"job_id": "job-1", "status": "deleted"}
+            await controller.http_delete(request)
+
+        do_delete.assert_awaited_once_with("job-1", purge_disk=True)
