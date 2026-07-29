@@ -1,11 +1,15 @@
-"""llm_retry — provider-error triage shared by every LLM call site.
+"""llm_retry — provider-error triage and the retry loop, shared by every LLM call site.
 
-This module answers one question: *what kind of failure is this?* It does NOT
-decide what to do about it. Terminal disposition stays with each caller — a
-worker job freezes for pause+backoff re-dispatch, a session turn surfaces the
-error and stays alive, a summarizer fold raises so the caller degrades to
-trimming, a light subagent reader returns partial synthesis, an auxiliary task
-falls back to the main model. That divergence is correct policy, not accident.
+This module answers two questions: *what kind of failure is this?*
+(:func:`_classify_llm_error`) and *should I try again, and after how long?*
+(:class:`RetryPolicy` + :func:`invoke_with_retry`). It deliberately does NOT
+decide what happens when retries run out. Terminal disposition stays with each
+caller — a worker job freezes for pause+backoff re-dispatch, a session turn
+surfaces the error and stays alive, a summarizer fold raises so the caller
+degrades to trimming, a light subagent reader returns partial synthesis, an
+auxiliary task falls back to the main model. That divergence is correct policy,
+not accident, and folding it in here is what would make this unusable and get
+it bypassed.
 
 Everything here is pure exception inspection — ``status_code`` attributes,
 class-name matching, and regex over stringified provider bodies. No graph
@@ -31,11 +35,18 @@ them — bias for retry, but do not retry blindly:
 See docs/issues/llm_retry_and_fallback_reimplemented_per_call_site.md.
 """
 
+import asyncio
+import logging
 import os
 import re
 import time
-from typing import Any, Dict, Optional
+from dataclasses import dataclass, field
+from typing import Any, Awaitable, Callable, Dict, Optional, Tuple, TypeVar
 from urllib.parse import urlsplit
+
+logger = logging.getLogger(__name__)
+
+T = TypeVar("T")
 
 
 def _extract_rate_limit_delay(error: Exception) -> Optional[float]:
@@ -626,3 +637,141 @@ def initial_error_freeze_fields(
         "initial_error_summary": first_summary[:500],
         "initial_classification": first_classification,
     }
+
+
+# ---------------------------------------------------------------------------
+# Retry policy + loop
+#
+# The mechanism half of this module. Six call sites used to hand-roll this loop
+# with four different backoff schedules, and two of them (the light subagent
+# readers and the auxiliary tasks) had no loop at all — a single transient 408
+# killed both readers of a parallel fan-out on critic job 37c418d2.
+# docs/issues/llm_retry_and_fallback_reimplemented_per_call_site.md
+# ---------------------------------------------------------------------------
+
+# Verdicts that another identical attempt could plausibly clear. `permanent`,
+# `quota_exhausted` and `cooldown` are deliberately absent: no wait fixes a bad
+# model name, a billing wall, or a multi-day quota reset, and retrying them is
+# what produced the 2026-05-12 cluster outage.
+RETRYABLE_CLASSIFICATIONS = frozenset({"transient", "rate_limit", "auth_unavailable"})
+
+
+@dataclass(frozen=True)
+class RetryPolicy:
+    """How hard to try, and how long to wait between tries.
+
+    Deliberately small: attempts, spacing, and which verdicts qualify. What to
+    do once it gives up belongs to the caller, not here.
+
+    Attributes:
+        max_attempts: Total attempts including the first (1 disables retrying).
+        base_delay: Exponential base — attempt *n* sleeps ``base * 2**n``.
+        max_delay: Ceiling on any single sleep, applied last.
+        retryable: Classifications worth another attempt.
+        never_retry: Exception types that bypass classification and always
+            raise. Use for failures where a second identical attempt is not
+            just useless but actively harmful — e.g. an ``asyncio.TimeoutError``
+            against a hung model, where retrying burns another full timeout
+            when escalating elsewhere would have answered immediately.
+        respect_retry_after: Floor the sleep at any provider-stated Retry-After.
+            Leave off where a long provider wait is worse than escalating (an
+            auxiliary task falling back to the main model shouldn't sit out a
+            90 s rate-limit window).
+    """
+
+    max_attempts: int = 3
+    base_delay: float = 1.0
+    max_delay: float = 60.0
+    retryable: frozenset = RETRYABLE_CLASSIFICATIONS
+    never_retry: Tuple[type, ...] = field(default_factory=tuple)
+    respect_retry_after: bool = True
+
+    def __post_init__(self) -> None:
+        if self.max_attempts < 1:
+            raise ValueError("max_attempts must be >= 1")
+
+    def should_retry(self, error: BaseException, attempt: int) -> bool:
+        """True if ``error`` on 0-indexed ``attempt`` warrants another try."""
+        if attempt + 1 >= self.max_attempts:
+            return False
+        if self.never_retry and isinstance(error, self.never_retry):
+            return False
+        if not isinstance(error, Exception):
+            return False
+        return _classify_llm_error(error) in self.retryable
+
+    def delay_for(self, error: BaseException, attempt: int) -> float:
+        """Seconds to sleep before the attempt after 0-indexed ``attempt``."""
+        delay = self.base_delay * (2**attempt)
+        if self.respect_retry_after and isinstance(error, Exception):
+            try:
+                provider = _extract_rate_limit_delay(error)
+            except Exception:  # pragma: no cover - defensive
+                provider = None
+            if provider is not None:
+                delay = max(delay, provider)
+        return min(delay, self.max_delay)
+
+
+# For a caller that already owns a retry loop one layer up. Retry belongs at
+# exactly ONE layer per call path: nesting two loops multiplies provider calls
+# and hides the inner failures from the outer layer's attempt accounting and
+# progress events. Pass this rather than deleting the wrapping, so the call site
+# still reads as "retry is a decision made here".
+NO_RETRY = RetryPolicy(max_attempts=1)
+
+
+async def invoke_with_retry(
+    fn: Callable[[], Awaitable[T]],
+    *,
+    policy: RetryPolicy,
+    description: str = "LLM call",
+    on_retry: Optional[Callable[[BaseException, int, float], None]] = None,
+) -> T:
+    """Await ``fn()``, retrying per ``policy``; re-raise the last error if it gives up.
+
+    ``fn`` is re-invoked from scratch each attempt, so wrap the *whole* call —
+    including any per-attempt ``asyncio.wait_for`` — inside it, or every retry
+    will share one already-consumed timeout budget.
+
+    This never swallows: the caller always sees the final exception and decides
+    the disposition. ``asyncio.CancelledError`` is a ``BaseException`` and so
+    propagates untouched rather than being treated as a failed attempt.
+
+    Args:
+        fn: Zero-arg coroutine factory performing one attempt.
+        policy: Attempts, backoff, and which verdicts qualify.
+        description: Used in the retry log line.
+        on_retry: Called as ``(error, attempt_number_1_indexed, delay)`` before
+            each sleep — for metrics or a caller-specific "degraded" signal.
+
+    Returns:
+        Whatever ``fn()`` returns on the first successful attempt.
+
+    Raises:
+        The exception from the final attempt.
+    """
+    attempt = 0
+    while True:
+        try:
+            return await fn()
+        except Exception as exc:
+            if not policy.should_retry(exc, attempt):
+                raise
+            delay = policy.delay_for(exc, attempt)
+            logger.warning(
+                "%s failed (%s: %s) — attempt %d/%d, retrying in %.1fs",
+                description,
+                type(exc).__name__,
+                str(exc)[:200],
+                attempt + 1,
+                policy.max_attempts,
+                delay,
+            )
+            if on_retry is not None:
+                try:
+                    on_retry(exc, attempt + 1, delay)
+                except Exception:  # pragma: no cover - never let a hook break retry
+                    logger.debug("on_retry hook raised; continuing", exc_info=True)
+            await asyncio.sleep(delay)
+            attempt += 1

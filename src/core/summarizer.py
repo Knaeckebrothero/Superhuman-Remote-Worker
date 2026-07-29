@@ -42,6 +42,7 @@ from src.core.chunk_planner import (
     count_text_tokens,
 )
 from src.core.context import IdentityAnchor
+from src.core.llm_retry import NO_RETRY
 
 logger = logging.getLogger(__name__)
 
@@ -365,7 +366,14 @@ class SummarizationEngine:
             summarization_prompt=self.summarization_prompt or "",
             max_summary_length=self.max_summary_length,
         )
-        result = await self.auxiliary.chain(task, timeout=self.call_timeout)
+        # NO_RETRY: the fold loop above already owns the retry for this call
+        # (MAX_ATTEMPTS + BACKOFF_SECONDS + the is_overflow_error gate). Letting
+        # AuxiliaryLLM add its own would double the provider calls per fold and
+        # hide the first failure from `_emit_progress`, so the cockpit would show
+        # attempt 1 twice instead of 1 then 2.
+        result = await self.auxiliary.chain(
+            task, timeout=self.call_timeout, retry_policy=NO_RETRY
+        )
         return format_structured_summary(result)
 
     async def _emit_progress(
