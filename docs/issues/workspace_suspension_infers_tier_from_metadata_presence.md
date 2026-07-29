@@ -20,7 +20,7 @@ gate run 2026-07-28 and it exposed a second gate behind this one.**
 > reaching `capture_vm_snapshot` — which then refused, because a VM workspace is
 > only reachable over the tailnet and the orchestrator has no route there. So the
 > VM still keeps running. That second, architectural gate is filed separately as
-> `docs/issues/vm_session_suspend_unreachable_from_orchestrator.md` and needs a
+> `docs/issues/vm_workspace_snapshot_unreachable_from_orchestrator.md` and needs a
 > decision. What this fix *does* deliver: the tier is read correctly, the snapshot
 > manifest is no longer mislabelled `pod`, the SSH port is no longer the pod's
 > 30022, and the failure is now visible instead of a silent tier misread.
