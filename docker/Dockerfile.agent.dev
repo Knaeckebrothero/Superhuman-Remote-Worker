@@ -142,6 +142,16 @@ RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
 COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
 COPY --from=builder /usr/local/bin /usr/local/bin
 
+# Pre-bake the tiktoken vocab. On egress-restricted clusters (k3d) the lazy
+# download fails with a ~4s SYNCHRONOUS DNS retry per token-count call, which
+# blocks the event loop densely enough that 1s liveness probes time out and
+# the kubelet kills healthy officer/session pods mid-turn (observed live,
+# exit 137). Build hosts have internet; runtime only ever reads the cache.
+ENV TIKTOKEN_CACHE_DIR=/opt/tiktoken-cache
+RUN mkdir -p /opt/tiktoken-cache && \
+    python -c "import tiktoken; tiktoken.get_encoding('cl100k_base')" && \
+    chmod -R a+rX /opt/tiktoken-cache
+
 # No browser in the agent image — Chromium lives on the workspace image only
 # (browser-exec daemon). See docs/issues/remove_local_browser_fallback.md.
 

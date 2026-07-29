@@ -5520,6 +5520,40 @@ class PostgresDB:
             )
         return row["last_at"] if row else None
 
+    async def merge_thread_officer_state(
+        self, thread_id: str, patch: Dict[str, Any]
+    ) -> bool:
+        """Shallow-merge runtime officer state into ``metadata.officer_state``.
+
+        Runtime state (sitrep fingerprints, page-budget counters, digest
+        queue) lives under ``metadata.officer_state`` — deliberately NOT
+        ``config_override.officer``, which flows into config resolution on
+        every dispatch. One atomic ``||`` at the officer_state level: a patch
+        key replaces its previous value wholesale (a new sitrep snapshot
+        replaces the old one), which is the semantics every current caller
+        wants. Returns False on bad id / missing thread; never raises on
+        those.
+        """
+        try:
+            thread_uuid = UUID(thread_id)
+        except (ValueError, TypeError):
+            return False
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                """
+                UPDATE threads
+                   SET metadata = jsonb_set(
+                        COALESCE(metadata, '{}'::jsonb),
+                        '{officer_state}',
+                        COALESCE(metadata->'officer_state', '{}'::jsonb)
+                            || $2::jsonb)
+                 WHERE id = $1
+                """,
+                thread_uuid,
+                json.dumps(patch),
+            )
+        return result == "UPDATE 1"
+
     async def get_thread_job_counts(self, thread_id: str) -> Dict[str, int]:
         """Terminal/in-flight tallies over every job a thread created.
 

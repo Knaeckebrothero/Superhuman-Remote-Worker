@@ -22,6 +22,7 @@ expert cannot start a session, and a session expert cannot run a job.
 |---|---|---|
 | **General Worker** | Worker | Safe general-purpose research, writing, analysis, planning, and file deliverables. This is the initial application worker default. |
 | **Assistant** | Session | General turn-by-turn research, writing, analysis, planning, and light coding. This is the initial application session default. |
+| **Centurion** | Session | The standing officer of a project: supervises its worker jobs, owns the backlog, and briefs the user. Runs as an always-on wake/sleep session when a project enables its officer; the same profile dresses interactive conferences with him. |
 | **Scholar** | Worker | Broad exploration: web/codebase research, experiments, and high-volume findings for later evaluation. |
 | **Critic** | Worker | Evidence-based review of diffs, proposals, tests, and quality. It is also used by the optional job verification workflow. |
 | **Developer** | Worker | Test-driven implementation using specification, red, green, and refactor phases. |

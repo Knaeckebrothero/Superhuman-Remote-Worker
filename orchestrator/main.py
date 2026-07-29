@@ -162,7 +162,9 @@ from services.project_loop_sweeper import project_loop_sweeper_loop  # noqa: E40
 from services.session_wake import (  # noqa: E402
     file_officer_timer,
     kick_drain as _kick_session_wake_drain,
+    kick_event_drain as _kick_officer_event_drain,
     maybe_wake_session,
+    notify_all_officers,
     session_wake_sweeper_loop,
 )
 from services.stale_verification_sweeper import (  # noqa: E402
@@ -713,6 +715,23 @@ async def stale_agent_detector(shutdown_event: asyncio.Event) -> None:
                 logger.info(
                     f"Marked {count} agent(s) as offline due to missed heartbeats"
                 )
+                # Fleet-scoped officer wake (centurion S4): agents dropping
+                # offline is capacity news every officer should judge. 10-min
+                # debounce on 'fleet' keeps a flapping node from spamming.
+                await _step(
+                    "officer_fleet_offline",
+                    notify_all_officers(
+                        postgres_db,
+                        source="fleet",
+                        dedup_key="fleet:agents_offline",
+                        payload={
+                            "summary": (
+                                f"{count} agent(s) marked offline (missed heartbeats)"
+                            )
+                        },
+                    ),
+                )
+                _kick_officer_event_drain(postgres_db)
 
             # 2. Consistency-based: release slots held by zombie agents
             stuck_working = await _step(
@@ -812,6 +831,21 @@ async def stale_agent_detector(shutdown_event: asyncio.Event) -> None:
                 logger.info(
                     f"Recovered {recovered} orphaned job(s) from offline agents"
                 )
+                await _step(
+                    "officer_fleet_orphans",
+                    notify_all_officers(
+                        postgres_db,
+                        source="fleet",
+                        dedup_key="fleet:orphans_recovered",
+                        payload={
+                            "summary": (
+                                f"{recovered} orphaned job(s) auto-paused for "
+                                "re-dispatch (agent offline)"
+                            )
+                        },
+                    ),
+                )
+                _kick_officer_event_drain(postgres_db)
                 _trigger_dispatch()
 
             # 4b. Job execution lease: expired lease == orphaned, decided
@@ -830,6 +864,21 @@ async def stale_agent_detector(shutdown_event: asyncio.Event) -> None:
                     _job_id,
                 )
             if expired:
+                await _step(
+                    "officer_fleet_leases",
+                    notify_all_officers(
+                        postgres_db,
+                        source="fleet",
+                        dedup_key="fleet:lease_recovered",
+                        payload={
+                            "summary": (
+                                f"{len(expired)} job(s) recovered by lease "
+                                f"expiry: " + ", ".join(str(j)[:8] for j in expired[:5])
+                            )
+                        },
+                    ),
+                )
+                _kick_officer_event_drain(postgres_db)
                 _trigger_dispatch()
 
             # 5. GC: drop offline agent rows older than 24h
@@ -5036,14 +5085,24 @@ async def _release_thread_resources(thread_id: str) -> None:
     except Exception:
         logger.exception("Workspace cleanup failed for thread %s", thread_id)
 
+    # BOTH provisioners, not either/or: a thread can have pods from both over
+    # its lifetime — pool pods (agent_provisioner) from normal attach, and a
+    # dedicated persistent-<tid> pod + PVC from the officer watchdog's respawn
+    # path. The old elif skipped the persistent cleanup whenever the pool
+    # provisioner was available, leaking a 10Gi PVC per respawned officer on
+    # retirement (k3d smoke, open item 7). Both deletes are idempotent no-ops
+    # when nothing matches.
     try:
         if agent_provisioner.is_available:
             await agent_provisioner.delete_agent_pod_by_thread(thread_id)
-        elif persistent_provisioner.is_available:
+    except Exception:
+        logger.exception("Agent pod cleanup failed for thread %s", thread_id)
+    try:
+        if persistent_provisioner.is_available:
             await persistent_provisioner.delete_agent_pod(thread_id)
             await persistent_provisioner.delete_agent_pvc(thread_id)
     except Exception:
-        logger.exception("Agent pod cleanup failed for thread %s", thread_id)
+        logger.exception("Persistent pod cleanup failed for thread %s", thread_id)
 
 
 # Threads with a suspend currently in flight. Two triggers can race on the
@@ -5098,14 +5157,20 @@ async def _suspend_thread_resources_inner(thread_id: str) -> None:
         "workspace alive (reconciler will reap) but deleting the agent pod",
         thread_id,
     )
+    # Pods from BOTH provisioners (see _release_thread_resources), but NOT the
+    # persistent PVC: suspend serves resumable threads, and for a dedicated
+    # pod that PVC is the workspace itself. It is reclaimed at retirement by
+    # the release path.
     try:
         if agent_provisioner.is_available:
             await agent_provisioner.delete_agent_pod_by_thread(thread_id)
-        elif persistent_provisioner.is_available:
-            await persistent_provisioner.delete_agent_pod(thread_id)
-            await persistent_provisioner.delete_agent_pvc(thread_id)
     except Exception:
         logger.exception("Agent pod cleanup failed for thread %s", thread_id)
+    try:
+        if persistent_provisioner.is_available:
+            await persistent_provisioner.delete_agent_pod(thread_id)
+    except Exception:
+        logger.exception("Persistent pod cleanup failed for thread %s", thread_id)
 
 
 def _provider_of_model(model: str) -> str | None:
@@ -8753,6 +8818,47 @@ async def create_job(request: Request, job: JobCreate) -> dict[str, Any]:
             str(job.thread_id) if (job.thread_id and root_creation) else None
         )
 
+        # Officer capacity gate (centurion.md §6, S5): an officer thread may
+        # hold at most max_concurrent_workers jobs in flight. Enforced here —
+        # the single job-creation funnel — not in the tool, so a forgetful
+        # model cannot bypass it. The advisory xact lock serializes parallel
+        # create calls from one officer (capacity TOCTOU, risk 9); it is
+        # per-thread, so ordinary creates never contend.
+        if creating_thread_id:
+            try:
+                creating_thread = await postgres_db.get_thread(creating_thread_id)
+            except Exception:
+                creating_thread = None
+            officer_meta = _thread_officer_meta(creating_thread or {})
+            if _officer_meta_enabled(officer_meta):
+                try:
+                    cap = max(1, int(officer_meta.get("max_concurrent_workers") or 3))
+                except (TypeError, ValueError):
+                    cap = 3
+                async with postgres_db.acquire() as conn:
+                    async with conn.transaction():
+                        await conn.execute(
+                            "SELECT pg_advisory_xact_lock(hashtext($1))",
+                            creating_thread_id,
+                        )
+                        in_flight = await conn.fetchval(
+                            """
+                            SELECT COUNT(*) FROM jobs
+                             WHERE created_by_thread_id = $1
+                               AND status IN ('created', 'processing')
+                            """,
+                            UUID(creating_thread_id),
+                        )
+                if int(in_flight or 0) >= cap:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            f"Officer capacity reached: {in_flight}/{cap} worker "
+                            "jobs already in flight. Wait for one to finish, "
+                            "cancel one, or raise max_concurrent_workers."
+                        ),
+                    )
+
         result = await postgres_db.create_job(
             description=job.description,
             document_path=job.document_path,
@@ -9285,6 +9391,11 @@ async def pause_job(request: Request, job_id: str) -> dict[str, str]:
                 status_code=400,
                 detail="Job cannot be paused (status may have changed)",
             )
+
+        # 'paused' is officer-only inside maybe_wake_session — it never enters
+        # the ordinary jobs outbox (risk 6), but a paused job is exactly what
+        # the project's officer exists to notice.
+        await maybe_wake_session(postgres_db, job_id, "paused")
 
         # Cascade pause to processing child/subjobs
         await _cascade_pause_to_children(job_id)
@@ -20249,6 +20360,12 @@ class OfficerWakeRequest(BaseModel):
     reason: str = ""
 
 
+class OfficerNotifyRequest(BaseModel):
+    message: str
+    urgency: str = "log"  # log | digest | page
+    subject: str = ""
+
+
 def _thread_officer_meta(thread: dict) -> dict:
     """The officer block from a thread row's metadata.config_override, or {}."""
     metadata = thread.get("metadata") or {}
@@ -20295,6 +20412,147 @@ async def agent_file_officer_wake(
     minutes = max(sleep_min, min(int(body.minutes), max(sleep_min, sleep_max)))
     filed = await file_officer_timer(postgres_db, thread_id, minutes, body.reason)
     return {"filed": filed, "minutes": minutes}
+
+
+async def _dispatch_officer_page(
+    thread: dict, thread_id: str, subject: str, message_md: str
+) -> bool:
+    """Page the thread owner out-of-band (email/ntfy per their prefs).
+
+    Shared by the notify endpoint's 'page' urgency and the watchdog's
+    respawn-failure alert. The recipient MUST be resolved explicitly —
+    notification_service.dispatch's email leg sends to ``recipient_email or
+    ""`` and silently drops the send otherwise (the 2026-07-27 dev live gate
+    lesson, same as session_wake._notify_owner).
+    """
+    user_id = thread.get("user_id")
+    if not user_id:
+        return False
+    try:
+        user = await postgres_db.get_user(str(user_id))
+    except Exception:
+        user = None
+    if not user or not user.get("email"):
+        logger.warning(
+            "officer page: owner %s has no email — page dropped",
+            str(user_id)[:8],
+        )
+        return False
+    results = await notification_service.dispatch(
+        user_id=str(user_id),
+        # No job behind an officer page; the thread UUID keys the queue row
+        # (plain uuid column, no FK) so quiet-hours digests still group it.
+        job_id=thread_id,
+        subject=subject or "Your centurion needs you",
+        message_md=message_md,
+        job_description="officer page",
+        config_name=str(thread.get("config_name") or "session_base"),
+        thread_id=thread_id,
+        recipient_email=user.get("email"),
+        recipient_name=user.get("display_name") or "Legatus",
+    )
+    return not results.get("error")
+
+
+@app.post("/api/agents/threads/{thread_id}/officer/notify")
+async def agent_officer_notify(
+    request: Request,
+    thread_id: str,
+    body: OfficerNotifyRequest,
+) -> dict[str, Any]:
+    """The officer's notify_user contract (centurion.md §6). **Internal** —
+    requires ``X-Internal-Key``; ingress strips this path.
+
+    Three urgencies:
+      * ``log`` — no-op server-side: the officer's transcript already carries
+        the line; this exists so the tool has an honest cheap tier.
+      * ``digest`` — appended to ``metadata.officer_state.digest`` (capped
+        ring; surfaced in the cockpit / next conference rather than pushed).
+      * ``page`` — immediate out-of-band notification, budgeted by
+        ``officer.max_pages_per_day``; over budget it DOWNGRADES to digest
+        and tells the officer so (never fails the tool call).
+    """
+    await require_internal(request)
+    thread = await postgres_db.get_thread(thread_id)
+    if thread is None:
+        raise HTTPException(status_code=404, detail="Thread not found")
+    officer_meta = _thread_officer_meta(thread)
+    if not _officer_meta_enabled(officer_meta):
+        raise HTTPException(status_code=409, detail="Thread is not an officer session")
+
+    urgency = (body.urgency or "log").strip().lower()
+    if urgency not in ("log", "digest", "page"):
+        raise HTTPException(
+            status_code=400, detail="urgency must be log, digest, or page"
+        )
+    message = (body.message or "").strip()
+    if not message:
+        raise HTTPException(status_code=400, detail="message must not be empty")
+
+    if urgency == "log":
+        return {"delivered": "log"}
+
+    metadata = thread.get("metadata") or {}
+    if isinstance(metadata, str):
+        try:
+            metadata = json.loads(metadata)
+        except (json.JSONDecodeError, TypeError):
+            metadata = {}
+    officer_state = metadata.get("officer_state") or {}
+    if not isinstance(officer_state, dict):
+        officer_state = {}
+    today = datetime.now(timezone.utc).date().isoformat()
+
+    downgraded = False
+    if urgency == "page":
+        pages = officer_state.get("pages") or {}
+        if not isinstance(pages, dict) or pages.get("date") != today:
+            pages = {"date": today, "count": 0}
+        try:
+            budget = int(officer_meta.get("max_pages_per_day") or 3)
+        except (TypeError, ValueError):
+            budget = 3
+        if int(pages.get("count") or 0) >= budget > 0:
+            downgraded = True
+        else:
+            paged = await _dispatch_officer_page(
+                thread, thread_id, body.subject, message
+            )
+            await postgres_db.merge_thread_officer_state(
+                thread_id,
+                {"pages": {"date": today, "count": int(pages.get("count") or 0) + 1}},
+            )
+            if paged:
+                return {
+                    "delivered": "page",
+                    "pages_used_today": int(pages.get("count") or 0) + 1,
+                    "pages_budget": budget,
+                }
+            # Undeliverable (no email / notifier down) — fall through to
+            # digest so the message is not lost, and say so.
+            downgraded = True
+
+    digest = officer_state.get("digest") or []
+    if not isinstance(digest, list):
+        digest = []
+    digest = (
+        digest
+        + [
+            {
+                "at": datetime.now(timezone.utc).isoformat(),
+                "subject": (body.subject or "")[:120],
+                "message": message[:500],
+            }
+        ]
+    )[-50:]
+    await postgres_db.merge_thread_officer_state(thread_id, {"digest": digest})
+    result: dict[str, Any] = {"delivered": "digest", "queued": len(digest)}
+    if downgraded:
+        result["downgraded"] = True
+        result["detail"] = (
+            "page budget exhausted or page undeliverable — queued as digest"
+        )
+    return result
 
 
 @app.put("/api/agents/threads/{thread_id}/status")
@@ -25197,14 +25455,29 @@ async def _officer_watchdog_check_one(officer_row: dict, session_wake_svc) -> No
         thread_id, config_name=config_name
     )
     if not ok:
-        # TODO(S5): page the Legatus via the notify contract once the
-        # thread-scoped notification endpoint exists. Until then this log
-        # line is the alert surface; the cooldown retries next window.
         logger.error(
             "officer watchdog: respawn FAILED for officer thread %s — will "
             "retry after cooldown",
             thread_id[:8],
         )
+        # Page the owner (S5 notify contract). Deliberately OUTSIDE the page
+        # budget — a dead, unrespawnable officer cannot page for himself, and
+        # the respawn cooldown already rate-limits this to one page per
+        # window. Best-effort: a notifier outage must not break the watchdog.
+        try:
+            await _dispatch_officer_page(
+                thread,
+                thread_id,
+                subject="Centurion down — respawn failing",
+                message_md=(
+                    f"The officer session `{thread_id[:8]}` is down and the "
+                    "watchdog's respawn attempt failed. It will retry every "
+                    f"{OFFICER_RESPAWN_COOLDOWN_MINUTES} min; until one "
+                    "succeeds, no wakes are being processed."
+                ),
+            )
+        except Exception:
+            logger.exception("officer watchdog: respawn-failure page failed")
 
 
 async def officer_watchdog(shutdown_event: asyncio.Event) -> None:

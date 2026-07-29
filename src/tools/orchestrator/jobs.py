@@ -127,6 +127,31 @@ ORCHESTRATOR_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "short_description": "Pause a running job.",
         "phases": ["strategic", "tactical"],
     },
+    "steer_worker_job": {
+        "module": "orchestrator.jobs",
+        "function": "steer_worker_job",
+        "description": (
+            "Send guidance to a RUNNING job without stopping it. The worker "
+            "reads it at its next strategic phase (or immediately with "
+            "urgent=true). Use for course corrections; use "
+            "resume_worker_job's feedback for paused/frozen jobs."
+        ),
+        "category": "orchestrator",
+        "short_description": "Send guidance to a running job.",
+        "phases": ["strategic", "tactical"],
+    },
+    "get_stuck_jobs": {
+        "module": "orchestrator.jobs",
+        "function": "get_stuck_jobs",
+        "description": (
+            "List jobs that look stuck: 'processing' with no update inside "
+            "the threshold. Use during a wake to decide whether to steer, "
+            "pause, or escalate."
+        ),
+        "category": "orchestrator",
+        "short_description": "List jobs with no recent progress.",
+        "phases": ["strategic", "tactical"],
+    },
 }
 
 
@@ -819,6 +844,73 @@ def create_orchestrator_tools(context: ToolContext) -> List[Any]:
             except httpx.RequestError as e:
                 return f"Failed to connect to orchestrator: {e}"
 
+    @tool
+    async def steer_worker_job(job_id: str, message: str, urgent: bool = False) -> str:
+        """Send guidance to a running job without stopping it.
+
+        The worker reads queued guidance at its next strategic phase — use
+        this for course corrections ("stop retrying X, try Y", "the answer
+        you need is in file Z"). ``urgent=True`` interrupts the worker
+        immediately; reserve it for work that is actively being wasted.
+        For a paused or frozen job, use resume_worker_job with feedback
+        instead — steering only reaches live workers.
+
+        Args:
+            job_id: Job UUID (or unique 8-char prefix).
+            message: The guidance. Concrete and short; the worker sees it
+                verbatim.
+            urgent: Deliver as an immediate interrupt instead of at the next
+                strategic phase.
+        """
+        try:
+            async with _get_client(user_id=context.user_id) as client:
+                resolved = await _resolve_job_id(client, base_url, job_id)
+                resp = await client.post(
+                    f"{base_url}/api/jobs/{resolved}/messages/officer/reply",
+                    json={"message": str(message), "urgent": bool(urgent)},
+                )
+                if resp.status_code != 200:
+                    return f"Steer failed ({resp.status_code}): {resp.text[:300]}"
+                data = resp.json()
+                return (
+                    f"Guidance delivered to job {_short_id(resolved)} "
+                    f"(strategy: {data.get('delivery_strategy', 'queued')})."
+                )
+        except Exception as e:
+            return f"Steer failed: {e}"
+
+    @tool
+    async def get_stuck_jobs(threshold_minutes: int = 60) -> str:
+        """List jobs that appear stuck (processing, but no update recently).
+
+        Args:
+            threshold_minutes: How long without an update counts as stuck
+                (default 60).
+        """
+        try:
+            async with _get_client(user_id=context.user_id) as client:
+                resp = await client.get(
+                    f"{base_url}/api/stats/stuck",
+                    params={"threshold_minutes": int(threshold_minutes)},
+                )
+                if resp.status_code != 200:
+                    return (
+                        f"Stuck lookup failed ({resp.status_code}): {resp.text[:300]}"
+                    )
+                jobs = resp.json()
+                if not jobs:
+                    return f"No jobs stuck past {threshold_minutes} minutes."
+                lines = [f"{len(jobs)} job(s) stuck past {threshold_minutes} min:"]
+                for job in jobs[:20]:
+                    lines.append(
+                        f"- {_short_id(job.get('id'))} "
+                        f"[{job.get('status', '?')}] "
+                        f"{_truncate(job.get('description'), limit=100)}"
+                    )
+                return "\n".join(lines)
+        except Exception as e:
+            return f"Stuck lookup failed: {e}"
+
     return [
         get_session_context,
         create_worker_job,
@@ -829,4 +921,6 @@ def create_orchestrator_tools(context: ToolContext) -> List[Any]:
         resume_worker_job,
         cancel_worker_job,
         pause_worker_job,
+        steer_worker_job,
+        get_stuck_jobs,
     ]
