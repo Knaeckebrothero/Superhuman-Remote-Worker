@@ -565,7 +565,7 @@ class KnowledgeStore:
         killed *every* watermark write — the reindex wrote all its rows and then
         died on this last statement, so ``indexed_commit`` never advanced and
         each run re-embedded the whole vault
-        (docs/issues/kb_reindex_watermark_never_advances.md). Casting at every
+        (docs/done/kb_reindex_watermark_never_advances.md). Casting at every
         occurrence pins both parameters to the column type regardless of which
         use Postgres resolves first. ``::varchar`` (unqualified) rather than
         ``::varchar(64)`` deliberately: a cast to a length-qualified type
