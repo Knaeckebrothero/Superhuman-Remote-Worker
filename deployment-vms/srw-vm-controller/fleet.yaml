@@ -69,8 +69,13 @@ helm:
       # ONE FIRST: orchestrator-on against a controller that still
       # cascade-deletes disks would suspend sessions into nothing. This order
       # is harmless — the controller just keeps disks nobody asks it to keep.
+      # TEMPORARILY OFF: first flip (2026-07-29) hit a CDI webhook 422 —
+      # a standalone DataVolume requires spec.source.pvc.namespace, which a
+      # templated one may omit. Fixed in daec8704; re-enable once an image
+      # containing it is deployed. See the live-gate notes in
+      # docs/features/vm_workspace_persistence_reconciliation.md.
       persistentRootdisk:
-        enabled: true
+        enabled: false
 dependsOn: []
 # Cluster targeting handled by the dedicated GitRepo
 # (HomeLab/rancher_cluster/fleet-gitrepo-srw-vms.yaml) whose spec.targets
