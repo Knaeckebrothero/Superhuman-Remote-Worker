@@ -55,6 +55,30 @@ export interface ToolResult {
     bytesTotal?: number;
 }
 
+/**
+ * A durable thing a card is a *handle on*, as opposed to a record of a call
+ * that already finished.
+ *
+ * Every card in slices 1–3 is a snapshot: the tool ran, it returned, the card
+ * shows what the model saw. A job card is different — the call returns in
+ * milliseconds ("job created, id=…") while the thing the user cares about runs
+ * for twenty minutes afterwards, changes status several times, and then wants
+ * acting on. `entity` is what turns a transcript artifact into a view onto a
+ * row that keeps changing, and it generalizes (a future `create_project` card
+ * would use the same seam).
+ *
+ * Absent on every card that exists today, which stay inert.
+ *
+ * NOTE: the live status is deliberately NOT stored here. `ToolCardView` is
+ * memoized per event object in an identity-keyed WeakMap, so writing status
+ * into it would mean busting that cache on every poll. Live state lives in a
+ * separate signal map — see `JobWatchService`.
+ */
+export interface ToolCardEntity {
+    readonly kind: 'job';
+    readonly id: string;
+}
+
 export interface ToolCardAction {
     readonly kind: 'open_canvas';
     /** Revision presented by this historical tool result when recoverable. */
@@ -98,6 +122,13 @@ export interface ToolCardView {
     details: ToolDetail[];
     /** Optional trusted Cockpit action; never an agent-supplied URL. */
     action?: ToolCardAction;
+    /**
+     * Durable row this card watches, when it has one. Present only on
+     * `create_worker_job` today. Its mere presence is the subscription — the
+     * card looks the id up in the live map and renders current state instead of
+     * the frozen call result.
+     */
+    entity?: ToolCardEntity;
     /** Normalized type/title only; never includes source URLs or workspace internals. */
     canvasPresentation?: CanvasPresentationSummary;
     /** Explicit error message (audit) or the errored output (live). */

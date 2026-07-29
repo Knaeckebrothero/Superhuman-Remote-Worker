@@ -20,7 +20,7 @@ related:
 
 > Every agent tool call — in a live session or the debug audit trail — should render through **one** schema-driven card: tool name, input parameters, the result the model saw, and optional execution details. Expanding any card should look the same and tell you the same things, regardless of tool or data source.
 
-**Status:** Slice 1 (schema + registry + `<app-tool-card>` + persistent-chat wiring) shipped + **live-verified on k3d 2026-06-17**. Slices 2–3 pending. **Slice 4 — the job card** added 2026-07-26 (design only); it is the first card that outlives its tool call and the first to carry actions, so it extends the schema rather than just adding a descriptor.
+**Status:** Slice 1 (schema + registry + `<app-tool-card>` + persistent-chat wiring) shipped + **live-verified on k3d 2026-06-17**. Slices 2–3 pending. **Slice 4 — the job card: BUILT 2026-07-29**, uncommitted, live gate not yet run; see [Slice 4 — what shipped](#slice-4--what-shipped-2026-07-29). It is the first card that outlives its tool call and the first to carry actions, so it extends the schema rather than just adding a descriptor.
 **Closes:** `session_turn_rendering.md` deferred decision #5 ("whether tool_result content gets its own collapse level inside the tool card or is always visible").
 
 ## Live verification (slice 1, 2026-06-17)
@@ -375,26 +375,90 @@ which is a closed union of `kind: 'open_canvas'` today
   `TestBed.createComponent` does not work under vitest here — test exported pure
   functions instead.
 
+### Slice 4 — what shipped (2026-07-29)
+
+Built against the audit above; every seam it named still existed (paths had
+drifted — chat is `views/persistent-chat/`, not `views/chat/`).
+
+| Piece | Where |
+|---|---|
+| `entity?: ToolCardEntity` on the view | `core/models/tool-card.model.ts` |
+| `create_worker_job` descriptor (`result: 'none'` — the receipt is not content) | `core/tools/tool-descriptors.ts` |
+| `parseJobEntity()` — id recovered from the result so it survives history replay | same |
+| `JobWatchService` — `jobsById` signal map + one poller per *job* | `core/services/job-watch.service.ts` |
+| `isTerminalJobStatus` / `isRunningJobStatus` / shared `jobStatusTone` | `core/util/job-status.ts` |
+| The panel: status chip, summary, Approve / Open-diff / Cancel | `ui/tool-card/job-tool-card-panel.component.ts` |
+| Job-diff drawer, separate signal from the cloud-diff one | `views/persistent-chat/persistent-chat.component.ts` |
+
+Decisions worth keeping:
+
+- **The panel renders outside `<details>`.** Every other card hides its body
+  behind a disclosure because it is a record of a finished call. A job card is a
+  handle on something running, so its status must be readable and its actions
+  reachable without expanding.
+- **A child component, not code inside `<app-tool-card>`.** Keeps that component
+  what its docstring promises — source-agnostic and presentational — and
+  confines the polling/ApiService dependency to the one card that needs it.
+  Mirrors `<app-canvas-tool-card-presentation>`.
+- **One poller per job, not per card.** `watch()` is idempotent by id, so a
+  fan-out where several cards point at the same job issues one request, not N.
+- **The id parser anchors on the `Job ID:` label.** The receipt also prints an
+  owner id and an agent id; grabbing the first uuid would point the card at the
+  wrong entity and still look plausible, because every field is a uuid.
+- **`pending_review` is deliberately not terminal.** The poller stops at
+  terminal; if it counted, the card would freeze on "awaiting review" and miss
+  the approval that flips it to `completed` — the one transition the review loop
+  exists to show.
+- **The actionable-card rule is satisfied structurally, not defensively.** The
+  audit called for treating a stale click as benign. Instead each button is gated
+  on the *freshly fetched* status, so the resurrected-dead-button failure cannot
+  arise; the post-action refresh closes the remaining race. No bespoke error
+  handling — `ApiService` already catches, toasts and returns null, so an inline
+  error would double-report.
+
+**Deliberately not built** (each is separable, none blocks the above):
+
+- **Turn-level batch grouping.** The audit found the seam (`groupEvents`) but
+  also that `pinnedEventIds()` always pins a turn's last tool call, so job calls
+  must be exempted from `isFoldable`/pinning *before* the grouping pass — a real
+  edit to a load-bearing function with 53 tests. That is a separate change from
+  the card itself, and it only matters for fan-outs.
+- **Resume-with-feedback.** Needs a text-input affordance; Approve + Open-diff is
+  most of the review loop.
+- **Proposed state.** Still deferred by design (see the decision log).
+- **The audit/debug surface.** The card is shared, so it renders there too, but
+  polling from that surface is untested.
+
+**Verification so far:** 16 new unit tests (pure functions — `TestBed` does not
+work under vitest here); full cockpit suite 1450 passing; i18n parity green with
+both locales; `ng build` clean with initial at 2.65 MB, under the 2.75 MB hard
+ceiling (the 2.25 MB warning was already breached before this change). **No live
+gate yet** — nothing here has been exercised against a real running job.
+
 ### Open questions (slice 4)
 
-- **Who is speaking when a job reports back?** An injected completion must not
-  render as a *user* message. Leading candidate: no new message at all —
-  transition the existing card in place to its returned state. That makes the
-  card the delivery surface, which is why it lives in this doc. See
-  [[session_wake_on_job_completion]] open question #1.
-- **Live transport.** Poll the jobs API per visible card, or piggyback the
-  session's existing event stream? Polling is simpler and bounded by visible
-  cards; the stream avoids N pollers on a long transcript.
-- **How far back does `live` apply?** Re-subscribing every job card in a
-  months-old transcript on load is wasteful. Probably: only non-terminal jobs,
-  resolved once at render.
+- ~~**Who is speaking when a job reports back?**~~ **Resolved elsewhere, and
+  differently than expected.** [[session_wake_on_job_completion]] shipped its own
+  answer — a `role='event'` row rendered as a muted system line — so a completion
+  produces both a transcript line (for the agent's context) and a card
+  transition (for the user). They are not competing surfaces: the message is what
+  the *model* reads, the card is what the *user* watches.
+- ~~**Live transport.**~~ **Resolved: polling**, 10 s, one poller per job, stopped
+  at terminal status. A `job.status` frame remains the upgrade path and needs no
+  transport work — but with `replicas: 2` it must route through the NATS→SSE
+  bridge, so it is not free either.
+- ~~**How far back does `live` apply?**~~ **Resolved by the terminal predicate.**
+  A card whose job is already finished polls exactly once and stops, so a
+  months-old transcript costs one request per distinct job on load rather than a
+  standing subscription. Still worth watching: a transcript with 50 job cards
+  issues 50 requests on open.
 
 ## Sequencing
 
 1. **Slice 1 (this change)** — schema + registry + chat adapter + `<app-tool-card>` + wire into `persistent-chat.component.ts` (replace the `#toolDetails` card body; keep the run-fold/grouping around it). Ship + verify on k3d.
 2. **Slice 2 (follow-up)** — audit adapter (`toolCardViewFromAudit`) is written and unit-tested in slice 1 to prove the schema is source-agnostic; slice 2 points `agent-activity.component.ts`'s tool step at `<app-tool-card>` and deletes its bespoke tool rendering.
 3. **Slice 3 (polish)** — Prism syntax highlighting for `code` results (deps already present: `prismjs`); `chat-history.component.ts` as a third consumer; delete the now-dead SCSS/helpers in persistent-chat.
-4. **Slice 4 (the job card, design only)** — `entity` / `live` / `actions` on the schema, a `create_worker_job` descriptor, the running + returned states. Independent of slices 2–3 and of [[session_wake_on_job_completion]]; sequence it against whichever of those is moving. Proposed state stays deferred.
+4. **Slice 4 (the job card) — BUILT 2026-07-29.** `entity` on the schema, a `create_worker_job` descriptor, live status + Approve / Open-diff / Cancel. Batch grouping, resume-with-feedback and the proposed state stay deferred; see [what shipped](#slice-4--what-shipped-2026-07-29). Live gate owed.
 
 ## Acceptance (slice 1)
 

@@ -679,7 +679,7 @@ The perception system builds on what already exists in the codebase:
 | `DocumentRenderer` (`src/services/document_renderer.py`) | Renders documents/pages as images for vision processing |
 | `DescriptionCache` (`src/services/description_cache.py`) | Caches vision descriptions to avoid redundant calls |
 | `read_file` with `describe` param | Already supports visual Q&A on documents |
-| `browse_website` tool | Playwright-based browser automation — can capture screenshots |
+| `browser_direct` tools (`browser_screenshot`) | Playwright-based browser control — can capture screenshots |
 | Multimodal config (`llm.multimodal`) | Already distinguishes between models that see images vs. need descriptions |
 
 The new pieces to build:

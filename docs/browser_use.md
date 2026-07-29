@@ -4,6 +4,16 @@
 > on a target architecture. This is a living design doc, not a spec.
 >
 > **Last updated**: 2026-04-08
+>
+> **Outcome (2026-07-29):** the direct-control option won. `browse_website` and
+> `download_from_website` — the autonomous sub-agent tools this document
+> analyses throughout — were **removed from `TOOL_REGISTRY`**
+> (`src/tools/research/__init__.py:27`); agents drive the browser themselves via
+> the `browser_direct` group. Read the sections below as the reasoning that led
+> there, not as a description of current behaviour. Their names lingered in
+> shipped configs long after removal and silently degraded every worker job's
+> tool load — see
+> `docs/issues/stale_tool_names_degrade_every_worker_job_tool_load.md`.
 
 ---
 

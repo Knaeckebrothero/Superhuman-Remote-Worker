@@ -71,8 +71,6 @@ tools:
     - extract_webpage
     - crawl_website
     - map_website
-    - browse_website
-    - download_from_website
     - research_topic
   # Light subagent delegation via spawn_subagent (replaces the inherited heavy
   # delegate_work / resume_delegation_child grant from the former broad base).

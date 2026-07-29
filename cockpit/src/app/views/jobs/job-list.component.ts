@@ -17,6 +17,7 @@ import {AppIconButtonComponent} from '../../ui/icon-button';
 import {AppDialogComponent} from '../../ui/dialog';
 import {AppMenuComponent, AppMenuItemComponent, AppMenuTriggerDirective} from '../../ui/menu';
 import {ViewportService} from '../../core/services/viewport.service';
+import {jobStatusTone as sharedJobStatusTone} from '../../core/util/job-status';
 type StatusFilter = 'all' | JobStatus;
 
 /** A row in the hierarchical job list. */
@@ -1184,26 +1185,10 @@ export class JobListComponent implements OnInit, OnDestroy {
     return this.jobs().filter((job) => job.status === status).length;
   }
 
+  /** Delegates to the shared helper — this was copy-pasted in two
+   *  components before the job tool card became the third consumer. */
   jobStatusTone(status: string): BadgeTone {
-    switch (status) {
-      case 'completed':
-        return 'success';
-      case 'processing':
-      case 'pending_review':
-        return 'warning';
-      case 'failed':
-        return 'danger';
-      case 'created':
-      case 'waiting':
-        return 'info';
-      case 'reviewing':
-        return 'accent';
-      case 'cancelled':
-      case 'paused':
-        return 'neutral';
-      default:
-        return 'neutral';
-    }
+    return sharedJobStatusTone(status);
   }
 
   selectJob(jobId: string): void {
