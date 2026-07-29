@@ -13,6 +13,7 @@ import logging
 from typing import Optional
 
 from services.workspace_lifecycle import (
+    EnsureOutcome,
     EnsureResult,
     WorkspaceOwner,
     ensure_workspace,
@@ -59,6 +60,38 @@ async def ensure_session_workspace(
     thread = await db.get_thread(thread_id)
     if not thread or thread.get("status") == "ended":
         return None
+
+    # Suspended-VM restore on reconnect — the VM-tier mirror of
+    # ensure_workspace's 'suspended' branch below. VM suspend deletes the VM
+    # with purge_disk=False; `rootdisk == "kept"` with the VM torn down is the
+    # durable signature of "the disk is waiting for a resume". (Not
+    # vm.status == "suspended": suspend writes that marker, but the
+    # controller's async delete-status overwrites it with 'deleted'.) Without
+    # this trigger nothing restores a suspended VM session at all — the two
+    # restore triggers in main.py key on workspace_container.status, which VM
+    # suspend never writes (live-gate finding, thread a1240add).
+    #
+    # Checked BEFORE the backend arms because an UPGRADED thread still declares
+    # its original backend ('virtual'/'sandbox' — the upgrade endpoints never
+    # rewrite it), so the declared string cannot be allowed to hide the disk.
+    # Safe from the reconcile sweep: it selects status='active' threads only,
+    # and a suspended thread is 'suspended' — this fires from /prepare
+    # (reconnect) alone. Double-fire converges: restore sets vm.status=
+    # 'restoring' immediately, which this condition excludes.
+    vm_ctx = _thread_metadata(thread).get("vm") or {}
+    if vm_ctx.get("rootdisk") == "kept" and vm_ctx.get("status") in (
+        "suspended",
+        "deleted",
+        "deleting",
+    ):
+        logger.info(
+            "session %s has a kept VM rootdisk (vm.status=%s) — restoring the VM",
+            thread_id,
+            vm_ctx.get("status"),
+        )
+        await suspension.restore(WorkspaceOwner.session(thread_id))
+        return EnsureResult(EnsureOutcome.PENDING, status="restoring")
+
     backend = _thread_backend(thread)
     if backend in LITE_BACKENDS:
         # virtual/none sessions run with no workspace pod (no_workspace_agent_mode.md
