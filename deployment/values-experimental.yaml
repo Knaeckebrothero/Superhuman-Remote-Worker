@@ -510,3 +510,29 @@ sessionRouter:
     traefik.ingress.kubernetes.io/router.priority: "1000"
 logLevel: "INFO"
 logFormat: "json"
+
+# -----------------------------------------------------------------------------
+# Persistent VM rootdisks — the ORCHESTRATOR's copy of the flag
+# (docs/features/vm_persistent_rootdisk.md).
+#
+# This does NOT deploy an in-cluster vm-controller (vmController.enabled stays
+# false — dev's controller lives on the vm cluster, configured in
+# deployment-vms/srw-vm-controller/fleet.yaml). It only renders
+# VM_PERSISTENT_ROOTDISK into the orchestrator's ConfigMap.
+#
+# What the orchestrator uses it for: deciding whether a VM workspace survives a
+# teardown, and therefore whether VM suspend may proceed WITHOUT a snapshot.
+# For VM targets a snapshot can never be captured from the orchestrator (it
+# SSHes, and a VM workspace is only reachable over the tailnet), which is why
+# VM sessions and VM jobs never idle-suspended at all — see
+# docs/issues/vm_workspace_snapshot_unreachable_from_orchestrator.md.
+#
+# MUST NOT be enabled before the vm-cluster controller has it: with the disk
+# still cascade-deleting, suspend would tear a workspace down believing the
+# files survive. Controller was enabled and live-gated first (steps 1-3 passed
+# 2026-07-29, run log in
+# docs/features/vm_workspace_persistence_reconciliation.md).
+# -----------------------------------------------------------------------------
+vmController:
+  persistentRootdisk:
+    enabled: true
