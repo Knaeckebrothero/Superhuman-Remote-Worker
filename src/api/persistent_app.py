@@ -316,7 +316,9 @@ def _officer_cfg():
     """
     if _session is None:
         return None
-    cfg = getattr(_session.config, "officer", None)
+    # Double getattr: attach-path callers (boot-WS watchdog, boot self-wake)
+    # run against test FakeSessions that may not carry .config at all.
+    cfg = getattr(getattr(_session, "config", None), "officer", None)
     # Strict `is True`: tests wire sessions with MagicMock configs, and a
     # truthy Mock attribute must not flip a normal session into officer mode.
     return cfg if getattr(cfg, "enabled", False) is True else None
