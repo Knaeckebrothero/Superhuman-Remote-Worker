@@ -5,12 +5,14 @@ import {AppIconComponent} from '../../ui/icon';
 import {
     JOB_TOOL_CATEGORIES,
     LIVE_TOOL_CATEGORIES,
+    pinResolvedValue,
     readConfigPath,
     SESSION_TOOL_CATEGORIES,
     SESSION_TOOL_GROUP_NAMES,
     SettingsMode,
     ToolCategoryMeta,
 } from './agent-settings.types';
+import {PinOnInteractDirective} from './pin-on-interact.directive';
 
 /** True when every selectable category key is enabled (none in the disabled set). */
 export function allToolCategoriesSelected(
@@ -43,7 +45,7 @@ export function disabledToolCategoriesFromConfig(
 @Component({
   selector: 'app-tools-group',
   standalone: true,
-  imports: [FormsModule, TranslocoPipe, AppIconComponent],
+  imports: [FormsModule, TranslocoPipe, AppIconComponent, PinOnInteractDirective],
   template: `
     <div class="settings-group">
       <div class="group-header">
@@ -88,6 +90,7 @@ export function disabledToolCategoriesFromConfig(
                 <label class="inline-label">{{ 'agentSettings.tools.maxDepth' | transloco }}</label>
                 <select class="inline-input"
                   [ngModel]="delegationMaxDepth() ?? resolvedDelegationMaxDepth()"
+              appPinOnInteract (pin)="pinValue(delegationMaxDepth, resolvedDelegationMaxDepth())"
                   (ngModelChange)="onDelegationMaxDepthChange($event)"
                   [disabled]="disabled()">
                   <option [ngValue]="1">1</option>
@@ -330,6 +333,14 @@ export class ToolsGroupComponent {
 
   readonly resolvedDelegationMaxDepth = computed(() => (this.r('delegation.max_depth') ?? 1) as number);
   readonly resolvedDelegationTimeout = computed(() => (this.r('delegation.default_timeout') ?? 7200) as number);
+
+  /** Commit a displayed-but-inherited value on deliberate interaction.
+   *  See PinOnInteractDirective — a <select> emits no change event when the
+   *  option already showing is re-picked, so without this the resolved default
+   *  is the one value the form cannot express. */
+  pinValue<T>(target: {(): T | null; set(value: T | null): void}, resolved: T): void {
+    if (pinResolvedValue(target, resolved)) this.change.emit();
+  }
 
   isCategoryEnabled(key: string): boolean {
     return !this.disabledCategories().has(key);

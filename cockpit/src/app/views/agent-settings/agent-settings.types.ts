@@ -334,3 +334,22 @@ export function resolveEffectiveModels(
 export function defaultModelOptionLabel(prefix: string, model: string | null | undefined): string {
   return model ? `${prefix} · ${model}` : prefix;
 }
+
+/**
+ * Commit a currently-inherited value into its override signal.
+ *
+ * Paired with `PinOnInteractDirective`: the controls render
+ * `override() ?? resolved()`, so "what the user sees" and "what the user chose"
+ * are different things. When they deliberately interact with a control, the
+ * displayed value becomes a choice. No-op once an override exists, so repeated
+ * interaction never clobbers a real selection — only the reset button clears
+ * back to inherit.
+ */
+export function pinResolvedValue<T>(
+  target: {(): T | null; set(value: T | null): void},
+  resolved: T,
+): boolean {
+  if (target() !== null) return false;
+  target.set(resolved);
+  return true;
+}

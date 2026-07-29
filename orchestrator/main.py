@@ -1553,6 +1553,29 @@ async def _resolve_session_account_defaults(
     return _deep_merge_dicts(out, layer)
 
 
+async def _account_defaults_layer(
+    user_id: str | None, expert_type: str
+) -> dict[str, Any]:
+    """The account fallback layer that create/dispatch feeds ``resolve_config``.
+
+    Single source for "what the caller's account contributes below the expert",
+    so the create forms can render the same resolved config the server will
+    actually build. Sessions get the full session layer — crucially including
+    ``workspace.backend``, which is ``virtual`` by default and therefore does
+    NOT match ``session_base.yaml``'s ``sandbox``; workers get only the
+    default-model floor, matching the ``base_defaults`` the job dispatcher
+    passes. Both mirror the exact calls in ``create_thread`` and the dispatcher.
+
+    Returns ``{}`` for an anonymous caller: with no account there is no layer,
+    and the framework base is already the honest answer.
+    """
+    if not user_id:
+        return {}
+    if expert_type == "session":
+        return await _resolve_session_account_defaults(user_id)
+    return await _resolve_default_models(user_id)
+
+
 async def _resolve_session_config(
     thread: dict[str, Any],
     metadata: dict[str, Any],
@@ -26059,6 +26082,7 @@ async def _load_expert_detail(
     *,
     user_id: str | None = None,
     defaults_type: Literal["worker", "session"] | None = None,
+    include_account_defaults: bool = False,
 ) -> dict[str, Any]:
     """Load full expert detail: merged config + instructions content. DB-backed
     experts (UUID) resolve their fragment onto the expert_type base; bundled
@@ -26068,6 +26092,18 @@ async def _load_expert_detail(
     provenance) so the create-form picker can show what will actually run if left
     untouched — see Layer 3 in
     docs/issues/loop_ran_codex_spark_not_selected_model_then_hung_on_cooldown.md.
+
+    ``include_account_defaults`` inserts the caller's account layer between the
+    framework base and the expert fragment, exactly where ``resolve_config``
+    puts ``base_defaults``. **Create forms must set it**: without it the form
+    resolves a different config than the one create/dispatch will build, and any
+    control keyed off a resolved value silently disagrees with the server. That
+    is not hypothetical — a New Session form reading ``workspace.backend`` as
+    the base's ``sandbox`` (instead of the account's ``virtual``) left
+    clone-based repository connectors selectable, and every create 400'd on the
+    lite-backend rule. It is deliberately OFF by default so the expert *editor*
+    keeps diffing against the pure framework baseline; folding personal
+    preferences into that baseline would let them be saved into a shared expert.
     """
     if _is_experts_db_enabled() and _looks_like_uuid(expert_id):
         row = await postgres_db.get_expert_by_id(expert_id)
@@ -26079,7 +26115,12 @@ async def _load_expert_detail(
         cfg = row.get("config") or {}
         if isinstance(cfg, str):
             cfg = json.loads(cfg)
-        merged = _deep_merge(base, cfg)
+        account_layer = (
+            await _account_defaults_layer(user_id, str(row["expert_type"]))
+            if include_account_defaults
+            else {}
+        )
+        merged = _deep_merge(_deep_merge(base, account_layer), cfg)
         merged.pop("connections", None)
         prompts = row.get("prompts") or {}
         if isinstance(prompts, str):
@@ -26140,7 +26181,16 @@ async def _load_expert_detail(
                 defaults = yaml.safe_load(f) or {}
         else:
             defaults = {}
-        merged = dict(defaults)
+        # `defaults` stays the pristine framework base — `defaults_tools` below
+        # reports the base's tool lists, which the account layer never carries.
+        merged = _deep_merge(
+            defaults,
+            await _account_defaults_layer(
+                user_id, "session" if inferred_type == "session" else "worker"
+            )
+            if include_account_defaults
+            else {},
+        )
         expert_config_dir = config_dir
         # The "defaults" virtual expert is model-agnostic — no expert-level model
         # pin, so its effective model is the account/system default.
@@ -26167,7 +26217,17 @@ async def _load_expert_detail(
         else:
             defaults = {}
 
-        merged = _deep_merge(defaults, expert_data)
+        # Account layer sits above the framework base and below the bundled
+        # expert leaf — the same slot `resolve_config` gives `base_defaults`.
+        base_layer = _deep_merge(
+            defaults,
+            await _account_defaults_layer(
+                user_id, "session" if extends_name == "session_base" else "worker"
+            )
+            if include_account_defaults
+            else {},
+        )
+        merged = _deep_merge(base_layer, expert_data)
         expert_config_dir = expert_dir
         # The expert's OWN llm fragment (leaf, pre-merge) — a model-agnostic
         # bundled expert has `llm: {}` here and resolves to the default floor.
@@ -26237,6 +26297,7 @@ async def get_expert(
     request: Request,
     expert_id: str,
     type: Literal["worker", "session"] | None = None,
+    account_defaults: bool = False,
 ) -> dict[str, Any]:
     """Get full expert detail including merged config and instructions content.
 
@@ -26245,6 +26306,12 @@ async def get_expert(
     Returns the expert's configuration (merged with defaults) and the raw
     instructions.md content, enabling the cockpit to pre-populate the job
     creation form.
+
+    ``account_defaults=true`` folds the caller's account fallback layer into
+    ``config`` at the precedence ``resolve_config`` uses. The New Session / New
+    Job forms pass it so what they render is what create/dispatch will resolve;
+    the expert editor must NOT, or a personal preference could be saved into a
+    shared expert. See ``_load_expert_detail``.
     """
     user = await require_approved_user(request, postgres_db)
     _uid = str(user["id"])
@@ -26258,7 +26325,13 @@ async def get_expert(
             project_ids=[] if visible == "all" else [str(p) for p in visible],
             is_admin=bool(user.get("is_admin")),
         )
-        detail = await _load_expert_detail(expert_id, user_id=_uid) if row else {}
+        detail = (
+            await _load_expert_detail(
+                expert_id, user_id=_uid, include_account_defaults=account_defaults
+            )
+            if row
+            else {}
+        )
         if not detail:
             raise HTTPException(
                 status_code=404, detail=f"Expert not found: {expert_id}"
@@ -26281,7 +26354,12 @@ async def get_expert(
         # "defaults" is a virtual expert representing the framework base for
         # the requested agent type. Worker remains the backward-compatible
         # default; session creation explicitly requests session_base.
-        detail = await _load_expert_detail(expert_id, user_id=_uid, defaults_type=type)
+        detail = await _load_expert_detail(
+            expert_id,
+            user_id=_uid,
+            defaults_type=type,
+            include_account_defaults=account_defaults,
+        )
         if not detail:
             raise HTTPException(status_code=404, detail="Defaults config not found")
         return detail
@@ -26290,7 +26368,9 @@ async def get_expert(
     if not expert_info:
         raise HTTPException(status_code=404, detail=f"Expert not found: {expert_id}")
 
-    detail = await _load_expert_detail(expert_id, user_id=_uid)
+    detail = await _load_expert_detail(
+        expert_id, user_id=_uid, include_account_defaults=account_defaults
+    )
     if not detail:
         raise HTTPException(
             status_code=404, detail=f"Expert config not found: {expert_id}"

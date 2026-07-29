@@ -4,6 +4,7 @@ import {ApiService} from '../../core/services/api.service';
 import {FileHandlingService} from '../../core/services/file-handling.service';
 import {JobArtifactService} from '../../core/services/job-artifact.service';
 import {UserService} from '../../core/services/user.service';
+import {ErrorMessageService} from '../../core/services/error-message.service';
 import {Datasource, EffectiveModels, Expert, ExpertDefaultsResponse, ExpertDetail, JobCreateRequest, Project} from '../../core/models/api.model';
 import {FilePreview, UploadStatus} from '../../core/models/file.model';
 import {AgentSettingsComponent} from '../agent-settings/agent-settings.component';
@@ -1097,6 +1098,7 @@ export class JobCreateComponent implements OnInit {
   private readonly route = inject(ActivatedRoute);
   private readonly router = inject(Router);
   private readonly userService = inject(UserService);
+  private readonly errors = inject(ErrorMessageService);
   private readonly modelService = inject(ModelService);
   readonly fileService = inject(FileHandlingService);
   readonly artifacts = inject(JobArtifactService);
@@ -1225,7 +1227,9 @@ export class JobCreateComponent implements OnInit {
     this.modelService.load();
     this.loadExperts();
     this.loadDatasources();
-    this.api.getExpertDetail('worker_base').subscribe((d) => {
+    // accountDefaults: resolve against the same layers the dispatcher will —
+    // the account model floor sits above worker_base and below the expert.
+    this.api.getExpertDetail('worker_base', {accountDefaults: true}).subscribe((d) => {
       if (d?.config) this.frameworkDefaults.set(d.config);
       if (d?.settings_matrix) this.frameworkSettingsMatrix.set(d.settings_matrix);
       if (d?.effective_models) this.frameworkEffectiveModels.set(d.effective_models);
@@ -1276,7 +1280,7 @@ export class JobCreateComponent implements OnInit {
 
   private fetchExpertDetail(expertId: string): void {
     this.isLoadingExpertDetail.set(true);
-    this.api.getExpertDetail(expertId).subscribe({
+    this.api.getExpertDetail(expertId, {accountDefaults: true}).subscribe({
       next: (detail) => {
         this.expertDetail.set(detail);
         if (detail?.instructions) {
@@ -1444,16 +1448,16 @@ export class JobCreateComponent implements OnInit {
     this.api.createJob(request).subscribe({
       next: (job) => {
         this.isSubmitting.set(false);
-        if (job) {
-          this.successMessage.set(`Job created successfully! ID: ${job.id.slice(0, 8)}...`);
-          this.resetForm();
-        } else {
-          this.errorMessage.set('Failed to create job. Please try again.');
-        }
+        this.successMessage.set(`Job created successfully! ID: ${job.id.slice(0, 8)}...`);
+        this.resetForm();
       },
+      // The form stays mounted with every selection intact, and shows what the
+      // server actually objected to — `err.message` would be Angular's
+      // "Http failure response for /api/jobs: 400 Bad Request", which tells the
+      // user nothing about which setting to change.
       error: (err) => {
         this.isSubmitting.set(false);
-        this.errorMessage.set(`Error: ${err.message || 'Unknown error'}`);
+        this.errorMessage.set(this.errors.translate(err, 'errors.jobs.createFailed'));
       },
     });
   }

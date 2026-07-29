@@ -488,7 +488,12 @@ export class ChatPageComponent implements OnInit, OnDestroy {
 
         if (threadId === '_creating') {
             this.canvas.selectThread(null);
-            // Navigate arrived before thread exists — create it now
+            // LEGACY bridge — nothing in the app navigates here any more. Both
+            // create forms now POST first and route to the real thread id, so a
+            // rejected config leaves the form standing instead of unmounting
+            // into this view and bouncing back to /sessions with a toast. Kept
+            // for history entries and service-worker-cached bundles from before
+            // that change: they still arrive with `createBody` in state.
             const state = history.state as { createBody?: Record<string, any> };
             if (state?.createBody) {
                 this.chat.createAndConnect(state.createBody).then(

@@ -508,6 +508,7 @@
       "permissionAutoAccept": "Auto-akzeptieren",
       "permissionAutonomous": "Autonom",
       "creating": "Wird erstellt...",
+      "failed": "Die Sitzung konnte nicht erstellt werden. Passe die Einstellungen unten an und versuche es erneut.",
       "create": "Erstellen",
       "cancel": "Abbrechen",
       "expertLabel": "Experte",

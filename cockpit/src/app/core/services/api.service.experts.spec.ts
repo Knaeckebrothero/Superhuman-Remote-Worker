@@ -87,4 +87,21 @@ describe('ApiService expert write methods', () => {
     svc.importExpert(body).subscribe();
     expect(http.post).toHaveBeenCalledWith('/api/experts/import', body);
   });
+
+  // The expert editor diffs against this response, so the account layer has to
+  // stay out unless a caller asks for it — otherwise a personal preference
+  // reads as the framework baseline and can be saved into a shared expert.
+  it('getExpertDetail omits the account layer by default', () => {
+    const {svc, http} = makeService();
+    svc.getExpertDetail('worker_base').subscribe();
+    expect(http.get).toHaveBeenCalledWith('/api/experts/worker_base');
+  });
+
+  it('getExpertDetail requests the account layer for create forms', () => {
+    const {svc, http} = makeService();
+    svc.getExpertDetail('worker_base', {accountDefaults: true}).subscribe();
+    expect(http.get).toHaveBeenCalledWith(
+      '/api/experts/worker_base?account_defaults=true',
+    );
+  });
 });
