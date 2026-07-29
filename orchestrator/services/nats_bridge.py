@@ -303,8 +303,14 @@ class NatsBridge:
             )
             return False
 
-    async def request_vm_delete(self, job_id: str) -> bool:
+    async def request_vm_delete(self, job_id: str, purge_disk: bool = True) -> bool:
         """Publish a VM deletion request.
+
+        Args:
+            job_id: Job or thread UUID (VM names are ``agent-vm-<id>`` for both).
+            purge_disk: False keeps the persistent rootdisk and the Headscale
+                node for a recreate. The controller defaults the field to True,
+                so an un-upgraded one is unaffected by its presence.
 
         Returns:
             True if published, False if NATS unavailable.
@@ -320,7 +326,11 @@ class NatsBridge:
             )
             return False
 
-        payload = {"job_id": job_id, "orchestrator_id": self._orchestrator_id}
+        payload = {
+            "job_id": job_id,
+            "orchestrator_id": self._orchestrator_id,
+            "purge_disk": purge_disk,
+        }
         try:
             await self._nc.publish(
                 subject,
@@ -498,6 +508,23 @@ class NatsBridge:
             ):
                 if data.get(key) is not None:
                     updates[key] = data[key]
+
+            # What the controller ACTUALLY did with the rootdisk, which is not
+            # necessarily what we asked for: a controller without
+            # VM_PERSISTENT_ROOTDISK cascade-deletes the disk no matter what
+            # purge_disk said. Recording its answer (rather than our intent)
+            # keeps context.vm.rootdisk honest for the kept-disk GC sweep, and
+            # the warning names the drift instead of letting it be silent.
+            if data.get("status") == "deleted":
+                if data.get("rootdisk") is not None:
+                    updates["rootdisk"] = data["rootdisk"]
+                else:
+                    logger.warning(
+                        "VM controller reported no rootdisk disposition for %s — it "
+                        "predates persistent rootdisks; any keep intent was NOT "
+                        "honoured and the disk is gone",
+                        job_id,
+                    )
 
             is_thread = await self._vm_entity_is_thread(job_id)
             logger.info(

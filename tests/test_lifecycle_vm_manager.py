@@ -642,7 +642,7 @@ class TestDelete:
         mgr, provisioner, *_ = _make_manager()
         inst = Instance(kind="vm", id="x", bound_to="job-1", metadata={"scope": "job"})
         await mgr.delete(inst, grace_s=0)
-        provisioner.delete_vm.assert_awaited_once_with("job-1")
+        provisioner.delete_vm.assert_awaited_once_with("job-1", purge_disk=True)
         provisioner.delete_thread_vm.assert_not_called()
 
     @pytest.mark.asyncio
@@ -655,7 +655,9 @@ class TestDelete:
             metadata={"scope": "thread"},
         )
         await mgr.delete(inst, grace_s=0)
-        provisioner.delete_thread_vm.assert_awaited_once_with("thread-1")
+        provisioner.delete_thread_vm.assert_awaited_once_with(
+            "thread-1", purge_disk=True
+        )
         provisioner.delete_vm.assert_not_called()
 
     @pytest.mark.asyncio
@@ -663,7 +665,7 @@ class TestDelete:
         mgr, provisioner, *_ = _make_manager()
         inst = Instance(kind="vm", id="x", bound_to="job-1", metadata={"scope": "job"})
         await mgr.drain(inst, grace_s=0)
-        provisioner.delete_vm.assert_awaited_once_with("job-1")
+        provisioner.delete_vm.assert_awaited_once_with("job-1", purge_disk=True)
 
     @pytest.mark.asyncio
     async def test_noop_when_provisioner_unavailable(self):
@@ -980,19 +982,43 @@ class TestAttemptCounter:
 
 
 class TestGiveUp:
+    """give_up fires on dirty + unreachable + snapshot-exhausted — exactly the
+    state whose files we must not destroy. The kept rootdisk IS the recovery
+    artifact. docs/features/vm_persistent_rootdisk.md D2.
+    """
+
     @pytest.mark.asyncio
-    async def test_give_up_force_deletes_job_vm(self):
+    async def test_give_up_keeps_the_job_rootdisk(self):
         mgr, provisioner, *_ = _make_manager()
         inst = Instance(kind="vm", id="x", bound_to="j1", metadata={"scope": "job"})
         await mgr.give_up(inst, grace_s=0)
-        provisioner.delete_vm.assert_awaited_once_with("j1")
+        provisioner.delete_vm.assert_awaited_once_with("j1", purge_disk=False)
 
     @pytest.mark.asyncio
-    async def test_give_up_force_deletes_thread_vm(self):
+    async def test_give_up_keeps_the_thread_rootdisk(self):
         mgr, provisioner, *_ = _make_manager()
         inst = Instance(kind="vm", id="x", bound_to="t1", metadata={"scope": "thread"})
         await mgr.give_up(inst, grace_s=0)
-        provisioner.delete_thread_vm.assert_awaited_once_with("t1")
+        provisioner.delete_thread_vm.assert_awaited_once_with("t1", purge_disk=False)
+
+    @pytest.mark.asyncio
+    async def test_give_up_records_the_kept_disk(self):
+        """The GC sweep finds kept disks by this key, so a give_up that forgets
+        to write it leaks 20 Gi until the controller's age backstop fires."""
+        mgr, _, _, _, db = _make_manager()
+        db.merge_vm_context = AsyncMock(return_value=True)
+        inst = Instance(kind="vm", id="x", bound_to="j1", metadata={"scope": "job"})
+        await mgr.give_up(inst, grace_s=0)
+        db.merge_vm_context.assert_awaited_with("j1", {"rootdisk": "kept"})
+
+    @pytest.mark.asyncio
+    async def test_drain_still_purges(self):
+        """Version drift wants a fresh image anyway — keeping the old disk
+        would defeat the drain."""
+        mgr, provisioner, *_ = _make_manager()
+        inst = Instance(kind="vm", id="x", bound_to="j1", metadata={"scope": "job"})
+        await mgr.drain(inst, grace_s=0)
+        provisioner.delete_vm.assert_awaited_once_with("j1", purge_disk=True)
 
 
 class TestSnapshotResetsAttempts:
@@ -1072,7 +1098,10 @@ class TestChurnRegression:
         mgr._tcp_probe = AsyncMock(return_value=False)  # unreachable, no real socket
         rec = InstanceLifecycleReconciler([mgr])
         report = await rec.tick()
-        provisioner.delete_vm.assert_awaited_once_with("j-idle")
+        # Reached via give_up (dirty + unreachable + attempts exhausted), which
+        # keeps the rootdisk — it is the only surviving copy of the state the
+        # snapshot could not capture.
+        provisioner.delete_vm.assert_awaited_once_with("j-idle", purge_disk=False)
         assert report["vm"]["reap_forced"] == 1
 
 
