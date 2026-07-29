@@ -424,13 +424,31 @@ class VMProvisioner:
             and ssh_port
         ):
             try:
-                await self._snapshot_service.capture_vm_snapshot(
+                # capture_vm_snapshot RETURNS False (it does not raise) when it
+                # declines — notably for a VM workspace, whose only address is on
+                # the tailnet the orchestrator cannot reach. Ignoring the return
+                # made this log a capture that never happened, on every VM
+                # release. docs/issues/
+                # vm_workspace_snapshot_unreachable_from_orchestrator.md
+                captured = await self._snapshot_service.capture_vm_snapshot(
                     job_id=job_id,
                     ssh_host=ssh_host,
                     ssh_port=int(ssh_port),
                     source_type="vm",
                 )
-                logger.info("VM snapshot captured for job %s before release", job_id)
+                if captured:
+                    logger.info(
+                        "VM snapshot captured for job %s before release", job_id
+                    )
+                else:
+                    logger.warning(
+                        "VM snapshot SKIPPED for job %s (%s:%s) — deleting anyway; "
+                        "workspace state not yet pushed to git will be lost. See "
+                        "context.snapshot.status for the reason.",
+                        job_id,
+                        ssh_host,
+                        ssh_port,
+                    )
             except Exception:
                 logger.exception(
                     "VM snapshot failed for job %s — deleting anyway", job_id
@@ -478,16 +496,27 @@ class VMProvisioner:
             and ssh_port
         ):
             try:
-                await self._snapshot_service.capture_vm_snapshot(
+                # See release_vm: a False return means "declined", not "raised".
+                captured = await self._snapshot_service.capture_vm_snapshot(
                     job_id=thread_id,
                     ssh_host=ssh_host,
                     ssh_port=int(ssh_port),
                     source_type="vm",
                     entity_type="threads",
                 )
-                logger.info(
-                    "VM snapshot captured for thread %s before release", thread_id
-                )
+                if captured:
+                    logger.info(
+                        "VM snapshot captured for thread %s before release", thread_id
+                    )
+                else:
+                    logger.warning(
+                        "VM snapshot SKIPPED for thread %s (%s:%s) — deleting "
+                        "anyway; workspace state not yet pushed to git will be "
+                        "lost. See metadata.snapshot.status for the reason.",
+                        thread_id,
+                        ssh_host,
+                        ssh_port,
+                    )
             except Exception:
                 logger.exception(
                     "VM snapshot failed for thread %s — deleting anyway", thread_id
