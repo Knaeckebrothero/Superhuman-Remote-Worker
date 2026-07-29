@@ -527,9 +527,21 @@ export class ApiService {
 
   /**
    * Get full expert detail including merged config and instructions.
+   *
+   * `accountDefaults` folds the caller's account fallback layer into `config`
+   * at the precedence the server's resolver uses. **Create forms must pass it**
+   * — without it the form resolves a different config than dispatch will build
+   * (e.g. `workspace.backend` reads the base's `sandbox` while a session
+   * actually boots `virtual`, which used to leave repository connectors
+   * selectable and 400 every create). The expert editor must NOT pass it: its
+   * diff baseline has to stay the pure framework base.
    */
-  getExpertDetail(expertId: string): Observable<ExpertDetail | null> {
-    return this.http.get<ExpertDetail>(`${this.baseUrl}/experts/${expertId}`).pipe(
+  getExpertDetail(
+    expertId: string,
+    opts?: {accountDefaults?: boolean},
+  ): Observable<ExpertDetail | null> {
+    const qs = opts?.accountDefaults ? '?account_defaults=true' : '';
+    return this.http.get<ExpertDetail>(`${this.baseUrl}/experts/${expertId}${qs}`).pipe(
       catchError(() => of(null)),
     );
   }
@@ -1393,14 +1405,16 @@ export class ApiService {
   /**
    * Create a new job.
    */
-  createJob(job: JobCreateRequest): Observable<Job | null> {
+  /**
+   * Create a job. Errors PROPAGATE — the create form keeps itself open and
+   * renders the server's reason inline so a rejected config can be corrected
+   * without losing the rest of the form. Swallowing it into `null` here made
+   * the component's error branch dead code and reduced every rejection to
+   * "Failed to create job. Please try again."
+   */
+  createJob(job: JobCreateRequest): Observable<Job> {
     return this.http.post<Job>(`${this.baseUrl}/jobs`, job).pipe(
       tap(() => this.toast.success(this.t('toasts.jobs.created'))),
-      catchError((error) => {
-        console.error('Failed to create job:', error);
-        this.toast.danger(this.errors.translate(error, 'errors.jobs.createFailed'));
-        return of(null);
-      }),
     );
   }
 

@@ -301,19 +301,30 @@ describe('ModelGroupComponent', () => {
       ]);
     });
 
-    it('resolves to the family default and treats picking it as no override', () => {
+    it('resolves to the family default and pins it when picked', () => {
       const {component} = createComponent();
       component.sessionModel.set('gemma-4-moe');
       expect(component.resolvedSessionReasoning()).toBe('on');
 
-      // Selecting the default is not an override…
+      // Picking the concrete level that happens to be the default is intent,
+      // so it lands in the override rather than collapsing back to inherit.
+      // (`mode` defaults to 'job' in this harness, whose getOverrides() reads
+      // the strategic/tactical slots — assert the session fragment under the
+      // mode that actually emits it.)
+      Object.defineProperty(component, 'mode', {value: () => 'session'});
       component.onSessionReasoningChange('on');
-      expect(component.sessionReasoning()).toBeNull();
-      expect(component.getOverrides()).toEqual({});
+      expect(component.sessionReasoning()).toBe('on');
+      expect(component.getOverrides()).toEqual({
+        llm: {model: 'gemma-4-moe', reasoning_level: 'on'},
+      });
 
-      // …selecting anything else is.
       component.onSessionReasoningChange('off');
       expect(component.sessionReasoning()).toBe('off');
+
+      // The explicit "Default" option is what clears it.
+      component.onSessionReasoningChange(null);
+      expect(component.sessionReasoning()).toBeNull();
+      expect(component.getOverrides()).toEqual({llm: {model: 'gemma-4-moe'}});
     });
 
     it('offers nothing for a model without a selectable capability (field hidden)', () => {

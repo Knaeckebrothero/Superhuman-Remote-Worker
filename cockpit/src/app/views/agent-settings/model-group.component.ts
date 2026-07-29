@@ -4,7 +4,8 @@ import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
 import {AppIconComponent} from '../../ui/icon';
 import {ModelService} from '../../core/services/model.service';
 import {EffectiveModels, EffectiveModelSlot} from '../../core/models/api.model';
-import {computeModelMismatch, ModelMismatch, readConfigPath, SettingsMode} from './agent-settings.types';
+import {computeModelMismatch, ModelMismatch, pinResolvedValue, readConfigPath, SettingsMode} from './agent-settings.types';
+import {PinOnInteractDirective} from './pin-on-interact.directive';
 import {defaultSelectableReasoning, getSelectableReasoningOptions, reasoningOptionsForModel} from './reasoning-options';
 import {formatTokens} from '../../core/util/format-tokens';
 
@@ -26,7 +27,7 @@ const STORAGE_KEYS = {
 @Component({
   selector: 'app-model-group',
   standalone: true,
-  imports: [FormsModule, TranslocoPipe, AppIconComponent],
+  imports: [FormsModule, TranslocoPipe, AppIconComponent, PinOnInteractDirective],
   template: `
     <div class="settings-group">
       <div class="group-label">{{ 'agentSettings.model.group' | transloco }}</div>
@@ -190,6 +191,7 @@ const STORAGE_KEYS = {
               <select
                 class="form-input"
                 [ngModel]="sessionReasoning() ?? resolvedSessionReasoning()"
+              appPinOnInteract (pin)="pinValue(sessionReasoning, resolvedSessionReasoning())"
                 (ngModelChange)="onSessionReasoningChange($event)"
                 [disabled]="disabled()"
               >
@@ -483,47 +485,50 @@ export class ModelGroupComponent {
     return count;
   });
 
+  /** Commit a displayed-but-inherited value on deliberate interaction.
+   *  See PinOnInteractDirective — a <select> emits no change event when the
+   *  option already showing is re-picked, so without this the resolved default
+   *  is the one value the form cannot express. */
+  pinValue<T>(target: {(): T | null; set(value: T | null): void}, resolved: T): void {
+    if (pinResolvedValue(target, resolved)) this.change.emit();
+  }
+
   onStrategicModelChange(value: string | null): void {
-    const resolved = value === this.resolvedStrategicModel() ? null : value;
-    this.strategicModel.set(resolved);
-    this.persistModel('strategic', resolved);
+    this.strategicModel.set(value);
+    this.persistModel('strategic', value);
     this.change.emit();
   }
 
   onTacticalModelChange(value: string | null): void {
-    const resolved = value === this.resolvedTacticalModel() ? null : value;
-    this.tacticalModel.set(resolved);
-    this.persistModel('tactical', resolved);
+    this.tacticalModel.set(value);
+    this.persistModel('tactical', value);
     this.change.emit();
   }
 
   onSubagentModelChange(value: string | null): void {
-    const resolved = value === this.resolvedSubagentModel() ? null : value;
-    this.subagentModel.set(resolved);
-    this.persistModel('subagent', resolved);
+    this.subagentModel.set(value);
+    this.persistModel('subagent', value);
     this.change.emit();
   }
 
   onSessionModelChange(value: string | null): void {
-    const resolved = value === this.resolvedSessionModel() ? null : value;
-    this.sessionModel.set(resolved);
+    this.sessionModel.set(value);
     // A reasoning pick is model-specific intent — drop it with the model so a
     // stale level never leaks into another family's option set.
     this.sessionReasoning.set(null);
-    this.persistModel('session', resolved);
+    this.persistModel('session', value);
     this.change.emit();
   }
 
   onSessionReasoningChange(value: string | null): void {
-    // Picking the resolved default = no override (mirrors Image Quality).
-    const normalized =
-      value === null || value === this.resolvedSessionReasoning() ? null : value;
-    this.sessionReasoning.set(normalized);
+    // Only the explicit "Default" option clears the override; picking the
+    // concrete level that happens to be the default pins it.
+    this.sessionReasoning.set(value);
     this.change.emit();
   }
 
   onTemperatureChange(value: number): void {
-    this.temperature.set(value === this.resolvedTemperature() ? null : value);
+    this.temperature.set(value);
     this.change.emit();
   }
 

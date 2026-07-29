@@ -9,8 +9,10 @@ import {
   IMAGE_QUALITY_TIERS,
   PERMISSION_MODES,
   readConfigPath,
+  pinResolvedValue,
   SettingsMode,
 } from './agent-settings.types';
+import {PinOnInteractDirective} from './pin-on-interact.directive';
 import {allowedEnumOptions} from './capability-gates';
 import type {GrantCatalog} from '../../core/models/api.model';
 
@@ -21,7 +23,7 @@ import type {GrantCatalog} from '../../core/models/api.model';
 @Component({
   selector: 'app-execution-group',
   standalone: true,
-  imports: [FormsModule, TranslocoPipe, AppIconComponent],
+  imports: [FormsModule, TranslocoPipe, AppIconComponent, PinOnInteractDirective],
   template: `
     <div class="settings-group">
       <div class="group-label">{{ 'agentSettings.execution.group' | transloco }}</div>
@@ -34,6 +36,7 @@ import type {GrantCatalog} from '../../core/models/api.model';
             <select
               class="form-input"
               [ngModel]="autonomy() ?? resolvedAutonomy()"
+              appPinOnInteract (pin)="pinValue(autonomy, resolvedAutonomy())"
               (ngModelChange)="onAutonomyChange($event)"
               [disabled]="disabled()"
             >
@@ -56,6 +59,7 @@ import type {GrantCatalog} from '../../core/models/api.model';
             <select
               class="form-input"
               [ngModel]="permissionMode() ?? resolvedPermissionMode()"
+              appPinOnInteract (pin)="pinValue(permissionMode, resolvedPermissionMode())"
               (ngModelChange)="onPermissionModeChange($event)"
               [disabled]="disabled()"
             >
@@ -82,6 +86,7 @@ import type {GrantCatalog} from '../../core/models/api.model';
             <select
               class="form-input"
               [ngModel]="narrationMode() ?? resolvedNarrationMode()"
+              appPinOnInteract (pin)="pinValue(narrationMode, resolvedNarrationMode())"
               (ngModelChange)="onNarrationModeChange($event)"
               [disabled]="disabled()"
             >
@@ -101,6 +106,7 @@ import type {GrantCatalog} from '../../core/models/api.model';
             <select
               class="form-input"
               [ngModel]="imageQuality() ?? resolvedImageQuality()"
+              appPinOnInteract (pin)="pinValue(imageQuality, resolvedImageQuality())"
               (ngModelChange)="onImageQualityChange($event)"
               [disabled]="disabled()"
             >
@@ -154,6 +160,7 @@ import type {GrantCatalog} from '../../core/models/api.model';
             <select
               class="form-input compact-select"
               [ngModel]="criticRounds() ?? resolvedCriticRounds()"
+              appPinOnInteract (pin)="pinValue(criticRounds, resolvedCriticRounds())"
               (ngModelChange)="onCriticRoundsChange($event)"
               [disabled]="disabled()"
             >
@@ -423,46 +430,54 @@ export class ExecutionGroupComponent {
     return count;
   });
 
+  /** Commit a displayed-but-inherited value on deliberate interaction.
+   *  See PinOnInteractDirective — a <select> emits no change event when the
+   *  option already showing is re-picked, so without this the resolved default
+   *  is the one value the form cannot express. */
+  pinValue<T>(target: {(): T | null; set(value: T | null): void}, resolved: T): void {
+    if (pinResolvedValue(target, resolved)) this.change.emit();
+  }
+
   onAutonomyChange(value: string): void {
-    this.autonomy.set(value === this.resolvedAutonomy() ? null : value);
+    this.autonomy.set(value);
     this.change.emit();
   }
 
   onPermissionModeChange(value: string): void {
-    this.permissionMode.set(value === this.resolvedPermissionMode() ? null : value);
+    this.permissionMode.set(value);
     this.change.emit();
   }
 
   onNarrationModeChange(value: string): void {
-    this.narrationMode.set(value === this.resolvedNarrationMode() ? null : value);
+    this.narrationMode.set(value);
     this.change.emit();
   }
 
   onScholarChange(event: Event): void {
     const checked = (event.target as HTMLInputElement).checked;
-    this.scholar.set(checked === this.resolvedScholar() ? null : checked);
+    this.scholar.set(checked);
     this.change.emit();
   }
 
   onCriticChange(event: Event): void {
     const checked = (event.target as HTMLInputElement).checked;
-    this.critic.set(checked === this.resolvedCritic() ? null : checked);
+    this.critic.set(checked);
     this.change.emit();
   }
 
   onCriticRoundsChange(value: number): void {
-    this.criticRounds.set(value === this.resolvedCriticRounds() ? null : value);
+    this.criticRounds.set(value);
     this.change.emit();
   }
 
   onProjectMemoryChange(event: Event): void {
     const checked = (event.target as HTMLInputElement).checked;
-    this.projectMemory.set(checked === this.resolvedProjectMemory() ? null : checked);
+    this.projectMemory.set(checked);
     this.change.emit();
   }
 
   onImageQualityChange(value: string): void {
-    this.imageQuality.set(value === this.resolvedImageQuality() ? null : value);
+    this.imageQuality.set(value);
     this.change.emit();
   }
 

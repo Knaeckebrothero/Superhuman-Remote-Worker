@@ -124,6 +124,9 @@ interface Project {
               <option value="autonomous">{{ 'sessions.create.permissionAutonomous' | transloco }}</option>
             </app-select>
           </app-form-field>
+          @if (createError()) {
+            <div class="create-error" role="alert">{{ createError() }}</div>
+          }
           <div class="dialog-actions">
             <app-button variant="primary" size="sm" [loading]="creating()" (clicked)="createSession()">
               {{ 'sessions.create.create' | transloco }}
@@ -363,6 +366,16 @@ interface Project {
       color: var(--text-muted);
     }
 
+    .create-error {
+      padding: 8px 12px;
+      margin-bottom: 12px;
+      border-radius: var(--radius-control);
+      background: var(--danger-tint);
+      border: 1px solid var(--danger-tint);
+      color: var(--danger-color);
+      font-size: 12px;
+    }
+
     .dialog-actions {
       display: flex;
       gap: 8px;
@@ -546,6 +559,8 @@ export class SessionsPageComponent implements OnInit {
     pendingDelete = signal<Thread | null>(null);
 
     showCreate = false;
+    /** In-dialog server rejection, so a bad config is correctable in place. */
+    readonly createError = signal<string | null>(null);
     newTitle = '';
     newConfig = 'session_base';
     newModel = this.loadSavedSessionModel();
@@ -612,6 +627,7 @@ export class SessionsPageComponent implements OnInit {
 
     async createSession(): Promise<void> {
         this.creating.set(true);
+        this.createError.set(null);
         const body: Record<string, any> = {
             title: this.newTitle || 'Untitled Session',
             config_name: this.newConfig,
@@ -624,12 +640,25 @@ export class SessionsPageComponent implements OnInit {
         if (this.selectedProjectIds().length > 0) {
             body['project_ids'] = this.selectedProjectIds();
         }
-        this.showCreate = false;
-        this.newTitle = '';
-        this.selectedProjectIds.set([]);
-        // Navigate immediately to chat view with spinner, create thread in background
-        this.router.navigate(['/sessions', '_creating'], {state: {createBody: body}});
-        this.creating.set(false);
+        // Create before dismissing the dialog: a rejected config used to close
+        // it, clear the fields and bounce back here with a toast, so there was
+        // nothing left to correct. Mirrors the full New Session form.
+        try {
+            const resp = await firstValueFrom(
+                this.http.post<{ thread_id: string }>(
+                    `${environment.apiUrl}/persistent/threads`,
+                    body,
+                ),
+            );
+            this.showCreate = false;
+            this.newTitle = '';
+            this.selectedProjectIds.set([]);
+            await this.router.navigate(['/sessions', resp.thread_id]);
+        } catch (err) {
+            this.createError.set(this.errors.translate(err, 'sessions.create.failed'));
+        } finally {
+            this.creating.set(false);
+        }
     }
 
     async onRenameThread(thread: Thread, title: string): Promise<void> {
