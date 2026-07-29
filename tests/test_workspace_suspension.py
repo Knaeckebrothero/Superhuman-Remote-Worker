@@ -1010,7 +1010,9 @@ class TestThreadTierIsExplicit:
         ok = await svc.suspend_thread_workspace("tid-vm")
 
         assert ok is True, "vm-tier suspend must not bail on the container status"
-        vm_prov.delete_thread_vm.assert_awaited_once_with("tid-vm")
+        # purge_disk=True here: this suite does not enable VM_PERSISTENT_ROOTDISK,
+        # so there is no disk to keep. See TestVmSuspendRidesThePersistentRootdisk.
+        vm_prov.delete_thread_vm.assert_awaited_once_with("tid-vm", purge_disk=True)
 
     @pytest.mark.asyncio
     async def test_vm_tier_snapshot_is_labelled_vm(self):
@@ -1076,4 +1078,117 @@ class TestThreadTierIsExplicit:
         n = await svc.check_idle_threads()
 
         assert n == 1, "idle vm-tier thread must actually be suspended"
-        vm_prov.delete_thread_vm.assert_awaited_once_with("tid-vm")
+        vm_prov.delete_thread_vm.assert_awaited_once_with("tid-vm", purge_disk=True)
+
+
+class TestVmSuspendRidesThePersistentRootdisk:
+    """VM session suspend used to be fail-closed on a snapshot that can never
+    succeed: capture_vm_snapshot SSHes from the orchestrator, a VM workspace is
+    only reachable over the tailnet, so every VM suspend refused and left the VM
+    running. With a persistent rootdisk the snapshot stops being load-bearing —
+    the disk itself carries the files across the teardown.
+
+    docs/features/vm_workspace_persistence_reconciliation.md,
+    docs/issues/vm_workspace_snapshot_unreachable_from_orchestrator.md.
+    """
+
+    @pytest.mark.asyncio
+    async def test_suspend_keeps_the_rootdisk(self, monkeypatch):
+        monkeypatch.setenv("VM_PERSISTENT_ROOTDISK", "true")
+        svc, vm_prov = make_vm_service()
+        svc._db.get_thread = AsyncMock(return_value=make_vm_thread())
+
+        ok = await svc.suspend_thread_workspace("tid-vm")
+
+        assert ok is True
+        vm_prov.delete_thread_vm.assert_awaited_once_with("tid-vm", purge_disk=False)
+
+    @pytest.mark.asyncio
+    async def test_unreachable_snapshot_no_longer_blocks_suspend(self, monkeypatch):
+        """The exact live failure: capture returns False (not raises) because
+        the orchestrator has no tailnet route. The VM must still suspend."""
+        monkeypatch.setenv("VM_PERSISTENT_ROOTDISK", "true")
+        svc, vm_prov = make_vm_service()
+        svc._db.get_thread = AsyncMock(return_value=make_vm_thread())
+        svc._snapshot_service.capture_vm_snapshot = AsyncMock(return_value=False)
+
+        ok = await svc.suspend_thread_workspace("tid-vm")
+
+        assert ok is True, "a kept disk makes the snapshot non-load-bearing"
+        vm_prov.delete_thread_vm.assert_awaited_once_with("tid-vm", purge_disk=False)
+
+    @pytest.mark.asyncio
+    async def test_suspend_records_the_kept_disk(self, monkeypatch):
+        """Restore reads this to decide whether to extract a snapshot over the
+        reattached disk (it must not)."""
+        monkeypatch.setenv("VM_PERSISTENT_ROOTDISK", "true")
+        svc, _ = make_vm_service()
+        svc._db.get_thread = AsyncMock(return_value=make_vm_thread())
+
+        await svc.suspend_thread_workspace("tid-vm")
+
+        merged = {}
+        for call in svc._db.merge_thread_vm_context.await_args_list:
+            merged.update(call.args[1])
+        assert merged.get("rootdisk") == "kept"
+
+    @pytest.mark.asyncio
+    async def test_flag_off_stays_fail_closed(self, monkeypatch):
+        """Without the controller-side flag the disk cascade-deletes, so a
+        failed snapshot must still keep the workspace alive — suspending would
+        destroy the session."""
+        monkeypatch.setenv("VM_PERSISTENT_ROOTDISK", "false")
+        svc, vm_prov = make_vm_service()
+        svc._db.get_thread = AsyncMock(return_value=make_vm_thread())
+        svc._snapshot_service.capture_vm_snapshot = AsyncMock(return_value=False)
+
+        ok = await svc.suspend_thread_workspace("tid-vm")
+
+        assert ok is False
+        vm_prov.delete_thread_vm.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_container_tier_stays_fail_closed(self, monkeypatch):
+        """Pods have no rootdisk to keep — the snapshot is still the only copy,
+        flag or no flag."""
+        monkeypatch.setenv("VM_PERSISTENT_ROOTDISK", "true")
+        svc, _ = make_vm_service()
+        svc._db.get_thread = AsyncMock(return_value=make_container_thread())
+        svc._snapshot_service.capture_vm_snapshot = AsyncMock(return_value=False)
+
+        ok = await svc.suspend_thread_workspace("tid-pod")
+
+        assert ok is False
+        svc._container_provisioner.delete_workspace.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_restore_does_not_extract_over_a_reattached_disk(self, monkeypatch):
+        """The disk is the live state at teardown; any snapshot is at best the
+        same moment and at worst older. Extracting it would overwrite newer
+        files with stale ones."""
+        monkeypatch.setenv("VM_PERSISTENT_ROOTDISK", "true")
+        svc, _ = make_vm_service()
+        thread = make_vm_thread()
+        thread["metadata"]["vm"]["rootdisk"] = "kept"
+        svc._db.get_thread = AsyncMock(return_value=thread)
+        svc._extract_snapshot = AsyncMock()
+
+        ok = await svc.restore_thread_workspace("tid-vm")
+
+        assert ok is True
+        svc._extract_snapshot.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_restore_still_extracts_when_the_disk_was_purged(self, monkeypatch):
+        """A thread suspended before the flag was on has no disk waiting — its
+        S3 snapshot is still the only copy."""
+        monkeypatch.setenv("VM_PERSISTENT_ROOTDISK", "true")
+        svc, _ = make_vm_service()
+        thread = make_vm_thread()
+        thread["metadata"]["vm"]["rootdisk"] = "purged"
+        svc._db.get_thread = AsyncMock(return_value=thread)
+        svc._extract_snapshot = AsyncMock()
+
+        await svc.restore_thread_workspace("tid-vm")
+
+        svc._extract_snapshot.assert_awaited_once()
