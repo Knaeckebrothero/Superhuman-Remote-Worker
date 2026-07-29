@@ -1352,3 +1352,87 @@ class TestUpgradedThreadReadsAsVmTier:
         await svc.suspend_thread_workspace("tid-up")
 
         vm_prov.delete_thread_vm.assert_awaited_once_with("tid-up", purge_disk=False)
+
+
+class TestVmRestoreEndsAtTheCreate:
+    """For a kept-disk VM restore there is nothing to do after create_thread_vm:
+    no extract (the disk already holds the workspace) and no SSH (coordinates
+    arrive minutes later via the daemon's register — VM creation is async over
+    NATS). The container-era tail required an ssh_host synchronously, so every
+    VM restore fell into 'no SSH host after provisioning' and stamped a
+    transient vm.status='failed' — which a declared-vm thread's attach poll
+    treats as fatal. Live-gate finding (thread a1240add)."""
+
+    def _kept_thread(self):
+        thread = make_vm_thread(thread_id="tid-vm")
+        thread["metadata"]["vm"]["rootdisk"] = "kept"
+        thread["metadata"]["vm"]["status"] = "deleted"
+        return thread
+
+    @pytest.mark.asyncio
+    async def test_kept_disk_restore_succeeds_without_ssh_host(self, monkeypatch):
+        monkeypatch.setenv("VM_PERSISTENT_ROOTDISK", "true")
+        svc, vm_prov = make_vm_service()
+        before = self._kept_thread()
+        # After create_thread_vm the context is reset to provisioning — no
+        # ssh_host yet. The old tail read this as failure.
+        after = self._kept_thread()
+        after["metadata"]["vm"] = {"status": "provisioning", "rootdisk": "kept"}
+        svc._db.get_thread = AsyncMock(side_effect=[before, after])
+        svc._extract_snapshot = AsyncMock()
+
+        ok = await svc.restore_thread_workspace("tid-vm")
+
+        assert ok is True
+        vm_prov.create_thread_vm.assert_awaited_once_with("tid-vm")
+        svc._extract_snapshot.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_kept_disk_restore_never_stamps_failed(self, monkeypatch):
+        monkeypatch.setenv("VM_PERSISTENT_ROOTDISK", "true")
+        svc, _ = make_vm_service()
+        before = self._kept_thread()
+        after = self._kept_thread()
+        after["metadata"]["vm"] = {"status": "provisioning", "rootdisk": "kept"}
+        svc._db.get_thread = AsyncMock(side_effect=[before, after])
+
+        await svc.restore_thread_workspace("tid-vm")
+
+        for call in svc._db.merge_thread_vm_context.await_args_list:
+            assert call.args[1].get("status") != "failed", (
+                "a kept-disk restore must not write the transient 'failed' that "
+                "kills a declared-vm thread's attach poll"
+            )
+
+    @pytest.mark.asyncio
+    async def test_kept_disk_restore_defers_ready_to_the_daemon(self, monkeypatch):
+        """'ready' must come from real evidence (daemon register / lifecycle
+        status), not from restore optimistically stamping it while the VM is
+        still booting."""
+        monkeypatch.setenv("VM_PERSISTENT_ROOTDISK", "true")
+        svc, _ = make_vm_service()
+        before = self._kept_thread()
+        after = self._kept_thread()
+        after["metadata"]["vm"] = {"status": "provisioning", "rootdisk": "kept"}
+        svc._db.get_thread = AsyncMock(side_effect=[before, after])
+
+        await svc.restore_thread_workspace("tid-vm")
+
+        for call in svc._db.merge_thread_vm_context.await_args_list:
+            assert call.args[1].get("status") != "ready"
+
+    @pytest.mark.asyncio
+    async def test_purged_disk_vm_restore_keeps_the_extract_path(self, monkeypatch):
+        """A pre-flag suspend has no disk waiting — its S3 snapshot is the only
+        copy, so the extract (and therefore the ssh wait) must remain."""
+        monkeypatch.setenv("VM_PERSISTENT_ROOTDISK", "true")
+        svc, _ = make_vm_service()
+        thread = make_vm_thread(thread_id="tid-vm")
+        thread["metadata"]["vm"]["rootdisk"] = "purged"
+        svc._db.get_thread = AsyncMock(return_value=thread)
+        svc._extract_snapshot = AsyncMock()
+
+        ok = await svc.restore_thread_workspace("tid-vm")
+
+        assert ok is True
+        svc._extract_snapshot.assert_awaited_once()

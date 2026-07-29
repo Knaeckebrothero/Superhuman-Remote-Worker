@@ -734,6 +734,24 @@ class WorkspaceSuspensionService:
                     )
                     return False
 
+                # Kept rootdisk: the restore IS the create. The reattached disk
+                # already holds the workspace (extracting a snapshot over it
+                # would replace newer files with older ones), and there is no
+                # SSH to wait for — VM creation is async over NATS, so
+                # ssh coordinates arrive minutes later via the daemon's
+                # register, which also supplies the real 'ready'. The
+                # container-era tail below demanded an ssh_host synchronously
+                # and read its absence as failure, stamping a transient
+                # vm.status='failed' that a declared-vm thread's attach poll
+                # treats as fatal (live-gate finding, thread a1240add).
+                if rootdisk_kept:
+                    logger.info(
+                        "VM restore for thread %s rides the kept rootdisk — no "
+                        "snapshot extract; readiness arrives via the daemon",
+                        thread_id,
+                    )
+                    return True
+
                 thread = await self._db.get_thread(thread_id)
                 metadata = thread.get("metadata") or {}
                 if isinstance(metadata, str):
@@ -785,22 +803,15 @@ class WorkspaceSuspensionService:
                     )
                 return False
 
-            # Extract snapshot into the workspace — unless the VM reattached a
-            # kept rootdisk, in which case the files are already there and are
-            # *newer* than any snapshot (the disk is the live state at teardown;
-            # a snapshot is the same moment at best, stale at worst). Extracting
-            # over it would overwrite newer files with older ones.
+            # Extract snapshot into the workspace. Kept-rootdisk VM restores
+            # never reach this point (they returned right after the create
+            # above — the disk already holds the workspace and extracting a
+            # snapshot over it would replace newer files with older ones), so
+            # everything here has an S3 snapshot as its only copy.
             ssh_port = _resolve_ssh_port(ws_ctx, vm_ctx, is_vm=is_vm)
-            if is_vm and rootdisk_kept:
-                logger.info(
-                    "Skipping snapshot extract for thread %s — its persistent "
-                    "rootdisk was reattached and already holds the workspace",
-                    thread_id,
-                )
-            else:
-                await self._extract_snapshot(
-                    thread_id, ssh_host, ssh_port=ssh_port, entity_type="threads"
-                )
+            await self._extract_snapshot(
+                thread_id, ssh_host, ssh_port=ssh_port, entity_type="threads"
+            )
 
             restored_ctx = {
                 "status": "ready",
