@@ -19,6 +19,7 @@ import {AppCheckboxComponent} from '../../ui/checkbox';
 import {AppBadgeComponent} from '../../ui/badge';
 import {AppFormFieldComponent} from '../../ui/form-field';
 import {ProjectLoopComponent} from './project-loop.component';
+import {ProjectOfficerComponent} from './project-officer.component';
 import {ProjectBacklogComponent} from './project-backlog.component';
 import {ExternalImageDirective} from '../../ui/external-image';
 import {
@@ -37,7 +38,7 @@ import {
     User,
 } from '../../core/models/api.model';
 
-type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'experts' | 'members' | 'loop' | 'settings';
+type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'experts' | 'members' | 'loop' | 'centurion' | 'settings';
 
 @Component({
   selector: 'app-project-detail-page',
@@ -60,6 +61,7 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
     MarkdownComponent,
     ExternalImageDirective,
     ProjectLoopComponent,
+    ProjectOfficerComponent,
     ProjectBacklogComponent,
   ],
   template: `
@@ -767,6 +769,13 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
           @if (activeTab() === 'loop') {
             <app-project-loop [projectId]="project()?.id ?? ''" />
             <app-project-backlog [projectId]="project()?.id ?? ''" />
+          }
+
+          @if (activeTab() === 'centurion') {
+            <app-project-officer
+              [projectId]="project()?.id ?? ''"
+              [projectName]="project()?.name ?? ''"
+            />
           }
 
           @if (activeTab() === 'settings') {
@@ -1693,6 +1702,7 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
     { id: 'experts', labelKey: 'projectDetail.tabs.experts' },
     { id: 'members', labelKey: 'projectDetail.tabs.members' },
     { id: 'loop', labelKey: 'projectDetail.tabs.loop' },
+    { id: 'centurion', labelKey: 'projectDetail.tabs.centurion' },
     { id: 'settings', labelKey: 'projectDetail.tabs.settings' },
   ];
 
