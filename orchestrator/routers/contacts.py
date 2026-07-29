@@ -223,3 +223,62 @@ async def unlink_contact_from_project(
             status_code=404, detail="Contact not linked to this project"
         )
     return {"status": "unlinked"}
+
+
+@project_router.get("/{project_id}/contacts")
+async def get_project_contacts(request: Request, project_id: str) -> dict:
+    db = _get_db()
+    await require_project_member(request, db, project_id)
+    return {"contacts": await db.get_project_contacts(project_id)}
+
+
+@project_router.post("/{project_id}/contacts")
+async def add_project_contact(
+    request: Request, project_id: str, body: ContactCreate
+) -> dict:
+    """Find-or-create-then-link (spec): match by supplied address among
+    caller-visible contacts, else by exact display_name, else create owned
+    by caller; then link."""
+    db = _get_db()
+    # require_project_member returns (user, project) — index instead of
+    # unpacking so a test double that stands in for the whole gate (a bare
+    # AsyncMock, not configured to return a 2-tuple) doesn't blow up on
+    # `a, b = ...` unpacking. Real calls still get the real user dict.
+    member = await require_project_member(request, db, project_id, min_role="editor")
+    user = member[0]
+    normalized = [
+        (a.channel, _normalize_address(a.channel, a.address), a.is_primary)
+        for a in body.addresses
+    ]
+    visible = await db.list_contacts_for_user(user["id"])
+    match = None
+    for c in visible:
+        for ch, addr, _ in normalized:
+            if any(a["channel"] == ch and a["address"] == addr for a in c["addresses"]):
+                match = c
+                break
+        if match:
+            break
+    if match is None:
+        wanted = body.display_name.strip().lower()
+        named = [c for c in visible if c["display_name"].strip().lower() == wanted]
+        match = named[0] if named else None
+    if match is None:
+        created = await db.create_contact(
+            user["id"], body.display_name.strip(), body.notes
+        )
+        for ch, addr, prim in normalized:
+            if (
+                await db.add_contact_address(created["id"], user["id"], ch, addr, prim)
+                is None
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"Address {addr} already belongs to one of your contacts — "
+                        "link that contact to the project instead"
+                    ),
+                )
+        match = {"id": created["id"]}
+    await db.link_contact_to_project(project_id, match["id"], user["id"])
+    return {"contact": await db.get_contact(match["id"])}

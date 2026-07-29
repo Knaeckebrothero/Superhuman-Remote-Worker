@@ -9646,29 +9646,47 @@ async def send_agent_message(
                     match = m
                     break
             if not match:
-                # Fallback: try external contacts for this project
-                ext_contact = await postgres_db.resolve_external_contact(
-                    project_id,
-                    request.to,
+                # Fallback: contacts registry (channel-aware; email path here)
+                resolved = await postgres_db.resolve_contact(
+                    project_id, request.to, "email"
                 )
-                if ext_contact:
-                    recipient_email = ext_contact["email"]
-                    recipient_name = ext_contact.get("display_name", "Contact")
-                    # External contacts don't have a user_id — keep job owner's
-                else:
-                    available = ", ".join(m.get("display_name", "?") for m in members)
-                    # Also list external contacts
-                    ext_contacts = await postgres_db.get_external_contacts(project_id)
-                    if ext_contacts:
-                        ext_names = ", ".join(
-                            c.get("display_name", "?") for c in ext_contacts
-                        )
-                        available += f" | External: {ext_names}"
+                if resolved["status"] == "ok":
+                    recipient_email = resolved["address"]
+                    recipient_name = resolved["display_name"]
+                    # Contacts don't have a user_id — keep job owner's
+                elif resolved["status"] == "no_channel_address":
                     raise HTTPException(
                         status_code=404,
                         detail=(
-                            f"Recipient '{request.to}' not found among project members or external contacts. "
-                            f"Available: {available}"
+                            f"{resolved['display_name']} has no email address "
+                            f"({', '.join(resolved['channels']) or 'no addresses'} only)."
+                        ),
+                    )
+                elif resolved["status"] == "ambiguous":
+                    cands = "; ".join(
+                        f"{c['display_name']} <{', '.join(c['addresses'])}>"
+                        for c in resolved["candidates"]
+                    )
+                    raise HTTPException(
+                        status_code=404,
+                        detail=(
+                            f"Recipient '{request.to}' is ambiguous — specify an address. "
+                            f"Candidates: {cands}"
+                        ),
+                    )
+                else:
+                    available = ", ".join(m.get("display_name", "?") for m in members)
+                    contact_rows = await postgres_db.get_project_contacts(project_id)
+                    if contact_rows:
+                        names = ", ".join(
+                            c.get("display_name", "?") for c in contact_rows
+                        )
+                        available += f" | Contacts: {names}"
+                    raise HTTPException(
+                        status_code=404,
+                        detail=(
+                            f"Recipient '{request.to}' not found among project members "
+                            f"or contacts. Available: {available}"
                         ),
                     )
             else:
@@ -10374,96 +10392,6 @@ async def get_pending_actions(request: Request) -> dict[str, Any]:
         return data
     except Exception as e:
         logger.exception(f"Failed to get pending action counts: {e}")
-        raise HTTPException(status_code=500, detail=str(e)) from e
-
-
-# =============================================================================
-# External Contacts Endpoints (Phase 3 Live Communication)
-# =============================================================================
-
-
-class ExternalContactCreate(BaseModel):
-    """Request body for adding an external contact."""
-
-    display_name: str = Field(..., max_length=200)
-    email: str = Field(..., max_length=320)
-
-
-@app.post("/api/projects/{project_id}/contacts")
-async def add_external_contact(
-    project_id: str,
-    body: ExternalContactCreate,
-    request: Request,
-) -> dict[str, Any]:
-    """Add an external contact to a project. Requires editor or higher."""
-    await require_project_member(request, postgres_db, project_id, min_role="editor")
-    try:
-        # Basic email format validation
-        if "@" not in body.email or "." not in body.email.split("@")[-1]:
-            raise HTTPException(status_code=400, detail="Invalid email format")
-
-        contact = await postgres_db.add_external_contact(
-            project_id=project_id,
-            display_name=body.display_name,
-            email=body.email,
-        )
-        return {
-            "status": "created",
-            "contact": {
-                "id": str(contact["id"]),
-                "display_name": contact["display_name"],
-                "email": _mask_email(contact["email"]),
-                "created_at": contact["created_at"].isoformat()
-                if contact.get("created_at")
-                else None,
-            },
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.exception(f"Failed to add external contact: {e}")
-        raise HTTPException(status_code=500, detail=str(e)) from e
-
-
-@app.get("/api/projects/{project_id}/contacts")
-async def list_external_contacts(request: Request, project_id: str) -> dict[str, Any]:
-    """List external contacts for a project."""
-    await require_project_member(request, postgres_db, project_id)
-    try:
-        contacts = await postgres_db.get_external_contacts(project_id)
-        return {
-            "contacts": [
-                {
-                    "id": str(c["id"]),
-                    "display_name": c["display_name"],
-                    "email": _mask_email(c["email"]),
-                    "created_at": c["created_at"].isoformat()
-                    if c.get("created_at")
-                    else None,
-                }
-                for c in contacts
-            ],
-        }
-    except Exception as e:
-        logger.exception(f"Failed to list external contacts: {e}")
-        raise HTTPException(status_code=500, detail=str(e)) from e
-
-
-@app.delete("/api/projects/{project_id}/contacts/{contact_id}")
-async def delete_external_contact(
-    request: Request, project_id: str, contact_id: str
-) -> dict[str, str]:
-    """Delete an external contact. Requires editor or higher."""
-    await require_project_member(request, postgres_db, project_id, min_role="editor")
-    try:
-        deleted = await postgres_db.delete_external_contact(contact_id)
-        if not deleted:
-            raise HTTPException(status_code=404, detail="Contact not found")
-        return {"status": "deleted"}
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.exception(f"Failed to delete external contact: {e}")
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
