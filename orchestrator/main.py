@@ -14273,7 +14273,7 @@ async def _advance_loop_member(
                 "loop_id": loop_id,
                 "turn_all_failed": all_failed,
                 "consecutive_failures": consecutive,
-                "note": (
+                "summary": (
                     "loop turn concluded — scheduling='officer': the next "
                     "dispatch is yours (nothing was auto-created)"
                 ),
@@ -20587,7 +20587,7 @@ async def _conclude_conference_if_any(thread: dict) -> None:
             payload={
                 "conference_thread_id": conf_tid,
                 "title": str(thread.get("title") or ""),
-                "note": (
+                "summary": (
                     "conference concluded — direction agreed there is now in "
                     "force. Re-read the charter posture and any KB/backlog "
                     "notes updated during the meeting before your next "
