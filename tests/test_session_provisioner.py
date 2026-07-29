@@ -297,3 +297,135 @@ async def test_ensure_skips_vm_thread_with_gitea_workspace_container():
     )
     assert res is None
     prov.create_workspace.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Suspended VM sessions must be restored on reconnect
+# (docs/features/vm_workspace_persistence_reconciliation.md, live-gate step 4)
+# ---------------------------------------------------------------------------
+
+
+def _suspended_vm_thread(backend="vm", vm_status="deleted", rootdisk="kept"):
+    """A VM session after suspend. vm.status is 'deleted' rather than
+    'suspended' because the controller's async delete-status overwrites the
+    suspend marker; rootdisk='kept' is the durable signature of "torn down
+    with the disk waiting"."""
+    return {
+        "id": "t-vm",
+        "status": "suspended",
+        "metadata": {
+            "config_override": {"workspace": {"backend": backend}},
+            "workspace_container": {
+                "git_remote_url": "http://gitea/srw/thread-t-vm.git",
+                "repo_name": "thread-t-vm",
+            },
+            "vm": {
+                "status": vm_status,
+                "rootdisk": rootdisk,
+                "ssh_host": "100.64.2.9",
+                "ssh_port": 22,
+            },
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_suspended_vm_thread_is_restored_on_ensure():
+    """The reconnect path: /prepare fires ensure_session_workspace; a VM thread
+    whose disk is waiting must get its VM back. Without this trigger nothing
+    restores a suspended VM session — the two main.py triggers key on
+    workspace_container.status, which VM suspend never writes (live-gate
+    finding, thread a1240add)."""
+    db = AsyncMock()
+    db.get_thread = AsyncMock(return_value=_suspended_vm_thread())
+    prov = AsyncMock()
+    susp = AsyncMock()
+    susp.restore = AsyncMock(return_value=True)
+
+    res = await ensure_session_workspace(
+        "t-vm", db=db, provisioner=prov, suspension=susp
+    )
+
+    susp.restore.assert_awaited_once()
+    owner = susp.restore.await_args.args[0]
+    assert owner.kind == "session" and owner.id == "t-vm"
+    assert res is not None and res.status == "restoring"
+    prov.create_workspace.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_upgraded_suspended_vm_thread_is_restored_despite_lite_backend():
+    """An UPGRADED thread still declares its original backend ('virtual' here)
+    — the upgrade endpoints never rewrite it. The restore check runs before the
+    lite arm so the declared string cannot hide the waiting disk."""
+    db = AsyncMock()
+    db.get_thread = AsyncMock(return_value=_suspended_vm_thread(backend="virtual"))
+    prov = AsyncMock()
+    susp = AsyncMock()
+    susp.restore = AsyncMock(return_value=True)
+
+    res = await ensure_session_workspace(
+        "t-vm", db=db, provisioner=prov, suspension=susp
+    )
+
+    susp.restore.assert_awaited_once()
+    assert res is not None and res.status == "restoring"
+
+
+@pytest.mark.asyncio
+async def test_purged_disk_does_not_trigger_restore():
+    """rootdisk='purged' (terminal release) means there is nothing to reattach
+    — the VM arm returns None exactly as before."""
+    db = AsyncMock()
+    db.get_thread = AsyncMock(return_value=_suspended_vm_thread(rootdisk="purged"))
+    prov = AsyncMock()
+    susp = AsyncMock()
+
+    res = await ensure_session_workspace(
+        "t-vm", db=db, provisioner=prov, suspension=susp
+    )
+
+    susp.restore.assert_not_called()
+    assert res is None
+
+
+@pytest.mark.asyncio
+async def test_live_vm_thread_does_not_trigger_restore():
+    """A running VM (status=ready) has nothing to restore; the vm arm skips as
+    before. Also guards double-fire: 'restoring' itself must not re-trigger."""
+    for status in ("ready", "restoring", "provisioning"):
+        db = AsyncMock()
+        db.get_thread = AsyncMock(return_value=_suspended_vm_thread(vm_status=status))
+        susp = AsyncMock()
+
+        res = await ensure_session_workspace(
+            "t-vm", db=db, provisioner=AsyncMock(), suspension=susp
+        )
+
+        susp.restore.assert_not_called()
+        assert res is None
+
+
+@pytest.mark.asyncio
+async def test_container_thread_with_no_vm_context_is_untouched():
+    """Sandbox threads never carry vm.rootdisk — their suspended restore keeps
+    flowing through ensure_workspace's own branch."""
+    db = AsyncMock()
+    db.get_thread = AsyncMock(
+        return_value={
+            "id": "t-pod",
+            "status": "active",
+            "metadata": {"workspace_container": {"status": "failed"}},
+        }
+    )
+    prov = AsyncMock()
+    prov.create_workspace = AsyncMock(return_value=True)
+    susp = AsyncMock()
+
+    res = await ensure_session_workspace(
+        "t-pod", db=db, provisioner=prov, suspension=susp
+    )
+
+    # unchanged: falls through to ensure_workspace, which recreates
+    prov.create_workspace.assert_awaited()
+    assert res is not None

@@ -148,10 +148,34 @@ Covered by `TestUpgradedThreadReadsAsVmTier`.
 
 **Root cause not addressed here:** the upgrade endpoints do not materialize the
 new tier into `config_override.workspace.backend`. Anything else reading that
-field to decide a thread's tier is still wrong for upgraded threads — notably
-`session_provisioner.ensure_session_workspace`, which would happily provision a
-sandbox container for a `sandbox`-declared thread that now runs on a VM. Worth a
-separate pass.
+field to decide a thread's tier is still wrong for upgraded threads. Known
+readers, status as of 2026-07-29:
+
+- `workspace_suspension._thread_is_vm_tier` — **fixed** (`24aed290`,
+  materialized VM first).
+- `session_provisioner.ensure_session_workspace` — **partially fixed**: the
+  suspended-VM restore check now runs before the backend arms, so a suspended
+  upgraded thread gets its VM back on reconnect. The lite/VM arm split itself
+  still keys on the declared backend, so a *live* upgraded thread is still
+  handled by the lite arm (currently harmless — it only ensures the virtual
+  binding — but it is the same latent misread).
+- `persistent_app._session_backend_is_vm` / `_session_backend_is_lite`
+  (agent side) — **NOT fixed**: an upgraded-from-virtual thread reads as lite,
+  so at attach the agent skips the workspace poll entirely and binds virtual
+  mounts even when the thread's VM is up. Concretely: after a suspend/resume
+  cycle of an upgraded VM session, the orchestrator restores the VM but the
+  fresh agent attaches as a virtual session and never touches it. How the
+  original (pre-suspend) upgrade flow hands the running agent its VM is a
+  different mechanism (live transport switch), which is why this never showed
+  before suspend/resume existed for VMs.
+
+The clean fix is at the source: make the upgrade endpoints materialize the new
+tier (write `config_override.workspace.backend = "vm"` alongside provisioning
+`metadata.vm`), after which every reader is right again and the
+materialized-first special cases become defense-in-depth. Needs its own pass —
+the write path touches config-override merge semantics
+(`_apply_thread_config_update`) and must not clobber concurrent settings
+edits.
 
 **A third instance of the same bug turned up during the fix.** `_resolve_ssh_port`
 also branched on `if ws_ctx:` — so a VM thread was handed the **pod** port 30022
