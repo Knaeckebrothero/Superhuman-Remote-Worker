@@ -179,9 +179,10 @@ predicted — but each keep-disk recreate strands the previous Headscale node.
 Follow-up (filed, not built): pin the NoCloud instance-id so per-instance
 modules don't re-run and on-disk tailscale state rejoins as the kept node;
 verify first whether KubeVirt's `cloudInitNoCloud` exposes the instance-id at
-all. Until then, keep-disk recreates cost one stranded Headscale node each —
-same leak class as [[srw_agent_headscale_ephemeral_leak]]'s non-ephemeral
-keys.
+all. Checked against Headscale directly: re-auth under the same hostname
+REPLACES the node, so cycles do not accumulate — the costs are an IP change
+per cycle and one stranded node when the entity's *final* delete is a
+keep-delete (terminal purges clean it up).
 
 ### D4 — GC discipline (the leak guard, mirror of Branch a Phase 1)
 

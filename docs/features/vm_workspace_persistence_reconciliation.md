@@ -307,15 +307,35 @@ thread tier read, `7dbd20d8` the missing restore trigger):
    SSH wait; readiness arrives via the daemon.
 2. **D3's cloud-init caveat is resolved by the live probe: the instance-id
    changes per VMI.** The recreated VM re-ran `tailscale up` with the fresh
-   auth key and joined as a NEW node (`100.64.2.9` → `100.64.2.12`). The
-   design's fallback held — the daemon re-registers and refreshes
-   `context.vm`, so nothing breaks — but each suspend/resume cycle strands the
-   previous Headscale node. Mitigation is D3's own suggestion (pin the NoCloud
-   instance-id so per-instance modules don't re-run and on-disk tailscale
-   state rejoins as the kept node); whether KubeVirt's `cloudInitNoCloud`
-   exposes that needs checking. Filed, not built.
+   auth key and rejoined as a new registration (`100.64.2.9` → `.12` → `.14`
+   across three cycles). **Corrected after checking Headscale directly:
+   re-auth under the same hostname REPLACES the node — cycles do not
+   accumulate nodes.** The costs are: the tailnet IP changes per cycle (the
+   daemon re-registers and refreshes `context.vm`, so nothing breaks), and a
+   *final* keep-delete strands the one surviving node. Terminal purges delete
+   it (verified: the purged probes left no nodes behind). Pinning the NoCloud
+   instance-id would make the VM rejoin as the *same* node with a stable IP;
+   whether KubeVirt's `cloudInitNoCloud` exposes the instance-id needs
+   checking first. Filed, not built.
 3. **The agent attached as a lite (virtual) session** — the already-filed
    agent-side tier blind spot observed live: the session is `active` with a
    ready VM the agent is not using. Root fix (materialize the tier at upgrade
    time) is written up in
    `../issues/workspace_suspension_infers_tier_from_metadata_presence.md`.
+
+**Post-gate lifecycle observations (same session):**
+
+- **Soft-end = suspend semantics, by design and now cheaper.** Ending the
+  session routed through drain-suspend: capture declined → suspending anyway →
+  `rootdisk KEPT`. Correct — a soft-ended session is resumable — and the kept
+  disk is what makes that true for VM sessions now. A cockpit tab left open
+  then legitimately resumed the ended session through `/resume` → `/prepare` →
+  the restore trigger → `rootdisk reattach`: an unplanned but real verification
+  of the **ended → resume** path, distinct from suspend → reopen.
+- **Interrupted permanent delete orphans the disk.** The MCP permanent delete
+  failed mid-teardown ("Not authenticated") *after* the thread row and VM were
+  gone but before anything purged the DV — leaving exactly the orphan class
+  layer 3 exists for (and ships OFF). Cleaned up manually (DV + one stranded
+  Headscale node). Two pre-existing wrinkles worth their own look someday:
+  permanent-delete's teardown is not atomic, and the MCP bridge lacks the auth
+  its tail requires.
