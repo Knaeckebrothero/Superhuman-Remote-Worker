@@ -118,9 +118,24 @@ That doc's claim that restore "runs only for sessions/threads" should be read as
    the agent pod is normally gone by reap/idle time, so this means spawning a
    short-lived job purely to snapshot.
 
-### Do this first regardless of the option chosen
+### Do this first regardless of the option chosen — DONE 2026-07-29
 
-**Stop the false success log.** `release_thread_vm` (and its job-side twin) must
+**Stop the false success log. IMPLEMENTED** (`release_vm` and `release_thread_vm`
+now bind the return value and branch on it; tests in
+`tests/test_vm_provisioner.py::TestReleaseReportsSnapshotOutcome` assert a skipped
+capture is never reported as captured, for both the job and thread paths). A
+skipped capture now logs at WARNING:
+
+```
+VM snapshot SKIPPED for thread <id> (100.64.1.6:22) — deleting anyway;
+workspace state not yet pushed to git will be lost. See
+metadata.snapshot.status for the reason.
+```
+
+Deletion still proceeds — non-fatal by design, unchanged. This does not reduce
+the data loss; it stops the logs denying it. Original description follows.
+
+`release_thread_vm` (and its job-side twin) must
 check `capture_vm_snapshot`'s return value and say what actually happened:
 
 ```
