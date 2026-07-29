@@ -220,3 +220,65 @@ The dispatcher itself behaved correctly — it treats a 422 as fatal and fails t
 job fast instead of looping (`Dispatcher: job ... VM parked ... — failing job`).
 
 Cost of the window: one throwaway probe job. Nothing else affected.
+
+**2026-07-29, attempt 2 — steps 1-3 PASSED** (controller `sha-61ce7db`, probe job
+`8bd4e6dc`).
+
+**Step 1 — the disk is structurally independent.** A standalone
+`agent-vm-8bd4e6dc-...-rootdisk` DataVolume was created (`rootdisk created` in the
+controller log), with **empty `ownerReferences`**, `WaitForFirstConsumer`, and the
+VM carrying **no `spec.dataVolumeTemplates`** while
+`volumes[].dataVolume.name` still referenced the disk by name. First boot paid the
+clone as expected: `CloneInProgress` → `Succeeded`, VMI Running 4m10s after create.
+
+**Step 2 — crash → reattach, no clone.** Hard-killed the VM object at 18:32:43
+(`kubectl delete vm`, mimicking the crash arm). The disk survived with **identical
+identity** across the whole cycle:
+
+| | before kill | after recovery |
+|---|---|---|
+| DV UID | `7435e9b4-b588-4f91-8832-ebfa4cbfe5ba` | same |
+| DV creationTimestamp | `2026-07-29T18:25:12Z` | same |
+| PVC UID | `590990cc-cc7e-4971-b99b-fc7f823a5d56` | same |
+| PV | `pvc-590990cc-...` | same |
+
+Controller log, in order:
+
+```
+rootdisk KEPT: agent-vm-8bd4e6dc-...-rootdisk — Headscale node retained so the
+               recreated VM rejoins the tailnet as the same node
+rootdisk reattach: agent-vm-8bd4e6dc-...-rootdisk
+VM created: agent-vm-8bd4e6dc-...
+```
+
+**VMI Running 17s after the recreate, against 4m10s for the first boot** — the clone
+is entirely off the recovery path, which was the design's central claim ("recovery
+becomes faster than a fresh start").
+
+Orchestrator side, from Postgres after recovery:
+
+```
+status=processing | vm.rootdisk=kept | vm.status=ready
+recovering=false  | vm.previous_error=workspace_unavailable
+```
+
+`previous_error` confirms this ran through the crash-recovery arm and not some other
+path; `rootdisk=kept` is the **controller's** reported disposition arriving via
+`_on_vm_lifecycle_status`, not the orchestrator's optimistic write. No
+"no rootdisk disposition" warning was logged, so the drift check saw a
+current controller. D3 (keep the Headscale node on a keep-delete) is confirmed by
+the log line above plus the VM rejoining and the agent reconnecting.
+
+**Step 3 — terminal purge.** Cancelling the job logged
+`Deleting VM ... (rootdisk=purge)` then `Deleted Headscale node`; VM, VMI,
+DataVolume and PVC are all gone, and all three goldens are untouched.
+
+**Test-design note, not a defect.** The probe asked the agent to write a sentinel
+file via the shell; `worker_base` ships `tools.shell: []`, so it never could. The
+disk-identity evidence above is stronger anyway — same DV UID, same PVC UID, same PV
+across the delete — since it shows the *physical* disk was reattached rather than a
+file being reproduced. A future probe wanting a file-level sentinel needs a config
+with the shell tool group enabled.
+
+**Step 4 (VM session suspend/resume) is NOT yet run** — it needs the orchestrator's
+copy of the flag, which is still off.
