@@ -8733,6 +8733,20 @@ async def create_job(request: Request, job: JobCreate) -> dict[str, Any]:
                 _admit_thread = None
             officer_meta = _thread_officer_meta(_admit_thread or {})
             if _officer_meta_enabled(officer_meta):
+                # Conference fence (centurion.md §4, belt-and-suspenders):
+                # while the Legatus is in conference the HELD background
+                # officer must not dispatch on stale direction — the meeting
+                # may be revising it. The conference session itself (a
+                # different thread) dispatches freely.
+                if officer_meta.get("hold"):
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            "conference in progress — this officer is held; "
+                            "scheduling resumes with the session brief after "
+                            "the conference ends."
+                        ),
+                    )
                 from services.officer_slots import SlotAdmissionError
                 from services.officer_slots import admit as officer_slot_admit
 
@@ -20459,6 +20473,237 @@ def _officer_meta_enabled(officer_meta: dict) -> bool:
     return officer_meta.get("enabled") in (True, "true", "True", 1)
 
 
+def _thread_is_conference(thread: dict) -> bool:
+    """True for a conference embodiment (centurion.md §2/S9) — a normal
+    interactive session wearing the officer's identity via
+    ``officer.conference``; ``officer.enabled`` stays false on it."""
+    return _thread_officer_meta(thread).get("conference") in (True, "true")
+
+
+async def _find_open_conference_thread(project_id: str) -> Optional[dict]:
+    """The project's open (non-ended) conference thread, if any.
+
+    One open conference per project is the single-writer rule (§2): the
+    create path reattaches to this instead of minting a rival embodiment.
+    """
+    async with postgres_db.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT id, status, title, created_at FROM threads
+             WHERE project_id = $1
+               AND status <> 'ended'
+               AND COALESCE(metadata->'config_override'
+                            ->'officer'->>'conference','false') = 'true'
+             ORDER BY created_at DESC
+             LIMIT 1
+            """,
+            project_id,
+        )
+    return dict(row) if row else None
+
+
+async def _hold_officer_for_conference(
+    project_id: str, conference_thread_id: str
+) -> None:
+    """Stamp the background officer's conference hold (centurion.md §4).
+
+    With the external timer the hold is uniform: the wake-claim query skips
+    held threads entirely (events AND timer rows stay pending) and the
+    watchdog stands down. A live stand-by notice is injected best-effort so
+    a mid-turn officer parks politely instead of racing the meeting. No-op
+    without an enabled officer — a conference on an officer-less project is
+    just a session with the persona.
+    """
+    try:
+        officer = await postgres_db.get_officer_thread_for_project(project_id)
+        if not officer or str(officer["id"]) == str(conference_thread_id):
+            return
+        officer_tid = str(officer["id"])
+        await postgres_db.merge_thread_config_override(
+            officer_tid,
+            {
+                "officer": {
+                    "hold": {
+                        "kind": "conference",
+                        "thread_id": str(conference_thread_id),
+                        "since": datetime.now(timezone.utc).isoformat(),
+                    }
+                }
+            },
+        )
+        logger.info(
+            "officer %s: conference hold stamped (conference %s)",
+            officer_tid[:8],
+            str(conference_thread_id)[:8],
+        )
+        from services import session_wake as _sw
+
+        officer_thread = await postgres_db.get_thread(officer_tid)
+        if officer_thread is not None:
+            agent = await _sw._resolve_live_agent(postgres_db, officer_thread)
+            if agent is not None:
+                await _sw._inject_live(
+                    agent,
+                    "[conference started — the Legatus is meeting with your "
+                    "conference embodiment. Standing hold: take no scheduling "
+                    "actions; your timers and events queue durably and arrive "
+                    "with the session brief. If your backstop fires before "
+                    "the brief: sleep.]",
+                )
+    except Exception:
+        logger.exception("conference hold: stamping failed (non-fatal)")
+
+
+async def _conclude_conference_if_any(thread: dict) -> None:
+    """On a conference thread leaving service: release the officer's hold and
+    enqueue the ``conference`` brief wake (centurion.md §4).
+
+    The wake coalesces with everything that queued during the meeting —
+    insert-dedup on the conference thread id makes end-hook and watchdog
+    self-heal idempotent. The brief is a pointer, not a transcript: direction
+    agreed in conference lands in the project stores (charter posture, KB,
+    backlog), which the officer re-reads anyway. Never raises.
+    """
+    try:
+        if not _thread_is_conference(thread):
+            return
+        project_id = thread.get("project_id")
+        if not project_id:
+            return
+        conf_tid = str(thread["id"])
+        officer = await postgres_db.get_officer_thread_for_project(str(project_id))
+        if not officer:
+            return
+        officer_tid = str(officer["id"])
+        hold = _thread_officer_meta(officer).get("hold") or {}
+        if isinstance(hold, dict) and hold.get("thread_id") in (None, conf_tid):
+            await postgres_db.merge_thread_config_override(
+                officer_tid, {"officer": {"hold": None}}
+            )
+        await postgres_db.enqueue_session_wake_event(
+            officer_tid,
+            source="conference",
+            dedup_key=conf_tid,
+            payload={
+                "conference_thread_id": conf_tid,
+                "title": str(thread.get("title") or ""),
+                "note": (
+                    "conference concluded — direction agreed there is now in "
+                    "force. Re-read the charter posture and any KB/backlog "
+                    "notes updated during the meeting before your next "
+                    "scheduling decision."
+                ),
+            },
+            project_id=str(project_id),
+        )
+        _kick_officer_event_drain(postgres_db)
+        logger.info(
+            "conference %s concluded — officer %s hold released, brief wake enqueued",
+            conf_tid[:8],
+            officer_tid[:8],
+        )
+    except Exception:
+        logger.exception("conference end: brief wake failed (non-fatal)")
+
+
+@app.get("/api/projects/{project_id}/officer")
+async def get_project_officer_summary(
+    request: Request, project_id: str
+) -> dict[str, Any]:
+    """The project's centurion at a glance — the cockpit's officer card (S9).
+
+    Everything the Legatus asked "where do I see him?" about: whether one is
+    enabled, his thread (the log), the next scheduled wake, queued events,
+    today's page spend, the digest ring, a live hold, and the open conference
+    if any. ``officer: null`` when the project has none — the card renders an
+    enable prompt from that.
+    """
+    await require_approved_user(request, postgres_db)
+    await require_project_member(request, postgres_db, project_id, min_role="viewer")
+
+    officer = await postgres_db.get_officer_thread_for_project(project_id)
+    conference = await _find_open_conference_thread(project_id)
+    if not officer:
+        return {
+            "officer": None,
+            "conference": (
+                {
+                    "thread_id": str(conference["id"]),
+                    "status": conference.get("status"),
+                }
+                if conference
+                else None
+            ),
+        }
+
+    officer_tid = str(officer["id"])
+    officer_meta = _thread_officer_meta(officer)
+    metadata = officer.get("metadata") or {}
+    if isinstance(metadata, str):
+        try:
+            metadata = json.loads(metadata)
+        except (json.JSONDecodeError, TypeError):
+            metadata = {}
+    officer_state = metadata.get("officer_state") or {}
+    if not isinstance(officer_state, dict):
+        officer_state = {}
+
+    timer = await postgres_db.get_pending_officer_timer(officer_tid)
+    async with postgres_db.acquire() as conn:
+        pending_events = await conn.fetchval(
+            "SELECT COUNT(*) FROM session_wake_events "
+            "WHERE thread_id = $1 AND state = 'pending'",
+            UUID(officer_tid),
+        )
+
+    today = datetime.now(timezone.utc).date().isoformat()
+    pages = officer_state.get("pages") or {}
+    pages_used = int(pages.get("count") or 0) if pages.get("date") == today else 0
+    try:
+        pages_budget = int(officer_meta.get("max_pages_per_day") or 3)
+    except (TypeError, ValueError):
+        pages_budget = 3
+    try:
+        token_ceiling = int(officer_meta.get("daily_token_ceiling") or 0)
+    except (TypeError, ValueError):
+        token_ceiling = 0
+
+    digest = officer_state.get("digest") or []
+    if not isinstance(digest, list):
+        digest = []
+
+    return {
+        "officer": {
+            "thread_id": officer_tid,
+            "status": officer.get("status"),
+            "title": officer.get("title"),
+            "created_at": officer.get("created_at"),
+            "hold": officer_meta.get("hold") or None,
+            "slots": officer_meta.get("slots") or None,
+            "sleep_minutes": {
+                "min": officer_meta.get("sleep_min_minutes") or 5,
+                "max": officer_meta.get("sleep_max_minutes") or 60,
+            },
+        },
+        "next_wake_at": (timer or {}).get("fire_at"),
+        "pending_events": int(pending_events or 0),
+        "pages_today": {"used": pages_used, "budget": pages_budget},
+        "token_ceiling": {
+            "daily": token_ceiling,
+            "deferred_today": officer_state.get("ceiling_notice") == today,
+        },
+        "digest": digest[-10:],
+        "conference": (
+            {
+                "thread_id": str(conference["id"]),
+                "status": conference.get("status"),
+            }
+            if conference
+            else None
+        ),
+    }
+
+
 @app.post("/api/agents/threads/{thread_id}/officer/wake")
 async def agent_file_officer_wake(
     request: Request,
@@ -20715,6 +20960,11 @@ async def agent_update_thread_status(
                 # _release_thread_resources for true destruction.
                 # See docs/issues/persistent_session_permission_check_race.md.
                 asyncio.create_task(_suspend_thread_resources(thread_id))
+                # A conference ending by idle-archive concludes the meeting
+                # exactly like a deliberate end: release the officer's hold
+                # + brief wake (centurion.md §4). thread_row was loaded above.
+                if thread_row is not None:
+                    await _conclude_conference_if_any(thread_row)
             else:
                 logger.info(
                     "Ignored agent 'ended' for thread %s — already suspended",
@@ -21966,6 +22216,28 @@ async def create_thread(
         if req_officer:
             config_override.setdefault("officer", {}).update(req_officer)
 
+        # Conference embodiment (centurion.md §2/S9): needs one unambiguous
+        # project (identity is project-scoped), and at most ONE open
+        # conference per project — the single-writer rule; reattach instead
+        # of minting a rival embodiment.
+        if (config_override.get("officer") or {}).get("conference") is True:
+            if not primary_project_id:
+                raise HTTPException(
+                    status_code=400,
+                    detail="A conference session needs exactly one project — "
+                    "the officer's identity is project-scoped.",
+                )
+            _open_conf = await _find_open_conference_thread(primary_project_id)
+            if _open_conf:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "conference_open: this project already has an open "
+                        f"conference session ({_open_conf['id']}) — resume it "
+                        "instead of opening a second one."
+                    ),
+                )
+
         # Resolve the complete create-time policy view.  This is also the source
         # for infrastructure-affecting values and grants, preventing the create
         # path from validating only a thin request fragment while attach sees a
@@ -22072,6 +22344,15 @@ async def create_thread(
                     thread_id,
                     json.dumps(metadata_patch),
                 )
+
+        # Conference open → hold the background officer (centurion.md §4):
+        # events and timers queue durably until the brief wake at conference
+        # end. No-op on officer-less projects.
+        if (
+            primary_project_id
+            and (config_override.get("officer") or {}).get("conference") is True
+        ):
+            await _hold_officer_for_conference(primary_project_id, thread_id)
 
         # A durable virtual object-store namespace is itself the workspace
         # backing. Bind it once at thread creation and preserve that generation
@@ -23631,6 +23912,11 @@ async def end_thread(
         except Exception:
             logger.warning("Officer stand-down merge failed for thread %s", thread_id)
 
+    # Conference end (centurion.md §4): release the officer's hold and
+    # enqueue the brief wake before teardown. Never raises; no-op for
+    # ordinary sessions.
+    await _conclude_conference_if_any(thread)
+
     # Snapshot + tear down workspace container/VM and agent pod
     await _release_thread_resources(thread_id)
 
@@ -23716,6 +24002,12 @@ async def resume_thread(
     await _revalidate_thread_datasource_ids(thread, metadata.get("datasource_ids"))
 
     await postgres_db.resume_thread(thread_id)
+
+    # Reopening a conference re-establishes the officer's hold (centurion.md
+    # §4) — the single-writer rule spans the meeting's whole lifetime, not
+    # just its first sitting.
+    if _thread_is_conference(thread) and thread.get("project_id"):
+        await _hold_officer_for_conference(str(thread["project_id"]), thread_id)
 
     # F-I2: the Slice A reconciler revokes cloud_ro_mounts grants of ended
     # threads, so an end -> resume cycle would otherwise leave a
@@ -25412,9 +25704,34 @@ async def _officer_watchdog_check_one(officer_row: dict, session_wake_svc) -> No
     """One officer thread's watchdog pass — see officer_watchdog below."""
     thread_id = str(officer_row["id"])
     officer_meta = _thread_officer_meta(officer_row)
-    if officer_meta.get("hold"):
+    hold = officer_meta.get("hold")
+    if hold:
         # Conference hold (centurion.md §4): stand down entirely — no
-        # implicit-timer filing, no overdue kicks, no respawn.
+        # implicit-timer filing, no overdue kicks, no respawn. But first,
+        # self-heal a STALE hold: if the conference thread is gone, ended, or
+        # idle-suspended (Legatus walked away; the attention sweeper parked
+        # it), the meeting is over — a missed end-hook must not hold the
+        # officer forever. Concluding here releases the hold and enqueues the
+        # brief wake (idempotent with the end-hook via insert-dedup on the
+        # conference thread id).
+        conf_tid = hold.get("thread_id") if isinstance(hold, dict) else None
+        if conf_tid:
+            conf = await postgres_db.get_thread(str(conf_tid))
+            if conf is None or conf.get("status") in ("ended", "suspended"):
+                logger.warning(
+                    "officer watchdog: stale conference hold on %s "
+                    "(conference %s is %s) — concluding",
+                    thread_id[:8],
+                    str(conf_tid)[:8],
+                    conf.get("status") if conf else "gone",
+                )
+                if conf is not None:
+                    await _conclude_conference_if_any(conf)
+                else:
+                    await postgres_db.merge_thread_config_override(
+                        thread_id, {"officer": {"hold": None}}
+                    )
+                return  # next tick resumes normal duties, unheld
         return
     try:
         sleep_max = int(officer_meta.get("sleep_max_minutes") or 60)
