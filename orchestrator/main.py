@@ -16070,6 +16070,7 @@ async def get_job_chat_history(
     page_size: int = Query(default=50, ge=1, le=200, alias="pageSize"),
     offset: Optional[int] = Query(default=None, ge=0),
     limit: Optional[int] = Query(default=None, ge=1, le=200),
+    lean: bool = Query(default=False),
 ) -> dict[str, Any]:
     """Get paginated chat history for a job.
 
@@ -16087,6 +16088,8 @@ async def get_job_chat_history(
         limit: Max entries to return, max 200 (overrides pageSize if set)
         page: Page number (1-indexed). Use -1 to request the last page.
         pageSize: Number of entries per page (max 200)
+        lean: Strip full message bodies (previews + truncated markers only);
+            hydrate single turns via ``/chat/entry/{entry_id}``.
     """
     await require_job_access(request, postgres_db, job_id)
     effective_size = limit if limit is not None else page_size
@@ -16109,9 +16112,34 @@ async def get_job_chat_history(
             page_size=page_size,
             offset=offset,
             limit=limit,
+            lean=lean,
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.get("/api/jobs/{job_id}/chat/entry/{entry_id}")
+async def get_job_chat_entry(
+    request: Request, job_id: str, entry_id: int
+) -> dict[str, Any]:
+    """Full detail for a single chat turn (complete inputs/response bodies).
+
+    The lean listing (``/chat?lean=true``) carries previews only; the debug
+    chat panel hydrates a turn here when the user expands a message or tool
+    result. The distinct ``/entry/`` segment mirrors ``/audit/step/{id}``.
+    """
+    await require_job_access(request, postgres_db, job_id)
+    if not audit_reader.is_available:
+        raise HTTPException(status_code=503, detail="Audit store not available")
+    try:
+        doc = await audit_reader.get_chat_entry(job_id, entry_id)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+    if doc is None:
+        raise HTTPException(
+            status_code=404, detail=f"Chat entry '{entry_id}' not found"
+        )
+    return doc
 
 
 # =============================================================================
@@ -16218,8 +16246,12 @@ async def list_repo_commits(
     effective_sha = sha if sha != "main" else (job_branch or sha)
 
     if since_ref:
-        # Use compare to get commits between two refs
-        compare = await gitea_client.get_compare(repo_name, since_ref, effective_sha)
+        # Commits-endpoint pagination with a client-side cut, not the compare
+        # API: Gitea 1.22 compare 404s on SHA bases and always pays a
+        # per-commit `git diff` server-side (ignores `stat=false`).
+        compare = await gitea_client.get_commits_between(
+            repo_name, since_ref, effective_sha
+        )
         if compare is None:
             raise HTTPException(
                 status_code=404,
@@ -20680,6 +20712,12 @@ async def get_project_officer_summary(
             "created_at": officer.get("created_at"),
             "hold": officer_meta.get("hold") or None,
             "slots": officer_meta.get("slots") or None,
+            # The brain HIS judgment runs on (explicit override only — a null
+            # means he's on the resolved session default, which the card
+            # renders as exactly that).
+            "model": ((metadata.get("config_override") or {}).get("llm") or {}).get(
+                "model"
+            ),
             "sleep_minutes": {
                 "min": officer_meta.get("sleep_min_minutes") or 5,
                 "max": officer_meta.get("sleep_max_minutes") or 60,

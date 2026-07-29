@@ -36,6 +36,7 @@ export interface OfficerSummary {
     created_at?: string | null;
     hold?: {kind?: string; thread_id?: string; since?: string} | null;
     slots?: Record<string, OfficerSlotSpec> | null;
+    model?: string | null;
     sleep_minutes?: {min: number; max: number};
   } | null;
   next_wake_at?: string | null;
@@ -153,6 +154,10 @@ export function nextWakeLabel(fireAt: string | null | undefined): string {
               <span class="k">Sleep bounds</span>
               <span class="v">{{ o.sleep_minutes?.min ?? 5 }}–{{ o.sleep_minutes?.max ?? 60 }} min</span>
             </div>
+            <div>
+              <span class="k">His model</span>
+              <span class="v" data-testid="officer-model">{{ o.model || 'session default' }}</span>
+            </div>
           </div>
 
           @if (slotRows().length) {
@@ -201,6 +206,20 @@ export function nextWakeLabel(fireAt: string | null | undefined): string {
             No centurion holds this century yet. Assign the kit — he chooses
             which troops to send; you decide what they are made of.
           </p>
+
+          <div class="officer-slot-row">
+            <app-form-field
+              label="Officer's own model"
+              hint="The brain his judgment runs on — pick a strong one; his wakes are cheap but his decisions steer everything. Blank = your session default."
+            >
+              <app-select [value]="fBrainModel()" (changed)="fBrainModel.set($event ?? '')">
+                <option value="">session default</option>
+                @for (m of modelOptions(); track m) {
+                  <option [value]="m">{{ m }}</option>
+                }
+              </app-select>
+            </app-form-field>
+          </div>
 
           @for (row of slotDrafts(); track $index; let i = $index) {
             <div class="officer-slot-row">
@@ -327,6 +346,11 @@ export class ProjectOfficerComponent implements OnInit, OnDestroy {
   readonly slotDrafts = signal<SlotDraft[]>([
     {name: 'line', count: 2, model: '', backend: 'sandbox'},
   ]);
+  // The officer's OWN brain (create_thread bridges top-level `model` into
+  // config_override.llm.model). Distinct from the slot models, which are what
+  // his workers run on — the classic mistake is arming the troops and leaving
+  // the commander on the account default.
+  readonly fBrainModel = signal('');
 
   private pollHandle: ReturnType<typeof setInterval> | null = null;
 
@@ -412,16 +436,18 @@ export class ProjectOfficerComponent implements OnInit, OnDestroy {
     const officer: Record<string, unknown> = {enabled: true};
     const slots = buildSlotsSpec(this.slotDrafts());
     if (slots) officer['slots'] = slots;
+    const body: Record<string, unknown> = {
+      title: `Centurion — ${this.projectName() || 'project'}`,
+      config_name: 'centurion',
+      project_ids: [pid],
+      config_override: {officer},
+    };
+    if (this.fBrainModel().trim()) body['model'] = this.fBrainModel().trim();
     try {
       const resp = await firstValueFrom(
         this.http.post<{thread_id: string}>(
           `${environment.apiUrl}/persistent/threads`,
-          {
-            title: `Centurion — ${this.projectName() || 'project'}`,
-            config_name: 'centurion',
-            project_ids: [pid],
-            config_override: {officer},
-          },
+          body,
         ),
       );
       // Opening the session boots the headless officer (attach = the loop
