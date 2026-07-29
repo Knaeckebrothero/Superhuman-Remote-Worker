@@ -85,6 +85,24 @@ def _injection_anchor_index(messages: List[BaseMessage]) -> int:
     return find_tail_injection_anchor(messages)
 
 
+def _charter_injection_enabled(config: Any) -> bool:
+    """Whether this session gets the pinned charter block (centurion.md §5).
+
+    True for the officer's background loop (officer.enabled) and for
+    conference embodiments (officer.conference) — both wear the project
+    identity; only the former is watched/slept. Strict ``is True`` checks on
+    purpose: MagicMock configs in the pinned session test files would
+    otherwise satisfy truthiness (S1 lesson).
+    """
+    officer = getattr(config, "officer", None)
+    if officer is None:
+        return False
+    return (
+        getattr(officer, "enabled", False) is True
+        or getattr(officer, "conference", False) is True
+    )
+
+
 def _inject_context_pairs(
     prepared: List[BaseMessage],
     manager_injection: List[BaseMessage],
@@ -92,6 +110,7 @@ def _inject_context_pairs(
     knowledge_block: str,
     citation_feedback_block: str = "",
     *,
+    charter_block: str = "",
     product_guide_turn_boundary: str = "",
 ) -> int:
     """Insert transient memory/knowledge/citation context pairs into ``prepared``.
@@ -172,6 +191,21 @@ def _inject_context_pairs(
             HumanMessage(content=product_guide_turn_boundary),
         )
         injected_count += 1
+
+    if charter_block:
+        try:
+            from .core.knowledge_injection import create_charter_injection_messages
+
+            ch_ai, ch_tool = create_charter_injection_messages(charter_block)
+            # Absolutely first in the injection zone — standing orders precede
+            # situational context (memory/knowledge/citations). Prepended
+            # last, after every other block has inserted, so nothing can slip
+            # ahead of it.
+            prepared.insert(base_inject_idx, ch_ai)
+            prepared.insert(base_inject_idx + 1, ch_tool)
+            injected_count += 2
+        except Exception as e:
+            logger.warning(f"Charter injection failed (non-fatal): {e}")
 
     return injected_count
 
@@ -1051,6 +1085,7 @@ async def _execute_turn(
     memory_block = ""
     knowledge_block = ""
     citation_feedback_block = ""
+    charter_block = ""
 
     from .core.knowledge_injection import selected_knowledge_bindings
     from .core.skill_resolution import (
@@ -1237,6 +1272,41 @@ async def _execute_turn(
                 e,
             )
 
+    # Charter injection (centurion.md §5): the project's pinned standing
+    # orders, fetched by (project_id, note_type='charter') — a dedicated read,
+    # never relevance-ranked — and re-injected EVERY turn for officer and
+    # conference sessions. Unconditional by design: compaction strips
+    # in-context constraints silently; per-turn re-injection is the pin.
+    if (
+        knowledge_store is not None
+        and effective_pids
+        and _charter_injection_enabled(config)
+    ):
+        try:
+            for _pid in effective_pids:
+                _charter = await asyncio.wait_for(
+                    knowledge_store.get_charter_note(_uuid.UUID(_pid)),
+                    timeout=_RETRIEVAL_TIMEOUT,
+                )
+                if _charter:
+                    charter_block = (
+                        "[CHARTER — standing orders for this project, pinned; "
+                        "re-read every wake. The posture block is yours to "
+                        "edit (kb_update); identity, authority and "
+                        "preferences belong to the Legatus.]\n\n"
+                        f"# {_charter.get('title') or 'Project charter'}\n\n"
+                        f"{_charter.get('content', '')}"
+                    )
+                    break
+        except asyncio.TimeoutError:
+            logger.warning("Charter retrieval timed out — skipping injection")
+        except Exception as e:
+            logger.warning(
+                "Charter retrieval failed (non-fatal): %s: %s",
+                type(e).__name__,
+                e,
+            )
+
     # Citation verification feedback (Phase 2b / D4 — persistent parity with the
     # worker's _inject_transient_messages): surface still-failed citations so the
     # agent can correct them. DB-driven and job-scoped (list_citations defaults to
@@ -1417,6 +1487,7 @@ async def _execute_turn(
             memory_block,
             knowledge_block,
             citation_feedback_block,
+            charter_block=charter_block,
             product_guide_turn_boundary=product_guide_turn_nudge,
         )
 

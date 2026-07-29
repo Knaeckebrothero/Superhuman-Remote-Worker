@@ -70,6 +70,11 @@ KB_TTL_BY_NOTE_TYPE: Dict[str, Optional[int]] = {
     "feature": None,
     "issue": None,
     "idea": None,
+    # Officer types (centurion.md §5). The charter is infinite by definition;
+    # reports are retired by the officer's gardening (supersede), not a clock —
+    # officer projects skip the loop's cycle-based TTL ticking anyway.
+    "charter": None,
+    "report": None,
 }
 KB_TTL_DEFAULT: Optional[int] = None
 
@@ -1194,6 +1199,45 @@ class KnowledgeStore:
             # kb_update can preserve an existing ticket's priority when the
             # caller doesn't specify a new one.
             "priority": r.get("priority", 1),
+        }
+
+    async def get_charter_note(self, project_id: uuid.UUID) -> Optional[Dict[str, Any]]:
+        """The project's ACTIVE charter note, if one exists (centurion.md §5).
+
+        Dedicated fetch by (project_id, note_type='charter') — the charter is
+        injected unconditionally into officer/conference turns and must never
+        depend on winning a relevance ranking. Keyed on ``project_id`` with NO
+        path filter, deliberately unlike :meth:`get_note_by_slug`: officer and
+        conference sessions run the lite (gitless) tier, so their charter is a
+        pathless pgvector row — the one durable write they have.
+
+        Returns the ``id``/``type`` dict shape shared with the other readers,
+        or None when the project has no active charter. Newest-modified wins
+        if bad data ever yields more than one.
+        """
+        row = await self.db.fetchrow(
+            """
+            SELECT note_id, title, note_type, status, content,
+                   job_id, created_at, modified_at
+            FROM knowledge_index
+            WHERE project_id = $1 AND note_type = 'charter' AND status = 'active'
+            ORDER BY modified_at DESC NULLS LAST
+            LIMIT 1
+            """,
+            project_id,
+        )
+        if row is None:
+            return None
+        r = dict(row)
+        return {
+            "id": r.get("note_id"),
+            "title": r.get("title", ""),
+            "type": r.get("note_type", ""),
+            "status": r.get("status", ""),
+            "content": r.get("content", ""),
+            "job_id": r.get("job_id"),
+            "created": r.get("created_at"),
+            "modified": r.get("modified_at"),
         }
 
     async def list_notes(

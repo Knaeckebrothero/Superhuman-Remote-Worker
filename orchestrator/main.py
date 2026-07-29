@@ -3584,6 +3584,7 @@ _SESSION_OFFICER_OVERRIDE_KEYS = frozenset(
         "max_actions_per_wake",
         "daily_token_ceiling",
         "slots",
+        "conference",
     }
 )
 
@@ -3617,6 +3618,11 @@ def _validated_session_officer_override(
     cleaned: dict[str, Any] = {}
     if "enabled" in officer:
         cleaned["enabled"] = officer["enabled"] in (True, "true", "True", 1)
+    if "conference" in officer:
+        # Conference embodiment (centurion.md §2/S9): identity attachment
+        # (charter injection) without officer lifecycle — enabled stays false
+        # on conference threads, so the watchdog/drain never touch them.
+        cleaned["conference"] = officer["conference"] in (True, "true", "True", 1)
     if "slots" in officer:
         # Typed worker roster (officer_slots.py). Validated hard at provision
         # so a typo'd kit fails HERE with a 400, not silently at the
@@ -3627,7 +3633,9 @@ def _validated_session_officer_override(
             cleaned["slots"] = validate_slots_spec(officer["slots"])
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-    for key in sorted(_SESSION_OFFICER_OVERRIDE_KEYS - {"enabled", "slots"}):
+    for key in sorted(
+        _SESSION_OFFICER_OVERRIDE_KEYS - {"enabled", "slots", "conference"}
+    ):
         if key in officer:
             try:
                 cleaned[key] = max(0, int(officer[key]))

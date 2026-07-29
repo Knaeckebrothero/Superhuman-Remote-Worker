@@ -74,6 +74,8 @@ NoteTypeValue = Literal[
     "feature",
     "issue",
     "idea",
+    "charter",
+    "report",
 ]
 NoteStatusValue = Literal["active", "resolved", "superseded", "archived"]
 NoteConfidenceValue = Literal["high", "medium", "low"]
@@ -100,6 +102,25 @@ _GRAPH_TIER_MSG = (
 def _content_hash(text: str) -> str:
     """Stable content fingerprint for exact-duplicate detection."""
     return hashlib.sha256((text or "").encode()).hexdigest()
+
+
+def _charter_write_denied(context: "ToolContext") -> Optional[str]:
+    """Trust boundary for the pinned charter (centurion.md §5).
+
+    Worker jobs process untrusted external content; a prompt-injection chain
+    from the object level must not be able to rewrite the officer's standing
+    orders. Only sessions — Legatus or officer hands, identified by the
+    ToolContext carrying a persistent-session thread id — may create or edit
+    'charter' notes. Workers file 'report' notes instead (provenance rides
+    the job_id column).
+    """
+    if getattr(context, "_thread_id", None):
+        return None
+    return (
+        "Error: 'charter' notes are Legatus/officer-owned standing orders and "
+        "cannot be written from a worker job. File your findings as a "
+        "'report' note instead."
+    )
 
 
 # The kb_lint URL sweep checks at most this many unique external URLs per run;
@@ -783,6 +804,11 @@ def create_kb_tools(
             if not existing:
                 return f"Error: Note '{note}' not found in project."
 
+            if (existing.get("type") or "") == "charter":
+                denied = _charter_write_denied(context)
+                if denied:
+                    return denied
+
             if content is not None:
                 new_content = content
             elif append is not None:
@@ -906,6 +932,19 @@ def create_kb_tools(
             return _write_scope_error(context)
 
         try:
+            # The graph path never loads the note before mutating it — the
+            # charter trust boundary needs the type, so pre-read here. A
+            # read failure falls through to the update (the note may simply
+            # not exist yet; update_note reports that itself).
+            try:
+                _pre = kg.read_note(project_id, note)
+            except Exception:
+                _pre = None
+            if isinstance(_pre, dict) and (_pre.get("type") or "") == "charter":
+                denied = _charter_write_denied(context)
+                if denied:
+                    return denied
+
             updated = kg.update_note(
                 project_id=project_id,
                 note_id=note,
@@ -1052,7 +1091,10 @@ def create_kb_tools(
         Args:
             title: Note title (generates the slug ID, e.g. "chose-jwt-over-oauth")
             type: Note type — one of: goal, plan, decision, learning, code,
-                source, question, state, retrospective, datasource
+                source, question, state, retrospective, datasource, feature,
+                issue, idea, charter, report. 'charter' is the project's
+                pinned standing-orders note (one active per project; sessions
+                only — worker jobs must file 'report' notes instead)
             content: Full markdown body of the note
             description: One-sentence summary for progressive-disclosure indexes.
                          Strongly recommended; derived from the content's first
@@ -1075,6 +1117,33 @@ def create_kb_tools(
         project_id = _get_project_id(context)
         if not project_id:
             return _write_scope_error(context)
+
+        if type == "charter":
+            denied = _charter_write_denied(context)
+            if denied:
+                return denied
+            # One ACTIVE charter per project (centurion.md §5) — enforced here,
+            # not by a DB constraint, so a duplicate charter file can never
+            # wedge the reindexer. A same-title rewrite would otherwise fork a
+            # content-hashed twin slug below, silently splitting the charter.
+            try:
+                _existing_charter = _run_async(
+                    ks.get_charter_note(uuid.UUID(project_id))
+                )
+            except Exception as e:
+                logger.warning(f"charter lookup failed (refusing write): {e}")
+                return (
+                    "Error: could not verify the project's existing charter — "
+                    "refusing to write a possible duplicate. Retry, or edit "
+                    "the known charter with kb_update."
+                )
+            if _existing_charter:
+                return (
+                    f"Error: this project already has an active charter "
+                    f"('{_existing_charter['id']}'). One charter per project — "
+                    f"edit it with kb_update('{_existing_charter['id']}', ...) "
+                    f"(posture block only, unless you are the Legatus)."
+                )
 
         # Exact-duplicate short-circuit (Step 1 hardening, docs §11.1): a
         # same-slug write with byte-identical content is a pure no-op for every
@@ -1204,6 +1273,20 @@ def create_kb_tools(
                     )
                 )
             except Exception as e:
+                if kg is None and not context.has_git():
+                    # Lite sessions (officer/conference, no git, no Neo4j):
+                    # the pgvector row IS the only durable write. Claiming
+                    # "Created" here would be silent data loss for exactly
+                    # the notes the officer's judgment depends on
+                    # (centurion_implementation_notes.md risk 11).
+                    logger.error(f"pgvector write failed for {slug} (sole store): {e}")
+                    return (
+                        # NB: `type` here is the note-type parameter, not the
+                        # builtin — hence __class__ for the exception name.
+                        f"Error: knowledge store write failed for '{slug}' — "
+                        f"the note was NOT saved. Retry, and escalate if this "
+                        f"persists. ({e.__class__.__name__}: {e})"
+                    )
                 logger.warning(f"pgvector write-through failed for {slug}: {e}")
                 # Durable truth is Neo4j (graph path) or the OKF file (kg-less);
                 # the reindexer can rebuild pgvector from either.

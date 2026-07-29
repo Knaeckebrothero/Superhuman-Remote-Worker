@@ -26,6 +26,7 @@ logger = logging.getLogger(__name__)
 
 # Prefix for identifying synthetic knowledge injection tool calls
 KNOWLEDGE_TOOL_CALL_ID_PREFIX = "knowledge_inject_"
+CHARTER_TOOL_CALL_ID_PREFIX = "charter_inject_"
 
 
 @dataclass
@@ -284,6 +285,46 @@ def create_knowledge_injection_messages(
             {
                 "name": "kb_search",
                 "args": {"query": "current_task_context"},
+                "id": tool_call_id,
+            }
+        ],
+    )
+
+    tool_message = ToolMessage(
+        content=content,
+        tool_call_id=tool_call_id,
+    )
+
+    return ai_message, tool_message
+
+
+def create_charter_injection_messages(
+    content: str,
+) -> Tuple[AIMessage, ToolMessage]:
+    """Synthetic AIMessage + ToolMessage pair carrying the project charter.
+
+    The charter (centurion.md §5) is pinned intent: injected unconditionally
+    every officer/conference turn as its own block — never via relevance
+    ranking, where a small note can simply lose the top-5. Re-injection per
+    turn is the pinning mechanism; the pair is excluded from summarization
+    like every other transient injection (workspace_injection.py), so
+    compaction can never silently strip the standing orders
+    (governance-decay: arXiv 2606.22528).
+
+    Args:
+        content: Formatted charter block (title + body of the charter note)
+
+    Returns:
+        Tuple of (AIMessage with tool_call, ToolMessage with charter content)
+    """
+    tool_call_id = f"{CHARTER_TOOL_CALL_ID_PREFIX}{content_hash_id(content)}"
+
+    ai_message = AIMessage(
+        content="",
+        tool_calls=[
+            {
+                "name": "kb_read",
+                "args": {"note": "charter"},
                 "id": tool_call_id,
             }
         ],
