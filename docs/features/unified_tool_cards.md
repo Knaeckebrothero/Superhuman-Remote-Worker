@@ -20,7 +20,7 @@ related:
 
 > Every agent tool call — in a live session or the debug audit trail — should render through **one** schema-driven card: tool name, input parameters, the result the model saw, and optional execution details. Expanding any card should look the same and tell you the same things, regardless of tool or data source.
 
-**Status:** Slice 1 (schema + registry + `<app-tool-card>` + persistent-chat wiring) shipped + **live-verified on k3d 2026-06-17**. Slices 2–3 pending. **Slice 4 — the job card: BUILT 2026-07-29**, uncommitted, live gate not yet run; see [Slice 4 — what shipped](#slice-4--what-shipped-2026-07-29). It is the first card that outlives its tool call and the first to carry actions, so it extends the schema rather than just adding a descriptor.
+**Status:** Slice 1 (schema + registry + `<app-tool-card>` + persistent-chat wiring) shipped + **live-verified on k3d 2026-06-17**. Slices 2–3 pending. **Slice 4 — the job card: BUILT + partially live-gated 2026-07-29** (API contract verified, three bugs found and fixed; visual pass still owed) — see [Slice 4 — what shipped](#slice-4--what-shipped-2026-07-29) and [Live gate](#live-gate-on-dev-2026-07-29--partial-and-it-found-three-bugs). It is the first card that outlives its tool call and the first to carry actions, so it extends the schema rather than just adding a descriptor.
 **Closes:** `session_turn_rendering.md` deferred decision #5 ("whether tool_result content gets its own collapse level inside the tool card or is always visible").
 
 ## Live verification (slice 1, 2026-06-17)
@@ -429,11 +429,45 @@ Decisions worth keeping:
 - **The audit/debug surface.** The card is shared, so it renders there too, but
   polling from that surface is untested.
 
-**Verification so far:** 16 new unit tests (pure functions — `TestBed` does not
-work under vitest here); full cockpit suite 1450 passing; i18n parity green with
-both locales; `ng build` clean with initial at 2.65 MB, under the 2.75 MB hard
-ceiling (the 2.25 MB warning was already breached before this change). **No live
-gate yet** — nothing here has been exercised against a real running job.
+**Verification:** 20 unit tests (pure functions — `TestBed` does not work under
+vitest here); full cockpit suite 1453 passing; i18n parity green in both
+locales; `ng build` clean with initial at 2.65 MB, under the 2.75 MB hard
+ceiling (the 2.25 MB warning was already breached before this change).
+
+### Live gate on dev (2026-07-29) — partial, and it found three bugs
+
+Run against the deployed cockpit (`sha-7fad429`, exactly the card commit) with a
+real session-created job. **The API-contract half ran; the visual half did
+not** — the browser extension was not connected, so nothing below was seen
+rendered. What *was* verified is the integration surface, which is where the
+bugs were:
+
+1. **`freeze_data`/`context` arrive as JSON *strings*, not objects.** asyncpg
+   hands JSONB back as text and the orchestrator passes it through, while the
+   cockpit `Job` model typed them as `Record<string, any>`. Indexing straight in
+   type-checks, compiles, and yields `undefined` forever — the summary would
+   simply never have appeared, with no error anywhere. Fixed with `asRecord()`;
+   the model now types both as `… | string | null` so the compiler can see it.
+2. **The summary is not in `context` at all.** An earlier draft read
+   `context.summary`, which does not exist. It is `freeze_data.summary` — the
+   same source the session-wake payload formatter uses.
+3. **`Job` had no `freeze_data` field**, despite the API returning it. Added.
+
+Correcting the `context` type immediately surfaced a **pre-existing** instance
+of the same class in `job-review.component.ts`: `context?.['snapshot']?.['status']`
+indexed a string, so the "Open IDE" button was quietly hidden for
+snapshot-only jobs. Fixed there too.
+
+Also confirmed positively: the id parser matches the tool's **verbatim** dev
+output (now pinned as a test — note the receipt repeats the id inside a
+`get_worker_job(...)` hint, so label-anchoring matters), and `diff_status` was
+`None` on the test job, so Open-diff correctly stayed hidden.
+
+**Still owed:** the visual pass — card renders with the descriptor title rather
+than the generic fallback, status chip updates live, polling stops at terminal,
+Approve appears only at `pending_review`, Open-diff opens the drawer. Dev
+currently has **no job with `diff_status='pending'`**, so exercising Open-diff
+needs a Mode-A diff job seeded first.
 
 ### Open questions (slice 4)
 

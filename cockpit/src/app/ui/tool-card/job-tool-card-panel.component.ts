@@ -16,6 +16,7 @@ import {ToolCardEntity} from '../../core/models/tool-card.model';
 import {JobWatchService} from '../../core/services/job-watch.service';
 import {ApiService} from '../../core/services/api.service';
 import {
+    asRecord,
     isRunningJobStatus,
     isTerminalJobStatus,
     jobStatusTone,
@@ -148,10 +149,29 @@ export class JobToolCardPanelComponent {
     protected readonly statusLabel = computed(() => this.job()?.status ?? '');
     protected readonly running = computed(() => isRunningJobStatus(this.job()?.status));
 
-    /** Frozen-summary text for a job awaiting review; absent while it runs. */
+    /**
+     * Summary of what the job produced, shown once it has one.
+     *
+     * Reads `freeze_data.summary` — the same source the session-wake payload
+     * formatter uses. Two things the dev live gate (2026-07-29) caught here,
+     * both of which failed *silently*:
+     *
+     * 1. **It is not in `context`.** An earlier draft read `context.summary`,
+     *    which simply does not exist; the freeze blob is where a job records
+     *    what it did.
+     * 2. **JSONB comes back as a STRING, not an object.** `GET /api/jobs/{id}`
+     *    returns `context` (and `freeze_data`) as raw JSON text — the
+     *    orchestrator-wide asyncpg behaviour — while the cockpit `Job` model
+     *    types them as `Record<string, any>`. So indexing straight into the
+     *    field type-checks, compiles, and always yields `undefined` at runtime.
+     *    Hence {@link asRecord}.
+     *
+     * Absent while the job runs, and absent again after approval (which clears
+     * `freeze_data`) — in both cases the card just shows status, which is
+     * correct.
+     */
     protected readonly summary = computed(() => {
-        const ctx = this.job()?.context as Record<string, unknown> | null | undefined;
-        const raw = ctx?.['summary'];
+        const raw = asRecord(this.job()?.freeze_data)?.['summary'];
         return typeof raw === 'string' && raw.trim() ? raw.trim() : null;
     });
 
