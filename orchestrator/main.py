@@ -3583,6 +3583,7 @@ _SESSION_OFFICER_OVERRIDE_KEYS = frozenset(
         "max_pages_per_day",
         "max_actions_per_wake",
         "daily_token_ceiling",
+        "slots",
     }
 )
 
@@ -3616,7 +3617,17 @@ def _validated_session_officer_override(
     cleaned: dict[str, Any] = {}
     if "enabled" in officer:
         cleaned["enabled"] = officer["enabled"] in (True, "true", "True", 1)
-    for key in sorted(_SESSION_OFFICER_OVERRIDE_KEYS - {"enabled"}):
+    if "slots" in officer:
+        # Typed worker roster (officer_slots.py). Validated hard at provision
+        # so a typo'd kit fails HERE with a 400, not silently at the
+        # officer's first dispatch.
+        from services.officer_slots import validate_slots_spec
+
+        try:
+            cleaned["slots"] = validate_slots_spec(officer["slots"])
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    for key in sorted(_SESSION_OFFICER_OVERRIDE_KEYS - {"enabled", "slots"}):
         if key in officer:
             try:
                 cleaned[key] = max(0, int(officer[key]))
@@ -8693,6 +8704,63 @@ async def create_job(request: Request, job: JobCreate) -> dict[str, Any]:
                 config_override or {}, request_config_override
             )
 
+        # Officer admission (centurion.md §6, S5/S5b): capacity + slot roster,
+        # enforced here — the single job-creation funnel — so a forgetful
+        # model cannot bypass it. Sits BEFORE the VM gate on purpose: a slot
+        # that pins backend=vm must stamp the config first so the submit-time
+        # 403 still fires for owners without the grant. The advisory xact
+        # lock serializes parallel creates from one officer (TOCTOU, risk 9);
+        # it is per-thread, so ordinary creates never contend. The slot's
+        # model/backend merge ON TOP of everything — the officer chooses
+        # which troops to send, the Legatus decides what they are made of.
+        officer_slot_name: str | None = None
+        _officer_admit_thread_id = (
+            str(job.thread_id) if (job.thread_id and root_creation) else None
+        )
+        if _officer_admit_thread_id:
+            try:
+                _admit_thread = await postgres_db.get_thread(_officer_admit_thread_id)
+            except Exception:
+                _admit_thread = None
+            officer_meta = _thread_officer_meta(_admit_thread or {})
+            if _officer_meta_enabled(officer_meta):
+                from services.officer_slots import SlotAdmissionError
+                from services.officer_slots import admit as officer_slot_admit
+
+                async with postgres_db.acquire() as conn:
+                    async with conn.transaction():
+                        await conn.execute(
+                            "SELECT pg_advisory_xact_lock(hashtext($1))",
+                            _officer_admit_thread_id,
+                        )
+                        slot_rows = await conn.fetch(
+                            """
+                            SELECT context->>'officer_slot' AS slot,
+                                   COUNT(*) AS n
+                              FROM jobs
+                             WHERE created_by_thread_id = $1
+                               AND status IN ('created', 'processing')
+                             GROUP BY 1
+                            """,
+                            UUID(_officer_admit_thread_id),
+                        )
+                in_flight_by_slot = {r["slot"]: int(r["n"]) for r in slot_rows}
+                requested_slot = context.get("officer_slot")
+                try:
+                    officer_slot_name, slot_patch = officer_slot_admit(
+                        officer_meta,
+                        str(requested_slot) if requested_slot else None,
+                        in_flight_by_slot,
+                    )
+                except SlotAdmissionError as exc:
+                    raise HTTPException(status_code=409, detail=str(exc)) from exc
+                if officer_slot_name:
+                    context["officer_slot"] = officer_slot_name
+                if slot_patch:
+                    config_override = _deep_merge_dicts(
+                        config_override or {}, slot_patch
+                    )
+
         # VM permission gate: refuse at submit time so the user gets a clear
         # 403 instead of a silent failure later in the dispatcher. The
         # dispatcher re-checks too (in case the grant is revoked after
@@ -8817,47 +8885,6 @@ async def create_job(request: Request, job: JobCreate) -> dict[str, Any]:
         creating_thread_id = (
             str(job.thread_id) if (job.thread_id and root_creation) else None
         )
-
-        # Officer capacity gate (centurion.md §6, S5): an officer thread may
-        # hold at most max_concurrent_workers jobs in flight. Enforced here —
-        # the single job-creation funnel — not in the tool, so a forgetful
-        # model cannot bypass it. The advisory xact lock serializes parallel
-        # create calls from one officer (capacity TOCTOU, risk 9); it is
-        # per-thread, so ordinary creates never contend.
-        if creating_thread_id:
-            try:
-                creating_thread = await postgres_db.get_thread(creating_thread_id)
-            except Exception:
-                creating_thread = None
-            officer_meta = _thread_officer_meta(creating_thread or {})
-            if _officer_meta_enabled(officer_meta):
-                try:
-                    cap = max(1, int(officer_meta.get("max_concurrent_workers") or 3))
-                except (TypeError, ValueError):
-                    cap = 3
-                async with postgres_db.acquire() as conn:
-                    async with conn.transaction():
-                        await conn.execute(
-                            "SELECT pg_advisory_xact_lock(hashtext($1))",
-                            creating_thread_id,
-                        )
-                        in_flight = await conn.fetchval(
-                            """
-                            SELECT COUNT(*) FROM jobs
-                             WHERE created_by_thread_id = $1
-                               AND status IN ('created', 'processing')
-                            """,
-                            UUID(creating_thread_id),
-                        )
-                if int(in_flight or 0) >= cap:
-                    raise HTTPException(
-                        status_code=409,
-                        detail=(
-                            f"Officer capacity reached: {in_flight}/{cap} worker "
-                            "jobs already in flight. Wait for one to finish, "
-                            "cancel one, or raise max_concurrent_workers."
-                        ),
-                    )
 
         result = await postgres_db.create_job(
             description=job.description,

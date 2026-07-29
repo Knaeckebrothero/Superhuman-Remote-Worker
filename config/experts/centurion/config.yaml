@@ -32,6 +32,13 @@ workspace:
 
 # Officer cadence defaults; enabled stays false here (see header). The thread
 # override that provisions an officer flips enabled and may tighten bounds.
+# A slot roster (typed worker allocations) is also set per thread, e.g.
+#   officer:
+#     slots:
+#       line:  {count: 2, model: "MiniMax-M3", backend: "sandbox"}
+#       heavy: {count: 1, model: "gpt-5.6-sol", backend: "vm"}
+# With a roster, per-slot counts replace max_concurrent_workers and each
+# dispatch's model/backend is stamped server-side (officer_slots.py).
 officer:
   enabled: false
   sleep_min_minutes: 5
