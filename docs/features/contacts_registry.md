@@ -15,13 +15,14 @@ related:
   - "[[email_datasource]]"
   - "[[datasource_redesign]]"
   - "[[mcp_datasources]]"
+  - "[[virtual_directories]]"
 ---
 
 # Contacts Registry
 
 > One address book for every person an agent may reach — email today, WhatsApp next — owned by a user, linked to projects, visible in Cockpit, and readable by agents as workspace files.
 
-**Status:** Design approved 2026-07-26→28 (brainstorm; Cockpit layout picked via visual mockups), spec written 2026-07-29. Not yet implemented.
+**Status:** Design approved 2026-07-26→28 (brainstorm; Cockpit layout picked via visual mockups), spec written 2026-07-29. §Agent surface amended 2026-07-30 to ride on [[virtual_directories]] instead of materialized files. Not yet implemented.
 **Filed:** 2026-07-29
 
 ## Motivation
@@ -46,7 +47,7 @@ Driving use case: stakeholder interviews — register a client's executives once
 - **Not a connector type.** Connectors grant capability (credentials → tools); a contact grants nothing — it is an addressee that channels resolve against. The WhatsApp *channel* (credentials, adapter, webhook) is the thing that becomes a connector later; explicitly out of scope here.
 - **Project-linked scoping**, mirroring `project_datasources`: an agent sees exactly the contacts linked to its project. The registry stays the control point — no per-message human approval, no raw addresses accepted from agents.
 - **Own top-level Cockpit page** at `/contacts` (peer of `/datasources`), not a tab inside Connectors and not per-project-only UI.
-- **Agents read contacts as materialized workspace files** (`contacts/<slug>.md`), the same projection pattern as `skills/`. No new agent tools.
+- **Agents read contacts as a virtual `contacts/` directory** (`contacts/<slug>.md` served live through the file tools by [[virtual_directories]]; originally specced as materialized files, amended 2026-07-30). No new agent tools.
 
 ## Data model
 
@@ -175,9 +176,11 @@ search…                          filter: project | channel
 ▸ Priya Nair        [email]                         1 proj
 ```
 
-## Agent surface — materialized files, no new tools
+## Agent surface — virtual `contacts/` directory, no new tools
 
-**DB is the source of truth; the workspace gets a read-only projection.** At job/session start, the same seeding lever that materializes `skills/` writes `contacts/<slug>.md` for every contact linked to the job's project:
+*(Amended 2026-07-30: originally materialized files; now a virtual projection via [[virtual_directories]]. The rendered file format below is unchanged.)*
+
+**DB is the source of truth; the agent sees a read-only virtual projection.** The [[virtual_directories]] ContactsProvider serves `contacts/<slug>.md` for every contact linked to the job's project — live through the file tools (orchestrator internal endpoint, ~60s TTL cache), plus a `README.md` index (display name + channel chips). Nothing is written to the workspace filesystem:
 
 ```markdown
 ---
@@ -196,13 +199,13 @@ ask her about cart abandonment before anyone else.
 - Body = `notes` — the natural home for a per-stakeholder interview brief.
 - **Raw addresses are included** (user decision 2026-07-28): useful to the agent, harmless to authorization — the orchestrator resolves recipients by name server-side and rejects raw addresses from agents. Snapshot-PII is handled by retention policy, not by crippling the file.
 - Slugs: kebab-cased `display_name`, sanitized (existing `_safe_component` pattern), `-2` suffix on collision.
-- Read path: existing `read_file` / `search_files` / `list_directory`. Write path: none — files are regenerated each job start; agent edits are ignored and overwritten.
-- **Why files can't be the grant** (the registry stays server-side): the workspace is agent-writable, so a file-as-grant would let the agent mint recipients (`datasource_redesign.md` records exactly this failure class with the advisory `read_only` flag); the orchestrator authorizes sends and cannot see the workspace; workspaces are `emptyDir` and don't survive recycle; `opt_in_status`/`last_inbound_at` are webhook-written runtime state.
-- **Staleness:** linking a contact mid-session doesn't rewrite files until the next job/session start — but sends still work immediately (resolution is live, server-side). Documented limitation.
-- **Failure mode:** materialization errors are logged and never block job start — the files degrade discovery, not correctness.
-- Gated by `CONTACTS_MATERIALIZE_ENABLED` (default `true`) — cheap kill-switch, house style.
-- **`contacts/` must be added to `_LOOP_MAIN_GITIGNORE`** (`orchestrator/services/job_provisioning.py:43`). `skills/` already leaked onto a loop's `main` once (caught by k3d E2E); the identical leak here would commit names, emails, and phone numbers into a project artifact. This line ships in the same PR as materialization, not later.
-- No `list_contacts` tool, no context injection (revised during brainstorm): capability-surface cost rule — the file projection gives discovery for free, and `send_message`'s `"Available: …"` 404 remains the fallback. If WhatsApp's `message_contact` later proves a listing tool necessary, it rides along then.
+- Read path: existing `read_file` / `search_files` / `list_directory` (served by the overlay; invisible to the shell). Write path: none — mutations into `contacts/` are rejected by the overlay with a teaching error; the agent-edit-overwrite ambiguity of materialized files no longer exists.
+- **Why files can't be the grant** (the registry stays server-side): a projection must not mint recipients (`datasource_redesign.md` records exactly this failure class with the advisory `read_only` flag); the orchestrator authorizes sends and resolves recipients server-side; `opt_in_status`/`last_inbound_at` are webhook-written runtime state. The virtual projection makes this structural — there is no writable surface at all.
+- **Freshness:** linking a contact mid-session appears within the ~60s TTL (the materialization design's "invisible until next start" limitation is gone). Sends were always live (resolution is server-side).
+- **Failure mode:** per [[virtual_directories]] — stale cache served on fetch failure; with no cache, reads return a "contacts temporarily unavailable" tool error; boot never blocks.
+- Gated by `VIRTUAL_DIRS_ENABLED` (default `true`), shared with `tools/` — supersedes the previously planned `CONTACTS_MATERIALIZE_ENABLED`.
+- ~~`contacts/` in `_LOOP_MAIN_GITIGNORE`~~ — no longer needed: no real files exist to leak onto a loop's `main` or into workspace snapshots. (The `skills/`-style PII-leak class is structurally closed.)
+- No `list_contacts` tool, no context injection (revised during brainstorm): capability-surface cost rule — the virtual projection gives discovery for free (including its README index), and `send_message`'s `"Available: …"` 404 remains the fallback. If WhatsApp's `message_contact` later proves a listing tool necessary, it rides along then.
 
 ## Error handling
 
@@ -216,7 +219,7 @@ ask her about cart abandonment before anyone else.
 | Non-owner PATCH/DELETE | 403 |
 | Non-member/viewer link attempt | Existing `require_project_member` 403 (editor floor) |
 | Malformed address | Per-channel validation: existing email check; E.164 for whatsapp |
-| Materialization failure | Log and continue; never block job start |
+| Virtual-projection fetch failure | Stale cache served if warm; else "contacts temporarily unavailable" tool error; never blocks job start ([[virtual_directories]]) |
 
 ## Testing
 
@@ -224,7 +227,7 @@ ask her about cart abandonment before anyone else.
 - **Cross-tenant:** two owners each holding `anna@acme.de` both succeed and never resolve into each other's contacts. (Exercises the per-owner uniqueness correction; the one test not to skip.)
 - **Resolver:** name match, address match, wrong-channel miss (distinct error), unknown miss, ambiguous name, primary selection.
 - **Access gates:** extend `tests/test_project_access.py` — member-only list, editor-only link/unlink, owner-only mutate, visibility union.
-- **Materialization:** files land with correct frontmatter; slug collision; overwrite-on-regenerate; `contacts/` present in `_LOOP_MAIN_GITIGNORE`; failure is non-fatal.
+- **Virtual projection:** rendered files match the frontmatter format; slug collision determinism; README index; TTL/stale/error paths; mutation rejection — per [[virtual_directories]] §Testing (ContactsProvider bullets live there).
 - **Cockpit (vitest):** rows render chips/opt-in/counts; expansion toggles read-only; single form instance; delete dialog names projects.
 - CI (Py3.12) is the gate (local pytest is noisy on 3.14); live-verify on local k3d before dev deploy, per house practice.
 
@@ -243,3 +246,4 @@ WhatsApp channel connector (credentials, adapter, webhook, `message_contact`) �
 - **2026-07-27:** Layout C — expandable rows — then C1: expansion strictly read-only, editing via the house form panel, one at a time. (User, via visual mockups.)
 - **2026-07-28:** Agents consume contacts as materialized `contacts/<slug>.md` workspace files (skills-projection pattern), DB remains truth; raw addresses included in frontmatter; no `list_contacts` tool. (User.)
 - **2026-07-29:** Per-owner (not global) address uniqueness; channel-semantic opt-in defaults (email `opted_in`, whatsapp `pending`); opt-in resets on address edit; find-or-create-then-link semantics for the project-scoped POST. (Spec.)
+- **2026-07-30:** Agent surface re-based from materialized files onto the [[virtual_directories]] ContactsProvider — live TTL reads replace boot-time seeding; gitignore/snapshot-PII/staleness/edit-overwrite concerns struck; `CONTACTS_MATERIALIZE_ENABLED` superseded by `VIRTUAL_DIRS_ENABLED`. File format and raw-address decision unchanged. (User.)
