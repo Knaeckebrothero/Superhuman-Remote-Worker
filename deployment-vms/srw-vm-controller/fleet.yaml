@@ -56,6 +56,21 @@ helm:
       # import per VM. See docs/features/vm_golden_image_boot_acceleration.md.
       goldenImage:
         enabled: true
+      # Persistent rootdisks: create each VM's root disk as a STANDALONE
+      # DataVolume instead of a spec.dataVolumeTemplates entry, so it carries
+      # no ownerRef and survives VM deletion. A recreate reattaches it by name
+      # — files intact, and the ~3m27s clone skipped entirely, which makes
+      # crash recovery faster than a fresh start.
+      # See docs/features/vm_persistent_rootdisk.md.
+      #
+      # The orchestrator has its own copy of this flag
+      # (deployment/values-experimental.yaml → VM_PERSISTENT_ROOTDISK) which
+      # decides whether VM suspend may proceed without a snapshot. ENABLE THIS
+      # ONE FIRST: orchestrator-on against a controller that still
+      # cascade-deletes disks would suspend sessions into nothing. This order
+      # is harmless — the controller just keeps disks nobody asks it to keep.
+      persistentRootdisk:
+        enabled: true
 dependsOn: []
 # Cluster targeting handled by the dedicated GitRepo
 # (HomeLab/rancher_cluster/fleet-gitrepo-srw-vms.yaml) whose spec.targets
