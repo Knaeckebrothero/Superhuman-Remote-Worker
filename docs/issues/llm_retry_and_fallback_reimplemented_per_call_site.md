@@ -194,6 +194,32 @@ retry manager doing double duty. A real `RetryPolicy` retires that.
    transient on main → raise. `mark_aux_unreachable` moves to *after* retries
    are exhausted, which is when the model is genuinely unreachable rather than
    momentarily rude.
+
+   **DONE.** `RetryPolicy` / `invoke_with_retry` / `RETRYABLE_CLASSIFICATIONS`
+   added to `src/core/llm_retry.py`; `_ainvoke_fallback` wraps both the primary
+   and the previously-bare escalated call. Aux policy is deliberately tight
+   (`_AUX_RETRY`: 2 attempts, 1 s apart) with two exclusions —
+   `asyncio.TimeoutError` in `never_retry` (a hung model should escalate, not
+   burn a second full timeout) and `rate_limit` out of `retryable` with
+   `respect_retry_after=False` (escalating beats sitting out a 90 s provider
+   window, which is exactly the choice the fallback exists to make). Tests:
+   `tests/test_llm_retry_policy.py` (22, new) + `TestAuxRetryBeforeFallback`
+   in `tests/test_auxiliary_fallback.py` (4, new).
+
+   `tests/test_auxiliary_fallback.py::test_aux_recovers_clears_fallback_state`
+   was rewritten rather than repaired: it asserted that *one* aux failure
+   yields the fallback's answer, which is the bug this step fixes. It now fails
+   twice to exhaust the budget before escalating.
+
+   **Known interaction, deferred to step 4:** `core/summarizer.py` retries the
+   whole fold (`MAX_ATTEMPTS=3`, `BACKOFF_SECONDS=(5.0, 15.0)`) *around*
+   `aux.chain()`, so a transient now nests — worst case 12 provider calls per
+   fold where it used to be 6. Bounded and cheap in practice: `is_overflow_error`
+   short-circuits deterministic failures, `never_retry` stops timeouts
+   amplifying, and the added aux-layer sleeps total ~2 s against the
+   summarizer's existing 20 s of backoff. Collapsing the outer loop onto the
+   shared policy in step 4 removes the nesting; it is layering (transport vs
+   whole-fold-including-parse), not pure duplication, so it is not urgent.
 3. **`light_runner.py`.** Pure upside, no behaviour to preserve, closes
    Finding 1. Bound to ~2 attempts so it stays inside
    `delegation.light.timeout_seconds: 240`. Also fix Finding 1b — stop

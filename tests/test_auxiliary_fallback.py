@@ -25,7 +25,13 @@ from src.core.loader import (
     _parse_auxiliary_config,
     create_llm,
 )
-from src.services.auxiliary import AuxiliaryLLM, CurationResult, CurateKnowledgeTask
+from src.core.llm_retry import NO_RETRY
+from src.services.auxiliary import (
+    AuxiliaryLLM,
+    AuxInputTooLarge,
+    CurateKnowledgeTask,
+    CurationResult,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -182,10 +188,14 @@ class TestAuxiliaryMainModelFallback:
 
     @pytest.mark.asyncio
     async def test_aux_recovers_clears_fallback_state(self):
-        # aux fails once (fallback covers it), then recovers on the next call.
+        # aux exhausts its retry budget (fallback covers it), then recovers on
+        # the next call. Two failures, not one: a single blip is now retried on
+        # aux and never reaches the fallback (see test_transient_blip_* below).
         aux = MagicMock()
         aux.model_name = "aux-model"
-        aux.ainvoke = AsyncMock(side_effect=[RuntimeError("blip"), "aux-back"])
+        aux.ainvoke = AsyncMock(
+            side_effect=[RuntimeError("blip"), RuntimeError("blip"), "aux-back"]
+        )
         fb = _mock_llm("main-model", result="fb-answer")
         wrapper = AuxiliaryLLM(llm=aux, fallback_llm=fb)
 
@@ -197,6 +207,116 @@ class TestAuxiliaryMainModelFallback:
         assert second == "aux-back"
         assert wrapper.health.aux_reachable is True
         assert wrapper.health.heartbeat_summary()["on_fallback"] is False
+
+
+class TestAuxRetryBeforeFallback:
+    """Retry and fallback are different axes and compose in that order.
+
+    Before this, aux had no retry, so the fallback was doing retry's job: one
+    transient blip on the cheap aux model instantly rerouted the call to the
+    expensive main model and lit the aux-degraded heartbeat flag.
+    docs/issues/llm_retry_and_fallback_reimplemented_per_call_site.md
+    """
+
+    @pytest.mark.asyncio
+    async def test_transient_blip_is_retried_on_aux_not_escalated(self):
+        aux = MagicMock()
+        aux.model_name = "aux-model"
+        aux.ainvoke = AsyncMock(side_effect=[RuntimeError("blip"), "aux-answer"])
+        fb = _mock_llm("main-model", result="fb-answer")
+        wrapper = AuxiliaryLLM(llm=aux, fallback_llm=fb)
+
+        result = await wrapper.ainvoke(["a"], task_name="t")
+
+        # Retried on aux and succeeded — the expensive model was never called...
+        assert result == "aux-answer"
+        assert aux.ainvoke.await_count == 2
+        fb.ainvoke.assert_not_awaited()
+        # ...and one blip must not declare the model unreachable.
+        assert wrapper.health.aux_reachable is True
+        assert wrapper.health.heartbeat_summary()["degraded"] is False
+
+    @pytest.mark.asyncio
+    async def test_timeout_escalates_without_burning_a_second_timeout(self):
+        # A hung aux model should escalate immediately: falling back answers
+        # now, retrying just spends another full timeout to learn nothing.
+        aux = MagicMock()
+        aux.model_name = "aux-model"
+        aux.ainvoke = AsyncMock(side_effect=TimeoutError())
+        fb = _mock_llm("main-model", result="fb-answer")
+        wrapper = AuxiliaryLLM(llm=aux, fallback_llm=fb)
+
+        result = await wrapper.ainvoke(["a"], task_name="t")
+
+        assert result == "fb-answer"
+        assert aux.ainvoke.await_count == 1
+        assert wrapper.health.aux_reachable is False
+
+    @pytest.mark.asyncio
+    async def test_permanent_error_escalates_without_retry(self):
+        # No wait fixes a bad model name — go straight to the fallback.
+        aux = MagicMock()
+        aux.model_name = "aux-model"
+        aux.ainvoke = AsyncMock(side_effect=Exception("model gpt-x does not exist"))
+        fb = _mock_llm("main-model", result="fb-answer")
+        wrapper = AuxiliaryLLM(llm=aux, fallback_llm=fb)
+
+        assert await wrapper.ainvoke(["a"], task_name="t") == "fb-answer"
+        assert aux.ainvoke.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_deterministic_overflow_is_never_retried(self):
+        # Regression: ContextOverflowError / AuxInputTooLarge reach the
+        # classifier as internal typed exceptions, not provider errors, so its
+        # catch-all called them `transient` and the aux layer cheerfully re-sent
+        # a 951k-token payload that cannot fit by construction. AuxInputTooLarge's
+        # own docstring says callers must NOT retry these.
+        from src.llm.exceptions import ContextOverflowError
+
+        for exc in (
+            ContextOverflowError(951682, 131072),
+            AuxInputTooLarge(951682, 131072, "SummarizeTask"),
+        ):
+            aux = MagicMock()
+            aux.model_name = "aux-model"
+            aux.ainvoke = AsyncMock(side_effect=exc)
+            wrapper = AuxiliaryLLM(llm=aux, fallback_llm=None)
+
+            with pytest.raises(type(exc)):
+                await wrapper.ainvoke(["a"], task_name="t")
+            assert aux.ainvoke.await_count == 1, f"{type(exc).__name__} was retried"
+
+    @pytest.mark.asyncio
+    async def test_no_retry_policy_disables_the_aux_layer_loop(self):
+        # Callers that already own a retry loop (the summarization fold, memory
+        # extraction) opt out so retry stays at exactly one layer per path.
+        aux = MagicMock()
+        aux.model_name = "aux-model"
+        aux.ainvoke = AsyncMock(side_effect=[RuntimeError("blip"), "aux-answer"])
+        fb = _mock_llm("main-model", result="fb-answer")
+        wrapper = AuxiliaryLLM(llm=aux, fallback_llm=fb)
+
+        result = await wrapper.ainvoke(["a"], task_name="t", retry_policy=NO_RETRY)
+
+        # One aux attempt, then straight to the fallback — no inner retry.
+        assert aux.ainvoke.await_count == 1
+        assert result == "fb-answer"
+
+    @pytest.mark.asyncio
+    async def test_escalated_fallback_call_is_itself_retried(self):
+        # The escalated path used to be the ONE path with no protection: a blip
+        # on the main model raised straight out, which compaction surfaces as
+        # SummarizationFailed('aux_unavailable') — failing the turn on a blip.
+        aux = _mock_llm("aux-model", error=RuntimeError("aux down"))
+        fb = MagicMock()
+        fb.model_name = "main-model"
+        fb.ainvoke = AsyncMock(side_effect=[RuntimeError("blip"), "fb-answer"])
+        wrapper = AuxiliaryLLM(llm=aux, fallback_llm=fb)
+
+        result = await wrapper.ainvoke(["a"], task_name="t")
+
+        assert result == "fb-answer"
+        assert fb.ainvoke.await_count == 2
 
     def test_fallback_identical_to_primary_is_dropped(self):
         # If the "fallback" IS the primary (aux already the main model), there is

@@ -36,6 +36,8 @@ from pydantic import BaseModel, Field, ValidationError
 if TYPE_CHECKING:
     from src.core.archiver import LLMArchiver
 
+from src.core.llm_retry import RetryPolicy, invoke_with_retry
+from src.llm.exceptions import ContextOverflowError
 from src.llm.structured_recovery import recover_structured
 
 logger = logging.getLogger(__name__)
@@ -1004,6 +1006,38 @@ class AuxInputTooLarge(Exception):
         )
 
 
+# Aux calls are background/compaction work behind a per-call timeout, so the
+# retry budget is deliberately tight: one extra attempt, ~1 s apart. That clears
+# the common transient (a dropped stream fails fast, it does not sit out the
+# timeout) without materially widening worst-case latency on the compaction
+# path, which is the only aux caller a user waits on.
+#
+# Three deliberate exclusions, all cases where a second identical attempt is not
+# merely useless but actively wasteful:
+#   * ContextOverflowError / AuxInputTooLarge — deterministic by construction.
+#     A payload that exceeds the window exceeds it every time; AuxInputTooLarge's
+#     own docstring says callers must NOT retry. These reach the classifier as
+#     internal typed exceptions, not provider errors, so its catch-all would
+#     otherwise call them `transient` and burn a duplicate oversized request.
+#   * asyncio.TimeoutError — a hung aux model should ESCALATE, not burn a second
+#     full timeout. Falling back answers immediately; retrying does not.
+#   * rate_limit (via `retryable`) — a throttled aux model should escalate too.
+#     Sitting out a provider's 90 s Retry-After is strictly worse than asking the
+#     main model, which is exactly the choice the fallback exists to make.
+_AUX_RETRY = RetryPolicy(
+    max_attempts=2,
+    base_delay=1.0,
+    max_delay=5.0,
+    retryable=frozenset({"transient", "auth_unavailable"}),
+    never_retry=(asyncio.TimeoutError, ContextOverflowError, AuxInputTooLarge),
+    respect_retry_after=False,
+)
+
+# The escalated call has nowhere left to go, so give it the same one retry
+# rather than letting a blip on the main model raise straight out.
+_AUX_FALLBACK_RETRY = _AUX_RETRY
+
+
 class AuxiliaryLLM:
     """Unified support task execution with chain and agent modes.
 
@@ -1081,32 +1115,55 @@ class AuxiliaryLLM:
         structured_schema: Optional[Type[BaseModel]] = None,
         method: Optional[str] = None,
         fallback_method: Optional[str] = None,
+        retry_policy: Optional[RetryPolicy] = None,
     ):
         """Invoke ``build_runnable(llm).ainvoke(invoke_arg)`` on the dedicated aux
-        model; on failure, retry once on the main-model fallback.
+        model; on failure, retry the aux model, then fall back to the main model.
 
         ``build_runnable`` maps an LLM to the runnable to invoke (identity for a
         raw ``ainvoke``, ``.with_structured_output(...)`` for chain mode,
         ``.bind_tools(...)`` for a single agent turn) — so the exact same
         fallback wraps every aux call shape.
 
+        Retry and fallback are DIFFERENT AXES and compose in that order. Before
+        :class:`RetryPolicy` existed, this method had no retry at all, so the
+        fallback was doing retry's job: a single transient blip on the cheap aux
+        model instantly rerouted memory extraction, title generation and
+        compaction onto the expensive main model, and lit the heartbeat
+        ``aux_degraded`` flag while doing it. Now a transient failure gets a
+        second attempt on the aux model first, and only a genuinely stuck or
+        permanently-broken aux model escalates.
+
         Semantics (the calibrated "fail loud" contract):
           - Aux model succeeds → normal return; aux marked reachable.
-          - Aux model fails + a fallback exists → LOUD error, retry on the main
-            model, return its result. Never silent: ``mark_aux_unreachable``
-            lights the heartbeat ``aux_degraded`` flag.
-          - Aux model fails + no fallback (aux IS the main model), OR the
-            fallback ALSO fails → raise. The caller then fails the turn/session
-            (compaction → ``SummarizationFailed('aux_unavailable')``) rather
-            than limping with half a context.
+          - Aux model fails transiently → bounded retry on the aux model
+            (``_AUX_RETRY``); a success on attempt 2 is a normal return and
+            never touches the fallback or the health flag.
+          - Aux retries exhausted, or a permanent/timeout failure + a fallback
+            exists → LOUD error, escalate to the main model, return its result.
+            Never silent: ``mark_aux_unreachable`` lights the heartbeat
+            ``aux_degraded`` flag — and now only fires once the aux model is
+            genuinely unreachable rather than momentarily rude.
+          - Aux fails + no fallback (aux IS the main model), OR the fallback
+            ALSO fails (itself retried under ``_AUX_FALLBACK_RETRY``) → raise.
+            The caller then fails the turn/session (compaction →
+            ``SummarizationFailed('aux_unavailable')``) rather than limping
+            with half a context.
         """
         _timeout = timeout if timeout is not None else self.timeout
+        _policy = retry_policy if retry_policy is not None else _AUX_RETRY
         method = method or self.structured_output_method
         fallback_method = fallback_method or self.fallback_structured_output_method
         try:
-            result = await asyncio.wait_for(
-                build_runnable(self.llm, method).ainvoke(invoke_arg),
-                timeout=_timeout,
+            # The per-attempt wait_for lives INSIDE the retried callable so each
+            # attempt gets its own timeout budget rather than sharing a spent one.
+            result = await invoke_with_retry(
+                lambda: asyncio.wait_for(
+                    build_runnable(self.llm, method).ainvoke(invoke_arg),
+                    timeout=_timeout,
+                ),
+                policy=_policy,
+                description=f"aux '{task_name}' on model '{self.health.model}'",
             )
             self.health.mark_aux_reachable()
             if structured_schema is not None:
@@ -1168,9 +1225,23 @@ class AuxiliaryLLM:
                 self._fallback_model_name,
             )
             self.health.mark_aux_unreachable(task_name, primary_exc)
-            fallback_raw = await asyncio.wait_for(
-                build_runnable(self.fallback_llm, fallback_method).ainvoke(invoke_arg),
-                timeout=_timeout,
+            # The escalated call used to be the one path with no protection at
+            # all: a transient blip on the MAIN model raised straight out of
+            # here, and for compaction that surfaces as
+            # SummarizationFailed('aux_unavailable') — failing the turn on a
+            # blip, at the exact moment we had already given up on aux.
+            fallback_raw = await invoke_with_retry(
+                lambda: asyncio.wait_for(
+                    build_runnable(self.fallback_llm, fallback_method).ainvoke(
+                        invoke_arg
+                    ),
+                    timeout=_timeout,
+                ),
+                policy=_policy,
+                description=(
+                    f"aux '{task_name}' fallback on main model "
+                    f"'{self._fallback_model_name}'"
+                ),
             )
             if structured_schema is not None:
                 try:
@@ -1199,6 +1270,7 @@ class AuxiliaryLLM:
         *,
         task_name: str = "raw_invoke",
         timeout: Optional[float] = None,
+        retry_policy: Optional[RetryPolicy] = None,
     ):
         """Raw (unstructured) aux call with main-model fallback.
 
@@ -1212,6 +1284,7 @@ class AuxiliaryLLM:
             messages,
             task_name=task_name,
             timeout=timeout,
+            retry_policy=retry_policy,
         )
 
     def _recover_structured_output(
@@ -1270,7 +1343,12 @@ class AuxiliaryLLM:
             return None
         return {"raw": raw_result, "parsed": parsed, "parsing_error": None}
 
-    async def chain(self, task: AuxTask, timeout: Optional[float] = None) -> BaseModel:
+    async def chain(
+        self,
+        task: AuxTask,
+        timeout: Optional[float] = None,
+        retry_policy: Optional[RetryPolicy] = None,
+    ) -> BaseModel:
         """Single LLM call: system prompt + context -> structured output.
 
         For tasks that need reasoning but no tool access.
@@ -1322,6 +1400,7 @@ class AuxiliaryLLM:
                 method=self.structured_output_method,
                 task_name=task.__class__.__name__,
                 timeout=timeout if timeout is not None else self.timeout,
+                retry_policy=retry_policy,
             ),
             task=task,
             messages=messages,
