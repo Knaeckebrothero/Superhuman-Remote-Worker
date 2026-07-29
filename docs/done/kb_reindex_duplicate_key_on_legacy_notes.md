@@ -10,6 +10,7 @@ related:
   - "[[okf_knowledge_base]]"
   - "[[kb_reindex_watermark_never_advances]]"
   - "[[okf_kb_hygiene_worklist]]"
+  - "[[kb_duplicate_frontmatter_ids_collide_on_reindex]]"
 ---
 
 # `kb_export` turned a note filename into a directory inside the vault, giving every note a duplicate OKF id
@@ -175,7 +176,8 @@ it was.
 
 ## Residual: four duplicate frontmatter ids
 
-The remaining 4 errors are a **different defect**, previously drowned in the 1811. Four
+The remaining 4 errors are a **different defect**, previously drowned in the 1811, and
+now tracked separately as [[kb_duplicate_frontmatter_ids_collide_on_reindex]]. Four
 pairs of distinct files carry the same frontmatter `id`, and since `note_fields` takes
 `note_id` from frontmatter rather than the filename, both claim one identity:
 
@@ -185,9 +187,9 @@ knowledge/phase-75-blocker-diagnosis-ac-3ac-4-pdf-prefix-oracles-mathematically-
    both:  id: phase-75-blocker-diagnosis-ac-3ac-4-pdf-prefix-oracles-mathematically-impossible
 ```
 
-`kb_lint`'s existing `duplicate-id` rule (`gardener.py:334`) is the detector. The fix is
-editing one `id:` line per pair, but which note is canonical is a content judgement —
-left for a human. Not caused by `kb_export`.
+The vault holds no duplicate *files* there — every note is at one path — so it is not
+this bug and not `kb_export`'s doing. See the split-out issue for all four pairs and
+the disposition.
 
 ## Not a symptom: the 128 pathless rows
 
