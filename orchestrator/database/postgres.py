@@ -2098,6 +2098,7 @@ class PostgresDB:
         now: datetime,
         reset_window_seconds: int,
         fingerprint: Optional[str] = None,
+        repeat_key: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Atomically advance ``context.llm_outage`` for an ``llm_unavailable`` pause.
 
@@ -2174,6 +2175,22 @@ class PostgresDB:
                     first_dt = now_utc
                 attempt += 1
 
+                # Consecutive-identical streak for the repeat give-up
+                # (completion.llm_outage_repeat_key). Unlike ``fingerprint``,
+                # which only needs the PREVIOUS value, this needs a running
+                # count — so carry it forward on a match and restart otherwise.
+                # A None key (rate-limit text / deterministic_exempt) breaks the
+                # streak, same as the strict fingerprint. Survives the reset
+                # branch deliberately: an error that repeats identically across
+                # a >2h productive gap is still the same error.
+                repeats = 0
+                if repeat_key is not None:
+                    repeats = (
+                        int(outage.get("repeats", 0) or 0) + 1
+                        if outage.get("repeat_key") == repeat_key
+                        else 1
+                    )
+
                 new_outage = {
                     "attempt": attempt,
                     "first_failed_at": first_dt.isoformat(),
@@ -2183,6 +2200,8 @@ class PostgresDB:
                     # determine_job_status is strictly consecutive-identical.
                     # None (non-4xx / outage-shaped error) breaks any streak.
                     "fingerprint": fingerprint,
+                    "repeat_key": repeat_key,
+                    "repeats": repeats,
                 }
                 await conn.execute(
                     """
@@ -2201,6 +2220,7 @@ class PostgresDB:
             "attempt": attempt,
             "first_failed_at": new_outage["first_failed_at"],
             "reset": reset,
+            "repeats": repeats,
         }
 
     async def merge_vm_context(self, job_id: str, vm_updates: Dict[str, Any]) -> bool:

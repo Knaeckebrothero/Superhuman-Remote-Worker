@@ -21,12 +21,14 @@ from orchestrator.services.completion import (  # noqa: E402
     LLM_OUTAGE_BACKOFF_CAP_SECONDS,
     LLM_OUTAGE_CEILING_SECONDS,
     LLM_OUTAGE_MAX_ATTEMPTS,
+    LLM_OUTAGE_REPEAT_CEILING,
     LLM_OUTAGE_RESET_WINDOW_SECONDS,
     MEMORY_RETRY_CAP,
     determine_job_status,
     evaluate_llm_outage,
     llm_outage_backoff_seconds,
     llm_outage_fingerprint,
+    llm_outage_repeat_key,
 )
 
 NOW = datetime(2026, 7, 1, 12, 0, 0, tzinfo=timezone.utc)
@@ -530,6 +532,166 @@ class TestDeterminismFailFast:
         status, err = determine_job_status(job, STOP)
         assert status == "paused"
         assert err is None
+
+
+# Verbatim freeze summary from job d251e513 (2026-07-29). The Codex proxy's
+# sole auth entry flipped to `status: error` after an upstream 408 stream drop,
+# so every retry bounced off an instant 503. Identical on all 13 re-dispatches.
+CODEX_503 = (
+    "Error code: 503 - {'error': {'message': 'auth_unavailable: no auth "
+    "available (providers=codex, model=gpt-5.6-sol)', 'type': 'server_error', "
+    "'code': 'internal_server_error'}}"
+)
+
+
+class TestLlmOutageRepeatKey:
+    def test_5xx_gets_a_repeat_key(self):
+        # The strict fingerprint deliberately skips 5xx; the repeat key must
+        # not, or a deterministic 503 rides the ceiling forever.
+        assert llm_outage_fingerprint({"error_summary": CODEX_503}) is None
+        assert llm_outage_repeat_key({"error_summary": CODEX_503}) is not None
+
+    def test_connection_error_gets_a_repeat_key(self):
+        assert llm_outage_repeat_key({"error_summary": "Connection error."}) is not None
+
+    def test_digits_normalized_away(self):
+        # Version/counter digits must not split the streak.
+        other = CODEX_503.replace("503", "500").replace("gpt-5.6-sol", "gpt-9.9-sol")
+        assert llm_outage_repeat_key({"error_summary": CODEX_503}) == (
+            llm_outage_repeat_key({"error_summary": other})
+        )
+
+    def test_long_ids_normalized_away(self):
+        # NB: no .format() — the summary carries literal `{'error': ...}` braces.
+        base = CODEX_503 + " request_id: "
+        a = base + "06a12d1aed49504c11643e132559ac86"
+        b = base + "aaaabbbbccccddddeeeeffff00001111"
+        assert llm_outage_repeat_key({"error_summary": a}) == (
+            llm_outage_repeat_key({"error_summary": b})
+        )
+
+    def test_model_name_is_semantic_not_volatile(self):
+        # A short model slug survives normalization, so a different model is a
+        # different error — switching models must restart the streak.
+        other = CODEX_503.replace("gpt-5.6-sol", "some-other-model")
+        assert llm_outage_repeat_key({"error_summary": CODEX_503}) != (
+            llm_outage_repeat_key({"error_summary": other})
+        )
+
+    def test_different_errors_key_differently(self):
+        assert llm_outage_repeat_key({"error_summary": CODEX_503}) != (
+            llm_outage_repeat_key({"error_summary": "Connection error."})
+        )
+
+    def test_rate_limit_text_excluded(self):
+        assert (
+            llm_outage_repeat_key({"error_summary": "Error code: 429 - slow down"})
+            is None
+        )
+
+    def test_deterministic_exempt_excluded(self):
+        assert (
+            llm_outage_repeat_key(
+                {"error_summary": NGINX_404_SUMMARY, "deterministic_exempt": True}
+            )
+            is None
+        )
+
+    def test_no_text_returns_none(self):
+        assert llm_outage_repeat_key({}) is None
+
+
+class TestRepeatGiveUp:
+    """A 5xx that survives N identical backoff cycles is not an outage."""
+
+    def _job(self, summary, *, repeats, key=None, extra=None):
+        ctx = _real_outage_ctx(repeats or 1, 300, 60)
+        ctx["llm_outage"]["repeat_key"] = (
+            key
+            if key is not None
+            else llm_outage_repeat_key({"error_summary": summary})
+        )
+        ctx["llm_outage"]["repeats"] = repeats
+        job = _llm_job(ctx)
+        job["freeze_data"]["error_summary"] = summary
+        job["freeze_data"].update(extra or {})
+        return job
+
+    def test_under_ceiling_keeps_pausing(self):
+        job = self._job(CODEX_503, repeats=LLM_OUTAGE_REPEAT_CEILING - 2)
+        status, err = determine_job_status(job, STOP)
+        assert status == "paused"
+        assert err is None
+
+    def test_at_ceiling_fails(self):
+        # prior repeats + this pause == the ceiling.
+        job = self._job(CODEX_503, repeats=LLM_OUTAGE_REPEAT_CEILING - 1)
+        status, err = determine_job_status(job, STOP)
+        assert status == "failed"
+        assert str(LLM_OUTAGE_REPEAT_CEILING) in err
+        assert "Admin" in err  # actionable operator pointer
+
+    def test_first_failure_pauses(self):
+        job = self._job(CODEX_503, repeats=0, key=None)
+        job["context"]["llm_outage"]["repeat_key"] = None
+        status, err = determine_job_status(job, STOP)
+        assert status == "paused"
+
+    def test_different_error_breaks_the_streak(self):
+        # Prior streak was at the ceiling, but this pause carries a DIFFERENT
+        # error — the streak restarts rather than inheriting the give-up.
+        job = self._job(
+            "Connection error.",
+            repeats=LLM_OUTAGE_REPEAT_CEILING - 1,
+            key=llm_outage_repeat_key({"error_summary": CODEX_503}),
+        )
+        status, err = determine_job_status(job, STOP)
+        assert status == "paused"
+
+    def test_exempt_edge_outage_never_gives_up(self):
+        # A provider gateway that is still down must ride the ceiling, however
+        # many identical cycles it takes — that is the feature's whole purpose.
+        job = self._job(
+            NGINX_404_SUMMARY,
+            repeats=LLM_OUTAGE_REPEAT_CEILING + 5,
+            key=llm_outage_repeat_key({"error_summary": NGINX_404_SUMMARY}),
+            extra={"deterministic_exempt": True},
+        )
+        status, err = determine_job_status(job, STOP)
+        assert status == "paused"
+
+    def test_rate_limit_streak_never_gives_up(self):
+        job = self._job(
+            "Error code: 429 - too many requests",
+            repeats=LLM_OUTAGE_REPEAT_CEILING + 5,
+            key="whatever",
+        )
+        status, err = determine_job_status(job, STOP)
+        assert status == "paused"
+
+    def test_message_prefers_the_initial_error(self):
+        # The retry storm's LAST error is a symptom; the FIRST is the cause.
+        job = self._job(
+            CODEX_503,
+            repeats=LLM_OUTAGE_REPEAT_CEILING - 1,
+            extra={
+                "initial_error_summary": "Error code: 408 - stream disconnected",
+                "initial_classification": "transient",
+            },
+        )
+        status, err = determine_job_status(job, STOP)
+        assert status == "failed"
+        assert "408" in err
+        assert "stream disconnected" in err
+
+    def test_duration_ceiling_still_wins_first(self):
+        # The existing ceiling check runs before the repeat check; a job past
+        # both must report the ceiling reason, not the repeat reason.
+        job = self._job(CODEX_503, repeats=LLM_OUTAGE_REPEAT_CEILING - 1)
+        job["context"] = _real_outage_ctx(8, LLM_OUTAGE_CEILING_SECONDS + 3600, 60)
+        status, err = determine_job_status(job, STOP)
+        assert status == "failed"
+        assert "continuous outage" in err
 
 
 class TestBornParkedShape:

@@ -733,6 +733,15 @@ LLM_OUTAGE_BACKOFF_CAP_SECONDS = _env_int("LLM_OUTAGE_BACKOFF_CAP_SECONDS", 3_60
 # Jitter strategy: "full" (uniform[0, envelope], the thundering-herd default) or
 # "equal" (envelope/2 + uniform[0, envelope/2], a >=50% floor).
 LLM_OUTAGE_JITTER = (os.getenv("LLM_OUTAGE_JITTER") or "full").strip().lower() or "full"
+# Consecutive pauses carrying a byte-identical (normalized) error before we stop
+# auto-redispatching a NON-4xx failure. 4xx request rejections are deterministic
+# on sight and give up after 2 (llm_outage_fingerprint below); a 5xx/transport
+# error repeats identically during a GENUINE provider outage too, so it needs a
+# higher bar. At the 60-min backoff cap 4 pauses is still ~2-3h of outage
+# tolerance, versus the 12h duration ceiling spent achieving nothing.
+# Incident: 2026-07-29 job d251e513 burned 13 attempts on an identical
+# `503 auth_unavailable` that failed on attempt 1 of every single re-dispatch.
+LLM_OUTAGE_REPEAT_CEILING = _env_int("LLM_OUTAGE_REPEAT_CEILING", 4)
 
 
 def _parse_context(job: dict[str, Any]) -> dict[str, Any]:
@@ -792,12 +801,47 @@ def llm_outage_fingerprint(fd: dict[str, Any]) -> str | None:
         return None
     if not re.search(r"\b4\d\d\b", low):
         return None
-    # {20,} not shorter: ids (uuids, request ids, tool_call ids) are 20+ chars
-    # while semantic tokens like 'bad_request_error' (17) must survive so
-    # different error TYPES keep distinct fingerprints.
+    return _normalize_llm_error(low)
+
+
+def _normalize_llm_error(low: str) -> str:
+    """Hash an error string with volatile ids/numbers stripped.
+
+    ``{20,}`` not shorter: ids (uuids, request ids, tool_call ids) are 20+ chars
+    while semantic tokens like ``bad_request_error`` (17) must survive so
+    different error TYPES keep distinct fingerprints.
+    """
     norm = re.sub(r"[a-z0-9_-]{20,}", "<tok>", low)
     norm = re.sub(r"\d+", "<n>", norm)
     return hashlib.sha256(norm[:500].encode("utf-8")).hexdigest()[:16]
+
+
+def llm_outage_repeat_key(fd: dict[str, Any]) -> str | None:
+    """Signature of ANY outage error, for the consecutive-repeat give-up.
+
+    The sibling :func:`llm_outage_fingerprint` only claims request-shaped 4xx,
+    because those are deterministic on sight and must die after two cycles. But
+    a 5xx / transport error can ALSO be deterministic — the 2026-07-29
+    ``d251e513`` incident failed on attempt 1 of thirteen consecutive
+    re-dispatches with a byte-identical ``503 auth_unavailable``, each separated
+    by a fully-idle backoff hour, and rode the ceiling for nothing.
+
+    So this fingerprints everything the strict function skips, and the caller
+    pairs it with the much higher :data:`LLM_OUTAGE_REPEAT_CEILING` so a genuine
+    multi-hour provider outage still gets to ride the pause+backoff path — which
+    is the entire point of the feature. Same exclusions as the strict function:
+    ``deterministic_exempt`` (provider gateway still down) and rate-limit texts
+    (they have their own cooldown handling) never count toward the streak.
+    """
+    if fd.get("deterministic_exempt"):
+        return None
+    src = str(fd.get("error_summary") or fd.get("reason") or "")
+    if not src:
+        return None
+    low = src.lower()
+    if "429" in low or "rate limit" in low or "too many requests" in low:
+        return None
+    return _normalize_llm_error(low)
 
 
 def evaluate_llm_outage(ctx: dict[str, Any], now: datetime) -> dict[str, Any]:
@@ -1160,9 +1204,10 @@ def determine_job_status(
         # enter here (llm_outage_fingerprint returns None for connection/5xx/
         # rate errors). docs/features/outbound_message_hygiene.md (layer 3).
         fp = llm_outage_fingerprint(fd)
+        prior = _parse_context(job).get("llm_outage")
+        prior = prior if isinstance(prior, dict) else {}
         if fp is not None:
-            prior = _parse_context(job).get("llm_outage")
-            if isinstance(prior, dict) and prior.get("fingerprint") == fp:
+            if prior.get("fingerprint") == fp:
                 summary = fd.get("error_summary") or fd.get("reason") or "LLM error"
                 return (
                     "failed",
@@ -1173,6 +1218,35 @@ def determine_job_status(
                     "poisoned or the model config is wrong — resume with "
                     "feedback (compacts context) or fix the model "
                     "(Admin → Models).",
+                )
+        # Repeat give-up: the same error (5xx/transport included) surviving
+        # LLM_OUTAGE_REPEAT_CEILING consecutive pauses is not an outage we are
+        # waiting out — each re-dispatch got a fresh pod, a fresh connection and
+        # an idle endpoint, and still failed identically. Higher bar than the
+        # 4xx path above precisely so a real multi-hour outage still rides the
+        # backoff. The initial error is preferred in the message: the retry
+        # storm's LAST error is often a downstream symptom of the FIRST one
+        # (d251e513: a 408 stream drop, reported as five 503s).
+        rk = llm_outage_repeat_key(fd)
+        if rk is not None and prior.get("repeat_key") == rk:
+            repeats = int(prior.get("repeats", 0) or 0) + 1
+            if repeats >= LLM_OUTAGE_REPEAT_CEILING:
+                summary = (
+                    fd.get("initial_error_summary")
+                    or fd.get("error_summary")
+                    or fd.get("reason")
+                    or "LLM error"
+                )
+                return (
+                    "failed",
+                    f"LLM call failed identically on {repeats} consecutive "
+                    "backoff cycles — each re-dispatch hit a fresh pod and an "
+                    "idle endpoint, so this is not an outage that waiting can "
+                    f"clear. Giving up instead of burning the "
+                    f"{LLM_OUTAGE_CEILING_SECONDS / 3600:.0f}h ceiling. First "
+                    f"error of the last attempt: {str(summary)[:200]}. Resume "
+                    "with feedback (compacts context) or check the model "
+                    "endpoint/provider (Admin → Models).",
                 )
         return ("paused", None)
     if is_loop_job:

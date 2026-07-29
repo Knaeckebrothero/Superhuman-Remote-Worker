@@ -36,17 +36,31 @@ workspace:
   prewarm:
     enabled: false
 
-# Object store — bundled single-node Garage (`garage.enabled`), the same opt-in
-# store self-hosters get. Replaces the old separate MinIO fixture: the chart
-# deploys Garage + an idempotent bootstrap Job (buckets srw-snapshots +
-# srw-workspaces, native-format keys) and AUTO-WIRES both seams to it — snapshots
-# (S3_ENDPOINT, boto3) and the virtual tier (VIRTUAL_WORKSPACE_*, rclone provider
-# "Other"). So NO endpoint/credential wiring is needed here, and s3.endpoint /
-# virtualWorkspace.s3.endpoint MUST stay empty (a set endpoint bypasses Garage).
-# Creds auto-generate in the chart Secret (secrets.create). For a pure no-store
-# smoke test: garage.enabled=false + virtualWorkspace.rclone.type="memory".
-garage:
-  enabled: true
+# Object store — bundled single-node Garage, the same store self-hosters get.
+# Replaces the old separate MinIO fixture: the chart deploys Garage + an
+# idempotent bootstrap Job (buckets srw-snapshots + srw-workspaces,
+# native-format keys) and AUTO-WIRES both seams to it — snapshots (S3_ENDPOINT,
+# boto3) and the virtual tier (VIRTUAL_WORKSPACE_*, rclone provider "Other").
+# Creds auto-generate in the chart Secret (secrets.create).
+#
+# `garage.enabled` is deliberately NOT set here. The chart default is auto
+# (null = run the bundled store unless you brought your own `s3.endpoint`), so
+# leaving it unset makes local dev exercise the same resolution a fresh chart
+# consumer gets, instead of a forced-on path nobody else runs.
+#
+# Blanking the endpoints below is what makes that safe. They are the auto
+# input, and this overlay loads AFTER the private values-local.yaml — a stale
+# one carrying an endpoint would otherwise flip auto off and leave local dev
+# with no object store at all. Same defensive reason as the secrets block
+# below, which already clears stale MinIO-format credentials.
+#
+# For a pure no-store smoke test: garage.enabled=false +
+# virtualWorkspace.rclone.type="memory".
+s3:
+  endpoint: ""
+virtualWorkspace:
+  s3:
+    endpoint: ""
 
 # Older private values-local.yaml files carried MinIO-style placeholder S3
 # credentials. Garage rejects those identifiers, so the later Tilt overlay
