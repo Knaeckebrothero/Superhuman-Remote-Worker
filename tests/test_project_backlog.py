@@ -1101,11 +1101,15 @@ class TestCloseBacklogTicket:
         """A note that predates the status field (or never had one) must gain
         exactly one status line, not be left untouched and not gain a
         duplicate on a second close."""
-        from orchestrator.services.project_backlog import _rewrite_status
+        from orchestrator.services.project_backlog import (
+            _REWRITTEN,
+            _rewrite_status,
+        )
 
         original = "---\nid: feature-x\ntype: feature\n---\n# T\nbody\n"
-        updated = _rewrite_status(original, "resolved")
+        updated, outcome = _rewrite_status(original, "resolved")
 
+        assert outcome == _REWRITTEN  # inserting a line is a real write
         assert updated.count("status:") == 1
         assert "status: resolved" in updated
         assert "id: feature-x" in updated
@@ -1117,7 +1121,10 @@ class TestCloseBacklogTicket:
         round-trip (its own docstring) -- reserializing would reformat every
         note a human ever wrote. Prove every other line, including odd
         spacing, blank lines, and the body, survives untouched."""
-        from orchestrator.services.project_backlog import _rewrite_status
+        from orchestrator.services.project_backlog import (
+            _REWRITTEN,
+            _rewrite_status,
+        )
 
         original = (
             "---\n"
@@ -1133,8 +1140,9 @@ class TestCloseBacklogTicket:
             "Some body text with  double  spaces and a trailing note.\n"
             "  - indented bullet\n"
         )
-        updated = _rewrite_status(original, "resolved")
+        updated, outcome = _rewrite_status(original, "resolved")
 
+        assert outcome == _REWRITTEN
         orig_lines = original.splitlines()
         new_lines = updated.splitlines()
         assert len(orig_lines) == len(new_lines)  # no lines added or removed
@@ -1307,6 +1315,150 @@ class TestCloseBacklogTicket:
                 "resolved",
             )
         assert any("no rewritable" in r.message for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_unterminated_frontmatter_reports_failure_and_warns(self, caplog):
+        """The second of _rewrite_status's three byte-identical returns: a
+        `---` opener with no closing `---`. It has a status line, and that
+        line is NOT at the target -- but there is no parseable frontmatter
+        block to rewrite it inside, so this stays a genuine no-op: warn, no
+        write, False. Only the missing-frontmatter case was covered before,
+        which is how these three came to be conflated
+        (docs/issues/backlog_close_mislabels_idempotent_reclose.md)."""
+        import logging
+        from unittest.mock import AsyncMock, MagicMock
+
+        from orchestrator.services.project_backlog import close_backlog_ticket
+
+        conn = MagicMock()
+        conn.execute = AsyncMock(return_value="UPDATE 1")
+
+        class _CM:
+            async def __aenter__(self):
+                return conn
+
+            async def __aexit__(self, *a):
+                return False
+
+        vector_db = MagicMock()
+        vector_db.acquire = MagicMock(return_value=_CM())
+
+        gitea = MagicMock()
+        gitea.get_file_content = AsyncMock(
+            return_value="---\nid: feature-x\ntype: feature\nstatus: active\n# T\n"
+        )
+        gitea.create_or_update_file = AsyncMock(return_value=True)
+
+        with caplog.at_level(
+            logging.WARNING, logger="orchestrator.services.project_backlog"
+        ):
+            ok = await close_backlog_ticket(
+                vector_db,
+                gitea,
+                "68137e29-6b1f-4f1b-a0c1-4e6dc2be3f9a",
+                "feature-x",
+                "resolved",
+            )
+
+        assert ok is False
+        gitea.create_or_update_file.assert_not_awaited()
+        assert any("no rewritable" in r.message for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_idempotent_reclose_reports_success_without_writing(self):
+        """The third byte-identical return, and the only one that is a
+        SUCCESS: the note's frontmatter already says `status: resolved`, so
+        the rewrite is a no-op because the durable mirror is already exactly
+        right. Reachable via the torn-advance heal window (the close runs
+        before campaign=None is persisted, so a re-driven advance calls it
+        twice on one ticket) and via a human setting the status by hand
+        before the campaign disposes. Returning False here made main.py log
+        `the durable mirror did not land` about a mirror that had."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        from orchestrator.services.project_backlog import close_backlog_ticket
+
+        conn = MagicMock()
+        conn.execute = AsyncMock(return_value="UPDATE 1")
+
+        class _CM:
+            async def __aenter__(self):
+                return conn
+
+            async def __aexit__(self, *a):
+                return False
+
+        vector_db = MagicMock()
+        vector_db.acquire = MagicMock(return_value=_CM())
+
+        gitea = MagicMock()
+        gitea.get_file_content = AsyncMock(
+            return_value="---\nid: feature-x\ntype: feature\nstatus: resolved\n---\n# T\n"
+        )
+        gitea.create_or_update_file = AsyncMock(return_value=True)
+
+        ok = await close_backlog_ticket(
+            vector_db,
+            gitea,
+            "68137e29-6b1f-4f1b-a0c1-4e6dc2be3f9a",
+            "feature-x",
+            "resolved",
+        )
+
+        assert ok is True
+        # Nothing to write: a commit here would be an empty churn commit in
+        # the note repo for every re-close.
+        gitea.create_or_update_file.assert_not_awaited()
+        # The two writes stay independent -- the index close still runs.
+        conn.execute.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_idempotent_reclose_is_not_warned_as_malformed(self, caplog):
+        """The wrong-cause half of the same bug: the frontmatter is present
+        and perfectly well-formed, so the malformed-frontmatter warning must
+        not fire. The re-close is still not silent -- it says what it saw, at
+        debug, on a path whose whole purpose is auditable closure."""
+        import logging
+        from unittest.mock import AsyncMock, MagicMock
+
+        from orchestrator.services.project_backlog import close_backlog_ticket
+
+        conn = MagicMock()
+        conn.execute = AsyncMock(return_value="UPDATE 1")
+
+        class _CM:
+            async def __aenter__(self):
+                return conn
+
+            async def __aexit__(self, *a):
+                return False
+
+        vector_db = MagicMock()
+        vector_db.acquire = MagicMock(return_value=_CM())
+
+        gitea = MagicMock()
+        gitea.get_file_content = AsyncMock(
+            return_value="---\nid: feature-x\ntype: feature\nstatus: resolved\n---\n# T\n"
+        )
+        gitea.create_or_update_file = AsyncMock(return_value=True)
+
+        with caplog.at_level(
+            logging.DEBUG, logger="orchestrator.services.project_backlog"
+        ):
+            await close_backlog_ticket(
+                vector_db,
+                gitea,
+                "68137e29-6b1f-4f1b-a0c1-4e6dc2be3f9a",
+                "feature-x",
+                "resolved",
+            )
+
+        assert not any("no rewritable" in r.message for r in caplog.records)
+        assert not any(r.levelno >= logging.WARNING for r in caplog.records)
+        already = [r for r in caplog.records if "already at" in r.message]
+        assert already, "the no-op re-close must still say what it saw"
+        assert already[0].levelno == logging.DEBUG
+        assert "resolved" in already[0].getMessage()
 
 
 # =============================================================================
