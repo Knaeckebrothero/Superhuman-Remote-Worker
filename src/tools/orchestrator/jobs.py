@@ -583,6 +583,7 @@ def create_orchestrator_tools(context: ToolContext) -> List[Any]:
         config_override: Optional[Dict[str, Any]] = None,
         expert_id: Optional[str] = None,
         slot: Optional[str] = None,
+        required_deliverables: Optional[List[str]] = None,
     ) -> str:
         """Create a new worker job on the orchestrator.
 
@@ -610,6 +611,13 @@ def create_orchestrator_tools(context: ToolContext) -> List[Any]:
                 worker's model and workspace backend server-side — pick the
                 smallest slot that serves the task. Omit when the roster has
                 a single slot type; non-officer sessions ignore this.
+            required_deliverables: Deliverable contract — workspace-relative
+                artifact paths (e.g. ["output/report.md"]) or "kb:<slug>"
+                note slugs the worker MUST produce. The platform shows the
+                list to the worker at dispatch and refuses a completion that
+                claims success while any is missing (bounced back to the
+                worker with the precise missing/present listing) — declare
+                one whenever you would otherwise check files by hand.
 
         Returns:
             Job creation result with job ID
@@ -646,6 +654,10 @@ def create_orchestrator_tools(context: ToolContext) -> List[Any]:
             payload["config_override"] = config_override
         if expert_id:
             payload["expert_id"] = expert_id
+        # Deliverable contract (P1-C): server normalizes + stores in
+        # jobs.context; the completion gate enforces it at the seal.
+        if required_deliverables:
+            payload["required_deliverables"] = [str(p) for p in required_deliverables]
         # Explicit selection overrides inheritance; [] means "attach none".
         # Omitting it lets the orchestrator inherit the parent session/job's
         # selection (server-side, keyed off thread_id below).

@@ -1038,10 +1038,16 @@ def _complete_phase_with_git(
     phase_type: str,
     todos_archived: int = 0,
     job_id: str = "unknown",
+    required_deliverables: Optional[List[str]] = None,
 ) -> None:
     """Complete a phase with git operations.
 
     Creates a git tag for the completed phase and commits any pending changes.
+    When the job carries a deliverable contract, a job-stamped
+    ``output/manifest_status.json`` is written FIRST so the boundary
+    commit+push carries contract status a supervisor can read from Gitea
+    (P1-C / F13 — inherited parent-snapshot completion files are exposed by
+    the embedded job_id).
 
     Args:
         workspace: WorkspaceManager with git_manager
@@ -1049,8 +1055,26 @@ def _complete_phase_with_git(
         phase_type: Completed phase type ("strategic" or "tactical")
         todos_archived: Number of todos archived in this phase
         job_id: Job UUID (used to namespace tags in shared repos)
+        required_deliverables: The job's ``required_deliverables`` manifest
+            (workspace paths / ``kb:`` slugs); None/empty writes nothing
     """
     git_mgr = workspace.git_manager
+
+    # Job-stamped contract status BEFORE the boundary commit, so the push
+    # below carries it. No manifest → no file (don't create noise).
+    if required_deliverables:
+        from .deliverables import write_manifest_status
+
+        branch = None
+        try:
+            if git_mgr and git_mgr.is_active:
+                branch = git_mgr.current_branch()
+        except Exception:  # noqa: BLE001 — branch is provenance, not critical
+            branch = None
+        write_manifest_status(
+            workspace, job_id, phase_number, required_deliverables, branch=branch
+        )
+
     if not git_mgr or not git_mgr.is_active:
         return
 
@@ -1239,6 +1263,9 @@ def on_strategic_phase_complete(
         phase_type="strategic",
         todos_archived=completed_todos,
         job_id=job_id,
+        required_deliverables=(state.get("metadata") or {}).get(
+            "required_deliverables"
+        ),
     )
 
     logger.info(
@@ -1314,6 +1341,9 @@ def on_tactical_phase_complete(
         phase_type="tactical",
         todos_archived=completed_todos,
         job_id=job_id,
+        required_deliverables=(state.get("metadata") or {}).get(
+            "required_deliverables"
+        ),
     )
 
     # Check autonomy level for phase boundary freeze (before loading new todos)

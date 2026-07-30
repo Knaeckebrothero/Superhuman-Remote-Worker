@@ -2350,6 +2350,16 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
         brief_parts = [f"# Task Brief\n\n## Description\n\n{description}"]
         if kickoff_message:
             brief_parts.append(f"\n\n## Kickoff Message\n\n{kickoff_message}")
+        # Deliverable contract (P1-C): render the job's required_deliverables
+        # manifest as an explicit block — workers can't be held to a floor
+        # they were never shown. Empty string when the job has no manifest.
+        from .core.deliverables import format_deliverable_contract_block
+
+        contract_block = format_deliverable_contract_block(
+            metadata.get("required_deliverables")
+        )
+        if contract_block:
+            brief_parts.append(contract_block)
         brief_content = "".join(brief_parts)
         self._workspace_manager.write_file("task_brief.md", brief_content)
         self._agent_seed_files["task_brief.md"] = brief_content

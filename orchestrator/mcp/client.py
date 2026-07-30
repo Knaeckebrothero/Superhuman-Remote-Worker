@@ -808,6 +808,7 @@ class AsyncCockpitClient:
         parent_job_id: str | None = None,
         project_id: str | None = None,
         user_id: str | None = None,
+        required_deliverables: list[str] | None = None,
     ) -> dict[str, Any]:
         """Create a new job.
 
@@ -821,6 +822,8 @@ class AsyncCockpitClient:
             parent_job_id: Parent job UUID for verification/follow-up jobs
             project_id: Project UUID to associate this job with
             user_id: User UUID who created this job
+            required_deliverables: Deliverable contract (P1-C) — paths /
+                "kb:<slug>" entries validated at the seal
 
         Returns:
             Created job record with ID
@@ -843,6 +846,8 @@ class AsyncCockpitClient:
             body["project_id"] = project_id
         if user_id:
             body["user_id"] = user_id
+        if required_deliverables:
+            body["required_deliverables"] = required_deliverables
         resp = await self._client.post("/api/jobs", json=body)
         resp.raise_for_status()
         return resp.json()
@@ -1836,6 +1841,7 @@ class AsyncCockpitClient:
         instructions: str | None = None,
         config_override: dict[str, Any] | None = None,
         context: dict[str, Any] | None = None,
+        required_deliverables: list[str] | None = None,
     ) -> dict[str, Any]:
         """Create a job within a project context.
 
@@ -1847,6 +1853,8 @@ class AsyncCockpitClient:
             instructions: Additional inline instructions
             config_override: Per-job config overrides
             context: Additional context dictionary
+            required_deliverables: Deliverable contract (P1-C) — paths /
+                "kb:<slug>" entries validated at the seal
 
         Returns:
             Created job record with ID
@@ -1863,6 +1871,8 @@ class AsyncCockpitClient:
             body["config_override"] = config_override
         if context:
             body["context"] = context
+        if required_deliverables:
+            body["required_deliverables"] = required_deliverables
         resp = await self._client.post(f"/api/projects/{project_id}/jobs", json=body)
         resp.raise_for_status()
         return resp.json()
