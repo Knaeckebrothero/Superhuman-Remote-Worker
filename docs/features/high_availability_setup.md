@@ -57,7 +57,8 @@ What survives a single-node loss *today*, assuming the failure isn't on the node
 | App (stateful) | postgres-keycloak | StatefulSet `replicas: 1` | ✗ | Auth DB. Down ⇒ no login. |
 | App (stateful) | postgres-audit | StatefulSet `replicas: 1` | ✗ | Audit store (`AUDIT_BACKEND`). Non-fatal but a SPOF. |
 | App (stateful) | Neo4j | StatefulSet `replicas: 1` | ✗ (non-fatal) | Knowledge graph; optional per CLAUDE.md. |
-| App (stateful) | Gitea | StatefulSet `replicas: 1` | ✗ | Workspace git server on **SQLite** + local PVC. Fast to recover; load fixes in the checklist below. |
+| App (stateful) | Gitea | StatefulSet `replicas: 1` | ✗ | Workspace git server. Metadata DB is now **Postgres by default** (`srw-giteadb`); existing instances stay pinned to SQLite until migrated. Git objects always on the PVC. |
+| App (stateful) | giteadb | StatefulSet `replicas: 1` | ✗ | **New 2026-07-30.** Gitea's metadata Postgres. Same single-replica SPOF as the others — covered by the Priority 1 roadmap item. |
 | App | NATS | external 3-node hub (`nats.internal: false` default) | ✓ | **Coordination plane HA'd 2026-06** via BYO hub. In-chart NATS (internal mode) remains single-replica. |
 | App | Keycloak (server) | hardcoded `replicas: 1` | ✗ | DB-backed and HA-capable upstream (KC 26), **but the chart runs `start-dev`** (local-only caches) — prod-mode switch required before >1 replica. See checklist P2. |
 | App | OpenCloud | hardcoded `replicas: 1` | ✗ | Single-writer by design (file locking). Accept SPOF. |
@@ -193,13 +194,13 @@ The data tier is where the real SPOFs live. Each item below is its own discrete 
 
 ### Priority 1: PostgreSQL → CloudNativePG
 
-> **Status (2026-07-30): not started.** No `cnpg` / CloudNativePG resources exist in the SRW deployment trees — all Postgres instances are plain single-replica StatefulSets. Scope shrank back to **four** instances: `postgres-litellm` was removed along with the LiteLLM gateway, and MongoDB left the chart (audit now lives on `postgres-audit`). This is the **M3** item in [[orchestrator_ha_scaling]] — the acknowledged remaining SPOF now that the orchestrator itself is HA. The BYO alternative (managed/HA Postgres via `databases.*.externalHost`, zero chart work) is equally valid, and likely the right answer for SaaS.
+> **Status (2026-07-30): not started.** No `cnpg` / CloudNativePG resources exist in the SRW deployment trees — all Postgres instances are plain single-replica StatefulSets. Scope is **five** instances: `postgres-litellm` was removed along with the LiteLLM gateway and MongoDB left the chart (audit now lives on `postgres-audit`), but `postgres-gitea` was added 2026-07-30 when Gitea's metadata DB moved off SQLite. This is the **M3** item in [[orchestrator_ha_scaling]] — the acknowledged remaining SPOF now that the orchestrator itself is HA. The BYO alternative (managed/HA Postgres via `databases.*.externalHost`, zero chart work) is equally valid, and likely the right answer for SaaS.
 
-All four Postgres instances (`postgres`, `postgres-vector`/pgvector, `postgres-keycloak`, `postgres-audit`) would migrate to [CloudNativePG](https://cloudnative-pg.io/). Standard answer in the K8s ecosystem; gives synchronous replication, automatic failover, point-in-time recovery, and operator-managed backups.
+All five Postgres instances (`postgres`, `postgres-vector`/pgvector, `postgres-keycloak`, `postgres-audit`, and `postgres-gitea` as of 2026-07-30) would migrate to [CloudNativePG](https://cloudnative-pg.io/). Standard answer in the K8s ecosystem; gives synchronous replication, automatic failover, point-in-time recovery, and operator-managed backups.
 
 **Pooler constraint (either path):** orchestrator leader election holds a *session-scoped* Postgres advisory lock (`orchestrator/services/leader_election.py`). A transaction-mode pooler (PgBouncer/pgcat txn mode) in front of the orchestrator silently breaks it — orchestrator connections must be direct or session-pooled.
 
-- Four separate `Cluster` resources, one per logical DB.
+- Five separate `Cluster` resources, one per logical DB.
 - Multi-replica with at least one synchronous standby.
 - Existing chart's `databases.postgres.externalUrl` etc. already supports pointing at an external (or operator-managed) DB — no chart changes needed beyond setting those values.
 - Migration path: dump from current StatefulSet → restore into new `Cluster` → flip `externalUrl` → tear down old StatefulSet. See `docs/db_migration.md` for the migration tooling.
@@ -242,8 +243,9 @@ Gitea is **not** resource-starved (98m CPU against a 2000m limit); the observed 
 - [x] **(2026-07-30) compare/`stat=true` cost**: `get_compare` now passes `stat/verification/files=false` — but measurement showed Gitea 1.22 **ignores `stat`** on the compare endpoint (honored from 1.23) *and* 404s on SHA bases (`BaseNotExist`), which meant the `since_ref` path of `/api/jobs/{id}/repo/commits` was both slow-by-design and broken for SHA refs. **Fixed properly:** that path now uses the new `GiteaClient.get_commits_between` — commits-endpoint pagination (which honors `stat=false`, ~155×) with a client-side cut at `since_ref`. Verified live: 200/40ms with a SHA base that previously 404'd.
 - [x] **(2026-07-30) `cron.git_gc_repos` enabled** — `@weekly`, via `GITEA__cron_0X2E_git_gc_repos__*` env in the chart. Verified registered in `/api/v1/admin/cron` on k3d.
 - [x] **(2026-07-30) SQLite WAL** — `GITEA__database__SQLITE_JOURNAL_MODE=WAL` in the chart; `-wal`/`-shm` files confirmed live on k3d. The Postgres migration remains the right pre-SaaS move (tracked below) but WAL removes the worst single-writer/corruption risk now.
-- [ ] **SQLite → Postgres migration** — deferred; a real data-migration operation (dump/convert/restore per instance), do it deliberately pre-SaaS rather than as a drive-by.
-- [ ] **Cache adapter** is `memory` (default) — nothing survives a restart. Low priority; a persistent adapter means Redis (new infra), accept restart-loss for now.
+- [x] **(2026-07-30) SQLite → Postgres: chart support shipped, `postgres` is now the default.** `gitea.database.type` (`postgres` | `sqlite3`, invalid values fail the render) selects the backend; `databases.gitea` adds a bundled `srw-giteadb` StatefulSet on the same pattern as the Keycloak DB, or points at a managed server via `externalHost`/`sslMode`. `GITEA_DB_PASSWORD` is generate-and-preserve in the chart-managed Secret. A `preflight-db-migration` init container refuses to start a Postgres-configured Gitea whose metadata is still an un-migrated SQLite file, so the flip cannot silently orphan repos. Verified on k3d in an isolated namespace: all four render paths + `helm lint`, guard blocks/passes correctly against real Postgres, and a byte-copy of the dev instance (5 users / 131 repos) migrated cleanly and served through the authenticated API.
+- [ ] **Migrate the existing instances** — dev/homelab and local k3d are **pinned to `sqlite3`** in their overlays and keep running as before; migrating each is an operator step. Runbook (validated): `docs/operations/gitea_sqlite_to_postgres.md`. Note the trap it documents: letting pgloader create the schema produces a Gitea that cannot start — it must be schema-first, data-only.
+- [ ] **Cache adapter** is `memory` (default) — nothing survives a restart. Low priority; a persistent adapter means Redis (new infra), accept restart-loss for now. Note the HomeLab Gitea (`git.h4ll.app`) already runs Postgres + Redis and is a useful reference config.
 
 SaaS-scale note: the first hard wall is **inodes, not CPU** — ~277 inodes/repo means 100k repos ≈ 28M inodes, which exhausts default ext4 before disk fills. That's a filesystem/provisioning decision for later, recorded here so it isn't rediscovered.
 
@@ -283,6 +285,8 @@ Caveat: the availability win is partly gated on P3 — a 2-replica Keycloak on a
 - `helm/templates/databases/postgres-vector.yaml` — same
 - `helm/templates/databases/postgres-keycloak.yaml` — same
 - `helm/templates/databases/postgres-audit.yaml` — same
+- `helm/templates/databases/postgres-gitea.yaml` — same (`srw-giteadb`, added 2026-07-30)
+- `docs/operations/gitea_sqlite_to_postgres.md` — validated migration runbook for existing Gitea instances
 - `helm/values.yaml` — `orchestrator.replicas: 2` default; cockpit/mcp still 1; Postgres connection-budget arithmetic
 - `helm/templates/services/keycloak.yaml` — `start-dev` invocation + hardcoded `replicas: 1` (checklist P2)
 - `helm/templates/services/gitea.yaml` — hardcoded `sqlite3` (checklist P1)

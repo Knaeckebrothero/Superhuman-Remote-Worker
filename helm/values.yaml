@@ -840,6 +840,33 @@ databases:
       limits:
         memory: "1Gi"
         cpu: "500m"
+  # Dedicated Postgres for the bundled Gitea (gitea.database.type: postgres).
+  # Its own server for the same failure-domain reason as the audit DB: Gitea is
+  # a chatty writer on every agent push, and a git-metadata problem must not be
+  # able to stall the control plane's DB. Only renders when the bundled Gitea,
+  # `gitea.database.type: postgres`, and this DB are all internal.
+  gitea:
+    enabled: true
+    # -- When false, the bundled Gitea points at externalHost/Port/Db below
+    #    (managed Postgres — RDS, Cloud SQL, CloudNativePG). Credentials still
+    #    come from the Secret (GITEA_DB_USER / GITEA_DB_PASSWORD).
+    internal: true
+    externalHost: ""
+    externalPort: 5432
+    externalDb: "gitea"
+    # -- Gitea's libpq sslmode. "disable" is right for the in-cluster Service;
+    #    a managed external Postgres usually wants "require" or "verify-full".
+    sslMode: "disable"
+    image: postgres:16
+    storageClass: ""
+    storageSize: "8Gi"
+    resources:
+      requests:
+        memory: "128Mi"
+        cpu: "50m"
+      limits:
+        memory: "512Mi"
+        cpu: "500m"
   # Dedicated Postgres for the bundled Keycloak. Keeps the IdP's data plane
   # isolated from the orchestrator's. Only renders when both the bundled
   # Keycloak and this DB are internal.
@@ -970,6 +997,25 @@ gitea:
   # When internal=true, defaults to https://git.{global.domain}.
   externalUrl: ""
   image: gitea/gitea:1.22-rootless
+  # -- Metadata database backing the bundled Gitea: users, orgs, repo
+  # metadata, issues, PRs, and the OIDC login source. Git object data always
+  # lives on the Gitea PVC and is NOT affected by this setting.
+  #
+  #   postgres (default) — dedicated `srw-giteadb` StatefulSet, or an external
+  #     server via `databases.gitea`. Concurrent readers/writers, no
+  #     single-file corruption risk, and the only option with a scaling story.
+  #   sqlite3 — one file on the Gitea PVC. Simplest, zero extra infra, but
+  #     single-writer and lost/corrupted by an ungraceful kill mid-write.
+  #
+  # SWITCHING AN EXISTING INSTALL IS A DATA MIGRATION, NOT A CONFIG FLIP.
+  # The git repos on the PVC survive either way, but Gitea reads *which repos
+  # and users exist* from this database — pointing a populated instance at an
+  # empty Postgres yields a Gitea that believes it is a fresh install while
+  # hundreds of repos sit orphaned on disk. A preflight init container refuses
+  # to start in exactly that situation; run the migration first:
+  # docs/operations/gitea_sqlite_to_postgres.md
+  database:
+    type: postgres
   storageClass: ""
   storageSize: "8Gi"
   # Gitea serves every jobs-repo clone the agents make, and pack generation is

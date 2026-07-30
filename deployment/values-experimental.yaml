@@ -232,6 +232,22 @@ codexProxy:
   # (3) a gpt-5.6-sol completion succeeds. Revert this line if 401s return.
   image: docker.io/eceasy/cli-proxy-api:v7.2.61
 # -----------------------------------------------------------------------------
+# Gitea metadata DB — PINNED to sqlite3.
+#
+# The chart default is `postgres` (2026-07-30). This cluster's Gitea predates
+# that flip and still holds every user/org/repo row in the SQLite file on its
+# PVC, so it must NOT follow the default: Gitea would come up against an empty
+# Postgres as a fresh install with all repos orphaned on disk. (The chart's
+# preflight init container catches exactly that and refuses to start, so the
+# failure mode is a stuck pod rather than data loss — this pin avoids even
+# that.) Remove this block only as the last step of the migration runbook:
+# docs/operations/gitea_sqlite_to_postgres.md
+# -----------------------------------------------------------------------------
+gitea:
+  database:
+    type: sqlite3
+
+# -----------------------------------------------------------------------------
 # Cloud storage — OpenCloud bundled (chart default)
 # -----------------------------------------------------------------------------
 opencloud:
