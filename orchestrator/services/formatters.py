@@ -326,6 +326,16 @@ def format_chat_bulk(data: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _todo_label(todo: dict[str, Any]) -> str:
+    """Display label for a todo item.
+
+    The Gitea-backed /todos* routes key items on ``content`` (todos.yaml
+    schema and archive parser alike); ``subject`` is kept as a fallback for
+    older payloads.
+    """
+    return todo.get("subject") or todo.get("content") or "Untitled"
+
+
 def format_job_summary(
     job: dict[str, Any] | Exception | None,
     progress: dict[str, Any] | Exception | None,
@@ -403,7 +413,7 @@ def format_job_summary(
                     "completed": "●",
                     "skipped": "⊘",
                 }.get(t.get("status", ""), "?")
-                lines.append(f"  {icon} {t.get('subject', 'Untitled')}")
+                lines.append(f"  {icon} {_todo_label(t)}")
         else:
             lines.append("  (no current todos)")
         archives = todos.get("archives", [])
@@ -474,7 +484,7 @@ def format_todos(todos: dict[str, Any]) -> str:
                 "completed": "●",
                 "skipped": "⊘",
             }.get(todo.get("status", ""), "?")
-            lines.append(f"  {status_icon} {todo.get('subject', 'Untitled')}")
+            lines.append(f"  {status_icon} {_todo_label(todo)}")
             if todo.get("description"):
                 desc = todo["description"][:100]
                 if len(todo["description"]) > 100:
@@ -1054,12 +1064,15 @@ def format_workspace_overview(job_id: str, data: dict[str, Any]) -> str:
 
     lines = [f"Workspace overview for job {job_id}\n"]
 
-    # File listing
+    # File listing (repo root; directories carry no size)
     files = data.get("files", [])
     if files:
         lines.append(f"Files ({len(files)}):")
         for f in files:
             name = f.get("name", "unknown")
+            if f.get("type") == "dir":
+                lines.append(f"  {name}/")
+                continue
             size = f.get("size", 0)
             if size >= 1024:
                 size_str = f"{size / 1024:.1f} KB"
@@ -1964,7 +1977,7 @@ def format_current_todos(data: dict[str, Any]) -> str:
             "completed": "●",
             "skipped": "⊘",
         }.get(todo.get("status", ""), "?")
-        lines.append(f"  {status_icon} {todo.get('subject', 'Untitled')}")
+        lines.append(f"  {status_icon} {_todo_label(todo)}")
         if todo.get("description"):
             desc = todo["description"][:100]
             if len(todo["description"]) > 100:
@@ -2023,7 +2036,7 @@ def format_todo_archive_detail(
                 "completed": "●",
                 "skipped": "⊘",
             }.get(todo.get("status", ""), "?")
-            lines.append(f"  {status_icon} {todo.get('subject', 'Untitled')}")
+            lines.append(f"  {status_icon} {_todo_label(todo)}")
             if todo.get("notes"):
                 lines.append(f"      Notes: {todo['notes'][:150]}")
     else:

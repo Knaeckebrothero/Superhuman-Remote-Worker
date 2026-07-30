@@ -65,7 +65,6 @@ import {
     User,
     UserCapabilities,
     VoiceCapabilities,
-    WorkspaceOverview,
 } from '../models/api.model';
 import {ThreadUploadResponse, UploadInfo, UploadResponse} from '../models/file.model';
 import {AuditEntry, AuditFilterCategory, AuditResponse, JobSummary,} from '../models/audit.model';
@@ -1804,57 +1803,6 @@ export class ApiService {
         return of(null);
       }),
     );
-  }
-
-  /**
-   * Get workspace overview for a job.
-   */
-  getJobWorkspace(jobId: string): Observable<WorkspaceOverview | null> {
-    return this.http.get<WorkspaceOverview>(`${this.baseUrl}/jobs/${jobId}/workspace`).pipe(
-      catchError((error) => {
-        console.error(`Failed to fetch workspace for job ${jobId}:`, error);
-        return of(null);
-      }),
-    );
-  }
-
-  /**
-   * Get content of a specific workspace file.
-   */
-  getWorkspaceFile(jobId: string, filename: string): Observable<{ filename: string; content: string } | null> {
-    return this.http
-      .get<{ filename: string; content: string }>(`${this.baseUrl}/jobs/${jobId}/workspace/${filename}`)
-      .pipe(
-        catchError((error) => {
-          console.error(`Failed to fetch workspace file ${filename} for job ${jobId}:`, error);
-          return of(null);
-        }),
-      );
-  }
-
-  /**
-   * Write content to a workspace file (requires user approval flow).
-   */
-  writeWorkspaceFile(
-    jobId: string,
-    path: string,
-    content: string,
-    commitMessage?: string,
-  ): Observable<{ path: string; size: number; committed: boolean } | null> {
-    const body: Record<string, string> = { content };
-    if (commitMessage) body['commit_message'] = commitMessage;
-
-    return this.http
-      .put<{ path: string; size: number; committed: boolean }>(
-        `${this.baseUrl}/jobs/${jobId}/workspace/${path}`,
-        body,
-      )
-      .pipe(
-        catchError((error) => {
-          console.error(`Failed to write workspace file ${path} for job ${jobId}:`, error);
-          return of(null);
-        }),
-      );
   }
 
   // ===== Repo Browser Endpoints (Gitea proxy) =====

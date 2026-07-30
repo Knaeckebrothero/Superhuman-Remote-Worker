@@ -6,8 +6,8 @@ that G1 brings under the visibility model:
 * ``list_jobs`` (admin-only cross-user filter; visibility OR for non-admins;
   MCP project scope narrowing)
 * ``get_job`` (owner / project-member / admin)
-* The 28 get-by-id read endpoints (audit, llm-requests, citations, memories,
-  workspace files, todos, repo, bulk caches, etc.) — every one calls
+* The get-by-id read endpoints (audit, llm-requests, citations, memories,
+  todos, repo, bulk caches, etc.) — every one calls
   ``require_job_access`` before doing any work.
 
 Tests share the 3-user / 2-project fixture from ``conftest.py``. The
@@ -307,7 +307,8 @@ class TestGetJob:
 #
 # Picks one endpoint per backend so we prove the gate is wired everywhere:
 #   audit store (PG) → get_job_audit, get_job_llm_requests
-#   workspace svc    → get_job_workspace, get_workspace_file
+#   gitea (todos)    → get_job_todos, get_current_todos,
+#                       list_todo_archives, get_archived_todos
 #   gitea (repo)     → list_repo_contents, get_repo_file
 #   vector_db (PG)   → list_job_citations, list_job_memories,
 #                       get_citation_stats, get_memory_stats,
@@ -361,31 +362,63 @@ class TestGatedReadEndpoints:
         assert exc.value.status_code == 403
 
     @pytest.mark.asyncio
-    async def test_get_job_workspace_blocked_cross_user(
+    async def test_get_job_todos_blocked_cross_user(
         self, user_b, job_a, fake_db, fake_request
     ):
-        from main import get_job_workspace
+        from main import get_job_todos
 
         with (
             _patch_caller_and_db(user_b, fake_db),
-            patch("main.workspace_service", _make_dud("workspace_service")),
+            patch("main.gitea_client", _make_dud("gitea_client")),
         ):
             with pytest.raises(HTTPException) as exc:
-                await get_job_workspace(fake_request, str(job_a["id"]))
+                await get_job_todos(fake_request, str(job_a["id"]))
         assert exc.value.status_code == 403
 
     @pytest.mark.asyncio
-    async def test_get_workspace_file_blocked_cross_user(
+    async def test_get_current_todos_blocked_cross_user(
         self, user_b, job_a, fake_db, fake_request
     ):
-        from main import get_workspace_file
+        from main import get_current_todos
 
         with (
             _patch_caller_and_db(user_b, fake_db),
-            patch("main.workspace_service", _make_dud("workspace_service")),
+            patch("main.gitea_client", _make_dud("gitea_client")),
         ):
             with pytest.raises(HTTPException) as exc:
-                await get_workspace_file(fake_request, str(job_a["id"]), "workspace.md")
+                await get_current_todos(fake_request, str(job_a["id"]))
+        assert exc.value.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_list_todo_archives_blocked_cross_user(
+        self, user_b, job_a, fake_db, fake_request
+    ):
+        from main import list_todo_archives
+
+        with (
+            _patch_caller_and_db(user_b, fake_db),
+            patch("main.gitea_client", _make_dud("gitea_client")),
+        ):
+            with pytest.raises(HTTPException) as exc:
+                await list_todo_archives(fake_request, str(job_a["id"]))
+        assert exc.value.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_get_archived_todos_blocked_cross_user(
+        self, user_b, job_a, fake_db, fake_request
+    ):
+        from main import get_archived_todos
+
+        with (
+            _patch_caller_and_db(user_b, fake_db),
+            patch("main.gitea_client", _make_dud("gitea_client")),
+        ):
+            with pytest.raises(HTTPException) as exc:
+                await get_archived_todos(
+                    fake_request,
+                    str(job_a["id"]),
+                    "todos_phase_1_tactical_20260730_120000.md",
+                )
         assert exc.value.status_code == 403
 
     @pytest.mark.asyncio
@@ -620,19 +653,74 @@ class TestGatedReadEndpointsHappyPath:
         fake_reader.get_job_audit.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_get_job_workspace_owner_reaches_service(
+    async def test_get_job_todos_owner_reaches_gitea(
         self, user_a, job_a, fake_db, fake_request
     ):
-        from main import get_job_workspace
+        """Owner gets the Gitea-backed todo state (todos.yaml + archives)."""
+        from main import get_job_todos
 
-        fake_svc = MagicMock()
-        fake_svc.get_workspace_overview = MagicMock(return_value={"files": []})
+        # Legacy-fallback repo resolution: no project jobs-repo rows → job-{id}.
+        fake_db.get_project_repositories = AsyncMock(return_value=[])
+
+        async def list_contents(repo_name, path="", ref=None):
+            if path == "":
+                return [
+                    {"name": "plan.md", "path": "plan.md", "type": "file", "size": 12},
+                    {"name": "archive", "path": "archive", "type": "dir", "size": 0},
+                ]
+            if path == "archive":
+                return [
+                    {
+                        "name": "todos_phase_1_tactical_20260730_120000.md",
+                        "path": "archive/todos_phase_1_tactical_20260730_120000.md",
+                        "type": "file",
+                        "size": 100,
+                    }
+                ]
+            return None
+
+        fake_gitea = MagicMock()
+        fake_gitea.is_initialized = True
+        fake_gitea.list_contents = AsyncMock(side_effect=list_contents)
+        fake_gitea.get_file_content = AsyncMock(
+            return_value="todos:\n  - id: 1\n    content: Verify the fix end-to-end\n"
+        )
         with (
             _patch_caller_and_db(user_a, fake_db),
-            patch("main.workspace_service", fake_svc),
+            patch("main.gitea_client", fake_gitea),
         ):
-            result = await get_job_workspace(fake_request, str(job_a["id"]))
-        assert result == {"files": []}
+            result = await get_job_todos(fake_request, str(job_a["id"]))
+
+        assert result["has_workspace"] is True
+        assert result["current"]["todos"][0]["content"] == "Verify the fix end-to-end"
+        assert result["current"]["is_current"] is True
+        assert (
+            result["archives"][0]["filename"]
+            == "todos_phase_1_tactical_20260730_120000.md"
+        )
+        assert result["archives"][0]["phase_name"] == "phase_1_tactical"
+        assert result["archives"][0]["timestamp"] == "2026-07-30T12:00:00"
+
+    @pytest.mark.asyncio
+    async def test_get_job_todos_gitea_down_degrades_to_empty(
+        self, user_a, job_a, fake_db, fake_request
+    ):
+        """House rule: Gitea being down must never 500 the cockpit todo view."""
+        from main import get_job_todos
+
+        fake_gitea = MagicMock()
+        fake_gitea.is_initialized = False
+        with (
+            _patch_caller_and_db(user_a, fake_db),
+            patch("main.gitea_client", fake_gitea),
+        ):
+            result = await get_job_todos(fake_request, str(job_a["id"]))
+        assert result == {
+            "job_id": str(job_a["id"]),
+            "current": None,
+            "archives": [],
+            "has_workspace": False,
+        }
 
     @pytest.mark.asyncio
     async def test_get_job_progress_admin_reaches_db(
@@ -725,22 +813,6 @@ class TestJobMutationGates:
         ):
             with pytest.raises(HTTPException) as exc:
                 await stop_ide_session(fake_request, str(job_a["id"]))
-        assert exc.value.status_code == 403
-
-    @pytest.mark.asyncio
-    async def test_write_workspace_file_blocked_cross_user(
-        self, user_b, job_a, fake_db, fake_request
-    ):
-        from main import write_workspace_file
-
-        with (
-            _patch_caller_and_db(user_b, fake_db),
-            patch("main.workspace_service", _make_dud("workspace_service")),
-        ):
-            with pytest.raises(HTTPException) as exc:
-                await write_workspace_file(
-                    fake_request, str(job_a["id"]), "foo.md", {"content": "x"}
-                )
         assert exc.value.status_code == 403
 
     @pytest.mark.asyncio
