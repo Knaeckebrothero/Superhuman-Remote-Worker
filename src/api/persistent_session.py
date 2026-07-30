@@ -1617,6 +1617,33 @@ class PersistentSession:
         if self.workspace_manager.virtual_overlay is not None:
             sweep_legacy_tools_dir(self.workspace_manager.virtual_overlay.inner)
 
+        # contacts/ is virtual and project-scoped (docs/features/contacts_registry.md).
+        # Only registered when the session has a project — without one,
+        # `contacts/` is never reserved and the path falls through to the real
+        # filesystem. `os` is already imported at module level (line 14) — reuse
+        # it rather than shadowing it with a local import (ruff F823 risk).
+        import httpx
+
+        from ..core.virtual_dirs import ContactsProvider
+
+        orchestrator_url = os.getenv("ORCHESTRATOR_URL", "").rstrip("/")
+        thread_id = self.thread_id
+        if orchestrator_url and thread_id and self.project_id:
+
+            def _fetch_contacts():
+                response = httpx.get(
+                    f"{orchestrator_url}/api/contacts/internal/list",
+                    params={"thread_id": thread_id},
+                    headers={"X-Internal-Key": os.getenv("MCP_INTERNAL_KEY", "")},
+                    timeout=3.0,
+                )
+                response.raise_for_status()
+                return response.json().get("contacts", [])
+
+            self.workspace_manager.register_virtual_provider(
+                ContactsProvider(_fetch_contacts)
+            )
+
         # Apply description overrides and enforcement
         self.tools = apply_description_overrides(self.tools)
         self.tools = apply_instruction_enforcement(self.tools, self.tool_context)

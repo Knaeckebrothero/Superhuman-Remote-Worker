@@ -2974,6 +2974,34 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
         if self._workspace_manager.virtual_overlay is not None:
             sweep_legacy_tools_dir(self._workspace_manager.virtual_overlay.inner)
 
+        # contacts/ is virtual and project-scoped (docs/features/contacts_registry.md).
+        # Only registered when the job has a project — without one, `contacts/`
+        # is never reserved and the path falls through to the real filesystem.
+        # `os` is already imported at module level (line 17) — a local re-import
+        # here would shadow it for this whole method and break the earlier
+        # os.environ.get() calls above (ruff F823).
+        import httpx
+
+        from .core.virtual_dirs import ContactsProvider
+
+        orchestrator_url = os.getenv("ORCHESTRATOR_URL", "").rstrip("/")
+        job_id = self._current_job_id
+        if orchestrator_url and job_id and raw_project_id:
+
+            def _fetch_contacts():
+                response = httpx.get(
+                    f"{orchestrator_url}/api/contacts/internal/list",
+                    params={"job_id": job_id},
+                    headers={"X-Internal-Key": os.getenv("MCP_INTERNAL_KEY", "")},
+                    timeout=3.0,
+                )
+                response.raise_for_status()
+                return response.json().get("contacts", [])
+
+            self._workspace_manager.register_virtual_provider(
+                ContactsProvider(_fetch_contacts)
+            )
+
         loaded_tool_names = [t.name for t in self._tools]
 
         # Stash the resolved tool list + limits so the light spawn_subagent
