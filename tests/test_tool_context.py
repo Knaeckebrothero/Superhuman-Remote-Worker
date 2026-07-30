@@ -354,6 +354,79 @@ class TestReadTracking:
 
 
 # =============================================================================
+# Instruction-file pinning (FIFO eviction exemption)
+# =============================================================================
+
+
+class TestInstructionPinning:
+    """Instruction-file paths are exempt from FIFO eviction once read.
+
+    Any 10 reads used to evict the todo-guide skill and re-arm the
+    enforce-gate — one forced guide re-read per strategic phase. Pinned
+    paths stay "recently read"; the write-authorization path
+    (recent_read_matches) deliberately ignores the pin.
+    """
+
+    def _ctx_with_guide(self):
+        ctx = ToolContext()
+        ctx._instruction_files = [
+            FakeInstructionEntry(
+                "skills/todo-guide/SKILL.md", "before_tool", "next_phase_todos", True
+            ),
+        ]
+        return ctx
+
+    def test_instruction_file_survives_many_subsequent_reads(self):
+        ctx = self._ctx_with_guide()
+        ctx.record_file_read("skills/todo-guide/SKILL.md")
+        for i in range(25):
+            ctx.record_file_read(f"file_{i}.md")
+
+        assert ctx.was_recently_read("skills/todo-guide/SKILL.md") is True
+        # Enforce-gate stays satisfied — no forced re-read
+        assert ctx.check_tool_enforcement("next_phase_todos") is None
+
+    def test_normal_files_still_evict(self):
+        ctx = self._ctx_with_guide()
+        ctx.record_file_read("skills/todo-guide/SKILL.md")
+        ctx.record_file_read("notes/facts.md")
+        for i in range(10):
+            ctx.record_file_read(f"file_{i}.md")
+
+        assert ctx.was_recently_read("notes/facts.md") is False
+        assert ctx.was_recently_read("skills/todo-guide/SKILL.md") is True
+
+    def test_invalidate_clears_pin(self):
+        ctx = self._ctx_with_guide()
+        ctx.record_file_read("skills/todo-guide/SKILL.md")
+        for i in range(10):
+            ctx.record_file_read(f"file_{i}.md")  # evicted from deque, pin holds
+
+        assert ctx.invalidate_recent_read("skills/todo-guide/SKILL.md") is True
+        assert ctx.was_recently_read("skills/todo-guide/SKILL.md") is False
+
+    def test_pin_does_not_authorize_writes(self):
+        """recent_read_matches (write authorization) ignores the pin."""
+        ctx = self._ctx_with_guide()
+        ctx.record_file_read("skills/todo-guide/SKILL.md", "guide body")
+        for i in range(10):
+            ctx.record_file_read(f"file_{i}.md")
+
+        assert ctx.was_recently_read("skills/todo-guide/SKILL.md") is True
+        assert (
+            ctx.recent_read_matches("skills/todo-guide/SKILL.md", "guide body") is False
+        )
+
+    def test_unconfigured_paths_are_not_pinned(self):
+        ctx = ToolContext()
+        ctx.record_file_read("skills/todo-guide/SKILL.md")
+        for i in range(10):
+            ctx.record_file_read(f"file_{i}.md")
+
+        assert ctx.was_recently_read("skills/todo-guide/SKILL.md") is False
+
+
+# =============================================================================
 # Instruction enforcement
 # =============================================================================
 

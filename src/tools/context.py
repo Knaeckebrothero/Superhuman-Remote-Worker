@@ -13,7 +13,17 @@ from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Deque, Dict, List, Literal, Optional
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Deque,
+    Dict,
+    List,
+    Literal,
+    Optional,
+    Set,
+)
 from urllib.parse import urlparse
 
 from ..core.datasource_catalog import DATASOURCE_TYPES
@@ -228,6 +238,12 @@ class ToolContext:
     _recent_reads: Deque[str] = field(
         default_factory=lambda: deque(maxlen=10)
     )  # Recently read file paths
+    _pinned_reads: Set[str] = field(
+        default_factory=set
+    )  # Instruction-file paths, exempt from FIFO eviction: once read they
+    # stay "recently read" so enforce-gates never re-arm mid-job. Only
+    # path-based enforcement consults this — write authorization
+    # (recent_read_matches) deliberately does not.
     _recent_read_versions: Dict[str, str] = field(
         default_factory=dict
     )  # Optional sha256 of the full text bytes observed for a recent path
@@ -854,6 +870,11 @@ class ToolContext:
             content: Complete text content observed by the reader, when available
         """
         normalized = path.lstrip("/").strip()
+        # Instruction files are pinned: reading other files must never evict
+        # them back into "unread", or every enforce-gate re-arms once the
+        # 10-entry FIFO cycles (one forced guide re-read per strategic phase).
+        if self._is_instruction_path(normalized):
+            self._pinned_reads.add(normalized)
         evicted = None
         # Remove if already present (we'll re-add at the end)
         if normalized in self._recent_reads:
@@ -880,10 +901,20 @@ class ToolContext:
                 "sha256:" + hashlib.sha256(raw).hexdigest()
             )
 
+    def _is_instruction_path(self, normalized: str) -> bool:
+        """Whether a normalized path is a configured instruction file."""
+        for entry in self._instruction_files:
+            entry_path = (getattr(entry, "path", "") or "").lstrip("/").strip()
+            if entry_path and entry_path == normalized:
+                return True
+        return False
+
     def was_recently_read(self, path: str) -> bool:
         """Check if file was read within the tracking window.
 
-        Used by edit_file and write_file to enforce read-before-write discipline.
+        Used by edit_file and write_file to enforce read-before-write
+        discipline. Instruction files stay "recently read" once pinned,
+        regardless of how many reads followed.
 
         Args:
             path: Path to check
@@ -892,7 +923,7 @@ class ToolContext:
             True if the file was recently read, False otherwise
         """
         normalized = path.lstrip("/").strip()
-        return normalized in self._recent_reads
+        return normalized in self._recent_reads or normalized in self._pinned_reads
 
     def recent_read_matches(self, path: str, content: str | bytes) -> bool:
         """Check path recency and any recorded full-text content version.
@@ -923,9 +954,10 @@ class ToolContext:
         """
 
         normalized = path.lstrip("/").strip()
-        present = normalized in self._recent_reads
-        if present:
+        present = normalized in self._recent_reads or normalized in self._pinned_reads
+        if normalized in self._recent_reads:
             self._recent_reads.remove(normalized)
+        self._pinned_reads.discard(normalized)
         self._recent_read_versions.pop(normalized, None)
         return present
 

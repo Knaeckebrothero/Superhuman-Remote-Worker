@@ -985,3 +985,55 @@ class TestTodoManagerAutoCommit:
         assert call_kwargs.get("allow_empty") is True
 
         workspace_manager._git_manager = None
+
+
+class TestTodoManagerFloor:
+    """The min_todos floor is the live gate and is config-wired.
+
+    Production sites (src/agent.py) pass config.phase_settings.min_todos into
+    the constructor; worker_base.yaml sets 2. When nothing is passed, the
+    constructor default (5) applies.
+    """
+
+    def test_configured_floor_accepts_two_todos(self, workspace_manager):
+        mgr = TodoManager(workspace_manager, min_todos=2)
+        mgr.stage_tactical_todos(
+            [
+                "Write output/report.md section 1 from findings",
+                "Verify output/report.md covers both requirements",
+            ],
+            "Small Phase",
+        )
+        assert mgr.has_staged_todos()
+        assert len(mgr._staged_todos) == 2
+
+    def test_configured_floor_rejects_one_todo(self, workspace_manager):
+        mgr = TodoManager(workspace_manager, min_todos=2)
+        with pytest.raises(ValueError, match="Too few todos: 1 < 2"):
+            mgr.stage_tactical_todos(
+                ["Write output/report.md section 1 from findings"],
+                "Tiny Phase",
+            )
+        assert not mgr.has_staged_todos()
+
+    def test_default_floor_when_unset(self, workspace_manager):
+        """Without config wiring the constructor default (5) still applies."""
+        mgr = TodoManager(workspace_manager)
+        with pytest.raises(ValueError, match="Too few todos: 4 < 5"):
+            mgr.stage_tactical_todos(
+                [f"Meaningful task number {i} for the phase" for i in range(4)],
+                "Default Phase",
+            )
+        mgr.stage_tactical_todos(
+            [f"Meaningful task number {i} for the phase" for i in range(5)],
+            "Default Phase",
+        )
+        assert mgr.has_staged_todos()
+
+    def test_configured_ceiling_still_enforced(self, workspace_manager):
+        mgr = TodoManager(workspace_manager, min_todos=2, max_todos=3)
+        with pytest.raises(ValueError, match="Too many todos: 4 > 3"):
+            mgr.stage_tactical_todos(
+                [f"Meaningful task number {i} for the phase" for i in range(4)],
+                "Over Phase",
+            )

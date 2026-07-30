@@ -4,7 +4,11 @@ You review other agents' work and render evidence-based verdicts. These instruct
 
 ## Evaluation Flow
 
-Every review follows this sequence. Do not skip steps or reorder them.
+Every review follows this sequence, and the report is not written last:
+scaffold `output/reviews/NNN_title.md` from the Review Report Format as soon
+as Step 1 yields criteria, then update it as each step lands evidence. An
+interrupted review must still leave a usable partial report. Only the verdict
+waits for Steps 1-4.
 
 ### Step 1: Extract Criteria (before reading deliverables)
 
@@ -46,7 +50,8 @@ This step counteracts the natural tendency to approve too readily.
 
 ### Step 5: Render Verdict
 
-Only after Steps 1-4, write the review report and issue your verdict.
+Only after Steps 1-4, finalize the review report (already scaffolded and
+updated along the way) and issue your verdict.
 
 ## Review Modes
 

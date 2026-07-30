@@ -1397,3 +1397,180 @@ class TestPhaseGate:
                     m for m in result.get("messages", []) if isinstance(m, ToolMessage)
                 ]
                 assert tool_msgs[0].content == "content"
+
+
+# =============================================================================
+# Test: Act-ratio tripwire (process-artifact-only streaks)
+# =============================================================================
+
+
+class TestActRatioTripwire:
+    """N consecutive process-artifact-only tool actions inject a one-line
+    "stop planning" nudge; any concrete action resets the counter."""
+
+    def _make_audited(self, threshold=3):
+        cfg = FakeConfig(limits=LimitsConfig(act_ratio_nudge_threshold=threshold))
+        fake_tools = []
+        for name in ["read_file", "edit_file", "write_file", "todo_list", "web_search"]:
+            t = MagicMock()
+            t.name = name
+            fake_tools.append(t)
+        patcher = patch("src.graph.ToolNode")
+        MockToolNode = patcher.start()
+        mock_tn = AsyncMock()
+        MockToolNode.return_value = mock_tn
+        audited = create_audited_tool_node(fake_tools, cfg)
+        return audited, mock_tn, patcher
+
+    @staticmethod
+    def _act_nudges(result):
+        return [
+            m
+            for m in result.get("messages", [])
+            if isinstance(m, SystemMessage) and "Stop planning" in m.content
+        ]
+
+    async def _run_call(self, audited, mock_tn, name, args, call_id):
+        mock_tn.ainvoke = AsyncMock(
+            return_value={"messages": [make_tool_result(name, "ok", call_id)]}
+        )
+        state = make_state([make_tool_call(name, args, call_id)])
+        return await audited(state)
+
+    @pytest.mark.asyncio
+    async def test_nudge_fires_after_n_process_only_actions(self):
+        audited, mock_tn, patcher = self._make_audited(threshold=3)
+        try:
+            process_calls = [
+                ("read_file", {"path": "todos.yaml"}),
+                ("edit_file", {"path": "plan.md", "old_string": "a"}),
+                ("write_file", {"path": "archive/phase_2_retrospective.md"}),
+            ]
+            for i, (name, args) in enumerate(process_calls):
+                result = await self._run_call(audited, mock_tn, name, args, f"c_{i}")
+                if i < 2:
+                    assert self._act_nudges(result) == []
+            nudges = self._act_nudges(result)
+            assert len(nudges) == 1
+            assert "3 steps" in nudges[0].content
+        finally:
+            patcher.stop()
+
+    @pytest.mark.asyncio
+    async def test_concrete_action_resets_counter(self):
+        audited, mock_tn, patcher = self._make_audited(threshold=3)
+        try:
+            await self._run_call(
+                audited, mock_tn, "read_file", {"path": "plan.md"}, "c0"
+            )
+            await self._run_call(
+                audited, mock_tn, "edit_file", {"path": "todos.yaml"}, "c1"
+            )
+            # Concrete target -> reset
+            result = await self._run_call(
+                audited, mock_tn, "write_file", {"path": "output/report.md"}, "c2"
+            )
+            assert self._act_nudges(result) == []
+            # Two more process actions: streak is 2, still under threshold
+            await self._run_call(
+                audited, mock_tn, "read_file", {"path": "plan.md"}, "c3"
+            )
+            result = await self._run_call(
+                audited,
+                mock_tn,
+                "edit_file",
+                {"path": "plan.md", "old_string": "x"},
+                "c4",
+            )
+            assert self._act_nudges(result) == []
+        finally:
+            patcher.stop()
+
+    @pytest.mark.asyncio
+    async def test_no_target_tool_resets_counter(self):
+        """Tools without file targets (e.g. web_search) count as concrete."""
+        audited, mock_tn, patcher = self._make_audited(threshold=3)
+        try:
+            await self._run_call(
+                audited, mock_tn, "read_file", {"path": "plan.md"}, "c0"
+            )
+            await self._run_call(
+                audited,
+                mock_tn,
+                "edit_file",
+                {"path": "plan.md", "old_string": "x"},
+                "c1",
+            )
+            result = await self._run_call(
+                audited, mock_tn, "web_search", {"query": "topic"}, "c2"
+            )
+            assert self._act_nudges(result) == []
+        finally:
+            patcher.stop()
+
+    @pytest.mark.asyncio
+    async def test_todo_state_tools_count_as_process(self):
+        audited, mock_tn, patcher = self._make_audited(threshold=3)
+        try:
+            for i in range(2):
+                result = await self._run_call(
+                    audited, mock_tn, "todo_list", {}, f"t{i}"
+                )
+                assert self._act_nudges(result) == []
+            result = await self._run_call(
+                audited, mock_tn, "read_file", {"path": "todos.yaml"}, "t2"
+            )
+            assert len(self._act_nudges(result)) == 1
+        finally:
+            patcher.stop()
+
+    @pytest.mark.asyncio
+    async def test_rearms_after_firing(self):
+        audited, mock_tn, patcher = self._make_audited(threshold=2)
+        try:
+            await self._run_call(audited, mock_tn, "todo_list", {}, "a0")
+            result = await self._run_call(audited, mock_tn, "todo_list", {}, "a1")
+            assert len(self._act_nudges(result)) == 1
+            # Counter re-armed: two more process actions fire again
+            await self._run_call(audited, mock_tn, "todo_list", {}, "a2")
+            result = await self._run_call(audited, mock_tn, "todo_list", {}, "a3")
+            assert len(self._act_nudges(result)) == 1
+        finally:
+            patcher.stop()
+
+    @pytest.mark.asyncio
+    async def test_zero_threshold_disables(self):
+        audited, mock_tn, patcher = self._make_audited(threshold=0)
+        try:
+            result = None
+            for i in range(8):
+                result = await self._run_call(
+                    audited, mock_tn, "read_file", {"path": "todos.yaml"}, f"z{i}"
+                )
+            assert self._act_nudges(result) == []
+        finally:
+            patcher.stop()
+
+    @pytest.mark.asyncio
+    async def test_counter_resets_on_phase_change(self):
+        audited, mock_tn, patcher = self._make_audited(threshold=3)
+        try:
+            for i in range(2):
+                mock_tn.ainvoke = AsyncMock(
+                    return_value={
+                        "messages": [make_tool_result("todo_list", "ok", f"p{i}")]
+                    }
+                )
+                state = make_state(
+                    [make_tool_call("todo_list", {}, f"p{i}")], phase_number=1
+                )
+                await audited(state)
+            # Phase flips: streak resets, so one more process call stays quiet
+            mock_tn.ainvoke = AsyncMock(
+                return_value={"messages": [make_tool_result("todo_list", "ok", "p9")]}
+            )
+            state = make_state([make_tool_call("todo_list", {}, "p9")], phase_number=2)
+            result = await audited(state)
+            assert self._act_nudges(result) == []
+        finally:
+            patcher.stop()
