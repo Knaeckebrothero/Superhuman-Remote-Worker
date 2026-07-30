@@ -88,6 +88,38 @@ _AUTO_CONTINUE_FREEZE_TYPES = frozenset(
     }
 )
 
+# >>> TEMPORARY QUICKFIX (2026-07-30) — delete with the upstream fix.
+# docs/issues/codex_stream_disconnect_shape_nudge.md
+# Injected as a user turn when the orchestrator has seen N byte-identical
+# upstream rejections of the SAME payload. Its only job is to make the next
+# request differ, so the wording is secondary to its existence — but it has
+# three jobs beyond that, and each earns its line:
+#   1. It must not read as a real instruction, or the agent re-plans.
+#   2. It must not imply the agent erred (it did not — openai/codex#9995).
+#   3. It must say NOTHING WAS LOST. The freeze point is side-effect-clean (the
+#      LLM call failed, so the tools node never ran), but an agent that is not
+#      told so will burn a turn on git_status/read_file re-verifying a workspace
+#      that never changed.
+# Formatted like _format_delegation_results (## heading + prose) — the other
+# message this codebase injects into a running conversation.
+_SHAPE_NUDGE_TEXT = (
+    "## Transport Notice\n"
+    "\n"
+    "The model provider closed the response stream on the previous request — "
+    "repeatedly, and identically each time. This is a known fault on their "
+    "side. It is not a problem with your work, your plan, or your last tool "
+    "call.\n"
+    "\n"
+    "Nothing was lost. The failure happened before the model replied, so no "
+    "tool ran and no file, commit, or todo changed. The workspace is exactly "
+    "as you left it — there is nothing to verify or repair.\n"
+    "\n"
+    "This message exists only so the retried request is no longer "
+    "byte-identical to the one being rejected. Ignore it and carry on exactly "
+    "where you left off: do not restart, re-plan, redo completed work, or "
+    "reply to this message."
+)
+
 
 class _AiosqliteConnectionWrapper:
     """Wrapper for aiosqlite.Connection that adds is_alive() method.
@@ -1019,6 +1051,32 @@ class UniversalAgent:
                             f"cleared terminal stop flags so the graph re-enters "
                             f"and resumes from its checkpoint"
                         )
+                        # >>> TEMPORARY QUICKFIX — remove with the upstream fix.
+                        # docs/issues/codex_stream_disconnect_shape_nudge.md
+                        # The orchestrator arms this after N byte-identical
+                        # failures. Resuming replays the SAME payload, which
+                        # upstream has already rejected every time; appending a
+                        # short turn changes it, which is the whole trick a
+                        # Codex user performs by typing "retry"
+                        # (openai/codex#10378). Cheap on purpose — it costs a
+                        # few dozen tokens and preserves context, unlike the
+                        # force-compaction fallback in restore_from_feedback.
+                        _outage_meta = (updated_metadata or {}).get("llm_outage")
+                        if isinstance(_outage_meta, dict) and _outage_meta.get(
+                            "pending_shape_nudge"
+                        ):
+                            from langchain_core.messages import HumanMessage
+
+                            await self._graph.aupdate_state(
+                                thread_config,
+                                {"messages": [HumanMessage(content=_SHAPE_NUDGE_TEXT)]},
+                                as_node="__start__",
+                            )
+                            logger.warning(
+                                f"[{job_id}] Injected request-shape nudge — the "
+                                f"previous payload was rejected upstream on "
+                                f"every retry; appending a turn to change it"
+                            )
                 except Exception as e:
                     logger.warning(
                         f"[{job_id}] Failed to clear stop flags on auto-continue "
