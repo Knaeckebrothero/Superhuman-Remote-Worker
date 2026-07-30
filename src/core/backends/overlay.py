@@ -74,6 +74,22 @@ class VirtualOverlayBackend:
         self._providers[provider.prefix] = provider
         logger.debug("Registered virtual provider: %s", provider.prefix)
 
+    def rebind(self, inner: Any) -> None:
+        """Point the overlay at a new real backend, keeping the providers.
+
+        A workspace-tier upgrade (virtual -> sandbox, container -> VM) replaces
+        the real backend mid-run. Rebinding — rather than building a fresh
+        overlay — preserves every already-registered provider, so the virtual
+        paths keep serving across the swap instead of 404ing until (and unless)
+        something re-registers them.
+        """
+        if inner is None:
+            raise ValueError("VirtualOverlayBackend.rebind requires a backend")
+        if inner is self:
+            raise ValueError("VirtualOverlayBackend cannot wrap itself")
+        self._inner = inner
+        logger.debug("Virtual overlay rebound to %s", type(inner).__name__)
+
     # --- routing ----------------------------------------------------------
 
     @staticmethod

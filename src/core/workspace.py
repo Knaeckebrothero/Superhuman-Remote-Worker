@@ -344,6 +344,35 @@ class WorkspaceManager:
             return
         self._virtual_overlay.register(provider)
 
+    def swap_backend(self, new_backend: "WorkspaceBackend") -> None:
+        """Replace the real backend, keeping the virtual overlay in front of it.
+
+        Workspace-tier upgrades (virtual -> sandbox in ``src/agent.py``,
+        container -> VM in ``src/api/persistent_session.py``) hand the manager a
+        different backend mid-run. Assigning ``self._backend`` directly drops
+        the overlay: ``_virtual_overlay`` keeps wrapping the OLD, now
+        disconnected backend, ``backend`` becomes the raw new one, and every
+        virtual path 404s from then on — including the deferred-tool full docs.
+        Re-registering providers cannot repair that, because they land on an
+        overlay nothing reads through any more.
+
+        Rebinding keeps the same overlay object (and therefore every registered
+        provider) in place over the new backend.
+
+        Args:
+            new_backend: The connected replacement backend. Must be a real
+                backend, never another overlay.
+        """
+        if new_backend is None:
+            raise TypeError("swap_backend requires a backend")
+        # Defensive: an overlay-in-an-overlay would double-route virtual paths.
+        new_backend = getattr(new_backend, "inner", new_backend)
+        if self._virtual_overlay is not None:
+            self._virtual_overlay.rebind(new_backend)
+            self._backend = self._virtual_overlay
+        else:
+            self._backend = new_backend
+
     @property
     def path(self) -> Path:
         """Get the root path of this workspace."""

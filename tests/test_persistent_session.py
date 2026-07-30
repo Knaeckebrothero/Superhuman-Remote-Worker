@@ -2441,7 +2441,12 @@ class TestSwapBackend:
             session.swap_backend(new_backend)
 
     def test_sets_workspace_manager_backend(self):
-        """After swap, workspace_manager._backend is the new backend."""
+        """The swap goes through WorkspaceManager.swap_backend().
+
+        Not a direct ``_backend`` assignment: that unwraps the virtual overlay
+        and 404s every virtual path afterwards
+        (docs/features/virtual_directories.md).
+        """
         session = _make_session()
         mock_wm = MagicMock()
         mock_wm.backend = MagicMock(spec=[])
@@ -2453,7 +2458,7 @@ class TestSwapBackend:
         with patch.object(session, "_setup_shell_manager"):
             session.swap_backend(new_backend)
 
-        assert mock_wm._backend == new_backend
+        mock_wm.swap_backend.assert_called_once_with(new_backend)
 
     def test_rebuilds_shell_manager(self):
         """swap_backend calls _setup_shell_manager to rebuild shell."""
@@ -2503,6 +2508,9 @@ class _SwappableWM:
     def __init__(self, backend):
         self._backend = backend
         self._files = {}
+
+    def swap_backend(self, new_backend):
+        self._backend = new_backend
 
     @property
     def backend(self):

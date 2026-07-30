@@ -1405,8 +1405,18 @@ class UniversalAgent:
         swap is in-process and ephemeral.
         """
         job_id = self._current_job_id
+        # The REAL backend, not the overlay: swap_backend() rebinds the overlay
+        # in place, so an overlay reference held across the swap would resolve
+        # to the NEW backend — and `old_backend.disconnect()` below would tear
+        # down the workspace we just upgraded onto. Unwrapping also keeps the
+        # seed copy on the real filesystem (no virtual files materialized into
+        # the sandbox).
+        from .core.virtual_dirs import unwrap_backend
+
         old_backend = (
-            self._workspace_manager.backend if self._workspace_manager else None
+            unwrap_backend(self._workspace_manager.backend)
+            if self._workspace_manager
+            else None
         )
         if old_backend is None:
             return False
@@ -1497,7 +1507,11 @@ class UniversalAgent:
             return False
 
         # 5. Swap the backend on the WorkspaceManager, drop the old virtual one.
-        self._workspace_manager._backend = new_backend
+        #    swap_backend() (not `_backend = ...`) so the virtual overlay is
+        #    rebound onto the new backend and the already-registered providers
+        #    keep serving — a direct assignment unwraps the overlay and every
+        #    virtual path, deferred-tool docs included, 404s from here on.
+        self._workspace_manager.swap_backend(new_backend)
         try:
             await asyncio.to_thread(old_backend.disconnect)
         except Exception:
