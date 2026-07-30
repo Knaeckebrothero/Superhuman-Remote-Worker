@@ -355,3 +355,116 @@ class TestPersistentSessionSkillGuard:
         session._deploy_instruction_files()
 
         assert session.workspace_manager.read_file(path) == "USER EDITED"
+
+
+class TestReseedFromSnapshotIfFresh:
+    """The snapshot re-seed must fire on a fresh workspace and ONLY there.
+
+    ``recover_to_phase`` overwrites checkpoint.db, plan.md, todos.yaml and
+    archive/ (src/core/phase_snapshot.py). Firing it on a same-pod resume
+    (cooldown pause/resume, freeze-continue, outage-sweeper redispatch)
+    silently rewinds the job to the last phase boundary. The seeded-content
+    marker is the only thing distinguishing the two cases, and probing a
+    *virtual* task_brief.md would answer "unseeded" on every single resume.
+    See docs/features/virtual_directories.md.
+    """
+
+    @staticmethod
+    def _agent(tmp_path, backend):
+        ws = WorkspaceManager(
+            job_id="job-1",
+            config=MagicMock(git_versioning=False),
+            backend=backend,
+            base_path=tmp_path,
+        )
+        agent = _bare_agent(ws)
+        agent.config = SimpleNamespace(
+            llm=SimpleNamespace(model="test-model"),
+            instruction_files=[],
+            extra={},
+            workspace=SimpleNamespace(structure=["output"]),
+        )
+        return agent
+
+    def test_seeded_workspace_does_not_rewind_to_the_last_snapshot(
+        self, tmp_path, monkeypatch
+    ):
+        from src.core.backends.seed import mark_workspace_seeded
+
+        backend = FilesystemTestBackend(tmp_path)
+        agent = self._agent(tmp_path, backend)
+        # A previous boot seeded this workspace; the pod never went away.
+        mark_workspace_seeded(agent._workspace_manager.backend)
+
+        snapshot_mgr = MagicMock()
+        monkeypatch.setattr(
+            "src.core.phase_snapshot.PhaseSnapshotManager",
+            MagicMock(return_value=snapshot_mgr),
+        )
+
+        assert agent._reseed_from_snapshot_if_fresh("job-1", backend) is False
+        snapshot_mgr.recover_to_phase.assert_not_called()
+        snapshot_mgr.get_latest_snapshot.assert_not_called()
+
+    def test_legacy_seeded_workspace_does_not_rewind_either(
+        self, tmp_path, monkeypatch
+    ):
+        """No marker, but a real task_brief.md from a pre-marker release."""
+        backend = FilesystemTestBackend(tmp_path)
+        (tmp_path / "task_brief.md").write_text("# Task Brief\n")
+        agent = self._agent(tmp_path, backend)
+
+        snapshot_mgr = MagicMock()
+        monkeypatch.setattr(
+            "src.core.phase_snapshot.PhaseSnapshotManager",
+            MagicMock(return_value=snapshot_mgr),
+        )
+
+        assert agent._reseed_from_snapshot_if_fresh("job-1", backend) is False
+        snapshot_mgr.recover_to_phase.assert_not_called()
+
+    def test_fresh_workspace_still_recovers_from_the_last_snapshot(
+        self, tmp_path, monkeypatch
+    ):
+        """The safety net this branch exists for must still fire."""
+        backend = FilesystemTestBackend(tmp_path)
+        agent = self._agent(tmp_path, backend)
+
+        snapshot_mgr = MagicMock()
+        snapshot_mgr.get_latest_snapshot.return_value = SimpleNamespace(phase_number=3)
+        monkeypatch.setattr(
+            "src.core.phase_snapshot.PhaseSnapshotManager",
+            MagicMock(return_value=snapshot_mgr),
+        )
+
+        assert agent._reseed_from_snapshot_if_fresh("job-1", backend) is True
+        snapshot_mgr.recover_to_phase.assert_called_once()
+        assert snapshot_mgr.recover_to_phase.call_args.args[0] == 3
+
+    def test_a_virtual_task_brief_cannot_suppress_the_recovery(
+        self, tmp_path, monkeypatch
+    ):
+        """The original hazard, inverted: virtual files must not read as seeded."""
+        from src.core.virtual_dirs import SingleFileProvider
+
+        backend = FilesystemTestBackend(tmp_path)
+        agent = self._agent(tmp_path, backend)
+        agent._workspace_manager.register_virtual_provider(
+            SingleFileProvider("task_brief.md", lambda: "# Task Brief\n")
+        )
+        assert agent._workspace_manager.backend.exists("task_brief.md")
+
+        snapshot_mgr = MagicMock()
+        snapshot_mgr.get_latest_snapshot.return_value = SimpleNamespace(phase_number=1)
+        monkeypatch.setattr(
+            "src.core.phase_snapshot.PhaseSnapshotManager",
+            MagicMock(return_value=snapshot_mgr),
+        )
+
+        assert (
+            agent._reseed_from_snapshot_if_fresh(
+                "job-1", agent._workspace_manager.backend
+            )
+            is True
+        )
+        snapshot_mgr.recover_to_phase.assert_called_once()

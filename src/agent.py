@@ -1709,6 +1709,61 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
         # fallback then applies).
         return resolved_content
 
+    def _reseed_from_snapshot_if_fresh(self, job_id: str, workspace_backend) -> bool:
+        """Restore the last phase snapshot onto a workspace that lost its content.
+
+        Only for a genuinely fresh workspace. ``recover_to_phase`` overwrites
+        ``checkpoint.db``, ``plan.md``, ``todos.yaml`` and ``archive/``
+        (``src/core/phase_snapshot.py``), so firing it on a same-pod resume
+        (cooldown pause/resume, freeze-continue, outage-sweeper redispatch)
+        silently rewinds the job to the last phase boundary. The seeded-content
+        marker is what distinguishes the two; probing a *virtual* file would
+        answer "unseeded" on every resume and rewind every one of them.
+
+        Extracted from ``_setup_job_workspace`` so the decision is testable on
+        its own. Never raises.
+
+        Returns:
+            True when a snapshot was pushed onto the workspace.
+        """
+        try:
+            from .core.backends.seed import workspace_is_seeded
+
+            if workspace_is_seeded(workspace_backend):
+                return False
+
+            logger.info(
+                f"VM workspace is fresh — seeding from last snapshot for job {job_id}"
+            )
+            from .core.phase_snapshot import PhaseSnapshotManager
+
+            recovery_mgr = PhaseSnapshotManager(
+                job_id, workspace_backend=workspace_backend
+            )
+            latest = recovery_mgr.get_latest_snapshot()
+            if not latest:
+                logger.warning("No snapshots available to seed VM workspace")
+                return False
+
+            # Ensure base directories exist on VM
+            for subdir in self.config.workspace.structure:
+                try:
+                    workspace_backend.mkdir(subdir.rstrip("/"))
+                except Exception:
+                    pass
+            # Push snapshot files to VM
+            recovery_mgr.recover_to_phase(
+                latest.phase_number,
+                workspace_manager=self._workspace_manager,
+            )
+            logger.info(
+                f"Seeded VM workspace from phase {latest.phase_number} snapshot"
+            )
+            return True
+        except Exception as e:
+            logger.warning(f"VM workspace seeding failed: {e}")
+            return False
+
     async def _setup_job_workspace(
         self,
         job_id: str,
@@ -2193,38 +2248,7 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
 
         # VM recovery: seed fresh VM workspace from last snapshot if needed
         if resume and workspace_backend and workspace_backend.supports_shell:
-            try:
-                from .core.virtual_dirs import unwrap_backend
-
-                if not unwrap_backend(workspace_backend).exists("task_brief.md"):
-                    logger.info(
-                        f"VM workspace is fresh — seeding from last snapshot for job {job_id}"
-                    )
-                    from .core.phase_snapshot import PhaseSnapshotManager
-
-                    recovery_mgr = PhaseSnapshotManager(
-                        job_id, workspace_backend=workspace_backend
-                    )
-                    latest = recovery_mgr.get_latest_snapshot()
-                    if latest:
-                        # Ensure base directories exist on VM
-                        for subdir in self.config.workspace.structure:
-                            try:
-                                workspace_backend.mkdir(subdir.rstrip("/"))
-                            except Exception:
-                                pass
-                        # Push snapshot files to VM
-                        recovery_mgr.recover_to_phase(
-                            latest.phase_number,
-                            workspace_manager=self._workspace_manager,
-                        )
-                        logger.info(
-                            f"Seeded VM workspace from phase {latest.phase_number} snapshot"
-                        )
-                    else:
-                        logger.warning("No snapshots available to seed VM workspace")
-            except Exception as e:
-                logger.warning(f"VM workspace seeding failed: {e}")
+            self._reseed_from_snapshot_if_fresh(job_id, workspace_backend)
 
         # G2: reattached remote workspace (PVC reattach on crash-recovery). The
         # working tree already lives on the REMOTE backend root, so the
@@ -2301,7 +2325,7 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             code, letting content-bearing git-less workspaces fall through to
             initialize()'s ``rm -rf``.
             """
-            from .core.virtual_dirs import unwrap_backend
+            from .core.backends.overlay import unwrap_backend
 
             probe = unwrap_backend(self._workspace_manager.backend)
             try:
@@ -2309,6 +2333,8 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             except Exception as e:
                 logger.warning(f"Workspace probe for {rel!r} failed: {e}")
                 return False
+
+        from .core.backends.seed import mark_workspace_seeded, workspace_is_seeded
 
         # Pod handoff: clone workspace from Gitea if resuming on a new pod
         # (no git working tree yet — G2 above already preserved and returned
@@ -2347,11 +2373,13 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                 f"Pod handoff clone failed for job {job_id}, falling through to normal init"
             )
 
-        # Check if resuming an existing workspace. Content probe via the
-        # backend (task_brief.md — the same probe the VM snapshot seeding
-        # uses): preserves a seeded-but-git-less workspace instead of letting
-        # the fresh-init path below wipe it.
-        if resume and _backend_has("task_brief.md"):
+        # Check if resuming an existing workspace. Content probe via the real
+        # backend (the seeded-content marker — the same probe the VM snapshot
+        # seeding uses): preserves a seeded-but-git-less workspace instead of
+        # letting the fresh-init path below wipe it with initialize()'s
+        # `rm -rf`. Probing a virtual file instead would answer "unseeded"
+        # forever and wipe every git-less resume.
+        if resume and workspace_is_seeded(self._workspace_manager.backend):
             logger.info(f"Resuming job {job_id} with existing workspace")
             # instructions.md is virtual (docs/features/virtual_directories.md)
             # and cannot go missing; the upload source (if any) was already
@@ -2403,6 +2431,12 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
         # Priority for instructions.md is inline > upload > template — inline
         # is read live from metadata at serve time, and the upload source (if
         # any) was already resolved at the top of this function.
+
+        # Seeded-content marker, written exactly where the real task_brief.md
+        # used to be: on the fresh-init path, after every resume branch has
+        # returned. It is what the two probes above read, so it must mean "this
+        # workspace was seeded for this job", not "a process booted".
+        mark_workspace_seeded(self._workspace_manager.backend)
 
         # Give the repo a meaningful landing page: replace the Gitea auto-init
         # stub README (or write one when absent) with the job description.

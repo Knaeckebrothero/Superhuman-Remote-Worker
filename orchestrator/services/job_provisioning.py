@@ -54,6 +54,7 @@ _LOOP_MAIN_GITIGNORE = "\n".join(
         "notes/",
         "instructions.md",
         "task_brief.md",
+        ".srw_seeded",
         "output/job_frozen.json",
         "output/job_completion.json",
         "repos/",

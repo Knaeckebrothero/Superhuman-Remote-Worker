@@ -248,12 +248,12 @@ def test_workspace_module_constructs_when_loaded_outside_its_package(tmp_path):
 def test_production_probe_call_sites_bypass_the_overlay():
     """Tripwire pinning the real call sites, not just the helper.
 
-    ``unwrap_backend`` is unit-tested above, but nothing otherwise pins the
+    ``workspace_is_seeded`` is unit-tested below, but nothing otherwise pins the
     production probes. An edit — or a merge/rebase conflict resolution — that
-    drops the unwrap call would let a virtual ``task_brief.md`` mask a wiped
-    workspace, and every other test in the suite would still pass. The Step 4
-    grep cannot catch it either: ``_backend_has`` probes through a variable,
-    not the literal string.
+    reintroduced a direct ``exists()`` probe would let a virtual file mask a
+    wiped workspace, and every other test in the suite would still pass. The
+    Step 4 grep cannot catch it either: ``_backend_has`` probes through a
+    variable, not the literal string.
     """
     from pathlib import Path
 
@@ -261,9 +261,67 @@ def test_production_probe_call_sites_bypass_the_overlay():
         encoding="utf-8"
     )
 
-    # VM-recovery / snapshot re-seed probe.
-    assert 'unwrap_backend(workspace_backend).exists("task_brief.md")' in source
+    # Both seeded-content probes go through the marker helper, which unwraps.
+    assert "workspace_is_seeded(workspace_backend)" in source
+    assert "workspace_is_seeded(self._workspace_manager.backend)" in source
 
-    # The shared _backend_has helper behind the resume gate.
+    # The old sentinel had no writer left, so it answered "unseeded" forever.
+    assert 'exists("task_brief.md")' not in source
+
+    # The marker is written on the fresh-init path, or nothing is ever seeded.
+    assert "mark_workspace_seeded(self._workspace_manager.backend)" in source
+
+    # The shared _backend_has helper (still used for the .git probe) unwraps.
     start = source.index("def _backend_has(")
     assert "unwrap_backend(" in source[start : start + 1200]
+
+
+def test_seeded_marker_probe_ignores_a_virtual_file(tmp_path):
+    """A virtual file must never make a wiped workspace look seeded."""
+    from src.core.backends.seed import SEEDED_MARKER, workspace_is_seeded
+
+    overlay = VirtualOverlayBackend(FilesystemTestBackend(tmp_path))
+    overlay.register(SingleFileProvider("task_brief.md", lambda: "# Task Brief\n"))
+    overlay.register(SingleFileProvider(SEEDED_MARKER, lambda: "fake"))
+
+    assert overlay.exists("task_brief.md")
+    assert overlay.exists(SEEDED_MARKER)
+    assert workspace_is_seeded(overlay) is False
+
+
+def test_seeded_marker_round_trips_through_the_manager(tmp_path, monkeypatch):
+    from src.core.backends.seed import (
+        SEEDED_MARKER,
+        mark_workspace_seeded,
+        workspace_is_seeded,
+    )
+
+    ws = _manager(tmp_path, monkeypatch)
+    assert workspace_is_seeded(ws.backend) is False
+
+    assert mark_workspace_seeded(ws.backend) is True
+    assert (tmp_path / SEEDED_MARKER).exists()
+    assert workspace_is_seeded(ws.backend) is True
+
+    # Idempotent: a second boot must not re-dirty the file.
+    assert mark_workspace_seeded(ws.backend) is False
+
+
+def test_legacy_workspace_without_a_marker_still_reads_as_seeded(tmp_path):
+    """Workspaces seeded before the marker existed must degrade SAFE.
+
+    They carry a real task_brief.md and no marker. Answering "unseeded" there
+    would rewind them to the last phase boundary (VM probe) or wipe them
+    (resume gate), so the legacy sentinel is still accepted as evidence.
+    """
+    from src.core.backends.seed import workspace_is_seeded
+
+    backend = FilesystemTestBackend(tmp_path)
+    (tmp_path / "task_brief.md").write_text("seeded by a pre-marker release")
+    assert workspace_is_seeded(backend) is True
+
+
+def test_empty_workspace_reads_as_unseeded(tmp_path):
+    from src.core.backends.seed import workspace_is_seeded
+
+    assert workspace_is_seeded(FilesystemTestBackend(tmp_path)) is False
