@@ -3,6 +3,7 @@ import {
   buildToolResultIndex,
   isLegacyTodosInput,
   legacyInjectKind,
+  resolveToolResultState,
   splitTurn,
 } from './chat-history.component';
 import {ChatEntry, ChatInput} from '../../core/models/chat.model';
@@ -117,5 +118,33 @@ describe('buildToolResultIndex', () => {
     });
     expect(idx.get('call_b')?.entryId).toBe('4');
     expect(idx.has('knowledge_inject_x')).toBe(false);
+  });
+});
+
+describe('resolveToolResultState', () => {
+  // Results live in the FOLLOWING turn's inputs, so only the last loaded turn
+  // can still be waiting on data. Everything else was never recorded — jobs
+  // predating the archiver delta fix lost every tool result this way, and the
+  // old code (keyed on hasMore() alone) mislabeled them all as "arrives later".
+  it('marks the last loaded turn as unloaded while more turns exist', () => {
+    expect(resolveToolResultState('9', '9', true)).toBe('unloaded');
+  });
+
+  it('marks earlier turns missing even when the job has more turns', () => {
+    // Turn 9's result would be in turn 10, which is already loaded.
+    expect(resolveToolResultState('9', '42', true)).toBe('missing');
+  });
+
+  it('marks the final turn of a fully loaded job as missing', () => {
+    expect(resolveToolResultState('69', '69', false)).toBe('missing');
+  });
+
+  it('marks everything missing when the whole job is loaded', () => {
+    // The e239ef27 case: 69 turns, all loaded, zero tool results written.
+    expect(resolveToolResultState('9', '69', false)).toBe('missing');
+  });
+
+  it('treats an empty window as missing rather than perpetually loading', () => {
+    expect(resolveToolResultState('9', null, true)).toBe('missing');
   });
 });

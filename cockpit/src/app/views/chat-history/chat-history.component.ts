@@ -260,10 +260,22 @@ interface Body {
                           <div class="tool-call-result" [class.expanded]="isExpanded('res:' + tc.id)">
                             @if (toolResultIndex().get(tc.id); as res) {
                               {{ bodyText(res.input, 'res:' + tc.id) }}
-                            } @else if (chat.hasMore()) {
-                              <span class="no-result">{{ 'chatHistory.resultInLaterTurn' | transloco }}</span>
+                            } @else if (toolResultState(t.entry._id) === 'unloaded') {
+                              @if (chat.loadingMore()) {
+                                <span class="no-result">
+                                  <app-spinner size="sm" tone="accent" />
+                                  {{ 'chatHistory.resultLoading' | transloco }}
+                                </span>
+                              } @else {
+                                <span class="no-result">
+                                  {{ 'chatHistory.resultInLaterTurn' | transloco }}
+                                  <button class="expand-btn" (click)="chat.loadMore()">
+                                    {{ 'chatHistory.resultLoadNext' | transloco }}
+                                  </button>
+                                </span>
+                              }
                             } @else {
-                              <span class="no-result">{{ 'chatHistory.resultPending' | transloco }}</span>
+                              <span class="no-result">{{ 'chatHistory.resultNotRecorded' | transloco }}</span>
                             }
                           </div>
                           @if (toolResultIndex().get(tc.id); as res) {
@@ -710,6 +722,17 @@ interface Body {
       .no-result {
         color: var(--text-muted, var(--text-muted));
         font-style: italic;
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        flex-wrap: wrap;
+      }
+
+      /* The inline "Load it" affordance sits on the same baseline as the
+         explanatory text, so it must not inherit the italic run-in style. */
+      .no-result .expand-btn {
+        font-style: normal;
+        margin: 0;
       }
 
       /* Reasoning */
@@ -811,6 +834,15 @@ export class ChatHistoryComponent {
    */
   readonly toolResultIndex = computed(() => buildToolResultIndex(this.chat.rows()));
 
+  /**
+   * Entry id of the last loaded turn — the only turn whose unresolved tool
+   * calls may still be waiting on data. See {@link toolResultState}.
+   */
+  private readonly lastLoadedEntryId = computed(() => {
+    const rows = this.chat.rows();
+    return rows.length > 0 ? rows[rows.length - 1]._id : null;
+  });
+
   // Entry count display
   readonly entryCount = computed(() => {
     return this.transloco.translate('chatHistory.turnsCount', {n: this.turns().length});
@@ -824,6 +856,29 @@ export class ChatHistoryComponent {
       const jobId = this.data.currentJobId();
       untracked(() => this.chat.setJob(jobId));
     });
+  }
+
+  /**
+   * Why a tool call shows no result.
+   *
+   * A turn's tool results are stored as the *next* turn's inputs (the archiver
+   * records the messages that arrived since the last AI message). So an
+   * unresolved call means one of two very different things, and only one of
+   * them is a loading state:
+   *
+   * - `unloaded` — this is the last loaded turn and the job has more, so the
+   *   result lives in a turn we simply haven't fetched. Resolvable.
+   * - `missing` — the following turn IS loaded (or there is no following turn),
+   *   so the result was never recorded. Nothing to wait for. Jobs that ran
+   *   before the archiver delta fix lost every tool result this way; see
+   *   project_chat_history_injection_bloat_lazy_hydration.
+   *
+   * The previous code keyed this off the global `hasMore()` alone, which
+   * mislabeled every never-recorded result in a partially loaded job as
+   * "arrives in a later turn".
+   */
+  toolResultState(entryId: string): ToolResultState {
+    return resolveToolResultState(entryId, this.lastLoadedEntryId(), this.chat.hasMore());
   }
 
   /** Near the bottom → fetch the next page (infinite scroll). */
@@ -1041,6 +1096,25 @@ export function splitTurn(entry: ChatEntry): TurnVM {
  * as the next turn's inputs; indexing the whole loaded window (instead of
  * peeking at entry idx+1) survives empty-delta turns and page boundaries.
  */
+/** Why a tool call has no result — see {@link resolveToolResultState}. */
+export type ToolResultState = 'unloaded' | 'missing';
+
+/**
+ * Classify an unresolved tool call: waiting on data, or never recorded.
+ *
+ * Only the last loaded turn can still be waiting, because results are stored
+ * as the *following* turn's inputs. If the following turn is already loaded
+ * (i.e. this isn't the last row) or the job has no further turns, the result
+ * was never written and no amount of paging will produce it.
+ */
+export function resolveToolResultState(
+  entryId: string,
+  lastLoadedEntryId: string | null,
+  hasMore: boolean,
+): ToolResultState {
+  return entryId === lastLoadedEntryId && hasMore ? 'unloaded' : 'missing';
+}
+
 export function buildToolResultIndex(
   entries: ChatEntry[],
 ): Map<string, { entryId: string; input: ChatInput }> {
