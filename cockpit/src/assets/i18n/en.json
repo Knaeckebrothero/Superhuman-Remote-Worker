@@ -2376,8 +2376,10 @@
     "showFull": "Show full ({{size}})",
     "showFullNoSize": "Show full",
     "collapse": "Collapse",
-    "resultPending": "Result pending or not available",
-    "resultInLaterTurn": "Result arrives in a later turn — load more turns to see it",
+    "resultNotRecorded": "No result recorded for this call",
+    "resultInLaterTurn": "Result is stored in the next turn, which isn't loaded yet.",
+    "resultLoadNext": "Load it",
+    "resultLoading": "Loading the next turn…",
     "viewRequest": "View full request",
     "showingTurns": "Showing {{n}} chat turns",
     "turnsCount": "{{n}} turns"

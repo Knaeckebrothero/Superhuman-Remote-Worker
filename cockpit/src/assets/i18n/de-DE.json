@@ -2376,8 +2376,10 @@
     "showFull": "Vollständig anzeigen ({{size}})",
     "showFullNoSize": "Vollständig anzeigen",
     "collapse": "Einklappen",
-    "resultPending": "Ergebnis ausstehend oder nicht verfügbar",
-    "resultInLaterTurn": "Ergebnis folgt in einer späteren Runde — weitere Runden laden",
+    "resultNotRecorded": "Für diesen Aufruf wurde kein Ergebnis gespeichert",
+    "resultInLaterTurn": "Das Ergebnis steht in der nächsten Runde, die noch nicht geladen ist.",
+    "resultLoadNext": "Laden",
+    "resultLoading": "Nächste Runde wird geladen…",
     "viewRequest": "Vollständige Anfrage anzeigen",
     "showingTurns": "{{n}} Chat-Runden angezeigt",
     "turnsCount": "{{n}} Runden"
