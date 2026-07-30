@@ -41,6 +41,16 @@ def build_instruction_providers(
     ]
 
 
+def unwrap_backend(backend: Any) -> Any:
+    """Return the real backend behind a virtual overlay.
+
+    Content probes that ask "does this workspace still hold its seeded files?"
+    must bypass virtualization: a virtual task_brief.md always exists, so a
+    naive probe would classify a wiped workspace as seeded and skip re-seeding.
+    """
+    return getattr(backend, "inner", backend)
+
+
 def sweep_legacy_tools_dir(backend: Any) -> bool:
     """Delete a leftover materialized ``tools/`` directory. Never raises.
 
@@ -74,4 +84,5 @@ __all__ = [
     "ToolsProvider",
     "build_instruction_providers",
     "sweep_legacy_tools_dir",
+    "unwrap_backend",
 ]

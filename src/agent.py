@@ -2180,7 +2180,9 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
         # VM recovery: seed fresh VM workspace from last snapshot if needed
         if resume and workspace_backend and workspace_backend.supports_shell:
             try:
-                if not workspace_backend.exists("task_brief.md"):
+                from .core.virtual_dirs import unwrap_backend
+
+                if not unwrap_backend(workspace_backend).exists("task_brief.md"):
                     logger.info(
                         f"VM workspace is fresh — seeding from last snapshot for job {job_id}"
                     )
@@ -2272,7 +2274,12 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             return metadata or {}
 
         def _backend_has(rel: str) -> bool:
-            """Probe the workspace backend, treating probe failures as absent.
+            """Probe the REAL workspace backend, treating failures as absent.
+
+            Bypasses the virtual overlay on purpose: instructions.md and
+            task_brief.md are virtual and always "exist", so probing through
+            the overlay would report every fresh pod as seeded. The question
+            here is strictly "did real seeded content survive?".
 
             The gates below used local ``Path.exists()`` checks, which are
             always False for a remote workspace — pod handoff degenerated to
@@ -2280,8 +2287,11 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             code, letting content-bearing git-less workspaces fall through to
             initialize()'s ``rm -rf``.
             """
+            from .core.virtual_dirs import unwrap_backend
+
+            probe = unwrap_backend(self._workspace_manager.backend)
             try:
-                return self._workspace_manager.exists(rel)
+                return probe.exists(rel)
             except Exception as e:
                 logger.warning(f"Workspace probe for {rel!r} failed: {e}")
                 return False
