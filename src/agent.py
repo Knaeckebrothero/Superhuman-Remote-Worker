@@ -34,7 +34,6 @@ from .core.loader import (
     load_agent_config,
     load_config_from_resolved,
     create_llm,
-    load_instructions,
     get_all_tool_names,
     resolve_config_path,
     resolve_model_settings,
@@ -241,10 +240,19 @@ class UniversalAgent:
         self._todo_manager: Optional[TodoManager] = None
         self._current_job_id: Optional[str] = None
         self._job_metadata: Optional[Dict[str, Any]] = None
+        # Upload-sourced instructions.md content, resolved eagerly by
+        # _resolve_uploaded_instructions() because a virtual-file provider's
+        # read() is synchronous and the download is not. None means "no
+        # upload for this job" (or not yet resolved) — the instructions
+        # provider then falls back to inline metadata, then the template.
+        self._resolved_instructions_md: Optional[str] = None
         # Agent-authored workspace files (path → content) that a pod re-provision
-        # would drop (task_brief.md, bound skills). Re-asserted on SSH reconnect
-        # via RemoteBackend's on_reconnect hook. See
+        # would drop (bound skills). Re-asserted on SSH reconnect via
+        # RemoteBackend's on_reconnect hook. See
         # docs/issues/reviewing_parent_pod_reaped_under_critic.md (Issue 4).
+        # instructions.md / task_brief.md used to be re-asserted here too, but
+        # a virtual file cannot be lost, so re-assertion narrows to genuinely
+        # seeded real files (docs/features/virtual_directories.md).
         self._agent_seed_files: Dict[str, str] = {}
         self._datasource_connections: Dict[str, Any] = {}
         self._datasource_clients: Dict[
@@ -1605,6 +1613,83 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
         except Exception as e:
             logger.warning(f"Failed to inject repo context into datasources.md: {e}")
 
+    async def _resolve_uploaded_instructions(
+        self, metadata: Dict[str, Any]
+    ) -> Optional[str]:
+        """Resolve upload-sourced instructions.md content (async I/O).
+
+        A virtual file's read() is synchronous, so the upload source (HTTP
+        download via the orchestrator, with a local ``uploads/<id>`` fallback)
+        must be resolved eagerly, here, rather than lazily inside the
+        provider. Inline instructions need no such care — the provider reads
+        ``metadata["instructions"]`` live at serve time.
+
+        Returns:
+            The resolved content, or None when there is no upload id or the
+            upload could not be found by either path (the caller's template
+            fallback then applies).
+        """
+        instr_upload_id = metadata.get("instructions_upload_id")
+        if not instr_upload_id:
+            return None
+
+        from .core.workspace import get_workspace_base_path
+        import tempfile
+
+        instructions_written = False
+        resolved_content: Optional[str] = None
+
+        # Try HTTP download first
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            downloaded_files = await self._download_upload_files(
+                instr_upload_id, temp_path, logger
+            )
+
+            if downloaded_files:
+                # Find the instructions file from downloaded files
+                instr_files = list(temp_path.glob("*.md")) + list(
+                    temp_path.glob("*.txt")
+                )
+                if instr_files:
+                    uploaded_instr_path = instr_files[0]
+                    resolved_content = uploaded_instr_path.read_text(encoding="utf-8")
+                    logger.info(
+                        f"Copied uploaded instructions (HTTP): {uploaded_instr_path.name}"
+                    )
+                    instructions_written = True
+
+        # Fall back to local filesystem
+        if not instructions_written:
+            instr_uploads_dir = get_workspace_base_path() / "uploads" / instr_upload_id
+
+            if instr_uploads_dir.exists():
+                # Find the instructions file (.md or .txt)
+                instr_files = list(instr_uploads_dir.glob("*.md")) + list(
+                    instr_uploads_dir.glob("*.txt")
+                )
+                if instr_files:
+                    uploaded_instr_path = instr_files[0]
+                    resolved_content = uploaded_instr_path.read_text(encoding="utf-8")
+                    logger.info(
+                        f"Copied uploaded instructions (local): {uploaded_instr_path.name}"
+                    )
+                    instructions_written = True
+                else:
+                    logger.warning(
+                        f"No .md/.txt files found in instructions upload: {instr_upload_id}"
+                    )
+            else:
+                logger.warning(
+                    f"Instructions upload directory not found: {instr_uploads_dir}"
+                )
+
+        # Fall back to template if upload failed
+        if not instructions_written:
+            pass  # Template-based fallback handled by _deploy_instruction_files()
+
+        return resolved_content
+
     async def _setup_job_workspace(
         self,
         job_id: str,
@@ -1633,6 +1718,29 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
         # Fresh capture per job: files we write on top of the pod's git clone,
         # re-asserted if a pod re-provision drops them (see the reconnect hook).
         self._agent_seed_files = {}
+
+        # Resolve upload-sourced instructions.md eagerly, once, before any of
+        # the branches below (fresh init, resume-with-existing-workspace,
+        # pod-handoff clone, PVC reattach) can return early. Every one of
+        # those branches leads to _deploy_instruction_files() registering a
+        # virtual instructions.md provider that reads
+        # self._resolved_instructions_md — a virtual file persists nothing
+        # between runs, so a resumed job whose instructions came from an
+        # upload would otherwise silently fall back to the template on
+        # whichever branch happened to fire. `metadata` is read-only with
+        # respect to these keys for the rest of this function (verified: only
+        # `updated_metadata`, a separate copy, is mutated below), so resolving
+        # here is equivalent to resolving in each branch — just impossible to
+        # accidentally miss one. Cheap when there is no upload (the helper
+        # returns immediately); non-fatal on failure (falls through to
+        # inline/template).
+        try:
+            self._resolved_instructions_md = await self._resolve_uploaded_instructions(
+                metadata
+            )
+        except Exception as e:
+            logger.warning(f"Instructions upload resolution failed (non-fatal): {e}")
+            self._resolved_instructions_md = None
 
         # On resume: try to load frozen config from JSONB (prevents config drift).
         # NOTE: serialize_resolved_config strips api_key from agent.llm before
@@ -2142,15 +2250,10 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                             git_mgr.checkout_branch(metadata["branch_name"])
                     except Exception as e:
                         logger.warning(f"Reattach: branch ensure failed: {e}")
-            # instructions.md lives on the PVC; only rewrite if it vanished.
-            try:
-                if not workspace_backend.exists("instructions.md"):
-                    self._workspace_manager.write_file(
-                        "instructions.md",
-                        load_instructions(self.config, model=self.config.llm.model),
-                    )
-            except Exception as e:
-                logger.warning(f"Reattach: instructions ensure failed: {e}")
+            # instructions.md is virtual (docs/features/virtual_directories.md)
+            # and cannot go missing, so the old "rewrite if vanished" guard is
+            # gone; the upload source (if any) was already resolved at the top
+            # of this function, before this branch could return early.
             self._todo_manager = TodoManager(
                 workspace=self._workspace_manager,
                 min_todos=self.config.phase_settings.min_todos,
@@ -2221,16 +2324,10 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
         # the fresh-init path below wipe it.
         if resume and _backend_has("task_brief.md"):
             logger.info(f"Resuming job {job_id} with existing workspace")
-            # Verify workspace has required files (backend-aware — a local
-            # Path.exists() is always False on remote workspaces and would
-            # clobber user-provided instructions with the template)
-            if not self._workspace_manager.exists("instructions.md"):
-                # Only write instructions if missing
-                instructions = load_instructions(
-                    self.config, model=self.config.llm.model
-                )
-                self._workspace_manager.write_file("instructions.md", instructions)
-                logger.debug("Wrote missing instructions.md to workspace")
+            # instructions.md is virtual (docs/features/virtual_directories.md)
+            # and cannot go missing; the upload source (if any) was already
+            # resolved at the top of this function, before this branch could
+            # return early.
 
             # Initialize git manager if git versioning is enabled (safe on existing repos)
             if (
@@ -2271,96 +2368,12 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
         else:
             self._workspace_manager.initialize()
 
-        # Copy instructions to workspace (priority: inline > upload > template)
-        if metadata.get("instructions"):
-            # Use inline instructions (from job creation form or builder)
-            self._workspace_manager.write_file(
-                "instructions.md", metadata["instructions"]
-            )
-            logger.info("Using inline instructions from job metadata")
-        elif metadata.get("instructions_upload_id"):
-            # Use uploaded instructions
-            instr_upload_id = metadata["instructions_upload_id"]
-            from .core.workspace import get_workspace_base_path
-            import tempfile
-
-            instructions_written = False
-
-            # Try HTTP download first
-            with tempfile.TemporaryDirectory() as temp_dir:
-                temp_path = Path(temp_dir)
-                downloaded_files = await self._download_upload_files(
-                    instr_upload_id, temp_path, logger
-                )
-
-                if downloaded_files:
-                    # Find the instructions file from downloaded files
-                    instr_files = list(temp_path.glob("*.md")) + list(
-                        temp_path.glob("*.txt")
-                    )
-                    if instr_files:
-                        uploaded_instr_path = instr_files[0]
-                        content = uploaded_instr_path.read_text(encoding="utf-8")
-                        self._workspace_manager.write_file("instructions.md", content)
-                        logger.info(
-                            f"Copied uploaded instructions (HTTP): {uploaded_instr_path.name}"
-                        )
-                        instructions_written = True
-
-            # Fall back to local filesystem
-            if not instructions_written:
-                instr_uploads_dir = (
-                    get_workspace_base_path() / "uploads" / instr_upload_id
-                )
-
-                if instr_uploads_dir.exists():
-                    # Find the instructions file (.md or .txt)
-                    instr_files = list(instr_uploads_dir.glob("*.md")) + list(
-                        instr_uploads_dir.glob("*.txt")
-                    )
-                    if instr_files:
-                        uploaded_instr_path = instr_files[0]
-                        content = uploaded_instr_path.read_text(encoding="utf-8")
-                        self._workspace_manager.write_file("instructions.md", content)
-                        logger.info(
-                            f"Copied uploaded instructions (local): {uploaded_instr_path.name}"
-                        )
-                        instructions_written = True
-                    else:
-                        logger.warning(
-                            f"No .md/.txt files found in instructions upload: {instr_upload_id}"
-                        )
-                else:
-                    logger.warning(
-                        f"Instructions upload directory not found: {instr_uploads_dir}"
-                    )
-
-            # Fall back to template if upload failed
-            if not instructions_written:
-                pass  # Template-based fallback handled by _deploy_instruction_files()
-        else:
-            pass  # Template-based instructions handled by _deploy_instruction_files()
-
-        # Write task brief to workspace (description + optional kickoff message)
-        description = metadata.get("description", "")
-        kickoff_message = metadata.get("kickoff_message", "")
-        brief_parts = [f"# Task Brief\n\n## Description\n\n{description}"]
-        if kickoff_message:
-            brief_parts.append(f"\n\n## Kickoff Message\n\n{kickoff_message}")
-        # Deliverable contract (P1-C): render the job's required_deliverables
-        # manifest as an explicit block — workers can't be held to a floor
-        # they were never shown. Empty string when the job has no manifest.
-        from .core.deliverables import format_deliverable_contract_block
-
-        contract_block = format_deliverable_contract_block(
-            metadata.get("required_deliverables")
-        )
-        if contract_block:
-            brief_parts.append(contract_block)
-        brief_content = "".join(brief_parts)
-        self._workspace_manager.write_file("task_brief.md", brief_content)
-        self._agent_seed_files["task_brief.md"] = brief_content
-        logger.debug("Wrote task_brief.md to workspace")
+        # instructions.md / task_brief.md are virtual
+        # (docs/features/virtual_directories.md): served live by providers
+        # registered in _deploy_instruction_files(), never written here.
+        # Priority for instructions.md is inline > upload > template — inline
+        # is read live from metadata at serve time, and the upload source (if
+        # any) was already resolved at the top of this function.
 
         # Give the repo a meaningful landing page: replace the Gitea auto-init
         # stub README (or write one when absent) with the job description.
@@ -3191,7 +3204,8 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
         ``{% if has_tool("kb_write") %}`` resolve correctly.
 
         Deploys:
-        - instructions.md (from template, only if not already written from upload/inline)
+        - instructions.md / task_brief.md as virtual providers (served live,
+          never written — see docs/features/virtual_directories.md)
         - Additional instruction_files from config (literal files + bound skills)
         - In-scope skill directories (Slice 2)
         """
@@ -3201,15 +3215,51 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             load_instructions,
         )
 
-        # instructions.md — only deploy template if not already present (upload/inline).
-        # Must go through the backend: get_path().exists() checks the agent pod's
-        # local filesystem and is always False on remote workspaces, which used to
-        # clobber user-provided instructions with the template.
-        if not self._workspace_manager.exists("instructions.md"):
-            instructions = load_instructions(self.config, model=self.config.llm.model)
-            instructions = render_instruction_content(instructions, loaded_tool_names)
-            self._workspace_manager.write_file("instructions.md", instructions)
-            logger.debug("Deployed template-based instructions.md to workspace")
+        # instructions.md / task_brief.md are virtual
+        # (docs/features/virtual_directories.md): served from the job record or
+        # the rendered template, never written to the workspace. This deletes
+        # the exists()-probe precedence dance and the "rewrite if it vanished"
+        # repair path — a virtual file cannot go missing.
+        from .core.virtual_dirs import build_instruction_providers
+        from .core.deliverables import format_deliverable_contract_block
+
+        metadata = self._job_metadata or {}
+
+        def _uploaded_instructions():
+            # Priority inline > upload (the template is the caller's fallback).
+            # Inline is read live so it survives the resume path; upload content
+            # was resolved eagerly at boot because its I/O is async.
+            inline = metadata.get("instructions")
+            if inline and inline.strip():
+                return inline
+            return self._resolved_instructions_md
+
+        def _rendered_template():
+            content = load_instructions(self.config, model=self.config.llm.model)
+            return render_instruction_content(content, loaded_tool_names)
+
+        def _task_brief():
+            description = metadata.get("description", "")
+            kickoff_message = metadata.get("kickoff_message", "")
+            parts = [f"# Task Brief\n\n## Description\n\n{description}"]
+            if kickoff_message:
+                parts.append(f"\n\n## Kickoff Message\n\n{kickoff_message}")
+            # Deliverable contract (P1-C): render the job's required_deliverables
+            # manifest as an explicit block — workers can't be held to a floor
+            # they were never shown. Empty string when the job has no manifest.
+            contract_block = format_deliverable_contract_block(
+                metadata.get("required_deliverables")
+            )
+            if contract_block:
+                parts.append(contract_block)
+            return "".join(parts)
+
+        for provider in build_instruction_providers(
+            uploaded=_uploaded_instructions,
+            template=_rendered_template,
+            brief=_task_brief,
+        ):
+            self._workspace_manager.register_virtual_provider(provider)
 
         # todo_guide is now the bundled "todo-guide" skill, bound via instruction_files
         # (before_tool:next_phase_todos) and materialized in the loop below — no matrix
