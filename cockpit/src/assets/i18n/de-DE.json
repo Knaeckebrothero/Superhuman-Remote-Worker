@@ -337,6 +337,7 @@
     "review": "Auftragsprüfung",
     "projects": "Projekte",
     "datasources": "Konnektoren",
+    "contacts": "Kontakte",
     "experts": "Experten",
     "skills": "Skills",
     "automations": "Automationen",
@@ -2001,6 +2002,22 @@
       "reindexFailed": "Neuindizierung der OKF Knowledge Base fehlgeschlagen",
       "fileTooLarge": "Datei überschreitet 64 KB — Anmeldedaten-Dateien sind auf 64 KB begrenzt."
     }
+  },
+  "contacts": {
+    "title": "Kontakte",
+    "new": "Neuer Kontakt",
+    "search": "Kontakte durchsuchen…",
+    "empty": "Noch keine Kontakte. Kontakte sind Personen, die deine Agenten erreichen dürfen — lege einen an und verknüpfe ihn mit einem Projekt.",
+    "projectsShort": "Proj.",
+    "primary": "primär",
+    "noAddresses": "Keine Adressen",
+    "optIn": {"pending": "Opt-in ausstehend", "opted_out": "abgemeldet"},
+    "filter": {"allChannels": "Alle Kanäle", "allProjects": "Alle Projekte"},
+    "form": {"newTitle": "Neuer Kontakt", "editTitle": "Kontakt bearbeiten", "name": "Anzeigename",
+             "notes": "Notizen (für Agenten sichtbar — Briefings, Präferenzen, Kontext)",
+             "addresses": "Adressen", "addAddress": "+ Adresse hinzufügen", "projects": "Projekte"},
+    "delete": {"title": "Kontakt löschen",
+               "message": "Der Kontakt wird aus diesen Projekten entfernt: {{projects}}. Agenten können diese Person danach nicht mehr erreichen."}
   },
   "inbox": {
     "title": "Aktionszentrum",

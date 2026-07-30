@@ -45,6 +45,12 @@ export const routes: Routes = [
   { path: 'projects', component: ProjectListPageComponent, canActivate: [authGuard] },
   { path: 'projects/:id', component: ProjectDetailPageComponent, canActivate: [authGuard, projectAccessGuard] },
   { path: 'datasources', component: DatasourcesPageComponent, canActivate: [authGuard] },
+  {
+    path: 'contacts',
+    loadComponent: () =>
+      import('./views/contacts/contacts-page.component').then(m => m.ContactsPageComponent),
+    canActivate: [authGuard],
+  },
   { path: 'experts', component: ExpertsPageComponent, canActivate: [authGuard] },
   { path: 'experts/new', component: ExpertEditorComponent, canActivate: [authGuard] },
   { path: 'experts/:id/edit', component: ExpertEditorComponent, canActivate: [authGuard] },

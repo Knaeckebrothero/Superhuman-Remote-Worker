@@ -337,6 +337,7 @@
     "review": "Job Review",
     "projects": "Projects",
     "datasources": "Connectors",
+    "contacts": "Contacts",
     "experts": "Experts",
     "skills": "Skills",
     "automations": "Automations",
@@ -2001,6 +2002,22 @@
       "reindexFailed": "Failed to reindex the OKF Knowledge Base",
       "fileTooLarge": "File exceeds 64 KB — credential files are capped at 64 KB."
     }
+  },
+  "contacts": {
+    "title": "Contacts",
+    "new": "New contact",
+    "search": "Search contacts…",
+    "empty": "No contacts yet. Contacts are people your agents may reach — add one and link it to a project.",
+    "projectsShort": "proj",
+    "primary": "primary",
+    "noAddresses": "No addresses",
+    "optIn": {"pending": "opt-in pending", "opted_out": "opted out"},
+    "filter": {"allChannels": "All channels", "allProjects": "All projects"},
+    "form": {"newTitle": "New contact", "editTitle": "Edit contact", "name": "Display name",
+             "notes": "Notes (visible to agents — briefings, preferences, context)",
+             "addresses": "Addresses", "addAddress": "+ Add address", "projects": "Projects"},
+    "delete": {"title": "Delete contact",
+               "message": "This removes the contact from these projects: {{projects}}. Agents will no longer be able to message them."}
   },
   "inbox": {
     "title": "Action Center",
