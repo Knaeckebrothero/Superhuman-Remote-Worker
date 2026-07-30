@@ -68,6 +68,14 @@ import {LegionMarkComponent} from '../../ui/legion-mark';
           </a>
           <a
             class="nav-link"
+            routerLink="/contacts"
+            routerLinkActive="active"
+          >
+            <app-icon size="md" class="nav-icon">group</app-icon>
+            {{ 'nav.contacts' | transloco }}
+          </a>
+          <a
+            class="nav-link"
             routerLink="/experts"
             routerLinkActive="active"
           >
