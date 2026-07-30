@@ -1469,7 +1469,7 @@ Use whatever attribute already holds the job metadata dict in that class for `me
 - the instructions upload/inline `write_file("instructions.md", ...)` calls (~2213, ~2239, ~2259) and the `instructions_written` bookkeeping — the provider now reads `metadata["instructions"]` directly; keep any code that *populates* that metadata from an upload,
 - the resume repair block `if not self._workspace_manager.exists("instructions.md"): ... write_file(...)` (~2164-2170).
 
-**3d.** Apply the same replacement in `src/api/persistent_session.py._deploy_instruction_files` (line ~995): register the providers instead of writing `instructions.md`. Sessions have no task brief; pass `brief=lambda: ""` only if the session path currently writes one — otherwise register just the instructions provider by selecting it from the returned list.
+**3d. Session path — register NOTHING.** Verified 2026-07-30: `src/api/persistent_session.py._deploy_instruction_files` writes neither `instructions.md` nor `task_brief.md`, and never has. Slice 1 is a passive migration — it replaces materialized files with virtual equivalents and adds no file a surface never had. Registering an instructions provider here would give every session workspace a new agent-visible file duplicating `get_phase_system_prompt`'s output; that is a product decision, not a migration step. Leave this function's instructions behavior alone. (The spec's Motivation table previously listed this path as a writer — that was wrong and is corrected.)
 
 **3e.** Config-driven `instruction_files` (literal files and bound skills → `skills/<name>/SKILL.md`) stay exactly as they are: real files, still written, still tracked in `_agent_seed_files`.
 
