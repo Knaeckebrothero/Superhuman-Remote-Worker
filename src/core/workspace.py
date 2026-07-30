@@ -31,6 +31,7 @@ from urllib.parse import urlsplit
 
 if TYPE_CHECKING:
     from ..managers.git_manager import GitManager
+    from .backends.overlay import VirtualOverlayBackend
     from .workspace_backend import WorkspaceBackend
 
 logger = logging.getLogger(__name__)
@@ -298,7 +299,19 @@ class WorkspaceManager:
         self._workspace_path = self._base_path
         self._initialized = False
 
-        self._backend = backend
+        # Virtual directories: wrap the real backend so registered prefixes
+        # (tools/, contacts/, instructions.md) are served from live state.
+        # See docs/features/virtual_directories.md.
+        self._virtual_overlay: Optional["VirtualOverlayBackend"] = None
+        if backend is not None and os.getenv(
+            "VIRTUAL_DIRS_ENABLED", "true"
+        ).lower() not in ("false", "0", "no"):
+            from .backends.overlay import VirtualOverlayBackend
+
+            self._virtual_overlay = VirtualOverlayBackend(backend)
+            self._backend = self._virtual_overlay
+        else:
+            self._backend = backend
 
         # Git manager (created during initialize if git_versioning enabled)
         self._git_manager: Optional["GitManager"] = None
@@ -310,6 +323,21 @@ class WorkspaceManager:
     def backend(self) -> "WorkspaceBackend":
         """Get the workspace backend."""
         return self._backend
+
+    @property
+    def virtual_overlay(self):
+        """The virtual overlay, or None when VIRTUAL_DIRS_ENABLED is off."""
+        return self._virtual_overlay
+
+    def register_virtual_provider(self, provider) -> None:
+        """Register a virtual directory provider. No-op when disabled."""
+        if self._virtual_overlay is None:
+            logger.debug(
+                "VIRTUAL_DIRS_ENABLED is off — ignoring provider %s",
+                getattr(provider, "prefix", "?"),
+            )
+            return
+        self._virtual_overlay.register(provider)
 
     @property
     def path(self) -> Path:

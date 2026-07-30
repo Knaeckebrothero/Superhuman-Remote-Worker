@@ -56,10 +56,7 @@ from .core.workspace import (
 from .graph import build_phase_alternation_graph, run_graph_with_streaming
 from .managers import TodoManager
 from .tools import ToolContext, load_tools, apply_instruction_enforcement
-from .tools.description_manager import (
-    generate_workspace_tool_docs,
-    apply_description_overrides,
-)
+from .tools.description_manager import apply_description_overrides
 from .utils.db_url import checkpointer_backend, resolve_checkpoint_url
 
 # Set True once per agent process after the Postgres checkpoint schema has been
@@ -2931,16 +2928,25 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
 
             self._tools = implemented_tools
 
-        # Generate tool documentation in workspace (before overrides so full docstrings are captured)
-        tools_dir = self._workspace_manager.get_path("tools")
+        # Tool docs are a virtual directory (docs/features/virtual_directories.md):
+        # served from the live tool list, never written to the workspace.
+        from .core.virtual_dirs import ToolsProvider, sweep_legacy_tools_dir
 
-        def _write_tool_doc(rel_path: str, content: str) -> None:
-            self._workspace_manager.write_file(f"tools/{rel_path}", content)
+        # CRITICAL: hold the PRE-override tool objects. Further down,
+        # `self._tools = apply_description_overrides(self._tools)` rebinds the
+        # attribute to copies whose deferred-tool descriptions are short
+        # blurbs. A provider reading `self._tools` at call time would render
+        # those blurbs into tools/<name>.md and defeat the whole deferred-tool
+        # design (short in context, FULL on disk). apply_description_overrides
+        # returns copies, so the originals this list holds stay full.
+        self._full_description_tools = self._tools
+        self._workspace_manager.register_virtual_provider(
+            ToolsProvider(lambda: self._full_description_tools)
+        )
+        if self._workspace_manager.virtual_overlay is not None:
+            sweep_legacy_tools_dir(self._workspace_manager.virtual_overlay.inner)
 
         loaded_tool_names = [t.name for t in self._tools]
-        generate_workspace_tool_docs(
-            loaded_tool_names, tools_dir, tools=self._tools, write_fn=_write_tool_doc
-        )
 
         # Stash the resolved tool list + limits so the light spawn_subagent
         # backend can build a reader that inherits the parent's tools (minus the
