@@ -1030,16 +1030,21 @@ class AsyncCockpitClient:
 
     @_create_retry_decorator()
     async def get_workspace_file(self, job_id: str, path: str) -> dict[str, Any]:
-        """Read a file from the job's local workspace.
+        """Read a file from the job's workspace repo (Gitea-backed).
+
+        Committed state as of the worker's last phase-boundary push, read
+        at the job branch head.
 
         Args:
             job_id: Job UUID
-            path: Relative path within the workspace
+            path: Relative path within the workspace repo
 
         Returns:
-            Dict with path and content
+            Dict with path, content, and size
         """
-        resp = await self._client.get(f"/api/jobs/{job_id}/workspace/{path}")
+        resp = await self._client.get(
+            f"/api/jobs/{job_id}/repo/file", params={"path": path}
+        )
         resp.raise_for_status()
         return resp.json()
 
@@ -1047,15 +1052,69 @@ class AsyncCockpitClient:
     async def get_workspace_overview(self, job_id: str) -> dict[str, Any]:
         """Get workspace overview with file listing and content previews.
 
+        Composed from the job's Gitea repo (committed state as of the
+        worker's last phase-boundary push): repo-root listing, truncated
+        workspace.md/plan.md previews when present, and the Gitea-backed
+        todo state. Degrades to ``has_workspace: False`` when Gitea or the
+        job repo is unavailable.
+
         Args:
             job_id: Job UUID
 
         Returns:
-            Workspace overview dict
+            Workspace overview dict (job_id, has_workspace, files,
+            workspace_md, plan_md, todos, archive_count)
         """
-        resp = await self._client.get(f"/api/jobs/{job_id}/workspace")
+        overview: dict[str, Any] = {
+            "job_id": job_id,
+            "has_workspace": False,
+            "files": [],
+            "workspace_md": None,
+            "plan_md": None,
+            "todos": None,
+            "archive_count": 0,
+        }
+
+        resp = await self._client.get(
+            f"/api/jobs/{job_id}/repo/contents", params={"path": ""}
+        )
+        if resp.status_code in (404, 503):
+            return overview
         resp.raise_for_status()
-        return resp.json()
+        entries = resp.json() or []
+
+        overview["has_workspace"] = True
+        overview["files"] = [
+            {
+                "name": entry.get("name"),
+                "size": entry.get("size", 0),
+                "type": entry.get("type"),
+            }
+            for entry in entries
+        ]
+
+        file_names = {e.get("name") for e in entries if e.get("type") == "file"}
+        for key, name in (("workspace_md", "workspace.md"), ("plan_md", "plan.md")):
+            if name not in file_names:
+                continue
+            file_resp = await self._client.get(
+                f"/api/jobs/{job_id}/repo/file", params={"path": name}
+            )
+            if file_resp.status_code != 200:
+                continue
+            content = file_resp.json().get("content") or ""
+            preview = content[:2000]
+            if len(content) > 2000:
+                preview += "\n\n... (truncated)"
+            overview[key] = preview
+
+        todos_resp = await self._client.get(f"/api/jobs/{job_id}/todos")
+        if todos_resp.status_code == 200:
+            todos_data = todos_resp.json()
+            overview["todos"] = todos_data.get("current")
+            overview["archive_count"] = len(todos_data.get("archives") or [])
+
+        return overview
 
     @_create_retry_decorator()
     async def get_job_progress(self, job_id: str) -> dict[str, Any]:
