@@ -1,5 +1,10 @@
 from src.core.backends.overlay import VirtualOverlayBackend
-from src.core.virtual_dirs import ToolsProvider, sweep_legacy_tools_dir
+from src.core.virtual_dirs import (
+    SingleFileProvider,
+    ToolsProvider,
+    sweep_legacy_tools_dir,
+    unwrap_backend,
+)
 from src.core.workspace import WorkspaceManager, WorkspaceManagerConfig
 from tests._fs_backend import FilesystemTestBackend
 
@@ -122,3 +127,31 @@ def test_provider_serves_full_docstrings_after_overrides_rebind(tmp_path, monkey
     assert full_tools[0].description == full_doc
 
     assert full_doc in ws.read_file("tools/get_document_info.md")
+
+
+def test_unwrap_returns_inner_for_overlay(tmp_path):
+    inner = FilesystemTestBackend(tmp_path)
+    assert unwrap_backend(VirtualOverlayBackend(inner)) is inner
+
+
+def test_unwrap_passes_plain_backends_through(tmp_path):
+    backend = FilesystemTestBackend(tmp_path)
+    assert unwrap_backend(backend) is backend
+
+
+def test_virtual_task_brief_must_not_mask_an_unseeded_workspace(tmp_path):
+    """Regression: the seeded-content probe must see the real filesystem."""
+    overlay = VirtualOverlayBackend(FilesystemTestBackend(tmp_path))
+    overlay.register(SingleFileProvider("task_brief.md", lambda: "# Task Brief\n"))
+
+    # Virtually present ...
+    assert overlay.exists("task_brief.md")
+    # ... but the workspace is empty, so the probe must report unseeded.
+    assert not unwrap_backend(overlay).exists("task_brief.md")
+
+
+def test_probe_sees_a_genuinely_seeded_workspace(tmp_path):
+    overlay = VirtualOverlayBackend(FilesystemTestBackend(tmp_path))
+    overlay.register(SingleFileProvider("task_brief.md", lambda: "# Task Brief\n"))
+    (tmp_path / "task_brief.md").write_text("seeded earlier")
+    assert unwrap_backend(overlay).exists("task_brief.md")
