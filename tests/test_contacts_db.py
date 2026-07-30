@@ -71,6 +71,30 @@ async def test_cross_tenant_same_address(db, seeded):
     )
 
 
+async def test_add_duplicate_primary_rolls_back_demotion(db, seeded):
+    """Finding 1 (final review): is_primary=True on a DUPLICATE address must
+    not leave the channel primary-less. The old `ON CONFLICT ... DO NOTHING`
+    let the demotion UPDATE commit even though the conflicting insert added
+    nothing — this reproduces that exact sequence and asserts the demotion
+    rolled back with it."""
+    c = await db.create_contact(seeded["a"], "Anna Duplicate")
+    first = await db.add_contact_address(c["id"], seeded["a"], "email", "anna@dup.de")
+    assert first["is_primary"] is True
+
+    dup = await db.add_contact_address(
+        c["id"], seeded["a"], "email", "anna@dup.de", is_primary=True
+    )
+    assert dup is None
+
+    addresses = (await db.get_contact(c["id"]))["addresses"]
+    assert len(addresses) == 1
+    # get_contact's nested addresses come back JSON-aggregated (id as str);
+    # add_contact_address's direct RETURNING row has id as a native UUID —
+    # str() both sides rather than fighting that pre-existing quirk.
+    assert str(addresses[0]["id"]) == str(first["id"])
+    assert addresses[0]["is_primary"] is True
+
+
 async def test_resolver_statuses(db, seeded):
     c = await db.create_contact(seeded["a"], "Priya Nair")
     await db.add_contact_address(c["id"], seeded["a"], "email", "priya@x.de")

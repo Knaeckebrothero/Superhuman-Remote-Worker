@@ -12682,7 +12682,6 @@ class PostgresDB:
                         """INSERT INTO contact_addresses
                                (contact_id, owner_user_id, channel, address, is_primary, opt_in_status)
                            VALUES ($1, $2, $3, $4, $5, $6)
-                           ON CONFLICT (owner_user_id, channel, address) DO NOTHING
                            RETURNING *""",
                         contact_id,
                         owner_user_id,
@@ -12693,11 +12692,20 @@ class PostgresDB:
                     )
                     return dict(row) if row else None
             except asyncpg.UniqueViolationError:
-                # Two concurrent calls can both observe "no primary yet" for
-                # this (contact_id, channel) and race to insert one; the
-                # loser hits uq_contact_primary_per_channel here. No data
-                # corruption (the index held), just report it like any other
-                # duplicate — the transaction already rolled back.
+                # Two distinct unique indexes can raise here:
+                #  - (owner_user_id, channel, address): a plain duplicate.
+                #  - uq_contact_primary_per_channel: two concurrent calls both
+                #    observed "no primary yet" for this (contact_id, channel)
+                #    and raced to insert one.
+                # Either way the exception propagates out of the `async with
+                # conn.transaction()` block above, so Postgres rolls back the
+                # whole transaction — including the is_primary=false demotion
+                # UPDATE a few lines up. Without that rollback (the previous
+                # `ON CONFLICT ... DO NOTHING`), a duplicate-address call with
+                # is_primary=True would silently commit the demotion while
+                # inserting nothing, leaving the channel with no primary at
+                # all. No data corruption from the index itself either way —
+                # just report it like any other duplicate.
                 return None
 
     async def update_contact_address(

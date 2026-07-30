@@ -169,6 +169,47 @@ async def test_patch_address_owner_only(db, as_user_a):
     db.update_contact_address.assert_not_awaited()
 
 
+async def test_patch_contact_blank_display_name_400(db, as_user_a):
+    """Finding 3: an all-whitespace display_name must 400, not silently blank
+    the contact's name (COALESCE in the DB layer only skips NULL, not "")."""
+    db.get_contact.return_value = {"id": "c1", "owner_user_id": USER_A["id"]}
+    with pytest.raises(HTTPException) as e:
+        await contacts_router.patch_contact(
+            _req(), "c1", contacts_router.ContactPatch(display_name="   ")
+        )
+    assert e.value.status_code == 400
+    db.update_contact.assert_not_awaited()
+
+
+async def test_patch_contact_strips_display_name(db, as_user_a):
+    db.get_contact.return_value = {"id": "c1", "owner_user_id": USER_A["id"]}
+    db.update_contact.return_value = {"id": "c1", "display_name": "Anna"}
+    out = await contacts_router.patch_contact(
+        _req(), "c1", contacts_router.ContactPatch(display_name="  Anna  ")
+    )
+    db.update_contact.assert_awaited_once_with("c1", "Anna", None)
+    assert out == {"contact": {"id": "c1", "display_name": "Anna"}}
+
+
+async def test_patch_address_duplicate_409(db, as_user_a):
+    """Finding 2: update_contact_address maps a unique violation to None —
+    the router must turn that into 409, not pass {"address": null} through
+    as a 200 (ContactsService.patchAddress types the response non-null)."""
+    db.get_contact_address.return_value = {
+        "id": "a1",
+        "owner_user_id": USER_A["id"],
+        "channel": "email",
+        "address": "old@acme.de",
+    }
+    db.update_contact_address.return_value = None  # duplicate
+    with pytest.raises(HTTPException) as e:
+        await contacts_router.patch_address(
+            _req(), "a1", contacts_router.AddressPatch(address="dupe@acme.de")
+        )
+    assert e.value.status_code == 409
+    assert "dupe@acme.de" in e.value.detail
+
+
 async def test_patch_address_normalizes_on_success(db, as_user_a):
     db.get_contact_address.return_value = {
         "id": "a1",
