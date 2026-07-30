@@ -48,8 +48,17 @@ def unwrap_backend(backend: Any) -> Any:
     Content probes that ask "does this workspace still hold its seeded files?"
     must bypass virtualization: a virtual task_brief.md always exists, so a
     naive probe would classify a wiped workspace as seeded and skip re-seeding.
+    Cloud sync uses it for a different reason — it is not a tool-layer consumer,
+    so it must never see (or write back to) virtual paths.
+
+    Typed on ``VirtualOverlayBackend`` rather than duck-typed on ``.inner``: a
+    ``MagicMock`` auto-creates every attribute, so ``getattr(mock, "inner",
+    mock)`` silently hands back a child mock and a test's stand-in backend
+    stops being the object under test.
     """
-    return getattr(backend, "inner", backend)
+    from ..backends.overlay import VirtualOverlayBackend
+
+    return backend.inner if isinstance(backend, VirtualOverlayBackend) else backend
 
 
 def sweep_legacy_tools_dir(backend: Any) -> bool:

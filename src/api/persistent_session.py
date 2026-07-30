@@ -2228,7 +2228,12 @@ class PersistentSession:
         if not self.workspace_manager:
             raise RuntimeError("No workspace manager to swap backend on")
 
-        old_backend = self.workspace_manager.backend
+        # The REAL backend, not the overlay: swap_backend() rebinds the overlay
+        # in place, so an overlay reference held across the swap would follow it
+        # onto the new backend.
+        from ..core.virtual_dirs import unwrap_backend
+
+        old_backend = unwrap_backend(self.workspace_manager.backend)
 
         # Connect new backend first (fail fast)
         if (
@@ -2245,8 +2250,11 @@ class PersistentSession:
             except Exception as e:
                 logger.warning(f"Old backend disconnect error: {e}")
 
-        # Swap on WorkspaceManager
-        self.workspace_manager._backend = new_backend
+        # Swap on WorkspaceManager. swap_backend() rebinds the virtual overlay
+        # onto the new backend and keeps the registered providers; assigning
+        # `_backend` directly unwraps the overlay and 404s every virtual path
+        # (docs/features/virtual_directories.md).
+        self.workspace_manager.swap_backend(new_backend)
 
         # Rebuild ShellManager with new backend
         self._setup_shell_manager()

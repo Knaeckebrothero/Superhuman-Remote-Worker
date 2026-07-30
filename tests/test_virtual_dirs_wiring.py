@@ -157,6 +157,62 @@ def test_probe_sees_a_genuinely_seeded_workspace(tmp_path):
     assert unwrap_backend(overlay).exists("task_brief.md")
 
 
+def test_swap_backend_keeps_the_overlay_in_front_of_the_new_backend(
+    tmp_path, monkeypatch
+):
+    """Regression: a workspace-tier upgrade must not destroy the overlay.
+
+    ``workspace_manager._backend = new_backend`` replaces the overlay with the
+    raw backend and leaves ``_virtual_overlay`` pointing at the old,
+    disconnected one — so after a virtual->sandbox upgrade every virtual path
+    404s, including the deferred-tool full docs that are the whole point of
+    ``defer_to_workspace``. Re-registering a provider cannot repair it: the
+    provider lands on an overlay nothing reads through any more.
+    """
+    ws = _manager(tmp_path, monkeypatch)
+    ws.register_virtual_provider(
+        ToolsProvider(lambda: [FakeTool("read_file", "Reads.")])
+    )
+
+    new_root = tmp_path / "upgraded"
+    new_root.mkdir()
+    new_backend = FilesystemTestBackend(new_root)
+    ws.swap_backend(new_backend)
+
+    assert ws.virtual_overlay is not None
+    assert ws.virtual_overlay.inner is new_backend
+    assert ws.backend is ws.virtual_overlay
+    # The already-registered provider still serves, with no re-registration.
+    assert "Reads." in ws.read_file("tools/read_file.md")
+    # ... and real reads land on the NEW backend.
+    (new_root / "notes.md").write_text("upgraded")
+    assert ws.read_file("notes.md") == "upgraded"
+
+
+def test_swap_backend_without_an_overlay_still_swaps(tmp_path, monkeypatch):
+    ws = _manager(tmp_path, monkeypatch, enabled="false")
+    new_backend = FilesystemTestBackend(tmp_path)
+    ws.swap_backend(new_backend)
+    assert ws.backend is new_backend
+
+
+def test_production_backend_swaps_go_through_swap_backend():
+    """Tripwire: no production site may assign ``_backend`` directly.
+
+    Both hot-swap sites (worker tier upgrade, session container->VM swap) used
+    to overwrite the private attribute, silently unwrapping the overlay. Every
+    other test in the suite passes with that bug present, so pin the call
+    sites.
+    """
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    for rel in ("src/agent.py", "src/api/persistent_session.py"):
+        source = (root / rel).read_text(encoding="utf-8")
+        assert "workspace_manager._backend = " not in source, rel
+        assert ".swap_backend(new_backend)" in source, rel
+
+
 def test_workspace_module_constructs_when_loaded_outside_its_package(tmp_path):
     """Regression: six test modules load workspace.py via spec_from_file_location.
 
