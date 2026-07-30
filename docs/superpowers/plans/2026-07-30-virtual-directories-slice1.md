@@ -375,11 +375,16 @@ git commit -m "feat(workspace): virtual overlay backend — provider contract an
 
 - [ ] **Step 1: Write the failing test**
 
+Add this import to the **existing import block at the top of the file** — not mid-file, which trips ruff `E402` and fails the blocking `main` lint gate:
+
+```python
+from src.core.workspace_backend import SEARCH_RESULT_HARD_CAP
+```
+
+Then append the test functions:
+
 ```python
 # append to tests/test_virtual_overlay.py
-from src.core.workspace_backend import SEARCH_RESULT_HARD_CAP
-
-
 def test_root_listing_merges_virtual_prefix(overlay, tmp_path):
     (tmp_path / "notes.md").write_text("hi")
     listing = overlay.list_dir("")
@@ -414,6 +419,17 @@ def test_search_inside_prefix_searches_provider_only(overlay, tmp_path):
     hits = overlay.search_files("Reads a file", path="tools")
     assert [h["path"] for h in hits] == ["tools/read_file.md"]
     assert hits[0]["line_number"] == 3
+
+
+def test_search_scoped_to_a_single_virtual_file(overlay):
+    # Naming one entry must search THAT entry, never its siblings.
+    hits = overlay.search_files("Reads a file", path="tools/read_file.md")
+    assert [h["path"] for h in hits] == ["tools/read_file.md"]
+    assert overlay.search_files("Available Tools", path="tools/read_file.md") == []
+
+
+def test_listing_below_a_virtual_entry_is_empty(overlay):
+    assert overlay.list_dir("tools/README.md") == []
 
 
 def test_root_search_merges_real_and_virtual(overlay, tmp_path):
@@ -503,8 +519,14 @@ Add to `src/core/backends/overlay.py` — extend the import line to `import fnma
     ) -> list:
         m = self._match(path)
         if m is not None:
-            provider, _ = m
+            provider, name = m
             hits = self._search_provider(provider, query, case_sensitive)
+            if name:
+                # A path naming one entry scopes the search to that entry —
+                # discarding `name` here would report hits under sibling files
+                # the caller never named.
+                target = f"{provider.prefix}/{name}" if provider.is_dir else name
+                hits = [hit for hit in hits if hit["path"] == target]
             return hits[:SEARCH_RESULT_HARD_CAP]
 
         results = list(
