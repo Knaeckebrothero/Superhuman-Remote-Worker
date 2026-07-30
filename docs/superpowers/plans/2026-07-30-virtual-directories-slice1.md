@@ -1818,9 +1818,13 @@ class ContactsProvider:
         fresh = self._cache is not None and (time.monotonic() - self._fetched_at) < self._ttl
         if fresh:
             return self._cache
+        # Stamp BEFORE the attempt so failures are throttled to the same TTL
+        # cadence as successes. Stamping only on success means that during an
+        # orchestrator outage every single read re-attempts the fetch and pays
+        # the full client timeout before falling back to stale content.
+        self._fetched_at = time.monotonic()
         try:
             self._cache = self._render(self._fetch() or [])
-            self._fetched_at = time.monotonic()
         except Exception as e:
             if self._cache is not None:
                 logger.warning("contacts fetch failed; serving stale cache: %s", e)
@@ -1870,7 +1874,20 @@ async def list_internal_contacts(
     return {"contacts": await db.get_project_contacts(project_id)}
 ```
 
-Register the route so it is reachable under the app's internal surface, following whatever prefix the existing `contacts` router uses. `get_project_contacts(project_id)` already exists from the contacts implementation; add `resolve_project_for_agent(job_id, thread_id)` to `orchestrator/database/postgres.py` as a single query returning `jobs.project_id` or `threads.project_id`.
+Register the route so it is reachable under the app's internal surface, following whatever prefix the existing `contacts` router uses. `get_project_contacts(project_id)` already exists from the contacts implementation; add `resolve_project_for_agent(job_id, thread_id)` to `orchestrator/database/postgres.py`.
+
+**Resolve a thread's project the way the runtime does — via `thread_mounts`, not `threads.project_id`.** A session's `project_ids` is built as `[m.source_ref for m in mounts if m.mount_kind == "project"]` (`orchestrator/main.py:23629`), and `postgres.py:6377` states `thread_mounts` "replaces the legacy `threads.metadata.project_ids` as source of truth for project attachment". `threads.project_id` is written only at thread creation (`postgres.py:6145`), so a thread that gained its project through a mount would resolve to NULL — the client-side guard would register `contacts/` while the endpoint returned `{"contacts": []}` forever, with no error. Query mounts first, fall back to the column:
+
+```sql
+-- thread branch
+SELECT source_ref FROM thread_mounts
+WHERE thread_id = $1 AND mount_kind = 'project' AND source_ref IS NOT NULL
+ORDER BY created_at
+LIMIT 1
+-- fall back to: SELECT project_id FROM threads WHERE id = $1
+```
+
+The job branch stays a plain `SELECT project_id FROM jobs WHERE id = $1`. Cover all of it with tests: job branch, thread-via-mount, thread-via-column fallback, and a malformed UUID returning `None` rather than raising.
 
 **3c.** Register the provider at both agent boot paths, next to the tools provider, using a **sync** `httpx` client (the backend API is synchronous; the async `OrchestratorClient` cannot be awaited from it):
 
