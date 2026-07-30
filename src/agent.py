@@ -3345,12 +3345,29 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                 parts.append(contract_block)
             return "".join(parts)
 
-        for provider in build_instruction_providers(
+        instruction_providers = build_instruction_providers(
             uploaded=_uploaded_instructions,
             template=_rendered_template,
             brief=_task_brief,
-        ):
+        )
+        for provider in instruction_providers:
             self._workspace_manager.register_virtual_provider(provider)
+
+        # Kill switch: with VIRTUAL_DIRS_ENABLED off there is no overlay, the
+        # registration above is a no-op, and the old write path is deleted — so
+        # instructions.md / task_brief.md would exist nowhere and graph.py's
+        # first HumanMessage (composed from both) would be empty. Materialize
+        # exactly those two so the switch is a genuine rollback rather than a
+        # way to start an agent that was never told its task. Seeding them also
+        # restores their re-assertion on SSH reconnect, as before the migration.
+        if self._workspace_manager.virtual_overlay is None:
+            from .core.virtual_dirs import materialize_single_file_providers
+
+            self._agent_seed_files.update(
+                materialize_single_file_providers(
+                    self._workspace_manager, instruction_providers
+                )
+            )
 
         # todo_guide is now the bundled "todo-guide" skill, bound via instruction_files
         # (before_tool:next_phase_todos) and materialized in the loop below — no matrix

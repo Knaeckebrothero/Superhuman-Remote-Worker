@@ -468,3 +468,66 @@ class TestReseedFromSnapshotIfFresh:
             is True
         )
         snapshot_mgr.recover_to_phase.assert_called_once()
+
+
+class TestKillSwitchMaterialization:
+    """VIRTUAL_DIRS_ENABLED=false must be a rollback, not an outage.
+
+    src/graph.py composes the job's FIRST HumanMessage from task_brief.md +
+    instructions.md. With the overlay off, register_virtual_provider() is a
+    no-op and the old write path is deleted, so both reads raised
+    FileNotFoundError and the agent started never having been told what its job
+    is. An emergency lever whose failure mode is "the agent forgets the task"
+    is not a safe lever, so the disabled path materializes exactly those two
+    files.
+    """
+
+    def _agent(self, tmp_path):
+        ws = WorkspaceManager(job_id="t", backend=RemoteLikeBackend(tmp_path))
+        agent = _bare_agent(ws)
+        agent._job_metadata = {
+            "instructions": "CUSTOM USER BRIEF",
+            "description": "Ship the thing",
+        }
+        return ws, agent
+
+    def test_instruction_files_are_real_when_the_switch_is_off(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("VIRTUAL_DIRS_ENABLED", "false")
+        ws, agent = self._agent(tmp_path)
+        assert ws.virtual_overlay is None
+
+        agent._deploy_instruction_files([])
+
+        assert ws.read_file("instructions.md") == "CUSTOM USER BRIEF"
+        assert "Ship the thing" in ws.read_file("task_brief.md")
+        # Real files on the real backend, not an overlay illusion.
+        assert (tmp_path / "instructions.md").exists()
+        assert (tmp_path / "task_brief.md").exists()
+
+    def test_materialized_files_are_re_asserted_on_reconnect(
+        self, tmp_path, monkeypatch
+    ):
+        """A re-provisioned pod loses them, so they must be seed files again."""
+        monkeypatch.setenv("VIRTUAL_DIRS_ENABLED", "false")
+        ws, agent = self._agent(tmp_path)
+
+        agent._deploy_instruction_files([])
+
+        assert set(agent._agent_seed_files) >= {"instructions.md", "task_brief.md"}
+
+    def test_nothing_is_materialized_when_the_overlay_is_on(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("VIRTUAL_DIRS_ENABLED", "true")
+        ws, agent = self._agent(tmp_path)
+        assert ws.virtual_overlay is not None
+
+        agent._deploy_instruction_files([])
+
+        # Served, never written — the whole point of the feature.
+        assert ws.read_file("instructions.md") == "CUSTOM USER BRIEF"
+        assert not (tmp_path / "instructions.md").exists()
+        assert not (tmp_path / "task_brief.md").exists()
+        assert "instructions.md" not in agent._agent_seed_files
