@@ -13,6 +13,7 @@ import sys
 from pathlib import Path
 from unittest.mock import MagicMock
 
+import httpx
 import pytest
 
 project_root = Path(__file__).parent.parent
@@ -607,3 +608,212 @@ async def test_get_session_context_reports_admin_as_unrestricted(monkeypatch):
     result = await get_context.ainvoke({})
 
     assert "admin (unrestricted)" in result
+
+
+# ---------------------------------------------------------------------------
+# Gitea-backed workspace reads
+#
+# get_job_workspace_file / list_job_workspace_files ride GET
+# /api/jobs/{id}/repo/* (committed state as of the worker's last
+# phase-boundary push), NOT the dead orchestrator-local /workspace/* routes.
+# The staleness header keeps the officer from reasoning on hours-old bytes
+# unknowingly, and a 404 must name what was searched instead of laundering
+# a wrong guess into "the worker delivered nothing".
+# ---------------------------------------------------------------------------
+
+_REPO_JOB_ID = "19707fa1-0000-4000-8000-000000000001"
+_HEAD_COMMIT = {
+    "sha": "abcdef1234567890",
+    "message": "phase 2 tactical complete\n\ndetails",
+    "author": "worker",
+    "date": "2026-07-30T09:00:00Z",
+}
+
+
+class _RepoClient(_CapturingClient):
+    """Serves /repo/file, /repo/contents, and /repo/commits."""
+
+    def __init__(
+        self,
+        *,
+        file_status=200,
+        content="line one\nline two",
+        entries=None,
+        commits_fail=False,
+    ):
+        super().__init__()
+        self.file_status = file_status
+        self.content = content
+        self.entries = entries if entries is not None else []
+        self.commits_fail = commits_fail
+
+    async def get(self, url, params=None, **kwargs):
+        self.gets.append((url, params or {}))
+        resp = MagicMock()
+        resp.raise_for_status = MagicMock()
+        if url.endswith("/repo/commits"):
+            if self.commits_fail:
+                raise httpx.RequestError("commits lookup down")
+            resp.json = MagicMock(
+                return_value={"total_commits": 1, "commits": [_HEAD_COMMIT]}
+            )
+        elif url.endswith("/repo/file"):
+            if self.file_status == 404:
+                err = MagicMock()
+                err.status_code = 404
+                resp.raise_for_status = MagicMock(
+                    side_effect=httpx.HTTPStatusError(
+                        "404", request=MagicMock(), response=err
+                    )
+                )
+            else:
+                resp.json = MagicMock(
+                    return_value={
+                        "path": (params or {}).get("path"),
+                        "content": self.content,
+                        "size": len(self.content),
+                    }
+                )
+        elif url.endswith("/repo/contents"):
+            resp.json = MagicMock(return_value=self.entries)
+        else:
+            resp.json = MagicMock(return_value=[])
+        return resp
+
+
+@pytest.mark.asyncio
+async def test_get_job_workspace_file_reads_repo_route_with_staleness_header(
+    monkeypatch,
+):
+    """The read must hit /repo/file (Gitea) and lead with the head commit so
+    the caller knows how fresh the bytes are."""
+    cap = _RepoClient()
+    monkeypatch.setattr("src.tools.orchestrator.jobs._get_client", lambda **kw: cap)
+    tools = create_orchestrator_tools(ToolContext(user_id="user-xyz"))
+    read = _tool_by_name(tools, "get_job_workspace_file")
+
+    result = await read.ainvoke({"job_id": _REPO_JOB_ID, "path": "plan.md"})
+
+    file_calls = [(u, p) for u, p in cap.gets if u.endswith("/repo/file")]
+    assert file_calls == [
+        (
+            f"http://localhost:8085/api/jobs/{_REPO_JOB_ID}/repo/file",
+            {"path": "plan.md"},
+        )
+    ]
+    commits_calls = [(u, p) for u, p in cap.gets if u.endswith("/repo/commits")]
+    assert commits_calls == [
+        (
+            f"http://localhost:8085/api/jobs/{_REPO_JOB_ID}/repo/commits",
+            {"limit": 1},
+        )
+    ]
+    assert result.startswith(
+        "[repo head: abcdef1 2026-07-30T09:00:00Z — phase 2 tactical complete]"
+    )
+    assert "=== plan.md ===" in result
+    assert "line one\nline two" in result
+
+
+@pytest.mark.asyncio
+async def test_get_job_workspace_file_passes_ref_and_names_it(monkeypatch):
+    """An explicit ref rides as a query param to both /repo/file and the
+    commits lookup, and the header names the ref instead of the branch head."""
+    cap = _RepoClient()
+    monkeypatch.setattr("src.tools.orchestrator.jobs._get_client", lambda **kw: cap)
+    tools = create_orchestrator_tools(ToolContext(user_id="user-xyz"))
+    read = _tool_by_name(tools, "get_job_workspace_file")
+
+    tag = "19707fa1-phase-2-tactical-complete"
+    result = await read.ainvoke({"job_id": _REPO_JOB_ID, "path": "plan.md", "ref": tag})
+
+    file_calls = [(u, p) for u, p in cap.gets if u.endswith("/repo/file")]
+    assert file_calls[0][1] == {"path": "plan.md", "ref": tag}
+    commits_calls = [(u, p) for u, p in cap.gets if u.endswith("/repo/commits")]
+    assert commits_calls[0][1] == {"limit": 1, "sha": tag}
+    assert result.startswith(f"[ref '{tag}': abcdef1")
+
+
+@pytest.mark.asyncio
+async def test_get_job_workspace_file_404_names_ref_and_suggests_lister(
+    monkeypatch,
+):
+    """The old message ('File not found') laundered the tool's own URL bug
+    into a worker-didn't-deliver narrative. Not-found must say what was
+    searched and point at the browse tool."""
+    cap = _RepoClient(file_status=404)
+    monkeypatch.setattr("src.tools.orchestrator.jobs._get_client", lambda **kw: cap)
+    tools = create_orchestrator_tools(ToolContext(user_id="user-xyz"))
+    read = _tool_by_name(tools, "get_job_workspace_file")
+
+    result = await read.ainvoke({"job_id": _REPO_JOB_ID, "path": "output/report.md"})
+
+    assert "'output/report.md' not found" in result
+    assert "the job branch head" in result
+    assert "list_job_workspace_files" in result
+
+    result = await read.ainvoke(
+        {"job_id": _REPO_JOB_ID, "path": "output/report.md", "ref": "some-tag"}
+    )
+
+    assert "ref 'some-tag'" in result
+    assert "list_job_workspace_files" in result
+
+
+@pytest.mark.asyncio
+async def test_get_job_workspace_file_survives_commits_failure(monkeypatch):
+    """The staleness header is best-effort: a dead commits lookup must not
+    block the file read itself."""
+    cap = _RepoClient(commits_fail=True)
+    monkeypatch.setattr("src.tools.orchestrator.jobs._get_client", lambda **kw: cap)
+    tools = create_orchestrator_tools(ToolContext(user_id="user-xyz"))
+    read = _tool_by_name(tools, "get_job_workspace_file")
+
+    result = await read.ainvoke({"job_id": _REPO_JOB_ID, "path": "plan.md"})
+
+    assert result.startswith("=== plan.md ===")
+    assert "line one\nline two" in result
+
+
+@pytest.mark.asyncio
+async def test_list_job_workspace_files_lists_directory(monkeypatch):
+    """The lister exists so the officer can browse instead of guessing
+    filenames into 404s; dirs first, sizes when known, same header."""
+    entries = [
+        {"name": "plan.md", "path": "plan.md", "type": "file", "size": 1532},
+        {"name": "notes", "path": "notes", "type": "dir", "size": 0},
+    ]
+    cap = _RepoClient(entries=entries)
+    monkeypatch.setattr("src.tools.orchestrator.jobs._get_client", lambda **kw: cap)
+    tools = create_orchestrator_tools(ToolContext(user_id="user-xyz"))
+    lister = _tool_by_name(tools, "list_job_workspace_files")
+
+    result = await lister.ainvoke({"job_id": _REPO_JOB_ID})
+
+    contents_calls = [(u, p) for u, p in cap.gets if u.endswith("/repo/contents")]
+    assert contents_calls == [
+        (
+            f"http://localhost:8085/api/jobs/{_REPO_JOB_ID}/repo/contents",
+            {"path": ""},
+        )
+    ]
+    assert result.startswith("[repo head: abcdef1")
+    assert "Contents of '/' (2 entries):" in result
+    assert "\n  notes/\n" in result
+    assert "plan.md (1532 bytes)" in result
+
+
+@pytest.mark.asyncio
+async def test_list_job_workspace_files_passes_path_and_ref(monkeypatch):
+    cap = _RepoClient(entries=[])
+    monkeypatch.setattr("src.tools.orchestrator.jobs._get_client", lambda **kw: cap)
+    tools = create_orchestrator_tools(ToolContext(user_id="user-xyz"))
+    lister = _tool_by_name(tools, "list_job_workspace_files")
+
+    result = await lister.ainvoke(
+        {"job_id": _REPO_JOB_ID, "path": "notes", "ref": "tag-1"}
+    )
+
+    contents_calls = [(u, p) for u, p in cap.gets if u.endswith("/repo/contents")]
+    assert contents_calls[0][1] == {"path": "notes", "ref": "tag-1"}
+    assert "Directory 'notes' is empty." in result

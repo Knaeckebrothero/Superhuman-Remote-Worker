@@ -66,6 +66,7 @@ export const SESSION_TOOL_GROUP_NAMES: Record<string, string[]> = {
     'list_worker_jobs',
     'get_worker_job',
     'get_job_workspace_file',
+    'list_job_workspace_files',
     'approve_worker_job',
     'resume_worker_job',
     'cancel_worker_job',

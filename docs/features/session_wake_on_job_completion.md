@@ -620,7 +620,7 @@ output lives." Ours is the singular version of it.
 - Task: Explore a warm-neutral theme for the marketing site
 - Summary: <freeze_data.summary, truncated ~500 chars>
 - Confidence: 85%
-- Outputs: 4 deliverables — read them with get_worker_job / get_job_workspace_file
+- Outputs: 4 deliverables — get_worker_job for the summary; list_job_workspace_files / get_job_workspace_file for the job repo's files (committed state as of the worker's last push — mid-phase work is not visible; pass ref for a phase tag)
 
 Your outstanding jobs: 1 of 3 finished — 1 still running, 1 failed.
 
@@ -670,8 +670,10 @@ costs nothing for sessions without the Fleet Management group.
 ```
 <scheduled_work>
 Jobs you create with create_worker_job run asynchronously; you are told when each
-one finishes. On each notice, decide: inspect the result now (get_worker_job,
-get_job_workspace_file) or note it and continue. Speak to the user only when a
+one finishes. On each notice, decide: inspect the result now (get_worker_job for
+the summary; list_job_workspace_files / get_job_workspace_file for files the
+worker pushed — committed state as of its last phase-boundary push) or note it
+and continue. Speak to the user only when a
 result changes the plan or a job failed — do not narrate every completion of a
 fan-out. If an early result shows the batch is heading the wrong way, cancel the
 siblings with cancel_worker_job rather than letting them spend.

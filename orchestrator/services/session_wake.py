@@ -588,15 +588,16 @@ async def _format_wake_message(db: Any, row: dict[str, Any], thread_id: str) -> 
     if confidence is not None:
         lines.append(f"- Confidence: {confidence}")
     deliverables = freeze.get("deliverables")
+    read_hint = (
+        "get_worker_job for the summary; list_job_workspace_files / "
+        "get_job_workspace_file for the job repo's files (committed state as "
+        "of the worker's last push — mid-phase work is not visible; pass ref "
+        "for a phase tag)"
+    )
     if isinstance(deliverables, list) and deliverables:
-        lines.append(
-            f"- Outputs: {len(deliverables)} deliverables — read them with "
-            "get_worker_job / get_job_workspace_file"
-        )
+        lines.append(f"- Outputs: {len(deliverables)} deliverables — {read_hint}")
     else:
-        lines.append(
-            "- Outputs: read them with get_worker_job / get_job_workspace_file"
-        )
+        lines.append(f"- Outputs: {read_hint}")
 
     error = (row.get("error_message") or "").strip()
     if error and status in ("failed", "cancelled"):

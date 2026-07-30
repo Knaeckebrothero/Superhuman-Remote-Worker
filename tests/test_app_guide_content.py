@@ -605,6 +605,7 @@ def test_every_selectable_live_fleet_tool_has_an_explicit_guide_topic():
             "list_worker_jobs",
             "get_worker_job",
             "get_job_workspace_file",
+            "list_job_workspace_files",
             "approve_worker_job",
             "resume_worker_job",
             "cancel_worker_job",
