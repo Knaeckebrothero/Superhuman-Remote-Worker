@@ -8,7 +8,7 @@ Run via subagent-driven development (fresh implementer per task, task-scoped rev
 
 | Task | State | Commits |
 |---|---|---|
-| 1 · Migration + backfill | ✅ Shipped — **numbered `0075`, not `0072`** (0072–0074 were taken by concurrent work) | `a5d9605c` |
+| 1 · Migration + backfill | ✅ Shipped as **`0076_contacts_normalize.sql`** — the plan said 0072, it landed as 0075, then had to move to 0076 when a concurrent session's `0075_project_loop_officer_scheduling.sql` landed and was already applied on dev. `discover()` in `migrate.py` raises on duplicate prefixes, so a duplicate takes the whole runner down at boot — **always re-check the free number immediately before pushing, not just before writing** | `a5d9605c`, renumbered in `6b6cff77` |
 | 2 · DB layer | ✅ Shipped (1 fix round: primary-promotion race → clean duplicate result) | `0154ff34`, `8560093c` |
 | 3 · Contacts router | ✅ Shipped (1 fix round: 409 rollback, test gaps, tuple-extraction lock) | `bd8adcc4`, `62750597` |
 | 4 · Send rewire + retirement | ✅ Shipped (1 fix round: find-or-create 409 rollback) | `60c7d177`, `4bdb8ed7` |
