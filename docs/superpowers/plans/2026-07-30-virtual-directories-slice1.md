@@ -1511,12 +1511,14 @@ def test_error_when_the_fetch_fails_with_a_cold_cache():
         ContactsProvider(fetch).entries()
 ```
 
+Note the house import style: `tests/conftest.py` puts `orchestrator/` on `sys.path`, so router tests import `from routers import ...` (see `tests/test_contacts_api.py`), never `from orchestrator.routers import ...`.
+
 ```python
 # tests/test_contacts_internal_endpoint.py
 import pytest
 from fastapi import HTTPException
 
-from orchestrator.routers import contacts as contacts_router
+from routers import contacts as contacts_router
 
 
 @pytest.mark.asyncio
@@ -1632,7 +1634,7 @@ class ContactsProvider:
 
 Export it from `src/core/virtual_dirs/__init__.py` (import + `__all__`).
 
-**3b.** Add the internal endpoint to `orchestrator/routers/contacts.py` (import `require_internal` from `orchestrator/security/access.py` alongside the existing guards):
+**3b.** Add the internal endpoint to `orchestrator/routers/contacts.py`. The module already imports its guards as `from security.access import require_project_member` (orchestrator's own root is on `sys.path`) — add `require_internal` to that import. The DB handle comes from the module's `_get_db()` helper, **not** a module-level `postgres_db`. The router's prefix is `/api/contacts`, so declare this route **above** the parameterized routes:
 
 ```python
 @router.get("/internal/list")
@@ -1652,12 +1654,13 @@ async def list_internal_contacts(
         raise HTTPException(
             status_code=400, detail="Provide exactly one of job_id or thread_id"
         )
-    project_id = await postgres_db.resolve_project_for_agent(
+    db = _get_db()
+    project_id = await db.resolve_project_for_agent(
         job_id=job_id, thread_id=thread_id
     )
     if not project_id:
         return {"contacts": []}
-    return {"contacts": await postgres_db.get_project_contacts(project_id)}
+    return {"contacts": await db.get_project_contacts(project_id)}
 ```
 
 Register the route so it is reachable under the app's internal surface, following whatever prefix the existing `contacts` router uses. `get_project_contacts(project_id)` already exists from the contacts implementation; add `resolve_project_for_agent(job_id, thread_id)` to `orchestrator/database/postgres.py` as a single query returning `jobs.project_id` or `threads.project_id`.
