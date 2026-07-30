@@ -11,8 +11,10 @@ tags:
 
 # LLM retry/fallback is reimplemented at every call site — two sites have none, one misfires, four backoff schedules disagree
 
-**Status:** DIAGNOSED 2026-07-29, UNBUILT. Design agreed (mechanism/disposition
-split, see "Proposed shape"); no code written.
+**Status:** RESOLVED 2026-07-30. Steps 1–3 shipped, pushed, and verified in the
+agent image on the k3d cluster (`1f8fa194`, `f0cd0e0b`, and — bundled into a
+Tilt fix — `4333781d`). Every finding below is closed. Step 4 was **reassessed
+and dropped** (see "Migration order"); step 5 remains optional and unstarted.
 **Severity:** medium-high — one confirmed live job damaged
 (`37c418d2`, 2026-07-28), a standing cost leak on every auxiliary blip, and a
 false-positive health signal on the aux heartbeat. Nothing is currently
@@ -224,13 +226,83 @@ retry manager doing double duty. A real `RetryPolicy` retires that.
    Finding 1. Bound to ~2 attempts so it stays inside
    `delegation.light.timeout_seconds: 240`. Also fix Finding 1b — stop
    labelling failures `[subagent done]`. Proves the purity constraint holds.
-4. **`summarizer.py` + `extraction_engine.py`.** Straight swaps of an identical
-   `(5.0, 15.0)` / max-3 loop for the shared one.
+
+   **DONE** (`4333781d`). `_READER_RETRY` = 2 attempts / 1 s, `transient` +
+   `auth_unavailable` only. Two things that were not obvious going in:
+
+   - `_remaining()` must be re-read **inside** the retried callable. Captured
+     once, a retry reuses the first attempt's budget and the reader outlives
+     its deadline — which is exactly what gets a whole fan-out discarded by the
+     delegation batch watchdog that
+     `spawn_subagent_fanout_trips_delegation_batch_watchdog.md` exists to
+     satisfy. Self-correcting once re-read: if a retry's backoff overshoots,
+     the next `wait_for` gets a non-positive timeout, raises, and escapes to
+     synthesis, so the deadline still wins without a separate guard.
+   - `asyncio.TimeoutError` **must** be in `never_retry`. In this harness the
+     timeout *is* the wall-clock deadline and the caller catches it to force a
+     partial-result synthesis; retrying it would silently break that contract
+     and no existing test covered it. `tests/test_light_subagent.py` now
+     asserts exactly 2 LLM calls on that path — a third means the deadline is
+     being treated as a transient blip.
+
+   Verified in-pod on the real Tilt-built agent image by replaying the exact
+   408 from job `37c418d2`: the reader retries and returns its finding.
+
+4. **`summarizer.py` + `extraction_engine.py` — REASSESSED AND DROPPED.**
+   The original framing ("straight swaps of an identical `(5.0, 15.0)` / max-3
+   loop") was wrong. Those loops are **task-level retry, not transport retry**,
+   and collapsing them would either pollute `RetryPolicy` with disposition —
+   the exact mistake this document argues against — or be churn that
+   reintroduces double-retry.
+
+   Concretely, they do three things the shared mechanism cannot and should not:
+   they retry `_call_once`, which includes structured-output **parse and
+   recovery**, not just the provider call; their non-retryable gate
+   (`is_overflow_error`) covers `ValidationError` and `invalid_json_schema`,
+   parse concerns the transport classifier deliberately excludes; and they own
+   typed give-up semantics — `SummarizationFailed` so the caller degrades to
+   trimming, per-chunk *skip* for extraction — plus cockpit-visible
+   `_emit_progress(attempt=N)` events.
+
+   `retry_policy=NO_RETRY` at those two call sites is therefore the **correct
+   end state, not a stopgap**: one retry layer per path, with the layer that
+   owns the give-up semantics owning the loop. Step 2 proved the alternative
+   empirically — nesting doubled provider calls *and* hid the inner failure
+   from the outer layer's attempt accounting, so the cockpit showed attempt 1
+   twice instead of 1 then 2.
 5. **`graph.py` — optional, last, lowest priority.** It has ~1200 lines of
    error handling because it owns the richest disposition (freeze / pause /
    backoff / audit); the retry loop is a small part of that. Highest risk,
    lowest reward. Leave it consuming the shared classifier after step 1 and
    revisit only if it stops being the odd one out.
+
+## What the inventory looks like now
+
+| site | classify | retry loop | notes |
+|---|---|---|---|
+| `graph.py` worker execute | shared | own (step 5, optional) | owns freeze / pause+backoff / audit |
+| `persistent_graph.py` session | shared | own | imports normally now; lazy-import dodge gone |
+| `core/summarizer.py` fold | own parse gate | own, `NO_RETRY` below it | task-level by design |
+| `memory/extraction_engine.py` | own parse gate | own, `NO_RETRY` below it | task-level by design |
+| `services/auxiliary.py` | shared | shared (`_AUX_RETRY`) | retry now beneath the fallback, not replaced by it |
+| `delegation/light_runner.py` | shared | shared (`_READER_RETRY`) | was zero |
+
+Four backoff schedules became one shared mechanism plus two deliberate
+task-level loops that opt out explicitly. The two sites that had nothing now
+have retry.
+
+## Still open
+
+- **The parent-side 408 live confirmation is still owed.** The fix in
+  `docs/done/transient_408_stream_disconnect_misclassified_as_permanent.md`
+  wants a real 408 in the worker execute node auditing as
+  `classification: transient` with `attempts > 1`. Job `37c418d2` does **not**
+  discharge it — those 408s hit readers, which had no classifier at all at the
+  time.
+- **`_recover_via_raw_invoke`** (`auxiliary.py`) is still unretried.
+  Deliberate: it is a best-effort parse recovery that already degrades to
+  `None`, so a blip costs a recovery attempt rather than a result.
+- **Step 5 (`graph.py`)** unstarted and optional.
 
 ## Explicitly out of scope
 
