@@ -1,4 +1,7 @@
+import pytest
+
 from src.core.virtual_dirs import (
+    ContactsProvider,
     SingleFileProvider,
     ToolsProvider,
     build_instruction_providers,
@@ -134,3 +137,76 @@ def test_task_brief_is_served_from_the_callable():
 def test_instruction_providers_are_read_only():
     for provider in _providers().values():
         assert not provider.writable and not provider.is_dir
+
+
+CONTACTS = [
+    {
+        "display_name": "Anna Weber",
+        "notes": "Head of Operations.",
+        "addresses": [
+            {"channel": "email", "address": "anna@acme.de", "is_primary": True}
+        ],
+        "projects": [{"name": "Acme Website"}],
+    }
+]
+
+
+def test_contacts_entries_include_index_and_each_contact():
+    provider = ContactsProvider(lambda: CONTACTS)
+    assert set(provider.entries()) == {"README.md", "anna-weber.md"}
+
+
+def test_contact_file_carries_name_and_notes():
+    body = ContactsProvider(lambda: CONTACTS).read("anna-weber.md")
+    assert "Anna Weber" in body and "Head of Operations." in body
+
+
+def test_readme_lists_contacts():
+    assert "Anna Weber" in ContactsProvider(lambda: CONTACTS).read("README.md")
+
+
+def test_slug_collisions_are_deterministic():
+    duplicates = [dict(CONTACTS[0]), dict(CONTACTS[0])]
+    names = set(ContactsProvider(lambda: duplicates).entries())
+    assert {"anna-weber.md", "anna-weber-2.md"} <= names
+
+
+def test_empty_project_renders_an_empty_index():
+    provider = ContactsProvider(lambda: [])
+    assert set(provider.entries()) == {"README.md"}
+    assert "no contacts" in provider.read("README.md").lower()
+
+
+def test_fetch_happens_once_per_ttl_window():
+    calls = []
+
+    def fetch():
+        calls.append(1)
+        return CONTACTS
+
+    provider = ContactsProvider(fetch, ttl_seconds=3600)
+    provider.entries()
+    provider.read("anna-weber.md")
+    assert len(calls) == 1
+
+
+def test_stale_cache_is_served_when_the_fetch_fails():
+    state = {"fail": False}
+
+    def fetch():
+        if state["fail"]:
+            raise RuntimeError("orchestrator down")
+        return CONTACTS
+
+    provider = ContactsProvider(fetch, ttl_seconds=0)
+    assert provider.read("anna-weber.md")
+    state["fail"] = True
+    assert "Anna Weber" in provider.read("anna-weber.md")  # stale, not an error
+
+
+def test_error_when_the_fetch_fails_with_a_cold_cache():
+    def fetch():
+        raise RuntimeError("orchestrator down")
+
+    with pytest.raises(ValueError, match="temporarily unavailable"):
+        ContactsProvider(fetch).entries()
