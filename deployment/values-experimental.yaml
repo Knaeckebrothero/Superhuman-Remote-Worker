@@ -65,7 +65,7 @@ image:
   orchestrator:
     tag: sha-27a9c8a
   agent:
-    tag: sha-2c1f82f
+    tag: sha-18bbcae
   cockpit:
     tag: sha-04a6ba1
   mcp:
@@ -81,8 +81,8 @@ provenance:
       sourceRevision: 27a9c8aa6fc4cdb0a62e60cc23a4841f6eba8ea0
       releaseVersion: "0.0.0-dev.sha-27a9c8aa6fc4cdb0a62e60cc23a4841f6eba8ea0"
     agent:
-      sourceRevision: 2c1f82feaa78f51ea18f8ce22b37d5f9beb6ae82
-      releaseVersion: "0.0.0-dev.sha-2c1f82feaa78f51ea18f8ce22b37d5f9beb6ae82"
+      sourceRevision: 18bbcaef67ec882e1c6e6d74f8a78807692ec9db
+      releaseVersion: "0.0.0-dev.sha-18bbcaef67ec882e1c6e6d74f8a78807692ec9db"
     cockpit:
       sourceRevision: 04a6ba1d54416cc38694229167184a090da66f08
       releaseVersion: "0.0.0-dev.sha-04a6ba1d54416cc38694229167184a090da66f08"
