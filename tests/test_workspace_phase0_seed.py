@@ -1,9 +1,11 @@
 """Workspace seeding regressions: instructions clobber, job README, Phase 0 commit.
 
-Covers the remote-backend instructions.md clobber (user-provided instructions
-landed on the workspace, then _deploy_instruction_files overwrote them with
-the template because its guard called .exists() on a local Path for a path
-that only exists on the remote host), plus the Phase 0 seed behavior
+instructions.md is now a virtual file (docs/features/virtual_directories.md):
+TestInstructionsClobber verifies the provider's inline > upload > template
+precedence — the direct descendant of a real historical bug where
+_deploy_instruction_files's guard called .exists() on a local Path for a path
+that only ever exists on the remote host, unconditionally overwriting
+user-provided instructions with the template. Plus the Phase 0 seed behavior
 (README rewrite + seed commit).
 """
 
@@ -36,6 +38,8 @@ def _bare_agent(workspace_manager, config=None):
     agent = UniversalAgent.__new__(UniversalAgent)
     agent._workspace_manager = workspace_manager
     agent._agent_seed_files = {}
+    agent._job_metadata = None
+    agent._resolved_instructions_md = None
     agent.config = config or SimpleNamespace(
         llm=SimpleNamespace(model="test-model"),
         instruction_files=[],
@@ -45,12 +49,21 @@ def _bare_agent(workspace_manager, config=None):
 
 
 class TestInstructionsClobber:
-    """User-provided instructions.md must survive _deploy_instruction_files."""
+    """User-provided instructions win over the template.
+
+    instructions.md is virtual, so there is no exists()-probe left to fool —
+    _deploy_instruction_files unconditionally registers a provider whose
+    precedence (inline > upload > template) lives in
+    build_instruction_providers(). This is the regression test for the bug
+    that motivated the migration: a real .exists() probe on a local Path is
+    always False for a remote backend, so the old guard clobbered
+    user-provided instructions with the template on every remote job.
+    """
 
     def test_custom_instructions_survive_on_remote_backend(self, tmp_path):
         ws = WorkspaceManager(job_id="t", backend=RemoteLikeBackend(tmp_path))
-        ws.write_file("instructions.md", "CUSTOM USER BRIEF")
         agent = _bare_agent(ws)
+        agent._job_metadata = {"instructions": "CUSTOM USER BRIEF"}
 
         agent._deploy_instruction_files([])
 
@@ -69,6 +82,85 @@ class TestInstructionsClobber:
         agent._deploy_instruction_files([])
 
         assert ws.read_file("instructions.md") == "TEMPLATE"
+
+
+class TestResolveUploadedInstructions:
+    """_resolve_uploaded_instructions() — the eager async resolution that lets
+    a virtual instructions.md survive the resume paths in
+    _setup_job_workspace. A virtual file persists nothing between runs, so
+    the upload source (unlike inline, which is read live from metadata) must
+    be resolved before any of that function's early returns, not lazily
+    inside the provider — this is the unit-level half of that fix; the
+    call-site (top-of-function, before any branch) is covered by the full
+    existing _setup_job_workspace test suite passing unchanged.
+    """
+
+    @pytest.mark.asyncio
+    async def test_no_upload_id_returns_none_without_any_io(self):
+        agent = _bare_agent(MagicMock())
+        agent._download_upload_files = AsyncMock(
+            side_effect=AssertionError("must not attempt I/O without an upload id")
+        )
+
+        result = await agent._resolve_uploaded_instructions({"instructions": "INLINE"})
+
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_http_download_wins_when_available(self):
+        agent = _bare_agent(MagicMock())
+
+        async def fake_download(upload_id, dest_dir, job_logger):
+            (dest_dir / "instructions.md").write_text("FROM HTTP", encoding="utf-8")
+            return ["instructions.md"]
+
+        agent._download_upload_files = fake_download
+
+        result = await agent._resolve_uploaded_instructions(
+            {"instructions_upload_id": "up-1"}
+        )
+
+        assert result == "FROM HTTP"
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_local_uploads_dir_when_http_fails(
+        self, tmp_path, monkeypatch
+    ):
+        import src.core.workspace as workspace_module
+
+        monkeypatch.setattr(
+            workspace_module, "get_workspace_base_path", lambda: tmp_path
+        )
+        local_dir = tmp_path / "uploads" / "up-2"
+        local_dir.mkdir(parents=True)
+        (local_dir / "instructions.md").write_text("FROM LOCAL", encoding="utf-8")
+
+        agent = _bare_agent(MagicMock())
+        agent._download_upload_files = AsyncMock(return_value=None)  # HTTP unavailable
+
+        result = await agent._resolve_uploaded_instructions(
+            {"instructions_upload_id": "up-2"}
+        )
+
+        assert result == "FROM LOCAL"
+
+    @pytest.mark.asyncio
+    async def test_returns_none_when_upload_id_resolves_to_nothing(
+        self, tmp_path, monkeypatch
+    ):
+        import src.core.workspace as workspace_module
+
+        monkeypatch.setattr(
+            workspace_module, "get_workspace_base_path", lambda: tmp_path
+        )
+        agent = _bare_agent(MagicMock())
+        agent._download_upload_files = AsyncMock(return_value=None)
+
+        result = await agent._resolve_uploaded_instructions(
+            {"instructions_upload_id": "missing-upload"}
+        )
+
+        assert result is None
 
 
 class TestJobReadme:

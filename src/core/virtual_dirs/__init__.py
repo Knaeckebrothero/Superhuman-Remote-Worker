@@ -1,7 +1,7 @@
 """Virtual directory providers. See docs/features/virtual_directories.md."""
 
 import logging
-from typing import Any
+from typing import Any, Callable, Optional
 
 from .single_file import SingleFileProvider
 from .tools_provider import ToolsProvider
@@ -12,6 +12,33 @@ logger = logging.getLogger(__name__)
 # marker that a real tools/ directory is a leftover from materialization and
 # not a directory the user owns.
 _GENERATED_TOOLS_MARKER = "# Available Tools"
+
+
+def build_instruction_providers(
+    *,
+    uploaded: Callable[[], Optional[str]],
+    template: Callable[[], str],
+    brief: Callable[[], str],
+) -> list:
+    """Providers for instructions.md and task_brief.md.
+
+    Precedence for instructions.md is resolved here, in one place: an upload or
+    inline body from the job record wins; otherwise the rendered template. The
+    materialized version resolved this with exists() probes across three call
+    sites, which is how a remote-backend probe once clobbered user-provided
+    instructions with the template (src/agent.py, 2026-07 comment).
+    """
+
+    def _instructions() -> str:
+        body = uploaded()
+        if body and body.strip():
+            return body
+        return template()
+
+    return [
+        SingleFileProvider("instructions.md", _instructions),
+        SingleFileProvider("task_brief.md", brief),
+    ]
 
 
 def sweep_legacy_tools_dir(backend: Any) -> bool:
@@ -42,4 +69,9 @@ def sweep_legacy_tools_dir(backend: Any) -> bool:
         return False
 
 
-__all__ = ["SingleFileProvider", "ToolsProvider", "sweep_legacy_tools_dir"]
+__all__ = [
+    "SingleFileProvider",
+    "ToolsProvider",
+    "build_instruction_providers",
+    "sweep_legacy_tools_dir",
+]

@@ -32,6 +32,7 @@ from ..core.loader import (
     get_phase_system_prompt,
     get_project_root,
     load_auxiliary_prompt,
+    load_instructions,
     render_instruction_content,
     supports_parallel_tool_calls,
 )
@@ -1009,6 +1010,32 @@ class PersistentSession:
         # before the instruction-files guard since skills come from the frozen
         # blob (_resolved_skills), not the expert config dir.
         self._deploy_catalog_skill_files()
+
+        # instructions.md is virtual (docs/features/virtual_directories.md).
+        # Sessions have no job-record upload/inline source and no task brief
+        # (this method never wrote either as real files), so only the
+        # instructions provider is registered, template-only. tool_names is
+        # read live via self.tools since this method runs before tools load
+        # (_load_tools_for_backend runs later) — the closure sees the real
+        # list by the time the agent actually reads the file.
+        from ..core.virtual_dirs import build_instruction_providers
+
+        def _rendered_template() -> str:
+            content = load_instructions(self.config, model=self.config.llm.model)
+            tool_names = [t.name for t in self.tools] if self.tools else []
+            return render_instruction_content(content, tool_names)
+
+        instruction_providers = {
+            p.prefix: p
+            for p in build_instruction_providers(
+                uploaded=lambda: None,
+                template=_rendered_template,
+                brief=lambda: "",
+            )
+        }
+        self.workspace_manager.register_virtual_provider(
+            instruction_providers["instructions.md"]
+        )
 
         if not self.config.instruction_files:
             return
