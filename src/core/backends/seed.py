@@ -13,12 +13,87 @@ from __future__ import annotations
 
 import logging
 import posixpath
-from typing import TYPE_CHECKING, Dict, List
+from typing import TYPE_CHECKING, Any, Dict, List
+
+from .overlay import unwrap_backend
 
 if TYPE_CHECKING:
     from ..workspace_backend import WorkspaceBackend
 
 logger = logging.getLogger(__name__)
+
+
+# --------------------------------------------------------------------------
+# Seeded-content sentinel
+#
+# "Does this workspace still hold the content that was seeded for its job?"
+# used to be answered by probing for a real ``task_brief.md``. Virtual
+# directories removed that file's last writer (it is served, not written), so
+# the probe would answer "unseeded" forever — silently rewinding same-pod
+# resumes to the last phase boundary and letting a git-less resume fall through
+# to initialize()'s ``rm -rf``.
+#
+# A dedicated marker replaces it: purpose-named, not agent-facing (so it adds
+# no agent surface), and unaffected by Slice 2.
+# See docs/features/virtual_directories.md.
+# --------------------------------------------------------------------------
+
+SEEDED_MARKER = ".srw_seeded"
+
+# Workspaces seeded before SEEDED_MARKER existed carry a real task_brief.md
+# instead. Accepting it as evidence degrades toward the SAFE branch — no wipe,
+# no silent rewind — for workspaces already in flight when this shipped.
+_LEGACY_SEEDED_SENTINEL = "task_brief.md"
+
+# Fixed body, deliberately: a timestamp would re-dirty the file on every boot
+# and churn the workspace repo.
+_SEEDED_MARKER_BODY = (
+    "Superhuman Remote Worker seeded this workspace.\n"
+    "Framework marker — do not edit. See docs/features/virtual_directories.md.\n"
+)
+
+
+def mark_workspace_seeded(backend: Any) -> bool:
+    """Record that this workspace holds real seeded content. Never raises.
+
+    Written on the fresh-init path only — exactly where the old ``task_brief.md``
+    sentinel was written — so the marker means "this workspace was seeded for
+    this job", not "this process booted".
+
+    Returns:
+        True when the marker was written by this call.
+    """
+    real = unwrap_backend(backend)
+    try:
+        if real.exists(SEEDED_MARKER):
+            return False
+        real.write_file(SEEDED_MARKER, _SEEDED_MARKER_BODY)
+        logger.debug("Wrote seeded-workspace marker %s", SEEDED_MARKER)
+        return True
+    except Exception as e:  # a missing marker degrades safely; never block boot
+        logger.warning("Could not write seeded-workspace marker: %s", e)
+        return False
+
+
+def workspace_is_seeded(backend: Any) -> bool:
+    """True when this workspace still holds the content seeded for its job.
+
+    Always probes the REAL backend: virtual files always "exist", so probing
+    through the overlay would report every freshly wiped pod as seeded and skip
+    the re-seed.
+
+    A probe failure counts as "not found" for that name — the same fail-safe the
+    call sites used before — but the legacy sentinel is still consulted, so a
+    transient error on one name cannot on its own condemn a seeded workspace.
+    """
+    real = unwrap_backend(backend)
+    for name in (SEEDED_MARKER, _LEGACY_SEEDED_SENTINEL):
+        try:
+            if real.exists(name):
+                return True
+        except Exception as e:
+            logger.warning("Seeded-content probe for %r failed: %s", name, e)
+    return False
 
 
 def reseed_missing_files(
