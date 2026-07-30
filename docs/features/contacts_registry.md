@@ -11,6 +11,7 @@ aliases:
   - contacts page
 related:
   - "[[whatsapp_messaging_channel]]"
+  - "[[ms365_main_cloud_and_datasource]]"
   - "[[notify_user_tool]]"
   - "[[email_datasource]]"
   - "[[datasource_redesign]]"
@@ -239,7 +240,27 @@ ask her about cart abandonment before anyone else.
 
 ## Out of scope (v1)
 
-WhatsApp channel connector (credentials, adapter, webhook, `message_contact`) — this registry is its prerequisite · migrating the email-datasource recipient allowlist into contacts · `list_contacts` agent tool · per-contact grants · CSV/vCard import · orchestrator-MCP contact tools · contact avatars/dedup-merge UI · pagination.
+WhatsApp channel connector (credentials, adapter, webhook, `message_contact`) — this registry is its prerequisite · migrating the email-datasource recipient allowlist into contacts · `list_contacts` agent tool · per-contact grants · CSV/vCard import · cloud-directory sync and org-native channels (see §Future direction) · orchestrator-MCP contact tools · contact avatars/dedup-merge UI · pagination.
+
+## Future direction: cloud directory sync + org-native channels
+
+*Noted 2026-07-30 (user). Not designed, not scheduled — this is the shape of the next step once the registry stands, recorded so the schema decisions above are read with it in mind.*
+
+Every contact today is typed in by hand. But the organisations we serve already keep an address book, and this system already talks to it: `MainCloudBackend` (`orchestrator/services/cloud/base.py`) abstracts the main cloud, with `nextcloud.py` and `opencloud.py` shipped and `ms365.py` designed as Phase 5 ([[ms365_main_cloud_and_datasource]]). Nextcloud and Microsoft 365 both expose contacts; OpenCloud speaks LibreGraph, a deliberate subset of MS Graph, so a Graph-shaped contacts fetch would likely serve OpenCloud and M365 from close to one implementation, with CardDAV covering Nextcloud.
+
+Two payoffs, in order of value:
+
+1. **Directory import — the registry populates itself.** The friction this feature never removed is that a manager must register a dozen stakeholders before delegating anything. Syncing the org directory turns "add each executive" into "they're already there."
+2. **Org-native channels.** Once a contact carries a Teams identity or a Nextcloud user id, the agent can message colleagues where they already work — Teams chat via MS Graph, Nextcloud Talk via its OCS API — rather than only email and (later) WhatsApp. That is the "message everyone in the org" capability: same tool call, same registry, a different channel.
+
+Design notes for whoever picks this up — each is a real constraint in the schema above, not a detail to discover later:
+
+- **`contact_addresses.channel` is a `CHECK` enumeration** (`'email'`, `'whatsapp'`). Every new channel needs a migration to widen it. Consider whether that constraint should become a lookup table before the third channel lands.
+- **The channel seam already exists.** [[whatsapp_messaging_channel]] defines a `ChannelAdapter` protocol (`send_text`, `send_template`, `parse_webhook`, `verify_signature`, `is_available`). Teams and Talk are additional adapters behind it, not new architecture. Ship WhatsApp first so the protocol is proven against a hostile real-world API.
+- **Ownership doesn't fit a synced directory.** `contacts.owner_user_id` is per-user and uniqueness is per-owner — right for hand-entered contacts, wrong for an org directory that no single user owns. This needs a deliberate answer (tenant-owned rows, or a synced-scope concept) rather than an arbitrary owner.
+- **Synced rows need a provenance column and a conflict policy.** A `source` (`manual` / `cloud:<datasource_id>` / `idp`) plus a rule for what a re-sync may overwrite. Without it, the second sync silently reverts every local edit — the same hazard the phase-2 drop migration has to guard against.
+- **The IdP may be the better directory for *colleagues*.** Org membership is authoritative in Keycloak, not in a cloud address book; cloud contacts are authoritative for *external* people. Those are two different sources with two different trust levels, and conflating them would be a mistake.
+- **Consent and blast radius change character.** "Message everyone in the org" is exactly the capability the contact registry exists to bound. A synced directory of hundreds of people, reachable without per-message approval, deserves its own look at rate limits and at whether project-linking is still a sufficient control.
 
 ## Companion change to the WhatsApp spec
 

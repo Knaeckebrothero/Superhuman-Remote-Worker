@@ -1,8 +1,38 @@
 # Contacts Registry Implementation Plan
 
+> **EXECUTED 2026-07-30 — this plan is a historical record, not a to-do list.** Status below. Do not re-run tasks 1–8.
+
+## Execution status
+
+Run via subagent-driven development (fresh implementer per task, task-scoped review after each, whole-branch review at the end). All work is on `develop`, **unpushed**.
+
+| Task | State | Commits |
+|---|---|---|
+| 1 · Migration + backfill | ✅ Shipped — **numbered `0075`, not `0072`** (0072–0074 were taken by concurrent work) | `a5d9605c` |
+| 2 · DB layer | ✅ Shipped (1 fix round: primary-promotion race → clean duplicate result) | `0154ff34`, `8560093c` |
+| 3 · Contacts router | ✅ Shipped (1 fix round: 409 rollback, test gaps, tuple-extraction lock) | `bd8adcc4`, `62750597` |
+| 4 · Send rewire + retirement | ✅ Shipped (1 fix round: find-or-create 409 rollback) | `60c7d177`, `4bdb8ed7` |
+| 5 · `contact_files` | ✅ Shipped, **dormant** — retained as the [[virtual_directories]] ContactsProvider's renderer; no caller today | `17a23116` |
+| 6 · Materialization wiring | ⛔ **REVERTED** — superseded by the virtual-dirs ContactsProvider (user decision, same day). Shipped then reverted; `test_contacts_materialization.py` deleted | `7d419866`, `1978a431`, reverted by `91c9e4dd` |
+| 7 · Cockpit types + service | ✅ Shipped | `a8ae44b9` |
+| 8 · Cockpit `/contacts` page | ✅ Shipped (1 fix round: **critical** — form re-seeds via `linkedSignal`; a stale form could previously write contact A's data onto contact B and delete B's addresses) | `cf91f79b`, `dfb3ac5e` |
+| 9 · Live k3d gate | ❌ **NOT RUN** — cluster API unreachable from host; also needs a full tilt rebuild. Scope now smaller (no materialization to verify) | — |
+
+**Whole-branch review** (no Critical): 5 Important defects fixed in one wave — `add_contact_address` committed a primary demotion it should have rolled back; duplicate-address PATCH returned 200 with a null body; blank `display_name` was writable; non-owner Edit/Delete buttons wedged the confirm dialog permanently on 403; saved-address channel edits were silently dropped. Plus chip i18n and dialog labels. → `4ccab18c`
+
+**Deviations from this plan's text, all reviewed:** `require_project_member` returns `(user, project)` (plan assumed a bare user) → index-`[0]` extraction; the legacy delete endpoint was `/api/projects/{id}/contacts/{cid}` and never verified project membership → retired and split into unlink (editor) vs destroy (owner); `PostgresDB`, not `PostgresDatabase`; Cockpit used the house `ApiService.getProjects()` instead of the plan's inline HTTP fallback, and the confirm dialog needed an `[open]` binding the plan omitted entirely.
+
+**Known gap for future work:** this repo's vitest harness cannot drive signal `input()` values (no ngtsc transform in `vitest.config.ts`, no `test` architect target), so the Task-8 form regression is proven by a three-layer proxy rather than end-to-end. `@angular/build`'s unit-test runner is installed but unwired — worth its own task.
+
+**Owed:** the live gate (task 9), the phase-2 `external_contacts` drop migration (guard its sweep — see caution below), and the ContactsProvider agent surface.
+
+> **Phase-2 caution:** naively re-running task 1's backfill body in the drop migration would overwrite `display_name`s users have since edited in Cockpit and resurrect contacts whose backfilled address they deleted. `updated_at > created_at` is *not* a usable "was edited" discriminator, because task 1 backdates `created_at` while leaving `updated_at = NOW()`.
+
+---
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Cross-channel contact registry (email + whatsapp) replacing `external_contacts`: normalized schema + backfill, owner/editor-split API, agent discovery via materialized `contacts/<slug>.md` workspace files, and a `/contacts` Cockpit page.
+**Goal:** Cross-channel contact registry (email + whatsapp) replacing `external_contacts`: normalized schema + backfill, owner/editor-split API, agent discovery via materialized `contacts/<slug>.md` workspace files (⛔ superseded during execution — see task 6 above), and a `/contacts` Cockpit page.
 
 **Architecture:** Postgres migration adds `contacts` / `contact_addresses` / `project_contacts` (legacy table stays until a later drop migration). A new FastAPI router owns the CRUD + link endpoints; `send_agent_message` switches to a channel-aware `resolve_contact`. The orchestrator gathers project contacts into the resolved-config blob exactly like skills; agent + session runtimes write the files. Cockpit gets a lazy-loaded page (expandable read-only rows + one-at-a-time edit form).
 
