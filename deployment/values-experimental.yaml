@@ -63,32 +63,32 @@ global:
 # -----------------------------------------------------------------------------
 image:
   orchestrator:
-    tag: sha-711bf7a
+    tag: sha-576a15f
   agent:
-    tag: sha-711bf7a
+    tag: sha-576a15f
   cockpit:
-    tag: sha-9c92ed6
+    tag: sha-576a15f
   mcp:
-    tag: sha-5eb436e
+    tag: sha-576a15f
   workspace:
     tag: sha-5eb436e
 # Full deployment identities are updated alongside each independently rebuilt
 # image. Short image tags remain display/update handles only.
 provenance:
-  releaseVersion: "0.0.0-dev.sha-711bf7a0f8aa0f52f74329694959cdcfbb76914d"
+  releaseVersion: "0.0.0-dev.sha-576a15f4c66673bfeef7570060af6260fbafe518"
   components:
     orchestrator:
-      sourceRevision: 711bf7a0f8aa0f52f74329694959cdcfbb76914d
-      releaseVersion: "0.0.0-dev.sha-711bf7a0f8aa0f52f74329694959cdcfbb76914d"
+      sourceRevision: 576a15f4c66673bfeef7570060af6260fbafe518
+      releaseVersion: "0.0.0-dev.sha-576a15f4c66673bfeef7570060af6260fbafe518"
     agent:
-      sourceRevision: 711bf7a0f8aa0f52f74329694959cdcfbb76914d
-      releaseVersion: "0.0.0-dev.sha-711bf7a0f8aa0f52f74329694959cdcfbb76914d"
+      sourceRevision: 576a15f4c66673bfeef7570060af6260fbafe518
+      releaseVersion: "0.0.0-dev.sha-576a15f4c66673bfeef7570060af6260fbafe518"
     cockpit:
-      sourceRevision: 9c92ed6ebec442a8445fabb2b6177ebb50a7b6fb
-      releaseVersion: "0.0.0-dev.sha-9c92ed6ebec442a8445fabb2b6177ebb50a7b6fb"
+      sourceRevision: 576a15f4c66673bfeef7570060af6260fbafe518
+      releaseVersion: "0.0.0-dev.sha-576a15f4c66673bfeef7570060af6260fbafe518"
     mcp:
-      sourceRevision: 5eb436eb9181b3271aef223e89c8d87861d95b4c
-      releaseVersion: "0.0.0-dev.sha-5eb436eb9181b3271aef223e89c8d87861d95b4c"
+      sourceRevision: 576a15f4c66673bfeef7570060af6260fbafe518
+      releaseVersion: "0.0.0-dev.sha-576a15f4c66673bfeef7570060af6260fbafe518"
     workspace:
       sourceRevision: 5eb436eb9181b3271aef223e89c8d87861d95b4c
       releaseVersion: "0.0.0-dev.sha-5eb436eb9181b3271aef223e89c8d87861d95b4c"
