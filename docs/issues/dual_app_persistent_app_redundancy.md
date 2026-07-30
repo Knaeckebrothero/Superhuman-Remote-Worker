@@ -14,8 +14,8 @@ related:
 # Three agent API apps, one behavior contract — dual_app re-implements instead of composing
 
 **Status:** 🔴 **OPEN** — structural debt, filed for a deliberate later fix.
-Filed 2026-07-30 from the stale-Centurion-pod incident (fourth incident of
-this class; receipts below).
+Filed 2026-07-30 from the stale-Centurion-pod incident (receipts below — a
+fifth landed **hours after filing**, during the remediation of the first).
 
 ## The shape
 
@@ -79,6 +79,20 @@ incident. Four receipts:
    hand-ported to dual_app with a second test class purely to guard the
    port ([[officer_blind_reads_and_worker_bureaucracy]] P0-D). The port was
    necessary only because the handler exists twice.
+5. **Provisioner flavor — NetworkPolicy labels (hours after filing).** The
+   same duplication exists one layer down: `agent_provisioner` and
+   `persistent_provisioner` both build agent-pod manifests. The chart-label
+   block the DB NetworkPolicies require
+   (`app.kubernetes.io/{name,instance}` + `component=agent`) was added to
+   `agent_provisioner` — with a comment saying exactly why — but never to
+   `persistent_provisioner`. The manual bounce remediating receipt #1
+   forced the officer watchdog down the dedicated-pod path for the first
+   time, and the replacement crash-looped on asyncpg `ECONNREFUSED` to
+   `srw-postgres` (k3s netpol controller REJECTs). Masked until then
+   because the previous respawn had adopted a pool pod, whose labels were
+   right. Fixed same day (labels + `srw/build-sha` mirrored into
+   `persistent_provisioner`); the divergence surface therefore includes
+   the provisioner pair, not just the app modules.
 
 ## Cost
 

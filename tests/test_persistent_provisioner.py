@@ -244,6 +244,36 @@ class TestPodManifest:
         assert labels["srw/thread-id"] == "abc123def456-full-uuid"
         assert labels["srw/component"] == "persistent-agent"
 
+    def test_chart_labels_for_netpol_admission(self, monkeypatch):
+        """The Helm-rendered DB NetworkPolicies select
+        app.kubernetes.io/component=agent; without these labels the pod's
+        Postgres connections are REJECTED — the officer respawn crash-looped
+        on asyncpg ECONNREFUSED (2026-07-30)."""
+        monkeypatch.setenv("AGENT_LABEL_NAME", "srw-dev")
+        monkeypatch.setenv("AGENT_LABEL_INSTANCE", "srw-release")
+        labels = self._build()["metadata"]["labels"]
+        assert labels["app.kubernetes.io/name"] == "srw-dev"
+        assert labels["app.kubernetes.io/instance"] == "srw-release"
+        assert labels["app.kubernetes.io/component"] == "agent"
+
+    def test_chart_labels_absent_outside_chart(self, monkeypatch):
+        monkeypatch.delenv("AGENT_LABEL_NAME", raising=False)
+        monkeypatch.delenv("AGENT_LABEL_INSTANCE", raising=False)
+        labels = self._build()["metadata"]["labels"]
+        assert "app.kubernetes.io/name" not in labels
+        assert "app.kubernetes.io/instance" not in labels
+        assert "app.kubernetes.io/component" not in labels
+
+    def test_build_sha_label_from_image_tag(self, monkeypatch):
+        monkeypatch.setenv("PERSISTENT_AGENT_IMAGE", "ghcr.io/x/agent:sha-18bbcae")
+        labels = self._build()["metadata"]["labels"]
+        assert labels["srw/build-sha"] == "18bbcae"
+
+    def test_no_build_sha_label_for_unpinned_tag(self, monkeypatch):
+        monkeypatch.setenv("PERSISTENT_AGENT_IMAGE", "ghcr.io/x/agent:latest")
+        labels = self._build()["metadata"]["labels"]
+        assert "srw/build-sha" not in labels
+
     def test_restart_policy_never(self):
         m = self._build()
         assert m["spec"]["restartPolicy"] == "Never"
