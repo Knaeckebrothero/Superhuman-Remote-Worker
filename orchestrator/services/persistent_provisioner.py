@@ -65,6 +65,16 @@ class PersistentProvisioner:
             "PERSISTENT_AGENT_IMAGE",
             "ghcr.io/knaeckebrothero/superhuman-remote-worker-agent:latest",
         )
+        # Chart labels — without these the database NetworkPolicies (which
+        # match app.kubernetes.io/{name,instance} + component=agent) REJECT
+        # ingress from these pods: the officer respawn crash-looped on
+        # asyncpg ECONNREFUSED to srw-postgres until they were added
+        # (2026-07-30). Injected by the chart's orchestrator Deployment,
+        # same mechanism as agent_provisioner.
+        self._chart_label_name: str = os.environ.get("AGENT_LABEL_NAME", "").strip()
+        self._chart_label_instance: str = os.environ.get(
+            "AGENT_LABEL_INSTANCE", ""
+        ).strip()
         self._configmap_name: str = os.environ.get("AGENT_CONFIGMAP", "srw-config")
         self._secret_name: str = os.environ.get("AGENT_SECRET", "srw")
         self._ssh_secret_name: str = os.environ.get(
@@ -474,17 +484,31 @@ class PersistentProvisioner:
         Deployment.  Pod-specific overrides (AGENT_CONFIG, AGENT_PORT) are
         set via ``env``.
         """
+        labels = {
+            "app": "srw-persistent-agent",
+            "srw/thread-id": thread_id,
+            "srw/component": "persistent-agent",
+        }
+        # NetworkPolicy admission (see __init__): the Helm-rendered DB
+        # policies select component=agent specifically — "persistent-agent"
+        # does not match them.
+        if self._chart_label_name:
+            labels["app.kubernetes.io/name"] = self._chart_label_name
+        if self._chart_label_instance:
+            labels["app.kubernetes.io/instance"] = self._chart_label_instance
+        if self._chart_label_name or self._chart_label_instance:
+            labels["app.kubernetes.io/component"] = "agent"
+        # Build SHA — lets the lifecycle reconciler enumerate stale pods by
+        # selector, same convention as agent_provisioner.
+        if ":sha-" in self._agent_image:
+            labels["srw/build-sha"] = self._agent_image.rsplit(":sha-", 1)[-1]
         return {
             "apiVersion": "v1",
             "kind": "Pod",
             "metadata": {
                 "name": pod_name,
                 "namespace": self._namespace,
-                "labels": {
-                    "app": "srw-persistent-agent",
-                    "srw/thread-id": thread_id,
-                    "srw/component": "persistent-agent",
-                },
+                "labels": labels,
             },
             "spec": {
                 "restartPolicy": "Never",
