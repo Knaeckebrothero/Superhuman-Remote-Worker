@@ -217,6 +217,25 @@ class TestWatchdogHold:
         assert patch == {"officer": {"hold": None}}
 
 
+class TestReasoningLevelBridge:
+    """The create-path effort bridge (session-create rebuilds config_override
+    from validated fragments — an unbridged reasoning_level would be silently
+    dropped, the trap that once ate the officer block)."""
+
+    def test_accepts_known_levels(self):
+        for level in ("low", "medium", "high", "xhigh", "max", "none"):
+            assert main._validated_reasoning_level(level) == level
+
+    def test_normalizes_case_and_whitespace(self):
+        assert main._validated_reasoning_level("  XHigh ") == "xhigh"
+
+    def test_rejects_garbage(self):
+        from fastapi import HTTPException
+
+        with pytest.raises(HTTPException):
+            main._validated_reasoning_level("ultra")
+
+
 class TestOfficerSummaryEndpoint:
     @pytest.mark.asyncio
     async def test_summary_shape(self, monkeypatch):

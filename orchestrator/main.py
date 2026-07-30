@@ -3575,6 +3575,25 @@ def _validated_session_workspace_override(
     return ws
 
 
+# Reasoning-effort vocabulary accepted at session create. The superset across
+# families — the family capability clamps to what the chosen model actually
+# supports at attach (loader._clamp_reasoning_level), so over-asking degrades
+# gracefully; garbage fails loud here instead of being silently dropped.
+_SESSION_REASONING_LEVELS = frozenset({"none", "low", "medium", "high", "xhigh", "max"})
+
+
+def _validated_reasoning_level(value: Any) -> str:
+    level = str(value or "").strip().lower()
+    if level not in _SESSION_REASONING_LEVELS:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"reasoning_level must be one of {sorted(_SESSION_REASONING_LEVELS)}"
+            ),
+        )
+    return level
+
+
 _SESSION_OFFICER_OVERRIDE_KEYS = frozenset(
     {
         "enabled",
@@ -20718,6 +20737,9 @@ async def get_project_officer_summary(
             "model": ((metadata.get("config_override") or {}).get("llm") or {}).get(
                 "model"
             ),
+            "reasoning_level": (
+                (metadata.get("config_override") or {}).get("llm") or {}
+            ).get("reasoning_level"),
             "sleep_minutes": {
                 "min": officer_meta.get("sleep_min_minutes") or 5,
                 "max": officer_meta.get("sleep_max_minutes") or 60,
@@ -21949,6 +21971,15 @@ class ThreadCreateRequest(BaseModel):
         description="LLM model override (e.g. RedHatAI/gemma-4-31B-it-FP8-Dynamic)",
     )
     temperature: float | None = Field(None, description="Temperature override")
+    reasoning_level: str | None = Field(
+        None,
+        description=(
+            "Per-session reasoning-effort override (low|medium|high|xhigh|max|"
+            "none). Omit to inherit the account default, then the family "
+            "default. Clamped to the model family's supported levels at "
+            "attach (model_config_matrix.yaml)."
+        ),
+    )
     config_override: dict[str, Any] | None = Field(
         None,
         description=(
@@ -22211,6 +22242,14 @@ async def create_thread(
         if request_body.temperature is not None:
             config_override.setdefault("llm", {})["temperature"] = (
                 request_body.temperature
+            )
+        if request_body.reasoning_level:
+            # Same bridge as model/temperature — without it a requested effort
+            # would be silently dropped by this validated-fragments rebuild
+            # (the exact trap that once ate the officer block). Vocabulary
+            # check here; the family capability still clamps at attach.
+            config_override.setdefault("llm", {})["reasoning_level"] = (
+                _validated_reasoning_level(request_body.reasoning_level)
             )
         # The agent reads its permission mode from config.interactive.permission_mode
         # (src/api/persistent_session.py), NOT from the threads.permission_mode
