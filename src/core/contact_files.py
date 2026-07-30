@@ -5,10 +5,16 @@ job/session start (same lever as skills/). Frontmatter scalars are emitted via
 json.dumps — JSON is valid YAML flow syntax, so this needs no yaml dependency
 (this module is imported by the orchestrator image; keep it stdlib-only).
 
-Currently dormant: its boot-time caller was reverted in favour of a
-virtual-directory overlay (docs/features/virtual_directories.md). This module
-is retained as the designated renderer for that design's ContactsProvider,
-which will call it from a live, TTL-cached read path instead.
+The boot-time caller was reverted in favour of a virtual-directory overlay
+(docs/features/virtual_directories.md). ``ContactsProvider`` now serves the same
+content live, and it calls ``contact_slug`` + ``render_contact_md`` directly —
+those two are the live renderers and are covered by the provider's tests.
+
+``contacts_to_workspace_files`` is NOT on that path and has no caller anywhere
+in the tree: it bundles ``contacts/<slug>.md`` *paths* for the deleted
+write-at-boot lever, whereas the provider serves unprefixed entry names plus a
+README index it builds itself. It is kept as the reference bundler for a future
+caller that needs the file-path form; treat it as dormant, not as the seam.
 """
 
 from __future__ import annotations
