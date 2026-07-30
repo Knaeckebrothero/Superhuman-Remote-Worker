@@ -60,7 +60,7 @@ What survives a single-node loss *today*, assuming the failure isn't on the node
 | App (stateful) | Gitea | StatefulSet `replicas: 1` | ✗ | Workspace git server. Metadata DB is now **Postgres by default** (`srw-giteadb`); existing instances stay pinned to SQLite until migrated. Git objects always on the PVC. |
 | App (stateful) | giteadb | StatefulSet `replicas: 1` | ✗ | **New 2026-07-30.** Gitea's metadata Postgres. Same single-replica SPOF as the others — covered by the Priority 1 roadmap item. |
 | App | NATS | external 3-node hub (`nats.internal: false` default) | ✓ | **Coordination plane HA'd 2026-06** via BYO hub. In-chart NATS (internal mode) remains single-replica. |
-| App | Keycloak (server) | hardcoded `replicas: 1` | ✗ | DB-backed and HA-capable upstream (KC 26), **but the chart runs `start-dev`** (local-only caches) — prod-mode switch required before >1 replica. See checklist P2. |
+| App | Keycloak (server) | `keycloak.replicas` (default 1; **dev runs 2**) | ✓ at 2 | **HA since 2026-07-30** — production mode + Infinispan/`jdbc-ping` clustering + DB-persisted sessions. Verified zero auth downtime through a pod kill on dev. Its DB is still single-replica (P3). |
 | App | OpenCloud | hardcoded `replicas: 1` | ✗ | Single-writer by design (file locking). Accept SPOF. |
 | App | vm-controller | hardcoded `replicas: 1` | ✗ | Singleton by design (NATS consumer). |
 | Agent fleet | Worker agents | scaled by orchestrator | ✓ | Heartbeat + auto re-dispatch handles loss. |
@@ -252,15 +252,14 @@ Gitea is **not** resource-starved (98m CPU against a 2000m limit); the observed 
 
 SaaS-scale note: the first hard wall is **inodes, not CPU** — ~277 inodes/repo means 100k repos ≈ 28M inodes, which exhausts default ext4 before disk fills. That's a filesystem/provisioning decision for later, recorded here so it isn't rediscovered.
 
-### P2 — Keycloak production mode + `replicas: 2` (chart, small)
+### P2 — Keycloak production mode + `replicas: 2` — **DONE (2026-07-30)**
 
-Prerequisites are already in place: external Postgres (`keycloakdb`), prod-shaped hostname/proxy env (`KC_HOSTNAME`, `KC_PROXY_HEADERS=xforwarded`). KC 26 makes multi-replica cheap: user sessions persist to the DB by default (26.0+) and cluster discovery defaults to jdbc-ping through that same DB (26.1+) — **no new infra**.
+- [x] **`start-dev` → `start`.** Confirmed from the binary itself, not docs: dev mode pins `cache=local` and `hostname-strict=false` via *classpath* defaults, so a second replica was never going to share sessions. Production mode defaults to `cache=ispn` with the **`jdbc-ping`** discovery stack — peers found through the Keycloak database we already run, so **no headless Service, no DNS_PING, no new infra** — and KC 26 auto-enables mTLS between cluster members. Everything production mode requires was already configured (`KC_HOSTNAME`, `KC_HTTP_ENABLED`, `KC_PROXY_HEADERS`, Postgres). Note `--features` is build-time, so the first start after the switch re-augments the image (~40 s); the existing 300 s startupProbe budget covers it.
+- [x] **`keycloak.replicas` exposed**, default **1** — deliberately not 2: a fresh install runs `--import-realm` on every replica at once against an empty DB, and that concurrent-bootstrap path is untested. Existing installs have no import to race, so they opt in via their overlay. Same soak-on-dev-first pattern the orchestrator used for M1.
+- [x] **postStart concurrency verified.** Two pods running the kcadm hook simultaneously left the realm clean: 18 clients, no duplicate `cockpit-bff`, 7 users, zero kcadm warnings. The hook's operations are idempotent updates and its create-if-missing paths found the client present.
+- [x] **Live-verified on k3d then dev.** k3d at `replicas: 2`: both pods joined one cluster view (`ISPN000094`, 2 members), full browser login worked under `hostname-strict`, and a session **plus its Keycloak token refresh survived deleting both pods in turn** — including the one that served the login. Gitea SSO through the same realm still lands on its dashboard. Dev then took production mode at the chart default, came up clean (KC 26.2.5, realm intact, branded login page served correctly through Cloudflare + Traefik), and was opted into `replicas: 2`: 2-node cluster formed, and **deleting a pod produced zero auth downtime** (10/10 probes returned 200 through the kill) where previously that was a stack-wide auth outage.
 
-- [ ] Switch `start-dev` → `start` (`helm/templates/services/keycloak.yaml:616`) and re-verify realm behavior (dev mode currently also relaxes theme/hostname checks).
-- [ ] Verify the realm-import and postStart kcadm session-lifespan hooks are idempotent when two pods run them concurrently.
-- [ ] Expose `keycloak.replicas` as a chart value, default 2.
-
-Caveat: the availability win is partly gated on P3 — a 2-replica Keycloak on a 1-replica `keycloakdb` just moves the SPOF down one layer. Do P0 first; do this when convenient.
+Two things worth carrying forward: no NetworkPolicy selects the Keycloak *server* pods, so JGroups 7800 is unrestricted — which k3d could not have proven since k3s ships no policy enforcement by default. And the availability win is still partly gated on P3: a 2-replica Keycloak in front of a single-replica `keycloakdb` has moved the SPOF down one layer, not removed it. A PodDisruptionBudget for Keycloak is the obvious follow-up, but note the trap documented for the orchestrator — `minAvailable: 1` blocks all voluntary evictions at `replicas: 1`, so it has to be conditional on the replica count.
 
 ### P3 — Data tier HA (the remaining real SPOF)
 
