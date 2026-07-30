@@ -1037,6 +1037,18 @@ keycloak:
   # When false, fill in the externalIssuerUrl and externalInternalUrl fields below.
   internal: true
   image: quay.io/keycloak/keycloak:26.2
+  # -- Replica count for the bundled Keycloak. The pod runs in production mode
+  # (`start`), so >1 is correctness-safe without extra infrastructure: the
+  # Infinispan cluster discovers peers via `jdbc-ping` through the Keycloak
+  # database, and user sessions are persisted to that database rather than held
+  # in each pod's memory (KC 26.0+). No headless Service or DNS_PING required.
+  #
+  # Default stays 1 for the same reason the orchestrator's did before M1 soaked
+  # on dev: a FRESH install runs `--import-realm` on every replica at once
+  # against an empty database, and that concurrent-bootstrap path is untested
+  # here. Existing installs have no import to race, so opt them in via the
+  # deployment overlay (dev does this) and leave fresh installs at 1.
+  replicas: 1
   realm: "srw"
   # -- Public OIDC issuer URL (when internal=false, e.g. "https://login.microsoftonline.com/{tenant}/v2.0"
   # for Azure AD, or "https://accounts.google.com" for Google Workspace).
