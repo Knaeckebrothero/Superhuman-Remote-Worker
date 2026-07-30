@@ -163,14 +163,71 @@ def is_drain_requested() -> bool:
     return _drain_intent_received
 
 
+# Statuses that mean "this job is no longer ours to run". Deliberately a
+# DENY-list: an unrecognised or new status leaves the run alone (fail-open),
+# because wrongly stopping a healthy run is worse than a late stop, and the
+# push signal remains the fast path either way. Faithful port of the app.py
+# backstop — same statuses, same stop mechanism.
+_PREEMPTED_JOB_STATUSES = {
+    "failed": "cancel",
+    "cancelled": "cancel",
+    "paused": "pause",
+}
+
+
+def _check_job_preempted(response: Dict[str, Any]) -> None:
+    """Stop the run if the orchestrator says our job was taken away.
+
+    ``job_status`` in the heartbeat response is the DB status of the job
+    THIS pod reported as current (the orchestrator looks it up from
+    ``heartbeat.current_job_id``). When an out-of-band steer / cockpit
+    pause / cancel / manual flip moves the row to a denied status, no push
+    stop signal reaches the pod — without this backstop it runs to natural
+    END as an orphan, double-writing the shared checkpoint thread
+    (``thread_id = job_id``) against its replacement and pinning
+    single-slot pools at 'working'.
+
+    Reuses the exact machinery /job/cancel and /job/pause drive: the
+    streaming loop breaks after the current node and ``_complete_stop()``
+    resets the pod to IDLE. Idempotent — once ``_stop_requested`` is set,
+    further heartbeats no-op. The agent's own orderly completion can't
+    trip this: both completion paths null ``_current_job_id`` before
+    ``report_completion``, so by the time its own report flips the row the
+    current-job guard already blocks.
+    docs/issues/officer_blind_reads_and_worker_bureaucracy.md (P0-D)
+    """
+    job_id = _current_job_id
+    if _pod_state != PodState.WORKING or not job_id or _stop_requested.is_set():
+        return
+    if not isinstance(response, dict):
+        return
+    job_status = response.get("job_status")
+    reason = _PREEMPTED_JOB_STATUSES.get(job_status)
+    if reason is None:
+        # Includes job_status=None (older orchestrator, or the lookup failed) —
+        # degrade to the previous push-only behaviour rather than guessing.
+        return
+    logger.warning(
+        "Job %s is '%s' on the orchestrator but this agent is still running it "
+        "— stopping (reason=%s). The job was terminated out-of-band; work since "
+        "then was not attributable to it.",
+        job_id,
+        job_status,
+        reason,
+    )
+    _request_stop(reason)
+
+
 async def _handle_heartbeat_intents(response: Dict[str, Any]) -> None:
     """Heartbeat-response callback: react to orchestrator-set intents.
 
+    Runs the job-status preemption backstop first, then drain intents.
     Idle workers (``ready`` status, no job) exit immediately to free
     the slot for a fresh-version pod. Busy workers just record the
     intent — the graph reacts at its next safe boundary.
     """
     global _drain_intent_received, _drain_intent_handled
+    _check_job_preempted(response)
     intents = response.get("intents") or {}
     if not isinstance(intents, dict) or not intents.get("should_drain"):
         return
