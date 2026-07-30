@@ -101,7 +101,7 @@ class VirtualOverlayBackend:
             return None
         if not provider.is_dir:
             return (provider, p) if p == provider.prefix else (provider, "")
-        return provider, p[len(head):].lstrip("/")
+        return provider, p[len(head) :].lstrip("/")
 
     # --- provider calls, never allowed to crash the agent loop ------------
 
@@ -193,16 +193,16 @@ class VirtualOverlayBackend:
                 )
         return results
 
-    def _search_provider(
-        self, provider: Any, query: str, case_sensitive: bool
-    ) -> list:
+    def _search_provider(self, provider: Any, query: str, case_sensitive: bool) -> list:
         needle = query if case_sensitive else query.lower()
         hits = []
         for name in sorted(self._entries(provider)):
             try:
                 content = provider.read(name) or ""
             except Exception as e:
-                logger.warning("virtual search skipped %s/%s: %s", provider.prefix, name, e)
+                logger.warning(
+                    "virtual search skipped %s/%s: %s", provider.prefix, name, e
+                )
                 continue
             rel = f"{provider.prefix}/{name}" if provider.is_dir else name
             for lineno, line in enumerate(content.splitlines(), 1):
@@ -220,8 +220,14 @@ class VirtualOverlayBackend:
     ) -> list:
         m = self._match(path)
         if m is not None:
-            provider, _ = m
+            provider, name = m
             hits = self._search_provider(provider, query, case_sensitive)
+            if name:
+                # A path naming one entry scopes the search to that entry —
+                # discarding `name` here would report hits under sibling files
+                # the caller never named.
+                target = f"{provider.prefix}/{name}" if provider.is_dir else name
+                hits = [hit for hit in hits if hit["path"] == target]
             return hits[:SEARCH_RESULT_HARD_CAP]
 
         results = list(
@@ -231,9 +237,7 @@ class VirtualOverlayBackend:
             for provider in self._providers.values():
                 if exclude_dirs and provider.prefix in exclude_dirs:
                     continue
-                results.extend(
-                    self._search_provider(provider, query, case_sensitive)
-                )
+                results.extend(self._search_provider(provider, query, case_sensitive))
         return results[:SEARCH_RESULT_HARD_CAP]
 
     # --- delegation -------------------------------------------------------

@@ -1,6 +1,7 @@
 import pytest
 
 from src.core.backends.overlay import EntryMeta, VirtualOverlayBackend
+from src.core.workspace_backend import SEARCH_RESULT_HARD_CAP
 from tests._fs_backend import FilesystemTestBackend
 
 
@@ -12,10 +13,14 @@ class FakeProvider:
     writable = False
 
     def __init__(self, docs=None):
-        self.docs = docs if docs is not None else {
-            "README.md": "# Available Tools\n\n- read_file\n",
-            "read_file.md": "# read_file\n\nReads a file.\n",
-        }
+        self.docs = (
+            docs
+            if docs is not None
+            else {
+                "README.md": "# Available Tools\n\n- read_file\n",
+                "read_file.md": "# read_file\n\nReads a file.\n",
+            }
+        )
         self.read_calls = 0
 
     def entries(self):
@@ -105,9 +110,6 @@ def test_unknown_attributes_delegate_to_inner(overlay):
     assert overlay.root == overlay.inner.root
 
 
-from src.core.workspace_backend import SEARCH_RESULT_HARD_CAP
-
-
 def test_root_listing_merges_virtual_prefix(overlay, tmp_path):
     (tmp_path / "notes.md").write_text("hi")
     listing = overlay.list_dir("")
@@ -124,7 +126,10 @@ def test_root_listing_dedupes_real_leftover(overlay, tmp_path):
 def test_listing_inside_prefix_comes_from_provider(overlay, tmp_path):
     (tmp_path / "tools").mkdir()
     (tmp_path / "tools" / "stale.md").write_text("x")
-    assert sorted(overlay.list_dir("tools")) == ["tools/README.md", "tools/read_file.md"]
+    assert sorted(overlay.list_dir("tools")) == [
+        "tools/README.md",
+        "tools/read_file.md",
+    ]
 
 
 def test_listing_respects_pattern(overlay):
@@ -166,3 +171,14 @@ def test_search_respects_hard_cap(tmp_path):
     ov = VirtualOverlayBackend(FilesystemTestBackend(tmp_path))
     ov.register(Big())
     assert len(ov.search_files("needle")) == SEARCH_RESULT_HARD_CAP
+
+
+def test_search_scoped_to_a_single_virtual_file(overlay):
+    # Naming one entry must search THAT entry, never its siblings.
+    hits = overlay.search_files("Reads a file", path="tools/read_file.md")
+    assert [h["path"] for h in hits] == ["tools/read_file.md"]
+    assert overlay.search_files("Available Tools", path="tools/read_file.md") == []
+
+
+def test_listing_below_a_virtual_entry_is_empty(overlay):
+    assert overlay.list_dir("tools/README.md") == []
