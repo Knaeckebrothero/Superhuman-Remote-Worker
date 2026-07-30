@@ -11,10 +11,13 @@ No isinstance checks target backend types in the codebase, so this is safe.
 See docs/features/virtual_directories.md.
 """
 
+import fnmatch
 import logging
 import posixpath
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Protocol, Tuple
+
+from ..workspace_backend import SEARCH_RESULT_HARD_CAP
 
 logger = logging.getLogger(__name__)
 
@@ -163,6 +166,75 @@ class VirtualOverlayBackend:
         # Contract (workspace_backend.py:448): 0 for a missing path, never an
         # exception. Both real backends honour it; virtual paths must too.
         return meta.size if meta is not None else 0
+
+    def list_dir(self, path: str = "", pattern: str = "*") -> list:
+        m = self._match(path)
+        if m is not None:
+            provider, name = m
+            if name or not provider.is_dir:
+                return []  # flat: nothing lives below a virtual entry
+            return [
+                f"{provider.prefix}/{n}"
+                for n in sorted(self._entries(provider))
+                if fnmatch.fnmatch(n, pattern)
+            ]
+
+        results = list(self._inner.list_dir(path, pattern))
+        if self._normalize(path):
+            return results  # only the workspace root gains virtual entries
+
+        seen = {r.rstrip("/") for r in results}
+        for provider in self._providers.values():
+            if provider.prefix in seen:
+                continue
+            if fnmatch.fnmatch(provider.prefix, pattern):
+                results.append(
+                    f"{provider.prefix}/" if provider.is_dir else provider.prefix
+                )
+        return results
+
+    def _search_provider(
+        self, provider: Any, query: str, case_sensitive: bool
+    ) -> list:
+        needle = query if case_sensitive else query.lower()
+        hits = []
+        for name in sorted(self._entries(provider)):
+            try:
+                content = provider.read(name) or ""
+            except Exception as e:
+                logger.warning("virtual search skipped %s/%s: %s", provider.prefix, name, e)
+                continue
+            rel = f"{provider.prefix}/{name}" if provider.is_dir else name
+            for lineno, line in enumerate(content.splitlines(), 1):
+                haystack = line if case_sensitive else line.lower()
+                if needle in haystack:
+                    hits.append({"path": rel, "line_number": lineno, "line": line})
+        return hits
+
+    def search_files(
+        self,
+        query: str,
+        path: str = "",
+        case_sensitive: bool = False,
+        exclude_dirs: Optional[list] = None,
+    ) -> list:
+        m = self._match(path)
+        if m is not None:
+            provider, _ = m
+            hits = self._search_provider(provider, query, case_sensitive)
+            return hits[:SEARCH_RESULT_HARD_CAP]
+
+        results = list(
+            self._inner.search_files(query, path, case_sensitive, exclude_dirs)
+        )
+        if not self._normalize(path):
+            for provider in self._providers.values():
+                if exclude_dirs and provider.prefix in exclude_dirs:
+                    continue
+                results.extend(
+                    self._search_provider(provider, query, case_sensitive)
+                )
+        return results[:SEARCH_RESULT_HARD_CAP]
 
     # --- delegation -------------------------------------------------------
 

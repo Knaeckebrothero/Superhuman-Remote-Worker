@@ -103,3 +103,66 @@ def test_provider_failure_surfaces_readable_error(tmp_path):
 
 def test_unknown_attributes_delegate_to_inner(overlay):
     assert overlay.root == overlay.inner.root
+
+
+from src.core.workspace_backend import SEARCH_RESULT_HARD_CAP
+
+
+def test_root_listing_merges_virtual_prefix(overlay, tmp_path):
+    (tmp_path / "notes.md").write_text("hi")
+    listing = overlay.list_dir("")
+    assert "notes.md" in listing
+    assert "tools/" in listing
+
+
+def test_root_listing_dedupes_real_leftover(overlay, tmp_path):
+    (tmp_path / "tools").mkdir()
+    (tmp_path / "tools" / "stale.md").write_text("x")
+    assert overlay.list_dir("").count("tools/") == 1
+
+
+def test_listing_inside_prefix_comes_from_provider(overlay, tmp_path):
+    (tmp_path / "tools").mkdir()
+    (tmp_path / "tools" / "stale.md").write_text("x")
+    assert sorted(overlay.list_dir("tools")) == ["tools/README.md", "tools/read_file.md"]
+
+
+def test_listing_respects_pattern(overlay):
+    assert overlay.list_dir("tools", "READ*") == ["tools/README.md"]
+
+
+def test_nonroot_listing_gets_no_virtual_entries(overlay, tmp_path):
+    (tmp_path / "sub").mkdir()
+    assert overlay.list_dir("sub") == []
+
+
+def test_search_inside_prefix_searches_provider_only(overlay, tmp_path):
+    (tmp_path / "tools").mkdir()
+    (tmp_path / "tools" / "stale.md").write_text("Reads a file.")
+    hits = overlay.search_files("Reads a file", path="tools")
+    assert [h["path"] for h in hits] == ["tools/read_file.md"]
+    assert hits[0]["line_number"] == 3
+
+
+def test_root_search_merges_real_and_virtual(overlay, tmp_path):
+    (tmp_path / "notes.md").write_text("read_file is handy\n")
+    paths = {h["path"] for h in overlay.search_files("read_file")}
+    assert "notes.md" in paths
+    assert "tools/README.md" in paths
+
+
+def test_search_is_case_insensitive_by_default(overlay):
+    assert overlay.search_files("READS A FILE")
+    assert not overlay.search_files("READS A FILE", case_sensitive=True)
+
+
+def test_search_respects_hard_cap(tmp_path):
+    body = "\n".join(["needle"] * (SEARCH_RESULT_HARD_CAP + 50))
+
+    class Big(FakeProvider):
+        def __init__(self):
+            super().__init__({"big.md": body})
+
+    ov = VirtualOverlayBackend(FilesystemTestBackend(tmp_path))
+    ov.register(Big())
+    assert len(ov.search_files("needle")) == SEARCH_RESULT_HARD_CAP
