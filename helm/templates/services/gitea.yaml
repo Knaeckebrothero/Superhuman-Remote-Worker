@@ -69,8 +69,32 @@ spec:
                 echo "No SQLite database present — fresh Postgres install, proceeding."
                 exit 0
               fi
+              # Separate "cannot reach/authenticate" from "reachable but empty"
+              # BEFORE counting users. Both make the count come back blank, but
+              # the remedies are unrelated — reporting an un-migrated database
+              # when the real fault is a missing GITEA_DB_PASSWORD (the common
+              # first-run failure on ESO/Vault clusters, where the chart cannot
+              # generate one) sends operators after a migration problem that
+              # does not exist.
+              if ! CONN_ERR=$(psql -tAc 'SELECT 1' 2>&1 >/dev/null); then
+                cat >&2 <<EOF
+              ============================================================
+              REFUSING TO START: cannot reach the Gitea metadata database.
+
+              psql could not connect to $PGUSER@$PGHOST:$PGPORT/$PGDATABASE:
+
+                $CONN_ERR
+
+              This is a connectivity/credential fault, NOT a migration state.
+              On ESO/Vault-backed clusters the usual cause is a missing or
+              wrong GITEA_DB_PASSWORD in the Vault bundle — the chart only
+              generates that key when secrets.create=true.
+              ============================================================
+              EOF
+                exit 1
+              fi
               USERS=$(psql -tAc 'SELECT COUNT(*) FROM "user"' 2>/dev/null | tr -d '[:space:]')
-              # Empty or non-numeric = no schema yet / unreachable; treat as 0.
+              # Blank or non-numeric now means "connected, no schema yet" only.
               case "$USERS" in ''|*[!0-9]*) USERS=0 ;; esac
               if [ "$USERS" -gt 0 ]; then
                 echo "Postgres already holds $USERS users — migration complete, proceeding."
