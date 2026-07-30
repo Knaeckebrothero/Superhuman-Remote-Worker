@@ -240,6 +240,77 @@ class VirtualOverlayBackend:
                 results.extend(self._search_provider(provider, query, case_sensitive))
         return results[:SEARCH_RESULT_HARD_CAP]
 
+    # --- mutation path (write operations) ---------------------------------
+
+    _DENY_TEMPLATE = (
+        "{path} is inside the virtual directory '{prefix}', which is generated "
+        "from live state and cannot be {verb}. Copy a file out (copy "
+        "'{path}' to a normal workspace path) if you want an editable version."
+    )
+
+    def _deny(self, path: str, provider: Any, verb: str) -> None:
+        raise VirtualPathError(
+            self._DENY_TEMPLATE.format(path=path, prefix=provider.prefix, verb=verb)
+        )
+
+    def write_file(self, path: str, content: Any) -> None:
+        m = self._match(path)
+        if m is None:
+            return self._inner.write_file(path, content)
+        provider, name = m
+        if not provider.writable or not name:
+            self._deny(path, provider, "written to")
+        provider.write(name, content)
+
+    def append_file(self, path: str, content: str) -> None:
+        m = self._match(path)
+        if m is None:
+            return self._inner.append_file(path, content)
+        provider, name = m
+        if not provider.writable or not name:
+            self._deny(path, provider, "appended to")
+        existing = self._read(provider, name, path) or ""
+        provider.write(name, existing + content)
+
+    def mkdir(self, path: str) -> None:
+        m = self._match(path)
+        if m is None:
+            return self._inner.mkdir(path)
+        self._deny(path, m[0], "created")
+
+    def delete_file(self, path: str) -> bool:
+        m = self._match(path)
+        if m is None:
+            return self._inner.delete_file(path)
+        self._deny(path, m[0], "deleted")
+
+    def delete_directory(self, path: str) -> bool:
+        m = self._match(path)
+        if m is None:
+            return self._inner.delete_directory(path)
+        self._deny(path, m[0], "deleted")
+
+    def move(self, src: str, dst: str) -> None:
+        for candidate in (src, dst):
+            m = self._match(candidate)
+            if m is not None:
+                self._deny(candidate, m[0], "moved")
+        return self._inner.move(src, dst)
+
+    def copy(self, src: str, dst: str) -> None:
+        dst_match = self._match(dst)
+        if dst_match is not None:
+            self._deny(dst, dst_match[0], "copied onto")
+        src_match = self._match(src)
+        if src_match is None:
+            return self._inner.copy(src, dst)
+        # Copy-out: the escape hatch the denial message advertises.
+        provider, name = src_match
+        content = self._read(provider, name, src) if name else None
+        if content is None:
+            raise FileNotFoundError(f"File not found: {src}")
+        self._inner.write_file(dst, content)
+
     # --- delegation -------------------------------------------------------
 
     def __getattr__(self, name: str) -> Any:

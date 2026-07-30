@@ -1,6 +1,6 @@
 import pytest
 
-from src.core.backends.overlay import EntryMeta, VirtualOverlayBackend
+from src.core.backends.overlay import EntryMeta, VirtualOverlayBackend, VirtualPathError
 from src.core.workspace_backend import SEARCH_RESULT_HARD_CAP
 from tests._fs_backend import FilesystemTestBackend
 
@@ -182,3 +182,72 @@ def test_search_scoped_to_a_single_virtual_file(overlay):
 
 def test_listing_below_a_virtual_entry_is_empty(overlay):
     assert overlay.list_dir("tools/README.md") == []
+
+
+@pytest.mark.parametrize(
+    "op",
+    [
+        lambda ov: ov.write_file("tools/x.md", "nope"),
+        lambda ov: ov.append_file("tools/README.md", "nope"),
+        lambda ov: ov.mkdir("tools/sub"),
+        lambda ov: ov.delete_file("tools/README.md"),
+        lambda ov: ov.delete_directory("tools"),
+        lambda ov: ov.move("tools/README.md", "copy.md"),
+        lambda ov: ov.move("real.md", "tools/README.md"),
+        lambda ov: ov.copy("real.md", "tools/x.md"),
+    ],
+)
+def test_mutations_on_readonly_virtual_paths_are_rejected(overlay, tmp_path, op):
+    (tmp_path / "real.md").write_text("real")
+    with pytest.raises(VirtualPathError) as excinfo:
+        op(overlay)
+    assert "virtual" in str(excinfo.value).lower()
+
+
+def test_copy_out_of_virtual_to_real_is_allowed(overlay, tmp_path):
+    overlay.copy("tools/README.md", "my_tools.md")
+    assert "Available Tools" in (tmp_path / "my_tools.md").read_text()
+
+
+def test_real_to_real_mutations_still_delegate(overlay, tmp_path):
+    overlay.write_file("scratch.md", "content")
+    assert (tmp_path / "scratch.md").read_text() == "content"
+    overlay.delete_file("scratch.md")
+    assert not (tmp_path / "scratch.md").exists()
+
+
+def test_writable_provider_receives_writes(tmp_path):
+    class Writable(FakeProvider):
+        prefix = "plan.md"
+        is_dir = False
+        writable = True
+
+        def __init__(self):
+            super().__init__({"plan.md": "# Plan\n"})
+            self.written = None
+
+        def write(self, name, content):
+            self.written = (name, content)
+            self.docs[name] = content
+
+    provider = Writable()
+    ov = VirtualOverlayBackend(FilesystemTestBackend(tmp_path))
+    ov.register(provider)
+    ov.write_file("plan.md", "# New Plan\n")
+    assert provider.written == ("plan.md", "# New Plan\n")
+    assert ov.read_file("plan.md") == "# New Plan\n"
+
+
+def test_writable_provider_still_rejects_delete(tmp_path):
+    class Writable(FakeProvider):
+        prefix = "plan.md"
+        is_dir = False
+        writable = True
+
+        def write(self, name, content):
+            self.docs[name] = content
+
+    ov = VirtualOverlayBackend(FilesystemTestBackend(tmp_path))
+    ov.register(Writable({"plan.md": "x"}))
+    with pytest.raises(VirtualPathError):
+        ov.delete_file("plan.md")
