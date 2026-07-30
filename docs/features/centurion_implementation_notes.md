@@ -15,6 +15,24 @@ related:
 
 Companion to [[centurion]]. Distilled from the 2026-07-28 code-planner research (three agents; all anchors verified against the working tree at `95ee3011` that day — re-verify on pickup, they will drift). This is the build plan; the design rationale lives in the feature doc.
 
+> **Steer semantics changed 2026-07-30 (P1 wave of
+> `docs/issues/officer_blind_reads_and_worker_bureaucracy.md` — supersedes every
+> "`urgent` interrupts" mention below).** `steer_worker_job(urgent=True)` no longer
+> triggers a destructive resume: on a live run it appends to
+> `context.pending_guidance`, rides the heartbeat response into the worker pod, and
+> renders as a transient `[SUPERVISOR GUIDANCE]` pair on the very next LLM turn —
+> intact context, no compaction, no re-plan; delivery is acked into
+> `context.consumed_replies` (readable by the officer), and only a job with **no live
+> run** falls back to a resume. The destructive path is now exclusively
+> `resume_worker_job` (docstring prices it honestly). Non-urgent steers are delivered
+> for real too: the boundary drain injects a persistent `[QUEUED MESSAGES]` message
+> and consumes the thread (the old `messages/*_received.md` dead-letter box is fixed).
+> The officer also gained `create_worker_job(required_deliverables=[...])` (P1-C):
+> declare the contract at dispatch, read per-boundary `output/manifest_status.json`
+> from the job repo, and let the platform's seal gate bounce empty seals instead of
+> burning a review cycle. Cancel/pause now push an evidence snapshot before teardown
+> (P1-D) — a cancelled worker's mid-phase work survives in its Gitea branch.
+
 > **As-built S7–S9 + guards (2026-07-30 overnight, commits `ae045186` / `97f2d673` / `773ad46e` / `f7274da0`) — v1 complete.** Deltas from the plan below:
 > - **S7 (`ae045186`)**: the "three lockstep sites" are FOUR — the `NoteTypeValue` Literal in `knowledge_tools.py` binds the LLM schema and `tests/test_tool_vocabularies.py` pins Literal==NOTE_TYPES==reindexer. One-active-charter is **app-enforced in kb_write**, NOT a partial unique index — the reindexer upserts human-editable files and a constraint would wedge a whole run on one duplicate; the write path also **fail-closes** when the uniqueness lookup errors. Worker denial keys on `ToolContext._thread_id` (set only by persistent sessions; `job_id` is useless — sessions set it to the thread id). The charter fetch (`KnowledgeStore.get_charter_note`) is project_id-keyed with **NO path filter** — lite sessions write pathless pgvector rows that `get_note_by_slug`/`list_notes` (files-canonical, `path IS NOT NULL`) can never see. Injection = a dedicated transient pair (`charter_inject_` prefix, registered in `is_workspace_injection_message` so summarization excludes it), prepended LAST so it sits absolutely first in the tail zone; gate `_charter_injection_enabled` = officer.enabled OR officer.conference, strict `is True`. Risk 11 fixed for real: kg-less+gitless kb_write now returns an error when the pgvector write (the sole store) fails. `OfficerConfig.conference` added (loader both paths + sanitizer bool key). Charter template ships beside the expert (`config/experts/centurion/charter_template.md`, loader-inert) + persona rule 9.
 > - **S8 (`97f2d673`)**: migration **0075** (CHECK + budget relax, as planned). The advance branch keeps `consecutive_failures`/`last_error` bookkeeping for the sitrep and clears both pointers, but never writes `status` — a failing turn never stops an officer loop. The wake is `source='loop'`, dedup `<loop8>:<seq_index>` (exactly-once via the stage barrier + insert dedup; the completed member's own `job_transition` wake coalesces with it). Conversion is **one-way** (→ officer) via `convert_project_loop_to_officer` — guards in the UPDATE's WHERE (active row, `campaign IS NULL`, not already officer) so a raced campaign start can't slip between check and write; an in-flight TURN converts cleanly (its completion lands in the officer branch). Start-path: officer loops skip the first spawn and wake the officer (`started:<loop8>`); an enabled officer thread is required at start AND convert. Sweeper: ONE guard after the stage-sweep branch (empty pointers = steady state; adopt+heal both skipped); the stage-sweep stays as the missed-hook net.

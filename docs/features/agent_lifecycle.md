@@ -115,7 +115,7 @@ All major CLI coding agents converge on the same core pattern. The differences a
 | **Lifecycle** | One per user, runs 24/7 (idle when no messages), archivable | Pool member, starts at deploy time, cycles through jobs indefinitely |
 | **Execution loop** | `while(tool_call)` — model decides everything, no phases | Phase alternation graph — strategic/tactical cycles with todos |
 | **Transport** | WebSocket (bidirectional, real-time streaming) | REST (orchestrator pushes jobs via HTTP POST) |
-| **User interaction** | Every turn + mid-turn steering + approval requests | None during execution (freeze/feedback at phase boundaries) |
+| **User interaction** | Every turn + mid-turn steering + approval requests | Mid-run `[SUPERVISOR GUIDANCE]` injection (next LLM turn, since 2026-07-30) + queued messages at phase boundaries + freeze/feedback |
 | **Job delegation** | Has MCP tools to create/monitor/manage worker jobs | Executes jobs assigned by orchestrator |
 | **Provisioning** | Orchestrator creates pod + optional VM per session | Static pool, orchestrator adjusts replica count |
 | **State management** | Session-scoped (`persistent_app.py`) | Global singleton (`app.py`, unchanged) |
