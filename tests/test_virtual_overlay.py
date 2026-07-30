@@ -251,3 +251,33 @@ def test_writable_provider_still_rejects_delete(tmp_path):
     ov.register(Writable({"plan.md": "x"}))
     with pytest.raises(VirtualPathError):
         ov.delete_file("plan.md")
+
+
+def test_writable_provider_receives_appends(tmp_path):
+    class Writable(FakeProvider):
+        prefix = "plan.md"
+        is_dir = False
+        writable = True
+
+        def write(self, name, content):
+            self.docs[name] = content
+
+    ov = VirtualOverlayBackend(FilesystemTestBackend(tmp_path))
+    ov.register(Writable({"plan.md": "# Plan\n"}))
+    ov.append_file("plan.md", "- step one\n")
+    assert ov.read_file("plan.md") == "# Plan\n- step one\n"
+
+
+def test_writable_provider_write_failure_is_a_readable_error(tmp_path):
+    class Exploding(FakeProvider):
+        prefix = "plan.md"
+        is_dir = False
+        writable = True
+
+        def write(self, name, content):
+            raise RuntimeError("database down")
+
+    ov = VirtualOverlayBackend(FilesystemTestBackend(tmp_path))
+    ov.register(Exploding({"plan.md": "# Plan\n"}))
+    with pytest.raises(ValueError, match="could not be written"):
+        ov.write_file("plan.md", "# New\n")
