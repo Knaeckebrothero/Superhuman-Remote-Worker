@@ -377,8 +377,8 @@ live-cluster, two web-research); condensed here, load-bearing facts only:
 
 ### Annex A — read-path landscape (landed 2026-07-30)
 
-Full survey of every way a worker job's files can be read. Highlights (full table in the
-investigating agent's report; the load-bearing facts):
+Full survey of every way a worker job's files can be read — the load-bearing facts
+(every claim carries its file:line; re-derivable from those sites):
 
 **Working on k8s/VM (all Gitea-backed, staleness = last push):**
 `GET /api/jobs/{id}/repo/file|contents|commits|diff|tags` (`main.py:16169-16354` →
@@ -555,8 +555,13 @@ k8s events (~1h TTL), `e239ef27`'s S3 log archive (missing), `7c2685e8`'s frozen
 (cleared by cancellation).
 ### Annex E — framework survey (landed 2026-07-30)
 
-How mature systems solve the three gaps. Proof points (URLs in the agent report; the
-decisive ones inline):
+How mature systems solve the three gaps — proof points, decisive URLs inline; the rest
+findable under the named product doc pages (LangGraph interrupts /
+interrupt-concurrent; OpenHands sdk guides convo-send-message-while-running, critic,
+agent-stuck-detector; CrewAI concepts/tasks; Claude Code agent-sdk subagents +
+hooks; MetaGPT arXiv 2308.00352; SWE-agent arXiv 2405.15793; Anthropic
+built-multi-agent-research-system; Cognition dont-build-multi-agents +
+devin-can-now-manage-devins):
 
 - **Observability**: OpenHands makes the typed event stream *the* state — UI, stuck
   detector, and supervisor are all just subscribers; Claude Code emits task-state
@@ -603,8 +608,8 @@ P1-C(4); the officer's existing sitrep delta already implements "subscribe, don'
 for *status* — what's missing is only the artifact-manifest leg.
 ### Annex F — research evidence (landed 2026-07-30)
 
-Key findings per question (full citations with URLs in the investigating agent's
-report):
+Key findings per question (primary sources named inline — arXiv IDs and paper/post
+titles are sufficient to re-locate everything):
 
 - **Planning overhead**: plan signal decays 4.1× within one action-observation step;
   evicting plans during compression costs −34.7pp ("Plans Don't Persist",
