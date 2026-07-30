@@ -597,6 +597,43 @@ async def handle_pod_workspace_recovery(
     }
 
 
+async def apply_deliverable_gate(
+    job: dict[str, Any],
+    result: dict[str, Any],
+    new_status: str | None,
+    *,
+    db: Any,
+    gitea: Any,
+    queue_resume: Callable[..., Any],
+    vector_db: Any = None,
+) -> tuple[str | None, list[str], bool]:
+    """P1-C deliverable-contract arm of the completion decision.
+
+    Sits between ``determine_job_status`` and the status write in the
+    /complete handler: a completion that CLAIMS done-ness while
+    ``context.required_deliverables`` artifacts are absent at the job branch
+    HEAD is bounced back through the P1-A resume-with-feedback lane instead
+    of sealing (bounded by the module's bounce cap; Gitea-down fails open).
+
+    Thin hook by design — all gate logic lives in
+    ``services.deliverable_gate`` (same extraction pattern as
+    ``handle_pod_workspace_recovery`` above). Returns
+    ``(new_status, actions, bounced)``; on ``bounced=True`` the caller must
+    early-return without sealing or spawning critic/curator subjobs.
+    """
+    from services.deliverable_gate import run_deliverable_gate
+
+    return await run_deliverable_gate(
+        job,
+        result,
+        new_status,
+        db=db,
+        gitea=gitea,
+        queue_resume=queue_resume,
+        vector_db=vector_db,
+    )
+
+
 def _get_ctx(job: dict[str, Any]) -> dict[str, Any]:
     """workspace_container sub-dict from a job row's context JSONB."""
     ctx = job.get("context") or {}

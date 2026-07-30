@@ -6563,6 +6563,16 @@ class JobCreate(BaseModel):
     kickoff_message: str | None = Field(
         None, description="Opening message to the agent (task brief)"
     )
+    required_deliverables: list[str] | None = Field(
+        None,
+        description=(
+            "Deliverable contract (P1-C): workspace-relative artifact paths "
+            "(or 'kb:<slug>' knowledge-note slugs) that must exist on the job "
+            "branch before a completion claiming success may seal. Stored in "
+            "context.required_deliverables; rendered into the worker's task "
+            "brief; enforced by services/deliverable_gate.py at /complete."
+        ),
+    )
     datasource_ids: list[str] | None = Field(
         None, description="Connector IDs to attach to the job"
     )
@@ -8612,6 +8622,16 @@ async def create_job(request: Request, job: JobCreate) -> dict[str, Any]:
             context["instructions"] = job.instructions
         if job.kickoff_message:
             context["kickoff_message"] = job.kickoff_message
+        if job.required_deliverables:
+            # Deliverable contract (P1-C): normalize + dedupe into context.
+            # The dispatcher forwards context to the agent (task-brief render,
+            # phase-boundary manifest_status.json) and the completion gate
+            # validates the seal against it.
+            from services.deliverable_gate import parse_required_deliverables
+
+            manifest = parse_required_deliverables(job.required_deliverables)
+            if manifest:
+                context["required_deliverables"] = manifest
 
         # Internal transport authentication is not user authorization. Derive
         # agent-created job identity/scope from the originating thread/parent
@@ -15231,6 +15251,40 @@ async def complete_job(
                     logger.warning(
                         f"Failed to send llm_unavailable give-up alert for {job_id}: {e}"
                     )
+
+        # 1·gate. Deliverable-contract gate (P1-C): a completion that CLAIMS
+        # done-ness must have every context.required_deliverables artifact
+        # present at the job branch HEAD (Gitea) before it may seal — or spawn
+        # critic/curator work. Missing → bounce back through the P1-A
+        # resume-with-feedback lane with the precise missing/present listing
+        # (bounded by the gate's cap; at the cap the seal falls through with
+        # the report stamped in context.deliverable_gate). Gitea-down fails
+        # open. Logic in services/deliverable_gate.py.
+        # docs/issues/officer_blind_reads_and_worker_bureaucracy.md §4 P1-C.
+        from services.completion import apply_deliverable_gate
+
+        new_status, _gate_actions, _gate_bounced = await apply_deliverable_gate(
+            job,
+            result,
+            new_status,
+            db=postgres_db,
+            gitea=gitea_client,
+            queue_resume=_internal_resume_job,
+            vector_db=vector_db,
+        )
+        actions.extend(_gate_actions)
+        if _gate_bounced:
+            # Refused seal: the job is already parked paused with
+            # queued_feedback (+ queued_feedback_reason) and the dispatcher
+            # triggered. Skip the status write, notifications, subjob graft,
+            # critic/curator spawns and loop advance — none may act on a
+            # bounced seal.
+            return {
+                "status": "handled",
+                "job_id": job_id,
+                "new_status": "paused",
+                "actions": actions,
+            }
 
         # 1a. Mode A diff capture (job_cloud_export.md §3.3). If this is a
         # project-attached job that received a baseline at dispatch, see

@@ -186,18 +186,33 @@ def create_job_tools(context: ToolContext) -> List[Any]:
             # Validate confidence
             confidence = max(0.0, min(1.0, confidence))
 
-            # Validation gate: cross-check deliverables before accepting
+            # Validation gate: cross-check deliverables before accepting.
+            # Paths are NORMALIZED, not pedantically matched (F14): a missing
+            # or extra `repo/` prefix (or `./`) must never fail a seal when the
+            # file exists under either spelling — that exact rejection forced a
+            # COMPLETE job (58027ee7) into a 0.45 honest-floor seal.
+            # docs/issues/officer_blind_reads_and_worker_bureaucracy.md
+            from ...core.deliverables import (
+                KB_DELIVERABLE_PREFIX,
+                resolve_workspace_deliverable,
+            )
+
             validation_warnings = []
 
             # Check that listed deliverables exist and are non-empty
             for deliverable in deliverables:
-                if not workspace.exists(deliverable):
+                resolved, found = resolve_workspace_deliverable(workspace, deliverable)
+                if resolved and resolved.startswith(KB_DELIVERABLE_PREFIX):
+                    # Knowledge-note deliverable — verified server-side by the
+                    # orchestrator's gate, not against the workspace.
+                    continue
+                if not found:
                     validation_warnings.append(
                         f"Deliverable '{deliverable}' does not exist"
                     )
                 else:
                     try:
-                        content = workspace.read_file(deliverable)
+                        content = workspace.read_file(resolved)
                         if len(content.strip()) < 50:
                             validation_warnings.append(
                                 f"Deliverable '{deliverable}' appears empty or trivial ({len(content)} bytes)"
