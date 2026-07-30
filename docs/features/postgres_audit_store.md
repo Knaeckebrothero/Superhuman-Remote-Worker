@@ -471,11 +471,19 @@ sides expose the union of:
   the same so callers in `graph.py` don't change)
 
 **Read surface** (mirrors `orchestrator/database/mongodb.py`):
-- `get_job_audit(job_id, limit, offset, order, filter)` — paginated
-- `get_job_audit_bulk(job_id, limit, offset)`
-- `get_chat_history(job_id, limit, offset)` and `_bulk` variant
-- `get_graph_deltas_bulk(job_id, limit, offset)`
+- `get_job_audit(job_id, limit, offset, order, filter, lean)` — paginated;
+  `lean=True` is the list projection (no metadata / heavy payload sub-keys)
+- `get_audit_step(job_id, step_id)` — full single-step detail behind the lean list
+- `get_chat_history(job_id, limit, offset, lean)` — paginated; `lean=True`
+  strips full message bodies (previews + `truncated`/`chars` markers)
+- `get_chat_entry(job_id, entry_id)` — full single-turn detail behind the lean list
 - `get_request(id)` — by BIGINT id (was 24-hex ObjectId)
+
+*(The three `_bulk` readers listed here originally — `get_job_audit_bulk`,
+`get_chat_history_bulk`, `get_graph_deltas_bulk` — were removed on 2026-06-29
+along with their endpoints; MCP now uses the lean+offset paths. See
+`docs/features/debug_audit_view_refactor.md` §0. The `lean`/detail pairs above
+landed in P1 (audit) and P4 (chat) of that refactor.)*
 - `get_audit_time_range(job_id)` — first/last timestamp
 - `get_job_version(job_id)` — `{auditEntryCount, chatEntryCount, graphDeltaCount, lastUpdate}`
 - `list_llm_requests(job_id, limit, offset)`

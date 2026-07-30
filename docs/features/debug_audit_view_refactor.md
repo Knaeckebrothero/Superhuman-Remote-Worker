@@ -1,8 +1,8 @@
 # Debug audit view refactor — from "download the whole job" to a windowed trace inspector
 
-**Status:** **Implemented + k3d/browser-verified.** 2026-06-29. P0 committed (`7ea0d798`); P1 + the Agent-Activity refactor (P2) pushed + **deployed to dev**; **chat + graph migration + slider removal + dead-code sweep + a sort toggle done + verified, uncommitted on `develop`.** **The MCP bulk-tool migration + removal of the backend `/{audit,chat,graph}/bulk` endpoints + `get_*_bulk` store methods (incl. the retired `mongodb.py` copies) is now done too (2026-06-29) — the last OOM-prone read path is gone, and it's been verified end-to-end on the main cluster via the real MCP, including reading the original OOM job `19707fa1` at `limit=5000` without a crash.** Current as-built state is in **§0 below**; the original design + roadmap (§§1–10) are kept for context with deviations annotated. Slider + synchronized replay: **removed entirely** (owner: demo-only). The crash that motivated this is root-caused in the companion issue `docs/issues/audit_metadata_config_duplication_ooms_orchestrator.md` (the write-side OOM fix is **Phase 0**). The enabler: most server-side primitives already existed (`get_job_audit` paged+filtered, `get_request` lazy-detail, `iter_tool_calls` keyset) — so this was largely **frontend deletion + one lean projection**, not a rewrite.
+**Status:** **Implemented + k3d/browser-verified.** 2026-06-29; **P4 (chat lean + lazy hydration) added 2026-07-30 — see §0.1.** P0 committed (`7ea0d798`); P1 + the Agent-Activity refactor (P2) pushed + **deployed to dev**; **chat + graph migration + slider removal + dead-code sweep + a sort toggle done + verified, uncommitted on `develop`.** **The MCP bulk-tool migration + removal of the backend `/{audit,chat,graph}/bulk` endpoints + `get_*_bulk` store methods (incl. the retired `mongodb.py` copies) is now done too (2026-06-29) — the last OOM-prone read path is gone, and it's been verified end-to-end on the main cluster via the real MCP, including reading the original OOM job `19707fa1` at `limit=5000` without a crash.** Current as-built state is in **§0 below**; the original design + roadmap (§§1–10) are kept for context with deviations annotated. Slider + synchronized replay: **removed entirely** (owner: demo-only). The crash that motivated this is root-caused in the companion issue `docs/issues/audit_metadata_config_duplication_ooms_orchestrator.md` (the write-side OOM fix is **Phase 0**). The enabler: most server-side primitives already existed (`get_job_audit` paged+filtered, `get_request` lazy-detail, `iter_tool_calls` keyset) — so this was largely **frontend deletion + one lean projection**, not a rewrite.
 **Component:** Cockpit debug dashboard (`cockpit/src/app/debug/**`, `cockpit/src/app/core/services/data.service.ts`, `indexed-db.service.ts`, `api.service.ts`) · audit read path (`orchestrator/database/audit_store.py`, `orchestrator/main.py` `/api/jobs/{id}/audit*`).
-**Related:** `docs/issues/audit_metadata_config_duplication_ooms_orchestrator.md` (P0 root cause) · memory topics `project_self_improvement_loop`, `project_loop_repo_compounding` (loop jobs run the most steps → most exposed) · `project_cross_pod_checkpointer_d3` (separate checkpoint-blob bloat).
+**Related:** `docs/issues/audit_metadata_config_duplication_ooms_orchestrator.md` (P0 root cause) · `docs/done/chat_history_tail_injections_swallow_the_conversation_delta.md` (**P4**, 2026-07-30 — chat gets the same lean+detail split, plus the write-side delta bug it exposed) · memory topics `project_self_improvement_loop`, `project_loop_repo_compounding` (loop jobs run the most steps → most exposed) · `project_cross_pod_checkpointer_d3` (separate checkpoint-blob bloat).
 
 ---
 
@@ -21,7 +21,7 @@ Functionally **complete and verified** (k3d build + 716 cockpit tests + live bro
 | **P1** (backend) | `_STITCH_LEAN` + `lean=` flag on `get_job_audit`; `get_audit_step` + `GET /api/jobs/{id}/audit/step/{step_id}`. Stitch composed from shared parts so CORE/LEAN can't drift. MCP fat path unchanged. |
 | **P2 API** | `ApiService.getAuditPage(…, order)` (lean, offset-paged) + `getAuditStep`. |
 | **P2 frontend** | new **`AuditTraceService`** (paged infinite-scroll + lazy per-step detail + server-side filter + asc/desc order); **`agent-activity.component`** rewritten onto it. Pushed + deployed to dev. |
-| **P3 chat** | new **`ChatTraceService`** (paged `/chat`); **`chat-history.component`** rewritten onto it (infinite scroll, decoupled from the slider). |
+| **P3 chat** | new **`ChatTraceService`** (paged `/chat`); **`chat-history.component`** rewritten onto it (infinite scroll, decoupled from the slider). *Superseded by P4 (§0.1): pages are now lean + hydrated on demand.* |
 | **P3 graph** | `GraphService` already loaded independently (`getGraphChanges`); removed its now-inert slider-sync effects. |
 | **2c — kill the OOM** | `DataService.loadJob` gutted → **no `/*/bulk` eager download**; `DataService` slimmed to a job-selection holder. |
 | **2c — slider** | removed from `timeline.component` (scrubber/play/time/loading/cache); timeline = job dropdown + refresh + AUTO. |
@@ -29,8 +29,50 @@ Functionally **complete and verified** (k3d build + 716 cockpit tests + live bro
 | **Dead-code sweep** | removed `fetchAndCacheJob`/`loadWindow` + all slider/window signals from `DataService`; `getJobAuditBulk`/`getChatHistoryBulk`/`getGraphDeltasBulk` + `Bulk*Response` from `ApiService`; graph slider-sync. `data.service.spec` rewritten. **716/716 tests pass.** |
 | **MCP migration + backend bulk removal** (2026-06-29) | MCP `get_audit_bulk`→`/audit?lean=true&offset&limit&filter` (and the `filter` that was silently dropped is now wired through); `get_chat_bulk`→`/chat?offset&limit`; both capped at 200. Added offset/limit to `AuditStore.get_chat_history` + the `/chat` endpoint (mirrors `/audit`). **Deleted** the three `/{audit,chat,graph}/bulk` endpoints + `get_job_audit_bulk`/`get_chat_history_bulk`/`get_graph_deltas_bulk` store methods. `/graph/bulk` had **zero** consumers. New tests: 5 MCP-client (params/caps/filter) + 3 chat-pagination contract; **303 audit/chat/mcp/archiver tests pass**, ruff clean. |
 | **Legacy `mongodb.py` cleanup** (2026-06-29) | Removed the matching `get_job_audit_bulk`/`get_chat_history_bulk`/`get_graph_deltas_bulk` from the retired `MongoDB` store (zero call sites; the live reader is `AuditStore`) + the stale docstring example. The non-bulk methods that real callers still use are untouched; MongoDB/MCP/pagination tests green. |
+| **P4 — chat lean + hydration** (2026-07-30, uncommitted) | Chat finally gets the P1/P2 treatment it was explicitly denied in P3 (see §0.1): `lean=` on `/chat` + `GET /chat/entry/{entry_id}`, `ChatTraceService.hydrateEntry`, expand-in-place everywhere, injected context collapsed to one strip, tool results resolved via a window-wide `tool_call_id` map. Fixed en route: the write-side delta bug that had been dropping real tool results (`docs/done/chat_history_tail_injections_swallow_the_conversation_delta.md`). |
 
 **Browser-verified (697-step job):** selecting a job issues only `/audit?…lean=true` + `/chat?page` (**no `/*/bulk`**); Agent 100/697, Chat 100/160; expand → `/audit/step/{id}` fills heavy args; filter re-queries server-side (errors→0, tools→159); sort → `order=desc` shows #697 first; slider gone; **0 console errors**.
+
+### 0.1 P4 — the chat panel catches up (2026-07-30)
+
+P3 migrated chat onto paging but deliberately stopped there: *"chat content
+renders inline, so (unlike the audit trace) there is no lean projection or
+per-row detail fetch."* That held only while turns were small. Once the
+transient injections (todos, memory, knowledge, instruction files) moved to the
+message-list **tail** for prompt-cache reasons, every archived turn started
+carrying the whole re-injected frame — on one dev job, **99.2 % of stored chat
+input bytes** — and the panel rendered it as conversation, one `<active_tasks>`
+wall per turn. Chasing that surfaced a genuine write-side bug: the archiver's
+"delta = everything after the last `AIMessage`" heuristic was anchoring on the
+*synthetic* `AIMessage` of an injection pair and **dropping the real tool
+results**, which is why every tool card read "Result pending or not available".
+
+Root cause, measurements, and the write-side fix are in
+`docs/done/chat_history_tail_injections_swallow_the_conversation_delta.md`. The
+read/render half is a straight application of this document's own pattern:
+
+| Concern | Audit (P1/P2) | Chat (P4) |
+|---|---|---|
+| Lean list projection | `_STITCH_LEAN` + `lean=` on `/audit` | `_lean_chat_doc` + `lean=` on `/chat` (previews + `truncated`/`chars`) |
+| Per-record detail | `GET /audit/step/{step_id}` | `GET /chat/entry/{entry_id}` |
+| Frontend | `AuditTraceService` + row expand → detail fetch | `ChatTraceService.hydrateEntry()` swaps the full row in place; every body gets a `Show full (5.2 kB)` control |
+| Heavy-but-never-rendered field | `metadata.resolved_config` (stripped at write, P0) | the injected context frame (stored as `type="context"` descriptors; full text only when its hash changes) |
+
+Two things beyond the audit pattern, both forced by chat's shape:
+
+- **Cross-row references.** A tool *result* lands in a later turn than its
+  *call*, so `getToolResult` peeked at `entries[idx+1]` — fragile across
+  empty-delta turns and page boundaries. Now a `tool_call_id → result` map over
+  the whole loaded window, with an honest "arrives in a later turn" state at the
+  tail of a page.
+- **Retroactive classification.** The ~66k rows already written can't be fixed
+  by the write-side change, so the component classifies legacy raw injections
+  client-side (`<active_tasks>` prefix, `*_inject_` tool-call ids) into the same
+  context strip. The MCP `_format_chat_entry` does the same collapse.
+
+Also removed here: the chat panel's shell-state widget (~150 lines + styles +
+i18n), keyed on a `ChatEntry.shell_state` field no reader has emitted since the
+Postgres cutover — the same "delete what the UI never renders" sweep as §8.
 
 **MCP migration verified on k3d (real job `74c2371a`, admin auth, live orchestrator):** `get_audit_bulk`→3/21 lean entries (no `metadata`/`tool.arguments`), `get_chat_bulk`→3/5 turns, both formatted; `limit=5000` clamps to 200; `filter=errors`→0 vs `all`→21 (filter now reaches the endpoint). OpenAPI confirms the three `/*/bulk` routes are gone and `/chat` exposes `offset`+`limit`. Real-data pagination: `offset=0,limit=2` and `offset=2,limit=2` return disjoint row ids on a 24k-turn job; legacy `page=2,pageSize=2` is byte-equivalent.
 
@@ -46,6 +88,8 @@ Functionally **complete and verified** (k3d build + 716 cockpit tests + live bro
 ### Files (uncommitted on `develop`, atop the deployed P0–P2)
 
 New: `cockpit/src/app/core/services/{audit-trace,chat-trace}.service.ts`. Changed: `api.service.ts`, `data.service.ts` (+ `.spec`), `agent-activity.component.ts`, `chat-history.component.ts`, `timeline.component.ts`, `graph.service.ts`, `orchestrator/database/audit_store.py`, `orchestrator/main.py`. MCP migration adds: `orchestrator/mcp/client.py`, `orchestrator/mcp/server.py`, `orchestrator/database/mongodb.py` (legacy bulk methods removed), `tests/test_mcp.py` (+`TestAsyncCockpitClientAuditChatBulk`), `tests/test_audit_pagination.py` (+`TestChatPaginationContract`).
+
+**P4 adds** (also uncommitted): `src/core/archiver.py`, `orchestrator/services/formatters.py`, `cockpit/src/app/core/models/chat.model.ts`, `cockpit/src/assets/i18n/{en,de-DE}.json`; new `tests/test_chat_lean.py`, `cockpit/src/app/core/services/chat-trace.service.spec.ts`, `cockpit/src/app/views/chat-history/chat-history.component.spec.ts` (+ new cases in `tests/test_archiver_pg.py`).
 
 ---
 
@@ -141,7 +185,7 @@ A post-hoc (and live-tail) execution-trace inspector — same family as a CI log
 | 5 | Filtering | **Server-side** via existing `filter_category` pushdown | Switching filter re-queries; never download-all-then-filter. |
 | 6 | Detail loading | **Lazy per step** (generalize the Request Viewer pattern) | Row-click fetches that step's heavy fields + linked request on demand. |
 | 7 | Search parity | Preserve via server filter + step/phase jump now; full-text over payloads later | The old "everything in memory" implicitly allowed client-side Ctrl-F; don't silently lose it. |
-| 8 | Graph + chat | Same lazy+virtualized treatment | Graph scales with tool calls; chat is smaller (turns) but should follow the pattern. Graph already has its own independent slider (`graph-timeline.component.ts:103`) — the codebase is already drifting toward independent panels. |
+| 8 | Graph + chat | Same lazy+virtualized treatment | Graph scales with tool calls; chat is smaller (turns) but should follow the pattern. Graph already has its own independent slider (`graph-timeline.component.ts:103`) — the codebase is already drifting toward independent panels. **Amended P4 (§0.1): "chat is smaller" was wrong once tail-injection landed — a turn carries the whole re-injected context frame. Chat needed the full lean+detail split, not just paging.** |
 
 ---
 
