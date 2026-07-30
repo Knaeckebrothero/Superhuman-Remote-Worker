@@ -1748,3 +1748,33 @@ export interface GrantListResponse {
   grants: Grant[];
   catalog: GrantCatalog;
 }
+
+// --- Contacts registry (docs/features/contacts_registry.md) ---
+export type ContactChannel = 'email' | 'whatsapp';
+export type ContactOptIn = 'pending' | 'opted_in' | 'opted_out';
+
+export interface ContactAddress {
+  id: string;
+  channel: ContactChannel;
+  address: string;
+  is_primary: boolean;
+  opt_in_status: ContactOptIn;
+  last_inbound_at: string | null;
+  created_at: string;
+}
+
+export interface ContactProjectRef {
+  id: string;
+  name: string;
+}
+
+export interface Contact {
+  id: string;
+  owner_user_id: string;
+  display_name: string;
+  notes: string | null;
+  addresses: ContactAddress[];
+  projects: ContactProjectRef[];
+  created_at: string;
+  updated_at: string;
+}
