@@ -39,6 +39,7 @@ from ._session_auth import validate_session_token as _validate_session_token
 from .orchestrator_client import OrchestratorClient, create_orchestrator_client_from_env
 from ..agent import UniversalAgent
 from ..core.loader import resolve_config_path
+from ..core.phase import push_evidence_snapshot
 from ..core.workspace_backend import completion_error_payload
 
 logger = logging.getLogger(__name__)
@@ -486,9 +487,48 @@ async def _reset_to_idle(
     logger.info(f"Agent returned to IDLE (reported '{final_status}')")
 
 
+# Ceiling for the pre-teardown evidence push. Must stay under the 120s
+# cooperative-stop window (/job/cancel, /job/pause, lifespan drain), or a
+# wedged push would degrade every cooperative stop into a hard kill. The
+# per-command git timeouts (GitManager, 60s/120s) bound the healthy path;
+# this bounds a wedged SSH backend.
+_EVIDENCE_PUSH_TIMEOUT_SECONDS = 60.0
+
+
+async def _push_evidence_snapshot(job_id: str, reason: str) -> None:
+    """Best-effort commit+push of the workspace before cooperative-stop teardown.
+
+    A cancel used to destroy everything committed or written since the last
+    phase-boundary push — per-todo commits are local-only, and workspace
+    reaping then erases them permanently. The supervisor's kill switch must
+    never destroy the evidence he kills for (P1-D of
+    docs/issues/officer_blind_reads_and_worker_bureaucracy.md).
+
+    Runs the sync git calls (possibly over SSH) in a thread with a hard
+    timeout. A git failure must never block or fail the teardown itself.
+    """
+    workspace = getattr(_agent, "_workspace_manager", None)
+    if workspace is None:
+        return
+    try:
+        await asyncio.wait_for(
+            asyncio.to_thread(push_evidence_snapshot, workspace, reason, job_id),
+            timeout=_EVIDENCE_PUSH_TIMEOUT_SECONDS,
+        )
+    except Exception as e:
+        logger.warning(
+            f"[{job_id}] Evidence push before {reason} teardown failed (non-fatal): {e}"
+        )
+
+
 async def _complete_stop(reset_source: str) -> None:
-    """Finish a cooperative stop (cancel/pause): reset to IDLE, then signal the
-    waiting cancel/pause handler.
+    """Finish a cooperative stop (cancel/pause): push an evidence snapshot,
+    reset to IDLE, then signal the waiting cancel/pause handler.
+
+    The evidence push comes first: at this point the streaming loop has
+    broken out, so the graph is suspended (no concurrent workspace writes)
+    and the workspace handle is still live — the last moment the job's
+    unpushed work can reach its Gitea branch before teardown/reaping.
 
     Ordering is load-bearing. ``_reset_to_idle()`` calls ``_clear_stop()``,
     which clears ``_stop_completed``; the cancel/pause handler is blocked on
@@ -497,6 +537,7 @@ async def _complete_stop(reset_source: str) -> None:
     with no job — the zombie pattern (see
     docs/done/worker_pod_state_zombie_on_cancel.md).
     """
+    await _push_evidence_snapshot(_current_job_id or "unknown", _stop_reason or "stop")
     await _reset_to_idle(reset_source)
     _stop_completed.set()
 

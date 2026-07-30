@@ -1079,6 +1079,60 @@ def _complete_phase_with_git(
         # Don't fail the transition - git is optional
 
 
+def push_evidence_snapshot(
+    workspace: Optional["WorkspaceManager"],
+    reason: str,
+    job_id: str = "unknown",
+) -> bool:
+    """Best-effort commit+push of the workspace as-is before a stop tears it down.
+
+    Pushes to the job's Gitea branch otherwise happen only at phase-0 seed,
+    phase boundaries, freeze and finalize — per-todo completion commits are
+    local-only. Cancelling (or pausing/draining) a job mid-phase therefore
+    destroyed everything since the last boundary push, and workspace reaping
+    then erased it permanently (P1-D of
+    docs/issues/officer_blind_reads_and_worker_bureaucracy.md).
+
+    Unlike ``_complete_phase_with_git`` this is not a phase ritual: no tag,
+    no archive — just stage-all + commit (skipped when the tree is clean) +
+    push (skipped when nothing is unpushed). Never raises; failures are
+    logged at warning and the caller's teardown proceeds regardless.
+
+    Args:
+        workspace: WorkspaceManager with git_manager (may be None/uninitialized)
+        reason: Why the job is stopping (e.g. "cancel", "pause")
+        job_id: Job UUID for log correlation
+
+    Returns:
+        True if a push succeeded, False otherwise (including all skip paths)
+    """
+    git_mgr = workspace.git_manager if workspace else None
+    if not git_mgr or not git_mgr.is_active:
+        return False
+
+    try:
+        committed = git_mgr.commit(
+            f"Evidence snapshot: job stopped (reason={reason})", allow_empty=False
+        )
+        # A clean tree can still carry unpushed per-todo commits — push
+        # whenever anything would otherwise be lost with the workspace.
+        if not committed and not git_mgr.has_unpushed_commits():
+            logger.debug(f"[{job_id}] No evidence to push on {reason} — skipping")
+            return False
+        pushed = git_mgr.push()
+        if pushed:
+            logger.info(f"[{job_id}] Evidence snapshot pushed before stop ({reason})")
+        else:
+            logger.warning(
+                f"[{job_id}] Evidence snapshot push failed on {reason} — work "
+                f"since the last boundary push exists only on the workspace"
+            )
+        return pushed
+    except Exception as e:
+        logger.warning(f"[{job_id}] Evidence snapshot on {reason} failed: {e}")
+        return False
+
+
 def on_strategic_phase_complete(
     state: "UniversalAgentState",
     workspace: "WorkspaceManager",
