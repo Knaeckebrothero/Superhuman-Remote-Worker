@@ -10,6 +10,26 @@ class FakeTool:
         self.description = description
 
 
+class CopyableFakeTool:
+    """Fake tool supporting ``model_copy``, like the real Pydantic StructuredTool.
+
+    Required: without ``model_copy``, ``_copy_with_description`` falls back to
+    mutating the tool **in place** (`description_manager.py`, "Could not copy
+    tool" branch), which corrupts the pre-override objects and would fail even
+    correct wiring.
+    """
+
+    def __init__(self, name, description):
+        self.name = name
+        self.description = description
+
+    def model_copy(self, update=None):
+        clone = CopyableFakeTool(self.name, self.description)
+        for key, value in (update or {}).items():
+            setattr(clone, key, value)
+        return clone
+
+
 def _manager(tmp_path, monkeypatch, enabled="true"):
     monkeypatch.setenv("VIRTUAL_DIRS_ENABLED", enabled)
     return WorkspaceManager(
@@ -76,18 +96,29 @@ def test_provider_serves_full_docstrings_after_overrides_rebind(tmp_path, monkey
 
     apply_description_overrides() returns copies carrying short blurbs and the
     caller rebinds its tool attribute to them. A provider bound to that
-    rebound attribute would serve blurbs — defeating the deferred-tool design.
-    The provider must hold the pre-override objects.
+    rebound attribute would serve blurbs — defeating the deferred-tool design
+    (short in context, full on disk). The provider must hold the pre-override
+    objects.
+
+    The fixture MUST be a real ``defer_to_workspace: True`` tool. With a
+    non-deferred tool (e.g. read_file) apply_description_overrides takes its
+    pass-through branch, no copy is ever made, and the test passes under the
+    buggy binding too — a placebo.
     """
     from src.tools.description_manager import apply_description_overrides
 
-    full_tools = [FakeTool("read_file", "Full docstring, every argument explained.")]
+    full_doc = "Full docstring. Every argument explained at length."
+    full_tools = [CopyableFakeTool("get_document_info", full_doc)]
+
     ws = _manager(tmp_path, monkeypatch)
+    # The wiring contract under test: bound to the PRE-override objects.
     ws.register_virtual_provider(ToolsProvider(lambda: full_tools))
 
-    # Simulate the boot sequence: overrides run and rebind the agent's list.
-    _rebound = apply_description_overrides(list(full_tools))
+    rebound = apply_description_overrides(list(full_tools))
 
-    assert "Full docstring, every argument explained." in ws.read_file(
-        "tools/read_file.md"
-    )
+    # Guards: prove the override actually shortened something and left the
+    # originals intact. Without these the test can silently go vacuous again.
+    assert rebound[0].description != full_doc
+    assert full_tools[0].description == full_doc
+
+    assert full_doc in ws.read_file("tools/get_document_info.md")
