@@ -31,7 +31,7 @@ Framework content is currently **materialized as real files** on an `emptyDir` w
 |---|---|---|---|
 | `tools/README.md`, `tools/<name>.md` | system | `generate_workspace_tool_docs` in `src/agent.py`, `src/api/persistent_session.py` | agent reads (deferred-tool docs) |
 | `contacts/<slug>.md` | system | *(nothing — materialization reverted in `b8e48c10`)* | agent reads |
-| `instructions.md`, `task_brief.md` | system (template / job upload / inline) | `_deploy_instruction_files` (`src/agent.py:3101`), `src/api/persistent_session.py:995` | agent reads; `src/graph.py:472,478` |
+| `instructions.md`, `task_brief.md` | system (template / job upload / inline) | `_deploy_instruction_files` (`src/agent.py:3101`) — **worker jobs only**; the session path (`src/api/persistent_session.py:995`) writes neither file and never has (verified 2026-07-30) | agent reads; `src/graph.py:472,478` |
 | `plan.md`, `todos.yaml` | **agent** | `PlanManager.write` (`src/managers/plan.py:93`), todo tools | agent; curator (`src/graph.py:2783`); orchestrator display via `orchestrator/services/workspace.py:519`, `get_all_todos`; `/api/jobs/{id}/todos*`; MCP; Cockpit |
 
 Materialization has a recurring failure class:
@@ -93,7 +93,7 @@ class VirtualDirProvider(Protocol):
 
 `list_dir`, `exists`, `is_file`, `is_dir`, `stat`, glob patterns, and `search_files` (grep over `entries()` + `read()`) are derived generically in the overlay, so a provider cannot contradict itself. A `prefix` may be a directory (`tools`) or a single file (`instructions.md`) — a file-prefix provider serves exactly one entry and reports `is_dir=False`. Virtual directories are **flat**; no subdirectories in v1. Rendered content flows through the normal `read_file` size caps/pagination.
 
-**Registration.** At the boot paths that write these files today: worker (`src/agent.py`) and session (`src/api/persistent_session.py`). Tools and instructions providers always; contacts only when the job/session has a project. Kill switch `VIRTUAL_DIRS_ENABLED` (default `true`).
+**Registration.** At the boot paths that write these files today: worker (`src/agent.py`) and session (`src/api/persistent_session.py`). Tools always. **Instructions on the worker path only** — sessions write neither `instructions.md` nor `task_brief.md` today, and Slice 1 is a passive migration, so it adds no file a surface never had (session instructions would duplicate `get_phase_system_prompt`'s output; if wanted, that is its own decision). Contacts only when the job/session has a project. Kill switch `VIRTUAL_DIRS_ENABLED` (default `true`).
 
 ## Slice 1 providers (read-only)
 
