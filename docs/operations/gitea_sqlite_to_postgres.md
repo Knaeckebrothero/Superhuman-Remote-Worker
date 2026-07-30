@@ -1,11 +1,13 @@
 # Migrating the bundled Gitea from SQLite to PostgreSQL
 
-> **Status:** **Executed successfully on the local k3d cluster 2026-07-30**
-> (5 users / 131 repos / 1 Keycloak login source, all preserved). Every step
-> below is the version that actually ran, including the guard firing on the
-> live instance and the post-migration smoke tests. Previously rehearsed
-> against a byte-copy in an isolated namespace. **The dev/homelab cluster has
-> not been migrated yet** — it remains pinned to `sqlite3`.
+> **Status: executed successfully on BOTH clusters, 2026-07-30.**
+> Local k3d (5 users / 131 repos) and the Fleet-managed dev/homelab cluster
+> (25 users / 443 repos / 2665 releases / 1 Keycloak login source), all
+> preserved and verified table-by-table. Every step below is the version that
+> actually ran. The dev run added the failure modes k3d could not surface —
+> truncated `kubectl cp` backups, a varchar overflow silently dropping a whole
+> table, and Fleet reverting manual scale-downs — so steps 0, 0b and 3 are
+> written from those, not from theory.
 >
 > **Applies to:** any deployment whose Gitea predates the 2026-07-30 chart
 > default flip (`gitea.database.type: postgres`) and is therefore pinned to
@@ -52,21 +54,70 @@ sequences reset, zero startup errors, all users and repos visible afterwards.
 
 Throughout, `NS` is the release namespace and `CTX` your kube context.
 
-### 0. Back up (non-negotiable)
+### 0. Back up (non-negotiable) — and verify the backup
+
+**`kubectl cp` silently truncates large files.** On the dev instance it produced
+a 29 MB copy of a 31 MB database and printed only `Dropping out copy after 0
+retries`; the truncated file still *opened* in sqlite3 and answered queries,
+which is exactly what makes it dangerous. Stream through `tar` instead and
+check the checksum:
 
 ```bash
-# Snapshot the SQLite file plus its WAL sidecars. -wal holds committed data
-# not yet folded into the main file; copying gitea.db alone can lose writes.
-for f in gitea.db gitea.db-wal gitea.db-shm; do
-  kubectl --context=$CTX -n $NS cp srw-gitea-0:/var/lib/gitea/data/$f ./backup/$f -c gitea
-done
-# Fold the WAL into the main file so the copy is self-contained.
-sqlite3 ./backup/gitea.db "PRAGMA wal_checkpoint(TRUNCATE);"
-sqlite3 ./backup/gitea.db "SELECT 'users='||(SELECT COUNT(*) FROM user), 'repos='||(SELECT COUNT(*) FROM repository);"
+kubectl --context=$CTX -n $NS exec $POD -- sh -c 'cd /var/lib/gitea/data && md5sum gitea.db'
+kubectl --context=$CTX -n $NS exec $POD -- \
+  tar cf - -C /var/lib/gitea/data gitea.db gitea.db-wal gitea.db-shm | tar xf - -C ./backup
+
+md5sum ./backup/gitea.db                       # MUST match the in-pod md5
+sqlite3 ./backup/gitea.db "PRAGMA integrity_check;"   # MUST print: ok
 ```
 
-Record those two numbers — they are the acceptance criteria in step 6. Also
-take a volume snapshot of the Gitea PVC if your storage class supports it.
+`-wal` holds committed data not yet folded into the main file, so copy all
+three. Then fold the WAL in and record the acceptance criteria:
+
+```bash
+sqlite3 ./backup/gitea.db "PRAGMA wal_checkpoint(TRUNCATE);"
+sqlite3 ./backup/gitea.db "PRAGMA integrity_check;"
+sqlite3 ./backup/gitea.db "SELECT 'users='||(SELECT COUNT(*) FROM user), \
+  'repos='||(SELECT COUNT(*) FROM repository), \
+  'login_sources='||(SELECT COUNT(*) FROM login_source);"
+```
+
+Those numbers are the acceptance criteria in step 6. Also take a volume
+snapshot of the Gitea PVC if your storage class supports it.
+
+> If Gitea is already guard-blocked (`Init:Error`), you cannot `exec` into it.
+> Scale the StatefulSet to 0 and mount the PVC in a throwaway pod pinned to the
+> same node (`nodeName:` — the PVC is ReadWriteOnce) to take the backup and do
+> the file-parking in step 2.
+
+### 0b. Pre-flight the data against Postgres column limits
+
+**SQLite does not enforce `VARCHAR(n)`; Postgres does.** Any value that
+overflows kills the whole COPY batch, and pgloader then reports `0` rows for
+that table while every other table succeeds — a partial migration that looks
+successful unless you compare row counts. On dev, four `release.title` values
+(max 387 chars) silently dropped all **2665** release rows.
+
+Check every varchar column before loading:
+
+```bash
+# 1. Dump the chart's own schema limits (after step 2 creates the schema)
+kubectl --context=$CTX -n $NS exec srw-giteadb-0 -- env PGPASSWORD=$PW \
+  psql -U gitea -d gitea -tAc \
+  "SELECT table_name||'.'||column_name||'|'||character_maximum_length
+     FROM information_schema.columns
+    WHERE table_schema='public' AND data_type='character varying'
+      AND character_maximum_length IS NOT NULL" > pgcols.txt
+
+# 2. Report any SQLite value exceeding its target limit, then truncate those
+#    values in a WORKING COPY (never the pristine backup):
+cp ./backup/gitea.db ./backup/gitea-migrate.db
+sqlite3 ./backup/gitea-migrate.db \
+  "UPDATE release SET title = substr(title,1,255) WHERE LENGTH(title) > 255;"
+```
+
+Truncating is the honest fix: Gitea running on Postgres could never have stored
+those values, so they are artifacts of SQLite's permissiveness.
 
 ### 1. Flip the overlay to Postgres
 
@@ -194,8 +245,23 @@ pgloader /tmp/gitea-data.load"
 
 `data only` is the load-bearing clause — it keeps Gitea's schema and inserts
 rows into it. `reset sequences` is required, otherwise the first new repo or
-user collides with an existing primary key. Expect `0` in the errors column on
-every table.
+user collides with an existing primary key.
+
+**Read the summary line, not just the exit code.** The leftmost column is
+errors: a `✓` means clean, a number means rows were dropped. Anything other
+than `✓` — go back to step 0b, fix the offending values in the working copy,
+and re-run (the load is idempotent: `truncate` clears the tables first). The
+error detail is in `/tmp/pgloader/*.log` inside the pod, e.g.
+`ERROR Database error 22001: value too long for type character varying(255)`
+with a `CONTEXT: COPY release, line 1508, column title:` naming the culprit.
+
+> On a Fleet-managed cluster the StatefulSet's `replicas` is reverted to 1
+> within ~90 s of a manual `kubectl scale`, so run the load immediately after
+> scaling down. It is fast (dev: 20,492 rows / 22.6 MB in 4.1 s), so the window
+> is ample — but do not leave Gitea scaled to 0 and walk away expecting it to
+> stay there. Note also that you cannot use the preflight guard as the lock
+> here: step 2's schema build lets the postStart hook create the bootstrap
+> admin, so the guard sees one user and reports "migration complete".
 
 > **Air-gapped / flaky-DNS clusters:** if the in-cluster pull of
 > `dimitri/pgloader` fails to resolve `registry-1.docker.io`, pull on the host
@@ -233,6 +299,18 @@ kubectl --context=$CTX -n $NS exec deploy/srw-orchestrator -c orchestrator -- sh
   'curl -s -u "$GITEA_ADMIN_USER:$GITEA_ADMIN_PASSWORD" \
    "http://srw-gitea:3000/api/v1/repos/search?limit=1" -D - -o /dev/null | grep -i x-total-count'
 kubectl --context=$CTX -n $NS exec srw-gitea-0 -c gitea -- gitea admin user list
+```
+
+**Compare every table, not just the headline counts.** This is what catches a
+silently-dropped table (the `release` case above): a whole-table failure leaves
+users and repos perfectly correct. Generate one `UNION ALL` query over the
+non-empty SQLite tables and diff the results:
+
+```bash
+sqlite3 ./backup/gitea-migrate.db \
+  "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+# → count each in both engines; every non-empty table must match exactly.
+# Dev 2026-07-30: 23 non-empty tables, 23 matched, 0 mismatched.
 ```
 
 Then exercise the paths that actually matter for SRW. All four were run on k3d
