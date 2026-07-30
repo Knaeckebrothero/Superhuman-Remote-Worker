@@ -215,6 +215,12 @@ async def acquire_reader_env(
     reader_names = _reader_tool_names(parent_tool_names, allow_writes=allow_writes)
     tools = load_tools(reader_names, reader_context)
 
+    # Readers get their own overlay (own WorkspaceManager); give it a provider
+    # bound to the reader's own tool list — not the parent's.
+    from src.core.virtual_dirs import ToolsProvider
+
+    reader_ws.register_virtual_provider(ToolsProvider(lambda: tools))
+
     port_block = _build_reader_port_block(index, total, worktree_rel)
 
     return ReaderEnv(

@@ -1162,7 +1162,6 @@ class TestSetupTools:
             ),
             patch.object(session, "_scope_skills_for_tool_names"),
             patch.object(session, "_deploy_catalog_skill_files"),
-            patch("src.tools.generate_workspace_tool_docs"),
         ):
             session._setup_tools(None)
 
@@ -1220,7 +1219,6 @@ class TestSetupTools:
             ),
             patch.object(session, "_scope_skills_for_tool_names"),
             patch.object(session, "_deploy_catalog_skill_files"),
-            patch("src.tools.generate_workspace_tool_docs"),
         ):
             session._setup_tools(None)
 
@@ -2485,6 +2483,15 @@ class _SwappableWM:
     def backend(self):
         return self._backend
 
+    @property
+    def virtual_overlay(self):
+        # Virtual dirs are irrelevant to this test double; behave like the
+        # real WorkspaceManager does when VIRTUAL_DIRS_ENABLED is off.
+        return None
+
+    def register_virtual_provider(self, provider):
+        pass
+
     def get_path(self, rel):
         return f"/tmp/ws/{rel}"
 
@@ -2557,7 +2564,6 @@ class TestResetupToolsForBackend:
                 side_effect=lambda x, y: x,
             ),
             patch("src.api.persistent_session.ToolContext"),
-            patch("src.tools.generate_workspace_tool_docs"),
             patch(
                 "src.api.persistent_session.supports_parallel_tool_calls",
                 return_value=False,
