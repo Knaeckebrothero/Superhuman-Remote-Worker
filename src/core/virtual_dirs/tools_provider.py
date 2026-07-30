@@ -38,3 +38,11 @@ class ToolsProvider:
 
     def read(self, name: str) -> Optional[str]:
         return self._render_all().get(name)
+
+    def read_all(self) -> Dict[str, str]:
+        """One render pass for the whole set — see ``VirtualOverlayBackend._read_all``.
+
+        Without it, a root search costs ``entries()`` plus one full re-render
+        per tool doc: ~1,700 ``generate_tool_description`` calls at 40 tools.
+        """
+        return self._render_all()

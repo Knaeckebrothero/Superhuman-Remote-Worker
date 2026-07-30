@@ -281,3 +281,106 @@ def test_writable_provider_write_failure_is_a_readable_error(tmp_path):
     ov.register(Exploding({"plan.md": "# Plan\n"}))
     with pytest.raises(ValueError, match="could not be written"):
         ov.write_file("plan.md", "# New\n")
+
+
+# ---------------------------------------------------------------------------
+# Search cost: one render pass per search, not one per entry.
+# ---------------------------------------------------------------------------
+
+
+class _CountingToolsProvider:
+    """ToolsProvider-shaped provider that counts per-document renders.
+
+    Mirrors the real cost model: ToolsProvider.read() re-renders the WHOLE
+    document set on every call, so entries()+read()-per-name is quadratic in
+    the tool count on the agent's request path.
+    """
+
+    prefix = "tools"
+    is_dir = True
+    writable = False
+
+    def __init__(self, names):
+        self._names = list(names)
+        self.renders = 0
+
+    def _render_all(self):
+        docs = {"README.md": "# Available Tools\n"}
+        for name in self._names:
+            self.renders += 1
+            docs[f"{name}.md"] = f"# {name}\n\nneedle in {name}\n"
+        return docs
+
+    def entries(self):
+        from src.core.backends.overlay import EntryMeta
+
+        return {
+            name: EntryMeta(size=len(body.encode("utf-8")))
+            for name, body in self._render_all().items()
+        }
+
+    def read(self, name):
+        return self._render_all().get(name)
+
+    def read_all(self):
+        return self._render_all()
+
+
+def test_root_search_renders_each_document_once(tmp_path):
+    """Regression: root search was O(N^2) markdown renders.
+
+    _search_provider called entries() (a full render) and then read() per entry
+    — and ToolsProvider.read() re-renders everything per call. With ~40 tools
+    that is ~1,700 generate_tool_description invocations per root search, paid
+    on the agent's request path.
+    """
+    from src.core.backends.overlay import VirtualOverlayBackend
+    from tests._fs_backend import FilesystemTestBackend
+
+    names = [f"tool_{i}" for i in range(10)]
+    provider = _CountingToolsProvider(names)
+    overlay = VirtualOverlayBackend(FilesystemTestBackend(tmp_path))
+    overlay.register(provider)
+
+    hits = overlay.search_files("needle")
+
+    assert len(hits) == len(names)
+    # One pass over the document set, not one pass per entry.
+    assert provider.renders == len(names)
+
+
+def test_search_still_reflects_the_current_document_set(tmp_path):
+    """Freshness must survive the optimization — no cross-call memoization."""
+    from src.core.backends.overlay import VirtualOverlayBackend
+    from tests._fs_backend import FilesystemTestBackend
+
+    provider = _CountingToolsProvider(["tool_a"])
+    overlay = VirtualOverlayBackend(FilesystemTestBackend(tmp_path))
+    overlay.register(provider)
+
+    assert len(overlay.search_files("needle")) == 1
+    provider._names.append("tool_b")
+    assert len(overlay.search_files("needle")) == 2
+
+
+def test_search_falls_back_when_a_provider_has_no_read_all(tmp_path):
+    """read_all() is optional — providers without it must still be searchable."""
+    from src.core.backends.overlay import EntryMeta, VirtualOverlayBackend
+    from tests._fs_backend import FilesystemTestBackend
+
+    class Minimal:
+        prefix = "notes_v"
+        is_dir = True
+        writable = False
+
+        def entries(self):
+            return {"a.md": EntryMeta(size=6)}
+
+        def read(self, name):
+            return "needle" if name == "a.md" else None
+
+    overlay = VirtualOverlayBackend(FilesystemTestBackend(tmp_path))
+    overlay.register(Minimal())
+
+    hits = overlay.search_files("needle")
+    assert [h["path"] for h in hits] == ["notes_v/a.md"]

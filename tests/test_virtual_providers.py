@@ -245,3 +245,65 @@ def test_repeated_reads_during_an_outage_attempt_only_one_fetch_per_window(
         assert "Anna Weber" in provider.read("anna-weber.md")  # stale-served
 
     assert len(calls) == 2  # the warm fetch + exactly one retry, not five
+
+
+# ---------------------------------------------------------------------------
+# Search cost, measured on the REAL providers (not a stand-in).
+# ---------------------------------------------------------------------------
+
+
+def _real_tool_names(count=10):
+    from src.tools.registry import TOOL_REGISTRY
+
+    return sorted(TOOL_REGISTRY)[:count]
+
+
+_REAL_TOOL_NAMES = _real_tool_names()
+
+
+def test_root_search_renders_each_tool_doc_once(tmp_path, monkeypatch):
+    """Regression: a root search re-rendered every tool doc once per entry.
+
+    ``ToolsProvider.read`` renders the WHOLE set to return one document, and the
+    overlay called ``entries()`` (another full render) then ``read()`` per name.
+    At the production tool count (~40) that is ~1,700 ``generate_tool_description``
+    invocations for a single ``search_files`` on the agent's request path.
+    """
+    from src.core.backends.overlay import VirtualOverlayBackend
+    from src.tools.description_manager import DescriptionManager
+    from tests._fs_backend import FilesystemTestBackend
+
+    rendered = []
+    real = DescriptionManager.generate_tool_description
+
+    def counting(self, name):
+        rendered.append(name)
+        return real(self, name)
+
+    monkeypatch.setattr(DescriptionManager, "generate_tool_description", counting)
+
+    # Real registry names: an unregistered name short-circuits to a stub and
+    # would not exercise the rendering cost this test is about.
+    tools = [FakeTool(name, "Does the needle thing.") for name in _REAL_TOOL_NAMES]
+    overlay = VirtualOverlayBackend(FilesystemTestBackend(tmp_path))
+    overlay.register(ToolsProvider(lambda: tools))
+
+    hits = overlay.search_files("needle")
+
+    assert len(hits) == len(tools)
+    assert len(rendered) == len(tools)  # one pass, not one per entry
+
+
+def test_root_search_reflects_a_tool_list_changed_since_the_last_search(tmp_path):
+    """The one-pass optimization must not memoize across calls."""
+    from src.core.backends.overlay import VirtualOverlayBackend
+    from tests._fs_backend import FilesystemTestBackend
+
+    first, second = _REAL_TOOL_NAMES[0], _REAL_TOOL_NAMES[1]
+    tools = [FakeTool(first, "Does the needle thing.")]
+    overlay = VirtualOverlayBackend(FilesystemTestBackend(tmp_path))
+    overlay.register(ToolsProvider(lambda: tools))
+
+    assert len(overlay.search_files("needle")) == 1
+    tools.append(FakeTool(second, "Does the needle thing too."))
+    assert len(overlay.search_files("needle")) == 2

@@ -76,3 +76,7 @@ class ContactsProvider:
 
     def read(self, name: str) -> Optional[str]:
         return self._docs().get(name)
+
+    def read_all(self) -> Dict[str, str]:
+        """One TTL-checked pass for the whole set (see ``_read_all``)."""
+        return self._docs()
