@@ -157,6 +157,38 @@ def test_probe_sees_a_genuinely_seeded_workspace(tmp_path):
     assert unwrap_backend(overlay).exists("task_brief.md")
 
 
+def test_workspace_module_constructs_when_loaded_outside_its_package(tmp_path):
+    """Regression: six test modules load workspace.py via spec_from_file_location.
+
+    That deliberately bypasses ``src/__init__.py`` side effects, so the module
+    has no parent package and a function-local ``from .backends.overlay import
+    ...`` raises ``ImportError: attempted relative import with no known parent
+    package`` inside ``WorkspaceManager.__init__`` — 129 collection errors
+    across the suite. Targeted runs import via the package path and never see
+    it, so this pins the direct-load context explicitly.
+    """
+    import importlib.util
+    import sys
+    from pathlib import Path
+
+    module_path = Path(__file__).resolve().parents[1] / "src" / "core" / "workspace.py"
+    spec = importlib.util.spec_from_file_location("direct_load_workspace", module_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    try:
+        spec.loader.exec_module(module)
+        # Construction — not import — is what trips the relative import.
+        ws = module.WorkspaceManager(
+            job_id="job-direct",
+            config=module.WorkspaceManagerConfig(base_path=str(tmp_path)),
+            backend=FilesystemTestBackend(tmp_path),
+        )
+        assert ws.virtual_overlay is not None
+    finally:
+        sys.modules.pop(spec.name, None)
+
+
 def test_production_probe_call_sites_bypass_the_overlay():
     """Tripwire pinning the real call sites, not just the helper.
 
