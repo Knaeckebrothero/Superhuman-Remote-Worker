@@ -107,6 +107,24 @@ class TestResolveUploadedInstructions:
         assert result is None
 
     @pytest.mark.asyncio
+    async def test_inline_short_circuits_even_when_upload_id_is_also_set(self):
+        """Inline wins over upload (mirrors the deleted if/elif), so when both
+        are present the download must never be attempted — regression test
+        for a real bug: an earlier version resolved the upload unconditionally,
+        paying an HTTP round-trip + local glob on every job with both fields
+        set even though the result was always going to be discarded."""
+        agent = _bare_agent(MagicMock())
+        agent._download_upload_files = AsyncMock(
+            side_effect=AssertionError("must not attempt I/O when inline is present")
+        )
+
+        result = await agent._resolve_uploaded_instructions(
+            {"instructions": "INLINE", "instructions_upload_id": "up-1"}
+        )
+
+        assert result is None
+
+    @pytest.mark.asyncio
     async def test_http_download_wins_when_available(self):
         agent = _bare_agent(MagicMock())
 
