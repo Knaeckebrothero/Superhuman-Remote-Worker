@@ -21,6 +21,12 @@ import {ContactListComponent} from './contact-list.component';
       <h2>{{ 'contacts.title' | transloco }}</h2>
       <button [disabled]="showForm()" (click)="openNew()">{{ 'contacts.new' | transloco }}</button>
     </div>
+    @if (saveError(); as err) {
+      <div class="error-msg">
+        <span>{{ err }}</span>
+        <button (click)="saveError.set(null)">{{ 'common.dismiss' | transloco }}</button>
+      </div>
+    }
     <div class="filters">
       <input [ngModel]="q()" (ngModelChange)="q.set($event); reload()"
         [placeholder]="'contacts.search' | transloco" />
@@ -41,7 +47,7 @@ import {ContactListComponent} from './contact-list.component';
     <app-contact-list [contacts]="contacts()" (edit)="openEdit($event)" (remove)="askDelete($event)" />
     @if (deleting(); as target) {
       <app-confirm-name-dialog
-        [open]="true"
+        [open]="!!deleting()"
         [title]="'contacts.delete.title' | transloco"
         [message]="deleteMessage(target)"
         [requiredName]="target.display_name"
@@ -53,6 +59,9 @@ import {ContactListComponent} from './contact-list.component';
   styles: [`
     .page-header { display: flex; justify-content: space-between; align-items: center; }
     .filters { display: flex; gap: .5rem; margin: .5rem 0 1rem; }
+    .error-msg { display: flex; align-items: center; justify-content: space-between;
+      gap: .5rem; padding: .5rem .75rem; margin: .5rem 0; border-radius: 6px;
+      background: var(--danger-tint); border: 1px solid var(--danger-tint); color: var(--danger); }
   `],
 })
 export class ContactsPageComponent implements OnInit {
@@ -65,6 +74,7 @@ export class ContactsPageComponent implements OnInit {
   readonly showForm = signal(false);
   readonly editing = signal<Contact | null>(null);
   readonly deleting = signal<Contact | null>(null);
+  readonly saveError = signal<string | null>(null);
   readonly q = signal('');
   readonly channel = signal('');
   readonly projectId = signal('');
@@ -102,6 +112,7 @@ export class ContactsPageComponent implements OnInit {
   }
 
   save(result: ContactFormResult): void {
+    this.saveError.set(null);
     const existing = this.editing();
     const base$ = existing
       ? this.api.update(existing.id, {display_name: result.display_name, notes: result.notes})
@@ -131,6 +142,12 @@ export class ContactsPageComponent implements OnInit {
       }
       return ops.length ? forkJoin(ops) : of(null);
     })).subscribe({next: () => { this.closeForm(); this.reload(); },
-                   error: () => this.reload()});
+                   error: () => {
+                     // forkJoin fails fast: some ops may already have applied server-side.
+                     // No rollback — surface the failure and reload to show real state;
+                     // the (still-open) form keeps the user's input so they can retry.
+                     this.saveError.set(this.transloco.translate('contacts.saveError'));
+                     this.reload();
+                   }});
   }
 }
