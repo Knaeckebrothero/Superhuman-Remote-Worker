@@ -26417,16 +26417,18 @@ async def upload_files_to_thread(
 ) -> dict[str, Any]:
     """Push files into a persistent thread workspace's ``uploads/`` directory.
 
-    Files are SFTP'd into ``<workspace_path>/uploads/`` on the live
-    workspace container (or VM). The cockpit then appends an
-    ``Attached files: …`` hint to the user's next message so the agent
-    can find them. See ``services/thread_uploads.py`` for SSH details.
+    Lands in ``<workspace_path>/uploads/`` over SFTP for the pod/VM tiers, or
+    under ``threads/<id>/uploads/`` in the object store for the ``virtual``
+    tier. The cockpit then appends an ``Attached files: …`` hint to the user's
+    next message so the agent can find them, identically for either transport.
+    See ``services/thread_uploads.py``.
 
     Returns:
         ``{"thread_id": "...", "files": [{name, size, mime_type, path}, ...]}``
     """
     from services.thread_uploads import (
         ThreadUploadError,
+        resolve_thread_upload_destination,
         upload_files_to_thread_workspace,
     )
 
@@ -26434,6 +26436,18 @@ async def upload_files_to_thread(
 
     if not files:
         raise HTTPException(status_code=400, detail="No files provided")
+
+    # Decide the destination before materializing bodies. FastAPI has already
+    # parsed the multipart by now, so this saves the second in-memory copy
+    # rather than the transfer — but it also keeps a tier that can never accept
+    # files from looking like a transient failure.
+    try:
+        destination = resolve_thread_upload_destination(thread)
+    except ThreadUploadError as e:
+        logger.warning(
+            "Thread upload refused for %s: %d %s", thread_id, e.status_code, e.detail
+        )
+        raise HTTPException(status_code=e.status_code, detail=e.detail) from e
 
     payloads: list[tuple[str, bytes, str]] = []
     for f in files:
@@ -26447,7 +26461,9 @@ async def upload_files_to_thread(
         )
 
     try:
-        results = await upload_files_to_thread_workspace(thread, payloads)
+        results = await upload_files_to_thread_workspace(
+            thread, payloads, destination=destination
+        )
     except ThreadUploadError as e:
         logger.warning(
             "Thread upload failed for %s: %d %s", thread_id, e.status_code, e.detail
