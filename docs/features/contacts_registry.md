@@ -180,6 +180,8 @@ search…                          filter: project | channel
 
 *(Amended 2026-07-30: originally materialized files; now a virtual projection via [[virtual_directories]]. The rendered file format below is unchanged.)*
 
+*(Reverted 2026-07-30: the boot-time materialization code — `_gather_project_contacts` in `orchestrator/main.py` and its call sites, the `contacts` lever through `resolve_config`/`load_config_from_resolved`, and the workspace write loops in `src/agent.py` / `src/api/persistent_session.py` — is removed now that the amendment above supersedes it. Its body (resolve the job/session's project(s) → `get_project_contacts` → dedupe by contact id → render via `contacts_to_workspace_files`) is the designated body for the ContactsProvider's orchestrator internal endpoint; only the transport changes, from a boot-time config blob to a live fetch with a ~60s TTL keyed by job/thread identity. `src/core/contact_files.py` is retained as that renderer but is currently dormant — it still needs a `README.md` index renderer, which the provider requires and the module does not yet have.)*
+
 **DB is the source of truth; the agent sees a read-only virtual projection.** The [[virtual_directories]] ContactsProvider serves `contacts/<slug>.md` for every contact linked to the job's project — live through the file tools (orchestrator internal endpoint, ~60s TTL cache), plus a `README.md` index (display name + channel chips). Nothing is written to the workspace filesystem:
 
 ```markdown

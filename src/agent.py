@@ -3268,19 +3268,6 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             self._workspace_manager.write_file(ws_path, content)
             logger.debug(f"Deployed skill file to workspace: {ws_path}")
 
-        # Contacts projection (docs/features/contacts_registry.md): read-only
-        # discovery files; DB is truth, sends authorize server-side. Same
-        # write path as skills; regenerated (overwritten) every deploy.
-        contacts_files = self.config.extra.get("_resolved_contacts", {}).get(
-            "files", {}
-        )
-        for ws_path, content in contacts_files.items():
-            parent_dir = str(Path(ws_path).parent)
-            if parent_dir and parent_dir != ".":
-                self._workspace_manager.backend.mkdir(parent_dir)
-            self._workspace_manager.write_file(ws_path, content)
-            logger.debug(f"Deployed contact file to workspace: {ws_path}")
-
     async def _register_initial_documents_background(
         self, context: "ToolContext"
     ) -> None:

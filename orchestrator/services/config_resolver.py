@@ -69,7 +69,6 @@ def resolve_config(
     expert_type: str = "session",
     capture: Optional[dict] = None,
     skills: Optional[dict] = None,
-    contacts: Optional[dict] = None,
 ) -> dict:
     """Resolve the full agent config to a ``serialize_resolved_config``-shaped blob.
 
@@ -182,13 +181,6 @@ def resolve_config(
     # blob shape identical for jobs and sessions and unit-testable without a DB.
     if skills:
         blob["skills"] = skills
-
-    # Contacts projection (docs/features/contacts_registry.md): same lever as
-    # skills — gathered by the caller (DB I/O lives in orchestrator/main.py),
-    # attached here so the blob shape is identical for jobs and sessions and
-    # unit-testable without a DB.
-    if contacts:
-        blob["contacts"] = contacts
 
     return blob
 

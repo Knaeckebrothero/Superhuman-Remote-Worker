@@ -1687,9 +1687,6 @@ async def _resolve_session_config(
         _skills_payload = await _gather_in_scope_skills(
             user_id, [project_id] if project_id else None
         )
-        _contacts_payload = await _gather_project_contacts(
-            user_id, [project_id] if project_id else None
-        )
         # Per-model registry overrides must reach the matrix as explicit llm
         # keys, else the blob bakes the family window and the admin
         # context_window cap is silently dropped (see
@@ -1706,7 +1703,6 @@ async def _resolve_session_config(
             expert_type="session",
             capture=_cap,
             skills=_skills_payload,
-            contacts=_contacts_payload,
         )
         # Bound skills are delivered deterministically (instructions channel);
         # strip them from the model-invoked catalog so they aren't double-offered.
@@ -2712,10 +2708,6 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
                     str(job["user_id"]) if job.get("user_id") else None,
                     [str(job["project_id"])] if job.get("project_id") else None,
                 )
-                _contacts_payload = await _gather_project_contacts(
-                    str(job["user_id"]) if job.get("user_id") else None,
-                    [str(job["project_id"])] if job.get("project_id") else None,
-                )
                 # Per-model registry overrides (context_window; later
                 # max_output_tokens) must reach the matrix as explicit llm keys,
                 # else the blob bakes the family window and the admin cap is
@@ -2732,7 +2724,6 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
                     expert_type="worker",
                     capture=_cap,
                     skills=_skills_payload,
-                    contacts=_contacts_payload,
                 )
                 # Bound skills are delivered deterministically (instructions channel);
                 # strip them from the model-invoked catalog so they aren't double-offered.
@@ -28013,42 +28004,6 @@ async def _gather_in_scope_skills(
             files[row["name"]] = await postgres_db.get_skill_files(row["_ref"])
 
     return {"menu": menu, "files": files}
-
-
-def _is_contacts_materialize_enabled() -> bool:
-    return os.getenv("CONTACTS_MATERIALIZE_ENABLED", "true").strip().lower() not in (
-        "false",
-        "0",
-        "no",
-        "off",
-    )
-
-
-async def _gather_project_contacts(
-    user_id: str | None, project_ids: list[str] | None = None
-) -> dict[str, Any]:
-    """Resolved-blob contacts payload: contacts/<slug>.md files for every
-    contact linked to the job's project(s). Read-only projection — DB stays
-    truth; sends authorize server-side regardless. {} when gated off.
-    Failures degrade discovery, never job start."""
-    from src.core.contact_files import contacts_to_workspace_files
-
-    if not _is_contacts_materialize_enabled() or not user_id or not project_ids:
-        return {}
-    try:
-        seen: set[str] = set()
-        rows: list[dict[str, Any]] = []
-        for pid in project_ids:
-            for c in await postgres_db.get_project_contacts(str(pid)):
-                if str(c["id"]) not in seen:
-                    seen.add(str(c["id"]))
-                    rows.append(c)
-        if not rows:
-            return {}
-        return {"files": contacts_to_workspace_files(rows)}
-    except Exception:
-        logger.exception("contacts materialization gather failed (non-fatal)")
-        return {}
 
 
 async def _create_forked_skill(

@@ -4,6 +4,11 @@ DB is the source of truth; these files are a read-only projection written at
 job/session start (same lever as skills/). Frontmatter scalars are emitted via
 json.dumps — JSON is valid YAML flow syntax, so this needs no yaml dependency
 (this module is imported by the orchestrator image; keep it stdlib-only).
+
+Currently dormant: its boot-time caller was reverted in favour of a
+virtual-directory overlay (docs/features/virtual_directories.md). This module
+is retained as the designated renderer for that design's ContactsProvider,
+which will call it from a live, TTL-cached read path instead.
 """
 
 from __future__ import annotations
