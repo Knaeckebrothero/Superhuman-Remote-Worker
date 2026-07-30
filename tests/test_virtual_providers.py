@@ -1,4 +1,8 @@
-from src.core.virtual_dirs import SingleFileProvider, ToolsProvider
+from src.core.virtual_dirs import (
+    SingleFileProvider,
+    ToolsProvider,
+    build_instruction_providers,
+)
 from src.tools.description_manager import generate_tool_index
 
 
@@ -63,3 +67,70 @@ def test_single_file_provider_renders_lazily():
     provider.read("task_brief.md")
     provider.read("task_brief.md")
     assert len(calls) == 2  # always live, never cached
+
+
+def _providers(uploaded=None, template="TEMPLATE", brief="# Task Brief\n"):
+    return {
+        p.prefix: p
+        for p in build_instruction_providers(
+            uploaded=lambda: uploaded,
+            template=lambda: template,
+            brief=lambda: brief,
+        )
+    }
+
+
+def test_builds_both_instruction_files():
+    assert set(_providers()) == {"instructions.md", "task_brief.md"}
+
+
+def test_uploaded_instructions_beat_the_template():
+    provider = _providers(uploaded="UPLOADED")["instructions.md"]
+    assert provider.read("instructions.md") == "UPLOADED"
+
+
+def test_template_is_used_when_no_upload():
+    provider = _providers(uploaded=None)["instructions.md"]
+    assert provider.read("instructions.md") == "TEMPLATE"
+
+
+def test_blank_upload_falls_back_to_template():
+    provider = _providers(uploaded="   ")["instructions.md"]
+    assert provider.read("instructions.md") == "TEMPLATE"
+
+
+def test_source_precedence_is_inline_then_upload_then_template():
+    """Mirrors the agent's `_uploaded_instructions` closure contract."""
+
+    def resolver(inline, upload):
+        def _resolve():
+            if inline and inline.strip():
+                return inline
+            return upload
+
+        return _resolve
+
+    def _read(inline, upload):
+        providers = {
+            p.prefix: p
+            for p in build_instruction_providers(
+                uploaded=resolver(inline, upload),
+                template=lambda: "TEMPLATE",
+                brief=lambda: "",
+            )
+        }
+        return providers["instructions.md"].read("instructions.md")
+
+    assert _read("INLINE", "UPLOAD") == "INLINE"
+    assert _read(None, "UPLOAD") == "UPLOAD"
+    assert _read(None, None) == "TEMPLATE"
+
+
+def test_task_brief_is_served_from_the_callable():
+    provider = _providers(brief="# Task Brief\n\nDo the thing.")["task_brief.md"]
+    assert "Do the thing." in provider.read("task_brief.md")
+
+
+def test_instruction_providers_are_read_only():
+    for provider in _providers().values():
+        assert not provider.writable and not provider.is_dir
