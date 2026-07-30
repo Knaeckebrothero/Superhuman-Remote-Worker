@@ -5105,5 +5105,4 @@ def load_config_from_resolved(resolved: dict) -> AgentConfig:
     config.extra["_resolved_prompts"] = resolved.get("prompts", {})
     config.extra["_resolved_instructions"] = resolved.get("instructions", {})
     config.extra["_resolved_skills"] = resolved.get("skills") or {}
-    config.extra["_resolved_contacts"] = resolved.get("contacts") or {}
     return config
