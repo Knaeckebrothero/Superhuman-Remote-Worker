@@ -343,3 +343,26 @@ class VirtualOverlayBackend:
         if name.startswith("_"):
             raise AttributeError(name)
         return getattr(self._inner, name)
+
+
+def unwrap_backend(backend: Any) -> Any:
+    """Return the real backend behind a virtual overlay.
+
+    Two classes of caller need this:
+
+    * **Sentinel probes** asking "does this workspace still hold its seeded
+      files?" — a virtual file always exists, so probing through the overlay
+      classifies a wiped workspace as seeded and skips re-seeding.
+    * **Non-tool-layer consumers** such as cloud sync, which must operate on
+      the real filesystem: virtual content is framework projection, not user
+      data, and writing back into a virtual prefix raises ``VirtualPathError``.
+
+    Typed on ``VirtualOverlayBackend`` rather than duck-typed on ``.inner``: a
+    ``MagicMock`` auto-creates every attribute, so ``getattr(mock, "inner",
+    mock)`` silently hands back a child mock and a test's stand-in backend
+    stops being the object under test.
+
+    Lives here, not in ``src.core.virtual_dirs``, so importing it costs nothing
+    — that package pulls in the whole tool registry (~13s to import).
+    """
+    return backend.inner if isinstance(backend, VirtualOverlayBackend) else backend
