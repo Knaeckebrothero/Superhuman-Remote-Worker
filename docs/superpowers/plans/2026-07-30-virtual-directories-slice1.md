@@ -1055,6 +1055,28 @@ def test_legacy_write_helpers_are_gone():
     import src.tools as tools_pkg
 
     assert not hasattr(tools_pkg, "generate_workspace_tool_docs")
+
+
+def test_provider_serves_full_docstrings_after_overrides_rebind(tmp_path, monkeypatch):
+    """Deferred tools must reach tools/<name>.md with FULL docstrings.
+
+    apply_description_overrides() returns copies carrying short blurbs and the
+    caller rebinds its tool attribute to them. A provider bound to that
+    rebound attribute would serve blurbs — defeating the deferred-tool design.
+    The provider must hold the pre-override objects.
+    """
+    from src.tools.description_manager import apply_description_overrides
+
+    full_tools = [FakeTool("read_file", "Full docstring, every argument explained.")]
+    ws = _manager(tmp_path, monkeypatch)
+    ws.register_virtual_provider(ToolsProvider(lambda: full_tools))
+
+    # Simulate the boot sequence: overrides run and rebind the agent's list.
+    _rebound = apply_description_overrides(list(full_tools))
+
+    assert "Full docstring, every argument explained." in ws.read_file(
+        "tools/read_file.md"
+    )
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -1160,14 +1182,24 @@ Add near the other properties:
         # served from the live tool list, never written to the workspace.
         from .core.virtual_dirs import ToolsProvider, sweep_legacy_tools_dir
 
+        # CRITICAL: hold the PRE-override tool objects. Further down,
+        # `self._tools = apply_description_overrides(self._tools)` rebinds the
+        # attribute to copies whose deferred-tool descriptions are short
+        # blurbs. A provider reading `self._tools` at call time would render
+        # those blurbs into tools/<name>.md and defeat the whole deferred-tool
+        # design (short in context, FULL on disk). apply_description_overrides
+        # returns copies, so the originals this list holds stay full.
+        self._full_description_tools = self._tools
         self._workspace_manager.register_virtual_provider(
-            ToolsProvider(lambda: self._tools)
+            ToolsProvider(lambda: self._full_description_tools)
         )
         if self._workspace_manager.virtual_overlay is not None:
             sweep_legacy_tools_dir(self._workspace_manager.virtual_overlay.inner)
 
         loaded_tool_names = [t.name for t in self._tools]
 ```
+
+Any path that changes the tool set (the virtual→sandbox upgrade re-derive) re-runs this setup and reassigns `self._full_description_tools`, so live-list freshness is preserved.
 
 Remove the now-unused `generate_workspace_tool_docs` name from the import block at `src/agent.py:60`.
 
@@ -1177,8 +1209,12 @@ Remove the now-unused `generate_workspace_tool_docs` name from the import block 
         # Tool docs are virtual (docs/features/virtual_directories.md).
         from ..core.virtual_dirs import ToolsProvider, sweep_legacy_tools_dir
 
+        # Pre-override objects — see the CRITICAL note in the agent.py step:
+        # `self.tools = apply_description_overrides(self.tools)` below rebinds
+        # the attribute to short-description copies.
+        self._full_description_tools = self.tools
         self.workspace_manager.register_virtual_provider(
-            ToolsProvider(lambda: self.tools)
+            ToolsProvider(lambda: self._full_description_tools)
         )
         if self.workspace_manager.virtual_overlay is not None:
             sweep_legacy_tools_dir(self.workspace_manager.virtual_overlay.inner)
