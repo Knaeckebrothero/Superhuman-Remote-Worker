@@ -1336,6 +1336,33 @@ def test_blank_upload_falls_back_to_template():
     assert provider.read("instructions.md") == "TEMPLATE"
 
 
+def test_source_precedence_is_inline_then_upload_then_template():
+    """Mirrors the agent's `_uploaded_instructions` closure contract."""
+
+    def resolver(inline, upload):
+        def _resolve():
+            if inline and inline.strip():
+                return inline
+            return upload
+
+        return _resolve
+
+    def _read(inline, upload):
+        providers = {
+            p.prefix: p
+            for p in build_instruction_providers(
+                uploaded=resolver(inline, upload),
+                template=lambda: "TEMPLATE",
+                brief=lambda: "",
+            )
+        }
+        return providers["instructions.md"].read("instructions.md")
+
+    assert _read("INLINE", "UPLOAD") == "INLINE"
+    assert _read(None, "UPLOAD") == "UPLOAD"
+    assert _read(None, None) == "TEMPLATE"
+
+
 def test_task_brief_is_served_from_the_callable():
     provider = _providers(brief="# Task Brief\n\nDo the thing.")["task_brief.md"]
     assert "Do the thing." in provider.read("task_brief.md")
@@ -1378,6 +1405,22 @@ def build_instruction_providers(*, uploaded, template, brief) -> list:
     ]
 ```
 
+**3a-bis. Resolve the instructions source eagerly (do this first).**
+
+`instructions.md` has three sources with the priority the code comments already state — **inline > upload > template**:
+
+1. `metadata["instructions"]` — inline content, available on every path including resume.
+2. `metadata["instructions_upload_id"]` — requires `await self._download_upload_files(...)` over HTTP, with a local `uploads/<id>` fallback. **Async I/O.**
+3. the rendered template.
+
+A provider's `read()` is synchronous, so source 2 cannot be resolved lazily inside it. Resolve it eagerly where the async code already lives and change only its *sink*:
+
+- Add `self._resolved_instructions_md: Optional[str] = None` beside `self._job_metadata` (`src/agent.py:211`).
+- In the upload branch (~2212-2277), replace every `self._workspace_manager.write_file("instructions.md", content)` with `self._resolved_instructions_md = content`. Keep the HTTP-then-local fallback order and the logging exactly as-is; only the sink changes. The `instructions_written` bookkeeping stays — it still drives the fallback chain.
+- Delete the inline branch's `write_file` (~2206-2211); the provider reads `metadata["instructions"]` directly, so nothing needs storing.
+
+**The resume trap.** `_setup_job_workspace` returns early on the resume path (~2196) *before* the instructions block. That was fine when `instructions.md` persisted on disk from the previous run — but a virtual file persists nothing, so a resumed job with an **upload** would silently fall back to the template. Move the upload resolution so it runs on the resume path too (extract it into an `async def _resolve_uploaded_instructions(self, metadata) -> Optional[str]` helper and call it on both paths, before the early return). Inline needs no such care — it is read from `metadata` at serve time. If this restructuring turns out not to be feasible in that function's shape, stop and report NEEDS_CONTEXT rather than shipping the regression.
+
 **3b.** In `src/agent.py._deploy_instruction_files`, delete the `instructions.md` block (the `if not self._workspace_manager.exists("instructions.md"):` guard and its body, ~3118-3126) and register providers instead. `_deploy_instruction_files` already receives `loaded_tool_names`, which the template render needs:
 
 ```python
@@ -1391,7 +1434,13 @@ def build_instruction_providers(*, uploaded, template, brief) -> list:
         metadata = self._job_metadata or {}
 
         def _uploaded_instructions():
-            return metadata.get("instructions")
+            # Priority inline > upload (the template is the caller's fallback).
+            # Inline is read live so it survives the resume path; upload content
+            # was resolved eagerly at boot because its I/O is async.
+            inline = metadata.get("instructions")
+            if inline and inline.strip():
+                return inline
+            return self._resolved_instructions_md
 
         def _rendered_template():
             content = load_instructions(self.config, model=self.config.llm.model)
