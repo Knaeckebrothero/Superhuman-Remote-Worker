@@ -37,6 +37,7 @@ export interface OfficerSummary {
     hold?: {kind?: string; thread_id?: string; since?: string} | null;
     slots?: Record<string, OfficerSlotSpec> | null;
     model?: string | null;
+    reasoning_level?: string | null;
     sleep_minutes?: {min: number; max: number};
   } | null;
   next_wake_at?: string | null;
@@ -156,7 +157,10 @@ export function nextWakeLabel(fireAt: string | null | undefined): string {
             </div>
             <div>
               <span class="k">His model</span>
-              <span class="v" data-testid="officer-model">{{ o.model || 'session default' }}</span>
+              <span class="v" data-testid="officer-model">
+                {{ o.model || 'session default' }}
+                @if (o.reasoning_level) { · {{ o.reasoning_level }} }
+              </span>
             </div>
           </div>
 
@@ -217,6 +221,19 @@ export function nextWakeLabel(fireAt: string | null | undefined): string {
                 @for (m of modelOptions(); track m) {
                   <option [value]="m">{{ m }}</option>
                 }
+              </app-select>
+            </app-form-field>
+            <app-form-field
+              label="Reasoning"
+              hint="Effort per wake. Clamped to what the model supports."
+            >
+              <app-select [value]="fReasoning()" (changed)="fReasoning.set($event ?? '')">
+                <option value="">default (high)</option>
+                <option value="low">low</option>
+                <option value="medium">medium</option>
+                <option value="high">high</option>
+                <option value="xhigh">xhigh</option>
+                <option value="max">max</option>
               </app-select>
             </app-form-field>
           </div>
@@ -351,6 +368,8 @@ export class ProjectOfficerComponent implements OnInit, OnDestroy {
   // his workers run on — the classic mistake is arming the troops and leaving
   // the commander on the account default.
   readonly fBrainModel = signal('');
+  // His reasoning effort per wake ('' = family default, which is high).
+  readonly fReasoning = signal('');
 
   private pollHandle: ReturnType<typeof setInterval> | null = null;
 
@@ -443,6 +462,7 @@ export class ProjectOfficerComponent implements OnInit, OnDestroy {
       config_override: {officer},
     };
     if (this.fBrainModel().trim()) body['model'] = this.fBrainModel().trim();
+    if (this.fReasoning()) body['reasoning_level'] = this.fReasoning();
     try {
       const resp = await firstValueFrom(
         this.http.post<{thread_id: string}>(
