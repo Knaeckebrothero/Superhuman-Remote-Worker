@@ -196,6 +196,24 @@ def test_swap_backend_without_an_overlay_still_swaps(tmp_path, monkeypatch):
     assert ws.backend is new_backend
 
 
+def test_swap_backend_does_not_unwrap_a_stand_in_backend(tmp_path, monkeypatch):
+    """``getattr(new_backend, "inner", new_backend)`` swaps in a child mock.
+
+    ``unwrap_backend`` is isinstance-typed on ``VirtualOverlayBackend`` for
+    exactly this reason (``src/core/backends/overlay.py``): a ``MagicMock``
+    auto-creates every attribute, so duck-typing on ``.inner`` silently hands
+    back a child mock and the manager stops pointing at the backend the caller
+    passed. ``swap_backend`` must use the helper, not ``getattr``.
+    """
+    from unittest.mock import MagicMock
+
+    ws = _manager(tmp_path, monkeypatch)
+    new_backend = MagicMock()
+    ws.swap_backend(new_backend)
+    assert ws.virtual_overlay is not None
+    assert ws.virtual_overlay.inner is new_backend
+
+
 def test_production_backend_swaps_go_through_swap_backend():
     """Tripwire: no production site may assign ``_backend`` directly.
 
