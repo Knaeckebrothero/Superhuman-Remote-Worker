@@ -20,7 +20,7 @@ import os
 from contextlib import asynccontextmanager
 from datetime import datetime
 from enum import Enum
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket
 from fastapi.responses import JSONResponse
@@ -219,16 +219,97 @@ def _check_job_preempted(response: Dict[str, Any]) -> None:
     _request_stop(reason)
 
 
+# Supervisor-guidance inbox (P1-A of
+# docs/issues/officer_blind_reads_and_worker_bureaucracy.md): the
+# non-destructive steer lane. The heartbeat response carries the job's
+# ``context.pending_guidance`` (entries ``{id, text, source, created_at}``);
+# the graph renders the inbox as a transient [SUPERVISOR GUIDANCE] block each
+# LLM turn (src/graph.py) and acks rendered entries so the orchestrator moves
+# them to ``context.consumed_replies``. Once the orchestrator stops sending an
+# id the inbox prunes it. Worst-case delivery latency = one heartbeat interval
+# (set by the orchestrator at registration, currently 60s) + the time to the
+# worker's next LLM turn. Entries survive pod death before the ack — still
+# pending in job context, so the successor pod gets them redelivered.
+_guidance_inbox: Dict[str, List[Dict[str, Any]]] = {}
+
+
+def get_pending_guidance(job_id: str) -> List[Dict[str, Any]]:
+    """Public helper for the worker graph: pending guidance for ``job_id``."""
+    return list(_guidance_inbox.get(job_id, []))
+
+
+def ack_guidance(
+    job_id: str,
+    guidance_ids: Optional[List[str]] = None,
+    reply_threads: Optional[List[str]] = None,
+) -> None:
+    """Fire-and-forget ack: mark guidance/queued replies consumed on the orchestrator.
+
+    Best-effort by design — on failure the entries stay in
+    ``context.pending_guidance``/``context.queued_replies`` and are simply
+    redelivered (at-least-once). Never blocks the graph.
+    """
+    client = _orchestrator_client
+    if client is None or not (guidance_ids or reply_threads):
+        return
+
+    async def _send() -> None:
+        try:
+            await client.ack_job_guidance(
+                job_id,
+                guidance_ids=list(guidance_ids or []),
+                reply_threads=list(reply_threads or []),
+            )
+        except Exception as e:
+            logger.debug(f"Guidance ack for job {job_id} failed (will redeliver): {e}")
+
+    try:
+        asyncio.get_running_loop().create_task(_send())
+    except RuntimeError:
+        # No running loop (sync/test context) — skip; redelivery covers it.
+        pass
+
+
+def _update_guidance_inbox(response: Dict[str, Any]) -> None:
+    """Replace the inbox for the current job from the heartbeat response.
+
+    The orchestrator is the source of truth: a present list overwrites the
+    inbox wholesale (so consumed entries prune themselves once the ack has
+    landed), an empty list clears it, and a missing/None field (older
+    orchestrator, or the job lookup failed) leaves the inbox untouched.
+    """
+    job_id = _current_job_id
+    if _pod_state != PodState.WORKING or not job_id:
+        return
+    if not isinstance(response, dict):
+        return
+    entries = response.get("pending_guidance")
+    if not isinstance(entries, list):
+        return
+    valid = [e for e in entries if isinstance(e, dict)]
+    if valid:
+        if _guidance_inbox.get(job_id) != valid:
+            logger.info(
+                f"Supervisor guidance pending for job {job_id}: {len(valid)} entr"
+                f"{'y' if len(valid) == 1 else 'ies'}"
+            )
+        _guidance_inbox[job_id] = valid
+    else:
+        _guidance_inbox.pop(job_id, None)
+
+
 async def _handle_heartbeat_intents(response: Dict[str, Any]) -> None:
     """Heartbeat-response callback: react to orchestrator-set intents.
 
-    Runs the job-status preemption backstop first, then drain intents.
-    Idle workers (``ready`` status, no job) exit immediately to free
-    the slot for a fresh-version pod. Busy workers just record the
-    intent — the graph reacts at its next safe boundary.
+    Runs the job-status preemption backstop first, then the supervisor-
+    guidance inbox update, then drain intents. Idle workers (``ready``
+    status, no job) exit immediately to free the slot for a fresh-version
+    pod. Busy workers just record the intent — the graph reacts at its
+    next safe boundary.
     """
     global _drain_intent_received, _drain_intent_handled
     _check_job_preempted(response)
+    _update_guidance_inbox(response)
     intents = response.get("intents") or {}
     if not isinstance(intents, dict) or not intents.get("should_drain"):
         return
@@ -439,6 +520,9 @@ async def _reset_to_idle(
         _current_job_id = None
         _current_job_task = None
         _clear_stop()
+        # Guidance is job-scoped; anything unrendered is still pending in job
+        # context on the orchestrator and will be redelivered on re-dispatch.
+        _guidance_inbox.clear()
 
         if _pod_state == PodState.SESSION and not skip_session_cleanup:
             try:
@@ -1038,6 +1122,7 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
                     metadata=resume_metadata if resume_metadata else None,
                     resume=True,
                     feedback=request.feedback,
+                    feedback_reason=request.feedback_reason,
                     original_config_name=request.config_name,
                     previous_status=request.previous_status,
                     stream=True,

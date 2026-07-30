@@ -70,7 +70,7 @@ from datetime import date, datetime, timedelta, timezone  # noqa: E402
 from decimal import Decimal  # noqa: E402
 from collections.abc import Coroutine, Mapping  # noqa: E402
 from typing import Any, Literal, Optional  # noqa: E402
-from uuid import UUID  # noqa: E402
+from uuid import UUID, uuid4  # noqa: E402
 
 import asyncpg  # noqa: E402
 import yaml  # noqa: E402
@@ -3091,6 +3091,7 @@ async def _resume_job_on_agent(job: dict, agent: dict) -> bool:
         if isinstance(job_context, str):
             job_context = json.loads(job_context)
         queued_feedback = job_context.pop("queued_feedback", None)
+        queued_feedback_reason = job_context.pop("queued_feedback_reason", None)
         delegation_results = job_context.pop("delegation_results", None)
 
         resume_payload = {
@@ -3106,6 +3107,8 @@ async def _resume_job_on_agent(job: dict, agent: dict) -> bool:
         }
         if queued_feedback:
             resume_payload["feedback"] = queued_feedback
+            if queued_feedback_reason:
+                resume_payload["feedback_reason"] = queued_feedback_reason
         if delegation_results:
             resume_payload["delegation_results"] = delegation_results
 
@@ -3146,6 +3149,7 @@ async def _resume_job_on_agent(job: dict, agent: dict) -> bool:
             key
             for key, value in (
                 ("queued_feedback", queued_feedback),
+                ("queued_feedback_reason", queued_feedback_reason),
                 ("delegation_results", delegation_results),
             )
             if value
@@ -9906,6 +9910,53 @@ async def _notify_operator_freeze(
     logger.info(f"Freeze notification sent for job {job_id} ({freeze_type})")
 
 
+# Fallback reason for interrupt-style replies that could not ride the
+# guidance lane (job not processing → resumed instead). Rendered verbatim
+# in the worker's [FEEDBACK_RESUME] banner.
+_URGENT_RESUME_REASON = (
+    "An urgent operator message arrived while this job was not running; "
+    "the job was resumed to deliver it."
+)
+
+
+async def _queue_supervisor_guidance(
+    job: dict[str, Any], thread_id: str, message: str
+) -> str | None:
+    """Non-destructive urgent steer (P1-A): append to ``context.pending_guidance``.
+
+    The entry rides the agent-heartbeat response into the worker's next LLM
+    turn as a transient [SUPERVISOR GUIDANCE] block — no pause, no pod
+    replacement, no context compaction, no forced re-plan (the old urgent arm
+    was a hidden resume-with-feedback that destroyed the worker's in-flight
+    tactical context). Worst-case delivery: one heartbeat interval (currently
+    60s) + the time to the worker's next LLM turn. The agent acks via
+    ``POST /api/jobs/{id}/guidance/ack``, which moves the entry to
+    ``context.consumed_replies`` — senders confirm delivery there.
+
+    Returns:
+        The delivery strategy, or None when there is no live run to deliver
+        into (job not ``processing``, or the row vanished) — callers fall
+        back to the resume path.
+    """
+    if job.get("status") != "processing":
+        return None
+    entry = {
+        "id": str(uuid4()),
+        "text": message,
+        "source": thread_id,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    if not await postgres_db.append_pending_guidance(str(job["id"]), entry):
+        return None
+    logger.info(
+        "Queued supervisor guidance %s for job %s (thread %s)",
+        entry["id"][:8],
+        str(job["id"])[:8],
+        thread_id,
+    )
+    return "guidance_next_turn"
+
+
 async def _route_inbound_reply(
     job_id: str,
     thread_id: str,
@@ -9924,7 +9975,9 @@ async def _route_inbound_reply(
         message: Reply body
         sender_email: Sender's email (for user resolution, IMAP only)
         email_message_id: RFC822 Message-ID for dedup (IMAP only)
-        urgent: Whether the reply should interrupt immediately
+        urgent: Deliver into the worker's next LLM turn via the guidance
+            lane (non-destructive). Only when the job has no live run does
+            urgent fall back to a resume-with-feedback.
 
     Returns:
         Tuple of (delivery_strategy, sequence_number).
@@ -9980,7 +10033,14 @@ async def _route_inbound_reply(
     )
 
     if is_blocking_reply:
-        await _internal_resume_job(job_id, feedback=message)
+        await _internal_resume_job(
+            job_id,
+            feedback=message,
+            reason=(
+                "This job froze waiting for a reply to its outbound message; "
+                "the reply below answers it."
+            ),
+        )
         return "immediate_resume", sequence
 
     # Look up user delivery preferences
@@ -9994,19 +10054,32 @@ async def _route_inbound_reply(
         except Exception:
             pass  # Non-critical — fall back to defaults
 
-    # Check urgent flag (explicit from cockpit, or user preference)
+    # Check urgent flag (explicit from cockpit, or user preference).
+    # Urgent ≠ resume anymore (P1-A): a live run gets the message as
+    # next-turn guidance; only a job with no live run is resumed to
+    # deliver it.
     urgent_override = user_prefs.get("urgent_override", True)
     if urgent and urgent_override:
-        await _internal_resume_job(job_id, feedback=message)
+        strategy = await _queue_supervisor_guidance(job, thread_id, message)
+        if strategy:
+            return strategy, sequence
+        await _internal_resume_job(
+            job_id, feedback=message, reason=_URGENT_RESUME_REASON
+        )
         return "immediate_interrupt", sequence
 
-    # Check user's async reply preference
+    # Check user's async reply preference (same semantics as urgent above)
     async_pref = user_prefs.get("async_reply", "next_strategic_phase")
     if async_pref == "immediate_interrupt":
-        await _internal_resume_job(job_id, feedback=message)
+        strategy = await _queue_supervisor_guidance(job, thread_id, message)
+        if strategy:
+            return strategy, sequence
+        await _internal_resume_job(
+            job_id, feedback=message, reason=_URGENT_RESUME_REASON
+        )
         return "immediate_interrupt", sequence
 
-    # LLM triage: let auxiliary model decide interrupt vs queue
+    # LLM triage: let auxiliary model decide guidance-now vs queue
     if async_pref == "llm_triage" and job.get("status") == "processing":
         try:
             from services.message_triage import triage_message
@@ -10019,13 +10092,15 @@ async def _route_inbound_reply(
                 db=postgres_db,
             )
             if decision.get("action") == "interrupt":
-                await _internal_resume_job(job_id, feedback=message)
-                logger.info(
-                    "LLM triage: interrupt job %s — %s",
-                    job_id[:8],
-                    decision.get("reason", ""),
-                )
-                return "llm_triage_interrupt", sequence
+                strategy = await _queue_supervisor_guidance(job, thread_id, message)
+                if strategy:
+                    logger.info(
+                        "LLM triage: next-turn guidance for job %s — %s",
+                        job_id[:8],
+                        decision.get("reason", ""),
+                    )
+                    return "llm_triage_guidance", sequence
+                # No live run after all — fall through to the queued lane.
         except Exception as e:
             logger.warning("LLM triage failed, falling through to queue: %s", e)
 
@@ -10069,8 +10144,12 @@ async def reply_to_agent_message(
     """Reply to an agent's message (cockpit UI or IMAP).
 
     If the job is in 'waiting_for_reply' status and the thread matches,
-    resumes the job with the reply as feedback. Otherwise, queues the reply
-    for the next strategic phase.
+    resumes the job with the reply as feedback. ``urgent`` (and the
+    immediate-interrupt user preference) delivers into the worker's next
+    LLM turn via the non-destructive guidance lane
+    (``delivery_strategy="guidance_next_turn"``); only a job with no live
+    run is resumed to deliver an urgent message. Otherwise the reply is
+    queued and injected at the next tactical→strategic phase boundary.
     """
     await require_job_access(request, postgres_db, job_id)
     try:
@@ -10099,6 +10178,52 @@ async def reply_to_agent_message(
             f"Failed to deliver reply for job {job_id} thread {thread_id}: {e}"
         )
         raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+class GuidanceAckRequest(BaseModel):
+    """Body for the agent's guidance-delivery ack (P1-A)."""
+
+    guidance_ids: list[str] = Field(
+        default_factory=list,
+        description="context.pending_guidance entry ids rendered into the "
+        "worker's LLM context",
+    )
+    reply_threads: list[str] = Field(
+        default_factory=list,
+        description="thread ids whose context.queued_replies were drained "
+        "at a phase boundary",
+    )
+
+
+@app.post("/api/jobs/{job_id}/guidance/ack")
+async def ack_job_guidance(
+    request: Request, job_id: str, body: GuidanceAckRequest
+) -> dict[str, Any]:
+    """Ack delivered supervisor guidance / drained queued replies.
+    **Internal** (P4b) — requires ``X-Internal-Key``.
+
+    The agent calls this after the entries reached LLM-visible context.
+    Entries move atomically ``context.pending_guidance`` (by id) /
+    ``context.queued_replies`` (by thread id) → ``context.consumed_replies``
+    with a ``consumed_at`` stamp — which stops heartbeat redelivery /
+    boundary re-materialization, and lets the sender confirm delivery by
+    reading job context. At-least-once by design: a lost ack just means
+    the worker sees the same guidance for one more turn. Idempotent.
+    """
+    await require_internal(request)
+    try:
+        moved = await postgres_db.consume_job_guidance(
+            job_id,
+            guidance_ids=body.guidance_ids,
+            reply_threads=body.reply_threads,
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+    if moved is None:
+        raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
+    return {"status": "ok", "consumed": moved}
 
 
 @app.get("/api/jobs/{job_id}/messages")
@@ -11094,6 +11219,15 @@ async def resume_job(
                 detail=f"Job cannot be resumed (status: {job['status']}).",
             )
 
+        # Honest [FEEDBACK_RESUME] banner cause for this explicit resume
+        # path, derived from the status the job is actually leaving.
+        feedback_reason = (
+            "This job was frozen for review; a reviewer resumed it with the "
+            "feedback below."
+            if job["status"] in ("pending_review", "reviewing")
+            else "An operator explicitly resumed this job with the feedback below."
+        )
+
         async def _queue_for_dispatch(message: str) -> dict[str, str]:
             """Park the job as 'paused' (dispatchable, unassigned) and kick the
             auto-dispatcher. Used both when no agent is ready and when the
@@ -11105,7 +11239,13 @@ async def resume_job(
             """
             feedback = request.feedback if request else None
             await postgres_db.queue_job_for_resume(
-                job_id, {"queued_feedback": feedback} if feedback else None
+                job_id,
+                {
+                    "queued_feedback": feedback,
+                    "queued_feedback_reason": feedback_reason,
+                }
+                if feedback
+                else None,
             )
             logger.info(
                 f"Queued job {job_id} for auto-dispatch (previous status: "
@@ -11187,9 +11327,14 @@ async def resume_job(
         # with the queue fallback below, which merges the same value.
         if request.feedback:
             await postgres_db.merge_job_context(
-                job_id, {"queued_feedback": request.feedback}
+                job_id,
+                {
+                    "queued_feedback": request.feedback,
+                    "queued_feedback_reason": feedback_reason,
+                },
             )
             job_context["queued_feedback"] = request.feedback
+            job_context["queued_feedback_reason"] = feedback_reason
             job = {**job, "context": job_context}
 
         # Restore S3 environment snapshot into the VM before resuming.
@@ -11706,12 +11851,22 @@ async def _resume_job_without_vm_internal(
 # =============================================================================
 
 
-async def _internal_resume_job(job_id: str, feedback: str) -> None:
+async def _internal_resume_job(
+    job_id: str, feedback: str, reason: str | None = None
+) -> None:
     """Queue a job for resume via the auto-dispatcher.
 
-    Stores feedback in the job's context as ``queued_feedback``, sets status
-    to ``paused`` (dispatchable), and triggers the dispatcher.  Avoids HTTP
-    self-calls — the dispatcher will pick it up and send it to an agent.
+    THE escalation verb — this is a destructive resume: the worker
+    force-compacts its context, archives its in-flight todos, and re-plans
+    from scratch against the feedback. Use it when the plan itself is wrong;
+    a mid-run course correction belongs on the guidance lane
+    (``_queue_supervisor_guidance``) instead.
+
+    Stores feedback in the job's context as ``queued_feedback`` (plus
+    ``queued_feedback_reason`` when given — rendered verbatim in the worker's
+    [FEEDBACK_RESUME] banner so the stated cause is the actual cause), sets
+    status to ``paused`` (dispatchable), and triggers the dispatcher.  Avoids
+    HTTP self-calls — the dispatcher will pick it up and send it to an agent.
 
     The single write also sheds the row-level freeze. This path's dominant
     caller is a human reply to a ``blocking_message`` freeze, so the job ALWAYS
@@ -11720,9 +11875,10 @@ async def _internal_resume_job(job_id: str, feedback: str) -> None:
     paused-but-invisible forever.
     See docs/issues/blocking_message_reply_keeps_freeze_data.md.
     """
-    if not await postgres_db.queue_job_for_resume(
-        job_id, {"queued_feedback": feedback}
-    ):
+    updates: dict[str, Any] = {"queued_feedback": feedback}
+    if reason:
+        updates["queued_feedback_reason"] = reason
+    if not await postgres_db.queue_job_for_resume(job_id, updates):
         logger.warning(f"_internal_resume_job: job {job_id} not found")
         return
 
@@ -12744,7 +12900,14 @@ async def _handle_critic_verdict_on_complete(
             f"Critic {job_id} returned target {target_job_id} "
             f"({len(open_findings)} open finding(s))"
         )
-        await _internal_resume_job(target_job_id, feedback="\n".join(feedback_lines))
+        await _internal_resume_job(
+            target_job_id,
+            feedback="\n".join(feedback_lines),
+            reason=(
+                "The critic reviewed the completed work and returned it with "
+                "open findings; address them."
+            ),
+        )
         actions.append(
             f"target {target_job_id} resumed with feedback from critic {job_id}"
         )
@@ -21818,15 +21981,30 @@ async def agent_heartbeat(
         # status without sending one.
         # docs/issues/transient_db_error_hard_fails_job_and_destroys_vm.md (Defect 3)
         job_status: str | None = None
+        pending_guidance: list[dict[str, Any]] | None = None
         if heartbeat.current_job_id:
             try:
                 _hb_job = await postgres_db.get_job(heartbeat.current_job_id)
                 if _hb_job:
                     job_status = _hb_job.get("status")
+                    # Supervisor guidance (P1-A) rides the same row read at
+                    # zero marginal DB cost. Contract: a LIST whenever the
+                    # row was read — an empty list is the prune signal for
+                    # the agent's inbox; None (lookup failed / older
+                    # orchestrator) means "no information, keep your inbox".
+                    _hb_ctx = _hb_job.get("context") or {}
+                    if isinstance(_hb_ctx, str):
+                        try:
+                            _hb_ctx = json.loads(_hb_ctx)
+                        except json.JSONDecodeError:
+                            _hb_ctx = {}
+                    _hb_pg = _hb_ctx.get("pending_guidance")
+                    pending_guidance = _hb_pg if isinstance(_hb_pg, list) else []
             except Exception:
                 # Never fail a heartbeat over this — a missing job_status just
                 # degrades to the old push-only behaviour.
                 job_status = None
+                pending_guidance = None
 
         # Surface orchestrator-set intents (drain, version-upgrade hints)
         # so the agent can react on the next heartbeat tick. Keeping the
@@ -21836,6 +22014,7 @@ async def agent_heartbeat(
             "status": "ok",
             "intents": result.get("intents") or {},
             "job_status": job_status,
+            "pending_guidance": pending_guidance,
         }
     except HTTPException:
         raise

@@ -132,6 +132,12 @@ class UniversalAgentState(TypedDict):
     # Consumed by restore_from_feedback node, then cleared
     resume_feedback: Optional[str]
 
+    # Why the job was resumed with feedback (critic return, supervisor
+    # escalation, reviewer feedback, ...). Free-form; rendered verbatim in
+    # the [FEEDBACK_RESUME] banner. Set alongside resume_feedback, consumed
+    # by restore_from_feedback, then cleared.
+    resume_reason: Optional[str]
+
 
 def create_initial_state(
     job_id: str,
@@ -202,4 +208,5 @@ def create_initial_state(
         freeze_data=None,
         # Resume from feedback
         resume_feedback=None,
+        resume_reason=None,
     )

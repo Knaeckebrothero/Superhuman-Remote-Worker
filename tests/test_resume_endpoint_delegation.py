@@ -328,11 +328,20 @@ class TestResumeEndpointDelegation:
             MagicMock(), JOB_ID, main.JobResumeRequest(feedback="try again")
         )
 
+        # The explicit resume path also stamps the honest [FEEDBACK_RESUME]
+        # banner cause (P1-A): a paused job -> the operator wording.
         main.postgres_db.merge_job_context.assert_awaited_once_with(
-            JOB_ID, {"queued_feedback": "try again"}
+            JOB_ID,
+            {
+                "queued_feedback": "try again",
+                "queued_feedback_reason": (
+                    "An operator explicitly resumed this job with the feedback below."
+                ),
+            },
         )
         delegated_job = endpoint_collaborators.delegate.await_args.args[0]
         assert delegated_job["context"]["queued_feedback"] == "try again"
+        assert delegated_job["context"]["queued_feedback_reason"]
 
     @pytest.mark.asyncio
     async def test_declined_resume_falls_back_to_queue(self, endpoint_collaborators):
@@ -413,7 +422,13 @@ class TestResumeEndpointWorkspacelessJob:
         )
 
         workspaceless.queue_for_resume.assert_awaited_once_with(
-            JOB_ID, {"queued_feedback": "try again"}
+            JOB_ID,
+            {
+                "queued_feedback": "try again",
+                "queued_feedback_reason": (
+                    "An operator explicitly resumed this job with the feedback below."
+                ),
+            },
         )
 
     @pytest.mark.asyncio

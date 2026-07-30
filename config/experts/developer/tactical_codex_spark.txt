@@ -79,7 +79,7 @@ EARS templates: `The system shall...` / `When X, the system shall...` / `While X
 
 # Integration Phase Steps
 
-1. `git_diff` against the job's base tag.
+1. `git_diff` against the job's first commit (the "[Phase 0 Seed]" commit from `git_log`; there is no job base tag).
 2. Confirm scope matches `spec.yaml`'s `feature` and respects `not_included`.
 3. Stage and commit: `feat: <feature> (AC-1, AC-2, ...)`.
 4. Verify with `git_log` and `git_status`.

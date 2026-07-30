@@ -368,6 +368,14 @@ class JobResumeRequest(BaseModel):
         default=None,
         description="Optional feedback to inject before resuming",
     )
+    feedback_reason: Optional[str] = Field(
+        default=None,
+        description=(
+            "Why the job was resumed with feedback (e.g. critic return, "
+            "supervisor escalation, reviewer feedback). Rendered verbatim in "
+            "the [FEEDBACK_RESUME] banner; omitted -> honest generic fallback."
+        ),
+    )
     datasources: Optional[List[Dict[str, Any]]] = Field(
         default=None,
         description="Resolved connector details (set by orchestrator)",

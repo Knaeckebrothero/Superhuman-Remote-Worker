@@ -923,7 +923,14 @@ def create_orchestrator_tools(context: ToolContext) -> List[Any]:
         job_id: str,
         feedback: Optional[str] = None,
     ) -> str:
-        """Resume a paused or frozen job with optional feedback.
+        """Resume a paused or frozen job with optional feedback (escalation).
+
+        With feedback this is the DESTRUCTIVE verb: the worker compacts its
+        conversation context, archives its in-flight todos, and re-plans
+        from scratch against the feedback. Use it when the plan itself is
+        wrong or the job is genuinely stuck; for a course correction on a
+        running job use steer_worker_job — it delivers without destroying
+        the worker's in-flight work.
 
         Args:
             job_id: The job UUID to resume
@@ -1005,19 +1012,24 @@ def create_orchestrator_tools(context: ToolContext) -> List[Any]:
     async def steer_worker_job(job_id: str, message: str, urgent: bool = False) -> str:
         """Send guidance to a running job without stopping it.
 
-        The worker reads queued guidance at its next strategic phase — use
-        this for course corrections ("stop retrying X, try Y", "the answer
-        you need is in file Z"). ``urgent=True`` interrupts the worker
-        immediately; reserve it for work that is actively being wasted.
-        For a paused or frozen job, use resume_worker_job with feedback
-        instead — steering only reaches live workers.
+        Non-destructive either way — the worker keeps its context, todos,
+        and plan. ``urgent=True`` lands the message in the worker's next
+        LLM turn (delivery ≤ ~1 heartbeat interval, currently 60s, plus
+        the time to that turn); ``urgent=False`` delivers at the next
+        phase boundary. Use it for course corrections ("stop retrying X,
+        try Y", "the answer you need is in file Z"). Confirm delivery by
+        checking the job's context for the entry under consumed_replies.
+        If the plan itself is wrong and the worker must re-plan, use
+        resume_worker_job with feedback — that one COSTS the worker its
+        in-flight work. For a paused or frozen job, steering has no live
+        run to reach: an urgent steer resumes it to deliver the message.
 
         Args:
             job_id: Job UUID (or unique 8-char prefix).
             message: The guidance. Concrete and short; the worker sees it
                 verbatim.
-            urgent: Deliver as an immediate interrupt instead of at the next
-                strategic phase.
+            urgent: Deliver into the worker's next LLM turn instead of at
+                the next phase boundary.
         """
         try:
             async with _get_client(user_id=context.user_id) as client:

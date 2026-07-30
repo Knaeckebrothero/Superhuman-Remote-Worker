@@ -723,6 +723,7 @@ class UniversalAgent:
         stream: bool = False,
         resume: bool = False,
         feedback: Optional[str] = None,
+        feedback_reason: Optional[str] = None,
         original_config_name: Optional[str] = None,
         previous_status: Optional[str] = None,
     ) -> Dict[str, Any]:
@@ -737,6 +738,8 @@ class UniversalAgent:
             stream: If True, return an async iterator of state updates
             resume: If True, resume from last completed phase snapshot
             feedback: Optional feedback message to inject when resuming a frozen job
+            feedback_reason: Why the job was resumed with feedback (rendered in
+                the [FEEDBACK_RESUME] banner; None -> honest generic fallback)
             original_config_name: Original config name used when job was created
                 (for legacy checkpoint lookup when resuming old jobs)
             previous_status: Job status before resume. Graceful stops (cancelled,
@@ -978,6 +981,7 @@ class UniversalAgent:
                     thread_config,
                     {
                         "resume_feedback": feedback,
+                        "resume_reason": feedback_reason,
                         "should_stop": False,
                         "goal_achieved": False,
                         "is_final_phase": False,

@@ -962,13 +962,23 @@ class TodoManager:
             f"set_phase_info called (ignored): phase={phase_number}/{total_phases}, name={phase_name}"
         )
 
-    def archive_with_failure_note(self, issue: str) -> str:
-        """Archive todos with a failure note.
+    def archive_with_failure_note(
+        self,
+        issue: str,
+        *,
+        phase_label: str = "failed",
+        heading: str = "Failure Note",
+    ) -> str:
+        """Archive todos with an explanatory note.
 
-        Used by todo_rewind when the current approach isn't working.
+        Used by todo_rewind when the current approach isn't working (the
+        defaults), and by restore_from_feedback to archive in-flight todos a
+        feedback resume preempts — with an honest label instead of "failed".
 
         Args:
-            issue: Description of why the approach failed
+            issue: Description of why the todos are being archived
+            phase_label: Prefix for the archive header name (default "failed")
+            heading: Section heading for the appended note
 
         Returns:
             Confirmation message
@@ -976,15 +986,15 @@ class TodoManager:
         if not self._todos:
             return "No todos to archive."
 
-        # Add failure note to archive content
+        # Add explanatory note to archive content
         count = len(self._todos)
-        phase_name = f"failed_{datetime.now(timezone.utc).strftime('%H%M%S')}"
+        phase_name = f"{phase_label}_{datetime.now(timezone.utc).strftime('%H%M%S')}"
 
-        # Archive with phase name indicating failure
+        # Archive with phase name indicating why the phase ended early
         archive_path = self.archive(phase_name)
 
-        # Append failure note to the archive file
-        note_content = f"\n\n## Failure Note\n\n{issue}\n"
+        # Append the note to the archive file
+        note_content = f"\n\n## {heading}\n\n{issue}\n"
         try:
             existing = self._workspace.read_file(archive_path)
             self._workspace.write_file(archive_path, existing + note_content)
@@ -992,7 +1002,7 @@ class TodoManager:
             logger.warning(f"Could not append failure note: {e}")
 
         return (
-            f"Archived {count} todos with failure note to {archive_path}.\n"
+            f"Archived {count} todos with {heading.lower()} to {archive_path}.\n"
             f"Issue: {issue}\n"
             f"Todo list cleared for re-planning."
         )
