@@ -79,12 +79,29 @@ ORCHESTRATOR_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "module": "orchestrator.jobs",
         "function": "get_job_workspace_file",
         "description": (
-            "Read a file from a worker job's workspace. Use this to inspect "
-            "the worker's output, plan, or workspace notes. Common files: "
+            "Read a file from a worker job's workspace repo (Gitea-backed). "
+            "Returns committed state as of the worker's last push — workers "
+            "push at every phase boundary, at freeze, and at finalize, so "
+            "mid-phase edits are not visible yet. Pass ref to read a phase "
+            "tag like '{short_id}-phase-{N}-{type}-complete'. Common files: "
             "plan.md, notes/, output/*.md"
         ),
         "category": "orchestrator",
-        "short_description": "Read a file from a job's workspace.",
+        "short_description": "Read a pushed file from a job's workspace repo.",
+        "phases": ["strategic", "tactical"],
+    },
+    "list_job_workspace_files": {
+        "module": "orchestrator.jobs",
+        "function": "list_job_workspace_files",
+        "description": (
+            "List a directory of a worker job's workspace repo (Gitea-backed) "
+            "to see what the worker has actually pushed. Browse with this "
+            "before get_job_workspace_file instead of guessing filenames. "
+            "Same staleness contract: committed state as of the worker's last "
+            "push; pass ref for a phase tag."
+        ),
+        "category": "orchestrator",
+        "short_description": "List pushed files in a job's workspace repo.",
         "phases": ["strategic", "tactical"],
     },
     "approve_worker_job": {
@@ -363,6 +380,46 @@ async def _resolve_job_id(
             f"Job ID prefix '{cleaned}' is ambiguous; matches include: {sample}"
         )
     return cleaned
+
+
+async def _repo_head_line(
+    client: httpx.AsyncClient,
+    base_url: str,
+    job_id: str,
+    ref: Optional[str],
+) -> str:
+    """One-line staleness header for Gitea-backed workspace reads.
+
+    Best-effort by contract: a repo read must still return its content when
+    the commits lookup fails, so failures degrade to naming the explicit ref
+    (or to no header at all for branch-head reads) instead of raising.
+    """
+    label = f"ref '{ref}'" if ref else "repo head"
+    params: Dict[str, Any] = {"limit": 1}
+    if ref:
+        params["sha"] = ref
+    try:
+        resp = await client.get(
+            f"{base_url}/api/jobs/{job_id}/repo/commits", params=params
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        commits = data.get("commits") if isinstance(data, dict) else None
+        head = commits[0] if commits else {}
+        sha = str(head.get("sha") or "")
+        if not sha:
+            raise ValueError("commits response carried no sha")
+        line = f"[{label}: {sha[:7]}"
+        date = str(head.get("date") or "").strip()
+        if date:
+            line += f" {date}"
+        subject = str(head.get("message") or "").strip().splitlines()
+        if subject and subject[0].strip():
+            line += f" — {_truncate(subject[0], limit=100)}"
+        return line + "]"
+    except Exception as e:
+        logger.debug("Repo head lookup failed for job %s: %s", job_id, e)
+        return f"[reading {label}]" if ref else ""
 
 
 def _format_job_list_item(job: Dict[str, Any]) -> List[str]:
@@ -717,35 +774,122 @@ def create_orchestrator_tools(context: ToolContext) -> List[Any]:
                 return f"Failed to connect to orchestrator: {e}"
 
     @tool
-    async def get_job_workspace_file(job_id: str, path: str) -> str:
-        """Read a file from a worker job's workspace.
+    async def get_job_workspace_file(
+        job_id: str, path: str, ref: Optional[str] = None
+    ) -> str:
+        """Read a file from a worker job's workspace repository.
+
+        Gitea-backed: reads committed state as of the worker's last
+        phase-boundary push (workers push at every phase boundary, freeze,
+        and finalize), so mid-phase edits are not visible yet. Pass ``ref``
+        to read a phase tag like ``{short_id}-phase-{N}-{type}-complete``
+        instead of the branch head.
 
         Args:
             job_id: The job UUID
             path: Relative file path (e.g., plan.md, notes/decisions.md, output/result.md)
+            ref: Optional branch, tag, or commit SHA to read from
+                (default: the job branch head)
 
         Returns:
-            File contents or error message
+            File contents, prefixed with the commit actually read, or an
+            error message
         """
         async with _get_client(user_id=context.user_id) as client:
             try:
                 resolved_job_id = await _resolve_job_id(client, base_url, job_id)
+                params: Dict[str, Any] = {"path": path}
+                if ref:
+                    params["ref"] = ref
                 resp = await client.get(
-                    f"{base_url}/api/jobs/{resolved_job_id}/workspace/file",
-                    params={"path": path},
+                    f"{base_url}/api/jobs/{resolved_job_id}/repo/file",
+                    params=params,
                 )
                 resp.raise_for_status()
                 data = resp.json()
                 content = data.get("content", "")
+                header = await _repo_head_line(client, base_url, resolved_job_id, ref)
+                prefix = f"{header}\n" if header else ""
                 if not content:
-                    return f"File '{path}' is empty or not found."
-                return f"=== {path} ===\n{content}"
+                    return f"{prefix}File '{path}' exists but is empty."
+                return f"{prefix}=== {path} ===\n{content}"
             except ValueError as e:
                 return str(e)
             except httpx.HTTPStatusError as e:
                 if e.response.status_code == 404:
-                    return f"File '{path}' not found in job {job_id}."
+                    where = f"ref '{ref}'" if ref else "the job branch head"
+                    return (
+                        f"File '{path}' not found at {where} of job "
+                        f"{job_id}'s repo — use list_job_workspace_files to "
+                        "browse what the worker has pushed."
+                    )
                 return f"Failed to read file: HTTP {e.response.status_code}"
+            except httpx.RequestError as e:
+                return f"Failed to connect to orchestrator: {e}"
+
+    @tool
+    async def list_job_workspace_files(
+        job_id: str, path: str = "", ref: Optional[str] = None
+    ) -> str:
+        """List a directory in a worker job's workspace repository.
+
+        Gitea-backed, same staleness contract as get_job_workspace_file:
+        shows committed state as of the worker's last phase-boundary push.
+        Browse here before reading files instead of guessing paths into
+        not-found errors.
+
+        Args:
+            job_id: The job UUID
+            path: Directory path within the repo (default: repo root)
+            ref: Optional branch, tag, or commit SHA to list from
+                (default: the job branch head)
+
+        Returns:
+            Directory listing (directories first) or error message
+        """
+        async with _get_client(user_id=context.user_id) as client:
+            try:
+                resolved_job_id = await _resolve_job_id(client, base_url, job_id)
+                params: Dict[str, Any] = {"path": path}
+                if ref:
+                    params["ref"] = ref
+                resp = await client.get(
+                    f"{base_url}/api/jobs/{resolved_job_id}/repo/contents",
+                    params=params,
+                )
+                resp.raise_for_status()
+                entries = resp.json()
+                header = await _repo_head_line(client, base_url, resolved_job_id, ref)
+                prefix = f"{header}\n" if header else ""
+                shown = path or "/"
+                if not entries:
+                    return f"{prefix}Directory '{shown}' is empty."
+                dirs = sorted(
+                    (e for e in entries if e.get("type") == "dir"),
+                    key=lambda e: str(e.get("name", "")),
+                )
+                files = sorted(
+                    (e for e in entries if e.get("type") != "dir"),
+                    key=lambda e: str(e.get("name", "")),
+                )
+                lines = [f"Contents of '{shown}' ({len(entries)} entries):"]
+                for entry in dirs:
+                    lines.append(f"  {entry.get('name', '?')}/")
+                for entry in files:
+                    size = entry.get("size")
+                    suffix = f" ({size} bytes)" if isinstance(size, int) else ""
+                    lines.append(f"  {entry.get('name', '?')}{suffix}")
+                return prefix + "\n".join(lines)
+            except ValueError as e:
+                return str(e)
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code == 404:
+                    where = f"ref '{ref}'" if ref else "the job branch head"
+                    return (
+                        f"Directory '{path or '/'}' not found at {where} of "
+                        f"job {job_id}'s repo."
+                    )
+                return f"Failed to list files: HTTP {e.response.status_code}"
             except httpx.RequestError as e:
                 return f"Failed to connect to orchestrator: {e}"
 
@@ -930,6 +1074,7 @@ def create_orchestrator_tools(context: ToolContext) -> List[Any]:
         list_worker_jobs,
         get_worker_job,
         get_job_workspace_file,
+        list_job_workspace_files,
         approve_worker_job,
         resume_worker_job,
         cancel_worker_job,

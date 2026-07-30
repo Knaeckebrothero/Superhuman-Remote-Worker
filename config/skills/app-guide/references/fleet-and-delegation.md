@@ -59,7 +59,8 @@ When the corresponding tools are actually loaded, a session can:
 
 - inspect its session and project scope;
 - create a worker job and list or inspect visible jobs;
-- read a named file from a worker job's workspace;
+- list and read files a worker job has pushed to its workspace repo (state
+  as of the worker's last checkpoint push, not live mid-phase edits);
 - approve a job that is pending review;
 - resume a paused or frozen job with feedback;
 - request a safe-point pause or cancel a job; and
