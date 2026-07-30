@@ -15,7 +15,7 @@ from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
 from security.auth import require_approved_user
-from security.access import require_project_member
+from security.access import require_internal, require_project_member
 
 router = APIRouter(prefix="/api/contacts", tags=["Contacts"])
 project_router = APIRouter(prefix="/api/projects", tags=["Contacts"])
@@ -80,6 +80,30 @@ async def _owned_contact(request: Request, contact_id: str) -> dict:
             status_code=403, detail="Only the contact owner can modify it"
         )
     return contact
+
+
+@router.get("/internal/list")
+async def list_internal_contacts(
+    request: Request,
+    job_id: str | None = None,
+    thread_id: str | None = None,
+) -> dict:
+    """Contacts linked to the caller's project. Agent-internal.
+
+    The project is derived server-side from the job/thread — the agent never
+    supplies a project_id, so it cannot read another project's contacts. Same
+    trust posture as send_message recipient resolution.
+    """
+    await require_internal(request)
+    if bool(job_id) == bool(thread_id):
+        raise HTTPException(
+            status_code=400, detail="Provide exactly one of job_id or thread_id"
+        )
+    db = _get_db()
+    project_id = await db.resolve_project_for_agent(job_id=job_id, thread_id=thread_id)
+    if not project_id:
+        return {"contacts": []}
+    return {"contacts": await db.get_project_contacts(project_id)}
 
 
 @router.get("")

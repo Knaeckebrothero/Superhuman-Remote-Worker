@@ -3,6 +3,7 @@
 import logging
 from typing import Any, Callable, Optional
 
+from .contacts_provider import ContactsProvider
 from .single_file import SingleFileProvider
 from .tools_provider import ToolsProvider
 
@@ -80,6 +81,7 @@ def sweep_legacy_tools_dir(backend: Any) -> bool:
 
 
 __all__ = [
+    "ContactsProvider",
     "SingleFileProvider",
     "ToolsProvider",
     "build_instruction_providers",

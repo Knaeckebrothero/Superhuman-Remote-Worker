@@ -12819,6 +12819,40 @@ class PostgresDB:
         async with self.acquire() as conn:
             return [_contact_row(r) for r in await conn.fetch(sql, project_id)]
 
+    async def resolve_project_for_agent(
+        self, job_id: Optional[str] = None, thread_id: Optional[str] = None
+    ) -> Optional[str]:
+        """Resolve the project a job or thread belongs to, for agent-internal reads.
+
+        The internal contacts endpoint (docs/features/contacts_registry.md)
+        never accepts a project_id from the agent — this is the server-side
+        control point that derives it from the job/thread identity instead,
+        the same trust posture as send_message recipient resolution. Callers
+        are expected to pass exactly one of job_id/thread_id (the router
+        enforces that); this method just resolves whichever it's given.
+        """
+        if job_id:
+            try:
+                uuid_val = UUID(job_id)
+            except ValueError:
+                return None
+            async with self.acquire() as conn:
+                project_id = await conn.fetchval(
+                    "SELECT project_id FROM jobs WHERE id = $1", uuid_val
+                )
+        elif thread_id:
+            try:
+                uuid_val = UUID(thread_id)
+            except ValueError:
+                return None
+            async with self.acquire() as conn:
+                project_id = await conn.fetchval(
+                    "SELECT project_id FROM threads WHERE id = $1", uuid_val
+                )
+        else:
+            return None
+        return str(project_id) if project_id else None
+
     async def user_can_see_contact(self, user_id: str, contact_id: str) -> bool:
         """True if the contact is owned by, or project-linked to, this user."""
         async with self.acquire() as conn:
