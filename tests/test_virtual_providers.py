@@ -6,6 +6,7 @@ from src.core.virtual_dirs import (
     ToolsProvider,
     build_instruction_providers,
 )
+from src.core.virtual_dirs import contacts_provider as contacts_provider_module
 from src.tools.description_manager import generate_tool_index
 
 
@@ -210,3 +211,37 @@ def test_error_when_the_fetch_fails_with_a_cold_cache():
 
     with pytest.raises(ValueError, match="temporarily unavailable"):
         ContactsProvider(fetch).entries()
+
+
+def test_repeated_reads_during_an_outage_attempt_only_one_fetch_per_window(
+    monkeypatch,
+):
+    """Once the TTL lapses during an outage, retries must be throttled to the
+    same cadence as successes — not re-attempted on every single read.
+
+    Regression: stamping ``_fetched_at`` only on success means a failed
+    attempt never advances the clock, so every subsequent read keeps seeing
+    a stale timestamp and keeps retrying (and paying the client timeout)
+    until the fetch succeeds again.
+    """
+    clock = {"t": 0.0}
+    monkeypatch.setattr(contacts_provider_module.time, "monotonic", lambda: clock["t"])
+
+    state = {"fail": False}
+    calls = []
+
+    def fetch():
+        calls.append(1)
+        if state["fail"]:
+            raise RuntimeError("orchestrator down")
+        return CONTACTS
+
+    provider = ContactsProvider(fetch, ttl_seconds=60)
+    provider.read("anna-weber.md")  # warms the cache: 1 fetch so far
+    state["fail"] = True
+    clock["t"] = 61  # TTL has lapsed; the next read must retry exactly once
+
+    for _ in range(5):
+        assert "Anna Weber" in provider.read("anna-weber.md")  # stale-served
+
+    assert len(calls) == 2  # the warm fetch + exactly one retry, not five
