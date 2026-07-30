@@ -1629,6 +1629,12 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             upload could not be found by either path (the caller's template
             fallback then applies).
         """
+        # Priority inline > upload (mirrors the deleted if/elif): don't pay for
+        # a download — HTTP round-trip plus a local glob — when inline content
+        # will win anyway.
+        if (metadata.get("instructions") or "").strip():
+            return None
+
         instr_upload_id = metadata.get("instructions_upload_id")
         if not instr_upload_id:
             return None
@@ -1684,10 +1690,9 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                     f"Instructions upload directory not found: {instr_uploads_dir}"
                 )
 
-        # Fall back to template if upload failed
-        if not instructions_written:
-            pass  # Template-based fallback handled by _deploy_instruction_files()
-
+        # instructions_written stays False here only when both sources failed;
+        # resolved_content is already None in that case (the caller's template
+        # fallback then applies).
         return resolved_content
 
     async def _setup_job_workspace(
