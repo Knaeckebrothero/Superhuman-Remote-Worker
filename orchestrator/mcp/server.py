@@ -459,9 +459,12 @@ async def resume_job_with_feedback(
 ) -> str:
     """Resume a frozen/failed job from its checkpoint, optionally injecting feedback.
 
-    MUTATION: This resumes agent execution on the job. If feedback is provided,
-    it is injected into the agent's context before re-execution. The job can be
-    in any status except 'completed'. If the originally assigned agent is
+    MUTATION — and with feedback, DESTRUCTIVE: the worker force-compacts its
+    conversation context, archives its in-flight todos, and re-plans from
+    scratch against the feedback. Use it when the plan itself is wrong; for a
+    mid-run course correction use send_message_to_job (non-destructive, lands
+    in the worker's next LLM turn with urgent=true). The job can be in any
+    status except 'completed'. If the originally assigned agent is
     unavailable, the orchestrator auto-selects a ready agent.
 
     Args:
@@ -2723,14 +2726,19 @@ async def send_message_to_job(
     """Send a reply to an agent's message thread (as a human).
 
     Routes the reply to the agent. If the agent is waiting for a reply
-    on this thread (blocking mode), it resumes immediately. Otherwise
-    the reply is queued for the next strategic phase.
+    on this thread (blocking mode), it resumes immediately. ``urgent``
+    delivers into the worker's next LLM turn WITHOUT destroying its
+    context (guidance lane, ~≤60s + one turn; strategy
+    ``guidance_next_turn``) — only a job with no live run gets resumed
+    to deliver an urgent message. Non-urgent replies are injected at the
+    next tactical→strategic phase boundary. To force a full re-plan
+    instead, use resume_job_with_feedback (destructive).
 
     Args:
         job_id: Job UUID
         thread_id: Thread ID to reply to
         message: Reply body text
-        urgent: If true, deliver as immediate interrupt regardless of mode
+        urgent: If true, deliver into the worker's next LLM turn
 
     Returns:
         Delivery confirmation with strategy used

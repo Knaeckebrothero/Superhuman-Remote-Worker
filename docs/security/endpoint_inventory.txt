@@ -147,6 +147,7 @@ GET    /api/jobs/{job_id}/diff/{file_path:path}                                 
 POST   /api/jobs/{job_id}/ensure-workspace-access                                       gated:require_approved_user
 POST   /api/jobs/{job_id}/export-to-shared-folder                                       gated:require_job_access
 GET    /api/jobs/{job_id}/frozen                                                        gated:require_job_access
+POST   /api/jobs/{job_id}/guidance/ack                                                  internal:require_internal
 DELETE /api/jobs/{job_id}/ide                                                           gated:require_job_access
 GET    /api/jobs/{job_id}/ide                                                           gated:require_job_access
 POST   /api/jobs/{job_id}/ide                                                           gated:require_job_access

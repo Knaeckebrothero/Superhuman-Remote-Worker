@@ -10,9 +10,11 @@ todos:
       REVIEW: Examine what the previous phase accomplished using git evidence.
 
       Steps:
-      (1) Use the git_tags tool to confirm phase boundary tags exist.
+      (1) Use the git_tags tool to list the phase boundary tags
+          (<job_short_id>-phase-<N>-<type>-complete; each marks the END of that phase).
       (2) Use the git_log tool (max_count=15) to see commits from the previous phase.
-      (3) Use git_diff with the phase start tag to see all file changes.
+      (3) Use git_diff between the two most recent boundary tags to see all file
+          changes (only one tag yet? diff from the "[Phase 0 Seed]" commit in git_log).
       (4) CONTENT CHECK: For every file in output/ that was created or modified,
           use read_file to examine its actual content. Check specifically:
           - Does it contain substantive prose/content, or just headings and placeholders?

@@ -17,7 +17,7 @@ WHY: After context compaction, your memory of what happened is unreliable. Git e
 
 1. Use git tools to verify what actually changed:
    - `git_log` for recent commits (raise max_count to scan more history)
-   - `git_diff` against the phase-start tag for all changes since phase start
+   - `git_diff` against the previous boundary tag (`<job_short_id>-phase-<N>-<type>-complete`, from `git_tags`) for all changes since phase start
    - `git_tags` to check phase milestones
    - `read_file` to spot-check key files
 2. Phase-type compliance check — confirm the previous tactical phase respected its file scope:
