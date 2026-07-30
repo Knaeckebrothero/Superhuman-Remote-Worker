@@ -428,6 +428,18 @@ email:
     from: "noreply@superhuman-remote-worker.com"
   domain: "superhuman-remote-worker.com"
 keycloak:
+  # HA — 2 replicas (2026-07-30). Safe because the chart runs Keycloak in
+  # production mode: the Infinispan cluster discovers peers through
+  # srw-keycloakdb via jdbc-ping (no headless Service, no new infra) and user
+  # sessions persist to that database instead of living in each pod's memory.
+  # Verified on k3d: both pods join a single cluster view, and a live session
+  # plus its token refresh survived deleting either pod in turn.
+  #
+  # The chart default stays 1 because a FRESH install would run --import-realm
+  # on both replicas at once against an empty database. This realm already
+  # exists, so there is no import to race — the same reasoning that lets
+  # orchestrator run replicas:2 here ahead of the chart default.
+  replicas: 2
   bridgeCert:
     enabled: true
     smtpHost: "protonmail-bridge.protonmail-bridge.svc"
