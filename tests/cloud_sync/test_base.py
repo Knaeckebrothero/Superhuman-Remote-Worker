@@ -155,3 +155,73 @@ async def test_poll_cancels_cleanly(tmp_path: Path):
     await sync.stop()
     assert sync._poll_task is None
     assert sync._running is False
+
+
+# ---------------------------------------------------------------------------
+# Virtual directories: cloud sync is not a tool-layer consumer and must never
+# see (or write back into) a virtual prefix.
+# docs/features/virtual_directories.md
+# ---------------------------------------------------------------------------
+
+
+class _FakeContactsProvider:
+    """Stand-in for ContactsProvider — a directory prefix carrying PII."""
+
+    prefix = "contacts"
+    is_dir = True
+    writable = False
+
+    def entries(self):
+        from src.core.backends.overlay import EntryMeta
+
+        return {
+            "README.md": EntryMeta(size=10),
+            "anna-weber.md": EntryMeta(size=64),
+        }
+
+    def read(self, name):
+        return "Anna Weber\nanna.weber@example.com\n+49 30 1234567\n"
+
+
+def _overlay_backend(tmp_path: Path):
+    from src.core.backends.overlay import VirtualOverlayBackend
+    from tests._fs_backend import FilesystemTestBackend
+
+    overlay = VirtualOverlayBackend(FilesystemTestBackend(tmp_path))
+    overlay.register(_FakeContactsProvider())
+    return overlay
+
+
+def test_virtual_provider_files_never_enter_the_sync_walk(tmp_path: Path):
+    """Regression: contacts PII must not reach the user's cloud folder.
+
+    The session handler hands ``workspace_manager.backend`` — the overlay — to
+    the sync coordinator. Walking it merges virtual prefixes into the root
+    listing, and SYNC_IGNORE_PATTERNS covers ``tools/`` but not ``contacts/``,
+    so contact names, emails and phone numbers were uploaded. Adding names to
+    the ignore list would leave the next provider to rediscover this, so the
+    fix is structural: sync walks the REAL backend.
+    """
+    (tmp_path / "notes.md").write_text("real file")
+    sync = FakeSync(tmp_path, workspace_backend=_overlay_backend(tmp_path))
+
+    walked = sync._walk_backend_files()
+
+    assert walked == ["notes.md"]
+    assert not [p for p in walked if p.startswith("contacts")]
+
+
+@pytest.mark.asyncio
+async def test_pull_write_back_does_not_hit_the_virtual_prefix(tmp_path: Path):
+    """A write-back into a virtual prefix raised VirtualPathError.
+
+    The coordinator runs ``strict=True``, so that exception propagated out of
+    the session's initial ``pull_all()`` and the handler set
+    ``workspace_sync = None`` — cloud sync silently off for the session's whole
+    life. Writing through the real backend cannot raise it.
+    """
+    sync = FakeSync(tmp_path, workspace_backend=_overlay_backend(tmp_path))
+
+    await sync._pull_file_to_backend("contacts/anna-weber.md", "etag-1")
+
+    assert (tmp_path / "contacts" / "anna-weber.md").read_text() == "remote-content"
