@@ -22,12 +22,14 @@ from orchestrator.services.completion import (  # noqa: E402
     LLM_OUTAGE_CEILING_SECONDS,
     LLM_OUTAGE_MAX_ATTEMPTS,
     LLM_OUTAGE_REPEAT_CEILING,
+    LLM_OUTAGE_SHAPE_NUDGE,
     LLM_OUTAGE_RESET_WINDOW_SECONDS,
     MEMORY_RETRY_CAP,
     determine_job_status,
     evaluate_llm_outage,
     llm_outage_backoff_seconds,
     llm_outage_fingerprint,
+    llm_outage_nudge_state,
     llm_outage_repeat_key,
 )
 
@@ -604,7 +606,9 @@ class TestLlmOutageRepeatKey:
 class TestRepeatGiveUp:
     """A 5xx that survives N identical backoff cycles is not an outage."""
 
-    def _job(self, summary, *, repeats, key=None, extra=None):
+    # nudge_attempted defaults True so these exercise the give-up itself; the
+    # one-extra-cycle quickfix that precedes it has its own class below.
+    def _job(self, summary, *, repeats, key=None, extra=None, nudge_attempted=True):
         ctx = _real_outage_ctx(repeats or 1, 300, 60)
         ctx["llm_outage"]["repeat_key"] = (
             key
@@ -612,6 +616,7 @@ class TestRepeatGiveUp:
             else llm_outage_repeat_key({"error_summary": summary})
         )
         ctx["llm_outage"]["repeats"] = repeats
+        ctx["llm_outage"]["shape_nudge_attempted"] = nudge_attempted
         job = _llm_job(ctx)
         job["freeze_data"]["error_summary"] = summary
         job["freeze_data"].update(extra or {})
@@ -692,6 +697,124 @@ class TestRepeatGiveUp:
         status, err = determine_job_status(job, STOP)
         assert status == "failed"
         assert "continuous outage" in err
+
+
+class TestShapeNudgeQuickfix:
+    """TEMPORARY — delete with docs/issues/codex_stream_disconnect_shape_nudge.md.
+
+    Upstream rejects a byte-identical payload deterministically, so the repeat
+    give-up must spend exactly ONE more cycle on a shape change before it fires.
+    """
+
+    def _job(self, *, repeats, nudge_attempted):
+        ctx = _real_outage_ctx(repeats, 300, 60)
+        ctx["llm_outage"]["repeat_key"] = llm_outage_repeat_key(
+            {"error_summary": CODEX_503}
+        )
+        ctx["llm_outage"]["repeats"] = repeats
+        if nudge_attempted is not None:
+            ctx["llm_outage"]["shape_nudge_attempted"] = nudge_attempted
+        job = _llm_job(ctx)
+        job["freeze_data"]["error_summary"] = CODEX_503
+        return job
+
+    def test_ceiling_first_hit_pauses_for_the_nudge(self):
+        if not LLM_OUTAGE_SHAPE_NUDGE:
+            return
+        job = self._job(repeats=LLM_OUTAGE_REPEAT_CEILING - 1, nudge_attempted=False)
+        status, err = determine_job_status(job, STOP)
+        assert status == "paused"
+        assert err is None
+
+    def test_legacy_state_without_the_flag_also_pauses(self):
+        # Jobs paused before this shipped have no shape_nudge_attempted key.
+        if not LLM_OUTAGE_SHAPE_NUDGE:
+            return
+        job = self._job(repeats=LLM_OUTAGE_REPEAT_CEILING - 1, nudge_attempted=None)
+        status, _ = determine_job_status(job, STOP)
+        assert status == "paused"
+
+    def test_after_the_nudge_it_gives_up(self):
+        # The nudge is strictly one-shot: a second identical failure fails.
+        job = self._job(repeats=LLM_OUTAGE_REPEAT_CEILING, nudge_attempted=True)
+        status, err = determine_job_status(job, STOP)
+        assert status == "failed"
+        assert "nudge was already tried" in err
+
+    def test_give_up_message_omits_nudge_note_when_not_tried(self):
+        # Only reachable with the quickfix disabled — the message must not claim
+        # a nudge happened when it did not.
+        job = self._job(repeats=LLM_OUTAGE_REPEAT_CEILING, nudge_attempted=False)
+        status, err = determine_job_status(job, STOP)
+        if LLM_OUTAGE_SHAPE_NUDGE:
+            assert status == "paused"
+        else:
+            assert status == "failed"
+            assert "nudge was already tried" not in err
+
+    def test_nudge_does_not_extend_the_duration_ceiling(self):
+        # The 12h ceiling outranks the quickfix — an armed nudge must not keep a
+        # genuinely dead job alive past it.
+        job = self._job(repeats=LLM_OUTAGE_REPEAT_CEILING - 1, nudge_attempted=False)
+        job["context"] = _real_outage_ctx(8, LLM_OUTAGE_CEILING_SECONDS + 3600, 60)
+        status, err = determine_job_status(job, STOP)
+        assert status == "failed"
+        assert "continuous outage" in err
+
+
+class TestShapeNudgeLatch:
+    """TEMPORARY — the arm/latch state machine behind the shape nudge.
+
+    Lives in the DB write path (increment_job_llm_outage_attempt), which has no
+    test coverage of its own, so the logic is extracted and pinned here. The
+    latch is the safety property: without it every cycle re-arms and the job
+    nudges forever — the exact grinding the repeat ceiling exists to stop.
+    """
+
+    CEIL = 4
+
+    def test_below_ceiling_does_not_arm(self):
+        for n in range(1, self.CEIL):
+            assert llm_outage_nudge_state({}, n, self.CEIL) == (False, False)
+
+    def test_arms_once_at_the_ceiling(self):
+        assert llm_outage_nudge_state({}, self.CEIL, self.CEIL) == (True, True)
+
+    def test_latches_so_the_next_cycle_gives_up(self):
+        prior = {"shape_nudge_attempted": True}
+        pending, attempted = llm_outage_nudge_state(prior, self.CEIL + 1, self.CEIL)
+        assert pending is False  # <- the anti-forever-loop property
+        assert attempted is True  # <- keeps determine_job_status on the fail path
+
+    def test_stays_latched_for_the_whole_streak(self):
+        prior = {"shape_nudge_attempted": True}
+        for n in range(self.CEIL + 1, self.CEIL + 8):
+            assert llm_outage_nudge_state(prior, n, self.CEIL) == (False, True)
+
+    def test_streak_reset_clears_the_latch(self):
+        # repeats == 1 is a fresh streak (different error, or a productive gap):
+        # a future unrelated outage deserves its own nudge.
+        prior = {"shape_nudge_attempted": True}
+        assert llm_outage_nudge_state(prior, 1, self.CEIL) == (False, False)
+        assert llm_outage_nudge_state({}, self.CEIL, self.CEIL) == (True, True)
+
+    def test_disabled_never_arms(self):
+        for n in range(1, self.CEIL + 5):
+            assert llm_outage_nudge_state({}, n, None) == (False, False)
+
+    def test_disabled_preserves_a_prior_latch(self):
+        # Flipping the kill switch mid-streak must not re-open the nudge.
+        prior = {"shape_nudge_attempted": True}
+        assert llm_outage_nudge_state(prior, self.CEIL + 1, None) == (False, True)
+
+    def test_matches_the_ceiling_actually_configured(self):
+        # Guards against the arming point drifting away from the give-up point.
+        assert llm_outage_nudge_state(
+            {}, LLM_OUTAGE_REPEAT_CEILING, LLM_OUTAGE_REPEAT_CEILING
+        ) == (
+            True,
+            True,
+        )
 
 
 class TestBornParkedShape:
