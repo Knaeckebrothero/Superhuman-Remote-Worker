@@ -74,7 +74,7 @@ A and B ship in Slice 1; C in Slice 2. The contract below is designed for all th
 
 ## Architecture
 
-**Seam.** New `VirtualOverlayBackend` (`src/core/backends/overlay.py`) wraps the real backend where `WorkspaceManager` stores it (`self._backend`). Local, remote-SSH, and virtual-tier backends are wrapped identically; file tools keep calling `context.workspace_manager` and never learn the overlay exists. Subagents inherit it through the shared context.
+**Seam.** New `VirtualOverlayBackend` (`src/core/backends/overlay.py`) wraps the real backend where `WorkspaceManager` stores it (`self._backend`). Local, remote-SSH, and virtual-tier backends are wrapped identically; file tools keep calling `context.workspace_manager` and never learn the overlay exists. Subagent readers build their **own** `WorkspaceManager` over a `SubdirBackend` (`src/tools/delegation/reader_env.py:156`), so they get their own overlay and must have providers registered explicitly — a reader's `tools/` is bound to the reader's own tool list, not the parent's.
 
 **Idiom.** Same as `SubdirBackend` (`src/core/backends/subdir.py`): a plain delegating wrapper, *not* a `WorkspaceBackend` subclass — `__getattr__` forwards everything not overridden, so future backend-interface growth delegates by default. Overridden are the path-touching methods: `read_file`, `write_file`, `append_file`, `exists`, `is_file`, `is_dir`, `list_dir`, `search_files`, `stat`, `resolve_path`, `mkdir`, `delete_file`, `delete_directory`, `move`, `copy`.
 
