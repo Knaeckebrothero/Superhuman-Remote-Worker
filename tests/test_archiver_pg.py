@@ -12,9 +12,19 @@ from __future__ import annotations
 from uuid import uuid4
 
 import pytest
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_core.messages import (
+    AIMessage,
+    HumanMessage,
+    SystemMessage,
+    ToolMessage,
+)
 
 from src.core.archiver import LLMArchiver
+from src.core.knowledge_injection import KNOWLEDGE_TOOL_CALL_ID_PREFIX
+from src.core.workspace_injection import (
+    create_instruction_tool_messages,
+    create_todos_human_message,
+)
 
 
 class FakeWriter:
@@ -264,3 +274,104 @@ def test_writer_only_construction(fw):
     # injected writer and carries no Mongo state.
     arch = LLMArchiver(writer=fw)
     assert arch._writer is fw
+
+
+# ---------------------------------------------------------------------------
+# Chat delta vs the transient tail-injection block (todos/knowledge/…)
+# ---------------------------------------------------------------------------
+
+
+def _payload_with_injections(todos: str = "Current Tasks\n  - [ ] todo_1: explore"):
+    """History + tail-injection block, shaped as graph.py assembles it."""
+    real_tc_id = "call_real123"
+    history = [
+        SystemMessage("sys"),
+        HumanMessage("do the task"),
+        AIMessage(
+            "",
+            tool_calls=[
+                {"name": "read_file", "args": {"path": "a.md"}, "id": real_tc_id}
+            ],
+        ),
+        ToolMessage("file body here", tool_call_id=real_tc_id, name="read_file"),
+    ]
+    kb_id = f"{KNOWLEDGE_TOOL_CALL_ID_PREFIX}abcd1234"
+    kb_pair = [
+        AIMessage(
+            "",
+            tool_calls=[{"name": "kb_search", "args": {"query": "ctx"}, "id": kb_id}],
+        ),
+        ToolMessage("--- Project Knowledge ---\n[1] a note", tool_call_id=kb_id),
+    ]
+    instr_ai, instr_tool = create_instruction_tool_messages(
+        "instructions.md", "READ ME"
+    )
+    tail = kb_pair + [instr_ai, instr_tool, create_todos_human_message(todos)]
+    return history + tail, real_tc_id
+
+
+def test_chat_delta_survives_tail_injections(archiver, fw):
+    """Real tool results are the delta; injections become context descriptors."""
+    messages, real_tc_id = _payload_with_injections()
+    archiver.archive(str(uuid4()), "universal", messages, AIMessage("next"), "gpt-x")
+
+    inputs = fw.chat_rows[-1]["inputs"]
+    real = [i for i in inputs if i["type"] != "context"]
+    ctx = [i for i in inputs if i["type"] == "context"]
+
+    # The delta is the real tool result — not the injected block.
+    assert [i["type"] for i in real] == ["tool"]
+    assert real[0]["tool_call_id"] == real_tc_id
+    assert real[0]["content"] == "file body here"
+    # No raw injected content stored as human/tool inputs.
+    assert not any(i["content"].startswith("<active_tasks>") for i in real)
+
+    assert {c["kind"] for c in ctx} == {"knowledge", "instruction", "todos"}
+    for c in ctx:
+        assert set(c) >= {"kind", "hash", "chars", "content_preview", "content"}
+    instr = next(c for c in ctx if c["kind"] == "instruction")
+    assert instr["label"] == "instructions.md"
+    # Todos entry keeps the wrapper so the preview is self-identifying.
+    todos = next(c for c in ctx if c["kind"] == "todos")
+    assert todos["content"].startswith("<active_tasks>")
+
+
+def test_chat_context_content_only_on_change(archiver, fw):
+    """Unchanged injections store hash+preview only; changes re-store content."""
+    job = str(uuid4())
+    messages, _ = _payload_with_injections()
+    archiver.archive(job, "universal", messages, AIMessage("a"), "gpt-x")
+    archiver.archive(job, "universal", messages, AIMessage("b"), "gpt-x")
+
+    second = [i for i in fw.chat_rows[1]["inputs"] if i["type"] == "context"]
+    assert second and all("content" not in c for c in second)
+    assert all(c["content_preview"] for c in second)
+
+    changed, _ = _payload_with_injections(todos="Current Tasks\n  - [x] todo_1: done")
+    archiver.archive(job, "universal", changed, AIMessage("c"), "gpt-x")
+    third = {c["kind"]: c for c in fw.chat_rows[2]["inputs"] if c["type"] == "context"}
+    assert "content" in third["todos"]
+    assert "content" not in third["knowledge"]
+
+    # A different job shares no hash state with the first.
+    archiver.archive(str(uuid4()), "universal", messages, AIMessage("d"), "gpt-x")
+    fourth = [i for i in fw.chat_rows[3]["inputs"] if i["type"] == "context"]
+    assert all("content" in c for c in fourth)
+
+
+def test_chat_tool_call_args_stored_when_long(archiver, fw):
+    long_cmd = "x" * 500
+    response = AIMessage(
+        "",
+        tool_calls=[
+            {"name": "shell_execute", "args": {"command": long_cmd}, "id": "c1"},
+            {"name": "read_file", "args": {"path": "a.md"}, "id": "c2"},
+        ],
+    )
+    archiver.archive(str(uuid4()), "universal", [HumanMessage("q")], response, "gpt-x")
+    tcs = {t["id"]: t for t in fw.chat_rows[-1]["response"]["tool_calls"]}
+    assert tcs["c1"]["args_preview"].endswith("... [truncated]")
+    assert len(tcs["c1"]["args"]) > len(tcs["c1"]["args_preview"])
+    assert long_cmd[:300] in tcs["c1"]["args"]
+    # Short args fit in the preview — no duplicate full copy.
+    assert "args" not in tcs["c2"]

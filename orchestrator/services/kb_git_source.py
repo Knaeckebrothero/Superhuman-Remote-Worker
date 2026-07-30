@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import ipaddress
+import logging
 import os
 import re
 import shlex
@@ -24,6 +25,7 @@ import shutil
 import signal
 import socket
 import stat
+import tarfile
 import tempfile
 from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass
@@ -31,6 +33,8 @@ from pathlib import Path, PurePosixPath
 from types import TracebackType
 from typing import AsyncContextManager, Protocol
 from urllib.parse import quote, quote_plus, urlsplit
+
+logger = logging.getLogger(__name__)
 
 
 class KnowledgeGitSnapshot(Protocol):
@@ -758,10 +762,23 @@ def _safe_markdown_path(path: str, root_path: str) -> bool:
 
 
 class _GiteaSnapshot:
+    """Snapshot over the native ``GiteaClient``.
+
+    Reads default to one REST ``contents/`` call per file. ``prefetch()``
+    switches bulk reads to a single ``archive/<ref>.tar.gz`` download served
+    from a local temp file — callers with a large planned batch (the
+    reindexer) use it to avoid the per-file N+1 that was the measured
+    dominant Gitea load (~11k sequential ``contents/`` calls/day). Single
+    or few-file readers skip it and keep the cheap per-file path.
+    """
+
     def __init__(self, client: object, repo_name: str, ref: str) -> None:
         self._client = client
         self._repo_name = repo_name
         self._ref = ref
+        self._archive: tarfile.TarFile | None = None
+        self._archive_members: dict[str, tarfile.TarInfo] | None = None
+        self._archive_path: str | None = None
 
     async def list_tree(self) -> list[dict[str, str]]:
         tree = await self._client.list_tree(self._repo_name, self._ref)
@@ -769,8 +786,103 @@ class _GiteaSnapshot:
             raise KnowledgeGitSourceError("Gitea tree read failed")
         return tree
 
+    async def prefetch(self) -> bool:
+        """Bulk-load this snapshot's tree as one archive download.
+
+        Never raises and is idempotent; on failure subsequent ``get_file``
+        calls simply stay on the per-file REST path.
+        """
+        if self._archive_members is not None:
+            return True
+        fd, path = tempfile.mkstemp(prefix="kb-archive-", suffix=".tar.gz")
+        os.close(fd)
+        ok = False
+        try:
+            ok = await self._client.download_repo_archive(
+                self._repo_name, self._ref, path
+            )
+            if ok:
+                members = await asyncio.to_thread(self._index_archive, path)
+                ok = members is not None
+                if ok:
+                    self._archive_path = path
+                    self._archive_members = members
+        except Exception:
+            logger.warning(
+                "kb archive prefetch failed for %s@%s — falling back to per-file reads",
+                self._repo_name,
+                self._ref,
+                exc_info=True,
+            )
+            ok = False
+        finally:
+            if not ok:
+                with contextlib.suppress(OSError):
+                    os.unlink(path)
+        return ok
+
+    def _index_archive(self, path: str) -> dict[str, tarfile.TarInfo] | None:
+        """Open the tarball and map repo-relative paths to members."""
+        try:
+            archive = tarfile.open(path, mode="r:gz")
+            members: dict[str, tarfile.TarInfo] = {}
+            for member in archive.getmembers():
+                if not member.isfile():
+                    continue
+                # Entries carry one top-level directory (the repo name);
+                # strip it to get repo-relative paths.
+                _, _, rel = member.name.partition("/")
+                if rel:
+                    members[rel] = member
+            self._archive = archive
+            return members
+        except Exception:
+            logger.warning(
+                "kb archive unreadable for %s@%s — falling back to per-file reads",
+                self._repo_name,
+                self._ref,
+                exc_info=True,
+            )
+            return None
+
     async def get_file(self, path: str) -> str | None:
+        if self._archive_members is not None:
+            return await asyncio.to_thread(self._read_from_archive, path)
         return await self._client.get_file_content(self._repo_name, path, ref=self._ref)
+
+    def _read_from_archive(self, path: str) -> str | None:
+        member = (self._archive_members or {}).get(path)
+        if member is None or self._archive is None:
+            return None
+        try:
+            fh = self._archive.extractfile(member)
+            if fh is None:
+                return None
+            with fh:
+                # Same contract as the REST path (get_file_content): a file
+                # that isn't valid UTF-8 reads as None, never an exception.
+                return fh.read().decode("utf-8")
+        except Exception as e:
+            logger.warning(
+                "kb archive read failed for %s in %s@%s: %s",
+                path,
+                self._repo_name,
+                self._ref,
+                e,
+            )
+            return None
+
+    def close(self) -> None:
+        """Release the archive file handle and delete the temp file."""
+        if self._archive is not None:
+            with contextlib.suppress(Exception):
+                self._archive.close()
+            self._archive = None
+        self._archive_members = None
+        if self._archive_path is not None:
+            with contextlib.suppress(OSError):
+                os.unlink(self._archive_path)
+            self._archive_path = None
 
 
 class GiteaKnowledgeGitSource:
@@ -798,7 +910,11 @@ class GiteaKnowledgeGitSource:
 
     @contextlib.asynccontextmanager
     async def snapshot(self, ref: str) -> AsyncIterator[KnowledgeGitSnapshot]:
-        yield _GiteaSnapshot(self._client, self._repo_name, ref)
+        snap = _GiteaSnapshot(self._client, self._repo_name, ref)
+        try:
+            yield snap
+        finally:
+            snap.close()
 
 
 class _RemoteSnapshot:

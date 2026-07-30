@@ -229,6 +229,11 @@ class LLMArchiver:
                 and every write no-ops.
         """
         self._writer = writer
+        # Per-job last-seen hash of each injected context block (todos,
+        # knowledge, …), so chat_history stores an injection's full content
+        # only on the turn it changes. Best-effort: lost on process restart
+        # (the next turn simply re-stores full content once).
+        self._context_hashes: Dict[str, Dict[str, str]] = {}
 
     @classmethod
     def from_env(cls) -> Optional["LLMArchiver"]:
@@ -486,6 +491,17 @@ class LLMArchiver:
         This stores only the new messages (inputs that triggered this response)
         and the LLM response, enabling a clean sequential view of conversations.
 
+        The payload also carries the transient tail-injection block (todos,
+        memory, knowledge, citation feedback, instruction files — re-injected
+        fresh every request, see workspace_injection.py). Those are excluded
+        from the delta scan — with them included, the "last AIMessage" was the
+        synthetic injection pair and the real tool results were dropped while
+        the full injected block was re-stored on every turn (99% of
+        chat_history bytes). Instead each injection is archived as a compact
+        ``type="context"`` descriptor (kind/hash/chars/preview), with full
+        content only on the turn its hash changes; the full payload is always
+        in llm_requests via request_id.
+
         Args:
             job_id: Job identifier
             agent_type: Agent type
@@ -498,21 +514,29 @@ class LLMArchiver:
             phase: Current phase ("strategic" or "tactical")
             phase_number: Current phase number
         """
+        from src.core.workspace_injection import is_workspace_injection_message
+
         try:
-            # Find new inputs: messages after the last AIMessage
+            # Partition the payload: real conversation vs transient injections.
+            real_messages: List[BaseMessage] = []
+            injected: List[BaseMessage] = []
+            for msg in messages:
+                if isinstance(msg, SystemMessage):
+                    continue
+                if is_workspace_injection_message(msg):
+                    injected.append(msg)
+                else:
+                    real_messages.append(msg)
+
+            # Find new inputs: real messages after the last real AIMessage
             # These are the messages that triggered this response
             last_ai_idx = -1
-            for i, msg in enumerate(messages):
+            for i, msg in enumerate(real_messages):
                 if isinstance(msg, AIMessage):
                     last_ai_idx = i
 
-            # New inputs are everything after last AI message (excluding system)
             new_inputs = []
-            start_idx = last_ai_idx + 1 if last_ai_idx >= 0 else 0
-            for msg in messages[start_idx:]:
-                if isinstance(msg, SystemMessage):
-                    continue
-
+            for msg in real_messages[last_ai_idx + 1 :]:
                 content = _normalize_content(msg.content)
 
                 input_entry: Dict[str, Any] = {
@@ -528,6 +552,10 @@ class LLMArchiver:
 
                 new_inputs.append(input_entry)
 
+            # Injected context frame, as compact descriptors (payload order:
+            # the block sits after the conversation, so append at the end).
+            new_inputs.extend(self._context_frame_entries(job_id, injected))
+
             # Extract response
             resp_content = _normalize_content(response.content)
             response_data: Dict[str, Any] = {
@@ -538,18 +566,24 @@ class LLMArchiver:
                 else False,
             }
 
-            # Add tool calls if present
+            # Add tool calls if present. args_preview (200) is the collapsed
+            # one-liner; args carries the arguments up to 4000 chars so the
+            # debug chat view can show real commands without opening the full
+            # llm_requests row (only stored when it adds over the preview —
+            # pathological cases like write_file bodies stay in llm_requests).
             if hasattr(response, "tool_calls") and response.tool_calls:
-                response_data["tool_calls"] = [
-                    {
+                tool_call_rows = []
+                for tc in response.tool_calls:
+                    args_str = str(tc.get("args", {}))
+                    tc_row: Dict[str, Any] = {
                         "id": tc.get("id", ""),
                         "name": tc.get("name", ""),
-                        "args_preview": self._truncate_string(
-                            str(tc.get("args", {})), 200
-                        ),
+                        "args_preview": self._truncate_string(args_str, 200),
                     }
-                    for tc in response.tool_calls
-                ]
+                    if len(args_str) > 200:
+                        tc_row["args"] = self._truncate_string(args_str, 4000)
+                    tool_call_rows.append(tc_row)
+                response_data["tool_calls"] = tool_call_rows
 
             # Extract reasoning (DeepSeek-style models with reasoning_content)
             reasoning = None
@@ -583,6 +617,85 @@ class LLMArchiver:
 
         except Exception as e:
             logger.warning(f"Failed to archive chat entry: {e}")
+
+    def _context_frame_entries(
+        self, job_id: str, injected: List[BaseMessage]
+    ) -> List[Dict[str, Any]]:
+        """Compact ``type="context"`` input entries for the transient injections.
+
+        One entry per injected block (the synthetic AIMessage half of a pair
+        is skipped — its content lives in the paired ToolMessage). Each entry
+        carries kind, content hash, size, and a 500-char preview; full content
+        is included only when the hash differs from the previous archived turn
+        of this job, so per-turn rows stay small while every change point
+        remains reconstructable from chat_history alone.
+        """
+        from src.core.citation_feedback_injection import (
+            CITATION_FEEDBACK_TOOL_CALL_ID_PREFIX,
+        )
+        from src.core.knowledge_injection import KNOWLEDGE_TOOL_CALL_ID_PREFIX
+        from src.core.memory_injection import MEMORY_TOOL_CALL_ID_PREFIX
+        from src.core.workspace_injection import (
+            INSTRUCTION_TOOL_CALL_ID_PREFIX,
+            content_hash_id,
+        )
+
+        kind_by_prefix = (
+            (INSTRUCTION_TOOL_CALL_ID_PREFIX, "instruction"),
+            (MEMORY_TOOL_CALL_ID_PREFIX, "memory"),
+            (KNOWLEDGE_TOOL_CALL_ID_PREFIX, "knowledge"),
+            (CITATION_FEEDBACK_TOOL_CALL_ID_PREFIX, "citation_feedback"),
+        )
+
+        # Bound the per-job hash cache (worker --loop reuses the process).
+        if job_id not in self._context_hashes and len(self._context_hashes) >= 64:
+            self._context_hashes.pop(next(iter(self._context_hashes)))
+        prev = self._context_hashes.setdefault(job_id, {})
+
+        # Labels (instruction file paths) come from the synthetic AIMessage
+        # half of each pair, keyed by tool_call_id.
+        labels: Dict[str, str] = {}
+        for msg in injected:
+            if isinstance(msg, AIMessage) and getattr(msg, "tool_calls", None):
+                for tc in msg.tool_calls:
+                    path = (tc.get("args") or {}).get("path")
+                    if path:
+                        labels[tc.get("id", "")] = str(path)
+
+        entries: List[Dict[str, Any]] = []
+        for msg in injected:
+            label: Optional[str] = None
+            if isinstance(msg, HumanMessage):
+                # Only the todos block is injected as a transient HumanMessage.
+                kind = "todos"
+            elif isinstance(msg, ToolMessage):
+                tcid = getattr(msg, "tool_call_id", "") or ""
+                kind = next(
+                    (k for p, k in kind_by_prefix if tcid.startswith(p)), "other"
+                )
+                label = labels.get(tcid)
+            else:
+                continue  # synthetic AIMessage half of a pair
+
+            content = _normalize_content(msg.content)
+            digest = content_hash_id(content)
+            entry: Dict[str, Any] = {
+                "type": "context",
+                "kind": kind,
+                "hash": digest,
+                "chars": len(content),
+                "content_preview": self._truncate_string(content, 500),
+            }
+            if label:
+                entry["label"] = label
+            # Several instruction files can be injected per turn: track each
+            # by label (or content hash) so they don't clobber one another.
+            key = kind if kind != "instruction" else f"instruction:{label or digest}"
+            if prev.get(key) != digest:
+                entry["content"] = content
+            prev[key] = digest
+            entries.append(entry)
+        return entries
 
     # =========================================================================
     # Agent Audit Methods - Complete execution history tracking

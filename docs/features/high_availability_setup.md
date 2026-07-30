@@ -23,6 +23,7 @@ related:
 **Status:** Living reference. Runbook is usable now; roadmap is design-stage.
 **Filed:** 2026-05-20
 **Refreshed:** 2026-06-24 — inventory re-verified against the Helm chart (the live path via Fleet); added two newer single-replica Postgres SPOFs (`postgres-audit`, `postgres-litellm`); confirmed no roadmap item has started.
+**Refreshed:** 2026-07-30 — inventory re-verified after the orchestrator HA landing (M0–M2, `replicas: 2` chart default) and the NATS move to an external 3-node hub. MongoDB and `postgres-litellm` rows dropped (both removed from the chart). Added the prioritized [scalability & HA checklist](#scalability--ha-checklist-2026-07-30) consolidating open work across both HA docs plus new findings (Keycloak BFF refresh bug, `start-dev` blocker, Gitea load fixes).
 **Triggered by:** 2026-05-16 incident — pulling `node3` for maintenance took the whole SRW stack offline despite a healthy 3-node etcd quorum and 2-replica Longhorn data redundancy.
 
 ## What "HA" means in this project
@@ -48,25 +49,23 @@ What survives a single-node loss *today*, assuming the failure isn't on the node
 | Cluster | k3s control plane | 3 (etcd voters: node1/2/3) | ✓ | Quorum survives 1-of-3 loss; node4 is worker-only. |
 | Cluster | API server | per control-plane node | ✓ | Reachable as long as quorum holds. |
 | Storage | Longhorn data replicas | 2 (cluster default) | ✓ (data survives) | Data is safe; volume **attachment** is the bottleneck — see "Today's gap". |
-| App (stateless) | Orchestrator | `replicas: 1` | ✗ | See [[orchestrator_ha_scaling]]. |
+| App (stateless) | Orchestrator | `replicas: 2` (chart default) | ✓ | **HA since 2026-06** — M0–M2 shipped (leader election, PDB, preStop drain); live-verified. See [[orchestrator_ha_scaling]]. |
 | App (stateless) | Cockpit | `replicas: 1` (configurable) | ✗ | Easy to scale; not the SPOF that matters. |
 | App (stateless) | MCP server | `replicas: 1` (configurable) | ✗ | Same. |
 | App (stateful) | PostgreSQL | StatefulSet `replicas: 1` | ✗ | Primary data store. **Highest-impact SPOF.** |
 | App (stateful) | pgvector | StatefulSet `replicas: 1` | ✗ | Embeddings + memories store. |
 | App (stateful) | postgres-keycloak | StatefulSet `replicas: 1` | ✗ | Auth DB. Down ⇒ no login. |
-| App (stateful) | postgres-audit | StatefulSet `replicas: 1` | ✗ | **New since this doc** (`helm/templates/databases/postgres-audit.yaml`). Audit store (`AUDIT_BACKEND`). Non-fatal but a SPOF. |
-| App (stateful) | postgres-litellm | StatefulSet `replicas: 1` | ✗ | **New since this doc** (`helm/templates/databases/postgres-litellm.yaml`). LiteLLM gateway DB. Down ⇒ no LLM dispatch. |
-| App (stateful) | MongoDB | StatefulSet `replicas: 1` | ✗ (non-fatal) | Audit trail only; agent + orchestrator degrade gracefully. |
+| App (stateful) | postgres-audit | StatefulSet `replicas: 1` | ✗ | Audit store (`AUDIT_BACKEND`). Non-fatal but a SPOF. |
 | App (stateful) | Neo4j | StatefulSet `replicas: 1` | ✗ (non-fatal) | Knowledge graph; optional per CLAUDE.md. |
-| App (stateful) | Gitea | StatefulSet `replicas: 1` | ✗ | Workspace git server. Fast to recover; not catastrophic. |
-| App (stateful) | NATS | StatefulSet `replicas: 1` | ✗ | Coordination plane SPOF. Worth fixing early — see roadmap. |
-| App | Keycloak (server) | hardcoded `replicas: 1` | ✗ | Stateless server but DB-backed. Down ⇒ no login until restart. |
+| App (stateful) | Gitea | StatefulSet `replicas: 1` | ✗ | Workspace git server on **SQLite** + local PVC. Fast to recover; load fixes in the checklist below. |
+| App | NATS | external 3-node hub (`nats.internal: false` default) | ✓ | **Coordination plane HA'd 2026-06** via BYO hub. In-chart NATS (internal mode) remains single-replica. |
+| App | Keycloak (server) | hardcoded `replicas: 1` | ✗ | DB-backed and HA-capable upstream (KC 26), **but the chart runs `start-dev`** (local-only caches) — prod-mode switch required before >1 replica. See checklist P2. |
 | App | OpenCloud | hardcoded `replicas: 1` | ✗ | Single-writer by design (file locking). Accept SPOF. |
 | App | vm-controller | hardcoded `replicas: 1` | ✗ | Singleton by design (NATS consumer). |
 | Agent fleet | Worker agents | scaled by orchestrator | ✓ | Heartbeat + auto re-dispatch handles loss. |
 | Workspaces | `workspace-*` / `ws-thread-*` pods | per-job, scheduler-placed | ✓ | Lost workspace ⇒ orchestrator re-provisions or restores from snapshot. |
 
-The honest summary: **the control plane and the storage *bytes* are HA, but every persistent application service is single-replica.** Node loss survives data-wise but not service-wise.
+The honest summary as of 2026-07-30: **the control plane, the storage *bytes*, the coordination plane (external NATS hub), and the orchestrator are HA — but every persistent data service is still single-replica.** Node loss survives data-wise but not service-wise; the gap has narrowed to the data tier (plus the small stateless singletons).
 
 ## Today's gap: why a single-node loss takes everything down
 
@@ -194,59 +193,102 @@ The data tier is where the real SPOFs live. Each item below is its own discrete 
 
 ### Priority 1: PostgreSQL → CloudNativePG
 
-> **Status (2026-06-24): not started.** No `cnpg` / CloudNativePG resources exist in the SRW deployment trees — all Postgres instances are plain single-replica StatefulSets. (The only `cnpg` manifests in the repo are in the unrelated `HomeLab/` tree.) Note the migration scope grew: there are now **five** Postgres instances, not three — add `postgres-audit` and `postgres-litellm` to the list below.
+> **Status (2026-07-30): not started.** No `cnpg` / CloudNativePG resources exist in the SRW deployment trees — all Postgres instances are plain single-replica StatefulSets. Scope shrank back to **four** instances: `postgres-litellm` was removed along with the LiteLLM gateway, and MongoDB left the chart (audit now lives on `postgres-audit`). This is the **M3** item in [[orchestrator_ha_scaling]] — the acknowledged remaining SPOF now that the orchestrator itself is HA. The BYO alternative (managed/HA Postgres via `databases.*.externalHost`, zero chart work) is equally valid, and likely the right answer for SaaS.
 
-All five Postgres instances (`postgres`, `postgres-vector`/pgvector, `postgres-keycloak`, `postgres-audit`, `postgres-litellm`) would migrate to [CloudNativePG](https://cloudnative-pg.io/). Standard answer in the K8s ecosystem; gives synchronous replication, automatic failover, point-in-time recovery, and operator-managed backups.
+All four Postgres instances (`postgres`, `postgres-vector`/pgvector, `postgres-keycloak`, `postgres-audit`) would migrate to [CloudNativePG](https://cloudnative-pg.io/). Standard answer in the K8s ecosystem; gives synchronous replication, automatic failover, point-in-time recovery, and operator-managed backups.
 
-- Three separate `Cluster` resources, one per logical DB.
+**Pooler constraint (either path):** orchestrator leader election holds a *session-scoped* Postgres advisory lock (`orchestrator/services/leader_election.py`). A transaction-mode pooler (PgBouncer/pgcat txn mode) in front of the orchestrator silently breaks it — orchestrator connections must be direct or session-pooled.
+
+- Four separate `Cluster` resources, one per logical DB.
 - Multi-replica with at least one synchronous standby.
 - Existing chart's `databases.postgres.externalUrl` etc. already supports pointing at an external (or operator-managed) DB — no chart changes needed beyond setting those values.
 - Migration path: dump from current StatefulSet → restore into new `Cluster` → flip `externalUrl` → tear down old StatefulSet. See `docs/db_migration.md` for the migration tooling.
 
 ### Priority 2: NATS → multi-replica
 
-> **Status (2026-06-24): not started, and clustering is currently *explicitly disabled*.** `helm/templates/nats/configmap.yaml:32-33` carries a "No clustering — single replica is fine for pilot" note plus a TODO to add the `cluster {}` block and bump replicas. `helm/templates/nats/statefulset.yaml:25` is still `replicas: 1`.
-
-Cheap, low-risk, high-value. NATS clusters horizontally out of the box; the chart already runs a StatefulSet, just bump replicas and add the cluster routes config (currently commented as a TODO). Coordination plane stops being a SPOF, which matters more once the orchestrator goes multi-replica (per `orchestrator_ha_scaling.md` Phase 4).
+> **Status (2026-07-30): RESOLVED — differently than planned.** The coordination plane moved to an **external 3-node NATS hub** (`nats.internal: false` is the chart default; the cluster connects as a leaf/client). In-chart NATS still exists for internal mode and remains single-replica, but it's no longer the deployed path. In-chart clustering stays deferred/BYO.
 
 ### Priority 3 (optional): MongoDB → ReplicaSet
 
-Audit data is non-fatal — CLAUDE.md explicitly notes "MongoDB/Neo4j failures are non-fatal." Brief downtime here is acceptable. Only do this if/when the audit trail starts being load-bearing for compliance.
+> **Status (2026-07-30): OBSOLETE.** MongoDB was removed from the chart; the audit trail moved to the Postgres audit store (`postgres-audit`), which is covered by Priority 1.
 
 ### Out of scope (accept SPOF + document recovery)
 
 - **Neo4j community edition** — no clustering without enterprise license. Stays single-replica. Recovery is restore-from-volume.
-- **Gitea** — clustering is awkward and rarely worth it. Single-replica with fast recovery is fine.
+- **Gitea** — clustering is awkward (shared FS + Redis + external DB, upstream support experimental) and rarely worth it. Single-replica with fast recovery is fine — but see checklist P1: the *measured* Gitea problems are self-inflicted load and SQLite, not topology.
 - **OpenCloud** — single-writer by design (file locking). Don't fight the product.
-- **Keycloak server** (the pod, not the DB) — stateless, but the chart hardcodes `replicas: 1`. Trivial to expose as a chart value if needed; not currently a real problem.
+- **Keycloak server** (the pod, not the DB) — HA-capable upstream and *nearly* free on KC 26 (persistent user sessions in the DB since 26.0, jdbc-ping discovery via the shared DB since 26.1 — no new infra). Not "trivial" in our chart though: it runs `start-dev`, which is single-node-only. Promoted from "out of scope" to checklist P2.
 - **vm-controller** — singleton by design (NATS consumer); leader election would be the fix, similar pattern to `orchestrator_ha_scaling.md` Phase 1.
 
 ## Application tier
 
-Multi-replica orchestrator (and the coordination work that requires) is fully specified in [[orchestrator_ha_scaling]]. The data-tier work in *this* doc is a **prerequisite** for that doc's Phase 2+ — running multiple orchestrator replicas against a single-replica PostgreSQL is fine for active-passive failover (Track 1) but starts to bottleneck in active-active (Track 2).
+Multi-replica orchestrator (and the coordination work that requires) is fully specified in [[orchestrator_ha_scaling]] — **shipped and live-verified as of 2026-06-29** (M0 active-passive hardening, M1 leader election, M2-L4 NATS replica-safety, background-loop sweep). The original execution order is done through step 3 (drain discipline → Track 1 → NATS); what remains is the data tier (Priority 1 above) and the optional active-active polish (L2/L3), both captured in the checklist below.
 
-Suggested execution order across both docs:
-1. Drain discipline (this doc) — operational, zero cost.
-2. `orchestrator_ha_scaling.md` Track 1 (active-passive) — orchestrator survives its own crashes.
-3. NATS multi-replica (this doc, Priority 2) — coordination plane stops being SPOF.
-4. PostgreSQL → CloudNativePG (this doc, Priority 1) — data tier HA.
-5. `orchestrator_ha_scaling.md` Track 2 (active-active, leader election, etc.) — horizontal scale.
+## Scalability & HA checklist (2026-07-30)
+
+Consolidated, prioritized work list from the 2026-07-30 scalability review. Ordering principle: cheap code fixes that shrink outage blast radius first, measured load problems second, topology last. Items are checked off here (with a date) rather than deleted, so this section doubles as the progress record.
+
+### P0 — Keycloak outage must not destroy login sessions (app code, ~hours)
+
+- [x] **(2026-07-30)** Stop deleting BFF sessions when Keycloak is merely *unreachable*. `_refresh_session_in_place` (`orchestrator/security/auth.py`) used to delete the session row on **any** `KeycloakClientError`, but `kc_client.py` raised that same error for network failures and definitive rejections alike — so a Keycloak outage longer than one access-token lifespan (15 min) permanently destroyed every active session. **Fixed:** `KeycloakClientError` now carries `status_code` + `oauth_error`; only a definitive rejection (400 `invalid_grant` — refresh token expired/revoked/SSO ended) deletes the row. Unreachable, 5xx, malformed bodies, and client-misconfig (`invalid_client`) keep the row and fail the request with a retryable 503 (WS handshakes map it to a 4401 close, row kept). Verified on k3d end-to-end: refresh 200 with KC up → scaled KC to 0 → refresh 503 + `/api/auth/me` still 200 + all session rows intact → KC back → same session refreshes 200 without re-login. Unit coverage in `tests/test_bff_session_auth.py`. Residual (accepted): a JWKS cold cache (orchestrator restarted mid-outage) makes cookie validation raise `PyJWKClientError` → 500s until KC returns, but never deletes sessions; PyJWT's lru-cached signing keys cover the non-restart case.
+
+Keycloak is *not* in the per-request hot path (BFF validates JWTs locally via cached JWKS, `orchestrator/security/oidc.py`; KC only sees login/logout/refresh), so this one fix buys most of the practical resilience before any replica work.
+
+### P1 — Gitea: cut self-inflicted load before touching topology (measured 2026-07-29)
+
+Gitea is **not** resource-starved (98m CPU against a 2000m limit); the observed slowness is our own call patterns. Keep it single-replica (see "Out of scope") and fix the load:
+
+- [x] **(2026-07-30) kb_reindex N+1**: was ~11,450 sequential `GET /contents/knowledge/**` calls per day, one REST call per note. **Fixed:** `_GiteaSnapshot` (`orchestrator/services/kb_git_source.py`) gained a `prefetch()` that downloads the snapshot once as `archive/<ref>.tar.gz` (new `GiteaClient.download_repo_archive`, streamed to a temp file, cleaned on snapshot exit) and serves `get_file` from the tarball; the reindexer calls it when the planned batch is ≥ `KB_REINDEX_ARCHIVE_THRESHOLD` (default 25) changed notes, so small incremental sweeps keep the cheap per-file path. Failure falls back to per-file REST, never raises. Verified in-pod against live Gitea: archive reads byte-identical to REST reads, temp file cleaned. *(Residual: the same N+1 shape in `main.py::_copy_tree` — Mode-B cloud export — is untouched.)*
+- [x] **(2026-07-30) compare/`stat=true` cost**: `get_compare` now passes `stat/verification/files=false` — but measurement showed Gitea 1.22 **ignores `stat`** on the compare endpoint (honored from 1.23) *and* 404s on SHA bases (`BaseNotExist`), which meant the `since_ref` path of `/api/jobs/{id}/repo/commits` was both slow-by-design and broken for SHA refs. **Fixed properly:** that path now uses the new `GiteaClient.get_commits_between` — commits-endpoint pagination (which honors `stat=false`, ~155×) with a client-side cut at `since_ref`. Verified live: 200/40ms with a SHA base that previously 404'd.
+- [x] **(2026-07-30) `cron.git_gc_repos` enabled** — `@weekly`, via `GITEA__cron_0X2E_git_gc_repos__*` env in the chart. Verified registered in `/api/v1/admin/cron` on k3d.
+- [x] **(2026-07-30) SQLite WAL** — `GITEA__database__SQLITE_JOURNAL_MODE=WAL` in the chart; `-wal`/`-shm` files confirmed live on k3d. The Postgres migration remains the right pre-SaaS move (tracked below) but WAL removes the worst single-writer/corruption risk now.
+- [ ] **SQLite → Postgres migration** — deferred; a real data-migration operation (dump/convert/restore per instance), do it deliberately pre-SaaS rather than as a drive-by.
+- [ ] **Cache adapter** is `memory` (default) — nothing survives a restart. Low priority; a persistent adapter means Redis (new infra), accept restart-loss for now.
+
+SaaS-scale note: the first hard wall is **inodes, not CPU** — ~277 inodes/repo means 100k repos ≈ 28M inodes, which exhausts default ext4 before disk fills. That's a filesystem/provisioning decision for later, recorded here so it isn't rediscovered.
+
+### P2 — Keycloak production mode + `replicas: 2` (chart, small)
+
+Prerequisites are already in place: external Postgres (`keycloakdb`), prod-shaped hostname/proxy env (`KC_HOSTNAME`, `KC_PROXY_HEADERS=xforwarded`). KC 26 makes multi-replica cheap: user sessions persist to the DB by default (26.0+) and cluster discovery defaults to jdbc-ping through that same DB (26.1+) — **no new infra**.
+
+- [ ] Switch `start-dev` → `start` (`helm/templates/services/keycloak.yaml:616`) and re-verify realm behavior (dev mode currently also relaxes theme/hostname checks).
+- [ ] Verify the realm-import and postStart kcadm session-lifespan hooks are idempotent when two pods run them concurrently.
+- [ ] Expose `keycloak.replicas` as a chart value, default 2.
+
+Caveat: the availability win is partly gated on P3 — a 2-replica Keycloak on a 1-replica `keycloakdb` just moves the SPOF down one layer. Do P0 first; do this when convenient.
+
+### P3 — Data tier HA (the remaining real SPOF)
+
+- [ ] Decide the path: **BYO managed/HA Postgres** via existing `databases.*.externalHost` values (zero chart work; right answer for SaaS) vs **in-chart CloudNativePG** (Priority 1 above; right answer for self-contained homelab/on-prem).
+- [ ] Whichever path: respect the pooler constraint (session-scoped advisory lock for leader election — no transaction-mode pooling on orchestrator connections).
+- [ ] Postgres connection budget: per-agent checkpointer connections + 2 orchestrator replicas share `max_connections` (arithmetic documented in `helm/values.yaml`, orchestrator section). This is the first hard Postgres *throughput* limit as the agent fleet grows; a session-mode pooler for agent/checkpointer traffic is the likely fix.
+
+### P4 — Deferred until volume demands (tracked, not scheduled)
+
+- [ ] **L2 dispatch throughput**: job dispatch is a leader-gated singleton loop; the `SELECT … FOR UPDATE SKIP LOCKED` multi-replica design exists in [[orchestrator_ha_scaling]]. Only needed at job volumes far above current.
+- [ ] **L3 cross-replica SSE/notification fan-out**: session streams are already replica-safe (`thread_events` in Postgres is the source of truth); the gap is the low-volume notification/sudo channels, which are replica-local today.
+- [ ] **Cockpit / MCP `replicas: 2`**: stateless, cheap; only matters for node-loss tolerance.
+- [ ] **Agent heartbeat batching**: one REST call + DB write per agent per 5 s — fine into the hundreds of agents; batch or move to NATS beyond that.
 
 ## Decision log
 
 - **2026-05-20:** Filed after the 2026-05-16 node-pull incident. Choice: document operational discipline (drain) as the *first* HA investment, ahead of any infrastructure work. Rationale: planned maintenance is far more frequent than unplanned hardware failure in this homelab, and `kubectl drain` costs nothing.
 - **2026-05-20:** Decided to keep this doc as the umbrella and reference `orchestrator_ha_scaling.md` rather than merging them. The orchestrator HA work is a *consumer* of data-tier HA, not the same problem.
 - **2026-05-20:** Postgres-tier migration prioritized over MongoDB. Rationale: Mongo loss is non-fatal per existing graceful-degradation contract; Postgres loss takes down jobs, auth, and the cockpit.
+- **2026-07-30:** Added the scalability & HA checklist after a full-stack review. Key calls: (1) the Keycloak BFF refresh bug (sessions deleted on KC-unreachable) is P0 — a code fix beats any topology work on blast radius per effort; (2) Keycloak multi-replica moved from "out of scope" to P2 — KC 26 made it near-free (DB-persisted sessions + jdbc-ping), the only real blocker is our `start-dev` invocation; (3) Gitea stays single-replica — its measured problems are self-inflicted call patterns (kb_reindex N+1, `stat=true`, no gc) and SQLite, not resources or replica count; (4) data tier remains the top structural SPOF, with BYO managed Postgres acknowledged as the likely SaaS path over CloudNativePG.
 
 ## Related code
 
 - `helm/templates/databases/postgres.yaml` — current single-replica StatefulSet
 - `helm/templates/databases/postgres-vector.yaml` — same
 - `helm/templates/databases/postgres-keycloak.yaml` — same
-- `helm/templates/databases/mongodb.yaml` — same
-- `helm/templates/nats/statefulset.yaml` — single replica today
-- `helm/values.yaml` — default `replicas: 1` for orchestrator/cockpit/mcp
-- `docs/features/orchestrator_ha_scaling.md` — application-tier HA design
+- `helm/templates/databases/postgres-audit.yaml` — same
+- `helm/values.yaml` — `orchestrator.replicas: 2` default; cockpit/mcp still 1; Postgres connection-budget arithmetic
+- `helm/templates/services/keycloak.yaml` — `start-dev` invocation + hardcoded `replicas: 1` (checklist P2)
+- `helm/templates/services/gitea.yaml` — hardcoded `sqlite3` (checklist P1)
+- `orchestrator/security/auth.py` / `orchestrator/security/kc_client.py` — BFF session refresh path (checklist P0)
+- `orchestrator/services/leader_election.py` — session-scoped advisory lock (pooler constraint)
+- `docs/features/orchestrator_ha_scaling.md` — application-tier HA design (shipped M0–M2; open L2/L3)
 - `docs/db_migration.md` — migration tooling (relevant for the CloudNativePG cutover)
 
 ## Sources

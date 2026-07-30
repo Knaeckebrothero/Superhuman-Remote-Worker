@@ -97,6 +97,9 @@ async def get_current_user(request: Request, db) -> dict:
 
     Raises:
         HTTPException 401 if not authenticated or all paths fail.
+        HTTPException 503 if the cookie path needed a Keycloak token refresh
+            and Keycloak was unreachable/broken — the session is kept alive
+            and the client should retry, not re-login.
     """
     # Path 1: cookie BFF.
     session_id = request.cookies.get(SESSION_COOKIE)
@@ -143,9 +146,11 @@ async def _resolve_from_cookie(session_id: str, db) -> dict | None:
     ``SRW_SESSION_IDLE_TIMEOUT_S`` rather than deleting it: the BFF session
     is a renewable lease over the KC SSO session, so an idle-but-still-valid
     session is renewed instead of force-logging the user out (which would
-    lose unsent work). A refresh failure (KC down, SSO ended, refresh token
-    revoked) deletes the session row and returns None. The absolute lifetime
-    cap remains a hard stop with no refresh attempt.
+    lose unsent work). A *definitive* refresh rejection (SSO ended, refresh
+    token revoked) deletes the session row and returns None; an unreachable
+    or broken KC keeps the row and raises 503 for this request instead (see
+    ``_refresh_session_in_place``). The absolute lifetime cap remains a hard
+    stop with no refresh attempt.
     """
     sess = await db.get_srw_session(session_id)
     if not sess:
@@ -205,22 +210,51 @@ async def _resolve_from_cookie(session_id: str, db) -> dict | None:
 async def _refresh_session_in_place(sess: dict, db) -> str | None:
     """Refresh KC tokens and write them back to the session row.
 
-    Returns the new access token on success; None if the refresh fails
-    (and the caller should treat the session as dead).
+    Returns the new access token on success. Returns None only when Keycloak
+    definitively rejected the refresh (400 ``invalid_grant``: SSO session
+    ended / refresh token revoked) — the row is deleted and the caller treats
+    the session as dead → clean re-login.
+
+    When Keycloak is unreachable or otherwise broken (network error, 5xx,
+    malformed body, client misconfig like ``invalid_client``), the row is
+    KEPT and 503 is raised instead: the KC SSO session is in all likelihood
+    still valid, and deleting the row would permanently log every active user
+    out after any KC outage longer than one access-token lifespan (~15 min).
+    This way the request fails retryably and sessions resume on their own
+    once KC is back. The grace is bounded by KC's own timeouts: if the outage
+    outlives the refresh token, the next refresh IS an ``invalid_grant`` and
+    the row dies then.
     """
     try:
         tokens = await kc_bff_client.refresh(sess["refresh_token"])
     except KeycloakClientError as e:
-        logger.info("Session %s refresh failed (%s) — deleting", sess["id"], e)
-        await db.delete_srw_session(sess["id"])
-        return None
+        if e.definitive_rejection:
+            logger.info("Session %s refresh rejected (%s) — deleting", sess["id"], e)
+            await db.delete_srw_session(sess["id"])
+            return None
+        logger.warning(
+            "Session %s refresh failed transiently (%s) — keeping session",
+            sess["id"],
+            e,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="Authentication service temporarily unavailable",
+        ) from e
     access_token = tokens.get("access_token")
     refresh_token = tokens.get("refresh_token") or sess["refresh_token"]
     expires_in = tokens.get("expires_in")
     if not access_token or not expires_in:
-        logger.warning("Session %s refresh returned malformed payload", sess["id"])
-        await db.delete_srw_session(sess["id"])
-        return None
+        # KC answered 200 with an unusable body — server-side breakage, not a
+        # grant rejection. Same posture as unreachable: keep the row, 503.
+        logger.warning(
+            "Session %s refresh returned malformed payload — keeping session",
+            sess["id"],
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="Authentication service temporarily unavailable",
+        )
     new_access_expires_at = datetime.now(UTC) + timedelta(seconds=int(expires_in))
     await db.refresh_srw_session_tokens(
         sess["id"],
@@ -656,7 +690,14 @@ async def resolve_ws_user(ws, db) -> dict | None:
     session_id = ws.cookies.get(SESSION_COOKIE)
     if not session_id:
         return None
-    return await _resolve_from_cookie(session_id, db)
+    try:
+        return await _resolve_from_cookie(session_id, db)
+    except HTTPException:
+        # KC-unavailable surfaces as 503 from the refresh path; a WS
+        # handshake has no HTTP response to carry it. Map to None so the
+        # caller closes 4401 and the client retries — the session row was
+        # kept, so the retry succeeds once KC is back.
+        return None
 
 
 async def cleanup_expired_tokens(db, shutdown_event: asyncio.Event) -> None:

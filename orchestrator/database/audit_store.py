@@ -186,6 +186,57 @@ def _audit_row_to_doc(r: asyncpg.Record) -> Dict[str, Any]:
     return doc
 
 
+def _lean_chat_element(el: Any) -> Any:
+    """Strip a full ``content`` body from one inputs/response/reasoning element.
+
+    Keeps ``content_preview`` and marks the element ``truncated`` (+ ``chars``)
+    so the UI knows a detail fetch has more. Elements whose content already
+    equals the preview pass through unchanged.
+    """
+    if not isinstance(el, dict):
+        return el
+    content = el.get("content")
+    preview = el.get("content_preview")
+    if isinstance(content, str) and isinstance(preview, str) and content != preview:
+        el = {k: v for k, v in el.items() if k != "content"}
+        el["truncated"] = True
+        el.setdefault("chars", len(content))
+    return el
+
+
+def _lean_chat_doc(doc: Dict[str, Any]) -> Dict[str, Any]:
+    """chat_history doc -> lean listing projection (previews only).
+
+    Drops full message bodies from ``inputs`` (including the full copies on
+    ``context`` change turns), ``response.content``, per-tool-call ``args``,
+    and ``reasoning.content``; :meth:`AuditStore.get_chat_entry` serves the
+    complete doc on demand. Pure + non-mutating so it's unit-testable and safe
+    on shared row dicts.
+    """
+    doc = dict(doc)
+    inputs = doc.get("inputs")
+    if isinstance(inputs, list):
+        doc["inputs"] = [_lean_chat_element(el) for el in inputs]
+    response = doc.get("response")
+    if isinstance(response, dict):
+        response = _lean_chat_element(response)
+        tool_calls = response.get("tool_calls")
+        if isinstance(tool_calls, list):
+            lean_tcs = []
+            for tc in tool_calls:
+                if isinstance(tc, dict) and "args" in tc:
+                    tc = {k: v for k, v in tc.items() if k != "args"}
+                    tc["args_truncated"] = True
+                lean_tcs.append(tc)
+            response = dict(response)
+            response["tool_calls"] = lean_tcs
+        doc["response"] = response
+    reasoning = doc.get("reasoning")
+    if isinstance(reasoning, dict):
+        doc["reasoning"] = _lean_chat_element(reasoning)
+    return doc
+
+
 class AuditStore:
     """Async reader over the audit Postgres read pool."""
 
@@ -454,12 +505,19 @@ class AuditStore:
         page_size: int = 50,
         offset: Optional[int] = None,
         limit: Optional[int] = None,
+        lean: bool = False,
     ) -> Dict[str, Any]:
         """Paginated chat turns.
 
         Supports offset/limit (REST-style) or page/pageSize (legacy); offset/limit
         wins when both are provided. Mirrors ``get_job_audit`` so a single endpoint
         can serve both styles and the response echoes both.
+
+        ``lean=True`` strips full message bodies from each entry (keeping the
+        previews plus ``truncated``/``chars`` markers) so the debug chat panel
+        can page cheaply and hydrate single turns on demand via
+        :meth:`get_chat_entry` — same split as the audit lean projection +
+        ``get_audit_step``.
         """
         effective_size = limit if limit is not None else page_size
         empty = {
@@ -499,8 +557,11 @@ class AuditStore:
             response_page = (
                 (effective_skip // effective_size) + 1 if effective_size else 1
             )
+            entries = [self._chat_row_to_doc(r) for r in rows]
+            if lean:
+                entries = [_lean_chat_doc(d) for d in entries]
             return {
-                "entries": [self._chat_row_to_doc(r) for r in rows],
+                "entries": entries,
                 "total": total,
                 "page": response_page,
                 "pageSize": effective_size,
@@ -511,6 +572,36 @@ class AuditStore:
         except Exception as e:
             logger.warning(f"get_chat_history failed: {e}")
             return empty
+
+    async def get_chat_entry(
+        self, job_id: str, entry_id: Any
+    ) -> Optional[Dict[str, Any]]:
+        """Full doc for one chat turn (by ``chat_history.id``).
+
+        Detail fetch behind the lean listing: returns the complete inputs /
+        response / reasoning bodies the ``lean`` projection drops. ``entry_id``
+        is int-parsed (non-numeric → ``None`` → the endpoint's 404-after-auth).
+        Returns ``None`` when the store is unavailable or the row isn't part of
+        this job.
+        """
+        if not self._available or self._pool is None:
+            return None
+        try:
+            eid = int(entry_id)
+        except (TypeError, ValueError):
+            return None
+        try:
+            async with self._pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    "SELECT * FROM chat_history WHERE job_id=$1::uuid AND id=$2 "
+                    "LIMIT 1",
+                    job_id,
+                    eid,
+                )
+            return self._chat_row_to_doc(row) if row else None
+        except Exception as e:
+            logger.warning(f"get_chat_entry failed: {e}")
+            return None
 
     @staticmethod
     def _chat_row_to_doc(r: asyncpg.Record) -> Dict[str, Any]:

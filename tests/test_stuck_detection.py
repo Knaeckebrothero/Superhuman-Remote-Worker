@@ -1319,7 +1319,14 @@ class TestPhaseGate:
 
     @pytest.mark.asyncio
     async def test_batch_rejected_when_any_call_violates(self, config):
-        """If any tool call in a batch violates phase, entire batch is rejected."""
+        """If any tool call in a batch violates phase, entire batch is rejected.
+
+        Only the violating call may be told it is phase-illegal. The
+        co-batched phase-legal call gets an honest "not executed, re-issue"
+        message — the old wording told legal tools they were unavailable,
+        teaching models their tool surface was unreliable (job edd06963
+        "stale palette" belief spiral).
+        """
         fake_read = MagicMock()
         fake_read.name = "read_file"  # both phases
         fake_jc = MagicMock()
@@ -1343,8 +1350,22 @@ class TestPhaseGate:
             msgs = result.get("messages", [])
             tool_msgs = [m for m in msgs if isinstance(m, ToolMessage)]
 
-            # Both calls get error responses (entire batch rejected)
+            # Both calls get responses (entire batch rejected)
             assert len(tool_msgs) == 2
+            by_id = {m.tool_call_id: m for m in tool_msgs}
+
+            # Violating call: the real phase error
+            assert (
+                "'job_complete' is not available in the tactical phase"
+                in by_id["call_jc"].content
+            )
+            # Legal call: must NOT be told it is phase-illegal
+            assert "'read_file' is not available" not in by_id["call_rf"].content
+            assert "Not executed" in by_id["call_rf"].content
+            assert "IS available" in by_id["call_rf"].content
+            assert "'job_complete'" in by_id["call_rf"].content
+            assert "Re-issue" in by_id["call_rf"].content
+
             mock_tn.ainvoke.assert_not_called()
 
     @pytest.mark.asyncio

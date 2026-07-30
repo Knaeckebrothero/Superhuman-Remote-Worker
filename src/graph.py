@@ -3844,7 +3844,11 @@ def create_audited_tool_node(
         # Defense-in-depth: reject tool calls not declared for the current phase.
         # LLM schema binding is the primary gate; this catches hallucinated calls.
         # ToolNode can't selectively skip calls, so if any call violates the
-        # phase gate we reject the entire batch with explicit error messages.
+        # phase gate we reject the entire batch — but only the violating calls
+        # get the "not available" error. Co-batched phase-legal calls get an
+        # honest "not executed, re-issue" message: telling a legal tool it is
+        # phase-illegal teaches the model its tool surface is unreliable
+        # (proven "stale palette" belief spiral, job edd06963).
         allowed = _phase_allowed.get(phase_str, set())
         phase_violations = [
             tc
@@ -3857,13 +3861,28 @@ def create_audited_tool_node(
                 f"[{job_id}] Phase gate: {violated_names} not available "
                 f"in {phase_str} phase — rejecting entire batch"
             )
+            # Violation is decided purely by tool name, so name membership
+            # exactly identifies the violating calls.
+            violated_name_set = set(violated_names)
+            violated_list = ", ".join(f"'{n}'" for n in sorted(violated_name_set))
             return {
                 "messages": [
                     ToolMessage(
                         content=(
-                            f"Error: '{tc['name']}' is not available in the "
-                            f"{phase_str} phase. Use tools appropriate for "
-                            f"this phase."
+                            (
+                                f"Error: '{tc['name']}' is not available in the "
+                                f"{phase_str} phase. Use tools appropriate for "
+                                f"this phase."
+                            )
+                            if tc["name"] in violated_name_set
+                            else (
+                                f"Not executed: '{tc['name']}' IS available in "
+                                f"the {phase_str} phase, but the batch also "
+                                f"contained {violated_list} (not available in "
+                                f"this phase) and was rejected as a whole. "
+                                f"Re-issue '{tc['name']}' in a new batch "
+                                f"without the phase-restricted tool."
+                            )
                         ),
                         tool_call_id=tc["call_id"],
                         name=tc["name"],
