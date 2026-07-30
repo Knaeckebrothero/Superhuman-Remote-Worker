@@ -25,6 +25,7 @@ for a project at a time.
 - [Configure the run](#configure-the-run)
 - [Standard scheduling and parallel stages](#standard-scheduling-and-parallel-stages)
 - [Campaign scheduling](#campaign-scheduling)
+- [Officer scheduling](#officer-scheduling)
 - [Monitor, pause, resume, and stop](#monitor-pause-resume-and-stop)
 
 ## Configure the run
@@ -96,8 +97,22 @@ campaign stages and acceptance list; disposed campaigns remain in its history.
 Questions filed by loop agents and campaign dispositions can also appear in
 the Inbox.
 
-Campaign versus Standard is fixed when the loop starts. To change it, stop the
-current loop and start another.
+Campaign versus Standard is fixed when the loop starts. To change between
+those two, stop the current loop and start another; converting a live loop to
+Officer scheduling is the one exception (below).
+
+## Officer scheduling
+
+**Officer** hands the loop's scheduling judgment to the project's Centurion
+(see the projects guide's Centurion tab). Each concluded turn wakes him
+instead of auto-spawning the next job: he decides what runs next from the
+backlog, his sitreps, and the project charter — and a run of failures never
+stops the loop mechanically; he judges whether to press on, change approach,
+or escalate. Officer loops need no iteration or deadline budget (the officer
+and his own daily limits are the brake), and they require the project to have
+an enabled Centurion first. A live Standard or Campaign loop can be converted
+to Officer scheduling once — while no campaign is in flight — via the loop
+API; converting back means stopping and starting a fresh loop with a budget.
 
 ## Monitor, pause, resume, and stop
 

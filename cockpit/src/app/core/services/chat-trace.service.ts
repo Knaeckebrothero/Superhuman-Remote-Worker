@@ -10,8 +10,13 @@ import { ChatEntry } from '../models/chat.model';
  * path (DataService) for the chat stream: fetches conversation turns from
  * `/api/jobs/{id}/chat` a page at a time (infinite scroll), driven directly by
  * the selected job. Nothing is downloaded up front, so it scales to large jobs
- * that previously 504'd the bulk endpoint. Chat content renders inline, so
- * (unlike the audit trace) there is no lean projection or per-row detail fetch.
+ * that previously 504'd the bulk endpoint.
+ *
+ * Pages are fetched with `lean=true` (previews + truncated markers only, no
+ * full message bodies); when the user expands a truncated message or tool
+ * result, `hydrateEntry()` fetches the complete turn from
+ * `/api/jobs/{id}/chat/entry/{id}` and swaps it into `rows` in place — same
+ * lean-list + detail-fetch split as the audit trace.
  *
  * See docs/features/debug_audit_view_refactor.md (Phase 2c / P3).
  */
@@ -45,6 +50,9 @@ export class ChatTraceService {
   /** Monotonic token so a stale in-flight load can't clobber a newer job. */
   private epoch = 0;
 
+  /** In-flight per-entry hydrations (dedupe concurrent expands). */
+  private hydrations = new Map<string, Promise<boolean>>();
+
   /** Select the job to show chat for. No-op if unchanged. */
   async setJob(jobId: string | null): Promise<void> {
     if (jobId === this._jobId()) return;
@@ -59,6 +67,7 @@ export class ChatTraceService {
     this._total.set(0);
     this._page = 0;
     this.error.set(null);
+    this.hydrations.clear();
 
     const jobId = this._jobId();
     if (!jobId) return;
@@ -66,7 +75,7 @@ export class ChatTraceService {
     this.loading.set(true);
     try {
       const resp = await firstValueFrom(
-        this.api.getChatHistory(jobId, 1, this.PAGE_SIZE),
+        this.api.getChatHistory(jobId, 1, this.PAGE_SIZE, true),
       );
       if (token !== this.epoch) return; // superseded by a newer job
       if (resp.error) this.error.set(resp.error);
@@ -93,7 +102,7 @@ export class ChatTraceService {
     this.loadingMore.set(true);
     try {
       const resp = await firstValueFrom(
-        this.api.getChatHistory(jobId, nextPage, this.PAGE_SIZE),
+        this.api.getChatHistory(jobId, nextPage, this.PAGE_SIZE, true),
       );
       if (token !== this.epoch) return; // job changed mid-flight
       if (resp.entries.length > 0) {
@@ -106,6 +115,38 @@ export class ChatTraceService {
     } finally {
       if (token === this.epoch) this.loadingMore.set(false);
     }
+  }
+
+  /**
+   * Replace one lean row with its full detail (complete message bodies).
+   *
+   * Used when the user expands a truncated message/tool result. Resolves true
+   * once the row in `rows` carries full content; concurrent calls for the
+   * same entry share one request.
+   */
+  hydrateEntry(entryId: string): Promise<boolean> {
+    const jobId = this._jobId();
+    if (!jobId) return Promise.resolve(false);
+    const inflight = this.hydrations.get(entryId);
+    if (inflight) return inflight;
+
+    const token = this.epoch;
+    const promise = (async () => {
+      try {
+        const full = await firstValueFrom(this.api.getChatEntry(jobId, entryId));
+        if (!full || token !== this.epoch) return false;
+        this._rows.update((rows) =>
+          rows.map((r) => (r._id === entryId ? full : r)),
+        );
+        return true;
+      } catch {
+        return false; // transient; the preview stays usable
+      } finally {
+        this.hydrations.delete(entryId);
+      }
+    })();
+    this.hydrations.set(entryId, promise);
+    return promise;
   }
 
   /** Manual refresh (re-fetch the current job from the top). */

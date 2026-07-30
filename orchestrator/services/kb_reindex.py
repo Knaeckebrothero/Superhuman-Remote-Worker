@@ -52,6 +52,12 @@ SWEEP_TICK_SECONDS = int(os.getenv("KB_REINDEX_SWEEP_SECONDS", "900"))
 # index while keeping the Cockpit progress bar visibly moving.
 _PROGRESS_BUMP_EVERY = 25
 
+# Batch size at which a snapshot's blob reads switch from per-file REST calls
+# to one repo-archive download (sources that support prefetch — native Gitea).
+# Break-even: an archive costs a few seconds of Gitea-side generation; a REST
+# read costs ~130ms. Below the threshold the per-file path is cheaper.
+_ARCHIVE_PREFETCH_THRESHOLD = int(os.getenv("KB_REINDEX_ARCHIVE_THRESHOLD", "25"))
+
 # The vault root within a project's jobs repo (slice 1 dual-write target).
 KNOWLEDGE_PREFIX = "knowledge/"
 
@@ -701,6 +707,15 @@ async def _reindex_snapshot(
     current_map = knowledge_blob_map(tree, root_path)
     indexed_map = await store.get_indexed_blob_shas(kb_id)
     upsert_paths, delete_paths = plan_reindex(indexed_map, current_map, full=full)
+
+    # Bulk-fetch the snapshot as ONE archive download when the batch is big
+    # enough to amortize it (full rebuilds, big backlogs). Small incremental
+    # runs keep the cheap per-file path. Kills the sequential per-note REST
+    # N+1 that was the measured dominant Gitea load. Best-effort: prefetch
+    # never raises, and without it get_file falls back to per-file reads.
+    prefetch = getattr(snapshot, "prefetch", None)
+    if prefetch is not None and len(upsert_paths) >= _ARCHIVE_PREFETCH_THRESHOLD:
+        await prefetch()
 
     # Reset determinate-progress counters for this run so Cockpit can render a
     # bar. notes_total is the per-run work set (changed notes on an incremental

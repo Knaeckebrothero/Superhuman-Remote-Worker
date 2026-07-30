@@ -210,8 +210,10 @@ nudges:
       2. Identify root causes for the failures
       3. Stage smaller, more focused todos
 
+  # See default.yaml: never enumerate the tool surface here — models read such
+  # lists as exhaustive and conclude their other bound tools are gone.
   todo_list_footer: |-
-    Tools available: `todo_complete`, `todo_rewind`, `mark_complete`. Invocations use the canonical Gemma tool-call format from your system prompt: `<|tool_call>call:fn{{...}}<tool_call|>`.
+    Mark each finished task by invoking the `todo_complete` tool with its todo id. This task list is a status reminder, not a tool list — every tool bound in this request stays available. Invocations use the canonical Gemma tool-call format from your system prompt: `<|tool_call>call:fn{{...}}<tool_call|>`.
     Never type tool calls as plain text or with parens.
 
   read_file_required_error: |-

@@ -276,10 +276,15 @@ nudges:
 
   # ----- src/managers/todo.py -----
 
-  # Sites: src/managers/todo.py:409 (todo-list footer)
+  # Sites: src/managers/todo.py:416 (todo-list footer)
+  # NEVER enumerate the tool surface here ("Tools available: ..."). Models read
+  # such lists as exhaustive and conclude their other bound tools are gone —
+  # proven rewind-loop root cause (job 1cab4b88, 9 tactical phases burned;
+  # docs/issues/agent_phase_guardrails_burn_legitimate_work.md). Describe how
+  # to advance the task list; the bound tool schema defines what exists.
   todo_list_footer: |-
-    Tools available: `todo_complete` (mark a task finished — pass the todo id), `todo_rewind` (revisit a completed task — pass the todo id), `mark_complete` (signal the current phase is done).
-    Invoke them via the tool-call format defined in your system prompt.
+    Mark each finished task by invoking the `todo_complete` tool with its todo id. This task list is a status reminder, not a tool list — it does not limit which tools you can call; every tool bound in this request stays available.
+    Invoke tools via the tool-call format defined in your system prompt.
 
   # ----- src/services/recall_store.py -----
 

@@ -808,3 +808,91 @@ async def test_snapshot_cancellation_kills_process_and_cleans_all_temp_files(tmp
 
     assert process.killed
     assert list(tmp_path.iterdir()) == []
+
+
+def _make_archive(tmp_path: Path) -> Path:
+    """A Gitea-shaped tar.gz: one top-level repo dir wrapping the tree."""
+    import io
+    import tarfile
+
+    archive_path = tmp_path / "repo-head.tar.gz"
+    with tarfile.open(archive_path, "w:gz") as tar:
+        for name, data in [
+            ("jobs-project/knowledge/a.md", b"# A\n"),
+            ("jobs-project/knowledge/b.md", b"# B\n"),
+            ("jobs-project/knowledge/bad.md", b"\xff\xfe garbage"),
+        ]:
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            tar.addfile(info, io.BytesIO(data))
+    return archive_path
+
+
+@pytest.mark.asyncio
+async def test_gitea_snapshot_prefetch_serves_reads_from_archive(tmp_path):
+    """After prefetch, get_file reads the tarball — zero per-file REST calls."""
+    import shutil
+
+    archive_src = _make_archive(tmp_path)
+    client = AsyncMock()
+
+    async def fake_download(repo_name, ref, dest_path):
+        shutil.copy(archive_src, dest_path)
+        return True
+
+    client.download_repo_archive = AsyncMock(side_effect=fake_download)
+    source = GiteaKnowledgeGitSource(client, "jobs-project")
+
+    async with source.snapshot(HEAD_SHA) as snapshot:
+        assert await snapshot.prefetch() is True
+        assert await snapshot.prefetch() is True  # idempotent
+        temp_path = snapshot._archive_path
+        assert temp_path is not None and os.path.exists(temp_path)
+
+        assert await snapshot.get_file("knowledge/a.md") == "# A\n"
+        assert await snapshot.get_file("knowledge/b.md") == "# B\n"
+        # Same contract as the REST path: undecodable/missing read as None.
+        assert await snapshot.get_file("knowledge/bad.md") is None
+        assert await snapshot.get_file("knowledge/missing.md") is None
+
+    client.download_repo_archive.assert_awaited_once_with(
+        "jobs-project", HEAD_SHA, temp_path
+    )
+    client.get_file_content.assert_not_called()
+    assert not os.path.exists(temp_path)  # context exit removed the temp file
+
+
+@pytest.mark.asyncio
+async def test_gitea_snapshot_prefetch_failure_falls_back_to_rest():
+    """A failed archive download degrades to the per-file path, never raises."""
+    client = AsyncMock()
+    client.download_repo_archive = AsyncMock(return_value=False)
+    client.get_file_content = AsyncMock(return_value="# Note\n")
+    source = GiteaKnowledgeGitSource(client, "jobs-project")
+
+    async with source.snapshot(HEAD_SHA) as snapshot:
+        assert await snapshot.prefetch() is False
+        assert await snapshot.get_file("knowledge/a.md") == "# Note\n"
+
+    client.get_file_content.assert_awaited_once_with(
+        "jobs-project", "knowledge/a.md", ref=HEAD_SHA
+    )
+
+
+@pytest.mark.asyncio
+async def test_gitea_snapshot_corrupt_archive_falls_back_to_rest(tmp_path):
+    """A tarball that won't parse is discarded and reads stay on REST."""
+    client = AsyncMock()
+
+    async def fake_download(repo_name, ref, dest_path):
+        Path(dest_path).write_bytes(b"not a tarball")
+        return True
+
+    client.download_repo_archive = AsyncMock(side_effect=fake_download)
+    client.get_file_content = AsyncMock(return_value="# Note\n")
+    source = GiteaKnowledgeGitSource(client, "jobs-project")
+
+    async with source.snapshot(HEAD_SHA) as snapshot:
+        assert await snapshot.prefetch() is False
+        assert snapshot._archive_path is None  # temp file already cleaned up
+        assert await snapshot.get_file("knowledge/a.md") == "# Note\n"
