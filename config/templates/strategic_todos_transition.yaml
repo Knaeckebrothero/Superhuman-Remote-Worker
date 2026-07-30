@@ -11,10 +11,14 @@ todos:
       using git evidence — not memory (which may be wrong after context compaction).
 
       Steps:
-      (1) Use the git_tags tool to confirm phase boundary tags exist.
+      (1) Use the git_tags tool to list the phase boundary tags. They are named
+          <job_short_id>-phase-<N>-<type>-complete (e.g. a1b2c3d4-phase-2-tactical-complete);
+          each marks the END of that phase.
       (2) Use the git_log tool (max_count=15) to see commits from the previous phase.
-      (3) Use git_diff with the phase start tag (e.g., ref="phase_N_start") to see
-          all file changes made during the phase.
+      (3) Use git_diff between the two most recent boundary tags from step 1
+          (ref1=older tag, ref2=newer tag) to see all file changes made during
+          the phase. If only one boundary tag exists yet (first phase), diff
+          from the "[Phase 0 Seed]" commit shown by git_log instead.
 
       Then write a retrospective to archive/phase_N_retrospective.md with these
       six sections:

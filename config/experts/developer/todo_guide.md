@@ -111,7 +111,7 @@ Example todos:
 Purpose: Package the work for review.
 
 Example todos:
-- "Review all changes via `git_diff` against the job's base tag. Confirm scope matches spec.yaml feature and respects not_included."
+- "Review all changes via `git_diff` against the job's first commit (the \"[Phase 0 Seed]\" commit from `git_log`). Confirm scope matches spec.yaml feature and respects not_included."
 - "Stage and commit with message `feat: <feature> (AC-1, AC-2, ...)`. Push to origin <branch>."
 - "Verify via `git_log` and `git_status`: commit landed, branch clean."
 

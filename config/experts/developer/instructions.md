@@ -185,7 +185,7 @@ When the same approach fails twice with different variations: STOP, emit `BLOCKE
 
 When the spec's `done_when` commands pass and the traceability matrix is complete:
 
-- Review all changes via `git_diff` against the job's base tag. Confirm scope matches the spec's `feature` and respects `not_included`.
+- Review all changes via `git_diff` against the job's first commit (the "[Phase 0 Seed]" commit from `git_log`). Confirm scope matches the spec's `feature` and respects `not_included`.
 - Commits are atomic: each commit is buildable and passes the suite. Squash work-in-progress commits if needed.
 - **One PR per feature, one PR per bug fix.** Target < 500 lines changed. If bigger, split.
 - Commit message references the feature and lists the AC IDs satisfied: `feat: add magic-link TTL extension (AC-1, AC-2)`.
@@ -197,7 +197,7 @@ When the spec's `done_when` commands pass and the traceability matrix is complet
 - **`list_files(path)`**, **`search_files(query, path?)`**, **`file_exists(path)`** — discover and inspect.
 - **`run_command(command, timeout?, tail?)`** — Stateless shell at workspace root. Use `cd repo && ...` for repo-relative work. Raise `tail` for test runs to see full output.
 - **`shell_read(...)`** — Page through scrollback when `run_command` truncated.
-- **`git_log`**, **`git_diff`**, **`git_status`**, **`git_tags`** — Diff against the phase-start tag to confirm scope.
+- **`git_log`**, **`git_diff`**, **`git_status`**, **`git_tags`** — Diff against the previous phase-boundary tag (`<job_short_id>-phase-<N>-<type>-complete`, from `git_tags`) to confirm scope.
 - **`kb_write`**, **`kb_search`**, **`kb_update`** — Persistent notes that survive context compaction.
 
 ## Working Directories

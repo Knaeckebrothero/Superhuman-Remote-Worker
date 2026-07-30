@@ -491,3 +491,125 @@ class TestAppendVerificationRound:
             == 1
         )
         assert len((await _read_ctx(db, jid))["verification_rounds"]) == 1
+
+
+# ---------------------------------------------------------------------------
+# append_pending_guidance + consume_job_guidance (P1-A guidance lane)
+# ---------------------------------------------------------------------------
+
+
+class TestAppendPendingGuidance:
+    @pytest.mark.asyncio
+    async def test_creates_array_and_preserves_siblings(self, db):
+        jid = str(uuid4())
+        await _insert_job(db, jid, {"keep": "me"})
+
+        ok = await db.append_pending_guidance(jid, {"id": "g1", "text": "steer"})
+
+        assert ok is True
+        ctx = await _read_ctx(db, jid)
+        assert ctx["pending_guidance"] == [{"id": "g1", "text": "steer"}]
+        assert ctx["keep"] == "me"
+
+    @pytest.mark.asyncio
+    async def test_concurrent_appends_all_land(self, db):
+        jid = str(uuid4())
+        await _insert_job(db, jid, {})
+        n = 8
+
+        await asyncio.gather(
+            *(db.append_pending_guidance(jid, {"id": f"g{i}"}) for i in range(n))
+        )
+
+        ctx = await _read_ctx(db, jid)
+        assert sorted(e["id"] for e in ctx["pending_guidance"]) == sorted(
+            f"g{i}" for i in range(n)
+        )
+
+    @pytest.mark.asyncio
+    async def test_missing_job_and_invalid_id_return_false(self, db):
+        assert await db.append_pending_guidance(str(uuid4()), {"id": "g"}) is False
+        assert await db.append_pending_guidance("not-a-uuid", {"id": "g"}) is False
+
+
+class TestConsumeJobGuidance:
+    @pytest.mark.asyncio
+    async def test_moves_acked_guidance_to_consumed_replies(self, db):
+        jid = str(uuid4())
+        await _insert_job(
+            db,
+            jid,
+            {
+                "pending_guidance": [
+                    {"id": "g1", "text": "rendered"},
+                    {"id": "g2", "text": "still pending"},
+                ],
+                "keep": "me",
+            },
+        )
+
+        moved = await db.consume_job_guidance(jid, guidance_ids=["g1"])
+
+        assert moved == 1
+        ctx = await _read_ctx(db, jid)
+        assert [e["id"] for e in ctx["pending_guidance"]] == ["g2"]
+        assert [e["id"] for e in ctx["consumed_replies"]] == ["g1"]
+        assert ctx["consumed_replies"][0]["consumed_at"]
+        assert ctx["keep"] == "me"
+
+    @pytest.mark.asyncio
+    async def test_moves_drained_reply_threads(self, db):
+        jid = str(uuid4())
+        await _insert_job(
+            db,
+            jid,
+            {
+                "queued_replies": [
+                    {"thread_id": "officer", "message": "drained"},
+                    {"thread_id": "other", "message": "not drained"},
+                ]
+            },
+        )
+
+        moved = await db.consume_job_guidance(jid, reply_threads=["officer"])
+
+        assert moved == 1
+        ctx = await _read_ctx(db, jid)
+        assert [r["thread_id"] for r in ctx["queued_replies"]] == ["other"]
+        assert [r["thread_id"] for r in ctx["consumed_replies"]] == ["officer"]
+
+    @pytest.mark.asyncio
+    async def test_idempotent_reack_is_noop(self, db):
+        jid = str(uuid4())
+        await _insert_job(db, jid, {"pending_guidance": [{"id": "g1"}]})
+
+        assert await db.consume_job_guidance(jid, guidance_ids=["g1"]) == 1
+        assert await db.consume_job_guidance(jid, guidance_ids=["g1"]) == 0
+
+        ctx = await _read_ctx(db, jid)
+        assert ctx["pending_guidance"] == []
+        assert len(ctx["consumed_replies"]) == 1
+
+    @pytest.mark.asyncio
+    async def test_concurrent_append_during_consume_is_not_lost(self, db):
+        """The FOR UPDATE row lock: an atomic append racing the consume's
+        read-filter-write must land, not be clobbered by the wholesale
+        key rewrite."""
+        jid = str(uuid4())
+        await _insert_job(db, jid, {"pending_guidance": [{"id": "g1"}]})
+
+        await asyncio.gather(
+            db.consume_job_guidance(jid, guidance_ids=["g1"]),
+            db.append_pending_guidance(jid, {"id": "g2"}),
+        )
+
+        ctx = await _read_ctx(db, jid)
+        ids = {e["id"] for e in ctx["pending_guidance"]} | {
+            e["id"] for e in ctx["consumed_replies"]
+        }
+        assert ids == {"g1", "g2"}
+
+    @pytest.mark.asyncio
+    async def test_missing_job_returns_none(self, db):
+        assert await db.consume_job_guidance(str(uuid4()), guidance_ids=["g"]) is None
+        assert await db.consume_job_guidance("not-a-uuid", guidance_ids=["g"]) is None

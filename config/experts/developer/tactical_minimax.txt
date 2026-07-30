@@ -74,7 +74,7 @@ WHY: Refactor is where regressions hide. Without "every previously-green test st
 </refactor_phase_workflow>
 
 <integration_phase_workflow>
-1. Review `git_diff` against the job's base tag.
+1. Review `git_diff` against the job's first commit (the "[Phase 0 Seed]" commit from `git_log`; there is no job base tag).
 2. Confirm scope matches `spec.yaml`'s `feature` and respects `not_included`.
 3. Stage and commit with a message referencing AC IDs: `feat: <feature> (AC-1, AC-2)`.
 4. Verify with `git_log` and `git_status`.

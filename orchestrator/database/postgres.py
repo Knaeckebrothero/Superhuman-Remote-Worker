@@ -2001,6 +2001,142 @@ class PostgresDB:
 
         return result == "UPDATE 1"
 
+    async def append_pending_guidance(self, job_id: str, entry: Dict[str, Any]) -> bool:
+        """Atomically append one guidance entry to ``context.pending_guidance``.
+
+        The non-destructive steer lane (P1-A of
+        docs/issues/officer_blind_reads_and_worker_bureaucracy.md): urgent
+        officer/operator messages land here instead of triggering a
+        resume-with-feedback, ride the agent-heartbeat response into the
+        worker's next LLM turn, and are moved to ``context.consumed_replies``
+        by ``consume_job_guidance`` once rendered.
+
+        Same single-statement ``jsonb_set(..., arr || $1)`` form as
+        ``append_queued_reply`` so two concurrent senders both land.
+
+        Args:
+            job_id: Job UUID as string
+            entry: Guidance object (id/text/source/created_at)
+
+        Returns:
+            True if updated, False if not found / id invalid
+        """
+        import json as json_module
+
+        try:
+            uuid_val = UUID(job_id)
+        except ValueError:
+            return False
+
+        query = (
+            "UPDATE jobs "
+            "SET context = jsonb_set("
+            "        COALESCE(context, '{}'::jsonb), "
+            "        '{pending_guidance}', "
+            "        COALESCE(context->'pending_guidance', '[]'::jsonb) || $1::jsonb"
+            "    ), "
+            "    updated_at = CURRENT_TIMESTAMP "
+            "WHERE id = $2"
+        )
+        async with self.acquire() as conn:
+            result = await conn.execute(query, json_module.dumps(entry), uuid_val)
+
+        return result == "UPDATE 1"
+
+    async def consume_job_guidance(
+        self,
+        job_id: str,
+        guidance_ids: Optional[List[str]] = None,
+        reply_threads: Optional[List[str]] = None,
+    ) -> Optional[int]:
+        """Atomically move delivered guidance/replies to ``context.consumed_replies``.
+
+        ``pending_guidance`` entries are matched by ``id``, ``queued_replies``
+        entries by ``thread_id``; matches are appended to
+        ``context.consumed_replies`` with a ``consumed_at`` stamp. This is the
+        clearing contract the agent's ack drives: once an id leaves
+        ``pending_guidance`` it stops riding heartbeat responses, and a
+        drained reply thread is not re-materialized at the next phase
+        boundary. Idempotent — acking an already-consumed id is a no-op.
+
+        Not a single-statement write: the filter needs Python, so it runs as
+        SELECT ... FOR UPDATE + one merge UPDATE in a transaction. All other
+        context writers are row-locking UPDATEs, so concurrent appends block
+        on the lock instead of being lost.
+
+        Args:
+            job_id: Job UUID as string
+            guidance_ids: ``pending_guidance`` entry ids to consume
+            reply_threads: thread ids whose ``queued_replies`` were drained
+
+        Returns:
+            Number of entries moved, or None if the job doesn't exist /
+            the id is invalid.
+        """
+        import json as json_module
+
+        try:
+            uuid_val = UUID(job_id)
+        except ValueError:
+            return None
+
+        id_set = set(guidance_ids or [])
+        thread_set = set(reply_threads or [])
+
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    "SELECT context FROM jobs WHERE id = $1 FOR UPDATE",
+                    uuid_val,
+                )
+                if not row:
+                    return None
+
+                ctx = row.get("context") or {}
+                if isinstance(ctx, str):
+                    ctx = json_module.loads(ctx)
+
+                pending = ctx.get("pending_guidance") or []
+                queued = ctx.get("queued_replies") or []
+                consumed = list(ctx.get("consumed_replies") or [])
+                consumed_at = datetime.now(timezone.utc).isoformat()
+
+                moved = 0
+                keep_pending = []
+                for entry in pending:
+                    if isinstance(entry, dict) and entry.get("id") in id_set:
+                        consumed.append({**entry, "consumed_at": consumed_at})
+                        moved += 1
+                    else:
+                        keep_pending.append(entry)
+
+                keep_queued = []
+                for entry in queued:
+                    if isinstance(entry, dict) and entry.get("thread_id") in thread_set:
+                        consumed.append({**entry, "consumed_at": consumed_at})
+                        moved += 1
+                    else:
+                        keep_queued.append(entry)
+
+                if moved == 0:
+                    return 0
+
+                await conn.execute(
+                    "UPDATE jobs "
+                    "SET context = COALESCE(context, '{}'::jsonb) || $1::jsonb, "
+                    "    updated_at = CURRENT_TIMESTAMP "
+                    "WHERE id = $2",
+                    json_module.dumps(
+                        {
+                            "pending_guidance": keep_pending,
+                            "queued_replies": keep_queued,
+                            "consumed_replies": consumed,
+                        }
+                    ),
+                    uuid_val,
+                )
+                return moved
+
     async def append_verification_round(
         self, job_id: str, record: Dict[str, Any]
     ) -> int:

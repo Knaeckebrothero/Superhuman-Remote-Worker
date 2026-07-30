@@ -1111,6 +1111,25 @@ def create_execute_node(
                     f"[{job_id}] Citation feedback retrieval failed (non-fatal): {e}"
                 )
 
+        # Supervisor guidance (P1-A): the non-destructive steer. Entries land
+        # in the dual_app inbox via the heartbeat response (worst case one
+        # heartbeat interval, currently 60s, to reach the inbox) and render
+        # here on the very next LLM turn — no kill, no compaction, no
+        # re-plan. Re-derived per turn, so compaction-immune; keeps rendering
+        # until the post-turn ack (below) clears ``context.pending_guidance``
+        # (~1-2 turns of overlap, at-least-once).
+        _guidance_entries = _get_pending_supervisor_guidance(job_id)
+        _guidance_block = [""]
+        if _guidance_entries:
+            from src.core.guidance_injection import format_supervisor_guidance
+
+            _guidance_block[0] = format_supervisor_guidance(_guidance_entries)
+            if _guidance_block[0]:
+                logger.info(
+                    f"[{job_id}] Supervisor guidance injection: "
+                    f"{len(_guidance_entries)} pending entrie(s)"
+                )
+
         def _inject_transient_messages(target_messages: list) -> None:
             """Splice transient injections (memories, knowledge, instruction files, todos) at the tail.
 
@@ -1184,6 +1203,20 @@ def create_execute_node(
                             logger.warning(
                                 f"[{job_id}] Phase instruction file not found: {entry.path}"
                             )
+
+            # Supervisor guidance: the last synthetic pair before the todo
+            # list, so mid-run steering is the freshest context short of the
+            # current tasks themselves.
+            if _guidance_block[0]:
+                from src.core.guidance_injection import (
+                    create_guidance_injection_messages,
+                )
+
+                guid_ai, guid_tool = create_guidance_injection_messages(
+                    _guidance_block[0]
+                )
+                block.append(guid_ai)
+                block.append(guid_tool)
 
             # Todo list as transient HumanMessage — last, so the request ends
             # with the current tasks (query-at-end) and the synthetic tool-call
@@ -1334,6 +1367,20 @@ def create_execute_node(
                 # Reset failure streaks on a successful LLM response.
                 _tool_use_failed_streak[0] = 0
                 _llm_error_streak[0] = 0
+
+                # Supervisor guidance rendered into THIS turn's request —
+                # ack it (best-effort, fire-and-forget) so the orchestrator
+                # moves the entries to ``context.consumed_replies`` and the
+                # officer can confirm delivery by reading job context. Once
+                # per execute() call, even across the retry loop.
+                if _guidance_entries:
+                    _ack_supervisor_guidance(
+                        job_id,
+                        guidance_ids=[
+                            str(e["id"]) for e in _guidance_entries if e.get("id")
+                        ],
+                    )
+                    _guidance_entries = []
 
                 # Repair/scrub malformed tool-call arguments BEFORE anything
                 # else reads the response — an unparseable call otherwise
@@ -2916,14 +2963,20 @@ async def _process_queued_replies(
     job_id: str,
     workspace: "WorkspaceManager",
     postgres_db,
-) -> int:
+) -> List[Dict[str, Any]]:
     """Consume queued async replies from job context and write to workspace.
 
-    Called at tactical→strategic phase boundaries so replies appear in
-    ``git_diff`` during the upcoming strategic review.
+    Called at tactical→strategic phase boundaries. Writes each reply as a
+    ``messages/{thread}/{seq}_received.md`` audit file; the caller
+    (handle_transition) injects the drained content into LLM-visible context
+    as a persistent HumanMessage and acks the drained thread ids so the
+    orchestrator moves them ``context.queued_replies`` →
+    ``context.consumed_replies`` (the clearing contract — without it every
+    boundary re-materialized duplicates and nothing ever told the worker to
+    read the files).
 
     Returns:
-        Number of replies processed.
+        The drained reply entries (``thread_id``/``message``/``timestamp``).
     """
     from datetime import datetime, timezone as tz
 
@@ -2933,7 +2986,7 @@ async def _process_queued_replies(
         job_id,
     )
     if not row:
-        return 0
+        return []
 
     ctx = row.get("context") or {}
     if isinstance(ctx, str):
@@ -2941,11 +2994,7 @@ async def _process_queued_replies(
 
     queued = ctx.get("queued_replies")
     if not queued:
-        return 0
-
-    # NOTE: queued_replies are cleared from DB context by the orchestrator
-    # when the agent reports completion with consumed_reply_threads=True.
-    # We only write the replies to workspace files here.
+        return []
 
     # Write each reply as a workspace file
     for reply in queued:
@@ -2982,7 +3031,33 @@ async def _process_queued_replies(
     logger.info(
         f"[{job_id}] Processed {len(queued)} queued async replies at phase boundary"
     )
-    return len(queued)
+    return list(queued)
+
+
+def _format_drained_replies(replies: List[Dict[str, Any]]) -> str:
+    """Render drained queued replies as one visible message-block.
+
+    Injected as a persistent HumanMessage at the tactical→strategic boundary
+    — a compaction point, so the cache impact is nil — because the audit
+    files alone were a dead letter box: nothing told the worker to read them.
+    """
+    lines = [
+        "[QUEUED MESSAGES] Messages received while you were working "
+        "(also archived under messages/):",
+        "",
+    ]
+    for reply in replies:
+        thread_id = reply.get("thread_id", "unknown")
+        timestamp = reply.get("timestamp", "")
+        meta = ", ".join(str(p) for p in (thread_id, timestamp) if p)
+        lines.append(f"--- ({meta}) ---")
+        lines.append(str(reply.get("message", "")).strip())
+        lines.append("")
+    lines.append(
+        "Weigh these against the current plan during the strategic review; "
+        "they do not force a re-plan by themselves."
+    )
+    return "\n".join(lines)
 
 
 def _is_drain_requested() -> bool:
@@ -3000,6 +3075,39 @@ def _is_drain_requested() -> bool:
         return is_drain_requested()
     except Exception:
         return False
+
+
+def _get_pending_supervisor_guidance(job_id: str) -> List[Dict[str, Any]]:
+    """Pending supervisor guidance from the dual-mode heartbeat inbox (P1-A).
+
+    Same lazy-import contract as ``_is_drain_requested``: outside the dual
+    app (tests, standalone runs) there is no inbox and no guidance.
+    """
+    try:
+        from src.api.dual_app import get_pending_guidance
+
+        return get_pending_guidance(job_id)
+    except Exception:
+        return []
+
+
+def _ack_supervisor_guidance(
+    job_id: str,
+    guidance_ids: Optional[List[str]] = None,
+    reply_threads: Optional[List[str]] = None,
+) -> None:
+    """Fire-and-forget delivery ack via the dual-mode orchestrator client.
+
+    Moves the named entries ``context.pending_guidance`` /
+    ``context.queued_replies`` → ``context.consumed_replies`` on the
+    orchestrator. Best-effort: failure just means redelivery.
+    """
+    try:
+        from src.api.dual_app import ack_guidance
+
+        ack_guidance(job_id, guidance_ids=guidance_ids, reply_threads=reply_threads)
+    except Exception:
+        pass
 
 
 def create_handle_transition_node(
@@ -3037,11 +3145,14 @@ def create_handle_transition_node(
         )
 
         # Process queued async replies at tactical→strategic boundaries.
-        # Writes received message files to workspace so they appear in
-        # git_diff during the upcoming strategic review phase.
+        # Writes received message files to workspace AND (below) injects the
+        # content into LLM-visible context — the files alone were never read.
+        drained_replies: List[Dict[str, Any]] = []
         if not is_strategic and postgres_db:
             try:
-                await _process_queued_replies(job_id, workspace, postgres_db)
+                drained_replies = await _process_queued_replies(
+                    job_id, workspace, postgres_db
+                )
             except Exception as e:
                 logger.warning(f"[{job_id}] Failed to process queued replies: {e}")
 
@@ -3108,6 +3219,22 @@ def create_handle_transition_node(
         # report_completion() → orchestrator for status determination.
         if result.freeze_data:
             updates["freeze_data"] = result.freeze_data
+
+        # Deliver drained queued replies into context (persistent HumanMessage
+        # — the boundary is already a compaction point, so cache impact is
+        # nil) and ack the drained threads so the orchestrator clears
+        # ``context.queued_replies`` (no re-materialization at the next
+        # boundary). If the ack fails the same replies are re-drained once —
+        # at-least-once beats the old unbounded duplicate loop.
+        if drained_replies:
+            reply_message = HumanMessage(
+                content=_format_drained_replies(drained_replies)
+            )
+            updates["messages"] = list(updates.get("messages") or []) + [reply_message]
+            drained_threads = sorted(
+                {str(r.get("thread_id")) for r in drained_replies if r.get("thread_id")}
+            )
+            _ack_supervisor_guidance(job_id, reply_threads=drained_threads)
 
         # Phase 1d — Continue-as-New on orchestrator drain intent.
         # The lifecycle reconciler marks workers on a stale image with
@@ -3484,6 +3611,17 @@ def create_restore_from_feedback_node(
         feedback = state.get("resume_feedback", "")
         messages = state.get("messages", [])
 
+        # Why the job was resumed with feedback, as passed through the resume
+        # payload (``feedback_reason``). Free-form on purpose — new callers
+        # (e.g. a deliverable-gate bounce) inject their own reason without
+        # touching this node. Absent → honest generic fallback; the old
+        # hardcoded "previously frozen for human review" was frequently false
+        # (supervisor escalations arrive on running jobs that were never
+        # frozen for review).
+        resume_reason = (state.get("resume_reason") or "").strip() or (
+            "This job was interrupted and resumed with feedback from its operator."
+        )
+
         logger.info(
             f"[{job_id}] Restoring from feedback resume ({len(feedback)} chars)"
         )
@@ -3513,10 +3651,7 @@ def create_restore_from_feedback_node(
 
         # Step 2: Write feedback.md to workspace for persistence across context compaction
         feedback_content = (
-            f"# Human Feedback\n\n"
-            f"Received when resuming frozen job.\n\n"
-            f"## Feedback\n\n"
-            f"{feedback}\n"
+            f"# Resume Feedback\n\n{resume_reason}\n\n## Feedback\n\n{feedback}\n"
         )
         workspace.write_file("feedback.md", feedback_content)
         logger.info(f"[{job_id}] Wrote feedback.md to workspace")
@@ -3557,19 +3692,59 @@ def create_restore_from_feedback_node(
                 f"[{job_id}] Wrote received message to {msg_dir}/{seq:03d}_received.md"
             )
 
-        # Step 3: Create HumanMessage with formatted feedback
+        # Step 3: Create HumanMessage with formatted feedback. The banner
+        # states the ACTUAL cause (see resume_reason above), never a blanket
+        # "previously frozen for human review".
         feedback_message = HumanMessage(
             content=(
-                f"[FEEDBACK_RESUME] This job was previously frozen for human review. "
-                f"The human operator has provided feedback and resumed the job.\n\n"
-                f"## Human Feedback\n\n{feedback}\n\n"
+                f"[FEEDBACK_RESUME] {resume_reason}\n\n"
+                f"## Feedback\n\n{feedback}\n\n"
                 f"The feedback has been saved to feedback.md for reference. "
                 f"Process the feedback using the strategic todos below, then create "
                 f"corrective tactical todos to address each feedback item."
             )
         )
 
-        # Step 4: Load resume-specific strategic todos
+        # Step 4a: Archive any in-flight todos from the checkpoint before the
+        # resume todos replace them. This node is the entry point on a
+        # feedback resume (restore_todo_state never ran), so the manager is
+        # empty and the checkpointed todos would otherwise be silently
+        # discarded — the officer's steer used to destroy the very tactical
+        # work it was demanding. Archive with a preemption note instead
+        # (staged-but-unapplied todos are not in flight and are dropped as
+        # before).
+        checkpoint_todos = state.get("todos") or []
+        if checkpoint_todos:
+            todo_manager.restore_state(
+                {
+                    "todos": checkpoint_todos,
+                    "staged_todos": None,
+                    "next_id": state.get("todo_next_id"),
+                    "phase_number": state.get("phase_number", 0),
+                    "is_strategic_phase": state.get("is_strategic_phase", True),
+                }
+            )
+            if todo_manager.list_all():
+                try:
+                    archive_path = todo_manager.archive_with_failure_note(
+                        "A feedback resume preempted this phase before it "
+                        "completed — these todos were in flight, not failed. "
+                        "Re-plan against the feedback and re-stage whatever "
+                        "is still relevant.",
+                        phase_label="preempted",
+                        heading="Preempted by Feedback Resume",
+                    )
+                    logger.info(
+                        f"[{job_id}] Archived {len(checkpoint_todos)} in-flight "
+                        f"todo(s) preempted by feedback resume: {archive_path}"
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"[{job_id}] Could not archive preempted todos "
+                        f"(continuing with resume): {e}"
+                    )
+
+        # Step 4b: Load resume-specific strategic todos
         resume_todos = get_resume_strategic_todos(config, tool_names=tool_names)
         todo_list = [todo.to_dict() for todo in resume_todos]
         todo_manager.set_todos_from_list(todo_list)
@@ -3592,6 +3767,8 @@ def create_restore_from_feedback_node(
                 iteration=state.get("iteration", 0),
                 data={
                     "feedback_length": len(feedback),
+                    "resume_reason": resume_reason,
+                    "preempted_todos": len(checkpoint_todos),
                     "resume_todos": len(resume_todos),
                     "messages_before": len(messages),
                     "messages_after": len(actual_messages),
@@ -3608,6 +3785,7 @@ def create_restore_from_feedback_node(
         return {
             "messages": result_messages,
             "resume_feedback": None,  # Clear — consumed
+            "resume_reason": None,  # Clear — consumed
             "is_final_phase": False,
             "should_stop": False,
             "goal_achieved": False,

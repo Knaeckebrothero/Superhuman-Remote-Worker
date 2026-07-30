@@ -1543,6 +1543,51 @@ class OrchestratorClient:
             )
             return False
 
+    async def ack_job_guidance(
+        self,
+        job_id: str,
+        guidance_ids: list[str] | None = None,
+        reply_threads: list[str] | None = None,
+    ) -> bool:
+        """Ack delivered supervisor guidance / drained queued replies.
+
+        The orchestrator atomically moves the named entries from
+        ``context.pending_guidance`` (by entry id) and ``context.queued_replies``
+        (by thread id) to ``context.consumed_replies``, which stops redelivery
+        and lets the sender confirm delivery by reading job context. Best-effort:
+        a failed ack just means redelivery (at-least-once), so callers should
+        fire-and-forget.
+
+        Args:
+            job_id: UUID of the job the guidance was delivered to
+            guidance_ids: ``pending_guidance`` entry ids rendered into context
+            reply_threads: thread ids whose queued replies were drained
+
+        Returns:
+            True if the orchestrator recorded the ack.
+        """
+        if not self._client:
+            await self.connect()
+
+        url = f"{self.orchestrator_url}/api/jobs/{job_id}/guidance/ack"
+        payload = {
+            "guidance_ids": guidance_ids or [],
+            "reply_threads": reply_threads or [],
+        }
+
+        try:
+            response = await self._client.post(url, json=payload)
+            if response.status_code == 200:
+                return True
+            logger.warning(
+                f"Guidance ack failed for job {job_id}: "
+                f"{response.status_code} - {response.text}"
+            )
+            return False
+        except httpx.RequestError as e:
+            logger.warning(f"Failed to ack guidance for job {job_id}: {e}")
+            return False
+
     async def create_delegation_job(
         self,
         description: str,
