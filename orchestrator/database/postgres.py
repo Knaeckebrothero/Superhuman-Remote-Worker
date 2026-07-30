@@ -12830,6 +12830,18 @@ class PostgresDB:
         the same trust posture as send_message recipient resolution. Callers
         are expected to pass exactly one of job_id/thread_id (the router
         enforces that); this method just resolves whichever it's given.
+
+        The thread branch tries ``thread_mounts`` (``mount_kind='project'``)
+        FIRST, falling back to the legacy ``threads.project_id`` column only
+        if no mount resolves. ``thread_mounts`` is the actual source of truth
+        for a session's project attachment (migration 0013_thread_mounts.sql)
+        — ``threads.project_id`` is written only at thread creation and goes
+        stale the moment a project is attached via a mount instead (the
+        normal path; see ``GET /api/persistent/threads/{id}``, whose
+        ``project_ids`` are derived from mounts, not the column). Querying
+        the column alone would silently resolve NULL for a mounted-but-not-
+        column-set thread, and the endpoint would return an empty contacts
+        list forever with no error — worse than failing loudly.
         """
         if job_id:
             try:
@@ -12847,8 +12859,19 @@ class PostgresDB:
                 return None
             async with self.acquire() as conn:
                 project_id = await conn.fetchval(
-                    "SELECT project_id FROM threads WHERE id = $1", uuid_val
+                    """
+                    SELECT source_ref FROM thread_mounts
+                    WHERE thread_id = $1 AND mount_kind = 'project'
+                          AND source_ref IS NOT NULL
+                    ORDER BY created_at
+                    LIMIT 1
+                    """,
+                    uuid_val,
                 )
+                if project_id is None:
+                    project_id = await conn.fetchval(
+                        "SELECT project_id FROM threads WHERE id = $1", uuid_val
+                    )
         else:
             return None
         return str(project_id) if project_id else None
