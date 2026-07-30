@@ -51,6 +51,12 @@ class VirtualDirProvider(Protocol):
 
     def write(self, name: str, content: str) -> None: ...
 
+    # Optional. Return every entry's content in ONE pass. Providers that render
+    # the whole set per read (ToolsProvider, ContactsProvider) should implement
+    # it; search is O(N^2) without it. Omitting it is safe — the overlay falls
+    # back to entries() + read().
+    def read_all(self) -> Dict[str, str]: ...
+
 
 class VirtualOverlayBackend:
     """Routes registered prefixes to providers; delegates everything else."""
@@ -143,6 +149,37 @@ class VirtualOverlayBackend:
             logger.warning("virtual write failed for %s: %s", path, e)
             raise VirtualPathError(f"{path} could not be written: {e}") from e
 
+    def _read_all(self, provider: Any) -> Dict[str, str]:
+        """Every entry's content, in ONE pass when the provider offers one.
+
+        ``entries()`` + ``read()``-per-name is quadratic for providers that
+        render the whole document set per call: ``ToolsProvider.read`` re-renders
+        all ~40 tool docs to return one of them, so a root ``search_files``
+        costs ~N^2 ``generate_tool_description`` invocations on the agent's
+        request path. ``read_all()`` collapses that to a single render.
+
+        Called fresh per overlay operation — nothing is memoized across calls,
+        so content still reflects the current tool/contact list every time.
+        """
+        read_all = getattr(provider, "read_all", None)
+        if callable(read_all):
+            try:
+                return dict(read_all())
+            except Exception as e:
+                logger.warning(
+                    "virtual read_all() failed for %s: %s", provider.prefix, e
+                )
+                return {}
+        docs: Dict[str, str] = {}
+        for name in self._entries(provider):
+            try:
+                docs[name] = provider.read(name) or ""
+            except Exception as e:
+                logger.warning(
+                    "virtual search skipped %s/%s: %s", provider.prefix, name, e
+                )
+        return docs
+
     # --- read path --------------------------------------------------------
 
     def read_file(self, path: str, binary: bool = False) -> Any:
@@ -220,14 +257,9 @@ class VirtualOverlayBackend:
     def _search_provider(self, provider: Any, query: str, case_sensitive: bool) -> list:
         needle = query if case_sensitive else query.lower()
         hits = []
-        for name in sorted(self._entries(provider)):
-            try:
-                content = provider.read(name) or ""
-            except Exception as e:
-                logger.warning(
-                    "virtual search skipped %s/%s: %s", provider.prefix, name, e
-                )
-                continue
+        docs = self._read_all(provider)
+        for name in sorted(docs):
+            content = docs[name] or ""
             rel = f"{provider.prefix}/{name}" if provider.is_dir else name
             for lineno, line in enumerate(content.splitlines(), 1):
                 haystack = line if case_sensitive else line.lower()

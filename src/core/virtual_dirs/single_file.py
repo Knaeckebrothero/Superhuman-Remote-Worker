@@ -23,3 +23,7 @@ class SingleFileProvider:
         if name != self.prefix:
             return None
         return self._render()
+
+    def read_all(self) -> Dict[str, str]:
+        """One render pass instead of ``entries()`` + ``read()`` (see ``_read_all``)."""
+        return {self.prefix: self._render() or ""}
