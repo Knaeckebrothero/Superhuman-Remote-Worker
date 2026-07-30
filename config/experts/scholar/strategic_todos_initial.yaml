@@ -120,10 +120,9 @@ todos:
     content: >-
       CREATE first phase todos using the next_phase_todos tool.
 
-      IMPORTANT: You MUST invoke the read_file tool on `skills/todo-guide/SKILL.md` BEFORE calling next_phase_todos.
-      The tool will reject your call if you haven't read the guide.
+      Create 5-7 todos for the first exploration phase. (The todo-guide skill at
+      skills/todo-guide/SKILL.md covers todo crafting.)
 
-      After reading the guide, create 5-7 todos for the first exploration phase.
       Each todo must:
       - Target a specific question from your exploration plan
       - Name the exploration mode (web search, codebase read, log query, experiment)
@@ -141,6 +140,5 @@ todos:
 
       COMPLETION CRITERIA: next_phase_todos called successfully with 5-7 todos.
 
-      INSTEAD OF: Skipping reading skills/todo-guide/SKILL.md — the tool enforces this.
-      Instead of vague todos like "research the topic" — specify what to search,
+      INSTEAD OF: Vague todos like "research the topic" — specify what to search,
       where to look, and what artifact to produce.

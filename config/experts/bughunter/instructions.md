@@ -40,7 +40,7 @@ For each finding, before it leaves your hands:
 
 ### Step 5: Hunt Report
 
-After all probes, write a single hunt report at `output/findings/000_hunt_summary.md`. It lists every finding with its severity and confidence, every probe that came up empty, and every blocker. This is the deliverable.
+The hunt report at `output/findings/000_hunt_summary.md` is the deliverable — scaffold it when the threat model is ranked (Step 2) and update it after every probe, so an interrupted hunt still leaves a usable summary. After all probes, finalize it: every finding with its severity and confidence, every probe that came up empty, and every blocker.
 
 ## Reproduction Formats
 

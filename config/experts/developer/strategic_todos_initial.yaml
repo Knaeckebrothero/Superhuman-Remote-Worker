@@ -164,9 +164,8 @@ todos:
     content: >-
       CREATE first phase todos using the next_phase_todos tool.
 
-      IMPORTANT: You MUST invoke read_file on `skills/todo-guide/SKILL.md` BEFORE calling
-      next_phase_todos. The tool will reject your call if you haven't. The guide contains
-      the TDD phase types, exit gates, and forbidden test patterns.
+      (The todo-guide skill at skills/todo-guide/SKILL.md covers the TDD phase
+      types, exit gates, and forbidden test patterns.)
 
       The FIRST tactical phase has `tdd_phase: spec`. Create 3-5 todos that will produce
       spec.yaml and lock it into spec_lock.md. Each todo must reference tdd_phase=spec
@@ -201,7 +200,6 @@ todos:
       COMPLETION CRITERIA: next_phase_todos called successfully with 3-5 todos, each
       stamped with tdd_phase=spec.
 
-      INSTEAD OF: Skipping reading skills/todo-guide/SKILL.md — the tool enforces this. Instead of
-      creating red or green todos in the first phase — the spec must exist first. Instead
-      of writing the spec yourself in this strategic phase — strategic plans, tactical
-      writes files.
+      INSTEAD OF: Creating red or green todos in the first phase — the spec must
+      exist first. Instead of writing the spec yourself in this strategic phase —
+      strategic plans, tactical writes files.

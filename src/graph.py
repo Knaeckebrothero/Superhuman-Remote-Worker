@@ -3881,6 +3881,7 @@ def create_audited_tool_node(
     # Loop detection state: track recent tool calls as (name, args_hash) tuples
     import hashlib
     from collections import deque
+    from fnmatch import fnmatch
 
     _tool_call_history: deque = deque(maxlen=30)
     _LOOP_WARNING_THRESHOLD = 10  # warn after 10 identical calls in last 30
@@ -3899,6 +3900,16 @@ def create_audited_tool_node(
     _PROGRESS_THRESHOLD = config.limits.progress_stall_threshold  # default 30
     _HARD_CAP = config.limits.max_tool_calls_per_phase  # default 500
 
+    # Act-ratio tripwire: N consecutive executed tool actions touching ONLY
+    # process artifacts (todos/plan/archive) get a one-line "stop planning"
+    # nudge. Patterns come from config; 0 disables.
+    _ACT_RATIO_THRESHOLD = config.limits.act_ratio_nudge_threshold  # default 6
+    _PROCESS_PATTERNS = [
+        str(p).lstrip("/").strip()
+        for p in (config.limits.process_artifact_patterns or [])
+    ]
+    _process_only_streak = [0]
+
     _TOOL_TIMEOUT_RETRIES = [0]  # tracks consecutive batch timeouts
     _TOOL_BATCH_TIMEOUT_SECONDS = 900  # absolute cap for any audited tool batch
 
@@ -3912,6 +3923,31 @@ def create_audited_tool_node(
         "kb_write",
         "kb_update",
     }
+
+    # Todo-state tools manipulate todos.yaml by definition — they count as
+    # process actions for the act-ratio tripwire.
+    TODO_STATE_TOOLS = {"todo_complete", "todo_list", "todo_rewind", "next_phase_todos"}
+
+    # Arg keys inspected for file targets when classifying process actions.
+    # Content-bearing args (e.g. write_file's `content`) are deliberately
+    # excluded — only the target path decides.
+    PATH_ARG_KEYS = ("path", "file_path", "source", "dest", "directory", "filename")
+
+    def _is_process_action(name: str, args: Optional[dict]) -> bool:
+        """True when a call touches only process artifacts (act-ratio guard)."""
+        if name in TODO_STATE_TOOLS:
+            return True
+        targets = []
+        for key in PATH_ARG_KEYS:
+            value = (args or {}).get(key)
+            if isinstance(value, str) and value.strip():
+                targets.append(value.lstrip("/").strip())
+        if not targets:
+            return False
+        return all(
+            any(fnmatch(target, pattern) for pattern in _PROCESS_PATTERNS)
+            for target in targets
+        )
 
     TOOL_NOT_FOUND_PATTERN = "is not a valid tool"
 
@@ -4076,6 +4112,7 @@ def create_audited_tool_node(
             _calls_since_progress[0] = 0
             _reflection_injected[0] = False
             _phase_tool_call_count[0] = 0
+            _process_only_streak[0] = 0
             _warned_signatures.clear()
             _category_failures.clear()
             _TOOL_TIMEOUT_RETRIES[0] = 0
@@ -4419,6 +4456,33 @@ def create_audited_tool_node(
                     f"[{job_id}] Progress nudge #{nudge_count}: "
                     f"{calls} calls without progress "
                     f"(phase {phase_number} {phase_str})"
+                )
+
+        # Act-ratio tripwire: count consecutive process-artifact-only actions;
+        # any concrete action resets. At threshold, inject the one-line nudge
+        # and re-arm the counter.
+        if _ACT_RATIO_THRESHOLD > 0 and executed_tool_batch:
+            if all(
+                _is_process_action(tc["name"], tc["args"]) for tc in tool_calls_info
+            ):
+                _process_only_streak[0] += len(tool_calls_info)
+            else:
+                _process_only_streak[0] = 0
+            if _process_only_streak[0] >= _ACT_RATIO_THRESHOLD:
+                streak = _process_only_streak[0]
+                _process_only_streak[0] = 0
+                result.setdefault("messages", []).append(
+                    SystemMessage(
+                        content=format_nudge(
+                            "act_ratio_nudge",
+                            model=config.llm.model,
+                            count=streak,
+                        )
+                    )
+                )
+                logger.info(
+                    f"[{job_id}] Act-ratio nudge: {streak} consecutive "
+                    f"process-artifact actions (phase {phase_number} {phase_str})"
                 )
 
         # Update tool audit documents with results

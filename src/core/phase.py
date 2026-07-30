@@ -107,7 +107,7 @@ def get_initial_strategic_todos(
         PredefinedTodo(
             id=3,
             content=(
-                "Divide the plan into phases, where each phase contains 5-20 "
+                "Divide the plan into phases, where each phase contains 2-20 "
                 "concrete, actionable todos."
             ),
         ),
@@ -1168,8 +1168,10 @@ def on_strategic_phase_complete(
         state: Current agent state
         workspace: WorkspaceManager for file access
         todo_manager: TodoManager for loading todos
-        min_todos: Minimum todos required (default: 5, used by staging)
-        max_todos: Maximum todos allowed (default: 20, used by staging)
+        min_todos: Todo floor quoted in agent-facing messages. Enforcement
+            happens in TodoManager.stage_tactical_todos, whose floor is
+            wired from config.phase_settings at construction (src/agent.py).
+        max_todos: Todo ceiling quoted in agent-facing messages (see above).
 
     Returns:
         TransitionResult indicating success/failure with state updates
@@ -1213,7 +1215,7 @@ def on_strategic_phase_complete(
         return reject_transition(
             state,
             "No todos staged for the next phase. "
-            "Use next_phase_todos tool to create 5-20 tasks first, "
+            f"Use next_phase_todos tool to create {min_todos}-{max_todos} tasks first, "
             "or call job_complete if the plan is fully executed.",
         )
 

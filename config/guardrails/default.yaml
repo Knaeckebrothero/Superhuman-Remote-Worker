@@ -255,6 +255,11 @@ nudges:
     Your last response was detected as degenerate and has been discarded. Issues found: {pattern_detail}.
     If you were trying to call a tool, retry with smaller arguments or a different approach.
 
+  # Sites: src/graph.py audited_tools (act-ratio tripwire)
+  # Placeholders: {count}
+  act_ratio_nudge: |-
+    You've spent {count} steps on planning artifacts. Stop planning; take the next concrete action toward the current todo.
+
   # Sites: src/graph.py:3020-3023 (loop-warning suffix appended to ToolMessage)
   loop_warning_suffix: |-
     [LOOP WARNING] You have called this tool with the same arguments multiple times. You may be stuck in a loop.

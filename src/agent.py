@@ -2156,6 +2156,8 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                 logger.warning(f"Reattach: instructions ensure failed: {e}")
             self._todo_manager = TodoManager(
                 workspace=self._workspace_manager,
+                min_todos=self.config.phase_settings.min_todos,
+                max_todos=self.config.phase_settings.max_todos,
                 model_name=self.config.llm.model,
             )
             logger.debug(
@@ -2206,6 +2208,8 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
 
                 self._todo_manager = TodoManager(
                     workspace=self._workspace_manager,
+                    min_todos=self.config.phase_settings.min_todos,
+                    max_todos=self.config.phase_settings.max_todos,
                     model_name=self.config.llm.model,
                 )
                 logger.info(f"Pod handoff complete for job {job_id}")
@@ -2256,6 +2260,8 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             # Create todo manager for this workspace
             self._todo_manager = TodoManager(
                 workspace=self._workspace_manager,
+                min_todos=self.config.phase_settings.min_todos,
+                max_todos=self.config.phase_settings.max_todos,
                 model_name=self.config.llm.model,
             )
 
@@ -2605,6 +2611,8 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
         # Create todo manager for this workspace
         self._todo_manager = TodoManager(
             workspace=self._workspace_manager,
+            min_todos=self.config.phase_settings.min_todos,
+            max_todos=self.config.phase_settings.max_todos,
             model_name=self.config.llm.model,
         )
 

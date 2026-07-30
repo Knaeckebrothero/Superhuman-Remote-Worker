@@ -1504,6 +1504,17 @@ class ResponseValidationConfig:
     max_line_repetitions: int = 10
 
 
+# Default process-artifact patterns for the act-ratio tripwire
+# (limits.process_artifact_patterns). Shared by the LimitsConfig default
+# and the yaml parser fallback.
+DEFAULT_PROCESS_ARTIFACT_PATTERNS = [
+    "todos.yaml",
+    "plan.md",
+    "archive/*",
+    "*retrospective*",
+]
+
+
 @dataclass
 class LimitsConfig:
     """Execution limits configuration."""
@@ -1539,6 +1550,15 @@ class LimitsConfig:
     max_tool_calls_per_phase: int = (
         500  # max tool calls per phase before rewind (tactical) or freeze (strategic)
     )
+    # Act-ratio tripwire: consecutive tool actions touching ONLY process
+    # artifacts (see process_artifact_patterns) before a "stop planning"
+    # nudge is injected. 0 disables the tripwire.
+    act_ratio_nudge_threshold: int = 6
+    # fnmatch patterns (workspace-relative) that classify a file target as a
+    # process artifact for the act-ratio tripwire.
+    process_artifact_patterns: List[str] = field(
+        default_factory=lambda: list(DEFAULT_PROCESS_ARTIFACT_PATTERNS)
+    )
 
 
 @dataclass
@@ -1558,7 +1578,10 @@ class ContextManagementConfig:
 class PhaseSettings:
     """Phase alternation settings.
 
-    Controls the strategic/tactical phase transitions.
+    Controls the strategic/tactical phase transitions. min/max_todos are
+    the LIVE bounds: agent.py passes them into TodoManager at construction,
+    where stage_tactical_todos enforces them. worker_base.yaml lowers the
+    floor to 2.
     """
 
     min_todos: int = 5  # Minimum todos required for strategic->tactical transition
@@ -2184,6 +2207,16 @@ def _parse_auxiliary_config(data: Dict[str, Any]) -> AuxiliaryConfig:
     )
 
 
+def _parse_process_artifact_patterns(limits_data: Dict[str, Any]) -> List[str]:
+    """Act-ratio pattern list from limits; non-list/empty falls back to default."""
+    raw = limits_data.get("process_artifact_patterns")
+    if isinstance(raw, list):
+        patterns = [str(p).strip() for p in raw if str(p).strip()]
+        if patterns:
+            return patterns
+    return list(DEFAULT_PROCESS_ARTIFACT_PATTERNS)
+
+
 def _parse_response_validation(data: Dict[str, Any]) -> ResponseValidationConfig:
     """Parse response validation configuration from dict."""
     if not data:
@@ -2341,6 +2374,8 @@ def load_agent_config(
         tool_category_timeouts=tool_category_timeouts,
         progress_stall_threshold=limits_data.get("progress_stall_threshold", 30),
         max_tool_calls_per_phase=limits_data.get("max_tool_calls_per_phase", 500),
+        act_ratio_nudge_threshold=limits_data.get("act_ratio_nudge_threshold", 6),
+        process_artifact_patterns=_parse_process_artifact_patterns(limits_data),
     )
 
     context_data = data.get("context_management", {})
@@ -2581,6 +2616,8 @@ def load_agent_config_from_dict(
         tool_category_timeouts=tool_category_timeouts,
         progress_stall_threshold=limits_data.get("progress_stall_threshold", 30),
         max_tool_calls_per_phase=limits_data.get("max_tool_calls_per_phase", 500),
+        act_ratio_nudge_threshold=limits_data.get("act_ratio_nudge_threshold", 6),
+        process_artifact_patterns=_parse_process_artifact_patterns(limits_data),
     )
 
     context_data = data.get("context_management", {})
