@@ -396,17 +396,24 @@ export class ApiService {
   }
 
   /**
-   * Get paginated chat history for a job from MongoDB.
+   * Get paginated chat history for a job from the audit store.
    * Returns a clean sequential view of conversation turns.
+   *
+   * `lean` strips full message bodies (previews + `truncated` markers only);
+   * hydrate individual turns via {@link getChatEntry}.
    */
   getChatHistory(
     jobId: string,
     page: number = 1,
     pageSize: number = 50,
+    lean: boolean = false,
   ): Observable<ChatHistoryResponse> {
-    const params = new HttpParams()
+    let params = new HttpParams()
       .set('page', page.toString())
       .set('pageSize', pageSize.toString());
+    if (lean) {
+      params = params.set('lean', 'true');
+    }
 
     return this.http
       .get<ChatHistoryResponse>(`${this.baseUrl}/jobs/${jobId}/chat`, { params })
@@ -425,6 +432,22 @@ export class ApiService {
             hasMore: false,
             error: error.message || 'Failed to fetch chat history',
           });
+        }),
+      );
+  }
+
+  /**
+   * Get one full chat turn (complete inputs/response bodies) by entry id.
+   * Detail fetch behind the lean listing.
+   */
+  getChatEntry(jobId: string, entryId: string): Observable<ChatEntry | null> {
+    return this.http
+      .get<ChatEntry>(`${this.baseUrl}/jobs/${jobId}/chat/entry/${entryId}`)
+      .pipe(
+        map((entry) => (entry ? normalizeChatEntry(entry) : entry)),
+        catchError((error) => {
+          console.error(`Failed to fetch chat entry ${entryId}:`, error);
+          return of(null);
         }),
       );
   }

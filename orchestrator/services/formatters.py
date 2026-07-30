@@ -197,13 +197,48 @@ def format_audit_bulk(data: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+# Transient-injection markers, mirrored from src/core/*_injection.py (the MCP
+# image doesn't ship src/): legacy chat_history rows stored the re-injected
+# block verbatim as human/tool inputs; newer rows store type="context"
+# descriptors. Both collapse to one [context] line per turn.
+_INJECT_KIND_BY_PREFIX = (
+    ("instruction_inject_", "instruction"),
+    ("memory_inject_", "memory"),
+    ("knowledge_inject_", "knowledge"),
+    ("citation_feedback_inject_", "citation_feedback"),
+)
+
+
+def _context_label(msg: dict[str, Any]) -> str | None:
+    """Kind label when an inputs element is injected context, else None."""
+    kind = msg.get("kind")
+    if msg.get("type") == "context":
+        return str(kind) if kind else "context"
+    if msg.get("type") == "human":
+        content = msg.get("content_preview") or msg.get("content") or ""
+        if isinstance(content, str) and content.startswith("<active_tasks>"):
+            return "todos"
+    if msg.get("type") == "tool":
+        tcid = msg.get("tool_call_id") or ""
+        for prefix, k in _INJECT_KIND_BY_PREFIX:
+            if tcid.startswith(prefix):
+                return k
+    return None
+
+
 def _format_chat_entry(entry: dict[str, Any], turn_number: int) -> list[str]:
     """Format a single chat entry into display lines."""
     lines = [f"--- Turn {entry.get('turn_number', turn_number)} ---"]
 
-    # Input messages
+    # Input messages; the re-injected context frame collapses to one line.
     inputs = entry.get("inputs", entry.get("input_messages", []))
+    context_kinds: list[str] = []
     for msg in inputs:
+        ctx = _context_label(msg)
+        if ctx is not None:
+            if ctx not in context_kinds:
+                context_kinds.append(ctx)
+            continue
         role = msg.get("type", msg.get("role", "unknown"))
         content = msg.get("content_preview") or msg.get("content", "")
         if isinstance(content, str):
@@ -213,6 +248,8 @@ def _format_chat_entry(entry: dict[str, Any], turn_number: int) -> list[str]:
         else:
             preview = str(content)[:300]
         lines.append(f"[{role}]: {preview}")
+    if context_kinds:
+        lines.append(f"[context]: {', '.join(context_kinds)} (re-injected each turn)")
 
     # Response
     response = entry.get("response", {})

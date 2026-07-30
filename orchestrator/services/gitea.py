@@ -859,6 +859,12 @@ class GiteaClient:
         try:
             resp = await client.get(
                 f"{self._url}/api/v1/repos/{self._user}/{repo_name}/compare/{base}...{head}",
+                # Same fast flags as get_commits — we only read sha/message/
+                # author/date below. Gitea 1.22 only honors `files`; `stat`
+                # (the expensive per-commit `git diff` subprocess) is
+                # hardcoded on there and honored from 1.23. Harmless where
+                # ignored, saves ~150ms/commit where not.
+                params={"stat": "false", "verification": "false", "files": "false"},
             )
             if resp.status_code == 404:
                 return None
@@ -887,6 +893,111 @@ class GiteaClient:
         except Exception as e:
             logger.warning(f"Failed to compare {base}...{head} in {repo_name}: {e}")
             return None
+
+    async def get_commits_between(
+        self,
+        repo_name: str,
+        since_ref: str,
+        head: str = "main",
+        *,
+        max_commits: int = 500,
+    ) -> dict | None:
+        """List commits on ``head`` newer than ``since_ref`` (exclusive).
+
+        Replaces the compare API for the "commits since job start" path.
+        Two reasons: Gitea 1.22's compare endpoint 404s on SHA bases
+        (``BaseNotExist``), and it computes per-commit diff stats server-side
+        (one ``git diff`` subprocess per commit, ~150ms each) regardless of
+        the ``stat`` query flag. The commits endpoint accepts SHA starting
+        points and honors ``stat=false`` (~155x cheaper), so we page it from
+        ``head`` and cut client-side at ``since_ref``.
+
+        Returns the get_compare shape: {"total_commits", "commits"}. When
+        ``since_ref`` isn't found within ``max_commits`` (not an ancestor,
+        or force-pushed away), the collected commits are still returned with
+        ``"truncated": True``. None when ``head`` can't be listed at all.
+        """
+        if not self._initialized:
+            return None
+
+        since_sha = since_ref.strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{7,40}", since_sha):
+            # Branch/tag base — resolve to a SHA so the cut below can match.
+            resolved = await self.get_branch_head_sha(repo_name, since_ref)
+            if resolved:
+                since_sha = resolved.lower()
+            else:
+                logger.debug(
+                    f"get_commits_between: could not resolve base ref "
+                    f"'{since_ref}' in {repo_name}; walk will run to the cap"
+                )
+
+        page_limit = 50
+        collected: list[dict] = []
+        for page in range(1, max(1, max_commits // page_limit) + 1):
+            batch = await self.get_commits(
+                repo_name, sha=head, page=page, limit=page_limit
+            )
+            if batch is None:
+                if page == 1:
+                    return None
+                logger.warning(
+                    f"get_commits_between: page {page} failed for {repo_name}; "
+                    f"returning partial result"
+                )
+                break
+            for commit in batch:
+                sha = commit.get("sha", "").lower()
+                if sha.startswith(since_sha):
+                    return {"total_commits": len(collected), "commits": collected}
+                collected.append(commit)
+            if len(batch) < page_limit:
+                # Walked the whole history without meeting since_ref.
+                break
+        return {
+            "total_commits": len(collected),
+            "commits": collected,
+            "truncated": True,
+        }
+
+    async def download_repo_archive(
+        self, repo_name: str, ref: str, dest_path: str
+    ) -> bool:
+        """Stream a repository archive (``<ref>.tar.gz``) to ``dest_path``.
+
+        One request for the whole tree — the bulk-read alternative to N
+        per-file ``contents/`` calls (the measured kb_reindex hot path:
+        ~11k sequential reads/day at ~130ms each). Accepts branch, tag, or
+        commit SHA refs; entries are prefixed with one top-level directory
+        (the repo name).
+
+        Returns True on success. On any failure the file at ``dest_path``
+        must be considered garbage.
+        """
+        if not self._initialized:
+            return False
+
+        client = self._get_client()
+        url = f"{self._url}/api/v1/repos/{self._user}/{repo_name}/archive/{ref}.tar.gz"
+        try:
+            # Generous read timeout: Gitea generates the archive server-side
+            # before the first byte (seconds for large repos, then cached).
+            async with client.stream(
+                "GET", url, timeout=httpx.Timeout(30.0, read=120.0)
+            ) as resp:
+                if resp.status_code != 200:
+                    logger.warning(
+                        f"Archive download for {repo_name}@{ref} failed "
+                        f"(status {resp.status_code})"
+                    )
+                    return False
+                with open(dest_path, "wb") as fh:
+                    async for chunk in resp.aiter_bytes():
+                        fh.write(chunk)
+            return True
+        except Exception as e:
+            logger.warning(f"Archive download for {repo_name}@{ref} failed: {e}")
+            return False
 
     async def get_diff(
         self, repo_name: str, base: str, head: str = "HEAD"

@@ -4,7 +4,14 @@ These lock in the idle-renewal behavior: a session idle past
 ``SRW_SESSION_IDLE_TIMEOUT_S`` is re-validated against Keycloak (refreshed in
 place) rather than blind-deleted, so an idle-but-still-valid session survives
 instead of force-logging the user out. The absolute lifetime cap stays a hard
-stop, and a genuine KC rejection still deletes the row and returns None.
+stop, and a definitive KC rejection (400 ``invalid_grant``) still deletes the
+row and returns None.
+
+They also lock in the outage posture: when Keycloak is merely unreachable or
+broken (network error, 5xx, ``invalid_client`` misconfig, malformed body),
+the session row is KEPT and the request fails with a retryable 503 — a KC
+outage must not permanently log every user out (HA checklist P0 in
+docs/features/high_availability_setup.md).
 
 Mirrors the AsyncMock + patch.object style of ``tests/test_mcp.py``. We call
 ``_resolve_from_cookie`` directly (it takes ``(session_id, db)``), patch
@@ -17,13 +24,16 @@ import asyncio
 import os
 from contextlib import ExitStack, contextmanager
 from datetime import datetime, timedelta, UTC
-from unittest.mock import AsyncMock, patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock, patch
 from uuid import uuid4
 
+import httpx
 import pytest
+from fastapi import HTTPException
 
-from security.auth import _resolve_from_cookie
-from security.kc_client import KeycloakClientError
+from security.auth import _resolve_from_cookie, resolve_ws_user
+from security.kc_client import KeycloakBFFClient, KeycloakClientError
 
 SESSION_ID = "sess-123"
 SENTINEL_USER = {"id": "user-1", "display_name": "Tester", "is_approved": True}
@@ -158,18 +168,77 @@ class TestResolveFromCookie:
         db.touch_srw_session_last_seen.assert_awaited_once_with(SESSION_ID)
 
     @pytest.mark.asyncio
-    async def test_idle_with_dead_kc_deletes_and_returns_none(self):
-        """Idle + KC rejects the refresh token → row deleted, None, no resolve."""
+    async def test_idle_with_kc_rejection_deletes_and_returns_none(self):
+        """Idle + KC definitively rejects the refresh → row deleted, None."""
         now = datetime.now(UTC)
         sess = _session(last_seen_at=now - timedelta(hours=1))
         db = _make_db(sess)
 
-        with _auth_patches(refresh_side_effect=KeycloakClientError("revoked")) as m:
+        with _auth_patches(
+            refresh_side_effect=KeycloakClientError(
+                "KC token endpoint 400 (invalid_grant)",
+                status_code=400,
+                oauth_error="invalid_grant",
+            )
+        ) as m:
             result = await _resolve_from_cookie(SESSION_ID, db)
 
         assert result is None
         db.delete_srw_session.assert_awaited_once_with(SESSION_ID)
         m["validate_token"].assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("status_code", "oauth_error"),
+        [
+            (None, None),  # unreachable: connect/timeout/TLS
+            (502, "non_json_response"),  # ingress 502 during a KC rollout
+            (500, "unknown_error"),  # KC internal error
+            (401, "invalid_client"),  # orchestrator misconfig, not a dead session
+            (400, "unsupported_grant_type"),  # ditto
+        ],
+    )
+    async def test_kc_outage_keeps_session_and_raises_503(
+        self, status_code, oauth_error
+    ):
+        """KC unreachable/broken → row KEPT, 503 raised, no token write.
+
+        This is the P0 fix: before, any KeycloakClientError deleted the row,
+        so a >15-min KC outage force-re-logged-in every user permanently.
+        """
+        now = datetime.now(UTC)
+        sess = _session(last_seen_at=now - timedelta(hours=1))
+        db = _make_db(sess)
+
+        with _auth_patches(
+            refresh_side_effect=KeycloakClientError(
+                f"KC token endpoint {status_code} ({oauth_error})",
+                status_code=status_code,
+                oauth_error=oauth_error,
+            )
+        ) as m:
+            with pytest.raises(HTTPException) as exc_info:
+                await _resolve_from_cookie(SESSION_ID, db)
+
+        assert exc_info.value.status_code == 503
+        db.delete_srw_session.assert_not_called()
+        db.refresh_srw_session_tokens.assert_not_called()
+        m["validate_token"].assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_malformed_refresh_payload_keeps_session_and_raises_503(self):
+        """KC answers 200 with an unusable body → server breakage, keep + 503."""
+        now = datetime.now(UTC)
+        sess = _session(last_seen_at=now - timedelta(hours=1))
+        db = _make_db(sess)
+
+        with _auth_patches(refresh={}):
+            with pytest.raises(HTTPException) as exc_info:
+                await _resolve_from_cookie(SESSION_ID, db)
+
+        assert exc_info.value.status_code == 503
+        db.delete_srw_session.assert_not_called()
+        db.refresh_srw_session_tokens.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_absolute_expiry_hard_stops_without_refresh(self):
@@ -293,3 +362,101 @@ class TestResolveFromCookie:
 
         assert result == SENTINEL_USER
         m["decode_id_token"].assert_called_once_with(new_id_token)
+
+
+class TestResolveWsUser:
+    """WS handshakes can't carry an HTTP 503 — outage maps to None, row kept."""
+
+    @pytest.mark.asyncio
+    async def test_kc_outage_maps_503_to_none_without_deleting(self):
+        """KC down during a WS connect → None (caller closes 4401), row kept."""
+        now = datetime.now(UTC)
+        sess = _session(last_seen_at=now - timedelta(hours=1))
+        db = _make_db(sess)
+        ws = SimpleNamespace(cookies={"srw_session": SESSION_ID})
+
+        with _auth_patches(
+            refresh_side_effect=KeycloakClientError("KC token endpoint unreachable")
+        ):
+            result = await resolve_ws_user(ws, db)
+
+        assert result is None
+        db.delete_srw_session.assert_not_called()
+
+
+class TestKeycloakClientErrorClassification:
+    """The tagging contract the auth path relies on to tell outage from rejection."""
+
+    def test_invalid_grant_400_is_definitive(self):
+        e = KeycloakClientError("x", status_code=400, oauth_error="invalid_grant")
+        assert e.definitive_rejection
+
+    @pytest.mark.parametrize(
+        ("status_code", "oauth_error"),
+        [
+            (None, None),
+            (502, None),
+            (500, "unknown_error"),
+            (401, "invalid_client"),
+            (400, "unsupported_grant_type"),
+            (200, None),  # malformed-JSON-on-200 carries no oauth_error
+        ],
+    )
+    def test_everything_else_is_not_definitive(self, status_code, oauth_error):
+        e = KeycloakClientError("x", status_code=status_code, oauth_error=oauth_error)
+        assert not e.definitive_rejection
+
+
+class TestPostTokenErrorTagging:
+    """kc_client must tag raised errors so downstream classification works."""
+
+    def _kc(self) -> KeycloakBFFClient:
+        kc = KeycloakBFFClient()
+        kc.client_secret = "s3cret"  # bypass the config-error raise in _basic_auth
+        return kc
+
+    def _client_ctx(self, *, post_side_effect=None, response=None):
+        """An `async with httpx.AsyncClient(...)` stand-in."""
+        ctx = AsyncMock()
+        if post_side_effect is not None:
+            ctx.__aenter__.return_value.post = AsyncMock(side_effect=post_side_effect)
+        else:
+            ctx.__aenter__.return_value.post = AsyncMock(return_value=response)
+        return ctx
+
+    @pytest.mark.asyncio
+    async def test_network_error_carries_no_status_code(self):
+        ctx = self._client_ctx(post_side_effect=httpx.ConnectError("boom"))
+        with patch("security.kc_client.httpx.AsyncClient", return_value=ctx):
+            with pytest.raises(KeycloakClientError) as exc_info:
+                await self._kc().refresh("rt")
+        assert exc_info.value.status_code is None
+        assert not exc_info.value.definitive_rejection
+
+    @pytest.mark.asyncio
+    async def test_400_invalid_grant_is_tagged_definitive(self):
+        resp = Mock(status_code=400)
+        resp.json = Mock(
+            return_value={
+                "error": "invalid_grant",
+                "error_description": "Token is not active",
+            }
+        )
+        ctx = self._client_ctx(response=resp)
+        with patch("security.kc_client.httpx.AsyncClient", return_value=ctx):
+            with pytest.raises(KeycloakClientError) as exc_info:
+                await self._kc().refresh("rt")
+        assert exc_info.value.status_code == 400
+        assert exc_info.value.oauth_error == "invalid_grant"
+        assert exc_info.value.definitive_rejection
+
+    @pytest.mark.asyncio
+    async def test_5xx_is_tagged_non_definitive(self):
+        resp = Mock(status_code=502, text="<html>bad gateway</html>")
+        resp.json = Mock(side_effect=ValueError("not json"))
+        ctx = self._client_ctx(response=resp)
+        with patch("security.kc_client.httpx.AsyncClient", return_value=ctx):
+            with pytest.raises(KeycloakClientError) as exc_info:
+                await self._kc().refresh("rt")
+        assert exc_info.value.status_code == 502
+        assert not exc_info.value.definitive_rejection

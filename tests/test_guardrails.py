@@ -255,3 +255,37 @@ class TestNudgeCoverage:
             f"KNOWN_NUDGES has keys not present in config/guardrails/default.yaml: "
             f"{missing}"
         )
+
+
+# =============================================================================
+# todo_list_footer — must never enumerate the tool surface
+# =============================================================================
+
+
+class TestTodoListFooter:
+    """Regression: the todo-list footer must never enumerate the tool surface.
+
+    The footer is appended to the todo list and injected as the final
+    HumanMessage of every request (end-of-prompt = max attention). A
+    "Tools available: ..." list there reads as exhaustive and convinces the
+    model its other bound tools are gone — proven root cause of the job
+    1cab4b88 rewind loop (nine tactical phases burned to todo_rewind) and
+    the job edd06963 "stale palette" memory spiral. See
+    docs/issues/agent_phase_guardrails_burn_legitimate_work.md.
+    """
+
+    def test_no_family_enumerates_tool_surface(self):
+        from src.core.loader import _load_guardrails_matrix
+
+        matrix = _load_guardrails_matrix(None)
+        assert "default" in matrix
+        for family in sorted(matrix):
+            footer = format_nudge("todo_list_footer", family=family)
+            # The forbidden pattern: presenting a closed tool list.
+            assert "Tools available" not in footer, family
+            assert "todo_rewind" not in footer, family
+            assert "mark_complete" not in footer, family
+            # It still teaches how to advance the list...
+            assert "todo_complete" in footer, family
+            # ...and explicitly disclaims being a tool list.
+            assert "not a tool list" in footer, family
