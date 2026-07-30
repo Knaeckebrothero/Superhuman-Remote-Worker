@@ -366,7 +366,15 @@ class WorkspaceManager:
         if new_backend is None:
             raise TypeError("swap_backend requires a backend")
         # Defensive: an overlay-in-an-overlay would double-route virtual paths.
-        new_backend = getattr(new_backend, "inner", new_backend)
+        # Via the isinstance-typed helper, never getattr(_, "inner", _): a
+        # MagicMock auto-creates `.inner`, so duck-typing here would swap in a
+        # child mock instead of the backend the caller passed.
+        try:
+            from .backends.overlay import unwrap_backend
+        except ImportError:  # module loaded directly — see __init__
+            from src.core.backends.overlay import unwrap_backend
+
+        new_backend = unwrap_backend(new_backend)
         if self._virtual_overlay is not None:
             self._virtual_overlay.rebind(new_backend)
             self._backend = self._virtual_overlay
