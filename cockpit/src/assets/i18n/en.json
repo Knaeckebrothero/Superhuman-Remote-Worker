@@ -2015,10 +2015,13 @@
     "filter": {"allChannels": "All channels", "allProjects": "All projects"},
     "form": {"newTitle": "New contact", "editTitle": "Edit contact", "name": "Display name",
              "notes": "Notes (visible to agents — briefings, preferences, context)",
-             "addresses": "Addresses", "addAddress": "+ Add address", "projects": "Projects"},
+             "addresses": "Addresses", "addAddress": "+ Add address", "projects": "Projects",
+             "channelLocked": "Channel can't be changed after saving — remove this address and add a new one instead."},
     "delete": {"title": "Delete contact",
-               "message": "This removes the contact from these projects: {{projects}}. Agents will no longer be able to message them."},
-    "saveError": "Save failed. Some changes may not have been applied — check the contact and retry."
+               "message": "This removes the contact from these projects: {{projects}}. Agents will no longer be able to message them.",
+               "namePrompt": "Type the contact's name to confirm:"},
+    "saveError": "Save failed. Some changes may not have been applied — check the contact and retry.",
+    "deleteError": "Delete failed. You may not have permission, or the contact already changed — refresh and retry."
   },
   "inbox": {
     "title": "Action Center",

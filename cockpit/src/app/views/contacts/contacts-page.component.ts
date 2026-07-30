@@ -6,6 +6,7 @@ import {forkJoin, of, switchMap} from 'rxjs';
 import {Contact, ContactProjectRef} from '../../core/models/api.model';
 import {ApiService} from '../../core/services/api.service';
 import {ContactsService} from '../../core/services/contacts.service';
+import {UserService} from '../../core/services/user.service';
 import {AppConfirmNameDialogComponent} from '../../ui/confirm-name-dialog';
 import {ContactFormComponent, ContactFormResult} from './contact-form.component';
 import {ContactListComponent} from './contact-list.component';
@@ -44,14 +45,17 @@ import {ContactListComponent} from './contact-list.component';
       <app-contact-form [contact]="editing()" [projects]="projects()"
         (saved)="save($event)" (cancelled)="closeForm()" />
     }
-    <app-contact-list [contacts]="contacts()" (edit)="openEdit($event)" (remove)="askDelete($event)" />
+    <app-contact-list [contacts]="contacts()" [currentUserId]="userService.currentUserId()"
+      (edit)="openEdit($event)" (remove)="askDelete($event)" />
     @if (deleting(); as target) {
       <app-confirm-name-dialog
         [open]="!!deleting()"
         [title]="'contacts.delete.title' | transloco"
         [message]="deleteMessage(target)"
         [requiredName]="target.display_name"
+        [namePrompt]="'contacts.delete.namePrompt' | transloco"
         [confirmLabel]="'common.delete' | transloco"
+        [cancelLabel]="'common.cancel' | transloco"
         (confirmed)="doDelete(target)"
         (dismissed)="deleting.set(null)" />
     }
@@ -68,6 +72,9 @@ export class ContactsPageComponent implements OnInit {
   private readonly api = inject(ContactsService);
   private readonly projectsApi = inject(ApiService);   // loadProjects: house projects listing
   private readonly transloco = inject(TranslocoService);
+  // Not private: read directly from the template ([currentUserId] binding
+  // below), mirroring sidebar.component.ts's `readonly userService`.
+  readonly userService = inject(UserService);
 
   readonly contacts = signal<Contact[]>([]);
   readonly projects = signal<ContactProjectRef[]>([]);
@@ -96,9 +103,9 @@ export class ContactsPageComponent implements OnInit {
     this.projectsApi.getProjects().subscribe(rows => this.projects.set(rows));
   }
 
-  openNew(): void { this.editing.set(null); this.showForm.set(true); }
-  openEdit(c: Contact): void { this.editing.set(c); this.showForm.set(true); }
-  closeForm(): void { this.showForm.set(false); this.editing.set(null); }
+  openNew(): void { this.saveError.set(null); this.editing.set(null); this.showForm.set(true); }
+  openEdit(c: Contact): void { this.saveError.set(null); this.editing.set(c); this.showForm.set(true); }
+  closeForm(): void { this.saveError.set(null); this.showForm.set(false); this.editing.set(null); }
 
   deleteMessage(c: Contact): string {
     const names = c.projects.map(p => p.name).join(', ');
@@ -108,7 +115,18 @@ export class ContactsPageComponent implements OnInit {
   askDelete(c: Contact): void { this.deleting.set(c); }
 
   doDelete(c: Contact): void {
-    this.api.remove(c.id).subscribe(() => { this.deleting.set(null); this.reload(); });
+    this.api.remove(c.id).subscribe({
+      next: () => { this.deleting.set(null); this.reload(); },
+      error: () => {
+        // Without this handler a 403 (non-owner) or 404 (already deleted by
+        // someone else) left `deleting()` non-null while the dialog had
+        // already self-closed ([open]="!!deleting()" never changes value
+        // again) — dead for the rest of the page's life. Clear it here so
+        // the dialog can reopen, and surface the failure like save errors do.
+        this.deleting.set(null);
+        this.saveError.set(this.transloco.translate('contacts.deleteError'));
+      },
+    });
   }
 
   save(result: ContactFormResult): void {
