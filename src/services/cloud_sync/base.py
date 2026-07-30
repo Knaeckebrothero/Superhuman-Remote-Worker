@@ -18,6 +18,8 @@ import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
+from ...core.backends.overlay import unwrap_backend
+
 if TYPE_CHECKING:
     from ...core.workspace_backend import WorkspaceBackend
 
@@ -68,7 +70,19 @@ class WorkspaceSyncBase(abc.ABC):
     ) -> None:
         self._workspace_path = Path(workspace_path)
         self._poll_interval = poll_interval
-        self._backend = workspace_backend
+        # Unwrap the virtual overlay once, here, so no method below can reach a
+        # virtual path. Cloud sync is not a tool-layer consumer: virtual
+        # prefixes (tools/, contacts/, instructions.md) are framework
+        # projection, not user data. Walking the overlay merged contacts/ into
+        # the root listing and uploaded contact names, emails and phone numbers
+        # to the user's cloud folder — SYNC_IGNORE_PATTERNS lists tools/ but
+        # nothing else — and the return pull then raised VirtualPathError,
+        # which the coordinator's strict=True turned into "cloud sync disabled
+        # for the rest of the session". Doing it structurally, rather than by
+        # extending SYNC_IGNORE_PATTERNS, means a future provider cannot
+        # reintroduce either failure.
+        # See docs/features/virtual_directories.md.
+        self._backend = unwrap_backend(workspace_backend) if workspace_backend else None
         # Workspace-relative path of this mount inside the backend's filesystem.
         # Empty string means "the whole workspace" (legacy single-folder mount).
         # For project mounts, e.g. "projects/alpha". No leading/trailing slash.

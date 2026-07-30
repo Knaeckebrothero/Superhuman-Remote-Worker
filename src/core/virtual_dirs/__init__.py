@@ -3,6 +3,7 @@
 import logging
 from typing import Any, Callable, Optional
 
+from ..backends.overlay import unwrap_backend
 from .contacts_provider import ContactsProvider
 from .single_file import SingleFileProvider
 from .tools_provider import ToolsProvider
@@ -40,25 +41,6 @@ def build_instruction_providers(
         SingleFileProvider("instructions.md", _instructions),
         SingleFileProvider("task_brief.md", brief),
     ]
-
-
-def unwrap_backend(backend: Any) -> Any:
-    """Return the real backend behind a virtual overlay.
-
-    Content probes that ask "does this workspace still hold its seeded files?"
-    must bypass virtualization: a virtual task_brief.md always exists, so a
-    naive probe would classify a wiped workspace as seeded and skip re-seeding.
-    Cloud sync uses it for a different reason — it is not a tool-layer consumer,
-    so it must never see (or write back to) virtual paths.
-
-    Typed on ``VirtualOverlayBackend`` rather than duck-typed on ``.inner``: a
-    ``MagicMock`` auto-creates every attribute, so ``getattr(mock, "inner",
-    mock)`` silently hands back a child mock and a test's stand-in backend
-    stops being the object under test.
-    """
-    from ..backends.overlay import VirtualOverlayBackend
-
-    return backend.inner if isinstance(backend, VirtualOverlayBackend) else backend
 
 
 def sweep_legacy_tools_dir(backend: Any) -> bool:
