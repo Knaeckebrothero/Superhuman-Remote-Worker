@@ -25,6 +25,7 @@ SESSION_TOOL_OVERRIDE_NAMES: dict[str, frozenset[str]] = {
             "list_worker_jobs",
             "get_worker_job",
             "get_job_workspace_file",
+            "list_job_workspace_files",
             "approve_worker_job",
             "resume_worker_job",
             "cancel_worker_job",

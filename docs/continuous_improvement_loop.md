@@ -66,7 +66,7 @@ New expert type that can introspect completed jobs. Needs a new tool category (`
 | `get_job_audit` | `GET /api/jobs/{id}/audit` | Paginated audit trail (LLM messages, tool calls, errors) |
 | `get_job_chat` | `GET /api/jobs/{id}/chat` | Conversation turns showing reasoning flow |
 | `get_job_todos` | `GET /api/jobs/{id}/todos` | Current + archived todos across phases |
-| `get_job_workspace_file` | `GET /api/jobs/{id}/workspace/{file}` | Read workspace.md, plan.md from another job |
+| `get_job_workspace_file` | `GET /api/jobs/{id}/repo/file?path=…&ref=…` | Read plan.md, notes/ from another job's Gitea repo (committed state as of its last push) |
 | `search_job_audit` | `GET /api/jobs/{id}/audit` + filtering | Search for specific patterns, errors, tool names |
 
 The tools accept a `target_job_id` parameter (not the evaluator's own job). Implementation reuses the sync `CockpitClient` from `orchestrator/mcp/client.py` which already wraps every needed endpoint.
