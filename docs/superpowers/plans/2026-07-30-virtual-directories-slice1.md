@@ -142,6 +142,13 @@ def test_stat_reports_rendered_size(overlay):
     )
 
 
+def test_stat_returns_zero_for_a_missing_virtual_entry(overlay):
+    # WorkspaceBackend.stat contract (workspace_backend.py:448): "0 if path
+    # doesn't exist". RemoteBackend and FilesystemTestBackend both honour it;
+    # a virtual path must not diverge.
+    assert overlay.stat("tools/nope.md") == 0
+
+
 def test_provider_failure_surfaces_readable_error(tmp_path):
     class Broken(FakeProvider):
         def read(self, name):
@@ -328,9 +335,9 @@ class VirtualOverlayBackend:
         if not name:
             return sum(meta.size for meta in entries.values())
         meta = entries.get(name)
-        if meta is None:
-            raise FileNotFoundError(f"File not found: {path}")
-        return meta.size
+        # Contract (workspace_backend.py:448): 0 for a missing path, never an
+        # exception. Both real backends honour it; virtual paths must too.
+        return meta.size if meta is not None else 0
 
     # --- delegation -------------------------------------------------------
 
