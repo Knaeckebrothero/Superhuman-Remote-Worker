@@ -10,6 +10,7 @@ related:
   - "[[builder_to_sessions_consolidation]]"
   - "[[two_graphs]]"
   - "[[prompts]]"
+  - "[[virtual_directories]]"
 ---
 
 # Tool Deferral & Description Management
@@ -32,10 +33,10 @@ Lives in `src/tools/description_manager.py`.
 
 - **Per-tool registry metadata** `defer_to_workspace: True` + a one-line `short_description`, set in the tool modules. Deferred today (**24 tools**): citation (11), mongodb (5), `sql_*` (3), graph/neo4j (3), `web_search` (1), `get_document_info` (1) — the datasource-heavy, complex-usage ones.
 - **`apply_description_overrides(tools)`** — at load time, for any tool flagged `defer_to_workspace`, swaps the full docstring for `short_description` via `model_copy(update={"description": ...})`. Called at `agent.py:2809` (worker) and `persistent_session.py:1311` (sessions).
-- **`generate_workspace_tool_docs(...)`** — writes `tools/README.md` (index grouped by category) + `tools/<tool>.md` (full doc per tool) into the workspace. Called just before the overrides at both sites.
+- **`generate_tool_index(...)` / `generate_tool_description(...)`** — render `tools/README.md` (index grouped by category) + `tools/<tool>.md` (full doc per tool). These are the canonical renderers; the file-writing wrappers that used to call them at boot (`generate_workspace_docs`, `generate_workspace_tool_docs`) are **deleted**. `tools/` is now a virtual directory served live from the currently loaded tool list by `ToolsProvider` ([[virtual_directories]]) — same paths, same bytes, no file on the workspace filesystem, and mid-lifecycle tool changes are reflected without a regeneration step.
 - Helpers: `get_deferred_tools()`, `get_core_tools()`.
 
-So the "short blurb in context, full doc on disk to read on demand" loop **is built** — for a hardcoded set of tools.
+So the "short blurb in context, full doc read on demand" loop **is built** — for a hardcoded set of tools.
 
 ## Token cost (honest accounting)
 
