@@ -534,6 +534,7 @@ async def create_job(
     instructions: str | None = None,
     config_override: dict[str, Any] | None = None,
     context: dict[str, Any] | None = None,
+    required_deliverables: list[str] | None = None,
 ) -> str:
     """Create a new job for agent execution.
 
@@ -551,6 +552,11 @@ async def create_job(
             {"llm": {"model": "codex/gpt-5.3-codex-spark"}}.
             Use the list_models tool to discover available model IDs.
         context: Additional context dictionary
+        required_deliverables: Deliverable contract — workspace-relative
+            artifact paths (e.g. "output/report.md") or "kb:<slug>" note
+            slugs that must exist before a completion claiming success may
+            seal. Shown to the worker at dispatch; missing deliverables
+            bounce the seal back to the worker with the precise list.
 
     Returns:
         Created job details with ID
@@ -564,6 +570,7 @@ async def create_job(
             instructions=instructions,
             config_override=config_override,
             context=context,
+            required_deliverables=required_deliverables,
         )
         return fmt.format_created_job(result, config_name)
     except Exception as e:
@@ -1936,6 +1943,7 @@ async def create_project_job(
     instructions: str | None = None,
     config_override: dict[str, Any] | None = None,
     datasource_ids: list[str] | None = None,
+    required_deliverables: list[str] | None = None,
 ) -> str:
     """Create a job within a project context.
 
@@ -1952,6 +1960,11 @@ async def create_project_job(
             {"llm": {"model": "codex/gpt-5.3-codex-spark"}}.
             Use the list_models tool to discover available model IDs.
         datasource_ids: Connector IDs to attach (optional)
+        required_deliverables: Deliverable contract — workspace-relative
+            artifact paths (e.g. "output/report.md") or "kb:<slug>" note
+            slugs that must exist before a completion claiming success may
+            seal. Shown to the worker at dispatch; missing deliverables
+            bounce the seal back to the worker with the precise list.
 
     Returns:
         Created job summary with ID
@@ -1964,6 +1977,7 @@ async def create_project_job(
         instructions=instructions,
         config_override=config_override,
         datasource_ids=datasource_ids,
+        required_deliverables=required_deliverables,
     )
     return fmt.format_created_job(result, config_name)
 
