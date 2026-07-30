@@ -24,6 +24,17 @@ twice** (2026-05-09 and 2026-06-12; see the *Deferral log* below). A targeted
 pending review); it is explicitly **not** the proper solution and does not
 discharge the deferral.
 
+**2026-07-30 adjacent fix:** the *attached* variant of gap #1 is closed —
+dual_app's heartbeat handler now delegates session drains to
+persistent_app's parked-check + drain-suspend (found via the stale Centurion
+officer pod that survived a day of image rolls; see
+[[dual_app_persistent_app_redundancy]]). This doc's specific wedge —
+`session` status with **no** thread — remains open: the new branch
+deliberately defers while `pa._session is None` (agent-side, the attach
+window is indistinguishable from the wedge), so the wedged shape still
+never self-drains and stays on the guarded-reap stopgap / unified-lifecycle
+fix above.
+
 **Filed:** 2026-06-12, from the minimax-m3 session incident follow-up
 (thread `b9b392f7`). Two agent pods on dev had survived **5–7 days** of
 image bumps (`srw-agent-j-38c90a93` on `sha-0bb1715` from 06-05,
