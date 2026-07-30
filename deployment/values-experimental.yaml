@@ -63,11 +63,11 @@ global:
 # -----------------------------------------------------------------------------
 image:
   orchestrator:
-    tag: sha-576a15f
+    tag: sha-5252d18
   agent:
-    tag: sha-576a15f
+    tag: sha-5252d18
   cockpit:
-    tag: sha-576a15f
+    tag: sha-5252d18
   mcp:
     tag: sha-576a15f
   workspace:
@@ -75,17 +75,17 @@ image:
 # Full deployment identities are updated alongside each independently rebuilt
 # image. Short image tags remain display/update handles only.
 provenance:
-  releaseVersion: "0.0.0-dev.sha-576a15f4c66673bfeef7570060af6260fbafe518"
+  releaseVersion: "0.0.0-dev.sha-5252d18be066504e34030ec7fd428a124f010387"
   components:
     orchestrator:
-      sourceRevision: 576a15f4c66673bfeef7570060af6260fbafe518
-      releaseVersion: "0.0.0-dev.sha-576a15f4c66673bfeef7570060af6260fbafe518"
+      sourceRevision: 5252d18be066504e34030ec7fd428a124f010387
+      releaseVersion: "0.0.0-dev.sha-5252d18be066504e34030ec7fd428a124f010387"
     agent:
-      sourceRevision: 576a15f4c66673bfeef7570060af6260fbafe518
-      releaseVersion: "0.0.0-dev.sha-576a15f4c66673bfeef7570060af6260fbafe518"
+      sourceRevision: 5252d18be066504e34030ec7fd428a124f010387
+      releaseVersion: "0.0.0-dev.sha-5252d18be066504e34030ec7fd428a124f010387"
     cockpit:
-      sourceRevision: 576a15f4c66673bfeef7570060af6260fbafe518
-      releaseVersion: "0.0.0-dev.sha-576a15f4c66673bfeef7570060af6260fbafe518"
+      sourceRevision: 5252d18be066504e34030ec7fd428a124f010387
+      releaseVersion: "0.0.0-dev.sha-5252d18be066504e34030ec7fd428a124f010387"
     mcp:
       sourceRevision: 576a15f4c66673bfeef7570060af6260fbafe518
       releaseVersion: "0.0.0-dev.sha-576a15f4c66673bfeef7570060af6260fbafe518"
@@ -246,7 +246,6 @@ codexProxy:
 gitea:
   database:
     type: sqlite3
-
 # -----------------------------------------------------------------------------
 # Cloud storage — OpenCloud bundled (chart default)
 # -----------------------------------------------------------------------------
