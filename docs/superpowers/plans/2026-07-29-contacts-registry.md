@@ -6,19 +6,21 @@
 
 Run via subagent-driven development (fresh implementer per task, task-scoped review after each, whole-branch review at the end). All work is on `develop`, **unpushed**.
 
-| Task | State | Commits |
-|---|---|---|
-| 1 · Migration + backfill | ✅ Shipped as **`0076_contacts_normalize.sql`** — the plan said 0072, it landed as 0075, then had to move to 0076 when a concurrent session's `0075_project_loop_officer_scheduling.sql` landed and was already applied on dev. `discover()` in `migrate.py` raises on duplicate prefixes, so a duplicate takes the whole runner down at boot — **always re-check the free number immediately before pushing, not just before writing** | `a5d9605c`, renumbered in `6b6cff77` |
-| 2 · DB layer | ✅ Shipped (1 fix round: primary-promotion race → clean duplicate result) | `0154ff34`, `8560093c` |
-| 3 · Contacts router | ✅ Shipped (1 fix round: 409 rollback, test gaps, tuple-extraction lock) | `bd8adcc4`, `62750597` |
-| 4 · Send rewire + retirement | ✅ Shipped (1 fix round: find-or-create 409 rollback) | `60c7d177`, `4bdb8ed7` |
-| 5 · `contact_files` | ✅ Shipped, **dormant** — retained as the [[virtual_directories]] ContactsProvider's renderer; no caller today | `17a23116` |
-| 6 · Materialization wiring | ⛔ **REVERTED** — superseded by the virtual-dirs ContactsProvider (user decision, same day). Shipped then reverted; `test_contacts_materialization.py` deleted | `7d419866`, `1978a431`, reverted by `91c9e4dd` |
-| 7 · Cockpit types + service | ✅ Shipped | `a8ae44b9` |
-| 8 · Cockpit `/contacts` page | ✅ Shipped (1 fix round: **critical** — form re-seeds via `linkedSignal`; a stale form could previously write contact A's data onto contact B and delete B's addresses) | `cf91f79b`, `dfb3ac5e` |
-| 9 · Live k3d gate | ❌ **NOT RUN** — cluster API unreachable from host; also needs a full tilt rebuild. Scope now smaller (no materialization to verify) | — |
+> **Commits are cited by subject, not SHA.** This branch's history is rewritten repeatedly — concurrent sessions rebase it and the push hook rewrites SHAs — so every SHA recorded during this run went stale within hours. Find work with `git log --grep`.
 
-**Whole-branch review** (no Critical): 5 Important defects fixed in one wave — `add_contact_address` committed a primary demotion it should have rolled back; duplicate-address PATCH returned 200 with a null body; blank `display_name` was writable; non-owner Edit/Delete buttons wedged the confirm dialog permanently on 403; saved-address channel edits were silently dropped. Plus chip i18n and dialog labels. → `4ccab18c`
+| Task | State | Commit subjects |
+|---|---|---|
+| 1 · Migration + backfill | ✅ Shipped as **`0076_contacts_normalize.sql`** — the plan said 0072, it landed as 0075, then moved to 0076 when a concurrent session's `0075_project_loop_officer_scheduling.sql` landed and was already applied on dev. `discover()` in `migrate.py` raises on duplicate prefixes, so a duplicate takes the whole runner down at boot — **always re-check the free number immediately before pushing, not just before writing** | `feat(db): contacts registry schema + external_contacts backfill`; renumbered by another session, header comment synced in `fix(db): sync contacts migration header comment` |
+| 2 · DB layer | ✅ Shipped (1 fix round: primary-promotion race → clean duplicate result) | `feat(db): contacts registry DB layer`; `fix(db): translate primary-promotion race…` |
+| 3 · Contacts router | ✅ Shipped (1 fix round: 409 rollback, test gaps, tuple-extraction lock) | `feat(api): contacts registry router`; `fix(api): roll back half-created contact on 409…` |
+| 4 · Send rewire + retirement | ✅ Shipped (1 fix round: find-or-create 409 rollback) | `feat(api): channel-aware recipient resolution…`; `fix(api): roll back half-created contact in find-or-create…` |
+| 5 · `contact_files` | ✅ Shipped, **dormant** — retained as the [[virtual_directories]] ContactsProvider's renderer; no caller today | `feat(core): render contacts as workspace markdown files` |
+| 6 · Materialization wiring | ⛔ **REVERTED** — superseded by the virtual-dirs ContactsProvider (user decision, same day). Shipped then reverted; `test_contacts_materialization.py` deleted | `feat(agent): materialize project contacts…` + `test(agent): prove contacts gather gate…`, undone by `revert(agent): drop contacts materialization…` |
+| 7 · Cockpit types + service | ✅ Shipped | `feat(cockpit): contact types + ContactsService` |
+| 8 · Cockpit `/contacts` page | ✅ Shipped (1 fix round: **critical** — form re-seeds via `linkedSignal`; a stale form could previously write contact A's data onto contact B and delete B's addresses) | `feat(cockpit): /contacts page…`; `fix(cockpit): re-seed contact form on target change…` |
+| 9 · Live gate | ❌ **NOT RUN** — local k3d unusable on this machine (API unreachable from host). Superseded plan: gate on the **dev cluster** after push. Scope is smaller than the plan's task 9 (no materialization to verify) | — |
+
+**Whole-branch review** (no Critical): 5 Important defects fixed in one wave — `add_contact_address` committed a primary demotion it should have rolled back; duplicate-address PATCH returned 200 with a null body; blank `display_name` was writable; non-owner Edit/Delete buttons wedged the confirm dialog permanently on 403; saved-address channel edits were silently dropped. Plus chip i18n and dialog labels. → `fix(contacts): address final-review findings`
 
 **Deviations from this plan's text, all reviewed:** `require_project_member` returns `(user, project)` (plan assumed a bare user) → index-`[0]` extraction; the legacy delete endpoint was `/api/projects/{id}/contacts/{cid}` and never verified project membership → retired and split into unlink (editor) vs destroy (owner); `PostgresDB`, not `PostgresDatabase`; Cockpit used the house `ApiService.getProjects()` instead of the plan's inline HTTP fallback, and the confirm dialog needed an `[open]` binding the plan omitted entirely.
 
