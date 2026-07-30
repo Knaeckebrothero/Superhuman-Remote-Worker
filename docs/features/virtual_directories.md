@@ -105,7 +105,7 @@ Migration: delete both `generate_workspace_tool_docs` call sites and the file-wr
 
 ### ContactsProvider
 
-The contacts registry is **implemented on `develop`** (migration `0075`, `orchestrator/routers/contacts.py`, Cockpit page) except its agent surface, and the renderer `src/core/contact_files.py` (`contact_slug`, `render_contact_md`, `contacts_to_workspace_files`) is retained dormant for exactly this provider.
+The contacts registry is **implemented on `develop`** (migration `0076_contacts_normalize.sql`, `orchestrator/routers/contacts.py`, Cockpit page) except its agent surface, and the renderer `src/core/contact_files.py` (`contact_slug`, `render_contact_md`, `contacts_to_workspace_files`) is retained dormant for exactly this provider.
 
 New: one orchestrator internal endpoint, `X-Internal-Key` authed, keyed by **job/thread identity — not agent-supplied `project_id`** (the orchestrator derives the project binding server-side, same trust posture as `send_message`). ~60s TTL cache, ~3s client timeout. Serves `<slug>.md` per the contacts file format plus a `README.md` index. This deliberately replaces the reverted `b8e48c10` approach, which pushed contacts through the resolved-config blob at boot — the staleness this design removes.
 
@@ -141,7 +141,7 @@ CREATE UNIQUE INDEX uq_job_documents_job ON job_documents(job_id, path) WHERE jo
 CREATE UNIQUE INDEX uq_job_documents_thread ON job_documents(thread_id, path) WHERE thread_id IS NOT NULL;
 ```
 
-Migration number = next free at implementation time (`0075` is taken by contacts).
+Migration number = next free at implementation time (`0076` is contacts, renumbered from `0075` when `0075_project_loop_officer_scheduling.sql` claimed that slot — check again before writing).
 
 **Write path.** Agent `write_file("plan.md", …)` → overlay → `provider.write()` → orchestrator internal endpoint (upsert) → cache updated in place. Write-through, no local copy, last-write-wins. A failed write raises a tool error the agent can see and retry — never a silent drop.
 
