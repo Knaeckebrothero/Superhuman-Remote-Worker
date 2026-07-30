@@ -547,7 +547,7 @@ metadata:
     reloader.stakater.com/auto: "true"
   {{- end }}
 spec:
-  replicas: 1
+  replicas: {{ .Values.keycloak.replicas }}
   selector:
     matchLabels:
       {{- include "srw.componentSelectorLabels" (dict "context" . "component" "keycloak") | nindent 6 }}
@@ -613,7 +613,24 @@ spec:
         - name: keycloak
           image: {{ .Values.keycloak.image }}
           args:
-            - start-dev
+            # Production mode. `start-dev` was a multi-replica dead end: it
+            # pins `cache=local` (every pod an island — sessions bound to
+            # whichever pod served them) and `hostname-strict=false`, both
+            # from dev-mode classpath defaults rather than anything we set.
+            #
+            # `start` gives `cache=ispn` with the `jdbc-ping` discovery stack
+            # by default, which finds peers through the Keycloak database we
+            # already run — no headless Service, no DNS_PING, no new infra.
+            # Together with persistent user sessions (stored in the DB by
+            # default since KC 26.0) that makes keycloak.replicas > 1 safe.
+            #
+            # Everything production mode demands is already set below:
+            # KC_HOSTNAME (required once hostname-strict defaults to true),
+            # KC_HTTP_ENABLED (TLS terminates at the ingress), KC_PROXY_HEADERS,
+            # and a real database. Note `--features` is a build-time option, so
+            # the first start after this change re-augments the image and takes
+            # noticeably longer — the startupProbe allows 300s.
+            - start
             - --import-realm
             - --health-enabled=true
             - --tls-hostname-verifier=ANY
