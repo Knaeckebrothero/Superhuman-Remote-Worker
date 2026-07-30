@@ -160,9 +160,9 @@ class VirtualOverlayBackend:
         if not name:
             return sum(meta.size for meta in entries.values())
         meta = entries.get(name)
-        if meta is None:
-            raise FileNotFoundError(f"File not found: {path}")
-        return meta.size
+        # Contract (workspace_backend.py:448): 0 for a missing path, never an
+        # exception. Both real backends honour it; virtual paths must too.
+        return meta.size if meta is not None else 0
 
     # --- delegation -------------------------------------------------------
 
