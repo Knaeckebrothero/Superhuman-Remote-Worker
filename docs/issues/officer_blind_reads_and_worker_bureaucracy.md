@@ -13,8 +13,10 @@ deliverables to the end, the project memory system has institutionalized a forma
 giving-up pattern, and the infra underneath (VM SSH, agent heartbeats, codex-proxy) was
 flapping all night.
 
-**Status:** findings verified against code + cluster 2026-07-30. Fixes **unbuilt** unless
-marked. All six research annexes (§7: read paths, steer mechanics, phase overhead,
+**Status:** findings verified against code + cluster 2026-07-30. **P0 wave shipped and
+deployed to dev the same day** — P0-A `ef3ec62b`, P0-D `3cda6f09`, P0-B `70ca9461`
+(+ C2 snapshot `58e3a667`), P0-C executed against the dev RecallStore 11:40 UTC;
+shipped-notes inline in §4. P1/P2 remain unbuilt. All six research annexes (§7: read paths, steer mechanics, phase overhead,
 cluster evidence, framework survey, research literature) have landed and are folded into
 the findings and fix plan. Companion doc for the phase-guardrail arc:
 `docs/issues/agent_phase_guardrails_burn_legitimate_work.md` (2026-07-15) — finding
@@ -56,15 +58,15 @@ judgment.
 
 | # | Finding | Site | Status |
 |---|---------|------|--------|
-| F1 | Officer's `get_job_workspace_file` sends the path as a query param to a `{path:path}` route — reads literal file `file`, 404s **always**, and the error message echoes the requested path, laundering the bug as worker non-delivery | `src/tools/orchestrator/jobs.py:733` vs `orchestrator/main.py:16370` | Open — **P0** |
-| F2 | The backing endpoint is a dev relic: `WorkspaceService._get_job_path` ignores `job_id` and reads orchestrator-local `WORKSPACE_PATH` — on k8s that PVC only ever contains `uploads/`, so every job-file read returns 404 while `is_available` stays true. It is also a **cross-job leak by construction** (same path for every job_id). The MCP `get_workspace_file`/`get_workspace_overview` build the URL correctly but hit the same dead backend; the cockpit **todo view** reads the same service and is permanently empty on k8s | `orchestrator/services/workspace.py:65-80`; PVC `helm/templates/orchestrator/deployment.yaml:1284-1320`; MCP `orchestrator/mcp/client.py:1032,1047`; cockpit `todo.service.ts:106` | Open — pre-known substrate, see companion doc; full blast radius in annex A |
-| F3 | Officer has **no working read path at all**: his toolset lacks the Gitea-backed reader (the MCP server's `get_job_file` works today), and his sitrep instructions direct him at the broken tool | toolset `src/core/session_tool_overrides.py:27`; sitrep text `orchestrator/services/session_wake.py:594-598`; working path `orchestrator/mcp/server.py:714` | Open — **P0** |
-| F4 | Urgent steer ≡ resume-with-feedback, and it is worse than "destructive": (a) `restore_from_feedback` force-compacts (originals dropped from the checkpoint via `RemoveMessage`), **wipes in-flight tactical todos without archiving them** (archive_phase bypassed on this route), re-enters strategic, and injects a factually false "[FEEDBACK_RESUME] previously frozen for human review" banner; the resume template then mandates "REWRITE plan.md — the old plan is no longer relevant"; (b) **no stop signal ever reaches the running pod** — the deployed `dual_app` heartbeat handler reads only `should_drain` and ignores the `job_status` field the orchestrator already returns (the deny-list backstop exists only in the non-deployed `app.py`), so the old pod keeps executing as an **orphan, double-writing the same Postgres checkpoint thread** as the replacement pod, and with a single-slot pool the job sits paused until the orphan dies; (c) the non-urgent lane is a dead letter box: queued replies are written to `messages/…_received.md` which **nothing tells the worker to read** (no read tool exists; the REVIEW todo's `git_diff` cites a tag name that is never created), and the documented clearing contract (`consumed_reply_threads`) **was never implemented**, so every tactical→strategic boundary re-materializes a duplicate. Effective latency of a "queued" steer: unbounded | urgent: `src/graph.py:3481-3621` (todo wipe `:3572-3575` via `src/managers/todo.py:787-789`, false banner `:3560-3569`); orphan: `orchestrator/main.py:11704-11725` (no stop), `src/api/dual_app.py:166-201` vs `src/api/app.py:79-121`; queued: drain `src/graph.py:3040-3046` → `:2915-2985`, phantom contract `:2946-2948`, wrong tag `config/templates/strategic_todos_transition.yaml` vs `src/core/phase.py:1060-1061` | Open — **P0-D** (orphan) + **P1-A** (steer); full trace annex B |
+| F1 | Officer's `get_job_workspace_file` sends the path as a query param to a `{path:path}` route — reads literal file `file`, 404s **always**, and the error message echoes the requested path, laundering the bug as worker non-delivery | `src/tools/orchestrator/jobs.py:733` vs `orchestrator/main.py:16370` | **Fixed** `ef3ec62b` (P0-A) |
+| F2 | The backing endpoint is a dev relic: `WorkspaceService._get_job_path` ignores `job_id` and reads orchestrator-local `WORKSPACE_PATH` — on k8s that PVC only ever contains `uploads/`, so every job-file read returns 404 while `is_available` stays true. It is also a **cross-job leak by construction** (same path for every job_id). The MCP `get_workspace_file`/`get_workspace_overview` build the URL correctly but hit the same dead backend; the cockpit **todo view** reads the same service and is permanently empty on k8s | `orchestrator/services/workspace.py:65-80`; PVC `helm/templates/orchestrator/deployment.yaml:1284-1320`; MCP `orchestrator/mcp/client.py:1032,1047`; cockpit `todo.service.ts:106` | **Routes deleted, consumers repointed at Gitea** `70ca9461` (P0-B); service kept for uploads/logs/frozen-json |
+| F3 | Officer has **no working read path at all**: his toolset lacks the Gitea-backed reader (the MCP server's `get_job_file` works today), and his sitrep instructions direct him at the broken tool | toolset `src/core/session_tool_overrides.py:27`; sitrep text `orchestrator/services/session_wake.py:594-598`; working path `orchestrator/mcp/server.py:714` | **Fixed** `ef3ec62b` (P0-A): reader repointed, lister added, sitrep/prompt text updated |
+| F4 | Urgent steer ≡ resume-with-feedback, and it is worse than "destructive": (a) `restore_from_feedback` force-compacts (originals dropped from the checkpoint via `RemoveMessage`), **wipes in-flight tactical todos without archiving them** (archive_phase bypassed on this route), re-enters strategic, and injects a factually false "[FEEDBACK_RESUME] previously frozen for human review" banner; the resume template then mandates "REWRITE plan.md — the old plan is no longer relevant"; (b) **no stop signal ever reaches the running pod** — the deployed `dual_app` heartbeat handler reads only `should_drain` and ignores the `job_status` field the orchestrator already returns (the deny-list backstop exists only in the non-deployed `app.py`), so the old pod keeps executing as an **orphan, double-writing the same Postgres checkpoint thread** as the replacement pod, and with a single-slot pool the job sits paused until the orphan dies; (c) the non-urgent lane is a dead letter box: queued replies are written to `messages/…_received.md` which **nothing tells the worker to read** (no read tool exists; the REVIEW todo's `git_diff` cites a tag name that is never created), and the documented clearing contract (`consumed_reply_threads`) **was never implemented**, so every tactical→strategic boundary re-materializes a duplicate. Effective latency of a "queued" steer: unbounded | urgent: `src/graph.py:3481-3621` (todo wipe `:3572-3575` via `src/managers/todo.py:787-789`, false banner `:3560-3569`); orphan: `orchestrator/main.py:11704-11725` (no stop), `src/api/dual_app.py:166-201` vs `src/api/app.py:79-121`; queued: drain `src/graph.py:3040-3046` → `:2915-2985`, phantom contract `:2946-2948`, wrong tag `config/templates/strategic_todos_transition.yaml` vs `src/core/phase.py:1060-1061` | Orphan **fixed** `3cda6f09` (P0-D); steer-as-rollback + dead-letter queue still open — **P1-A**; full trace annex B |
 | F5 | Verifier #2 **complied and was executed anyway**: wrote `output/baseline_verification.md` at step 61 (~13 min in), archiver pushed it to Gitea (present, 3.2 KB scaffold, branch `job/e239ef27`); officer's three reads said "not found"; his two urgent steers each cost the worker a full re-plan (plan.md rewrite + restage ≥5 todos + todo-guide re-read), preempting the fill-in work he was demanding | audit `e239ef27` steps 55-61, 284-290, 346 | Evidence — drives F1/F3/F4 |
 | F6 | Verifier #1 spent 5.5 h / 1096 steps / 7 phases on structural archaeology and process, sealed at confidence 0.42 with 26/27 todos "done" and **0/7 plan-§1 deliverables**, and — its own words — test suite "INFERRED GREEN-by-construction … **unverified by pytest execution**". It never ran pytest, the one command the truth gate existed for | `7c2685e8` `output/completion.json` (in Gitea) | Evidence — drives F7/F8/P1 |
-| F7 | The "honest-floor seal" is a **learned, propagated institution — and quantified**: annex D's sweep finds **7/7 distinct seals since 07-26 at confidence 0.42-0.55**, every one carrying honest-floor/NOT-SHIPPED language; exactly one clean seal (0.85) exists in the sample, from 07-09. Verifier #1 cites confidence-floor precedents from iterations 26/35/37 via pinned RecallStore memories; process-lore ("4-step verify-before-done gate", "two-stage seal") is recited near-every-turn; cross-job pin contamination is visible ("memories [1]/[2]/[5]/[6] are for OTHER jobs"). Crucially, the proximate causes *inside* the seals are mostly **real harness bugs** — stuck shell blocking pytest/ruff (3 seals), the palette lie (3), subagent fan-out failures (2) — which the memory system then generalized into culture | audit `7c2685e8` entries 449, 488-498, 725-744, 955, 1022; annex D §1 sweep | Open — **P2** memory hygiene |
+| F7 | The "honest-floor seal" is a **learned, propagated institution — and quantified**: annex D's sweep finds **7/7 distinct seals since 07-26 at confidence 0.42-0.55**, every one carrying honest-floor/NOT-SHIPPED language; exactly one clean seal (0.85) exists in the sample, from 07-09. Verifier #1 cites confidence-floor precedents from iterations 26/35/37 via pinned RecallStore memories; process-lore ("4-step verify-before-done gate", "two-stage seal") is recited near-every-turn; cross-job pin contamination is visible ("memories [1]/[2]/[5]/[6] are for OTHER jobs"). Crucially, the proximate causes *inside* the seals are mostly **real harness bugs** — stuck shell blocking pytest/ruff (3 seals), the palette lie (3), subagent fan-out failures (2) — which the memory system then generalized into culture | audit `7c2685e8` entries 449, 488-498, 725-744, 955, 1022; annex D §1 sweep | **147 poison rows retired** on dev 07-30 (P0-C); write-path hygiene still open — **P2-A** |
 | F8 | Phase machinery forces padding and defers delivery: the `min_todos=5` floor rejected the agent's 2-todo plan ("Too few todos: 2 < 5") — and the yaml key that should tune it is a **dead end** (parsed and threaded to a parameter that is never read; live gate is a constructor default no production site sets — annex C §2); the 4-todo strategic boilerplate (~1,799 tokens) is re-injected tail-anchored on **every LLM turn** of a strategic phase; the strategic system prompt adds a second, ~80%-redundant audit-retrospective ("default assumption is that the tactical phase failed"); the templates contradict the code ("Target 3-7" vs a floor of 5); and report-last is **explicitly instructed** in three layers — initial-plan ordering ("research phases first … then execution phases to produce deliverables"), the todo-guide ("Don't jump straight to producing deliverables"), and critic instructions ("Do not skip steps or reorder them", report = step 5 of 5) with critic verdict tools bound strategic-only, so the deliverable *cannot* be produced during tactical work | live gate `src/managers/todo.py:647` (dead path `src/core/phase.py:348`); dead yaml wiring `src/core/loader.py:2363` → `src/core/phase.py:1086` (param never read); boilerplate `config/templates/strategic_todos_transition.yaml`; audit protocol `config/prompts/strategic.txt:6-32`; ordering `config/templates/strategic_todos_initial.yaml:66-68`, `config/skills/todo-guide/SKILL.md:51`, `config/experts/critic/instructions.md:7` | Open — **P1**; full ledger in annex C |
-| F9 | The lying `todo_list_footer` ("only 3 tools exist") was **still live all night**: the fix landed in commit `e4244dfe` at 00:13 UTC but the image bump (`d7027501`, sha-576a15f) only rolled at 09:12 UTC. Overnight palette-confusion reasoning in the audit is the real old footer plus the laundered pinned memories. Retiring those poisoned RecallStore memories is now **unblocked and owed** | timing: `git log e4244dfe d7027501`; background: `memory project_todo_footer_false_tool_surface` | Fix deployed 09:12 UTC; memory retirement open — **P0-C** |
+| F9 | The lying `todo_list_footer` ("only 3 tools exist") was **still live all night**: the fix landed in commit `e4244dfe` at 00:13 UTC but the image bump (`d7027501`, sha-576a15f) only rolled at 09:12 UTC. Overnight palette-confusion reasoning in the audit is the real old footer plus the laundered pinned memories. Retiring those poisoned RecallStore memories is now **unblocked and owed** | timing: `git log e4244dfe d7027501`; background: `memory project_todo_footer_false_tool_surface` | Fix deployed 09:12 UTC; **memories retired 07-30** — see P0-C |
 | F10 | Heavy verifier died on a codex-proxy 408 stream-disconnect streak. The July classifier fix **worked as designed** (classified transient, retried 4 backoff cycles on fresh pods, then gave up on the identical-error streak). The officer's own turns errored twice on the same proxy; it answered 200 again by ~09:20 | job `eb0143f8` error text; `docs/done/transient_408_stream_disconnect_misclassified_as_permanent.md` | Infra — **P2** monitor; first live confirmation of the classifier fix |
 | F11 | Infra noise demystified (annex D §3-4): the ~120 "offline agents" are **accumulated one-shot registrations** (one pod per dispatch, stale-detector marks each ended pod offline → one event per pod, all night), not concurrent flapping. Real incidents inside the window: the 23h spike was a **deploy storm** (three orchestrator rolls 23:10→00:05 from the evening's own pushes; the officer's agent went dark at 23:12, two minutes after a roll, and its replacement pod **crashed at startup** — asyncpg pool failure, exit 3 — the "item-7" debris pod); the 07h spike was `eb0143f8`'s pause+backoff loop burning 8 fresh pods. VM workspace SSH timeouts are chronic: **~11 jobs killed by workspace reachability in 18 days**, 7 on headscale-mesh IPs, a cluster every 2-3 days; verifier #2's audit even shows it *rationalizing* the SSH failure ("the palette now confirms todos completed") | annex D §3-4; audit `e239ef27` steps 334, 345, 351 | Open — **P2** infra track |
 | F12 | **The truth gate is still open — but narrower than feared.** `58027ee7`'s own seal claims "all 8 deliverables SHIPPED, baseline **179 passed / 3 pre-existing failures** (NOT caused by kassenabschluss), ruff clean" — a coherent claim, not the feared 180-vs-179 contradiction. It sealed at 0.45 anyway because `job_complete` **rejected its deliverable paths for lacking the `repo/` prefix** (F14). One clean pytest run on current main settles it | annex D §6; KB note `century-state-on-change-of-command` | Operational follow-up — §5 |
@@ -132,6 +134,14 @@ push; pass `ref` for phase tags `{short_id}-phase-{N}-{type}-complete`". Note
 code drifted from its own spec.
 *Acceptance:* officer session on k3d reads a file a live worker pushed at its previous
 phase boundary; nonexistent path names branch+ref searched; staleness header present.
+> **Shipped `ef3ec62b`** (2026-07-30; agent image `sha-5252d18`, sitrep text rides
+> orchestrator `sha-4cf2d01`). As designed: `/repo/file` + optional `ref`, head-commit
+> staleness header (explicit refs labeled `[ref '…': …]`), 404s name the ref searched and
+> point at the new `list_job_workspace_files`; all five toolset mirrors updated (session
+> overrides, persistent defaults, centurion expert config, cockpit group names,
+> app-guide reference). Unit-tested against the live route shapes; the officer's first
+> real read is the remaining acceptance check — no officer pod survived the deploy roll,
+> so his next wake binds the fixed tools automatically.
 
 **P0-B. Kill the dev-relic workspace endpoints (don't fix them).**
 Per annex A: `WorkspaceService` has no job dimension at all and its PVC holds only
@@ -146,6 +156,14 @@ that patch `workspace_service` (`tests/test_job_access.py`,
 stays out of scope: it needs a new agent-side file endpoint plus a shell-state-style
 proxy and is unreachable for mesh VMs anyway — Gitea-first now, explicit `live=true`
 opt-in later if wanted.
+> **Shipped `70ca9461`** (+ C2 endpoint snapshot `58e3a667`; orchestrator image
+> `sha-4cf2d01`). Routes and the three cockpit methods deleted; MCP tools repointed
+> (fixing two legs of `get_job_summary` for free); `/todos*` rewritten Gitea-backed via
+> new `orchestrator/services/job_todos.py`, cockpit response shape preserved
+> key-for-key with empty-shape degradation when Gitea is down. Live-verified on k3d:
+> `/todos` returned 6 parsed phase archives from a real job repo; deleted routes 404.
+> Lesson: CI's develop path filter skipped `test-python` on these pushes — the
+> endpoint-inventory drift only surfaced in the local full-suite gate.
 
 **P0-C. Retire the poisoned RecallStore memories (now unblocked).**
 The footer fix is deployed as of 09:12 UTC. The dev-cluster pinned memories that
@@ -153,6 +171,20 @@ launder the old footer ("palette is stale display noise") and the honest-floor/t
 seal lore must be superseded or deleted — there is no MCP delete; needs an orchestrator
 API or direct DB pass. Sequencing note from the earlier incident stands: fix first
 (done), then retire memories, else the rewind loop returns.
+> **Executed 2026-07-30 11:40:51 UTC** against `srw-pgvector-0`/`srw_vector` on dev:
+> **147 clear-poison rows retired** (141 actively pinned — seal doctrine,
+> confidence-floor codification, palette/footer lore in both variants, giving-up
+> playbooks; the freshest extracted 05:17 that same morning) via the store's own
+> supersede semantics (`valid_to = superseded_at = now, remaining_turns = 0`,
+> `superseded_by` NULL), which removes them from pinned injection and every
+> hybrid-search channel. Resavio pinned recitations 2504 → 2363; 162 borderline rows
+> (real harness mechanics/workarounds) and 166 false positives (real domain
+> palette/footer knowledge) deliberately kept. **Reversible**:
+> `UPDATE memories SET valid_to = NULL, superseded_at = NULL WHERE superseded_at =
+> '2026-07-30 11:40:51.463159+00' AND superseded_by IS NULL`. Residual risk: the
+> observer extracts only from live turns, but the lore's second homes (KB notes,
+> `plan.md` stop-conditions and verify-before-done skills inside existing repos/vault)
+> can seed fresh re-extraction — re-sweep in a few days; P2-A is the durable close.
 
 **P0-D. Stop orphaning pods on out-of-band status changes (live correctness bug).**
 Port the `job_status` deny-list from `src/api/app.py:79-121` into the deployed
@@ -164,6 +196,12 @@ pools (`get_available_agents` requires `ready`; the orphan stays `working`). Its
 eventual completion report is discarded at `orchestrator/main.py:14627-14672`. Small
 port, large blast radius; several of last night's "orphans_recovered" flaps were
 plausibly self-inflicted by the 05:33 steer through this hole.
+> **Shipped `3cda6f09`** (agent image `sha-5252d18`). Faithful port: deny-list
+> `failed/cancelled → cancel`, `paused → pause`, fail-open on unknown or missing
+> status; rides `_request_stop`, the same cooperative stop `/job/cancel` and
+> `/job/pause` set, so teardown and slot release behave exactly like a push cancel.
+> Guarded by pod-state + current-job id (nulled before the agent's own completion
+> report, so orderly shutdown can't trip it) + stop-flag idempotency.
 
 ### P1 — make supervision constructive and delivery incremental
 
@@ -312,16 +350,17 @@ officer doesn't read roll-induced churn as fleet sickness.
    repo once, with no deselection, and hand the officer the result — his standing orders
    have all construction blocked pending exactly this fact. Expected per `58027ee7`'s
    own claim: 179 pass / 3 pre-existing failures.
-2. Officer can stand down from 3-strike alert once P0-A ships; until then his correct
-   posture is what he chose: long sleeps, no new verifiers.
+2. **Unblocked 07-30**: P0-A is deployed, and no officer pod survived the roll, so his
+   next wake binds the fixed reader + lister automatically. He can stand down from the
+   3-strike alert; his truth-gate order stays until item 1 is answered.
 3. **Clear the parking lot** (annex D §2): `4435994d` + `2dbe6854` are pending_review
    because their critic subjobs died on "parent workspace vm=deleted, subjob cannot
    inherit" (known issue class — reviewed parents' VMs get reaped before automated
    verification can run); `1cab4b88` (the footer-incident job) has sat unreviewed since
    07-16; `35b23256` has been paused on the pre-fix 408 since 07-15 and will never be
    re-picked on its own.
-4. **Delete the item-7 debris pod** (`persistent-d67ee261-334`, Error state since
-   23:57 — startup crash during the deploy storm, asyncpg pool failure).
+4. **Done 07-30**: item-7 debris pod (`persistent-d67ee261-334`, Error since 23:57 —
+   startup crash during the deploy storm, asyncpg pool failure) deleted.
 
 ---
 
@@ -364,9 +403,10 @@ The research annexes sharpen the direction without settling it:
   The tiered retreat — not wholesale deletion — is the defensible move while MiniMax-class
   line workers remain in the fleet.
 
-Sequencing stands: ship P0 first so the next supervised night produces clean evidence
-instead of artifacts of blindness; run P1-B's config-first cuts as measurable
-experiments; decide the alternation question on that data.
+Sequencing stands — first step complete: **P0 shipped 2026-07-30**, so the next
+supervised night produces clean evidence instead of artifacts of blindness. Next: run
+P1-B's config-first cuts as measurable experiments; decide the alternation question on
+that data.
 
 ---
 
