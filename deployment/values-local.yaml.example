@@ -264,6 +264,8 @@ databases:
     storageSize: "5Gi"
   audit:
     storageSize: "2Gi"
+  gitea:
+    storageSize: "2Gi"
   neo4j:
     # Disabled for a lighter dev stack (JVM + ~1Gi working memory + 5Gi PVC).
     # The configmap drops the Neo4j URL and the orchestrator degrades to

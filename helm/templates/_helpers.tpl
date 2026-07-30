@@ -308,6 +308,52 @@ jdbc:postgresql://{{ include "srw.fullname" . }}-keycloakdb:5432/keycloak
 {{- end }}
 
 {{/*
+Connection parts the bundled Gitea uses for its metadata database when
+gitea.database.type is "postgres". Resolves to the in-cluster `srw-giteadb`
+Service when databases.gitea.internal is true, or to the operator-supplied
+external server otherwise. Credentials never appear here — Gitea reads
+GITEA__database__USER / __PASSWD from the Secret.
+*/}}
+{{- define "srw.giteaDbHost" -}}
+{{- if .Values.databases.gitea.internal -}}
+{{- printf "%s-giteadb" (include "srw.fullname" .) -}}
+{{- else -}}
+{{- required "databases.gitea.externalHost is required when databases.gitea.internal is false" .Values.databases.gitea.externalHost -}}
+{{- end -}}
+{{- end }}
+
+{{- define "srw.giteaDbPort" -}}
+{{- if .Values.databases.gitea.internal -}}
+5432
+{{- else -}}
+{{- .Values.databases.gitea.externalPort | default 5432 -}}
+{{- end -}}
+{{- end }}
+
+{{- define "srw.giteaDbName" -}}
+{{- if .Values.databases.gitea.internal -}}
+gitea
+{{- else -}}
+{{- .Values.databases.gitea.externalDb | default "gitea" -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+True when the bundled Gitea should use Postgres for its metadata DB. Any value
+other than "sqlite3" is rejected loudly rather than silently falling back —
+a typo here would otherwise point a populated Gitea at a fresh database.
+*/}}
+{{- define "srw.giteaUsesPostgres" -}}
+{{- $type := .Values.gitea.database.type | default "postgres" -}}
+{{- if eq $type "postgres" -}}
+true
+{{- else if eq $type "sqlite3" -}}
+{{- else -}}
+{{- fail (printf "gitea.database.type must be \"postgres\" or \"sqlite3\", got %q" $type) -}}
+{{- end -}}
+{{- end }}
+
+{{/*
 Resources for the Keycloak bootstrap Job.
 
   - srw.keycloakBootstrapServer  — URL kcadm authenticates against.
