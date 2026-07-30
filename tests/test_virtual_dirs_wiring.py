@@ -155,3 +155,27 @@ def test_probe_sees_a_genuinely_seeded_workspace(tmp_path):
     overlay.register(SingleFileProvider("task_brief.md", lambda: "# Task Brief\n"))
     (tmp_path / "task_brief.md").write_text("seeded earlier")
     assert unwrap_backend(overlay).exists("task_brief.md")
+
+
+def test_production_probe_call_sites_bypass_the_overlay():
+    """Tripwire pinning the real call sites, not just the helper.
+
+    ``unwrap_backend`` is unit-tested above, but nothing otherwise pins the
+    production probes. An edit — or a merge/rebase conflict resolution — that
+    drops the unwrap call would let a virtual ``task_brief.md`` mask a wiped
+    workspace, and every other test in the suite would still pass. The Step 4
+    grep cannot catch it either: ``_backend_has`` probes through a variable,
+    not the literal string.
+    """
+    from pathlib import Path
+
+    source = (Path(__file__).resolve().parents[1] / "src" / "agent.py").read_text(
+        encoding="utf-8"
+    )
+
+    # VM-recovery / snapshot re-seed probe.
+    assert 'unwrap_backend(workspace_backend).exists("task_brief.md")' in source
+
+    # The shared _backend_has helper behind the resume gate.
+    start = source.index("def _backend_has(")
+    assert "unwrap_backend(" in source[start : start + 1200]
