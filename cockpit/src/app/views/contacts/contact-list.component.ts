@@ -1,5 +1,5 @@
-import {ChangeDetectionStrategy, Component, input, output, signal} from '@angular/core';
-import {TranslocoPipe} from '@jsverse/transloco';
+import {ChangeDetectionStrategy, Component, inject, input, output, signal} from '@angular/core';
+import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
 
 import {Contact, ContactChannel} from '../../core/models/api.model';
 
@@ -39,10 +39,12 @@ import {Contact, ContactChannel} from '../../core/models/api.model';
             @for (p of contact.projects; track p.id) { <span class="chip">{{ p.name }}</span> }
           </div>
           @if (contact.notes) { <p class="notes">{{ contact.notes }}</p> }
-          <div class="actions">
-            <button (click)="edit.emit(contact); $event.stopPropagation()">{{ 'common.edit' | transloco }}</button>
-            <button (click)="remove.emit(contact); $event.stopPropagation()">{{ 'common.delete' | transloco }}</button>
-          </div>
+          @if (canModify(contact, currentUserId())) {
+            <div class="actions">
+              <button (click)="edit.emit(contact); $event.stopPropagation()">{{ 'common.edit' | transloco }}</button>
+              <button (click)="remove.emit(contact); $event.stopPropagation()">{{ 'common.delete' | transloco }}</button>
+            </div>
+          }
         </div>
       }
     }
@@ -64,9 +66,13 @@ import {Contact, ContactChannel} from '../../core/models/api.model';
 })
 export class ContactListComponent {
   readonly contacts = input<Contact[]>([]);
+  /** Visibility is owned ∪ project-linked (spec), but only the owner may
+   * mutate — co-members must see, not edit/delete, contacts they don't own. */
+  readonly currentUserId = input<string | null>(null);
   readonly edit = output<Contact>();
   readonly remove = output<Contact>();
 
+  private readonly transloco = inject(TranslocoService);
   private readonly expanded = signal<Set<string>>(new Set());
 
   isExpanded(id: string): boolean {
@@ -88,6 +94,15 @@ export class ContactListComponent {
     const primary = contact.addresses.find(a => a.channel === channel && a.is_primary)
       ?? contact.addresses.find(a => a.channel === channel);
     if (!primary || primary.opt_in_status === 'opted_in') return channel;
-    return `${channel}·${primary.opt_in_status === 'pending' ? 'pending' : 'opted out'}`;
+    return `${channel}·${this.transloco.translate('contacts.optIn.' + primary.opt_in_status)}`;
+  }
+
+  /** Owner-only mutation gate. Takes `currentUserId` explicitly (rather than
+   * reading the `currentUserId` input internally) so it stays a pure,
+   * directly-testable predicate — this repo's vitest harness has no way to
+   * drive a signal input()'s value outside of ngtsc/TestBed compilation
+   * (see contact-form.component.spec.ts for the documented gap). */
+  canModify(contact: Contact, currentUserId: string | null): boolean {
+    return contact.owner_user_id === currentUserId;
   }
 }

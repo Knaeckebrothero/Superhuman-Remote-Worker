@@ -130,7 +130,12 @@ async def create_contact(request: Request, body: ContactCreate) -> dict:
 @router.patch("/{contact_id}")
 async def patch_contact(request: Request, contact_id: str, body: ContactPatch) -> dict:
     await _owned_contact(request, contact_id)
-    updated = await _get_db().update_contact(contact_id, body.display_name, body.notes)
+    display_name = body.display_name
+    if display_name is not None:
+        display_name = display_name.strip()
+        if not display_name:
+            raise HTTPException(status_code=400, detail="display_name cannot be empty")
+    updated = await _get_db().update_contact(contact_id, display_name, body.notes)
     return {"contact": updated}
 
 
@@ -176,6 +181,14 @@ async def patch_address(request: Request, address_id: str, body: AddressPatch) -
     if body.address is not None:
         new_addr = _normalize_address(existing["channel"], body.address)
     updated = await db.update_contact_address(address_id, new_addr, body.is_primary)
+    if updated is None:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Address {new_addr or existing['address']} already belongs to "
+                "one of your contacts — link that contact to the project instead"
+            ),
+        )
     return {"address": updated}
 
 

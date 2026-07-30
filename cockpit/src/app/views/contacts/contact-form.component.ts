@@ -52,7 +52,9 @@ export function seedProjectIds(contact: Contact | null): Set<string> {
       <div class="label">{{ 'contacts.form.addresses' | transloco }}</div>
       @for (row of rows(); track $index; let i = $index) {
         <div class="addr-row">
-          <select [ngModel]="row.channel" (ngModelChange)="patchRow(i, {channel: $event})">
+          <select [ngModel]="row.channel" (ngModelChange)="patchRow(i, {channel: $event})"
+            [disabled]="!!row.id"
+            [title]="row.id ? ('contacts.form.channelLocked' | transloco) : ''">
             <option value="email">email</option>
             <option value="whatsapp">whatsapp</option>
           </select>
