@@ -112,39 +112,16 @@ class TestDeployBoundSkillWithoutDeploymentDir:
         assert "CITE BODY" in session.workspace_manager.read_file(path)
 
 
-class TestSessionInstructionsProvider:
-    """instructions.md is virtual for sessions too
-    (docs/features/virtual_directories.md): template-only, since a session has
-    no job-record upload/inline source and (unlike worker jobs) no task
-    brief — _deploy_instruction_files never wrote either as real files."""
+class TestSessionRegistersNoInstructionsProviders:
+    """Slice 1 is a passive migration for the session path: sessions never
+    wrote instructions.md or task_brief.md as real files (their instructions
+    reach the model through get_phase_system_prompt instead), so there is
+    nothing to replace with a virtual equivalent. Registering one would be a
+    new agent-visible file — a product decision, not a migration step — so
+    _deploy_instruction_files must register neither provider for sessions.
+    """
 
-    def test_deploys_instructions_md_from_the_rendered_template(
-        self, tmp_path, monkeypatch
-    ):
-        from src.core.workspace import WorkspaceManager
-        from tests._fs_backend import FilesystemTestBackend
-
-        # Module-level bindings in persistent_session.py itself — patching
-        # src.core.loader's copy would not be seen by the already-imported
-        # local names.
-        monkeypatch.setattr(
-            "src.api.persistent_session.load_instructions",
-            lambda *a, **k: "TEMPLATE BODY",
-        )
-        monkeypatch.setattr(
-            "src.api.persistent_session.render_instruction_content",
-            lambda content, *a, **k: content,
-        )
-        session = _make_session()
-        session.workspace_manager = WorkspaceManager(
-            job_id="t", backend=FilesystemTestBackend(tmp_path)
-        )
-
-        session._deploy_instruction_files()
-
-        assert session.workspace_manager.read_file("instructions.md") == "TEMPLATE BODY"
-
-    def test_no_task_brief_provider_is_registered(self, tmp_path):
+    def test_neither_instructions_nor_task_brief_provider_is_registered(self, tmp_path):
         from src.core.workspace import WorkspaceManager
         from tests._fs_backend import FilesystemTestBackend
 
@@ -155,10 +132,9 @@ class TestSessionInstructionsProvider:
 
         session._deploy_instruction_files()
 
-        assert "instructions.md" in session.workspace_manager.virtual_overlay.providers
-        assert (
-            "task_brief.md" not in session.workspace_manager.virtual_overlay.providers
-        )
+        providers = session.workspace_manager.virtual_overlay.providers
+        assert "instructions.md" not in providers
+        assert "task_brief.md" not in providers
 
 
 class TestCapabilityScopedCanvasSkillDeployment:
