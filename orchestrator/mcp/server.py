@@ -315,7 +315,8 @@ async def get_chat_bulk(
 async def get_todos(job_id: str) -> str:
     """Get all todos for a job including current active todos and archives.
 
-    Shows task planning and execution progress across phases.
+    Shows task planning and execution progress across phases. Gitea-backed:
+    committed state as of the worker's last phase-boundary push.
 
     Args:
         job_id: Job UUID to get todos for
@@ -370,7 +371,9 @@ async def get_job_summary(job_id: str) -> str:
 
     Fetches status, progress, todos, workspace overview, and recent tool
     calls in parallel. Returns everything in a single response — ideal for
-    understanding a job's current state without multiple tool calls.
+    understanding a job's current state without multiple tool calls. The
+    todos and workspace sections are Gitea-backed: committed state as of
+    the worker's last phase-boundary push.
 
     Args:
         job_id: Job UUID to summarize
@@ -817,15 +820,17 @@ async def get_frozen_job(job_id: str) -> str:
 
 @mcp.tool
 async def get_workspace_file(job_id: str, path: str) -> str:
-    """Read any file from the job's local workspace filesystem.
+    """Read a file from the job's workspace repo (Gitea-backed).
 
-    Unlike get_job_file (which reads from Gitea at any ref), this reads the
-    current local file. Useful when Gitea is unavailable or for real-time state.
+    Returns committed state as of the worker's last phase-boundary push —
+    workers push at every phase boundary, freeze, and finalize, so mid-phase
+    edits are not visible yet. Reads the job branch head; use get_job_file
+    with a ref to read a phase tag instead.
 
     Args:
         job_id: Job UUID
-        path: Relative path within the workspace (e.g., "workspace.md", "plan.md",
-              "todos.yaml", "archive/phase_1_retrospective.md")
+        path: Relative path within the workspace repo (e.g., "plan.md",
+              "notes/decisions.md", "archive/phase_1_retrospective.md")
 
     Returns:
         File content as text
@@ -841,10 +846,12 @@ async def get_workspace_file(job_id: str, path: str) -> str:
 
 @mcp.tool
 async def get_workspace_overview(job_id: str) -> str:
-    """Get a summary of the workspace state.
+    """Get a summary of the workspace state from the job's Gitea repo.
 
-    Returns file listing, truncated workspace.md/plan.md previews,
-    current todo counts, and archive count.
+    Returns the repo-root file listing, truncated workspace.md/plan.md
+    previews when present, current todo counts, and archive count — all
+    committed state as of the worker's last phase-boundary push (mid-phase
+    edits are not visible yet).
 
     Args:
         job_id: Job UUID

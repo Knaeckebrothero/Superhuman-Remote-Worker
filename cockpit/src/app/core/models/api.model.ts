@@ -1688,36 +1688,6 @@ export interface StuckJob {
   stuck_component: string;
 }
 
-// =============================================================================
-// Workspace Models
-// =============================================================================
-
-/**
- * Workspace file metadata.
- */
-export interface WorkspaceFile {
-  name: string;
-  size: number;
-  modified: number;
-}
-
-/**
- * Workspace overview for a job.
- */
-export interface WorkspaceOverview {
-  job_id: string;
-  has_workspace: boolean;
-  files: WorkspaceFile[];
-  workspace_md?: string;
-  plan_md?: string;
-  todos?: {
-    todos: unknown[];
-    source: string;
-    is_current: boolean;
-  };
-  archive_count: number;
-}
-
 // --- Capability grants (User-Defined Experts, Slice 2) ---
 
 /** One entry of the capability catalog (delivered by both grant endpoints). */

@@ -209,6 +209,11 @@ from services.workspace_binding import (  # noqa: E402
     remote_canvas_presentation_available,
 )
 from services.workspace import workspace_service  # noqa: E402
+from services.job_todos import (  # noqa: E402
+    build_archive_listing,
+    parse_archived_todos,
+    parse_current_todos,
+)
 from services.gitea import GiteaClient  # noqa: E402
 from services.keycloak_admin import KeycloakGroupSync  # noqa: E402
 from services.cloud import (  # noqa: E402
@@ -16350,84 +16355,12 @@ async def list_repo_tags(
     return tags
 
 
-# =============================================================================
-# Workspace / Todo Endpoints
-# =============================================================================
-
-
-@app.get("/api/jobs/{job_id}/workspace")
-async def get_job_workspace(request: Request, job_id: str) -> dict[str, Any]:
-    """Get workspace overview for a job.
-
-    Returns:
-        Dict with workspace files, workspace.md/plan.md content (truncated),
-        current todos, and archive count.
-    """
-    await require_job_access(request, postgres_db, job_id)
-    return workspace_service.get_workspace_overview(job_id)
-
-
-@app.get("/api/jobs/{job_id}/workspace/{path:path}")
-async def get_workspace_file(
-    request: Request, job_id: str, path: str
-) -> dict[str, str]:
-    """Get content of a workspace file by relative path.
-
-    Supports any file within the job workspace, including subdirectories
-    (e.g., "archive/phase_1_retrospective.md"). Path is sandboxed.
-
-    Args:
-        job_id: Job UUID
-        path: Relative path within the workspace
-
-    Returns:
-        Dict with path and file content
-    """
-    await require_job_access(request, postgres_db, job_id)
-    content = workspace_service.get_workspace_file(job_id, path)
-    if content is None:
-        raise HTTPException(
-            status_code=404,
-            detail=f"File '{path}' not found in workspace for job '{job_id}'",
-        )
-    return {"path": path, "content": content}
-
-
-@app.put("/api/jobs/{job_id}/workspace/{path:path}")
-async def write_workspace_file(
-    request: Request,
-    job_id: str,
-    path: str,
-    body: dict[str, Any] = Body(...),
-) -> dict[str, Any]:
-    """Write content to a workspace file.
-
-    Sandboxed — directory traversal is blocked, and certain paths
-    (todos.yaml, .git/, tools/) are not editable.
-
-    Args:
-        job_id: Job UUID
-        path: Relative path within the workspace
-        body: {"content": "...", "commit_message": "..."}
-    """
-    await require_job_access(request, postgres_db, job_id)
-    content = body.get("content")
-    if content is None:
-        raise HTTPException(status_code=400, detail="Missing 'content' in request body")
-
-    blocked = workspace_service.is_path_blocked(path)
-    if blocked:
-        raise HTTPException(status_code=403, detail=blocked)
-
-    result = workspace_service.write_workspace_file(
-        job_id=job_id,
-        path=path,
-        content=content,
-        commit_message=body.get("commit_message"),
-    )
-    if "error" in result:
-        raise HTTPException(status_code=400, detail=result["error"])
-    return result
+# NOTE: the former GET/PUT /api/jobs/{id}/workspace* routes were removed.
+# They read the orchestrator-local WorkspaceService disk (a dev-era relic
+# with no job dimension — on k8s that PVC only ever holds uploads/), so
+# every read 404'd and any hit was a cross-job leak by construction. Job
+# files are served from Gitea via /api/jobs/{id}/repo/* above. See
+# docs/issues/officer_blind_reads_and_worker_bureaucracy.md §4 P0-B.
 
 
 @app.get("/api/jobs/{job_id}/diff")
@@ -16925,28 +16858,70 @@ async def export_job_to_shared_folder(request: Request, job_id: str) -> dict[str
 
 @app.get("/api/jobs/{job_id}/todos")
 async def get_job_todos(request: Request, job_id: str) -> dict[str, Any]:
-    """Get all todos for a job (current + archives).
+    """Get all todos for a job (current + archives) from its Gitea repo.
+
+    Reads the committed state as of the worker's last phase-boundary push:
+    ``todos.yaml`` at the job branch head plus ``archive/todos_*.md`` phase
+    archives.
+
+    Gracefully degrades — Gitea unavailable or repo/files missing yields the
+    empty shape instead of an error, because the cockpit todo view renders
+    this response directly.
 
     Returns:
         Dict with:
         - job_id: Job UUID
-        - current: Current todos from todos.yaml (if exists)
+        - current: Current todos from todos.yaml (if the worker pushed one)
         - archives: List of archived todo files
-        - has_workspace: Whether workspace directory exists
+        - has_workspace: Whether the job's Gitea repo was reachable
     """
     await require_job_access(request, postgres_db, job_id)
-    return workspace_service.get_all_todos(job_id)
+
+    current: dict[str, Any] | None = None
+    archives: list[dict[str, Any]] = []
+    has_workspace = False
+
+    if gitea_client.is_initialized:
+        repo_name, job_branch = await resolve_job_repo(job_id)
+        root_entries = await gitea_client.list_contents(repo_name, "", ref=job_branch)
+        if root_entries is not None:
+            has_workspace = True
+            content = await gitea_client.get_file_content(
+                repo_name, "todos.yaml", ref=job_branch
+            )
+            if content is not None:
+                current = parse_current_todos(content)
+            archive_entries = await gitea_client.list_contents(
+                repo_name, "archive", ref=job_branch
+            )
+            archives = build_archive_listing(archive_entries)
+
+    return {
+        "job_id": job_id,
+        "current": current,
+        "archives": archives,
+        "has_workspace": has_workspace,
+    }
 
 
 @app.get("/api/jobs/{job_id}/todos/current")
 async def get_current_todos(request: Request, job_id: str) -> dict[str, Any]:
-    """Get current active todos from todos.yaml.
+    """Get current active todos from todos.yaml in the job's Gitea repo.
+
+    Committed state as of the worker's last phase-boundary push.
 
     Returns:
         Dict with todos list and metadata, or 404 if not found
     """
     await require_job_access(request, postgres_db, job_id)
-    result = workspace_service.get_current_todos(job_id)
+    result: dict[str, Any] | None = None
+    if gitea_client.is_initialized:
+        repo_name, job_branch = await resolve_job_repo(job_id)
+        content = await gitea_client.get_file_content(
+            repo_name, "todos.yaml", ref=job_branch
+        )
+        if content is not None:
+            result = parse_current_todos(content)
     if result is None:
         raise HTTPException(
             status_code=404, detail=f"No current todos found for job '{job_id}'"
@@ -16956,20 +16931,29 @@ async def get_current_todos(request: Request, job_id: str) -> dict[str, Any]:
 
 @app.get("/api/jobs/{job_id}/todos/archives")
 async def list_todo_archives(request: Request, job_id: str) -> list[dict[str, Any]]:
-    """List all archived todo files for a job.
+    """List archived todo files from the job repo's ``archive/`` directory.
+
+    Committed state as of the worker's last phase-boundary push. Empty list
+    when Gitea is unavailable or the repo has no archives yet.
 
     Returns:
         List of archive metadata (filename, phase_name, timestamp)
     """
     await require_job_access(request, postgres_db, job_id)
-    return workspace_service.list_archived_todos(job_id)
+    if not gitea_client.is_initialized:
+        return []
+    repo_name, job_branch = await resolve_job_repo(job_id)
+    entries = await gitea_client.list_contents(repo_name, "archive", ref=job_branch)
+    return build_archive_listing(entries)
 
 
 @app.get("/api/jobs/{job_id}/todos/archives/{filename}")
 async def get_archived_todos(
     request: Request, job_id: str, filename: str
 ) -> dict[str, Any]:
-    """Get parsed content of an archived todo file.
+    """Get parsed content of an archived todo file from the job's Gitea repo.
+
+    Committed state as of the worker's last phase-boundary push.
 
     Args:
         job_id: Job UUID
@@ -16979,7 +16963,16 @@ async def get_archived_todos(
         Dict with parsed todos, summary, and metadata
     """
     await require_job_access(request, postgres_db, job_id)
-    result = workspace_service.get_archived_todos(job_id, filename)
+    result: dict[str, Any] | None = None
+    # Security: same filename sanitation the local-disk route enforced
+    safe = not (".." in filename or "/" in filename or "\\" in filename)
+    if safe and gitea_client.is_initialized:
+        repo_name, job_branch = await resolve_job_repo(job_id)
+        content = await gitea_client.get_file_content(
+            repo_name, f"archive/{filename}", ref=job_branch
+        )
+        if content is not None:
+            result = parse_archived_todos(content, filename)
     if result is None:
         raise HTTPException(
             status_code=404, detail=f"Archive '{filename}' not found for job '{job_id}'"
