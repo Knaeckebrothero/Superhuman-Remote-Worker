@@ -209,6 +209,7 @@ async def acquire_reader_env(
     reader_context._snapshot_callback = None
     reader_context._freeze_request = None
     reader_context._recent_reads = deque(maxlen=10)
+    reader_context._pinned_reads = set()
     reader_context._recent_read_versions = {}
 
     reader_names = _reader_tool_names(parent_tool_names, allow_writes=allow_writes)

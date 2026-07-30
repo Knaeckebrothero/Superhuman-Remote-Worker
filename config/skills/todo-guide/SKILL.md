@@ -19,9 +19,10 @@ the `next_phase_todos` gate requires it — it's short.)
 
 ## Short phases, tight focus
 
-Target **3–7 todos per tactical phase**, default **5**. Go lower (3–4) for a
-focused phase like verifying one section; higher (6–7) only for repetitive batch
-work. If you need more than 7, it's two phases.
+Target **2–5 todos per tactical phase**. Go lower (2–3) for a focused phase
+like verifying one section; higher (5–6) only for repetitive batch work. If
+you need more than 6, it's two phases. A correct 2-todo phase beats a padded
+5-todo one.
 
 A phase is **one coherent unit of work** — "research the topic," "write section
 3," "verify chapter 2's citations" — not a whole project stage. Every phase ends
@@ -48,19 +49,21 @@ The test: *"Could I confirm this is done by checking one specific thing?"*
 
 ## Pick the right phase type
 
-Don't jump straight to producing deliverables — match the phase to where you are:
+Scaffold the deliverable file in phase 1 and update it at every phase boundary —
+research fills the scaffold in, it doesn't precede it. Then match each phase to
+where you are:
 
 | Phase type | Typical todos | When to use |
 |---|---|---|
-| Research | 3–5 | New/unfamiliar topic — understand before committing |
-| Elaboration | 3–5 | Turn a rough plan into a concrete, sequenced breakdown |
-| Execution | 5 | Produce one specific section or artifact |
-| Batch processing | 5–7 | Repetitive operation over many similar items |
-| Integration | 5 | Combine separately-produced parts into a coherent whole |
-| Verification | 3–5 | Quality check before declaring done |
+| Research | 2–4 | New/unfamiliar topic — gather what the scaffold needs |
+| Elaboration | 2–4 | Turn a rough plan into a concrete, sequenced breakdown |
+| Execution | 3–5 | Produce one specific section or artifact |
+| Batch processing | 4–6 | Repetitive operation over many similar items |
+| Integration | 3–5 | Combine separately-produced parts into a coherent whole |
+| Verification | 2–4 | Quality check before declaring done |
 {% if has_tool("delegate_work") -%}
 | Delegation | 2–3 | Independent subtasks that benefit from parallel agents |
-{% endif -%}
+{%- endif %}
 
 Two of these defer to dedicated skills — load them when you plan that phase:
 - **Verification** → the `verify-before-done` skill covers *how* to produce
@@ -76,7 +79,7 @@ For example todos for each phase type and a full multi-phase worked example, rea
   separate phases — mixing them makes a phase hard to review.
 - **Every todo advances a deliverable.** Workspace bookkeeping (archiving, status
   updates) happens automatically at phase boundaries — don't spend todos on it.
-- **Research before you write** about an unfamiliar topic — better sources,
-  better output.
+- **Scaffold first, research to fill.** The deliverable file exists from phase
+  1; research an unfamiliar topic before writing its content into the scaffold.
 - **Reconcile at the end.** Before closing a phase, mark each todo done (with a
   note on what it produced) or carry the remainder into the next phase.

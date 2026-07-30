@@ -760,18 +760,19 @@ class TestPredefinedTodos:
         assert any("next_phase_todos" in c.lower() for c in contents)
 
     def test_transition_strategic_todos(self):
-        """Test get_transition_strategic_todos returns correct todos."""
+        """Test get_transition_strategic_todos returns the slim 2-todo cycle."""
         todos = get_transition_strategic_todos()
-        assert len(todos) == 4
+        # De-bureaucratized transition: REVIEW+ADAPT merged, PLAN-OR-COMPLETE
+        # kept, REFLECT folded into a conditional sentence.
+        assert len(todos) == 2
 
         # Check content patterns
         contents = [t.content for t in todos]
         assert any("review" in c.lower() for c in contents)
-        assert any("knowledge" in c.lower() or "kb_" in c.lower() for c in contents)
+        assert any("kb_" in c.lower() for c in contents)
         assert any("plan.md" in c.lower() for c in contents)
-        assert any(
-            "todos.yaml" in c.lower() or "job_complete" in c.lower() for c in contents
-        )
+        assert any("job_complete" in c.lower() for c in contents)
+        assert any("next_phase_todos" in c.lower() for c in contents)
 
 
 class TestTodosYamlValidation:
@@ -970,7 +971,9 @@ class TestHandleTransitionNode:
 
         # TodoManager should have predefined strategic todos
         todos = managers["todo"].list_all()
-        assert len(todos) == 4  # Transition strategic todos
+        assert (
+            len(todos) == 2
+        )  # Transition strategic todos (review+adapt, plan-or-complete)
 
     @pytest.mark.asyncio
     async def test_drain_intent_freezes_with_version_upgrade(
@@ -1149,8 +1152,8 @@ class TestPhaseAlternationCycle:
             "[PHASE_TRANSITION]" in getattr(m, "content", "")
             for m in state.get("messages", [])
         )
-        # Should have transition strategic todos (4 items)
-        assert len(managers["todo"].list_all()) == 4
+        # Should have transition strategic todos (2 items)
+        assert len(managers["todo"].list_all()) == 2
 
     def test_job_completion_detection(self, managers, mock_config):
         """Test that job_complete creates the completion marker file."""

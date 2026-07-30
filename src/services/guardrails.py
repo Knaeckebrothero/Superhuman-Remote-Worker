@@ -49,6 +49,7 @@ KNOWN_NUDGES: Dict[str, Set[str]] = {
         "todo_count",
     },
     "phase_transition_tactical_to_strategic": {"phase_number"},
+    "act_ratio_nudge": {"count"},
     # src/managers/todo.py
     "todo_list_footer": set(),
     # src/services/recall_store.py

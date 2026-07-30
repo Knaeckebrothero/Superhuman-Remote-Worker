@@ -231,6 +231,15 @@ limits:
     max_line_repetitions: 10    # same line repeated in output
   progress_stall_threshold: 30     # tool calls without progress before nudge reminder
   max_tool_calls_per_phase: 500    # max tool calls per phase before rewind (tactical) or freeze (strategic)
+  # Act-ratio tripwire: after N consecutive tool actions that touch ONLY
+  # process artifacts (patterns below), inject a one-line "stop planning"
+  # nudge. Any action on a non-process target resets the counter. 0 disables.
+  act_ratio_nudge_threshold: 6
+  process_artifact_patterns:       # fnmatch, workspace-relative
+    - todos.yaml
+    - plan.md
+    - "archive/*"
+    - "*retrospective*"
   # Per-category audited tool-batch timeout (seconds). The batch timeout is the
   # max of categories in the batch, then clipped by graph-level hard ceilings.
   tool_category_timeouts:
@@ -254,6 +263,13 @@ limits:
     workflows: 120
     loop: 120
     agent_catalog: 120
+
+# Phase alternation bounds — enforced by TodoManager.stage_tactical_todos
+# (next_phase_todos rejects outside this range). Floor of 2: decompose-as-
+# needed beats padded upfront decomposition; a correct 2-todo phase is legal.
+phase_settings:
+  min_todos: 2
+  max_todos: 20
 
 context_management:
   compact_on_archive: true

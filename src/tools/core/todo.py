@@ -85,7 +85,7 @@ def create_todo_tools(context: ToolContext) -> List[Any]:
         - Prepare work items after strategic planning is complete
 
         The tool validates:
-        - Todo count (5-20 items required)
+        - Todo count against the configured bounds (workers: 2-20)
         - Each todo content (minimum 10 characters)
 
         After calling this tool, complete your current strategic todo by

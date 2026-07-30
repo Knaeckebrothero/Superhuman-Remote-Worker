@@ -55,7 +55,10 @@ All other config values are properly parsed and used at runtime:
 - **connections**: `postgres`, `neo4j`
 - **limits**: `context_threshold_tokens`, `message_count_threshold`, `message_count_min_tokens`, `tool_retry_count`, `model_max_context_tokens`, `summarization_safe_limit`, `summarization_chunk_size`
 - **context_management**: `compact_on_archive`, `keep_recent_tool_results`, `keep_recent_messages`, `summarization_template`, `reasoning_level`, `max_summary_length`
-- **phase_settings**: `min_todos`, `max_todos`
+- **phase_settings**: `min_todos`, `max_todos` — active since 2026-07: agent.py
+  passes them into `TodoManager` at construction, where
+  `stage_tactical_todos` enforces them (before that the yaml key dead-ended
+  in an unread parameter and the live gate was TodoManager's default of 5)
 - **research**: `proxy.*` (via extra)
 - **browser**: `headless`, `timeout`, `use_vision` (via extra)
 - **Expert UI**: `icon`, `color`, `tags` (via extra, consumed by orchestrator)

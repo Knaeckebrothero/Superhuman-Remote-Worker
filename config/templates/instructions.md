@@ -183,7 +183,7 @@ For single deliverables:
 
 1. **Start by exploring** - Read source materials and workspace files to understand the full context
 2. **Plan before executing** - Create a clear plan in `plan.md` before diving into work
-3. **Right-size your phases** - 3-7 todos per phase, based on task complexity
+3. **Right-size your phases** - 2-5 todos per phase, based on task complexity
 {% if has_tool("kb_write") -%}
 4. **Document as you go** - Record progress and key decisions using `kb_write`
 {% else -%}
