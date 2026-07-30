@@ -1604,22 +1604,18 @@ class PersistentSession:
         # admits it only when both use_skill and set_canvas actually loaded.
         self._deploy_catalog_skill_files({"present-with-canvas"})
 
-        # Generate tool documentation in workspace (before overrides so full
-        # docstrings are captured — mirrors agent.py._setup_job_tools)
-        try:
-            from ..tools import generate_workspace_tool_docs
+        # Tool docs are virtual (docs/features/virtual_directories.md).
+        from ..core.virtual_dirs import ToolsProvider, sweep_legacy_tools_dir
 
-            tools_dir = self.workspace_manager.get_path("tools")
-
-            def _write_tool_doc(rel_path: str, content: str) -> None:
-                self.workspace_manager.write_file(f"tools/{rel_path}", content)
-
-            loaded_names = [t.name for t in self.tools]
-            generate_workspace_tool_docs(
-                loaded_names, tools_dir, tools=self.tools, write_fn=_write_tool_doc
-            )
-        except Exception as e:
-            logger.warning(f"Failed to generate tool docs: {e}")
+        # Pre-override objects — see the CRITICAL note in the agent.py step:
+        # `self.tools = apply_description_overrides(self.tools)` below rebinds
+        # the attribute to short-description copies.
+        self._full_description_tools = self.tools
+        self.workspace_manager.register_virtual_provider(
+            ToolsProvider(lambda: self._full_description_tools)
+        )
+        if self.workspace_manager.virtual_overlay is not None:
+            sweep_legacy_tools_dir(self.workspace_manager.virtual_overlay.inner)
 
         # Apply description overrides and enforcement
         self.tools = apply_description_overrides(self.tools)
