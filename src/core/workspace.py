@@ -306,7 +306,12 @@ class WorkspaceManager:
         if backend is not None and os.getenv(
             "VIRTUAL_DIRS_ENABLED", "true"
         ).lower() not in ("false", "0", "no"):
-            from .backends.overlay import VirtualOverlayBackend
+            try:
+                from .backends.overlay import VirtualOverlayBackend
+            except ImportError:
+                # Loaded directly (tests use spec_from_file_location to bypass
+                # package __init__ side effects), so there is no parent package.
+                from src.core.backends.overlay import VirtualOverlayBackend
 
             self._virtual_overlay = VirtualOverlayBackend(backend)
             self._backend = self._virtual_overlay
