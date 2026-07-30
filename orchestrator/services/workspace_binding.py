@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
 from typing import Any
 from uuid import UUID
 
@@ -68,6 +69,81 @@ def virtual_thread_backing_id(thread_id: str, spec: dict[str, Any]) -> str:
     return f"rclone:{digest}"
 
 
+class VirtualBackingUnavailable(Exception):
+    """A thread's virtual object-store backing cannot be used right now.
+
+    Carries a machine-readable ``reason`` rather than an HTTP status because
+    callers disagree about how to report the same condition: Canvas answers
+    with its own ``CanvasFileError`` codes, uploads with ``ThreadUploadError``.
+    """
+
+    def __init__(self, reason: str, detail: str):
+        super().__init__(detail)
+        self.reason = reason
+        self.detail = detail
+
+
+def resolve_virtual_thread_backing(
+    thread: dict[str, Any],
+) -> tuple[dict[str, Any], str]:
+    """Resolve a ``virtual`` thread's current durable object-store backing.
+
+    Read-only: this deliberately never binds or rebinds. A thread with no
+    binding is a create-time misconfiguration, and silently minting one here
+    would let an ordinary file write mutate workspace identity.
+
+    Returns:
+        ``(rclone_spec, key_prefix)``. ``key_prefix`` is ``threads/<id>/`` — the
+        same prefix the agent's lite backend is attached with at dispatch
+        (``_inject_lite_workspace_config``), so a write of ``uploads/x`` here is
+        exactly what the agent's ``read_file("uploads/x")`` resolves.
+
+    Raises:
+        VirtualBackingUnavailable: ``not_configured`` (no durable object store
+            on this deployment), ``backing_changed`` (thread unbound or bound to
+            a different backing), or ``transport_missing`` (no ``rclone``).
+    """
+
+    thread_id = str(thread.get("id") or "")
+    spec = virtual_workspace_rclone_spec()
+    if not spec or spec.get("type") == "memory":
+        # "memory" is process-local, so another orchestrator replica could not
+        # read what this one wrote — never a real backing.
+        raise VirtualBackingUnavailable(
+            "not_configured",
+            "Virtual workspace storage is not configured on this deployment",
+        )
+
+    metadata = thread.get("metadata") or {}
+    if isinstance(metadata, str):
+        try:
+            metadata = json.loads(metadata)
+        except (TypeError, ValueError):
+            metadata = {}
+    if not isinstance(metadata, dict):
+        metadata = {}
+
+    binding = metadata.get("_workspace_binding")
+    expected_backing_id = virtual_thread_backing_id(thread_id, spec)
+    if (
+        not isinstance(binding, dict)
+        or binding.get("kind") != "virtual"
+        or binding.get("backing_id") != expected_backing_id
+    ):
+        raise VirtualBackingUnavailable(
+            "backing_changed",
+            "Virtual workspace backing changed and must be rebound",
+        )
+
+    if shutil.which("rclone") is None:
+        raise VirtualBackingUnavailable(
+            "transport_missing",
+            "Virtual workspace transport is unavailable",
+        )
+
+    return spec, f"threads/{thread_id}/"
+
+
 async def ensure_virtual_thread_workspace_binding(
     db: Any, thread_id: str
 ) -> dict[str, Any] | None:
@@ -86,7 +162,9 @@ async def ensure_virtual_thread_workspace_binding(
 
 __all__ = [
     "CANVAS_WORKSPACE_GENERATION_KEY",
+    "VirtualBackingUnavailable",
     "ensure_virtual_thread_workspace_binding",
     "remote_canvas_presentation_available",
+    "resolve_virtual_thread_backing",
     "virtual_thread_backing_id",
 ]

@@ -1,8 +1,18 @@
-"""Upload files into a persistent thread's live workspace via SFTP.
+"""Upload files into a persistent thread's live workspace.
 
-Files land in ``<workspace_path>/uploads/`` on the remote workspace
-container/VM. Filenames are sanitized to prevent path traversal and
-collisions are resolved by appending a counter.
+Files land in ``<workspace>/uploads/``. Which transport gets them there is
+decided by the thread's workspace tier:
+
+- ``sandbox`` / ``vm`` — SFTP into the workspace container or VM (paramiko).
+- ``virtual`` — object-store ``put`` under ``threads/<id>/uploads/``, the same
+  durable namespace the agent's lite backend is attached to at dispatch, so the
+  agent's own ``read_file("uploads/x")`` resolves what we wrote.
+
+``none`` (a disposable agent-local tmpdir) has no orchestrator-reachable
+storage and is refused permanently rather than pretending to be transient.
+
+Filenames are sanitized to prevent path traversal and collisions are resolved by
+appending a counter.
 
 The agent learns about new uploads when the cockpit appends an
 ``Attached files: …`` hint to the next user message — see
@@ -13,11 +23,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import posixpath
 import re
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import PurePosixPath
-from typing import Any, Iterable
+from typing import Any, Iterable, Iterator
 
 try:
     import paramiko
@@ -29,19 +41,31 @@ except ImportError:  # pragma: no cover - import-time guard
     )
 
 from . import resolve_ssh_key_path
+from .workspace_binding import VirtualBackingUnavailable, resolve_virtual_thread_backing
 
 logger = logging.getLogger(__name__)
 
 # Cap individual files at 100MB. The cockpit allows larger uploads for
 # job creation (5GB), but those go into local orchestrator storage. Live
-# workspace pushes flow through SFTP into a container/VM, where huge
-# blobs are rarely useful and tie up the orchestrator process.
+# workspace pushes flow through the orchestrator process into a container/VM or
+# object store, where huge blobs are rarely useful and tie up that process.
 MAX_FILE_SIZE = 100 * 1024 * 1024
 MAX_FILES_PER_REQUEST = 20
 
 DEFAULT_USERNAME = "agent-host"
 DEFAULT_WORKSPACE_PATH = "/home/agent-host/workspace"
 UPLOADS_SUBDIR = "uploads"
+
+# Tiers with no orchestrator-reachable workspace storage at all.
+UNREACHABLE_BACKENDS = frozenset({"none"})
+
+# Bound concurrent object-store uploads: each one holds a full request body in
+# memory and spawns rclone children. Mirrors the ceiling Canvas puts on its own
+# virtual materializations, with a bounded queue wait so a saturated
+# orchestrator fails fast instead of piling up.
+MAX_CONCURRENT_VIRTUAL_UPLOADS = int(os.getenv("THREAD_UPLOAD_MAX_CONCURRENT", "4"))
+VIRTUAL_UPLOAD_QUEUE_TIMEOUT = float(os.getenv("THREAD_UPLOAD_QUEUE_TIMEOUT", "10"))
+_VIRTUAL_UPLOAD_SEMAPHORE = asyncio.Semaphore(max(1, MAX_CONCURRENT_VIRTUAL_UPLOADS))
 
 
 @dataclass
@@ -61,6 +85,14 @@ class _SshTarget:
     username: str
     key_path: str
     workspace_path: str
+
+
+@dataclass
+class _VirtualTarget:
+    """Object-store destination for a ``virtual`` (lite) thread."""
+
+    spec: dict[str, Any]  # rclone {type, config, root}
+    prefix: str  # "threads/<thread_id>/"
 
 
 class ThreadUploadError(Exception):
@@ -86,14 +118,37 @@ def _sanitize_filename(filename: str) -> str:
     return filename or "unnamed"
 
 
-def _resolve_target(thread: dict[str, Any]) -> _SshTarget:
-    """Pick SSH connection details from the thread's metadata.
+def _name_candidates(name: str) -> Iterator[str]:
+    """Yield ``name``, then ``name_1.ext``, ``name_2.ext``, … indefinitely.
 
-    Preference order:
-      1. ``metadata.vm`` (live VM via QEMU/NATS)
-      2. ``metadata.workspace_container.host`` (Docker compose pool)
-      3. ``metadata.workspace_container.pod_ip`` (K8s pod)
+    Shared by both transports so SFTP and object-store uploads resolve
+    collisions to the same names.
     """
+    yield name
+    p = PurePosixPath(name)
+    stem, suffix = p.stem, p.suffix
+    counter = 1
+    while True:
+        yield f"{stem}_{counter}{suffix}"
+        counter += 1
+
+
+def _claim_name(taken: set[str], name: str) -> str:
+    """Pick the first free candidate and reserve it in ``taken``.
+
+    Reserving as we go is what keeps two identically-named files *in one batch*
+    from overwriting each other — the SFTP path gets that for free by stat-ing
+    after each write, a flat key space does not.
+    """
+    for candidate in _name_candidates(name):
+        if candidate not in taken:
+            taken.add(candidate)
+            return candidate
+    raise AssertionError("unreachable: _name_candidates is infinite")
+
+
+def _thread_metadata(thread: dict[str, Any]) -> dict[str, Any]:
+    """Thread ``metadata`` as a dict, tolerating a JSON-string column."""
     metadata = thread.get("metadata") or {}
     if isinstance(metadata, str):
         import json
@@ -102,6 +157,62 @@ def _resolve_target(thread: dict[str, Any]) -> _SshTarget:
             metadata = json.loads(metadata)
         except (ValueError, TypeError):
             metadata = {}
+    return metadata if isinstance(metadata, dict) else {}
+
+
+def _workspace_backend(metadata: dict[str, Any]) -> str | None:
+    """The thread's selected tier from ``config_override.workspace.backend``."""
+    config_override = metadata.get("config_override")
+    if not isinstance(config_override, dict):
+        return None
+    workspace = config_override.get("workspace")
+    if not isinstance(workspace, dict):
+        return None
+    backend = workspace.get("backend")
+    return backend if isinstance(backend, str) else None
+
+
+def resolve_thread_upload_destination(
+    thread: dict[str, Any],
+) -> _SshTarget | _VirtualTarget:
+    """Decide where this thread's uploads go, without moving any bytes.
+
+    Exposed separately so the API layer can reject an impossible upload before
+    materializing request bodies.
+
+    Preference order for SSH tiers:
+      1. ``metadata.vm`` (live VM via QEMU/NATS)
+      2. ``metadata.workspace_container.host`` (Docker compose pool)
+      3. ``metadata.workspace_container.pod_ip`` (K8s pod)
+
+    Raises:
+        ThreadUploadError: With a status and message honest about *why* — a
+            permanent refusal for tiers that can never accept files, an
+            operator-facing 503 for misconfigured storage, and the original
+            transient 409 only where waiting can actually help.
+    """
+    metadata = _thread_metadata(thread)
+    backend = _workspace_backend(metadata)
+
+    if backend in UNREACHABLE_BACKENDS:
+        raise ThreadUploadError(
+            status_code=409,
+            detail=(
+                "This session has no workspace, so files cannot be attached to "
+                "it. Start a session with a workspace to upload files."
+            ),
+        )
+
+    if backend == "virtual":
+        try:
+            spec, prefix = resolve_virtual_thread_backing(thread)
+        except VirtualBackingUnavailable as e:
+            # not_configured / transport_missing are deployment problems the
+            # user cannot retry their way out of; backing_changed needs a
+            # reopened session, not a wait.
+            status = 409 if e.reason == "backing_changed" else 503
+            raise ThreadUploadError(status_code=status, detail=e.detail) from e
+        return _VirtualTarget(spec=spec, prefix=prefix)
 
     vm_ctx = metadata.get("vm") or {}
     ws_ctx = metadata.get("workspace_container") or {}
@@ -120,6 +231,8 @@ def _resolve_target(thread: dict[str, Any]) -> _SshTarget:
         workspace_path = ws_ctx.get("workspace_path") or DEFAULT_WORKSPACE_PATH
 
     if not host:
+        # Genuinely transient now: this branch is only reachable for tiers that
+        # do provision a pod/VM, so waiting is the right advice.
         raise ThreadUploadError(
             status_code=409,
             detail="Workspace is not ready — try again in a moment",
@@ -155,17 +268,12 @@ def _ensure_remote_dir(sftp: Any, path: str) -> None:
 
 def _next_available_name(sftp: Any, directory: str, name: str) -> str:
     """Return ``name`` if free, else ``name_1.ext``, ``name_2.ext`` …"""
-    p = PurePosixPath(name)
-    stem, suffix = p.stem, p.suffix
-    candidate = name
-    counter = 1
-    while True:
+    for candidate in _name_candidates(name):
         try:
             sftp.stat(posixpath.join(directory, candidate))
         except FileNotFoundError:
             return candidate
-        candidate = f"{stem}_{counter}{suffix}"
-        counter += 1
+    raise AssertionError("unreachable: _name_candidates is infinite")
 
 
 def _sftp_write_files(
@@ -242,19 +350,108 @@ def _sftp_write_files(
         client.close()
 
 
+def _virtual_write_files(
+    target: _VirtualTarget,
+    payloads: list[tuple[str, bytes, str]],
+    *,
+    store: Any | None = None,
+) -> list[UploadedFile]:
+    """Synchronous helper that writes all files into the thread's object store.
+
+    One store for the whole batch, and **one** listing to seed collision
+    resolution — probing per file would cost an rclone subprocess per probe.
+
+    No directory marker is written: ``VirtualWorkspaceBackend.is_dir`` derives
+    directories from key prefixes, so the first object makes ``uploads/`` exist
+    for the agent's ``list_dir``/``walk``.
+
+    Args:
+        store: Injected object store, for tests. Built from ``target.spec`` and
+            closed here when not supplied.
+    """
+    owned = store is None
+    if store is None:
+        from src.core.backends.rclone import RcloneObjectStore
+
+        store = RcloneObjectStore(
+            remote_type=str(target.spec["type"]),
+            config=target.spec.get("config") or {},
+            root=str(target.spec.get("root") or ""),
+        )
+
+    uploads_prefix = f"{target.prefix}{UPLOADS_SUBDIR}/"
+    try:
+        taken: set[str] = set()
+        for info in store.list(uploads_prefix):
+            remainder = info.key[len(uploads_prefix) :]
+            if remainder and "/" not in remainder:
+                taken.add(remainder)
+
+        results: list[UploadedFile] = []
+        for filename, data, mime_type in payloads:
+            final_name = _claim_name(taken, _sanitize_filename(filename))
+            store.put(f"{uploads_prefix}{final_name}", data)
+            results.append(
+                UploadedFile(
+                    name=final_name,
+                    size=len(data),
+                    mime_type=mime_type or "application/octet-stream",
+                    path=posixpath.join(UPLOADS_SUBDIR, final_name),
+                )
+            )
+            logger.info(
+                "Uploaded %s (%d bytes) to %s%s",
+                final_name,
+                len(data),
+                uploads_prefix,
+                final_name,
+            )
+        return results
+    finally:
+        if owned:
+            store.close()
+
+
+@asynccontextmanager
+async def _virtual_upload_slot():
+    """Acquire an object-store upload slot with a bounded queue wait."""
+    acquired = False
+    try:
+        try:
+            await asyncio.wait_for(
+                _VIRTUAL_UPLOAD_SEMAPHORE.acquire(),
+                timeout=max(0.1, VIRTUAL_UPLOAD_QUEUE_TIMEOUT),
+            )
+            acquired = True
+        except (TimeoutError, asyncio.TimeoutError) as e:
+            raise ThreadUploadError(
+                status_code=503,
+                detail="Upload capacity is currently exhausted — try again shortly",
+            ) from e
+        yield
+    finally:
+        if acquired:
+            _VIRTUAL_UPLOAD_SEMAPHORE.release()
+
+
 async def upload_files_to_thread_workspace(
     thread: dict[str, Any],
     files: Iterable[tuple[str, bytes, str]],
+    *,
+    destination: _SshTarget | _VirtualTarget | None = None,
 ) -> list[UploadedFile]:
     """Push files into the thread workspace's ``uploads/`` directory.
 
     Args:
         thread: Thread row (must contain ``metadata`` JSONB column).
         files: Iterable of ``(filename, content_bytes, mime_type)`` tuples.
+        destination: Pre-resolved destination from
+            ``resolve_thread_upload_destination``. Resolved here when omitted.
 
     Raises:
-        ThreadUploadError: When the workspace is not reachable, the SSH
-            key is missing, or per-file/total limits are exceeded.
+        ThreadUploadError: When the workspace is not reachable, the tier cannot
+            accept files, the SSH key is missing, or per-file/total limits are
+            exceeded.
 
     Returns:
         Metadata for each successfully uploaded file.
@@ -274,5 +471,10 @@ async def upload_files_to_thread_workspace(
                 detail=f"File '{name}' exceeds {MAX_FILE_SIZE // (1024 * 1024)}MB",
             )
 
-    target = _resolve_target(thread)
-    return await asyncio.to_thread(_sftp_write_files, target, payloads)
+    if destination is None:
+        destination = resolve_thread_upload_destination(thread)
+
+    if isinstance(destination, _VirtualTarget):
+        async with _virtual_upload_slot():
+            return await asyncio.to_thread(_virtual_write_files, destination, payloads)
+    return await asyncio.to_thread(_sftp_write_files, destination, payloads)
