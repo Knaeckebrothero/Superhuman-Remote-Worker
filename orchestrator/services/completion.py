@@ -742,6 +742,16 @@ LLM_OUTAGE_JITTER = (os.getenv("LLM_OUTAGE_JITTER") or "full").strip().lower() o
 # Incident: 2026-07-29 job d251e513 burned 13 attempts on an identical
 # `503 auth_unavailable` that failed on attempt 1 of every single re-dispatch.
 LLM_OUTAGE_REPEAT_CEILING = _env_int("LLM_OUTAGE_REPEAT_CEILING", 4)
+# >>> TEMPORARY QUICKFIX (2026-07-30) — docs/issues/codex_stream_disconnect_shape_nudge.md
+# Spend one extra backoff cycle on a request-SHAPE change before the repeat
+# give-up fires. Exists only because OpenAI's `stream disconnected before
+# completion` (openai/codex#9995, still OPEN) is deterministic per payload: the
+# identical request keeps failing, a slightly different one usually does not.
+# DELETE this flag and its two call sites once that upstream bug is fixed —
+# set LLM_OUTAGE_SHAPE_NUDGE=0 to disable without a deploy.
+LLM_OUTAGE_SHAPE_NUDGE = (
+    os.getenv("LLM_OUTAGE_SHAPE_NUDGE") or "1"
+).strip().lower() not in ("0", "false", "no", "off")
 
 
 def _parse_context(job: dict[str, Any]) -> dict[str, Any]:
@@ -842,6 +852,39 @@ def llm_outage_repeat_key(fd: dict[str, Any]) -> str | None:
     if "429" in low or "rate limit" in low or "too many requests" in low:
         return None
     return _normalize_llm_error(low)
+
+
+def llm_outage_nudge_state(
+    prior: dict[str, Any], repeats: int, nudge_at_repeats: int | None
+) -> tuple[bool, bool]:
+    """One-shot arming for the request-shape nudge → ``(pending, attempted)``.
+
+    >>> TEMPORARY QUICKFIX — docs/issues/codex_stream_disconnect_shape_nudge.md
+
+    Pure so it can be tested without a database;
+    :meth:`PostgresDB.increment_job_llm_outage_attempt` is its only caller and
+    persists both flags into ``context.llm_outage``.
+
+    The latch is the whole safety property. ``attempted`` must stay True for the
+    rest of a streak so the NEXT identical failure falls through to the real
+    give-up — otherwise every cycle re-arms and the job nudges forever, which is
+    the exact grinding this was built to stop. It must also reset when the streak
+    does (``repeats == 1``), so an unrelated future outage gets its own nudge.
+
+    Args:
+        prior: the ``llm_outage`` object as it was BEFORE this pause.
+        repeats: consecutive-identical count INCLUDING this pause (1 = fresh).
+        nudge_at_repeats: arm at this count; None disables the quickfix.
+
+    Returns:
+        ``(pending, attempted)`` — ``pending`` is consumed by the agent on the
+        next resume; ``attempted`` persists for the life of the streak.
+    """
+    streak_continues = repeats > 1
+    attempted = bool(streak_continues and prior.get("shape_nudge_attempted"))
+    if nudge_at_repeats is not None and repeats >= nudge_at_repeats and not attempted:
+        return True, True
+    return False, attempted
 
 
 def evaluate_llm_outage(ctx: dict[str, Any], now: datetime) -> dict[str, Any]:
@@ -1231,6 +1274,20 @@ def determine_job_status(
         if rk is not None and prior.get("repeat_key") == rk:
             repeats = int(prior.get("repeats", 0) or 0) + 1
             if repeats >= LLM_OUTAGE_REPEAT_CEILING:
+                # >>> TEMPORARY QUICKFIX — remove when the upstream 408 is fixed.
+                # docs/issues/codex_stream_disconnect_shape_nudge.md
+                # Spend ONE more cycle on a request-shape change before giving
+                # up. A byte-identical replay of a payload upstream has already
+                # rejected N times cannot succeed, but appending a short turn
+                # changes the payload and usually can — that is precisely what a
+                # human does in Codex CLI when its 5 stream retries run out
+                # ("type retry and it usually works again", openai/codex#10378).
+                # We are autonomous, so nobody types it; this does.
+                # The increment (postgres.increment_job_llm_outage_attempt) sets
+                # pending_shape_nudge, the agent injects the turn on resume, and
+                # shape_nudge_attempted makes it strictly one-shot per streak.
+                if LLM_OUTAGE_SHAPE_NUDGE and not prior.get("shape_nudge_attempted"):
+                    return ("paused", None)
                 summary = (
                     fd.get("initial_error_summary")
                     or fd.get("error_summary")
@@ -1246,7 +1303,12 @@ def determine_job_status(
                     f"{LLM_OUTAGE_CEILING_SECONDS / 3600:.0f}h ceiling. First "
                     f"error of the last attempt: {str(summary)[:200]}. Resume "
                     "with feedback (compacts context) or check the model "
-                    "endpoint/provider (Admin → Models).",
+                    "endpoint/provider (Admin → Models)."
+                    + (
+                        " A request-shape nudge was already tried and did not clear it."
+                        if prior.get("shape_nudge_attempted")
+                        else ""
+                    ),
                 )
         return ("paused", None)
     if is_loop_job:

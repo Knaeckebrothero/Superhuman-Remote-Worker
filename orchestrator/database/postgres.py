@@ -2099,6 +2099,7 @@ class PostgresDB:
         reset_window_seconds: int,
         fingerprint: Optional[str] = None,
         repeat_key: Optional[str] = None,
+        nudge_at_repeats: Optional[int] = None,
     ) -> Dict[str, Any]:
         """Atomically advance ``context.llm_outage`` for an ``llm_unavailable`` pause.
 
@@ -2191,6 +2192,28 @@ class PostgresDB:
                         else 1
                     )
 
+                # >>> TEMPORARY QUICKFIX — docs/issues/codex_stream_disconnect_shape_nudge.md
+                # One request-shape nudge per streak. Logic lives in
+                # services.completion.llm_outage_nudge_state so it is unit-
+                # testable without a database (the latch it implements is what
+                # stops the job nudging forever).
+                # Both import forms: the orchestrator runs with its own dir on
+                # sys.path (`services.…`, as main.py does), while tests and
+                # tooling import the package absolutely. Nothing else under
+                # database/ imports from services/, so don't assume either
+                # works — this path only executes mid-outage, which is the
+                # worst possible place to discover an ImportError.
+                try:
+                    from services.completion import llm_outage_nudge_state
+                except ImportError:  # pragma: no cover - import-path shim
+                    from orchestrator.services.completion import (
+                        llm_outage_nudge_state,
+                    )
+
+                pending_nudge, nudge_attempted = llm_outage_nudge_state(
+                    outage, repeats, nudge_at_repeats
+                )
+
                 new_outage = {
                     "attempt": attempt,
                     "first_failed_at": first_dt.isoformat(),
@@ -2202,6 +2225,9 @@ class PostgresDB:
                     "fingerprint": fingerprint,
                     "repeat_key": repeat_key,
                     "repeats": repeats,
+                    # TEMPORARY QUICKFIX flags — see the block above.
+                    "pending_shape_nudge": pending_nudge,
+                    "shape_nudge_attempted": nudge_attempted,
                 }
                 await conn.execute(
                     """
@@ -2221,6 +2247,7 @@ class PostgresDB:
             "first_failed_at": new_outage["first_failed_at"],
             "reset": reset,
             "repeats": repeats,
+            "pending_shape_nudge": pending_nudge,
         }
 
     async def merge_vm_context(self, job_id: str, vm_updates: Dict[str, Any]) -> bool:
