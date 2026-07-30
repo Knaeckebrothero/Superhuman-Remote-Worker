@@ -1,4 +1,4 @@
-import {ChangeDetectionStrategy, Component, OnInit, computed, input, output, signal} from '@angular/core';
+import {ChangeDetectionStrategy, Component, computed, input, linkedSignal, output} from '@angular/core';
 import {FormsModule} from '@angular/forms';
 import {TranslocoPipe} from '@jsverse/transloco';
 
@@ -12,6 +12,32 @@ export interface ContactFormResult {
   projectIds: string[];
 }
 
+// Pure seed functions, one per linkedSignal below. Exported (rather than
+// inlined as lambdas) so contact-form.component.spec.ts can verify the
+// re-seed-on-target-change contract by driving these with a plain signal()
+// standing in for `contact()`: this Angular/vitest setup doesn't run
+// components through ngtsc, so signal `input()` fields carry no compiled
+// metadata under TestBed (`ɵcmp.inputs` is empty; both template binding and
+// componentRef.setInput() reject 'contact'/'projects' as unrecognized —
+// confirmed empirically, see the spec file) — there's currently no way to
+// drive an input()'s value from a test in this repo. signal()/linkedSignal()
+// carry no such requirement, so testing the derivation through them exactly
+// mirrors what the linkedSignals below do with `this.contact()`.
+export function seedName(contact: Contact | null): string {
+  return contact?.display_name ?? '';
+}
+export function seedNotes(contact: Contact | null): string {
+  return contact?.notes ?? '';
+}
+export function seedRows(contact: Contact | null):
+    {id?: string; channel: string; address: string; is_primary: boolean}[] {
+  return (contact?.addresses ?? []).map(a => (
+    {id: a.id, channel: a.channel, address: a.address, is_primary: a.is_primary}));
+}
+export function seedProjectIds(contact: Contact | null): Set<string> {
+  return new Set((contact?.projects ?? []).map(p => p.id));
+}
+
 @Component({
   selector: 'app-contact-form',
   standalone: true,
@@ -20,8 +46,8 @@ export interface ContactFormResult {
   template: `
     <div class="form-panel">
       <h3>{{ (contact() ? 'contacts.form.editTitle' : 'contacts.form.newTitle') | transloco }}</h3>
-      <input [(ngModel)]="name" [placeholder]="'contacts.form.name' | transloco" />
-      <textarea [(ngModel)]="notes" rows="3"
+      <input [ngModel]="name()" (ngModelChange)="name.set($event)" [placeholder]="'contacts.form.name' | transloco" />
+      <textarea [ngModel]="notes()" (ngModelChange)="notes.set($event)" rows="3"
         [placeholder]="'contacts.form.notes' | transloco"></textarea>
       <div class="label">{{ 'contacts.form.addresses' | transloco }}</div>
       @for (row of rows(); track $index; let i = $index) {
@@ -60,29 +86,28 @@ export interface ContactFormResult {
     .actions { display: flex; justify-content: flex-end; gap: .5rem; }
   `],
 })
-export class ContactFormComponent implements OnInit {
+export class ContactFormComponent {
   readonly contact = input<Contact | null>(null);
   readonly projects = input<ContactProjectRef[]>([]);
   readonly saved = output<ContactFormResult>();
   readonly cancelled = output<void>();
 
-  name = '';
-  notes = '';
-  readonly rows = signal<{id?: string; channel: string; address: string; is_primary: boolean}[]>([]);
-  readonly selectedProjects = signal<Set<string>>(new Set());
+  /**
+   * Local editable state derives from `contact()` via linkedSignal: it seeds
+   * on first read AND re-seeds whenever `contact()` changes identity (a new
+   * edit target, or edit->new), while staying freely writable for
+   * in-progress edits in between. This replaces a one-shot `ngOnInit` seed,
+   * which went stale when the page swapped edit targets without destroying
+   * this component instance (`@if (showForm())` in contacts-page doesn't
+   * re-toggle just because `editing()` changes) — the stale local state was
+   * then saved over whichever contact was actually open, corrupting it.
+   */
+  readonly name = linkedSignal(() => seedName(this.contact()));
+  readonly notes = linkedSignal(() => seedNotes(this.contact()));
+  readonly rows = linkedSignal(() => seedRows(this.contact()));
+  readonly selectedProjects = linkedSignal(() => seedProjectIds(this.contact()));
   readonly valid = computed(() =>
-    this.name.trim().length > 0 || (this.contact()?.display_name ?? '').length > 0);
-
-  ngOnInit(): void {
-    const c = this.contact();
-    if (c) {
-      this.name = c.display_name;
-      this.notes = c.notes ?? '';
-      this.rows.set(c.addresses.map(a => ({
-        id: a.id, channel: a.channel, address: a.address, is_primary: a.is_primary})));
-      this.selectedProjects.set(new Set(c.projects.map(p => p.id)));
-    }
-  }
+    this.name().trim().length > 0 || (this.contact()?.display_name ?? '').length > 0);
 
   addRow(): void {
     this.rows.update(r => [...r, {channel: 'email', address: '', is_primary: false}]);
@@ -100,8 +125,8 @@ export class ContactFormComponent implements OnInit {
   }
   submit(): void {
     this.saved.emit({
-      display_name: this.name.trim(),
-      notes: this.notes.trim(),
+      display_name: this.name().trim(),
+      notes: this.notes().trim(),
       addresses: this.rows().filter(r => r.address.trim()),
       projectIds: [...this.selectedProjects()],
     });

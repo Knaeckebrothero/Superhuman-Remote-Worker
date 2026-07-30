@@ -2017,7 +2017,8 @@
              "notes": "Notizen (für Agenten sichtbar — Briefings, Präferenzen, Kontext)",
              "addresses": "Adressen", "addAddress": "+ Adresse hinzufügen", "projects": "Projekte"},
     "delete": {"title": "Kontakt löschen",
-               "message": "Der Kontakt wird aus diesen Projekten entfernt: {{projects}}. Agenten können diese Person danach nicht mehr erreichen."}
+               "message": "Der Kontakt wird aus diesen Projekten entfernt: {{projects}}. Agenten können diese Person danach nicht mehr erreichen."},
+    "saveError": "Speichern fehlgeschlagen. Einige Änderungen wurden möglicherweise nicht übernommen — Kontakt prüfen und erneut versuchen."
   },
   "inbox": {
     "title": "Aktionszentrum",

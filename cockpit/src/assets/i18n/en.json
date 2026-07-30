@@ -2017,7 +2017,8 @@
              "notes": "Notes (visible to agents — briefings, preferences, context)",
              "addresses": "Addresses", "addAddress": "+ Add address", "projects": "Projects"},
     "delete": {"title": "Delete contact",
-               "message": "This removes the contact from these projects: {{projects}}. Agents will no longer be able to message them."}
+               "message": "This removes the contact from these projects: {{projects}}. Agents will no longer be able to message them."},
+    "saveError": "Save failed. Some changes may not have been applied — check the contact and retry."
   },
   "inbox": {
     "title": "Action Center",
