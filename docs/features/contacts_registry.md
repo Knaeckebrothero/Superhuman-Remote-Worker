@@ -27,7 +27,9 @@ related:
 
 **Implemented on `develop` 2026-07-30 (unpushed), except the agent surface:** migration `0076_contacts_normalize.sql` (renumbered twice under concurrent work: the spec said 0072, it shipped as 0075, then moved to 0076 when another session's `0075_project_loop_officer_scheduling.sql` landed and was already applied on dev — `migrate.py` hard-fails the whole runner on duplicate prefixes), DB layer, `orchestrator/routers/contacts.py`, the `send_agent_message` rewire + legacy retirement, and the Cockpit `/contacts` page all landed and passed review. The **agent surface is not implemented** — a materialized-files version shipped and was reverted the same day (`revert(agent): drop contacts materialization…`) when this section was re-based onto [[virtual_directories]]; it now waits on the ContactsProvider. `src/core/contact_files.py` is retained, dormant, as that provider's renderer.
 
-**Live gate NOT run.** The local k3d gate (plan Task 9) never executed — cluster unavailable. The backfill has therefore never run against real data, and `resolve_contact`'s four `send_agent_message` branches, `get_project_contacts`, and the Cockpit page are verified by unit/mock tests only. Run it before any dev deploy.
+**Live gate NOT run.** The local k3d gate (plan Task 9) never executed — k3d is unusable on the dev machine, so **the dev cluster is the gate**. `resolve_contact`'s four `send_agent_message` branches, `get_project_contacts`, and the Cockpit page are verified by unit/mock tests only.
+
+Backfill risk is lower than it looks: dev's `external_contacts` table holds **0 rows** (checked 2026-07-30 against `srw-postgres-0`), so on dev the backfill is a no-op and the DDL is what's really being exercised. Prod is unmeasured — count rows and check owner resolvability (`added_by`, else a `role='owner'` project member) *before* the prod cut, or unresolvable rows are silently skipped with only a `RAISE WARNING`.
 **Filed:** 2026-07-29
 
 ## Motivation
@@ -56,7 +58,7 @@ Driving use case: stakeholder interviews — register a client's executives once
 
 ## Data model
 
-Migration `0072_contacts_normalize.sql` (number = next free at implementation time; uncommitted branches may claim 0072 first):
+Migration — **shipped as `0076_contacts_normalize.sql`** (specced as 0072; see §Status for the renumber history and the duplicate-prefix hazard):
 
 ```sql
 contacts (
