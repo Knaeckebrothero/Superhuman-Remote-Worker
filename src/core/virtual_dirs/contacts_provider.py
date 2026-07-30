@@ -53,9 +53,13 @@ class ContactsProvider:
         )
         if fresh:
             return self._cache
+        # Stamp BEFORE the attempt so failures are throttled to the same TTL
+        # cadence as successes. Stamping only on success means that during an
+        # orchestrator outage every single read re-attempts the fetch and pays
+        # the full client timeout before falling back to stale content.
+        self._fetched_at = time.monotonic()
         try:
             self._cache = self._render(self._fetch() or [])
-            self._fetched_at = time.monotonic()
         except Exception as e:
             if self._cache is not None:
                 logger.warning("contacts fetch failed; serving stale cache: %s", e)
