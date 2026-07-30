@@ -119,6 +119,14 @@ class VirtualOverlayBackend:
             logger.warning("virtual read failed for %s: %s", path, e)
             raise VirtualPathError(f"{path} is temporarily unavailable: {e}") from e
 
+    def _write(self, provider: Any, name: str, content: str, path: str) -> None:
+        """Mirror of ``_read``: a provider write must never crash the loop."""
+        try:
+            provider.write(name, content)
+        except Exception as e:
+            logger.warning("virtual write failed for %s: %s", path, e)
+            raise VirtualPathError(f"{path} could not be written: {e}") from e
+
     # --- read path --------------------------------------------------------
 
     def read_file(self, path: str, binary: bool = False) -> Any:
@@ -260,7 +268,7 @@ class VirtualOverlayBackend:
         provider, name = m
         if not provider.writable or not name:
             self._deny(path, provider, "written to")
-        provider.write(name, content)
+        self._write(provider, name, content, path)
 
     def append_file(self, path: str, content: str) -> None:
         m = self._match(path)
@@ -270,7 +278,7 @@ class VirtualOverlayBackend:
         if not provider.writable or not name:
             self._deny(path, provider, "appended to")
         existing = self._read(provider, name, path) or ""
-        provider.write(name, existing + content)
+        self._write(provider, name, existing + content, path)
 
     def mkdir(self, path: str) -> None:
         m = self._match(path)
