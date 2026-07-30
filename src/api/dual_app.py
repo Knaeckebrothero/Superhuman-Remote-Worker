@@ -150,9 +150,11 @@ def _get_current_job_id() -> Optional[str]:
 # response carries ``intents.should_drain=true``. Idle workers exit
 # immediately; busy workers expose the flag to the graph so it can
 # freeze with ``freeze_data.type="version_upgrade"`` at the next phase
-# boundary (Continue-as-New).
+# boundary (Continue-as-New); attached sessions defer until the loop
+# parks, then drain-suspend (delegated to persistent_app).
 _drain_intent_received: bool = False
 _drain_intent_handled: bool = False
+_drain_deferred_logged: bool = False
 
 
 def is_drain_requested() -> bool:
@@ -305,9 +307,13 @@ async def _handle_heartbeat_intents(response: Dict[str, Any]) -> None:
     guidance inbox update, then drain intents. Idle workers (``ready``
     status, no job) exit immediately to free the slot for a fresh-version
     pod. Busy workers just record the intent — the graph reacts at its
-    next safe boundary.
+    next safe boundary. Attached sessions get persistent_app's semantics
+    (defer while a turn is in flight, clean drain-suspend once parked) —
+    a session never reaches a phase boundary, so before that branch the
+    intent dead-lettered and stale adopted-session pods survived every
+    deploy (docs/issues/dual_app_persistent_app_redundancy.md).
     """
-    global _drain_intent_received, _drain_intent_handled
+    global _drain_intent_received, _drain_intent_handled, _drain_deferred_logged
     _check_job_preempted(response)
     _update_guidance_inbox(response)
     intents = response.get("intents") or {}
@@ -332,6 +338,33 @@ async def _handle_heartbeat_intents(response: Dict[str, Any]) -> None:
         except Exception:
             pass
         os._exit(0)
+    elif _pod_state == PodState.SESSION:
+        # Dual pods host adopted sessions on persistent_app's module state
+        # (/session/attach seeds pa.* and calls pa._attach_session), so the
+        # drain semantics are delegated, not re-implemented.
+        import src.api.persistent_app as pa
+
+        if pa._session is None or not pa._session_parked():
+            # No live session object yet (/session/attach flips the pod
+            # state before the backgrounded setup creates pa._session) or a
+            # turn is in flight — never tear down out-of-band. Left
+            # unhandled so every heartbeat re-checks until the loop parks;
+            # if the session instead detaches, the IDLE branch exits the
+            # stale pod rather than returning it to the pool.
+            if not _drain_deferred_logged:
+                logger.info(
+                    "Drain intent received (reason=%s) — session attached, "
+                    "deferring until the loop parks",
+                    intents.get("drain_reason", "unspecified"),
+                )
+                _drain_deferred_logged = True
+            return
+        _drain_intent_handled = True
+        logger.info(
+            "Drain intent received (reason=%s) — suspending session and exiting",
+            intents.get("drain_reason", "unspecified"),
+        )
+        await pa._drain_suspend_session()
     elif not _drain_intent_handled:
         # Busy — log once. The graph picks this up via is_drain_requested().
         _drain_intent_handled = True
