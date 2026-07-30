@@ -230,7 +230,15 @@ codexProxy:
   # resolve through the proxy. Verify after rollout: (1) codex auth survives
   # >13 calls (no 401 storm), (2) no raw `<|tool_call>` leak in chat content,
   # (3) a gpt-5.6-sol completion succeeds. Revert this line if 401s return.
-  image: docker.io/eceasy/cli-proxy-api:v7.2.61
+  #
+  # 2026-07-30 -> v7.2.110: v7.2.61 (built 07-10) predates CLIProxyAPI#3055's
+  # fix (09da52ad, 07-15), which stops a request-scoped 408 stream disconnect
+  # from being charged to the CREDENTIAL — the cascade behind every
+  # `503 auth_unavailable` freeze on this cluster (jobs d251e513, eb0143f8).
+  # Verify after rollout: a 408 in the proxy log is NO LONGER followed by a run
+  # of 503s (`/v0/management/auth-files` should stay status=active), and job
+  # freezes stop carrying `auth_unavailable`. Note this jumps 49 releases.
+  image: docker.io/eceasy/cli-proxy-api:v7.2.110
 # -----------------------------------------------------------------------------
 # Gitea metadata DB — migrating SQLite -> Postgres (2026-07-30).
 #
