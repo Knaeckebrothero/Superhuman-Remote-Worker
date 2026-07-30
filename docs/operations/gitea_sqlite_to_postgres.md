@@ -1,9 +1,11 @@
 # Migrating the bundled Gitea from SQLite to PostgreSQL
 
-> **Status:** Validated 2026-07-30 against a byte-copy of the k3d dev instance
-> (5 users / 131 repos). The chart mechanics, the preflight guard, and the
-> data-only pgloader procedure below were all exercised end-to-end in an
-> isolated namespace. No production instance has been migrated yet.
+> **Status:** **Executed successfully on the local k3d cluster 2026-07-30**
+> (5 users / 131 repos / 1 Keycloak login source, all preserved). Every step
+> below is the version that actually ran, including the guard firing on the
+> live instance and the post-migration smoke tests. Previously rehearsed
+> against a byte-copy in an isolated namespace. **The dev/homelab cluster has
+> not been migrated yet** — it remains pinned to `sqlite3`.
 >
 > **Applies to:** any deployment whose Gitea predates the 2026-07-30 chart
 > default flip (`gitea.database.type: postgres`) and is therefore pinned to
@@ -70,7 +72,37 @@ take a volume snapshot of the Gitea PVC if your storage class supports it.
 
 Remove the `gitea.database.type: sqlite3` pin from your values overlay
 (`deployment/values-experimental.yaml`, `deployment/values-local.yaml`, …) so
-the chart default applies, and deploy.
+the chart default applies, add a `databases.gitea.storageSize` matching your
+storage class's constraints, and deploy.
+
+> **Under Tilt (local k3d), the values edit does NOT auto-deploy.** The
+> Tiltfile's `k8s_custom_deploy` sets `deps=[]` — only image rebuilds drive the
+> loop — and `tilt trigger srw` runs `helm uninstall` first, which you do not
+> want mid-migration. Apply by invoking Tilt's own script with the image tags
+> the release is already running, so a bare `helm upgrade` cannot revert them
+> to the stale `ghcr` defaults (see
+> `reference_tilt_helm_upgrade_reverts_image`):
+>
+> ```bash
+> IMGFLAGS=$(helm -n srw get values srw | python3 -c "
+> import yaml,sys; v=yaml.safe_load(sys.stdin); out=[]
+> for k,s in v.get('image',{}).items():
+>     if isinstance(s,dict):
+>         if s.get('repository'): out.append(f'--set image.{k}.repository={s[\"repository\"]}')
+>         if s.get('tag'): out.append(f'--set image.{k}.tag={s[\"tag\"]}')
+> print(' '.join(out))")
+> RELEASE_NAME=srw CHART=./helm NAMESPACE=srw scripts/tilt-helm-apply.sh \
+>   --take-ownership --values=deployment/values-local.yaml \
+>   --values=deployment/values-tilt.yaml $IMGFLAGS
+> ```
+>
+> Confirm with a `--dry-run` first that every `image:` line still carries a
+> `tilt-*` tag.
+
+> **Expect a stack-wide pod bounce.** Adding `GITEA_DB_PASSWORD` to the Secret
+> makes Stakater Reloader restart everything annotated
+> `reloader.stakater.com/auto` (orchestrator, Keycloak, MCP, …). Harmless, but
+> it churns for a few minutes — let it settle before smoke-testing.
 
 Expected, and **not** a failure: `srw-giteadb` comes up healthy while
 `srw-gitea` sits in `Init:CrashLoopBackOff` with the guard's refusal message.
@@ -82,11 +114,39 @@ reverting the pin at this point restores service immediately.
 The guard blocks on *SQLite file present + empty Postgres*, so briefly remove
 the first condition:
 
+Scale Gitea to zero so the RWO volume is free, then park the file with a
+throwaway pod that mounts the same PVC (this is what was actually run — it
+avoids trying to `exec` into a pod stuck in `Init:Error`):
+
 ```bash
 kubectl --context=$CTX -n $NS scale statefulset/srw-gitea --replicas=0
-# Park the SQLite file out of the way (do NOT delete it — it is the rollback).
-kubectl --context=$CTX -n $NS debug -it srw-gitea-0 --image=busybox:1.36 \
-  --target=gitea -- sh -c 'mv /var/lib/gitea/data/gitea.db /var/lib/gitea/data/gitea.db.migrating'
+# wait for the pod to be gone, then:
+cat << 'EOF' | kubectl --context=$CTX -n $NS apply -f -
+apiVersion: v1
+kind: Pod
+metadata:
+  name: gitea-dbpark
+spec:
+  restartPolicy: Never
+  containers:
+    - name: shell
+      image: busybox:1.36
+      command: ["sleep", "600"]
+      volumeMounts:
+        - {name: data, mountPath: /var/lib/gitea}
+  volumes:
+    - name: data
+      persistentVolumeClaim: {claimName: srw-gitea-data}
+EOF
+
+# Park the SQLite file AND its WAL sidecars (do NOT delete — this is the rollback).
+kubectl --context=$CTX -n $NS exec gitea-dbpark -- sh -c '
+  mv /var/lib/gitea/data/gitea.db /var/lib/gitea/data/gitea.db.migrating
+  for s in wal shm; do
+    [ -f /var/lib/gitea/data/gitea.db-$s ] && \
+      mv /var/lib/gitea/data/gitea.db-$s /var/lib/gitea/data/gitea.db.migrating-$s
+  done'
+kubectl --context=$CTX -n $NS delete pod gitea-dbpark
 kubectl --context=$CTX -n $NS scale statefulset/srw-gitea --replicas=1
 ```
 
@@ -99,9 +159,11 @@ kubectl --context=$CTX -n $NS exec srw-giteadb-0 -- \
 # expect ~110 on Gitea 1.22
 ```
 
-> If the PVC is ReadWriteOnce and `kubectl debug` is unavailable, do the rename
-> from inside the Gitea container instead (`kubectl exec ... -c gitea -- mv …`)
-> while it is running on the SQLite backend, before step 1.
+> The DB password lives in the chart Secret under `GITEA_DB_PASSWORD`. Note the
+> Secret's name is the release name (`srw` on k3d), not `srw-secrets`:
+> `kubectl -n $NS get secret srw -o jsonpath='{.data.GITEA_DB_PASSWORD}' | base64 -d`.
+> An empty password makes pgloader fail with a cryptic
+> `The value NIL is not of type STRING when binding STRING`.
 
 ### 3. Load the data
 
@@ -173,14 +235,33 @@ kubectl --context=$CTX -n $NS exec deploy/srw-orchestrator -c orchestrator -- sh
 kubectl --context=$CTX -n $NS exec srw-gitea-0 -c gitea -- gitea admin user list
 ```
 
-Then exercise the paths that actually matter for SRW:
+Then exercise the paths that actually matter for SRW. All four were run on k3d
+after the 2026-07-30 migration and passed:
 
-- **Log in to the Gitea web UI via Keycloak** — proves the `login_source` row
-  survived; without it OIDC users cannot authenticate.
-- **Open a job's repo through the Cockpit** — proves repo rows resolve to the
-  git objects still on the PVC.
-- **Create a session or job that pushes** — proves sequences were reset (a
-  missed `reset sequences` shows up here as a primary-key collision).
+- **Log in to the Gitea web UI via Keycloak** (`https://git.localhost/` → *Sign
+  in with Keycloak* → lands on `test - Dashboard`) — proves the `login_source`
+  row survived; without it OIDC users cannot authenticate. Verify the source is
+  present and active first:
+  ```bash
+  kubectl --context=$CTX -n $NS exec srw-giteadb-0 -- \
+    env PGPASSWORD=$PW psql -U gitea -d gitea -tAc "SELECT name, type, is_active FROM login_source"
+  # expect: Keycloak|6|t
+  ```
+  A first-time OIDC user is auto-registered as a *new* Gitea account, so the
+  user count legitimately grows by one here — not a migration fault.
+- **Read a job's repo through the Cockpit** — proves repo rows resolve to git
+  objects still on the PVC:
+  `GET /api/jobs/{id}/repo/commits` (and the `?since_ref=<sha>` variant) should
+  return real commits.
+- **Sequence check** — create and delete a throwaway repo. A missed
+  `reset sequences` surfaces here as a primary-key collision:
+  ```bash
+  curl -u $ADMIN -X POST -H 'Content-Type: application/json' \
+    -d '{"name":"migration-seq-check","private":true}' \
+    http://srw-gitea:3000/api/v1/user/repos     # expect a fresh id, then DELETE it
+  ```
+- **Let the stack settle before judging** — the Reloader bounce (step 1) means
+  transient `Terminating`/`Init:` pods are expected for a few minutes.
 
 ### Rollback
 
@@ -198,6 +279,48 @@ The `srw-giteadb` PVC carries `helm.sh/resource-policy: keep`, so a failed
 attempt leaves the half-migrated Postgres around for inspection rather than
 silently vanishing. Delete it explicitly before retrying so step 2's schema
 creation starts clean.
+
+## Prerequisites for the Fleet-managed dev/homelab cluster
+
+That cluster does not use the chart-managed Secret, so two gates must be
+cleared **before** un-pinning `gitea.database.type` there. Both were verified
+open on 2026-07-30.
+
+1. **`GITEA_DB_PASSWORD` must exist in Vault.** The `srw` Secret is ESO-synced
+   with `dataFrom: extract` from `homelab/superhuman-remote-worker/srw-secrets`
+   (KV v2). The chart's generate-and-preserve fallback only applies when
+   `secrets.create=true`, which this cluster does not use — so a missing key is
+   not filled in, it just leaves `srw-giteadb` in
+   `CreateContainerConfigError`. Add a fresh 32-char random value, then let ESO
+   refresh (1 h interval) or force it:
+   ```bash
+   kubectl -n superhuman-remote-worker annotate externalsecret srw \
+     force-sync=$(date +%s) --overwrite
+   kubectl -n superhuman-remote-worker get secret srw \
+     -o jsonpath='{.data.GITEA_DB_PASSWORD}' | base64 -d   # must be non-empty
+   ```
+
+2. **A chart containing the Postgres support must be published and pinned in
+   `fleet.yaml`.** `develop.yml`'s `deploy-experimental` job publishes only when
+   `changes.outputs.chart == 'true'` or an image build succeeded — and change
+   detection looks at the pushed tip. A `helm/` commit batched *underneath* a
+   docs-only tip therefore produces no chart (this happened to `22c07e5f`).
+   Landing any commit that touches `helm/` publishes the chart and auto-bumps
+   `fleet.yaml` in the same CI commit. Confirm before proceeding:
+   ```bash
+   helm show chart oci://ghcr.io/knaeckebrothero/charts/srw-dev \
+     --version 0.0.0-dev.sha-<sha>
+   ```
+
+Landing the chart *before* the Vault key is safe: `values-experimental.yaml`
+still pins `sqlite3`, and `postgres-gitea.yaml` is gated on that, so nothing
+new renders until the pin is dropped. Drop the pin only once both gates pass.
+
+**Plan the window.** Steps 2–4 take Gitea offline for several minutes, and
+agents push to Gitea throughout a job. Check for live work first
+(`kubectl get pods | grep -E 'agent-j|workspace'`) and pick a quiet slot. The
+dev instance is ~10× k3d's (443 repos, 31 MB SQLite), so expect the pgloader
+step to take tens of seconds rather than one.
 
 ## Notes for external Postgres
 
