@@ -15,6 +15,37 @@ related:
 
 Companion to [[centurion]]. Distilled from the 2026-07-28 code-planner research (three agents; all anchors verified against the working tree at `95ee3011` that day — re-verify on pickup, they will drift). This is the build plan; the design rationale lives in the feature doc.
 
+> **First live conference + the notify channel made two-way (2026-07-30→31,
+> `0ccc5038` + `99223c6d`).** S9 got its first production exercise on Better Resavio:
+> single-writer conference, hold + live stand-by notice, brief wake on conclude, and
+> watchdog self-heal all worked mechanically — what failed was everything *around*
+> them (eight findings, two fixed same-day: `docs/issues/officer_conference_live_fire_findings.md`).
+> As-built deltas that matter for pickup:
+> - **`notify_user` is now a two-way channel (P-H)**: calls render as first-class
+>   "Officer → you" bubbles in the session log (never folded/auto-collapsed); page
+>   emails append an "Open his log to reply" session link (bare URL — the email leg
+>   escapes markdown); and pages persist a real notification row (they never had —
+>   `message_log.thread_id` was `VARCHAR(12)` and `job_id` FK'd to jobs; migration
+>   `0077` widens it, the inbox renders a "Session page" card routing to the
+>   session). The session log IS the reply channel; IMAP reply routing stays
+>   deliberately unbuilt.
+> - **Deploy churn no longer rolls centuries (P-G.1)**: image identity is the last
+>   input-touching commit per component, so docs/batched pushes stop re-tagging (and
+>   drain-recycling) the worker fleet mid-job. Digest-based drift and sitrep
+>   deploy-window tagging (F8) remain open.
+> - **P1 mechanics held under real supervision** (first supervised night): the
+>   guidance lane steered mid-run without re-plans, the officer attached
+>   `required_deliverables` contracts unprompted on every dispatch, evidence push
+>   preserved cancelled work (the salvaged RED tests seeded the next morning's
+>   recovery job), and the slot roster's `backend: vm` carried the heavy workspace
+>   all night. The seal gate itself is still unexercised live (jobs were cancelled
+>   pre-completion).
+> - **Command doctrine now lives in the KB**: the Legatus's standing orders
+>   (act-within-authority instead of idling the century; guidance over re-plans with
+>   a one-re-plan cap; cancel only provably stalled work; suspect deploys on
+>   clustered offline events) were written by the officer as a `decision` note —
+>   the charter/KB injection surfaces them at every wake.
+
 > **Steer semantics changed 2026-07-30 (P1 wave of
 > `docs/issues/officer_blind_reads_and_worker_bureaucracy.md` — supersedes every
 > "`urgent` interrupts" mention below).** `steer_worker_job(urgent=True)` no longer
