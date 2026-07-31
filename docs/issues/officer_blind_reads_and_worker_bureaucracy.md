@@ -18,8 +18,18 @@ deployed to dev the same day** — P0-A `ef3ec62b`, P0-D `3cda6f09`, P0-B `70ca9
 (+ C2 snapshot `58e3a667`), P0-C executed against the dev RecallStore 11:40 UTC;
 shipped-notes inline in §4. **P1 wave shipped the same evening** — P1-D `dee67f2a`,
 P1-A `dc33a86b`, P1-B `9170558c` (+ audit-protocol A/B lever `4eba5d47`), P1-C
-`6cd60bb2`; shipped-notes inline in §4; live acceptance rides the next supervised
-night. P2 remains unbuilt. All six research annexes (§7: read paths, steer mechanics, phase overhead,
+`6cd60bb2`; shipped-notes inline in §4. **Live acceptance ran on the supervised night
+of 07-30→31** (full record: `officer_conference_live_fire_findings.md`, night-2
+addendum): P1-A's guidance lane delivered mid-run steers with no re-plan (the officer
+still *chose* two destructive re-plans — addressed by standing orders, not code);
+P1-C contracts were attached by the officer unprompted on all three dispatches,
+with his own five-file contracts; P1-D preserved the cancelled jobs' evidence — the
+salvaged RED tests seeded the morning's recovery job; the slot roster put the heavy
+workspace on a VM automatically and it held all night. **Not yet exercised: the seal
+gate itself** — both contracted jobs were cancelled before any completion claim, so
+the gate's first live firing rides the recovery job. The night also surfaced two new
+platform findings (every-push retag churn F7 — fixed; drain-cause invisibility F8 —
+tracked), both in the conference doc. P2 remains unbuilt. All six research annexes (§7: read paths, steer mechanics, phase overhead,
 cluster evidence, framework survey, research literature) have landed and are folded into
 the findings and fix plan. Companion doc for the phase-guardrail arc:
 `docs/issues/agent_phase_guardrails_burn_legitimate_work.md` (2026-07-15) — finding

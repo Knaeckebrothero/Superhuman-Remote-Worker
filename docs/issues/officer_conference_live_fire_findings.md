@@ -14,11 +14,14 @@ related:
 
 # Conference live fire — eight findings from the first real officer conference
 
-**Status:** 🔴 **OPEN** — filed 2026-07-30 for design discussion; F7/F8
-and the F4 mail-reply addendum added 07-31 after the first supervised
-night. Nothing below is fixed; operational mitigations that already
-happened are marked inline (the original interim deadlock resolved — see
-*Night-2 addendum*).
+**Status:** 🟠 **PARTIALLY SHIPPED** — filed 2026-07-30; F7/F8 and the F4
+mail-reply addendum added 07-31 after the first supervised night.
+**Shipped 07-31 (one batched push): F4 → P-H `0ccc5038` (two-way notify
+channel) and F7 → P-G.1 `99223c6d` (input-identity tagging)** — shipped
+notes inline under those findings. Open: F1 scoping, F2 brain
+inheritance, F3 brief payload, F5 reindex hygiene, F6 search planes,
+F8 deploy attribution (P-G.3). The original interim deadlock resolved —
+see *Night-2 addendum*.
 
 **Context.** First production use of the conference machinery (centurion.md
 §2/S9) on the Better Resavio century, evening of 2026-07-30. The mechanical
@@ -101,6 +104,24 @@ from the email itself either (the IMAP reply loop routes to *job* message
 threads). The only working reply channel is typing into his session —
 which nothing in the email or the notification center points to.
 
+> **Shipped 2026-07-31 (P-H, `0ccc5038`).** Three surfaces, one push:
+> (1) `notify_user` calls render as first-class "Officer → you" bubbles
+> in the session log (urgency chip, subject, markdown body, delivery
+> receipt), exempt from tool-call folding and turn auto-collapse;
+> (2) page emails (and the watchdog's respawn-failure alerts) append
+> "Open his log to reply: …/sessions/{tid}" via the existing
+> `COCKPIT_EXTERNAL_URL` — as a labeled bare URL, because the email leg
+> HTML-escapes rather than renders markdown; (3) the deeper bug: pages
+> **never persisted a notification row at all**, and couldn't have
+> (`message_log.thread_id` was `VARCHAR(12)`, `job_id` FK'd to jobs) —
+> migration `0077` widens the thread-id columns (also defusing a latent
+> quiet-hours session-wake overflow), the page path now writes the row,
+> and the inbox renders a "Session page" card routing to the session log
+> instead of the job-lookup blank. Deliberately out of scope: email
+> reply routing via IMAP (the session IS the reply channel), read-marking
+> and badges, historical pages (rows were never written, so pre-fix pages
+> stay email-only).
+
 **F5 — KB reindex: partial forever, expensive when manual, and stuck-file
 churn.** The operator reindex ran full (3012 embeddings, 86 min). ~30
 loop-era notes fail **every** pass and will forever: 12 × `value too long
@@ -139,6 +160,30 @@ officer's pause/cancel calls failing 5× against the orchestrator's own
 concurrent rollouts. A meaningful slice of the night's "900 steps, only
 RED tests" was this churn, not worker output.
 
+> **Shipped 2026-07-31 (P-G.1, `99223c6d`) — with a mechanism
+> correction.** The pipeline was NOT content-blind: per-component change
+> detection already gated rebuilds. The actual defect was that rebuilt
+> components were tagged with the **push HEAD sha** — batched pushes
+> ending in a docs commit, and catch-up runs after blocked builds, kept
+> minting fresh identities for unchanged content, and every minted tag
+> drained the fleet once. Fix: component identity = `git log -1` over
+> that component's own watched paths, used consistently for the GHCR
+> tag, the baked `BUILD_SHA`, provenance identities and the bump step —
+> replays rewrite byte-identical values and the deploy commit is skipped
+> when nothing changed. Also fixed en passant: the orchestrator's watch
+> list was missing `src/` (its Dockerfile copies it — src-only pushes
+> silently never redeployed the orchestrator), plus two smaller
+> Dockerfile-derived path corrections. **First live run verified the
+> mixed-push scenario**: the shipping push itself retagged only
+> orchestrator+cockpit (agent/workspace untouched → zero drain, the
+> recovery job ran through its own feature's deployment). The docs-only
+> scenario (no deploy commit at all) is expected from the dry-run
+> walkthrough; the push carrying this very doc update is its first live
+> test. Still open:
+> digest-based drift comparison (P-G.2), the same pattern in `main.yml`
+> (flagged, needs its own review), and run-sha tagging on the VM image
+> path.
+
 **F8 — Drain and deploy causes are invisible to the officer.** All he saw
 was `fleet: agents_offline` and `orphans_recovered (agent offline)` —
 indistinguishable from crashes. He attributed platform churn to worker
@@ -170,17 +215,18 @@ other kept. The original postmortem's "sitreps should tag deploy windows"
   the KB panel.
 - **P-F Search-plane honesty** (F6): one index for both tools, or a
   mandatory "searched index @ X" stamp everywhere.
-- **P-G Stop the false drains** (F7, F8 — likely first to build): (1) CI
-  only re-tags components whose build inputs changed; (2) drift predicate
-  compares image digests (or build-content hash), not tag strings;
-  (3) sitreps tag active deploy/drain windows so restart churn is
-  attributable; (4) officer doctrine until then: clustered
-  `agents_offline`/orphan events ⇒ suspect deploys before workers
-  (issued as standing order 4, 07-31). Endgame per the postmortem annex:
-  rainbow deploys — in-flight jobs finish on the old version.
-- **P-H Mail reply routing** (F4 addendum): page emails and the
-  notification center must link to the officer's session (the only
-  working reply channel), or grow a real reply route.
+- **P-G Stop the false drains** (F7, F8): (1) ✅ **shipped `99223c6d`** —
+  input-identity tagging (see F7 shipped-note); (2) drift predicate
+  compares image digests (or build-content hash), not tag strings —
+  open; (3) sitreps tag active deploy/drain windows so restart churn is
+  attributable — open (this is F8's fix); (4) officer doctrine until
+  then: clustered `agents_offline`/orphan events ⇒ suspect deploys
+  before workers (issued as standing order 4, 07-31). Endgame per the
+  postmortem annex: rainbow deploys — in-flight jobs finish on the old
+  version.
+- **P-H Mail reply routing** (F4 addendum): ✅ **shipped `0ccc5038`** —
+  bubbles + email deep link + inbox Session-page card (see F4
+  shipped-note).
 
 ## Night-2 addendum (2026-07-31) — how the handoff resolved
 
