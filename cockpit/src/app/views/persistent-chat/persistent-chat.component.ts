@@ -1238,7 +1238,7 @@ export function clearDraft(threadId: string | null): void {
                     }
 
                     <!-- Streaming pulse while the turn is in flight with nothing yet. -->
-                    @if (streaming && turn.events.length === 0 && !chat.pendingPermission()) {
+                    @if (streaming && turn.events.length === 0 && chat.pendingPermissions().length === 0) {
                       <div class="thinking">
                         <span class="thinking-dot"></span>
                         <span class="thinking-dot"></span>
@@ -1337,7 +1337,7 @@ export function clearDraft(threadId: string | null): void {
 
         <!-- Inline approval card (mile marker) — anchored to the live turn,
              not gated on streaming state so it stays visible across edge cases. -->
-        @if (chat.pendingPermission(); as perm) {
+        @if (chat.pendingPermissions()[0]; as perm) {
           <div class="mile">
             <div class="mile-label">{{ 'chat.permission.title' | transloco }}</div>
             <div class="mile-title">{{ permissionTitle(perm) }}</div>
@@ -1349,7 +1349,7 @@ export function clearDraft(threadId: string | null): void {
               }
             </div>
             <div class="mile-actions">
-              <app-button variant="success" size="sm" (clicked)="chat.approve()">{{ 'chat.permission.approve' | transloco }}</app-button>
+              <app-button variant="success" size="sm" (clicked)="chat.approveAll()">{{ 'chat.permission.approve' | transloco }}</app-button>
               <app-button variant="info" size="sm" (clicked)="approveAndAutoAccept()">{{ 'chat.permission.autoAccept' | transloco }}</app-button>
               <app-button variant="danger" size="sm" (clicked)="chat.stop()">{{ 'chat.permission.stop' | transloco }}</app-button>
             </div>
@@ -3014,7 +3014,7 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     }
 
     approveAndAutoAccept(): void {
-        this.chat.approve();
+        this.chat.approveAll();
         this.chat.setMode('auto_accept');
     }
 
