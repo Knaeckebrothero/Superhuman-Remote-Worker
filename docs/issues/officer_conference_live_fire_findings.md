@@ -12,14 +12,13 @@ related:
   - "[[centurion_implementation_notes]]"
 ---
 
-# Conference live fire — six findings from the first real officer conference
+# Conference live fire — eight findings from the first real officer conference
 
-**Status:** 🔴 **OPEN** — filed 2026-07-30 for design discussion. Nothing
-below is fixed; operational mitigations that already happened are marked
-inline. **Interim state at filing:** the directive note exists and is now
-searchable, but the officer has stopped searching and is holding all
-dispatches awaiting a Legatus reply — the unblock is a session message
-pointing at the note handle (see *Interim unblock* at the bottom).
+**Status:** 🔴 **OPEN** — filed 2026-07-30 for design discussion; F7/F8
+and the F4 mail-reply addendum added 07-31 after the first supervised
+night. Nothing below is fixed; operational mitigations that already
+happened are marked inline (the original interim deadlock resolved — see
+*Night-2 addendum*).
 
 **Context.** First production use of the conference machinery (centurion.md
 §2/S9) on the Better Resavio century, evening of 2026-07-30. The mechanical
@@ -94,6 +93,13 @@ returns `not results.get("error")` while the email leg can fail with only
 `results["email"]=False` — a failed send can still report "Paged the
 Legatus". The 07:48 page was likely delivered but unnoticed; there is no
 in-app record of sent pages beyond the budget counter.
+**Addendum (07-31): the page email cannot be answered.** The cockpit
+"Answer" button in the notification center dead-ends — officer pages are
+queued with `job_id = thread_id` (no job behind a page), so the center
+cannot resolve the message and shows nothing. There is no reply route
+from the email itself either (the IMAP reply loop routes to *job* message
+threads). The only working reply channel is typing into his session —
+which nothing in the email or the notification center points to.
 
 **F5 — KB reindex: partial forever, expensive when manual, and stuck-file
 churn.** The operator reindex ran full (3012 embeddings, 86 min). ~30
@@ -114,6 +120,33 @@ different/fallback path with **no index stamp** and found the note while
 the agent-visible index was still stale — producing a false "it's findable
 now" all-clear during the incident. Both planes should query the same
 index or at minimum both must stamp what they searched.
+
+**F7 — Every push drains the whole worker fleet (content-blind drift +
+retag-on-anything).** Found on night 2 (07-30→31): CI re-tags **all**
+images on every develop push — including docs-only commits (the agent tag
+literally pointed at a docs HEAD, `sha-26a734d`) — and the lifecycle
+reconciler's drift predicate compares tag SHAs, not image content. Result:
+each push re-declares every running agent pod stale and starts a rolling
+drain. Overnight, several pushes produced drain waves at 21:51, 23:14,
+23:23 ×2, 01:04 and 02:21 (`category=drained, reason=stale_image,
+exit_code=0` in the reap captures); the officer's two contracted jobs were
+Continue-as-New'd across ≥3 agent pods each. The drain itself is graceful
+(boundary freeze, checkpoint resume, VM workspace untouched) but not free:
+pause → re-dispatch → boot → compacted restore → re-orientation, paid
+repeatedly, plus at least one degradation to the orphan/missed-heartbeat
+crash path (cousin of [[version_upgrade_drain_livelock]]), plus the
+officer's pause/cancel calls failing 5× against the orchestrator's own
+concurrent rollouts. A meaningful slice of the night's "900 steps, only
+RED tests" was this churn, not worker output.
+
+**F8 — Drain and deploy causes are invisible to the officer.** All he saw
+was `fleet: agents_offline` and `orphans_recovered (agent offline)` —
+indistinguishable from crashes. He attributed platform churn to worker
+failure and escalated (two destructive re-plans) against restarts the
+platform itself was causing; the platform's state-*preserving* restarts
+then interleaved with his state-*resetting* re-plans, each wiping what the
+other kept. The original postmortem's "sitreps should tag deploy windows"
+(P2-B) now has a full night of receipts.
 
 ## Fix directions (for discussion, roughly ordered)
 
@@ -137,15 +170,36 @@ index or at minimum both must stamp what they searched.
   the KB panel.
 - **P-F Search-plane honesty** (F6): one index for both tools, or a
   mandatory "searched index @ X" stamp everywhere.
+- **P-G Stop the false drains** (F7, F8 — likely first to build): (1) CI
+  only re-tags components whose build inputs changed; (2) drift predicate
+  compares image digests (or build-content hash), not tag strings;
+  (3) sitreps tag active deploy/drain windows so restart churn is
+  attributable; (4) officer doctrine until then: clustered
+  `agents_offline`/orphan events ⇒ suspect deploys before workers
+  (issued as standing order 4, 07-31). Endgame per the postmortem annex:
+  rainbow deploys — in-flight jobs finish on the old version.
+- **P-H Mail reply routing** (F4 addendum): page emails and the
+  notification center must link to the officer's session (the only
+  working reply channel), or grow a real reply route.
 
-## Interim unblock (until P-C exists)
+## Night-2 addendum (2026-07-31) — how the handoff resolved
 
-The officer holds until told. One session message resolves it:
-
-> Centurion — the brief exists; the search index was broken on our side,
-> now repaired. Read `project:legatus-directive-2026-07-30-truth-gate-then-ui`
-> directly by handle (do not rely on search). It is in force: truth gate
-> first, then UI. Release the hold.
+The directive was delivered by session message via the API front door
+(`POST /api/persistent/threads/{tid}/input` with the user's MCP
+credential) after the pointer-brief failed — the officer read the note by
+handle on first try and dispatched both contracted jobs within two
+minutes. Overnight he supervised them well (2.5 h of "no steering
+needed", artifact-based contract checks, guidance-lane steers, evidence
+preserved, gradual escalation, page with an A/B/C decision) while F7's
+deploy churn rolled his workers underneath him. Both jobs were cancelled
+near 02:00 with zero contract deliverables (part churn, part genuine
+worker process-drift: spec ceremony + RED tests, no implementation).
+Morning after: standing orders issued (act within authority instead of
+idling the century; guidance over re-plans with a one-re-plan cap; cancel
+only provably stalled work; suspect deploys on clustered offline events)
+and recovery option A authorized. The officer's own slot roster put the
+heavy job's workspace on a VM automatically — the one part of the stack
+that held all night.
 
 ## What already worked (keep)
 
