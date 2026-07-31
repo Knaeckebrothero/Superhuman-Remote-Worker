@@ -52,6 +52,7 @@ def _make_callbacks(**overrides) -> PersistentLoopCallbacks:
         on_error=AsyncMock(),
         check_interrupt=MagicMock(return_value=False),
         on_vm_upgrade_needed=None,
+        announce_permission_batch=None,
     )
     defaults.update(overrides)
     return PersistentLoopCallbacks(**defaults)
@@ -78,6 +79,7 @@ async def _run_turn_with_parallel_tools(
     permission_check,
     messages: list[BaseMessage],
     n_calls: int = 2,
+    announce_permission_batch=None,
 ):
     """Drive one turn whose single AIMessage carries ``n_calls`` parallel
     tool calls, then a final tool-free AIMessage ends the turn."""
@@ -124,6 +126,7 @@ async def _run_turn_with_parallel_tools(
     callbacks = _make_callbacks(
         get_user_input=_input,
         permission_check=permission_check,
+        announce_permission_batch=announce_permission_batch,
     )
 
     await run_persistent_loop(
@@ -260,3 +263,44 @@ class TestApprovedPathUnchanged:
         tool.ainvoke.assert_not_called()
         tool_msgs = [m for m in messages if isinstance(m, ToolMessage)]
         assert len(tool_msgs) == 1
+
+
+class TestBatchAnnounce:
+    @pytest.mark.asyncio
+    async def test_announce_called_once_with_all_calls_before_gating(self):
+        """The whole batch must be announced before the first gate blocks,
+        so the user sees every card at once instead of one per finished tool."""
+        seen = []
+        gate_order = []
+
+        announce = AsyncMock(side_effect=lambda calls: seen.append(list(calls)))
+
+        async def _permission_check(tool_name, tool_args, tool_call_id):
+            gate_order.append(tool_call_id)
+            return PermissionOutcome.APPROVED
+
+        messages: list[BaseMessage] = []
+        await _run_turn_with_parallel_tools(
+            permission_check=_permission_check,
+            messages=messages,
+            n_calls=4,
+            announce_permission_batch=announce,
+        )
+
+        assert announce.await_count == 1
+        assert [c["id"] for c in seen[0]] == ["tc_0", "tc_1", "tc_2", "tc_3"]
+        # Announced before any gate ran.
+        assert gate_order == ["tc_0", "tc_1", "tc_2", "tc_3"]
+
+    @pytest.mark.asyncio
+    async def test_no_announce_callback_still_works(self):
+        """Back-compat: callers that never set the callback are unaffected."""
+
+        async def _permission_check(tool_name, tool_args, tool_call_id):
+            return PermissionOutcome.APPROVED
+
+        messages: list[BaseMessage] = []
+        tool = await _run_turn_with_parallel_tools(
+            permission_check=_permission_check, messages=messages, n_calls=2
+        )
+        assert tool.ainvoke.await_count == 2
