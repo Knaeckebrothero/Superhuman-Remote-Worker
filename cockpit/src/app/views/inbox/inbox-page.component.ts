@@ -409,6 +409,49 @@ function relativeTime(iso: string, nowLabel: string): string {
               </details>
             </div>
 
+          } @else if (selectedItem()!.type === 'message' && selectedItem()!.message?.sessionThreadId) {
+            <!-- ========== SESSION PAGE DETAIL (officer page: no job) ========== -->
+            <!-- Keyed to a persistent session, not a job — there is no thread
+                 to fetch and no job-scoped reply route. The session log is the
+                 working reply channel, so the primary action opens it. -->
+            <div class="detail-content message-detail session-page-detail">
+              <div class="detail-header">
+                <span class="detail-type-badge message">
+                  <app-icon size="sm">campaign</app-icon>
+                  {{ selectedItem()!.message!.subject || ('inbox.messageDetail.messageLabel' | transloco) }}
+                </span>
+                <app-badge tone="accent" size="xs" [uppercase]="true">
+                  {{ 'inbox.messageDetail.sessionPage' | transloco }}
+                </app-badge>
+              </div>
+
+              <div class="detail-ids">
+                <app-copy-field [label]="'inbox.detail.sessionId' | transloco" [value]="selectedItem()!.message!.sessionThreadId!" />
+              </div>
+
+              <div class="thread-body">
+                <div class="msg-bubble msg-outbound">
+                  <div class="msg-header">
+                    <span class="msg-sender">{{ 'inbox.messageDetail.senderAgent' | transloco }}</span>
+                    <span class="msg-time">{{ formatMsgTime(selectedItem()!.timestamp) }}</span>
+                  </div>
+                  <div class="msg-content">
+                    @if (selectedItem()!.message!.lastMessage) {
+                      <markdown [data]="selectedItem()!.message!.lastMessage"></markdown>
+                    } @else {
+                      {{ 'inbox.messageDetail.noMessagesLoaded' | transloco }}
+                    }
+                  </div>
+                </div>
+              </div>
+
+              <div class="action-bar">
+                <app-button variant="primary" size="sm" (clicked)="goToSession(selectedItem()!.message!.sessionThreadId!)">
+                  <app-icon size="sm">open_in_new</app-icon> {{ 'inbox.messageDetail.openSessionLog' | transloco }}
+                </app-button>
+              </div>
+            </div>
+
           } @else if (selectedItem()!.type === 'message' && selectedItem()!.message) {
             <!-- ========== MESSAGE DETAIL ========== -->
             <div class="detail-content message-detail">

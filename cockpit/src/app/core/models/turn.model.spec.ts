@@ -9,6 +9,7 @@ import {
     FoldableEvent,
     groupEvents,
     lastTextOf,
+    notifyToolCalls,
     summarizeFolded,
     TextEvent,
     ThoughtEvent,
@@ -25,6 +26,8 @@ const tht = (id: string, status: ThoughtEvent['status'] = 'done'): ThoughtEvent 
     ({kind: 'thought', id, content: '...', status, startedAt: 0});
 const tool = (id: string, status: ToolCallStatus = 'completed', category?: string): ToolCallEvent =>
     ({kind: 'tool_call', id, tool: 'read_file', args: {}, status, startedAt: 0, category});
+const notify = (id: string): ToolCallEvent =>
+    ({kind: 'tool_call', id, tool: 'notify_user', args: {message: 'm', urgency: 'log'}, status: 'completed', startedAt: 0});
 const comp = (id: string): CompactionEvent => ({kind: 'compaction', id, summary: 'compacted', startedAt: 0});
 
 /** Ids in a group, folded or single — keeps the grouping assertions readable. */
@@ -218,6 +221,13 @@ describe('groupEvents', () => {
         expect(shapeOf(g)).toEqual(['folded(b0,b1)', 'single(b2)', 'folded(b3,b4)', 'single(b5)']);
     });
 
+    it('never folds notify_user — an officer→user message is first-class, like text', () => {
+        // Buried mid-run between plain tool calls, the message must still
+        // surface as its own bubble rather than vanish into the chip.
+        const g = groupEvents([tool('b0'), tool('b1'), notify('b2'), tool('b3'), tool('b4'), tool('b5')]);
+        expect(shapeOf(g)).toEqual(['folded(b0,b1)', 'single(b2)', 'folded(b3,b4)', 'single(b5)']);
+    });
+
     describe('the live edge', () => {
         it('pins every in-flight call — 5 tools at once means 5 cards', () => {
             const g = groupEvents([
@@ -285,6 +295,17 @@ describe('groupEvents', () => {
         }
         const g = groupEvents(events);
         expect(g.map(x => x.kind)).toEqual(['single', 'folded', 'single']);
+    });
+});
+
+describe('notifyToolCalls', () => {
+    it('returns only the notify_user calls, in order', () => {
+        const t = mkTurn([tool('b0'), notify('b1'), txt('b2', 'closing'), notify('b3')]);
+        expect(notifyToolCalls(t).map(e => e.id)).toEqual(['b1', 'b3']);
+    });
+
+    it('returns [] for a turn without officer messages', () => {
+        expect(notifyToolCalls(mkTurn([tool('b0'), txt('b1', 'x')]))).toEqual([]);
     });
 });
 

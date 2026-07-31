@@ -3,6 +3,9 @@ import {
     NormalizedToolCall,
     CanvasPresentationKind,
     CanvasPresentationSummary,
+    NOTIFY_USER_TOOL,
+    NotifyMessageView,
+    NotifyUrgency,
     ParamKind,
     ToolCardView,
     ToolDetail,
@@ -180,6 +183,9 @@ export const TOOL_DESCRIPTORS: Record<string, ToolDescriptor> = {
     // Communication & delegation
     send_message: {title: 'Send message', icon: 'send', category: 'communication', params: [{key: ['message', 'content'], label: 'Message', kind: 'text'}], subtitle: (a) => pickArg(a, ['message', 'content'])},
     delegate_work: {title: 'Delegate work', icon: 'group_work', category: 'delegation', params: [{key: ['task', 'description'], label: 'Task', kind: 'text'}], subtitle: (a) => pickArg(a, ['task', 'description'])},
+    // notify_user renders as a first-class officer→user bubble (see `notify`
+    // on ToolCardView); this descriptor is the fallback surface only.
+    notify_user: {title: 'Message the user', icon: 'campaign', category: 'communication', params: [{key: 'subject', label: 'Subject', kind: 'text'}, {key: 'message', label: 'Message', kind: 'text'}, {key: 'urgency', label: 'Urgency', kind: 'text'}], result: {kind: 'text'}, subtitle: (a) => pickArg(a, ['subject', 'message'])},
 
     // Fleet management. create_worker_job is the only card that outlives its
     // own tool call: the call returns "job created, id=…" immediately and the
@@ -407,6 +413,33 @@ export function parseJobEntity(n: NormalizedToolCall): ToolCardView['entity'] {
     return undefined;
 }
 
+/**
+ * Extract the officer→user message from a `notify_user` call. The args ARE the
+ * message (available the moment the call starts streaming); the result string
+ * is the delivery receipt ("Paged the Legatus (2/3 pages used today)."), which
+ * lands later. An unknown/absent urgency degrades to 'log' — the tool's own
+ * default — rather than suppressing the bubble.
+ *
+ * Exported for unit tests (same pattern as {@link parseJobEntity}).
+ */
+export function parseNotifyMessage(
+    n: NormalizedToolCall,
+    args: Record<string, unknown>,
+): NotifyMessageView | undefined {
+    if (n.tool !== NOTIFY_USER_TOOL) return undefined;
+    const raw = pickArg(args, 'urgency').trim().toLowerCase();
+    const urgency: NotifyUrgency = raw === 'page' || raw === 'digest' ? raw : 'log';
+    const subject = pickArg(args, 'subject').trim();
+    const body = pickArg(args, 'message');
+    const receipt = (n.result ?? '').trim();
+    return {
+        urgency,
+        ...(subject ? {subject} : {}),
+        body,
+        ...(receipt ? {receipt} : {}),
+    };
+}
+
 function canvasAction(metadata: CanvasResultMetadata | undefined): ToolCardView['action'] {
     if (!metadata) return undefined;
     return {
@@ -451,6 +484,7 @@ export function buildToolCardView(n: NormalizedToolCall): ToolCardView {
         details: buildDetails(n),
         action: canvasAction(canvasMetadata),
         canvasPresentation: canvasMetadata?.presentation,
+        notify: parseNotifyMessage(n, args),
         entity: parseJobEntity(n),
         error: n.error ? String(n.error) : undefined,
     };

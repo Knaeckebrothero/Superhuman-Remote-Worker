@@ -1,4 +1,5 @@
 import {ChatAttachment, ToolCallInfo} from '../services/persistent-chat.service';
+import {NOTIFY_USER_TOOL} from './tool-card.model';
 
 /**
  * Turn-based conversation model for the persistent chat UI.
@@ -185,6 +186,18 @@ export function isToolCall(e: TurnEvent): e is ToolCallEvent {
 }
 
 /**
+ * The officer→user messages (`notify_user` calls) in a turn. These render as
+ * first-class chat bubbles and must stay visible even when the turn is
+ * collapsed — collapsing folds the *lead-up*, and a message addressed to the
+ * user is never lead-up.
+ */
+export function notifyToolCalls(turn: AssistantTurn): ToolCallEvent[] {
+    return turn.events.filter(
+        (e): e is ToolCallEvent => e.kind === 'tool_call' && e.tool === NOTIFY_USER_TOOL,
+    );
+}
+
+/**
  * Returns the last text event in a turn (the "headline" used in the
  * collapsed-turn view). Returns undefined for turns without any text.
  */
@@ -368,7 +381,10 @@ export type EventGroup =
 export const MIN_FOLD_RUN = 2;
 
 export function isFoldable(e: TurnEvent): e is FoldableEvent {
-    return e.kind === 'tool_call' || e.kind === 'thought';
+    if (e.kind === 'thought') return true;
+    // notify_user is a message addressed to the user, not work — like text,
+    // it never disappears into a "N× tool calls" chip.
+    return e.kind === 'tool_call' && e.tool !== NOTIFY_USER_TOOL;
 }
 
 /**

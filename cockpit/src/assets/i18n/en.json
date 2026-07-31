@@ -67,7 +67,17 @@
       "set_canvas": "Present in Canvas",
       "get_canvas": "Inspect Canvas",
       "clear_canvas": "Clear Canvas",
-      "create_worker_job": "Schedule job"
+      "create_worker_job": "Schedule job",
+      "notify_user": "Message the user"
+    },
+    "notify": {
+      "from": "Officer → you",
+      "sending": "sending…",
+      "urgency": {
+        "page": "Page",
+        "digest": "Digest",
+        "log": "Log"
+      }
     },
     "job": {
       "approve": "Approve",
@@ -2087,6 +2097,8 @@
       "messageLabel": "Message",
       "modeBlocking": "blocking",
       "modeAsync": "async",
+      "sessionPage": "Session page",
+      "openSessionLog": "Open session log",
       "defaultAgent": "agent",
       "threadLoading": "Loading thread...",
       "noMessagesLoaded": "No messages loaded",
