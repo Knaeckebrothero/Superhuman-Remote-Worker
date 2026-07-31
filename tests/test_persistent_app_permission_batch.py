@@ -298,3 +298,35 @@ class TestAnnounceSkipsTerminalRows:
         ids = [r["id"] for r in bcast.call_args.args[1]["requests"]]
         assert "tc_terminal" not in ids
         assert ids == ["tc_fresh"]
+
+
+class TestCallbackWiring:
+    @pytest.mark.asyncio
+    async def test_loop_callbacks_carry_the_announce_hook(self):
+        """Without this wiring the batch card never appears in production.
+
+        Captures the real PersistentLoopCallbacks the session builds, rather
+        than asserting on source text.
+        """
+        captured = {}
+
+        def _fake_run(**kwargs):
+            captured["callbacks"] = kwargs.get("callbacks")
+
+            async def _noop():
+                return None
+
+            return _noop()
+
+        with (
+            patch.object(pa, "_session", _mock_session()),
+            patch.object(pa, "_thread_id", "tid"),
+            patch.object(pa, "_loop_task", None),
+            patch.object(pa, "_session_ready", lambda: True),
+            patch.object(pa, "run_persistent_loop", _fake_run),
+        ):
+            pa._ensure_persistent_loop_started("test")
+
+        cb = captured["callbacks"]
+        assert cb is not None, "loop was never started"
+        assert cb.announce_permission_batch is pa._loop_announce_permission_batch
