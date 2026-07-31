@@ -254,6 +254,12 @@ class ToolContext:
     )  # List[InstructionFileEntry]
     recall_store: Optional[Any] = None  # RecallStore instance (Memory Light)
     shell_manager: Optional[Any] = None  # ShellManager (persistent terminal sessions)
+    progress_committer: Optional[Any] = (
+        None  # ProgressCommitter (src/core/progress_commit.py). Shared by the
+        # todo_complete tool and the graph's turn loop so both triggers use one
+        # push clock. Left None for persistent sessions, which already commit
+        # and push per turn (src/persistent_graph.py:949).
+    )
     session_task_manager: Optional[Any] = (
         None  # SessionTaskManager (persistent session todos)
     )
@@ -278,6 +284,29 @@ class ToolContext:
     _officer_sleep_request: Optional[Dict[str, Any]] = (
         None  # Officer sleep tool parked a wake request (centurion sessions)
     )
+    _replan_request: Optional[str] = (
+        None  # Reason string parked by request_replan: the tactical phase has
+        # learned something that changes the approach and wants the strategic
+        # phase early. Consumed by check_todos, which ends the phase. Note this
+        # is the ONLY way to leave a tactical phase without completing every
+        # todo, so it is also the only in-flight adaptation path once phases
+        # get large.
+    )
+    _reply_drain_requested: bool = (
+        False  # A todo just completed — a natural break at which to deliver
+        # queued (non-urgent) replies. Set by todo_complete, consumed by
+        # audited_tools. Replaces the tactical->strategic boundary as the
+        # drain point, which stops firing often enough as phases grow.
+    )
+    _delivered_reply_keys: Set[str] = field(
+        default_factory=set
+    )  # Content keys of queued replies already appended to the conversation.
+    # The delivery ack is fire-and-forget, so the heartbeat inbox keeps
+    # returning the same entries for up to one interval afterwards; without
+    # this, every todo completed in that window would append the same reply
+    # again. Deliberately process-local: a successor pod has no record of the
+    # delivery, so it redelivers — which is the correct at-least-once
+    # behaviour when the ack may never have landed.
     _snapshot_callback: Optional[Any] = (
         None  # Callable[[str], None] — pre-write file snapshot for undo
     )
@@ -822,6 +851,37 @@ class ToolContext:
         req = self._freeze_request
         self._freeze_request = None
         return req
+
+    def request_replan(self, reason: str) -> None:
+        """Ask for the strategic phase early, without discarding todo state.
+
+        Called from ``request_replan``. Sync-safe; consumed by ``check_todos``.
+        """
+        self._replan_request = reason
+
+    def consume_replan_request(self) -> Optional[str]:
+        """Return and clear any pending replan request."""
+        reason = self._replan_request
+        self._replan_request = None
+        return reason
+
+    def request_reply_drain(self) -> None:
+        """Mark a natural break at which queued replies may be delivered.
+
+        Called from ``todo_complete``: a finished todo is the break the old
+        ``next_strategic_phase`` default was really trying to express — finish
+        the current unit of work, then read your mail. Sync-safe.
+        """
+        self._reply_drain_requested = True
+
+    def consume_reply_drain(self) -> bool:
+        """Return and clear the natural-break flag.
+
+        Called from the async audited_tools node after tool execution.
+        """
+        requested = self._reply_drain_requested
+        self._reply_drain_requested = False
+        return requested
 
     def request_officer_sleep(self, sleep_data: Dict[str, Any]) -> None:
         """Record the officer sleep tool's wake request (sync-safe).

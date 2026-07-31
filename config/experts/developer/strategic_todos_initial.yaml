@@ -140,8 +140,11 @@ todos:
       | 7 | integration  | Commit + PR                               | -            |
       ```
 
-      PHASE SIZING: Target 5-10 todos per tactical phase. Each phase is one coherent
-      slice of TDD work. Prefer many short phases over few long ones.
+      PHASE SIZING: Target 8-16 todos per tactical phase. Each phase is one coherent
+      slice of TDD work — the phase count is set by the TDD cycle itself, not by
+      batch size. Do NOT split within a type: one red phase covering every failing
+      test beats three small ones, because each extra boundary costs a full planning
+      cycle.
 
       AC GROUPING: A red phase + the matching green phase covers ~2-4 AC at a time. Smaller
       AC batches mean tighter feedback loops; larger batches mean more risk of partial green.
@@ -167,7 +170,7 @@ todos:
       (The todo-guide skill at skills/todo-guide/SKILL.md covers the TDD phase
       types, exit gates, and forbidden test patterns.)
 
-      The FIRST tactical phase has `tdd_phase: spec`. Create 3-5 todos that will produce
+      The FIRST tactical phase has `tdd_phase: spec`. Create 3-6 todos that will produce
       spec.yaml and lock it into spec_lock.md. Each todo must reference tdd_phase=spec
       and may not touch `src/` or `tests/`.
 
@@ -197,7 +200,7 @@ todos:
       Then the SECOND strategic phase will (after reading the locked spec) set `tdd_phase: red`
       and create todos to write the failing tests for the first AC batch.
 
-      COMPLETION CRITERIA: next_phase_todos called successfully with 3-5 todos, each
+      COMPLETION CRITERIA: next_phase_todos called successfully with 3-6 todos, each
       stamped with tdd_phase=spec.
 
       INSTEAD OF: Creating red or green todos in the first phase — the spec must

@@ -13,7 +13,7 @@ WHY: Strategic review prevents wasted effort by catching problems early and ensu
 5. Identify blockers, completed milestones, and next priorities. For each blocker, state the root cause, not just the symptom.
 6. Update plan.md with revised strategy if needed. Write your plan as a structured markdown spec: list goals, acceptance criteria, and ordered steps.
 7. Self-check: Does the updated plan address the root task? Are there gaps or untested assumptions? Would a reviewer find missing steps?
-8. Check deliverable artifacts: if files exist from a prior run or phase, verify they reflect current state. Regenerate deliverables from scratch rather than editing stale artifacts — check timestamps, IDs, and content against the current run.
+8. Check deliverable artifacts: if files exist from a prior run or phase, verify they reflect current state. Edit them in place — work committed earlier in THIS run is yours and your context for it is intact. Regenerate from scratch only when an artifact predates this run, or when you cannot account for how it got its contents.
 </review_protocol>
 
 <knowledge_maintenance>

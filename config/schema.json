@@ -542,9 +542,15 @@
         },
         "max_tool_calls_per_phase": {
           "type": "integer",
-          "minimum": 20,
-          "default": 200,
-          "description": "Max tool calls per phase before rewind (tactical) or freeze (strategic)"
+          "minimum": 0,
+          "default": 0,
+          "description": "Optional per-phase tool-call ceiling (0 = off). Superseded by max_tool_calls_per_job, which bounds the job rather than resetting each boundary"
+        },
+        "max_tool_calls_per_job": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 5000,
+          "description": "Job-wide tool-call ceiling — the only automatic stop for a runaway job. Exceeding it freezes with budget_exceeded for human review (0 disables)"
         },
         "tool_category_timeouts": {
           "type": "object",
@@ -567,6 +573,24 @@
           "minimum": 0,
           "default": 6,
           "description": "Consecutive tool actions touching only process artifacts before the act-ratio 'stop planning' nudge fires (0 disables)"
+        },
+        "progress_push_interval_seconds": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 60,
+          "description": "Minimum seconds between progress pushes to the workspace remote. Commits are unthrottled; only the network round-trip is rate-limited"
+        },
+        "progress_wip_commit_after_seconds": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 300,
+          "description": "Seconds without a commit before the turn loop commits work in progress, covering agents stuck on a single long todo (0 disables)"
+        },
+        "queued_reply_max_wait_seconds": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 300,
+          "description": "Maximum seconds a queued (non-urgent) reply waits for a natural break (a completed todo) before being delivered anyway (0 = break-driven only)"
         },
         "process_artifact_patterns": {
           "type": "array",
@@ -591,7 +615,7 @@
         "max_todos": {
           "type": "integer",
           "minimum": 1,
-          "default": 20,
+          "default": 30,
           "description": "Maximum todos allowed for a strategic->tactical transition"
         }
       },

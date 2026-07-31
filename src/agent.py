@@ -2845,6 +2845,28 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             _job_metadata=job_metadata,
         )
         context.project_ids = native_project_ids
+
+        # Progress durability. Phase boundaries used to be the only thing that
+        # pushed the workspace to its remote, which made every external view of
+        # a running job as stale as the last boundary. Wire the committer here,
+        # where the workspace and config are both resolved, so the todo tool and
+        # the turn loop share one push clock.
+        try:
+            from src.core.progress_commit import ProgressCommitter
+
+            _limits = self.config.limits
+            _ws = self._workspace_manager
+            context.progress_committer = ProgressCommitter(
+                # Resolved per call, not captured: a workspace re-init or tier
+                # upgrade swaps the GitManager out from under us mid-job.
+                lambda: _ws.git_manager,
+                job_id=self._current_job_id or "unknown",
+                push_interval=_limits.progress_push_interval_seconds,
+                wip_after=_limits.progress_wip_commit_after_seconds,
+            )
+        except Exception as e:
+            logger.warning(f"ProgressCommitter unavailable (non-fatal): {e}")
+
         self._tool_context = context
 
         # Initialize ShellManager for persistent terminal sessions. Shells run

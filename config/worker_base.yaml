@@ -91,7 +91,7 @@ tools:
     - next_phase_todos
     - todo_complete
     - todo_list
-    - todo_rewind
+    - request_replan
     - mark_complete
     - job_complete
   # Research tools - web search, academic papers, browser & workflows (src/tools/research/)
@@ -230,11 +230,33 @@ limits:
     max_token_repetitions: 20   # same word/token repeated consecutively
     max_line_repetitions: 10    # same line repeated in output
   progress_stall_threshold: 30     # tool calls without progress before nudge reminder
-  max_tool_calls_per_phase: 500    # max tool calls per phase before rewind (tactical) or freeze (strategic)
+  # Per-phase ceiling: OFF by default. It resets at every phase boundary, so it
+  # bounded a phase but never a job — and with few large phases it would have
+  # tightened the effective budget rather than loosened it. Set >0 only if you
+  # deliberately want a per-phase guard.
+  max_tool_calls_per_phase: 0
+  # Job ceiling — the real backstop, and the ONLY automatic stop a runaway job
+  # has (the progress nudge and act-ratio tripwire only inject reminders; loop
+  # detection only masks tools; the orchestrator has no job-duration limit).
+  # Exceeding it freezes with budget_exceeded, which parks for human review
+  # rather than auto-redispatching, so it cannot livelock. 0 disables it.
+  max_tool_calls_per_job: 5000
   # Act-ratio tripwire: after N consecutive tool actions that touch ONLY
   # process artifacts (patterns below), inject a one-line "stop planning"
   # nudge. Any action on a non-process target resets the counter. 0 disables.
   act_ratio_nudge_threshold: 6
+  # Progress durability — see src/core/progress_commit.py. Commits land per
+  # completed todo (free, local); pushes are throttled to this interval so a
+  # burst of quick todos doesn't hammer Gitea.
+  progress_push_interval_seconds: 60
+  # Wall-clock floor: commit work in progress after this long with no commit.
+  # Catches the stuck agent, which by definition never calls todo_complete.
+  # 0 disables.
+  progress_wip_commit_after_seconds: 300
+  # Steering lane B (queued, non-urgent replies): delivered at the agent's next
+  # completed todo, or after this long if it never reaches one. Urgent guidance
+  # is lane A and ignores this — it renders every turn. 0 = break-driven only.
+  queued_reply_max_wait_seconds: 300
   process_artifact_patterns:       # fnmatch, workspace-relative
     - todos.yaml
     - plan.md
@@ -269,7 +291,12 @@ limits:
 # needed beats padded upfront decomposition; a correct 2-todo phase is legal.
 phase_settings:
   min_todos: 2
-  max_todos: 20
+  # Raised 20 -> 30 for the fewer-larger-phases model: a single execution phase
+  # now covers work that used to be split across several. Note the cost — todo
+  # bodies are injected verbatim on EVERY turn (see the ~15k/turn floor in
+  # docs/issues/phase_model_overhead_amnesia_loop.md F3), so this cap is also a
+  # per-turn token budget. Prefer coarser todos over more of them.
+  max_todos: 30
 
 context_management:
   compact_on_archive: true

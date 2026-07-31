@@ -576,13 +576,19 @@ class TestProgressHeartbeatMarker:
 # =============================================================================
 
 
-class TestHardCap:
-    """Tests for the hard budget cap per phase."""
+class TestBudgetCaps:
+    """Tests for the tool-call budgets.
+
+    The per-phase cap is now OFF by default and the JOB cap is the real
+    backstop — bounding a phase stopped bounding a job once phases got large
+    (it reset at every boundary). Exceeding either freezes; the old tactical
+    branch instead called ``archive_with_failure_note``, which wrote every todo
+    — completed ones included — into a failure archive and emptied the list.
+    """
 
     @pytest.mark.asyncio
-    async def test_hard_cap_rewinds_tactical_phase(self):
-        """Exceeding hard cap in tactical phase should rewind, not freeze."""
-        cfg = FakeConfig(limits=LimitsConfig(max_tool_calls_per_phase=5))
+    async def test_job_cap_freezes_without_destroying_todos(self):
+        cfg = FakeConfig(limits=LimitsConfig(max_tool_calls_per_job=5))
         fake_tool = MagicMock()
         fake_tool.name = "read_file"
 
@@ -601,72 +607,27 @@ class TestHardCap:
                 return_value={"messages": [make_tool_result("read_file", "ok")]}
             )
             MockToolNode.return_value = mock_tn
-
             audited = create_audited_tool_node([fake_tool], cfg, tool_context=mock_ctx)
 
-            # 5 calls: within cap
             for i in range(5):
                 state = make_state(
                     [make_tool_call("read_file", {"path": f"f_{i}"}, f"call_{i}")]
                 )
-                result = await audited(state)
-                assert not result.get("should_stop", False)
+                assert not (await audited(state)).get("should_stop", False)
 
-            # 6th call: exceeds cap — should rewind, NOT freeze
             state = make_state([make_tool_call("read_file", {"path": "f_6"}, "call_6")])
             result = await audited(state)
-            assert not result.get("should_stop", False)
-            # Should have rewind message
-            sys_msgs = [
-                m for m in result.get("messages", []) if isinstance(m, SystemMessage)
-            ]
-            assert len(sys_msgs) == 1
-            assert "PHASE BUDGET" in sys_msgs[0].content
-            assert "next_phase_todos" in sys_msgs[0].content
-            # Todos should have been archived
-            mock_todo.archive_with_failure_note.assert_called_once()
+
+        assert result.get("should_stop") is True
+        assert result["freeze_data"]["freeze_type"] == "budget_exceeded"
+        assert result["freeze_data"]["budget_scope"] == "job"
+        # The regression this replaced: todos must survive.
+        mock_todo.archive_with_failure_note.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_hard_cap_freezes_strategic_phase(self):
-        """Exceeding hard cap in strategic phase should freeze."""
-        cfg = FakeConfig(limits=LimitsConfig(max_tool_calls_per_phase=5))
-        fake_tool = MagicMock()
-        fake_tool.name = "read_file"
-
-        mock_ws = MagicMock()
-        mock_ws.git_manager = MagicMock()
-        mock_ws.git_manager.is_active = False
-        mock_ctx = MagicMock()
-        mock_ctx.workspace_manager = mock_ws
-        mock_ctx.consume_freeze_request.return_value = None
-        mock_ctx.drain_pending_memories.return_value = []
-
-        with patch("src.graph.ToolNode") as MockToolNode:
-            mock_tn = AsyncMock()
-            mock_tn.ainvoke = AsyncMock(
-                return_value={"messages": [make_tool_result("read_file", "ok")]}
-            )
-            MockToolNode.return_value = mock_tn
-
-            audited = create_audited_tool_node([fake_tool], cfg, tool_context=mock_ctx)
-
-            # 6 calls in strategic phase: exceeds cap
-            for i in range(6):
-                state = make_state(
-                    [make_tool_call("read_file", {"path": f"f_{i}"}, f"call_{i}")],
-                    is_strategic=True,
-                )
-                result = await audited(state)
-
-            assert result.get("should_stop") is True
-            msgs = result.get("messages", [])
-            assert any("phase frozen" in m.content.lower() for m in msgs)
-            assert any(isinstance(m, ToolMessage) for m in msgs)
-
-    @pytest.mark.asyncio
-    async def test_hard_cap_resets_on_phase_change(self):
-        """Hard cap counter should reset when phase changes."""
-        cfg = FakeConfig(limits=LimitsConfig(max_tool_calls_per_phase=5))
+    async def test_job_cap_does_not_reset_on_phase_change(self):
+        """The whole point — a per-phase counter never bounded the job."""
+        cfg = FakeConfig(limits=LimitsConfig(max_tool_calls_per_job=6))
         fake_tool = MagicMock()
         fake_tool.name = "read_file"
 
@@ -676,25 +637,88 @@ class TestHardCap:
                 return_value={"messages": [make_tool_result("read_file", "ok")]}
             )
             MockToolNode.return_value = mock_tn
-
             audited = create_audited_tool_node([fake_tool], cfg)
 
-            # Phase 1: use 4 of 5 budget
             for i in range(4):
-                state = make_state(
-                    [make_tool_call("read_file", {"path": f"f_{i}"}, f"call_{i}")],
-                    phase_number=1,
+                await audited(
+                    make_state(
+                        [make_tool_call("read_file", {"path": f"f_{i}"}, f"c{i}")],
+                        phase_number=1,
+                    )
                 )
-                await audited(state)
+            # New phase: the phase counter resets, the job counter must not.
+            results = []
+            for i in range(3):
+                results.append(
+                    await audited(
+                        make_state(
+                            [make_tool_call("read_file", {"path": f"g_{i}"}, f"g{i}")],
+                            phase_number=2,
+                        )
+                    )
+                )
 
-            # Phase 2: counter resets, can do 5 more
-            for i in range(5):
-                state = make_state(
-                    [make_tool_call("read_file", {"path": f"g_{i}"}, f"call_g{i}")],
-                    phase_number=2,
+        assert results[-1].get("should_stop") is True
+        assert results[-1]["freeze_data"]["budget_scope"] == "job"
+
+    @pytest.mark.asyncio
+    async def test_job_cap_zero_disables_the_stop(self):
+        cfg = FakeConfig(limits=LimitsConfig(max_tool_calls_per_job=0))
+        fake_tool = MagicMock()
+        fake_tool.name = "read_file"
+
+        with patch("src.graph.ToolNode") as MockToolNode:
+            mock_tn = AsyncMock()
+            mock_tn.ainvoke = AsyncMock(
+                return_value={"messages": [make_tool_result("read_file", "ok")]}
+            )
+            MockToolNode.return_value = mock_tn
+            audited = create_audited_tool_node([fake_tool], cfg)
+
+            for i in range(40):
+                result = await audited(
+                    make_state(
+                        [make_tool_call("read_file", {"path": f"f_{i}"}, f"c{i}")]
+                    )
                 )
-                result = await audited(state)
                 assert not result.get("should_stop", False)
+
+    @pytest.mark.asyncio
+    async def test_phase_cap_still_honoured_when_set(self):
+        """Back-compat: an operator who deliberately sets one still gets it."""
+        cfg = FakeConfig(
+            limits=LimitsConfig(max_tool_calls_per_phase=5, max_tool_calls_per_job=0)
+        )
+        fake_tool = MagicMock()
+        fake_tool.name = "read_file"
+
+        with patch("src.graph.ToolNode") as MockToolNode:
+            mock_tn = AsyncMock()
+            mock_tn.ainvoke = AsyncMock(
+                return_value={"messages": [make_tool_result("read_file", "ok")]}
+            )
+            MockToolNode.return_value = mock_tn
+            audited = create_audited_tool_node([fake_tool], cfg)
+
+            for i in range(5):
+                await audited(
+                    make_state(
+                        [make_tool_call("read_file", {"path": f"f_{i}"}, f"c{i}")]
+                    )
+                )
+            result = await audited(
+                make_state([make_tool_call("read_file", {"path": "f6"}, "c6")])
+            )
+
+        assert result.get("should_stop") is True
+        assert result["freeze_data"]["budget_scope"] == "phase"
+
+    @pytest.mark.asyncio
+    async def test_phase_cap_off_by_default(self):
+        """The default config must not stop a long single phase."""
+        cfg = FakeConfig(limits=LimitsConfig())
+        assert cfg.limits.max_tool_calls_per_phase == 0
+        assert cfg.limits.max_tool_calls_per_job == 5000
 
 
 # =============================================================================
@@ -1072,20 +1096,20 @@ class TestFreezePayload:
 
 
 # =============================================================================
-# Test: todo_rewind resets loop detection
+# Test: request_replan resets loop detection
 # =============================================================================
 
 
-class TestTodoRewindReset:
-    """Tests for todo_rewind resetting loop detection state."""
+class TestRequestReplanReset:
+    """Tests for request_replan resetting loop detection state."""
 
     @pytest.mark.asyncio
     async def test_rewind_clears_loop_state(self, config):
-        """Successful todo_rewind should reset loop detection state."""
+        """A successful request_replan should reset loop detection state."""
         fake_tool = MagicMock()
         fake_tool.name = "some_tool"
         fake_rewind = MagicMock()
-        fake_rewind.name = "todo_rewind"
+        fake_rewind.name = "request_replan"
 
         with patch("src.graph.ToolNode") as MockToolNode:
             mock_tn = AsyncMock()
@@ -1106,15 +1130,19 @@ class TestTodoRewindReset:
                 return_value={
                     "messages": [
                         make_tool_result(
-                            "todo_rewind",
-                            "Archived 5 todos. To recover...",
+                            "request_replan",
+                            "Replan requested. Progress kept...",
                             "call_rw",
                         )
                     ]
                 }
             )
             state = make_state(
-                [make_tool_call("todo_rewind", {"issue": "approach broken"}, "call_rw")]
+                [
+                    make_tool_call(
+                        "request_replan", {"reason": "approach broken"}, "call_rw"
+                    )
+                ]
             )
             await audited(state)
 
@@ -1132,11 +1160,11 @@ class TestTodoRewindReset:
 
     @pytest.mark.asyncio
     async def test_failed_rewind_does_not_reset(self, config):
-        """A failed todo_rewind should NOT reset loop detection state."""
+        """A failed request_replan should NOT reset loop detection state."""
         fake_tool = MagicMock()
         fake_tool.name = "some_tool"
         fake_rewind = MagicMock()
-        fake_rewind.name = "todo_rewind"
+        fake_rewind.name = "request_replan"
 
         with patch("src.graph.ToolNode") as MockToolNode:
             mock_tn = AsyncMock()
@@ -1157,7 +1185,7 @@ class TestTodoRewindReset:
                 return_value={
                     "messages": [
                         make_tool_result(
-                            "todo_rewind",
+                            "request_replan",
                             "Error: You must provide an 'issue' describing why",
                             "call_rw",
                         )
@@ -1165,7 +1193,7 @@ class TestTodoRewindReset:
                 }
             )
             state = make_state(
-                [make_tool_call("todo_rewind", {"issue": ""}, "call_rw")]
+                [make_tool_call("request_replan", {"reason": ""}, "call_rw")]
             )
             await audited(state)
 
@@ -1263,9 +1291,9 @@ class TestPhaseGate:
 
     @pytest.mark.asyncio
     async def test_tactical_only_tool_rejected_in_strategic(self, config):
-        """todo_rewind (tactical-only) is rejected in strategic phase."""
+        """request_replan (tactical-only) is rejected in strategic phase."""
         fake_tool = MagicMock()
-        fake_tool.name = "todo_rewind"
+        fake_tool.name = "request_replan"
 
         with patch("src.graph.ToolNode") as MockToolNode:
             mock_tn = AsyncMock()
@@ -1274,7 +1302,7 @@ class TestPhaseGate:
             audited = create_audited_tool_node([fake_tool], config)
 
             state = make_state(
-                [make_tool_call("todo_rewind", {"issue": "stuck"}, "call_rw")],
+                [make_tool_call("request_replan", {"reason": "stuck"}, "call_rw")],
                 is_strategic=True,
             )
             result = await audited(state)

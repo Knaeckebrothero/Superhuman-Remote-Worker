@@ -74,7 +74,8 @@ todos:
       (1) Lists completed phases from the previous run (for context).
       (2) Creates corrective phases ordered by feedback severity (critical first).
       (3) Each corrective phase targets specific feedback items and files.
-      (4) Estimates todo count per phase (target 2-5 todos per phase).
+      (4) Prefers ONE corrective phase covering all the feedback; split into
+      several only where a later fix genuinely depends on an earlier one landing.
 
       REWRITE plan.md — the old plan is no longer relevant.
 
@@ -104,7 +105,7 @@ todos:
       - Include a verification todo that checks the corrected output against
         the original feedback
 
-      Target 2-5 todos for the first corrective phase.
+      Cover all the feedback in one corrective phase where you can.
 
       CRITICAL: Do not call job_complete in this phase. You have not yet made
       the corrections — you are only planning them. job_complete should only be

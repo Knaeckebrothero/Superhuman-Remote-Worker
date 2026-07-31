@@ -10,6 +10,8 @@ aliases:
   - phase overhead deep dive
   - forced compaction amnesia loop
   - strategic phase overhead
+  - fewer larger phases
+  - three-phase jobs
 related:
   - "[[officer_blind_reads_and_worker_bureaucracy]]"
   - "[[officer_conference_live_fire_findings]]"
@@ -21,18 +23,29 @@ related:
 
 # Phase-model overhead: the forced-compaction amnesia loop
 
-**Status:** 🔴 **OPEN** — filed 2026-07-31 after a code-side deep dive
-prompted by "the phase model isn't suited for small tasks (and maybe not
-for long ones either)". Nothing below is fixed. The measurements are from
-phase archives pulled live before the dev API went down; the token-side
-confirmation is still owed (see *Not yet verified*).
+**Status:** 🟡 **IN PROGRESS** — filed 2026-07-31 after a code-side deep
+dive prompted by "the phase model isn't suited for small tasks (and maybe
+not for long ones either)". The root cause (P-1), the structural
+prerequisites for enlarging phases, and the behaviour change itself have
+since shipped in-tree; see §5.
+The measurements are from phase archives pulled live before the dev API
+went down; the token-side confirmation is still owed (see *Not yet
+verified*).
 
-**One-line summary.** The strategic/tactical loop forcibly wipes the
-agent's working context at every strategic→tactical boundary, then
-mandates that the next strategic phase reconstruct that same state from
-git — and charges ~15k tokens of transient injection for every turn of
-that reconstruction, on a memory tier that gets *less* useful as the job
-gets longer.
+**Direction, decided 2026-07-31.** The split is **not** being torn down.
+Tactical phases get much larger, so a job runs roughly three phases —
+plan → execute → review-and-submit. That turns out to be mostly a
+*prompt* change (§7); the code work is removing the things that silently
+depended on boundaries being frequent.
+
+**One-line summary (the diagnosis as filed).** The strategic/tactical
+loop forcibly wiped the agent's working context at every
+strategic→tactical boundary, then mandated that the next strategic phase
+reconstruct that same state from git — charging ~15k tokens of transient
+injection for every turn of that reconstruction, on a memory tier that
+got *less* useful as the job got longer. The wipe and the memory ratchet
+are now fixed; the injection floor (P-4) and the unconditional
+reconstruction block (P-2) are not.
 
 ---
 
@@ -110,13 +123,16 @@ workspace files) is outrunning the template fixes; cf. P2-A in
 
 ### F1 — Every strategic phase ends by forcibly erasing its own context
 
-`src/graph.py:2907`, inside `archive_phase`:
+> **✅ Fixed 2026-07-31** (§5, slice 1). Described below in the present
+> tense as it stood at filing; the line now reads `force_summarize = False`.
+
+`src/graph.py:2957`, inside `archive_phase`:
 
 ```python
 force_summarize = is_strategic  # True when completing strategic phase
 ```
 
-`compact_on_archive: true` (`config/worker_base.yaml:275`) means every
+`compact_on_archive: true` (`config/worker_base.yaml`) means every
 phase boundary calls `ensure_within_limits`; `force=True` on the
 strategic side makes it summarize **regardless of token pressure**. The
 inline comment states the intent plainly: *"This gives tactical phases a
@@ -126,6 +142,10 @@ So the phase that just did the thinking has its reasoning replaced by a
 prose summary the moment it finishes.
 
 ### F2 — The git archaeology is a *consequence* of F1, not independent bureaucracy
+
+> **Unblocked, not removed.** With F1 fixed the archaeology is no longer
+> *load-bearing* — the context it reconstructs is still there. Making the
+> block conditional so it is no longer *paid* is P-2, still open.
 
 `config/templates/strategic_todos_transition.yaml:14`:
 
@@ -154,10 +174,10 @@ todo list appended last at `src/graph.py:1224`).
 
 | Injection | Per-turn cost | Source |
 |---|---|---|
-| memory | up to **10,000 tok** | `config/worker_base.yaml:296` `budget_tokens` |
+| memory | up to **10,000 tok** | `config/worker_base.yaml` `memory.budget_tokens` |
 | knowledge | ~2,500 tok | `src/graph.py:713` (budget estimate) |
 | todo list, **verbatim bodies** | ~2,135 tok initial / ~1,000 tok transition | `src/graph.py:853` `format_for_injection()` |
-| `verify-before-done` SKILL.md | ~909 tok, **every tactical turn** | `config/worker_base.yaml:201` `trigger: phase:tactical`, `enforce: false` |
+| `verify-before-done` SKILL.md | ~909 tok, **every tactical turn** | `config/worker_base.yaml` `instruction_files`, `trigger: phase:tactical`, `enforce: false` |
 | phase system prompt | ~1,400–1,600 tok | `config/prompts/{strategic,tactical}*.txt` |
 
 **≈15k tokens of scaffolding before a single line of conversation
@@ -170,7 +190,7 @@ ceremony template is re-injected verbatim on every turn of that phase.
 
 ### F4 — The memory tier starves relevance as the job grows
 
-`src/services/recall_store.py:1166`, assembly order:
+`src/services/recall_store.py:1186`, assembly order:
 
 1. **Tier 1**: `get_ttl_active()` (`recall_store.py:956`) — all memories
    with `remaining_turns > 0`, **ordered by `importance DESC`**, appended
@@ -187,10 +207,21 @@ culture documented in the postmortem: the process lore is not being
 *recalled*, it is being **injected by construction, every turn**.
 
 It also grows monotonically: extraction fires at every phase boundary
-(`src/graph.py:2723`, `CaptureEvent(kind="phase_boundary")`) *and* every
-5 turns (`config/worker_base.yaml:298` `observer_interval: 5`). More
+(`src/graph.py:2761`, `CaptureEvent(kind="phase_boundary")`) *and* every
+5 turns (`config/worker_base.yaml` `memory.observer_interval: 5`). More
 phases → larger pinned tier → smaller relevance share → worse-informed
 strategic phases → more archaeology → more phases.
+
+> **Amended 2026-07-31 — the growth was a bug, not the policy.** Extraction
+> volume is not what produced ~2,400 pinned rows. `hybrid_search`'s
+> access-tracking UPDATE re-armed `remaining_turns` to the full TTL for
+> every row it *fetched* (up to 150/turn) while `decrement_ttl` only ticks
+> −1/turn, so a memory expired only if it stayed out of the top-150 for ten
+> consecutive turns — and rows the budget loop discarded, which the model
+> never saw, came back pinned anyway. Retrieval was re-pinning the tier
+> that was starving retrieval. Fixed in §5, slice 1. The tier-1-first
+> assembly order described above is unchanged and is still worth capping
+> (P-3), but it now guards a bounded pool.
 
 ### F5 — Together, F1–F4 explain the 106s → 768s curve
 
@@ -220,15 +251,15 @@ The phase loop reimplemented a worse variant by accident.
 
 ## 4. Fix directions (causal order — each is upstream of the next)
 
-- **P-1 — Stop forcing summarization at strategic→tactical**
-  (`src/graph.py:2907`). Let compaction be threshold-driven like
+- **P-1 — ✅ SHIPPED. Stop forcing summarization at strategic→tactical**
+  (`src/graph.py:2957`). Let compaction be threshold-driven like
   everywhere else. One line. This is the root: with context intact across
   the boundary, the git archaeology becomes *optional* and the intended
   "tick and continue" design becomes expressible at all. Risk: strategic
   phases inherit tactical tool-result bloat — mitigated by the existing
   `clear_old_tool_results` + threshold path, and empirically survivable
   (the persistent/session runtime runs for days without a forced wipe).
-- **P-2 — Make REVIEW-AND-ADAPT conditional.** Fast path when every
+- **P-2 — ⬜ NOT STARTED. Make REVIEW-AND-ADAPT conditional.** Fast path when every
   tactical todo completed **and** the P1-C deliverable manifest — already
   written at every boundary to `output/manifest_status.json` — agrees the
   contract paths moved: append one outcome line to `plan.md`, stage the
@@ -237,22 +268,349 @@ The phase loop reimplemented a worse variant by accident.
   artifact-based rather than narrative-based, so it is simultaneously
   cheaper and harder to fake than reading a diff. Depends on P-1 for
   honesty.
-- **P-3 — Cap the pinned memory tier** at a fraction of budget (~30 %) so
-  hybrid search always gets a share, and make phase-boundary extraction
-  outcome-gated (this is P2-A from the postmortem). Without it, P-1/P-2
-  savings are eaten back as the pool grows.
-- **P-4 — Trim the per-turn floor.** 10k memory budget is very large for
-  a worker; todo bodies can inject verbatim once and then as ID+status;
-  `verify-before-done` does not need re-injection on every tactical turn.
+- **P-3 — 🟡 PARTIAL. Cap the pinned memory tier** at a fraction of
+  budget (~30 %) so hybrid search always gets a share, and make
+  phase-boundary extraction outcome-gated (this is P2-A from the
+  postmortem). Without it, P-1/P-2 savings are eaten back as the pool
+  grows. **The mechanical half is fixed** — see the TTL ratchet in §5 —
+  which removes the runaway. The *policy* half (an explicit budget cap on
+  the pinned tier) is still open; it now guards a pool that no longer
+  grows without bound.
+- **P-4 — ⬜ NOT STARTED. Trim the per-turn floor.** 10k memory budget is
+  very large for a worker; todo bodies can inject verbatim once and then
+  as ID+status; `verify-before-done` does not need re-injection on every
+  tactical turn.
 
 ---
 
-## 5. What this means for the "add a ReAct runtime" proposal
+## 5. What shipped (2026-07-31, in-tree, uncommitted)
+
+Six slices. The first is the root cause; slices 2-4 exist because
+enlarging phases removes guarantees that were quietly riding on
+boundaries being frequent — durability, steering, and the ability to
+change the plan mid-phase. Slice 5 is the behaviour change itself; slice 6
+removes the last thing that would have fought it.
+
+### Slice 1 — the amnesia loop itself
+
+- **`force_summarize = False`** (`src/graph.py:2957`). The one-liner from
+  P-1. Compaction is now threshold-driven everywhere.
+- **Provider-anchored compaction trigger** (`src/graph.py`, in `execute`).
+  The worker now feeds `response.usage_metadata["input_tokens"]` to
+  `context_mgr.record_provider_usage`, mirroring the session loop
+  (`persistent_graph.py:1968`). This had to land *with* P-1, not after:
+  the trigger previously ran on a local estimate blind to 60–90 bound
+  tool schemas (~10–25k tokens/request), and forced boundary compaction
+  was the only thing masking that undercount. Remove the mask without
+  fixing the meter and the real request runs far larger than the
+  threshold can see.
+- **Evidence carve-out emptied** (`src/core/context.py`,
+  `preserve_content_patterns`). It retained every tool result containing
+  `error:`/`failed`/`not found`/etc. *forever*. Its stated consumer, the
+  strategic `<phase_audit_protocol>`, was deleted in `4eba5d47` — the
+  consumer was gone, the unbounded retention stayed. It is also actively
+  harmful: retaining an agent's own past errors is the measured
+  self-conditioning effect (arXiv 2509.09677, accuracy ~70 % → ~15 % as
+  induced past errors rise, undiminished by model scale). Side-effect
+  tools (`write_file`/`edit_file`/`patch_*`) keep their exemption, and
+  recent failures remain verbatim inside `keep_recent_tool_results` — the
+  carve-out only ever governed results *older* than that window.
+- **TTL re-arm ratchet removed** (`src/services/recall_store.py`,
+  `hybrid_search` access tracking). This is the mechanical cause behind
+  F4, and it is a bug rather than a policy choice: the access-tracking
+  UPDATE re-armed `remaining_turns` to the full TTL for every row the
+  search *fetched* — up to 150 per turn — while `decrement_ttl` only
+  ticks −1 per turn. A memory therefore expired only if it stayed out of
+  the top-150 for ten consecutive turns. Worse, it re-armed rows that the
+  budget loop then *discarded*: rows the model never saw came back
+  pinned, growing the very tier that starves relevance retrieval. All
+  three runtimes funnel through that one seam.
+
+### Slice 2 — progress durability (`src/core/progress_commit.py`, new)
+
+All six `git_mgr.push()` calls lived in `src/core/phase.py`, so every
+external view of a running job — orchestrator, cockpit, MCP workspace
+tools, officer — was defined as *"committed state as of the last
+phase-boundary push"*. At ~16 phases that was an incidental ~4-minute
+heartbeat. At three phases it is hours of silence in which the step count
+climbs and every artifact reads empty, which is **worse than a visible
+stall**: missing evidence reads as evidence of no work. That is the
+night-2 false-conviction shape (F7/F8 in
+[[officer_conference_live_fire_findings]]) recreated structurally.
+
+`ProgressCommitter` has two triggers, deliberately not one:
+
+- `on_todo_complete()` from the `todo_complete` tool — the semantic one,
+  giving history real messages (`todo_3: add retry to the fetch path`).
+- `on_turn()` from `audited_tools` — a wall-clock floor committing `WIP:`
+  after `limits.progress_wip_commit_after_seconds` (300). **This is the
+  load-bearing one.** The semantic trigger is anti-correlated with need:
+  an agent grinding on one hard todo emits no completions, so a
+  todo-only policy goes quiet exactly when an observer most needs signal.
+  It also backstops the model simply forgetting to call `todo_complete`
+  — durability must not depend on a tool the model may skip.
+- `flush()` is unconditional, wired into the tool-requested freeze path
+  (ordered *after* `result["should_stop"]` is set, since it shares that
+  `try` and losing the freeze to a git error would be worse).
+
+Commit and push are separated on purpose: commit is local and free (per
+todo), push is a Gitea round-trip throttled by
+`limits.progress_push_interval_seconds` (60) and guarded by
+`has_unpushed_commits()` — which is network-free and was already
+documented as *"used to decide whether an end-of-turn push is
+worthwhile"*. A failed push still resets the clock, so a down remote
+costs one attempt per interval rather than one per turn.
+
+*Trap worth recording:* `WorkspaceManager._git_manager` is reassigned in
+several places (`src/core/workspace.py:547/562/571/637`) and a mid-job
+tier upgrade swaps it. The committer therefore takes a **provider
+callable**, resolved per call. A handle captured once would commit
+against a dead workspace, or stop committing — with no error either way.
+
+### Slice 3 — steering lane B re-keyed
+
+Steering has **two** lanes, and only one was broken:
+
+- **Lane A — `pending_guidance`** (urgent). Rides the heartbeat into
+  `dual_app`'s inbox and is re-derived **every turn** at
+  `src/graph.py:1121` as a transient `[SUPERVISOR GUIDANCE]` block.
+  Already phase-independent and compaction-immune. **Untouched.**
+- **Lane B — `queued_replies`** (the default,
+  `async_reply: "next_strategic_phase"`, `orchestrator/main.py:10114`).
+  Drained only in `handle_transition`, behind `if not is_strategic`.
+
+At three phases a job has exactly one tactical→strategic boundary, so a
+non-urgent reply sent during planning waits out the whole execution
+phase, and one sent during review — the phase where a supervisor is most
+likely to write — is **never delivered at all**. Not late: absent.
+
+Lane B is now keyed to `todo_complete` (via
+`ToolContext.request_reply_drain()`, drained in `audited_tools`) with a
+`limits.queued_reply_max_wait_seconds` floor, for exactly the same
+anti-correlation reason as slice 2. A finished todo *is* the natural
+break the `next_strategic_phase` default was trying to express — same
+intent, roughly an order of magnitude more often, independent of phase
+structure. `queued_replies` now rides the heartbeat next to
+`pending_guidance` (same job-row read, zero marginal DB cost); this was
+also forced, since `audited_tools` has no `postgres_db`.
+
+Two hazards found and closed while building:
+
+1. **Duplicate accumulation.** The ack is fire-and-forget, so the
+   heartbeat keeps returning delivered entries for up to one interval.
+   Lane A shrugs this off because its block is transient; lane B appends
+   **persistent** `HumanMessage`s, so every todo completed in that window
+   would stack the same reply into history permanently. Closed with a
+   content-derived `_reply_key()` plus `ToolContext._delivered_reply_keys`
+   (queued replies carry no id, unlike guidance entries). Process-local
+   on purpose — a successor pod has no record of the delivery and *should*
+   redeliver.
+2. **Backstop race.** The phase-boundary drain survives, because outside
+   the dual app there is no heartbeat inbox and the DB is the only
+   source. But it reads the DB directly and could re-append mail the new
+   path had already delivered. `tool_context` is now threaded into
+   `create_handle_transition_node` and the backstop filters through the
+   same key set.
+
+### Slice 4 — `todo_rewind` → `request_replan`
+
+The tactical phase's only escape hatch was `todo_rewind`, and it was a
+genuine rewind. It called `archive_with_failure_note`, which wrote **every
+todo — including the completed ones** — into `archive/failed_<time>.md`
+and emptied the list. The strategic phase that followed therefore
+inherited no record of what had actually been achieved and had to
+reconstruct it, which is the same amnesia pattern as F1 arriving by a
+different door.
+
+It also never asked for the strategic phase. It reached one *indirectly*,
+by leaving the todo list empty until `check_todos` hit its "no todos in
+tactical phase — forcing phase complete to recover" branch — a path that
+exists for resume bugs.
+
+`request_replan` keeps everything:
+
+- **Nothing is archived-as-failed and nothing is cleared.** Completed
+  todos stay completed, pending ones stay pending, and `archive_phase`
+  records them at the boundary with their real statuses — which is
+  exactly what the incoming strategic phase needs in order to decide what
+  to carry forward. Files and commits were never touched by either
+  version.
+- **The boundary is requested explicitly**, via
+  `ToolContext.request_replan(reason)` → `check_todos` →
+  `phase_complete=True`, instead of falling through a recovery branch.
+- **The reason reaches the next phase.** `check_todos` puts it in
+  `state["replan_reason"]`; `handle_transition` injects a
+  `[REPLAN REQUESTED]` message telling the strategic phase this was
+  deliberate, not a failure, and that valid work should be carried
+  forward rather than redone. It is cleared at the transition so a stale
+  reason cannot steer a later phase.
+- Staged todos *are* still dropped — they are a bet on the plan being
+  revised, so the strategic phase should re-decide rather than inherit
+  them.
+
+The rename is deliberate. Tool names are what the model actually reads,
+and "rewind" states the opposite of what the tool now does. This matters
+more at three phases, where `request_replan` is the **only** way to adapt
+mid-job. Note the name appears in eight config files
+(`config/worker_base.yaml` plus seven expert configs), so the rename had
+to sweep those too — `tests/test_config_tool_names_are_registered.py` is
+what guards that.
+
+The unrelated `max_tool_calls_per_phase` budget rewind (§7, blocker 3)
+still calls `archive_with_failure_note` and is unchanged.
+
+### Slice 5 — the prompts
+
+Three kinds of strictness live in the prompts and they were not all the
+same problem.
+
+**Loosened — phase sizing.** The old guidance did not merely suggest small
+phases, it *asked for* them: `config/templates/strategic_todos_initial.yaml`
+(pre-change) read
+"Target 2-5 todos per tactical phase. **Prefer many short phases over few
+long ones**", and the developer template said the same. The default is now
+one execution phase covering the task, with a second phase having to earn
+its planning cycle. Rewritten in: the four `instructions*.md` variants, the
+generic `strategic_todos_initial.yaml` / `_resume.yaml` /
+`_transition_gpt_oss.yaml`, and the scholar, developer and designer
+`strategic_todos_initial.yaml` + `todo_guide.md`. `max_todos` 20 → 30.
+
+Two experts were deliberately *not* collapsed to one phase:
+
+- **developer** — `spec`/`red`/`green`/`refactor` differ in what they are
+  allowed to write, and the guide names mixing them as the failure mode
+  that erases TDD. The phase count there is the methodology. What changed
+  is splitting *within* a type: one red phase covering every failing test,
+  8-16 todos rather than 5-10.
+- **designer** — phases are user-facing groupings (core screens / edge
+  cases / polish). Kept, batch raised 3-5 → 6-12.
+
+**Retargeted — instructions written for an amnesiac agent.**
+`strategic*.txt` step 7 told the agent to "regenerate deliverables from
+scratch rather than editing stale artifacts". That was correct when it
+could not trust what it had; with context surviving the boundary and
+per-todo commits it is now actively wasteful, and it is exactly the
+compounding cost F5 describes. It now says to edit in place, and to
+regenerate only for artifacts predating the run. The tactical "stay on the
+current task" constraint and the "if blocked on multiple todos, end the
+phase early" line both now name `request_replan`, which is the mechanism
+they were describing without having one.
+
+**Deliberately NOT loosened — verification.** `verify-before-done` and
+tactical steps 5-6 (read the semantic content of tool output, do not
+proceed as if a failed call succeeded, do not fabricate missing data) are
+untouched. The measured failure in §2b was 1,645 audit entries and **zero
+contract deliverables** — lots of activity, nothing that held up. That
+calls for more verification discipline, not less; the skill itself cites
+the number (missing or incorrect verification is ~1 in 4 multi-agent
+failures, MAST arXiv 2503.13657). The overhead was never the verification,
+it was the amnesia and the reconstruction the amnesia forced.
+
+There *is* a real cost complaint inside that: `verify-before-done` is
+~909 tokens on **every tactical turn**. That is an injection-economics
+problem (P-4) — inject it once per phase, or at todo-completion time when
+it actually applies — not a reason to weaken the content.
+
+**Caveat.** Prompt changes are the least verifiable part of this work
+offline. Tests confirm the templates still parse and render; they cannot
+confirm the model behaves differently. This slice above all needs the k3d
+run before it goes near dev.
+
+### Slice 6 — the tool-call budget becomes job-level
+
+`max_tool_calls_per_phase: 500` was the last hard blocker, and looking at it
+properly it was wrong in three ways at once.
+
+**Wrong unit.** It reset at every phase boundary, so it bounded a *phase*
+and never a *job*. With ~16 phases it was really an ~8,000-call job budget;
+with three large phases it would have become ~1,500 — a **tightening**,
+exactly backwards for this model.
+
+**Wrong action.** On the tactical side it did not freeze, it *rewound* —
+calling `archive_with_failure_note`, which writes every todo (the completed
+ones included) into a failure archive and empties the list. That is the
+identical destructive behaviour removed from `request_replan` in slice 4,
+and it fired on jobs that had usually done real work.
+
+**Load-bearing in a way nothing else is.** Grep says it plainly at the
+progress nudge: *"Never freezes the job — the hard cap is the only stop."*
+The progress nudge and act-ratio tripwire only inject reminders; loop
+detection only masks tools; and the orchestrator has **no** job-duration
+ceiling (`mark_stuck_working_agents_ready` is about agents with no job, and
+`get_stuck_jobs` is a query tool, not enforcement). Removing the budget
+outright would have left a wedged job burning credits until a human noticed
+— which for overnight unattended runs is the whole exposure.
+
+So: **bumped and re-scoped rather than removed.**
+
+- `max_tool_calls_per_job: 5000` — new, counted across phases, never reset
+  at a boundary. Roughly matches the old *effective* job budget, so it is a
+  bump in practice as well as in shape.
+- `max_tool_calls_per_phase: 0` — off by default, knob retained so an
+  operator who deliberately wants a per-phase guard still has one.
+- Hitting either now **freezes** with `budget_exceeded` and flushes the
+  workspace first. Nothing is archived-as-failed and nothing is cleared.
+  `budget_exceeded` is not in `AUTO_REDISPATCH_FREEZE_TYPES`, so it parks
+  for human review and cannot livelock.
+- The progress nudge no longer quotes a phase budget, and stays silent
+  about remaining calls when no budget is armed — an unbounded job must not
+  be told it has "0 calls remaining".
+
+Set `max_tool_calls_per_job: 0` to disable the stop entirely. That is
+supported, but it leaves **no** automatic ceiling on a runaway job; only do
+it when something else is watching the spend.
+
+The now-unreachable `budget_rewind` guardrail template was deleted from
+`default.yaml`, `gemma.yaml` and `KNOWN_NUDGES`. Leaving it would have
+repeated the slice-1 pattern exactly: a consumer deleted, its config left
+behind to confuse the next reader.
+
+### Verification
+
+12,258 pass; the 11 failures are pre-existing and were proven so by
+stashing the changes and re-running on a clean tree (they need live
+Postgres, live MCP servers, or assert on CI workflow content). `ruff`
+clean. New suites: `tests/test_progress_commit.py` (29),
+`tests/test_queued_reply_steering.py` (23),
+`tests/test_request_replan.py` (16).
+`tests/test_supervisor_guidance.py` unchanged and green — the check that
+lane A was not disturbed. Beyond unit level: `ProgressCommitter` was
+exercised against a real `GitManager` on a scratch repo (multi-line todo
+flattened into a subject, clean tree correctly producing *no* commit,
+floor firing, `git=None` mid-job degrading quietly), and every new config
+knob was round-tripped through `serialize_resolved_config` including a
+non-default override.
+
+**Not yet run on a cluster.** No job has executed against this code.
+
+---
+
+## 6. What this means for the "add a ReAct runtime" proposal
 
 The session opened with the idea of adding a proper ReAct-loop runtime
-alongside the phase model. Two corrections came out of the dive.
+alongside the phase model. Three corrections came out of the dive.
 
-**First, the runtime already exists.** `src/persistent_graph.py::run_persistent_loop`
+**First — there are already four ReAct loops, not one or two.** Counted
+2026-07-31; every one of them dispatches `tool_calls` in a loop, and they
+have all diverged:
+
+| # | Where | Size | Shape | Drives |
+|---|---|---|---|---|
+| 1 | `src/graph.py` | 5,054 | The **only** `StateGraph` in the repo | jobs |
+| 2 | `src/persistent_graph.py` | 2,444 | **Not a graph** despite the name — plain `while True:` at 781, inner tool loop at 1363 | sessions **and** the officer |
+| 3 | `src/services/auxiliary.py::AuxiliaryLLM.agent()` | ~105 | `for iteration in range(max_iterations)` + a forced structured-output call | knowledge curation, memory assembly |
+| 4 | `src/tools/delegation/light_runner.py::run_light_subagent` | 320 | deadline + forced synthesis on timeout | `spawn_subagent` |
+
+The divergence *is* the tax. Stop conditions differ (`max_tool_calls_per_phase`,
+which resets per phase, vs an iteration cap vs wall-clock deadlines);
+timeout behaviour differs (2 and 4 force an answer, 1 and 3 do not);
+retry policy differs (`_READER_RETRY` vs `_is_retryable_llm_error` vs
+`llm_retry`); and only #2 anchored compaction on provider token counts
+until slice 1 above fixed #1. That last one is this failure mode in
+miniature — a correctness fix living in one loop and silently absent from
+the others for months. **Do not build a fifth.**
+
+**Second, the runtime already exists.** `src/persistent_graph.py::run_persistent_loop`
 is a plain ReAct loop with compaction, memory injection, KB injection,
 skills, a phase-free `SessionTaskManager` todo list
 (`src/managers/session_tasks.py`), its own audit sink, its own
@@ -264,7 +622,16 @@ blocking on `get_user_input()`, and reuse of `job_complete` → `freeze_data`.
 The orchestrator is already runtime-agnostic (it reads the completion
 POST; the P1-C contract and seal gate are orchestrator-side).
 
-**Second — and this reverses the sequencing — a ReAct runtime does not
+It is also the only one of the four with the seams a job driver would
+need: `get_current_tools` / `get_current_system_prompt` /
+`get_current_context` are re-read **at the start of every turn** — which
+is precisely "a ReAct loop with changing instructions", already in
+production — plus per-turn commit+push (`persistent_graph.py:949/960`), a
+caller-supplied `messages` list (so resume is a driver concern, not baked
+in), one production caller (`src/api/persistent_app.py:433`) and ten test
+files already driving it headlessly.
+
+**Third — and this reverses the sequencing — a ReAct runtime does not
 fix any of F3/F4.** The injection block and the pinned-first assembly are
 **shared** code: `config/session_base.yaml:163` carries the identical
 `budget_tokens: 10000` and the same tier-1-first path. Porting jobs onto
@@ -285,7 +652,58 @@ audit/stuck-detection between the two runtimes (same disease as
 
 ---
 
-## 6. What already works (keep)
+## 7. The plan from here: fewer, larger phases
+
+The split stays. Tactical phases get much larger, so a job runs roughly
+three phases: **plan → execute → review-and-submit.**
+
+**Most of this was a prompt change, not a code change** — and it has
+shipped (§5, slice 5). `check_todos` ends a tactical phase on exactly one
+condition, `todo_manager.all_complete()`, and nothing else. Phase size is
+therefore purely a function of how many todos the strategic phase
+scheduled. Nothing in the graph ever enforced small phases: we asked for
+them, in the predefined strategic todos the planning phase executes.
+
+The strongest statement was in `config/templates/strategic_todos_initial.yaml` —
+*"Target 2-5 todos per tactical phase. **Prefer many short phases over
+few long ones.**"* Those templates matter more than the general
+"Best Practices" list, because they are the todos the planning phase
+actually runs. Full list of what was rewritten is in slice 5;
+`phase_settings.max_todos` is now 30 (`config/worker_base.yaml`).
+
+**The in-flight adaptation path exists and has been rebuilt** — see §5,
+slice 4. It was `todo_rewind`, a genuine rewind; it is now
+`request_replan`, which keeps everything and just ends the phase early.
+
+### Remaining blockers, in order
+
+1. **✅ Turn-level durability** — slice 2 above.
+2. **✅ Turn-level steering** — slice 3 above.
+3. **✅ Job-level step budget** — §5, slice 6. `max_tool_calls_per_job`
+   (5000) replaces the per-phase rewind, and hitting it freezes rather
+   than destroying todo state. Remaining gap: the counter is in-process,
+   so it resets on pod replacement. Moving it orchestrator-side would make
+   it survive Continue-as-New; that is a hardening, not a blocker, since
+   `budget_exceeded` parks for human review rather than auto-resuming.
+4. **⬜ Turn-level drain.** Exactly one drain check exists
+   (`src/graph.py:3474`, in `handle_transition`). A job inside a
+   multi-hour execution phase would block a fleet drain for that whole
+   time — which matters because every `develop` push re-tags images and
+   rolling-drains the fleet (F7).
+5. **⬜ Autonomy-level semantics.** `partial`, `guided` and `dependent`
+   all pause at phase boundaries. At three phases they collapse into
+   roughly `review` and need redefining against something else.
+6. **✅ Then the behaviour change**: done — §5, slices 4 and 5.
+7. **⬜ Then P-2**, the conditional review fast path — which makes the
+   third phase cheap when nothing diverged.
+
+Note that blockers 1–4 are also exactly the prerequisites a `JobDriver`
+on runtime #2 would need. Nothing here is throwaway if the runtime
+question is reopened later.
+
+---
+
+## 8. What already works (keep)
 
 The system delivers; it pays rent it does not owe. Receipts: `58027ee7`
 completed with a verified claim (179 pass / 3 pre-existing failures —
@@ -301,8 +719,14 @@ backed officer reads (P0-A/B), proven subagent delegation.
 
 ---
 
-## 7. Not yet verified
+## 9. Not yet verified
 
+- **Nothing in §5 has run on a cluster.** All of it is unit- and
+  integration-tested in-tree, and `ProgressCommitter` was exercised
+  against a real `GitManager` on a scratch repo, but no job has executed
+  against this code. The end-to-end check is a job on k3d showing commits
+  landing *between* phase boundaries and a queued reply arriving at a
+  completed todo rather than at a transition.
 - **Token attribution per phase.** All durations above are wall-clock
   from phase archives. The token-side confirmation (`list_llm_requests`
   on `396a5d4c`, bucketed by phase) is owed — the dev API and cluster
@@ -313,7 +737,15 @@ backed officer reads (P0-A/B), proven subagent delegation.
   turns no cheaper than tactical ones.
 - **Whether P-1 alone is sufficient** to stop the growth curve, or
   whether P-3 is required to see it. Testable: run one contracted job
-  before/after and compare the strategic-phase duration sequence.
+  before/after and compare the strategic-phase duration sequence. Note
+  the TTL fix in §5 changes the P-3 baseline — the pinned pool no longer
+  grows without bound, so this should be re-measured before deciding
+  whether the policy cap is still needed.
 - Interaction between P-1 and the `message_count_threshold: 300` /
   `max_tool_calls_per_phase: 500` limits, which have never been exercised
-  with un-forced boundaries.
+  with un-forced boundaries. The second of those is now known to be an
+  active blocker rather than an open question (§7, blocker 3).
+- **Prompt-cache behaviour.** No `cache_control` is set anywhere in the
+  LLM path, and per-phase tool binding invalidates the prefix at every
+  flip. Fewer phases should help by construction, but no hit-rate has
+  been measured, so no cost claim should be made on that basis yet.

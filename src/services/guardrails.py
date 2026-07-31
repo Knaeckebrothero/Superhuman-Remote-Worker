@@ -38,7 +38,6 @@ logger = logging.getLogger(__name__)
 KNOWN_NUDGES: Dict[str, Set[str]] = {
     # src/graph.py recovery + phase nudges
     "todo_action": {"todo_id"},
-    "budget_rewind": {"used", "cap"},
     "degenerate_recovery_assistant": set(),
     "degenerate_recovery_user": {"pattern_detail"},
     "loop_warning_suffix": set(),
