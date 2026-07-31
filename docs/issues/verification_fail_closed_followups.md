@@ -43,20 +43,64 @@ Four movers were found by four successive probes. The fifth-mover check was
 done by **reading** every other workspace-root writer, not by observing a real
 round.
 
-**What settles it:** drive one real job through two verification rounds on dev
-and compare the two recorded `content_tree` values in
-`jobs.context.verification_rounds`. A real agent turn also writes `plan.md`
-(`src/managers/plan.py:93`) and `workspace.md` (`src/managers/memory.py:95`) via
-tools — if either churns per round, the guard is narrowed again and **no test in
-the suite would catch it**. The failure mode is invisible: an inert guard is
-indistinguishable from one with no reason to fire.
+### Live gate — run 2026-07-29/30 on dev. Partial pass.
 
-**Three other things have never been exercised against a live orchestrator:**
-whether a critic actually receives the rendered brief (the template was
-discarded since the orchestrator migration and is fixed but never observed
-working); whether the agent→orchestrator round-recording call and its 409 path
-work from a real agent pod; and whether escalation's wake hook and owner
-notification actually fire.
+Two jobs were driven through the deployed code:
+`7d67d684-633d-4688-9d20-60cb8d7b0a1e` (approved on round 1) and
+`6df02f64-b4d7-477e-877d-ba570610d54d` (a fixture engineered to be returned).
+
+**Confirmed working in production:**
+
+- **The critic receives its rendered brief.** Read directly from the critic's
+  workspace: `instructions.md` is the full template — target job, deliverables,
+  agent summary and confidence, and an `## Open Findings From Previous Rounds`
+  section. This had been rendered-and-discarded on every critic since the
+  orchestrator migration and had never once been observed working. Every
+  downstream correction is visibly present in the text the critic actually read:
+  the `findings`/`dispositions` signatures, "you cannot close a finding by
+  re-judging it", the "not the same thing as being the first round" wording, and
+  "Returning is honoured at ANY severity".
+- **The round-recording endpoint works from a real agent pod.** The critic's
+  freeze reads `round: 1, verdict: approved, open_findings: [], freeze_type:
+  verdict` — a shape that only exists if the agent called the internal endpoint,
+  authenticated, received a *computed* verdict and stored the server's value.
+- **`content_tree` is captured on real freezes:** `257a850e45be…` and
+  `6417fe445bb7…` on the two jobs.
+- **Live corroboration of the original defect:** the first job's freeze records
+  `head_commit: 3c1757a8`, which is the commit *before* its own "Job completed"
+  commit — exactly the pre-commit capture that made the first guard inert, and
+  confirmation that abandoning that field was right.
+
+**Still not measured — the reason this is a partial pass:** cross-round
+`content_tree` stability. Job 1 was approved on round 1, so it recorded a single
+value. Job 2 ran multiple rounds but was derailed by two unrelated defects the
+same run surfaced (below), so its rounds are not a clean comparison. A real
+agent turn also writes `plan.md` (`src/managers/plan.py:93`) and `workspace.md`
+(`src/managers/memory.py:95`) via tools — if either churns per round, the guard
+is narrowed again and **no test in the suite would catch it**. The failure mode
+is invisible: an inert guard is indistinguishable from one with no reason to
+fire.
+
+**Two new defects found by the live run**, both filed separately, neither
+caused by this change:
+
+- `docs/issues/edit_file_append_lost_across_feedback_resume.md` — an
+  `edit_file` append silently does not survive the job-completed → feedback-
+  resume boundary. The fixture's one-paragraph fix never landed across any
+  round; the reviewer correctly kept reporting it missing. This defeats the
+  remediation path generally, not just for verification.
+- `docs/issues/critic_brief_lands_in_shared_workspace_and_misleads_target.md` —
+  the critic inherits the parent's workspace, so its brief is written as
+  `instructions.md` into the root the *target* reads from. The target then
+  believes it is the reviewer and tries to call verdict tools it does not have.
+  Note the shape of this one: fixing brief delivery is what created the
+  exposure.
+
+**Inferred, not confirmed:** job 2 ended in `pending_review` under
+`autonomy: full`, which is what escalation looks like for a non-loop job — the
+approve path would have set `completed`. Reading `error_message` or
+`context.verification_rounds` on that job would confirm which escalation branch
+fired and is the cheapest way to close the question.
 
 ### Standing architectural recommendation
 

@@ -14,7 +14,14 @@ tags:
 **Revised:** 2026-07-27 after a five-agent audit (three codebase, two prior-art).
 The revision **corrected two misdiagnoses in the first version** — see
 [Corrections](#corrections-to-the-first-version-of-this-doc).
-**Status:** CONFIRMED in code + live DB. UNFIXED.
+**Status:** **FIXED AND SHIPPED** — rewritten fail-closed on `develop`
+(32 commits `c9f3cf1a..928ed60b`, pushed and deployed to dev 2026-07-28).
+Live gate run 2026-07-29/30: **partial pass** — brief delivery, the
+round-recording endpoint and `content_tree` capture are all confirmed working
+in production; cross-round `content_tree` stability is still unmeasured. Open
+follow-ups, the settled-questions record and the live-gate results are in
+`docs/issues/verification_fail_closed_followups.md`. This document is retained
+as the incident analysis and design rationale.
 **Severity:** **high** — a quality gate whose every failure mode is
 "approved". Rejected work can reach `completed` with no error, no warning,
 and no log line saying a verdict was lost.
