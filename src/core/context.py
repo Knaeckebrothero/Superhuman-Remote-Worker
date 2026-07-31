@@ -795,17 +795,17 @@ class ContextConfig:
         "patch_file",
         "patch_tool",
     )
-    preserve_content_patterns: Tuple[str, ...] = (
-        "error:",
-        "exception",
-        "traceback",
-        "enoent",
-        "no such file",
-        "permission denied",
-        "not found",
-        "failed",
-        "non-zero exit",
-    )
+    # Failure-content preservation is OFF. It existed to feed the strategic
+    # <phase_audit_protocol>, which was deleted in 4eba5d47 — the consumer is
+    # gone but the unbounded retention stayed, and it is actively harmful:
+    # keeping an agent's own old error traces in context is the measured
+    # "self-conditioning" effect (arXiv 2509.09677 — accuracy falls from ~70%
+    # to ~15% as induced past errors rise, and it does not diminish with model
+    # scale). Recent failures are still visible: keep_recent_tool_results
+    # retains the last N results verbatim regardless of content. This carve-out
+    # only ever governed results OLDER than that window, which are exactly the
+    # ones that should decay to a placeholder. Restore by re-adding patterns.
+    preserve_content_patterns: Tuple[str, ...] = ()
 
 
 def count_tokens_tiktoken(

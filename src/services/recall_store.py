@@ -1106,21 +1106,41 @@ class RecallStore:
             importance_floor,
         )
 
-        # Update access tracking and reset TTL for accessed memories
+        # Update access tracking. This deliberately does NOT re-arm
+        # remaining_turns any more.
+        #
+        # It used to also set `remaining_turns = GREATEST(COALESCE(
+        # remaining_turns, 0), default_ttl)`, which re-pinned every row this
+        # search FETCHED — up to match_count (= max_memories_per_injection,
+        # 150) rows per turn — while decrement_ttl only ticks -1 per turn. A
+        # memory therefore expired only if it stayed out of the top-150 for 10
+        # consecutive turns, so one retrieval stream sustained ~150 x 10 =
+        # ~1,500 permanently-pinned rows, and concurrent jobs sharing a
+        # project scope stacked on top (one project reached ~2,400).
+        #
+        # Worse, the re-arm fired on rows FETCHED, not rows INJECTED: retrieve()
+        # fills the budget from the pinned tier first, then still runs this
+        # search and re-pins all 150 candidates before the budget loop discards
+        # most of them. Rows the model never saw came back pinned, growing the
+        # pinned tier, which ate more budget, which discarded more
+        # freshly-pinned candidates — a self-sustaining ratchet that starved
+        # relevance retrieval entirely (get_ttl_active is injected first, so
+        # once it fills the budget, hybrid search results never reach the LLM).
+        #
+        # All three runtimes (worker, session, MemoryManager) funnel through
+        # this one seam, so this covers every path. Pinning is now what its
+        # docstring claims: set at write, or by an explicit boost_ttl, decayed
+        # once per turn.
         if rows:
             ids = [row["id"] for row in rows]
             await self.db.execute(
                 """
                 UPDATE memories
                 SET access_count = access_count + 1,
-                    last_accessed = CURRENT_TIMESTAMP,
-                    remaining_turns = GREATEST(
-                        COALESCE(remaining_turns, 0), $2
-                    )
+                    last_accessed = CURRENT_TIMESTAMP
                 WHERE id = ANY($1)
                 """,
                 ids,
-                self.default_ttl,
             )
 
         results = [MemoryRecord.from_row(dict(row)) for row in rows]
