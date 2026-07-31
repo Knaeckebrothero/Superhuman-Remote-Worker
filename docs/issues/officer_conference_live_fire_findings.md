@@ -177,9 +177,9 @@ RED tests" was this churn, not worker output.
 > mixed-push scenario**: the shipping push itself retagged only
 > orchestrator+cockpit (agent/workspace untouched → zero drain, the
 > recovery job ran through its own feature's deployment). The docs-only
-> scenario (no deploy commit at all) is expected from the dry-run
-> walkthrough; the push carrying this very doc update is its first live
-> test. Still open:
+> scenario passed its first live test the same morning: the doc-update
+> push's run completed green with **zero deploy commits**. Both
+> acceptance scenarios verified; docs pushes are free again. Still open:
 > digest-based drift comparison (P-G.2), the same pattern in `main.yml`
 > (flagged, needs its own review), and run-sha tagging on the VM image
 > path.
@@ -246,6 +246,23 @@ only provably stalled work; suspect deploys on clustered offline events)
 and recovery option A authorized. The officer's own slot roster put the
 heavy job's workspace on a VM automatically — the one part of the stack
 that held all night.
+
+**Day after (07-31 through the evening).** The P-H channel went live on
+dev (orchestrator+cockpit `sha-0ccc503`; pre-fix pages are not
+backfilled — rows were never written — so the first *new* page is the
+live test of bubbles/card/link). The recovery job `aa25440f` was killed
+at 11:22 by a **workspace I/O timeout** (reading a skill file) — the
+original postmortem's P2-B transport class claiming its third verifier;
+the seal gate therefore remains unexercised (no attempt has yet reached
+a completion claim). What changed is the response: the officer absorbed
+the whole day **without a single page or idle hour** — his sleep notes
+now cite the doctrine verbatim ("per the deploy-churn standing order" on
+a benign offline event, non-destructive guidance at the first
+strategy-only boundary, cancel only on the two-boundary stall rule) —
+cancelled a second stalled attempt, and by evening had a line-slot
+recovery (`d1894a91`) actively implementing. The command layer now works;
+the residual failures are the worker phase-pathology (tracked separately:
+phase-model overhead root cause) and P2-B transport flakes.
 
 ## What already worked (keep)
 
