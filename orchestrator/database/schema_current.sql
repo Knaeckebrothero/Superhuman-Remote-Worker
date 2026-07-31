@@ -772,6 +772,39 @@ COMMENT ON COLUMN public.config_overrides.kind IS 'Resolver subsection (MatrixRe
 
 
 --
+-- Name: contact_addresses; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.contact_addresses (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    contact_id uuid NOT NULL,
+    owner_user_id uuid NOT NULL,
+    channel text NOT NULL,
+    address text NOT NULL,
+    is_primary boolean DEFAULT false NOT NULL,
+    opt_in_status text DEFAULT 'pending'::text NOT NULL,
+    last_inbound_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now(),
+    CONSTRAINT contact_addresses_channel_check CHECK ((channel = ANY (ARRAY['email'::text, 'whatsapp'::text]))),
+    CONSTRAINT contact_addresses_opt_in_status_check CHECK ((opt_in_status = ANY (ARRAY['pending'::text, 'opted_in'::text, 'opted_out'::text])))
+);
+
+
+--
+-- Name: contacts; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.contacts (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    owner_user_id uuid NOT NULL,
+    display_name text NOT NULL,
+    notes text,
+    created_at timestamp with time zone DEFAULT now(),
+    updated_at timestamp with time zone DEFAULT now()
+);
+
+
+--
 -- Name: datasources; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -1197,7 +1230,7 @@ CREATE TABLE public.message_log (
     id uuid DEFAULT gen_random_uuid() NOT NULL,
     job_id uuid,
     user_id uuid,
-    thread_id character varying(12) NOT NULL,
+    thread_id character varying(64) NOT NULL,
     direction character varying(10) NOT NULL,
     recipient_email text,
     subject text NOT NULL,
@@ -1209,6 +1242,13 @@ CREATE TABLE public.message_log (
     email_message_id text,
     read_at timestamp with time zone
 );
+
+
+--
+-- Name: COLUMN message_log.thread_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.message_log.thread_id IS 'Conversation key. Job messages use a short hex token (email threading), loop events use ''loop-'' + 6 chars, officer pages use the persistent session thread UUID (job_id is NULL on those rows — the jobs FK forbids storing a thread id there, and the session log is the reply channel).';
 
 
 --
@@ -1244,7 +1284,7 @@ CREATE TABLE public.notification_queue (
     id uuid DEFAULT gen_random_uuid() NOT NULL,
     user_id uuid NOT NULL,
     job_id uuid,
-    thread_id character varying(12),
+    thread_id character varying(64),
     subject text NOT NULL,
     message text NOT NULL,
     channels jsonb DEFAULT '{}'::jsonb NOT NULL,
@@ -1284,6 +1324,18 @@ CREATE TABLE public.project_api_keys (
     created_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP,
     updated_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP,
     CONSTRAINT valid_project_api_key_provider CHECK (((provider)::text = ANY ((ARRAY['openai'::character varying, 'anthropic'::character varying, 'google'::character varying, 'groq'::character varying, 'openrouter'::character varying, 'mistral'::character varying, 'vision'::character varying])::text[])))
+);
+
+
+--
+-- Name: project_contacts; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.project_contacts (
+    project_id uuid NOT NULL,
+    contact_id uuid NOT NULL,
+    added_by uuid,
+    created_at timestamp with time zone DEFAULT now()
 );
 
 
@@ -2442,6 +2494,30 @@ ALTER TABLE ONLY public.cloud_ro_mounts
 
 
 --
+-- Name: contact_addresses contact_addresses_owner_user_id_channel_address_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.contact_addresses
+    ADD CONSTRAINT contact_addresses_owner_user_id_channel_address_key UNIQUE (owner_user_id, channel, address);
+
+
+--
+-- Name: contact_addresses contact_addresses_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.contact_addresses
+    ADD CONSTRAINT contact_addresses_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: contacts contacts_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.contacts
+    ADD CONSTRAINT contacts_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: datasources datasources_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -2583,6 +2659,14 @@ ALTER TABLE ONLY public.processed_inbound_emails
 
 ALTER TABLE ONLY public.project_api_keys
     ADD CONSTRAINT project_api_keys_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: project_contacts project_contacts_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.project_contacts
+    ADD CONSTRAINT project_contacts_pkey PRIMARY KEY (project_id, contact_id);
 
 
 --
@@ -3072,6 +3156,20 @@ CREATE INDEX idx_config_override_lookup ON public.config_overrides USING btree (
 
 
 --
+-- Name: idx_contact_addresses_contact; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_contact_addresses_contact ON public.contact_addresses USING btree (contact_id);
+
+
+--
+-- Name: idx_contacts_owner; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_contacts_owner ON public.contacts USING btree (owner_user_id);
+
+
+--
 -- Name: idx_datasources_created_by; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -3314,6 +3412,13 @@ CREATE INDEX idx_notif_queue_pending ON public.notification_queue USING btree (u
 --
 
 CREATE INDEX idx_project_api_keys_project ON public.project_api_keys USING btree (project_id);
+
+
+--
+-- Name: idx_project_contacts_contact; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_project_contacts_contact ON public.project_contacts USING btree (contact_id);
 
 
 --
@@ -3629,6 +3734,13 @@ CREATE UNIQUE INDEX uq_canvases_origin_generation ON public.canvases USING btree
 --
 
 CREATE UNIQUE INDEX uq_config_override ON public.config_overrides USING btree (COALESCE(family, ''::character varying), kind, name);
+
+
+--
+-- Name: uq_contact_primary_per_channel; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX uq_contact_primary_per_channel ON public.contact_addresses USING btree (contact_id, channel) WHERE is_primary;
 
 
 --
@@ -4022,6 +4134,30 @@ ALTER TABLE ONLY public.capability_grants
 
 
 --
+-- Name: contact_addresses contact_addresses_contact_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.contact_addresses
+    ADD CONSTRAINT contact_addresses_contact_id_fkey FOREIGN KEY (contact_id) REFERENCES public.contacts(id) ON DELETE CASCADE;
+
+
+--
+-- Name: contact_addresses contact_addresses_owner_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.contact_addresses
+    ADD CONSTRAINT contact_addresses_owner_user_id_fkey FOREIGN KEY (owner_user_id) REFERENCES public.users(id) ON DELETE CASCADE;
+
+
+--
+-- Name: contacts contacts_owner_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.contacts
+    ADD CONSTRAINT contacts_owner_user_id_fkey FOREIGN KEY (owner_user_id) REFERENCES public.users(id) ON DELETE CASCADE;
+
+
+--
 -- Name: datasources datasources_created_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -4251,6 +4387,30 @@ ALTER TABLE ONLY public.notification_queue
 
 ALTER TABLE ONLY public.project_api_keys
     ADD CONSTRAINT project_api_keys_project_id_fkey FOREIGN KEY (project_id) REFERENCES public.projects(id) ON DELETE CASCADE;
+
+
+--
+-- Name: project_contacts project_contacts_added_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.project_contacts
+    ADD CONSTRAINT project_contacts_added_by_fkey FOREIGN KEY (added_by) REFERENCES public.users(id) ON DELETE SET NULL;
+
+
+--
+-- Name: project_contacts project_contacts_contact_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.project_contacts
+    ADD CONSTRAINT project_contacts_contact_id_fkey FOREIGN KEY (contact_id) REFERENCES public.contacts(id) ON DELETE CASCADE;
+
+
+--
+-- Name: project_contacts project_contacts_project_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.project_contacts
+    ADD CONSTRAINT project_contacts_project_id_fkey FOREIGN KEY (project_id) REFERENCES public.projects(id) ON DELETE CASCADE;
 
 
 --

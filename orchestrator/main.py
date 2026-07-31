@@ -13414,9 +13414,9 @@ async def _notify_loop_event(
     try:
         await postgres_db.log_message(
             job_id=str(job_id),
-            # message_log.thread_id is varchar(12) NOT NULL (email-threading
-            # key). Loop events aren't email threads; group them per loop —
-            # "loop-" + 6 hex chars = 11 chars.
+            # message_log.thread_id is the conversation key (email-threading
+            # for job messages). Loop events aren't email threads; group them
+            # per loop — "loop-" + 6 hex chars.
             thread_id=f"loop-{str(loop.get('id', ''))[:6]}",
             direction="outbound",
             subject=subject,
@@ -20944,6 +20944,21 @@ async def agent_file_officer_wake(
     return {"filed": filed, "minutes": minutes}
 
 
+def _officer_session_link(thread_id: str) -> str | None:
+    """Absolute cockpit deep link to an officer session, or None when the
+    cockpit base URL is unknown.
+
+    Reads ``COCKPIT_EXTERNAL_URL`` (chart configmap, from ``srw.cockpitUrl``
+    — the same var the email/notification services use for their deep links)
+    at call time. Unset → None: a page without a link beats a page with a
+    broken one.
+    """
+    base = os.getenv("COCKPIT_EXTERNAL_URL", "").strip().rstrip("/")
+    if not base:
+        return None
+    return f"{base}/sessions/{thread_id}"
+
+
 async def _dispatch_officer_page(
     thread: dict, thread_id: str, subject: str, message_md: str
 ) -> bool:
@@ -20954,6 +20969,12 @@ async def _dispatch_officer_page(
     notification_service.dispatch's email leg sends to ``recipient_email or
     ""`` and silently drops the send otherwise (the 2026-07-27 dev live gate
     lesson, same as session_wake._notify_owner).
+
+    Appends a deep link to the officer's session so every page carries a way
+    back. Deliberately a labeled bare URL, not a markdown ``[label](url)``:
+    the email leg (send_agent_message) HTML-escapes the body instead of
+    rendering markdown, and ntfy/Slack get the raw text — a bare URL is
+    clickable-or-copyable in every leg, brackets-and-parens in none.
     """
     user_id = thread.get("user_id")
     if not user_id:
@@ -20968,13 +20989,18 @@ async def _dispatch_officer_page(
             str(user_id)[:8],
         )
         return False
+    subject = subject or "Your centurion needs you"
+    session_link = _officer_session_link(thread_id)
+    page_body = message_md
+    if session_link:
+        page_body = f"{message_md}\n\nOpen his log to reply: {session_link}"
     results = await notification_service.dispatch(
         user_id=str(user_id),
         # No job behind an officer page; the thread UUID keys the queue row
         # (plain uuid column, no FK) so quiet-hours digests still group it.
         job_id=thread_id,
-        subject=subject or "Your centurion needs you",
-        message_md=message_md,
+        subject=subject,
+        message_md=page_body,
         job_description="officer page",
         config_name=str(thread.get("config_name") or "session_base"),
         thread_id=thread_id,
@@ -20984,7 +21010,32 @@ async def _dispatch_officer_page(
         # §6): it is budgeted, and everything digest-worthy already waits.
         bypass_quiet_hours=True,
     )
-    return not results.get("error")
+    if results.get("error"):
+        return False
+    # Persist the notification-center row (message_log is the bell's backing
+    # store; get_user_notifications reads it). job_id stays NULL — the jobs FK
+    # forbids the thread UUID — and thread_id carries the session UUID so the
+    # cockpit can route "Open session log" to /sessions/{thread_id} (F4
+    # addendum). The body is the pre-link text: the card supplies the route
+    # itself. Best-effort: a bell-row failure must not fail a delivered page.
+    try:
+        await postgres_db.log_message(
+            job_id=None,
+            user_id=str(user_id),
+            thread_id=thread_id,
+            direction="outbound",
+            recipient_email=user.get("email"),
+            subject=subject,
+            message=message_md,
+            mode="async",
+            status="sent",
+        )
+    except Exception:
+        logger.warning(
+            "officer page: notification-center row write failed (non-fatal)",
+            exc_info=True,
+        )
+    return True
 
 
 @app.post("/api/agents/threads/{thread_id}/officer/notify")

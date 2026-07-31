@@ -43,6 +43,7 @@ import {
     isUserTurn,
     lastTextOf,
     MIN_FOLD_RUN,
+    notifyToolCalls,
     summarizeFolded,
     TextEvent,
     ThoughtEvent,
@@ -1132,6 +1133,15 @@ export function clearDraft(threadId: string | null): void {
                          one-line headline (plain text so the truncate mixin
                          works; markdown emits block elements that defeat
                          nowrap). -->
+                    <!-- Officer→user messages stay visible even collapsed:
+                         collapsing folds the lead-up, and a message addressed
+                         to the user is never lead-up. Chronological, before
+                         the closing prose. -->
+                    @for (nc of collapsedNotifyCalls(turn); track nc.id) {
+                      <div class="event-tool">
+                        <ng-container [ngTemplateOutlet]="toolDetails" [ngTemplateOutletContext]="{ $implicit: [nc] }"></ng-container>
+                      </div>
+                    }
                     @let answer = finalAnswer(turn);
                     @if (answer) {
                       <!-- A user can collapse a still-streaming turn (the manual
@@ -3254,6 +3264,21 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         const groups = groupEvents(turn.events);
         this.groupedEventsCache.set(turn, groups);
         return groups;
+    }
+
+    /**
+     * Officer→user messages (`notify_user`) shown in a COLLAPSED turn — the
+     * one event type besides the final answer that collapsing never hides.
+     * Memoized per turn object like {@link groupedEvents}.
+     */
+    private readonly notifyCallsCache = new WeakMap<AssistantTurn, ToolCallEvent[]>();
+
+    collapsedNotifyCalls(turn: AssistantTurn): ToolCallEvent[] {
+        const cached = this.notifyCallsCache.get(turn);
+        if (cached) return cached;
+        const calls = notifyToolCalls(turn);
+        this.notifyCallsCache.set(turn, calls);
+        return calls;
     }
 
     /**

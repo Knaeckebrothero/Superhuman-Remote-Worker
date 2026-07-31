@@ -12067,7 +12067,7 @@ class PostgresDB:
 
     async def log_message(
         self,
-        job_id: str,
+        job_id: str | None,
         thread_id: str,
         direction: str,
         subject: str,
@@ -12082,8 +12082,11 @@ class PostgresDB:
         """Log a message to the message_log table.
 
         Args:
-            job_id: Job UUID
-            thread_id: Short thread identifier
+            job_id: Job UUID, or None for session-keyed rows (officer pages)
+                that have no job behind them — the jobs FK forbids storing
+                the thread UUID here; thread_id carries it instead
+            thread_id: Thread identifier (short hex for job messages,
+                persistent-session UUID for officer pages)
             direction: 'outbound' or 'inbound'
             subject: Message subject
             message: Message body
@@ -12097,10 +12100,12 @@ class PostgresDB:
         Returns:
             Created message_log row as dict, or None on failure
         """
-        try:
-            job_uuid = UUID(job_id)
-        except ValueError:
-            return None
+        job_uuid = None
+        if job_id is not None:
+            try:
+                job_uuid = UUID(job_id)
+            except ValueError:
+                return None
 
         user_uuid = None
         if user_id:

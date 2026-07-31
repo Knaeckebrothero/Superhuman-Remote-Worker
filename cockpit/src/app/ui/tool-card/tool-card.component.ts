@@ -57,6 +57,29 @@ export function canvasToolCardContext(
         JobToolCardPanelComponent,
     ],
     template: `
+    @if (view().notify; as n) {
+      <!-- Officer→user message: a first-class chat bubble, not a collapsed
+           call record. Mirrors the user's own speech bubble (the officer is
+           *addressing* the user); the receipt line is the delivery record. -->
+      <div class="tc-notify" [class.tc-notify--failed]="notifyFailed()">
+        <div class="tc-notify__meta">
+          <app-icon size="sm" class="tc-notify__icon">campaign</app-icon>
+          <span class="tc-notify__from">{{ 'toolCard.notify.from' | transloco }}</span>
+          <span [class]="'tc-notify__chip tc-notify__chip--' + n.urgency">
+            {{ 'toolCard.notify.urgency.' + n.urgency | transloco }}
+          </span>
+        </div>
+        <div class="tc-notify__bubble">
+          @if (n.subject) {
+            <div class="tc-notify__subject">{{ n.subject }}</div>
+          }
+          <div class="tc-notify__body"><markdown [data]="n.body"></markdown></div>
+        </div>
+        @if (notifyReceipt(); as receipt) {
+          <div class="tc-notify__receipt" [class.tc-notify__receipt--error]="notifyFailed()">{{ receipt }}</div>
+        }
+      </div>
+    } @else {
     <details class="tc" [class.tc--error]="status() === 'error'" [class.tc--denied]="status() === 'denied'"
              [attr.open]="open() ? '' : null">
       <summary class="tc__head">
@@ -164,6 +187,7 @@ export function canvasToolCardContext(
       <app-job-tool-card-panel [entity]="entity"
                                (diffRequested)="jobDiffRequested.emit($event)" />
     }
+    }
   `,
     styleUrl: './tool-card.component.scss',
 })
@@ -198,6 +222,23 @@ export class AppToolCardComponent implements OnDestroy {
     /** Auto-open on a problem; otherwise honour `defaultOpen`. */
     protected readonly open = computed(
         () => this.defaultOpen() || this.status() === 'error' || this.status() === 'denied',
+    );
+
+    /** The notify bubble's delivery receipt line: result, error, or "sending". */
+    protected readonly notifyReceipt = computed(() => {
+        this.lang();
+        const receipt = this.view().notify?.receipt || this.view().error || '';
+        if (receipt) return receipt;
+        const s = this.status();
+        if (s === 'pending' || s === 'running') {
+            return this.transloco.translate('toolCard.notify.sending');
+        }
+        // denied without an error text: surface the status rather than nothing
+        return s === 'denied' ? this.statusLabel() : '';
+    });
+
+    protected readonly notifyFailed = computed(
+        () => this.status() === 'error' || this.status() === 'denied',
     );
 
     /** Title via `toolCard.titles.<tool>` with the descriptor literal as fallback. */
