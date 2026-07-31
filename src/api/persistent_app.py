@@ -437,6 +437,7 @@ def _ensure_persistent_loop_started(
             on_tool_start=_loop_on_tool_start,
             on_tool_result=_loop_on_tool_result,
             permission_check=_loop_permission_check,
+            announce_permission_batch=_loop_announce_permission_batch,
             on_turn_start=_loop_on_turn_start,
             on_turn_complete=_loop_on_turn_complete,
             on_error=_loop_on_error,
