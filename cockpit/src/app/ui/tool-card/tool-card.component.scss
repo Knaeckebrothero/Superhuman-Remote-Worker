@@ -334,3 +334,115 @@ $mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
     transform: rotate(360deg);
   }
 }
+
+/* ── Officer→user message (notify_user) ───────────────────────────── */
+
+/* A first-class chat bubble, not a call record. Mirrors the user's own
+   speech bubble (.message-user .message-body in the chat view: same tinted
+   background + accent hairline) with the OPPOSITE corner clipped — the
+   officer speaks from the agent's side. Styles live here, not in the chat's
+   stylesheet: view encapsulation means the chat's .message-user rules can't
+   reach into this component anyway. */
+.tc-notify {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  width: fit-content;
+  max-width: min(100%, 560px);
+}
+
+.tc-notify__meta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.tc-notify__icon {
+  color: var(--accent-color);
+  flex-shrink: 0;
+}
+
+/* "Officer → you" — same small-caps voice as the card status, so the bubble
+   can never be mistaken for a message the user wrote. */
+.tc-notify__from {
+  font-family: var(--font-display, inherit);
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  font-size: 9.5px;
+  font-weight: 600;
+  color: var(--text-muted);
+}
+
+.tc-notify__chip {
+  font-family: var(--font-display, inherit);
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  font-size: 9.5px;
+  font-weight: 700;
+  padding: 1px 7px;
+  border-radius: var(--radius-pill, 999px);
+}
+
+.tc-notify__chip--page {
+  color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 14%, transparent);
+  border: 1px solid color-mix(in srgb, var(--danger) 45%, transparent);
+}
+
+.tc-notify__chip--digest {
+  color: var(--warning);
+  background: color-mix(in srgb, var(--warning) 14%, transparent);
+  border: 1px solid color-mix(in srgb, var(--warning) 45%, transparent);
+}
+
+.tc-notify__chip--log {
+  color: var(--text-muted);
+  background: var(--surface-1, rgba(255, 255, 255, 0.05));
+  border: 1px solid var(--border-color, transparent);
+}
+
+.tc-notify__bubble {
+  padding: 10px 14px;
+  border-radius: var(--radius-lg);
+  border-top-left-radius: var(--radius-tag);
+  background: var(--user-bubble, var(--surface-0));
+  color: var(--user-bubble-text, var(--text-primary));
+  border: 1px solid color-mix(in srgb, var(--accent-color) 30%, var(--border-color));
+  /* Match the chat's message text, not the card's 12px chrome. The custom
+     property inherits from .chat-container; the fallback matches its default. */
+  font-size: var(--chat-body-font-size, 15px);
+  line-height: 1.6;
+  overflow-wrap: break-word;
+}
+
+.tc-notify--failed .tc-notify__bubble {
+  border-color: color-mix(in srgb, var(--danger) 45%, var(--border-color));
+}
+
+.tc-notify__subject {
+  font-weight: 700;
+  margin-bottom: 4px;
+}
+
+.tc-notify__body {
+  :first-child {
+    margin-top: 0;
+  }
+
+  :last-child {
+    margin-bottom: 0;
+  }
+}
+
+/* Delivery receipt ("Paged the Legatus (2/3 pages used today).") — a quiet
+   footer, not content. */
+.tc-notify__receipt {
+  font-size: 11px;
+  font-style: italic;
+  color: var(--text-muted);
+  padding-left: 2px;
+}
+
+.tc-notify__receipt--error {
+  color: var(--danger);
+}

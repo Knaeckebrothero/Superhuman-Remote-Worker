@@ -103,6 +103,32 @@ export interface CanvasPresentationSummary {
 }
 
 /**
+ * The officer tool whose calls are a message TO the user, not work. Shared by
+ * the card builder (bubble view) and the turn fold logic (never folded into a
+ * "N× tool calls" chip — a message addressed to the user is first-class, like
+ * text).
+ */
+export const NOTIFY_USER_TOOL = 'notify_user';
+
+export type NotifyUrgency = 'log' | 'digest' | 'page';
+
+/**
+ * First-class officer→user message extracted from a `notify_user` call.
+ * Present only on that tool; its presence switches `<app-tool-card>` from the
+ * generic collapsed card to a chat-bubble rendering (the officer is
+ * *addressing* the user, so the call's args ARE the message).
+ */
+export interface NotifyMessageView {
+    readonly urgency: NotifyUrgency;
+    /** Short subject line; page/digest only in practice. */
+    readonly subject?: string;
+    /** The message body, rendered like normal chat message text. */
+    readonly body: string;
+    /** Delivery receipt — the tool's result string ("Paged the Legatus (2/3 …)."). */
+    readonly receipt?: string;
+}
+
+/**
  * The complete, render-ready description of one tool call. Produced by
  * `buildToolCardView()` from a `NormalizedToolCall`; consumed by
  * `<app-tool-card [view]>`.
@@ -131,6 +157,8 @@ export interface ToolCardView {
     entity?: ToolCardEntity;
     /** Normalized type/title only; never includes source URLs or workspace internals. */
     canvasPresentation?: CanvasPresentationSummary;
+    /** Officer→user message (notify_user only) — renders as a bubble, not a card. */
+    notify?: NotifyMessageView;
     /** Explicit error message (audit) or the errored output (live). */
     error?: string;
 }

@@ -67,7 +67,17 @@
       "set_canvas": "In Canvas präsentieren",
       "get_canvas": "Canvas prüfen",
       "clear_canvas": "Canvas leeren",
-      "create_worker_job": "Job planen"
+      "create_worker_job": "Job planen",
+      "notify_user": "Nachricht an den Nutzer"
+    },
+    "notify": {
+      "from": "Offizier → Sie",
+      "sending": "wird gesendet…",
+      "urgency": {
+        "page": "Page",
+        "digest": "Digest",
+        "log": "Log"
+      }
     },
     "job": {
       "approve": "Freigeben",
@@ -2087,6 +2097,8 @@
       "messageLabel": "Nachricht",
       "modeBlocking": "blockierend",
       "modeAsync": "asynchron",
+      "sessionPage": "Sitzungsmeldung",
+      "openSessionLog": "Sitzungsprotokoll öffnen",
       "defaultAgent": "Agent",
       "threadLoading": "Thread wird geladen …",
       "noMessagesLoaded": "Keine Nachrichten geladen",

@@ -37,6 +37,13 @@ export interface MessageActionData {
   configName: string | null;
   jobDescription: string | null;
   unread: boolean;
+  /**
+   * Set when the notification is keyed to a persistent session (an officer
+   * page) instead of a job: there is no job to resolve — thread lookup and
+   * inline reply would 404 — and the working reply channel is the session
+   * log at /sessions/{sessionThreadId}.
+   */
+  sessionThreadId?: string | null;
 }
 
 export interface ReviewActionData {
