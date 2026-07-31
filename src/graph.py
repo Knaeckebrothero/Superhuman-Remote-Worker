@@ -2597,15 +2597,38 @@ def create_check_todos_node(
     todo_manager: TodoManager,
     config: AgentConfig,
     tool_names: Optional[List[str]] = None,
+    tool_context: Optional[ToolContext] = None,
 ) -> Callable[[UniversalAgentState], Dict[str, Any]]:
     """Create the check_todos node.
 
-    This node checks if all todos are complete.
+    This node checks if all todos are complete, or if the tactical phase has
+    asked to end early via ``request_replan``.
     """
 
     def check_todos(state: UniversalAgentState) -> Dict[str, Any]:
         """Check if all todos are complete."""
         job_id = state.get("job_id", "unknown")
+
+        # Replan requested: end the phase now, keeping every todo exactly as it
+        # is. This is the only way out of a tactical phase without completing
+        # all todos, and it exists so an agent that learns mid-phase that the
+        # approach is wrong can say so instead of grinding through todos it
+        # knows are pointless. Deliberately does NOT clear or archive-as-failed
+        # anything — archive_phase records the real statuses at the boundary,
+        # which is what the incoming strategic phase needs to decide what to
+        # keep.
+        if tool_context is not None:
+            replan_reason = tool_context.consume_replan_request()
+            if replan_reason:
+                todo_state = todo_manager.export_state()
+                logger.info(f"[{job_id}] Replan requested — ending phase early")
+                return {
+                    "phase_complete": True,
+                    "replan_reason": replan_reason,
+                    "todos": todo_state["todos"],
+                    "staged_todos": todo_state["staged_todos"],
+                    "todo_next_id": todo_state["next_id"],
+                }
 
         # Validate todos exist before checking completion
         todos = todo_manager.list_all()
@@ -3005,7 +3028,6 @@ async def _process_queued_replies(
     Returns:
         The drained reply entries (``thread_id``/``message``/``timestamp``).
     """
-    from datetime import datetime, timezone as tz
 
     # Read queued_replies from job context
     row = await postgres_db.fetchrow(
@@ -3023,8 +3045,28 @@ async def _process_queued_replies(
     if not queued:
         return []
 
-    # Write each reply as a workspace file
-    for reply in queued:
+    _write_reply_files(job_id, workspace, queued)
+    logger.info(
+        f"[{job_id}] Processed {len(queued)} queued async replies at phase boundary"
+    )
+    return list(queued)
+
+
+def _write_reply_files(
+    job_id: str,
+    workspace: "WorkspaceManager",
+    replies: List[Dict[str, Any]],
+) -> None:
+    """Archive queued replies as ``messages/{thread}/{seq}_received.md`` files.
+
+    Shared by both drain paths (the natural-break drain in audited_tools and
+    the phase-boundary backstop). The files are the durable record; the
+    LLM-visible message the caller injects is what actually makes the agent
+    read them.
+    """
+    from datetime import datetime, timezone as tz
+
+    for reply in replies:
         thread_id = reply.get("thread_id", "unknown")
         message = reply.get("message", "")
         timestamp = reply.get(
@@ -3052,13 +3094,8 @@ async def _process_queued_replies(
         )
         workspace.write_file(f"{msg_dir}/{seq:03d}_received.md", msg_content)
 
-    if queued and workspace.git_manager and workspace.git_manager.is_active:
-        workspace.git_manager.commit(f"Received {len(queued)} queued reply(ies)")
-
-    logger.info(
-        f"[{job_id}] Processed {len(queued)} queued async replies at phase boundary"
-    )
-    return list(queued)
+    if replies and workspace.git_manager and workspace.git_manager.is_active:
+        workspace.git_manager.commit(f"Received {len(replies)} queued reply(ies)")
 
 
 def _format_drained_replies(replies: List[Dict[str, Any]]) -> str:
@@ -3118,6 +3155,133 @@ def _get_pending_supervisor_guidance(job_id: str) -> List[Dict[str, Any]]:
         return []
 
 
+def _get_queued_replies(job_id: str) -> List[Dict[str, Any]]:
+    """Queued (non-urgent) replies from the dual-mode heartbeat inbox.
+
+    Same lazy-import contract as ``_get_pending_supervisor_guidance``: outside
+    the dual app there is no inbox, and the phase-boundary backstop in
+    ``handle_transition`` still reads them straight from the DB.
+    """
+    try:
+        from src.api.dual_app import get_queued_replies
+
+        return get_queued_replies(job_id)
+    except Exception:
+        return []
+
+
+def _replies_overdue(replies: List[Dict[str, Any]], max_wait_seconds: float) -> bool:
+    """True when the oldest queued reply has waited longer than the floor.
+
+    The wall-clock floor exists for the same reason the progress-commit one
+    does: the natural-break trigger is anti-correlated with need. An agent
+    stuck on a single long todo never completes one, so a break-only policy
+    strands its mail exactly when a supervisor is most likely to be writing.
+
+    An unparseable timestamp counts as overdue. Delivering a reply twice is a
+    tolerated outcome here (the ack path is explicitly at-least-once);
+    stranding one is the failure being fixed.
+    """
+    if max_wait_seconds <= 0:
+        return False
+
+    from datetime import datetime, timezone as tz
+
+    now = datetime.now(tz.utc)
+    for reply in replies:
+        raw = str(reply.get("timestamp") or "").strip()
+        if not raw:
+            return True
+        try:
+            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=tz.utc)
+        except (ValueError, TypeError):
+            return True
+        if (now - parsed).total_seconds() >= max_wait_seconds:
+            return True
+    return False
+
+
+def _reply_key(reply: Dict[str, Any]) -> str:
+    """Stable identity for a queued reply.
+
+    Queued replies carry no id (unlike guidance entries), so identity is
+    content-derived: the same thread, timestamp and body is the same message.
+    """
+    return "|".join(
+        str(reply.get(field, "")) for field in ("thread_id", "timestamp", "message")
+    )
+
+
+def _deliver_queued_replies(
+    job_id: str,
+    tool_context: "ToolContext",
+    config: AgentConfig,
+    result: Dict[str, Any],
+) -> None:
+    """Drain queued replies into the conversation at a natural break.
+
+    Steering has two lanes. Lane A (``pending_guidance``) is the urgent one and
+    renders as a transient block on every LLM turn — it does not pass through
+    here. Lane B is this one: non-urgent mail, held until the agent surfaces.
+
+    "Surfacing" used to mean a tactical->strategic phase boundary, which was a
+    reasonable proxy while phases were small. It stops being one as phases grow
+    — at three phases a job has exactly one such boundary, and a reply sent
+    during the review phase would never be delivered at all. A completed todo
+    is the better break: same intent ("finish the current unit of work, then
+    read your mail"), roughly an order of magnitude more often, and independent
+    of phase structure.
+
+    The reply is appended as a persistent HumanMessage rather than a transient
+    injection: unlike a nudge, a reply is durable information the agent should
+    still have several turns later.
+    """
+    inbox = _get_queued_replies(job_id)
+
+    # Drop anything already appended to the conversation. The ack is
+    # fire-and-forget, so the heartbeat keeps returning delivered entries for
+    # up to one interval; without this filter every todo completed inside that
+    # window would append the same reply again. Lane A can ignore this because
+    # its block is transient and re-rendered each turn — lane B's messages are
+    # persistent, so a duplicate would sit in history forever.
+    delivered = tool_context._delivered_reply_keys
+    replies = [r for r in inbox if _reply_key(r) not in delivered]
+
+    if not replies:
+        # Clear any stale break flag so it can't fire against later mail.
+        tool_context.consume_reply_drain()
+        return
+
+    at_break = tool_context.consume_reply_drain()
+    max_wait = float(getattr(config.limits, "queued_reply_max_wait_seconds", 300) or 0)
+    if not at_break and not _replies_overdue(replies, max_wait):
+        return
+
+    workspace = getattr(tool_context, "workspace_manager", None)
+    if workspace is not None:
+        try:
+            _write_reply_files(job_id, workspace, replies)
+        except Exception as e:
+            # The archive is best-effort; the conversation delivery below is
+            # the part that actually makes the agent act.
+            logger.warning(f"[{job_id}] Failed to archive queued replies: {e}")
+
+    result["messages"] = list(result.get("messages") or []) + [
+        HumanMessage(content=_format_drained_replies(replies))
+    ]
+
+    delivered.update(_reply_key(r) for r in replies)
+
+    threads = sorted({str(r.get("thread_id")) for r in replies if r.get("thread_id")})
+    _ack_supervisor_guidance(job_id, reply_threads=threads)
+    logger.info(
+        f"[{job_id}] Delivered {len(replies)} queued reply(ies) at "
+        f"{'a completed todo' if at_break else 'the wall-clock floor'}"
+    )
+
+
 def _ack_supervisor_guidance(
     job_id: str,
     guidance_ids: Optional[List[str]] = None,
@@ -3145,6 +3309,7 @@ def create_handle_transition_node(
     max_todos: int = 20,
     postgres_db: Optional[Any] = None,
     tool_names: Optional[List[str]] = None,
+    tool_context: Optional[ToolContext] = None,
 ) -> Callable[[UniversalAgentState], Dict[str, Any]]:
     """Create the handle_transition node.
 
@@ -3171,15 +3336,27 @@ def create_handle_transition_node(
             f"{'strategic' if is_strategic else 'tactical'} phase"
         )
 
-        # Process queued async replies at tactical→strategic boundaries.
-        # Writes received message files to workspace AND (below) injects the
-        # content into LLM-visible context — the files alone were never read.
+        # Queued-reply BACKSTOP. The primary drain is now the natural-break one
+        # in audited_tools (a completed todo, plus a wall-clock floor), which is
+        # phase-independent and fires far more often. This path survives for the
+        # case that one cannot serve: outside the dual app there is no heartbeat
+        # inbox to read, so the DB is the only source.
+        #
+        # Filtered by the same delivered-keys set, because the two paths race:
+        # the natural-break ack is fire-and-forget, so a boundary reached before
+        # it lands would otherwise re-append mail the agent already has.
         drained_replies: List[Dict[str, Any]] = []
         if not is_strategic and postgres_db:
             try:
                 drained_replies = await _process_queued_replies(
                     job_id, workspace, postgres_db
                 )
+                if tool_context is not None and drained_replies:
+                    _already = tool_context._delivered_reply_keys
+                    drained_replies = [
+                        r for r in drained_replies if _reply_key(r) not in _already
+                    ]
+                    _already.update(_reply_key(r) for r in drained_replies)
             except Exception as e:
                 logger.warning(f"[{job_id}] Failed to process queued replies: {e}")
 
@@ -3246,6 +3423,28 @@ def create_handle_transition_node(
         # report_completion() → orchestrator for status determination.
         if result.freeze_data:
             updates["freeze_data"] = result.freeze_data
+
+        # Tell the incoming strategic phase why it was called early. Without
+        # this the phase would see a boundary it cannot explain: the todos are
+        # archived with some still pending, and nothing says whether that was a
+        # deliberate replan or a failure. Cleared in the same breath so a stale
+        # reason cannot steer a later phase.
+        replan_reason = state.get("replan_reason")
+        if replan_reason:
+            replan_msg = HumanMessage(
+                content=(
+                    "[REPLAN REQUESTED] The previous phase ended early and on "
+                    "purpose — it is not a failure, and nothing was undone. "
+                    "Completed todos stayed completed; unfinished ones are in "
+                    "the phase archive with their real status.\n\n"
+                    f"Stated reason: {replan_reason}\n\n"
+                    "Check the plan against this, change what it invalidates, "
+                    "and stage the next batch. Work that is still valid does "
+                    "not need redoing — carry it forward."
+                )
+            )
+            updates["messages"] = list(updates.get("messages") or []) + [replan_msg]
+            updates["replan_reason"] = None
 
         # Deliver drained queued replies into context (persistent HumanMessage
         # — the boundary is already a compaction point, so cache impact is
@@ -3917,6 +4116,7 @@ def create_audited_tool_node(
     _calls_since_progress = [0]
     _reflection_injected = [False]
     _phase_tool_call_count = [0]
+    _job_tool_call_count = [0]  # never reset at a phase boundary
     _last_phase_number = [-1]
 
     # Loop warning state: signatures that have triggered warnings
@@ -3925,7 +4125,12 @@ def create_audited_tool_node(
 
     # Config-driven thresholds
     _PROGRESS_THRESHOLD = config.limits.progress_stall_threshold  # default 30
-    _HARD_CAP = config.limits.max_tool_calls_per_phase  # default 500
+    # Per-phase ceiling, now OFF by default (0). See LimitsConfig.
+    _PHASE_CAP = config.limits.max_tool_calls_per_phase
+    # Job ceiling — the actual backstop. Counted across phases, never reset at a
+    # boundary, because bounding a *phase* stopped bounding a *job* the moment
+    # phases got large.
+    _JOB_CAP = getattr(config.limits, "max_tool_calls_per_job", 5000)
 
     # Act-ratio tripwire: N consecutive executed tool actions touching ONLY
     # process artifacts (todos/plan/archive) get a one-line "stop planning"
@@ -3953,7 +4158,12 @@ def create_audited_tool_node(
 
     # Todo-state tools manipulate todos.yaml by definition — they count as
     # process actions for the act-ratio tripwire.
-    TODO_STATE_TOOLS = {"todo_complete", "todo_list", "todo_rewind", "next_phase_todos"}
+    TODO_STATE_TOOLS = {
+        "todo_complete",
+        "todo_list",
+        "request_replan",
+        "next_phase_todos",
+    }
 
     # Arg keys inspected for file targets when classifying process actions.
     # Content-bearing args (e.g. write_file's `content`) are deliberately
@@ -4144,92 +4354,72 @@ def create_audited_tool_node(
             _category_failures.clear()
             _TOOL_TIMEOUT_RETRIES[0] = 0
 
-        # Hard cap check
+        # Budget check. The job ceiling is the real backstop; the per-phase one
+        # is an opt-in extra (0 = off) and no longer fires by default.
         _phase_tool_call_count[0] += len(tool_calls_info)
-        if _phase_tool_call_count[0] > _HARD_CAP:
-            if phase_str == "strategic":
-                # Strategic phases should be short — freeze if budget exceeded.
-                logger.error(
-                    f"[{job_id}] Hard cap in strategic phase: "
-                    f"{_phase_tool_call_count[0]} calls "
-                    f"(phase {phase_number})"
-                )
-                freeze_data = {
-                    "freeze_type": "budget_exceeded",
-                    "phase": phase_str,
-                    "phase_number": phase_number,
-                    "reason": f"Hard cap of {_HARD_CAP} tool calls exceeded in strategic phase",
-                    "tool_calls_this_phase": _phase_tool_call_count[0],
-                    "warned_signatures": len(_warned_signatures),
-                }
-                if tool_context and tool_context.workspace_manager:
-                    try:
-                        tool_context.workspace_manager.write_file(
-                            "output/job_frozen.json",
-                            json.dumps(freeze_data, indent=2, ensure_ascii=False),
-                        )
-                    except Exception as e:
-                        logger.error(f"[{job_id}] Failed to write freeze file: {e}")
-                freeze_msgs = [
-                    ToolMessage(
-                        content=(
-                            f"PHASE FROZEN: {_phase_tool_call_count[0]} tool "
-                            "calls in strategic phase without completing "
-                            "review. Job paused for human review."
-                        ),
-                        tool_call_id=tc["call_id"],
-                        name=tc["name"],
+        _job_tool_call_count[0] += len(tool_calls_info)
+        _over_job_cap = _JOB_CAP > 0 and _job_tool_call_count[0] > _JOB_CAP
+        _over_phase_cap = _PHASE_CAP > 0 and _phase_tool_call_count[0] > _PHASE_CAP
+        if _over_job_cap or _over_phase_cap:
+            # Always freeze — never the old destructive tactical rewind, which
+            # called archive_with_failure_note and so wrote every todo (the
+            # COMPLETED ones included) into a failure archive and emptied the
+            # list. That is the same behaviour removed from request_replan, and
+            # it destroyed the phase record of a job that had usually done real
+            # work. A freeze loses nothing: budget_exceeded parks for human
+            # review (it is not in AUTO_REDISPATCH_FREEZE_TYPES), and the
+            # workspace is committed and pushed.
+            _scope = "job" if _over_job_cap else "phase"
+            _cap = _JOB_CAP if _over_job_cap else _PHASE_CAP
+            _used = (
+                _job_tool_call_count[0] if _over_job_cap else _phase_tool_call_count[0]
+            )
+            logger.error(
+                f"[{job_id}] Tool-call budget exceeded ({_scope}): "
+                f"{_used} > {_cap} (phase {phase_number} {phase_str})"
+            )
+            freeze_data = {
+                "freeze_type": "budget_exceeded",
+                "phase": phase_str,
+                "phase_number": phase_number,
+                "reason": (
+                    f"{_scope.capitalize()} budget of {_cap} tool calls "
+                    f"exceeded ({_used} used)"
+                ),
+                "budget_scope": _scope,
+                "tool_calls_this_phase": _phase_tool_call_count[0],
+                "tool_calls_this_job": _job_tool_call_count[0],
+                "warned_signatures": len(_warned_signatures),
+            }
+            if tool_context and tool_context.workspace_manager:
+                try:
+                    tool_context.workspace_manager.write_file(
+                        "output/job_frozen.json",
+                        json.dumps(freeze_data, indent=2, ensure_ascii=False),
                     )
-                    for tc in tool_calls_info
-                ]
-                return {"should_stop": True, "messages": freeze_msgs}
-            else:
-                # Tactical phase — don't freeze, rewind and let the agent retry.
-                logger.warning(
-                    f"[{job_id}] Hard cap in tactical phase: "
-                    f"{_phase_tool_call_count[0]} calls "
-                    f"(phase {phase_number}). Triggering rewind."
+                except Exception as e:
+                    logger.error(f"[{job_id}] Failed to write freeze file: {e}")
+            # Push before parking: a human is about to read this workspace.
+            _committer = getattr(tool_context, "progress_committer", None)
+            if _committer is not None:
+                _committer.flush(f"Frozen: {_scope} tool-call budget exceeded")
+            freeze_msgs = [
+                ToolMessage(
+                    content=(
+                        f"JOB FROZEN: {_used} tool calls exceeded the {_scope} "
+                        f"budget of {_cap}. Nothing was discarded — your todos, "
+                        "files and commits are intact. Parked for human review."
+                    ),
+                    tool_call_id=tc["call_id"],
+                    name=tc["name"],
                 )
-                rewind_note = f"Budget of {_HARD_CAP} tool calls reached in this phase"
-                # Archive current todos and clear the list
-                if tool_context and tool_context.todo_manager:
-                    try:
-                        tool_context.todo_manager.archive_with_failure_note(rewind_note)
-                        if tool_context.todo_manager.has_staged_todos():
-                            tool_context.todo_manager.clear_staged_todos()
-                    except Exception as e:
-                        logger.error(f"[{job_id}] Failed to rewind todos: {e}")
-                # Capture count before reset for the message
-                calls_used = _phase_tool_call_count[0]
-                # Reset counters so the next phase starts fresh
-                _phase_tool_call_count[0] = 0
-                _calls_since_progress[0] = 0
-                _tool_call_history.clear()
-                _warned_signatures.clear()
-                _reflection_injected[0] = False
-
-                rewind_msg = SystemMessage(
-                    content=format_nudge(
-                        "budget_rewind",
-                        model=config.llm.model,
-                        used=calls_used,
-                        cap=_HARD_CAP,
-                    )
-                )
-                # Return ToolMessages (to satisfy pending tool calls) + the rewind message.
-                # Don't execute the tools — skip straight to the rewind.
-                tool_msgs = [
-                    ToolMessage(
-                        content=(
-                            f"Skipped: phase budget of {_HARD_CAP} tool calls "
-                            "reached. Todos archived — rethink your approach."
-                        ),
-                        tool_call_id=tc["call_id"],
-                        name=tc["name"],
-                    )
-                    for tc in tool_calls_info
-                ]
-                return {"messages": tool_msgs + [rewind_msg]}
+                for tc in tool_calls_info
+            ]
+            return {
+                "should_stop": True,
+                "freeze_data": freeze_data,
+                "messages": freeze_msgs,
+            }
 
         # Fingerprint-based loop detection -> track signatures for warnings
         _loop_warned_call_ids: set = set()  # call_ids to warn about after execution
@@ -4440,14 +4630,14 @@ def create_audited_tool_node(
         else:
             _calls_since_progress[0] += len(tool_calls_info)
 
-        # todo_rewind is a deliberate re-plan: reset loop detection state
-        if "todo_rewind" in {tc["name"] for tc in tool_calls_info}:
+        # request_replan is a deliberate re-plan: reset loop detection state
+        if "request_replan" in {tc["name"] for tc in tool_calls_info}:
             for msg in result.get("messages", []):
                 if (
                     isinstance(msg, ToolMessage)
                     and not _is_tool_error(msg.content or "")
                     and any(
-                        tc["name"] == "todo_rewind"
+                        tc["name"] == "request_replan"
                         and tc["call_id"] == msg.tool_call_id
                         for tc in tool_calls_info
                     )
@@ -4456,22 +4646,29 @@ def create_audited_tool_node(
                     _warned_signatures.clear()
                     _calls_since_progress[0] = 0
                     _reflection_injected[0] = False
-                    logger.info(f"[{job_id}] Loop detection reset after todo_rewind")
+                    logger.info(f"[{job_id}] Loop detection reset after request_replan")
                     break
 
         # Progress nudge: periodic reminders to write findings down.
-        # Never freezes the job — the hard cap (Layer 4) is the only stop.
+        # Never freezes the job — the job budget is the only stop.
         if _calls_since_progress[0] >= _PROGRESS_THRESHOLD:
             calls = _calls_since_progress[0]
             nudge_count = (calls - _PROGRESS_THRESHOLD) // _PROGRESS_THRESHOLD + 1
             # Inject a nudge every _PROGRESS_THRESHOLD calls without progress
             if calls == _PROGRESS_THRESHOLD or calls % _PROGRESS_THRESHOLD == 0:
-                remaining = _HARD_CAP - _phase_tool_call_count[0]
+                # Quote the budget only when one is actually armed — an
+                # unbounded job must not be told it has "0 calls remaining".
+                if _JOB_CAP > 0:
+                    budget_line = (
+                        f" Job budget: {_JOB_CAP - _job_tool_call_count[0]}/"
+                        f"{_JOB_CAP} calls remaining."
+                    )
+                else:
+                    budget_line = ""
                 diagnostic = SystemMessage(
                     content=(
                         f"OBSERVATION: {calls} tool calls since the last file "
-                        f"write or todo completion. Phase budget: "
-                        f"{remaining}/{_HARD_CAP} calls remaining.\n\n"
+                        f"write or todo completion.{budget_line}\n\n"
                         "If you have gathered useful information, write it to "
                         "a file now — findings not written to files are lost "
                         "during context compaction. If you still need specific "
@@ -4566,12 +4763,41 @@ def create_audited_tool_node(
                         ws.git_manager.commit("Job frozen: waiting for reply")
                     result["should_stop"] = True
                     result["freeze_data"] = freeze_req
+                    # Push immediately rather than waiting for the throttle: the
+                    # entire point of this freeze is that a human or the officer
+                    # is about to read the workspace. Deliberately ordered AFTER
+                    # the freeze state is recorded — this shares the enclosing
+                    # try, and losing the freeze to a git error would be far
+                    # worse than a late push.
+                    _committer = getattr(tool_context, "progress_committer", None)
+                    if _committer is not None:
+                        _committer.flush("Job frozen: waiting for reply")
                     logger.info(
                         f"[{job_id}] Freeze requested by tool: "
                         f"{freeze_req.get('freeze_type')}"
                     )
                 except Exception as e:
                     logger.error(f"[{job_id}] Failed to process freeze request: {e}")
+
+        # Wall-clock durability floor. todo_complete is the primary commit
+        # trigger, but it is anti-correlated with need: an agent stuck on one
+        # long todo never calls it, so a todo-only policy goes silent exactly
+        # when an observer most needs to see movement. This is the backstop —
+        # and it stays cheap, because the committer checks elapsed time locally
+        # before touching git at all.
+        if tool_context is not None:
+            _committer = getattr(tool_context, "progress_committer", None)
+            if _committer is not None:
+                _committer.on_turn()
+
+        # Steering lane B: deliver queued (non-urgent) replies at the agent's
+        # natural break. Lane A (urgent guidance) does not come through here —
+        # it re-renders every turn in execute() and is unaffected.
+        if tool_context is not None:
+            try:
+                _deliver_queued_replies(job_id, tool_context, config, result)
+            except Exception as e:
+                logger.warning(f"[{job_id}] Queued-reply delivery failed: {e}")
 
         return result
 
@@ -4819,7 +5045,9 @@ def build_phase_alternation_graph(
         tool_names=_tool_names,
         memory_service=memory_service,
     )
-    check_todos = create_check_todos_node(todo_manager, config, tool_names=_tool_names)
+    check_todos = create_check_todos_node(
+        todo_manager, config, tool_names=_tool_names, tool_context=tool_context
+    )
     archive_phase = create_archive_phase_node(
         todo_manager,
         plan_manager,
@@ -4846,6 +5074,7 @@ def build_phase_alternation_graph(
         max_todos=config.phase_settings.max_todos,
         postgres_db=postgres_db,
         tool_names=_tool_names,
+        tool_context=tool_context,
     )
 
     check_goal = create_check_goal_node(plan_manager, workspace, config, todo_manager)

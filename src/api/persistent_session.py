@@ -137,7 +137,7 @@ _EXCLUDED_TOOLS = frozenset(
         "next_phase_todos",
         "todo_complete",
         "todo_list",
-        "todo_rewind",
+        "request_replan",
         "mark_complete",
         "job_complete",
     }

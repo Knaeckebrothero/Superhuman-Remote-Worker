@@ -234,10 +234,26 @@ def _check_job_preempted(response: Dict[str, Any]) -> None:
 # pending in job context, so the successor pod gets them redelivered.
 _guidance_inbox: Dict[str, List[Dict[str, Any]]] = {}
 
+# Queued-reply inbox — the OTHER steering lane, carried on the same heartbeat
+# under the same contract. These are non-urgent messages ("see this when you
+# surface"), as opposed to guidance ("act on this now"). They used to be read
+# straight from the DB and delivered only at a tactical->strategic boundary,
+# which stops being a usable cadence once tactical phases grow: at three phases
+# per job there is exactly one such boundary, and a reply sent during the
+# review phase would never be delivered at all. The graph now drains this inbox
+# at the agent's own natural breaks — a completed todo — with a wall-clock
+# floor so a stuck agent still sees its mail.
+_reply_inbox: Dict[str, List[Dict[str, Any]]] = {}
+
 
 def get_pending_guidance(job_id: str) -> List[Dict[str, Any]]:
     """Public helper for the worker graph: pending guidance for ``job_id``."""
     return list(_guidance_inbox.get(job_id, []))
+
+
+def get_queued_replies(job_id: str) -> List[Dict[str, Any]]:
+    """Public helper for the worker graph: queued replies for ``job_id``."""
+    return list(_reply_inbox.get(job_id, []))
 
 
 def ack_guidance(
@@ -272,32 +288,57 @@ def ack_guidance(
         pass
 
 
-def _update_guidance_inbox(response: Dict[str, Any]) -> None:
-    """Replace the inbox for the current job from the heartbeat response.
+def _replace_inbox(
+    inbox: Dict[str, List[Dict[str, Any]]],
+    job_id: str,
+    entries: Any,
+    label: str,
+) -> None:
+    """Replace one inbox for ``job_id`` from a heartbeat-response field.
 
     The orchestrator is the source of truth: a present list overwrites the
     inbox wholesale (so consumed entries prune themselves once the ack has
     landed), an empty list clears it, and a missing/None field (older
     orchestrator, or the job lookup failed) leaves the inbox untouched.
     """
+    if not isinstance(entries, list):
+        return
+    valid = [e for e in entries if isinstance(e, dict)]
+    if valid:
+        if inbox.get(job_id) != valid:
+            logger.info(
+                f"{label} pending for job {job_id}: {len(valid)} entr"
+                f"{'y' if len(valid) == 1 else 'ies'}"
+            )
+        inbox[job_id] = valid
+    else:
+        inbox.pop(job_id, None)
+
+
+def _update_guidance_inbox(response: Dict[str, Any]) -> None:
+    """Refresh both steering inboxes for the current job from the heartbeat.
+
+    Both lanes share the transport and the prune contract; they differ only in
+    when the graph renders them — guidance every turn, replies at the agent's
+    next natural break.
+    """
     job_id = _current_job_id
     if _pod_state != PodState.WORKING or not job_id:
         return
     if not isinstance(response, dict):
         return
-    entries = response.get("pending_guidance")
-    if not isinstance(entries, list):
-        return
-    valid = [e for e in entries if isinstance(e, dict)]
-    if valid:
-        if _guidance_inbox.get(job_id) != valid:
-            logger.info(
-                f"Supervisor guidance pending for job {job_id}: {len(valid)} entr"
-                f"{'y' if len(valid) == 1 else 'ies'}"
-            )
-        _guidance_inbox[job_id] = valid
-    else:
-        _guidance_inbox.pop(job_id, None)
+    _replace_inbox(
+        _guidance_inbox,
+        job_id,
+        response.get("pending_guidance"),
+        "Supervisor guidance",
+    )
+    _replace_inbox(
+        _reply_inbox,
+        job_id,
+        response.get("queued_replies"),
+        "Queued replies",
+    )
 
 
 async def _handle_heartbeat_intents(response: Dict[str, Any]) -> None:

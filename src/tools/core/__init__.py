@@ -2,7 +2,7 @@
 
 This toolkit is always loaded as it provides essential agent functionality.
 It includes:
-- Todo tools: Task tracking (next_phase_todos, todo_complete, todo_list, todo_rewind)
+- Todo tools: Task tracking (next_phase_todos, todo_complete, todo_list, request_replan)
 - Job tools: Completion signaling (mark_complete, job_complete)
 """
 

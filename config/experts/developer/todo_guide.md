@@ -18,12 +18,19 @@ Every developer phase is one of these types. The strategic phase chooses; the ta
 
 **Pick exactly one tdd_phase per tactical phase.** Mixing types in one phase is the failure mode that erases the TDD discipline.
 
-**Target: 5-10 todos per tactical phase.** Adapt based on complexity:
-- Spec phase: 3-5 todos (interview, write spec, lock to spec_lock.md, init matrix)
-- Red phase: 1 todo per behavior under test (target 5-8)
-- Green phase: 1 todo per failing test (target 5-8)
-- Refactor phase: 3-5 focused structural changes
-- Integration phase: 3-5 todos (review diff, commit, push, verify)
+**Phase count here is set by the TDD cycle, not by batch size.** Other experts default
+to a single execution phase; you are the exception, because `spec`/`red`/`green` differ
+in what they are *allowed to write* and collapsing them erases the discipline.
+
+What you should NOT do is split within a type. One `red` phase covering every failing
+test beats three small ones — each extra boundary costs a full planning cycle.
+
+**Target: 8-16 todos per tactical phase.** Adapt based on complexity:
+- Spec phase: 3-6 todos (interview, write spec, lock to spec_lock.md, init matrix)
+- Red phase: 1 todo per behavior under test — all of them, in one phase
+- Green phase: 1 todo per failing test — all of them, in one phase
+- Refactor phase: 3-6 focused structural changes (skip entirely when not needed)
+- Integration phase: 3-6 todos (review diff, commit, push, verify)
 
 ---
 
@@ -186,4 +193,8 @@ For GREEN phase:
 | `refactor` | 3-5 | After green; only when structure genuinely needs improvement |
 | `integration` | 3-5 | Final phase — PR/commit prep |
 
-**Default per phase: 7 todos.** Spec/integration phases are smaller (3-5). Red/green phases scale with AC count. If a phase needs > 12 todos, split the spec or split the phase.
+**Default per phase: as many todos as the type needs.** Spec/integration are naturally
+smaller (3-6). Red/green scale with AC count and should cover the whole spec in one
+phase — do not split a red or green phase to keep the list short. If a phase would
+exceed ~25 todos the spec is too big; split the spec, not the phase. If execution shows
+the spec itself is wrong, invoke `request_replan`.

@@ -202,14 +202,6 @@ nudges:
     Action required: complete the current todo `{todo_id}` now by invoking the `todo_complete` tool.
     The Gemma tool-call format is `<|tool_call>call:fn{{key:<|"|>val<|"|>}}<tool_call|>` — use braces, never parens.
 
-  budget_rewind: |-
-    PHASE BUDGET REACHED: {used}/{cap} tool calls consumed.
-    Stage new todos by invoking the `next_phase_todos` tool. Use the canonical brace format defined in your system prompt — do not type Python-style calls.
-    Before staging:
-      1. Review what worked and what didn't
-      2. Identify root causes for the failures
-      3. Stage smaller, more focused todos
-
   # See default.yaml: never enumerate the tool surface here — models read such
   # lists as exhaustive and conclude their other bound tools are gone.
   todo_list_footer: |-

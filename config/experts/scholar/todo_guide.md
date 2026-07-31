@@ -8,7 +8,9 @@ for exploration and idea generation.
 
 ## Core Principle: Breadth Over Depth
 
-**Target: 5-7 todos per tactical phase.** Each todo should explore one question or
+**Target: cover the whole investigation in ONE tactical phase (10-20 todos).** A phase
+boundary costs a full planning cycle, so prefer a larger phase over several small ones.
+Each todo should explore one question or
 produce one artifact. Don't spend more than one phase deep-diving a single topic.
 
 Each tactical phase ends with a strategic review where you assess coverage:
@@ -193,5 +195,7 @@ Every factual claim in an idea artifact must cite a source:
 {% endif -%}
 | Synthesis | 4-6 | Reviewing findings, writing remaining ideas |
 
-**Default to 5 todos.** Go higher (6-7) for broad web exploration sweeps. Go lower
-(3-4) for focused experiments. If you need more than 7, split into two phases.
+**Default to one phase covering the investigation.** The counts above are the shape of
+the work inside a phase, not a reason to split: a second phase is worth its planning
+cycle only when the next questions genuinely cannot be written until the first batch
+lands. If findings invalidate the plan mid-phase, invoke `request_replan` instead.

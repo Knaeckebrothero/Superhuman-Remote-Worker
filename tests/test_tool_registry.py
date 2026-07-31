@@ -65,10 +65,10 @@ class TestRegistryMetadata:
         assert "next_phase_todos" in TOOL_REGISTRY
         assert TOOL_REGISTRY["next_phase_todos"]["phases"] == ["strategic"]
 
-    def test_todo_rewind_is_tactical_only(self):
-        """todo_rewind must be tactical-only."""
-        assert "todo_rewind" in TOOL_REGISTRY
-        assert TOOL_REGISTRY["todo_rewind"]["phases"] == ["tactical"]
+    def test_request_replan_is_tactical_only(self):
+        """request_replan must be tactical-only."""
+        assert "request_replan" in TOOL_REGISTRY
+        assert TOOL_REGISTRY["request_replan"]["phases"] == ["tactical"]
 
     def test_mark_complete_available_both_phases(self):
         """mark_complete must be available in both phases."""
@@ -192,15 +192,15 @@ class TestFilterToolsByPhase:
         result = filter_tools_by_phase(["job_complete", "read_file"], "tactical")
         assert "job_complete" not in result
 
-    def test_strategic_excludes_todo_rewind(self):
-        """Strategic phase should exclude todo_rewind."""
-        result = filter_tools_by_phase(["todo_rewind", "read_file"], "strategic")
-        assert "todo_rewind" not in result
+    def test_strategic_excludes_request_replan(self):
+        """Strategic phase should exclude request_replan."""
+        result = filter_tools_by_phase(["request_replan", "read_file"], "strategic")
+        assert "request_replan" not in result
 
-    def test_tactical_includes_todo_rewind(self):
-        """Tactical phase should include todo_rewind."""
-        result = filter_tools_by_phase(["todo_rewind", "read_file"], "tactical")
-        assert "todo_rewind" in result
+    def test_tactical_includes_request_replan(self):
+        """Tactical phase should include request_replan."""
+        result = filter_tools_by_phase(["request_replan", "read_file"], "tactical")
+        assert "request_replan" in result
 
     def test_both_phases_include_read_file(self):
         """read_file should be available in both phases."""
@@ -248,12 +248,12 @@ class TestGetToolsForPhase:
     def test_tactical_includes_tactical_tools(self):
         """Tactical phase should include tactical-only tools."""
         tools = get_tools_for_phase("tactical")
-        assert "todo_rewind" in tools
+        assert "request_replan" in tools
 
     def test_strategic_excludes_tactical_only(self):
         """Strategic should exclude tactical-only tools."""
         tools = get_tools_for_phase("strategic")
-        assert "todo_rewind" not in tools
+        assert "request_replan" not in tools
 
     def test_tactical_excludes_strategic_only(self):
         """Tactical should exclude strategic-only tools."""

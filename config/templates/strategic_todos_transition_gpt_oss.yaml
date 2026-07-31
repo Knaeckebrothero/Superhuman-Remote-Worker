@@ -65,7 +65,8 @@ todos:
 
       === CONTINUE CONDITION ===
 
-      Call next_phase_todos with 2-5 todos for the next tactical phase. Each
+      Call next_phase_todos with the todos for the next tactical phase — enough
+      to cover the remaining work in one phase where possible. Each
       todo MUST produce substantive content (NEVER "create skeleton" or "add
       headings"), name exact files, sections, and expected word counts, and be
       completable in 1-3 tool calls. Include a verification todo that checks

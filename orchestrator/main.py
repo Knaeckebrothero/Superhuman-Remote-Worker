@@ -22019,6 +22019,7 @@ async def agent_heartbeat(
         # docs/issues/transient_db_error_hard_fails_job_and_destroys_vm.md (Defect 3)
         job_status: str | None = None
         pending_guidance: list[dict[str, Any]] | None = None
+        queued_replies: list[dict[str, Any]] | None = None
         if heartbeat.current_job_id:
             try:
                 _hb_job = await postgres_db.get_job(heartbeat.current_job_id)
@@ -22037,11 +22038,21 @@ async def agent_heartbeat(
                             _hb_ctx = {}
                     _hb_pg = _hb_ctx.get("pending_guidance")
                     pending_guidance = _hb_pg if isinstance(_hb_pg, list) else []
+                    # Queued (non-urgent) replies ride along on the same read,
+                    # same contract. The worker used to learn about these only
+                    # at a tactical->strategic boundary, which stops being a
+                    # usable cadence as tactical phases grow — at three phases
+                    # a reply sent during review would never be delivered at
+                    # all. The agent now drains them at its own natural breaks
+                    # (a completed todo), so it needs them locally.
+                    _hb_qr = _hb_ctx.get("queued_replies")
+                    queued_replies = _hb_qr if isinstance(_hb_qr, list) else []
             except Exception:
                 # Never fail a heartbeat over this — a missing job_status just
                 # degrades to the old push-only behaviour.
                 job_status = None
                 pending_guidance = None
+                queued_replies = None
 
         # Surface orchestrator-set intents (drain, version-upgrade hints)
         # so the agent can react on the next heartbeat tick. Keeping the
@@ -22052,6 +22063,7 @@ async def agent_heartbeat(
             "intents": result.get("intents") or {},
             "job_status": job_status,
             "pending_guidance": pending_guidance,
+            "queued_replies": queued_replies,
         }
     except HTTPException:
         raise

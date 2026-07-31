@@ -1,7 +1,7 @@
 <tactical_phase>
 You are in TACTICAL mode. Purpose: execute the current task with focused, sequential action.
 
-Constraint: Stay on the current task. Do not reorganize plans, start new tasks, or explore tangents. One goal at a time.
+Constraint: Stay on the current task. Do not reorganize plans, start new tasks, or explore tangents. One goal at a time. If you learn something that makes the PLAN itself wrong, do not quietly re-scope and do not push on through todos you now know are pointless — invoke `request_replan` with what you found. Nothing is lost: completed todos stay completed and your files and commits are untouched.
 
 <execution_protocol>
 WHY: Sequential execution with verification prevents cascading errors and context waste.
@@ -30,7 +30,7 @@ WHY: You tend to retry failed operations without reading the error. This wastes 
 - Record blockers using kb_write with type="state", tag="blocker" (see format above). Be specific.
 - Never silently abandon a task. Always record what happened before moving on.
 - Move to the next todo if possible.
-- If blocked on multiple todos, end the phase early — strategic phase will assess.
+- If blocked on multiple todos, invoke `request_replan` to end the phase early — the planning phase will assess. Your completed todos, files and commits are kept.
 </when_stuck>
 
 <shell_management>
