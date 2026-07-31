@@ -4587,9 +4587,11 @@ async def _loop_permission_check(
         return PermissionOutcome.APPROVED
 
     if mode == "auto_accept":
-        # Auto-accept reads and writes; still ask for shell commands.
-        shell_tools = {"run_command", "shell_execute", "shell_read"}
-        if tool_name not in shell_tools:
+        # Auto-accept reads and writes; still ask for shell commands. Reads
+        # the shared _SHELL_TOOLS constant (not a local copy) so this stays
+        # in lockstep with _gate_needed — two independently-maintained sets
+        # could silently drift and leave a gated call with no announced row.
+        if tool_name not in _SHELL_TOOLS:
             return PermissionOutcome.APPROVED
 
     # Phase 5 wake path: if this tool_call_id was already resolved (typical
@@ -4598,19 +4600,24 @@ async def _loop_permission_check(
     # checkpoint), reuse that decision instead of inserting a fresh
     # request. We only honor terminal 'approved'/'denied' here — 'expired'
     # means the prior request timed out without a user response, so the
-    # new attempt deserves a fresh prompt.
+    # new attempt deserves a fresh prompt. A 'pending' row means the batch
+    # announce (_loop_announce_permission_batch) already inserted it —
+    # claim that row instead of inserting a second one for the same
+    # tool_call_id (there is no unique constraint to stop a duplicate).
+    claimed_request_id: Optional[str] = None
     if _session.postgres_conn is not None and _thread_id is not None:
         try:
             async with _session.postgres_conn.acquire() as conn:
                 existing = await conn.fetchrow(
-                    "SELECT status FROM thread_permission_requests "
+                    "SELECT id, status FROM thread_permission_requests "
                     "WHERE thread_id = $1 AND tool_call_id = $2 "
-                    "  AND status IN ('approved', 'denied') "
-                    "ORDER BY decided_at DESC NULLS LAST LIMIT 1",
+                    "  AND status IN ('approved', 'denied', 'pending') "
+                    "ORDER BY decided_at DESC NULLS LAST, requested_at DESC "
+                    "LIMIT 1",
                     _thread_id,
                     tool_call_id,
                 )
-            if existing is not None:
+            if existing is not None and existing["status"] != "pending":
                 decision = existing["status"]
                 _session.tool_decisions[tool_call_id] = decision
                 logger.info(
@@ -4625,6 +4632,10 @@ async def _loop_permission_check(
                     if decision == "approved"
                     else PermissionOutcome.DECLINED
                 )
+            if existing is not None:
+                # A batch announce already inserted this row. Claim it —
+                # inserting again would orphan a card nobody waits on.
+                claimed_request_id = str(existing["id"])
         except Exception as e:
             # Soft-fail: fall through to the regular INSERT-and-wait path.
             logger.warning(
@@ -4635,26 +4646,33 @@ async def _loop_permission_check(
 
     # Supervised mode (or shell under auto_accept): ask user via the
     # durable permission table, then wait on LISTEN/NOTIFY.
-    request_id = await _insert_permission_request(tool_call_id, tool_name, tool_args)
-    if request_id is None:
-        # DB unavailable — conservative deny rather than risk silent
-        # auto-approval. Logged at WARNING by the insert helper. This is a
-        # real DECLINE, not a park: with no durable row there is nothing a
-        # later approval could resolve.
-        if _session is not None:
-            _session.tool_decisions[tool_call_id] = "denied"
-        return PermissionOutcome.DECLINED
+    if claimed_request_id is not None:
+        request_id = claimed_request_id
+    else:
+        request_id = await _insert_permission_request(
+            tool_call_id, tool_name, tool_args
+        )
+        if request_id is None:
+            # DB unavailable — conservative deny rather than risk silent
+            # auto-approval. Logged at WARNING by the insert helper. This is a
+            # real DECLINE, not a park: with no durable row there is nothing a
+            # later approval could resolve.
+            if _session is not None:
+                _session.tool_decisions[tool_call_id] = "denied"
+            return PermissionOutcome.DECLINED
 
-    # Broadcast carries both ids so clients can refer back via either.
-    _broadcast(
-        "permission.request",
-        {
-            "id": tool_call_id,
-            "approval_id": request_id,
-            "tool": tool_name,
-            "args": _safe_serialize(tool_args),
-        },
-    )
+        # Broadcast carries both ids so clients can refer back via either.
+        # Skipped when the row was claimed: the batch frame already
+        # announced it, and a second frame would duplicate the card.
+        _broadcast(
+            "permission.request",
+            {
+                "id": tool_call_id,
+                "approval_id": request_id,
+                "tool": tool_name,
+                "args": _safe_serialize(tool_args),
+            },
+        )
 
     # Phase 5: sudo gate hit untethered is the second natural-pause site.
     # Flip the thread so the attention-sleep watchdog can fire after the
