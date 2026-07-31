@@ -1337,19 +1337,23 @@ export function clearDraft(threadId: string | null): void {
 
         <!-- Inline approval card (mile marker) — anchored to the live turn,
              not gated on streaming state so it stays visible across edge cases. -->
-        @if (chat.pendingPermissions()[0]; as perm) {
-          <div class="mile">
+        @if (chat.pendingPermissions().length > 0) {
+          <div class="mile mile-permission">
             <div class="mile-label">{{ 'chat.permission.title' | transloco }}</div>
-            <div class="mile-title">{{ permissionTitle(perm) }}</div>
-            <div class="mile-detail">
-              <app-icon size="sm" class="mile-detail-icon">{{ toolIcon(perm.tool) }}</app-icon>
-              <code class="mile-tool">{{ perm.tool }}</code>
-              @if (formatToolArgs(perm.args); as a) {
-                <code class="mile-args">({{ a }})</code>
-              }
+            <div class="mile-title">
+              {{ 'chat.permission.batchTitle' | transloco: {count: chat.pendingPermissions().length} }}
             </div>
+            <ul class="permission-list">
+              @for (perm of chat.pendingPermissions(); track perm.id) {
+                <li class="permission-row">
+                  <app-icon size="sm">{{ toolIcon(perm.tool) }}</app-icon>
+                  <code class="permission-tool">{{ perm.tool }}</code>
+                  <code class="permission-args">{{ permissionArgs(perm) }}</code>
+                </li>
+              }
+            </ul>
             <div class="mile-actions">
-              <app-button variant="success" size="sm" (clicked)="chat.approveAll()">{{ 'chat.permission.approve' | transloco }}</app-button>
+              <app-button variant="success" size="sm" (clicked)="chat.approveAll()">{{ 'chat.permission.approveAll' | transloco }}</app-button>
               <app-button variant="info" size="sm" (clicked)="approveAndAutoAccept()">{{ 'chat.permission.autoAccept' | transloco }}</app-button>
               <app-button variant="danger" size="sm" (clicked)="chat.stop()">{{ 'chat.permission.stop' | transloco }}</app-button>
             </div>
@@ -3014,8 +3018,8 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     }
 
     approveAndAutoAccept(): void {
-        this.chat.approveAll();
         this.chat.setMode('auto_accept');
+        this.chat.approveAll();
     }
 
     /** Display-only: whether reasoning ("thinking") blocks open expanded by default. */
@@ -3458,8 +3462,15 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         return this.fallbackToolLabel(tc.tool);
     }
 
-    permissionTitle(perm: PermissionRequest): string {
-        return this.toolLabel({...perm, status: 'pending'} as ToolCallInfo);
+    /** Compact one-line args preview so the user can see WHAT each call does
+     *  before approving the batch — including a destructive shell command. */
+    permissionArgs(perm: PermissionRequest): string {
+        const args = perm.args ?? {};
+        const parts = Object.entries(args).map(([k, v]) => {
+            const s = typeof v === 'string' ? v : JSON.stringify(v);
+            return `${k}: ${s.length > 120 ? s.slice(0, 120) + '…' : s}`;
+        });
+        return parts.join(', ');
     }
 
     formatTime(d: Date | string | number): string {
