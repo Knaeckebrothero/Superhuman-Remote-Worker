@@ -4287,6 +4287,63 @@ async def _insert_permission_request(
         return None
 
 
+_SHELL_TOOLS = {"run_command", "shell_execute", "shell_read"}
+
+
+def _gate_needed(mode: str, tool_name: str) -> bool:
+    """Whether this call would actually hit a permission gate.
+
+    Mirrors the early-returns in ``_loop_permission_check`` so the announce
+    never creates a row for a call that auto-approves.
+    """
+    if mode == "autonomous":
+        return False
+    if mode == "auto_accept":
+        return tool_name in _SHELL_TOOLS
+    return True
+
+
+async def _loop_announce_permission_batch(tool_calls: List[Dict[str, Any]]) -> None:
+    """Insert a pending row for every gate-needing call in one batch, then
+    emit a single ``permission.request_batch`` frame.
+
+    Lets the cockpit show every pending call at once instead of one card per
+    finished tool. The per-call gate path then *claims* these rows rather
+    than inserting its own — see ``_loop_permission_check``.
+    """
+    if _session is None or _thread_id is None:
+        return
+    mode = _session.permission_mode
+    gated = [tc for tc in tool_calls if _gate_needed(mode, tc.get("name", ""))]
+    if not gated:
+        return
+
+    requests: List[Dict[str, Any]] = []
+    for tc in gated:
+        tool_call_id = tc.get("id") or ""
+        tool_name = tc.get("name", "")
+        tool_args = tc.get("args", {}) or {}
+        if not tool_call_id:
+            continue
+        request_id = await _insert_permission_request(
+            tool_call_id, tool_name, tool_args
+        )
+        if request_id is None:
+            # DB refused this row — leave it to the per-call gate path.
+            continue
+        requests.append(
+            {
+                "id": tool_call_id,
+                "approval_id": request_id,
+                "tool": tool_name,
+                "args": _safe_serialize(tool_args),
+            }
+        )
+
+    if requests:
+        _broadcast("permission.request_batch", {"requests": requests})
+
+
 async def _pending_permission_requests() -> List[Dict[str, Any]]:
     """Every still-pending gate for this thread, shaped like the
     ``permission.request`` broadcast payload.
