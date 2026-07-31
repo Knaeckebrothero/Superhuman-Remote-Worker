@@ -460,13 +460,18 @@ class TestArchivePhaseNode:
         assert len(managers["todo"].list_all()) == 0
 
     @pytest.mark.asyncio
-    async def test_force_summarize_on_strategic_to_tactical_transition(
+    async def test_no_force_summarize_on_strategic_to_tactical_transition(
         self, managers, mock_config
     ):
-        """Test that summarization is forced when transitioning from strategic to tactical.
+        """Boundary compaction is threshold-driven, never forced — both directions.
 
-        This ensures tactical phases get a 'fresh conversation' with just the plan summary,
-        reducing context size and removing irrelevant planning discussions.
+        This used to force a full summarization on the strategic→tactical hop to
+        give tactical a 'fresh conversation with just the plan summary'. That
+        erased what the NEXT strategic phase needed, forcing it to reconstruct
+        state from git, at a cost that grew every phase. Repeated irreversible
+        query-agnostic compaction grows end-task error super-linearly in the
+        number of events (arXiv 2607.08032), and no major harness compacts on a
+        structural boundary. See docs/issues/phase_model_overhead_amnesia_loop.md.
         """
         managers["todo"].add("Task 1")
         managers["todo"].complete("todo_1")
@@ -496,14 +501,14 @@ class TestArchivePhaseNode:
             mock_summarization_prompt,
         )
 
-        # Test strategic phase (is_strategic=True) - should force summarization
+        # Strategic phase completing (is_strategic=True) — the hop that used to force
         state = {"job_id": "test-123", "messages": [], "is_strategic_phase": True}
         await node(state)
 
-        # Verify ensure_within_limits was called with force=True
+        # Verify ensure_within_limits was NOT forced
         call_kwargs = mock_context_mgr.ensure_within_limits.call_args
-        assert call_kwargs.kwargs.get("force") is True, (
-            "Expected force=True for strategic→tactical transition"
+        assert call_kwargs.kwargs.get("force") is False, (
+            "Boundary compaction must be threshold-driven, not forced"
         )
 
     @pytest.mark.asyncio

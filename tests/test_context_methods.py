@@ -357,8 +357,15 @@ class TestEvidencePreservation:
         assert tool_msgs[2].content == "read result 2"
         assert tool_msgs[3].content == "read result 3"
 
-    def test_error_content_preserved_when_old(self, mgr):
-        """Old tool results containing error signals must survive clearing."""
+    def test_error_content_cleared_when_old(self, mgr):
+        """Old tool results containing error signals are cleared like any other.
+
+        Failure-content preservation was removed with the <phase_audit_protocol>
+        that consumed it (4eba5d47): keeping an agent's own stale error traces in
+        context drives the measured self-conditioning effect (arXiv 2509.09677).
+        Recent failures are still visible via the keep_recent window; only ones
+        older than it decay to a placeholder.
+        """
         messages = [
             AIMessage(
                 content="",
@@ -378,14 +385,15 @@ class TestEvidencePreservation:
         result = mgr.clear_old_tool_results(messages, keep_recent=2)
         tool_msgs = [m for m in result if isinstance(m, ToolMessage)]
 
-        # Error message at index 0 preserved, non-error at index 1 cleared
-        assert "ENOENT" in tool_msgs[0].content
+        # Both old results cleared — error content earns no exemption
+        assert tool_msgs[0].content == "[cleared]"
         assert tool_msgs[1].content == "[cleared]"
+        # The recent window still carries failures verbatim
         assert tool_msgs[2].content == "recent 1"
         assert tool_msgs[3].content == "recent 2"
 
-    def test_traceback_content_preserved(self, mgr):
-        """Python traceback text must survive clearing."""
+    def test_traceback_content_cleared_when_old(self, mgr):
+        """Python traceback text outside the recent window is cleared too."""
         traceback_content = (
             'Traceback (most recent call last):\n  File "x.py", line 1\n'
             "ValueError: bad input"
@@ -406,8 +414,9 @@ class TestEvidencePreservation:
         ]
         result = mgr.clear_old_tool_results(messages, keep_recent=1)
         tool_msgs = [m for m in result if isinstance(m, ToolMessage)]
-        assert "Traceback" in tool_msgs[0].content
-        assert "ValueError" in tool_msgs[0].content
+        assert tool_msgs[0].content == "[cleared]"
+        # Tool name survives so the reader still knows what produced it
+        assert tool_msgs[0].name == "run_command"
 
     def test_non_evidence_still_cleared(self, mgr):
         """Ordinary tool results with no evidence markers still get cleared."""
@@ -447,8 +456,12 @@ class TestEvidencePreservation:
         assert tool_msgs[0].content == "[cleared]"
         assert tool_msgs[0].name == "kb_search"
 
-    def test_error_content_not_truncated_when_long(self, mgr):
-        """Long error content must survive length-based truncation too."""
+    def test_error_content_truncated_when_long(self, mgr):
+        """Long error content is truncated like any other long result.
+
+        Side-effect tools (write_file/edit_file/patch_*) keep their exemption —
+        see the next test. Only the failure-content patterns were dropped.
+        """
         long_error = "Error: " + ("x" * 500) + " Exception details"
         messages = [
             AIMessage(
@@ -464,9 +477,9 @@ class TestEvidencePreservation:
         ]
         result = mgr.truncate_long_tool_results(messages)
         tool_msgs = [m for m in result if isinstance(m, ToolMessage)]
-        # The full error content must be intact
-        assert tool_msgs[0].content == long_error
-        assert "TRUNCATED" not in tool_msgs[0].content
+        # Error content earns no length exemption any more
+        assert "TRUNCATED" in tool_msgs[0].content
+        assert len(tool_msgs[0].content) < len(long_error)
 
     def test_write_file_result_not_truncated_when_long(self, mgr):
         """write_file outputs survive length truncation."""
