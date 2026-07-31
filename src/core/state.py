@@ -112,9 +112,15 @@ class UniversalAgentState(TypedDict):
     tool_retry_state: Optional[Dict[str, Any]]
 
     # Phase transition state (legacy, for backwards compatibility)
-    # Set when a phase transition is triggered by todo_complete or todo_rewind
+    # Set when a phase transition is triggered by todo_complete or request_replan
     # Contains: transition_type, trigger_summarization, metadata
     phase_transition: Optional[Dict[str, Any]]
+
+    # Why the tactical phase asked to end early (request_replan tool).
+    # Set by check_todos when it consumes the request, read by handle_transition
+    # so the incoming strategic phase is told what changed. Cleared at the
+    # transition — a stale reason must not steer a later phase.
+    replan_reason: Optional[str]
 
     # Todo persistence (for checkpoint/resume)
     # These fields sync TodoManager state to LangGraph checkpoints

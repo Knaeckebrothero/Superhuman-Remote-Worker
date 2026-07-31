@@ -370,7 +370,7 @@ Goal: Produce a written brief on speculative decoding for LLM serving, ~1500-200
 - `search_papers`, `download_paper` — academic search
 - `read_file`, `write_file`, `edit_file`, `move_file`, `list_dir` — workspace
 - `cite_web`, `cite_document` — citations
-- `todo_complete`, `todo_rewind`, `next_phase_todos`, `mark_complete` — todo management
+- `todo_complete`, `request_replan`, `next_phase_todos`, `mark_complete` — todo management
 - `run_command`, `shell_execute`, `shell_read` — shell
 
 ## Workflow
@@ -604,7 +604,7 @@ def _build_prod_tools() -> list[dict[str, Any]]:
         },
     )
     t(
-        "todo_rewind",
+        "request_replan",
         "Reopen a previously completed todo.",
         {"todo_id": _arg_str()},
         ["todo_id"],

@@ -76,7 +76,9 @@ todos:
       explicit reason (threads depend on each other's results, or a single narrow
       topic). Record the decision in the phase table — later phases follow the plan.
 
-      PHASE SIZING: Target 5-7 todos per tactical phase.
+      PHASE SIZING: Cover the investigation in ONE exploration phase (10-20 todos)
+      where you can. A second phase must earn its planning cycle — plan one only when
+      its questions cannot be written until the first phase's findings land.
 
       PHASE ORDERING: Start with broad web exploration or codebase archaeology to
       establish context. Follow with focused investigation of promising leads.
@@ -120,7 +122,7 @@ todos:
     content: >-
       CREATE first phase todos using the next_phase_todos tool.
 
-      Create 5-7 todos for the first exploration phase. (The todo-guide skill at
+      Create 10-20 todos for the exploration phase. (The todo-guide skill at
       skills/todo-guide/SKILL.md covers todo crafting.)
 
       Each todo must:
@@ -138,7 +140,7 @@ todos:
 
       Include at least one todo for recording findings as knowledge notes (kb_write).
 
-      COMPLETION CRITERIA: next_phase_todos called successfully with 5-7 todos.
+      COMPLETION CRITERIA: next_phase_todos called successfully with the exploration todos.
 
       INSTEAD OF: Vague todos like "research the topic" — specify what to search,
       where to look, and what artifact to produce.

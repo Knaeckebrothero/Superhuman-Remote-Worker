@@ -974,9 +974,16 @@ class TodoManager:
     ) -> str:
         """Archive todos with an explanatory note.
 
-        Used by todo_rewind when the current approach isn't working (the
-        defaults), and by restore_from_feedback to archive in-flight todos a
-        feedback resume preempts — with an honest label instead of "failed".
+        Used by restore_from_feedback to archive in-flight todos a feedback
+        resume preempts (with an honest label instead of "failed"), and by the
+        ``max_tool_calls_per_phase`` budget rewind in graph.py.
+
+        NOT used by ``request_replan`` any more. That tool used to call this
+        with the "failed" defaults, which wrote *every* todo — including the
+        completed ones — into a failure archive and emptied the list, so the
+        next strategic phase inherited no record of what had actually been
+        achieved. A replan now leaves the todos alone and lets the normal
+        phase archive record their real statuses.
 
         Args:
             issue: Description of why the todos are being archived

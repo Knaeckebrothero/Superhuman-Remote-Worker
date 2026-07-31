@@ -283,7 +283,7 @@ class TestTodoListFooter:
             footer = format_nudge("todo_list_footer", family=family)
             # The forbidden pattern: presenting a closed tool list.
             assert "Tools available" not in footer, family
-            assert "todo_rewind" not in footer, family
+            assert "request_replan" not in footer, family
             assert "mark_complete" not in footer, family
             # It still teaches how to advance the list...
             assert "todo_complete" in footer, family

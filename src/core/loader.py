@@ -1547,9 +1547,22 @@ class LimitsConfig:
     progress_stall_threshold: int = (
         30  # tool calls without progress before nudge reminder
     )
-    max_tool_calls_per_phase: int = (
-        500  # max tool calls per phase before rewind (tactical) or freeze (strategic)
-    )
+    # Optional per-phase ceiling. DEFAULT 0 = OFF. This used to be 500 and was
+    # the only stop the worker had, but it is the wrong unit: it resets at every
+    # phase boundary, so with 16 phases it was really an ~8000-call job budget,
+    # and with 3 large phases it would have become ~1500 — a tightening, exactly
+    # backwards for the fewer-larger-phases model. Superseded by
+    # max_tool_calls_per_job; kept so an operator who deliberately wants a
+    # per-phase guard can still set one.
+    max_tool_calls_per_phase: int = 0
+    # Job-level tool-call ceiling — the real backstop, and the only automatic
+    # stop a runaway job has. Nothing else terminates: the progress nudge and
+    # act-ratio tripwire only inject reminders, loop detection only masks tools,
+    # and the orchestrator has no job-duration ceiling. Hitting it freezes with
+    # budget_exceeded, which is NOT in AUTO_REDISPATCH_FREEZE_TYPES, so it parks
+    # for a human instead of looping. 0 disables it entirely — only do that if
+    # something else is watching the spend.
+    max_tool_calls_per_job: int = 5000
     # Act-ratio tripwire: consecutive tool actions touching ONLY process
     # artifacts (see process_artifact_patterns) before a "stop planning"
     # nudge is injected. 0 disables the tripwire.
@@ -1559,6 +1572,22 @@ class LimitsConfig:
     process_artifact_patterns: List[str] = field(
         default_factory=lambda: list(DEFAULT_PROCESS_ARTIFACT_PATTERNS)
     )
+    # Progress durability (src/core/progress_commit.py). Decouples "what an
+    # outside observer can see" from phase structure, which matters more the
+    # larger tactical phases get. Commits are free and happen per todo; pushes
+    # cost a Gitea round-trip and are throttled to this interval.
+    progress_push_interval_seconds: int = 60
+    # Seconds without any commit before the turn loop commits work in progress.
+    # Covers the case the per-todo trigger cannot: an agent stuck on a single
+    # long todo emits no completions, so it would otherwise go dark exactly
+    # when observers most need to see movement. 0 disables the floor.
+    progress_wip_commit_after_seconds: int = 300
+    # Steering lane B: how long a queued (non-urgent) reply may wait before it
+    # is delivered without a natural break. The break trigger (a completed
+    # todo) is anti-correlated with need — a stuck agent never reaches one —
+    # so this is the floor that stops mail being stranded. 0 disables it,
+    # leaving delivery entirely break-driven.
+    queued_reply_max_wait_seconds: int = 300
 
 
 @dataclass
@@ -2373,9 +2402,19 @@ def load_agent_config(
         ),
         tool_category_timeouts=tool_category_timeouts,
         progress_stall_threshold=limits_data.get("progress_stall_threshold", 30),
-        max_tool_calls_per_phase=limits_data.get("max_tool_calls_per_phase", 500),
+        max_tool_calls_per_phase=limits_data.get("max_tool_calls_per_phase", 0),
+        max_tool_calls_per_job=limits_data.get("max_tool_calls_per_job", 5000),
         act_ratio_nudge_threshold=limits_data.get("act_ratio_nudge_threshold", 6),
         process_artifact_patterns=_parse_process_artifact_patterns(limits_data),
+        progress_push_interval_seconds=limits_data.get(
+            "progress_push_interval_seconds", 60
+        ),
+        progress_wip_commit_after_seconds=limits_data.get(
+            "progress_wip_commit_after_seconds", 300
+        ),
+        queued_reply_max_wait_seconds=limits_data.get(
+            "queued_reply_max_wait_seconds", 300
+        ),
     )
 
     context_data = data.get("context_management", {})
@@ -2615,9 +2654,19 @@ def load_agent_config_from_dict(
         ),
         tool_category_timeouts=tool_category_timeouts,
         progress_stall_threshold=limits_data.get("progress_stall_threshold", 30),
-        max_tool_calls_per_phase=limits_data.get("max_tool_calls_per_phase", 500),
+        max_tool_calls_per_phase=limits_data.get("max_tool_calls_per_phase", 0),
+        max_tool_calls_per_job=limits_data.get("max_tool_calls_per_job", 5000),
         act_ratio_nudge_threshold=limits_data.get("act_ratio_nudge_threshold", 6),
         process_artifact_patterns=_parse_process_artifact_patterns(limits_data),
+        progress_push_interval_seconds=limits_data.get(
+            "progress_push_interval_seconds", 60
+        ),
+        progress_wip_commit_after_seconds=limits_data.get(
+            "progress_wip_commit_after_seconds", 300
+        ),
+        queued_reply_max_wait_seconds=limits_data.get(
+            "queued_reply_max_wait_seconds", 300
+        ),
     )
 
     context_data = data.get("context_management", {})

@@ -205,7 +205,7 @@ tools:
     - next_phase_todos      # Stage todos for next tactical phase
     - todo_complete          # Mark current todo done
     - todo_list              # List current todos
-    - todo_rewind            # Roll back failed todo
+    - request_replan         # End the phase early and re-plan, keeping all work
     - mark_complete          # Signal phase/task completion
     - job_complete           # Signal final completion (strategic only)
 

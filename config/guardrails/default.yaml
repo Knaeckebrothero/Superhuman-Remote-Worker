@@ -237,16 +237,6 @@ nudges:
     Action required: complete the current todo `{todo_id}` now by invoking the `todo_complete` tool.
     Use the tool-call format defined in your system prompt — do not type the call as plain text.
 
-  # Sites: src/graph.py:2939-2951 (phase-budget hard cap rewind)
-  # Placeholders: {used}, {cap}
-  budget_rewind: |-
-    PHASE BUDGET REACHED: {used}/{cap} tool calls consumed.
-    Before staging new todos with the `next_phase_todos` tool:
-      1. Review what worked and what didn't
-      2. Identify root causes for the failures
-      3. Stage smaller, more focused todos
-    Do not repeat the same sequence of calls.
-
   # Sites: src/graph.py:1193-1208 (degenerate-response recovery)
   degenerate_recovery_assistant: |-
     My previous response was degenerate — it contained repetitive or malformed output. I need to retry with a shorter, well-formed response.
