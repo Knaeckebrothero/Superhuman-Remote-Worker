@@ -26,8 +26,12 @@ P1-C contracts were attached by the officer unprompted on all three dispatches,
 with his own five-file contracts; P1-D preserved the cancelled jobs' evidence — the
 salvaged RED tests seeded the morning's recovery job; the slot roster put the heavy
 workspace on a VM automatically and it held all night. **Not yet exercised: the seal
-gate itself** — both contracted jobs were cancelled before any completion claim, so
-the gate's first live firing rides the recovery job. The night also surfaced two new
+gate itself** — no contracted job has reached a completion claim: the night's two were
+cancelled, and the 07-31 recovery attempt was killed by a P2-B workspace I/O timeout
+(annex D's transport class claiming its third verifier). The officer absorbed that day
+under the new standing orders — correct attribution, guidance-first, re-dispatch, zero
+pages — so the command layer is accepted; the gate's first firing now rides whichever
+recovery attempt first survives the infra. The night also surfaced two new
 platform findings (every-push retag churn F7 — fixed; drain-cause invisibility F8 —
 tracked), both in the conference doc. P2 remains unbuilt. All six research annexes (§7: read paths, steer mechanics, phase overhead,
 cluster evidence, framework survey, research literature) have landed and are folded into
