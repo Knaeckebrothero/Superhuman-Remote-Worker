@@ -1368,6 +1368,21 @@ def create_execute_node(
                 _tool_use_failed_streak[0] = 0
                 _llm_error_streak[0] = 0
 
+                # Anchor the compaction trigger on the provider's real
+                # input_tokens, mirroring the session loop
+                # (persistent_graph.py:1968). Workers never did this, so the
+                # trigger ran on a local estimate blind to the bound tool
+                # schemas — 60-90 tools is roughly 10-25k tokens per request
+                # that the threshold could not see. Forced boundary compaction
+                # masked the undercount by resetting history every two phases;
+                # once that stops, the local count would sit below threshold
+                # while the real request ran far larger. See
+                # docs/issues/phase_model_overhead_amnesia_loop.md.
+                _record_usage = getattr(context_mgr, "record_provider_usage", None)
+                if _record_usage is not None:
+                    _usage = getattr(response, "usage_metadata", None) or {}
+                    _record_usage(_usage.get("input_tokens"))
+
                 # Supervisor guidance rendered into THIS turn's request —
                 # ack it (best-effort, fire-and-forget) so the orchestrator
                 # moves the entries to ``context.consumed_replies`` and the
@@ -2904,7 +2919,19 @@ def create_archive_phase_node(
         if config.context_management.compact_on_archive:
             # Force summarization when transitioning from strategic to tactical
             # This gives tactical phases a "fresh conversation" with just the plan summary
-            force_summarize = is_strategic  # True when completing strategic phase
+            # Threshold-driven only. This used to be `is_strategic`, forcing a
+            # full LLM summarization at every strategic->tactical hop to give
+            # the tactical phase a "fresh conversation with just the plan
+            # summary". That erased the context the NEXT strategic phase needed,
+            # which is why the transition template tells the agent to use git
+            # evidence "not memory (memory may be wrong after compaction)" — the
+            # archaeology was a workaround for platform-induced amnesia, and it
+            # got more expensive every phase (106s -> 768s across 16 phases on
+            # job 396a5d4c). Repeated irreversible query-agnostic compaction
+            # grows end-task error super-linearly in the number of events
+            # (arXiv 2607.08032); no major harness compacts on a structural
+            # boundary. See docs/issues/phase_model_overhead_amnesia_loop.md.
+            force_summarize = False
 
             compacted_messages = await context_mgr.ensure_within_limits(
                 messages,
