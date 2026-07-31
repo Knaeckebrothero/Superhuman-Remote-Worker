@@ -17,7 +17,13 @@ def _mock_session(permission_mode: str = "supervised"):
     session = MagicMock()
     session.permission_mode = permission_mode
     session.tool_decisions = {}
-    session.postgres_conn = MagicMock()
+    # None (not an unconfigured MagicMock): a bare MagicMock auto-chains
+    # through `async with conn.acquire() as c: await c.fetchval(...)` and
+    # returns a truthy AsyncMock rather than raising or returning None,
+    # which would make any real DB-backed check silently misread "no row
+    # configured" as "found a row". Tests that need a real DB round trip
+    # wire postgres_conn explicitly (see _conn_with below).
+    session.postgres_conn = None
     return session
 
 
@@ -238,3 +244,57 @@ class TestSharedShellToolSet:
                     f"{tool_name!r} was auto-approved though _gate_needed "
                     "says it requires a gate — the two paths disagree"
                 )
+
+
+class TestAnnounceSkipsTerminalRows:
+    """Phase 5 wake replay: LangGraph restores a tool_call_id whose gate was
+    already resolved out-of-band (e.g. a magic-link click) while the agent
+    was suspended — that row is 'approved'/'denied' with decided_at set.
+    Announcing unconditionally would INSERT a fresh 'pending' row for the
+    same tool_call_id; _loop_permission_check's terminal-row short-circuit
+    then returns immediately without ever claiming, waiting on, or expiring
+    that new row. Nothing else reaps it (there is no expires_at sweeper —
+    only an active waiter CAS-expires on timeout), so it re-renders as a
+    live approval card on every reattach forever: exactly the orphaned,
+    unresolvable card this task exists to prevent.
+    """
+
+    @pytest.mark.asyncio
+    async def test_skips_tool_call_with_existing_terminal_decision(self):
+        calls = [
+            {"name": "web_search", "args": {"query": "a"}, "id": "tc_terminal"},
+            {"name": "web_search", "args": {"query": "b"}, "id": "tc_fresh"},
+        ]
+
+        async def _fetchval(sql, *args):
+            # Existence check is WHERE thread_id = $1 AND tool_call_id = $2.
+            tool_call_id = args[1]
+            return 1 if tool_call_id == "tc_terminal" else None
+
+        conn = AsyncMock()
+        conn.fetchval = AsyncMock(side_effect=_fetchval)
+        acquire_ctx = MagicMock()
+        acquire_ctx.__aenter__ = AsyncMock(return_value=conn)
+        acquire_ctx.__aexit__ = AsyncMock(return_value=False)
+
+        session = _mock_session()
+        session.postgres_conn = MagicMock()
+        session.postgres_conn.acquire = MagicMock(return_value=acquire_ctx)
+
+        insert = AsyncMock(return_value="rid-fresh")
+        bcast = MagicMock()
+
+        with (
+            patch.object(pa, "_session", session),
+            patch.object(pa, "_thread_id", "tid"),
+            patch.object(pa, "_insert_permission_request", insert),
+            patch.object(pa, "_broadcast", bcast),
+        ):
+            await pa._loop_announce_permission_batch(calls)
+
+        # No fresh row for the already-decided call — inserting one would
+        # orphan a card nobody claims or resolves.
+        insert.assert_awaited_once_with("tc_fresh", "web_search", {"query": "b"})
+        ids = [r["id"] for r in bcast.call_args.args[1]["requests"]]
+        assert "tc_terminal" not in ids
+        assert ids == ["tc_fresh"]

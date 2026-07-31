@@ -4303,6 +4303,47 @@ def _gate_needed(mode: str, tool_name: str) -> bool:
     return True
 
 
+async def _has_terminal_permission_decision(tool_call_id: str) -> bool:
+    """True if this tool_call_id already has an approved/denied row for the
+    current thread.
+
+    Covers the Phase 5 wake replay: a gate resolved out-of-band (e.g. a
+    magic-link click) while the agent was suspended leaves a terminal row
+    behind, then LangGraph restores the SAME tool_call_id on wake. Without
+    this check the announce step would INSERT a fresh 'pending' row for it;
+    _loop_permission_check's terminal-row short-circuit returns immediately
+    without ever claiming, waiting on, or expiring that new row, and nothing
+    else reaps it (there is no expires_at sweeper — only an active waiter
+    CAS-expires on timeout). The orphan re-renders as a live approval card
+    on every reattach, forever.
+
+    Soft-fails to False (assume no terminal row) so a DB hiccup degrades to
+    the pre-batch behavior — the per-call gate path still inserts and gates
+    — rather than blocking the announce.
+    """
+    if _session is None or _session.postgres_conn is None or _thread_id is None:
+        return False
+    try:
+        async with _session.postgres_conn.acquire() as conn:
+            found = await conn.fetchval(
+                "SELECT 1 FROM thread_permission_requests "
+                "WHERE thread_id = $1 AND tool_call_id = $2 "
+                "  AND status IN ('approved', 'denied') "
+                "LIMIT 1",
+                _thread_id,
+                tool_call_id,
+            )
+        return found is not None
+    except Exception as e:
+        logger.warning(
+            "Terminal-decision check for tool_call %s failed (%s); "
+            "assuming none exists",
+            tool_call_id,
+            e,
+        )
+        return False
+
+
 async def _loop_announce_permission_batch(tool_calls: List[Dict[str, Any]]) -> None:
     """Insert a pending row for every gate-needing call in one batch, then
     emit a single ``permission.request_batch`` frame.
@@ -4324,6 +4365,12 @@ async def _loop_announce_permission_batch(tool_calls: List[Dict[str, Any]]) -> N
         tool_name = tc.get("name", "")
         tool_args = tc.get("args", {}) or {}
         if not tool_call_id:
+            continue
+        if await _has_terminal_permission_decision(tool_call_id):
+            # Already resolved out-of-band before this wake — see
+            # _has_terminal_permission_decision. _loop_permission_check
+            # will short-circuit on that terminal row on its own; a fresh
+            # pending row here would just be orphaned.
             continue
         request_id = await _insert_permission_request(
             tool_call_id, tool_name, tool_args
