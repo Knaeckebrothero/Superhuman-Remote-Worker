@@ -245,6 +245,8 @@ def _cool_save_flag(request: Request, name: str) -> bool | None:
     return value.strip().lower() == "true"
 
 
+# nosec: public WOPI CheckFileInfo — access_token gate validated in-handler
+# The Office host echoes the token back on every callback; see _access_token().
 @router.get("/files/{file_id}")
 async def check_file_info(
     file_id: str,
@@ -293,6 +295,8 @@ async def check_file_info(
             response_lease.release()
 
 
+# nosec: public WOPI PutFile — access_token gate, write scope checked in-handler
+# Same token path as CheckFileInfo, with require_write=True.
 @router.post("/files/{file_id}/contents")
 async def put_file(
     file_id: str,
@@ -411,6 +415,7 @@ async def put_file(
         _raise_edit_error(exc)
 
 
+# nosec: public WOPI GetFile — same access_token gate as CheckFileInfo
 @router.get("/files/{file_id}/contents")
 async def get_file(
     file_id: str,

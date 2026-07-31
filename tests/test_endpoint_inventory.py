@@ -64,10 +64,12 @@ def test_endpoint_inventory_matches_manifest():
 def test_no_new_unscoped_endpoints():
     """The number of unscoped endpoints must not increase.
 
-    The current backlog of ~55 unscoped endpoints is grandfathered as
-    follow-up work (see docs/multi_tenancy.md P3 notes). New unscoped
-    endpoints have to be acknowledged either by adding a gate or by
-    marking them ``# nosec: public <reason>`` above the decorator.
+    main.py carries no unscoped endpoints at all. The remaining backlog is the
+    five ``/api/uploads`` routes, which surfaced when the walk was extended to
+    include_router-mounted modules and take no user identity of any kind — not
+    grandfathered on purpose, just not yet gated. New unscoped endpoints have
+    to be acknowledged either by adding a gate or by marking them
+    ``# nosec: public <reason>`` above the decorator.
     """
     script = _load_script()
     endpoints = script.collect_endpoints()

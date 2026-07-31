@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Walk orchestrator/main.py and classify every /api/* endpoint by access gate.
+"""Walk the orchestrator's routes and classify every endpoint by access gate.
 
 Output: one line per endpoint in stable sort order:
 
@@ -15,14 +15,15 @@ Classifications:
 The CI snapshot lives at docs/security/endpoint_inventory.txt; a mismatch
 fails the regression test and forces a manual review of any new endpoint.
 
-SCOPE LIMIT: only `@app.METHOD(...)` decorators in orchestrator/main.py are
-walked. Routes mounted via `app.include_router(...)` — everything under
-orchestrator/routers/, plus auth/bff.py, uploads.py and graph_routes.py — are
-NOT covered, so this manifest is not a complete inventory of the API surface.
-Extending the walk to routers means teaching `_gate_calls` to follow
-module-local gate helpers (e.g. contacts' `_owned_contact`) and annotating the
-token-authenticated /wopi/* and /auth/* paths, otherwise ~20 already-gated
-endpoints get mislabeled `unscoped`.
+Two route sources are walked:
+
+  * `@app.METHOD(...)` in orchestrator/main.py — restricted to /api/* paths,
+    which is every route main.py serves that this inventory cares about.
+  * `@<router>.METHOD(...)` in any module that builds an `APIRouter`, with the
+    router's `prefix=` folded into the path. These are mounted by main.py's
+    `app.include_router(...)` block and were invisible here until 2026-07-31;
+    the /auth/* and /wopi/* paths among them are listed in full rather than
+    filtered to /api/*, since those are the ones worth eyeballing.
 """
 
 from __future__ import annotations
@@ -34,7 +35,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-MAIN_PY = REPO_ROOT / "orchestrator" / "main.py"
+ORCHESTRATOR = REPO_ROOT / "orchestrator"
+MAIN_PY = ORCHESTRATOR / "main.py"
 MANIFEST = REPO_ROOT / "docs" / "security" / "endpoint_inventory.txt"
 
 HTTP_METHODS = {"get", "post", "put", "patch", "delete"}
@@ -64,6 +66,9 @@ GATE_NAMES = {
     "user_can_access_job_or_thread",
     "user_can_access_datasource",
     "user_can_access_ide_entity",
+    # BFF cookie-session resolver — raises 401 when there is no valid session.
+    # Auth-only, same tier as require_approved_user.
+    "get_current_user",
 }
 
 
@@ -84,12 +89,19 @@ def _decorator_call(decorator: ast.expr) -> ast.Call | None:
     return decorator if isinstance(decorator, ast.Call) else None
 
 
-def _route_info(decorator: ast.Call) -> tuple[str, str] | None:
-    """Return (method, path) if this is `app.METHOD("/api/...")`."""
+def _route_info(
+    decorator: ast.Call, route_vars: dict[str, str]
+) -> tuple[str, str] | None:
+    """Return (method, path) if this decorator mounts a route on a known object.
+
+    ``route_vars`` maps the decorated variable to the prefix its routes hang
+    off — ``{"app": ""}`` for main.py, or one entry per ``APIRouter`` in a
+    router module (``{"router": "/api/contacts", ...}``).
+    """
     func = decorator.func
     if not isinstance(func, ast.Attribute):
         return None
-    if not (isinstance(func.value, ast.Name) and func.value.id == "app"):
+    if not (isinstance(func.value, ast.Name) and func.value.id in route_vars):
         return None
     method = func.attr
     if method not in HTTP_METHODS:
@@ -99,26 +111,85 @@ def _route_info(decorator: ast.Call) -> tuple[str, str] | None:
     path_node = decorator.args[0]
     if not (isinstance(path_node, ast.Constant) and isinstance(path_node.value, str)):
         return None
-    path = path_node.value
-    if not path.startswith("/api/"):
-        return None
-    return method, path
+    return method, route_vars[func.value.id] + path_node.value
 
 
-def _gate_calls(func: ast.FunctionDef | ast.AsyncFunctionDef) -> list[str]:
-    """Names of gate functions invoked in the body or as Depends() in signature."""
+def _router_prefixes(tree: ast.Module) -> dict[str, str]:
+    """Map each `x = APIRouter(prefix=...)` variable to its prefix."""
+    prefixes: dict[str, str] = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign) or not isinstance(node.value, ast.Call):
+            continue
+        callee = node.value.func
+        name = (
+            callee.id if isinstance(callee, ast.Name) else getattr(callee, "attr", None)
+        )
+        if name != "APIRouter":
+            continue
+        prefix = ""
+        for keyword in node.value.keywords:
+            if keyword.arg == "prefix" and isinstance(keyword.value, ast.Constant):
+                prefix = keyword.value.value
+        for target in node.targets:
+            if isinstance(target, ast.Name):
+                prefixes[target.id] = prefix
+    return prefixes
+
+
+def _local_functions(
+    tree: ast.Module,
+) -> dict[str, ast.FunctionDef | ast.AsyncFunctionDef]:
+    """Module-level defs, so `_gate_calls` can follow a handler into its helper."""
+    return {
+        node.name: node
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+
+
+def _gate_calls(
+    func: ast.FunctionDef | ast.AsyncFunctionDef,
+    local_funcs: dict[str, ast.FunctionDef | ast.AsyncFunctionDef] | None = None,
+    _seen: set[str] | None = None,
+) -> list[str]:
+    """Names of gate functions invoked in the body or as Depends() in signature.
+
+    Calls into a module-local helper are followed (cycle-guarded), because the
+    routers routinely wrap their gate in a private one — contacts'
+    ``_owned_contact``, canvases' ``_require_delegated_owner`` — and reporting
+    those handlers as ungated would be a false positive, not a finding.
+    """
+    local_funcs = local_funcs or {}
+    _seen = _seen if _seen is not None else set()
     found: list[str] = []
+
+    def _resolve(name: str | None, *, bare: bool) -> None:
+        """``bare`` = called as `helper(...)`, not `something.helper(...)`.
+
+        Only bare names may be followed into a local def. `db.get_project_contacts()`
+        is a database method that happens to share a name with the route handler
+        of the same resource — recursing on attribute calls picks up that
+        handler's gate and reports it as this endpoint's.
+        """
+        if name is None:
+            return
+        if name in GATE_NAMES:
+            found.append(name)
+        elif bare and name in local_funcs and name not in _seen:
+            _seen.add(name)
+            found.extend(_gate_calls(local_funcs[name], local_funcs, _seen))
+
     # Body: look for Call nodes whose func name is a gate
     for node in ast.walk(func):
         if isinstance(node, ast.Call):
             target = node.func
             name: str | None = None
+            bare = False
             if isinstance(target, ast.Name):
-                name = target.id
+                name, bare = target.id, True
             elif isinstance(target, ast.Attribute):
                 name = target.attr
-            if name in GATE_NAMES:
-                found.append(name)
+            _resolve(name, bare=bare)
     # Signature: Depends(gate) markers in default values
     for default in func.args.defaults + func.args.kw_defaults:
         if not isinstance(default, ast.Call):
@@ -130,22 +201,23 @@ def _gate_calls(func: ast.FunctionDef | ast.AsyncFunctionDef) -> list[str]:
             continue
         dep_target = default.args[0]
         dep_name: str | None = None
+        dep_bare = False
         if isinstance(dep_target, ast.Name):
-            dep_name = dep_target.id
+            dep_name, dep_bare = dep_target.id, True
         elif isinstance(dep_target, ast.Attribute):
             dep_name = dep_target.attr
-        if dep_name in GATE_NAMES:
-            found.append(dep_name)
+        _resolve(dep_name, bare=dep_bare)
     return found
 
 
 def _classify(
     func: ast.FunctionDef | ast.AsyncFunctionDef,
     public_reason: str | None,
+    local_funcs: dict[str, ast.FunctionDef | ast.AsyncFunctionDef] | None = None,
 ) -> str:
     if public_reason is not None:
         return f"public:{public_reason}" if public_reason else "public"
-    gates = _gate_calls(func)
+    gates = _gate_calls(func, local_funcs)
     if not gates:
         return "unscoped"
     # Pick the label that describes the typical-caller path. Resource-bound
@@ -200,10 +272,30 @@ def _public_reason(source_lines: list[str], decorator_lineno: int) -> str | None
     return None
 
 
-def collect_endpoints(main_path: Path = MAIN_PY) -> list[Endpoint]:
-    source = main_path.read_text()
+def _collect_module(
+    path: Path, *, app_var: str | None = None, api_only: bool = False
+) -> list[Endpoint]:
+    """Endpoints declared in one module.
+
+    ``app_var`` walks a single FastAPI instance (main.py); otherwise every
+    ``APIRouter`` in the module is walked with its prefix applied.
+
+    Local-helper following is deliberately router-only. The routers are small,
+    single-purpose modules where a private wrapper around a gate is
+    unambiguous. main.py is not: its handlers call large shared helpers that
+    reach a gate somewhere downstream, and following those conflates "this
+    handler's gate" with "a gate reachable from here" — which then outranks the
+    real label and reports admin-only and internal-only endpoints as ordinary
+    resource-gated ones. Keeping main.py on direct calls + Depends preserves
+    every classification the manifest already carried.
+    """
+    source = path.read_text()
     source_lines = source.splitlines()
-    tree = ast.parse(source, filename=str(main_path))
+    tree = ast.parse(source, filename=str(path))
+    route_vars = {app_var: ""} if app_var else _router_prefixes(tree)
+    if not route_vars:
+        return []
+    local_funcs = None if app_var else _local_functions(tree)
     endpoints: list[Endpoint] = []
     for node in ast.walk(tree):
         if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -212,20 +304,42 @@ def collect_endpoints(main_path: Path = MAIN_PY) -> list[Endpoint]:
             call = _decorator_call(decorator)
             if call is None:
                 continue
-            info = _route_info(call)
+            info = _route_info(call, route_vars)
             if info is None:
                 continue
-            method, path = info
+            method, route = info
+            if api_only and not route.startswith("/api/"):
+                continue
             reason = _public_reason(source_lines, decorator.lineno)
-            classification = _classify(node, reason)
             endpoints.append(
                 Endpoint(
                     method=method,
-                    path=path,
+                    path=route,
                     func_name=node.name,
-                    classification=classification,
+                    classification=_classify(node, reason, local_funcs),
                 )
             )
+    return endpoints
+
+
+def _router_modules() -> list[Path]:
+    """Orchestrator modules that build an APIRouter, in stable order.
+
+    Discovered rather than listed so a new router file lands in the manifest
+    the day it is written — the failure mode this walk exists to close was a
+    router extraction silently dropping three endpoints off the inventory.
+    """
+    return sorted(
+        path
+        for path in ORCHESTRATOR.rglob("*.py")
+        if path != MAIN_PY and "APIRouter(" in path.read_text()
+    )
+
+
+def collect_endpoints(main_path: Path = MAIN_PY) -> list[Endpoint]:
+    endpoints = _collect_module(main_path, app_var="app", api_only=True)
+    for module in _router_modules():
+        endpoints.extend(_collect_module(module))
     endpoints.sort(key=lambda e: (e.path, e.method))
     return endpoints
 
@@ -235,9 +349,9 @@ def render_manifest(endpoints: list[Endpoint]) -> str:
         "# orchestrator endpoint inventory — generated by scripts/check_endpoint_auth.py\n"
         "# DO NOT EDIT BY HAND. Regenerate with `python scripts/check_endpoint_auth.py --write`.\n"
         "#\n"
-        "# SCOPE: main.py `@app.METHOD(...)` routes only. Routers mounted via\n"
-        "# include_router (orchestrator/routers/*, auth/bff.py, uploads.py,\n"
-        "# graph_routes.py) are NOT walked — this is not the full API surface.\n"
+        "# SCOPE: main.py `@app.METHOD(...)` /api/* routes, plus every APIRouter the\n"
+        "# app mounts (orchestrator/routers/*, auth/bff.py, uploads.py, graph_routes.py)\n"
+        "# with its prefix folded in. Router /auth/* and /wopi/* are listed in full.\n"
         "#\n"
         "# Classifications:\n"
         "#   gated:<gate>           — protected by a require_* / user_can_access_* helper\n"
