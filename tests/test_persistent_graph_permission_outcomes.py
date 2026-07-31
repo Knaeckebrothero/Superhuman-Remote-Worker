@@ -270,13 +270,14 @@ class TestBatchAnnounce:
     async def test_announce_called_once_with_all_calls_before_gating(self):
         """The whole batch must be announced before the first gate blocks,
         so the user sees every card at once instead of one per finished tool."""
-        seen = []
-        gate_order = []
+        timeline = []  # Shared list: ("announce", None) or ("gate", tool_call_id)
 
-        announce = AsyncMock(side_effect=lambda calls: seen.append(list(calls)))
+        async def announce(calls):
+            timeline.append(("announce", None))
+            assert [c["id"] for c in calls] == ["tc_0", "tc_1", "tc_2", "tc_3"]
 
         async def _permission_check(tool_name, tool_args, tool_call_id):
-            gate_order.append(tool_call_id)
+            timeline.append(("gate", tool_call_id))
             return PermissionOutcome.APPROVED
 
         messages: list[BaseMessage] = []
@@ -287,10 +288,13 @@ class TestBatchAnnounce:
             announce_permission_batch=announce,
         )
 
-        assert announce.await_count == 1
-        assert [c["id"] for c in seen[0]] == ["tc_0", "tc_1", "tc_2", "tc_3"]
-        # Announced before any gate ran.
-        assert gate_order == ["tc_0", "tc_1", "tc_2", "tc_3"]
+        # Announce must precede all gates: timeline is [("announce", None), ("gate", "tc_0"), ...]
+        assert timeline[0] == ("announce", None), (
+            f"announce must fire first, got: {timeline}"
+        )
+        assert timeline[1:] == [("gate", f"tc_{i}") for i in range(4)], (
+            f"all gates must follow announce, got: {timeline}"
+        )
 
     @pytest.mark.asyncio
     async def test_no_announce_callback_still_works(self):
@@ -303,4 +307,32 @@ class TestBatchAnnounce:
         tool = await _run_turn_with_parallel_tools(
             permission_check=_permission_check, messages=messages, n_calls=2
         )
+        assert tool.ainvoke.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_announce_exception_does_not_break_turn(self):
+        """Soft-fail: if announce raises, gates and tools still execute normally."""
+        timeline = []
+
+        async def announce_breaks(calls):
+            timeline.append("announce_called")
+            raise RuntimeError("boom")
+
+        async def _permission_check(tool_name, tool_args, tool_call_id):
+            timeline.append(("gate", tool_call_id))
+            return PermissionOutcome.APPROVED
+
+        messages: list[BaseMessage] = []
+        tool = await _run_turn_with_parallel_tools(
+            permission_check=_permission_check,
+            messages=messages,
+            n_calls=2,
+            announce_permission_batch=announce_breaks,
+        )
+
+        # Announce was attempted but raised; gates and tools still executed
+        assert "announce_called" in timeline
+        assert ("gate", "tc_0") in timeline
+        assert ("gate", "tc_1") in timeline
+        # Both tools ran despite announce failure
         assert tool.ainvoke.await_count == 2
