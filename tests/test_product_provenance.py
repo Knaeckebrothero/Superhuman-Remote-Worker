@@ -358,6 +358,29 @@ def test_all_release_dockerfiles_carry_standard_declared_oci_metadata():
             assert marker in text, f"{relative_path} lacks {marker}"
 
 
+# 99223c6d moved develop.yml off push HEAD: each component is built from its own
+# last-input commit, so the full-revision expression is now per-job —
+# `steps.ident.outputs.full` for image labels, `COMPONENT_SHA` for the chart
+# provenance block. Both carry the full 40-char sha; the 7-char image tag is
+# *derived* from them (`${FULL::7}` / `${COMPONENT_SHA::7}`), never substituted
+# for them. main.yml still builds everything from push HEAD and stays on
+# `github.sha`. The contract this test guards is unchanged: whatever the
+# dialect, the revision label gets the full sha and the short one is only a tag.
+_FULL_REVISION_EXPRS = (
+    "${{ github.sha }}",
+    "${{ steps.ident.outputs.full }}",
+)
+_SHORT_SHA_EXPRS = (
+    "${{ steps.short_sha.outputs.sha }}",
+    "${{ steps.ident.outputs.short }}",
+)
+
+
+def _count_full_revision(workflow: str, key: str) -> int:
+    """Occurrences of ``key=<full-revision expression>``, in either dialect."""
+    return sum(workflow.count(f"{key}={expr}") for expr in _FULL_REVISION_EXPRS)
+
+
 def test_image_workflows_pass_full_source_revision_separately_from_short_sha():
     main = (_ROOT / ".github/workflows/main.yml").read_text(encoding="utf-8")
     develop = (_ROOT / ".github/workflows/develop.yml").read_text(encoding="utf-8")
@@ -365,10 +388,10 @@ def test_image_workflows_pass_full_source_revision_separately_from_short_sha():
         encoding="utf-8"
     )
 
-    assert main.count("SRW_SOURCE_REVISION=${{ github.sha }}") >= 6
-    assert develop.count("SRW_SOURCE_REVISION=${{ github.sha }}") >= 7
-    assert main.count("org.opencontainers.image.revision=${{ github.sha }}") == 6
-    assert develop.count("org.opencontainers.image.revision=${{ github.sha }}") == 7
+    assert _count_full_revision(main, "SRW_SOURCE_REVISION") >= 6
+    assert _count_full_revision(develop, "SRW_SOURCE_REVISION") >= 7
+    assert _count_full_revision(main, "org.opencontainers.image.revision") == 6
+    assert _count_full_revision(develop, "org.opencontainers.image.revision") == 7
     for component in (
         "agent",
         "orchestrator",
@@ -385,13 +408,24 @@ def test_image_workflows_pass_full_source_revision_separately_from_short_sha():
     assert "REF_FULL_SHA=$(git rev-parse HEAD)" in stage1
     assert '--build-arg "SRW_SOURCE_REVISION=${REF_FULL_SHA}"' in stage1
     assert "BUILD_SHA=${{ steps.short_sha.outputs.sha }}" in main
-    assert "BUILD_SHA=${{ steps.short_sha.outputs.sha }}" in develop
-    assert "SRW_SOURCE_REVISION=${{ steps.short_sha.outputs.sha }}" not in main
-    assert "SRW_SOURCE_REVISION=${{ steps.short_sha.outputs.sha }}" not in develop
+    assert "BUILD_SHA=${{ steps.ident.outputs.short }}" in develop
+
+    # The short sha is a tag, never a revision — in either workflow's dialect.
+    for expr in _SHORT_SHA_EXPRS:
+        assert f"SRW_SOURCE_REVISION={expr}" not in main
+        assert f"SRW_SOURCE_REVISION={expr}" not in develop
+        assert f"org.opencontainers.image.revision={expr}" not in main
+        assert f"org.opencontainers.image.revision={expr}" not in develop
+
+    # ...and it must stay *derived* from the full sha, so the two cannot drift
+    # apart into an image tagged with one commit and labeled with another.
+    assert develop.count("short=${FULL::7}") == 5
+    assert develop.count('COMPONENT_TAG="sha-${COMPONENT_SHA::7}"') == 5
+
     assert (
         ".provenance.components[strenv(component)].sourceRevision = strenv(GITHUB_SHA)"
     ) in main
-    assert develop.count("sourceRevision = strenv(GITHUB_SHA)") >= 5
+    assert develop.count("sourceRevision = strenv(COMPONENT_SHA)") >= 5
 
 
 @pytest.mark.skipif(shutil.which("helm") is None, reason="helm is unavailable")
