@@ -65,16 +65,27 @@ def test_shared_browser_stack_assertion_runs_live_stream_conformance():
     assert '[ "$label" = "shared-browser stream conformance" ]' in assertion
 
 
+def _detector_inputs(workflow: str, name: str) -> str:
+    """The path list feeding develop.yml's ``<name>`` change detector.
+
+    Two spellings are in play. 99223c6d hoisted some lists into a
+    ``<NAME>_PATHS=(...)`` array so the same paths could also drive
+    ``last_input_sha``; the rest are still inline in ``<NAME>=$(has_changes ...)``.
+    Prefer the array — where one exists the inline form only references it, so
+    reading the inline form would find no paths at all. Neither list nests
+    parens, so the first ``)`` closes it.
+    """
+    for opener in (f"{name}_PATHS=(", f"{name}=$(has_changes"):
+        _, sep, rest = workflow.partition(opener)
+        if sep:
+            return rest.split(")", 1)[0]
+    raise AssertionError(f"no change detector found for {name} in develop.yml")
+
+
 def test_stream_conformance_changes_rebuild_every_workspace_image():
     workflow = (REPO / ".github/workflows/develop.yml").read_text()
-    workspace_detector = workflow.split("WORKSPACE=$(has_changes", 1)[1].split(
-        "VM_CONTROLLER=$(has_changes", 1
-    )[0]
-    vm_detector = workflow.split("VM_BASE=$(has_changes", 1)[1].split(
-        "SUDO_GATE=$(has_changes", 1
-    )[0]
-    assert "docker/check-browser-stream.py" in workspace_detector
-    assert "docker/check-browser-stream.py" in vm_detector
+    assert "docker/check-browser-stream.py" in _detector_inputs(workflow, "WORKSPACE")
+    assert "docker/check-browser-stream.py" in _detector_inputs(workflow, "VM_BASE")
 
     tilt = (REPO / "Tiltfile").read_text()
     workspace_build = tilt.split("docker_build(\n    'srw-workspace'", 1)[1].split(
