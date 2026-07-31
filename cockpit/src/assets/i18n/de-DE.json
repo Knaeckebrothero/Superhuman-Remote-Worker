@@ -1464,6 +1464,8 @@
     "permission": {
       "title": "Berechtigung erforderlich",
       "approve": "Genehmigen",
+      "batchTitle": "Der Agent möchte {{count}} Werkzeugaufruf(e) ausführen",
+      "approveAll": "Alle genehmigen",
       "autoAccept": "Auto-akzeptieren",
       "stop": "Stoppen"
     },
