@@ -8,6 +8,10 @@ name: develop
 #   - Images get SHA + :experimental tags (no version tags)
 #   - Helm chart published as "srw-dev" with 0.0.0-dev.sha-<hash> versions
 #   - deploy-experimental updates fleet.yaml chart version + image tags
+#   - Container image tags are per-component identities: sha of the newest
+#     commit that touched the component's build inputs (NOT the push HEAD),
+#     so a push that doesn't change a component never moves its tag and the
+#     lifecycle reconciler never drains agents over a no-op retag
 #
 # PR vs push behavior:
 #   - PR to develop: change-based image builds run with `push: false` —
@@ -441,6 +445,15 @@ jobs:
       vm-controller: ${{ steps.check.outputs.vm-controller }}
       sudo-gate: ${{ steps.check.outputs.sudo-gate }}
       workspace: ${{ steps.check.outputs.workspace }}
+      # Per-component image identity: full sha of the newest commit that
+      # touched the component's build inputs. Consumed by the build jobs
+      # (image tag + baked BUILD_SHA/provenance) and deploy-experimental
+      # (values-experimental.yaml tag + provenance identity).
+      agent-sha: ${{ steps.check.outputs.agent-sha }}
+      orchestrator-sha: ${{ steps.check.outputs.orchestrator-sha }}
+      cockpit-sha: ${{ steps.check.outputs.cockpit-sha }}
+      mcp-sha: ${{ steps.check.outputs.mcp-sha }}
+      workspace-sha: ${{ steps.check.outputs.workspace-sha }}
       chart: ${{ steps.check.outputs.chart }}
       website: ${{ steps.check.outputs.website }}
       python-changed: ${{ steps.test-paths.outputs.python }}
@@ -512,6 +525,19 @@ jobs:
             echo "false"
           }
 
+          # Newest commit that touched a component's build inputs — the
+          # component's image identity (tag + provenance), instead of the
+          # push HEAD. A rebuild from unchanged inputs (catch-up after a
+          # blocked run, or a batched push whose HEAD is unrelated — e.g.
+          # docs) reproduces the SAME identity, so values-experimental.yaml
+          # only moves — and the lifecycle reconciler only drains agent pods
+          # — when the component's content actually changed.
+          last_input_sha() {
+            local sha
+            sha=$(git log -1 --format=%H HEAD -- "$@")
+            echo "${sha:-$GITHUB_SHA}"
+          }
+
           SHA_AGENT=$(extract_sha agent)
           SHA_ORCHESTRATOR=$(extract_sha orchestrator)
           SHA_COCKPIT=$(extract_sha cockpit)
@@ -530,30 +556,48 @@ jobs:
           echo "  mcp=$SHA_MCP  workspace=$SHA_WORKSPACE"
           echo "  vm-controller=$SHA_VM_CONTROLLER  vm-base=$SHA_VM_BASE"
 
-          AGENT=$(has_changes "$SHA_AGENT" \
-            src/ config/ agent.py requirements.txt docker/Dockerfile.agent)
-
-          ORCHESTRATOR=$(has_changes "$SHA_ORCHESTRATOR" \
-            orchestrator/ config/ docker/Dockerfile.orchestrator)
-
-          COCKPIT=$(has_changes "$SHA_COCKPIT" \
-            cockpit/ docker/Dockerfile.cockpit docker/cockpit-nginx.conf)
-
-          MCP=$(has_changes "$SHA_MCP" \
-            orchestrator/mcp/ orchestrator/services/formatters.py \
-            orchestrator/services/__init__.py \
+          # Build-input path lists — single source for BOTH the rebuild
+          # predicate (has_changes) and the image identity (last_input_sha),
+          # so a component's tag can only ever move to a commit that touched
+          # its inputs. Lists mirror the Dockerfiles' COPY statements:
+          # Dockerfile.orchestrator copies src/, Dockerfile.cockpit copies
+          # docker/cockpit-canvas-env.sh, Dockerfile.mcp copies
+          # orchestrator/security/__init__.py — keep them in sync.
+          AGENT_PATHS=(src/ config/ agent.py requirements.txt
+            docker/Dockerfile.agent)
+          ORCHESTRATOR_PATHS=(orchestrator/ src/ config/
+            docker/Dockerfile.orchestrator)
+          COCKPIT_PATHS=(cockpit/ docker/Dockerfile.cockpit
+            docker/cockpit-nginx.conf docker/cockpit-canvas-env.sh)
+          MCP_PATHS=(orchestrator/mcp/ orchestrator/services/formatters.py
+            orchestrator/services/__init__.py
+            orchestrator/security/__init__.py
             orchestrator/security/anti_framing.py docker/Dockerfile.mcp)
-
           # docker/browser-exec is COPY'd into the workspace image at build time
           # (see Dockerfile.workspace §2c), so changes to it must rebuild the
           # workspace image. Missing this path caused a0ce92d2's browser-exec
           # fix to sit unbuilt while sha-310acc2 (the broken first cut) stayed
           # deployed. See docs/features/browser_workspace_executor.md.
-          WORKSPACE=$(has_changes "$SHA_WORKSPACE" \
-            docker/Dockerfile.workspace docker/workspace-entrypoint.sh \
-            docker/browser-exec docker/check-browser-stream.py \
-            docker/assert-browser-stack.sh \
+          WORKSPACE_PATHS=(docker/Dockerfile.workspace
+            docker/workspace-entrypoint.sh
+            docker/browser-exec docker/check-browser-stream.py
+            docker/assert-browser-stack.sh
             .playwright-version)
+
+          AGENT=$(has_changes "$SHA_AGENT" "${AGENT_PATHS[@]}")
+          AGENT_SHA=$(last_input_sha "${AGENT_PATHS[@]}")
+
+          ORCHESTRATOR=$(has_changes "$SHA_ORCHESTRATOR" "${ORCHESTRATOR_PATHS[@]}")
+          ORCHESTRATOR_SHA=$(last_input_sha "${ORCHESTRATOR_PATHS[@]}")
+
+          COCKPIT=$(has_changes "$SHA_COCKPIT" "${COCKPIT_PATHS[@]}")
+          COCKPIT_SHA=$(last_input_sha "${COCKPIT_PATHS[@]}")
+
+          MCP=$(has_changes "$SHA_MCP" "${MCP_PATHS[@]}")
+          MCP_SHA=$(last_input_sha "${MCP_PATHS[@]}")
+
+          WORKSPACE=$(has_changes "$SHA_WORKSPACE" "${WORKSPACE_PATHS[@]}")
+          WORKSPACE_SHA=$(last_input_sha "${WORKSPACE_PATHS[@]}")
 
           VM_CONTROLLER=$(has_changes "$SHA_VM_CONTROLLER" \
             vm/controller/)
@@ -638,6 +682,7 @@ jobs:
           echo "  mcp=$MCP  workspace=$WORKSPACE"
           echo "  vm-controller=$VM_CONTROLLER  vm-base=$VM_BASE  vm-base-stage1=$VM_BASE_STAGE1  sudo-gate=$SUDO_GATE"
           echo "  chart=$CHART  website=$WEBSITE"
+          echo "  input shas: agent=${AGENT_SHA::7} orchestrator=${ORCHESTRATOR_SHA::7} cockpit=${COCKPIT_SHA::7} mcp=${MCP_SHA::7} workspace=${WORKSPACE_SHA::7}"
 
           {
             echo "agent=$AGENT"
@@ -645,6 +690,11 @@ jobs:
             echo "cockpit=$COCKPIT"
             echo "mcp=$MCP"
             echo "workspace=$WORKSPACE"
+            echo "agent-sha=$AGENT_SHA"
+            echo "orchestrator-sha=$ORCHESTRATOR_SHA"
+            echo "cockpit-sha=$COCKPIT_SHA"
+            echo "mcp-sha=$MCP_SHA"
+            echo "workspace-sha=$WORKSPACE_SHA"
             echo "vm-controller=$VM_CONTROLLER"
             echo "vm-base=$VM_BASE"
             echo "vm-base-stage1=$VM_BASE_STAGE1"
@@ -850,16 +900,30 @@ jobs:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      # Image identity = newest commit touching this component's build inputs
+      # (computed in the changes job), NOT the push HEAD — docs-HEAD pushes
+      # and catch-up rebuilds reproduce the same tag for unchanged inputs.
+      # The tag suffix must stay equal to the baked BUILD_SHA below: the
+      # lifecycle reconciler drains agents whose reported BUILD_SHA differs
+      # from the sha in the configured image tag.
+      - name: Resolve component identity
+        id: ident
+        run: |
+          FULL="${{ needs.changes.outputs.agent-sha }}"
+          : "${FULL:=$GITHUB_SHA}"
+          {
+            echo "full=$FULL"
+            echo "short=${FULL::7}"
+            echo "version=0.0.0-dev.sha-${FULL}"
+          } >> "$GITHUB_OUTPUT"
       - name: Extract metadata
         id: meta
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-agent
           tags: |
-            type=sha,format=short,prefix=sha-
+            type=raw,value=sha-${{ steps.ident.outputs.short }}
             type=raw,value=experimental,enable=${{ github.event_name != 'pull_request' }}
-      - id: short_sha
-        run: echo "sha=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
       - name: Build${{ github.event_name == 'pull_request' && ' (PR validation, no push)' || ' and push' }}
         uses: docker/build-push-action@v5
         with:
@@ -870,18 +934,18 @@ jobs:
           labels: |
             ${{ steps.meta.outputs.labels }}
             org.opencontainers.image.source=${{ env.SRW_SOURCE_URL }}
-            org.opencontainers.image.revision=${{ github.sha }}
-            org.opencontainers.image.version=${{ env.SRW_RELEASE_VERSION }}
+            org.opencontainers.image.revision=${{ steps.ident.outputs.full }}
+            org.opencontainers.image.version=${{ steps.ident.outputs.version }}
             org.opencontainers.image.documentation=${{ env.SRW_DOCUMENTATION_URL }}
             io.srw.component=agent
           provenance: false
           cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-agent:buildcache-develop
           cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-agent:buildcache-develop,mode=max,image-manifest=true,oci-mediatypes=true,compression=zstd,ignore-error=true
           build-args: |
-            BUILD_SHA=${{ steps.short_sha.outputs.sha }}
-            SRW_SOURCE_REVISION=${{ github.sha }}
+            BUILD_SHA=${{ steps.ident.outputs.short }}
+            SRW_SOURCE_REVISION=${{ steps.ident.outputs.full }}
             SRW_SOURCE_URL=${{ env.SRW_SOURCE_URL }}
-            SRW_RELEASE_VERSION=${{ env.SRW_RELEASE_VERSION }}
+            SRW_RELEASE_VERSION=${{ steps.ident.outputs.version }}
             SRW_DOCUMENTATION_URL=${{ env.SRW_DOCUMENTATION_URL }}
 
   build-orchestrator:
@@ -910,13 +974,24 @@ jobs:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      # Image identity = newest input commit, not push HEAD (see build-agent).
+      - name: Resolve component identity
+        id: ident
+        run: |
+          FULL="${{ needs.changes.outputs.orchestrator-sha }}"
+          : "${FULL:=$GITHUB_SHA}"
+          {
+            echo "full=$FULL"
+            echo "short=${FULL::7}"
+            echo "version=0.0.0-dev.sha-${FULL}"
+          } >> "$GITHUB_OUTPUT"
       - name: Extract metadata
         id: meta
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-orchestrator
           tags: |
-            type=sha,format=short,prefix=sha-
+            type=raw,value=sha-${{ steps.ident.outputs.short }}
             type=raw,value=experimental,enable=${{ github.event_name != 'pull_request' }}
       - name: Build${{ github.event_name == 'pull_request' && ' (PR validation, no push)' || ' and push' }}
         uses: docker/build-push-action@v5
@@ -928,15 +1003,15 @@ jobs:
           labels: |
             ${{ steps.meta.outputs.labels }}
             org.opencontainers.image.source=${{ env.SRW_SOURCE_URL }}
-            org.opencontainers.image.revision=${{ github.sha }}
-            org.opencontainers.image.version=${{ env.SRW_RELEASE_VERSION }}
+            org.opencontainers.image.revision=${{ steps.ident.outputs.full }}
+            org.opencontainers.image.version=${{ steps.ident.outputs.version }}
             org.opencontainers.image.documentation=${{ env.SRW_DOCUMENTATION_URL }}
             io.srw.component=orchestrator
           provenance: false
           build-args: |
-            SRW_SOURCE_REVISION=${{ github.sha }}
+            SRW_SOURCE_REVISION=${{ steps.ident.outputs.full }}
             SRW_SOURCE_URL=${{ env.SRW_SOURCE_URL }}
-            SRW_RELEASE_VERSION=${{ env.SRW_RELEASE_VERSION }}
+            SRW_RELEASE_VERSION=${{ steps.ident.outputs.version }}
             SRW_DOCUMENTATION_URL=${{ env.SRW_DOCUMENTATION_URL }}
           cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-orchestrator:buildcache-develop
           cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-orchestrator:buildcache-develop,mode=max,image-manifest=true,oci-mediatypes=true,compression=zstd,ignore-error=true
@@ -967,13 +1042,24 @@ jobs:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      # Image identity = newest input commit, not push HEAD (see build-agent).
+      - name: Resolve component identity
+        id: ident
+        run: |
+          FULL="${{ needs.changes.outputs.cockpit-sha }}"
+          : "${FULL:=$GITHUB_SHA}"
+          {
+            echo "full=$FULL"
+            echo "short=${FULL::7}"
+            echo "version=0.0.0-dev.sha-${FULL}"
+          } >> "$GITHUB_OUTPUT"
       - name: Extract metadata
         id: meta
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-cockpit
           tags: |
-            type=sha,format=short,prefix=sha-
+            type=raw,value=sha-${{ steps.ident.outputs.short }}
             type=raw,value=experimental,enable=${{ github.event_name != 'pull_request' }}
       - name: Build${{ github.event_name == 'pull_request' && ' (PR validation, no push)' || ' and push' }}
         uses: docker/build-push-action@v5
@@ -985,15 +1071,15 @@ jobs:
           labels: |
             ${{ steps.meta.outputs.labels }}
             org.opencontainers.image.source=${{ env.SRW_SOURCE_URL }}
-            org.opencontainers.image.revision=${{ github.sha }}
-            org.opencontainers.image.version=${{ env.SRW_RELEASE_VERSION }}
+            org.opencontainers.image.revision=${{ steps.ident.outputs.full }}
+            org.opencontainers.image.version=${{ steps.ident.outputs.version }}
             org.opencontainers.image.documentation=${{ env.SRW_DOCUMENTATION_URL }}
             io.srw.component=cockpit
           provenance: false
           build-args: |
-            SRW_SOURCE_REVISION=${{ github.sha }}
+            SRW_SOURCE_REVISION=${{ steps.ident.outputs.full }}
             SRW_SOURCE_URL=${{ env.SRW_SOURCE_URL }}
-            SRW_RELEASE_VERSION=${{ env.SRW_RELEASE_VERSION }}
+            SRW_RELEASE_VERSION=${{ steps.ident.outputs.version }}
             SRW_DOCUMENTATION_URL=${{ env.SRW_DOCUMENTATION_URL }}
           cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-cockpit:buildcache-develop
           cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-cockpit:buildcache-develop,mode=max,image-manifest=true,oci-mediatypes=true,compression=zstd,ignore-error=true
@@ -1024,13 +1110,24 @@ jobs:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      # Image identity = newest input commit, not push HEAD (see build-agent).
+      - name: Resolve component identity
+        id: ident
+        run: |
+          FULL="${{ needs.changes.outputs.mcp-sha }}"
+          : "${FULL:=$GITHUB_SHA}"
+          {
+            echo "full=$FULL"
+            echo "short=${FULL::7}"
+            echo "version=0.0.0-dev.sha-${FULL}"
+          } >> "$GITHUB_OUTPUT"
       - name: Extract metadata
         id: meta
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-mcp
           tags: |
-            type=sha,format=short,prefix=sha-
+            type=raw,value=sha-${{ steps.ident.outputs.short }}
             type=raw,value=experimental,enable=${{ github.event_name != 'pull_request' }}
       - name: Build${{ github.event_name == 'pull_request' && ' (PR validation, no push)' || ' and push' }}
         uses: docker/build-push-action@v5
@@ -1042,15 +1139,15 @@ jobs:
           labels: |
             ${{ steps.meta.outputs.labels }}
             org.opencontainers.image.source=${{ env.SRW_SOURCE_URL }}
-            org.opencontainers.image.revision=${{ github.sha }}
-            org.opencontainers.image.version=${{ env.SRW_RELEASE_VERSION }}
+            org.opencontainers.image.revision=${{ steps.ident.outputs.full }}
+            org.opencontainers.image.version=${{ steps.ident.outputs.version }}
             org.opencontainers.image.documentation=${{ env.SRW_DOCUMENTATION_URL }}
             io.srw.component=mcp
           provenance: false
           build-args: |
-            SRW_SOURCE_REVISION=${{ github.sha }}
+            SRW_SOURCE_REVISION=${{ steps.ident.outputs.full }}
             SRW_SOURCE_URL=${{ env.SRW_SOURCE_URL }}
-            SRW_RELEASE_VERSION=${{ env.SRW_RELEASE_VERSION }}
+            SRW_RELEASE_VERSION=${{ steps.ident.outputs.version }}
             SRW_DOCUMENTATION_URL=${{ env.SRW_DOCUMENTATION_URL }}
           cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-mcp:buildcache-develop
           cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-mcp:buildcache-develop,mode=max,image-manifest=true,oci-mediatypes=true,compression=zstd,ignore-error=true
@@ -1081,13 +1178,24 @@ jobs:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      # Image identity = newest input commit, not push HEAD (see build-agent).
+      - name: Resolve component identity
+        id: ident
+        run: |
+          FULL="${{ needs.changes.outputs.workspace-sha }}"
+          : "${FULL:=$GITHUB_SHA}"
+          {
+            echo "full=$FULL"
+            echo "short=${FULL::7}"
+            echo "version=0.0.0-dev.sha-${FULL}"
+          } >> "$GITHUB_OUTPUT"
       - name: Extract metadata
         id: meta
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-workspace
           tags: |
-            type=sha,format=short,prefix=sha-
+            type=raw,value=sha-${{ steps.ident.outputs.short }}
             type=raw,value=experimental,enable=${{ github.event_name != 'pull_request' }}
       - name: Read Playwright version
         id: pw
@@ -1099,17 +1207,17 @@ jobs:
           file: ./docker/Dockerfile.workspace
           build-args: |
             PLAYWRIGHT_VERSION=${{ steps.pw.outputs.version }}
-            SRW_SOURCE_REVISION=${{ github.sha }}
+            SRW_SOURCE_REVISION=${{ steps.ident.outputs.full }}
             SRW_SOURCE_URL=${{ env.SRW_SOURCE_URL }}
-            SRW_RELEASE_VERSION=${{ env.SRW_RELEASE_VERSION }}
+            SRW_RELEASE_VERSION=${{ steps.ident.outputs.version }}
             SRW_DOCUMENTATION_URL=${{ env.SRW_DOCUMENTATION_URL }}
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: |
             ${{ steps.meta.outputs.labels }}
             org.opencontainers.image.source=${{ env.SRW_SOURCE_URL }}
-            org.opencontainers.image.revision=${{ github.sha }}
-            org.opencontainers.image.version=${{ env.SRW_RELEASE_VERSION }}
+            org.opencontainers.image.revision=${{ steps.ident.outputs.full }}
+            org.opencontainers.image.version=${{ steps.ident.outputs.version }}
             org.opencontainers.image.documentation=${{ env.SRW_DOCUMENTATION_URL }}
             io.srw.component=workspace
           provenance: false
@@ -1590,50 +1698,81 @@ jobs:
           deployment-vms/srw-vm-controller/fleet.yaml
 
       # -- Update image tags in values-experimental.yaml --
+      # Each component is stamped with ITS OWN identity (newest commit that
+      # touched its build inputs, from the changes job) — never the push
+      # HEAD. Rebuilds from unchanged inputs rewrite identical values, the
+      # final git-diff gate sees no delta, and no deploy commit — so no
+      # stale-image drain of the agent fleet — happens without a real
+      # content change. Fallback to GITHUB_SHA mirrors the build jobs.
       - name: Update orchestrator tag
         if: needs.build-orchestrator.result == 'success'
+        env:
+          COMPONENT_SHA: ${{ needs.changes.outputs.orchestrator-sha }}
         run: |
+          : "${COMPONENT_SHA:=$GITHUB_SHA}"
+          export COMPONENT_TAG="sha-${COMPONENT_SHA::7}"
+          export COMPONENT_VERSION="0.0.0-dev.sha-${COMPONENT_SHA}"
           yq -i '
-            .image.orchestrator.tag = "${{ steps.tag.outputs.sha }}" |
-            .provenance.releaseVersion = strenv(SRW_RELEASE_VERSION) |
-            .provenance.components.orchestrator.sourceRevision = strenv(GITHUB_SHA) |
-            .provenance.components.orchestrator.releaseVersion = strenv(SRW_RELEASE_VERSION)
+            .image.orchestrator.tag = strenv(COMPONENT_TAG) |
+            .provenance.releaseVersion = strenv(COMPONENT_VERSION) |
+            .provenance.components.orchestrator.sourceRevision = strenv(COMPONENT_SHA) |
+            .provenance.components.orchestrator.releaseVersion = strenv(COMPONENT_VERSION)
           ' deployment/values-experimental.yaml
 
       - name: Update agent tag
         if: needs.build-agent.result == 'success'
+        env:
+          COMPONENT_SHA: ${{ needs.changes.outputs.agent-sha }}
         run: |
+          : "${COMPONENT_SHA:=$GITHUB_SHA}"
+          export COMPONENT_TAG="sha-${COMPONENT_SHA::7}"
+          export COMPONENT_VERSION="0.0.0-dev.sha-${COMPONENT_SHA}"
           yq -i '
-            .image.agent.tag = "${{ steps.tag.outputs.sha }}" |
-            .provenance.components.agent.sourceRevision = strenv(GITHUB_SHA) |
-            .provenance.components.agent.releaseVersion = strenv(SRW_RELEASE_VERSION)
+            .image.agent.tag = strenv(COMPONENT_TAG) |
+            .provenance.components.agent.sourceRevision = strenv(COMPONENT_SHA) |
+            .provenance.components.agent.releaseVersion = strenv(COMPONENT_VERSION)
           ' deployment/values-experimental.yaml
 
       - name: Update cockpit tag
         if: needs.build-cockpit.result == 'success'
+        env:
+          COMPONENT_SHA: ${{ needs.changes.outputs.cockpit-sha }}
         run: |
+          : "${COMPONENT_SHA:=$GITHUB_SHA}"
+          export COMPONENT_TAG="sha-${COMPONENT_SHA::7}"
+          export COMPONENT_VERSION="0.0.0-dev.sha-${COMPONENT_SHA}"
           yq -i '
-            .image.cockpit.tag = "${{ steps.tag.outputs.sha }}" |
-            .provenance.components.cockpit.sourceRevision = strenv(GITHUB_SHA) |
-            .provenance.components.cockpit.releaseVersion = strenv(SRW_RELEASE_VERSION)
+            .image.cockpit.tag = strenv(COMPONENT_TAG) |
+            .provenance.components.cockpit.sourceRevision = strenv(COMPONENT_SHA) |
+            .provenance.components.cockpit.releaseVersion = strenv(COMPONENT_VERSION)
           ' deployment/values-experimental.yaml
 
       - name: Update MCP tag
         if: needs.build-mcp.result == 'success'
+        env:
+          COMPONENT_SHA: ${{ needs.changes.outputs.mcp-sha }}
         run: |
+          : "${COMPONENT_SHA:=$GITHUB_SHA}"
+          export COMPONENT_TAG="sha-${COMPONENT_SHA::7}"
+          export COMPONENT_VERSION="0.0.0-dev.sha-${COMPONENT_SHA}"
           yq -i '
-            .image.mcp.tag = "${{ steps.tag.outputs.sha }}" |
-            .provenance.components.mcp.sourceRevision = strenv(GITHUB_SHA) |
-            .provenance.components.mcp.releaseVersion = strenv(SRW_RELEASE_VERSION)
+            .image.mcp.tag = strenv(COMPONENT_TAG) |
+            .provenance.components.mcp.sourceRevision = strenv(COMPONENT_SHA) |
+            .provenance.components.mcp.releaseVersion = strenv(COMPONENT_VERSION)
           ' deployment/values-experimental.yaml
 
       - name: Update workspace tag
         if: needs.build-workspace.result == 'success'
+        env:
+          COMPONENT_SHA: ${{ needs.changes.outputs.workspace-sha }}
         run: |
+          : "${COMPONENT_SHA:=$GITHUB_SHA}"
+          export COMPONENT_TAG="sha-${COMPONENT_SHA::7}"
+          export COMPONENT_VERSION="0.0.0-dev.sha-${COMPONENT_SHA}"
           yq -i '
-            .image.workspace.tag = "${{ steps.tag.outputs.sha }}" |
-            .provenance.components.workspace.sourceRevision = strenv(GITHUB_SHA) |
-            .provenance.components.workspace.releaseVersion = strenv(SRW_RELEASE_VERSION)
+            .image.workspace.tag = strenv(COMPONENT_TAG) |
+            .provenance.components.workspace.sourceRevision = strenv(COMPONENT_SHA) |
+            .provenance.components.workspace.releaseVersion = strenv(COMPONENT_VERSION)
           ' deployment/values-experimental.yaml
 
       - name: Update VM controller image tag
