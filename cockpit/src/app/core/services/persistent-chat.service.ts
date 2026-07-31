@@ -581,7 +581,10 @@ export class PersistentChatService {
 
     // --- Permission state ---
     readonly permissionMode = signal<PermissionMode>('supervised');
-    readonly pendingPermission = signal<PermissionRequest | null>(null);
+    /** Every gate currently awaiting a decision. A parallel tool batch puts
+     *  all of its calls here at once so one card can list them —
+     *  docs/superpowers/specs/2026-08-01-batch-tool-approval-design.md. */
+    readonly pendingPermissions = signal<PermissionRequest[]>([]);
 
     // --- Running-command snapshot ---
     // Set from the session.state welcome frame on (re)attach when the loop is
@@ -2048,7 +2051,7 @@ export class PersistentChatService {
         // (thread creation calls disconnect() before connect()) must never
         // destroy queued sends — that was the root of the "Creating thread"
         // swallow. Only a genuine thread switch (connect() cold path) clears it.
-        this.pendingPermission.set(null);
+        this.pendingPermissions.set([]);
         this.compaction.set(null);
         // The workspace-upgrade signals are per-thread and must not bleed across
         // a switch. workspaceUpgradeInProgress especially: disconnect() closes
@@ -2544,37 +2547,55 @@ export class PersistentChatService {
         });
     }
 
-    /** Approve a pending permission request. */
-    approve(): void {
-        const pending = this.pendingPermission();
-        this.pendingPermission.set(null);
-        if (pending?.id) {
+    /** Map raw wire entries (snake_case `approval_id`) to `PermissionRequest`s
+     *  (camelCase `approvalId`). Shared by `session.state`, `permission.request`,
+     *  and `permission.request_batch` — an unmapped `approvalId` silently
+     *  degrades every decision to "most-recent-pending" REST resolution. */
+    private _toPermissionRequests(raw: unknown): PermissionRequest[] {
+        const list = (raw as Record<string, unknown>[]) || [];
+        return list
+            .filter((r) => typeof r?.['id'] === 'string' && r['id'])
+            .map((r) => {
+                const approvalId = r['approval_id'] as string | undefined;
+                return {
+                    id: r['id'] as string,
+                    ...(approvalId ? {approvalId} : {}),
+                    tool: (r['tool'] as string) || '',
+                    args: (r['args'] as Record<string, unknown>) || {},
+                };
+            });
+    }
+
+    /** Approve every pending gate. Each decision carries its own approval_id:
+     *  the no-id REST fallback resolves "most-recent-pending", which is the
+     *  wrong gate when a batch is open. */
+    approveAll(): void {
+        const pending = this.pendingPermissions();
+        this.pendingPermissions.set([]);
+        for (const req of pending) {
             this.dispatch({
                 type: 'permission_decision',
-                toolUseId: pending.id,
+                toolUseId: req.id,
                 decision: 'approved',
                 timestamp: Date.now(),
             });
+            this._resolvePermission(req, 'approve');
         }
-        this._resolvePermission(pending, 'approve');
     }
 
-    /** Deny a pending permission request. */
-    deny(): void {
-        const pending = this.pendingPermission();
-        this.pendingPermission.set(null);
-        if (pending?.id) {
-            // The reducer handles both the existing-pending-call case and
-            // the no-prior-tool_started case (synthetic denied entry) — see
-            // turn-reducer.ts:permission_decision.
+    /** Deny every pending gate. */
+    denyAll(): void {
+        const pending = this.pendingPermissions();
+        this.pendingPermissions.set([]);
+        for (const req of pending) {
             this.dispatch({
                 type: 'permission_decision',
-                toolUseId: pending.id,
+                toolUseId: req.id,
                 decision: 'denied',
                 timestamp: Date.now(),
             });
+            this._resolvePermission(req, 'deny');
         }
-        this._resolvePermission(pending, 'deny');
     }
 
     private _resolvePermission(
@@ -2653,13 +2674,13 @@ export class PersistentChatService {
         }
     }
 
-    /** Stop a pending permission prompt + halt the turn so the user can
-     *  type a follow-up. Denies the call so the backend isn't stranded
+    /** Stop every pending permission prompt + halt the turn so the user can
+     *  type a follow-up. Denies each call so the backend isn't stranded
      *  awaiting a decision (the loop would otherwise block on the
      *  `permission_check` await forever), then sends interrupt so the
      *  next loop iteration bails out instead of acting on the denial. */
     stop(): void {
-        this.deny();
+        this.denyAll();
         void this.interrupt();
     }
 
@@ -2801,25 +2822,9 @@ export class PersistentChatService {
                 // the gate unanswerable. Same presence-check discipline as
                 // running_tool. See the backend welcome frame.
                 if ('pending_permissions' in params) {
-                    const raw =
-                        (params['pending_permissions'] as Record<string, unknown>[]) || [];
-                    // Wire format is snake_case (approval_id); the client type is
-                    // camelCase. Mapping matters: without approvalId the decision
-                    // POST falls back to "most-recent-pending" instead of
-                    // targeting this gate.
-                    const list: PermissionRequest[] = raw
-                        .filter((r) => typeof r?.['id'] === 'string' && r['id'])
-                        .map((r) => {
-                            const approvalId = r['approval_id'] as string | undefined;
-                            return {
-                                id: r['id'] as string,
-                                ...(approvalId ? {approvalId} : {}),
-                                tool: (r['tool'] as string) || '',
-                                args: (r['args'] as Record<string, unknown>) || {},
-                            };
-                        });
+                    const list = this._toPermissionRequests(params['pending_permissions']);
                     if (list.length > 0) {
-                        this.pendingPermission.set(list[0]);
+                        this.pendingPermissions.set(list);
                         for (const req of list) {
                             this.dispatch({
                                 type: 'permission_request',
@@ -2918,17 +2923,39 @@ export class PersistentChatService {
                 }
                 break;
 
+            case 'permission.request_batch': {
+                const list = this._toPermissionRequests(params['requests']);
+                if (list.length > 0) {
+                    this.pendingPermissions.set(list);
+                    for (const req of list) {
+                        this.dispatch({
+                            type: 'permission_request',
+                            toolUseId: req.id,
+                            tool: req.tool,
+                            args: req.args ?? {},
+                            timestamp: now,
+                        });
+                    }
+                }
+                break;
+            }
+
             case 'permission.request': {
                 const id = (params['id'] as string) || '';
                 const tool = (params['tool'] as string) || '';
                 const args = (params['args'] as Record<string, unknown>) || {};
                 const approvalId = (params['approval_id'] as string) || undefined;
-                this.pendingPermission.set({
-                    id,
-                    ...(approvalId ? {approvalId} : {}),
-                    tool,
-                    args,
-                });
+                if (id) {
+                    const entry: PermissionRequest = {
+                        id,
+                        ...(approvalId ? {approvalId} : {}),
+                        tool,
+                        args,
+                    };
+                    this.pendingPermissions.update((list) =>
+                        list.some((p) => p.id === id) ? list : [...list, entry],
+                    );
+                }
                 this.dispatch({
                     type: 'permission_request',
                     toolUseId: id,
@@ -2947,9 +2974,9 @@ export class PersistentChatService {
                 const resolvedId = (params['id'] as string) || '';
                 const decision =
                     params['decision'] === 'approved' ? 'approved' : 'denied';
-                if (this.pendingPermission()?.id === resolvedId) {
-                    this.pendingPermission.set(null);
-                }
+                this.pendingPermissions.update((list) =>
+                    list.filter((p) => p.id !== resolvedId),
+                );
                 if (resolvedId) {
                     this.dispatch({
                         type: 'permission_decision',

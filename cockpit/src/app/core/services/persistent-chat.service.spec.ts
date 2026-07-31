@@ -1252,17 +1252,17 @@ describe('PersistentChatService — SSE event dispatch', () => {
         ).toHaveLength(0);
     });
 
-    it('sets pendingPermission on permission.request', async () => {
+    it('adds to pendingPermissions on permission.request', async () => {
         const {service, es} = await setup();
         fireSseMessage(es, {
             method: 'permission.request',
             params: {id: 'tc-1', tool: 'run_command', args: {cmd: 'ls'}},
         }, '1:1');
-        expect(service.pendingPermission()).toEqual({
+        expect(service.pendingPermissions()).toEqual([{
             id: 'tc-1',
             tool: 'run_command',
             args: {cmd: 'ls'},
-        });
+        }]);
     });
 
     it('keeps approval_id from permission.request for durable approval', async () => {
@@ -1276,12 +1276,12 @@ describe('PersistentChatService — SSE event dispatch', () => {
                 args: {cmd: 'ls'},
             },
         }, '1:1');
-        expect(service.pendingPermission()).toEqual({
+        expect(service.pendingPermissions()).toEqual([{
             id: 'tc-1',
             approvalId: 'approval-1',
             tool: 'run_command',
             args: {cmd: 'ls'},
-        });
+        }]);
     });
 
     it('re-surfaces a pending gate from the session.state welcome frame', async () => {
@@ -1303,28 +1303,28 @@ describe('PersistentChatService — SSE event dispatch', () => {
                 ],
             },
         }, '1:1');
-        expect(service.pendingPermission()).toEqual({
+        expect(service.pendingPermissions()).toEqual([{
             id: 'tc-9',
             approvalId: 'approval-9',
             tool: 'web_search',
             args: {query: 'capital of Japan'},
-        });
+        }]);
     });
 
-    it('leaves pendingPermission alone when session.state omits the key', async () => {
+    it('leaves pendingPermissions alone when session.state omits the key', async () => {
         // Presence-check discipline: a metadata-only session.state from
         // another channel must not clobber a live approval card.
         const {service, es} = await setup();
-        (service as any).pendingPermission.set({
+        (service as any).pendingPermissions.set([{
             id: 'tc-live',
             tool: 'run_command',
             args: {cmd: 'ls'},
-        });
+        }]);
         fireSseMessage(es, {
             method: 'session.state',
             params: {permission_mode: 'supervised'},
         }, '1:1');
-        expect(service.pendingPermission()?.id).toBe('tc-live');
+        expect(service.pendingPermissions()[0]?.id).toBe('tc-live');
     });
 
     it('promotes ready event to sessionReady=true and flushes the outbox', async () => {
@@ -1408,6 +1408,75 @@ describe('PersistentChatService — SSE event dispatch', () => {
         );
         // Turn-loop push/pull failures retry next turn; not a degraded session.
         expect(service.cloudSyncDegraded()).toBe(false);
+    });
+
+    it('shows every call in a batch at once', async () => {
+        const {service, es} = await setup();
+        fireSseMessage(es, {
+            method: 'permission.request_batch',
+            params: {
+                requests: [
+                    {id: 'tc-0', approval_id: 'a-0', tool: 'web_search', args: {q: 'fr'}},
+                    {id: 'tc-1', approval_id: 'a-1', tool: 'web_search', args: {q: 'jp'}},
+                ],
+            },
+        }, '1:1');
+        expect(service.pendingPermissions().map((p) => p.id)).toEqual(['tc-0', 'tc-1']);
+        expect(service.pendingPermissions()[1].approvalId).toBe('a-1');
+    });
+
+    it('approveAll sends an explicit approval_id per entry', async () => {
+        // _resolve_pending_permission falls back to "most-recent-pending"
+        // when no id is given — with N gates open that resolves the WRONG one.
+        const {service, es, mockHttp} = await setup();
+        fireSseMessage(es, {
+            method: 'permission.request_batch',
+            params: {
+                requests: [
+                    {id: 'tc-0', approval_id: 'a-0', tool: 'web_search', args: {}},
+                    {id: 'tc-1', approval_id: 'a-1', tool: 'web_search', args: {}},
+                ],
+            },
+        }, '1:1');
+
+        service.approveAll();
+
+        const urls = mockHttp.post.mock.calls.map((c: unknown[]) => c[0] as string);
+        expect(urls.some((u) => u.endsWith('/approve/a-0'))).toBe(true);
+        expect(urls.some((u) => u.endsWith('/approve/a-1'))).toBe(true);
+        expect(service.pendingPermissions()).toEqual([]);
+    });
+
+    it('permission.resolved removes only its own entry', async () => {
+        const {service, es} = await setup();
+        fireSseMessage(es, {
+            method: 'permission.request_batch',
+            params: {
+                requests: [
+                    {id: 'tc-0', approval_id: 'a-0', tool: 'web_search', args: {}},
+                    {id: 'tc-1', approval_id: 'a-1', tool: 'web_search', args: {}},
+                ],
+            },
+        }, '1:1');
+        fireSseMessage(es, {
+            method: 'permission.resolved',
+            params: {id: 'tc-0', approval_id: 'a-0', decision: 'approved'},
+        }, '1:2');
+        expect(service.pendingPermissions().map((p) => p.id)).toEqual(['tc-1']);
+    });
+
+    it('restores a multi-entry batch from the session.state welcome frame', async () => {
+        const {service, es} = await setup();
+        fireSseMessage(es, {
+            method: 'session.state',
+            params: {
+                pending_permissions: [
+                    {id: 'tc-0', approval_id: 'a-0', tool: 'web_search', args: {}},
+                    {id: 'tc-1', approval_id: 'a-1', tool: 'web_search', args: {}},
+                ],
+            },
+        }, '1:1');
+        expect(service.pendingPermissions().map((p) => p.id)).toEqual(['tc-0', 'tc-1']);
     });
 });
 
@@ -2091,70 +2160,70 @@ describe('PersistentChatService — control WS (slash commands + permissions)', 
         return ctx;
     }
 
-    it('approve() sends {method: "approve"} over the control WS', async () => {
+    it('approveAll() sends {method: "approve"} over the control WS', async () => {
         const ctx = await readySession();
-        // Stage a pending permission so approve() has something to clear.
-        (ctx.service as any).pendingPermission.set({
+        // Stage a pending permission so approveAll() has something to clear.
+        (ctx.service as any).pendingPermissions.set([{
             id: 'tc-1', tool: 'run_command', args: {},
-        });
+        }]);
 
-        ctx.service.approve();
+        ctx.service.approveAll();
         const sent = ctx.wsInstances[0].send.mock.calls.map((c: any) => JSON.parse(c[0]));
         expect(sent).toContainEqual({method: 'approve'});
-        expect(ctx.service.pendingPermission()).toBeNull();
+        expect(ctx.service.pendingPermissions()).toEqual([]);
     });
 
-    it('approve() resolves durable approval requests through REST', async () => {
+    it('approveAll() resolves durable approval requests through REST', async () => {
         const ctx = await readySession();
         ctx.mockHttp.post.mockClear();
         ctx.wsInstances[0].send.mockClear();
-        (ctx.service as any).pendingPermission.set({
+        (ctx.service as any).pendingPermissions.set([{
             id: 'tc-rest',
             approvalId: 'approval-1',
             tool: 'run_command',
             args: {},
-        });
+        }]);
 
-        ctx.service.approve();
+        ctx.service.approveAll();
 
         expect(ctx.mockHttp.post).toHaveBeenCalledWith(
             expect.stringContaining('/persistent/threads/thread-c/approve/approval-1'),
             {decision: 'approve'},
         );
         expect(ctx.wsInstances[0].send).not.toHaveBeenCalled();
-        expect(ctx.service.pendingPermission()).toBeNull();
+        expect(ctx.service.pendingPermissions()).toEqual([]);
     });
 
-    it('deny() resolves durable approval requests through REST', async () => {
+    it('denyAll() resolves durable approval requests through REST', async () => {
         const ctx = await readySession();
         ctx.mockHttp.post.mockClear();
         ctx.wsInstances[0].send.mockClear();
-        (ctx.service as any).pendingPermission.set({
+        (ctx.service as any).pendingPermissions.set([{
             id: 'tc-deny-rest',
             approvalId: 'approval-2',
             tool: 'run_command',
             args: {},
-        });
+        }]);
 
-        ctx.service.deny();
+        ctx.service.denyAll();
 
         expect(ctx.mockHttp.post).toHaveBeenCalledWith(
             expect.stringContaining('/persistent/threads/thread-c/approve/approval-2'),
             {decision: 'deny'},
         );
         expect(ctx.wsInstances[0].send).not.toHaveBeenCalled();
-        expect(ctx.service.pendingPermission()).toBeNull();
+        expect(ctx.service.pendingPermissions()).toEqual([]);
     });
 
-    it('deny() sends {method: "deny"} and seeds the denied tool call in the active turn', async () => {
+    it('denyAll() sends {method: "deny"} and seeds the denied tool call in the active turn', async () => {
         const ctx = await readySession();
         // Real permission.request always fires inside a turn — set that up.
         fireSseMessage(ctx.sseInstances[0], {method: 'turn.started', params: {turn_id: 1}}, '1:2');
-        (ctx.service as any).pendingPermission.set({
+        (ctx.service as any).pendingPermissions.set([{
             id: 'tc-2', tool: 'rm_rf', args: {path: '/'},
-        });
+        }]);
 
-        ctx.service.deny();
+        ctx.service.denyAll();
         const sent = ctx.wsInstances[0].send.mock.calls.map((c: any) => JSON.parse(c[0]));
         expect(sent).toContainEqual({method: 'deny'});
         const turn = ctx.service.currentStreamingTurn()!;
