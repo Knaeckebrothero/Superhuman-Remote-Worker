@@ -533,6 +533,15 @@ class PersistentLoopCallbacks:
     # docs/issues/session_empty_response_gpt5_codex_stop.md.
     on_thinking_reset: Optional[Callable[..., Awaitable[None]]] = None
 
+    # Announce a whole batch of tool calls for approval at once, before any
+    # of them is gated. Lets the client render one card listing every call
+    # instead of one card per finished tool. Optional: None ⇒ the per-call
+    # gate path announces each call itself (previous behaviour).
+    # See docs/superpowers/specs/2026-08-01-batch-tool-approval-design.md.
+    announce_permission_batch: Optional[
+        Callable[[List[Dict[str, Any]]], Awaitable[None]]
+    ] = None
+
     def __post_init__(self) -> None:
         # Back-compat: callers that still pass the deprecated on_vm_upgrade_needed
         # get it promoted to the generalized on_workspace_upgrade_needed the loop
@@ -2223,6 +2232,15 @@ async def _execute_turn(
         # No tool calls? Turn is done.
         if not hasattr(response, "tool_calls") or not response.tool_calls:
             break
+
+        # Announce the whole batch up front so the client can show every
+        # pending call at once. Soft-fail: if this breaks, the per-call gate
+        # path below still inserts and prompts exactly as before.
+        if callbacks.announce_permission_batch is not None:
+            try:
+                await callbacks.announce_permission_batch(response.tool_calls)
+            except Exception as e:
+                logger.warning("Permission batch announce failed: %s", e)
 
         # --- Execute tool calls ---
         for i, tool_call in enumerate(response.tool_calls):
