@@ -1833,6 +1833,10 @@ class PersistentSession:
             for ds, clone_name in zip(old_repos, resolve_repo_clone_names(old_repos)):
                 if _key(ds) in removed_repos:
                     self.workspace_manager.source_repos.pop(clone_name, None)
+                    # source_repo_meta holds the repository's plaintext token;
+                    # leaving it behind keeps a detached credential live on the
+                    # workspace manager for the rest of the session.
+                    self.workspace_manager.source_repo_meta.pop(clone_name, None)
 
         self.datasource_configs = new_configs
         self._refresh_runtime_facts()

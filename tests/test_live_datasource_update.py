@@ -717,6 +717,37 @@ class TestResetupDatasources:
         assert "old-repo" not in session.workspace_manager.source_repos
 
     @pytest.mark.asyncio
+    async def test_removal_also_drops_the_forge_metadata_and_its_token(self):
+        """``source_repo_meta`` holds the repository's plaintext token.
+
+        Popping only ``source_repos`` leaves that credential live on the
+        workspace manager for the rest of the session, after the user has
+        detached the datasource.
+        """
+        repo_old = {
+            "type": "repository",
+            "name": "Old Repo",
+            "connection_url": "https://git.example/org/old-repo.git",
+        }
+        session = _make_session(datasource_configs=[repo_old])
+        session.workspace_manager.source_repos = {"old-repo": MagicMock()}
+        session.workspace_manager.source_repo_meta = {
+            "old-repo": {"forge": "gitea", "token": "sekrit"}
+        }
+        with (
+            patch(
+                "src.core.datasource_setup.process_datasources",
+                return_value=({}, {}, []),
+            ),
+            patch("src.core.datasource_setup.clone_repository_datasources"),
+            patch("src.core.datasource_setup.inject_datasource_index"),
+        ):
+            await session.resetup_datasources([])
+
+        assert "old-repo" not in session.workspace_manager.source_repos
+        assert "old-repo" not in session.workspace_manager.source_repo_meta
+
+    @pytest.mark.asyncio
     async def test_mcp_live_attach_connects_registers_and_grants_wildcard(self):
         session = _make_session()
         manager = MagicMock()

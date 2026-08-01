@@ -998,7 +998,14 @@ def clone_repository_datasources(
                         "owner": owner,
                         "repo": repo_slug,
                         "token": (creds or {}).get("token", ""),
-                        "read_only": bool(ds.get("read_only")),
+                        # The agent payload carries the project link flag as
+                        # `project_read_only`; `read_only` is the publisher's
+                        # declared flag on public datasources. Either one
+                        # forbids writes, and reading only the latter made
+                        # every read-only repository record read_only=False.
+                        "read_only": bool(
+                            ds.get("project_read_only") or ds.get("read_only")
+                        ),
                         "default_branch": branch,
                     }
                 except Exception as e:

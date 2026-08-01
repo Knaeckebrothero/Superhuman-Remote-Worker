@@ -46,6 +46,19 @@ def token_ds(name="My Repo", url="https://github.com/org/repo.git", **extra):
     }
 
 
+def agent_payload(*db_rows):
+    """Run resolved DB rows through the REAL orchestrator payload builder.
+
+    Hand-writing the agent-side dict is what let three wiring gaps ship
+    green: a fixture that invents ``config=``/``read_only=`` keys tests a
+    contract the orchestrator never produces. Anything asserting on what the
+    agent receives must start here.
+    """
+    from orchestrator.main import _build_datasources_payload
+
+    return _build_datasources_payload(list(db_rows))
+
+
 class TestCapabilityGate:
     """No shell-capable backend → loud skip, never a local clone."""
 
@@ -174,6 +187,178 @@ class TestBackendClone:
         ):
             clone_repository_datasources([ds], ws)
         assert ws.source_repo_meta["repo"]["read_only"] is True
+
+
+class TestRealAgentPayloadCarriesForgeMetadata:
+    """Contract tests: the clone must work on what the orchestrator ACTUALLY
+    sends, not on a hand-written dict.
+
+    ``_build_datasources_payload`` is the only producer of the agent-side
+    datasource list. It used to attach ``config`` for ``kb``/``email`` only
+    and it has never emitted a ``read_only`` key (it emits
+    ``project_read_only``), so every repository clone recorded ``forge=""``
+    (``resolve_api_base`` raised, the whole meta block was swallowed) and
+    every read-only repo recorded ``read_only: False``.
+    """
+
+    def test_payload_forwards_config_with_forge(self):
+        """Guard for the forge gap: no ``config`` in the payload means
+        ``repo_open_pr`` always answers "has no forge recorded"."""
+        payload = agent_payload(
+            token_ds(config={"forge": "gitea"}, project_read_only=False)
+        )
+        assert payload[0]["config"] == {"forge": "gitea"}
+
+    def test_payload_forwards_empty_config_when_unset(self):
+        payload = agent_payload(token_ds(project_read_only=False))
+        assert payload[0]["config"] == {}
+
+    def test_clone_from_real_payload_records_forge_metadata(self):
+        ws = make_workspace_manager()
+        payload = agent_payload(
+            token_ds(
+                name="SRW Repository",
+                url="https://github.com/Knaeckebrothero/Superhuman-Remote-Worker",
+                config={"forge": "github"},
+                default_branch="develop",
+                project_read_only=False,
+            )
+        )
+        with patch(
+            "src.managers.git_manager.GitManager.clone", return_value=MagicMock()
+        ):
+            clone_repository_datasources(payload, ws)
+
+        meta = ws.source_repo_meta["Superhuman-Remote-Worker"]
+        assert meta["forge"] == "github"
+        assert meta["api_base"] == "https://api.github.com"
+        assert meta["owner"] == "Knaeckebrothero"
+        assert meta["repo"] == "Superhuman-Remote-Worker"
+        assert meta["token"] == "tok123"
+        assert meta["read_only"] is False
+
+    def test_clone_from_real_payload_honours_project_read_only(self):
+        """Guard for the key-name gap: the payload says
+        ``project_read_only``, the clone read ``read_only``, so the per-repo
+        write gate failed open for every read-only repository."""
+        ws = make_workspace_manager()
+        payload = agent_payload(
+            token_ds(config={"forge": "github"}, project_read_only=True)
+        )
+        with patch(
+            "src.managers.git_manager.GitManager.clone", return_value=MagicMock()
+        ):
+            clone_repository_datasources(payload, ws)
+
+        assert ws.source_repo_meta["repo"]["read_only"] is True
+
+    def test_mixed_read_only_and_read_write_repos_gate_independently(self):
+        """The category gate grants write tools when ANY attached repo is
+        read-write, so with a mixed attach the per-repo flag is the only
+        remaining guard on the read-only clone."""
+        ws = make_workspace_manager()
+        payload = agent_payload(
+            token_ds(
+                name="Writable",
+                url="https://github.com/org/writable.git",
+                config={"forge": "github"},
+                project_read_only=False,
+            ),
+            token_ds(
+                name="Mirror",
+                url="https://github.com/org/mirror.git",
+                config={"forge": "github"},
+                project_read_only=True,
+            ),
+        )
+        with patch(
+            "src.managers.git_manager.GitManager.clone", return_value=MagicMock()
+        ):
+            clone_repository_datasources(payload, ws)
+
+        assert ws.source_repo_meta["writable"]["read_only"] is False
+        assert ws.source_repo_meta["mirror"]["read_only"] is True
+
+    def test_publisher_declared_read_only_still_honoured(self):
+        """``read_only`` (publisher-declared, public datasources) must keep
+        working alongside the project link flag."""
+        ws = make_workspace_manager()
+        ds = token_ds(config={"forge": "github"})
+        ds["read_only"] = True
+        with patch(
+            "src.managers.git_manager.GitManager.clone", return_value=MagicMock()
+        ):
+            clone_repository_datasources([ds], ws)
+
+        assert ws.source_repo_meta["repo"]["read_only"] is True
+
+    def test_full_chain_from_db_row_to_loaded_repo_tools(self):
+        """The one test that would have caught all three wiring gaps.
+
+        Walks every real seam in order — resolved DB row →
+        ``_build_datasources_payload`` → ``clone_repository_datasources`` →
+        ``_build_datasource_tool_override`` → ``load_config_from_resolved``
+        → ``get_all_tool_names`` → ``load_tools`` — and asserts that live
+        ``repo_*`` tools come out the far end. Every unit test in this branch
+        passed while this chain produced nothing.
+        """
+        from src.core.loader import get_all_tool_names, load_config_from_resolved
+        from src.tools.context import ToolContext
+        from src.tools.registry import load_tools
+
+        payload = agent_payload(
+            token_ds(
+                name="SRW Repository",
+                url="https://github.com/Knaeckebrothero/Superhuman-Remote-Worker",
+                config={"forge": "github"},
+                default_branch="develop",
+                project_read_only=False,
+            )
+        )
+        ws = make_workspace_manager()
+        with patch(
+            "src.managers.git_manager.GitManager.clone", return_value=MagicMock()
+        ):
+            clone_repository_datasources(payload, ws)
+        assert ws.source_repo_meta["Superhuman-Remote-Worker"]["forge"] == "github"
+
+        from orchestrator.main import _build_datasource_tool_override
+
+        override = _build_datasource_tool_override(payload, None)
+        config = load_config_from_resolved(
+            {
+                "agent": {
+                    "agent_id": "a",
+                    "display_name": "A",
+                    "tools": override["tools"],
+                },
+                "prompts": {},
+                "instructions": {},
+            }
+        )
+        names = [n for n in get_all_tool_names(config) if n.startswith("repo_")]
+        tools = load_tools(names, ToolContext(workspace_manager=ws))
+
+        assert [t.name for t in tools] == [
+            "repo_commit",
+            "repo_push",
+            "repo_pull",
+            "repo_open_pr",
+        ]
+
+    def test_unparseable_url_records_no_metadata_at_all(self):
+        """SSH-form connection_url: ``resolve_api_base`` raises, the meta
+        block is skipped. The clone still succeeds — the tool layer is what
+        must fail closed (see test_repo_tools)."""
+        ws = make_workspace_manager()
+        ds = token_ds(url="git@github.com:org/repo.git", config={"forge": "github"})
+        with patch(
+            "src.managers.git_manager.GitManager.clone", return_value=MagicMock()
+        ):
+            clone_repository_datasources([ds], ws)
+
+        assert "repo" in ws.source_repos
+        assert "repo" not in ws.source_repo_meta
 
 
 class TestResolveRepoCloneNames:

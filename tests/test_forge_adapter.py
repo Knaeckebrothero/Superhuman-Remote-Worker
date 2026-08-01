@@ -147,3 +147,59 @@ async def test_error_response_raises_without_leaking_token(monkeypatch):
 
     assert "422" in str(exc.value)
     assert "sekrit" not in str(exc.value)
+
+
+@pytest.mark.asyncio
+async def test_github_validation_errors_detail_reaches_the_agent(monkeypatch):
+    """GitHub's most common PR refusals hide the reason one level down.
+
+    "head branch not pushed" and "no commits between" both come back as a
+    generic ``{"message": "Validation Failed"}`` with the actionable text in
+    ``errors[0].message``. Surfacing only the top-level message leaves the
+    agent with nothing to act on.
+    """
+    transport, _ = _capture(
+        status=422,
+        payload={
+            "message": "Validation Failed",
+            "errors": [{"message": "No commits between develop and job/abc"}],
+        },
+    )
+    monkeypatch.setattr("src.services.forge._transport", transport, raising=False)
+
+    target = ForgeRepo("github", "https://api.github.com", "acme", "widget", "sekrit")
+    with pytest.raises(ForgeError) as exc:
+        await open_pull_request(target, title="T", head="job/abc", base="develop")
+
+    text = str(exc.value)
+    assert "No commits between develop and job/abc" in text
+    assert "Validation Failed" in text
+    assert "sekrit" not in text
+
+
+@pytest.mark.asyncio
+async def test_error_detail_tolerates_odd_errors_shapes(monkeypatch):
+    """``errors`` is sometimes a list of bare strings, sometimes absent."""
+    for payload in (
+        {"message": "Validation Failed", "errors": ["plain string"]},
+        {"message": "Validation Failed", "errors": []},
+        {"message": "Validation Failed", "errors": {"not": "a list"}},
+        {"message": "Validation Failed"},
+    ):
+        transport, _ = _capture(status=422, payload=payload)
+        monkeypatch.setattr("src.services.forge._transport", transport, raising=False)
+        target = ForgeRepo("github", "https://api.github.com", "a", "b", "sekrit")
+        with pytest.raises(ForgeError) as exc:
+            await open_pull_request(target, title="T", head="h", base="b")
+        assert "Validation Failed" in str(exc.value)
+        assert "sekrit" not in str(exc.value)
+
+
+def test_forge_repo_repr_never_prints_the_token():
+    """One uncaught non-ForgeError puts this dataclass in a traceback."""
+    target = ForgeRepo("github", "https://api.github.com", "acme", "widget", "sekrit")
+
+    assert "sekrit" not in repr(target)
+    assert "widget" in repr(target)
+    # Still readable through the attribute — only the repr is redacted.
+    assert target.token == "sekrit"
