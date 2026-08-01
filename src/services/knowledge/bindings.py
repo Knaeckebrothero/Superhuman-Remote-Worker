@@ -8,6 +8,25 @@ from dataclasses import dataclass
 from typing import Any, Iterable, Literal, Optional
 
 
+# Mirror of ``orchestrator.services.kb_datasources.NATIVE_PROJECT_CONFIG_KEY``
+# (the agent image has no orchestrator deps, so the constant is duplicated
+# rather than imported). A ``kb`` datasource carrying this key is the
+# management surface over a project's OWN knowledge base, not an external one:
+# its notes live under ``kb_id = project_id``, never under the datasource UUID.
+NATIVE_PROJECT_CONFIG_KEY = "native_project_id"
+
+
+def native_kb_project_id(datasource: dict[str, Any] | None) -> Optional[str]:
+    """Return the project whose native KB this ``kb`` datasource mirrors."""
+    if not datasource:
+        return None
+    config = datasource.get("config") or {}
+    if not isinstance(config, dict):
+        return None
+    value = config.get(NATIVE_PROJECT_CONFIG_KEY)
+    return str(value) if value else None
+
+
 @dataclass(frozen=True)
 class KnowledgeBinding:
     """One authorized knowledge base visible to an agent runtime."""
@@ -57,15 +76,26 @@ def build_knowledge_bindings(
     The first native project remains the sole write target, matching the
     existing primary-project behavior. External KB datasource payloads are
     always read-only in Slice 4 v1.
+
+    A project's own KB datasource (auto-attached at project creation) is keyed
+    by its *project* id, not its datasource id — its notes are indexed under
+    the project. So when it is selected alongside its own project it collapses
+    into the native binding already emitted above, which keeps the project's
+    knowledge base writable and stops the same KB being offered twice under
+    two aliases (docs/features/knowledge_base_repo_separation.md §6).
     """
     bindings: list[KnowledgeBinding] = []
     used: set[str] = set()
+    bound_kb_ids: set[uuid.UUID] = set()
 
     for index, raw_project_id in enumerate(project_ids):
         try:
             project_id = uuid.UUID(str(raw_project_id))
         except (TypeError, ValueError):
             continue
+        if project_id in bound_kb_ids:
+            continue
+        bound_kb_ids.add(project_id)
         base = "project" if index == 0 else f"project-{project_id.hex[:8]}"
         bindings.append(
             KnowledgeBinding(
@@ -87,8 +117,9 @@ def build_knowledge_bindings(
         if str(datasource.get("type") or "").lower() != "kb":
             continue
         raw_id = datasource.get("datasource_id") or datasource.get("id")
+        native_project = native_kb_project_id(datasource)
         try:
-            kb_id = uuid.UUID(str(raw_id))
+            kb_id = uuid.UUID(str(native_project or raw_id))
         except (TypeError, ValueError):
             continue
         name = str(datasource.get("name") or "Knowledge Base")
@@ -103,6 +134,12 @@ def build_knowledge_bindings(
     # jobs, sessions, and database query plans.
     prepared_datasources.sort(key=lambda item: (item[0], item[1].hex))
     for base, kb_id, name, config, datasource in prepared_datasources:
+        if kb_id in bound_kb_ids:
+            # Already bound — the project's own KB reached here as a datasource
+            # row. A second binding would be the same notes under a second
+            # alias, read-only, shadowing the writable native one.
+            continue
+        bound_kb_ids.add(kb_id)
         root_path = str(config.get("root_path") or "")
         bindings.append(
             KnowledgeBinding(

@@ -1519,8 +1519,15 @@ CREATE TABLE public.project_repositories (
     created_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP,
     updated_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP,
     CONSTRAINT chk_reference_read_only CHECK ((((role)::text <> 'reference'::text) OR (read_only = true))),
-    CONSTRAINT valid_repo_role CHECK (((role)::text = ANY ((ARRAY['jobs'::character varying, 'source'::character varying, 'reference'::character varying])::text[])))
+    CONSTRAINT valid_repo_role CHECK (((role)::text = ANY ((ARRAY['jobs'::character varying, 'source'::character varying, 'reference'::character varying, 'knowledge'::character varying])::text[])))
 );
+
+
+--
+-- Name: COLUMN project_repositories.role; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.project_repositories.role IS 'jobs = the per-project job/output repo (one per project); source = a working code repo; reference = read-only context; knowledge = the dedicated KB vault repo (one per project). Projects without a knowledge repo fall back to the jobs repo for KB resolution.';
 
 
 --
@@ -3825,6 +3832,13 @@ CREATE UNIQUE INDEX uq_project_default_expert ON public.project_experts USING bt
 --
 
 CREATE UNIQUE INDEX uq_project_jobs_repo ON public.project_repositories USING btree (project_id) WHERE ((role)::text = 'jobs'::text);
+
+
+--
+-- Name: uq_project_knowledge_repo; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX uq_project_knowledge_repo ON public.project_repositories USING btree (project_id) WHERE ((role)::text = 'knowledge'::text);
 
 
 --

@@ -1364,6 +1364,75 @@ class KnowledgeStore:
             for r in rows
         ]
 
+    async def list_notes_full(
+        self,
+        kb_id: uuid.UUID,
+        limit: int = 5000,
+    ) -> List[Dict[str, Any]]:
+        """Every row of a KB, bodies included — the gardener (kb_lint/kb_index) backend.
+
+        Deliberately NOT ``list_notes`` with a bigger limit. Two differences,
+        both load-bearing for a maintenance surface
+        (docs/features/knowledge_base_repo_separation.md §5a):
+
+        1. **No ``path IS NOT NULL`` gate.** The read path (``kb_read``/
+           ``kb_list``) is files-canonical and hides pathless rows on purpose.
+           A linter must see exactly what the read path cannot: a row the agent
+           wrote that no file backs is not "absent", it is a *defect* — invisible
+           to every reader and a candidate for :meth:`reconcile_orphans`. Gating
+           the linter the same way would let a KB whose materialisation is broken
+           lint "clean" while being unreadable, which is the silent-empty failure
+           this surface exists to catch. Callers report the pathless ones.
+        2. **Ghost-inclusive scoping.** ``upsert_note`` (the agent write-through)
+           sets ``project_id`` but never ``kb_id``/``path`` — those arrive when
+           the reindexer adopts the row. Keying on ``kb_id`` alone would miss
+           every just-written note, so un-adopted rows are matched through
+           ``project_id`` as well (same reasoning as :meth:`reconcile_orphans`
+           keying on ``project_id``). Safe for external KBs: their rows always
+           carry a ``kb_id``, so they can only match the first branch.
+
+        Returns the ``id``/``type`` dict shape the other readers use, plus
+        ``path`` (None when unmaterialised) and ``superseded_by`` (which the
+        lint supersede-chain rule needs). ``limit`` is a guard against pulling
+        an unbounded number of note bodies into agent memory; callers must
+        report truncation loudly rather than silently linting a prefix.
+        """
+        rows = await self.db.fetch(
+            """
+            SELECT note_id, path, title, note_type, status, confidence,
+                   priority, tags, keywords, job_id, phase, content,
+                   superseded_by, created_at, modified_at
+            FROM knowledge_index
+            WHERE (kb_id = $1 OR (kb_id IS NULL AND project_id = $1))
+            ORDER BY note_id
+            LIMIT $2
+            """,
+            kb_id,
+            limit,
+        )
+        return [
+            {
+                "id": r["note_id"],
+                "path": r["path"],
+                "title": r["title"],
+                "type": r["note_type"],
+                "status": r["status"],
+                "content": r["content"],
+                "confidence": r["confidence"],
+                # dict(r).get: tolerates fake rows in tests that predate a
+                # column, same convention as list_notes' priority read.
+                "priority": dict(r).get("priority", 1),
+                "tags": r["tags"] or [],
+                "keywords": r["keywords"] or [],
+                "job_id": r["job_id"],
+                "phase": r["phase"],
+                "superseded_by": dict(r).get("superseded_by"),
+                "created": r["created_at"],
+                "modified": r["modified_at"],
+            }
+            for r in rows
+        ]
+
     # =========================================================================
     # TTL lifecycle — KB convergence
     # (docs/features/kb_convergence_ttl_reverification.md)

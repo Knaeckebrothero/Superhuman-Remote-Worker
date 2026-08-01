@@ -194,6 +194,11 @@ entries and zero deliverables. The split:
 
 ### 6.1 Knowledge base as a default-attached datasource
 
+> **Superseded in detail by `knowledge_base_repo_separation.md` (2026-08-01).** That doc
+> carries the concrete design — new `knowledge` repo role + migration, server-side note
+> materialisation, resolution with fallback so existing projects are untouched. The
+> correction below still stands and is why the substrate flip stays out of both docs.
+
 Every project gets a KB datasource created and attached by default, inherited by all its
 jobs. Behaviour is unchanged for users — every project has a knowledge base today too — but
 it decouples *"this project has knowledge"* from *"the agent's workspace is a checkout of
@@ -380,9 +385,14 @@ Ordered so each step is independently useful and nothing blocks on the largest p
    lands, no fallback ever fires (a full merge would re-land the whole branch); post-commit
    ceremony failures demote to notes. `change_files` gained per-file create/update; gitea
    client gained `close_pr`/`comment_on_pr`.
-4. **KB as default datasource** (6.1) — the attach-by-default part only. The mirror
-   demotion is re-scoped out of this doc entirely (see the correction in 6.1: it is the
-   files→store substrate flip, owned by `knowledge_base_substrate_decision`).
+4. **KB as default datasource** (6.1) — **promoted to its own doc:
+   `knowledge_base_repo_separation.md` (2026-08-01, DESIGN).** It outgrew a bullet: the KB
+   gets its own managed repo per project, auto-attached as a `kb` datasource, and the note
+   materialisation moves server-side via `change_files`. The trigger was discovering that
+   nothing in `src/` ever commits or pushes a cloned source repo, so the obvious
+   "clone the KB repo into the workspace" design silently loses every note. The mirror
+   demotion remains out of scope in both docs (it is the files→store substrate flip, owned
+   by `knowledge_base_substrate_decision`).
 5. **Change-capable datasources** (6.3), git first — credentials, branch policy, PR
    capture. Then cloud, then SQL as separate decisions.
 
