@@ -1,5 +1,17 @@
 # Virtual Directories — Slice 1 Implementation Plan
 
+> **DONE.** All nine tasks executed 2026-07-30 → 08-01, each with its own review
+> and fix loop, followed by a whole-branch review and a single fix wave. Shipped,
+> deployed, and live-gated on dev (agent `sha-f41970a`). Current state lives in
+> `docs/features/virtual_directories.md`; open verification gaps live in
+> `tests/virtual_directories_test_coverage.md`.
+>
+> Note for anyone reading this as a model plan: the per-task reviews found a real
+> defect in **this plan's own prescribed code** on nearly every task (a `stat()`
+> contract break, a search scope leak, an unguarded provider write, a regression
+> test that could not fail, a wrong tool-list binding, a `KeyError` on every
+> contact render). The text below is the corrected version.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Serve `tools/`, `contacts/`, `instructions.md`, and `task_brief.md` to the agent from live state through a workspace-backend overlay, so no framework files are ever written to the workspace filesystem.
