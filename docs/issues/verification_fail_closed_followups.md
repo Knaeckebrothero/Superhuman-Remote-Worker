@@ -71,15 +71,9 @@ Two jobs were driven through the deployed code:
   commit — exactly the pre-commit capture that made the first guard inert, and
   confirmation that abandoning that field was right.
 
-**Still not measured — the reason this is a partial pass:** cross-round
-`content_tree` stability. Job 1 was approved on round 1, so it recorded a single
-value. Job 2 ran multiple rounds but was derailed by two unrelated defects the
-same run surfaced (below), so its rounds are not a clean comparison. A real
-agent turn also writes `plan.md` (`src/managers/plan.py:93`) and `workspace.md`
-(`src/managers/memory.py:95`) via tools — if either churns per round, the guard
-is narrowed again and **no test in the suite would catch it**. The failure mode
-is invisible: an inert guard is indistinguishable from one with no reason to
-fire.
+**Measured 2026-08-01 — the guard has zero sensitivity on a verification
+round.** This was the open item that made the run a partial pass, and the
+answer is worse than the worry. See "Cross-round `content_tree`" below.
 
 **Two new defects found by the live run**, both filed separately, neither
 caused by this change:
@@ -101,19 +95,130 @@ caused by this change:
   Note the shape of this one: fixing brief delivery is what created the
   exposure.
 
-**Inferred, not confirmed:** job 2 ended in `pending_review` under
-`autonomy: full`, which is what escalation looks like for a non-loop job — the
-approve path would have set `completed`. Reading `error_message` or
-`context.verification_rounds` on that job would confirm which escalation branch
-fired and is the cheapest way to close the question.
+**Confirmed 2026-08-01** (was "inferred, not confirmed"): job 2 escalated on
+the **round-limit** branch, not the no-progress branch.
+`error_message = "Round limit reached (3) with 2 finding(s) still open
+(F1, F2)."`, `status = pending_review`, and its ledger holds three rounds each
+with `verdict: returned`. The no-progress branch never fired — for the reason
+below.
 
-### Standing architectural recommendation
+### Cross-round `content_tree` — measured 2026-08-01, and the guard is inert again
 
-**If a fifth tree-mover ever appears, do not add it to the denylist.** Invert
-the design to an **allowlist** — hash `output/` minus the completion files — so
-a newly added bookkeeping path defaults to *ignored* rather than to silently
-breaking the guard. Four corrections to a denylist whose failure mode is silent
-is the signal to change the approach, not to extend the list.
+Read from job 2's ledger, which recorded three rounds:
+
+| Round | `content_tree` | `head_commit` |
+|---|---|---|
+| 1 | `cd0c89c4…` | `09cb3153` |
+| 2 | `b4a0b3b8…` | `813c632f` |
+| 3 | `037c0bbf…` | `89cbcd62` |
+
+Three rounds, three different hashes, guard silent throughout.
+
+**Rounds 2→3 cannot be used as evidence.** `813c632f` is on
+`subjob/50dee4ae/critic` and `89cbcd62` on `subjob/4469a364/critic` — divergent
+branches, per the branch-inheritance defect. A diff across them conflates branch
+divergence with round progress. Discarded.
+
+**Round 1→2 is a clean linear descent** and is decisive. Diffing the two freeze
+commits with the four `NON_DELIVERABLE_PATHS` excluded — i.e. exactly what the
+guard hashes — twelve paths moved in a single round:
+
+| Path | Written by | Changes every round? |
+|---|---|---|
+| `instructions.md` | the critic's brief, re-rendered per round | yes |
+| `output/critic_verdict.json` | critic | yes |
+| `output/verification_report.json` | critic | yes |
+| `output/verification_report_round_N.json` | critic, N in the name | yes |
+| `tools/{approve_job,return_job_with_feedback,shell_execute,spawn_subagent}.md` | critic's tool docs | yes |
+| `knowledge/<per-round-note>.md` | KB note per round | yes |
+| `plan.md` | agent bookkeeping | yes |
+| `task_brief.md` | agent bookkeeping | yes |
+| `output/glossary.md` | **the deliverable** | only on real progress |
+
+Eleven of the twelve move whether or not the worker did anything. So on a
+verification round the tree is **guaranteed** to move: the critic writes into
+the same tree the guard hashes, so it moves the hash by existing. The guard
+cannot fire, ever, on the only path it was built for.
+
+It was silent on job 2 for the right reason by luck — `output/glossary.md` did
+change each round — but its sensitivity is zero regardless.
+
+Note the two fixes interlock. `instructions.md`, `output/critic_verdict.json`,
+`output/verification_report*.json` and `tools/*.md` are in the target's tree
+**only** because of the shared workspace
+(`critic_brief_lands_in_shared_workspace_and_misleads_target.md`). Giving the
+critic its own workspace removes those. It does not remove `plan.md`,
+`task_brief.md`, `knowledge/` or `workspace.md`, which are enough on their own
+to keep the guard inert.
+
+### Required fix (was a standing recommendation)
+
+**Invert the denylist to an allowlist** — hash `output/` minus the two
+completion files, and nothing else. This was written up as *"if a fifth
+tree-mover ever appears, do not extend the denylist"*. Eight have now been
+observed in three classes, so the trigger has fired. An allowlist makes a newly
+added bookkeeping path default to *ignored* rather than to silently breaking the
+guard, and it is robust whether or not the critic ever gets its own workspace.
+
+Five corrections to a denylist whose failure mode is silent is the signal to
+change the approach, not to extend the list.
+
+### Live gate — re-run 2026-08-01 on `sha-f41970a`. The gate held; the fixture died around it.
+
+Deployed image contains both the rewrite (`928ed60b`) and the branch fix
+(`e71f343c`). Target `40efbb39-0890-40fa-a464-6e3d6bd92832`, critic
+`245889ac-6d5b-4771-bd5a-5f47fd1b7e31`. Same fixture text and overrides as the
+first run.
+
+**The headline goal — observing the loop converge — was not reached, and the
+reason has nothing to do with verification.** Zero rounds were recorded.
+
+**What the gate proved, and this is the valuable part:** the fail-closed
+property held under a case no test covers. The critic submitted
+`return_job_with_feedback` with `findings: "[]"`. The tool rejected it:
+
+```
+Error: the verdict was NOT recorded and must be corrected and resubmitted.
+verdict rejected:
+- Cannot return a job with no findings: `opened` is empty and no findings from
+  previous rounds are open. If the deliverable has a problem, describe it as a
+  finding in `opened`.
+```
+
+Nothing recorded, nothing silently approved, and the rejection names the
+correction. `validate_verdict_call` did precisely its job — including the
+`open_before` carve-out, which is why this is a rejection of a genuinely
+inconsistent call rather than of the common round-2 shape.
+
+**Three defects found, all filed, none in the verification path:**
+
+- `git_push_fails_silently_via_workspace_backend.md` — **the root cause of the
+  whole run.** Every `git push` failed for the target's entire 72-minute life,
+  26 times, each logging `git push failed: ` with an *empty* reason
+  (`_parse_shell_run_output` hardcodes `stderr=""` on the workspace-backend
+  path). Gitea holds only `Initial commit`. The job still reported
+  `job_complete` at confidence 1.0, then the pod was reclaimed. The critic
+  reviewed an empty repository and was right to.
+- `rejected_verdict_livelocks_critic_and_wedges_parent.md` — the critic could
+  not convert "deliverable absent" into a structured finding, resubmitted the
+  same invalid call 5 times, and livelocked: 189 iterations, 41 commits cycling
+  two strategic todos, 15 shells, 105 minutes, parent pinned in `reviewing`
+  throughout. **`_UNSTICK_REVIEWING_SQL` cannot fire on a live critic** — it
+  covers a critic that *died*, not one that will never finish. Cancelled
+  manually.
+- **Fixture defect, for whoever runs this next:** the target executed *both*
+  staged rounds in one pass — its completion summary describes writing the
+  glossary *and* appending `## Sources` (Vogels 2009, Fielding 2000) before ever
+  completing once. Staged instructions that say "on your first completion omit
+  X; when returned, add X" are read as a script to run internally, not as two
+  rounds. **A convergence fixture must make round 1's gap something the agent
+  cannot close without a real return** — e.g. withhold a fact it must be *given*
+  in feedback, rather than asking it to pretend not to know something.
+
+**Still unmeasured after two attempts:** the loop converging (return → fix →
+approve). Both runs died before round 2 for unrelated infrastructure reasons.
+Fix the silent-push defect first — a third attempt without it will fail the same
+way.
 
 ---
 
