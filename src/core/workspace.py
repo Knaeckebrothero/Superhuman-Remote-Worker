@@ -324,6 +324,9 @@ class WorkspaceManager:
         # Source/reference repo git managers, keyed by repo name
         self._source_repos: dict[str, "GitManager"] = {}
 
+        # Forge/auth metadata per cloned repo, keyed like _source_repos
+        self._source_repo_meta: dict[str, dict] = {}
+
     @property
     def backend(self) -> "WorkspaceBackend":
         """Get the workspace backend."""
@@ -403,6 +406,15 @@ class WorkspaceManager:
     def source_repos(self) -> dict[str, "GitManager"]:
         """Git managers for source/reference repos, keyed by repo name."""
         return self._source_repos
+
+    @property
+    def source_repo_meta(self) -> dict[str, dict]:
+        """Forge/auth metadata per cloned repo, keyed like ``source_repos``.
+
+        ``source_repos`` holds GitManager instances, which know how to run git
+        but nothing about the forge's API. The repo tools need both.
+        """
+        return self._source_repo_meta
 
     def get_head_commit(self) -> Optional[str]:
         """Best-effort HEAD commit SHA at the workspace root.

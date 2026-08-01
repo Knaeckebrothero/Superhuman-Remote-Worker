@@ -22,6 +22,7 @@ def make_workspace_manager(supports_shell=True, with_backend=True):
     ws = MagicMock()
     ws.path = Path("/tmp/ws")
     ws.source_repos = {}
+    ws.source_repo_meta = {}
     if not with_backend:
         ws.backend = None
         return ws
@@ -140,6 +141,39 @@ class TestBackendClone:
             clone_repository_datasources([token_ds()], ws)
         assert ws.source_repos == {}
         assert any("Failed to clone" in r.message for r in caplog.records)
+
+    def test_token_clone_records_forge_metadata_for_tools(self):
+        """Tools need forge/token/owner/repo; source_repos only carries GitManager."""
+        ws = make_workspace_manager()
+        ds = token_ds(
+            name="SRW Repository",
+            url="https://github.com/Knaeckebrothero/Superhuman-Remote-Worker",
+            config={"forge": "github"},
+            default_branch="develop",
+            read_only=False,
+        )
+        with patch(
+            "src.managers.git_manager.GitManager.clone", return_value=MagicMock()
+        ):
+            clone_repository_datasources([ds], ws)
+
+        meta = ws.source_repo_meta["Superhuman-Remote-Worker"]
+        assert meta["forge"] == "github"
+        assert meta["api_base"] == "https://api.github.com"
+        assert meta["owner"] == "Knaeckebrothero"
+        assert meta["repo"] == "Superhuman-Remote-Worker"
+        assert meta["token"] == "tok123"
+        assert meta["read_only"] is False
+        assert meta["default_branch"] == "develop"
+
+    def test_repo_metadata_marks_read_only_datasources(self):
+        ws = make_workspace_manager()
+        ds = token_ds(config={"forge": "github"}, read_only=True)
+        with patch(
+            "src.managers.git_manager.GitManager.clone", return_value=MagicMock()
+        ):
+            clone_repository_datasources([ds], ws)
+        assert ws.source_repo_meta["repo"]["read_only"] is True
 
 
 class TestResolveRepoCloneNames:
