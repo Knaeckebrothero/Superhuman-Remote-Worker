@@ -17288,6 +17288,13 @@ def _build_datasources_payload(
         if ds_type == "kb":
             entry["datasource_id"] = str(ds["id"])
             entry["config"] = _normalize_kb_config(ds.get("config"))
+        if ds_type == "repository":
+            # The clone reads config["forge"] to resolve the forge API base;
+            # without it every repository records forge="" and repo_open_pr
+            # can never be used. _datasource_row_to_dict already parsed the
+            # JSONB, so this is a real dict. No secrets live in config —
+            # credentials travel in `creds`.
+            entry["config"] = ds.get("config") or {}
         if ds_type == "email":
             # v1: one mailbox per job/session — the agent keys connections by
             # type, so a second email datasource would silently shadow the

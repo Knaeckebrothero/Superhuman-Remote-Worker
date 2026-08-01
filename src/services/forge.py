@@ -9,7 +9,7 @@ supports one, unlike GitHub Apps which are GitHub-only.
 """
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 from urllib.parse import quote, urlparse
 
@@ -35,7 +35,9 @@ class ForgeRepo:
     api_base: str
     owner: str
     repo: str
-    token: str
+    # repr=False: one uncaught non-ForgeError renders this dataclass into a
+    # traceback, and tracebacks reach logs and the agent transcript.
+    token: str = field(repr=False)
 
 
 def parse_owner_repo(url: str) -> tuple[str, str]:
@@ -132,7 +134,18 @@ async def open_pull_request(
         try:
             data = resp.json()
             detail = str(data.get("message") or data.get("error") or "")[:200]
-        except ValueError:
+            # GitHub/Gitea bury the actionable reason one level down: the two
+            # most common PR refusals ("head branch not pushed", "no commits
+            # between X and Y") both arrive as a generic
+            # {"message": "Validation Failed", "errors": [{"message": ...}]}.
+            errors = data.get("errors")
+            if isinstance(errors, list) and errors:
+                first = errors[0]
+                nested = first.get("message") if isinstance(first, dict) else first
+                nested = str(nested or "")[:200]
+                if nested and nested != detail:
+                    detail = f"{detail}: {nested}" if detail else nested
+        except (ValueError, AttributeError):
             pass
         raise ForgeError(
             f"{target.forge} refused the pull request "

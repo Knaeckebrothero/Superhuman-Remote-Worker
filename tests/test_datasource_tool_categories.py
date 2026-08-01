@@ -135,6 +135,94 @@ def test_read_only_repository_gets_only_pull():
     assert cats["repo"] == ["repo_pull"]
 
 
+class TestRepoCategorySurvivesTheRealFunnel:
+    """Category maps are useless if the loader drops the category.
+
+    ``datasource_tool_categories`` returning ``{"repo": [...]}`` proves
+    nothing on its own: the override travels through ``ToolsConfig`` (a
+    dataclass with a fixed field list) and out through ``get_all_tool_names``
+    (a hardcoded category tuple), which is the single funnel both
+    ``src/agent.py`` and ``src/api/persistent_session.py`` use to decide what
+    to load. A category missing from EITHER place is silently discarded, so
+    ``"repo" in tools_by_category`` in the registry is never true and the
+    whole toolkit is dead code. These tests walk the real funnel.
+    """
+
+    def _config_for(self, datasources):
+        from orchestrator.main import _build_datasource_tool_override
+        from src.core.loader import load_config_from_resolved
+
+        override = _build_datasource_tool_override(datasources, None)
+        resolved = {
+            "agent": {
+                "agent_id": "a",
+                "display_name": "A",
+                "tools": override["tools"],
+            },
+            "prompts": {},
+            "instructions": {},
+        }
+        return load_config_from_resolved(resolved)
+
+    def test_tools_config_has_a_repo_field(self):
+        """A dataclass without the field silently drops the category."""
+        from src.core.loader import ToolsConfig
+
+        assert "repo" in ToolsConfig.__dataclass_fields__
+        assert ToolsConfig().repo == []
+
+    def test_loader_keeps_the_repo_category(self):
+        config = self._config_for([_ds("repository")])
+        assert config.tools.repo == [
+            "repo_commit",
+            "repo_push",
+            "repo_pull",
+            "repo_open_pr",
+        ]
+
+    def test_get_all_tool_names_yields_repo_tools(self):
+        """The guard for the whole feature: without ``"repo"`` in the
+        ``get_all_tool_names`` category tuple, the agent never asks the
+        registry for a single repo tool."""
+        from src.core.loader import get_all_tool_names
+
+        names = get_all_tool_names(self._config_for([_ds("repository")]))
+        assert "repo_commit" in names
+        assert "repo_push" in names
+        assert "repo_pull" in names
+        assert "repo_open_pr" in names
+
+    def test_read_only_repository_yields_only_repo_pull(self):
+        from src.core.loader import get_all_tool_names
+
+        names = get_all_tool_names(
+            self._config_for([_ds("repository", read_only=True)])
+        )
+        assert "repo_pull" in names
+        assert "repo_commit" not in names
+        assert "repo_push" not in names
+        assert "repo_open_pr" not in names
+
+    def test_no_repository_attached_yields_no_repo_tools(self):
+        from src.core.loader import get_all_tool_names
+
+        names = get_all_tool_names(self._config_for([_ds("postgresql")]))
+        assert not [n for n in names if n.startswith("repo_")]
+
+    def test_registry_sees_the_repo_category(self):
+        """End of the funnel: the name list the agent hands the registry must
+        group back into a ``repo`` bucket, which is what gates the wiring
+        block in ``src/tools/registry.py`` (``if "repo" in
+        tools_by_category``)."""
+        from src.core.loader import get_all_tool_names
+        from src.tools.registry import TOOL_REGISTRY
+
+        names = get_all_tool_names(self._config_for([_ds("repository")]))
+        # Same grouping load_tools() performs before dispatching by category.
+        categories = {TOOL_REGISTRY[n].get("category") for n in names}
+        assert "repo" in categories
+
+
 class TestEmailTierCategories:
     """Email is tier-keyed (config.access), not binary read/write."""
 

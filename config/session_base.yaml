@@ -131,6 +131,8 @@ tools:
   sql: [ ]
   mongodb: [ ]
   email: [ ]
+  # Repository-datasource write tools; `git` above stays the workspace's own.
+  repo: [ ]
   # Not used in persistent mode
   evaluation: [ ]
   delegation: [ ]
