@@ -1478,6 +1478,72 @@ describe('PersistentChatService — SSE event dispatch', () => {
         }, '1:1');
         expect(service.pendingPermissions().map((p) => p.id)).toEqual(['tc-0', 'tc-1']);
     });
+
+    it('converges on the approval_id of a re-announced call instead of dropping it', async () => {
+        // The claim SELECT in _loop_permission_check soft-fails on any DB
+        // blip: the gate then INSERTs a SECOND pending row and broadcasts
+        // permission.request carrying the NEW approval_id — the only id the
+        // waiter is filtering NOTIFY on. Appending only when the tool_call_id
+        // is absent DROPS that frame, so the card keeps the stale announced
+        // id; "Approve all" resolves the announced row, the NOTIFY id never
+        // matches the waiter's, the card vanishes and the agent blocks
+        // forever with no recovery path.
+        const {service, es, mockHttp} = await setup();
+        fireSseMessage(es, {
+            method: 'permission.request_batch',
+            params: {
+                requests: [
+                    {id: 'tc-0', approval_id: 'a-stale', tool: 'run_command',
+                     args: {command: 'rm -rf /var/data'}},
+                    {id: 'tc-1', approval_id: 'a-1', tool: 'web_search', args: {}},
+                ],
+            },
+        }, '1:1');
+        fireSseMessage(es, {
+            method: 'permission.request',
+            params: {
+                id: 'tc-0',
+                approval_id: 'a-authoritative',
+                tool: 'run_command',
+                args: {command: 'rm -rf /var/data'},
+            },
+        }, '1:2');
+
+        // Updated in place — not appended as a duplicate row, not dropped.
+        expect(service.pendingPermissions().map((p) => p.id)).toEqual(['tc-0', 'tc-1']);
+        expect(service.pendingPermissions()[0].approvalId).toBe('a-authoritative');
+        // Full args survive the update: the destructive command must stay
+        // visible before the single "Approve all" click.
+        expect(service.pendingPermissions()[0].args)
+            .toEqual({command: 'rm -rf /var/data'});
+
+        service.approveAll();
+
+        const urls = mockHttp.post.mock.calls.map((c: unknown[]) => c[0] as string);
+        expect(urls.some((u) => u.endsWith('/approve/a-authoritative'))).toBe(true);
+        expect(urls.some((u) => u.endsWith('/approve/a-stale'))).toBe(false);
+    });
+
+    it('drops the announced card when the backend expires an unclaimed row', async () => {
+        // Turn-end sweep: rows the turn never reached are CAS-expired and
+        // journalled as permission.resolved, so an attached client must not
+        // keep offering a gate nobody is waiting on.
+        const {service, es} = await setup();
+        fireSseMessage(es, {
+            method: 'permission.request_batch',
+            params: {
+                requests: [
+                    {id: 'tc-0', approval_id: 'a-0', tool: 'web_search', args: {}},
+                    {id: 'tc-1', approval_id: 'a-1', tool: 'web_search', args: {}},
+                ],
+            },
+        }, '1:1');
+        fireSseMessage(es, {
+            method: 'permission.resolved',
+            params: {id: 'tc-1', approval_id: 'a-1', decision: 'expired'},
+        }, '1:2');
+        expect(service.pendingPermissions().map((p) => p.id)).toEqual(['tc-0']);
+    });
 });
 
 describe('PersistentChatService — cursor persistence', () => {
