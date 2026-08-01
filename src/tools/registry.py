@@ -21,6 +21,7 @@ from typing import Any, Dict, List
 from .canvas import create_canvas_tools, get_canvas_metadata
 from .citation import create_citation_tools, get_citation_metadata
 from .webdav import create_webdav_tools, get_webdav_metadata
+from .repo import create_repo_tools, get_repo_metadata
 from .communication import create_communication_tools, get_communication_metadata
 from .context import ToolContext
 
@@ -82,6 +83,7 @@ TOOL_REGISTRY.update(get_graph_metadata())
 TOOL_REGISTRY.update(get_sql_metadata())
 TOOL_REGISTRY.update(get_mongodb_metadata())
 TOOL_REGISTRY.update(get_webdav_metadata())
+TOOL_REGISTRY.update(get_repo_metadata())
 TOOL_REGISTRY.update(get_email_metadata())
 TOOL_REGISTRY.update(get_git_metadata())
 TOOL_REGISTRY.update(get_shell_metadata())
@@ -561,6 +563,25 @@ def load_tools(tool_names: List[str], context: ToolContext) -> List[Any]:
                         logger.debug(f"Loaded webdav tool: {tool.name}")
             except Exception as e:
                 logger.warning(f"Could not load webdav tools: {e}")
+
+    # Repository datasource write tools. NOTE: unlike the other datasource
+    # toolkits this cannot use context.has_datasource() — repository
+    # datasources never enter context.datasources (process_datasources skips
+    # them); the clones live on workspace_manager instead.
+    if "repo" in tools_by_category:
+        ws = context.workspace_manager
+        if not getattr(ws, "source_repos", None):
+            logger.warning("Repo tools require at least one cloned repository")
+        else:
+            try:
+                repo_tools = create_repo_tools(context)
+                requested = set(tools_by_category["repo"])
+                for tool in repo_tools:
+                    if tool.name in requested:
+                        all_tools.append(tool)
+                        logger.debug(f"Loaded repo tool: {tool.name}")
+            except Exception as e:
+                logger.warning(f"Could not load repo tools: {e}")
 
     # MCP datasource tools are already-live LangChain tools owned by the
     # per-job/session MCPManager. Missing or failed servers degrade cleanly.
