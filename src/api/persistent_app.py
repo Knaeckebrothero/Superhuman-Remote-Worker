@@ -4398,50 +4398,42 @@ async def _retire_announced_permission_rows(
     """
     if not _announced_permission_rows:
         return
-    doomed = [
-        (tool_call_id, request_id)
-        for tool_call_id, (request_id, tool_name) in _announced_permission_rows.items()
-        if (mode is None or not _gate_needed(mode, tool_name))
-        and request_id != _active_permission_request_id
-    ]
+    # Take ownership up front so a second sweep can't double-work the same
+    # rows; anything we fail to reach goes back on the ledger below.
+    doomed: Dict[str, Tuple[str, str]] = {
+        tool_call_id: entry
+        for tool_call_id, entry in _announced_permission_rows.items()
+        if (mode is None or not _gate_needed(mode, entry[1]))
+        and entry[0] != _active_permission_request_id
+    }
     if not doomed:
         return
-    for tool_call_id, _ in doomed:
+    for tool_call_id in doomed:
         _announced_permission_rows.pop(tool_call_id, None)
 
     if _session is None or _session.postgres_conn is None:
         return
 
     expired: List[Tuple[str, str]] = []
-    unswept: List[Tuple[str, Tuple[str, str]]] = []
     try:
         async with _session.postgres_conn.acquire() as conn:
-            for idx, (tool_call_id, request_id) in enumerate(doomed):
-                try:
-                    row_id = await conn.fetchval(
-                        "UPDATE thread_permission_requests "
-                        "SET status = 'expired', decided_at = now(), "
-                        "    decided_by = 'system' "
-                        "WHERE id = $1 AND status = 'pending' "
-                        "RETURNING id",
-                        request_id,
-                    )
-                except Exception:
-                    # Re-track the rows we never got to so a later sweep
-                    # (next announce / next turn end) can retry them.
-                    unswept = [
-                        (tcid, (rid, ""))
-                        for tcid, rid in doomed[idx:]
-                        if tcid not in _announced_permission_rows
-                    ]
-                    raise
+            for tool_call_id, (request_id, _tool) in list(doomed.items()):
+                row_id = await conn.fetchval(
+                    "UPDATE thread_permission_requests "
+                    "SET status = 'expired', decided_at = now(), "
+                    "    decided_by = 'system' "
+                    "WHERE id = $1 AND status = 'pending' "
+                    "RETURNING id",
+                    request_id,
+                )
+                doomed.pop(tool_call_id, None)
                 if row_id is not None:
                     expired.append((tool_call_id, request_id))
     except Exception as e:
-        logger.warning(
-            "Retiring announced permission rows failed (%s): %s", reason, e
-        )
-        for tool_call_id, entry in unswept:
+        logger.warning("Retiring announced permission rows failed (%s): %s", reason, e)
+        # Put back whatever we never reached so the next sweep retries it —
+        # setdefault so a fresh announce for the same call still wins.
+        for tool_call_id, entry in doomed.items():
             _announced_permission_rows.setdefault(tool_call_id, entry)
 
     for tool_call_id, request_id in expired:

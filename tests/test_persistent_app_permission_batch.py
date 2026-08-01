@@ -598,3 +598,26 @@ class TestClaimSelectSoftFailKeepsTheAnnouncedRow:
         insert.assert_not_awaited()
         assert waited["id"] == "rid-tc_0"
         assert outcome is PermissionOutcome.APPROVED
+
+    @pytest.mark.asyncio
+    async def test_sweep_db_failure_is_soft_and_keeps_the_rows_tracked(self):
+        """The sweep runs first inside the turn-end hook — if it raised, the
+        turn's message save, title pass and cloud push would all be skipped.
+        Soft-fail, and leave the unreached rows on the ledger so the next
+        sweep retries them."""
+        store = _FakeRowStore()
+        session = _session_with_store(store)
+        ledger: dict = {}
+
+        with (
+            patch.object(pa, "_session", session),
+            patch.object(pa, "_thread_id", "tid"),
+            patch.object(pa, "_announced_permission_rows", ledger),
+            patch.object(pa, "_subscribers", {}),
+            patch.object(pa, "_broadcast", MagicMock()),
+        ):
+            await pa._loop_announce_permission_batch(FOUR_CALLS)
+            store.fetchval = AsyncMock(side_effect=RuntimeError("pool exhausted"))
+            await _end_the_turn()  # must not raise
+
+        assert set(ledger) == {"tc_0", "tc_1", "tc_2", "tc_3"}
