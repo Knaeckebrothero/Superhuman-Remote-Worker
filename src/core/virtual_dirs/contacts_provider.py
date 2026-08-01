@@ -1,6 +1,6 @@
 """ContactsProvider — contacts/ served live from the orchestrator.
 
-The DB is the source of truth (docs/features/contacts_registry.md). The agent
+The DB is the source of truth (docs/done/contacts_registry.md). The agent
 sees a read-only projection with a short TTL, so a contact linked mid-session
 becomes visible without a restart. Deliberately not the reverted boot-snapshot
 approach (commit b8e48c10), which could only ever be as fresh as job start.

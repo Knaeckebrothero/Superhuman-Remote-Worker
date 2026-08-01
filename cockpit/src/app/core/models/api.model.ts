@@ -1749,7 +1749,7 @@ export interface GrantListResponse {
   catalog: GrantCatalog;
 }
 
-// --- Contacts registry (docs/features/contacts_registry.md) ---
+// --- Contacts registry (docs/done/contacts_registry.md) ---
 export type ContactChannel = 'email' | 'whatsapp';
 export type ContactOptIn = 'pending' | 'opted_in' | 'opted_out';
 
