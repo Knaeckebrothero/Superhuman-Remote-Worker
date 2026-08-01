@@ -17468,6 +17468,46 @@ def _normalize_kb_config(config: dict[str, Any] | None) -> dict[str, Any]:
     return {"root_path": "/".join(parts)}
 
 
+def _normalize_repository_config(
+    config: dict[str, Any] | None, connection_url: str | None
+) -> dict[str, Any]:
+    """Validate and default the ``forge`` field on a repository datasource.
+
+    Host inference only covers the two SaaS hosts. A self-hosted Gitea and a
+    self-hosted GitLab are indistinguishable by URL, so those must declare
+    ``forge`` explicitly rather than be guessed at.
+    """
+    from src.services.forge import SUPPORTED_FORGES  # noqa: PLC0415
+
+    out = dict(config or {})
+    forge = str(out.get("forge") or "").strip().lower()
+
+    if not forge:
+        host = (urlparse(connection_url or "").hostname or "").lower()
+        if host in ("github.com", "www.github.com"):
+            forge = "github"
+        elif host in ("gitlab.com", "www.gitlab.com"):
+            forge = "gitlab"
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Repository connectors on a self-hosted host must declare "
+                    f"'forge' explicitly (one of {sorted(SUPPORTED_FORGES)}) — "
+                    "a self-hosted Gitea and GitLab cannot be told apart by URL"
+                ),
+            )
+
+    if forge not in SUPPORTED_FORGES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported forge {forge!r}; expected one of {sorted(SUPPORTED_FORGES)}",
+        )
+
+    out["forge"] = forge
+    return out
+
+
 def _validate_kb_repository_url(connection_url: str | None) -> str:
     """Require a safe network Git URL with no embedded credentials."""
     value = (connection_url or "").strip()
@@ -17686,6 +17726,10 @@ async def create_datasource(body: DatasourceCreate, request: Request) -> dict[st
                 detail="Connector config is not supported for MCP connectors",
             )
         datasource_config = {}
+    elif body.type == "repository":
+        datasource_config = _normalize_repository_config(
+            body.config, body.connection_url
+        )
     else:
         if body.config:
             raise HTTPException(
@@ -17898,6 +17942,12 @@ async def update_datasource(
             connection_url = None
             mcp_connection_url_set = bool(
                 url_was_supplied or existing_ds.get("connection_url") is not None
+            )
+    elif (existing_ds.get("type") or "") == "repository":
+        if datasource_config is not None:
+            effective_url = body.connection_url or existing_ds.get("connection_url")
+            datasource_config = _normalize_repository_config(
+                datasource_config, effective_url
             )
     elif datasource_config:
         raise HTTPException(
