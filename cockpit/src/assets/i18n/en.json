@@ -2023,17 +2023,45 @@
     "projectsShort": "proj",
     "primary": "primary",
     "noAddresses": "No addresses",
-    "optIn": {"pending": "opt-in pending", "opted_out": "opted out"},
-    "filter": {"allChannels": "All channels", "allProjects": "All projects"},
-    "form": {"newTitle": "New contact", "editTitle": "Edit contact", "name": "Display name",
-             "notes": "Notes (visible to agents — briefings, preferences, context)",
-             "addresses": "Addresses", "addAddress": "+ Add address", "projects": "Projects",
-             "channelLocked": "Channel can't be changed after saving — remove this address and add a new one instead."},
-    "delete": {"title": "Delete contact",
-               "message": "This removes the contact from these projects: {{projects}}. Agents will no longer be able to message them.",
-               "namePrompt": "Type the contact's name to confirm:"},
+    "optIn": {
+      "pending": "opt-in pending",
+      "opted_out": "opted out"
+    },
+    "filter": {
+      "allChannels": "All channels",
+      "allProjects": "All projects",
+      "channelAria": "Filter by channel",
+      "projectAria": "Filter by project"
+    },
+    "form": {
+      "newTitle": "New contact",
+      "editTitle": "Edit contact",
+      "name": "Display name",
+      "notes": "Notes (visible to agents — briefings, preferences, context)",
+      "addresses": "Addresses",
+      "addAddress": "Add address",
+      "projects": "Projects",
+      "channelLocked": "Channel can't be changed after saving — remove this address and add a new one instead.",
+      "namePlaceholder": "Anna Weber",
+      "notesLabel": "Notes",
+      "addressesHint": "Where agents may reach this person. The first address on a channel becomes its primary.",
+      "removeAddress": "Remove address",
+      "channelAria": "Channel",
+      "addressAria": "Address",
+      "projectsHint": "Agents on a linked project can message this contact.",
+      "noProjects": "No projects yet. Create one to link this contact."
+    },
+    "delete": {
+      "title": "Delete contact",
+      "message": "This removes the contact from these projects: {{projects}}. Agents will no longer be able to message them.",
+      "namePrompt": "Type the contact's name to confirm:"
+    },
     "saveError": "Save failed. Some changes may not have been applied — check the contact and retry.",
-    "deleteError": "Delete failed. You may not have permission, or the contact already changed — refresh and retry."
+    "deleteError": "Delete failed. You may not have permission, or the contact already changed — refresh and retry.",
+    "subtitle": "People your agents may reach. Link a contact to a project and agents on that project can message them.",
+    "emptyTitle": "No contacts yet",
+    "noAddressesHint": "This contact has no addresses, so no agent can reach them. Add one to make them reachable.",
+    "loadError": "Couldn't load contacts. Check your connection and retry."
   },
   "inbox": {
     "title": "Action Center",

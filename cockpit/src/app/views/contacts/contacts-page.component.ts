@@ -1,5 +1,4 @@
 import {ChangeDetectionStrategy, Component, OnInit, inject, signal} from '@angular/core';
-import {FormsModule} from '@angular/forms';
 import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
 import {forkJoin, of, switchMap} from 'rxjs';
 
@@ -7,7 +6,13 @@ import {Contact, ContactProjectRef} from '../../core/models/api.model';
 import {ApiService} from '../../core/services/api.service';
 import {ContactsService} from '../../core/services/contacts.service';
 import {UserService} from '../../core/services/user.service';
+import {SidebarToggleComponent} from '../../shell/sidebar-toggle/sidebar-toggle.component';
+import {AppButtonComponent} from '../../ui/button';
 import {AppConfirmNameDialogComponent} from '../../ui/confirm-name-dialog';
+import {AppIconComponent} from '../../ui/icon';
+import {AppInputComponent} from '../../ui/input';
+import {AppSelectComponent} from '../../ui/select';
+import {AppSpinnerComponent} from '../../ui/spinner';
 import {ContactFormComponent, ContactFormResult} from './contact-form.component';
 import {ContactListComponent} from './contact-list.component';
 
@@ -15,38 +20,100 @@ import {ContactListComponent} from './contact-list.component';
   selector: 'app-contacts-page',
   standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [FormsModule, TranslocoPipe, ContactListComponent, ContactFormComponent,
-            AppConfirmNameDialogComponent],
+  imports: [
+    TranslocoPipe,
+    ContactListComponent,
+    ContactFormComponent,
+    SidebarToggleComponent,
+    AppButtonComponent,
+    AppConfirmNameDialogComponent,
+    AppIconComponent,
+    AppInputComponent,
+    AppSelectComponent,
+    AppSpinnerComponent,
+  ],
   template: `
-    <div class="page-header">
-      <h2>{{ 'contacts.title' | transloco }}</h2>
-      <button [disabled]="showForm()" (click)="openNew()">{{ 'contacts.new' | transloco }}</button>
-    </div>
-    @if (saveError(); as err) {
-      <div class="error-msg">
-        <span>{{ err }}</span>
-        <button (click)="saveError.set(null)">{{ 'common.dismiss' | transloco }}</button>
+    <div class="page">
+      <div class="page-toggle">
+        <app-sidebar-toggle />
       </div>
-    }
-    <div class="filters">
-      <input [ngModel]="q()" (ngModelChange)="q.set($event); reload()"
-        [placeholder]="'contacts.search' | transloco" />
-      <select [ngModel]="channel()" (ngModelChange)="channel.set($event); reload()">
-        <option value="">{{ 'contacts.filter.allChannels' | transloco }}</option>
-        <option value="email">email</option>
-        <option value="whatsapp">whatsapp</option>
-      </select>
-      <select [ngModel]="projectId()" (ngModelChange)="projectId.set($event); reload()">
-        <option value="">{{ 'contacts.filter.allProjects' | transloco }}</option>
-        @for (p of projects(); track p.id) { <option [value]="p.id">{{ p.name }}</option> }
-      </select>
+
+      <main class="page-content">
+        <header class="header">
+          <div class="header__text">
+            <h2 class="header__title">{{ 'contacts.title' | transloco }}</h2>
+            <p class="header__subtitle">{{ 'contacts.subtitle' | transloco }}</p>
+          </div>
+          <app-button variant="primary" [disabled]="showForm()" (clicked)="openNew()">
+            {{ 'contacts.new' | transloco }}
+          </app-button>
+        </header>
+
+        @if (saveError(); as err) {
+          <div class="banner" role="alert">
+            <app-icon size="sm">error</app-icon>
+            <span class="banner__text">{{ err }}</span>
+            <app-button variant="ghost" size="sm" (clicked)="saveError.set(null)">
+              {{ 'common.dismiss' | transloco }}
+            </app-button>
+          </div>
+        }
+
+        <div class="filters">
+          <app-input
+            class="filters__search"
+            [value]="q()"
+            (valueChange)="q.set($event); reload()"
+            [placeholder]="'contacts.search' | transloco"
+            [ariaLabel]="'contacts.search' | transloco"
+          />
+          <app-select
+            class="filters__select"
+            [value]="channel()"
+            (valueChange)="channel.set($event ?? ''); reload()"
+            [fullWidth]="false"
+            [ariaLabel]="'contacts.filter.channelAria' | transloco"
+          >
+            <option value="">{{ 'contacts.filter.allChannels' | transloco }}</option>
+            <option value="email">email</option>
+            <option value="whatsapp">whatsapp</option>
+          </app-select>
+          <app-select
+            class="filters__select"
+            [value]="projectId()"
+            (valueChange)="projectId.set($event ?? ''); reload()"
+            [fullWidth]="false"
+            [ariaLabel]="'contacts.filter.projectAria' | transloco"
+          >
+            <option value="">{{ 'contacts.filter.allProjects' | transloco }}</option>
+            @for (p of projects(); track p.id) {
+              <option [value]="p.id">{{ p.name }}</option>
+            }
+          </app-select>
+        </div>
+
+        @if (showForm()) {
+          <app-contact-form
+            [contact]="editing()"
+            [projects]="projects()"
+            (saved)="save($event)"
+            (cancelled)="closeForm()"
+          />
+        }
+
+        @if (loading()) {
+          <div class="loading"><app-spinner size="md" /></div>
+        } @else {
+          <app-contact-list
+            [contacts]="contacts()"
+            [currentUserId]="userService.currentUserId()"
+            (edit)="openEdit($event)"
+            (remove)="askDelete($event)"
+          />
+        }
+      </main>
     </div>
-    @if (showForm()) {
-      <app-contact-form [contact]="editing()" [projects]="projects()"
-        (saved)="save($event)" (cancelled)="closeForm()" />
-    }
-    <app-contact-list [contacts]="contacts()" [currentUserId]="userService.currentUserId()"
-      (edit)="openEdit($event)" (remove)="askDelete($event)" />
+
     @if (deleting(); as target) {
       <app-confirm-name-dialog
         [open]="!!deleting()"
@@ -57,16 +124,116 @@ import {ContactListComponent} from './contact-list.component';
         [confirmLabel]="'common.delete' | transloco"
         [cancelLabel]="'common.cancel' | transloco"
         (confirmed)="doDelete(target)"
-        (dismissed)="deleting.set(null)" />
+        (dismissed)="deleting.set(null)"
+      />
     }
   `,
-  styles: [`
-    .page-header { display: flex; justify-content: space-between; align-items: center; }
-    .filters { display: flex; gap: .5rem; margin: .5rem 0 1rem; }
-    .error-msg { display: flex; align-items: center; justify-content: space-between;
-      gap: .5rem; padding: .5rem .75rem; margin: .5rem 0; border-radius: 6px;
-      background: var(--danger-tint); border: 1px solid var(--danger-tint); color: var(--danger); }
-  `],
+  styles: [
+    `
+      :host {
+        display: block;
+        height: 100%;
+      }
+
+      .page {
+        display: flex;
+        flex-direction: column;
+        height: 100%;
+      }
+
+      .page-toggle {
+        padding: 8px 12px;
+        flex-shrink: 0;
+      }
+
+      .page-toggle:not(:has(.sidebar-toggle)) {
+        display: none;
+      }
+
+      .page-content {
+        flex: 1;
+        min-height: 0;
+        overflow-y: auto;
+        padding: 8px 16px 24px;
+        max-width: var(--content-max-width);
+        width: 100%;
+        margin: 0 auto;
+      }
+
+      .header {
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: 16px;
+        margin-bottom: 16px;
+      }
+
+      .header__title {
+        margin: 0;
+        font-family: var(--font-display);
+      }
+
+      .header__subtitle {
+        margin: 2px 0 0;
+        color: var(--text-muted);
+        font-size: 0.85rem;
+        max-width: 60ch;
+      }
+
+      .banner {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 8px 8px 8px 12px;
+        margin-bottom: 12px;
+        border: 1px solid var(--danger);
+        border-radius: var(--radius-control);
+        background: var(--danger-tint);
+        color: var(--danger);
+      }
+
+      .banner__text {
+        flex: 1;
+        font-size: 0.85rem;
+      }
+
+      .filters {
+        display: flex;
+        gap: 8px;
+        margin-bottom: 16px;
+      }
+
+      .filters__search {
+        flex: 1;
+        min-width: 0;
+      }
+
+      .filters__select {
+        flex: 0 0 auto;
+      }
+
+      .loading {
+        display: grid;
+        place-items: center;
+        padding: 48px 0;
+      }
+
+      @media (max-width: 640px) {
+        .header {
+          flex-direction: column;
+          align-items: stretch;
+        }
+
+        .filters {
+          flex-wrap: wrap;
+        }
+
+        .filters__search {
+          flex: 1 0 100%;
+        }
+      }
+    `,
+  ],
 })
 export class ContactsPageComponent implements OnInit {
   private readonly api = inject(ContactsService);
@@ -82,6 +249,7 @@ export class ContactsPageComponent implements OnInit {
   readonly editing = signal<Contact | null>(null);
   readonly deleting = signal<Contact | null>(null);
   readonly saveError = signal<string | null>(null);
+  readonly loading = signal(true);
   readonly q = signal('');
   readonly channel = signal('');
   readonly projectId = signal('');
@@ -94,7 +262,15 @@ export class ContactsPageComponent implements OnInit {
   reload(): void {
     this.api.list({q: this.q() || undefined, channel: this.channel() || undefined,
                    project_id: this.projectId() || undefined})
-      .subscribe(rows => this.contacts.set(rows));
+      .subscribe({
+        next: rows => { this.contacts.set(rows); this.loading.set(false); },
+        error: () => {
+          // The list is the page: a failed load must not leave a spinner
+          // spinning forever with no explanation.
+          this.loading.set(false);
+          this.saveError.set(this.transloco.translate('contacts.loadError'));
+        },
+      });
   }
 
   private loadProjects(): void {
