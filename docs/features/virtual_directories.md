@@ -20,8 +20,32 @@ related:
 
 > Agent-facing framework files — `tools/`, `contacts/`, `instructions.md`, and later `plan.md` / `todos.yaml` — served from live state through the workspace file tools instead of written to the workspace filesystem. Nothing goes stale after a snapshot restore, nothing leaks into a repo or backup, and agent-authored state stops dying with the pod.
 
-**Status:** Design approved 2026-07-30 (brainstorm + prior-art review); scope extended the same day to instruction/organization files. Not yet implemented.
+**Status:** Slice 1 **IMPLEMENTED and LIVE-GATED on dev** 2026-08-01 (agent image `sha-f41970a`). Design approved 2026-07-30; scope extended the same day to instruction/organization files. Slice 2 (writable `plan.md` / `todos.yaml`) not started.
 **Filed:** 2026-07-30
+
+### Live gate — dev, 2026-08-01 (job `97c7a8aa`, sandbox tier, project `knaeckebrothero's Project`)
+
+PASSED, evidenced by the job's audit trail plus direct `kubectl exec` inspection of the workspace pod's real filesystem:
+
+| Check | Result |
+|---|---|
+| Root listing | `tools/`, `contacts/`, `instructions.md`, `task_brief.md` all present to the agent |
+| `tools/README.md` | served, correct index |
+| `tools/get_document_info.md` | **full docstring**, not the short blurb — the pre-override binding holds in production |
+| write into `tools/` | rejected: *"…is inside the virtual directory 'tools', which is generated from live state and cannot be written to. Copy a file out…"* |
+| copy-out | `Copied: tools/README.md -> my_tools_copy.md`, real editable file on disk |
+| `search_files` | merged: 5 hits under `tools/`, 10 from real files |
+| unknown name under a prefix | clean `File not found` — no fall-through to a stale real file |
+| `file_exists` | agrees with reads on both a present and an absent virtual entry |
+| `contacts/README.md` | *"No contacts are linked to this project."* — live fetch, server-derived project, empty-project path |
+| `instructions.md` / `task_brief.md` | served virtually; **absent from the real filesystem** |
+| `.srw_seeded` | **present on the real filesystem** — the replacement sentinel is written |
+
+**Tool-layer boundary confirmed directly:** the workspace pod's real `/home/agent-host/workspace` contains `.srw_seeded`, `README.md`, `plan.md`, `my_tools_copy.md`, `archive/`, `knowledge/`, `output/`, `reference/`, `skills/`, `.git/` — and **no** `instructions.md`, **no** `task_brief.md`, **no** `contacts/`. Stronger evidence than the planned `run_command("ls")` check, which could not run (`worker_base` ships `tools.shell: []`).
+
+**Not exercised, still owed:** the tier-upgrade path (virtual→sandbox mid-job); the cloud-sync scenario (session-only — MCP has no session chat-send, so it needs a human-driven Cockpit session with contacts linked and sync on); the same-pod resume and git-less-resume scenarios; and the `VIRTUAL_DIRS_ENABLED=false` rollback smoke.
+
+**Gate finding (minor):** `config/worker_base.yaml:50` still lists `tools/` in the workspace `structure`, so `initialize()` creates an empty real `tools/` directory that nothing writes to. Harmless — the overlay owns the whole prefix and the boot sweep correctly leaves it alone (no generated marker) — but it is dead scaffolding and should be dropped from `structure`.
 
 ## Motivation
 
