@@ -470,6 +470,69 @@ class KnowledgeStore:
         )
         return result is not None
 
+    async def get_note_revisions(
+        self,
+        project_id: uuid.UUID,
+        note_id: str,
+        limit: int = 20,
+    ) -> List[Dict[str, Any]]:
+        """Prior versions of a note, newest change first (attributable history).
+
+        Reads ``knowledge_note_revisions`` — rows cut by the ``knowledge_index``
+        capture triggers (vector migration 0016, workspace_and_change_records.md
+        §6.2), one per content/title-changing UPDATE and one per DELETE. Each
+        dict is the note as it stood BEFORE that change, plus the change
+        envelope: ``action`` ('update'|'delete'), ``replaced_by_job_id`` (the
+        job whose write displaced this version; NULL for deletes) and
+        ``changed_at``. Revisions carry no embedding/search_doc by design —
+        a restore re-embeds through the normal upsert path.
+
+        Args:
+            project_id: Project UUID
+            note_id: Note slug
+            limit: Max revisions returned (newest first)
+
+        Returns:
+            List of revision dicts, most recent change first
+        """
+        rows = await self.db.fetch(
+            """
+            SELECT id, project_id, note_id, title, note_type, status,
+                   confidence, tags, keywords, job_id, phase, content,
+                   created_at, modified_at, action, replaced_by_job_id,
+                   changed_at
+            FROM knowledge_note_revisions
+            WHERE project_id = $1 AND note_id = $2
+            ORDER BY changed_at DESC
+            LIMIT $3
+            """,
+            project_id,
+            note_id,
+            limit,
+        )
+        return [
+            {
+                "id": r["id"],
+                "note_id": r["note_id"],
+                "project_id": r["project_id"],
+                "title": r["title"],
+                "note_type": r["note_type"],
+                "status": r["status"],
+                "confidence": r["confidence"],
+                "tags": r["tags"] or [],
+                "keywords": r["keywords"] or [],
+                "job_id": r["job_id"],
+                "phase": r["phase"],
+                "content": r["content"],
+                "created_at": r["created_at"],
+                "modified_at": r["modified_at"],
+                "action": r["action"],
+                "replaced_by_job_id": r["replaced_by_job_id"],
+                "changed_at": r["changed_at"],
+            }
+            for r in rows
+        ]
+
     # =========================================================================
     # Chunk-granular index — OKF files-canonical KB slice 3 (§5.1)
     #

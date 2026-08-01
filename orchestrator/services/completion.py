@@ -634,6 +634,49 @@ async def apply_deliverable_gate(
     )
 
 
+async def write_job_change_record(
+    job: dict[str, Any],
+    new_status: str,
+    *,
+    gitea: Any,
+    vector_db: Any = None,
+    error: str | None = None,
+) -> bool:
+    """General per-job change record — the completion-path hook (§6.5).
+
+    The invariant (docs/features/workspace_and_change_records.md §5/§6.5):
+    every repo-backed job leaves exactly ONE record on the project repo's
+    ``main`` on reaching a terminal status (``completed`` | ``failed``) —
+    including jobs that merged nothing and failed jobs (a failure is
+    information). Jobs with no ``repo_name`` are skipped silently and safely.
+
+    Loop jobs are skipped here: the loop advance records them itself
+    (``_merge_and_retro_loop_job`` → ``write_loop_retro``) with the merge
+    outcome it just produced — detected via the same loop-context stamp the
+    loop service keys off (``context.loop_id``, ``job_loop_id``). Belt and
+    braces, the writer is additionally idempotent by job id (an existing
+    ``retros/*-<jobid8>.md`` blocks a second write).
+
+    Thin hook by design — rendering, ``changes`` derivation and the
+    idempotence check live in ``services.job_records`` (same extraction
+    pattern as ``apply_deliverable_gate`` above). Best-effort: the writer
+    logs and swallows its own failures; a record must never block
+    completion handling.
+    """
+    from services.job_records import write_job_record
+    from services.project_loops import job_loop_id
+
+    if job_loop_id(job):
+        return False
+    return await write_job_record(
+        gitea,
+        job,
+        status=new_status,
+        error=error,
+        vector_db=vector_db,
+    )
+
+
 def _get_ctx(job: dict[str, Any]) -> dict[str, Any]:
     """workspace_container sub-dict from a job row's context JSONB."""
     ctx = job.get("context") or {}
@@ -1078,8 +1121,13 @@ def determine_job_status(
         # (Carve-out (2) below handles the single-report dual-payload case; this
         # covers the already-persisted row regardless of which trailing op raised
         # the error.) Return "no change" so the successful status stands.
+        # ``curated`` (§6.4) is the same evidence as ``merged``: the job's
+        # contribution is already on ``main``.
         # docs/done/coincident_infra_error_overrides_reported_job_outcome.md
-        if job.get("status") == "completed" or job.get("merge_status") == "merged":
+        if job.get("status") == "completed" or job.get("merge_status") in (
+            "merged",
+            "curated",
+        ):
             logger.warning(
                 "Job %s: ignoring a coincident error on an already-successful job "
                 "(status=%s, merge_status=%s): %s",

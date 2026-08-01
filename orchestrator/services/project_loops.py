@@ -21,8 +21,15 @@ import base64
 import json
 import logging
 import os
-from datetime import UTC, datetime
+from datetime import datetime
 from typing import Any
+
+# ``write_loop_retro`` moved to ``services.job_records`` (the §6.5
+# generalisation of the per-job record — one renderer for loop retros and
+# general job records). The ``as`` re-export keeps this module the loop
+# path's import surface (main.py, tests) with the loop's path, frontmatter
+# and body byte-identical to the pre-move writer.
+from services.job_records import write_loop_retro as write_loop_retro
 
 logger = logging.getLogger(__name__)
 
@@ -1093,85 +1100,234 @@ async def merge_loop_job_branch(
     return "merged", sha
 
 
-_RETRO_NOTES_LIMIT = 6000
+def _contracted_file_deliverables(job: dict[str, Any]) -> list[str]:
+    """The job's FILE deliverables (canonical, ``kb:`` entries dropped).
+
+    Same manifest source and normalization as the seal-side gate
+    (``services.deliverable_gate``): ``context.required_deliverables``,
+    ``repo/`` prefix and ``./`` stripped. ``kb:`` entries are store-backed,
+    never files — a contract of only those curates nothing.
+    """
+    from services.deliverable_gate import (
+        KB_DELIVERABLE_PREFIX,
+        parse_required_deliverables,
+    )
+
+    manifest = parse_required_deliverables(job.get("context"))
+    return [p for p in manifest if not p.startswith(KB_DELIVERABLE_PREFIX)]
 
 
-async def write_loop_retro(
+async def merge_loop_job_contribution(
     gitea_client: Any,
     job: dict[str, Any],
     *,
-    ctx: dict[str, Any],
-    merge_status: str,
-    merged_sha: str | None,
-    failed: bool = False,
-    error: str | None = None,
-) -> bool:
-    """Record a loop job's outcome as ``retros/NNN-<role>-<jobid8>.md`` on ``main``.
+    ctx: dict[str, Any] | None = None,
+) -> tuple[str, str | None, list[str]]:
+    """Land a completed loop job's contribution on ``main`` — curated when
+    the job carries a file-deliverable contract, full squash-merge otherwise.
 
-    Orchestrator-written AFTER the merge outcome is known, so the retro
-    carries mechanical truth (merge status + SHA) next to the agent's own
-    ``freeze_data`` completion notes — critics read this instead of trusting
-    KB self-reports from destroyed workspaces (F40). Best-effort: failures
-    must never block the loop advance.
+    The §6.4 change (docs/features/workspace_and_change_records.md): a job
+    with ``required_deliverables`` naming at least one FILE gets a **curated
+    merge** — the contracted files are copied from the branch head onto
+    ``main`` as ONE commit and *nothing else merges*. The branch becomes a
+    genuine scratchpad: stray ``.venv``s and scratch files stop accumulating
+    into permanent shared history. The audit PR is still created, then
+    closed UNMERGED with a comment naming the retro record and the curated
+    commit. Jobs with no contract (or a ``kb:``-only one) take the exact
+    ``merge_loop_job_branch`` path — behaviour byte-identical to today.
+
+    Returns ``(merge_status, merged_sha, merge_notes)``. ``merge_status``
+    adds ``curated`` to the existing vocabulary (``merged`` / ``empty`` /
+    ``merge-failed`` / ``skipped``); for ``curated`` the SHA is the curated
+    commit on ``main``. ``merge_notes`` are orchestrator observations for
+    the retro's ``## Merge notes`` section: what was curated (and at which
+    branch spelling), contracted paths missing from the branch, and any
+    fallback warning.
+
+    Fallback rules — never lose work to a curation bug:
+
+    * Mechanical failure mid-curation (unreadable tree/blob, refused commit,
+      any unexpected error) → today's full squash-merge, with a warning
+      note. Only reachable BEFORE the curated commit exists; afterwards a
+      full merge would re-land the whole branch on top of it.
+    * NONE of the contracted files on the branch → full merge + warning (an
+      empty curation would silently discard whatever work exists; policing
+      missing deliverables is the deliverable gate's job, not the merge's).
+    * Some missing → curate what exists, list the missing paths.
     """
+    files_contract = _contracted_file_deliverables(job)
+    if not files_contract:
+        status, sha = await merge_loop_job_branch(gitea_client, job)
+        return status, sha, []
+
+    # Structural guards — same vocabulary and same order as the full merge.
     repo_name = job.get("repo_name")
-    if not repo_name:
-        return False
+    branch = job.get("branch_name")
+    if not repo_name or not branch or branch == "main":
+        return "skipped", None, []
+    compare = await gitea_client.get_compare(repo_name, "main", branch)
+    if compare is None:
+        return "merge-failed", None, []
+    if not compare.get("total_commits"):
+        return "empty", None, []
+
+    from services.job_records import loop_retro_path, loop_role_iteration
 
     job_id = str(job.get("id"))
-    role = ctx.get("loop_role") or job.get("config_name") or "unknown"
+    role, _ = loop_role_iteration(job, ctx or {})
+
+    async def _fallback(reason: str) -> tuple[str, str | None, list[str]]:
+        logger.warning(
+            "curated merge for job %s fell back to full squash-merge: %s",
+            job_id[:8],
+            reason,
+        )
+        status, sha = await merge_loop_job_branch(gitea_client, job)
+        return (
+            status,
+            sha,
+            [f"curated merge FELL BACK to full squash-merge: {reason}"],
+        )
+
+    # ------------------------------------------------------------------
+    # Curation phase — every failure here falls back to the full merge.
+    # ------------------------------------------------------------------
     try:
-        iteration = int(ctx.get("loop_iteration") or 0)
-    except (TypeError, ValueError):
-        iteration = 0
+        branch_tree = await gitea_client.list_tree(repo_name, branch)
+        if branch_tree is None:
+            return await _fallback(f"branch tree unreadable at {repo_name}@{branch}")
+        branch_paths = {
+            str(entry.get("path"))
+            for entry in branch_tree
+            if entry.get("type") == "blob" and entry.get("path")
+        }
 
-    freeze = job.get("freeze_data")
-    if isinstance(freeze, str):
-        try:
-            freeze = json.loads(freeze)
-        except (json.JSONDecodeError, ValueError):
-            freeze = {"notes": freeze}
-    notes = (freeze or {}).get("notes") or "(none recorded)"
-    if len(notes) > _RETRO_NOTES_LIMIT:
-        notes = notes[:_RETRO_NOTES_LIMIT] + "\n\n[truncated]"
+        # Variant resolution (F14 both-spellings rule, mirroring
+        # src/core/deliverables.deliverable_path_variants): the canonical
+        # path first, then the ``repo/``-prefixed checkout spelling. The
+        # blob is written back to the SAME path it was found at.
+        resolved: list[tuple[str, str]] = []  # (canonical, path on branch)
+        missing: list[str] = []
+        for canonical in files_contract:
+            for variant in (canonical, f"repo/{canonical}"):
+                if variant in branch_paths:
+                    resolved.append((canonical, variant))
+                    break
+            else:
+                missing.append(canonical)
 
-    description = (job.get("description") or "").splitlines()[0].strip()
-    lines = [
-        "---",
-        "type: retro",
-        f"iteration: {iteration}",
-        f"role: {role}",
-        f"job: {job_id}",
-        f"branch: {job.get('branch_name') or '~'}",
-        f"status: {'failed' if failed else 'completed'}",
-        f"merge_status: {merge_status}",
-        f"merge_sha: {merged_sha or '~'}",
-        f"created: {datetime.now(UTC).isoformat(timespec='seconds')}",
-        "---",
-        "",
-        f"# Loop iter {iteration} · {role}",
-        "",
-        description,
-        "",
-        "## Agent completion notes",
-        "",
-        notes,
-    ]
-    if failed and error:
-        lines += ["", "## Error", "", str(error)[:2000]]
-    content = "\n".join(lines) + "\n"
+        if not resolved:
+            return await _fallback(
+                f"none of the {len(files_contract)} contracted file "
+                f"deliverable(s) exist on the branch — an empty curation "
+                f"would discard whatever work exists"
+            )
 
-    path = f"retros/{iteration:03d}-{role}-{job_id[:8]}.md"
-    return bool(
-        await gitea_client.change_files(
-            repo_name,
-            "main",
-            [
+        main_tree = await gitea_client.list_tree(repo_name, "main")
+        if main_tree is None:
+            return await _fallback(f"main tree unreadable at {repo_name}")
+        main_paths = {
+            str(entry.get("path"))
+            for entry in main_tree
+            if entry.get("type") == "blob" and entry.get("path")
+        }
+
+        files: list[dict[str, str]] = []
+        for canonical, path in resolved:
+            blob = await gitea_client.get_file_bytes(repo_name, path, ref=branch)
+            if blob is None:
+                return await _fallback(f"blob unreadable at {path}@{branch}")
+            files.append(
                 {
                     "path": path,
-                    "content_b64": base64.b64encode(content.encode()).decode(),
+                    "content_b64": base64.b64encode(blob).decode(),
+                    # ``create`` on an existing path is a Gitea 422; pick per
+                    # file against main's tree.
+                    "operation": "update" if path in main_paths else "create",
                 }
-            ],
-            message=f"retro: iter {iteration:03d} {role} ({job_id[:8]}) — {merge_status}",
+            )
+    except Exception as e:  # noqa: BLE001 — a curation bug must not lose work
+        return await _fallback(f"unexpected curation error: {e!r}")
+
+    message = f"curated merge: {role} ({job_id[:8]}) — {len(files)} deliverable(s)"
+    try:
+        committed = await gitea_client.change_files(
+            repo_name, "main", files, message=message
         )
+    except Exception as e:  # noqa: BLE001
+        return await _fallback(f"curated commit raised: {e!r}")
+    if not committed:
+        return await _fallback("curated commit refused by change_files")
+
+    # ------------------------------------------------------------------
+    # The curated commit is on ``main`` — the point of no return. From here
+    # every failure is a note, NEVER a fallback (a full merge now would
+    # re-land the whole branch on top of the curated files).
+    # ------------------------------------------------------------------
+    notes: list[str] = []
+    try:
+        curated_sha = await gitea_client.get_branch_head_sha(repo_name, "main")
+    except Exception:  # noqa: BLE001 — sha is provenance, not load-bearing
+        curated_sha = None
+    sha8 = (curated_sha or "")[:8] or "?"
+    notes.append(
+        f"curated merge: {len(resolved)}/{len(files_contract)} contracted "
+        f"deliverable(s) copied to main @ {sha8}"
     )
+    for canonical, path in resolved:
+        notes.append(
+            f"merged {canonical}"
+            + (f" (branch spelling: {path})" if path != canonical else "")
+        )
+    for canonical in missing:
+        notes.append(
+            f"contracted deliverable NOT on the branch (not curated): {canonical}"
+        )
+
+    # Audit-PR ceremony: the numbered PR documents the branch's full diff,
+    # then closes unmerged — the branch stays behind as the scratchpad's
+    # audit log. Strictly best-effort.
+    try:
+        record_path = loop_retro_path(job, ctx or {})
+        title = (job.get("description") or "").splitlines()[0].strip()[:200] or (
+            f"Loop job {job_id[:8]}"
+        )
+        pr = await gitea_client.create_pr(
+            repo_name,
+            title=title,
+            head=branch,
+            base="main",
+            body=f"job: {job_id}\nbranch: {branch}",
+        )
+        if pr:
+            await gitea_client.comment_on_pr(
+                repo_name,
+                pr["number"],
+                (
+                    f"Curated merge (§6.4): {len(resolved)} contracted "
+                    f"deliverable(s) landed on `main` as `{curated_sha or '?'}`.\n"
+                    f"Record: `{record_path}`\n\n"
+                    f"This PR is the branch's audit trail and is closed "
+                    f"WITHOUT merging — the branch is a scratchpad; only "
+                    f"contracted deliverables merge."
+                ),
+            )
+            closed = await gitea_client.close_pr(repo_name, pr["number"])
+            if not closed:
+                notes.append(
+                    f"audit PR #{pr['number']} could not be closed "
+                    f"(left open, unmerged)"
+                )
+        else:
+            notes.append("audit PR could not be created (curated commit landed)")
+    except Exception as e:  # noqa: BLE001 — ceremony must not flip the outcome
+        notes.append(f"audit PR ceremony failed: {e!r}")
+
+    logger.info(
+        "curated merge for job %s: %d/%d deliverable(s) → main (%s)",
+        job_id[:8],
+        len(resolved),
+        len(files_contract),
+        sha8,
+    )
+    return "curated", curated_sha, notes

@@ -537,13 +537,19 @@ class GiteaClient:
         files: list[dict],
         message: str,
     ) -> bool:
-        """Create multiple files in a SINGLE commit via Gitea's ChangeFiles API.
+        """Write multiple files in a SINGLE commit via Gitea's ChangeFiles API.
 
         Args:
             repo_name: Repository name.
             branch: Target branch.
-            files: list of ``{"path": str, "content_b64": str}`` — each created
-                (base64 content keeps binary files byte-faithful).
+            files: list of ``{"path": str, "content_b64": str}`` with an
+                optional ``"operation"`` of ``create`` (default) or ``update``
+                (base64 content keeps binary files byte-faithful). ``update``
+                needs no blob SHA: Gitea validates against the branch head
+                commit when none is given — but ``create`` on an existing path
+                is a 422, so callers writing over unknown state must pick the
+                operation per file (see the curated merge in
+                ``services.project_loops``).
             message: Commit message.
 
         Returns:
@@ -559,7 +565,11 @@ class GiteaClient:
             "branch": branch,
             "message": message,
             "files": [
-                {"operation": "create", "path": f["path"], "content": f["content_b64"]}
+                {
+                    "operation": f.get("operation", "create"),
+                    "path": f["path"],
+                    "content": f["content_b64"],
+                }
                 for f in files
             ],
         }
@@ -1402,6 +1412,78 @@ class GiteaClient:
 
         except httpx.HTTPError as e:
             logger.warning(f"Failed to merge PR #{pr_index} in {repo_name}: {e}")
+            return False
+
+    async def close_pr(self, repo_name: str, pr_index: int) -> bool:
+        """Close a pull request WITHOUT merging it.
+
+        Used by the curated merge (workspace_and_change_records.md §6.4): the
+        contracted deliverables land on ``main`` as their own commit, and the
+        PR stays behind — closed, unmerged — as the branch's audit trail.
+
+        Args:
+            repo_name: Repository name
+            pr_index: PR number/index
+
+        Returns:
+            True if closed, False on failure.
+        """
+        if not self._initialized:
+            return False
+
+        client = self._get_client()
+
+        try:
+            resp = await client.patch(
+                f"{self._url}/api/v1/repos/{self._user}/{repo_name}/pulls/{pr_index}",
+                json={"state": "closed"},
+            )
+            if resp.status_code in (200, 201):
+                logger.info(f"Closed PR #{pr_index} in {repo_name} (unmerged)")
+                return True
+            logger.warning(
+                f"Failed to close PR #{pr_index} in {repo_name} "
+                f"(status {resp.status_code}): {resp.text[:200]}"
+            )
+            return False
+        except httpx.HTTPError as e:
+            logger.warning(f"Failed to close PR #{pr_index} in {repo_name}: {e}")
+            return False
+
+    async def comment_on_pr(self, repo_name: str, pr_index: int, body: str) -> bool:
+        """Post a comment on a pull request.
+
+        Gitea serves PR comments through the issues API (a PR is an issue
+        with code attached), hence the ``/issues/`` path.
+
+        Args:
+            repo_name: Repository name
+            pr_index: PR number/index
+            body: Comment body (markdown)
+
+        Returns:
+            True if the comment was created, False on failure.
+        """
+        if not self._initialized:
+            return False
+
+        client = self._get_client()
+
+        try:
+            resp = await client.post(
+                f"{self._url}/api/v1/repos/{self._user}/{repo_name}"
+                f"/issues/{pr_index}/comments",
+                json={"body": body},
+            )
+            if resp.status_code in (200, 201):
+                return True
+            logger.warning(
+                f"Failed to comment on PR #{pr_index} in {repo_name} "
+                f"(status {resp.status_code}): {resp.text[:200]}"
+            )
+            return False
+        except httpx.HTTPError as e:
+            logger.warning(f"Failed to comment on PR #{pr_index} in {repo_name}: {e}")
             return False
 
     async def rename_repo(self, old_name: str, new_name: str) -> bool:

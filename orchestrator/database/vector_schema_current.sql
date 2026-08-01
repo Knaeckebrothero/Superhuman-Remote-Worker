@@ -270,6 +270,39 @@ $$;
 
 
 --
+-- Name: knowledge_index_capture_revision(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.knowledge_index_capture_revision() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+    v_action TEXT := 'delete';
+    v_replaced_by UUID := NULL;        -- a deleted version was replaced by nothing
+BEGIN
+    IF TG_OP = 'UPDATE' THEN
+        v_action := 'update';
+        v_replaced_by := NEW.job_id;
+    END IF;
+    INSERT INTO knowledge_note_revisions (
+        project_id, note_id, title, note_type, status, confidence,
+        tags, keywords, job_id, phase, content, created_at, modified_at,
+        action, replaced_by_job_id
+    ) VALUES (
+        OLD.project_id, OLD.note_id, OLD.title, OLD.note_type, OLD.status,
+        OLD.confidence, OLD.tags, OLD.keywords, OLD.job_id, OLD.phase,
+        OLD.content, OLD.created_at, OLD.modified_at,
+        v_action, v_replaced_by
+    );
+    IF TG_OP = 'DELETE' THEN
+        RETURN OLD;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
 -- Name: knowledge_multi_project_hybrid_search(text, public.vector, uuid[], integer, double precision, double precision, double precision, integer); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -647,6 +680,32 @@ CREATE TABLE public.knowledge_links (
 
 
 --
+-- Name: knowledge_note_revisions; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.knowledge_note_revisions (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    project_id uuid NOT NULL,
+    note_id character varying(100) NOT NULL,
+    title text NOT NULL,
+    note_type character varying(50) NOT NULL,
+    status character varying(50),
+    confidence character varying(20),
+    tags text[] DEFAULT '{}'::text[],
+    keywords text[] DEFAULT '{}'::text[],
+    job_id uuid,
+    phase integer,
+    content text NOT NULL,
+    created_at timestamp with time zone,
+    modified_at timestamp with time zone,
+    action character varying(10) NOT NULL,
+    replaced_by_job_id uuid,
+    changed_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT valid_revision_action CHECK (((action)::text = ANY ((ARRAY['update'::character varying, 'delete'::character varying])::text[])))
+);
+
+
+--
 -- Name: memory_retrieval_messages; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -896,6 +955,14 @@ ALTER TABLE ONLY public.knowledge_index
 
 ALTER TABLE ONLY public.knowledge_links
     ADD CONSTRAINT knowledge_links_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: knowledge_note_revisions knowledge_note_revisions_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.knowledge_note_revisions
+    ADD CONSTRAINT knowledge_note_revisions_pkey PRIMARY KEY (id);
 
 
 --
@@ -1149,6 +1216,13 @@ CREATE INDEX idx_knowledge_links_target ON public.knowledge_links USING btree (k
 
 
 --
+-- Name: idx_knowledge_note_revisions_note; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_knowledge_note_revisions_note ON public.knowledge_note_revisions USING btree (project_id, note_id, changed_at DESC);
+
+
+--
 -- Name: idx_knowledge_project; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -1370,6 +1444,20 @@ CREATE INDEX schema_migrations_dirty_idx ON public.schema_migrations USING btree
 --
 
 CREATE UNIQUE INDEX uq_knowledge_kb_path ON public.knowledge_index USING btree (kb_id, path) WHERE ((kb_id IS NOT NULL) AND (path IS NOT NULL));
+
+
+--
+-- Name: knowledge_index trg_knowledge_index_revision_delete; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_knowledge_index_revision_delete BEFORE DELETE ON public.knowledge_index FOR EACH ROW EXECUTE FUNCTION public.knowledge_index_capture_revision();
+
+
+--
+-- Name: knowledge_index trg_knowledge_index_revision_update; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_knowledge_index_revision_update BEFORE UPDATE ON public.knowledge_index FOR EACH ROW WHEN (((old.content IS DISTINCT FROM new.content) OR (old.title IS DISTINCT FROM new.title))) EXECUTE FUNCTION public.knowledge_index_capture_revision();
 
 
 --
