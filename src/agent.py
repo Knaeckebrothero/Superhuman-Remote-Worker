@@ -176,6 +176,67 @@ def _format_delegation_results(delegation_results: list) -> str:
     return "\n".join(lines)
 
 
+# The branch a job's work belongs on when the job row carries no explicit
+# ``branch_name``. NULL does not mean "any branch is fine" — it means the job
+# lives on the repo's default branch, which is exactly how every *reader*
+# resolves it (``job.get("branch_name") or "main"`` in
+# orchestrator/services/diff_source.py, deliverable_gate.py, ide_session.py,
+# job_cloud_baseline.py and orchestrator/main.py).
+DEFAULT_JOB_BRANCH = "main"
+
+
+def ensure_job_branch(git_mgr, metadata: Optional[Dict[str, Any]], job_id: str = ""):
+    """Put a re-attached working tree back on the branch this job owns.
+
+    Only the paths that attach to a *pre-existing* tree need this. A fresh
+    clone already lands on the branch it was told to check out, but a workspace
+    that is re-attached (PVC reattach) or resumed in place keeps whatever branch
+    the previous occupant left checked out — and the previous occupant may have
+    been a *subjob*. Critic/scholar subjobs run on
+    ``subjob/<short_id>/<config>`` branches (orchestrator/services/
+    job_provisioning.py:164), so a parent resumed after one of them can silently
+    continue on the subjob's branch. Its commits then push to that branch and
+    ``main`` never advances, while every reader (critic, cockpit, MCP,
+    ``get_workspace_file``, and any later re-clone) still reads ``main`` and
+    correctly reports the work missing.
+
+    See docs/issues/edit_file_append_lost_across_feedback_resume.md — job
+    6df02f64, where a ``## Sources`` append was committed and pushed to
+    ``subjob/50dee4ae/critic`` and was never visible on ``main``.
+
+    Never raises: a workspace we cannot re-point is still usable, and failing
+    the job over it would be worse than the drift. Failures are logged at
+    WARNING because this whole bug class is defined by its silence.
+
+    Returns:
+        The branch the tree is on afterwards, or None if it could not be read.
+    """
+    if git_mgr is None:
+        return None
+
+    # A NULL branch_name is the *standalone job* case, not an opt-out: that job
+    # owns the default branch. Treating it as "leave the tree wherever it is" is
+    # what let a parent inherit a critic subjob's branch.
+    expected = (metadata or {}).get("branch_name") or DEFAULT_JOB_BRANCH
+
+    try:
+        current = git_mgr.current_branch()
+        if current == expected:
+            return current
+        if not git_mgr.checkout_branch(expected):
+            logger.warning(
+                f"[{job_id}] Resume: could not switch workspace from branch "
+                f"{current!r} to {expected!r} — commits will land on {current!r} "
+                f"and {expected!r} will not advance"
+            )
+            return current
+        logger.info(f"[{job_id}] Switched to expected branch: {expected}")
+        return expected
+    except Exception as e:  # noqa: BLE001 - never fail a resume over branch drift
+        logger.warning(f"[{job_id}] Resume: branch ensure failed: {e}")
+        return None
+
+
 class UniversalAgent:
     """
     Configurable autonomous agent using workspace-centric architecture.
@@ -2289,12 +2350,11 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                 self._workspace_manager._initialized = True
                 if metadata.get("git_remote_url"):
                     git_mgr.add_remote("origin", metadata["git_remote_url"])
-                if metadata.get("branch_name"):
-                    try:
-                        if git_mgr.current_branch() != metadata["branch_name"]:
-                            git_mgr.checkout_branch(metadata["branch_name"])
-                    except Exception as e:
-                        logger.warning(f"Reattach: branch ensure failed: {e}")
+            # Re-point the tree at the branch this job owns — whether the handle
+            # was just attached above or one already existed. A re-attached PVC
+            # keeps whatever branch its previous occupant (possibly a subjob)
+            # left checked out.
+            ensure_job_branch(self._workspace_manager.git_manager, metadata, job_id)
             # instructions.md is virtual (docs/features/virtual_directories.md)
             # and cannot go missing, so the old "rewrite if vanished" guard is
             # gone; the upload source (if any) was already resolved at the top
@@ -2400,13 +2460,9 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                     "origin", metadata["git_remote_url"]
                 )
 
-            # Ensure correct branch for project jobs
-            if metadata.get("branch_name") and self._workspace_manager.git_manager:
-                current = self._workspace_manager.git_manager.current_branch()
-                expected = metadata["branch_name"]
-                if current != expected:
-                    self._workspace_manager.git_manager.checkout_branch(expected)
-                    logger.info(f"Switched to expected branch: {expected}")
+            # Ensure the tree is on the branch this job owns (not whatever a
+            # previous occupant — e.g. a critic subjob — left checked out).
+            ensure_job_branch(self._workspace_manager.git_manager, metadata, job_id)
 
             # Create todo manager for this workspace
             self._todo_manager = TodoManager(
