@@ -79,6 +79,15 @@ _check "agent-chromium executable" test -x /usr/local/bin/agent-chromium
 # Chromium fails here rather than on the first agent screenshot.
 _check "agent-chromium runs"       /usr/local/bin/agent-chromium --headless --no-sandbox --version
 
+# browser-exec renders headful under Xvfb by default (BROWSER_EXEC_HEADFUL), so
+# a missing Xvfb silently downgrades every workspace to the headless fingerprint
+# — coherent-geometry and WebGL checks start failing on sites that gate on them,
+# with nothing in the job output saying why. Xvfb arrives via Playwright's
+# `install --with-deps`, i.e. as a transitive dependency nobody declared: exactly
+# the kind of thing that vanishes on an upstream dependency-list change. Assert
+# it like any other load-bearing binary.
+_check "Xvfb present"              command -v Xvfb
+
 # Exercises the actual browser-use/CDP stream seam, including loading, active
 # target handoff, viewer limits, and a zero-viewer restart. The program owns and
 # removes all of its temporary state so this is safe inside an image-build RUN.

@@ -58,12 +58,34 @@ def _make_tools(ctx):
     return {t.name: t for t in tools}
 
 
-def _capture_workspace():
-    """A mock workspace_manager that records write_file(path, content) calls."""
-    ws = MagicMock()
-    writes: dict = {}
-    ws.write_file.side_effect = lambda rel, content: writes.__setitem__(rel, content)
-    return ws, writes
+def _capture_materialize():
+    """Patch the server-side materialisation seam and record the rendered notes.
+
+    The OKF file is a Gitea commit the orchestrator makes now, not a workspace
+    write (docs/features/knowledge_base_repo_separation.md §7 step 4), so the
+    frontmatter these tests assert on is in the POST body.
+    Returns ``(patcher, rendered)`` with ``rendered`` keyed by note slug.
+    """
+    rendered: dict = {}
+
+    def _fake(project_id, slug, content, job_id):
+        rendered[slug] = content
+        return {"status": "committed", "path": f"knowledge/{slug}.md"}
+
+    patcher = patch(
+        "src.tools.knowledge.knowledge_tools._post_vault_file", side_effect=_fake
+    )
+    return patcher, rendered
+
+
+@pytest.fixture(autouse=True)
+def _no_materialization_http():
+    """Keep these tests off the network — kb_write/kb_update POST now."""
+    with patch(
+        "src.tools.knowledge.knowledge_tools._post_vault_file",
+        return_value={"status": "skipped", "reason": "no-repo"},
+    ):
+        yield
 
 
 class TestPriorityRoundTrip:
@@ -198,35 +220,31 @@ class TestKbWritePriorityNonTicketUnaffected:
     frontmatter — priority is scoped to feature/issue/idea tickets."""
 
     def test_decision_note_gets_no_priority_frontmatter_line(self):
-        ws, writes = _capture_workspace()
         ctx = _kb_context()
-        ctx.workspace_manager = ws
-        ctx.has_git.return_value = True
         ctx.knowledge_store.get_note_by_slug = AsyncMock(return_value=None)
         tools = _make_tools(ctx)
-        tools["kb_write"].invoke(
-            {"title": "Chose JWT", "type": "decision", "content": "body"}
-        )
-        md = writes["knowledge/chose-jwt.md"]
-        assert "priority:" not in md
+        patcher, rendered = _capture_materialize()
+        with patcher:
+            tools["kb_write"].invoke(
+                {"title": "Chose JWT", "type": "decision", "content": "body"}
+            )
+        assert "priority:" not in rendered["chose-jwt"]
 
     def test_feature_note_gets_priority_frontmatter_line(self):
-        ws, writes = _capture_workspace()
         ctx = _kb_context()
-        ctx.workspace_manager = ws
-        ctx.has_git.return_value = True
         ctx.knowledge_store.get_note_by_slug = AsyncMock(return_value=None)
         tools = _make_tools(ctx)
-        tools["kb_write"].invoke(
-            {
-                "title": "Add dark mode",
-                "type": "feature",
-                "content": "body",
-                "priority": "high",
-            }
-        )
-        md = writes["knowledge/add-dark-mode.md"]
-        assert "priority: high" in md
+        patcher, rendered = _capture_materialize()
+        with patcher:
+            tools["kb_write"].invoke(
+                {
+                    "title": "Add dark mode",
+                    "type": "feature",
+                    "content": "body",
+                    "priority": "high",
+                }
+            )
+        assert "priority: high" in rendered["add-dark-mode"]
 
 
 def _existing_ticket(**over):
@@ -317,10 +335,7 @@ class TestKbUpdatePriorityPreservationWithNeo4j:
         sentinel COALESCE'd against the real row in knowledge_store.py), so
         neither the DB row nor the frontmatter ever assert a guessed value.
         """
-        ws, writes = _capture_workspace()
         ctx = _kb_context_with_kg()
-        ctx.workspace_manager = ws
-        ctx.has_git.return_value = True
         ctx.knowledge_graph.update_note.return_value = True
         ctx.knowledge_graph.read_note.return_value = {
             "type": "feature",
@@ -332,9 +347,11 @@ class TestKbUpdatePriorityPreservationWithNeo4j:
             side_effect=Exception("pgvector hiccup")
         )
         tools = _make_tools(ctx)
-        result = tools["kb_update"].invoke(
-            {"note": "add-dark-mode", "status": "resolved"}
-        )
+        patcher, rendered = _capture_materialize()
+        with patcher:
+            result = tools["kb_update"].invoke(
+                {"note": "add-dark-mode", "status": "resolved"}
+            )
 
         # (c) a pgvector hiccup must not block the rest of the update.
         assert "status → resolved" in result
@@ -350,7 +367,7 @@ class TestKbUpdatePriorityPreservationWithNeo4j:
 
         # The frontmatter must not assert a value we don't actually know --
         # _render_note_md omits the line entirely when the key is absent.
-        md = writes["knowledge/add-dark-mode.md"]
+        md = rendered["add-dark-mode"]
         assert "priority:" not in md
 
     def test_lookback_failure_is_logged_not_swallowed(self, caplog):
@@ -937,6 +954,25 @@ class TestSpawnLoopJobBacklogWiring(_SpawnLoopJobHarness):
 # =============================================================================
 
 
+def _repo_db(**roles):
+    """A postgres double for close_backlog_ticket's KB-repo resolution.
+
+    Defaults to the shape every project on the fleet has today — one jobs
+    repo, no knowledge repo — so the close tests below keep targeting exactly
+    the repo they always did. Pass ``knowledge=[...]`` / ``jobs=[]`` to model
+    a project that has been separated, or one with no repo at all.
+    """
+    table = {"jobs": [{"name": "project-68137e29-jobs", "branch": "main"}]}
+    table.update(roles)
+
+    async def _by_role(project_id, role=None):
+        return list(table.get(role) or [])
+
+    db = AsyncMock()
+    db.get_project_repositories.side_effect = _by_role
+    return db
+
+
 class TestCloseBacklogTicket:
     @pytest.mark.asyncio
     async def test_writes_file_and_index(self):
@@ -971,6 +1007,7 @@ class TestCloseBacklogTicket:
             "68137e29-6b1f-4f1b-a0c1-4e6dc2be3f9a",
             "feature-x",
             "resolved",
+            postgres_db=_repo_db(),
         )
 
         assert ok is True
@@ -1008,6 +1045,7 @@ class TestCloseBacklogTicket:
             "68137e29-6b1f-4f1b-a0c1-4e6dc2be3f9a",
             "feature-x",
             "resolved",
+            postgres_db=_repo_db(),
         )
         assert ok is False
 
@@ -1044,6 +1082,7 @@ class TestCloseBacklogTicket:
             "68137e29-6b1f-4f1b-a0c1-4e6dc2be3f9a",
             "feature-x",
             "resolved",
+            postgres_db=_repo_db(),
         )
 
         assert ok is False  # the durable (file) write did not happen
@@ -1090,6 +1129,7 @@ class TestCloseBacklogTicket:
                 "68137e29-6b1f-4f1b-a0c1-4e6dc2be3f9a",
                 "feature-x",
                 "resolved",
+                postgres_db=_repo_db(),
             )
 
         assert ok is False
@@ -1194,6 +1234,7 @@ class TestCloseBacklogTicket:
                 "68137e29-6b1f-4f1b-a0c1-4e6dc2be3f9a",
                 "decision-verdict-1",
                 "resolved",
+                postgres_db=_repo_db(),
             )
 
         matches = [r for r in caplog.records if "0 rows" in r.message]
@@ -1235,6 +1276,7 @@ class TestCloseBacklogTicket:
                 "68137e29-6b1f-4f1b-a0c1-4e6dc2be3f9a",
                 "issue-real-ticket",
                 "resolved",
+                postgres_db=_repo_db(),
             )
 
         assert not any("0 rows" in r.message for r in caplog.records)
@@ -1274,6 +1316,7 @@ class TestCloseBacklogTicket:
             "68137e29-6b1f-4f1b-a0c1-4e6dc2be3f9a",
             "feature-x",
             "resolved",
+            postgres_db=_repo_db(),
         )
 
         assert ok is False
@@ -1313,6 +1356,7 @@ class TestCloseBacklogTicket:
                 "68137e29-6b1f-4f1b-a0c1-4e6dc2be3f9a",
                 "feature-x",
                 "resolved",
+                postgres_db=_repo_db(),
             )
         assert any("no rewritable" in r.message for r in caplog.records)
 
@@ -1358,6 +1402,7 @@ class TestCloseBacklogTicket:
                 "68137e29-6b1f-4f1b-a0c1-4e6dc2be3f9a",
                 "feature-x",
                 "resolved",
+                postgres_db=_repo_db(),
             )
 
         assert ok is False
@@ -1403,6 +1448,7 @@ class TestCloseBacklogTicket:
             "68137e29-6b1f-4f1b-a0c1-4e6dc2be3f9a",
             "feature-x",
             "resolved",
+            postgres_db=_repo_db(),
         )
 
         assert ok is True
@@ -1451,6 +1497,7 @@ class TestCloseBacklogTicket:
                 "68137e29-6b1f-4f1b-a0c1-4e6dc2be3f9a",
                 "feature-x",
                 "resolved",
+                postgres_db=_repo_db(),
             )
 
         assert not any("no rewritable" in r.message for r in caplog.records)
@@ -1459,6 +1506,120 @@ class TestCloseBacklogTicket:
         assert already, "the no-op re-close must still say what it saw"
         assert already[0].levelno == logging.DEBUG
         assert "resolved" in already[0].getMessage()
+
+
+# =============================================================================
+# KB repo separation step 2: the mirror resolves its repo, it doesn't guess
+# (docs/features/knowledge_base_repo_separation.md §5, §5a)
+# =============================================================================
+
+
+class TestCloseBacklogTicketRepoResolution:
+    """close_backlog_ticket used to build ``project-<id8>-jobs`` from the
+    project id. That is a second copy of the resolution rule, and once a
+    project has its own knowledge repo the mirror would rewrite a note in the
+    jobs repo while the reindexer reads the knowledge repo — a divergence
+    with no error anywhere (§10). It now goes through
+    ``kb_reindex.resolve_kb_repo`` like every other consumer.
+    """
+
+    PROJECT_ID = "68137e29-6b1f-4f1b-a0c1-4e6dc2be3f9a"
+
+    def _deps(self):
+        conn = MagicMock()
+        conn.execute = AsyncMock(return_value="UPDATE 1")
+
+        class _CM:
+            async def __aenter__(self):
+                return conn
+
+            async def __aexit__(self, *a):
+                return False
+
+        vector_db = MagicMock()
+        vector_db.acquire = MagicMock(return_value=_CM())
+
+        gitea = MagicMock()
+        gitea.get_file_content = AsyncMock(
+            return_value="---\nid: feature-x\ntype: feature\nstatus: active\n---\n# T\n"
+        )
+        gitea.create_or_update_file = AsyncMock(return_value=True)
+        return vector_db, gitea, conn
+
+    async def _close(self, postgres_db):
+        from orchestrator.services.project_backlog import close_backlog_ticket
+
+        vector_db, gitea, conn = self._deps()
+        ok = await close_backlog_ticket(
+            vector_db,
+            gitea,
+            self.PROJECT_ID,
+            "feature-x",
+            "resolved",
+            postgres_db=postgres_db,
+        )
+        return ok, gitea, conn
+
+    @pytest.mark.asyncio
+    async def test_jobs_repo_only_is_todays_behaviour(self):
+        """No project has a knowledge repo yet, so this is the whole fleet:
+        the mirror must land in the jobs repo, exactly where the hardcoded
+        name used to put it."""
+        ok, gitea, _conn = await self._close(_repo_db())
+
+        assert ok is True
+        assert gitea.get_file_content.await_args.args == (
+            "project-68137e29-jobs",
+            "knowledge/feature-x.md",
+        )
+        assert gitea.create_or_update_file.await_args.args[0] == "project-68137e29-jobs"
+
+    @pytest.mark.asyncio
+    async def test_knowledge_repo_wins_when_the_project_has_one(self):
+        ok, gitea, _conn = await self._close(
+            _repo_db(knowledge=[{"name": "project-68137e29-knowledge"}])
+        )
+
+        assert ok is True
+        assert gitea.get_file_content.await_args.args[0] == (
+            "project-68137e29-knowledge"
+        )
+        assert (
+            gitea.create_or_update_file.await_args.args[0]
+            == "project-68137e29-knowledge"
+        )
+
+    @pytest.mark.asyncio
+    async def test_repo_less_project_degrades_to_an_index_only_close(self, caplog):
+        """A project with neither repo has no file to mirror to. Gitea must
+        not be called at all (the old code would have asked for a repo whose
+        name it invented), the index close must still run, and the skip must
+        be logged rather than silent."""
+        import logging
+
+        with caplog.at_level(
+            logging.INFO, logger="orchestrator.services.project_backlog"
+        ):
+            ok, gitea, conn = await self._close(_repo_db(jobs=[]))
+
+        assert ok is False
+        gitea.get_file_content.assert_not_awaited()
+        gitea.create_or_update_file.assert_not_awaited()
+        conn.execute.assert_awaited_once()  # the index mirror is independent
+        assert any("no KB repo" in r.message for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_resolution_matches_the_reindexer_for_the_same_project(self):
+        """The property that matters, stated directly: whatever repo the KB
+        reindexer would read for a project is the repo the mirror writes."""
+        from orchestrator.services.kb_reindex import resolve_kb_repo
+
+        db = _repo_db(knowledge=[{"name": "project-68137e29-knowledge"}])
+        _ok, gitea, _conn = await self._close(db)
+
+        resolved = await resolve_kb_repo(db, self.PROJECT_ID)
+        assert resolved is not None
+        assert gitea.create_or_update_file.await_args.args[0] == resolved[0]
 
 
 # =============================================================================

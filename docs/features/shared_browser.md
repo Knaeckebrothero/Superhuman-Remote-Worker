@@ -104,8 +104,38 @@ surfaced six usability defects, all fixed on develop
   `--disable-blink-features=AutomationControlled` and a user agent rebuilt
   from the real binary's `--version` minus the `Headless` marker, so
   human-driven clicks stop failing bot checks on the two loudest signals.
-  Client-hint brands still expose headless; the complete fix (headful under
-  Xvfb) is deliberately deferred.
+- **Headful under Xvfb (default; `BROWSER_EXEC_HEADFUL=0` opts out).** The
+  earlier note here claimed the residual signal was client-hint brands leaking
+  `HeadlessChrome`. That is no longer true — Chrome's new headless mode reports
+  `Chromium`, `navigator.webdriver=false` and five plugins. Measuring the
+  as-shipped daemon found the real signals elsewhere, and neither involved
+  headlessness being *visible*; they were things headless *forces*:
+
+  | signal | headless (was) | headful under Xvfb (now) |
+  |---|---|---|
+  | `screen` / `outer` / `inner` | `800x600` / `780x580` / `1920x1080` | `1920x1080` / `1919x1079` / `1919x992` |
+  | geometry coherent? | **no** — page larger than its window, on a smaller monitor | yes |
+  | WebGL renderer | **none** — `getContext('webgl')` returns null | `ANGLE (…SwiftShader)` |
+  | `Notification.permission` | `granted`, unprompted | `default` |
+
+  The impossible geometry came from browser-use's `Emulation` device-metrics
+  override, which resizes the viewport without touching screen/window metrics;
+  headful drops the override and lets the real window size the viewport. WebGL
+  returns because `--disable-gpu` is replaced by ANGLE/SwiftShader. The
+  permission surface is fixed independently (`permissions=[]`) and applies in
+  both modes. Xvfb is already in both workspace images via Playwright's
+  `install --with-deps`, so this needs no new image surface — and
+  `assert-browser-stack.sh` now asserts it so the transitive dependency cannot
+  disappear silently. Missing or unstartable Xvfb degrades to headless rather
+  than failing the browser.
+
+  Still open, in descending order of value: the `Runtime.enable` CDP leak that
+  Playwright emits (needs a patched Playwright — `rebrowser-patches` or
+  Patchright — and browser-use is pinned `<0.13`, so it is a dependency
+  decision, not a config change); SwiftShader as a residual VM tell, which
+  needs a real GPU; and egress IP reputation, which no browser-side change can
+  touch. None of this makes an *unattended* agent pass reCAPTCHA — the goal is
+  that a human holding the baton can.
 
 Still deferred are the stage-2 VM artifact run and deployment-specific VM
 binding/routing attestation. Live prompt-driven handoff also needs a working

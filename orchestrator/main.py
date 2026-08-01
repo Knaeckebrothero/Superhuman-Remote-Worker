@@ -7201,6 +7201,18 @@ class KnowledgeNoteUpdate(BaseModel):
     remove_tags: list[str] | None = Field(None, description="Tags to remove")
 
 
+class KnowledgeMaterializeRequest(BaseModel):
+    """Request body for materialising one note into the project's KB repo."""
+
+    slug: str = Field(
+        ..., description="Note id — becomes knowledge/<slug>.md in the KB repo"
+    )
+    content: str = Field(..., description="Fully rendered OKF note markdown")
+    job_id: str | None = Field(
+        None, description="Writing job UUID, for per-job commit attribution"
+    )
+
+
 class CustomJSONEncoder(json.JSONEncoder):
     """JSON encoder that handles PostgreSQL types."""
 
@@ -13619,18 +13631,29 @@ async def _merge_and_retro_loop_job(
             _kb_project = loop.get("project_id")
             if _kb_project:
 
-                async def _kb_reindex_after_merge(pid: str, repo: str | None) -> None:
+                async def _kb_reindex_after_merge(pid: str) -> None:
+                    # Deliberately does NOT pass repo_name: `_reindex_project_kb`
+                    # resolves the vault repo itself (knowledge-role first, jobs
+                    # as fallback) and only skips resolution when handed a name.
+                    # `job["repo_name"]` is always the *jobs* repo, so passing it
+                    # pins this trigger to the wrong repo for any project whose
+                    # vault has moved to a knowledge repo. Because
+                    # `plan_reindex` treats every indexed path missing from the
+                    # tree as a delete, an absent `knowledge/` would drop the
+                    # project's entire chunk index here, and the leader-gated
+                    # sweep would rebuild it from the real vault moments later —
+                    # a search index flapping empty on every loop job, reported
+                    # by nothing louder than the warning below. See
+                    # docs/features/knowledge_base_repo_separation.md §10a.
                     try:
-                        await _reindex_project_kb(pid, repo_name=repo)
+                        await _reindex_project_kb(pid)
                     except Exception:
                         logger.warning(
                             "post-merge kb_reindex failed (non-fatal)",
                             exc_info=True,
                         )
 
-                asyncio.create_task(
-                    _kb_reindex_after_merge(str(_kb_project), job.get("repo_name"))
-                )
+                asyncio.create_task(_kb_reindex_after_merge(str(_kb_project)))
         if merge_status == "empty" and is_loop_execution_role(completed_role):
             logger.error(
                 "project loop %s: execution job %s COMPLETED but its branch has "
@@ -17336,7 +17359,11 @@ def _build_datasources_payload(
         }
         if ds_type == "kb":
             entry["datasource_id"] = str(ds["id"])
-            entry["config"] = _normalize_kb_config(ds.get("config"))
+            # stored=True keeps the native-project marker in the payload: the
+            # agent's binding builder needs it to collapse a project's own KB
+            # row into the writable native binding instead of adding a second,
+            # read-only binding for the same notes.
+            entry["config"] = _normalize_kb_config(ds.get("config"), stored=True)
         if ds_type == "repository":
             # The clone reads config["forge"] to resolve the forge API base;
             # without it every repository records forge="" and repo_open_pr
@@ -17481,14 +17508,27 @@ def _normalize_datasource_credentials(
     return credentials
 
 
-def _normalize_kb_config(config: dict[str, Any] | None) -> dict[str, Any]:
+def _normalize_kb_config(
+    config: dict[str, Any] | None, *, stored: bool = False
+) -> dict[str, Any]:
     """Validate the non-secret v1 config for an OKF KB datasource.
 
     ``root_path`` is relative to the configured repository root. Keep the
     accepted shape intentionally small so misspelled future-looking keys do not
     silently change indexing behavior.
+
+    ``stored=True`` normalizes a config read back out of the database and
+    carries the server-owned ``native_project_id`` marker through. User input
+    is always normalized without it, so the marker cannot be hand-forged onto
+    an external connector to steer it out of the sweep — and, read the other
+    way, cannot be stripped off a project's own KB by editing its root path
+    (that would drop the vault straight back into the external sweep and
+    double-index it; docs/features/knowledge_base_repo_separation.md §6).
     """
+    from services.kb_datasources import NATIVE_PROJECT_CONFIG_KEY
+
     raw = dict(config or {})
+    native_project = raw.pop(NATIVE_PROJECT_CONFIG_KEY, None) if stored else None
     unknown = sorted(set(raw) - {"root_path"})
     if unknown:
         raise HTTPException(
@@ -17521,7 +17561,10 @@ def _normalize_kb_config(config: dict[str, Any] | None) -> dict[str, Any]:
                 detail="KB root_path must not contain '..'",
             )
         parts.append(part)
-    return {"root_path": "/".join(parts)}
+    normalized_config = {"root_path": "/".join(parts)}
+    if native_project:
+        normalized_config[NATIVE_PROJECT_CONFIG_KEY] = str(native_project)
+    return normalized_config
 
 
 def _normalize_repository_config(
@@ -17906,11 +17949,29 @@ async def update_datasource(
         except CredentialFileValidationError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    from services.kb_datasources import (
+        NATIVE_PROJECT_CONFIG_KEY,
+        native_kb_project_id,
+    )
+
     connection_url = body.connection_url
     datasource_config = body.config
     mcp_connection_url_set = False
     reindex_required = False
-    if existing_ds.get("type") == "kb":
+    native_project = native_kb_project_id(existing_ds)
+    if existing_ds.get("type") == "kb" and native_project:
+        # A project's own KB row is a management surface, not a remote source:
+        # it has no repository URL or credentials to validate, and it is never
+        # indexed under its datasource id, so no edit here can require a
+        # rebuild. Config still goes through the normalizer (unknown keys stay
+        # rejected) and the server-owned marker is re-attached, so editing the
+        # root path cannot quietly promote the vault into the external sweep
+        # and index every note a second time.
+        if datasource_config is not None:
+            datasource_config = _normalize_kb_config(datasource_config)
+            datasource_config[NATIVE_PROJECT_CONFIG_KEY] = native_project
+        connection_url = None  # nothing to point at; leave the column alone
+    elif existing_ds.get("type") == "kb":
         if connection_url is not None:
             connection_url = _validate_kb_repository_url(connection_url)
             reindex_required = (
@@ -18124,10 +18185,22 @@ async def reindex_datasource_knowledge(
     request: Request, datasource_id: str, full: bool = False
 ) -> dict[str, Any]:
     """Incrementally refresh an external OKF KB; owner/admin only."""
+    from services.kb_datasources import native_kb_project_id
+
     _, datasource = await require_datasource_owner(request, postgres_db, datasource_id)
     if datasource.get("type") != "kb":
         raise HTTPException(
             status_code=400, detail="Connector is not an OKF Knowledge Base"
+        )
+    if native_kb_project_id(datasource):
+        # Indexing it here would write its project's notes a second time under
+        # this datasource's id and duplicate every search hit.
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "This connector mirrors the project's own knowledge base; "
+                "reindex it from the project instead"
+            ),
         )
     try:
         return await _reindex_kb_datasource_now(datasource, force_full=full)
@@ -32598,6 +32671,100 @@ async def _ensure_project_cloud_resources(
     return project
 
 
+async def _provision_project_knowledge_repo(
+    project: dict[str, Any], owner_id: str | None
+) -> dict[str, Any] | None:
+    """Create the project's knowledge repo and attach it as its own KB.
+
+    Two artifacts, in this order:
+
+    * ``project-<id8>-knowledge`` registered with role ``knowledge`` — the
+      vault ``resolve_kb_repo`` prefers from now on, and the repo the
+      materialisation endpoint commits notes into.
+    * a ``kb`` datasource linked to the project — the design's
+      "default-attached datasource" (§6). It is a **management surface**:
+      something to see, list and unlink in the cockpit. It is *not* an index
+      of its own. Its notes are indexed under ``kb_id = project_id`` by the
+      native sweep, which is why the row carries the ``native_project_id``
+      marker: without it the external sweep would index the same vault a
+      second time under this row's UUID and every note would come back twice
+      in search (§8, criterion 5).
+
+    ``connection_url`` is deliberately left null. The authenticated Gitea URL
+    would leak credentials through the connector API, and a second copy of
+    "where the vault lives" is exactly the divergence §10 warns about —
+    ``project_repositories`` is the one place that answer is kept.
+
+    Returns the created datasource row, or None when Gitea refused the repo.
+    """
+    from services.kb_datasources import NATIVE_PROJECT_CONFIG_KEY
+
+    project_id = str(project["id"])
+    id8 = project_id[:8]
+    repo_name = f"project-{id8}-knowledge"
+
+    repo_url = await gitea_client.create_repo(repo_name)
+    if not repo_url:
+        logger.warning(
+            "Gitea did not create knowledge repo '%s'; project %s keeps its "
+            "vault in the jobs repo",
+            repo_name,
+            project_id,
+        )
+        return None
+
+    await postgres_db.add_project_repository(
+        project_id=project_id,
+        name=repo_name,
+        repo_url=repo_url,
+        role="knowledge",
+        description="Project knowledge vault (OKF notes under knowledge/)",
+        is_managed=True,
+    )
+
+    if owner_id:
+        try:
+            creator = await postgres_db.get_user(owner_id)
+            if creator and creator.get("email"):
+                await gitea_client.grant_user_repo_access(creator["email"], repo_name)
+        except Exception as e:
+            logger.warning(
+                f"Failed to grant Gitea access for project creator on "
+                f"knowledge repo: {e}"
+            )
+
+    # Names are unique per (name, type, owner), so the id8 keeps two projects
+    # with the same title from colliding on their KB connectors.
+    datasource = await postgres_db.create_datasource(
+        name=f"{project['name']} Knowledge ({id8})",
+        ds_type="kb",
+        connection_url=None,
+        description=(
+            f"This project's knowledge base, stored in `{repo_name}`. "
+            "Notes written with kb_write land here."
+        ),
+        config={"root_path": "knowledge", NATIVE_PROJECT_CONFIG_KEY: project_id},
+        created_by=owner_id,
+        read_only=True,
+    )
+    # read_only=True mirrors what POST /api/projects/{id}/datasources forces
+    # for every kb link. It scopes the *connector*, not the knowledge base:
+    # the project's own KB stays writable through its native binding, which is
+    # where kb_write has always targeted it.
+    await postgres_db.link_datasource_to_project(
+        project_id,
+        str(datasource["id"]),
+        read_only=True,
+    )
+    logger.info(
+        "Provisioned knowledge repo '%s' + KB connector %s for project %s",
+        repo_name,
+        datasource["id"],
+        project_id,
+    )
+    return datasource
+
+
 @app.post("/api/projects")
 async def create_project(body: ProjectCreate, request: Request) -> dict[str, Any]:
     """Create a new project with the requesting user as owner."""
@@ -32623,7 +32790,8 @@ async def create_project(body: ProjectCreate, request: Request) -> dict[str, Any
             role="owner",
         )
 
-        # Create Gitea jobs repo and grant creator access
+        # Create the Gitea jobs repo (workspace root for project jobs) and the
+        # knowledge repo (the KB vault), granting the creator access to both.
         if gitea_client.is_initialized:
             repo_name = f"project-{str(project['id'])[:8]}-jobs"
             repo_url = await gitea_client.create_repo(repo_name)
@@ -32647,6 +32815,22 @@ async def create_project(body: ProjectCreate, request: Request) -> dict[str, Any
                         logger.warning(
                             f"Failed to grant Gitea access for project creator: {e}"
                         )
+
+            # Knowledge repo — the project's KB vault, kept out of the jobs
+            # repo so note commits never mix with job records
+            # (docs/features/knowledge_base_repo_separation.md §3). It is
+            # written server-side and never cloned into a workspace. Nothing
+            # downstream requires it: a project without one falls back to the
+            # jobs repo via resolve_kb_repo, which is exactly what every
+            # project created before this shipped does. So a Gitea hiccup here
+            # degrades the vault's home, and must not cost the project.
+            try:
+                await _provision_project_knowledge_repo(project, owner_id)
+            except Exception as e:
+                logger.warning(
+                    f"Failed to provision knowledge repo for project "
+                    f"{project['id']}: {e}"
+                )
 
         # Provision Keycloak group + main-cloud Space + WebDAV datasource,
         # then sync the creator into both the Keycloak and LibreGraph groups.
@@ -34155,9 +34339,19 @@ async def _reindex_kb_datasource_now(
 async def _run_scheduled_kb_datasource_reindex(
     datasource_id: str, *, force_full: bool
 ) -> None:
+    from services.kb_datasources import native_kb_project_id
+
     try:
         datasource = await postgres_db.get_datasource(datasource_id)
         if not datasource or datasource.get("type") != "kb":
+            return
+        if native_kb_project_id(datasource):
+            # Its project's sweep already indexes these notes under the
+            # project id; a second pass here would duplicate every one of them.
+            logger.debug(
+                "Skipping external reindex of native project KB datasource %s",
+                datasource_id,
+            )
             return
         await _reindex_kb_datasource_now(datasource, force_full=force_full)
     except Exception as exc:
@@ -34303,6 +34497,42 @@ async def reindex_knowledge(
         return await _reindex_project_kb(project_id, force_full=full)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.post("/api/projects/{project_id}/knowledge/materialize")
+async def materialize_knowledge_note(
+    request: Request,
+    project_id: str,
+    body: KnowledgeMaterializeRequest,
+) -> dict[str, Any]:
+    """Commit one rendered note to ``knowledge/<slug>.md`` in the project's KB
+    repo. **Internal** (P4b) — requires ``X-Internal-Key``.
+
+    Step 3 of docs/features/knowledge_base_repo_separation.md: the agent used
+    to write this file into its workspace checkout, which welded the vault to
+    the jobs repo and skipped entirely wherever there was no git (persistent
+    sessions, lite tiers, repo-less projects). The write is server-side now —
+    one note, one commit, into whichever repo ``resolve_kb_repo`` picks.
+
+    Always answers 200 with the service's ``{status, reason, repo, branch,
+    path, operation}``; the failure vocabulary lives in the body, not the HTTP
+    code, because the caller is required to log-and-continue exactly as the
+    old non-fatal file write did. ``status`` is ``committed`` / ``skipped``
+    (``no-repo``, ``unchanged``) / ``failed``.
+    """
+    await require_internal(request)
+    from services.kb_materialize import (
+        materialize_knowledge_note as _materialize_note,
+    )
+
+    return await _materialize_note(
+        postgres_db=postgres_db,
+        gitea_client=gitea_client,
+        project_id=project_id,
+        slug=body.slug,
+        content=body.content,
+        job_id=body.job_id,
+    )
 
 
 @app.post("/api/projects/{project_id}/knowledge/search")

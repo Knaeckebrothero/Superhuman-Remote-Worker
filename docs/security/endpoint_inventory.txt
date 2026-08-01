@@ -280,6 +280,7 @@ GET    /api/projects/{project_id}/jobs                                          
 POST   /api/projects/{project_id}/jobs                                                  gated:require_project_member
 GET    /api/projects/{project_id}/knowledge                                             gated:require_project_member
 POST   /api/projects/{project_id}/knowledge/export                                      gated:require_project_member
+POST   /api/projects/{project_id}/knowledge/materialize                                 internal:require_internal
 POST   /api/projects/{project_id}/knowledge/reindex                                     gated:require_project_member
 POST   /api/projects/{project_id}/knowledge/search                                      gated:require_project_member
 GET    /api/projects/{project_id}/knowledge/summary                                     gated:require_project_member

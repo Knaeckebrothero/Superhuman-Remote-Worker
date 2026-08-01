@@ -13,6 +13,39 @@ from .kb_git_source import RemoteKnowledgeGitSource, validate_git_remote_url
 from .kb_reindex import knowledge_blob_map, reindex_kb
 
 
+# Server-owned marker inside a ``kb`` datasource's non-secret ``config``: this
+# row is a *management surface* over the named project's native KB (visible,
+# listable, unlinkable in the cockpit), not an external repository.
+#
+# It exists to keep the vault out of the external sweep. External KBs are
+# indexed under their own datasource UUID; the native project KB is indexed
+# under ``project_id``. Index the same notes under both and every note appears
+# twice in search under two different ``kb_id``s — the one failure in
+# docs/features/knowledge_base_repo_separation.md that corrupts search rather
+# than merely failing it (§6, §8 criterion 5).
+#
+# The agent image cannot import orchestrator code, so
+# ``src/services/knowledge/bindings.py`` mirrors this constant; the two must
+# stay in sync (tests/test_kb_native_datasource.py asserts it).
+NATIVE_PROJECT_CONFIG_KEY = "native_project_id"
+
+
+def native_kb_project_id(datasource: Optional[dict[str, Any]]) -> Optional[str]:
+    """Return the project whose native KB this ``kb`` row mirrors, else None.
+
+    A truthy answer means: do not index this datasource, do not bind it as a
+    second KB — the project's own sweep already covers those notes under
+    ``kb_id = project_id``.
+    """
+    if not datasource:
+        return None
+    config = datasource.get("config") or {}
+    if not isinstance(config, dict):
+        return None
+    value = config.get(NATIVE_PROJECT_CONFIG_KEY)
+    return str(value) if value else None
+
+
 def _external_reindex_limit() -> int:
     """Bound distinct-repository clone/embed work in one orchestrator process."""
     try:
@@ -52,6 +85,15 @@ async def reindex_kb_datasource(
     """Index one external datasource under its stable datasource UUID."""
     if str(datasource.get("type") or "").lower() != "kb":
         raise ValueError("Connector is not an OKF Knowledge Base")
+    # Last line of defence against the double-index. Every external index path
+    # funnels through here (sweep, create/update reschedule, manual reindex),
+    # so a caller that forgets the marker fails loudly instead of quietly
+    # duplicating a project's whole vault under a second kb_id.
+    if native_kb_project_id(datasource):
+        raise ValueError(
+            "This connector mirrors a project's own knowledge base; it is "
+            "indexed under its project id, not as an external source"
+        )
     kb_id = uuid.UUID(str(datasource["id"]))
     config = datasource.get("config") or {}
     # Per-KB locks prevent duplicate writers, but create/update/manual requests
@@ -143,8 +185,10 @@ def index_status_payload(
 
 
 __all__ = [
+    "NATIVE_PROJECT_CONFIG_KEY",
     "index_status_payload",
     "kb_source_from_datasource",
+    "native_kb_project_id",
     "reindex_kb_datasource",
     "test_kb_datasource",
 ]

@@ -15,11 +15,13 @@ See docs/features/project_knowledge_base.md for full architecture.
 import asyncio
 import hashlib
 import logging
+import os
 import re
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Literal, Optional
 
+import httpx
 from langchain_core.tools import tool
 
 from ...services.knowledge_graph import (
@@ -126,6 +128,12 @@ def _charter_write_denied(context: "ToolContext") -> Optional[str]:
 # The kb_lint URL sweep checks at most this many unique external URLs per run;
 # the remainder is reported loudly (never a silent cap).
 _URL_SWEEP_CAP = 25
+
+# Upper bound on the notes kb_lint/kb_index pull out of the knowledge index in
+# one call — a guard against loading an unbounded number of note bodies into
+# agent memory. Sized above the largest live vault (~3.2k notes); a run that
+# hits it says so loudly, same posture as _URL_SWEEP_CAP.
+_VAULT_SCAN_CAP = 5000
 
 
 def _check_external_url(url: str, timeout: float = 5.0) -> Optional[str]:
@@ -391,7 +399,7 @@ def _resolve_note_scope(
 
 
 # =============================================================================
-# OKF markdown serialization (slice 1 — files-canonical dual-write)
+# OKF markdown serialization (files-canonical KB)
 # See docs/features/okf_knowledge_base.md §7, §11.
 # =============================================================================
 
@@ -427,7 +435,7 @@ def _render_note_md(note: Dict[str, Any]) -> str:
     ``description`` frontmatter, standard **markdown** links (never wikilinks)
     for the emergent graph, in-note ``author``/``job``/``branch`` provenance
     (squash-merge erases git authorship). Optional fields are omitted when
-    absent. Shared by ``kb_write``/``kb_update`` dual-write and ``kb_export``.
+    absent. Shared by ``kb_write``/``kb_update`` materialisation and ``kb_export``.
 
     Expected keys (all optional except ``id``/``type``): ``id``, ``type``,
     ``title``, ``description``, ``content``, ``tags``, ``keywords``,
@@ -517,33 +525,163 @@ def _note_provenance(context: ToolContext) -> Dict[str, Optional[str]]:
     return {"author": author, "job": context.job_id, "branch": branch}
 
 
-def _dual_write_note(context: ToolContext, slug: str, note: Dict[str, Any]) -> None:
-    """Materialize a note as flat ``knowledge/<slug>.md`` on the workspace.
+# =============================================================================
+# Server-side materialisation
+# (docs/features/knowledge_base_repo_separation.md §3, step 4)
+#
+# A note used to be written twice: the row into ``knowledge_index``, and the
+# file into the agent's own workspace checkout (``_dual_write_note``). That
+# second write welded the vault to whatever repo the workspace happened to be
+# a clone of, and — because it was guarded on ``has_git()`` — skipped entirely
+# wherever there was no git: persistent sessions, lite tiers, repo-less
+# projects. Their notes stayed pathless, and ``kb_read``/``kb_search`` gate on
+# ``path IS NOT NULL``, so they were invisible to every reader.
+#
+# There is one write path now and it is server-side: the agent POSTs the
+# rendered markdown, the orchestrator commits it into whichever repo §5's
+# ``resolve_kb_repo`` picks for the project. It needs neither git nor a
+# workspace, which is what makes the note visible on those runtimes for the
+# first time. Rendering stays here (the orchestrator does not know OKF's note
+# format); only the commit moved.
+# =============================================================================
 
-    Slice 1 of the files-canonical KB. Guarded on ``has_git()`` (stricter than
-    ``has_workspace()``: persistent sessions, repo-less projects and lite tiers
-    keep their DB-only write) — skip + log otherwise, never fall back to local
-    I/O (that writes to the ephemeral agent host, invisible to the workspace
-    pod's clone; the citation-engine stub-mode bug and ``kb_export``'s old
-    local-``Path`` fallback are the cautionary tales). Non-fatal, mirroring the
-    pgvector write-through: a failed file write must never fail the tool.
+# Generous, because losing the note is worse than blocking the tool call: a
+# missed materialisation leaves a row no reader can see (§10).
+_MATERIALIZE_TIMEOUT_SECONDS = 30.0
+
+# Deliberately identical to the prefix orchestrator/services/kb_materialize.py
+# logs under, so ONE grep/alert rule — `kb-materialize:` at ERROR — catches a
+# broken vault write from either side of the seam. §10 asks for a signal that
+# is actually looked at: after this change a failed materialisation means the
+# note exists in Postgres and is invisible to every reader, which is not a
+# warning.
+_MATERIALIZE_LOG = "kb-materialize:"
+
+
+def _post_vault_file(
+    project_id: str,
+    slug: str,
+    content: str,
+    job_id: Optional[str],
+) -> Dict[str, Any]:
+    """POST one rendered note to the orchestrator's materialisation endpoint.
+
+    Returns the endpoint's ``{status, reason, repo, branch, path, operation}``
+    verbatim, or a synthesized ``failed`` result when the call itself did not
+    complete. **Never raises** — every caller must be able to log and carry on,
+    exactly as the old non-fatal file write did.
+
+    The endpoint answers HTTP 200 for every KB-level outcome on purpose (its
+    failure vocabulary lives in the body), so a non-200 here is a transport or
+    auth problem, not a refused note.
     """
-    if not context.has_git():
-        return
+    base_url = os.getenv("ORCHESTRATOR_URL", "http://localhost:8085").rstrip("/")
+    url = f"{base_url}/api/projects/{project_id}/knowledge/materialize"
+    headers: Dict[str, str] = {}
+    internal_key = os.getenv("MCP_INTERNAL_KEY", "")
+    if internal_key:
+        headers["X-Internal-Key"] = internal_key
+
+    payload: Dict[str, Any] = {"slug": slug, "content": content}
+    if job_id:
+        payload["job_id"] = str(job_id)
+
+    try:
+        with httpx.Client(
+            timeout=_MATERIALIZE_TIMEOUT_SECONDS, headers=headers
+        ) as client:
+            response = client.post(url, json=payload)
+    except Exception as e:  # noqa: BLE001 — non-fatal by contract
+        return {"status": "failed", "reason": f"unreachable: {e.__class__.__name__}"}
+
+    if response.status_code != 200:
+        return {"status": "failed", "reason": f"http-{response.status_code}"}
+
+    try:
+        body = response.json()
+    except Exception:  # noqa: BLE001 — a non-JSON 200 is still a failed write
+        return {"status": "failed", "reason": "malformed-response"}
+    if not isinstance(body, dict) or not body.get("status"):
+        return {"status": "failed", "reason": "malformed-response"}
+    return body
+
+
+def _materialize_note(
+    context: ToolContext, slug: str, note: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Commit a note as ``knowledge/<slug>.md`` in the project's KB repo.
+
+    Renders ``note`` with the same serializer the file has always used, stamps
+    in-note provenance (author/job/branch — squash-merge erases git
+    authorship), and hands the markdown to the orchestrator, which owns the
+    commit. No workspace and no git are required, and none is touched.
+
+    Non-fatal, mirroring the pgvector write-through: the ``knowledge_index``
+    row is already written and the tool must still succeed. Recovery is a
+    rewrite of the note (the reindexer is idempotent), not repair tooling —
+    hence the loud log rather than a raise.
+
+    Returns the endpoint's status dict, for callers that want to report the
+    outcome. ``status`` is ``committed`` / ``skipped`` / ``failed``.
+    """
+    project_id = _get_project_id(context)
+    if not project_id:
+        # No writable native KB in scope. The row write upstream already
+        # failed its own scope check in that case, so this is belt-and-braces.
+        logger.error(
+            "%s no writable project knowledge base in scope — note '%s' was "
+            "NOT materialised and stays invisible to kb_read/kb_search",
+            _MATERIALIZE_LOG,
+            slug,
+        )
+        return {"status": "failed", "reason": "no-project-scope"}
+
     try:
         enriched = dict(note)
         for key, value in _note_provenance(context).items():
             if value:
                 enriched[key] = value
-        context.workspace_manager.write_file(
-            f"knowledge/{slug}.md", _render_note_md(enriched)
+        content = _render_note_md(enriched)
+        job_id = context.job_id
+    except Exception as e:  # noqa: BLE001 — a serializer bug must not fail kb_write
+        logger.error(
+            "%s could not render note '%s' for project %s: %r — NOT "
+            "materialised, and invisible to kb_read/kb_search until rewritten",
+            _MATERIALIZE_LOG,
+            slug,
+            project_id,
+            e,
+            exc_info=True,
         )
-    except Exception as e:
-        logger.warning(f"knowledge/ dual-write failed for {slug}: {e}")
+        return {"status": "failed", "reason": "render-error"}
+
+    result = _post_vault_file(project_id, slug, content, job_id)
+
+    if str(result.get("status")) == "failed":
+        logger.error(
+            "%s note '%s' (project %s) was NOT materialised (%s) — the row is "
+            "in the knowledge index but no file backs it, so kb_read/kb_search "
+            "cannot see it until the note is written again",
+            _MATERIALIZE_LOG,
+            slug,
+            project_id,
+            result.get("reason") or "unknown",
+        )
+    else:
+        logger.debug(
+            "%s note '%s' (project %s): %s%s",
+            _MATERIALIZE_LOG,
+            slug,
+            project_id,
+            result.get("status"),
+            f" ({result.get('reason')})" if result.get("reason") else "",
+        )
+    return result
 
 
-# The OKF vault root inside a project's jobs repo — the same prefix the
-# reindexer scans (orchestrator/services/kb_reindex.py KNOWLEDGE_PREFIX).
+# The OKF vault root — the same prefix the reindexer scans and the
+# materialisation endpoint commits under
+# (orchestrator/services/kb_reindex.py KNOWLEDGE_PREFIX).
 _VAULT_ROOT = "knowledge"
 
 
@@ -590,6 +728,119 @@ def _export_dir_error(path: str) -> Optional[str]:
             "directory (e.g. `exports/kb`) instead."
         )
     return None
+
+
+# =============================================================================
+# Gardener source of truth — the knowledge index, not the workspace
+# (docs/features/knowledge_base_repo_separation.md §5a)
+#
+# kb_lint/kb_index used to glob `knowledge/*.md` off the workspace. Once the
+# vault moves into its own server-side repo that glob does not fail, it returns
+# nothing — a healthy KB reported as empty, which is the most dangerous outcome
+# of the repo separation. Both tools therefore read `knowledge_index` rows and
+# render each one back into the OKF note it materialises to, using the very
+# serializer that writes the file (`_render_note_md`), so every existing lint
+# rule keeps working on byte-equivalent input.
+#
+# What the index cannot see, and why that is acceptable: `invalid-yaml` /
+# `missing-frontmatter` / `missing-title` describe defects of a *file*, and a
+# row cannot be malformed in those ways — a note that fails to parse never
+# becomes a row at all (the reindexer's `note_fields` hardening), and the
+# reindex watermark is where that surfaces. In exchange the index shows a class
+# of defect files never could: a row no file backs (`path IS NULL`), invisible
+# to kb_read/kb_search. See `_unmaterialised_finding`.
+# =============================================================================
+
+
+def _vault_path_intent(path: Optional[str]) -> tuple[bool, Optional[str]]:
+    """Classify a gardener ``path`` argument as ``(targets_the_vault, error)``.
+
+    The argument is vestigial for the vault itself — those notes come from the
+    index now, wherever their files live. It survives for the one question the
+    index cannot answer: an explicit *other* markdown directory in the
+    workspace (`docs`, a repository datasource checkout). So:
+
+    - omitted, or ``knowledge`` (the old default) → the project KB, read from
+      the index. Never re-interpreted as "glob a workspace directory that no
+      longer holds the vault" — that reinterpretation is precisely the
+      silent-empty failure this refactor exists to remove.
+    - somewhere *inside* the vault (``knowledge/sub``) → refused with a reason,
+      for the same reason: there is nothing there to glob.
+    - anything else → a workspace directory, globbed as before.
+    """
+    cleaned = str(path or "").strip().replace("\\", "/").strip("/")
+    parts = [p for p in cleaned.split("/") if p not in ("", ".")]
+    if not parts:
+        return True, None
+    if parts[0].lower() != _VAULT_ROOT:
+        return False, None
+    if len(parts) == 1:
+        return True, None
+    return True, (
+        f"Error: `{path}` points inside the knowledge vault, which is no longer "
+        "a workspace directory — its notes live in the knowledge index and in "
+        "the knowledge repo, so there is nothing there to scan. Omit `path` to "
+        "target the whole knowledge base."
+    )
+
+
+def _store_note_markdown(row: Dict[str, Any], root: str) -> Dict[str, str]:
+    """Render one ``knowledge_index`` row as the OKF note file it materialises to.
+
+    ``{"path", "text"}`` — the shape ``lint_kb``/``external_url_map`` consume.
+    The path is the row's real file path when the reindexer has stamped one,
+    otherwise the flat vault path the note will land at, so a finding is always
+    anchored somewhere the agent can act on. ``description`` is intentionally
+    left out: the index has no such column, so ``_render_note_md`` derives it
+    from the body exactly as it does on the write path.
+    """
+    return {
+        "path": row.get("path") or f"{root}/{row.get('id')}.md",
+        "text": _render_note_md(
+            {
+                "id": row.get("id"),
+                "type": row.get("type") or "unknown",
+                "title": row.get("title"),
+                "content": row.get("content") or "",
+                "tags": row.get("tags") or [],
+                "keywords": row.get("keywords") or [],
+                "confidence": row.get("confidence"),
+                "status": row.get("status"),
+                "priority": row.get("priority"),
+                "job": str(row["job_id"]) if row.get("job_id") else None,
+                "created": row.get("created"),
+                "modified": row.get("modified"),
+                "superseded_by": row.get("superseded_by"),
+            }
+        ),
+    }
+
+
+def _unmaterialised_finding(rows: List[Dict[str, Any]], root: str) -> List[Finding]:
+    """One aggregate warning for index rows that no file backs yet.
+
+    These are the notes ``kb_read``/``kb_list`` cannot return (both gate on
+    ``path IS NOT NULL``), so a KB where materialisation is broken reads empty
+    while linting full. Aggregated rather than per-note on purpose: a lite-tier
+    KB can have every row pathless, and 3,000 identical warnings would bury the
+    findings that need acting on.
+    """
+    pending = [str(r.get("id")) for r in rows if not r.get("path")]
+    if not pending:
+        return []
+    shown = ", ".join(pending[:5])
+    more = f" (+{len(pending) - 5} more)" if len(pending) > 5 else ""
+    return [
+        Finding(
+            "unmaterialised-note",
+            "warning",
+            root,
+            f"{len(pending)} of {len(rows)} note(s) have no file backing them "
+            f"yet: {shown}{more} — they are in the knowledge index but "
+            "`kb_read`/`kb_search` cannot see them until the note is written "
+            "into the knowledge repo and picked up by a reindex",
+        )
+    ]
 
 
 def create_kb_tools(
@@ -841,8 +1092,9 @@ def create_kb_tools(
             _jid = existing.get("job_id")
             job_id_arg = uuid.UUID(_jid) if isinstance(_jid, str) else _jid
 
-            # OKF file is canonical — write it first (mirrors kb_write ordering),
-            # so the edit survives even if the disposable pgvector write fails.
+            # OKF file is canonical — materialise it first (mirrors kb_write
+            # ordering), so the edit survives even if the disposable pgvector
+            # write fails.
             updated_note = {
                 "id": note,
                 "type": new_type,
@@ -857,7 +1109,7 @@ def create_kb_tools(
             }
             if new_type in _TICKET_TYPES:
                 updated_note["priority"] = new_priority
-            _dual_write_note(context, note, updated_note)
+            _materialize_note(context, note, updated_note)
             try:
                 _run_async(
                     ks.upsert_note(
@@ -907,7 +1159,7 @@ def create_kb_tools(
         add_tags: Optional[List[str]] = None,
         add_links: Optional[List[dict]] = None,
     ) -> str:
-        """Update an existing note: Neo4j + OKF dual-write + pgvector write-through.
+        """Update an existing note: Neo4j + OKF file + pgvector write-through.
 
         Shared by the ``kb_update`` tool and the verdict gate's UPDATE/SUPERSEDE
         routing, so both apply an edit the same way. ``priority`` is
@@ -972,7 +1224,7 @@ def create_kb_tools(
                     # None is a real, load-bearing value here, not "no
                     # opinion": it means "the current priority could not be
                     # determined", and both ks.upsert_note (COALESCE against
-                    # the row's existing value) and the dual-write dict below
+                    # the row's existing value) and the note dict below
                     # (key omitted entirely) treat it as "leave unchanged" —
                     # never as license to guess DEFAULT_PRIORITY_RANK, which
                     # previously clobbered a real existing priority whenever
@@ -1003,7 +1255,7 @@ def create_kb_tools(
                                     f"priority lookback failed for {note}, "
                                     f"leaving its priority unchanged: {e}"
                                 )
-                    # Files-canonical dual-write (slice 1) — before the
+                    # Files-canonical materialisation — before the
                     # disposable-index upsert, so the canonical file lands even
                     # if the pgvector write fails.
                     full_note_dict = {
@@ -1021,7 +1273,7 @@ def create_kb_tools(
                     }
                     if new_type in _TICKET_TYPES and new_priority is not None:
                         full_note_dict["priority"] = new_priority
-                    _dual_write_note(context, note, full_note_dict)
+                    _materialize_note(context, note, full_note_dict)
                     _run_async(
                         ks.upsert_note(
                             note_id=note,
@@ -1084,9 +1336,9 @@ def create_kb_tools(
 
         Write-through: creates the note in Neo4j (source of truth), upserts into
         the pgvector search index, AND materializes the note as an OKF markdown
-        file at ``knowledge/<slug>.md`` on the workspace (delivered to the repo's
-        ``main`` by the normal commit/merge flow). The note is immediately
-        available for search and graph queries.
+        file at ``knowledge/<slug>.md`` in the project's knowledge repository —
+        committed server-side, so it needs neither a workspace nor git. The note
+        is immediately available for search and graph queries.
 
         Args:
             title: Note title (generates the slug ID, e.g. "chose-jwt-over-oauth")
@@ -1275,10 +1527,15 @@ def create_kb_tools(
             except Exception as e:
                 if kg is None and not context.has_git():
                     # Lite sessions (officer/conference, no git, no Neo4j):
-                    # the pgvector row IS the only durable write. Claiming
-                    # "Created" here would be silent data loss for exactly
-                    # the notes the officer's judgment depends on
-                    # (centurion_implementation_notes.md risk 11).
+                    # the pgvector row is the write the caller can count on.
+                    # Materialisation below no longer needs git, so the note
+                    # may well still reach the KB repo — but that is a
+                    # *server-side* outcome this path cannot see yet, and
+                    # claiming "Created" on a failed store write would be
+                    # silent data loss for exactly the notes the officer's
+                    # judgment depends on (centurion_implementation_notes.md
+                    # risk 11). Fail loudly; a retry re-materialises
+                    # idempotently.
                     logger.error(f"pgvector write failed for {slug} (sole store): {e}")
                     return (
                         # NB: `type` here is the note-type parameter, not the
@@ -1291,7 +1548,8 @@ def create_kb_tools(
                 # Durable truth is Neo4j (graph path) or the OKF file (kg-less);
                 # the reindexer can rebuild pgvector from either.
 
-            # Files-canonical dual-write (slice 1): materialize knowledge/<slug>.md.
+            # Files-canonical materialisation: commit knowledge/<slug>.md into
+            # the project's KB repo, server-side.
             new_note = {
                 "id": slug,
                 "type": type,
@@ -1309,7 +1567,7 @@ def create_kb_tools(
                 # entirely when the key is absent, keeping non-ticket notes'
                 # frontmatter byte-identical (Global constraint).
                 new_note["priority"] = rank
-            _dual_write_note(context, slug, new_note)
+            _materialize_note(context, slug, new_note)
 
             # Verdict SUPERSEDE: retire the stale note(s) the candidate replaces,
             # pointing them at the new note (status=superseded + SUPERSEDED_BY).
@@ -1956,8 +2214,8 @@ def create_kb_tools(
             # already, so there is nothing to migrate out of the graph.
             return (
                 "Nothing to export: this knowledge base has no Graph tier (Neo4j). "
-                "The `knowledge/*.md` files in the workspace are already the "
-                "canonical OKF export."
+                "The `knowledge/*.md` files in the project's knowledge repository "
+                "are already the canonical OKF export."
             )
 
         bindings = _native_bindings(context)
@@ -1976,7 +2234,7 @@ def create_kb_tools(
             # A workspace backend is required: never write to the local agent
             # host (ephemeral, invisible to the workspace pod's clone). Uses the
             # shared OKF serializer (markdown links, provenance) — same output
-            # as the kb_write/kb_update dual-write.
+            # as the kb_write/kb_update materialisation.
             if workspace is None:
                 return (
                     "Error: kb_export requires a workspace backend; refusing to "
@@ -2007,19 +2265,52 @@ def create_kb_tools(
     # Maintenance / gardener tools (slice 2)
     # =========================================================================
 
-    @tool
-    def kb_lint(path: str = "knowledge", check_urls: bool = False) -> str:
-        """Lint an OKF knowledge base for structural, id and link issues.
+    def _vault_binding() -> Optional[KnowledgeBinding]:
+        """The native KB the gardener tools operate on — the project vault.
 
-        Reads every `*.md` note under `path` and checks frontmatter validity,
+        Exactly one: `knowledge/` was one directory in one workspace, and
+        linting several projects' KBs as a single vault would invent
+        cross-project ``duplicate-id`` findings. Prefers the writable native
+        binding (the primary project, the same one ``_get_project_id`` picks)
+        and falls back to the first native scope for read-only multi-project
+        contexts.
+        """
+        natives = _native_bindings(context)
+        for binding in natives:
+            if binding.writable:
+                return binding
+        return natives[0] if natives else None
+
+    def _vault_rows(
+        binding: KnowledgeBinding,
+    ) -> tuple[List[Dict[str, Any]], Optional[str]]:
+        """Every ``knowledge_index`` row of a KB, or an operator-readable error."""
+        try:
+            rows = _run_async(ks.list_notes_full(binding.kb_id, limit=_VAULT_SCAN_CAP))
+        except Exception as e:
+            logger.error(f"knowledge index read failed for {binding.alias}: {e}")
+            return [], f"Error reading the knowledge index: {e}"
+        return list(rows or []), None
+
+    def _scan_truncated(rows: List[Dict[str, Any]]) -> bool:
+        return len(rows) >= _VAULT_SCAN_CAP
+
+    @tool
+    def kb_lint(path: Optional[str] = None, check_urls: bool = False) -> str:
+        """Lint the knowledge base for structural, id and link issues.
+
+        Reads every note from the knowledge index — not from the workspace, so
+        it works on lite tiers and persistent sessions too — and checks
         required keys (id/type/description), id format/uniqueness, dead and
-        broken-supersede links, orphans, missing titles, oversized notes,
-        slug-forked twins and embedding-near-duplicates. Read-only — returns
-        a report; it never edits notes. Point it at the project KB
-        (`knowledge/`), a repository datasource, or any markdown vault.
+        broken-supersede links, orphans, oversized notes, slug-forked twins,
+        notes no file backs yet, and embedding-near-duplicates. Read-only —
+        returns a report; it never edits notes.
 
         Args:
-            path: Directory to lint (default "knowledge").
+            path: Omit it to lint the project knowledge base (the normal case).
+                Pass a directory to lint some *other* markdown vault in the
+                workspace instead (e.g. `docs`, a repository datasource
+                checkout); that mode needs a workspace.
             check_urls: Also probe external http(s) links and flag clearly
                 dead ones (404/410, unreachable host). Off by default —
                 it is slow (network) and capped per run.
@@ -2027,26 +2318,70 @@ def create_kb_tools(
         Returns:
             A markdown lint report (errors then warnings), or a status message.
         """
-        if not context.has_workspace():
-            return "Error: kb_lint requires a workspace backend to read notes."
-        ws = context.workspace_manager
-        root = path.rstrip("/") or "knowledge"
-        try:
-            entries = ws.list_files(root, "*.md")
-        except Exception as e:
-            return f"Error listing `{root}/`: {e}"
-
         notes: List[Dict[str, str]] = []
-        for rel in entries:
-            if rel.endswith("/"):
-                continue
+        extra_findings: List[Finding] = []
+
+        targets_vault, path_error = _vault_path_intent(path)
+        if path_error:
+            return path_error
+
+        if targets_vault:
+            binding = _vault_binding()
+            if binding is None:
+                return (
+                    "Error: no project knowledge base is in scope to lint. "
+                    "Pass `path` to lint a markdown directory in the workspace "
+                    "instead."
+                )
+            root = binding.root_path or _VAULT_ROOT
+            rows, error = _vault_rows(binding)
+            if error:
+                return error
+            if not rows:
+                return (
+                    f"No knowledge notes found in {binding.name} "
+                    f"(`{binding.alias}`) — the knowledge index holds no notes "
+                    "for this knowledge base."
+                )
+            notes = [_store_note_markdown(row, root) for row in rows]
+            extra_findings = _unmaterialised_finding(rows, root)
+            if _scan_truncated(rows):
+                extra_findings.append(
+                    Finding(
+                        "vault-scan-truncated",
+                        "warning",
+                        root,
+                        f"only the first {_VAULT_SCAN_CAP} notes were linted "
+                        "(scan cap) — findings below are incomplete",
+                    )
+                )
+        else:
+            # Explicit non-vault directory: the one job the index cannot do.
+            root = str(path).rstrip("/")
+            if not context.has_workspace():
+                return (
+                    f"Error: linting `{root}/` needs a workspace backend, and "
+                    "this runtime has none. Omit `path` to lint the project "
+                    "knowledge base, which reads from the knowledge index and "
+                    "needs no workspace."
+                )
+            ws = context.workspace_manager
             try:
-                notes.append({"path": rel, "text": ws.read_file(rel)})
+                entries = ws.list_files(root, "*.md")
             except Exception as e:
-                logger.warning(f"kb_lint: could not read {rel}: {e}")
-        if not notes:
-            return f"No markdown notes found under `{root}/`."
+                return f"Error listing `{root}/`: {e}"
+            for rel in entries:
+                if rel.endswith("/"):
+                    continue
+                try:
+                    notes.append({"path": rel, "text": ws.read_file(rel)})
+                except Exception as e:
+                    logger.warning(f"kb_lint: could not read {rel}: {e}")
+            if not notes:
+                return f"No markdown notes found under `{root}/`."
+
         report = lint_kb(notes)
+        report.findings.extend(extra_findings)
 
         # Embedding-backed near-duplicate pass (the slice-2 deferred rule):
         # the pgvector index already holds one embedding per note, so one
@@ -2094,57 +2429,148 @@ def create_kb_tools(
         return report.format_markdown()
 
     @tool
-    def kb_index(path: str = "knowledge") -> str:
-        """Regenerate the OKF `index.md` for a knowledge base.
+    def kb_index(path: Optional[str] = None) -> str:
+        """Regenerate the OKF `index.md` for a markdown vault.
 
-        Reads every `*.md` note under `path`, groups them by `type`, and writes
-        a heading-grouped `[Title](slug.md) - description` index to
-        `<path>/index.md` (OKF §6 shape, no frontmatter). Content outside the
-        auto-generated markers is preserved, so human-authored sections survive.
-        Malformed and reserved files (index.md/log.md) are skipped.
+        For the project knowledge base this reports the note count only: the
+        vault lives in the project's knowledge repository, not in the
+        workspace, so its `index.md` is never written from here. Use `kb_list`
+        for the same grouping live.
+
+        For an explicit workspace directory it writes a heading-grouped
+        `[Title](slug.md) - description` index to `<path>/index.md` (OKF §6
+        shape, no frontmatter). Content outside the auto-generated markers is
+        preserved, so human-authored sections survive. Reserved files
+        (index.md/log.md) are skipped.
 
         Args:
-            path: Directory to index (default "knowledge").
+            path: Omit it for the project knowledge base (the normal case).
+                Pass a directory to index some *other* markdown vault in the
+                workspace instead; that mode needs a workspace, and is the
+                only mode that writes a file.
 
         Returns:
-            A status message naming the file written and note count.
+            A status message with the note count, naming the file when one was
+            written.
         """
         if _has_bound_scopes and not _get_project_id(context):
             return _write_scope_error(context)
-        if not context.has_workspace():
-            return "Error: kb_index requires a workspace backend."
-        ws = context.workspace_manager
-        root = path.rstrip("/") or "knowledge"
-        try:
-            entries = ws.list_files(root, "*.md")
-        except Exception as e:
-            return f"Error listing `{root}/`: {e}"
 
         metas: List[Dict[str, Any]] = []
-        for rel in entries:
-            if rel.endswith("/") or is_reserved(rel):
-                continue
-            try:
-                fm, body = parse_note_md(ws.read_file(rel))
-            except Exception as e:
-                # Malformed YAML (ValueError) or an unreadable file — kb_lint
-                # surfaces the former; skip it for indexing either way.
-                logger.warning(f"kb_index: skipping {rel}: {e}")
-                continue
-            note_id = fm.get("id") if fm else None
-            if not note_id:
-                continue  # unindexable (kb_lint reports the missing id)
-            metas.append(
-                {
-                    "id": note_id,
-                    "type": fm.get("type") or "misc",
-                    "description": fm.get("description"),
-                    "title": note_title(body) or note_id,
-                }
-            )
-        if not metas:
-            return f"No indexable notes found under `{root}/`."
+        truncated = False
 
+        targets_vault, path_error = _vault_path_intent(path)
+        if path_error:
+            return path_error
+
+        if targets_vault:
+            binding = _vault_binding()
+            if binding is None:
+                return _write_scope_error(context)
+            root = binding.root_path or _VAULT_ROOT
+            rows, error = _vault_rows(binding)
+            if error:
+                return error
+            truncated = _scan_truncated(rows)
+            for row in rows:
+                note_id = row.get("id")
+                # Reserved ids (index/log) are generated artefacts, never notes.
+                if not note_id or is_reserved(f"{note_id}.md"):
+                    continue
+                content = row.get("content") or ""
+                metas.append(
+                    {
+                        "id": note_id,
+                        "type": row.get("type") or "misc",
+                        # The index has no description column, so derive it the
+                        # same way the write path does when frontmatter omits
+                        # one — the bullets stay populated either way.
+                        "description": _derive_description(content),
+                        "title": row.get("title") or note_title(content) or note_id,
+                    }
+                )
+            if not metas:
+                return (
+                    f"No indexable notes found in {binding.name} "
+                    f"(`{binding.alias}`) — the knowledge index holds no notes "
+                    "for this knowledge base."
+                )
+            # knowledge_base_repo_separation §7 step 4: this used to write
+            # `<root>/index.md` through the workspace, the last vault write in
+            # this module besides the note materialisation. It cannot stay.
+            # The vault is not a workspace directory any more — writing OKF
+            # navigation into the checkout would put `index.md` in the jobs
+            # repo while every note it links to is committed to the knowledge
+            # repo, which is precisely the split this design removes. Nor can
+            # the agent read the repo's current `index.md`, so regenerating it
+            # blind would silently drop the human-authored sections outside
+            # the generated markers that `render_index_md` exists to preserve.
+            #
+            # Generated vault navigation needs a server-side owner. The note
+            # materialisation endpoint is not it: `index`/`log` are reserved
+            # OKF basenames it refuses by contract (they are generated
+            # artefacts the reindexer never indexes), and the reindexer —
+            # which already walks every note on every sweep and can read the
+            # existing file — is the natural home. Until that exists,
+            # kb_index reports the grouping instead of writing it somewhere
+            # wrong. Nothing is lost: no code reads `knowledge/index.md`, and
+            # `kb_list` gives the same grouping live.
+            summary = (
+                f"Indexed {len(metas)} note(s) from the knowledge index of "
+                f"{binding.name} (`{binding.alias}`)."
+            )
+            if truncated:
+                summary += (
+                    f" WARNING: only the first {_VAULT_SCAN_CAP} notes were "
+                    "read (scan cap) — the grouping is incomplete."
+                )
+            return summary + (
+                f" `{root}/index.md` was NOT rewritten: the vault lives in the "
+                "project's knowledge repository, not in this workspace, so its "
+                "generated navigation is never written from here. The notes "
+                "themselves are unaffected — `kb_list` gives the same grouping "
+                "live, and `kb_read`/`kb_search` reach every one of them."
+            )
+        else:
+            root = str(path).rstrip("/")
+            if not context.has_workspace():
+                return (
+                    f"Error: indexing `{root}/` needs a workspace backend, and "
+                    "this runtime has none. Omit `path` to index the project "
+                    "knowledge base, which reads from the knowledge index."
+                )
+            ws = context.workspace_manager
+            try:
+                entries = ws.list_files(root, "*.md")
+            except Exception as e:
+                return f"Error listing `{root}/`: {e}"
+            for rel in entries:
+                if rel.endswith("/") or is_reserved(rel):
+                    continue
+                try:
+                    fm, body = parse_note_md(ws.read_file(rel))
+                except Exception as e:
+                    # Malformed YAML (ValueError) or an unreadable file —
+                    # kb_lint surfaces the former; skip it for indexing anyway.
+                    logger.warning(f"kb_index: skipping {rel}: {e}")
+                    continue
+                note_id = fm.get("id") if fm else None
+                if not note_id:
+                    continue  # unindexable (kb_lint reports the missing id)
+                metas.append(
+                    {
+                        "id": note_id,
+                        "type": fm.get("type") or "misc",
+                        "description": fm.get("description"),
+                        "title": note_title(body) or note_id,
+                    }
+                )
+            if not metas:
+                return f"No indexable notes found under `{root}/`."
+
+        # Only the explicit non-vault mode reaches here — an ordinary markdown
+        # directory in the workspace (`docs`, a repository datasource
+        # checkout), which is a workspace file by definition and stays one.
         index_rel = f"{root}/index.md"
         existing = ws.read_file(index_rel) if ws.exists(index_rel) else None
         try:
