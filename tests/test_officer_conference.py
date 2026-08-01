@@ -191,7 +191,7 @@ class TestWatchdogHold:
 
     @pytest.mark.asyncio
     async def test_suspended_conference_concludes_hold(self, monkeypatch):
-        # Legatus walked away; attention sweep parked the conference. The
+        # Legate walked away; attention sweep parked the conference. The
         # meeting is over — the officer must not be held all night.
         held = _officer_row(hold={"kind": "conference", "thread_id": CONF_TID})
         suspended = _conference_row(status="suspended")

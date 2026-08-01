@@ -27,7 +27,7 @@ see *Night-2 addendum*.
 §2/S9) on the Better Resavio century, evening of 2026-07-30. The mechanical
 layer worked exactly as designed: one open conference per project, officer
 hold stamped and politely announced, brief wake enqueued on conclude,
-hold released. Everything in this document is what stood between a Legatus
+hold released. Everything in this document is what stood between a Legate
 dictating a two-paragraph order at 17:28 and the century acting on it —
 **as of filing, ~2.5 h later, the officer still has not received the
 order.** Each finding alone is survivable; chained, they turned a working
@@ -45,7 +45,7 @@ handoff mechanism into a deadlock.
 | 17:30–17:36 | Officer wake: **15+ searches, all against index stamped `29f03b66` (stale)** — directive unfindable; 10-action wake budget guard trips; "Conference handoff gap" appended to century-state; digest item queued (F3, F5) |
 | 18:06 | Next wake: still nothing → **page 2/3**: "the promised durable direction still is not present…" (delivered — the page→email channel works; F4) |
 | 17:37–19:03 | Operator reindex → runs **full**: 3012 notes re-embedded, **86 minutes**, finishes **partial** (12 varchar errors + 17 broken frontmatter + 4 dup-id pairs); watermark finally advances past `29f03b66` (F5) |
-| 18:37, 19:23 | Officer wakes **no longer search at all** — after repeated failure he rationally stops polling and waits for the Legatus. The healed index is invisible to him (F3) |
+| 18:37, 19:23 | Officer wakes **no longer search at all** — after repeated failure he rationally stops polling and waits for the Legate. The healed index is invisible to him (F3) |
 
 ## Findings
 
@@ -54,7 +54,7 @@ duty.** The centurion tool family (`list/get/create/approve/resume/cancel/
 pause/steer_worker_job`, `get_stuck_jobs`) calls the global endpoints
 (`GET /api/jobs`, `PUT /api/jobs/{id}/cancel`, …) via a client that acts
 as the *session user* (`src/tools/orchestrator/jobs.py:742`). For an admin
-Legatus that is the whole cluster; for any user it is all their projects
+Legate that is the whole cluster; for any user it is all their projects
 plus ownerless MCP jobs. The sitrep generator is correctly
 project-scoped — his *senses* are scoped, his *hands* are not. Live
 consequence: the embodiment proposed cancelling another project's test
@@ -83,10 +83,10 @@ live) and inject **handles plus the inline body of small notes** directly
 into the wake payload. An aux-LLM transcript summary covers direction that
 was discussed but never written (weak/lazy embodiment); it must never
 block the hold-release, degrade to the manifest on aux failure, and be
-marked machine-generated (a Legatus note always outranks it). Wake copy
+marked machine-generated (a Legate note always outranks it). Wake copy
 should stop implying search is the retrieval path.
 
-**F4 — notify_user reaches the Legatus unevenly, and success reporting
+**F4 — notify_user reaches the Legate unevenly, and success reporting
 can lie.** `digest` urgency appends to a metadata ring surfaced **only**
 on the cockpit officer card ("Digest — what he queued for you") — no
 badge, no push, no email; three items sat there invisible all evening
@@ -94,7 +94,7 @@ badge, no push, no email; three items sat there invisible all evening
 (email via SMTP; the 18:06 page arrived), but `_dispatch_officer_page`
 returns `not results.get("error")` while the email leg can fail with only
 `results["email"]=False` — a failed send can still report "Paged the
-Legatus". The 07:48 page was likely delivered but unnoticed; there is no
+Legate". The 07:48 page was likely delivered but unnoticed; there is no
 in-app record of sent pages beyond the budget counter.
 **Addendum (07-31): the page email cannot be answered.** The cockpit
 "Answer" button in the notification center dead-ends — officer pages are

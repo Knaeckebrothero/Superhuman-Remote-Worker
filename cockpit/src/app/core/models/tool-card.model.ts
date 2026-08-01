@@ -124,7 +124,7 @@ export interface NotifyMessageView {
     readonly subject?: string;
     /** The message body, rendered like normal chat message text. */
     readonly body: string;
-    /** Delivery receipt — the tool's result string ("Paged the Legatus (2/3 …)."). */
+    /** Delivery receipt — the tool's result string ("Paged the Legate (2/3 …)."). */
     readonly receipt?: string;
 }
 

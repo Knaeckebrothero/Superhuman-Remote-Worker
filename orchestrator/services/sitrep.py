@@ -169,7 +169,7 @@ async def build_wake_message(
 
         lines.append(
             "Assess, act within your authority, then file a sleep. Use "
-            "notify_user if something needs the Legatus."
+            "notify_user if something needs the Legate."
         )
         patch = {
             "sitrep": {

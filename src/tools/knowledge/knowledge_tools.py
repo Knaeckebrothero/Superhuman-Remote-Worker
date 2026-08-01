@@ -109,7 +109,7 @@ def _charter_write_denied(context: "ToolContext") -> Optional[str]:
 
     Worker jobs process untrusted external content; a prompt-injection chain
     from the object level must not be able to rewrite the officer's standing
-    orders. Only sessions — Legatus or officer hands, identified by the
+    orders. Only sessions — Legate or officer hands, identified by the
     ToolContext carrying a persistent-session thread id — may create or edit
     'charter' notes. Workers file 'report' notes instead (provenance rides
     the job_id column).
@@ -117,7 +117,7 @@ def _charter_write_denied(context: "ToolContext") -> Optional[str]:
     if getattr(context, "_thread_id", None):
         return None
     return (
-        "Error: 'charter' notes are Legatus/officer-owned standing orders and "
+        "Error: 'charter' notes are Legate/officer-owned standing orders and "
         "cannot be written from a worker job. File your findings as a "
         "'report' note instead."
     )
@@ -1142,7 +1142,7 @@ def create_kb_tools(
                     f"Error: this project already has an active charter "
                     f"('{_existing_charter['id']}'). One charter per project — "
                     f"edit it with kb_update('{_existing_charter['id']}', ...) "
-                    f"(posture block only, unless you are the Legatus)."
+                    f"(posture block only, unless you are the Legate)."
                 )
 
         # Exact-duplicate short-circuit (Step 1 hardening, docs §11.1): a

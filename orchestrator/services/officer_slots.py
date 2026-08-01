@@ -2,7 +2,7 @@
 
 The flat ``officer.max_concurrent_workers`` cap answers "how many workers
 may he run"; slots answer "what KIND of workers does he command". The
-Legatus assigns a kit at provision time::
+Legate assigns a kit at provision time::
 
     officer:
       enabled: true

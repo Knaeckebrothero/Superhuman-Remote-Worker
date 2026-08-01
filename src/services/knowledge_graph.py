@@ -64,7 +64,7 @@ NOTE_TYPES = frozenset(
         "idea",
         # Officer types (docs/features/centurion.md §5, vector/0015). 'charter'
         # is the project's pinned commander's-intent note — one ACTIVE charter
-        # per project, write-gated to sessions (Legatus/officer hands; workers
+        # per project, write-gated to sessions (Legate/officer hands; workers
         # are refused in kb_write). 'report' is a worker recon deliverable —
         # provenance rides job_id; reports inform, never steer.
         "charter",

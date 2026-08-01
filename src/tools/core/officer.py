@@ -47,7 +47,7 @@ OFFICER_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "module": "core.officer",
         "function": "notify_user",
         "description": (
-            "Message your Legatus (the user) out-of-band. urgency='log' for "
+            "Message your Legate (the user) out-of-band. urgency='log' for "
             "the record only, 'digest' for the next briefing, 'page' for an "
             "immediate notification (budgeted per day — over budget it "
             "downgrades to digest). Officer sessions only."
@@ -106,13 +106,13 @@ def create_officer_tools(context: ToolContext) -> List[Any]:
 
     @tool
     async def notify_user(message: str, urgency: str = "log", subject: str = "") -> str:
-        """Message your Legatus (the user) through the notify contract.
+        """Message your Legate (the user) through the notify contract.
 
         Three tiers — pick the LOWEST that serves the purpose:
           * ``log``: for the record only. Costs nothing, interrupts nobody.
             The default; most observations belong here.
           * ``digest``: queued for the next briefing/conference. For things
-            the Legatus should know but not be woken for.
+            the Legate should know but not be woken for.
           * ``page``: immediate out-of-band notification (email/push). For
             things that cannot wait: repeated failures you cannot fix, a
             blocked decision above your authority, capacity exhausted with
@@ -121,7 +121,7 @@ def create_officer_tools(context: ToolContext) -> List[Any]:
             they are.
 
         Args:
-            message: What the Legatus needs to know, in 1-5 sentences.
+            message: What the Legate needs to know, in 1-5 sentences.
             urgency: 'log' | 'digest' | 'page'.
             subject: Short subject line (page/digest only).
 
@@ -156,7 +156,7 @@ def create_officer_tools(context: ToolContext) -> List[Any]:
         delivered = data.get("delivered")
         if delivered == "page":
             return (
-                f"Paged the Legatus ({data.get('pages_used_today')}/"
+                f"Paged the Legate ({data.get('pages_used_today')}/"
                 f"{data.get('pages_budget')} pages used today)."
             )
         if data.get("downgraded"):
