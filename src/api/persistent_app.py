@@ -15,7 +15,7 @@ import re
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Awaitable, Callable, Dict, List, NoReturn, Optional
+from typing import Any, Awaitable, Callable, Dict, List, NoReturn, Optional, Tuple
 
 import httpx
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
@@ -2962,6 +2962,18 @@ async def handle_persistent_websocket(ws: WebSocket) -> None:
                         )
                         continue
                     _session.permission_mode = new_mode
+                    if new_mode in ("auto_accept", "autonomous"):
+                        # Rows announced under the stricter mode that the new
+                        # one auto-approves will never reach a gate — retire
+                        # them now so the card shrinks instead of stranding
+                        # entries nobody waits on. The row an active waiter
+                        # holds is deliberately left alone.
+                        asyncio.create_task(
+                            _retire_announced_permission_rows(
+                                f"mode.set {new_mode}", new_mode
+                            ),
+                            name="retire-announced-on-mode-downgrade",
+                        )
                     await _ws_send(ws, "mode.changed", {"mode": new_mode})
                     logger.info(f"Permission mode changed to: {new_mode}")
                 else:
@@ -4345,6 +4357,112 @@ async def _has_terminal_permission_decision(tool_call_id: str) -> bool:
         return False
 
 
+# tool_call_id -> (permission-row id, tool name) for the batch announced by
+# the turn currently running. Mutated in place (never rebound) so tests and
+# concurrent readers see one dict.
+_announced_permission_rows: Dict[str, Tuple[str, str]] = {}
+
+# The row _loop_permission_check is blocked on right now, if any. A sweep must
+# never expire it out from under its own waiter: the waiter would read
+# 'expired', report NO_ANSWER and park a turn the user had just unblocked.
+_active_permission_request_id: Optional[str] = None
+
+
+async def _retire_announced_permission_rows(
+    reason: str, mode: Optional[str] = None
+) -> None:
+    """CAS-expire announced permission rows that nothing will ever claim.
+
+    An announced row is only retired by its OWN gate in
+    ``_loop_permission_check``, and that gate runs at most once per call. Any
+    turn exit before call *i* — parked on NO_ANSWER, interrupted, errored, or
+    a mid-batch mode downgrade — strands rows *i..N* as 'pending' forever:
+    there is no ``expires_at`` sweeper anywhere, only an active waiter
+    CAS-expires a row.
+
+    A stranded row is not inert. ``_pending_permission_requests`` rides the
+    ``session.state`` welcome frame, so it re-renders on every reattach as a
+    live approval card; "Approve all" flips it to 'approved', the NOTIFY
+    reaches NO waiter, and **nothing executes** while the user believes they
+    approved those tools. That silent divergence between what the UI claims
+    and what runs is why this cleanup exists.
+
+    ``mode``: retire only the rows that permission mode would no longer gate
+    (a mid-batch downgrade). Omitted ⇒ retire the whole batch, which is what
+    the end of a turn wants. The row an active waiter is holding is never
+    touched.
+
+    CAS (``WHERE id = $1 AND status = 'pending'``) so a genuine decision that
+    landed a microsecond earlier still wins; only rows this sweep really
+    expired are broadcast, so an attached client drops exactly those cards.
+    """
+    if not _announced_permission_rows:
+        return
+    doomed = [
+        (tool_call_id, request_id)
+        for tool_call_id, (request_id, tool_name) in _announced_permission_rows.items()
+        if (mode is None or not _gate_needed(mode, tool_name))
+        and request_id != _active_permission_request_id
+    ]
+    if not doomed:
+        return
+    for tool_call_id, _ in doomed:
+        _announced_permission_rows.pop(tool_call_id, None)
+
+    if _session is None or _session.postgres_conn is None:
+        return
+
+    expired: List[Tuple[str, str]] = []
+    unswept: List[Tuple[str, Tuple[str, str]]] = []
+    try:
+        async with _session.postgres_conn.acquire() as conn:
+            for idx, (tool_call_id, request_id) in enumerate(doomed):
+                try:
+                    row_id = await conn.fetchval(
+                        "UPDATE thread_permission_requests "
+                        "SET status = 'expired', decided_at = now(), "
+                        "    decided_by = 'system' "
+                        "WHERE id = $1 AND status = 'pending' "
+                        "RETURNING id",
+                        request_id,
+                    )
+                except Exception:
+                    # Re-track the rows we never got to so a later sweep
+                    # (next announce / next turn end) can retry them.
+                    unswept = [
+                        (tcid, (rid, ""))
+                        for tcid, rid in doomed[idx:]
+                        if tcid not in _announced_permission_rows
+                    ]
+                    raise
+                if row_id is not None:
+                    expired.append((tool_call_id, request_id))
+    except Exception as e:
+        logger.warning(
+            "Retiring announced permission rows failed (%s): %s", reason, e
+        )
+        for tool_call_id, entry in unswept:
+            _announced_permission_rows.setdefault(tool_call_id, entry)
+
+    for tool_call_id, request_id in expired:
+        # Journal it like any other outcome so an attached cockpit drops the
+        # card immediately instead of showing a gate nobody is waiting on.
+        _broadcast(
+            "permission.resolved",
+            {
+                "id": tool_call_id,
+                "approval_id": request_id,
+                "decision": "expired",
+            },
+        )
+    if expired:
+        logger.info(
+            "Retired %d unclaimed announced permission row(s) (%s)",
+            len(expired),
+            reason,
+        )
+
+
 async def _loop_announce_permission_batch(tool_calls: List[Dict[str, Any]]) -> None:
     """Insert a pending row for every gate-needing call in one batch, then
     emit a single ``permission.request_batch`` frame.
@@ -4355,6 +4473,10 @@ async def _loop_announce_permission_batch(tool_calls: List[Dict[str, Any]]) -> N
     """
     if _session is None or _thread_id is None:
         return
+    # Belt-and-braces against a turn that ended without its cleanup hook
+    # (e.g. the loop task cancelled outright): never let a previous batch's
+    # rows sit pending behind a fresh one.
+    await _retire_announced_permission_rows("superseded by a new batch")
     mode = _session.permission_mode
     gated = [tc for tc in tool_calls if _gate_needed(mode, tc.get("name", ""))]
     if not gated:
@@ -4379,6 +4501,10 @@ async def _loop_announce_permission_batch(tool_calls: List[Dict[str, Any]]) -> N
         if request_id is None:
             # DB refused this row — leave it to the per-call gate path.
             continue
+        # Own the row until its gate claims it or the turn ends. Without this
+        # ledger nothing can tell a row that was answered from one the turn
+        # walked away from.
+        _announced_permission_rows[tool_call_id] = (request_id, tool_name)
         requests.append(
             {
                 "id": tool_call_id,
@@ -4631,7 +4757,13 @@ async def _loop_permission_check(
 
     mode = _session.permission_mode
 
+    # A mid-batch mode downgrade takes these early exits *before* the claim
+    # block below, so this call's announced row — and every later one the new
+    # mode auto-approves — would never be retired by anyone. Sweep them here,
+    # scoped by the new mode so a shell call still gating under auto_accept
+    # keeps the row its own gate is about to claim.
     if mode == "autonomous":
+        await _retire_announced_permission_rows("mode downgraded to autonomous", mode)
         return PermissionOutcome.APPROVED
 
     if mode == "auto_accept":
@@ -4640,6 +4772,9 @@ async def _loop_permission_check(
         # in lockstep with _gate_needed — two independently-maintained sets
         # could silently drift and leave a gated call with no announced row.
         if tool_name not in _SHELL_TOOLS:
+            await _retire_announced_permission_rows(
+                "mode downgraded to auto_accept", mode
+            )
             return PermissionOutcome.APPROVED
 
     # Phase 5 wake path: if this tool_call_id was already resolved (typical
@@ -4685,12 +4820,20 @@ async def _loop_permission_check(
                 # inserting again would orphan a card nobody waits on.
                 claimed_request_id = str(existing["id"])
         except Exception as e:
-            # Soft-fail: fall through to the regular INSERT-and-wait path.
+            # Soft-fail: fall through to the regular INSERT-and-wait path…
             logger.warning(
                 "Wake-path SELECT for tool_call %s failed (%s); falling back",
                 tool_call_id,
                 e,
             )
+            # …unless the announce step still remembers the row it created
+            # for this exact tool_call_id. Inserting a SECOND row would hand
+            # the waiter a NEW approval_id while the card keeps showing the
+            # announced one; the user's decision then resolves a row nobody
+            # is listening on and the turn blocks forever with the card gone.
+            remembered = _announced_permission_rows.get(tool_call_id)
+            if remembered is not None:
+                claimed_request_id = remembered[0]
 
     # Supervised mode (or shell under auto_accept): ask user via the
     # durable permission table, then wait on LISTEN/NOTIFY.
@@ -4738,7 +4881,15 @@ async def _loop_permission_check(
             name="phase5-flip-awaiting-user-sudo",
         )
 
-    final_status = await _wait_for_permission_resolution(request_id)
+    # Publish the row we are blocked on so a concurrent sweep (mode.set from
+    # the WS task) can't expire it under us and turn a live question into a
+    # parked turn.
+    global _active_permission_request_id
+    _active_permission_request_id = request_id
+    try:
+        final_status = await _wait_for_permission_resolution(request_id)
+    finally:
+        _active_permission_request_id = None
     # Three-state, deliberately NOT collapsed to a bool: 'expired' means the
     # question was never answered, which is not the user refusing.
     if final_status == "approved":
@@ -4913,6 +5064,11 @@ async def _notify_cloud_stage() -> None:
 
 
 async def _loop_on_turn_complete(turn_id: int, metrics: Optional[dict] = None) -> None:
+    # Runs on EVERY turn exit — completed, parked on an unanswered gate,
+    # interrupted, or errored (run_persistent_loop catches and still calls
+    # this). Announced rows no gate ever claimed must die with the turn, or
+    # they resurface on reattach as an approval card that runs nothing.
+    await _retire_announced_permission_rows(f"turn {turn_id} ended")
     if _session is None:
         return
     # Ensure the (shared) session aux LLM logs to llm_requests — covers the
