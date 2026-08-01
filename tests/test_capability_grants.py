@@ -123,7 +123,7 @@ def test_flags_ungranted_shell_and_vm_and_autonomy():
 
 
 def test_datasource_grant_covers_every_datasource_tool_category():
-    for category in ("sql", "mongodb", "graph", "webdav", "email", "mcp"):
+    for category in ("sql", "mongodb", "graph", "webdav", "email", "mcp", "repo"):
         violations = evaluate(
             {"tools": {category: ["tool"]}},
             {**DEFAULTS, "datasource_tools": False},
