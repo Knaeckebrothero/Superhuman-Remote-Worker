@@ -143,3 +143,32 @@ async def test_visibility_union_and_primary(db, seeded):
         )
     edited = await db.update_contact_address(second["id"], address="+4917033333")
     assert edited["opt_in_status"] == "pending" and edited["last_inbound_at"] is None
+
+
+async def test_update_contact_notes_tristate(db, seeded):
+    """Regression: update_contact must prepare at all.
+
+    ``$3`` used to appear only in ``IS NULL`` / ``NULLIF($3, '')``, neither of
+    which pins a type, so asyncpg's untyped PREPARE raised
+    AmbiguousParameterError on *every* call — PATCH /api/contacts/{id} was a
+    guaranteed 500. Caught by the dev live gate, not by the suite, because
+    update_contact had no direct test. Cast is ``$3::text``.
+    """
+    c = await db.create_contact(seeded["a"], "Tri State", "original")
+
+    unchanged = await db.update_contact(c["id"], None, None)
+    assert unchanged["display_name"] == "Tri State"
+    assert unchanged["notes"] == "original"
+
+    renamed = await db.update_contact(c["id"], "Tri State II", None)
+    assert renamed["display_name"] == "Tri State II"
+    assert renamed["notes"] == "original"
+
+    set_notes = await db.update_contact(c["id"], None, "replaced")
+    assert set_notes["notes"] == "replaced"
+
+    cleared = await db.update_contact(c["id"], None, "")
+    assert cleared["notes"] is None
+    assert cleared["display_name"] == "Tri State II"
+
+    assert await db.update_contact("00000000-0000-0000-0000-000000000000") is None

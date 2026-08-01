@@ -12626,13 +12626,22 @@ class PostgresDB:
 
         ``notes``: ``None`` leaves it unchanged, ``""`` clears it, any other
         text sets it — the Cockpit form sends ``""`` to clear.
+
+        ``$3`` is cast explicitly. asyncpg prepares statements without
+        declaring parameter types, and ``$3`` only ever appears in
+        ``IS NULL`` and ``NULLIF($3, '')`` — neither pins a type, so Postgres
+        raised ``AmbiguousParameterError`` at PREPARE time for *every* call,
+        whatever the values, making ``PATCH /api/contacts/{id}`` a guaranteed
+        500. ``$2`` needs no cast: ``COALESCE($2, display_name)`` resolves
+        against the column.
         """
         async with self.acquire() as conn:
             row_id = await conn.fetchval(
                 """
                 UPDATE contacts
                    SET display_name = COALESCE($2, display_name),
-                       notes = CASE WHEN $3 IS NULL THEN notes ELSE NULLIF($3, '') END,
+                       notes = CASE WHEN $3::text IS NULL THEN notes
+                                    ELSE NULLIF($3::text, '') END,
                        updated_at = NOW()
                  WHERE id = $1
              RETURNING id
