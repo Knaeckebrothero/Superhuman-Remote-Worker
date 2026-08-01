@@ -981,6 +981,29 @@ def clone_repository_datasources(
                 if branch:
                     git_mgr.checkout_branch(branch)
                 workspace_manager.source_repos[repo_name] = git_mgr
+                try:
+                    from ..services.forge import parse_owner_repo, resolve_api_base
+
+                    forge = str((ds.get("config") or {}).get("forge") or "").lower()
+                    raw_url = ds.get("connection_url", "")
+                    owner, repo_slug = parse_owner_repo(raw_url)
+                    workspace_manager.source_repo_meta[repo_name] = {
+                        "forge": forge,
+                        "api_base": resolve_api_base(raw_url, forge),
+                        "owner": owner,
+                        "repo": repo_slug,
+                        "token": (creds or {}).get("token", ""),
+                        "read_only": bool(ds.get("read_only")),
+                        "default_branch": branch,
+                    }
+                except Exception as e:
+                    # A metadata failure must not fail the clone; the repo is
+                    # still usable through the shell and the read-only git tools.
+                    logger.warning(
+                        "Could not record forge metadata for repos/%s: %s",
+                        repo_name,
+                        e,
+                    )
                 logger.info(
                     "Cloned repository datasource %r into repos/%s",
                     ds_name,
