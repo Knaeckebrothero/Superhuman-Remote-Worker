@@ -95,6 +95,21 @@ finish."*
 From the outside a livelocked critic is indistinguishable from a slow one.
 Nothing distinguishes them today, and nothing bounds the wait.
 
+**The mechanism itself is healthy — measured.** Cancelling the critic at 14:34
+made the parent eligible, and the sweeper moved it to `pending_review` at
+15:06:17 with *"Automated verification did not complete (critic pipeline died);
+returned to manual review."* — 32 minutes after the parent's `updated_at` was
+bumped, i.e. the 30-minute grace plus one sweep interval. So the watchdog fires
+correctly and promptly once its predicate is satisfiable. The gap is precisely
+and only the live-critic case: nothing else about it needs changing, which makes
+fix 2 below a narrow addition rather than a rework.
+
+Note the second-order effect: cancelling the critic *bumped the parent's
+`updated_at`*, restarting the grace clock. An operator manually clearing a
+wedged critic therefore waits a further full grace period before the parent
+moves. Harmless here, but worth knowing before someone concludes the watchdog is
+broken.
+
 ## Fix directions
 
 1. **Count rejected verdict submissions per critic.** After N (3 is
