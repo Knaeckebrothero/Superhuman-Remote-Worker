@@ -107,6 +107,7 @@ class _FakeShellBackend:
 
     def __init__(self):
         self.runs = []  # (command, tab_name, working_dir)
+        self.sends = []  # (text, tab_name, working_dir)
         self.tabs = []  # tab names ensured/opened
         self.closed = []
         self.cancelled = []  # tab names cancelled
@@ -117,6 +118,10 @@ class _FakeShellBackend:
 
     def shell_ensure_tab(self, name):
         self.tabs.append(name)
+
+    def shell_send(self, name, text, enter=True, working_dir=None):
+        self.sends.append((text, name, working_dir))
+        return f"sent {text} to {name}"
 
     def shell_close_tab(self, name):
         self.closed.append(name)
@@ -143,6 +148,12 @@ class TestSubdirBackendShell:
         sub = SubdirBackend(fake, "wt")
         sub.shell_run("ls", working_dir="sub")
         assert fake.runs[-1][2] == "wt/sub"
+
+    def test_async_working_dir_is_rerooted(self):
+        fake = _FakeShellBackend()
+        sub = SubdirBackend(fake, "wt")
+        sub.shell_send("default", "npm run dev", working_dir="sub")
+        assert fake.sends[-1] == ("npm run dev", "default", "wt/sub")
 
     def test_tab_names_namespaced(self):
         fake = _FakeShellBackend()

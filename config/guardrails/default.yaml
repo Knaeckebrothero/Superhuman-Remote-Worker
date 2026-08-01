@@ -93,16 +93,16 @@ tool_examples:
   # ----- src/tools/shell/shell_tools.py -----
   run_command: |-
     Examples:
-        run_command(command="pytest tests/ -x")
-        run_command(command="git diff HEAD~1", tail=100)
-        run_command(command="npm run build", timeout=300)
-        run_command(command="sshpass -p 'pass' ssh user@host 'systemctl status nginx'")
+        run_command(command="pytest tests/ -x", working_dir=".")
+        run_command(command="git diff HEAD~1", working_dir=".", tail=100)
+        run_command(command="npm run build", working_dir=".", timeout=300)
+        run_command(command="sshpass -p 'pass' ssh user@host 'systemctl status nginx'", working_dir=".")
 
   shell_execute: |-
     Examples:
-        shell_execute(command="pytest tests/ -x")
-        shell_execute(command="npm run dev", name="dev", is_async=True)
-        shell_execute(command="C-c", name="dev", keys=True)
+        shell_execute(command="pytest tests/ -x", working_dir=".")
+        shell_execute(command="npm run dev", working_dir=".", name="dev", is_async=True)
+        shell_execute(command="C-c", working_dir=".", name="dev", keys=True)
 
   shell_read: |-
     Examples:

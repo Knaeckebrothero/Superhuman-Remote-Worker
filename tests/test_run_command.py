@@ -8,7 +8,7 @@ is RemoteBackend's, covered by test_workspace_backends.py.
 """
 
 import uuid
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -25,6 +25,13 @@ def make_backend():
     backend = MagicMock()
     backend.supports_shell = True
     backend.shell_run.return_value = "Exit code: 0\n--- stdout ---\nok"
+    backend.shell_send.return_value = "Sent"
+    backend.shell_read.return_value = ("output", {"tab": "default"})
+    backend.shell_read_with_offset.return_value = (
+        "output",
+        {"tab": "default"},
+    )
+    backend.shell_format_tab_header.return_value = "[Shells: default]"
     return backend
 
 
@@ -130,6 +137,17 @@ class TestRunCommand:
         assert "Exit code: 0" in result
         assert "hello-world" in result
         assert backend.shell_run.call_args[0][0] == "echo hello-world"
+        assert backend.shell_run.call_args[1]["working_dir"] == "."
+
+    def test_working_dir_forwarded(self, manager, backend):
+        tool = self._get_run_command(manager)
+        tool.invoke({"command": "pwd", "working_dir": "repo"})
+        assert backend.shell_run.call_args[1]["working_dir"] == "repo"
+
+    def test_null_working_dir_is_normalized_to_workspace_root(self, manager, backend):
+        tool = self._get_run_command(manager)
+        tool.invoke({"command": "pwd", "working_dir": None})
+        assert backend.shell_run.call_args[1]["working_dir"] == "."
 
     def test_exit_code_captured(self, manager, backend):
         backend.shell_run.return_value = "Exit code: 1\n(no output)"
@@ -245,6 +263,61 @@ class TestRunCommand:
         tool = self._get_run_command(manager)
         result = tool.invoke({"command": "true"})
         assert "Exit code: 0" in result
+
+
+class TestShellExecuteWorkingDir:
+    """The persistent tool applies working_dir only to command paths."""
+
+    def _get_shell_execute(self, manager):
+        context = _make_context(manager, mode="persistent")
+        tools = create_shell_tools(context)
+        return next(t for t in tools if t.name == "shell_execute")
+
+    def test_sync_working_dir_forwarded(self, manager, backend):
+        tool = self._get_shell_execute(manager)
+        tool.invoke({"command": "pwd", "working_dir": "repo"})
+        backend.shell_run.assert_called_once_with(
+            "pwd",
+            tab_name="default",
+            timeout=None,
+            working_dir="repo",
+        )
+
+    def test_async_working_dir_forwarded_to_send(self, manager, backend):
+        tool = self._get_shell_execute(manager)
+        with patch("src.tools.shell.shell_tools.time.sleep"):
+            tool.invoke(
+                {
+                    "command": "npm run dev",
+                    "name": "dev",
+                    "is_async": True,
+                    "working_dir": "repo",
+                }
+            )
+        backend.shell_send.assert_called_once_with(
+            "dev",
+            "npm run dev",
+            enter=True,
+            working_dir="repo",
+        )
+
+    def test_keys_mode_ignores_working_dir(self, manager, backend):
+        tool = self._get_shell_execute(manager)
+        with patch("src.tools.shell.shell_tools.time.sleep"):
+            tool.invoke(
+                {
+                    "command": "C-c",
+                    "keys": True,
+                    "working_dir": "repo",
+                }
+            )
+        backend.shell_send.assert_called_once_with(
+            "default",
+            "C-c",
+            enter=False,
+            working_dir=None,
+        )
+        backend.shell_run.assert_not_called()
 
 
 class TestToolNameAliasing:
