@@ -2023,17 +2023,45 @@
     "projectsShort": "Proj.",
     "primary": "primär",
     "noAddresses": "Keine Adressen",
-    "optIn": {"pending": "Opt-in ausstehend", "opted_out": "abgemeldet"},
-    "filter": {"allChannels": "Alle Kanäle", "allProjects": "Alle Projekte"},
-    "form": {"newTitle": "Neuer Kontakt", "editTitle": "Kontakt bearbeiten", "name": "Anzeigename",
-             "notes": "Notizen (für Agenten sichtbar — Briefings, Präferenzen, Kontext)",
-             "addresses": "Adressen", "addAddress": "+ Adresse hinzufügen", "projects": "Projekte",
-             "channelLocked": "Der Kanal kann nach dem Speichern nicht mehr geändert werden — entferne diese Adresse und füge stattdessen eine neue hinzu."},
-    "delete": {"title": "Kontakt löschen",
-               "message": "Der Kontakt wird aus diesen Projekten entfernt: {{projects}}. Agenten können diese Person danach nicht mehr erreichen.",
-               "namePrompt": "Geben Sie zur Bestätigung den Namen des Kontakts ein:"},
+    "optIn": {
+      "pending": "Opt-in ausstehend",
+      "opted_out": "abgemeldet"
+    },
+    "filter": {
+      "allChannels": "Alle Kanäle",
+      "allProjects": "Alle Projekte",
+      "channelAria": "Nach Kanal filtern",
+      "projectAria": "Nach Projekt filtern"
+    },
+    "form": {
+      "newTitle": "Neuer Kontakt",
+      "editTitle": "Kontakt bearbeiten",
+      "name": "Anzeigename",
+      "notes": "Notizen (für Agenten sichtbar — Briefings, Präferenzen, Kontext)",
+      "addresses": "Adressen",
+      "addAddress": "Adresse hinzufügen",
+      "projects": "Projekte",
+      "channelLocked": "Der Kanal kann nach dem Speichern nicht mehr geändert werden — entferne diese Adresse und füge stattdessen eine neue hinzu.",
+      "namePlaceholder": "Anna Weber",
+      "notesLabel": "Notizen",
+      "addressesHint": "Wo Agenten diese Person erreichen dürfen. Die erste Adresse eines Kanals wird zur primären.",
+      "removeAddress": "Adresse entfernen",
+      "channelAria": "Kanal",
+      "addressAria": "Adresse",
+      "projectsHint": "Agenten in einem verknüpften Projekt können diesen Kontakt anschreiben.",
+      "noProjects": "Noch keine Projekte. Lege eines an, um den Kontakt zu verknüpfen."
+    },
+    "delete": {
+      "title": "Kontakt löschen",
+      "message": "Der Kontakt wird aus diesen Projekten entfernt: {{projects}}. Agenten können diese Person danach nicht mehr erreichen.",
+      "namePrompt": "Geben Sie zur Bestätigung den Namen des Kontakts ein:"
+    },
     "saveError": "Speichern fehlgeschlagen. Einige Änderungen wurden möglicherweise nicht übernommen — Kontakt prüfen und erneut versuchen.",
-    "deleteError": "Löschen fehlgeschlagen. Möglicherweise fehlt die Berechtigung, oder der Kontakt hat sich bereits geändert — aktualisieren und erneut versuchen."
+    "deleteError": "Löschen fehlgeschlagen. Möglicherweise fehlt die Berechtigung, oder der Kontakt hat sich bereits geändert — aktualisieren und erneut versuchen.",
+    "subtitle": "Personen, die deine Agenten erreichen dürfen. Verknüpfe einen Kontakt mit einem Projekt, damit Agenten darin ihn anschreiben können.",
+    "emptyTitle": "Noch keine Kontakte",
+    "noAddressesHint": "Dieser Kontakt hat keine Adressen und ist daher für keinen Agenten erreichbar. Füge eine hinzu.",
+    "loadError": "Kontakte konnten nicht geladen werden. Prüfe die Verbindung und versuche es erneut."
   },
   "inbox": {
     "title": "Aktionszentrum",
