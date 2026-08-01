@@ -11,9 +11,10 @@ tags:
 # Issue — attachment upload was never implemented for the lite workspace tiers
 
 **Status:** Found 2026-07-30 on dev while diagnosing session `e6e6d412`.
-**FIXED 2026-07-30** for `virtual`; `none` now refuses honestly. Unit-tested
-(`tests/test_thread_uploads.py`, 26 cases) and **k3d live-gated** — see
-"Live gate" below.
+**FIXED 2026-07-30** (commit `94eb3e71` on `develop`) for `virtual`; `none` now
+refuses honestly. Unit-tested (`tests/test_thread_uploads.py`, 26 cases) and
+**k3d live-gated**, then **confirmed on dev 2026-08-01** against the original
+repro payload (session `5833c729`) — see "Live gate" and "Dev confirmation".
 
 **One line:** `POST /api/persistent/threads/{id}/uploads` only knows how to SFTP
 into a workspace container or VM, so on `virtual` — the **default** session tier,
@@ -113,14 +114,17 @@ handler runs. By the time any line of ours executes, the client has already
 uploaded everything and Starlette has spooled it. Reordering inside the handler
 therefore saves the second, in-memory copy — not the transfer. A genuinely early
 reject has to happen client-side, which is the real argument for the composer
-knowing the tier (open decision 2). Moot for `virtual` once uploads work there;
-it only bites `none`.
+knowing the tier. Moot for `virtual` now that uploads work there; it only bites
+`none`, which is why the shipped fix reorders inside the handler and leaves the
+client alone.
 
 ### The composer does not gate on tier
 
 The attach button is unconditional (`persistent-chat.component.ts:1706`), so the
 UI cheerfully accepts ten files into a session that structurally cannot hold
-them, and only says so after the upload.
+them, and only says so after the upload. **Left as-is deliberately** — once
+`virtual` works, `none` is the only tier that refuses, and conditional UI for one
+rarely-used tier costs more than the honest error message buys.
 
 ## Why the destination already exists
 
@@ -208,10 +212,36 @@ uploads/notes.md                 7 bytes
    `409 This session has no workspace, so files cannot be attached to it. Start a
    session with a workspace to upload files.` — no "try again in a moment".
 
-Still worth eyeballing on the first real user run: whether a shell-less lite
-agent (`supports_shell` is `False`) reaches for the file when it sees the
-`[Attached files in uploads/: …]` hint, or wastes a turn trying to `cat` it —
-the hint was written for a tier with a real filesystem. Storage working does not
-prove the prompt reads well; if it flails, the hint should become tier-aware.
-Also unmeasured: latency for a full 20-file batch, since SFTP opened one session
-for the batch and this spawns one rclone subprocess per object.
+## Dev confirmation — the original repro, now working
+
+Session `5833c729` on dev (2026-08-01), `virtual` tier, the **same payload that
+produced the 409**: ten files, ~1.95 MB, thesis PDFs plus `schema.cql`.
+
+```
+08:49:55  POST /api/persistent/threads/5833c729-…/uploads 200 (3267ms)
+```
+
+Against the original `409 (9315ms)`. Both open questions are now answered:
+
+1. **The hint reads correctly for a shell-less agent.** It did not try to `cat`
+   anything. It called `list_files` on `uploads` (all ten returned), then
+   `get_document_info` on the PDFs, then `read_file("uploads/…")` on six — the
+   exact surface `VirtualWorkspaceBackend` supports. PDF text extraction works
+   through the object store too. No tier-aware rewording needed.
+2. **Latency is a non-issue.** 3.3 s for ten objects, one rclone subprocess
+   each. The per-object subprocess cost does not dominate at this batch size.
+
+Two incidental confirmations worth keeping:
+
+- **Collision renaming preserved real content.** Both duplicate-named pairs
+  (`Themen Proposal.pdf` / `_1.pdf`, `expose_thesis_A_kg_quality_criteria.md.pdf`
+  / `_1.pdf`) turned out to be genuinely *different* documents that shared a
+  display name — different sizes and different extracted content. The agent read
+  both as distinct sources. Overwriting would have silently destroyed one.
+- **The tier does the full round trip.** Upload in → read → deliverable written
+  to `output/expose_thesis_A_schema_fitness_revised.md` → rendered in Canvas.
+  Uploads were the missing leg, not the whole leg.
+
+Unrelated snag observed in the same run: the agent's first `cite_document` batch
+was rejected with "You must read `skills/cite-as-you-write/SKILL.md` before using
+cite_document", costing a round of tool calls. That is skill gating, not uploads.
