@@ -2952,9 +2952,24 @@ export class PersistentChatService {
                         tool,
                         args,
                     };
-                    this.pendingPermissions.update((list) =>
-                        list.some((p) => p.id === id) ? list : [...list, entry],
-                    );
+                    // Converge on the authoritative approval_id rather than
+                    // dropping a frame for a call already listed. The gate's
+                    // claim SELECT soft-fails on any DB blip and then INSERTs
+                    // a SECOND pending row, broadcasting its NEW approval_id —
+                    // the only id the waiter filters NOTIFY on. Keeping the
+                    // stale announced id would resolve a row nobody waits on:
+                    // the card vanishes and the agent blocks forever.
+                    this.pendingPermissions.update((list) => {
+                        const idx = list.findIndex(
+                            (p) =>
+                                p.id === id ||
+                                (!!approvalId && p.approvalId === approvalId),
+                        );
+                        if (idx < 0) return [...list, entry];
+                        const next = [...list];
+                        next[idx] = {...next[idx], ...entry};
+                        return next;
+                    });
                 }
                 this.dispatch({
                     type: 'permission_request',
