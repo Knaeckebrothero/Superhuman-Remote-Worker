@@ -10,7 +10,7 @@ the job landed there. ``main`` never advanced past round 1, so every reader
 (critic, cockpit, MCP ``get_workspace_file``, and the eventual re-clone) read
 ``main`` and correctly reported the section missing.
 
-See docs/issues/edit_file_append_lost_across_feedback_resume.md.
+See docs/issues/resumed_job_inherits_subjob_git_branch.md.
 
 These tests drive a **real** git repository through a **real** ``GitManager``.
 Mocking ``current_branch``/``checkout_branch`` would assert only that the helper

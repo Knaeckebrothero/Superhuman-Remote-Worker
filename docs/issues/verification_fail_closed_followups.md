@@ -84,11 +84,16 @@ fire.
 **Two new defects found by the live run**, both filed separately, neither
 caused by this change:
 
-- `docs/issues/edit_file_append_lost_across_feedback_resume.md` — an
-  `edit_file` append silently does not survive the job-completed → feedback-
-  resume boundary. The fixture's one-paragraph fix never landed across any
-  round; the reviewer correctly kept reporting it missing. This defeats the
-  remediation path generally, not just for verification.
+- `docs/issues/resumed_job_inherits_subjob_git_branch.md` — reported from
+  this gate as an `edit_file` append that silently does not survive the
+  job-completed → feedback-resume boundary. Since root-caused to something
+  wider, and **fixed** (`ensure_job_branch`, `src/agent.py`): a job resumed onto
+  a workspace a subjob last occupied keeps the *subjob's* branch, so everything
+  it writes afterwards is invisible on `main`. Not append-specific and not
+  `edit_file`-specific — see that file for the corrected framing. The fixture's
+  one-paragraph fix never landed on the ref the reviewer reads; the reviewer
+  correctly kept reporting it missing. This defeats the remediation path
+  generally, not just for verification.
 - `docs/issues/critic_brief_lands_in_shared_workspace_and_misleads_target.md` —
   the critic inherits the parent's workspace, so its brief is written as
   `instructions.md` into the root the *target* reads from. The target then
