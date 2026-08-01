@@ -12,7 +12,14 @@ Design document for decoupling the agent's tool layer from the local filesystem,
 
 **Status (March 2026):** Phases 1-4 code-complete. `WorkspaceBackend` ABC, `LocalBackend` (pathlib), `RemoteBackend` (SSH/SFTP + remote tmux), config integration, `ShellManager` delegation, NATS Helm values, VM Controller service + K8s manifest, NATS bridge + VM provisioner in orchestrator, REST endpoints, lifecycle hooks, auto-dispatch wiring (VM IP injection into config_override), remote-aware phase snapshots (extract from VM / push to VM), VM failure recovery (detect → re-provision → seed → resume). Needs deployment and integration testing against real KubeVirt infrastructure.
 
-> **Update (2026-04-11):** `LocalBackend` has since been **removed entirely** from production paths. The agent never operates on its own filesystem — `backend: remote` is the only supported configuration and `WorkspaceConfig.__post_init__` rejects `backend: local`. A stripped-down `FilesystemTestBackend` lives in `tests/_fs_backend.py` for unit tests that need a tmp_path workspace; it is deliberately not importable from `src/`. Everything below that describes `LocalBackend` as a live class is retained as historical design context — read it with that caveat. The rest of the design (RemoteBackend, the ABC, shell delegation, VM provisioning) is unchanged.
+> **Update (2026-04-11):** `LocalBackend` has since been **removed entirely** from production paths. The agent never operates on its own filesystem — `backend: remote` is the only supported configuration and `WorkspaceConfig.__post_init__` rejects `backend: local`. A stripped-down `FilesystemTestBackend` lives in `tests/_fs_backend.py` for unit tests that need a tmp_path workspace; it is deliberately not importable from `src/`. Everything below that describes `LocalBackend` as a live class is retained as historical design context — read it with that caveat. RemoteBackend, the ABC, and VM provisioning remain, while shell delegation changed again in the update below.
+
+> **Update (2026-06-11):** `a7156b5e` removed the in-process libtmux fallback. `ShellManager`
+> now requires a workspace backend with `supports_shell=True` and delegates every shell operation;
+> construction without one fails closed. Descriptions below of an optional backend, `_use_backend`
+> branches, or local libtmux execution record the original March implementation and are not current
+> architecture. Shell tests use mocked backends; a local k3d workspace SSH/tmux exercise is the live
+> behavioral gate.
 
 ## Motivation
 
@@ -104,8 +111,11 @@ Everything that touches workspace files or executes commands goes through the ba
 Defined in `src/core/workspace_backend.py`. Key design decisions:
 
 - **File operations are abstract** — every backend must implement them.
-- **Shell operations are non-abstract** — default to `NotImplementedError`. Only `RemoteBackend` overrides them. `LocalBackend` doesn't need to because `ShellManager` handles local shell directly via libtmux.
-- **`supports_shell` property** — lets `ShellManager` decide whether to delegate or use libtmux.
+- **Shell operations are non-abstract** — they default to `NotImplementedError`, and shell-capable
+  backends such as `RemoteBackend` override them. `ShellManager` refuses to construct for a backend
+  that does not provide shell support.
+- **`supports_shell` property** — a fail-closed capability gate for registering and constructing
+  shell tools; it no longer selects between remote and local executors.
 - **No `ShellResult`/`ShellReadResult` dataclasses** — shell methods return plain strings and tuples to match `ShellManager`'s existing return types, avoiding a conversion layer.
 
 ```python
@@ -151,8 +161,8 @@ class WorkspaceBackend(ABC):
 
     # --- Shell operations (non-abstract, default NotImplementedError) ---
     #
-    # Override in backends that support remote shell execution.
-    # For local execution, ShellManager uses libtmux directly.
+    # Override in backends that support workspace shell execution.
+    # ShellManager requires such a backend and has no local execution path.
 
     def shell_run(self, command, timeout=120, tab_name="default", working_dir=None) -> str:
         raise NotImplementedError("Shell operations not supported by this backend")
@@ -169,7 +179,7 @@ class WorkspaceBackend(ABC):
 
     @property
     def supports_shell(self) -> bool:
-        """Used by ShellManager to decide delegation vs local libtmux."""
+        """Whether this backend can host shell execution."""
         return False
 
     # --- Lifecycle (abstract) ---
@@ -239,7 +249,8 @@ class LocalBackend(WorkspaceBackend):
 
 **File:** `src/core/backends/remote.py` (~1027 lines)
 
-Full SSH/SFTP backend with remote tmux shell management. `supports_shell` returns `True`, so `ShellManager` delegates all shell operations to this backend instead of using local libtmux.
+Full SSH/SFTP backend with remote tmux shell management. `supports_shell` returns `True`, so
+`ShellManager` can be constructed and forwards all shell operations to this backend.
 
 ```python
 class RemoteBackend(WorkspaceBackend):
@@ -506,7 +517,9 @@ Both config parsing functions (`load_agent_config_from_dict` and the resolved co
 
 **Dependencies:** `paramiko>=3.4.0` added to `requirements.txt`. The import is deferred (try/except) in `remote.py` — only required when `backend: remote` is configured.
 
-For local development, `backend: local` preserves current behavior — zero changes to the dev workflow.
+The former `backend: local` development path is no longer supported. Unit tests that need local
+files use `tests/_fs_backend.py::FilesystemTestBackend`; live shell behavior is exercised against a
+workspace through the local k3d workflow.
 
 ## Integration with Existing Components
 
@@ -532,26 +545,33 @@ Higher-level logic stays in the manager: read-before-write tracking, document re
 
 ### ShellManager (Implemented)
 
-**File:** `src/tools/coding/shell_manager.py`
+**File:** `src/tools/shell/shell_manager.py`
 
-Added `backend: Optional[Any] = None` parameter to `__init__`. Sets `_use_backend = True` when `backend.supports_shell` is True.
-
-When `_use_backend` is True, **all methods delegate to the backend** via early returns at the top of each method:
+`ShellManager` requires a backend with `supports_shell=True`; omitting it or passing an incapable
+backend raises `RuntimeError`. All shell methods delegate to that backend. Agent-side code retains
+blocked-command and sudo gating plus lightweight tab bookkeeping; the backend owns the tmux session,
+polling, timeouts, output extraction, and authoritative tab state.
 
 ```python
-def run_sync(self, command, timeout, tail, working_dir):
-    if self._use_backend:
-        raw = self._backend.shell_run(command, timeout, "default", working_dir)
-        # ... tail truncation ...
-        return raw
-    # ... existing libtmux code unchanged ...
+if backend is None or not getattr(backend, "supports_shell", False):
+    raise RuntimeError("ShellManager requires a workspace backend with shell support")
+
+def run_sync(self, command, timeout=None, working_dir=None, tab_name="default"):
+    return self._backend.shell_run(
+        command,
+        timeout=timeout,
+        working_dir=working_dir,
+        tab_name=tab_name,
+    )
 ```
 
-Methods that delegate: `run_sync()`, `send()`, `read()`, `read_with_offset()`, `close_tab()`, `format_tab_header()`, `list_tabs()`, `cleanup()`, `is_alive()`, `open_tab()`, `ensure_tab()`.
+Delegated methods include `run_sync()`, `send()`, `read()`, `read_with_offset()`, `close_tab()`,
+`format_tab_header()`, `list_tabs()`, `cleanup()`, `is_alive()`, `open_tab()`, and `ensure_tab()`.
+Agent-side `ShellTab` objects are bookkeeping stubs only.
 
-For backend-delegated tabs, stub `ShellTab(window=None, pane=None)` objects are created for local tracking compatibility (tab registry).
-
-**Sentinel-based completion detection lives in the backend** (`RemoteBackend.shell_run`), not in `ShellManager`. This avoids `ShellManager` needing to know about SSH channels. The local libtmux code in `ShellManager` is untouched in the else branches — zero behavioral change for `backend: local`.
+**Sentinel-based completion detection lives in the backend** (`RemoteBackend.shell_run`), while the
+shared command builder and stall logic remain in `shell_manager.py`. There is no local libtmux else
+branch.
 
 ### GitManager (Not Yet Wired)
 
