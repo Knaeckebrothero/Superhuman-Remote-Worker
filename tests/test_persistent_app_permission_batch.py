@@ -178,7 +178,9 @@ class TestClaimsAnnouncedRow:
             patch.object(pa, "_subscribers", {"c1": MagicMock()}),
             patch.object(pa, "_insert_permission_request", AsyncMock()),
             patch.object(
-                pa, "_wait_for_permission_resolution", AsyncMock(return_value="approved")
+                pa,
+                "_wait_for_permission_resolution",
+                AsyncMock(return_value="approved"),
             ),
             patch.object(pa, "_broadcast", bcast),
         ):
@@ -200,7 +202,9 @@ class TestClaimsAnnouncedRow:
             patch.object(pa, "_subscribers", {"c1": MagicMock()}),
             patch.object(pa, "_insert_permission_request", insert),
             patch.object(
-                pa, "_wait_for_permission_resolution", AsyncMock(return_value="approved")
+                pa,
+                "_wait_for_permission_resolution",
+                AsyncMock(return_value="approved"),
             ),
             patch.object(pa, "_broadcast", bcast),
         ):
