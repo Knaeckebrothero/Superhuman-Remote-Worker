@@ -223,6 +223,12 @@ Migration number = next free at implementation time (`0076` is contacts, renumbe
 - **Boot sweeps:** marker → deleted; no marker → preserved + logged; errors non-fatal.
 - **Live gate on local k3d** before dev deploy: session — root listing shows `tools/`, read `tools/README.md`, rejected write, contact linked mid-session appears within TTL; worker job — `plan.md` written by the agent is visible in Cockpit **after the pod is deleted**; shell-written shadow `plan.md` is reconciled, not lost. This gate can also discharge the contacts registry's own never-run live gate. CI (Py3.12) is the merge gate.
 
+## Remaining work
+
+**Test coverage map: `tests/virtual_directories_test_coverage.md`** — what is verified, by which mechanism, and what could not be covered yet with the steps to close each gap. In priority order the open gaps are: the cloud-sync round-trip (session-only, needs a human-driven Cockpit session — this is the PII-leak scenario), a real tier upgrade with the overlay live, the two destructive resume paths the `.srw_seeded` sentinel guards, the kill-switch smoke, and subagent-reader isolation.
+
+**Slice 2** (writable `plan.md` / `todos.yaml` on a `job_documents` table, with mtime shadow reconciliation for shell writes) is designed above but not started. The `writable` / `write()` half of the provider contract and `EntryMeta.mtime` already exist and are unit-tested against fake writable providers, so Slice 2 adds a provider rather than a redesign — that tested-but-unused code is deliberate, not dead.
+
 ## Out of scope
 
 Skills migration (scripts are shell-executed and need real files) · shell visibility / FUSE · subdirectories inside virtual prefixes · "(virtual)" markers in listings · `workspace.md` (legacy, already unused per `src/graph.py:419`) · `notes/`, `output/`, `archive/` (genuine agent artifacts, belong on disk) · additional providers (datasources, experts, memory) · a materialization fallback mode · version history / diffs for `job_documents`.
