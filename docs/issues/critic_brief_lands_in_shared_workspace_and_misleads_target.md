@@ -83,5 +83,5 @@ Options 1 and 2 are real fixes; 1 is the one to ship first.
 - `docs/issues/verification_round_reset_spawns_blind_critic.md` — the rewrite
   whose brief-delivery fix created this exposure.
 - `docs/issues/verification_fail_closed_followups.md` — live-gate results.
-- `docs/issues/edit_file_append_lost_across_feedback_resume.md` — the other
+- `docs/issues/resumed_job_inherits_subjob_git_branch.md` — the other
   defect the same run surfaced.
