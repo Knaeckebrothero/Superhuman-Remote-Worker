@@ -14,6 +14,7 @@ import logging
 import os
 import posixpath
 import re
+import shlex
 import socket
 import stat as stat_module
 import threading
@@ -1268,6 +1269,7 @@ class RemoteBackend(WorkspaceBackend):
             start_time = time.monotonic()
             output_text = ""
             exit_code = None
+            resolved_cwd = None
             last_content_hash = None
             stall_start = None
 
@@ -1288,11 +1290,13 @@ class RemoteBackend(WorkspaceBackend):
 
                 if sentinel_line_idx is not None:
                     line = all_lines[sentinel_line_idx]
-                    parts = line.strip().split()
+                    sentinel_parts = line.strip().split(maxsplit=2)
                     try:
-                        exit_code = int(parts[-1]) if parts else 1
+                        exit_code = int(sentinel_parts[1])
                     except (ValueError, IndexError):
                         exit_code = 1
+                    if len(sentinel_parts) == 3:
+                        resolved_cwd = sentinel_parts[2]
 
                     # Command finished — tab is no longer busy.
                     tab.pending_sentinel = None
@@ -1389,7 +1393,10 @@ class RemoteBackend(WorkspaceBackend):
             tab.last_activity = datetime.now(timezone.utc)
 
             # Format output
-            parts = [f"Exit code: {exit_code}"]
+            parts = [
+                f"Exit code: {exit_code}",
+                f"CWD: {resolved_cwd or '(unknown)'}",
+            ]
             if output_text:
                 parts.append(f"--- stdout ---\n{output_text}")
             else:
@@ -1421,8 +1428,12 @@ class RemoteBackend(WorkspaceBackend):
         tab_name: str,
         text: str,
         enter: bool = True,
+        working_dir: Optional[str] = None,
     ) -> str:
         self._ensure_shell()
+
+        if working_dir and not enter:
+            raise ValueError("working_dir cannot be applied to raw keystrokes")
 
         if enter:
             blocked = self._check_blocked(text)
@@ -1432,6 +1443,21 @@ class RemoteBackend(WorkspaceBackend):
         if tab_name not in self._tabs:
             raise KeyError(
                 f"Tab '{tab_name}' not found. Available: {', '.join(self._tabs.keys())}"
+            )
+
+        if working_dir:
+            full_dir = (
+                posixpath.join(self._sandbox_cwd, working_dir)
+                if self._sandbox_cwd
+                else working_dir
+            )
+            restore = (
+                f"; cd {shlex.quote(self._sandbox_cwd)}" if self._sandbox_cwd else ""
+            )
+            text = (
+                f"cd {shlex.quote(full_dir)} && "
+                "printf 'CWD: %s\\n' \"$PWD\" && "
+                f"eval {shlex.quote(text)}{restore}"
             )
 
         self._tmux_send_keys(tab_name, text, enter=enter)

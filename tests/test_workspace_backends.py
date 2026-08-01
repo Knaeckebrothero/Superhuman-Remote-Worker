@@ -11,7 +11,7 @@ import stat as stat_module
 from contextlib import contextmanager
 import sys
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 
@@ -1695,6 +1695,80 @@ class TestRemoteBackendShellOperations:
         backend.shell_cleanup()  # Should not raise
 
 
+class TestRemoteBackendShellRun:
+    """Sentinel output reports CWD and working_dir calls restore the tab."""
+
+    _SENTINEL = "__DONE_0123456789ab__"
+    _ROOT = "/home/agent-host/workspace"
+
+    @staticmethod
+    def _ready(backend):
+        backend._shell_initialized = True
+        backend._tabs["default"] = _RemoteTab("default")
+
+    @staticmethod
+    def _uuid(uuid4):
+        uuid4.return_value.hex = "0123456789abcdef"
+
+    def test_working_dir_restores_between_calls(self, remote_backend):
+        backend, _, _ = remote_backend
+        self._ready(backend)
+        captures = [
+            [f"agent@host:{self._ROOT}$"],
+            [f"agent@host:{self._ROOT}$", f"{self._SENTINEL} 0 /tmp"],
+            [f"agent@host:{self._ROOT}$"],
+            [f"agent@host:{self._ROOT}$", f"{self._SENTINEL} 0 {self._ROOT}"],
+        ]
+
+        with (
+            patch("src.core.backends.remote.uuid.uuid4") as uuid4,
+            patch("src.core.backends.remote.time.sleep"),
+            patch.object(backend, "_tmux_capture", side_effect=captures),
+            patch.object(backend, "_tmux_send_keys") as send,
+        ):
+            self._uuid(uuid4)
+            first = backend.shell_run(
+                "cd /tmp && pwd", working_dir=".", tab_name="default"
+            )
+            second = backend.shell_run("pwd", working_dir=".", tab_name="default")
+
+        assert "CWD: /tmp" in first
+        assert f"CWD: {self._ROOT}" in second
+        assert send.call_args_list[0] == call(
+            "default", f"cd {self._ROOT}/.", enter=True
+        )
+        assert '"$PWD"' in send.call_args_list[1].args[1]
+        assert send.call_args_list[2] == call("default", f"cd {self._ROOT}", enter=True)
+        assert send.call_args_list[3] == call(
+            "default", f"cd {self._ROOT}/.", enter=True
+        )
+        assert send.call_args_list[5] == call("default", f"cd {self._ROOT}", enter=True)
+
+    def test_without_working_dir_keeps_persistent_cwd_visible(self, remote_backend):
+        backend, _, _ = remote_backend
+        self._ready(backend)
+        captures = [
+            [f"agent@host:{self._ROOT}$"],
+            [f"agent@host:{self._ROOT}$", f"{self._SENTINEL} 0 /tmp"],
+            ["agent@host:/tmp$"],
+            ["agent@host:/tmp$", f"{self._SENTINEL} 0 /tmp"],
+        ]
+
+        with (
+            patch("src.core.backends.remote.uuid.uuid4") as uuid4,
+            patch("src.core.backends.remote.time.sleep"),
+            patch.object(backend, "_tmux_capture", side_effect=captures),
+            patch.object(backend, "_tmux_send_keys") as send,
+        ):
+            self._uuid(uuid4)
+            first = backend.shell_run("cd /tmp && pwd", tab_name="default")
+            second = backend.shell_run("pwd", tab_name="default")
+
+        assert "CWD: /tmp" in first
+        assert "CWD: /tmp" in second
+        assert all(sent.args[1] != f"cd {self._ROOT}" for sent in send.call_args_list)
+
+
 class TestRemoteBackendShellSend:
     """Tests for RemoteBackend.shell_send()."""
 
@@ -1747,6 +1821,41 @@ class TestRemoteBackendShellSend:
             result = backend.shell_send("default", "reboot", enter=False)
 
         assert "Sent" in result
+
+    def test_async_working_dir_wraps_command_and_restore(self, remote_backend):
+        backend, mock_ssh, _ = remote_backend
+        backend.connect()
+        self._setup_exec_mock(mock_ssh)
+
+        with patch("time.sleep"):
+            backend._init_shell()
+        with patch.object(backend, "_tmux_send_keys") as send:
+            backend.shell_send(
+                "default",
+                "npm run dev",
+                working_dir="repo",
+            )
+
+        sent = send.call_args.args[1]
+        assert sent.startswith(f"cd {backend._sandbox_cwd}/repo && ")
+        assert "printf 'CWD: %s\\n' \"$PWD\"" in sent
+        assert "eval 'npm run dev'" in sent
+        assert sent.endswith(f"; cd {backend._sandbox_cwd}")
+
+    def test_working_dir_rejected_for_raw_keystrokes(self, remote_backend):
+        backend, mock_ssh, _ = remote_backend
+        backend.connect()
+        self._setup_exec_mock(mock_ssh)
+
+        with patch("time.sleep"):
+            backend._init_shell()
+        with pytest.raises(ValueError, match="raw keystrokes"):
+            backend.shell_send(
+                "default",
+                "C-c",
+                enter=False,
+                working_dir="repo",
+            )
 
 
 class TestRemoteBackendShellCancel:

@@ -161,8 +161,20 @@ class SubdirBackend:
     def shell_open_tab(self, name: str, *args, **kwargs):
         return self._parent.shell_open_tab(self._tab(name), *args, **kwargs)
 
-    def shell_send(self, name: str, *args, **kwargs):
-        return self._parent.shell_send(self._tab(name), *args, **kwargs)
+    def shell_send(
+        self,
+        name: str,
+        text: str,
+        enter: bool = True,
+        working_dir=None,
+    ):
+        wd = self._p(working_dir) if working_dir else None
+        return self._parent.shell_send(
+            self._tab(name),
+            text,
+            enter=enter,
+            working_dir=wd,
+        )
 
     def shell_read(self, name: str, *args, **kwargs):
         return self._parent.shell_read(self._tab(name), *args, **kwargs)

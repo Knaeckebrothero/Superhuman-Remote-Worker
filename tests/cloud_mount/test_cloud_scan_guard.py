@@ -19,7 +19,13 @@ class FakeShellManager:
     def format_tab_header(self) -> str:
         return "[Shells: default]"
 
-    def run_sync(self, command: str, tab_name: str, timeout=None) -> str:
+    def run_sync(
+        self,
+        command: str,
+        tab_name: str,
+        timeout=None,
+        working_dir=None,
+    ) -> str:
         self.run_calls.append(command)
         return "Exit code: 0\n--- stdout ---\nok"
 

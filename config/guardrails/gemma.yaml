@@ -83,15 +83,15 @@ tool_examples:
   # ----- src/tools/shell/shell_tools.py -----
   run_command: |-
     Examples:
-        <|tool_call>call:run_command{command:<|"|>pytest tests/ -x<|"|>}<tool_call|>
-        <|tool_call>call:run_command{command:<|"|>git diff HEAD~1<|"|>,tail:100}<tool_call|>
-        <|tool_call>call:run_command{command:<|"|>npm run build<|"|>,timeout:300}<tool_call|>
+        <|tool_call>call:run_command{command:<|"|>pytest tests/ -x<|"|>,working_dir:<|"|>.<|"|>}<tool_call|>
+        <|tool_call>call:run_command{command:<|"|>git diff HEAD~1<|"|>,working_dir:<|"|>.<|"|>,tail:100}<tool_call|>
+        <|tool_call>call:run_command{command:<|"|>npm run build<|"|>,working_dir:<|"|>.<|"|>,timeout:300}<tool_call|>
 
   shell_execute: |-
     Examples:
-        <|tool_call>call:shell_execute{command:<|"|>pytest tests/ -x<|"|>}<tool_call|>
-        <|tool_call>call:shell_execute{command:<|"|>npm run dev<|"|>,name:<|"|>dev<|"|>,is_async:true}<tool_call|>
-        <|tool_call>call:shell_execute{command:<|"|>C-c<|"|>,name:<|"|>dev<|"|>,keys:true}<tool_call|>
+        <|tool_call>call:shell_execute{command:<|"|>pytest tests/ -x<|"|>,working_dir:<|"|>.<|"|>}<tool_call|>
+        <|tool_call>call:shell_execute{command:<|"|>npm run dev<|"|>,working_dir:<|"|>.<|"|>,name:<|"|>dev<|"|>,is_async:true}<tool_call|>
+        <|tool_call>call:shell_execute{command:<|"|>C-c<|"|>,working_dir:<|"|>.<|"|>,name:<|"|>dev<|"|>,keys:true}<tool_call|>
 
   shell_read: |-
     Examples:
