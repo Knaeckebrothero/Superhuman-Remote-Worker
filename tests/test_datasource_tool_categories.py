@@ -28,6 +28,7 @@ class TestDatasourceToolCategories:
             "sql": [],
             "mongodb": [],
             "webdav": [],
+            "repo": [],
             "email": [],
             "mcp": [],
         }
@@ -81,14 +82,17 @@ class TestDatasourceToolCategories:
         assert cats["sql"] == ["sql_query", "sql_schema"]
 
     def test_unmapped_types_are_ignored(self):
+        # "repository" is deliberately excluded here — it is now mapped (to
+        # "repo"), so it belongs in the mapped-types tests, not this one.
         cats = datasource_tool_categories(
-            [_ds("repository"), _ds("kb"), _ds("generic"), {"name": "typeless"}]
+            [_ds("kb"), _ds("generic"), {"name": "typeless"}]
         )
         assert cats == {
             "graph": [],
             "sql": [],
             "mongodb": [],
             "webdav": [],
+            "repo": [],
             "email": [],
             "mcp": [],
         }
@@ -109,6 +113,26 @@ class TestDatasourceToolCategories:
         cats = datasource_tool_categories([_ds("webdav", read_only=True)])
         cats["webdav"].append("mutated")
         assert "mutated" not in DATASOURCE_TOOL_MAP["webdav"]["read"]
+
+
+def test_repository_maps_to_repo_category_not_git():
+    """Reusing 'git' would strip the workspace git tools when no repo is attached."""
+    from src.core.datasource_setup import datasource_tool_categories
+
+    cats = datasource_tool_categories(
+        [{"type": "repository", "name": "r", "project_read_only": False}]
+    )
+    assert "repo_push" in cats["repo"]
+    assert "git" not in cats
+
+
+def test_read_only_repository_gets_only_pull():
+    from src.core.datasource_setup import datasource_tool_categories
+
+    cats = datasource_tool_categories(
+        [{"type": "repository", "name": "r", "project_read_only": True}]
+    )
+    assert cats["repo"] == ["repo_pull"]
 
 
 class TestEmailTierCategories:
