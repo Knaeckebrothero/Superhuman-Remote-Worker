@@ -199,13 +199,51 @@ jobs. Behaviour is unchanged for users — every project has a knowledge base to
 it decouples *"this project has knowledge"* from *"the agent's workspace is a checkout of
 something"*, which are currently fused.
 
-This also settles the file question. The KB's authoritative store is Postgres; the only
-filesystem dependency is that `kb_write` also materialises `knowledge/<slug>.md` on the
-workspace (`src/tools/knowledge/knowledge_tools.py:521`), and `kb_export` is documented as
-*"one-way export for human browsing or migration"* (`:1931`). Nothing reads back. So the
-markdown mirror should become an explicit export, not an automatic dual-write on every note
-— removing a consistency surface that has already produced a vault-corruption incident and
-a `kb: dissolve the .md-shaped export directories` cleanup commit in this very project.
+**Correction (2026-08-01, same day):** the first draft of this section claimed the
+`knowledge/<slug>.md` files were a write-only mirror ("nothing reads back") and proposed
+demoting them to an explicit export. A full trace of every consumer proved that wrong —
+**the files are not a mirror of the store; for the git-backed tier they are the canonical
+vault the store is built FROM:**
+
+- The KB reindexer ingests from `knowledge/` in the project's jobs repo
+  (`orchestrator/services/kb_reindex.py:61` — `KNOWLEDGE_PREFIX = "knowledge/"`, "the
+  vault root"; `resolve_kb_repo:909` targets exactly the repo `_dual_write_note` writes).
+- The agent-facing read path is gated on file backing: `get_note_by_slug`
+  (`src/services/knowledge_store.py` — `WHERE … path IS NOT NULL`, "files-canonical")
+  and `list_notes` carry the same filter, and `path` is set **only** by the reindexer.
+  `kb_read`/`kb_list` sit on these.
+- `kb_search` and job-start knowledge injection run on `knowledge_chunks`, whose sole
+  non-test writer is the reindexer. No file → no chunks → invisible to search.
+- The reindexer **deletes** indexed rows whose file vanished from the tree and
+  **archives** pathless active rows after a 1h grace (`plan_reindex` deletes;
+  `reconcile_orphans`). Removing the dual-write would therefore empty the native KB and
+  garbage-collect every new note an hour after it is written.
+- Also file-reading: `kb_lint`, `kb_index`, and
+  `project_backlog.close_backlog_ticket` (which reads *and rewrites* the note file —
+  its docstring calls the file "the durable mirror").
+
+What genuinely does **not** read the files: the cockpit (all seven KB calls hit
+`/api/...knowledge*`), the orchestrator's knowledge endpoints, the `kb:` deliverable seal
+(`deliverable_gate.py` checks `knowledge_index` directly, no path filter), and every agent
+prompt/template/archiver/resume path.
+
+Two consequences for this design:
+
+1. **Demoting the mirror is not a small step — it is the files-canonical → store-canonical
+   substrate flip**, i.e. the open decision in `knowledge_base_substrate_decision`, not a
+   side task of this doc. It stays out of scope here. The existence proof that
+   store-canonical works is already in production: the gitless/lite tier runs KB without
+   any files today via deliberate path-agnostic exemptions (`get_charter_note` — "NO path
+   filter, deliberately"; the backlog pool; the deliverable gate). Those exemptions are the
+   template for the flip when it happens.
+2. **A latent inconsistency worth knowing about:** the cockpit's read endpoints have no
+   `path IS NOT NULL` filter while the agent tools do — so the cockpit can display notes
+   that agents cannot read or find. This is presumably why mirror-less rows were never
+   noticed as missing. Any substrate work should reconcile the two read surfaces first.
+
+The vault-corruption incident and the `kb: dissolve the .md-shaped export directories`
+cleanup remain real costs of the dual-write — but they are costs of the *substrate choice*,
+to be weighed there, not something this design can remove for free.
 
 ### 6.2 Attributable knowledge history
 
@@ -279,6 +317,23 @@ becomes genuinely free to be messy, which is what the requester asked for.
 This also removes most of the pressure behind the `repo/` vs `repos/` layout question. If
 only contracted paths merge, where the agent scribbles matters much less.
 
+**Implementation status (2026-08-01): built, loop merge path only** —
+`merge_loop_job_contribution` (`orchestrator/services/project_loops.py`), dispatched from
+`_merge_and_retro_loop_job`. A loop job whose `context.required_deliverables` names ≥1 FILE
+(same parser as the seal gate; `kb:` entries never count) gets a curated merge: each
+contracted path is resolved at the branch head under both spellings (canonical first, then
+`repo/`-prefixed), the blobs land on `main` as ONE commit (`curated merge: <role>
+(<jobid8>) — N deliverable(s)`), and the audit PR is created then closed UNMERGED with a
+comment naming the retro record and the curated commit. New `merge_status: curated`
+(`merged_sha` = the curated commit) flows through the retro/record writers unchanged; the
+retro gains an orchestrator-written `## Merge notes` section (what curated, which spelling,
+missing contracted paths). Fallbacks, decided: mechanical failure mid-curation or zero
+contracted files on the branch → today's full squash-merge with a warning note (never lose
+work to a curation bug; the deliverable gate, not the merge, polices missing
+deliverables); partial → curate what exists, list the missing. No contract / `kb:`-only →
+full merge, call-for-call identical (pinned by tests/test_loop_merge.py). Non-loop jobs
+have no merge step today and are untouched.
+
 ### 6.5 Generalise the job record beyond loop jobs
 
 `write_loop_retro` lives in `project_loops.py` and is invoked from
@@ -291,6 +346,16 @@ recorded).
 Lift the writer out of the loop service, call it from the general job-completion path, and
 keep the loop's iteration/role fields as optional frontmatter.
 
+**Implementation status (2026-08-01):** built — `orchestrator/services/job_records.py`, hook
+"5d2" in the `/complete` handler, loop rendering byte-identical (golden-tested), agent-declared
+changes forced to `verified: false` regardless of what the agent stamps. **Known v1 gap, on
+record:** only jobs that terminalize *through `/complete`* get a record. Manual status flips,
+cancellations, the infra-transient give-up paths inside `/complete`, and sweeper-driven failures
+do not — closing that fully means hooking `update_job_status` itself (or each call site), which
+was deliberately left out of v1. The invariant "every job leaves a record, always" is therefore
+aspirational until that lands; treat absence of a record as "didn't exit through /complete", not
+"didn't run".
+
 ## 7. Sequencing
 
 Ordered so each step is independently useful and nothing blocks on the largest piece.
@@ -298,20 +363,36 @@ Ordered so each step is independently useful and nothing blocks on the largest p
 0. **Prerequisite — `docs/issues/shell_cwd_drifts_and_the_anchor_is_unreachable.md`.**
    Small, already specified, and it makes path drift visible *before* directories start
    moving. Doing layout work while the drift is silent is how today's mess was produced.
+   **DONE 2026-08-01** — committed `f41970ae`+`e7d29b2d`, verified 6/6 criteria.
 1. **Generalise the job record** (6.5) + extend the schema with `changes` (5). No behaviour
    change for existing loops; establishes the invariant everything else writes into.
+   **BUILT 2026-08-01** (uncommitted) — see the status note in 6.5, incl. the /complete-only
+   coverage gap.
 2. **KB revisions** (6.2). One migration plus a trigger. Delivers the attribution sentence
    on its own, independent of everything else.
+   **BUILT 2026-08-01** (uncommitted) — migration `0016_knowledge_note_revisions.sql`, both
+   triggers, `get_note_revisions()`, snapshot regenerated, integration-tested through the
+   production migration runner against real Postgres.
 3. **Curated merge** (6.4). Turns the branch into a scratchpad and stops the accumulation.
-4. **KB as default datasource** (6.1) + demote the markdown mirror to explicit export.
+   **BUILT 2026-08-01** (uncommitted) — `merge_loop_job_contribution` in `project_loops.py`;
+   `merge_status: curated`; PR closed unmerged after the curated commit; no-contract path
+   proven call-for-call identical to the old full merge. Note: once the curated commit
+   lands, no fallback ever fires (a full merge would re-land the whole branch); post-commit
+   ceremony failures demote to notes. `change_files` gained per-file create/update; gitea
+   client gained `close_pr`/`comment_on_pr`.
+4. **KB as default datasource** (6.1) — the attach-by-default part only. The mirror
+   demotion is re-scoped out of this doc entirely (see the correction in 6.1: it is the
+   files→store substrate flip, owned by `knowledge_base_substrate_decision`).
 5. **Change-capable datasources** (6.3), git first — credentials, branch policy, PR
    capture. Then cloud, then SQL as separate decisions.
 
 ## 8. Open questions
 
-- **Does anything read the `knowledge/*.md` mirror?** Cockpit knowledge views, the
-  deliverable seal, and project-page reads were not traced. If one reads files rather than
-  the store, the mirror is load-bearing and 6.1 gets more complicated.
+- ~~**Does anything read the `knowledge/*.md` mirror?**~~ **Answered 2026-08-01, and the
+  answer was "yes, and worse than reading"** — the files are the reindexer's ingestion
+  source and the agent read path is gated on file backing. Full findings folded into the
+  6.1 correction above. The cockpit, API endpoints, seal, and prompts are confirmed
+  file-free.
 - **SQL write policy.** Should agents write to database datasources at all? Migrations
   only? This is a product/safety decision, not a technical one.
 - **Verification depth for change records.** Resolving a PR URL is cheap; diffing its

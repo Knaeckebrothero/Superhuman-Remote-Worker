@@ -7,8 +7,19 @@ was not a model failure in the usual sense: it wrote the right file with the rig
 verified its SHA-256 correctly. It wrote it to the wrong directory, and nothing in the harness could
 tell it so.
 
-**Status:** open / unbuilt. Every claim below is verified against code at `572c40ba` or against
-cluster state on 2026-08-01.
+**Status:** **IMPLEMENTED** in `f41970ae` (all four slices, 15 files) + `e7d29b2d`, 2026-08-01.
+Independently verified same day against all six acceptance criteria — including a by-hand replay of
+the `d1894a91` failure (drifted CWD now prints `CWD:` on the shell result and the resolved absolute
+path in the `read_file` error, exposing the off-by-one in one turn). 322 targeted tests green, zero
+skips. The findings below describe the tree at `572c40ba`, i.e. *before* the fix; they are kept as
+the record of the defect.
+
+**Residue (open, small):** the sync-path `cd` sends (`remote.py` restore/anchor sites) are unquoted
+f-strings while the async wrapper `shlex.quote`s — a `working_dir` containing spaces fails its `cd`
+loudly (no silent drift, error visible in output + `CWD:` line), but quoting them is a two-line
+consistency fix. Also note `run_command`'s docstring deliberately does NOT carry the "inline cd
+persists" sentence — post-fix it would be false there, since stateless mode now restores on every
+call.
 
 **One-line summary:** `shell_execute`/`run_command` run in a persistent tmux tab whose working
 directory an inline `cd` changes permanently, while `read_file`/`write_file` resolve against the
@@ -260,8 +271,12 @@ the tool at the moment of failure is the cheapest way to build the reflex.
 
 ## Tests
 
-- `tests/test_run_command.py` — tmux-dependent, **auto-skips when tmux is absent**. Confirm it
-  actually ran; a green suite may have skipped the only coverage that matters here.
+- ~~`tests/test_run_command.py` — tmux-dependent, **auto-skips when tmux is absent**.~~ **Stale
+  (found during verification):** the file was rewritten to script `backend.shell_run` directly — no
+  tmux skip logic remains anywhere in `tests/`, so it always runs. CLAUDE.md still carries the old
+  auto-skip claim. Consequence worth keeping visible: **the repo has no live-tmux end-to-end
+  coverage**; the cd/restore behaviour is proven at the keystroke-assertion level
+  (`tests/test_workspace_backends.py::TestRemoteBackendShellRun`), not against a real tmux pane.
 - Drive `WorkspaceManager` against `tests/_fs_backend.py::FilesystemTestBackend` for the
   `read_file` message change (no SSH needed).
 - Full gate: `pytest tests/ -x -q --tb=short`, then

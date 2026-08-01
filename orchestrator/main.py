@@ -13546,25 +13546,34 @@ async def _merge_and_retro_loop_job(
     failed: bool,
     last_error: str | None,
 ) -> tuple[str, str | None]:
-    """Per-job artifact handling: squash-merge the branch, flag F29 /
-    merge-failed, trigger the post-merge KB reindex, write the retro.
+    """Per-job artifact handling: land the branch's contribution on main
+    (curated merge when the job carries a file-deliverable contract, full
+    squash-merge otherwise), flag F29 / merge-failed, trigger the post-merge
+    KB reindex, write the retro.
 
     Shared by the single-role advance and each parallel-stage member (each
     member merges + retros itself; the loop rotates only at the barrier). Best
     effort — never raises. Returns ``(merge_status, merged_sha)``.
 
-    See docs/features/loop_repo_compounding_v2.md.
+    See docs/features/loop_repo_compounding_v2.md and
+    docs/features/workspace_and_change_records.md §6.4 (curated merge).
     """
     from services.project_loops import (
         is_loop_execution_role,
-        merge_loop_job_branch,
+        merge_loop_job_contribution,
         write_loop_retro,
     )
 
     merge_status, merged_sha = "skipped", None
+    merge_notes: list[str] = []
     if not failed:
         try:
-            merge_status, merged_sha = await merge_loop_job_branch(gitea_client, job)
+            # §6.4 curated merge: jobs with a file-deliverable contract land
+            # ONLY the contracted files on main; everything else takes the
+            # full squash-merge path unchanged.
+            merge_status, merged_sha, merge_notes = await merge_loop_job_contribution(
+                gitea_client, job, ctx=ctx
+            )
         except Exception:
             logger.exception(
                 "project loop %s: completion squash-merge raised (non-fatal)", loop_id
@@ -13589,6 +13598,14 @@ async def _merge_and_retro_loop_job(
                 str(job["id"])[:8],
                 (merged_sha or "")[:8],
             )
+        elif merge_status == "curated":
+            logger.info(
+                "project loop %s: job %s curated-merged to main (%s) — "
+                "contracted deliverables only, branch left as scratchpad",
+                loop_id,
+                str(job["id"])[:8],
+                (merged_sha or "")[:8],
+            )
         # Slice-3 KB freshness (post-merge trigger): the squash — or the job's
         # own direct-to-main kb_write pushes — likely moved knowledge/ on
         # `main`; bring the chunk index up to the new HEAD. Fires on `empty`
@@ -13597,7 +13614,8 @@ async def _merge_and_retro_loop_job(
         # short-circuit makes a false fire one HEAD read. Fire-and-forget: a
         # first full rebuild can take minutes and must never delay the loop
         # advance; a lost task self-heals via the leader-gated sweep.
-        if merge_status in ("merged", "empty"):
+        # ``curated`` moves main exactly like ``merged`` does.
+        if merge_status in ("merged", "curated", "empty"):
             _kb_project = loop.get("project_id")
             if _kb_project:
 
@@ -13640,7 +13658,9 @@ async def _merge_and_retro_loop_job(
 
     # Retro collection (F40): record the outcome — mechanical merge truth plus
     # the agent's own freeze_data notes — as retros/NNN-<role>-<jobid8>.md on
-    # `main`. Written for failed jobs too. Best-effort.
+    # `main`. Written for failed jobs too. Best-effort. ``merge_notes`` carry
+    # the curated-merge observations (§6.4): what curated, what was missing
+    # from the branch, and any fallback warning.
     try:
         await write_loop_retro(
             gitea_client,
@@ -13650,6 +13670,7 @@ async def _merge_and_retro_loop_job(
             merged_sha=merged_sha,
             failed=failed,
             error=last_error,
+            merge_notes=merge_notes,
         )
     except Exception:
         logger.exception("project loop %s: retro write failed (non-fatal)", loop_id)
@@ -15563,6 +15584,34 @@ async def complete_job(
             logger.error(
                 f"Error advancing project loop for {job_id}: {e}", exc_info=True
             )
+
+        # 5d2. Per-job change record (workspace_and_change_records.md §5/§6.5):
+        # every repo-backed job leaves exactly one record on the project repo's
+        # `main` when THIS completion made it terminal — failed jobs and jobs
+        # that merged nothing included. Keyed on new_status like the session
+        # wake below (None = nothing terminal happened in this call, so a
+        # duplicate/late report can't re-record). Loop jobs are skipped inside
+        # the hook — the loop advance above just wrote their retro — and the
+        # writer's own exists-check backstops that skip; sitting after 5d means
+        # the backstop can actually see a freshly-written loop retro.
+        # Best-effort: a record failure never blocks completion handling.
+        if new_status in ("completed", "failed"):
+            try:
+                from services.completion import write_job_change_record
+
+                if await write_job_change_record(
+                    job,
+                    new_status,
+                    gitea=gitea_client,
+                    vector_db=vector_db,
+                    error=error_message,
+                ):
+                    actions.append("job change record written to main")
+            except Exception:
+                logger.warning(
+                    f"Job {job_id}: change-record write failed (non-fatal)",
+                    exc_info=True,
+                )
 
         # 5e. Wake the session that created this job, if any. Must sit BEFORE
         # the workspace archive below: that call tears the workspace down, and
