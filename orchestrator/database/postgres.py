@@ -295,7 +295,7 @@ PG_TYPE_MAP = {
 
 
 # =============================================================================
-# Contacts registry (docs/features/contacts_registry.md)
+# Contacts registry (docs/done/contacts_registry.md)
 # =============================================================================
 # House gotcha: asyncpg returns json_agg()/JSONB columns as strings, not
 # parsed Python objects — _contact_row() decodes them (mirrors
@@ -12545,7 +12545,7 @@ class PostgresDB:
         return (count or 0) + 1
 
     # =========================================================================
-    # Contacts registry (docs/features/contacts_registry.md)
+    # Contacts registry (docs/done/contacts_registry.md)
     # =========================================================================
 
     async def list_contacts_for_user(
@@ -12838,7 +12838,7 @@ class PostgresDB:
     ) -> Optional[str]:
         """Resolve the project a job or thread belongs to, for agent-internal reads.
 
-        The internal contacts endpoint (docs/features/contacts_registry.md)
+        The internal contacts endpoint (docs/done/contacts_registry.md)
         never accepts a project_id from the agent — this is the server-side
         control point that derives it from the job/thread identity instead,
         the same trust posture as send_message recipient resolution. Callers

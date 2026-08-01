@@ -1,4 +1,4 @@
-"""Render project contacts as workspace files (docs/features/contacts_registry.md).
+"""Render project contacts as workspace files (docs/done/contacts_registry.md).
 
 DB is the source of truth; these files are a read-only projection written at
 job/session start (same lever as skills/). Frontmatter scalars are emitted via

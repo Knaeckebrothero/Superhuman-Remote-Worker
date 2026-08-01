@@ -1,6 +1,6 @@
 # Contacts Registry Implementation Plan
 
-> **EXECUTED 2026-07-30 — this plan is a historical record, not a to-do list.** Status below. Do not re-run tasks 1–8.
+> **COMPLETE — executed 2026-07-30, gated on dev 2026-08-01. Historical record, not a to-do list.** Status below; do not re-run any task.
 
 ## Execution status
 
@@ -18,7 +18,8 @@ Run via subagent-driven development (fresh implementer per task, task-scoped rev
 | 6 · Materialization wiring | ⛔ **REVERTED** — superseded by the virtual-dirs ContactsProvider (user decision, same day). Shipped then reverted; `test_contacts_materialization.py` deleted | `feat(agent): materialize project contacts…` + `test(agent): prove contacts gather gate…`, undone by `revert(agent): drop contacts materialization…` |
 | 7 · Cockpit types + service | ✅ Shipped | `feat(cockpit): contact types + ContactsService` |
 | 8 · Cockpit `/contacts` page | ✅ Shipped (1 fix round: **critical** — form re-seeds via `linkedSignal`; a stale form could previously write contact A's data onto contact B and delete B's addresses) | `feat(cockpit): /contacts page…`; `fix(cockpit): re-seed contact form on target change…` |
-| 9 · Live gate | ❌ **NOT RUN** — local k3d unusable on this machine (API unreachable from host). Superseded plan: gate on the **dev cluster** after push. Scope is smaller than the plan's task 9 (no materialization to verify) | — |
+| 9 · Live gate | ✅ **RUN on the dev cluster 2026-08-01** — local k3d is unusable on this machine (API unreachable from host), so dev became the gate. Caught a real bug: see below | `fix(db): cast $3 in update_contact…` |
+| 10 · UI rebuild (unplanned) | ✅ Shipped 2026-08-01 — the page was rebuilt on the house UI kit after the gate; see below | `feat(cockpit): rebuild the contacts page on the house UI kit` |
 
 **Whole-branch review** (no Critical): 5 Important defects fixed in one wave — `add_contact_address` committed a primary demotion it should have rolled back; duplicate-address PATCH returned 200 with a null body; blank `display_name` was writable; non-owner Edit/Delete buttons wedged the confirm dialog permanently on 403; saved-address channel edits were silently dropped. Plus chip i18n and dialog labels. → `fix(contacts): address final-review findings`
 
@@ -26,7 +27,11 @@ Run via subagent-driven development (fresh implementer per task, task-scoped rev
 
 **Known gap for future work:** this repo's vitest harness cannot drive signal `input()` values (no ngtsc transform in `vitest.config.ts`, no `test` architect target), so the Task-8 form regression is proven by a three-layer proxy rather than end-to-end. `@angular/build`'s unit-test runner is installed but unwired — worth its own task.
 
-**Owed:** the live gate (task 9), the phase-2 `external_contacts` drop migration (guard its sweep — see caution below), and the ContactsProvider agent surface.
+**The gate earned its keep.** `update_contact` raised `AmbiguousParameterError` at PREPARE time on *every* call — `$3` sat only in `IS NULL` / `NULLIF($3, '')`, neither of which pins a type, and asyncpg prepares untyped — so **every `PATCH /api/contacts/{id}` was a 500** and editing a contact was impossible. It was one of the six DB methods both reviews flagged as untested, and it was the one that broke. Mock-based router tests sailed past it; only a real database could catch it. Fixed with `$3::text` plus the missing integration test, verified to fail without the cast. Diagnosis trap: the browser reports that 500 as a CORS error, because unhandled 500s bypass the CORS middleware.
+
+**Post-gate UI rebuild.** The page shipped with raw `ngModel` inputs and hand-rolled chips — the plan's own code, flagged as a cosmetic fast-follow by both the implementer and the reviewer. Rebuilt on the house kit, which also fixed three non-cosmetic things: the row is now a `<button>` with `aria-expanded` (was a click-only `<div>`, unreachable by keyboard), badge tone encodes *reachability* rather than channel, and blank `display_name` no longer passes `valid()` — the final review asked for that and it had survived the fix wave.
+
+**Owed after this plan:** only the phase-2 `external_contacts` drop migration (guard its sweep — see caution below). The ContactsProvider agent surface shipped separately with [[virtual_directories]] Slice 1 and consumes task 5's `contact_files.py`, which is why that module survived task 6's revert.
 
 > **Phase-2 caution:** naively re-running task 1's backfill body in the drop migration would overwrite `display_name`s users have since edited in Cockpit and resurrect contacts whose backfilled address they deleted. `updated_at > created_at` is *not* a usable "was edited" discriminator, because task 1 backdates `created_at` while leaving `updated_at = NOW()`.
 
