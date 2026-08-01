@@ -63,8 +63,8 @@ class TestDispatchOfficerPageLink:
             "get_user",
             AsyncMock(
                 return_value={
-                    "email": "legatus@example.com",
-                    "display_name": "Legatus",
+                    "email": "legate@example.com",
+                    "display_name": "Legate",
                 }
             ),
         )
@@ -112,8 +112,8 @@ class TestDispatchOfficerPageBellRow:
             "get_user",
             AsyncMock(
                 return_value={
-                    "email": "legatus@example.com",
-                    "display_name": "Legatus",
+                    "email": "legate@example.com",
+                    "display_name": "Legate",
                 }
             ),
         )

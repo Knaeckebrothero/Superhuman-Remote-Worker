@@ -471,7 +471,7 @@ export class ProjectOfficerComponent implements OnInit, OnDestroy {
         ),
       );
       // Opening the session boots the headless officer (attach = the loop
-      // bootstrap); the Legatus lands on the log and can leave anytime.
+      // bootstrap); the Legate lands on the log and can leave anytime.
       await this.router.navigate(['/sessions', resp.thread_id]);
     } catch (err) {
       this.message.set(this.errText(err, 'Provisioning failed'));

@@ -8773,7 +8773,7 @@ async def create_job(request: Request, job: JobCreate) -> dict[str, Any]:
         # lock serializes parallel creates from one officer (TOCTOU, risk 9);
         # it is per-thread, so ordinary creates never contend. The slot's
         # model/backend merge ON TOP of everything — the officer chooses
-        # which troops to send, the Legatus decides what they are made of.
+        # which troops to send, the Legate decides what they are made of.
         officer_slot_name: str | None = None
         _officer_admit_thread_id = (
             str(job.thread_id) if (job.thread_id and root_creation) else None
@@ -8786,7 +8786,7 @@ async def create_job(request: Request, job: JobCreate) -> dict[str, Any]:
             officer_meta = _thread_officer_meta(_admit_thread or {})
             if _officer_meta_enabled(officer_meta):
                 # Conference fence (centurion.md §4, belt-and-suspenders):
-                # while the Legatus is in conference the HELD background
+                # while the Legate is in conference the HELD background
                 # officer must not dispatch on stale direction — the meeting
                 # may be revising it. The conference session itself (a
                 # different thread) dispatches freely.
@@ -20743,7 +20743,7 @@ async def _hold_officer_for_conference(
             if agent is not None:
                 await _sw._inject_live(
                     agent,
-                    "[conference started — the Legatus is meeting with your "
+                    "[conference started — the Legate is meeting with your "
                     "conference embodiment. Standing hold: take no scheduling "
                     "actions; your timers and events queue durably and arrive "
                     "with the session brief. If your backstop fires before "
@@ -20811,7 +20811,7 @@ async def get_project_officer_summary(
 ) -> dict[str, Any]:
     """The project's centurion at a glance — the cockpit's officer card (S9).
 
-    Everything the Legatus asked "where do I see him?" about: whether one is
+    Everything the Legate asked "where do I see him?" about: whether one is
     enabled, his thread (the log), the next scheduled wake, queued events,
     today's page spend, the digest ring, a live hold, and the open conference
     if any. ``officer: null`` when the project has none — the card renders an
@@ -21005,7 +21005,7 @@ async def _dispatch_officer_page(
         config_name=str(thread.get("config_name") or "session_base"),
         thread_id=thread_id,
         recipient_email=user.get("email"),
-        recipient_name=user.get("display_name") or "Legatus",
+        recipient_name=user.get("display_name") or "Legate",
         # A page is the one urgency that crosses quiet hours (centurion.md
         # §6): it is budgeted, and everything digest-worthy already waits.
         bypass_quiet_hours=True,
@@ -26013,7 +26013,7 @@ async def _officer_watchdog_check_one(officer_row: dict, session_wake_svc) -> No
         # Conference hold (centurion.md §4): stand down entirely — no
         # implicit-timer filing, no overdue kicks, no respawn. But first,
         # self-heal a STALE hold: if the conference thread is gone, ended, or
-        # idle-suspended (Legatus walked away; the attention sweeper parked
+        # idle-suspended (Legate walked away; the attention sweeper parked
         # it), the meeting is over — a missed end-hook must not hold the
         # officer forever. Concluding here releases the hold and enqueues the
         # brief wake (idempotent with the end-hook via insert-dedup on the

@@ -1293,7 +1293,7 @@ async def _execute_turn(
                         "[CHARTER — standing orders for this project, pinned; "
                         "re-read every wake. The posture block is yours to "
                         "edit (kb_update); identity, authority and "
-                        "preferences belong to the Legatus.]\n\n"
+                        "preferences belong to the Legate.]\n\n"
                         f"# {_charter.get('title') or 'Project charter'}\n\n"
                         f"{_charter.get('content', '')}"
                     )

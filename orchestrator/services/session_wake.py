@@ -822,7 +822,7 @@ async def _officer_ceiling_deferral(
     ``officer.daily_token_ceiling`` — or None to deliver normally.
 
     Fail-OPEN on every error: metering being down must never brick wakes.
-    The brake only touches the drain — direct Legatus input bypasses it, so
+    The brake only touches the drain — direct Legate input bypasses it, so
     a ceilinged officer still answers his commander immediately. The ledger
     lags live usage by one materializer poll, which is fine for a daily cap.
     """
@@ -858,7 +858,7 @@ async def _note_ceiling_breach(
 ) -> None:
     """One day-stamped digest entry when the ceiling brake engages.
 
-    The notify contract's 'force-sleep + digest notice': the Legatus learns
+    The notify contract's 'force-sleep + digest notice': the Legate learns
     the officer went quiet from the digest, not from silence. Idempotent per
     UTC day via ``officer_state.ceiling_notice``.
     """
