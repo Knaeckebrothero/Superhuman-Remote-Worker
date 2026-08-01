@@ -123,6 +123,11 @@ DATASOURCE_TOOL_MAP: Dict[str, Dict[str, Any]] = {
             "webdav_delete",
         ],
     },
+    "repository": {
+        "category": "repo",
+        "read": ["repo_pull"],
+        "write": ["repo_commit", "repo_push", "repo_pull", "repo_open_pr"],
+    },
     # Email is tier-keyed (config.access), not binary read/write — see
     # EMAIL_TIER_TOOLS and docs/features/email_datasource.md.
     "email": {
