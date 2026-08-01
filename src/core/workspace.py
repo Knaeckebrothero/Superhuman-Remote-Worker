@@ -741,7 +741,15 @@ class WorkspaceManager:
         return git_mgr
 
     def _clone_auxiliary_repos(self) -> None:
-        """Clone source/reference repositories into repos/ subdirectory."""
+        """Clone source/reference repositories into repos/ subdirectory.
+
+        Two roles are deliberately never cloned: ``jobs`` (it *is* the
+        workspace root) and ``knowledge`` (the KB vault is server-side —
+        notes are read through the KB tools and written via the
+        orchestrator's materialisation endpoint, so a checkout would be a
+        stale second copy nobody reads;
+        docs/features/knowledge_base_repo_separation.md §3).
+        """
         if not self.config.repositories:
             return
 
@@ -756,6 +764,8 @@ class WorkspaceManager:
         for repo in self.config.repositories:
             if repo["role"] == "jobs":
                 continue  # Jobs repo IS the workspace root
+            if repo["role"] == "knowledge":
+                continue  # KB vault is server-side; never checked out
 
             repo_name = repo["name"]
             target = repos_dir / repo_name

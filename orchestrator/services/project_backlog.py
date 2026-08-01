@@ -242,12 +242,46 @@ def _rewrite_status(markdown: str, new_status: str) -> tuple[str, str]:
     return "---" + head + sep + tail, _REWRITTEN
 
 
+async def _resolve_note_repo(project_id: str, postgres_db: Any) -> str | None:
+    """The repo whose ``knowledge/`` vault holds this project's notes.
+
+    Routed through ``kb_reindex.resolve_kb_repo`` — the one resolver the KB
+    sweep and the note write path also use — rather than re-deriving the
+    jobs-repo name from the project id here. A second copy of that rule is
+    exactly how the mirror and the reindexer come to target different repos
+    once a project has its own ``knowledge`` repo, and that divergence is
+    silent (docs/features/knowledge_base_repo_separation.md §5a, §10).
+
+    ``postgres_db`` is late-bound off ``main`` when the caller passes none: it
+    is a module global built during orchestrator startup, and importing
+    ``main`` at call time rather than import time avoids the circular import
+    (same pattern as services/sitrep.py). ``None`` when the project has no KB
+    repo at all — there is no file to mirror to, only the index.
+    """
+    if postgres_db is None:
+        try:
+            import main as orchestrator_main  # late import: avoid circular
+
+            postgres_db = getattr(orchestrator_main, "postgres_db", None)
+        except Exception:
+            postgres_db = None
+        if postgres_db is None:
+            return None
+
+    from .kb_reindex import resolve_kb_repo  # late import: avoid circular
+
+    resolved = await resolve_kb_repo(postgres_db, str(project_id))
+    return resolved[0] if resolved else None
+
+
 async def close_backlog_ticket(
     vector_db: Any,
     gitea: Any,
     project_id: str,
     note_id: str,
     new_status: str,
+    *,
+    postgres_db: Any = None,
 ) -> bool:
     """Mirror a ticket's closed status to the note file AND the index row.
 
@@ -262,12 +296,26 @@ async def close_backlog_ticket(
     block, or one with no closing ``---``): that file was never really
     touched, and claiming success there would hide exactly the case that most
     needs a human to look at the note by hand.
+
+    ``postgres_db`` is only needed to resolve which repo holds the vault (see
+    ``_resolve_note_repo``); callers that have the handle should pass it, and
+    it is late-bound off ``main`` when they don't.
     """
-    repo_name = f"project-{str(project_id)[:8]}-jobs"
     file_path = f"knowledge/{note_id}.md"
     durable_ok = False
+    repo_name: str | None = None
     try:
-        current = await gitea.get_file_content(repo_name, file_path)
+        repo_name = await _resolve_note_repo(project_id, postgres_db)
+        if repo_name is None:
+            logger.info(
+                "backlog: project %s has no KB repo — %s → %s is an index-only close",
+                project_id,
+                note_id,
+                new_status,
+            )
+        current = (
+            await gitea.get_file_content(repo_name, file_path) if repo_name else None
+        )
         if current:
             updated, outcome = _rewrite_status(current, new_status)
             if outcome == _ALREADY_SET:
@@ -298,7 +346,7 @@ async def close_backlog_ticket(
                         f"backlog: {note_id} → {new_status}",
                     )
                 )
-        else:
+        elif repo_name is not None:
             logger.info(
                 "backlog: note file %s not found in %s — index-only close",
                 file_path,

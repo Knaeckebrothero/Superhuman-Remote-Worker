@@ -43,6 +43,7 @@ import json
 import os
 import re
 import secrets
+import shutil
 import socket
 import struct
 import subprocess
@@ -75,6 +76,33 @@ PROFILE_DIR = os.environ.get(
 # (which isn't on the image, and which every browser-use >=0.13 CDP build reaches
 # for when it can't find a browser). See docs/features/browser_workspace_executor.md §5.1.
 CHROMIUM_PATH = os.environ.get("BROWSER_EXEC_CHROMIUM", "/usr/local/bin/agent-chromium")
+# Headful rendering under a virtual X server (see _ensure_display).
+#
+# Headlessness itself is no longer the loud signal it was: Chrome's new headless
+# mode reports honest client-hint brands (``Chromium``, not ``HeadlessChrome``),
+# navigator.webdriver=false under AutomationControlled, and a populated plugin
+# list. What headless *forces* is two things no real browser does, and bot checks
+# read both before a click ever lands:
+#
+#   1. Incoherent geometry. browser-use applies an Emulation device-metrics
+#      override, which resizes the viewport without touching screen/window
+#      metrics. Measured as-shipped: screen 800x600, outer 780x580, inner
+#      1920x1080 — a page larger than the window it lives in, on a monitor
+#      smaller than both. That triple cannot occur on real hardware and is the
+#      cheapest bot test there is.
+#   2. No WebGL at all. With --disable-gpu, getContext('webgl') returns null.
+#      Software rendering (SwiftShader) is a weak signal; *zero* WebGL is a
+#      strong one, because real browsers essentially always have a context.
+#
+# Both close by rendering into an Xvfb display at a plausible desktop size and
+# letting the real window size the viewport. Xvfb is already in the workspace
+# image — Playwright's ``install --with-deps`` pulls it in — so this costs no
+# image surface. Set BROWSER_EXEC_HEADFUL=0 to go back to headless.
+HEADFUL = os.environ.get("BROWSER_EXEC_HEADFUL", "1").lower() not in ("0", "false", "no")
+DISPLAY_NAME = os.environ.get("BROWSER_EXEC_DISPLAY", ":99")
+SCREEN_WIDTH = int(os.environ.get("BROWSER_EXEC_SCREEN_WIDTH", "1920"))
+SCREEN_HEIGHT = int(os.environ.get("BROWSER_EXEC_SCREEN_HEIGHT", "1080"))
+XVFB_START_TIMEOUT_S = float(os.environ.get("BROWSER_EXEC_XVFB_TIMEOUT", "10"))
 # Directory exposed to the browser when rendering a local file (see
 # LocalFileServer). Defaults to the agent's workspace; override only to widen or
 # narrow that root deliberately.
@@ -810,6 +838,98 @@ def _clean_user_agent() -> str | None:
     return user_agent
 
 
+_XVFB_PROC: list = []  # daemon-lifetime handle; started at most once
+
+
+def _x_socket_ready(display: str) -> bool:
+    """True once the X server's unix socket for ``display`` exists."""
+    num = display.lstrip(":").split(".")[0]
+    return Path(f"/tmp/.X11-unix/X{num}").exists()
+
+
+async def _ensure_display() -> bool:
+    """Bring up an Xvfb display for headful Chromium. False → stay headless.
+
+    Idempotent and deliberately non-fatal. A workspace without Xvfb, or an Xvfb
+    that refuses to start, degrades to the previous headless behaviour rather
+    than breaking every ``browser_*`` tool — the same posture the daemon takes
+    everywhere else. The cost of degrading is a browser that fails bot checks,
+    not a browser that fails to run.
+    """
+    if not HEADFUL:
+        return False
+    if _XVFB_PROC:
+        return _XVFB_PROC[0].poll() is None
+    # An inherited display wins: a real X server, or an outer `xvfb-run` that
+    # already wrapped us. Never start a second server over a working one.
+    inherited = os.environ.get("DISPLAY")
+    if inherited and _x_socket_ready(inherited):
+        log(f"using inherited DISPLAY={inherited}")
+        return True
+    # Adopt an Xvfb already sitting on our display. A SIGKILLed daemon never
+    # runs _stop_display, so its Xvfb outlives it; without this the replacement
+    # daemon's spawn loses the address-in-use race and degrades to headless for
+    # the rest of the workspace's life — a silent fingerprint regression whose
+    # only symptom is bot checks starting to fail again.
+    if _x_socket_ready(DISPLAY_NAME):
+        os.environ["DISPLAY"] = DISPLAY_NAME
+        log(f"adopting existing display {DISPLAY_NAME}")
+        return True
+    if shutil.which("Xvfb") is None:
+        log("Xvfb not installed; falling back to headless")
+        return False
+    try:
+        proc = subprocess.Popen(
+            [
+                "Xvfb",
+                DISPLAY_NAME,
+                "-screen",
+                "0",
+                f"{SCREEN_WIDTH}x{SCREEN_HEIGHT}x24",
+                "-nolisten",
+                "tcp",
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception as exc:
+        log(f"Xvfb spawn failed ({exc}); falling back to headless")
+        return False
+
+    deadline = time.monotonic() + XVFB_START_TIMEOUT_S
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            log(f"Xvfb exited rc={proc.returncode}; falling back to headless")
+            return False
+        if _x_socket_ready(DISPLAY_NAME):
+            os.environ["DISPLAY"] = DISPLAY_NAME
+            _XVFB_PROC.append(proc)
+            log(f"Xvfb up on {DISPLAY_NAME} ({SCREEN_WIDTH}x{SCREEN_HEIGHT})")
+            return True
+        await asyncio.sleep(0.1)
+
+    log("Xvfb did not come up in time; falling back to headless")
+    try:
+        proc.terminate()
+    except Exception:
+        pass
+    return False
+
+
+def _stop_display() -> None:
+    """Reap Xvfb on daemon shutdown so a restart gets a clean display."""
+    while _XVFB_PROC:
+        proc = _XVFB_PROC.pop()
+        try:
+            proc.terminate()
+            proc.wait(timeout=5)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+
 class BrowserDaemon:
     """Owns a single persistent ``BrowserSession`` and runs actions on it."""
 
@@ -846,34 +966,63 @@ class BrowserDaemon:
         # namespaces), so disable it and avoid /dev/shm + GPU — the same flags the
         # old _start_remote_chromium used.
         #
-        # Fingerprint hygiene: headless Chromium advertises itself twice —
-        # navigator.webdriver=true and a "HeadlessChrome/…" user agent — and
-        # bot checks (e.g. Cloudflare Turnstile) fail the browser on those
-        # before any click lands, no matter WHO is driving. AutomationControlled
-        # clears webdriver; the UA override keeps the real binary's version but
-        # drops the Headless marker. Client-hint brands still expose headless —
-        # the honest fix for the rest is a headful X server, deliberately out
-        # of scope here.
+        # Fingerprint hygiene. AutomationControlled clears navigator.webdriver;
+        # the UA override keeps the real binary's version but drops any Headless
+        # marker. The remaining signals — and they are the ones that actually
+        # fail bot checks — are geometry coherence, WebGL presence and the
+        # permission surface; see the HEADFUL block above for the measurements.
+        headful = await _ensure_display()
         args = [
             "--no-sandbox",
             "--disable-dev-shm-usage",
-            "--disable-gpu",
             "--disable-blink-features=AutomationControlled",
         ]
+        if headful:
+            # Software GL, but *present*. Without a GPU this still reports
+            # SwiftShader, which is a weak signal; having no WebGL context at
+            # all is a strong one. --window-size sizes the real window, which
+            # in turn sizes the viewport (no device-metrics override below).
+            args += [
+                "--use-gl=angle",
+                "--use-angle=swiftshader",
+                "--enable-unsafe-swiftshader",
+                f"--window-size={SCREEN_WIDTH},{SCREEN_HEIGHT}",
+                "--window-position=0,0",
+            ]
+        else:
+            args.append("--disable-gpu")
         user_agent = _clean_user_agent()
         if user_agent:
             args.append(f"--user-agent={user_agent}")
+        # Headful only: let the window drive the viewport instead of overriding
+        # device metrics, so inner ≤ outer ≤ screen holds. Headless has no real
+        # window, so it keeps browser-use's default sizing.
+        sizing = (
+            {
+                "no_viewport": True,
+                "viewport": None,
+                "window_size": {"width": SCREEN_WIDTH, "height": SCREEN_HEIGHT},
+            }
+            if headful
+            else {}
+        )
         session = BrowserSession(
-            headless=True,
+            headless=not headful,
             executable_path=CHROMIUM_PATH,
             user_data_dir=PROFILE_DIR,
             chromium_sandbox=False,
+            # browser-use grants a permission set by default. A profile where
+            # Notification.permission is already "granted" without anyone having
+            # been prompted is a long-standing automation tell; real first-visit
+            # state is "default".
+            permissions=[],
             args=args,
+            **sizing,
         )
         await session.start()
         self._session = session
         self._install_focus_handler(session)
-        log("Chromium session started")
+        log(f"Chromium session started (headful={headful})")
         return session
 
     async def _open_start_page(self) -> None:
@@ -1559,6 +1708,7 @@ async def _serve() -> int:
     finally:
         stream_server.close()
         await stream_server.wait_closed()
+        _stop_display()
     log("shutting down")
     try:
         os.unlink(SOCKET_PATH)

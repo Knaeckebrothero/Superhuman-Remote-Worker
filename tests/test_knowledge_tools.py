@@ -16,6 +16,7 @@ Covers section 13 of persistent_agent_tests.md:
   13.13 kb_export
 """
 
+import os
 import uuid
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -24,6 +25,7 @@ from pydantic import ValidationError
 
 from src.tools.knowledge.knowledge_tools import (
     KNOWLEDGE_TOOLS_METADATA,
+    _post_vault_file,
     create_kb_tools,
 )
 
@@ -85,6 +87,100 @@ def _capture_workspace():
     writes: dict = {}
     ws.write_file.side_effect = lambda rel, content: writes.__setitem__(rel, content)
     return ws, writes
+
+
+@pytest.fixture(autouse=True)
+def _no_materialization_http():
+    """Keep every test in this module off the network.
+
+    Materialising a note is a real HTTP POST now, so any test that writes a
+    note would otherwise try to reach an orchestrator. Tests that assert on
+    the call patch over this with ``_capture_materialize``; ``TestPostVaultFile``
+    holds its own module-level reference and is unaffected.
+    """
+    with patch(
+        "src.tools.knowledge.knowledge_tools._post_vault_file",
+        return_value={"status": "skipped", "reason": "no-repo"},
+    ):
+        yield
+
+
+def _capture_materialize(result=None):
+    """Patch the server-side materialisation seam and record what it was sent.
+
+    Returns ``(patcher, calls)``; use ``with patcher:`` around the invocation.
+    ``calls`` collects one ``{project_id, slug, content, job_id}`` dict per
+    POST, which is the whole payload the orchestrator endpoint receives.
+    Patching here rather than at ``httpx`` keeps every tool test off the
+    network while still asserting the exact request.
+    """
+    calls: list = []
+
+    def _fake(project_id, slug, content, job_id):
+        calls.append(
+            {
+                "project_id": project_id,
+                "slug": slug,
+                "content": content,
+                "job_id": job_id,
+            }
+        )
+        return dict(result or {"status": "committed", "path": f"knowledge/{slug}.md"})
+
+    patcher = patch(
+        "src.tools.knowledge.knowledge_tools._post_vault_file", side_effect=_fake
+    )
+    return patcher, calls
+
+
+def _fake_http(status_code=200, body=None, raises=None):
+    """A patcher for the module's ``httpx.Client`` plus the recording client."""
+    response = MagicMock(status_code=status_code)
+    if isinstance(body, Exception):
+        response.json.side_effect = body
+    else:
+        response.json.return_value = body
+    client = MagicMock()
+    if raises is not None:
+        client.post.side_effect = raises
+    else:
+        client.post.return_value = response
+    ctor = MagicMock()
+    ctor.return_value.__enter__.return_value = client
+    return patch("src.tools.knowledge.knowledge_tools.httpx.Client", ctor), ctor, client
+
+
+def _store_row(note_id, note_type="learning", content="", **extra):
+    """One ``knowledge_index`` row in the shape ``list_notes_full`` returns.
+
+    Defaults to a materialised note (``path`` set) — the normal state; pass
+    ``path=None`` for a row no file backs yet.
+    """
+    row = {
+        "id": note_id,
+        "path": f"knowledge/{note_id}.md",
+        "title": note_id,
+        "type": note_type,
+        "status": "active",
+        "content": content,
+        "confidence": None,
+        "priority": 1,
+        "tags": [],
+        "keywords": [],
+        "job_id": None,
+        "phase": None,
+        "superseded_by": None,
+        "created": None,
+        "modified": None,
+    }
+    row.update(extra)
+    return row
+
+
+def _fake_kb_store(ctx, rows):
+    """Back the context's knowledge_store with a fixed vault read (gardener path)."""
+    ctx.knowledge_store.list_notes_full = AsyncMock(return_value=list(rows))
+    return ctx.knowledge_store
 
 
 def _fake_kb_workspace(files: dict):
@@ -1086,39 +1182,105 @@ class TestKbExportDestinationGuard:
 
 
 class TestKbLint:
-    def test_error_when_no_workspace(self):
+    """kb_lint reads the knowledge index, not the workspace vault.
+
+    knowledge_base_repo_separation §5a: once the vault moves into its own
+    server-side repo a workspace glob returns nothing, and a healthy KB would
+    lint as "no markdown notes found" — the silent-empty mode this surface
+    exists to prevent.
+    """
+
+    def test_lints_notes_from_the_store_without_a_workspace(self):
         ctx = _make_context()
         ctx.has_workspace.return_value = False
+        ctx.workspace_manager = None
+        _fake_kb_store(
+            ctx,
+            [
+                _store_row("n1", "decision", "# N1\n\nSee [ghost](ghost.md).\n"),
+            ],
+        )
         tools, _ = _make_tools(ctx)
         result = _invoke(_get_tool(tools, "kb_lint"), {})
-        assert "Error" in result
+        assert "dead-link" in result
+        assert "knowledge/n1.md" in result
 
-    def test_no_notes_found(self):
+    def test_no_notes_found_reports_the_index_honestly(self):
         ctx = _make_context()
-        ctx.has_workspace.return_value = True
-        ws, _ = _fake_kb_workspace({})
-        ctx.workspace_manager = ws
+        ctx.has_workspace.return_value = False
+        _fake_kb_store(ctx, [])
         tools, _ = _make_tools(ctx)
         result = _invoke(_get_tool(tools, "kb_lint"), {})
-        assert "No markdown notes" in result
+        assert "No knowledge notes found" in result
+        assert "knowledge index" in result
 
     def test_reports_dead_link_finding(self):
         ctx = _make_context()
-        ctx.has_workspace.return_value = True
-        ws, _ = _fake_kb_workspace(
-            {
-                "knowledge/n1.md": (
-                    '---\nid: n1\ntype: decision\ndescription: "d"\n---\n\n'
-                    "# N1\n\nSee [ghost](ghost.md).\n"
-                ),
-            }
+        _fake_kb_store(
+            ctx, [_store_row("n1", "decision", "# N1\n\nSee [ghost](ghost.md).\n")]
         )
-        ctx.workspace_manager = ws
         tools, _ = _make_tools(ctx)
         result = _invoke(_get_tool(tools, "kb_lint"), {})
         assert "dead-link" in result
 
+    def test_vault_path_arg_never_globs_the_workspace(self):
+        # `path="knowledge"` was the old default and models still pass it. It
+        # must mean "the project KB", never "glob a workspace directory that no
+        # longer holds the vault".
+        ctx = _make_context()
+        ctx.has_workspace.return_value = True
+        ws, _ = _fake_kb_workspace({})
+        ctx.workspace_manager = ws
+        _fake_kb_store(ctx, [_store_row("n1", "decision", "# N1\n\n[n2](n2.md)\n")])
+        tools, _ = _make_tools(ctx)
+        result = _invoke(_get_tool(tools, "kb_lint"), {"path": "knowledge"})
+        ws.list_files.assert_not_called()
+        assert "dead-link" in result
+
+    def test_flags_notes_no_file_backs(self):
+        # The state the read path cannot see: a row with path IS NULL is
+        # invisible to kb_read/kb_search, so lint must say so out loud.
+        ctx = _make_context()
+        _fake_kb_store(
+            ctx,
+            [
+                _store_row("n1", "decision", "# N1\n\n[n2](n2.md)\n", path=None),
+                _store_row("n2", "decision", "# N2\n\n[n1](n1.md)\n"),
+            ],
+        )
+        tools, _ = _make_tools(ctx)
+        result = _invoke(_get_tool(tools, "kb_lint"), {})
+        assert "unmaterialised-note" in result
+        assert "1 of 2" in result
+        assert "n1" in result
+
+    def test_no_unmaterialised_finding_when_all_notes_have_files(self):
+        ctx = _make_context()
+        _fake_kb_store(ctx, [_store_row("n1", "decision", "# N1\n\n[n2](n2.md)\n")])
+        tools, _ = _make_tools(ctx)
+        result = _invoke(_get_tool(tools, "kb_lint"), {})
+        assert "unmaterialised-note" not in result
+
+    def test_index_read_error_is_reported(self):
+        ctx = _make_context()
+        ctx.knowledge_store.list_notes_full = AsyncMock(
+            side_effect=RuntimeError("pgvector down")
+        )
+        tools, _ = _make_tools(ctx)
+        result = _invoke(_get_tool(tools, "kb_lint"), {})
+        assert "Error reading the knowledge index" in result
+
+    def test_error_when_no_knowledge_base_in_scope(self):
+        ctx = _make_context()
+        ctx.project_ids = []
+        tools, _ = _make_tools(ctx)
+        result = _invoke(_get_tool(tools, "kb_lint"), {})
+        assert "Error" in result
+        assert "no project knowledge base" in result
+
     def test_respects_path_arg(self):
+        # The one thing the index cannot answer: an arbitrary markdown vault
+        # in the workspace (docs/, a repository datasource checkout).
         ctx = _make_context()
         ctx.has_workspace.return_value = True
         ws, _ = _fake_kb_workspace(
@@ -1129,53 +1291,115 @@ class TestKbLint:
         _invoke(_get_tool(tools, "kb_lint"), {"path": "docs"})
         ws.list_files.assert_called_with("docs", "*.md")
 
-
-class TestKbIndex:
-    def test_error_when_no_workspace(self):
+    def test_explicit_path_without_workspace_is_actionable(self):
         ctx = _make_context()
         ctx.has_workspace.return_value = False
         tools, _ = _make_tools(ctx)
-        result = _invoke(_get_tool(tools, "kb_index"), {})
+        result = _invoke(_get_tool(tools, "kb_lint"), {"path": "docs"})
         assert "Error" in result
+        assert "docs" in result
+        assert "Omit `path`" in result
 
-    def test_writes_index_grouped_by_type(self):
+    def test_path_inside_the_vault_is_refused_not_globbed(self):
         ctx = _make_context()
         ctx.has_workspace.return_value = True
-        ws, writes = _fake_kb_workspace(
-            {
-                "knowledge/chose-jwt.md": (
-                    '---\nid: chose-jwt\ntype: decision\ndescription: "We chose JWT."\n'
-                    "---\n\n# Chose JWT\n\nbody\n"
-                ),
-            }
-        )
+        ws, _ = _fake_kb_workspace({})
         ctx.workspace_manager = ws
         tools, _ = _make_tools(ctx)
+        result = _invoke(_get_tool(tools, "kb_lint"), {"path": "knowledge/sub"})
+        ws.list_files.assert_not_called()
+        assert "Error" in result
+        assert "Omit `path`" in result
+
+
+class TestKbIndex:
+    """The vault is not a workspace directory any more, so `knowledge/index.md`
+    is never written from here — the last vault write in the module went with
+    the note dual-write (knowledge_base_repo_separation §7 step 4). The
+    explicit-`path` mode still indexes an ordinary workspace directory."""
+
+    def test_vault_mode_writes_nothing_to_the_workspace(self):
+        # Even with a git-backed workspace right there. Writing it would put
+        # OKF navigation in the jobs repo while its notes live in the
+        # knowledge repo — the split this design removes.
+        ctx = _make_context()
+        ctx.has_workspace.return_value = True
+        ctx.has_git.return_value = True
+        ws, writes = _fake_kb_workspace({})
+        ctx.workspace_manager = ws
+        _fake_kb_store(
+            ctx,
+            [
+                _store_row(
+                    "chose-jwt",
+                    "decision",
+                    "# Chose JWT\n\nWe chose JWT.\n",
+                    title="Chose JWT",
+                )
+            ],
+        )
+        tools, _ = _make_tools(ctx)
         result = _invoke(_get_tool(tools, "kb_index"), {})
-        assert "knowledge/index.md" in writes
-        content = writes["knowledge/index.md"]
-        assert "## decision" in content
-        assert "[Chose JWT](chose-jwt.md)" in content
+        assert writes == {}
+        ws.write_file.assert_not_called()
+        ws.list_files.assert_not_called()
         assert "1 note" in result
+        assert "NOT rewritten" in result
+        assert "knowledge/index.md" in result
+        assert "kb_list" in result
 
-    def test_skips_reserved_and_malformed(self):
+    def test_skips_reserved_ids(self):
+        ctx = _make_context()
+        ctx.has_workspace.return_value = True
+        ctx.has_git.return_value = True
+        ws, _writes = _fake_kb_workspace({})
+        ctx.workspace_manager = ws
+        _fake_kb_store(
+            ctx,
+            [
+                _store_row("good", "learning", "# Good\n", title="Good"),
+                _store_row("index", "learning", "# Index\n"),
+                _store_row("log", "learning", "# Log\n"),
+            ],
+        )
+        tools, _ = _make_tools(ctx)
+        result = _invoke(_get_tool(tools, "kb_index"), {})
+        assert "1 note" in result  # index/log are generated artefacts, not notes
+
+    def test_counts_notes_without_a_workspace_at_all(self):
+        # Lite tiers / persistent sessions: the notes are readable from the
+        # index, and the tool no longer needs a workspace to say so.
+        ctx = _make_context()
+        ctx.has_workspace.return_value = False
+        ctx.has_git.return_value = False
+        ctx.workspace_manager = None
+        _fake_kb_store(ctx, [_store_row("good", "learning", "# Good\n")])
+        tools, _ = _make_tools(ctx)
+        result = _invoke(_get_tool(tools, "kb_index"), {})
+        assert "1 note" in result
+        assert "NOT rewritten" in result
+        assert "knowledge/index.md" in result
+
+    def test_no_indexable_notes_reports_the_index(self):
+        ctx = _make_context()
+        _fake_kb_store(ctx, [])
+        tools, _ = _make_tools(ctx)
+        result = _invoke(_get_tool(tools, "kb_index"), {})
+        assert "No indexable notes found" in result
+        assert "knowledge index" in result
+
+    def test_respects_path_arg_for_other_vaults(self):
         ctx = _make_context()
         ctx.has_workspace.return_value = True
         ws, writes = _fake_kb_workspace(
-            {
-                "knowledge/good.md": (
-                    '---\nid: good\ntype: learning\ndescription: "d"\n---\n\n# Good\n'
-                ),
-                "knowledge/index.md": "# Index\n\n(reserved, not a note)\n",
-                "knowledge/broken.md": "---\nnot: : yaml\n---\nbody",
-            }
+            {"docs/a.md": '---\nid: a\ntype: note\ndescription: "d"\n---\n\n# A\n'}
         )
         ctx.workspace_manager = ws
         tools, _ = _make_tools(ctx)
-        result = _invoke(_get_tool(tools, "kb_index"), {})
-        content = writes["knowledge/index.md"]
-        assert "[Good](good.md)" in content
-        assert "1 note" in result  # index.md + broken.md excluded
+        result = _invoke(_get_tool(tools, "kb_index"), {"path": "docs"})
+        ws.list_files.assert_called_with("docs", "*.md")
+        assert "docs/index.md" in writes
+        assert "1 note" in result
 
     def test_returns_summary_with_count(self, tmp_path):
         tools, ctx = _make_tools()
@@ -1386,7 +1610,13 @@ class TestRenderNoteMd:
 
 
 # =============================================================================
-# Slice 1: kb_write / kb_update dual-write to knowledge/<slug>.md
+# Server-side materialisation of knowledge/<slug>.md
+# (docs/features/knowledge_base_repo_separation.md §7 step 4)
+#
+# The note file used to be a second write into the agent's own workspace
+# checkout, guarded on has_git(). It is a POST to the orchestrator now, which
+# owns the commit — so it needs neither git nor a workspace, and no vault write
+# touches the agent's filesystem any more.
 # =============================================================================
 
 
@@ -1400,56 +1630,196 @@ def _make_git_context(**kwargs):
     return ctx
 
 
-class TestKbWriteDualWrite:
-    """Slice 1: kb_write materializes knowledge/<slug>.md via the workspace."""
+def _make_gitless_context(**kwargs):
+    """A runtime with NO workspace and NO git — persistent session / lite tier.
 
-    def test_writes_flat_knowledge_file_when_git_active(self):
+    Exactly the shape whose notes used to stay pathless (and therefore
+    invisible to kb_read/kb_search) because the dual-write skipped it.
+    """
+    ctx = _make_context(**kwargs)
+    ctx.has_git.return_value = False
+    ctx.has_workspace.return_value = False
+    ctx.workspace_manager = None
+    ctx._job_metadata = {"config_name": "interactive"}
+    return ctx
+
+
+class TestPostVaultFile:
+    """The HTTP seam itself — URL, auth, payload, and its never-raise contract.
+
+    Everything above it is allowed to log-and-continue only because this
+    function absorbs every transport outcome into a status dict.
+    """
+
+    def _post(self, **env):
+        base = {"ORCHESTRATOR_URL": "http://orch:8085", "MCP_INTERNAL_KEY": "sekret"}
+        base.update(env)
+        with patch.dict(os.environ, base, clear=False):
+            return _post_vault_file("proj-1", "chose-jwt", "# body\n", "job-9")
+
+    def test_posts_to_the_projects_materialize_endpoint(self):
+        patcher, ctor, client = _fake_http(body={"status": "committed"})
+        with patcher:
+            result = self._post()
+        url = client.post.call_args[0][0]
+        assert url == "http://orch:8085/api/projects/proj-1/knowledge/materialize"
+        assert result == {"status": "committed"}
+
+    def test_sends_slug_content_and_job_id(self):
+        patcher, ctor, client = _fake_http(body={"status": "committed"})
+        with patcher:
+            self._post()
+        payload = client.post.call_args.kwargs["json"]
+        assert payload == {
+            "slug": "chose-jwt",
+            "content": "# body\n",
+            "job_id": "job-9",
+        }
+
+    def test_authenticates_with_the_internal_key(self):
+        patcher, ctor, _ = _fake_http(body={"status": "committed"})
+        with patcher:
+            self._post()
+        assert ctor.call_args.kwargs["headers"] == {"X-Internal-Key": "sekret"}
+
+    def test_omits_job_id_when_there_is_none(self):
+        # Persistent sessions have no job; the endpoint's job_id is optional.
+        patcher, ctor, client = _fake_http(body={"status": "committed"})
+        with patcher, patch.dict(os.environ, {}, clear=False):
+            _post_vault_file("proj-1", "n1", "x", None)
+        assert "job_id" not in client.post.call_args.kwargs["json"]
+
+    def test_transport_failure_returns_failed_instead_of_raising(self):
+        import httpx as _httpx
+
+        patcher, _, _ = _fake_http(raises=_httpx.ConnectError("boom"))
+        with patcher:
+            result = self._post()
+        assert result["status"] == "failed"
+        assert "unreachable" in result["reason"]
+
+    def test_non_200_returns_failed(self):
+        # The endpoint answers 200 for every KB-level outcome, so a non-200 is
+        # transport/auth — 401 from a missing internal key, most likely.
+        patcher, _, _ = _fake_http(status_code=401, body={"detail": "nope"})
+        with patcher:
+            result = self._post()
+        assert result == {"status": "failed", "reason": "http-401"}
+
+    def test_malformed_body_returns_failed(self):
+        patcher, _, _ = _fake_http(body=ValueError("not json"))
+        with patcher:
+            result = self._post()
+        assert result == {"status": "failed", "reason": "malformed-response"}
+
+    def test_statusless_body_returns_failed(self):
+        patcher, _, _ = _fake_http(body={"repo": "x"})
+        with patcher:
+            result = self._post()
+        assert result == {"status": "failed", "reason": "malformed-response"}
+
+
+class TestKbWriteMaterialization:
+    """kb_write hands the rendered note to the orchestrator, never the workspace."""
+
+    def test_materializes_the_rendered_note_through_the_endpoint(self):
         ctx = _make_git_context()
         ctx.knowledge_graph.create_note.return_value = "chose-jwt"
         ctx.knowledge_store.upsert_note = AsyncMock(return_value=uuid.uuid4())
         tools, _ = _make_tools(ctx)
 
-        with patch("src.tools.knowledge.knowledge_tools.asyncio"):
+        patcher, calls = _capture_materialize()
+        with patcher, patch("src.tools.knowledge.knowledge_tools.asyncio"):
             _invoke(
                 _get_tool(tools, "kb_write"),
                 {"title": "Chose JWT", "type": "decision", "content": "We chose JWT."},
             )
 
-        ctx.workspace_manager.write_file.assert_called_once()
-        path_arg, content_arg = ctx.workspace_manager.write_file.call_args[0]
-        assert path_arg == "knowledge/chose-jwt.md"
-        assert "id: chose-jwt" in content_arg
-        assert "author: developer" in content_arg
-        assert "branch: job/abc" in content_arg
+        assert len(calls) == 1
+        call = calls[0]
+        assert call["project_id"] == ctx.project_id
+        assert call["slug"] == "chose-jwt"
+        assert call["job_id"] == ctx.job_id
+        assert "id: chose-jwt" in call["content"]
+        assert "author: developer" in call["content"]
+        assert "branch: job/abc" in call["content"]
 
-    def test_no_file_write_when_git_inactive(self):
+    def test_never_writes_the_note_to_the_workspace(self):
+        # Acceptance criterion 11: no vault write touches the agent filesystem.
         ctx = _make_git_context()
-        ctx.has_git.return_value = False
         ctx.knowledge_graph.create_note.return_value = "n1"
         ctx.knowledge_store.upsert_note = AsyncMock(return_value=uuid.uuid4())
         tools, _ = _make_tools(ctx)
 
-        with patch("src.tools.knowledge.knowledge_tools.asyncio"):
-            result = _invoke(
+        patcher, _ = _capture_materialize()
+        with patcher, patch("src.tools.knowledge.knowledge_tools.asyncio"):
+            _invoke(
                 _get_tool(tools, "kb_write"),
                 {"title": "T", "type": "decision", "content": "x"},
             )
         ctx.workspace_manager.write_file.assert_not_called()
-        assert "n1" in result  # still succeeds
 
-    def test_file_write_failure_is_nonfatal(self):
+    def test_materializes_without_a_workspace_or_git(self):
+        # The new capability (criterion 9): persistent sessions and lite tiers
+        # used to skip the write entirely and leave the note pathless, which
+        # made it invisible to kb_read/kb_search.
+        ctx = _make_gitless_context()
+        ctx.knowledge_graph.create_note.return_value = "from-a-session"
+        ctx.knowledge_store.upsert_note = AsyncMock(return_value=uuid.uuid4())
+        tools, _ = _make_tools(ctx)
+
+        patcher, calls = _capture_materialize()
+        with patcher, patch("src.tools.knowledge.knowledge_tools.asyncio"):
+            result = _invoke(
+                _get_tool(tools, "kb_write"),
+                {"title": "From A Session", "type": "learning", "content": "x"},
+            )
+
+        assert [c["slug"] for c in calls] == ["from-a-session"]
+        assert "author: interactive" in calls[0]["content"]
+        assert "branch:" not in calls[0]["content"]  # no git, no branch
+        assert "from-a-session" in result
+
+    def test_materialization_failure_is_nonfatal(self):
         ctx = _make_git_context()
         ctx.knowledge_graph.create_note.return_value = "n1"
         ctx.knowledge_store.upsert_note = AsyncMock(return_value=uuid.uuid4())
-        ctx.workspace_manager.write_file.side_effect = OSError("disk full")
         tools, _ = _make_tools(ctx)
 
-        with patch("src.tools.knowledge.knowledge_tools.asyncio"):
+        patcher, calls = _capture_materialize(
+            {"status": "failed", "reason": "commit-refused"}
+        )
+        with patcher, patch("src.tools.knowledge.knowledge_tools.asyncio"):
             result = _invoke(
                 _get_tool(tools, "kb_write"),
                 {"title": "T", "type": "decision", "content": "x"},
             )
-        assert "n1" in result  # dual-write failure never fails the tool
+        assert len(calls) == 1
+        assert "n1" in result  # a failed materialisation never fails the tool
+
+    def test_failed_materialization_is_logged_as_an_error(self):
+        # Sec.10: after this change a failed materialisation means the note is
+        # in Postgres and invisible to every reader. It gets an alertable
+        # ERROR under the same `kb-materialize:` prefix the orchestrator uses,
+        # not an unread warning.
+        ctx = _make_git_context()
+        ctx.knowledge_graph.create_note.return_value = "n1"
+        ctx.knowledge_store.upsert_note = AsyncMock(return_value=uuid.uuid4())
+        tools, _ = _make_tools(ctx)
+
+        patcher, _ = _capture_materialize(
+            {"status": "failed", "reason": "resolve-error"}
+        )
+        with patcher, patch("src.tools.knowledge.knowledge_tools.asyncio"):
+            with patch("src.tools.knowledge.knowledge_tools.logger") as log:
+                _invoke(
+                    _get_tool(tools, "kb_write"),
+                    {"title": "T", "type": "decision", "content": "x"},
+                )
+        assert log.error.called
+        rendered = log.error.call_args[0][0] % log.error.call_args[0][1:]
+        assert rendered.startswith("kb-materialize:")
+        assert "resolve-error" in rendered
 
     def test_passes_description_arg_into_frontmatter(self):
         ctx = _make_git_context()
@@ -1457,7 +1827,8 @@ class TestKbWriteDualWrite:
         ctx.knowledge_store.upsert_note = AsyncMock(return_value=uuid.uuid4())
         tools, _ = _make_tools(ctx)
 
-        with patch("src.tools.knowledge.knowledge_tools.asyncio"):
+        patcher, calls = _capture_materialize()
+        with patcher, patch("src.tools.knowledge.knowledge_tools.asyncio"):
             _invoke(
                 _get_tool(tools, "kb_write"),
                 {
@@ -1467,14 +1838,13 @@ class TestKbWriteDualWrite:
                     "description": "A crisp summary.",
                 },
             )
-        _, content_arg = ctx.workspace_manager.write_file.call_args[0]
-        assert 'description: "A crisp summary."' in content_arg
+        assert 'description: "A crisp summary."' in calls[0]["content"]
 
 
-class TestKbUpdateDualWrite:
-    """Slice 1: kb_update re-materializes knowledge/<slug>.md via the workspace."""
+class TestKbUpdateMaterialization:
+    """kb_update re-materializes the note server-side, on both update paths."""
 
-    def test_rewrites_knowledge_file_on_update(self):
+    def _kg_context(self):
         ctx = _make_git_context()
         ctx.knowledge_graph.update_note.return_value = True
         ctx.knowledge_graph.read_note.return_value = {
@@ -1485,23 +1855,28 @@ class TestKbUpdateDualWrite:
             "status": "active",
             "relationships": [{"type": "SUPPORTS", "target": "a"}],
         }
+        return ctx
+
+    def test_graph_path_materializes_the_updated_note(self):
+        ctx = self._kg_context()
         tools, _ = _make_tools(ctx)
 
-        with patch("src.tools.knowledge.knowledge_tools.asyncio"):
+        patcher, calls = _capture_materialize()
+        with patcher, patch("src.tools.knowledge.knowledge_tools.asyncio"):
             _invoke(
                 _get_tool(tools, "kb_update"),
                 {"note": "n1", "content": "updated body"},
             )
 
-        ctx.workspace_manager.write_file.assert_called_once()
-        path_arg, content_arg = ctx.workspace_manager.write_file.call_args[0]
-        assert path_arg == "knowledge/n1.md"
-        assert "updated body" in content_arg
-        assert "[a](a.md)" in content_arg
+        assert len(calls) == 1
+        assert calls[0]["slug"] == "n1"
+        assert calls[0]["project_id"] == ctx.project_id
+        assert "updated body" in calls[0]["content"]
+        assert "[a](a.md)" in calls[0]["content"]
+        ctx.workspace_manager.write_file.assert_not_called()
 
-    def test_no_file_write_when_git_inactive(self):
-        ctx = _make_git_context()
-        ctx.has_git.return_value = False
+    def test_graph_path_materializes_without_a_workspace_or_git(self):
+        ctx = _make_gitless_context()
         ctx.knowledge_graph.update_note.return_value = True
         ctx.knowledge_graph.read_note.return_value = {
             "id": "n1",
@@ -1510,30 +1885,58 @@ class TestKbUpdateDualWrite:
         }
         tools, _ = _make_tools(ctx)
 
-        with patch("src.tools.knowledge.knowledge_tools.asyncio"):
+        patcher, calls = _capture_materialize()
+        with patcher, patch("src.tools.knowledge.knowledge_tools.asyncio"):
             result = _invoke(
                 _get_tool(tools, "kb_update"),
                 {"note": "n1", "content": "x"},
             )
-        ctx.workspace_manager.write_file.assert_not_called()
+        assert [c["slug"] for c in calls] == ["n1"]
         assert "Updated" in result
 
-    def test_file_write_failure_is_nonfatal(self):
-        ctx = _make_git_context()
-        ctx.knowledge_graph.update_note.return_value = True
-        ctx.knowledge_graph.read_note.return_value = {
-            "id": "n1",
-            "title": "T",
-            "content": "x",
-        }
-        ctx.workspace_manager.write_file.side_effect = OSError("disk full")
+    def test_storeonly_path_materializes_the_updated_note(self):
+        # The kg-less update path (_update_existing_kgless) — the third call
+        # site, and the one a lite tier actually takes.
+        ctx = _make_gitless_context()
+        ctx.knowledge_graph = None
+        ctx.knowledge_store.get_note_by_slug = AsyncMock(
+            return_value={
+                "id": "n1",
+                "title": "T",
+                "type": "decision",
+                "content": "old",
+                "status": "active",
+                "tags": [],
+                "keywords": [],
+                "priority": 1,
+            }
+        )
+        ctx.knowledge_store.upsert_note = AsyncMock(return_value=uuid.uuid4())
         tools, _ = _make_tools(ctx)
 
-        with patch("src.tools.knowledge.knowledge_tools.asyncio"):
+        patcher, calls = _capture_materialize()
+        with patcher:
+            result = _invoke(
+                _get_tool(tools, "kb_update"),
+                {"note": "n1", "content": "brand new body"},
+            )
+        assert [c["slug"] for c in calls] == ["n1"]
+        assert "brand new body" in calls[0]["content"]
+        assert "Updated" in result
+
+    def test_materialization_failure_is_nonfatal(self):
+        ctx = self._kg_context()
+        tools, _ = _make_tools(ctx)
+
+        patcher, calls = _capture_materialize(
+            {"status": "failed", "reason": "commit-error"}
+        )
+        with patcher, patch("src.tools.knowledge.knowledge_tools.asyncio"):
             result = _invoke(
                 _get_tool(tools, "kb_update"),
                 {"note": "n1", "content": "x"},
             )
+        assert len(calls) == 1
         assert "Updated" in result
 
 
@@ -1762,26 +2165,21 @@ class TestKbWriteSlugDedup:
 # =============================================================================
 
 
-_KB_LINT_TWIN_FILES = {
-    "knowledge/n1.md": (
-        '---\nid: n1\ntype: learning\ndescription: "d"\n---\n\n# N1\n\n[n2](n2.md)\n'
-    ),
-    "knowledge/n2.md": (
-        '---\nid: n2\ntype: learning\ndescription: "d"\n---\n\n# N2\n\n[n1](n1.md)\n'
-    ),
-}
+_KB_LINT_TWIN_ROWS = [
+    _store_row("n1", "learning", "# N1\n\n[n2](n2.md)\n"),
+    _store_row("n2", "learning", "# N2\n\n[n1](n1.md)\n"),
+]
 
 
 class TestKbLintNearDuplicates:
-    def _ctx(self, files):
+    def _ctx(self, rows):
         ctx = _make_context()
-        ctx.has_workspace.return_value = True
-        ws, _ = _fake_kb_workspace(dict(files))
-        ctx.workspace_manager = ws
+        ctx.has_workspace.return_value = False
+        _fake_kb_store(ctx, rows)
         return ctx
 
     def test_reports_near_duplicate_pairs_from_index(self):
-        ctx = self._ctx(_KB_LINT_TWIN_FILES)
+        ctx = self._ctx(_KB_LINT_TWIN_ROWS)
         ctx.knowledge_store.find_near_duplicate_pairs = AsyncMock(
             return_value=[("n1", "n2", 0.95)]
         )
@@ -1791,7 +2189,7 @@ class TestKbLintNearDuplicates:
         assert "95" in result
 
     def test_index_pairs_outside_vault_ignored(self):
-        ctx = self._ctx(_KB_LINT_TWIN_FILES)
+        ctx = self._ctx(_KB_LINT_TWIN_ROWS)
         ctx.knowledge_store.find_near_duplicate_pairs = AsyncMock(
             return_value=[("ghost-a", "ghost-b", 0.99)]
         )
@@ -1801,7 +2199,7 @@ class TestKbLintNearDuplicates:
 
     def test_store_error_is_non_fatal(self):
         # The deterministic report must stand alone when pgvector is down.
-        ctx = self._ctx(_KB_LINT_TWIN_FILES)
+        ctx = self._ctx(_KB_LINT_TWIN_ROWS)
         ctx.knowledge_store.find_near_duplicate_pairs = AsyncMock(
             side_effect=RuntimeError("pgvector down")
         )
@@ -1814,7 +2212,7 @@ class TestKbLintNearDuplicates:
         # D-1: the 07-05 lint-policy decision (raise 0.9→0.97) lives at this
         # call site — the store default (0.9) is unusable lint noise (307 pairs
         # vs 7 at 0.97 on the live KB). The lint policy owns its floor.
-        ctx = self._ctx(_KB_LINT_TWIN_FILES)
+        ctx = self._ctx(_KB_LINT_TWIN_ROWS)
         ctx.knowledge_store.find_near_duplicate_pairs = AsyncMock(return_value=[])
         tools, _ = _make_tools(ctx)
         _invoke(_get_tool(tools, "kb_lint"), {})
@@ -1827,28 +2225,22 @@ class TestKbLintNearDuplicates:
 # =============================================================================
 
 
-_KB_LINT_URL_FILES = {
-    "knowledge/n1.md": (
-        '---\nid: n1\ntype: source\ndescription: "d"\n---\n\n'
-        "# N1\n\n[docs](https://gone.example/x) [n2](n2.md)\n"
-    ),
-    "knowledge/n2.md": (
-        '---\nid: n2\ntype: source\ndescription: "d"\n---\n\n# N2\n\n[n1](n1.md)\n'
-    ),
-}
+_KB_LINT_URL_ROWS = [
+    _store_row("n1", "source", "# N1\n\n[docs](https://gone.example/x) [n2](n2.md)\n"),
+    _store_row("n2", "source", "# N2\n\n[n1](n1.md)\n"),
+]
 
 
 class TestKbLintUrlSweep:
-    def _ctx(self, files):
+    def _ctx(self, rows):
         ctx = _make_context()
-        ctx.has_workspace.return_value = True
-        ws, _ = _fake_kb_workspace(dict(files))
-        ctx.workspace_manager = ws
+        ctx.has_workspace.return_value = False
+        _fake_kb_store(ctx, rows)
         ctx.knowledge_store.find_near_duplicate_pairs = AsyncMock(return_value=[])
         return ctx
 
     def test_off_by_default_no_network(self):
-        ctx = self._ctx(_KB_LINT_URL_FILES)
+        ctx = self._ctx(_KB_LINT_URL_ROWS)
         tools, _ = _make_tools(ctx)
         with patch(
             "src.tools.knowledge.knowledge_tools._check_external_url"
@@ -1858,7 +2250,7 @@ class TestKbLintUrlSweep:
         assert "dead-external-url" not in result
 
     def test_flags_dead_url_when_enabled(self):
-        ctx = self._ctx(_KB_LINT_URL_FILES)
+        ctx = self._ctx(_KB_LINT_URL_ROWS)
         tools, _ = _make_tools(ctx)
         with patch(
             "src.tools.knowledge.knowledge_tools._check_external_url",
@@ -1869,7 +2261,7 @@ class TestKbLintUrlSweep:
         assert "gone.example" in result
 
     def test_alive_url_not_flagged(self):
-        ctx = self._ctx(_KB_LINT_URL_FILES)
+        ctx = self._ctx(_KB_LINT_URL_ROWS)
         tools, _ = _make_tools(ctx)
         with patch(
             "src.tools.knowledge.knowledge_tools._check_external_url",
@@ -1879,14 +2271,15 @@ class TestKbLintUrlSweep:
         assert "dead-external-url" not in result
 
     def test_cap_is_loud(self):
-        files = {
-            f"knowledge/n{i}.md": (
-                f'---\nid: n{i}\ntype: source\ndescription: "d"\n---\n\n'
-                f"# N{i}\n\n[u](https://example.com/{i}) [n0](n0.md)\n"
+        rows = [
+            _store_row(
+                f"n{i}",
+                "source",
+                f"# N{i}\n\n[u](https://example.com/{i}) [n0](n0.md)\n",
             )
             for i in range(30)
-        }
-        ctx = self._ctx(files)
+        ]
+        ctx = self._ctx(rows)
         tools, _ = _make_tools(ctx)
         with patch(
             "src.tools.knowledge.knowledge_tools._check_external_url",
@@ -2139,18 +2532,21 @@ class TestKbWriteWithoutNeo4j:
         assert "Error" in result
         assert not ctx.knowledge_store.upsert_note.called
 
-    def test_no_kg_writes_okf_file(self):
+    def test_no_kg_materializes_the_okf_note(self):
         ws, writes = _capture_workspace()
         ctx = _make_context_no_kg()
         ctx.workspace_manager = ws
         ctx.has_git.return_value = True
         ctx.knowledge_store.get_note_by_slug.return_value = None
         tools, _ = _make_tools(ctx)
-        _invoke(
-            _get_tool(tools, "kb_write"),
-            {"title": "New Title", "type": "decision", "content": "body"},
-        )
-        assert "knowledge/new-title.md" in writes
+        patcher, calls = _capture_materialize()
+        with patcher:
+            _invoke(
+                _get_tool(tools, "kb_write"),
+                {"title": "New Title", "type": "decision", "content": "body"},
+            )
+        assert [c["slug"] for c in calls] == ["new-title"]
+        assert writes == {}  # the file is a server-side commit, not a workspace write
 
     def test_no_kg_empty_slug_falls_back_deterministically(self):
         ctx = _make_context_no_kg()

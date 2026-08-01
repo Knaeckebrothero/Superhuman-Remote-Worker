@@ -58,8 +58,15 @@ _PROGRESS_BUMP_EVERY = 25
 # read costs ~130ms. Below the threshold the per-file path is cheaper.
 _ARCHIVE_PREFETCH_THRESHOLD = int(os.getenv("KB_REINDEX_ARCHIVE_THRESHOLD", "25"))
 
-# The vault root within a project's jobs repo (slice 1 dual-write target).
+# The vault root within a project's KB repo (slice 1 dual-write target). Same
+# path whichever repo resolve_kb_repo lands on.
 KNOWLEDGE_PREFIX = "knowledge/"
+
+# Repo roles that can host a project's KB vault, in resolution precedence
+# order. Read by resolve_kb_repo (which repo a project's vault is in) and by
+# kb_sweep_tick (which projects have a vault at all) — the two must agree on
+# the vocabulary or the sweep would skip projects the resolver can serve.
+_KB_REPO_ROLES: Tuple[str, ...] = ("knowledge", "jobs")
 
 # Bump when OKF parsing semantics change independently of the chunker. The
 # watermark pipeline stamp also includes the normalized root, while chunk rows
@@ -911,15 +918,29 @@ async def resolve_kb_repo(
 ) -> Optional[Tuple[str, str]]:
     """Resolve a project's KB vault location: ``(repo_name, branch)``.
 
-    The vault lives under ``knowledge/`` in the project's jobs repo (slice-1
-    dual-write target); the first jobs-role repo wins. ``None`` when the project
-    has no jobs repo — nothing to index.
+    Precedence (docs/features/knowledge_base_repo_separation.md §5):
+
+    1. the project's ``knowledge``-role repo, if it has one;
+    2. otherwise its ``jobs`` repo — the vault's original home, and where
+       every project created before the separation still keeps it;
+    3. ``None`` when it has neither — nothing to index.
+
+    Within a role the first (oldest) repo wins, matching
+    ``get_project_repositories``' ``created_at ASC`` ordering. The vault root
+    stays ``knowledge/`` either way, so nothing downstream of this needs to
+    know which repo it was handed.
+
+    This is deliberately the *only* place that rule is written down: every
+    consumer — the sweep below, the backlog mirror, the write path — resolves
+    through here, because a second copy is how the reader and the writer come
+    to target different repos without anything failing loudly (§10).
     """
-    repos = await postgres_db.get_project_repositories(project_id, role="jobs")
-    if not repos:
-        return None
-    first = repos[0]
-    return str(first.get("name")), str(first.get("branch") or "main")
+    for role in _KB_REPO_ROLES:
+        repos = await postgres_db.get_project_repositories(project_id, role=role)
+        if repos:
+            first = repos[0]
+            return str(first.get("name")), str(first.get("branch") or "main")
+    return None
 
 
 async def kb_sweep_tick(
@@ -932,29 +953,45 @@ async def kb_sweep_tick(
 ) -> int:
     """One sweep: refresh native project and external datasource KBs.
 
-    The work list is every jobs-role project repo. Per-KB failures are logged
-    and skipped — one broken repo must not starve the rest. Returns the number
-    of KBs that actually did work (``up-to-date`` checks don't count).
+    The work list is every project with a KB-capable repo, one KB each; which
+    repo that is comes from ``resolve_kb_repo`` rather than a second query, so
+    the sweep cannot read a different repo than the write path targets — the
+    silent divergence behind ``kb_reindex_watermark_never_advances``. The query
+    here only enumerates candidate projects; it deliberately does not apply the
+    precedence rule itself.
+
+    Per-KB failures are logged and skipped — one broken repo must not starve
+    the rest. Returns the number of KBs that actually did work (``up-to-date``
+    checks don't count).
     """
     rows = await postgres_db.fetch(
         """
-        SELECT DISTINCT ON (project_id) project_id, name, branch
+        SELECT DISTINCT project_id
         FROM project_repositories
-        WHERE role = 'jobs'
-        ORDER BY project_id, created_at ASC
-        """
+        WHERE role = ANY($1::text[])
+        ORDER BY project_id
+        """,
+        list(_KB_REPO_ROLES),
     )
     worked = 0
     for row in rows:
         project_id = row["project_id"]
         try:
+            # One extra indexed lookup per project per tick (default 900s),
+            # against a reindex that costs a Gitea HEAD fetch at minimum —
+            # cheap enough to buy a single resolution rule.
+            resolved = await resolve_kb_repo(postgres_db, str(project_id))
+            if resolved is None:
+                # Raced with a repo detach between the enumeration and here.
+                continue
+            repo_name, branch = resolved
             result = await reindex_fn(
                 gitea_client=gitea_client,
                 store=store,
                 embedding_service=embedding_service,
                 kb_id=project_id,
-                repo_name=str(row["name"]),
-                branch=str(row["branch"] or "main"),
+                repo_name=repo_name,
+                branch=branch,
             )
             if result.get("status") not in ("up-to-date", "no-head"):
                 worked += 1
@@ -972,8 +1009,21 @@ async def kb_sweep_tick(
     if not isinstance(external_rows, (list, tuple)):
         external_rows = []  # compatibility with narrow/mocked DB facades
 
-    if external_rows:
-        from .kb_datasources import reindex_kb_datasource
+    from .kb_datasources import native_kb_project_id, reindex_kb_datasource
+
+    # A project's own KB datasource (auto-attached at project creation) is a
+    # management surface over notes this tick already swept above under
+    # ``kb_id = project_id``. Sweeping it again as an external source would
+    # index every note a second time under the datasource UUID, and search
+    # would return each of them twice
+    # (docs/features/knowledge_base_repo_separation.md §6, criterion 5).
+    kept = [row for row in external_rows if not native_kb_project_id(row)]
+    if len(kept) != len(external_rows):
+        logger.debug(
+            "kb_sweep: skipping %d native project KB datasource(s)",
+            len(external_rows) - len(kept),
+        )
+    external_rows = kept
 
     for datasource in external_rows:
         datasource_id = datasource.get("id")

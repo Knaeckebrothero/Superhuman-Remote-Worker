@@ -1118,31 +1118,79 @@ class TestReindexKbSerialization:
 # =============================================================================
 
 
+def _repo_db(repos_by_project=None, **roles):
+    """A postgres double whose ``get_project_repositories`` answers per role.
+
+    ``_repo_db(jobs=[...], knowledge=[...])`` for one project;
+    ``_repo_db({project_id: {"jobs": [...]}})`` when the sweep needs several.
+    An unlisted role (or project) answers ``[]`` — the real query's shape, and
+    the reason a single ``return_value`` would let a role-blind resolver pass.
+    """
+    db = AsyncMock()
+    table = (
+        {str(pid): roles_ for pid, roles_ in repos_by_project.items()}
+        if repos_by_project is not None
+        else None
+    )
+
+    async def _by_role(project_id, role=None):
+        entry = roles if table is None else table.get(str(project_id), {})
+        return list(entry.get(role) or [])
+
+    db.get_project_repositories.side_effect = _by_role
+    return db
+
+
 class TestResolveKbRepo:
     @pytest.mark.asyncio
     async def test_first_jobs_role_repo_wins(self):
-        db = AsyncMock()
-        db.get_project_repositories.return_value = [
-            {"name": "project-abc-jobs", "branch": "main"},
-            {"name": "project-abc-jobs-2", "branch": "dev"},
-        ]
+        """No project has a knowledge repo yet, so this is today's behaviour
+        and it must stay bit-for-bit intact: the oldest jobs repo."""
+        db = _repo_db(
+            jobs=[
+                {"name": "project-abc-jobs", "branch": "main"},
+                {"name": "project-abc-jobs-2", "branch": "dev"},
+            ]
+        )
         result = await resolve_kb_repo(db, "proj-id")
         assert result == ("project-abc-jobs", "main")
-        db.get_project_repositories.assert_awaited_once_with("proj-id", role="jobs")
+        assert db.get_project_repositories.await_args_list[-1].kwargs == {
+            "role": "jobs"
+        }
+
+    @pytest.mark.asyncio
+    async def test_knowledge_repo_wins_over_jobs_repo(self):
+        """A project that has both resolves to the knowledge repo — and the
+        jobs repo is never even consulted, so precedence can't be an accident
+        of ordering."""
+        db = _repo_db(
+            knowledge=[{"name": "project-abc-knowledge", "branch": "main"}],
+            jobs=[{"name": "project-abc-jobs", "branch": "main"}],
+        )
+        assert await resolve_kb_repo(db, "p") == ("project-abc-knowledge", "main")
+        roles = [
+            c.kwargs.get("role") for c in db.get_project_repositories.await_args_list
+        ]
+        assert roles == ["knowledge"]
+
+    @pytest.mark.asyncio
+    async def test_knowledge_repo_branch_is_honoured(self):
+        db = _repo_db(knowledge=[{"name": "kb-repo", "branch": "vault"}])
+        assert await resolve_kb_repo(db, "p") == ("kb-repo", "vault")
 
     @pytest.mark.asyncio
     async def test_missing_branch_defaults_to_main(self):
-        db = AsyncMock()
-        db.get_project_repositories.return_value = [
-            {"name": "project-abc-jobs", "branch": None}
-        ]
+        db = _repo_db(jobs=[{"name": "project-abc-jobs", "branch": None}])
         assert await resolve_kb_repo(db, "p") == ("project-abc-jobs", "main")
 
     @pytest.mark.asyncio
     async def test_no_repos_returns_none(self):
-        db = AsyncMock()
-        db.get_project_repositories.return_value = []
+        db = _repo_db()
         assert await resolve_kb_repo(db, "p") is None
+        roles = [
+            c.kwargs.get("role") for c in db.get_project_repositories.await_args_list
+        ]
+        assert roles == ["knowledge", "jobs"], "both roles must be tried"
 
 
 # =============================================================================
@@ -1151,17 +1199,22 @@ class TestResolveKbRepo:
 
 
 class TestKbSweepTick:
-    def _rows(self):
+    def _db(self, roles_by_project=None):
+        """Two projects on the work list, each with only a jobs repo (today's
+        fleet). ``fetch`` enumerates project ids only — the repo per project
+        comes from the resolver."""
         self.p1, self.p2 = uuid.uuid4(), uuid.uuid4()
-        return [
-            {"project_id": self.p1, "name": "project-1-jobs", "branch": "main"},
-            {"project_id": self.p2, "name": "project-2-jobs", "branch": "main"},
-        ]
+        table = roles_by_project or {
+            self.p1: {"jobs": [{"name": "project-1-jobs", "branch": "main"}]},
+            self.p2: {"jobs": [{"name": "project-2-jobs", "branch": "main"}]},
+        }
+        db = _repo_db(table)
+        db.fetch.return_value = [{"project_id": pid} for pid in table]
+        return db
 
     @pytest.mark.asyncio
-    async def test_reindexes_every_jobs_repo(self):
-        postgres_db = AsyncMock()
-        postgres_db.fetch.return_value = self._rows()
+    async def test_reindexes_every_project_kb(self):
+        postgres_db = self._db()
         reindex_fn = AsyncMock(return_value={"status": "completed", "upserted": 1})
         n = await kb_sweep_tick(
             postgres_db=postgres_db,
@@ -1176,15 +1229,69 @@ class TestKbSweepTick:
         assert kwargs["kb_id"] == self.p1
         assert kwargs["repo_name"] == "project-1-jobs"
         assert kwargs["branch"] == "main"
-        # the work-list query targets jobs-role repos
+        # the work list enumerates KB-capable projects; it must not re-apply
+        # the precedence rule (that lives in resolve_kb_repo alone)
         query = postgres_db.fetch.call_args[0][0]
         assert "project_repositories" in query
         assert "jobs" in str(postgres_db.fetch.call_args[0])
+        assert "knowledge" in str(postgres_db.fetch.call_args[0])
+
+    @pytest.mark.asyncio
+    async def test_sweep_picks_the_repo_the_resolver_picks(self):
+        """The §10 hazard: if the sweep resolved a project's repo differently
+        from every other consumer, the KB would break silently. Project 1 has
+        both repos and project 2 only a jobs repo — the sweep must reindex
+        exactly what resolve_kb_repo hands back for each."""
+        p1, p2 = uuid.uuid4(), uuid.uuid4()
+        postgres_db = self._db(
+            {
+                p1: {
+                    "knowledge": [{"name": "project-1-knowledge", "branch": "main"}],
+                    "jobs": [{"name": "project-1-jobs", "branch": "main"}],
+                },
+                p2: {"jobs": [{"name": "project-2-jobs", "branch": "dev"}]},
+            }
+        )
+        reindex_fn = AsyncMock(return_value={"status": "completed"})
+        await kb_sweep_tick(
+            postgres_db=postgres_db,
+            store=MagicMock(),
+            gitea_client=MagicMock(),
+            embedding_service=MagicMock(),
+            reindex_fn=reindex_fn,
+        )
+        swept = {
+            c.kwargs["kb_id"]: (c.kwargs["repo_name"], c.kwargs["branch"])
+            for c in reindex_fn.await_args_list
+        }
+        assert swept == {
+            p1: await resolve_kb_repo(postgres_db, str(p1)),
+            p2: await resolve_kb_repo(postgres_db, str(p2)),
+        }
+        assert swept[p1] == ("project-1-knowledge", "main")
+        assert swept[p2] == ("project-2-jobs", "dev")
+
+    @pytest.mark.asyncio
+    async def test_project_whose_repo_vanished_is_skipped_not_reindexed(self):
+        """Enumeration and resolution are two queries, so a repo can be
+        detached between them. Skip that project rather than reindex a KB
+        with no repo behind it."""
+        gone = uuid.uuid4()
+        postgres_db = self._db({gone: {}})
+        reindex_fn = AsyncMock(return_value={"status": "completed"})
+        n = await kb_sweep_tick(
+            postgres_db=postgres_db,
+            store=MagicMock(),
+            gitea_client=MagicMock(),
+            embedding_service=MagicMock(),
+            reindex_fn=reindex_fn,
+        )
+        assert n == 0
+        reindex_fn.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_up_to_date_not_counted_as_work(self):
-        postgres_db = AsyncMock()
-        postgres_db.fetch.return_value = self._rows()
+        postgres_db = self._db()
         reindex_fn = AsyncMock(return_value={"status": "up-to-date"})
         n = await kb_sweep_tick(
             postgres_db=postgres_db,
@@ -1198,8 +1305,7 @@ class TestKbSweepTick:
 
     @pytest.mark.asyncio
     async def test_one_kb_failure_does_not_kill_the_tick(self):
-        postgres_db = AsyncMock()
-        postgres_db.fetch.return_value = self._rows()
+        postgres_db = self._db()
         reindex_fn = AsyncMock(
             side_effect=[RuntimeError("boom"), {"status": "completed"}]
         )
@@ -1212,6 +1318,32 @@ class TestKbSweepTick:
         )
         assert n == 1  # the second KB still reindexed
         assert reindex_fn.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_one_unresolvable_project_does_not_starve_the_rest(self):
+        """A resolution failure is inside the same per-project guard as a
+        reindex failure — one broken project must not cost the sweep."""
+        postgres_db = self._db()
+        broken, healthy = self.p1, self.p2
+
+        async def _by_role(project_id, role=None):
+            if str(project_id) == str(broken):
+                raise RuntimeError("pg hiccup")
+            return (
+                [{"name": "project-2-jobs", "branch": "main"}] if role == "jobs" else []
+            )
+
+        postgres_db.get_project_repositories.side_effect = _by_role
+        reindex_fn = AsyncMock(return_value={"status": "completed"})
+        n = await kb_sweep_tick(
+            postgres_db=postgres_db,
+            store=MagicMock(),
+            gitea_client=MagicMock(),
+            embedding_service=MagicMock(),
+            reindex_fn=reindex_fn,
+        )
+        assert n == 1
+        assert reindex_fn.await_args.kwargs["kb_id"] == healthy
 
     @pytest.mark.asyncio
     async def test_external_datasource_is_swept_once_under_datasource_id(
@@ -1362,3 +1494,59 @@ class TestReindexKbReconciliation:
         assert result["status"] == "completed"  # watermark still advanced
         assert result["errors"] == 0
         assert result["reconciled"] == 0
+
+
+class TestPostMergeReindexTriggerResolvesItsOwnRepo:
+    """Guard for docs/features/knowledge_base_repo_separation.md §10a.
+
+    ``_reindex_project_kb`` resolves the vault repo (knowledge-role first,
+    jobs as fallback) **only when it is not handed a ``repo_name``**. The
+    post-merge KB-freshness trigger used to pass ``job["repo_name"]``, which
+    is always the *jobs* repo — pinning the reindex to the wrong repo for any
+    project whose vault has moved to a knowledge repo.
+
+    That failure is silent and destructive rather than loud: ``plan_reindex``
+    treats every indexed path absent from the tree as a delete, so reindexing
+    against a repo with no ``knowledge/`` drops the project's entire chunk
+    index, and the leader-gated sweep rebuilds it minutes later. The visible
+    symptom is a search index that flaps empty on every loop job, reported by
+    nothing louder than a non-fatal warning.
+
+    There is no unit seam on the closure (it is nested in the completion
+    handler and fired via ``asyncio.create_task``), so this asserts on the
+    source. Coarse, but it fails the moment someone re-pins the repo.
+    """
+
+    def _main_src(self) -> str:
+        import pathlib
+
+        return (
+            pathlib.Path(__file__).resolve().parents[1] / "orchestrator" / "main.py"
+        ).read_text(encoding="utf-8")
+
+    def test_trigger_does_not_pin_repo_name(self):
+        src = self._main_src()
+        assert "async def _kb_reindex_after_merge" in src, (
+            "post-merge KB trigger not found — if it was renamed, move this "
+            "guard with it rather than deleting it (see §10a)."
+        )
+        body = src.split("async def _kb_reindex_after_merge", 1)[1][:1400]
+        assert "_reindex_project_kb(pid)" in body, (
+            "The post-merge KB trigger must call _reindex_project_kb without a "
+            "repo_name so it resolves the vault repo itself. Passing the job's "
+            "repo_name pins it to the jobs repo and wipes the chunk index for "
+            "any project with a knowledge repo. See §10a."
+        )
+        assert "repo_name=" not in body, (
+            "repo_name= reappeared in the post-merge KB trigger — this is the "
+            "exact §10a regression: silent chunk-index wipe."
+        )
+
+    def test_no_caller_pins_repo_name_to_the_jobs_repo(self):
+        # The other half of the trap: repo_name is a legitimate parameter, but
+        # feeding it the *job's* repo is never right for a project-scoped KB.
+        src = self._main_src()
+        assert 'repo_name=job.get("repo_name")' not in src, (
+            "A caller is passing the job's repo into a KB reindex. The job repo "
+            "is always the jobs repo; project KB resolution must win. See §10a."
+        )

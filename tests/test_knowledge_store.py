@@ -1112,6 +1112,86 @@ class TestListNotes:
 
 
 # =============================================================================
+# list_notes_full() — the kb_lint / kb_index gardener backend
+# =============================================================================
+
+
+class TestListNotesFull:
+    @pytest.mark.asyncio
+    async def test_does_not_filter_on_path(self):
+        # The linter's whole job is to see what the read path cannot: a row no
+        # file backs is a defect (invisible to kb_read/kb_search), not an
+        # absence. Gating it like list_notes would let a KB whose
+        # materialisation is broken lint "clean" while reading empty.
+        store, mock_db, _ = _make_store()
+        mock_db.fetch.return_value = []
+        await store.list_notes_full(uuid.uuid4())
+        sql = mock_db.fetch.call_args[0][0]
+        assert "path IS NOT NULL" not in sql
+
+    @pytest.mark.asyncio
+    async def test_matches_unadopted_rows_through_project_id(self):
+        # upsert_note (the agent write-through) sets project_id but never
+        # kb_id, so a kb_id-only filter would miss every just-written note.
+        store, mock_db, _ = _make_store()
+        mock_db.fetch.return_value = []
+        await store.list_notes_full(uuid.uuid4())
+        sql = mock_db.fetch.call_args[0][0]
+        assert "kb_id IS NULL AND project_id = $1" in sql
+
+    @pytest.mark.asyncio
+    async def test_maps_rows_with_path_and_supersede(self):
+        store, mock_db, _ = _make_store()
+        job_id = uuid.uuid4()
+        mock_db.fetch.return_value = [
+            {
+                "note_id": "n1",
+                "path": "knowledge/n1.md",
+                "title": "N1",
+                "note_type": "decision",
+                "status": "superseded",
+                "confidence": "high",
+                "priority": 0,
+                "tags": ["a"],
+                "keywords": None,
+                "job_id": job_id,
+                "phase": 3,
+                "content": "body",
+                "superseded_by": "n2",
+                "created_at": None,
+                "modified_at": None,
+            }
+        ]
+        out = await store.list_notes_full(uuid.uuid4())
+        assert out == [
+            {
+                "id": "n1",
+                "path": "knowledge/n1.md",
+                "title": "N1",
+                "type": "decision",
+                "status": "superseded",
+                "content": "body",
+                "confidence": "high",
+                "priority": 0,
+                "tags": ["a"],
+                "keywords": [],
+                "job_id": job_id,
+                "phase": 3,
+                "superseded_by": "n2",
+                "created": None,
+                "modified": None,
+            }
+        ]
+
+    @pytest.mark.asyncio
+    async def test_passes_the_scan_cap_as_a_limit(self):
+        store, mock_db, _ = _make_store()
+        mock_db.fetch.return_value = []
+        await store.list_notes_full(uuid.uuid4(), limit=7)
+        assert mock_db.fetch.call_args[0][2] == 7
+
+
+# =============================================================================
 # reconcile_orphans() — R-1 ghost reconciliation
 # =============================================================================
 

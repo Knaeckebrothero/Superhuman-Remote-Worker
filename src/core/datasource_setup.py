@@ -20,6 +20,8 @@ import subprocess
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
+from src.services.knowledge.bindings import native_kb_project_id
+
 logger = logging.getLogger(__name__)
 
 # Kept in sync with orchestrator/security/credential_files.py. The orchestrator
@@ -1071,7 +1073,14 @@ def inject_datasource_index(
 
     # Group by category for readable output
     repos = [ds for ds in ds_configs if ds.get("type") == "repository"]
-    knowledge_bases = [ds for ds in ds_configs if ds.get("type") == "kb"]
+    # A project's own KB datasource is a management surface, not an external
+    # source: it is bound as the writable native KB. Listing it here would
+    # advertise the agent's own knowledge base as "read-only".
+    knowledge_bases = [
+        ds
+        for ds in ds_configs
+        if ds.get("type") == "kb" and not native_kb_project_id(ds)
+    ]
     databases = [
         ds for ds in ds_configs if ds.get("type") in ("postgresql", "neo4j", "mongodb")
     ]
