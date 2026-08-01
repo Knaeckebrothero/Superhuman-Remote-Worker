@@ -9,11 +9,20 @@ related:
   - "[[shell_stall_detection_false_positive]]"
 ---
 
-# Two redundant shell-execution implementations (local libtmux vs remote SSH), kept in sync by hand
+# Historical: two redundant shell-execution implementations (local libtmux vs remote SSH)
 
 **Reported**: 2026-05-25
-**Status**: Open — tech debt; design options below. Partial mitigation landed on branch `fix/shell-stall-detection` (the *pure* logic is now shared; the imperative loops are still duplicated).
-**Severity**: Medium. Two consequences: (1) **maintainability/correctness** — the same logic lives in two places and drifts; this already caused one bug to exist (and need fixing) in both copies, see [[shell_stall_detection_false_positive]]. (2) A latent **isolation footgun** — the local path can execute agent-authored commands on the *agent pod* if a caller-side guard is ever bypassed (see "Related footgun" below).
+**Status**: Resolved/superseded on 2026-06-11 by `a7156b5e` (`fix(shell): remove the local libtmux
+path - shells run only on the workspace`).
+**Historical severity**: Medium. Two consequences: (1) **maintainability/correctness** — the same logic lived in two places and drifted; this caused one bug to exist (and need fixing) in both copies, see [[shell_stall_detection_false_positive]]. (2) A latent **isolation footgun** — the local path could execute agent-authored commands on the *agent pod* if a caller-side guard was bypassed (see "Related footgun" below).
+
+**Current-state note (2026-08-01):** `ShellManager` now fails closed unless it receives a workspace
+backend with `supports_shell=True`; the in-process libtmux implementation described below no longer
+exists. `tests/test_shell_manager.py` and `tests/test_run_command.py` use mocked backends, while
+`tests/test_workspace_backends.py` scripts the RemoteBackend transport and sentinel behavior. The
+automated suite therefore does not exercise a real tmux pane; use the local k3d workspace SSH/tmux
+gate for live shell behavior. The rest of this document is retained as the historical analysis that
+motivated removal of the duplicate path, not as a description of the current architecture.
 
 ## Summary
 
@@ -32,13 +41,20 @@ The two methods are ~200 lines each and implement the same algorithm: build a se
 
 ## Why it persists (the root cause: a testability asymmetry)
 
-This is the crux. The **production** path (`remote.py`) cannot be exercised in CI without a VM + sshd, so it has effectively **no integration coverage**. The **local libtmux** path *can* run against a real tmux in CI with no extra infra, so the shell test suite is built entirely on it:
+This was the crux before `a7156b5e`. The **production** path (`remote.py`) could not be exercised in
+CI without a VM + sshd, while the **local libtmux** path could run against real tmux with no extra
+infrastructure. At that point, the shell test suite was built around the local path:
 
-- `tests/test_shell_manager.py` and `tests/test_run_command.py` construct `ShellManager(...)` with **no backend** and drive real tmux. These are the only tests that exercise the sentinel/poll/stall/colliding logic end-to-end.
+- `tests/test_shell_manager.py` and `tests/test_run_command.py` constructed `ShellManager(...)` with
+  **no backend** and drove real tmux. They were the only tests that exercised the
+  sentinel/poll/stall/colliding logic end-to-end.
 - `tests/test_shell_stall_logic.py` covers the *transport-agnostic* helper (`compute_no_change_state`) without tmux.
 - `tests/test_managers_git.py` uses a **mocked** backend (parsing only).
 
-So the local path survives largely as the **testable reference implementation**. We keep two implementations because deleting the local one would leave the shell engine with no CI-testable path at all — and the remaining (prod) path is the harder one to test. Historically the local libtmux `ShellManager` was also the *original* executor; `RemoteBackend` was layered on later for isolation, and the algorithm was copy-adapted rather than abstracted.
+The local path therefore survived for a time as the **testable reference implementation**. The two
+implementations were kept because deleting it would have left the shell engine without a
+CI-testable path. The eventual resolution accepted transport-mocked coverage and removed the unsafe
+executor; real-pane behavior now needs the local k3d gate described above.
 
 ## Evidence of the cost
 

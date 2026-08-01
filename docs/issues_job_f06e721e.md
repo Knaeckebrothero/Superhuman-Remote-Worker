@@ -150,7 +150,13 @@ The system recorded 5/5 todos complete, archiving the phase as successful, while
 
 ### BUG-5: `run_command` heredoc handling causes stuck shells (Medium)
 
-**Status**: ✅ Fixed 2026-04-11. Added a module-level `build_sentinel_command(command, sentinel)` helper in `src/tools/shell/shell_manager.py`. Single-line commands keep the existing `f'{command}; echo "{sentinel} $?"'` chaining (preserves the interactive-prompt detection for commands like `read answer`). Multi-line commands get wrapped in an outer `bash << "SRW_DELIM_<uuid>"` heredoc with a unique START marker, so inner heredocs (`python3 <<'PY' ... PY`) and multi-statement scripts are read by inner bash from the captured heredoc body instead of being typed line-by-line into tmux. Output extraction uses the START marker to locate where the user command's stdout begins. Applied identically to `shell_run` in `src/core/backends/remote.py` (imports the helper). Added 4 regression tests in `tests/test_run_command.py`. An initial attempt using plain `\n` separation was abandoned because it silently auto-fed the sentinel echo as stdin to `read`-style commands, breaking interactive-prompt detection; the heredoc-wrap avoids that.
+**Status**: ✅ Fixed 2026-04-11. Added a module-level `build_sentinel_command(command, sentinel)` helper in `src/tools/shell/shell_manager.py`. At the time of this fix, single-line commands kept the existing `f'{command}; echo "{sentinel} $?"'` chaining (preserving interactive-prompt detection for commands like `read answer`). Multi-line commands get wrapped in an outer `bash << "SRW_DELIM_<uuid>"` heredoc with a unique START marker, so inner heredocs (`python3 <<'PY' ... PY`) and multi-statement scripts are read by inner bash from the captured heredoc body instead of being typed line-by-line into tmux. Output extraction uses the START marker to locate where the user command's stdout begins. Applied identically to `shell_run` in `src/core/backends/remote.py` (imports the helper). Added 4 regression tests in `tests/test_run_command.py`. An initial attempt using plain `\n` separation was abandoned because it silently auto-fed the sentinel echo as stdin to `read`-style commands, breaking interactive-prompt detection; the heredoc-wrap avoids that.
+
+**2026-08-01 follow-up:** `f41970ae` changed the completion trailer to `printf` the exit status and
+`$PWD`, so every synchronous result can report `CWD:` without a second SSH round-trip. The local
+libtmux executor was removed earlier in `a7156b5e`; `test_run_command.py` is now mock-backed and the
+RemoteBackend sentinel/restore cases live in `tests/test_workspace_backends.py`. These later changes
+do not alter the original heredoc diagnosis or fix.
 
 **Note**: The latent trailing-comment bug (`ls # something` swallowing the sentinel echo) is NOT fixed by this — single-line commands still use `;` chaining. Separate, not scoped to BUG-5.
 

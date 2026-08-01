@@ -7,12 +7,12 @@ was not a model failure in the usual sense: it wrote the right file with the rig
 verified its SHA-256 correctly. It wrote it to the wrong directory, and nothing in the harness could
 tell it so.
 
-**Status:** **IMPLEMENTED** in `f41970ae` (all four slices, 15 files) + `e7d29b2d`, 2026-08-01.
-Independently verified same day against all six acceptance criteria — including a by-hand replay of
-the `d1894a91` failure (drifted CWD now prints `CWD:` on the shell result and the resolved absolute
-path in the `read_file` error, exposing the off-by-one in one turn). 322 targeted tests green, zero
-skips. The findings below describe the tree at `572c40ba`, i.e. *before* the fix; they are kept as
-the record of the defect.
+**Status:** **IMPLEMENTED** in `f41970ae` (all four slices, 15 files) and documented in `e7d29b2d`,
+2026-08-01. Independently verified the same day against all six acceptance criteria, including a
+by-hand replay of the `d1894a91` failure on the local k3d workspace. The drifted shell CWD now prints
+as `CWD:` and the `read_file` error names the workspace-resolved absolute path, exposing the
+off-by-one in one turn. The findings below describe the tree at `572c40ba`, i.e. *before* the fix;
+they are kept as the record of the defect.
 
 **Residue (open, small):** the sync-path `cd` sends (`remote.py` restore/anchor sites) are unquoted
 f-strings while the async wrapper `shlex.quote`s — a `working_dir` containing spaces fails its `cd`
@@ -269,21 +269,58 @@ the tool at the moment of failure is the cheapest way to build the reflex.
    shell redirect to `repo/tests/x` produce output that makes the mismatch evident without needing
    to already know about it.
 
+## Implementation and verification record (2026-08-01)
+
+| Criterion | Result | Evidence |
+|---|---|---|
+| 1. Both tools forward `working_dir` and restore it | **Pass** | `tests/test_run_command.py` asserts forwarding/default normalization. `TestRemoteBackendShellRun::test_working_dir_restores_between_calls` asserts both the initial `cd` and the restore command. `TestRemoteBackendShellSend::test_async_working_dir_wraps_command_and_restore` covers the async path; raw keystrokes reject a backend-level `working_dir`. |
+| 2. Persistent mode preserves drift and reports it | **Pass** | `TestRemoteBackendShellRun::test_without_working_dir_keeps_persistent_cwd_visible` reports `/tmp` on both calls. The live k3d replay also left a persistent tab in `/tmp`, with both results reporting `CWD: /tmp`. |
+| 3. Stateless mode restores the workspace root | **Pass** | `TestRemoteBackendShellRun::test_working_dir_restores_between_calls` reports `/tmp` for the command and the workspace root on the following call. The live k3d replay produced the same sequence. |
+| 4. Missing reads identify the resolved path and recovery tool | **Pass** | The three not-found paths are covered by `test_read_file_error_reports_resolved_path_and_search_hint`, `test_read_file_race_uses_same_resolved_not_found_message`, and `test_missing_file_reports_resolved_path_and_search_hint`. |
+| 5. Guardrail examples anchor commands | **Pass** | `TestResolveGuardrails::test_all_shell_example_overrides_set_working_dir_without_inline_cd` scans the default and family overrides; every shell example sets `working_dir` and none uses inline `cd`. Only `gemma.yaml` overrides the affected keys and therefore needed the family edit. |
+| 6. Original mismatch is visible in one turn | **Pass** | On the live k3d workspace, a shell drifted one level reported that directory in `CWD:`, while `read_file("repo/tests/x")` reported the different workspace-root absolute path and suggested `search_files`. |
+
+Verification totals:
+
+- Focused shell/workspace/guardrail tests: **322 passed, 0 skipped**.
+- `pytest tests/test_run_command.py -q -rs`: **29 passed, 0 skipped**. This file ran; it did not
+  auto-skip.
+- Full pre-change baseline, without `-x`: **8 failed, 12,285 passed, 23 skipped, 33 warnings** in
+  775.71s.
+- Full post-change suite, without `-x`: **8 failed, 12,299 passed, 23 skipped, 35 warnings** in
+  784.60s. The same eight environment-dependent cases failed: one local PostgreSQL connection to
+  `:5432` and seven live-MCP cases. There were no new failures.
+- `ruff check src/ orchestrator/ tests/`: **passed**.
+- `ruff format --check src/ orchestrator/ tests/`: **882 files already formatted**.
+- Live k3d SSH/tmux exercise: **passed** for persistent drift visibility, stateless restore, async
+  restore, raw-keystroke handling, and the shell/read mismatch replay. The temporary tmux session
+  and test directory were removed afterward.
+
+Contradictions found while implementing the verified write-up:
+
+- The cited `files.py:1044` site was the `edit_file` precheck, not a `read_file` branch. It was
+  relocated by symbol and updated because it is the third named not-found site.
+- `tests/test_run_command.py` does not use real tmux and does not contain an auto-skip. It was already
+  mock-backed at the reference commit. Real tmux therefore needs the separate k3d behavioral gate.
+- This checkout's pre-existing full-suite baseline was eight failures, not approximately eleven;
+  the two anticipated CI-workflow assertion failures did not occur.
+
 ## Tests
 
-- ~~`tests/test_run_command.py` — tmux-dependent, **auto-skips when tmux is absent**.~~ **Stale
-  (found during verification):** the file was rewritten to script `backend.shell_run` directly — no
-  tmux skip logic remains anywhere in `tests/`, so it always runs. CLAUDE.md still carries the old
-  auto-skip claim. Consequence worth keeping visible: **the repo has no live-tmux end-to-end
-  coverage**; the cd/restore behaviour is proven at the keystroke-assertion level
-  (`tests/test_workspace_backends.py::TestRemoteBackendShellRun`), not against a real tmux pane.
+- `tests/test_run_command.py` scripts `backend.shell_run`; it is not tmux-dependent and has no
+  auto-skip. It covers model-facing schemas, forwarding, defaults, and tool-mode behavior.
+- `tests/test_workspace_backends.py::TestRemoteBackendShellRun` and
+  `::TestRemoteBackendShellSend` prove the sentinel parsing and exact SSH/tmux commands, including
+  restore commands. These are transport-mocked tests, not a live tmux integration test.
+- The automated suite has no live-tmux end-to-end coverage. For shell behavior changes, use the
+  local k3d workspace SSH/tmux exercise as the live behavioral gate.
 - Drive `WorkspaceManager` against `tests/_fs_backend.py::FilesystemTestBackend` for the
   `read_file` message change (no SSH needed).
-- Full gate: `pytest tests/ -x -q --tb=short`, then
+- Full gate: `pytest tests/ -q --tb=short`, then
   `ruff check src/ orchestrator/ tests/` and `ruff format --check src/ orchestrator/ tests/`.
-- Known-noise baseline: ~11 pre-existing failures locally (live Postgres :5432, live MCP servers,
-  two CI-workflow assertions) — see `reference_local_pytest_failures_are_py313_env`. Do not treat
-  those as regressions, and do not let `-x` hide the rest.
+- Always capture the full-suite baseline without `-x`. The 2026-08-01 implementation run had eight
+  pre-existing environment-dependent failures (one live PostgreSQL and seven live-MCP cases); see
+  the exact before/after totals above rather than assuming a fixed known-noise count.
 
 ## Out of scope / follow-ups
 

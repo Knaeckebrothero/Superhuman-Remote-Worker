@@ -131,7 +131,9 @@ k3d cluster stop srw
 - Use `AsyncMock` for awaitable collaborators.
 - Keep `config.extra` as a real dict in tests; using `MagicMock()` there can
   break YAML/config handling.
-- tmux-dependent tests may auto-skip when tmux is unavailable.
+- `tests/test_run_command.py` uses a mocked shell backend and never requires tmux. RemoteBackend
+  sentinel/restore behavior is transport-mocked in `tests/test_workspace_backends.py`; use a local
+  k3d workspace SSH/tmux exercise for a real-pane behavioral gate.
 - Cockpit tests use Vitest with jsdom and `cockpit/src/test-setup.ts`.
 - Use `vi.fn()` for Cockpit mocks and `of()` for RxJS observables.
 - Angular signal mocks need callable values with `.set()` / `.update()` when the
