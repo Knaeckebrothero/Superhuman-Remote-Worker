@@ -185,7 +185,12 @@ def _format_delegation_results(delegation_results: list) -> str:
 DEFAULT_JOB_BRANCH = "main"
 
 
-def ensure_job_branch(git_mgr, metadata: Optional[Dict[str, Any]], job_id: str = ""):
+def ensure_job_branch(
+    git_mgr,
+    metadata: Optional[Dict[str, Any]],
+    job_id: str = "",
+    create: bool = False,
+):
     """Put a re-attached working tree back on the branch this job owns.
 
     Only the paths that attach to a *pre-existing* tree need this. A fresh
@@ -223,7 +228,7 @@ def ensure_job_branch(git_mgr, metadata: Optional[Dict[str, Any]], job_id: str =
         current = git_mgr.current_branch()
         if current == expected:
             return current
-        if not git_mgr.checkout_branch(expected):
+        if not git_mgr.checkout_branch(expected, create=create):
             logger.warning(
                 f"[{job_id}] Resume: could not switch workspace from branch "
                 f"{current!r} to {expected!r} — commits will land on {current!r} "
@@ -2409,10 +2414,16 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                 backend=self._workspace_manager.backend,
             )
             if git_mgr:
-                # Checkout the correct branch for project jobs
-                branch = metadata.get("branch_name")
-                if branch:
-                    git_mgr.checkout_branch(branch)
+                # Land on the branch this job owns. `create=True` because the
+                # clone has the remote: provisioning logs a failed branch
+                # creation but still writes `branch_name` to the DB
+                # (services/job_provisioning.py:167-188), so the DB can name a
+                # branch Gitea lacks. A plain checkout returns False silently
+                # there, leaving the tree on the clone default — work lands on
+                # `main` while every reader resolves `job/<short_id>`. Creating
+                # it locally lets the first push publish it, which is what
+                # WorkspaceManager already does (core/workspace.py:550, :641).
+                ensure_job_branch(git_mgr, metadata, job_id, create=True)
 
                 self._workspace_manager._git_manager = git_mgr
                 self._workspace_manager._initialized = True

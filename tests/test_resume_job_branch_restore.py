@@ -157,3 +157,43 @@ class TestResumeBranchRestore:
 
     def test_no_git_manager_is_tolerated(self):
         assert ensure_job_branch(None, {"branch_name": "main"}, "x") is None
+
+
+class TestPodHandoffCreatesMissingBranch:
+    """The DB can name a branch Gitea does not have.
+
+    Provisioning logs a failed `create_branch` and still writes `branch_name`
+    to the jobs row (orchestrator/services/job_provisioning.py:167-188), so a
+    freshly cloned pod-handoff workspace can be told to check out a branch that
+    exists nowhere. A plain checkout returns False *silently* there, leaving the
+    tree on the clone default — every commit lands on `main` while every reader
+    resolves `job/<short_id>` and sees nothing. This is the incident inverted.
+    """
+
+    def test_missing_branch_is_created_not_silently_ignored(self, workspace: Path):
+        git_mgr = GitManager(workspace)
+        _git(workspace, "checkout", DEFAULT_JOB_BRANCH)
+        metadata = {"branch_name": "job/abc12345"}  # never created in the repo
+
+        ensure_job_branch(git_mgr, metadata, "abc12345", create=True)
+
+        assert git_mgr.current_branch() == "job/abc12345"
+
+    def test_work_lands_on_the_branch_readers_resolve(self, workspace: Path):
+        git_mgr = GitManager(workspace)
+        _git(workspace, "checkout", DEFAULT_JOB_BRANCH)
+
+        ensure_job_branch(git_mgr, {"branch_name": "job/abc12345"}, "abc", create=True)
+        (workspace / "output" / "glossary.md").write_text("recovered", encoding="utf-8")
+        assert git_mgr.commit("[Phase 1 Tactical] todo_1: write deliverable")
+
+        assert (
+            _content_on(workspace, "job/abc12345", "output/glossary.md") == "recovered"
+        )
+
+    def test_create_false_still_reports_a_missing_branch(self, workspace: Path, caplog):
+        """Without create, the failure must at least be loud."""
+        git_mgr = GitManager(workspace)
+        with caplog.at_level("WARNING"):
+            ensure_job_branch(git_mgr, {"branch_name": "job/nope"}, "x", create=False)
+        assert any("job/nope" in r.message for r in caplog.records)

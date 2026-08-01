@@ -215,11 +215,26 @@ for unrelated reasons and never decided (see
 in `docs/issues/verification_round_reset_spawns_blind_critic.md`). This incident
 is the strongest argument for it so far.
 
-**Secondary, unrelated to the loss above:** in both `finalize_job` branches the
-final `todo_manager.archive("final")` runs *after* `git_mgr.commit()` +
-`git_mgr.push()` (`src/core/phase.py:918-935` and `990-1007`), so the final
-archive file it writes can never be committed. Real but minor, and not a cause
-of this incident.
+**Correction — a secondary claim in the first version of this file was wrong.**
+It said that because `todo_manager.archive("final")` runs *after*
+`git_mgr.commit()` + `git_mgr.push()` in both `finalize_job` branches
+(`src/core/phase.py:918-935`, `990-1007`), the final archive "can never be
+committed". The ordering is real, but **nothing is lost on the graph path**:
+`archive_phase` already archived and cleared the todos one node earlier
+(`src/graph.py:2822`; `archive()` clears at `src/managers/todo.py:612-614`),
+`handle_transition` has exactly one inbound edge — from `archive_phase`
+(`src/graph.py:5147`) — and `archive()` short-circuits on an empty list
+(`src/managers/todo.py:546-548`). So the post-push call writes no file, and the
+final phase's archive *is* one of the archives already committed. Job
+6df02f64 having three archives and no fourth is the expected output, not
+evidence of loss. The ordering is still worth fixing (it is live on the
+direct-call path the tests use — see `tests/test_autonomy.py:519-527`), but it
+is cosmetic, not a durability defect.
+
+The same mistake is worth noting as a method lesson: the claim was asserted
+from call ordering alone, without checking whether the collection being written
+was already empty. Two independent reviews reached opposite conclusions on it;
+the one that traced the graph edges was right.
 
 ## Related
 
