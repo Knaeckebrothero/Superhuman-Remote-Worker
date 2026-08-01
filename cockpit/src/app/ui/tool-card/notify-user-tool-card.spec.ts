@@ -27,7 +27,7 @@ function notifyCall(over: Partial<NormalizedToolCall> = {}): NormalizedToolCall 
       subject: 'Loop halted',
     },
     status: 'ok',
-    result: 'Paged the Legatus (2/3 pages used today).',
+    result: 'Paged the Legate (2/3 pages used today).',
     ...over,
   };
 }
@@ -39,7 +39,7 @@ describe('parseNotifyMessage', () => {
       urgency: 'page',
       subject: 'Loop halted',
       body: 'Job **alpha** failed twice; I paused the loop.',
-      receipt: 'Paged the Legatus (2/3 pages used today).',
+      receipt: 'Paged the Legate (2/3 pages used today).',
     });
   });
 
@@ -149,7 +149,7 @@ describe('notify_user tool-card rendering', () => {
 
     // The result string is the delivery receipt.
     expect(root.querySelector('.tc-notify__receipt')?.textContent?.trim())
-      .toBe('Paged the Legatus (2/3 pages used today).');
+      .toBe('Paged the Legate (2/3 pages used today).');
   });
 
   it('maps each urgency to its chip class', async () => {

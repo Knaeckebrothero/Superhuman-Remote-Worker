@@ -18,10 +18,10 @@ related:
 
 **Filed + fixed:** 2026-07-30, from a user report that the debug Chat History
 panel renders the `<active_tasks>` todo block on every single turn.
-**Status:** **FIXED — built, unit-tested, and k3d/browser-verified; uncommitted
-on `develop`** (the owner commits/pushes). Three layers changed: the archiver's
-delta extraction (write), a lean listing + per-entry detail endpoint (read), and
-the cockpit chat panel (render).
+**Status:** **FIXED — shipped on `develop` (`e4244dfe`, docs in `22c07e5f`,
+follow-up `a5d93f71`) and confirmed on the live dev cluster 2026-07-30** (see
+§4). Three layers changed: the archiver's delta extraction (write), a lean
+listing + per-entry detail endpoint (read), and the cockpit chat panel (render).
 **Components:** `src/core/archiver.py` · `orchestrator/database/audit_store.py`
 · `orchestrator/main.py` · `orchestrator/services/formatters.py` ·
 `cockpit/src/app/{core/services,core/models,views/chat-history}/**`.
@@ -157,13 +157,34 @@ Mirrors the split the audit stream already uses (`lean=` + `/audit/step/{id}`):
   applies retroactively to every row already in the store.
 - Tool results now resolve through a `tool_call_id → result` map built over the
   **whole loaded window** instead of peeking at `entries[idx+1]`; that survives
-  empty-delta turns and page boundaries, and rows whose result hasn't paged in
-  yet say so honestly ("Result arrives in a later turn — load more turns").
+  empty-delta turns and page boundaries. Unresolved calls are labelled by
+  `resolveToolResultState()` — see §3.4.
 - Every message, reasoning block, tool result, args block and context item gets
   a `Show full (5.2 kB)` / `Collapse` control that hydrates on first expand.
 - **Deleted:** the shell-state widget (~150 lines + styles + 5 i18n keys). It
   keyed on `ChatEntry.shell_state`, which neither the archiver nor
   `_chat_row_to_doc` has ever emitted — dead since the Postgres cutover.
+
+### 3.4 Follow-up — "not loaded yet" is not "never recorded" (`a5d93f71`)
+
+The first cut labelled every unresolved tool call *"result arrives in a later
+turn"* whenever `hasMore()` was true. On a partially loaded job that is a lie
+for all but one row: a result lives in the **next** turn's inputs, so only the
+**last loaded** turn can still be waiting on data. Every earlier unresolved call
+was never recorded — which is exactly the state the write-side bug left behind,
+so the panel was reassuring the reader that lost results were still coming.
+
+The pure exported `resolveToolResultState(entryId, lastLoadedEntryId, hasMore)`
+now returns `unloaded` only for `entryId === lastLoadedEntryId && hasMore`, and
+`missing` otherwise (including an empty window, which would otherwise render as
+perpetually loading). `unloaded` shows a spinner plus a **Load it** action
+calling `loadMore()`; `missing` says *"No result recorded for this call"*.
+
+Deliberately **not** auto-fetching the next page when the last row is expanded:
+that cascades one page fetch per page and re-creates the eager download this
+whole refactor removed. i18n: `resultPending` removed; `resultNotRecorded` /
+`resultInLaterTurn` / `resultLoadNext` / `resultLoading` added in en + de-DE
+parity.
 
 ## 4. Verification
 
@@ -184,6 +205,20 @@ Mirrors the split the audit stream already uses (`lean=` + `/audit/step/{id}`):
   turn from the 500-char preview to 5623 chars. On a pre-tail-era job, 93/100
   tool calls show real results with working expand controls. No console errors
   from the panel.
+- **Live write path confirmed on dev (2026-07-30).** Deploy carrying the fix is
+  `d7027501` (`sha-576a15f`). Job `b5134690` (09:00Z, 168 turns) archives real
+  tool results per turn (`[tool]: Written: plan.md`, …) alongside the `context`
+  descriptors. Job `e239ef27` (06:20Z, 69 turns) — same day, older agent image —
+  has **zero** tool inputs across all 69 turns: the pre-rollout write path, lost
+  for good. Injection kind does *not* explain the split; memory and knowledge
+  injections share the synthetic `AIMessage`+`ToolMessage` shape
+  (`src/core/memory_injection.py:22-52`, `knowledge_injection.py:266-296`) and
+  poisoned the old delta scan equally. The variable is the agent image.
+- The `a5d93f71` follow-up (§3.4) adds 5 vitest cases (**1476 green**) and is
+  **not** browser-driven: staging both states live needs a >100-turn job for
+  `unloaded` and a pre-fix job for `missing`, and the k3d orchestrator was
+  churning at the time. Logic is pure and unit-covered; the render path is the
+  same one already browser-verified above.
 
 ## 5. Residual
 
@@ -191,10 +226,6 @@ Mirrors the split the audit stream already uses (`lean=` + `/audit/step/{id}`):
   unrecoverable from `chat_history`; they remain in `llm_requests` (the full
   payload is archived there), reachable via the turn's request-id link. The UI
   classification makes legacy rows readable, not complete.
-- **New write path not yet observed on a live job.** It is unit-tested against
-  the exact payload shape `graph.py` assembles, but the agent pod running during
-  verification predates the rebuild. Worth a glance at the `inputs` of the next
-  k3d job: expect `type:"context"` entries and real `call_*` ids side by side.
 - **No backfill.** Existing rows keep the duplicated frame. This is storage
   weight only (~99 % of chat input bytes on injection-heavy jobs); a
   `chat_history` prune/rewrite is a cleanup, not a fix, and would destroy the

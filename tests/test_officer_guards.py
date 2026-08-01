@@ -2,7 +2,7 @@
 
 The ceiling (centurion.md §4, third loop-guard layer) brakes the DRAIN: over
 budget, claimed wake rows are deferred (not released — no attempts burned) to
-the UTC reset and one day-stamped digest notice is written. Direct Legatus
+the UTC reset and one day-stamped digest notice is written. Direct Legate
 input bypasses the drain, so a ceilinged officer still answers immediately.
 Pages are the one urgency that crosses quiet hours (§6 notify contract).
 """

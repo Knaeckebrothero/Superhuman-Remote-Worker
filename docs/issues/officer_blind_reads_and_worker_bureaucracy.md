@@ -48,7 +48,7 @@ mechanics.
 | Time (UTC) | Event |
 |---|---|
 | 21:16 | Officer (fresh on gpt-5.6-sol) orients, writes change-of-command KB note: engine stable per iter-30 QA, demo gap = web UI, legacy claims self-conflicting (180/180 vs 179 pass / 3 fail / 1 deselected) → declares truth gate: no construction until independent verification. |
-| 21:53 | Absorbs the Legatus demo ruling (web UI required); plans hygiene + verification + heavy-slot UI architecture. |
+| 21:53 | Absorbs the Legate demo ruling (web UI required); plans hygiene + verification + heavy-slot UI architecture. |
 | 00:08 | Legacy loop job `58027ee7` (DEVELOPER, iter 3) completes with claimed Kassenabschluss export. Officer does not accept the claim. |
 | 00:09 | Spawns verifier #1 `7c2685e8` (critic, MiniMax-M3 line slot): "verify 58027ee7, establish the truthful repository baseline." |
 | 00:10–05:31 | Monitors it for 5.5 h / 1096 steps / 7 phases. Steers at 05:21 ("stop archaeology, write the report"). |
@@ -59,7 +59,7 @@ mechanics.
 | 07:25 | Cancels verifier #2. |
 | 07:27 | Escalates to heavy slot: `eb0143f8` (gpt-5.6-sol), KB-note-only deliverable. |
 | 07:47 | Heavy verifier fails: codex-proxy 408 stream-disconnect, identical on 4 backoff cycles across fresh pods. |
-| 07:48 | Officer pages the Legatus (1/3), concludes "truth gate failed three times by two distinct mechanisms", stands down to long sleeps. Two of his own turns error on the same proxy (07:40, 08:45); recovers 09:20. |
+| 07:48 | Officer pages the Legate (1/3), concludes "truth gate failed three times by two distinct mechanisms", stands down to long sleeps. Two of his own turns error on the same proxy (07:40, 08:45); recovers 09:20. |
 
 **What the officer got right** (relevant because the fixes below must not lobotomize
 this): skepticism about self-conflicting completion claims; keying acceptance to an

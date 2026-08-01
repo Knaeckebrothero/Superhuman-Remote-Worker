@@ -29,7 +29,7 @@ Functionally **complete and verified** (k3d build + 716 cockpit tests + live bro
 | **Dead-code sweep** | removed `fetchAndCacheJob`/`loadWindow` + all slider/window signals from `DataService`; `getJobAuditBulk`/`getChatHistoryBulk`/`getGraphDeltasBulk` + `Bulk*Response` from `ApiService`; graph slider-sync. `data.service.spec` rewritten. **716/716 tests pass.** |
 | **MCP migration + backend bulk removal** (2026-06-29) | MCP `get_audit_bulk`→`/audit?lean=true&offset&limit&filter` (and the `filter` that was silently dropped is now wired through); `get_chat_bulk`→`/chat?offset&limit`; both capped at 200. Added offset/limit to `AuditStore.get_chat_history` + the `/chat` endpoint (mirrors `/audit`). **Deleted** the three `/{audit,chat,graph}/bulk` endpoints + `get_job_audit_bulk`/`get_chat_history_bulk`/`get_graph_deltas_bulk` store methods. `/graph/bulk` had **zero** consumers. New tests: 5 MCP-client (params/caps/filter) + 3 chat-pagination contract; **303 audit/chat/mcp/archiver tests pass**, ruff clean. |
 | **Legacy `mongodb.py` cleanup** (2026-06-29) | Removed the matching `get_job_audit_bulk`/`get_chat_history_bulk`/`get_graph_deltas_bulk` from the retired `MongoDB` store (zero call sites; the live reader is `AuditStore`) + the stale docstring example. The non-bulk methods that real callers still use are untouched; MongoDB/MCP/pagination tests green. |
-| **P4 — chat lean + hydration** (2026-07-30, uncommitted) | Chat finally gets the P1/P2 treatment it was explicitly denied in P3 (see §0.1): `lean=` on `/chat` + `GET /chat/entry/{entry_id}`, `ChatTraceService.hydrateEntry`, expand-in-place everywhere, injected context collapsed to one strip, tool results resolved via a window-wide `tool_call_id` map. Fixed en route: the write-side delta bug that had been dropping real tool results (`docs/done/chat_history_tail_injections_swallow_the_conversation_delta.md`). |
+| **P4 — chat lean + hydration** (2026-07-30, shipped `e4244dfe` + `a5d93f71`) | Chat finally gets the P1/P2 treatment it was explicitly denied in P3 (see §0.1): `lean=` on `/chat` + `GET /chat/entry/{entry_id}`, `ChatTraceService.hydrateEntry`, expand-in-place everywhere, injected context collapsed to one strip, tool results resolved via a window-wide `tool_call_id` map. Fixed en route: the write-side delta bug that had been dropping real tool results (`docs/done/chat_history_tail_injections_swallow_the_conversation_delta.md`). |
 
 **Browser-verified (697-step job):** selecting a job issues only `/audit?…lean=true` + `/chat?page` (**no `/*/bulk`**); Agent 100/697, Chat 100/160; expand → `/audit/step/{id}` fills heavy args; filter re-queries server-side (errors→0, tools→159); sort → `order=desc` shows #697 first; slider gone; **0 console errors**.
 
@@ -63,8 +63,11 @@ Two things beyond the audit pattern, both forced by chat's shape:
 - **Cross-row references.** A tool *result* lands in a later turn than its
   *call*, so `getToolResult` peeked at `entries[idx+1]` — fragile across
   empty-delta turns and page boundaries. Now a `tool_call_id → result` map over
-  the whole loaded window, with an honest "arrives in a later turn" state at the
-  tail of a page.
+  the whole loaded window. Follow-up `a5d93f71`: only the **last loaded** turn
+  can legitimately be waiting on data, so `resolveToolResultState()` separates
+  `unloaded` (spinner + a "Load it" action) from `missing` ("No result recorded")
+  — otherwise every result the write-side bug destroyed was labelled as still
+  coming.
 - **Retroactive classification.** The ~66k rows already written can't be fixed
   by the write-side change, so the component classifies legacy raw injections
   client-side (`<active_tasks>` prefix, `*_inject_` tool-call ids) into the same
@@ -85,11 +88,11 @@ Postgres cutover — the same "delete what the UI never renders" sweep as §8.
 - **Live tail** (§7-P3 step 2) — auto-refresh now just reloads the job list; per-stream keyset tail / follow-mode is future work.
 - Unused timeline CSS (`.scrubber`/`.play-button`/…) — cosmetic.
 
-### Files (uncommitted on `develop`, atop the deployed P0–P2)
+### Files (all shipped on `develop`; P1 `86e8fd46`, P3 `83ba4a6e` + `1dcd9415`, P4 `e4244dfe` + `a5d93f71`, atop the deployed P0–P2)
 
 New: `cockpit/src/app/core/services/{audit-trace,chat-trace}.service.ts`. Changed: `api.service.ts`, `data.service.ts` (+ `.spec`), `agent-activity.component.ts`, `chat-history.component.ts`, `timeline.component.ts`, `graph.service.ts`, `orchestrator/database/audit_store.py`, `orchestrator/main.py`. MCP migration adds: `orchestrator/mcp/client.py`, `orchestrator/mcp/server.py`, `orchestrator/database/mongodb.py` (legacy bulk methods removed), `tests/test_mcp.py` (+`TestAsyncCockpitClientAuditChatBulk`), `tests/test_audit_pagination.py` (+`TestChatPaginationContract`).
 
-**P4 adds** (also uncommitted): `src/core/archiver.py`, `orchestrator/services/formatters.py`, `cockpit/src/app/core/models/chat.model.ts`, `cockpit/src/assets/i18n/{en,de-DE}.json`; new `tests/test_chat_lean.py`, `cockpit/src/app/core/services/chat-trace.service.spec.ts`, `cockpit/src/app/views/chat-history/chat-history.component.spec.ts` (+ new cases in `tests/test_archiver_pg.py`).
+**P4 adds** (shipped in `e4244dfe`, follow-up `a5d93f71`): `src/core/archiver.py`, `orchestrator/services/formatters.py`, `cockpit/src/app/core/models/chat.model.ts`, `cockpit/src/assets/i18n/{en,de-DE}.json`; new `tests/test_chat_lean.py`, `cockpit/src/app/core/services/chat-trace.service.spec.ts`, `cockpit/src/app/views/chat-history/chat-history.component.spec.ts` (+ new cases in `tests/test_archiver_pg.py`).
 
 ---
 
@@ -210,7 +213,7 @@ Write-side fix from `docs/issues/audit_metadata_config_duplication_ooms_orchestr
 - **Files:** `src/api/dual_app.py` (+ mirror `src/api/app.py`) metadata build; backfill SQL per live partition.
 - **Acceptance:** `GET /api/jobs/19707fa1/audit/bulk?limit=5000` returns < 5 MB (was ~½ GB); orchestrator RSS stays flat; no OOM; the existing dashboard opens the 6k job.
 
-### Phase 1 — Lean projection + per-step detail (backend) ✅ done + k3d-verified (uncommitted)
+### Phase 1 — Lean projection + per-step detail (backend) ✅ done + k3d-verified, shipped `86e8fd46`
 
 1. **Lean list projection** — add `_STITCH_LEAN` (or a `detail: bool = False` arg threaded through `get_job_audit`) that selects only render columns and projects a small payload (tool name/success, model, request_id, error type + truncated message, bounded previews) — **excluding** `metadata`, `tool.arguments`, `error.traceback`, `state`, full content. Keep the existing fat path as the non-default so MCP `get_audit_trail` and any other `get_job_audit` callers are unchanged.
 2. **Per-step detail endpoint** — `GET /api/jobs/{id}/audit/{step_id}` → the full stitched doc for one step (heavy is fine for a single row). Backed by a `get_audit_step(job_id, step_id)` reusing `_STITCH_CORE` with `WHERE f.id = $2`.

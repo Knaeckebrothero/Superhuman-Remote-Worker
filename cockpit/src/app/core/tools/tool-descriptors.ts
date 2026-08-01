@@ -416,7 +416,7 @@ export function parseJobEntity(n: NormalizedToolCall): ToolCardView['entity'] {
 /**
  * Extract the officer→user message from a `notify_user` call. The args ARE the
  * message (available the moment the call starts streaming); the result string
- * is the delivery receipt ("Paged the Legatus (2/3 pages used today)."), which
+ * is the delivery receipt ("Paged the Legate (2/3 pages used today)."), which
  * lands later. An unknown/absent urgency degrades to 'log' — the tool's own
  * default — rather than suppressing the bubble.
  *
