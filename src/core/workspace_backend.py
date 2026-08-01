@@ -557,6 +557,7 @@ class WorkspaceBackend(ABC):
         tab_name: str,
         text: str,
         enter: bool = True,
+        working_dir: Optional[str] = None,
     ) -> str:
         """Send keystrokes to a tab.
 
@@ -564,6 +565,8 @@ class WorkspaceBackend(ABC):
             tab_name: Tab name.
             text: Text or tmux key names to send.
             enter: Whether to press Enter after sending.
+            working_dir: Optional workspace-relative directory for a command.
+                Backends must not apply it to raw keystrokes.
 
         Returns:
             Confirmation message.

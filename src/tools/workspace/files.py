@@ -151,6 +151,14 @@ def create_file_tools(context: ToolContext) -> List[Any]:
 
     workspace = context.workspace_manager
 
+    def _file_not_found(path: str) -> str:
+        resolved_path = workspace.get_path(path)
+        return (
+            f"Error: File not found: {resolved_path}\n"
+            f'  (resolved from workspace root; you passed "{path}")\n'
+            "  Use `search_files` to locate it if you expected it elsewhere."
+        )
+
     # Get word limit (with backward compatibility fallback)
     max_read_words = context.get_config("max_read_words")
     if max_read_words is None:
@@ -753,7 +761,7 @@ def create_file_tools(context: ToolContext) -> List[Any]:
 
             # Check file exists
             if not workspace.exists(path):
-                return f"Error: File not found: {path}"
+                return _file_not_found(path)
 
             full_path = workspace.get_path(path)
             if full_path.is_dir():
@@ -867,7 +875,7 @@ def create_file_tools(context: ToolContext) -> List[Any]:
             return result
 
         except FileNotFoundError:
-            return f"Error: File not found: {path}"
+            return _file_not_found(path)
         except ValueError as e:
             return f"Error: {str(e)}"
         except WorkspaceUnavailableError:
@@ -1041,7 +1049,7 @@ def create_file_tools(context: ToolContext) -> List[Any]:
                 return upperdir_guard_msg
 
             if not workspace.exists(path):
-                return f"Error: File not found: {path}"
+                return _file_not_found(path)
 
             full_path = workspace.get_path(path)
             if full_path.is_dir():

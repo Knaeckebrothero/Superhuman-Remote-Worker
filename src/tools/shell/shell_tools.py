@@ -204,7 +204,7 @@ TMUX_SPECIAL_KEYS = frozenset(
 )
 
 # Tool metadata for registry
-# Appended to run_command results when the single stateless tab is wedged
+# Appended to run_command results when its shared command tab is wedged
 # (still-running, colliding, or blocked on a prompt). run_command has no keys
 # mode, so cancel_command is the model's only in-band escape from a hung tab.
 _CANCEL_HINT = (
@@ -373,13 +373,18 @@ def create_shell_tools(context: ToolContext) -> List[Any]:
         command: str,
         timeout: Optional[int] = None,
         tail: int = 30,
+        working_dir: Optional[str] = ".",
     ) -> str:
         """Execute a shell command and return its output.
 
         Runs the command to completion and returns the exit code + stdout.
-        Commands run in the workspace directory. Use for: running tests,
-        building projects, git operations, file system commands, deploying,
-        checking logs, SSH via sshpass, and any other shell task.
+        Every call starts in `working_dir`, resolved relative to the workspace
+        root, and restores the tab to the workspace root after completion.
+        Always set `working_dir`. Do not use `cd` unless absolutely necessary;
+        explicit working directories keep shell and file-tool paths aligned.
+        Use for: running tests, building projects, git operations, file system
+        commands, deploying, checking logs, SSH via sshpass, and any other
+        shell task.
 
         LONG-RUNNING / QUIET COMMANDS: a command that produces no new output for
         ~30s (a large `pip install`, a build, a big download, data ingestion or
@@ -413,6 +418,9 @@ def create_shell_tools(context: ToolContext) -> List[Any]:
         Args:
             command: Shell command to execute (e.g., "pytest tests/ -x",
                 "git status", "curl -s https://api.example.com/health").
+            working_dir: Directory in which to start the command, relative to
+                the workspace root (default ".", the workspace root). A null or
+                empty value is also normalized to the workspace root.
             timeout: Max seconds to wait (max 600). Omit for normal commands —
                 a quiet command then returns "still running" after ~30s. Set an
                 explicit value for known long/quiet work (installs, builds) to
@@ -443,7 +451,12 @@ def create_shell_tools(context: ToolContext) -> List[Any]:
             if delete_msg and delete_blocks:
                 return delete_msg
 
-            output = sm.run_sync(command, tab_name="default", timeout=timeout)
+            output = sm.run_sync(
+                command,
+                tab_name="default",
+                timeout=timeout,
+                working_dir=working_dir or ".",
+            )
             if guard_msg:
                 output = f"{guard_msg}\n\n{output}"
             if delete_msg:
@@ -462,7 +475,7 @@ def create_shell_tools(context: ToolContext) -> List[Any]:
                 output = _truncate_output(output, max_output_chars, "output")
                 return output + _CANCEL_HINT
 
-            # Colliding: the single stateless tab is busy with a previous
+            # Colliding: the shared run_command tab is busy with a previous
             # command, so this one never ran. cancel_command is the way out.
             if "previous command still running" in output:
                 output = _truncate_output(output, max_output_chars, "output")
@@ -499,6 +512,7 @@ def create_shell_tools(context: ToolContext) -> List[Any]:
         is_async: bool = False,
         keys: bool = False,
         timeout: Optional[int] = None,
+        working_dir: Optional[str] = None,
     ) -> str:
         """Execute a command or send keystrokes in a persistent terminal tab.
 
@@ -506,6 +520,12 @@ def create_shell_tools(context: ToolContext) -> List[Any]:
         window). Tabs auto-create on first use and persist between calls —
         environment, working directory, virtualenvs, and history all survive.
         You can SSH in one tab while running local commands in another.
+
+        Always set `working_dir` for commands. Do not use `cd` unless absolutely
+        necessary — when `working_dir` is omitted, an inline `cd` persists in
+        that tab for the rest of the job. A supplied `working_dir` is resolved
+        relative to the workspace root and the root is restored when the
+        command finishes.
 
         IMPORTANT: Never write paramiko, fabric, pexpect, or subprocess SSH
         scripts. Every tab is a real terminal — just use ssh/scp/rsync directly.
@@ -526,9 +546,13 @@ def create_shell_tools(context: ToolContext) -> List[Any]:
           keys=True: Send raw keystrokes. Text input (passwords, "yes", "y")
               auto-submits with Enter. Control keys ("C-c", "Up", "Escape")
               are sent as-is. Send "Enter" alone to press Enter without text.
+              `working_dir` is ignored because keystrokes target the live
+              process exactly where it is already running.
           is_async=True: Fire-and-forget. Returns immediately without waiting.
               ONLY for long-running background processes (dev servers, builds,
-              VPN connections). Use shell_read() later to check progress.
+              VPN connections). Use shell_read() later to check progress. When
+              `working_dir` is set, the command is anchored there and the tab
+              returns to the workspace root after the command exits.
 
         SSH workflow (use sync mode, not is_async):
           1. shell_execute(command="ssh user@host", name="srv")
@@ -556,6 +580,10 @@ def create_shell_tools(context: ToolContext) -> List[Any]:
                 default no-change behavior (~30s quiet → "still running"); set
                 an explicit value for known long/quiet work (large installs,
                 builds) to wait the full duration.
+            working_dir: Directory in which to start the command, relative to
+                the workspace root. In sync and async command modes the tab is
+                restored to the workspace root after completion. Ignored when
+                `keys=True`.
 
         Returns:
             [Shells: tab1 | tab2 | ...] header + command output.
@@ -600,7 +628,12 @@ def create_shell_tools(context: ToolContext) -> List[Any]:
                     return f"{tab_header}\n{delete_msg}"
                 # Async mode: send command, wait briefly, return what appeared
                 sm.read(name, lines=1, since_cursor=False)  # snapshot cursor
-                result = sm.send(name, command, enter=True)
+                result = sm.send(
+                    name,
+                    command,
+                    enter=True,
+                    working_dir=working_dir,
+                )
                 # Sudo intercept: trigger freeze for VM upgrade
                 freeze_msg = _check_sudo_freeze(result, command, context)
                 if freeze_msg:
@@ -633,7 +666,12 @@ def create_shell_tools(context: ToolContext) -> List[Any]:
                 if delete_msg and delete_blocks:
                     return f"{tab_header}\n{delete_msg}"
                 # Sync mode: sentinel-based wait for completion
-                output = sm.run_sync(command, tab_name=name, timeout=timeout)
+                output = sm.run_sync(
+                    command,
+                    tab_name=name,
+                    timeout=timeout,
+                    working_dir=working_dir,
+                )
                 if guard_msg:
                     output = f"{guard_msg}\n\n{output}"
                 if delete_msg:

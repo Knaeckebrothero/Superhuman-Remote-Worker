@@ -10,8 +10,10 @@ Covers:
 from __future__ import annotations
 
 import textwrap
+from pathlib import Path
 
 import pytest
+import yaml
 from langchain_core.tools import tool
 
 from src.core.loader import resolve_guardrails
@@ -65,6 +67,27 @@ class TestResolveGuardrails:
         )
         # Other tools come from default
         assert "git_log()" in g["tool_examples"]["git_log"]
+
+    def test_all_shell_example_overrides_set_working_dir_without_inline_cd(self):
+        guardrail_dir = Path(__file__).parents[1] / "config" / "guardrails"
+        for guardrail_path in guardrail_dir.glob("*.yaml"):
+            config = yaml.safe_load(guardrail_path.read_text(encoding="utf-8"))
+            examples = config.get("tool_examples", {})
+            for tool_name in ("run_command", "shell_execute"):
+                if tool_name not in examples:
+                    continue
+                calls = [
+                    line.strip()
+                    for line in examples[tool_name].splitlines()
+                    if tool_name in line
+                ]
+                assert calls, f"{guardrail_path}: no {tool_name} calls"
+                for call_text in calls:
+                    assert "working_dir" in call_text, (
+                        f"{guardrail_path}: {call_text} omits working_dir"
+                    )
+                    assert 'command="cd ' not in call_text
+                    assert 'command:<|"|>cd ' not in call_text
 
 
 # =============================================================================

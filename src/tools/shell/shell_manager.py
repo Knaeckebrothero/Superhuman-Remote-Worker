@@ -50,7 +50,10 @@ def build_sentinel_command(command: str, sentinel: str) -> Tuple[str, Optional[s
         command's stdout begins) or None for single-line commands.
     """
     if "\n" not in command:
-        return f'{command}; echo "{sentinel} $?"', None
+        return (
+            f'{command}; printf \'{sentinel} %s %s\\n\' "$?" "$PWD"',
+            None,
+        )
 
     outer_delim = f"SRW_DELIM_{uuid.uuid4().hex[:12]}"
     start_marker = f"__SRW_START_{uuid.uuid4().hex[:12]}__"
@@ -58,7 +61,7 @@ def build_sentinel_command(command: str, sentinel: str) -> Tuple[str, Optional[s
         f'bash << "{outer_delim}"\n'
         f'echo "{start_marker}"\n'
         f"{command}\n"
-        f'echo "{sentinel} $?"\n'
+        f'printf "{sentinel} %s %s\\n" "$?" "$PWD"\n'
         f"{outer_delim}"
     )
     return full_cmd, start_marker
@@ -420,13 +423,22 @@ class ShellManager:
         )
         return metadata
 
-    def send(self, name: str, text: str, enter: bool = True) -> str:
+    def send(
+        self,
+        name: str,
+        text: str,
+        enter: bool = True,
+        working_dir: Optional[str] = None,
+    ) -> str:
         """Send keystrokes to a tab.
 
         Args:
             name: Tab name
             text: Text to send (plain text or tmux key names like "Up", "C-c")
             enter: Whether to press Enter after sending (default True)
+            working_dir: Optional workspace-relative directory for an async
+                         command. The backend restores the workspace root when
+                         that command exits. Do not use for raw keystrokes.
 
         Returns:
             Confirmation message or blocked error
@@ -440,7 +452,12 @@ class ShellManager:
             blocked = self._check_blocked(text)
             if blocked:
                 return blocked
-        return self._backend.shell_send(name, text, enter=enter)
+        return self._backend.shell_send(
+            name,
+            text,
+            enter=enter,
+            working_dir=working_dir,
+        )
 
     def cancel(self, name: str = "default") -> str:
         """Send Ctrl+C to a tab to abort a stuck/hung command.

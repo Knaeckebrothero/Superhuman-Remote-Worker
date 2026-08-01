@@ -120,13 +120,35 @@ class TestReadFileTracking:
         assert tool_context.was_recently_read("test.md")
         assert "Hello, world!" in result
 
-    def test_read_file_error_does_not_record(self, workspace_tools, tool_context):
+    def test_read_file_error_reports_resolved_path_and_search_hint(
+        self,
+        workspace_tools,
+        workspace_manager,
+        tool_context,
+    ):
         """Test that failed reads are not recorded."""
         read_file = workspace_tools["read_file"]
         result = read_file.invoke({"path": "nonexistent.md"})
 
         assert "Error" in result
+        assert str(workspace_manager.get_path("nonexistent.md")) in result
+        assert 'you passed "nonexistent.md"' in result
+        assert "search_files" in result
         assert not tool_context.was_recently_read("nonexistent.md")
+
+    def test_read_file_race_uses_same_resolved_not_found_message(
+        self,
+        workspace_tools,
+        workspace_manager,
+        monkeypatch,
+    ):
+        """A file removed after exists() gets the same actionable error."""
+        monkeypatch.setattr(workspace_manager, "exists", lambda _path: True)
+
+        result = workspace_tools["read_file"].invoke({"path": "vanished.txt"})
+
+        assert str(workspace_manager.get_path("vanished.txt")) in result
+        assert "search_files" in result
 
 
 class TestEditFileReadRequirement:
@@ -145,6 +167,22 @@ class TestEditFileReadRequirement:
 
         assert "Error" in result
         assert "read_file" in result.lower()
+
+    def test_missing_file_reports_resolved_path_and_search_hint(
+        self,
+        workspace_tools,
+        workspace_manager,
+    ):
+        result = workspace_tools["edit_file"].invoke(
+            {
+                "path": "missing.md",
+                "old_string": "old",
+                "new_string": "new",
+            }
+        )
+
+        assert str(workspace_manager.get_path("missing.md")) in result
+        assert "search_files" in result
 
     def test_edit_file_works_after_read(self, workspace_tools, workspace_manager):
         """Test that edit_file works after reading."""
