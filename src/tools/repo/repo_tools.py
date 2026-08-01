@@ -57,7 +57,23 @@ def create_repo_tools(context: ToolContext) -> List[Any]:
             return f"Unknown repository {repo!r}. Attached repositories: {known}"
         return repos[repo], meta_all.get(repo, {})
 
-    def _refuse_if_read_only(meta: dict, repo: str) -> Optional[str]:
+    def _refuse_write(meta: dict, repo: str) -> Optional[str]:
+        """Refusal reason for a write on ``repo``, or None if it may proceed.
+
+        Fails CLOSED on missing metadata. An empty dict is not proof that the
+        repository is writable — it is proof that the clone could not record
+        anything, e.g. an SSH-form connection_url whose host cannot be parsed.
+        Treating that as "not read-only" turned a metadata bug into an
+        unguarded push.
+        """
+        if not meta:
+            return (
+                f"Repository {repo!r} has no recorded connector metadata, so "
+                "writes cannot be authorized. This usually means its "
+                "connection URL is in SSH form (git@host:owner/repo) or its "
+                "forge is unset — fix the connector and re-attach it. "
+                "repo_pull still works, and the shell can drive git directly."
+            )
         if meta.get("read_only"):
             return (
                 f"Repository {repo!r} is attached read-only; "
@@ -77,13 +93,17 @@ def create_repo_tools(context: ToolContext) -> List[Any]:
         if isinstance(resolved, str):
             return resolved
         git_mgr, meta = resolved
-        refusal = _refuse_if_read_only(meta, repo)
+        refusal = _refuse_write(meta, repo)
         if refusal:
             return refusal
-        if git_mgr.commit(message):
+        # allow_empty defaults to True on GitManager.commit — that would
+        # manufacture an empty commit and report success, contradicting the
+        # "nothing to commit" answer below.
+        if git_mgr.commit(message, allow_empty=False):
             return f"Committed in {repo}: {message}"
         return (
-            f"Nothing to commit in {repo} (or the commit failed — check repo_status)."
+            f"Nothing to commit in {repo} (or the commit failed). Inspect the "
+            f"clone with the shell: `git -C repos/{repo} status`."
         )
 
     @tool
@@ -98,7 +118,7 @@ def create_repo_tools(context: ToolContext) -> List[Any]:
         if isinstance(resolved, str):
             return resolved
         git_mgr, meta = resolved
-        refusal = _refuse_if_read_only(meta, repo)
+        refusal = _refuse_write(meta, repo)
         if refusal:
             return refusal
         target = branch or git_mgr.current_branch()
@@ -148,7 +168,7 @@ def create_repo_tools(context: ToolContext) -> List[Any]:
         if isinstance(resolved, str):
             return resolved
         git_mgr, meta = resolved
-        refusal = _refuse_if_read_only(meta, repo)
+        refusal = _refuse_write(meta, repo)
         if refusal:
             return refusal
         if not meta.get("forge"):

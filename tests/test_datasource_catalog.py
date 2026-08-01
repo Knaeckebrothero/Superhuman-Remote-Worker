@@ -37,10 +37,14 @@ def test_datasource_catalog_matches_agent_consumers():
         for definition in DATASOURCE_TYPE_CATALOG
         if definition.runtime_kind == "credential_file"
     }
+    # "repository" keeps its own runtime_kind — it clones onto the workspace
+    # instead of opening a connection — but it is tool-backed too now (the
+    # repo_* category), so it belongs in this side of the drift check.
     tool_types = {
         definition.type_id
         for definition in DATASOURCE_TYPE_CATALOG
-        if definition.runtime_kind in {"managed_tools", "email_tools", "mcp_tools"}
+        if definition.runtime_kind
+        in {"managed_tools", "email_tools", "mcp_tools", "repository"}
     }
 
     assert credential_types == CREDENTIAL_FILE_TYPES

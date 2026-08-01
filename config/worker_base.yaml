@@ -142,6 +142,10 @@ tools:
   # WebDAV tools - WebDAV file operations (src/tools/webdav/)
   # Injected automatically via datasource system
   webdav: []
+  # Repo tools - write operations on cloned repository datasources
+  # (src/tools/repo/). Injected automatically via datasource system; distinct
+  # from `git`, which covers the agent's own workspace history.
+  repo: []
   # Email tools - IMAP/SMTP mailbox operations (src/tools/email/)
   # Injected automatically via datasource system
   email: []

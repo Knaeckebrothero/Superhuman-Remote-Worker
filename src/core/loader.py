@@ -1468,6 +1468,11 @@ class ToolsConfig:
     sql: List[str] = field(default_factory=list)
     mongodb: List[str] = field(default_factory=list)
     git: List[str] = field(default_factory=list)
+    # Repository-datasource write tools (repo_commit/push/pull/open_pr).
+    # Distinct from `git`, which is the workspace's own version control:
+    # reusing `git` would strip the workspace git tools whenever no
+    # repository datasource is attached.
+    repo: List[str] = field(default_factory=list)
     shell: List[str] = field(default_factory=list)
     evaluation: List[str] = field(default_factory=list)
     knowledge: List[str] = field(default_factory=list)
@@ -2359,6 +2364,7 @@ def load_agent_config(
         sql=tools_data.get("sql", []),
         mongodb=tools_data.get("mongodb", []),
         git=tools_data.get("git", []),
+        repo=tools_data.get("repo", []),
         shell=tools_data.get("shell", tools_data.get("coding", [])),
         evaluation=tools_data.get("evaluation", []),
         knowledge=tools_data.get("knowledge", []),
@@ -2611,6 +2617,7 @@ def load_agent_config_from_dict(
         sql=tools_data.get("sql", []),
         mongodb=tools_data.get("mongodb", []),
         git=tools_data.get("git", []),
+        repo=tools_data.get("repo", []),
         shell=tools_data.get("shell", tools_data.get("coding", [])),
         evaluation=tools_data.get("evaluation", []),
         knowledge=tools_data.get("knowledge", []),
@@ -4473,6 +4480,7 @@ def get_all_tool_names(config: AgentConfig) -> List[str]:
         "sql",
         "mongodb",
         "git",
+        "repo",
         "shell",
         "evaluation",
         "knowledge",
