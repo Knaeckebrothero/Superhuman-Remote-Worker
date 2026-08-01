@@ -401,6 +401,22 @@ export function pickRunningCommandCard(
     return runningTool;
 }
 
+/**
+ * Full argument content for one pending permission call — every arg, in
+ * full, joined as "key: value, key: value". This is the entire safety model
+ * for the batch approval card: "Approve all" runs every call shown,
+ * including a destructive shell command, so nothing here may ever be
+ * truncated. A long value wraps and the row list scrolls instead
+ * (.permission-args / .permission-list in persistent-chat.component.scss)
+ * — it must never be clipped out of the DOM.
+ */
+export function formatPermissionArgs(args: Record<string, unknown> | null | undefined): string {
+    const safe = args ?? {};
+    return Object.entries(safe)
+        .map(([k, v]) => `${k}: ${typeof v === 'string' ? v : JSON.stringify(v)}`)
+        .join(', ');
+}
+
 /** The workspace-upgrade card to render, or null when there's nothing to show. */
 export type WorkspaceOfferCard =
     | {state: 'provisioning'; tier: string; elapsed?: number; willContinue: boolean}
@@ -3462,15 +3478,11 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         return this.fallbackToolLabel(tc.tool);
     }
 
-    /** Compact one-line args preview so the user can see WHAT each call does
-     *  before approving the batch — including a destructive shell command. */
+    /** Full argument content so the user can see WHAT each call does before
+     *  approving the batch — see formatPermissionArgs (must never truncate:
+     *  that's the whole safety model for a destructive call in the batch). */
     permissionArgs(perm: PermissionRequest): string {
-        const args = perm.args ?? {};
-        const parts = Object.entries(args).map(([k, v]) => {
-            const s = typeof v === 'string' ? v : JSON.stringify(v);
-            return `${k}: ${s.length > 120 ? s.slice(0, 120) + '…' : s}`;
-        });
-        return parts.join(', ');
+        return formatPermissionArgs(perm.args);
     }
 
     formatTime(d: Date | string | number): string {

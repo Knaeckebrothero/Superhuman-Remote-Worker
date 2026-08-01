@@ -1,4 +1,4 @@
-import {beforeEach, describe, expect, it} from 'vitest';
+import {beforeEach, describe, expect, it, vi} from 'vitest';
 
 import {
     canComposeDuringSession,
@@ -8,6 +8,7 @@ import {
     composeDenyPrefill,
     draftKey,
     extractClipboardFiles,
+    formatPermissionArgs,
     isMicMode,
     isNearBottom,
     isStartupBannerVisible,
@@ -18,6 +19,7 @@ import {
     pickCurrentStartupStep,
     pickRunningCommandCard,
     pickWorkspaceOfferCard,
+    PersistentChatComponent,
     readingWidthToCss,
     saveDraft,
     shouldFoldToolRun,
@@ -214,6 +216,95 @@ describe('pickRunningCommandCard', () => {
             ],
         };
         expect(pickRunningCommandCard(rt, [turn])).toBeNull();
+    });
+});
+
+/**
+ * The batch approval card's per-row argument text. This is the
+ * safety-load-bearing piece: "Approve all" runs every call shown, including
+ * a destructive shell command, so formatPermissionArgs must never truncate
+ * — a truncated arg is a hidden arg. See persistent-chat.component.scss
+ * (.permission-args / .permission-list) for how a long result stays fully
+ * in the DOM (wrap + scroll) instead of being clipped.
+ *
+ * What this does NOT cover: that the template's @for actually emits one
+ * <li> per pendingPermissions() entry, and that the card's "Approve all" /
+ * "Stop" buttons are bound to chat.approveAll() / chat.stop(). The
+ * component is never mounted in a spec (see test-setup.ts) — that
+ * template-wiring question is checked by code review and by
+ * strictTemplates (chat.approveAll / chat.stop must exist and be
+ * callable), not by a unit test here. That pendingPermissions() itself
+ * carries every entry, not just the first, is proven independently in
+ * persistent-chat.service.spec.ts.
+ */
+describe('formatPermissionArgs', () => {
+    it('renders a single string arg as "key: value"', () => {
+        expect(formatPermissionArgs({file_path: 'src/app.ts'})).toBe('file_path: src/app.ts');
+    });
+
+    it('JSON-stringifies non-string values', () => {
+        expect(formatPermissionArgs({count: 3, force: true})).toBe('count: 3, force: true');
+    });
+
+    it('joins multiple keys with ", " in insertion order', () => {
+        expect(formatPermissionArgs({a: '1', b: '2', c: '3'})).toBe('a: 1, b: 2, c: 3');
+    });
+
+    it('returns an empty string when there are no args', () => {
+        expect(formatPermissionArgs({})).toBe('');
+        expect(formatPermissionArgs(undefined)).toBe('');
+        expect(formatPermissionArgs(null)).toBe('');
+    });
+
+    it('never truncates — a destructive suffix past 120 chars still reaches the DOM', () => {
+        // Regression pin for the CRITICAL finding: an earlier version sliced
+        // every value to 120 chars in TypeScript, before the template ever
+        // saw it, so "rm -rf /important-data" silently vanished behind an
+        // ellipsis with no way to recover it. One click on "Approve all"
+        // would have run it, unseen.
+        const command = 'echo start && ' + 'a'.repeat(400) + ' && rm -rf /important-data';
+        const result = formatPermissionArgs({command});
+        expect(result).toContain('rm -rf /important-data');
+        expect(result).toBe(`command: ${command}`);
+        expect(result).not.toContain('…');
+    });
+
+    it('keeps every entry independent across a multi-call batch, not just the first', () => {
+        // This is what each row in the @for loop calls; proves it has no
+        // shared state and produces correct, distinct text for every
+        // pending call in a batch, not only entry 0.
+        const perms = [
+            {command: 'echo one'},
+            {command: 'echo two'},
+            {command: 'rm -rf /tmp/scratch'},
+        ];
+        expect(perms.map((p) => formatPermissionArgs(p))).toEqual([
+            'command: echo one',
+            'command: echo two',
+            'command: rm -rf /tmp/scratch',
+        ]);
+    });
+});
+
+/**
+ * approveAndAutoAccept() sets the mode BEFORE approving so a call that
+ * immediately follows the just-approved batch (the agent continuing its
+ * turn) lands under auto_accept instead of re-prompting. Invoked via
+ * .call() against a bare `{chat}` stand-in rather than a constructed
+ * component — the class is never mounted in specs (see test-setup.ts),
+ * but this method only ever touches `this.chat`, so no other
+ * constructor/DI surface is needed to exercise the real, shipped method.
+ */
+describe('approveAndAutoAccept', () => {
+    it('sets auto_accept mode before approving the batch', () => {
+        const calls: string[] = [];
+        const chat = {
+            setMode: vi.fn((mode: string) => calls.push(`setMode:${mode}`)),
+            approveAll: vi.fn(() => calls.push('approveAll')),
+        };
+        const host = {chat} as unknown as PersistentChatComponent;
+        PersistentChatComponent.prototype.approveAndAutoAccept.call(host);
+        expect(calls).toEqual(['setMode:auto_accept', 'approveAll']);
     });
 });
 
