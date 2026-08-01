@@ -330,3 +330,271 @@ class TestCallbackWiring:
         cb = captured["callbacks"]
         assert cb is not None, "loop was never started"
         assert cb.announce_permission_batch is pa._loop_announce_permission_batch
+
+
+# =============================================================================
+# Announced rows must not outlive the turn that announced them
+#
+# An announced row is only ever retired by its OWN gate in
+# _loop_permission_check, and that gate runs at most once per call. Any turn
+# exit before call i — parked on NO_ANSWER, interrupted, errored, or a
+# mid-batch mode downgrade — strands rows i..N as 'pending' forever: there is
+# no expires_at sweeper, only an active waiter CAS-expires a row. A stranded
+# row rides `session.state` on every reattach and re-renders as a live
+# approval card; "Approve all" then flips it to 'approved' with NO waiter
+# listening, so nothing executes while the user believes they approved the
+# tools. That silent divergence is the reason this is Critical.
+# =============================================================================
+
+
+FOUR_CALLS = [
+    {"name": "web_search", "args": {"query": "a"}, "id": "tc_0"},
+    {"name": "web_search", "args": {"query": "b"}, "id": "tc_1"},
+    {"name": "web_search", "args": {"query": "c"}, "id": "tc_2"},
+    {"name": "web_search", "args": {"query": "d"}, "id": "tc_3"},
+]
+
+
+class _FakeRowStore:
+    """Just enough of ``thread_permission_requests`` to exercise the CAS
+    sweep: an id -> status map plus the three statements the sweep path
+    touches (INSERT, the CAS expire, and the status re-read)."""
+
+    def __init__(self) -> None:
+        self.status: dict[str, str] = {}
+
+    async def fetchval(self, sql: str, *args):
+        if "INSERT INTO thread_permission_requests" in sql:
+            request_id = f"rid-{args[1]}"  # $2 is tool_call_id
+            self.status[request_id] = "pending"
+            return request_id
+        if "SET status = 'expired'" in sql:
+            # CAS: only a row that is still pending may be expired.
+            request_id = args[0]
+            if self.status.get(request_id) == "pending":
+                self.status[request_id] = "expired"
+                return request_id
+            return None
+        if "SELECT 1 FROM thread_permission_requests" in sql:
+            return None  # no terminal decision from a prior wake
+        if "SELECT status FROM thread_permission_requests" in sql:
+            return self.status.get(args[0])
+        return None
+
+    async def fetchrow(self, sql: str, *args):
+        if "SELECT id, status FROM thread_permission_requests" in sql:
+            # The claim SELECT: $2 is tool_call_id.
+            request_id = f"rid-{args[1]}"
+            status = self.status.get(request_id)
+            if status in ("approved", "denied", "pending"):
+                return {"id": request_id, "status": status}
+            return None
+        return None
+
+
+def _session_with_store(store: _FakeRowStore, mode: str = "supervised"):
+    acquire_ctx = MagicMock()
+    acquire_ctx.__aenter__ = AsyncMock(return_value=store)
+    acquire_ctx.__aexit__ = AsyncMock(return_value=False)
+    session = _mock_session(mode)
+    session.workspace_sync = None
+    session.messages = []
+    session.postgres_conn = MagicMock()
+    session.postgres_conn.acquire = MagicMock(return_value=acquire_ctx)
+    return session
+
+
+async def _end_the_turn(turn_id: int = 7):
+    """Drive the real turn-end callback with everything unrelated stubbed."""
+    with (
+        patch.object(pa, "_wire_session_aux_archiver", MagicMock()),
+        patch.object(pa, "_save_turn_ai_messages", AsyncMock()),
+        patch.object(pa, "_auto_title_after_first_turn", AsyncMock()),
+        patch.object(pa, "_should_notify_cloud_stage", lambda: False),
+    ):
+        await pa._loop_on_turn_complete(turn_id)
+
+
+class TestAnnouncedRowsDoNotOutliveTheTurn:
+    @pytest.mark.asyncio
+    async def test_turn_parked_on_no_answer_expires_the_unreached_rows(self):
+        """Repro, no interrupt required: 4 calls announced, the user closes
+        the tab, gate 0 goes untethered and CAS-expires its own row, the turn
+        parks. Rows 1-3 were never gated — they must not survive as pending.
+        """
+        store = _FakeRowStore()
+        session = _session_with_store(store)
+
+        async def _wait(request_id, *a, **kw):
+            # Untethered: _wait_for_permission_resolution CAS-expires its row.
+            store.status[request_id] = "expired"
+            return "expired"
+
+        with (
+            patch.object(pa, "_session", session),
+            patch.object(pa, "_thread_id", "tid"),
+            patch.object(pa, "_announced_permission_rows", {}),
+            patch.object(pa, "_subscribers", {}),
+            patch.object(pa, "_broadcast", MagicMock()),
+            patch.object(pa, "_wait_for_permission_resolution", _wait),
+        ):
+            await pa._loop_announce_permission_batch(FOUR_CALLS)
+            assert list(store.status.values()) == ["pending"] * 4
+
+            outcome = await pa._loop_permission_check("web_search", {}, "tc_0")
+            assert outcome is PermissionOutcome.NO_ANSWER
+
+            await _end_the_turn()
+
+        assert store.status == {
+            "rid-tc_0": "expired",
+            "rid-tc_1": "expired",
+            "rid-tc_2": "expired",
+            "rid-tc_3": "expired",
+        }, "stranded rows would re-render as a phantom card that runs nothing"
+
+    @pytest.mark.asyncio
+    async def test_interrupted_turn_expires_every_announced_row(self):
+        """Stop (or the composer's bare interrupt) leaves the waited-on row
+        'pending' by design — no decision may be fabricated. But the turn is
+        over, so nothing will ever claim it or the rows behind it."""
+        store = _FakeRowStore()
+        session = _session_with_store(store)
+
+        with (
+            patch.object(pa, "_session", session),
+            patch.object(pa, "_thread_id", "tid"),
+            patch.object(pa, "_announced_permission_rows", {}),
+            patch.object(pa, "_subscribers", {"c1": MagicMock()}),
+            patch.object(pa, "_broadcast", MagicMock()),
+            patch.object(
+                pa,
+                "_wait_for_permission_resolution",
+                AsyncMock(return_value="interrupted"),
+            ),
+        ):
+            await pa._loop_announce_permission_batch(FOUR_CALLS)
+            outcome = await pa._loop_permission_check("web_search", {}, "tc_0")
+            assert outcome is PermissionOutcome.NO_ANSWER
+
+            await _end_the_turn()
+
+        assert set(store.status.values()) == {"expired"}
+
+    @pytest.mark.asyncio
+    async def test_concurrent_approval_is_not_clobbered(self):
+        """The sweep is a CAS (`WHERE id = $1 AND status = 'pending'`): a
+        decision that landed a microsecond earlier still wins, and only rows
+        the sweep actually expired are broadcast as resolved."""
+        store = _FakeRowStore()
+        session = _session_with_store(store)
+        bcast = MagicMock()
+
+        with (
+            patch.object(pa, "_session", session),
+            patch.object(pa, "_thread_id", "tid"),
+            patch.object(pa, "_announced_permission_rows", {}),
+            patch.object(pa, "_subscribers", {"c1": MagicMock()}),
+            patch.object(pa, "_broadcast", bcast),
+        ):
+            await pa._loop_announce_permission_batch(FOUR_CALLS)
+            # The user clicked "Approve all" as the turn was unwinding.
+            store.status["rid-tc_1"] = "approved"
+            bcast.reset_mock()
+
+            await _end_the_turn()
+
+        assert store.status["rid-tc_1"] == "approved"
+        assert store.status["rid-tc_0"] == "expired"
+        resolved = [
+            c.args[1]["id"]
+            for c in bcast.call_args_list
+            if c.args[0] == "permission.resolved"
+        ]
+        assert "tc_1" not in resolved
+        assert set(resolved) == {"tc_0", "tc_2", "tc_3"}
+
+    @pytest.mark.asyncio
+    async def test_mid_batch_switch_to_autonomous_retires_every_row(self):
+        """Trigger (c): the gate for call i returns APPROVED at the top,
+        before the claim block, so nothing ever retires rows i..N."""
+        store = _FakeRowStore()
+        session = _session_with_store(store)
+
+        with (
+            patch.object(pa, "_session", session),
+            patch.object(pa, "_thread_id", "tid"),
+            patch.object(pa, "_announced_permission_rows", {}),
+            patch.object(pa, "_subscribers", {"c1": MagicMock()}),
+            patch.object(pa, "_broadcast", MagicMock()),
+        ):
+            await pa._loop_announce_permission_batch(FOUR_CALLS)
+            session.permission_mode = "autonomous"
+            outcome = await pa._loop_permission_check("web_search", {}, "tc_1")
+
+        assert outcome is PermissionOutcome.APPROVED
+        assert set(store.status.values()) == {"expired"}
+
+    @pytest.mark.asyncio
+    async def test_mid_batch_switch_to_auto_accept_keeps_shell_rows(self):
+        """Trigger (b) — but only for calls the new mode really auto-approves.
+        A shell call still gates under auto_accept, so its announced row must
+        survive for the gate that is about to claim it."""
+        calls = FOUR_CALLS[:2] + [
+            {"name": "run_command", "args": {"cmd": "rm -rf /tmp/x"}, "id": "tc_sh"}
+        ]
+        store = _FakeRowStore()
+        session = _session_with_store(store)
+
+        with (
+            patch.object(pa, "_session", session),
+            patch.object(pa, "_thread_id", "tid"),
+            patch.object(pa, "_announced_permission_rows", {}),
+            patch.object(pa, "_subscribers", {"c1": MagicMock()}),
+            patch.object(pa, "_broadcast", MagicMock()),
+        ):
+            await pa._loop_announce_permission_batch(calls)
+            session.permission_mode = "auto_accept"
+            await pa._loop_permission_check("web_search", {}, "tc_0")
+
+        assert store.status["rid-tc_0"] == "expired"
+        assert store.status["rid-tc_1"] == "expired"
+        assert store.status["rid-tc_sh"] == "pending", (
+            "the shell gate still needs its announced row to claim"
+        )
+
+
+class TestClaimSelectSoftFailKeepsTheAnnouncedRow:
+    """Defect 2, backend half. If the claim SELECT raises, falling through to
+    a second INSERT hands the waiter a NEW approval_id while the card still
+    shows the announced one — the decision then resolves a row nobody is
+    listening on and the turn blocks forever with the card gone. The announce
+    owner already knows the row id in memory; use it."""
+
+    @pytest.mark.asyncio
+    async def test_db_blip_on_claim_select_reuses_the_announced_row(self):
+        store = _FakeRowStore()
+        session = _session_with_store(store)
+        waited = {}
+
+        async def _wait(request_id, *a, **kw):
+            waited["id"] = request_id
+            return "approved"
+
+        with (
+            patch.object(pa, "_session", session),
+            patch.object(pa, "_thread_id", "tid"),
+            patch.object(pa, "_announced_permission_rows", {}),
+            patch.object(pa, "_subscribers", {"c1": MagicMock()}),
+            patch.object(pa, "_broadcast", MagicMock()),
+            patch.object(pa, "_wait_for_permission_resolution", _wait),
+        ):
+            await pa._loop_announce_permission_batch(FOUR_CALLS)
+            store.fetchrow = AsyncMock(side_effect=RuntimeError("connection reset"))
+            insert = AsyncMock(return_value="rid-SECOND")
+            with patch.object(pa, "_insert_permission_request", insert):
+                outcome = await pa._loop_permission_check("web_search", {}, "tc_0")
+
+        insert.assert_not_awaited()
+        assert waited["id"] == "rid-tc_0"
+        assert outcome is PermissionOutcome.APPROVED

@@ -369,10 +369,12 @@ class TurnResult:
     interrupted: bool = False
     error: Optional[str] = None
     metrics: Optional[dict] = None
-    # True when the turn stopped on an unanswered permission gate. The tool
-    # calls are neither run nor refused — the durable pending request resumes
-    # them once the user answers.
-    awaiting_permission: bool = False
+    # NOTE: there is deliberately no `awaiting_permission` flag. A turn that
+    # parks on an unanswered gate just ends — the durable pending row is the
+    # only record, and cleaning it up belongs to whoever announced it
+    # (_retire_announced_permission_rows in the transport). A flag nobody
+    # reads reads as "resumption is wired" to the next maintainer, and it
+    # was not.
     # True when an officer session's sleep tool ended the turn after its tool
     # batch (centurion.md §4). The transport consumes the parked sleep request
     # and files the durable wake with the orchestrator.
@@ -2293,9 +2295,11 @@ async def _execute_turn(
             if outcome is PermissionOutcome.NO_ANSWER:
                 # The gate was never answered (TTL elapsed, or the approval
                 # card never reached the browser). Park the turn: write NO
-                # ToolMessage, leave this call and every call after it
-                # un-run, and let the durable pending row resume the work
-                # when the user actually answers.
+                # ToolMessage and leave this call and every call after it
+                # un-run. Returning is the whole handling — the turn ends
+                # here, and the transport's on_turn_complete retires the
+                # announced rows for the calls we never reached so they
+                # can't resurface as an approval card that runs nothing.
                 logger.info(
                     "Permission gate unanswered for tool %s (%s) — parking turn; "
                     "%d call(s) left ungated",
@@ -2307,7 +2311,6 @@ async def _execute_turn(
                     turn_id=0,
                     messages_added=messages_added,
                     tool_calls_made=tool_calls_made,
-                    awaiting_permission=True,
                 )
 
             # Notify client
