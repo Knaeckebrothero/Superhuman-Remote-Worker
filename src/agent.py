@@ -3100,7 +3100,7 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
         if self._workspace_manager.virtual_overlay is not None:
             sweep_legacy_tools_dir(self._workspace_manager.virtual_overlay.inner)
 
-        # contacts/ is virtual and project-scoped (docs/features/contacts_registry.md).
+        # contacts/ is virtual and project-scoped (docs/done/contacts_registry.md).
         # Only registered when the job has a project — without one, `contacts/`
         # is never reserved and the path falls through to the real filesystem.
         # `os` is already imported at module level (line 17) — a local re-import
