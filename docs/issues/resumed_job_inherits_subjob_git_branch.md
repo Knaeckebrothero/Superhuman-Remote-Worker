@@ -185,16 +185,35 @@ obviously calls, and would have passed against the buggy code.
 
 ## Open — worth its own investigation
 
-**Why was the parent in the critic's workspace at all?** The evidence that it
-was is conclusive (the critic's artifacts and its branch are both in the
-parent's round-2 tree), but the provisioning mechanism that put it there is not
-established here. The code asserts the opposite invariant in two places
-(`evaluation_tools.py:115`, `main.py:19071`), so either subjobs share the
-parent's workspace PVC contrary to that intent, or the parent's resume
-re-attached a workspace the critic had used. `ensure_job_branch` makes the
-parent resilient either way — it now asserts its own branch instead of
-inheriting one — but if the sharing is itself unintended, that is a second
-defect upstream of this one.
+**Why was the parent in the critic's workspace at all? — answered: by design.**
+Subjob workspace sharing is deliberate, not a provisioning accident. A
+verification critic is spawned with the parent's `context.vm` /
+`context.workspace_container` copied verbatim plus an explicit
+`inherits_parent_workspace: True` flag; the dispatch-time resolver gates on that
+flag and overlays the parent's **live** workspace
+(`orchestrator/main.py:4252`, `:4499`; scholars do the same at `:12020`,
+`:12023`). One pod, one filesystem, two agents.
+
+So the two invariant assertions this contradicts (`evaluation_tools.py:115`,
+`main.py:19071`) are wrong about the filesystem — they hold for *branches*, not
+for the working tree, which is exactly the confusion that produced this bug.
+
+That makes this the **second** defect from a single root, and the other one is
+already filed:
+`docs/issues/critic_brief_lands_in_shared_workspace_and_misleads_target.md` —
+the critic's brief is written as `instructions.md` into the same shared root, so
+the target reads it and concludes it is the reviewer. Same mechanism, different
+victim: one inherits the subjob's **branch**, the other inherits its
+**instructions**.
+
+`ensure_job_branch` correctly makes the parent resilient to the branch half. It
+does not address the sharing itself, and a third consequence of the same root is
+likely. **Giving the critic its own workspace, seeded from the parent's
+snapshot, would close all of them at once** — that has been proposed repeatedly
+for unrelated reasons and never decided (see
+`docs/issues/unify_scholar_critic_subjob_provisioning.md`, and the open question
+in `docs/issues/verification_round_reset_spawns_blind_critic.md`). This incident
+is the strongest argument for it so far.
 
 **Secondary, unrelated to the loss above:** in both `finalize_job` branches the
 final `todo_manager.archive("final")` runs *after* `git_mgr.commit()` +
