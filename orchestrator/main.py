@@ -69,7 +69,7 @@ configure_logging(
 from datetime import date, datetime, timedelta, timezone  # noqa: E402
 from decimal import Decimal  # noqa: E402
 from collections.abc import Coroutine, Mapping  # noqa: E402
-from typing import Any, Literal, Optional  # noqa: E402
+from typing import Any, Literal, NamedTuple, Optional  # noqa: E402
 from uuid import UUID, uuid4  # noqa: E402
 
 import asyncpg  # noqa: E402
@@ -281,6 +281,16 @@ from src.core.session_tool_overrides import (  # noqa: E402
     SessionToolOverrideError,
     session_tool_group_enablement,
     validate_session_tool_overrides,
+)
+from src.core.tool_report import (  # noqa: E402
+    ORIGIN_AGENT,
+    ORIGIN_PREDICTION,
+    ToolReportError,
+    categorize_tool_names,
+    compose_tool_view,
+    layer_provenance,
+    read_agent_toolset_report,
+    tool_groups_from_view,
 )
 
 # Tool -> category, for annotating replayed history (_stamp_tool_categories).
@@ -1760,6 +1770,18 @@ async def _resolve_session_config(
         return None
 
 
+#: Budget for the agent toolset probe. The cockpit blocks its settings pane on
+#: this endpoint, so an unreachable pod must degrade to a labelled prediction
+#: quickly rather than stall the pane. Matches the ``/session/status`` probe.
+_AGENT_TOOLSET_TIMEOUT_S = 3.0
+
+#: Agent rows in these states keep a ``pod_ip`` that no longer routes. NOT the
+#: complement of ``session``: an agent is ``ready`` for up to one heartbeat
+#: interval after attach, and skipping the probe there would report a
+#: prediction for the first minute of every session.
+_AGENT_TERMINAL_STATUSES = frozenset({"offline", "failed", "completed"})
+
+
 def _merged_session_tool_groups(
     *,
     base_config_name: str,
@@ -1800,6 +1822,35 @@ def _merged_session_tool_groups(
     row, the project-expert link override, and the request override (which is
     where a live Settings toggle lands, so this stays fresh after a toggle).
     """
+    merged, _provenance = _merged_session_tool_policy(
+        base_config_name=base_config_name,
+        expert_row=expert_row,
+        project_overrides=project_overrides,
+        request_override=request_override,
+    )
+    return session_tool_group_enablement({"tools": merged})
+
+
+def _merged_session_tool_policy(
+    *,
+    base_config_name: str,
+    expert_row: dict[str, Any] | None,
+    project_overrides: dict[str, Any] | None,
+    request_override: dict[str, Any] | None,
+) -> tuple[dict[str, list[str]], dict[str, str]]:
+    """``(merged tools mapping, category -> deciding layer)``.
+
+    SYNCHRONOUS — see :func:`_merged_session_tool_groups`, whose skip ledger
+    this shares because it runs the same resolve.
+
+    This is a *prediction* and is only ever served as one. It cannot see the
+    agent's runtime injection layer or its backend capability gate, so it is
+    structurally weaker than the agent's own report — not merely staler. D6.
+
+    Provenance exploits ``deep_merge``'s list-replacement rule: for
+    ``tools.<category>`` the most specific layer naming the category owns it
+    outright, so "which layer decided it" is the last hit down the chain.
+    """
     capture: dict[str, Any] = {}
     resolve_config(
         base_config_name=base_config_name,
@@ -1810,7 +1861,37 @@ def _merged_session_tool_groups(
         expert_type="session",
         capture=capture,
     )
-    return session_tool_group_enablement(capture.get("merged_fragment") or {})
+    merged_fragment = capture.get("merged_fragment") or {}
+    merged = merged_fragment.get("tools")
+    merged = merged if isinstance(merged, dict) else {}
+
+    base_fragment: dict[str, Any] = {}
+    try:
+        base_path, _ = resolve_config_path(base_config_name)
+        base_fragment = load_and_merge_config(base_path) or {}
+    except Exception:
+        logger.warning(
+            "Tool-group provenance could not load base config '%s'; the base "
+            "layer will read as unset",
+            base_config_name,
+        )
+
+    expert_fragment = (expert_row or {}).get("config") or {}
+    if isinstance(expert_fragment, str):
+        try:
+            expert_fragment = json.loads(expert_fragment)
+        except (json.JSONDecodeError, TypeError):
+            expert_fragment = {}
+
+    provenance = layer_provenance(
+        [
+            ("base", base_fragment),
+            ("expert", expert_fragment),
+            ("project", project_overrides),
+            ("request", request_override),
+        ]
+    )
+    return merged, provenance
 
 
 def _legacy_session_tool_groups(
@@ -1859,6 +1940,168 @@ def _legacy_session_tool_groups(
             canvas_names = ["_unknown_base_assume_enabled"]
     groups["canvas"] = bool(canvas_names)
     return groups
+
+
+def _legacy_session_tool_policy(
+    base_config_name: str,
+    request_override: dict[str, Any] | None,
+) -> tuple[dict[str, list[str]], dict[str, str]]:
+    """``(predicted tools mapping, provenance)`` for the LEGACY agent path.
+
+    SYNCHRONOUS — loads the base YAML. Call via ``asyncio.to_thread``.
+
+    Same prediction status as :func:`_merged_session_tool_policy`, plus the
+    legacy path's own asymmetry: the four closed groups are APPENDED by
+    ``persistent_session._load_tools_for_backend`` whenever no explicit ``[]``
+    disable marker is present, so an unset group is ENABLED here and DISABLED
+    on the resolved path. :func:`_legacy_session_tool_groups` is the pinned
+    statement of that rule; this reuses it rather than restating it.
+    """
+    base_tools: dict[str, Any] = {}
+    try:
+        base_path, _ = resolve_config_path(base_config_name)
+        base_tools = (load_and_merge_config(base_path) or {}).get("tools") or {}
+    except Exception:
+        logger.warning(
+            "Legacy tool-policy probe could not load base config '%s'", base_config_name
+        )
+    override_tools = (request_override or {}).get("tools")
+    override_tools = override_tools if isinstance(override_tools, dict) else {}
+
+    merged: dict[str, list[str]] = {}
+    for key, value in {**base_tools, **override_tools}.items():
+        merged[key] = list(value) if isinstance(value, (list, tuple)) else []
+
+    # The append rule, expressed once: an enabled closed group carries its
+    # canonical names even when the base ships the key empty.
+    for group, enabled in _legacy_session_tool_groups(
+        base_config_name, request_override
+    ).items():
+        if enabled and not merged.get(group):
+            merged[group] = sorted(SESSION_TOOL_OVERRIDE_NAMES[group])
+        elif not enabled:
+            merged[group] = []
+
+    provenance = layer_provenance(
+        [("base", {"tools": base_tools}), ("request", {"tools": override_tools})]
+    )
+    for group in SESSION_TOOL_OVERRIDE_NAMES:
+        provenance.setdefault(group, "runtime")
+    return merged, provenance
+
+
+class _Measurement(NamedTuple):
+    """What a running agent said, or why it could not be asked.
+
+    ``categories`` is ``None`` whenever there is nothing to measure, and
+    ``reason`` then says why in words a caller can show — "we could not measure
+    this" and "the agent has no such tools" are different facts, and conflating
+    them is D1 all over again.
+    """
+
+    categories: dict[str, list[str]] | None
+    observed_at: str | None
+    backend: dict[str, Any] | None
+    reason: str | None
+
+
+def _unmeasured(reason: str) -> "_Measurement":
+    return _Measurement(None, None, None, reason)
+
+
+async def _agent_toolset_measurement(thread: dict[str, Any]) -> "_Measurement":
+    """Ask the bound agent what it ACTUALLY bound.
+
+    This is the D6 seam. The orchestrator does NOT recompute the agent's
+    binding: it asks. Everything that decides the final toolset (the runtime
+    injection layer, ``filter_tools_by_backend``, ``load_tools``'s per-tool
+    fallback) lives in the agent process, and a second implementation of that
+    here would drift — which is the original bug in this series.
+
+    Short timeout and no retry: this backs a settings pane, and a slow answer
+    that is *labelled* a prediction beats a fast pane that stalls on a dead pod.
+    """
+    agent_id = thread.get("agent_id")
+    if not agent_id:
+        return _unmeasured("no agent is attached to this session")
+    try:
+        agent = await postgres_db.get_agent(str(agent_id))
+    except Exception:
+        logger.warning("Toolset probe could not load agent %s", agent_id)
+        return _unmeasured("the bound agent could not be looked up")
+    if not agent or not agent.get("pod_ip"):
+        return _unmeasured("the bound agent has no reachable address")
+    if agent.get("status") in _AGENT_TERMINAL_STATUSES:
+        # A stale binding: the row keeps its pod_ip after the pod is gone, so
+        # probing it burns the whole timeout on the settings pane's critical
+        # path. Observed on k3d — an ended session left `offline` + a pod_ip
+        # that no longer routes.
+        return _unmeasured(f"the bound agent is {agent['status']}")
+
+    url = f"http://{agent['pod_ip']}:{agent.get('pod_port') or 8001}/session/toolset"
+    try:
+        async with httpx.AsyncClient(timeout=_AGENT_TOOLSET_TIMEOUT_S) as client:
+            response = await client.get(url)
+    except Exception as exc:
+        logger.info("Toolset probe to %s failed: %s", url, exc)
+        return _unmeasured("the agent did not answer the toolset probe")
+
+    if response.status_code == 404:
+        # An agent image that predates this route. Its `/status` already
+        # publishes `session.tools`, which is the same measurement with less
+        # structure — categorise it here rather than downgrade to a guess.
+        return await _agent_toolset_from_status(agent)
+    if response.status_code != 200:
+        return _unmeasured(f"the agent answered {response.status_code}")
+
+    try:
+        payload = response.json()
+    except Exception:
+        return _unmeasured("the agent's toolset answer was not JSON")
+    if not payload.get("attached"):
+        return _unmeasured("the agent is not attached to a session")
+    report = payload.get("report") or {}
+    try:
+        categories = read_agent_toolset_report(payload.get("report"))
+    except ToolReportError as exc:
+        logger.warning("Toolset probe returned an unreadable report: %s", exc)
+        return _unmeasured("the agent's toolset report could not be read")
+    backend = report.get("backend")
+    return _Measurement(
+        categories=categories,
+        observed_at=report.get("observed_at"),
+        backend=backend if isinstance(backend, dict) else None,
+        reason=None,
+    )
+
+
+async def _agent_toolset_from_status(agent: dict[str, Any]) -> "_Measurement":
+    """Fallback measurement for an agent image without ``/session/toolset``.
+
+    Still the agent's own answer — ``/status`` returns ``[t.name for t in
+    _session.tools]`` — so this stays a measurement, not a prediction. The one
+    loss is MCP tools: they are registered into the AGENT's process registry at
+    attach, so categorising a flat name list here files them under
+    ``unclassified`` instead of ``mcp``.
+    """
+    url = f"http://{agent['pod_ip']}:{agent.get('pod_port') or 8001}/status"
+    try:
+        async with httpx.AsyncClient(timeout=_AGENT_TOOLSET_TIMEOUT_S) as client:
+            response = await client.get(url)
+        if response.status_code != 200:
+            return _unmeasured("the agent has no toolset endpoint")
+        names = (response.json() or {}).get("tools")
+    except Exception as exc:
+        logger.info("Toolset /status fallback to %s failed: %s", url, exc)
+        return _unmeasured("the agent has no toolset endpoint")
+    if not isinstance(names, list):
+        return _unmeasured("the agent has no toolset endpoint")
+    return _Measurement(
+        categories=categorize_tool_names([n for n in names if isinstance(n, str)]),
+        observed_at=None,
+        backend=None,
+        reason=None,
+    )
 
 
 async def _session_grant_violations(thread: dict[str, Any]) -> list[str]:
@@ -23979,28 +24222,71 @@ async def get_thread(thread_id: str, request: Request) -> dict[str, Any]:
     return result
 
 
+async def _session_tool_grants(thread: dict[str, Any]) -> dict[str, Any] | None:
+    """The owner's capability grants, for explaining an ``unavailable``.
+
+    ``None`` means "impose no grant-based restriction" — both for an admin
+    (``_resolve_runner_grants`` returns ``None``) and for a lookup failure. A
+    read surface must never INVENT a denial: the PDP at attach and dispatch is
+    the enforcement, this is only the explanation, and a fabricated
+    "unavailable — needs the shell_tools grant" is its own D1 violation.
+    """
+    try:
+        project_ids = [str(thread["project_id"])] if thread.get("project_id") else []
+        return await _resolve_runner_grants(
+            runner_user_id=str(thread.get("user_id"))
+            if thread.get("user_id")
+            else None,
+            project_ids=project_ids,
+        )
+    except Exception:
+        logger.warning(
+            "Tool-group grant lookup failed for thread %s; reporting no "
+            "grant-based restrictions",
+            thread.get("id"),
+        )
+        return None
+
+
 @app.get("/api/persistent/threads/{thread_id}/tool-groups")
 async def get_thread_tool_groups(thread_id: str, request: Request) -> dict[str, Any]:
-    """Resolved enablement of the four closed session tool groups (auth: owner).
+    """What toolset does this session's agent actually have? (auth: owner)
 
-    The Cockpit Settings→Tools checkboxes render from this. They cannot be
-    derived from the thread's ``config_override`` alone: an unset group resolves
-    to ``session_base``'s ``[]`` — i.e. DISABLED — so guessing "absent means on"
-    shows a ticked Fleet Management box for a session whose agent has no fleet
-    tools at all. That is exactly the bug this endpoint closes.
+    D6: **the answer comes from the agent.** The orchestrator asks the bound
+    pod what it bound and serves that; it does not recompute it. Only the agent
+    sees the runtime injection layer (``persistent_session._load_tools_for_backend``
+    appends the session-task trio, the product guide, the fleet/catalog/workflow
+    lists, ``srw_cloud_status``, the officer pair, the datasource categories),
+    ``filter_tools_by_backend``, and ``load_tools``'s per-tool fallback. A
+    config-only view over-reports by dozens of names, and the divergence
+    between two implementations of one fact is the original bug here.
+
+    ``origin`` is the field that matters, and callers MUST branch on it:
+
+    - ``agent`` — **measured**. A running pod enumerated its bound tools.
+      ``observed_at`` is set.
+    - ``prediction`` — **forecast** from the merged config, because there is no
+      agent to ask (a new session, a suspended one, an unreachable pod).
+      ``prediction_reason`` says which. Structurally weaker, not merely older:
+      it cannot see the three layers listed above. Rendering it as fact is D1
+      violated at a new seam.
+
+    ``categories`` answers for ALL of them (25, ``mcp`` included), each with
+    ``state`` (``on``/``off``/``unavailable``), ``reason`` when not settable,
+    ``settable``, ``decided_by`` (the layer that produced the answer) and
+    ``tools``. Measured entries also carry ``configured``, so a caller can see
+    the merge and the measurement disagree instead of having to trust one.
+
+    ``source`` is unchanged and still describes the PREDICTION's model —
+    ``resolved`` / ``legacy`` / ``error``. It says nothing about ``origin``:
+    a measured answer is a measured answer whichever path the config took.
+
+    ``tool_groups`` (the four closed groups, booleans) is retained for the
+    cockpit and is now DERIVED from ``categories`` rather than computed beside
+    it, so the endpoint cannot disagree with itself.
 
     Deliberately NOT a field on ``GET /api/persistent/threads/{id}``: that
-    endpoint is hot (every pane open, every thread load, the list view's
-    sibling) and this answer costs a config resolve.
-
-    ``source`` tells the caller which agent path the answer models:
-
-    - ``resolved`` — the orchestrator-resolved blob the agent hydrates.
-    - ``legacy`` — experts off, so the agent takes the ``config_name`` +
-      ``config_override`` fallback, where an unset group is ENABLED.
-    - ``error`` — the resolve failed, so ``tool_groups`` is ``None``. Honest by
-      construction: a resolve error REFUSES the attach (fail closed) rather
-      than downgrading to legacy, so there is no agent answer to report.
+    endpoint is hot and this answer costs a config resolve plus a pod probe.
     """
     user, thread = await require_thread_owner(request, postgres_db, thread_id)
     metadata = thread.get("metadata") or {}
@@ -24016,38 +24302,172 @@ async def get_thread_tool_groups(thread_id: str, request: Request) -> dict[str, 
         # Sentinel / cockpit-conflated expert UUID → the real session base.
         base = "session_base"
 
+    m = await _agent_toolset_measurement(thread)
+    grants = await _session_tool_grants(thread)
+
+    source = "resolved"
+    configured: dict[str, Any] = {}
+    provenance: dict[str, str] = {}
+
     if not _is_experts_db_enabled() or not await _user_experts_enabled():
-        groups = await asyncio.to_thread(
-            _legacy_session_tool_groups, base, request_override
+        source = "legacy"
+        configured, provenance = await asyncio.to_thread(
+            _legacy_session_tool_policy, base, request_override
         )
-        return {"thread_id": thread_id, "source": "legacy", "tool_groups": groups}
+    else:
+        try:
+            expert_id = metadata.get("expert_id")
+            expert_row = (
+                await postgres_db.get_expert_by_id(str(expert_id))
+                if expert_id
+                else None
+            )
+            project_id = str(thread["project_id"]) if thread.get("project_id") else None
+            project_overrides = None
+            if project_id and expert_id:
+                link = await postgres_db.get_project_expert_link(
+                    project_id=project_id, expert_id=str(expert_id)
+                )
+                if link:
+                    project_overrides = link.get("config_override") or None
+                    if isinstance(project_overrides, str):
+                        project_overrides = json.loads(project_overrides)
+            configured, provenance = await asyncio.to_thread(
+                _merged_session_tool_policy,
+                base_config_name=base,
+                expert_row=expert_row,
+                project_overrides=project_overrides,
+                request_override=request_override,
+            )
+        except Exception:
+            logger.exception("Tool-group resolve failed for thread %s", thread_id)
+            source = "error"
+            if m.categories is None:
+                # No measurement AND no resolve: there is nothing honest to
+                # report. A resolve error REFUSES the attach (fail closed), so
+                # there is no agent answer either.
+                return {
+                    "thread_id": thread_id,
+                    "source": "error",
+                    "origin": ORIGIN_PREDICTION,
+                    "observed_at": None,
+                    "prediction_reason": m.reason,
+                    "backend": None,
+                    "tool_groups": None,
+                    "categories": None,
+                }
+
+    # Only a MEASURED answer carries backend capabilities: they come from the
+    # agent's own report. A prediction has no provisioned workspace to inspect,
+    # which is one of the three reasons it over-reports (the live gate saw it
+    # over-report by 14 execution tools on a no-shell tier).
+    view = compose_tool_view(
+        measured=m.categories,
+        configured=configured,
+        provenance=provenance,
+        backend_caps=m.backend,
+        grants=grants,
+    )
+    measured_ok = m.categories is not None
+    return {
+        "thread_id": thread_id,
+        "source": source,
+        "origin": ORIGIN_AGENT if measured_ok else ORIGIN_PREDICTION,
+        "observed_at": m.observed_at,
+        "prediction_reason": None if measured_ok else m.reason,
+        "backend": m.backend,
+        "tool_groups": tool_groups_from_view(view),
+        "categories": view,
+    }
+
+
+class ToolGroupPreviewRequest(BaseModel):
+    """What would a session created with THIS config bind? (a prediction)"""
+
+    config_name: Optional[str] = None
+    expert_id: Optional[str] = None
+    project_id: Optional[str] = None
+    config_override: Optional[dict[str, Any]] = None
+
+
+@app.post("/api/persistent/tool-groups/preview")
+async def preview_tool_groups(
+    body: ToolGroupPreviewRequest, request: Request
+) -> dict[str, Any]:
+    """The New Session form's read. **Always a prediction, by construction.**
+
+    There is no agent yet, so this endpoint can never return ``origin:
+    "agent"`` — and that is the point of it being a separate route rather than
+    a mode of the thread endpoint. D6's consequence is that the creation form
+    forecasts while the live pane measures; making the difference structural
+    (two routes, one of which cannot ever say "measured") is cheaper to keep
+    honest than a flag someone forgets to read.
+
+    Same ``categories`` shape as the thread endpoint, so one renderer serves
+    both surfaces.
+    """
+    user = await require_approved_user(request, postgres_db)
+    base = canonical_config_name(body.config_name or "session_base")
+    if _looks_like_uuid(base):
+        base = "session_base"
+
+    expert_row = None
+    project_overrides = None
+    try:
+        if body.expert_id:
+            expert_row = await postgres_db.get_expert_by_id(str(body.expert_id))
+            if body.project_id:
+                link = await postgres_db.get_project_expert_link(
+                    project_id=str(body.project_id), expert_id=str(body.expert_id)
+                )
+                if link:
+                    project_overrides = link.get("config_override") or None
+                    if isinstance(project_overrides, str):
+                        project_overrides = json.loads(project_overrides)
+    except Exception:
+        logger.warning("Tool-group preview could not load the expert/project layer")
 
     try:
-        expert_id = metadata.get("expert_id")
-        expert_row = (
-            await postgres_db.get_expert_by_id(str(expert_id)) if expert_id else None
-        )
-        project_id = str(thread["project_id"]) if thread.get("project_id") else None
-        project_overrides = None
-        if project_id and expert_id:
-            link = await postgres_db.get_project_expert_link(
-                project_id=project_id, expert_id=str(expert_id)
-            )
-            if link:
-                project_overrides = link.get("config_override") or None
-                if isinstance(project_overrides, str):
-                    project_overrides = json.loads(project_overrides)
-        groups = await asyncio.to_thread(
-            _merged_session_tool_groups,
+        configured, provenance = await asyncio.to_thread(
+            _merged_session_tool_policy,
             base_config_name=base,
             expert_row=expert_row,
             project_overrides=project_overrides,
-            request_override=request_override,
+            request_override=body.config_override or None,
         )
     except Exception:
-        logger.exception("Tool-group resolve failed for thread %s", thread_id)
-        return {"thread_id": thread_id, "source": "error", "tool_groups": None}
-    return {"thread_id": thread_id, "source": "resolved", "tool_groups": groups}
+        logger.exception("Tool-group preview resolve failed")
+        raise HTTPException(
+            status_code=422,
+            detail="This configuration cannot be resolved, so its toolset "
+            "cannot be predicted.",
+        )
+
+    try:
+        grants = await _resolve_runner_grants(
+            runner_user_id=str(user["id"]),
+            project_ids=[str(body.project_id)] if body.project_id else [],
+        )
+    except Exception:
+        logger.warning("Tool-group preview grant lookup failed")
+        grants = None
+
+    view = compose_tool_view(
+        measured=None,
+        configured=configured,
+        provenance=provenance,
+        backend_caps=None,
+        grants=grants,
+    )
+    return {
+        "source": "resolved",
+        "origin": ORIGIN_PREDICTION,
+        "observed_at": None,
+        "prediction_reason": "no agent exists for an unsaved session",
+        "backend": None,
+        "tool_groups": tool_groups_from_view(view),
+        "categories": view,
+    }
 
 
 @app.patch("/api/persistent/threads/{thread_id}")

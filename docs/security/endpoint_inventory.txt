@@ -257,6 +257,7 @@ POST   /api/persistent/threads/{thread_id}/tts                                  
 POST   /api/persistent/threads/{thread_id}/tts/plan                                     gated:require_thread_owner
 POST   /api/persistent/threads/{thread_id}/tts/plan/stream                              gated:require_thread_owner
 POST   /api/persistent/threads/{thread_id}/uploads                                      gated:require_thread_owner
+POST   /api/persistent/tool-groups/preview                                              gated:require_approved_user
 GET    /api/projects                                                                    gated:require_approved_user
 POST   /api/projects                                                                    gated:require_approved_user
 DELETE /api/projects/{project_id}                                                       gated:require_project_owner

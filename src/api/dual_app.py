@@ -1379,6 +1379,20 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
             }
         )
 
+    @app.get("/session/toolset", tags=["Session"])
+    async def session_toolset() -> JSONResponse:
+        """Same measured toolset read as the dedicated-session app.
+
+        Registered on BOTH apps deliberately. ``/session/status`` exists only
+        here, so ``_thread_turn_in_flight`` 404s against every dedicated
+        session pod (they run ``--mode persistent``) — a live bug this route
+        must not reproduce, since a pool-attached session that answered 404
+        would silently downgrade the orchestrator to a prediction.
+        """
+        import src.api.persistent_app as pa
+
+        return JSONResponse(pa._session_toolset_report())
+
     @app.post("/session/detach", tags=["Session"])
     async def session_detach() -> JSONResponse:
         global _pod_state
