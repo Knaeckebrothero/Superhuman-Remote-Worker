@@ -831,7 +831,7 @@ is what the author would want:
 | `developer` | `core` | `{except: [todo_list]}` — 5/9, one genuine omission on top of the 3 |
 | `designer`, `designer-interactive`, `scholar` | `workspace` | `{except: [delete_directory, rename_file, use_skill]}` |
 | `developer` | `git` | `{except: [git_show]}` |
-| `bughunter` | `shell` | `true` after step A — its only omission is `srw_cloud_status` |
+| `bughunter` | `shell` | `{except: [srw_cloud_status]}` — **not** `true`; see the mode-alias rule below |
 | `critic`, `developer`, `scholar` | `delegation` | `{only: [spawn_subagent]}` until the `delegate_work` decision lands |
 
 **Keep as `only`** — genuine per-persona narrowing, frozen deliberately:
@@ -856,10 +856,27 @@ is what the author would want:
 > it as a review-specific posture — it may itself be a copied snapshot. Flag it for
 > a human decision rather than encoding it as intent.
 
-**Never migrate `shell` to `true`.** `run_command` and `shell_execute` are a mode
-alias pair: `get_all_tool_names` (`src/core/loader.py:4507-4510`) rewrites one to
-the other based on `extra.shell.mode`. That is why `shell_execute` is omitted 7/8
-— naming both is redundant at best. `shell` stays `only` or `except`.
+**Never let `shell` auto-track the registry.** `shell` must always enumerate
+explicitly — `only`, or `except` with a non-empty exclusion. `true` is refused
+by the normaliser, and so is `{except: []}`, which would otherwise spell `true`
+by another route.
+
+> **Rationale corrected 2026-08-02, twice.** The original reason given here was
+> the `run_command` / `shell_execute` mode-alias pair, which
+> `get_all_tool_names` (`src/core/loader.py:4507-4510`) rewrites based on
+> `extra.shell.mode`. That reason does not survive contact: `bughunter` already
+> names both halves today, and `expand_true("shell")` is byte-identical to what
+> it already grants — so `true` would have been pure identity for the one config
+> the migration table proposed it for. A first correction swapped that row to
+> `{except: [srw_cloud_status]}`, which expands to the *same four names* and
+> therefore fixed nothing.
+>
+> The real reason is auto-tracking. `true` means "this category, and whatever
+> is added to it later". For a code-execution category that is the wrong
+> default: a tool added to `shell` in the registry would silently land in every
+> config that said `true`, with no diff to review anywhere. Explicit
+> enumeration forces a titled commit. The alias-pair behaviour is real but
+> orthogonal — it makes naming both halves redundant, not dangerous.
 
 ### The 80 empty declarations — two kinds, two different fixes
 
@@ -906,8 +923,20 @@ three-way agreement test. **No config file changes.** The commit-1 snapshot must
 not move — that is the acceptance criterion.
 
 **Commit 3 — `grant: "code"` + `gate:` classification** for the 38 code-only
-tools, plus a test that no config names one and a test that the 19 legacy-shim
-tools are *not* marked. Makes `true` behaviour-preserving for `core` and `shell`.
+tools, plus a test that no config names one and a test that the unmarked set is
+*not* marked. Makes `true` behaviour-preserving for `core` and `shell`.
+
+> **Corrected 2026-08-02, after implementation.** The count "19" was right but
+> its description was not: the must-not-mark set is **29**, and the legacy shim
+> itself appends **26** names. The 19 decomposes as 16 shim names (the other 10
+> being named by `config/experts/centurion`) plus `approve_job`,
+> `return_job_with_feedback` and `loop_plan`. Implemented as a tri-state
+> `grant` (`"code"` / `"explicit"` / absent) rather than the `gate:` marker
+> proposed here — `gate:` already carries a descriptive-string role at
+> §"Step A", so overloading it as a boolean predicate would recreate the very
+> conflation this document exists to remove. `gate:` stays descriptive on every
+> classified entry. See `src/tools/orchestrator/jobs.py` and
+> `tests/test_tool_grant_classification.py`.
 
 **Commit 4a — the 80 empty declarations.** `[]` → `false` for the 15 policy
 categories; **delete the key** for the 11 machine-owned connector categories.
