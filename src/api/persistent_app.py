@@ -379,6 +379,49 @@ def _turn_in_flight() -> bool:
     return _loop_task is not None and not _loop_task.done() and not _awaiting_input
 
 
+def _session_toolset_report() -> dict:
+    """The toolset this session ACTUALLY bound, for the orchestrator to serve.
+
+    D6 (``docs/issues/tool_configuration_defects_and_fix_roadmap.md``): the
+    resolved answer comes from the agent, not from an orchestrator-side
+    re-implementation.  Everything that decides the final set happens HERE and
+    only here — the runtime injection layer (``_load_tools_for_backend``
+    appends the session-task trio, the product guide, the fleet/catalog/
+    workflow lists, ``srw_cloud_status``, the officer pair, …),
+    ``filter_tools_by_backend``, and ``load_tools``'s per-tool instantiation
+    fallback.  A view rebuilt from YAML over-reports by dozens of names.
+
+    Read off the live tool objects rather than any name list, because
+    ``apply_description_overrides`` / ``apply_instruction_enforcement`` rebind
+    ``self.tools`` and the never-bind-zero floor can replace it outright.  What
+    the model is offered is the only thing worth reporting.
+
+    ``attached`` is false when no session is bound: an honest "nothing to
+    measure" beats a confident empty toolset.
+    """
+    from src.core.tool_report import build_agent_toolset_report
+
+    session = _session
+    if session is None:
+        return {
+            "attached": False,
+            "thread_id": _thread_id,
+            "report": None,
+        }
+    names = [
+        tool.name
+        for tool in (session.tools or [])
+        if isinstance(getattr(tool, "name", None), str)
+    ]
+    backend = getattr(getattr(session, "workspace_manager", None), "backend", None)
+    report = build_agent_toolset_report(
+        thread_id=getattr(session, "thread_id", None) or _thread_id,
+        tool_names=names,
+        backend=backend,
+    )
+    return {"attached": True, "thread_id": report["thread_id"], "report": report}
+
+
 def _app_guide_health() -> dict[str, str]:
     """Return bounded product-guide delivery health for agent diagnostics."""
 
@@ -2434,6 +2477,16 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
                 "app_guide": _app_guide_health(),
             }
         )
+
+    @app.get("/session/toolset")
+    async def session_toolset():
+        """The bound toolset, measured. Backs the orchestrator's tool-groups read.
+
+        In-cluster only and unauthenticated, matching every other control route
+        on this app — the orchestrator reaches it by pod IP and the ingress does
+        not expose it. It leaks no config values, only tool names.
+        """
+        return JSONResponse(_session_toolset_report())
 
     # --- Session attach/detach (pool mode) ---
 

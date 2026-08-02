@@ -369,7 +369,7 @@ class TestFailureModes:
             patch("main._is_experts_db_enabled", MagicMock(return_value=True)),
             patch("main._user_experts_enabled", AsyncMock(return_value=True)),
             patch(
-                "main._merged_session_tool_groups",
+                "main._merged_session_tool_policy",
                 MagicMock(side_effect=RuntimeError("boom")),
             ),
         ):
@@ -385,7 +385,7 @@ class TestFailureModes:
         sentinel = MagicMock(side_effect=AssertionError("called past gate"))
         with (
             _patch_caller_and_db(user_b, fake_db),
-            patch("main._merged_session_tool_groups", sentinel),
+            patch("main._merged_session_tool_policy", sentinel),
         ):
             with pytest.raises(HTTPException) as exc:
                 await get_thread_tool_groups(str(_thread()["id"]), fake_request)
@@ -404,7 +404,7 @@ class TestFailureModes:
         sentinel = MagicMock(side_effect=AssertionError("called past gate"))
         with (
             _patch_caller_and_db(user_a, fake_db),
-            patch("main._merged_session_tool_groups", sentinel),
+            patch("main._merged_session_tool_policy", sentinel),
         ):
             with pytest.raises(HTTPException) as exc:
                 await get_thread_tool_groups(orphan_id, fake_request)
