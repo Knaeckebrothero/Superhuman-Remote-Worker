@@ -112,6 +112,21 @@ class GitManager:
             return self._backend.exists(git_path)
         return (self._workspace_path / ".git").exists()
 
+    def _inactive_reason(self) -> str:
+        """Explain why :attr:`is_active` is False, for diagnostic logging.
+
+        Mirrors the branches in ``is_active``. Kept separate so the hot path
+        stays a plain boolean and only failures pay for the string.
+        """
+        if not self._git_available:
+            return "git binary unavailable"
+        if self._use_backend:
+            git_path = (
+                posixpath.join(self._remote_cwd, ".git") if self._remote_cwd else ".git"
+            )
+            return f"no {git_path} on the workspace backend"
+        return f"no .git at {self._workspace_path}"
+
     @property
     def workspace_path(self) -> Path:
         """Get the workspace path."""
@@ -785,7 +800,12 @@ class GitManager:
     ) -> bool:
         """Push commits and optionally tags to remote.
 
-        Gracefully returns False if no remote is configured.
+        Gracefully returns False if git is inactive or no remote is configured.
+        Both of those are *logged at WARNING* — they used to return silently,
+        which is how job bbce4bed lost a deliverable: every phase-boundary push
+        returned False across 8 phases and left no trace anywhere, because five
+        of the six call sites also discard the return value. See
+        docs/issues/deliverable_lost_to_nested_repo_commit_and_stranded_mode_a_job.md.
 
         Args:
             remote: Remote name (default: "origin")
@@ -795,7 +815,14 @@ class GitManager:
         Returns:
             True if push succeeded, False otherwise
         """
-        if not self.is_active or not self.has_remote(remote):
+        if not self.is_active:
+            logger.warning(f"push skipped — git not active: {self._inactive_reason()}")
+            return False
+        if not self.has_remote(remote):
+            logger.warning(
+                f"push skipped — no '{remote}' remote configured "
+                f"(at {self._remote_cwd or self._workspace_path})"
+            )
             return False
 
         try:

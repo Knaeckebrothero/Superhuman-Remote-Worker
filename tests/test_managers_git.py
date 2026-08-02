@@ -3,6 +3,7 @@
 Tests git versioning functionality for agent workspaces.
 """
 
+import logging
 import shutil
 import subprocess
 import sys
@@ -98,6 +99,62 @@ class TestHasUnpushedCommits:
     def test_false_when_inactive(self, git_manager):
         """Uninitialized repo → False (no crash)."""
         assert git_manager.has_unpushed_commits() is False
+
+
+class TestPushSkipLogging:
+    """push() must say why it declined.
+
+    Regression guard for the defect behind job bbce4bed: both early returns
+    used to be silent, and five of the six call sites discard the return
+    value, so a job could fail to push across every phase boundary and leave
+    no trace in any log.
+    """
+
+    def test_inactive_repo_logs_reason(self, git_manager, caplog):
+        """No .git → WARNING naming the path that was checked."""
+        with caplog.at_level(logging.WARNING, logger="src.managers.git_manager"):
+            assert git_manager.push() is False
+        assert any(
+            "git not active" in r.message and ".git" in r.message
+            for r in caplog.records
+        ), caplog.text
+
+    def test_missing_remote_logs_reason(self, initialized_git, caplog):
+        """Active repo but no remote → WARNING naming the remote."""
+        with caplog.at_level(logging.WARNING, logger="src.managers.git_manager"):
+            assert initialized_git.push() is False
+        assert any("no 'origin' remote" in r.message for r in caplog.records), (
+            caplog.text
+        )
+
+    def test_missing_remote_names_the_requested_remote(self, initialized_git, caplog):
+        """A non-default remote name appears verbatim, not hardcoded 'origin'."""
+        with caplog.at_level(logging.WARNING, logger="src.managers.git_manager"):
+            assert initialized_git.push(remote="upstream") is False
+        assert any("no 'upstream' remote" in r.message for r in caplog.records), (
+            caplog.text
+        )
+
+    def test_successful_push_logs_no_skip_warning(
+        self, initialized_git, bare_remote, caplog
+    ):
+        """Happy path stays quiet — the new logging must not become noise."""
+        initialized_git.add_remote("origin", str(bare_remote))
+        with caplog.at_level(logging.WARNING, logger="src.managers.git_manager"):
+            assert initialized_git.push() is True
+        assert not any("push skipped" in r.message for r in caplog.records), caplog.text
+
+    def test_git_unavailable_is_distinguished_from_missing_repo(
+        self, temp_workspace, caplog
+    ):
+        """A missing git binary reports as such, not as a missing .git."""
+        with patch("shutil.which", return_value=None):
+            gm = GitManager(temp_workspace)
+            with caplog.at_level(logging.WARNING, logger="src.managers.git_manager"):
+                assert gm.push() is False
+        assert any("git binary unavailable" in r.message for r in caplog.records), (
+            caplog.text
+        )
 
 
 class TestGitManagerInit:
