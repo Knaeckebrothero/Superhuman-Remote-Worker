@@ -362,6 +362,78 @@ describe('ModelGroupComponent', () => {
     });
   });
 
+  describe('reasoning reset notice (Task 3 fix)', () => {
+    // The reset itself is correct and stays (decided, not open — reasoning
+    // vocabularies are per-family and don't translate). What was missing is
+    // any sign it happened: the select just snaps back to the family default,
+    // which looks identical to having never picked anything.
+    it('starts false and does not fire when there was nothing to lose', () => {
+      const {component} = createComponent();
+      expect(component.reasoningResetNotice()).toBe(false);
+
+      component.onSessionModelChange('gemma-4-moe');
+      expect(component.reasoningResetNotice()).toBe(false);
+
+      component.prefillFromConfig({});
+      expect(component.reasoningResetNotice()).toBe(false);
+    });
+
+    it('fires when a session model change clears an existing pick', () => {
+      const {component} = createComponent();
+      component.onSessionReasoningChange('high');
+      component.onSessionModelChange('gemma-4-moe');
+      expect(component.sessionReasoning()).toBeNull();
+      expect(component.reasoningResetNotice()).toBe(true);
+    });
+
+    it('fires when a config prefill clears an existing pick — not only on a deliberate expert switch', () => {
+      const {component} = createComponent();
+      component.onSessionReasoningChange('low');
+      // No model change, no expert-card click modeled here — prefillFromConfig
+      // is the same method SessionCreateComponent's applyEffectiveDefault()
+      // invokes automatically once an in-flight default-expert lookup
+      // resolves (see session-create.component.spec.ts). This asserts the
+      // sink's behavior in isolation from that trigger.
+      component.prefillFromConfig({});
+      expect(component.sessionReasoning()).toBeNull();
+      expect(component.reasoningResetNotice()).toBe(true);
+    });
+
+    it('is dismissed by the next deliberate reasoning pick', () => {
+      const {component} = createComponent();
+      component.onSessionReasoningChange('high');
+      component.onSessionModelChange('gemma-4-moe'); // clears + raises the notice
+      expect(component.reasoningResetNotice()).toBe(true);
+
+      component.onSessionReasoningChange('on');
+      expect(component.reasoningResetNotice()).toBe(false);
+    });
+
+    it('is dismissed by re-confirming the shown default via pinReasoning', () => {
+      const {component} = createComponent();
+      component.sessionModel.set('gemma-4-moe');
+      component.onSessionReasoningChange('off');
+      component.onSessionModelChange('gemma-4-moe'); // clears 'off' back to null, raises the notice
+      expect(component.reasoningResetNotice()).toBe(true);
+
+      component.pinReasoning();
+      expect(component.reasoningResetNotice()).toBe(false);
+      // pinReasoning also does what pinValue always does: promotes the shown
+      // resolved default into an explicit pin.
+      expect(component.sessionReasoning()).toBe(component.resolvedSessionReasoning());
+    });
+
+    it('is cleared by resetAll', () => {
+      const {component} = createComponent();
+      component.onSessionReasoningChange('high');
+      component.onSessionModelChange('gemma-4-moe');
+      expect(component.reasoningResetNotice()).toBe(true);
+
+      component.resetAll();
+      expect(component.reasoningResetNotice()).toBe(false);
+    });
+  });
+
   describe('subagent (delegation reader) model', () => {
     it('starts null and is counted in job-mode modifiedCount', () => {
       const {component} = createComponent();
