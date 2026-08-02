@@ -1,0 +1,412 @@
+---
+tags:
+  - issue
+  - roadmap
+  - cockpit
+  - orchestrator
+  - sessions
+  - config-resolution
+related:
+  - "[[session_create_tool_toggles_cannot_enable_a_group]]"
+  - "[[registered_tools_no_config_can_grant]]"
+  - "[[session_uploads_never_extract_archives]]"
+  - "[[tool_config_policy_vs_membership]]"
+  - "[[session_tool_group_checkbox_disagrees_with_the_agent]]"
+---
+
+# Tool configuration — consolidated defect register and fix roadmap
+
+**Status:** OPEN, diagnosed 2026-08-01/02. Nothing implemented.
+**Owner:** unassigned.
+**Purpose:** single entry point for the nine defects found in one investigation.
+The detail lives in the three linked docs; this one exists so the work can be
+sequenced and picked up without reading all four.
+
+## Motivating incident
+
+Dev session `1930dec9-181d-4fd5-a030-90b3d0b363d6`, 2026-08-01. A user attached a
+`.zip` and asked the agent to work on the letter inside it. The agent could not
+open the archive, fell back to asking for shell, and had none. It then advised
+the user to switch the workspace to "Container" and enable shell tools at
+session creation — advice that could not work, since `sandbox` *is* the
+container tier and the Shell checkbox cannot grant anything.
+
+The user's response — *"I know I've used live persistent sessions with shell
+tools"* — was correct and was the key to the whole investigation. Sessions had
+shell by default for four months. It was removed eleven days earlier by a commit
+titled a chore, whose body states "No functional changes introduced."
+
+Everything below was found pulling that thread.
+
+## Defect register
+
+| # | Defect | Sev | Detail in |
+|---|---|---|---|
+| 1 | `57430a2a` (2026-07-22) silently removed `tools.shell` from the session base. **Not to be reverted** — see Decisions; off-by-default is now the intended state. The defect is that it happened silently and left no way to turn shell back on. | medium | [[session_create_tool_toggles_cannot_enable_a_group]] |
+| 2 | Unticking 8 of the 12 tool categories on the New Session form is silently discarded server-side — **fails open**. The user is shown a restriction that was never applied. | **high** | ↑ same |
+| 3 | No tool group can be *enabled* from the New Session form; the re-enable branch reads member names from the layer it is overriding, which is `[]`. | medium-high | ↑ same |
+| 4 | A Reasoning selection is discarded on model/expert change **with no feedback**. The discard itself is correct and must stay — see the note below. | low | ↑ same, Part 3 |
+| 5 | Ten registered tools have no reachable grant path; five curation prompts unconditionally order the curator to call two of them (`kb_lint`, `kb_index`) with no `has_tool` guard. | medium | [[registered_tools_no_config_can_grant]] |
+| 6 | `product_help` and `session_task` are registry categories with no `ToolsConfig` field, so naming them in YAML is silently discarded. | low | ↑ same, §5 |
+| 7 | Session uploads never extract archives (the worker path does), and `read_file` reports any binary as a raw UTF-8 codec error. | medium | [[session_uploads_never_extract_archives]] |
+| 8 | The **job**-create path has no tool allowlist at all — the smuggling scenario `session_tool_overrides.py` exists to prevent is open on the job surface, with only the dispatch PDP behind it. | **security, triage** | [[tool_config_policy_vs_membership]] §open items |
+| 9 | `_validate_expert_fragment` deny-scans credentials but not tool names, so a hand-authored expert may be able to name a `*_bundle` write tool and pass the session gate. **Reasoned from code, not exercised.** | **security, triage** | [[registered_tools_no_config_can_grant]] §3c |
+
+## The common cause
+
+Defects 1–6 are all downstream of one representational choice: `tools.<category>`
+is a list of tool names, and that single field carries both **membership** (which
+tools) and **policy** (whether the group is on). All 24 registry categories have
+at least one tool, so no group is ever legitimately empty — every `[]` in every
+config is purely a disable marker.
+
+That overload has three consequences, and each produced defects above:
+
+- **"Off" is self-describing; "on" is not.** Disabling needs no information;
+  enabling needs the full member list, which the code looks for in the layer it
+  is overriding. → defect 3.
+- **Name lists cannot track the registry.** A tool added to an existing category
+  reaches no existing config. → defects 5 and 6.
+- **Configs are unreadable as documentation.** `shell: []` looks like a statement
+  about shell's contents; it is a policy flag on a group of 5 tools. That is how
+  a diff removing a capability read as tidying a list. → defect 1.
+
+Two structural findings sit underneath, both worth knowing before touching any of
+this:
+
+**There is a tool-grant layer written in Python, not YAML.** `sleep`,
+`notify_user`, the `task_*` tools, `read_product_guide`, all 28 datasource tool
+names, `approve_job`/`return_job_with_feedback` and `loop_plan` are injected at
+runtime by code that appears in no config file
+(`src/api/persistent_session.py:1408-1557`, `src/agent.py:3066-3068`,
+`datasource_tool_categories`, `orchestrator/main.py:12961`,
+`project_loops.py:898`). A YAML-only audit over-reports unreachable tools by 67.
+Any design that treats YAML as the grant surface is wrong.
+
+**Nothing can answer "what config did this agent actually get?"** Every
+conclusion in this investigation came from reading files and inferring; the only
+ground truth available was a line in a pod log (`Loaded 65 tools for persistent
+session`). This is the real reason the system feels unknowable, and it is why
+defect 1 survived eleven days.
+
+## Decisions taken (2026-08-02)
+
+**D1 — Priority 1 is that the UI tells the truth.** Whatever the settings surface
+shows for a tool group must equal what the agent ends up with, in every case.
+This outranks every individual defect below; defects 2, 3 and 6 are all instances
+of it and are fixed as part of it rather than separately.
+
+**D2 — Agents do not get shell by default.** `tools.shell` is *not* restored to
+`config/session_base.yaml`. The 2026-07-22 removal produced the right end state
+by the wrong means. What must change is that the state becomes legible
+(`shell: false`, not `shell: []`) and reversible.
+
+**D3 — Shell must be enablable two ways: from the UI, and via an expert.** The
+expert route already works (`developer` declares its own `tools.shell`). The UI
+route requires `shell` to join the settable vocabulary, which the closed
+allowlist currently prevents. This closes the open product question that earlier
+revisions of this doc left to triage.
+
+**D4 — The `shell_tools` capability grant stays the real gate.** Already enforced
+against the *merged* config at both session attach and job dispatch
+(`_enforce_dispatch_grants`, `orchestrator/main.py:4754`), with an admin bypass.
+So wiring the UI toggle grants nothing to a user who lacks the grant, and the
+`developer` expert is subject to the same check. **Consequence to accept:** a
+non-admin user needs an explicit `shell_tools` grant before *either* route gives
+them shell. If pilot users are expected to self-serve shell, that is a separate
+grant-policy decision, not a config one.
+
+**D5 — The nine tools the registry has and the closed vocabulary does not get
+classified in registry metadata**, as admin-only or never-in-sessions, so `true`
+expands to the safe set *by construction*. Not by a hand-maintained parallel
+list — that is what `SESSION_TOOL_OVERRIDE_NAMES` is today, and its divergence
+from the registry is only visible if you go looking. Gates Phase 1.2.
+
+**D6 — The resolved answer comes from the agent, not from a re-implementation.**
+The agent reports its bound toolset after attach and the API serves that.
+Rebuilding the injection logic orchestrator-side would drift, and drift between
+two implementations of the same fact is the original bug. **Consequence to
+design for:** the creation form has no agent yet, so it can only show a
+*prediction*; the live pane shows *actual*. They must be visibly different in
+the UI — a predicted state presented as fact is D1 violated at a new seam.
+
+**D7 — Three-state controls, not checkboxes:** *on* / *off* / *unavailable with
+a reason*. Two states cannot express the truth D1 requires.
+
+**D8 — `shell_tools` stays admin-granted.** No self-serve for non-admin users
+through either the UI or an expert. Shell is code execution and the existing
+grant already behaves correctly.
+
+**D9 — Grant `kb_index` / `kb_lint` to the curator** rather than guarding the
+five prompts. The tools were built for that job. It is a behaviour change and
+lands as its own commit.
+
+**D10 — The worker base keeps its current (empty) `shell` and `delegation`.**
+Every real expert backfills what it needs; only a job on the bare base is
+affected, and under D2 that is the intended default. Now pinned by the snapshot.
+
+**D11 — The job-create path's missing tool allowlist is a gap, not a design.**
+Close it with the generic validator from Phase 1.2 rather than a second bespoke
+one.
+
+### Triage item 7 — resolved 2026-08-02, and it does not escalate D5
+
+**Question:** can a hand-authored expert name a `*_bundle` write tool and pass
+every gate? **Answer: yes, it passes — but it is not a privilege escalation.**
+
+Verified locally, not against the cluster:
+
+- `capability_grants.evaluate()` returns **no violations** for a user holding
+  zero grants. The gated keys are `shell`, `delegation`, the connector
+  categories, `browser_direct`, models and autonomy — `agent_catalog`,
+  `workflows` and `orchestrator` are not among them
+  (`src/core/capability_grants.py:147-185`).
+- `_validate_expert_fragment` (`orchestrator/main.py:27905`) only deny-scans
+  credential sections.
+- `SESSION_TOOL_OVERRIDE_NAMES` never applies — it validates *request*
+  overrides, not expert configs.
+- The name survives the load: a fragment declaring
+  `tools.agent_catalog: [set_expert_bundle]` resolves with that tool present,
+  and `filter_tools_by_backend` touches only `shell`/`browser_direct`/`git`.
+
+**Why it is nonetheless not an escalation:** the tool acts *as its owner*. It
+calls the orchestrator's own REST API with `_get_client(user_id=context.user_id)`
+(`src/tools/orchestrator/catalog.py:864`), so ownership checks and
+`_enforce_save_grants` still apply — an agent cannot write an expert granting
+shell to a user who lacks the `shell_tools` grant. `dry_run` also defaults to
+`True`. The agent can do what its owner could already do from the cockpit.
+
+**Residual, worth tracking but not urgent:** an agent that can rewrite experts
+can *persist* changes that affect future agents. That is a blast-radius and
+prompt-injection-reach concern, not a cross-user boundary break. It is an
+argument for D5 classifying these as admin-only, which was already the decision.
+
+**Not verified:** that a live session created this way binds and successfully
+executes the tool end to end. The config and validation path is proven; the
+runtime round trip is not.
+
+### What D1 actually requires
+
+"The UI shows the final config" is a stronger requirement than "the checkbox
+matches the override", and it has consequences worth stating before work starts:
+
+- **The read must include every layer, including the ones that are not YAML.**
+  The runtime injection layer (`persistent_session.py:1408-1557` and friends)
+  grants `sleep`, `notify_user`, the datasource categories and more. A resolved
+  view that omits it will show `core: off` while the agent holds two core tools —
+  a new disagreement in place of the old one. Today's `/tool-groups` endpoint is
+  a *lean* resolve with a documented skip ledger and covers 4 of 24 categories;
+  it is the right seam but not yet the right answer.
+- **It must include the gates, not just the merge.** `filter_tools_by_backend`
+  drops `shell`/`browser_direct`/`git` on lite workspace tiers, and the
+  `shell_tools` grant can deny shell outright. Both change the final answer.
+- **Therefore a checkbox is the wrong control.** At minimum three states are
+  needed: *on*, *off*, and *unavailable* with a reason ("needs the shell_tools
+  grant", "not supported on this workspace tier", "granted by the runtime, not
+  configurable"). A two-state checkbox cannot express the truth D1 demands, and
+  forcing it to try is what produced defects 2 and 3.
+- **Both write surfaces must accept the whole vocabulary the UI displays.**
+  Creation and live currently accept a hand-curated four. Anything the UI renders
+  that the boundary silently drops is defect 2 again under a new name.
+
+## Verdict on the bigger question
+
+**Fix the seams; do not rewrite the config system.** The base → expert → project
+→ request → runtime layering is a reasonable shape and caused none of these
+defects. The failures were the `[]` overload, enablement logic computed in
+several places with one path answering the opposite, silent drops at every
+boundary, and no observability. Under a feature freeze with two live pilots, a
+rewrite is the change most likely to repeat `57430a2a`. This is argued at length
+in [[tool_config_policy_vs_membership]] §"Recommendation up front".
+
+## Roadmap
+
+Ordered so that each step stands alone and stopping anywhere leaves the system
+better than now. Phase 0 is roughly an hour and returns the lost capability.
+
+### Phase 0 — pin the current state
+
+**0.1 Golden snapshot test** — `tests/test_config_tool_grants_snapshot.py`.
+Walks both bases, `interactive.yaml` and every `config/experts/*/config.yaml`
+through `load_and_merge_config` + `get_all_tool_names`, asserting the sorted
+result against a checked-in fixture. Add the unknown-category-key assertion
+while there (`schema.json` cannot catch defect 6).
+
+*This is the commit that would have caught `57430a2a`*, and it makes every later
+step verifiable: from here on, the acceptance criterion for most work is "the
+snapshot did not move." Under D2 there is no shell revert to land first, so this
+is now the true first commit — it pins the current state, which is also the
+intended one.
+
+**0.2 Note on the worker base.** `57430a2a` also emptied `tools.shell` (3 names)
+and `tools.delegation` (2 names) in `worker_base.yaml`. Nothing observable broke:
+the developer, critic, scholar, designer, bughunter and product-qa experts each
+declare their own lists, so only a job on the bare base is affected — and under
+D2 that is the desired default anyway. The snapshot pins it as-is. No action.
+
+### Phase 1 — make the resolved config knowable (D1, the spine)
+
+This phase is the priority. Everything in Phase 2 gets easier once it exists, and
+defects 2, 3 and 6 are closed by it rather than separately.
+
+**1.1 A true resolved-tools read.** Generalise `_merged_session_tool_groups` /
+`GET /api/persistent/threads/{id}/tool-groups` from 4 categories to all 24, and
+from a lean merge to the *final* answer — merge, plus the runtime injection
+layer, plus `filter_tools_by_backend`, plus the `shell_tools` grant outcome.
+Return per category: state (`on` / `off` / `unavailable`), reason when
+unavailable, and provenance (which layer decided it).
+*Acceptance:* for a live session, the endpoint's per-category answer matches the
+agent pod's `Loaded N tools` log exactly. That comparison is the test — pod log
+against endpoint, on a real thread, for at least one session on each workspace
+tier.
+*Risk to watch:* injection happens agent-side at attach, after the orchestrator's
+resolve. If the orchestrator cannot compute it faithfully, the honest fallback is
+to have the agent report its bound set back and serve that, rather than to
+approximate. An approximation here recreates the original bug.
+
+**1.2 One vocabulary at both write boundaries.** Replace the hand-curated
+`SESSION_TOOL_OVERRIDE_NAMES` with registry-membership validation over all
+categories, at both create (`main.py:22569`) and runtime update
+(`main.py:21473`). Unknown or unhonourable keys are **rejected**, not dropped —
+the precedent is `_validated_reasoning_level` ("garbage fails loud here instead
+of being silently dropped", `main.py:3591-3593`).
+*Closes defect 2.* *Acceptance:* a create request naming a category the boundary
+will not honour returns 400, not 201.
+*Blocked by:* the 4b decision below — widening the vocabulary is exactly what
+makes `agent_catalog: true` reach the six unaudited `*_bundle` writes. Take that
+decision before this ships, or ship with the curated-expansion mitigation and an
+expiry.
+
+**1.3 The cockpit renders from 1.1, in three states.** Both surfaces — creation
+and live — read the resolved endpoint and show *on / off / unavailable + reason*.
+Live stops filtering to four categories; creation stops deriving re-enable names
+from the layer it is overriding.
+*Closes defect 3.* *Acceptance:* every category the UI renders is one the
+boundary accepts, and its displayed state matches 1.1's answer.
+
+**1.4 Shell becomes settable (D3).** Falls out of 1.2 and 1.3 once `shell` is in
+the vocabulary. Keep `shell_tools` as the gate (D4) and surface a denial as
+*unavailable — needs the shell_tools grant*, never as a silent drop or a plain
+unticked box.
+*Acceptance:* an admin can enable shell on a new session and the agent binds
+`run_command`; a user without the grant sees it unavailable with the reason, and
+a request that names it anyway is refused.
+
+### Phase 2 — the schema
+
+Seven commits, fully specified in [[tool_config_policy_vs_membership]]
+§Sequencing. Phase 1 above overlaps its commits 1, 5 and 6; what remains:
+
+- `normalize_tool_policy` + registry-derived expansion. No config changes;
+  snapshot must not move.
+- `grant: "code"` / `gate:` classification for the 38 code-only tools — makes
+  `true` behaviour-preserving for `core` and `shell`, and is what lets 1.1
+  describe the injection layer instead of guessing at it.
+- **4a** `[]` → `false` for the 15 policy categories; **delete the key** for the
+  11 machine-owned connector categories.
+- **4b** Decide the nine tools the registry has and the closed vocabulary does
+  not. Under D1 this is no longer a side risk — it **gates 1.2**.
+- **4c** Migrate the 23 full declarations to `true`.
+- Optional per-persona `only`/`except` adoption. Pure readability.
+
+Under D2, `config/session_base.yaml` gains `shell: false` at 4a — the legible
+form of the state `57430a2a` left behind.
+
+### Phase 3 — the rest of the register
+
+**3.1 Curation prompts (defect 5).** Either grant the curator
+`kb_index`/`kb_lint`, or guard the five prompt variants with
+`{% if has_tool(...) %}` as the `delegate_work` references already are. Granting
+is probably right — the tools were built for this job — but it is a behaviour
+change and should be explicit.
+
+**3.2 Archive handling (defect 7).** Extract `.zip` at the session upload seam in
+`orchestrator/services/thread_uploads.py`, mirroring the worker path, with
+explicit traversal and size caps rather than the worker version's incidental
+protection. Separately, give `read_file` a binary branch so it reports an archive
+listing or `[binary file: N bytes]` instead of a codec error. Independent of
+everything above — this is the defect that started the investigation and it can
+be done any time.
+
+**3.3 Reasoning reset feedback (defect 4).** **Do not remove the reset.** It is
+correct and load-bearing: reasoning vocabularies are per-family and do not
+translate — `gemma` is a binary `on`/`off` toggle, `gpt-5.6` is an effort enum
+`low…max`. Carrying `max` into a toggle family is meaningless, and carrying a
+stale sampler value across families is what produced hard 400s and motivated the
+clearer in the first place (`21f55ab1`, "the stale `top_k` lesson").
+
+The whole defect is the **absence of feedback**. The select silently snaps back
+to the family default, which is visually indistinguishable from never having
+been touched — so the user believes a level is set that is not. Same *form* as
+D1: a UI showing a state the backend does not hold. Fix: say so when it happens.
+
+Downgraded and explicitly *not* recommended: making the reset conditional on the
+new family supporting the level. It would help only in narrow cases
+(`gpt-5.6-sol` → `gpt-5.6-terra`, identical option sets; `high` valid in both
+`gpt-5` and `gpt-5.6`), it is already covered server-side for enum→enum by
+`_clamp_reasoning_level` walking the effort ladder to the nearest supported value
+(`src/core/loader.py:2939`), and it cannot work at all for enum→toggle. Not worth
+the branch.
+
+**Unverified premise:** the trigger in the motivating session was never
+confirmed. The absence of `llm.reasoning_level` from the thread's
+`config_override` proves the value was not sent; that it was *cleared by a model
+or expert change* is an inference from those being the only two clearers. If the
+user did not change either after picking, a third path drops the value and this
+entry is mis-diagnosed. Confirm before fixing.
+
+Three traps that must not be lost between docs:
+
+- **4a is not a uniform sweep.** 11 of the 26 base empties are machine-owned
+  connector categories where `[]` means "config does not manage this", not
+  "off". Convert those and the day `false` becomes a real veto, every migrated
+  config kills its own datasources.
+- **`shell` must never become `true`** — `run_command` and `shell_execute` are a
+  mode-alias pair rewritten at `loader.py:4507-4510`.
+- **4b gates 5.** `SESSION_TOOL_OVERRIDE_NAMES` is hand-curated, not a registry
+  transcription (`agent_catalog` 5 vs 9, `workflows` 7 vs 9, `orchestrator` 14 vs
+  17). A naive `agent_catalog: true` newly grants `set_expert_bundle` and
+  `set_skill_bundle` — catalogue *writes* — to any session ticking "Experts &
+  Skills". The curated list encodes a safety judgement the registry category does
+  not carry; that judgement must move into registry metadata before membership
+  moves to the registry.
+
+### Triage, not scheduled
+
+- ~~**Defect 9** (`*_bundle` privilege path)~~ — **resolved**, see triage item 7
+  above. It passes every gate, but acts as its owner through the normal API, so
+  it is not an escalation. Downgraded to a blast-radius argument for D5.
+- **Defect 8** (job-path allowlist) — **decided** by D11: a gap, closed with the
+  Phase 1.2 validator. Remains the only unaddressed security-shaped item.
+- ~~Should the Shell checkbox work as a per-session toggle?~~ **Decided** — see
+  D2/D3/D4. Off by default, settable from the UI and via experts, gated by
+  `shell_tools`. Now Phase 1.4, not triage.
+- Open, if pilot users are meant to self-serve shell: `shell_tools` is
+  deny-by-default and admin-granted, so today they cannot. That is a
+  grant-policy question, not a config one, and nothing in this roadmap changes
+  it either way.
+
+## Provenance, and what was got wrong on the way
+
+Recorded because the earlier revisions of these docs are still in git history and
+three of their conclusions were wrong. Anyone re-deriving from them should know:
+
+- **"Shell was never available in sessions"** — wrong. It was the default from
+  2026-03-31 to 2026-07-22. The error came from reading the
+  `# Shell and application-control groups are opt-in at the expert layer` comment
+  as established policy; `git blame` shows it was written *by the commit that
+  removed the capability*, on the same line. A justification introduced alongside
+  a change is not evidence of prior intent. The same trap is present a second
+  time at `config/experts/developer/config.yaml:76`.
+- **"`sleep`, `notify_user`, `request_workspace_upgrade`, `srw_cloud_status` are
+  ungrantable"** — wrong, and the reason matters: they are granted by the runtime
+  injection layer described above. Centurion's wake/sleep cycle was verified
+  working live (thread `d67ee261` called `sleep` at 2026-08-02 09:15 UTC), not
+  inferred from config.
+- **"Critic and curator have effectively read-only workspace tools"** — wrong.
+  Their lists contain `write_file` and are byte-identical to the developer's,
+  which suggests a copied snapshot rather than per-persona intent. More of the 40
+  subset declarations are drift than first reported; treat any claim that a
+  subset encodes intent as needing evidence.
+- An early scan used `config/*.yaml`, which **misses `config/experts/*/config.yaml`**
+  — the majority of tool declarations. Any glob over configs must be recursive.
