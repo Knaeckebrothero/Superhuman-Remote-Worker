@@ -95,12 +95,16 @@ for your reviewer. If CI will run the real gate, say that too.
 
 **7. Commit and push your branch.** From here on, use the `repo_*` tools instead
 of raw git for anything that touches the remote. The three write tools —
-`repo_commit`, `repo_push`, `repo_open_pr` — all refuse outright if the datasource
-is attached read-only, or if its forge metadata is missing entirely; both fail
-closed instead of guessing (`repo_pull` is exempt from both checks and always
-works). None of that should apply to a repo you were told to contribute to, but if
-a call comes back with that refusal, believe it — don't route around it with the
-shell.
+`repo_commit`, `repo_push`, `repo_open_pr` — refuse outright if the datasource is
+attached read-only, or if no connector metadata was recorded at all (an
+unparseable connection URL, or a legacy connector with no forge set);
+`repo_open_pr` additionally refuses when the forge itself is unset. A repository
+attached read-only *through a project link* skips that message entirely — the
+write tools are simply absent from your toolset there, so calling one fails as an
+unknown tool, not a refusal. `repo_pull` skips those checks, but it isn't
+unconditional either: diverged history or a missing remote still fail it. None of
+that should apply to a repo you were told to contribute to, but if a call comes
+back refused — or missing — believe it and don't route around it with the shell.
 
 ```
 repo_commit(repo="<name>", message="<type>(<scope>): <what and why>")
@@ -108,14 +112,18 @@ repo_push(repo="<name>")
 ```
 
 `repo_push` defaults to whatever branch is currently checked out, so it pushes
-`job/<short_id>` without you naming it again. `repo_commit` stages every change in
-the clone before committing; if there's nothing to commit it tells you rather than
-manufacturing an empty commit — treat that as a cue to check `git status`, not a
-bug.
+`job/<short_id>` without you naming it again — and it always pushes your tags too,
+so don't create one before you're ready to publish it. `repo_commit` stages every
+change in the clone before committing; if there's nothing to commit it tells you
+rather than manufacturing an empty commit — treat that as a cue to check `git
+status`, not a bug.
 
-If `repo_push` reports a rejection, you almost certainly targeted a protected
-branch — re-read step 3. If it reports a credentials problem, stop and report it;
-don't reach for the shell to try alternate remotes or force the push through.
+If `repo_push` fails, the message alone can't tell you why — a protected-branch
+rejection, a credentials problem, and no remote configured all come back as the
+same generic failure string. Run `git -C repos/<name> push` via the shell to see
+git's actual error before concluding anything: a protected-branch rejection means
+re-read step 3; a credentials problem means stop and report it — don't reach for
+the shell to try alternate remotes or force the push through.
 
 **8. Write `output/pr.md` — the reviewer's entry point.** Use the scaffold below.
 This is what the human will paste as the pull-request description, so write it for

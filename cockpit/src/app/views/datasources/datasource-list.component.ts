@@ -2364,6 +2364,10 @@ export class DatasourceListComponent implements OnInit {
   // Generic env var editor
   envVars: { key: string; value: string }[] = [];
   private mcpTransportDirty = false;
+  /** True once the user has explicitly picked a forge via onForgeSelect in
+   *  this form session. Mirrors mcpTransportDirty: stops onConnectionUrlChange
+   *  from re-inferring over a deliberate choice, and is reset on open/close. */
+  private forgeDirty = false;
 
   ngOnInit(): void {
     this.refresh();
@@ -2409,7 +2413,10 @@ export class DatasourceListComponent implements OnInit {
       cli_hint: ds.cli_hint || '',
       default_branch: ds.default_branch || '',
       root_path: ds.config?.root_path || '',
-      forge: ds.config?.forge || '',
+      // Legacy repository connectors created before the forge field existed
+      // have empty config; fall back to inferring from the stored URL so
+      // github.com/gitlab.com connectors don't open blank with Save disabled.
+      forge: ds.config?.forge || this.inferForgeFromUrl(ds.connection_url || ''),
       // MCP credentials, including transport, are redacted by REST. Default
       // the editor to remote HTTP and preserve the stored credential object
       // unless the user enters replacement connection details.
@@ -2456,6 +2463,7 @@ export class DatasourceListComponent implements OnInit {
     this.kubeconfigContent = '';
     this.genericFiles = [];
     this.mcpTransportDirty = false;
+    this.forgeDirty = false;
     this.editingId.set(ds.id);
     this.showForm.set(true);
     this.formTestResult.set(null);
@@ -2567,6 +2575,12 @@ export class DatasourceListComponent implements OnInit {
   onTypeChange(): void {
     // Reset URL placeholder trigger
     this.formTestResult.set(null);
+    // Entering the URL before switching to 'repository' left forge blank
+    // forever, since onConnectionUrlChange only infers for that type. Catch
+    // up now — unless the user already made an explicit choice.
+    if (this.formData.type === 'repository' && !this.forgeDirty) {
+      this.formData.forge = this.inferForgeFromUrl(this.formData.connection_url);
+    }
   }
 
   onTypeSelect(value: DatasourceType | null): void {
@@ -2600,10 +2614,14 @@ export class DatasourceListComponent implements OnInit {
    *  blocks submission until the user picks one explicitly, rather than
    *  letting the server 400 (self-hosted Gitea and GitLab are
    *  indistinguishable by URL alone; see orchestrator/main.py
-   *  `_normalize_repository_config`). */
+   *  `_normalize_repository_config`).
+   *
+   *  Skipped once forgeDirty (the user explicitly picked one via
+   *  onForgeSelect): re-inferring on every keystroke would silently
+   *  overwrite a deliberate choice and re-disable Save. */
   onConnectionUrlChange(value: string = this.formData.connection_url): void {
     this.formData.connection_url = value;
-    if (this.formData.type === 'repository') {
+    if (this.formData.type === 'repository' && !this.forgeDirty) {
       this.formData.forge = this.inferForgeFromUrl(value);
     }
   }
@@ -2621,8 +2639,10 @@ export class DatasourceListComponent implements OnInit {
   }
 
   onForgeSelect(value: string | null): void {
-    this.formData.forge =
+    const next =
       value === 'github' || value === 'gitea' || value === 'gitlab' ? value : '';
+    this.forgeDirty = this.forgeDirty || this.formData.forge !== next;
+    this.formData.forge = next;
   }
 
   /**
@@ -3273,6 +3293,7 @@ export class DatasourceListComponent implements OnInit {
     this.gitSshKey = '';
     this.envVars = [];
     this.mcpTransportDirty = false;
+    this.forgeDirty = false;
     this.kubeconfigContent = '';
     this.genericFiles = [];
   }
