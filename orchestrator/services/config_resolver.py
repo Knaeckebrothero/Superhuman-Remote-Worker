@@ -26,6 +26,7 @@ from src.core.loader import (
     resolve_config_path,
     serialize_resolved_config,
 )
+from src.core.tool_policy import normalize_tool_policy
 
 # Prompt segments a DB/forked expert may override — one family-agnostic version
 # each (model adaptation stays in the systemprompt_<family> wrapper). persona +
@@ -104,6 +105,9 @@ def resolve_config(
             parent_path, _ = resolve_config_path(str(raw_leaf["$extends"]))
             bundled_leaf = dict(raw_leaf)
             bundled_leaf.pop("$extends", None)
+            # Read straight off disk, so it bypasses load_and_merge_config's
+            # normalisation and needs its own.
+            bundled_leaf = normalize_tool_policy(bundled_leaf)
     except Exception:
         raw_leaf = {}
 
@@ -119,7 +123,7 @@ def resolve_config(
     if base_defaults:
         if base_defaults.get("llm"):
             explicit_llm_keys |= set(base_defaults["llm"].keys())
-        data = deep_merge(data, base_defaults)
+        data = deep_merge(data, normalize_tool_policy(base_defaults))
 
     if bundled_leaf:
         if bundled_leaf.get("llm"):
@@ -150,13 +154,28 @@ def resolve_config(
             k for k in _OVERLAY_PROMPT_KEYS if prompts_override.get(k)
         ]
 
+    # Every remaining authored layer, normalised at birth. Layer-local
+    # expansion is what lets deep_merge stay untouched: each layer is already
+    # list[str] by the time it merges, so the existing "most specific layer
+    # that mentions a category wins it wholesale" rule carries unchanged.
+    # Server-generated request fragments (_critic_config_override,
+    # the campaign-loop {"loop": ["loop_plan"]}) ride this same path and need
+    # no special handling.
     for layer in (project_overrides, db_overrides, user_settings, request_override):
         if layer:
             if layer.get("llm"):
                 explicit_llm_keys |= set(layer["llm"].keys())
-            data = deep_merge(data, layer)
+            data = deep_merge(data, normalize_tool_policy(layer))
 
     _apply_settings_matrix(data, explicit_llm_keys, deployment_dir)
+
+    # Idempotent sweep, and it must land HERE — before the capture, not inside
+    # load_agent_config_from_dict. capture["merged_fragment"] is what the
+    # dispatch PDP evaluates, and capability_grants._truthy is wrong on two raw
+    # policy shapes: it reads {} as false (grant violation missed) and
+    # {only: []} as true (violation fabricated for an empty group). Both are
+    # refused by the normaliser, and the PDP only ever sees lists.
+    data = normalize_tool_policy(data)
 
     if capture is not None:
         # Full merged config in fragment shape — the policy view for the dispatch

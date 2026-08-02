@@ -43,6 +43,7 @@ from ..core.skill_resolution import (
     app_guide_health_snapshot,
 )
 from ..core.session_tool_overrides import validate_session_tool_overrides
+from ..core.tool_policy import normalize_tool_policy
 from ..core.workspace_backend import WorkspaceUnavailableError
 from ..agent import UniversalAgent
 from ..llm.reasoning_chat import extract_reasoning_text_from_block
@@ -1723,6 +1724,11 @@ async def _attach_session(
             load_agent_config_from_dict,
         )
 
+        # The legacy (experts-off) attach path reads the RAW request override
+        # rather than the orchestrator's merged fragment, so it needs its own
+        # normalisation — otherwise `canvas: false` never becomes the `[]` that
+        # _apply_session_tool_group_markers matches on, and the group stays on.
+        config_override = normalize_tool_policy(config_override)
         base_dict = dataclasses.asdict(effective_config)
         merged = deep_merge(base_dict, config_override)
         _apply_session_tool_group_markers(merged, config_override)
@@ -6400,6 +6406,9 @@ async def _handle_config_update(
                 return
             new_ds_payload = ws_info.get("datasources") or []
 
+        # Live `config.update` is the same raw-override shape as the legacy
+        # attach path above; normalise before both the merge and the markers.
+        effective_override = normalize_tool_policy(effective_override)
         base_dict = dataclasses.asdict(_session.config)
         merged = deep_merge(base_dict, effective_override)
         _apply_session_tool_group_markers(merged, effective_override)
