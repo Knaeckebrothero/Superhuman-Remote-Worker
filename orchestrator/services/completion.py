@@ -641,6 +641,8 @@ async def write_job_change_record(
     gitea: Any,
     vector_db: Any = None,
     error: str | None = None,
+    merge_status: str | None = None,
+    merged_sha: str | None = None,
 ) -> bool:
     """General per-job change record — the completion-path hook (§6.5).
 
@@ -656,6 +658,10 @@ async def write_job_change_record(
     loop service keys off (``context.loop_id``, ``job_loop_id``). Belt and
     braces, the writer is additionally idempotent by job id (an existing
     ``retros/*-<jobid8>.md`` blocks a second write).
+
+    ``merge_status`` / ``merged_sha`` name a merge THIS transition just
+    performed (§6.6) so the record can carry it; omitted, the writer falls
+    back to whatever the job row carries.
 
     Thin hook by design — rendering, ``changes`` derivation and the
     idempotence check live in ``services.job_records`` (same extraction
@@ -674,7 +680,195 @@ async def write_job_change_record(
         status=new_status,
         error=error,
         vector_db=vector_db,
+        merge_status=merge_status,
+        merged_sha=merged_sha,
     )
+
+
+# ---------------------------------------------------------------------------
+# Terminal-transition side effects (§6.6)
+# docs/features/workspace_and_change_records.md
+# ---------------------------------------------------------------------------
+
+# Merge outcomes that mean "this job's contribution is ALREADY on main".
+# Same vocabulary as determine_job_status' coincident-error backstop above;
+# here it is the double-merge guard for a second terminal call on one job
+# (approve, then a late /complete report; a loop job re-reported).
+ALREADY_MERGED_STATUSES = ("merged", "curated")
+
+
+def job_has_file_contract(job: dict[str, Any]) -> bool:
+    """True when ``context.required_deliverables`` names at least one FILE.
+
+    Deliberately THE predicate ``merge_loop_job_contribution`` dispatches on
+    (imported, not re-derived): the two must never disagree, because a job
+    the merge considers contract-less takes its FULL squash-merge path —
+    which for an ad-hoc job would land the entire scratchpad (``plan.md``,
+    ``todos.yaml``, phase archives, probe files) on ``main``, the exact
+    accumulation §6.4 exists to prevent. ``kb:`` entries are store-backed
+    and never count.
+    """
+    from services.project_loops import contracted_file_deliverables
+
+    return bool(contracted_file_deliverables(job))
+
+
+def should_merge_job_contribution(
+    job: dict[str, Any], new_status: str
+) -> tuple[bool, str]:
+    """Pure gate: may this terminal transition land the job's branch on ``main``?
+
+    Returns ``(should_merge, reason)``; the reason is logged and asserted on
+    in tests. The exclusions, in order (§6.6 "Invariants to preserve"):
+
+    * anything but a successful ``completed`` — a failed job's partial
+      deliverables must not reach shared history (and the loop merge path
+      declines failed jobs identically, ``_merge_and_retro_loop_job``);
+    * **subjobs** — they branch ``subjob/<id>/<role>`` from the PARENT and
+      land through the delegation graft, never into project ``main``;
+    * **loop jobs** — the loop advance already merged them (the retro is
+      their record);
+    * a job whose row already says ``merged``/``curated`` — the
+      double-merge backstop for a second terminal call;
+    * no project, no project branch, or a per-job ``job-<id>`` repo (the
+      agent worked directly on that repo's ``main``: nothing to merge);
+    * **no file contract** — §6.6 policy: record only, the branch stays.
+    """
+    from services.project_loops import job_loop_id
+
+    if new_status != "completed":
+        return False, f"status {new_status!r} is not a successful completion"
+    if job.get("parent_job_id"):
+        return False, "subjob (the delegation graft owns its merge)"
+    if job_loop_id(job):
+        return False, "loop job (the loop advance owns its merge)"
+    row_merge_status = str(job.get("merge_status") or "")
+    if row_merge_status in ALREADY_MERGED_STATUSES:
+        return False, f"already {row_merge_status} (double-merge backstop)"
+    if not job.get("project_id"):
+        return False, "no project (nothing to merge into)"
+    repo_name = job.get("repo_name")
+    branch = job.get("branch_name")
+    if not repo_name or not branch or branch == "main":
+        return False, "no project branch to merge"
+    if repo_name == f"job-{str(job.get('id'))[:8]}":
+        return False, "per-job repo (the agent worked on its own main)"
+    if not job_has_file_contract(job):
+        return False, "no file contract (§6.6: record only, branch stays)"
+    return True, "file contract"
+
+
+async def apply_terminal_job_side_effects(
+    job: dict[str, Any],
+    new_status: str,
+    *,
+    gitea: Any,
+    db: Any = None,
+    vector_db: Any = None,
+    error: str | None = None,
+) -> dict[str, Any]:
+    """Everything a job's terminal transition owes the project repo (§6.6).
+
+    ONE function behind BOTH terminal paths — the ``/complete`` handler and
+    ``approve_job`` — so an approved job and an autonomy-``full`` job that
+    sealed itself leave identical traces. Hooking the *transition* rather
+    than "approval" is deliberate: ``review`` autonomy makes approval the
+    transition (the human gate stays where it was asked for), while ``full``
+    autonomy transitions unattended and the merge rides along.
+
+    Two side effects, in order:
+
+    1. **Merge**, only when :func:`should_merge_job_contribution` says so —
+       i.e. a successful, non-subjob, non-loop project job carrying a FILE
+       contract. Delegates to ``merge_loop_job_contribution`` (the §6.4
+       curated merge; contracted paths only, audit PR closed unmerged) —
+       there is exactly one merge implementation. A job with **no** contract
+       is NOT merged at all: its branch stays, and the record below names it.
+    2. **Change record** via :func:`write_job_change_record`, carrying the
+       merge outcome this call just produced. Loop jobs are skipped inside
+       the writer (their retro is the record).
+
+    Best-effort by contract, like the record hook it replaces: every failure
+    is logged and swallowed, so a Gitea outage can never fail an approval or
+    a completion. Returns the observable outcome —
+    ``{merge_status, merged_sha, merge_notes, merge_skipped_reason,
+    record_written, actions}`` — which the callers surface in their action
+    log and the tests compare across the two paths.
+    """
+    outcome: dict[str, Any] = {
+        "merge_status": None,
+        "merged_sha": None,
+        "merge_notes": [],
+        "merge_skipped_reason": None,
+        "record_written": False,
+        "actions": [],
+    }
+    if new_status not in ("completed", "failed"):
+        return outcome
+
+    job_id = str(job.get("id"))
+    should_merge, reason = should_merge_job_contribution(job, new_status)
+    if not should_merge:
+        # Logged at info, not debug: "why is my work still on the branch?" is
+        # the first question the §6.6 no-contract policy provokes.
+        outcome["merge_skipped_reason"] = reason
+        logger.info("Job %s: no terminal merge — %s", job_id[:8], reason)
+    else:
+        # A raise is the same outcome as a returned merge-failed (mirrors
+        # _merge_and_retro_loop_job) — the branch kept everything either way.
+        status, sha, notes = "merge-failed", None, []
+        try:
+            from services.project_loops import merge_loop_job_contribution
+
+            status, sha, notes = await merge_loop_job_contribution(gitea, job)
+            logger.info(
+                "Job %s: terminal merge of %s -> %s (%s)",
+                job_id[:8],
+                job.get("branch_name"),
+                status,
+                (sha or "")[:8] or "-",
+            )
+        except Exception:
+            logger.warning(
+                "Job %s: terminal merge raised (non-fatal)", job_id, exc_info=True
+            )
+        outcome["merge_status"] = status
+        outcome["merged_sha"] = sha
+        outcome["merge_notes"] = list(notes or [])
+        outcome["actions"].append(f"branch merge -> {status}")
+        # Stamp the outcome on the row AND on the caller's dict: the row is
+        # what the double-merge backstop reads on a LATER call, the dict is
+        # what it reads within this one.
+        if status != "skipped":
+            job["merge_status"] = status
+            if db is not None:
+                try:
+                    await db.update_job_merge_status(job_id, merge_status=status)
+                except Exception:
+                    logger.warning(
+                        "Job %s: recording merge_status=%s failed (non-fatal)",
+                        job_id[:8],
+                        status,
+                        exc_info=True,
+                    )
+
+    try:
+        if await write_job_change_record(
+            job,
+            new_status,
+            gitea=gitea,
+            vector_db=vector_db,
+            error=error,
+            merge_status=outcome["merge_status"],
+            merged_sha=outcome["merged_sha"],
+        ):
+            outcome["record_written"] = True
+            outcome["actions"].append("job change record written to main")
+    except Exception:
+        logger.warning(
+            "Job %s: change-record write failed (non-fatal)", job_id, exc_info=True
+        )
+    return outcome
 
 
 def _get_ctx(job: dict[str, Any]) -> dict[str, Any]:

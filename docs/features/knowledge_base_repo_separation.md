@@ -275,6 +275,52 @@ also the step that fixes note materialisation for lite tiers and persistent sess
 11. `grep -rn "knowledge/" src/tools/knowledge/` shows no remaining workspace write or
     workspace glob of the vault — the refactor is complete, not merely bypassed.
 
+### 8a. k3d verification status (2026-08-01)
+
+Run against the local k3d cluster on project `d4f216f9` ("KB Repo Separation Gate"), created
+through the authenticated `POST /api/projects` so provisioning ran for real.
+
+| # | Criterion | Result |
+|---|-----------|--------|
+| 1 | Existing projects untouched | **PASS** — a note posted for a project with no knowledge repo resolved to its **jobs** repo and committed there (`project-9acaf531-jobs`, `knowledge/k3d-probe-note.md`). The fallback works on live data. |
+| 2 | Two managed repos + one auto-attached `kb` connector | **PASS** — `project-d4f216f9-{jobs,knowledge}` both `is_managed`, plus one `kb` datasource carrying `config.native_project_id` and a deliberately null `connection_url` (see below). |
+| 3 | Note lands in the knowledge repo, nowhere in the jobs repo | **PASS** — `knowledge/gate-note.md` present in the knowledge repo; the jobs repo has **0** `knowledge/` entries. Commit message `kb: gate-note (job aaaaaaaa)` with the full job uuid in the body. |
+| 4 | Readable via `kb_read` / findable via `kb_search` after reindex | **PASS** — after seeding the tiktoken cache (see below) the sweep adopted the file: `path = knowledge/gate-note.md`, `status = active`, and 1 chunk with a non-null embedding. It therefore satisfies the `path IS NOT NULL` gate the agent read path uses, and has the chunk row `kb_search` runs on. |
+| 5 | Exactly one search hit (no double-index) | **PASS** — exactly **1** row for the project, keyed `kb_id = project_id = d4f216f9…`, and **0** rows under the connector's own uuid. The sweep logs `kb_sweep: skipping 1 native project KB datasource(s)` on every tick. |
+| 6 | No checkout of the knowledge repo in the workspace | not yet exercised — needs a job to run. |
+| 7 | `knowledge_note_revisions` on overwrite | not yet exercised — needs two jobs. |
+| 8 | Notes-only job still produces a change record | not yet exercised — needs a job. |
+
+**Criteria 6–8 need a real job to run** (workspace provisioning, a second job overwriting a
+note, and a change record on `/complete`). They are not blocked by anything — just not
+exercised by a note-level test.
+
+**One environmental detour worth recording.** The first two sweeps resolved the knowledge
+repo and read `gate-note.md` correctly, then failed to chunk it:
+`Failed to resolve 'openaipublic.blob.core.windows.net'` while fetching the tiktoken
+`cl100k_base` encoding — k3d has no egress for it (the known
+`k3d_tiktoken_offline_blocks_kb_reindex` issue). Fixed by seeding the cache in the
+orchestrator pod: the file is keyed by the sha1 of its URL, i.e.
+`/tmp/data-gym-cache/9b5ad71b2ce5302211f9c61530b329a4922fc6a4`. The following sweep indexed
+it. Unrelated to this design, but it will bite anyone verifying KB work on k3d.
+
+**`connection_url` is deliberately null on the auto-created connector — do not "fix" it.**
+`gitea.create_repo` returns an *authenticated* clone URL (`http://user:pass@host/...`; its own
+docstring says so), and unlike `redact_repository` — which strips embedded credentials and
+externalizes the host, and whose docstring calls the raw value "a credential leak to every
+project member" — `redact_datasource` (`orchestrator/security/access.py`) only pops
+`credentials` and never touches `connection_url`. Storing the URL would therefore return
+credentials to every project member via `GET /api/datasources`, reopening an already-fixed
+leak through a different table. `project_repositories` stays the single answer to "where does
+the vault live"; if the UI ever needs to display it, derive it at read time through
+`redact_repository` rather than storing a second copy.
+
+Follow-up worth its own ticket, latent today: `redact_datasource` should sanitise
+`connection_url` the way `redact_repository` does. Nothing currently exploits it — zero
+datasources on either k3d or dev carry credentials in that field, because in practice they go
+in the `credentials` blob, which *is* stripped — but a user pasting
+`postgres://user:pass@host/db` as a connection URL would be exposed to every project member.
+
 ## 9. Test plan — the fresh project
 
 Better Resavio is not the test bed: it predates all of this and its vault would take the

@@ -11502,6 +11502,28 @@ async def approve_job(
 
         logger.info(f"Job {job_id} approved (gitea={wrote_to_gitea})")
 
+        # 5b. Terminal-transition side effects (§6.6) — the SAME call the
+        # /complete handler makes, because approval IS this job's transition
+        # to `completed` (a `review`-autonomy job never reaches /complete's
+        # terminal branch). Without it an approved job got neither the merge
+        # of its contracted deliverables nor a change record, and its work sat
+        # on `job/<short_id>` forever. Best-effort: never fails the approval.
+        try:
+            from services.completion import apply_terminal_job_side_effects
+
+            await apply_terminal_job_side_effects(
+                job,
+                "completed",
+                gitea=gitea_client,
+                db=postgres_db,
+                vector_db=vector_db,
+            )
+        except Exception:
+            logger.warning(
+                f"Job {job_id}: terminal side effects failed (non-fatal)",
+                exc_info=True,
+            )
+
         # Graft subjob output onto parent branch if applicable
         merge_result = None
         if job.get("parent_job_id"):
@@ -15608,31 +15630,34 @@ async def complete_job(
                 f"Error advancing project loop for {job_id}: {e}", exc_info=True
             )
 
-        # 5d2. Per-job change record (workspace_and_change_records.md §5/§6.5):
-        # every repo-backed job leaves exactly one record on the project repo's
-        # `main` when THIS completion made it terminal — failed jobs and jobs
-        # that merged nothing included. Keyed on new_status like the session
-        # wake below (None = nothing terminal happened in this call, so a
-        # duplicate/late report can't re-record). Loop jobs are skipped inside
-        # the hook — the loop advance above just wrote their retro — and the
-        # writer's own exists-check backstops that skip; sitting after 5d means
-        # the backstop can actually see a freshly-written loop retro.
-        # Best-effort: a record failure never blocks completion handling.
+        # 5d2. Terminal-transition side effects (workspace_and_change_records.md
+        # §5/§6.5/§6.6): land the job's contracted deliverables on the project
+        # repo's `main` and leave exactly one record there — failed jobs and
+        # jobs that merged nothing included. Keyed on new_status like the
+        # session wake below (None = nothing terminal happened in this call, so
+        # a duplicate/late report can't re-merge or re-record). Loop jobs are
+        # skipped inside the hook — the loop advance above owns their merge and
+        # just wrote their retro — and the record writer's own exists-check
+        # backstops that skip; sitting after 5d means the backstop can actually
+        # see a freshly-written loop retro. THE SAME call runs in approve_job,
+        # which is where a `review`-autonomy job's transition happens.
+        # Best-effort: a failure here never blocks completion handling.
         if new_status in ("completed", "failed"):
             try:
-                from services.completion import write_job_change_record
+                from services.completion import apply_terminal_job_side_effects
 
-                if await write_job_change_record(
+                side_effects = await apply_terminal_job_side_effects(
                     job,
                     new_status,
                     gitea=gitea_client,
+                    db=postgres_db,
                     vector_db=vector_db,
                     error=error_message,
-                ):
-                    actions.append("job change record written to main")
+                )
+                actions.extend(side_effects["actions"])
             except Exception:
                 logger.warning(
-                    f"Job {job_id}: change-record write failed (non-fatal)",
+                    f"Job {job_id}: terminal side effects failed (non-fatal)",
                     exc_info=True,
                 )
 

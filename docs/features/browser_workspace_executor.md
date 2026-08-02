@@ -76,7 +76,7 @@ Non-goal: changing the agent-facing tool contract. The nine `browser_*` tools ke
 
 A self-contained Python program shipped in the workspace image (the image deliberately excludes agent code, so `browser-exec` carries its own deps). Two modes in one entrypoint:
 
-- **`browser-exec serve`** — daemon. Lazily constructs a `browser-use` `BrowserSession` (local launch, `executable_path=/usr/local/bin/agent-chromium`, `user_data_dir=<workspace>/.browser-profile`, `headless=true`). Listens on `/tmp/browser-exec.sock`. Serializes requests (the agent issues actions one at a time). Holds the page + selector map.
+- **`browser-exec serve`** — daemon. Lazily constructs a `browser-use` `BrowserSession` (local launch, `executable_path=/usr/local/bin/agent-chromium`, `user_data_dir=<workspace>/.browser-profile`). Runs **headful under an Xvfb display** by default so the browser's geometry and WebGL surface stay coherent to bot checks — `BROWSER_EXEC_HEADFUL=0` reverts to `headless=true`, and a missing Xvfb degrades to headless automatically. See `docs/features/shared_browser.md` for the measurements. Listens on `/tmp/browser-exec.sock`. Serializes requests (the agent issues actions one at a time). Holds the page + selector map.
 - **`browser-exec <action> [--json '<args>']`** — client. Connects to the socket (auto-spawns `serve` via `nohup` + retry if not running), sends the action, prints the daemon's JSON reply to **stdout**, exits.
 
 **Actions** (1:1 with today's `browser_direct.py` helpers, which move here):

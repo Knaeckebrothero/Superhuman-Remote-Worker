@@ -1100,13 +1100,18 @@ async def merge_loop_job_branch(
     return "merged", sha
 
 
-def _contracted_file_deliverables(job: dict[str, Any]) -> list[str]:
+def contracted_file_deliverables(job: dict[str, Any]) -> list[str]:
     """The job's FILE deliverables (canonical, ``kb:`` entries dropped).
 
     Same manifest source and normalization as the seal-side gate
     (``services.deliverable_gate``): ``context.required_deliverables``,
     ``repo/`` prefix and ``./`` stripped. ``kb:`` entries are store-backed,
     never files — a contract of only those curates nothing.
+
+    Public because it is the predicate :func:`merge_loop_job_contribution`
+    dispatches on (curated vs full merge), and §6.6's terminal-transition
+    gate MUST ask the same question before calling in — see
+    ``services.completion.job_has_file_contract``.
     """
     from services.deliverable_gate import (
         KB_DELIVERABLE_PREFIX,
@@ -1155,7 +1160,7 @@ async def merge_loop_job_contribution(
       missing deliverables is the deliverable gate's job, not the merge's).
     * Some missing → curate what exists, list the missing paths.
     """
-    files_contract = _contracted_file_deliverables(job)
+    files_contract = contracted_file_deliverables(job)
     if not files_contract:
         status, sha = await merge_loop_job_branch(gitea_client, job)
         return status, sha, []
