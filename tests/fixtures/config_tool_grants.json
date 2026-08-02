@@ -224,6 +224,8 @@
     "git_tags",
     "job_complete",
     "kb_contradictions",
+    "kb_index",
+    "kb_lint",
     "kb_list",
     "kb_provenance",
     "kb_read",
