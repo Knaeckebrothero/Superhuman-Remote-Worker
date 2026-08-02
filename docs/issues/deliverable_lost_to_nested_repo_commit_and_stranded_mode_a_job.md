@@ -444,11 +444,17 @@ reintroduce the drift class `f41970ae` just closed. Instead:
 - **Do NOT widen the `projects/` filter.** It is the cloud-folder mirror prefix; accept
   writes those paths back into the user's storage. Widening it would publish `output/`,
   `archive/`, `tmp/` and `.venv/` into their cloud root and issue deletions there.
-- **Let Mode B run for cloud-folder projects.** The smallest fix that produces the missing
-  button: drop the `project_has_cloud_folder` refusal at `main.py:16947` so
-  "export deliverables to a shared folder" is available regardless of Mode A. The two flows
-  are orthogonal — one syncs an existing folder in place, the other publishes job output —
-  and nothing about Mode A requires suppressing Mode B.
+- **DECIDED 2026-08-02: wait for §6.3. No interim.** Removing the
+  `project_has_cloud_folder` refusal at `main.py:16947` would restore the export button
+  today, but publishes without a review step and adds a line to delete later. Since 219 of
+  220 Mode A jobs are stranded and there have been **zero** exports ever, nothing depends on
+  this path — so there is no user to unblock, and the interim buys little. Revisit only if
+  someone actually needs output published before §6.3 lands.
+- **Retire Mode A rather than repair it.** Once the cloud folder is a change-capable
+  datasource, the mirror/diff/accept flow is a parallel implementation of the same concept.
+  Keeping both is how two subsystems end up with incompatible conventions — which is exactly
+  how bbce4bed's deliverable landed where nothing publishes from. The zero-exports figure
+  makes retirement cheap.
 - **Do NOT extend Mode A's mirror to cover deliverables.** An earlier revision of this doc
   proposed widening the diff scope to `projects/<slug>/` ∪ declared deliverables and
   extending the writeback to match. That would invest in a mechanism
