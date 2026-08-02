@@ -160,9 +160,15 @@ ORCHESTRATOR_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "grant": "explicit",
         "gate": (
             "named outright in a tools.orchestrator list (today: "
-            "config/experts/centurion). Absent from "
-            "SESSION_TOOL_OVERRIDE_NAMES, so a session-requested "
-            "`orchestrator: true` must not widen onto this write"
+            "config/experts/centurion). Excluded from a category-level `true` "
+            "ONLY to keep the expansion behaviour-preserving against "
+            "SESSION_TOOL_OVERRIDE_NAMES — its absence from that vocabulary is "
+            "UNRATIFIED DRIFT, not a security boundary: 64f51a91 (07-29) "
+            "registered it without touching session_tool_overrides.py, and "
+            "ef3ec62b (07-30) edited the vocabulary the next day for a sibling "
+            "tool without back-filling it. This tool's own docstring calls it "
+            "non-destructive and names resume_worker_job — a vocabulary member "
+            "— as the costly one. Ratify or admit it; do not inherit it"
         ),
     },
     "get_stuck_jobs": {
@@ -179,8 +185,15 @@ ORCHESTRATOR_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "grant": "explicit",
         "gate": (
             "named outright in a tools.orchestrator list (today: "
-            "config/experts/centurion). A fleet-wide read across every job, "
-            "and absent from SESSION_TOOL_OVERRIDE_NAMES"
+            "config/experts/centurion). Excluded from a category-level `true` "
+            "ONLY to keep the expansion behaviour-preserving against "
+            "SESSION_TOOL_OVERRIDE_NAMES — its absence from that vocabulary is "
+            "UNRATIFIED DRIFT, not a security boundary. It is NOT a fleet-wide "
+            "read: GET /api/stats/stuck (orchestrator/main.py:18565) scopes to "
+            "the caller via require_approved_user + _visibility_kwargs_for_stats, "
+            "the same G5/G1 posture as list_worker_jobs, which IS in the "
+            "vocabulary. Same drift history as steer_worker_job (64f51a91, "
+            "ef3ec62b). Ratify or admit it; do not inherit it"
         ),
     },
 }
