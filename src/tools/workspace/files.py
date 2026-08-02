@@ -113,6 +113,31 @@ def _cloud_upperdir_guard_for_path(context: ToolContext, path: str) -> Optional[
         return None
 
 
+def _absolute(workspace: Any, path: str) -> str:
+    """Render ``path`` as the absolute path the shell would see.
+
+    The file tools resolve relative paths against the **workspace root**;
+    ``shell_execute`` resolves them against the tab's current directory, which
+    any ``cd`` moves. So the same relative string can denote two different
+    files, and echoing the caller's own string back in a tool result tells the
+    model nothing about which one it got. Job bbce4bed lost a deliverable in
+    exactly that gap: ``Written: output/report.md`` next to a shell that was
+    ``cd``'d into a subdirectory, with nothing anywhere naming the anchor.
+
+    Delegates to the backend's own ``resolve_path`` (via
+    :meth:`WorkspaceManager.get_path`), the same resolution ``_file_not_found``
+    reports, so every backend — remote, subdir, virtual overlay — renders its
+    real root. Falls back to the relative path if resolution fails: a
+    diagnostic aid must never be the reason a write fails.
+
+    See docs/issues/deliverable_lost_to_nested_repo_commit_and_stranded_mode_a_job.md.
+    """
+    try:
+        return str(workspace.get_path(path))
+    except Exception:  # pragma: no cover - defensive; write already succeeded
+        return path
+
+
 def _get_mime_type(file_path: Path) -> str:
     """Get MIME type for a file based on extension."""
     mime_type, _ = mimetypes.guess_type(str(file_path))
@@ -901,12 +926,20 @@ def create_file_tools(context: ToolContext) -> List[Any]:
         - Write intermediate results (candidates/candidates.md)
         - Store processed data (chunks/chunk_001.md)
 
+        Paths are resolved against the **workspace root**, NOT against the
+        working directory of your shell. `write_file("output/x.md")` writes the
+        same file whether or not `shell_execute` has `cd`'d somewhere — so if
+        your shell is in a subdirectory, `cat output/x.md` there will NOT find
+        it. The confirmation returns the absolute path; compare it against the
+        `CWD:` line in shell results when the two seem to disagree.
+
         Args:
-            path: Relative path for the file (e.g., "research.md")
+            path: Path for the file, relative to the workspace root
+                (e.g., "research.md")
             content: Content to write
 
         Returns:
-            Confirmation message with file path and size
+            Confirmation message with the resolved absolute path and size
         """
         # Block binary file extensions — write_file is text-only
         BINARY_EXTENSIONS = {
@@ -997,7 +1030,10 @@ def create_file_tools(context: ToolContext) -> List[Any]:
             if existed and had_recent_read:
                 context.record_file_read(path, content)
 
-            return f"Written: {path}"
+            # Absolute, not the caller's own string: `output/x.md` here and
+            # `output/x.md` in a shell that has cd'd elsewhere are different
+            # files, and only this line says which one you got.
+            return f"Written: {_absolute(workspace, path)} ({len(content)} chars)"
 
         except ValueError as e:
             return f"Error: {str(e)}"

@@ -257,7 +257,48 @@ records as never having been exercised; it now has been, and it reproduces. Comb
 `write_file` resolving against the workspace root unconditionally, Defect 2's mechanism is
 fully accounted for.
 
-### E2 — why did the phase-boundary push not land? · **HYPOTHESES NARROWED, RUN PENDING**
+### E2 — why did the phase-boundary push not land? · **H1/H2 REFUTED · BLOCKED ON LLM KEYS**
+
+**Instrumentation landed** (`d7e05c39`): both early returns in `GitManager.push` now log at
+WARNING, and `_inactive_reason()` separates a missing git binary from a missing `.git`. The
+next occurrence is diagnosable from the log alone. Deployed to k3d as agent image
+`tilt-60a46ecb9ec21cca` and verified present in the image.
+
+**Both original hypotheses refuted against live workspaces** (2026-08-02):
+
+| workspace | `.git` | `origin` | branch | push dry-run |
+| --- | --- | --- | --- | --- |
+| k3d `workspace-3adc5d1b-789` | present | configured | `job/3adc5d1b` | — |
+| dev `workspace-cd3bfe52-c01` (job running) | present | configured | `main` | **succeeds** (`3d041bd..96abd59`) |
+
+So the push mechanism itself works: credentials, permissions and remote are all fine, and a
+dry run lands. H1 and H2 do not reproduce on a healthy job.
+
+**Note two distinct repo layouts** — bbce4bed used a project-wide repo
+(`project-68137e29-jobs`, branch `job/bbce4bed`); `cd3bfe52` uses a per-job repo
+(`job-cd3bfe52`, branch `main`). Any fix must hold for both.
+
+**Confirmed the file is genuinely gone**, not merely misfiled: no `job-bbce4bed` repo exists
+in Gitea; `main` of `project-68137e29-jobs` is at the same `098bf3fe` as the job branch; and
+`git log --all -- output/ui_recovery_report.md` is empty across every ref.
+
+**What remains unknowable post-hoc:** every git command bbce4bed ran began with
+`cd /home/agent-host/workspace/repo`, so the workspace root's branch was never captured in
+the audit. We know only that the root had HEAD `4d1a23fe` at freeze time — a commit absent
+from Gitea, i.e. real local commits that never pushed. A third hypothesis is now open:
+
+- **H3** — the root repo was on a branch other than `job/bbce4bed` (a `subjob/…` ref, cf.
+  [[project_resume_inherits_subjob_branch]]). `push()` auto-detects via
+  `git branch --show-current` (`git_manager.py:804`), so it would have pushed that branch and
+  left `job/bbce4bed` untouched. `workspace-cd3bfe52-c01` carries a local
+  `subjob/09c3f309/critic` branch, so the ref does exist in live workspaces.
+
+**Blocked:** running a real multi-phase job on k3d needs LLM credentials, and every key in
+`deployment/values-local.yaml` is empty (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`,
+`GROQ_API_KEY`, `OPENROUTER_API_KEY` all `""`); the `models` catalog is correspondingly
+empty. Needs a key before E2 can run.
+
+### E2 (original hypotheses, retained for the record)
 
 Static analysis has already reduced this to two candidates, both of which produce exactly
 the observed silence (see "The failure is silent by construction"):
@@ -273,11 +314,80 @@ logs are live rather than the truncated S3 archive that hid this in production.
 Assertions for the run: branch tip advances at each phase boundary; `output/manifest_status.json`
 appears on the branch; `push()` returns `True`.
 
-### E3 — Mode A dead zone · **NOT STARTED**
+### E3 — Mode A dead zone · **CONFIRMED 2026-08-02 · WORSE THAN FILED**
 
-Reproducible without waiting on E2: create a project with a cloud folder, run a job that
-seals `job_complete` without advancing its branch, then open it in the cockpit. Expect no
-diff UI and no export affordance.
+Verified end-to-end on k3d against **unmodified existing data** — project
+`7ceb84dc` (`e2e-scholar-clone-fix`), which has a cloud folder. No state was fabricated.
+
+Every completed job in it is stranded:
+
+| job | status | `cloud_review_mode` | `diff_status` | `cloud_diff_baseline_commit` |
+| --- | --- | --- | --- | --- |
+| `d23cf1b5` | completed | `diff` | **NULL** | absent |
+| `22fd993c` | completed | `diff` | **NULL** | absent |
+| `1f7bb260` | completed | `diff` | **NULL** | absent |
+| `77bbb5bd` | completed | `diff` | **NULL** | `37be759cbd1f` |
+| `d029762b` | failed | — | NULL | `37be759cbd1f` |
+
+And the export endpoint refuses, as designed:
+
+```
+POST /api/jobs/d23cf1b5-.../export-to-shared-folder
+HTTP 409 {"detail":"Job's project has a cloud folder — use the diff-review
+          (accept/reject) flow instead of shared-folder export."}
+```
+
+**This is not an edge case triggered by a failed push.** It is the *default* outcome for
+Mode A jobs on this cluster — 4 of 4 completed jobs have no diff UI and no export
+affordance. Two distinct routes reach it:
+
+- **No baseline seeded** (3 of 5): `capture_job_diff` bails at
+  `if not baseline: return False` (`job_cloud_baseline.py:401`) before it looks at anything.
+- **Baseline seeded but diff empty** (`77bbb5bd`): bails at `head == baseline` (`:415`) or at
+  the empty project-folder file list (`:423`).
+
+Either way `diff_status` stays NULL, the Mode A review flow never renders, and the Mode B
+button it falls through to is unreachable by construction. bbce4bed was not unlucky; it hit
+the normal path.
+
+#### Production blast radius (dev cluster, 2026-08-02)
+
+| Mode A jobs | count | `diff_status IS NULL` | no baseline | ever exported |
+| --- | --- | --- | --- | --- |
+| completed | 211 | **210** | 30 | **0** |
+| pending_review | 9 | **9** | 4 | **0** |
+
+219 of 220 Mode A jobs are stranded, and the export path has never once succeeded. Note only
+30 lack a baseline — so the dominant failure is *not* missing seeding.
+
+#### Root cause: the diff filters on a directory these repos do not have
+
+`_diff_files_by_tree` discards every path that is not under `projects/`:
+
+```python
+for path in sorted(set(base_blobs.keys()) | set(head_blobs.keys())):
+    if not path.startswith("projects/"):
+        continue                      # job_cloud_baseline.py:365-366
+```
+
+But job repos are laid out at the workspace root — `output/`, `archive/`, `notes/`,
+`knowledge/`, `evidence/`, `documents/`. There is no `projects/` directory. Verified against
+job `58027ee7` (completed, Mode A, baseline `098bf3fe6d`):
+
+```
+total changed files vs baseline: 50
+of those under projects/:         0
+top-level dirs: archive documents evidence knowledge notes output …   (no projects/)
+```
+
+So the filter matches nothing, `files` is empty, `capture_job_diff` returns at
+`if not files` (`:423`), and `diff_status` stays NULL — **for every Mode A job, always**.
+That is the 210. The feature is scoped to a `projects/<slug>/*` layout that the job repos
+these projects actually use never adopted.
+
+**This makes Defect 3 the most severe of the three:** Mode A cloud review has never
+functioned. bbce4bed was not unlucky — no Mode A job has ever reached the diff flow, and
+none can until the path scope matches the real repo layout.
 
 ## Suggested fixes
 
@@ -306,11 +416,22 @@ reintroduce the drift class `f41970ae` just closed. Instead:
 - Fire the cwd restore for in-body `cd`, not only for the `working_dir` argument
   (`remote.py:1389`).
 
-**Defect 3.** Give the empty-diff Mode A case an explicit state instead of a fall-through:
-when `cloud_review_mode === 'diff'` and `diff_status IS NULL`, render "no changes were
-pushed to this job's branch" with the branch ref and tip. Consider surfacing the gate's seal
-reason too, so the user reads "sealed after 2 bounces, 1 deliverable still missing" instead
-of reconstructing it from the freeze summary.
+**Defect 3 (now the most severe — the feature has never worked).**
+
+- **Fix the path scope first.** `_diff_files_by_tree`'s `projects/` filter
+  (`job_cloud_baseline.py:365`) discards 100% of the real diff, because job repos are laid
+  out at the workspace root (`output/`, `archive/`, `notes/`, …) with no `projects/`
+  directory. Either widen the scope to the deliverable paths these repos actually use, or
+  make it configurable per repo layout. Until this changes, nothing downstream can help.
+- **Then give the empty-diff case an explicit state** rather than a fall-through: when
+  `cloud_review_mode === 'diff'` and `diff_status IS NULL`, render "no changes were pushed to
+  this job's branch" with the branch ref and tip — so a genuine empty diff is legible instead
+  of silently landing in a pane with no applicable action.
+- **Alarm on the invariant.** 219 of 220 Mode A jobs stranded and 0 exports ever should not
+  have needed a human to notice. A counter on "Mode A jobs sealed with `diff_status IS NULL`"
+  would have surfaced this the first week.
+- Consider surfacing the gate's seal reason too, so the user reads "sealed after 2 bounces,
+  1 deliverable still missing" instead of reconstructing it from the freeze summary.
 
 ## Verification
 
