@@ -360,34 +360,57 @@ the normal path.
 219 of 220 Mode A jobs are stranded, and the export path has never once succeeded. Note only
 30 lack a baseline — so the dominant failure is *not* missing seeding.
 
-#### Root cause: the diff filters on a directory these repos do not have
+#### The `projects/` filter is correct — it is a cloud-folder mirror, not a noise filter
 
-`_diff_files_by_tree` discards every path that is not under `projects/`:
+Read the accept path before touching it. `projects/<slug>/` is a **two-way mirror of the
+user's cloud folder**, not an arbitrary scope:
 
-```python
-for path in sorted(set(base_blobs.keys()) | set(head_blobs.keys())):
-    if not path.startswith("projects/"):
-        continue                      # job_cloud_baseline.py:365-366
+- `seed_project_folder_baseline` walks the project's cloud folder and pushes its files into
+  Gitea under `projects/<slug>` (`job_cloud_baseline.py:105`).
+- The agent edits them there.
+- Accept "writes/deletes each diff path back via the cloud backend" (`main.py:16738`),
+  mapping `projects/<slug>/sub/file.md` → `sub/file.md` (`:484-489`).
+
+So **dropping the filter would be actively destructive**, not merely noisy: accept would try
+to write `output/`, `archive/`, `tmp/`, and — in `project-68137e29-jobs` — `repo/.venv/` and
+`repo/.coverage` into the root of the user's cloud storage, and would issue **deletions**
+there for every `deleted` diff entry. Paths outside the prefix have no cloud counterpart and
+`_strip_prefix` would not even map them.
+
+Files outside `projects/` are not "shadow changes" being hidden. The Mode A diff answers
+"what will be written to your cloud folder", not "what did this job change".
+
+#### Actual root cause: the cloud folders are empty, so the mirror never exists
+
+The seed reports success while finding nothing. Across Mode A jobs: **247 `state=ready`**,
+28 `failed`, 45 unset — yet every `ready` job recorded **zero entries**:
+
+```
+job       seed_state  entries  n_files
+f0e20d10  ready       object   0
+bbce4bed  ready       object   0
+4268052c  ready       object   0
+d1894a91  ready       object   0
 ```
 
-But job repos are laid out at the workspace root — `output/`, `archive/`, `notes/`,
-`knowledge/`, `evidence/`, `documents/`. There is no `projects/` directory. Verified against
-job `58027ee7` (completed, Mode A, baseline `098bf3fe6d`):
+The projects' cloud folders are **empty**, so the seed walks them, pushes nothing, stamps a
+baseline and reports `ready`. `projects/<slug>/` therefore never exists — confirmed on job
+`58027ee7`: 0 files under `projects/` at its branch head *and* at its baseline `098bf3fe6d`,
+while 50 other files changed.
 
-```
-total changed files vs baseline: 50
-of those under projects/:         0
-top-level dirs: archive documents evidence knowledge notes output …   (no projects/)
-```
+The full chain:
 
-So the filter matches nothing, `files` is empty, `capture_job_diff` returns at
-`if not files` (`:423`), and `diff_status` stays NULL — **for every Mode A job, always**.
-That is the 210. The feature is scoped to a `projects/<slug>/*` layout that the job repos
-these projects actually use never adopted.
+1. Project cloud folder is empty → seed pushes 0 files, reports `ready`.
+2. `projects/<slug>/` never exists, so the agent has nothing to edit there — and its
+   deliverable contract points at `output/` anyway.
+3. Diff scoped to `projects/` finds nothing → `diff_status` stays NULL.
+4. Mode A review never renders; Mode B export 409s *because* the project has a cloud folder.
 
-**This makes Defect 3 the most severe of the three:** Mode A cloud review has never
-functioned. bbce4bed was not unlucky — no Mode A job has ever reached the diff flow, and
-none can until the path scope matches the real repo layout.
+**The real gap is a missing feature, not a wrong filter.** Mode A is an *in-place
+cloud-folder editing* flow: it assumes the folder already holds documents the agent edits.
+Mode B is the *publish-deliverables* flow. A project with a cloud folder is routed to Mode A
+and thereby locked out of Mode B — so when its jobs produce deliverables in `output/`,
+**nothing publishes them anywhere**. That is precisely the missing button.
 
 ## Suggested fixes
 
@@ -418,11 +441,20 @@ reintroduce the drift class `f41970ae` just closed. Instead:
 
 **Defect 3 (now the most severe — the feature has never worked).**
 
-- **Fix the path scope first.** `_diff_files_by_tree`'s `projects/` filter
-  (`job_cloud_baseline.py:365`) discards 100% of the real diff, because job repos are laid
-  out at the workspace root (`output/`, `archive/`, `notes/`, …) with no `projects/`
-  directory. Either widen the scope to the deliverable paths these repos actually use, or
-  make it configurable per repo layout. Until this changes, nothing downstream can help.
+- **Do NOT widen the `projects/` filter.** It is the cloud-folder mirror prefix; accept
+  writes those paths back into the user's storage. Widening it would publish `output/`,
+  `archive/`, `tmp/` and `.venv/` into their cloud root and issue deletions there.
+- **Let Mode B run for cloud-folder projects.** The smallest fix that produces the missing
+  button: drop the `project_has_cloud_folder` refusal at `main.py:16947` so
+  "export deliverables to a shared folder" is available regardless of Mode A. The two flows
+  are orthogonal — one syncs an existing folder in place, the other publishes job output —
+  and nothing about Mode A requires suppressing Mode B.
+- **Then decide whether Mode A should publish deliverables too**, e.g. copying
+  `required_deliverables` alongside the `projects/` writeback on accept. Optional; the
+  previous bullet already unblocks the user.
+- **Fix the seed's success reporting.** Walking an empty cloud folder and recording
+  `state=ready` with zero entries is indistinguishable from real success. It should record
+  "seeded 0 files — nothing to mirror", which would have made this visible immediately.
 - **Then give the empty-diff case an explicit state** rather than a fall-through: when
   `cloud_review_mode === 'diff'` and `diff_status IS NULL`, render "no changes were pushed to
   this job's branch" with the branch ref and tip — so a genuine empty diff is legible instead
