@@ -158,6 +158,15 @@ async def create_automation(request: Request, body: AutomationCreate) -> dict[st
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    # An automation's config_override is stored raw and handed STRAIGHT to
+    # db.create_job by create_job_from_automation — it never crosses
+    # POST /api/jobs, so the validator there does not see it, and every cron
+    # fire re-plants whatever is stored. Validate it at the only boundary it
+    # does cross: this one.
+    from main import _with_validated_tool_overrides  # late import: avoid circular
+
+    validated_override = _with_validated_tool_overrides(body.config_override)
+
     if body.project_id:
         # Editor or higher needed to scope an automation to a project —
         # an automation creates jobs that show up on the project page.
@@ -195,7 +204,7 @@ async def create_automation(request: Request, body: AutomationCreate) -> dict[st
         expert=expert,
         expert_id=body.expert_id,
         prompt=body.prompt,
-        config_override=body.config_override or {},
+        config_override=validated_override or {},
         autonomy=body.autonomy,
         priority=body.priority,
         max_chain_depth=body.max_chain_depth,
@@ -258,6 +267,15 @@ async def update_automation(
     fields = body.model_dump(exclude_unset=True)
     if not fields:
         return row
+
+    # Same reason as create: this override is replayed into db.create_job on
+    # every fire, bypassing the POST /api/jobs validator entirely.
+    if "config_override" in fields:
+        from main import _with_validated_tool_overrides  # late import: circular
+
+        fields["config_override"] = _with_validated_tool_overrides(
+            fields["config_override"]
+        )
 
     if "cron_expr" in fields:
         try:

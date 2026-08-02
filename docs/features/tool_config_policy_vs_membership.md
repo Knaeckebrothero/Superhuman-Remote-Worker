@@ -737,6 +737,26 @@ transcribing 24 name sets, so file it and land it after commit 5.
 > `_critic_config_override` and the campaign loop's `{"loop": ["loop_plan"]}` go
 > through `postgres_db.create_job` directly, and the officer slot patch merges
 > in after the boundary. `tests/test_tool_override_boundary.py`.
+>
+> **Three more, found by review of that change and closed with it.** "Exactly
+> three places" was never the whole list:
+>
+> * `POST /api/sessions/{id}/prepare` (`orchestrator/routers/sessions.py`) — the
+>   body's `config_override` flows to `_resolve_session_config`, where a
+>   non-None value **replaces** the thread's persisted override outright
+>   (`main.py:1684-1688`). A write boundary, not a hint.
+> * `POST` / `PATCH /api/automations` — stored raw, and
+>   `create_job_from_automation` passes it **directly** to `db.create_job`, so
+>   it never crosses `POST /api/jobs` and every cron fire re-plants it.
+> * `POST` / `PATCH /api/projects` `default_config_override` — merged under
+>   every job in the project, making it a cross-principal escalation: the
+>   planter is a project owner, the runner is any member, and `evaluate()` keys
+>   off the category name. Validated on the **write path only**, so no existing
+>   row is read or rejected until someone rewrites it. Note the cockpit *does*
+>   send this field (`project-detail.component.ts::toggleProjectMemory`
+>   re-submits the whole stored override), so a project already holding an
+>   invalid `tools` block will surface it at the next toggle — which is the
+>   intended way to learn a row is broken.
 
 **The "base-granted shell bypasses the grant" claim needs re-verification.**
 `docs/issues/session_create_tool_toggles_cannot_enable_a_group.md` states the
@@ -999,7 +1019,12 @@ the cockpit still sends lists and still works.
 >   fix for that checkbox.
 > * Anything the boundary will not honour is **rejected**, never dropped.
 >   Replacing one silent discard with a narrower silent discard fixes nothing;
->   the precedent is `_validated_reasoning_level`.
+>   the precedent is `_validated_reasoning_level`. That rule bites this design's
+>   own `expand_category_true` warning: `{"tools": {"sql": true}}` returning 200
+>   with `[]` is "asked for ON, got OFF". The warning stays correct for a config
+>   layer; at a request boundary an affirmative policy that expands to nothing
+>   is now a 400. `false` / `[]` remain legal, since asserting an unmanaged
+>   category is off costs nothing.
 >
 > The plan also assumed commit 5 preceded any widening of what a *closed group*
 > may name. It does not: membership is checked against the whole registry
