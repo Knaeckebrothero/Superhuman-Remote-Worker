@@ -59,6 +59,18 @@ ARCHIVE_EXTENSIONS = {".zip"}
 # the agent what's inside, not to reproduce a multi-thousand-entry manifest.
 MAX_ARCHIVE_LISTING_ENTRIES = 200
 
+# Sidecar suffix the session-upload seam
+# (orchestrator/services/thread_uploads.py::ZIP_REFUSAL_NOTE_SUFFIX) writes
+# next to a zip it fell back to storing verbatim because extraction was
+# refused (corrupt, traversal entry, over a cap). Checked before describing
+# an archive below — otherwise a merely *parseable* but refused zip reads as
+# an ordinary, successfully extracted one: a full entry listing with nothing
+# saying those entries were never separated into readable files. That is
+# the motivating incident's dead end, recreated one layer down. No shared
+# import exists between the orchestrator and agent processes; keep both
+# ends of this string in sync by hand.
+ZIP_REFUSAL_NOTE_SUFFIX = ".extraction-refused.txt"
+
 # Tool metadata for registry
 # Phase availability: file tools are available in both strategic and tactical modes
 FILE_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
@@ -172,6 +184,25 @@ def _is_visual_document(file_path: Path) -> bool:
 def _is_archive_file(file_path: Path) -> bool:
     """Check if file is an archive read_file should list rather than decode."""
     return file_path.suffix.lower() in ARCHIVE_EXTENSIONS
+
+
+def _read_zip_extraction_note(workspace: Any, path: str) -> Optional[str]:
+    """The session-upload seam's refusal note for ``path``, if one exists.
+
+    Returns None for the overwhelming majority of archives — either the
+    upload extracted cleanly, this zip predates the extraction seam, or it
+    was never a session upload at all (e.g. one living inside a cloned
+    repo). Never raises: a missing or unreadable note must never block the
+    ordinary archive listing that follows it.
+    """
+    note_path = f"{path}{ZIP_REFUSAL_NOTE_SUFFIX}"
+    try:
+        if not workspace.exists(note_path):
+            return None
+        return workspace.read_file(note_path).strip()
+    except Exception as e:
+        logger.debug(f"Could not read zip extraction note for {path}: {e}")
+        return None
 
 
 def _describe_zip_archive(local_path: Path, display_name: str, size: int) -> str:
@@ -896,11 +927,20 @@ def create_file_tools(context: ToolContext) -> List[Any]:
             # searching the workspace for an "unzip" capability that isn't
             # coming (docs/issues/session_uploads_never_extract_archives.md).
             if _is_archive_file(full_path):
+                # Check BEFORE describing the archive: a zip that the
+                # upload seam refused to extract (cap/traversal) still
+                # parses fine here, so without this it reads as an
+                # ordinary, successfully extracted archive — the entries
+                # below are shown but none of them are actually separately
+                # readable, and nothing else says so.
+                note = _read_zip_extraction_note(workspace, path)
                 with workspace.local_copy(path) as local_path:
                     archive_size = local_path.stat().st_size
                     result = _describe_zip_archive(
                         local_path, full_path.name, archive_size
                     )
+                if note:
+                    result = f"{note}\n\n{result}"
                 if not result.startswith("Error:"):
                     context.record_file_read(path)
                 return result

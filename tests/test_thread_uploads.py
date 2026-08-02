@@ -22,9 +22,10 @@ import pytest
 from services.thread_uploads import (
     MAX_FILE_SIZE,
     MAX_FILES_PER_REQUEST,
-    MAX_ZIP_ENTRIES,
+    MAX_ZIP_ENTRIES_PER_REQUEST,
     MAX_ZIP_ENTRY_UNCOMPRESSED_BYTES,
-    MAX_ZIP_TOTAL_UNCOMPRESSED_BYTES,
+    MAX_ZIP_TOTAL_UNCOMPRESSED_BYTES_PER_REQUEST,
+    ZIP_REFUSAL_NOTE_SUFFIX,
     ThreadUploadError,
     ZipExtractionRefused,
     _expand_payloads_for_extraction,
@@ -361,7 +362,7 @@ class TestPlanZipExtraction:
     def test_rejects_too_many_entries(self, monkeypatch):
         from services import thread_uploads
 
-        monkeypatch.setattr(thread_uploads, "MAX_ZIP_ENTRIES", 3)
+        monkeypatch.setattr(thread_uploads, "MAX_ZIP_ENTRIES_PER_REQUEST", 3)
         data = _make_zip({f"f{i}.txt": b"x" for i in range(4)})
 
         with pytest.raises(ZipExtractionRefused):
@@ -380,18 +381,37 @@ class TestPlanZipExtraction:
         from services import thread_uploads
 
         monkeypatch.setattr(thread_uploads, "MAX_ZIP_ENTRY_UNCOMPRESSED_BYTES", 100)
-        monkeypatch.setattr(thread_uploads, "MAX_ZIP_TOTAL_UNCOMPRESSED_BYTES", 150)
+        monkeypatch.setattr(
+            thread_uploads, "MAX_ZIP_TOTAL_UNCOMPRESSED_BYTES_PER_REQUEST", 150
+        )
         data = _make_zip({"a.bin": b"x" * 100, "b.bin": b"x" * 100})
 
         with pytest.raises(ZipExtractionRefused):
             _plan_zip_extraction(data, stem="bundle")
 
+    def test_explicit_caps_override_the_module_defaults(self):
+        """_expand_payloads_for_extraction passes tighter, remaining-budget
+        caps per call — confirm the parameters actually take effect rather
+        than the function silently falling back to the module globals."""
+        data = _make_zip({"a.txt": b"x" * 50})
+
+        with pytest.raises(ZipExtractionRefused):
+            _plan_zip_extraction(data, stem="bundle", max_entry_bytes=10)
+
+        with pytest.raises(ZipExtractionRefused):
+            _plan_zip_extraction(data, stem="bundle", max_total_bytes=10)
+
+        with pytest.raises(ZipExtractionRefused):
+            _plan_zip_extraction(
+                _make_zip({"a.txt": b"1", "b.txt": b"2"}), stem="bundle", max_entries=1
+            )
+
     def test_real_world_caps_relate_sensibly_to_max_file_size(self):
         """Documents the chosen relationship so a future edit to
         MAX_FILE_SIZE doesn't silently detune these — see task-1 report."""
         assert MAX_ZIP_ENTRY_UNCOMPRESSED_BYTES == MAX_FILE_SIZE
-        assert MAX_ZIP_TOTAL_UNCOMPRESSED_BYTES == 3 * MAX_FILE_SIZE
-        assert MAX_ZIP_ENTRIES == 2_000
+        assert MAX_ZIP_TOTAL_UNCOMPRESSED_BYTES_PER_REQUEST == 3 * MAX_FILE_SIZE
+        assert MAX_ZIP_ENTRIES_PER_REQUEST == 100
 
 
 class TestExpandPayloadsForExtraction:
@@ -469,7 +489,11 @@ class TestExpandPayloadsForExtraction:
             [("bundle.zip", garbage, "application/zip")], set()
         )
 
-        assert expanded == [("bundle.zip", garbage, "application/zip")]
+        assert ("bundle.zip", garbage, "application/zip") in expanded
+        # A refusal note rides alongside — see TestZipRefusalNote for content
+        # assertions; here just confirm nothing else was written.
+        assert len(expanded) == 2
+        assert expanded[1][0] == f"bundle.zip{ZIP_REFUSAL_NOTE_SUFFIX}"
 
     def test_traversal_zip_falls_back_to_storing_the_original_bytes_verbatim(self):
         """Half-extracted is not an option: the whole archive is refused
@@ -480,12 +504,15 @@ class TestExpandPayloadsForExtraction:
             [("evil.zip", data, "application/zip")], set()
         )
 
-        assert expanded == [("evil.zip", data, "application/zip")]
+        assert ("evil.zip", data, "application/zip") in expanded
+        assert len(expanded) == 2
+        assert expanded[1][0] == f"evil.zip{ZIP_REFUSAL_NOTE_SUFFIX}"
 
     def test_zip_with_only_filtered_entries_falls_back_to_verbatim(self):
         """A zip containing only __MACOSX/dotfile junk extracts to nothing
         useful — keep the original rather than silently storing an empty
-        directory."""
+        directory. No note: nothing was actually refused, an empty listing
+        already says "nothing here" on its own (see TestZipRefusalNote)."""
         data = _make_zip({".hidden": b"x", "__MACOSX/._x": b"y"})
 
         expanded = _expand_payloads_for_extraction(
@@ -496,8 +523,9 @@ class TestExpandPayloadsForExtraction:
 
     def test_fallback_reuses_the_claimed_stem_slot_avoiding_a_second_collision(self):
         """The stem is claimed once whether extraction succeeds or falls
-        back — so the fallback name can never collide with something else
-        claimed in between."""
+        back — so if only the bare stem ("bundle") was previously taken,
+        the fallback's own exact name ("bundle.zip") is free and does not
+        need shifting."""
         taken = {"bundle"}
         garbage = b"not actually a zip file"
 
@@ -505,7 +533,179 @@ class TestExpandPayloadsForExtraction:
             [("bundle.zip", garbage, "application/zip")], taken
         )
 
-        assert expanded == [("bundle_1.zip", garbage, "application/zip")]
+        fallback_names = [n for n, _, _ in expanded]
+        assert "bundle.zip" in fallback_names
+        assert "bundle_1.zip" not in fallback_names
+
+    def test_fallback_name_itself_is_shifted_when_it_collides_too(self):
+        """Unlike the case above: when the exact fallback name ("bundle.zip")
+        is ALSO already taken (not just the bare stem), it must shift —
+        proving the fallback goes through real collision resolution against
+        its own candidate, not just against the stem's."""
+        taken = {"bundle", "bundle.zip"}
+        garbage = b"not actually a zip file"
+
+        expanded = _expand_payloads_for_extraction(
+            [("bundle.zip", garbage, "application/zip")], taken
+        )
+
+        assert ("bundle_1.zip", garbage, "application/zip") in expanded
+
+    def test_pre_existing_upload_with_the_exact_fallback_name_is_not_overwritten(self):
+        """CRITICAL regression (review finding 1): the fallback name used to
+        be assembled by string-concatenating the (possibly already-shifted)
+        stem plus the original suffix, without ever checking that exact
+        combined string against `taken` — only the bare stem was ever
+        claimed. A pre-existing "bundle.zip" real upload was silently
+        overwritten by a later corrupt/over-cap/traversal-bearing upload of
+        the same name. `taken` here models that pre-existing upload having
+        already claimed "bundle.zip" (not just "bundle")."""
+        taken = {"bundle.zip"}
+        garbage = b"not actually a zip file"
+
+        expanded = _expand_payloads_for_extraction(
+            [("bundle.zip", garbage, "application/zip")], taken
+        )
+
+        names = [n for n, _, _ in expanded]
+        # The new upload must NOT land on "bundle.zip" — that name was
+        # already claimed by something this function never touched.
+        assert "bundle.zip" not in names
+        assert ("bundle_1.zip", garbage, "application/zip") in expanded
+
+
+class TestZipRefusalNote:
+    """The sidecar note _expand_payloads_for_extraction writes alongside a
+    refused zip's verbatim fallback (review finding 2): a valid-but-refused
+    zip still parses fine, so read_file's entry listing alone can't tell
+    the agent apart from a normal, successfully extracted archive."""
+
+    def test_note_is_written_alongside_a_refused_fallback(self):
+        garbage = b"not actually a zip file"
+
+        expanded = _expand_payloads_for_extraction(
+            [("broken.zip", garbage, "application/zip")], set()
+        )
+
+        note_name = f"broken.zip{ZIP_REFUSAL_NOTE_SUFFIX}"
+        note = next((data for n, data, _ in expanded if n == note_name), None)
+        assert note is not None
+        assert b"Extraction refused" in note
+        assert b"not a valid zip file" in note
+
+    def test_note_names_the_specific_refusal_reason(self):
+        data = _make_zip({"good.txt": b"fine", "../../etc/passwd": b"pwned"})
+
+        expanded = _expand_payloads_for_extraction(
+            [("evil.zip", data, "application/zip")], set()
+        )
+
+        note = next(
+            data for n, data, _ in expanded if n == f"evil.zip{ZIP_REFUSAL_NOTE_SUFFIX}"
+        )
+        assert b"resolves outside the destination directory" in note
+
+    def test_note_mime_type_is_text_plain(self):
+        garbage = b"not actually a zip file"
+
+        expanded = _expand_payloads_for_extraction(
+            [("broken.zip", garbage, "application/zip")], set()
+        )
+
+        [mime_type] = [
+            m for n, _, m in expanded if n == f"broken.zip{ZIP_REFUSAL_NOTE_SUFFIX}"
+        ]
+        assert mime_type == "text/plain"
+
+    def test_no_note_when_extraction_succeeds(self):
+        data = _make_zip({"a.txt": b"hi"})
+
+        expanded = _expand_payloads_for_extraction(
+            [("bundle.zip", data, "application/zip")], set()
+        )
+
+        assert not any(n.endswith(ZIP_REFUSAL_NOTE_SUFFIX) for n, _, _ in expanded)
+
+    def test_no_note_when_zip_extracts_to_nothing_useful(self):
+        data = _make_zip({".hidden": b"x"})
+
+        expanded = _expand_payloads_for_extraction(
+            [("junk.zip", data, "application/zip")], set()
+        )
+
+        assert not any(n.endswith(ZIP_REFUSAL_NOTE_SUFFIX) for n, _, _ in expanded)
+
+
+class TestPerRequestZipBudget:
+    """Review finding 3+4: entry count and uncompressed bytes are capped
+    per upload REQUEST (shared across every zip in the batch), not reset
+    per zip — a first cut of this reset the budget for each archive, so a
+    full MAX_FILES_PER_REQUEST=20 batch multiplied both the memory ceiling
+    and the virtual transport's serial rclone-subprocess-per-key cost by
+    20x."""
+
+    def test_entry_budget_is_shared_across_zips_in_one_batch(self, monkeypatch):
+        from services import thread_uploads
+
+        monkeypatch.setattr(thread_uploads, "MAX_ZIP_ENTRIES_PER_REQUEST", 3)
+        first = _make_zip({f"f{i}.txt": b"x" for i in range(3)})  # exactly fills it
+        second = _make_zip({"g.txt": b"y"})  # nothing left for this one
+
+        expanded = _expand_payloads_for_extraction(
+            [
+                ("first.zip", first, "application/zip"),
+                ("second.zip", second, "application/zip"),
+            ],
+            set(),
+        )
+
+        names = [n for n, _, _ in expanded]
+        assert sum(1 for n in names if n.startswith("first/")) == 3
+        # second.zip's own per-zip cap would easily allow 1 entry — it's
+        # the *shared* budget, already spent by first.zip, that refuses it.
+        assert "second.zip" in names
+
+    def test_byte_budget_is_shared_across_zips_in_one_batch(self, monkeypatch):
+        from services import thread_uploads
+
+        monkeypatch.setattr(thread_uploads, "MAX_ZIP_ENTRY_UNCOMPRESSED_BYTES", 1_000)
+        monkeypatch.setattr(
+            thread_uploads, "MAX_ZIP_TOTAL_UNCOMPRESSED_BYTES_PER_REQUEST", 150
+        )
+        first = _make_zip({"a.bin": b"x" * 100})
+        second = _make_zip({"b.bin": b"x" * 100})  # 100 + 100 > 150 shared budget
+
+        expanded = _expand_payloads_for_extraction(
+            [
+                ("first.zip", first, "application/zip"),
+                ("second.zip", second, "application/zip"),
+            ],
+            set(),
+        )
+
+        assert ("first/a.bin", b"x" * 100, "application/octet-stream") in expanded
+        names = [n for n, _, _ in expanded]
+        assert "second.zip" in names
+
+    def test_unspent_budget_carries_forward_to_a_later_zip(self, monkeypatch):
+        """Not just a hard per-zip reset in disguise: a small first zip
+        leaves room for a second one, as long as both fit the shared cap."""
+        from services import thread_uploads
+
+        monkeypatch.setattr(thread_uploads, "MAX_ZIP_ENTRIES_PER_REQUEST", 2)
+        first = _make_zip({"a.txt": b"1"})
+        second = _make_zip({"b.txt": b"2"})
+
+        expanded = _expand_payloads_for_extraction(
+            [
+                ("first.zip", first, "application/zip"),
+                ("second.zip", second, "application/zip"),
+            ],
+            set(),
+        )
+
+        names = {n for n, _, _ in expanded}
+        assert names == {"first/a.txt", "second/b.txt"}
 
 
 # =============================================================================
@@ -609,7 +809,9 @@ class TestVirtualWrite:
         self, target, store
     ):
         """No partial extraction: the whole archive is stored as the
-        original upload rather than half-expanded."""
+        original upload rather than half-expanded. A refusal note rides
+        alongside it (review finding 2) so read_file can tell this apart
+        from a normal, successfully extracted archive."""
         data = _make_zip({"good.txt": b"fine", "../../etc/passwd": b"pwned"})
 
         result = _virtual_write_files(
@@ -619,6 +821,54 @@ class TestVirtualWrite:
         assert result[0].name == "evil.zip"
         assert store.get(f"{UPLOADS}evil.zip") == data
         assert all(info.key.startswith(UPLOADS) for info in store.list(""))
+        note_name = f"evil.zip{ZIP_REFUSAL_NOTE_SUFFIX}"
+        assert any(r.name == note_name for r in result)
+        assert b"resolves outside" in store.get(f"{UPLOADS}{note_name}")
+
+    def test_corrupt_reupload_does_not_overwrite_an_existing_upload_of_the_same_name(
+        self, target, store
+    ):
+        """CRITICAL regression (review finding 1): uploads/bundle.zip
+        already exists as a real, previously-uploaded file. A new, corrupt
+        upload also named "bundle.zip" must not silently clobber it — the
+        old bug assembled the fallback name from the (possibly-shifted)
+        stem plus the suffix without ever checking that exact combined
+        string against what's already there."""
+        store.put(f"{UPLOADS}bundle.zip", b"original good bytes")
+        garbage = b"not actually a zip file"
+
+        result = _virtual_write_files(
+            target, [("bundle.zip", garbage, "application/zip")], store=store
+        )
+
+        # The old upload survives untouched.
+        assert store.get(f"{UPLOADS}bundle.zip") == b"original good bytes"
+        # The new (refused) upload landed somewhere else instead.
+        fallback = next(
+            r for r in result if not r.name.endswith(ZIP_REFUSAL_NOTE_SUFFIX)
+        )
+        assert fallback.name != "bundle.zip"
+        assert store.get(f"{UPLOADS}{fallback.name}") == garbage
+
+    def test_traversal_reupload_does_not_overwrite_an_existing_upload_of_the_same_name(
+        self, target, store
+    ):
+        """Same CRITICAL regression, via the traversal-refusal path rather
+        than corrupt bytes — both raise ZipExtractionRefused through the
+        same fallback code."""
+        store.put(f"{UPLOADS}bundle.zip", b"original good bytes")
+        data = _make_zip({"good.txt": b"fine", "../../etc/passwd": b"pwned"})
+
+        result = _virtual_write_files(
+            target, [("bundle.zip", data, "application/zip")], store=store
+        )
+
+        assert store.get(f"{UPLOADS}bundle.zip") == b"original good bytes"
+        fallback = next(
+            r for r in result if not r.name.endswith(ZIP_REFUSAL_NOTE_SUFFIX)
+        )
+        assert fallback.name != "bundle.zip"
+        assert store.get(f"{UPLOADS}{fallback.name}") == data
 
     def test_existing_extracted_directory_blocks_a_new_zip_stem_collision(
         self, target, store
@@ -791,6 +1041,9 @@ class TestSftpWrite:
 
         assert result[0].name == "evil.zip"
         assert sftp_env.files[f"{self.UPLOADS_DIR}/evil.zip"] == data
+        note_name = f"evil.zip{ZIP_REFUSAL_NOTE_SUFFIX}"
+        assert any(r.name == note_name for r in result)
+        assert b"resolves outside" in sftp_env.files[f"{self.UPLOADS_DIR}/{note_name}"]
 
     def test_corrupt_zip_falls_back_to_verbatim_storage(self, sftp_env):
         garbage = b"not actually a zip file"
@@ -801,6 +1054,28 @@ class TestSftpWrite:
 
         assert result[0].name == "broken.zip"
         assert sftp_env.files[f"{self.UPLOADS_DIR}/broken.zip"] == garbage
+
+    def test_corrupt_reupload_does_not_overwrite_an_existing_remote_upload(
+        self, sftp_env
+    ):
+        """CRITICAL regression (review finding 1), reproduced on the SFTP
+        transport too: an existing uploads/bundle.zip must survive a later,
+        corrupt re-upload of the same name."""
+        sftp_env.files[f"{self.UPLOADS_DIR}/bundle.zip"] = b"original good bytes"
+        garbage = b"not actually a zip file"
+
+        result = _sftp_write_files(
+            _ssh_target(), [("bundle.zip", garbage, "application/zip")]
+        )
+
+        assert (
+            sftp_env.files[f"{self.UPLOADS_DIR}/bundle.zip"] == b"original good bytes"
+        )
+        fallback = next(
+            r for r in result if not r.name.endswith(ZIP_REFUSAL_NOTE_SUFFIX)
+        )
+        assert fallback.name != "bundle.zip"
+        assert sftp_env.files[f"{self.UPLOADS_DIR}/{fallback.name}"] == garbage
 
 
 # =============================================================================
