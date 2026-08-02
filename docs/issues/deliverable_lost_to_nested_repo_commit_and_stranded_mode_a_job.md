@@ -1,0 +1,326 @@
+---
+tags:
+  - issue
+  - agent
+  - workspace
+  - git
+  - cockpit
+  - cloud-export
+related:
+  - "[[job_cloud_export]]"
+  - "[[workspace_and_change_records]]"
+  - "[[officer_blind_reads_and_worker_bureaucracy]]"
+---
+
+# A correct deliverable never reached its branch, and two path anchors made it undiagnosable
+
+**Filed:** 2026-08-02. Found while asking why job `bbce4bed` had nothing in `output/` on its
+branch and no "export to cloud folder" button in the cockpit. Three defects in a chain: the
+phase-boundary push never ran, the agent could not diagnose that because `write_file` and
+the shell resolve the same relative path against different roots, and the resulting job
+state has no exit in the UI.
+
+Reference job: `bbce4bed-79be-4e36-bbb1-9dd12ce43dcf` — project `Better Resavio`
+(`68137e29-6b1f-4f1b-a0c1-4e6dc2be3f9a`), config `developer`, model MiniMax-M3, created
+2026-08-01T14:42:32Z, sealed `pending_review` 2026-08-02T03:27:59Z after 8 phases and
+~13 hours.
+
+## The agent did nothing wrong with the path
+
+Worth stating plainly, because two plausible-sounding theories are both false.
+
+**It is not a hallucinated deliverable.** The agent wrote `output/ui_recovery_report.md`
+six times:
+
+| written (UTC) | chars in JSON |
+| --- | --- |
+| 2026-08-01 14:58:19 | 1 967 |
+| 2026-08-01 16:36:12 | 3 428 |
+| 2026-08-01 16:59:03 | 3 428 |
+| 2026-08-01 22:29:58 | 17 093 |
+| 2026-08-01 22:44:24 | 16 647 |
+| 2026-08-02 01:43:43 | 14 158 |
+
+The final version is 14 158 *characters* → **14 248 bytes** UTF-8 (the file is full of
+German domain nouns — Kurort, Belegung, Kassenabschluss). That is byte-for-byte the number
+in its freeze summary, and the recovered file carries exactly the six contracted `##`
+headings it claimed.
+
+**Nor did it write to the wrong path.** The job's own task brief contracts exactly
+`output/ui_recovery_report.md`, and says so explicitly:
+
+```
+## Required Deliverables (Contract)
+- `output/ui_recovery_report.md`
+
+Rules:
+- Scaffold each deliverable file EARLY (phase 1), even as an outline.
+- Update them every phase — each phase boundary commits and pushes
+  them, and records contract status in `output/manifest_status.json`.
+- Paths are workspace-relative; `repo/` prefix is accepted either way.
+```
+
+`normalize_deliverable_path` (`src/core/deliverables.py:42-64`) strips `repo/` — canonical
+form is *without* it — and `resolve_workspace_deliverable` accepts either form. So sibling
+jobs writing `repo/output/…` and this one writing `output/…` are the same contracted
+artifact. The agent wrote the canonical path it was given.
+
+## Defect 1 — the promised phase-boundary commit-and-push never ran
+
+The brief promises *"each phase boundary commits and pushes them"*. Across 8 phases and
+13 hours, branch `job/bbce4bed` never moved off
+`098bf3fe6dbbdfb463e675db72f433db075412ba`, dated **2026-07-29T15:41:08Z** — three days
+before the job started.
+
+Corroborating: `output/manifest_status.json`, which `write_manifest_status` is supposed to
+emit at *every* phase boundary (F13), is also absent from the branch, though the agent
+demonstrably wrote it. Nothing this job produced reached Gitea.
+
+### The failure is silent by construction
+
+`GitManager.push` (`src/managers/git_manager.py:783`) **returns `False`; it never raises**
+for its two most likely failure modes:
+
+```python
+if not self.is_active or not self.has_remote(remote):
+    return False          # git_manager.py:798-799 — no log line at all
+```
+
+That early return emits *nothing* — not even a warning. The `logger.warning` calls further
+down only cover the case where git actually ran and exited nonzero.
+
+Now the call sites. There are six; **five discard the return value entirely**:
+
+| site | return checked? |
+| --- | --- |
+| `phase.py:545`, `:739`, `:925`, `:997`, `:1099` | no — bare `git_mgr.push()` |
+| `progress_commit.py:223` | no — bare `git.push()` |
+| `phase.py:1146` (`push_evidence_snapshot`) | **yes** — `pushed = git_mgr.push()` |
+
+And the protection wrapped around two of them guards against an exception the function is
+written never to throw:
+
+```python
+try:
+    git_mgr.push()
+except Exception as e:
+    logger.warning(f"[{job_id}] Final git push failed: {e}")   # phase.py:927, :999
+```
+
+So if `is_active` was false (no `.git` at the manager's resolved `_remote_cwd`) or
+`has_remote("origin")` was false, every phase-boundary push across 8 phases returned `False`
+and **nothing anywhere recorded it** — no exception, no warning, no log line. That matches
+the evidence exactly: an 83-line log archive containing zero git lines, and a branch that
+never moved.
+
+Which of the two conditions fired is not determinable post-hoc — the workspace pod is gone
+with no PVC (86 `pvc-workspace-*` exist in the namespace, none for this job). But the defect
+does not depend on knowing: **a push that cannot land must not be able to seal a job
+silently.**
+
+The deliverable gate then did its job correctly: it checks the branch HEAD in Gitea, found
+the contracted artifact missing, and bounced twice before sealing —
+`actions=['deliverable gate: bounce cap reached (2) with 1 still missing — sealing as
+pending_review with report', ...]`.
+
+## Defect 2 — `write_file` and the shell resolve the same relative path differently
+
+This is why the agent could not diagnose Defect 1, and why it argued with a gate that was
+telling the truth.
+
+| tool | anchor for a relative path | mutable? |
+| --- | --- | --- |
+| `write_file` / `read_file` / `file_exists` | the workspace root, `/home/agent-host/workspace` | no |
+| `shell_execute` | the tmux tab's cwd | **yes** — any `cd` moves it |
+
+The agent had `cd /home/agent-host/workspace/repo` at the top of its shell blocks (that is
+where the product tree lives, and where pytest/ruff must run). From then on the string
+`output/ui_recovery_report.md` denoted **two different files**:
+
+- via `write_file`/`read_file` → `/home/agent-host/workspace/output/ui_recovery_report.md` — exists
+- via the shell → `/home/agent-host/workspace/repo/output/ui_recovery_report.md` — does not
+
+Both tools answered honestly about different files. The agent's corrective ritual —
+`cd repo` then `git add output/ui_recovery_report.md` — matched nothing, `git commit`
+printed "nothing to commit", and **the block exited 0**. `repo/output/` exists and is
+populated (5 files plus `repros/`), so nothing looked wrong. It concluded the gate was
+anchored to a stale commit ("merge-base 098bf3fe6dbb was the historical bounce-check
+anchor") and re-sealed. `098bf3fe` was not historical; it was — and remains — the live tip.
+
+Two things make this invisible from the model's seat:
+
+- **The tool contract never names the anchor.** `write_file`'s docstring says only
+  *"path: Relative path for the file (e.g. `research.md`)"* — relative to what is never
+  stated (`src/tools/workspace/files.py:905`).
+- **The result echoes the input.** `write_file` returns `f"Written: {path}"`
+  (`files.py:999`) — the same string it was handed, revealing nothing about where it landed.
+  `read_file` behaves the same. Meanwhile `shell_execute` *does* report its absolute
+  location (`CWD: …`), added by `f41970ae` *"fix(shell): anchor working directories and
+  report cwd"* on 2026-08-01, ~2h before this job started. The shell was instrumented
+  because cwd drift had bitten there; the file tools were assumed immune because they are
+  root-anchored. True, and exactly the blind spot — immune to drift, but silent about which
+  root.
+
+Related gap in that same fix: the cwd restore only fires on `if working_dir and
+self._sandbox_cwd:` (`src/core/backends/remote.py:1389`), i.e. when the caller passes a
+`working_dir` argument. An in-body `cd` — what models actually write — does not trip it.
+
+### This is a compliance failure, not a documentation gap
+
+Uncomfortable but important: `f41970ae` *also* added this to `shell_execute`'s docstring
+(`src/tools/shell/shell_tools.py:524-528`):
+
+> Always set `working_dir` for commands. Do not use `cd` unless absolutely necessary — when
+> `working_dir` is omitted, an inline `cd` persists in that tab for the rest of the job. A
+> supplied `working_dir` is resolved relative to the workspace root and the root is restored
+> when the command finishes.
+
+So the agent had an explicit prohibition, a purpose-built `working_dir` parameter, and
+`CWD: /home/agent-host/workspace/repo` printed in every result. It used an inline `cd` in
+every shell block anyway. Guidance the model reliably ignores is a comment, not a control —
+which is the argument for enforcing the anchor in the tool rather than documenting it
+harder. Note this cuts only one way: `write_file`'s docstring still never names its anchor,
+so there is a real documentation gap *and* a compliance failure, in different tools.
+
+## Defect 3 — a Mode A job that pushes nothing has no exit
+
+Because `projects.main_cloud_folder_handle` is set for `Better Resavio`,
+`_with_cloud_review_mode` (`orchestrator/main.py:8378`) computes
+`cloud_review_mode = 'diff'` — Mode A. Every export affordance is gated on Mode B
+`'open_folder'`:
+
+| site | gate |
+| --- | --- |
+| `cockpit/.../job-review.component.ts:186` | `cloud_review_mode === 'open_folder'` |
+| `cockpit/.../job-list.component.ts:268` | `status === 'completed' && cloud_review_mode === 'open_folder' && !exported_at` |
+| `cockpit/.../job-list.component.ts:375` | `status === 'completed' && cloud_review_mode === 'open_folder'` |
+| `POST /api/jobs/{id}/export-to-cloud` | 409s when `project_has_cloud_folder` (`main.py:16947`) |
+
+That is deliberate — Mode A jobs are meant to use the diff accept/reject flow instead. But
+that flow renders only when `diff_status === 'pending'` (`job-review.component.ts:91`), and
+`capture_job_diff` leaves `diff_status` NULL:
+
+```python
+head = await _read_head_commit(gitea_client, repo_name, branch)
+...
+if head == baseline:
+    return False                      # job_cloud_baseline.py:415
+```
+
+Branch HEAD never moved, so `head == baseline`, so no diff was captured, so `diff_status` is
+NULL. The job falls through into the generic review-content branch, whose only cloud
+affordance is the Mode B button it can never satisfy.
+
+**Net:** `pending_review` + Mode A + `diff_status IS NULL` = no diff UI, no export button,
+no API path, no way to move the output anywhere from the cockpit. Verified DB state:
+
+```
+status       | pending_review
+diff_status  | (null)
+exported_at  | (null)
+```
+
+## Recovering the content
+
+Unpushed `write_file` content survives in the audit store. The arg key is **`path`**, not
+`file_path` — the obvious query silently returns nothing:
+
+```sql
+SELECT tc->'args'->>'content'
+FROM llm_requests r, LATERAL jsonb_array_elements(r.response->'tool_calls') tc
+WHERE r.job_id = '<uuid>'
+  AND tc->>'name' = 'write_file'
+  AND tc->'args'->>'path' = 'output/ui_recovery_report.md'
+ORDER BY r.timestamp DESC LIMIT 1;
+```
+
+Use `llm_requests`, not `agent_audit` — the latter truncates.
+
+## Investigation status (k3d)
+
+Isolating each defect on the local cluster, since the production evidence is exhausted (pod
+gone, no PVC, log archive truncated to 83 tail lines).
+
+### E1 — shell cwd persists across separate calls · **CONFIRMED 2026-08-02**
+
+Run against real tmux in a live workspace pod (`workspace-3adc5d1b-789`, k3d), driving
+`tmux send-keys` the way `RemoteBackend` does:
+
+| step | command sent | observed cwd |
+| --- | --- | --- |
+| 1 | `pwd` | `/home/agent-host/workspace` |
+| 2 | `cd /tmp/repo` (in-body, no `working_dir`) | — |
+| 3 | `pwd` — **separate invocation** | `/tmp/repo` |
+
+Step 3 never mentioned the directory. This is the live-tmux behavioural gate that CLAUDE.md
+records as never having been exercised; it now has been, and it reproduces. Combined with
+`write_file` resolving against the workspace root unconditionally, Defect 2's mechanism is
+fully accounted for.
+
+### E2 — why did the phase-boundary push not land? · **HYPOTHESES NARROWED, RUN PENDING**
+
+Static analysis has already reduced this to two candidates, both of which produce exactly
+the observed silence (see "The failure is silent by construction"):
+
+- **H1** — `is_active` false: no `.git` at the manager's resolved `_remote_cwd`.
+- **H2** — `has_remote("origin")` false: no remote configured on the job repo.
+
+Both return `False` with no log output, and five of six call sites discard the return. So
+the k3d run is no longer a fishing trip — instrument `push()` to log *which* early return
+fired, run a multi-phase job, and read it directly. k3d is decisive here because agent pod
+logs are live rather than the truncated S3 archive that hid this in production.
+
+Assertions for the run: branch tip advances at each phase boundary; `output/manifest_status.json`
+appears on the branch; `push()` returns `True`.
+
+### E3 — Mode A dead zone · **NOT STARTED**
+
+Reproducible without waiting on E2: create a project with a cloud folder, run a job that
+seals `job_complete` without advancing its branch, then open it in the cockpit. Expect no
+diff UI and no export affordance.
+
+## Suggested fixes
+
+**Defect 1 (the one that lost the file).** Three changes, none large:
+
+- Make `push()`'s early return say why. `if not self.is_active or not self.has_remote(remote)`
+  (`git_manager.py:798`) should log which condition fired, at WARNING. Today it is the only
+  failure path in the function that emits nothing.
+- **Check the return value.** Five of six call sites discard it. A phase boundary whose push
+  returned `False` should not be treated as a completed boundary.
+- A job that never advanced its branch must not seal clean — surface it into `freeze_data`
+  so the orchestrator can refuse, rather than logging into an archive that is truncated by
+  the time anyone looks. `has_unpushed_commits()` (`git_manager.py:832`) already exists and
+  needs no network round-trip, so the seal path can cheaply assert "nothing left behind".
+
+**Defect 2 (the one that made it undiagnosable).** Do not change resolution semantics —
+making the file tools cwd-relative would put writes at the mercy of mutable shell state and
+reintroduce the drift class `f41970ae` just closed. Instead:
+
+- Return the **resolved absolute path**: `Written: /home/agent-host/workspace/output/ui_recovery_report.md (14248 bytes)`.
+  The root is on hand as `workspace.workspace_path` (`src/core/workspace.py:390`). Then the
+  write result and the shell's `CWD:` line sit in the same transcript and the gap is
+  readable. Same for `read_file` and `file_exists`.
+- State the anchor in the tool docstrings: *relative to the workspace root, independent of
+  the shell's working directory*.
+- Fire the cwd restore for in-body `cd`, not only for the `working_dir` argument
+  (`remote.py:1389`).
+
+**Defect 3.** Give the empty-diff Mode A case an explicit state instead of a fall-through:
+when `cloud_review_mode === 'diff'` and `diff_status IS NULL`, render "no changes were
+pushed to this job's branch" with the branch ref and tip. Consider surfacing the gate's seal
+reason too, so the user reads "sealed after 2 bounces, 1 deliverable still missing" instead
+of reconstructing it from the freeze summary.
+
+## Verification
+
+For Defect 1: run a multi-phase job and assert the branch tip advances at each phase
+boundary; assert `output/manifest_status.json` is present on the branch. Both fail today.
+
+For Defect 2: from a shell `cd`'d into a subdirectory, `write_file("output/x.md")` then
+`shell_execute("cat output/x.md")`. They disagree today, and nothing in either result
+explains why.
+
+For Defect 3: freeze any job on a cloud-folder project `job_complete` without pushing and
+open it in the cockpit. There should be an explanatory empty state; today there is a review
+pane with no applicable action.
