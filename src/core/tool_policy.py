@@ -38,6 +38,13 @@ working untouched, and DB-backed experts need no migration.  It is pinned by
 ``tests/test_tool_policy.py::TestIdentityProperty`` and by
 ``tests/test_config_tool_grants_snapshot.py``.
 
+One category is narrower than the table above: **`shell` accepts `only` (or a
+bare list) and `false` (or `[]`), and nothing else.** `true` and `except` both
+auto-track the registry — `except` is `true` minus a fixed subtraction,
+recomputed on every resolution — and a tool added to a code-execution category
+must not reach live configs without a diff. See
+:data:`ENUMERATE_ONLY_CATEGORIES`.
+
 **Normalisation is layer-local.** Expanding a policy needs only the registry
 and the value — never the parent layer.  So it runs per-layer at birth and the
 existing ``deep_merge`` "lists replace, dicts merge" semantics carry the whole
@@ -67,7 +74,36 @@ MCP_WILDCARD = "*"
 #: silent ``[]``.
 LEGACY_CATEGORY_ALIASES: dict[str, str] = {"coding": "shell"}
 
+#: Categories that must enumerate their tools and may never auto-track the
+#: registry.  ``only`` (and its legacy spelling, a bare list) is the sole form
+#: that does not auto-track: ``true`` means "this category and whatever is
+#: added to it later", and ``{except: [...]}`` means *exactly the same thing*
+#: minus a fixed subtraction, recomputed from the registry on every
+#: resolution.  For a code-execution category both are the wrong default — a
+#: tool added to ``shell`` in the registry would land in every config that used
+#: either form, with no diff to review anywhere.  ``only`` forces a titled
+#: commit.  ``false`` (and ``[]``) stay legal: turning a category off carries no
+#: membership and cannot acquire anything.
+#:
+#: Note this is *not* the mode-alias argument.  ``run_command`` /
+#: ``shell_execute`` being rewritten by ``get_all_tool_names`` from
+#: ``extra.shell.mode`` makes naming both halves redundant, not dangerous, and
+#: ``config/experts/bughunter`` already names both today.
+ENUMERATE_ONLY_CATEGORIES: frozenset[str] = frozenset({"shell"})
+
 _POLICY_KEYS = ("only", "except")
+
+
+def _enumerate_only_error(category: str, form: str) -> "ToolPolicyError":
+    return ToolPolicyError(
+        f"tools.{category}: {form} is not accepted. {category} must enumerate "
+        f"its tools — write {{only: [...]}} (or a bare list, the same thing) "
+        f"or false. Both `true` and `except` auto-track the registry, so a tool "
+        f"added to the {category} category later would land here with no diff "
+        f"to review; for a code-execution category that is the wrong default. "
+        f"See docs/features/tool_config_policy_vs_membership.md, "
+        f"'`shell` accepts `only` and `false`'."
+    )
 
 
 class ToolPolicyError(ValueError):
@@ -141,23 +177,8 @@ def expand_category_true(category: str) -> list[str]:
     if category == "mcp":
         return [MCP_WILDCARD]
 
-    # ``run_command`` and ``shell_execute`` are a mode-alias pair:
-    # ``get_all_tool_names`` rewrites one into the other from
-    # ``extra.shell.mode``, so a ``true`` expansion — which names both halves —
-    # resolves to the same effective tool twice.  A mode-aware expansion is not
-    # available either: the mode is not layer-local, so the layer being
-    # normalised may not declare it while the merged config does.  Refuse the
-    # spelling that requires no thought; ``except`` and explicit lists, which
-    # oblige the author to look at the category, stay available.
-    if category == "shell":
-        raise ToolPolicyError(
-            "tools.shell: true is not accepted. run_command and shell_execute "
-            "are a mode-alias pair (get_all_tool_names rewrites one into the "
-            "other from extra.shell.mode), so `true` would name the same "
-            "effective tool twice. Write the names explicitly, or "
-            "{except: [srw_cloud_status]} once you have checked which half of "
-            "the pair this config's shell mode selects."
-        )
+    if category in ENUMERATE_ONLY_CATEGORIES:
+        raise _enumerate_only_error(category, "true")
 
     names = _grantable(category)
     if not names:
@@ -328,6 +349,11 @@ def _expand_mapping(value: dict, category: str) -> list[str]:
         # steer_worker_job / get_stuck_jobs.
         return names
 
+    # Checked before the empty-list case so `{except: []}` on an
+    # enumerate-only category is told the real rule rather than "write true",
+    # which is itself refused there.
+    if category in ENUMERATE_ONLY_CATEGORIES:
+        raise _enumerate_only_error(category, "'except'")
     if category == "mcp":
         raise ToolPolicyError(
             "tools.mcp: 'except' is not meaningful — MCP tool names are "
@@ -364,6 +390,7 @@ def _require_list(value: Any, category: str, key: str) -> list:
 
 
 __all__ = [
+    "ENUMERATE_ONLY_CATEGORIES",
     "LEGACY_CATEGORY_ALIASES",
     "MCP_WILDCARD",
     "ToolPolicyError",
