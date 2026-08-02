@@ -33447,13 +33447,23 @@ async def create_project(body: ProjectCreate, request: Request) -> dict[str, Any
     # setup flow); regular users get bound to themselves.
     user = await require_approved_user(request, postgres_db)
     owner_id = body.user_id if user.get("is_admin") else str(user["id"])
+    # A project's default_config_override is merged UNDER every job created in
+    # the project (create_job), so an unvalidated tools block here is a
+    # cross-principal escalation: the planter is not the runner, and the PDP
+    # keys off the category name, so `tools.canvas: ["run_command"]` binds a
+    # shell tool for jobs whose owner has no shell_tools grant. Validated on
+    # WRITE only — no existing row is touched, and the field only reaches this
+    # check when a caller explicitly sends it.
+    validated_project_override = _with_validated_tool_overrides(
+        body.default_config_override
+    )
     try:
         project = await postgres_db.create_project(
             name=body.name,
             description=body.description,
             goal=body.goal,
             default_config_name=body.default_config_name,
-            default_config_override=body.default_config_override,
+            default_config_override=validated_project_override,
         )
 
         # Add creator as owner
@@ -33666,6 +33676,16 @@ async def update_project(
     kwargs = {k: v for k, v in body.model_dump().items() if v is not None}
     if not kwargs:
         raise HTTPException(status_code=400, detail="No fields to update")
+    # Write-only, same rationale as create_project: this layer is merged under
+    # every job in the project, so a tools block here escapes the runner's
+    # grants. Only fires when the field is explicitly sent — the cockpit's
+    # project-memory toggle re-submits the STORED override, so a project
+    # already holding an invalid tools block surfaces it here instead of
+    # quietly binding foreign tools on every job.
+    if "default_config_override" in kwargs:
+        kwargs["default_config_override"] = _with_validated_tool_overrides(
+            kwargs["default_config_override"]
+        )
     # network_tier is admin-gated: a tier change widens what the project's
     # workspaces can reach at the pod-network layer (e.g. home-allowed
     # exposes the homelab LAN). Letting any project owner choose their own

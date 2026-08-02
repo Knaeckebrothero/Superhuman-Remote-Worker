@@ -3024,6 +3024,17 @@ async def create_persistent_thread(
     container and agent pod. The thread starts in 'created' status and
     waits for an agent to connect.
 
+    **Deliberately exposes no ``config_override``, and adding one is a
+    security decision, not a convenience.** Session create accepts any tool
+    name the registry knows in its own category, including the
+    ``grant: "explicit"`` control-plane writes (``set_expert_bundle`` and
+    friends) — safe today only because no *model-authored* path reaches that
+    parameter. This tool is the one that would open it: an MCP caller is an
+    LLM, and a prompt-injected fragment would arrive as a legitimate request.
+    Pinned by ``tests/test_tool_override_boundary.py``
+    ``TestNoModelAuthoredPathReachesSessionCreate``. If you add the parameter,
+    that test fails and you must first decide what a model may name.
+
     Args:
         title: Human-readable session title
         config_name: Agent config to use (default: "session_base")
