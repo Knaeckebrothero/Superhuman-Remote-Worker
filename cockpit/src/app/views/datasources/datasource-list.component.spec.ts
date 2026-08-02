@@ -576,6 +576,23 @@ describe('DatasourceListComponent repository forge selection', () => {
     expect(payload.config).toEqual({forge: 'gitea'});
   });
 
+  it('keeps an explicit forge choice through further URL edits', () => {
+    const {component} = createComponent();
+    component.openCreateForm();
+    component.formData.name = 'Widget';
+    component.formData.type = 'repository';
+    component.onForgeSelect('gitea');
+
+    // The bug: every keystroke on the URL re-inferred forge from the host
+    // and clobbered the explicit pick back to '', re-disabling Save.
+    component.onConnectionUrlChange('https://git.example.com/acme/w');
+    component.onConnectionUrlChange('https://git.example.com/acme/wi');
+    component.onConnectionUrlChange('https://git.example.com/acme/widget');
+
+    expect(component.formData.forge).toBe('gitea');
+    expect(component.canSave()).toBe(true);
+  });
+
   it('round-trips the stored forge into the edit form', () => {
     const {component, ds} = createComponent();
     component.openEditForm({
@@ -586,5 +603,24 @@ describe('DatasourceListComponent repository forge selection', () => {
     });
 
     expect(component.formData.forge).toBe('gitea');
+  });
+
+  it('includes the chosen forge in the update payload config', () => {
+    const {api, component, ds} = createComponent();
+    component.openEditForm({
+      ...ds,
+      type: 'repository',
+      connection_url: 'https://git.example.com/acme/widget',
+      config: {forge: 'gitea'},
+    });
+    component.onForgeSelect('github');
+    component.gitAuthMethod = 'token';
+
+    component.saveForm();
+
+    expect(api.updateDatasource).toHaveBeenCalledWith(
+      ds.id,
+      expect.objectContaining({config: {forge: 'github'}}),
+    );
   });
 });
