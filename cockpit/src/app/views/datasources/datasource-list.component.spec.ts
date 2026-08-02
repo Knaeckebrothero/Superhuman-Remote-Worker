@@ -508,3 +508,83 @@ describe('DatasourceListComponent publish confirmation tiers', () => {
     expect(api.createDatasource).toHaveBeenCalledOnce();
   });
 });
+
+describe('DatasourceListComponent repository forge selection', () => {
+  it('leaves forge blank and blocks save for a self-hosted host', () => {
+    const {component} = createComponent();
+    component.openCreateForm();
+    component.formData.name = 'Widget';
+    component.formData.type = 'repository';
+    component.gitAuthMethod = 'token';
+    component.formCredentials.password = 'tok';
+
+    component.onConnectionUrlChange('https://git.example.com/acme/widget');
+
+    expect(component.formData.forge).toBe('');
+    expect(component.canSave()).toBe(false);
+  });
+
+  it('defaults forge to github for a github.com URL', () => {
+    const {component} = createComponent();
+    component.openCreateForm();
+    component.formData.type = 'repository';
+
+    component.onConnectionUrlChange('https://github.com/acme/widget');
+
+    expect(component.formData.forge).toBe('github');
+  });
+
+  it('defaults forge to gitlab for a gitlab.com URL', () => {
+    const {component} = createComponent();
+    component.openCreateForm();
+    component.formData.type = 'repository';
+
+    component.onConnectionUrlChange('https://gitlab.com/acme/widget');
+
+    expect(component.formData.forge).toBe('gitlab');
+  });
+
+  it('includes the chosen forge in the create payload config', () => {
+    const {api, component} = createComponent();
+    component.openCreateForm();
+    component.formData.name = 'Widget';
+    component.formData.type = 'repository';
+    component.onConnectionUrlChange('https://github.com/acme/widget');
+    component.gitAuthMethod = 'token';
+    component.formCredentials.password = 'tok';
+
+    component.doSave();
+
+    const payload = api.createDatasource.mock.calls[0][0];
+    expect(payload.config).toEqual({forge: 'github'});
+  });
+
+  it('lets an explicit forge selection override a self-hosted host', () => {
+    const {api, component} = createComponent();
+    component.openCreateForm();
+    component.formData.name = 'Widget';
+    component.formData.type = 'repository';
+    component.onConnectionUrlChange('https://git.example.com/acme/widget');
+    component.onForgeSelect('gitea');
+    component.gitAuthMethod = 'token';
+    component.formCredentials.password = 'tok';
+
+    expect(component.canSave()).toBe(true);
+    component.doSave();
+
+    const payload = api.createDatasource.mock.calls[0][0];
+    expect(payload.config).toEqual({forge: 'gitea'});
+  });
+
+  it('round-trips the stored forge into the edit form', () => {
+    const {component, ds} = createComponent();
+    component.openEditForm({
+      ...ds,
+      type: 'repository',
+      connection_url: 'https://git.example.com/acme/widget',
+      config: {forge: 'gitea'},
+    });
+
+    expect(component.formData.forge).toBe('gitea');
+  });
+});
