@@ -449,9 +449,16 @@ reintroduce the drift class `f41970ae` just closed. Instead:
   "export deliverables to a shared folder" is available regardless of Mode A. The two flows
   are orthogonal — one syncs an existing folder in place, the other publishes job output —
   and nothing about Mode A requires suppressing Mode B.
-- **Then decide whether Mode A should publish deliverables too**, e.g. copying
-  `required_deliverables` alongside the `projects/` writeback on accept. Optional; the
-  previous bullet already unblocks the user.
+- **Do NOT extend Mode A's mirror to cover deliverables.** An earlier revision of this doc
+  proposed widening the diff scope to `projects/<slug>/` ∪ declared deliverables and
+  extending the writeback to match. That would invest in a mechanism
+  `workspace_and_change_records.md` is replacing: under that design the cloud folder becomes
+  a **change-capable datasource** the agent writes to directly (§6.3), with a `kind`-tagged
+  change record merging to `main` — not a folder mirrored into git, edited there, and
+  written back. Mode A's mirror is the older shape of the same idea. Build §6.3's cloud
+  destination rather than deepening the mirror.
+  Note §6.3 is gated on write-scoped per-datasource credentials and branch policy, which is
+  an open decision (`writable datasources`), so the 409 removal above is the interim.
 - **Fix the seed's success reporting.** Walking an empty cloud folder and recording
   `state=ready` with zero entries is indistinguishable from real success. It should record
   "seeded 0 files — nothing to mirror", which would have made this visible immediately.
