@@ -170,6 +170,11 @@ heavy `delegate_work` pair.
 
 ## 3. The result — 10 unreachable tools
 
+> **Now 8, as of 2026-08-02.** `kb_index` and `kb_lint` were granted to the
+> curator (commit `19b3a7cf`), closing §3a. The live unreachable set is the six
+> `*_bundle` tools plus `delegate_work` / `resume_delegation_child`. The table
+> below is kept as the original finding; §3a is resolved, §3b and §3c are open.
+
 Registry minus every layer in §2:
 
 | Tool | Category | Since | Kind |
