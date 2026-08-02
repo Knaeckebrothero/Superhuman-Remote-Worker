@@ -133,6 +133,7 @@ def build_expert_config(base: dict, row: dict) -> tuple[dict, dict]:
     deep_merge). Returns (merged_config_dict, prompts_dict). Tolerates JSONB
     delivered as str (asyncpg without a codec)."""
     from src.core.loader import deep_merge
+    from src.core.tool_policy import normalize_tool_policy
 
     config = row.get("config") or {}
     prompts = row.get("prompts") or {}
@@ -140,6 +141,12 @@ def build_expert_config(base: dict, row: dict) -> tuple[dict, dict]:
         config = json.loads(config)
     if isinstance(prompts, str):
         prompts = json.loads(prompts)
+    # The DB expert fragment is an authored config layer and this is the one
+    # seam it enters through, so it is normalised here rather than at every
+    # caller. Stored fragments are JSON lists today — lists stay canonical
+    # forever, so no row needs migrating — but the expert editor will start
+    # emitting true/false, and both must merge identically.
+    config = normalize_tool_policy(config)
     merged = deep_merge(base, config)
     merged.pop("connections", None)  # belt-and-braces; deny-scan already ran at save
     return merged, prompts

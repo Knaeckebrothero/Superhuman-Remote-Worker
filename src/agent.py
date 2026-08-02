@@ -2047,9 +2047,14 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                 deep_merge,
                 load_agent_config_from_dict,
             )
+            from .core.tool_policy import normalize_tool_policy
             import dataclasses
 
-            config_override = metadata["config_override"]
+            # Non-hydrated dispatch delivers the request-layer override raw, so
+            # the agent is where its tool policy has to be resolved. (On the
+            # orchestrator-resolved path config_override is None and the blob
+            # already carries canonical lists.)
+            config_override = normalize_tool_policy(metadata["config_override"])
             logger.info(
                 f"Applying inline config override: {list(config_override.keys())}"
             )
