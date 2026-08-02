@@ -229,6 +229,51 @@ class TestReadFileBinaryAndArchiveHandling:
         assert result == f"[binary file: broken.zip, {len(garbage)} bytes]"
         assert "codec" not in result
 
+    def test_read_file_on_refused_zip_surfaces_the_upload_seams_note(
+        self, workspace_tools, workspace_manager
+    ):
+        """Review finding 2: a zip the session-upload seam refused to
+        extract (cap/traversal) still *parses fine* as a zip, so without
+        checking for the sidecar note, read_file would show a normal,
+        successful-looking entry listing with nothing indicating that none
+        of these members are actually separately readable — the exact dead
+        end from the motivating incident, recreated one layer down.
+        """
+        from src.tools.workspace.files import ZIP_REFUSAL_NOTE_SUFFIX
+
+        data = self._make_zip({"cover_letter.txt": b"...", "photos/big.bin": b"..."})
+        workspace_manager.backend.write_file("bundle.zip", data)
+        workspace_manager.backend.write_file(
+            f"bundle.zip{ZIP_REFUSAL_NOTE_SUFFIX}",
+            b"Extraction refused: uncompressed contents exceed the "
+            b"314572800-byte total limit\n\nThis archive's original bytes "
+            b"are stored as-is.",
+        )
+
+        result = workspace_tools["read_file"].invoke({"path": "bundle.zip"})
+
+        # The refusal is front and center, not buried or absent.
+        assert result.startswith("Extraction refused:")
+        assert "314572800-byte total limit" in result
+        # The (still accurate) entry listing follows it rather than being
+        # replaced — the agent can still see what's inside.
+        assert "cover_letter.txt" in result
+        assert "photos/big.bin" in result
+
+    def test_read_file_on_ordinary_zip_has_no_refusal_note_prefix(
+        self, workspace_tools, workspace_manager
+    ):
+        """No sidecar note present (the overwhelming majority of zips,
+        including every one that isn't a refused session upload) — read_file
+        must not invent a refusal that didn't happen."""
+        data = self._make_zip({"a.txt": b"hello"})
+        workspace_manager.backend.write_file("normal.zip", data)
+
+        result = workspace_tools["read_file"].invoke({"path": "normal.zip"})
+
+        assert "Extraction refused" not in result
+        assert "a.txt" in result
+
     def test_read_file_on_arbitrary_binary_returns_binary_message(
         self, workspace_tools, workspace_manager, tool_context
     ):
