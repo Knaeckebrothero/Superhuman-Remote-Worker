@@ -186,6 +186,11 @@ PRODUCT_CAPABILITY_TOOLS_METADATA: dict[str, dict[str, Any]] = {
         "category": "product_help",
         "short_description": "Check current SRW capability and session state.",
         "phases": ["strategic", "tactical"],
+        # Persistent-session floor appended at persistent_session.py:1442-1448
+        # behind an operator-owned env canary, independent of every
+        # user-selectable tool group.
+        "grant": "code",
+        "gate": "PRODUCT_CAPABILITIES_TOOL_ENABLED env canary",
     }
 }
 

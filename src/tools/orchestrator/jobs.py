@@ -157,6 +157,13 @@ ORCHESTRATOR_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "category": "orchestrator",
         "short_description": "Send guidance to a running job.",
         "phases": ["strategic", "tactical"],
+        "grant": "explicit",
+        "gate": (
+            "named outright in a tools.orchestrator list (today: "
+            "config/experts/centurion). Absent from "
+            "SESSION_TOOL_OVERRIDE_NAMES, so a session-requested "
+            "`orchestrator: true` must not widen onto this write"
+        ),
     },
     "get_stuck_jobs": {
         "module": "orchestrator.jobs",
@@ -169,6 +176,12 @@ ORCHESTRATOR_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "category": "orchestrator",
         "short_description": "List jobs with no recent progress.",
         "phases": ["strategic", "tactical"],
+        "grant": "explicit",
+        "gate": (
+            "named outright in a tools.orchestrator list (today: "
+            "config/experts/centurion). A fleet-wide read across every job, "
+            "and absent from SESSION_TOOL_OVERRIDE_NAMES"
+        ),
     },
 }
 

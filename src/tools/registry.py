@@ -104,6 +104,117 @@ TOOL_REGISTRY.update(get_session_task_metadata())
 TOOL_REGISTRY.update(get_delegation_metadata())
 
 
+# ---------------------------------------------------------------------------
+# Grant classification
+# ---------------------------------------------------------------------------
+# Two optional metadata keys answer one question: *who is allowed to put this
+# tool's name into the list passed to* ``load_tools``?  They are METADATA ONLY
+# — nothing reads them yet.  The category-level ``true`` expansion that will
+# consume them is a separate change
+# (docs/features/tool_config_policy_vs_membership.md, "Step A: classify
+# code-only tools in the registry").
+#
+# ``grant``
+#   absent       Config may grant it, including through a category-level
+#                ``true`` / ``except`` policy.  The default, and the case for
+#                103 of the 151 registered tools.
+#   ``"code"``   Runtime code binds it *instead of* config.  No shipped config
+#                should name one, and a category-level ``true`` must not
+#                expand to it — otherwise ``core: true`` and ``shell: true``
+#                would read as granting tools whose real switch is somewhere
+#                else entirely (``officer.enabled``, ``cloud_mount.active``, an
+#                attached datasource).  Excluding them is what makes ``true``
+#                behaviour-preserving for ``core`` and ``shell``.
+#   ``"explicit"``
+#                Config may grant it, but only by writing its name.  A
+#                category-level ``true`` / ``except`` must not reach it.  This
+#                is the safety judgement that ``SESSION_TOOL_OVERRIDE_NAMES``
+#                (src/core/session_tool_overrides.py) carries today as a
+#                hand-curated parallel list: nine registry entries sit in a
+#                selectable category yet are absent from that vocabulary, six
+#                of them control-plane *writes* (``set_expert_bundle`` and
+#                friends).  Marking them here means a future
+#                ``agent_catalog: true`` cannot silently acquire them.
+#
+# ``gate``
+#   A short string, present on every classified entry: what actually decides
+#   whether the tool gets bound.  For ``"code"`` that is the runtime fact or
+#   config key that controls the injection; for ``"explicit"`` it is the naming
+#   requirement and the reason for it.  Without this field the rule is folklore
+#   — see the design doc's "code floors" note.
+#
+# The expansion contract a consumer must implement:
+#
+#     expand(True, cat)            -> [n for n in get_tools_by_category(cat)
+#                                      if "grant" not in TOOL_REGISTRY[n]]
+#     expand({"except": xs}, cat)  -> expand(True, cat) minus xs
+#     expand({"only": xs}, cat)    -> xs as written (an explicit name is an
+#     expand([...], cat)              explicit name; ``"code"`` entries stay
+#                                     nameable so nothing that works today
+#                                     stops working)
+#
+# Deliberately NOT classified, and why:
+#   * the 26 legacy experts-off shim names appended at
+#     ``src/api/persistent_session.py:1470-1520`` — the runtime re-adds those
+#     canonical ``orchestrator`` / ``agent_catalog`` / ``workflows`` lists only
+#     when no disable marker is present.  On the resolved path config still
+#     decides, so marking them would make those groups permanently
+#     un-enableable: the current bug, re-introduced by its own fix.
+#   * ``approve_job`` / ``return_job_with_feedback`` (stamped as
+#     ``tools.evaluation`` by ``_critic_config_override``) and ``loop_plan``
+#     (stamped as ``tools.loop`` by the planner loops).  Those are code writing
+#     a *config fragment*, which is a config grant; ``evaluation: true`` and
+#     ``loop: true`` must keep resolving to them.
+#   * ``mcp``.  ``ToolsConfig`` has the field, the registry has no static
+#     members, and ``register_mcp_tools`` populates the category per
+#     job/session at runtime.  ``mcp: true`` normalises to the existing ``"*"``
+#     sentinel rather than expanding against the registry, so there is nothing
+#     here to mark.
+
+#: Categories whose every tool is bound by runtime code rather than by a
+#: config's tool list.  Expressed per category because that is the truth: a new
+#: tool added to any of these is code-granted by construction.  Per-tool
+#: ``gate`` strings win over the category default (``setdefault`` below), which
+#: is how ``product_help``'s two differently-gated floors stay accurate.
+CODE_GRANTED_CATEGORIES: Dict[str, str] = {
+    # Datasource-derived.  ``DATASOURCE_TOOL_MAP``
+    # (src/core/datasource_setup.py) maps an attached datasource type to a
+    # whole category list, and the result is written straight onto
+    # ``config.tools.<category>`` at attach/dispatch time.  The bases ship
+    # these keys as ``[]`` with a comment saying config does not manage them.
+    "graph": "a neo4j datasource is attached",
+    "sql": "a postgresql datasource is attached",
+    "mongodb": "a mongodb datasource is attached",
+    "webdav": "a webdav datasource is attached",
+    "repo": "a repository datasource is attached",
+    "email": "an email datasource is attached (tier from its config.access)",
+    # Persistent-session floors.  Neither category has a ``ToolsConfig`` field,
+    # so ``tools.product_help: [...]`` in a YAML file is silently discarded
+    # today (src/core/loader.py).  Recording it as a code grant makes that a
+    # stated rule instead of an accident of a missing dataclass field.
+    "product_help": "persistent-session floor; see each tool's own gate",
+    "session_task": "persistent session, unconditional "
+    "(src/api/persistent_session.py:1415)",
+}
+
+
+def _classify_code_granted_categories() -> None:
+    """Stamp the category-level grant classification onto ``TOOL_REGISTRY``.
+
+    Runs once at import, after every ``get_*_metadata()`` merge above.  Uses
+    ``setdefault`` so a per-tool classification declared next to the tool
+    always wins over the category default.
+    """
+    for category, gate in CODE_GRANTED_CATEGORIES.items():
+        for meta in TOOL_REGISTRY.values():
+            if meta.get("category") == category:
+                meta.setdefault("grant", "code")
+                meta.setdefault("gate", gate)
+
+
+_classify_code_granted_categories()
+
+
 def get_available_tools() -> Dict[str, Dict[str, Any]]:
     """Get all registered tools with their metadata.
 

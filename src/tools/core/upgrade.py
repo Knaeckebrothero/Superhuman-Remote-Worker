@@ -45,6 +45,10 @@ WORKSPACE_UPGRADE_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "category": "core",
         "short_description": "Ask to upgrade to a real sandbox workspace.",
         "phases": ["strategic", "tactical"],  # Available in both modes
+        # No config lists this; persistent_session.py:1547 and agent.py:3078
+        # append it, and only where there is something to upgrade to.
+        "grant": "code",
+        "gate": "lite tier — backend.supports_shell is False",
     },
 }
 

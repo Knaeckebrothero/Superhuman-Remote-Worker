@@ -35,6 +35,14 @@ DELEGATION_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "category": "delegation",
         "short_description": "Spawn 1-5 parallel subagent jobs from your workspace.",
         "phases": ["strategic", "tactical"],
+        "grant": "explicit",
+        "gate": (
+            "named outright in a tools.delegation list. No config has granted "
+            "the heavy delegation pair since 57430a2a emptied worker_base on "
+            "2026-07-22; whether to restore it is an open decision "
+            "(docs/issues/registered_tools_no_config_can_grant.md §3b) and "
+            "`delegation: true` must not be the thing that takes it"
+        ),
     },
     "resume_delegation_child": {
         "module": "delegation.delegate_work",
@@ -47,6 +55,11 @@ DELEGATION_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "category": "delegation",
         "short_description": "Send a child back to work with feedback, then re-suspend.",
         "phases": ["strategic", "tactical"],
+        "grant": "explicit",
+        "gate": (
+            "named outright in a tools.delegation list; the other half of the "
+            "heavy delegation pair, same open decision as delegate_work"
+        ),
     },
 }
 

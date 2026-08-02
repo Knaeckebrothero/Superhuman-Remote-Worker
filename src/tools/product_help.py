@@ -46,6 +46,11 @@ PRODUCT_HELP_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         ),
         "category": "product_help",
         "phases": ["strategic", "tactical"],
+        # Persistent-session floor appended at persistent_session.py:1427-1432
+        # and removed again by the operator break-glass. `product_help` has no
+        # ToolsConfig field at all, so a config naming it is discarded today.
+        "grant": "code",
+        "gate": "app-guide break-glass off (app_guide_break_glass_disabled)",
     },
 }
 

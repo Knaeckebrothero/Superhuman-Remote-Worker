@@ -42,6 +42,9 @@ OFFICER_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "category": "core",
         "short_description": "End the wake; sleep until the timer or an event.",
         "phases": ["strategic", "tactical"],  # phase-free in sessions
+        # No config lists this; persistent_session.py:1554-1557 appends it.
+        "grant": "code",
+        "gate": "officer.enabled is True",
     },
     "notify_user": {
         "module": "core.officer",
@@ -55,6 +58,9 @@ OFFICER_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "category": "core",
         "short_description": "Message the user: log, digest, or page.",
         "phases": ["strategic", "tactical"],
+        # No config lists this; persistent_session.py:1554-1557 appends it.
+        "grant": "code",
+        "gate": "officer.enabled is True",
     },
 }
 
