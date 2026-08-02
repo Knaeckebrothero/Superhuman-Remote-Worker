@@ -826,10 +826,15 @@ class GitManager:
             return False
 
         try:
-            # Auto-detect branch
+            # Auto-detect branch. Fall back on an EMPTY result too, not just a
+            # non-zero exit: a detached HEAD reports success with no output, and
+            # `git push -u origin ""` fails with `invalid refspec`.
+            # has_unpushed_commits() has always guarded this; push() did not,
+            # which is the asymmetry that turned a parser bug into lost work.
             if branch is None:
                 result = self._run_git(["branch", "--show-current"])
-                branch = result.stdout.strip() if result.returncode == 0 else "main"
+                detected = result.stdout.strip() if result.returncode == 0 else ""
+                branch = detected or "main"
 
             # Push branch
             result = self._run_git(
@@ -1232,19 +1237,37 @@ class GitManager:
                 exit_code = 1
 
             rest = lines[1] if len(lines) > 1 else ""
-            stdout_marker = "--- stdout ---\n"
-            if rest.startswith(stdout_marker):
-                stdout = rest[len(stdout_marker) :]
-            elif rest.strip() == "(no output)":
-                stdout = ""
-            else:
-                stdout = rest
 
+            # Locate the payload marker rather than assuming it is the first
+            # line. The backend prepends header lines before it — `CWD:` since
+            # f41970ae — and the old `rest.startswith(...)` check fell through
+            # to `stdout = rest`, handing callers the banner as command output.
+            # That is how push() came to invoke
+            # `git push -u origin "CWD: /…\n--- stdout ---\nmain"`, failing with
+            # `invalid refspec` on every phase boundary. See
+            # docs/issues/deliverable_lost_to_nested_repo_commit_and_stranded_mode_a_job.md
+            stdout_marker = "--- stdout ---\n"
+            marker_at = rest.find(stdout_marker)
+            if marker_at != -1:
+                stdout = rest[marker_at + len(stdout_marker) :]
+            else:
+                # No payload marker: drop known header lines, then recheck for
+                # the empty sentinel (which the header also displaced).
+                body = "\n".join(
+                    ln for ln in rest.split("\n") if not ln.startswith("CWD:")
+                ).strip()
+                stdout = "" if body == "(no output)" else body
+
+            # The backend merges stdout and stderr into one stream, so on
+            # failure the diagnosis is in `stdout`. Mirror it into `stderr` too:
+            # callers log `result.stderr` on failure, and hardcoding "" is why
+            # the real breakage surfaced for a day as `git push failed: ` with
+            # nothing after the colon.
             return subprocess.CompletedProcess(
                 args=cmd,
                 returncode=exit_code,
                 stdout=stdout,
-                stderr="",
+                stderr="" if exit_code == 0 else stdout,
             )
 
         # No "Exit code:" prefix — timeout, stall, or other error
