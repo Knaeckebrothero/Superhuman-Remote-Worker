@@ -1,8 +1,10 @@
-import {afterEach, describe, expect, it, vi} from 'vitest';
-import {Injector, runInInjectionContext, signal} from '@angular/core';
+import {afterEach, beforeAll, describe, expect, it, vi} from 'vitest';
+import {Injector, runInInjectionContext, signal, ɵresolveComponentResources} from '@angular/core';
+import {TestBed} from '@angular/core/testing';
 import {HttpClient} from '@angular/common/http';
 import {of} from 'rxjs';
-import {TranslocoService} from '@jsverse/transloco';
+import {TranslocoService, TranslocoTestingModule} from '@jsverse/transloco';
+import en from '../../../assets/i18n/en.json';
 import {ModelGroupComponent} from './model-group.component';
 import {ModelService} from '../../core/services/model.service';
 import {SettingsService} from '../../core/services/settings.service';
@@ -485,5 +487,133 @@ describe('ModelGroupComponent', () => {
       const {component} = createComponent();
       expect(component.showSubagent()).toBe(true);
     });
+  });
+});
+
+// Task 3 review fix — every test above builds ModelGroupComponent via
+// runInInjectionContext, which never renders a template: it can prove the
+// signal flips, but nothing above it proves the notice is actually visible,
+// or that its transloco key resolves to real text at runtime rather than the
+// raw key string (a missing/misspelled key renders literally — AOT's
+// strictTemplates catches a *bad binding*, not an *absent translation
+// entry*). This mounts the real component through TestBed and asserts against
+// the rendered DOM, using the actual shipped en.json (not a hand-inlined
+// translation stub) so a key present in the template but missing from the
+// real asset file would fail this test.
+describe('ModelGroupComponent — reasoning reset notice rendering (Task 3 review fix)', () => {
+  // The template renders <app-icon>, whose @Component uses an external
+  // `styleUrl`. The Angular CLI normally inlines styleUrl content at build
+  // time; this project's vitest setup JIT-compiles raw TS with no such
+  // transform, so `TestBed.configureTestingModule` throws ("Component
+  // 'AppIconComponent' is not resolved") unless the pending resource queue is
+  // drained first (same pattern as memory-panel.component.spec.ts). These
+  // tests DO render the template and assert on real DOM text, but the style
+  // content itself is irrelevant to that — an empty-string resolver is enough
+  // to unblock compilation without pretending to test CSS.
+  beforeAll(async () => {
+    await ɵresolveComponentResources(() => Promise.resolve(''));
+  });
+
+  afterEach(() => {
+    TestBed.resetTestingModule();
+    localStorage.clear();
+  });
+
+  function mountInSessionMode() {
+    const modelServiceMock = {
+      models: signal([]),
+      auxiliaryModels: signal([]),
+      visionModels: signal([]),
+      whisperModels: signal([]),
+      embeddingModels: signal([]),
+      providers: signal([]),
+      reasoningByModel: signal<Record<string, {method: string; default: string | null; options: string[]}>>({
+        'gpt-5.6-sol': {method: 'effort_enum', default: 'high', options: ['low', 'medium', 'high', 'xhigh', 'max']},
+      }),
+      loading: signal(false),
+      loaded: signal(true),
+      load: vi.fn(),
+    };
+
+    TestBed.configureTestingModule({
+      imports: [
+        ModelGroupComponent,
+        TranslocoTestingModule.forRoot({
+          langs: {en},
+          translocoConfig: {availableLangs: ['en'], defaultLang: 'en'},
+        }),
+      ],
+      providers: [{provide: ModelService, useValue: modelServiceMock}],
+    });
+
+    const fixture = TestBed.createComponent(ModelGroupComponent);
+    // `mode` is a signal input(); this repo's vitest pipeline doesn't run
+    // components through ngtsc, so ɵcmp.inputs is empty here and both
+    // template property binding and fixture.componentRef.setInput() throw
+    // NG0303 for every signal-input component (see the identical workaround
+    // and its full explanation in contact-form.component.spec.ts). Session
+    // mode is required for the Reasoning field to render at all (it's
+    // entirely behind the session/@else branch), so — same trick this file
+    // already relies on for `mode` elsewhere — replace the property directly.
+    Object.defineProperty(fixture.componentInstance, 'mode', {value: () => 'session'});
+    fixture.detectChanges();
+    return fixture;
+  }
+
+  it('renders nothing when there is no reset to report', () => {
+    const fixture = mountInSessionMode();
+    const root = fixture.nativeElement as HTMLElement;
+    expect(root.querySelector('.reasoning-reset-notice')).toBeNull();
+  });
+
+  it('renders the resolved notice text — not the raw translation key — once an involuntary prefill clears a pick', () => {
+    const fixture = mountInSessionMode();
+    const component = fixture.componentInstance;
+
+    // Drives the field into existence and gives it something to lose.
+    component.onSessionModelChange('gpt-5.6-sol');
+    component.onSessionReasoningChange('max');
+    fixture.detectChanges();
+    expect((fixture.nativeElement as HTMLElement).querySelector('.reasoning-reset-notice')).toBeNull();
+
+    // The involuntary path itself: SessionCreateComponent's
+    // applyEffectiveDefault() cascade calls exactly this, with exactly this
+    // shape of config, once a default-expert resolution lands (see
+    // session-create.component.spec.ts's Task 3 describe block).
+    component.prefillFromConfig({llm: {}});
+    fixture.detectChanges();
+
+    const notice = (fixture.nativeElement as HTMLElement).querySelector('.reasoning-reset-notice');
+    expect(notice).not.toBeNull();
+    // The message lives in its own <span>, separate from the <app-icon>
+    // sibling: in JSDOM (no Material Symbols font) app-icon's ligature name
+    // ("info") renders as literal projected text, which would otherwise
+    // contaminate a whole-container text assertion — querying the span is
+    // the more correct check, not a workaround, since a real browser
+    // wouldn't render "info" as legible text at all.
+    const message = notice!.querySelector('span');
+    expect(message).not.toBeNull();
+    const text = (message!.textContent ?? '').trim();
+    // Proves the pipe actually resolved the real, shipped en.json entry.
+    // A missing or misspelled key renders literally as
+    // "agentSettings.model.reasoningResetNotice" — AOT's strictTemplates
+    // does not catch that, since the binding itself is well-typed either way.
+    expect(text).not.toContain('agentSettings.model.reasoningResetNotice');
+    expect(text).toBe(en.agentSettings.model.reasoningResetNotice);
+  });
+
+  it('the notice disappears once the user dismisses it with a fresh pick', () => {
+    const fixture = mountInSessionMode();
+    const component = fixture.componentInstance;
+
+    component.onSessionModelChange('gpt-5.6-sol');
+    component.onSessionReasoningChange('max');
+    component.prefillFromConfig({llm: {}});
+    fixture.detectChanges();
+    expect((fixture.nativeElement as HTMLElement).querySelector('.reasoning-reset-notice')).not.toBeNull();
+
+    component.onSessionReasoningChange('high');
+    fixture.detectChanges();
+    expect((fixture.nativeElement as HTMLElement).querySelector('.reasoning-reset-notice')).toBeNull();
   });
 });
