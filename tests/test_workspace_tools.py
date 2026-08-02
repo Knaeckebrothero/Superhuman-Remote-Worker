@@ -3,9 +3,11 @@
 Tests the read tracking mechanism and enforcement in workspace tools.
 """
 
+import io
 import pytest
 import tempfile
 import sys
+import zipfile
 from pathlib import Path
 
 # Add project root to path
@@ -149,6 +151,124 @@ class TestReadFileTracking:
 
         assert str(workspace_manager.get_path("vanished.txt")) in result
         assert "search_files" in result
+
+
+class TestReadFileBinaryAndArchiveHandling:
+    """read_file must diagnose binary content honestly instead of leaking a
+    raw UTF-8 codec error.
+
+    Regression coverage for docs/issues/session_uploads_never_extract_archives.md:
+    a zip attached to a session was unreadable because read_file's only
+    fallback for undecodable bytes was `f"Error: {str(e)}"` — the bare
+    UnicodeDecodeError message.
+    """
+
+    def _make_zip(self, entries: dict[str, bytes]) -> bytes:
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as zf:
+            for name, data in entries.items():
+                zf.writestr(name, data)
+        return buf.getvalue()
+
+    def test_read_file_on_zip_returns_entry_listing(
+        self, workspace_tools, workspace_manager, tool_context
+    ):
+        data = self._make_zip(
+            {
+                "cover_letter.txt": b"Dear hiring manager...",
+                "photo.jpg": b"\xff\xd8\xff\xe0fakejpegbytes",
+            }
+        )
+        workspace_manager.backend.write_file("bundle.zip", data)
+
+        result = workspace_tools["read_file"].invoke({"path": "bundle.zip"})
+
+        assert "cover_letter.txt" in result
+        assert "photo.jpg" in result
+        assert "2" in result  # entry count
+        assert "codec" not in result
+        assert "utf-8" not in result.lower()
+        assert not result.startswith("Error")
+        assert tool_context.was_recently_read("bundle.zip")
+
+    def test_read_file_on_zip_reports_entry_sizes(
+        self, workspace_tools, workspace_manager
+    ):
+        data = self._make_zip({"notes.txt": b"x" * 1234})
+        workspace_manager.backend.write_file("notes.zip", data)
+
+        result = workspace_tools["read_file"].invoke({"path": "notes.zip"})
+
+        assert "1,234" in result or "1234" in result
+
+    def test_read_file_on_zip_skips_directories_dotfiles_and_macosx(
+        self, workspace_tools, workspace_manager
+    ):
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as zf:
+            zf.writestr("real.txt", b"hello")
+            zf.writestr("dir/", b"")
+            zf.writestr(".hidden", b"secret")
+            zf.writestr("__MACOSX/._real.txt", b"junk")
+        workspace_manager.backend.write_file("mixed.zip", buf.getvalue())
+
+        result = workspace_tools["read_file"].invoke({"path": "mixed.zip"})
+
+        assert "real.txt" in result
+        assert ".hidden" not in result
+        assert "__MACOSX" not in result
+
+    def test_read_file_on_corrupt_zip_returns_binary_message_not_codec_error(
+        self, workspace_tools, workspace_manager
+    ):
+        garbage = b"this is not actually a zip file, just some bytes\xdd\xdd"
+        workspace_manager.backend.write_file("broken.zip", garbage)
+
+        result = workspace_tools["read_file"].invoke({"path": "broken.zip"})
+
+        assert result == f"[binary file: broken.zip, {len(garbage)} bytes]"
+        assert "codec" not in result
+
+    def test_read_file_on_arbitrary_binary_returns_binary_message(
+        self, workspace_tools, workspace_manager, tool_context
+    ):
+        data = b"\xff\xfe\x00\x01\x02binary\xdd\xdd"
+        workspace_manager.backend.write_file("blob.dat", data)
+
+        result = workspace_tools["read_file"].invoke({"path": "blob.dat"})
+
+        assert result == f"[binary file: blob.dat, {len(data)} bytes]"
+        assert "codec" not in result
+        assert tool_context.was_recently_read("blob.dat")
+
+    def test_read_file_on_text_file_is_unaffected(
+        self, workspace_tools, workspace_manager
+    ):
+        """Plain UTF-8 content must still go through the normal text path."""
+        workspace_manager.write_file("plain.txt", "hello world")
+
+        result = workspace_tools["read_file"].invoke({"path": "plain.txt"})
+
+        assert "hello world" in result
+        assert "binary file" not in result
+
+    def test_read_file_on_docx_is_not_reported_as_binary(
+        self, workspace_tools, workspace_manager
+    ):
+        """The near-miss the incident report calls out: DOCX must keep
+        working exactly as before — only archives/other binaries are new."""
+        docx = pytest.importorskip("docx")
+
+        document = docx.Document()
+        document.add_paragraph("Hello from a real docx.")
+        buf = io.BytesIO()
+        document.save(buf)
+        workspace_manager.backend.write_file("letter.docx", buf.getvalue())
+
+        result = workspace_tools["read_file"].invoke({"path": "letter.docx"})
+
+        assert "binary file" not in result
+        assert "Hello from a real docx" in result
 
 
 class TestEditFileReadRequirement:
