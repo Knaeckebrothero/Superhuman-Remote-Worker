@@ -364,6 +364,21 @@ def validate_tool_override_fragment(config_override: Any) -> dict[str, list[str]
             )
         claimed_by[category] = key
         names = expand_tool_policy(value, category)
+        if not names and _is_affirmative(value):
+            # The caller asked for ON and the expansion is empty, because every
+            # tool here is ``grant: "code"``.  ``expand_category_true`` logs a
+            # warning and returns ``[]``, which is right for a config layer and
+            # wrong for a request: returning 200 on "turn SQL on" while turning
+            # nothing on is *accepted and discarded*, the very thing this
+            # boundary exists to remove.  ``false`` / ``[]`` stay legal — asking
+            # to turn off a category nobody manages is a harmless no-op.
+            raise ToolPolicyError(
+                f"tools.{key}: this would turn nothing on. Every tool in the "
+                f"{category} category is granted by runtime code "
+                f"({_registry().CODE_GRANTED_CATEGORIES.get(category, 'runtime code')} "
+                f"decides), so config cannot enable it. Drop the key; write "
+                f"false only if you meant to assert it is off."
+            )
         foreign = _foreign_tool_names(names, category)
         if foreign:
             raise ToolPolicyError(
@@ -379,6 +394,17 @@ def validate_tool_override_fragment(config_override: Any) -> dict[str, list[str]
 # ---------------------------------------------------------------------------
 # internals
 # ---------------------------------------------------------------------------
+def _is_affirmative(value: Any) -> bool:
+    """Whether a policy value asks for tools rather than for none.
+
+    ``true`` and ``{except: [...]}`` are the two forms that can *request* a
+    non-empty set and still expand to ``[]`` (a wholly ``grant: "code"``
+    category).  A bare list and ``{only: [...]}`` cannot — both are refused
+    when empty — and ``false`` / ``[]`` are the negative forms.
+    """
+    return value is True or (isinstance(value, dict) and "except" in value)
+
+
 def _foreign_tool_names(names: list[str], category: str) -> list[str]:
     """Describe every name in ``names`` that does not belong to ``category``."""
     reg = _registry()

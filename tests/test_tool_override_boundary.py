@@ -21,11 +21,26 @@ against the global registry rather than the key it arrived under, so
 ``_truthy(tools.get("shell"))``, a category key, so it never sees it.
 
 The fix is one generic validator
-(``src.core.tool_policy.validate_tool_override_fragment``) at all three
-boundaries. The rule: the category must be real and every name in it must
-belong to that category *per the registry*. Anything the boundary will not
-honour is **rejected with a 400** — never silently dropped, which would only
-replace one silent drop with another.
+(``src.core.tool_policy.validate_tool_override_fragment``) at every boundary
+that accepts a caller-supplied ``tools`` fragment. The rule: the category must
+be real and every name in it must belong to that category *per the registry*.
+Anything the boundary will not honour is **rejected with a 400** — never
+silently dropped, which would only replace one silent drop with another.
+
+Six boundaries, and the coverage below is deliberately split between the
+validator and each **call site**, because the defect was a filter at the call
+site and a validator-level test cannot see one being re-narrowed:
+
+===============================  ==========================================
+Boundary                         Call-site class
+===============================  ==========================================
+``POST /persistent/threads``     ``TestSessionCreateBoundary``
+``PATCH .../config`` (runtime)   ``TestSessionRuntimeUpdateBoundary``
+``POST /api/jobs``               ``TestJobCreateBoundary``
+``POST /sessions/{id}/prepare``  ``TestPrepareBoundary``
+``POST``/``PATCH /automations``  ``TestAutomationBoundary``
+``POST``/``PATCH /projects``     ``TestProjectDefaultOverrideBoundary``
+===============================  ==========================================
 
 What this validator is NOT: an authorization gate. Capability grants
 (``src/core/capability_grants.py``) remain the single PDP, and
@@ -603,3 +618,607 @@ class TestLiveSessionSanitiser:
         payload = {"tools": {"canvas": True}}
         _sanitize_live_session_config_override(payload)
         assert payload == {"tools": {"canvas": True}}
+
+
+# =============================================================================
+# The session call sites — I2
+# =============================================================================
+#
+# Everything above this line tests the shared validator. That is not enough,
+# and the gap was found by review: re-narrowing `create_thread` or
+# `_apply_thread_config_update` back to the four closed groups — Defect 2,
+# verbatim — left the whole suite green, because both sites delegate to a
+# helper the tests exercised directly. A filter at the call site is invisible
+# to a validator-level test. These two classes drive the endpoints.
+
+SESSION_THREAD_ID = "11111111-2222-3333-4444-555555555555"
+SESSION_USER_ID = str(uuid.uuid4())
+
+
+@pytest.fixture
+def session_create_env(monkeypatch):
+    """`POST /api/persistent/threads` with its collaborators stubbed.
+
+    `resolve_config` is left REAL — it reads the shipped YAML, so the
+    assertions below prove the fragment survives an actual resolution rather
+    than a mock's idea of one.
+    """
+    import orchestrator.main as main
+
+    conn = AsyncMock()
+    conn.execute = AsyncMock(return_value="UPDATE 1")
+    acquire_cm = AsyncMock()
+    acquire_cm.__aenter__.return_value = conn
+    acquire_cm.__aexit__.return_value = False
+
+    db = SimpleNamespace(
+        get_user_settings=AsyncMock(return_value={}),
+        create_thread=AsyncMock(return_value=SESSION_THREAD_ID),
+        acquire=MagicMock(return_value=acquire_cm),
+        list_thread_mounts=AsyncMock(return_value=[]),
+        replace_thread_mounts=AsyncMock(),
+    )
+    user = {"id": SESSION_USER_ID, "is_admin": False}
+
+    monkeypatch.setattr(main, "postgres_db", db)
+    monkeypatch.setattr(main, "require_approved_user", AsyncMock(return_value=user))
+    monkeypatch.setattr(main, "_enforce_readiness_gate", AsyncMock())
+    monkeypatch.setattr(
+        main, "_authorize_thread_project_ids", AsyncMock(return_value=[])
+    )
+    monkeypatch.setattr(
+        main, "_resolve_session_account_defaults", AsyncMock(return_value={})
+    )
+    monkeypatch.setattr(main, "_is_experts_db_enabled", MagicMock(return_value=False))
+    monkeypatch.setattr(main, "_user_experts_enabled", AsyncMock(return_value=False))
+    monkeypatch.setattr(
+        main, "_authorize_thread_datasource_ids", AsyncMock(return_value=[])
+    )
+    grants = AsyncMock()
+    monkeypatch.setattr(main, "_enforce_session_create_grants", grants)
+    return main, db, conn, grants
+
+
+def _thread_create_body(main, config_override):
+    return main.ThreadCreateRequest(title="t", config_override=config_override)
+
+
+def _persisted_thread_override(conn) -> dict:
+    """The `tools` block as it lands in threads.metadata — the durable
+    artifact, and the thing the user's untick has to survive into."""
+    import json
+
+    payload = json.loads(conn.execute.await_args.args[2])
+    return payload["config_override"]
+
+
+class TestSessionCreateBoundary:
+    @pytest.mark.asyncio
+    async def test_unticking_a_previously_discarded_category_reaches_the_thread(
+        self, session_create_env
+    ):
+        """THE motivating defect, at the endpoint. Before: `tools.research` was
+        copied across only if it was one of four groups, so this key never
+        reached `threads.metadata.config_override` and the agent bound research
+        tools anyway."""
+        main, _, conn, _ = session_create_env
+
+        await main.create_thread(
+            _thread_create_body(main, {"tools": {"research": [], "git": []}}),
+            MagicMock(),
+        )
+
+        persisted = _persisted_thread_override(conn)
+        assert persisted["tools"]["research"] == []
+        assert persisted["tools"]["git"] == []
+
+    @pytest.mark.asyncio
+    async def test_the_whole_form_deselect_survives(self, session_create_env):
+        main, _, conn, _ = session_create_env
+
+        await main.create_thread(
+            _thread_create_body(
+                main, {"tools": {c: [] for c in COCKPIT_SESSION_CATEGORIES}}
+            ),
+            MagicMock(),
+        )
+
+        persisted = _persisted_thread_override(conn)
+        assert set(persisted["tools"]) == set(COCKPIT_SESSION_CATEGORIES)
+        assert all(v == [] for v in persisted["tools"].values())
+
+    @pytest.mark.asyncio
+    async def test_the_grant_check_sees_the_widened_fragment(self, session_create_env):
+        """A category the boundary now honours must also reach the PDP — the
+        fix must not hand the agent tools the grant check never saw."""
+        main, _, _, grants = session_create_env
+
+        await main.create_thread(
+            _thread_create_body(main, {"tools": {"shell": ["run_command"]}}),
+            MagicMock(),
+        )
+
+        fragment = grants.await_args.args[0]
+        assert fragment["tools"]["shell"] == ["run_command"]
+
+    @pytest.mark.asyncio
+    async def test_a_smuggle_is_a_400_and_nothing_is_created(self, session_create_env):
+        main, db, _, _ = session_create_env
+
+        with pytest.raises(main.HTTPException) as exc:
+            await main.create_thread(
+                _thread_create_body(main, {"tools": {"canvas": ["run_command"]}}),
+                MagicMock(),
+            )
+        assert exc.value.status_code == 400
+        assert "run_command" in exc.value.detail
+        db.create_thread.assert_not_awaited()
+
+
+@pytest.fixture
+def session_patch_env(monkeypatch):
+    """The internal runtime PATCH (`agent_update_thread_config`) — the live
+    `config.update` boundary, driven at the endpoint."""
+    import orchestrator.main as main
+
+    thread_row = {
+        "id": SESSION_THREAD_ID,
+        "user_id": SESSION_USER_ID,
+        "project_id": None,
+        "metadata": {"config_override": {"workspace": {"backend": "sandbox"}}},
+    }
+    db = SimpleNamespace(
+        get_thread=AsyncMock(return_value=thread_row),
+        get_user=AsyncMock(return_value={"id": SESSION_USER_ID, "is_admin": False}),
+        merge_thread_config_override=AsyncMock(return_value=True),
+        set_thread_datasource_ids=AsyncMock(return_value=True),
+        record_security_event=AsyncMock(),
+        resolve_api_keys_for_job=AsyncMock(return_value={}),
+        resolve_datasources_for_thread=AsyncMock(return_value=[]),
+    )
+    monkeypatch.setattr(main, "postgres_db", db)
+    monkeypatch.setattr(main, "require_internal", AsyncMock())
+    monkeypatch.setattr(main, "_thread_project_ids", AsyncMock(return_value=[]))
+    grants = AsyncMock()
+    monkeypatch.setattr(main, "_enforce_session_create_grants", grants)
+    return main, db, grants
+
+
+class TestSessionRuntimeUpdateBoundary:
+    @pytest.mark.asyncio
+    async def test_a_live_untick_outside_the_four_groups_is_persisted(
+        self, session_patch_env
+    ):
+        """Before: this boundary REPLACED `tools` with the accepted four-group
+        subset, so a live "turn research off" was acknowledged and dropped."""
+        main, db, _ = session_patch_env
+
+        await main.agent_update_thread_config(
+            MagicMock(),
+            SESSION_THREAD_ID,
+            main.AgentThreadConfigUpdateRequest(
+                config_override={"tools": {"research": [], "canvas": []}}
+            ),
+        )
+
+        merged = db.merge_thread_config_override.await_args.args[1]
+        assert merged["tools"] == {"research": [], "canvas": []}
+
+    @pytest.mark.asyncio
+    async def test_a_live_smuggle_is_a_400_and_nothing_persists(
+        self, session_patch_env
+    ):
+        main, db, _ = session_patch_env
+
+        with pytest.raises(main.HTTPException) as exc:
+            await main.agent_update_thread_config(
+                MagicMock(),
+                SESSION_THREAD_ID,
+                main.AgentThreadConfigUpdateRequest(
+                    config_override={"tools": {"citation": ["run_command"]}}
+                ),
+            )
+        assert exc.value.status_code == 400
+        db.merge_thread_config_override.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_the_datasource_flip_wins_over_the_requests_own_tools(
+        self, session_patch_env
+    ):
+        """The order in the grant fragment is load-bearing. Now that a request
+        may name a connector category, `tools.sql: []` would mask a
+        datasource_tools violation — while attach applies the flip LAST, so the
+        session would get the tools anyway."""
+        main, db, grants = session_patch_env
+        db.resolve_datasources_for_thread = AsyncMock(
+            return_value=[
+                {"type": "postgresql", "name": "PG", "project_read_only": False}
+            ]
+        )
+        db.get_datasource = AsyncMock(
+            return_value={"id": "ds-a", "type": "postgresql", "is_global": True}
+        )
+        with patch.object(
+            main, "user_can_access_datasource", AsyncMock(return_value=True)
+        ):
+            await main.agent_update_thread_config(
+                MagicMock(),
+                SESSION_THREAD_ID,
+                main.AgentThreadConfigUpdateRequest(
+                    config_override={"tools": {"sql": []}},
+                    datasource_ids=["ds-a"],
+                ),
+            )
+
+        fragment = grants.await_args.args[0]
+        assert fragment["tools"]["sql"], (
+            "the request's `sql: []` masked the datasource flip from the PDP"
+        )
+
+
+# =============================================================================
+# The three boundaries found by review — I1 and I3
+# =============================================================================
+
+
+class TestPrepareBoundary:
+    """`POST /api/sessions/{id}/prepare` takes a `config_override` that flows
+    to `_resolve_session_config`, where a non-None value **replaces** the
+    thread's persisted override outright — so it is a write boundary, not a
+    hint. Owner-only and API-direct (the cockpit posts `{}`)."""
+
+    @pytest.fixture
+    def prepare_env(self, monkeypatch):
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+
+        from orchestrator.routers import sessions as sessions_mod
+
+        async def _fake_auth(request, db):
+            return {"id": "u1", "is_approved": True}
+
+        monkeypatch.setattr(sessions_mod, "require_approved_user", _fake_auth)
+        monkeypatch.setattr(
+            sessions_mod,
+            "_get_db",
+            lambda: SimpleNamespace(
+                get_thread=AsyncMock(
+                    return_value={
+                        "id": "t1",
+                        "user_id": "u1",
+                        "agent_id": None,
+                        "config_name": "session_base",
+                    }
+                )
+            ),
+        )
+        do_prepare = MagicMock()
+        monkeypatch.setattr(sessions_mod, "_do_prepare", do_prepare)
+        monkeypatch.setattr(
+            sessions_mod, "_schedule_prepare_task", lambda coro: MagicMock()
+        )
+
+        app = FastAPI()
+        app.include_router(sessions_mod.router)
+        return TestClient(app, raise_server_exceptions=False), do_prepare
+
+    def test_a_smuggle_is_a_400_and_nothing_is_provisioned(self, prepare_env):
+        client, do_prepare = prepare_env
+
+        resp = client.post(
+            "/api/sessions/t1/prepare",
+            json={"config_override": {"tools": {"canvas": ["run_command"]}}},
+        )
+
+        assert resp.status_code == 400
+        assert "run_command" in resp.text
+        do_prepare.assert_not_called()
+
+    def test_a_valid_override_reaches_provisioning_normalised(self, prepare_env):
+        client, do_prepare = prepare_env
+
+        resp = client.post(
+            "/api/sessions/t1/prepare",
+            json={"config_override": {"tools": {"canvas": True, "research": []}}},
+        )
+
+        assert resp.status_code == 202
+        passed = do_prepare.call_args.kwargs["config_override"]
+        assert passed["tools"] == {
+            "canvas": ["clear_canvas", "get_canvas", "set_canvas"],
+            "research": [],
+        }
+
+    def test_the_cockpits_empty_body_is_unaffected(self, prepare_env):
+        """The shipped cockpit posts `{}` — no behaviour change for it."""
+        client, do_prepare = prepare_env
+
+        assert client.post("/api/sessions/t1/prepare", json={}).status_code == 202
+        assert do_prepare.call_args.kwargs["config_override"] is None
+
+
+class TestAutomationBoundary:
+    """An automation's `config_override` is stored raw and handed STRAIGHT to
+    `db.create_job` by `create_job_from_automation` — it never crosses
+    `POST /api/jobs`, so every cron fire re-plants whatever is stored."""
+
+    @pytest.fixture
+    def automations_env(self, monkeypatch):
+        from orchestrator.routers import automations as mod
+
+        caller = {"id": SESSION_USER_ID, "is_admin": False}
+        db = SimpleNamespace(
+            create_automation=AsyncMock(return_value={"id": "a1"}),
+            update_automation=AsyncMock(return_value={"id": "a1"}),
+        )
+        # The router late-imports `from main import postgres_db`, which
+        # resolves sys.modules["main"] — patching orchestrator.main misses it.
+        monkeypatch.setattr("main.postgres_db", db)
+        monkeypatch.setattr(
+            mod, "require_approved_user", AsyncMock(return_value=caller)
+        )
+        monkeypatch.setattr(
+            mod,
+            "validate_automation_expert_selection",
+            AsyncMock(return_value="developer"),
+        )
+        monkeypatch.setattr(
+            mod,
+            "_resolve_automation_or_404",
+            AsyncMock(
+                return_value={
+                    "id": "a1",
+                    "owner_id": SESSION_USER_ID,
+                    "project_id": None,
+                    "expert": "developer",
+                    "enabled": True,
+                    "cron_expr": "0 * * * *",
+                    "timezone": "UTC",
+                }
+            ),
+        )
+        return mod, db
+
+    def _create_body(self, mod, config_override):
+        return mod.AutomationCreate(
+            name="a",
+            cron_expr="0 * * * *",
+            expert="developer",
+            prompt="p",
+            config_override=config_override,
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_smuggle_is_a_400_and_nothing_is_stored(self, automations_env):
+        from fastapi import HTTPException
+
+        mod, db = automations_env
+
+        with pytest.raises(HTTPException) as exc:
+            await mod.create_automation(
+                MagicMock(),
+                self._create_body(mod, {"tools": {"canvas": ["run_command"]}}),
+            )
+        assert exc.value.status_code == 400
+        db.create_automation.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_valid_override_is_stored_normalised(self, automations_env):
+        mod, db = automations_env
+
+        await mod.create_automation(
+            MagicMock(), self._create_body(mod, {"tools": {"research": []}})
+        )
+
+        stored = db.create_automation.await_args.kwargs["config_override"]
+        assert stored["tools"] == {"research": []}
+
+    @pytest.mark.asyncio
+    async def test_the_patch_path_is_validated_too(self, automations_env):
+        """Every fire replays the stored override, so an update is the same
+        boundary as a create."""
+        from fastapi import HTTPException
+
+        mod, db = automations_env
+
+        with pytest.raises(HTTPException) as exc:
+            await mod.update_automation(
+                MagicMock(),
+                "a1",
+                mod.AutomationUpdate(
+                    config_override={"tools": {"citation": ["shell_execute"]}}
+                ),
+            )
+        assert exc.value.status_code == 400
+        db.update_automation.assert_not_awaited()
+
+
+class TestProjectDefaultOverrideBoundary:
+    """`projects.default_config_override` is merged UNDER every job created in
+    the project, so an unvalidated tools block here is a cross-principal
+    escalation: the planter is not the runner, and the PDP keys off the
+    category name. Validated on WRITE only — no existing row is touched."""
+
+    @pytest.fixture
+    def project_env(self, monkeypatch):
+        import orchestrator.main as main
+
+        db = SimpleNamespace(
+            create_project=AsyncMock(return_value={"id": "p1"}),
+            add_project_member=AsyncMock(),
+            update_project=AsyncMock(return_value=True),
+        )
+        monkeypatch.setattr(main, "postgres_db", db)
+        monkeypatch.setattr(
+            main,
+            "require_approved_user",
+            AsyncMock(return_value={"id": SESSION_USER_ID, "is_admin": False}),
+        )
+        monkeypatch.setattr(main, "require_project_owner", AsyncMock())
+        return main, db
+
+    @pytest.mark.asyncio
+    async def test_create_rejects_a_smuggle(self, project_env):
+        main, db = project_env
+
+        with pytest.raises(main.HTTPException) as exc:
+            await main.create_project(
+                main.ProjectCreate(
+                    name="p",
+                    user_id=SESSION_USER_ID,
+                    default_config_override={"tools": {"canvas": ["run_command"]}},
+                ),
+                MagicMock(),
+            )
+        assert exc.value.status_code == 400
+        db.create_project.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_patch_rejects_a_smuggle(self, project_env):
+        main, db = project_env
+
+        with pytest.raises(main.HTTPException) as exc:
+            await main.update_project(
+                "p1",
+                main.ProjectUpdate(
+                    default_config_override={"tools": {"knowledge": ["run_command"]}}
+                ),
+                MagicMock(),
+            )
+        assert exc.value.status_code == 400
+        db.update_project.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_patch_that_does_not_send_the_field_is_untouched(self, project_env):
+        """Write-only is what makes this back-compatible: an existing row with
+        a bad override is never read, let alone rejected, until someone
+        rewrites it."""
+        main, db = project_env
+
+        await main.update_project("p1", main.ProjectUpdate(name="renamed"), MagicMock())
+
+        assert db.update_project.await_args.args[0] == "p1"
+        assert "default_config_override" not in db.update_project.await_args.kwargs
+
+    @pytest.mark.asyncio
+    async def test_the_cockpits_memory_toggle_payload_still_works(self, project_env):
+        """`project-detail.component.ts::toggleProjectMemory` re-submits the
+        WHOLE stored override plus a memory key. It carries no tools block, so
+        it is unaffected — this is the payload the write-path check has to keep
+        working."""
+        main, db = project_env
+
+        await main.update_project(
+            "p1",
+            main.ProjectUpdate(
+                default_config_override={"memory": {"project_scoped": True}}
+            ),
+            MagicMock(),
+        )
+
+        assert db.update_project.await_args.kwargs["default_config_override"] == {
+            "memory": {"project_scoped": True}
+        }
+
+
+# =============================================================================
+# An affirmative policy that turns nothing on — M-b
+# =============================================================================
+
+
+class TestAffirmativeThatExpandsToNothing:
+    """`{"tools": {"sql": true}}` used to return `{"sql": []}` with a 200 and a
+    server-side log: the caller asked for ON and got OFF. That is "accepted and
+    discarded" at a request boundary — this task's own defect in miniature. A
+    warning is right for a config layer and wrong for a request."""
+
+    @pytest.mark.parametrize(
+        "category",
+        [
+            "sql",
+            "graph",
+            "mongodb",
+            "webdav",
+            "email",
+            "repo",
+            "product_help",
+            "session_task",
+        ],
+    )
+    def test_true_on_a_wholly_code_granted_category_is_a_400(self, category):
+        with pytest.raises(ToolPolicyError) as exc:
+            validate_tool_override_fragment({"tools": {category: True}})
+        assert "turn nothing on" in str(exc.value)
+        # The message names the real gate, so the caller learns why.
+        assert "runtime code" in str(exc.value) or "attached" in str(exc.value)
+
+    def test_except_that_expands_to_nothing_is_a_400_too(self):
+        with pytest.raises(ToolPolicyError, match="turn nothing on"):
+            validate_tool_override_fragment(
+                {"tools": {"sql": {"except": ["sql_query"]}}}
+            )
+
+    @pytest.mark.parametrize("off", [False, []])
+    def test_turning_such_a_category_off_stays_legal(self, off):
+        """Asking to turn off a category nobody manages is a harmless no-op,
+        and both bases ship exactly this."""
+        assert validate_tool_override_fragment({"tools": {"sql": off}}) == {"sql": []}
+
+    def test_a_category_config_does_manage_is_unaffected(self):
+        assert validate_tool_override_fragment({"tools": {"canvas": True}})["canvas"]
+
+
+# =============================================================================
+# What actually makes the `explicit`-tier collapse safe — C1
+# =============================================================================
+
+
+class TestNoModelAuthoredPathReachesSessionCreate:
+    """Membership is the whole registry category, so a session-create request
+    may NAME a `grant: "explicit"` control-plane write (`set_expert_bundle`)
+    that the old four-name list refused. `true` still cannot reach them, and
+    the tool acts as the session's own user — but neither of those answers
+    prompt injection.
+
+    The property that does is that **no model-authored path reaches session
+    create's `config_override`**: the MCP `create_persistent_thread` tool
+    exposes no such parameter, and `spawn_subagent` uses a fixed environment.
+    That is load-bearing and otherwise invisible — adding the parameter would
+    silently dissolve the mitigation. So it is pinned here.
+    """
+
+    def test_the_mcp_session_create_tool_exposes_no_config_override(self):
+        # Parsed, not imported: `orchestrator.mcp.server` needs `fastmcp`,
+        # which the orchestrator image ships and this test environment does
+        # not. The signature is what matters and the AST has it.
+        import ast
+        from pathlib import Path
+
+        tree = ast.parse(Path("orchestrator/mcp/server.py").read_text())
+        fns = [
+            n
+            for n in ast.walk(tree)
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and n.name == "create_persistent_thread"
+        ]
+        assert fns, "create_persistent_thread vanished — re-point this test"
+        for fn in fns:
+            args = fn.args
+            params = {a.arg for a in [*args.posonlyargs, *args.args, *args.kwonlyargs]}
+            assert "config_override" not in params, (
+                "Adding config_override to the MCP session-create tool opens a "
+                "MODEL-AUTHORED path to a boundary that accepts every registry "
+                "name in its own category, including the *_bundle "
+                "control-plane writes. Decide what a model may name before "
+                "adding it — see TestNoModelAuthoredPathReachesSessionCreate."
+            )
+
+    def test_the_job_create_tool_does_expose_one_which_is_why_it_is_validated(self):
+        """The contrast that makes the point: `create_worker_job` DOES forward
+        a model-authored fragment verbatim, which is exactly why the job
+        boundary had to be closed rather than trusted."""
+        from pathlib import Path
+
+        src = Path("src/tools/orchestrator/jobs.py").read_text()
+        assert "async def create_worker_job(" in src
+        assert "config_override: Optional[Dict[str, Any]] = None," in src

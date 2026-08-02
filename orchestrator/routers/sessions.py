@@ -126,6 +126,18 @@ async def prepare_session(
             else "session_base"
         )
 
+    # This body's config_override is a write boundary, not a hint: it flows to
+    # _resolve_session_config (main.py), where a non-None value REPLACES the
+    # thread's persisted override outright. Unvalidated, that is the smuggle
+    # from the job surface reappearing here — `tools.canvas: ["run_command"]`
+    # binds a shell tool, because the loader resolves a name against the global
+    # registry rather than the key it arrived under. Same one validator as
+    # every other boundary. The cockpit posts `{}`, so nothing it sends is
+    # affected; this closes the API-direct path.
+    from main import _with_validated_tool_overrides  # late import: avoid circular
+
+    validated_override = _with_validated_tool_overrides(body.config_override)
+
     # Fire-and-forget the actual work in a background task. Progress reaches
     # the cockpit via SSE. Idempotency is enforced by the advisory lock
     # inside _do_prepare.
@@ -134,7 +146,7 @@ async def prepare_session(
             thread_id=thread_id,
             user_id=str(user["id"]),
             config_name=boot_config_name,
-            config_override=body.config_override,
+            config_override=validated_override,
         )
     )
 
