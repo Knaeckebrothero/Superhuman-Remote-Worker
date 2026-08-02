@@ -1,4 +1,4 @@
-import {afterEach, beforeEach, describe, expect, it} from 'vitest';
+import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest';
 import {TestBed} from '@angular/core/testing';
 import {provideHttpClient} from '@angular/common/http';
 import {
@@ -7,7 +7,7 @@ import {
 } from '@angular/common/http/testing';
 import {TranslocoService} from '@jsverse/transloco';
 import {firstValueFrom} from 'rxjs';
-import {ApiService} from './api.service';
+import {ApiService, SESSION_TOOL_GROUPS_TIMEOUT_MS} from './api.service';
 import {AppToastService} from '../../ui/toast';
 import {ErrorMessageService} from './error-message.service';
 
@@ -324,5 +324,65 @@ describe('ApiService OKF Knowledge Base datasource index endpoints', () => {
     expect(req.request.body).toEqual({read_only: true});
     req.flush({status: 'linked'});
     expect(await pending).toEqual({status: 'linked'});
+  });
+});
+
+describe('ApiService.getSessionToolGroups', () => {
+  let api: ApiService;
+  let httpMock: HttpTestingController;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    TestBed.resetTestingModule();
+    TestBed.configureTestingModule({
+      providers: [
+        ApiService,
+        provideHttpClient(),
+        provideHttpClientTesting(),
+        {provide: AppToastService, useValue: {}},
+        {provide: TranslocoService, useValue: {translate: (k: string) => k}},
+        {provide: ErrorMessageService, useValue: {}},
+      ],
+    });
+    api = TestBed.inject(ApiService);
+    httpMock = TestBed.inject(HttpTestingController);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('returns the tool_groups map on a normal answer', async () => {
+    const pending = firstValueFrom(api.getSessionToolGroups('thread-1'));
+    httpMock
+      .expectOne((r) => r.url.endsWith('/persistent/threads/thread-1/tool-groups'))
+      .flush({thread_id: 'thread-1', source: 'resolved', tool_groups: {canvas: true}});
+    await expect(pending).resolves.toEqual({canvas: true});
+    httpMock.verify();
+  });
+
+  it('gives up after a deadline instead of hanging the settings pane', async () => {
+    // The server now probes the session pod for its real bound toolset, so
+    // this request can hang on a wedged agent. `loadThread` forkJoins it and
+    // anchors `lastApplied` only once both arms settle — without a deadline
+    // the baseline stays unanchored and every later edit is swallowed.
+    const pending = firstValueFrom(api.getSessionToolGroups('thread-1'));
+    const req = httpMock.expectOne((r) =>
+      r.url.endsWith('/persistent/threads/thread-1/tool-groups'),
+    );
+
+    expect(req.cancelled).toBe(false);
+
+    await vi.advanceTimersByTimeAsync(SESSION_TOOL_GROUPS_TIMEOUT_MS + 1);
+
+    // Resolves (to the null fallback) rather than never settling, and the
+    // in-flight request is actually aborted rather than left dangling.
+    await expect(pending).resolves.toBeNull();
+    expect(req.cancelled).toBe(true);
+    httpMock.verify();
+  });
+
+  it('sits above the server-side probe budget so a slow-but-live agent wins', () => {
+    expect(SESSION_TOOL_GROUPS_TIMEOUT_MS).toBeGreaterThan(3000);
   });
 });

@@ -12,21 +12,38 @@ the runtime-injection layer orchestrator-side would be a second implementation
 of one fact, and divergence between two implementations of one fact is the
 original bug in this whole series.
 
-So there are two kinds of answer and they are never interchangeable:
+So there are three kinds of answer and they are never interchangeable:
 
 ``origin="agent"``
-    **Measured.**  A running agent enumerated ``session.tools`` after binding
-    and said so.  ``observed_at`` is set.
+    **Measured, in full.**  A running agent enumerated ``session.tools`` after
+    binding and returned the structured report below.  ``observed_at`` and
+    ``backend`` are set.
+
+``origin="agent_partial"``
+    **Measured, but only the names.**  The agent answered with a bound-tool
+    list and nothing else — today that is an image predating
+    ``GET /session/toolset``, whose ``/status`` publishes the same
+    ``session.tools`` with no timestamp, no workspace capabilities, and no
+    agent-side categorisation (so MCP tools land in
+    :data:`UNCLASSIFIED_CATEGORY`).  The tool names are as trustworthy as
+    ``"agent"``; everything *around* them is missing, and a caller that renders
+    a workspace-tier explanation must not do so from this.
 
 ``origin="prediction"``
     **Forecast.**  No agent exists yet (the New Session form) or none is
     reachable.  Derived from the merged config, which cannot see the runtime
     injection layer or the backend capability gate — so it is *structurally*
-    weaker, not merely older.  ``observed_at`` is ``None``.
+    weaker, not merely older.  ``observed_at`` is ``None`` and
+    ``prediction_reason`` says which case this is.
 
-A prediction presented as a measurement is D1 violated at a new seam, so the
-two carry different ``origin`` values and the predicted form carries a
-``prediction_reason``.
+A prediction presented as a measurement is D1 violated at a new seam, and so is
+a *degraded* measurement presented as a complete one — the second is subtler and
+was shipped once here: with no ``backend``, the tier gate is invisible and a
+no-shell session rendered its execution groups as ordinary unticked checkboxes.
+
+``origin`` is therefore the discriminator, and the only one: do **not** infer
+measured-ness from ``observed_at``, which is legitimately ``None`` on
+``agent_partial``.  :data:`MEASURED_ORIGINS` is the check you want.
 
 Three states, per D7 — a checkbox cannot express the truth D1 requires:
 
@@ -65,7 +82,13 @@ STATE_OFF = "off"
 STATE_UNAVAILABLE = "unavailable"
 
 ORIGIN_AGENT = "agent"
+ORIGIN_AGENT_PARTIAL = "agent_partial"
 ORIGIN_PREDICTION = "prediction"
+
+#: The origins whose ``tools`` came from a running agent. Use this rather than
+#: ``== ORIGIN_AGENT`` wherever the question is "is this measured?", so a
+#: degraded measurement is not mistaken for a forecast.
+MEASURED_ORIGINS: frozenset[str] = frozenset({ORIGIN_AGENT, ORIGIN_AGENT_PARTIAL})
 
 DECIDED_BY_GRANT = "grant"
 DECIDED_BY_BACKEND = "backend"
@@ -328,6 +351,17 @@ def compose_tool_view(
     is then used ONLY to explain the answer — never to correct it.  That
     asymmetry is D6: the agent is the authority on what it bound, and anything
     that "fixes up" its answer has reintroduced the second implementation.
+
+    **``off`` is a promise, and it is only made when it can be kept.**  On a
+    measurement, a category whose merged config grants tools while the agent
+    bound none is ``unavailable``, not ``off``: config already asked and the
+    answer was no, so a checkbox there offers an "on" that writes config and
+    changes no binding.  The live gate produced exactly that —
+    ``knowledge: configured=10 kb_*, tools=0`` — and it also covers the case
+    where the reason is a backend gate the reader cannot see (an agent report
+    without ``backend``: the tools are still measurably absent even when the
+    cause is not legible).  ``off`` therefore means "nothing here, and nothing
+    has said no".
     """
     provenance = provenance or {}
     blocked_by_grant = grant_blocked_categories(grants)
@@ -351,11 +385,26 @@ def compose_tool_view(
         backend_reason = blocked_by_backend.get(category)
         code_reason = code_granted.get(category)
 
+        # A measured category that config populated and the agent did not bind.
+        # Weakest of the four reasons because it states the OUTCOME without the
+        # cause: a backend gate, a knowledge store that never came up, a tool
+        # that failed to instantiate. Ranked last so a legible cause always wins
+        # the message, but it fires even when no cause is legible — which is the
+        # whole point, since a degraded report carries no backend to blame.
+        unbound_reason = None
+        if bound is not None and conf and not bound:
+            unbound_reason = (
+                f"the merged config grants {len(conf)} tool(s) here and the "
+                f"agent bound none, so enabling this group would not change "
+                f"what it holds"
+            )
+
         # Precedence is deliberate: a denied grant is the strongest statement
         # (nothing about the workspace or the config can restore it), then the
-        # workspace tier, then "config never managed this category at all".
-        settable = not (grant_reason or backend_reason or code_reason)
-        reason = grant_reason or backend_reason or code_reason
+        # workspace tier, then "config never managed this category at all",
+        # then the bare observation above.
+        reason = grant_reason or backend_reason or code_reason or unbound_reason
+        settable = reason is None
 
         if tools:
             state = STATE_ON
@@ -414,7 +463,9 @@ __all__ = [
     "DECIDED_BY_RUNTIME",
     "DECIDED_BY_UNSET",
     "GRANT_GATED_CATEGORIES",
+    "MEASURED_ORIGINS",
     "ORIGIN_AGENT",
+    "ORIGIN_AGENT_PARTIAL",
     "ORIGIN_PREDICTION",
     "REPORT_VERSION",
     "STATE_OFF",

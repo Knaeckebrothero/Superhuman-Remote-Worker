@@ -11,6 +11,7 @@ re-implementation. These tests hold the two halves of that:
   a new seam.
 """
 
+import asyncio
 import json
 from contextlib import ExitStack
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -19,7 +20,9 @@ import pytest
 
 from src.core.session_tool_overrides import SESSION_TOOL_OVERRIDE_NAMES
 from src.core.tool_report import (
+    MEASURED_ORIGINS,
     ORIGIN_AGENT,
+    ORIGIN_AGENT_PARTIAL,
     ORIGIN_PREDICTION,
     REPORT_VERSION,
     STATE_ON,
@@ -167,6 +170,7 @@ class TestMeasuredAnswer:
         assert result["origin"] == ORIGIN_AGENT
         assert result["observed_at"] == "2026-08-02T12:00:00Z"
         assert result["prediction_reason"] is None
+        assert result["degraded_reason"] is None
         assert result["categories"]["research"]["state"] == STATE_ON
 
     @pytest.mark.asyncio
@@ -293,7 +297,12 @@ class TestBackendCapabilitiesRideTheReport:
             },
             grants=None,
         )
-        assert result["categories"]["git"]["reason"] is None
+        # The tier does not gate it...
+        assert result["categories"]["git"]["decided_by"] != "backend"
+        assert "workspace tier" not in (result["categories"]["git"]["reason"] or "")
+        # ...but session_base grants git tools the agent did not bind, and that
+        # shortfall is still reported rather than smoothed into a plain "off".
+        assert result["categories"]["git"]["state"] == STATE_UNAVAILABLE
 
     @pytest.mark.asyncio
     async def test_a_prediction_reports_no_backend(self, user_a, fake_db, fake_request):
@@ -445,14 +454,16 @@ class TestPredictionIsLabelled:
 
 class TestOlderAgentImageFallback:
     @pytest.mark.asyncio
-    async def test_status_tools_are_still_a_measurement(
+    async def test_status_tools_are_a_measurement_but_a_DEGRADED_one(
         self, user_a, fake_db, fake_request
     ):
-        """``/status`` already publishes the bound names; use them.
+        """``/status`` already publishes the bound names; use them — and say so.
 
         An agent image predating ``/session/toolset`` is not a reason to
-        downgrade to a guess — its ``/status`` returns the same
-        ``session.tools`` list with less structure.
+        downgrade to a guess. But it IS a reason to stop short of the full
+        contract: no timestamp, no workspace capabilities, no agent-side
+        categorisation. ``agent_partial`` is how a caller tells, because
+        ``observed_at`` alone cannot — it is legitimately null here.
         """
         result, calls = await _call(
             user_a,
@@ -464,11 +475,43 @@ class TestOlderAgentImageFallback:
                 "/status": _Response(payload={"tools": ["web_search", "read_file"]}),
             },
         )
-        assert result["origin"] == ORIGIN_AGENT
+        assert result["origin"] == ORIGIN_AGENT_PARTIAL
+        assert result["origin"] in MEASURED_ORIGINS
         assert result["observed_at"] is None, "no timestamp is available on this path"
+        assert result["backend"] is None
+        assert result["prediction_reason"] is None, "this IS measured"
+        assert "predates" in result["degraded_reason"]
         assert result["categories"]["research"]["tools"] == ["web_search"]
         assert result["categories"]["workspace"]["tools"] == ["read_file"]
         assert any(u.endswith("/status") for u in calls)
+
+    @pytest.mark.asyncio
+    async def test_a_degraded_measurement_never_promises_an_unverifiable_on(
+        self, user_a, fake_db, fake_request
+    ):
+        """The harm the third origin exists to bound.
+
+        With no ``backend`` the composer cannot name the tier gate, so a naive
+        renderer would show ``git``/``browser_direct`` as an ordinary unticked
+        checkbox on a no-shell session — a MEASUREMENT saying "tick this and it
+        will work" when it cannot. The bound-none rule catches it anyway.
+        """
+        result, _ = await _call(
+            user_a,
+            fake_db,
+            _thread(agent_id="agent-1"),
+            fake_request,
+            routes={
+                "/session/toolset": _Response(status_code=404, payload={}),
+                "/status": _Response(payload={"tools": ["read_file"]}),
+            },
+            grants=None,
+        )
+        for category in ("git", "browser_direct"):
+            entry = result["categories"][category]
+            assert entry["state"] == STATE_UNAVAILABLE, category
+            assert entry["settable"] is False, category
+            assert entry["reason"], category
 
     @pytest.mark.asyncio
     async def test_neither_endpoint_answering_is_a_prediction(
@@ -684,6 +727,147 @@ class TestPreviewEndpoint:
             with pytest.raises(HTTPException) as exc:
                 await preview_tool_groups(ToolGroupPreviewRequest(), fake_request)
         assert exc.value.status_code == 403
+
+
+class TestPreviewModelsTheLegacyPathToo:
+    """The creation form must predict the path a created session would take.
+
+    With experts off, the agent APPENDS the four closed groups unless an
+    explicit ``[]`` disables them — the opposite of the resolved path for an
+    unset group. A preview that always predicted ``resolved`` would tell the
+    user "Fleet Management: off" and then hand them a session that has it,
+    which is this series' own defect rebuilt in the surface that predicts it.
+    """
+
+    async def _preview(self, user, db, req, *, experts, override=None):
+        from main import ToolGroupPreviewRequest, preview_tool_groups
+
+        with (
+            patch("main.require_approved_user", _approved(user)),
+            patch("main.postgres_db", db),
+            patch("main._is_experts_db_enabled", MagicMock(return_value=experts)),
+            patch("main._user_experts_enabled", AsyncMock(return_value=experts)),
+            patch("main._resolve_runner_grants", AsyncMock(return_value=None)),
+        ):
+            return await preview_tool_groups(
+                ToolGroupPreviewRequest(
+                    config_name="session_base", config_override=override
+                ),
+                req,
+            )
+
+    @pytest.mark.asyncio
+    async def test_legacy_deployment_predicts_the_groups_ON(
+        self, user_a, fake_db, fake_request
+    ):
+        result = await self._preview(user_a, fake_db, fake_request, experts=False)
+        assert result["source"] == "legacy"
+        assert result["tool_groups"]["orchestrator"] is True
+        assert result["tool_groups"]["workflows"] is True
+
+    @pytest.mark.asyncio
+    async def test_resolved_deployment_predicts_them_OFF(
+        self, user_a, fake_db, fake_request
+    ):
+        """The same base config, the opposite answer — which is the whole point."""
+        result = await self._preview(user_a, fake_db, fake_request, experts=True)
+        assert result["source"] == "resolved"
+        assert result["tool_groups"]["orchestrator"] is False
+        assert result["tool_groups"]["workflows"] is False
+
+    @pytest.mark.asyncio
+    async def test_legacy_still_honours_an_explicit_disable(
+        self, user_a, fake_db, fake_request
+    ):
+        result = await self._preview(
+            user_a,
+            fake_db,
+            fake_request,
+            experts=False,
+            override={"tools": {"orchestrator": []}},
+        )
+        assert result["tool_groups"]["orchestrator"] is False
+
+    @pytest.mark.asyncio
+    async def test_it_is_still_a_prediction_on_the_legacy_path(
+        self, user_a, fake_db, fake_request
+    ):
+        result = await self._preview(user_a, fake_db, fake_request, experts=False)
+        assert result["origin"] == ORIGIN_PREDICTION
+        assert result["degraded_reason"] is None
+
+
+class TestOneDeadlineForTheWholeProbe:
+    """404-then-/status is TWO requests, and it is the normal path today.
+
+    ``httpx``'s timeout is per-operation, so a per-request bound lets the
+    fallback cost a second full budget — and lets a trickling pod exceed either
+    without tripping one. The settings pane blocks on this endpoint.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_slow_two_hop_probe_is_cut_off_and_labelled(
+        self, user_a, fake_db, fake_request
+    ):
+        import main as orch_main
+
+        async def _crawl(url):
+            await asyncio.sleep(5)
+            return _Response(payload={})
+
+        client = MagicMock()
+        client.__aenter__ = AsyncMock(return_value=client)
+        client.__aexit__ = AsyncMock(return_value=False)
+        client.get = AsyncMock(side_effect=_crawl)
+
+        fake_db.get_thread = AsyncMock(return_value=_thread(agent_id="agent-1"))
+        fake_db.get_agent = AsyncMock(return_value=_AGENT_ROW)
+        started = asyncio.get_event_loop().time()
+        with (
+            patch("main.require_approved_user", _approved(user_a)),
+            patch(
+                "security.access.require_approved_user", AsyncMock(return_value=user_a)
+            ),
+            patch("main.postgres_db", fake_db),
+            patch("main._is_experts_db_enabled", MagicMock(return_value=True)),
+            patch("main._user_experts_enabled", AsyncMock(return_value=True)),
+            patch("main._resolve_runner_grants", AsyncMock(return_value=None)),
+            patch.object(orch_main, "_AGENT_TOOLSET_BUDGET_S", 0.2),
+            patch("main.httpx.AsyncClient", MagicMock(return_value=client)),
+        ):
+            result = await orch_main.get_thread_tool_groups(
+                str(_thread()["id"]), fake_request
+            )
+        elapsed = asyncio.get_event_loop().time() - started
+
+        assert result["origin"] == ORIGIN_PREDICTION
+        assert "budget" in result["prediction_reason"]
+        assert elapsed < 2.0, f"probe was not bounded (took {elapsed:.2f}s)"
+
+    @pytest.mark.asyncio
+    async def test_a_booting_agent_is_not_probed(self, user_a, fake_db, fake_request):
+        """Registered but not serving: nothing bound, so nothing to measure."""
+        from main import get_thread_tool_groups
+
+        fake_db.get_thread = AsyncMock(return_value=_thread(agent_id="agent-1"))
+        fake_db.get_agent = AsyncMock(return_value={**_AGENT_ROW, "status": "booting"})
+        http_patch, calls = _agent_http({})
+        with (
+            patch("main.require_approved_user", _approved(user_a)),
+            patch(
+                "security.access.require_approved_user", AsyncMock(return_value=user_a)
+            ),
+            patch("main.postgres_db", fake_db),
+            patch("main._is_experts_db_enabled", MagicMock(return_value=True)),
+            patch("main._user_experts_enabled", AsyncMock(return_value=True)),
+            patch("main._resolve_runner_grants", AsyncMock(return_value=None)),
+            http_patch,
+        ):
+            result = await get_thread_tool_groups(str(_thread()["id"]), fake_request)
+
+        assert result["origin"] == ORIGIN_PREDICTION
+        assert "booting" in result["prediction_reason"]
+        assert calls == []
 
 
 # =============================================================================
