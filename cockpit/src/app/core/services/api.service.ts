@@ -1,6 +1,6 @@
 import {inject, Injectable} from '@angular/core';
 import {HttpClient, HttpErrorResponse, HttpParams} from '@angular/common/http';
-import {catchError, map, Observable, of, tap, throwError} from 'rxjs';
+import {catchError, map, Observable, of, tap, throwError, timeout} from 'rxjs';
 import {TranslocoService} from '@jsverse/transloco';
 import {AppToastService} from '../../ui/toast';
 import {ErrorMessageService} from './error-message.service';
@@ -144,10 +144,49 @@ export interface IdeSessionStatus {
  * unset group is enabled there), or `error`, in which case `tool_groups` is
  * null and the caller falls back to its own base defaults.
  */
+/**
+ * Per-category answer from the tool-groups read. `state` is three-valued
+ * because a checkbox cannot express the truth: `off` is a promise that ticking
+ * would work, and the server only makes it when it can be kept — a group whose
+ * config grants tools the agent did not bind is `unavailable`, not `off`.
+ */
+export interface SessionToolCategory {
+  state: 'on' | 'off' | 'unavailable';
+  /** Non-null whenever `settable` is false. Safe to show the user. */
+  reason: string | null;
+  settable: boolean;
+  /** Which layer produced the answer: grant / backend / runtime / registry / a config layer. */
+  decided_by: string;
+  tools: string[];
+  /** What the merged config asked for. Measured answers only. */
+  configured?: string[];
+}
+
 export interface SessionToolGroupsResponse {
   thread_id: string;
+  /** Which agent path the PREDICTION models. Says nothing about `origin`. */
   source: 'resolved' | 'legacy' | 'error';
+  /**
+   * The discriminator, and the only one — do not infer measured-ness from
+   * `observed_at`, which is legitimately null on `agent_partial`.
+   *
+   * - `agent`         a running pod reported its bound toolset, in full
+   * - `agent_partial` a pod reported, but names only (older agent image):
+   *                   trust `tools`, do not render a workspace-tier story
+   * - `prediction`    no agent to ask; a forecast from the merged config,
+   *                   which cannot see the runtime injection layer or the
+   *                   backend gate. Never render this as fact.
+   */
+  origin?: 'agent' | 'agent_partial' | 'prediction';
+  observed_at?: string | null;
+  /** Why this is a forecast. `origin === 'prediction'` only. */
+  prediction_reason?: string | null;
+  /** What the measurement is missing. `origin === 'agent_partial'` only. */
+  degraded_reason?: string | null;
+  /** Workspace capabilities as the agent reported them. `origin === 'agent'` only. */
+  backend?: Record<string, boolean> | null;
   tool_groups: Record<string, boolean> | null;
+  categories?: Record<string, SessionToolCategory> | null;
 }
 
 /**
@@ -161,6 +200,14 @@ export interface SnapshotStorageStats {
   gc_pending_size_bytes: number;
   error?: string;
 }
+
+/**
+ * Client-side deadline for the tool-groups read, which the settings pane
+ * blocks on. The server bounds its own agent probe at 3s; this sits above that
+ * so only a genuinely stuck request trips it, and guarantees the pane's
+ * `lastApplied` baseline always gets anchored.
+ */
+export const SESSION_TOOL_GROUPS_TIMEOUT_MS = 8000;
 
 /**
  * HTTP client service for the cockpit API.
@@ -1615,6 +1662,16 @@ export class ApiService {
                 `${this.baseUrl}/persistent/threads/${threadId}/tool-groups`,
             )
             .pipe(
+                // The server now probes the session pod for its ACTUAL bound
+                // toolset, so this request can take seconds against a hung
+                // agent. `loadThread` forkJoins it and anchors `lastApplied`
+                // only once both arms settle — with no deadline, a pod that
+                // never replies leaves the baseline unanchored for the life of
+                // the pane and every subsequent edit is silently swallowed.
+                // Must exceed the server's own probe budget (3s) so a slow-but-
+                // answering agent still wins; the client is the backstop, not
+                // the primary bound.
+                timeout(SESSION_TOOL_GROUPS_TIMEOUT_MS),
                 map((response) => response?.tool_groups ?? null),
                 catchError((error) => {
                     console.error(`Failed to get tool groups for thread ${threadId}:`, error);
