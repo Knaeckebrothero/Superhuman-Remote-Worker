@@ -831,7 +831,7 @@ is what the author would want:
 | `developer` | `core` | `{except: [todo_list]}` — 5/9, one genuine omission on top of the 3 |
 | `designer`, `designer-interactive`, `scholar` | `workspace` | `{except: [delete_directory, rename_file, use_skill]}` |
 | `developer` | `git` | `{except: [git_show]}` |
-| `bughunter` | `shell` | `{except: [srw_cloud_status]}` — **not** `true`; see the mode-alias rule below |
+| `bughunter` | `shell` | **no change — leave the bare list.** A bare list already *is* `only`. Both `true` and `{except: [srw_cloud_status]}` now raise for `shell`; see the rule below |
 | `critic`, `developer`, `scholar` | `delegation` | `{only: [spawn_subagent]}` until the `delegate_work` decision lands |
 
 **Keep as `only`** — genuine per-persona narrowing, frozen deliberately:
