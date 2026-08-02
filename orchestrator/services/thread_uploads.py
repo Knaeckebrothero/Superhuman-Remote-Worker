@@ -14,6 +14,12 @@ storage and is refused permanently rather than pretending to be transient.
 Filenames are sanitized to prevent path traversal and collisions are resolved by
 appending a counter.
 
+A ``.zip`` upload is expanded into ``uploads/<stem>/…`` rather than stored as
+a single opaque archive, mirroring the worker-job path's ``_extract_zip``
+(``src/agent.py:4067``) so an attached archive is immediately readable by
+``read_file``/``list_files`` with no unzip capability required. See
+``_expand_payloads_for_extraction`` below.
+
 The agent learns about new uploads when the cockpit appends an
 ``Attached files: …`` hint to the next user message — see
 ``persistent-chat.service.ts``.
@@ -22,10 +28,14 @@ The agent learns about new uploads when the cockpit appends an
 from __future__ import annotations
 
 import asyncio
+import io
 import logging
+import mimetypes
 import os
 import posixpath
 import re
+import stat as stat_module
+import zipfile
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import PurePosixPath
@@ -147,6 +157,256 @@ def _claim_name(taken: set[str], name: str) -> str:
     raise AssertionError("unreachable: _name_candidates is infinite")
 
 
+# =============================================================================
+# Zip extraction
+#
+# The worker-job path already does this (``_extract_zip``, src/agent.py:4067,
+# called at :2625/:2676/:2718): a `.zip` document is expanded into
+# `documents/…` instead of left as an opaque archive. This mirrors that for
+# session uploads, but hardens what it borrows: the worker's dotfile skip
+# blocks ".." only *incidentally* (because ".." happens to start with ".")
+# and it has no entry-count or size caps at all.
+# =============================================================================
+
+
+class ZipExtractionRefused(Exception):
+    """A zip payload failed validation and must not be partially expanded.
+
+    Raised for anything that makes safe, COMPLETE extraction impossible: a
+    corrupt/non-zip payload, a path-traversal entry, too many entries, or an
+    uncompressed size over either cap below. Callers catch this and fall
+    back to storing the archive verbatim — a zip either extracts completely
+    and safely, or the user keeps exactly what they uploaded. Never a
+    silently half-extracted result.
+    """
+
+
+# MAX_FILE_SIZE (100MB, above) already bounds the compressed upload; these
+# bound what it may explode into, so a corrupt or hostile archive fails
+# cleanly instead of filling the workspace, blowing up orchestrator memory,
+# or hanging the write loop on thousands of tiny entries.
+#
+#   MAX_ZIP_ENTRIES: generous for a folder of documents/photos, small enough
+#   to bound total SFTP/object-store round trips for one request.
+#
+#   MAX_ZIP_ENTRY_UNCOMPRESSED_BYTES: no single extracted member may be
+#   bigger than a standalone upload would have been allowed to be.
+#
+#   MAX_ZIP_TOTAL_UNCOMPRESSED_BYTES: real documents/images rarely compress
+#   more than 2-3x, so 3x the compressed cap is generous headroom while
+#   keeping the in-memory extraction buffer bounded — this happens inside
+#   the orchestrator process, up to MAX_CONCURRENT_VIRTUAL_UPLOADS at once.
+MAX_ZIP_ENTRIES = 2_000
+MAX_ZIP_ENTRY_UNCOMPRESSED_BYTES = MAX_FILE_SIZE
+MAX_ZIP_TOTAL_UNCOMPRESSED_BYTES = 3 * MAX_FILE_SIZE
+
+# Chunk size for the capped incremental read in _read_zip_entry_capped.
+_ZIP_READ_CHUNK_SIZE = 65536
+
+
+def _is_symlink_zip_entry(info: zipfile.ZipInfo) -> bool:
+    """True when a zip entry's Unix mode bits mark it as a symlink.
+
+    Extraction never calls a symlink-creation API, but a symlink entry's
+    "content" is just its target path string — writing that as if it were
+    real file content would be misleading, so it's skipped like a directory
+    entry instead of materialized as a bogus file.
+    """
+    mode = info.external_attr >> 16
+    return stat_module.S_ISLNK(mode) if mode else False
+
+
+def _safe_zip_member_path(stem: str, entry_name: str) -> str | None:
+    """Resolve a zip entry name to a path under ``stem``, or None if unsafe.
+
+    Deliberate, unlike the worker's ``_extract_zip`` (``src/agent.py:4067``),
+    whose dotfile skip incidentally also blocks ".." only because ".."
+    happens to start with ".". Rejects absolute paths, Windows drive
+    letters/backslash separators (never legitimate in a zip's stored POSIX
+    names), and any entry whose normalized destination would resolve outside
+    ``stem`` — the "Zip-Slip" family of path-traversal entries.
+    """
+    if not entry_name or "\x00" in entry_name or entry_name.startswith("/"):
+        return None
+    if "\\" in entry_name or re.match(r"^[A-Za-z]:", entry_name):
+        return None
+
+    joined = posixpath.normpath(posixpath.join(stem, entry_name))
+    if joined == stem or not joined.startswith(stem + "/"):
+        return None
+    return joined
+
+
+def _read_zip_entry_capped(fh: Any, cap: int, entry_name: str) -> bytes:
+    """Read a zip entry's decompressed bytes, aborting past ``cap``.
+
+    A zip's declared ``file_size``/CRC can lie about what its compressed
+    stream actually decompresses to, so the real defense against a zip bomb
+    is bounding bytes as they come out of the decompressor — not trusting
+    the archive's own metadata (the pre-check against declared size in
+    ``_plan_zip_extraction`` is a cheap fast-fail, not the backstop).
+    """
+    total = 0
+    chunks: list[bytes] = []
+    while True:
+        chunk = fh.read(_ZIP_READ_CHUNK_SIZE)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > cap:
+            raise ZipExtractionRefused(
+                f"entry {entry_name!r} decompresses past the {cap}-byte per-entry limit"
+            )
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def _plan_zip_extraction(data: bytes, stem: str) -> list[tuple[str, bytes]]:
+    """Validate and expand a zip's bytes into ``(name, content)`` pairs.
+
+    ``name`` is relative to the uploads/ directory root (e.g.
+    ``"myarchive/sub/file.txt"`` for ``stem="myarchive"``) — ready to become
+    ``UploadedFile.name`` directly, exactly like a flat upload's name.
+
+    Raises ``ZipExtractionRefused`` for anything that makes safe, complete
+    extraction impossible. Never returns a partial result: a caller either
+    gets every safe entry or none of them ("rather than half-extracted").
+    """
+    try:
+        return _plan_zip_extraction_unsafe(data, stem)
+    except ZipExtractionRefused:
+        raise
+    except Exception as e:
+        # zipfile can raise more than BadZipFile for a hostile or corrupt
+        # archive (NotImplementedError for an exotic compression method,
+        # RuntimeError for an encrypted entry, ...). None of those should
+        # ever crash an upload request — they all mean the same thing here:
+        # this zip cannot be safely and completely extracted.
+        raise ZipExtractionRefused(f"could not process zip: {e}") from e
+
+
+def _plan_zip_extraction_unsafe(data: bytes, stem: str) -> list[tuple[str, bytes]]:
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(data))
+    except zipfile.BadZipFile as e:
+        raise ZipExtractionRefused(f"not a valid zip file: {e}") from e
+
+    with zf:
+        infos = zf.infolist()
+        if len(infos) > MAX_ZIP_ENTRIES:
+            raise ZipExtractionRefused(
+                f"{len(infos)} entries exceeds the {MAX_ZIP_ENTRIES}-entry limit"
+            )
+
+        plan: list[tuple[str, bytes]] = []
+        total_uncompressed = 0
+
+        for info in infos:
+            name = info.filename
+            if info.is_dir():
+                continue
+            if not PurePosixPath(name).name:
+                continue  # empty/degenerate filename — structural, not a
+                # traversal attempt
+
+            # Deliberate security boundary FIRST, independent of the content
+            # filters below — otherwise a traversal entry built purely from
+            # ".." components (e.g. "../../etc/passwd") would be silently
+            # *skipped* by the dotfile filter instead of refusing the whole
+            # archive, since ".." happens to start with ".". That is
+            # precisely the worker's incidental behaviour this must not
+            # reproduce.
+            dest = _safe_zip_member_path(stem, name)
+            if dest is None:
+                raise ZipExtractionRefused(
+                    f"entry {name!r} resolves outside the destination directory"
+                )
+
+            # Content filters: routine exclusions, not safety violations.
+            parts = PurePosixPath(name).parts
+            if any(part.startswith(".") for part in parts):
+                continue  # dotfiles/hidden
+            if "__MACOSX" in parts:
+                continue
+            if _is_symlink_zip_entry(info):
+                continue
+
+            if info.file_size > MAX_ZIP_ENTRY_UNCOMPRESSED_BYTES:
+                raise ZipExtractionRefused(
+                    f"entry {name!r} declares {info.file_size} bytes "
+                    f"uncompressed, over the {MAX_ZIP_ENTRY_UNCOMPRESSED_BYTES} "
+                    "byte per-entry limit"
+                )
+
+            with zf.open(info) as fh:
+                content = _read_zip_entry_capped(
+                    fh, MAX_ZIP_ENTRY_UNCOMPRESSED_BYTES, name
+                )
+
+            total_uncompressed += len(content)
+            if total_uncompressed > MAX_ZIP_TOTAL_UNCOMPRESSED_BYTES:
+                raise ZipExtractionRefused(
+                    "uncompressed contents exceed the "
+                    f"{MAX_ZIP_TOTAL_UNCOMPRESSED_BYTES}-byte total limit"
+                )
+
+            plan.append((dest, content))
+
+    return plan
+
+
+def _expand_payloads_for_extraction(
+    payloads: list[tuple[str, bytes, str]],
+    taken: set[str],
+) -> list[tuple[str, bytes, str]]:
+    """Resolve final names for a batch of uploads, expanding any ``.zip``.
+
+    ``taken`` is mutated as names are claimed — files and zip stems share one
+    namespace (a directory and a file can't coexist under the same name in
+    ``uploads/`` either way). Returns ``(name, data, mime_type)`` triples
+    ready to write verbatim at ``uploads/<name>``: a regular upload gets its
+    usual sanitized, collision-resolved flat name; a zip's members get
+    ``<stem>/<relative path within the archive>``.
+
+    A zip that fails validation (corrupt, unsafe entry, over a cap) falls
+    back to its original bytes stored under the claimed stem plus its
+    original suffix — never a half-extracted result, never a vanished
+    upload (docs/issues/session_uploads_never_extract_archives.md).
+    """
+    expanded: list[tuple[str, bytes, str]] = []
+    for filename, data, mime_type in payloads:
+        safe_name = _sanitize_filename(filename)
+        suffix = PurePosixPath(safe_name).suffix
+
+        if suffix.lower() != ".zip":
+            expanded.append((_claim_name(taken, safe_name), data, mime_type))
+            continue
+
+        # Claim the slot once, whether extraction succeeds or falls back —
+        # so a fallback can never collide with something claimed in between.
+        stem = _claim_name(taken, PurePosixPath(safe_name).stem or "archive")
+        plan: list[tuple[str, bytes]] = []
+        try:
+            plan = _plan_zip_extraction(data, stem)
+        except ZipExtractionRefused as e:
+            logger.warning(
+                "Zip extraction refused for %r (%s) — storing the upload "
+                "as-is instead of extracting it",
+                filename,
+                e,
+            )
+
+        if not plan:
+            expanded.append((f"{stem}{suffix}", data, mime_type))
+            continue
+
+        for member_name, content in plan:
+            mime, _ = mimetypes.guess_type(member_name)
+            expanded.append((member_name, content, mime or "application/octet-stream"))
+
+    return expanded
+
+
 def _thread_metadata(thread: dict[str, Any]) -> dict[str, Any]:
     """Thread ``metadata`` as a dict, tolerating a JSON-string column."""
     metadata = thread.get("metadata") or {}
@@ -266,23 +526,16 @@ def _ensure_remote_dir(sftp: Any, path: str) -> None:
             sftp.mkdir(cursor)
 
 
-def _next_available_name(sftp: Any, directory: str, name: str) -> str:
-    """Return ``name`` if free, else ``name_1.ext``, ``name_2.ext`` …"""
-    for candidate in _name_candidates(name):
-        try:
-            sftp.stat(posixpath.join(directory, candidate))
-        except FileNotFoundError:
-            return candidate
-    raise AssertionError("unreachable: _name_candidates is infinite")
-
-
 def _sftp_write_files(
     target: _SshTarget,
     payloads: list[tuple[str, bytes, str]],
 ) -> list[UploadedFile]:
     """Synchronous helper that opens one SFTP session and writes all files.
 
-    Each payload tuple is ``(filename, data, mime_type)``.
+    Each payload tuple is ``(filename, data, mime_type)``. A ``.zip`` payload
+    is expanded into ``uploads/<stem>/…`` — see
+    ``_expand_payloads_for_extraction``; a corrupt/unsafe zip falls back to
+    being written verbatim like any other file.
     """
     if paramiko is None:  # pragma: no cover - import guard
         raise ThreadUploadError(
@@ -322,24 +575,38 @@ def _sftp_write_files(
             uploads_dir = posixpath.join(target.workspace_path, UPLOADS_SUBDIR)
             _ensure_remote_dir(sftp, uploads_dir)
 
+            # One listing, resolved in-memory from here — equivalent to the
+            # old per-candidate sftp.stat() probe for this single connection
+            # (nothing else writes through it concurrently), and it's what a
+            # zip's stem name needs anyway: claiming a whole subtree can't be
+            # done with a single stat probe the way one flat name can.
+            taken: set[str] = set()
+            try:
+                taken.update(sftp.listdir(uploads_dir))
+            except OSError:
+                pass  # just created above; nothing to collide with yet
+
+            expanded = _expand_payloads_for_extraction(payloads, taken)
+
             results: list[UploadedFile] = []
-            for filename, data, mime_type in payloads:
-                safe = _sanitize_filename(filename)
-                final_name = _next_available_name(sftp, uploads_dir, safe)
-                remote_path = posixpath.join(uploads_dir, final_name)
+            for name, data, mime_type in expanded:
+                remote_path = posixpath.join(uploads_dir, name)
+                parent = posixpath.dirname(remote_path)
+                if parent != uploads_dir:
+                    _ensure_remote_dir(sftp, parent)
                 with sftp.open(remote_path, "wb") as f:
                     f.write(data)
                 results.append(
                     UploadedFile(
-                        name=final_name,
+                        name=name,
                         size=len(data),
                         mime_type=mime_type or "application/octet-stream",
-                        path=posixpath.join(UPLOADS_SUBDIR, final_name),
+                        path=posixpath.join(UPLOADS_SUBDIR, name),
                     )
                 )
                 logger.info(
                     "Uploaded %s (%d bytes) to %s",
-                    final_name,
+                    name,
                     len(data),
                     target.host,
                 )
@@ -360,6 +627,9 @@ def _virtual_write_files(
 
     One store for the whole batch, and **one** listing to seed collision
     resolution — probing per file would cost an rclone subprocess per probe.
+    A ``.zip`` payload is expanded into ``uploads/<stem>/…`` — see
+    ``_expand_payloads_for_extraction``; a corrupt/unsafe zip falls back to
+    being written verbatim like any other file.
 
     No directory marker is written: ``VirtualWorkspaceBackend.is_dir`` derives
     directories from key prefixes, so the first object makes ``uploads/`` exist
@@ -381,30 +651,36 @@ def _virtual_write_files(
 
     uploads_prefix = f"{target.prefix}{UPLOADS_SUBDIR}/"
     try:
+        # Top-level component of every existing key, flat or nested — a zip
+        # extracted earlier left "bundle/..." keys with no "bundle" key of
+        # its own, so a plain remainder-has-no-slash filter (the pre-zip
+        # version of this loop) would miss it and let a new "bundle.zip"
+        # collide with — and mix its members into — that directory.
         taken: set[str] = set()
         for info in store.list(uploads_prefix):
             remainder = info.key[len(uploads_prefix) :]
-            if remainder and "/" not in remainder:
-                taken.add(remainder)
+            if remainder:
+                taken.add(remainder.split("/", 1)[0])
+
+        expanded = _expand_payloads_for_extraction(payloads, taken)
 
         results: list[UploadedFile] = []
-        for filename, data, mime_type in payloads:
-            final_name = _claim_name(taken, _sanitize_filename(filename))
-            store.put(f"{uploads_prefix}{final_name}", data)
+        for name, data, mime_type in expanded:
+            store.put(f"{uploads_prefix}{name}", data)
             results.append(
                 UploadedFile(
-                    name=final_name,
+                    name=name,
                     size=len(data),
                     mime_type=mime_type or "application/octet-stream",
-                    path=posixpath.join(UPLOADS_SUBDIR, final_name),
+                    path=posixpath.join(UPLOADS_SUBDIR, name),
                 )
             )
             logger.info(
                 "Uploaded %s (%d bytes) to %s%s",
-                final_name,
+                name,
                 len(data),
                 uploads_prefix,
-                final_name,
+                name,
             )
         return results
     finally:

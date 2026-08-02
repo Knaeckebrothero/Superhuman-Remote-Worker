@@ -13,13 +13,25 @@ virtual backend's own contract tests use — so nothing here needs rclone or SSH
 from __future__ import annotations
 
 import asyncio
+import io
+import stat
+import zipfile
 
 import pytest
 
 from services.thread_uploads import (
     MAX_FILE_SIZE,
     MAX_FILES_PER_REQUEST,
+    MAX_ZIP_ENTRIES,
+    MAX_ZIP_ENTRY_UNCOMPRESSED_BYTES,
+    MAX_ZIP_TOTAL_UNCOMPRESSED_BYTES,
     ThreadUploadError,
+    ZipExtractionRefused,
+    _expand_payloads_for_extraction,
+    _plan_zip_extraction,
+    _read_zip_entry_capped,
+    _safe_zip_member_path,
+    _sftp_write_files,
     _SshTarget,
     _VirtualTarget,
     _virtual_write_files,
@@ -38,6 +50,16 @@ SPEC = {
     "root": "srw-workspaces",
     "config": {"endpoint": "http://objects.test:9000"},
 }
+
+
+def _make_zip(entries: dict) -> bytes:
+    """Build zip bytes from ``{name: data}`` (or ``{name: ZipInfo}`` keys
+    when a test needs to set attributes like ``external_attr``)."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        for name, data in entries.items():
+            zf.writestr(name, data)
+    return buf.getvalue()
 
 
 def _thread(backend: str | None = None, **metadata) -> dict:
@@ -229,6 +251,264 @@ class TestLiteDestinations:
 
 
 # =============================================================================
+# Zip extraction — transport-agnostic core
+# =============================================================================
+
+
+class TestSafeZipMemberPath:
+    """Deliberate traversal rejection, unlike the worker's ``_extract_zip``
+    (``src/agent.py:4067``), whose dotfile skip only *incidentally* also
+    blocks ".." because ".." happens to start with "."."""
+
+    def test_ordinary_nested_entry_resolves_under_stem(self):
+        assert _safe_zip_member_path("bundle", "sub/file.txt") == "bundle/sub/file.txt"
+
+    def test_harmless_internal_dotdot_is_normalized_not_rejected(self):
+        """A "../" that stays within the entry's own subtree isn't a
+        traversal attempt — only escaping *stem* is."""
+        assert _safe_zip_member_path("bundle", "sub/../file.txt") == "bundle/file.txt"
+
+    def test_rejects_traversal_escaping_stem(self):
+        assert _safe_zip_member_path("bundle", "../../etc/passwd") is None
+
+    def test_rejects_traversal_that_exactly_cancels_stem(self):
+        assert _safe_zip_member_path("bundle", "sub/../..") is None
+
+    def test_rejects_absolute_path(self):
+        assert _safe_zip_member_path("bundle", "/etc/passwd") is None
+
+    def test_rejects_backslash_separator(self):
+        assert _safe_zip_member_path("bundle", "sub\\evil.dll") is None
+
+    def test_rejects_windows_drive_letter(self):
+        assert _safe_zip_member_path("bundle", "C:/Windows/evil.dll") is None
+
+    def test_rejects_nul_byte(self):
+        assert _safe_zip_member_path("bundle", "evil\x00.txt") is None
+
+    def test_rejects_empty_name(self):
+        assert _safe_zip_member_path("bundle", "") is None
+
+
+class TestReadZipEntryCapped:
+    """The chunked-read cap is what actually defends against a zip bomb —
+    a declared ``file_size``/CRC can lie about what a stream decompresses
+    to, so bounding *actual* bytes read is the real backstop."""
+
+    def test_reads_under_cap_normally(self):
+        fh = io.BytesIO(b"hello world")
+        assert _read_zip_entry_capped(fh, cap=1000, entry_name="x") == b"hello world"
+
+    def test_aborts_when_actual_bytes_exceed_cap_regardless_of_any_claim(self):
+        # Nothing here claims a size at all — this proves the cap is
+        # enforced against bytes actually produced, not metadata.
+        fh = io.BytesIO(b"x" * 1000)
+
+        with pytest.raises(ZipExtractionRefused):
+            _read_zip_entry_capped(fh, cap=100, entry_name="huge")
+
+
+class TestPlanZipExtraction:
+    def test_extracts_entries_under_stem_preserving_structure(self):
+        data = _make_zip({"a.txt": b"hello", "sub/b.txt": b"world"})
+
+        plan = _plan_zip_extraction(data, stem="bundle")
+
+        assert dict(plan) == {"bundle/a.txt": b"hello", "bundle/sub/b.txt": b"world"}
+
+    def test_skips_directory_entries_dotfiles_and_macosx(self):
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as zf:
+            zf.writestr("real.txt", b"hello")
+            zf.writestr("dir/", b"")
+            zf.writestr(".hidden", b"secret")
+            zf.writestr("__MACOSX/._real.txt", b"junk")
+            zf.writestr("sub/.git/config", b"nope")
+
+        plan = _plan_zip_extraction(buf.getvalue(), stem="bundle")
+
+        assert dict(plan) == {"bundle/real.txt": b"hello"}
+
+    def test_skips_symlink_entries(self):
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as zf:
+            zf.writestr("real.txt", b"hello")
+            link = zipfile.ZipInfo("link")
+            link.external_attr = (stat.S_IFLNK | 0o777) << 16
+            zf.writestr(link, "/etc/passwd")
+
+        plan = _plan_zip_extraction(buf.getvalue(), stem="bundle")
+
+        assert dict(plan) == {"bundle/real.txt": b"hello"}
+
+    def test_rejects_traversal_entry_refusing_the_whole_archive(self):
+        """Zip-Slip: one unsafe entry refuses the batch rather than
+        extracting everything else and silently dropping just that one —
+        "rather than half-extracted" (task brief)."""
+        data = _make_zip({"good.txt": b"fine", "../../etc/passwd": b"pwned"})
+
+        with pytest.raises(ZipExtractionRefused):
+            _plan_zip_extraction(data, stem="bundle")
+
+    def test_rejects_corrupt_non_zip_bytes(self):
+        with pytest.raises(ZipExtractionRefused):
+            _plan_zip_extraction(b"not actually a zip file", stem="bundle")
+
+    def test_rejects_empty_bytes(self):
+        with pytest.raises(ZipExtractionRefused):
+            _plan_zip_extraction(b"", stem="bundle")
+
+    def test_rejects_too_many_entries(self, monkeypatch):
+        from services import thread_uploads
+
+        monkeypatch.setattr(thread_uploads, "MAX_ZIP_ENTRIES", 3)
+        data = _make_zip({f"f{i}.txt": b"x" for i in range(4)})
+
+        with pytest.raises(ZipExtractionRefused):
+            _plan_zip_extraction(data, stem="bundle")
+
+    def test_rejects_entry_over_the_per_entry_cap(self, monkeypatch):
+        from services import thread_uploads
+
+        monkeypatch.setattr(thread_uploads, "MAX_ZIP_ENTRY_UNCOMPRESSED_BYTES", 10)
+        data = _make_zip({"big.bin": b"x" * 11})
+
+        with pytest.raises(ZipExtractionRefused):
+            _plan_zip_extraction(data, stem="bundle")
+
+    def test_rejects_when_total_uncompressed_exceeds_the_total_cap(self, monkeypatch):
+        from services import thread_uploads
+
+        monkeypatch.setattr(thread_uploads, "MAX_ZIP_ENTRY_UNCOMPRESSED_BYTES", 100)
+        monkeypatch.setattr(thread_uploads, "MAX_ZIP_TOTAL_UNCOMPRESSED_BYTES", 150)
+        data = _make_zip({"a.bin": b"x" * 100, "b.bin": b"x" * 100})
+
+        with pytest.raises(ZipExtractionRefused):
+            _plan_zip_extraction(data, stem="bundle")
+
+    def test_real_world_caps_relate_sensibly_to_max_file_size(self):
+        """Documents the chosen relationship so a future edit to
+        MAX_FILE_SIZE doesn't silently detune these — see task-1 report."""
+        assert MAX_ZIP_ENTRY_UNCOMPRESSED_BYTES == MAX_FILE_SIZE
+        assert MAX_ZIP_TOTAL_UNCOMPRESSED_BYTES == 3 * MAX_FILE_SIZE
+        assert MAX_ZIP_ENTRIES == 2_000
+
+
+class TestExpandPayloadsForExtraction:
+    def test_regular_payload_passes_through_sanitized_and_claimed(self):
+        taken: set[str] = set()
+
+        expanded = _expand_payloads_for_extraction(
+            [("notes.md", b"hi", "text/markdown")], taken
+        )
+
+        assert expanded == [("notes.md", b"hi", "text/markdown")]
+        assert taken == {"notes.md"}
+
+    def test_regular_payload_collision_resolves_like_before(self):
+        taken = {"notes.md"}
+
+        expanded = _expand_payloads_for_extraction(
+            [("notes.md", b"hi", "text/markdown")], taken
+        )
+
+        assert expanded == [("notes_1.md", b"hi", "text/markdown")]
+
+    def test_zip_payload_expands_into_members_under_its_stem(self):
+        data = _make_zip({"a.txt": b"hello", "sub/b.txt": b"world"})
+        taken: set[str] = set()
+
+        expanded = _expand_payloads_for_extraction(
+            [("bundle.zip", data, "application/zip")], taken
+        )
+
+        names = {name for name, _, _ in expanded}
+        assert names == {"bundle/a.txt", "bundle/sub/b.txt"}
+        assert "bundle" in taken
+
+    def test_zip_member_mime_type_is_guessed_from_its_own_extension(self):
+        data = _make_zip({"photo.jpg": b"fake-jpeg-bytes"})
+
+        expanded = _expand_payloads_for_extraction(
+            [("bundle.zip", data, "application/zip")], set()
+        )
+
+        [(name, _, mime_type)] = expanded
+        assert name == "bundle/photo.jpg"
+        assert mime_type == "image/jpeg"
+
+    def test_two_zips_with_the_same_stem_get_distinct_directories(self):
+        data = _make_zip({"a.txt": b"1"})
+        taken: set[str] = set()
+
+        expanded = _expand_payloads_for_extraction(
+            [
+                ("bundle.zip", data, "application/zip"),
+                ("bundle.zip", data, "application/zip"),
+            ],
+            taken,
+        )
+
+        names = {name for name, _, _ in expanded}
+        assert names == {"bundle/a.txt", "bundle_1/a.txt"}
+
+    def test_zip_stem_colliding_with_an_existing_name_is_renamed(self):
+        taken = {"bundle"}
+        data = _make_zip({"a.txt": b"1"})
+
+        expanded = _expand_payloads_for_extraction(
+            [("bundle.zip", data, "application/zip")], taken
+        )
+
+        assert expanded == [("bundle_1/a.txt", b"1", "text/plain")]
+
+    def test_corrupt_zip_falls_back_to_storing_the_original_bytes_verbatim(self):
+        garbage = b"not actually a zip file"
+
+        expanded = _expand_payloads_for_extraction(
+            [("bundle.zip", garbage, "application/zip")], set()
+        )
+
+        assert expanded == [("bundle.zip", garbage, "application/zip")]
+
+    def test_traversal_zip_falls_back_to_storing_the_original_bytes_verbatim(self):
+        """Half-extracted is not an option: the whole archive is refused
+        and the user keeps exactly what they uploaded."""
+        data = _make_zip({"good.txt": b"fine", "../../etc/passwd": b"pwned"})
+
+        expanded = _expand_payloads_for_extraction(
+            [("evil.zip", data, "application/zip")], set()
+        )
+
+        assert expanded == [("evil.zip", data, "application/zip")]
+
+    def test_zip_with_only_filtered_entries_falls_back_to_verbatim(self):
+        """A zip containing only __MACOSX/dotfile junk extracts to nothing
+        useful — keep the original rather than silently storing an empty
+        directory."""
+        data = _make_zip({".hidden": b"x", "__MACOSX/._x": b"y"})
+
+        expanded = _expand_payloads_for_extraction(
+            [("junk.zip", data, "application/zip")], set()
+        )
+
+        assert expanded == [("junk.zip", data, "application/zip")]
+
+    def test_fallback_reuses_the_claimed_stem_slot_avoiding_a_second_collision(self):
+        """The stem is claimed once whether extraction succeeds or falls
+        back — so the fallback name can never collide with something else
+        claimed in between."""
+        taken = {"bundle"}
+        garbage = b"not actually a zip file"
+
+        expanded = _expand_payloads_for_extraction(
+            [("bundle.zip", garbage, "application/zip")], taken
+        )
+
+        assert expanded == [("bundle_1.zip", garbage, "application/zip")]
+
+
+# =============================================================================
 # Object-store transport
 # =============================================================================
 
@@ -310,6 +590,217 @@ class TestVirtualWrite:
         result = _virtual_write_files(target, [("x.bin", b"x", "")], store=store)
 
         assert result[0].mime_type == "application/octet-stream"
+
+    def test_zip_payload_is_extracted_into_a_stem_directory(self, target, store):
+        data = _make_zip({"a.txt": b"hello", "sub/b.txt": b"world"})
+
+        result = _virtual_write_files(
+            target, [("bundle.zip", data, "application/zip")], store=store
+        )
+
+        names = {r.name for r in result}
+        assert names == {"bundle/a.txt", "bundle/sub/b.txt"}
+        assert store.get(f"{UPLOADS}bundle/a.txt") == b"hello"
+        assert store.get(f"{UPLOADS}bundle/sub/b.txt") == b"world"
+        paths = {r.path for r in result}
+        assert paths == {"uploads/bundle/a.txt", "uploads/bundle/sub/b.txt"}
+
+    def test_traversal_entry_inside_zip_falls_back_to_verbatim_storage(
+        self, target, store
+    ):
+        """No partial extraction: the whole archive is stored as the
+        original upload rather than half-expanded."""
+        data = _make_zip({"good.txt": b"fine", "../../etc/passwd": b"pwned"})
+
+        result = _virtual_write_files(
+            target, [("evil.zip", data, "application/zip")], store=store
+        )
+
+        assert result[0].name == "evil.zip"
+        assert store.get(f"{UPLOADS}evil.zip") == data
+        assert all(info.key.startswith(UPLOADS) for info in store.list(""))
+
+    def test_existing_extracted_directory_blocks_a_new_zip_stem_collision(
+        self, target, store
+    ):
+        """A previous zip already extracted to uploads/bundle/... — a new
+        zip that would also stem to "bundle" must not land in the same
+        directory and mix with unrelated content."""
+        store.put(f"{UPLOADS}bundle/old.txt", b"from the first upload")
+        data = _make_zip({"new.txt": b"from the second upload"})
+
+        result = _virtual_write_files(
+            target, [("bundle.zip", data, "application/zip")], store=store
+        )
+
+        assert result[0].name == "bundle_1/new.txt"
+        assert store.get(f"{UPLOADS}bundle/old.txt") == b"from the first upload"
+        assert store.get(f"{UPLOADS}bundle_1/new.txt") == b"from the second upload"
+
+    def test_zip_and_regular_file_in_one_batch_do_not_collide(self, target, store):
+        """Files and zip stems share one namespace: the plain "bundle"
+        claims that name first (payload order), so the zip's stem resolves
+        to "bundle_1" rather than clobbering it."""
+        data = _make_zip({"a.txt": b"hello"})
+
+        result = _virtual_write_files(
+            target,
+            [
+                ("bundle", b"a plain file, not a zip", "text/plain"),
+                ("bundle.zip", data, "application/zip"),
+            ],
+            store=store,
+        )
+
+        names = {r.name for r in result}
+        assert names == {"bundle", "bundle_1/a.txt"}
+        assert store.get(f"{UPLOADS}bundle") == b"a plain file, not a zip"
+        assert store.get(f"{UPLOADS}bundle_1/a.txt") == b"hello"
+
+
+# =============================================================================
+# SFTP transport
+#
+# _sftp_write_files had no unit coverage at all before this — it needs a
+# fake SFTPClient rather than the InMemoryObjectStore the virtual transport
+# tests use. The fake tracks directories (via mkdir) and written files
+# in-memory so assertions don't need a real SSH connection.
+# =============================================================================
+
+
+class _FakeSftpFile:
+    def __init__(self, sink: dict, path: str):
+        self._sink = sink
+        self._path = path
+        self._buf = b""
+
+    def write(self, data: bytes) -> None:
+        self._buf += data
+
+    def __enter__(self) -> "_FakeSftpFile":
+        return self
+
+    def __exit__(self, *exc_info) -> bool:
+        self._sink[self._path] = self._buf
+        return False
+
+
+class _FakeSftp:
+    """Minimal paramiko SFTPClient stand-in for ``_sftp_write_files``."""
+
+    def __init__(self):
+        self.dirs: set[str] = {""}
+        self.files: dict[str, bytes] = {}
+
+    def stat(self, path: str):
+        if path in self.dirs or path in self.files:
+            return object()
+        raise FileNotFoundError(path)
+
+    def mkdir(self, path: str) -> None:
+        self.dirs.add(path)
+
+    def listdir(self, path: str) -> list[str]:
+        prefix = path.rstrip("/") + "/"
+        children: set[str] = set()
+        for existing in (*self.dirs, *self.files):
+            if existing.startswith(prefix) and existing != path:
+                remainder = existing[len(prefix) :]
+                if remainder:
+                    children.add(remainder.split("/", 1)[0])
+        return sorted(children)
+
+    def open(self, path: str, mode: str) -> _FakeSftpFile:
+        return _FakeSftpFile(self.files, path)
+
+    def close(self) -> None:
+        pass
+
+
+@pytest.fixture
+def sftp_env(monkeypatch):
+    """Patch paramiko.SSHClient so _sftp_write_files runs against a fake
+    in-memory SFTP filesystem instead of a real connection."""
+    import paramiko
+
+    from unittest.mock import MagicMock
+
+    fake_sftp = _FakeSftp()
+    mock_ssh = MagicMock()
+    mock_ssh.open_sftp.return_value = fake_sftp
+    monkeypatch.setattr(paramiko, "SSHClient", MagicMock(return_value=mock_ssh))
+    return fake_sftp
+
+
+def _ssh_target() -> _SshTarget:
+    return _SshTarget(
+        host="10.0.0.5",
+        port=22,
+        username="agent-host",
+        key_path="/key",
+        workspace_path="/home/agent-host/workspace",
+    )
+
+
+class TestSftpWrite:
+    UPLOADS_DIR = "/home/agent-host/workspace/uploads"
+
+    def test_regular_file_upload_still_works(self, sftp_env):
+        """Regression coverage for the taken-set refactor: collision
+        resolution must behave exactly as the old live-probe loop did."""
+        result = _sftp_write_files(
+            _ssh_target(), [("notes.md", b"hello", "text/markdown")]
+        )
+
+        assert result[0].name == "notes.md"
+        assert result[0].path == "uploads/notes.md"
+        assert sftp_env.files[f"{self.UPLOADS_DIR}/notes.md"] == b"hello"
+
+    def test_collision_resolves_against_an_existing_remote_file(self, sftp_env):
+        sftp_env.files[f"{self.UPLOADS_DIR}/notes.md"] = b"old"
+
+        result = _sftp_write_files(
+            _ssh_target(), [("notes.md", b"new", "text/markdown")]
+        )
+
+        assert result[0].name == "notes_1.md"
+        assert sftp_env.files[f"{self.UPLOADS_DIR}/notes_1.md"] == b"new"
+        assert sftp_env.files[f"{self.UPLOADS_DIR}/notes.md"] == b"old"
+
+    def test_zip_payload_is_extracted_into_nested_remote_paths(self, sftp_env):
+        data = _make_zip({"a.txt": b"hello", "sub/b.txt": b"world"})
+
+        result = _sftp_write_files(
+            _ssh_target(), [("bundle.zip", data, "application/zip")]
+        )
+
+        names = {r.name for r in result}
+        assert names == {"bundle/a.txt", "bundle/sub/b.txt"}
+        assert sftp_env.files[f"{self.UPLOADS_DIR}/bundle/a.txt"] == b"hello"
+        assert sftp_env.files[f"{self.UPLOADS_DIR}/bundle/sub/b.txt"] == b"world"
+        # Nested parent directories were created before the write.
+        assert f"{self.UPLOADS_DIR}/bundle" in sftp_env.dirs
+        assert f"{self.UPLOADS_DIR}/bundle/sub" in sftp_env.dirs
+
+    def test_traversal_zip_falls_back_to_verbatim_storage(self, sftp_env):
+        data = _make_zip({"good.txt": b"fine", "../../etc/passwd": b"pwned"})
+
+        result = _sftp_write_files(
+            _ssh_target(), [("evil.zip", data, "application/zip")]
+        )
+
+        assert result[0].name == "evil.zip"
+        assert sftp_env.files[f"{self.UPLOADS_DIR}/evil.zip"] == data
+
+    def test_corrupt_zip_falls_back_to_verbatim_storage(self, sftp_env):
+        garbage = b"not actually a zip file"
+
+        result = _sftp_write_files(
+            _ssh_target(), [("broken.zip", garbage, "application/zip")]
+        )
+
+        assert result[0].name == "broken.zip"
+        assert sftp_env.files[f"{self.UPLOADS_DIR}/broken.zip"] == garbage
 
 
 # =============================================================================
