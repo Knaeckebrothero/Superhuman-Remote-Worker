@@ -63,26 +63,26 @@ global:
 # -----------------------------------------------------------------------------
 image:
   orchestrator:
-    tag: sha-669b495
+    tag: sha-d7e05c3
   agent:
-    tag: sha-669b495
+    tag: sha-d7e05c3
   cockpit:
     tag: sha-8710200
   mcp:
     tag: sha-2c1f82f
   workspace:
-    tag: sha-5eb436e
+    tag: sha-571fbc8
 # Full deployment identities are updated alongside each independently rebuilt
 # image. Short image tags remain display/update handles only.
 provenance:
-  releaseVersion: "0.0.0-dev.sha-669b49526edde1a12072bf1abd89989bbe693e8c"
+  releaseVersion: "0.0.0-dev.sha-d7e05c3964497a57b88a56959938709c979fc708"
   components:
     orchestrator:
-      sourceRevision: 669b49526edde1a12072bf1abd89989bbe693e8c
-      releaseVersion: "0.0.0-dev.sha-669b49526edde1a12072bf1abd89989bbe693e8c"
+      sourceRevision: d7e05c3964497a57b88a56959938709c979fc708
+      releaseVersion: "0.0.0-dev.sha-d7e05c3964497a57b88a56959938709c979fc708"
     agent:
-      sourceRevision: 669b49526edde1a12072bf1abd89989bbe693e8c
-      releaseVersion: "0.0.0-dev.sha-669b49526edde1a12072bf1abd89989bbe693e8c"
+      sourceRevision: d7e05c3964497a57b88a56959938709c979fc708
+      releaseVersion: "0.0.0-dev.sha-d7e05c3964497a57b88a56959938709c979fc708"
     cockpit:
       sourceRevision: 8710200713a679d59140933bc91a5d82f87676af
       releaseVersion: "0.0.0-dev.sha-8710200713a679d59140933bc91a5d82f87676af"
@@ -90,8 +90,8 @@ provenance:
       sourceRevision: 2c1f82feaa78f51ea18f8ce22b37d5f9beb6ae82
       releaseVersion: "0.0.0-dev.sha-2c1f82feaa78f51ea18f8ce22b37d5f9beb6ae82"
     workspace:
-      sourceRevision: 5eb436eb9181b3271aef223e89c8d87861d95b4c
-      releaseVersion: "0.0.0-dev.sha-5eb436eb9181b3271aef223e89c8d87861d95b4c"
+      sourceRevision: 571fbc8ca40847bb63cf57c92d86f3df15e35a7c
+      releaseVersion: "0.0.0-dev.sha-571fbc8ca40847bb63cf57c92d86f3df15e35a7c"
 # -----------------------------------------------------------------------------
 # Orchestrator HA — M1 leader-election go-live
 # (docs/operations/orchestrator_m1_go_live.md)
