@@ -3117,13 +3117,16 @@ def test_canvas_session_create_override_is_closed() -> None:
     import main
 
     with pytest.raises(main.HTTPException) as exc:
-        main._validated_session_tool_overrides({"tools": {"canvas": ["run_command"]}})
+        main._validated_tool_overrides({"tools": {"canvas": ["run_command"]}})
     assert exc.value.status_code == 400
 
-    accepted = main._validated_session_tool_overrides(
+    # ``shell`` is no longer discarded — every category the request names is
+    # honoured now (Defect 2). The canvas group is still closed against a
+    # foreign name, which is the part this test exists for.
+    accepted = main._validated_tool_overrides(
         {"tools": {"canvas": [], "shell": ["shell_execute"]}}
     )
-    assert accepted == {"canvas": []}
+    assert accepted == {"canvas": [], "shell": ["shell_execute"]}
     assert main._session_tool_group_disabled_markers({"tools": {"canvas": []}}) == {
         "_canvas_disabled": True
     }

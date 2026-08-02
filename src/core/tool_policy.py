@@ -53,6 +53,13 @@ layer model unmodified.  A consequence worth stating out loud: a child
 category* minus ``c``, which is wider than its parent.  That is intended; see
 ``TestMergeOrder.test_parent_only_child_except_WIDENS_and_that_is_intended``.
 
+This module is also the **request boundary's** vocabulary — see
+:func:`validate_tool_override_fragment`.  Config layers and API requests are
+the same kind of object, so they get the same answer to "is this a legal
+``tools.<category>`` value, and do these names live in this category?".  The
+difference is only what a failure means: a config file raises at load, a
+request gets a 400.
+
 Design: ``docs/features/tool_config_policy_vs_membership.md``.
 """
 
@@ -285,9 +292,118 @@ def assert_tool_policy_canonical(tools_data: Any, *, where: str) -> None:
             )
 
 
+def validate_tool_override_fragment(config_override: Any) -> dict[str, list[str]]:
+    """Validate a **request-layer** ``tools`` mapping against the registry.
+
+    The one tool vocabulary for every write boundary: session create, session
+    runtime update, and job create.  A ``tools.<category>`` fragment is
+    accepted when the category is real and every name in it belongs to that
+    category *per the registry*.  Anything else raises
+    :class:`ToolPolicyError`, which each boundary turns into a 400.
+
+    **Reject, never drop.**  The predecessor
+    (``session_tool_overrides.validate_session_tool_overrides``) honoured four
+    hand-curated groups and silently discarded the rest, so unticking eight of
+    the twelve categories the New Session form renders was accepted and thrown
+    away — a restriction shown to the user and never applied.  Silence is the
+    defect; a boundary that will not honour a fragment must say so.
+
+    Membership is the **whole** category, not
+    :func:`expand_category_true`'s grantable subset.  ``grant: "code"`` and
+    ``grant: "explicit"`` restrict *category-level policy*, not an explicit
+    name — ``config/experts/centurion`` names ``steer_worker_job`` and
+    ``get_stuck_jobs`` — so treating "not in ``true``'s expansion" as "not
+    allowed" would make this validator a second, stricter grant system.  It is
+    not one: capability grants (``src/core/capability_grants.py``) remain the
+    PDP.  This is a shape-and-vocabulary gate and nothing more.
+
+    ``mcp`` has no static registry membership — ``register_mcp_tools``
+    discovers it per session, and never in the orchestrator process.  Names
+    there cannot be checked positively, so the rule inverts: a name the
+    registry knows under a *different* category is rejected (that is the
+    smuggle), and an unrecognised one passes as a presumed runtime-discovered
+    MCP tool.
+
+    Returns the accepted mapping keyed by **canonical** category, with every
+    value normalised to the ``list[str]`` the rest of the stack speaks — so a
+    caller can assign it straight back over ``config_override["tools"]`` and
+    know the PDP downstream reads canonical lists rather than raw policy
+    values (see the ``_truthy`` table in
+    ``docs/features/tool_config_policy_vs_membership.md``).  A fragment with no
+    ``tools`` key returns ``{}``.
+    """
+    if not isinstance(config_override, dict) or "tools" not in config_override:
+        return {}
+
+    tools = config_override.get("tools")
+    if not isinstance(tools, dict):
+        raise ToolPolicyError(
+            f"tools: expected an object keyed by tool category; got "
+            f"{type(tools).__name__} ({tools!r})."
+        )
+
+    known = config_tool_categories()
+    accepted: dict[str, list[str]] = {}
+    claimed_by: dict[str, str] = {}
+    for key, value in tools.items():
+        if not isinstance(key, str):
+            raise ToolPolicyError(f"tools: category keys must be strings; got {key!r}.")
+        category = LEGACY_CATEGORY_ALIASES.get(key, key)
+        if category not in known:
+            raise ToolPolicyError(
+                f"tools.{key}: unknown tool category. Known categories: "
+                f"{', '.join(sorted(known))}."
+            )
+        if category in accepted:
+            # Only reachable through an alias (``coding`` + ``shell``).  Two
+            # values for one category is unresolvable, and picking one is the
+            # silent drop this function exists to remove.
+            raise ToolPolicyError(
+                f"tools.{key} and tools.{claimed_by[category]} both address the "
+                f"{category} category. Write one of them."
+            )
+        claimed_by[category] = key
+        names = expand_tool_policy(value, category)
+        foreign = _foreign_tool_names(names, category)
+        if foreign:
+            raise ToolPolicyError(
+                f"tools.{key}: {', '.join(foreign)}. A tool list may only name "
+                f"tools of its own category — the loader resolves a name "
+                f"against the global registry, not against the key it arrived "
+                f"under, so a foreign name would bind the foreign tool."
+            )
+        accepted[category] = names
+    return accepted
+
+
 # ---------------------------------------------------------------------------
 # internals
 # ---------------------------------------------------------------------------
+def _foreign_tool_names(names: list[str], category: str) -> list[str]:
+    """Describe every name in ``names`` that does not belong to ``category``."""
+    reg = _registry()
+    if category == "mcp":
+        offenders = [
+            name
+            for name in names
+            if name != MCP_WILDCARD
+            and (reg.TOOL_REGISTRY.get(name) or {}).get("category") not in (None, "mcp")
+        ]
+    else:
+        members = set(reg.get_tools_by_category(category))
+        offenders = [name for name in names if name not in members]
+
+    described: list[str] = []
+    for name in sorted(set(offenders)):
+        home = (reg.TOOL_REGISTRY.get(name) or {}).get("category")
+        described.append(
+            f"'{name}' is in tools.{home}"
+            if home
+            else f"'{name}' is not a registered tool"
+        )
+    return described
+
+
 def _require_known_category(category: str) -> None:
     if category not in config_tool_categories():
         raise ToolPolicyError(
@@ -399,4 +515,5 @@ __all__ = [
     "expand_category_true",
     "expand_tool_policy",
     "normalize_tool_policy",
+    "validate_tool_override_fragment",
 ]

@@ -42,8 +42,10 @@ from ..core.skill_resolution import (
     APP_GUIDE_LOADER_TOOL,
     app_guide_health_snapshot,
 )
-from ..core.session_tool_overrides import validate_session_tool_overrides
-from ..core.tool_policy import normalize_tool_policy
+from ..core.tool_policy import (
+    normalize_tool_policy,
+    validate_tool_override_fragment,
+)
 from ..core.workspace_backend import WorkspaceUnavailableError
 from ..agent import UniversalAgent
 from ..llm.reasoning_chat import extract_reasoning_text_from_block
@@ -1397,18 +1399,21 @@ def _sanitize_live_session_config_override(
 ) -> Dict[str, Any]:
     """Fence the live config surface before it reaches generic config loading.
 
-    Only the closed session-facing tool groups are mutable through this
-    WebSocket path.  Unknown categories retain the create endpoint's existing
-    ignore semantics, while a known group carrying an unknown or foreign tool
-    name raises.  Returning a copy keeps the caller-owned WebSocket payload
-    immutable.
+    Every ``tools.<category>`` is checked against the registry — the category
+    must exist and every name in it must belong to that category, because the
+    loader resolves a name globally rather than by the key it arrived under.
+    Anything that fails raises ``ToolPolicyError`` (a ``ValueError``, which is
+    what this boundary has always signalled with); nothing is silently
+    dropped.  This mirrors the orchestrator's PATCH boundary rather than
+    narrowing it, so the two cannot disagree about what a live update means.
+    Returning a copy keeps the caller-owned WebSocket payload immutable.
     """
 
     if not isinstance(config_override, dict):
         raise ValueError("Session config override must be an object")
     sanitized = dict(config_override)
     if "tools" in sanitized:
-        accepted_tools = validate_session_tool_overrides(sanitized)
+        accepted_tools = validate_tool_override_fragment(sanitized)
         if accepted_tools:
             sanitized["tools"] = accepted_tools
         else:

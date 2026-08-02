@@ -42,10 +42,15 @@ export const SESSION_TOOL_CATEGORIES: ToolCategoryMeta[] = [
 ];
 
 /**
- * The four closed session tool groups — the ONLY categories the live
- * `config.update` path validates; anything else is silently dropped at both
- * boundaries (src/core/session_tool_overrides.py). Live mode renders exactly
- * these; rendering the full session list would give 8 toggles that no-op.
+ * The four closed session tool groups the live pane offers as switches.
+ *
+ * Historically these were the ONLY categories either session boundary
+ * validated, and the other eight were silently dropped — so rendering them
+ * live would have given 8 toggles that no-op. That is no longer true: every
+ * write boundary now validates every category against the registry
+ * (src/core/tool_policy.py::validate_tool_override_fragment), and a fragment
+ * it will not honour is a 400 rather than a discard. Widening the live pane to
+ * the full list is a UI decision, not a backend constraint.
  */
 export const LIVE_TOOL_CATEGORIES: ToolCategoryMeta[] = SESSION_TOOL_CATEGORIES.filter(
   (cat) => ['canvas', 'orchestrator', 'agent_catalog', 'workflows'].includes(cat.key),
@@ -56,8 +61,10 @@ export const LIVE_TOOL_CATEGORIES: ToolCategoryMeta[] = SESSION_TOOL_CATEGORIES.
  * SESSION_TOOL_OVERRIDE_NAMES in src/core/session_tool_overrides.py, pinned
  * against drift by tests/test_session_tool_group_mirror.py. Used as the
  * payload when a live toggle re-enables a group (the agent keys enablement
- * off empty-vs-non-empty, but the list must pass the closed-vocabulary
- * validation, so send the canonical full set).
+ * off empty-vs-non-empty, so send the canonical full set).
+ *
+ * The backend now also accepts `true` for a category and expands it to
+ * exactly these names, which makes this mirror redundant rather than wrong.
  */
 export const SESSION_TOOL_GROUP_NAMES: Record<string, string[]> = {
   orchestrator: [

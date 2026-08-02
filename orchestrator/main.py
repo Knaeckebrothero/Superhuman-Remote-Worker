@@ -278,9 +278,11 @@ from src.core.datasource_catalog import (  # noqa: E402
 from src.core.datasource_setup import datasource_tool_categories  # noqa: E402
 from src.core.session_tool_overrides import (  # noqa: E402
     SESSION_TOOL_OVERRIDE_NAMES,
-    SessionToolOverrideError,
     session_tool_group_enablement,
-    validate_session_tool_overrides,
+)
+from src.core.tool_policy import (  # noqa: E402
+    ToolPolicyError,
+    validate_tool_override_fragment,
 )
 from src.core.tool_report import (  # noqa: E402
     ORIGIN_AGENT,
@@ -3979,8 +3981,6 @@ def _validated_session_officer_override(
     return cleaned or None
 
 
-_SESSION_CREATE_TOOL_OVERRIDE_KEYS = frozenset(SESSION_TOOL_OVERRIDE_NAMES)
-_SESSION_CREATE_TOOL_OVERRIDE_NAMES = SESSION_TOOL_OVERRIDE_NAMES
 _SESSION_TOOL_DISABLED_MARKERS = {
     "orchestrator": "_fleet_management_disabled",
     "agent_catalog": "_agent_catalog_disabled",
@@ -3989,25 +3989,50 @@ _SESSION_TOOL_DISABLED_MARKERS = {
 }
 
 
-def _validated_session_tool_overrides(
+def _validated_tool_overrides(
     config_override: Any,
 ) -> dict[str, list[str]]:
-    """Extract allowed New Session tool group toggles.
+    """Validate a request's ``tools`` mapping, or 400.
 
-    At session creation we intentionally honor only the SRW session-facing
-    control groups, not arbitrary tool grants from the request.
+    The one vocabulary for every write boundary — session create, session
+    runtime update, job create.  Every category is checked against the
+    registry, and anything the boundary will not honour is **rejected**, not
+    dropped: the predecessor honoured four hand-curated groups and silently
+    discarded the other eight the New Session form renders, so unticking
+    ``research`` or ``shell`` was accepted and never applied.  Same rationale
+    as ``_validated_reasoning_level`` — garbage fails loud here instead of
+    disappearing.
+
+    This is a shape-and-vocabulary gate.  Capability grants
+    (``_enforce_session_create_grants`` / ``_enforce_job_create_grants``) stay
+    the authorization decision point; nothing here duplicates them.
     """
     try:
-        return validate_session_tool_overrides(config_override)
-    except SessionToolOverrideError as exc:
+        return validate_tool_override_fragment(config_override)
+    except ToolPolicyError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+def _with_validated_tool_overrides(
+    config_override: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Return ``config_override`` with its ``tools`` mapping validated in place.
+
+    Assignment, not filtering: :func:`_validated_tool_overrides` raises on
+    anything it will not honour, so what comes back covers every category the
+    caller wrote — normalised to the canonical ``list[str]`` the PDP and the
+    loader both read.
+    """
+    if not isinstance(config_override, dict) or "tools" not in config_override:
+        return config_override
+    return {**config_override, "tools": _validated_tool_overrides(config_override)}
 
 
 def _validated_session_fleet_tools_override(
     config_override: Any,
 ) -> Optional[list[str]]:
     """Extract the New Session Fleet Management tool toggle."""
-    return _validated_session_tool_overrides(config_override).get("orchestrator")
+    return _validated_tool_overrides(config_override).get("orchestrator")
 
 
 def _fleet_management_explicitly_disabled(
@@ -8998,6 +9023,22 @@ async def create_job(request: Request, job: JobCreate) -> dict[str, Any]:
             await require_project_member(
                 request, postgres_db, str(job.project_id), min_role="editor"
             )
+    # The job surface had no tool vocabulary at all: it stripped four lifecycle
+    # markers and then accepted `tools.<anything>: [<any registered name>]`.
+    # That is the exact smuggle src/core/session_tool_overrides.py was written
+    # to prevent — the loader resolves a name against the global registry, not
+    # against the key it arrived under, so `tools.canvas: ["run_command"]`
+    # binds a shell tool — open on the other surface with only the dispatch PDP
+    # behind it, and the PDP keys off the category NAME (`_truthy(tools.shell)`)
+    # so it never sees the smuggled one.
+    #
+    # Applies to the internal path too: X-Internal-Key is transport
+    # authentication, not authorization, and create_worker_job forwards a
+    # model-authored config_override verbatim. The server's own fragments are
+    # unaffected — _critic_config_override and the loop's `{"loop":
+    # ["loop_plan"]}` go through postgres_db.create_job directly, and the
+    # officer slot patch is merged in below, after this point.
+    job.config_override = _with_validated_tool_overrides(job.config_override)
     await _enforce_readiness_gate()
     try:
         # Merge upload IDs into context
@@ -22010,14 +22051,20 @@ async def _apply_thread_config_update(
     internal ones — the recorded path distinguishes the two).
     """
     if "tools" in config_override:
-        # Runtime updates use the same closed group/name boundary as
-        # session creation.  Persist only the accepted session-facing
-        # subset; otherwise a globally registered tool could be smuggled
-        # through an unrelated category and instantiated by name later.
-        accepted_tools = _validated_session_tool_overrides(config_override)
+        # Runtime updates use the same registry vocabulary as session creation
+        # and job creation.  A fragment this boundary will not honour is a 400
+        # from here, not a silent discard: the previous closed-group filter
+        # replaced `tools` with the four accepted groups and dropped the rest,
+        # so a live "turn research off" was acknowledged and never applied.
+        # The names are also checked against their own category, because the
+        # loader resolves a name against the global registry rather than the
+        # key it arrived under.
+        accepted_tools = _validated_tool_overrides(config_override)
         if accepted_tools:
             config_override["tools"] = accepted_tools
         else:
+            # `tools: {}` only — it asks for nothing, so there is nothing to
+            # honour and nothing to report as changed.
             config_override.pop("tools", None)
 
     # Audit summary is computed PRE-enrichment so it names only the keys the
@@ -22061,14 +22108,20 @@ async def _apply_thread_config_update(
             project_ids=await _thread_project_ids(thread_id),
         )
         flip = _build_datasource_tool_override(resolved_ds, None)
-        # The flip's categories (sql/graph/mongodb/webdav) are outside the
-        # validated session tools vocabulary, so layering the request's own
-        # already-validated groups on top cannot mask them.
+        # THE FLIP WINS, and the order is load-bearing. It used to be the other
+        # way round, safe only because the request's tools were filtered down
+        # to four non-connector groups first. Now that every category is
+        # honoured, a request could send `tools.sql: []` and mask a
+        # datasource_tools violation from the PDP below — while attach applies
+        # the flip LAST anyway (_build_datasource_tool_override updates the
+        # request's tools with the datasource categories), so the session would
+        # get connector tools the grant check never saw. Modelling attach
+        # exactly is what keeps this fragment honest.
         grant_fragment = {
             **config_override,
             "tools": {
-                **flip.get("tools", {}),
                 **(config_override.get("tools") or {}),
+                **flip.get("tools", {}),
             },
         }
 
@@ -23103,16 +23156,20 @@ async def create_thread(
         # validated workspace sub-dict here (no creds); the backend must land in
         # config_override now because the workspace is provisioned synchronously
         # at create — unlike the other Advanced settings it can't be a runtime
-        # PATCH. Only the SRW session-facing tool group toggles are accepted at
-        # create time below.
+        # PATCH. Tool groups are validated against the registry just below.
         req_workspace = _validated_session_workspace_override(
             request_body.config_override
         )
         if req_workspace:
             config_override.setdefault("workspace", {}).update(req_workspace)
-        req_tool_groups = _validated_session_tool_overrides(
-            request_body.config_override
-        )
+        # EVERY tool category the request names, not four of them. The form
+        # renders twelve and writes `tools.<cat>: []` for each one unticked;
+        # copying across only the four allowlisted groups meant the other eight
+        # restrictions were shown to the user, accepted by the API, and thrown
+        # away. Names are checked against their own registry category, so a
+        # smuggled `tools.canvas: ["run_command"]` is a 400 rather than a shell
+        # tool. Grants are still enforced below on the fully resolved config.
+        req_tool_groups = _validated_tool_overrides(request_body.config_override)
         if req_tool_groups:
             config_override.setdefault("tools", {}).update(req_tool_groups)
         # Officer (centurion) block — must be denormalized into thread
