@@ -5,10 +5,11 @@ loading the appropriate tools based on configuration.
 """
 
 import copy
+import functools
 import logging
 import os
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields as dataclass_fields
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -16,6 +17,10 @@ import yaml
 from langchain_core.language_models import BaseChatModel
 
 from src.core.model_registry import family_of
+from src.core.tool_policy import (
+    assert_tool_policy_canonical,
+    normalize_tool_policy,
+)
 from src.llm.reasoning_chat import ReasoningChatOpenAI
 
 logger = logging.getLogger(__name__)
@@ -255,6 +260,12 @@ def load_and_merge_config(config_path: str) -> Dict[str, Any]:
     config_path = canonical_config_name(config_path)
     with open(config_path, "r", encoding="utf-8") as f:
         config_data = yaml.safe_load(f)
+
+    # Normalisation seam 1 of 6: every bundled YAML and every link of the
+    # $extends chain. Runs BEFORE the merge because expansion is layer-local —
+    # each layer resolves to list[str] on its own, and deep_merge's "lists
+    # replace, dicts merge" then carries the layer model unmodified.
+    config_data = normalize_tool_policy(config_data)
 
     # Handle $extends inheritance
     if "$extends" in config_data:
@@ -1488,7 +1499,21 @@ class WorkspaceConfig:
 
 @dataclass
 class ToolsConfig:
-    """Tools configuration by category (matches src/tools/ packages)."""
+    """Tools configuration by category (matches src/tools/ packages).
+
+    One field per ``TOOL_REGISTRY`` category, plus ``mcp`` (whose membership is
+    discovered at runtime, so it has no static registry category). The field
+    set is pinned against the registry by
+    ``tests/test_tool_policy.py::TestCategoryVocabularyAgreement`` — it cannot
+    be *derived* at import time because ``src/tools/registry`` imports this
+    module (via ``spawn_subagent``), so the dependency only runs one way.
+
+    Values are canonical ``List[str]``. The authoring vocabulary
+    (``true`` / ``false`` / ``{only}`` / ``{except}``) is resolved to that form
+    upstream by ``src.core.tool_policy.normalize_tool_policy``; a non-list
+    reaching this dataclass is a missed call site and raises rather than
+    silently emptying the group.
+    """
 
     workspace: List[str] = field(default_factory=list)
     core: List[str] = field(default_factory=list)
@@ -1520,6 +1545,16 @@ class ToolsConfig:
     # orchestrator injects `tools.loop` via config_override only for a planner
     # loop's checkpoint critic (docs/features/loop_campaign_scheduling.md).
     loop: List[str] = field(default_factory=list)
+    # Registry categories that had no field until 2026-08-02, so a
+    # `tools.product_help:` / `tools.session_task:` key parsed and did nothing.
+    # Both are wholly `grant: "code"` (bound by the persistent-session floors
+    # at src/api/persistent_session.py), so `true` expands to [] and the fields
+    # grant nothing new — `load_tools` already binds their tools when named
+    # under any key, because it groups by registry metadata rather than by the
+    # key a name arrived under. Having the field makes the natural key work and
+    # makes the vocabulary agreement testable.
+    product_help: List[str] = field(default_factory=list)
+    session_task: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -2385,6 +2420,9 @@ def load_agent_config(
     )
 
     tools_data = data.get("tools", {})
+    # Last line of defence: the authoring vocabulary must already have been
+    # resolved to lists. A bool arriving here would silently empty the group.
+    assert_tool_policy_canonical(tools_data, where="ToolsConfig")
     tools_config = ToolsConfig(
         workspace=tools_data.get("workspace", []),
         core=tools_data.get("core", []),
@@ -2409,6 +2447,8 @@ def load_agent_config(
         agent_catalog=tools_data.get("agent_catalog", []),
         workflows=tools_data.get("workflows", []),
         loop=tools_data.get("loop", []),
+        product_help=tools_data.get("product_help", []),
+        session_task=tools_data.get("session_task", []),
     )
 
     connections_data = data.get("connections", {})
@@ -2641,6 +2681,9 @@ def load_agent_config_from_dict(
     )
 
     tools_data = data.get("tools", {})
+    # Last line of defence: the authoring vocabulary must already have been
+    # resolved to lists. A bool arriving here would silently empty the group.
+    assert_tool_policy_canonical(tools_data, where="ToolsConfig")
     tools_config = ToolsConfig(
         workspace=tools_data.get("workspace", []),
         core=tools_data.get("core", []),
@@ -2665,6 +2708,8 @@ def load_agent_config_from_dict(
         agent_catalog=tools_data.get("agent_catalog", []),
         workflows=tools_data.get("workflows", []),
         loop=tools_data.get("loop", []),
+        product_help=tools_data.get("product_help", []),
+        session_task=tools_data.get("session_task", []),
     )
 
     connections_data = data.get("connections", {})
@@ -2886,6 +2931,10 @@ def load_uploaded_config(uploaded_config_path: Path) -> Dict[str, Any]:
     # Remove $extends if present - we always extend defaults for uploaded configs
     uploaded_data.pop("$extends", None)
     uploaded_data.pop("$comment", None)
+
+    # Normalisation seam 2 of 6: a job's uploaded config is an authored layer
+    # like any other, and this path never goes through load_and_merge_config.
+    uploaded_data = normalize_tool_policy(uploaded_data)
 
     # Merge: defaults as base, uploaded as override
     merged = deep_merge(defaults_data, uploaded_data)
@@ -4484,6 +4533,17 @@ def load_auxiliary_prompt(
     return template
 
 
+@functools.lru_cache(maxsize=1)
+def _tools_config_field_names() -> tuple[str, ...]:
+    """Every ``ToolsConfig`` field, in declaration order.
+
+    Declaration order is the order ``get_all_tool_names`` emits categories in,
+    and is preserved so the resolved list is byte-identical to the hand-kept
+    tuple this replaced.
+    """
+    return tuple(f.name for f in dataclass_fields(ToolsConfig))
+
+
 def get_all_tool_names(config: AgentConfig) -> List[str]:
     """Get all tool names from configuration.
 
@@ -4507,31 +4567,11 @@ def get_all_tool_names(config: AgentConfig) -> List[str]:
         return []
 
     names: list[str] = []
-    for category in (
-        "workspace",
-        "core",
-        "research",
-        "browser_direct",
-        "citation",
-        "graph",
-        "sql",
-        "mongodb",
-        "git",
-        "repo",
-        "shell",
-        "evaluation",
-        "knowledge",
-        "webdav",
-        "email",
-        "mcp",
-        "communication",
-        "delegation",
-        "orchestrator",
-        "canvas",
-        "agent_catalog",
-        "workflows",
-        "loop",
-    ):
+    # Derived from the dataclass rather than transcribed. A hand-kept tuple was
+    # a third list to drift alongside ToolsConfig and config/schema.json, and
+    # its drift is silent in the worst direction: a field the tuple forgets is
+    # a category that parses, validates and grants nothing.
+    for category in _tools_config_field_names():
         names.extend(_category_names(category))
 
     # Shell mode aliasing for backward compatibility

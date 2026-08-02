@@ -260,150 +260,15 @@
       }
     },
     "tools": {
+      "description": "Tool configuration by category: one field per TOOL_REGISTRY category, plus mcp. Each value is POLICY, not membership: true / false / {only: [...]} / {except: [...]}, or the legacy spellings (a bare list = only; [] = false). See docs/features/tool_config_policy_vs_membership.md.",
       "type": "object",
-      "description": "Tool configuration by category (matches src/tools/ packages)",
-      "required": ["workspace", "core"],
+      "required": [
+        "workspace",
+        "core"
+      ],
       "properties": {
-        "workspace": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          },
-          "description": "Workspace file operation tools (src/tools/workspace/)",
-          "examples": [["read_file", "write_file", "list_files", "edit_file"]]
-        },
-        "core": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          },
-          "description": "Core tools: todo management + job completion (src/tools/core/)",
-          "examples": [["next_phase_todos", "todo_complete", "mark_complete", "job_complete"]]
-        },
-        "research": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          },
-          "description": "Research/web search tools (src/tools/research/)",
-          "examples": [["web_search"]]
-        },
-        "citation": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          },
-          "description": "Citation management tools (src/tools/citation/)",
-          "examples": [["cite_document", "cite_web", "list_sources"]]
-        },
-        "graph": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          },
-          "description": "Neo4j graph tools (src/tools/graph/). Injected automatically when a Neo4j datasource is attached to the job. Usually left empty in config.",
-          "examples": [["cypher_query", "cypher_execute", "get_database_schema"]]
-        },
-        "sql": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          },
-          "description": "PostgreSQL query tools (src/tools/sql/). Injected automatically when a PostgreSQL datasource is attached to the job.",
-          "examples": [["sql_query", "sql_schema", "sql_execute"]]
-        },
-        "mongodb": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          },
-          "description": "MongoDB query tools (src/tools/mongodb/). Injected automatically when a MongoDB datasource is attached to the job.",
-          "examples": [["mongo_query", "mongo_aggregate", "mongo_schema", "mongo_insert", "mongo_update"]]
-        },
-        "git": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          },
-          "description": "Git version control tools for workspace history (src/tools/git/)",
-          "examples": [["git_log", "git_show", "git_diff", "git_status", "git_tags"]]
-        },
-        "shell": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          },
-          "description": "Shell tools: command execution (src/tools/shell/)",
-          "examples": [["run_command", "shell_read"], ["shell_execute", "shell_read"]]
-        },
-        "evaluation": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          },
-          "description": "Evaluation/verdict tools for critic agents: approve or return jobs with feedback (src/tools/evaluation/)",
-          "examples": [["approve_job", "return_job_with_feedback"]]
-        },
-        "knowledge": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          },
-          "description": "Knowledge base tools: project knowledge CRUD + search (src/tools/knowledge/)",
-          "examples": [["kb_write", "kb_update", "kb_read", "kb_list", "kb_search", "kb_related"]]
-        },
-        "communication": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          },
-          "description": "Communication tools: agent-initiated messaging to humans via email (src/tools/communication/)",
-          "examples": [["send_message"]]
-        },
-        "delegation": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          },
-          "description": "Delegation tools: spawn child jobs that branch off the workspace (src/tools/delegation/)",
-          "examples": [["delegate_work"]]
-        },
-        "orchestrator": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          },
-          "description": "Orchestrator tools: create/monitor/manage worker jobs via the orchestrator REST API. Primarily for persistent agents (src/tools/orchestrator/)",
-          "examples": [
-            [
-              "create_worker_job",
-              "list_worker_jobs",
-              "get_worker_job",
-              "approve_worker_job",
-              "resume_worker_job"
-            ]
-          ]
-        },
-        "canvas": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          },
-          "description": "Dynamic Canvas presentation tools for persistent sessions (src/tools/canvas/)",
-          "examples": [
-            [
-              "get_canvas",
-              "set_canvas",
-              "clear_canvas"
-            ]
-          ]
-        },
         "agent_catalog": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          },
-          "description": "Agent catalog tools: manage experts and skills. Primarily for persistent agents (src/tools/orchestrator/catalog.py)",
+          "description": "Agent catalog tools: manage experts and skills. Primarily for persistent agents (src/tools/orchestrator/catalog.py). Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
           "examples": [
             [
               "list_experts",
@@ -412,14 +277,1240 @@
               "search_skills",
               "get_skill"
             ]
+          ],
+          "oneOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "uniqueItems": true
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "only": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                },
+                "except": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                }
+              },
+              "oneOf": [
+                {
+                  "required": [
+                    "only"
+                  ]
+                },
+                {
+                  "required": [
+                    "except"
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        "browser_direct": {
+          "description": "Direct browser-control tools (src/tools/research/browser_direct.py). Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
+          "oneOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "uniqueItems": true
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "only": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                },
+                "except": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                }
+              },
+              "oneOf": [
+                {
+                  "required": [
+                    "only"
+                  ]
+                },
+                {
+                  "required": [
+                    "except"
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        "canvas": {
+          "description": "Dynamic Canvas presentation tools for persistent sessions (src/tools/canvas/). Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
+          "examples": [
+            [
+              "get_canvas",
+              "set_canvas",
+              "clear_canvas"
+            ]
+          ],
+          "oneOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "uniqueItems": true
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "only": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                },
+                "except": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                }
+              },
+              "oneOf": [
+                {
+                  "required": [
+                    "only"
+                  ]
+                },
+                {
+                  "required": [
+                    "except"
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        "citation": {
+          "description": "Citation management tools (src/tools/citation/). Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
+          "examples": [
+            [
+              "cite_document",
+              "cite_web",
+              "list_sources"
+            ]
+          ],
+          "oneOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "uniqueItems": true
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "only": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                },
+                "except": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                }
+              },
+              "oneOf": [
+                {
+                  "required": [
+                    "only"
+                  ]
+                },
+                {
+                  "required": [
+                    "except"
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        "communication": {
+          "description": "Communication tools: agent-initiated messaging to humans via email (src/tools/communication/). Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
+          "examples": [
+            [
+              "send_message"
+            ]
+          ],
+          "oneOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "uniqueItems": true
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "only": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                },
+                "except": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                }
+              },
+              "oneOf": [
+                {
+                  "required": [
+                    "only"
+                  ]
+                },
+                {
+                  "required": [
+                    "except"
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        "core": {
+          "description": "Core tools: todo management + job completion (src/tools/core/). Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
+          "examples": [
+            [
+              "next_phase_todos",
+              "todo_complete",
+              "mark_complete",
+              "job_complete"
+            ]
+          ],
+          "oneOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "uniqueItems": true
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "only": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                },
+                "except": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                }
+              },
+              "oneOf": [
+                {
+                  "required": [
+                    "only"
+                  ]
+                },
+                {
+                  "required": [
+                    "except"
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        "delegation": {
+          "description": "Delegation tools: spawn child jobs that branch off the workspace (src/tools/delegation/). Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
+          "examples": [
+            [
+              "delegate_work"
+            ]
+          ],
+          "oneOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "uniqueItems": true
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "only": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                },
+                "except": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                }
+              },
+              "oneOf": [
+                {
+                  "required": [
+                    "only"
+                  ]
+                },
+                {
+                  "required": [
+                    "except"
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        "email": {
+          "description": "email tools. Machine-owned: every tool here is code-granted (an email datasource is attached (tier from its config.access)), so `true` resolves to [] and the key is better deleted than declared. Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
+          "oneOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "uniqueItems": true
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "only": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                },
+                "except": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                }
+              },
+              "oneOf": [
+                {
+                  "required": [
+                    "only"
+                  ]
+                },
+                {
+                  "required": [
+                    "except"
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        "evaluation": {
+          "description": "Evaluation/verdict tools for critic agents: approve or return jobs with feedback (src/tools/evaluation/). Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
+          "examples": [
+            [
+              "approve_job",
+              "return_job_with_feedback"
+            ]
+          ],
+          "oneOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "uniqueItems": true
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "only": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                },
+                "except": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                }
+              },
+              "oneOf": [
+                {
+                  "required": [
+                    "only"
+                  ]
+                },
+                {
+                  "required": [
+                    "except"
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        "git": {
+          "description": "Git version control tools for workspace history (src/tools/git/). Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
+          "examples": [
+            [
+              "git_log",
+              "git_show",
+              "git_diff",
+              "git_status",
+              "git_tags"
+            ]
+          ],
+          "oneOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "uniqueItems": true
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "only": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                },
+                "except": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                }
+              },
+              "oneOf": [
+                {
+                  "required": [
+                    "only"
+                  ]
+                },
+                {
+                  "required": [
+                    "except"
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        "graph": {
+          "description": "Neo4j graph tools (src/tools/graph/). Injected automatically when a Neo4j datasource is attached to the job. Usually left empty in config. Machine-owned: every tool here is code-granted (a neo4j datasource is attached), so `true` resolves to [] and the key is better deleted than declared. Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
+          "examples": [
+            [
+              "cypher_query",
+              "cypher_execute",
+              "get_database_schema"
+            ]
+          ],
+          "oneOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "uniqueItems": true
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "only": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                },
+                "except": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                }
+              },
+              "oneOf": [
+                {
+                  "required": [
+                    "only"
+                  ]
+                },
+                {
+                  "required": [
+                    "except"
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        "knowledge": {
+          "description": "Knowledge base tools: project knowledge CRUD + search (src/tools/knowledge/). Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
+          "examples": [
+            [
+              "kb_write",
+              "kb_update",
+              "kb_read",
+              "kb_list",
+              "kb_search",
+              "kb_related"
+            ]
+          ],
+          "oneOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "uniqueItems": true
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "only": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                },
+                "except": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                }
+              },
+              "oneOf": [
+                {
+                  "required": [
+                    "only"
+                  ]
+                },
+                {
+                  "required": [
+                    "except"
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        "loop": {
+          "description": "Loop campaign tools (src/tools/loop/); injected per job via config_override for a planner loop's checkpoint critic, never listed in bundled configs. Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
+          "oneOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "uniqueItems": true
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "only": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                },
+                "except": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                }
+              },
+              "oneOf": [
+                {
+                  "required": [
+                    "only"
+                  ]
+                },
+                {
+                  "required": [
+                    "except"
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        "mcp": {
+          "description": "MCP datasource tools, discovered at runtime; no static registry membership, so `true` resolves to the '*' sentinel expanded after MCP discovery. Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
+          "oneOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "uniqueItems": true
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "only": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                },
+                "except": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                }
+              },
+              "oneOf": [
+                {
+                  "required": [
+                    "only"
+                  ]
+                },
+                {
+                  "required": [
+                    "except"
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        "mongodb": {
+          "description": "MongoDB query tools (src/tools/mongodb/). Injected automatically when a MongoDB datasource is attached to the job. Machine-owned: every tool here is code-granted (a mongodb datasource is attached), so `true` resolves to [] and the key is better deleted than declared. Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
+          "examples": [
+            [
+              "mongo_query",
+              "mongo_aggregate",
+              "mongo_schema",
+              "mongo_insert",
+              "mongo_update"
+            ]
+          ],
+          "oneOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "uniqueItems": true
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "only": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                },
+                "except": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                }
+              },
+              "oneOf": [
+                {
+                  "required": [
+                    "only"
+                  ]
+                },
+                {
+                  "required": [
+                    "except"
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        "orchestrator": {
+          "description": "Orchestrator tools: create/monitor/manage worker jobs via the orchestrator REST API. Primarily for persistent agents (src/tools/orchestrator/). Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
+          "examples": [
+            [
+              "create_worker_job",
+              "list_worker_jobs",
+              "get_worker_job",
+              "approve_worker_job",
+              "resume_worker_job"
+            ]
+          ],
+          "oneOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "uniqueItems": true
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "only": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                },
+                "except": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                }
+              },
+              "oneOf": [
+                {
+                  "required": [
+                    "only"
+                  ]
+                },
+                {
+                  "required": [
+                    "except"
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        "product_help": {
+          "description": "Product-guide reader tools (src/tools/product_help.py, src/tools/product_capabilities.py). Machine-owned: every tool here is code-granted (persistent-session floor; see each tool's own gate), so `true` resolves to [] and the key is better deleted than declared. Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
+          "oneOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "uniqueItems": true
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "only": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                },
+                "except": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                }
+              },
+              "oneOf": [
+                {
+                  "required": [
+                    "only"
+                  ]
+                },
+                {
+                  "required": [
+                    "except"
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        "repo": {
+          "description": "Repository-datasource write tools (src/tools/repo/); distinct from `git`, which is the workspace's own version control. Machine-owned: every tool here is code-granted (a repository datasource is attached), so `true` resolves to [] and the key is better deleted than declared. Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
+          "oneOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "uniqueItems": true
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "only": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                },
+                "except": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                }
+              },
+              "oneOf": [
+                {
+                  "required": [
+                    "only"
+                  ]
+                },
+                {
+                  "required": [
+                    "except"
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        "research": {
+          "description": "Research/web search tools (src/tools/research/). Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
+          "examples": [
+            [
+              "web_search"
+            ]
+          ],
+          "oneOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "uniqueItems": true
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "only": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                },
+                "except": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                }
+              },
+              "oneOf": [
+                {
+                  "required": [
+                    "only"
+                  ]
+                },
+                {
+                  "required": [
+                    "except"
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        "session_task": {
+          "description": "Lightweight session todo tools (src/tools/core/session_task_tools.py). Machine-owned: every tool here is code-granted (persistent session, unconditional (src/api/persistent_session.py:1415)), so `true` resolves to [] and the key is better deleted than declared. Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
+          "oneOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "uniqueItems": true
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "only": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                },
+                "except": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                }
+              },
+              "oneOf": [
+                {
+                  "required": [
+                    "only"
+                  ]
+                },
+                {
+                  "required": [
+                    "except"
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        "shell": {
+          "description": "Shell tools: command execution (src/tools/shell/). Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
+          "examples": [
+            [
+              "run_command",
+              "shell_read"
+            ],
+            [
+              "shell_execute",
+              "shell_read"
+            ]
+          ],
+          "oneOf": [
+            {
+              "type": "boolean",
+              "const": false,
+              "description": "Only `false` is accepted here. `true` would name both halves of the run_command/shell_execute mode-alias pair that get_all_tool_names rewrites from extra.shell.mode; write {except: [...]} or an explicit list instead."
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "uniqueItems": true
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "only": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                },
+                "except": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                }
+              },
+              "oneOf": [
+                {
+                  "required": [
+                    "only"
+                  ]
+                },
+                {
+                  "required": [
+                    "except"
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        "sql": {
+          "description": "PostgreSQL query tools (src/tools/sql/). Injected automatically when a PostgreSQL datasource is attached to the job. Machine-owned: every tool here is code-granted (a postgresql datasource is attached), so `true` resolves to [] and the key is better deleted than declared. Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
+          "examples": [
+            [
+              "sql_query",
+              "sql_schema",
+              "sql_execute"
+            ]
+          ],
+          "oneOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "uniqueItems": true
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "only": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                },
+                "except": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                }
+              },
+              "oneOf": [
+                {
+                  "required": [
+                    "only"
+                  ]
+                },
+                {
+                  "required": [
+                    "except"
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        "webdav": {
+          "description": "WebDAV / cloud-storage tools (src/tools/webdav/). Machine-owned: every tool here is code-granted (a webdav datasource is attached), so `true` resolves to [] and the key is better deleted than declared. Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
+          "oneOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "uniqueItems": true
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "only": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                },
+                "except": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                }
+              },
+              "oneOf": [
+                {
+                  "required": [
+                    "only"
+                  ]
+                },
+                {
+                  "required": [
+                    "except"
+                  ]
+                }
+              ]
+            }
           ]
         },
         "workflows": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          },
-          "description": "Workflow tools: inspect automations and project loops, and draft disabled automations. Primarily for persistent agents (src/tools/orchestrator/workflows.py)",
+          "description": "Workflow tools: inspect automations and project loops, and draft disabled automations. Primarily for persistent agents (src/tools/orchestrator/workflows.py). Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
           "examples": [
             [
               "list_automations",
@@ -430,9 +1521,113 @@
               "list_project_loop_jobs",
               "explain_project_loop"
             ]
+          ],
+          "oneOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "uniqueItems": true
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "only": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                },
+                "except": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                }
+              },
+              "oneOf": [
+                {
+                  "required": [
+                    "only"
+                  ]
+                },
+                {
+                  "required": [
+                    "except"
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        "workspace": {
+          "description": "Workspace file operation tools (src/tools/workspace/). Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
+          "examples": [
+            [
+              "read_file",
+              "write_file",
+              "list_files",
+              "edit_file"
+            ]
+          ],
+          "oneOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "uniqueItems": true
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "only": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                },
+                "except": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                }
+              },
+              "oneOf": [
+                {
+                  "required": [
+                    "only"
+                  ]
+                },
+                {
+                  "required": [
+                    "except"
+                  ]
+                }
+              ]
+            }
           ]
         }
-      }
+      },
+      "additionalProperties": false
     },
     "instruction_files": {
       "type": "array",

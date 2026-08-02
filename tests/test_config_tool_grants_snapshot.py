@@ -156,10 +156,13 @@ def test_snapshot_covers_every_shipped_config(snapshot):
 def test_declared_tool_categories_are_read_by_the_loader(config_name):
     """A ``tools.*`` key the loader does not read is silently discarded.
 
-    ``ToolsConfig`` has 23 fields; the registry has 24 categories.
-    ``product_help`` and ``session_task`` have no field, so declaring either in
-    YAML grants nothing and says nothing. This asserts no shipped config relies
-    on a key that goes nowhere.
+    ``ToolsConfig`` now has one field per registry category plus ``mcp``, so the
+    only keys that go nowhere are typos (``tools.workspaces``). Until
+    2026-08-02 it had 23 fields against the registry's 24 categories, and
+    ``tools.product_help:`` / ``tools.session_task:`` parsed and did nothing;
+    those fields now exist and the three vocabularies are pinned to agree by
+    ``tests/test_tool_policy.py::TestCategoryVocabularyAgreement``. This
+    assertion is unchanged and still the tripwire for a key that goes nowhere.
     """
     path, _ = resolve_config_path(config_name)
     declared = (load_and_merge_config(path) or {}).get("tools") or {}
