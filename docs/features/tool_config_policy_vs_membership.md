@@ -856,12 +856,25 @@ is what the author would want:
 > it as a review-specific posture — it may itself be a copied snapshot. Flag it for
 > a human decision rather than encoding it as intent.
 
-**Never let `shell` auto-track the registry.** `shell` must always enumerate
-explicitly — `only`, or `except` with a non-empty exclusion. `true` is refused
-by the normaliser, and so is `{except: []}`, which would otherwise spell `true`
-by another route.
+**`shell` accepts `only` and `false`. Nothing else.** `true`, `{except: [...]}`
+and `{except: []}` are all refused by the normaliser and by `config/schema.json`.
 
-> **Rationale corrected 2026-08-02, twice.** The original reason given here was
+The rule is about auto-tracking, and only `only` avoids it. `true` means "this
+category and whatever is added to it later"; `except` means exactly the same
+thing minus a fixed subtraction, recomputed from the registry on every
+resolution. For a code-execution category both are wrong: a tool added to
+`shell` in the registry would land in every config that used either form, with
+no diff to review anywhere. `only` forces a titled commit.
+
+> **Rationale corrected 2026-08-02, three times — the last one is the rule
+> above.** The first two attempts both permitted `except`, which does not
+> survive the argument they were making: `{except: [srw_cloud_status]}` expands
+> to the same four names `true` would, recomputed every resolution, so it
+> auto-tracks identically. A rule that forbids `true` while blessing `except`
+> is spelling-based, not semantic. `only` is the only form that does not
+> auto-track, so `only` is the rule.
+>
+> The earlier reasoning, kept so it is not re-derived: the original reason was
 > the `run_command` / `shell_execute` mode-alias pair, which
 > `get_all_tool_names` (`src/core/loader.py:4507-4510`) rewrites based on
 > `extra.shell.mode`. That reason does not survive contact: `bughunter` already
