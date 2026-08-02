@@ -64,6 +64,11 @@ WORKFLOW_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "category": "workflows",
         "short_description": "Get editable automation JSON.",
         "phases": ["strategic", "tactical"],
+        "grant": "explicit",
+        "gate": (
+            "named outright in a tools.workflows list; automation authoring, "
+            "absent from SESSION_TOOL_OVERRIDE_NAMES"
+        ),
     },
     "set_automation_bundle": {
         "module": "orchestrator.workflows",
@@ -76,6 +81,12 @@ WORKFLOW_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "category": "workflows",
         "short_description": "Create or update an automation from JSON.",
         "phases": ["strategic", "tactical"],
+        "grant": "explicit",
+        "gate": (
+            "named outright in a tools.workflows list; a control-plane WRITE "
+            "that creates or updates an automation, so a user ticking "
+            "'Automations & Loops' must never acquire it"
+        ),
     },
     "get_project_loop": {
         "module": "orchestrator.workflows",

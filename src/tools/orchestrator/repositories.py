@@ -45,6 +45,12 @@ REPOSITORY_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "category": "orchestrator",
         "short_description": "Clone a project repository into the session workspace.",
         "phases": ["strategic", "tactical"],
+        # No config lists this; persistent_session.py:1540 appends it. It is
+        # also one of the three `orchestrator` entries absent from
+        # SESSION_TOOL_OVERRIDE_NAMES, so the code grant is what keeps a
+        # category-level `orchestrator: true` from widening onto it.
+        "grant": "code",
+        "gate": "fleet management enabled AND backend.supports_shell",
     },
 }
 

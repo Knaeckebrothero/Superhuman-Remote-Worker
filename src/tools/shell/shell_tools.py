@@ -252,6 +252,12 @@ SHELL_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "category": "shell",
         "short_description": "Show cloud mount/cache status.",
         "phases": ["strategic", "tactical"],
+        # No config lists this; persistent_session.py:1526 appends it. Keeping
+        # it out of a category-level `shell: true` also stops an operator who
+        # wanted "shell commands on" from silently acquiring a cloud-mount
+        # reporter that happens to share the category.
+        "grant": "code",
+        "gate": "cloud_mount_manager.active",
     },
 }
 
