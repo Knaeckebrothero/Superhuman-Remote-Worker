@@ -40,6 +40,7 @@ from src.core.loader import (
 )
 from src.core.session_tool_overrides import SESSION_TOOL_OVERRIDE_NAMES
 from src.core.tool_policy import (
+    ENUMERATE_ONLY_CATEGORIES,
     MCP_WILDCARD,
     ToolPolicyError,
     assert_tool_policy_canonical,
@@ -247,7 +248,7 @@ class TestOnlyIsNeverIntersected:
         still nameable.  Nothing that works today stops working."""
         assert TOOL_REGISTRY["srw_cloud_status"].get("grant") == "code"
         assert "srw_cloud_status" not in expand_tool_policy(
-            {"except": ["run_command"]}, "shell"
+            {"except": ["cypher_query"]}, "graph"
         )
         assert expand_tool_policy({"only": ["srw_cloud_status"]}, "shell") == [
             "srw_cloud_status"
@@ -264,41 +265,98 @@ class TestOnlyIsNeverIntersected:
 # ===========================================================================
 # The two hazards Task 4 handed over
 # ===========================================================================
-class TestShellNeverExpandsViaTrue:
-    """``run_command`` and ``shell_execute`` are a mode-alias pair.
+class TestShellMustEnumerate:
+    """``shell`` accepts ``only`` and ``false``. Nothing else.
 
-    ``get_all_tool_names`` rewrites one into the other from
-    ``extra.shell.mode``; a ``true`` expansion names *both* halves, so the
-    resolved list carries the same effective tool twice.  The mode is not
-    layer-local (a layer may not declare it while the merged config does), so
-    a mode-aware expansion is not available either.  ``true`` is refused; an
-    author who has actually looked at the category can still write ``except``
-    or an explicit list.
+    The rule is about **auto-tracking**, and only ``only`` avoids it. ``true``
+    means "this category and whatever is added to it later"; ``{except: [...]}``
+    means exactly the same thing minus a fixed subtraction, recomputed from the
+    registry on every resolution. For a code-execution category both are the
+    wrong default: a tool added to ``shell`` in the registry would land in
+    every config that used either form, with no diff to review anywhere.
+
+    A rule that forbade ``true`` while blessing ``except`` would be
+    spelling-based, not semantic — the two expand to the identical four names
+    today, which is what ``test_true_and_except_are_the_same_thing`` pins.
+
+    Not to be confused with the mode-alias argument: ``run_command`` /
+    ``shell_execute`` being rewritten from ``extra.shell.mode`` makes naming
+    both halves redundant, not dangerous, and ``bughunter`` already names both.
     """
 
     def test_shell_true_is_refused(self):
         with pytest.raises(ToolPolicyError) as exc:
             expand_tool_policy(True, "shell")
         msg = str(exc.value)
-        assert "shell" in msg and "run_command" in msg
+        assert "shell" in msg and "auto-track" in msg and "only" in msg
 
-    def test_the_alias_pair_is_why(self):
-        members = set(get_tools_by_category("shell"))
-        assert {"run_command", "shell_execute"} <= members
+    @pytest.mark.parametrize(
+        "value", [{"except": ["srw_cloud_status"]}, {"except": ["run_command"]}]
+    )
+    def test_shell_except_is_refused(self, value):
+        with pytest.raises(ToolPolicyError) as exc:
+            expand_tool_policy(value, "shell")
+        assert "auto-track" in str(exc.value)
 
-    def test_shell_false_and_lists_still_work(self):
-        assert expand_tool_policy(False, "shell") == []
-        assert expand_tool_policy(["run_command"], "shell") == ["run_command"]
-
-    def test_empty_except_is_refused_so_it_cannot_spell_true(self):
-        with pytest.raises(ToolPolicyError):
+    def test_shell_empty_except_is_refused_with_the_shell_rule(self):
+        """``{except: []}`` must not fall through to the generic "write true"
+        message, because ``true`` is refused here too."""
+        with pytest.raises(ToolPolicyError) as exc:
             expand_tool_policy({"except": []}, "shell")
+        assert "auto-track" in str(exc.value)
 
-    def test_a_named_except_is_permitted(self):
-        """The design doc's Step C migrates bughunter's shell to this form."""
-        got = expand_tool_policy({"except": ["srw_cloud_status"]}, "shell")
-        assert "srw_cloud_status" not in got
-        assert "run_command" in got
+    def test_true_and_except_are_the_same_thing(self):
+        """Why blessing ``except`` while refusing ``true`` made no sense: on
+        every other category the two forms differ only by the subtraction, and
+        both are recomputed from the live registry."""
+        full = sorted(
+            n
+            for n, meta in TOOL_REGISTRY.items()
+            if meta.get("category") == "shell" and "grant" not in meta
+        )
+        assert expand_tool_policy({"except": ["git_log"]}, "git") == sorted(
+            set(expand_category_true("git")) - {"git_log"}
+        )
+        assert full == ["cancel_command", "run_command", "shell_execute", "shell_read"]
+
+    def test_the_accepted_forms_still_work(self):
+        assert expand_tool_policy(False, "shell") == []
+        assert expand_tool_policy([], "shell") == []
+        assert expand_tool_policy(["run_command"], "shell") == ["run_command"]
+        assert expand_tool_policy({"only": ["run_command", "shell_read"]}, "shell") == [
+            "run_command",
+            "shell_read",
+        ]
+
+    def test_every_shipped_shell_declaration_is_still_accepted(self):
+        """Eleven configs declare ``tools.shell``; all are bare lists or ``[]``,
+        the legacy spellings of ``only`` and ``false``. None is affected."""
+        decls = [(rel, v) for rel, cat, v in _DECLARATIONS if cat == "shell"]
+        assert len(decls) == 11, decls
+        for rel, value in decls:
+            assert (
+                normalize_tool_policy({"tools": {"shell": value}})["tools"]["shell"]
+                == value
+            ), rel
+
+    def test_the_rule_is_scoped_to_shell(self):
+        assert ENUMERATE_ONLY_CATEGORIES == {"shell"}
+        assert expand_category_true("git")
+        assert expand_tool_policy({"except": ["git_log"]}, "git")
+
+    def test_the_legacy_coding_alias_obeys_the_shell_rule(self):
+        for value in (True, {"except": ["srw_cloud_status"]}):
+            with pytest.raises(ToolPolicyError):
+                normalize_tool_policy({"tools": {"coding": value}})
+
+    def test_schema_json_refuses_true_and_except_on_shell(self):
+        schema = json.loads((_REPO_ROOT / "config" / "schema.json").read_text())
+        block = schema["properties"]["tools"]["properties"]["shell"]
+        boolean, array, mapping = block["oneOf"]
+        assert boolean["const"] is False, "shell must not accept `true`"
+        assert array["type"] == "array", "bare lists stay legal"
+        assert set(mapping["properties"]) == {"only"}, "shell must not accept `except`"
+        assert mapping["required"] == ["only"]
 
 
 class TestMcp:

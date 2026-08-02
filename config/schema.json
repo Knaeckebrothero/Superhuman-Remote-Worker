@@ -1344,7 +1344,7 @@
           ]
         },
         "shell": {
-          "description": "Shell tools: command execution (src/tools/shell/). Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
+          "description": "Shell tools: command execution (src/tools/shell/). shell must enumerate its tools: only `{only: [...]}` (or a bare list, the same thing) and `false` (or []) are accepted. `true` and `except` both auto-track the registry, so a tool added to the shell category later would land here with no diff to review; for a code-execution category that is the wrong default.",
           "examples": [
             [
               "run_command",
@@ -1359,7 +1359,7 @@
             {
               "type": "boolean",
               "const": false,
-              "description": "Only `false` is accepted here. `true` would name both halves of the run_command/shell_execute mode-alias pair that get_all_tool_names rewrites from extra.shell.mode; write {except: [...]} or an explicit list instead."
+              "description": "Only `false` is accepted here. shell must enumerate its tools: only `{only: [...]}` (or a bare list, the same thing) and `false` (or []) are accepted. `true` and `except` both auto-track the registry, so a tool added to the shell category later would land here with no diff to review; for a code-execution category that is the wrong default."
             },
             {
               "type": "array",
@@ -1379,28 +1379,12 @@
                   },
                   "uniqueItems": true,
                   "minItems": 1
-                },
-                "except": {
-                  "type": "array",
-                  "items": {
-                    "type": "string"
-                  },
-                  "uniqueItems": true,
-                  "minItems": 1
                 }
               },
-              "oneOf": [
-                {
-                  "required": [
-                    "only"
-                  ]
-                },
-                {
-                  "required": [
-                    "except"
-                  ]
-                }
-              ]
+              "required": [
+                "only"
+              ],
+              "description": "Only `{only: [...]}` is accepted here. shell must enumerate its tools: only `{only: [...]}` (or a bare list, the same thing) and `false` (or []) are accepted. `true` and `except` both auto-track the registry, so a tool added to the shell category later would land here with no diff to review; for a code-execution category that is the wrong default."
             }
           ]
         },
