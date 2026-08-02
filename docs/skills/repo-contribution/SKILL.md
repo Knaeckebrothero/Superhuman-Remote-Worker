@@ -39,6 +39,8 @@ means the guardrail is working. Cut a branch.
 and **preserves case**, so it may not match the lowercase name you expect. Every
 git command in this skill runs with `-C repos/<name>` or from inside that
 directory. If you edit files anywhere else, they are not part of your change.
+That same `<name>` is the `repo` argument every `repo_*` tool below expects —
+copy it exactly, case included.
 
 **2. Set a commit identity.** The default identity is a generic placeholder. Set
 something honest that identifies the agent:
@@ -63,6 +65,9 @@ git -C repos/<name> checkout -b job/<short_id> origin/<base-branch>
 
 Branch first, before you edit anything. Cutting the branch after you've made
 changes works, but it's how you end up accidentally committing to the base.
+There's no tool for this step — branching stays a shell command; the `repo_*`
+tools you'll meet later cover commit, push, pull, and opening the PR, not
+checking out.
 
 **4. Read the task fully before editing.** If it references an issue or design
 document in the repo, read that document — it usually contains constraints, prior
@@ -88,26 +93,58 @@ checks you ran, which you could not, and why. An unverified change that is label
 unverified is useful; an unverified change that reads as tested is a trap you set
 for your reviewer. If CI will run the real gate, say that too.
 
-**7. Commit and push your branch.**
+**7. Commit and push your branch.** From here on, use the `repo_*` tools instead
+of raw git for anything that touches the remote. The three write tools —
+`repo_commit`, `repo_push`, `repo_open_pr` — all refuse outright if the datasource
+is attached read-only, or if its forge metadata is missing entirely; both fail
+closed instead of guessing (`repo_pull` is exempt from both checks and always
+works). None of that should apply to a repo you were told to contribute to, but if
+a call comes back with that refusal, believe it — don't route around it with the
+shell.
 
-```bash
-git -C repos/<name> add -A
-git -C repos/<name> commit -m "<type>(<scope>): <what and why>"
-git -C repos/<name> push -u origin job/<short_id>
+```
+repo_commit(repo="<name>", message="<type>(<scope>): <what and why>")
+repo_push(repo="<name>")
 ```
 
-If the push is rejected because the branch is protected, you targeted the wrong
-branch — re-read step 3. If it's rejected for credentials, stop and report it;
-don't try alternate remotes or rewrite the remote URL.
+`repo_push` defaults to whatever branch is currently checked out, so it pushes
+`job/<short_id>` without you naming it again. `repo_commit` stages every change in
+the clone before committing; if there's nothing to commit it tells you rather than
+manufacturing an empty commit — treat that as a cue to check `git status`, not a
+bug.
+
+If `repo_push` reports a rejection, you almost certainly targeted a protected
+branch — re-read step 3. If it reports a credentials problem, stop and report it;
+don't reach for the shell to try alternate remotes or force the push through.
 
 **8. Write `output/pr.md` — the reviewer's entry point.** Use the scaffold below.
 This is what the human will paste as the pull-request description, so write it for
-them, not as a log of your session.
+them, not as a log of your session. It also becomes the `body` you hand to
+`repo_open_pr` next, so leave it as that finished artifact rather than draft notes.
 
-**9. Stop.** Do not merge, do not push to the base branch, and do not mark the work
-complete yourself. The job freezes for human review by design — that gate is the
-whole point of the workflow. If you're resumed with feedback, push more commits to
-the *same* branch; the pull request updates in place.
+**9. Open the pull request.**
+
+```
+repo_open_pr(
+    repo="<name>",
+    title="<type>(<scope>): <one-line summary>",
+    base="<base branch from step 3>",
+    body=<contents of output/pr.md>,
+)
+```
+
+Call this only after `repo_push` has succeeded — the forge rejects a pull request
+whose head branch doesn't exist on the remote yet, and getting that order backwards
+is the most common way this step fails. `head` defaults to the branch you're
+already on, so name it only if you're opening the PR from somewhere else. If the
+call fails after a successful push, nothing is lost: `output/pr.md` is still on
+disk, so you or the human reviewer can open the PR by hand with that file as the
+description.
+
+**10. Stop.** Do not merge, do not push to the base branch, and do not mark the
+work complete yourself. The job freezes for human review by design — that gate is
+the whole point of the workflow. If you're resumed with feedback, push more
+commits to the *same* branch; the pull request updates in place.
 
 ## `output/pr.md` scaffold
 
@@ -143,5 +180,5 @@ this is the part the reviewer cannot reconstruct on their own.>
 - **Imply you tested what you didn't run** — name the checks you skipped and why; a labeled unverified change is honest, an unlabeled one is a trap.
 - **Bundle unrelated changes** — a drive-by refactor inside a bugfix gets the whole PR bounced.
 - **Write the PR description as a session log** — the reviewer needs the *why* and the risks, not your narration.
-- **Commit secrets, credentials, or workspace scratch files** — check `git status` before `add -A`, and respect the repo's `.gitignore`.
-- **Force-push or rewrite history on a pushed branch** — the reviewer may already be reading it.
+- **Commit secrets, credentials, or workspace scratch files** — `repo_commit` stages everything in the clone, so run `git status` before calling it, and respect the repo's `.gitignore`.
+- **Reach for the shell to force-push or rewrite history on a pushed branch** — `repo_push` has no force option by design; if it's rejected, push new commits instead of overwriting ones the reviewer may already be reading.
