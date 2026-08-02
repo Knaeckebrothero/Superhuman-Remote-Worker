@@ -2617,6 +2617,7 @@
       "single": "Modell",
       "reasoning": "Reasoning",
       "reasoningDefaultOption": "{{label}} (Standard)",
+      "reasoningResetNotice": "Auf Standard zurückgesetzt — deine Reasoning-Auswahl wurde nicht übernommen.",
       "default": "Standard",
       "defaultResolved": "{{model}} ({{source}})",
       "defaultResolvedNoSource": "Standard · {{model}}",

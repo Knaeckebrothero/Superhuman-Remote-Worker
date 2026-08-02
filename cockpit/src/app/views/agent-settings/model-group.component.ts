@@ -191,7 +191,7 @@ const STORAGE_KEYS = {
               <select
                 class="form-input"
                 [ngModel]="sessionReasoning() ?? resolvedSessionReasoning()"
-              appPinOnInteract (pin)="pinValue(sessionReasoning, resolvedSessionReasoning())"
+              appPinOnInteract (pin)="pinReasoning()"
                 (ngModelChange)="onSessionReasoningChange($event)"
                 [disabled]="disabled()"
               >
@@ -207,6 +207,16 @@ const STORAGE_KEYS = {
                 <button type="button" class="reset-btn" (click)="onSessionReasoningChange(null)" [title]="'agentSettings.common.resetToDefault' | transloco"><app-icon size="xs">close</app-icon></button>
               }
             </div>
+            <!-- task-3: the reset stays (per-family vocabularies don't
+                 translate) but must no longer be silent — the select alone
+                 looks identical to "never touched", and gpt-5.6-sol's default
+                 (High) reads a lot like a forgotten Max at a glance. -->
+            @if (reasoningResetNotice()) {
+              <div class="reasoning-reset-notice">
+                <app-icon size="xs">info</app-icon>
+                <span>{{ 'agentSettings.model.reasoningResetNotice' | transloco }}</span>
+              </div>
+            }
           </div>
         }
       }
@@ -291,6 +301,18 @@ const STORAGE_KEYS = {
       background: var(--danger-tint);
       color: var(--danger);
     }
+    .reasoning-reset-notice {
+      display: flex;
+      align-items: center;
+      gap: 5px;
+      margin-top: 5px;
+      color: var(--text-muted);
+      font-size: 11px;
+      line-height: 1.4;
+    }
+    .reasoning-reset-notice app-icon {
+      flex-shrink: 0;
+    }
     .model-mismatch {
       display: flex;
       gap: 8px;
@@ -361,6 +383,20 @@ export class ModelGroupComponent {
   // llm.reasoning_level; cleared on every model change so a level picked for
   // one model can't silently ride into another family's option set.
   readonly sessionReasoning = signal<string | null>(null);
+
+  // True after a model change or a config prefill has cleared an existing
+  // reasoning pick out from under the user — task-3 fix. The reset itself is
+  // correct and stays (reasoning vocabularies are per-family and don't
+  // translate), but until now it was silent: the select just snapped back to
+  // the family default, indistinguishable from never having picked at all.
+  // The prefill path in particular does not require a deliberate expert
+  // switch — SessionCreateComponent's effective-default-expert resolution can
+  // invoke it well after initial render (an `/experts` or `/expert-defaults`
+  // response landing late, a project selection), so the user may never have
+  // touched Model or the expert grid at all. Cleared by the next deliberate
+  // reasoning interaction (a fresh pick, or re-confirming the shown default
+  // via pinReasoning) or by resetAll.
+  readonly reasoningResetNotice = signal(false);
 
   // Config-derived default (fallback when the server `effective_models` is
   // absent — e.g. older API or the "defaults" virtual expert). The server value
@@ -514,7 +550,9 @@ export class ModelGroupComponent {
   onSessionModelChange(value: string | null): void {
     this.sessionModel.set(value);
     // A reasoning pick is model-specific intent — drop it with the model so a
-    // stale level never leaks into another family's option set.
+    // stale level never leaks into another family's option set. Only raise
+    // the notice if there was actually a pick to lose (task-3 fix).
+    if (this.sessionReasoning() !== null) this.reasoningResetNotice.set(true);
     this.sessionReasoning.set(null);
     this.persistModel('session', value);
     this.change.emit();
@@ -523,8 +561,17 @@ export class ModelGroupComponent {
   onSessionReasoningChange(value: string | null): void {
     // Only the explicit "Default" option clears the override; picking the
     // concrete level that happens to be the default pins it.
+    this.reasoningResetNotice.set(false);
     this.sessionReasoning.set(value);
     this.change.emit();
+  }
+
+  /** Reasoning select's PinOnInteract handler: re-confirming the shown
+   *  (resolved-default) value is also the user acknowledging the field, so it
+   *  dismisses a pending reset notice the same as a fresh pick would. */
+  pinReasoning(): void {
+    this.reasoningResetNotice.set(false);
+    this.pinValue(this.sessionReasoning, this.resolvedSessionReasoning());
   }
 
   onTemperatureChange(value: number): void {
@@ -561,6 +608,7 @@ export class ModelGroupComponent {
     this.subagentModel.set(null);
     this.sessionModel.set(null);
     this.sessionReasoning.set(null);
+    this.reasoningResetNotice.set(false);
     this.temperature.set(null);
   }
 
@@ -585,8 +633,14 @@ export class ModelGroupComponent {
       sub?.['model'] || tact?.['model'] || baseModel ? null : this.loadSavedModel('subagent'),
     );
     this.sessionModel.set(baseModel ? null : this.loadSavedModel('session'));
-    // Reasoning picks don't survive an expert switch — the new expert's config
-    // (and possibly family) makes the old level meaningless.
+    // Reasoning picks don't survive a config prefill — the new expert's
+    // config (and possibly family) makes the old level meaningless. This
+    // fires on more than a deliberate expert switch: SessionCreateComponent
+    // also calls it from applyEffectiveDefault()'s automatic resolution of
+    // the effective default expert, which nothing in this component's own
+    // controls gates — so surface it the same as the model-change clearer
+    // above (task-3 fix), only when there was a pick to lose.
+    if (this.sessionReasoning() !== null) this.reasoningResetNotice.set(true);
     this.sessionReasoning.set(null);
   }
 
