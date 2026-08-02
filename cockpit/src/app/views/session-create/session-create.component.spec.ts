@@ -166,32 +166,50 @@ describe('SessionCreateComponent submit flow', () => {
 
 // Task 3 — root cause of the vanishing Reasoning pick (dev thread
 // 1930dec9-181d-4fd5-a030-90b3d0b363d6). The inference that the user must
-// have changed the model or switched expert didn't hold up: this reproduces
-// the actual trigger. `applyEffectiveDefault()` re-resolves the effective
-// default expert (and, once found, fetches its detail and prefills the form)
-// from THREE places — the plain `/experts` list landing, the `/expert-defaults`
-// lookup landing, and a project selection resolving — every one of them gated
-// only on `expertSelectionTouched`, which nothing in the Model/Reasoning
-// controls ever sets. So the very same `prefillFromConfig` sink the brief
-// already knew about (model-group.component.ts:589) fires on an involuntary,
-// timing-dependent path too, not only on a deliberate expert switch — and it
-// can land after the user has already picked a level in the Settings tab,
-// which is interactive immediately off framework defaults, before any expert
-// resolves. No project or expert interaction is needed to hit it: the plain
-// project-less `/expert-defaults` round every session-create load already
-// issues is sufficient.
-describe('SessionCreateComponent — reasoning pick vs. an in-flight default-expert resolution (Task 3)', () => {
+// have changed the model or switched expert didn't hold up: `prefillFromConfig`
+// — the same sink the original inference already named — is also invoked by
+// `SessionCreateComponent.applyEffectiveDefault()` (`:498`), which re-resolves
+// the effective default expert and, when it differs from what's currently
+// selected (the guard at `:502`, `expert && selectedExpert()?.id !== expert.id`),
+// fetches its detail and prefills the form. That guard is what decides whether
+// ANY post-load re-resolution can do anything at all — and it is gated only on
+// `expertSelectionTouched`, which nothing in the Model/Reasoning controls ever
+// sets, so it stays live for the component's whole lifetime unless the user
+// clicks an expert card.
+//
+// Three call sites feed that guard: `loadExperts()`'s response landing (`:474`),
+// `loadEffectiveDefault()`'s own response landing (`:493` — itself re-issued
+// from `loadExperts()`'s tail call at `:479` AND from `loadProjects()`'s
+// response handler at `:464`, once a default project auto-populates), and
+// `toggleProject()` (`:531`).
+//
+// The first two settle in parallel at `ngOnInit`, typically within a few
+// hundred ms — a near-zero real-world window for a human to have already
+// filled in two dropdowns. The project path has no such bound: the user can
+// take as long as they like, and a project chip is a perfectly ordinary,
+// easily-overlooked thing to click after already configuring Model/Reasoning
+// (it sits above the Settings tab, and re-visiting it is not unusual). Its
+// default expert can differ from whatever auto-selected earlier (`source:
+// 'project'` vs `'user'`/`'application'`), which is exactly what satisfies the
+// `:502` guard on demand, any time, with zero expert-grid interaction. That is
+// the best fit for "I don't recall changing the model or the expert" — the
+// primary test below reproduces that path; the page-load race is kept as a
+// secondary variant, since the mechanism is identical and it's worth having
+// regression coverage for both.
+describe('SessionCreateComponent — reasoning pick lost to an involuntary prefillFromConfig (Task 3)', () => {
   afterEach(() => {
     TestBed.resetTestingModule();
     localStorage.clear();
   });
 
-  it('silently wipes a Reasoning pick when the effective-default-expert lookup resolves after the user has already picked one', () => {
-    // The real ModelGroupComponent — the sink under test — built the same way
-    // model-group.component.spec.ts does, standing in for the ViewChild
-    // SessionCreateComponent talks to through AgentSettingsComponent. This
-    // keeps the assertions honest: they exercise the actual clearing logic,
-    // not a stand-in that only proves the call happened.
+  /** Builds a real `ModelGroupComponent` (the sink under test, constructed the
+   *  same way model-group.component.spec.ts does) plus a `SessionCreateComponent`
+   *  fixture wired so its `agentSettings` ViewChild forwards to that real
+   *  instance — reproducing AgentSettingsComponent.prefillFromConfig's own
+   *  first line (`this.modelGroup?.prefillFromConfig(config)`). Assertions
+   *  made against `modelGroup` exercise the actual production clearing logic,
+   *  not a stand-in that only proves a call happened. */
+  function setupWithRealModelGroup() {
     const modelServiceMock = {
       models: signal([]),
       auxiliaryModels: signal([]),
@@ -235,60 +253,74 @@ describe('SessionCreateComponent — reasoning pick vs. an in-flight default-exp
     const http = TestBed.inject(HttpTestingController);
     fixture.detectChanges(); // runs ngOnInit — issues every request below at once
 
-    // Stand-in for the real `agentSettings` ViewChild. AgentSettingsComponent's
-    // own prefillFromConfig forwards to the model group as its first line
-    // (`this.modelGroup?.prefillFromConfig(config)`) — this fake reproduces
-    // exactly that line so fetchExpertDetail()'s real callback runs against
-    // the real ModelGroupComponent built above.
     fixture.componentInstance.agentSettings = {
       prefillFromConfig: (config: Record<string, unknown>) => modelGroup.prefillFromConfig(config),
     } as any;
 
-    // The account-defaults fetch resolves — the Settings tab is now showing
-    // and interactive off framework defaults. No expert is selected yet.
+    return {fixture, http, modelGroup};
+  }
+
+  it('the primary path: a project-chip click, well after the pick, resolves a different project-scoped default expert', () => {
+    const {fixture, http, modelGroup} = setupWithRealModelGroup();
+
+    // The page loads and settles completely and quietly — expert list,
+    // account defaults, datasources, and the (project-less) effective-default
+    // lookup all resolve, auto-selecting expert-1. Nothing has been picked
+    // yet, so this settling is inert.
     http.expectOne(
       (r) => r.urlWithParams.endsWith('/experts/session_base?type=session&account_defaults=true'),
     ).flush({config: {}});
-    http.expectOne((r) => r.url.endsWith('/datasources/eligible')).flush([]);
+    http.expectOne((r) => r.url.includes('/datasources/eligible')).flush([]);
+    http.expectOne((r) => r.urlWithParams.endsWith('/experts?type=session')).flush([
+      {id: 'expert-1', display_name: 'Coder', description: '', icon: 'code', color: '#fff', tags: []},
+      {id: 'expert-2', display_name: 'Researcher', description: '', icon: 'science', color: '#fff', tags: []},
+    ]);
+    http.expectOne((r) => r.url.includes('/expert-defaults')).flush({
+      personal_defaults_allowed: true,
+      defaults: {
+        worker: {application: null, personal: null, effective: null, source: 'application'},
+        session: {application: {id: 'expert-1'}, personal: null, effective: {id: 'expert-1'}, source: 'application'},
+      },
+    });
+    http.expectOne(
+      (r) => r.urlWithParams.endsWith('/experts/expert-1?account_defaults=true'),
+    ).flush({config: {llm: {}}});
+    expect(fixture.componentInstance.selectedExpert()?.id).toBe('expert-1');
+    expect(modelGroup.reasoningResetNotice()).toBe(false); // quiescent — nothing to lose yet
 
-    // The user acts on the form exactly as reported: picks a model, then
-    // Reasoning: Max. No expert card is ever clicked — toggleExpert() never
-    // runs, so expertSelectionTouched stays false for the rest of the test.
+    // Unbounded time later, the user fills in the Settings tab: a model, then
+    // Reasoning: Max. No pending requests, nothing racing — a plain, settled
+    // page. No expert card is ever clicked.
     modelGroup.onSessionModelChange('gpt-5.6-sol');
     modelGroup.onSessionReasoningChange('max');
     expect(modelGroup.sessionReasoning()).toBe('max');
 
-    // Only now do the two requests that were already in flight before the
-    // user acted — the plain expert list and the effective-default lookup
-    // that every session-create page load issues, with no project or expert
-    // interaction required — resolve.
-    http.expectOne(
-      (r) => r.urlWithParams.endsWith('/experts?type=session'),
-    ).flush([
-      {id: 'expert-1', display_name: 'Coder', description: '', icon: 'code', color: '#fff', tags: []},
-    ]);
-    http.expectOne((r) => r.url.endsWith('/expert-defaults')).flush({
+    // The user clicks a project chip — an ordinary action on this form, and
+    // the only one taken besides the Model/Reasoning picks. toggleExpert()
+    // never runs; expertSelectionTouched stays false throughout.
+    fixture.componentInstance.toggleProject('project-x');
+
+    http.expectOne((r) => r.url.includes('/datasources/eligible')).flush([]);
+    // The project's own effective default expert differs from expert-1 —
+    // exactly what the `:502` guard checks for, and exactly what a per-project
+    // override (`source: 'project'`) ordinarily produces.
+    http.expectOne((r) => r.url.includes('/expert-defaults')).flush({
       personal_defaults_allowed: true,
       defaults: {
         worker: {application: null, personal: null, effective: null, source: 'application'},
-        session: {
-          application: {id: 'expert-1'},
-          personal: null,
-          effective: {id: 'expert-1'},
-          source: 'application',
-        },
+        session: {application: {id: 'expert-1'}, personal: null, effective: {id: 'expert-2'}, source: 'project'},
       },
     });
-
-    // That lookup just auto-selected expert-1 and fetched its detail — a
-    // request the user never asked for.
+    // That resolution just auto-selected expert-2 and fetched its detail — a
+    // request the user never asked for and a control (the expert grid) they
+    // never touched.
     http.expectOne(
-      (r) => r.urlWithParams.endsWith('/experts/expert-1?account_defaults=true'),
+      (r) => r.urlWithParams.endsWith('/experts/expert-2?account_defaults=true'),
     ).flush({config: {llm: {}}});
 
-    // The user never touched the model or reasoning selects again and never
-    // clicked an expert card — yet the reasoning pick is gone, and there is
-    // no trace that it ever reset (the bug as reported).
+    // The reasoning pick is gone, with no trace it ever reset — the bug as
+    // reported — reached via a click on a project chip, minutes after the
+    // pick, with no model change and no expert-card click at all.
     expect(modelGroup.sessionReasoning()).toBeNull();
     // The fix (task 3): the reset itself is correct and stays — reasoning
     // vocabularies don't translate across families — but it must no longer
@@ -299,6 +331,54 @@ describe('SessionCreateComponent — reasoning pick vs. an in-flight default-exp
     // onSessionModelChange had just written, so it silently re-lands on the
     // identical value — indistinguishable from "my pick stuck." This is why
     // the user only noticed the Reasoning field, not the Model field.
+    expect(modelGroup.sessionModel()).toBe('gpt-5.6-sol');
+
+    http.verify();
+  });
+
+  it('a secondary, narrow-window variant: the plain page-load default-expert resolution lands after an unusually fast pick', () => {
+    // Kept for completeness — the mechanism (an involuntary prefillFromConfig)
+    // is identical to the primary test above, but this variant's real-world
+    // window is only as wide as the page's initial parallel requests take to
+    // settle (typically well under a second), which is implausible for a
+    // human to beat with two dropdown picks. The project-chip path above is
+    // the better fit for the reported incident.
+    const {fixture, http, modelGroup} = setupWithRealModelGroup();
+
+    http.expectOne(
+      (r) => r.urlWithParams.endsWith('/experts/session_base?type=session&account_defaults=true'),
+    ).flush({config: {}});
+    http.expectOne((r) => r.url.includes('/datasources/eligible')).flush([]);
+
+    // The user acts before the plain expert-list/effective-default round
+    // (already in flight since ngOnInit) has settled. No expert card is ever
+    // clicked — expertSelectionTouched stays false for the rest of the test.
+    modelGroup.onSessionModelChange('gpt-5.6-sol');
+    modelGroup.onSessionReasoningChange('max');
+    expect(modelGroup.sessionReasoning()).toBe('max');
+
+    // Only now do the two requests that were already in flight before the
+    // user acted — the plain expert list and the effective-default lookup
+    // every session-create load issues, with no project or expert
+    // interaction required — resolve.
+    http.expectOne(
+      (r) => r.urlWithParams.endsWith('/experts?type=session'),
+    ).flush([
+      {id: 'expert-1', display_name: 'Coder', description: '', icon: 'code', color: '#fff', tags: []},
+    ]);
+    http.expectOne((r) => r.url.includes('/expert-defaults')).flush({
+      personal_defaults_allowed: true,
+      defaults: {
+        worker: {application: null, personal: null, effective: null, source: 'application'},
+        session: {application: {id: 'expert-1'}, personal: null, effective: {id: 'expert-1'}, source: 'application'},
+      },
+    });
+    http.expectOne(
+      (r) => r.urlWithParams.endsWith('/experts/expert-1?account_defaults=true'),
+    ).flush({config: {llm: {}}});
+
+    expect(modelGroup.sessionReasoning()).toBeNull();
+    expect(modelGroup.reasoningResetNotice()).toBe(true);
     expect(modelGroup.sessionModel()).toBe('gpt-5.6-sol');
 
     http.verify();
