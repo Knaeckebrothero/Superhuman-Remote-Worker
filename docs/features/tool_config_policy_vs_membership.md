@@ -714,7 +714,7 @@ fail-loud 422 at dispatch, not a silent drop.
 
 ### Two open items, recorded but not fixed here
 
-**The job-create path has no allowlist at all.** `validate_session_tool_overrides`
+**The job-create path has no allowlist at all.** ~~`validate_session_tool_overrides`
 is called from exactly three places — `orchestrator/main.py:21473` (live
 `config.update`), `:22569` (`POST /persistent/threads`), and
 `src/api/persistent_app.py:1367` (runtime sanitiser). None is the job path. Job
@@ -723,8 +723,20 @@ creation strips only `_PUBLIC_JOB_CONFIG_RESERVED_KEYS`
 arbitrary `config_override.tools.<anything>: [<any registered name>]`. That is
 literally the scenario `session_tool_overrides.py:1-13` was written to prevent,
 open on the other surface, with only the dispatch PDP behind it. **Out of scope
-here** — but the generic validator above makes the fix a one-line reuse instead of
+here**~~ — but the generic validator above makes the fix a one-line reuse instead of
 transcribing 24 name sets, so file it and land it after commit 5.
+
+> **CLOSED 2026-08-03**, together with commit 5 — the two are one change, because
+> the reason the job path had no allowlist was that writing a fourth copy of a
+> hand-curated list was unthinkable. `POST /api/jobs` now calls
+> `_with_validated_tool_overrides` on the request fragment, on **both** the
+> public and the internal path: `X-Internal-Key` is transport authentication,
+> not authorization, and `create_worker_job` forwards a model-authored
+> `config_override` verbatim, which is exactly a caller who can write
+> `tools.canvas: ["run_command"]`. The server's own fragments are untouched —
+> `_critic_config_override` and the campaign loop's `{"loop": ["loop_plan"]}` go
+> through `postgres_db.create_job` directly, and the officer slot patch merges
+> in after the boundary. `tests/test_tool_override_boundary.py`.
 
 **The "base-granted shell bypasses the grant" claim needs re-verification.**
 `docs/issues/session_create_tool_toggles_cannot_enable_a_group.md` states the
@@ -972,6 +984,34 @@ explicitly licensed it.
 **Commit 5 — the request boundary.** `SESSION_TOOL_OVERRIDE_GROUPS` + registry
 membership validation, accepting `true`/`false`/`only`/`except`. Server-side only;
 the cockpit still sends lists and still works.
+
+> **Corrected 2026-08-03, at implementation.** There is no
+> `SESSION_TOOL_OVERRIDE_GROUPS`. A group allowlist would have been a fifth
+> parallel list, and the "which categories may a request address?" question it
+> answers has only one honest answer: all of them. So
+> `validate_tool_override_fragment` (`src/core/tool_policy.py`) validates
+> **every** category against the registry, at all three boundaries plus the job
+> path, and the plan's two consequences change accordingly:
+>
+> * `{"tools": {"shell": true}}` is **not** "dropped and logged". It is a 400 —
+>   from `ENUMERATE_ONLY_CATEGORIES`, which already refuses `true` for `shell`.
+>   `{"tools": {"shell": []}}` is accepted and honoured, which is the Defect-2
+>   fix for that checkbox.
+> * Anything the boundary will not honour is **rejected**, never dropped.
+>   Replacing one silent discard with a narrower silent discard fixes nothing;
+>   the precedent is `_validated_reasoning_level`.
+>
+> The plan also assumed commit 5 preceded any widening of what a *closed group*
+> may name. It does not: membership is checked against the whole registry
+> category, because `grant: "explicit"` restricts category-level policy and not
+> an explicit name (`config/experts/centurion` names two of them). See "the
+> biggest risk" above — mitigation 2 landed, and `true` still expands to exactly
+> the curated set. The residual is that a request may now *name*
+> `set_expert_bundle` under `agent_catalog`, which the four-group list refused.
+> That is bounded: the tool acts as the session's own user
+> (`_get_client(user_id=context.user_id)`), so it grants an agent something the
+> user can already do in the cockpit — and the job path accepted it outright
+> until this commit.
 
 **Commit 6 — the cockpit.** Send `true`/`false`; delete `SESSION_TOOL_GROUP_NAMES`,
 `toolGroupDefaultsConfig`, the `defaultsTools` input and the `defaults_tools` API
