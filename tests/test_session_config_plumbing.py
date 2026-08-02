@@ -23,10 +23,7 @@ from fastapi import HTTPException
 
 import orchestrator.main as orch_main
 from src.api.persistent_app import _load_expert_config
-from src.core.session_tool_overrides import (
-    SessionToolOverrideError,
-    validate_session_tool_overrides,
-)
+from src.core.tool_policy import ToolPolicyError, validate_tool_override_fragment
 
 
 class _FakeResponse:
@@ -269,7 +266,7 @@ class TestSessionWorkspaceBackendDefaultChain:
         assert tools == []
 
     def test_session_tool_group_overrides_pass_through(self):
-        tools = orch_main._validated_session_tool_overrides(
+        tools = orch_main._validated_tool_overrides(
             {"tools": {"orchestrator": [], "agent_catalog": [], "workflows": []}}
         )
         assert tools == {"orchestrator": [], "agent_catalog": [], "workflows": []}
@@ -293,7 +290,7 @@ class TestSessionWorkspaceBackendDefaultChain:
 
     def test_invalid_agent_catalog_tools_override_rejected(self):
         with pytest.raises(orch_main.HTTPException) as exc:
-            orch_main._validated_session_tool_overrides(
+            orch_main._validated_tool_overrides(
                 {"tools": {"agent_catalog": "disabled"}}
             )
         assert exc.value.status_code == 400
@@ -301,9 +298,7 @@ class TestSessionWorkspaceBackendDefaultChain:
 
     def test_invalid_workflows_tools_override_rejected(self):
         with pytest.raises(orch_main.HTTPException) as exc:
-            orch_main._validated_session_tool_overrides(
-                {"tools": {"workflows": "disabled"}}
-            )
+            orch_main._validated_tool_overrides({"tools": {"workflows": "disabled"}})
         assert exc.value.status_code == 400
         assert "workflows" in exc.value.detail
 
@@ -318,13 +313,13 @@ class TestSessionWorkspaceBackendDefaultChain:
     )
     def test_cross_category_session_tool_override_rejected(self, group, injected):
         with pytest.raises(orch_main.HTTPException) as exc:
-            orch_main._validated_session_tool_overrides({"tools": {group: [injected]}})
+            orch_main._validated_tool_overrides({"tools": {group: [injected]}})
         assert exc.value.status_code == 400
         assert group in exc.value.detail
         assert injected in exc.value.detail
 
     def test_known_session_tool_override_names_are_accepted(self):
-        assert orch_main._validated_session_tool_overrides(
+        assert orch_main._validated_tool_overrides(
             {
                 "tools": {
                     "orchestrator": ["get_session_context"],
@@ -341,18 +336,24 @@ class TestSessionWorkspaceBackendDefaultChain:
         }
 
     def test_shared_validator_rejects_cross_category_canvas_name(self):
-        with pytest.raises(SessionToolOverrideError, match="run_command"):
-            validate_session_tool_overrides({"tools": {"canvas": ["run_command"]}})
+        with pytest.raises(ToolPolicyError, match="run_command"):
+            validate_tool_override_fragment({"tools": {"canvas": ["run_command"]}})
 
-    def test_shared_validator_ignores_non_session_categories(self):
-        assert validate_session_tool_overrides(
+    def test_shared_validator_honors_every_category_not_four(self):
+        """Was ``..._ignores_non_session_categories``, and that was the defect.
+
+        The boundary accepted a restriction on ``shell`` (and seven other
+        categories the New Session form renders) and threw it away.
+        """
+        assert validate_tool_override_fragment(
             {
                 "tools": {
                     "canvas": ["get_canvas"],
                     "shell": ["run_command"],
+                    "research": [],
                 }
             }
-        ) == {"canvas": ["get_canvas"]}
+        ) == {"canvas": ["get_canvas"], "shell": ["run_command"], "research": []}
 
     def test_fleet_management_disabled_detection(self):
         assert orch_main._fleet_management_explicitly_disabled(

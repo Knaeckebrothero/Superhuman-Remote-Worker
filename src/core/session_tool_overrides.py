@@ -1,15 +1,27 @@
-"""Closed validation for user-selectable persistent-session tool groups.
+"""The four user-selectable persistent-session tool groups.
 
-Tool names are globally registered and are grouped by their registry metadata,
-not by the key they arrived under in a config fragment.  Consequently, a
-request such as ``tools.canvas = ["run_command"]`` must never reach the generic
-loader: the loader would correctly find ``run_command`` in the global registry
-and instantiate a shell tool even though the request hid it under an unrelated
-group.
+These are the closed groups the New Session / Settings→Tools UI has always
+rendered as independent switches, and the set the
+``/api/persistent/threads/{id}/tool-groups`` endpoint answers for.  They are a
+**presentation** vocabulary: which groups the product offers as one checkbox.
 
-Keep this module framework-free so both the orchestrator request boundary and
-the persistent runtime's live ``config.update`` boundary use the exact same
-closed category-to-name mapping.
+They are no longer a **validation** vocabulary.  Request-boundary validation
+moved to ``src.core.tool_policy.validate_tool_override_fragment``, which checks
+every category against the registry instead of four against a hand-curated
+name list.  Keeping the list in that second role was the defect: the boundary
+honoured these four and silently discarded the other eight categories the form
+renders, so unticking ``research`` or ``shell`` was accepted and thrown away.
+It also left the smuggling case — ``tools.canvas = ["run_command"]``, which the
+loader resolves by registry metadata rather than by the key it arrived under —
+open on the job surface, which never consulted this list at all.
+
+The safety judgement this list used to carry now lives in registry metadata as
+``grant: "explicit"`` (``src/tools/registry.py``), which is what keeps a
+category-level ``true`` for one of these groups from widening past the names
+below.  ``tests/test_tool_grant_classification.py`` pins the two to agree.
+
+Keep this module framework-free — the orchestrator, the agent runtime and the
+cockpit-mirror test all read it.
 """
 
 from __future__ import annotations
@@ -60,47 +72,6 @@ SESSION_TOOL_OVERRIDE_NAMES: dict[str, frozenset[str]] = {
 }
 
 
-class SessionToolOverrideError(ValueError):
-    """A selectable session group contains an invalid or foreign tool name."""
-
-
-def validate_session_tool_overrides(
-    config_override: Any,
-) -> dict[str, list[str]]:
-    """Return the safe session-facing tool-group subset of an override.
-
-    Other tool categories are intentionally ignored, matching the New Session
-    API's existing contract: only the independently toggled session groups in
-    :data:`SESSION_TOOL_OVERRIDE_NAMES` are accepted from this surface.  Every
-    accepted group is type-checked and then checked against its own closed name
-    set, so a globally valid tool cannot be smuggled through a different group.
-    """
-
-    tools = config_override.get("tools") if isinstance(config_override, dict) else None
-    if not isinstance(tools, dict):
-        return {}
-
-    accepted: dict[str, list[str]] = {}
-    for group, allowed_names in SESSION_TOOL_OVERRIDE_NAMES.items():
-        if group not in tools:
-            continue
-        value = tools.get(group)
-        if not isinstance(value, list) or not all(
-            isinstance(name, str) for name in value
-        ):
-            raise SessionToolOverrideError(
-                f"Invalid tools.{group} override; expected a string list."
-            )
-        unexpected = sorted(set(value) - allowed_names)
-        if unexpected:
-            raise SessionToolOverrideError(
-                f"Invalid tools.{group} override; unknown or cross-category "
-                f"tool name(s): {', '.join(unexpected)}."
-            )
-        accepted[group] = list(value)
-    return accepted
-
-
 def session_tool_group_enablement(merged_config: Any) -> dict[str, bool]:
     """Return resolved-path enablement per closed session group.
 
@@ -127,7 +98,5 @@ def session_tool_group_enablement(merged_config: Any) -> dict[str, bool]:
 
 __all__ = [
     "SESSION_TOOL_OVERRIDE_NAMES",
-    "SessionToolOverrideError",
     "session_tool_group_enablement",
-    "validate_session_tool_overrides",
 ]

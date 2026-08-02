@@ -4230,7 +4230,11 @@ class TestHandleConfigUpdateEnrichmentGate:
             "resetup_tools_for_backend()"
         )
 
-    def test_live_tool_override_sanitizer_keeps_only_closed_session_groups(self):
+    def test_live_tool_override_sanitizer_keeps_every_valid_category(self):
+        """Was ``..._keeps_only_closed_session_groups``, and keeping only four
+        was the defect: a live "turn shell off" was acknowledged and discarded.
+        Every category is validated against the registry now; the copy is what
+        keeps the caller-owned WebSocket payload immutable."""
         from src.api.persistent_app import _sanitize_live_session_config_override
 
         original = {
@@ -4244,7 +4248,7 @@ class TestHandleConfigUpdateEnrichmentGate:
 
         assert sanitized == {
             "llm": {"temperature": 0.2},
-            "tools": {"canvas": ["get_canvas"]},
+            "tools": {"canvas": ["get_canvas"], "shell": ["run_command"]},
         }
         assert original["tools"]["shell"] == ["run_command"]
 
