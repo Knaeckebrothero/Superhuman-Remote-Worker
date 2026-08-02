@@ -2627,6 +2627,7 @@
       "temperature": "Temperature",
       "reasoning": "Reasoning",
       "reasoningDefaultOption": "{{label}} (default)",
+      "reasoningResetNotice": "Reset to default — your reasoning pick didn't carry over.",
       "default": "Default",
       "defaultResolved": "{{model}} ({{source}})",
       "defaultResolvedNoSource": "Default · {{model}}",
