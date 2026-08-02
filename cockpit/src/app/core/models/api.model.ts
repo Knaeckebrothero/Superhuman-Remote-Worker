@@ -233,6 +233,15 @@ export type DatasourceType =
 export type EmailAccessTier = 'read' | 'read_write' | 'draft' | 'send';
 
 /**
+ * Forge (git host software) for a ``repository`` datasource. Required by the
+ * server (``orchestrator/main.py`` ``_normalize_repository_config``): it
+ * infers ``github``/``gitlab`` from a github.com/gitlab.com connection URL,
+ * but a self-hosted host must declare this explicitly — a self-hosted Gitea
+ * and a self-hosted GitLab are indistinguishable by URL alone.
+ */
+export type RepositoryForge = 'github' | 'gitea' | 'gitlab';
+
+/**
  * A single file entry inside ``credentials.files[]`` for credential-file types.
  *
  * The server applies type-specific defaults (target_path, mode, env_var) when
@@ -251,6 +260,8 @@ export interface CredentialFileEntry {
 export interface DatasourceConfig {
   /** Repository-relative POSIX root containing OKF Markdown notes. */
   root_path?: string;
+  /** Repository: which forge this connector targets — see ``RepositoryForge``. */
+  forge?: RepositoryForge;
   /** Email: access tier (tool-layer enforced; ``draft`` is the default). */
   access?: EmailAccessTier;
   /** Email: folder allowlist; empty = whole mailbox (rejected for ``send``). */

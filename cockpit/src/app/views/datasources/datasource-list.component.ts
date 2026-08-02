@@ -13,6 +13,7 @@ import {
     DatasourceType,
     DatasourceUpdateRequest,
     EmailAccessTier,
+    RepositoryForge,
 } from '../../core/models/api.model';
 import {AppButtonComponent} from '../../ui/button';
 import {AppIconButtonComponent} from '../../ui/icon-button';
@@ -200,7 +201,7 @@ type KeyValueRow = {key: string; value: string};
                   size="sm"
                   class="mono"
                   [value]="formData.connection_url"
-                  (valueChange)="formData.connection_url = $event"
+                  (valueChange)="onConnectionUrlChange($event)"
                   [placeholder]="urlPlaceholder()"
                   [disabled]="isSaving()"
                 />
@@ -487,6 +488,25 @@ type KeyValueRow = {key: string; value: string};
               </app-form-field>
             }
 
+            <!-- Repository: forge. github.com/gitlab.com default automatically;
+                 any other host is left blank (required) since a self-hosted
+                 Gitea and GitLab can't be told apart by URL alone. -->
+            @if (formData.type === 'repository') {
+              <app-form-field [label]="'datasources.form.forgeLabel' | transloco" [required]="true">
+                <app-select
+                  size="sm"
+                  [value]="formData.forge"
+                  (changed)="onForgeSelect($event)"
+                  [disabled]="isSaving()"
+                >
+                  <option value="">{{ 'datasources.form.forgePlaceholder' | transloco }}</option>
+                  <option value="github">{{ 'datasources.form.forgeGithub' | transloco }}</option>
+                  <option value="gitea">{{ 'datasources.form.forgeGitea' | transloco }}</option>
+                  <option value="gitlab">{{ 'datasources.form.forgeGitlab' | transloco }}</option>
+                </app-select>
+              </app-form-field>
+            }
+
             <!-- Git-backed datasource: auth method -->
             @if (isGitBackedType()) {
               <app-form-field [label]="'datasources.form.authMethodLabel' | transloco" [required]="true">
@@ -512,6 +532,18 @@ type KeyValueRow = {key: string; value: string};
                     [disabled]="isSaving()"
                   />
                 </app-form-field>
+                @if (formData.type === 'repository' && formData.forge === 'github') {
+                  <div class="form-hint">{{ 'datasources.form.forgeTokenHintGithub' | transloco }}</div>
+                }
+                @if (formData.type === 'repository' && formData.forge === 'gitlab') {
+                  <div class="form-hint">{{ 'datasources.form.forgeTokenHintGitlab' | transloco }}</div>
+                }
+                @if (formData.type === 'repository' && formData.forge === 'gitea') {
+                  <div class="trust-notice">
+                    <app-icon size="sm">warning</app-icon>
+                    <div>{{ 'datasources.form.forgeTokenHintGitea' | transloco }}</div>
+                  </div>
+                }
               }
               @if (gitAuthMethod === 'ssh') {
                 <app-form-field [label]="'datasources.form.sshKeyLabel' | transloco">
@@ -2158,6 +2190,11 @@ export class DatasourceListComponent implements OnInit {
       }
       return !!this.formData.connection_url.trim();
     }
+    if (this.formData.type === 'repository') {
+      // forge is required — self-hosted hosts don't default it, so an empty
+      // selection must block save rather than let the server 400.
+      return !!this.formData.connection_url && !!this.formData.forge;
+    }
     return !!this.formData.connection_url;
   }
 
@@ -2174,6 +2211,8 @@ export class DatasourceListComponent implements OnInit {
     cli_hint: string;
     default_branch: string;
     root_path: string;
+    /** Repository only; '' means "not yet chosen" (blocks canSave()). */
+    forge: RepositoryForge | '';
     mcpTransport: McpTransport;
     mcpToken: string;
     mcpHeaders: KeyValueRow[];
@@ -2190,6 +2229,7 @@ export class DatasourceListComponent implements OnInit {
     cli_hint: '',
     default_branch: '',
     root_path: '',
+    forge: '',
     mcpTransport: 'http',
     mcpToken: '',
     mcpHeaders: [],
@@ -2369,6 +2409,7 @@ export class DatasourceListComponent implements OnInit {
       cli_hint: ds.cli_hint || '',
       default_branch: ds.default_branch || '',
       root_path: ds.config?.root_path || '',
+      forge: ds.config?.forge || '',
       // MCP credentials, including transport, are redacted by REST. Default
       // the editor to remote HTTP and preserve the stored credential object
       // unless the user enters replacement connection details.
@@ -2550,6 +2591,38 @@ export class DatasourceListComponent implements OnInit {
 
   onGitAuthMethodChange(value: string | null): void {
     this.gitAuthMethod = value === 'ssh' ? 'ssh' : 'token';
+  }
+
+  /** Connection-URL input handler (shared by every non-generic type). For
+   *  repository connectors this also (re)derives `forge` from the host:
+   *  github.com/gitlab.com default automatically; every other host — every
+   *  self-hosted Gitea or GitLab included — is left blank so `canSave()`
+   *  blocks submission until the user picks one explicitly, rather than
+   *  letting the server 400 (self-hosted Gitea and GitLab are
+   *  indistinguishable by URL alone; see orchestrator/main.py
+   *  `_normalize_repository_config`). */
+  onConnectionUrlChange(value: string = this.formData.connection_url): void {
+    this.formData.connection_url = value;
+    if (this.formData.type === 'repository') {
+      this.formData.forge = this.inferForgeFromUrl(value);
+    }
+  }
+
+  private inferForgeFromUrl(url: string): RepositoryForge | '' {
+    let host = '';
+    try {
+      host = new URL(url).hostname.toLowerCase();
+    } catch {
+      return '';
+    }
+    if (host === 'github.com' || host === 'www.github.com') return 'github';
+    if (host === 'gitlab.com' || host === 'www.gitlab.com') return 'gitlab';
+    return '';
+  }
+
+  onForgeSelect(value: string | null): void {
+    this.formData.forge =
+      value === 'github' || value === 'gitea' || value === 'gitlab' ? value : '';
   }
 
   /**
@@ -3004,6 +3077,11 @@ export class DatasourceListComponent implements OnInit {
     if (this.formData.type === 'kb') {
       return {root_path: this.formData.root_path.trim()};
     }
+    if (this.formData.type === 'repository') {
+      // canSave() already requires forge to be non-blank before this can be
+      // reached from the UI; the `{}` fallback only guards a defensive call.
+      return this.formData.forge ? {forge: this.formData.forge} : {};
+    }
     if (this.formData.type === 'email') {
       return {
         access: this.emailForm.access,
@@ -3178,6 +3256,7 @@ export class DatasourceListComponent implements OnInit {
       cli_hint: '',
       default_branch: '',
       root_path: '',
+      forge: '',
       mcpTransport: 'http',
       mcpToken: '',
       mcpHeaders: [],
