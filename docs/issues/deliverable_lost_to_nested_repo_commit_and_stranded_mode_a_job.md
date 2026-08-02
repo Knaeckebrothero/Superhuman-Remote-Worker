@@ -65,7 +65,72 @@ form is *without* it — and `resolve_workspace_deliverable` accepts either form
 jobs writing `repo/output/…` and this one writing `output/…` are the same contracted
 artifact. The agent wrote the canonical path it was given.
 
-## Defect 1 — the promised phase-boundary commit-and-push never ran
+## Defect 1 — SOLVED: `f41970ae` broke every git command through the workspace backend
+
+**Root cause found and fixed 2026-08-02 (`22b2511e`).** It is a regression introduced by the
+cwd-anchoring fix itself.
+
+`f41970ae` added a `CWD: <path>` line to `RemoteBackend.shell_run`'s output
+(`remote.py:1396-1405`). `GitManager._parse_shell_run_output` was not updated — it checked
+whether the payload marker was the **first** line after `Exit code:` and, failing that, fell
+through to `stdout = rest`, handing callers the entire banner as command output:
+
+```python
+rest = lines[1] if len(lines) > 1 else ""
+if rest.startswith("--- stdout ---\n"):   # no longer true — CWD: is in the way
+    ...
+else:
+    stdout = rest                          # the whole banner
+```
+
+Proven directly:
+
+```
+BEFORE f41970ae: branch = 'main'
+AFTER  f41970ae: branch = 'CWD: /home/agent-host/workspace\n--- stdout ---\nmain'
+```
+
+So since **2026-08-01 12:41**, every git command routed through the workspace backend has
+returned polluted stdout. The damage lands in `push()`, which uses that stdout as a branch
+name — `git push -u origin "CWD: …\n--- stdout ---\nmain"` → `fatal: invalid refspec`, exit
+128, on **every phase boundary**. bbce4bed started at 14:42 the same day, two hours later,
+and ran 13 hours across 8 phases without landing a commit.
+
+It stayed invisible because the parser also hardcoded `stderr=""`, so the one log line it
+produced read `git push failed: ` with nothing after the colon.
+
+This retroactively explains the very first oddity in this investigation — bbce4bed's
+`freeze_data.head_commit` recorded as
+`CWD: /home/agent-host/workspace\n--- stdout ---\n4d1a23fee0…`. That is the same pollution.
+`4d1a23fe` was a real commit all along; it was absent from Gitea because the push was
+broken, not because it was fabricated.
+
+**Why the tests did not catch it:** `TestParseShellRunOutput` pins the pre-`f41970ae`
+format. The producer changed and the consumer's tests kept asserting the old contract, so
+they stayed green while every caller silently broke.
+
+### Reproduced and verified on k3d
+
+| | broken image | fixed image (`tilt-103fef5f45fdd776`) |
+| --- | --- | --- |
+| job | `742b76ab` | `93366372` |
+| agent log | `git push failed:` (empty stderr) | no push failures |
+| branch tip | frozen — advanced only when pushed by hand | **2 → 3 → 5 commits, unattended** |
+
+The same `git push -u origin main` run by hand in the broken job's workspace exits 0, which
+is what ruled out credentials, permissions and the remote.
+
+### The fix (`22b2511e`)
+
+- Locate the payload marker instead of assuming its position; strip header lines before the
+  `(no output)` sentinel check.
+- Mirror output into `stderr` on non-zero exit — the backend merges the streams, and callers
+  log `stderr` on failure.
+- Fall back to `"main"` when branch detection returns **empty**, not only on non-zero exit.
+  `has_unpushed_commits()` always had this guard and `push()` did not; that asymmetry is what
+  turned a parser bug into lost work.
+
+### Original diagnosis (superseded, retained for the record)
 
 The brief promises *"each phase boundary commits and pushes them"*. Across 8 phases and
 13 hours, branch `job/bbce4bed` never moved off
@@ -257,7 +322,20 @@ records as never having been exercised; it now has been, and it reproduces. Comb
 `write_file` resolving against the workspace root unconditionally, Defect 2's mechanism is
 fully accounted for.
 
-### E2 — why did the phase-boundary push not land? · **H1/H2 REFUTED · BLOCKED ON LLM KEYS**
+### E2 — why did the phase-boundary push not land? · **SOLVED 2026-08-02**
+
+Root cause is the `CWD:` banner leaking into git stdout — see Defect 1 above. Fixed in
+`22b2511e`, reproduced and verified on k3d before and after.
+
+**Correction on the "blocked" call below:** k3d was never blocked. The empty
+`OPENAI_API_KEY`/`ANTHROPIC_API_KEY`/… entries in `values-local.yaml` are irrelevant because
+the seeded models are `provider_kind='endpoint'` — `gemma-4-moe` (enabled, 131k context)
+points at `https://ai.h4ll.app/v1`, reachable from the cluster in 157 ms. The `/api/models`
+call that returned 0 was the wrong shape; the `models` table has 10 rows. H1/H2 were
+correctly refuted, but the conclusion that E2 could not run was wrong, and it cost several
+hours.
+
+### E2 (original hypotheses and blocked status, retained for the record)
 
 **Instrumentation landed** (`d7e05c39`): both early returns in `GitManager.push` now log at
 WARNING, and `_inactive_reason()` separates a missing git binary from a missing `.git`. The
