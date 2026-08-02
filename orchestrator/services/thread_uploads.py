@@ -18,7 +18,14 @@ A ``.zip`` upload is expanded into ``uploads/<stem>/…`` rather than stored as
 a single opaque archive, mirroring the worker-job path's ``_extract_zip``
 (``src/agent.py:4067``) so an attached archive is immediately readable by
 ``read_file``/``list_files`` with no unzip capability required. See
-``_expand_payloads_for_extraction`` below.
+``_expand_payloads_for_extraction`` below. When extraction is refused
+(corrupt, unsafe entry, over a cap) the archive is stored verbatim under its
+own claimed name plus a sidecar ``ZIP_REFUSAL_NOTE_SUFFIX`` file explaining
+why — both flow through the normal upload-result plumbing, so they show up
+like any other attached file in the HTTP response and the cockpit's
+"Attached files:" hint, and ``read_file`` on the archive itself surfaces the
+same note (see ``_read_zip_extraction_note`` in
+``src/tools/workspace/files.py``).
 
 The agent learns about new uploads when the cockpit appends an
 ``Attached files: …`` hint to the next user message — see
@@ -184,24 +191,48 @@ class ZipExtractionRefused(Exception):
 # MAX_FILE_SIZE (100MB, above) already bounds the compressed upload; these
 # bound what it may explode into, so a corrupt or hostile archive fails
 # cleanly instead of filling the workspace, blowing up orchestrator memory,
-# or hanging the write loop on thousands of tiny entries.
-#
-#   MAX_ZIP_ENTRIES: generous for a folder of documents/photos, small enough
-#   to bound total SFTP/object-store round trips for one request.
+# or hanging the write loop.
 #
 #   MAX_ZIP_ENTRY_UNCOMPRESSED_BYTES: no single extracted member may be
-#   bigger than a standalone upload would have been allowed to be.
+#   bigger than a standalone upload would have been allowed to be. Bounds
+#   peak memory for decompressing any one entry.
 #
-#   MAX_ZIP_TOTAL_UNCOMPRESSED_BYTES: real documents/images rarely compress
-#   more than 2-3x, so 3x the compressed cap is generous headroom while
-#   keeping the in-memory extraction buffer bounded — this happens inside
-#   the orchestrator process, up to MAX_CONCURRENT_VIRTUAL_UPLOADS at once.
-MAX_ZIP_ENTRIES = 2_000
+#   MAX_ZIP_ENTRIES_PER_REQUEST / MAX_ZIP_TOTAL_UNCOMPRESSED_BYTES_PER_REQUEST:
+#   shared across *every* zip in one upload request (MAX_FILES_PER_REQUEST
+#   payloads), not reset per archive. An earlier version of this module
+#   capped these per zip, which a full batch multiplies by 20 — ~6GB
+#   decompressed plus ~2GB still-referenced compressed payloads, ~24GB with
+#   MAX_CONCURRENT_VIRTUAL_UPLOADS=4 concurrent requests. Sized instead for
+#   the *virtual* transport's real per-entry cost: RcloneObjectStore.put
+#   spawns one `rclone rcat` subprocess per key
+#   (src/core/backends/rclone.py:256), ~100ms observed. 100 entries is ~10s
+#   of worst-case spawn time for the *whole request* — comfortably under a
+#   typical 30-60s proxy timeout, where 2,000 (~3.5 min) or a 20-zip batch
+#   at that rate (~1hr+) would die mid-write with the workspace partially
+#   populated, since the plan is atomic but the write loop is not. 300MB
+#   (3x the compressed per-file cap) keeps the transient decompressed
+#   buffer bounded to ~1.2GB across 4 concurrent requests. The SFTP
+#   transport's per-write cost is much cheaper (no subprocess), but shares
+#   the same cap rather than carrying a second number to maintain.
 MAX_ZIP_ENTRY_UNCOMPRESSED_BYTES = MAX_FILE_SIZE
-MAX_ZIP_TOTAL_UNCOMPRESSED_BYTES = 3 * MAX_FILE_SIZE
+MAX_ZIP_ENTRIES_PER_REQUEST = 100
+MAX_ZIP_TOTAL_UNCOMPRESSED_BYTES_PER_REQUEST = 3 * MAX_FILE_SIZE
 
 # Chunk size for the capped incremental read in _read_zip_entry_capped.
 _ZIP_READ_CHUNK_SIZE = 65536
+
+# Sidecar suffix written next to a zip that fell back to verbatim storage
+# because extraction was refused (corrupt, traversal entry, over a cap).
+# read_file (src/tools/workspace/files.py::_read_zip_extraction_note) checks
+# for this exact suffix before listing a zip's entries — otherwise a merely
+# *parseable* but refused archive reads as an ordinary, successfully
+# extracted one: the agent sees a full entry listing with nothing anywhere
+# (not the HTTP response, not the cockpit hint, not read_file) saying those
+# entries were never separated into readable files. That is the motivating
+# incident's dead end, recreated one layer down. No shared import exists
+# between the orchestrator and agent processes; keep both ends of this
+# string in sync by hand.
+ZIP_REFUSAL_NOTE_SUFFIX = ".extraction-refused.txt"
 
 
 def _is_symlink_zip_entry(info: zipfile.ZipInfo) -> bool:
@@ -261,19 +292,33 @@ def _read_zip_entry_capped(fh: Any, cap: int, entry_name: str) -> bytes:
     return b"".join(chunks)
 
 
-def _plan_zip_extraction(data: bytes, stem: str) -> list[tuple[str, bytes]]:
+def _plan_zip_extraction(
+    data: bytes,
+    stem: str,
+    *,
+    max_entries: int | None = None,
+    max_entry_bytes: int | None = None,
+    max_total_bytes: int | None = None,
+) -> list[tuple[str, bytes]]:
     """Validate and expand a zip's bytes into ``(name, content)`` pairs.
 
     ``name`` is relative to the uploads/ directory root (e.g.
     ``"myarchive/sub/file.txt"`` for ``stem="myarchive"``) — ready to become
     ``UploadedFile.name`` directly, exactly like a flat upload's name.
 
+    The three ``max_*`` caps default to the module-level per-request
+    constants, but ``_expand_payloads_for_extraction`` passes in whatever is
+    actually left of that shared budget when a batch has more than one zip
+    — the caps are enforced *per request*, not per archive.
+
     Raises ``ZipExtractionRefused`` for anything that makes safe, complete
     extraction impossible. Never returns a partial result: a caller either
     gets every safe entry or none of them ("rather than half-extracted").
     """
     try:
-        return _plan_zip_extraction_unsafe(data, stem)
+        return _plan_zip_extraction_unsafe(
+            data, stem, max_entries, max_entry_bytes, max_total_bytes
+        )
     except ZipExtractionRefused:
         raise
     except Exception as e:
@@ -285,7 +330,23 @@ def _plan_zip_extraction(data: bytes, stem: str) -> list[tuple[str, bytes]]:
         raise ZipExtractionRefused(f"could not process zip: {e}") from e
 
 
-def _plan_zip_extraction_unsafe(data: bytes, stem: str) -> list[tuple[str, bytes]]:
+def _plan_zip_extraction_unsafe(
+    data: bytes,
+    stem: str,
+    max_entries: int | None,
+    max_entry_bytes: int | None,
+    max_total_bytes: int | None,
+) -> list[tuple[str, bytes]]:
+    # Read fresh from the module globals on every call (rather than as
+    # parameter defaults, which Python binds once at def time) so tests can
+    # still monkeypatch the module-level constants directly.
+    if max_entries is None:
+        max_entries = MAX_ZIP_ENTRIES_PER_REQUEST
+    if max_entry_bytes is None:
+        max_entry_bytes = MAX_ZIP_ENTRY_UNCOMPRESSED_BYTES
+    if max_total_bytes is None:
+        max_total_bytes = MAX_ZIP_TOTAL_UNCOMPRESSED_BYTES_PER_REQUEST
+
     try:
         zf = zipfile.ZipFile(io.BytesIO(data))
     except zipfile.BadZipFile as e:
@@ -293,9 +354,9 @@ def _plan_zip_extraction_unsafe(data: bytes, stem: str) -> list[tuple[str, bytes
 
     with zf:
         infos = zf.infolist()
-        if len(infos) > MAX_ZIP_ENTRIES:
+        if len(infos) > max_entries:
             raise ZipExtractionRefused(
-                f"{len(infos)} entries exceeds the {MAX_ZIP_ENTRIES}-entry limit"
+                f"{len(infos)} entries exceeds the {max_entries}-entry limit"
             )
 
         plan: list[tuple[str, bytes]] = []
@@ -331,23 +392,21 @@ def _plan_zip_extraction_unsafe(data: bytes, stem: str) -> list[tuple[str, bytes
             if _is_symlink_zip_entry(info):
                 continue
 
-            if info.file_size > MAX_ZIP_ENTRY_UNCOMPRESSED_BYTES:
+            if info.file_size > max_entry_bytes:
                 raise ZipExtractionRefused(
                     f"entry {name!r} declares {info.file_size} bytes "
-                    f"uncompressed, over the {MAX_ZIP_ENTRY_UNCOMPRESSED_BYTES} "
-                    "byte per-entry limit"
+                    f"uncompressed, over the {max_entry_bytes} byte "
+                    "per-entry limit"
                 )
 
             with zf.open(info) as fh:
-                content = _read_zip_entry_capped(
-                    fh, MAX_ZIP_ENTRY_UNCOMPRESSED_BYTES, name
-                )
+                content = _read_zip_entry_capped(fh, max_entry_bytes, name)
 
             total_uncompressed += len(content)
-            if total_uncompressed > MAX_ZIP_TOTAL_UNCOMPRESSED_BYTES:
+            if total_uncompressed > max_total_bytes:
                 raise ZipExtractionRefused(
                     "uncompressed contents exceed the "
-                    f"{MAX_ZIP_TOTAL_UNCOMPRESSED_BYTES}-byte total limit"
+                    f"{max_total_bytes}-byte total limit"
                 )
 
             plan.append((dest, content))
@@ -368,12 +427,28 @@ def _expand_payloads_for_extraction(
     usual sanitized, collision-resolved flat name; a zip's members get
     ``<stem>/<relative path within the archive>``.
 
-    A zip that fails validation (corrupt, unsafe entry, over a cap) falls
-    back to its original bytes stored under the claimed stem plus its
-    original suffix — never a half-extracted result, never a vanished
-    upload (docs/issues/session_uploads_never_extract_archives.md).
+    A zip that fails validation (corrupt, unsafe entry, over a cap, or the
+    request's shared extraction budget already spent — see below) falls
+    back to its original bytes, claimed through the *same* ``_claim_name``
+    check as every other name here — it must never land on a name nothing
+    checked against ``taken``, or it can silently overwrite an unrelated
+    existing upload. A sidecar note (``ZIP_REFUSAL_NOTE_SUFFIX``) is written
+    alongside explaining why, because the stored bytes alone don't say
+    extraction was attempted and refused — see the module-level comment on
+    that constant. Never a half-extracted result, never a vanished upload
+    (docs/issues/session_uploads_never_extract_archives.md).
+
+    Entry count and uncompressed bytes are capped *per call* (i.e. per
+    upload request — this runs once per ``upload_files_to_thread_workspace``
+    invocation), shared across every zip in ``payloads`` rather than reset
+    for each one. See the ``MAX_ZIP_ENTRIES_PER_REQUEST`` comment for why a
+    per-zip cap alone isn't enough once a batch can hold
+    ``MAX_FILES_PER_REQUEST`` of them.
     """
     expanded: list[tuple[str, bytes, str]] = []
+    remaining_entries = MAX_ZIP_ENTRIES_PER_REQUEST
+    remaining_bytes = MAX_ZIP_TOTAL_UNCOMPRESSED_BYTES_PER_REQUEST
+
     for filename, data, mime_type in payloads:
         safe_name = _sanitize_filename(filename)
         suffix = PurePosixPath(safe_name).suffix
@@ -382,23 +457,72 @@ def _expand_payloads_for_extraction(
             expanded.append((_claim_name(taken, safe_name), data, mime_type))
             continue
 
-        # Claim the slot once, whether extraction succeeds or falls back —
-        # so a fallback can never collide with something claimed in between.
+        # Claim BOTH names this payload could end up needing before
+        # attempting extraction, so whichever outcome actually happens has
+        # already been checked against `taken` — the fallback below must
+        # never be assembled from a claimed name plus a suffix nobody
+        # checked (that was CRITICAL 1 in review: an existing "bundle.zip"
+        # got silently clobbered by a corrupt/refused re-upload of the same
+        # name, because only the bare "bundle" stem was ever claimed). The
+        # unused slot is a harmless over-reservation either way.
         stem = _claim_name(taken, PurePosixPath(safe_name).stem or "archive")
+        fallback_name = _claim_name(taken, safe_name)
+
         plan: list[tuple[str, bytes]] = []
-        try:
-            plan = _plan_zip_extraction(data, stem)
-        except ZipExtractionRefused as e:
-            logger.warning(
-                "Zip extraction refused for %r (%s) — storing the upload "
-                "as-is instead of extracting it",
-                filename,
-                e,
+        refusal_reason: str | None = None
+        if remaining_entries <= 0 or remaining_bytes <= 0:
+            refusal_reason = (
+                "this request's zip-extraction budget was already spent by "
+                "an earlier archive in the same upload"
             )
+            logger.warning(
+                "Zip extraction skipped for %r — per-request extraction "
+                "budget exhausted by earlier archives in this batch; "
+                "storing as-is instead",
+                filename,
+            )
+        else:
+            try:
+                plan = _plan_zip_extraction(
+                    data,
+                    stem,
+                    max_entries=min(MAX_ZIP_ENTRIES_PER_REQUEST, remaining_entries),
+                    max_entry_bytes=min(
+                        MAX_ZIP_ENTRY_UNCOMPRESSED_BYTES, remaining_bytes
+                    ),
+                    max_total_bytes=min(
+                        MAX_ZIP_TOTAL_UNCOMPRESSED_BYTES_PER_REQUEST, remaining_bytes
+                    ),
+                )
+            except ZipExtractionRefused as e:
+                refusal_reason = str(e)
+                logger.warning(
+                    "Zip extraction refused for %r (%s) — storing the upload "
+                    "as-is instead of extracting it",
+                    filename,
+                    e,
+                )
 
         if not plan:
-            expanded.append((f"{stem}{suffix}", data, mime_type))
+            expanded.append((fallback_name, data, mime_type))
+            if refusal_reason is not None:
+                note_name = _claim_name(
+                    taken, f"{fallback_name}{ZIP_REFUSAL_NOTE_SUFFIX}"
+                )
+                note_body = (
+                    f"Extraction refused: {refusal_reason}\n\n"
+                    "This archive's original bytes are stored as-is at the "
+                    "path above. Reading it will show an entry listing (if "
+                    "it can still be parsed as a zip), but none of its "
+                    "members were separated into individually readable "
+                    "files — ask for a fresh, smaller/safer upload if you "
+                    "need a specific one.\n"
+                ).encode("utf-8")
+                expanded.append((note_name, note_body, "text/plain"))
             continue
+
+        remaining_entries -= len(plan)
+        remaining_bytes -= sum(len(content) for _, content in plan)
 
         for member_name, content in plan:
             mime, _ = mimetypes.guess_type(member_name)
