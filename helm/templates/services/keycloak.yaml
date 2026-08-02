@@ -715,6 +715,7 @@ spec:
                   name: {{ include "srw.secretName" . }}
                   key: PGADMIN_OIDC_CLIENT_SECRET
             {{- end }}
+            {{- if .Values.opencloud.enabled }}
             - name: OPENCLOUD_KEYCLOAK_CLIENT_SECRET
               valueFrom:
                 secretKeyRef:
@@ -727,6 +728,7 @@ spec:
                   name: {{ include "srw.configMapName" . }}
                   key: OPENCLOUD_PUBLIC_URL
                   optional: true
+            {{- end }}
             {{- if .Values.mcp.enabled }}
             - name: MCP_OIDC_CLIENT_SECRET
               valueFrom:
@@ -809,7 +811,9 @@ spec:
                                 {{- if .Values.nextcloud.enabled }}
                                 "nextcloud:$NEXTCLOUD_OIDC_CLIENT_SECRET" \
                                 {{- end }}
+                                {{- if .Values.opencloud.enabled }}
                                 "opencloud-orchestrator:$OPENCLOUD_KEYCLOAK_CLIENT_SECRET" \
+                                {{- end }}
                                 {{- if .Values.pgadmin.enabled }}
                                 "pgadmin:$PGADMIN_OIDC_CLIENT_SECRET" \
                                 {{- end }}
@@ -934,8 +938,15 @@ spec:
                       -s "ssoSessionMaxLifespanRememberMe={{ .Values.keycloak.session.ssoSessionMaxLifespanRememberMe }}" \
                       -s "accessTokenLifespan={{ .Values.keycloak.session.accessTokenLifespan }}" \
                       -s "offlineSessionIdleTimeout={{ .Values.keycloak.session.offlineSessionIdleTimeout }}" 2>/dev/null
+                    {{- if .Values.opencloud.enabled }}
                     # --- Ensure OpenCloud clients + group ---
                     # Idempotent: creates only if missing. Mirrors setup-opencloud-client.sh.
+                    # Helm-gated on opencloud.enabled: the runtime `-n` guard alone was
+                    # not enough, because OPENCLOUD_KEYCLOAK_CLIENT_SECRET outlives the
+                    # backend in Vault. A cluster migrated off OpenCloud would otherwise
+                    # keep re-creating the five OpenCloud clients — and re-registering
+                    # opencloudUser as a realm DEFAULT group, so every new user kept
+                    # joining it — on every Keycloak pod restart.
                     if [ -n "$OPENCLOUD_KEYCLOAK_CLIENT_SECRET" ]; then
                       OC_URL="${OPENCLOUD_PUBLIC_URL:-{{ include "srw.cloudUrl" . }}}"
                       # opencloudAdmin group (role mapping for OpenCloud admin access)
@@ -1077,6 +1088,43 @@ spec:
                         done
                       done
                     fi
+                    {{- end }}
+                    {{- if .Values.nextcloud.enabled }}
+                    # --- Ensure the Nextcloud client exists ---
+                    # The realm-import entry above only lands on FIRST boot (empty
+                    # DB). A cluster that turns Nextcloud on later — e.g. migrating
+                    # off OpenCloud — would otherwise never get the client, and
+                    # "Log in with Keycloak" on the cloud host fails with
+                    # "Client not found" even though Nextcloud's own setup hook
+                    # registered the provider on its side. Create-if-missing, then
+                    # re-assert redirect URIs on every start so a global.domain
+                    # flip propagates (same self-heal as gitea/mcp-server below).
+                    if [ -n "$NEXTCLOUD_OIDC_CLIENT_SECRET" ]; then
+                      NCID=$($KC get clients -r {{ .Values.keycloak.realm }} -q clientId=nextcloud --fields id --format csv --noquotes 2>/dev/null | tail -1)
+                      if [ -z "$NCID" ]; then
+                        NCID=$($KC create clients -r {{ .Values.keycloak.realm }} \
+                          -s clientId=nextcloud -s name="Nextcloud" \
+                          -s description="Cloud storage" \
+                          -s enabled=true -s publicClient=false \
+                          -s standardFlowEnabled=true -s implicitFlowEnabled=false \
+                          -s directAccessGrantsEnabled=false -s serviceAccountsEnabled=false \
+                          -s protocol=openid-connect \
+                          -s "secret=$NEXTCLOUD_OIDC_CLIENT_SECRET" -i 2>/dev/null)
+                      fi
+                      if [ -n "$NCID" ]; then
+                        $KC update "clients/$NCID" -r {{ .Values.keycloak.realm }} \
+                          -s 'redirectUris=["http://localhost:8800/apps/user_oidc/code","{{ include "srw.cloudUrl" . }}/apps/user_oidc/code"]' \
+                          -s 'webOrigins=["http://localhost:8800","{{ include "srw.cloudUrl" . }}"]' 2>/dev/null \
+                          || echo "WARN: kcadm nextcloud redirectUris re-assert failed"
+                        # Match the realm-import defaultClientScopes.
+                        for SNAME in openid profile email groups; do
+                          SID=$($KC get client-scopes -r {{ .Values.keycloak.realm }} --fields id,name 2>/dev/null \
+                            | grep -B1 "\"name\" : \"$SNAME\"" | grep '"id"' | head -1 | sed 's/.*"id" : "//;s/".*//' || true)
+                          [ -n "$SID" ] && $KC update "clients/$NCID/default-client-scopes/$SID" -r {{ .Values.keycloak.realm }} 2>/dev/null
+                        done
+                      fi
+                    fi
+                    {{- end }}
                     # --- Ensure Gitea protocol mappers have config ---
                     # (realm import sometimes stores empty config objects)
                     GID=$($KC get clients -r {{ .Values.keycloak.realm }} -q clientId=gitea --fields id --format csv --noquotes 2>/dev/null | tail -1)

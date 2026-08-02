@@ -339,7 +339,7 @@ The `test` user is pre-seeded in the Keycloak realm with `admin` + `user` roles,
 | `https://api.localhost/`    | Orchestrator REST API |
 | `https://auth.localhost/`   | Keycloak (admin console at `/admin`) |
 | `https://git.localhost/`    | Gitea |
-| `https://cloud.localhost/`  | OpenCloud |
+| `https://cloud.localhost/`  | Nextcloud (the main cloud backend) |
 | `https://mcp.localhost/`    | MCP server |
 
 `*.localhost` resolves to `::1` automatically (RFC 6761 + glibc `myhostname` NSS), so there's no DNS config to do.
@@ -374,7 +374,9 @@ kubectl --context=k3d-srw -n srw get pods -l app.kubernetes.io/component=workspa
 
 **4. Gitea SSO** — open `https://git.localhost/`, click **Sign In** → **Sign in with Keycloak**. Should land on `test - Dashboard` without a manual credentials step.
 
-**5. OpenCloud SSO** — open `https://cloud.localhost/`. Should redirect through Keycloak and land on `Personal - OpenCloud` (`/files/spaces/personal/test`). If you land on `/access-denied`, the OpenCloud OIDC workaround isn't applied — see Troubleshooting (almost always: stale `hostAliases` IP).
+**5. Nextcloud SSO** — open `https://cloud.localhost/`, click **Log in with Keycloak**. Should land on the Files view. A plain `curl -sk https://cloud.localhost/status.php` is the cheaper check that the pod and Ingress are healthy (`"installed":true`).
+
+> The local stack runs **Nextcloud**, not OpenCloud (`nextcloud.enabled=true` + `opencloud.enabled=false` in `values-local.yaml.example`). Sections below that describe an OpenCloud `hostAliases` workaround are leftovers from before that switch and no longer apply — the example values file has no `hostAliases` block.
 
 ### Daily usage
 

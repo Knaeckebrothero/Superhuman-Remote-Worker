@@ -368,6 +368,54 @@ spec:
                   number: 9200
 ---
 {{- end }}
+{{- if and .Values.nextcloud.enabled .Values.nextcloud.internal (not .Values.opencloud.enabled) }}
+# Nextcloud (cloud storage) — same $cloudHost as the OpenCloud Ingress above,
+# so the two are mutually exclusive. The `not opencloud.enabled` guard mirrors
+# the MAIN_CLOUD_BACKEND precedence in configmap.yaml (opencloud wins when both
+# are on); without it a both-enabled values file would render two Ingresses
+# claiming one host and Traefik would pick a winner arbitrarily.
+# Only the bundled backend gets an Ingress: with `internal: false` the
+# Nextcloud lives outside the release and brings its own routing.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ $fullName }}-nextcloud-ingress
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "nextcloud") | nindent 4 }}
+  annotations:
+    {{- if and .Values.ingress.tls.enabled .Values.ingress.tls.issuerName }}
+    cert-manager.io/cluster-issuer: {{ .Values.ingress.tls.issuerName }}
+    {{- end }}
+    {{- if .Values.ingress.tls.enabled }}
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+    traefik.ingress.kubernetes.io/router.tls: "true"
+    {{- else }}
+    traefik.ingress.kubernetes.io/router.entrypoints: web
+    {{- end }}
+    {{- with .Values.ingress.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  ingressClassName: {{ .Values.ingress.className }}
+  {{- if .Values.ingress.tls.enabled }}
+  tls:
+    - hosts:
+        - {{ $cloudHost }}
+      secretName: {{ $fullName }}-nextcloud-tls
+  {{- end }}
+  rules:
+    - host: {{ $cloudHost }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ $fullName }}-nextcloud
+                port:
+                  number: 80
+---
+{{- end }}
 {{- if and .Values.databases.neo4j.enabled .Values.databases.neo4j.browser.enabled }}
 # Neo4j browser UI
 apiVersion: networking.k8s.io/v1
