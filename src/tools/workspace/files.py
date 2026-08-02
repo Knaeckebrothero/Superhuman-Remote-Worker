@@ -12,7 +12,8 @@ Enhanced with visual content support:
 import base64
 import logging
 import mimetypes
-from pathlib import Path
+import zipfile
+from pathlib import Path, PurePosixPath
 from typing import Any, Dict, List, Literal, Optional
 
 from langchain_core.tools import tool
@@ -48,6 +49,15 @@ AUDIO_EXTENSIONS = {
 
 # Document extensions that support visual rendering
 VISUAL_DOCUMENT_EXTENSIONS = {".pdf", ".pptx", ".docx"}
+
+# Archive extensions read_file lists entries for instead of attempting to
+# decode as text. Scoped to zip for now — the only format the session/worker
+# upload paths extract (docs/issues/session_uploads_never_extract_archives.md).
+ARCHIVE_EXTENSIONS = {".zip"}
+
+# Bound the entry listing for a large archive — read_file's job is to tell
+# the agent what's inside, not to reproduce a multi-thousand-entry manifest.
+MAX_ARCHIVE_LISTING_ENTRIES = 200
 
 # Tool metadata for registry
 # Phase availability: file tools are available in both strategic and tactical modes
@@ -157,6 +167,50 @@ def _is_audio_file(file_path: Path) -> bool:
 def _is_visual_document(file_path: Path) -> bool:
     """Check if file is a document that supports visual rendering."""
     return file_path.suffix.lower() in VISUAL_DOCUMENT_EXTENSIONS
+
+
+def _is_archive_file(file_path: Path) -> bool:
+    """Check if file is an archive read_file should list rather than decode."""
+    return file_path.suffix.lower() in ARCHIVE_EXTENSIONS
+
+
+def _describe_zip_archive(local_path: Path, display_name: str, size: int) -> str:
+    """Build an entry listing for a zip archive instead of its raw bytes.
+
+    Falls back to the generic binary message when ``local_path`` wears a
+    ``.zip`` extension but isn't actually a readable archive — a corrupt
+    upload or a renamed non-zip file fails cleanly either way, never with a
+    stack trace or a raw codec error.
+    """
+    try:
+        with zipfile.ZipFile(local_path) as zf:
+            infos = [
+                info
+                for info in zf.infolist()
+                if not info.is_dir()
+                and "__MACOSX" not in PurePosixPath(info.filename).parts
+                and not any(
+                    part.startswith(".") for part in PurePosixPath(info.filename).parts
+                )
+            ]
+    except Exception as e:
+        logger.debug(f"Could not list zip entries for {display_name}: {e}")
+        return f"[binary file: {display_name}, {size:,} bytes]"
+
+    lines = [f"Archive: {display_name} — {len(infos)} file(s), {size:,} bytes"]
+    lines.append("")
+    shown = infos[:MAX_ARCHIVE_LISTING_ENTRIES]
+    for info in shown:
+        lines.append(f"{info.file_size:>12,}  {info.filename}")
+    remaining = len(infos) - len(shown)
+    if remaining > 0:
+        lines.append(f"… and {remaining} more")
+    lines.append("")
+    lines.append(
+        "This is a zip archive — read_file lists its entries but cannot "
+        "show file contents directly."
+    )
+    return "\n".join(lines)
 
 
 def create_file_tools(context: ToolContext) -> List[Any]:
@@ -765,6 +819,13 @@ def create_file_tools(context: ToolContext) -> List[Any]:
         - Supports offset/limit paging like text files
         - Large files are automatically chunked for transcription
 
+        For archives (ZIP):
+        - Returns an entry listing (names, sizes, count) instead of contents
+
+        For any other binary file:
+        - Returns a `[binary file: name, N bytes]` message rather than a
+          decode error
+
         Args:
             path: Relative path to the file (e.g., "plan.md")
             offset: For text files: starting line number (1-indexed, default: 1)
@@ -778,6 +839,8 @@ def create_file_tools(context: ToolContext) -> List[Any]:
             For documents: includes text + visual content descriptions.
             For images: includes image data or description.
             For audio: includes text transcription of spoken content.
+            For archives: an entry listing. For other binaries: a short
+            descriptive message.
         """
         try:
             cache_guard_msg = _cloud_cache_guard_for_path(context, path)
@@ -828,6 +891,20 @@ def create_file_tools(context: ToolContext) -> List[Any]:
                     context.record_file_read(path)
                 return result
 
+            # Handle archives (zip): an entry listing beats a raw codec error
+            # and lets the agent ask for a specific member instead of
+            # searching the workspace for an "unzip" capability that isn't
+            # coming (docs/issues/session_uploads_never_extract_archives.md).
+            if _is_archive_file(full_path):
+                with workspace.local_copy(path) as local_path:
+                    archive_size = local_path.stat().st_size
+                    result = _describe_zip_archive(
+                        local_path, full_path.name, archive_size
+                    )
+                if not result.startswith("Error:"):
+                    context.record_file_read(path)
+                return result
+
             # For non-document files, page parameters are ignored
             if page_start is not None or page_end is not None:
                 logger.warning(
@@ -842,8 +919,16 @@ def create_file_tools(context: ToolContext) -> List[Any]:
             if start_line < 1:
                 return "Error: offset must be >= 1 (line numbers are 1-indexed)"
 
-            # Read file content
-            content = workspace.read_file(path)
+            # Read file content. Detect binary content up front: an
+            # undecodable file raises UnicodeDecodeError, a ValueError
+            # subclass, which the generic handler below would otherwise
+            # report as a bare codec message instead of an honest diagnosis.
+            try:
+                content = workspace.read_file(path)
+            except UnicodeDecodeError:
+                size = workspace.get_size(path)
+                context.record_file_read(path)
+                return f"[binary file: {full_path.name}, {size:,} bytes]"
             lines = content.splitlines()
             total_lines = len(lines)
 
