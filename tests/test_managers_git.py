@@ -835,6 +835,60 @@ class TestParseShellRunOutput:
         assert result.returncode == 128
         assert "fatal" in result.stdout
 
+    def test_parse_success_with_cwd_header(self):
+        """The `CWD:` line f41970ae added must not leak into stdout.
+
+        Regression guard for the defect that lost job bbce4bed's deliverable:
+        the parser assumed `--- stdout ---` was the first line after
+        `Exit code:`, fell through to `stdout = rest`, and handed callers the
+        whole banner as command output.
+        """
+        gm = self._make_gm()
+        output = "Exit code: 0\nCWD: /home/agent-host/workspace\n--- stdout ---\nmain"
+        result = gm._parse_shell_run_output(output, ["branch", "--show-current"])
+        assert result.returncode == 0
+        assert result.stdout.strip() == "main"
+        assert "CWD:" not in result.stdout
+
+    def test_parse_no_output_with_cwd_header(self):
+        """The empty sentinel still reads as empty once a header precedes it."""
+        gm = self._make_gm()
+        output = "Exit code: 0\nCWD: /home/agent-host/workspace\n(no output)"
+        result = gm._parse_shell_run_output(output, ["add", "-A"])
+        assert result.returncode == 0
+        assert result.stdout == ""
+
+    def test_parse_multiline_stdout_with_cwd_header(self):
+        """Payload after the marker survives intact, newlines included."""
+        gm = self._make_gm()
+        output = (
+            "Exit code: 0\nCWD: /home/agent-host/workspace\n"
+            "--- stdout ---\nline one\nline two"
+        )
+        result = gm._parse_shell_run_output(output, ["log"])
+        assert result.stdout == "line one\nline two"
+
+    def test_failure_surfaces_output_as_stderr(self):
+        """Callers log result.stderr on failure — it must not be empty.
+
+        `git push failed: ` with nothing after the colon is what made this
+        regression invisible for a day.
+        """
+        gm = self._make_gm()
+        output = (
+            "Exit code: 128\nCWD: /home/agent-host/workspace\n"
+            "--- stdout ---\nfatal: invalid refspec ''"
+        )
+        result = gm._parse_shell_run_output(output, ["push"])
+        assert result.returncode == 128
+        assert "invalid refspec" in result.stderr
+
+    def test_success_leaves_stderr_empty(self):
+        """A clean run reports no error text."""
+        gm = self._make_gm()
+        output = "Exit code: 0\nCWD: /ws\n--- stdout ---\nfine"
+        assert gm._parse_shell_run_output(output, ["status"]).stderr == ""
+
     def test_parse_timeout(self):
         """Parse timeout output (no Exit code prefix)."""
         gm = self._make_gm()
