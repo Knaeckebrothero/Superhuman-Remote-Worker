@@ -361,6 +361,83 @@ was deliberately left out of v1. The invariant "every job leaves a record, alway
 aspirational until that lands; treat absence of a record as "didn't exit through /complete", not
 "didn't run".
 
+### 6.6 Terminal-transition side effects — merge ad-hoc jobs too (2026-08-01)
+
+**The gap.** `provision_job_repo` (`orchestrator/services/job_provisioning.py`) cuts a
+`job/<short_id>` branch from `main` for **every** project job — its docstring is explicit
+that "EVERY job-creation path — the HTTP handler, cron automations, and the run-now button"
+provisions identically, and `loop_floor` only seeds a `.gitignore`. But
+`_merge_and_retro_loop_job` is reachable **only** from loop advance. So a user-scheduled
+project job branches, commits to that branch via `ProgressCommitter`, and then nobody ever
+merges it. Its work sits on `job/abc12345` indefinitely.
+
+Worse, `approve_job` (`orchestrator/main.py:11359`) does its own raw
+`UPDATE jobs SET status = 'completed'` at `:11494` rather than routing through the `/complete`
+handler. So it triggers neither the merge **nor** the §6.5 change-record hook — this is the
+"/complete-only" coverage gap already noted in 6.5, seen from the approval side. An approved
+job today leaves no record at all.
+
+**Design: hook the terminal transition, not "approval".** The obvious move — merge when the
+user approves — moves the hole rather than closing it: jobs with autonomy `full` never enter
+`pending_review`, so they would still never merge. Instead, attach both side effects to the
+terminal status transition (`new_status in ("completed", "failed")`), which is where the
+change record already hooks. Then:
+
+- **`review` autonomy** — the job waits in `pending_review`; approval *is* the transition to
+  `completed`, so the merge happens on approval, which is the human gate that was wanted.
+- **`full` autonomy** — the transition is automatic and the merge rides along, consistent
+  with loop jobs today.
+
+One code path, the gate preserved where the user asked for one, no hole where they didn't.
+
+**Policy for jobs with no contract — deliberately not a full merge.**
+`merge_loop_job_contribution` falls back to a full squash-merge when `required_deliverables`
+names no files. For an ad-hoc job that fallback would land the entire scratchpad — `plan.md`,
+`todos.yaml`, phase archives, loose probe files — on `main`, which is exactly the accumulation
+§6.4 exists to stop. So:
+
+| Job has a file contract | Behaviour on terminal transition |
+|---|---|
+| yes | curated merge of the contracted files + change record |
+| no  | change record only; the branch stays, unmerged |
+
+Nothing is lost in the second case: the record is written to `main` and names the branch, so
+the work is discoverable. It also gives `required_deliverables` a real incentive — declare a
+contract and your output lands on `main`; don't, and it stays on the branch.
+
+**Invariants to preserve.**
+
+- **Loop jobs must not double-merge.** They already merge during loop advance; the existing
+  `merge_status in ("merged", "curated")` idempotency backstop covers a second call, and
+  `write_job_change_record` already skips loop jobs (their retro is the record).
+- **Rejection must not merge.** `POST /api/jobs/{job_id}/reject` (`main.py:16839`) is the
+  counterpart to approve; a rejected job's branch stays as it is.
+- **Best-effort, never blocking.** A merge failure must not fail approval or completion —
+  same posture as the change-record hook.
+- **Subjobs are out of scope.** They branch from the parent (`subjob/<id>/<role>`) and merge
+  into the parent's branch through the existing delegation path, not into project `main`.
+
+**Implementation status (2026-08-01): built** —
+`services.completion.apply_terminal_job_side_effects(job, new_status, *, gitea, db,
+vector_db, error)` is the single function; both terminal paths call it and nothing else
+(`approve_job` right after its status UPDATE, hook "5d2" in `/complete` in place of the
+bare record call). The merge gate is the pure
+`should_merge_job_contribution(job, new_status) -> (bool, reason)`; the contract predicate
+is `job_has_file_contract`, which *imports* the merge's own
+`contracted_file_deliverables` (renamed public in `project_loops.py`) rather than
+re-deriving it — a disagreement between the two would send a contract-less job into the
+full squash-merge path, i.e. the whole scratchpad onto `main`. The merge itself is still
+`merge_loop_job_contribution`; there is one merge implementation. Outcome
+(`merge_status`/`merged_sha`) is stamped on the row and flows into the record, which is
+why the second terminal call on one job is a no-op. **One deliberate narrowing vs. the
+table above:** only `completed` merges — a `failed` job gets the record but keeps its
+branch, matching `_merge_and_retro_loop_job` (`if not failed:`) so a half-written
+deliverable from a crashed run never reaches shared history. Known cosmetic gap: the
+closed audit PR's comment names the *loop* record path (`retros/000-<role>-<jobid8>.md`)
+for ad-hoc jobs, because the merge builds it from an empty loop ctx; the real record is
+`retros/<ts>-<role>-<jobid8>.md`, same directory and same `-<jobid8>.md` suffix. Pinned by
+tests/test_terminal_side_effects.py (incl. both handlers driven for real and compared).
+
 ## 7. Sequencing
 
 Ordered so each step is independently useful and nothing blocks on the largest piece.
