@@ -12,6 +12,10 @@ import pytest
 from src.core.capability_grants import CATALOG, evaluate
 from src.core.session_tool_overrides import SESSION_TOOL_OVERRIDE_NAMES
 from src.core.tool_report import (
+    MEASURED_ORIGINS,
+    ORIGIN_AGENT,
+    ORIGIN_AGENT_PARTIAL,
+    ORIGIN_PREDICTION,
     DECIDED_BY_BACKEND,
     DECIDED_BY_GRANT,
     DECIDED_BY_REGISTRY,
@@ -271,11 +275,12 @@ class TestMeasurementWins:
         assert view["core"]["decided_by"] == DECIDED_BY_RUNTIME
 
     def test_agent_answer_overrides_a_config_that_promised_tools(self):
+        """And the shortfall reads UNAVAILABLE, not off — see TestOffIsAPromise."""
         view = compose_tool_view(
             measured={},
             configured={"research": ["web_search"]},
         )
-        assert view["research"]["state"] == STATE_OFF
+        assert view["research"]["state"] == STATE_UNAVAILABLE
         assert view["research"]["tools"] == []
         assert view["research"]["configured"] == ["web_search"]
 
@@ -292,6 +297,69 @@ class TestMeasurementWins:
         view = compose_tool_view(measured=None, configured={"research": ["web_search"]})
         assert "configured" not in view["research"]
         assert view["research"]["tools"] == ["web_search"]
+
+
+class TestOffIsAPromise:
+    """``off`` means "ticking would work". It is only said when it can be kept.
+
+    The live gate produced the counterexample: ``knowledge`` measured
+    ``configured=10 kb_*, tools=0`` and rendered ``off, settable: true`` — a
+    checkbox offering an "on" that writes config and changes no binding.
+    """
+
+    def test_config_granted_but_agent_bound_none_is_unavailable(self):
+        view = compose_tool_view(
+            measured={"knowledge": []},
+            configured={"knowledge": ["kb_read", "kb_write"]},
+        )
+        entry = view["knowledge"]
+        assert entry["state"] == STATE_UNAVAILABLE
+        assert entry["settable"] is False
+        assert "bound none" in entry["reason"]
+        assert "2 tool(s)" in entry["reason"]
+
+    def test_it_fires_without_any_legible_cause(self):
+        """The point: no backend, no grant, no code mark — still honest.
+
+        A degraded agent report carries no ``backend``, so the tier gate is
+        invisible. The tools are measurably absent regardless, and that is
+        enough to refuse the promise.
+        """
+        view = compose_tool_view(
+            measured={"git": []},
+            configured={"git": ["git_log", "git_status"]},
+            backend_caps=None,
+            grants=None,
+        )
+        assert view["git"]["state"] == STATE_UNAVAILABLE
+        assert view["git"]["settable"] is False
+
+    def test_a_legible_cause_still_wins_the_message(self):
+        view = compose_tool_view(
+            measured={"git": []},
+            configured={"git": ["git_log"]},
+            backend_caps={"supports_shell": False},
+        )
+        assert view["git"]["reason"].startswith("this workspace tier")
+
+    def test_config_empty_and_agent_empty_stays_off(self):
+        """Nothing asked, nothing refused — the control is genuinely offerable."""
+        view = compose_tool_view(measured={"citation": []}, configured={"citation": []})
+        assert view["citation"]["state"] == STATE_OFF
+        assert view["citation"]["settable"] is True
+        assert view["citation"]["reason"] is None
+
+    def test_a_prediction_never_claims_the_shortfall(self):
+        """No measurement means no evidence the binding failed."""
+        view = compose_tool_view(measured=None, configured={"knowledge": ["kb_read"]})
+        assert view["knowledge"]["state"] == STATE_ON
+
+    def test_partial_bind_is_on_not_unavailable(self):
+        view = compose_tool_view(
+            measured={"research": ["web_search"]},
+            configured={"research": ["web_search", "crawl_website"]},
+        )
+        assert view["research"]["state"] == STATE_ON
 
 
 class TestThreeStates:
@@ -420,3 +488,14 @@ class TestCategoriesOutsideTheVocabulary:
     def test_every_known_category_appears_even_with_no_data(self):
         view = compose_tool_view(measured={}, configured={})
         assert set(report_categories()) <= set(view)
+
+
+class TestOriginVocabulary:
+    def test_both_agent_origins_count_as_measured(self):
+        assert MEASURED_ORIGINS == {ORIGIN_AGENT, ORIGIN_AGENT_PARTIAL}
+
+    def test_prediction_is_not_measured(self):
+        assert ORIGIN_PREDICTION not in MEASURED_ORIGINS
+
+    def test_the_three_origins_are_distinct(self):
+        assert len({ORIGIN_AGENT, ORIGIN_AGENT_PARTIAL, ORIGIN_PREDICTION}) == 3

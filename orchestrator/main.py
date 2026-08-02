@@ -284,6 +284,7 @@ from src.core.session_tool_overrides import (  # noqa: E402
 )
 from src.core.tool_report import (  # noqa: E402
     ORIGIN_AGENT,
+    ORIGIN_AGENT_PARTIAL,
     ORIGIN_PREDICTION,
     ToolReportError,
     categorize_tool_names,
@@ -1770,16 +1771,26 @@ async def _resolve_session_config(
         return None
 
 
-#: Budget for the agent toolset probe. The cockpit blocks its settings pane on
-#: this endpoint, so an unreachable pod must degrade to a labelled prediction
-#: quickly rather than stall the pane. Matches the ``/session/status`` probe.
-_AGENT_TOOLSET_TIMEOUT_S = 3.0
+#: TOTAL wall-clock budget for the agent toolset probe, both hops included.
+#: Enforced with ``asyncio.wait_for``, not with httpx's timeout: httpx's is
+#: per-operation, so a 404 on ``/session/toolset`` followed by the ``/status``
+#: fallback would otherwise cost two full budgets, and a pod trickling bytes
+#: could exceed either without ever tripping one. The cockpit blocks its
+#: settings pane on this endpoint, so the bound has to be a real deadline.
+_AGENT_TOOLSET_BUDGET_S = 3.0
 
-#: Agent rows in these states keep a ``pod_ip`` that no longer routes. NOT the
-#: complement of ``session``: an agent is ``ready`` for up to one heartbeat
-#: interval after attach, and skipping the probe there would report a
-#: prediction for the first minute of every session.
+#: Agent rows in these states keep a ``pod_ip`` that no longer routes.
 _AGENT_TERMINAL_STATUSES = frozenset({"offline", "failed", "completed"})
+
+#: Registered but not yet serving: nothing is bound, so there is nothing to
+#: measure and the probe would only spend budget discovering that. Kept apart
+#: from the terminal set so the reason we report is the true one.
+_AGENT_PREREADY_STATUSES = frozenset({"booting"})
+
+#: NOTE on what is deliberately NOT skipped: ``ready``. An agent stays ``ready``
+#: for up to one heartbeat interval (60s) after attach, so gating the probe on
+#: ``status == "session"`` would report a prediction for the first minute of
+#: every session — the exact silently-wrong answer this endpoint removes.
 
 
 def _merged_session_tool_groups(
@@ -2003,10 +2014,49 @@ class _Measurement(NamedTuple):
     observed_at: str | None
     backend: dict[str, Any] | None
     reason: str | None
+    #: True when the agent gave us bound tool NAMES but none of the structure
+    #: around them — no timestamp, no workspace capabilities, no agent-side
+    #: categorisation. Surfaced as ``origin: "agent_partial"`` so a caller
+    #: cannot read a missing ``backend`` as "this tier gates nothing".
+    partial: bool = False
 
 
 def _unmeasured(reason: str) -> "_Measurement":
     return _Measurement(None, None, None, reason)
+
+
+def _origin_fields(m: "_Measurement") -> dict[str, Any]:
+    """The provenance block every tool-groups answer carries.
+
+    One function so the thread endpoint and the preview route cannot describe
+    their own trustworthiness differently. ``origin`` is the discriminator:
+
+    - ``agent``          full structured report; ``observed_at`` + ``backend`` set
+    - ``agent_partial``  bound names only (an image predating the route); the
+                         names are trustworthy, everything around them absent
+    - ``prediction``     no measurement at all
+
+    ``degraded_reason`` is set only on ``agent_partial`` and says what is
+    missing. It is deliberately a different key from ``prediction_reason`` —
+    "measured but thin" and "not measured" are different facts, and a caller
+    that conflates them will render a workspace-tier explanation it does not
+    have.
+    """
+    if m.categories is None:
+        return {
+            "origin": ORIGIN_PREDICTION,
+            "observed_at": None,
+            "prediction_reason": m.reason,
+            "degraded_reason": None,
+            "backend": None,
+        }
+    return {
+        "origin": ORIGIN_AGENT_PARTIAL if m.partial else ORIGIN_AGENT,
+        "observed_at": m.observed_at,
+        "prediction_reason": None,
+        "degraded_reason": m.reason if m.partial else None,
+        "backend": m.backend,
+    }
 
 
 async def _agent_toolset_measurement(thread: dict[str, Any]) -> "_Measurement":
@@ -2018,8 +2068,9 @@ async def _agent_toolset_measurement(thread: dict[str, Any]) -> "_Measurement":
     fallback) lives in the agent process, and a second implementation of that
     here would drift — which is the original bug in this series.
 
-    Short timeout and no retry: this backs a settings pane, and a slow answer
-    that is *labelled* a prediction beats a fast pane that stalls on a dead pod.
+    Hard total deadline and no retry: this backs a settings pane, and a slow
+    answer that is *labelled* a prediction beats a fast pane that stalls on a
+    dead pod.
     """
     agent_id = thread.get("agent_id")
     if not agent_id:
@@ -2031,16 +2082,36 @@ async def _agent_toolset_measurement(thread: dict[str, Any]) -> "_Measurement":
         return _unmeasured("the bound agent could not be looked up")
     if not agent or not agent.get("pod_ip"):
         return _unmeasured("the bound agent has no reachable address")
-    if agent.get("status") in _AGENT_TERMINAL_STATUSES:
+    status = agent.get("status")
+    if status in _AGENT_TERMINAL_STATUSES:
         # A stale binding: the row keeps its pod_ip after the pod is gone, so
-        # probing it burns the whole timeout on the settings pane's critical
+        # probing it burns the whole budget on the settings pane's critical
         # path. Observed on k3d — an ended session left `offline` + a pod_ip
         # that no longer routes.
-        return _unmeasured(f"the bound agent is {agent['status']}")
+        return _unmeasured(f"the bound agent is {status}")
+    if status in _AGENT_PREREADY_STATUSES:
+        return _unmeasured(f"the bound agent is still {status}")
 
+    # ONE deadline across both hops. See _AGENT_TOOLSET_BUDGET_S.
+    try:
+        return await asyncio.wait_for(
+            _agent_toolset_probe(agent), _AGENT_TOOLSET_BUDGET_S
+        )
+    except (asyncio.TimeoutError, TimeoutError):
+        logger.info("Toolset probe to agent %s exceeded its budget", agent_id)
+        return _unmeasured("the agent did not answer within the probe budget")
+
+
+async def _agent_toolset_probe(agent: dict[str, Any]) -> "_Measurement":
+    """The network half of :func:`_agent_toolset_measurement`.
+
+    Split out so ONE ``asyncio.wait_for`` bounds the whole thing — including
+    the ``/status`` fallback, which is the normal path against any agent image
+    predating ``/session/toolset``.
+    """
     url = f"http://{agent['pod_ip']}:{agent.get('pod_port') or 8001}/session/toolset"
     try:
-        async with httpx.AsyncClient(timeout=_AGENT_TOOLSET_TIMEOUT_S) as client:
+        async with httpx.AsyncClient(timeout=_AGENT_TOOLSET_BUDGET_S) as client:
             response = await client.get(url)
     except Exception as exc:
         logger.info("Toolset probe to %s failed: %s", url, exc)
@@ -2086,7 +2157,7 @@ async def _agent_toolset_from_status(agent: dict[str, Any]) -> "_Measurement":
     """
     url = f"http://{agent['pod_ip']}:{agent.get('pod_port') or 8001}/status"
     try:
-        async with httpx.AsyncClient(timeout=_AGENT_TOOLSET_TIMEOUT_S) as client:
+        async with httpx.AsyncClient(timeout=_AGENT_TOOLSET_BUDGET_S) as client:
             response = await client.get(url)
         if response.status_code != 200:
             return _unmeasured("the agent has no toolset endpoint")
@@ -2100,7 +2171,12 @@ async def _agent_toolset_from_status(agent: dict[str, Any]) -> "_Measurement":
         categories=categorize_tool_names([n for n in names if isinstance(n, str)]),
         observed_at=None,
         backend=None,
-        reason=None,
+        reason=(
+            "this agent image predates GET /session/toolset, so only the bound "
+            "tool names are available — no observation time, no workspace "
+            "capabilities, and MCP tools cannot be categorised"
+        ),
+        partial=True,
     )
 
 
@@ -24263,8 +24339,16 @@ async def get_thread_tool_groups(thread_id: str, request: Request) -> dict[str, 
 
     ``origin`` is the field that matters, and callers MUST branch on it:
 
-    - ``agent`` — **measured**. A running pod enumerated its bound tools.
-      ``observed_at`` is set.
+    - ``agent`` — **measured, in full**. A running pod enumerated its bound
+      tools and returned the structured report. ``observed_at`` and ``backend``
+      are set.
+    - ``agent_partial`` — **measured, names only**. The pod answered but its
+      image predates ``GET /session/toolset``, so the bound names come from
+      ``/status`` with no timestamp, no workspace capabilities and no
+      agent-side categorisation. ``degraded_reason`` says so. The names are as
+      trustworthy as ``agent``; do NOT render a workspace-tier explanation from
+      this answer, and do NOT infer measured-ness from ``observed_at``, which
+      is legitimately null here.
     - ``prediction`` — **forecast** from the merged config, because there is no
       agent to ask (a new session, a suspended one, an unreachable pod).
       ``prediction_reason`` says which. Structurally weaker, not merely older:
@@ -24276,6 +24360,11 @@ async def get_thread_tool_groups(thread_id: str, request: Request) -> dict[str, 
     ``settable``, ``decided_by`` (the layer that produced the answer) and
     ``tools``. Measured entries also carry ``configured``, so a caller can see
     the merge and the measurement disagree instead of having to trust one.
+
+    ``off`` is a promise that ticking the box would work, and it is only made
+    when it can be kept: on a measurement, a category whose merged config
+    grants tools while the agent bound none is ``unavailable``. See
+    ``compose_tool_view``.
 
     ``source`` is unchanged and still describes the PREDICTION's model —
     ``resolved`` / ``legacy`` / ``error``. It says nothing about ``origin``:
@@ -24349,10 +24438,7 @@ async def get_thread_tool_groups(thread_id: str, request: Request) -> dict[str, 
                 return {
                     "thread_id": thread_id,
                     "source": "error",
-                    "origin": ORIGIN_PREDICTION,
-                    "observed_at": None,
-                    "prediction_reason": m.reason,
-                    "backend": None,
+                    **_origin_fields(m),
                     "tool_groups": None,
                     "categories": None,
                 }
@@ -24368,14 +24454,10 @@ async def get_thread_tool_groups(thread_id: str, request: Request) -> dict[str, 
         backend_caps=m.backend,
         grants=grants,
     )
-    measured_ok = m.categories is not None
     return {
         "thread_id": thread_id,
         "source": source,
-        "origin": ORIGIN_AGENT if measured_ok else ORIGIN_PREDICTION,
-        "observed_at": m.observed_at,
-        "prediction_reason": None if measured_ok else m.reason,
-        "backend": m.backend,
+        **_origin_fields(m),
         "tool_groups": tool_groups_from_view(view),
         "categories": view,
     }
@@ -24403,6 +24485,14 @@ async def preview_tool_groups(
     (two routes, one of which cannot ever say "measured") is cheaper to keep
     honest than a flag someone forgets to read.
 
+    ``source`` models the same three agent paths as the thread endpoint and is
+    NOT hardcoded: with the experts feature or the per-user kill switch off, a
+    created session takes the legacy path, where the four closed groups are
+    APPENDED unless explicitly disabled — the opposite of the resolved path for
+    an unset group. Predicting "off" and labelling it ``resolved`` on such a
+    deployment would be this series' own defect, rebuilt in the form that
+    predicts it.
+
     Same ``categories`` shape as the thread endpoint, so one renderer serves
     both surfaces.
     """
@@ -24413,8 +24503,9 @@ async def preview_tool_groups(
 
     expert_row = None
     project_overrides = None
+    legacy = not _is_experts_db_enabled() or not await _user_experts_enabled()
     try:
-        if body.expert_id:
+        if body.expert_id and not legacy:
             expert_row = await postgres_db.get_expert_by_id(str(body.expert_id))
             if body.project_id:
                 link = await postgres_db.get_project_expert_link(
@@ -24428,13 +24519,18 @@ async def preview_tool_groups(
         logger.warning("Tool-group preview could not load the expert/project layer")
 
     try:
-        configured, provenance = await asyncio.to_thread(
-            _merged_session_tool_policy,
-            base_config_name=base,
-            expert_row=expert_row,
-            project_overrides=project_overrides,
-            request_override=body.config_override or None,
-        )
+        if legacy:
+            configured, provenance = await asyncio.to_thread(
+                _legacy_session_tool_policy, base, body.config_override or None
+            )
+        else:
+            configured, provenance = await asyncio.to_thread(
+                _merged_session_tool_policy,
+                base_config_name=base,
+                expert_row=expert_row,
+                project_overrides=project_overrides,
+                request_override=body.config_override or None,
+            )
     except Exception:
         logger.exception("Tool-group preview resolve failed")
         raise HTTPException(
@@ -24460,11 +24556,8 @@ async def preview_tool_groups(
         grants=grants,
     )
     return {
-        "source": "resolved",
-        "origin": ORIGIN_PREDICTION,
-        "observed_at": None,
-        "prediction_reason": "no agent exists for an unsaved session",
-        "backend": None,
+        "source": "legacy" if legacy else "resolved",
+        **_origin_fields(_unmeasured("no agent exists for an unsaved session")),
         "tool_groups": tool_groups_from_view(view),
         "categories": view,
     }
