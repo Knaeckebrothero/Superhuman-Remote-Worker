@@ -54,11 +54,32 @@ def test_validate_fragment_blocks_connections():
     assert ei.value.status_code == 422
 
 
-def test_validate_fragment_allows_clean_config():
-    # Should not raise.
-    _validate_expert_fragment(
-        {"llm": {"model": "gemma-4-moe"}, "tools": {"shell": True}}
-    )
+def test_validate_fragment_allows_clean_config_and_canonicalises_tools():
+    """Should not raise, and returns the fragment with `tools` normalised — the
+    caller persists what comes back, so a row never holds a policy value the
+    save-time PDP would read backwards."""
+    assert _validate_expert_fragment(
+        {
+            "llm": {"model": "gemma-4-moe"},
+            "tools": {"shell": ["run_command"], "git": []},
+        }
+    ) == {
+        "llm": {"model": "gemma-4-moe"},
+        "tools": {"shell": ["run_command"], "git": []},
+    }
+
+
+def test_validate_fragment_runs_the_shared_tool_gate():
+    """The fragment gate is now the same one every other write boundary runs
+    (400, not 422): `shell` must enumerate, and a cross-category smuggle is
+    refused. See tests/test_tool_override_boundary.py::TestExpertWriteBoundary."""
+    with pytest.raises(HTTPException) as ei:
+        _validate_expert_fragment({"tools": {"shell": True}})
+    assert ei.value.status_code == 400
+
+    with pytest.raises(HTTPException) as ei:
+        _validate_expert_fragment({"tools": {"canvas": ["run_command"]}})
+    assert ei.value.status_code == 400
 
 
 # --- T2: update contract (immutable name/type; unset fields dropped) ---

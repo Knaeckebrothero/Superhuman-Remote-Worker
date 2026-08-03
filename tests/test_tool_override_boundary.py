@@ -27,7 +27,7 @@ be real and every name in it must belong to that category *per the registry*.
 Anything the boundary will not honour is **rejected with a 400** — never
 silently dropped, which would only replace one silent drop with another.
 
-Six boundaries, and the coverage below is deliberately split between the
+Seven boundaries, and the coverage below is deliberately split between the
 validator and each **call site**, because the defect was a filter at the call
 site and a validator-level test cannot see one being re-narrowed:
 
@@ -40,6 +40,7 @@ Boundary                         Call-site class
 ``POST /sessions/{id}/prepare``  ``TestPrepareBoundary``
 ``POST``/``PATCH /automations``  ``TestAutomationBoundary``
 ``POST``/``PATCH /projects``     ``TestProjectDefaultOverrideBoundary``
+``/api/experts`` (five writes)   ``TestExpertWriteBoundary``
 ===============================  ==========================================
 
 What this validator is NOT: an authorization gate. Capability grants
@@ -53,6 +54,7 @@ from __future__ import annotations
 
 import uuid
 from contextlib import ExitStack
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -1222,3 +1224,271 @@ class TestNoModelAuthoredPathReachesSessionCreate:
         src = Path("src/tools/orchestrator/jobs.py").read_text()
         assert "async def create_worker_job(" in src
         assert "config_override: Optional[Dict[str, Any]] = None," in src
+
+
+# =============================================================================
+# The expert boundary — the one the "every write boundary" pass missed
+# =============================================================================
+
+BUNDLED_EXPERT_CONFIGS = sorted(
+    p.parent.name for p in Path("config/experts").glob("*/config.yaml")
+)
+
+
+class TestExpertWriteBoundary:
+    """An expert's `config` is an authored config layer, and until now the only
+    thing standing in front of it was a *credential* deny-scan plus the grants
+    PDP. Neither can see a cross-category smuggle: the PDP keys off the category
+    (`_truthy(tools.get("shell"))`), and `load_tools` regroups by REGISTRY
+    category — so `tools.canvas: ["run_command"]` stored here binds a shell tool
+    with no `shell_tools` grant, for every job and session the expert drives.
+
+    Five writes, not four. `POST /api/experts/{id}/duplicate` had neither gate:
+    it forks a *visible* row, which may be another principal's, so it is the one
+    path that can propagate a stored smuggle into a new row.
+
+    Second, quieter failure this closes: a stored fragment is normalised on the
+    way OUT (`expert_resolution.build_expert_config`), so a shape
+    `normalize_tool_policy` refuses — `tools.shell: true` — was storable and
+    then made the expert unresolvable. Refusing at write turns a later 500 into
+    an immediate 400.
+    """
+
+    @pytest.fixture
+    def expert_env(self, monkeypatch):
+        import orchestrator.main as main
+
+        db = SimpleNamespace(
+            create_expert=AsyncMock(return_value={"id": "e1"}),
+            update_expert=AsyncMock(return_value={"id": "e1"}),
+            get_expert_by_id=AsyncMock(
+                return_value={
+                    "id": "e1",
+                    "owner_id": SESSION_USER_ID,
+                    "expert_type": "session",
+                    "name": "helper",
+                    "display_name": "Helper",
+                    "icon": "smart_toy",
+                    "color": "#6B7280",
+                    "managed_key": None,
+                }
+            ),
+            get_expert_visible_by_id=AsyncMock(
+                return_value={
+                    "id": "e2",
+                    "owner_id": str(uuid.uuid4()),
+                    "expert_type": "session",
+                    "name": "shared",
+                    "display_name": "Shared",
+                    "icon": "smart_toy",
+                    "color": "#6B7280",
+                    "config": {"tools": {"canvas": ["run_command"]}},
+                }
+            ),
+            fork_and_set_user_expert_default=AsyncMock(return_value={"id": "e3"}),
+        )
+        monkeypatch.setattr(main, "postgres_db", db)
+        monkeypatch.setattr(
+            main,
+            "require_approved_user",
+            AsyncMock(return_value={"id": SESSION_USER_ID, "is_admin": False}),
+        )
+        # The save-time PDP is stubbed so these tests see the SHAPE gate alone;
+        # `test_the_pdp_reads_the_canonical_fragment` asserts what it is handed.
+        monkeypatch.setattr(main, "_enforce_expert_save", AsyncMock())
+        monkeypatch.setattr(
+            main, "user_visible_project_ids", AsyncMock(return_value=[])
+        )
+        monkeypatch.setattr(
+            main, "personal_defaults_allowed", AsyncMock(return_value=True)
+        )
+        return main, db
+
+    def _create_body(self, main, config):
+        return main.ExpertCreate(
+            name="helper",
+            display_name="Helper",
+            expert_type="session",
+            config=config,
+        )
+
+    SMUGGLE = {"tools": {"canvas": ["run_command"]}}
+
+    @pytest.mark.asyncio
+    async def test_create_rejects_a_smuggle_and_stores_nothing(self, expert_env):
+        main, db = expert_env
+
+        with pytest.raises(main.HTTPException) as exc:
+            await main.create_expert(MagicMock(), self._create_body(main, self.SMUGGLE))
+
+        assert exc.value.status_code == 400
+        assert "run_command" in exc.value.detail
+        db.create_expert.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_update_rejects_a_smuggle_and_stores_nothing(self, expert_env):
+        main, db = expert_env
+
+        with pytest.raises(main.HTTPException) as exc:
+            await main.update_expert(
+                MagicMock(),
+                str(uuid.uuid4()),
+                main.ExpertUpdate(config=self.SMUGGLE),
+            )
+
+        assert exc.value.status_code == 400
+        db.update_expert.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_import_rejects_a_smuggle(self, expert_env):
+        """A posted bundle is caller-supplied JSON — the same trust level as a
+        create body, and the export/import pair is how a fragment travels
+        between deployments."""
+        main, db = expert_env
+
+        with pytest.raises(main.HTTPException) as exc:
+            await main.import_expert(MagicMock(), self._create_body(main, self.SMUGGLE))
+
+        assert exc.value.status_code == 400
+        db.create_expert.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_fork_of_a_personal_default_rejects_a_smuggle(self, expert_env):
+        main, db = expert_env
+        selection = SimpleNamespace(
+            expert={
+                "name": "shared",
+                "display_name": "Shared",
+                "expert_type": "session",
+                "icon": "smart_toy",
+                "color": "#6B7280",
+                "config": self.SMUGGLE,
+            }
+        )
+        with patch.object(
+            main, "resolve_root_expert", AsyncMock(return_value=selection)
+        ):
+            with pytest.raises(main.HTTPException) as exc:
+                await main.fork_my_expert_default(
+                    MagicMock(), "session", main.ExpertDefaultForkRequest()
+                )
+
+        assert exc.value.status_code == 400
+        db.fork_and_set_user_expert_default.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_duplicate_rejects_a_smuggle_carried_by_the_source_row(
+        self, expert_env
+    ):
+        """The fifth site, and the only one that had NO save-time gate at all.
+        A legacy row is never validated where it sits (write-only, as at every
+        other boundary), but copying it is a new write by a new principal."""
+        main, db = expert_env
+
+        with pytest.raises(main.HTTPException) as exc:
+            await main.duplicate_expert(MagicMock(), str(uuid.uuid4()))
+
+        assert exc.value.status_code == 400
+        db.create_expert.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_an_unresolvable_shape_is_refused_at_write_not_at_read(
+        self, expert_env
+    ):
+        """`tools.shell: true` is refused by `normalize_tool_policy`, which runs
+        when the row is READ — so storing it produced an expert that could not
+        resolve. Same 400 as every other boundary gives it."""
+        main, db = expert_env
+
+        with pytest.raises(main.HTTPException) as exc:
+            await main.create_expert(
+                MagicMock(), self._create_body(main, {"tools": {"shell": True}})
+            )
+
+        assert exc.value.status_code == 400
+        assert "must enumerate" in exc.value.detail
+        db.create_expert.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_the_stored_fragment_is_canonical(self, expert_env):
+        """Assignment, not filtering: what is stored is the normalised list the
+        loader and the PDP both speak, so `true` never sits in a row waiting to
+        be re-interpreted."""
+        main, db = expert_env
+
+        await main.create_expert(
+            MagicMock(), self._create_body(main, {"tools": {"git": True}})
+        )
+
+        assert db.create_expert.await_args.kwargs["config"] == {
+            "tools": sorted_git_expansion()
+        }
+
+    @pytest.mark.asyncio
+    async def test_the_pdp_reads_the_canonical_fragment(self, expert_env, monkeypatch):
+        """Order is load-bearing. The PDP reads `_truthy(tools.get(...))`, which
+        gets `{}` and `{only: []}` backwards; normalising first means it can
+        only ever see a list."""
+        main, _db = expert_env
+        seen = AsyncMock()
+        monkeypatch.setattr(main, "_enforce_expert_save", seen)
+
+        await main.create_expert(
+            MagicMock(), self._create_body(main, {"tools": {"shell": False}})
+        )
+
+        assert seen.await_args.args[1] == {"tools": {"shell": []}}
+
+    @pytest.mark.asyncio
+    async def test_a_config_without_tools_is_untouched(self, expert_env):
+        main, db = expert_env
+
+        await main.create_expert(
+            MagicMock(), self._create_body(main, {"llm": {"model": "gemma-4-moe"}})
+        )
+
+        assert db.create_expert.await_args.kwargs["config"] == {
+            "llm": {"model": "gemma-4-moe"}
+        }
+
+    @pytest.mark.asyncio
+    async def test_the_expert_editors_own_payload_still_saves(self, expert_env):
+        """Back-compat that matters most: `tools-group.component.ts` is shared
+        by the expert editor, and it emits `true` for on, `[]` for off and the
+        `enumerate_only` enumeration for a category that refuses `true`. All
+        three have to survive this gate."""
+        main, db = expert_env
+        from src.core.tool_policy import enumerate_only_members
+
+        payload = {
+            "tools": {
+                "shell": enumerate_only_members()["shell"],
+                "research": True,
+                "citation": [],
+            },
+            "delegation": {"enabled": False},
+        }
+        await main.create_expert(MagicMock(), self._create_body(main, payload))
+
+        stored = db.create_expert.await_args.kwargs["config"]
+        assert stored["tools"]["shell"] == enumerate_only_members()["shell"]
+        assert stored["tools"]["citation"] == []
+        assert stored["tools"]["research"] == sorted(
+            n
+            for n in get_tools_by_category("research")
+            if "grant" not in TOOL_REGISTRY[n]
+        ), "`true` did not expand against the registry"
+        assert stored["delegation"] == {"enabled": False}
+
+    @pytest.mark.parametrize("expert", BUNDLED_EXPERT_CONFIGS)
+    def test_every_bundled_expert_still_duplicates(self, expert):
+        """ "Start from scholar" is the primary way an expert gets created, and
+        it now runs the source through the gate. All eleven shipped configs must
+        pass or the gate has broken onboarding."""
+        import yaml
+
+        config = yaml.safe_load(
+            Path(f"config/experts/{expert}/config.yaml").read_text()
+        )
+        config.pop("$extends", None)
+        validate_tool_override_fragment(config)
