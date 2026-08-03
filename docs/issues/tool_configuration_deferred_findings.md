@@ -194,6 +194,33 @@ handoff items this series dropped.
    `true` and `except` emit **sorted** lists; an explicit list keeps author order.
    Tool-menu ordering is a prompt-surface fact, so a migration is not
    byte-neutral even when the *set* is identical.
+6. **A capability grant keyed on a category can be bypassed by naming its tools
+   under a different category, because the PDP reads keys and `load_tools`
+   resolves names.** `capability_grants.evaluate` checks
+   `tools.get("catalog_authoring")`, but `load_tools` groups by each name's
+   *registry* category — so a stored fragment spelling
+   `tools.agent_catalog: [set_expert_bundle]` would bind the write while the
+   grant check never fires. Introduced 2026-08-03 by
+   [[agent_authored_catalog_entries]]; the same shape applies to any future
+   category-keyed grant, which is why it belongs here rather than in that doc.
+
+   **Unreachable through any write boundary** — `validate_tool_override_fragment`
+   rejects the foreign name with a 400 (live-verified), so the only way in is a
+   row written before 08-03 or by a path that skips validation.
+
+   **Exposed population measured on dev, 2026-08-03: zero.** All 11 experts
+   surveyed — 9 bundled (in-repo, and a full-history grep of `config/` for the
+   six names returns no commits) plus both DB rows, `Assistant` and
+   `General Worker`, neither of which declares `agent_catalog` or `workflows` at
+   all. Still unmeasured: prod's database, and project-scoped experts stored in
+   a project's Gitea repo — the same instrument gap
+   [[registered_tools_no_config_can_grant]] records.
+
+   Fold this into the `jsonb_typeof` scan owed in §1: while reading stored
+   `tools` fragments, also grep them for the six `*_bundle` names under any key
+   other than `catalog_authoring`. The durable fix, if a row ever turns up, is to
+   make the PDP evaluate the *resolved* toolset by registry category rather than
+   the fragment's keys.
 6. **The 100-entry upload cap is shared with SFTP**, which has no per-write
    subprocess cost — the cap was sized against `rclone rcat`'s one-subprocess-per-key
    behaviour. Deliberately "one number, not two"; worth revisiting if the SFTP
