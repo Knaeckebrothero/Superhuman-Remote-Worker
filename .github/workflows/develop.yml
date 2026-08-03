@@ -819,7 +819,7 @@ jobs:
           helm repo add collabora https://collaboraonline.github.io/online --force-update
           helm dependency build helm/
       - name: Install dependencies
-        run: uv pip install --system -r requirements.txt -r orchestrator/requirements.txt -r requirements-dev.txt pytest pytest-asyncio
+        run: uv pip install --system -r requirements.txt -r orchestrator/requirements.txt -r orchestrator/mcp/requirements.txt -r requirements-dev.txt pytest pytest-asyncio
       - name: Run tests
         run: pytest tests/ -x -q --tb=short
 
@@ -1097,6 +1097,8 @@ jobs:
     permissions:
       contents: read
       packages: write
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
@@ -1130,6 +1132,7 @@ jobs:
             type=raw,value=sha-${{ steps.ident.outputs.short }}
             type=raw,value=experimental,enable=${{ github.event_name != 'pull_request' }}
       - name: Build${{ github.event_name == 'pull_request' && ' (PR validation, no push)' || ' and push' }}
+        id: build
         uses: docker/build-push-action@v5
         with:
           context: .
@@ -1751,12 +1754,16 @@ jobs:
         if: needs.build-mcp.result == 'success'
         env:
           COMPONENT_SHA: ${{ needs.changes.outputs.mcp-sha }}
+          COMPONENT_DIGEST: ${{ needs.build-mcp.outputs.digest }}
         run: |
           : "${COMPONENT_SHA:=$GITHUB_SHA}"
+          test -n "$COMPONENT_DIGEST"
+          case "$COMPONENT_DIGEST" in sha256:*) ;; *) exit 1 ;; esac
           export COMPONENT_TAG="sha-${COMPONENT_SHA::7}"
           export COMPONENT_VERSION="0.0.0-dev.sha-${COMPONENT_SHA}"
           yq -i '
             .image.mcp.tag = strenv(COMPONENT_TAG) |
+            .image.mcp.digest = strenv(COMPONENT_DIGEST) |
             .provenance.components.mcp.sourceRevision = strenv(COMPONENT_SHA) |
             .provenance.components.mcp.releaseVersion = strenv(COMPONENT_VERSION)
           ' deployment/values-experimental.yaml

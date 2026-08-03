@@ -70,6 +70,7 @@ image:
     tag: sha-8710200
   mcp:
     tag: sha-2c1f82f
+    digest: sha256:5b24c4fc4b73430a4644984551a07d45cf483fa7e93d1843f92c4e110b8b72b4
   workspace:
     tag: sha-571fbc8
 # Full deployment identities are updated alongside each independently rebuilt
@@ -92,6 +93,9 @@ provenance:
     workspace:
       sourceRevision: 571fbc8ca40847bb63cf57c92d86f3df15e35a7c
       releaseVersion: "0.0.0-dev.sha-571fbc8ca40847bb63cf57c92d86f3df15e35a7c"
+# Production-like Fleet deployments must resolve MCP by immutable digest.
+mcp:
+  requireImageDigest: true
 # -----------------------------------------------------------------------------
 # Orchestrator HA — M1 leader-election go-live
 # (docs/operations/orchestrator_m1_go_live.md)

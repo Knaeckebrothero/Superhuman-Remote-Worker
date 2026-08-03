@@ -1,14 +1,17 @@
 # MCP Capability and Reliability Audit
 
-**Status:** Open  
-**Date:** 2026-08-03  
+**Status:** Source remediation implemented; disposable live acceptance pending
+**Date:** 2026-08-03
 **Scope:** The orchestrator-facing MCP server in `orchestrator/mcp/`, its REST
 client, deployment packaging, tool contracts, and validation coverage.
 
 ## Executive summary
 
-The MCP server is broad—it currently registers roughly 104 tools—but it is not
-yet a reliable or authoritative representation of the orchestrator API.
+The MCP server is broad—it currently registers 104 tools. At the start of this
+audit it was not a reliable or authoritative representation of the
+orchestrator API. The source/image remediation below closes the identified P0
+transport risks and establishes an authoritative contract, while the remaining
+workflow and disposable live-acceptance gaps still prevent a completion claim.
 
 The Scholar incident did **not** show that MCP job creation bypasses the regular
 job API. Both `create_job` and `create_project_job` ultimately use the normal
@@ -16,7 +19,8 @@ orchestrator create-job path. The failure was caused by the surrounding MCP
 contract: its success response instructed the caller to perform a redundant
 manual assignment, and the deployed tool schema was stale relative to source.
 
-The wider audit found two more urgent cross-cutting risks:
+The wider audit found two urgent cross-cutting risks that are now remediated in
+source and the production image:
 
 1. request authentication is stored in mutable headers on a shared asynchronous
    client, so concurrent requests and health probes can overwrite one another's
@@ -25,8 +29,99 @@ The wider audit found two more urgent cross-cutting risks:
    mutations, so a mutation can succeed server-side and then be repeated or
    reported as failed.
 
-These should be fixed before treating a broad live mutation exercise as a safe
-completion test.
+The broad live mutation exercise remains gated on a disposable environment and
+the acceptance controls recorded below.
+
+## Remediation update — 2026-08-03
+
+The source and production-image remediation is implemented. No external
+deployment or shared-infrastructure mutation test was performed.
+
+Completed:
+
+- Request identity is now task-local and copied into each outgoing HTTP request
+  by an `httpx.Auth` flow. The shared client's default headers contain no user,
+  scope, or internal-key state. Concurrent delayed calls from two differently
+  scoped users and a simultaneous unauthenticated health probe are covered.
+- Safe GET retries are separate from mutations. Every mutation is sent exactly
+  once. A read/write/response-stream failure after send raises an explicit
+  `MutationOutcomeUnknown`, and MCP action formatting no longer labels that
+  condition as a confirmed failure. Connect failures remain distinguishable.
+- `orchestrator/mcp/capabilities.py` is the authoritative 104-tool manifest.
+  Registration fails without a contract entry and publishes read-only,
+  destructive, idempotent, and open-world annotations plus REST operation,
+  authorization, side-effect, retry, schema-source, and coverage metadata.
+- Missing REST workflows now have explicit `required`,
+  `intentionally_excluded`, or `superseded` decisions. The human contract is in
+  `docs/mcp_capability_contract.md`.
+- Schema revision 3 exposes a canonical SHA-256 `tools/list` digest, count,
+  baked-artifact match status, source/release/image provenance, Python version,
+  and FastMCP version through `/health`. A configured stale/missing schema
+  artifact makes readiness degraded.
+- The production Dockerfile now uses Python 3.12 and exact MCP dependency
+  versions, bakes `/app/tool-schema.json`, and ships a disposable real-protocol
+  smoke test. Two fresh stdio clients must produce the baked raw `tools/list`;
+  the test then invokes read, mutation, denied, and degraded-service paths.
+- Both Python test workflows now install `orchestrator/mcp/requirements.txt`
+  alongside the root, orchestrator, and development requirements. This keeps
+  raw-schema tests on the same pinned FastMCP/MCP runtime as the shipped image.
+- The production-like Fleet values resolve MCP by immutable image digest.
+  Helm can require that digest, stamps image/source identity into the pod
+  template, and injects bounded provenance. Develop CI records the pushed build
+  digest in `values-experimental.yaml`, so an MCP artifact change changes the
+  pod template and rolls the deployment.
+- Priority schema drift is reconciled: `paused` is a job-list status; job and
+  project-job creation expose database expert selection, kickoff message,
+  context, priority, and deliverables; project create/update expose default
+  config overrides; connector tools expose all 12 canonical types plus config,
+  publication, and read-only fields with corrected ownership/publication text.
+  Job creation still uses normal automatic dispatch; `assign_job` remains an
+  administrator recovery/override action.
+
+Current evidence:
+
+- `tests/test_mcp_client_safety.py`: 6 passed (identity isolation, health-probe
+  isolation, delayed/ambiguous mutation behavior, connect-failure distinction).
+- `tests/test_mcp_client_contracts.py`: 6 passed (job forwarding and email, MCP,
+  kubeconfig, KB, publication/config connector bodies).
+- `tests/test_mcp_capabilities.py`: 6 passed (104-name equality, metadata and
+  annotations, canonical digest, health provenance/artifact match, priority
+  schemas, and missing-workflow decisions).
+- `tests/test_mcp.py` plus `tests/test_mcp_dispatch_contract.py`: 64 passed.
+- Supporting connector API/setup, scope, naming, and registry suites: 76 passed;
+  the directly relevant remediation selection totals 158 passing tests.
+- A clean CI-equivalent Python 3.12.13 environment resolved the four workflow
+  requirement sets, including `langchain-mcp-adapters==0.1.14`, FastMCP 3.4.4,
+  and MCP SDK 1.29.0. `uv pip check` found all 254 installed packages
+  compatible; the MCP wildcard suite passed 171 tests, and the complete Python
+  gate passed 12,644 tests with 28 explicitly environment-gated skips.
+- Both documented Helm lint commands passed; the Fleet render uses
+  `repository@sha256:...` and includes MCP source/image provenance.
+- `docker/Dockerfile.mcp` built successfully. Its in-image smoke result was
+  `status=ok`, `tool_count=104`, `fresh_connections=2`, and
+  `mutation_calls=1` using Python 3.12, FastMCP 3.4.4, HTTPX 0.28.1, PyJWT
+  2.13.0, Tenacity 9.1.4, and MCP SDK 1.29.0.
+
+Remaining before MCP can be called complete:
+
+- Implement the workflows classified `required`: job accept/reject, job export,
+  persistent input/interrupt and approvals, connector eligibility, and
+  connector indexing status/recovery.
+- Finish lower-priority schema reconciliation beyond the job/project/connector
+  fields addressed here, including an explicit decision for remaining upload
+  and infrastructure-specific request fields.
+- Fix the table-query non-page-aligned offset defect and richer job-list
+  predicates noted below.
+- Run the full live acceptance matrix in a disposable namespace with real OAuth
+  callers, independent state verification, optional-service degradation, and
+  reversible fixtures. The image smoke uses stdio plus a stub; production HTTP
+  auth/ingress and client cache rediscovery have not been exercised live.
+- Expand representative protocol invocation into behavior coverage for every
+  supported tool. The manifest/schema test covers every registration, but not
+  every endpoint's success/error semantics.
+- Deploy the changed digest-pinned chart through the authorized release process
+  and capture live `/health` plus raw `tools/list`. This session did not deploy
+  externally.
 
 ## What the MCP does—and does not do
 
