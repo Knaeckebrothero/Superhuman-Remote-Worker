@@ -58,6 +58,35 @@ describe('buildToolCardView', () => {
         expect(v.details).toEqual([]); // trivial read: no execution details
     });
 
+    it('read_file on a markdown file renders as markdown, keeping the language chip', () => {
+        const v = buildToolCardView(
+            norm({tool: 'read_file', args: {path: 'skills/x/SKILL.md'}, result: '# Title\n'}),
+        );
+        expect(v.result?.kind).toBe('markdown');
+        expect(v.result?.language).toBe('markdown');
+    });
+
+    it.each(['a.markdown', 'a.mdx'])('read_file on %s also renders as markdown', (path) => {
+        const v = buildToolCardView(norm({tool: 'read_file', args: {path}, result: '# Title\n'}));
+        expect(v.result?.kind).toBe('markdown');
+    });
+
+    it('read_file on a non-markdown file still renders as code', () => {
+        const v = buildToolCardView(
+            norm({tool: 'read_file', args: {path: 'a/b.py'}, result: 'x = 1\n'}),
+        );
+        expect(v.result?.kind).toBe('code');
+        expect(v.result?.language).toBe('python');
+    });
+
+    it('a tool declared markdown is unaffected and carries no language chip', () => {
+        const v = buildToolCardView(
+            norm({tool: 'web_search', args: {query: 'anything'}, result: '## Hit\n'}),
+        );
+        expect(v.result?.kind).toBe('markdown');
+        expect(v.result?.language).toBeUndefined();
+    });
+
     it('run_command keeps the FULL chained command and clamps only the hint', () => {
         const cmd = 'cd /very/long/path && ./build.sh --flag --another-flag && echo done now please';
         const v = buildToolCardView(

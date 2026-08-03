@@ -224,6 +224,59 @@ $mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
   }
 }
 
+/* The one exception to the no-max-height rule above: rendered prose is far
+   taller than the same content as source, so a whole file read would flood the
+   transcript. The cap is visual only — the parser always sees the complete
+   source, so fences and tables never break mid-structure. */
+.tc__md--capped {
+  position: relative;
+  max-height: 24rem;
+  overflow: hidden;
+
+  &::after {
+    content: '';
+    position: absolute;
+    inset-inline: 0;
+    bottom: 0;
+    height: 3rem;
+
+    /* Must fade to the card's own background (`.tc` above), or the gradient
+       reads as a dark smudge in the light theme. */
+    background: linear-gradient(to bottom, transparent, var(--surface-0));
+    pointer-events: none;
+  }
+}
+
+/* ── Rendered / Raw switch ────────────────────────────────────────── */
+
+.tc__view {
+  display: inline-flex;
+  gap: 1px;
+  margin-inline-start: 4px;
+  border-radius: var(--radius-tag);
+  overflow: hidden;
+
+  button {
+    border: 0;
+    padding: 1px 6px;
+    background: var(--code-bg, rgba(0, 0, 0, 0.22));
+    color: var(--text-secondary);
+    font: inherit;
+    font-size: 10px;
+    letter-spacing: 0.02em;
+    cursor: pointer;
+
+    &:hover {
+      color: var(--text-primary);
+    }
+  }
+}
+
+.tc__view--on {
+  background: var(--accent-color) !important;
+  color: var(--on-accent, #fff) !important;
+}
+
 /* ── Diff ─────────────────────────────────────────────────────────── */
 
 .tc__diff {

@@ -84,7 +84,12 @@
       "openDiff": "Änderungen öffnen",
       "cancel": "Job abbrechen",
       "diffTitle": "Job {{id}} — Änderungen"
-    }
+    },
+    "view": {
+      "rendered": "Gerendert",
+      "raw": "Quelltext"
+    },
+    "showAll": "Alles anzeigen"
   },
   "canvas": {
     "paneLabel": "Dynamischer Canvas",

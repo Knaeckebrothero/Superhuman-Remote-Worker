@@ -1,22 +1,20 @@
 # App Guide M2 verification record
 
-> **Status (2026-07-27): incomplete.** M2a–M2d are closed. M2e's deterministic
-> guide, evaluator, and changed-state action work is implemented and green, but
-> the model and deployed live gates have not passed. Endpoint/tool defaults
-> remain off and M2 must not be called complete.
-
-> **Testing handoff (2026-07-28):** the source was pushed and a redeployment was
-> reported. This is not yet live evidence. Independent acceptance is defined in
-> [App Guide M2 live acceptance — tester-agent handoff](app_guide_m2_live_acceptance_handoff.md).
-
-> **Live acceptance attempted (2026-07-28): verdict BLOCKED.** See [App Guide M2
-> live acceptance results 2026-07-28](app_guide_m2_live_acceptance_results_2026-07-28.md).
-> The rollout-control, endpoint-admission, dependency-failure, and rollback
-> gates passed on a local k3d target. The live email matrix, changed-state
-> before-action cell, mixed-deployment cell, and MCP-token admission rows had no
-> available fixtures, and the three-repeat model matrix could not run on the
-> intended release route. The status above therefore stands: M2 is not complete
-> and both defaults remain off.
+> **Status (owner-reconciled 2026-08-03): release incomplete.** M2a–M2d are
+> closed. M2e's implementation and offline verification are complete, but its
+> release acceptance has not passed. Endpoint/tool defaults remain off and M2
+> must not be called complete.
+>
+> **Live acceptance attempted 2026-07-28: verdict BLOCKED.** See the
+> [sanitized results](app_guide_m2_live_acceptance_results_2026-07-28.md) and
+> [re-run handoff](app_guide_m2_live_acceptance_handoff.md). The exercised flag
+> transitions, cookie-authenticated endpoint/bounds subset, and the fresh
+> dependency-failure/rollback paths produced positive evidence; their required
+> resumed repetitions were not recorded. State B remained blocked on MCP-token
+> and sentinel rows; State C failed the
+> exact-one-call criterion on the fallback model; fresh/resumed coverage was
+> not run; and the email/action, controlled-partial, mixed-deployment,
+> sentinel-privacy, and intended-release-model gates remained blocked.
 
 This record separates offline contract evidence, model behavior, and deployed
 runtime evidence. A green deterministic fixture is not a substitute for a
@@ -86,10 +84,22 @@ routing:    30 cases (17 positive / 13 negative)
 capability: 8 cases across stable, near-miss, dynamic, failure, action, and rollback
 ```
 
-A one-case smoke attempt used the configured local OpenAI-compatible route
-without printing or persisting its credential or endpoint. The provider
-rejected authentication, so the result is **not** model evidence. The required
-full eight-case matrix, repeated three times, remains open.
+An early one-case smoke attempt used the configured local OpenAI-compatible
+route without printing or persisting its credential or endpoint. The provider
+rejected authentication, so that attempt supplied no model evidence. During
+the later live run, the complete eight-case corpus was repeated three times on
+the only reachable route, `gemma-4-moe`:
+
+```text
+run 1: 1/8 passed; trajectory 2; grounding 2; strict order 5
+run 2: 0/8 passed; trajectory 3; grounding 1; strict order 6
+run 3: 1/8 passed; trajectory 3; grounding 2; strict order 5
+all runs: 0 critical forbidden claims; 0 provider errors
+```
+
+These are diagnostic failures. They do not satisfy the release gate because
+the intended release route was unavailable. The required three-repeat matrix
+on that route remains open.
 
 ## Focused verification
 
@@ -126,47 +136,78 @@ post-review delta is covered by both the 183-test focused run and the current
 deprecations, AsyncMock resource-warning cases, and duplicate OpenAPI
 operation-ID warnings; no M2e assertion failed.
 
-## Deployment and rollout state
+## Deployment and rollout evidence
 
-On 2026-07-28 the source push and a redeployment were reported. The repository
-experimental overlay now declares image `sha-5eb436e` and full source revision
-`5eb436eb9181b3271aef223e89c8d87861d95b4c`, which contains the M2e
-implementation. The current local `k3d-srw` API is not reachable, so this
-record does not promote the report or overlay declaration to observed live
-evidence. The tester must verify the real target through the linked handoff.
+The 2026-07-28 acceptance run targeted a local single-node k3d/Tilt deployment
+built from source commit `ec4bbe6b`, which contains minimum implementation
+commit `326963b7`. The locally built images did not declare component source
+revisions or artifact digests, so candidate identity was established only from
+the worktree/build path and the presence of the feature modules. This is
+useful local-canary evidence, not immutable deployed provenance and not the
+mixed-build test.
 
-The earlier local `srw` k3d attempt had a stopped (`0/1` server) target, so no
-then-current worktree image was deployed for M2e. The following remain
-unverified:
+The run exercised the four distinct flag combinations and restored State E:
 
-One controlled start attempt was restored to the stopped state without
-deploying changes. k3d reported its server container running, but the
-server-load-balancer container could not reach the API upstream (`Host is
-unreachable`) and `kubectl` timed out. This is infrastructure unavailability,
-not live M2e evidence.
+| Evidence area | Reconciled outcome |
+|---|---|
+| State A default-off | PASS |
+| Cookie-authenticated endpoint, thread ownership, filters, bounds, and no-store behavior | PASS for exercised rows |
+| State B as a complete gate | BLOCKED: both MCP-token rows and the sentinel privacy protocol lacked fixtures |
+| State C tool canary | FAIL on fallback route: one extra broad capability call preceded the required exact-ID call |
+| Fresh/resumed None, Virtual, and Container sessions | NOT RUN |
+| Live email tiers and changed-before-action sink test | BLOCKED: no connectors, server, or sink |
+| Controlled partial/unknown and mixed declared provenance | BLOCKED: no approved seams |
+| Three-repeat intended-release-model matrix | BLOCKED: route unavailable; fallback diagnostics failed 0–1/8 |
+| State D dependency failure and State E rollback | BLOCKED as complete gates: exercised fresh paths and final false/false state passed, but the required resumed repetitions were not recorded |
+| Privacy | BLOCKED: no leak was observed, but the required sentinel fixture was unavailable |
 
-- controlled endpoint dark launch and privacy-safe fixture comparison;
-- tool canary on fresh and resumed None, Virtual, and Container sessions;
-- email denied, unattached, read, draft, send-off, send-on, degraded, partial,
-  and detach/downgrade cells against real session binding;
-- a real deployment-disabled Protected Cloud or shared-browser cell;
-- a staggered mixed-component deployment;
-- endpoint-off/tool-on and tool-off rollback behavior; and
-- the complete three-repeat model matrix with zero critical false positives.
+The naturally occurring `memory.recall deployment=unknown` observation is not
+the controlled partial cell. Envelope completeness describes whether the
+requested visible set was returned without evaluation errors or truncation;
+it may remain `complete` when an individual layer legitimately resolves to
+`unknown`.
+
+Before this run, a push and redeployment of experimental revision
+`5eb436eb9181b3271aef223e89c8d87861d95b4c` (`sha-5eb436e`) was reported. The
+acceptance run did not target that deployment, so the report remains historical
+context rather than App Guide live evidence. An even earlier controlled local
+start attempt also supplied no evidence: the k3d load balancer could not reach
+the API upstream (`Host is unreachable`), and the stopped state was restored
+without deploying changes.
+
+`deployment/values-experimental.yaml` is CI-updated and may now contain newer,
+independently advanced component revisions. A future tester must inspect the
+actual reconciled workloads and capability response rather than copying any
+historical tag from this record. That independently versioned overlay may be a
+candidate seam for the mixed-build test only when an operator deliberately
+controls and verifies the stagger.
 
 `PRODUCT_CAPABILITIES_ENDPOINT_ENABLED` and
-`PRODUCT_CAPABILITIES_TOOL_ENABLED` therefore remain default `false` in
-environment examples, Compose, and Helm. Explicit false is the rollback path.
-No English/German UI copy changed because the deterministic summary is
+`PRODUCT_CAPABILITIES_TOOL_ENABLED` remain default `false` in environment
+examples, Compose, and Helm. Explicit false is the rollback path. No
+English/German UI copy changed because the deterministic summary is
 model-facing tool context, not a Cockpit or end-user reason-code component.
 
 ## Exit decision
 
 M2e and M2 remain **open**. Default-on rollout is authorized only after:
 
-1. the source-derived M2 closure union, Ruff, Helm, and diff gates pass;
-2. all 24 model trajectories (eight cases × three repetitions) pass with zero
-   critical false-positive capability/action claims;
-3. the controlled fresh/resumed live matrix passes; and
-4. disabling the capability dependency leaves the M1 guide available while
-   dynamic claims become explicitly unknown.
+1. a clean candidate reruns the source-derived M2 closure union, Ruff, Helm,
+   and diff gates;
+2. project- and user-scoped MCP admission plus the complete sentinel privacy
+   protocol pass;
+3. State C emits exactly one focused capability-ID call and all 24 intended-
+   release-model trajectories pass with zero critical false-positive
+   capability/action claims;
+4. fresh and resumed None, Virtual, and Container sessions pass;
+5. the complete email tier/degraded/detach matrix and the real
+   changed-before-action sink test pass without SMTP submission;
+6. controlled partial/unknown, real deployment-disabled, and staggered mixed-
+   provenance cells pass; and
+7. dependency failure and full rollback, including resumed behavior, leave the
+   M1 guide available while dynamic claims become explicitly unknown.
+
+The first run's positive subset remains useful regression context but cannot
+be combined with a later candidate to manufacture one passing release run.
+This 2026-08-03 reconciliation updates documentation only; it did not rerun the
+offline suite or a deployment.
