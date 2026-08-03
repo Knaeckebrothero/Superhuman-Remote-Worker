@@ -177,7 +177,7 @@ todo list appended last at `src/graph.py:1224`).
 | memory | up to **10,000 tok** | `config/worker_base.yaml` `memory.budget_tokens` |
 | knowledge | ~2,500 tok | `src/graph.py:713` (budget estimate) |
 | todo list, **verbatim bodies** | ~2,135 tok initial / ~1,000 tok transition | `src/graph.py:853` `format_for_injection()` |
-| `verify-before-done` SKILL.md | ~909 tok, **every tactical turn** | `config/worker_base.yaml` `instruction_files`, `trigger: phase:tactical`, `enforce: false` |
+| `verify-before-done` SKILL.md | ~909 tok, **every tactical turn in the affected build; retired 2026-08-03** | Former `config/worker_base.yaml` `trigger: phase:tactical`; now phase/freshness-gated at `todo_complete` / `job_complete` |
 | phase system prompt | ~1,400–1,600 tok | `config/prompts/{strategic,tactical}*.txt` |
 
 **≈15k tokens of scaffolding before a single line of conversation
@@ -260,11 +260,12 @@ The phase loop reimplemented a worse variant by accident.
   `clear_old_tool_results` + threshold path, and empirically survivable
   (the persistent/session runtime runs for days without a forced wipe).
 - **P-2 — ⬜ NOT STARTED. Make REVIEW-AND-ADAPT conditional.** Fast path when every
-  tactical todo completed **and** the P1-C deliverable manifest — already
-  written at every boundary to `output/manifest_status.json` — agrees the
-  contract paths moved: append one outcome line to `plan.md`, stage the
+  tactical todo completed **and** an orchestrator/Gitea check at the boundary
+  confirms the declared P1-C contract paths moved: append one outcome line to `plan.md`, stage the
   next todos, continue. Load the full block only on a failed todo, or on
-  a **manifest/todo disagreement**. This is the anti-rubber-stamp check:
+  a **contract/todo disagreement**. Do not materialize the derived check inside
+  the worker workspace; the former boundary status file was retired on
+  2026-08-03 after stale data deadlocked a Scholar completion. This is the anti-rubber-stamp check:
   artifact-based rather than narrative-based, so it is simultaneously
   cheaper and harder to fake than reading a diff. Depends on P-1 for
   honesty.
@@ -276,10 +277,11 @@ The phase loop reimplemented a worse variant by accident.
   which removes the runaway. The *policy* half (an explicit budget cap on
   the pinned tier) is still open; it now guards a pool that no longer
   grows without bound.
-- **P-4 — ⬜ NOT STARTED. Trim the per-turn floor.** 10k memory budget is
-  very large for a worker; todo bodies can inject verbatim once and then
-  as ID+status; `verify-before-done` does not need re-injection on every
-  tactical turn.
+- **P-4 — 🟡 PARTIAL. Trim the per-turn floor.** The 2026-08-03 activation
+  correction removed continuous `verify-before-done` injection: completion now
+  requires a phase-scoped read no more than 20 LLM turns old, and other phase
+  guidance is checkpointed once per concrete phase. The remaining items are the
+  10k worker-memory budget and repeated verbatim todo bodies.
 
 ---
 
@@ -506,10 +508,11 @@ the number (missing or incorrect verification is ~1 in 4 multi-agent
 failures, MAST arXiv 2503.13657). The overhead was never the verification,
 it was the amnesia and the reconstruction the amnesia forced.
 
-There *is* a real cost complaint inside that: `verify-before-done` is
-~909 tokens on **every tactical turn**. That is an injection-economics
-problem (P-4) — inject it once per phase, or at todo-completion time when
-it actually applies — not a reason to weaken the content.
+There *was* a real cost complaint inside that: the affected build injected
+`verify-before-done` (~909 tokens) on **every tactical turn**. P-4's skill
+component was fixed on 2026-08-03: the body is now required at
+`todo_complete`/`job_complete`, scoped to the current phase and a 20-turn
+freshness window. The content itself remains unchanged.
 
 **Caveat.** Prompt changes are the least verifiable part of this work
 offline. Tests confirm the templates still parse and render; they cannot

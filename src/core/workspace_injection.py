@@ -8,7 +8,7 @@ making it appear as if the agent already read certain files. This approach:
 
 Handles injection of:
 - Todo lists (as transient HumanMessage)
-- Instruction files triggered by phase transitions (active injection for enforce=false)
+- Instruction files delivered once at a concrete phase start
 - Memory and knowledge injection use their own modules (memory_injection.py, knowledge_injection.py)
 """
 
@@ -94,7 +94,7 @@ def create_instruction_tool_messages(
 
     Creates a fake tool call that makes it appear as if the agent already
     called read_file on the instruction file and received the content.
-    Used for active injection (enforce=false) of phase-triggered instruction files.
+    Used for checkpointed, once-per-phase-start instruction delivery.
 
     Args:
         file_path: Workspace-relative path of the instruction file

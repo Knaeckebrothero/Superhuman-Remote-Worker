@@ -240,14 +240,19 @@ class ToolContext:
     )  # Recently read file paths
     _pinned_reads: Set[str] = field(
         default_factory=set
-    )  # Instruction-file paths, exempt from FIFO eviction: once read they
-    # stay "recently read" so enforce-gates never re-arm mid-job. Only
-    # path-based enforcement consults this — write authorization
-    # (recent_read_matches) deliberately does not.
+    )  # Instruction-file paths, exempt from FIFO eviction. The path remains
+    # known after one read; phase/freshness-scoped gates separately validate
+    # _instruction_read_stamps and may still re-arm. Write authorization
+    # (recent_read_matches) deliberately does not consult this set.
     _recent_read_versions: Dict[str, str] = field(
         default_factory=dict
     )  # Optional sha256 of the full text bytes observed for a recent path
+    _instruction_read_stamps: Dict[str, Dict[str, Any]] = field(
+        default_factory=dict
+    )  # path -> LLM turn + concrete phase instance at the most recent read
     _current_phase: Optional[str] = None
+    _current_phase_number: Optional[int] = None
+    _current_turn_count: int = 0
     _llm_config: Optional[Any] = None  # LLMConfig for phase-aware multimodal
     _instruction_files: List[Any] = field(
         default_factory=list
@@ -930,11 +935,16 @@ class ToolContext:
             content: Complete text content observed by the reader, when available
         """
         normalized = path.lstrip("/").strip()
-        # Instruction files are pinned: reading other files must never evict
-        # them back into "unread", or every enforce-gate re-arms once the
-        # 10-entry FIFO cycles (one forced guide re-read per strategic phase).
+        # Instruction files are pinned: unrelated reads must not make a
+        # job-scoped gate look unread merely because the 10-entry FIFO cycled.
+        # Phase/freshness-scoped gates use the independent stamp below.
         if self._is_instruction_path(normalized):
             self._pinned_reads.add(normalized)
+            self._instruction_read_stamps[normalized] = {
+                "phase": self._current_phase,
+                "phase_number": self._current_phase_number,
+                "turn_count": self._current_turn_count,
+            }
         evicted = None
         # Remove if already present (we'll re-add at the end)
         if normalized in self._recent_reads:
@@ -973,8 +983,9 @@ class ToolContext:
         """Check if file was read within the tracking window.
 
         Used by edit_file and write_file to enforce read-before-write
-        discipline. Instruction files stay "recently read" once pinned,
-        regardless of how many reads followed.
+        discipline. Instruction files stay present once pinned regardless of
+        how many reads followed. Binding-specific phase/freshness checks happen
+        separately in instruction_read_is_valid().
 
         Args:
             path: Path to check
@@ -1019,6 +1030,7 @@ class ToolContext:
             self._recent_reads.remove(normalized)
         self._pinned_reads.discard(normalized)
         self._recent_read_versions.pop(normalized, None)
+        self._instruction_read_stamps.pop(normalized, None)
         return present
 
     def get_read_tracking_limit(self) -> int:
@@ -1028,6 +1040,52 @@ class ToolContext:
             Number of recent reads to track (default 10)
         """
         return self.get_config("read_tracking_limit", 10)
+
+    def instruction_entry_applies(self, entry: Any) -> bool:
+        """Whether an enforced binding applies in the current phase kind."""
+        phases = getattr(entry, "phases", None)
+        return not phases or self._current_phase in phases
+
+    def instruction_read_is_valid(self, entry: Any) -> bool:
+        """Whether an instruction read satisfies one enforced binding.
+
+        Ordinary bindings retain the historical job-scoped pin. Bindings may
+        additionally require a read in the current concrete phase instance and
+        may expire after a bounded number of LLM turns.
+        """
+        path = (entry.path or "").lstrip("/").strip()
+        if not self.was_recently_read(path):
+            return False
+
+        read_scope = getattr(entry, "read_scope", "job")
+        max_age = getattr(entry, "max_read_age_turns", None)
+        if read_scope == "job" and max_age is None:
+            return True
+
+        stamp = self._instruction_read_stamps.get(path)
+        if stamp is None:
+            return False
+        if read_scope == "phase" and (
+            stamp.get("phase") != self._current_phase
+            or stamp.get("phase_number") != self._current_phase_number
+        ):
+            return False
+        if max_age is not None:
+            age = self._current_turn_count - int(stamp.get("turn_count", 0))
+            if age < 0 or age > max_age:
+                return False
+        return True
+
+    def get_enforcement_entries(self, tool_name: str) -> List[Any]:
+        """Get active enforced instruction bindings for a tool."""
+        return [
+            entry
+            for entry in self._instruction_files
+            if entry.enforce
+            and entry.trigger_type == "before_tool"
+            and entry.trigger_target == tool_name
+            and self.instruction_entry_applies(entry)
+        ]
 
     def get_enforcement_files(self, tool_name: str) -> List[str]:
         """Get instruction files that must be read before using a tool.
@@ -1041,15 +1099,7 @@ class ToolContext:
         Returns:
             List of workspace-relative file paths that must be read first
         """
-        required = []
-        for entry in self._instruction_files:
-            if (
-                entry.enforce
-                and entry.trigger_type == "before_tool"
-                and entry.trigger_target == tool_name
-            ):
-                required.append(entry.path)
-        return required
+        return [entry.path for entry in self.get_enforcement_entries(tool_name)]
 
     def check_tool_enforcement(self, tool_name: str) -> Optional[str]:
         """Check if a tool's instruction file enforcement requirements are met.
@@ -1063,24 +1113,25 @@ class ToolContext:
         Returns:
             Error message string if enforcement fails, None if OK
         """
-        required_files = self.get_enforcement_files(tool_name)
-        for file_path in required_files:
-            if not self.was_recently_read(file_path):
+        for entry in self.get_enforcement_entries(tool_name):
+            if not self.instruction_read_is_valid(entry):
                 from src.services.guardrails import format_nudge
 
                 model = self._llm_config.model if self._llm_config is not None else None
                 return format_nudge(
                     "read_file_required_error",
                     model=model,
-                    file_path=file_path,
+                    file_path=entry.path,
                     tool_name=tool_name,
                 )
         return None
 
     def get_phase_instruction_files(self, phase: str) -> List[Any]:
-        """Get instruction files triggered by a phase transition.
+        """Get instruction files eligible for once-only phase-start delivery.
 
-        Returns entries with trigger type 'phase' matching the given phase.
+        Returns ``phase_start`` entries plus the legacy ``phase`` alias. The
+        graph's checkpoint ledger suppresses subsequent delivery in the same
+        concrete phase instance.
 
         Args:
             phase: Phase name ('strategic' or 'tactical')
@@ -1091,16 +1142,27 @@ class ToolContext:
         return [
             entry
             for entry in self._instruction_files
-            if entry.trigger_type == "phase" and entry.trigger_target == phase
+            if entry.trigger_type in {"phase", "phase_start"}
+            and entry.trigger_target == phase
         ]
 
-    def set_current_phase(self, phase: str) -> None:
-        """Set the current execution phase for phase-aware behavior.
+    def set_current_phase(
+        self,
+        phase: str,
+        phase_number: Optional[int] = None,
+        turn_count: Optional[int] = None,
+    ) -> None:
+        """Set the current execution position for phase-aware behavior.
 
         Args:
             phase: Phase name ("strategic" or "tactical")
+            phase_number: Concrete phase-instance number, when available
+            turn_count: Current checkpointed LLM-turn counter, when available
         """
         self._current_phase = phase
+        self._current_phase_number = phase_number
+        if turn_count is not None:
+            self._current_turn_count = turn_count
 
     def get_phase_multimodal(self) -> bool:
         """Get the effective multimodal setting for the current phase.

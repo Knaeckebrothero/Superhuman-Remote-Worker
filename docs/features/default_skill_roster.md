@@ -14,13 +14,14 @@ tags:
 
 ## Build status & resume state
 
-*Snapshot as of 2026-06-26. This section is the resume anchor — start here.*
+*Snapshot as of 2026-06-26, with the activation contract corrected
+2026-08-03. This section is the resume anchor — start here.*
 
 ### What's built
 
 | Skill | Tier | Status | Scope / binding | Transfer verdict | Evidence base |
 |---|---|---|---|---|---|
-| `verify-before-done` | 1 | ✅ built 06-22 | **bound** `phase:tactical` on worker experts (defaults→developer/critic/curator/bughunter + scholar/designer overriders) | universal | `Verify Before Done Skill Research.md` (repo root) |
+| `verify-before-done` | 1 | ✅ built 06-22; activation corrected 08-03 | **gated** before tactical `todo_complete` and strategic `job_complete`; read must be in the current phase and ≤20 LLM turns old | universal | `Verify Before Done Skill Research.md` (repo root) |
 | `todo-guide` (= planning-and-decomposition) | 1 | ✅ shipped earlier; optimized 06-24 (308→82-line body, +L3 `references/phase-patterns.md`) | **bound** `before_tool:next_phase_todos` (enforced gate) | universal | predates this initiative |
 | `brainstorming` | 1 | ✅ built 06-24 | **model-invoked** (unbound) | universal | `researches/brainstorming*.md` |
 | `systematic-debugging` | 1 | ✅ built 06-24 | **model-invoked**, code-scoped (description self-scopes) | **code-scoped — NOT universal** (RCA bridge fails its own evidence test; no non-code agent example) | `researches/systematic-debugging*.md` |
@@ -28,7 +29,7 @@ tags:
 | `project-onboarding` (was `codebase-onboarding`) | 2 | ✅ built 06-25 | **model-invoked**, universal (all experts) | **universal as a *procedure*** (inventory→source-of-truth→structure/vocab→map: the named procedure in archival survey / *First 90 Days* / consulting / journalism / Klein) | `researches/project-onboarding.report.md` |
 | `test-driven-development` | 2 | ✅ built 06-25 | **model-invoked**, code-scoped (self-scopes); home=`developer` (binding deferred) | **universal only as a *principle*** (pre-registration); code-specific procedure; agent practice near-totally code | `researches/test-driven-development.report.md` |
 | `sub-agent-delegation` | 2 | ⏳ **NOT built — next/last Tier-2** | TBD | optimization-shaped (see below) | — |
-| `research-guide` | 3-ish | ✅ shipped earlier | **bound** `phase:tactical` on scholar | scholar research methodology | predates this initiative |
+| `research-guide` | 3-ish | ✅ shipped earlier; activation corrected 08-03 | **bound** `phase_start:tactical` on scholar; injected once per concrete tactical phase | scholar research methodology | predates this initiative |
 
 All four Tier-2 builds (and the Tier-1 model-invoked skills) are **uncommitted on `develop`**, live on local k3d only. Dev cluster gets them when `develop` is pushed; the user owns the private prod deploy. `SKILLS_DB_ENABLED` is dev-on / prod-off; **model-invoked skills appear only when the flag is on; bound skills are flag-independent.**
 
@@ -62,10 +63,10 @@ Each skill is built the same way (greenlit, repeatable):
 
 ### Open / deferred decisions
 
-- **Home-expert bindings (the one open decision carried across builds):** `code-review`→`critic` and `test-driven-development`→`developer`, both as optional `phase:tactical` bindings. **Deferred together** into a later deliberate "wire skills to home experts" pass, so the `deep_merge` re-list cost is paid once and the bindings are judged as a set.
+- **Home-expert bindings (the one open decision carried across builds):** `code-review`→`critic` and `test-driven-development`→`developer`, both as optional `phase_start:tactical` bindings if one-shot phase orientation is actually desirable. **Deferred together** into a later deliberate "wire skills to home experts" pass, so the `deep_merge` re-list cost is paid once and the bindings are judged as a set.
 - **`sub-agent-delegation` (next/last Tier-2) — live 3-way choice the user is deciding:** it's *optimization-shaped* — `delegate_work` (spawns 1–5 worktree children, parallel, review+merge) + `strategic.txt:56-58` already cover the basics, and only 3 experts can delegate. Options: **(a)** full pipeline build anyway; **(b)** lighter "audit existing coverage → small gap-fill skill or skip"; **(c)** call Tier-2 done here.
 - **Not started:** Tier-3 expert-dedicated skills (scholar→research-methodology+citation, developer→dev bundle, critic→receiving-code-review, writer→long-form, assistant→clarification-and-scoping) and the `skill-creator` meta-skill.
-- **Carried-forward follow-ups (not blocking):** verify-before-done enforcement tiers B (read-gate) / C (trace-gate); brainstorming cross-domain eval (`tests/brainstorming_skill_validation.md`); `fence_skills_menu` `<`/`>` hardening.
+- **Carried-forward follow-ups (not blocking):** verify-before-done tier C (trace-gate; tier B read-gates shipped 08-03); brainstorming cross-domain eval (`tests/brainstorming_skill_validation.md`); `fence_skills_menu` `<`/`>` hardening.
 
 ## Motivation
 
@@ -82,7 +83,7 @@ A skill is reusable "how to do X well" procedural knowledge the agent loads on d
 - **Opt-in (4):** `test-driven-development` (built; code-scoped) · `code-review` (built) · `project-onboarding` (built; was `codebase-onboarding`) · `sub-agent-delegation`.
 - **Expert-dedicated:** scholar → research-methodology + citation; developer → dev bundle; critic → receiving-code-review; writer → long-form writing (*weakest validation*); assistant → clarification-and-scoping.
 - **Meta — `skill-creator`:** the one cross-vendor procedural *default* (Anthropic + Codex). Lets every client author their own; aligns with SRW's user-authored-skills goal.
-- **SRW already ships 2 of these** — `todo-guide` (the planning skill, `before_tool: next_phase_todos` enforced gate) and `research-guide` (scholar research, `phase: tactical`). This extends a pattern that is already right.
+- **SRW already ships 2 of these** — `todo-guide` (the planning skill, `before_tool:next_phase_todos` enforced gate) and `research-guide` (scholar research, `phase_start:tactical`, once per phase). This extends a pattern that is already right.
 
 ## Headline finding: a two-layer split
 
@@ -123,7 +124,7 @@ Applying [[default_expert_roster]]'s "few well-specified > many" rule (Anthropic
 | Skill | Body covers | Validation | SRW mapping |
 |---|---|---|---|
 | **`systematic-debugging`** | Hypothesis → instrument → reproduce → isolate root cause **before** fixing; one change at a time | superpowers + Cursor Debug Mode + community `SKILL.md` | model-invoked via `use_skill` |
-| **`verify-before-done`** | Run verification commands, confirm output, gather evidence **before** any success/completion claim | superpowers `verification-before-completion` + MAST FM-3.2/3.3 (17.3%) | tactical `todo_complete` gate + `check_goal` node — **candidate for an *enforced* binding** |
+| **`verify-before-done`** | Run verification commands, confirm output, gather evidence **before** any success/completion claim | superpowers `verification-before-completion` + MAST FM-3.2/3.3 (17.3%) | **shipped read-gates:** tactical `todo_complete` + strategic `job_complete`, current phase and ≤20 turns |
 | **`planning-and-decomposition`** | Research → clarify → plan with file paths/owners → await approval; break work into verifiable units | Cursor ("single most impactful") + superpowers `writing-plans` + MAST FM-1.1/1.5 (24%) | **already shipped** as `todo-guide`, bound `before_tool: next_phase_todos` (enforced) |
 | **`brainstorming`** | Structured divergent exploration (generate many options, defer judgment) before converging | superpowers `brainstorming` | model-invoked; the one **non-code** creative procedure — serves writers/researchers/analysts |
 
@@ -144,7 +145,7 @@ These are heavily validated but **dev/coordination-leaning** rather than truly u
 
 | Expert | Skill | Note |
 |---|---|---|
-| **scholar** | `research-methodology` + citation discipline | **already shipped** as `research-guide` (`phase: tactical`) → `cite_web` / `kb_write`; the most concrete existing mapping |
+| **scholar** | `research-methodology` + citation discipline | **already shipped** as `research-guide` (`phase_start:tactical`, once per phase) → `cite_web` / `kb_write`; the most concrete existing mapping |
 | **developer** | dev bundle (debug / TDD / review / onboarding) | delivered as **enforced phase bindings**, not optional menu entries |
 | **critic** | `receiving-code-review` + verification rigor | → strategic verdict tools |
 | **writer** | long-form / technical writing & editing | ⚠️ **weakest validation in the roster** — no vendor ships a generic *prose procedure*, only artifact tools (docx, doc-coauthoring). Spike before committing. → `webdav_*` export |
@@ -161,7 +162,7 @@ These are heavily validated but **dev/coordination-leaning** rather than truly u
 Worth stating plainly: **SRW is already ~2/8 of the way to this roster.** [[agent_skills]] Slice 3 migrated:
 
 - **`todo-guide`** → bound `before_tool: next_phase_todos` (enforced gate). This **is** the `planning-and-decomposition` skill, already in production behind the enforced-binding mechanism.
-- **`research-guide`** → bound `phase: tactical`. This **is** the scholar `research-methodology` skill.
+- **`research-guide`** → bound `phase_start:tactical`, injected once per concrete phase. This **is** the scholar `research-methodology` skill.
 
 And the **enforced-gate pattern** SRW built is exactly the model `superpowers` validates ("mandatory workflows, not suggestions"). So this roster is not a from-scratch build — it extends a substrate and a pattern that are already correct.
 
@@ -182,19 +183,23 @@ Distilled from the primary best-practices sources ([`skill-creator/SKILL.md`](ht
 
 The research deliberately surfaced four questions the sources cannot settle — they are product/packaging calls:
 
-1. **TDD & `code-review`: Tier 2 or Tier 3?** The most-validated candidates, but software-specific. A knowledge-work/home deployment may want them off by default; a dev shop wants them always-on. **(Partially resolved 2026-06-25: both built as Tier-2 model-invoked catalog entries. `code-review` ships universal (critique transfers as a frame); `test-driven-development` ships code-scoped (transfer is principle-only). Neither is hard-bound yet — the optional `critic`/`developer` `phase:tactical` bindings are deferred together as a later "wire skills to home experts" pass, pending the deep-merge re-list cost.)**
+1. **TDD & `code-review`: Tier 2 or Tier 3?** The most-validated candidates, but software-specific. A knowledge-work/home deployment may want them off by default; a dev shop wants them always-on. **(Partially resolved 2026-06-25: both built as Tier-2 model-invoked catalog entries. `code-review` ships universal (critique transfers as a frame); `test-driven-development` ships code-scoped (transfer is principle-only). Neither is hard-bound yet — optional `critic`/`developer` bindings would now use one-shot `phase_start:tactical`, never continuous injection.)**
 2. **Do coding-validated skills transfer to pure knowledge-work?** This is the central **unmeasured** premise — *every* strong validation source (superpowers, Cursor, Cline) is a **coding** ecosystem. No source measures `systematic-debugging`'s value for non-code research/writing. Plausible (the procedures are general) but it is extrapolation. **Recommended de-risk:** run one SRW eval job with a draft `systematic-debugging` skill on a *non-coding* task before committing it to the core.
 3. **Model-invoked vs. enforced/gated, per skill?** Evidence supports both. Likely mix: *enforce* `verify-before-done` (and keep the existing enforced `planning`), leave `brainstorming` / `systematic-debugging` model-invoked. Tune on SRW's own eval set, per Anthropic's "match your evaluation tasks" guidance.
 4. **Build `writer` first?** It is the planned new writer expert ([[default_expert_roster]]) but the **weakest-validated** roster entry — no vendor ships a generic prose *procedure*. A spike is warranted before baseline commitment.
 
 ## Enforcement model & follow-ups
 
-Skills can be delivered at three escalating levels of enforcement. Authoring the `SKILL.md` (the guidance) is independent of which level it is bound at — and `verify-before-done`, the first build, deliberately ships at the lowest level, with the higher two captured here as follow-ups. The same ladder applies to any skill where compliance matters.
+Skills can be delivered at three escalating levels of enforcement. Authoring the
+`SKILL.md` is independent of its binding. The original
+`verify-before-done` rollout shipped at guidance level; its read-gate level
+shipped on 2026-08-03 after a live Scholar run showed that repeated guidance
+could restart verification rather than finish it.
 
 | Tier | Mechanism | Status for `verify-before-done` |
 |---|---|---|
-| **A — Guidance** | Author the `SKILL.md`; bind `phase:tactical` so the body auto-injects whenever the agent is doing tactical work (where completion happens). Portable; no orchestrator changes. | **✅ Shipped 2026-06-22** (worker experts). |
-| **B — Read-gate** | The *existing* `before_tool` enforce binding (as `todo-guide` uses on `next_phase_todos`): the action is refused until the agent has read the skill. | **Available, not used here** — forces *reading*, not *doing*. |
+| **A — Guidance** | Author the `SKILL.md`; use model invocation or a checkpointed `phase_start` binding when orientation is needed. Continuous full-body injection is not supported. | **Superseded for this skill 2026-08-03.** |
+| **B — Read-gate** | A `before_tool` enforce binding refuses the action until the agent has read the skill; phase scope and turn freshness can be required. | **✅ Shipped 2026-08-03** for `todo_complete` and `job_complete` (current phase, ≤20 turns). |
 | **C — Trace-gate** | Orchestrator-side check at `check_goal` / the completion gate: reject `goal_achieved` / `todo_complete` unless a workspace tool actually ran in the current tactical phase **and** its output is referenced in the completion payload; on failure, re-inject the body and force another loop. | **Deferred** — new infra, its own design doc. |
 
 **The key distinction (B vs C):** "the agent read the skill" ≠ "the agent performed verification." B only proves the body was in context; the agent can read it and still claim success without running anything. C is the only tier that checks the *behavior*. The verify-before-done research argues C is necessary (it cites a "compliance gap" where models promise to follow a process in text but skip the execution) — and C is *general* completion-integrity infra that would harden every skill, which is why it belongs in its own design doc rather than riding on this one.

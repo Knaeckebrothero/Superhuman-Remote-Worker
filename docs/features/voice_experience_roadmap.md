@@ -15,9 +15,20 @@ related:
   - "[[custom_llm_endpoints]]"
   - "[[auxiliary]]"
   - "[[db_backed_llm_config]]"
+  - "[[supervisor_control_plane_and_live_talk]]"
 ---
 
 # Voice Experience Roadmap (voice-in / voice-out)
+
+> **Sibling track — live talk mode.** Real-time conversational voice (talk
+> to an agent *while* it works, using the OpenAI Realtime API) is **not**
+> part of this roadmap. It turned out to be a client of the officer's
+> steering API rather than a TTS feature, and is designed separately in
+> **[[supervisor_control_plane_and_live_talk]]**. The split is deliberate:
+> the Realtime model caps at ~4,096 output tokens (~3.5 min of speech), so
+> **this** pipeline keeps all long-form narration. Realtime owns
+> conversation; the rewrite → chunk → synthesize pipeline owns reading
+> things aloud.
 
 > Make read-aloud feel first-class instead of bolted-on: a transparent status
 > box that morphs into a custom themed audio player, voices picked from the

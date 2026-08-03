@@ -9,6 +9,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from src.core.loader import InstructionFileEntry
 from src.tools.context import ToolContext
 from src.tools.registry import (
     TOOL_REGISTRY,
@@ -619,6 +620,34 @@ class TestApplyInstructionEnforcement:
         ctx.record_file_read("guide_b.md")
         result = tool.func()
         assert result == "my_tool called"
+
+    def test_wrapper_evaluates_phase_and_freshness_at_invocation_time(self):
+        ctx = ToolContext()
+        entry = InstructionFileEntry(
+            trigger="before_tool:todo_complete",
+            skill="verify-before-done",
+            phases=["tactical"],
+            read_scope="phase",
+            max_read_age_turns=20,
+        )
+        ctx._instruction_files = [entry]
+        tool = self._make_tool("todo_complete")
+        apply_instruction_enforcement([tool], ctx)
+
+        # Strategic todo completion is deliberately outside this binding.
+        ctx.set_current_phase("strategic", phase_number=1, turn_count=1)
+        assert tool.func() == "todo_complete called"
+
+        # The same wrapped tool closes when execution enters tactical mode.
+        ctx.set_current_phase("tactical", phase_number=2, turn_count=2)
+        assert entry.path in tool.func()
+        ctx.record_file_read(entry.path)
+        assert tool.func() == "todo_complete called"
+
+        # The wrapper consults current state on every invocation, so expiry
+        # closes it without reloading or re-wrapping the tool.
+        ctx.set_current_phase("tactical", phase_number=2, turn_count=23)
+        assert entry.path in tool.func()
 
 
 # =============================================================================

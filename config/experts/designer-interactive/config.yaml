@@ -32,7 +32,9 @@ workspace:
 
 instruction_files:
   - file: design_guide.md
-    trigger: on_setup
+    # Persistent sessions have no phase loop. Require the guide at the first
+    # artifact write instead of relying on an unimplemented setup injection.
+    trigger: before_tool:write_file
     enforce: true
 
 tools:

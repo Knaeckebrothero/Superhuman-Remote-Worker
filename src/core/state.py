@@ -48,6 +48,7 @@ class UniversalAgentState(TypedDict):
         phase_number: Increments at each phase transition (for tracking/logging)
         is_final_phase: True when job_complete was called, job completes when todos done
         turn_count: LLM call counter, used by memory extraction to trigger every N turns
+        phase_instruction_injections: Checkpointed once-per-phase instruction keys
         last_observed_turn: Last turn when memory extraction ran (for interval tracking)
 
         # File-based context
@@ -87,6 +88,7 @@ class UniversalAgentState(TypedDict):
     phase_number: int  # Increments at each phase transition
     is_final_phase: bool  # True when job_complete called, awaiting todo completion
     turn_count: int  # LLM call counter (for memory extraction interval)
+    phase_instruction_injections: List[str]  # Once-per-phase instruction keys
     last_observed_turn: int  # Last turn when memory extraction ran
     last_assembled_turn: int  # Last turn when memory assembler ran
 
@@ -191,6 +193,7 @@ def create_initial_state(
         phase_number=1,
         is_final_phase=False,
         turn_count=0,
+        phase_instruction_injections=[],
         last_observed_turn=0,
         last_assembled_turn=0,
         # File-based context
