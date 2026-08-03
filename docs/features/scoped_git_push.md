@@ -287,7 +287,11 @@ token (refreshed)". Aligns with the Vault/secret-source direction in
   ([[repo_datasource]] §4) still limits to one repository datasource per job.
   (`useHttpPath` is specified anyway so the design is robust if that lifts.)
 - **PR creation** — a fine-grained PAT with `Pull requests: write` + `gh`/API
-  makes this a small follow-on; not in v1.
+  makes this a small follow-on; not in v1. Its first motivating consumer is
+  agent-maintained documentation ([[documentation_drift_maintenance]]): the same
+  drift-fix intelligence opens a PR in the SRW repo via CI `GITHUB_TOKEN` today,
+  and in a *user's* repo via this feature once built — one feature, two
+  credential backends.
 - **SSH deploy-key extension** — the SSH path stays as-is; not extended here.
 - **Hiding the token from the agent** (Posture 2/3) — future work.
 
@@ -335,6 +339,7 @@ token (refreshed)". Aligns with the Vault/secret-source direction in
 
 ## Related
 
+- [[documentation_drift_maintenance]] — a consumer of the write/PR path; the cross-repo doc-freshness capability this feature unlocks.
 - [[repo_datasource]] — clone flow this builds on; its deferred write tools land here.
 - [[credential_file_datasources]] — materialization, cleanup manifest, encryption-at-rest, Posture 1.
 - [[coding_agent]] — primary consumer (clone → change → push/PR).
