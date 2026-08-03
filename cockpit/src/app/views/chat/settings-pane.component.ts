@@ -13,15 +13,14 @@ import {
 import {TranslocoPipe} from '@jsverse/transloco';
 import {forkJoin} from 'rxjs';
 import {AgentSettingsComponent} from '../agent-settings/agent-settings.component';
+import {readConfigPath} from '../agent-settings/agent-settings.types';
 import {
-    LIVE_TOOL_CATEGORIES,
-    SESSION_TOOL_GROUP_NAMES,
-    readConfigPath,
-    toolGroupDefaultsConfig,
-} from '../agent-settings/agent-settings.types';
+    enabledCategoryKeys,
+    toolsFragment,
+} from '../agent-settings/resolved-toolset';
 import {deepMergeConfig} from '../agent-settings/config-merge';
 import {PersistentChatService, NarrationMode, PermissionMode} from '../../core/services/persistent-chat.service';
-import {ApiService} from '../../core/services/api.service';
+import {ApiService, SessionToolGroupsResponse} from '../../core/services/api.service';
 import {CapabilitiesService} from '../../core/services/capabilities.service';
 import {ModelService} from '../../core/services/model.service';
 import {Datasource} from '../../core/models/api.model';
@@ -78,6 +77,7 @@ const APPLY_DEBOUNCE_MS = 400;
           <app-agent-settings
             mode="live"
             [config]="liveConfig()"
+            [resolvedToolset]="resolvedToolset()"
             [disabled]="!chat.isConnected()"
             [gatedCapabilities]="capabilities.grants() ?? null"
             [datasources]="pickerDatasources()"
@@ -210,15 +210,15 @@ export class SettingsPaneComponent {
 
     /** Redacted config_override from thread metadata (fetched on open). */
     private readonly threadOverride = signal<Record<string, unknown>>({});
-    /** Server-resolved tool-group enablement; null = unknown (not fetched yet,
-     *  older orchestrator, or the request failed) → the session_base mirror
-     *  stands in. Always set BEFORE prefill/anchor — see loadThread. */
-    private readonly serverToolGroups = signal<Record<string, boolean> | null>(null);
-    /** Tool-group defaults expanded into a config fragment, merged UNDER the
-     *  thread override so an unset group resolves to its real default rather
-     *  than reading as enabled. */
-    private readonly toolGroupDefaults = computed(() =>
-        toolGroupDefaultsConfig(this.serverToolGroups()),
+    /** The session's resolved toolset — the agent's own answer where there is
+     *  one. null = not fetched yet, older orchestrator, or the request failed;
+     *  the tools surface then degrades to its static list. Always set BEFORE
+     *  prefill/anchor — see loadThread. */
+    readonly resolvedToolset = signal<SessionToolGroupsResponse | null>(null);
+    /** The categories the answer says are ON — the diff baseline, and the one
+     *  definition of "enabled" this pane uses. */
+    private readonly resolvedCategories = computed(
+        () => this.resolvedToolset()?.categories ?? null,
     );
     readonly loadingThread = signal(false);
     /** The session's currently attached datasource ids (durable selection;
@@ -237,14 +237,16 @@ export class SettingsPaneComponent {
     private lastApplied: Record<string, unknown> | null = null;
     private applyTimer: ReturnType<typeof setTimeout> | null = null;
 
-    /** The session's current effective config: the resolved tool-group
-     *  defaults, overlaid with the durable overrides, overlaid with the live
-     *  signals (which win — they track config.changed acks, so the sub-groups'
-     *  "resolved default" is always the running state).
+    /** The session's current effective config: the durable overrides overlaid
+     *  with the live signals (which win — they track config.changed acks, so
+     *  the sub-groups' "resolved default" is always the running state).
      *
-     *  The defaults layer is what makes an absent `tools.<group>` render and
-     *  diff as DISABLED when the base config ships it empty. deepMergeConfig
-     *  replaces arrays wholesale, so an explicitly pinned group still wins. */
+     *  Tool groups are NOT in here any more. They used to ride a synthesised
+     *  defaults layer, because a config-shaped fragment was the only way to
+     *  tell the tools control which groups were on. The resolved read answers
+     *  that directly and answers it better — it sees the runtime injection
+     *  layer, the backend capability gate and the grants, none of which any
+     *  config layer can express. */
     readonly liveConfig = computed(() => {
         const live: Record<string, unknown> = {
             llm: {
@@ -256,10 +258,7 @@ export class SettingsPaneComponent {
                 narration_mode: this.chat.narrationMode(),
             },
         };
-        return deepMergeConfig(
-            deepMergeConfig(this.toolGroupDefaults(), this.threadOverride()),
-            live,
-        );
+        return deepMergeConfig(this.threadOverride(), live);
     });
 
     readonly workspaceTier = computed(() =>
@@ -319,9 +318,25 @@ export class SettingsPaneComponent {
 
     private loadThread(threadId: string): void {
         this.loadingThread.set(true);
-        // Honest "unknown" while loading: the mirror stands in until the
-        // server answers, so liveConfig() is never momentarily wrong.
-        this.serverToolGroups.set(null);
+        // EVERY per-thread anchor is dropped here, before the fetch, and the
+        // baseline most of all. `lastApplied` used to survive a thread switch:
+        // for the whole request window `applyChanges` would diff the NEW
+        // session's desired state against the OLD session's baseline and
+        // dispatch the difference — into the new session. `threadOverride`
+        // had the same shape of bug, feeding liveConfig() the previous
+        // thread's durable config while the pane already pointed elsewhere.
+        // The window was sub-second until the read grew a pod probe; it is now
+        // up to 8s. Clearing the baseline is not merely safer, it is what
+        // makes applyChanges' "no baseline ⇒ re-arm, never absorb" guard
+        // actually cover a session switch.
+        this.lastApplied = null;
+        this.threadOverride.set({});
+        this.attachedIds.set([]);
+        this.pickerDatasources.set([]);
+        // Honest "unknown" while loading: the tools surface degrades to its
+        // static list until the server answers, so nothing is shown as
+        // measured that has not been measured.
+        this.resolvedToolset.set(null);
         // forkJoin, NOT two independent subscribes: the tool-group answer must
         // land BEFORE prefillFromConfig and BEFORE the lastApplied anchor. If
         // it arrived after, liveConfig() would shift under a stale baseline and
@@ -337,7 +352,7 @@ export class SettingsPaneComponent {
             // user is actually looking at.
             if (this.chat.threadId() !== threadId) return;
             this.loadingThread.set(false);
-            this.serverToolGroups.set(toolGroups);
+            this.resolvedToolset.set(toolGroups);
             const metadata = (thread?.['metadata'] ?? {}) as Record<string, unknown>;
             const override = (metadata['config_override'] ?? {}) as Record<string, unknown>;
             this.threadOverride.set(override);
@@ -350,12 +365,16 @@ export class SettingsPaneComponent {
             this.attachedIds.set(ids);
 
             // Prefill the sub-groups' baselines from the effective config
-            // (tools group derives its enabled/disabled baseline here; this
-            // also clears any pins made while the fetch was in flight — the
-            // datasource picker gets the same reset), then anchor the diff
+            // (this also clears any pins made while the fetch was in flight —
+            // the datasource picker gets the same reset), then anchor the diff
             // baseline to the CONFIG-ONLY state — never to getOverrides(),
             // which would silently absorb a pending pin.
             this.settings()?.prefillFromConfig(this.liveConfig());
+            // Tool groups anchor to the AGENT's answer, not to the config: the
+            // config says what was asked for and the answer says what is held,
+            // and on a real session those differed by 28 names.
+            const categories = this.resolvedCategories();
+            if (categories) this.settings()?.prefillFromResolvedToolset(categories);
             this.settings()?.resetDatasourceSelection();
             this.lastApplied = this.desiredState({});
 
@@ -406,13 +425,20 @@ export class SettingsPaneComponent {
         state['interactive.narration_mode'] =
             readConfigPath(overrides, 'interactive.narration_mode')
             ?? readConfigPath(config, 'interactive.narration_mode');
-        for (const cat of LIVE_TOOL_CATEGORIES) {
-            const pinned = readConfigPath(overrides, `tools.${cat.key}`) as unknown[] | null;
-            if (pinned !== null) {
-                state[`tools.${cat.key}`] = pinned.length > 0;
-            } else {
-                const current = readConfigPath(config, `tools.${cat.key}`) as unknown[] | null;
-                state[`tools.${cat.key}`] = !(Array.isArray(current) && current.length === 0);
+        // Every category the server answered for, not a hand-picked four. A
+        // pinned value normalises to a boolean so a policy spelling (`true`,
+        // `{only: [...]}`, a name list) never masquerades as a change; the
+        // unpinned value comes from the resolved answer, which is the only
+        // thing that knows whether the agent actually holds the category.
+        const categories = this.resolvedCategories();
+        if (categories) {
+            const on = enabledCategoryKeys(categories);
+            for (const key of Object.keys(categories)) {
+                const pinned = readConfigPath(overrides, `tools.${key}`);
+                state[`tools.${key}`] =
+                    pinned !== null && pinned !== undefined
+                        ? !(Array.isArray(pinned) && pinned.length === 0) && pinned !== false
+                        : on.has(key);
             }
         }
         // Canonical joined form so the diff is a plain string compare. The
@@ -442,11 +468,24 @@ export class SettingsPaneComponent {
                 llm[path.split('.')[1]] = desired[path];
             }
         }
-        for (const cat of LIVE_TOOL_CATEGORIES) {
-            const key = `tools.${cat.key}`;
-            if (desired[key] !== previous[key]) {
-                tools[cat.key] = desired[key] ? [...SESSION_TOOL_GROUP_NAMES[cat.key]] : [];
-            }
+        const categories = this.resolvedCategories();
+        if (categories) {
+            const unsettable = new Set(
+                Object.keys(categories).filter((key) => categories[key].settable === false),
+            );
+            Object.assign(
+                tools,
+                toolsFragment(Object.keys(categories), {
+                    disabled: new Set(
+                        Object.keys(categories).filter((key) => !desired[`tools.${key}`]),
+                    ),
+                    baselineOn: new Set(
+                        Object.keys(categories).filter((key) => !!previous[`tools.${key}`]),
+                    ),
+                    unsettable,
+                    enumerateOnly: this.resolvedToolset()?.enumerate_only ?? null,
+                }),
+            );
         }
         if (Object.keys(llm).length) fragment['llm'] = llm;
         if (Object.keys(tools).length) fragment['tools'] = tools;

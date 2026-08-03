@@ -2563,58 +2563,123 @@
       "0": "Unlimited"
     },
     "tools": {
+      "countBound": "{{n}} bound",
+      "countPredicted": "{{n}} predicted",
       "group": "Tools",
       "maxDepth": "Max depth",
-      "timeout": "Timeout (sec)"
+      "provenance": {
+        "measured": "Live from the running agent",
+        "measured_partial": "Live from the running agent — partial answer",
+        "predicted": "Predicted, not measured",
+        "unknown": "The resolved toolset could not be read"
+      },
+      "timeout": "Timeout (sec)",
+      "unknownCategory": "This cockpit build has no description for this category."
     },
     "toolCategories": {
-      "research": {
-        "label": "Research",
-        "description": "Ability to search the web, find academic papers, and browse websites"
+      "agent_catalog": {
+        "label": "Experts & Skills",
+        "description": "Ability to manage experts and skills"
       },
       "browser_direct": {
         "label": "Browser",
         "description": "Direct browser control — navigate, click, type, screenshot, and visually verify pages"
       },
+      "canvas": {
+        "label": "Canvas",
+        "description": "Ability to present workspace files in the shared session Canvas"
+      },
       "citation": {
         "label": "Citation",
         "description": "Ability to track sources, manage citations, and generate bibliographies"
-      },
-      "shell": {
-        "label": "Shell",
-        "description": "Ability to run shell commands in a sandboxed terminal"
       },
       "communication": {
         "label": "Communication",
         "description": "Ability to send email messages to you or your team"
       },
+      "core": {
+        "label": "Core",
+        "description": "Planning, progress and completion — todos, replanning, notifications, sleep"
+      },
       "delegation": {
         "label": "Delegation",
         "description": "Ability to spawn subagents that work in parallel"
       },
-      "canvas": {
-        "label": "Canvas",
-        "description": "Ability to present workspace files in the shared session Canvas"
+      "email": {
+        "label": "Email",
+        "description": "Read and send through an attached email datasource"
       },
-      "orchestrator": {
-        "label": "Fleet Management",
-        "description": "Ability to inspect and steer SRW jobs, projects, repositories, and session workspace upgrades"
+      "evaluation": {
+        "label": "Evaluation",
+        "description": "Approve or return worker jobs with feedback"
       },
-      "agent_catalog": {
-        "label": "Experts & Skills",
-        "description": "Ability to manage experts and skills"
+      "git": {
+        "label": "Git",
+        "description": "Ability to inspect workspace version history"
       },
-      "workflows": {
-        "label": "Automations & Loops",
-        "description": "Ability to inspect automations and project loops, and draft disabled automations"
+      "graph": {
+        "label": "Graph",
+        "description": "Query attached Neo4j datasources"
       },
       "knowledge": {
         "label": "Knowledge",
         "description": "Ability to read and write to the project knowledge base"
       },
-      "git": {
-        "label": "Git",
-        "description": "Ability to inspect workspace version history"
+      "loop": {
+        "label": "Project Loop",
+        "description": "Plan an autonomous project loop"
+      },
+      "mcp": {
+        "label": "MCP Servers",
+        "description": "Tools discovered from attached MCP servers at session start"
+      },
+      "mongodb": {
+        "label": "MongoDB",
+        "description": "Query attached MongoDB datasources"
+      },
+      "orchestrator": {
+        "label": "Fleet Management",
+        "description": "Ability to inspect and steer SRW jobs, projects, repositories, and session workspace upgrades"
+      },
+      "product_help": {
+        "label": "Product Help",
+        "description": "Read the SRW product guide and capability reference"
+      },
+      "repo": {
+        "label": "Repositories",
+        "description": "Read and write attached repository datasources"
+      },
+      "research": {
+        "label": "Research",
+        "description": "Ability to search the web, find academic papers, and browse websites"
+      },
+      "session_task": {
+        "label": "Session Tasks",
+        "description": "The session's own task list"
+      },
+      "shell": {
+        "label": "Shell",
+        "description": "Ability to run shell commands in a sandboxed terminal"
+      },
+      "sql": {
+        "label": "SQL",
+        "description": "Query attached PostgreSQL datasources"
+      },
+      "unclassified": {
+        "label": "Other",
+        "description": "Tools this cockpit build does not recognise — usually discovered at runtime"
+      },
+      "webdav": {
+        "label": "Cloud Storage",
+        "description": "Read and write files on attached WebDAV / cloud datasources"
+      },
+      "workflows": {
+        "label": "Automations & Loops",
+        "description": "Ability to inspect automations and project loops, and draft disabled automations"
+      },
+      "workspace": {
+        "label": "Workspace Files",
+        "description": "Read, write, move and search files in the session workspace"
       }
     },
     "model": {

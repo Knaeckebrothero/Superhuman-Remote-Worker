@@ -3,14 +3,27 @@ import {HttpTestingController, provideHttpClientTesting} from '@angular/common/h
 import {Injector, runInInjectionContext, signal} from '@angular/core';
 import {TestBed} from '@angular/core/testing';
 import {Router} from '@angular/router';
+import {of} from 'rxjs';
 import {TranslocoService} from '@jsverse/transloco';
 import {afterEach, describe, expect, it, vi} from 'vitest';
 import {CapabilitiesService} from '../../core/services/capabilities.service';
 import {ErrorMessageService} from '../../core/services/error-message.service';
 import {ModelService} from '../../core/services/model.service';
 import {UserService} from '../../core/services/user.service';
+import {ApiService} from '../../core/services/api.service';
 import {ModelGroupComponent} from '../agent-settings/model-group.component';
 import {protectedCloudToggleVisible, SessionCreateComponent} from './session-create.component';
+
+/**
+ * The tool-groups preview is the only thing the form uses ApiService for, and
+ * it is deliberately stubbed in the existing setups: those tests drive raw
+ * HttpTestingController expectations and a real ApiService would drag the
+ * whole transloco provider tree in behind it. The preview wiring gets its own
+ * describe at the bottom, where the stub IS the subject.
+ */
+function stubApi(preview: unknown = null) {
+  return {previewToolGroups: vi.fn().mockReturnValue(of(preview))};
+}
 
 describe('protectedCloudToggleVisible', () => {
   it('hidden when feature off', () => {
@@ -52,6 +65,7 @@ describe('SessionCreateComponent framework defaults', () => {
             grants: signal(null),
           },
         },
+        {provide: ApiService, useValue: stubApi()},
       ],
     });
     TestBed.overrideComponent(SessionCreateComponent, {
@@ -119,6 +133,7 @@ describe('SessionCreateComponent submit flow', () => {
           provide: CapabilitiesService,
           useValue: {protectedCloudAvailable: signal(false), grants: signal(null)},
         },
+        {provide: ApiService, useValue: stubApi()},
       ],
     });
     TestBed.overrideComponent(SessionCreateComponent, {set: {imports: [], template: ''}});
@@ -245,6 +260,7 @@ describe('SessionCreateComponent — reasoning pick lost to an involuntary prefi
           provide: CapabilitiesService,
           useValue: {protectedCloudAvailable: signal(false), grants: signal(null)},
         },
+        {provide: ApiService, useValue: stubApi()},
       ],
     });
     TestBed.overrideComponent(SessionCreateComponent, {set: {imports: [], template: ''}});
@@ -382,5 +398,165 @@ describe('SessionCreateComponent — reasoning pick lost to an involuntary prefi
     expect(modelGroup.sessionModel()).toBe('gpt-5.6-sol');
 
     http.verify();
+  });
+});
+
+
+describe('SessionCreateComponent tool preview', () => {
+  afterEach(() => TestBed.resetTestingModule());
+
+  function setup(preview: unknown) {
+    const api = stubApi(preview);
+    TestBed.configureTestingModule({
+      providers: [
+        provideHttpClient(),
+        provideHttpClientTesting(),
+        {provide: Router, useValue: {navigate: vi.fn()}},
+        {provide: UserService, useValue: {currentUserId: signal<string | null>(null)}},
+        {provide: ModelService, useValue: {load: vi.fn()}},
+        {provide: ErrorMessageService, useValue: {translate: (_e: unknown, f: string) => f}},
+        {
+          provide: CapabilitiesService,
+          useValue: {protectedCloudAvailable: signal(false), grants: signal(null)},
+        },
+        {provide: ApiService, useValue: api},
+      ],
+    });
+    TestBed.overrideComponent(SessionCreateComponent, {set: {imports: [], template: ''}});
+    const fixture = TestBed.createComponent(SessionCreateComponent);
+    const http = TestBed.inject(HttpTestingController);
+    return {fixture, http, api};
+  }
+
+  const ANSWER = {
+    source: 'resolved',
+    origin: 'prediction',
+    observed_at: null,
+    prediction_reason: 'no agent exists for an unsaved session',
+    enumerate_only: {shell: ['run_command']},
+    tool_groups: {},
+    categories: {
+      canvas: {state: 'on', settable: true, reason: null, decided_by: 'base', tools: ['get_canvas']},
+      shell: {
+        state: 'unavailable',
+        settable: false,
+        reason: 'requires the shell_tools capability grant',
+        decided_by: 'grant',
+        tools: [],
+      },
+    },
+  };
+
+  it('routes the preview EXACTLY as createSession routes the create', () => {
+    // A preview that resolved a different expert layer from the create it
+    // previews would be this series' defect rebuilt in the surface built to
+    // prevent it. `source: 'user'` marks a DB expert, which must go by
+    // expert_id with config_name held at the persistent base.
+    const {fixture, api} = setup(ANSWER);
+    const component = fixture.componentInstance;
+    component.toggleExpert({
+      id: 'db-expert-1',
+      display_name: 'Coder',
+      description: '',
+      icon: 'code',
+      color: '#fff',
+      tags: [],
+      source: 'user',
+    } as never);
+
+    expect(api.previewToolGroups).toHaveBeenCalledWith({
+      config_name: 'session_base',
+      expert_id: 'db-expert-1',
+      project_id: null,
+    });
+  });
+
+  it('a bundled expert previews by config_name, matching create', () => {
+    const {fixture, api} = setup(ANSWER);
+    fixture.componentInstance.toggleExpert({
+      id: 'scholar',
+      display_name: 'Scholar',
+      description: '',
+      icon: 'school',
+      color: '#fff',
+      tags: [],
+      source: 'bundled',
+    } as never);
+
+    expect(api.previewToolGroups).toHaveBeenCalledWith({
+      config_name: 'scholar',
+      expert_id: null,
+      project_id: null,
+    });
+  });
+
+  it('the answer reaches the settings surface and re-anchors the tool switches', () => {
+    const {fixture, api} = setup(ANSWER);
+    const component = fixture.componentInstance;
+    const prefill = vi.fn();
+    component.agentSettings = {
+      prefillFromConfig: vi.fn(),
+      prefillFromResolvedToolset: prefill,
+      hasToolEdits: () => false,
+    } as never;
+
+    component.toggleExpert({
+      id: 'scholar', display_name: 'S', description: '', icon: 'x', color: '#fff', tags: [],
+      source: 'bundled',
+    } as never);
+
+    expect(component.toolPreview()).toEqual(ANSWER);
+    expect(prefill).toHaveBeenCalledWith(ANSWER.categories);
+    expect(api.previewToolGroups).toHaveBeenCalled();
+  });
+
+  it('a late answer never clobbers a switch the user has already flipped', () => {
+    // Same class of bug as the live pane's, on the other surface: the config
+    // prefill has already run by the time this lands.
+    const {fixture} = setup(ANSWER);
+    const component = fixture.componentInstance;
+    const prefill = vi.fn();
+    component.agentSettings = {
+      prefillFromConfig: vi.fn(),
+      prefillFromResolvedToolset: prefill,
+      hasToolEdits: () => true,
+    } as never;
+
+    component.toggleExpert({
+      id: 'scholar', display_name: 'S', description: '', icon: 'x', color: '#fff', tags: [],
+      source: 'bundled',
+    } as never);
+
+    // The prediction still renders — it is what the rows read — but the
+    // baseline is left alone.
+    expect(component.toolPreview()).toEqual(ANSWER);
+    expect(prefill).not.toHaveBeenCalled();
+  });
+
+  it('the project selection moves the prediction, because the project layer can', () => {
+    const {fixture, api} = setup(ANSWER);
+    fixture.componentInstance.toggleProject('proj-1');
+
+    expect(api.previewToolGroups).toHaveBeenLastCalledWith({
+      config_name: 'session_base',
+      expert_id: null,
+      project_id: 'proj-1',
+    });
+  });
+
+  it('a failed preview leaves the surface with no answer rather than a wrong one', () => {
+    const {fixture} = setup(null);
+    const component = fixture.componentInstance;
+    const prefill = vi.fn();
+    component.agentSettings = {
+      prefillFromConfig: vi.fn(),
+      prefillFromResolvedToolset: prefill,
+      hasToolEdits: () => false,
+    } as never;
+
+    component.toggleProject('proj-1');
+
+    expect(component.toolPreview()).toBeNull();
+    expect(prefill).not.toHaveBeenCalled();
   });
 });

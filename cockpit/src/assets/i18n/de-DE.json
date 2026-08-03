@@ -2554,58 +2554,123 @@
       "0": "Unbegrenzt"
     },
     "tools": {
+      "countBound": "{{n}} gebunden",
+      "countPredicted": "{{n}} vorhergesagt",
       "group": "Werkzeuge",
       "maxDepth": "Max. Tiefe",
-      "timeout": "Timeout (Sek.)"
+      "provenance": {
+        "measured": "Live vom laufenden Agenten",
+        "measured_partial": "Live vom laufenden Agenten — unvollständige Antwort",
+        "predicted": "Vorhergesagt, nicht gemessen",
+        "unknown": "Der aufgelöste Werkzeugsatz konnte nicht gelesen werden"
+      },
+      "timeout": "Timeout (Sek.)",
+      "unknownCategory": "Dieser Cockpit-Build hat keine Beschreibung für diese Kategorie."
     },
     "toolCategories": {
-      "research": {
-        "label": "Recherche",
-        "description": "Kann das Web durchsuchen, wissenschaftliche Quellen finden und Websites besuchen"
+      "agent_catalog": {
+        "label": "Experten & Skills",
+        "description": "Kann Experten und Skills verwalten"
       },
       "browser_direct": {
         "label": "Browser",
         "description": "Direkte Browser-Steuerung — navigieren, klicken, tippen, Screenshots erstellen und Seiten visuell verifizieren"
       },
+      "canvas": {
+        "label": "Canvas",
+        "description": "Kann Workspace-Dateien im gemeinsamen Sitzungs-Canvas präsentieren"
+      },
       "citation": {
         "label": "Zitation",
         "description": "Kann Quellen verfolgen, Zitate verwalten und Literaturverzeichnisse erstellen"
-      },
-      "shell": {
-        "label": "Shell",
-        "description": "Kann Shell-Befehle in einem isolierten Terminal ausführen"
       },
       "communication": {
         "label": "Kommunikation",
         "description": "Kann E-Mails an Sie oder Ihr Team versenden"
       },
+      "core": {
+        "label": "Kern",
+        "description": "Planung, Fortschritt und Abschluss — Aufgabenliste, Neuplanung, Benachrichtigungen, Schlafen"
+      },
       "delegation": {
         "label": "Delegation",
         "description": "Kann Subagenten starten, die parallel arbeiten"
       },
-      "canvas": {
-        "label": "Canvas",
-        "description": "Kann Workspace-Dateien im gemeinsamen Sitzungs-Canvas präsentieren"
+      "email": {
+        "label": "E-Mail",
+        "description": "Über eine angebundene E-Mail-Datenquelle lesen und senden"
       },
-      "orchestrator": {
-        "label": "Flottenverwaltung",
-        "description": "Kann SRW-Aufträge, Projekte, Repositories und Workspace-Upgrades für Sessions einsehen und steuern"
+      "evaluation": {
+        "label": "Bewertung",
+        "description": "Worker-Jobs freigeben oder mit Feedback zurückgeben"
       },
-      "agent_catalog": {
-        "label": "Experten & Skills",
-        "description": "Kann Experten und Skills verwalten"
+      "git": {
+        "label": "Git",
+        "description": "Kann den Versionsverlauf des Workspaces einsehen"
       },
-      "workflows": {
-        "label": "Automatisierungen & Loops",
-        "description": "Kann Automatisierungen und Projekt-Loops einsehen und deaktivierte Automatisierungen entwerfen"
+      "graph": {
+        "label": "Graph",
+        "description": "Angebundene Neo4j-Datenquellen abfragen"
       },
       "knowledge": {
         "label": "Wissen",
         "description": "Kann die Projekt-Wissensbasis lesen und beschreiben"
       },
-      "git": {
-        "label": "Git",
-        "description": "Kann den Versionsverlauf des Workspaces einsehen"
+      "loop": {
+        "label": "Projektschleife",
+        "description": "Eine autonome Projektschleife planen"
+      },
+      "mcp": {
+        "label": "MCP-Server",
+        "description": "Werkzeuge, die beim Sitzungsstart von angebundenen MCP-Servern erkannt werden"
+      },
+      "mongodb": {
+        "label": "MongoDB",
+        "description": "Angebundene MongoDB-Datenquellen abfragen"
+      },
+      "orchestrator": {
+        "label": "Flottenverwaltung",
+        "description": "Kann SRW-Aufträge, Projekte, Repositories und Workspace-Upgrades für Sessions einsehen und steuern"
+      },
+      "product_help": {
+        "label": "Produkthilfe",
+        "description": "SRW-Produkthandbuch und Funktionsübersicht lesen"
+      },
+      "repo": {
+        "label": "Repositories",
+        "description": "Angebundene Repository-Datenquellen lesen und schreiben"
+      },
+      "research": {
+        "label": "Recherche",
+        "description": "Kann das Web durchsuchen, wissenschaftliche Quellen finden und Websites besuchen"
+      },
+      "session_task": {
+        "label": "Sitzungsaufgaben",
+        "description": "Die eigene Aufgabenliste der Sitzung"
+      },
+      "shell": {
+        "label": "Shell",
+        "description": "Kann Shell-Befehle in einem isolierten Terminal ausführen"
+      },
+      "sql": {
+        "label": "SQL",
+        "description": "Angebundene PostgreSQL-Datenquellen abfragen"
+      },
+      "unclassified": {
+        "label": "Sonstige",
+        "description": "Werkzeuge, die dieser Cockpit-Build nicht kennt — meist zur Laufzeit erkannt"
+      },
+      "webdav": {
+        "label": "Cloud-Speicher",
+        "description": "Dateien in angebundenen WebDAV-/Cloud-Datenquellen lesen und schreiben"
+      },
+      "workflows": {
+        "label": "Automatisierungen & Loops",
+        "description": "Kann Automatisierungen und Projekt-Loops einsehen und deaktivierte Automatisierungen entwerfen"
+      },
+      "workspace": {
+        "label": "Arbeitsbereich-Dateien",
+        "description": "Dateien im Arbeitsbereich der Sitzung lesen, schreiben, verschieben und durchsuchen"
       }
     },
     "model": {

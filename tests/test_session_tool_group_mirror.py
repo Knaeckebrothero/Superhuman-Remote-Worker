@@ -1,94 +1,89 @@
-"""Pin the cockpit's mirror of the session tool-group vocabulary.
+"""The cockpit must not carry a hand-maintained mirror of the tool vocabulary.
 
-The live settings pane re-enables a tool group by sending the group's full
-canonical tool list (agent-settings.types.ts SESSION_TOOL_GROUP_NAMES); the
-agent and orchestrator validate it against the closed vocabulary in
-src/core/session_tool_overrides.py. A drift between the two turns a re-enable
-toggle into a hard 422 — this test fails the build instead.
+This file used to pin two such mirrors — ``SESSION_TOOL_GROUP_NAMES`` (a copy
+of ``SESSION_TOOL_OVERRIDE_NAMES``) and ``SESSION_TOOL_GROUP_BASE_ENABLED`` (a
+copy of ``config/session_base.yaml``'s enablement) — against drift. Pinning
+them was the right thing to do while they existed, and the drift it guarded
+against was real: a stale copy put the wrong tick on the screen.
+
+They are gone. The cockpit no longer needs either fact:
+
+* to turn a category ON it sends a POLICY (``true``, or the ``enumerate_only``
+  enumeration the response serves for a category that refuses ``true``), and
+  the write boundary expands it against the registry;
+* to know whether a category IS on it reads the resolved answer, which is the
+  agent's own report where there is one — a strictly better source than the
+  base config, which cannot see the runtime injection layer, the backend
+  capability gate, or a tool that failed to instantiate.
+
+So the test inverts. Rather than checking a copy is faithful, it checks the
+copy has not come back. A mirror that must be kept in sync is a defect with a
+delay on it, and this whole change is about removing that species.
 """
 
 import re
 from pathlib import Path
-
-from src.core.loader import load_and_merge_config, resolve_config_path
-from src.core.session_tool_overrides import SESSION_TOOL_OVERRIDE_NAMES
 
 TYPES_FILE = (
     Path(__file__).resolve().parents[1]
     / "cockpit/src/app/views/agent-settings/agent-settings.types.ts"
 )
 
-
-def _parse_ts_mirror() -> dict[str, frozenset[str]]:
-    src = TYPES_FILE.read_text(encoding="utf-8")
-    match = re.search(
-        r"export const SESSION_TOOL_GROUP_NAMES[^=]*=\s*\{(.*?)\n\};",
-        src,
-        re.DOTALL,
-    )
-    assert match, "SESSION_TOOL_GROUP_NAMES not found in agent-settings.types.ts"
-    body = match.group(1)
-    groups: dict[str, frozenset[str]] = {}
-    for group_match in re.finditer(r"(\w+):\s*\[(.*?)\]", body, re.DOTALL):
-        names = re.findall(r"'([^']+)'", group_match.group(2))
-        groups[group_match.group(1)] = frozenset(names)
-    return groups
+#: Symbols whose whole job was to duplicate a backend fact in TypeScript.
+RETIRED_MIRRORS = (
+    "SESSION_TOOL_GROUP_NAMES",
+    "SESSION_TOOL_GROUP_BASE_ENABLED",
+    "toolGroupDefaultsConfig",
+    "LIVE_TOOL_CATEGORIES",
+)
 
 
-def _parse_ts_base_enabled() -> dict[str, bool]:
-    src = TYPES_FILE.read_text(encoding="utf-8")
-    match = re.search(
-        r"export const SESSION_TOOL_GROUP_BASE_ENABLED[^=]*=\s*\{(.*?)\n\};",
-        src,
-        re.DOTALL,
-    )
-    assert match, "SESSION_TOOL_GROUP_BASE_ENABLED not found in agent-settings.types.ts"
-    return {
-        name: value == "true"
-        for name, value in re.findall(r"(\w+):\s*(true|false)", match.group(1))
-    }
+def _cockpit_sources() -> list[Path]:
+    root = TYPES_FILE.parents[4]  # the cockpit/ project root
+    return [p for p in (root / "src").rglob("*.ts") if "node_modules" not in p.parts]
 
 
-def _session_base_group_enablement() -> dict[str, bool]:
-    """Ground truth: a group is enabled iff session_base declares it non-empty.
-
-    Goes through the loader rather than raw yaml.safe_load so a future
-    ``$extends`` on session_base is followed. The settings matrix that
-    ``resolve_config`` layers on top writes only llm/limits/shell.mode, so
-    skipping it cannot move a tool group.
-    """
-    base_path, _ = resolve_config_path("session_base")
-    tools = (load_and_merge_config(base_path) or {}).get("tools") or {}
-    return {group: bool(tools.get(group)) for group in SESSION_TOOL_OVERRIDE_NAMES}
-
-
-def test_cockpit_mirror_matches_backend_vocabulary():
-    mirror = _parse_ts_mirror()
-    backend = {k: frozenset(v) for k, v in SESSION_TOOL_OVERRIDE_NAMES.items()}
-    assert mirror == backend, (
-        "cockpit SESSION_TOOL_GROUP_NAMES drifted from "
-        "src/core/session_tool_overrides.py SESSION_TOOL_OVERRIDE_NAMES — "
-        f"cockpit-only: { {k: sorted(v - backend.get(k, frozenset())) for k, v in mirror.items()} }, "
-        f"backend-only: { {k: sorted(v - mirror.get(k, frozenset())) for k, v in backend.items()} }"
+def test_the_retired_mirrors_stay_retired():
+    offenders: dict[str, list[str]] = {}
+    for path in _cockpit_sources():
+        text = path.read_text(encoding="utf-8")
+        for name in RETIRED_MIRRORS:
+            # Match a real identifier use, not the name inside a comment
+            # explaining why it is gone.
+            for line in text.splitlines():
+                stripped = line.lstrip()
+                if stripped.startswith(("*", "//", "/*")):
+                    continue
+                if re.search(rf"\b{name}\b", line):
+                    offenders.setdefault(name, []).append(f"{path.name}: {stripped}")
+    assert not offenders, (
+        "a retired tool-vocabulary mirror is back in the cockpit. Turning a "
+        "category on is a POLICY the write boundary expands against the "
+        "registry (src/core/tool_policy.py), and whether it IS on comes from "
+        f"GET /api/persistent/threads/{{id}}/tool-groups. Found: {offenders}"
     )
 
 
-def test_cockpit_base_enabled_mirror_matches_session_base_yaml():
-    """The cockpit's fallback defaults must match what the base config ships.
-
-    This is the client half of the "checkbox says on, agent has no tools" bug:
-    when the tool-groups endpoint is unavailable the pane falls back to this
-    map, and a stale copy would put the wrong tick back on the screen.
-    """
-    mirror = _parse_ts_base_enabled()
-    expected = _session_base_group_enablement()
-    assert mirror == expected, (
-        "cockpit SESSION_TOOL_GROUP_BASE_ENABLED drifted from "
-        "config/session_base.yaml tool groups — "
-        f"cockpit: {mirror}, session_base.yaml: {expected}"
+def test_the_tool_name_lists_are_gone_from_the_types_module():
+    """The narrow version of the above, on the file that held them."""
+    source = TYPES_FILE.read_text(encoding="utf-8")
+    assert "get_session_context" not in source, (
+        "agent-settings.types.ts names individual tools again. The cockpit has "
+        "no business knowing which tools are in a category; the registry "
+        "decides, server-side, at the write boundary."
     )
 
 
-def test_cockpit_base_enabled_covers_every_closed_group():
-    """A group missing from the map would read ``undefined`` → wrongly disabled."""
-    assert set(_parse_ts_base_enabled()) == set(SESSION_TOOL_OVERRIDE_NAMES)
+def test_the_write_vocabulary_is_served_not_transcribed():
+    """`shell` is the one category a client must enumerate — from the server."""
+    from src.core.tool_policy import ENUMERATE_ONLY_CATEGORIES, enumerate_only_members
+
+    served = enumerate_only_members()
+    assert set(served) == set(ENUMERATE_ONLY_CATEGORIES)
+    source = TYPES_FILE.read_text(encoding="utf-8")
+    for names in served.values():
+        for name in names:
+            assert name not in source, (
+                f"{name} is hardcoded in the cockpit. It is served on every "
+                "tool-groups response as `enumerate_only`."
+            )

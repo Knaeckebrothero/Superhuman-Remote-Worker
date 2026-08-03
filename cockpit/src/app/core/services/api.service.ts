@@ -187,6 +187,18 @@ export interface SessionToolGroupsResponse {
   backend?: Record<string, boolean> | null;
   tool_groups: Record<string, boolean> | null;
   categories?: Record<string, SessionToolCategory> | null;
+  /**
+   * Categories that refuse `tools.<c>: true` at the write boundary, mapped to
+   * the enumeration to send instead (`{shell: ["run_command", ...]}`).
+   *
+   * `true` auto-tracks the registry, which is the wrong default for a
+   * code-execution category — so `shell` is settable only by naming its tools,
+   * and the server names them rather than the cockpit keeping a list that can
+   * go stale. Absent from an orchestrator older than this contract; a client
+   * then falls back to `true` and gets a 400 naming the rule, which is the
+   * correct failure for a request the boundary will not honour.
+   */
+  enumerate_only?: Record<string, string[]> | null;
 }
 
 /**
@@ -1648,15 +1660,20 @@ export class ApiService {
     }
 
     /**
-     * Get the server-resolved enablement of the four closed session tool
-     * groups. Authoritative: it folds in the base config, expert and project
-     * layers, none of which the thread's `config_override` reveals.
+     * The session's resolved toolset: what the running agent actually bound,
+     * or a labelled prediction when there is no agent to ask.
+     *
+     * Returns the WHOLE response, not just `tool_groups`. The four booleans
+     * were all the pane could render and all the transport carried, and that
+     * is why the live surface showed four of twenty-five categories with no
+     * way to say why the other twenty-one were missing.
      *
      * Null on any failure — including a 404 from an orchestrator that predates
-     * the endpoint — so the caller falls back to SESSION_TOOL_GROUP_BASE_ENABLED.
-     * Deliberately silent (no toast): the fallback is correct for the stock case.
+     * the endpoint — and the caller then renders its static list in two
+     * states. Deliberately silent (no toast): a missing resolved answer
+     * degrades the surface, it does not break it.
      */
-    getSessionToolGroups(threadId: string): Observable<Record<string, boolean> | null> {
+    getSessionToolGroups(threadId: string): Observable<SessionToolGroupsResponse | null> {
         return this.http
             .get<SessionToolGroupsResponse>(
                 `${this.baseUrl}/persistent/threads/${threadId}/tool-groups`,
@@ -1672,9 +1689,41 @@ export class ApiService {
                 // answering agent still wins; the client is the backstop, not
                 // the primary bound.
                 timeout(SESSION_TOOL_GROUPS_TIMEOUT_MS),
-                map((response) => response?.tool_groups ?? null),
+                map((response) => response ?? null),
                 catchError((error) => {
                     console.error(`Failed to get tool groups for thread ${threadId}:`, error);
+                    return of(null);
+                }),
+            );
+    }
+
+    /**
+     * What WOULD a session created with this config bind? Always a prediction.
+     *
+     * A separate route rather than a mode of the thread read, so the creation
+     * form's limitation is structural: there is no agent yet, so this can
+     * never return `origin: "agent"`. A forecast rendered as fact is the
+     * defect this whole change exists to remove, and the cheapest way to keep
+     * that honest is to make it impossible to get a measurement here.
+     *
+     * Same deadline and same silent-null contract as the thread read.
+     */
+    previewToolGroups(body: {
+        config_name?: string | null;
+        expert_id?: string | null;
+        project_id?: string | null;
+        config_override?: Record<string, unknown> | null;
+    }): Observable<SessionToolGroupsResponse | null> {
+        return this.http
+            .post<SessionToolGroupsResponse>(
+                `${this.baseUrl}/persistent/tool-groups/preview`,
+                body,
+            )
+            .pipe(
+                timeout(SESSION_TOOL_GROUPS_TIMEOUT_MS),
+                map((response) => response ?? null),
+                catchError((error) => {
+                    console.error('Failed to preview tool groups:', error);
                     return of(null);
                 }),
             );

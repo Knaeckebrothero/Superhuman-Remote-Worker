@@ -5,6 +5,7 @@ import {firstValueFrom} from 'rxjs';
 import {environment} from '../../core/environment';
 import {UserService} from '../../core/services/user.service';
 import {AgentSettingsComponent} from '../../views/agent-settings/agent-settings.component';
+import {ApiService, SessionToolGroupsResponse} from '../../core/services/api.service';
 import {resolveEffectiveModels} from '../../views/agent-settings/agent-settings.types';
 import {ModelService} from '../../core/services/model.service';
 import {CapabilitiesService} from '../../core/services/capabilities.service';
@@ -59,7 +60,6 @@ interface Expert {
 interface ExpertDetail extends Expert {
   config: Record<string, unknown>;
   instructions: string | null;
-  defaults_tools?: Record<string, string[]>;
   settings_matrix?: Record<string, Record<string, unknown>>;
   /** Effective model + provenance per slot (server-resolved). */
   effective_models?: EffectiveModels | null;
@@ -169,8 +169,8 @@ interface ExpertDetail extends Expert {
         <app-agent-settings
           mode="session"
           [config]="expertDetail()?.config ?? frameworkDefaults() ?? {}"
+          [resolvedToolset]="toolPreview()"
           [disabled]="creating()"
-          [defaultsTools]="expertDetail()?.defaults_tools ?? {}"
           [settingsMatrix]="expertDetail()?.settings_matrix ?? frameworkSettingsMatrix()"
           [effectiveModels]="resolvedEffectiveModels()"
           [datasources]="datasources()"
@@ -376,6 +376,7 @@ export class SessionCreateComponent implements OnInit {
   private readonly userService = inject(UserService);
   private readonly modelService = inject(ModelService);
   private readonly errorMessages = inject(ErrorMessageService);
+  private readonly api = inject(ApiService);
   readonly capabilities = inject(CapabilitiesService);
 
   @ViewChild(AgentSettingsComponent) agentSettings!: AgentSettingsComponent;
@@ -410,6 +411,17 @@ export class SessionCreateComponent implements OnInit {
   readonly resolvedEffectiveModels = computed(() =>
     resolveEffectiveModels(this.expertDetail()?.effective_models, this.frameworkEffectiveModels()),
   );
+  /**
+   * What a session created with the CURRENT selection would bind — a
+   * prediction, and labelled as one by the endpoint that produces it.
+   *
+   * The form has no agent to ask, so it cannot do better; what it must not do
+   * is present the forecast as fact. The route it calls structurally cannot
+   * return a measurement, which is what keeps that honest without relying on
+   * anyone remembering to check a flag.
+   */
+  readonly toolPreview = signal<SessionToolGroupsResponse | null>(null);
+  private toolPreviewSerial = 0;
   readonly loadingExperts = signal(false);
   readonly loadingExpert = signal(false);
   readonly datasources = signal<any[]>([]);
@@ -529,6 +541,9 @@ export class SessionCreateComponent implements OnInit {
     // Refresh eligible datasources for the new project selection.
     this.loadDatasourcesList();
     this.loadEffectiveDefault();
+    // The project layer can override the expert's tools, so the prediction
+    // moves with the selection.
+    this.loadToolPreview();
   }
 
   toggleExpert(expert: Expert): void {
@@ -551,19 +566,66 @@ export class SessionCreateComponent implements OnInit {
       },
       error: () => this.loadingExpert.set(false),
     });
+    this.loadToolPreview();
+  }
+
+  /**
+   * Ask what this configuration would bind, and re-anchor the tool switches to
+   * the answer.
+   *
+   * Serial-guarded: a slower answer for an expert the user has already
+   * switched away from must not paint over the current one. And it re-anchors
+   * ONLY while the user has not touched a tool switch — the config prefill has
+   * already run by the time this lands, so clobbering a click here would be
+   * the same late-response bug the live pane's forkJoin exists to prevent,
+   * rebuilt on the other surface.
+   */
+  private loadToolPreview(): void {
+    const serial = ++this.toolPreviewSerial;
+    const expert = this.selectedExpert();
+    const projectIds = Array.from(this.selectedProjectIds());
+    // Routed EXACTLY as createSession routes it. A preview that resolved a
+    // different expert layer from the create it previews would be this
+    // series' defect in the surface built to prevent it.
+    const {configName, expertId} = this.expertRouting(expert);
+    this.api.previewToolGroups({
+      config_name: configName,
+      expert_id: expertId ?? null,
+      project_id: projectIds.length === 1 ? projectIds[0] : null,
+    }).subscribe((preview) => {
+      if (serial !== this.toolPreviewSerial) return;
+      this.toolPreview.set(preview);
+      const categories = preview?.categories;
+      if (categories && !this.agentSettings?.hasToolEdits()) {
+        this.agentSettings?.prefillFromResolvedToolset(categories);
+      }
+    });
+  }
+
+  /** How an expert selection maps onto the create/preview request.
+   *
+   *  DB-backed experts (source user/global/managed) go via `expert_id`;
+   *  `config_name` stays the persistent base. Bundled experts keep the
+   *  `config_name` path. Fixes the `config_name=<uuid>` conflation that
+   *  crashed session boot — and shared with the tool preview so the two
+   *  cannot resolve different expert layers. */
+  private expertRouting(expert: Expert | null): {
+    configName: string;
+    expertId: string | undefined;
+  } {
+    const isDbExpert = expert?.storage_kind === 'db' ||
+      ['user', 'global', 'managed'].includes(expert?.source ?? '');
+    return {
+      configName: expert && !isDbExpert ? expert.id : 'session_base',
+      expertId: isDbExpert ? expert!.id : undefined,
+    };
   }
 
   async createSession(): Promise<void> {
     this.creating.set(true);
 
     const expert = this.selectedExpert();
-    // DB-backed experts (source user/global) go via expert_id; config_name
-    // stays the persistent base. Bundled experts keep the config_name path.
-    // Fixes the config_name=<uuid> conflation that crashed session boot.
-    const isDbExpert = expert?.storage_kind === 'db' ||
-      ['user', 'global', 'managed'].includes(expert?.source ?? '');
-    const configName = expert && !isDbExpert ? expert.id : 'session_base';
-    const expertId = isDbExpert ? expert!.id : undefined;
+    const {configName, expertId} = this.expertRouting(expert);
     const projectIds = Array.from(this.selectedProjectIds());
 
     // Build config_override from settings component

@@ -115,8 +115,6 @@ export interface EffectiveModels {
 export interface ExpertDetail extends Expert {
   config: Record<string, unknown>;
   instructions: string | null;
-  /** Tool lists from the expert's mode base, used by the structured editor. */
-  defaults_tools?: Record<string, string[]>;
   /** Raw settings_matrix.yaml for client-side model-family resolution. */
   settings_matrix?: Record<string, Record<string, unknown>>;
   /** Effective model + provenance per slot (server-resolved). */
