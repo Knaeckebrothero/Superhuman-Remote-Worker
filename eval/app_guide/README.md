@@ -18,6 +18,21 @@ inside `config/skills/app-guide/`, where the runtime skill could see them.
 This is a model evaluation, not an ordinary unit test; a skipped run is not
 release evidence.
 
+## Current release evidence
+
+As of the 2026-08-03 documentation reconciliation, M1 is closed and the M2
+harness/implementation is offline-green, but M2 release acceptance remains
+open. The first deployed M2 run ended **BLOCKED** because the intended release
+model and several live fixtures were unavailable; its three complete
+`gemma-4-moe` runs failed diagnostically at 1/8, 0/8, and 1/8 passing cases,
+with zero critical forbidden claims. Do not use those fallback results as a
+passing baseline or combine their cells with a later candidate.
+
+See the [verification record](../../docs/tests/app_guide_m2_verification.md),
+the [sanitized first-run
+results](../../docs/tests/app_guide_m2_live_acceptance_results_2026-07-28.md),
+and the [re-run handoff](../../docs/tests/app_guide_m2_live_acceptance_handoff.md).
+
 ## Validate the corpus
 
 No endpoint or key is needed:

@@ -1,7 +1,21 @@
-import {ChangeDetectionStrategy, Component, OnDestroy, computed, inject, input, output, signal} from '@angular/core';
+import {
+    ChangeDetectionStrategy,
+    Component,
+    ElementRef,
+    OnDestroy,
+    computed,
+    effect,
+    inject,
+    input,
+    output,
+    signal,
+    viewChild,
+} from '@angular/core';
 import {toSignal} from '@angular/core/rxjs-interop';
 import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
 import {MarkdownComponent} from 'ngx-markdown';
+import {KatexDirective} from '../../core/markdown/katex.directive';
+import {toRenderableMarkdown} from '../../core/markdown/tool-result-source';
 import {AppIconComponent} from '../icon';
 import {AppIconButtonComponent} from '../icon-button';
 import {copyText} from '../copy-field';
@@ -50,6 +64,7 @@ export function canvasToolCardContext(
     imports: [
         TranslocoPipe,
         MarkdownComponent,
+        KatexDirective,
         ExternalImageDirective,
         AppIconComponent,
         AppIconButtonComponent,
@@ -117,6 +132,22 @@ export function canvasToolCardContext(
               <span>{{ 'toolCard.sections.result' | transloco }}</span>
               @if (r.language) { <span class="tc__tag">{{ r.language }}</span> }
               @else if (r.diffMode) { <span class="tc__tag">{{ 'toolCard.diff.' + r.diffMode | transloco }}</span> }
+              @if (r.kind === 'markdown') {
+                <!-- Rendered is the reading view; Raw is the exact bytes the
+                     model saw, line numbers included. -->
+                <span class="tc__view">
+                  <button type="button" class="tc__view-rendered"
+                          [class.tc__view--on]="mode() === 'rendered'"
+                          (click)="mode.set('rendered')">
+                    {{ 'toolCard.view.rendered' | transloco }}
+                  </button>
+                  <button type="button" class="tc__view-raw"
+                          [class.tc__view--on]="mode() === 'raw'"
+                          (click)="mode.set('raw')">
+                    {{ 'toolCard.view.raw' | transloco }}
+                  </button>
+                </span>
+              }
               @if (canCopy(r)) {
                 <app-icon-button class="tc__copy" variant="ghost" size="sm"
                                  [ariaLabel]="(copied() ? 'common.copied' : 'common.copy') | transloco"
@@ -138,13 +169,21 @@ export function canvasToolCardContext(
                   <div class="tc__more-note">{{ 'toolCard.diff.truncated' | transloco:{count: r.truncatedLines} }}</div>
                 }
               </div>
-            } @else if (r.kind === 'markdown') {
-              <div class="tc__md"><markdown [data]="r.content || ''"></markdown></div>
+            } @else if (renders(r)) {
+              <div #mdBody class="tc__md" [class.tc__md--capped]="!showFull()">
+                <markdown appKatex [data]="renderableSource(r)"></markdown>
+              </div>
             } @else {
               <pre class="tc__result" [class.tc__result--terminal]="r.kind === 'terminal'">{{ visibleContent(r) }}</pre>
             }
 
-            @if (hiddenLineCount(r) > 0) {
+            @if (renders(r)) {
+              @if (mdOverflowed()) {
+                <button type="button" class="tc__more" (click)="showFull.set(!showFull())">
+                  {{ (showFull() ? 'toolCard.showLess' : 'toolCard.showAll') | transloco }}
+                </button>
+              }
+            } @else if (hiddenLineCount(r) > 0) {
               <button type="button" class="tc__more" (click)="showFull.set(true)">
                 {{ 'toolCard.showMore' | transloco:{count: hiddenLineCount(r)} }}
               </button>
@@ -207,7 +246,34 @@ export class AppToolCardComponent implements OnDestroy {
 
     protected readonly showFull = signal(false);
     protected readonly copied = signal(false);
+    /** Per-card and deliberately not persisted: Raw is an occasional check. */
+    protected readonly mode = signal<'rendered' | 'raw'>('rendered');
+    /** True once the rendered body is taller than its collapsed cap. */
+    protected readonly mdOverflowed = signal(false);
+    private readonly mdBody = viewChild<ElementRef<HTMLElement>>('mdBody');
     private copiedTimer?: ReturnType<typeof setTimeout>;
+
+    constructor() {
+        // The "Show more" button must appear only when content is genuinely
+        // hidden. A source-line-count heuristic lies in both directions —
+        // sixty lines of dense prose overflow, sixty short bullets don't — so
+        // measure the laid-out element instead.
+        effect((onCleanup) => {
+            const el = this.mdBody()?.nativeElement;
+            if (!el || typeof ResizeObserver === 'undefined') {
+                this.mdOverflowed.set(false);
+                return;
+            }
+            const observer = new ResizeObserver(() => {
+                // Expanding removes the cap, which would measure as "fits" and
+                // hide the button the user needs to collapse again.
+                if (this.showFull()) return;
+                this.mdOverflowed.set(el.scrollHeight > el.clientHeight + 1);
+            });
+            observer.observe(el);
+            onCleanup(() => observer.disconnect());
+        });
+    }
 
     protected readonly status = computed<ToolCardStatus>(() => this.view().status);
     protected readonly canvasActionAvailable = computed(() => {
@@ -280,22 +346,37 @@ export class AppToolCardComponent implements OnDestroy {
         return r.kind !== 'diff' && !!r.content;
     }
 
-    /** Result content trimmed to the line cap unless expanded or markdown. */
+    /** A markdown result currently being shown as prose rather than as source. */
+    renders(r: ToolResult): boolean {
+        return r.kind === 'markdown' && this.mode() === 'rendered';
+    }
+
+    /** Source cleaned of `cat -n` numbering and frontmatter traps. */
+    renderableSource(r: ToolResult): string {
+        return toRenderableMarkdown(r.content ?? '');
+    }
+
+    /** What the copy button yields: whatever the user is actually looking at. */
+    copyPayload(r: ToolResult): string {
+        return this.renders(r) ? this.renderableSource(r) : (r.content ?? '');
+    }
+
+    /** Result content trimmed to the line cap unless expanded or rendered. */
     visibleContent(r: ToolResult): string {
         const content = r.content ?? '';
-        if (this.showFull() || r.kind === 'markdown') return content;
+        if (this.showFull() || this.renders(r)) return content;
         const nl = this.lineCount(content);
         if (nl <= RESULT_LINE_CAP) return content;
         return content.split('\n').slice(0, RESULT_LINE_CAP).join('\n');
     }
 
     hiddenLineCount(r: ToolResult): number {
-        if (this.showFull() || r.kind === 'diff' || r.kind === 'markdown') return 0;
+        if (this.showFull() || r.kind === 'diff' || this.renders(r)) return 0;
         return Math.max(0, this.lineCount(r.content ?? '') - RESULT_LINE_CAP);
     }
 
     isCapped(r: ToolResult): boolean {
-        return r.kind !== 'diff' && r.kind !== 'markdown' && this.lineCount(r.content ?? '') > RESULT_LINE_CAP;
+        return r.kind !== 'diff' && !this.renders(r) && this.lineCount(r.content ?? '') > RESULT_LINE_CAP;
     }
 
     private lineCount(s: string): number {
@@ -312,7 +393,7 @@ export class AppToolCardComponent implements OnDestroy {
     }
 
     async copy(r: ToolResult): Promise<void> {
-        const ok = await copyText(r.content ?? '');
+        const ok = await copyText(this.copyPayload(r));
         if (!ok) return;
         this.copied.set(true);
         clearTimeout(this.copiedTimer);

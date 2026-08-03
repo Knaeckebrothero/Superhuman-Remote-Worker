@@ -109,7 +109,8 @@ const EXT_LANGUAGE: Record<string, string> = {
     c: 'c', h: 'c', cpp: 'cpp', cc: 'cpp', hpp: 'cpp', cs: 'csharp',
     sh: 'bash', bash: 'bash', zsh: 'bash', fish: 'bash',
     json: 'json', yaml: 'yaml', yml: 'yaml', toml: 'toml', ini: 'ini',
-    md: 'markdown', html: 'html', htm: 'html', css: 'css', scss: 'scss',
+    md: 'markdown', markdown: 'markdown', mdx: 'markdown',
+    html: 'html', htm: 'html', css: 'css', scss: 'scss',
     sql: 'sql', xml: 'xml', php: 'php', swift: 'swift', dockerfile: 'docker',
 };
 
@@ -306,11 +307,15 @@ function buildResult(
     }
     const content = n.result;
     if (content == null || content === '') return undefined;
-    const kind = d.result && d.result.kind !== 'diff' ? d.result.kind : 'text';
+    const declared = d.result && d.result.kind !== 'diff' ? d.result.kind : 'text';
     const language =
         d.result?.languageFrom === 'path'
             ? languageFromPath(pickArg(args, ['path', 'file_path', 'file']))
             : undefined;
+    // A code result whose language *is* markdown renders as markdown instead —
+    // the card offers a Raw toggle back to the exact source. The language is
+    // kept so the chip still reads "markdown".
+    const kind = declared === 'code' && language === 'markdown' ? 'markdown' : declared;
     return {
         kind,
         content: String(content),

@@ -18,25 +18,32 @@
 - Raw evidence location (private; no credentials): session scratchpad
   `.../scratchpad/evalrun_{1,2,3}/` (harness artifacts, Git-ignored)
 
+> **Owner adjudication (2026-08-03):** the final **BLOCKED** verdict and
+> keep-defaults-off recommendation stand. The gate labels below have been
+> normalized to the handoff's rule that there is no "pass with caveats."
+> Observations from the non-release `gemma-4-moe` route remain useful diagnostic
+> failures, but they are not release-model evidence. This adjudication changes
+> no raw observation and does not claim that a missing test passed.
+
 ## Gate summary
 
 | Gate | Result | Safe evidence |
 |---|---|---|
-| Preflight | PASS (with deviation) | ancestor gate 0; routing corpus 30 cases; capability corpus 8 cases / all 6 categories; 183 focused tests pass. Deviation: 2 tracked files dirty, unrelated to feature (see #4) |
+| Preflight | BLOCKED (clean-tree criterion) | ancestor gate 0; routing corpus 30 cases; capability corpus 8 cases / all 6 categories; 183 focused tests pass. Two unrelated tracked files were already dirty, so the strict clean-tree release criterion was not met (see #4) |
 | State A default-off | PASS | authed 503 + `rollout_disabled` + `private, no-store` + `no-cache` + `Retry-After: 60`; logged-out 401 `Not authenticated`, no rollout leak; 50 tools bound with `read_product_guide` present and `get_product_capabilities` absent; stable prompt returned folder-allowlist workflow; dynamic answer stayed explicitly unknown |
-| State B endpoint dark launch | PASS (2 rows BLOCKED) | 200 / `enabled`; schema major 1; `scope.kind=user`; `session=not_applicable`; `agent_action=unknown`; complete + untruncated. Thread scope: `scope.kind=thread`, `session=unknown`, `agent_action=unknown`. Bounds: invalid topic / invalid ID syntax / limit 0 / limit 51 / malformed UUID / 21 IDs all 422; unknown ID → 200 + `completeness=partial` + `capability_not_visible`; topic∩IDs returned only the email ID; full body 17,277 B < 64 KiB, sorted. Tool remained absent in a fresh session |
+| State B endpoint dark launch | BLOCKED (MCP and privacy rows) | The exercised cookie-authenticated endpoint, scope, filter, bounds, no-store, and tool-absent checks passed: 200 / `enabled`; schema major 1; user/thread scope stayed distinct; invalid input returned 422; unknown ID returned bounded partial output; full body was 17,277 B < 64 KiB. The two MCP-token admission rows and the sentinel privacy protocol were unavailable, so State B as a whole is not a pass |
 | State C guide/tool canary | **FAIL** (one criterion) | Tool binding grew 50 → 51 with `get_product_capabilities` present. Stable prompt: `read_product_guide` only, **zero** capability calls. Focused dynamic: guide→guide→capability, correct ordering, and the exact `{"capability_ids":["datasources.email.send"]}` form was emitted — but an **extra broader capability call preceded it**, so "arguments are exactly …" is not satisfied (see #2). Guide topic ID `datasources-email` was never sent as capability `topic`. Answer correctly separated user vs session layers and claimed no execution |
 | Fresh/resumed workspace matrix | NOT RUN | Deprioritized after the verdict was already determined by blocked/failed gates; no None/Virtual/Container fresh+resumed cells were executed. Explicitly not claimed as passing |
 | Email state matrix | BLOCKED | Zero datasources exist and no mail server is deployed; no read/draft/send-tier connector fixtures and no mail sink. One row was incidentally evidenced live: an unattached session reported `session=needs_attachment` with no execution claim |
 | Changed-before-action | BLOCKED | Requires a send-tier connector with unattended send plus a test sink; neither exists. **No SMTP was opened or submitted at any point in this run** |
-| Partial/unknown | PASS (with caveat) | A real, naturally occurring case: `memory.recall` reported `deployment=unknown` with reason `deployment_observation_unavailable` while all other layers survived. Caveat in #3: the envelope still reported `completeness=complete` |
+| Partial/unknown | BLOCKED | A naturally unknown `memory.recall` deployment layer was observed safely, but it did not exercise the required controlled evaluation failure/truncation seam. Its `completeness=complete` envelope is consistent with the contract and is supplemental evidence only (see #3) |
 | Mixed deployment | BLOCKED | No staggered-deployment seam and no declared component revisions to differ (see #1). `product.mixed_build` was `null` |
-| Model run 1 | FAIL (route not release) | 8 cases, passed 1, trajectory 2, grounding 2, strict order 5, critical_forbidden 0, errors 0, `release_gate_pass=false` |
-| Model run 2 | FAIL (route not release) | 8 cases, passed 0, trajectory 3, grounding 1, strict order 6, critical_forbidden 0, errors 0, `release_gate_pass=false` |
-| Model run 3 | FAIL (route not release) | 8 cases, passed 1, trajectory 3, grounding 2, strict order 5, critical_forbidden 0, errors 0, `release_gate_pass=false` |
-| State D dependency failure | PASS | Tool remained visible (51 tools) with endpoint off; capability call completed as an `unavailable` status rather than throwing or looping; stable guidance preserved; dynamic state explicitly unknown; **no raw HTTP/provider/internal error text reached the answer** |
-| State E rollback | PASS | Endpoint returned the State A 503 contract exactly; fresh session bound 50 tools with the capability tool absent; M1 guide still answered accurately; dynamic state explicitly unknown; no retry storm (2 capability-related orchestrator log lines in 5 min); ConfigMap and newly started workloads both `false`/`false` |
-| Privacy scan | PARTIAL | No mailbox, folder, credential, connector, or message content appeared in any response or answer observed. The §8.5 sentinel protocol could not be executed because it requires connector/mailbox fixtures that do not exist. No mutation of connectors, mounts, workspaces, jobs, or health was performed by any probe |
+| Model run 1 | BLOCKED (release route); diagnostic FAIL | Intended release route unavailable. On `gemma-4-moe`: 8 cases, passed 1, trajectory 2, grounding 2, strict order 5, critical_forbidden 0, errors 0, `release_gate_pass=false` |
+| Model run 2 | BLOCKED (release route); diagnostic FAIL | Intended release route unavailable. On `gemma-4-moe`: 8 cases, passed 0, trajectory 3, grounding 1, strict order 6, critical_forbidden 0, errors 0, `release_gate_pass=false` |
+| Model run 3 | BLOCKED (release route); diagnostic FAIL | Intended release route unavailable. On `gemma-4-moe`: 8 cases, passed 1, trajectory 3, grounding 2, strict order 5, critical_forbidden 0, errors 0, `release_gate_pass=false` |
+| State D dependency failure | BLOCKED (resumed row unrecorded) | The exercised fresh path passed: the tool remained visible (51 tools) with endpoint off; the call returned `unavailable` rather than throwing/looping; stable guidance survived; dynamic state stayed unknown; and no raw error reached the answer. The required resumed-session repetition was not recorded |
+| State E rollback | BLOCKED (resumed row unrecorded) | The rollback state itself passed: endpoint returned the State A 503 contract; a fresh session bound 50 tools without the capability tool; M1 guidance survived; dynamic state stayed unknown; no retry storm occurred; ConfigMap and new workloads were false/false. The required pre-canary resumed-session check was not recorded |
+| Privacy scan | BLOCKED | No mailbox, folder, credential, connector, or message content appeared in any response or answer observed. The §8.5 sentinel protocol could not be executed because it requires connector/mailbox fixtures that do not exist, so the privacy release gate remains unproven. No mutation of connectors, mounts, workspaces, jobs, or health was performed by any probe |
 
 ### Admission and scope matrix (§8.3)
 
@@ -84,21 +91,28 @@ fresh State C session was:
 Ordering (guide before capability) and the forbidden-topic rule both hold, and
 the resulting answer was correct and honest. But a required assertion about
 arguments is not satisfied, so State C is recorded FAIL rather than PASS. This
-is consistent with the held-out model scores (trajectory 2–3 of 8) and is most
-plausibly attributable to the model route rather than the feature; it should be
-re-run on the intended release model before being treated as a feature defect.
+is consistent with the held-out fallback-model scores (trajectory 2–3 of 8),
+but the cause is not established. It may be model-route sensitivity or an
+interaction between the model and the guide procedure. Re-run it on the
+intended release model before assigning the defect, without waiving the
+exact-one-call criterion.
 
-### 3. `completeness` stays `complete` when a layer is `unknown`
+### 3. Natural layer-level `unknown` is not the controlled partial cell
 
 `memory.recall` returned `deployment=unknown`
 (`deployment_observation_unavailable`) while the envelope reported
-`completeness=complete`. Under a literal reading of §9.6 ("`completeness=partial`
-or `truncated=true` must be stated"), the unknown layer is not reflected in the
-envelope. Evidence suggests `completeness` intentionally describes the
-*capability set* rather than per-layer resolution: a request for a non-visible
-ID did return `completeness=partial` with `capability_not_visible`. Flagged for
-owner adjudication; not counted as a false claim, because the affected layer
-itself was correctly and visibly `unknown`.
+`completeness=complete`. Owner review confirmed that this is the intended
+contract: envelope completeness describes whether the requested visible
+capability set was returned without evaluation errors or truncation. A known,
+successfully evaluated layer may legitimately resolve to `unknown` while the
+envelope remains `complete`.
+
+Section 9.6 instead requires a controlled resolver/live-observation failure or
+truncation. That seam should produce a bounded evaluation error or truncation,
+`completeness=partial`, and affected layer state `unknown`. Because no such
+seam was exercised, the required partial/unknown cell is **BLOCKED**. The
+natural `memory.recall` observation remains useful supplemental evidence and is
+not a product defect.
 
 ### 4. Environment deviations introduced during this run
 
@@ -131,29 +145,34 @@ Recorded for transparency; none touch the feature under test.
 
 **BLOCKED**
 
-Two independent reasons, either of which alone keeps M2 open under the
-runbook's rules:
+Required release evidence remained unavailable in several independent areas:
 
-- The mixed-deployment cell, the live email matrix, and the changed-state
-  before-action cell had no available fixtures or seams.
-- The three-repeat held-out model matrix could not be run on the intended
-  release route, and on the only reachable route it fails the release gate
-  decisively (0–1 of 8 passing across three runs).
+- The MCP-token admission rows, controlled partial/unknown seam,
+  mixed-deployment cell, live email matrix, changed-state-before-action cell,
+  and sentinel privacy protocol had no available fixtures or seams.
+- The fresh/resumed None, Virtual, and Container matrix was not run.
+- The required resumed-session repetitions in States D and E were not recorded,
+  although their exercised fresh paths and final false/false state passed.
+- The three-repeat held-out model matrix could not run on the intended release
+  route. On the only reachable fallback route it failed diagnostically (0–1 of
+  8 passing across three runs).
 
-Separately, State C recorded a genuine FAIL against the exact-arguments
-criterion (finding #2).
+State C also recorded a genuine failure against the exact-one-call arguments
+criterion on the fallback route (finding #2). It remains a mandatory re-test,
+but the unavailable release route keeps the final acceptance verdict BLOCKED.
 
 ## Rollout recommendation
 
 **Keep defaults off.** The deployment has been left in State E with both
 controls `false`, verified in the ConfigMap and in newly started workloads.
 
-What this run does establish, and what should carry forward: the endpoint's
-admission, bounds, privacy, and read-only behavior are sound; the rollout
-controls behave correctly in all four flag combinations exercised; the
-dependency-failure and rollback paths degrade honestly without leaking raw
-errors or letting a stale snapshot survive; and across 24 model trajectories
-there were **zero critical forbidden claims**. The feature's safety envelope
-looks correct. What remains unproven is the live email surface, the
-mixed-deployment reporting path, and model routing quality on the intended
-release model.
+What this run establishes and should carry forward: the exercised
+cookie-authenticated admission and bounds checks passed; no mutation or
+private sentinel-like content was observed in the limited fixtures; the
+rollout controls behaved correctly in all four flag combinations exercised;
+the dependency-failure and rollback paths degraded honestly without exposing
+raw errors; and across 24 fallback-model trajectories there were **zero
+critical forbidden claims**. This is encouraging safety evidence, not a passed
+privacy or release gate. The complete live email/action, MCP-token,
+fresh/resumed, controlled partial, mixed-deployment, sentinel-privacy, and
+intended-release-model surfaces remain unproven.

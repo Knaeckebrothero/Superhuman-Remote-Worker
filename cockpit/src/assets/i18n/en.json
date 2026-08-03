@@ -84,7 +84,12 @@
       "openDiff": "Open diff",
       "cancel": "Cancel job",
       "diffTitle": "Job {{id}} — changes"
-    }
+    },
+    "view": {
+      "rendered": "Rendered",
+      "raw": "Raw"
+    },
+    "showAll": "Show all"
   },
   "canvas": {
     "paneLabel": "Dynamic Canvas",

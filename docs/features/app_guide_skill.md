@@ -10,8 +10,9 @@ tags:
 
 # SRW Self-Knowledge and App Guide
 
-> **Status**: v1 `app-guide` shipped 2026-07-08. M1a managed delivery, M1b
-> Email/OKF guidance and connector drift coverage, M1c Automations/Fleet,
+> **Status (reconciled 2026-08-03):** v1 `app-guide` shipped 2026-07-08. M1a
+> managed delivery, M1b Email/OKF guidance and connector drift coverage, M1c
+> Automations/Fleet,
 > M1d Canvas/browser and permissions/workspaces, M1e project
 > loops/campaigns and Protected Cloud, and the M1f reliability closure are
 > implemented. On 2026-07-26 the exact final runtime image passed all six
@@ -24,13 +25,19 @@ tags:
 > session overlay and separately gated agent tool, and M2d's additive
 > schema-1.1 component provenance are implemented. M2e's deterministic guide
 > integration, held-out capability trajectory suite, and changed-before-action
-> email enforcement are implemented in the 2026-07-27 M2e slice. The formal model,
-> canary, fresh/resumed live-session, and rollback matrices have not passed, so
+> email enforcement are implemented in the 2026-07-27 M2e slice. The formal
+> model, canary, fresh/resumed live-session, and rollback matrices have not passed, so
 > both rollout gates remain default-off and **M2 is not complete**. A live
-> acceptance run on 2026-07-28 returned **BLOCKED**: the rollout-state,
-> endpoint-admission, dependency-failure, and rollback gates passed, but the
-> email/changed-state/mixed-deployment cells had no fixtures and the
-> three-repeat model matrix could not use the intended release route
+> acceptance run on 2026-07-28 returned **BLOCKED**. The exercised rollout
+> transitions, cookie-authenticated endpoint/bounds checks, and the fresh
+> dependency-failure/rollback paths produced useful positive evidence; the
+> required resumed repetitions for the latter paths were not recorded. State B
+> remained blocked on MCP-token and sentinel-privacy rows;
+> State C failed the exact-one-capability-call criterion on the reachable
+> fallback model; the fresh/resumed matrix was not run; and the email/action,
+> controlled-partial, mixed-deployment, privacy-sentinel, and intended-release-
+> model gates remained blocked. An owner reconciliation on 2026-08-03 retained
+> the overall verdict and normalized the detailed gate labels
 > ([results](../tests/app_guide_m2_live_acceptance_results_2026-07-28.md)). The
 > remaining visual help and
 > Phases 3–8 remain open. Post-closure
@@ -940,6 +947,12 @@ free-form reasons.
 
 `registry_revision` changes when definitions/help mappings change.
 `evaluated_at`, freshness, and completeness describe the dynamic observation.
+Envelope `completeness` describes whether the requested visible capability set
+was returned without evaluation errors or truncation; it does not mean every
+layer resolved to a positive or non-`unknown` state. A successfully evaluated
+layer may therefore be `unknown` while the envelope remains `complete`.
+Controlled resolver failures, omitted/non-visible requested IDs, and response
+truncation produce bounded errors and/or `completeness=partial`.
 M2 performs no application caching and returns `Cache-Control: private,
 no-store`; a later same-schema ETag optimization may be added only with
 explicit invalidation for grants, flags, attachments, workspace tiers, and
@@ -1217,6 +1230,35 @@ The check produces a proposed patch or issue with source evidence. It does not
 silently rewrite or merge product documentation, update
 `last_verified_revision`, or accept visual baselines. Product QA may run the
 same audit on a schedule and file drift findings against the released build.
+
+#### First implementable slice (concept, 2026-08-03)
+
+The AI drift review can ship *before* the deterministic gates. Those gates need
+the capability registry (M2/M3); the AI review needs only the guide plus a diff,
+both of which exist today. A concept exploration settled the following shape for
+a first slice, scoped to the `app-guide` skill:
+
+- **Target docs:** `config/skills/app-guide/**` only (~614 lines — small enough
+  to prompt in full). The trigger surface stays the broad product-surface list
+  above.
+- **Cadence:** nightly batch on `develop`, diffing `last_verified_revision..HEAD`
+  (not `main`, which is the later manual release cut). `develop` takes ~29 direct
+  commits/day, so per-push/per-PR are out; batching yields at most one PR/day and
+  a silent exit when nothing product-facing changed.
+- **Output:** one draft PR editing the target docs, with per-claim `file:line`
+  evidence; never auto-merged.
+- **Watermark:** `last_verified_revision` advances *only on human merge* of the
+  drift PR (the bump rides in the PR's own diff); closing re-reports the range
+  next run. Reuses the `changes:` seam (`develop.yml:418`) and the
+  `github-actions[bot]` commit-back precedent, so the only new CI capability is
+  the model call. (This watermark is referenced here but not yet implemented.)
+- **Open forks:** call mechanism (direct API + apply script vs.
+  `claude-code-action` vs. advisory-only) and whether to build it as a CI job or
+  as a dogfooded SRW loop.
+
+The cross-repo generalization of this slice — the same intelligence maintaining
+*any* connected repository's docs through the git-write path — is captured in
+[[documentation_drift_maintenance]].
 
 ### Feature definition of done
 
@@ -1644,11 +1686,11 @@ Verified/SLSA provenance remains explicitly out of scope.
 - [x] Add English and German reason-code presentation where a UI or
   deterministic user-facing summary actually exposes it.
 
-**Current M2e result (2026-07-27, incomplete):** the managed skill now reads
-the focused guide before an exact capability-ID lookup, keeps stable how-to
-answers guide-only, preserves per-layer partial/unknown/mixed state, and treats
-the snapshot as advisory. Unknown guide-topic filters fail closed before a
-server fetch. A separate eight-case held-out M2 corpus covers stable,
+**Current M2e result (reconciled 2026-08-03; release incomplete):** the managed
+skill now reads the focused guide before an exact capability-ID lookup, keeps
+stable how-to answers guide-only, preserves per-layer partial/unknown/mixed
+state, and treats the snapshot as advisory. Unknown guide-topic filters fail
+closed before a server fetch. A separate eight-case held-out M2 corpus covers stable,
 capability-near-miss, ready, denied, partial/unknown, mixed-build,
 changed-before-action, and tool-absent rollback trajectories without
 disturbing the balanced 30-case M1 corpus.
@@ -1675,12 +1717,26 @@ tests** with 12 existing warnings; the larger pre-hardening source-derived
 union passed 1778, and the final delta is included in both current runs.
 Repository-wide Ruff lint, scoped format, both Helm profiles, and diff
 validation pass; the repository-wide format check reports only the unrelated
-`tests/test_atomic_job_context.py`. A smoke attempt against the configured local
-OpenAI-compatible model route was rejected at authentication and is not
-release evidence. The k3d cluster is stopped, so the canary, three-repeat
-eight-case model matrix,
-fresh/resumed deployment matrix, mixed deployment, and rollback probe remain
-open. Defaults must not flip until those gates pass.
+`tests/test_atomic_job_context.py`. An initial model-route smoke was rejected at
+authentication and supplied no evidence. The later 2026-07-28 local-k3d run
+exercised all four flag combinations and recorded State A, the exercised
+cookie-authenticated endpoint subset, and the fresh dependency-failure and
+rollback paths as working; the required resumed repetitions were not recorded.
+It also recorded an extra broad capability call before the required
+exact-ID call in State C. Three complete eight-case runs on `gemma-4-moe`
+scored only 0–1 passing cases, with zero critical forbidden claims; because the
+intended release route was unavailable, these are diagnostic failures rather
+than the required release-model evidence.
+
+The full State B gate remains blocked on missing MCP-token and sentinel
+fixtures. The fresh/resumed None/Virtual/Container matrix was not run. Live
+email tiers, changed-before-action with a sink, controlled partial failure,
+mixed declared provenance, full sentinel privacy, and the three-repeat
+intended-release-model run remain open. The natural
+`memory.recall deployment=unknown` observation does not close the controlled
+partial cell: its `completeness=complete` envelope is valid under the contract
+above. Defaults must not flip until the complete re-run passes. The 2026-08-03
+reconciliation changed documentation only and added no new test evidence.
 
 **Exit gate:** email correctly distinguishes supported/available, denied by
 the real datasource grant, allowed but unattached, ready at its effective tier,
@@ -1723,6 +1779,10 @@ decision instead of silently aging the guide.
 - [ ] Add an AI drift-review job that drafts patches/findings from relevant
   diffs with file-level evidence; never auto-merge, advance verification
   metadata, or accept visual baselines.
+  - Separable from the deterministic gates: it needs only (guide + diff), so it
+    can land as a standalone slice alongside M1b rather than waiting for the
+    capability registry. Decided shape + open forks in
+    [[documentation_drift_maintenance]] and §First implementable slice above.
 - [ ] Add a scheduled Product QA audit for release drift and guide misses.
 - [ ] Update feature/PR guidance so user-visible changes must update or exempt
   capability/help coverage.

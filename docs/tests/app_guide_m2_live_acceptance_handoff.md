@@ -1,21 +1,24 @@
 # App Guide M2 live acceptance — tester-agent handoff
 
-> **Status (2026-07-28): executed once; verdict BLOCKED.** Results are recorded
-> in [App Guide M2 live acceptance results
+> **Status (owner-reconciled 2026-08-03): executed once; verdict BLOCKED.**
+> Results are recorded in [App Guide M2 live acceptance results
 > 2026-07-28](app_guide_m2_live_acceptance_results_2026-07-28.md). The run was
 > performed against a local k3d target built from `ec4bbe6b` (contains
-> `326963b7`), not against the experimental image below. States A, B, D and E
-> passed; State C failed one criterion; the email, changed-state,
-> mixed-deployment, and MCP-token cells were BLOCKED for missing fixtures, and
-> the three-repeat model matrix could not use the intended release route. Both
-> rollout gates were restored to default-off. **M2 remains open**; a re-run is
-> required once the missing fixtures and release model route exist.
+> `326963b7`). State A and the fresh dependency-failure/rollback paths produced
+> positive evidence, but the latter paths' required resumed repetitions were
+> not recorded. State B's exercised cookie-authenticated subset passed but its
+> full gate was blocked by missing MCP-token and sentinel fixtures. State C failed
+> the exact-one-call criterion on the fallback model. Fresh/resumed coverage
+> was not run; the email/action, controlled-partial, mixed-deployment, privacy,
+> and intended-release-model cells remained blocked. Both rollout gates were
+> restored to default-off. **M2 remains open.**
 >
-> This runbook stays authoritative for that re-run. The repository's current
-> experimental image declaration is `sha-5eb436e`, with full source revision
-> `5eb436eb9181b3271aef223e89c8d87861d95b4c`. The tester must verify the
-> actual target rather than treating that declaration or the deployment report
-> as evidence.
+> This runbook stays authoritative for the re-run. The CI-managed experimental
+> overlay has advanced since the historical `sha-5eb436e` deployment report
+> and now carries independently changing component revisions. Read the current
+> overlay only as a planning hint: the tester must verify the actual reconciled
+> workloads and capability response rather than treating a repository
+> declaration or deployment report as evidence.
 
 This runbook hands the remaining M2 release gates to a tester agent. It covers
 the authenticated dark endpoint, persistent-session capability tool, App Guide
@@ -505,6 +508,10 @@ These require operator-owned seams.
 - For partial/unknown, use a safe controlled resolver/live-observation failure.
   Known layers must survive; affected layers remain `unknown`;
   `completeness=partial` or `truncated=true` must be stated.
+  A naturally and successfully evaluated layer that reports `unknown` with
+  `completeness=complete` does not fill this cell: envelope completeness tracks
+  requested-set evaluation errors/truncation, not whether every layer is
+  non-`unknown`.
 - For mixed build, run a real staggered orchestrator/agent deployment with
   different declared full revisions. The response must set
   `product.mixed_build=true`, identify differing component revisions, and avoid
@@ -698,3 +705,27 @@ Recommend default-on consideration only when all are true:
 
 The tester recommends; the repository owner decides and performs any default
 flip. Until then, M2e and M2 remain open.
+
+## 15. Required delta from the 2026-07-28 run
+
+Treat the first run as regression context, not as cells that can be copied into
+a passing result for a later candidate. On one clean candidate and actual
+deployment, the re-run must include:
+
+1. clean-worktree preflight and immutable deployed component identity;
+2. both MCP-token admission rows and the complete synthetic sentinel scan;
+3. all State C prompts, with exactly one focused capability-ID call for the
+   focused dynamic prompt and no extra broad lookup;
+4. fresh and resumed None, Virtual, and Container sessions;
+5. every live email tier/degraded/detach row plus the supervised
+   changed-before-action test against an operator-provided sink;
+6. a controlled resolver/live failure that produces genuine partial output, a
+   real deployment-disabled capability, and a controlled stagger with declared
+   mixed component revisions;
+7. all three eight-case repetitions on the intended release model; and
+8. dependency-failure and rollback checks, including the required resumed
+   session behavior, ending at false/false.
+
+The prior `gemma-4-moe` runs remain diagnostic failures (1/8, 0/8, and 1/8,
+with zero critical forbidden claims); they are not a baseline to weaken or
+release evidence to merge with a future run.
