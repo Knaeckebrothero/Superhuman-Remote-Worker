@@ -813,7 +813,9 @@ def format_created_job(result: dict[str, Any], config_name: str) -> str:
         lines.append(f"Description: {desc}")
 
     lines.append(
-        "\nNext step: Use assign_job(job_id, agent_id) to assign this job to an agent."
+        "\nDispatch: Queued for automatic workspace provisioning and agent "
+        "assignment. Monitor the job status; manual assignment is only an "
+        "administrative override."
     )
     return "\n".join(lines)
 

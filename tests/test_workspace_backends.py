@@ -22,6 +22,7 @@ if str(project_root) not in sys.path:
 
 from src.core.workspace_backend import (  # noqa: E402
     RemoteCommandTimeoutError,
+    WorkspaceAuthenticationError,
     WorkspaceUnavailableError,
 )
 
@@ -211,7 +212,18 @@ from src.core.backends.remote import (  # noqa: E402
     _TCP_KEEPALIVE_INTERVAL_SECONDS,
     _TCP_USER_TIMEOUT_MILLIS,
     _TRANSPORT_KEEPALIVE_SECONDS,
+    _validate_private_key,
 )
+
+
+@pytest.fixture(autouse=True)
+def _valid_private_key_for_mocked_ssh():
+    """Most tests exercise mocked transport behavior, not key parsing."""
+    with patch(
+        "src.core.backends.remote._validate_private_key",
+        return_value="SHA256:test-fingerprint",
+    ):
+        yield
 
 
 @pytest.fixture
@@ -232,6 +244,7 @@ def remote_backend():
             host="10.0.0.42",
             port=22,
             username="agent-host",
+            key_path="/run/secrets/test-workspace-key",
             workspace_path="/home/agent-host/workspace",
             job_id="aaaa-bbbb-cccc-dddd",
             max_retries=2,
@@ -322,6 +335,9 @@ class TestRemoteBackendConnect:
             port=22,
             username="agent-host",
             timeout=5,
+            key_filename="/run/secrets/test-workspace-key",
+            allow_agent=False,
+            look_for_keys=False,
         )
 
     def test_connect_with_key_path(self):
@@ -399,6 +415,26 @@ class TestRemoteBackendConnectClassification:
                 backend.connect()
             assert mock_ssh.connect.call_count == 1
 
+    def test_authentication_failure_is_terminal_without_retry(self):
+        import paramiko as real_paramiko
+
+        err = real_paramiko.AuthenticationException("Authentication failed")
+        with self._scenario(err, 5) as (backend, mock_ssh):
+            with pytest.raises(
+                WorkspaceAuthenticationError, match="authentication failed"
+            ):
+                backend.connect()
+            assert mock_ssh.connect.call_count == 1
+
+    def test_no_authentication_methods_symptom_is_terminal_without_retry(self):
+        import paramiko as real_paramiko
+
+        err = real_paramiko.SSHException("No authentication methods available")
+        with self._scenario(err, 5) as (backend, mock_ssh):
+            with pytest.raises(WorkspaceAuthenticationError):
+                backend.connect()
+            assert mock_ssh.connect.call_count == 1
+
     def test_no_route_fails_fast(self):
         """OSError EHOSTUNREACH = no route → gone → fail fast."""
         err = OSError(errno.EHOSTUNREACH, "No route to host")
@@ -460,6 +496,25 @@ class TestRemoteBackendConnectClassification:
                 backend.connect()
         assert "workspace" in str(exc.value)
         assert "VM" not in str(exc.value)
+
+
+class TestRemotePrivateKeyValidation:
+    """Credential configuration fails before Paramiko tries ambient identities."""
+
+    def test_missing_key_path_is_explicit_authentication_error(self):
+        with pytest.raises(WorkspaceAuthenticationError, match="key_path is missing"):
+            _validate_private_key(None)
+
+    def test_nonexistent_key_path_is_explicit_authentication_error(self, tmp_path):
+        missing = tmp_path / "missing-key"
+        with pytest.raises(WorkspaceAuthenticationError, match="does not exist"):
+            _validate_private_key(str(missing))
+
+    def test_invalid_key_is_not_reported_as_workspace_unavailable(self, tmp_path):
+        invalid = tmp_path / "invalid-key"
+        invalid.write_text("definitely not a private key", encoding="utf-8")
+        with pytest.raises(WorkspaceAuthenticationError, match="invalid"):
+            _validate_private_key(str(invalid))
 
 
 class TestRemoteBackendDisconnect:

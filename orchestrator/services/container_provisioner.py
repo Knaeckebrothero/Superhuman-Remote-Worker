@@ -20,7 +20,12 @@ import logging
 import os
 from typing import Any, Optional
 
-from services import workspace_metering
+from services import resolve_ssh_key_path, workspace_metering
+from services.ssh_helpers import (
+    SSHPrivateKeyError,
+    wait_for_agent_ssh,
+    workspace_private_key_fingerprint,
+)
 from services.workspace_binding import CANVAS_WORKSPACE_GENERATION_KEY
 from services.workspace_lifecycle import WorkspaceOwner
 
@@ -43,6 +48,10 @@ except ImportError:
 # Matches the projects.network_tier column default; the closed CHECK set
 # in 0016_project_network_tier.sql is the source of truth for valid names.
 DEFAULT_NETWORK_TIER = "internet-only"
+
+
+class WorkspaceSSHAuthenticationError(RuntimeError):
+    """A K8s-ready workspace rejected the configured SSH identity."""
 
 
 def _env_flag(name: str, default: bool) -> bool:
@@ -79,6 +88,15 @@ class ContainerProvisioner:
         )
         self._ssh_secret_name: str = os.environ.get(
             "WORKSPACE_SSH_SECRET", "vm-ssh-key"
+        )
+        self._ssh_auth_ready_timeout: float = float(
+            os.environ.get("WORKSPACE_SSH_AUTH_READY_TIMEOUT_S", "30")
+        )
+        self._ssh_auth_connect_timeout: int = int(
+            os.environ.get("WORKSPACE_SSH_AUTH_CONNECT_TIMEOUT_S", "5")
+        )
+        self._ssh_auth_poll_interval: float = float(
+            os.environ.get("WORKSPACE_SSH_AUTH_POLL_INTERVAL_S", "2")
         )
         self._storage_class: str = os.environ.get(
             "WORKSPACE_STORAGE_CLASS", "longhorn-ephemeral"
@@ -1636,10 +1654,15 @@ class ContainerProvisioner:
         return False
 
     async def _wait_for_ready(self, pod_name: str, timeout: int = 120) -> Optional[str]:
-        """Poll until the workspace pod is Running and has an IP.
+        """Poll until the pod is ready and accepts the configured SSH key.
 
         Returns:
-            Pod IP if ready, None if timeout.
+            Pod IP after authenticated readiness, None on Kubernetes timeout.
+
+        Raises:
+            WorkspaceSSHAuthenticationError: the pod is Kubernetes-ready but
+                the configured private key is unusable or authentication does
+                not succeed within its bounded readiness window.
         """
         deadline = asyncio.get_event_loop().time() + timeout
 
@@ -1655,7 +1678,37 @@ class ContainerProvisioner:
                     if pod.status.container_statuses and all(
                         cs.ready for cs in pod.status.container_statuses
                     ):
-                        return pod.status.pod_ip
+                        key_path = resolve_ssh_key_path()
+                        try:
+                            fingerprint = workspace_private_key_fingerprint(key_path)
+                        except SSHPrivateKeyError as exc:
+                            raise WorkspaceSSHAuthenticationError(str(exc)) from exc
+
+                        ready, attempts, last_error = await wait_for_agent_ssh(
+                            pod.status.pod_ip,
+                            30022,
+                            deadline_s=self._ssh_auth_ready_timeout,
+                            connect_timeout_s=self._ssh_auth_connect_timeout,
+                            interval_s=self._ssh_auth_poll_interval,
+                            key_path=key_path,
+                        )
+                        if ready:
+                            logger.info(
+                                "Workspace SSH authenticated: %s @ %s:30022 "
+                                "(attempts=%d, key=%s)",
+                                pod_name,
+                                pod.status.pod_ip,
+                                attempts,
+                                fingerprint,
+                            )
+                            return pod.status.pod_ip
+                        raise WorkspaceSSHAuthenticationError(
+                            "Workspace pod became Kubernetes-ready but rejected "
+                            f"the configured SSH key after {attempts} attempt(s) "
+                            f"(key={fingerprint}): {last_error or 'authentication failed'}"
+                        )
+            except WorkspaceSSHAuthenticationError:
+                raise
             except Exception:
                 pass
 

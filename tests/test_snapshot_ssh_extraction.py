@@ -12,6 +12,7 @@ import tempfile
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import paramiko
 import pytest
 
 project_root = Path(__file__).parent.parent
@@ -23,9 +24,11 @@ if _orchestrator_dir not in sys.path:
 
 from orchestrator.services.ssh_helpers import (  # noqa: E402
     EXTRACT_REMOTE_CMD,
+    SSHPrivateKeyError,
     build_agent_ssh_cmd,
     stream_extract_snapshot,
     wait_for_agent_ssh,
+    workspace_private_key_fingerprint,
 )
 
 
@@ -34,6 +37,21 @@ def _fake_proc(returncode=0, stderr=b""):
     proc.returncode = returncode
     proc.communicate = AsyncMock(return_value=(b"", stderr))
     return proc
+
+
+class TestWorkspacePrivateKeyFingerprint:
+    def test_valid_key_returns_only_public_fingerprint(self, tmp_path):
+        key_path = tmp_path / "id_rsa"
+        paramiko.RSAKey.generate(1024).write_private_key_file(str(key_path))
+
+        fingerprint = workspace_private_key_fingerprint(str(key_path))
+
+        assert fingerprint.startswith("SHA256:")
+        assert "PRIVATE KEY" not in fingerprint
+
+    def test_missing_key_is_a_safe_configuration_error(self, tmp_path):
+        with pytest.raises(SSHPrivateKeyError, match="does not exist"):
+            workspace_private_key_fingerprint(str(tmp_path / "missing"))
 
 
 @pytest.fixture
@@ -74,6 +92,8 @@ class TestBuildAgentSshCmd:
         )
         assert "ConnectTimeout=3" in cmd
         assert "BatchMode=yes" in cmd
+        assert "IdentitiesOnly=yes" in cmd
+        assert "PreferredAuthentications=publickey" in cmd
         assert cmd[-1] == "true"
 
 
@@ -111,6 +131,25 @@ class TestWaitForAgentSsh:
         assert ready is False
         assert attempts == 1
         assert "timed out" in error
+
+    @pytest.mark.asyncio
+    async def test_missing_ssh_binary_fails_safely_without_retry(self):
+        with patch(
+            "asyncio.create_subprocess_exec",
+            new=AsyncMock(side_effect=FileNotFoundError("ssh")),
+        ):
+            ready, attempts, error = await wait_for_agent_ssh(
+                "10.0.0.9",
+                22,
+                deadline_s=30,
+                connect_timeout_s=1,
+                interval_s=1,
+                key_path="/tmp/k",
+            )
+
+        assert ready is False
+        assert attempts == 1
+        assert error == "ssh readiness probe could not start: FileNotFoundError"
 
 
 class TestStreamExtractSnapshot:

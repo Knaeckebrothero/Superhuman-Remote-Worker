@@ -309,6 +309,7 @@ class CockpitClient:
         instructions: str | None = None,
         config_override: dict[str, Any] | None = None,
         context: dict[str, Any] | None = None,
+        required_deliverables: list[str] | None = None,
     ) -> dict[str, Any]:
         """Create a new job."""
         body: dict[str, Any] = {
@@ -323,6 +324,8 @@ class CockpitClient:
             body["config_override"] = config_override
         if context:
             body["context"] = context
+        if required_deliverables:
+            body["required_deliverables"] = required_deliverables
         resp = self._client.post("/api/jobs", json=body)
         resp.raise_for_status()
         return resp.json()
@@ -334,7 +337,7 @@ class CockpitClient:
         return resp.json()
 
     def assign_job(self, job_id: str, agent_id: str) -> dict[str, Any]:
-        """Assign a job to an agent."""
+        """Request the admin assignment override (may queue provisioning)."""
         resp = self._client.post(f"/api/jobs/{job_id}/assign/{agent_id}")
         resp.raise_for_status()
         return resp.json()
@@ -868,14 +871,15 @@ class AsyncCockpitClient:
 
     @_create_retry_decorator()
     async def assign_job(self, job_id: str, agent_id: str) -> dict[str, Any]:
-        """Assign a job to an agent.
+        """Request the admin assignment override.
 
         Args:
             job_id: Job UUID
             agent_id: Agent UUID
 
         Returns:
-            Assignment result with status
+            Assignment result; status is ``assigned`` or ``queued`` when the
+            workspace first requires automatic provisioning
         """
         resp = await self._client.post(f"/api/jobs/{job_id}/assign/{agent_id}")
         resp.raise_for_status()
