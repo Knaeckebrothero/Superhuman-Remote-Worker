@@ -62,13 +62,36 @@ including ~40 triaged deferred minors and every ruling:
 A category the runtime holds *partially* — `shell` on the default topology, held
 by `srw_cloud_status` alone — is now locked in **both** directions on the live
 pane, because `settable: false` is one boolean and the cockpit never emits an
-unsettable key. Nothing regresses (the enable path there was already dead: the
-diff baseline is anchored to the server's answer and never moves after an apply,
-so re-ticking a category the answer calls `on` emits nothing), and the New
-Session form is unaffected because a prediction has no bound set to lock. But
-"config may still *add* to this category" has no expression in the current
-contract. Fast-follow, client-side: either a per-tool affordance or an explicit
-"add the config-grantable tools" action.
+unsettable key.
+
+> **This IS a regression. Corrected 2026-08-03 — the fix wave's own safety
+> argument was falsified on re-review.** The claim was that the enable path was
+> already dead because the diff baseline never moves after an apply. That is
+> true of `tools-group.component.ts::getOverrides()` and false of the pane that
+> actually dispatches: `settings-pane.component.ts:523` runs
+> `this.lastApplied = desired` on every apply, and `applyChanges` builds
+> `baselineOn` from `lastApplied`, not from `prefillFromResolved`. The reviewer
+> drove the real component: with `settable: true` an untick → apply → re-tick →
+> apply dispatched `{tools: {shell: {only: [run_command, shell_read]}}}`, a
+> working enable; with `settable: false` the identical sequence dispatched
+> nothing.
+>
+> The lock also self-selects the worst population. `session_base.yaml` ships
+> `tools.shell: []` and `persistent_session.py:1526` appends `srw_cloud_status`
+> whenever a cloud mount is active — which default projects have — so a stock
+> session's shell bound set is exactly `[srw_cloud_status]` and locks, while a
+> session that already holds `run_command` has a mixed set and does not. **The
+> only sessions locked out of gaining shell are the ones without it.**
+> Granting shell to a running session from the settings pane was possible before
+> this fix and is not now, on the default topology.
+>
+> Not a product-wide capability loss — a new session predicts rather than
+> measures, so it does not lock, and the expert route is unaffected. But it is a
+> new defect on the highest-stakes tool group, introduced by a blocker fix, and
+> it needs a decision rather than a footnote. The narrow close is one client-side
+> line: skip unsettable keys only in the *off* direction. The wider question is
+> that `settable` is a single boolean where the truth has two directions —
+> "config may still add here" has no expression in the contract at all.
 
 **What was achieved:** `[]` no longer conflates membership with policy, so "on"
 is expressible; all 12 form categories are honoured where 4 were; eight of nine
