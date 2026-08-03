@@ -223,8 +223,32 @@ export function enablePolicy(
  * no reader that can misread it.
  *
  * A category the server marked unsettable is never emitted, in either
- * direction: the user cannot have changed it, and writing config against a
- * grant or a workspace tier only produces a fragment the PDP will refuse.
+ * direction — the user cannot have changed it, and writing config against a
+ * grant or a workspace tier only produces a fragment the PDP will refuse —
+ * UNLESS it is also named in `lockedOn`.
+ *
+ * `lockedOn` names the subset of `unsettable` the agent is presently HOLDING
+ * (`compose_tool_view`'s per-tool code grant: `state: 'on'`, `settable:
+ * false`) rather than one the server refused outright (`unavailable`). For
+ * those keys this function drops the special-casing ENTIRELY — both
+ * directions run the ordinary diff, so a local "turn it off" can register
+ * exactly as it would for a settable category. That is deliberate, not a
+ * gap: a category the agent already holds needs SOME way to notice a later
+ * "turn it back on" as a change (a diff against a value that never moves
+ * cannot detect anything), and this function has no memory across calls to
+ * do that any other way. It is NOT, by itself, the guarantee that the OFF
+ * write never reaches the wire — this function has no notion of "reaches the
+ * wire" versus "purely local bookkeeping". The caller that actually dispatches
+ * (settings-pane.component.ts::applyChanges, not
+ * tools-group.component.ts::getOverrides, whose result only ever feeds a
+ * boolean back through `desiredState`) MUST strip any `lockedOn` key's `[]`
+ * from what THIS call returns before sending it — unticking a code-granted
+ * category is fiction regardless of what got written locally, because the
+ * runtime re-appends those names after the merge. A category outside
+ * `lockedOn` — the server refused it outright, or a caller's own gate did —
+ * stays refused in both directions no matter how `disabled`/`baselineOn` are
+ * shaped; `lockedOn` only ever widens what `unsettable` narrowed, never the
+ * reverse.
  */
 export function toolsFragment(
     keys: Iterable<string>,
@@ -232,12 +256,17 @@ export function toolsFragment(
         disabled: ReadonlySet<string>;
         baselineOn: ReadonlySet<string>;
         unsettable: ReadonlySet<string>;
+        /** The subset of `unsettable` exempted from the skip below — see the
+         *  function doc. Omit (or pass empty) to refuse every unsettable key
+         *  outright, in either direction: the original, symmetric behaviour. */
+        lockedOn?: ReadonlySet<string>;
         enumerateOnly: Record<string, string[]> | null | undefined;
     },
 ): Record<string, unknown> {
     const tools: Record<string, unknown> = {};
+    const lockedOn = opts.lockedOn ?? EMPTY_SET;
     for (const key of keys) {
-        if (opts.unsettable.has(key)) continue;
+        if (opts.unsettable.has(key) && !lockedOn.has(key)) continue;
         const wantOn = !opts.disabled.has(key);
         if (wantOn === opts.baselineOn.has(key)) continue;
         if (!wantOn) {
@@ -249,6 +278,8 @@ export function toolsFragment(
     }
     return tools;
 }
+
+const EMPTY_SET: ReadonlySet<string> = new Set();
 
 /**
  * Fallback label for a category the cockpit has no metadata for.
