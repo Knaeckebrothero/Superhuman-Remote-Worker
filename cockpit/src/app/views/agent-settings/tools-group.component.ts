@@ -19,6 +19,7 @@ import {
     enabledCategoryKeys,
     humanizeCategoryKey,
     isMeasured,
+    lockedOnAdditions,
     resolvedToolRows,
     toolsetProvenance,
     toolsFragment,
@@ -136,6 +137,33 @@ export function disabledToolCategoriesFromConfig(
               ><app-icon size="xs">close</app-icon></button>
             }
           </label>
+          <!-- The other direction of a lock.
+               settable:false says "you cannot switch this off", and the
+               disabled checkbox above says it faithfully. It does NOT say
+               "config cannot add here" — a per-tool code grant locks the row
+               because everything BOUND is code-granted, which leaves the
+               category's config-grantable members untouched. On the default
+               topology that is how a running session gains shell.
+               A checkbox cannot express an additive-only action: the only
+               gesture available from a ticked box is unticking it, which is
+               the one thing that must never happen here. So the action is its
+               own control, it names what it will add, and it has no off state
+               at all. -->
+          @if (additionsFor(row).length) {
+            <div class="tool-additions" [attr.data-category]="row.key">
+              <span class="tool-additions-note">{{
+                'agentSettings.tools.addable' | transloco:{ names: additionsFor(row).join(', ') }
+              }}</span>
+              <button
+                type="button"
+                class="tool-additions-btn"
+                (click)="requestAdditions(row.key)"
+                [disabled]="disabled() || additionsRequested(row.key)"
+              >{{ (additionsRequested(row.key)
+                    ? 'agentSettings.tools.addRequested'
+                    : 'agentSettings.tools.addAction') | transloco:{ n: additionsFor(row).length } }}</button>
+            </div>
+          }
           @if (row.key === 'delegation' && rowState(row) === 'on') {
             <div class="inline-params">
               <div class="inline-field" [class.modified]="delegationMaxDepth() !== null">
@@ -330,6 +358,38 @@ export function disabledToolCategoriesFromConfig(
       display: flex;
       gap: 12px;
       padding: 6px 10px 6px 42px;
+    }
+    .tool-additions {
+      display: flex;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 4px 8px;
+      padding: 2px 10px 6px 42px;
+    }
+    .tool-additions-note {
+      font-size: 11px;
+      line-height: 1.4;
+      color: var(--text-muted);
+    }
+    .tool-additions-btn {
+      flex-shrink: 0;
+      padding: 2px 8px;
+      border: 1px solid var(--accent-color, var(--surface-1));
+      border-radius: var(--radius-control);
+      background: none;
+      color: var(--accent-color, var(--text-primary));
+      cursor: pointer;
+      font-family: inherit;
+      font-size: 11px;
+      font-weight: 600;
+    }
+    .tool-additions-btn:hover:not(:disabled) {
+      background: rgba(255, 255, 255, 0.06);
+    }
+    .tool-additions-btn:disabled {
+      border-color: var(--border-color, var(--surface-1));
+      color: var(--text-muted);
+      cursor: default;
     }
     .inline-field {
       display: flex;
@@ -552,18 +612,40 @@ export class ToolsGroupComponent {
     () => new Set(this.rows().filter((row) => !this.isRowSettable(row)).map((row) => row.key)),
   );
 
-  /** The subset of `unsettableKeys` the agent is actively HOLDING — read off
-   *  the untouched server entry (`state`), never off a row's post-toggle
-   *  computed state, which for a client-gated-but-server-settable row would
-   *  read back whatever the user just clicked. Passed to `toolsFragment` as
-   *  `lockedOn`: unticking one of these is still refused (the runtime
-   *  re-appends the code-granted names regardless), but ticking one is a real
-   *  write — see resolved-toolset.ts::toolsFragment. */
-  private readonly lockedOnKeys = computed<Set<string>>(() => {
+  /**
+   * Per category, the config-grantable tools a LOCKED-ON row could still gain.
+   *
+   * Read off the untouched server entry, never off a row's post-toggle
+   * computed state: the answer must not move because the user clicked
+   * something. Non-empty only where the client can NAME the tools — see
+   * resolved-toolset.ts::lockedOnAdditions, which refuses to guess.
+   *
+   * A row the client's own grant gate blocks gets nothing: `isCategoryBlocked`
+   * is a refusal in its own right, and offering to add tools the PDP will
+   * deny is the same dead end as a checkbox the boundary 400s.
+   */
+  private readonly additionsByKey = computed<Record<string, string[]>>(() => {
     const categories = this.serverCategories();
-    if (!categories) return new Set();
-    return new Set([...this.unsettableKeys()].filter((key) => categories[key]?.state === 'on'));
+    if (!categories) return {};
+    const enumerateOnly = this.resolved()?.enumerate_only ?? this.enumerateOnly();
+    const out: Record<string, string[]> = {};
+    for (const key of Object.keys(categories)) {
+      if (this.isCategoryBlocked(key)) continue;
+      const names = lockedOnAdditions(key, categories[key], enumerateOnly);
+      if (names.length) out[key] = names;
+    }
+    return out;
   });
+
+  /**
+   * Locked-on categories the user has asked to complete.
+   *
+   * ADDITIVE ONLY, and there is no gesture that removes a key. That is the
+   * whole point of a separate channel: the off direction of a locked category
+   * is not a request the server was ever asked to honour, so it must not be
+   * representable here.
+   */
+  private readonly requestedAdditions = signal<Set<string>>(new Set());
 
   /** True when the user may flip this row: the server allows it AND the
    *  client-side grant gate does not grey it. */
@@ -596,6 +678,53 @@ export class ToolsGroupComponent {
     return !this.isRowSettable(row);
   }
 
+  /** The config-grantable tools this row could still gain, named. Empty for
+   *  every row that is not locked-on, and for every locked-on row whose
+   *  additions cannot be proved. */
+  additionsFor(row: ResolvedToolRow): string[] {
+    return this.additionsByKey()[row.key] ?? [];
+  }
+
+  /** True once the user has asked for this category's additions. The button
+   *  then says so instead of accepting a second click that would diff to
+   *  nothing — a silent no-op control is the defect this series exists to
+   *  remove, and re-arming it here would be a small new one. */
+  additionsRequested(key: string): boolean {
+    return this.requestedAdditions().has(key);
+  }
+
+  /**
+   * Ask for a locked-on category's config-grantable tools.
+   *
+   * One-way: there is no companion "un-request". The write is additive, the
+   * PDP still enforces the author's own grants, and the pane dispatches it
+   * through the same debounce as every other edit.
+   */
+  requestAdditions(key: string): void {
+    if (!this.additionsByKey()[key]?.length) return;
+    if (this.requestedAdditions().has(key)) return;
+    this.requestedAdditions.update((set) => new Set(set).add(key));
+    this.change.emit();
+  }
+
+  /**
+   * Category → the enumeration to write for a requested addition.
+   *
+   * The dispatching host reads this INSTEAD of looking for the request in the
+   * switch diff, where it is structurally invisible: a locked-on category is
+   * on before and after, so its boolean never moves. See
+   * settings-pane.component.ts::desiredState.
+   */
+  getToolAdditions(): Record<string, string[]> {
+    const additions = this.additionsByKey();
+    const out: Record<string, string[]> = {};
+    for (const key of this.requestedAdditions()) {
+      const names = additions[key];
+      if (names?.length) out[key] = [...names];
+    }
+    return out;
+  }
+
   humanize(key: string): string {
     return humanizeCategoryKey(key);
   }
@@ -622,6 +751,10 @@ export class ToolsGroupComponent {
 
   readonly modifiedCount = computed(() => {
     let count = this.rows().filter((row) => !row.pristine).length;
+    // A locked row is `pristine` by construction (its switch cannot move), so
+    // a pending addition is invisible to the line above and would otherwise
+    // not be counted as the edit it is.
+    count += this.requestedAdditions().size;
     if (this.delegationMaxDepth() !== null) count++;
     if (this.delegationTimeout() !== null) count++;
     return count;
@@ -629,9 +762,11 @@ export class ToolsGroupComponent {
 
   /** True when the user has moved a tool switch since the last prefill. A
    *  parent uses this to decide whether a late-arriving read may re-anchor the
-   *  baseline or would clobber a click. */
+   *  baseline or would clobber a click. A pending addition counts: re-anchoring
+   *  clears it (see `anchor`), so it is exactly the kind of edit a late read
+   *  must not silently discard. */
   hasToolEdits(): boolean {
-    return this.rows().some((row) => !row.pristine);
+    return this.requestedAdditions().size > 0 || this.rows().some((row) => !row.pristine);
   }
 
   // --- Resolved defaults ---
@@ -719,9 +854,15 @@ export class ToolsGroupComponent {
         rows.map((row) => row.key).filter((key) => !this.expertDisabledCategories().has(key)),
       ),
       unsettable: this.unsettableKeys(),
-      lockedOn: this.lockedOnKeys(),
       enumerateOnly: this.resolved()?.enumerate_only ?? this.enumerateOnly(),
     });
+    // Requested additions ride the same fragment — they ARE a `tools` write.
+    // `toolsFragment` cannot produce them (it refuses every unsettable key, in
+    // both directions, which is what keeps the off half impossible), so they
+    // are merged in here. Only ever an enumeration, never `[]`.
+    for (const [key, names] of Object.entries(this.getToolAdditions())) {
+      tools[key] = {only: names};
+    }
 
     const result: Record<string, unknown> = {};
     if (Object.keys(tools).length > 0) result['tools'] = tools;
@@ -776,11 +917,15 @@ export class ToolsGroupComponent {
     // Reset delegation inline params on expert change
     this.delegationMaxDepth.set(null);
     this.delegationTimeout.set(null);
+    // A re-anchor is a new baseline, so a request made against the old one is
+    // no longer meaningful. Hosts guard this with `hasToolEdits()`.
+    this.requestedAdditions.set(new Set());
   }
 
   resetAll(): void {
     this.userDisabled.set(new Set(this.expertDisabledCategories()));
     this.delegationMaxDepth.set(null);
     this.delegationTimeout.set(null);
+    this.requestedAdditions.set(new Set());
   }
 }

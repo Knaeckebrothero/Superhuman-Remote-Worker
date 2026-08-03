@@ -2554,6 +2554,9 @@
       "0": "Unbegrenzt"
     },
     "tools": {
+      "addAction": "Hinzufügen ({{n}})",
+      "addRequested": "Hinzufügen angefordert",
+      "addable": "Dauerhaft aktiv — die Konfiguration kann zusätzlich hinzufügen: {{names}}",
       "countBound": "{{n}} gebunden",
       "countPredicted": "{{n}} vorhergesagt",
       "group": "Werkzeuge",

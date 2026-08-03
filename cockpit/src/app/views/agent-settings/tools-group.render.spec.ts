@@ -278,6 +278,123 @@ describe('ToolsGroupComponent rendering', () => {
     expect(row.querySelector('.tool-toggle-reason')).toBeNull();
   });
 
+  it('a locked-ON row offers an ADD control, and the checkbox is still un-untickable', () => {
+    // The defect a live browser drive caught and every green unit test missed:
+    // the machinery to gain shell on a running session was correct and
+    // reachable only by calling component methods. The rendered `<input>` is
+    // `disabled`, a disabled checkbox fires no `change`, and there is no other
+    // route — so the capability existed and no user could get to it.
+    //
+    // Both halves are asserted HERE, on the DOM, because that is where the
+    // defect lived: the checkbox must stay inert (unticking a code-granted
+    // category is fiction) AND the additive action must exist as its own
+    // control, because a ticked box has no "turn on" gesture to offer.
+    const fixture = mount({
+      mode: 'live',
+      resolved: response({
+        categories: {
+          shell: cat({
+            state: 'on',
+            settable: false,
+            reason:
+              'the runtime binds srw_cloud_status here regardless of config '
+              + '(cloud_mount_manager.active), so unticking this group cannot release it',
+            tools: ['srw_cloud_status'],
+          }),
+        },
+      }),
+    });
+    const instance = fixture.componentInstance;
+    instance.prefillFromResolved(instance.resolved()!.categories!);
+    fixture.detectChanges();
+
+    const row = rowFor(fixture, 'Shell');
+    const box = row.querySelector('input[type="checkbox"]') as HTMLInputElement;
+    expect(box.checked).toBe(true);
+    expect(box.disabled).toBe(true);
+
+    // Half 1 — the off direction is unreachable AND unwritable. A real click
+    // on a disabled input is a no-op; a forced `change` (what an extension or
+    // a stray dispatchEvent could still deliver) must not produce a fragment.
+    box.click();
+    box.dispatchEvent(new Event('change'));
+    fixture.detectChanges();
+    expect(
+      (rowFor(fixture, 'Shell').querySelector('input[type="checkbox"]') as HTMLInputElement).checked,
+    ).toBe(true);
+    expect(instance.getOverrides()).toEqual({});
+
+    // Half 2 — the add control exists, names what it will add, and writes the
+    // enumeration the server served.
+    const block = (fixture.nativeElement as HTMLElement).querySelector(
+      '.tool-additions[data-category="shell"]',
+    ) as HTMLElement;
+    expect(block).not.toBeNull();
+    expect(block.textContent).toContain('config can still add');
+    expect(block.textContent).toContain('run_command');
+    const button = block.querySelector('button') as HTMLButtonElement;
+    expect(button.disabled).toBe(false);
+    expect(button.textContent).toContain('Add (4)');
+
+    button.click();
+    fixture.detectChanges();
+
+    expect(instance.getOverrides()).toEqual({
+      tools: {shell: {only: ['cancel_command', 'run_command', 'shell_execute', 'shell_read']}},
+    });
+    // ...and the control says the request was made rather than accepting a
+    // second click that would diff to nothing.
+    const after = (fixture.nativeElement as HTMLElement).querySelector(
+      '.tool-additions[data-category="shell"] button',
+    ) as HTMLButtonElement;
+    expect(after.disabled).toBe(true);
+    expect(after.textContent).toContain('Add requested');
+  });
+
+  it('a locked-ON row whose category config cannot add offers NO add control', () => {
+    // `product_help` and `session_task` are wholly grant:"code" — `true`
+    // expands to nothing there, so an Add button would be a write boundary 400
+    // dressed as an affordance. Silence is the honest render.
+    const fixture = mount({
+      mode: 'live',
+      resolved: response({
+        categories: {
+          product_help: cat({
+            state: 'on',
+            settable: false,
+            reason: 'granted by the runtime, not by config (persistent-session floor)',
+            tools: ['read_product_guide'],
+          }),
+        },
+      }),
+    });
+    expect(rowFor(fixture, 'Product Help')).not.toBeNull();
+    expect((fixture.nativeElement as HTMLElement).querySelector('.tool-additions')).toBeNull();
+  });
+
+  it('a grant-blocked locked row offers no add control either', () => {
+    // The client-side grant belt is a refusal in its own right. Offering to add
+    // tools the PDP will 422 is the same dead end from the other side.
+    const fixture = mount({
+      mode: 'live',
+      resolved: response({
+        categories: {
+          shell: cat({state: 'on', settable: false, reason: 'locked', tools: ['srw_cloud_status']}),
+        },
+      }),
+      gatedCapabilities: {shell_tools: false},
+    });
+    expect((fixture.nativeElement as HTMLElement).querySelector('.tool-additions')).toBeNull();
+  });
+
+  it('an ordinary settable row gets no add control — it has a checkbox', () => {
+    const fixture = mount({
+      mode: 'live',
+      resolved: response({categories: {shell: cat({state: 'on', tools: ['run_command']})}}),
+    });
+    expect((fixture.nativeElement as HTMLElement).querySelector('.tool-additions')).toBeNull();
+  });
+
   it('a locked-and-empty category still renders blocked, with the reason', () => {
     const fixture = mount({
       resolved: response({

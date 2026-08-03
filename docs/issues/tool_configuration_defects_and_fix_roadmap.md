@@ -57,12 +57,37 @@ including ~40 triaged deferred minors and every ruling:
    per item) and `tool_config_policy_vs_membership.md` (commits 1–6 landed, 7
    optional and untouched).
 
-### Known consequence of blocker 2's fix
+### Known consequence of blocker 2's fix — **CLOSED 2026-08-03**
 
-A category the runtime holds *partially* — `shell` on the default topology, held
-by `srw_cloud_status` alone — is now locked in **both** directions on the live
-pane, because `settable: false` is one boolean and the cockpit never emits an
-unsettable key.
+**Resolved, and not the way this section predicted.** The live pane now carries
+an explicit *add* affordance on a locked-on row: the checkbox stays checked and
+`disabled` (unticking a code-granted category remains impossible, visually and
+in dispatch), and beside it the row names the config-grantable tools it lacks
+and offers a one-gesture `Add (n)`. The write is additive by construction —
+`toolsFragment` refuses every unsettable key in **both** directions again, with
+no per-key exemption for a caller to strip, and the request rides its own
+tracked path because a locked-on category's boolean is `true` before the gesture
+and `true` after it. Browser-verified end to end on a sandbox-tier session:
+untick → 0 frames; Add → one `config.update` carrying the enumeration → the
+override persisted → the agent rebound with `run_command`, `cancel_command`,
+`shell_read` and `shell` back to `settable: true`. Detail:
+`.superpowers/sdd/tool_configuration_defects_and_fix_roadmap/live-gates-report.md`,
+round 3.
+
+**No second contract field was needed**, and the reason is worth recording:
+`enumerate_only` already ships the config-grantable membership of every category
+that refuses `true`, so the client can subtract the bound set and *name* the
+additions. Where the enable policy is `true` the client cannot see the expansion
+and deliberately offers nothing — which is also the right answer, because the
+locked categories that take `true` (`product_help`, `session_task`, the
+connector categories) expand to nothing at all. The affordance therefore appears
+on exactly one row, `shell`, on exactly the topology that needs it.
+
+The original diagnosis, kept because two proposed one-line fixes were both
+wrong: a category the runtime holds *partially* — `shell` on the default
+topology, held by `srw_cloud_status` alone — was locked in **both** directions on
+the live pane, because `settable: false` is one boolean and the cockpit never
+emits an unsettable key.
 
 > **This IS a regression. Corrected 2026-08-03 — the fix wave's own safety
 > argument was falsified on re-review.** The claim was that the enable path was
@@ -88,10 +113,16 @@ unsettable key.
 > Not a product-wide capability loss — a new session predicts rather than
 > measures, so it does not lock, and the expert route is unaffected. But it is a
 > new defect on the highest-stakes tool group, introduced by a blocker fix, and
-> it needs a decision rather than a footnote. The narrow close is one client-side
-> line: skip unsettable keys only in the *off* direction. The wider question is
-> that `settable` is a single boolean where the truth has two directions —
-> "config may still add here" has no expression in the contract at all.
+> it needs a decision rather than a footnote.
+>
+> **Two proposed one-line closes, both wrong, kept as a warning.** (a) "skip
+> unsettable keys only in the *off* direction" — this makes the write path
+> reachable and the *control* still is not: the locked row is already checked, so
+> the only gesture a checkbox offers is unticking, and a checkbox that appears to
+> turn off and springs back is the original Critical finding restored. (b) "remove
+> `disabled` from the template" — same defect, one step earlier. The real shape is
+> that a ticked box has no "turn on" gesture at all, so the additive half needs a
+> control of its own. See the CLOSED note above.
 
 **What was achieved:** `[]` no longer conflates membership with policy, so "on"
 is expressible; all 12 form categories are honoured where 4 were; eight of nine

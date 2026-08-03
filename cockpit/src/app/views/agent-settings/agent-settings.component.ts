@@ -369,6 +369,16 @@ export class AgentSettingsComponent {
     return this.datasourcesGroup?.getSelectedIds() ?? [];
   }
 
+  /** Category → the enumeration a requested locked-on addition writes.
+   *
+   *  A creation form needs nothing from this (it submits `getOverrides()`,
+   *  which already carries them). The live pane does: its dispatch is a diff
+   *  over switch positions, and a locked-on category's position never moves.
+   *  See ToolsGroupComponent.getToolAdditions. */
+  getToolAdditions(): Record<string, string[]> {
+    return this.toolsGroup?.getToolAdditions() ?? {};
+  }
+
   /** Drop any in-flight picker selection back to the default (live mode:
    *  the attached set). The pane calls this on thread load so a pin made
    *  while the fetch was in flight can't leak into the diff baseline. */

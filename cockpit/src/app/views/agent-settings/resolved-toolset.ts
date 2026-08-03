@@ -215,6 +215,52 @@ export function enablePolicy(
 }
 
 /**
+ * The tools a LOCKED-ON category could still gain from config.
+ *
+ * `settable: false` is one boolean over two independent facts, and only one of
+ * them is "the control is inert":
+ *
+ * 1. **You cannot turn this off.** The runtime re-appends the names it holds
+ *    after the merge, so `tools.<c>: []` changes nothing and the box comes
+ *    back ticked. That is what `settable: false` says, and it is true.
+ * 2. **Config may still ADD here.** A per-tool code grant locks the category
+ *    because everything *bound* is code-granted — it says nothing about the
+ *    config-grantable members that are not bound. `shell` on a shell-capable
+ *    tier is exactly this: bound `[srw_cloud_status]`, and four grantable
+ *    names (`run_command`, `shell_read`, …) still available.
+ *
+ * The contract carries no field for fact 2, but it does not need one for the
+ * population that has it: `enumerate_only` already ships the config-grantable
+ * membership of every category that refuses `true`, which is what makes the
+ * subtraction below possible without the cockpit keeping a tool-name list.
+ *
+ * **A `true` policy therefore returns `[]`, deliberately.** `true` expands
+ * server-side against the registry and the client cannot know whether the
+ * expansion is empty — and for the locked categories that take `true` it *is*
+ * empty (`product_help`, `session_task` and the connector categories are
+ * wholly `grant: "code"`; `core`'s officer case has `configured` ⊇ `bound`
+ * already). Offering an "add" that expands to nothing would be a 400 at the
+ * write boundary dressed up as an affordance — the unrecoverable dead end this
+ * series keeps removing. Silence is the honest answer where nothing can be
+ * proved.
+ */
+export function lockedOnAdditions(
+    key: string,
+    entry: SessionToolCategory | undefined | null,
+    enumerateOnly: Record<string, string[]> | null | undefined,
+): string[] {
+    if (!entry) return [];
+    // Only a category the agent HOLDS and the user cannot switch off. An
+    // `unavailable` row is the server refusing outright, and an ordinary
+    // settable row already has a working checkbox.
+    if (entry.state !== 'on' || entry.settable !== false) return [];
+    const policy = enablePolicy(key, enumerateOnly);
+    if (policy === null || policy === true) return [];
+    const bound = new Set(entry.tools ?? []);
+    return policy.only.filter((name) => !bound.has(name));
+}
+
+/**
  * Turn a baseline + the user's switches into a `tools` fragment.
  *
  * Off is `[]` rather than `false`. Both are accepted everywhere and mean the
@@ -224,31 +270,21 @@ export function enablePolicy(
  *
  * A category the server marked unsettable is never emitted, in either
  * direction — the user cannot have changed it, and writing config against a
- * grant or a workspace tier only produces a fragment the PDP will refuse —
- * UNLESS it is also named in `lockedOn`.
+ * grant or a workspace tier only produces a fragment the PDP will refuse.
  *
- * `lockedOn` names the subset of `unsettable` the agent is presently HOLDING
- * (`compose_tool_view`'s per-tool code grant: `state: 'on'`, `settable:
- * false`) rather than one the server refused outright (`unavailable`). For
- * those keys this function drops the special-casing ENTIRELY — both
- * directions run the ordinary diff, so a local "turn it off" can register
- * exactly as it would for a settable category. That is deliberate, not a
- * gap: a category the agent already holds needs SOME way to notice a later
- * "turn it back on" as a change (a diff against a value that never moves
- * cannot detect anything), and this function has no memory across calls to
- * do that any other way. It is NOT, by itself, the guarantee that the OFF
- * write never reaches the wire — this function has no notion of "reaches the
- * wire" versus "purely local bookkeeping". The caller that actually dispatches
- * (settings-pane.component.ts::applyChanges, not
- * tools-group.component.ts::getOverrides, whose result only ever feeds a
- * boolean back through `desiredState`) MUST strip any `lockedOn` key's `[]`
- * from what THIS call returns before sending it — unticking a code-granted
- * category is fiction regardless of what got written locally, because the
- * runtime re-appends those names after the merge. A category outside
- * `lockedOn` — the server refused it outright, or a caller's own gate did —
- * stays refused in both directions no matter how `disabled`/`baselineOn` are
- * shaped; `lockedOn` only ever widens what `unsettable` narrowed, never the
- * reverse.
+ * That symmetry is deliberate and it is load-bearing: it is what makes "a
+ * locked category can never be turned off" a property of this function rather
+ * than a stripping pass some caller has to remember. An earlier fix punched a
+ * per-key hole in it (`lockedOn`) so that a locked-ON category could be
+ * *gained* by unticking it, applying, re-ticking and applying again — four
+ * gestures through a control that is rendered `disabled`, with the off-write
+ * kept off the wire by a downstream `delete`. The gesture never existed for a
+ * user and the hole let `[]` be built for a category that cannot honour it.
+ * The additive half now has its own channel, which cannot express "off" at
+ * all: {@link lockedOnAdditions} names the tools, and the request rides
+ * `tools.<c>: {only: [...]}` on its own tracked path (see
+ * `ToolsGroupComponent.getToolAdditions` and
+ * `settings-pane.component.ts::applyChanges`).
  */
 export function toolsFragment(
     keys: Iterable<string>,
@@ -256,17 +292,12 @@ export function toolsFragment(
         disabled: ReadonlySet<string>;
         baselineOn: ReadonlySet<string>;
         unsettable: ReadonlySet<string>;
-        /** The subset of `unsettable` exempted from the skip below — see the
-         *  function doc. Omit (or pass empty) to refuse every unsettable key
-         *  outright, in either direction: the original, symmetric behaviour. */
-        lockedOn?: ReadonlySet<string>;
         enumerateOnly: Record<string, string[]> | null | undefined;
     },
 ): Record<string, unknown> {
     const tools: Record<string, unknown> = {};
-    const lockedOn = opts.lockedOn ?? EMPTY_SET;
     for (const key of keys) {
-        if (opts.unsettable.has(key) && !lockedOn.has(key)) continue;
+        if (opts.unsettable.has(key)) continue;
         const wantOn = !opts.disabled.has(key);
         if (wantOn === opts.baselineOn.has(key)) continue;
         if (!wantOn) {
@@ -278,8 +309,6 @@ export function toolsFragment(
     }
     return tools;
 }
-
-const EMPTY_SET: ReadonlySet<string> = new Set();
 
 /**
  * Fallback label for a category the cockpit has no metadata for.
