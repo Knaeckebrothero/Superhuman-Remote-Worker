@@ -16,40 +16,59 @@ related:
 
 # Tool configuration — consolidated defect register and fix roadmap
 
-**Status:** IMPLEMENTED 2026-08-02/03 across 22 commits on `develop`, **not
-pushed**, and **not yet merge-ready** — the final whole-branch review returned
-four blockers, listed under "Merge blockers" below. Phases 0–3 are done; each
-task went implement → adversarial review → fix → scoped re-review. Full
-execution record, including ~40 triaged deferred minors and every ruling:
+**Status:** IMPLEMENTED 2026-08-02/03 on `develop`, **not pushed**. The final
+whole-branch review returned four merge blockers; **three are now fixed** and
+the fourth needs the cluster, not an agent. Phases 0–3 are done; each task went
+implement → adversarial review → fix → scoped re-review. Full execution record,
+including ~40 triaged deferred minors and every ruling:
 `.superpowers/sdd/tool_configuration_defects_and_fix_roadmap/progress.md`.
 **Owner:** unassigned.
 
 ## Merge blockers (final review, 2026-08-03)
 
-1. **The expert write boundary was missed.** `orchestrator/main.py:29009`,
-   `:29052`, `:29156`, `:29348` run only the credential deny-scan and the
-   grants PDP — `validate_tool_override_fragment` is absent. Verified
-   escalation: an expert carrying `tools.canvas: ["run_command"]` is storable
-   by any approved user; the PDP keys off the category so it sees nothing,
-   `load_tools` regroups by *registry* category, and the shell tool binds
-   without the `shell_tools` grant. Four one-line calls to a validator that
-   already exists. A three-task seam failure — Task 5 predicted it, Task 7
-   ("every write boundary") did not enumerate it, Task 8 then routed UI traffic
-   through it.
-2. **A per-tool code grant renders as an un-untickable ticked box.**
-   `src/core/tool_report.py:386` knows only *category*-level grants, so
-   `srw_cloud_status`, `sleep`, `notify_user` and `request_workspace_upgrade`
-   are invisible to it while the agent re-appends them after the merge.
-   `compose_tool_view` guards "off is a promise" with no symmetric guard for
-   "on is revocable". Reachable on any session with a cloud mount — the default
-   topology. Server-side only; the cockpit already renders locked-on correctly.
+1. ~~**The expert write boundary was missed.**~~ **FIXED.** The four sites the
+   review named (`orchestrator/main.py` create / update / import / fork-a-default)
+   plus a **fifth it missed** — `POST /api/experts/{id}/duplicate`, which had
+   neither the deny-scan nor the PDP and forks a row that may be another
+   principal's — now run `validate_tool_override_fragment` through
+   `_validate_expert_fragment`, which returns the canonical fragment so the row
+   is persisted normalised and the save-time PDP only ever reads a list. The
+   verified escalation (`tools.canvas: ["run_command"]` stored by any approved
+   user, invisible to a PDP that keys off the category, bound as shell by a
+   loader that regroups by *registry* category) is closed, and so is a quieter
+   one: `normalize_tool_policy` runs when the row is READ, so a shape it refuses
+   (`tools.shell: true`) was storable and made the expert unresolvable
+   afterwards. Covered by `TestExpertWriteBoundary`.
+2. ~~**A per-tool code grant renders as an un-untickable ticked box.**~~
+   **FIXED.** `code_granted_tools()` adds the per-*tool* tier the category map
+   structurally could not see, and `compose_tool_view` gained the mirror of "off
+   is a promise": when everything the agent bound is a `grant: "code"` name, the
+   category is `on` with `settable: false`, `decided_by: registry` and a reason
+   naming the tools and their gates. It fires only when unticking would change
+   nothing — a bound set that also holds a config-granted name stays an ordinary
+   ticked box. Covered by `TestOnIsRevocable`, one case per re-append site.
 3. **Live gates for Phases 1.2 and 1.3 never ran** — blocked on the k3d cluster
    (gitea's sqlite→postgres guard, migration drift, an ad-hoc pod image).
-   Phase 1.1's gate *did* run and passed. Blocker 2 is precisely what a gate
-   catches and eight rounds of static review nearly missed.
-4. ~~Doc status headers stale~~ — this file corrected;
-   `registered_tools_no_config_can_grant.md:20` and
-   `tool_config_policy_vs_membership.md:39` still say "not started".
+   Phase 1.1's gate *did* run and passed. **Still the open blocker**, and
+   blocker 2 is precisely what a gate catches and eight rounds of static review
+   nearly missed.
+4. ~~Doc status headers stale~~ — **FIXED.** All three corrected:
+   this file, `registered_tools_no_config_can_grant.md` (shipped vs remaining,
+   per item) and `tool_config_policy_vs_membership.md` (commits 1–6 landed, 7
+   optional and untouched).
+
+### Known consequence of blocker 2's fix
+
+A category the runtime holds *partially* — `shell` on the default topology, held
+by `srw_cloud_status` alone — is now locked in **both** directions on the live
+pane, because `settable: false` is one boolean and the cockpit never emits an
+unsettable key. Nothing regresses (the enable path there was already dead: the
+diff baseline is anchored to the server's answer and never moves after an apply,
+so re-ticking a category the answer calls `on` emits nothing), and the New
+Session form is unaffected because a prediction has no bound set to lock. But
+"config may still *add* to this category" has no expression in the current
+contract. Fast-follow, client-side: either a per-tool affordance or an explicit
+"add the config-grantable tools" action.
 
 **What was achieved:** `[]` no longer conflates membership with policy, so "on"
 is expressible; all 12 form categories are honoured where 4 were; eight of nine
