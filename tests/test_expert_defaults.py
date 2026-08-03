@@ -29,7 +29,19 @@ async def test_unspecified_defaults_type_remains_worker_for_compatibility():
 
 
 @pytest.mark.asyncio
-async def test_db_expert_detail_includes_base_tools_and_settings_matrix(monkeypatch):
+async def test_db_expert_detail_includes_settings_matrix_and_no_defaults_tools(
+    monkeypatch,
+):
+    """`defaults_tools` is gone, and its absence is the assertion.
+
+    It existed for exactly one caller — the cockpit's re-enable payload, which
+    sent ``tools[cat] = [...defaults_tools[cat]]``. Every category worth
+    re-enabling ships ``[]`` in both bases, so that payload was empty and the
+    tick emitted nothing at all. The forms now write a policy (``true``, or the
+    ``enumerate_only`` enumeration for ``shell``) and the write boundary
+    expands it against the registry, so re-serving the base's lists would only
+    invite the dead path back.
+    """
     expert_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
     monkeypatch.setenv("EXPERTS_DB_ENABLED", "true")
     monkeypatch.setattr(
@@ -54,8 +66,7 @@ async def test_db_expert_detail_includes_base_tools_and_settings_matrix(monkeypa
 
     detail = await _load_expert_detail(expert_id)
 
-    assert detail["defaults_tools"]["workspace"]
-    assert detail["defaults_tools"]["shell"] == []
+    assert "defaults_tools" not in detail
     assert "gpt-5.6" in detail["settings_matrix"]
 
 
