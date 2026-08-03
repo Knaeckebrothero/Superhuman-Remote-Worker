@@ -17,7 +17,44 @@ related:
 
 # Ten registered tools have no reachable grant path — and five curation prompts unconditionally order the curator to call two of them
 
-**Status:** OPEN, diagnosed 2026-08-02. Not started.
+**Status:** OPEN, diagnosed 2026-08-02 — the *invisible* half is fixed, the ten
+tools are unchanged.
+
+**Shipped** 2026-08-02/03 on `develop` (not pushed;
+[[tool_configuration_defects_and_fix_roadmap]] is the register), all of it
+consuming this inventory rather than acting on it:
+
+- **§2 is machine-readable.** Every injection site config cannot revoke now
+  carries `grant: "code"` plus this document's own `gate` string in
+  `TOOL_REGISTRY`; `CODE_GRANTED_CATEGORIES` classifies the eight whole-category
+  cases. The three marker-gated lists (14 `orchestrator`, 5 `agent_catalog`, 7
+  `workflows`) are deliberately *unmarked*, because unticking those categories
+  really does drop them.
+- **§5's two field-less categories are stated rules, not accidents.**
+  `product_help` and `session_task` are recorded as code grants, so
+  `tools.product_help: [...]` being discarded is now something the system says
+  rather than something it does silently.
+- **Both are served to the user.** `GET .../tool-groups` reports, per category,
+  that the runtime decided it and which gate — and after this review round, per
+  *tool* too (`code_granted_tools()`), which is what makes `srw_cloud_status`,
+  `sleep`, `notify_user` and `request_workspace_upgrade` visible instead of
+  showing as an ordinary ticked checkbox nobody can untick.
+- **Item 3's premise is void.** The six `*_bundle` tools got `grant: "explicit"`,
+  so a config *can* name them (an in-category explicit name is accepted at every
+  write boundary; `tests/test_tool_override_boundary.py::TestNoModelAuthoredPathReachesSessionCreate`
+  pins why that is bounded). They are no longer ungrantable — only ungranted.
+  The §3c verification is still owed, but the question narrowed: the reachable
+  path is now a *documented* one.
+
+**Not shipped, and what keeps this issue open:** items 1, 2 and 5 — the curator
+still cannot call the `kb_lint`/`kb_index` that five of its prompts order, the
+`delegate_work` decision is still unrecorded (and
+`config/experts/developer/config.yaml`'s "former broad base" comment still reads
+as history), and there is no prompt lint. Item 4's reachability test was **not**
+added: `tests/test_config_tool_names_are_registered.py` still checks one
+direction only. The implementing series held "no shipped config's grants change"
+as an acceptance property, so every count and every row in §3 stands as written.
+
 **Severity:** medium. Nothing crashes and nothing fails open. Two distinct
 harms: (a) the curator is told, in every model-family variant of its prompt, to
 run `kb_lint` and `kb_index`, which it cannot hold — the same class as
