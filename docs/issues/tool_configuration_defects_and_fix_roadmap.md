@@ -12,19 +12,51 @@ related:
   - "[[session_uploads_never_extract_archives]]"
   - "[[tool_config_policy_vs_membership]]"
   - "[[session_tool_group_checkbox_disagrees_with_the_agent]]"
+  - "[[tool_configuration_live_gates_2026-08-03]]"
+  - "[[tool_configuration_deferred_findings]]"
+  - "[[resume_job_grant_recheck_fails_open]]"
+  - "[[job_mode_reasoning_pick_silently_reset]]"
+  - "[[duplicate_expert_bypasses_user_experts_kill_switch]]"
 ---
 
 # Tool configuration — consolidated defect register and fix roadmap
 
-**Status:** IMPLEMENTED 2026-08-02/03 on `develop`, **not pushed**. The final
-whole-branch review returned four merge blockers; **three are now fixed** and
-the fourth needs the cluster, not an agent. Phases 0–3 are done; each task went
-implement → adversarial review → fix → scoped re-review. Full execution record,
-including ~40 triaged deferred minors and every ruling:
-`.superpowers/sdd/tool_configuration_defects_and_fix_roadmap/progress.md`.
+**Status:** IMPLEMENTED **and live-gated** 2026-08-02/03 on `develop`, **not
+pushed**. Phases 0–3 are done; each of the eight tasks went implement →
+adversarial review → fix → scoped re-review. The final whole-branch review
+returned four merge blockers and **all four are now closed** — three by the fix
+wave, the fourth by six live gates across three rounds, every one passing (one
+defect found by round 1, fixed, re-gated in round 3).
+
+**Remaining before this is finished, none of it code review:** push, deploy to
+dev, and re-run the cheap half of the gates against a built cockpit bundle rather
+than a dev server. Then the one owed action in the follow-up register: a
+read-only `jsonb_typeof` scan of any target database, because Task 5 turned
+malformed stored `tools` values into a hard failure where they were previously
+ignored in silence.
+
+**This file and its three siblings stay in `docs/issues/` and `docs/features/`
+until then**, deliberately. The house convention for `docs/done/` is work that is
+fixed *and* verified on a deployment — the closest sibling,
+[[session_tool_group_checkbox_disagrees_with_the_agent]], names its commit, its
+`sha-*` image and the dev session it was live-verified on — and none of this is
+pushed, so `develop` is not what any deployment is running.
+Two of the four also have genuinely open content on their own terms:
+[[registered_tools_no_config_can_grant]] items 1/2/5 are unshipped, and
+[[session_uploads_never_extract_archives]] has no live gate at all. The move to
+`docs/done/` is a single commit once dev is running this code and the gates
+re-pass there.
+
+- Gate evidence, with the numbers: [[tool_configuration_live_gates_2026-08-03]]
+- Everything triaged as deferred, plus what was settled and must not be
+  re-litigated: [[tool_configuration_deferred_findings]]
+- Filed out of the run: [[resume_job_grant_recheck_fails_open]],
+  [[job_mode_reasoning_pick_silently_reset]],
+  [[duplicate_expert_bypasses_user_experts_kill_switch]]
+
 **Owner:** unassigned.
 
-## Merge blockers (final review, 2026-08-03)
+## Merge blockers (final review, 2026-08-03) — all four closed
 
 1. ~~**The expert write boundary was missed.**~~ **FIXED.** The four sites the
    review named (`orchestrator/main.py` create / update / import / fork-a-default)
@@ -39,6 +71,10 @@ including ~40 triaged deferred minors and every ruling:
    one: `normalize_tool_policy` runs when the row is READ, so a shape it refuses
    (`tools.shell: true`) was storable and made the expert unresolvable
    afterwards. Covered by `TestExpertWriteBoundary`.
+   *Residual on that fifth route, filed separately:* duplicate still skips
+   `_enforce_expert_save`, so the user-experts kill switch and the save-time
+   grants PDP do not run there —
+   [[duplicate_expert_bypasses_user_experts_kill_switch]].
 2. ~~**A per-tool code grant renders as an un-untickable ticked box.**~~
    **FIXED.** `code_granted_tools()` adds the per-*tool* tier the category map
    structurally could not see, and `compose_tool_view` gained the mirror of "off
@@ -47,11 +83,56 @@ including ~40 triaged deferred minors and every ruling:
    naming the tools and their gates. It fires only when unticking would change
    nothing — a bound set that also holds a config-granted name stays an ordinary
    ticked box. Covered by `TestOnIsRevocable`, one case per re-append site.
-3. **Live gates for Phases 1.2 and 1.3 never ran** — blocked on the k3d cluster
-   (gitea's sqlite→postgres guard, migration drift, an ad-hoc pod image).
-   Phase 1.1's gate *did* run and passed. **Still the open blocker**, and
-   blocker 2 is precisely what a gate catches and eight rounds of static review
-   nearly missed.
+3. ~~**Live gates for Phases 1.2 and 1.3 never ran.**~~ **RUN 2026-08-03 —
+   six gates, three rounds, all passing.** The cluster blockers (gitea's
+   sqlite→postgres guard, migration drift, an ad-hoc pod image) were cleared
+   first; Phase 1.1's gate had already run and passed under Task 6. Full
+   evidence: [[tool_configuration_live_gates_2026-08-03]].
+
+   *Round 1* — **Phase 1.2** proved by a **control**, not by an absence: a
+   session with `tools.research: []` bound **32** tools with zero of the eight
+   `research` members, while a stock session on the same expert, tier and image
+   bound **40**, the extra 8 being exactly `research`. (The control is what makes
+   it proof — `knowledge` reports `configured: 10, bound: 0` for unrelated
+   reasons.) Agreement was three-way: pod log 32 = the agent's own
+   `GET /session/toolset` 32 = the endpoint's 32, exact set match, with
+   `decided_by: "request"`. Smuggling `tools.canvas: ["run_command"]` returned
+   **400 at eight write boundaries** in total (five here, three in round 2),
+   each with a clean-body control on the same route; the strongest is the
+   automations control, which stored `{"canvas": true}` **normalised to the three
+   canvas tool names** — a shape-mismatch rejection could not have done that, so
+   the 400 is the validator's verdict. **Phase 1.3** passed on three of four
+   items (25 rows, 0 untranslated keys, all four provenance banners, locked-on
+   rows muted-not-warning, a degraded pane rendering 0 rows) and found the
+   defect described below.
+
+   *Round 2*, after the owner authorised a DB-only non-admin user on the
+   throwaway cluster — **Phase 1.4** in both directions. Read side: `shell` reads
+   `unavailable / settable:false / decided_by:"grant"` with the reason *"requires
+   the shell_tools capability grant"* and `configured: []` — the config never
+   asked, and the refusal fires anyway. Strongest evidence: **one response
+   carrying two causes and two sentences** — `shell` by=grant next to
+   `git`/`browser_direct` by=backend with the tier sentence, on one session, one
+   tier. Reversible with a single `capability_grants` row, and the identical
+   `POST /api/experts` body is **422** as the non-admin and **200** as the admin.
+   And **D5 held where it matters**: `agent_catalog: true` live-measured bound
+   exactly **5** tools with **all six `*_bundle` writes absent**, `workflows: true`
+   bound 7, `orchestrator: true` excluded `get_stuck_jobs`/`steer_worker_job` —
+   principal-independently, because the exclusion is a registry mark read by
+   `_grantable` rather than a grant lookup.
+
+   *Round 3* — the round-1 defect, fixed and re-driven with the failing state
+   reproduced first so the drive is known to be sensitive. One `Add (4)` gesture
+   dispatched one `config.update`, the server persisted it normalised, and the
+   agent rebound **55 → 85 tools** (set-diff 30 added, 0 removed; three of the
+   thirty are the shell tools, `shell_execute` absent as its mode-alias twin) —
+   after which the row **heals itself** back to an ordinary settable checkbox.
+
+   Blocker 2 was precisely what a gate catches and eight rounds of static review
+   nearly missed; round 1's defect is the third time in this series that a green
+   suite endorsed something wrong and a rendered check caught it. What is still
+   not gated is listed in the gate doc — chiefly server-produced `agent_partial`,
+   and anything at all on a real deployment.
 4. ~~Doc status headers stale~~ — **FIXED.** All three corrected:
    this file, `registered_tools_no_config_can_grant.md` (shipped vs remaining,
    per item) and `tool_config_policy_vs_membership.md` (commits 1–6 landed, 7
@@ -71,8 +152,7 @@ and `true` after it. Browser-verified end to end on a sandbox-tier session:
 untick → 0 frames; Add → one `config.update` carrying the enumeration → the
 override persisted → the agent rebound with `run_command`, `cancel_command`,
 `shell_read` and `shell` back to `settable: true`. Detail:
-`.superpowers/sdd/tool_configuration_defects_and_fix_roadmap/live-gates-report.md`,
-round 3.
+[[tool_configuration_live_gates_2026-08-03]], round 3.
 
 **No second contract field was needed**, and the reason is worth recording:
 `enumerate_only` already ships the config-grantable membership of every category
@@ -125,16 +205,25 @@ emits an unsettable key.
 > control of its own. See the CLOSED note above.
 
 **What was achieved:** `[]` no longer conflates membership with policy, so "on"
-is expressible; all 12 form categories are honoured where 4 were; eight of nine
-write boundaries reject rather than drop; the agent is the sole authority on
-what it bound, with one implementation of that answer. Task 5's identity
-property — no shipped config's grants change — held across all eight tasks.
+is expressible; all 12 form categories are honoured where 4 were; every tool
+write boundary rejects rather than drops, including the expert surface the first
+pass missed — **eight of them driven live, all 400** — and the agent is the sole
+authority on what it bound, with one implementation of that answer. Task 5's
+identity property — no shipped config's grants change — held across all eight
+tasks, with `tests/fixtures/config_tool_grants.json` still at md5
+`9ddc4f79…`, unmoved since Task 2's deliberate `kb_*` grant.
 
 **What was not:** no creation form can tell the truth structurally, because a
 prediction cannot see the backend gate, runtime injection, or datasource
 attachment — and no cockpit surface branches on `origin` in a way that changes
 the control, so a forecast still renders as switch positions. Job create is the
 weakest surface: no server-computed view at all.
+
+**Carried out of the run, not lost with it:** about forty findings triaged as
+*minor, deferred*, ten rulings settled at real cost, and three tickets that were
+owed. All in [[tool_configuration_deferred_findings]] — read its §1 before this
+branch reaches a database with hand-authored experts.
+
 **Purpose:** single entry point for the nine defects found in one investigation.
 The detail lives in the three linked docs; this one exists so the work can be
 sequenced and picked up without reading all four.
