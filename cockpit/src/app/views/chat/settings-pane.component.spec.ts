@@ -6,11 +6,38 @@ import {ApiService} from '../../core/services/api.service';
 import {CapabilitiesService} from '../../core/services/capabilities.service';
 import {ModelService} from '../../core/services/model.service';
 import {PersistentChatService} from '../../core/services/persistent-chat.service';
-import {
-  SESSION_TOOL_GROUP_BASE_ENABLED,
-  SESSION_TOOL_GROUP_NAMES,
-} from '../agent-settings/agent-settings.types';
+import type {
+  SessionToolCategory,
+  SessionToolGroupsResponse,
+} from '../../core/services/api.service';
 import {SettingsPaneComponent} from './settings-pane.component';
+
+/** Build the resolved tool-groups answer the pane now reads. */
+function toolsetAnswer(
+  states: Record<string, 'on' | 'off' | 'unavailable'>,
+  over: Partial<SessionToolGroupsResponse> = {},
+): SessionToolGroupsResponse {
+  const categories: Record<string, SessionToolCategory> = {};
+  for (const [key, state] of Object.entries(states)) {
+    categories[key] = {
+      state,
+      settable: state !== 'unavailable',
+      reason: state === 'unavailable' ? 'the agent bound none' : null,
+      decided_by: 'base',
+      tools: state === 'on' ? ['x'] : [],
+    };
+  }
+  return {
+    thread_id: 'thread-1',
+    source: 'resolved',
+    origin: 'agent',
+    observed_at: '2026-08-03T10:00:00Z',
+    enumerate_only: {shell: ['run_command', 'shell_read']},
+    tool_groups: null,
+    categories,
+    ...over,
+  };
+}
 
 /**
  * The live settings pane's desired-state diff (live_session_settings.md
@@ -25,11 +52,13 @@ function createPane(options: {
   grants?: Record<string, unknown> | null;
   attachedIds?: string[];
   eligible?: Array<{id: string; type: string; name: string}>;
-  /** Server-resolved tool-group enablement; null models an orchestrator that
-   *  predates the endpoint (the pane falls back to its session_base mirror). */
-  toolGroups?: Record<string, boolean> | null;
+  /** The resolved toolset; null models an orchestrator that predates the
+   *  endpoint (the tools surface then degrades to its static list). */
+  toolGroups?: SessionToolGroupsResponse | null;
   /** Observable for the tool-groups call, to drive the load-ordering test. */
-  toolGroups$?: Observable<Record<string, boolean> | null>;
+  toolGroups$?: Observable<SessionToolGroupsResponse | null>;
+  /** Thread ids whose metadata differs, for the thread-switch test. */
+  threadsById?: Record<string, Record<string, unknown>>;
 } = {}) {
   const chat = {
     threadId: signal<string | null>('thread-1'),
@@ -77,6 +106,8 @@ function createPane(options: {
   Object.defineProperty(component, 'active', {value: () => true});
   const fakeSettings = {
     prefillFromConfig: vi.fn(),
+    prefillFromResolvedToolset: vi.fn(),
+    hasToolEdits: vi.fn().mockReturnValue(false),
     getOverrides: vi.fn().mockReturnValue({}),
     // Real group defaults its selection to the attached set (via
     // initialSelectedIds); mirror that default here.
@@ -132,110 +163,114 @@ describe('SettingsPaneComponent apply diff', () => {
     expect(chat.updateConfig).not.toHaveBeenCalled();
   });
 
-  it('tool toggles send [] to disable and the vocabulary mirror to re-enable', () => {
+  it('tool toggles send [] to disable and a policy to re-enable', () => {
     // Baseline must have canvas OFF and workflows ON for both directions to
-    // diff. The server is the source of that baseline now — an override of
-    // `{tools: {canvas: []}}` alone would leave workflows disabled by the
-    // session_base default, so "disable workflows" would be a no-op.
+    // diff. The AGENT's answer is that baseline now — not a config merge,
+    // which cannot see the runtime injection layer or the capability gate.
     const {component, chat, fakeSettings} = createPane({
-      toolGroups: {
-        orchestrator: false,
-        agent_catalog: false,
-        workflows: true,
-        canvas: false,
-      },
+      toolGroups: toolsetAnswer({
+        orchestrator: 'off',
+        agent_catalog: 'off',
+        workflows: 'on',
+        canvas: 'off',
+      }),
     });
     // Re-enable canvas, disable workflows in one batch.
     fakeSettings.getOverrides.mockReturnValue({
-      tools: {canvas: SESSION_TOOL_GROUP_NAMES['canvas'], workflows: []},
+      tools: {canvas: true, workflows: []},
     });
 
     component.onSettingsChange();
     vi.runAllTimers();
 
     expect(chat.updateConfig).toHaveBeenCalledExactlyOnceWith({
-      tools: {
-        canvas: SESSION_TOOL_GROUP_NAMES['canvas'],
-        workflows: [],
-      },
+      tools: {canvas: true, workflows: []},
     });
   });
 
-  it('an unset group reads as disabled from the server defaults', () => {
+  it('the tools baseline is anchored to the AGENT answer, not the config', () => {
     // The reported bug: config_override says nothing about orchestrator, so
     // the pane used to render it ticked while the agent had zero fleet tools.
     const {fakeSettings} = createPane({
       override: {},
-      toolGroups: {
-        orchestrator: false,
-        agent_catalog: false,
-        workflows: false,
-        canvas: true,
-      },
+      toolGroups: toolsetAnswer({
+        orchestrator: 'off',
+        agent_catalog: 'off',
+        workflows: 'off',
+        canvas: 'on',
+      }),
     });
 
-    const prefilled = fakeSettings.prefillFromConfig.mock.calls[0][0] as {
-      tools: Record<string, string[]>;
-    };
-    expect(prefilled.tools['orchestrator']).toEqual([]);
-    expect(prefilled.tools['agent_catalog']).toEqual([]);
-    expect(prefilled.tools['workflows']).toEqual([]);
-    expect(prefilled.tools['canvas']).toEqual(SESSION_TOOL_GROUP_NAMES['canvas']);
+    const anchored = fakeSettings.prefillFromResolvedToolset.mock.calls[0][0] as Record<
+      string,
+      SessionToolCategory
+    >;
+    expect(anchored['orchestrator'].state).toBe('off');
+    expect(anchored['canvas'].state).toBe('on');
+    // And the config prefill no longer carries a synthesised tools layer.
+    const prefilled = fakeSettings.prefillFromConfig.mock.calls[0][0] as Record<string, unknown>;
+    expect(prefilled['tools']).toBeUndefined();
   });
 
-  it('falls back to the session_base mirror when the endpoint is unavailable', () => {
-    // Older orchestrator (404) or a failed request → getSessionToolGroups
-    // yields null, and the client's own defaults must still be correct.
-    const {fakeSettings} = createPane({override: {}, toolGroups: null});
+  it('the surface degrades honestly when the endpoint is unavailable', () => {
+    // Older orchestrator (404) or a failed request → null. The pane must not
+    // invent a baseline; it anchors nothing and dispatches no tool fragment.
+    const {component, chat, fakeSettings} = createPane({override: {}, toolGroups: null});
 
-    const prefilled = fakeSettings.prefillFromConfig.mock.calls[0][0] as {
-      tools: Record<string, string[]>;
-    };
-    for (const [group, enabled] of Object.entries(SESSION_TOOL_GROUP_BASE_ENABLED)) {
-      expect(prefilled.tools[group]).toEqual(
-        enabled ? SESSION_TOOL_GROUP_NAMES[group] : [],
-      );
-    }
+    expect(fakeSettings.prefillFromResolvedToolset).not.toHaveBeenCalled();
+    fakeSettings.getOverrides.mockReturnValue({llm: {model: 'a'}});
+    component.onSettingsChange();
+    vi.runAllTimers();
+    expect(chat.updateConfig).toHaveBeenCalledExactlyOnceWith({llm: {model: 'a'}});
   });
 
-  it('a thread override wins over the server defaults', () => {
-    const {fakeSettings} = createPane({
-      override: {tools: {canvas: []}},
-      toolGroups: {
-        orchestrator: false,
-        agent_catalog: false,
-        workflows: false,
-        canvas: true,
-      },
+  it('every category the answer returns is diffable, not just four', () => {
+    // The live pane could only carry canvas/orchestrator/agent_catalog/
+    // workflows. `knowledge` is one of the eight it could not express.
+    const {component, chat, fakeSettings} = createPane({
+      toolGroups: toolsetAnswer({canvas: 'on', knowledge: 'on', git: 'off'}),
     });
+    fakeSettings.getOverrides.mockReturnValue({tools: {knowledge: []}});
 
-    const prefilled = fakeSettings.prefillFromConfig.mock.calls[0][0] as {
-      tools: Record<string, string[]>;
-    };
-    expect(prefilled.tools['canvas']).toEqual([]);
+    component.onSettingsChange();
+    vi.runAllTimers();
+
+    expect(chat.updateConfig).toHaveBeenCalledExactlyOnceWith({tools: {knowledge: []}});
   });
 
-  it('re-enabling a base-disabled group dispatches the vocabulary mirror', () => {
+  it('an unavailable category is never dispatched, however the surface reports it', () => {
+    // The server refused. Writing config against a grant or a workspace tier
+    // produces a fragment the PDP will reject and changes no binding.
+    const {component, chat, fakeSettings} = createPane({
+      toolGroups: toolsetAnswer({shell: 'unavailable', canvas: 'on'}),
+    });
+    fakeSettings.getOverrides.mockReturnValue({tools: {shell: true}});
+
+    component.onSettingsChange();
+    vi.runAllTimers();
+
+    expect(chat.updateConfig).not.toHaveBeenCalled();
+  });
+
+  it('re-enabling a base-disabled group dispatches a policy', () => {
     // This path was dead before the fix: the group rendered ticked, so its
     // baseline was "enabled" and turning it on could never produce a delta.
     const {component, chat, fakeSettings} = createPane({
       override: {},
-      toolGroups: {
-        orchestrator: false,
-        agent_catalog: false,
-        workflows: false,
-        canvas: true,
-      },
+      toolGroups: toolsetAnswer({
+        orchestrator: 'off',
+        agent_catalog: 'off',
+        workflows: 'off',
+        canvas: 'on',
+      }),
     });
-    fakeSettings.getOverrides.mockReturnValue({
-      tools: {orchestrator: SESSION_TOOL_GROUP_NAMES['orchestrator']},
-    });
+    fakeSettings.getOverrides.mockReturnValue({tools: {orchestrator: true}});
 
     component.onSettingsChange();
     vi.runAllTimers();
 
     expect(chat.updateConfig).toHaveBeenCalledExactlyOnceWith({
-      tools: {orchestrator: SESSION_TOOL_GROUP_NAMES['orchestrator']},
+      tools: {orchestrator: true},
     });
   });
 
@@ -256,21 +291,80 @@ describe('SettingsPaneComponent apply diff', () => {
     vi.advanceTimersByTime(2000);
     expect(chat.updateConfig).not.toHaveBeenCalled();
 
-    // Deliberately DIFFERENT from SESSION_TOOL_GROUP_BASE_ENABLED (orchestrator
-    // is on here): if this landed after the anchor, the baseline would still
-    // hold the mirror's values and the next change would diff against them.
-    toolGroups$.next({
-      orchestrator: true,
-      agent_catalog: false,
-      workflows: false,
-      canvas: true,
-    });
+    // If this landed after the anchor, the baseline would hold a different
+    // set from what the surface renders and the next change would diff
+    // against it.
+    toolGroups$.next(
+      toolsetAnswer({
+        orchestrator: 'on',
+        agent_catalog: 'off',
+        workflows: 'off',
+        canvas: 'on',
+      }),
+    );
     toolGroups$.complete();
 
     expect(fakeSettings.prefillFromConfig).toHaveBeenCalled();
     component.onSettingsChange();
     vi.runAllTimers();
     expect(chat.updateConfig).not.toHaveBeenCalled();
+  });
+
+  it('a thread switch drops the diff baseline BEFORE the fetch', () => {
+    // The race: `lastApplied` used to survive `loadThread`. For the whole
+    // request window — sub-second once, now up to 8s because the read probes
+    // the agent pod — an edit would diff the NEW session's desired state
+    // against the OLD session's baseline and dispatch the difference into the
+    // new session. Concretely: thread-1 has canvas ON, thread-2 has it OFF, so
+    // a stale baseline turns an unrelated model pin into "disable canvas".
+    const toolGroups$ = new Subject<SessionToolGroupsResponse | null>();
+    const {component, chat, api, fakeSettings} = createPane({
+      toolGroups: toolsetAnswer({canvas: 'on'}),
+    });
+    // Baseline for thread-1 is anchored.
+    fakeSettings.getOverrides.mockReturnValue({llm: {model: 'a'}});
+    component.onSettingsChange();
+    vi.runAllTimers();
+    expect(chat.updateConfig).toHaveBeenCalledTimes(1);
+
+    // Switch threads; the new read is still in flight.
+    api.getSessionToolGroups.mockReturnValue(toolGroups$);
+    chat.threadId.set('thread-2');
+    TestBed.tick();
+
+    // An edit lands inside the window.
+    fakeSettings.getOverrides.mockReturnValue({llm: {model: 'b'}});
+    component.onSettingsChange();
+    vi.advanceTimersByTime(2000);
+    expect(chat.updateConfig).toHaveBeenCalledTimes(1);
+
+    // Only once the new thread's answer lands does anything dispatch, and it
+    // dispatches against the NEW baseline.
+    toolGroups$.next(toolsetAnswer({canvas: 'off'}));
+    toolGroups$.complete();
+    vi.runAllTimers();
+    expect(chat.updateConfig).toHaveBeenCalledTimes(2);
+    expect(chat.updateConfig).toHaveBeenNthCalledWith(2, {llm: {model: 'b'}});
+  });
+
+  it('a thread switch drops the previous thread config too', () => {
+    // `threadOverride` had the same shape of bug: liveConfig() kept serving
+    // the previous session's durable config while the pane already pointed
+    // elsewhere, so every control read from the wrong session for the window.
+    const toolGroups$ = new Subject<SessionToolGroupsResponse | null>();
+    const {component, chat, api} = createPane({
+      override: {workspace: {backend: 'vm'}},
+      attachedIds: ['ds-pg'],
+    });
+    expect(component.workspaceTier()).toBe('vm');
+
+    chat.workspaceTier.set(null);
+    api.getSessionToolGroups.mockReturnValue(toolGroups$);
+    chat.threadId.set('thread-2');
+    TestBed.tick();
+
+    expect(component.workspaceTier()).toBe('virtual');
+    expect(component.attachedIds()).toEqual([]);
   });
 
   it('a response for a superseded thread is ignored', () => {

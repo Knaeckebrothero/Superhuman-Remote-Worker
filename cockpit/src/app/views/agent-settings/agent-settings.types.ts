@@ -42,88 +42,39 @@ export const SESSION_TOOL_CATEGORIES: ToolCategoryMeta[] = [
 ];
 
 /**
- * The four closed session tool groups the live pane offers as switches.
+ * Presentation metadata for the categories the twelve above do not cover.
  *
- * Historically these were the ONLY categories either session boundary
- * validated, and the other eight were silently dropped — so rendering them
- * live would have given 8 toggles that no-op. That is no longer true: every
- * write boundary now validates every category against the registry
- * (src/core/tool_policy.py::validate_tool_override_fragment), and a fragment
- * it will not honour is a 400 rather than a discard. Widening the live pane to
- * the full list is a UI decision, not a backend constraint.
+ * PRESENTATION ONLY — icons, order and copy. It decides nothing about
+ * enablement and is never a vocabulary: the resolved read
+ * (`GET /api/persistent/threads/{id}/tool-groups`, `POST .../tool-groups/preview`)
+ * returns EVERY category the agent can hold, including `mcp`, `unclassified`
+ * and anything a config names, and the surfaces render what it returns. A key
+ * missing from here still renders — see `humanizeCategoryKey` — so this list
+ * going stale costs a nice label and nothing else. That is deliberate: the
+ * lists this change deleted were all lists whose staleness cost correctness.
  */
-export const LIVE_TOOL_CATEGORIES: ToolCategoryMeta[] = SESSION_TOOL_CATEGORIES.filter(
-  (cat) => ['canvas', 'orchestrator', 'agent_catalog', 'workflows'].includes(cat.key),
-);
+export const AUXILIARY_TOOL_CATEGORIES: ToolCategoryMeta[] = [
+  { key: 'workspace', label: 'Workspace Files', icon: 'folder_open', description: 'Read, write, move and search files in the session workspace' },
+  { key: 'core', label: 'Core', icon: 'bolt', description: 'Planning, progress and completion — todos, replanning, notifications, sleep' },
+  { key: 'session_task', label: 'Session Tasks', icon: 'checklist', description: "The session's own task list" },
+  { key: 'product_help', label: 'Product Help', icon: 'help_center', description: 'Read the SRW product guide and capability reference' },
+  { key: 'evaluation', label: 'Evaluation', icon: 'rule', description: 'Approve or return worker jobs with feedback' },
+  { key: 'loop', label: 'Project Loop', icon: 'restart_alt', description: 'Plan an autonomous project loop' },
+  { key: 'sql', label: 'SQL', icon: 'table', description: 'Query attached PostgreSQL datasources' },
+  { key: 'mongodb', label: 'MongoDB', icon: 'database', description: 'Query attached MongoDB datasources' },
+  { key: 'graph', label: 'Graph', icon: 'share', description: 'Query attached Neo4j datasources' },
+  { key: 'webdav', label: 'Cloud Storage', icon: 'cloud', description: 'Read and write files on attached WebDAV / cloud datasources' },
+  { key: 'email', label: 'Email', icon: 'inbox', description: 'Read and send through an attached email datasource' },
+  { key: 'repo', label: 'Repositories', icon: 'source', description: 'Read and write attached repository datasources' },
+  { key: 'mcp', label: 'MCP Servers', icon: 'extension', description: 'Tools discovered from attached MCP servers at session start' },
+  { key: 'unclassified', label: 'Other', icon: 'category', description: 'Tools this cockpit build does not recognise — usually discovered at runtime' },
+];
 
-/**
- * Full tool-name vocabulary per closed session group — mirror of
- * SESSION_TOOL_OVERRIDE_NAMES in src/core/session_tool_overrides.py, pinned
- * against drift by tests/test_session_tool_group_mirror.py. Used as the
- * payload when a live toggle re-enables a group (the agent keys enablement
- * off empty-vs-non-empty, so send the canonical full set).
- *
- * The backend now also accepts `true` for a category and expands it to
- * exactly these names, which makes this mirror redundant rather than wrong.
- */
-export const SESSION_TOOL_GROUP_NAMES: Record<string, string[]> = {
-  orchestrator: [
-    'get_session_context',
-    'create_worker_job',
-    'list_worker_jobs',
-    'get_worker_job',
-    'get_job_workspace_file',
-    'list_job_workspace_files',
-    'approve_worker_job',
-    'resume_worker_job',
-    'cancel_worker_job',
-    'pause_worker_job',
-    'get_current_project',
-    'list_project_jobs',
-    'list_project_repositories',
-    'get_default_project_repository',
-  ],
-  agent_catalog: ['list_experts', 'get_expert', 'list_skills', 'search_skills', 'get_skill'],
-  workflows: ['list_automations', 'get_automation', 'list_automation_runs', 'propose_automation', 'get_project_loop', 'list_project_loop_jobs', 'explain_project_loop'],
-  canvas: ['set_canvas', 'get_canvas', 'clear_canvas'],
-};
-
-/**
- * Default enablement of each closed session group in config/session_base.yaml —
- * a group ships EMPTY (= DISABLED) unless listed true here, so "absent from the
- * thread override" must NOT be read as enabled. Pinned against drift by
- * tests/test_session_tool_group_mirror.py.
- *
- * This is the fallback for GET /api/persistent/threads/{id}/tool-groups, which
- * is authoritative because it also folds in the expert and project layers.
- * Used when that endpoint is unavailable (older orchestrator, request failure).
- */
-export const SESSION_TOOL_GROUP_BASE_ENABLED: Record<string, boolean> = {
-  orchestrator: false,
-  agent_catalog: false,
-  workflows: false,
-  canvas: true,
-};
-
-/**
- * Expand a group→enabled map into a config fragment that can be merged UNDER a
- * thread's config_override, so an unset group resolves to its real default
- * instead of silently reading as enabled.
- *
- * Iterates the closed vocabulary rather than the input, so a server response
- * missing a key falls back per-key to the base mirror and an unknown key is
- * ignored. Pass null when the server answer is unavailable.
- */
-export function toolGroupDefaultsConfig(
-  enabled: Record<string, boolean> | null,
-): Record<string, unknown> {
-  const tools: Record<string, string[]> = {};
-  for (const key of Object.keys(SESSION_TOOL_GROUP_BASE_ENABLED)) {
-    const on = enabled?.[key] ?? SESSION_TOOL_GROUP_BASE_ENABLED[key];
-    tools[key] = on ? [...SESSION_TOOL_GROUP_NAMES[key]] : [];
-  }
-  return {tools};
-}
+/** Every category the cockpit has copy for, session order first. */
+export const ALL_TOOL_CATEGORIES: ToolCategoryMeta[] = [
+  ...SESSION_TOOL_CATEGORIES,
+  ...AUXILIARY_TOOL_CATEGORIES,
+];
 
 export const AUTONOMY_LEVELS = [
   { value: 'full', label: 'Full', description: 'Never freezes, runs to completion autonomously' },

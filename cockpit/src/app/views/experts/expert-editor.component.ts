@@ -288,7 +288,6 @@ interface EditorForm {
           [config]="baseForGroups()"
           [mode]="mode()"
           [disabled]="false"
-          [defaultsTools]="defaultsTools()"
           [gatedCapabilities]="gatedCapabilities()"
         />
       </section>
@@ -440,7 +439,6 @@ export class ExpertEditorComponent implements OnInit {
   // each unpinned slot inherits, so the "(base default)" option names it instead
   // of being an opaque "default".
   frameworkEffectiveModels = signal<EffectiveModels | null>(null);
-  defaultsTools = signal<Record<string, string[]>>({});
   settingsMatrix = signal<Record<string, Record<string, unknown>>>({});
   /** The expert's stored config fragment (the save baseline). {} on create. */
   rawFragment = signal<Record<string, unknown>>({});
@@ -619,7 +617,6 @@ export class ExpertEditorComponent implements OnInit {
       // Ignore a slower response for the type the user just switched away from.
       if (this.expertType() !== expertType) return;
       this.frameworkDefaults.set((d?.config as Record<string, unknown>) ?? {});
-      this.defaultsTools.set(d?.defaults_tools ?? {});
       this.settingsMatrix.set(d?.settings_matrix ?? {});
       this.frameworkEffectiveModels.set(d?.effective_models ?? null);
     });
