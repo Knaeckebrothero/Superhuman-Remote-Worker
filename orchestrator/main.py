@@ -28354,8 +28354,12 @@ async def _load_expert_detail(
         # so the forms could turn an expert-disabled category back on. It is
         # gone: the base ships `[]` for every category worth re-enabling, so
         # the payload it produced was empty and the re-enable emitted nothing.
-        # The forms now write `true` (or the `enumerate_only` list) and the
-        # write boundary expands it against the registry.
+        # `enumerate_only` replaces it and is a different kind of thing: not a
+        # copy of a config layer that can go stale, but the registry's own
+        # answer to "what must a caller write to turn this category on", for
+        # the one category (`shell`) that refuses `true`. Without it a form
+        # with no resolved read can only send `true`, which 400s naming a rule
+        # the user has no way to satisfy from the form.
         raw_matrix = _load_settings_matrix(_get_config_dir())
         return {
             "id": str(row["id"]),
@@ -28375,6 +28379,7 @@ async def _load_expert_detail(
             "config": merged,
             "instructions": prompts.get("instructions"),
             "persona": prompts.get("persona"),
+            "enumerate_only": enumerate_only_members(),
             "settings_matrix": raw_matrix,
             "effective_models": effective,
         }
@@ -28502,6 +28507,7 @@ async def _load_expert_detail(
     return {
         "config": merged,
         "instructions": instructions_content,
+        "enumerate_only": enumerate_only_members(),
         "settings_matrix": raw_matrix,
         "effective_models": effective,
     }

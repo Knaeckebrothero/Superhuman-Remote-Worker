@@ -95,6 +95,8 @@ type AgentSettingsTab = 'settings' | 'instructions' | 'advanced' | 'resolved';
             [mode]="mode()"
             [disabled]="disabled()"
             [resolved]="resolvedToolset()"
+            [readsResolvedToolset]="readsResolvedToolset()"
+            [enumerateOnly]="enumerateOnly()"
             (change)="onChange()"
           />
 
@@ -249,6 +251,12 @@ export class AgentSettingsComponent {
   /** Inherited tool lists from the selected expert's mode base. */
   /** The server's resolved toolset for this surface. See ToolsGroupComponent. */
   resolvedToolset = input<SessionToolGroupsResponse | null>(null);
+  /** True when this host performs a resolved read at all — see
+   *  ToolsGroupComponent.readsResolvedToolset. */
+  readsResolvedToolset = input(false);
+  /** Write vocabulary for enumerate-only categories, for hosts without a
+   *  resolved read. See ToolsGroupComponent.enumerateOnly. */
+  enumerateOnly = input<Record<string, string[]> | null>(null);
   /** Raw settings_matrix for client-side model-family resolution. */
   settingsMatrix = input<Record<string, Record<string, unknown>>>({});
   /** Server-resolved effective model + provenance per slot (forwarded to the

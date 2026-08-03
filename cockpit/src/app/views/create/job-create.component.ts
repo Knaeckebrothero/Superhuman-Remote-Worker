@@ -278,6 +278,7 @@ import {AppTooltipDirective} from '../../ui/tooltip';
             [config]="expertDetail()?.config ?? frameworkDefaults() ?? {}"
             [disabled]="isSubmitting()"
             [showProjectMemory]="projectHasSharedMemory()"
+            [enumerateOnly]="expertDetail()?.enumerate_only ?? frameworkEnumerateOnly()"
             [settingsMatrix]="expertDetail()?.settings_matrix ?? frameworkSettingsMatrix()"
             [effectiveModels]="resolvedEffectiveModels()"
             [datasources]="availableDatasources()"
@@ -1198,6 +1199,11 @@ export class JobCreateComponent implements OnInit {
 
   readonly frameworkDefaults = signal<Record<string, unknown> | null>(null);
   readonly frameworkSettingsMatrix = signal<Record<string, Record<string, unknown>>>({});
+  /** Write vocabulary for categories that refuse `true` — `shell` is the only
+   *  one today. Registry-derived and identical on every expert detail, so the
+   *  worker_base fetch is a fine source when no expert is selected. Without it
+   *  the Shell tick emits `true` and 400s on a rule the form cannot satisfy. */
+  readonly frameworkEnumerateOnly = signal<Record<string, string[]> | null>(null);
   // Server-resolved effective models for worker_base — the fallback floor used
   // underneath the selected expert, so the model picker's "Default" option
   // shows the resolved chat pin instead of the config-literal placeholder.
@@ -1232,6 +1238,7 @@ export class JobCreateComponent implements OnInit {
       if (d?.config) this.frameworkDefaults.set(d.config);
       if (d?.settings_matrix) this.frameworkSettingsMatrix.set(d.settings_matrix);
       if (d?.effective_models) this.frameworkEffectiveModels.set(d.effective_models);
+      if (d?.enumerate_only) this.frameworkEnumerateOnly.set(d.enumerate_only);
     });
   }
 

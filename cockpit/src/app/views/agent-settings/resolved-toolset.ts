@@ -50,13 +50,18 @@ export interface ResolvedToolRow {
     key: string;
     /** Presentation metadata when the cockpit knows this category; else null. */
     meta: ToolCategoryMeta | null;
-    /** Displayed state. `unavailable` is the server's, and the user cannot leave it. */
+    /**
+     * Displayed state. Three values, and `on` is reachable while locked:
+     * `on` + `settable: false` is a category the agent holds and the user
+     * cannot switch off, which is a different fact from `unavailable`.
+     */
     state: 'on' | 'off' | 'unavailable';
     /** False ⇒ the control is inert and `reason` says why. */
     settable: boolean;
     /**
      * The server's explanation. Present on `on` too, where it explains "not
      * settable" and NOT "why off" — render it as a note, never as a denial.
+     * `state === 'on' && !settable` is exactly that case.
      */
     reason: string | null;
     /** Which layer produced the answer: grant / backend / runtime / registry / a config layer. */
@@ -148,7 +153,17 @@ export function resolvedToolRows(
         return {
             key,
             meta: byKey.get(key) ?? null,
-            state: !settable ? 'unavailable' : userOn ? 'on' : 'off',
+            // A LOCKED row keeps the server's own state. `on` + `settable:
+            // false` is a category the agent is actively HOLDING and the user
+            // cannot switch off — `product_help` and `session_task` are
+            // unconditional persistent-session floors, so every session has
+            // two of them, and every connector category joins them the moment
+            // a datasource is attached. Collapsing that to `unavailable` drew
+            // a block glyph over tools the agent has, and rendered the "why
+            // you cannot change this" sentence as "why this is off". The
+            // server never says `off` for an unsettable category, so taking
+            // its state verbatim here can only yield `on` or `unavailable`.
+            state: !settable ? entry.state : userOn ? 'on' : 'off',
             settable,
             reason: entry.reason ?? null,
             decidedBy: entry.decided_by ?? 'unset',
