@@ -281,6 +281,16 @@ proves a category-level `true` cannot reach the bundle writes. Whether an expert
 that names `set_expert_bundle` *explicitly* binds and executes it end to end is
 still unverified.
 
+> **Closed later the same day**, and not by running that check. The six writes
+> were rehomed into a `catalog_authoring` category, so `set_expert_bundle` is now
+> foreign to `agent_catalog` and the explicit name 400s at the write boundary —
+> the question became unaskable rather than answered
+> ([[agent_authored_catalog_entries]],
+> [[catalog_authoring_live_gate_2026-08-03]] check 5). Worth noting what that
+> means for this gate's own claim: `agent_catalog: true` is still safe, but now
+> because the category contains only reads, not because `_grantable` subtracts a
+> marked subset.
+
 ---
 
 ## Round 2, gate C — the tier sentence

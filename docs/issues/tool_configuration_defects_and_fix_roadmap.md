@@ -35,6 +35,16 @@ read-only `jsonb_typeof` scan of any target database, because Task 5 turned
 malformed stored `tools` values into a hard failure where they were previously
 ignored in silence.
 
+**Follow-on, 2026-08-03 (3 commits, also unpushed):** the one decision this
+register left to the human — what to do about the six `*_bundle` writes — was
+taken and became a feature, [[agent_authored_catalog_entries]], live-gated in
+[[catalog_authoring_live_gate_2026-08-03]]. It closes defect-9's residual path
+(triage item 7), the 4b-gates-5 hazard, and §3c of
+[[registered_tools_no_config_can_grant]], each by structure rather than by
+adding a rule. Read that doc's "two hazards" section before touching this area:
+`SESSION_TOOL_OVERRIDE_NAMES` was serving two purposes and `ToolsConfig` is
+transcribed at two call sites.
+
 **This file and its three siblings stay in `docs/issues/` and `docs/features/`
 until then**, deliberately. The house convention for `docs/done/` is work that is
 fixed *and* verified on a deployment — the closest sibling,
@@ -357,8 +367,25 @@ one.
 
 ### Triage item 7 — resolved 2026-08-02, and it does not escalate D5
 
+> **Superseded 2026-08-03: the answer is now NO, it does not pass.** The six
+> `*_bundle` tools moved to a `catalog_authoring` category behind a
+> deny-by-default capability grant ([[agent_authored_catalog_entries]]), so
+> naming one under `agent_catalog` is foreign vocabulary and 400s, and naming it
+> under `catalog_authoring` requires the grant — verified live at the HTTP
+> boundary ([[catalog_authoring_live_gate_2026-08-03]], checks 1b and 5). The
+> gated-keys list quoted below has a new member.
+>
+> This section's core finding is what made that safe to turn into a *feature*
+> rather than delete: the tool acts as its owner, so ownership and
+> `_enforce_save_grants` already applied. The 08-03 work re-derived it
+> independently and extended it — `expert_type` is `Literal["worker","session"]`
+> with no privileged value, a non-owner update 403s, project-scoped automations
+> need editor, and an automation's stored `config_override` is validated at the
+> only boundary it crosses.
+
 **Question:** can a hand-authored expert name a `*_bundle` write tool and pass
-every gate? **Answer: yes, it passes — but it is not a privilege escalation.**
+every gate? **Answer (2026-08-02): yes, it passes — but it is not a privilege
+escalation.**
 
 Verified locally, not against the cluster:
 
@@ -576,6 +603,14 @@ Three traps that must not be lost between docs:
   Skills". The curated list encodes a safety judgement the registry category does
   not carry; that judgement must move into registry metadata before membership
   moves to the registry.
+
+  **Resolved 2026-08-03, and better than "move it into metadata": the judgement
+  moved into the category structure.** `agent_catalog` is now 5 vs 5 and
+  `workflows` 7 vs 7, because the six writes live in `catalog_authoring`
+  ([[agent_authored_catalog_entries]]). Metadata that must agree with a name list
+  is still two statements of one rule; a category whose membership *is* the
+  answer is one. `orchestrator` remains 14 vs 17 and keeps the `grant: "explicit"`
+  mark, because that category genuinely mixes privilege levels.
 
 ### Triage, not scheduled
 
