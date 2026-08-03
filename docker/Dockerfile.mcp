@@ -3,7 +3,7 @@
 # =============================================================================
 #
 # MCP server exposing orchestrator API to LLMs like Claude Code.
-# Uses FastMCP 2.0 with dual transport support (stdio/HTTP).
+# Uses a pinned FastMCP 3.x runtime with dual transport support (stdio/HTTP).
 #
 # Build:
 #   docker build -t srw-mcp -f docker/Dockerfile.mcp .
@@ -22,7 +22,7 @@
 #   docker exec -i mcp python run.py
 # =============================================================================
 
-FROM python:3.11-slim
+FROM python:3.12-slim@sha256:57cd7c3a7a273101a6485ba99423ee568157882804b1124b4dd04266317710de
 
 ARG SRW_SOURCE_REVISION=""
 ARG SRW_SOURCE_URL="https://github.com/knaeckebrothero/Superhuman-Remote-Worker"
@@ -30,7 +30,7 @@ ARG SRW_RELEASE_VERSION=""
 ARG SRW_DOCUMENTATION_URL="https://github.com/knaeckebrothero/Superhuman-Remote-Worker/tree/main/docs"
 
 LABEL maintainer="SRW Team"
-LABEL description="MCP Server for Claude Code integration (FastMCP 2.0)"
+LABEL description="SRW orchestrator-facing MCP server (FastMCP 3.x)"
 LABEL org.opencontainers.image.source="${SRW_SOURCE_URL}"
 LABEL org.opencontainers.image.revision="${SRW_SOURCE_REVISION}"
 LABEL org.opencontainers.image.version="${SRW_RELEASE_VERSION}"
@@ -67,13 +67,22 @@ COPY --chown=srw:srw orchestrator/services/__init__.py ./services/__init__.py
 COPY --chown=srw:srw orchestrator/security/__init__.py ./security/__init__.py
 COPY --chown=srw:srw orchestrator/security/anti_framing.py ./security/anti_framing.py
 
+# Bake the exact protocol schema into the image. The image smoke test compares
+# raw tools/list from two fresh clients against this artifact.
+RUN MCP_TRANSPORT=stdio python schema_artifact.py /app/tool-schema.json
+
 USER srw
 
 # Default to HTTP for container deployment
 ENV MCP_TRANSPORT=http \
     MCP_HOST=0.0.0.0 \
     MCP_PORT=8000 \
+    MCP_SCHEMA_ARTIFACT=/app/tool-schema.json \
     COCKPIT_API_URL=http://orchestrator:8085
+
+# Validate the exact final filesystem, dependency set, schema artifact, and
+# non-root runtime before the image can be exported or pushed by CI.
+RUN python image_smoke.py
 
 EXPOSE 8000
 

@@ -34,7 +34,7 @@ if _orchestrator_dir not in sys.path:
 
 # Pre-mock fastmcp before importing the server module
 _mock_mcp_instance = MagicMock()
-_mock_mcp_instance.tool = lambda fn: fn  # @mcp.tool is a passthrough
+_mock_mcp_instance.tool = lambda fn, **_kwargs: fn  # registration passthrough
 _mock_fastmcp = MagicMock()
 _mock_fastmcp.FastMCP.return_value = _mock_mcp_instance
 sys.modules.setdefault("fastmcp", _mock_fastmcp)
@@ -45,6 +45,15 @@ os.environ.setdefault("MCP_TRANSPORT", "stdio")
 # Now we can safely import the server module (fastmcp is mocked,
 # so it won't trigger the real ``import mcp.types`` chain)
 from mcp import server as _mcp_server_mod  # noqa: E402
+
+
+def test_ambiguous_mutation_is_not_labeled_as_confirmed_failure():
+    error = _mcp_server_mod.MutationOutcomeUnknown("POST", "/api/jobs")
+
+    rendered = _mcp_server_mod._format_action_error("create", "N/A", error)
+
+    assert "unknown outcome" in rendered
+    assert "failed" not in rendered.lower()
 
 
 # ============================================================================

@@ -5,8 +5,10 @@ Provides synchronous and asynchronous methods to interact with the debug cockpit
 
 from __future__ import annotations
 
+from contextvars import ContextVar
 import os
-from typing import Any, Literal
+from types import MappingProxyType
+from typing import Any, Literal, Mapping
 
 import httpx
 from tenacity import (
@@ -19,14 +21,58 @@ from tenacity import (
 FilterCategory = Literal["all", "messages", "tools", "errors"]
 
 
-def _create_retry_decorator():
-    """Create a retry decorator with exponential backoff."""
+def _create_safe_read_retry_decorator():
+    """Retry transport failures only for operations known to be safe reads."""
     return retry(
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=1, max=10),
         retry=retry_if_exception_type((httpx.ConnectError, httpx.TimeoutException)),
         reraise=True,
     )
+
+
+# Kept as a local spelling for the existing GET wrappers. Mutation methods are
+# intentionally undecorated and route through ``_mutation_request`` below.
+_create_retry_decorator = _create_safe_read_retry_decorator
+
+
+class MutationOutcomeUnknown(RuntimeError):
+    """A mutation may have committed, but its response was not received.
+
+    Mutations are deliberately never retried here. Callers must verify the
+    resource through a read operation before deciding whether to try again.
+    """
+
+    def __init__(self, method: str, path: str):
+        super().__init__(
+            f"Outcome unknown: {method} {path} may have been applied; the MCP "
+            "client did not retry it. Verify current state with a read tool "
+            "before acting again."
+        )
+        self.method = method
+        self.path = path
+
+
+class _RequestScopeAuth(httpx.Auth):
+    """Copy the current task's MCP identity onto one outgoing request.
+
+    The underlying ``httpx.AsyncClient`` is process-wide for connection
+    pooling, so its default headers must never carry caller identity. A
+    ``ContextVar`` keeps concurrent MCP calls isolated and the auth flow takes
+    a fresh immutable snapshot as each request is built.
+    """
+
+    _HEADER_NAMES = ("X-MCP-User-Id", "X-MCP-Scope", "X-Internal-Key")
+
+    def __init__(self, headers: ContextVar[Mapping[str, str] | None]):
+        self._headers = headers
+
+    def auth_flow(self, request: httpx.Request):
+        for name in self._HEADER_NAMES:
+            request.headers.pop(name, None)
+        for name, value in (self._headers.get() or {}).items():
+            request.headers[name] = value
+        yield request
 
 
 class CockpitClient:
@@ -76,7 +122,7 @@ class CockpitClient:
         """List jobs with optional status filter.
 
         Args:
-            status: Filter by status (created, processing, completed, failed, cancelled, pending_review)
+            status: Filter by lifecycle status, including pending_review and paused
             limit: Maximum number of jobs to return (1-500)
 
         Returns:
@@ -391,7 +437,12 @@ class CockpitClient:
 class AsyncCockpitClient:
     """Async HTTP client for the cockpit API with retry logic."""
 
-    def __init__(self, base_url: str | None = None):
+    def __init__(
+        self,
+        base_url: str | None = None,
+        *,
+        transport: httpx.AsyncBaseTransport | None = None,
+    ):
         """Initialize the async client.
 
         Args:
@@ -401,26 +452,65 @@ class AsyncCockpitClient:
         self.base_url = base_url or os.environ.get(
             "COCKPIT_API_URL", "http://localhost:8085"
         )
-        self._client = httpx.AsyncClient(base_url=self.base_url, timeout=30.0)
-        self._scope_headers: dict[str, str] = {}
         self._internal_key = os.environ.get("MCP_INTERNAL_KEY", "")
+        self._scope_headers: ContextVar[Mapping[str, str] | None] = ContextVar(
+            f"mcp_scope_headers_{id(self)}", default=None
+        )
+        self._client = httpx.AsyncClient(
+            base_url=self.base_url,
+            timeout=30.0,
+            auth=_RequestScopeAuth(self._scope_headers),
+            transport=transport,
+        )
 
     def set_scope_headers(self, user_id: str, scope: str) -> None:
-        """Set per-request scope headers from authenticated MCP token.
-
-        Updates the httpx client's default headers so all subsequent
-        requests include the scope context without modifying each call site.
-        """
-        self._client.headers["X-MCP-User-Id"] = user_id
-        self._client.headers["X-MCP-Scope"] = scope
+        """Bind authenticated MCP identity to the current async context."""
+        headers = {
+            "X-MCP-User-Id": user_id,
+            "X-MCP-Scope": scope,
+        }
         if self._internal_key:
-            self._client.headers["X-Internal-Key"] = self._internal_key
+            headers["X-Internal-Key"] = self._internal_key
+        self._scope_headers.set(MappingProxyType(headers))
 
     def clear_scope_headers(self) -> None:
-        """Remove scope headers (unauthenticated or stdio mode)."""
-        self._client.headers.pop("X-MCP-User-Id", None)
-        self._client.headers.pop("X-MCP-Scope", None)
-        self._client.headers.pop("X-Internal-Key", None)
+        """Make requests in the current async context unauthenticated."""
+        self._scope_headers.set(None)
+
+    async def _mutation_request(
+        self,
+        method: Literal["POST", "PUT", "PATCH", "DELETE"],
+        path: str,
+        **kwargs: Any,
+    ) -> httpx.Response:
+        """Send a mutation exactly once and surface ambiguous outcomes.
+
+        A connect failure or pool timeout happens before a response is
+        expected and is preserved as-is. Read/write timeouts and a broken
+        response stream can happen after the orchestrator committed, so those
+        are reported as unknown outcomes and are never retried.
+        """
+        request = getattr(self._client, method.lower())
+        try:
+            return await request(path, **kwargs)
+        except (
+            httpx.ReadTimeout,
+            httpx.WriteTimeout,
+            httpx.ReadError,
+            httpx.WriteError,
+            httpx.RemoteProtocolError,
+        ) as exc:
+            raise MutationOutcomeUnknown(method, path) from exc
+
+    async def _non_get_read_request(
+        self,
+        method: Literal["POST"],
+        path: str,
+        **kwargs: Any,
+    ) -> httpx.Response:
+        """Send a semantically read-only non-GET operation once."""
+        request = getattr(self._client, method.lower())
+        return await request(path, **kwargs)
 
     async def close(self) -> None:
         """Close the HTTP client."""
@@ -732,7 +822,6 @@ class AsyncCockpitClient:
     # Job Actions (mutations)
     # =========================================================================
 
-    @_create_retry_decorator()
     async def approve_job(self, job_id: str) -> dict[str, Any]:
         """Approve a frozen job, marking it as completed.
 
@@ -742,11 +831,10 @@ class AsyncCockpitClient:
         Returns:
             Approval result with status and completion data
         """
-        resp = await self._client.post(f"/api/jobs/{job_id}/approve")
+        resp = await self._mutation_request("POST", f"/api/jobs/{job_id}/approve")
         resp.raise_for_status()
         return resp.json()
 
-    @_create_retry_decorator()
     async def resume_job(
         self,
         job_id: str,
@@ -764,14 +852,14 @@ class AsyncCockpitClient:
         body: dict[str, Any] = {}
         if feedback:
             body["feedback"] = feedback
-        resp = await self._client.post(
+        resp = await self._mutation_request(
+            "POST",
             f"/api/jobs/{job_id}/resume",
             json=body if body else None,
         )
         resp.raise_for_status()
         return resp.json()
 
-    @_create_retry_decorator()
     async def cancel_job(self, job_id: str) -> dict[str, Any]:
         """Cancel a running job.
 
@@ -781,11 +869,10 @@ class AsyncCockpitClient:
         Returns:
             Cancellation result with status
         """
-        resp = await self._client.put(f"/api/jobs/{job_id}/cancel")
+        resp = await self._mutation_request("PUT", f"/api/jobs/{job_id}/cancel")
         resp.raise_for_status()
         return resp.json()
 
-    @_create_retry_decorator()
     async def pause_job(self, job_id: str) -> dict[str, Any]:
         """Pause a running job.
 
@@ -795,22 +882,24 @@ class AsyncCockpitClient:
         Returns:
             Pause result with status
         """
-        resp = await self._client.put(f"/api/jobs/{job_id}/pause")
+        resp = await self._mutation_request("PUT", f"/api/jobs/{job_id}/pause")
         resp.raise_for_status()
         return resp.json()
 
-    @_create_retry_decorator()
     async def create_job(
         self,
         description: str,
         config_name: str = "worker_base",
+        expert_id: str | None = None,
         datasource_ids: list[str] | None = None,
         instructions: str | None = None,
+        kickoff_message: str | None = None,
         config_override: dict[str, Any] | None = None,
         context: dict[str, Any] | None = None,
         parent_job_id: str | None = None,
         project_id: str | None = None,
         user_id: str | None = None,
+        priority: int = 5,
         required_deliverables: list[str] | None = None,
     ) -> dict[str, Any]:
         """Create a new job.
@@ -818,13 +907,16 @@ class AsyncCockpitClient:
         Args:
             description: Natural language task description
             config_name: Expert/agent config to use
+            expert_id: Preferred database-backed expert UUID
             datasource_ids: Global datasource IDs to clone as job-scoped
             instructions: Additional inline markdown instructions
+            kickoff_message: Opening task brief sent to the agent
             config_override: Per-job config overrides
             context: Additional context dictionary
             parent_job_id: Parent job UUID for verification/follow-up jobs
             project_id: Project UUID to associate this job with
             user_id: User UUID who created this job
+            priority: Dispatch priority from 0 (low) to 10 (high)
             required_deliverables: Deliverable contract (P1-C) — paths /
                 "kb:<slug>" entries validated at the seal
 
@@ -834,11 +926,16 @@ class AsyncCockpitClient:
         body: dict[str, Any] = {
             "description": description,
             "config_name": config_name,
+            "priority": priority,
         }
+        if expert_id:
+            body["expert_id"] = expert_id
         if datasource_ids:
             body["datasource_ids"] = datasource_ids
         if instructions:
             body["instructions"] = instructions
+        if kickoff_message:
+            body["kickoff_message"] = kickoff_message
         if config_override:
             body["config_override"] = config_override
         if context:
@@ -851,11 +948,10 @@ class AsyncCockpitClient:
             body["user_id"] = user_id
         if required_deliverables:
             body["required_deliverables"] = required_deliverables
-        resp = await self._client.post("/api/jobs", json=body)
+        resp = await self._mutation_request("POST", "/api/jobs", json=body)
         resp.raise_for_status()
         return resp.json()
 
-    @_create_retry_decorator()
     async def delete_job(self, job_id: str) -> dict[str, Any]:
         """Delete a job and its associated data.
 
@@ -865,11 +961,10 @@ class AsyncCockpitClient:
         Returns:
             Deletion result with status
         """
-        resp = await self._client.delete(f"/api/jobs/{job_id}")
+        resp = await self._mutation_request("DELETE", f"/api/jobs/{job_id}")
         resp.raise_for_status()
         return resp.json()
 
-    @_create_retry_decorator()
     async def assign_job(self, job_id: str, agent_id: str) -> dict[str, Any]:
         """Request the admin assignment override.
 
@@ -881,11 +976,12 @@ class AsyncCockpitClient:
             Assignment result; status is ``assigned`` or ``queued`` when the
             workspace first requires automatic provisioning
         """
-        resp = await self._client.post(f"/api/jobs/{job_id}/assign/{agent_id}")
+        resp = await self._mutation_request(
+            "POST", f"/api/jobs/{job_id}/assign/{agent_id}"
+        )
         resp.raise_for_status()
         return resp.json()
 
-    @_create_retry_decorator()
     async def test_datasource(self, datasource_id: str) -> dict[str, Any]:
         """Test connectivity to a datasource.
 
@@ -895,7 +991,9 @@ class AsyncCockpitClient:
         Returns:
             Test result with status and message
         """
-        resp = await self._client.post(f"/api/datasources/{datasource_id}/test")
+        resp = await self._non_get_read_request(
+            "POST", f"/api/datasources/{datasource_id}/test"
+        )
         resp.raise_for_status()
         return resp.json()
 
@@ -1209,7 +1307,7 @@ class AsyncCockpitClient:
 
     async def reload_skills(self) -> dict[str, Any]:
         """Force reload of bundled skills from disk."""
-        resp = await self._client.post("/api/skills/reload")
+        resp = await self._mutation_request("POST", "/api/skills/reload")
         resp.raise_for_status()
         return resp.json()
 
@@ -1253,7 +1351,7 @@ class AsyncCockpitClient:
         Returns:
             Dict with status and count of loaded experts
         """
-        resp = await self._client.post("/api/experts/reload")
+        resp = await self._mutation_request("POST", "/api/experts/reload")
         resp.raise_for_status()
         return resp.json()
 
@@ -1266,7 +1364,7 @@ class AsyncCockpitClient:
         Returns:
             Status dict
         """
-        resp = await self._client.delete(f"/api/agents/{agent_id}")
+        resp = await self._mutation_request("DELETE", f"/api/agents/{agent_id}")
         resp.raise_for_status()
         return resp.json()
 
@@ -1735,7 +1833,8 @@ class AsyncCockpitClient:
         Returns:
             Dict with notes list, query, and total count
         """
-        resp = await self._client.post(
+        resp = await self._non_get_read_request(
+            "POST",
             f"/api/projects/{project_id}/knowledge/search",
             json={"query": query, "limit": limit},
         )
@@ -1806,9 +1905,9 @@ class AsyncCockpitClient:
             body["goal"] = goal
         if default_config_name:
             body["default_config_name"] = default_config_name
-        if default_config_override:
+        if default_config_override is not None:
             body["default_config_override"] = default_config_override
-        resp = await self._client.post("/api/projects", json=body)
+        resp = await self._mutation_request("POST", "/api/projects", json=body)
         resp.raise_for_status()
         return resp.json()
 
@@ -1841,10 +1940,13 @@ class AsyncCockpitClient:
         project_id: str,
         description: str,
         config_name: str = "worker_base",
+        expert_id: str | None = None,
         datasource_ids: list[str] | None = None,
         instructions: str | None = None,
+        kickoff_message: str | None = None,
         config_override: dict[str, Any] | None = None,
         context: dict[str, Any] | None = None,
+        priority: int = 5,
         required_deliverables: list[str] | None = None,
     ) -> dict[str, Any]:
         """Create a job within a project context.
@@ -1853,10 +1955,13 @@ class AsyncCockpitClient:
             project_id: Project UUID
             description: Task description
             config_name: Expert/agent config to use
+            expert_id: Preferred database-backed expert UUID
             datasource_ids: Global datasource IDs to clone
             instructions: Additional inline instructions
+            kickoff_message: Opening task brief sent to the agent
             config_override: Per-job config overrides
             context: Additional context dictionary
+            priority: Dispatch priority from 0 (low) to 10 (high)
             required_deliverables: Deliverable contract (P1-C) — paths /
                 "kb:<slug>" entries validated at the seal
 
@@ -1866,18 +1971,25 @@ class AsyncCockpitClient:
         body: dict[str, Any] = {
             "description": description,
             "config_name": config_name,
+            "priority": priority,
         }
+        if expert_id:
+            body["expert_id"] = expert_id
         if datasource_ids:
             body["datasource_ids"] = datasource_ids
         if instructions:
             body["instructions"] = instructions
+        if kickoff_message:
+            body["kickoff_message"] = kickoff_message
         if config_override:
             body["config_override"] = config_override
         if context:
             body["context"] = context
         if required_deliverables:
             body["required_deliverables"] = required_deliverables
-        resp = await self._client.post(f"/api/projects/{project_id}/jobs", json=body)
+        resp = await self._mutation_request(
+            "POST", f"/api/projects/{project_id}/jobs", json=body
+        )
         resp.raise_for_status()
         return resp.json()
 
@@ -1922,7 +2034,9 @@ class AsyncCockpitClient:
             body["default_config_name"] = default_config_name
         if default_config_override is not None:
             body["default_config_override"] = default_config_override
-        resp = await self._client.patch(f"/api/projects/{project_id}", json=body)
+        resp = await self._mutation_request(
+            "PATCH", f"/api/projects/{project_id}", json=body
+        )
         resp.raise_for_status()
         return resp.json()
 
@@ -1937,7 +2051,7 @@ class AsyncCockpitClient:
         Returns:
             Status dict
         """
-        resp = await self._client.delete(f"/api/projects/{project_id}")
+        resp = await self._mutation_request("DELETE", f"/api/projects/{project_id}")
         resp.raise_for_status()
         return resp.json()
 
@@ -1972,7 +2086,9 @@ class AsyncCockpitClient:
             Created member record
         """
         body = {"user_id": user_id, "role": role}
-        resp = await self._client.post(f"/api/projects/{project_id}/members", json=body)
+        resp = await self._mutation_request(
+            "POST", f"/api/projects/{project_id}/members", json=body
+        )
         resp.raise_for_status()
         return resp.json()
 
@@ -1992,7 +2108,8 @@ class AsyncCockpitClient:
         Returns:
             Status dict
         """
-        resp = await self._client.patch(
+        resp = await self._mutation_request(
+            "PATCH",
             f"/api/projects/{project_id}/members/{user_id}",
             json={"role": role},
         )
@@ -2015,8 +2132,8 @@ class AsyncCockpitClient:
         Returns:
             Status dict
         """
-        resp = await self._client.delete(
-            f"/api/projects/{project_id}/members/{user_id}"
+        resp = await self._mutation_request(
+            "DELETE", f"/api/projects/{project_id}/members/{user_id}"
         )
         resp.raise_for_status()
         return resp.json()
@@ -2068,18 +2185,24 @@ class AsyncCockpitClient:
         job_id: str | None = None,
         cli_hint: str | None = None,
         default_branch: str | None = None,
+        config: dict[str, Any] | None = None,
+        is_global: bool = False,
+        read_only: bool | None = None,
     ) -> dict[str, Any]:
         """Create a new datasource.
 
         Args:
             name: User-provided label
-            ds_type: Type (generic, repository, postgresql, neo4j, mongodb, webdav)
+            ds_type: Canonical connector type ID
             connection_url: Connection string (nullable for generic)
             description: What this datasource contains
             credentials: Auth details
-            job_id: Job UUID for job-scoped, None for global
+            job_id: Job UUID for job-scoped; None remains user-owned/unscoped
             cli_hint: Suggested CLI command
             default_branch: Branch to clone (repository type)
+            config: Non-secret type-specific configuration
+            is_global: Publish for all users (capability-gated)
+            read_only: Declarative public/project access hint
 
         Returns:
             Created datasource record with ID
@@ -2088,19 +2211,24 @@ class AsyncCockpitClient:
             "name": name,
             "type": ds_type,
         }
-        if connection_url:
+        if connection_url is not None:
             body["connection_url"] = connection_url
-        if description:
+        if description is not None:
             body["description"] = description
-        if credentials:
+        if credentials is not None:
             body["credentials"] = credentials
         if job_id:
             body["job_id"] = job_id
-        if cli_hint:
+        if cli_hint is not None:
             body["cli_hint"] = cli_hint
-        if default_branch:
+        if default_branch is not None:
             body["default_branch"] = default_branch
-        resp = await self._client.post("/api/datasources", json=body)
+        if config is not None:
+            body["config"] = config
+        body["is_global"] = is_global
+        if read_only is not None:
+            body["read_only"] = read_only
+        resp = await self._mutation_request("POST", "/api/datasources", json=body)
         resp.raise_for_status()
         return resp.json()
 
@@ -2113,6 +2241,9 @@ class AsyncCockpitClient:
         credentials: dict[str, Any] | None = None,
         cli_hint: str | None = None,
         default_branch: str | None = None,
+        config: dict[str, Any] | None = None,
+        is_global: bool | None = None,
+        read_only: bool | None = None,
     ) -> dict[str, str]:
         """Update a datasource.
 
@@ -2124,6 +2255,9 @@ class AsyncCockpitClient:
             credentials: New auth details
             cli_hint: New CLI hint
             default_branch: New default branch
+            config: New non-secret type-specific configuration
+            is_global: Publish/unpublish (publication is capability-gated)
+            read_only: New declarative read-only hint
 
         Returns:
             Status dict
@@ -2141,7 +2275,15 @@ class AsyncCockpitClient:
             body["cli_hint"] = cli_hint
         if default_branch is not None:
             body["default_branch"] = default_branch
-        resp = await self._client.put(f"/api/datasources/{datasource_id}", json=body)
+        if config is not None:
+            body["config"] = config
+        if is_global is not None:
+            body["is_global"] = is_global
+        if read_only is not None:
+            body["read_only"] = read_only
+        resp = await self._mutation_request(
+            "PUT", f"/api/datasources/{datasource_id}", json=body
+        )
         resp.raise_for_status()
         return resp.json()
 
@@ -2154,7 +2296,9 @@ class AsyncCockpitClient:
         Returns:
             Status dict
         """
-        resp = await self._client.delete(f"/api/datasources/{datasource_id}")
+        resp = await self._mutation_request(
+            "DELETE", f"/api/datasources/{datasource_id}"
+        )
         resp.raise_for_status()
         return resp.json()
 
@@ -2172,8 +2316,8 @@ class AsyncCockpitClient:
         self, project_id: str, datasource_id: str
     ) -> dict[str, str]:
         """Link a datasource to a project."""
-        resp = await self._client.post(
-            f"/api/projects/{project_id}/datasources/{datasource_id}"
+        resp = await self._mutation_request(
+            "POST", f"/api/projects/{project_id}/datasources/{datasource_id}"
         )
         resp.raise_for_status()
         return resp.json()
@@ -2191,7 +2335,8 @@ class AsyncCockpitClient:
             body["read_only"] = read_only
         if description is not None:
             body["description"] = description
-        resp = await self._client.patch(
+        resp = await self._mutation_request(
+            "PATCH",
             f"/api/projects/{project_id}/datasources/{datasource_id}",
             json=body,
         )
@@ -2202,8 +2347,8 @@ class AsyncCockpitClient:
         self, project_id: str, datasource_id: str
     ) -> dict[str, str]:
         """Unlink a datasource from a project."""
-        resp = await self._client.delete(
-            f"/api/projects/{project_id}/datasources/{datasource_id}"
+        resp = await self._mutation_request(
+            "DELETE", f"/api/projects/{project_id}/datasources/{datasource_id}"
         )
         resp.raise_for_status()
         return resp.json()
@@ -2239,8 +2384,8 @@ class AsyncCockpitClient:
             body["add_tags"] = add_tags
         if remove_tags:
             body["remove_tags"] = remove_tags
-        resp = await self._client.patch(
-            f"/api/projects/{project_id}/knowledge/{note_id}", json=body
+        resp = await self._mutation_request(
+            "PATCH", f"/api/projects/{project_id}/knowledge/{note_id}", json=body
         )
         resp.raise_for_status()
         return resp.json()
@@ -2257,8 +2402,8 @@ class AsyncCockpitClient:
         Returns:
             Status dict
         """
-        resp = await self._client.delete(
-            f"/api/projects/{project_id}/knowledge/{note_id}"
+        resp = await self._mutation_request(
+            "DELETE", f"/api/projects/{project_id}/knowledge/{note_id}"
         )
         resp.raise_for_status()
         return resp.json()
@@ -2272,7 +2417,9 @@ class AsyncCockpitClient:
         Returns:
             Dict with status, path, note_count, project_name
         """
-        resp = await self._client.post(f"/api/projects/{project_id}/knowledge/export")
+        resp = await self._mutation_request(
+            "POST", f"/api/projects/{project_id}/knowledge/export"
+        )
         resp.raise_for_status()
         return resp.json()
 
@@ -2288,7 +2435,8 @@ class AsyncCockpitClient:
         Returns:
             Reindex summary dict (status, indexed_commit, upserted, ...)
         """
-        resp = await self._client.post(
+        resp = await self._mutation_request(
+            "POST",
             f"/api/projects/{project_id}/knowledge/reindex",
             params={"full": str(full).lower()},
         )
@@ -2327,7 +2475,9 @@ class AsyncCockpitClient:
             body["description"] = description
         if goal:
             body["goal"] = goal
-        resp = await self._client.post(f"/api/jobs/{job_id}/promote", json=body)
+        resp = await self._mutation_request(
+            "POST", f"/api/jobs/{job_id}/promote", json=body
+        )
         resp.raise_for_status()
         return resp.json()
 
@@ -2361,7 +2511,6 @@ class AsyncCockpitClient:
         resp.raise_for_status()
         return resp.json()
 
-    @_create_retry_decorator()
     async def approve_sudo_request(
         self,
         request_id: str,
@@ -2379,13 +2528,12 @@ class AsyncCockpitClient:
         body: dict[str, Any] = {}
         if reason:
             body["reason"] = reason
-        resp = await self._client.post(
-            f"/api/sudo/requests/{request_id}/approve", json=body
+        resp = await self._mutation_request(
+            "POST", f"/api/sudo/requests/{request_id}/approve", json=body
         )
         resp.raise_for_status()
         return resp.json()
 
-    @_create_retry_decorator()
     async def deny_sudo_request(
         self,
         request_id: str,
@@ -2400,7 +2548,8 @@ class AsyncCockpitClient:
         Returns:
             Dict with id and status.
         """
-        resp = await self._client.post(
+        resp = await self._mutation_request(
+            "POST",
             f"/api/sudo/requests/{request_id}/deny",
             json={"reason": reason},
         )
@@ -2425,7 +2574,6 @@ class AsyncCockpitClient:
         resp.raise_for_status()
         return resp.json()
 
-    @_create_retry_decorator()
     async def reply_to_message(
         self,
         job_id: str,
@@ -2444,7 +2592,8 @@ class AsyncCockpitClient:
         Returns:
             Dict with delivery strategy and sequence.
         """
-        resp = await self._client.post(
+        resp = await self._mutation_request(
+            "POST",
             f"/api/jobs/{job_id}/messages/{thread_id}/reply",
             json={"message": message, "urgent": urgent},
         )
@@ -2455,7 +2604,6 @@ class AsyncCockpitClient:
     # Persistent Threads
     # =========================================================================
 
-    @_create_retry_decorator()
     async def create_persistent_thread(
         self,
         config_name: str = "session_base",
@@ -2484,7 +2632,9 @@ class AsyncCockpitClient:
             body["model"] = model
         if temperature is not None:
             body["temperature"] = temperature
-        resp = await self._client.post("/api/persistent/threads", json=body)
+        resp = await self._mutation_request(
+            "POST", "/api/persistent/threads", json=body
+        )
         resp.raise_for_status()
         return resp.json()
 
@@ -2519,7 +2669,6 @@ class AsyncCockpitClient:
         resp.raise_for_status()
         return resp.json()
 
-    @_create_retry_decorator()
     async def end_persistent_thread(
         self, thread_id: str, permanent: bool = False
     ) -> dict[str, Any]:
@@ -2528,21 +2677,23 @@ class AsyncCockpitClient:
         Returns:
             Dict with ``status`` ('ended' or 'deleted').
         """
-        resp = await self._client.delete(
+        resp = await self._mutation_request(
+            "DELETE",
             f"/api/persistent/threads/{thread_id}",
             params={"permanent": permanent},
         )
         resp.raise_for_status()
         return resp.json()
 
-    @_create_retry_decorator()
     async def resume_persistent_thread(self, thread_id: str) -> dict[str, Any]:
         """Resume an ended persistent thread.
 
         Returns:
             Dict with ``status`` and ``thread_id``.
         """
-        resp = await self._client.post(f"/api/persistent/threads/{thread_id}/resume")
+        resp = await self._mutation_request(
+            "POST", f"/api/persistent/threads/{thread_id}/resume"
+        )
         resp.raise_for_status()
         return resp.json()
 
