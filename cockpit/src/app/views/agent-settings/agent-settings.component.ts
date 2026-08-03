@@ -2,6 +2,10 @@ import {Component, computed, effect, ElementRef, inject, input, output, signal, 
 import {TranslocoPipe} from '@jsverse/transloco';
 import {Datasource, EffectiveModels} from '../../core/models/api.model';
 import {ViewportService} from '../../core/services/viewport.service';
+import type {
+    SessionToolCategory,
+    SessionToolGroupsResponse,
+} from '../../core/services/api.service';
 import {SettingsMode} from './agent-settings.types';
 import {ExecutionGroupComponent} from './execution-group.component';
 import {ModelGroupComponent} from './model-group.component';
@@ -90,7 +94,7 @@ type AgentSettingsTab = 'settings' | 'instructions' | 'advanced' | 'resolved';
             [config]="config()"
             [mode]="mode()"
             [disabled]="disabled()"
-            [defaultsTools]="defaultsTools()"
+            [resolved]="resolvedToolset()"
             (change)="onChange()"
           />
 
@@ -243,7 +247,8 @@ export class AgentSettingsComponent {
   /** Whether the selected project has shared memory. */
   showProjectMemory = input(false);
   /** Inherited tool lists from the selected expert's mode base. */
-  defaultsTools = input<Record<string, string[]>>({});
+  /** The server's resolved toolset for this surface. See ToolsGroupComponent. */
+  resolvedToolset = input<SessionToolGroupsResponse | null>(null);
   /** Raw settings_matrix for client-side model-family resolution. */
   settingsMatrix = input<Record<string, Record<string, unknown>>>({});
   /** Server-resolved effective model + provenance per slot (forwarded to the
@@ -371,6 +376,23 @@ export class AgentSettingsComponent {
   /**
    * Called by parent when expert changes. Propagates to all sub-components.
    */
+  /**
+   * Anchor the tools baseline to the server's resolved answer.
+   *
+   * Separate from `prefillFromConfig` because the two carry different facts:
+   * a merged config says what was asked for, the resolved answer says what the
+   * agent holds. Call this AFTER `prefillFromConfig` — it is the stronger
+   * statement and must win.
+   */
+  prefillFromResolvedToolset(categories: Record<string, SessionToolCategory>): void {
+    this.toolsGroup?.prefillFromResolved(categories);
+  }
+
+  /** True when the user has moved a tool switch since the last anchor. */
+  hasToolEdits(): boolean {
+    return this.toolsGroup?.hasToolEdits() ?? false;
+  }
+
   prefillFromConfig(config: Record<string, unknown>): void {
     this.modelGroup?.prefillFromConfig(config);
     this.toolsGroup?.prefillFromConfig(config);

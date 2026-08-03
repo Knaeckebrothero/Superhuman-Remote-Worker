@@ -278,7 +278,6 @@ import {AppTooltipDirective} from '../../ui/tooltip';
             [config]="expertDetail()?.config ?? frameworkDefaults() ?? {}"
             [disabled]="isSubmitting()"
             [showProjectMemory]="projectHasSharedMemory()"
-            [defaultsTools]="expertDetail()?.defaults_tools ?? {}"
             [settingsMatrix]="expertDetail()?.settings_matrix ?? frameworkSettingsMatrix()"
             [effectiveModels]="resolvedEffectiveModels()"
             [datasources]="availableDatasources()"

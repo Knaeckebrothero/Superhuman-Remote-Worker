@@ -2,16 +2,28 @@ import {Component, computed, input, output, signal} from '@angular/core';
 import {FormsModule} from '@angular/forms';
 import {TranslocoPipe} from '@jsverse/transloco';
 import {AppIconComponent} from '../../ui/icon';
+import type {
+    SessionToolCategory,
+    SessionToolGroupsResponse,
+} from '../../core/services/api.service';
 import {
+    ALL_TOOL_CATEGORIES,
     JOB_TOOL_CATEGORIES,
-    LIVE_TOOL_CATEGORIES,
     pinResolvedValue,
     readConfigPath,
     SESSION_TOOL_CATEGORIES,
-    SESSION_TOOL_GROUP_NAMES,
     SettingsMode,
     ToolCategoryMeta,
 } from './agent-settings.types';
+import {
+    enabledCategoryKeys,
+    humanizeCategoryKey,
+    isMeasured,
+    resolvedToolRows,
+    toolsetProvenance,
+    toolsFragment,
+    type ResolvedToolRow,
+} from './resolved-toolset';
 import {PinOnInteractDirective} from './pin-on-interact.directive';
 
 /** True when every selectable category key is enabled (none in the disabled set). */
@@ -38,9 +50,19 @@ export function disabledToolCategoriesFromConfig(
 }
 
 /**
- * Tool category toggles.
- * Session mode shows additional categories (knowledge, git).
- * Delegation shows inline params (max_depth, timeout) when enabled.
+ * Tool category controls — three states, not two.
+ *
+ * `on` / `off` / `unavailable with a reason`. A checkbox cannot say "you lack
+ * the shell_tools grant", "this workspace tier has no shell", or "granted by
+ * the runtime, not by config", and forcing those into an unticked box is what
+ * produced both defects this change closes: a toggle that silently no-ops, and
+ * a form that promises an enablement the agent will not honour.
+ *
+ * When a resolved answer is supplied (`resolved`), it decides everything: which
+ * categories exist, which are on, which cannot be touched and why. Without one
+ * — an older orchestrator, or a surface with no read wired up — the component
+ * falls back to the static per-mode list and two states, which is what it
+ * always did.
  */
 @Component({
   selector: 'app-tools-group',
@@ -57,34 +79,58 @@ export function disabledToolCategoriesFromConfig(
           [disabled]="disabled() || selectableCategories().length === 0"
         >{{ (allSelected() ? 'agentSettings.common.deselectAll' : 'agentSettings.common.selectAll') | transloco }}</button>
       </div>
+      <div class="toolset-provenance" [attr.data-trust]="provenance().trust">
+        <app-icon size="xs">{{ provenanceIcon() }}</app-icon>
+        <span class="provenance-headline">
+          {{ 'agentSettings.tools.provenance.' + provenance().trust | transloco }}
+        </span>
+        @if (provenance().detail; as detail) {
+          <span class="provenance-detail">{{ detail }}</span>
+        }
+      </div>
+
       <div class="tool-toggles">
-        @for (cat of categories(); track cat.key) {
+        @for (row of rows(); track row.key) {
           <label
             class="tool-toggle"
-            [class.modified]="isModified(cat.key)"
-            [class.disabled]="disabled() || isCategoryBlocked(cat.key)"
-            [title]="isCategoryBlocked(cat.key) ? ('grants.lockedShort' | transloco) : ''"
+            [class.modified]="!row.pristine"
+            [class.unavailable]="rowState(row) === 'unavailable'"
+            [class.disabled]="disabled() || !isRowSettable(row)"
+            [title]="isCategoryBlocked(row.key) ? ('grants.lockedShort' | transloco) : (row.reason ?? '')"
           >
-            <input
-              type="checkbox"
-              [checked]="isCategoryEnabled(cat.key)"
-              (change)="toggleCategory(cat.key)"
-              [disabled]="disabled() || isCategoryBlocked(cat.key)"
-            >
-            <app-icon size="md" class="tool-toggle-icon">{{ cat.icon }}</app-icon>
+            @if (rowState(row) === 'unavailable') {
+              <app-icon size="sm" class="tool-state-blocked">block</app-icon>
+            } @else {
+              <input
+                type="checkbox"
+                [checked]="rowState(row) === 'on'"
+                (change)="toggleCategory(row.key)"
+                [disabled]="disabled()"
+              >
+            }
+            <app-icon size="md" class="tool-toggle-icon">{{ row.meta?.icon ?? 'category' }}</app-icon>
             <span class="tool-toggle-info">
-              <span class="tool-toggle-name">{{ 'agentSettings.toolCategories.' + cat.key + '.label' | transloco }}@if (isCategoryBlocked(cat.key)) { <span class="tool-lock">🔒</span> }</span>
-              <span class="tool-toggle-desc">{{ 'agentSettings.toolCategories.' + cat.key + '.description' | transloco }}</span>
+              <span class="tool-toggle-name">@if (row.meta) {{{ 'agentSettings.toolCategories.' + row.key + '.label' | transloco }}} @else {{{ humanize(row.key) }}}@if (isCategoryBlocked(row.key)) { <span class="tool-lock">🔒</span> }@if (row.toolCount) { <span class="tool-count">{{ (measured() ? 'agentSettings.tools.countBound' : 'agentSettings.tools.countPredicted') | transloco:{ n: row.toolCount } }}</span> }</span>
+              @if (row.meta) {
+                <span class="tool-toggle-desc">{{ 'agentSettings.toolCategories.' + row.key + '.description' | transloco }}</span>
+              } @else {
+                <span class="tool-toggle-desc">{{ 'agentSettings.tools.unknownCategory' | transloco }}</span>
+              }
+              @if (row.reason) {
+                <span class="tool-toggle-reason">{{ row.reason }}</span>
+              } @else if (isCategoryBlocked(row.key)) {
+                <span class="tool-toggle-reason">{{ 'grants.lockedShort' | transloco }}</span>
+              }
             </span>
-            @if (isModified(cat.key) && mode() !== 'live') {
+            @if (!row.pristine && mode() !== 'live') {
               <button
                 class="reset-btn"
-                (click)="resetCategory(cat.key, $event)"
+                (click)="resetCategory(row.key, $event)"
                 [title]="'agentSettings.common.resetToDefault' | transloco"
               ><app-icon size="xs">close</app-icon></button>
             }
           </label>
-          @if (cat.key === 'delegation' && isCategoryEnabled('delegation')) {
+          @if (row.key === 'delegation' && rowState(row) === 'on') {
             <div class="inline-params">
               <div class="inline-field" [class.modified]="delegationMaxDepth() !== null">
                 <label class="inline-label">{{ 'agentSettings.tools.maxDepth' | transloco }}</label>
@@ -157,6 +203,32 @@ export function disabledToolCategoriesFromConfig(
       opacity: 0.5;
       cursor: not-allowed;
     }
+    .toolset-provenance {
+      display: flex;
+      align-items: baseline;
+      flex-wrap: wrap;
+      gap: 4px 8px;
+      margin-bottom: 10px;
+      padding: 6px 10px;
+      border-radius: var(--radius-control);
+      border-left: 2px solid var(--border-color, var(--surface-1));
+      background: rgba(255, 255, 255, 0.03);
+      font-size: 11px;
+      line-height: 1.4;
+      color: var(--text-muted);
+    }
+    .toolset-provenance[data-trust="measured"] {
+      border-left-color: var(--success, var(--accent-color));
+    }
+    .toolset-provenance[data-trust="predicted"],
+    .toolset-provenance[data-trust="measured_partial"],
+    .toolset-provenance[data-trust="unknown"] {
+      border-left-color: var(--warning, var(--text-muted));
+    }
+    .provenance-headline {
+      font-weight: 600;
+      color: var(--text-primary, var(--text-primary));
+    }
     .tool-toggles {
       display: flex;
       flex-direction: column;
@@ -181,6 +253,26 @@ export function disabledToolCategoriesFromConfig(
     .tool-toggle.disabled {
       opacity: 0.6;
       cursor: not-allowed;
+    }
+    .tool-toggle.unavailable {
+      opacity: 0.75;
+    }
+    .tool-state-blocked {
+      flex-shrink: 0;
+      color: var(--text-muted);
+    }
+    .tool-toggle-reason {
+      font-size: 11px;
+      line-height: 1.4;
+      color: var(--warning, var(--text-muted));
+    }
+    .tool-count {
+      margin-left: 6px;
+      font-size: 10px;
+      font-weight: 500;
+      text-transform: uppercase;
+      letter-spacing: 0.4px;
+      color: var(--text-muted);
     }
     .tool-toggle input[type="checkbox"] {
       accent-color: var(--accent-color, var(--accent-color));
@@ -265,8 +357,15 @@ export class ToolsGroupComponent {
   config = input<Record<string, unknown>>({});
   mode = input<SettingsMode>('job');
   disabled = input(false);
-  /** Tool lists from the selected expert's mode base, used when re-enabling categories. */
-  defaultsTools = input<Record<string, string[]>>({});
+  /**
+   * The server's resolved answer — a measurement from the running agent, or a
+   * labelled prediction. When present it supplies the category set, the three
+   * states, the reasons and the write vocabulary; the merged `config` supplies
+   * none of those, because a config-only view cannot see the runtime injection
+   * layer, the backend capability gate, or a tool that failed to instantiate.
+   * On a real session those three moved 28 names.
+   */
+  resolved = input<SessionToolGroupsResponse | null>(null);
   /** Author's resolved capability grants for editor greying; null ⇒ no gating
    *  (launch flow / admin). Maps tool categories → catalog keys. */
   gatedCapabilities = input<Record<string, unknown> | null>(null);
@@ -288,26 +387,151 @@ export class ToolsGroupComponent {
 
   change = output<void>();
 
-  /** User-toggled disabled categories (key = category key). */
-  readonly disabledCategories = signal<Set<string>>(new Set());
-  /** Categories the expert config originally disabled. */
-  private expertDisabledCategories = new Set<string>();
+  /**
+   * The user's own switch positions, or null while they have set none.
+   *
+   * Null is not "everything on" — it means "defer to the server's answer".
+   * A plain set defaulting to empty would render every category ticked until
+   * something remembered to anchor it, which is precisely the shape of the
+   * bug being fixed: a control showing `on` for a group the agent does not
+   * hold. Anchoring is still explicit and synchronous (`prefillFromResolved`)
+   * so a host can order it against its own baseline; this only removes the
+   * consequence of forgetting.
+   */
+  private readonly userDisabled = signal<Set<string> | null>(null);
+  /** The baseline the diff is taken against, same fallback rule. */
+  private readonly anchoredBaseline = signal<Set<string> | null>(null);
 
   /** Delegation inline params. */
   readonly delegationMaxDepth = signal<number | null>(null);
   readonly delegationTimeout = signal<number | null>(null);
 
-  readonly categories = computed<ToolCategoryMeta[]>(() => {
-    // Live mode renders ONLY the four validated closed groups — the other 8
-    // session categories are silently dropped by the live config.update
-    // path's closed vocabulary and would no-op as toggles.
-    if (this.mode() === 'live') return LIVE_TOOL_CATEGORIES;
-    return this.mode() === 'session' ? SESSION_TOOL_CATEGORIES : JOB_TOOL_CATEGORIES;
+  /** The categories from the server's answer, or null when there is none. */
+  private readonly serverCategories = computed<Record<string, SessionToolCategory> | null>(
+    () => this.resolved()?.categories ?? null,
+  );
+
+  /** Categories the server's answer says are OFF (or unavailable). Empty when
+   *  there is no answer, which is what makes the static fallback render as it
+   *  always did. */
+  private readonly serverDisabled = computed<Set<string>>(() => {
+    const categories = this.serverCategories();
+    if (!categories) return new Set<string>();
+    const on = enabledCategoryKeys(categories);
+    return new Set(Object.keys(categories).filter((key) => !on.has(key)));
   });
 
-  /** Categories the user can actually toggle (not grant-blocked). */
+  /** Current switch positions: the user's, else the server's answer. */
+  readonly disabledCategories = computed<Set<string>>(
+    () => this.userDisabled() ?? this.serverDisabled(),
+  );
+
+  /** What the diff is taken against: the last anchor, else the server's answer. */
+  private readonly expertDisabledCategories = computed<Set<string>>(
+    () => this.anchoredBaseline() ?? this.serverDisabled(),
+  );
+
+  /** Where the answer came from, and how far it can be trusted. */
+  readonly provenance = computed(() => toolsetProvenance(this.resolved()));
+
+  /** True when the answer came off a running agent (including `agent_partial`,
+   *  which is a measurement with no timestamp — the common path against the
+   *  currently deployed fleet image). Never inferred from `observed_at`. */
+  readonly measured = computed(() => isMeasured(this.provenance().trust));
+
+  readonly provenanceIcon = computed(() => {
+    switch (this.provenance().trust) {
+      case 'measured': return 'sensors';
+      case 'measured_partial': return 'sensors_off';
+      case 'predicted': return 'schedule';
+      default: return 'help';
+    }
+  });
+
+  /** Presentation metadata for the surface: the full catalogue when the server
+   *  answers (it may name any category), the mode's own list otherwise. */
+  private readonly categoryMeta = computed<ToolCategoryMeta[]>(() => {
+    if (this.serverCategories()) return ALL_TOOL_CATEGORIES;
+    return this.mode() === 'job' ? JOB_TOOL_CATEGORIES : SESSION_TOOL_CATEGORIES;
+  });
+
+  /**
+   * The rendered rows.
+   *
+   * With a server answer this is EVERY category it returned — including ones
+   * the cockpit has no metadata for. Filtering it to a hand-picked subset is
+   * what left the live pane showing four of twenty-five, which is the same
+   * class of untruth as a toggle that does nothing.
+   */
+  readonly rows = computed<ResolvedToolRow[]>(() => {
+    const categories = this.serverCategories();
+    const disabled = this.disabledCategories();
+    if (categories) {
+      return resolvedToolRows(categories, this.categoryMeta(), disabled);
+    }
+    // No answer: the static list, two states, exactly as before.
+    return this.categoryMeta().map((meta) => ({
+      key: meta.key,
+      meta,
+      state: disabled.has(meta.key) ? ('off' as const) : ('on' as const),
+      settable: true,
+      reason: null,
+      decidedBy: 'unset',
+      toolCount: 0,
+      pristine: disabled.has(meta.key) === this.expertDisabledCategories().has(meta.key),
+    }));
+  });
+
+  /** Kept for callers that still want the flat metadata list. */
+  readonly categories = computed<ToolCategoryMeta[]>(() =>
+    this.rows().map((row) => row.meta ?? {
+      key: row.key,
+      label: humanizeCategoryKey(row.key),
+      icon: 'category',
+      description: '',
+    }),
+  );
+
+  /** Category keys nothing may write: the server refused, or the author's own
+   *  capability grants forbid it. Both are real refusals and neither may be
+   *  overwritten by a click. */
+  private readonly unsettableKeys = computed<Set<string>>(
+    () => new Set(this.rows().filter((row) => !this.isRowSettable(row)).map((row) => row.key)),
+  );
+
+  /** True when the user may flip this row: the server allows it AND the
+   *  client-side grant gate does not grey it. */
+  isRowSettable(row: ResolvedToolRow): boolean {
+    return row.settable && !this.isCategoryBlocked(row.key);
+  }
+
+  /**
+   * The state the row RENDERS as.
+   *
+   * `row.state` is the server's, which knows nothing about the client-side
+   * grant gate — that gate exists because the server's grant lookup fails
+   * OPEN on error, so it must stay a belt. A category it blocks is
+   * *unavailable*: the third state exists precisely so a control does not have
+   * to pretend that "you lack the grant" is an unticked box.
+   */
+  rowState(row: ResolvedToolRow): 'on' | 'off' | 'unavailable' {
+    return this.isRowSettable(row) ? row.state : 'unavailable';
+  }
+
+  humanize(key: string): string {
+    return humanizeCategoryKey(key);
+  }
+
+  /** Categories the user can actually toggle. */
   readonly selectableCategories = computed<ToolCategoryMeta[]>(() =>
-    this.categories().filter(cat => !this.isCategoryBlocked(cat.key))
+    this.rows()
+      .filter((row) => this.isRowSettable(row))
+      .map((row) => row.meta ?? {
+        key: row.key,
+        label: humanizeCategoryKey(row.key),
+        icon: 'category',
+        description: '',
+      }),
   );
 
   /** True when every selectable category is currently enabled. */
@@ -319,14 +543,18 @@ export class ToolsGroupComponent {
   );
 
   readonly modifiedCount = computed(() => {
-    let count = 0;
-    for (const cat of this.categories()) {
-      if (this.isModified(cat.key)) count++;
-    }
+    let count = this.rows().filter((row) => !row.pristine).length;
     if (this.delegationMaxDepth() !== null) count++;
     if (this.delegationTimeout() !== null) count++;
     return count;
   });
+
+  /** True when the user has moved a tool switch since the last prefill. A
+   *  parent uses this to decide whether a late-arriving read may re-anchor the
+   *  baseline or would clobber a click. */
+  hasToolEdits(): boolean {
+    return this.rows().some((row) => !row.pristine);
+  }
 
   // --- Resolved defaults ---
   private r(path: string): unknown { return readConfigPath(this.config(), path); }
@@ -348,21 +576,16 @@ export class ToolsGroupComponent {
 
   isModified(key: string): boolean {
     const disabled = this.disabledCategories().has(key);
-    const wasDisabledByExpert = this.expertDisabledCategories.has(key);
+    const wasDisabledByExpert = this.expertDisabledCategories().has(key);
     // Modified if: user disabled something that was enabled, or enabled something that was disabled
     return disabled !== wasDisabledByExpert;
   }
 
   toggleCategory(key: string): void {
-    this.disabledCategories.update(current => {
-      const next = new Set(current);
-      if (next.has(key)) {
-        next.delete(key);
-      } else {
-        next.add(key);
-      }
-      return next;
-    });
+    const next = new Set(this.disabledCategories());
+    if (next.has(key)) next.delete(key);
+    else next.add(key);
+    this.userDisabled.set(next);
     this.change.emit();
   }
 
@@ -371,29 +594,22 @@ export class ToolsGroupComponent {
   toggleAll(): void {
     const keys = this.selectableCategories().map(cat => cat.key);
     const selectAll = !allToolCategoriesSelected(keys, this.disabledCategories());
-    this.disabledCategories.update(current => {
-      const next = new Set(current);
-      for (const key of keys) {
-        if (selectAll) next.delete(key);
-        else next.add(key);
-      }
-      return next;
-    });
+    const next = new Set(this.disabledCategories());
+    for (const key of keys) {
+      if (selectAll) next.delete(key);
+      else next.add(key);
+    }
+    this.userDisabled.set(next);
     this.change.emit();
   }
 
   resetCategory(key: string, event: Event): void {
     event.preventDefault();
     event.stopPropagation();
-    this.disabledCategories.update(current => {
-      const next = new Set(current);
-      if (this.expertDisabledCategories.has(key)) {
-        next.add(key);
-      } else {
-        next.delete(key);
-      }
-      return next;
-    });
+    const next = new Set(this.disabledCategories());
+    if (this.expertDisabledCategories().has(key)) next.add(key);
+    else next.delete(key);
+    this.userDisabled.set(next);
     if (key === 'delegation') {
       this.delegationMaxDepth.set(null);
       this.delegationTimeout.set(null);
@@ -404,27 +620,29 @@ export class ToolsGroupComponent {
   onDelegationMaxDepthChange(v: number): void { this.delegationMaxDepth.set(v); this.change.emit(); }
   onDelegationTimeoutChange(v: number): void { this.delegationTimeout.set(v); this.change.emit(); }
 
-  /** Build the tools + delegation config_override fragment. */
+  /**
+   * Build the tools + delegation config_override fragment.
+   *
+   * A DIFF against the baseline, in both directions: off is `[]`, on is the
+   * policy the write boundary expands against the registry (`true`, or the
+   * `enumerate_only` enumeration for a category that refuses `true`).
+   *
+   * The re-enable used to copy names out of `defaultsTools()` — the very layer
+   * being overridden — and every category worth re-enabling ships `[]` there,
+   * so the branch emitted nothing and ticking a box had never once enabled
+   * anything. `true` cannot have that failure mode: the expansion happens
+   * against the registry, server-side, at the boundary.
+   */
   getOverrides(): Record<string, unknown> {
-    const tools: Record<string, unknown> = {};
-    const disabled = this.disabledCategories();
-
-    // User-disabled categories → empty array
-    disabled.forEach(cat => {
-      tools[cat] = [];
+    const rows = this.rows();
+    const tools = toolsFragment(rows.map((row) => row.key), {
+      disabled: this.disabledCategories(),
+      baselineOn: new Set(
+        rows.map((row) => row.key).filter((key) => !this.expertDisabledCategories().has(key)),
+      ),
+      unsettable: this.unsettableKeys(),
+      enumerateOnly: this.resolved()?.enumerate_only ?? null,
     });
-
-    // Re-enabled categories (expert had them disabled, user toggled ON)
-    // → restore a full tool list. Live mode uses the closed-vocabulary
-    // mirror (enablement is keyed off empty-vs-non-empty agent-side, but the
-    // payload must survive the closed-group validation); creation modes keep
-    // the mode-base lists.
-    const defaults = this.mode() === 'live' ? SESSION_TOOL_GROUP_NAMES : this.defaultsTools();
-    for (const cat of this.expertDisabledCategories) {
-      if (!disabled.has(cat) && defaults[cat]?.length) {
-        tools[cat] = [...defaults[cat]];
-      }
-    }
 
     const result: Record<string, unknown> = {};
     if (Object.keys(tools).length > 0) result['tools'] = tools;
@@ -432,7 +650,7 @@ export class ToolsGroupComponent {
     // Delegation config: sync delegation.enabled with the tool toggle,
     // and include inline param overrides
     const delegationEnabled = this.isCategoryEnabled('delegation');
-    const wasEnabledByExpert = !this.expertDisabledCategories.has('delegation');
+    const wasEnabledByExpert = !this.expertDisabledCategories().has('delegation');
     const hasParamOverrides = this.delegationMaxDepth() !== null || this.delegationTimeout() !== null;
 
     if (delegationEnabled !== wasEnabledByExpert || hasParamOverrides) {
@@ -446,14 +664,35 @@ export class ToolsGroupComponent {
     return result;
   }
 
-  /** Called by parent when expert changes to sync disabled state. */
+  /** Called by parent when expert changes to sync disabled state.
+   *
+   *  The merged config is the WEAKER baseline and only used where no resolved
+   *  answer exists — it reports a category as on whenever config granted names,
+   *  which on a real session over-reported by 24 tools and under-reported by 4.
+   *  Prefer `prefillFromResolved`. */
   prefillFromConfig(config: Record<string, unknown>): void {
     const disabled = disabledToolCategoriesFromConfig(
       config,
       this.categories().map((category) => category.key),
     );
-    this.disabledCategories.set(disabled);
-    this.expertDisabledCategories = new Set(disabled);
+    this.anchor(disabled);
+  }
+
+  /**
+   * Anchor the baseline to the server's resolved answer.
+   *
+   * `state === 'on'` is the ONE definition of enabled here, and it is the
+   * agent's when the agent answered. An unsettable category anchors as off, so
+   * the diff can never emit config against a grant or a workspace tier.
+   */
+  prefillFromResolved(categories: Record<string, SessionToolCategory>): void {
+    const on = enabledCategoryKeys(categories);
+    this.anchor(new Set(Object.keys(categories).filter((key) => !on.has(key))));
+  }
+
+  private anchor(disabled: Set<string>): void {
+    this.userDisabled.set(disabled);
+    this.anchoredBaseline.set(new Set(disabled));
 
     // Reset delegation inline params on expert change
     this.delegationMaxDepth.set(null);
@@ -461,7 +700,7 @@ export class ToolsGroupComponent {
   }
 
   resetAll(): void {
-    this.disabledCategories.set(new Set(this.expertDisabledCategories));
+    this.userDisabled.set(new Set(this.expertDisabledCategories()));
     this.delegationMaxDepth.set(null);
     this.delegationTimeout.set(null);
   }

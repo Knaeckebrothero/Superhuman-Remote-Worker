@@ -13,7 +13,28 @@ related:
 
 # New Session tool toggles: no group can be enabled, two thirds cannot be disabled, and the Reasoning pick is silently discarded — the creation form kept the pre-`ce9222f9` re-enable path
 
-**Status:** OPEN, diagnosed 2026-08-01. Not started.
+**Status:** **RESOLVED 2026-08-03** — code committed on `develop`, **live gate
+owed** (see the roadmap's task-8 report for the exact command). All three
+defects are closed:
+
+* **No group could be enabled** — the re-enable branch sourced member names
+  from `defaultsTools()`, the very layer it was overriding, which ships `[]`
+  for every category worth re-enabling. Both creation forms and the live pane
+  now send a **policy** (`true`, or the enumeration the response serves for
+  `shell`) and the write boundary expands it against the registry.
+* **Two thirds could not be disabled** — closed server-side by task 7
+  (`validate_tool_override_fragment` at every write boundary: reject, never
+  drop).
+* **Shell is settable** (D3/D4/D8) — off by default, `shell_tools` remains the
+  gate, and a user without it sees *unavailable* with the server's reason
+  rather than a silently unticked box.
+
+The controls are now three-state (on / off / unavailable-with-a-reason) and
+read `GET /api/persistent/threads/{id}/tool-groups` (live) or
+`POST /api/persistent/tool-groups/preview` (creation), which are the agent's
+own answer and a labelled forecast respectively.
+
+*Original diagnosis, 2026-08-01:*
 **Severity:** high, and one part **fails open** — unticking 8 of the 12 rendered
 tool categories at session creation is silently discarded, so a user shown a
 restriction may not have one. Separately, **sessions lost shell entirely on

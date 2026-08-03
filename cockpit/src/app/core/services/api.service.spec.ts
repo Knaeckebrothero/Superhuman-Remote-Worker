@@ -352,12 +352,28 @@ describe('ApiService.getSessionToolGroups', () => {
     vi.useRealTimers();
   });
 
-  it('returns the tool_groups map on a normal answer', async () => {
+  it('returns the WHOLE answer, not just the four booleans', async () => {
+    // `tool_groups` was all the old transport carried, which is why the live
+    // pane could show four of twenty-five categories and say nothing about the
+    // rest. The provenance, the per-category reasons and the write vocabulary
+    // all live in the fields it dropped.
+    const body = {
+      thread_id: 'thread-1',
+      source: 'resolved',
+      origin: 'agent_partial',
+      observed_at: null,
+      degraded_reason: 'this agent image predates GET /session/toolset',
+      enumerate_only: {shell: ['run_command']},
+      tool_groups: {canvas: true},
+      categories: {
+        canvas: {state: 'on', settable: true, reason: null, decided_by: 'base', tools: ['get_canvas']},
+      },
+    };
     const pending = firstValueFrom(api.getSessionToolGroups('thread-1'));
     httpMock
       .expectOne((r) => r.url.endsWith('/persistent/threads/thread-1/tool-groups'))
-      .flush({thread_id: 'thread-1', source: 'resolved', tool_groups: {canvas: true}});
-    await expect(pending).resolves.toEqual({canvas: true});
+      .flush(body);
+    await expect(pending).resolves.toEqual(body);
     httpMock.verify();
   });
 
@@ -384,5 +400,39 @@ describe('ApiService.getSessionToolGroups', () => {
 
   it('sits above the server-side probe budget so a slow-but-live agent wins', () => {
     expect(SESSION_TOOL_GROUPS_TIMEOUT_MS).toBeGreaterThan(3000);
+  });
+
+  it('previewToolGroups POSTs the selection and returns the forecast', async () => {
+    const body = {
+      source: 'resolved',
+      origin: 'prediction',
+      observed_at: null,
+      prediction_reason: 'no agent exists for an unsaved session',
+      enumerate_only: {shell: ['run_command']},
+      tool_groups: {canvas: true},
+      categories: {
+        canvas: {state: 'on', settable: true, reason: null, decided_by: 'base', tools: ['get_canvas']},
+      },
+    };
+    const pending = firstValueFrom(
+      api.previewToolGroups({config_name: 'session_base', project_id: 'p1'}),
+    );
+    const req = httpMock.expectOne((r) => r.url.endsWith('/persistent/tool-groups/preview'));
+    expect(req.request.method).toBe('POST');
+    expect(req.request.body).toEqual({config_name: 'session_base', project_id: 'p1'});
+    req.flush(body);
+    await expect(pending).resolves.toEqual(body);
+    httpMock.verify();
+  });
+
+  it('previewToolGroups is deadline-bounded and fails silently to null', async () => {
+    // The creation form blocks nothing on this, but a hung request that never
+    // settles would leave the tool switches anchored to the config forever.
+    const pending = firstValueFrom(api.previewToolGroups({config_name: 'session_base'}));
+    const req = httpMock.expectOne((r) => r.url.endsWith('/persistent/tool-groups/preview'));
+    await vi.advanceTimersByTimeAsync(SESSION_TOOL_GROUPS_TIMEOUT_MS + 1);
+    await expect(pending).resolves.toBeNull();
+    expect(req.cancelled).toBe(true);
+    httpMock.verify();
   });
 });

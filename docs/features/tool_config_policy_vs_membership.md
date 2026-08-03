@@ -544,18 +544,36 @@ the cockpit stops knowing names.
 | `SESSION_TOOL_GROUP_NAMES` | `agent-settings.types.ts:62-82` | **delete** — 29 hardcoded tool names whose only job is building a re-enable payload that becomes `true` |
 | `toolGroupDefaultsConfig` | `agent-settings.types.ts:110-119` | **delete** — it exists solely to re-expand bools into name lists so they can be `deepMergeConfig`d as lists |
 | `defaultsTools` input | `tools-group.component.ts:269`, forwarded `agent-settings.component.ts:93` | **delete** — plus the `defaults_tools` API field at `orchestrator/main.py:27549`, `:27569`, `:27691`, `:27701` and the model type at `api.model.ts:119` |
-| `SESSION_TOOL_GROUP_BASE_ENABLED` | `agent-settings.types.ts:94-99` | **keep** — already pure policy (`{group: bool}`), and still needed as the offline fallback when `/tool-groups` 404s on an older orchestrator |
-| `SESSION_TOOL_CATEGORIES` / `JOB_TOOL_CATEGORIES` / `LIVE_TOOL_CATEGORIES` | `agent-settings.types.ts:24-52` | **keep** — presentation only (key + icon + i18n lookup); the `label`/`description` literals are already dead, the real strings live at `assets/i18n/en.json:1645` |
+| `SESSION_TOOL_GROUP_BASE_ENABLED` | `agent-settings.types.ts:94-99` | ~~**keep**~~ → **deleted 2026-08-03**, see correction below |
+| `SESSION_TOOL_CATEGORIES` / `JOB_TOOL_CATEGORIES` / `LIVE_TOOL_CATEGORIES` | `agent-settings.types.ts:24-52` | **keep** the first two (presentation only); `LIVE_TOOL_CATEGORIES` **deleted 2026-08-03**, see below |
 | `CAT_TO_GRANT` | `tools-group.component.ts:274-278` | **keep** — category → capability-grant key, orthogonal to membership |
 
-The mirror test loses one of three assertions:
-
-- `test_cockpit_mirror_matches_backend_vocabulary` (`:65-73`) — **delete**, along
-  with `_parse_ts_mirror`. Nothing to mirror.
-- `test_cockpit_base_enabled_mirror_matches_session_base_yaml` (`:76-89`) and
-  `test_cockpit_base_enabled_covers_every_closed_group` (`:92-94`) — **keep**.
-  They pin a 4-entry bool map against the base YAML, which stays a real (if small)
-  drift surface.
+> **Corrected 2026-08-03, at implementation.** Two rows in the table above were
+> wrong, and one addition was needed.
+>
+> * **`SESSION_TOOL_GROUP_BASE_ENABLED` is deleted, not kept.** Its stated job
+>   was to be the offline fallback when `/tool-groups` 404s. But it answers a
+>   question the surface no longer asks: with three states, "no answer" is a
+>   state the UI can *render* ("the resolved toolset could not be read") rather
+>   than a hole it has to fill with a guess. Substituting a stale four-entry
+>   copy of `session_base.yaml` for a missing measurement is the same fail-open
+>   in a smaller costume — and the copy could only ever be right about the base
+>   layer, never about the expert, project, grant or backend layers that
+>   actually decide.
+> * **`LIVE_TOOL_CATEGORIES` is deleted.** The live pane renders whatever the
+>   resolved read returns. Filtering a complete answer down to four is the same
+>   untruth as a toggle that does nothing.
+> * **One thing had to be ADDED, and it is served, not transcribed.** `shell`
+>   refuses `tools.shell: true` (`ENUMERATE_ONLY_CATEGORIES`), so "the UI can
+>   turn shell on" (D3) needs an enumeration. Both tool-groups reads now carry
+>   `enumerate_only` — `src.core.tool_policy.enumerate_only_members()`, derived
+>   from the registry — so the enumeration is served rather than mirrored. A
+>   hardcoded shell tool list in the cockpit would have been a fifth parallel
+>   list added by the change that deletes four.
+>
+> `tests/test_session_tool_group_mirror.py` is repurposed rather than deleted:
+> it now fails if any of the four retired symbols reappears, or if a served
+> enumeration is hardcoded in the cockpit.
 
 Two places in the cockpit already speak pure policy and get simpler rather than
 different:
@@ -1038,12 +1056,16 @@ the cockpit still sends lists and still works.
 > user can already do in the cockpit — and the job path accepted it outright
 > until this commit.
 
-**Commit 6 — the cockpit.** Send `true`/`false`; delete `SESSION_TOOL_GROUP_NAMES`,
-`toolGroupDefaultsConfig`, the `defaultsTools` input and the `defaults_tools` API
-field; drop the `mode()` branch at `tools-group.component.ts:422`; widen
-`disabledToolCategoriesFromConfig`. **This is the commit that fixes the motivating
-bug** for the four allowlisted groups, and it is small because commits 2 and 5 did
-the work.
+**Commit 6 — the cockpit.** ✅ **DONE 2026-08-03.** Send a policy (`true`, or the
+served `enumerate_only` enumeration for `shell`) and `[]` for off; delete
+`SESSION_TOOL_GROUP_NAMES`, `SESSION_TOOL_GROUP_BASE_ENABLED`,
+`toolGroupDefaultsConfig`, `LIVE_TOOL_CATEGORIES`, the `defaultsTools` input and
+the `defaults_tools` API field; drop the `mode()` branch at
+`tools-group.component.ts:422`. **This is the commit that fixes the motivating
+bug**, and it went wider than "the four allowlisted groups": both surfaces now
+render every category the resolved read returns, in three states, with the
+server's own reason — because two states cannot express "unavailable, and here
+is why" (D7), and forcing them to try is what produced the defect.
 
 **Commit 7 — optional.** Per-persona `only`/`except` adoption for the 40 subsets.
 Pure readability. Abandonable with no debris.
