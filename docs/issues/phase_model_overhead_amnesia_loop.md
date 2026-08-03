@@ -749,3 +749,79 @@ backed officer reads (P0-A/B), proven subagent delegation.
   LLM path, and per-phase tool binding invalidates the prefix at every
   flip. Fewer phases should help by construction, but no hit-rate has
   been measured, so no cost claim should be made on that basis yet.
+
+## 10. Slice 0 re-measurement (2026-08-03, post-`99c9aba0` field data)
+
+The token-side confirmation §9 owed, run against the dev cluster after the
+reform had been live for three nights. Method: per-job `llm_requests`
+(`call_type='main'`) joined against phase-archive timestamps from Gitea;
+strategic share computed three ways (wall-clock, summed LLM latency,
+prompt tokens) so idle waits and tool time can't masquerade as ceremony.
+Analysis script + per-job JSON: session scratchpad `analyze.py` /
+`slice0_perjob.json`; cohort = 15 usable jobs (5 post-reform, 10 baseline).
+
+**Cohort hygiene** (matters as much as the numbers):
+
+- Jobs created 08-01 → 08-02T19:00Z are excluded: `f41970ae`'s CWD-banner
+  bug broke every phase-boundary push, and those jobs have **zero archives
+  in Gitea** — their phase history is unrecoverable. The exclusion is not
+  optional; the data doesn't exist.
+- `8302c195` (worker_base, 08-03) excluded post-hoc: a two-episode job —
+  last archive 07:02, critic died, then 92 more main requests 08:16→09:13
+  (real work incl. `next_phase_todos`) whose archives never reached Gitea.
+  Also ran at ~117k median prompt tokens on MiniMax (≈90% of the 131k
+  window) in episode 1 — worth its own investigation. Consequence:
+  **worker_base has no clean post-reform sample** in this cohort.
+- `dfbf9368` (critic, post) is a 5-minute single-phase verification —
+  degenerate, no conclusion drawn.
+
+**Result 1 — ceremony share dropped where it can be measured** (strategic
+share of summed LLM latency; prompt-token share in parens; gemma-4-moe on
+both sides of each comparison):
+
+| family | pre (per job) | post (per job) |
+|---|---|---|
+| developer | 57.3% / 62.7% / 38.5% (tok 65.7/64.4/42.2) | **32.3% / 42.1%** (tok 27.5/46.2) |
+| scholar | 52.7% / 55.7% (tok 45.7/53.6) | **30.8%** (tok 29.9) |
+
+Roughly: strategic ceremony fell from ~55–65% to ~30–45% of LLM spend.
+n=2–3 per cell and the nightly tasks drift night-to-night (one post
+"developer" job is actually the email automation, see Result 4), so this
+is directional, not proof — but the direction is consistent across all
+three metrics on every post job.
+
+**Result 2 — the compounding-strategic-phase curve is gone.** The
+pre-reform signature (F1): strategic durations growing 106→768s across a
+job as re-derivation cost escalated. Post-reform sequences oscillate with
+no trend — `becf5f64`: 427,100,318,351,294,303,132,99,88,254,120,296,269,
+95,566,136. (One 8633s strategic segment in `48a2994b` is an overnight
+stall inside a segment, not phase work.) This is the expected signature of
+P-1: without forced boundary summarization there is nothing to re-derive.
+
+**Result 3 — the cost moved into per-turn context, as P-1 predicts.**
+Median prompt tokens per main call, same model family: pre ~22–30k →
+post **33–50k** (developer 32.7k/50.3k, scholar 47.1k). Keeping context
+across boundaries means every turn carries more history; `48a2994b`
+totalled **93.7M input tokens** in one (654-min, 2800-request) job. The
+15k static injection floor (F3) is untouched — P-3 (pinned-tier cap) and
+P-4 (floor trim) never shipped and are now the **dominant remaining
+lever**. Phase-structure work has hit diminishing returns; injection
+economics has not.
+
+**Result 4 — the ONE-execution-phase default binds almost nowhere.**
+Small worker_base jobs already had the minimal 1S/1T/2S shape *before*
+the reform (`13fc2854`, `7d67d684`, `d7d6f511`). Scholar keeps 4S/3T by
+its own exploration-sweep template (overrides the base default).
+Developer is exempt by design. And cron **automations run developer
+config**: `becf5f64` ("Produktzusammenfassung", an inbox-summarize task)
+ran 29 archives / 13 tactical phases. Two follow-ups: (a) route small
+recurring automations to a collapsed config, (b) the collapsed default
+currently has no cohort where it's observable — the §9 paired-run suite
+is the only way to see it.
+
+**Verdict for the loosening path**: the two shipped mechanisms show their
+intended signatures (ceremony share down, compounding gone) at small n;
+the next slice should be **P-3/P-4 (injection economics), not further
+phase-structure loosening**, and the paired-run suite is needed to (a)
+give worker_base a clean post sample, (b) control night-to-night task
+drift, (c) make the ceremony numbers defensible beyond direction.
