@@ -5,6 +5,7 @@ from pathlib import Path
 
 import yaml
 
+from src.core.loader import render_instruction_content
 from src.core.skill_format import parse_skill_md, skill_identity
 
 _SKILLS = Path(__file__).resolve().parents[1] / "config" / "skills"
@@ -48,6 +49,44 @@ def test_bundled_word_count_skill_is_valid_and_script_bearing():
     # It is genuinely script-bearing, and the body points at the script.
     assert (root / "scripts" / "wordcount.py").exists()
     assert "scripts/wordcount.py" in md
+
+
+def test_verify_before_done_uses_shell_checks_only_when_available():
+    """A shell-less Scholar must not be instructed to call an absent runner."""
+    md = (_SKILLS / "verify-before-done" / "SKILL.md").read_text(encoding="utf-8")
+
+    with_shell = render_instruction_content(
+        md,
+        ["run_command", "file_exists", "read_file", "get_citation"],
+    )
+    without_shell = render_instruction_content(
+        md,
+        ["file_exists", "read_file", "get_citation"],
+    )
+
+    assert "`run_command` with the test/build/lint command" in with_shell
+    assert "`wc -w`" in with_shell
+    assert "This workspace has no command runner" not in with_shell
+
+    assert "run_command" not in without_shell
+    assert "`wc -w`" not in without_shell
+    assert "This workspace has no command runner" in without_shell
+    assert "call `file_exists` once" in without_shell
+    assert "call `read_file` once" in without_shell
+    assert "repeat an unchanged evidence bundle" in without_shell
+    assert "{%" not in without_shell
+
+
+def test_verify_before_done_reports_when_no_artifact_checker_is_available():
+    md = (_SKILLS / "verify-before-done" / "SKILL.md").read_text(encoding="utf-8")
+
+    rendered = render_instruction_content(md, [])
+
+    assert "no deterministic workspace checker is available" in rendered
+    assert "file_exists" not in rendered
+    assert "read_file" not in rendered
+    assert "run_command" not in rendered
+    assert "{%" not in rendered
 
 
 def test_bundled_code_review_skill_is_valid_and_on_topic():

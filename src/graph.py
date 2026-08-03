@@ -645,6 +645,9 @@ def create_execute_node(
         iteration = state.get("iteration", 0)
         messages = state.get("messages", [])
         is_strategic = state.get("is_strategic_phase", True)
+        phase_number = state.get("phase_number", 0)
+        phase_name = "strategic" if is_strategic else "tactical"
+        turn_count = state.get("turn_count", 0)
 
         # Select LLM based on current phase
         llm_with_tools = (
@@ -653,7 +656,11 @@ def create_execute_node(
 
         # Update tool context for phase-aware behavior (e.g., multimodal override)
         if tool_context is not None:
-            tool_context.set_current_phase("strategic" if is_strategic else "tactical")
+            tool_context.set_current_phase(
+                phase_name,
+                phase_number=phase_number,
+                turn_count=turn_count,
+            )
 
         from src.core.knowledge_injection import selected_knowledge_bindings
 
@@ -674,8 +681,6 @@ def create_execute_node(
         prepared_messages = []
 
         # Get phase-aware system prompt (todos, memory, and knowledge are injected as transient messages below)
-        phase_number = state.get("phase_number", 0)
-        phase_name = "strategic" if is_strategic else "tactical"
         phase_llm_config = config.llm.get_phase_config(phase_name)
         full_system = get_phase_system_prompt(
             config=config,
@@ -1130,6 +1135,11 @@ def create_execute_node(
                     f"{len(_guidance_entries)} pending entrie(s)"
                 )
 
+        completed_phase_injections = set(
+            state.get("phase_instruction_injections") or []
+        )
+        pending_phase_injections: set[str] = set()
+
         def _inject_transient_messages(target_messages: list) -> None:
             """Splice transient injections (memories, knowledge, instruction files, todos) at the tail.
 
@@ -1143,6 +1153,7 @@ def create_execute_node(
             "query", and models weight the end of the prompt highest.
             """
             block: list = []
+            target_phase_injections: set[str] = set()
 
             # MemoryManager seam: the assembled payload replaces the legacy
             # _memory_block/_knowledge_block branches below (both stay ""
@@ -1183,12 +1194,22 @@ def create_execute_node(
                 block.append(cit_ai)
                 block.append(cit_tool)
 
-            # Phase-triggered instruction files (active injection)
+            # Phase-start instruction files: each concrete phase instance sees
+            # each bound artifact once. The successful LLM turn checkpoints the
+            # keys below; unlike dynamic todos/memory, static skills are never
+            # re-presented as a fresh tail instruction on every request.
             if tool_context and hasattr(tool_context, "get_phase_instruction_files"):
-                _phase_name = "strategic" if is_strategic else "tactical"
-                phase_entries = tool_context.get_phase_instruction_files(_phase_name)
+                phase_entries = tool_context.get_phase_instruction_files(phase_name)
                 if phase_entries:
                     for entry in phase_entries:
+                        injection_key = (
+                            f"{phase_number}:{phase_name}:{entry.path.lstrip('/')}"
+                        )
+                        if (
+                            injection_key in completed_phase_injections
+                            or injection_key in target_phase_injections
+                        ):
+                            continue
                         try:
                             instr_content = workspace_manager.read_file(entry.path)
                             instr_ai, instr_tool = create_instruction_tool_messages(
@@ -1196,8 +1217,11 @@ def create_execute_node(
                             )
                             block.append(instr_ai)
                             block.append(instr_tool)
+                            target_phase_injections.add(injection_key)
+                            pending_phase_injections.add(injection_key)
                             logger.debug(
-                                f"[{job_id}] Injected instruction file: {entry.path}"
+                                f"[{job_id}] Injected phase-start instruction "
+                                f"once: {entry.path}"
                             )
                         except FileNotFoundError:
                             logger.warning(
@@ -1976,6 +2000,10 @@ def create_execute_node(
                     "turn_count": new_turn_count,
                     "error": None,
                 }
+                if pending_phase_injections:
+                    result_update["phase_instruction_injections"] = sorted(
+                        completed_phase_injections | pending_phase_injections
+                    )
                 if extraction_triggered:
                     result_update["last_observed_turn"] = new_turn_count
                 if assembly_triggered:
@@ -2039,6 +2067,13 @@ def create_execute_node(
                                 prepared_messages.append(msg)
                         else:
                             prepared_messages.append(msg)
+
+                    # The provider rejected the previous request before it
+                    # could consume any tail guidance. Rebuild the same
+                    # transient block after emergency compaction; otherwise a
+                    # phase-start key could be checkpointed even though the
+                    # successful retry never saw its instruction body.
+                    _inject_transient_messages(prepared_messages)
 
                     # Merge remove markers
                     if emergency_remove_markers:

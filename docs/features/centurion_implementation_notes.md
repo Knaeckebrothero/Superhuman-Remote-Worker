@@ -59,9 +59,11 @@ Companion to [[centurion]]. Distilled from the 2026-07-28 code-planner research 
 > for real too: the boundary drain injects a persistent `[QUEUED MESSAGES]` message
 > and consumes the thread (the old `messages/*_received.md` dead-letter box is fixed).
 > The officer also gained `create_worker_job(required_deliverables=[...])` (P1-C):
-> declare the contract at dispatch, read per-boundary `output/manifest_status.json`
-> from the job repo, and let the platform's seal gate bounce empty seals instead of
-> burning a review cycle. Cancel/pause now push an evidence snapshot before teardown
+> declare the contract at dispatch and let the platform's Gitea-backed seal gate
+> bounce empty seals instead of burning a review cycle. The former agent-visible
+> per-boundary status file was retired on 2026-08-03 after a smoke test proved its
+> stale snapshot could deadlock worker completion; status is derived from the contract
+> and repository ref instead. Cancel/pause now push an evidence snapshot before teardown
 > (P1-D) — a cancelled worker's mid-phase work survives in its Gitea branch.
 
 > **As-built S7–S9 + guards (2026-07-30 overnight, commits `ae045186` / `97f2d673` / `773ad46e` / `f7274da0`) — v1 complete.** Deltas from the plan below:

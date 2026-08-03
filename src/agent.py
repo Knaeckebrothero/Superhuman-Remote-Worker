@@ -870,6 +870,14 @@ class UniversalAgent:
                 job_id, metadata, resume=resume
             )
 
+            # Retired framework bookkeeping from P1-C/F13. Old job branches,
+            # inherited project snapshots, and resumed workspaces may still
+            # carry this tracked file. Remove it before the model receives its
+            # workspace so a stale boundary snapshot cannot masquerade as live
+            # deliverable state. The contract itself remains in task_brief.md;
+            # job_complete and the orchestrator gate validate the real files.
+            self._remove_legacy_manifest_status(job_id)
+
             # Handle frozen job resume. Backend-aware check: a local Path.exists()
             # never sees the marker on remote workspaces.
             if resume:
@@ -3377,6 +3385,21 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
         except Exception as e:
             logger.warning(f"[{job_id}] Phase 0 seed commit failed (non-fatal): {e}")
 
+    def _remove_legacy_manifest_status(self, job_id: str) -> None:
+        """Remove the retired agent-visible phase-boundary status file.
+
+        Existing repositories and resumed workspaces may contain a tracked copy
+        created by older workers. Cleanup is best-effort: inability to delete
+        obsolete observability data must not prevent the job from starting.
+        """
+        path = "output/manifest_status.json"
+        try:
+            if self._workspace_manager and self._workspace_manager.exists(path):
+                self._workspace_manager.delete_file(path)
+                logger.info(f"[{job_id}] Removed retired workspace file {path}")
+        except Exception as e:
+            logger.warning(f"[{job_id}] Could not remove retired file {path}: {e}")
+
     def _deploy_instruction_files(self, loaded_tool_names: List[str]) -> None:
         """Deploy instruction files to workspace with Jinja2 rendering.
 
@@ -3470,7 +3493,10 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                 framework_dir=templates_dir,
             )
             resolved_instructions = self.config.extra.get("_resolved_instructions", {})
+            deployed_paths: set[str] = set()
             for entry in self.config.instruction_files:
+                if entry.path in deployed_paths:
+                    continue
                 try:
                     if entry.skill:
                         # Bound skill: content from the (flag-independent) instructions
@@ -3489,6 +3515,7 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                             self._workspace_manager.backend.mkdir(parent_dir)
                         self._workspace_manager.write_file(entry.path, content)
                         self._agent_seed_files[entry.path] = content
+                        deployed_paths.add(entry.path)
                         logger.debug(f"Deployed bound skill to workspace: {entry.path}")
                         continue
                     # Check resolved config first (resumed jobs)
@@ -3502,6 +3529,7 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                     if parent_dir and parent_dir != ".":
                         self._workspace_manager.backend.mkdir(parent_dir)
                     self._workspace_manager.write_file(entry.file, content)
+                    deployed_paths.add(entry.path)
                     logger.debug(
                         f"Deployed instruction file to workspace: {entry.file}"
                     )

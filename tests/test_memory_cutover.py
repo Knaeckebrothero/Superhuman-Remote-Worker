@@ -31,12 +31,13 @@ from langchain_core.messages import (
     ToolMessage,
 )
 
-from src.core.loader import QueryConfig, load_agent_config
+from src.core.loader import InstructionFileEntry, QueryConfig, load_agent_config
 from src.core.workspace import WorkspaceManager
 from src.core.workspace_injection import (
     TODOS_INJECTION_CONTENT_PREFIX,
     is_workspace_injection_message,
 )
+from src.llm.exceptions import ContextOverflowError
 from src.managers import TodoManager, PlanManager
 from src.services.memory import (
     AssembleStats,
@@ -472,6 +473,122 @@ def execute_env(worker_config, workspace_manager):
 
 
 class TestWorkerExecuteWiring:
+    @pytest.mark.asyncio
+    async def test_phase_start_instruction_is_injected_once_per_phase_instance(
+        self, execute_env
+    ):
+        env = execute_env
+        entry = InstructionFileEntry(
+            trigger="phase_start:tactical",
+            skill="research-guide",
+            enforce=False,
+        )
+        # Duplicate bindings to the same artifact must still inject one body.
+        env["config"].instruction_files = [entry, entry]
+        env["ctx"]._instruction_files = [entry, entry]
+        marker = "UNIQUE PHASE-START RESEARCH PROCEDURE"
+        env["workspace"].write_file(entry.path, marker)
+        node = _make_execute_node(
+            env["config"],
+            env["workspace"],
+            env["todo"],
+            env["ctx"],
+            env["service"],
+            {"llm": env["llm"], "context": env["context"]},
+        )
+        state = _worker_state()
+
+        with (
+            patch("src.graph.get_archiver", return_value=None),
+            patch("src.graph.get_phase_system_prompt", return_value="SYS"),
+        ):
+            first = await node(state)
+            state.update(
+                {
+                    "iteration": first["iteration"],
+                    "turn_count": first["turn_count"],
+                    "phase_instruction_injections": first[
+                        "phase_instruction_injections"
+                    ],
+                }
+            )
+            second = await node(state)
+            state.update(
+                {
+                    "iteration": second["iteration"],
+                    "turn_count": second["turn_count"],
+                    "phase_instruction_injections": second.get(
+                        "phase_instruction_injections",
+                        state["phase_instruction_injections"],
+                    ),
+                    "phase_number": 4,
+                }
+            )
+            third = await node(state)
+
+        requests = [call.args[0] for call in env["llm"].ainvoke.call_args_list]
+
+        def carries_marker(request):
+            return any(
+                marker in str(getattr(message, "content", "")) for message in request
+            )
+
+        assert carries_marker(requests[0]) is True
+        assert (
+            sum(
+                marker in str(getattr(message, "content", ""))
+                for message in requests[0]
+            )
+            == 1
+        )
+        assert carries_marker(requests[1]) is False
+        assert carries_marker(requests[2]) is True
+        assert len(first["phase_instruction_injections"]) == 1
+        assert len(third["phase_instruction_injections"]) == 2
+
+    @pytest.mark.asyncio
+    async def test_phase_start_instruction_survives_emergency_compaction_retry(
+        self, execute_env
+    ):
+        env = execute_env
+        entry = InstructionFileEntry(
+            trigger="phase_start:tactical",
+            skill="research-guide",
+            enforce=False,
+        )
+        env["config"].instruction_files = [entry]
+        env["ctx"]._instruction_files = [entry]
+        marker = "PHASE GUIDANCE MUST REACH THE SUCCESSFUL RETRY"
+        env["workspace"].write_file(entry.path, marker)
+        env["llm"].ainvoke = AsyncMock(
+            side_effect=[
+                ContextOverflowError(token_count=101, limit=100),
+                AIMessage(content="done"),
+            ]
+        )
+        node = _make_execute_node(
+            env["config"],
+            env["workspace"],
+            env["todo"],
+            env["ctx"],
+            env["service"],
+            {"llm": env["llm"], "context": env["context"]},
+        )
+
+        with (
+            patch("src.graph.get_archiver", return_value=None),
+            patch("src.graph.get_phase_system_prompt", return_value="SYS"),
+        ):
+            result = await node(_worker_state())
+
+        requests = [call.args[0] for call in env["llm"].ainvoke.call_args_list]
+        assert len(requests) == 2
+        for request in requests:
+            assert any(
+                marker in str(getattr(message, "content", "")) for message in request
+            )
+        assert len(result["phase_instruction_injections"]) == 1
+
     @pytest.mark.asyncio
     async def test_flag_on_read_write_wiring(self, execute_env):
         env = execute_env

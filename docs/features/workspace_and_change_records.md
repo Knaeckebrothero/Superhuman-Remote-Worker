@@ -109,7 +109,7 @@ pull request; what is missing is credentials scoped to allow it and a place to r
 it happened.
 
 **A deliverable contract exists.** `required_deliverables` + the seal, and
-`deliverable_path_variants` (`src/core/deliverables.py:90`) already tolerates two spellings
+`deliverable_path_variants` (`src/core/deliverables.py`) already tolerates two spellings
 of a path.
 
 ## 4. The model

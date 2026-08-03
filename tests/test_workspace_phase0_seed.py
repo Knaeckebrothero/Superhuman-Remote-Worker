@@ -84,6 +84,75 @@ class TestInstructionsClobber:
         assert ws.read_file("instructions.md") == "TEMPLATE"
 
 
+class TestBoundSkillCapabilityRendering:
+    """Bound skills must see the post-backend, actually loaded tool palette."""
+
+    @pytest.mark.parametrize(
+        ("tool_names", "included", "excluded"),
+        [
+            (
+                ["run_command", "file_exists", "read_file"],
+                "`wc -w`",
+                "no command runner",
+            ),
+            (["file_exists", "read_file"], "no command runner", "run_command"),
+        ],
+    )
+    def test_verify_skill_is_rendered_for_loaded_tools(
+        self, tmp_path, tool_names, included, excluded
+    ):
+        from pathlib import Path
+
+        from src.core.loader import InstructionFileEntry
+
+        raw_skill = Path("config/skills/verify-before-done/SKILL.md").read_text(
+            encoding="utf-8"
+        )
+        config = SimpleNamespace(
+            llm=SimpleNamespace(model="test-model"),
+            instruction_files=[
+                InstructionFileEntry(
+                    trigger="phase_start:tactical",
+                    skill="verify-before-done",
+                    enforce=False,
+                )
+            ],
+            extra={
+                "_resolved_instructions": {"verify-before-done": raw_skill},
+                "_resolved_skills": {"files": {}},
+            },
+            _deployment_dir=None,
+        )
+        ws = WorkspaceManager(job_id="t", backend=RemoteLikeBackend(tmp_path))
+        agent = _bare_agent(ws, config)
+
+        agent._deploy_instruction_files(tool_names)
+
+        rendered = ws.read_file("skills/verify-before-done/SKILL.md")
+        assert included in rendered
+        assert excluded not in rendered
+        assert "{%" not in rendered
+
+
+class TestLegacyManifestCleanup:
+    def test_removes_retired_status_file_before_agent_can_read_it(self, tmp_path):
+        ws = WorkspaceManager(job_id="t", backend=RemoteLikeBackend(tmp_path))
+        ws.write_file("output/manifest_status.json", '{"exists": false}')
+        agent = _bare_agent(ws)
+
+        agent._remove_legacy_manifest_status("job-1")
+
+        assert not ws.exists("output/manifest_status.json")
+
+    def test_missing_retired_status_file_is_a_noop(self, tmp_path):
+        ws = WorkspaceManager(job_id="t", backend=RemoteLikeBackend(tmp_path))
+        agent = _bare_agent(ws)
+
+        agent._remove_legacy_manifest_status("job-1")
+
+        assert not ws.exists("output/manifest_status.json")
+
+
 class TestResolveUploadedInstructions:
     """_resolve_uploaded_instructions() — the eager async resolution that lets
     a virtual instructions.md survive the resume paths in

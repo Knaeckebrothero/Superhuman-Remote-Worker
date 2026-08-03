@@ -88,9 +88,12 @@ This replaces the current pattern where the full `instructions.md` (identity + m
 
 Instruction files live in the workspace (written at job init, expert-customizable via the matrix system). They provide guidance for specific activities — how to formulate todos, how to conduct reviews, how to write retrospectives, etc.
 
-**Key design principle: instruction files are auto-injected into the conversation based on trigger conditions, not left for the agent to discover.**
+**Key design principle: instruction bodies have bounded activation.** They are
+either injected once when a concrete phase starts, or the agent is required to
+read them immediately before a named action. A full instruction body is never
+re-injected on every LLM turn.
 
-> **Skills — Layer 3 documents ARE skills now (Slice 3 shipped, 2026-06-19; [[agent_skills]]).** The two instruction files below have migrated to **bundled skills** (`todo-guide`, `research-guide`). An `instruction_files` entry now takes **either** `file:` (an arbitrary workspace file, as before) **or** `skill:` (a bundled skill, resolved to `skills/<name>/SKILL.md`) — same `trigger`/`enforce` semantics either way. Their deterministic bindings are **preserved**: `todo-guide` keeps the `before_tool:next_phase_todos` tool-gate, `research-guide` the `phase:tactical` injection — and the gate is now satisfied by **either** `read_file` **or** `use_skill` (both record the same path). The `model_invoked` catalog (Slice 2 — the agent loads a `SKILL.md` body on its **own judgment** from the Layer-1 menu) is the *optional-discovery* sibling of these deterministic bindings; a deterministically-bound skill is filtered out of that menu so it is never also offered as optional. Net: Layer 3 is now **one artifact** (`SKILL.md`), with the binding deciding activation.
+> **Skills — Layer 3 documents ARE skills now (Slice 3 shipped, 2026-06-19; activation corrected 2026-08-03; [[agent_skills]]).** The two instruction files below migrated to **bundled skills** (`todo-guide`, `research-guide`). An `instruction_files` entry takes **either** `file:` (an arbitrary workspace file) **or** `skill:` (a bundled skill, resolved to `skills/<name>/SKILL.md`). Their deterministic bindings are preserved: `todo-guide` keeps the `before_tool:next_phase_todos` read gate, while `research-guide` uses `phase_start:tactical` and is injected exactly once per concrete tactical phase. A gate is satisfied by **either** `read_file` **or** `use_skill` (both record the same path). The `model_invoked` catalog is the optional-discovery sibling of these bindings; a deterministically bound skill is filtered out of that menu so it is not delivered through two paths.
 
 #### Existing Implementation: the `todo-guide` skill (formerly `todo_guide.md`)
 
@@ -100,22 +103,30 @@ It works at three levels:
 
 1. **Materialized to the workspace** at job init as `skills/todo-guide/SKILL.md` — for a bound skill the body rides the frozen `instructions` blob (flag-independent of `SKILLS_DB_ENABLED`), written by `_deploy_instruction_files`
 2. **Strategic todo templates** tell the agent to read `skills/todo-guide/SKILL.md` (`config/templates/strategic_todos_initial.yaml`, etc.) — soft guidance
-3. **Tool enforces it** — the `apply_instruction_enforcement` wrapper (`src/tools/registry.py`) checks `context.was_recently_read("skills/todo-guide/SKILL.md")` and rejects `next_phase_todos` until the agent has read it (via `read_file` **or** `use_skill`) — hard enforcement
+3. **Tool enforces it** — the `apply_instruction_enforcement` wrapper (`src/tools/registry.py`) checks the binding's read contract and rejects `next_phase_todos` until the agent has read it (via `read_file` **or** `use_skill`) — hard enforcement
 
-The enforcement mechanism uses `ToolContext._recent_reads` (a deque of the last 10 read paths). Both `read_file` and `use_skill` call `record_file_read()`, so either satisfies the gate. When a tool checks `was_recently_read()`, it looks in that deque and refuses to execute until the agent has read the guide — so the agent is forced to self-inject the content.
+Both `read_file` and `use_skill` call `record_file_read()`, so either satisfies a
+gate. Configured instruction paths are pinned independently of the ordinary
+read-before-write FIFO. A binding can additionally set `read_scope: phase` and
+`max_read_age_turns`, in which case `ToolContext` checks the concrete phase
+instance and LLM-turn stamp before allowing the action. This keeps ordinary
+one-read-per-job guidance cheap while making completion guidance genuinely
+fresh.
 
 This is the "before tool call" trigger already working: the agent cannot stage todos without first reading the guide.
 
 #### Injection Mechanisms
 
-There are two distinct ways content reaches the agent, depending on the trigger:
+There are two bounded ways content reaches the agent, selected by the trigger:
 
 | Mechanism | How Content Enters Conversation | When Used |
 |---|---|---|
-| **Passive injection** (enforce) | Tool gate rejects until agent calls `read_file` itself; content enters as a tool result | `enforce: true` — agent must read before tool executes |
-| **Active injection** (system) | System injects content as transient message (like workspace.md) | `enforce: false` — content provided automatically on trigger |
+| **Action gate** | Tool rejects until the agent calls `read_file` or `use_skill`; content enters as a tool result | `before_tool:<tool>` — guidance is mandatory immediately before an action |
+| **Phase-start injection** | System supplies a transient tool-result pair and checkpoints that delivery | `phase_start:<phase>` — guidance is supplied once per concrete phase instance |
 
-Passive injection (the existing pattern) is preferred when a tool call is the natural trigger point — it keeps the agent in control and the content enters naturally. Active injection is needed for triggers that aren't gated on a tool call (e.g., phase transitions).
+There is no continuous active mode. The legacy `phase:<phase>` spelling remains
+as a compatibility alias, but it has the same once-per-phase semantics as
+`phase_start:<phase>`.
 
 #### Generalizing the Pattern
 
@@ -123,19 +134,19 @@ Triggers determine when an instruction file gets injected or required:
 
 | Trigger Type | Example | Injection Mechanism |
 |---|---|---|
-| **Before tool call** + enforce | Todo guide required before `next_phase_todos` (already implemented) | Passive: tool rejects until agent reads the file |
-| **Before tool call** + no enforce | Plan template suggested before `next_phase_todos` | Active: system injects as transient message |
-| **On phase transition** | Review methodology injected when entering strategic phase | Active: system injects as transient message |
+| **Before tool call** | Todo guide required before `next_phase_todos` | Tool rejects until the agent reads the artifact; phase/freshness scope is optional |
+| **On phase start** | Research methodology supplied when entering a tactical phase | System injects once and checkpoints `(phase number, phase kind, artifact path)` |
 
 Properties:
 - **Optional to read manually** — the agent can always `read_file` any instruction file
-- **Automatically injected or enforced** when the trigger fires — the agent doesn't need to remember
+- **Injected once or enforced before an action** — never continuously re-injected
 - **Expert-customizable** — each expert can have its own instruction files and trigger mappings
 - **Additive** — new instruction files can be added without touching core code or the system prompt
 
 #### Trigger Configuration
 
-Instruction file triggers are defined as an array in the expert's config. Each entry specifies the file, the trigger condition, and whether enforcement is passive (agent must read) or active (system injects).
+Instruction file triggers are defined as an array in the expert's config. The
+trigger itself selects one-shot phase delivery or action-gated reading.
 
 ```yaml
 instruction_files:
@@ -144,12 +155,15 @@ instruction_files:
     enforce: true   # passive: tool rejects until the skill is read (read_file or use_skill)
 
   - skill: research-guide                 # scholar: injected on tactical-phase entry
-    trigger: phase:tactical
-    enforce: false  # active: system injects the SKILL.md body on phase transition
+    trigger: phase_start:tactical
+    enforce: false  # compatibility field; phase_start is always one-shot
 
-  - file: instructions/plan_template.md   # a literal file still works — file: XOR skill:
-    trigger: before_tool:next_phase_todos
-    enforce: false  # active: system injects before tool call
+  - skill: verify-before-done
+    trigger: before_tool:todo_complete
+    enforce: true
+    phases: [tactical]
+    read_scope: phase
+    max_read_age_turns: 20
 ```
 
 Each entry names **either** a `skill:` (a bundled skill, resolved to `skills/<name>/SKILL.md`) **or** a `file:` (an arbitrary workspace-relative file) — exactly one. Experts override by providing their own `instruction_files` entries (and bundled/authored skills) in their config.
@@ -186,7 +200,7 @@ These are never auto-injected. The agent reads them when it needs them, guided b
 - **Trigger config location**: Lives in the expert's config as an `instruction_files` array (see trigger configuration above).
 - **Kickoff message source**: New UI field in cockpit ("say something to the AI"), separate from the job description. Placeholder for now.
 - **Initial strategic todos**: Left as-is for now (`strategic_todos_initial.yaml`); will be updated after the new system is testable.
-- **Injection mechanisms**: Two types — passive (enforce via `was_recently_read` gate) and active (system injects as transient message). Decided per instruction file entry.
+- **Injection mechanisms**: Two bounded types — once-per-phase injection and a required read before a named tool action. Continuous active injection is retired.
 
 ## Open Decisions (Deferred)
 
@@ -195,8 +209,12 @@ Exact ordering and structure of expert persona + framework rules + phase directi
 
 ## Resolved Decisions (Phase 5)
 
-### Active injection implementation
-Resolved: `create_instruction_tool_messages()` in `workspace_injection.py` creates transient AIMessage+ToolMessage pairs (same pattern as workspace.md). Injected in the `execute` node after workspace injection, filtered by `get_phase_instruction_files()`.
+### One-shot phase-start injection implementation
+Resolved: `create_instruction_tool_messages()` in `workspace_injection.py`
+creates transient AIMessage+ToolMessage pairs. The worker `execute` node emits
+them only when the current `(phase number, phase kind, artifact path)` is not in
+the checkpointed `phase_instruction_injections` ledger; a successful LLM turn
+records the key. Safety-compaction rebuilds preserve the same logical delivery.
 
 ### `instructions.md` content mapping
 
@@ -227,7 +245,7 @@ The current `instructions.md` (138 lines) mixes six content types. Here's where 
 | Transient injection mechanism | Done | workspace.md pattern in `workspace_injection.py` |
 | Expert-specific system prompts | **Done** | `persona.txt` per expert, injected via `{expert_identity}` in systemprompt.txt every call |
 | Kickoff message rework | **Done** | `kickoff_message` field in API/UI, `task_brief.md` in workspace, HumanMessage includes task brief |
-| Instruction file trigger system | **Done** | Config-driven triggers via `instruction_files`, passive enforcement wrappers, phase injection. **Slice 3 (2026-06-19)** extended entries with a `skill:` form (XOR `file:`, → `skills/<name>/SKILL.md`) and migrated `todo-guide`/`research-guide` to bundled skills ([[agent_skills]]) |
+| Instruction file trigger system | **Done** | Config-driven triggers via `instruction_files`: action read-gates plus checkpointed once-per-phase injection. **Slice 3 (2026-06-19)** added `skill:`; the **2026-08-03 activation correction** retired continuous phase injection and added phase/freshness-scoped reads ([[agent_skills]]) |
 | Task file conventions | **Done** | Convention-based: `output/` for deliverables, `reference/` for domain material, Deliverables table in workspace.md and plan.md |
 | Content authoring | **Done** | Scholar as reference expert. Default persona written. `research_guide.md` for scholar. `instructions.md` fully mapped to layers. |
 
@@ -290,13 +308,15 @@ The current `instructions.md` (138 lines) mixes six content types. Here's where 
 - [x] Add `_instruction_files` field and helper methods to `ToolContext` (`get_enforcement_files`, `check_tool_enforcement`, `get_phase_instruction_files`)
 - [x] Implement passive enforcement (`enforce: true`): `apply_instruction_enforcement()` in `registry.py` wraps tool functions with `was_recently_read()` pre-checks
 - [x] Wire enforcement into `agent.py` tool loading — called after `apply_description_overrides`
-- [x] Implement active injection (`enforce: false`): `create_instruction_tool_messages()` in `workspace_injection.py` creates transient AIMessage+ToolMessage pairs for instruction file content
-- [x] Implement `phase:strategic` / `phase:tactical` triggers in `graph.py` execute node — injects instruction file content after workspace.md injection
+- [x] Historical: implement phase-matched transient injection with `create_instruction_tool_messages()`
+- [x] **Activation correction (2026-08-03):** replace per-request phase matching with checkpointed `phase_start:strategic|tactical`, retain `phase:*` only as a once-only compatibility alias, and add phase/freshness-scoped `before_tool` gates
 - [x] Copy instruction files to workspace at job init (generalized loop in `agent.py`)
 - [x] Migrate hardcoded `todo_guide.md` enforcement in `todo.py` to fallback-only (active when no `instruction_files` configured)
 - [x] Verify serialization roundtrip: `serialize_resolved_config()` → JSONB → `load_config_from_resolved()` preserves `instruction_files`
 
-**Result**: Adding a new instruction file = add a config entry + write the file. No code changes needed.
+**Result**: Adding a new instruction file = add a config entry + write the
+file. Its body is either delivered once at a phase start or required before a
+named action; there is no continuous delivery mode.
 
 ### Phase 4: Task Files & Conventions (Layer 4) [DONE]
 
@@ -337,7 +357,7 @@ The current `instructions.md` (138 lines) mixes six content types. Here's where 
 - [x] Expert personas already written in Phase 1 (developer, scholar, critic)
 - [x] Kickoff message: runtime field in UI, not a static template — no file needed
 - [x] Write `research_guide.md` for scholar (`config/experts/scholar/research_guide.md`) — research methodology, tool usage, citation requirements, output conventions
-- [x] Add `instruction_files` to scholar config — `todo_guide.md` (passive, inherited) + `research_guide.md` (active, tactical phase trigger)
+- [x] Add `instruction_files` to scholar config — now bundled as the `todo-guide` action gate plus one-shot `research-guide` `phase_start:tactical` orientation
 - [x] Add `reference/` to scholar workspace structure
 - [x] Deliverable specs: convention-based per Phase 4 — scholar already has `output/ideas/` and `output/experiments/`
 - [x] Map all `instructions.md` content to four layers (see Content Mapping table below)

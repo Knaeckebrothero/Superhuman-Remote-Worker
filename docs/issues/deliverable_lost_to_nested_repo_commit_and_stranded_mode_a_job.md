@@ -60,7 +60,11 @@ Rules:
 - Paths are workspace-relative; `repo/` prefix is accepted either way.
 ```
 
-`normalize_deliverable_path` (`src/core/deliverables.py:42-64`) strips `repo/` — canonical
+That is the historical task-brief wording from the affected run. The
+agent-visible boundary status file was retired on 2026-08-03; current briefs say
+the platform validates the contracted artifact paths directly.
+
+`normalize_deliverable_path` (`src/core/deliverables.py`) strips `repo/` — canonical
 form is *without* it — and `resolve_workspace_deliverable` accepts either form. So sibling
 jobs writing `repo/output/…` and this one writing `output/…` are the same contracted
 artifact. The agent wrote the canonical path it was given.
@@ -137,9 +141,10 @@ The brief promises *"each phase boundary commits and pushes them"*. Across 8 pha
 `098bf3fe6dbbdfb463e675db72f433db075412ba`, dated **2026-07-29T15:41:08Z** — three days
 before the job started.
 
-Corroborating: `output/manifest_status.json`, which `write_manifest_status` is supposed to
-emit at *every* phase boundary (F13), is also absent from the branch, though the agent
-demonstrably wrote it. Nothing this job produced reached Gitea.
+Historical corroboration: the then-current boundary status file was also absent
+from the branch, though the agent demonstrably wrote it. Nothing this job produced
+reached Gitea. That file mechanism was retired on 2026-08-03 and is no longer an
+acceptance signal.
 
 ### The failure is silent by construction
 
@@ -389,8 +394,8 @@ the k3d run is no longer a fishing trip — instrument `push()` to log *which* e
 fired, run a multi-phase job, and read it directly. k3d is decisive here because agent pod
 logs are live rather than the truncated S3 archive that hid this in production.
 
-Assertions for the run: branch tip advances at each phase boundary; `output/manifest_status.json`
-appears on the branch; `push()` returns `True`.
+Assertions for the run: branch tip advances at each phase boundary; the contracted
+deliverable appears on the branch; `push()` returns `True`.
 
 ### E3 — Mode A dead zone · **CONFIRMED 2026-08-02 · WORSE THAN FILED**
 
@@ -559,7 +564,8 @@ reintroduce the drift class `f41970ae` just closed. Instead:
 ## Verification
 
 For Defect 1: run a multi-phase job and assert the branch tip advances at each phase
-boundary; assert `output/manifest_status.json` is present on the branch. Both fail today.
+boundary; assert the contracted deliverable is present on the branch. Both failed in
+the affected build.
 
 For Defect 2: from a shell `cd`'d into a subdirectory, `write_file("output/x.md")` then
 `shell_execute("cat output/x.md")`. They disagree today, and nothing in either result

@@ -1214,24 +1214,55 @@ class InstructionFileEntry:
     Attributes:
         trigger: Trigger condition string:
             - "before_tool:<tool_name>" — fires when the named tool is called
-            - "phase:strategic" / "phase:tactical" — fires on phase transition
+            - "phase_start:strategic" / "phase_start:tactical" — injects once
+              when that concrete phase instance begins
+            - legacy "phase:<name>" is a compatibility alias for phase_start
         file: Workspace-relative path (e.g. "todo_guide.md"). XOR ``skill``.
         skill: Bundled skill name (e.g. "research-guide"). XOR ``file``;
                resolves to ``skills/<skill>/SKILL.md`` via ``path``.
         enforce: If True, tool rejects until agent reads the artifact (passive).
-                 If False, system injects content automatically (active).
+                 Phase-start bindings are injected once regardless of this flag.
+        phases: Optional phase-kind filter for ``before_tool`` bindings.
+        read_scope: ``job`` keeps a successful instruction read valid for the
+                    worker run; ``phase`` requires a read in the current concrete
+                    phase instance.
+        max_read_age_turns: Optional maximum age of an instruction read in LLM
+                            turns before a ``before_tool`` gate closes again.
     """
 
     trigger: str
     file: Optional[str] = None
     skill: Optional[str] = None
     enforce: bool = True
+    phases: Optional[List[str]] = None
+    read_scope: str = "job"
+    max_read_age_turns: Optional[int] = None
 
     def __post_init__(self) -> None:
         if bool(self.file) == bool(self.skill):
             raise ValueError(
                 "InstructionFileEntry requires exactly one of 'file' or 'skill' "
                 f"(got file={self.file!r}, skill={self.skill!r})"
+            )
+        if self.phases is not None:
+            if not isinstance(self.phases, list):
+                raise ValueError("InstructionFileEntry phases must be a list")
+            self.phases = [str(phase).strip().lower() for phase in self.phases]
+            invalid_phases = set(self.phases) - {"strategic", "tactical"}
+            if invalid_phases:
+                raise ValueError(
+                    "InstructionFileEntry phases contains invalid values: "
+                    f"{sorted(invalid_phases)}"
+                )
+        if self.read_scope not in {"job", "phase"}:
+            raise ValueError("InstructionFileEntry read_scope must be 'job' or 'phase'")
+        if self.max_read_age_turns is not None and (
+            isinstance(self.max_read_age_turns, bool)
+            or not isinstance(self.max_read_age_turns, int)
+            or self.max_read_age_turns <= 0
+        ):
+            raise ValueError(
+                "InstructionFileEntry max_read_age_turns must be a positive integer"
             )
 
     @property
@@ -1244,7 +1275,7 @@ class InstructionFileEntry:
 
     @property
     def trigger_type(self) -> str:
-        """Extract trigger type: 'before_tool' or 'phase'."""
+        """Extract trigger type (for example ``before_tool``/``phase_start``)."""
         return self.trigger.split(":")[0]
 
     @property
@@ -2458,6 +2489,9 @@ def load_agent_config(
             file=entry.get("file"),
             skill=entry.get("skill"),
             enforce=entry.get("enforce", True),
+            phases=entry.get("phases"),
+            read_scope=entry.get("read_scope", "job"),
+            max_read_age_turns=entry.get("max_read_age_turns"),
         )
         for entry in instruction_files_data
     ]
@@ -2711,6 +2745,9 @@ def load_agent_config_from_dict(
             file=entry.get("file"),
             skill=entry.get("skill"),
             enforce=entry.get("enforce", True),
+            phases=entry.get("phases"),
+            read_scope=entry.get("read_scope", "job"),
+            max_read_age_turns=entry.get("max_read_age_turns"),
         )
         for entry in instruction_files_data
     ]
