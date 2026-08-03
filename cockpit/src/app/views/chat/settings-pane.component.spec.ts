@@ -1,7 +1,9 @@
-import {Injector, runInInjectionContext, signal} from '@angular/core';
+import {Injector, runInInjectionContext, signal, ɵresolveComponentResources} from '@angular/core';
 import {TestBed} from '@angular/core/testing';
+import {TranslocoTestingModule} from '@jsverse/transloco';
 import {Observable, Subject, of} from 'rxjs';
-import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest';
+import {afterEach, beforeAll, beforeEach, describe, expect, it, vi} from 'vitest';
+import en from '../../../assets/i18n/en.json';
 import {ApiService} from '../../core/services/api.service';
 import {CapabilitiesService} from '../../core/services/capabilities.service';
 import {ModelService} from '../../core/services/model.service';
@@ -119,6 +121,7 @@ function createPane(options: {
         ),
     ),
     resetDatasourceSelection: vi.fn(),
+    getToolAdditions: vi.fn().mockReturnValue({} as Record<string, string[]>),
   };
   Object.defineProperty(component, 'settings', {value: () => fakeSettings});
   TestBed.tick(); // fire the load effect
@@ -213,46 +216,51 @@ function createPaneWithRealToolsGroup(toolGroups: SessionToolGroupsResponse) {
     getOverrides: () => toolsGroup.getOverrides(),
     getSelectedDatasourceIds: () => [] as string[],
     resetDatasourceSelection: () => {},
+    getToolAdditions: () => toolsGroup.getToolAdditions(),
   };
   Object.defineProperty(component, 'settings', {value: () => settings});
   TestBed.tick(); // fire the load effect
   return {component, chat, toolsGroup};
 }
 
-describe('SettingsPaneComponent locked-on categories (B2 fast-follow)', () => {
-  // The regression: a prior fix made compose_tool_view mark a category `on` +
-  // `settable: false` whenever every tool it bound is a per-tool code grant
-  // (default topology's `shell`, once a cloud mount adds `srw_cloud_status`).
-  // toolsFragment then skipped that key in BOTH directions, so the only
-  // sessions locked out of GAINING shell were the ones that did not have it
-  // yet. Off must stay refused (unticking a code-granted category is
-  // fiction — the runtime re-adds it); on must keep working (it is how the
-  // settable subset, run_command/shell_read, actually gets added).
+describe('SettingsPaneComponent locked-on categories', () => {
+  // `compose_tool_view` marks a category `on` + `settable: false` when every
+  // tool it bound is a per-tool code grant — the default topology's `shell`,
+  // once a cloud mount adds `srw_cloud_status`. Two facts hold at once and the
+  // pane must honour both: the category cannot be turned OFF (the runtime
+  // re-appends after the merge, so `[]` is a promise nothing can keep), and
+  // config can still ADD the four settable shell tools, which is how a running
+  // session gains shell at all.
+  //
+  // The off half is now structural — `toolsFragment` refuses every unsettable
+  // key in both directions, with no exemption to strip afterwards — and the add
+  // half rides its own tracked path, because a locked-on category's boolean is
+  // `true` before the gesture and `true` after it, so the switch diff is blind
+  // to it by construction.
   beforeEach(() => vi.useFakeTimers());
   afterEach(() => {
     vi.useRealTimers();
     TestBed.resetTestingModule();
   });
 
-  it('unsettable + turning off: nothing dispatched (the original defect stays fixed)', () => {
+  it('unsettable + turning off: nothing dispatched, however many times it is toggled', () => {
     const {component, chat, toolsGroup} = createPaneWithRealToolsGroup(lockedOnShellAnswer(false));
 
     toolsGroup.toggleCategory('shell'); // untick
     component.onSettingsChange();
     vi.runAllTimers();
+    expect(chat.updateConfig).not.toHaveBeenCalled();
 
+    toolsGroup.toggleCategory('shell'); // re-tick — no longer a route to the enable
+    component.onSettingsChange();
+    vi.runAllTimers();
     expect(chat.updateConfig).not.toHaveBeenCalled();
   });
 
-  it('unsettable + turning on: the enable is dispatched (the regression is closed)', () => {
+  it('unsettable + the add affordance: the enable is dispatched, in ONE gesture', () => {
     const {component, chat, toolsGroup} = createPaneWithRealToolsGroup(lockedOnShellAnswer(false));
 
-    toolsGroup.toggleCategory('shell'); // untick
-    component.onSettingsChange();
-    vi.runAllTimers();
-    expect(chat.updateConfig).not.toHaveBeenCalled(); // the off leg stays silent
-
-    toolsGroup.toggleCategory('shell'); // re-tick
+    toolsGroup.requestAdditions('shell');
     component.onSettingsChange();
     vi.runAllTimers();
 
@@ -261,11 +269,40 @@ describe('SettingsPaneComponent locked-on categories (B2 fast-follow)', () => {
     });
   });
 
-  it('control: the SAME sequence dispatches the off-write when the server marks it settable', () => {
+  it('the add request dispatches once, not on every later unrelated edit', () => {
+    const {component, chat, toolsGroup} = createPaneWithRealToolsGroup(lockedOnShellAnswer(false));
+
+    toolsGroup.requestAdditions('shell');
+    component.onSettingsChange();
+    vi.runAllTimers();
+    expect(chat.updateConfig).toHaveBeenCalledTimes(1);
+
+    // A second apply with nothing new must be silent: the tracked path is now
+    // part of the baseline, so the request is not re-sent forever.
+    component.onSettingsChange();
+    vi.runAllTimers();
+    expect(chat.updateConfig).toHaveBeenCalledTimes(1);
+  });
+
+  it('a locked-on category has no add request to make when config cannot add to it', () => {
+    // `enumerate_only` carries no entry, so the policy would be `true`, whose
+    // expansion the client cannot see. Nothing is offered and nothing is sent.
+    const answer = lockedOnShellAnswer(false);
+    answer.enumerate_only = {};
+    const {component, chat, toolsGroup} = createPaneWithRealToolsGroup(answer);
+
+    toolsGroup.requestAdditions('shell');
+    component.onSettingsChange();
+    vi.runAllTimers();
+
+    expect(chat.updateConfig).not.toHaveBeenCalled();
+  });
+
+  it('control: the SAME untick dispatches the off-write when the server marks it settable', () => {
     // Sanity check on the harness, not the fix: with `settable: true` the
     // untick DOES reach the wire — the pre-existing, correct behaviour this
     // task must leave alone — so the silence in the first test above is the
-    // fix, not a mount that never dispatches anything.
+    // refusal, not a mount that never dispatches anything.
     const {component, chat, toolsGroup} = createPaneWithRealToolsGroup(lockedOnShellAnswer(true));
 
     toolsGroup.toggleCategory('shell');
@@ -273,6 +310,142 @@ describe('SettingsPaneComponent locked-on categories (B2 fast-follow)', () => {
     vi.runAllTimers();
 
     expect(chat.updateConfig).toHaveBeenCalledExactlyOnceWith({tools: {shell: []}});
+  });
+});
+
+/**
+ * From a RENDERED click to the wire, in one test.
+ *
+ * The tests above drive `toolsGroup.requestAdditions('shell')` and the ones in
+ * tools-group.render.spec.ts click the real button and read the component back.
+ * Neither, alone, is what failed: the defect was a control that rendered
+ * `disabled` while every method behind it worked, so a suite that calls methods
+ * and a suite that never dispatches both stay green. This one starts at a DOM
+ * element and ends at `chat.updateConfig`.
+ */
+describe('SettingsPaneComponent locked-on categories, from the DOM', () => {
+  beforeAll(async () => {
+    await ɵresolveComponentResources(() => Promise.resolve(''));
+  });
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => {
+    vi.useRealTimers();
+    TestBed.resetTestingModule();
+  });
+
+  function mountPaneWithRenderedToolsGroup(toolGroups: SessionToolGroupsResponse) {
+    const chat = {
+      threadId: signal<string | null>('thread-1'),
+      isConnected: signal(true),
+      modelName: signal<string | null>(null),
+      temperature: signal<number | null>(null),
+      permissionMode: signal('supervised'),
+      narrationMode: signal('auto'),
+      workspaceTier: signal<string | null>(null),
+      workspaceUpgradeInProgress: signal<{tier: string; elapsed?: number} | null>(null),
+      updateConfig: vi.fn().mockReturnValue('req-1'),
+      setMode: vi.fn(),
+      setNarrationMode: vi.fn(),
+      upgradeWorkspace: vi.fn(),
+    };
+    const api = {
+      getPersistentThread: vi.fn().mockReturnValue(
+        of({metadata: {config_override: {}, datasource_ids: []}, project_ids: []}),
+      ),
+      getEligibleDatasources: vi.fn().mockReturnValue(of([])),
+      getSessionToolGroups: vi.fn().mockReturnValue(of(toolGroups)),
+    };
+
+    TestBed.configureTestingModule({
+      imports: [
+        ToolsGroupComponent,
+        TranslocoTestingModule.forRoot({
+          langs: {en},
+          translocoConfig: {availableLangs: ['en'], defaultLang: 'en'},
+        }),
+      ],
+      providers: [
+        SettingsPaneComponent,
+        {provide: PersistentChatService, useValue: chat},
+        {provide: ApiService, useValue: api},
+        {provide: CapabilitiesService, useValue: {grants: signal(null)}},
+        {provide: ModelService, useValue: {load: vi.fn()}},
+      ],
+    });
+
+    // The REAL control, rendered. Signal inputs cannot be set through
+    // setInput() in this pipeline (no ngtsc for vitest) — same workaround as
+    // tools-group.render.spec.ts.
+    const fixture = TestBed.createComponent(ToolsGroupComponent);
+    const toolsGroup = fixture.componentInstance;
+    Object.defineProperty(toolsGroup, 'mode', {value: () => 'live'});
+    Object.defineProperty(toolsGroup, 'resolved', {value: () => toolGroups});
+    fixture.detectChanges();
+
+    const component = TestBed.inject(SettingsPaneComponent);
+    Object.defineProperty(component, 'active', {value: () => true});
+    Object.defineProperty(component, 'settings', {
+      value: () => ({
+        prefillFromConfig: (config: Record<string, unknown>) => toolsGroup.prefillFromConfig(config),
+        prefillFromResolvedToolset: (categories: Record<string, SessionToolCategory>) =>
+          toolsGroup.prefillFromResolved(categories),
+        hasToolEdits: () => toolsGroup.hasToolEdits(),
+        getOverrides: () => toolsGroup.getOverrides(),
+        getSelectedDatasourceIds: () => [] as string[],
+        resetDatasourceSelection: () => {},
+        getToolAdditions: () => toolsGroup.getToolAdditions(),
+      }),
+    });
+    // The control emits `change`; in the app the host binds it to
+    // onSettingsChange(). Wire the same edge here rather than calling the pane
+    // by hand, so the click really is the only input to this test.
+    toolsGroup.change.subscribe(() => component.onSettingsChange());
+    TestBed.tick(); // fire the pane's load effect
+    fixture.detectChanges();
+    return {component, chat, fixture};
+  }
+
+  function shellAdditions(fixture: {nativeElement: unknown}): HTMLElement | null {
+    return (fixture.nativeElement as HTMLElement).querySelector(
+      '.tool-additions[data-category="shell"]',
+    );
+  }
+
+  it('clicking the rendered ADD button dispatches the enumeration', () => {
+    const {chat, fixture} = mountPaneWithRenderedToolsGroup(lockedOnShellAnswer(false));
+
+    const box = (fixture.nativeElement as HTMLElement).querySelector(
+      'input[type="checkbox"]',
+    ) as HTMLInputElement;
+    expect(box.checked).toBe(true);
+    expect(box.disabled).toBe(true);
+
+    const button = shellAdditions(fixture)?.querySelector('button') as HTMLButtonElement;
+    expect(button).toBeTruthy();
+    button.click();
+    fixture.detectChanges();
+    vi.runAllTimers();
+
+    expect(chat.updateConfig).toHaveBeenCalledExactlyOnceWith({
+      tools: {shell: {only: ['run_command', 'shell_read']}},
+    });
+  });
+
+  it('clicking the rendered CHECKBOX of the same row dispatches nothing', () => {
+    // The positive control is the test above: the harness demonstrably reaches
+    // the wire, so this silence is the refusal and not a dead mount.
+    const {chat, fixture} = mountPaneWithRenderedToolsGroup(lockedOnShellAnswer(false));
+
+    const box = (fixture.nativeElement as HTMLElement).querySelector(
+      'input[type="checkbox"]',
+    ) as HTMLInputElement;
+    box.click();
+    box.dispatchEvent(new Event('change')); // forced, past the disabled attribute
+    fixture.detectChanges();
+    vi.runAllTimers();
+
+    expect(chat.updateConfig).not.toHaveBeenCalled();
+    expect(box.checked).toBe(true);
   });
 });
 

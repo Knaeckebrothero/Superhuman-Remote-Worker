@@ -2563,6 +2563,9 @@
       "0": "Unlimited"
     },
     "tools": {
+      "addAction": "Add ({{n}})",
+      "addRequested": "Add requested",
+      "addable": "Locked on — config can still add: {{names}}",
       "countBound": "{{n}} bound",
       "countPredicted": "{{n}} predicted",
       "group": "Tools",
