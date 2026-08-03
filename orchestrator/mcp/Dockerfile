@@ -1,3 +1,5 @@
+# Local standalone/stdio convenience image only. Production and CI use
+# ../../docker/Dockerfile.mcp, which also bakes and verifies tools/list.
 FROM python:3.12-slim
 
 LABEL org.opencontainers.image.source="https://github.com/Knaeckebrothero/Superhuman-Remote-Worker"

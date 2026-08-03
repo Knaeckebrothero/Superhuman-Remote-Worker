@@ -631,6 +631,9 @@ auth:
 mcp:
   enabled: true
   replicas: 1
+  # -- Reject mutable tag-only image references. Enable in production values;
+  # local/Tilt workflows may leave this false for developer-built images.
+  requireImageDigest: false
   # -- Also route the MCP server under the cockpit host at /mcp (e.g.
   # https://localhost/mcp on k3d). Convenience for local dev so a committed
   # .mcp.json works without a dedicated mcp.<domain> cert/DNS. Leave off in
