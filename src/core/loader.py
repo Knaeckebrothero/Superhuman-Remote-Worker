@@ -1541,6 +1541,14 @@ class ToolsConfig:
     canvas: List[str] = field(default_factory=list)
     agent_catalog: List[str] = field(default_factory=list)
     workflows: List[str] = field(default_factory=list)
+    # Catalogue-authoring writes (expert / skill / automation bundle get+set),
+    # split out of `agent_catalog` and `workflows` on 2026-08-03 so those two
+    # groups contain only reads and their `true` expansion is safe by
+    # construction. Gated by the `catalog_authoring` capability grant
+    # (deny-by-default), because these tools create and update rows a user's
+    # other agents then run. Design:
+    # docs/features/agent_authored_catalog_entries.md
+    catalog_authoring: List[str] = field(default_factory=list)
     # Loop campaign tools (loop_plan). Never listed in bundled configs — the
     # orchestrator injects `tools.loop` via config_override only for a planner
     # loop's checkpoint critic (docs/features/loop_campaign_scheduling.md).
@@ -2446,6 +2454,7 @@ def load_agent_config(
         canvas=tools_data.get("canvas", []),
         agent_catalog=tools_data.get("agent_catalog", []),
         workflows=tools_data.get("workflows", []),
+        catalog_authoring=tools_data.get("catalog_authoring", []),
         loop=tools_data.get("loop", []),
         product_help=tools_data.get("product_help", []),
         session_task=tools_data.get("session_task", []),
@@ -2707,6 +2716,7 @@ def load_agent_config_from_dict(
         canvas=tools_data.get("canvas", []),
         agent_catalog=tools_data.get("agent_catalog", []),
         workflows=tools_data.get("workflows", []),
+        catalog_authoring=tools_data.get("catalog_authoring", []),
         loop=tools_data.get("loop", []),
         product_help=tools_data.get("product_help", []),
         session_task=tools_data.get("session_task", []),

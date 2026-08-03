@@ -125,8 +125,11 @@ class TestPopulation:
         assert "config/session_base.yaml" in files
         assert "config/worker_base.yaml" in files
         assert any("experts/centurion" in f for f in files)
-        assert len(_DECLARATIONS) == 143, (
-            f"expected 143 raw declarations, got {len(_DECLARATIONS)}"
+        # 144 as of 2026-08-03: session_base gained `catalog_authoring: [ ]` so
+        # the closed-group set it declares explicitly stays complete — an absent
+        # key reads as ENABLED in session_tool_group_enablement.
+        assert len(_DECLARATIONS) == 144, (
+            f"expected 144 raw declarations, got {len(_DECLARATIONS)}"
         )
 
     def test_every_shipped_declaration_is_already_a_list(self):

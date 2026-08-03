@@ -374,6 +374,65 @@
             }
           ]
         },
+        "catalog_authoring": {
+          "description": "Catalogue-authoring tools: create or update experts, skills and automations from portable JSON bundles (src/tools/orchestrator/catalog.py, workflows.py). Split out of agent_catalog/workflows so those groups hold only reads and their `true` expansion is safe by construction. Gated by the catalog_authoring capability grant, deny-by-default, because these tools write rows the user's other agents then run. Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
+          "examples": [
+            [
+              "get_expert_bundle",
+              "set_expert_bundle",
+              "get_skill_bundle",
+              "set_skill_bundle",
+              "get_automation_bundle",
+              "set_automation_bundle"
+            ]
+          ],
+          "oneOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "uniqueItems": true
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "only": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                },
+                "except": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "uniqueItems": true,
+                  "minItems": 1
+                }
+              },
+              "oneOf": [
+                {
+                  "required": [
+                    "only"
+                  ]
+                },
+                {
+                  "required": [
+                    "except"
+                  ]
+                }
+              ]
+            }
+          ]
+        },
         "canvas": {
           "description": "Dynamic Canvas presentation tools for persistent sessions (src/tools/canvas/). Policy, not membership: true / false / {only: [...]} / {except: [...]}, or a bare list.",
           "examples": [

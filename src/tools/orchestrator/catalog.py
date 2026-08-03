@@ -74,16 +74,9 @@ CATALOG_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
             "Get a portable JSON expert bundle for editing or forking. "
             "Authoring support; not injected by default."
         ),
-        "category": "agent_catalog",
+        "category": "catalog_authoring",
         "short_description": "Get editable expert JSON.",
         "phases": ["strategic", "tactical"],
-        "grant": "explicit",
-        "gate": (
-            "named outright in a tools.agent_catalog list; the four bundle "
-            "tools are catalogue authoring and are absent from "
-            "SESSION_TOOL_OVERRIDE_NAMES, so no category-level `true` may "
-            "reach them"
-        ),
     },
     "set_expert_bundle": {
         "module": "orchestrator.catalog",
@@ -93,15 +86,9 @@ CATALOG_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
             "dry_run defaults true; set dry_run=false to write. Authoring "
             "support; not injected by default."
         ),
-        "category": "agent_catalog",
+        "category": "catalog_authoring",
         "short_description": "Create or update an expert from JSON.",
         "phases": ["strategic", "tactical"],
-        "grant": "explicit",
-        "gate": (
-            "named outright in a tools.agent_catalog list; a control-plane "
-            "WRITE that creates or updates an expert, so a user ticking "
-            "'Experts & Skills' must never acquire it"
-        ),
     },
     "get_skill_bundle": {
         "module": "orchestrator.catalog",
@@ -110,14 +97,9 @@ CATALOG_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
             "Get a portable JSON skill bundle with the full file tree for "
             "editing or forking. Authoring support; not injected by default."
         ),
-        "category": "agent_catalog",
+        "category": "catalog_authoring",
         "short_description": "Get editable skill JSON.",
         "phases": ["strategic", "tactical"],
-        "grant": "explicit",
-        "gate": (
-            "named outright in a tools.agent_catalog list; catalogue "
-            "authoring, absent from SESSION_TOOL_OVERRIDE_NAMES"
-        ),
     },
     "set_skill_bundle": {
         "module": "orchestrator.catalog",
@@ -127,15 +109,9 @@ CATALOG_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
             "dry_run defaults true; set dry_run=false to write. Authoring "
             "support; not injected by default."
         ),
-        "category": "agent_catalog",
+        "category": "catalog_authoring",
         "short_description": "Create or update a skill from JSON.",
         "phases": ["strategic", "tactical"],
-        "grant": "explicit",
-        "gate": (
-            "named outright in a tools.agent_catalog list; a control-plane "
-            "WRITE that creates or updates a skill, so a user ticking "
-            "'Experts & Skills' must never acquire it"
-        ),
     },
 }
 
