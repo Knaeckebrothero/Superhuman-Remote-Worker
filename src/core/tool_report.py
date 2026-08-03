@@ -246,6 +246,32 @@ def code_granted_categories() -> dict[str, str]:
     }
 
 
+def code_granted_tools() -> dict[str, str]:
+    """Tool name -> the gate that binds it, for every ``grant: "code"`` tool.
+
+    The per-TOOL tier of the same classification :func:`code_granted_categories`
+    reports per category, and the one the category map structurally cannot see:
+    ``srw_cloud_status`` sits in ``shell``, ``sleep`` / ``notify_user`` /
+    ``request_workspace_upgrade`` in ``core`` and ``checkout_project_repository``
+    in ``orchestrator`` — three categories config manages heavily. The agent
+    appends exactly these AFTER the merge
+    (``src/api/persistent_session.py::_load_tools_for_backend``), so config can
+    neither grant nor revoke them.
+
+    Read off ``TOOL_REGISTRY`` rather than listed, so a new re-append site that
+    carries the mark is covered without editing this module — and one that does
+    not carry the mark is a registry omission, which is the right place to fix
+    it.
+    """
+    from src.tools.registry import TOOL_REGISTRY
+
+    return {
+        name: str(meta.get("gate") or "runtime code")
+        for name, meta in TOOL_REGISTRY.items()
+        if meta.get("grant") == "code"
+    }
+
+
 # ---------------------------------------------------------------------------
 # the agent's half — measurement
 # ---------------------------------------------------------------------------
@@ -362,11 +388,20 @@ def compose_tool_view(
     without ``backend``: the tools are still measurably absent even when the
     cause is not legible).  ``off`` therefore means "nothing here, and nothing
     has said no".
+
+    **And ``on`` is revocable, or it is not a switch.**  The symmetric case:
+    everything the agent bound is a per-tool code grant, so unticking writes
+    ``[]``, the runtime re-appends after the merge, and the box comes back
+    ticked — for the life of the session.  That is ``on`` with
+    ``settable: False`` and a reason naming the tools and their gates, not a
+    live checkbox.  ``srw_cloud_status`` makes it the default topology's
+    behaviour for ``shell``.
     """
     provenance = provenance or {}
     blocked_by_grant = grant_blocked_categories(grants)
     blocked_by_backend = backend_blocked_categories(backend_caps)
     code_granted = code_granted_categories()
+    code_granted_tool = code_granted_tools()
 
     known = set(report_categories())
     categories = sorted(known | set(measured or {}) | set(configured or {}))
@@ -399,11 +434,35 @@ def compose_tool_view(
                 f"what it holds"
             )
 
+        # ...and the mirror: **on is revocable**, or it is not offered as a
+        # switch. Everything the agent bound here carries the registry's
+        # per-tool ``grant: "code"`` mark, so the config that would remove it
+        # does not exist — the agent re-appends these AFTER the merge. Unticking
+        # writes ``tools.<c>: []`` and the next measurement reports the same
+        # tools, forever, which is a checkbox that cannot lose. Fires only when
+        # unticking would change *nothing*: a category whose bound set also
+        # holds a config-granted name is an ordinary ticked box, because
+        # unticking really does drop that name.
+        locked_on_reason = None
+        if bound and all(name in code_granted_tool for name in bound):
+            gates = sorted({code_granted_tool[name] for name in bound})
+            locked_on_reason = (
+                f"the runtime binds {', '.join(bound)} here regardless of config "
+                f"({'; '.join(gates)}), so unticking this group cannot release it"
+            )
+
         # Precedence is deliberate: a denied grant is the strongest statement
         # (nothing about the workspace or the config can restore it), then the
         # workspace tier, then "config never managed this category at all",
-        # then the bare observation above.
-        reason = grant_reason or backend_reason or code_reason or unbound_reason
+        # then the two bare observations above — which are mutually exclusive,
+        # one needing an empty bound set and the other a full one.
+        reason = (
+            grant_reason
+            or backend_reason
+            or code_reason
+            or locked_on_reason
+            or unbound_reason
+        )
         settable = reason is None
 
         if tools:
@@ -419,8 +478,15 @@ def compose_tool_view(
             decided_by = DECIDED_BY_BACKEND
         elif bound is not None and sorted(bound) != sorted(conf):
             # The merged config and the bound set disagree: something after the
-            # merge moved it — the runtime injection layer, or a code grant.
-            decided_by = DECIDED_BY_REGISTRY if code_reason else DECIDED_BY_RUNTIME
+            # merge moved it — the runtime injection layer, or a code grant. A
+            # per-tool code grant reads as ``registry`` for the same reason a
+            # category-level one does: the registry's ``grant`` mark is what
+            # classified it, and one rule is easier to keep honest than two.
+            decided_by = (
+                DECIDED_BY_REGISTRY
+                if (code_reason or locked_on_reason)
+                else DECIDED_BY_RUNTIME
+            )
         elif code_reason:
             decided_by = DECIDED_BY_REGISTRY
         else:
@@ -478,6 +544,7 @@ __all__ = [
     "build_agent_toolset_report",
     "categorize_tool_names",
     "code_granted_categories",
+    "code_granted_tools",
     "compose_tool_view",
     "grant_blocked_categories",
     "layer_provenance",
