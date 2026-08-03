@@ -260,11 +260,17 @@ curl -s  https://cloud.srw.works/status.php        # installed:true
 ```
 
 Then walk the app path: open a project (expect a fresh Group Folder to be
-provisioned), start a session (expect its mount to resolve), and confirm
-`groupfolders` is at or above 20.1.2 — the protected-cloud RO mount refuses to
-engage below that CVE floor (`check_version_floors` in
-`orchestrator/services/cloud/ro_probe.py`). The setup hook runs
-`occ app:update groupfolders` on every start for exactly this reason.
+provisioned) and start a session (expect its mount to resolve).
+
+On `groupfolders`, do **not** check against a flat 20.1.2 floor. The CVE floor
+(GHSA-2vrq-fhmf-c49m) is enforced **per release branch** by
+`GROUPFOLDERS_PATCHED` in `orchestrator/services/cloud/ro_probe.py`, because
+groupfolders ships one branch per Nextcloud major (19.x -> NC 31, 20.x -> NC 32)
+and the advisory patched every maintained branch. A flat 20.1.2 floor is
+branch-blind and would refuse a fully patched NC 31 install forever. The 19.x
+floor is **19.1.8**. This cluster runs NC 31.0.14 with groupfolders 19.1.20 —
+patched and passing. `occ app:update groupfolders` correctly reports "no
+updates" here; 19.1.20 is the newest release for NC 31.
 
 ## Rollback
 
