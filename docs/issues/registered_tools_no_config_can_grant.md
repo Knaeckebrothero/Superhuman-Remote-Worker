@@ -329,7 +329,37 @@ being told to call `delegate_work` when it cannot.** The cost is different: a
 whole guarded section of the standard worker instructions has been dead since
 2026-07-22 and nobody noticed.
 
-### 3c. The six `*_bundle` tools — designed off-by-default, with no way to turn them on
+### 3c. The six `*_bundle` tools — RESOLVED 2026-08-03: they became a feature
+
+**Status: closed.** The escape hatch this section says was never built is now
+built, and it is a product capability rather than a cleanup:
+[[agent_authored_catalog_entries]], live-gated in
+[[catalog_authoring_live_gate_2026-08-03]].
+
+What shipped is **neither** option this section proposed. The premise below — that
+these are unscoped control-plane writes needing an admin-scoped home — is wrong,
+and checking it is what changed the decision: every write calls the same HTTP
+endpoint the cockpit calls, carrying the session owner's real identity, so
+ownership checks, the `user_experts` kill switch and save-time grant evaluation
+already applied. Scoping was never missing; only the switch was. So the six moved
+into a **user-scoped** `catalog_authoring` category behind a deny-by-default
+`catalog_authoring` capability grant, and a user can now tell their agent to build
+them an expert or an automation.
+
+Two consequences for this document:
+
+- **The residual path in "Verification owed" is closed**, and by structure rather
+  than by testing. `tools.agent_catalog: [set_expert_bundle]` is now foreign
+  vocabulary and 400s at every write boundary, because the name genuinely belongs
+  to a different category. Verified live.
+- **`agent_catalog` and `workflows` now contain only reads**, so their `true`
+  expansion equals the session vocabulary by construction and no longer depends
+  on the `grant: "explicit"` mark. That tier is down from ten tools to four.
+
+*The original analysis follows, because the reasoning about intent is still
+accurate and the commits it cites are the history of the capability.*
+
+#### Original: designed off-by-default, with no way to turn them on
 
 `75eb94b2` (2026-07-09) and `c6f030da` (2026-07-09) added them. `75eb94b2`'s own
 body says: *"Ensured new tools are excluded from default persistent sessions
@@ -458,7 +488,17 @@ Ordered by value. Not started — none of this is implemented.
    survive a removal nobody wrote down. Pair the fix with a correction to
    `config/experts/developer/config.yaml:76` — the "former broad base" comment
    is `57430a2a`'s self-justification and should not be left reading as history.
-3. **Give the `*_bundle` tools a grant surface, or drop them.** They were shipped
+3. ~~**Give the `*_bundle` tools a grant surface, or drop them.**~~ **DONE
+   2026-08-03**, and neither of the two ways this item proposed — see §3c. They
+   got a grant surface *and* a category of their own
+   ([[agent_authored_catalog_entries]]), because the premise that they needed an
+   admin scope did not survive checking: the endpoints they call are already
+   owner-scoped. The interaction this item flags with
+   [[session_create_tool_toggles_cannot_enable_a_group]] item 2 is satisfied —
+   the category-list ⊆ allowlist assertion holds by construction now, since
+   `agent_catalog` and `workflows` contain only their vocabulary.
+
+   *Original text:* They were shipped
    as "explicit-grant"; no surface can express the grant. Either add an
    authoring group to `SESSION_TOOL_OVERRIDE_NAMES` (with its own capability
    grant — `set_expert_bundle` and `set_automation_bundle` are write tools on
@@ -488,14 +528,14 @@ Ordered by value. Not started — none of this is implemented.
 
 ## Verification owed
 
-- **The §3c residual path — still owed, and narrowed.** The live gates proved a
-  category-level `true` cannot reach the bundle writes
-  ([[tool_configuration_live_gates_2026-08-03]], gate A.3). They say nothing
-  about the *explicit* name: it has still not been shown that a hand-authored
-  expert with `tools.agent_catalog: [set_expert_bundle]` reaches `load_tools` and
-  executes. Create one on dev, attach a session, and read the bound tool names.
-  If it loads, item 3 is a live privilege-escalation surface for any expert
-  author, not just a dead-tool cleanup, and its priority goes up.
+- ~~**The §3c residual path.**~~ **CLOSED 2026-08-03, structurally.** The question
+  was whether a hand-authored `tools.agent_catalog: [set_expert_bundle]` reaches
+  `load_tools` — gate A.3 had only covered a category-level `true`. The rehoming
+  answered it by making the question moot: that name is now foreign to
+  `agent_catalog` and the boundary 400s, verified live at the real HTTP endpoint
+  ([[catalog_authoring_live_gate_2026-08-03]], check 5). The escalation surface
+  this entry was worried about does not exist; the capability it guarded is now
+  reachable only through `tools.catalog_authoring` plus a deny-by-default grant.
 - **Project-scoped experts.** `list_project_experts` reads expert configs from a
   project's Gitea repo, a layer distinct from both bundled YAML and the
   `experts` table. No project (of 53) was surveyed for a config granting any of

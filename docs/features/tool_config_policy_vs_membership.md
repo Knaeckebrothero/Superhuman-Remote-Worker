@@ -720,6 +720,22 @@ for automations. Six of these nine tools are in the ten-tool "unreachable by any
 route" set from [The overload](#the-overload-and-what-it-costs): nobody has ever
 audited them in a session context, because nothing could grant them.
 
+> **RESOLVED 2026-08-03 — and by mitigation 2, taken further than written.** The
+> nine tools were classified as this section demands, and the six `*_bundle`
+> writes went where it guessed they belonged: their own category. They now live in
+> `catalog_authoring` behind a deny-by-default capability grant
+> ([[agent_authored_catalog_entries]]), so `agent_catalog` and `workflows` contain
+> only reads and their `true` expansion equals the session vocabulary **by
+> construction** — the hazard below cannot occur, rather than being held off by a
+> mark. The table above is now historical: those categories are 5 and 7 tools,
+> matching their vocabularies exactly.
+>
+> One correction to this section's framing. It calls the `set_*_bundle` trio
+> catalogue writes wanting "their own admin-scoped category". Own category, yes;
+> admin-scoped, no — the endpoints they call are already owner-scoped, so the
+> capability shipped user-scoped and became a feature. Mitigation 3's temporary
+> "expand `true` to the curated set" divergence was never needed.
+
 **This is the single largest hazard in the design**, because it is exactly the
 failure mode the design is supposed to prevent, inverted: instead of a config
 silently losing tools, a config silently gains them. Three mitigations, and the
@@ -1236,6 +1252,8 @@ state is not evidence.** That is the whole lesson of this bug class.
 - **Moving the code floors into the layer model.** They stay in Python. This design
   documents where they sit and requires them to declare their gate; it does not
   relocate them.
-- **Rehoming the `*_bundle` tools** out of `agent_catalog` / `workflows`. Named as
-  the largest risk and required to be *decided* before any `true` reaches a closed
-  group, but the rehoming itself is its own change.
+- ~~**Rehoming the `*_bundle` tools** out of `agent_catalog` / `workflows`.~~
+  **DONE 2026-08-03** as its own change, as anticipated —
+  [[agent_authored_catalog_entries]]. It turned out to be the cheaper half of a
+  feature rather than pure risk-reduction, and it retired the `grant: "explicit"`
+  mark's load-bearing role for those two groups.
