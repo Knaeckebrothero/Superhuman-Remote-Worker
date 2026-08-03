@@ -454,14 +454,15 @@ describe('ToolsGroupComponent rendering', () => {
     const categories: Record<string, SessionToolCategory> = {};
     for (const key of [
       'research', 'browser_direct', 'citation', 'shell', 'communication', 'delegation',
-      'canvas', 'orchestrator', 'agent_catalog', 'workflows', 'knowledge', 'git',
+      'canvas', 'orchestrator', 'agent_catalog', 'workflows', 'catalog_authoring',
+      'knowledge', 'git',
       'workspace', 'core', 'session_task', 'product_help', 'evaluation', 'loop',
       'sql', 'mongodb', 'graph', 'webdav', 'email', 'repo', 'mcp', 'unclassified',
     ]) {
       categories[key] = cat({state: 'off'});
     }
     const fixture = mount({resolved: response({categories})});
-    expect(rows(fixture)).toHaveLength(26);
+    expect(rows(fixture)).toHaveLength(27);
     expect(text(fixture)).not.toContain('agentSettings.');
     expect(text(fixture)).not.toContain('grants.');
   });
@@ -489,6 +490,42 @@ describe('ToolsGroupComponent rendering', () => {
     expect(row.querySelector('input[type="checkbox"]')).toBeNull();
     expect(row.querySelector('.tool-toggle-reason')?.textContent).toBeTruthy();
     expect(row.querySelector('.tool-toggle-reason')?.textContent).not.toContain('grants.');
+  });
+
+  it('catalogue authoring reads as a WRITE capability, gated by its own grant', () => {
+    // The whole point of splitting these six out of `agent_catalog`: the label
+    // must say it writes, and the grant must gate it. If this row ever renders
+    // as a tickable box for an ungranted author, they author an expert the PDP
+    // refuses at save time — and the box was the promise that misled them.
+    const fixture = mount({
+      resolved: response({
+        categories: {
+          agent_catalog: cat({state: 'on', tools: ['list_experts']}),
+          catalog_authoring: cat({state: 'off'}),
+        },
+      }),
+      gatedCapabilities: {catalog_authoring: false},
+    });
+
+    const authoring = rowFor(fixture, 'Author Experts & Automations');
+    expect(authoring.classList.contains('unavailable')).toBe(true);
+    expect(authoring.querySelector('input[type="checkbox"]')).toBeNull();
+    expect(authoring.querySelector('.tool-toggle-reason')?.textContent).toBeTruthy();
+
+    // The read group next to it is untouched by the authoring grant.
+    const reads = rowFor(fixture, 'Experts & Skills');
+    expect(reads.classList.contains('unavailable')).toBe(false);
+    expect(text(fixture)).not.toContain('agentSettings.');
+  });
+
+  it('catalogue authoring is tickable once the grant is held', () => {
+    const fixture = mount({
+      resolved: response({categories: {catalog_authoring: cat({state: 'off'})}}),
+      gatedCapabilities: {catalog_authoring: true},
+    });
+    const row = rowFor(fixture, 'Author Experts & Automations');
+    expect(row.classList.contains('unavailable')).toBe(false);
+    expect(row.querySelector('input[type="checkbox"]')).not.toBeNull();
   });
 
   it('a grant-blocked category is never written, however the row is clicked', () => {

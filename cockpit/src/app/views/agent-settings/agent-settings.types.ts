@@ -35,8 +35,9 @@ export const SESSION_TOOL_CATEGORIES: ToolCategoryMeta[] = [
   ...JOB_TOOL_CATEGORIES,
   { key: 'canvas', label: 'Canvas', icon: 'dashboard_customize', description: 'Ability to present workspace files in the shared session Canvas' },
   { key: 'orchestrator', label: 'Fleet Management', icon: 'hub', description: 'Ability to inspect and steer SRW jobs, projects, repositories, and session workspace upgrades' },
-  { key: 'agent_catalog', label: 'Experts & Skills', icon: 'extension', description: 'Ability to manage experts and skills' },
+  { key: 'agent_catalog', label: 'Experts & Skills', icon: 'extension', description: 'Ability to look up experts and skills. Read-only — the row below is what creates them' },
   { key: 'workflows', label: 'Automations & Loops', icon: 'auto_mode', description: 'Ability to inspect automations and project loops, and draft disabled automations' },
+  { key: 'catalog_authoring', label: 'Author Experts & Automations', icon: 'edit_note', description: 'Ability to create and update your own experts, skills and automations on your behalf. New automations are created switched off for you to review' },
   { key: 'knowledge', label: 'Knowledge', icon: 'psychology', description: 'Ability to read and write to the project knowledge base' },
   { key: 'git', label: 'Git', icon: 'commit', description: 'Ability to inspect workspace version history' },
 ];
