@@ -1,4 +1,4 @@
-import {signal} from '@angular/core';
+import {Injector, runInInjectionContext, signal} from '@angular/core';
 import {TestBed} from '@angular/core/testing';
 import {Observable, Subject, of} from 'rxjs';
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest';
@@ -10,6 +10,7 @@ import type {
   SessionToolCategory,
   SessionToolGroupsResponse,
 } from '../../core/services/api.service';
+import {ToolsGroupComponent} from '../agent-settings/tools-group.component';
 import {SettingsPaneComponent} from './settings-pane.component';
 
 /** Build the resolved tool-groups answer the pane now reads. */
@@ -123,6 +124,157 @@ function createPane(options: {
   TestBed.tick(); // fire the load effect
   return {component, chat, api, fakeSettings};
 }
+
+/** `shell` bound to exactly the code-granted `srw_cloud_status` — the default
+ *  topology's shape once a cloud mount is active. `settable` is the only
+ *  thing that varies between the two real-world cases this file needs to
+ *  tell apart. */
+function lockedOnShellAnswer(settable: boolean): SessionToolGroupsResponse {
+  return {
+    thread_id: 'thread-1',
+    source: 'resolved',
+    origin: 'agent',
+    observed_at: '2026-08-03T10:00:00Z',
+    enumerate_only: {shell: ['run_command', 'shell_read']},
+    tool_groups: null,
+    categories: {
+      shell: {
+        state: 'on',
+        settable,
+        reason: settable
+          ? null
+          : 'the runtime binds srw_cloud_status here regardless of config (cloud_mount_manager.active)',
+        decided_by: settable ? 'base' : 'registry',
+        tools: ['srw_cloud_status'],
+      },
+    },
+  };
+}
+
+/**
+ * Same wiring as `createPane`, except `settings()` is backed by a REAL
+ * `ToolsGroupComponent` instead of a hand-mocked `getOverrides()`.
+ *
+ * The B2 fast-follow this exists to pin lives entirely in the interaction
+ * between the real `toolsFragment` call inside
+ * `ToolsGroupComponent.getOverrides()` and the real one inside
+ * `SettingsPaneComponent.applyChanges()` — a `getOverrides` that just returns
+ * a literal (as `createPane`'s `fakeSettings` does) cannot exercise either,
+ * so this is the one place in the file that needs the real control.
+ * `ToolsGroupComponent` injects nothing, so constructing it outside a
+ * template (no `TestBed.createComponent`) is the same trick
+ * live-mode.spec.ts's `createToolsGroup` uses, and for the same reason.
+ */
+function createPaneWithRealToolsGroup(toolGroups: SessionToolGroupsResponse) {
+  const chat = {
+    threadId: signal<string | null>('thread-1'),
+    isConnected: signal(true),
+    modelName: signal<string | null>(null),
+    temperature: signal<number | null>(null),
+    permissionMode: signal('supervised'),
+    narrationMode: signal('auto'),
+    workspaceTier: signal<string | null>(null),
+    workspaceUpgradeInProgress: signal<{tier: string; elapsed?: number} | null>(null),
+    updateConfig: vi.fn().mockReturnValue('req-1'),
+    setMode: vi.fn(),
+    setNarrationMode: vi.fn(),
+    upgradeWorkspace: vi.fn(),
+  };
+  const api = {
+    getPersistentThread: vi.fn().mockReturnValue(
+      of({metadata: {config_override: {}, datasource_ids: []}, project_ids: []}),
+    ),
+    getEligibleDatasources: vi.fn().mockReturnValue(of([])),
+    getSessionToolGroups: vi.fn().mockReturnValue(of(toolGroups)),
+  };
+  const capabilities = {grants: signal(null)};
+  const modelService = {load: vi.fn()};
+
+  TestBed.configureTestingModule({
+    providers: [
+      SettingsPaneComponent,
+      {provide: PersistentChatService, useValue: chat},
+      {provide: ApiService, useValue: api},
+      {provide: CapabilitiesService, useValue: capabilities},
+      {provide: ModelService, useValue: modelService},
+    ],
+  });
+  const component = TestBed.inject(SettingsPaneComponent);
+  Object.defineProperty(component, 'active', {value: () => true});
+
+  const toolsGroup = runInInjectionContext(Injector.create({providers: []}), () => new ToolsGroupComponent());
+  Object.defineProperty(toolsGroup, 'resolved', {value: () => toolGroups});
+
+  const settings = {
+    prefillFromConfig: (config: Record<string, unknown>) => toolsGroup.prefillFromConfig(config),
+    prefillFromResolvedToolset: (categories: Record<string, SessionToolCategory>) =>
+      toolsGroup.prefillFromResolved(categories),
+    hasToolEdits: () => toolsGroup.hasToolEdits(),
+    getOverrides: () => toolsGroup.getOverrides(),
+    getSelectedDatasourceIds: () => [] as string[],
+    resetDatasourceSelection: () => {},
+  };
+  Object.defineProperty(component, 'settings', {value: () => settings});
+  TestBed.tick(); // fire the load effect
+  return {component, chat, toolsGroup};
+}
+
+describe('SettingsPaneComponent locked-on categories (B2 fast-follow)', () => {
+  // The regression: a prior fix made compose_tool_view mark a category `on` +
+  // `settable: false` whenever every tool it bound is a per-tool code grant
+  // (default topology's `shell`, once a cloud mount adds `srw_cloud_status`).
+  // toolsFragment then skipped that key in BOTH directions, so the only
+  // sessions locked out of GAINING shell were the ones that did not have it
+  // yet. Off must stay refused (unticking a code-granted category is
+  // fiction — the runtime re-adds it); on must keep working (it is how the
+  // settable subset, run_command/shell_read, actually gets added).
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => {
+    vi.useRealTimers();
+    TestBed.resetTestingModule();
+  });
+
+  it('unsettable + turning off: nothing dispatched (the original defect stays fixed)', () => {
+    const {component, chat, toolsGroup} = createPaneWithRealToolsGroup(lockedOnShellAnswer(false));
+
+    toolsGroup.toggleCategory('shell'); // untick
+    component.onSettingsChange();
+    vi.runAllTimers();
+
+    expect(chat.updateConfig).not.toHaveBeenCalled();
+  });
+
+  it('unsettable + turning on: the enable is dispatched (the regression is closed)', () => {
+    const {component, chat, toolsGroup} = createPaneWithRealToolsGroup(lockedOnShellAnswer(false));
+
+    toolsGroup.toggleCategory('shell'); // untick
+    component.onSettingsChange();
+    vi.runAllTimers();
+    expect(chat.updateConfig).not.toHaveBeenCalled(); // the off leg stays silent
+
+    toolsGroup.toggleCategory('shell'); // re-tick
+    component.onSettingsChange();
+    vi.runAllTimers();
+
+    expect(chat.updateConfig).toHaveBeenCalledExactlyOnceWith({
+      tools: {shell: {only: ['run_command', 'shell_read']}},
+    });
+  });
+
+  it('control: the SAME sequence dispatches the off-write when the server marks it settable', () => {
+    // Sanity check on the harness, not the fix: with `settable: true` the
+    // untick DOES reach the wire — the pre-existing, correct behaviour this
+    // task must leave alone — so the silence in the first test above is the
+    // fix, not a mount that never dispatches anything.
+    const {component, chat, toolsGroup} = createPaneWithRealToolsGroup(lockedOnShellAnswer(true));
+
+    toolsGroup.toggleCategory('shell');
+    component.onSettingsChange();
+    vi.runAllTimers();
+
+    expect(chat.updateConfig).toHaveBeenCalledExactlyOnceWith({tools: {shell: []}});
+  });
+});
 
 describe('SettingsPaneComponent apply diff', () => {
   beforeEach(() => vi.useFakeTimers());

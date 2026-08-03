@@ -323,6 +323,73 @@ describe('toolsFragment', () => {
     ).toEqual({});
   });
 
+  it('`lockedOn` is per-key: an ON attempt on a category it does not name stays refused', () => {
+    // Both categories are unsettable, baseline OFF, and the caller wants both
+    // ON — but only `shell` is in `lockedOn`. `sql` must stay blocked even
+    // though the exact same shape of write succeeds for `shell` right next to
+    // it, proving this is a per-key lookup and not a switch that, once one
+    // category qualifies, opens the on-direction for every unsettable key.
+    expect(
+      toolsFragment(['shell', 'sql'], {
+        ...base,
+        unsettable: new Set(['shell', 'sql']),
+        lockedOn: new Set(['shell']),
+      }),
+    ).toEqual({shell: {only: ['run_command', 'shell_read']}});
+  });
+
+  it('B2 fast-follow: `lockedOn` drops the special-casing entirely — both directions run the ordinary diff', () => {
+    // The regression this fixes: B2 made `settable: false` symmetric in
+    // toolsFragment, so a category the agent holds via a per-tool code grant
+    // (state 'on') could no longer be turned on either — the only sessions
+    // locked out of GAINING shell were the ones that did not have it yet.
+    //
+    // This function does NOT itself refuse the off-direction for a `lockedOn`
+    // key — it has no notion of "reaches the wire" versus "local bookkeeping",
+    // and the mechanism needs the off-attempt to register SOMEWHERE so a
+    // later re-tick can be seen as a change (see the function doc and
+    // settings-pane.component.ts::applyChanges, which is the caller that
+    // actually enforces "never dispatch the off-write" by stripping it after
+    // calling this). Pinned here as the ordinary diff it now is.
+    const lockedOn = new Set(['shell']);
+
+    // Baseline on, still on: no local change -> nothing, same as any settable
+    // category.
+    expect(
+      toolsFragment(['shell'], {
+        ...base,
+        baselineOn: new Set(['shell']),
+        unsettable: new Set(['shell']),
+        lockedOn,
+      }),
+    ).toEqual({});
+
+    // Baseline on, user disables it: `lockedOn` lets this emit — the empty
+    // list is real LOCAL tracking, not yet a promise to the server.
+    expect(
+      toolsFragment(['shell'], {
+        ...base,
+        baselineOn: new Set(['shell']),
+        disabled: new Set(['shell']),
+        unsettable: new Set(['shell']),
+        lockedOn,
+      }),
+    ).toEqual({shell: []});
+
+    // Baseline OFF (e.g. the caller's own bookkeeping moved it there — see
+    // settings-pane.component.ts's `previous`), user wants it on: ON is a real
+    // write, because this is how the config-grantable subset actually gets
+    // added alongside the code-granted tools.
+    expect(
+      toolsFragment(['shell'], {
+        ...base,
+        baselineOn: new Set(),
+        unsettable: new Set(['shell']),
+        lockedOn,
+      }),
+    ).toEqual({shell: {only: ['run_command', 'shell_read']}});
+  });
+
   it('a category that cannot be enabled emits nothing rather than a doomed request', () => {
     expect(toolsFragment(['sql'], {...base, enumerateOnly: {sql: []}})).toEqual({});
   });

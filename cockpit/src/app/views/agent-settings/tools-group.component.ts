@@ -552,6 +552,19 @@ export class ToolsGroupComponent {
     () => new Set(this.rows().filter((row) => !this.isRowSettable(row)).map((row) => row.key)),
   );
 
+  /** The subset of `unsettableKeys` the agent is actively HOLDING — read off
+   *  the untouched server entry (`state`), never off a row's post-toggle
+   *  computed state, which for a client-gated-but-server-settable row would
+   *  read back whatever the user just clicked. Passed to `toolsFragment` as
+   *  `lockedOn`: unticking one of these is still refused (the runtime
+   *  re-appends the code-granted names regardless), but ticking one is a real
+   *  write — see resolved-toolset.ts::toolsFragment. */
+  private readonly lockedOnKeys = computed<Set<string>>(() => {
+    const categories = this.serverCategories();
+    if (!categories) return new Set();
+    return new Set([...this.unsettableKeys()].filter((key) => categories[key]?.state === 'on'));
+  });
+
   /** True when the user may flip this row: the server allows it AND the
    *  client-side grant gate does not grey it. */
   isRowSettable(row: ResolvedToolRow): boolean {
@@ -706,6 +719,7 @@ export class ToolsGroupComponent {
         rows.map((row) => row.key).filter((key) => !this.expertDisabledCategories().has(key)),
       ),
       unsettable: this.unsettableKeys(),
+      lockedOn: this.lockedOnKeys(),
       enumerateOnly: this.resolved()?.enumerate_only ?? this.enumerateOnly(),
     });
 

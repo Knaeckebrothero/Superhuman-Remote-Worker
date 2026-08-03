@@ -474,19 +474,43 @@ export class SettingsPaneComponent {
             const unsettable = new Set(
                 Object.keys(categories).filter((key) => categories[key].settable === false),
             );
-            Object.assign(
-                tools,
-                toolsFragment(Object.keys(categories), {
-                    disabled: new Set(
-                        Object.keys(categories).filter((key) => !desired[`tools.${key}`]),
-                    ),
-                    baselineOn: new Set(
-                        Object.keys(categories).filter((key) => !!previous[`tools.${key}`]),
-                    ),
-                    unsettable,
-                    enumerateOnly: this.resolvedToolset()?.enumerate_only ?? null,
-                }),
+            // The subset of `unsettable` the agent already holds (per-tool code
+            // grant, `state: 'on'` on the untouched server answer — never the
+            // live `desired`/`previous` booleans, which is what makes this
+            // stable while the category is toggled back and forth below).
+            // `toolsFragment` drops its special-casing entirely for these keys
+            // — it has no notion of "reaches the wire" versus "local
+            // bookkeeping" — so the stripping pass just after is what actually
+            // keeps the OFF half a promise this pane never makes to the server.
+            const lockedOn = new Set(
+                Object.keys(categories).filter(
+                    (key) => categories[key].settable === false && categories[key].state === 'on',
+                ),
             );
+            const builtTools = toolsFragment(Object.keys(categories), {
+                disabled: new Set(
+                    Object.keys(categories).filter((key) => !desired[`tools.${key}`]),
+                ),
+                baselineOn: new Set(
+                    Object.keys(categories).filter((key) => !!previous[`tools.${key}`]),
+                ),
+                unsettable,
+                lockedOn,
+                enumerateOnly: this.resolvedToolset()?.enumerate_only ?? null,
+            });
+            // A locked-on category's untick is real LOCALLY (it is what lets a
+            // later re-tick read as a change against the constant server-on
+            // fallback in `desired` — see ToolsGroupComponent.getOverrides(),
+            // which needs the same off-write to move ITS OWN tracking) but must
+            // never reach the wire: the runtime re-appends the code-granted
+            // names regardless, so "turn this off" is not a request the server
+            // was ever asked to honour. Strip it here, at the one place that
+            // actually dispatches.
+            for (const key of lockedOn) {
+                const value = builtTools[key];
+                if (Array.isArray(value) && value.length === 0) delete builtTools[key];
+            }
+            Object.assign(tools, builtTools);
         }
         if (Object.keys(llm).length) fragment['llm'] = llm;
         if (Object.keys(tools).length) fragment['tools'] = tools;
