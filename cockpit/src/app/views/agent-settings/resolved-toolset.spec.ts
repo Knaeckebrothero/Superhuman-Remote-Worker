@@ -133,8 +133,9 @@ describe('orderedCategoryKeys', () => {
 
 describe('resolvedToolRows', () => {
   it('SHARP EDGE 3: read `settable`, do not infer it from `state`', () => {
-    // A category can be `on` and unsettable (runtime-granted), and `off` is a
-    // promise the server only makes when it can keep it.
+    // The two are orthogonal, in both directions: a category can be `on` and
+    // unsettable (runtime-granted), and `off` is a promise the server only
+    // makes when it can keep it. Neither may be reconstructed from the other.
     const rows = resolvedToolRows(
       {
         product_help: cat({state: 'on', settable: false, reason: 'granted by the runtime', tools: ['read_product_guide']}),
@@ -145,17 +146,48 @@ describe('resolvedToolRows', () => {
     );
     const byKey = Object.fromEntries(rows.map((r) => [r.key, r]));
     expect(byKey['product_help'].settable).toBe(false);
-    expect(byKey['product_help'].state).toBe('unavailable');
+    expect(byKey['product_help'].state).toBe('on');
     expect(byKey['knowledge'].settable).toBe(false);
+    expect(byKey['knowledge'].state).toBe('unavailable');
   });
 
-  it('SHARP EDGE 4: a reason on an `on` row is carried, and the row stays on-ish', () => {
+  it('SHARP EDGE 4: a bound-but-locked category stays ON, reason and all', () => {
+    // The regression this replaces: `state` was derived from `settable` first,
+    // so `on` + `settable: false` rendered as `unavailable` — a block glyph
+    // over tools the agent is actively holding, with the "you cannot change
+    // this" sentence recoloured into "this is off". `product_help` and
+    // `session_task` are unconditional persistent-session floors, so this hit
+    // EVERY session, and every connector category joins them the moment a
+    // datasource is attached.
     const [row] = resolvedToolRows(
-      {product_help: cat({state: 'on', settable: false, reason: 'granted by the runtime, not by config'})},
+      {
+        product_help: cat({
+          state: 'on',
+          settable: false,
+          reason: 'granted by the runtime, not by config',
+          tools: ['read_product_guide'],
+        }),
+      },
       ALL_TOOL_CATEGORIES,
       new Set(),
     );
+    expect(row.state).toBe('on');
+    expect(row.settable).toBe(false);
     expect(row.reason).toBe('granted by the runtime, not by config');
+  });
+
+  it('a locked row keeps the server state even when the user set is empty', () => {
+    const rows = resolvedToolRows(
+      {
+        session_task: cat({state: 'on', settable: false, reason: 'runtime', tools: ['task_add']}),
+        knowledge: cat({state: 'unavailable', settable: false, reason: 'bound none'}),
+      },
+      ALL_TOOL_CATEGORIES,
+      new Set(['session_task', 'knowledge']),
+    );
+    const byKey = Object.fromEntries(rows.map((r) => [r.key, r.state]));
+    expect(byKey['session_task']).toBe('on');
+    expect(byKey['knowledge']).toBe('unavailable');
   });
 
   it('a user switch flips a settable row, and the row stops being pristine', () => {

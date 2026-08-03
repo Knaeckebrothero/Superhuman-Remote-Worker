@@ -6,6 +6,7 @@ import pytest
 
 import orchestrator.main as orchestrator_main
 from orchestrator.main import _load_expert_detail
+from src.core.tool_policy import enumerate_only_members
 
 
 @pytest.mark.asyncio
@@ -68,6 +69,41 @@ async def test_db_expert_detail_includes_settings_matrix_and_no_defaults_tools(
 
     assert "defaults_tools" not in detail
     assert "gpt-5.6" in detail["settings_matrix"]
+    # What replaced it, and it is a different kind of thing: not a copy of a
+    # config layer, but the registry's answer to "what must a caller write to
+    # turn this category on" for the one category that refuses `true`.
+    assert detail["enumerate_only"] == enumerate_only_members()
+
+
+@pytest.mark.asyncio
+async def test_bundled_expert_detail_serves_the_write_vocabulary_too():
+    """Job create and the expert editor read this route and never the preview.
+
+    They perform no resolved toolset read — the preview route resolves with
+    ``expert_type="session"`` and would model the wrong thing for a worker — so
+    without ``enumerate_only`` here, ticking Shell in either form emits
+    ``tools.shell: true`` and gets a 400 naming a rule the form gives the user
+    no way to satisfy. ``enumerate_only_members()`` is registry-derived and
+    entirely independent of expert type, so serving it costs nothing and is
+    correct on both.
+    """
+    detail = await _load_expert_detail("worker_base")
+
+    assert detail["enumerate_only"] == enumerate_only_members()
+    assert detail["enumerate_only"]["shell"]
+
+
+@pytest.mark.asyncio
+async def test_the_served_vocabulary_is_what_the_write_boundary_accepts():
+    """The round trip the forms actually perform."""
+    from src.core.tool_policy import validate_tool_override_fragment
+
+    detail = await _load_expert_detail("worker_base")
+    for category, names in detail["enumerate_only"].items():
+        accepted = validate_tool_override_fragment(
+            {"tools": {category: {"only": names}}}
+        )
+        assert accepted[category] == names
 
 
 class TestAccountDefaultsLayer:

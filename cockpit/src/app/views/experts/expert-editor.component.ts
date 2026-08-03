@@ -288,6 +288,7 @@ interface EditorForm {
           [config]="baseForGroups()"
           [mode]="mode()"
           [disabled]="false"
+          [enumerateOnly]="enumerateOnly()"
           [gatedCapabilities]="gatedCapabilities()"
         />
       </section>
@@ -440,6 +441,10 @@ export class ExpertEditorComponent implements OnInit {
   // of being an opaque "default".
   frameworkEffectiveModels = signal<EffectiveModels | null>(null);
   settingsMatrix = signal<Record<string, Record<string, unknown>>>({});
+  /** Write vocabulary for categories that refuse `true` (`shell`). Served on
+   *  every expert detail; without it the Shell tick writes an expert fragment
+   *  the loader refuses. */
+  enumerateOnly = signal<Record<string, string[]> | null>(null);
   /** The expert's stored config fragment (the save baseline). {} on create. */
   rawFragment = signal<Record<string, unknown>>({});
   private prefillDone = false;
@@ -618,6 +623,7 @@ export class ExpertEditorComponent implements OnInit {
       if (this.expertType() !== expertType) return;
       this.frameworkDefaults.set((d?.config as Record<string, unknown>) ?? {});
       this.settingsMatrix.set(d?.settings_matrix ?? {});
+      this.enumerateOnly.set(d?.enumerate_only ?? null);
       this.frameworkEffectiveModels.set(d?.effective_models ?? null);
     });
   }

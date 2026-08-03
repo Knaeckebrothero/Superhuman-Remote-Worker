@@ -79,15 +79,17 @@ export function disabledToolCategoriesFromConfig(
           [disabled]="disabled() || selectableCategories().length === 0"
         >{{ (allSelected() ? 'agentSettings.common.deselectAll' : 'agentSettings.common.selectAll') | transloco }}</button>
       </div>
-      <div class="toolset-provenance" [attr.data-trust]="provenance().trust">
-        <app-icon size="xs">{{ provenanceIcon() }}</app-icon>
-        <span class="provenance-headline">
-          {{ 'agentSettings.tools.provenance.' + provenance().trust | transloco }}
-        </span>
-        @if (provenance().detail; as detail) {
-          <span class="provenance-detail">{{ detail }}</span>
-        }
-      </div>
+      @if (showsProvenance()) {
+        <div class="toolset-provenance" [attr.data-trust]="provenance().trust">
+          <app-icon size="xs">{{ provenanceIcon() }}</app-icon>
+          <span class="provenance-headline">
+            {{ 'agentSettings.tools.provenance.' + provenance().trust | transloco }}
+          </span>
+          @if (provenance().detail; as detail) {
+            <span class="provenance-detail">{{ detail }}</span>
+          }
+        </div>
+      }
 
       <div class="tool-toggles">
         @for (row of rows(); track row.key) {
@@ -105,19 +107,23 @@ export function disabledToolCategoriesFromConfig(
                 type="checkbox"
                 [checked]="rowState(row) === 'on'"
                 (change)="toggleCategory(row.key)"
-                [disabled]="disabled()"
+                [disabled]="disabled() || isRowLocked(row)"
               >
             }
             <app-icon size="md" class="tool-toggle-icon">{{ row.meta?.icon ?? 'category' }}</app-icon>
             <span class="tool-toggle-info">
-              <span class="tool-toggle-name">@if (row.meta) {{{ 'agentSettings.toolCategories.' + row.key + '.label' | transloco }}} @else {{{ humanize(row.key) }}}@if (isCategoryBlocked(row.key)) { <span class="tool-lock">🔒</span> }@if (row.toolCount) { <span class="tool-count">{{ (measured() ? 'agentSettings.tools.countBound' : 'agentSettings.tools.countPredicted') | transloco:{ n: row.toolCount } }}</span> }</span>
+              <span class="tool-toggle-name">@if (row.meta) {{{ 'agentSettings.toolCategories.' + row.key + '.label' | transloco }}} @else {{{ humanize(row.key) }}}@if (isRowLocked(row)) { <span class="tool-lock">🔒</span> }@if (row.toolCount) { <span class="tool-count">{{ (measured() ? 'agentSettings.tools.countBound' : 'agentSettings.tools.countPredicted') | transloco:{ n: row.toolCount } }}</span> }</span>
               @if (row.meta) {
                 <span class="tool-toggle-desc">{{ 'agentSettings.toolCategories.' + row.key + '.description' | transloco }}</span>
               } @else {
                 <span class="tool-toggle-desc">{{ 'agentSettings.tools.unknownCategory' | transloco }}</span>
               }
               @if (row.reason) {
-                <span class="tool-toggle-reason">{{ row.reason }}</span>
+                <!-- On an ON row the sentence explains "you cannot change
+                     this", not "this is off". Rendering it in the warning
+                     colour would say the second thing. -->
+                <span [class]="rowState(row) === 'on' ? 'tool-toggle-note' : 'tool-toggle-reason'"
+                >{{ row.reason }}</span>
               } @else if (isCategoryBlocked(row.key)) {
                 <span class="tool-toggle-reason">{{ 'grants.lockedShort' | transloco }}</span>
               }
@@ -266,6 +272,11 @@ export function disabledToolCategoriesFromConfig(
       line-height: 1.4;
       color: var(--warning, var(--text-muted));
     }
+    .tool-toggle-note {
+      font-size: 11px;
+      line-height: 1.4;
+      color: var(--text-muted);
+    }
     .tool-count {
       margin-left: 6px;
       font-size: 10px;
@@ -366,6 +377,24 @@ export class ToolsGroupComponent {
    * On a real session those three moved 28 names.
    */
   resolved = input<SessionToolGroupsResponse | null>(null);
+  /**
+   * True when the HOST performs a resolved read at all.
+   *
+   * Distinguishes "the read failed" from "nobody asked". Surfaces with no read
+   * wired (job create, the expert editor) would otherwise fly a permanent
+   * "the resolved toolset could not be read" banner reporting the failure of a
+   * request that was never made.
+   */
+  readsResolvedToolset = input(false);
+  /**
+   * The write vocabulary for categories that refuse `tools.<c>: true`, for
+   * hosts that have it without a resolved read (`enumerate_only` on the expert
+   * detail). A resolved answer carries its own and wins.
+   *
+   * Without it, ticking `shell` emits `true` and the boundary 400s naming a
+   * rule the form gives the user no way to satisfy.
+   */
+  enumerateOnly = input<Record<string, string[]> | null>(null);
   /** Author's resolved capability grants for editor greying; null ⇒ no gating
    *  (launch flow / admin). Maps tool categories → catalog keys. */
   gatedCapabilities = input<Record<string, unknown> | null>(null);
@@ -439,6 +468,18 @@ export class ToolsGroupComponent {
    *  currently deployed fleet image). Never inferred from `observed_at`. */
   readonly measured = computed(() => isMeasured(this.provenance().trust));
 
+  /**
+   * Whether to say anything about provenance at all.
+   *
+   * Always when there IS an answer — a surface must never render a measurement
+   * or a forecast unlabelled. Otherwise only when the host claims to have
+   * asked, so "could not be read" reports a real failure rather than the
+   * absence of a request.
+   */
+  readonly showsProvenance = computed(
+    () => this.serverCategories() !== null || this.readsResolvedToolset(),
+  );
+
   readonly provenanceIcon = computed(() => {
     switch (this.provenance().trust) {
       case 'measured': return 'sensors';
@@ -469,7 +510,19 @@ export class ToolsGroupComponent {
     if (categories) {
       return resolvedToolRows(categories, this.categoryMeta(), disabled);
     }
-    // No answer: the static list, two states, exactly as before.
+    // Live mode with no answer renders NOTHING, and the banner says why.
+    //
+    // The static fallback is only honest where a config supplies the baseline,
+    // which is what `prefillFromConfig` gives the creation forms. The live
+    // pane has no such config — a stock session's `config_override` carries no
+    // `tools` key at all — so the fallback rendered twelve categories all
+    // TICKED, six of which ship `[]` in session_base, and every switch was
+    // dead because the pane's dispatch is keyed off the resolved answer. Six
+    // false assertions and twelve dead toggles is this task's own pair of
+    // headline defects, rebuilt on the degraded path. An empty section under
+    // an explicit "could not be read" asserts nothing.
+    if (this.mode() === 'live') return [];
+    // Creation forms: the static list, two states, baseline from the config.
     return this.categoryMeta().map((meta) => ({
       key: meta.key,
       meta,
@@ -513,9 +566,21 @@ export class ToolsGroupComponent {
    * OPEN on error, so it must stay a belt. A category it blocks is
    * *unavailable*: the third state exists precisely so a control does not have
    * to pretend that "you lack the grant" is an unticked box.
+   *
+   * **`on` survives a lock, from either gate.** A category the agent is
+   * holding is on, and no gate makes that untrue — it only makes it
+   * unchangeable. Drawing a block glyph over bound tools was the same class of
+   * lie as the checkbox this control replaces, pointed the other way.
    */
   rowState(row: ResolvedToolRow): 'on' | 'off' | 'unavailable' {
+    if (row.state === 'on') return 'on';
     return this.isRowSettable(row) ? row.state : 'unavailable';
+  }
+
+  /** True when the row cannot be changed — server or client gate. Orthogonal
+   *  to its state: a locked row can be on, off or unavailable. */
+  isRowLocked(row: ResolvedToolRow): boolean {
+    return !this.isRowSettable(row);
   }
 
   humanize(key: string): string {
@@ -641,7 +706,7 @@ export class ToolsGroupComponent {
         rows.map((row) => row.key).filter((key) => !this.expertDisabledCategories().has(key)),
       ),
       unsettable: this.unsettableKeys(),
-      enumerateOnly: this.resolved()?.enumerate_only ?? null,
+      enumerateOnly: this.resolved()?.enumerate_only ?? this.enumerateOnly(),
     });
 
     const result: Record<string, unknown> = {};

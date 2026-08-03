@@ -52,6 +52,8 @@ function mount(options: {
   mode?: string;
   resolved?: SessionToolGroupsResponse | null;
   gatedCapabilities?: Record<string, unknown> | null;
+  readsResolvedToolset?: boolean;
+  enumerateOnly?: Record<string, string[]> | null;
 } = {}) {
   TestBed.configureTestingModule({
     imports: [
@@ -68,6 +70,12 @@ function mount(options: {
   Object.defineProperty(instance, 'resolved', {value: () => options.resolved ?? null});
   Object.defineProperty(instance, 'gatedCapabilities', {
     value: () => options.gatedCapabilities ?? null,
+  });
+  Object.defineProperty(instance, 'readsResolvedToolset', {
+    value: () => options.readsResolvedToolset ?? true,
+  });
+  Object.defineProperty(instance, 'enumerateOnly', {
+    value: () => options.enumerateOnly ?? null,
   });
   fixture.detectChanges();
   return fixture;
@@ -208,12 +216,118 @@ describe('ToolsGroupComponent rendering', () => {
     expect(rowFor(fixture, 'Canvas').textContent).toContain('2 bound');
   });
 
-  it('no answer at all is labelled as such, and the static list still renders', () => {
-    const fixture = mount({resolved: null});
+  it('a creation form with no answer still renders its static list, labelled', () => {
+    // The creation forms get their baseline from `prefillFromConfig`, so the
+    // static fallback is as honest there as it ever was.
+    const fixture = mount({mode: 'session', resolved: null});
     const banner = (fixture.nativeElement as HTMLElement).querySelector('.toolset-provenance');
     expect(banner?.getAttribute('data-trust')).toBe('unknown');
     expect(banner?.textContent).toContain('The resolved toolset could not be read');
     expect(rows(fixture).length).toBeGreaterThan(0);
+  });
+
+  it('the LIVE pane with no answer renders no rows at all — not twelve ticked ones', () => {
+    // The degraded live path: an older orchestrator 404s, the network fails,
+    // or the 8s deadline trips on a read that probes an agent pod. The live
+    // pane has no config to fall back on — a stock session's config_override
+    // has no `tools` key — so the static list rendered twelve categories ALL
+    // TICKED, six of which ship `[]` in session_base, and every switch was
+    // dead because the pane's dispatch is keyed off the resolved answer.
+    // Six false assertions and twelve dead toggles: this task's own two
+    // headline defects, on the fallback path.
+    const fixture = mount({mode: 'live', resolved: null});
+    expect(rows(fixture)).toHaveLength(0);
+    expect(
+      (fixture.nativeElement as HTMLElement).querySelectorAll('input[type="checkbox"]'),
+    ).toHaveLength(0);
+    const banner = (fixture.nativeElement as HTMLElement).querySelector('.toolset-provenance');
+    expect(banner?.textContent).toContain('The resolved toolset could not be read');
+  });
+
+  it('a bound-but-locked category renders CHECKED and locked, never blocked', () => {
+    // `product_help` and `session_task` are unconditional persistent-session
+    // floors, so every single session has two of these. Drawing a block glyph
+    // over tools the agent is actively holding is the same class of lie as the
+    // checkbox this control replaces, pointed the other way — and it recolours
+    // the "you cannot change this" sentence into "this is off".
+    const fixture = mount({
+      resolved: response({
+        categories: {
+          product_help: cat({
+            state: 'on',
+            settable: false,
+            reason: 'granted by the runtime, not by config (persistent-session floor)',
+            tools: ['read_product_guide', 'get_product_capabilities'],
+          }),
+        },
+      }),
+    });
+    const row = rowFor(fixture, 'Product Help');
+    expect(row.querySelector('.tool-state-blocked')).toBeNull();
+    const box = row.querySelector('input[type="checkbox"]') as HTMLInputElement;
+    expect(box).not.toBeNull();
+    expect(box.checked).toBe(true);
+    expect(box.disabled).toBe(true);
+    expect(row.classList.contains('unavailable')).toBe(false);
+    expect(row.querySelector('.tool-lock')).not.toBeNull();
+    expect(row.textContent).toContain('2 bound');
+    // The sentence is a NOTE, not a denial — different element, muted colour.
+    expect(row.querySelector('.tool-toggle-note')?.textContent).toContain(
+      'granted by the runtime',
+    );
+    expect(row.querySelector('.tool-toggle-reason')).toBeNull();
+  });
+
+  it('a locked-and-empty category still renders blocked, with the reason', () => {
+    const fixture = mount({
+      resolved: response({
+        categories: {
+          knowledge: cat({
+            state: 'unavailable',
+            settable: false,
+            reason: 'the merged config grants 10 tool(s) here and the agent bound none',
+          }),
+        },
+      }),
+    });
+    const row = rowFor(fixture, 'Knowledge');
+    expect(row.querySelector('input[type="checkbox"]')).toBeNull();
+    expect(row.querySelector('.tool-state-blocked')).not.toBeNull();
+    expect(row.querySelector('.tool-toggle-reason')?.textContent).toContain('bound none');
+  });
+
+  it('a surface that performs no read flies no banner at all', () => {
+    // Job create and the expert editor wire no resolved read. An unconditional
+    // banner made both permanently report the failure of a request nobody
+    // made: "The resolved toolset could not be read".
+    const fixture = mount({mode: 'job', resolved: null, readsResolvedToolset: false});
+    expect((fixture.nativeElement as HTMLElement).querySelector('.toolset-provenance')).toBeNull();
+    expect(rows(fixture).length).toBeGreaterThan(0);
+  });
+
+  it('a host-supplied enumeration makes shell tickable without a resolved read', () => {
+    // Otherwise the tick emits `true` and the boundary 400s naming a rule the
+    // form gives the user no way to satisfy.
+    const fixture = mount({
+      mode: 'job',
+      resolved: null,
+      readsResolvedToolset: false,
+      enumerateOnly: {shell: ['cancel_command', 'run_command']},
+    });
+    const instance = fixture.componentInstance;
+    instance.prefillFromConfig({tools: {shell: []}});
+    fixture.detectChanges();
+
+    const box = rowFor(fixture, 'Shell').querySelector(
+      'input[type="checkbox"]',
+    ) as HTMLInputElement;
+    expect(box.checked).toBe(false);
+    box.click();
+    fixture.detectChanges();
+
+    expect(instance.getOverrides()).toEqual({
+      tools: {shell: {only: ['cancel_command', 'run_command']}},
+    });
   });
 
   it('no rendered string is an unresolved transloco key', () => {

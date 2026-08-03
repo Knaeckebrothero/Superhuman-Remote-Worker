@@ -96,8 +96,21 @@ describe('ToolsGroupComponent live mode', () => {
     ]);
   });
 
-  it('with no answer it falls back to the mode list, exactly as before', () => {
+  it('with no answer the live pane renders NOTHING, and asserts nothing', () => {
+    // Not "the static list, as before". The live pane has no config to derive
+    // a baseline from — a stock session's config_override carries no `tools`
+    // key — so the static list came out twelve categories ALL TICKED, six of
+    // which ship `[]` in session_base, with every switch dead because the
+    // pane's dispatch is keyed off the resolved answer. An empty section under
+    // an explicit "could not be read" banner is the only honest fallback here.
     const component = createToolsGroup('live');
+    expect(component.rows()).toEqual([]);
+  });
+
+  it('a CREATION surface with no answer does still fall back to its list', () => {
+    // There the baseline comes from prefillFromConfig, so the static list is
+    // as honest as it ever was and the form stays usable.
+    const component = createToolsGroup('session');
     expect(component.rows().map((r) => r.key)).toEqual(
       SESSION_TOOL_CATEGORIES.map((c) => c.key),
     );
