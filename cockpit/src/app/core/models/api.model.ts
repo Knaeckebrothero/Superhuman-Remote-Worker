@@ -115,6 +115,13 @@ export interface EffectiveModels {
 export interface ExpertDetail extends Expert {
   config: Record<string, unknown>;
   instructions: string | null;
+  /**
+   * Categories that refuse `tools.<c>: true` at the write boundary, mapped to
+   * the enumeration to send instead. Registry-derived, served rather than
+   * mirrored — it is what lets a form with no resolved read offer "shell on"
+   * instead of emitting a request the boundary rejects.
+   */
+  enumerate_only?: Record<string, string[]>;
   /** Raw settings_matrix.yaml for client-side model-family resolution. */
   settings_matrix?: Record<string, Record<string, unknown>>;
   /** Effective model + provenance per slot (server-resolved). */

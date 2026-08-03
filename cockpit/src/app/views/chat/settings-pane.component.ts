@@ -78,6 +78,7 @@ const APPLY_DEBOUNCE_MS = 400;
             mode="live"
             [config]="liveConfig()"
             [resolvedToolset]="resolvedToolset()"
+            [readsResolvedToolset]="true"
             [disabled]="!chat.isConnected()"
             [gatedCapabilities]="capabilities.grants() ?? null"
             [datasources]="pickerDatasources()"

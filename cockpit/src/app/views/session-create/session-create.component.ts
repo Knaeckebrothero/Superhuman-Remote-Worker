@@ -170,6 +170,7 @@ interface ExpertDetail extends Expert {
           mode="session"
           [config]="expertDetail()?.config ?? frameworkDefaults() ?? {}"
           [resolvedToolset]="toolPreview()"
+          [readsResolvedToolset]="true"
           [disabled]="creating()"
           [settingsMatrix]="expertDetail()?.settings_matrix ?? frameworkSettingsMatrix()"
           [effectiveModels]="resolvedEffectiveModels()"
