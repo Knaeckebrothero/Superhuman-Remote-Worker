@@ -45,6 +45,7 @@ from src.core.tool_policy import (
     ToolPolicyError,
     assert_tool_policy_canonical,
     config_tool_categories,
+    enumerate_only_members,
     expand_category_true,
     expand_tool_policy,
     normalize_tool_policy,
@@ -773,3 +774,53 @@ class TestSessionToolGroupMarkers:
         merged: dict = {_CANVAS_DISABLED_KEY: True}
         _apply_session_tool_group_markers(merged, override)
         assert _CANVAS_DISABLED_KEY not in merged
+
+
+class TestEnumerateOnlyMembersAreServable:
+    """The enumeration a UI needs in order to turn an enumerate-only category ON.
+
+    ``ENUMERATE_ONLY_CATEGORIES`` refuses ``true`` so a tool added to a
+    code-execution category cannot land in live configs with no diff. Correct —
+    and it leaves a client unable to *ask* for the category at all unless
+    something hands it the names. Serving them from the registry is what keeps
+    that from becoming a hand-maintained tool-name list in the cockpit, which
+    is the species of defect this whole change is removing.
+    """
+
+    def test_it_covers_exactly_the_categories_that_refuse_true(self):
+        assert set(enumerate_only_members()) == set(ENUMERATE_ONLY_CATEGORIES)
+
+    def test_every_served_enumeration_round_trips_through_the_write_boundary(self):
+        """The payload it prescribes must be one the boundary accepts."""
+        from src.core.tool_policy import validate_tool_override_fragment
+
+        for category, names in enumerate_only_members().items():
+            assert names, f"{category} would be unenablable"
+            accepted = validate_tool_override_fragment(
+                {"tools": {category: {"only": names}}}
+            )
+            assert accepted[category] == names
+
+    def test_true_is_still_refused_for_the_same_categories(self):
+        """The served list is a workaround for the rule, not a repeal of it."""
+        from src.core.tool_policy import validate_tool_override_fragment
+
+        for category in enumerate_only_members():
+            with pytest.raises(ToolPolicyError, match="must enumerate"):
+                validate_tool_override_fragment({"tools": {category: True}})
+
+    def test_it_names_no_code_granted_tool(self):
+        """`only` carrying a code-granted name would assert config manages it."""
+        from src.tools.registry import TOOL_REGISTRY
+
+        for names in enumerate_only_members().values():
+            for name in names:
+                assert "grant" not in TOOL_REGISTRY[name], name
+
+    def test_shell_is_the_current_membership(self):
+        assert enumerate_only_members()["shell"] == [
+            "cancel_command",
+            "run_command",
+            "shell_execute",
+            "shell_read",
+        ]

@@ -595,8 +595,16 @@ def _format_expert_detail(expert_id: str, detail: Dict[str, Any]) -> str:
 
     tools = config.get("tools") if isinstance(config.get("tools"), dict) else {}
     if tools:
+        # The STORED row, not a resolved config — normalisation never runs on
+        # this path, so every policy spelling arrives verbatim. `disabled` used
+        # to test `value == []`, which is False for `False` (and for `{}`), so
+        # an expert authored with `tools.shell: false` appeared in NEITHER
+        # line: the agent reading this detail was told nothing at all about a
+        # category the author had deliberately turned off. Falsy-vs-truthy is
+        # the same partition `expand_tool_policy` applies (`false`/`[]`/`{}`
+        # are all spellings of off), and it makes the two lines exhaustive.
         enabled = sorted(k for k, value in tools.items() if value)
-        disabled = sorted(k for k, value in tools.items() if value == [])
+        disabled = sorted(k for k, value in tools.items() if not value)
         if enabled:
             lines.append(f"Enabled tool categories: {', '.join(enabled)}")
         if disabled:
