@@ -36,6 +36,16 @@ CATALOG: dict[str, dict[str, Any]] = {
     # Deny-by-default and re-checked fail-closed at dispatch (a revoked grant
     # forces the flag back off). Spec: docs/features/email_datasource.md
     "email_autonomous_send": {"type": "bool", "default": False, "restrict_only": True},
+    # Agent-authored catalogue entries: lets a session's agent create or update
+    # experts, skills and automations on the user's behalf (tools.catalog_authoring).
+    # Deny-by-default and NOT backfilled, unlike shell_tools/delegation in 0030 —
+    # this is a new capability nobody held before, so there is nothing to
+    # grandfather and a backfill would hand it to every existing user silently.
+    # Deny-by-default is also what makes it a tier control: the writes themselves
+    # are owner-scoped by the endpoints they call, but an enabled automation
+    # creates jobs on a schedule, so this grant bounds token spend as much as
+    # permissions. Spec: docs/features/agent_authored_catalog_entries.md
+    "catalog_authoring": {"type": "bool", "default": False, "restrict_only": True},
     "datasource_tools": {"type": "bool", "default": True, "restrict_only": True},
     "browser": {"type": "bool", "default": True, "restrict_only": True},
     "model_selection": {"type": "list", "default": None, "restrict_only": True},
@@ -173,6 +183,13 @@ def evaluate(fragment: dict, grants: dict, *, is_admin: bool = False) -> list[st
         v.append("datasource_tools: connector tools are not permitted")
     if not grants.get("browser", True) and _truthy(tools.get("browser_direct")):
         v.append("browser: tools.browser_direct is not permitted")
+    if not grants.get("catalog_authoring", False) and _truthy(
+        tools.get("catalog_authoring")
+    ):
+        v.append(
+            "catalog_authoring: tools.catalog_authoring requires the "
+            "catalog_authoring grant"
+        )
 
     allowed = grants.get("model_selection")  # None = all
     if allowed is not None:

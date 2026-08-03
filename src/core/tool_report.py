@@ -123,6 +123,7 @@ GRANT_GATED_CATEGORIES: dict[str, frozenset[str]] = {
     "datasource_tools": frozenset(
         {"sql", "mongodb", "graph", "webdav", "email", "mcp", "repo"}
     ),
+    "catalog_authoring": frozenset({"catalog_authoring"}),
 }
 
 _GRANT_REASONS: dict[str, str] = {
@@ -130,6 +131,7 @@ _GRANT_REASONS: dict[str, str] = {
     "browser": "the browser capability grant is not held",
     "delegation": "requires the delegation capability grant",
     "datasource_tools": "the datasource_tools capability grant is not held",
+    "catalog_authoring": "requires the catalog_authoring capability grant",
 }
 
 

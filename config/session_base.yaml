@@ -124,6 +124,11 @@ tools:
   agent_catalog: [ ]
   # Automation and project-loop controls are opt-in at the expert/override layer.
   workflows: [ ]
+  # Catalogue-authoring WRITES (expert/skill/automation bundle get+set). Declared
+  # here so `session_tool_group_enablement` sees an explicit [] rather than an
+  # absent key, which it reads as enabled. Turning it on also needs the
+  # `catalog_authoring` capability grant, so the base default and the grant agree.
+  catalog_authoring: [ ]
   # Phase-specific tools not used in persistent mode
   core: [ ]
   # Datasource-injected (empty by default)

@@ -23,6 +23,7 @@ from src.core.tool_report import (
     DECIDED_BY_UNSET,
     GRANT_GATED_CATEGORIES,
     REPORT_VERSION,
+    _GRANT_REASONS,
     STATE_OFF,
     STATE_ON,
     STATE_UNAVAILABLE,
@@ -224,6 +225,38 @@ class TestGrantMapMatchesThePDP:
             if any(v.startswith(f"{grant_key}:") for v in violations):
                 actually_denied.add(category)
         assert actually_denied == GRANT_GATED_CATEGORIES[grant_key]
+
+    def test_no_gate_the_pdp_enforces_is_missing_from_the_map(self):
+        """The inverse direction, which the parametrised test cannot see.
+
+        Parametrising over ``GRANT_GATED_CATEGORIES`` checks every claim in the
+        map but never notices a grant the PDP enforces and the map omits — and
+        an omission is the failure that matters: the denial still happens, the
+        explanation just goes missing, so the pane says "off" where it should say
+        "needs a grant". Found while adding ``catalog_authoring``.
+        """
+        bool_grants = [k for k, spec in CATALOG.items() if spec["type"] == "bool"]
+        for grant_key in bool_grants:
+            denying = {
+                k: CATALOG[k]["default"]
+                for k in CATALOG
+                if CATALOG[k]["type"] != "list"
+            }
+            denying[grant_key] = False
+            denies_something = any(
+                v.startswith(f"{grant_key}:")
+                for category in report_categories()
+                for v in evaluate({"tools": {category: ["_probe_"]}}, denying)
+            )
+            if denies_something:
+                assert grant_key in GRANT_GATED_CATEGORIES, (
+                    f"{grant_key} gates a tool category in the PDP but has no "
+                    f"entry in GRANT_GATED_CATEGORIES, so a blocked user is "
+                    f"shown a plain 'off' with no reason"
+                )
+                assert grant_key in _GRANT_REASONS, (
+                    f"{grant_key} is mapped but has no human-readable reason"
+                )
 
 
 class TestCodeGrantedCategories:

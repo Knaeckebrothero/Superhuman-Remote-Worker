@@ -69,7 +69,37 @@ SESSION_TOOL_OVERRIDE_NAMES: dict[str, frozenset[str]] = {
         }
     ),
     "canvas": frozenset({"get_canvas", "set_canvas", "clear_canvas"}),
+    # Catalogue-authoring writes. A checkbox of its own rather than membership in
+    # `agent_catalog` / `workflows`, because those labels read as lookup
+    # capabilities and a box must not grant more than it says.
+    "catalog_authoring": frozenset(
+        {
+            "get_expert_bundle",
+            "set_expert_bundle",
+            "get_skill_bundle",
+            "set_skill_bundle",
+            "get_automation_bundle",
+            "set_automation_bundle",
+        }
+    ),
 }
+
+#: The groups the LEGACY (experts-off) agent path re-adds when no ``[]`` disable
+#: marker is present — ``persistent_session._setup_tools`` hardcodes exactly
+#: these three name lists, which is why an unset group reads as ENABLED there and
+#: DISABLED on the resolved path.
+#:
+#: This is a HISTORICAL FACT about deployed agent code, not a property of "how
+#: many checkboxes the product offers", and the two must not be conflated: a
+#: group added to ``SESSION_TOOL_OVERRIDE_NAMES`` today is not retroactively
+#: appended by an agent image built before it existed. Deriving the append rule
+#: from the presentation vocabulary would have made an unset ``catalog_authoring``
+#: predict six write tools that no agent binds.
+#:
+#: ``canvas`` is absent because its legacy branch is strip-only with no append.
+LEGACY_APPENDED_GROUPS: frozenset[str] = frozenset(
+    {"orchestrator", "agent_catalog", "workflows"}
+)
 
 
 def session_tool_group_enablement(merged_config: Any) -> dict[str, bool]:
@@ -97,6 +127,7 @@ def session_tool_group_enablement(merged_config: Any) -> dict[str, bool]:
 
 
 __all__ = [
+    "LEGACY_APPENDED_GROUPS",
     "SESSION_TOOL_OVERRIDE_NAMES",
     "session_tool_group_enablement",
 ]

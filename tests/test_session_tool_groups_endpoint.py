@@ -79,6 +79,9 @@ class TestResolvedPath:
             "agent_catalog": False,
             "workflows": False,
             "canvas": True,
+            # session_base declares `catalog_authoring: [ ]`, and turning it on
+            # additionally needs the capability grant.
+            "catalog_authoring": False,
         }
 
     @pytest.mark.asyncio
@@ -233,9 +236,14 @@ class TestLeanResolveFidelity:
             capture["merged_fragment"]
         )
         marker_names = orch_main._SESSION_TOOL_DISABLED_MARKERS
+        # Keyed on the MARKER set, not on SESSION_TOOL_OVERRIDE_NAMES. A marker
+        # exists to tell the legacy agent not to re-add a canonical list, so only
+        # groups that agent knows about have one; a presentation group added later
+        # (catalog_authoring) has no marker because no deployed agent re-adds it.
+        # Iterating the vocabulary here asserted a marker per checkbox, which is
+        # the same conflation `LEGACY_APPENDED_GROUPS` exists to break.
         reference = {
-            group: marker_names[group] not in markers
-            for group in SESSION_TOOL_OVERRIDE_NAMES
+            group: marker_names[group] not in markers for group in marker_names
         }
 
         lean = orch_main._merged_session_tool_groups(
@@ -245,7 +253,9 @@ class TestLeanResolveFidelity:
             request_override=request_override,
         )
 
-        assert lean == reference
+        assert {g: lean[g] for g in marker_names} == reference
+        # The resolved path answers for every presentation group, marker or not.
+        assert set(lean) == set(SESSION_TOOL_OVERRIDE_NAMES)
 
     @pytest.mark.asyncio
     async def test_session_account_defaults_never_carry_tools(self, fake_db):
@@ -293,6 +303,14 @@ class TestLegacyPath:
             "agent_catalog": True,
             "workflows": True,
             "canvas": True,
+            # The odd one out, and deliberately so: the inversion this test
+            # documents comes from the legacy agent re-adding canonical lists
+            # when no disable marker is present, and no deployed agent image
+            # re-adds `catalog_authoring` — it did not exist when they were
+            # built. So an unset catalog_authoring is OFF on both paths. If this
+            # ever flips to True, the endpoint is promising a write capability
+            # the agent will not bind.
+            "catalog_authoring": False,
         }
 
     @pytest.mark.asyncio

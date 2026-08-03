@@ -285,14 +285,6 @@ class TestNotClassified:
 class TestExplicitGrants:
     def test_explicit_set_is_pinned(self):
         assert _classified("explicit") == {
-            # Catalogue and automation authoring — four of these six are
-            # control-plane writes. Never in the session vocabulary.
-            "get_expert_bundle",
-            "set_expert_bundle",
-            "get_skill_bundle",
-            "set_skill_bundle",
-            "get_automation_bundle",
-            "set_automation_bundle",
             # In the registry's `orchestrator` category, granted by name to
             # config/experts/centurion, absent from the session vocabulary.
             "steer_worker_job",
@@ -303,6 +295,15 @@ class TestExplicitGrants:
             "delegate_work",
             "resume_delegation_child",
         }
+        # The six `*_bundle` tools left this tier on 2026-08-03. They did not
+        # become safer — they moved to `catalog_authoring`, a category of their
+        # own behind the `catalog_authoring` capability grant, so
+        # `agent_catalog: true` cannot reach them because they are not members,
+        # not because an exception list says so. Prefer that shape: this tier is
+        # for tools whose category genuinely mixes privilege levels.
+        assert _classified("explicit").isdisjoint(
+            SESSION_TOOL_OVERRIDE_NAMES["catalog_authoring"]
+        )
 
     def test_explicit_tools_stay_nameable(self):
         """centurion names two of them today; that must keep working.

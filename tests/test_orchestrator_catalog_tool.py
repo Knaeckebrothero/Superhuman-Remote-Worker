@@ -32,16 +32,25 @@ def test_catalog_tools_have_separate_category():
     expected = {
         "list_experts",
         "get_expert",
-        "get_expert_bundle",
-        "set_expert_bundle",
         "list_skills",
         "search_skills",
         "get_skill",
-        "get_skill_bundle",
-        "set_skill_bundle",
     }
     assert expected <= catalog
     assert expected.isdisjoint(fleet)
+
+    # The four bundle tools left this category on 2026-08-03 for
+    # `catalog_authoring`, so `agent_catalog` is now reads-only and a
+    # category-level `true` on it is safe without an exception list.
+    authoring = set(get_tools_by_category("catalog_authoring"))
+    assert {
+        "get_expert_bundle",
+        "set_expert_bundle",
+        "get_skill_bundle",
+        "set_skill_bundle",
+    } <= authoring
+    assert authoring.isdisjoint(catalog)
+    assert authoring.isdisjoint(fleet)
 
 
 class _CapturingClient:

@@ -277,6 +277,7 @@ from src.core.datasource_catalog import (  # noqa: E402
 )
 from src.core.datasource_setup import datasource_tool_categories  # noqa: E402
 from src.core.session_tool_overrides import (  # noqa: E402
+    LEGACY_APPENDED_GROUPS,
     SESSION_TOOL_OVERRIDE_NAMES,
     session_tool_group_enablement,
 )
@@ -1932,11 +1933,7 @@ def _legacy_session_tool_groups(
     """
     explicit = (request_override or {}).get("tools")
     explicit = explicit if isinstance(explicit, dict) else {}
-    groups = {
-        group: explicit.get(group) != []
-        for group in SESSION_TOOL_OVERRIDE_NAMES
-        if group != "canvas"
-    }
+    groups = {group: explicit.get(group) != [] for group in LEGACY_APPENDED_GROUPS}
     canvas_names: Any = explicit.get("canvas")
     if canvas_names is None:
         try:
@@ -1953,6 +1950,12 @@ def _legacy_session_tool_groups(
         if canvas_names is None:
             canvas_names = ["_unknown_base_assume_enabled"]
     groups["canvas"] = bool(canvas_names)
+    # Groups the legacy agent never learned to append (today: catalog_authoring).
+    # No append branch means no "unset reads as enabled" inversion — they follow
+    # the resolved rule, so only an explicit non-empty request turns them on.
+    # Reporting otherwise would predict a write capability the agent cannot bind.
+    for group in SESSION_TOOL_OVERRIDE_NAMES:
+        groups.setdefault(group, bool(explicit.get(group)))
     return groups
 
 
