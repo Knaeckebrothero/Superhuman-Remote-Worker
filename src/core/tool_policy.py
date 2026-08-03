@@ -203,6 +203,30 @@ def expand_category_true(category: str) -> list[str]:
     return names
 
 
+def enumerate_only_members() -> dict[str, list[str]]:
+    """Category -> the enumeration a caller must send to turn it ON.
+
+    :data:`ENUMERATE_ONLY_CATEGORIES` refuses ``true`` because ``true``
+    auto-tracks the registry and a code-execution category must not acquire a
+    tool without a diff.  That rule is right, and it leaves a client with no
+    way to *ask* for the category — the New Session form cannot offer "shell
+    on" unless something tells it the four names to write.
+
+    Serving them from the registry is what stops that becoming a fifth
+    hand-maintained parallel list in the cockpit.  The enumeration a caller
+    echoes back is frozen at the moment it is written, so the auto-tracking
+    hazard does not follow it: a tool added to ``shell`` tomorrow does not
+    appear in a session created today.
+
+    Grantable members only — the same subset :func:`expand_category_true`
+    would produce elsewhere — because a ``grant: "code"`` name in an ``only``
+    list is a name config does not manage.
+    """
+    return {
+        category: _grantable(category) for category in sorted(ENUMERATE_ONLY_CATEGORIES)
+    }
+
+
 def expand_tool_policy(value: Any, category: str) -> list[str]:
     """Resolve one ``tools.<category>`` value to the canonical ``list[str]``.
 
@@ -538,6 +562,7 @@ __all__ = [
     "ToolPolicyError",
     "assert_tool_policy_canonical",
     "config_tool_categories",
+    "enumerate_only_members",
     "expand_category_true",
     "expand_tool_policy",
     "normalize_tool_policy",

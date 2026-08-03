@@ -334,3 +334,55 @@ async def test_set_skill_bundle_dry_run_validates_file_tree(monkeypatch):
     assert "Bundle hash:" in result
     assert not cap.posts
     assert not cap.puts
+
+
+class TestFalseIsLegibleToTheAgent:
+    """`tools.<c>: false` must reach the agent as *disabled*, not as silence.
+
+    ``_format_expert_detail`` renders the **stored** expert row — no
+    normalisation runs on this path, so every policy spelling arrives verbatim.
+    The old `disabled` predicate was ``value == []``, and ``False == []`` is
+    ``False`` in Python, so an expert authored with ``tools.shell: false``
+    appeared in neither the Enabled nor the Disabled line: the one place an
+    agent can read another expert's tool policy said nothing at all about a
+    category its author had deliberately turned off.
+
+    This is the prerequisite the cockpit work needed before the settings forms
+    could write ``true``/``false`` instead of name lists.
+    """
+
+    @staticmethod
+    def _lines(tools: dict) -> str:
+        from src.tools.orchestrator.catalog import _format_expert_detail
+
+        return _format_expert_detail("e1", {"id": "e1", "config": {"tools": tools}})
+
+    def test_false_renders_as_disabled(self):
+        out = self._lines({"shell": False})
+        assert "Disabled tool categories: shell" in out
+        assert "Enabled tool categories" not in out
+
+    def test_the_legacy_empty_list_still_renders_as_disabled(self):
+        assert "Disabled tool categories: citation" in self._lines({"citation": []})
+
+    def test_true_renders_as_enabled(self):
+        out = self._lines({"orchestrator": True})
+        assert "Enabled tool categories: orchestrator" in out
+        assert "Disabled tool categories" not in out
+
+    def test_an_only_mapping_renders_as_enabled(self):
+        out = self._lines({"shell": {"only": ["run_command"]}})
+        assert "Enabled tool categories: shell" in out
+
+    def test_every_key_lands_in_exactly_one_line(self):
+        out = self._lines(
+            {"shell": False, "citation": [], "research": True, "canvas": ["get_canvas"]}
+        )
+        enabled = next(
+            line for line in out.splitlines() if line.startswith("Enabled tool")
+        )
+        disabled = next(
+            line for line in out.splitlines() if line.startswith("Disabled tool")
+        )
+        assert enabled == "Enabled tool categories: canvas, research"
+        assert disabled == "Disabled tool categories: citation, shell"

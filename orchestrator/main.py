@@ -282,6 +282,7 @@ from src.core.session_tool_overrides import (  # noqa: E402
 )
 from src.core.tool_policy import (  # noqa: E402
     ToolPolicyError,
+    enumerate_only_members,
     validate_tool_override_fragment,
 )
 from src.core.tool_report import (  # noqa: E402
@@ -24431,6 +24432,14 @@ async def get_thread_tool_groups(thread_id: str, request: Request) -> dict[str, 
     cockpit and is now DERIVED from ``categories`` rather than computed beside
     it, so the endpoint cannot disagree with itself.
 
+    ``enumerate_only`` answers the *write* half of the same question: which
+    categories refuse ``tools.<c>: true`` at the write boundary, and the
+    registry-derived enumeration a caller must send instead
+    (``{"shell": ["cancel_command", ...]}``). Without it the only way for the
+    New Session form to offer "shell on" would be a hand-maintained tool-name
+    list in the cockpit — a fifth parallel list, in the change that deletes
+    four. See :func:`src.core.tool_policy.enumerate_only_members`.
+
     Deliberately NOT a field on ``GET /api/persistent/threads/{id}``: that
     endpoint is hot and this answer costs a config resolve plus a pod probe.
     """
@@ -24515,6 +24524,7 @@ async def get_thread_tool_groups(thread_id: str, request: Request) -> dict[str, 
         "thread_id": thread_id,
         "source": source,
         **_origin_fields(m),
+        "enumerate_only": enumerate_only_members(),
         "tool_groups": tool_groups_from_view(view),
         "categories": view,
     }
@@ -24615,6 +24625,7 @@ async def preview_tool_groups(
     return {
         "source": "legacy" if legacy else "resolved",
         **_origin_fields(_unmeasured("no agent exists for an unsaved session")),
+        "enumerate_only": enumerate_only_members(),
         "tool_groups": tool_groups_from_view(view),
         "categories": view,
     }
@@ -28337,11 +28348,14 @@ async def _load_expert_detail(
             if user_id
             else None
         )
-        # Keep DB-backed detail responses at parity with bundled experts.  The
-        # editor/create forms need the mode base's full tool lists to turn an
-        # expert-disabled category back on, and they resolve model-family
-        # defaults client-side from the raw matrix.
-        defaults_tools = base.get("tools", {}) if isinstance(base, dict) else {}
+        # Keep DB-backed detail responses at parity with bundled experts: the
+        # forms resolve model-family defaults client-side from the raw matrix.
+        # `defaults_tools` used to ride here too — the mode base's tool lists,
+        # so the forms could turn an expert-disabled category back on. It is
+        # gone: the base ships `[]` for every category worth re-enabling, so
+        # the payload it produced was empty and the re-enable emitted nothing.
+        # The forms now write `true` (or the `enumerate_only` list) and the
+        # write boundary expands it against the registry.
         raw_matrix = _load_settings_matrix(_get_config_dir())
         return {
             "id": str(row["id"]),
@@ -28361,7 +28375,6 @@ async def _load_expert_detail(
             "config": merged,
             "instructions": prompts.get("instructions"),
             "persona": prompts.get("persona"),
-            "defaults_tools": defaults_tools,
             "settings_matrix": raw_matrix,
             "effective_models": effective,
         }
@@ -28388,8 +28401,8 @@ async def _load_expert_detail(
                 defaults = yaml.safe_load(f) or {}
         else:
             defaults = {}
-        # `defaults` stays the pristine framework base — `defaults_tools` below
-        # reports the base's tool lists, which the account layer never carries.
+        # `defaults` stays the pristine framework base; the account layer is
+        # merged on top only for `merged`.
         merged = _deep_merge(
             defaults,
             await _account_defaults_layer(
@@ -28481,10 +28494,6 @@ async def _load_expert_detail(
     for key in ("$extends", "connections"):
         merged.pop(key, None)
 
-    # Expose the defaults' tool lists so the cockpit can re-enable
-    # categories that an expert disabled (e.g., scholar sets citation: []).
-    defaults_tools = defaults.get("tools", {})
-
     effective = (
         await _compute_expert_effective_models(expert_llm_leaf, user_id)
         if user_id
@@ -28493,7 +28502,6 @@ async def _load_expert_detail(
     return {
         "config": merged,
         "instructions": instructions_content,
-        "defaults_tools": defaults_tools,
         "settings_matrix": raw_matrix,
         "effective_models": effective,
     }

@@ -729,6 +729,60 @@ class TestPreviewEndpoint:
         assert exc.value.status_code == 403
 
 
+class TestEnumerateOnlyRidesBothReads:
+    """A settings surface cannot offer "shell on" unless it is told the names.
+
+    ``shell`` refuses ``tools.shell: true`` at the write boundary, so the only
+    payload that enables it is an enumeration. Serving that enumeration from
+    the registry is what stops the cockpit growing a fifth hand-maintained
+    tool-name list in the change that deletes four — and it has to ride BOTH
+    reads, because the New Session form (preview) is the surface where "shell
+    becomes settable" is actually visible.
+    """
+
+    @pytest.mark.asyncio
+    async def test_the_thread_read_serves_it(self, user_a, fake_db, fake_request):
+        result, _ = await _call(user_a, fake_db, _thread(), fake_request)
+        assert result["enumerate_only"]["shell"]
+
+    @pytest.mark.asyncio
+    async def test_the_preview_read_serves_it(self, user_a, fake_db, fake_request):
+        from main import ToolGroupPreviewRequest, preview_tool_groups
+
+        with (
+            patch("main.require_approved_user", _approved(user_a)),
+            patch("main.postgres_db", fake_db),
+            patch("main._resolve_runner_grants", AsyncMock(return_value=None)),
+        ):
+            result = await preview_tool_groups(
+                ToolGroupPreviewRequest(config_name="session_base"), fake_request
+            )
+        assert result["enumerate_only"]["shell"]
+
+    @pytest.mark.asyncio
+    async def test_it_is_the_registry_answer_not_a_transcription(
+        self, user_a, fake_db, fake_request
+    ):
+        from src.core.tool_policy import enumerate_only_members
+
+        result, _ = await _call(user_a, fake_db, _thread(), fake_request)
+        assert result["enumerate_only"] == enumerate_only_members()
+
+    @pytest.mark.asyncio
+    async def test_what_it_prescribes_is_what_the_write_boundary_accepts(
+        self, user_a, fake_db, fake_request
+    ):
+        """The round trip the cockpit actually performs."""
+        from src.core.tool_policy import validate_tool_override_fragment
+
+        result, _ = await _call(user_a, fake_db, _thread(), fake_request)
+        for category, names in result["enumerate_only"].items():
+            accepted = validate_tool_override_fragment(
+                {"tools": {category: {"only": names}}}
+            )
+            assert accepted[category] == names
+
+
 class TestPreviewModelsTheLegacyPathToo:
     """The creation form must predict the path a created session would take.
 
