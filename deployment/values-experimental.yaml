@@ -63,33 +63,33 @@ global:
 # -----------------------------------------------------------------------------
 image:
   orchestrator:
-    tag: sha-22b2511
+    tag: sha-a1d9268
   agent:
-    tag: sha-22b2511
+    tag: sha-a1d9268
   cockpit:
     tag: sha-8710200
   mcp:
-    tag: sha-2c1f82f
-    digest: sha256:5b24c4fc4b73430a4644984551a07d45cf483fa7e93d1843f92c4e110b8b72b4
+    tag: sha-881fdf9
+    digest: sha256:59b99451ad905372893550fe4577c2671b85c1b9434d917c77e82234103fb329
   workspace:
     tag: sha-571fbc8
 # Full deployment identities are updated alongside each independently rebuilt
 # image. Short image tags remain display/update handles only.
 provenance:
-  releaseVersion: "0.0.0-dev.sha-22b2511e54ce289716d67ba6f1be7bd64fbb625d"
+  releaseVersion: "0.0.0-dev.sha-a1d92680cdf879e7e934f4a0d633dc47c2ebeded"
   components:
     orchestrator:
-      sourceRevision: 22b2511e54ce289716d67ba6f1be7bd64fbb625d
-      releaseVersion: "0.0.0-dev.sha-22b2511e54ce289716d67ba6f1be7bd64fbb625d"
+      sourceRevision: a1d92680cdf879e7e934f4a0d633dc47c2ebeded
+      releaseVersion: "0.0.0-dev.sha-a1d92680cdf879e7e934f4a0d633dc47c2ebeded"
     agent:
-      sourceRevision: 22b2511e54ce289716d67ba6f1be7bd64fbb625d
-      releaseVersion: "0.0.0-dev.sha-22b2511e54ce289716d67ba6f1be7bd64fbb625d"
+      sourceRevision: a1d92680cdf879e7e934f4a0d633dc47c2ebeded
+      releaseVersion: "0.0.0-dev.sha-a1d92680cdf879e7e934f4a0d633dc47c2ebeded"
     cockpit:
       sourceRevision: 8710200713a679d59140933bc91a5d82f87676af
       releaseVersion: "0.0.0-dev.sha-8710200713a679d59140933bc91a5d82f87676af"
     mcp:
-      sourceRevision: 2c1f82feaa78f51ea18f8ce22b37d5f9beb6ae82
-      releaseVersion: "0.0.0-dev.sha-2c1f82feaa78f51ea18f8ce22b37d5f9beb6ae82"
+      sourceRevision: 881fdf9c74bdd3427dfc32e32610c2d9ca1919d2
+      releaseVersion: "0.0.0-dev.sha-881fdf9c74bdd3427dfc32e32610c2d9ca1919d2"
     workspace:
       sourceRevision: 571fbc8ca40847bb63cf57c92d86f3df15e35a7c
       releaseVersion: "0.0.0-dev.sha-571fbc8ca40847bb63cf57c92d86f3df15e35a7c"
