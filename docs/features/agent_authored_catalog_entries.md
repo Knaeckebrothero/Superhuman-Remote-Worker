@@ -15,8 +15,10 @@ related:
 
 # Agent-authored catalogue entries
 
-**Status:** implemented 2026-08-03 on `develop`, unpushed. Live gate owed —
-**and it must be run as a non-admin** (see [Verification](#verification)).
+**Status:** implemented 2026-08-03 on `develop`, unpushed. **Live-gated on k3d as
+a non-admin — 8 checks, all passing** ([[catalog_authoring_live_gate_2026-08-03]]).
+Not yet exercised by an actual agent in conversation; see
+[Verification](#verification).
 
 A user can tell their session agent *"build me an expert that does X"* or
 *"set up an automation that runs this every Monday"*, and the agent writes it.
@@ -174,15 +176,23 @@ Unit: 13 255 Python tests and 1 644 cockpit tests pass; `tsc --noEmit` clean;
 the grants snapshot fixture did **not** move, confirming no shipped config's
 resolved toolset changed.
 
-**Live gate owed, as a non-admin.** `_enforce_save_grants` returns early for
-admins (`orchestrator/main.py:5043`), so gating this as an admin exercises the
-permissive path and proves nothing. The three checks:
+**Live-gated 2026-08-03 on k3d as a non-admin**, because
+`_enforce_save_grants` returns early for admins (`orchestrator/main.py:5043`) and
+gating as an admin would have exercised the permissive path. Full evidence in
+[[catalog_authoring_live_gate_2026-08-03]]; the eight checks in short: the PDP
+denies through real DB grant resolution, the HTTP boundary 422s naming the grant,
+a granted create returns 200 owned by that user with `true` normalised to the six
+names in storage, all six survive resolution **and bind through both factories**,
+an agent-created automation lands `enabled=false` with no `next_run_at`, a
+non-owner update 403s, and the old `agent_catalog: [set_expert_bundle]` spelling
+400s with a message naming the new category.
 
-1. without the grant, a session requesting `tools.catalog_authoring` is refused
-   with a 422 naming the grant;
-2. with the grant, the agent binds all six and `set_expert_bundle` with
-   `dry_run=false` creates an expert **owned by that user**;
-3. an agent-created automation lands `enabled=false`.
+The binding check is the one that mattered: `catalog_authoring` is the only
+category whose members come from two factories, and the `persistent_session`
+specs mock `load_tools`, so nothing in the unit suite exercises that branch.
+
+**Still owed:** an agent driving `set_expert_bundle(dry_run=false)` in an actual
+conversation. One dev session — grant it, ask for an expert, read back the row.
 
 ## Deliberately not done
 
