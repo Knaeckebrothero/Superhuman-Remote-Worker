@@ -149,9 +149,19 @@ handoff items this series dropped.
    each failing assertion is substantive.
 3. **No test pins "config must not narrow a non-empty measurement."** A
    narrowing fix-up inside `compose_tool_view` would fail zero tests.
-4. **The grant-map test parametrises over `GRANT_GATED_CATEGORIES`, not the
+4. ~~**The grant-map test parametrises over `GRANT_GATED_CATEGORIES`, not the
    catalog**, so a category added to the catalog without a grant mapping is not
-   caught.
+   caught.~~ **CLOSED 2026-08-03** by
+   `test_no_gate_the_pdp_enforces_is_missing_from_the_map`, which walks every bool
+   grant in `CATALOG`, asks the real PDP whether it denies any category, and
+   requires a map entry *and* a reason string when it does. Mutation-tested by
+   deleting the new entry. Predicted correctly here: adding `catalog_authoring`
+   hit exactly this hole, and the omission was invisible until the inverse
+   assertion existed. Note the consequence this item understates — the denial
+   still happens, so the failure is a *missing explanation*: the pane shows a bare
+   "off" where it should name the grant. The client-side twin `CAT_TO_GRANT`
+   (cockpit) has the same shape of hole and is **still open**: the seven
+   `datasource_tools` categories have never been listed there.
 5. **A schema test proves branch *types*, not acceptance.**
    `test_each_schema_block_accepts_the_five_forms` inspects the `oneOf` branches
    rather than validating the five forms through a validator.
@@ -260,6 +270,27 @@ handoff items this series dropped.
    prediction contract (a forecast cannot see runtime injection) and newly
    *visible* because the forms now render all 25 rows. The live pane handles this
    correctly via the locked-on path.
+7. **Job create has no grant gating at all, and this is the sharper half of the
+   "creation forms cannot tell the truth" gap.** Measured 2026-08-03 rather than
+   inferred: `views/create/job-create.component.ts:277` mounts
+   `<app-agent-settings mode="job">` with **no `gatedCapabilities`, no
+   `readsResolvedToolset` and no `resolved`** binding. So it renders the six
+   static `JOB_TOOL_CATEGORIES` rows, and a user without `shell_tools` is shown a
+   plain tickable **Shell** box — the same untruthful control the session work
+   removed, still live on the job surface. Its server-side twin is that
+   `preview_tool_groups` hardcodes `expert_type="session"`.
+
+   By contrast the New Session form is now largely honest, which is worth
+   recording because the two are usually lumped together:
+   `views/session-create/session-create.component.ts:173,180` **does** pass
+   `readsResolvedToolset=true` and `gatedCapabilities`, and the preview endpoint
+   applies the grant gate server-side. Verified on k3d for a non-admin: without
+   the grant, `catalog_authoring` came back
+   `{state: "unavailable", settable: false, reason: "requires the
+   catalog_authoring capability grant", decided_by: "grant"}`, and `shell` the
+   same. What that form still cannot see is runtime injection and datasource
+   attachment — and it says so, carrying `origin: "prediction"` with
+   `prediction_reason: "no agent exists for an unsaved session"`.
 7. **The live pane's 25 rows are 7 on / 10 off / 8 unavailable** on a stock
    session — worth knowing before reading a screenshot as a defect.
 8. **`rowState`'s `on` short-circuit bypasses the client-side grant belt** for a

@@ -233,7 +233,12 @@ class TestGrantMapMatchesThePDP:
         map but never notices a grant the PDP enforces and the map omits — and
         an omission is the failure that matters: the denial still happens, the
         explanation just goes missing, so the pane says "off" where it should say
-        "needs a grant". Found while adding ``catalog_authoring``.
+        "needs a grant".
+
+        Filed in advance as
+        ``docs/issues/tool_configuration_deferred_findings.md`` §4.4, and adding
+        ``catalog_authoring`` walked straight into it — the map entry was missing
+        and every test passed.
         """
         bool_grants = [k for k, spec in CATALOG.items() if spec["type"] == "bool"]
         for grant_key in bool_grants:
