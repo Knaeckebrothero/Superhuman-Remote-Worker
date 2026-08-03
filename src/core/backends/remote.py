@@ -8,8 +8,10 @@ Requires: paramiko (pip install paramiko)
 See docs/features/vm_backend.md for the full design.
 """
 
+import base64
 import errno
 import fnmatch
+import hashlib
 import logging
 import os
 import posixpath
@@ -47,6 +49,7 @@ from ..workspace_backend import (
     SEARCH_RESULT_HARD_CAP,
     RemoteChannelBusyError,
     RemoteCommandTimeoutError,
+    WorkspaceAuthenticationError,
     WorkspaceBackend,
     WorkspaceUnavailableError,
 )
@@ -60,6 +63,13 @@ logger = logging.getLogger(__name__)
 # Connect-failure buckets → how many attempts each is worth.
 _AMBIGUOUS_RETRY_CAP = 2
 _GONE_ERRNOS = {errno.EHOSTUNREACH, errno.ENETUNREACH, errno.ENETDOWN}
+_AUTH_ERROR_MARKERS = (
+    "authentication failed",
+    "authentication methods available",
+    "not a valid private key",
+    "private key file is encrypted",
+    "permission denied (publickey",
+)
 
 # _exec output cap: past this, output is dropped (marker appended) but the
 # channel keeps draining so the remote command can finish. Guards agent RAM.
@@ -97,6 +107,8 @@ _MEDIUM_OP_TIMEOUT_SECONDS = 120  # mv, du -sb: single-pass but can be slow
 def _classify_connect_error(e: Exception) -> str:
     """Bucket an SSH connect failure to size the retry budget.
 
+    'authentication' → the configured identity was rejected; retrying/recreating
+                  the workspace with the same configuration cannot repair it.
     'gone'      → the workspace host is destroyed (DNS won't resolve / no route);
                   retrying is pointless, fail fast.
     'booting'   → host is up but sshd is not listening yet (ECONNREFUSED);
@@ -106,6 +118,12 @@ def _classify_connect_error(e: Exception) -> str:
                   tailnet peer path is still converging.
     'ambiguous' → protocol / unknown; retry briefly then give up.
     """
+    if paramiko is not None and isinstance(
+        e, (paramiko.AuthenticationException, paramiko.PasswordRequiredException)
+    ):
+        return "authentication"
+    if any(marker in str(e).lower() for marker in _AUTH_ERROR_MARKERS):
+        return "authentication"
     if isinstance(e, socket.gaierror):
         return "gone"
     if isinstance(e, socket.timeout):
@@ -115,6 +133,35 @@ def _classify_connect_error(e: Exception) -> str:
     if isinstance(e, OSError) and e.errno in _GONE_ERRNOS:
         return "gone"
     return "ambiguous"
+
+
+def _validate_private_key(key_path: Optional[str]) -> str:
+    """Validate the configured key as this worker UID; return public fingerprint."""
+    if not key_path:
+        raise WorkspaceAuthenticationError(
+            "workspace.remote.key_path is missing; managed workspaces require "
+            "an explicit private key"
+        )
+    if not os.path.isfile(key_path):
+        raise WorkspaceAuthenticationError(
+            f"workspace.remote.key_path does not exist: {key_path}"
+        )
+    try:
+        with open(key_path, "rb"):
+            pass
+    except OSError as exc:
+        raise WorkspaceAuthenticationError(
+            f"workspace.remote.key_path is not readable by the worker: {key_path}"
+        ) from exc
+    try:
+        private_key = paramiko.PKey.from_path(key_path)
+    except (paramiko.SSHException, OSError, ValueError) as exc:
+        raise WorkspaceAuthenticationError(
+            "workspace.remote.key_path is invalid or passphrase-protected"
+        ) from exc
+
+    digest = hashlib.sha256(private_key.asbytes()).digest()
+    return "SHA256:" + base64.b64encode(digest).decode("ascii").rstrip("=")
 
 
 # Tab name validation
@@ -330,14 +377,22 @@ class RemoteBackend(WorkspaceBackend):
         instead of burning the full boot-window budget.
         See docs/issues/agent_fast_freeze_on_dead_workspace.md.
         """
+        fingerprint = _validate_private_key(self._key_path)
+        logger.info(
+            "Workspace SSH private key validated for %s:%d (fingerprint=%s)",
+            self._host,
+            self._port,
+            fingerprint,
+        )
         connect_kwargs = {
             "hostname": self._host,
             "port": self._port,
             "username": self._username,
             "timeout": self._connect_timeout,
+            "key_filename": self._key_path,
+            "allow_agent": False,
+            "look_for_keys": False,
         }
-        if self._key_path:
-            connect_kwargs["key_filename"] = self._key_path
 
         backoff = 2.0
         attempt = 0
@@ -350,6 +405,11 @@ class RemoteBackend(WorkspaceBackend):
                 break
             except (paramiko.SSHException, socket.error, OSError) as e:
                 bucket = _classify_connect_error(e)
+                if bucket == "authentication":
+                    raise WorkspaceAuthenticationError(
+                        f"Workspace SSH authentication failed for "
+                        f"{self._host}:{self._port} with key {fingerprint}: {e}"
+                    ) from e
                 if bucket == "gone":
                     effective_max = 1
                 elif (

@@ -21,6 +21,17 @@ class WorkspaceUnavailableError(Exception):
     pass
 
 
+class WorkspaceAuthenticationError(Exception):
+    """Raised when workspace SSH credentials/configuration are unusable.
+
+    Unlike ``WorkspaceUnavailableError``, this is deterministic and terminal:
+    recreating the same pod with the same key will not repair a missing,
+    unreadable, invalid, or unauthorized private key.
+    """
+
+    pass
+
+
 # --- transient infrastructure classification --------------------------------
 #
 # Matching is by exception CLASS NAME across the MRO rather than by importing
@@ -142,7 +153,9 @@ def completion_error_payload(exc: BaseException) -> Dict[str, Any]:
     Every app-layer ``except`` that reports an exception to ``/complete`` must
     build its payload here so the classification survives.
 
-    Three classes:
+    Four classes:
+      * ``workspace_authentication`` — SSH credentials/config are invalid;
+        terminal without workspace recovery.
       * ``workspace_unavailable`` — the VM/pod is gone; pause, reprovision,
         resume (docs/issues/streaming_strips_workspace_unavailable_type.md).
       * ``infra_transient`` — a backing service blipped; pause, KEEP the
@@ -150,10 +163,12 @@ def completion_error_payload(exc: BaseException) -> Dict[str, Any]:
         (docs/issues/transient_db_error_hard_fails_job_and_destroys_vm.md).
       * ``job_error`` — the job itself failed. Terminal.
 
-    Order matters: a dead workspace is checked first, since a workspace error
-    could otherwise be caught by the socket-level names in the transient set.
+    Order matters: deterministic authentication and dead-workspace errors are
+    checked before the socket-level names in the transient set.
     """
-    if isinstance(exc, WorkspaceUnavailableError):
+    if isinstance(exc, WorkspaceAuthenticationError):
+        error_type, recoverable = "workspace_authentication", False
+    elif isinstance(exc, WorkspaceUnavailableError):
         error_type, recoverable = "workspace_unavailable", True
     elif is_transient_infra_error(exc):
         error_type, recoverable = "infra_transient", True

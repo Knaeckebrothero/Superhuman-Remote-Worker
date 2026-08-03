@@ -1176,14 +1176,17 @@ class UniversalAgent:
                     await self._cleanup_checkpointer()
 
         except Exception as e:
-            # Detect workspace unavailable errors (VM connection lost)
-            from .core.workspace_backend import WorkspaceUnavailableError
+            from .core.workspace_backend import completion_error_payload
 
-            is_vm_error = isinstance(e, WorkspaceUnavailableError)
-
-            if is_vm_error:
+            error = completion_error_payload(e)["error"]
+            if error["type"] == "workspace_unavailable":
                 logger.error(
-                    f"Job {job_id}: VM workspace unavailable — will request recovery: {e}"
+                    f"Job {job_id}: workspace unavailable — will request recovery: {e}"
+                )
+            elif error["type"] == "workspace_authentication":
+                logger.error(
+                    f"Job {job_id}: workspace authentication failed "
+                    f"(non-retryable): {e}"
                 )
             else:
                 logger.error(f"Job {job_id} failed: {e}", exc_info=True)
@@ -1194,11 +1197,7 @@ class UniversalAgent:
             self._current_job_id = None
             error_state = {
                 "job_id": job_id,
-                "error": {
-                    "message": str(e),
-                    "type": "workspace_unavailable" if is_vm_error else "job_error",
-                    "recoverable": is_vm_error,
-                },
+                "error": error,
                 "should_stop": True,
             }
             if stream:
@@ -1360,24 +1359,25 @@ class UniversalAgent:
             # recovery arm routes on, so a dead-workspace job hard-fails (and
             # its VM is torn down) instead of pause → reprovision → resume.
             # docs/issues/streaming_strips_workspace_unavailable_type.md
-            from .core.workspace_backend import WorkspaceUnavailableError
+            from .core.workspace_backend import completion_error_payload
 
             job_id = self._current_job_id
-            is_vm_error = isinstance(e, WorkspaceUnavailableError)
-            if is_vm_error:
+            error = completion_error_payload(e)["error"]
+            if error["type"] == "workspace_unavailable":
                 logger.error(
-                    f"Job {job_id}: VM workspace unavailable mid-stream — "
+                    f"Job {job_id}: workspace unavailable mid-stream — "
                     f"will request recovery: {e}"
+                )
+            elif error["type"] == "workspace_authentication":
+                logger.error(
+                    f"Job {job_id}: workspace authentication failed mid-stream "
+                    f"(non-retryable): {e}"
                 )
             else:
                 logger.error(f"Job {job_id} failed mid-stream: {e}", exc_info=True)
             yield {
                 "job_id": job_id,
-                "error": {
-                    "message": str(e),
-                    "type": "workspace_unavailable" if is_vm_error else "job_error",
-                    "recoverable": is_vm_error,
-                },
+                "error": error,
                 "should_stop": True,
             }
         finally:

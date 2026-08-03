@@ -2567,33 +2567,16 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
             )
 
         # Inject workspace container config if job has a ready container.
-        # Prefer the stable Service DNS (`host`) over the ephemeral `pod_ip` so a
-        # reattached/recovered pod is reachable at a constant address (see
-        # docs/issues/workspace_reattach_ephemeral_ip_reconnect_churn.md).
+        # Keep this in one helper shared with resume: the resume path used to
+        # restore only host + port and silently drop username/key_path/path,
+        # producing Paramiko's "No authentication methods available" before
+        # the graph could start.
         container_ctx = _get_container_context(job)
         container_host = container_ctx.get("host") or container_ctx.get("pod_ip")
         if container_ctx.get("status") == "ready" and container_host:
-            config_override = config_override or {}
-            ws = config_override.setdefault("workspace", {})
-            ws["backend"] = "sandbox"
-            remote = ws.setdefault("remote", {})
-            remote.setdefault("host", container_host)
-            remote.setdefault("port", container_ctx.get("port", 22))
-            remote.setdefault("username", "agent-host")
-            # SSH key path resolution:
-            #   SSH_KEY_PATH env var (dev compose: .dev/ssh-keys/id_ed25519)
-            #   Docker Compose mode default: /run/secrets/ssh/id_ed25519
-            #   Kubernetes mode default: /run/secrets/vm-ssh-key
-            ssh_key_override = os.environ.get("SSH_KEY_PATH", "").strip()
-            if ssh_key_override:
-                remote.setdefault("key_path", ssh_key_override)
-            elif container_ctx.get("provisioner") == "docker":
-                remote.setdefault("key_path", "/run/secrets/ssh/id_ed25519")
-            else:
-                remote.setdefault("key_path", "/run/secrets/vm-ssh-key")
-            remote.setdefault("workspace_path", "/home/agent-host/workspace")
-            # Sandbox uses sudo freeze mechanism (VM upgrade prompt)
-            config_override.setdefault("shell", {}).setdefault("sudo_action", "freeze")
+            config_override = _inject_container_workspace_config(
+                config_override, container_ctx
+            )
             logger.info(
                 f"Dispatch: injected workspace container config for job {job_id} "
                 f"(host={container_host}:{container_ctx.get('port', 22)}, "
@@ -3025,27 +3008,26 @@ async def _resume_job_on_agent(job: dict, agent: dict) -> bool:
                 f"(host={vm_ctx['ssh_host']}:{vm_ctx.get('ssh_port', 22)})"
             )
 
-        # Inject sandbox (container) workspace host on resume. The dispatch path
-        # persisted the original pod's address into config_override; after a
-        # recreate (PVC reattach / crash recovery) that host is STALE, so we must
-        # OVERRIDE it with the current endpoint — preferring the stable Service
-        # DNS (`host`) over the ephemeral `pod_ip`. Without this, a recovered job
-        # dials a dead IP and churns to fail-loud
-        # (docs/issues/workspace_reattach_ephemeral_ip_reconnect_churn.md).
+        # Rebuild the complete managed-sandbox connection on resume. Endpoint
+        # replacement handles pod recreation, while the shared helper also
+        # restores the in-flight username/key/path values that are intentionally
+        # not persisted in jobs.config_override.
         container_ctx = _get_container_context(job)
         container_host = container_ctx.get("host") or container_ctx.get("pod_ip")
         if container_ctx.get("status") == "ready" and container_host:
-            config_override = config_override or {}
-            ws = config_override.setdefault("workspace", {})
-            ws["backend"] = "sandbox"
-            remote = ws.setdefault("remote", {})
-            remote["host"] = container_host  # override the stale persisted host
-            remote["port"] = container_ctx.get("port", 22)
+            config_override = _inject_container_workspace_config(
+                config_override, container_ctx, replace_endpoint=True
+            )
+            worktree_path = job.get("worktree_path")
+            if worktree_path:
+                config_override["workspace"]["remote"]["workspace_path"] = worktree_path
             logger.info(
-                "Resume dispatch: injected container host for job %s (host=%s:%s)",
+                "Resume dispatch: injected complete container config for job %s "
+                "(host=%s:%s, provisioner=%s)",
                 job_id,
                 container_host,
                 container_ctx.get("port", 22),
+                container_ctx.get("provisioner", "k8s"),
             )
 
         # Sticky sudo denial (vm_upgrade denied / resumed without VM): block
@@ -4089,6 +4071,60 @@ def _get_container_context(job: dict) -> dict:
         except (json.JSONDecodeError, TypeError):
             ctx = {}
     return ctx.get("workspace_container", {})
+
+
+def _container_ssh_key_path(container_ctx: dict) -> str:
+    """Resolve the private-key path shipped to a managed sandbox worker.
+
+    The key itself is never persisted in job state. The path must therefore be
+    reconstructed on every start and resume, using the same rules in both
+    paths. Docker and Kubernetes mount the shared key at different defaults.
+    """
+    override = os.environ.get("SSH_KEY_PATH", "").strip()
+    if override:
+        return override
+    if container_ctx.get("provisioner") == "docker":
+        return "/run/secrets/ssh/id_ed25519"
+    return "/run/secrets/vm-ssh-key"
+
+
+def _inject_container_workspace_config(
+    config_override: dict | None,
+    container_ctx: dict,
+    *,
+    replace_endpoint: bool = False,
+) -> dict:
+    """Inject a complete managed-sandbox SSH configuration.
+
+    ``replace_endpoint`` is used on resume because a recreated pod may have a
+    new address. Managed username/key fields are always refreshed because they
+    are in-flight deployment configuration and are deliberately not written
+    back to ``jobs.config_override``.
+    """
+    container_host = container_ctx.get("host") or container_ctx.get("pod_ip")
+    if container_ctx.get("status") != "ready" or not container_host:
+        return config_override or {}
+
+    config_override = config_override or {}
+    workspace = config_override.setdefault("workspace", {})
+    workspace["backend"] = "sandbox"
+    remote = workspace.setdefault("remote", {})
+
+    if replace_endpoint or not remote.get("host"):
+        remote["host"] = container_host
+    if replace_endpoint or not remote.get("port"):
+        remote["port"] = container_ctx.get("port", 22)
+    # These are properties of the orchestrator-managed sandbox image and agent
+    # deployment, not user/job settings. Always refresh them so a stale
+    # persisted remote block cannot point a resumed worker at an obsolete mount.
+    remote["username"] = "agent-host"
+    remote["key_path"] = _container_ssh_key_path(container_ctx)
+    if not remote.get("workspace_path"):
+        remote["workspace_path"] = "/home/agent-host/workspace"
+
+    # Managed sandboxes freeze on sudo so an operator can approve a VM upgrade.
+    config_override.setdefault("shell", {}).setdefault("sudo_action", "freeze")
+    return config_override
 
 
 # Job context key holding each remote tier's live workspace, by tier name.
@@ -6088,8 +6124,26 @@ async def _try_dispatch_pending_jobs() -> None:
                         },
                     )
                     if res.outcome is EnsureOutcome.FAILED:
-                        if container_status == "failed":
-                            error = container_ctx.get("error", "unknown error")
+                        failed_ctx = container_ctx
+                        if container_status != "failed":
+                            # create_workspace records the concrete failure in
+                            # context before returning False. Refresh once so a
+                            # first-attempt auth/RBAC/image failure reaches the
+                            # job error instead of being replaced by the generic
+                            # "could not be created" wrapper.
+                            try:
+                                refreshed_job = await postgres_db.get_job(job_id)
+                                if refreshed_job:
+                                    failed_ctx = _get_container_context(refreshed_job)
+                            except Exception:
+                                logger.warning(
+                                    "Dispatcher: could not refresh failed workspace "
+                                    "context for job %s",
+                                    job_id,
+                                    exc_info=True,
+                                )
+                        error = failed_ctx.get("error")
+                        if error:
                             msg = f"Workspace container failed: {error}"
                         else:
                             msg = (
@@ -8602,8 +8656,9 @@ async def create_job(request: Request, job: JobCreate) -> dict[str, Any]:
       Originless internal HTTP calls are rejected; userless system children
       must still derive scope from an authoritative parent/thread.
 
-    Creates a job with status 'created'. The job must be assigned to an agent
-    to start processing.
+    Creates a job with status 'created'. The automatic dispatcher provisions
+    its workspace and assigns a ready agent; callers should monitor the job
+    rather than manually assigning it.
 
     If ``project_id`` is set (directly or via the user's default project),
     the job is created within that project context: the project's default
@@ -17449,13 +17504,15 @@ def _mcp_datasource_runtime_allowed(datasource: dict[str, Any]) -> bool:
 async def assign_job_to_agent(
     request: Request, job_id: str, agent_id: str
 ) -> dict[str, str]:
-    """Manually assign a job to an agent.
+    """Administrative scheduling override for a job.
 
-    **Admin only** (P4c): manual dispatch override bypasses the
-    auto-assign dispatcher's queue, so only admins can call it.
+    **Admin only** (P4c). Normal callers should rely on automatic dispatch.
+    If the managed workspace is not live, this endpoint sheds stale workspace
+    state and queues normal provisioning instead of dispatching an incomplete
+    SSH configuration. The requested agent is not reserved in that case.
 
-    Validates job and agent status, then delegates to the shared dispatch helper.
-    Accepts jobs in 'created', 'failed', or 'paused' status.
+    With a live workspace, validates the agent and delegates to the shared
+    start/resume helper. Accepts 'created', 'failed', or 'paused' jobs.
     """
     await _require_admin(request)
     try:
@@ -17468,6 +17525,28 @@ async def assign_job_to_agent(
                 status_code=400,
                 detail=f"Job cannot be assigned (status: {job['status']})",
             )
+
+        missing_workspace = _resume_missing_workspace(job)
+        if missing_workspace:
+            await postgres_db.shed_workspace_context(
+                job_id, _WORKSPACE_CONTEXT_KEYS[missing_workspace]
+            )
+            if job["status"] != "created":
+                queued = await postgres_db.queue_job_for_resume(job_id)
+                if not queued:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Job changed while it was being queued for provisioning",
+                    )
+            _trigger_dispatch()
+            return {
+                "status": "queued",
+                "job_id": job_id,
+                "message": (
+                    f"No live {missing_workspace} workspace; queued for automatic "
+                    "provisioning and assignment. The requested agent was not reserved."
+                ),
+            }
 
         agent = await postgres_db.get_agent(agent_id)
         if not agent:

@@ -931,6 +931,122 @@ class TestCreateWorkspace:
         assert "API error" in last_call_updates["error"]
 
 
+class TestAuthenticatedWorkspaceReadiness:
+    """Kubernetes readiness is not enough; the configured key must log in."""
+
+    @staticmethod
+    def _ready_pod():
+        pod = MagicMock()
+        pod.status.phase = "Running"
+        pod.status.pod_ip = "10.42.0.50"
+        container = MagicMock()
+        container.ready = True
+        pod.status.container_statuses = [container]
+        return pod
+
+    @pytest.mark.asyncio
+    async def test_wait_for_ready_requires_authenticated_probe(self):
+        from orchestrator.services.container_provisioner import ContainerProvisioner
+
+        provisioner = ContainerProvisioner()
+        provisioner._core_api = MagicMock()
+        provisioner._core_api.read_namespaced_pod.return_value = self._ready_pod()
+
+        with (
+            patch(
+                "orchestrator.services.container_provisioner.resolve_ssh_key_path",
+                return_value="/run/secrets/test-key",
+            ),
+            patch(
+                "orchestrator.services.container_provisioner.workspace_private_key_fingerprint",
+                return_value="SHA256:test",
+            ),
+            patch(
+                "orchestrator.services.container_provisioner.wait_for_agent_ssh",
+                new=AsyncMock(return_value=(True, 2, "")),
+            ) as probe,
+        ):
+            result = await provisioner._wait_for_ready("workspace-test", timeout=1)
+
+        assert result == "10.42.0.50"
+        probe.assert_awaited_once_with(
+            "10.42.0.50",
+            30022,
+            deadline_s=provisioner._ssh_auth_ready_timeout,
+            connect_timeout_s=provisioner._ssh_auth_connect_timeout,
+            interval_s=provisioner._ssh_auth_poll_interval,
+            key_path="/run/secrets/test-key",
+        )
+
+    @pytest.mark.asyncio
+    async def test_auth_rejection_is_not_published_as_ready(self):
+        from orchestrator.services.container_provisioner import (
+            ContainerProvisioner,
+            WorkspaceSSHAuthenticationError,
+        )
+
+        provisioner = ContainerProvisioner()
+        provisioner._core_api = MagicMock()
+        provisioner._core_api.read_namespaced_pod.return_value = self._ready_pod()
+
+        with (
+            patch(
+                "orchestrator.services.container_provisioner.resolve_ssh_key_path",
+                return_value="/run/secrets/test-key",
+            ),
+            patch(
+                "orchestrator.services.container_provisioner.workspace_private_key_fingerprint",
+                return_value="SHA256:test",
+            ),
+            patch(
+                "orchestrator.services.container_provisioner.wait_for_agent_ssh",
+                new=AsyncMock(return_value=(False, 3, "Permission denied (publickey)")),
+            ),
+        ):
+            with pytest.raises(
+                WorkspaceSSHAuthenticationError, match="rejected.*SSH key"
+            ):
+                await provisioner._wait_for_ready("workspace-test", timeout=1)
+
+    @pytest.mark.asyncio
+    async def test_create_workspace_records_auth_failure_instead_of_ready(self):
+        from orchestrator.services.container_provisioner import (
+            ContainerProvisioner,
+            WorkspaceSSHAuthenticationError,
+        )
+
+        provisioner = ContainerProvisioner()
+        provisioner._k8s_available = True
+        provisioner._db = MagicMock()
+        provisioner._db.merge_workspace_container_context = AsyncMock(return_value=True)
+        provisioner._core_api = MagicMock()
+        provisioner._core_api.create_namespaced_pod = MagicMock()
+
+        with patch.object(
+            provisioner,
+            "_wait_for_ready",
+            new=AsyncMock(
+                side_effect=WorkspaceSSHAuthenticationError(
+                    "workspace rejected configured public key"
+                )
+            ),
+        ):
+            result = await provisioner.create_workspace(
+                WorkspaceOwner.job("test-job-auth-123456")
+            )
+
+        assert result is False
+        updates = [
+            call.args[1]
+            for call in provisioner._db.merge_workspace_container_context.call_args_list
+        ]
+        assert updates[-1] == {
+            "status": "failed",
+            "error": "workspace rejected configured public key",
+        }
+        assert not any(update.get("status") == "ready" for update in updates)
+
+
 class TestCreateWorkspacePvc:
     """Branch (a): PVC-backed job workspaces (WORKSPACE_PVC_ENABLED)."""
 
