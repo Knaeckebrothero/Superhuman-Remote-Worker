@@ -94,11 +94,36 @@ BEFORE f41970ae: branch = 'main'
 AFTER  f41970ae: branch = 'CWD: /home/agent-host/workspace\n--- stdout ---\nmain'
 ```
 
-So since **2026-08-01 12:41**, every git command routed through the workspace backend has
-returned polluted stdout. The damage lands in `push()`, which uses that stdout as a branch
-name — `git push -u origin "CWD: …\n--- stdout ---\nmain"` → `fatal: invalid refspec`, exit
-128, on **every phase boundary**. bbce4bed started at 14:42 the same day, two hours later,
-and ran 13 hours across 8 phases without landing a commit.
+The damage lands in `push()`, which uses that stdout as a branch name —
+`git push -u origin "CWD: …\n--- stdout ---\nmain"` → `fatal: invalid refspec`, exit 128.
+bbce4bed started at 14:42 on 2026-08-01, two hours after `f41970ae`, and ran 13 hours across
+8 phases without landing a commit.
+
+> **CORRECTION (2026-08-03).** An earlier revision of this doc — and commit `22b2511e`'s
+> message — claimed this broke *every* phase-boundary push cluster-wide from 2026-08-01
+> 12:41 onward. **That is wrong.** Measured against the dev cluster after the fix rolled out
+> at 19:59Z on 08-03, many jobs pushed normally throughout the supposed window:
+>
+> | repo | commits landed | window |
+> | --- | --- | --- |
+> | `job-becf5f64` | 102 | 08-02 22:05 → 08-03 01:15 |
+> | `job-5347c057` | 39 | 08-03 09:00 → 12:24 |
+> | `job-08e0006e` | 19 | 08-03 17:20 → 17:53 |
+> | `job-8e2c05cf` | 17 | 08-03 19:06 → 19:37 (pre-rollout) |
+>
+> The bug is real and reproducible — verified before/after on k3d, see below — but it fires
+> **conditionally**, and the trigger is not yet identified. `resolved_cwd` is only populated
+> when the tmux sentinel line carries a third field (`remote.py:1359`), and `shell_run` has
+> several early-return paths that never reach the banner-formatting block, so the `CWD:` line
+> is not present on every result. Do not rely on the blast-radius claim; treat the trigger as
+> an open question.
+
+**Attributable damage, as far as verified:** bbce4bed lost its deliverable to this (its own
+`freeze_data.head_commit` carries the pollution signature). Three other jobs in the window
+have branches holding only the seed commit and zero `output/` files — `42fb6e42`,
+`f9f167a4`, and `40efbb39` — but only circumstantially: none has been traced to a push
+failure, and `40efbb39` carries an unrelated critic-pipeline error. Counting them as
+casualties would repeat the over-claim.
 
 It stayed invisible because the parser also hardcoded `stderr=""`, so the one log line it
 produced read `git push failed: ` with nothing after the colon.
