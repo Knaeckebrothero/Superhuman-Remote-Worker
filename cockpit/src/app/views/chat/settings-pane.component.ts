@@ -33,6 +33,14 @@ import {AppButtonComponent} from '../../ui/button';
  *  upgrade verb). */
 const TRACKED_LLM_PATHS = ['llm.model', 'llm.temperature', 'llm.reasoning_level'] as const;
 
+/** Tracked-state prefix for a locked-on category's requested additions.
+ *
+ *  Deliberately NOT a real config path — nothing reads `tools+<c>` out of a
+ *  config, and it must not collide with the `tools.<c>` boolean it sits beside,
+ *  which tracks a different fact about the same category (whether it is on, not
+ *  whether the user asked to complete it). */
+const TOOL_ADDITIONS_PREFIX = 'tools+';
+
 /** How long to coalesce control changes before applying. One batch = one
  *  config.update = one prompt-cache invalidation, however many toggles the
  *  user flips in quick succession (live_session_settings.md, principle 4).
@@ -441,6 +449,19 @@ export class SettingsPaneComponent {
                         ? !(Array.isArray(pinned) && pinned.length === 0) && pinned !== false
                         : on.has(key);
             }
+            // A LOCKED-ON category is on before the click and on after it, so
+            // the boolean above cannot carry "add the tools config may still
+            // grant here" — the request is structurally invisible to a diff
+            // over switch positions. It gets its own tracked path, holding the
+            // requested enumeration, which means the ordinary diff dispatches
+            // it exactly once and the debounce, the `!previous ⇒ re-arm` guard
+            // and the thread-switch reset all apply to it unchanged. Empty for
+            // every session that never uses the affordance, so the baseline is
+            // stable.
+            const additions = this.settings()?.getToolAdditions() ?? {};
+            for (const key of Object.keys(categories)) {
+                state[`${TOOL_ADDITIONS_PREFIX}${key}`] = (additions[key] ?? []).join(',');
+            }
         }
         // Canonical joined form so the diff is a plain string compare. The
         // picker's untouched default IS the attached set, so this holds the
@@ -474,20 +495,11 @@ export class SettingsPaneComponent {
             const unsettable = new Set(
                 Object.keys(categories).filter((key) => categories[key].settable === false),
             );
-            // The subset of `unsettable` the agent already holds (per-tool code
-            // grant, `state: 'on'` on the untouched server answer — never the
-            // live `desired`/`previous` booleans, which is what makes this
-            // stable while the category is toggled back and forth below).
-            // `toolsFragment` drops its special-casing entirely for these keys
-            // — it has no notion of "reaches the wire" versus "local
-            // bookkeeping" — so the stripping pass just after is what actually
-            // keeps the OFF half a promise this pane never makes to the server.
-            const lockedOn = new Set(
-                Object.keys(categories).filter(
-                    (key) => categories[key].settable === false && categories[key].state === 'on',
-                ),
-            );
-            const builtTools = toolsFragment(Object.keys(categories), {
+            // Symmetric, and that is the guarantee: an unsettable category is
+            // never emitted in either direction, so "a locked category cannot
+            // be switched off" holds here by construction rather than by a
+            // downstream pass that strips an off-write someone else built.
+            Object.assign(tools, toolsFragment(Object.keys(categories), {
                 disabled: new Set(
                     Object.keys(categories).filter((key) => !desired[`tools.${key}`]),
                 ),
@@ -495,22 +507,20 @@ export class SettingsPaneComponent {
                     Object.keys(categories).filter((key) => !!previous[`tools.${key}`]),
                 ),
                 unsettable,
-                lockedOn,
                 enumerateOnly: this.resolvedToolset()?.enumerate_only ?? null,
-            });
-            // A locked-on category's untick is real LOCALLY (it is what lets a
-            // later re-tick read as a change against the constant server-on
-            // fallback in `desired` — see ToolsGroupComponent.getOverrides(),
-            // which needs the same off-write to move ITS OWN tracking) but must
-            // never reach the wire: the runtime re-appends the code-granted
-            // names regardless, so "turn this off" is not a request the server
-            // was ever asked to honour. Strip it here, at the one place that
-            // actually dispatches.
-            for (const key of lockedOn) {
-                const value = builtTools[key];
-                if (Array.isArray(value) && value.length === 0) delete builtTools[key];
+            }));
+            // ...and the other direction, which the diff above cannot see: a
+            // locked-ON category may still GAIN the tools config grants. This
+            // channel can only ever write an enumeration — there is no shape of
+            // `desired`/`previous` that makes it emit `[]` — which is what lets
+            // the affordance exist without reopening the off half.
+            for (const key of Object.keys(categories)) {
+                const path = `${TOOL_ADDITIONS_PREFIX}${key}`;
+                const requested = desired[path] as string;
+                if (requested && requested !== previous[path]) {
+                    tools[key] = {only: requested.split(',')};
+                }
             }
-            Object.assign(tools, builtTools);
         }
         if (Object.keys(llm).length) fragment['llm'] = llm;
         if (Object.keys(tools).length) fragment['tools'] = tools;
