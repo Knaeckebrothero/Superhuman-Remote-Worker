@@ -73,6 +73,10 @@ The current grant catalog covers:
 - `email_autonomous_send` — allow fail-closed unattended email sending;
 - `datasource_tools` — load connector-backed tools;
 - `browser` — load the agent's direct browser tools;
+- `catalog_authoring` — let the agent create and update the user's own experts,
+  skills, and automations. The writes are owner-scoped by the same endpoints the
+  UI uses, and a new automation is created switched off; the grant exists because
+  an enabled automation goes on to spawn jobs;
 - `model_selection` — restrict the selectable model set;
 - `autonomy_ceiling` — cap worker-job autonomy; and
 - `permission_mode` — cap persistent-session permission mode.

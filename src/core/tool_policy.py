@@ -152,9 +152,12 @@ def _grantable(category: str) -> list[str]:
       ``cloud_mount.active``, an attached datasource).  Excluding these is what
       makes ``core: true`` reproduce today's six tools exactly.
     * ``grant: "explicit"`` — config may grant it, but only by naming it.
-      Holds the four closed session groups' ``true`` expansion at exactly
-      ``SESSION_TOOL_OVERRIDE_NAMES``, so a user ticking "Experts & Skills"
-      cannot silently acquire ``set_expert_bundle``.
+      Holds a closed session group's ``true`` expansion at exactly
+      ``SESSION_TOOL_OVERRIDE_NAMES`` where the category mixes tiers
+      (``orchestrator``, which holds ``steer_worker_job``). The ``*_bundle``
+      writes no longer need it: they live in ``catalog_authoring``, so
+      ``agent_catalog: true`` cannot reach them structurally rather than by
+      exception.
 
     Neither mark affects an explicitly written name — see
     :func:`expand_tool_policy`.

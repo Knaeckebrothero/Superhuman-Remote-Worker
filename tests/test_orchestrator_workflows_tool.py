@@ -68,8 +68,6 @@ def test_workflow_tools_have_separate_category():
         "get_automation",
         "list_automation_runs",
         "propose_automation",
-        "get_automation_bundle",
-        "set_automation_bundle",
         "get_project_loop",
         "list_project_loop_jobs",
         "explain_project_loop",
@@ -77,6 +75,13 @@ def test_workflow_tools_have_separate_category():
     assert expected <= workflows
     assert expected.isdisjoint(fleet)
     assert expected.isdisjoint(catalog)
+
+    # The automation bundle get+set moved to `catalog_authoring` on 2026-08-03,
+    # leaving `workflows` with reads plus `propose_automation`, which drafts a
+    # bundle without writing it. So the group's `true` grants no writes.
+    authoring = set(get_tools_by_category("catalog_authoring"))
+    assert {"get_automation_bundle", "set_automation_bundle"} <= authoring
+    assert authoring.isdisjoint(workflows)
 
 
 @pytest.mark.asyncio

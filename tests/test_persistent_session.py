@@ -16,6 +16,7 @@ from src.api.persistent_session import (
     PersistentSession,
     _EXCLUDED_TOOLS,
 )
+from src.core.session_tool_overrides import SESSION_TOOL_OVERRIDE_NAMES
 from src.core.workspace_backend import WorkspaceUnavailableError
 
 
@@ -1507,8 +1508,13 @@ class TestSetupTools:
         assert "create_worker_job" in loaded_names
         assert "request_workspace_upgrade" in loaded_names
         assert "list_skills" not in loaded_names
-        assert "set_skill_bundle" not in loaded_names
         assert "list_automations" in loaded_names
+        # The bundle writes moved to `catalog_authoring` on 2026-08-03, so the
+        # Experts & Skills opt-out no longer governs them — its own checkbox and
+        # its own capability grant do. Unticking a READ group must not be what
+        # revokes a write capability, and vice versa: that coupling is why
+        # "Experts & Skills" once read as a manage capability.
+        assert "set_skill_bundle" in loaded_names
         assert "set_automation_bundle" in loaded_names
 
     def test_workflows_can_be_disabled(self):
@@ -1553,7 +1559,61 @@ class TestSetupTools:
         assert "create_worker_job" in loaded_names
         assert "list_skills" in loaded_names
         assert "list_automations" not in loaded_names
-        assert "set_automation_bundle" not in loaded_names
+        # Same decoupling as the agent_catalog case: the automation bundle writes
+        # answer to `catalog_authoring`, not to the Automations & Loops read group.
+        assert "set_automation_bundle" in loaded_names
+
+    def test_catalog_authoring_is_not_stripped_by_the_read_groups(self):
+        """The write group survives BOTH read opt-outs at once.
+
+        The two tests above each prove one half; this pins the pair, because the
+        failure mode worth guarding is a future strip branch quietly reclaiming
+        these six through whichever read group looks adjacent. What governs them
+        is the merged config (an unticked `catalog_authoring` never puts the names
+        in the list) plus the capability grant — not a runtime strip.
+        """
+        cfg = _make_config(
+            extra={"_agent_catalog_disabled": True, "_workflows_disabled": True}
+        )
+        session = _make_session(config=cfg)
+        session.workspace_manager = MagicMock()
+        session.workspace_manager.backend.supports_shell = False
+
+        with (
+            patch(
+                "src.api.persistent_session.get_all_tool_names",
+                return_value=[
+                    "web_search",
+                    "list_skills",
+                    "list_automations",
+                    "get_expert_bundle",
+                    "set_expert_bundle",
+                    "get_skill_bundle",
+                    "set_skill_bundle",
+                    "get_automation_bundle",
+                    "set_automation_bundle",
+                ],
+            ),
+            patch(
+                "src.api.persistent_session.load_tools", return_value=[]
+            ) as mock_load,
+            patch(
+                "src.api.persistent_session.apply_description_overrides",
+                side_effect=lambda x: x,
+            ),
+            patch(
+                "src.api.persistent_session.apply_instruction_enforcement",
+                side_effect=lambda x, y: x,
+            ),
+            patch("src.api.persistent_session.ToolContext"),
+        ):
+            session._setup_tools(None)
+
+        loaded_names = mock_load.call_args_list[0].args[0]
+        assert "list_skills" not in loaded_names
+        assert "list_automations" not in loaded_names
+        for name in SESSION_TOOL_OVERRIDE_NAMES["catalog_authoring"]:
+            assert name in loaded_names, f"{name} was stripped by a read opt-out"
 
     def test_canvas_can_be_disabled_independently(self):
         cfg = _make_config(extra={"_canvas_disabled": True})

@@ -34,6 +34,7 @@ def test_catalog_keys_and_defaults():
         "permission_mode",
         "public_datasources",
         "email_autonomous_send",
+        "catalog_authoring",
     }
     assert all(spec["restrict_only"] for spec in CATALOG.values())
     assert CATALOG["personal_default_experts"]["default"] is True
@@ -42,6 +43,9 @@ def test_catalog_keys_and_defaults():
     assert CATALOG["delegation"]["default"] is False
     assert CATALOG["public_datasources"]["default"] is False  # deny-by-default
     assert CATALOG["email_autonomous_send"]["default"] is False  # deny-by-default
+    # Deny-by-default AND not backfilled: nobody held it before, so unlike
+    # 0030's shell_tools/delegation there is nothing to grandfather.
+    assert CATALOG["catalog_authoring"]["default"] is False
     assert CATALOG["browser"]["default"] is True  # spec-deferred allow
     assert CATALOG["datasource_tools"]["default"] is True
     assert CATALOG["model_selection"]["default"] is None

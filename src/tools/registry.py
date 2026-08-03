@@ -127,14 +127,19 @@ TOOL_REGISTRY.update(get_delegation_metadata())
 #                behaviour-preserving for ``core`` and ``shell``.
 #   ``"explicit"``
 #                Config may grant it, but only by writing its name.  A
-#                category-level ``true`` / ``except`` must not reach it.  This
-#                is the safety judgement that ``SESSION_TOOL_OVERRIDE_NAMES``
-#                (src/core/session_tool_overrides.py) carries today as a
-#                hand-curated parallel list: nine registry entries sit in a
-#                selectable category yet are absent from that vocabulary, six
-#                of them control-plane *writes* (``set_expert_bundle`` and
-#                friends).  Marking them here means a future
-#                ``agent_catalog: true`` cannot silently acquire them.
+#                category-level ``true`` / ``except`` must not reach it.
+#
+#                This mark used to carry the safety judgement for the six
+#                ``*_bundle`` control-plane writes, which sat inside
+#                ``agent_catalog`` / ``workflows`` yet were absent from
+#                ``SESSION_TOOL_OVERRIDE_NAMES``.  On 2026-08-03 they moved to
+#                their own ``catalog_authoring`` category behind a capability
+#                grant, so those two groups now contain only reads and their
+#                ``true`` expansion equals the session vocabulary *by
+#                construction* — no mark required.  Prefer that fix: a category
+#                whose name matches its blast radius needs no exception list.
+#                What remains marked is the residue where a category genuinely
+#                mixes tiers (``delegate_work``, ``steer_worker_job``).
 #
 # ``gate``
 #   A short string, present on every classified entry: what actually decides
@@ -880,6 +885,28 @@ def load_tools(tool_names: List[str], context: ToolContext) -> List[Any]:
                     logger.debug(f"Loaded workflows tool: {tool.name}")
         except Exception as e:
             logger.warning(f"Could not load workflow tools: {e}")
+
+    # Catalogue-authoring tools (expert / skill / automation bundle get+set).
+    # The only category whose members come from TWO factories: the expert and
+    # skill bundles are built by create_catalog_tools, the automation bundles by
+    # create_workflow_tools.  They live in one category because they share a
+    # gate — the `catalog_authoring` capability grant — not because they share a
+    # module.  Constructing a factory is closure creation plus an env read, so
+    # calling one again here when a session also asked for its read-only sibling
+    # category is cheap; filtering by `requested` keeps each tool bound once.
+    if "catalog_authoring" in tools_by_category:
+        requested = set(tools_by_category["catalog_authoring"])
+        for factory in (create_catalog_tools, create_workflow_tools):
+            try:
+                for tool in factory(context):
+                    if tool.name in requested:
+                        all_tools.append(tool)
+                        logger.debug(f"Loaded catalog_authoring tool: {tool.name}")
+            except Exception as e:
+                logger.warning(
+                    f"Could not load catalog_authoring tools from "
+                    f"{factory.__name__}: {e}"
+                )
 
     logger.info(f"Loaded {len(all_tools)} tools: {[t.name for t in all_tools]}")
     return all_tools
