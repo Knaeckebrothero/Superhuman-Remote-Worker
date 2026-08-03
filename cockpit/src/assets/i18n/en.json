@@ -1664,7 +1664,8 @@
       "communication": "Communication",
       "delegation": "Delegating work",
       "orchestrator": "Fleet management",
-      "agent_catalog": "Managing experts and skills",
+      "agent_catalog": "Looking up experts and skills",
+      "catalog_authoring": "Authoring experts and automations",
       "workflows": "Managing automations and loops",
       "evaluation": "Evaluation"
     },
@@ -2587,7 +2588,11 @@
     "toolCategories": {
       "agent_catalog": {
         "label": "Experts & Skills",
-        "description": "Ability to manage experts and skills"
+        "description": "Ability to look up experts and skills. Read-only — the row below is what creates them"
+      },
+      "catalog_authoring": {
+        "label": "Author Experts & Automations",
+        "description": "Ability to create and update your own experts, skills and automations on your behalf. New automations are created switched off for you to review"
       },
       "browser_direct": {
         "label": "Browser",

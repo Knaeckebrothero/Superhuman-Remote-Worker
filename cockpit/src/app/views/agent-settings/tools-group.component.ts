@@ -459,10 +459,20 @@ export class ToolsGroupComponent {
    *  (launch flow / admin). Maps tool categories → catalog keys. */
   gatedCapabilities = input<Record<string, unknown> | null>(null);
 
+  /**
+   * Client mirror of `GRANT_GATED_CATEGORIES` (src/core/tool_report.py), used
+   * ONLY for editor greying — `capability_grants.evaluate` is the enforcement.
+   *
+   * Known-incomplete: the seven `datasource_tools` categories have never been
+   * listed here, so an author without that grant is not greyed and learns at
+   * save time via 422. Pre-existing; adding them is a behaviour change to the
+   * editor, not a fix to this row.
+   */
   private readonly CAT_TO_GRANT: Record<string, string> = {
     shell: 'shell_tools',
     delegation: 'delegation',
     browser_direct: 'browser',
+    catalog_authoring: 'catalog_authoring',
   };
 
   /** True if a category is blocked by a missing grant (disable-only — never

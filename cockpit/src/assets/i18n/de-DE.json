@@ -1664,7 +1664,8 @@
       "communication": "Kommunikation",
       "delegation": "Arbeit delegieren",
       "orchestrator": "Flottenverwaltung",
-      "agent_catalog": "Experten und Skills verwalten",
+      "agent_catalog": "Experten und Skills nachschlagen",
+      "catalog_authoring": "Experten und Automatisierungen erstellen",
       "workflows": "Automatisierungen und Loops verwalten",
       "evaluation": "Auswertung"
     },
@@ -2578,7 +2579,11 @@
     "toolCategories": {
       "agent_catalog": {
         "label": "Experten & Skills",
-        "description": "Kann Experten und Skills verwalten"
+        "description": "Kann Experten und Skills nachschlagen. Nur lesend — angelegt werden sie in der Zeile darunter"
+      },
+      "catalog_authoring": {
+        "label": "Experten & Automatisierungen erstellen",
+        "description": "Kann eigene Experten, Skills und Automatisierungen in Ihrem Namen anlegen und ändern. Neue Automatisierungen werden deaktiviert angelegt, damit Sie sie prüfen können"
       },
       "browser_direct": {
         "label": "Browser",
