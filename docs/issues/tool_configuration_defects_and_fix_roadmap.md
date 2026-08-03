@@ -16,8 +16,52 @@ related:
 
 # Tool configuration — consolidated defect register and fix roadmap
 
-**Status:** OPEN, diagnosed 2026-08-01/02. Nothing implemented.
+**Status:** IMPLEMENTED 2026-08-02/03 across 22 commits on `develop`, **not
+pushed**, and **not yet merge-ready** — the final whole-branch review returned
+four blockers, listed under "Merge blockers" below. Phases 0–3 are done; each
+task went implement → adversarial review → fix → scoped re-review. Full
+execution record, including ~40 triaged deferred minors and every ruling:
+`.superpowers/sdd/tool_configuration_defects_and_fix_roadmap/progress.md`.
 **Owner:** unassigned.
+
+## Merge blockers (final review, 2026-08-03)
+
+1. **The expert write boundary was missed.** `orchestrator/main.py:29009`,
+   `:29052`, `:29156`, `:29348` run only the credential deny-scan and the
+   grants PDP — `validate_tool_override_fragment` is absent. Verified
+   escalation: an expert carrying `tools.canvas: ["run_command"]` is storable
+   by any approved user; the PDP keys off the category so it sees nothing,
+   `load_tools` regroups by *registry* category, and the shell tool binds
+   without the `shell_tools` grant. Four one-line calls to a validator that
+   already exists. A three-task seam failure — Task 5 predicted it, Task 7
+   ("every write boundary") did not enumerate it, Task 8 then routed UI traffic
+   through it.
+2. **A per-tool code grant renders as an un-untickable ticked box.**
+   `src/core/tool_report.py:386` knows only *category*-level grants, so
+   `srw_cloud_status`, `sleep`, `notify_user` and `request_workspace_upgrade`
+   are invisible to it while the agent re-appends them after the merge.
+   `compose_tool_view` guards "off is a promise" with no symmetric guard for
+   "on is revocable". Reachable on any session with a cloud mount — the default
+   topology. Server-side only; the cockpit already renders locked-on correctly.
+3. **Live gates for Phases 1.2 and 1.3 never ran** — blocked on the k3d cluster
+   (gitea's sqlite→postgres guard, migration drift, an ad-hoc pod image).
+   Phase 1.1's gate *did* run and passed. Blocker 2 is precisely what a gate
+   catches and eight rounds of static review nearly missed.
+4. ~~Doc status headers stale~~ — this file corrected;
+   `registered_tools_no_config_can_grant.md:20` and
+   `tool_config_policy_vs_membership.md:39` still say "not started".
+
+**What was achieved:** `[]` no longer conflates membership with policy, so "on"
+is expressible; all 12 form categories are honoured where 4 were; eight of nine
+write boundaries reject rather than drop; the agent is the sole authority on
+what it bound, with one implementation of that answer. Task 5's identity
+property — no shipped config's grants change — held across all eight tasks.
+
+**What was not:** no creation form can tell the truth structurally, because a
+prediction cannot see the backend gate, runtime injection, or datasource
+attachment — and no cockpit surface branches on `origin` in a way that changes
+the control, so a forecast still renders as switch positions. Job create is the
+weakest surface: no server-computed view at all.
 **Purpose:** single entry point for the nine defects found in one investigation.
 The detail lives in the three linked docs; this one exists so the work can be
 sequenced and picked up without reading all four.
