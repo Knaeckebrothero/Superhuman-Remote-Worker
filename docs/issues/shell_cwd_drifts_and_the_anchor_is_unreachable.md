@@ -334,7 +334,7 @@ Contradictions found while implementing the verified write-up:
   shell state, and the matrix currently conflates them. Worth re-deciding once slices 1–2 land and
   the drift is at least visible — not before, since the data we have is from a build where it wasn't.
 - **Contract-path verification.** A todo that verified content but not location produced a false
-  green that misled the job for 14 hours. This is what the `manifest_status.json` /
+  green that misled the job for 14 hours. This is what the Gitea-backed
   `required_deliverables` seal is for — see `docs/issues/phase_model_overhead_amnesia_loop.md` §P-2.
 - **Todos that embed literal commands.** The brief handed the agent an exact command string carrying
   a hidden CWD assumption. Todos should state the contract (file at path P with hash H) and let the

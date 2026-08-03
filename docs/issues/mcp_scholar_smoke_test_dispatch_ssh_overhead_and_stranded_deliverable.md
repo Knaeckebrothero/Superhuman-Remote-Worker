@@ -26,8 +26,13 @@ environment.
 **Status:** **PARTIALLY REMEDIATED IN THIS CHECKOUT; LIVE ACCEPTANCE PENDING.**
 The failure chain is reproduced and bounded. P0-A (MCP/start-path provisioning)
 and P0-B (SSH configuration/authentication readiness) were implemented on
-2026-08-03. The deployed connector has not yet been refreshed and the three
-diagnostic job records were left intact. P0-C and the P1/P2 findings remain open.
+2026-08-03. A same-day local k3d acceptance run proved that the diagnostics are
+active, but also exposed a local-dev key-mode failure in the new SSH handshake.
+The remote connector still advertised the old MCP contract after it came back
+online. Functional P0-C/P0-D findings remain open; runtime containment is
+preserved separately in `job_runtime_containment_gap.md` and deliberately
+follows the correctness-first acceptance gate. Five diagnostic job records were
+left intact.
 
 **Severity:**
 
@@ -130,12 +135,17 @@ still be proven against the actual connector target after deployment.
 | F5 | Scholar-specific initialization forces five strategic process tasks and asks for a 10–20-todo phase even for a bounded one-file answer | Confirmed live + config | P1 |
 | F6 | Enforced skill-read gates caused predictable failed calls and extra LLM turns before both todo creation and citation | Confirmed in audit + config | P1 |
 | F7 | The source budget was not honored at the source-library layer: two searches automatically archived ten results, including irrelevant, non-primary, and inaccessible pages | Confirmed live | P1 |
-| F8 | The report was complete at LLM request 31, but verification repeated through request 55; no repeated-action/result loop breaker fired | Confirmed live | P0 cost / P1 function |
+| F8 | The report was complete at LLM request 31, but 21 more verification rounds issued 88 tool calls through request 55. A literal-search/regex mismatch, a phase-boundary-only stale manifest, and per-turn reinjection of the verification skill formed a completion deadlock; no hard loop breaker fired | Confirmed live + source | P0 cost / P1 function |
 | F9 | Live progress, phase, todo, and config reporting did not reflect the active job | Confirmed live | P2 |
 | F10 | The virtual report is proven written but never exported to Gitea and is unavailable through both deployed MCP readers after cancellation | Confirmed visibility failure; physical deletion not proven | P1 |
 | F11 | `pause_job` is a preemption primitive that immediately re-enters dispatch, while its MCP description reads like an operator hold | Confirmed live + code | P1 operator control |
 | F12 | There was no usable live steer/interrupt channel because `send_message_to_job` requires a thread ID and the job had no message thread | Confirmed live | P2 |
 | F13 | The original wrong-tree/worktree concern remains untested because neither Git-backed run reached Git | Confirmed limitation | Acceptance blocker |
+| F14 | The local k3d authenticated readiness gate correctly rejected the SSH key, but for a chart/dev-runtime incompatibility already described in chart comments: the root-running dev orchestrator invoked OpenSSH on a root-owned `0444` projected key | Confirmed local + source | P0 local acceptance |
+| F15 | `delegation.enabled=false` persisted in the resolved local config but did not remove or disable `spawn_subagent`; the model ignored the textual prohibition and launched three readers (33 additional LLM calls) | Confirmed local + source | P1 cost / contract |
+| F16 | Local Tavily calls were real provider errors caused by broken k3d external DNS, but `_direct_web_search` discarded the response's `error` field and reported a successful “No web results found” observation | Confirmed local provider probe + CoreDNS logs + source | P1 error semantics |
+| F17 | `search_papers` is incompatible with installed `arxiv==4.0.0`: source calls removed `Search.results()` instead of `Client.results(search)` | Confirmed local runtime + source | P1 tool function |
+| F18 | The local Scholar retried empty/broken research tools from main calls 37-55, including exact duplicate queries, and consumed 1.63M raw tokens before operator cancellation; the configured 120-tool budget and current warning-only loop detector did not contain it in time | Confirmed local audit | P0 cost / P1 function |
 
 ---
 
@@ -409,7 +419,10 @@ writes.
 The final report was readable at the logical path and the agent repeatedly said
 it already contained 4,248 characters, three sections, two sources, and five
 citations. It nevertheless restarted the same “define done, run fresh checks,
-reconcile” sequence for more than twenty LLM calls.
+reconcile” sequence for 21 more LLM calls. Those were not three slow or hung
+tools: requests 35-55 contained **21 separate batches and 88 tool calls**. Every
+LLM response selected another batch, the tools returned, and the graph invoked
+the LLM again.
 
 The loop's stable signature was roughly:
 
@@ -421,9 +434,46 @@ search_files(output/report.md, heading/URL patterns)
 ```
 
 The heading-pattern check repeatedly returned no matches while direct reads
-proved the headings existed. No code recognized that the normalized tool calls
-and their results were repeating, no bounded verifier terminated with a clear
-pass/fail, and the model never completed `todo_8`.
+proved the headings existed. The exact sequence explains why:
+
+1. Request 31 wrote the final report successfully. Request 32 immediately proved
+   `output/report.md` existed and read all 4,248 characters. The internal object
+   key echoed by the write result also led to one failed check of
+   `jobs/<job-id>/output/report.md`, but that path confusion did not persist.
+2. Request 34 tried to translate the writing check from the
+   `verify-before-done` skill into `wc`/`grep`, but called unavailable
+   `shell_execute` on the virtual workspace.
+3. The fallback used `search_files` with grep-style expressions such as
+   `^## [1-3]\.` and `^## `. The virtual backend implements case-folded **literal
+   substring** search (`needle in line`), while the SSH backend invokes grep and
+   therefore accepts regular expressions. The public tool text says “Text or
+   pattern” and does not disclose that backend-dependent semantic split. The
+   literal query returned no match even though direct reads showed the headings;
+   searches for literal `https://` and `Mitigation` succeeded.
+4. `output/manifest_status.json` still said `exists: false`. That file was a
+   correct phase-0 boundary snapshot created before the tactical report write.
+   It is refreshed only by `_complete_phase_with_git`, after all tactical todos
+   complete. The model made a fresh/true manifest part of `todo_8`'s definition
+   of done, but completing `todo_8` was itself the action required to reach the
+   boundary that refreshes the manifest. This was a circular condition.
+5. `verify-before-done` is actively injected at the tail of **every** tactical
+   request (`src/graph.py:_inject_transient_messages`), immediately before the
+   unchanged active todo list. The next model turn did receive the preceding tool
+   results, but the newly injected four-step gate and unchanged `todo_8` caused
+   deterministic MiniMax (temperature 0) to restart at “define done / run fresh”
+   instead of reconciling and deciding. Requests `93973` onward repeatedly say
+   that explicitly.
+
+This was therefore a prompt/graph attractor with two misleading state signals,
+not filesystem loss and not a blocked process. The filesystem and each tool call
+continued to answer; the model kept choosing another verification batch.
+
+The existing detector could not contain it. It counts identical tool name +
+argument fingerprints in a 30-call window, warns at ten, appends a nudge, and
+still executes the call (`src/graph.py:4107-4114`, `4424-4467`). Variations in
+the multi-tool bundles delayed even that warning. The progress-stall control is
+also a reminder, not a stop, and the ordinary job-level ceiling is 5,000 tool
+calls. No LLM-call, token, or verification-round ceiling exists.
 
 A loop breaker should operate below the model:
 
@@ -577,6 +627,15 @@ so the next acceptance run must explicitly cover it after F2/F3 are repaired.
 
 ## 10. Prioritized remediation plan
 
+### Priority decision — restore useful completed jobs before optimizing them
+
+The next release gate is one correct, durable, Git-backed Scholar result—not a
+lower token count. Fix SSH execution, truthful research tools, final artifact
+durability, exact-branch push, MCP readability, and terminal completion first.
+Ceremony reduction and runtime ceilings follow once successful-job baselines
+exist. A costly job that completes correctly is acceptable during recovery; an
+efficient job that produces no usable deliverable is not.
+
 ### P0-A — make every start path provision-aware — implemented, live gate open
 
 - [x] Stop telling ordinary MCP callers to use the admin manual-assign override.
@@ -595,15 +654,47 @@ so the next acceptance run must explicitly cover it after F2/F3 are repaired.
   independently validate/connect from the worker at initialization.
 - [x] Classify deterministic authentication failures separately and fail once
   with a useful backend-specific message.
+- [ ] Stage the projected key into a runtime-owned `0600` identity in local and
+  deployed environments, then pass the authenticated k3d workspace handshake.
 
-### P0-C — stop repeated identical execution loops
+### P0-C — restore the research-to-Git result path — immediate
 
-- Add normalized tool-call/result repetition detection.
-- Bound verification retries independently of phase/token budgets.
-- Freeze/fail once with the repeated check and last result instead of silently
-  continuing.
+- [ ] Restore k3d external DNS and prove one Tavily request from the agent pod.
+- [ ] Preserve Tavily/provider failures as typed errors instead of successful
+  empty result sets.
+- [ ] Update the paper-search adapter for the installed arXiv client and prove a
+  real query.
+- [ ] Complete a Scholar report, commit and push it to the exact assigned job
+  branch, and reach the orchestrator-owned terminal state.
+- [ ] Read that committed report back through MCP/Gitea.
 
-### P1-A — give Scholar a bounded-task path
+These are the current release blockers. Call count, token count, phase ceremony,
+and redundant-but-progressing work are observations during this gate, not reasons
+to reject an otherwise correct result.
+
+### P0-D — make successful required artifacts durable and readable — immediate
+
+- Ensure normal finalization exports every required file before terminal success.
+- Read the file from the exact committed job ref through the operator-facing MCP
+  surface.
+- Refuse terminal success when a declared required deliverable is absent from
+  that ref.
+- Separate live-workspace and committed-Gitea readers in names and descriptions.
+- Do not leak internal object-store prefixes into logical path confirmations.
+
+After normal successful completion passes, extend the same durability contract
+to hold, terminal failure, and cancellation, including recovery with provenance
+from object storage or audit. That interrupted-work recovery is important, but it
+must not delay proving the ordinary success path.
+
+### Deferred follow-up — stop repeated identical execution loops
+
+Tracked in `job_runtime_containment_gap.md`. This is not the immediate
+job-recovery gate and must not be implemented as a low ceiling that prematurely
+stops legitimate work. Start with shadow telemetry after functional acceptance,
+then add an adapt-or-hold policy which preserves required deliverables.
+
+### Deferred optimization — give Scholar a bounded-task path
 
 - Honor explicit no-delegation/source-count/finish-early instructions as hard
   constraints.
@@ -613,14 +704,6 @@ so the next acceptance run must explicitly cover it after F2/F3 are repaired.
 - Avoid enforced skill-read failure turns: inject the required small contract
   before the gated call or make the tool result itself actionable without another
   LLM cycle.
-
-### P1-B — make virtual artifacts durable and readable
-
-- Separate live-workspace and committed-Gitea readers in names and descriptions.
-- Snapshot/export required files on hold, terminal failure, and cancellation.
-- Expose artifact recovery with provenance from object storage/audit when final
-  export did not occur.
-- Do not leak internal object-store prefixes into logical path confirmations.
 
 ### P2 — repair operator controls and telemetry
 
@@ -634,35 +717,34 @@ so the next acceptance run must explicitly cover it after F2/F3 are repaired.
 
 ## 11. Required live acceptance test
 
-After the fixes, repeat the same bounded Scholar task through the deployed MCP
-surface—not a unit-only substitute—and require all of the following:
+After the functional fixes, repeat the same small Scholar task through the
+deployed MCP surface—not a unit-only substitute. The recovery gate requires all
+of the following:
 
 1. `create_project_job` exposes `required_deliverables=["output/report.md"]`.
 2. The documented next action cannot bypass workspace provisioning.
 3. A fresh worker pod authenticates to a fresh sandbox workspace; warm-pod
    environment leakage must not be allowed to mask the test.
-4. Object-level research begins within the first few LLM calls; no forced
-   10-20-todo plan is created for this task.
-5. No more than three sources are registered for the job, and inaccessible or
-   irrelevant search hits are not silently counted as selected sources.
-6. The report is scaffolded early, finalized, committed, and pushed to the
+4. At least one configured research provider returns real source evidence;
+   provider/DNS/client failures remain explicit errors rather than empty success.
+5. The final report answers the task and respects explicit correctness
+   constraints such as requested source count and citation requirements.
+6. The report is finalized, committed, and pushed to the
    assigned project job branch.
 7. `get_job_file("output/report.md")` returns the committed report and
    `get_workspace_file` has unambiguous live-vs-committed semantics.
 8. The job reaches `completed` or `pending_review` without operator intervention.
-9. No normalized tool/result bundle repeats more than three times without a state
-   change.
-10. A second run pauses into a true hold; the report remains retrievable while
-    held and after cancellation.
-11. Inspect the project repo/worktree and prove the deliverable landed on the
-    intended job branch, not `main`, another job's branch, a nested repo, or an
-    unpushed local commit. This is the explicit acceptance gate for the user's
-    original wrong-tree concern.
+9. Inspect the project repo/worktree and prove the deliverable landed on the
+   intended job branch, not `main`, another job's branch, a nested repo, or an
+   unpushed local commit. This is the explicit acceptance gate for the user's
+   original wrong-tree concern.
 
-Suggested smoke-test budget for this exact one-file task: first web/research tool
-within three LLM decisions, final artifact within ten minutes, and no unbounded
-verification tail. Record full token totals so the improvement is measurable
-against today's **2,487,273-token** baseline.
+Record time, parent/child LLM calls, token totals, delegation, phase ceremony,
+and repeated bundles during this run, but do not fail the functional gate merely
+because those numbers are inefficient. Once the report passes the gate above,
+use those observations as the baseline for the bounded-Scholar and containment
+follow-ups. True operator hold and interrupted-artifact recovery receive their
+own acceptance runs; neither replaces this successful-completion proof.
 
 ---
 
@@ -703,3 +785,266 @@ Related but distinct history:
 
 Both worker agents were back in `ready` state after cancellation. No live project,
 job, commit, workspace, or audit evidence was cleaned up.
+
+---
+
+## 13. Local k3d rerun after P0-A/P0-B (2026-08-03)
+
+The exact bounded RAG task was repeated against the local `k3d-srw` cluster in
+namespace `srw`. It used a fresh project job, automatic dispatch, an explicit
+`required_deliverables=["output/report.md"]`, `delegation.enabled=false`, and a
+temporary smoke-test ceiling of 120 tool calls. No manual assignment was used.
+
+### 13.1 Results
+
+| Attempt | Job | Backend | Outcome |
+|---|---|---|---|
+| Authenticated sandbox acceptance | `67e4e76b-394d-4b3a-b271-8cd9be69eb14` | `sandbox` | Automatic dispatch provisioned `workspace-67e4e76b-394`; the new handshake rejected the mounted key before worker execution; job `failed` with 0 audit entries |
+| Graph/runtime isolation | `77e7e85c-b5e0-4c2f-b1a9-81d6210e0e3c` | `virtual` | Scholar wrote a 569-character report scaffold, then entered a research retry loop; operator cancelled after enough evidence |
+
+The virtual run's complete LLM accounting was:
+
+| Main calls | Light-subagent calls | Prompt tokens | Completion tokens | Total raw tokens | Wall interval |
+|---:|---:|---:|---:|---:|---:|
+| 55 | 33 | 1,593,463 | 41,174 | **1,634,637** | 15m49s |
+
+This local run did **not** reproduce the original post-final-report loop because
+it never obtained the sources needed to finalize the scaffold. It reproduced the
+same missing containment at an earlier impossible todo: main calls 37-55 were
+`web_search`/`research_topic` retries, including several byte-identical queries,
+and every result was empty. Cancellation was requested at 15:04:24 UTC; the
+current LLM node completed at 15:04:33 before the graceful stop took effect.
+The local Gitea reader returned HTTP 404 for `output/report.md` on both jobs, so
+even the successfully written virtual scaffold was not exported to committed
+operator-visible state before cancellation.
+
+### 13.2 The SSH fix exposed a local deployment defect
+
+The readiness diagnostics worked as intended. They verified that the private key
+existed and parsed, logged only its public SHA256 fingerprint, then attempted an
+authenticated `ssh ... true`. The deterministic failure was:
+
+```text
+Permissions 0444 for '/run/secrets/vm-ssh-key' are too open.
+Load key "/run/secrets/vm-ssh-key": bad permissions
+Permission denied (publickey).
+```
+
+This is not a key-pair mismatch. `container_provisioner._wait_for_ready` invokes
+the OpenSSH client from the orchestrator pod. The local dev orchestrator runs as
+root; Kubernetes projects the root-owned secret with `defaultMode: 0444`; and
+OpenSSH refuses an identity owned by its own UID when group/world-readable.
+`helm/templates/orchestrator/deployment.yaml` already documents this exact dev
+case and says the key should be stage-copied to a runtime-owned `0600` file, but
+that staging path is not implemented. Production's non-root process may avoid
+OpenSSH's owner check on the root-owned file, but acceptance should use a
+runtime-owned `0600` copy in both environments rather than rely on that
+difference.
+
+This means P0-B's diagnostic/classification code is effective, but its local k3d
+deployment acceptance is still red.
+
+### 13.3 The bounded instructions did not override Scholar policy
+
+The first 24 main calls before useful fan-out were almost entirely prescribed
+framework work:
+
+- read brief and instructions; inventory tools/documents/reference;
+- search the KB and write five notes;
+- create `plan.md` and the report scaffold;
+- hit the enforced todo-guide rejection/read cycle;
+- stage exactly ten tactical todos.
+
+The model explicitly followed the high-salience Scholar strategic template even
+though the task said to begin research within three decisions, use at most four
+tactical steps, avoid delegation, and finish early. The template says the first
+phase normally has 10-20 todos and mandates fan-out for independent questions.
+
+More seriously, `delegation.enabled=false` was present in both the requested and
+resolved config, yet `tools.delegation` still contained `spawn_subagent` and the
+factory never checks the `enabled` flag. The parent launched three readers. Each
+reader ran about ten iterations and reached forced synthesis, adding 33 LLM calls
+without providing verifiable sources. A job-level disable must remove the tool
+and reject any residual invocation; a prompt prohibition is not an enforcement
+boundary.
+
+### 13.4 Research failures were laundered into retryable emptiness
+
+The empty local web results were not valid zero-result searches. A direct probe
+inside the same agent pod, without exposing the configured key, showed
+`TavilySearch.invoke` returning a dictionary whose only field was `error`, holding
+a DNS `ConnectionError`. `_direct_web_search` reads only
+`response.get("results", [])`, ignores `response["error"]`, and returns:
+
+```text
+No web results found for: <query>
+```
+
+The audit consequently marked each infrastructure failure as `success: true`.
+CoreDNS logs showed its upstream queries to the k3d Docker gateway timing out:
+
+```text
+api.tavily.com A/AAAA -> 172.18.0.1:53: i/o timeout
+```
+
+The separate paper-search fallback was also broken. The agent image has
+`arxiv==4.0.0`, where `Search.results` no longer exists and results are obtained
+through `Client.results(search)`. `src/tools/research/utils/arxiv_client.py`
+still calls `search.results()` in search, get, and download paths, producing:
+
+```text
+arXiv search error: 'Search' object has no attribute 'results'
+```
+
+The tactical todo explicitly required `web_search` evidence, so the model could
+not honestly complete it. The framework nevertheless offered no bounded
+provider-failure policy, no repeated-result hard stop, and no alternate
+completion path. The memory subsystem also retrieved and reinjected ten memories
+plus five KB notes on most retry turns, compounding the token cost.
+
+### 13.5 Containment requirements sharpened by the rerun
+
+The deferred containment follow-up should eventually be implemented as a
+deterministic runtime policy, not another prompt:
+
+1. Treat a provider response containing `error` as an error. Preserve a stable
+   classification such as DNS/auth/quota/timeout; never convert it to a valid
+   empty search.
+2. Track normalized `(tool, arguments, result, workspace/todo state)` bundles.
+   After two or three identical no-progress outcomes, stop that action and give
+   the graph one explicit adapt-or-freeze decision. A second failure to adapt
+   parks the job.
+3. Add independent ceilings for LLM calls, raw tokens, verification rounds, and
+   repeated provider failures. A tool-call cap alone does not bound 33 subagent
+   LLM calls or large per-turn prompt reinjection.
+4. Make cancellation/hold visible before starting another LLM call; retain the
+   graceful current-node drain, but do not let auxiliary memory work delay the
+   stop decision.
+5. Compute deliverable status on demand from the declared contract and the
+   authoritative live workspace/Gitea ref. Do not materialize a derived
+   phase-boundary status file in the worker workspace.
+6. Give `search_files` one backend-independent contract: either literal search
+   everywhere (and say so) or an explicit regex flag implemented consistently.
+7. Inject `verify-before-done` once when verification begins, or record its
+   current gate step in graph state. Do not re-present step 1 at the highest-
+   salience prompt position after every tool result.
+8. Enforce `delegation.enabled=false` at tool resolution and invocation, not in
+   prose.
+
+Before another paid Scholar smoke test, local readiness should additionally
+prove external DNS, one simple Tavily query, one arXiv query, the runtime-owned
+`0600` SSH key path, and the intended research-tool surface.
+
+### 13.6 Preserved local evidence
+
+The two local job rows, 269 virtual-run audit entries, 88 LLM request records,
+the 569-character scaffold write, and both agent pods were left intact. The
+sandbox workspace was reaped by the normal lifecycle after the failed readiness
+gate. No diagnostic job or audit record was deleted.
+
+### 13.7 Capability-aware verification correction (2026-08-03)
+
+The immediate skill contradiction is corrected in the working tree. Bound job
+skills are rendered after backend filtering against the tools that actually
+loaded. `verify-before-done` now uses `has_tool("run_command")` to select one of
+two procedures:
+
+- shell-capable jobs receive the test/build, `wc`, `grep`, and scripted-analysis
+  checks;
+- shell-less jobs receive bounded `file_exists` and `read_file` checks, plus the
+  available citation check, and no shell command names.
+
+The procedure now requires reconciliation immediately after one fresh evidence
+pass. Re-injection of the skill is explicitly not a reason to restart the gate;
+successful checks cannot be repeated without an intervening artifact change;
+and an unavailable verifier must be reported as a limitation rather than treated
+as either an artifact failure or a reason to retry indefinitely. This also
+removes the former "one logged tool call per claim" wording, which encouraged
+redundant calls even when one result established several criteria.
+
+Regression coverage renders both capability branches directly and exercises the
+real `_deploy_instruction_files(loaded_tool_names)` bound-skill path. The focused
+suite passed with 50 tests.
+
+This is a prompt-level prevention measure, not the separately tracked runtime
+containment boundary. The following framework gaps remain open:
+
+1. Catalog/on-demand skill files are materialized verbatim by
+   `skill_files_to_workspace`; only bound job skills consistently receive the
+   capability-aware rendering path.
+2. Persistent-session bound instructions currently call
+   `render_instruction_content(content, [])`, so every `has_tool` branch is
+   rendered as unavailable regardless of the session's actual tools.
+3. `has_tool` expresses presence only. It cannot distinguish incompatible
+   semantics behind the same tool name, such as literal versus regular-expression
+   `search_files`; that contract must be normalized or represented as a separate
+   capability.
+4. A misbehaving model can still ignore the skill. The repeated-bundle detector
+   and independent LLM/token/verification ceilings remain tracked in
+   `job_runtime_containment_gap.md`, but they do not block the next functional
+   recovery run. That run must prioritize producing and preserving a correct
+   Git-backed result.
+
+### 13.8 Agent-visible boundary manifest retired (2026-08-03)
+
+The stale status signal identified in section 8 is removed rather than refreshed
+more often. The boundary writer, its phase-transition wiring, and its task-brief
+instruction were deleted. New briefs explicitly tell workers not to create a
+separate manifest/status artifact; `job_complete` continues to validate the live
+workspace and the orchestrator's deliverable gate continues to validate committed
+Gitea state and stamp the final result in `jobs.context.deliverable_gate`.
+
+Old repositories and resumed/inherited workspaces can still contain a tracked copy
+from an earlier worker version. Job startup therefore removes the retired path
+before tools are loaded, so it cannot remain visible to the model or become a more
+deeply stale signal. The deletion is committed by the normal progress/boundary/final
+commit path. Historical copies remain recoverable through Git history.
+
+No production component in this checkout read the boundary file. The only removed
+information was a derived convenience snapshot (job, branch, phase, timestamp,
+path existence and size). Its authoritative inputs remain available from the job
+row and `required_deliverables`; Git-backed point-in-time state is derivable from
+the repository ref, and phase timestamps already exist in append-only audit events.
+If a phase-history UI is later required, it should store or compute an orchestrator
+event keyed by commit SHA, never reintroduce worker-visible bookkeeping.
+
+### 13.9 Continuous skill injection retired (implemented 2026-08-03)
+
+The affected `phase:<name>` implementation did not fire on a phase transition as
+its schema and configuration comments claimed. On every LLM request it reread each
+matching instruction file and appended a fresh synthetic `read_file` call/result at
+the highest-salience end of the prompt. `enforce` was ignored on this path. Thus
+Scholar received the full `research-guide` and `verify-before-done` bodies on every
+tactical request, while Designer received `design_guide.md` every tactical request
+even though that entry says `enforce: true`.
+
+No current binding needs continuous full-document injection. It has been replaced
+with two bounded activation forms:
+
+1. `phase_start:<name>` injects an instruction once per concrete phase instance.
+   The checkpoint records a key containing phase number, phase kind, and path.
+   The legacy `phase:<name>` spelling remains a compatibility alias
+   with the same once-only semantics; there is no while-phase mode.
+2. `before_tool:<name>` with `enforce: true` remains a passive gate. It gains
+   optional phase filtering, phase-instance read scope, and a maximum LLM-turn age.
+   A stale or out-of-scope read cannot unlock a later completion action.
+
+`research-guide` and the Designer guide now use one-shot phase-start delivery.
+`verify-before-done` now uses a tactical `todo_complete` gate and a strategic
+`job_complete` gate, each requiring a read in the current phase instance within 20
+LLM turns. The ordinary todo guide remains a job-scoped passive gate: its stable
+planning procedure need only be read once per worker run.
+
+This is distinct from dynamic per-turn context such as the live todo list, memory,
+and supervisor guidance. Those are state, not skills. A future repeated reminder
+must be a separately named, size-bounded feature with an interval and injection
+cap; it must not silently reuse a full `SKILL.md` binding.
+
+Implementation status: `InstructionFileEntry` now carries `phases`, `read_scope`,
+and `max_read_age_turns`; `ToolContext` stamps instruction reads against the
+current phase instance and LLM turn; enforcement wrappers evaluate those values
+at tool invocation time; and worker state checkpoints one-shot phase-injection
+keys. Worker, Scholar, Product QA, and Designer bindings have been migrated; the
+interactive Designer's unimplemented `on_setup` trigger is now a
+`before_tool:write_file` read gate. Both runtime/Cockpit schemas describe the
+bounded contract.

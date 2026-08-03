@@ -10,6 +10,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from src.core.loader import InstructionFileEntry
 from src.tools.context import ToolContext
 
 
@@ -495,9 +496,64 @@ class TestInstructionEnforcement:
         ctx = ToolContext()
         assert ctx.check_tool_enforcement("read_file") is None
 
+    def test_phase_filtered_gate_only_applies_in_selected_phase(self):
+        ctx = ToolContext()
+        ctx._instruction_files = [
+            InstructionFileEntry(
+                trigger="before_tool:todo_complete",
+                skill="verify-before-done",
+                phases=["tactical"],
+                read_scope="phase",
+                max_read_age_turns=20,
+            )
+        ]
+
+        ctx.set_current_phase("strategic", phase_number=1, turn_count=3)
+        assert ctx.check_tool_enforcement("todo_complete") is None
+
+        ctx.set_current_phase("tactical", phase_number=2, turn_count=4)
+        assert ctx.check_tool_enforcement("todo_complete") is not None
+
+    def test_phase_scoped_read_does_not_unlock_a_later_phase(self):
+        entry = InstructionFileEntry(
+            trigger="before_tool:todo_complete",
+            skill="verify-before-done",
+            phases=["tactical"],
+            read_scope="phase",
+            max_read_age_turns=20,
+        )
+        ctx = ToolContext()
+        ctx._instruction_files = [entry]
+        path = entry.path
+
+        ctx.set_current_phase("tactical", phase_number=2, turn_count=5)
+        ctx.record_file_read(path)
+        assert ctx.check_tool_enforcement("todo_complete") is None
+
+        ctx.set_current_phase("tactical", phase_number=4, turn_count=9)
+        assert ctx.check_tool_enforcement("todo_complete") is not None
+
+    def test_instruction_read_expires_after_configured_llm_turns(self):
+        entry = InstructionFileEntry(
+            trigger="before_tool:todo_complete",
+            skill="verify-before-done",
+            phases=["tactical"],
+            read_scope="phase",
+            max_read_age_turns=20,
+        )
+        ctx = ToolContext()
+        ctx._instruction_files = [entry]
+        ctx.set_current_phase("tactical", phase_number=2, turn_count=10)
+        ctx.record_file_read(entry.path)
+
+        ctx.set_current_phase("tactical", phase_number=2, turn_count=30)
+        assert ctx.check_tool_enforcement("todo_complete") is None
+        ctx.set_current_phase("tactical", phase_number=2, turn_count=31)
+        assert ctx.check_tool_enforcement("todo_complete") is not None
+
     def test_get_phase_instruction_files_strategic(self):
-        """Should return entries matching phase='strategic'."""
-        entry = FakeInstructionEntry("strat.md", "phase", "strategic", False)
+        """Should return phase_start entries and the legacy phase alias."""
+        entry = FakeInstructionEntry("strat.md", "phase_start", "strategic", False)
         ctx = ToolContext()
         ctx._instruction_files = [
             entry,

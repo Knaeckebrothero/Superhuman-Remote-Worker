@@ -8695,9 +8695,8 @@ async def create_job(request: Request, job: JobCreate) -> dict[str, Any]:
             context["kickoff_message"] = job.kickoff_message
         if job.required_deliverables:
             # Deliverable contract (P1-C): normalize + dedupe into context.
-            # The dispatcher forwards context to the agent (task-brief render,
-            # phase-boundary manifest_status.json) and the completion gate
-            # validates the seal against it.
+            # The dispatcher forwards context to the agent's task brief and the
+            # completion gate validates the seal against committed Gitea state.
             from services.deliverable_gate import parse_required_deliverables
 
             manifest = parse_required_deliverables(job.required_deliverables)

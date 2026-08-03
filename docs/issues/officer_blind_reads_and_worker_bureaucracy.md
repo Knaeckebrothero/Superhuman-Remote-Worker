@@ -87,7 +87,7 @@ judgment.
 | F10 | Heavy verifier died on a codex-proxy 408 stream-disconnect streak. The July classifier fix **worked as designed** (classified transient, retried 4 backoff cycles on fresh pods, then gave up on the identical-error streak). The officer's own turns errored twice on the same proxy; it answered 200 again by ~09:20 | job `eb0143f8` error text; `docs/done/transient_408_stream_disconnect_misclassified_as_permanent.md` | Infra — **P2** monitor; first live confirmation of the classifier fix |
 | F11 | Infra noise demystified (annex D §3-4): the ~120 "offline agents" are **accumulated one-shot registrations** (one pod per dispatch, stale-detector marks each ended pod offline → one event per pod, all night), not concurrent flapping. Real incidents inside the window: the 23h spike was a **deploy storm** (three orchestrator rolls 23:10→00:05 from the evening's own pushes; the officer's agent went dark at 23:12, two minutes after a roll, and its replacement pod **crashed at startup** — asyncpg pool failure, exit 3 — the "item-7" debris pod); the 07h spike was `eb0143f8`'s pause+backoff loop burning 8 fresh pods. VM workspace SSH timeouts are chronic: **~11 jobs killed by workspace reachability in 18 days**, 7 on headscale-mesh IPs, a cluster every 2-3 days; verifier #2's audit even shows it *rationalizing* the SSH failure ("the palette now confirms todos completed") | annex D §3-4; audit `e239ef27` steps 334, 345, 351 | Open — **P2** infra track |
 | F12 | **The truth gate is still open — but narrower than feared.** `58027ee7`'s own seal claims "all 8 deliverables SHIPPED, baseline **179 passed / 3 pre-existing failures** (NOT caused by kassenabschluss), ruff clean" — a coherent claim, not the feared 180-vs-179 contradiction. It sealed at 0.45 anyway because `job_complete` **rejected its deliverable paths for lacking the `repo/` prefix** (F14). One clean pytest run on current main settles it | annex D §6; KB note `century-state-on-change-of-command` | Operational follow-up — §5 |
-| F13 | **completion.json has no job-scoped provenance**: jobs inherit the parent workspace snapshot, so `output/completion.json` is frequently a *different job's* seal — 9 of 16 sampled jobs served a file timestamped before their own creation (one literally naming another job's branch). Any auditor — officer, critic, human — reading the file without checking its embedded job id reads false history. Verifier #1's cited "precedents" partly rest on this inherited-file substrate | annex D §1 | **Fixed** `6cd60bb2` (P1-C): job-stamped `output/manifest_status.json` written every phase boundary — embedded job_id + branch expose inherited files |
+| F13 | **completion.json has no job-scoped provenance**: jobs inherit the parent workspace snapshot, so `output/completion.json` is frequently a *different job's* seal — 9 of 16 sampled jobs served a file timestamped before their own creation (one literally naming another job's branch). Any auditor — officer, critic, human — reading the file without checking its embedded job id reads false history. Verifier #1's cited "precedents" partly rest on this inherited-file substrate | annex D §1 | **Fixed, implementation revised 2026-08-03**: readers use job DB state plus job-stamped completion data/Gitea refs. The original per-boundary workspace status file was retired after its stale snapshot deadlocked a worker |
 | F14 | **The completion validator misfires inward**: `job_complete` rejected `58027ee7`'s correct deliverable list because paths lacked the `repo/` prefix; the worker sealed at 0.45 with all work done, noting it would "re-call … to lift to 0.55-0.69" — which never happened. A pedantic path check converted a *complete* job into another honest-floor precedent for F7's culture | annex D §6 | **Fixed** `6cd60bb2` (P1-C): `job_complete` normalizes the `repo/` prefix instead of rejecting; the seal gate normalizes both sides |
 
 ---
@@ -360,9 +360,7 @@ every phase boundary (verifier #2's behavior — which was correct — becomes t
 > accepted at job creation (REST `JobCreate`, MCP `create_job`/`create_project_job`,
 > officer's `create_worker_job`), stored normalized in `jobs.context`, delivered to the
 > worker via the existing context passthrough (no new wire field) and rendered as a
-> "Required Deliverables (Contract)" block in `task_brief.md`. Every phase boundary
-> writes job-stamped `output/manifest_status.json` (job_id, branch, phase, per-path
-> exists/size) into the boundary commit (F13 fix). At the seal, the deterministic gate
+> "Required Deliverables (Contract)" block in `task_brief.md`. At the seal, the deterministic gate
 > (`orchestrator/services/deliverable_gate.py`) checks the job branch head in Gitea:
 > missing → refuse + bounce through the P1-A feedback lane with the precise
 > missing/present list at the checked sha (no critic/curator spawn on a bounce); cap 2
@@ -371,6 +369,14 @@ every phase boundary (verifier #2's behavior — which was correct — becomes t
 > stamp. F14 fixed on the agent side too (`job_complete` normalizes `repo/` instead of
 > rejecting). Scaffold-first corollary shipped with P1-B's template inversion. Cockpit
 > job-create UI field is the open follow-up.
+>
+> **Revision 2026-08-03:** the per-boundary workspace status file was retired. It had
+> no production reader, duplicated the Gitea gate, was writable by the worker, and was
+> necessarily stale inside a phase. A Scholar made freshness of that snapshot a final
+> todo prerequisite, creating a cycle in which the todo had to complete before the
+> boundary that could refresh it. Existing legacy copies are removed at job startup;
+> the declared contract, live `job_complete` validation, Gitea seal gate, and final
+> `context.deliverable_gate` report remain authoritative.
 
 **P1-D. Push on cancel/drain (evidence preservation).**
 Annex A found there is **no `git push` anywhere in the cancel path** — per-todo commits

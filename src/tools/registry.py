@@ -852,9 +852,9 @@ def apply_instruction_enforcement(
 ) -> List[Any]:
     """Apply instruction file enforcement wrappers to tools.
 
-    For each tool that has a 'before_tool' trigger with enforce=True,
-    wraps the tool's func to check was_recently_read() before executing.
-    The agent must read the instruction file before the tool will work.
+    For each tool that has a ``before_tool`` trigger with ``enforce=True``,
+    wraps the tool to evaluate the binding's current read contract before
+    execution. The contract may be job-scoped or phase/freshness-scoped.
 
     This generalizes the pattern from todo.py's hardcoded todo_guide.md
     check into a config-driven system.
@@ -869,49 +869,36 @@ def apply_instruction_enforcement(
     if not context._instruction_files:
         return tools
 
-    # Build lookup: tool_name -> list of enforced file paths
-    enforcement_map: Dict[str, List[str]] = {}
+    # Build the tool-name set once. The binding entries themselves remain in
+    # ToolContext because phase filters and read freshness are evaluated at
+    # invocation time, not when tools are loaded.
+    enforced_tool_names: set[str] = set()
     for entry in context._instruction_files:
         if entry.trigger_type == "before_tool" and entry.enforce:
-            enforcement_map.setdefault(entry.trigger_target, []).append(entry.path)
+            enforced_tool_names.add(entry.trigger_target)
 
-    if not enforcement_map:
+    if not enforced_tool_names:
         return tools
 
-    def _enforcement_block(tool_name, files):
+    def _enforcement_block(tool_name):
         """Return a nudge string if a required instruction file is still unread
         (gate closed), else None."""
-        for file_path in files:
-            if not context.was_recently_read(file_path):
-                from src.services.guardrails import format_nudge
+        return context.check_tool_enforcement(tool_name)
 
-                model = (
-                    context._llm_config.model
-                    if context._llm_config is not None
-                    else None
-                )
-                return format_nudge(
-                    "read_file_required_error",
-                    model=model,
-                    file_path=file_path,
-                    tool_name=tool_name,
-                )
-        return None
-
-    def _make_sync_wrapper(orig, tool_name, files):
+    def _make_sync_wrapper(orig, tool_name):
         @functools.wraps(orig)
         def wrapper(*args, **kwargs):
-            blocked = _enforcement_block(tool_name, files)
+            blocked = _enforcement_block(tool_name)
             if blocked is not None:
                 return blocked
             return orig(*args, **kwargs)
 
         return wrapper
 
-    def _make_async_wrapper(orig, tool_name, files):
+    def _make_async_wrapper(orig, tool_name):
         @functools.wraps(orig)
         async def wrapper(*args, **kwargs):
-            blocked = _enforcement_block(tool_name, files)
+            blocked = _enforcement_block(tool_name)
             if blocked is not None:
                 return blocked
             return await orig(*args, **kwargs)
@@ -919,10 +906,9 @@ def apply_instruction_enforcement(
         return wrapper
 
     for tool in tools:
-        if tool.name not in enforcement_map:
+        if tool.name not in enforced_tool_names:
             continue
 
-        required_files = enforcement_map[tool.name]
         tool_name = tool.name
 
         # Sync tools (e.g. next_phase_todos) expose .func; async @tool functions
@@ -931,21 +917,26 @@ def apply_instruction_enforcement(
         # wrapping only .func makes enforcement a silent no-op for async tools.
         wrapped = False
         if getattr(tool, "func", None) is not None:
-            tool.func = _make_sync_wrapper(tool.func, tool_name, required_files)
+            tool.func = _make_sync_wrapper(tool.func, tool_name)
             wrapped = True
         if getattr(tool, "coroutine", None) is not None:
-            tool.coroutine = _make_async_wrapper(
-                tool.coroutine, tool_name, required_files
-            )
+            tool.coroutine = _make_async_wrapper(tool.coroutine, tool_name)
             wrapped = True
 
         if wrapped:
+            required_files = [
+                entry.path
+                for entry in context._instruction_files
+                if entry.trigger_type == "before_tool"
+                and entry.enforce
+                and entry.trigger_target == tool_name
+            ]
             logger.debug(
                 f"Applied instruction enforcement to {tool_name}: "
                 f"requires {required_files}"
             )
 
-    wrapped_count = sum(1 for t in tools if t.name in enforcement_map)
+    wrapped_count = sum(1 for t in tools if t.name in enforced_tool_names)
     if wrapped_count:
         logger.info(f"Applied instruction enforcement to {wrapped_count} tools")
 

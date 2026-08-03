@@ -14,25 +14,13 @@ module is the agent-side half of that contract:
 * :func:`resolve_workspace_deliverable` — existence lookup that accepts both
   the prefixed and unprefixed form against the live workspace;
 * :func:`format_deliverable_contract_block` — the "Required deliverables
-  (contract)" block rendered into the worker's task brief at workspace init;
-* :func:`write_manifest_status` — the F13 fix: a job-stamped
-  ``output/manifest_status.json`` written at every phase boundary, so any
-  supervisor reads progress-vs-contract from Gitea references (and an
-  inherited stale ``completion.json`` is exposed by its embedded job_id).
+  (contract)" block rendered into the worker's task brief at workspace init.
 
 The orchestrator-side gate (orchestrator/services/deliverable_gate.py) applies
 the same path normalization against the job branch HEAD in Gitea.
 """
 
-import json
-import logging
-from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
-
-logger = logging.getLogger(__name__)
-
-# Workspace file written at each phase boundary when the job has a manifest.
-MANIFEST_STATUS_PATH = "output/manifest_status.json"
+from typing import Any, List, Optional, Tuple
 
 # Prefix marking a knowledge-note deliverable (checked server-side, not in the
 # workspace).
@@ -170,68 +158,11 @@ def format_deliverable_contract_block(deliverables: Any) -> str:
         "",
         "Rules:",
         "- Scaffold each deliverable file EARLY (phase 1), even as an outline.",
-        "- Update them every phase — each phase boundary commits and pushes",
-        "  them, and records contract status in `output/manifest_status.json`.",
+        "- Keep each deliverable current as work progresses; Git-backed workspaces",
+        "  commit and push progress automatically.",
+        "- Do not create a separate manifest or status file for this contract; the",
+        "  platform validates the listed artifacts directly.",
         '- Keep plan.md\'s "## Deliverables" section mapped to these paths.',
         "- Paths are workspace-relative; `repo/` prefix is accepted either way.",
     ]
     return "\n".join(lines)
-
-
-def write_manifest_status(
-    workspace: Any,
-    job_id: str,
-    phase_number: int,
-    required_deliverables: Any,
-    branch: Optional[str] = None,
-) -> Optional[Dict[str, Any]]:
-    """Write the job-stamped ``output/manifest_status.json`` (F13 fix).
-
-    Checked against the live workspace via the WorkspaceManager. Cheap by
-    design: existence + size only, no hashing. Jobs WITHOUT a manifest write
-    nothing (no noise), and any failure is logged and swallowed — the phase
-    boundary must never fail on bookkeeping.
-
-    Returns the written status dict, or ``None`` when nothing was written.
-    """
-    manifest = parse_required_deliverables(required_deliverables)
-    if not manifest:
-        return None
-
-    try:
-        entries: List[Dict[str, Any]] = []
-        for path in manifest:
-            if path.startswith(KB_DELIVERABLE_PREFIX):
-                # KB notes live server-side; the boundary snapshot records the
-                # obligation without claiming to have verified it.
-                entries.append({"path": path, "exists": None, "size_bytes": None})
-                continue
-            resolved, exists = resolve_workspace_deliverable(workspace, path)
-            size_bytes: Optional[int] = None
-            if exists and resolved:
-                try:
-                    size_bytes = int(workspace.get_size(resolved))
-                except Exception:  # noqa: BLE001 — size is best-effort
-                    size_bytes = None
-            entries.append({"path": path, "exists": exists, "size_bytes": size_bytes})
-
-        status = {
-            "job_id": job_id,
-            "branch": branch,
-            "phase": phase_number,
-            "generated_at": datetime.now(timezone.utc).isoformat(),
-            "deliverables": entries,
-        }
-        workspace.write_file(
-            MANIFEST_STATUS_PATH, json.dumps(status, indent=2, ensure_ascii=False)
-        )
-    except Exception as e:  # noqa: BLE001 — incl. a dead workspace: the phase
-        # transition must never fail on contract bookkeeping (the git ops right
-        # after this surface workspace death on their own).
-        logger.warning(f"[{job_id}] Failed to write {MANIFEST_STATUS_PATH}: {e}")
-        return None
-    logger.debug(
-        f"[{job_id}] Wrote {MANIFEST_STATUS_PATH}: "
-        f"{sum(1 for e in entries if e['exists'])}/{len(entries)} present"
-    )
-    return status

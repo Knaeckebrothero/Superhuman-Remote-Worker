@@ -1,7 +1,7 @@
 """Agent Skills — Slice 3 (expert bindings + migration).
 
 Covers the skill->binding mechanism: InstructionFileEntry's skill: field + path
-resolver, the before_tool/phase consumers resolving via entry.path, the
+resolver, the before_tool/phase-start consumers resolving via entry.path, the
 flag-independent serialize channel for bound skills, and the migration of the
 two bundled guides (research-guide, todo-guide).
 
@@ -30,10 +30,10 @@ def test_file_entry_path_is_the_file():
 
 def test_skill_entry_path_is_skill_md():
     e = InstructionFileEntry(
-        trigger="phase:tactical", skill="research-guide", enforce=False
+        trigger="phase_start:tactical", skill="research-guide", enforce=False
     )
     assert e.path == "skills/research-guide/SKILL.md"
-    assert e.trigger_type == "phase"
+    assert e.trigger_type == "phase_start"
     assert e.trigger_target == "tactical"
 
 
@@ -52,10 +52,20 @@ def test_parse_skill_binding_from_config():
             "instruction_files": [
                 {
                     "skill": "research-guide",
-                    "trigger": "phase:tactical",
+                    "trigger": "phase_start:tactical",
                     "enforce": False,
                 },
-                {"file": "todo_guide.md", "trigger": "before_tool:next_phase_todos"},
+                {
+                    "skill": "verify-before-done",
+                    "trigger": "before_tool:todo_complete",
+                    "phases": ["tactical"],
+                    "read_scope": "phase",
+                    "max_read_age_turns": 20,
+                },
+                {
+                    "file": "todo_guide.md",
+                    "trigger": "before_tool:next_phase_todos",
+                },
             ],
         }
     )
@@ -63,8 +73,31 @@ def test_parse_skill_binding_from_config():
     assert "skills/research-guide/SKILL.md" in by_path
     assert by_path["skills/research-guide/SKILL.md"].skill == "research-guide"
     assert by_path["skills/research-guide/SKILL.md"].enforce is False
+    verification = by_path["skills/verify-before-done/SKILL.md"]
+    assert verification.phases == ["tactical"]
+    assert verification.read_scope == "phase"
+    assert verification.max_read_age_turns == 20
     assert by_path["todo_guide.md"].file == "todo_guide.md"
     assert by_path["todo_guide.md"].enforce is True  # default
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"phases": "tactical"},
+        {"phases": ["invalid"]},
+        {"read_scope": "turn"},
+        {"max_read_age_turns": 0},
+        {"max_read_age_turns": True},
+    ],
+)
+def test_instruction_activation_options_validate(kwargs):
+    with pytest.raises(ValueError):
+        InstructionFileEntry(
+            trigger="before_tool:todo_complete",
+            skill="verify-before-done",
+            **kwargs,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -112,7 +145,9 @@ def test_phase_binding_targets_skill_path(tmp_path):
         tmp_path,
         [
             InstructionFileEntry(
-                trigger="phase:tactical", skill="research-guide", enforce=False
+                trigger="phase_start:tactical",
+                skill="research-guide",
+                enforce=False,
             )
         ],
     )
@@ -182,7 +217,18 @@ def test_serialize_freezes_bound_skill_md(tmp_path):
             "agent_id": "t",
             "display_name": "T",
             "instruction_files": [
-                {"skill": "hello-skill", "trigger": "phase:tactical", "enforce": False}
+                {
+                    "skill": "hello-skill",
+                    "trigger": "phase_start:tactical",
+                    "enforce": False,
+                },
+                {
+                    "skill": "verify-before-done",
+                    "trigger": "before_tool:todo_complete",
+                    "phases": ["tactical"],
+                    "read_scope": "phase",
+                    "max_read_age_turns": 20,
+                },
             ],
         }
     )
@@ -194,10 +240,18 @@ def test_serialize_freezes_bound_skill_md(tmp_path):
     assert "hello-skill" in blob["instructions"]
     assert "Hello Skill" in blob["instructions"]["hello-skill"]
     assert "SKILL" not in blob["instructions"]  # no stem collision
+    verify_binding = next(
+        entry
+        for entry in blob["agent"]["instruction_files"]
+        if entry.get("skill") == "verify-before-done"
+    )
+    assert verify_binding["phases"] == ["tactical"]
+    assert verify_binding["read_scope"] == "phase"
+    assert verify_binding["max_read_age_turns"] == 20
 
 
 # ---------------------------------------------------------------------------
-# Task 5: research_guide migrated to a bundled skill (phase:tactical binding)
+# Task 5: research_guide migrated to a once-per-phase bundled skill binding
 # ---------------------------------------------------------------------------
 
 from pathlib import Path as _P  # noqa: E402
@@ -220,7 +274,7 @@ def test_scholar_binds_research_guide_as_skill():
     entries = cfg["instruction_files"]
     research = [e for e in entries if e.get("skill") == "research-guide"]
     assert len(research) == 1
-    assert research[0]["trigger"] == "phase:tactical"
+    assert research[0]["trigger"] == "phase_start:tactical"
     assert research[0]["enforce"] is False
     assert not any(
         e.get("file") == "research_guide.md" for e in entries
@@ -254,6 +308,99 @@ def test_worker_base_binds_todo_guide_as_skill():
     assert todo[0]["trigger"] == "before_tool:next_phase_todos"
     assert todo[0]["enforce"] is True
     assert not any(e.get("file") == "todo_guide.md" for e in entries)
+
+
+def test_interactive_designer_uses_an_action_gate_not_setup_injection():
+    import yaml
+
+    cfg = yaml.safe_load(
+        _P("config/experts/designer-interactive/config.yaml").read_text()
+    )
+    assert cfg["instruction_files"] == [
+        {
+            "file": "design_guide.md",
+            "trigger": "before_tool:write_file",
+            "enforce": True,
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    "config_path",
+    [
+        "config/worker_base.yaml",
+        "config/experts/scholar/config.yaml",
+        "config/experts/product-qa/config.yaml",
+        "config/experts/designer/config.yaml",
+    ],
+)
+def test_verify_before_done_is_passive_and_freshness_scoped(config_path):
+    import yaml
+
+    cfg = yaml.safe_load(_P(config_path).read_text())
+    entries = [
+        entry
+        for entry in cfg["instruction_files"]
+        if entry.get("skill") == "verify-before-done"
+    ]
+    assert {entry["trigger"] for entry in entries} == {
+        "before_tool:todo_complete",
+        "before_tool:job_complete",
+    }
+    by_trigger = {entry["trigger"]: entry for entry in entries}
+    assert by_trigger["before_tool:todo_complete"]["phases"] == ["tactical"]
+    assert by_trigger["before_tool:job_complete"]["phases"] == ["strategic"]
+    for entry in entries:
+        assert entry["enforce"] is True
+        assert entry["read_scope"] == "phase"
+        assert entry["max_read_age_turns"] == 20
+
+
+def test_runtime_and_cockpit_schemas_accept_bounded_skill_bindings():
+    import json
+
+    import jsonschema
+    import yaml
+
+    runtime = json.loads(_P("config/schema.json").read_text())["properties"][
+        "instruction_files"
+    ]
+    cockpit = json.loads(_P("cockpit/src/assets/schema.json").read_text())[
+        "properties"
+    ]["instruction_files"]
+    assert runtime == cockpit
+
+    bindings = [
+        {
+            "skill": "research-guide",
+            "trigger": "phase_start:tactical",
+            "enforce": False,
+        },
+        {
+            "skill": "verify-before-done",
+            "trigger": "before_tool:todo_complete",
+            "enforce": True,
+            "phases": ["tactical"],
+            "read_scope": "phase",
+            "max_read_age_turns": 20,
+        },
+    ]
+    jsonschema.validate(bindings, runtime)
+    for config_path in (
+        "config/worker_base.yaml",
+        "config/experts/assistant/config.yaml",
+        "config/experts/designer/config.yaml",
+        "config/experts/designer-interactive/config.yaml",
+        "config/experts/product-qa/config.yaml",
+        "config/experts/scholar/config.yaml",
+    ):
+        config = yaml.safe_load(_P(config_path).read_text())
+        jsonschema.validate(config["instruction_files"], runtime)
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(
+            [{"file": "x.md", "skill": "x", "trigger": "phase_start:tactical"}],
+            runtime,
+        )
 
 
 def test_todo_guide_dropped_from_instruction_matrix():
