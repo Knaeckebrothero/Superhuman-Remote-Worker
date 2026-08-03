@@ -10,19 +10,67 @@ fix for the resume-time OOM where ``f.read()`` + ``communicate(input=...)``
 buffered the whole ``.tar.zst`` in RAM. Capture (snapshot_service) already
 streams; this brings restore to the same O(1)-memory footprint.
 
-Import-light by design (stdlib + ``resolve_ssh_key_path`` only — no boto3, no
-DB), so it is safe to import from tests and any service module.
+Import-light by design (stdlib + Paramiko + ``resolve_ssh_key_path`` — no boto3
+or DB), so it is safe to import from tests and any service module.
 """
 
 import asyncio
+import base64
+import hashlib
 import ipaddress
 import logging
 import os
+from pathlib import Path
 from typing import Optional
+
+import paramiko
 
 from services import resolve_ssh_key_path
 
 logger = logging.getLogger(__name__)
+
+
+class SSHPrivateKeyError(RuntimeError):
+    """Configured workspace private key is absent, unreadable, or invalid."""
+
+
+def workspace_private_key_fingerprint(key_path: Optional[str]) -> str:
+    """Validate a workspace private key and return its public SHA256 fingerprint.
+
+    Validation runs as the current process, so it catches real mount/UID
+    permission problems. Only the public fingerprint is returned; key bytes and
+    parser details are never logged or included in an error.
+    """
+    if not key_path:
+        raise SSHPrivateKeyError(
+            "Workspace SSH private key is not configured (SSH_KEY_PATH is empty)"
+        )
+
+    path = Path(key_path)
+    if not path.is_file():
+        raise SSHPrivateKeyError(
+            f"Workspace SSH private key file does not exist: {path}"
+        )
+    try:
+        # Open explicitly before parsing so the diagnostic names an actual
+        # current-UID readability problem rather than a generic auth failure.
+        with path.open("rb"):
+            pass
+    except OSError as exc:
+        raise SSHPrivateKeyError(
+            f"Workspace SSH private key is not readable by this process: {path}"
+        ) from exc
+
+    try:
+        private_key = paramiko.PKey.from_path(path)
+    except (paramiko.SSHException, OSError, ValueError) as exc:
+        raise SSHPrivateKeyError(
+            "Workspace SSH private key is invalid or passphrase-protected"
+        ) from exc
+
+    digest = hashlib.sha256(private_key.asbytes()).digest()
+    return "SHA256:" + base64.b64encode(digest).decode("ascii").rstrip("=")
+
 
 # Remote command run on the agent host to inflate + unpack a snapshot.
 # --xattrs/--acls so fuse-overlayfs opaque-dir xattrs + whiteouts round-trip
@@ -101,7 +149,18 @@ def build_agent_ssh_cmd(
         "UserKnownHostsFile=/dev/null",
         "-o",
         f"ConnectTimeout={int(connect_timeout_s)}",
-        *(["-o", "BatchMode=yes"] if batch_mode else []),
+        *(
+            [
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "IdentitiesOnly=yes",
+                "-o",
+                "PreferredAuthentications=publickey",
+            ]
+            if batch_mode
+            else []
+        ),
         "-p",
         str(ssh_port),
         f"agent-host@{ssh_host}",
@@ -178,11 +237,18 @@ async def wait_for_agent_ssh(
             connect_timeout_s=connect_timeout_s,
             batch_mode=True,
         )
-        proc = await asyncio.create_subprocess_exec(
-            *ssh_cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *ssh_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except OSError as exc:
+            return (
+                False,
+                attempts,
+                f"ssh readiness probe could not start: {type(exc).__name__}",
+            )
         try:
             _stdout, stderr = await asyncio.wait_for(
                 proc.communicate(), timeout=max(1, int(connect_timeout_s)) + 5

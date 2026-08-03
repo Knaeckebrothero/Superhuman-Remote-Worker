@@ -167,6 +167,57 @@ def _posted_payload() -> dict:
 
 class TestResumeJobOnAgentInjection:
     @pytest.mark.asyncio
+    async def test_sandbox_resume_rebuilds_complete_ssh_config(
+        self, resume_collaborators, monkeypatch
+    ):
+        monkeypatch.delenv("SSH_KEY_PATH", raising=False)
+        job = _job(
+            config_override={"workspace": {"backend": "sandbox"}},
+            context={
+                "workspace_container": {
+                    "status": "ready",
+                    "host": "workspace-job.svc.cluster.local",
+                    "port": 30022,
+                    "provisioner": "k8s",
+                }
+            },
+            worktree_path="/home/agent-host/workspace/.worktrees/job-1",
+        )
+
+        assert await main._resume_job_on_agent(job, _agent()) is True
+
+        remote = _posted_payload()["config_override"]["workspace"]["remote"]
+        assert remote == {
+            "host": "workspace-job.svc.cluster.local",
+            "port": 30022,
+            "username": "agent-host",
+            "key_path": "/run/secrets/vm-ssh-key",
+            "workspace_path": "/home/agent-host/workspace/.worktrees/job-1",
+        }
+        assert _posted_payload()["config_override"]["shell"]["sudo_action"] == "freeze"
+
+    @pytest.mark.asyncio
+    async def test_docker_resume_uses_docker_key_mount(
+        self, resume_collaborators, monkeypatch
+    ):
+        monkeypatch.delenv("SSH_KEY_PATH", raising=False)
+        job = _job(
+            config_override={"workspace": {"backend": "sandbox"}},
+            context={
+                "workspace_container": {
+                    "status": "ready",
+                    "pod_ip": "172.20.0.8",
+                    "port": 22,
+                    "provisioner": "docker",
+                }
+            },
+        )
+
+        assert await main._resume_job_on_agent(job, _agent()) is True
+        remote = _posted_payload()["config_override"]["workspace"]["remote"]
+        assert remote["key_path"] == "/run/secrets/ssh/id_ed25519"
+
+    @pytest.mark.asyncio
     async def test_injected_credentials_reach_the_posted_payload(
         self, resume_collaborators
     ):

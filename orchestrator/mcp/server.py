@@ -103,6 +103,20 @@ def _get_client() -> AsyncCockpitClient:
 # Health Check Endpoint
 # =============================================================================
 
+# Bump when an MCP tool signature or meaning changes in a way that callers need
+# to distinguish from a cached/deployed schema. Build provenance says which
+# source produced the pod; this small contract revision says which tool surface
+# that source promises.
+MCP_TOOL_SCHEMA_REVISION = "2"
+
+
+def _mcp_build_info() -> dict[str, str]:
+    return {
+        "tool_schema_revision": MCP_TOOL_SCHEMA_REVISION,
+        "source_revision": os.environ.get("SRW_SOURCE_REVISION", ""),
+        "release_version": os.environ.get("SRW_RELEASE_VERSION", ""),
+    }
+
 
 @mcp.custom_route("/health", methods=["GET"])
 async def health_check(request):
@@ -110,10 +124,12 @@ async def health_check(request):
     try:
         client = _get_client()
         await client.health_check()
-        return JSONResponse({"status": "healthy", "backend": "connected"})
+        return JSONResponse(
+            {"status": "healthy", "backend": "connected", **_mcp_build_info()}
+        )
     except Exception as e:
         return JSONResponse(
-            {"status": "degraded", "error": str(e)},
+            {"status": "degraded", "error": str(e), **_mcp_build_info()},
             status_code=503,
         )
 
@@ -539,8 +555,10 @@ async def create_job(
     """Create a new job for agent execution.
 
     MUTATION: This creates a job record and a Gitea repository. The job starts
-    in 'created' status and must be assigned to an agent to begin processing.
-    Jobs requiring input documents should use the cockpit UI instead.
+    in 'created' status and is automatically queued for workspace provisioning
+    and assignment to a ready agent. Monitor it with get_job; do not use
+    assign_job for the normal start path. Jobs requiring input documents should
+    use the cockpit UI instead.
 
     Args:
         description: Natural language task description
@@ -601,11 +619,13 @@ async def delete_job(job_id: str) -> str:
 
 @mcp.tool
 async def assign_job(job_id: str, agent_id: str) -> str:
-    """Assign a created job to a ready agent.
+    """Administratively request assignment to a ready agent.
 
-    MUTATION: This sends a JobStartRequest to the agent pod and updates the
-    job status to 'processing'. The job must be in 'created' or 'failed' status,
-    and the agent must be in 'ready' status.
+    MUTATION, ADMIN OVERRIDE: Normal created jobs are provisioned and assigned
+    automatically. If this job has no live managed workspace, the request is
+    queued through normal provisioning and the requested agent is not reserved.
+    With a live workspace, it starts/resumes directly on the requested ready
+    agent. The job must be created, failed, or paused.
 
     Args:
         job_id: Job UUID to assign
@@ -617,7 +637,8 @@ async def assign_job(job_id: str, agent_id: str) -> str:
     client = _get_client()
     try:
         result = await client.assign_job(job_id, agent_id)
-        return fmt.format_action_result("assign", job_id, result, agent_id=agent_id)
+        extra = {"agent_id": agent_id} if result.get("status") == "assigned" else {}
+        return fmt.format_action_result("assign", job_id, result, **extra)
     except Exception as e:
         return fmt.format_action_error("assign", job_id, e)
 
@@ -1948,7 +1969,8 @@ async def create_project_job(
     """Create a job within a project context.
 
     Uses the project's default config if not overridden. The job is
-    automatically linked to the project and gets a Gitea branch.
+    automatically linked to the project, gets a Gitea branch, and is queued for
+    workspace provisioning and automatic agent assignment.
 
     Args:
         project_id: Project UUID

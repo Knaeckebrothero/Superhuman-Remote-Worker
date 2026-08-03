@@ -15,6 +15,7 @@ import pytest
 import src.agent as agent_module
 from src.agent import UniversalAgent
 from src.core.workspace_backend import (
+    WorkspaceAuthenticationError,
     WorkspaceUnavailableError,
     completion_error_payload,
 )
@@ -121,6 +122,16 @@ class TestStreamingErrorType:
 
 
 class TestCompletionErrorPayload:
+    def test_workspace_authentication_is_typed_and_nonrecoverable(self):
+        payload = completion_error_payload(WorkspaceAuthenticationError("bad key"))
+        assert payload == {
+            "error": {
+                "message": "bad key",
+                "type": "workspace_authentication",
+                "recoverable": False,
+            }
+        }
+
     def test_workspace_unavailable_is_typed_and_recoverable(self):
         payload = completion_error_payload(WorkspaceUnavailableError("dead"))
         assert payload == {

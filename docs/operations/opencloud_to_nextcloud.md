@@ -44,11 +44,79 @@ lands. The `secretKeyRef` is not `optional: true`, so a missing key leaves the
 pod in `CreateContainerConfigError` — and by then OpenCloud is already gone,
 so the cluster has no cloud backend at all.
 
-The key needs `s3:CreateBucket` on the MinIO at `minio.minio.svc:9000`; the
-bucket (`srw-nextcloud`) is created by `OBJECTSTORE_S3_AUTOCREATE=true` on
-first boot. The other three Nextcloud keys (`NEXTCLOUD_ADMIN_PASSWORD`,
+The other three Nextcloud keys (`NEXTCLOUD_ADMIN_PASSWORD`,
 `NEXTCLOUD_AGENT_PASSWORD`, `NEXTCLOUD_OIDC_CLIENT_SECRET`) are already in the
 bundle from the shared realm-export era and are reused as-is.
+
+### The MinIO side already exists — do not re-create it
+
+Checked 2026-08-03 against `minio.minio.svc:9000`. Both the bucket and a
+correctly-scoped access key are already present from an earlier (2026-04)
+bundled-Nextcloud run:
+
+- Bucket `srw-nextcloud` — created 2026-03-19, **un-versioned, no object
+  lock**, which is what Nextcloud S3 primary storage requires (Nextcloud keeps
+  its own versions; S3 versioning bloats or breaks primary storage).
+- Access key `srw-nextcloud` — a service account under `miniroot`, no
+  expiry, with an embedded policy matching `srw-snapshots` verbatim in shape.
+
+Note the convention: this MinIO uses **bucket-scoped access keys with embedded
+policies**, not IAM users plus named policies — `mc admin user list` and
+`mc admin policy list` are therefore empty of anything custom. The
+`nextcloud-rw` named-policy recipe in the HomeLab repo's
+`docs/superpowers/plans/2026-06-03-nextcloud-ha.md` describes a different
+approach and was never applied here.
+
+The embedded policy on `srw-nextcloud`:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    { "Effect": "Allow",
+      "Action": ["s3:GetBucketLocation", "s3:ListBucket", "s3:ListBucketMultipartUploads"],
+      "Resource": ["arn:aws:s3:::srw-nextcloud"] },
+    { "Effect": "Allow",
+      "Action": ["s3:GetObject", "s3:ListMultipartUploadParts", "s3:PutObject",
+                 "s3:AbortMultipartUpload", "s3:DeleteObject"],
+      "Resource": ["arn:aws:s3:::srw-nextcloud/*"] },
+    { "Effect": "Allow",
+      "Action": ["s3:CreateBucket"],
+      "Resource": ["arn:aws:s3:::srw-nextcloud"] }
+  ]
+}
+```
+
+The bucket-scoped `s3:CreateBucket` is deliberate and matches `srw-snapshots`:
+the chart hardcodes `OBJECTSTORE_S3_AUTOCREATE=true`
+(`helm/templates/services/nextcloud.yaml`), and the grant is narrow enough that
+the key still cannot touch any other bucket.
+
+### Two things that do still need doing
+
+1. **The secret half of the key is unknown.** MinIO cannot reveal it, the
+   Vault bundle has no `NEXTCLOUD_S3_*` entries, and the repo carries only
+   commented placeholders (`.env.example`) and `"stub"` (`values-local.yaml`).
+   Rotate it in place — this preserves the key name and its embedded policy:
+
+   ```bash
+   mc admin accesskey edit local srw-nextcloud --secret-key '<new-secret>'
+   ```
+
+   Then write `NEXTCLOUD_S3_ACCESS_KEY=srw-nextcloud` and the new secret into
+   Vault.
+
+2. **The bucket is not empty** — 207 objects / 114 MiB dated 2026-04-06, in
+   Nextcloud's native `urn:oid:<fileid>` layout. Those are orphans: the object
+   key is `urn:oid:` plus a row id from Nextcloud's `oc_filecache`, and the
+   bundled Nextcloud comes up on a **fresh SQLite DB on a new PVC**, so its
+   fileid counter restarts at 1. It will write `urn:oid:1`, `urn:oid:2`, …
+   straight over the old objects, while every higher-numbered orphan lingers
+   forever. Empty the bucket before cutover:
+
+   ```bash
+   mc rm --recursive --force local/srw-nextcloud
+   ```
 
 ESO refreshes hourly; force it rather than waiting:
 

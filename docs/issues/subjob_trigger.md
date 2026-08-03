@@ -1,5 +1,16 @@
 # Verification Subjob Not Spawned After Job Completion
 
+> **SUPERSEDED (2026-08-03) — the diagnosis below is stale, do not act on it.**
+> This predates the orchestrator cutover. It blames agent-side
+> `_maybe_trigger_verification` / `_is_verification_enabled`, neither of which
+> exists in `src/` anymore; the trigger now lives in the orchestrator as
+> `_trigger_verification_on_complete` (`orchestrator/main.py:13005`), reachable
+> only from `POST /api/jobs/{job_id}/complete`. The diagnostic logging listed
+> under "Fixes Applied" went with the old call site. Kept as a record that the
+> symptom is recurrent. For the live analysis of "job in `pending_review`, no
+> critic spawned", see
+> [`verification_unreachable_for_hand_repaired_jobs.md`](verification_unreachable_for_hand_repaired_jobs.md).
+
 **Date:** 2026-03-07
 **Job:** `34f93b9d-e410-4e36-b1f2-b73a5f38890e` ("Redeploy everything as quadlets")
 **Status:** `pending_review` (should have been `reviewing` with critic spawned)
