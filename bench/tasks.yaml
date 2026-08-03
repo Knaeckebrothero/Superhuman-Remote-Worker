@@ -1,0 +1,209 @@
+# Fixed task set for the paired-run suite. NEVER edit a task's description in
+# place — task text is a pinned input; changes get a new id (S1b, D2b, ...).
+# Sources: S1/S2/S3 adapted verbatim-ish from real dev-cluster jobs
+# (13fc2854, d7d6f511, 7d67d684 — the July "live gate" probes); A1 mirrors the
+# Produktzusammenfassung automation shape with the inbox inlined.
+version: 1
+
+defaults:
+  config_name: worker_base
+  priority: 5
+
+tasks:
+  - id: S1-outbox-note
+    family: small
+    description: |
+      Write a short markdown note explaining what a transactional outbox is to
+      output/outbox-note.md, then stop.
+    required_deliverables: [output/outbox-note.md]
+
+  - id: S2-outbox-verify
+    family: small
+    description: |
+      Write a 5-line summary of what a transactional outbox is into
+      output/outbox.md, then verify the file exists by reading it back, then
+      stop.
+    required_deliverables: [output/outbox.md]
+
+  - id: S3-glossary
+    family: small
+    description: |
+      Write `output/glossary.md` — a short engineering glossary defining
+      exactly these five terms, in this order: idempotency, backpressure,
+      quorum, tombstone, write-amplification.
+
+      Acceptance criteria (ALL must be met):
+      1. Exactly five entries, one per term, in the order listed above.
+      2. Each entry is 2-3 sentences of plain-English definition.
+      3. Each entry ends with its own line beginning `Trade-off:` followed by
+         one sentence.
+      4. The file ends with a `## Sources` section listing at least two
+         references.
+    required_deliverables: [output/glossary.md]
+
+  - id: S4-csv-totals
+    family: small
+    description: |
+      Below is a small sales ledger. Produce two files:
+
+      1. `output/totals.csv` with header `category,total_eur` — one row per
+         category, totals summed from the ledger, rows sorted by category
+         name ascending.
+      2. `output/report.md` — a short note stating which category earned the
+         most, which earned the least, and the grand total.
+
+      Ledger (CSV):
+      ```
+      date,category,amount_eur
+      2026-07-01,hardware,1200.50
+      2026-07-02,software,299.00
+      2026-07-03,hardware,850.00
+      2026-07-05,services,2100.00
+      2026-07-08,software,499.99
+      2026-07-11,services,1750.25
+      2026-07-12,hardware,310.75
+      2026-07-15,software,89.00
+      2026-07-19,services,980.00
+      2026-07-22,hardware,45.10
+      2026-07-25,software,1299.00
+      2026-07-28,services,410.40
+      ```
+    required_deliverables: [output/totals.csv, output/report.md]
+
+  - id: M1-retry-memo
+    family: medium
+    description: |
+      Write a design memo `output/retry-memo.md` for the team: we are adding
+      retries to a webhook dispatcher that delivers events to third-party
+      endpoints (peak 50 events/s, endpoints time out or 5xx roughly 2% of
+      the time, occasional multi-minute outages).
+
+      The memo must:
+      1. Compare three strategies: fixed-interval retry, exponential backoff
+         with jitter, and a token-bucket retry budget.
+      2. For each: how it behaves during a brief blip vs. a multi-minute
+         outage, effect on delivery ordering, and worst-case amplification.
+      3. Include a comparison table.
+      4. End with a `## Recommendation` section choosing one strategy (or a
+         combination) with a 3-5 sentence justification and concrete starting
+         parameters.
+    required_deliverables: [output/retry-memo.md]
+
+  - id: M2-runbook
+    family: medium
+    description: |
+      Write an incident runbook `output/runbook.md` for this hypothetical
+      service: "relay" — a stateless HTTP API (3 replicas behind a load
+      balancer) that reads from Postgres and pushes notifications through a
+      third-party gateway. Known failure modes: Postgres connection-pool
+      exhaustion, gateway rate-limiting (429s), and a bad deploy causing 5xx
+      on one replica.
+
+      The runbook must have: a triage flowchart in text form (numbered
+      decision steps), one section per failure mode with detection signals /
+      immediate mitigation / verification steps, an escalation section, and a
+      `## Post-incident` checklist. Keep it operational — commands and checks,
+      not theory.
+    required_deliverables: [output/runbook.md]
+
+  - id: D1-wordfreq-kata
+    family: dev
+    config_name: developer
+    description: |
+      Implement a small Python CLI tool in this workspace, test-first.
+
+      Spec: `code/wordfreq.py` — reads a text file path as argv[1], prints the
+      top-N most frequent words (N from `--top N`, default 10), one
+      `word count` pair per line, most frequent first. `--ignore-case` folds
+      case. Words are `[a-zA-Z']+` tokens. Ties break alphabetically.
+      Non-existent file → exit code 2 with an error on stderr.
+
+      Deliverables:
+      1. `code/wordfreq.py` — the implementation.
+      2. `code/test_wordfreq.py` — pytest tests covering: basic counting,
+         top-N cutoff, tie-breaking, --ignore-case, and the missing-file exit
+         code.
+      3. `output/test-run.txt` — the output of running `pytest code/ -v`,
+         showing all tests passing.
+    required_deliverables:
+      [code/wordfreq.py, code/test_wordfreq.py, output/test-run.txt]
+
+  - id: D2-inventory-bugfix
+    family: dev
+    config_name: developer
+    description: |
+      The function below (drop it into `code/inventory.py`) has at least three
+      real bugs. Find and fix them, test-first: write
+      `code/test_inventory.py` with pytest tests that expose each bug (they
+      must fail against the original), then fix the implementation so all
+      tests pass, then save the passing `pytest code/ -v` output to
+      `output/test-run.txt`.
+
+      ```python
+      def restock_report(stock, incoming, low_watermark=10, exclude=[]):
+          """Merge incoming deliveries into stock and report items still low.
+
+          stock: dict name -> count. incoming: list of (name, count) tuples.
+          Returns (updated_stock, low_items) where low_items is the sorted
+          list of names with count < low_watermark, skipping excluded names.
+          """
+          for name, count in incoming:
+              if name in stock:
+                  stock[name] = stock[name] + count
+              else:
+                  stock[name] = count
+          low_items = []
+          for i in range(1, len(list(stock))):
+              name = list(stock)[i]
+              if stock[name] < low_watermark and name not in exclude:
+                  low_items.append(name)
+              exclude.append(name)
+          return stock, low_items
+      ```
+
+      Document each bug you found in a comment above its regression test.
+    required_deliverables:
+      [code/inventory.py, code/test_inventory.py, output/test-run.txt]
+
+  - id: R1-fusion-note
+    family: research
+    config_name: scholar
+    description: |
+      Research note: compare Reciprocal Rank Fusion (RRF) against weighted
+      score fusion for combining dense-vector and sparse/BM25 retrieval in a
+      hybrid search system. Produce `output/fusion-note.md` covering: how each
+      method works, sensitivity to score calibration between retrievers,
+      behaviour when one retriever degrades, tuning burden, and a
+      recommendation for a system that must work across heterogeneous
+      collections without per-collection tuning. Cite your sources.
+    required_deliverables: [output/fusion-note.md]
+
+  - id: A1-inbox-digest
+    family: automation
+    description: |
+      You maintain a daily digest. Below are today's three inbound messages.
+      Write `output/digest.md` with: one `##` section per message containing a
+      2-3 sentence summary and an action-items list (possibly empty), then a
+      final `## Overview` section with a one-paragraph roll-up and a combined,
+      deduplicated action list.
+
+      ---
+      Message 1 — from: anna@supplier-nord.example, subject: "Lieferverzug
+      Charge 2214": Sehr geehrte Damen und Herren, die Charge 2214
+      (Aluminiumprofile) verzoegert sich um voraussichtlich 8 Werktage wegen
+      eines Maschinenausfalls. Als Ausgleich bieten wir 4% Nachlass auf die
+      betroffene Rechnung an. Bitte bestaetigen Sie, ob der neue Liefertermin
+      (18. des Monats) fuer Sie machbar ist.
+
+      Message 2 — from: it-notices@corp.example, subject: "Planned maintenance
+      window": The ERP system will be unavailable Saturday 02:00-06:00 UTC for
+      a database upgrade. Export any reports you need beforehand. No action
+      needed if you do not work weekends.
+
+      Message 3 — from: felix@kunde-sued.example, subject: "Rahmenvertrag
+      Verlaengerung + Mengenstaffel": Hallo, wir moechten den Rahmenvertrag um
+      12 Monate verlaengern und ab Q4 die Abnahmemenge um ca. 20% erhoehen.
+      Koennen Sie uns bis Freitag ein aktualisiertes Angebot mit Mengenstaffel
+      schicken? Danke!
+      ---
+    required_deliverables: [output/digest.md]
