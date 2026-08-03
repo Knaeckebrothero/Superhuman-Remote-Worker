@@ -36,8 +36,37 @@ related:
 > Every existing declaration is already in canonical form, so normalisation is
 > the identity function on today's configs and the migration is opt-in per line.
 
-**Status:** Design, 2026-08-02. Not started. Line anchors verified on `develop`
-2026-08-02.
+**Status:** IMPLEMENTED 2026-08-02/03 on `develop`, **not pushed**. Commits 1–6
+of [Sequencing](#sequencing) all landed; each carries an in-place amendment
+above where the implementation diverged from the plan (three of them:
+`grant:` became a tri-state rather than a boolean marker, there is no
+`SESSION_TOOL_OVERRIDE_GROUPS` allowlist, and commit 6 went wider than the four
+groups). Commit 7 — per-persona `only`/`except` for the 40 subsets, pure
+readability — is untouched and still optional, and nothing under
+["Not in this plan"](#not-in-this-plan) was taken.
+
+Two of this document's own rules were only satisfied after the whole-branch
+review, and both are now in:
+
+- **[The request boundary](#sequencing) covers the expert surface.** Commit 5
+  wired eight boundaries and missed `/api/experts` (create, update, import,
+  duplicate, fork-a-default), where an expert's `config` is an authored layer
+  under every job and session it drives. All five now run
+  `validate_tool_override_fragment` and persist the canonical form.
+- **"Off is a promise" has its mirror** (the rule lives in
+  `src/core/tool_report.py::compose_tool_view`, which
+  [the two consumers](#the-two-consumers-that-must-agree) both read). A
+  category held *only* by per-tool `grant: "code"` names reports `on` with
+  `settable: false` and a reason, because the runtime re-appends those after the
+  merge (`srw_cloud_status`, `sleep`/`notify_user`,
+  `request_workspace_upgrade`, `checkout_project_repository`) and unticking
+  cannot release them.
+
+**Still owed:** the live gates for commits 5 and 6, blocked on the k3d cluster.
+Register and full execution record:
+[[tool_configuration_defects_and_fix_roadmap]].
+Line anchors below were verified on `develop` 2026-08-02 and several have since
+moved with the implementation they describe.
 **Filed against:** `docs/issues/session_create_tool_toggles_cannot_enable_a_group.md`
 **Scope:** `config/*.yaml`, `config/schema.json`, `src/core/loader.py`,
 `orchestrator/services/config_resolver.py`, `src/core/session_tool_overrides.py`,
