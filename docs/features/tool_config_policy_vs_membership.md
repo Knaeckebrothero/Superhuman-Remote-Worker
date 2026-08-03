@@ -20,6 +20,9 @@ related:
   - "[[tool_permission_tiers]]"
   - "[[settings_design]]"
   - "[[datasource_redesign]]"
+  - "[[tool_configuration_defects_and_fix_roadmap]]"
+  - "[[tool_configuration_live_gates_2026-08-03]]"
+  - "[[tool_configuration_deferred_findings]]"
 ---
 
 # Tool Config: Policy vs Membership
@@ -44,6 +47,17 @@ above where the implementation diverged from the plan (three of them:
 groups). Commit 7 — per-persona `only`/`except` for the 40 subsets, pure
 readability — is untouched and still optional, and nothing under
 ["Not in this plan"](#not-in-this-plan) was taken.
+
+**Live-gated 2026-08-03**, six gates across three rounds, all passing — including
+the two properties this document's design rests on: a category-level `true`
+expands to the *grantable* subset only (`agent_catalog: true` bound 5 tools with
+all six `*_bundle` writes absent, measured from the agent), and every write
+boundary refuses a cross-category name rather than dropping it (400 at eight
+boundaries, each with a clean-body control). Evidence:
+[[tool_configuration_live_gates_2026-08-03]]. Findings deferred during the run,
+and the rulings settled along the way — the `shell` auto-tracking rule, why
+`ToolsConfig` cannot be registry-derived, why `only` is never intersected — are in
+[[tool_configuration_deferred_findings]].
 
 Two of this document's own rules were only satisfied after the whole-branch
 review, and both are now in:

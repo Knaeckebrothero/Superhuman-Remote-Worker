@@ -13,6 +13,9 @@ related:
   - "[[stale_tool_names_degrade_every_worker_job_tool_load]]"
   - "[[application_tool_surface_baseline]]"
   - "[[centurion]]"
+  - "[[tool_configuration_defects_and_fix_roadmap]]"
+  - "[[tool_configuration_live_gates_2026-08-03]]"
+  - "[[tool_configuration_deferred_findings]]"
 ---
 
 # Ten registered tools have no reachable grant path — and five curation prompts unconditionally order the curator to call two of them
@@ -39,6 +42,13 @@ consuming this inventory rather than acting on it:
   *tool* too (`code_granted_tools()`), which is what makes `srw_cloud_status`,
   `sleep`, `notify_user` and `request_workspace_upgrade` visible instead of
   showing as an ordinary ticked checkbox nobody can untick.
+- **The `true`-expansion half of §3c is now measured, live.** A session created
+  with `tools: {agent_catalog: true, workflows: true}` bound exactly 5 and 7
+  tools with **all six `*_bundle` writes absent**, read from the agent's own
+  report rather than forecast, and principal-independently (the exclusion is the
+  registry mark read by `_grantable`, not a grant lookup). Evidence:
+  [[tool_configuration_live_gates_2026-08-03]], gate A.3. This does **not** close
+  §3c — see "Verification owed".
 - **Item 3's premise is void.** The six `*_bundle` tools got `grant: "explicit"`,
   so a config *can* name them (an in-category explicit name is accepted at every
   write boundary; `tests/test_tool_override_boundary.py::TestNoModelAuthoredPathReachesSessionCreate`
@@ -478,11 +488,14 @@ Ordered by value. Not started — none of this is implemented.
 
 ## Verification owed
 
-- **The §3c residual path.** It has *not* been shown that a hand-authored
-  expert with `tools.agent_catalog: [set_expert_bundle]` actually reaches
-  `load_tools`. Create one on dev, attach a session, and read the bound tool
-  names. If it loads, item 3 is a live privilege-escalation surface for any
-  expert author, not just a dead-tool cleanup, and its priority goes up.
+- **The §3c residual path — still owed, and narrowed.** The live gates proved a
+  category-level `true` cannot reach the bundle writes
+  ([[tool_configuration_live_gates_2026-08-03]], gate A.3). They say nothing
+  about the *explicit* name: it has still not been shown that a hand-authored
+  expert with `tools.agent_catalog: [set_expert_bundle]` reaches `load_tools` and
+  executes. Create one on dev, attach a session, and read the bound tool names.
+  If it loads, item 3 is a live privilege-escalation surface for any expert
+  author, not just a dead-tool cleanup, and its priority goes up.
 - **Project-scoped experts.** `list_project_experts` reads expert configs from a
   project's Gitea repo, a layer distinct from both bundled YAML and the
   `experts` table. No project (of 53) was surveyed for a config granting any of

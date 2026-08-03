@@ -9,13 +9,17 @@ related:
   - "[[session_tool_group_checkbox_disagrees_with_the_agent]]"
   - "[[session_tool_group_enablement_is_computed_in_two_places]]"
   - "[[session_uploads_never_extract_archives]]"
+  - "[[tool_configuration_defects_and_fix_roadmap]]"
+  - "[[tool_configuration_live_gates_2026-08-03]]"
+  - "[[tool_configuration_deferred_findings]]"
+  - "[[job_mode_reasoning_pick_silently_reset]]"
 ---
 
 # New Session tool toggles: no group can be enabled, two thirds cannot be disabled, and the Reasoning pick is silently discarded — the creation form kept the pre-`ce9222f9` re-enable path
 
-**Status:** **RESOLVED 2026-08-03** — code committed on `develop`, **live gate
-owed** (see the roadmap's task-8 report for the exact command). All three
-defects are closed:
+**Status:** **RESOLVED 2026-08-03** — code committed on `develop` (**not
+pushed**) and **live-gated the same day**, three rounds, all passing:
+[[tool_configuration_live_gates_2026-08-03]]. All three defects are closed:
 
 * **No group could be enabled** — the re-enable branch sourced member names
   from `defaultsTools()`, the very layer it was overriding, which ships `[]`
@@ -33,6 +37,11 @@ The controls are now three-state (on / off / unavailable-with-a-reason) and
 read `GET /api/persistent/threads/{id}/tool-groups` (live) or
 `POST /api/persistent/tool-groups/preview` (creation), which are the agent's
 own answer and a labelled forecast respectively.
+
+Part 3's Reasoning defect is fixed **for session mode only**, and the diagnosis
+in it was corrected on the way: the trigger is involuntary, not a model or expert
+change. Job mode has the same sink and the same cascade, unfixed —
+[[job_mode_reasoning_pick_silently_reset]].
 
 *Original diagnosis, 2026-08-01:*
 **Severity:** high, and one part **fails open** — unticking 8 of the 12 rendered
