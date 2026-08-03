@@ -33,6 +33,7 @@ from src.core.tool_report import (
     build_agent_toolset_report,
     categorize_tool_names,
     code_granted_categories,
+    code_granted_tools,
     compose_tool_view,
     grant_blocked_categories,
     layer_provenance,
@@ -260,19 +261,31 @@ class TestLayerProvenance:
 # =============================================================================
 class TestMeasurementWins:
     def test_agent_answer_overrides_a_disagreeing_config(self):
-        """The config says core is empty; the agent bound two core tools.
+        """The config says orchestrator is empty; the agent bound two of its tools.
 
         This is the runtime-injection layer, and the whole reason D6 says ask
         the agent. A view that reported ``off`` here would be the original bug
         wearing a new endpoint.
+
+        These two names are deliberately NOT ``grant: "code"``: they are
+        re-appended by ``_load_tools_for_backend`` and unticking the category
+        really does drop them (it writes ``tools.orchestrator: []``, which the
+        session reads as the ``_fleet_management_disabled`` marker). So this
+        stays an ordinary settable row, and ``decided_by`` is ``runtime`` —
+        contrast ``TestOnIsRevocable``, where an all-code-granted bind reads as
+        ``registry`` and cannot be unticked at all.
         """
         view = compose_tool_view(
-            measured={"core": ["read_product_guide", "srw_cloud_status"]},
-            configured={"core": []},
+            measured={"orchestrator": ["get_session_context", "create_worker_job"]},
+            configured={"orchestrator": []},
         )
-        assert view["core"]["state"] == STATE_ON
-        assert view["core"]["tools"] == ["read_product_guide", "srw_cloud_status"]
-        assert view["core"]["decided_by"] == DECIDED_BY_RUNTIME
+        assert view["orchestrator"]["state"] == STATE_ON
+        assert view["orchestrator"]["tools"] == [
+            "get_session_context",
+            "create_worker_job",
+        ]
+        assert view["orchestrator"]["decided_by"] == DECIDED_BY_RUNTIME
+        assert view["orchestrator"]["settable"] is True
 
     def test_agent_answer_overrides_a_config_that_promised_tools(self):
         """And the shortfall reads UNAVAILABLE, not off — see TestOffIsAPromise."""
@@ -360,6 +373,171 @@ class TestOffIsAPromise:
             configured={"research": ["web_search", "crawl_website"]},
         )
         assert view["research"]["state"] == STATE_ON
+
+
+class TestOnIsRevocable:
+    """The mirror of "off is a promise": a TICKED box promises unticking works.
+
+    ``code_granted_categories`` only knows the eight *category*-level grants, so
+    the per-TOOL tier was invisible here — and the agent re-appends exactly that
+    tier after the merge (``persistent_session.py``: ``srw_cloud_status`` on a
+    cloud mount, ``sleep``/``notify_user`` for an officer,
+    ``request_workspace_upgrade`` on a lite tier,
+    ``checkout_project_repository`` with fleet management). Unticking any of them
+    writes ``tools.<c>: []``, the runtime re-appends, the next read says ``on``:
+    a control that cannot lose, forever, with no explanation.
+
+    The composed row this used to produce, verbatim from a session with a cloud
+    mount — the DEFAULT project topology::
+
+        {'state': 'on', 'settable': True, 'reason': None,
+         'decided_by': 'runtime', 'tools': ['srw_cloud_status'],
+         'configured': []}
+    """
+
+    def test_a_runtime_held_category_is_locked_on_not_a_live_checkbox(self):
+        view = compose_tool_view(
+            measured={"shell": ["srw_cloud_status"]},
+            configured={"shell": []},
+            grants={"shell_tools": True},
+        )
+        entry = view["shell"]
+        assert entry["state"] == STATE_ON, "the agent holds a tool here"
+        assert entry["settable"] is False
+        assert entry["reason"] is not None
+        # The reason names the tool AND its gate, so the user learns why.
+        assert "srw_cloud_status" in entry["reason"]
+        assert "cloud_mount_manager.active" in entry["reason"]
+        assert entry["decided_by"] == DECIDED_BY_REGISTRY
+
+    def test_the_officer_floor_is_locked_too(self):
+        view = compose_tool_view(
+            measured={"core": ["sleep", "notify_user"]}, configured={"core": []}
+        )
+        entry = view["core"]
+        assert (entry["state"], entry["settable"]) == (STATE_ON, False)
+        assert "sleep" in entry["reason"] and "notify_user" in entry["reason"]
+        assert "officer.enabled" in entry["reason"]
+
+    def test_the_lite_tier_upgrade_tool_is_locked_too(self):
+        view = compose_tool_view(
+            measured={"core": ["request_workspace_upgrade"]}, configured={"core": []}
+        )
+        assert view["core"]["settable"] is False
+
+    def test_a_ticked_core_that_bound_nothing_it_asked_for_is_still_honest(self):
+        """The sibling of the `core` fast-follow: `core: true` expands to exactly
+        the six phase tools a session strips, so config asks for six and holds
+        two runtime ones. Unticking still cannot release those two."""
+        view = compose_tool_view(
+            measured={"core": ["sleep", "notify_user"]},
+            configured={"core": ["todo_list", "todo_complete", "mark_complete"]},
+        )
+        assert view["core"]["settable"] is False
+        assert view["core"]["state"] == STATE_ON
+
+    def test_a_category_config_can_still_shrink_stays_settable(self):
+        """The guard fires only when unticking would change NOTHING. Here it
+        would drop `run_command`, which is a real effect, so the control is
+        honest as an ordinary ticked box."""
+        view = compose_tool_view(
+            measured={"shell": ["run_command", "srw_cloud_status"]},
+            configured={"shell": ["run_command"]},
+            grants={"shell_tools": True},
+        )
+        entry = view["shell"]
+        assert (entry["state"], entry["settable"], entry["reason"]) == (
+            STATE_ON,
+            True,
+            None,
+        )
+
+    def test_an_ordinary_config_granted_category_is_untouched(self):
+        view = compose_tool_view(
+            measured={"research": ["web_search"]},
+            configured={"research": ["web_search"]},
+        )
+        assert view["research"]["settable"] is True
+        assert view["research"]["reason"] is None
+
+    def test_a_prediction_never_locks(self):
+        """No measurement means no bound set to reason about — and the creation
+        form is where turning shell ON still has to work."""
+        view = compose_tool_view(measured=None, configured={"shell": []})
+        assert view["shell"]["settable"] is True
+        assert view["shell"]["state"] == STATE_OFF
+
+    def test_a_grant_denial_still_wins_the_message(self):
+        """Precedence unchanged: the strongest statement is the one shown."""
+        view = compose_tool_view(
+            measured={"shell": ["srw_cloud_status"]},
+            configured={"shell": []},
+            grants={"shell_tools": False},
+        )
+        assert view["shell"]["decided_by"] == DECIDED_BY_GRANT
+        assert "shell_tools" in view["shell"]["reason"]
+        assert view["shell"]["settable"] is False
+
+    def test_an_mcp_or_unclassified_bind_is_not_mistaken_for_a_code_grant(self):
+        """Names the reader's registry does not know are not code-granted; they
+        are unknown, and inventing a lock for them would be a guess."""
+        view = compose_tool_view(
+            measured={"mcp": ["some_mcp_tool"], UNCLASSIFIED_CATEGORY: ["whatever"]},
+            configured={"mcp": []},
+        )
+        assert view["mcp"]["settable"] is True
+        assert view[UNCLASSIFIED_CATEGORY]["settable"] is True
+
+    def test_the_per_tool_tier_is_read_off_the_registry_not_a_literal(self):
+        from src.tools.registry import TOOL_REGISTRY
+
+        expected = {n for n, m in TOOL_REGISTRY.items() if m.get("grant") == "code"}
+        assert set(code_granted_tools()) == expected
+        # The four the category-level map cannot see, and the whole point of it.
+        assert {
+            "srw_cloud_status",
+            "sleep",
+            "notify_user",
+            "request_workspace_upgrade",
+            "checkout_project_repository",
+        } <= set(code_granted_tools())
+        assert all(gate for gate in code_granted_tools().values())
+
+    @pytest.mark.parametrize(
+        ("category", "names"),
+        [
+            ("shell", ["srw_cloud_status"]),
+            ("core", ["sleep", "notify_user"]),
+            ("core", ["request_workspace_upgrade"]),
+            ("orchestrator", ["checkout_project_repository"]),
+        ],
+    )
+    def test_every_post_merge_re_append_site_is_covered(self, category, names):
+        """One case per injection site in `_load_tools_for_backend`, so a new
+        re-append with a `grant: "code"` mark is covered by construction and one
+        WITHOUT the mark shows up as a missing lock here."""
+        entry = compose_tool_view(
+            measured={category: names}, configured={category: []}
+        )[category]
+        assert entry["settable"] is False
+        assert entry["reason"]
+
+    def test_unsettable_never_means_off(self):
+        """The invariant Task 8's client depends on: it renders `state` verbatim
+        for a locked row, so an unsettable row must be `on` or `unavailable` —
+        never `off`, which would draw an unticked box nobody can tick."""
+        for measured, configured in (
+            ({"shell": ["srw_cloud_status"]}, {"shell": []}),
+            ({"core": ["sleep"]}, {"core": []}),
+            ({"sql": []}, {"sql": []}),
+            ({"knowledge": []}, {"knowledge": ["kb_read"]}),
+        ):
+            for entry in compose_tool_view(
+                measured=measured, configured=configured
+            ).values():
+                if entry["settable"] is False:
+                    assert entry["state"] != STATE_OFF
+                    assert entry["reason"]
 
 
 class TestThreeStates:
