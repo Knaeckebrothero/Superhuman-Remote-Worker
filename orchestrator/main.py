@@ -28711,8 +28711,34 @@ def _require_experts_db() -> None:
         raise HTTPException(status_code=404, detail="DB-backed experts are not enabled")
 
 
-def _validate_expert_fragment(config: dict[str, Any]) -> None:
-    """Reject credential sections in a user fragment (decision 10, hard-deny)."""
+def _validate_expert_fragment(config: dict[str, Any]) -> dict[str, Any]:
+    """Gate an expert's authored fragment; return it in canonical form.
+
+    Two independent checks, and the second was missing for the whole of this
+    feature's life:
+
+    1. **Credentials** — reject credential sections (decision 10, hard-deny),
+       422 as before.
+    2. **The tools vocabulary** — the same
+       :func:`~src.core.tool_policy.validate_tool_override_fragment` every other
+       write boundary runs, 400 as everywhere else. An expert's ``config`` is an
+       authored config layer merged under every job and session it drives, and
+       the credential scan cannot see a *cross-category smuggle*:
+       ``tools.canvas: ["run_command"]`` was storable by any approved user,
+       invisible to the grants PDP (which keys off the category name) and bound
+       as shell by ``load_tools`` (which regroups by *registry* category).
+
+    It also closes a quieter one: a stored fragment is normalised on the way OUT
+    (``expert_resolution.build_expert_config``), so a shape
+    ``normalize_tool_policy`` refuses — ``tools.shell: true`` — was storable and
+    then made the expert unresolvable. Refusing here turns a later resolve
+    failure into an immediate 400.
+
+    Returns the fragment with ``tools`` normalised to ``list[str]``, so callers
+    persist the canonical form and the save-time PDP (which reads
+    ``_truthy(tools.get(...))``, and gets ``{}`` / ``{only: []}`` backwards)
+    only ever sees a list.
+    """
     from src.core.expert_resolution import hard_deny_scan
 
     offending = hard_deny_scan(config)
@@ -28722,6 +28748,7 @@ def _validate_expert_fragment(config: dict[str, Any]) -> None:
             detail="config may not set credential sections: "
             + ", ".join(sorted(offending)),
         )
+    return _with_validated_tool_overrides(config) or {}
 
 
 # ── Skills (Agent Skills, Slice 1) ────────────────────────────────────────
@@ -29084,7 +29111,7 @@ async def create_expert(request: Request, body: ExpertCreate) -> dict[str, Any]:
     _require_experts_db()
     user = await require_approved_user(request, postgres_db)
     if body.config:
-        _validate_expert_fragment(body.config)
+        body.config = _validate_expert_fragment(body.config)
     await _enforce_expert_save(request, body.config or {}, user=user)
     try:
         return await postgres_db.create_expert(
@@ -29127,7 +29154,7 @@ async def update_expert(
             status_code=403, detail="Only the owner may edit this expert"
         )
     if body.config is not None:
-        _validate_expert_fragment(body.config)
+        body.config = _validate_expert_fragment(body.config)
     await _enforce_expert_save(request, body.config or {}, user=user)
     fields = body.model_dump(exclude_unset=True)
     updated = await postgres_db.update_expert(
@@ -29196,6 +29223,13 @@ async def duplicate_expert(request: Request, expert_id: str) -> dict[str, Any]:
         src = _bundled_expert_bundle(expert_id)
         if not src:
             raise HTTPException(status_code=404, detail="Expert not found")
+    # A fork is a new write by a new principal, and the source row may be
+    # someone else's (visibility, not ownership, is the test above). Validating
+    # here is what stops a legacy smuggled fragment being copied forward — the
+    # same reason `fork_my_expert_default` validates its source. Both
+    # `_bundled_expert_bundle` and `_db_expert_to_bundle_src` build a fresh
+    # dict, so assigning into `src` cannot corrupt a cache or the source row.
+    src["config"] = _validate_expert_fragment(src.get("config") or {})
     return await _create_forked_expert(src, str(user["id"]), suffix="copy")
 
 
@@ -29231,7 +29265,7 @@ async def import_expert(request: Request, body: ExpertCreate) -> dict[str, Any]:
     _require_experts_db()
     user = await require_approved_user(request, postgres_db)
     if body.config:
-        _validate_expert_fragment(body.config)
+        body.config = _validate_expert_fragment(body.config)
     await _enforce_expert_save(request, body.config or {}, user=user)
     name = body.name
     for attempt in range(6):
@@ -29423,8 +29457,8 @@ async def fork_my_expert_default(
             raise HTTPException(status_code=503, detail=str(exc)) from exc
         source = _db_expert_to_bundle_src(selection.expert)
 
-    _validate_expert_fragment(source.get("config") or {})
-    await _enforce_expert_save(request, source.get("config") or {}, user=user)
+    source["config"] = _validate_expert_fragment(source.get("config") or {})
+    await _enforce_expert_save(request, source["config"], user=user)
     try:
         row = await postgres_db.fork_and_set_user_expert_default(
             user_id=uid, expert_type=expert_type, source=source
