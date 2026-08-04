@@ -458,6 +458,8 @@ jobs:
       website: ${{ steps.check.outputs.website }}
       python-changed: ${{ steps.test-paths.outputs.python }}
       cockpit-changed: ${{ steps.test-paths.outputs.cockpit }}
+      # Space-separated test files for pytest, or `tests/` for the whole suite.
+      pytest-target: ${{ steps.select.outputs.pytest-target }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -567,6 +569,58 @@ jobs:
           fi
 
           echo "Test path detection: $(grep -E '^(python|cockpit)=' "$GITHUB_OUTPUT" | tr '\n' ' ')"
+
+      - name: Select affected test files
+        id: select
+        # Which TESTS to run, as opposed to whether to run any. The selector is a
+        # static import graph plus data-file edges; scripts/select_affected_tests.py
+        # documents why a filename rule was rejected, and
+        # tests/test_select_affected_tests.py pins it against a real change whose
+        # failures it must not miss.
+        #
+        # Three ways this lands on the whole suite, all deliberate: no usable push
+        # range, the selector printing ALL (it fails open on anything ambiguous),
+        # or a selection so wide that narrowing buys nothing.
+        run: |
+          TOTAL=$(find tests -name 'test_*.py' | wc -l)
+
+          if [ -z "${RANGE_BASE:-}" ]; then
+            echo "Test selection: whole suite (no usable push range)"
+            echo "pytest-target=tests/" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Via a file, not `mapfile < <(...)`: process substitution does not
+          # propagate the command's exit status to mapfile, so a crashing selector
+          # would look like an empty selection rather than a failure. The empty
+          # check below would still fall open, but silently and for the wrong
+          # stated reason.
+          if ! python3 scripts/select_affected_tests.py \
+                 --repo . --base "$RANGE_BASE" --head HEAD > /tmp/selected.txt; then
+            echo "Test selection: whole suite (selector exited non-zero)"
+            echo "pytest-target=tests/" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          mapfile -t picked < /tmp/selected.txt
+
+          if [ "${#picked[@]}" -eq 0 ] || [ "${picked[0]}" = "ALL" ]; then
+            echo "Test selection: whole suite (selector said ALL)"
+            echo "pytest-target=tests/" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Above ~70% the remaining saving is not worth a 400-argument command
+          # line, and a hub-adjacent edit reaching most of the suite is a signal
+          # to just run it.
+          if [ "$(( ${#picked[@]} * 100 / TOTAL ))" -ge 70 ]; then
+            echo "Test selection: whole suite (${#picked[@]}/$TOTAL selected, over threshold)"
+            echo "pytest-target=tests/" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "Test selection: ${#picked[@]}/$TOTAL test file(s)"
+          printf '  %s\n' "${picked[@]}"
+          echo "pytest-target=${picked[*]}" >> "$GITHUB_OUTPUT"
 
       - name: Detect changes against last deployed SHA per component
         id: check
@@ -892,8 +946,11 @@ jobs:
           helm dependency build helm/
       - name: Install dependencies
         run: uv pip install --system -r requirements.txt -r orchestrator/requirements.txt -r orchestrator/mcp/requirements.txt -r requirements-dev.txt pytest pytest-asyncio
+      # `changes` narrowed this to the test files the diff can reach; the fallback
+      # covers a dispatch, where selection is skipped on purpose, and any path
+      # where the output is unset.
       - name: Run tests
-        run: pytest tests/ -x -q --tb=short
+        run: pytest ${{ needs.changes.outputs.pytest-target || 'tests/' }} -x -q --tb=short
 
   # ---------------------------------------------------------------------------
   # Cockpit unit + production-browser conformance tests (change-based)
