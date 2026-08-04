@@ -440,10 +440,14 @@ export class ToolsGroupComponent {
   /**
    * True when the HOST performs a resolved read at all.
    *
-   * Distinguishes "the read failed" from "nobody asked". Surfaces with no read
-   * wired (job create, the expert editor) would otherwise fly a permanent
-   * "the resolved toolset could not be read" banner reporting the failure of a
-   * request that was never made.
+   * Distinguishes "the read failed" from "nobody asked". A surface with no read
+   * wired would otherwise fly a permanent "the resolved toolset could not be
+   * read" banner reporting the failure of a request that was never made.
+   *
+   * Every host now passes `true` — the live pane, both creation forms and the
+   * expert editor. Kept as an input rather than assumed because the distinction
+   * it draws is the honest one for any surface added later, and defaulting it to
+   * `false` means a new host is silent until it opts in rather than lying.
    */
   readsResolvedToolset = input(false);
   /**
