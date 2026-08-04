@@ -37,10 +37,20 @@ python bench/submit.py --run-id baseline-01 --replicates 3 --resume
 
 # Report (works on partial runs; terminal jobs only in group stats)
 python bench/report.py --run-id baseline-01
+
+# Or hand the same resolved task set to the server-side Job Bench. The returned
+# UUID is the durable run id used by the report command; no laptop process stays
+# alive after submission.
+python bench/submit.py --server --run-id baseline-01 --replicates 3
+python bench/report.py --server --run-id <returned-run-uuid>
 ```
 
 Runs land in `bench/runs/<run-id>/` (gitignored): `manifest.json` written
 incrementally by the submitter, `report.json` by the reporter.
+
+In `--server` mode the frozen spec and submission ledger instead live in the
+orchestrator's `bench_runs` row. The CLI reads and resolves `tasks.yaml` before
+posting it; the server never reads a mutable task registry.
 
 ## Task families
 
