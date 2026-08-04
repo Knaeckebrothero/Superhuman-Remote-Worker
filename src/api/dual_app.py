@@ -954,6 +954,7 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
 
     @app.get("/status", tags=["Health"])
     async def agent_status() -> Dict[str, Any]:
+        runtime_status = _agent.get_status() if _agent is not None else {}
         return {
             "mode": "dual",
             "pod_state": _pod_state.value,
@@ -963,6 +964,7 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
             "uptime_seconds": (datetime.now() - _started_at).total_seconds()
             if _started_at
             else 0,
+            "research_providers": runtime_status.get("research_providers"),
         }
 
     # ===================================================================

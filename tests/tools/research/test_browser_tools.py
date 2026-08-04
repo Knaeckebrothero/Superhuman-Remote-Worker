@@ -339,6 +339,8 @@ class TestResearchTopic:
 
         # Should still return results from arXiv
         assert "Research Report" in result
+        assert "Provider warnings:" in result
+        assert "Semantic Scholar search failed: API error" in result
 
     @pytest.mark.asyncio
     async def test_research_topic_no_results(self, mock_tool_context):
@@ -362,6 +364,7 @@ class TestResearchTopic:
             result = await research_topic.ainvoke({"topic": "xyznonexistent"})
 
         assert "No results found" in result
+        assert "Provider failures:" not in result
 
     @pytest.mark.asyncio
     async def test_research_topic_both_fail(self, mock_tool_context):
@@ -385,6 +388,9 @@ class TestResearchTopic:
             result = await research_topic.ainvoke({"topic": "test"})
 
         assert "No results found" in result
+        assert "Provider failures:" in result
+        assert "arXiv search failed: arXiv down" in result
+        assert "Semantic Scholar search failed: S2 down" in result
 
     @pytest.mark.asyncio
     async def test_research_topic_caps_num_papers(self, mock_tool_context):

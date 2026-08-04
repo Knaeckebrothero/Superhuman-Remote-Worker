@@ -173,6 +173,10 @@ class AgentStatusResponse(BaseModel):
     uptime_seconds: float = Field(..., description="Uptime in seconds")
     connections: Dict[str, bool] = Field(..., description="Connection status")
     config: Dict[str, Any] = Field(..., description="Configuration summary")
+    research_providers: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Secret-free cached health for optional research providers",
+    )
 
 
 class ErrorResponse(BaseModel):
