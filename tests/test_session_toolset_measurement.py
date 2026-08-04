@@ -690,6 +690,117 @@ class TestPreviewEndpoint:
         assert off["tool_groups"]["canvas"] is False
 
     @pytest.mark.asyncio
+    async def test_worker_and_session_get_different_answers(
+        self, user_a, fake_db, fake_request
+    ):
+        """A job preview must answer for ``worker_base``, not ``session_base``.
+
+        What actually carries the difference is the BASE, and the distinction is
+        worth stating because the first version of this test asserted it via
+        ``expert_type`` and passed with ``expert_type`` hardcoded back to
+        ``"session"`` — measured, not assumed: ``resolve_config`` with
+        ``worker`` vs ``session`` yields byte-identical ``tools`` on both bases,
+        because that argument selects PROMPT leaves and nothing in the toolset.
+        See :meth:`test_expert_type_does_not_currently_shape_the_toolset`.
+
+        So this pins the base routing, and the mutation that breaks it is
+        defaulting a worker request to ``session_base``.
+        """
+        from main import ToolGroupPreviewRequest, preview_tool_groups
+
+        with (
+            patch("main.require_approved_user", _approved(user_a)),
+            patch("main.postgres_db", fake_db),
+            patch("main._resolve_runner_grants", AsyncMock(return_value=None)),
+        ):
+            session = await preview_tool_groups(
+                ToolGroupPreviewRequest(expert_type="session"), fake_request
+            )
+            worker = await preview_tool_groups(
+                ToolGroupPreviewRequest(expert_type="worker"), fake_request
+            )
+
+        def bound(view):
+            return {
+                k: tuple(v["tools"])
+                for k, v in view["categories"].items()
+                if v["tools"]
+            }
+
+        assert bound(session) != bound(worker), (
+            "worker and session predictions are identical, so expert_type is "
+            "not reaching resolve_config"
+        )
+        # `core` is the clearest divider: worker jobs carry the phase/todo tools
+        # and a session does not.
+        assert worker["categories"]["core"]["tools"]
+        assert not session["categories"]["core"]["tools"]
+        assert "job" in worker["prediction_reason"]
+
+    @pytest.mark.asyncio
+    async def test_worker_defaults_its_base_without_a_config_name(
+        self, user_a, fake_db, fake_request
+    ):
+        """No `config_name` on the job form must mean worker_base, not session_base."""
+        from main import ToolGroupPreviewRequest, preview_tool_groups
+
+        seen: dict = {}
+
+        def _spy(**kwargs):
+            seen.update(kwargs)
+            return {}, {}
+
+        with (
+            patch("main.require_approved_user", _approved(user_a)),
+            patch("main.postgres_db", fake_db),
+            patch("main._resolve_runner_grants", AsyncMock(return_value=None)),
+            patch("main._merged_session_tool_policy", MagicMock(side_effect=_spy)),
+        ):
+            await preview_tool_groups(
+                ToolGroupPreviewRequest(expert_type="worker"), fake_request
+            )
+
+        assert seen["base_config_name"] == "worker_base"
+        assert seen["expert_type"] == "worker"
+
+    def test_expert_type_does_not_currently_shape_the_toolset(self):
+        """The honest scope of the ``expert_type`` parameter.
+
+        It is threaded through because passing ``resolve_config`` the truthful
+        value is better than passing it a lie, and because it selects which
+        expert-row leaf is read. It is NOT what makes a job preview correct —
+        the base is. Pinned so nobody later "fixes" job create by threading
+        ``expert_type`` somewhere else and believing that did it, and so the day
+        this stops holding is a visible test change rather than a silent one.
+        """
+        import os
+        import sys
+
+        sys.path.insert(0, "orchestrator")
+        os.environ.setdefault("VECTOR_DB_URL", "postgresql://t:t@localhost:5432/t")
+        from services.config_resolver import resolve_config
+
+        def tools_for(base: str, expert_type: str) -> dict:
+            capture: dict = {}
+            resolve_config(
+                base_config_name=base,
+                base_defaults=None,
+                expert_row=None,
+                project_overrides=None,
+                request_override=None,
+                expert_type=expert_type,
+                capture=capture,
+            )
+            merged = (capture.get("merged_fragment") or {}).get("tools") or {}
+            return {k: tuple(v) for k, v in merged.items() if v}
+
+        for base in ("worker_base", "session_base"):
+            assert tools_for(base, "worker") == tools_for(base, "session"), (
+                f"expert_type now changes the toolset on {base}; the preview "
+                f"endpoint's base-only routing may no longer be sufficient"
+            )
+
+    @pytest.mark.asyncio
     async def test_an_unresolvable_config_is_refused_not_guessed(
         self, user_a, fake_db, fake_request
     ):

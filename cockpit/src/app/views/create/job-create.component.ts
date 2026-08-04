@@ -1,6 +1,8 @@
 import {Component, computed, effect, ElementRef, inject, OnInit, signal, ViewChild} from '@angular/core';
 import {ActivatedRoute, Router} from '@angular/router';
 import {ApiService} from '../../core/services/api.service';
+import type {SessionToolGroupsResponse} from '../../core/services/api.service';
+import {CapabilitiesService} from '../../core/services/capabilities.service';
 import {FileHandlingService} from '../../core/services/file-handling.service';
 import {JobArtifactService} from '../../core/services/job-artifact.service';
 import {UserService} from '../../core/services/user.service';
@@ -276,6 +278,9 @@ import {AppTooltipDirective} from '../../ui/tooltip';
           <app-agent-settings
             mode="job"
             [config]="expertDetail()?.config ?? frameworkDefaults() ?? {}"
+            [resolvedToolset]="toolPreview()"
+            [readsResolvedToolset]="true"
+            [gatedCapabilities]="capabilities.grants() ?? null"
             [disabled]="isSubmitting()"
             [showProjectMemory]="projectHasSharedMemory()"
             [enumerateOnly]="expertDetail()?.enumerate_only ?? frameworkEnumerateOnly()"
@@ -1095,6 +1100,7 @@ import {AppTooltipDirective} from '../../ui/tooltip';
 })
 export class JobCreateComponent implements OnInit {
   private readonly api = inject(ApiService);
+  readonly capabilities = inject(CapabilitiesService);
   private readonly route = inject(ActivatedRoute);
   private readonly router = inject(Router);
   private readonly userService = inject(UserService);
@@ -1175,6 +1181,8 @@ export class JobCreateComponent implements OnInit {
     // Refresh eligible datasources for the newly selected project.
     this.loadDatasources();
     this.loadEffectiveDefault();
+    // The project is a grant scope, so it can change what the answer says.
+    this.loadToolPreview();
   }
 
   onCloudStorageChange(value: string | null): void {
@@ -1240,6 +1248,9 @@ export class JobCreateComponent implements OnInit {
       if (d?.effective_models) this.frameworkEffectiveModels.set(d.effective_models);
       if (d?.enumerate_only) this.frameworkEnumerateOnly.set(d.enumerate_only);
     });
+    // The bare-worker_base prediction, so the pane is honest before the user
+    // picks anything. The expert and project hooks refine it from there.
+    this.loadToolPreview();
   }
 
   private loadExperts(): void {
@@ -1273,6 +1284,7 @@ export class JobCreateComponent implements OnInit {
     if (expert && this.selectedExpert()?.id !== expert.id) {
       this.selectedExpert.set(expert);
       this.fetchExpertDetail(expert.id);
+      this.loadToolPreview();
     }
   }
 
@@ -1282,6 +1294,58 @@ export class JobCreateComponent implements OnInit {
     if (this.selectedExpert()?.id === expert.id) return;
     this.selectedExpert.set(expert);
     this.fetchExpertDetail(expert.id);
+    this.loadToolPreview();
+  }
+
+  /** The server's answer for "what would a job created like this bind?".
+   *
+   *  Null until the first answer lands, and null again on failure — the tools
+   *  group renders its static list in that case, labelled, rather than an empty
+   *  pane. `readsResolvedToolset` is what tells it a read was attempted.
+   */
+  readonly toolPreview = signal<SessionToolGroupsResponse | null>(null);
+  private toolPreviewSerial = 0;
+
+  /** Ask the server what this job's toolset would be.
+   *
+   *  Sends `expert_type: 'worker'`: without it the endpoint answers for a
+   *  SESSION (session_base, session code floors), which is a different toolset —
+   *  60 tools vs 64 on the shipped bases — and predicting the wrong one on the
+   *  job form is the defect this whole series exists to remove, at a new seam.
+   *
+   *  Routed exactly as `createJob` routes the expert, for the same reason the
+   *  session form does it: a preview that resolved a different expert layer from
+   *  the create it previews would be worse than no preview.
+   *
+   *  Serial-guarded so a slow answer for an expert the user has already switched
+   *  away from cannot paint over the current one.
+   */
+  private loadToolPreview(): void {
+    const serial = ++this.toolPreviewSerial;
+    const expert = this.selectedExpert();
+    const isDbExpert =
+      !!expert &&
+      !['default', 'defaults', 'worker_base'].includes(expert.id) &&
+      (expert.storage_kind === 'db' ||
+        ['user', 'global', 'managed'].includes(expert.source ?? ''));
+    const isBundled =
+      !!expert && !isDbExpert && !['default', 'defaults', 'worker_base'].includes(expert.id);
+
+    this.api
+      .previewToolGroups({
+        expert_type: 'worker',
+        config_name: isBundled ? expert!.id : null,
+        expert_id: isDbExpert ? expert!.id : null,
+        project_id: this.selectedProjectId() ?? null,
+      })
+      .subscribe((preview) => {
+        if (serial !== this.toolPreviewSerial) return;
+        this.toolPreview.set(preview);
+        const categories = preview?.categories;
+        if (categories && !this.agentSettings?.hasToolEdits()) {
+          this.agentSettings?.prefillFromResolvedToolset(categories);
+        }
+      });
   }
 
   private fetchExpertDetail(expertId: string): void {
