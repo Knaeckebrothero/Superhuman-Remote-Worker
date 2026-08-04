@@ -24,6 +24,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from fastapi import HTTPException
 
 # Add orchestrator/ to sys.path so its top-level modules import bare.
 _ORCH = Path(__file__).parent.parent / "orchestrator"
@@ -494,3 +495,130 @@ class TestResumeEndpointWorkspacelessJob:
         assert result["status"] == "resumed"
         workspaceless.delegate.assert_awaited_once()
         workspaceless.shed.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# resume_job endpoint — Resume PEP grant re-check (decision 9, B3)
+# ---------------------------------------------------------------------------
+#
+# .superpowers/sdd/2026-08-04-expert-write-gate-holes/task-2-brief.md: the PEP
+# block re-runs resolve_config + _enforce_dispatch_grants against the
+# runner's CURRENT grants before replaying the job, so grants narrowed after
+# dispatch are honoured on resume rather than only at dispatch time.
+# resolve_config now raises ToolPolicyError DETERMINISTICALLY on a
+# permanently-malformed stored `tools` value instead of silently resolving it
+# to `[]`. The broad `except Exception` below was written to tolerate
+# TRANSIENT errors (a DB blip reading the expert/grant rows) and proceed on
+# the assumption that the dispatch-time check still stands; it also caught
+# this new deterministic case, turning one bad row into a latch that skips
+# the grant check on every resume of every job using that expert, forever,
+# while still returning success.
+
+
+def _capturing_resolve_config(**kwargs):
+    """Stand-in for the real ``resolve_config`` (pure/synchronous) that mimics
+    its side effect of writing ``merged_fragment`` into the caller's
+    ``capture`` dict. ``resume_job`` reads ``_rcap["merged_fragment"]`` when
+    building the ``_enforce_dispatch_grants`` call, so a mock that merely
+    returns a value and ignores ``capture`` would KeyError on that lookup
+    before the collaborator under test in a given case ever runs.
+    """
+    capture = kwargs.get("capture")
+    if capture is not None:
+        capture["merged_fragment"] = {}
+    return {}
+
+
+@pytest.fixture
+def grant_recheck_collaborators(monkeypatch, endpoint_collaborators):
+    """Turn the Resume PEP block ON — ``endpoint_collaborators`` turns it OFF
+    (correct for the delegation tests above, which aren't exercising it) —
+    and stub its two collaborators, ``resolve_config`` and
+    ``_enforce_dispatch_grants``, so each test below controls which one
+    raises, and with what.
+    """
+    monkeypatch.setattr(main, "_user_experts_enabled", AsyncMock(return_value=True))
+    monkeypatch.setattr(main, "_resolve_default_models", AsyncMock(return_value={}))
+    endpoint_collaborators.resolve_config = MagicMock(
+        side_effect=_capturing_resolve_config
+    )
+    monkeypatch.setattr(main, "resolve_config", endpoint_collaborators.resolve_config)
+    endpoint_collaborators.enforce_dispatch_grants = AsyncMock(return_value=None)
+    monkeypatch.setattr(
+        main,
+        "_enforce_dispatch_grants",
+        endpoint_collaborators.enforce_dispatch_grants,
+    )
+    return endpoint_collaborators
+
+
+class TestResumeEndpointGrantRecheck:
+    @pytest.mark.asyncio
+    async def test_malformed_stored_config_fails_closed(
+        self, grant_recheck_collaborators
+    ):
+        """A ToolPolicyError from resolve_config must fail closed and must
+        NOT put the job back on an agent. Asserting the status code alone
+        would still pass a fix that resumed the job first and merely
+        returned the right code afterwards."""
+        grant_recheck_collaborators.resolve_config.side_effect = main.ToolPolicyError(
+            "tools.core: unsupported value None (NoneType)."
+        )
+
+        with pytest.raises(HTTPException) as ei:
+            await main.resume_job(MagicMock(), JOB_ID, main.JobResumeRequest())
+
+        assert ei.value.status_code == 409
+        # Names the real cause (the stored config, not the caller's grants)
+        # and must not read like the 403 GrantDenied branch's wording below.
+        assert "cannot be resolved" in ei.value.detail
+        assert "your capability grants" not in ei.value.detail
+        grant_recheck_collaborators.delegate.assert_not_awaited()
+        grant_recheck_collaborators.queue_for_resume.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_transient_resolve_error_still_proceeds(
+        self, grant_recheck_collaborators
+    ):
+        """A plain transient error (DB blip, connection error) must still
+        resume the job — the fix is a narrowing of the broad handler, not a
+        reversal of the tolerate-and-proceed behaviour it was built for."""
+        grant_recheck_collaborators.resolve_config.side_effect = RuntimeError(
+            "connection reset by peer"
+        )
+
+        result = await main.resume_job(MagicMock(), JOB_ID, main.JobResumeRequest())
+
+        assert result == {
+            "status": "resumed",
+            "job_id": JOB_ID,
+            "agent_id": AGENT_ID,
+        }
+        grant_recheck_collaborators.delegate.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_grant_denied_still_403s(self, grant_recheck_collaborators):
+        """Pre-existing behaviour, not previously pinned at the endpoint
+        level: an actual grant violation still fails closed with 403, not
+        the new 409 this task adds for the unresolvable-config case."""
+        grant_recheck_collaborators.enforce_dispatch_grants.side_effect = (
+            main.GrantDenied(
+                ["shell_tools: tools.shell requires the shell_tools grant"]
+            )
+        )
+
+        with pytest.raises(HTTPException) as ei:
+            await main.resume_job(MagicMock(), JOB_ID, main.JobResumeRequest())
+
+        assert ei.value.status_code == 403
+        assert "shell_tools" in ei.value.detail
+        grant_recheck_collaborators.delegate.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_happy_path_still_resumes(self, grant_recheck_collaborators):
+        """Fixture sanity baseline: when both collaborators pass, the PEP
+        block is a no-op and the job resumes normally."""
+        result = await main.resume_job(MagicMock(), JOB_ID, main.JobResumeRequest())
+
+        assert result["status"] == "resumed"
+        grant_recheck_collaborators.delegate.assert_awaited_once()
