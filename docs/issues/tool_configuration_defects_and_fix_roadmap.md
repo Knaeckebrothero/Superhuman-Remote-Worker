@@ -223,11 +223,31 @@ identity property — no shipped config's grants change — held across all eigh
 tasks, with `tests/fixtures/config_tool_grants.json` still at md5
 `9ddc4f79…`, unmoved since Task 2's deliberate `kb_*` grant.
 
-**What was not:** no creation form can tell the truth structurally, because a
-prediction cannot see the backend gate, runtime injection, or datasource
-attachment — and no cockpit surface branches on `origin` in a way that changes
-the control, so a forecast still renders as switch positions. Job create is the
-weakest surface: no server-computed view at all.
+**What was not, as of the eight tasks:** no creation form could tell the truth
+structurally, because a prediction cannot see the backend gate, runtime
+injection, or datasource attachment — and no cockpit surface branched on `origin`
+in a way that changed the control, so a forecast rendered as switch positions.
+Job create was the weakest surface: no server-computed view at all.
+
+> **Substantially closed 2026-08-04 (`44c268d9`).** Job create now reads the same
+> endpoint the live pane and New Session read: `ToolGroupPreviewRequest` gained
+> `expert_type`, a worker request defaults its base to `worker_base`, and the form
+> passes `resolvedToolset` / `readsResolvedToolset` / `gatedCapabilities`. So it
+> renders every category the server returns with three states and grant reasons,
+> instead of six hardcoded rows that showed an ungranted user a tickable Shell
+> box.
+>
+> The *structural* half of the sentence above still stands and is not a bug: a
+> creation form has no agent, so it forecasts, and it says so — `origin:
+> "prediction"` with a reason, rendered as a banner. What is gone is the part that
+> was fixable: the forecast is now server-computed and grant-aware on both forms.
+>
+> **Still static: the expert editor.** It passes `gatedCapabilities` and
+> `enumerateOnly` but performs no resolved read, so it shows the static
+> catalogue with grant greying. Defensible — an expert is a fragment, not a run,
+> and `readsResolvedToolset` stays false so it flies no could-not-be-read banner
+> — but it is the one authoring surface where the server's answer is still absent.
+> Cheapest remaining item in this register.
 
 **Carried out of the run, not lost with it:** about forty findings triaged as
 *minor, deferred*, ten rulings settled at real cost, and three tickets that were

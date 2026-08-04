@@ -297,15 +297,36 @@ handoff items this series dropped.
    prediction contract (a forecast cannot see runtime injection) and newly
    *visible* because the forms now render all 25 rows. The live pane handles this
    correctly via the locked-on path.
-7. **Job create has no grant gating at all, and this is the sharper half of the
-   "creation forms cannot tell the truth" gap.** Measured 2026-08-03 rather than
-   inferred: `views/create/job-create.component.ts:277` mounts
+7. ~~**Job create has no grant gating at all**~~ — **FIXED 2026-08-04
+   (`44c268d9`).** Measured 2026-08-03 rather than inferred:
+   `views/create/job-create.component.ts:277` mounted
    `<app-agent-settings mode="job">` with **no `gatedCapabilities`, no
-   `readsResolvedToolset` and no `resolved`** binding. So it renders the six
-   static `JOB_TOOL_CATEGORIES` rows, and a user without `shell_tools` is shown a
-   plain tickable **Shell** box — the same untruthful control the session work
-   removed, still live on the job surface. Its server-side twin is that
-   `preview_tool_groups` hardcodes `expert_type="session"`.
+   `readsResolvedToolset` and no `resolved`** binding, so it rendered the six
+   static `JOB_TOOL_CATEGORIES` rows and showed a user without `shell_tools` a
+   plain tickable **Shell** box. It now reads the preview endpoint with
+   `expert_type: 'worker'` and renders what the server returns.
+
+   Two notes worth keeping from the fix. First, the server-side twin was NOT the
+   `expert_type` hardcoding, despite that being the obvious suspect: measured,
+   `resolve_config` returns byte-identical `tools` for `worker` and `session` on
+   both bases, because that argument selects prompt leaves. What mattered was the
+   base default — `session_base` vs `worker_base`. A test named for `expert_type`
+   passed with it reverted, which is how that was found.
+
+   Second, removing the `resolvedToolset` binding passed all fifteen pre-existing
+   job-create tests. That absence is why the defect shipped, and both creation
+   forms are now pinned to pass the read in
+   `cockpit/src/app/views/create/creation-forms-read-the-resolved-toolset.spec.ts`.
+
+8. **The expert editor still shows a static toolset.** It passes
+   `gatedCapabilities` and `enumerateOnly` but performs no resolved read
+   (`views/experts/expert-editor.component.ts`), so an author sees the static
+   catalogue with grant greying rather than "what an agent using this expert
+   would bind". Defensible, and not the same defect as job create was — an expert
+   is a config fragment rather than a run, and `readsResolvedToolset` stays false
+   so no could-not-be-read banner appears. But the row has an `expert_type` and
+   the preview endpoint now takes one, so the answer is available for the asking.
+   Cheapest remaining item in this register.
 
    By contrast the New Session form is now largely honest, which is worth
    recording because the two are usually lumped together:
