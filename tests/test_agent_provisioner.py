@@ -866,6 +866,227 @@ class TestProvisionBasic:
 
 
 # =============================================================================
+# TestSessionAgentWorkspacePvc
+# =============================================================================
+
+
+class TestSessionAgentWorkspacePvc:
+    """Durable ``/workspace`` for SESSION agent pods (WORKSPACE_PVC_ENABLED).
+
+    The agent pod's ``/workspace`` was framed as pure scratch — the real tree
+    lives in the separate workspace pod it reaches over SSH — but that framing
+    is incomplete: ``backend: none`` / lite sessions have no workspace pod at
+    all, so agent-local state written there is the only copy and died with every
+    pod recycle (drift drain, crash, node loss, version upgrade). Since the pod
+    name is random per provision, the volume identity has to come from the
+    thread, which is what makes a recycled pod reattach rather than boot onto
+    empty scratch.
+
+    Job agent pods stay emptyDir: they are stateless dispatch runners whose
+    durable state is in the workspace pod, the job repo and Postgres.
+    """
+
+    _TID = "11111111-2222-3333-4444-555555555555"
+    _PVC = "pvc-agent-s-11111111-222"
+
+    def _provisioner(self, pvc_enabled=True):
+        p, conn = _make_provisioner()
+        p._pvc_enabled = pvc_enabled
+        p._pvc_size = "10Gi"
+        p._storage_class = "longhorn-ephemeral"
+        pods_list = MagicMock()
+        pods_list.items = []
+        p._core_api.list_namespaced_pod.return_value = pods_list
+        return p, conn
+
+    @staticmethod
+    def _capture(p, pod_body, pvc_body=None):
+        p._core_api.create_namespaced_pod = lambda **kw: pod_body.update(
+            kw.get("body", {})
+        )
+        if pvc_body is not None:
+            p._core_api.create_namespaced_persistent_volume_claim = (
+                lambda **kw: pvc_body.update(kw.get("body", {}))
+            )
+
+    @pytest.mark.asyncio
+    async def test_session_pod_gets_a_thread_keyed_pvc(self):
+        p, _conn = self._provisioner()
+        pod_body, pvc_body = {}, {}
+        self._capture(p, pod_body, pvc_body)
+
+        with patch(
+            "orchestrator.services.agent_provisioner.asyncio.to_thread",
+            side_effect=_fake_to_thread,
+        ):
+            name = await p.provision_agent(purpose="session", thread_id=self._TID)
+
+        assert name is not None and name.startswith("srw-agent-s-")
+        # Keyed on the thread, not the (random) pod name — that is the whole point.
+        assert pvc_body["metadata"]["name"] == self._PVC
+        assert pvc_body["spec"]["accessModes"] == ["ReadWriteOnce"]
+        # The pod mounts the claim, not scratch.
+        vols = {v["name"]: v for v in pod_body["spec"]["volumes"]}
+        assert vols["workspace"]["persistentVolumeClaim"]["claimName"] == self._PVC
+        assert "emptyDir" not in vols["workspace"]
+
+    @pytest.mark.asyncio
+    async def test_pvc_carries_the_labels_gc_selects_on(self):
+        """Without ``srw.io/component: agent-workspace`` the claim is invisible
+        to the lifecycle reaper's label selector and leaks storage forever once
+        its thread is gone — the bug the legacy PersistentProvisioner helper has,
+        which is why this path does not reuse it. The thread id must be the FULL
+        uuid: the reaper resolves PVC → thread row by that value, and the pod's
+        12-char ``srw/thread-id`` label is not a thread key.
+        """
+        p, _conn = self._provisioner()
+        pod_body, pvc_body = {}, {}
+        self._capture(p, pod_body, pvc_body)
+
+        with patch(
+            "orchestrator.services.agent_provisioner.asyncio.to_thread",
+            side_effect=_fake_to_thread,
+        ):
+            await p.provision_agent(purpose="session", thread_id=self._TID)
+
+        labels = pvc_body["metadata"]["labels"]
+        assert labels["srw.io/component"] == "agent-workspace"
+        assert labels["srw/thread-id"] == self._TID
+
+    @pytest.mark.asyncio
+    async def test_job_agent_pod_stays_emptydir(self):
+        p, _conn = self._provisioner()
+        pod_body = {}
+        self._capture(p, pod_body)
+        p._core_api.create_namespaced_persistent_volume_claim = MagicMock()
+
+        with patch(
+            "orchestrator.services.agent_provisioner.asyncio.to_thread",
+            side_effect=_fake_to_thread,
+        ):
+            name = await p.provision_agent(purpose="job")
+
+        assert name is not None
+        p._core_api.create_namespaced_persistent_volume_claim.assert_not_called()
+        vols = {v["name"]: v for v in pod_body["spec"]["volumes"]}
+        assert vols["workspace"]["emptyDir"]["sizeLimit"] == "10Gi"
+        assert "persistentVolumeClaim" not in vols["workspace"]
+
+    @pytest.mark.asyncio
+    async def test_flag_off_keeps_session_pods_on_emptydir(self):
+        """Mixed-fleet safety: same switch as workspace PVCs, and a cluster that
+        hasn't flipped it behaves exactly as before."""
+        p, _conn = self._provisioner(pvc_enabled=False)
+        pod_body = {}
+        self._capture(p, pod_body)
+        p._core_api.create_namespaced_persistent_volume_claim = MagicMock()
+
+        with patch(
+            "orchestrator.services.agent_provisioner.asyncio.to_thread",
+            side_effect=_fake_to_thread,
+        ):
+            name = await p.provision_agent(purpose="session", thread_id=self._TID)
+
+        assert name is not None
+        p._core_api.create_namespaced_persistent_volume_claim.assert_not_called()
+        vols = {v["name"]: v for v in pod_body["spec"]["volumes"]}
+        assert "emptyDir" in vols["workspace"]
+
+    @pytest.mark.asyncio
+    async def test_pvc_failure_fails_closed_without_creating_a_pod(self):
+        """An emptyDir fallback would hand the user a session that looks healthy
+        and then loses its agent-local state on the next recycle — the exact
+        failure the PVC exists to prevent, with nothing in the UI to explain it.
+        A visible provision failure the caller can retry is strictly better.
+        """
+        p, conn = self._provisioner()
+        p._core_api.create_namespaced_pod = MagicMock()
+        p._core_api.create_namespaced_persistent_volume_claim = MagicMock(
+            side_effect=Exception("PVC API down")
+        )
+
+        with patch(
+            "orchestrator.services.agent_provisioner.asyncio.to_thread",
+            side_effect=_fake_to_thread,
+        ):
+            name = await p.provision_agent(purpose="session", thread_id=self._TID)
+
+        assert name is None
+        p._core_api.create_namespaced_pod.assert_not_called()
+        # The thread carries the failure, so the UI has something to show and
+        # the caller isn't left polling a session that will never come up.
+        stamped = conn.execute.await_args.args[-1]
+        assert '"status": "failed"' in stamped
+        assert "PVC creation failed" in stamped
+
+    @pytest.mark.asyncio
+    async def test_quota_403_also_fails_closed(self):
+        """Capacity exhaustion surfaces as a 403 from the namespace
+        ResourceQuota. Never silently drop durability because the cluster is
+        full."""
+        p, _conn = self._provisioner()
+
+        class _QuotaExc(Exception):
+            status = 403
+            body = "exceeded quota: srw-workspace-storage"
+
+        p._core_api.create_namespaced_pod = MagicMock()
+        p._core_api.create_namespaced_persistent_volume_claim = MagicMock(
+            side_effect=_QuotaExc()
+        )
+
+        with patch(
+            "orchestrator.services.agent_provisioner.asyncio.to_thread",
+            side_effect=_fake_to_thread,
+        ):
+            name = await p.provision_agent(purpose="session", thread_id=self._TID)
+
+        assert name is None
+        p._core_api.create_namespaced_pod.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_existing_claim_is_reused_not_recreated(self):
+        """409 is the reattach path every pod recycle takes — it must read as
+        success, or a recycled session agent could never come back to its data.
+        """
+        p, _conn = self._provisioner()
+        pod_body = {}
+        self._capture(p, pod_body)
+
+        conflict = type("ApiErr", (Exception,), {"status": 409})()
+        p._core_api.create_namespaced_persistent_volume_claim = MagicMock(
+            side_effect=conflict
+        )
+
+        with patch(
+            "orchestrator.services.agent_provisioner.asyncio.to_thread",
+            side_effect=_fake_to_thread,
+        ):
+            name = await p.provision_agent(purpose="session", thread_id=self._TID)
+
+        assert name is not None
+        vols = {v["name"]: v for v in pod_body["spec"]["volumes"]}
+        assert vols["workspace"]["persistentVolumeClaim"]["claimName"] == self._PVC
+
+    @pytest.mark.asyncio
+    async def test_pvc_name_never_collides_with_the_legacy_persistent_claim(self):
+        """``pvc-persistent-<id>`` belongs to the legacy PersistentProvisioner
+        pod path. Sharing one RWO claim between both paths would wedge whichever
+        pod attached second if the two ever coexist for a thread."""
+        p, _conn = self._provisioner()
+        pod_body, pvc_body = {}, {}
+        self._capture(p, pod_body, pvc_body)
+
+        with patch(
+            "orchestrator.services.agent_provisioner.asyncio.to_thread",
+            side_effect=_fake_to_thread,
+        ):
+            await p.provision_agent(purpose="session", thread_id=self._TID)
+
+        assert not pvc_body["metadata"]["name"].startswith("pvc-persistent-")
+
+
+# =============================================================================
 # TestActiveCountsByPurpose
 # =============================================================================
 

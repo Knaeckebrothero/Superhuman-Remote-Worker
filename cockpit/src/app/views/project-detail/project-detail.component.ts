@@ -236,11 +236,17 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
                         </td>
                         <td class="desc-cell">{{ truncate(job.description, 60) }}</td>
                         <td class="mono">{{ job.config_name }}</td>
-                        <td class="mono">{{ job.branch_name || '-' }}</td>
+                        <td class="mono">
+                          @if (job.repo_name) {
+                            {{ job.repo_name }}&#64;{{ job.branch_name || 'main' }}
+                          } @else {
+                            -
+                          }
+                        </td>
                         <td>
-                          @if (job.merge_status) {
-                            <span class="merge-badge" [class]="'merge-' + job.merge_status">
-                              {{ job.merge_status }}
+                          @if (job.delivery_status || job.merge_status) {
+                            <span class="merge-badge" [class]="'merge-' + (job.delivery_status || job.merge_status)">
+                              {{ job.delivery_status || job.merge_status }}
                             </span>
                           } @else {
                             <span class="text-muted">-</span>
@@ -560,7 +566,6 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
                   [value]="repoRole()"
                   (changed)="onRepoRoleChange($event)"
                 >
-                  <option value="jobs">{{ 'projectDetail.repos.roleJobs' | transloco }}</option>
                   <option value="source">{{ 'projectDetail.repos.roleSource' | transloco }}</option>
                   <option value="reference">{{ 'projectDetail.repos.roleReference' | transloco }}</option>
                 </app-select>
@@ -647,7 +652,6 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
               } @else if (projectExperts().length === 0) {
                 <div class="empty-inline">
                   {{ 'projectDetail.experts.emptyPrefix' | transloco }}
-                  <code>experts/</code> {{ 'projectDetail.experts.emptySuffix' | transloco }}
                 </div>
               } @else {
                 <div class="expert-grid">
@@ -1138,6 +1142,12 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
     .merge-pending { background: var(--warning-tint); color: var(--warning); }
     .merge-empty { background: var(--warning-tint); color: var(--warning); }
     .merge-merge-failed { background: var(--danger-tint); color: var(--danger); }
+    .merge-cloud-applied { background: var(--success-tint); color: var(--success); }
+    .merge-no-changes,
+    .merge-cloud-rejected { background: var(--surface-0); color: var(--text-muted); }
+    .merge-cloud-conflict,
+    .merge-cloud-partial,
+    .merge-cloud-unavailable { background: var(--danger-tint); color: var(--danger); }
 
     /* Role badges */
     .role-badge {
@@ -1631,7 +1641,7 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
   // Repos tab
   readonly repoName = signal('');
   readonly repoUrl = signal('');
-  readonly repoRole = signal<ProjectRepoRole>('jobs');
+  readonly repoRole = signal<Extract<ProjectRepoRole, 'source' | 'reference'>>('source');
   readonly repoReadOnly = signal(false);
   readonly repoCreateManaged = signal(false);
 
@@ -1874,7 +1884,7 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
   }
 
   onRepoRoleChange(value: string | null): void {
-    if (value) this.repoRole.set(value as ProjectRepoRole);
+    if (value === 'source' || value === 'reference') this.repoRole.set(value);
   }
 
   // Members

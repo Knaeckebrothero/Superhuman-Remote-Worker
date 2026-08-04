@@ -314,6 +314,19 @@ codexProxy:
 workspace:
   accessMode: "ReadWriteOnce"
   storageSize: "10Gi"
+  # k3d ships only the local-path storage class (no Longhorn). Per-workspace
+  # PVCs (Branch a) must target it, else they hang Pending against the
+  # non-existent longhorn-ephemeral default. local-path is Delete-reclaim +
+  # WaitForFirstConsumer (binds when the pod schedules) — both fine here.
+  ephemeralStorageClass: "local-path"
+  # Branch (a) E2E: PVC-back workspaces so files survive pod crashes. Covers
+  # jobs AND sessions — a session also gets a second claim for its agent pod
+  # (`pvc-agent-s-*`), and BOTH session claims are held until the thread row is
+  # deleted (an `ended` thread is resumable). On a laptop k3d node that means
+  # workspace PVCs accumulate with retained threads; delete threads you are
+  # done with, or `kubectl -n srw delete pvc -l srw.io/component=agent-workspace`
+  # between experiments. Set false to go back to emptyDir.
+  pvcEnabled: true
   networkPolicy:
     extraEgress:
       - to:

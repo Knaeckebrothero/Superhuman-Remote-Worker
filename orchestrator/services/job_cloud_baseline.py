@@ -12,12 +12,11 @@ handler. While it runs, the job carries
 in ``get_dispatchable_jobs`` skips jobs in that state so the agent
 never starts on an incomplete baseline.
 
-v1 limitations (deferred to v2):
+Compatibility limitation:
 
-* Text files only — anything that isn't UTF-8-decodable is logged and
-  skipped from the baseline. Binary files in the project folder will
-  not appear in the diff. Acceptable for the thesis/document workflows
-  this feature primarily targets; revisit when first user hits it.
+* Ordinary human-reviewed Mode A jobs retain the original text-only baseline
+  behavior. Strict loop baselines include binary files byte-for-byte because a
+  file-producing loop cannot silently start from an incomplete project folder.
 
 Both the OpenCloud and Nextcloud backends implement the byte-level
 project-folder methods this module relies on
@@ -29,6 +28,7 @@ Mode A works on either active backend.
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 from typing import Any
@@ -71,6 +71,20 @@ def slugify_project_name(name: str) -> str:
     return out or "project"
 
 
+def project_folder_slug(job: dict[str, Any], project: dict[str, Any]) -> str:
+    """Return the immutable seed-time cloud checkout slug for a job.
+
+    A project may be renamed while a job is running. Re-deriving the path from
+    the current name at completion would skip every diff path under the old
+    slug while falsely reporting a successful apply. New baselines persist the
+    seed-time slug; legacy baselines fall back to the current project name.
+    """
+    baseline = _job_context(job).get("cloud_baseline") or {}
+    if isinstance(baseline, dict) and baseline.get("project_slug"):
+        return str(baseline["project_slug"])
+    return slugify_project_name(str(project.get("name") or "project"))
+
+
 _BASELINE_COMMIT_MESSAGE = (
     "Mode A baseline: seed project folder for job {job_short}\n\n"
     "Seeded by orchestrator from project '{project_name}' cloud folder. "
@@ -88,6 +102,7 @@ async def seed_project_folder_baseline(
     postgres_db: Any,
     gitea_client: Any,
     main_cloud_router: MainCloudRouter,
+    require_complete: bool = False,
 ) -> None:
     """Walk the project's cloud folder, push files into Gitea, stamp baseline.
 
@@ -109,12 +124,16 @@ async def seed_project_folder_baseline(
         *,
         error: str | None = None,
         entries: dict[str, str] | None = None,
+        project_slug: str | None = None,
     ) -> None:
         """Merge ``cloud_baseline`` state at the top level. The merge is
         a JSONB ``||`` so we replace the whole ``cloud_baseline`` object
         each call; pass ``entries`` to persist the path→etag map.
         """
-        payload: dict[str, Any] = {"state": state}
+        payload: dict[str, Any] = {
+            "state": state,
+            "project_slug": project_slug or slug,
+        }
         if error:
             payload["error"] = error
         if entries is not None:
@@ -130,7 +149,14 @@ async def seed_project_folder_baseline(
         # Idempotency: a re-run after a successful seed should no-op.
         existing = await postgres_db.get_job(job_id)
         if existing and existing.get("cloud_diff_baseline_commit"):
-            await _set_state("ready")
+            existing_baseline = _job_context(existing).get("cloud_baseline") or {}
+            if not isinstance(existing_baseline, dict):
+                existing_baseline = {}
+            await _set_state(
+                "ready",
+                entries=existing_baseline.get("entries") or {},
+                project_slug=existing_baseline.get("project_slug") or slug,
+            )
             return
 
         await _set_state("seeding")
@@ -185,7 +211,7 @@ async def seed_project_folder_baseline(
             await _set_state("failed", error=f"list_project_folder: {e}")
             return
 
-        # 2. Filter to text files only. Walk dirs are no-ops in git.
+        # 2. Filter to files. Walk dirs are no-ops in git.
         files = [e for e in entries if not e.is_dir]
         # Path → etag map of every file we observed in the cloud at seed
         # time. Persisted into context so the accept-time external-mod
@@ -202,15 +228,16 @@ async def seed_project_folder_baseline(
             # has something to diff against (the empty tree).
             # We do this by capturing the current HEAD of the job branch.
             head_sha = await _read_head_commit(gitea_client, repo_name, branch)
-            if head_sha:
-                await postgres_db.update_job_cloud_diff(
-                    job_id, baseline_commit=head_sha
-                )
+            if not head_sha:
+                await _set_state("failed", error="could not read empty baseline HEAD")
+                return
+            await postgres_db.update_job_cloud_diff(job_id, baseline_commit=head_sha)
             await _set_state("ready", entries=entries_map)
             return
 
         seeded = 0
         skipped_binary = 0
+        failed_files = 0
         for entry in files:
             try:
                 blob = await backend.get_project_folder_file_bytes(
@@ -223,18 +250,47 @@ async def seed_project_folder_baseline(
                     entry.path,
                     e,
                 )
+                failed_files += 1
                 continue
-            # v1: text files only. Skip anything that isn't valid UTF-8.
+            # Human-reviewed Mode A keeps its original text-only baseline.
+            # Loops are strict: seed binary content byte-for-byte through
+            # Gitea's ChangeFiles API so the cloned workspace is a complete
+            # project-folder snapshot and generated binary artifacts can make
+            # the reverse trip to cloud storage.
             try:
                 content_text = blob.decode("utf-8")
             except UnicodeDecodeError:
-                skipped_binary += 1
-                logger.debug(
-                    "Mode A: job %s — skipping binary %s (%d bytes)",
-                    job_short,
-                    entry.path,
-                    len(blob),
-                )
+                if require_complete:
+                    ok = await gitea_client.change_files(
+                        repo_name,
+                        branch or "main",
+                        [
+                            {
+                                "path": f"{target_subpath}/{entry.path}",
+                                "content_b64": base64.b64encode(blob).decode("ascii"),
+                            }
+                        ],
+                        message=_BASELINE_COMMIT_MESSAGE.format(
+                            job_short=job_short, project_name=project_name
+                        ),
+                    )
+                    if ok:
+                        seeded += 1
+                    else:
+                        logger.warning(
+                            "Mode A: job %s — gitea binary write failed for %s",
+                            job_short,
+                            entry.path,
+                        )
+                        failed_files += 1
+                else:
+                    skipped_binary += 1
+                    logger.debug(
+                        "Mode A: job %s — skipping binary %s (%d bytes)",
+                        job_short,
+                        entry.path,
+                        len(blob),
+                    )
                 continue
             gitea_path = f"{target_subpath}/{entry.path}"
             ok = await gitea_client.create_or_update_file(
@@ -254,6 +310,18 @@ async def seed_project_folder_baseline(
                     job_short,
                     gitea_path,
                 )
+                failed_files += 1
+
+        if require_complete and failed_files:
+            await _set_state(
+                "failed",
+                error=(
+                    "loop cloud baseline was incomplete: "
+                    f"{failed_files} file read/write failure(s)"
+                ),
+                entries=entries_map,
+            )
+            return
 
         # 3. Capture the head of the branch as the baseline commit.
         baseline_sha = await _read_head_commit(gitea_client, repo_name, branch)
@@ -304,6 +372,7 @@ def fire_baseline_seed(
     postgres_db: Any,
     gitea_client: Any,
     main_cloud_router: MainCloudRouter,
+    require_complete: bool = False,
 ) -> asyncio.Task:
     """Fire-and-forget wrapper around :func:`seed_project_folder_baseline`.
 
@@ -320,6 +389,7 @@ def fire_baseline_seed(
             postgres_db=postgres_db,
             gitea_client=gitea_client,
             main_cloud_router=main_cloud_router,
+            require_complete=require_complete,
         )
     )
 
@@ -497,6 +567,8 @@ async def detect_external_mods(
     job: dict[str, Any],
     project: dict[str, Any],
     main_cloud_router: MainCloudRouter,
+    scope_paths: set[str] | None = None,
+    strict: bool = False,
 ) -> list[dict[str, str]]:
     """Check whether the cloud folder has been modified since seed.
 
@@ -510,20 +582,32 @@ async def detect_external_mods(
     where ``kind`` is ``etag_mismatch`` / ``missing_at_cloud`` /
     ``unexpected_at_cloud``. Empty list means the apply is safe.
 
-    Caller is responsible for fetching the diff summary and threading
-    the affected paths in via ``affected_cloud_paths``.
+    ``scope_paths`` limits the comparison to cloud-relative paths touched by
+    the job. Passing ``None`` retains the legacy whole-folder check.
+
+    ``strict=True`` is for unattended loop delivery. It raises when the live
+    folder cannot be enumerated instead of treating an unknown conflict state
+    as clean. The human-reviewed compatibility path keeps the legacy
+    fail-through behavior with the default ``False``.
     """
     baseline_entries = _job_context(job).get("cloud_baseline", {}).get("entries") or {}
     handle_db = project.get("main_cloud_folder_handle")
     backend_id = project.get("main_cloud_backend")
     if not handle_db or not backend_id:
-        # No cloud folder → can't externally mod. Treat as clean.
+        if strict:
+            raise RuntimeError("project cloud folder is unavailable")
+        # Legacy compatibility: no cloud folder was treated as clean and the
+        # apply step surfaced the actual failure.
         return []
     try:
         backend = main_cloud_router.for_backend(backend_id)
     except Exception:
+        if strict:
+            raise
         return []
     if not getattr(backend, "is_initialized", False):
+        if strict:
+            raise RuntimeError(f"cloud backend {backend_id!r} is not initialized")
         # Backend unavailable — caller decides whether that's fatal.
         # For external-mod detection we err on "we can't tell," so
         # return an empty list. The apply call will fail loudly when
@@ -535,8 +619,163 @@ async def detect_external_mods(
         baseline_entries=baseline_entries,
         backend=backend,
         handle=handle,
-        scope_paths=None,
+        scope_paths=scope_paths,
+        strict=strict,
     )
+
+
+async def deliver_loop_diff_to_cloud(
+    *,
+    job: dict[str, Any],
+    project: dict[str, Any],
+    postgres_db: Any,
+    gitea_client: Any,
+    main_cloud_router: MainCloudRouter,
+) -> dict[str, Any]:
+    """Apply a loop job's isolated project-file diff to its cloud folder.
+
+    This is the unattended counterpart to the human accept endpoint. It is
+    deliberately fail-closed: only a completely readable, conflict-free diff
+    advances automatically. Every ambiguous outcome returns ``needs_review``
+    so the completion handler can park the job at ``pending_review`` and keep
+    the loop barrier intact.
+
+    Returns ``{delivery_status, needs_review, delivery_sha, notes, ...}``.
+    Stable delivery statuses are ``no-changes`` and ``cloud-applied``;
+    review statuses name the reason (``cloud-conflict``, ``cloud-partial``,
+    ``cloud-unavailable``).
+    """
+    job_id = str(job.get("id"))
+    existing_delivery = _job_context(job).get("loop_cloud_delivery") or {}
+    if not isinstance(existing_delivery, dict):
+        existing_delivery = {}
+    existing_status = str(
+        job.get("merge_status")
+        or existing_delivery.get("delivery_status")
+        or ("cloud-applied" if job.get("diff_status") == "accepted" else "")
+    )
+    if existing_status in {"cloud-applied", "no-changes"}:
+        # Completion callbacks are at-least-once. Once delivery is durably
+        # stamped, never re-apply the same isolated diff or reinterpret our own
+        # prior cloud write as an external conflict.
+        return {
+            "delivery_status": existing_status,
+            "needs_review": False,
+            "delivery_sha": existing_delivery.get("delivery_sha"),
+            "notes": [str(note) for note in (existing_delivery.get("notes") or [])],
+            "applied": int(existing_delivery.get("applied") or 0),
+            "deleted": int(existing_delivery.get("deleted") or 0),
+        }
+
+    baseline = job.get("cloud_diff_baseline_commit")
+    repo_name = job.get("repo_name")
+    branch = job.get("branch_name") or "main"
+    if not baseline or not repo_name:
+        return {
+            "delivery_status": "cloud-unavailable",
+            "needs_review": True,
+            "delivery_sha": None,
+            "notes": ["loop job has no complete cloud baseline or isolated repo"],
+        }
+
+    head = await _read_head_commit(gitea_client, repo_name, branch)
+    if not head:
+        return {
+            "delivery_status": "cloud-unavailable",
+            "needs_review": True,
+            "delivery_sha": None,
+            "notes": ["could not read the isolated job repository HEAD"],
+        }
+
+    files = await _diff_files_by_tree(
+        gitea_client=gitea_client,
+        repo_name=repo_name,
+        baseline=str(baseline),
+        head=head,
+    )
+    if files is None:
+        return {
+            "delivery_status": "cloud-unavailable",
+            "needs_review": True,
+            "delivery_sha": head,
+            "notes": ["could not compare the cloud baseline with job HEAD"],
+        }
+    slug = project_folder_slug(job, project)
+    project_files = [
+        (entry, rel)
+        for entry in files
+        if (rel := _strip_project_prefix(entry["path"], slug)) is not None
+    ]
+    if not project_files:
+        # Framework/output commits remain useful in the isolated execution
+        # audit trail, but only paths under projects/<seed-time-slug>/ are
+        # deliverable project-cloud changes.
+        return {
+            "delivery_status": "no-changes",
+            "needs_review": False,
+            "delivery_sha": head,
+            "notes": [],
+            "applied": 0,
+            "deleted": 0,
+        }
+
+    await postgres_db.update_job_cloud_diff(job_id, diff_status="pending")
+    job["diff_status"] = "pending"
+
+    scope_paths = {rel for _entry, rel in project_files}
+    try:
+        diverged = await detect_external_mods(
+            job=job,
+            project=project,
+            main_cloud_router=main_cloud_router,
+            scope_paths=scope_paths,
+            strict=True,
+        )
+    except Exception as e:
+        return {
+            "delivery_status": "cloud-unavailable",
+            "needs_review": True,
+            "delivery_sha": head,
+            "notes": [f"could not verify the live cloud baseline: {e}"],
+        }
+    if diverged:
+        return {
+            "delivery_status": "cloud-conflict",
+            "needs_review": True,
+            "delivery_sha": head,
+            "notes": [
+                f"cloud changed since baseline: {item['path']}" for item in diverged
+            ],
+            "diverged": diverged,
+        }
+
+    applied = await apply_diff_to_cloud(
+        job=job,
+        project=project,
+        gitea_client=gitea_client,
+        main_cloud_router=main_cloud_router,
+    )
+    errors = [str(item) for item in (applied.get("errors") or [])]
+    if errors:
+        return {
+            "delivery_status": "cloud-partial",
+            "needs_review": True,
+            "delivery_sha": head,
+            "notes": errors,
+            "applied": int(applied.get("applied") or 0),
+            "deleted": int(applied.get("deleted") or 0),
+        }
+
+    await postgres_db.update_job_cloud_diff(job_id, diff_status="accepted")
+    job["diff_status"] = "accepted"
+    return {
+        "delivery_status": "cloud-applied",
+        "needs_review": False,
+        "delivery_sha": head,
+        "notes": [],
+        "applied": int(applied.get("applied") or 0),
+        "deleted": int(applied.get("deleted") or 0),
+    }
 
 
 async def detect_external_mods_against_baseline(
@@ -545,6 +784,7 @@ async def detect_external_mods_against_baseline(
     backend: Any,
     handle: Any,
     scope_paths: set[str] | None = None,
+    strict: bool = False,
 ) -> list[dict[str, str]]:
     """Live-compare a path→etag baseline against a fresh cloud folder listing.
 
@@ -566,6 +806,8 @@ async def detect_external_mods_against_baseline(
             handle
         )
     except CloudBackendError:
+        if strict:
+            raise
         # Same logic as above — apply will fail with the real reason.
         return []
     live_map = {e.path: e.etag for e in live_entries if not e.is_dir}
@@ -613,8 +855,7 @@ async def apply_diff_to_cloud(
     job_short = job_id[:8]
     repo_name = job.get("repo_name")
     branch = job.get("branch_name") or "main"
-    project_name = str(project.get("name") or "project")
-    slug = slugify_project_name(project_name)
+    slug = project_folder_slug(job, project)
     if not repo_name:
         return {"applied": 0, "deleted": 0, "errors": ["job has no repo_name"]}
 
@@ -676,20 +917,18 @@ async def apply_diff_to_cloud(
                 )
                 deleted += 1
             else:
-                # added or modified — fetch new content from Gitea HEAD.
-                new_content = await gitea_client.get_file_content(
+                # Added or modified — preserve the exact Gitea bytes. Loop
+                # deliverables commonly include PDFs, images, or office files;
+                # decoding those as UTF-8 would turn a valid artifact into a
+                # partial-write review.
+                new_content = await gitea_client.get_file_bytes(
                     repo_name, gitea_path, ref=head
                 )
                 if new_content is None:
                     errors.append(f"{gitea_path}: file missing in Gitea HEAD")
                     continue
-                blob = (
-                    new_content.encode("utf-8")
-                    if isinstance(new_content, str)
-                    else new_content
-                )
                 await backend.put_project_folder_file_bytes(
-                    handle, path=rel, content=blob
+                    handle, path=rel, content=new_content
                 )
                 applied += 1
         except CloudBackendError as e:

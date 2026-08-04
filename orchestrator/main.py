@@ -823,10 +823,14 @@ async def stale_agent_detector(shutdown_event: asyncio.Event) -> None:
                 # The DB transition leaves workspace + agent pods alive — release
                 # them here so we don't depend on the idle sweeper as the only
                 # backstop (it's disabled whenever S3 snapshots are unavailable).
+                # reclaim_volume=False: this fires when an agent pod merely goes
+                # offline, and the 'ended' it wrote above is a RESUMABLE state
+                # (resume_thread accepts it) — an agent crash must never take
+                # the user's PVC-backed workspace with it.
                 for thread_id in ended_ids:
                     await _step(
                         "release_thread_resources",
-                        _release_thread_resources(thread_id),
+                        _release_thread_resources(thread_id, reclaim_volume=False),
                     )
 
             # 3b. Propagate: PAUSED threads (awaiting_user / suspended) bound to
@@ -2833,8 +2837,11 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
                     f"Dispatch: failed to resolve project repos for job {job_id}: {e}"
                 )
 
-            # Derive git_remote_url from jobs repo if not already set
-            if repositories_payload and not git_remote_url:
+            # Legacy compatibility only: pre-migration project jobs stored a
+            # branch but no per-job remote. A newly-created root whose isolated
+            # repo provisioning failed has no branch; never attach that job to
+            # the old shared jobs repo as an accidental fallback.
+            if repositories_payload and not git_remote_url and job.get("branch_name"):
                 jobs_repo = next(
                     (r for r in repositories_payload if r["role"] == "jobs"), None
                 )
@@ -5421,6 +5428,8 @@ async def _enforce_job_workspace_upgrade_grants(
 async def _archive_and_cleanup_workspace(
     entity_id: str,
     entity_type: str = "jobs",
+    *,
+    reclaim_volume: bool = True,
 ) -> list[str]:
     """Snapshot workspace to S3, then delete container/VM.
 
@@ -5431,6 +5440,15 @@ async def _archive_and_cleanup_workspace(
     Args:
         entity_id: Job or thread UUID.
         entity_type: "jobs" or "threads".
+        reclaim_volume: Threads only — whether the workspace PVC dies with the
+            pod. The caller owns this decision because "release a thread's
+            workspace" covers two different intents: a thread whose status is
+            ``ended`` is still RESUMABLE (``resume_thread`` requires exactly
+            that status, and the agent's idle-archive sets it automatically
+            after 30 idle minutes), so tearing its volume down would silently
+            destroy a workspace the user can still reopen. Only a genuine
+            permanent delete passes True. Jobs keep the default: reclaiming a
+            job's PVC on a terminal state is correct and unchanged.
 
     Returns:
         List of action descriptions for logging.
@@ -5456,10 +5474,17 @@ async def _archive_and_cleanup_workspace(
                 await docker_provisioner.release_thread_workspace(entity_id)
                 actions.append("docker thread workspace released")
             elif container_provisioner.is_available:
+                # reclaim_volume=False snapshots + deletes the pod but KEEPS the
+                # PVC, so a resumable `ended` thread comes back to its own files
+                # instead of an empty volume (see the docstring above).
                 await container_provisioner.release_workspace(
-                    WorkspaceOwner.session(entity_id)
+                    WorkspaceOwner.session(entity_id),
+                    reclaim_volume=reclaim_volume,
                 )
-                actions.append("k8s thread workspace released")
+                actions.append(
+                    "k8s thread workspace released"
+                    + ("" if reclaim_volume else " (volume kept)")
+                )
 
         # VM cleanup (snapshot + delete)
         if vm_ctx.get("status") in ("provisioning", "created", "ready"):
@@ -5563,13 +5588,26 @@ async def _detach_agent_session(thread_id: str, timeout: float = 150.0) -> bool:
         return False
 
 
-async def _release_thread_resources(thread_id: str) -> None:
+async def _release_thread_resources(
+    thread_id: str, *, reclaim_volume: bool = False
+) -> None:
     """Release a thread's workspace container/VM and agent pod.
 
     Centralized so the user-facing DELETE, the agent-facing status flip,
     and the orphan reaper share one teardown sequence. Each step swallows
     its own exception — a failure in snapshotting must not block the
     agent-pod delete and vice versa, otherwise resources leak.
+
+    ``reclaim_volume`` decides whether the workspace PVC dies with the pod, and
+    defaults to False because most callers here do NOT mean "destroy this
+    user's data". A thread reaching ``ended`` is resumable — ``resume_thread``
+    accepts exactly that status, the idle-archive writes it after 30 idle
+    minutes, and the orphan sweeper writes it whenever an agent pod merely goes
+    offline. With PVC-backed session workspaces, reclaiming on those paths would
+    permanently delete a workspace the user can still reopen, so only the
+    permanent-delete branch of ``end_thread`` passes True. The safe default also
+    means a future caller that forgets the argument leaks a volume (recoverable)
+    rather than destroying one (not).
     """
     # Let a live session agent terminate cleanly (final memory capture +
     # git push) while its workspace still exists. No-op in seconds for
@@ -5578,7 +5616,9 @@ async def _release_thread_resources(thread_id: str) -> None:
     await _detach_agent_session(thread_id)
 
     try:
-        await _archive_and_cleanup_workspace(thread_id, entity_type="threads")
+        await _archive_and_cleanup_workspace(
+            thread_id, entity_type="threads", reclaim_volume=reclaim_volume
+        )
     except Exception:
         logger.exception("Workspace cleanup failed for thread %s", thread_id)
 
@@ -5597,7 +5637,19 @@ async def _release_thread_resources(thread_id: str) -> None:
     try:
         if persistent_provisioner.is_available:
             await persistent_provisioner.delete_agent_pod(thread_id)
-            await persistent_provisioner.delete_agent_pvc(thread_id)
+            # The pod is stateless and always goes; its PVC is the workspace
+            # itself, so it follows the same rule as the container workspace
+            # above — an `ended` thread is RESUMABLE (idle-archive and the
+            # orphan sweeper both write that status without any user intent to
+            # destroy data), and only a permanent delete reclaims the volume.
+            # Deleting it unconditionally here meant an idle timeout or a mere
+            # agent-pod crash wiped the workspace of any thread served by this
+            # provisioner (magic-link wake, officer-watchdog respawn). The cost
+            # is that the retirement leak noted above now drains on the
+            # permanent delete rather than on every end — the right way round:
+            # a leaked volume is recoverable, a deleted one is not.
+            if reclaim_volume:
+                await persistent_provisioner.delete_agent_pvc(thread_id)
     except Exception:
         logger.exception("Persistent pod cleanup failed for thread %s", thread_id)
 
@@ -7623,7 +7675,11 @@ class ProjectRepositoryCreate(BaseModel):
     name: str = Field(..., description="Repository display name")
     description: str | None = Field(None, description="Repository description")
     repo_url: str | None = Field(None, description="Repository URL (external repos)")
-    role: str = Field("source", description="Repository role: jobs, source, reference")
+    role: str = Field(
+        "source",
+        description="Repository role: source or reference",
+        pattern="^(source|reference)$",
+    )
     read_only: bool = Field(False, description="Whether this repo is read-only")
     branch: str = Field("main", description="Default branch")
     clone_path: str | None = Field(None, description="Local clone path")
@@ -9109,10 +9165,8 @@ async def create_job(request: Request, job: JobCreate) -> dict[str, Any]:
     rather than manually assigning it.
 
     If ``project_id`` is set (directly or via the user's default project),
-    the job is created within that project context: the project's default
-    config and config_override are used as fallbacks, and the workspace is
-    branched from the project's shared jobs repo instead of getting its own
-    per-job repo.
+    the project's config and resources are inherited, while the root job still
+    receives its own isolated repository. Subjobs branch within that root repo.
     """
     internal_call = is_internal_call(request)
     caller: dict[str, Any] | None = None
@@ -9660,26 +9714,31 @@ async def delete_job(request: Request, job_id: str) -> dict[str, str]:
 
         # Clean up Gitea repo/branch
         if gitea_client.is_initialized:
-            if (
-                job.get("parent_job_id")
-                and job.get("branch_name")
-                and job.get("repo_name")
-            ):
+            repo_name = job.get("repo_name")
+            branch_name = job.get("branch_name")
+            isolated_repo_name = f"job-{str(job.get('id') or job_id)[:8]}"
+            if job.get("parent_job_id") and branch_name and repo_name:
                 # Subjob: delete the branch (no-op if already merged and deleted)
-                await gitea_client.delete_branch(job["repo_name"], job["branch_name"])
-            elif job.get("repo_name"):
-                # Root job: delete the entire repo (also deletes subjob branches)
-                await gitea_client.delete_repo(job["repo_name"])
-            elif job.get("project_id") and job.get("branch_name"):
-                # Legacy: project jobs repo branch cleanup
-                repos = await postgres_db.get_project_repositories(
-                    str(job["project_id"]), role="jobs"
-                )
-                if repos:
-                    await gitea_client.delete_branch(
-                        repos[0]["name"], job["branch_name"]
+                await gitea_client.delete_branch(repo_name, branch_name)
+            elif repo_name == isolated_repo_name:
+                # New root-job model: this repo belongs to exactly this job.
+                await gitea_client.delete_repo(repo_name)
+            elif job.get("project_id") and branch_name:
+                # Legacy project job: the repo is shared. Never delete it from a
+                # job endpoint, even when repo_name is stamped on the row (which
+                # newer legacy rows are). Delete only this job's branch.
+                legacy_repo_name = repo_name
+                if not legacy_repo_name:
+                    repos = await postgres_db.get_project_repositories(
+                        str(job["project_id"]), role="jobs"
                     )
-
+                    legacy_repo_name = repos[0]["name"] if repos else None
+                if legacy_repo_name and branch_name != "main":
+                    await gitea_client.delete_branch(legacy_repo_name, branch_name)
+            elif repo_name and not job.get("project_id"):
+                # Pre-migration loose root job: its non-project repo is private
+                # to the job even if it predates the deterministic short name.
+                await gitea_client.delete_repo(repo_name)
         # Clean up vector DB tables (no FK cascade across databases)
         try:
             async with vector_db.acquire() as conn:
@@ -11958,6 +12017,15 @@ async def approve_job(
                 detail=f"Job cannot be approved (status: {job['status']}). "
                 f"Only jobs in 'pending_review' or 'reviewing' status can be approved.",
             )
+        if job.get("diff_status") == "pending":
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "This job has a pending project-cloud diff. Use the diff "
+                    "accept or reject action so cloud delivery is resolved "
+                    "before the job becomes terminal."
+                ),
+            )
 
         # 2. Read freeze data — DB first, Gitea fallback, local fallback
         frozen_data = None
@@ -13862,24 +13930,26 @@ async def _spawn_loop_job(
     Shared by the loop start endpoint and the ``_advance_project_loop`` hook
     (both via ``_spawn_loop_stage``). Mirrors the automation run-now path:
     ``create_loop_job`` does the DB write, then we provision the Gitea repo and
-    nudge the dispatcher. Raises on a failed job create (caller decides how to
-    handle); provisioning / dispatch failures are non-fatal (logged), matching
-    POST /api/jobs + run-now. ``seq_index`` / ``remaining_iterations`` are
+    nudge the dispatcher. Raises on a failed job create or isolated-repo/cloud
+    baseline provisioning (the caller fails the loop); only the final dispatch
+    nudge is best-effort. ``seq_index`` / ``remaining_iterations`` are
     stamped into the job's context for the torn-advance heal (see
     ``create_loop_job``). ``disable_memory_assembler`` (set for fan-out stage
     members) turns off the TTL-curation assembler so concurrent members don't
     race the shared project store. The real ticket pool (docs/superpowers/specs/
     2026-07-26-project-backlog-pipeline-design.md) is fetched here — the single
     funnel every loop spawn passes through — and handed to ``create_loop_job``
-    pre-rendered; a KB/pgvector outage costs the block, never the job.
+    pre-rendered. The recent structured job history is injected alongside it;
+    either lookup failing costs its context block, never the job.
     """
     from services.job_provisioning import provision_job_repo
-    from services.project_loops import create_loop_job
+    from services.project_loops import create_loop_job, render_loop_job_history
 
     # Hand the work pool over rather than making the agent hunt for it. Every
     # loop spawn funnels through here. Non-fatal: a KB outage costs the block,
     # not the job.
     backlog_block: str | None = None
+    history_block: str | None = None
     project_id = loop.get("project_id")
     if project_id and vector_db is not None:
         from services.project_backlog import fetch_backlog, render_backlog_block
@@ -13909,6 +13979,19 @@ async def _spawn_loop_job(
                 exc_info=True,
             )
 
+    if project_id:
+        try:
+            history_rows = await postgres_db.list_project_job_change_records(
+                str(project_id), limit=20
+            )
+            history_block = render_loop_job_history(history_rows)
+        except Exception:
+            logger.warning(
+                "loop %s: structured history fetch failed — spawning without it",
+                str(loop.get("id"))[:8],
+                exc_info=True,
+            )
+
     job = await create_loop_job(
         postgres_db,
         loop,
@@ -13919,6 +14002,7 @@ async def _spawn_loop_job(
         disable_memory_assembler=disable_memory_assembler,
         extra_context=extra_context,
         backlog_block=backlog_block,
+        history_block=history_block,
         park_until=park_until,
     )
 
@@ -13928,16 +14012,30 @@ async def _spawn_loop_job(
             gitea_client=gitea_client,
             postgres_db=postgres_db,
             main_cloud_router=main_cloud_router,
-            # Every loop role branches; the floor keeps scratch out of the
-            # completion squash-merge. See docs/features/loop_repo_compounding_v2.md.
+            # Every loop role receives an isolated repo; the floor keeps scratch
+            # out of the project-cloud diff.
             loop_floor=True,
         )
     except Exception:
         logger.exception(
-            "project loop %s: repo provisioning failed for job %s (non-fatal)",
+            "project loop %s: repo/cloud provisioning failed for job %s",
             loop.get("id"),
             job.get("id"),
         )
+        try:
+            await postgres_db.update_job_status(
+                str(job["id"]),
+                status="failed",
+                error_message="loop repo/cloud provisioning failed",
+            )
+            job["status"] = "failed"
+        except Exception:
+            logger.exception(
+                "project loop %s: failed to seal unprovisioned job %s",
+                loop.get("id"),
+                job.get("id"),
+            )
+        raise
 
     try:
         _trigger_dispatch()
@@ -14140,7 +14238,7 @@ async def _writeback_loop_stage(
     )
 
 
-async def _merge_and_retro_loop_job(
+async def _record_loop_job_outcome(
     job: dict[str, Any],
     *,
     ctx: dict[str, Any] | None,
@@ -14150,146 +14248,79 @@ async def _merge_and_retro_loop_job(
     failed: bool,
     last_error: str | None,
 ) -> tuple[str, str | None]:
-    """Per-job artifact handling: land the branch's contribution on main
-    (curated merge when the job carries a file-deliverable contract, full
-    squash-merge otherwise), flag F29 / merge-failed, trigger the post-merge
-    KB reindex, write the retro.
+    """Persist a loop member's delivery outcome and refresh its knowledge.
 
-    Shared by the single-role advance and each parallel-stage member (each
-    member merges + retros itself; the loop rotates only at the barrier). Best
-    effort — never raises. Returns ``(merge_status, merged_sha)``.
+    Project files have already taken the cloud-delivery path before a successful
+    member becomes terminal. This hook never merges the isolated job repo into
+    a project repo. It writes one structured database record, flags an execution
+    turn that produced no cloud changes, and triggers the independent knowledge
+    index refresh. Best effort — never raises. Returns
+    ``(delivery_status, delivery_sha)``.
 
-    See docs/features/loop_repo_compounding_v2.md and
-    docs/features/workspace_and_change_records.md §6.4 (curated merge).
+    See docs/features/project_jobs_repo_retirement.md.
     """
-    from services.project_loops import (
-        is_loop_execution_role,
-        merge_loop_job_contribution,
-        write_loop_retro,
+    from services.project_loops import is_loop_execution_role, write_loop_retro
+
+    delivery = (ctx or {}).get("loop_cloud_delivery") or {}
+    if not isinstance(delivery, dict):
+        delivery = {}
+    delivery_status = str(
+        job.get("merge_status")
+        or delivery.get("delivery_status")
+        or ("none" if failed else "no-changes")
     )
+    delivery_sha = delivery.get("delivery_sha")
+    delivery_notes = [str(note) for note in (delivery.get("notes") or [])]
 
-    merge_status, merged_sha = "skipped", None
-    merge_notes: list[str] = []
-    if not failed:
-        try:
-            # §6.4 curated merge: jobs with a file-deliverable contract land
-            # ONLY the contracted files on main; everything else takes the
-            # full squash-merge path unchanged.
-            merge_status, merged_sha, merge_notes = await merge_loop_job_contribution(
-                gitea_client, job, ctx=ctx
-            )
-        except Exception:
-            logger.exception(
-                "project loop %s: completion squash-merge raised (non-fatal)", loop_id
-            )
-            merge_status = "merge-failed"
-        completed_role = (ctx or {}).get("loop_role")
-        if merge_status != "skipped":
+    completed_role = (ctx or {}).get("loop_role")
+    if (
+        not failed
+        and delivery_status == "no-changes"
+        and is_loop_execution_role(completed_role)
+    ):
+        logger.warning(
+            "project loop %s: execution job %s completed without project-cloud changes",
+            loop_id,
+            str(job["id"])[:8],
+        )
+        actions.append(
+            f"project loop {str(loop_id)[:8]}: execution job "
+            f"{str(job['id'])[:8]} produced no project-cloud changes"
+        )
+
+    # Knowledge is independent of the job execution repo. Refresh the dedicated
+    # project vault after every successful member; the up-to-date short-circuit
+    # makes a no-op cheap and the leader sweep remains the recovery path.
+    if not failed and loop.get("project_id"):
+
+        async def _kb_reindex_after_job(pid: str) -> None:
             try:
-                await postgres_db.update_job_merge_status(
-                    str(job["id"]), merge_status=merge_status
-                )
+                await _reindex_project_kb(pid)
             except Exception:
-                logger.exception(
-                    "project loop %s: recording merge_status=%s failed (non-fatal)",
-                    loop_id,
-                    merge_status,
+                logger.warning(
+                    "post-job kb_reindex failed (non-fatal)",
+                    exc_info=True,
                 )
-        if merge_status == "merged":
-            logger.info(
-                "project loop %s: job %s squash-merged to main (%s)",
-                loop_id,
-                str(job["id"])[:8],
-                (merged_sha or "")[:8],
-            )
-        elif merge_status == "curated":
-            logger.info(
-                "project loop %s: job %s curated-merged to main (%s) — "
-                "contracted deliverables only, branch left as scratchpad",
-                loop_id,
-                str(job["id"])[:8],
-                (merged_sha or "")[:8],
-            )
-        # Slice-3 KB freshness (post-merge trigger): the squash — or the job's
-        # own direct-to-main kb_write pushes — likely moved knowledge/ on
-        # `main`; bring the chunk index up to the new HEAD. Fires on `empty`
-        # too: knowledge-only jobs (scholars, product-qa) land notes via
-        # kb_write while their branch diff is empty, and the up-to-date
-        # short-circuit makes a false fire one HEAD read. Fire-and-forget: a
-        # first full rebuild can take minutes and must never delay the loop
-        # advance; a lost task self-heals via the leader-gated sweep.
-        # ``curated`` moves main exactly like ``merged`` does.
-        if merge_status in ("merged", "curated", "empty"):
-            _kb_project = loop.get("project_id")
-            if _kb_project:
 
-                async def _kb_reindex_after_merge(pid: str) -> None:
-                    # Deliberately does NOT pass repo_name: `_reindex_project_kb`
-                    # resolves the vault repo itself (knowledge-role first, jobs
-                    # as fallback) and only skips resolution when handed a name.
-                    # `job["repo_name"]` is always the *jobs* repo, so passing it
-                    # pins this trigger to the wrong repo for any project whose
-                    # vault has moved to a knowledge repo. Because
-                    # `plan_reindex` treats every indexed path missing from the
-                    # tree as a delete, an absent `knowledge/` would drop the
-                    # project's entire chunk index here, and the leader-gated
-                    # sweep would rebuild it from the real vault moments later —
-                    # a search index flapping empty on every loop job, reported
-                    # by nothing louder than the warning below. See
-                    # docs/features/knowledge_base_repo_separation.md §10a.
-                    try:
-                        await _reindex_project_kb(pid)
-                    except Exception:
-                        logger.warning(
-                            "post-merge kb_reindex failed (non-fatal)",
-                            exc_info=True,
-                        )
+        asyncio.create_task(_kb_reindex_after_job(str(loop["project_id"])))
 
-                asyncio.create_task(_kb_reindex_after_merge(str(_kb_project)))
-        if merge_status == "empty" and is_loop_execution_role(completed_role):
-            logger.error(
-                "project loop %s: execution job %s COMPLETED but its branch has "
-                "no commits — nothing landed on `main` (F29 family); flagged "
-                "merge_status=empty",
-                loop_id,
-                str(job["id"])[:8],
-            )
-            actions.append(
-                f"project loop {str(loop_id)[:8]}: execution job "
-                f"{str(job['id'])[:8]} landed NOTHING (merge_status=empty)"
-            )
-        elif merge_status == "merge-failed":
-            logger.error(
-                "project loop %s: squash-merge of job %s branch %s FAILED — "
-                "contribution NOT on `main` (branch preserved); loop continues",
-                loop_id,
-                str(job["id"])[:8],
-                job.get("branch_name"),
-            )
-            actions.append(
-                f"project loop {str(loop_id)[:8]}: job {str(job['id'])[:8]} "
-                f"merge FAILED (contribution stranded on {job.get('branch_name')})"
-            )
-
-    # Retro collection (F40): record the outcome — mechanical merge truth plus
-    # the agent's own freeze_data notes — as retros/NNN-<role>-<jobid8>.md on
-    # `main`. Written for failed jobs too. Best-effort. ``merge_notes`` carry
-    # the curated-merge observations (§6.4): what curated, what was missing
-    # from the branch, and any fallback warning.
     try:
         await write_loop_retro(
-            gitea_client,
+            postgres_db,
             job,
             ctx=ctx or {},
-            merge_status=merge_status,
-            merged_sha=merged_sha,
+            merge_status=delivery_status,
+            merged_sha=str(delivery_sha) if delivery_sha else None,
             failed=failed,
             error=last_error,
-            merge_notes=merge_notes,
+            merge_notes=delivery_notes,
+            vector_db=vector_db,
         )
     except Exception:
-        logger.exception("project loop %s: retro write failed (non-fatal)", loop_id)
-    return merge_status, merged_sha
+        logger.exception(
+            "project loop %s: structured record write failed (non-fatal)", loop_id
+        )
+    return delivery_status, str(delivery_sha) if delivery_sha else None
 
 
 def _loop_stop_reason(
@@ -14956,14 +14987,15 @@ async def _advance_loop_member(
 ) -> None:
     """Advance a loop when a member of its in-flight turn completes.
 
-    Each member merges + retros itself immediately (its artifact handling is
-    independent), then hits the barrier: ``claim_project_loop_stage_barrier``
+    Each member records its already-resolved cloud delivery immediately (its
+    artifact handling is independent), then hits the barrier:
+    ``claim_project_loop_stage_barrier``
     drains the turn and returns True to exactly ONE caller — the member that
     finishes last (trivially, the job itself on a width-1 turn). Only that
     caller aggregates the turn outcome (a turn counts as a failure only if
     EVERY member failed; one success resets the consecutive counter), checks
     the stop conditions, and rotates to the next stage. Every earlier
-    finisher just does its own merge and backs off.
+    finisher just records its outcome and backs off.
 
     The barrier winner's job + decoded context feed the campaign step inside
     ``_rotate_loop_to_next_stage``. Campaign-relevant jobs (the checkpoint
@@ -14983,13 +15015,11 @@ async def _advance_loop_member(
         _err = _err.get("message") or str(_err)
     member_error = (str(_err) if _err else "job failed") if failed else None
 
-    # Per-member artifact handling: squash-merge, F29 flags, retro. Best
-    # effort — never blocks the barrier. Runs BEFORE the barrier claim below,
-    # so a hook+sweeper race can re-run it for the same member; that's fine —
-    # it's best-effort and idempotent (squash-merge no-ops when the branch is
-    # already merged) — while the rotate itself stays exactly-once behind the
-    # barrier.
-    await _merge_and_retro_loop_job(
+    # Per-member artifact handling: the cloud delivery already ran before the
+    # successful terminal transition; persist its structured record and refresh
+    # the independent KB. Runs before the barrier claim and is idempotent by
+    # job id, while rotation remains exactly-once behind the barrier.
+    await _record_loop_job_outcome(
         job,
         ctx=ctx,
         loop=loop,
@@ -15376,6 +15406,32 @@ async def complete_job(
         job = await postgres_db.get_job(job_id)
         if not job:
             raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
+
+        # Post-execution handoff states are monotonic.  The agent that reported
+        # one may still be unwinding while this handler archives its workspace
+        # or starts verification; that process can race us with a trailing
+        # pause/outage callback.  Do not let such a callback overwrite the
+        # completion freeze, downgrade the row to ``paused``, or put an
+        # already-delivered/review-gated job back in the dispatch queue.
+        # Explicit approve/reject/resume endpoints own transitions out of the
+        # review states. Failed rows deliberately retain the narrow late
+        # completion re-resolution path below.
+        #
+        # Reproduced on k3d: a loop diff reached Nextcloud and wrote its change
+        # record, then the old agent's llm_unavailable callback arrived 15s
+        # later and changed ``completed`` -> ``paused``.
+        if job["status"] in ("completed", "reviewing", "pending_review"):
+            logger.info(
+                "Job %s: ignoring late completion callback while status is %s",
+                job_id,
+                job["status"],
+            )
+            return {
+                "status": "handled",
+                "job_id": job_id,
+                "new_status": job["status"],
+                "actions": [f"late callback ignored; job already {job['status']}"],
+            }
 
         result = body.model_dump()
         actions: list[str] = []
@@ -15854,27 +15910,101 @@ async def complete_job(
                 "actions": actions,
             }
 
-        # 1a. Mode A diff capture (job_cloud_export.md §3.3). If this is a
-        # project-attached job that received a baseline at dispatch, see
-        # whether the agent made changes under projects/<slug>/. If so,
-        # override new_status to pending_review and stamp
-        # diff_status='pending'. Skipped for failed/cancelled exits — only
-        # an actually-completed run gets a diff review.
-        #
-        # EXEMPT project-loop jobs: they run unattended (autonomy: full) and route
-        # their changes through the loop's own branch squash-merge + retro trail,
-        # not the cloud accept/reject diff path. Holding one at pending_review
-        # would wedge the loop forever — the advance hook (§5d) fires only on a
-        # TERMINAL status, and the torn-advance sweeper won't heal a non-NULL
-        # pointer — so an execution role (or any role that writes project files)
-        # would stall every iteration awaiting a review nobody performs.
+        # 1a. Project-cloud delivery. Every project job receives a cloud
+        # baseline in its isolated repo. Ordinary jobs retain the human
+        # accept/reject workflow. Loop jobs auto-apply only a completely
+        # readable, conflict-free diff; any conflict, backend failure, or
+        # partial write parks the member at pending_review, so its loop barrier
+        # cannot rotate past an unresolved durable-file state.
         from services.project_loops import job_loop_id
 
-        if (
+        _completion_loop_id = job_loop_id(job)
+        if _completion_loop_id and new_status == "completed":
+            try:
+                from services.job_cloud_baseline import deliver_loop_diff_to_cloud
+
+                _delivery_project = (
+                    await postgres_db.get_project(str(job["project_id"]))
+                    if job.get("project_id")
+                    else None
+                )
+                if not _delivery_project:
+                    _loop_delivery = {
+                        "delivery_status": "cloud-unavailable",
+                        "needs_review": True,
+                        "delivery_sha": None,
+                        "notes": ["project row is unavailable"],
+                    }
+                else:
+                    _loop_delivery = await deliver_loop_diff_to_cloud(
+                        job=job,
+                        project=_delivery_project,
+                        postgres_db=postgres_db,
+                        gitea_client=gitea_client,
+                        main_cloud_router=main_cloud_router,
+                    )
+                _delivery_status = str(_loop_delivery["delivery_status"])
+                job["merge_status"] = _delivery_status
+                await postgres_db.update_job_merge_status(
+                    job_id, merge_status=_delivery_status
+                )
+
+                _job_ctx = job.get("context") or {}
+                if isinstance(_job_ctx, str):
+                    try:
+                        _job_ctx = json.loads(_job_ctx)
+                    except (json.JSONDecodeError, TypeError):
+                        _job_ctx = {}
+                if not isinstance(_job_ctx, dict):
+                    _job_ctx = {}
+                _job_ctx["loop_cloud_delivery"] = _loop_delivery
+                job["context"] = _job_ctx
+                await postgres_db.merge_job_context(
+                    job_id, {"loop_cloud_delivery": _loop_delivery}
+                )
+
+                if _loop_delivery.get("needs_review"):
+                    new_status = "pending_review"
+                    actions.append(
+                        f"loop cloud delivery {_delivery_status} -> pending_review"
+                    )
+                else:
+                    actions.append(f"loop cloud delivery -> {_delivery_status}")
+            except Exception as e:
+                # Fail closed for loops. Advancing here would strand the only
+                # durable copy of this turn's project-file contribution.
+                logger.exception(
+                    "Loop cloud delivery failed for job %s; parking for review",
+                    job_id,
+                )
+                new_status = "pending_review"
+                job["merge_status"] = "cloud-unavailable"
+                try:
+                    await postgres_db.update_job_merge_status(
+                        job_id, merge_status="cloud-unavailable"
+                    )
+                    await postgres_db.merge_job_context(
+                        job_id,
+                        {
+                            "loop_cloud_delivery": {
+                                "delivery_status": "cloud-unavailable",
+                                "needs_review": True,
+                                "notes": [str(e)],
+                            }
+                        },
+                    )
+                except Exception:
+                    logger.warning(
+                        "Failed to persist loop cloud delivery failure for %s",
+                        job_id,
+                        exc_info=True,
+                    )
+                actions.append("loop cloud delivery failed -> pending_review")
+        elif (
             job.get("cloud_diff_baseline_commit")
             and new_status in ("completed", "pending_review")
             and gitea_client.is_initialized
-            and not job_loop_id(job)
+            and not _completion_loop_id
         ):
             try:
                 from services.job_cloud_baseline import capture_diff_for_mode_a_job
@@ -16200,17 +16330,13 @@ async def complete_job(
                 f"Error advancing project loop for {job_id}: {e}", exc_info=True
             )
 
-        # 5d2. Terminal-transition side effects (workspace_and_change_records.md
-        # §5/§6.5/§6.6): land the job's contracted deliverables on the project
-        # repo's `main` and leave exactly one record there — failed jobs and
-        # jobs that merged nothing included. Keyed on new_status like the
-        # session wake below (None = nothing terminal happened in this call, so
-        # a duplicate/late report can't re-merge or re-record). Loop jobs are
-        # skipped inside the hook — the loop advance above owns their merge and
-        # just wrote their retro — and the record writer's own exists-check
-        # backstops that skip; sitting after 5d means the backstop can actually
-        # see a freshly-written loop retro. THE SAME call runs in approve_job,
-        # which is where a `review`-autonomy job's transition happens.
+        # 5d2. Structured terminal history (project_jobs_repo_retirement.md).
+        # New jobs write one database record; no history file is committed into
+        # their execution repo. Loop jobs are skipped inside this generic hook
+        # because the advance above owns their delivery-aware record. The same
+        # call runs in approve_job, where a review-autonomy job transitions.
+        # A narrow legacy merge path remains for in-flight jobs that were
+        # already attached to a shared project repo before this migration.
         # Best-effort: a failure here never blocks completion handling.
         if new_status in ("completed", "failed"):
             try:
@@ -17372,12 +17498,23 @@ async def accept_job_diff(request: Request, job_id: str) -> dict[str, Any]:
     from services.job_cloud_baseline import (
         apply_diff_to_cloud,
         detect_external_mods,
+        get_diff_summary,
+        project_folder_slug,
     )
 
+    diff_summary = await get_diff_summary(job=job, gitea_client=gitea_client)
+    slug = project_folder_slug(job, project)
+    prefix = f"projects/{slug}/"
+    affected_paths = {
+        str(entry.get("path"))[len(prefix) :]
+        for entry in ((diff_summary or {}).get("files") or [])
+        if str(entry.get("path") or "").startswith(prefix)
+    }
     diverged = await detect_external_mods(
         job=job,
         project=project,
         main_cloud_router=main_cloud_router,
+        scope_paths=affected_paths,
     )
     if diverged:
         raise HTTPException(
@@ -17415,7 +17552,53 @@ async def accept_job_diff(request: Request, job_id: str) -> dict[str, Any]:
 
     # --- Status transition ------------------------------------------
     await postgres_db.update_job_cloud_diff(job_id, diff_status="accepted")
+    await postgres_db.update_job_merge_status(job_id, merge_status="cloud-applied")
     await postgres_db.update_job_status(job_id, status="completed")
+    async with postgres_db.acquire() as conn:
+        await conn.execute(
+            "UPDATE jobs SET completed_at = COALESCE(completed_at, NOW()) "
+            "WHERE id = $1::uuid",
+            job_id,
+        )
+    delivery = {
+        "delivery_status": "cloud-applied",
+        "needs_review": False,
+        "delivery_sha": (diff_summary or {}).get("head_commit"),
+        "notes": [],
+        "applied": int(result.get("applied") or 0),
+        "deleted": int(result.get("deleted") or 0),
+    }
+    await postgres_db.merge_job_context(job_id, {"loop_cloud_delivery": delivery})
+    job["status"] = "completed"
+    job["diff_status"] = "accepted"
+    job["merge_status"] = "cloud-applied"
+    _accept_ctx = job.get("context") or {}
+    if isinstance(_accept_ctx, str):
+        try:
+            _accept_ctx = json.loads(_accept_ctx)
+        except (json.JSONDecodeError, TypeError):
+            _accept_ctx = {}
+    if not isinstance(_accept_ctx, dict):
+        _accept_ctx = {}
+    _accept_ctx["loop_cloud_delivery"] = delivery
+    job["context"] = _accept_ctx
+
+    terminal_actions: list[str] = []
+    from services.project_loops import job_loop_id
+
+    if job_loop_id(job):
+        await _advance_project_loop(job, {}, terminal_actions)
+    else:
+        from services.completion import apply_terminal_job_side_effects
+
+        side_effects = await apply_terminal_job_side_effects(
+            job,
+            "completed",
+            gitea=gitea_client,
+            db=postgres_db,
+            vector_db=vector_db,
+        )
+        terminal_actions.extend(side_effects["actions"])
     logger.info(
         "Mode A: job %s — diff accepted (%d applied, %d deleted)",
         job_id,
@@ -17428,6 +17611,7 @@ async def accept_job_diff(request: Request, job_id: str) -> dict[str, Any]:
         "status": "completed",
         "applied": result.get("applied", 0),
         "deleted": result.get("deleted", 0),
+        "actions": terminal_actions,
     }
 
 
@@ -17466,12 +17650,57 @@ async def reject_job_diff(request: Request, job_id: str) -> dict[str, Any]:
         )
 
     await postgres_db.update_job_cloud_diff(job_id, diff_status="rejected")
+    await postgres_db.update_job_merge_status(job_id, merge_status="cloud-rejected")
     await postgres_db.update_job_status(job_id, status="completed")
+    async with postgres_db.acquire() as conn:
+        await conn.execute(
+            "UPDATE jobs SET completed_at = COALESCE(completed_at, NOW()) "
+            "WHERE id = $1::uuid",
+            job_id,
+        )
+    delivery = {
+        "delivery_status": "cloud-rejected",
+        "needs_review": False,
+        "delivery_sha": None,
+        "notes": ["project-file diff rejected; cloud folder left unchanged"],
+    }
+    await postgres_db.merge_job_context(job_id, {"loop_cloud_delivery": delivery})
+    job["status"] = "completed"
+    job["diff_status"] = "rejected"
+    job["merge_status"] = "cloud-rejected"
+    _reject_ctx = job.get("context") or {}
+    if isinstance(_reject_ctx, str):
+        try:
+            _reject_ctx = json.loads(_reject_ctx)
+        except (json.JSONDecodeError, TypeError):
+            _reject_ctx = {}
+    if not isinstance(_reject_ctx, dict):
+        _reject_ctx = {}
+    _reject_ctx["loop_cloud_delivery"] = delivery
+    job["context"] = _reject_ctx
+
+    terminal_actions: list[str] = []
+    from services.project_loops import job_loop_id
+
+    if job_loop_id(job):
+        await _advance_project_loop(job, {}, terminal_actions)
+    else:
+        from services.completion import apply_terminal_job_side_effects
+
+        side_effects = await apply_terminal_job_side_effects(
+            job,
+            "completed",
+            gitea=gitea_client,
+            db=postgres_db,
+            vector_db=vector_db,
+        )
+        terminal_actions.extend(side_effects["actions"])
     logger.info("Mode A: job %s — diff rejected", job_id)
     return {
         "job_id": job_id,
         "diff_status": "rejected",
         "status": "completed",
+        "actions": terminal_actions,
     }
 
 
@@ -25281,8 +25510,12 @@ async def end_thread(
     # ordinary sessions.
     await _conclude_conference_if_any(thread)
 
-    # Snapshot + tear down workspace container/VM and agent pod
-    await _release_thread_resources(thread_id)
+    # Snapshot + tear down workspace container/VM and agent pod. The workspace
+    # VOLUME only dies on ?permanent=true: a soft end leaves the thread in
+    # 'ended', which resume_thread accepts, so reclaiming the PVC here would
+    # hand the user back an empty workspace on resume (the same reasoning that
+    # keeps the Gitea repo and cloud folder alive below).
+    await _release_thread_resources(thread_id, reclaim_volume=permanent)
 
     # Destructive cleanup of user-visible resources runs ONLY on permanent
     # delete. A soft "end" keeps the Gitea repo and the cloud session folder
@@ -30134,12 +30367,31 @@ async def _get_project_jobs_repo(project_id: str) -> str | None:
 async def list_project_experts(
     request: Request, project_id: str
 ) -> list[dict[str, Any]]:
-    """List expert configurations from a project's jobs repo.
+    """List DB-backed experts linked to a project.
 
-    Scans the experts/ directory in the project's Gitea jobs repo and returns
-    metadata for each expert configuration found.
+    During the safe migration, an old project's ``experts/`` directory remains
+    a read-only fallback when it has no structured links yet.
     """
     await require_project_member(request, postgres_db, project_id)
+    linked = await postgres_db.list_project_linked_experts(project_id)
+    if linked:
+        return [
+            {
+                "id": str(row["id"]),
+                "name": row["name"],
+                "display_name": row["display_name"],
+                "description": row.get("description") or "",
+                "icon": row.get("icon") or "psychology",
+                "color": row.get("color") or "#cba6f7",
+                "tags": row.get("tags") or [],
+                "expert_type": row.get("expert_type") or "worker",
+                "source": "project",
+                "storage_kind": "db",
+                "default_for": row.get("default_for"),
+            }
+            for row in linked
+        ]
+
     if not gitea_client.is_initialized:
         return []
 
@@ -30200,14 +30452,30 @@ async def list_project_experts(
 async def get_project_expert(
     request: Request, project_id: str, expert_name: str
 ) -> dict[str, Any]:
-    """Get full detail for a project expert including merged config and instructions."""
-    await require_project_member(request, postgres_db, project_id)
+    """Get full detail for a linked expert, with a legacy Git fallback."""
+    caller, _ = await require_project_member(request, postgres_db, project_id)
+    linked = await postgres_db.get_project_linked_expert(project_id, expert_name)
+    if linked:
+        detail = await _load_expert_detail(str(linked["id"]), user_id=str(caller["id"]))
+        project_override = linked.get("project_config_override") or {}
+        if isinstance(project_override, str):
+            try:
+                project_override = json.loads(project_override)
+            except (json.JSONDecodeError, TypeError):
+                project_override = {}
+        if isinstance(project_override, dict) and project_override:
+            detail["config"] = _deep_merge(detail.get("config") or {}, project_override)
+        detail["name"] = linked["name"]
+        detail["source"] = "project"
+        detail["default_for"] = linked.get("default_for")
+        return detail
+
     if not gitea_client.is_initialized:
         raise HTTPException(status_code=503, detail="Gitea not available")
 
     repo_name = await _get_project_jobs_repo(project_id)
     if not repo_name:
-        raise HTTPException(status_code=404, detail="No jobs repo for project")
+        raise HTTPException(status_code=404, detail="Project expert not found")
 
     # Read config
     config_content = await gitea_client.get_file_content(
@@ -30297,22 +30565,15 @@ def _user_dict(user: dict) -> dict:
     }
 
 
-async def _create_gitea_repo_for_project(user: dict, project: dict) -> None:
-    """Create a Gitea jobs repo for a user's default project (best-effort)."""
+async def _provision_default_project_knowledge(user: dict, project: dict) -> None:
+    """Create the dedicated knowledge vault for a user's default project."""
     try:
         if gitea_client.is_initialized and project:
-            repo_name = f"project-{str(project['id'])[:8]}-jobs"
-            repo_url = await gitea_client.create_repo(repo_name)
-            if repo_url:
-                await postgres_db.add_project_repository(
-                    project_id=str(project["id"]),
-                    name=repo_name,
-                    repo_url=repo_url,
-                    role="jobs",
-                    is_managed=True,
-                )
+            await _provision_project_knowledge_repo(project, str(user["id"]))
     except Exception as e:
-        logger.warning(f"Failed to create Gitea repo for user {user['id']}: {e}")
+        logger.warning(
+            f"Failed to provision default-project knowledge for user {user['id']}: {e}"
+        )
 
 
 # nosec: public auth-bootstrap (Bearer-required, intentionally serves pending-approval users)
@@ -33342,7 +33603,7 @@ async def create_user(body: UserCreate, request: Request) -> dict[str, Any]:
             approved_by=str(admin.get("id")),
         )
         user["is_approved"] = True
-        await _create_gitea_repo_for_project(user, project)
+        await _provision_default_project_knowledge(user, project)
 
         # Create personal WebDAV datasource for the default project.
         # Fresh owner provisioning — resolve via the owner seam (Issue 16).
@@ -33747,8 +34008,8 @@ async def _provision_project_knowledge_repo(
     repo_url = await gitea_client.create_repo(repo_name)
     if not repo_url:
         logger.warning(
-            "Gitea did not create knowledge repo '%s'; project %s keeps its "
-            "vault in the jobs repo",
+            "Gitea did not create knowledge repo '%s'; project %s has no "
+            "file-backed vault until provisioning is retried",
             repo_name,
             project_id,
         )
@@ -33841,40 +34102,13 @@ async def create_project(body: ProjectCreate, request: Request) -> dict[str, Any
             role="owner",
         )
 
-        # Create the Gitea jobs repo (workspace root for project jobs) and the
-        # knowledge repo (the KB vault), granting the creator access to both.
+        # Create only the dedicated KB vault. Root jobs get isolated repositories
+        # when they are created; project membership never selects a shared
+        # workspace. See project_jobs_repo_retirement.md.
         if gitea_client.is_initialized:
-            repo_name = f"project-{str(project['id'])[:8]}-jobs"
-            repo_url = await gitea_client.create_repo(repo_name)
-            if repo_url:
-                await postgres_db.add_project_repository(
-                    project_id=str(project["id"]),
-                    name=repo_name,
-                    repo_url=repo_url,
-                    role="jobs",
-                    is_managed=True,
-                )
-                # Grant creator read access
-                if owner_id:
-                    try:
-                        creator = await postgres_db.get_user(owner_id)
-                        if creator and creator.get("email"):
-                            await gitea_client.grant_user_repo_access(
-                                creator["email"], repo_name
-                            )
-                    except Exception as e:
-                        logger.warning(
-                            f"Failed to grant Gitea access for project creator: {e}"
-                        )
-
-            # Knowledge repo — the project's KB vault, kept out of the jobs
-            # repo so note commits never mix with job records
-            # (docs/features/knowledge_base_repo_separation.md §3). It is
-            # written server-side and never cloned into a workspace. Nothing
-            # downstream requires it: a project without one falls back to the
-            # jobs repo via resolve_kb_repo, which is exactly what every
-            # project created before this shipped does. So a Gitea hiccup here
-            # degrades the vault's home, and must not cost the project.
+            # The vault is written server-side and never cloned into a workspace.
+            # A Gitea hiccup remains non-fatal to project creation, but no new
+            # project falls back to a jobs repo because none is provisioned.
             try:
                 await _provision_project_knowledge_repo(project, owner_id)
             except Exception as e:
@@ -34527,12 +34761,18 @@ async def list_project_jobs(
     await require_project_member(request, postgres_db, project_id)
     try:
         async with postgres_db.acquire() as conn:
-            query = "SELECT * FROM job_summary WHERE project_id = $1"
+            query = (
+                "SELECT js.*, jcr.delivery_status, jcr.delivery_ref, "
+                "jcr.delivery_sha, jcr.record_type AS change_record_type "
+                "FROM job_summary js "
+                "LEFT JOIN job_change_records jcr ON jcr.job_id = js.id "
+                "WHERE js.project_id = $1"
+            )
             params: list = [project_id]
             if status:
-                query += " AND status = $2"
+                query += " AND js.status = $2"
                 params.append(status)
-            query += " ORDER BY created_at DESC LIMIT $" + str(len(params) + 1)
+            query += " ORDER BY js.created_at DESC LIMIT $" + str(len(params) + 1)
             params.append(limit)
             rows = await conn.fetch(query, *params)
 
@@ -34566,6 +34806,27 @@ async def list_project_jobs(
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
+@app.get("/api/projects/{project_id}/job-records")
+async def list_project_job_records(
+    request: Request,
+    project_id: str,
+    limit: int = Query(default=200, ge=1, le=500),
+) -> list[dict[str, Any]]:
+    """Return orchestrator-owned terminal history for a project."""
+    await require_project_member(request, postgres_db, project_id)
+    return await postgres_db.list_project_job_change_records(project_id, limit=limit)
+
+
+@app.get("/api/jobs/{job_id}/change-record")
+async def get_job_change_record(request: Request, job_id: str) -> dict[str, Any]:
+    """Return the immutable structured terminal record for one visible job."""
+    await require_job_access(request, postgres_db, job_id)
+    record = await postgres_db.get_job_change_record(job_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="Job change record not found")
+    return record
+
+
 @app.post("/api/jobs/{job_id}/promote")
 async def promote_job(
     request: Request,
@@ -34574,17 +34835,15 @@ async def promote_job(
 ) -> dict[str, Any]:
     """Promote a default-project job into a dedicated project.
 
-    Creates a new project, seeds its jobs repo from the job's branch content
-    (preserving git history), and moves the job to the new project.
+    Creates a new project, provisions its cloud/knowledge resources, and moves
+    the completed job into it. The job keeps its isolated execution repository;
+    no project workspace repository is created.
 
     P4c: ``body.user_id`` is forced to the caller (mirrors F2 — no cross-user
     promotion).
     """
     caller, _ = await require_job_access(request, postgres_db, job_id)
     body.user_id = caller["id"]
-    import shutil
-    import subprocess
-    import tempfile
 
     try:
         # Validate job
@@ -34634,103 +34893,17 @@ async def promote_job(
             role="owner",
         )
 
-        # Create Gitea jobs repo for the new project
-        new_repo_name = f"project-{new_project_id[:8]}-jobs"
-        new_repo_url = None
-
+        # Provision the project-owned resources. The promoted job's own repo is
+        # retained as its historical execution surface; it is never promoted
+        # into an implicit template for future jobs.
         if gitea_client.is_initialized:
-            new_repo_url = await gitea_client.create_repo(new_repo_name)
-
-        if new_repo_url:
-            await postgres_db.add_project_repository(
-                project_id=new_project_id,
-                name=new_repo_name,
-                repo_url=new_repo_url,
-                role="jobs",
-                is_managed=True,
-            )
-
-            # Seed the new repo from the old job's branch content
-            branch_name = job.get("branch_name")
-            old_repos = await postgres_db.get_project_repositories(
-                old_project_id, role="jobs"
-            )
-
-            if old_repos and branch_name:
-                old_repo_url = old_repos[0]["repo_url"]
-                tmp_dir = None
-                try:
-                    tmp_dir = tempfile.mkdtemp(prefix="srw-promote-")
-                    clone_path = os.path.join(tmp_dir, "repo")
-
-                    # Clone old jobs repo at the job branch
-                    result = subprocess.run(
-                        [
-                            "git",
-                            "clone",
-                            "--branch",
-                            branch_name,
-                            old_repo_url,
-                            clone_path,
-                        ],
-                        capture_output=True,
-                        text=True,
-                        timeout=120,
-                    )
-                    if result.returncode != 0:
-                        logger.warning(
-                            f"Promote: clone failed for branch '{branch_name}': "
-                            f"{result.stderr[:200]}"
-                        )
-                        # Fall back: clone default branch
-                        result = subprocess.run(
-                            ["git", "clone", old_repo_url, clone_path],
-                            capture_output=True,
-                            text=True,
-                            timeout=120,
-                        )
-                        if result.returncode != 0:
-                            logger.error(
-                                f"Promote: clone fallback also failed: {result.stderr[:200]}"
-                            )
-
-                    if os.path.isdir(clone_path):
-                        # Add new repo as remote, push as main
-                        subprocess.run(
-                            ["git", "remote", "add", "new-origin", new_repo_url],
-                            cwd=clone_path,
-                            capture_output=True,
-                            text=True,
-                            timeout=30,
-                        )
-                        # Rename current branch to main for the new repo
-                        subprocess.run(
-                            ["git", "checkout", "-B", "main"],
-                            cwd=clone_path,
-                            capture_output=True,
-                            text=True,
-                            timeout=30,
-                        )
-                        push_result = subprocess.run(
-                            ["git", "push", "-u", "new-origin", "main"],
-                            cwd=clone_path,
-                            capture_output=True,
-                            text=True,
-                            timeout=120,
-                        )
-                        if push_result.returncode == 0:
-                            logger.info(
-                                f"Promote: seeded new repo '{new_repo_name}' from "
-                                f"branch '{branch_name}'"
-                            )
-                        else:
-                            logger.warning(
-                                f"Promote: push to new repo failed: "
-                                f"{push_result.stderr[:200]}"
-                            )
-                finally:
-                    if tmp_dir and os.path.exists(tmp_dir):
-                        shutil.rmtree(tmp_dir, ignore_errors=True)
+            try:
+                await _provision_project_knowledge_repo(new_project, body.user_id)
+            except Exception as e:
+                logger.warning(
+                    f"Promote: knowledge provisioning failed for {new_project_id}: {e}"
+                )
+        new_project = await _ensure_project_cloud_resources(new_project)
 
         # Move job to new project
         async with postgres_db.acquire() as conn:
@@ -34741,13 +34914,13 @@ async def promote_job(
             )
 
         logger.info(
-            f"Promoted job {job_id[:8]} to project '{request.name}' ({new_project_id[:8]})"
+            f"Promoted job {job_id[:8]} to project '{body.name}' ({new_project_id[:8]})"
         )
 
         return {
             "status": "promoted",
             "project_id": new_project_id,
-            "project_name": request.name,
+            "project_name": body.name,
             "job_id": job_id,
         }
 
@@ -35507,8 +35680,9 @@ async def _reindex_project_kb(
 ) -> dict[str, Any]:
     """Bring a project KB's chunk index up to its repo HEAD (slice 3 PR3).
 
-    Shared entry for the post-merge trigger and the operator reindex endpoint.
-    Resolves the vault repo (jobs-role) when not supplied, builds the
+    Shared entry for the post-write trigger and the operator reindex endpoint.
+    Resolves the dedicated knowledge vault (with a legacy jobs-role fallback)
+    when not supplied, builds the
     catalog-resolved embedding service, and runs the tree-diff reindex. Returns
     the reindex summary dict; ``status`` carries the honesty signal
     (no-repo / no-embedding-service / up-to-date / completed / partial / ...).

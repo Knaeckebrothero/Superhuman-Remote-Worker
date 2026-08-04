@@ -21,6 +21,13 @@ related:
 
 # Loop Parallel Stages — Scholar ∥ Product-QA feeding the Critic
 
+> **Storage update 2026-08-04:** The fan-out grammar and barrier model in this
+> document remain current. Its shared-repo merge/`retros/` descriptions and
+> blanket Mode-A exemption are historical: loop members now use isolated job
+> repos, conflict-free file diffs auto-apply to the project cloud folder, and
+> ambiguous delivery parks the barrier for review. See
+> [[project_jobs_repo_retirement]].
+
 > Today a project loop's `role_sequence` is a flat list of roles run **one at a time**. This feature makes a sequence entry optionally a **set of roles that run concurrently as one stage**: `[["scholar", "product-qa"], "critic", "developer"]`. Scholar looks *outward* (new opportunities) while Product-QA looks *inward* (issues, gaps, missing product surfaces); both write candidate work items to the KB; the Critic then triages **build-a-feature vs. fix-the-product** from a quiescent KB. Parallel stages are restricted to **analysis roles** — the execution role stays a singleton, so the repo-compounding invariant is untouched.
 
 ## Status

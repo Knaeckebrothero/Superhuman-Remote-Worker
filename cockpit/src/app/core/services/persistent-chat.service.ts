@@ -727,9 +727,20 @@ export class PersistentChatService {
      * Issue 13.
      */
     readonly cloudSyncDegraded = signal(false);
+    /** Id of the sticky degraded toast, so a later recovery can dismiss the
+     *  exact one it raised rather than clearing every toast on screen. */
+    private cloudSyncDegradedToastId: number | null = null;
 
     // --- Creating state (thread being created via API before connect) ---
     readonly isCreating = signal(false);
+
+    /**
+     * True for the whole resume window — POST /resume through connect(). The
+     * composer stays open across it: `isStartingSession` deliberately excludes
+     * `threadStatus === 'ended'`, so without this the box would disable itself
+     * the instant the user sends and re-enable a moment later.
+     */
+    readonly isResuming = signal(false);
 
     // --- Draft session (instant landing at `/`) ---
     // The composer is open but no thread exists yet; the first send creates
@@ -850,6 +861,7 @@ export class PersistentChatService {
         this.connectionState.set('connecting');
         this.error.set(null);
         this.cloudSyncDegraded.set(false);
+        this.cloudSyncDegradedToastId = null;
         if (!sameThread) {
             // Cold path: wipe and refetch.
             this.dispatch({type: 'reset', threadId});
@@ -2096,17 +2108,25 @@ export class PersistentChatService {
         if (!threadId) return;
         const generation = this.connectGeneration;
         this.isSessionPaused.set(false);
+        this.isResuming.set(true);
         try {
-            await firstValueFrom(
-                this.http.post(`${environment.apiUrl}/persistent/threads/${threadId}/resume`, {})
-            );
-        } catch (err) {
-            // /resume may 409 if the thread isn't actually 'ended' (e.g. a
-            // double-click). Fall through to connect() either way — its
-            // cold-start path is self-healing.
+            try {
+                await firstValueFrom(
+                    this.http.post(`${environment.apiUrl}/persistent/threads/${threadId}/resume`, {})
+                );
+            } catch (err) {
+                // /resume may 409 if the thread isn't actually 'ended' (e.g. a
+                // double-click). Fall through to connect() either way — its
+                // cold-start path is self-healing.
+            }
+            if (!this._isCurrentConnect(threadId, generation)) return;
+            await this.connect(threadId);
+        } finally {
+            // connect() leaves connectionState connecting/connected, so
+            // isStartingSession takes over from here and the composer never
+            // sees a gap.
+            this.isResuming.set(false);
         }
-        if (!this._isCurrentConnect(threadId, generation)) return;
-        await this.connect(threadId);
     }
 
     /**
@@ -2274,6 +2294,16 @@ export class PersistentChatService {
             // queued item above flushes via markSessionReady like any early
             // send; no _flushOutbox needed here (session isn't ready yet).
             void this._createFromDraftSession(trimmed);
+            return true;
+        }
+        if (this.threadStatus() === 'ended') {
+            // Ended thread: SENDING resumes it. Typing deliberately does not —
+            // an agent pod plus a workspace get reserved on resume, and every
+            // half-written message would burn that. The queued item above rides
+            // the resume exactly like a landing draft's first message rides
+            // thread creation: connect() keeps the outbox on a same-thread
+            // reconnect, and markSessionReady flushes it once the agent is up.
+            void this.resumeSession();
             return true;
         }
         void this._flushOutbox();
@@ -3419,7 +3449,7 @@ export class PersistentChatService {
                 // flag instead of a misleading "will retry next turn" note.
                 if (params['degraded'] === true || op === 'initial_pull') {
                     this.cloudSyncDegraded.set(true);
-                    this.toast.danger(
+                    this.cloudSyncDegradedToastId = this.toast.danger(
                         `Cloud sync could not start for this session. The workspace may be missing files from the cloud, and changes won't be saved back to it. ${this.sanitizeError(params['message'] as string)}`,
                         {duration: 0},
                     );
@@ -3430,6 +3460,21 @@ export class PersistentChatService {
                         `Workspace sync (${op}) failed${turnLabel}. Your changes are in the workspace but not yet saved to the cloud. Will retry on next turn.`,
                     );
                 }
+                break;
+            }
+
+            case 'workspace_sync.recovered': {
+                // The agent rebuilt the sync coordinator at a turn boundary
+                // after a degraded attach (the target existed seconds later,
+                // or a transient failure cleared). Retract the sticky warning
+                // — leaving it up would tell the user their edits aren't
+                // being saved when they are.
+                this.cloudSyncDegraded.set(false);
+                if (this.cloudSyncDegradedToastId !== null) {
+                    this.toast.dismiss(this.cloudSyncDegradedToastId);
+                    this.cloudSyncDegradedToastId = null;
+                }
+                this.toast.success('Cloud sync is now running for this session.');
                 break;
             }
 

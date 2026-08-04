@@ -636,7 +636,7 @@ class TestDetachAgentSession:
             order.append("detach")
             return True
 
-        async def _archive(thread_id, entity_type):
+        async def _archive(thread_id, entity_type, *, reclaim_volume=True):
             order.append("workspace")
 
         provisioner = SimpleNamespace(
@@ -652,3 +652,178 @@ class TestDetachAgentSession:
         ):
             await orch_main._release_thread_resources("t1")
         assert order == ["detach", "workspace", "pod"]
+
+
+class TestEndedSessionKeepsItsVolume:
+    """THE session-durability invariant, end to end: **an ended thread is
+    RESUMABLE**, so ending or idling a session must never delete its workspace
+    volume. Only a hard delete reclaims it.
+
+    Now that session workspaces are PVC-backed, every teardown path that used to
+    be a harmless pod delete is a potential data-destruction path. Three callers
+    reach the same teardown for entirely different reasons: the user-facing
+    DELETE (soft end vs ?permanent=true), the agent's idle-archive after 30 idle
+    minutes, and the stale-agent sweeper when a pod merely goes offline. Only
+    the first of those, with ?permanent=true, means "destroy this user's data" —
+    and ``resume_thread`` requires exactly the 'ended' status the other two
+    write. The whole chain is pinned here (end_thread →
+    _release_thread_resources → _archive_and_cleanup_workspace →
+    release_workspace) because a default flipped at any one link silently
+    deletes workspaces at the far end.
+    """
+
+    @staticmethod
+    def _thread():
+        return {"id": "t1", "user_id": "u1", "agent_id": None, "metadata": {}}
+
+    async def _run_end_thread(self, *, permanent: bool):
+        """Drive the real DELETE endpoint, capturing the reclaim decision.
+
+        Returns ``(result, seen, db)`` — ``seen`` holds the kwargs
+        ``_release_thread_resources`` was called with.
+        """
+        seen: dict = {}
+
+        async def _release(thread_id, *, reclaim_volume=False):
+            seen["thread_id"] = thread_id
+            seen["reclaim_volume"] = reclaim_volume
+
+        db = SimpleNamespace(
+            end_thread=AsyncMock(),
+            delete_thread=AsyncMock(),
+            get_thread=AsyncMock(return_value=self._thread()),
+            merge_thread_config_override=AsyncMock(),
+        )
+        with (
+            patch.object(
+                orch_main,
+                "require_thread_owner",
+                AsyncMock(return_value=({"sub": "u1"}, self._thread())),
+            ),
+            patch.object(
+                orch_main, "_thread_turn_in_flight", AsyncMock(return_value=False)
+            ),
+            patch.object(orch_main, "_conclude_conference_if_any", AsyncMock()),
+            patch.object(orch_main, "_release_thread_resources", _release),
+            patch.object(orch_main, "postgres_db", db),
+            patch.object(
+                orch_main, "snapshot_service", SimpleNamespace(is_available=False)
+            ),
+            patch.object(
+                orch_main, "gitea_client", SimpleNamespace(is_initialized=False)
+            ),
+        ):
+            result = await orch_main.end_thread(
+                "t1", SimpleNamespace(), permanent=permanent, force=True
+            )
+        return result, seen, db
+
+    @pytest.mark.asyncio
+    async def test_soft_end_keeps_the_workspace_volume(self):
+        """A soft end leaves the thread in 'ended', which /resume accepts — so
+        reclaiming here would hand the user an empty workspace on a session they
+        never deleted. Same reasoning that already keeps the Gitea repo."""
+        result, seen, db = await self._run_end_thread(permanent=False)
+
+        assert result == {"status": "ended"}
+        assert seen["reclaim_volume"] is False
+        db.end_thread.assert_awaited_once_with("t1")
+        db.delete_thread.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_permanent_delete_reclaims_the_workspace_volume(self):
+        """The other half — without this the invariant would be trivially
+        satisfiable by never reclaiming anything, and every deleted session
+        would leak a 10Gi volume until the namespace quota rejects new ones."""
+        result, seen, db = await self._run_end_thread(permanent=True)
+
+        assert result == {"status": "deleted"}
+        assert seen["reclaim_volume"] is True
+        db.delete_thread.assert_awaited_once_with("t1")
+
+    @pytest.mark.asyncio
+    async def test_release_defaults_to_keeping_the_volume(self):
+        """The default is the safe one, so a caller that forgets the argument
+        leaks a volume (recoverable) rather than destroying one (not).
+
+        The two live callers both pass it explicitly today — end_thread forwards
+        ?permanent, the stale-agent sweeper hardcodes False — so this pins the
+        fallback the next caller will inherit. It matters because that caller is
+        most likely another "the agent went offline" path, which says nothing
+        about the user's intent to keep their files."""
+        captured: dict = {}
+
+        async def _archive(thread_id, entity_type, *, reclaim_volume=True):
+            captured["entity_type"] = entity_type
+            captured["reclaim_volume"] = reclaim_volume
+
+        with (
+            patch.object(orch_main, "_detach_agent_session", AsyncMock()),
+            patch.object(orch_main, "_archive_and_cleanup_workspace", _archive),
+            patch.object(
+                orch_main, "agent_provisioner", SimpleNamespace(is_available=False)
+            ),
+            patch.object(
+                orch_main, "persistent_provisioner", SimpleNamespace(is_available=False)
+            ),
+        ):
+            await orch_main._release_thread_resources("t1")
+
+        assert captured == {"entity_type": "threads", "reclaim_volume": False}
+
+    @pytest.mark.asyncio
+    async def test_release_forwards_an_explicit_reclaim(self):
+        captured: dict = {}
+
+        async def _archive(thread_id, entity_type, *, reclaim_volume=True):
+            captured["reclaim_volume"] = reclaim_volume
+
+        with (
+            patch.object(orch_main, "_detach_agent_session", AsyncMock()),
+            patch.object(orch_main, "_archive_and_cleanup_workspace", _archive),
+            patch.object(
+                orch_main, "agent_provisioner", SimpleNamespace(is_available=False)
+            ),
+            patch.object(
+                orch_main, "persistent_provisioner", SimpleNamespace(is_available=False)
+            ),
+        ):
+            await orch_main._release_thread_resources("t1", reclaim_volume=True)
+
+        assert captured["reclaim_volume"] is True
+
+    @pytest.mark.asyncio
+    async def test_archive_forwards_the_decision_to_the_provisioner(self):
+        """The last link: the flag has to survive all the way to the k8s call
+        that actually deletes the PVC, keyed on the session owner."""
+        # Same import path main.py uses — `services.*` and `orchestrator.services.*`
+        # load as distinct modules, and the dataclass equality below needs the
+        # class identity to match.
+        from services.workspace_lifecycle import WorkspaceOwner
+
+        for reclaim in (False, True):
+            thread = {
+                "id": "t1",
+                "metadata": {"workspace_container": {"status": "ready"}},
+            }
+            provisioner = SimpleNamespace(
+                is_available=True, release_workspace=AsyncMock(return_value=True)
+            )
+            with (
+                patch.object(
+                    orch_main,
+                    "postgres_db",
+                    SimpleNamespace(get_thread=AsyncMock(return_value=thread)),
+                ),
+                patch.object(orch_main, "container_provisioner", provisioner),
+                patch.object(
+                    orch_main, "vm_provisioner", SimpleNamespace(is_available=False)
+                ),
+            ):
+                await orch_main._archive_and_cleanup_workspace(
+                    "t1", entity_type="threads", reclaim_volume=reclaim
+                )
+
+            provisioner.release_workspace.assert_awaited_once_with(
+                WorkspaceOwner.session("t1"), reclaim_volume=reclaim
+            )

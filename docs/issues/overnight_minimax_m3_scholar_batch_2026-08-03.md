@@ -37,8 +37,9 @@ but non-blocking behaviors:
   model tool surface;
 - the deployed paper adapters were broken (`arxiv==4.0.0` API mismatch and
   Semantic Scholar HTTP 403), although the Scholar recovered through web search;
-  the source repair is now implemented, while deployment and the external
-  Semantic Scholar credential rotation remain;
+  the source repair is now implemented, a replacement Semantic Scholar key has
+  been requested, and the optional provider's deployment acceptance is deferred
+  until that credential arrives;
 - the connector still publishes the stale MCP creation/file-reader schema;
 - the phase-transition review prompt caused two completed reports to spend
   another 53 and 62 parent LLM rounds reconciling already-successful evidence;
@@ -313,7 +314,7 @@ text. The web comparison alone made 155 `web_search` and 26
 therefore local-development-specific or transient; its error-propagation fix is
 still desirable, but it was not reproduced here.
 
-The paper path is broken in production:
+The paper path was broken in the deployed batch image:
 
 - four arXiv `search_papers` calls returned
   `'Search' object has no attribute 'results'`;
@@ -323,9 +324,10 @@ The paper path is broken in production:
 The paper Scholar recognized the provider failures, recorded them, switched to
 `web_search`/`extract_webpage` against arXiv pages, and produced a 20-paper-link
 report. Its methodology note discloses the fallback and reduced confidence.
-That is good agent recovery, but it does not make the paper tools healthy.
-The source adapter is now updated as described below; deployment plus Semantic
-Scholar credential replacement and acceptance remain functional priorities.
+That is good agent recovery, but it did not make the deployed paper tools
+healthy at the time. The source adapter is now updated as described below. Its
+deployment remains to be exercised, while Semantic Scholar credential
+acceptance is optional and deferred rather than a job-completion blocker.
 
 #### Paper-provider remediation implemented 2026-08-04
 
@@ -375,7 +377,8 @@ generic response.
 The Kubernetes Secret is owned by External Secrets and synced from
 `homelab/superhuman-remote-worker/srw-secrets` in Vault. No replacement key is
 available in this checkout, and generating one requires the Semantic Scholar
-account/email workflow. Completion therefore requires an operator to:
+account/email workflow. Once a replacement is issued, acceptance requires an
+operator to:
 
 1. obtain a new Semantic Scholar API key and replace only the
    `SEMANTIC_SCHOLAR_API_KEY` property through the approved Vault workflow;
@@ -385,6 +388,33 @@ account/email workflow. Completion therefore requires an operator to:
    do not change in already-running containers; and
 4. run the worker-image probe above in a newly created agent before the next
    paper-job acceptance run.
+
+#### Paper-provider disposition — 2026-08-04
+
+An operator submitted the replacement-key request on 2026-08-04. Semantic
+Scholar manually reviews requests, so receipt may be delayed. No further code
+work is blocked on that external response: Semantic Scholar is an optional
+metadata/citation enrichment provider, arXiv and web research remain usable,
+and the repaired workflow now exposes provider failure while preserving healthy
+fallback results. This incident is therefore resolved for the current
+correctness track; credential installation and the probe above are deferred
+acceptance steps.
+
+The requested introductory key is also not a production-scale SaaS contract.
+Semantic Scholar documents a one-request-per-second introductory keyed limit and
+routes commercial use toward a separately approved/expanded license. A hosted
+multi-tenant product must not fan thousands of agents through a personal key.
+That future product decision belongs in a separate scholarly-provider design:
+central request brokering, caching and deduplication, plus either a negotiated
+Semantic Scholar agreement or a provider with explicit commercial capacity
+such as OpenAlex. Self-hosted OSS users may configure their own optional key;
+the shared product key must never be distributed.
+
+References:
+
+- <https://www.semanticscholar.org/product/api>
+- <https://api.semanticscholar.org/license/>
+- <https://developers.openalex.org/api-reference/authentication>
 
 The code-side focused gate is 129 passing tests across the arXiv client,
 Semantic Scholar transport/probe, paper/workflow tools, and worker API surface.
@@ -537,9 +567,10 @@ Scholar jobs can now start, research, write, commit, push, and complete. The nex
 work should stay separated by consequence:
 
 1. **Functional contract:** enforce `delegation.enabled=false`; deploy the
-   paper-provider source repair and rotate/probe the Semantic Scholar key;
-   refresh the MCP deployment/schema and rerun one job with a real server-side
-   `required_deliverables` value.
+   paper-provider source repair; refresh the MCP deployment/schema and rerun one
+   job with a real server-side `required_deliverables` value. Probe Semantic
+   Scholar after the requested replacement key arrives, but do not block useful
+   jobs or the current correctness track on this optional provider.
 2. **Shared context and evidence:** remove project-memory write-on-read
    deadlocks/per-consumer TTL corruption; split embedding batches; make citation
    traceability and source-index coverage machine-checkable; keep phase tags

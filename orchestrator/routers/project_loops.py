@@ -191,6 +191,16 @@ async def start_project_loop(
     project = await postgres_db.get_project(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
+    if not project.get("main_cloud_folder_handle") or not project.get(
+        "main_cloud_backend"
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Project loops require a provisioned project cloud folder. "
+                "Configure the project folder before starting the loop."
+            ),
+        )
     goal = body.goal_override if body.goal_override is not None else project.get("goal")
 
     loop = await postgres_db.create_project_loop(

@@ -24,25 +24,21 @@ import os
 from datetime import datetime
 from typing import Any
 
-# ``write_loop_retro`` moved to ``services.job_records`` (the §6.5
-# generalisation of the per-job record — one renderer for loop retros and
-# general job records). The ``as`` re-export keeps this module the loop
-# path's import surface (main.py, tests) with the loop's path, frontmatter
-# and body byte-identical to the pre-move writer.
+# The legacy name remains the loop path's import surface while the safe
+# migration lands. It now inserts a structured PostgreSQL record; it does not
+# write a retro file into an agent-visible repository.
 from services.job_records import write_loop_retro as write_loop_retro
 
 logger = logging.getLogger(__name__)
 
 
-# Every loop role works on its own `job/<id>` branch; on completion the
-# orchestrator squash-merges its net contribution onto `main` (one commit per
-# job, branch kept as the audit log). Execution roles are the ones whose merge
-# is EXPECTED to be non-empty — an `empty` merge from them is the F29-family
-# lost-work signal; analysis roles coordinate through the KB, so `empty` is
-# normal for them (until the KB is file-based). The execution slot is swappable
-# (developer / default / a future writer), so analysis is the closed set and
-# everything else is treated as execution.
-# See docs/features/loop_repo_compounding_v2.md.
+# Every loop role gets an isolated job repository seeded from the project cloud
+# folder. On completion, conflict-free changes under ``projects/<slug>/`` are
+# applied back to cloud. Execution roles are expected to produce such a diff;
+# analysis roles coordinate through the KB, so no file change is normal. The
+# execution slot is swappable (developer / default / a future writer), so
+# analysis is the closed set and everything else is treated as execution.
+# See docs/features/project_jobs_repo_retirement.md.
 #
 # product-qa audits the SHIPPED product (missing UI, broken setup, integration
 # gaps) and files issue candidates as KB notes — it never touches `repo/`, so an
@@ -83,7 +79,7 @@ def extract_cooldown_reset_at(
 
 
 def is_loop_execution_role(role: str | None) -> bool:
-    """True if a loop role produces the project artifact (merge must land)."""
+    """True if a loop role is expected to change project-cloud files."""
     return bool(role) and role not in LOOP_ANALYSIS_ROLES
 
 
@@ -93,8 +89,8 @@ def job_loop_id(job: dict[str, Any]) -> str | None:
     Reads ``context.loop_id`` (the stamp ``create_loop_job`` writes), tolerating a
     JSON-string context. This is the same signal ``_advance_project_loop`` keys
     off; exposed so the completion handler can ask "is this a loop job?" before
-    applying human-in-the-loop gates (e.g. Mode-A diff review) that would wedge an
-    unattended loop — its advance hook fires only on a terminal status.
+    applying the loop-specific automatic cloud-delivery policy before its
+    advance hook fires.
     """
     ctx = job.get("context") or {}
     if isinstance(ctx, str):
@@ -139,8 +135,8 @@ def validate_role_sequence(role_sequence: list[Any]) -> None:
 
     Enforces: non-empty sequence; every entry normalizes to ≥1 role; a fan-out
     (multi-role) stage contains ONLY analysis roles. The last rule keeps the
-    single-writer-per-artifact invariant — two execution roles committing to
-    ``main`` concurrently would race the squash-merge — and matches the design:
+    single-writer-per-artifact invariant — two execution roles applying to the
+    same cloud folder concurrently would race — and matches the design:
     parallel stages are additive *producers* (scholar ∥ product-qa) feeding a
     single downstream consumer, never concurrent executors.
     """
@@ -155,7 +151,7 @@ def validate_role_sequence(role_sequence: list[Any]) -> None:
                     "parallel role_sequence stages may contain analysis roles "
                     f"only (got execution role(s) {execution} in stage {roles}); "
                     "a fan-out stage is additive producers feeding one consumer, "
-                    "not concurrent executors racing the merge."
+                    "not concurrent executors racing cloud delivery."
                 )
 
 
@@ -433,10 +429,10 @@ _ROLE_BLOCKS: dict[str, str] = {
         "first so you don't re-propose a dead end. Write each candidate to the KB "
         "as a `plan` note tagged `proposal` (a one-line thesis and why it differs "
         "from the others). Do NOT self-filter — selecting is the Critic's job. "
-        "Your output is proposal notes, not repo commits. You work on your own "
-        "branch; anything you deliberately leave in the working tree is "
-        "squash-merged into the project when you finish, so keep it clean — "
-        "research scratch belongs in the KB, not the repo. Default to foraging "
+        "Your output is proposal notes, not file commits. This job's repository "
+        "is isolated; only deliberate edits below `projects/<project-slug>/` "
+        "are eligible for delivery to the project cloud folder. Research "
+        "scratch belongs in the KB, not that folder. Default to foraging "
         "widely rather than waiting to be told what to look at — file what you "
         "find as `idea` notes; that is how the backlog grows."
     ),
@@ -476,12 +472,10 @@ _ROLE_BLOCKS: dict[str, str] = {
         "UNCONDITIONAL — it does not stop on 'done'; if the system already meets "
         "the bar in an area, select the next most valuable ticket instead of "
         "declaring completion. Do NOT modify "
-        "the repository — only read, evaluate, and write your verdict to the KB. "
-        "You work on your own branch; anything you deliberately leave in the "
-        "working tree is squash-merged into the project when you finish, so "
-        "leave it untouched. Check `retros/` on the repo for the mechanical "
-        "record of what previous jobs actually landed (merge status per "
-        "iteration) — trust it over KB self-reports."
+        "project files — only read, evaluate, and write your verdict to the KB. "
+        "The repository attached to this job is isolated, not shared history. "
+        "Use the PROJECT JOB HISTORY in this kickoff for the orchestrator's "
+        "mechanical delivery record, and trust it over KB self-reports."
     ),
     "developer": (
         "Implement the Critic's chosen action. VALIDATE YOUR OWN WORK before "
@@ -490,12 +484,12 @@ _ROLE_BLOCKS: dict[str, str] = {
         "(multiple spawn_subagent calls in one turn) to explore unfamiliar code "
         "areas and look things up (docs, APIs, errors) in parallel, but write "
         "every production change yourself — subagent-driven coding fragments the "
-        "one thing that needs a coherent head. You work on your own branch of "
-        "the project repository; "
-        "your commits push there automatically, and when you finish the "
-        "orchestrator squash-merges your net contribution onto `main` — that "
-        "merge IS the project the next iteration builds on (job-scoped scratch "
-        "is kept out of it for you; partial work is safe on your branch). "
+        "one thing that needs a coherent head. The current durable project "
+        "files are seeded under `projects/<project-slug>/` in this isolated "
+        "workspace. Make project deliverables there. When you finish, the "
+        "orchestrator applies a conflict-free diff to the project cloud folder; "
+        "a conflict pauses the loop for review instead of overwriting newer "
+        "cloud state. Job-scoped scratch stays outside that folder. "
         "Record in the KB what you shipped and any follow-ups."
     ),
     "product-qa": (
@@ -512,8 +506,9 @@ _ROLE_BLOCKS: dict[str, str] = {
         "is the audit trail (paths searched, commands run, expected-vs-observed), "
         "not a reproduction. First check the KB (and the backlog pool above) for "
         "findings already filed — UPDATE them (kb_update), don't re-file "
-        "duplicates — and `retros/` on the repo for what prior iterations "
-        "actually landed. Then file 3-7 defects MAXIMUM — high-leverage over a "
+        "duplicates — and consult the PROJECT JOB HISTORY in this kickoff for "
+        "what prior iterations actually delivered. Then file 3-7 defects "
+        "MAXIMUM — high-leverage over a "
         "long bug list — each as its OWN `issue` note (kb_write, type=`issue`) "
         "carrying: severity, confidence, target user/workflow, evidence, "
         "smallest useful remediation, acceptance criteria, and a priority "
@@ -531,15 +526,17 @@ _ROLE_BLOCKS: dict[str, str] = {
         "outcome, not a failure to find work. You and Scholar are peers "
         "feeding the same backlog pool; you do not rank against each "
         "other — the Critic reads the pool and decides what to do next. "
-        "Your output is `issue` tickets, not repo commits. You work on your "
-        "own branch; an empty merge is expected — your findings live in the KB."
+        "Your output is `issue` tickets, not file commits. No project-cloud "
+        "change is expected — your findings live in the KB."
     ),
 }
 
 _ROLE_BLOCK_DEFAULT = (
     "Advance the goal acting as '{role}'. Build on the KB, validate your work "
-    "against the Definition of Done before declaring done, and record what you "
-    "did and what the next agent should do."
+    "against the Definition of Done before declaring done, and put durable "
+    "project files under `projects/<project-slug>/` so a conflict-free diff can "
+    "be applied to the project cloud folder. Record what you did and what the "
+    "next agent should do."
 )
 
 # Concise verb phrases for the job *description* (the UI title + task_brief
@@ -572,6 +569,32 @@ def build_loop_description(loop: dict[str, Any], *, role: str, iteration: int) -
     goal = (loop.get("goal") or "").strip()
     base = f"Loop iter {iteration} · {role.upper()}: {task}"
     return f"{base} — toward: {_goal_snippet(goal)}" if goal else base
+
+
+def render_loop_job_history(records: list[dict[str, Any]]) -> str:
+    """Compact, orchestrator-owned history block for the next loop kickoff."""
+    lines = ["PROJECT JOB HISTORY (structured database records, newest first):"]
+    if not records:
+        lines.append("- No prior loop job records.")
+        return "\n".join(lines)
+    for record in records:
+        iteration = record.get("iteration")
+        iteration_label = f"iter {iteration}" if iteration is not None else "job"
+        role = record.get("role") or "unknown"
+        job_id = str(record.get("job_id") or "")[:8]
+        status = record.get("status") or "unknown"
+        delivery = record.get("delivery_status") or "none"
+        line = (
+            f"- {iteration_label} · {role} · {job_id}: "
+            f"status={status}, delivery={delivery}"
+        )
+        summary = " ".join(str(record.get("completion_notes") or "").split())
+        if summary and summary != "(none recorded)":
+            line += f" — {summary[:240]}"
+        if record.get("error"):
+            line += f" — error: {' '.join(str(record['error']).split())[:160]}"
+        lines.append(line)
+    return "\n".join(lines)
 
 
 def _format_budget(remaining: int | None, run_until: Any) -> str:
@@ -670,12 +693,13 @@ def _campaign_member_block(campaign: dict[str, Any], stage_index: int) -> str:
         f"CAMPAIGN CONTEXT: you are stage {stage_index + 1} of {len(stages)} "
         f"of campaign '{campaign.get('title') or campaign.get('initiative_note_id')}' "
         f"(initiative KB note: {campaign.get('initiative_note_id')}).\n"
-        "- Prior stages' actual state: check retros/ (newest first) and the "
-        "repo — build on what landed, don't restart.\n"
+        "- Prior stages' actual state: use the current project-cloud files, "
+        "PROJECT JOB HISTORY, and KB — build on what was delivered, don't "
+        "restart.\n"
         "- The campaign is judged at its END against this pre-registered "
         f"acceptance evidence:\n{checks}\n"
         "- You do NOT have to reach a fully provable state THIS job — "
-        "mid-campaign scaffolding is fine — but your retro MUST be honest "
+        "mid-campaign scaffolding is fine — but your completion report MUST be honest "
         "about actual state: never claim working what isn't. The closing "
         "critic runs the checks above; honesty is the contract that keeps "
         "the loop sane."
@@ -689,6 +713,7 @@ def build_loop_kickoff(
     iteration: int,
     extra_context: dict[str, Any] | None = None,
     backlog_block: str | None = None,
+    history_block: str | None = None,
 ) -> str:
     """Assemble the loop-aware kickoff *message* for one job.
 
@@ -713,6 +738,7 @@ def build_loop_kickoff(
     ``services/project_backlog.render_backlog_block``). It is injected
     VERBATIM: this function stays pure and does no I/O, so the caller fetches
     it. Passing None (start-up paths, tests) simply omits the section.
+    ``history_block`` follows the same pattern for structured job records.
     """
     goal = (loop.get("goal") or "").strip() or (
         "(no explicit goal set — make useful, self-directed progress and record "
@@ -731,9 +757,10 @@ def build_loop_kickoff(
 
     parts = [
         "You are ONE step in a CONTINUOUS, UNATTENDED improvement loop on this "
-        "project. Other agents run before and after you. You coordinate ONLY "
-        "through the project knowledge base — it is your shared memory with them. "
-        "READ IT FIRST; WRITE BACK what matters before you finish.",
+        "project. Other agents run before and after you. Coordinate through the "
+        "project knowledge base and current project-cloud files; this job's "
+        "isolated repository is not shared history. READ THE KB FIRST; WRITE "
+        "BACK what matters before you finish.",
         f"PROJECT GOAL:\n{goal}",
         "DEFINITION OF DONE — the quality bar you STEER TOWARD (the loop keeps "
         f"improving past it; it does not stop when it's 'met'):\n{criteria}",
@@ -762,6 +789,9 @@ def build_loop_kickoff(
             "— proceed without it rather than hunting for a substitute; note "
             "the gap in your write-back."
         )
+
+    if history_block:
+        parts.append(history_block)
 
     parts += [
         "BEFORE you act: restate the goal in one line, then check the KB for "
@@ -806,6 +836,7 @@ async def create_loop_job(
     disable_memory_assembler: bool = False,
     extra_context: dict[str, Any] | None = None,
     backlog_block: str | None = None,
+    history_block: str | None = None,
     park_until: datetime | None = None,
 ) -> dict[str, Any]:
     """Materialize ONE bare loop job for the given role + iteration.
@@ -857,8 +888,9 @@ async def create_loop_job(
         "scholar": {"enabled": False},
         "curator": {"enabled": True},
         "autonomy": "full",
-        # The loop coordinates ONLY through the project knowledge base + shared
-        # memory, so a step that loses its embedding-backed stores must pause for
+        # Loop reasoning coordinates through the project knowledge base + shared
+        # memory, while durable files hand off through project cloud delivery.
+        # A step that loses its embedding-backed stores must pause for
         # re-dispatch rather than run blind (see
         # docs/done/embedding_key_missing_silently_disables_memory_and_kb.md).
         "memory": {"required": True},
@@ -911,12 +943,17 @@ async def create_loop_job(
         iteration=iteration,
         extra_context=extra_context,
         backlog_block=backlog_block,
+        history_block=history_block,
     )
     context = {
         "loop_id": loop_id,
         "loop_role": role,
         "loop_iteration": iteration,
         "kickoff_message": kickoff,
+        # Blocks dispatch from the instant the row exists. Loop provisioning
+        # replaces this with ready only after the project-cloud baseline has
+        # been seeded synchronously.
+        "cloud_baseline": {"state": "seeding"},
     }
     # Spawn-time counter stamps for the torn-advance heal (see docstring). Gated
     # on seq_index so legacy single-job callers stay stamp-free and fall through

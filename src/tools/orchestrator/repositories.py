@@ -28,8 +28,8 @@ REPOSITORY_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "module": "orchestrator.repositories",
         "function": "get_default_project_repository",
         "description": (
-            "Show the project's default jobs repository metadata. This is "
-            "usually the repository that carries the project's shared work."
+            "Show the project's preferred writable source repository metadata. "
+            "Project cloud files and job history are not repository roles."
         ),
         "category": "orchestrator",
         "short_description": "Show the default project repository.",
@@ -105,10 +105,11 @@ def _select_repository(
                 return repo
         return None
 
-    effective_role = role or "jobs"
-    for repo in repos:
-        if repo.get("role") == effective_role:
-            return repo
+    if role is not None:
+        for repo in repos:
+            if repo.get("role") == role:
+                return repo
+        return None
     return repos[0] if repos else None
 
 
@@ -216,7 +217,7 @@ def create_repository_tools(context: ToolContext) -> List[Any]:
 
     @tool
     async def get_default_project_repository(project_id: Optional[str] = None) -> str:
-        """Show the current project's default jobs repository."""
+        """Show the current project's preferred writable source repository."""
         effective_project_id = project_id or _current_project_id(context)
         if not effective_project_id:
             return (
@@ -227,12 +228,14 @@ def create_repository_tools(context: ToolContext) -> List[Any]:
         async with _get_client(user_id=context.user_id) as client:
             try:
                 repos = await _fetch_public_repositories(
-                    client, base_url, effective_project_id, role="jobs"
+                    client, base_url, effective_project_id
                 )
-                repo = _select_repository(repos, role="jobs")
+                repo = _select_repository(repos, role="source")
                 if not repo:
                     return (
-                        f"No jobs repository found for project {effective_project_id}."
+                        "No writable source repository is linked to project "
+                        f"{effective_project_id}. Project files live in the "
+                        "project cloud folder, not in a default Git workspace."
                     )
                 return "\n".join(_format_repository(repo))
             except httpx.HTTPStatusError as e:
@@ -249,7 +252,7 @@ def create_repository_tools(context: ToolContext) -> List[Any]:
         project_id: Optional[str] = None,
         repo_id: Optional[str] = None,
         name: Optional[str] = None,
-        role: str = "jobs",
+        role: str = "source",
         target_path: Optional[str] = None,
     ) -> str:
         """Clone a project repository into this session workspace.
@@ -258,7 +261,9 @@ def create_repository_tools(context: ToolContext) -> List[Any]:
             project_id: Optional project UUID. Defaults to this session's project.
             repo_id: Optional repository UUID to clone.
             name: Optional repository name to clone.
-            role: Repository role to select when repo_id/name are omitted.
+            role: Source/reference repository role to select when repo_id/name
+                are omitted. Managed knowledge and legacy jobs repositories are
+                never cloned into a new session workspace.
             target_path: Optional relative checkout path. Defaults to repos/<name>.
         """
         effective_project_id = project_id or _current_project_id(context)
@@ -289,6 +294,13 @@ def create_repository_tools(context: ToolContext) -> List[Any]:
         repo = _select_repository(repos, repo_id=repo_id, name=name, role=role)
         if not repo:
             return f"No matching repository found for project {effective_project_id}."
+        if repo.get("role") in {"jobs", "knowledge"}:
+            return (
+                f"Repository {repo.get('name') or repo.get('id')} has managed "
+                f"role '{repo.get('role')}' and is not checkout-eligible. "
+                "Only linked source/reference repositories belong in a new "
+                "agent workspace."
+            )
         repo_url = repo.get("repo_url")
         if not repo_url:
             return f"Repository {repo.get('name') or repo.get('id')} has no clone URL."

@@ -278,10 +278,17 @@ the requests we bill on.
 > Captured per request; not yet designed. Storage's importance is **conditional on the
 > hosting model**, which isn't decided.
 
-- **Workspace storage today ≈ free.** Pods use `emptyDir` by default
-  (`container_provisioner.py:191`) — ephemeral, node-local, dies with the pod. PVCs
-  (`longhorn-ephemeral`, default `10Gi`) are legacy/optional. So there's little
-  workspace storage cost to meter right now.
+- ~~**Workspace storage today ≈ free.**~~ **No longer true (2026-08-04).** emptyDir
+  is still the chart default, but `workspace.pvcEnabled` PVC-backs both jobs and
+  sessions on `longhorn-ephemeral` (default `10Gi` per claim), and it is already
+  ON in k3d dev and the homelab soak. Two things make this meterable in a way the
+  old optional-PVC framing was not: a **session consumes two claims** (workspace
+  pod + agent pod), and **session claims are released only when the thread row is
+  hard-deleted** — an `ended` thread is resumable and keeps its volumes. So
+  workspace storage no longer tracks concurrency; it tracks *retained threads*,
+  and it accumulates. That is a real GB-month line even before hosted-storage is
+  decided, and it is the first workspace-storage number worth putting on the
+  dashboard (PVC count + requested GiB by owner kind).
 - **The real persistent storage is elsewhere:** OpenCloud, object stores (`minio` /
   `garage`), and PVCs if re-enabled. These are GB-month on *our* infra → meterable as
   `category='storage'`, `unit='gib-month'` in the same ledger when we get to it.

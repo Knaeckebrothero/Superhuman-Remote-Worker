@@ -14,6 +14,19 @@
 > Branch (b) (durable VMs) and (c) (snapshot-hardening) remain unbuilt options for
 > the VM substrate. The rest of this brief is preserved as the original analysis.
 
+> **UPDATE 2026-08-04 — Branch (a) extended to sessions; the "jobs-only for v1"
+> scope above is superseded.** Under `WORKSPACE_PVC_ENABLED` a session now gets
+> **two** PVCs — `pvc-ws-thread-<tid[:12]>` for its workspace pod and
+> `pvc-agent-s-<tid[:12]>` for its agent pod (job agent pods stay emptyDir).
+> **The GC rule this brief specified at §Net-new work #2 — "thread *deleted*,
+> not merely *ended*" — is what shipped**, verbatim: an `ended` thread is
+> resumable and keeps its volumes; `end_thread` reclaims only with
+> `permanent=true`; the backstop reaper reclaims a session's claims only when the
+> `threads` row is genuinely absent, never on status. Consequently the
+> observations below that "workspace storage is emptyDir for sessions" and that
+> the only session PVC is the vestigial `pvc-persistent-*` describe the
+> **2026-06-10 architecture, not the current one**. Corrections are marked inline.
+
 Design brief — **substantially revised 2026-06-10** after verifying the live
 architecture against code and the dev cluster. The original framing ("migrate
 workspace pods to PVCs") was too narrow and rested on a wrong assumption (that
@@ -39,12 +52,20 @@ KubeVirt/CDI-DataVolume-backed — a strong lead; see branch (b)).
 
 ## TL;DR of the correction
 
+*(As of 2026-06-10. The first two bullets no longer describe the container
+backend — see the 2026-08-04 update in §Status.)*
+
 - There is **no per-workspace PersistentVolume in the active path** — not for
   jobs, not for sessions. Workspace storage is `emptyDir` (container backend) or
-  a fresh per-create disk (VM backend), plus an S3 snapshot.
+  a fresh per-create disk (VM backend), plus an S3 snapshot. **Superseded:**
+  under `WORKSPACE_PVC_ENABLED` both jobs and sessions are PVC-backed on the
+  container backend; VMs still are not.
 - The `pvc-persistent-*` PVC that looked like "sessions have PVCs" is
   **vestigial** — a dormant *fallback* provisioner left over from before session
-  state moved to Postgres. It is not exercised on current clusters.
+  state moved to Postgres. It is not exercised on current clusters. **Still
+  true**, and deliberately kept distinct: the live session claims are
+  `pvc-ws-thread-*` / `pvc-agent-s-*`, named apart from `pvc-persistent-*` so the
+  two paths can never contend for one RWO volume if they ever coexist.
 - The durable session state (conversation, plan, context) lives **in Postgres**
   and survives any pod/VM churn. The only thing actually lost on a teardown that
   can't snapshot is the **working files** in `/home/agent-host`.
@@ -65,10 +86,19 @@ Every agent run is a **harness pod** (runs the LangGraph process) plus an
 | Container — **session** | `srw-agent-s-<id>` pod, emptyDir `/workspace` (`agent_provisioner`) | `ws-thread-<id>` pod, **emptyDir** `/home/agent-host` (`container_provisioner`) | ❌ emptyDir |
 | **VM** — job or session | `srw-agent-*-<id>` pod, emptyDir `/workspace` | the VM, **fresh disk** per create, SSH `:22` | ❌ fresh disk |
 
+*(Table as of 2026-06-10. Under `WORKSPACE_PVC_ENABLED` — 2026-08-04 — the two
+container rows change: the **job** row's execution target is
+`pvc-workspace-<id[:12]>` while its harness stays emptyDir; the **session** row
+is PVC on **both** sides — harness `pvc-agent-s-<tid[:12]>`, execution target
+`pvc-ws-thread-<tid[:12]>`. The VM row is unchanged.)*
+
 The execution pod is created by the *same* `container_provisioner.create_workspace()`
-for jobs and sessions — it has no idea who's driving it. Its volume is `emptyDir`
+for jobs and sessions — it has no idea who's driving it. Its volume was `emptyDir`
 in both cases (`container_provisioner.py` `_build_pod_manifest`, the
-`pvc_name`-gated branch defaults to emptyDir at ~line 1080).
+`pvc_name`-gated branch defaults to emptyDir at ~line 1080); as of 2026-08-04 the
+`pvc_name` it is handed is non-null for **both** kinds when the flag is on —
+`_pvc_name_for(owner)` just swaps the prefix. That kind-blindness is why the
+session lift was a gate removal rather than a second code path.
 
 ### Why the `pvc-persistent-*` PVC is vestigial
 
@@ -96,7 +126,13 @@ Two consequences worth internalizing:
   **Postgres**, the checkpoint was demoted to an in-process cache and the
   active path correctly dropped the PVC. Sessions on emptyDir harness pods
   resume fine because they rehydrate from Postgres (`persistent_session.py:171`,
-  `get_thread()`), not from the `.db`.
+  `get_thread()`), not from the `.db`. **2026-08-04:** the session harness pod is
+  PVC-backed again (`pvc-agent-s-*`), but *not* for the old reason — the brain
+  still lives in Postgres and the checkpoint is still a cache. The claim exists
+  so a recycled agent pod (drift drain, crash, node loss, version upgrade)
+  reattaches its agent-local working state instead of booting onto empty scratch;
+  the pod name is random per provision, so the volume identity has to come from
+  the thread.
 - The S3 snapshot tars **`/home/agent-host`** on the *execution* pod
   (`snapshot_service.py:~285`) — it does **not** include the harness pod's
   checkpoint. So the snapshot protects working files, nothing else.
@@ -189,6 +225,17 @@ This is the design from the earlier pass, kept intact. It targets the
 2. PVC GC: explicit delete on *terminal* bound-work (job completed/failed/
    cancelled; thread **deleted**, not merely *ended*) + a backstop PVC-reaper arm
    for orphans. Snapshot-confirmed before delete.
+   **✅ IMPLEMENTED as specified (jobs 2026-06-30, sessions 2026-08-04).** The
+   thread-**deleted**-not-**ended** distinction is the load-bearing part and it
+   shipped exactly as written: `end_thread` reclaims the volume only with
+   `permanent=true`, and `reap_orphans` resolves a session claim against the
+   *existence* of the `threads` row and never consults its status — because
+   sessions end on an idle timeout routinely, a status-based reclaim here would
+   be precisely the data-destroying bug this rule exists to prevent. Every
+   uncertain branch (DB error, unreadable owner id, live pod, row still present)
+   keeps the volume. Note the practical inversion for sessions: their pod is
+   normally idle-reaped long before the thread is deleted, so the *backstop*
+   sweep — not the inline terminal path — is their primary reclaim route.
 3. Resume prefers PVC-reattach, S3-restore fallback (the fast-resume win).
 4. Capacity guard (ResourceQuota).
 5. `give_up` attach-wait robustness (RWO detach-before-reattach; dead-node falls

@@ -585,6 +585,37 @@
           "properties": { "image": { "type": "string" } }
         }
       }
+    },
+    "workspace": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "storageClass": { "type": "string" },
+        "storageSize": { "type": "string" },
+        "accessMode": {
+          "type": "string",
+          "enum": ["ReadWriteOnce", "ReadWriteMany", "ReadWriteOncePod"]
+        },
+        "ephemeralStorageClass": {
+          "type": "string",
+          "description": "Storage class for per-workspace PVCs (jobs and sessions). Required when resourceQuota.enabled, which is keyed on it."
+        },
+        "pvcEnabled": {
+          "type": "boolean",
+          "description": "PVC-back workspace pods for BOTH jobs and sessions; sessions additionally get a second claim for their agent pod. Default false = emptyDir."
+        },
+        "pvcSize": { "type": "string" },
+        "reattachReadyTimeout": { "type": "integer", "minimum": 1 },
+        "freshFallback": { "type": "boolean" },
+        "resourceQuota": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "maxStorage": { "type": "string" },
+            "maxCount": { "type": "integer", "minimum": 1 }
+          }
+        }
+      }
     }
   }
 }

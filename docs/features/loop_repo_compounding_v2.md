@@ -22,6 +22,11 @@ related:
 
 # Loop Repo Compounding v2 — Per-Job Branches, Orchestrator Squash-Merge, Jobs Repo as Coordination Repo
 
+> **Superseded 2026-08-04:** Loops no longer compound through a shared project
+> repository. File-producing turns apply their isolated job diff to the project
+> cloud folder; analysis turns coordinate through the KB. See
+> [[project_jobs_repo_retirement]].
+
 **Status:** ACCEPTED 2026-07-03, implementation in progress (same day) — successor to
 [[loop_repo_compounding]] (v1). Origin: design discussion 2026-07-03, prompted by live
 run-7 evidence. The original "wait for the run era to conclude" sequencing was overridden

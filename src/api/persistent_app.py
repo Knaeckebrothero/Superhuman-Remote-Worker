@@ -217,6 +217,15 @@ _draft_title_value: Optional[str] = None
 # _loop_on_tool_result.
 _tool_inflight: bool = False
 
+# Cloud sync failed to start at attach (no sync target resolved, or the initial
+# pull raised) and is worth retrying at a turn boundary. Without this the
+# session keeps ``workspace_sync = None`` for its WHOLE life — every use site is
+# guarded by ``if _session.workspace_sync:`` and nothing ever rebuilds it — so a
+# few-seconds-late sync target (or a transient WebDAV blip) cost the user every
+# push and pull of the session.
+# docs/issues/session_resume_cloud_sync_race_late_provision.md
+_cloud_sync_retry_pending: bool = False
+
 # Phase 2 event-log cursor. Allocated synchronously by _broadcast, then queued
 # through one ordered writer so a later sequence can never become visible in
 # Postgres before an earlier queued sequence. Each DB-backed runtime attach
@@ -1526,8 +1535,9 @@ async def _attach_session(
     base instead of the pod's boot config when provided.
     """
     global _session, _thread_id, _events_epoch, _next_seq, _tool_inflight
-    global _event_writer
+    global _event_writer, _cloud_sync_retry_pending
 
+    _cloud_sync_retry_pending = False
     _clear_all_canvas_awareness()
 
     if _session is not None:
@@ -2140,6 +2150,7 @@ async def _attach_session(
                 },
             )
             _session.workspace_sync = None
+            _cloud_sync_retry_pending = True
     elif cloud_degraded_hint:
         # Cloud is up but the orchestrator resolved no sync target for this
         # thread (session-folder provisioning failed upstream, so nc_session_folder
@@ -2161,6 +2172,7 @@ async def _attach_session(
                 "degraded": True,
             },
         )
+        _cloud_sync_retry_pending = True
 
     # Restore message history from DB (for session resume)
     await _restore_session_messages()
@@ -2259,7 +2271,7 @@ async def _terminate_session_inner(reason: str, *, mark_thread: bool = True) -> 
     global _loop_user_queue, _loop_interrupt_flag, _loop_last_user_content
     global _hard_interrupt_event
     global _events_epoch, _next_seq, _tool_inflight
-    global _event_writer
+    global _event_writer, _cloud_sync_retry_pending
 
     if not _session:
         return
@@ -2381,6 +2393,9 @@ async def _terminate_session_inner(reason: str, *, mark_thread: bool = True) -> 
     _events_epoch = 0
     _next_seq = 0
     _tool_inflight = False
+    # Pool agents serve many threads; a pending retry must not leak into the
+    # next session, whose attach resolves its own cloud state.
+    _cloud_sync_retry_pending = False
 
     # Safety valve: restart after N sessions to guard against state leakage
     _sessions_served += 1
@@ -5024,11 +5039,80 @@ async def _resilient_cloud_sync(op: str, runner, turn_id: int) -> bool:
     return False
 
 
+async def _retry_cloud_sync_start(turn_id: int) -> None:
+    """Re-attempt a cloud sync that failed to start at attach.
+
+    The attach-time resolution is a single snapshot read: an agent that lost
+    the race against session-folder provisioning (or hit a transient WebDAV
+    failure) kept ``workspace_sync = None`` for the session's WHOLE life,
+    because every use site is guarded and nothing rebuilt it. One retry per
+    turn boundary turns that permanent loss into a late start.
+
+    Silent by design after the first failure — the degraded toast was already
+    raised at attach, and re-broadcasting it every turn would be noise. Only
+    the transition back to working is announced.
+    docs/issues/session_resume_cloud_sync_race_late_provision.md
+    """
+    global _cloud_sync_retry_pending
+
+    if _session is None or not _orchestrator_client or not _thread_id:
+        return
+    try:
+        ws_info = await _orchestrator_client.get_thread_workspace(_thread_id)
+    except Exception:
+        return
+    if not ws_info:
+        return
+
+    # F-C1 fail-closed: a protected thread's only sanctioned live-write surface
+    # is the capture overlay. Never let a retry hand it a live WebDAV sync —
+    # and stop retrying, since that verdict cannot change mid-session.
+    if ws_info.get("protected_cloud"):
+        _cloud_sync_retry_pending = False
+        return
+
+    cloud_cfg = ws_info.get("cloud_sync")
+    if not cloud_cfg and ws_info.get("nc_session_folder"):
+        cloud_cfg = _legacy_nc_cloud_cfg(ws_info["nc_session_folder"])
+    if not cloud_cfg:
+        return  # still nothing to sync to — try again next turn
+
+    try:
+        coordinator = _build_sync_coordinator(
+            workspace_path=_session.workspace_manager.path,
+            workspace_backend=_session.workspace_manager.backend,
+            cloud_cfg=cloud_cfg,
+        )
+        if not coordinator:
+            return
+        await coordinator.pull_all()
+    except Exception as e:
+        # Keep the flag set: the target exists but isn't usable yet. Don't
+        # leave a half-built coordinator behind for the push at turn end.
+        logger.warning("Cloud sync retry failed on turn %s: %s", turn_id, e)
+        return
+
+    _session.workspace_sync = coordinator
+    _cloud_sync_retry_pending = False
+    logger.info(
+        "Cloud workspace sync recovered on turn %s (%d mount(s))",
+        turn_id,
+        len(coordinator),
+    )
+    _broadcast("workspace_sync.recovered", {"turn_id": turn_id})
+
+
 async def _loop_on_turn_start(turn_id: int) -> None:
     if _session is None:
         return
     _session.turn_count = turn_id
     _broadcast("turn.started", {"turn_id": turn_id})
+
+    # Cloud sync never started for this session (lost the race against
+    # session-folder provisioning, or the initial pull failed). Retry before
+    # the pull below so a recovered session syncs from this turn on.
+    if _cloud_sync_retry_pending and _session.workspace_sync is None:
+        await _retry_cloud_sync_start(turn_id)
 
     # Phase 1 of cloud_collaboration_model.md §9: pull cloud-side edits
     # before the turn runs so the agent sees the latest user-side state.

@@ -98,6 +98,26 @@ describe('canComposeDuringSession', () => {
         // first send creates the session; typing must be possible at t=0.
         expect(canComposeDuringSession(false, false, true)).toBe(true);
     });
+
+    it('allows composing on an ended session so a draft can be written first', () => {
+        // The box used to go dead the moment a session idled out, stranding a
+        // half-typed message the user could read but not edit. Composing is
+        // free; only SENDING resumes (and reserves an agent pod + workspace).
+        expect(canComposeDuringSession(false, false, false, true)).toBe(true);
+    });
+
+    it('keeps the composer open across a send-triggered resume', () => {
+        // isStartingSession is false while threadStatus is still 'ended', and
+        // the send flips threadStatus before connect() runs — without the
+        // isResuming term the box would disable itself mid-send and re-enable
+        // a moment later.
+        expect(canComposeDuringSession(false, false, false, false, true)).toBe(true);
+    });
+
+    it('still blocks a mid-session reconnect once the extra states are false', () => {
+        // Guard against the new params quietly turning the reconnect gate off.
+        expect(canComposeDuringSession(false, false, false, false, false)).toBe(false);
+    });
 });
 
 describe('canSendMessage', () => {

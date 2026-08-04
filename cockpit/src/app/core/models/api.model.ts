@@ -949,7 +949,8 @@ export type ProjectMemberRole = 'owner' | 'editor' | 'viewer';
 /**
  * Project repository role types.
  */
-export type ProjectRepoRole = 'jobs' | 'source' | 'reference';
+/** `jobs` is legacy-read-only; `knowledge` is orchestrator-managed. */
+export type ProjectRepoRole = 'jobs' | 'source' | 'reference' | 'knowledge';
 
 /**
  * Project from the orchestrator.
@@ -1225,7 +1226,7 @@ export interface ProjectRepositoryCreateRequest {
   name: string;
   description?: string;
   repo_url?: string;
-  role?: ProjectRepoRole;
+  role?: Extract<ProjectRepoRole, 'source' | 'reference'>;
   read_only?: boolean;
   branch?: string;
   clone_path?: string;
@@ -1493,6 +1494,10 @@ export interface Job {
   repo_name?: string | null;
   branch_name?: string | null;
   merge_status?: string | null;
+  delivery_status?: string | null;
+  delivery_ref?: string | null;
+  delivery_sha?: string | null;
+  change_record_type?: 'job_record' | 'loop_record' | null;
   priority?: number;
   status: JobStatus;
   created_at: string;

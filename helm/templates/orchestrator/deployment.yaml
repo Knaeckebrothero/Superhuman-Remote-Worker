@@ -411,8 +411,10 @@ spec:
                 configMapKeyRef:
                   name: {{ include "srw.configMapName" . }}
                   key: WORKSPACE_STORAGE_CLASS
-            # Branch (a): PVC-backed job workspaces. The orchestrator runs both
-            # the dispatcher's create_workspace and the lifecycle reaper, so it
+            # Branch (a): PVC-backed workspaces, jobs AND sessions. The
+            # orchestrator runs the dispatcher's create_workspace, the session
+            # agent provisioner (which gates its own pvc-agent-s-* claim on the
+            # SAME WORKSPACE_PVC_ENABLED flag) and the lifecycle reaper, so it
             # must see these. The deployment maps configmap keys explicitly
             # (not envFrom), so new keys need an entry here to reach the pod.
             - name: WORKSPACE_PVC_ENABLED
@@ -1331,16 +1333,11 @@ spec:
             # root-owned 0400 file — that breaks prod, including the paramiko
             # path above.
             #
-            # The `ssh -i` paths (services/{snapshot_service,ide_session}.py and
-            # services/ssh_helpers.py) also work in prod despite 0444: OpenSSH
-            # enforces its private-key permission check ONLY when the key file is
-            # owned by the same uid running ssh. Here the key is root-owned while
-            # the process is `srw`, so the check is skipped. It DOES trip in
-            # local dev, where docker/Dockerfile.orchestrator.dev runs the
-            # container as root (uid == key owner) -> "Permissions 0444 ... too
-            # open ... ignored" -> snapshot/IDE SSH fails. That is dev-only.
-            # There is no client-side `StrictModes` ssh option (it is an sshd
-            # directive); to make the dev SSH paths work, stage-copy the key to a
-            # 0600 file owned by the runtime user at startup (works as root or
-            # srw).
+            # Every SSH caller resolves this mount through
+            # services.resolve_ssh_key_path(). When the projected file is not a
+            # runtime-owned private file (including root-running Tilt), the
+            # resolver atomically stages a process-owned 0600 copy and returns
+            # that path. This keeps the readable 0444 mount required by the
+            # non-root production image without relying on OpenSSH's
+            # owner-dependent permission exception.
             defaultMode: 0444

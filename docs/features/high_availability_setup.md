@@ -118,7 +118,16 @@ done
 
 # 3. Drain. --ignore-daemonsets is required (Longhorn manager, kube-proxy,
 #    flannel are all DaemonSets). --delete-emptydir-data is required if any
-#    pod uses emptyDir.
+#    pod uses emptyDir — and it DESTROYS that data, so check first.
+#    2026-08-04: workspace pods are no longer uniformly emptyDir. Under
+#    workspace.pvcEnabled both job and session workspaces are RWO PVCs (a
+#    session also holds one for its agent pod). Mixed fleets are normal, so
+#    the flag stays required — it only ever discards the emptyDir pods. The
+#    PVC-backed ones detach/re-attach as in step 4, but note they are BARE
+#    pods with no controller: eviction does not recreate them. The
+#    orchestrator's reconciler does, via create_workspace, which reattaches
+#    the volume by its deterministic name. Expect that lag, not a rescheduled
+#    pod.
 kubectl --context=main drain node3 \
   --ignore-daemonsets \
   --delete-emptydir-data \

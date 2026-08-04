@@ -446,14 +446,24 @@ agent:
 # manual override, not policy default.
 # -----------------------------------------------------------------------------
 workspace:
-  # PVC-backed job workspaces (Branch a) — ON for the homelab soak/validation.
+  # PVC-backed workspaces (Branch a) — ON for the homelab soak/validation.
   # Gives durable reattach + crash-recovery auto-resume + the single-replica
   # node-loss fallback. ephemeralStorageClass defaults to longhorn-ephemeral
   # (present on this cluster, single replica). Rollback = set false (new pods
   # revert to emptyDir; existing PVC pods finish + GC normally — mixed fleet is
-  # safe). Capacity guard (resourceQuota) intentionally left default-off for the
-  # soak. Node-loss validation runbook: tests/workspace_pvc_node_loss_validation.md.
+  # safe). Node-loss validation runbook: tests/workspace_pvc_node_loss_validation.md.
   # Design: docs/features/workspace_pvc_branch_a_implementation.md.
+  #
+  # 2026-08-04: this flag now covers SESSIONS as well as jobs — a session claims
+  # `pvc-ws-thread-*` for its workspace pod and `pvc-agent-s-*` for its agent
+  # pod, and both are reclaimed only when the thread row is hard-deleted (an
+  # `ended` thread is resumable and keeps its volumes). Session storage on this
+  # cluster therefore grows with RETAINED THREADS, not with concurrency.
+  # `resourceQuota` is still intentionally default-off here, which was a
+  # low-risk call while only jobs held PVCs and self-reclaimed at terminal
+  # status; with sessions in scope it means the accumulation is unbounded
+  # against longhorn-ephemeral. Watch PVC count on this cluster and turn the
+  # quota on (or prune threads) before the soak becomes the capacity incident.
   pvcEnabled: true
   networkPolicy:
     operatorHomeAllowedEmail: ""

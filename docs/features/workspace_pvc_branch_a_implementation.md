@@ -30,6 +30,22 @@ homelab soak** (ns `superhuman-remote-worker`, enabled in `a9485f21`).
 is the chosen fork of [`workspace_pvc_backed_migration.md`](workspace_pvc_backed_migration.md).
 Sessions and VMs (branch b) are explicit non-goals for v1 (§Non-goals).
 
+> **REVERSED for sessions (2026-08-04) — the v1 jobs-only scope no longer holds.**
+> `WORKSPACE_PVC_ENABLED` now PVC-backs **sessions as well as jobs**. A session
+> gets **two** claims: `pvc-ws-thread-<tid[:12]>` for its workspace pod
+> (`container_provisioner`, the `owner.kind == "job"` gate removed) and
+> `pvc-agent-s-<tid[:12]>` for its agent pod (`agent_provisioner`, same flag).
+> Job agent pods stay emptyDir. The reclaim rule is deliberately **asymmetric**:
+> a job PVC dies at terminal status, a session's dies **only when the `threads`
+> row is hard-deleted** — an `ended` thread is resumable, so `end_thread`
+> reclaims the volume only with `permanent=true`. The orphan reaper covers both.
+> The reason sessions turned out to need this *more* than jobs, not less: a
+> session's pod is idle-reaped while its thread stays resumable, so emptyDir was
+> destroying the working tree of state a user could still reopen. This is a
+> **code-behavior** note — it says nothing about which clusters have the flag on.
+> Non-goals, the §Phase 0 gate line, and the mixed-fleet verification note below
+> are annotated accordingly; VMs (branch b) remain a non-goal.
+
 **One-line model:** PVC named by job UUID, mounted at `/home/agent-host`,
 reattached by name on any recreate, deleted when the job is terminal. The
 Postgres LangGraph checkpoint (cross-pod, already live) carries reasoning state;
@@ -52,7 +68,11 @@ resumes the checkpoint — coherent by construction, no snapshot/restore dance.
   into `_build_pod_manifest` (PVC-vs-emptyDir branch already existed,
   `:1129`). **Created BEFORE the seed ConfigMap** so a PVC failure leaves
   nothing to clean up (the prerequisite resource).
-- Sessions stay emptyDir (gated on `owner.kind == "job"`); one-line lift later.
+- ~~Sessions stay emptyDir (gated on `owner.kind == "job"`); one-line lift later.~~
+  **Lifted 2026-08-04:** the `owner.kind == "job"` gate is gone — `_pvc_name_for`
+  picks the prefix (`pvc-workspace` for jobs, `pvc-ws-thread` for sessions) and
+  both kinds are PVC-backed under the same flag. Session *agent* pods get their
+  own claim in `agent_provisioner` (`pvc-agent-s-<tid[:12]>`), also fail-closed.
 
 ### Phase 1 — GC discipline (the leak guard)
 
@@ -88,7 +108,9 @@ resumes the checkpoint — coherent by construction, no snapshot/restore dance.
 
 - `tests/test_container_provisioner.py` → `TestCreateWorkspacePvc` (4): PVC
   create+mount for jobs; emptyDir when disabled; session-skip (v1 scope);
-  fail-closed before pod on PVC error.
+  fail-closed before pod on PVC error. *(2026-08-04: the session-skip case was
+  inverted when sessions were PVC-backed — sessions now assert a
+  `pvc-ws-thread-*` claim, not its absence.)*
 - `tests/test_lifecycle_workspace_manager.py` → `TestDeleteTerminalPvc` (5),
   `TestGiveUpTerminal` (1), `TestReapOrphans` (7, incl. the DB-error-≠-gone
   safety case).
@@ -144,7 +166,10 @@ on the leader replica, not mocks.
    `{… 'orphans_reaped': 1}`. ✅
 5. **Mixed fleet** — the pre-existing emptyDir session pod was untouched (still
    emptyDir, no PVC ever created — v1 jobs-only honored); reaper handled both
-   kinds; zero PVCs leaked at the end. ✅
+   kinds; zero PVCs leaked at the end. ✅ *(Historical: as of 2026-08-04 a
+   session under the flag DOES get PVCs — two of them. The mixed-fleet property
+   this checked still holds, but it is now "PVC and emptyDir pods coexist
+   correctly", not "sessions are never PVC-backed".)*
 
 ---
 
@@ -297,8 +322,9 @@ branch, **no `rm -rf`, no clone**). This is the *inverse* of what the issue doc'
 **Tier-2 Option B** proposed ("force a fresh clone into the blanked box"): under
 PVC reattach (Option C) we **detect and preserve** the workspace instead of
 re-cloning it. Touches `agent.py:1835-1920` (and mirror the same gate in
-`api/persistent_session.py:346/421` only if/when sessions opt into PVCs — v1
-non-goal). **Risk:** changes resume behavior for *all* jobs, so it must land + be
+`api/persistent_session.py:346/421` — **sessions opted into PVCs on 2026-08-04,
+so that mirror is now live work, not a conditional**). **Risk:** changes resume
+behavior for *all* jobs, so it must land + be
 tested with G1 in place via the real recovery E2E — not blind.
 
 ### Verification — full pass (2026-06-29, after Option 1)
@@ -566,12 +592,20 @@ one wiring; Phase 1 closed the GC gap on the reconciler reap path.
 
 ## Non-goals (v1)
 
-- **Sessions** — stay emptyDir (brain in Postgres). One-line gate lift later.
+- ~~**Sessions** — stay emptyDir (brain in Postgres). One-line gate lift later.~~
+  **No longer a non-goal (2026-08-04):** the gate was lifted. Sessions are
+  PVC-backed under the same flag, two claims each (workspace pod + agent pod),
+  reclaimed only on thread **deletion**. See the reversal note at the top.
 - **VMs (branch b)** — different substrate (KubeVirt CDI DataVolume); separate
   effort. See [`workspace_pvc_backed_migration.md`](workspace_pvc_backed_migration.md) §Branch (b).
 - **Removing the S3 snapshot path** — kept as cross-node/DR backstop.
 - **Collapsing duplicated PVC plumbing** (`persistent_provisioner` vs
-  `container_provisioner`) — only relevant once sessions opt in.
+  `container_provisioner`) — ~~only relevant once sessions opt in~~ **now
+  relevant (2026-08-04)**: three PVC-creating helpers coexist
+  (`container_provisioner`, `agent_provisioner`, and the dormant
+  `persistent_provisioner`, whose `_create_pvc` still omits the
+  `srw.io/component=agent-workspace` label the reaper selects on). Still not
+  scheduled; noted so the divergence is not mistaken for design.
 
 ## Coupling — keep these docs in lockstep
 

@@ -34,6 +34,11 @@ How the **project self-improvement loop** ([[project_self_improvement_loop]]) ac
 >
 > **Successor proposed (2026-07-03):** [[loop_repo_compounding_v2]] — per-job branches for *all* roles + orchestrator squash-merge + jobs-repo-as-coordination-repo. Addresses Open Q5 (`main` bloat, confirmed live in run 7), the analysis-output loss, and replaces the SHA-compare no-op guard with a literal merge outcome. This v1 model stays live in code until v2 ships.
 
+> **Final successor (2026-08-04):** v2 is now also superseded. Every loop
+> member uses an isolated `job-<short-id>` repository; project files are
+> seeded from and applied back to the project cloud folder. See
+> [[project_jobs_repo_retirement]]. Everything below is historical rationale.
+
 ## Problem
 
 The loop's first real dev run ([[loop_review]], run 1, loop `27cabc53`) proved the *rotation* works — scholar proposes, critic selects, developer ships test-green code — but the loop **does not compound**:

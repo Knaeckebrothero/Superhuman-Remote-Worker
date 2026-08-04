@@ -1196,6 +1196,39 @@ async def test_start_rejects_campaign_caps_on_rotation():
     assert "campaign_caps" in e.value.detail
 
 
+@pytest.mark.asyncio
+async def test_start_rejects_project_without_cloud_folder():
+    from routers.project_loops import ProjectLoopStart, start_project_loop
+
+    project_id = str(uuid.uuid4())
+    body = ProjectLoopStart(max_iterations=3)
+    db = AsyncMock()
+    db.get_active_project_loop.return_value = None
+    db.get_project.return_value = {
+        "id": project_id,
+        "name": "No Cloud Yet",
+        "main_cloud_backend": None,
+        "main_cloud_folder_handle": None,
+    }
+    with ExitStack() as stack:
+        stack.enter_context(
+            patch(
+                "routers.project_loops.require_approved_user",
+                AsyncMock(return_value={"id": str(uuid.uuid4())}),
+            )
+        )
+        stack.enter_context(
+            patch("routers.project_loops.require_project_member", AsyncMock())
+        )
+        stack.enter_context(patch("main.postgres_db", db))
+        with pytest.raises(HTTPException) as e:
+            await start_project_loop(MagicMock(), project_id, body)
+
+    assert e.value.status_code == 409
+    assert "cloud folder" in e.value.detail
+    db.create_project_loop.assert_not_awaited()
+
+
 # =============================================================================
 # 5. P1 — checkpoint-only tool injection, kickoff blocks, notifications, tool
 # =============================================================================

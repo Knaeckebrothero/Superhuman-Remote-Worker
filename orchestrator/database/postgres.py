@@ -1454,6 +1454,86 @@ class PostgresDB:
                     logger.debug("prune_checkpoints_keep_last: skip (%s)", e)
         return total
 
+    async def create_job_change_record(
+        self,
+        *,
+        job_id: str,
+        project_id: str | None,
+        loop_id: str | None,
+        record_type: str,
+        role: str,
+        iteration: int | None,
+        status: str,
+        repo_name: str | None,
+        branch_name: str | None,
+        delivery_status: str,
+        delivery_ref: str | None,
+        delivery_sha: str | None,
+        completion_notes: str,
+        delivery_notes: list[str],
+        changes: list[dict[str, Any]],
+        error: str | None,
+    ) -> bool:
+        """Insert the immutable terminal history row for a job.
+
+        ``job_id`` is the primary key, so duplicate completion callbacks are a
+        no-op. The orchestrator records the outcome only after delivery status
+        is known; history never needs a read-modify-write update.
+        """
+        row = await self.fetchrow(
+            """
+            INSERT INTO job_change_records (
+                job_id, project_id, loop_id, record_type, role, iteration,
+                status, repo_name, branch_name, delivery_status, delivery_ref,
+                delivery_sha, completion_notes, delivery_notes, changes, error
+            ) VALUES (
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
+                $14::jsonb, $15::jsonb, $16
+            )
+            ON CONFLICT (job_id) DO NOTHING
+            RETURNING job_id
+            """,
+            UUID(str(job_id)),
+            UUID(str(project_id)) if project_id else None,
+            UUID(str(loop_id)) if loop_id else None,
+            record_type,
+            role,
+            iteration,
+            status,
+            repo_name,
+            branch_name,
+            delivery_status,
+            delivery_ref,
+            delivery_sha,
+            completion_notes,
+            json.dumps(delivery_notes),
+            json.dumps(changes),
+            error,
+        )
+        return row is not None
+
+    async def get_job_change_record(self, job_id: str) -> Dict[str, Any] | None:
+        row = await self.fetchrow(
+            "SELECT * FROM job_change_records WHERE job_id = $1",
+            UUID(str(job_id)),
+        )
+        return dict(row) if row else None
+
+    async def list_project_job_change_records(
+        self, project_id: str, *, limit: int = 200
+    ) -> List[Dict[str, Any]]:
+        rows = await self.fetch(
+            """
+            SELECT * FROM job_change_records
+            WHERE project_id = $1
+            ORDER BY created_at DESC
+            LIMIT $2
+            """,
+            UUID(str(project_id)),
+            limit,
+        )
+        return [dict(row) for row in rows]
+
     async def update_job_merge_status(
         self,
         job_id: str,
@@ -6067,6 +6147,17 @@ class PostgresDB:
                   AND COALESCE(
                       j.context->'cloud_baseline'->>'state', 'ready'
                   ) <> 'seeding'
+                  -- A loop baseline failure is fail-closed. Its spawn path
+                  -- marks the job/loop failed, but this guard closes the small
+                  -- race before that status write reaches the row. A missing
+                  -- baseline is allowed for legacy loop members created before
+                  -- project-cloud delivery became mandatory.
+                  AND NOT (
+                      COALESCE(j.context->>'loop_id', '') <> ''
+                      AND COALESCE(
+                          j.context->'cloud_baseline'->>'state', ''
+                      ) = 'failed'
+                  )
                   AND NOT EXISTS (
                       WITH RECURSIVE ancestors AS (
                           SELECT parent_job_id
@@ -9430,6 +9521,40 @@ class PostgresDB:
             "SELECT * FROM project_experts WHERE project_id = $1 AND expert_id = $2",
             UUID(str(project_id)),
             UUID(str(expert_id)),
+        )
+        return dict(row) if row else None
+
+    async def list_project_linked_experts(
+        self, project_id: str
+    ) -> List[Dict[str, Any]]:
+        """List DB-backed experts explicitly linked to one project."""
+        rows = await self.fetch(
+            """
+            SELECT e.*, pe.default_for, pe.config_override AS project_config_override
+            FROM project_experts pe
+            JOIN experts e ON e.id = pe.expert_id
+            WHERE pe.project_id = $1
+            ORDER BY e.display_name ASC, e.created_at ASC
+            """,
+            UUID(str(project_id)),
+        )
+        return [dict(row) for row in rows]
+
+    async def get_project_linked_expert(
+        self, project_id: str, expert_ref: str
+    ) -> Dict[str, Any] | None:
+        """Resolve a linked DB expert by UUID or stable name."""
+        row = await self.fetchrow(
+            """
+            SELECT e.*, pe.default_for, pe.config_override AS project_config_override
+            FROM project_experts pe
+            JOIN experts e ON e.id = pe.expert_id
+            WHERE pe.project_id = $1
+              AND (e.id::text = $2 OR e.name = $2)
+            LIMIT 1
+            """,
+            UUID(str(project_id)),
+            expert_ref,
         )
         return dict(row) if row else None
 
