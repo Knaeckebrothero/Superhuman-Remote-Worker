@@ -121,6 +121,14 @@ export interface JobSummary {
   /** Mode B export marker — set when "Export to shared folder" succeeds. */
   exported_at?: string | null;
   /**
+   * Backend-resolved browser URL of that export folder (the stored handle is
+   * opaque, so only the orchestrator can build it). Drives the "Open cloud
+   * folder" button that replaces "Export to cloud" once `exported_at` is set;
+   * null when the cloud backend is down, in which case the row falls back to a
+   * plain "Exported" badge.
+   */
+  exported_folder_url?: string | null;
+  /**
    * Backend-computed cloud-review routing (job_cloud_export.md). `'open_folder'`
    * (loose / default-project / no-cloud-folder jobs) shows the "Open cloud
    * folder" button; `'diff'` jobs route to the Mode A diff-review instead.

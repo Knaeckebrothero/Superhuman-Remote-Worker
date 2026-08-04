@@ -29,6 +29,29 @@ interface JobRow {
 }
 
 /**
+ * Which Mode B cloud affordance a row offers, if any.
+ *
+ * `'export'` and `'open'` are deliberately two separate actions rather than one
+ * button that exports-then-opens: the export routinely runs longer than the ~5s
+ * of transient user activation a browser grants a click, so opening from its
+ * completion callback gets swallowed by the popup blocker. `'exported'` is the
+ * degraded state — the export happened but the cloud backend can't currently
+ * hand us a URL, so there's nothing to link to.
+ */
+export type JobCloudAction = 'none' | 'export' | 'open' | 'exported';
+
+/** Pure decision helper for the above — exported for unit tests, and shared by
+ *  the wide-layout button row and the narrow-layout overflow menu so the two
+ *  can't drift. */
+export function jobCloudAction(job: JobSummary): JobCloudAction {
+  if (job.status !== 'completed' || job.cloud_review_mode !== 'open_folder') {
+    return 'none';
+  }
+  if (!job.exported_at) return 'export';
+  return job.exported_folder_url ? 'open' : 'exported';
+}
+
+/**
  * Job List component that displays jobs with filtering and actions.
  */
 @Component({
@@ -265,8 +288,13 @@ interface JobRow {
                         @if (row.job.status === 'completed' && !row.job.project_id) {
                           <app-menu-item (activated)="togglePromote(row.job.id)">{{ 'jobs.action.promote' | transloco }}</app-menu-item>
                         }
-                        @if (row.job.status === 'completed' && row.job.cloud_review_mode === 'open_folder' && !row.job.exported_at) {
-                          <app-menu-item (activated)="exportJobToSharedFolder(row.job.id)">{{ 'jobs.action.exportToCloud' | transloco }}</app-menu-item>
+                        @switch (cloudAction(row.job)) {
+                          @case ('export') {
+                            <app-menu-item (activated)="exportJobToSharedFolder(row.job.id)">{{ 'jobs.action.exportToCloud' | transloco }}</app-menu-item>
+                          }
+                          @case ('open') {
+                            <app-menu-item (activated)="openExportedFolder(row.job)">{{ 'jobs.action.openCloudFolder' | transloco }}</app-menu-item>
+                          }
                         }
                         @if (row.job.status !== 'processing' && row.job.status !== 'paused' && row.job.status !== 'reviewing' && row.job.status !== 'waiting') {
                           <app-menu-item tone="danger" (activated)="askDelete(row.job)">{{ 'jobs.action.delete' | transloco }}</app-menu-item>
@@ -372,8 +400,8 @@ interface JobRow {
                         {{ 'jobs.action.promote' | transloco }}
                       </app-button>
                     }
-                    @if (row.job.status === 'completed' && row.job.cloud_review_mode === 'open_folder') {
-                      @if (!row.job.exported_at) {
+                    @switch (cloudAction(row.job)) {
+                      @case ('export') {
                         <app-button
                           variant="secondary"
                           size="sm"
@@ -383,7 +411,18 @@ interface JobRow {
                         >
                           {{ 'jobs.action.exportToCloud' | transloco }}
                         </app-button>
-                      } @else {
+                      }
+                      @case ('open') {
+                        <app-button
+                          variant="secondary"
+                          size="sm"
+                          [ariaLabel]="'jobs.tooltip.openCloudFolder' | transloco"
+                          (clicked)="openExportedFolder(row.job); $event.stopPropagation()"
+                        >
+                          {{ 'jobs.action.openCloudFolder' | transloco }}
+                        </app-button>
+                      }
+                      @case ('exported') {
                         <app-badge tone="success" size="sm">
                           {{ 'jobs.action.exported' | transloco }}
                         </app-badge>
@@ -1460,6 +1499,13 @@ export class JobListComponent implements OnInit, OnDestroy {
     });
   }
 
+  /**
+   * Export (copy the deliverables into a cloud folder) — deliberately does NOT
+   * open the folder. The export routinely takes >5s, which is the lifetime of
+   * the browser's transient user activation, so a `window.open` in this
+   * callback gets swallowed by the popup blocker. Opening is a second, separate
+   * click on the button this refresh reveals ({@link openExportedFolder}).
+   */
   exportJobToSharedFolder(jobId: string): void {
     const next = new Set(this.exportingJobIds());
     next.add(jobId);
@@ -1469,15 +1515,28 @@ export class JobListComponent implements OnInit, OnDestroy {
       next: (result) => {
         this.removeExporting(jobId);
         if (result) {
-          const url = result.folder?.browser_url;
-          if (url) {
-            window.open(url, '_blank', 'noopener');
-          }
+          // Re-fetch so exported_at / exported_folder_url land on the row and
+          // the button flips to "Open cloud folder".
           this.refresh();
         }
       },
       error: () => this.removeExporting(jobId),
     });
+  }
+
+  /** Template binding for {@link jobCloudAction}. */
+  cloudAction(job: JobSummary): JobCloudAction {
+    return jobCloudAction(job);
+  }
+
+  /** Open an already-exported job's cloud folder. Runs synchronously inside
+   *  the click handler, so the browser still sees user activation and won't
+   *  treat the new tab as an unsolicited popup. */
+  openExportedFolder(job: JobSummary): void {
+    const url = job.exported_folder_url;
+    if (url) {
+      window.open(url, '_blank', 'noopener');
+    }
   }
 
   private removeExporting(jobId: string): void {

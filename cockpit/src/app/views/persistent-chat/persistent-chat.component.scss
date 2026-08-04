@@ -64,16 +64,26 @@
         display: flex;
         align-items: center;
         justify-content: space-between;
+        gap: 12px;
         padding: 10px 16px;
         border-bottom: 1px solid var(--border-color, var(--surface-0));
         background: var(--panel-bg);
         flex-shrink: 0;
       }
 
+      // The title yields, the actions don't. `min-width: 0` is load-bearing:
+      // without it this group's automatic minimum is its min-content width, and
+      // because the title is `white-space: nowrap` that min-content IS the whole
+      // title. The group then refuses to shrink at all and shoves .header-right
+      // past the pane edge, where the split area's overflow silently clips it —
+      // the buttons neither move nor resize, they just stop being reachable.
       .header-left {
         display: flex;
         align-items: center;
         gap: 8px;
+        flex: 1 1 auto;
+        min-width: 0;
+        overflow: hidden;
       }
 
       .back-link {
@@ -198,10 +208,14 @@
         transform: rotate(180deg);
       }
 
+      // Never shrink: a half-width button row is worse than a folded one, and
+      // the component's ResizeObserver folds these into the `⋮` menu once the
+      // title can no longer give up the space (see `headerCompact`).
       .header-right {
         display: flex;
         align-items: center;
         gap: 8px;
+        flex: 0 0 auto;
       }
 
       .settings-btn {

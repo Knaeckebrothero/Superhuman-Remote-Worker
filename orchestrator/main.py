@@ -8840,6 +8840,33 @@ def _redact_nested_workspace_state(
     return result
 
 
+def _resolve_exported_folder_url(handle_str: str | None) -> Optional[str]:
+    """Browser URL for a job's Mode B export folder, or None.
+
+    The job row stores only the opaque handle, so without this the cockpit has
+    no way to re-open the folder after the export response is gone (a reload,
+    or a popup the browser blocked). Jobs carry no per-row backend column —
+    unlike threads, which is why this doesn't reuse
+    :func:`_resolve_cloud_session_url` — so the discriminator comes from the
+    serialized handle itself, falling back to the active backend for the bare
+    legacy form. Pure URL construction, no I/O.
+    """
+    if not handle_str:
+        return None
+    backend = main_cloud_router.for_backend(None)
+    if not backend.is_initialized:
+        return None
+    try:
+        handle = SessionFolderHandle.from_db(handle_str, backend=backend.backend_id)
+        if handle.backend != backend.backend_id:
+            backend = main_cloud_router.for_backend(handle.backend)
+            if not backend.is_initialized:
+                return None
+        return backend.get_session_folder_browser_url(handle)
+    except Exception:
+        return None
+
+
 def _with_cloud_review_mode(job: dict[str, Any]) -> dict[str, Any]:
     """Attach the computed ``cloud_review_mode`` and drop the raw join column.
 
@@ -8851,10 +8878,17 @@ def _with_cloud_review_mode(job: dict[str, Any]) -> dict[str, Any]:
     ``services/job_cloud_baseline.py``. ``project_has_cloud_folder`` is computed
     by the ``LEFT JOIN projects`` in the postgres read queries; we pop it so the
     raw column never leaves over REST.
+
+    Also resolves ``exported_folder_handle`` into a ready-to-open
+    ``exported_folder_url`` for the same reason: handles are opaque to
+    everything outside the owning backend, so the cockpit can't derive it.
     """
     job = dict(job)
     job["cloud_review_mode"] = (
         "diff" if job.pop("project_has_cloud_folder", False) else "open_folder"
+    )
+    job["exported_folder_url"] = _resolve_exported_folder_url(
+        job.get("exported_folder_handle")
     )
     return job
 
@@ -17518,6 +17552,24 @@ async def export_job_to_shared_folder(request: Request, job_id: str) -> dict[str
         )
         if resolved_user_id:
             await backend.share_session_folder(folder_handle, resolved_user_id)
+        else:
+            # Not fatal — the files still land in the agent's cloud home and a
+            # later re-sync shares them once the account exists. But it IS the
+            # difference between "the folder opens" and "the folder 404s", so
+            # say so loudly here and hand the caller a `shared: false` it can
+            # surface. Backends that cannot provision accounts themselves
+            # (Nextcloud: user_oidc materialises the account on the user's
+            # first browser login) resolve to None until the user has signed
+            # in to the cloud at least once.
+            logger.warning(
+                "Mode B export: no %s account for user %s (email=%r) — folder "
+                "%s created but NOT shared; the user must sign in to the cloud "
+                "once before it becomes visible to them",
+                backend.backend_id,
+                user.get("id"),
+                user.get("email"),
+                folder_session_id,
+            )
     except CloudBackendError as e:
         logger.exception("Mode B export: folder provisioning failed for job %s", job_id)
         raise HTTPException(
@@ -17633,6 +17685,10 @@ async def export_job_to_shared_folder(request: Request, job_id: str) -> dict[str
     return {
         "job_id": job_id,
         "files_copied": files_copied,
+        # False = copied, but the folder is not visible to the caller yet (see
+        # the ensure_user miss above). The cockpit turns this into a distinct
+        # toast instead of claiming an unqualified success.
+        "shared": bool(resolved_user_id),
         "folder": {
             "name": folder_session_id,
             "browser_url": backend.get_session_folder_browser_url(folder_handle),

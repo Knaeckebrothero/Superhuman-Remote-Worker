@@ -16,6 +16,12 @@ related:
   - "[[job_resume_direct_path_skips_credential_injection]]"
   - "[[resume_never_provisions_a_missing_workspace]]"
   - "[[subjob_inherits_stale_workspace_container_snapshot]]"
+  - "[[overnight_minimax_m3_scholar_batch_2026-08-03]]"
+  - "[[job_runtime_containment_gap]]"
+  - "[[project_scoped_memory_deadlocks_under_parallel_jobs]]"
+  - "[[embedding_batch_overflow_skips_citation_source_embeddings]]"
+  - "[[minimax_m3_auxiliary_structured_output_flaps]]"
+  - "[[phase_boundary_tags_are_moved_then_rejected_by_remote]]"
 ---
 
 # Live MCP Scholar smoke test: default jobs cannot reach Git, while the virtual control writes its report and loops until cancelled
@@ -23,16 +29,25 @@ related:
 **Filed:** 2026-08-03 after a live MCP smoke test against the deployed SRW
 environment.
 
-**Status:** **PARTIALLY REMEDIATED IN THIS CHECKOUT; LIVE ACCEPTANCE PENDING.**
-The failure chain is reproduced and bounded. P0-A (MCP/start-path provisioning)
-and P0-B (SSH configuration/authentication readiness) were implemented on
-2026-08-03. A same-day local k3d acceptance run proved that the diagnostics are
-active, but also exposed a local-dev key-mode failure in the new SSH handshake.
-The remote connector still advertised the old MCP contract after it came back
-online. Functional P0-C/P0-D findings remain open; runtime containment is
-preserved separately in `job_runtime_containment_gap.md` and deliberately
-follows the correctness-first acceptance gate. Five diagnostic job records were
-left intact.
+**Status:** **MAIN-CLUSTER GIT PATH ACCEPTED (5/5); MCP CONTRACT, DELEGATION,
+AND PAPER-PROVIDER DEFECTS REMAIN.**
+
+The original failure chain was reproduced and its standard main-cluster path is
+now functionally recovered. P0-A (MCP/start-path provisioning) and P0-B (SSH
+configuration/authentication readiness) were implemented on 2026-08-03. On
+2026-08-03/04, five fresh project Scholar jobs then automatically dispatched on
+the main cluster, used ordinary sandbox workspaces, completed without operator
+intervention, pushed their exact reports to five isolated job branches, and left
+project `main` unchanged. That closes the normal success-path and original
+wrong-tree acceptance questions for this batch.
+
+It does **not** yet prove the exact requeue/resume credential-restoration path or
+the server-enforced required-deliverable gate. The connector still advertises
+the old MCP contract, the local k3d projected-key mode remains a development
+quirk, `delegation.enabled=false` is not a real capability gate, and the paper
+providers are broken in the deployed environment. Runtime containment remains
+separate in `job_runtime_containment_gap.md`; the successful batch now supplies
+its first main-cluster Scholar baseline.
 
 **Severity:**
 
@@ -46,19 +61,21 @@ left intact.
   live messaging requires a pre-existing thread, and progress/todo/config
   reporting did not describe the live run.
 
-This is a current live acceptance failure, not a claim that every symptom has one
-root cause. The sandbox SSH failure's immediate cause is now confirmed in source:
+This began as a live acceptance failure, not a claim that every symptom had one
+root cause. The sandbox SSH failure's immediate cause was confirmed in source:
 the resume dispatcher reconstructed only the container host and port, omitting
 the deliberately non-persisted username, private-key path, and workspace path.
-The deployed key pair must still pass the new authenticated readiness gate in the
-live acceptance run; no secret material was inspected to reach this conclusion.
+The main-cluster key pair subsequently passed the authenticated readiness gate
+on all five fresh overnight jobs. The requeue/resume identity-restoration path
+still needs its own targeted acceptance run; no secret material was inspected
+to reach either conclusion.
 
 ---
 
 ## 1. Executive verdict
 
-No Scholar job completed end to end. Three attempts isolated three different
-layers:
+At the time of the initial 2026-08-03 test, no Scholar job completed end to end.
+Three attempts isolated three different layers:
 
 | Attempt | Job | Backend/path | Terminal result | Runtime evidence | Gitea result |
 |---|---|---|---|---|---|
@@ -84,6 +101,10 @@ What the experiment does establish:
    loop indefinitely.
 4. Work written in the virtual workspace can be left outside Gitea and outside
    the deployed operator read surface when a job is interrupted.
+
+The later five-job acceptance in section 14 supersedes the first two statements
+for the normal fresh-dispatch path; this historical table remains the evidence
+that led to the corrections.
 
 ---
 
@@ -129,8 +150,8 @@ still be proven against the actual connector target after deployment.
 | # | Finding | Confidence | Priority |
 |---|---|---|---|
 | F1 | The deployed MCP surface is stale/internally contradictory: it omits a source-defined deliverable parameter and describes a Gitea reader as a local-workspace reader | Confirmed from live schema + checkout | P1 |
-| F2 | The MCP creation response tells callers to use `assign_job`, but manual assignment bypasses the only sandbox provisioning stage | Confirmed; fixed in checkout, live acceptance pending | P0 |
-| F3 | A requeued sandbox job used the resume path, which restored host/port but omitted its non-persisted SSH identity fields, producing `No authentication methods available` | Root cause confirmed; fixed in checkout, live acceptance pending | P0 |
+| F2 | The MCP creation response told callers to use `assign_job`, while manual assignment bypassed the only sandbox provisioning stage | Fixed in checkout; automatic start accepted 5/5, admin override still needs a targeted live check | P0 |
+| F3 | A requeued sandbox job used the resume path, which restored host/port but omitted its non-persisted SSH identity fields, producing `No authentication methods available` | Root cause fixed in checkout; fresh SSH accepted 5/5, requeue/resume acceptance still pending | P0 |
 | F4 | Sandbox SSH failures are logged as “VM workspace unavailable” and consume the generic three-attempt recovery budget | Confirmed; fixed in checkout | P1 |
 | F5 | Scholar-specific initialization forces five strategic process tasks and asks for a 10–20-todo phase even for a bounded one-file answer | Confirmed live + config | P1 |
 | F6 | Enforced skill-read gates caused predictable failed calls and extra LLM turns before both todo creation and citation | Confirmed in audit + config | P1 |
@@ -140,12 +161,26 @@ still be proven against the actual connector target after deployment.
 | F10 | The virtual report is proven written but never exported to Gitea and is unavailable through both deployed MCP readers after cancellation | Confirmed visibility failure; physical deletion not proven | P1 |
 | F11 | `pause_job` is a preemption primitive that immediately re-enters dispatch, while its MCP description reads like an operator hold | Confirmed live + code | P1 operator control |
 | F12 | There was no usable live steer/interrupt channel because `send_message_to_job` requires a thread ID and the job had no message thread | Confirmed live | P2 |
-| F13 | The original wrong-tree/worktree concern remains untested because neither Git-backed run reached Git | Confirmed limitation | Acceptance blocker |
+| F13 | The original runs never reached Git, leaving the wrong-tree/worktree concern untested | Closed for the fresh path: five isolated job branches passed; resume remains separate | Acceptance passed |
 | F14 | The local k3d authenticated readiness gate correctly rejected the SSH key, but for a chart/dev-runtime incompatibility already described in chart comments: the root-running dev orchestrator invoked OpenSSH on a root-owned `0444` projected key | Confirmed local + source | P0 local acceptance |
 | F15 | `delegation.enabled=false` persisted in the resolved local config but did not remove or disable `spawn_subagent`; the model ignored the textual prohibition and launched three readers (33 additional LLM calls) | Confirmed local + source | P1 cost / contract |
 | F16 | Local Tavily calls were real provider errors caused by broken k3d external DNS, but `_direct_web_search` discarded the response's `error` field and reported a successful “No web results found” observation | Confirmed local provider probe + CoreDNS logs + source | P1 error semantics |
 | F17 | `search_papers` is incompatible with installed `arxiv==4.0.0`: source calls removed `Search.results()` instead of `Client.results(search)` | Confirmed local runtime + source | P1 tool function |
 | F18 | The local Scholar retried empty/broken research tools from main calls 37-55, including exact duplicate queries, and consumed 1.63M raw tokens before operator cancellation; the configured 120-tool budget and current warning-only loop detector did not contain it in time | Confirmed local audit | P0 cost / P1 function |
+| F19 | Five fresh main-cluster Scholar jobs automatically provisioned/authenticated, completed, and pushed exact deliverables to isolated job branches; project `main` was unchanged | Confirmed live, 5/5 | P0 recovery passed |
+| F20 | `delegation.enabled=false` still leaves `spawn_subagent` in the bound tool definitions; the two disabled jobs made no calls only because the model obeyed prose | Confirmed live prompt/audit | P1 capability contract |
+| F21 | The generic transition todo says the stop condition comes first while requiring todo 1's review to have completed; two jobs repeated successful Git/file checks for 53 and 62 parent rounds before context compaction broke the attractor | Confirmed live + template | P1 overhead / completion risk |
+| F22 | One-shot skill delivery replaced continuous reinjection, but the passive `verify-before-done` gate rejected 50 completion calls because MiniMax repeatedly retried instead of reading the named skill | Confirmed live audit | P1 overhead; gate remained safe |
+| F23 | Main-cluster Tavily worked under heavy use; the paper job still reproduced the arXiv 4 adapter error and Semantic Scholar HTTP 403, then recovered through web/arXiv pages | Confirmed live | P1 paper-tool function |
+| F24 | The connector schema remains stale after the successful batch: no `required_deliverables`, obsolete manual-assignment copy, and incorrect `get_workspace_file` semantics | Confirmed from current connector schema | P1 deployment contract |
+| F25 | Citation traceability is inconsistent across successful reports: 1,083 registered sources produced 236 engine citations, while two reports used manual links with zero or near-zero engine citation coverage | Confirmed live stats/report reads | P1 quality contract |
+| F26 | CitationEngine skipped 380 auto-embedding attempts covering 359 unique source IDs; 374 exceeded the embedding backend's 64-input limit, while the source still counted as registered | Confirmed archived worker logs + source | P1 search/evidence quality |
+| F27 | Five concurrent jobs sharing one project produced 138 contained memory-retrieval deadlocks; per-turn project-wide TTL/access writes contend on the same rows and shared TTL is decremented once per consumer | Confirmed archived worker logs + source | P1 concurrency/context quality |
+| F28 | MiniMax-M3 failed 75 memory-extraction and 19 memory-assembly structured outputs, causing ten auxiliary degraded/recovered cycles while main jobs continued | Confirmed archived worker logs | P2 quality/overhead |
+| F29 | Every job logged `checkpoint.db not found` at all three phase snapshots (15 total), so the successful fresh path does not prove snapshot-backed resume | Confirmed archived worker logs | P1 recovery durability |
+| F30 | Two jobs force-moved an already-pushed tactical tag; seven `git push --tags` calls were rejected and the remote phase tag remained behind the final branch history | Confirmed archived logs/Gitea/source | P1 phase evidence |
+| F31 | One web extraction crashed on a string response (`.get` assumption), and two PDF sources could not register because NUL bytes reached PostgreSQL text | Confirmed archived worker logs | P2 provider/source ingestion |
+| F32 | MCP `list_llm_requests` does not expose the REST endpoint's `call_type`/`status`/`error` filters or render those fields, so batch token totals exclude/unidentify auxiliary failures | Confirmed connector output + source | P2 telemetry/MCP completeness |
 
 ---
 
@@ -636,16 +671,18 @@ Ceremony reduction and runtime ceilings follow once successful-job baselines
 exist. A costly job that completes correctly is acceptable during recovery; an
 efficient job that produces no usable deliverable is not.
 
-### P0-A — make every start path provision-aware — implemented, live gate open
+### P0-A — make every start path provision-aware — standard main path accepted
 
 - [x] Stop telling ordinary MCP callers to use the admin manual-assign override.
 - [x] Route a workspaceless manual assignment back through the dispatcher.
 - [x] Share the sandbox SSH config builder across start/resume and reuse the
   dispatcher's missing-workspace preflight for the admin path.
+- [x] Prove automatic provisioning/assignment on five concurrent fresh
+  main-cluster project jobs without `assign_job`.
 - [ ] Refresh the deployed MCP schema/tool cache and prove revision 2 in live
   acceptance.
 
-### P0-B — validate SSH authentication, not just workspace readiness — implemented, live gate open
+### P0-B — validate SSH authentication, not just workspace readiness — main path accepted; targeted resume/local gates open
 
 - [x] Calculate the non-secret private-key fingerprint and prove authorized-key
   parity with a real authenticated command.
@@ -654,19 +691,27 @@ efficient job that produces no usable deliverable is not.
   independently validate/connect from the worker at initialization.
 - [x] Classify deterministic authentication failures separately and fail once
   with a useful backend-specific message.
+- [x] Pass the ordinary main-cluster worker-to-workspace path on five fresh
+  sandbox jobs.
+- [ ] Target the requeue/resume path specifically so restored non-persisted SSH
+  identity fields are proven rather than inferred from a fresh dispatch.
 - [ ] Stage the projected key into a runtime-owned `0600` identity in local and
   deployed environments, then pass the authenticated k3d workspace handshake.
 
-### P0-C — restore the research-to-Git result path — immediate
+### P0-C — restore the research-to-Git result path — main web path accepted; paper tools open
 
-- [ ] Restore k3d external DNS and prove one Tavily request from the agent pod.
+- [x] Prove real Tavily/web retrieval from main-cluster agent pods (the web job
+  alone completed 155 searches and 26 extracts).
+- [ ] Restore k3d external DNS and prove one Tavily request from the local agent
+  pod if local acceptance remains a required development gate.
 - [ ] Preserve Tavily/provider failures as typed errors instead of successful
   empty result sets.
 - [ ] Update the paper-search adapter for the installed arXiv client and prove a
   real query.
-- [ ] Complete a Scholar report, commit and push it to the exact assigned job
-  branch, and reach the orchestrator-owned terminal state.
-- [ ] Read that committed report back through MCP/Gitea.
+- [x] Complete five Scholar reports, commit and push each to its exact assigned
+  job branch, and reach the orchestrator-owned terminal state.
+- [x] Read all five committed reports back through MCP/Gitea and prove `main`
+  was unchanged.
 
 These are the current release blockers. Call count, token count, phase ceremony,
 and redundant-but-progressing work are observations during this gate, not reasons
@@ -674,9 +719,10 @@ to reject an otherwise correct result.
 
 ### P0-D — make successful required artifacts durable and readable — immediate
 
-- Ensure normal finalization exports every required file before terminal success.
-- Read the file from the exact committed job ref through the operator-facing MCP
-  surface.
+- [x] Demonstrate that normal finalization exports the natural-language-declared
+  report before terminal success on five jobs.
+- [x] Read each file from the exact committed job ref through the
+  operator-facing MCP surface.
 - Refuse terminal success when a declared required deliverable is absent from
   that ref.
 - Separate live-workspace and committed-Gitea readers in names and descriptions.
@@ -745,6 +791,14 @@ because those numbers are inefficient. Once the report passes the gate above,
 use those observations as the baseline for the bounded-Scholar and containment
 follow-ups. True operator hold and interrupted-artifact recovery receive their
 own acceptance runs; neither replaces this successful-completion proof.
+
+**2026-08-04 gate result:** items 2, 3, 4 (through Tavily/web), 5, 6, 8,
+and 9 passed across five jobs. Item 1 remains blocked by the stale connector
+schema, and item 7 remains semantically ambiguous because the connector still
+describes the committed-repo reader as a live local-workspace reader. The paper
+provider half of item 4 failed, but the agent recovered through an authoritative
+alternative. See section 14 and
+`overnight_minimax_m3_scholar_batch_2026-08-03.md`.
 
 ---
 
@@ -1048,3 +1102,161 @@ keys. Worker, Scholar, Product QA, and Designer bindings have been migrated; the
 interactive Designer's unimplemented `on_setup` trigger is now a
 `before_tool:write_file` read gate. Both runtime/Cockpit schemas describe the
 bounded contract.
+
+## 14. Main-cluster overnight acceptance (2026-08-03/04)
+
+Five project-scoped MiniMax-M3 Scholar jobs were scheduled through the live MCP
+after the preceding corrections. The full per-job ledger, task text, report
+assessment, requests, and citation counts are preserved in
+`overnight_minimax_m3_scholar_batch_2026-08-03.md`.
+
+### 14.1 Functional result
+
+| Variant | Job | Result | Branch | Required report |
+|---|---|---|---|---|
+| no-delegation control | `66e5878c-3968-4e43-bd1d-9eaf2a97d315` | `completed` | `job/66e5878c` | present |
+| light readers, 10 iterations | `cb847a4b-b315-4a55-9387-8e28e2229b48` | `completed` | `job/cb847a4b` | present |
+| light readers, 24 iterations | `96bb50c2-51d3-4a6b-ac39-e808582d389c` | `completed` | `job/96bb50c2` | present |
+| paper-provider isolation | `44d67053-d203-4a66-a9f6-3e4d140567f6` | `completed` | `job/44d67053` | present |
+| current web/platform research | `90c74b6a-f69d-4a58-afa5-9b93c4c71877` | `completed` | `job/90c74b6a` | present |
+
+All five:
+
+- queued through automatic dispatch without `assign_job`;
+- began LLM work within the same 20-second interval, proving concurrent worker
+  capacity;
+- passed the ordinary main-cluster sandbox/SSH path;
+- produced substantive 23.8k–90.6k-character reports;
+- committed and pushed to their exact isolated job branches;
+- left project `main` and the other four job branches free of their report; and
+- were read back through the Git-backed MCP file API.
+
+This closes F13 for the fresh main-cluster path: the original wrong-tree,
+nested-repository, unpushed-local-commit, and cross-job-clobber concerns did not
+recur. It also isolates F14 as a k3d development-runtime/key-projection issue,
+not evidence that the main cluster currently cannot authenticate.
+
+The acceptance is not server-contract complete. The jobs named their reports in
+task prose; the live connector still omits `required_deliverables`. A final
+contract run must create a new job through the refreshed schema and prove the
+orchestrator refuses terminal success when that Gitea path is absent.
+
+### 14.2 Research and delegation defects still live
+
+The main web path did not reproduce the local Tavily/DNS failure. The five jobs
+contained no empty-result/DNS/connection error, and the web job successfully
+issued 155 searches plus 26 extracts. Provider error laundering still warrants
+its source fix, but local DNS is not a main-cluster release blocker on this
+evidence.
+
+The paper job reproduced F17 in the deployed environment: four arXiv searches
+and two arXiv lookups failed on `Search.results()`, while three Semantic Scholar
+searches returned HTTP 403. The Scholar adapted through web retrieval of arXiv
+pages and disclosed the limitation. The report's success is evidence for agent
+resilience, not for paper-tool correctness.
+
+F15 is also reconfirmed. In both jobs configured with
+`delegation.enabled=false`, the bound LLM tool definitions still contained
+`spawn_subagent`. Neither model invoked it, but only because it followed the
+text instruction. The enabled jobs spawned 14, 23, and 66 reader LLM calls and
+all readers returned naturally; no reader hit its configured iteration/token/
+time cap. This batch therefore does not support replacing the light readers or
+raising their default cap. It supports enforcing the existing `enabled` flag at
+tool resolution and invocation.
+
+### 14.3 Completion overhead after the report was already safe
+
+The batch made 628 LLM requests (525 parent and 103 reader), consumed
+58,774,707 raw prompt+completion tokens, and emitted 1,536 tool calls. Those
+figures were not functional acceptance limits. They are now a successful-job
+baseline.
+
+The retired manifest and continuous skill injection stayed retired. A new,
+narrower transition problem remained:
+
+- transition todo 1 requires a Git-backed review and quality confirmation;
+- transition todo 2 says its stop condition comes first, but allows completion
+  only after todo 1 confirmed quality; and
+- the active todo bodies are injected every turn.
+
+The 10- and 24-turn agentic-RAG jobs therefore spent 62 and 53 parent rounds,
+respectively, between the tactical-complete commit and completing transition
+todo 1. The two windows consumed 17.93M raw tokens and 360 tool calls, dominated
+by unchanged `file_exists`, `git_tags`, `git_diff`, `search_files`, and
+`list_files` results. Tool calls succeeded; the models repeatedly announced
+that they would check the stop condition first and review second. Both escaped
+immediately after context compaction reduced the next prompt from roughly
+200k-plus to roughly 20k tokens.
+
+This is live confirmation of P-2 in
+`phase_model_overhead_amnesia_loop.md`, not a resurrection of the deleted
+manifest. The fast path should reconcile an orchestrator/Git artifact fact with
+completed todos, then review/complete in dependency order. It should not ask the
+model to perform a prerequisite “first” while stating that the prerequisite
+depends on a different pending todo.
+
+The action-gated verification skill also rejected 50 completion calls across the
+five jobs before the model performed a valid phase-scoped skill read. The gate
+remained safe and was not continuously injected, but the current corrective
+error is not sufficient for this model. Improve the recovery interaction without
+weakening the proof requirement.
+
+### 14.4 Archived worker-log findings
+
+The audit-store trace did not contain every subsystem failure. A full
+WARNING/ERROR sweep of the five archived pod logs found:
+
+- 380 CitationEngine auto-embed failures across 359 unique sources (374
+  deterministic batches over the backend maximum of 64, plus five non-finite
+  vectors and one overload response);
+- 138 contained project-memory retrieval deadlocks, five TTL deadlocks, four
+  TTL timeouts, and 17 failed retrieval-message writes while the five jobs
+  shared one project memory scope;
+- 94 auxiliary structured-output validation failures and ten explicit
+  MiniMax-M3 degraded/recovered cycles;
+- 15 missing-checkpoint warnings—three phase snapshots per job had no
+  `checkpoint.db`;
+- seven rejected phase-tag pushes across two jobs after a local force-move of an
+  existing remote tag;
+- one web extractor response-shape exception; and
+- two PDF source registrations rejected because NUL bytes reached a PostgreSQL
+  text field.
+
+These failures were non-fatal by design or accident; all reports still
+completed. They nevertheless mean that terminal job success is not a health
+signal for memory, source indexing, auxiliary extraction, snapshot recovery, or
+phase-tag evidence.
+
+Dedicated issue records:
+
+- `project_scoped_memory_deadlocks_under_parallel_jobs.md`;
+- `embedding_batch_overflow_skips_citation_source_embeddings.md`;
+- `minimax_m3_auxiliary_structured_output_flaps.md`; and
+- `phase_boundary_tags_are_moved_then_rejected_by_remote.md`.
+
+The MCP-visible 58.77M raw-token figure covers the rendered main/light-reader
+request list and is a lower bound. The connector does not pass through or render
+the REST request-list fields needed to identify and total the auxiliary calls
+that produced the log failures.
+
+### 14.5 Updated priority boundary
+
+The ordinary main-cluster job path now produces durable results. Remaining work
+should be ordered as follows:
+
+1. **Functional:** refresh the MCP schema and prove a real
+   `required_deliverables` contract; enforce delegation disablement; repair the
+   arXiv and Semantic Scholar adapters.
+2. **Shared context/evidence:** eliminate project-memory deadlocks and
+   per-consumer TTL corruption, split embedding batches, make source-index
+   coverage visible, and keep phase tags immutable/exact.
+3. **Auxiliary/provider quality:** route structured tasks to a compatible model,
+   expose auxiliary accounting, and normalize web/PDF ingestion failures.
+4. **Efficiency:** implement the conditional transition fast path and improve
+   passive skill-gate recovery; then tune Scholar/source budgets.
+5. **Containment:** add shadow no-progress telemetry using this batch as the
+   successful baseline before arming holds or ceilings.
+
+The local k3d `0444` projected-key issue can remain deferred unless local
+sandbox acceptance itself becomes a required release gate. It no longer blocks
+the main-cluster correctness result.
