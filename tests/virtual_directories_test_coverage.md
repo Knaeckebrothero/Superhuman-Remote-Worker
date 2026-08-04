@@ -52,7 +52,29 @@ it.
 
 ## 2. Not covered — and how to close each gap
 
-### 2.1 Cloud sync end-to-end (the PII-leak scenario) — **highest priority**
+### 2.1 Cloud sync end-to-end (the PII-leak scenario) — **CLOSED 2026-08-04, local k3d**
+
+Run via Cockpit (Playwright-driven) on local k3d with `srw-nextcloud` as the cloud
+backend, using a real contact ("Anna Weber", email `anna.weber@pii-canary.invalid`,
+notes carrying the canary string `PIILEAKCANARY7f3a`) linked to the session's
+project. **PASSED:**
+
+| Step | Evidence |
+|---|---|
+| Provider + sync both live | agent log: `Registered virtual provider: tools`, `Registered virtual provider: contacts`, `Cloud workspace sync coordinator started (1 mount(s))` |
+| No sync errors across turns | no `workspace_sync.error`, no `VirtualPathError`, no `degraded` in either session's log |
+| **No PII in the cloud store** | `grep -rl "PIILEAKCANARY7f3a\|pii-canary.invalid\|Anna Weber"` over the whole Nextcloud data tree → **no matches**; no `anna-weber.md`, no `contacts/*.md`, no `task_brief.md` |
+| **Restart → initial pull succeeds** | after a pod recycle + resume, the new pod re-registered both providers and started the sync coordinator cleanly — the step that catches the silent-`workspace_sync = None` half |
+
+The gate also **found a real bug** — see §3.
+
+The one caveat worth keeping: the first session attempted was created via
+Cockpit's "Default project" path, which (per §3) never registered `contacts/`, so
+it could not have leaked contact data regardless. The pass above is the *second*
+session, where `contacts/` was confirmed registered before the cloud store was
+checked.
+
+### 2.1b Cloud sync — original gap description (kept for context)
 
 **Why it matters.** Before the fix, `WorkspaceSyncBase` walked the overlay, so
 contact names, emails and phone numbers were uploaded to the user's
@@ -146,7 +168,25 @@ contract's tested-but-unused half is not mistaken for dead code.
 
 ---
 
-## 3. Known gate finding (open, minor)
+## 3. Gate findings (open)
+
+### 3.1 Session `contacts/` never registers on the "Default project" path — **Medium**
+
+Full write-up: `docs/issues/session_contacts_never_register_on_default_project.md`.
+
+The client-side registration guard in `src/api/persistent_session.py` reads
+`self.project_id` → `project_ids[0]`, which the orchestrator derives **only** from
+`thread_mounts`. Cockpit's "Default project" flow sets `threads.project_id` and
+creates **no mount**, so the guard is false and `contacts/` is never registered —
+the agent sees no contacts on a project that has them, with no error anywhere.
+Explicit project selection creates a mount and works. The server-side resolver
+already handles both sources; the client just never asks.
+
+No unit test can catch this — it depends on which of two tables a given Cockpit
+flow wrote. Closing it needs either the client guard widened / removed (letting
+the server decide, as it already can) or the two creation paths reconciled.
+
+### 3.2 Dead `tools/` scaffolding — minor
 
 `config/worker_base.yaml:50` still lists `tools/` in the workspace `structure`,
 so `WorkspaceManager.initialize()` creates an **empty real `tools/` directory**
