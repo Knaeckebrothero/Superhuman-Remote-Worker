@@ -26,6 +26,30 @@ export function isBundled(e: Expert): boolean {
   return (e.source ?? 'bundled') === 'bundled';
 }
 
+/**
+ * Which transloco key (+ params) reports a `duplicate` result — pulled out
+ * of `duplicate()` so the "was anything dropped" decision is a pure function,
+ * unit-testable without standing up the component's five injected services.
+ *
+ * `dropped` names the capability grants (e.g. `"shell_tools"`) the source
+ * config needed that this user doesn't hold; the server strips them rather
+ * than refusing the fork (2026-08-04 decision) and reports them here so the
+ * strip is never silent — decision 9 in
+ * docs/done/global_expert_management.md is explicit that a silent capability
+ * downgrade burns debugging time. Grant keys are passed through verbatim
+ * (comma-joined, not humanized), because they're exactly what the Admin
+ * UI's grants table shows (`admin-grants.component.ts` renders them raw in
+ * a `<code>` cell).
+ */
+export function duplicateResultTranslationArgs(
+  dropped: string[] | undefined,
+): [key: string, params?: Record<string, string>] {
+  if (dropped && dropped.length > 0) {
+    return ['experts.duplicatedMissingGrants', {grants: dropped.join(', ')}];
+  }
+  return ['experts.duplicated'];
+}
+
 @Component({
   selector: 'app-experts-list',
   standalone: true,
@@ -355,8 +379,9 @@ export class ExpertsListComponent implements OnInit {
 
   duplicate(e: Expert): void {
     this.api.duplicateExpert(e.id).subscribe({
-      next: () => {
-        this.successMessage.set(this.transloco.translate('experts.duplicated'));
+      next: (result) => {
+        const [key, params] = duplicateResultTranslationArgs(result.dropped);
+        this.successMessage.set(this.transloco.translate(key, params));
         this.refresh();
       },
       error: (err) => this.errorMessage.set(this.detail(err) ?? 'Duplicate failed'),

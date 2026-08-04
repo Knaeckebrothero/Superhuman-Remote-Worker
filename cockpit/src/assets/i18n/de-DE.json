@@ -1741,6 +1741,7 @@
     "confirmDeleteBody": "Dies löscht dauerhaft",
     "deleted": "Experte gelöscht",
     "duplicated": "Experte dupliziert",
+    "duplicatedMissingGrants": "Experte dupliziert, aber entfernt, da folgende Berechtigungen fehlen: {{grants}}",
     "imported": "Experte importiert",
     "inUse": "Experte wird von {{count}} Aufträgen verwendet",
     "saveFailed": "Speichern fehlgeschlagen",

@@ -527,28 +527,17 @@ def test_defaults_grant_browser_and_datasource_but_deny_shell_and_delegation():
     assert stripped["tools"]["sql"] == ["run_query"]
 
 
-def test_strip_map_handles_every_grant_the_pdp_can_flag():
-    """Test group 2: completeness, derived from the PDP — not a hand-written
-    list. Iterates CATALOG (the same source `evaluate` reads), asking for
-    each key in turn "can `evaluate` ever flag this?" by denying only that
-    key against one fragment built to trip every rule `evaluate` currently
-    has. Any key it answers yes for must come back in `strip_to_grants`'
-    `dropped`, and the result must actually be clean — not just claimed to be.
-
-    This is the same shape of hole
-    tests/test_tool_report.py::TestGrantMapMatchesThePDP had (a grant the PDP
-    enforces silently missing from an explanatory map) and was fixed the same
-    way there: derive the "does the PDP care about this key" answer from the
-    PDP itself, and check for membership, never assert equality against a
-    literal enumeration of today's nine rules. A grant added to CATALOG later
-    with a matching new `evaluate` rule is picked up automatically, with no
-    edit to this test — a hand-listed ``{"shell_tools", "delegation", ...}``
-    could not do that.
-
-    Three of the twelve CATALOG keys (`personal_default_experts`,
-    `public_datasources`, `email_autonomous_send`) are gated elsewhere, not by
-    this fragment PDP, so `evaluate` never flags them — correctly excluded via
-    the `continue` below, not via a hand-picked skip list.
+def test_kitchen_sink_fragment_strips_every_current_violation_at_once():
+    """Regression/integration check, NOT the completeness mechanism (see
+    `test_strip_map_covers_every_catalog_key_or_is_explicitly_excluded`
+    below for that): a fragment that violates all nine rules `evaluate`
+    currently enforces, stripped in one pass against fully-denied grants,
+    comes back fully clean under the REAL (unmocked) `evaluate`. This is
+    still useful — it is the only test exercising all nine branches against
+    one shared fragment/`out` dict together, catching e.g. one branch's
+    deletion clobbering another's key in the same `tools` dict — but it
+    proves nothing about a grant this fragment doesn't happen to violate,
+    which is exactly why it cannot stand in for completeness (see below).
     """
     kitchen_sink = {
         "tools": {
@@ -570,26 +559,105 @@ def test_strip_map_handles_every_grant_the_pdp_can_flag():
         "autonomy": "full",
         "interactive": {"permission_mode": "autonomous"},
     }
-    checked = 0
+    grants = {k: _most_restrictive(spec) for k, spec in CATALOG.items()}
+
+    stripped, dropped = strip_to_grants(kitchen_sink, grants)
+
+    assert sorted(dropped) == sorted(
+        [
+            "shell_tools",
+            "delegation",
+            "datasource_tools",
+            "browser",
+            "catalog_authoring",
+            "vm_workspace",
+            "model_selection",
+            "autonomy_ceiling",
+            "permission_mode",
+        ]
+    )
+    assert evaluate(stripped, grants) == []
+
+
+#: Grant keys `evaluate` never reads at all — not part of the fragment PDP
+#: (they gate other endpoints: personal-default forking, datasource
+#: publishing, email autonomous-send), so `strip_to_grants` correctly has no
+#: branch for them. Explicit, reviewed, and commented, rather than "whatever
+#: the probe didn't happen to trigger" — see the test below for why that
+#: distinction is load-bearing.
+_NOT_ENFORCED_BY_EVALUATE_FRAGMENT_PDP = {
+    "personal_default_experts": (
+        "gates POST /api/expert-defaults/{type}/fork directly "
+        "(fork_my_expert_default's own check) — never read by evaluate()"
+    ),
+    "public_datasources": (
+        "gates is_global at the datasource routes, not a field evaluate() "
+        "reads on an expert fragment"
+    ),
+    "email_autonomous_send": (
+        "gates datasource.unattended_send at the datasource routes, not a "
+        "field evaluate() reads on an expert fragment"
+    ),
+}
+
+
+def test_strip_map_covers_every_catalog_key_or_is_explicitly_excluded(monkeypatch):
+    """Test group 2: completeness, derived from the PDP — not a hand-written
+    list, and NOT dependent on any probe fragment triggering anything.
+
+    **Why the previous version of this test was wrong, and how a reviewer
+    proved it**: it iterated `CATALOG` correctly, but asked "does `evaluate`
+    flag this key" by running the real `evaluate` against one hand-written
+    probe fragment (`kitchen_sink`) and checking whether THAT fragment
+    happened to trip the rule. A CATALOG key can gain a real `evaluate` rule
+    that the probe never touches — reviewer added `network_egress` (bool) to
+    CATALOG plus a matching `evaluate` rule gating `network.egress`, left
+    `strip_to_grants` untouched, and the old test still passed (`checked`
+    stayed at 9; `>= 9` cannot notice a rule it never saw). Driving the route
+    then 422'd a default-grants non-admin instead of stripping — the exact
+    defect this task exists to remove, silently reintroduced.
+
+    **The fix removes the probe dependency entirely**: `evaluate` is
+    monkeypatched (module-level, so `strip_to_grants`'s own unqualified call
+    picks it up) to report a violation for exactly one `key` at a time,
+    regardless of fragment content — so whether `strip_to_grants` handles
+    that key is no longer gated by whether any fragment "happens to" trigger
+    it. A CATALOG key with no matching branch fails immediately, UNLESS it is
+    named in `_NOT_ENFORCED_BY_EVALUATE_FRAGMENT_PDP` with a reason. There is
+    no third, silent outcome: every key is either handled here or excluded
+    there, and the test enumerates `CATALOG` itself, so a key added later
+    (like the reviewer's `network_egress`) is automatically in-scope with no
+    edit to this test.
+    """
+    import src.core.capability_grants as capability_grants
+
     for key in CATALOG:
-        grants = _deny_only(key)
-        flagged = {v.split(":", 1)[0] for v in evaluate(kitchen_sink, grants)}
-        if key not in flagged:
-            continue  # this CATALOG key is not enforced by evaluate() at all
-        checked += 1
-        stripped, dropped = strip_to_grants(kitchen_sink, grants)
-        assert key in dropped, (
-            f"evaluate() can flag {key!r} but strip_to_grants does not "
-            "handle it — a duplicate would 422 forever with no strip "
-            "possible for this grant"
+        if key in _NOT_ENFORCED_BY_EVALUATE_FRAGMENT_PDP:
+            continue
+
+        monkeypatch.setattr(
+            capability_grants,
+            "evaluate",
+            lambda fragment, grants, _key=key: [
+                f"{_key}: forced for completeness test"
+            ],
         )
-        assert evaluate(stripped, grants) == [], (
-            f"{key!r} was reported dropped but the stripped fragment still violates it"
+
+        _, dropped = strip_to_grants({}, {})
+
+        assert dropped == [key], (
+            f"CATALOG key {key!r} has no strip_to_grants branch that reacts "
+            "to it (or a branch reported a different key) — add one, or if "
+            "evaluate() genuinely never flags this key on an expert "
+            "fragment, add it to _NOT_ENFORCED_BY_EVALUATE_FRAGMENT_PDP with "
+            "a reason"
         )
-    # Vacuity guard on the probe itself, not on the completeness mechanism
-    # above: every evaluate()-enforced grant known today is 9 of the 12
-    # CATALOG keys, so a `kitchen_sink` that stopped tripping most of them
-    # (e.g. a typo breaking every gate) would still leave this loop silently
-    # doing nothing. This only rejects regressions in the probe; it never
-    # fails because a NEW rule was added.
-    assert checked >= 9
+
+
+def test_every_catalog_key_is_handled_or_excluded_not_both():
+    """A key cannot silently satisfy the completeness test by sitting in
+    both categories — the exclusion set is for keys evaluate() truly never
+    reads, not an escape hatch for a key someone forgot to wire up."""
+    assert set(_NOT_ENFORCED_BY_EVALUATE_FRAGMENT_PDP) <= set(CATALOG)
+    for key, reason in _NOT_ENFORCED_BY_EVALUATE_FRAGMENT_PDP.items():
+        assert reason, f"{key!r} needs a real reason, not a placeholder"
