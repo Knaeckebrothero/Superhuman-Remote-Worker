@@ -469,6 +469,17 @@ jobs:
         # chart-only push should not pay for it. The base has to be the whole
         # PUSH, not its tip commit.
         #
+        # Granularity, so the name does not oversell it: these two outputs gate
+        # whole JOBS, not tests. `python=true` runs the ENTIRE pytest suite and
+        # `python=false` runs none of it — one line touched under src/ costs
+        # exactly what five hundred do. There is no per-test or per-file
+        # selection anywhere in this pipeline. The saving is only for pushes that
+        # touch no watched path at all.
+        #
+        # The diff itself is two-dot (`git diff BASE HEAD`), so it compares tree
+        # SNAPSHOTS rather than walking commits: a file changed and reverted
+        # inside one push reads as unchanged, which is the intent.
+        #
         # `HEAD~1` was the base until 2026-08-04, and it silently under-tested
         # every multi-commit push: only the last commit decided. A push of six
         # commits ending in a dependency bump reported "no Python changed" and
@@ -509,9 +520,15 @@ jobs:
               ;;
             *)
               # workflow_dispatch and anything else: someone asked for a run on
-              # purpose, and there is no push range to narrow it to. Note that
-              # the old code took the HEAD~1 branch here, so a manual dispatch
-              # could not force the suite either.
+              # purpose, and there is no push range to narrow it to.
+              #
+              # `test-python` and `test-cockpit` already OR in
+              # `github.event_name == 'workflow_dispatch'` at the job level, so
+              # a dispatch has always forced BOTH suites whatever this step
+              # decided. This branch makes the step agree with them instead of
+              # contradicting them — and it is not purely cosmetic: `chart-test`
+              # has no such escape, so a dispatch could not force it before and
+              # can now.
               RUN_ALL="event-${{ github.event_name }}"
               ;;
           esac
