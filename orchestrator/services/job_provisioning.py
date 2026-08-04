@@ -31,18 +31,18 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 
-# Job-scoped scratch + framework scaffolding that must never become part of the
-# project artifact on a loop's `main` branch. Safe to ignore everywhere: todos
+# Job-scoped scratch + framework scaffolding that should not be committed to an
+# isolated loop job's execution repo. Safe to ignore everywhere: todos
 # restore from the LangGraph checkpoint (not disk), plan.md/workspace.md are read
 # only for non-blocking curation (FileNotFoundError-tolerant), and archive/ is
 # recovered from phase snapshots — not git. `skills/` (capability bundles
 # materialized into the workspace when SKILLS_DB_ENABLED) and `notes/` are
 # framework/job-scoped, not deliverables — a k3d E2E caught `skills/` leaking
-# onto main. The agent's actual code lives elsewhere (e.g. `repo/`) and is NOT
-# floored. See docs/features/loop_repo_compounding.md.
-_LOOP_MAIN_GITIGNORE = "\n".join(
+# into its durable cloud diff. The agent's actual project files live below
+# `projects/<slug>/` and are NOT floored. See project_jobs_repo_retirement.md.
+_LOOP_JOB_GITIGNORE = "\n".join(
     [
-        "# Loop artifact floor — job-scoped scratch never reaches the project.",
+        "# Loop execution floor — job-scoped scratch stays out of the job commit.",
         "workspace.md",
         "plan.md",
         "todos.yaml",
@@ -66,29 +66,31 @@ _LOOP_MAIN_GITIGNORE = "\n".join(
 )
 
 
-async def _ensure_loop_main_gitignore(gitea_client: Any, repo_name: str) -> None:
-    """Seed the scratch-floor ``.gitignore`` on a loop repo's ``main`` (idempotent).
+async def _ensure_loop_job_gitignore(gitea_client: Any, repo_name: str) -> bool:
+    """Seed the scratch-floor ``.gitignore`` on an isolated loop repo (idempotent).
 
-    Runs before the first execution job works on ``main`` so its commits exclude
-    job-scoped scratch. Idempotent via a sentinel: if ``.gitignore`` already
-    carries the floor, do nothing. Best-effort — a failure just risks a scratch
-    file reaching ``main`` (cosmetic), never a hard error.
+    Runs before the loop job works on its isolated repo's ``main`` so commits
+    exclude job-scoped scratch. Idempotent via a sentinel: if ``.gitignore`` already
+    carries the floor, do nothing. A loop treats ``False`` as a provisioning
+    failure because the seed commit also establishes a readable ``main`` HEAD.
     """
     try:
         existing = await gitea_client.get_file_bytes(
             repo_name, ".gitignore", ref="main"
         )
         if existing is not None and b"todos.yaml" in existing:
-            return  # floor already present
+            return True  # floor already present
         if existing is None:
-            content_b64 = base64.b64encode(_LOOP_MAIN_GITIGNORE.encode("utf-8")).decode(
+            content_b64 = base64.b64encode(_LOOP_JOB_GITIGNORE.encode("utf-8")).decode(
                 "ascii"
             )
-            await gitea_client.change_files(
-                repo_name,
-                "main",
-                [{"path": ".gitignore", "content_b64": content_b64}],
-                message="Add loop scratch .gitignore floor",
+            return bool(
+                await gitea_client.change_files(
+                    repo_name,
+                    "main",
+                    [{"path": ".gitignore", "content_b64": content_b64}],
+                    message="Add loop scratch .gitignore floor",
+                )
             )
         else:
             # .gitignore exists without the floor (rare — seeding runs before the
@@ -99,8 +101,10 @@ async def _ensure_loop_main_gitignore(gitea_client: Any, repo_name: str) -> None
                 "scratch files may reach main",
                 repo_name,
             )
+            return False
     except Exception as e:
         logger.warning("Failed to seed loop .gitignore floor for %s: %s", repo_name, e)
+        return False
 
 
 async def provision_job_repo(
@@ -114,9 +118,11 @@ async def provision_job_repo(
     """Provision a job's Gitea repo/branch, grant creator access, seed baseline.
 
     Mutates ``job_row`` in place (sets ``repo_name`` / ``branch_name``) and
-    returns it. Best-effort: a Gitea outage logs and leaves the job
-    repo-less rather than raising — callers treat provisioning as
-    non-fatal. No-ops when Gitea isn't initialized.
+    returns it. Ordinary jobs preserve the best-effort Gitea behavior: an
+    outage can leave them repo-less. ``loop_floor=True`` is deliberately
+    strict and raises unless both the isolated repository and complete project
+    cloud baseline are ready; an unattended file-producing loop must not run
+    against missing durable state. No-ops without Gitea only for ordinary jobs.
 
     Behaviour matches the block previously inlined in the ``POST /api/jobs``
     handler, with one improvement folded in: the creator access-grant now
@@ -125,6 +131,10 @@ async def provision_job_repo(
     email-only call silently no-ops for such users).
     """
     if not gitea_client.is_initialized:
+        if loop_floor:
+            raise RuntimeError(
+                "Gitea is unavailable; cannot provision isolated loop repo"
+            )
         return job_row
 
     # asyncpg returns native UUIDs; str()-coerce before any postgres_db
@@ -187,64 +197,20 @@ async def provision_job_repo(
                 )
             job_row["branch_name"] = branch_name
             job_row["repo_name"] = parent_repo_name
-    elif project_id:
-        # Project job: branch in project's shared jobs repo
-        repos = await postgres_db.get_project_repositories(project_id, role="jobs")
-        if repos:
-            jobs_repo = repos[0]
-            if loop_floor:
-                # Loop job (any role): seed the scratch `.gitignore` floor on
-                # `main` so the branch cut below inherits it and the job's
-                # completion squash-merge contains only contribution.
-                # See docs/features/loop_repo_compounding_v2.md.
-                await _ensure_loop_main_gitignore(gitea_client, jobs_repo["name"])
-            branch_name = f"job/{short_id}"
-            branch_ok = await gitea_client.create_branch(
-                jobs_repo["name"], branch_name, from_branch="main"
-            )
-            if not branch_ok:
-                logger.error(
-                    f"Failed to create branch '{branch_name}' in "
-                    f"'{jobs_repo['name']}' — main branch may not exist"
-                )
-            await postgres_db.merge_job_context(
-                job_id_str,
-                {
-                    "git_remote_url": jobs_repo["repo_url"],
-                },
-            )
-            async with postgres_db.acquire() as conn:
-                await conn.execute(
-                    "UPDATE jobs SET branch_name = $1, repo_name = $2 WHERE id = $3",
-                    branch_name,
-                    jobs_repo["name"],
-                    job_row["id"],
-                )
-            job_row["branch_name"] = branch_name
-            job_row["repo_name"] = jobs_repo["name"]
-        else:
-            # Project has no jobs repo — fall back to per-job repo
-            repo_name = f"job-{short_id}"
-            git_remote_url = await gitea_client.create_repo(repo_name)
-            if git_remote_url:
-                await postgres_db.merge_job_context(
-                    job_id_str,
-                    {
-                        "git_remote_url": git_remote_url,
-                    },
-                )
-                async with postgres_db.acquire() as conn:
-                    await conn.execute(
-                        "UPDATE jobs SET repo_name = $1 WHERE id = $2",
-                        repo_name,
-                        job_row["id"],
-                    )
-                job_row["repo_name"] = repo_name
     else:
-        # Root job without project: create standalone per-job repo
+        # Root job: always create an isolated repo. Project membership controls
+        # shared resources (cloud, KB, source/reference attachments), never the
+        # job's workspace lineage. Existing jobs keep their stored legacy repo;
+        # only newly-created roots pass through this branch.
         repo_name = f"job-{short_id}"
         git_remote_url = await gitea_client.create_repo(repo_name)
         if git_remote_url:
+            if loop_floor and not await _ensure_loop_job_gitignore(
+                gitea_client, repo_name
+            ):
+                raise RuntimeError(
+                    f"could not initialize isolated loop repository {repo_name}"
+                )
             await postgres_db.merge_job_context(
                 job_id_str,
                 {
@@ -258,6 +224,8 @@ async def provision_job_repo(
                     job_row["id"],
                 )
             job_row["repo_name"] = repo_name
+        elif loop_floor:
+            raise RuntimeError(f"could not create isolated loop repository {repo_name}")
 
     # Grant job creator read access to the Gitea repo. Pass username +
     # full_name + sub so grant_user_repo_access can pre-provision the Gitea
@@ -283,8 +251,10 @@ async def provision_job_repo(
     # runs in a background task that walks the project's cloud folder and
     # pushes text files into the job's Gitea repo under projects/<slug>/.
     # While it runs, the job carries context.cloud_baseline.state='seeding'
-    # and the dispatcher gate skips it. When done, it flips to 'ready' (or
-    # 'failed' on error — we still dispatch so the job doesn't deadlock).
+    # and the dispatcher gate skips it. Ordinary jobs seed asynchronously and
+    # retain the legacy fail-open behavior. Loops seed synchronously and fail
+    # their spawn if the baseline is incomplete: an unattended loop must never
+    # run without the durable file state it is meant to improve.
     # Only fires when the project actually has a cloud folder provisioned;
     # loose jobs and projects without a cloud_folder handle skip this path.
     if project_id and job_row.get("repo_name"):
@@ -293,16 +263,37 @@ async def provision_job_repo(
         except Exception:
             project_row = None
         if project_row and project_row.get("main_cloud_folder_handle"):
-            from services.job_cloud_baseline import fire_baseline_seed
+            if loop_floor:
+                from services.job_cloud_baseline import seed_project_folder_baseline
 
-            fire_baseline_seed(
-                job_id=job_id_str,
-                project=project_row,
-                repo_name=job_row["repo_name"],
-                branch=job_row.get("branch_name"),
-                postgres_db=postgres_db,
-                gitea_client=gitea_client,
-                main_cloud_router=main_cloud_router,
-            )
+                await seed_project_folder_baseline(
+                    job_id=job_id_str,
+                    project=project_row,
+                    repo_name=job_row["repo_name"],
+                    branch=job_row.get("branch_name"),
+                    postgres_db=postgres_db,
+                    gitea_client=gitea_client,
+                    main_cloud_router=main_cloud_router,
+                    require_complete=True,
+                )
+                refreshed = await postgres_db.get_job(job_id_str)
+                if not refreshed or not refreshed.get("cloud_diff_baseline_commit"):
+                    raise RuntimeError(
+                        "project cloud baseline could not be seeded completely"
+                    )
+            else:
+                from services.job_cloud_baseline import fire_baseline_seed
+
+                fire_baseline_seed(
+                    job_id=job_id_str,
+                    project=project_row,
+                    repo_name=job_row["repo_name"],
+                    branch=job_row.get("branch_name"),
+                    postgres_db=postgres_db,
+                    gitea_client=gitea_client,
+                    main_cloud_router=main_cloud_router,
+                )
+        elif loop_floor:
+            raise RuntimeError("project loop requires a provisioned cloud folder")
 
     return job_row

@@ -1327,17 +1327,36 @@ workspace:
   # ReadWriteMany (Longhorn). Single-node clusters with RWO-only storage
   # (k3s local-path) can override to "ReadWriteOnce".
   accessMode: "ReadWriteMany"
-  # -- Storage class for ephemeral per-job workspace PVCs
+  # -- Storage class for the ephemeral per-workspace PVCs (jobs and sessions,
+  # including a session's agent-pod claim). The capacity quota below is keyed
+  # on this class, so all three claim kinds share one bucket.
   ephemeralStorageClass: ""
-  # -- PVC-backed job workspaces (Branch a). When true, each job workspace gets
-  # a PVC named by its job UUID so on-disk files survive pod crashes and
-  # reattach by name on recreate; the PVC is reclaimed on terminal job states
-  # (completed/failed/cancelled) and retained across suspend/restore. Sessions
-  # stay emptyDir. Default off → emptyDir (today's behavior). Mixed fleets are
-  # safe — the reaper reads each pod's actual volume mode — so this is a rolling
-  # flip, not a cutover. See docs/features/workspace_pvc_branch_a_implementation.md.
+  # -- PVC-backed workspaces (Branch a). Covers BOTH jobs and sessions: every
+  # workspace pod gets a PVC named by its owner UUID (`pvc-workspace-<job>` /
+  # `pvc-ws-thread-<thread>`) so on-disk files survive pod crashes and reattach
+  # by name on recreate. A session ALSO gets a second claim for its agent pod
+  # (`pvc-agent-s-<thread>`), so one session consumes TWO claims; job agent pods
+  # stay emptyDir.
+  #
+  # Reclaim is asymmetric, and that is the part to internalize before flipping
+  # this on:
+  #   * job PVCs are reclaimed on terminal status (completed/failed/cancelled)
+  #     and retained across idle reap / suspend / restore;
+  #   * session PVCs are reclaimed ONLY when the `threads` row is hard-deleted.
+  #     An `ended` thread is still resumable (sessions end on an idle timeout
+  #     routinely), so its two claims outlive its pods. Turning this on makes
+  #     workspace storage track the number of RETAINED THREADS rather than
+  #     concurrency — size `resourceQuota` and the backing pool for that, and
+  #     prune threads you do not intend to reopen.
+  #
+  # Default off → emptyDir (pre-Branch-a behavior) and the rollback posture.
+  # Mixed fleets are safe — the reaper reads each pod's actual volume mode — so
+  # this is a rolling flip, not a cutover; flipping it back off leaves existing
+  # PVCs to drain as their work finishes.
+  # See docs/features/workspace_pvc_branch_a_implementation.md.
   pvcEnabled: false
-  # -- Size of each per-job workspace PVC (only used when pvcEnabled).
+  # -- Size of each workspace PVC (only used when pvcEnabled). Applies to every
+  # claim: job workspace, session workspace, and session agent.
   pvcSize: "10Gi"
   # -- Single-replica node-loss fallback (Phase 3b). Extended ready-wait (s) for a
   # PVC REATTACH: a transient node reboot (the replica's node returning) recovers
@@ -1351,11 +1370,11 @@ workspace:
   # destructive recovery path). false → a wedged reattach stays in recovery until
   # the node returns or the recovery cap fails it loud, never discarding.
   freshFallback: true
-  # -- Capacity guard for PVC-backed job workspaces (Phase 3a). Renders a
+  # -- Capacity guard for PVC-backed workspaces (Phase 3a). Renders a
   # namespaced ResourceQuota keyed on `ephemeralStorageClass` that caps BOTH the
-  # total storage and the count of concurrent workspace PVCs of that class. At
-  # the cap, new workspace PVCs are rejected (403) and the job fails closed with
-  # a distinct "workspace capacity quota exceeded" log line — never a silent
+  # total storage and the count of workspace PVCs of that class. At the cap, new
+  # workspace PVCs are rejected (403) and the owning work fails closed with a
+  # distinct "workspace capacity quota exceeded" log line — never a silent
   # emptyDir fallback. Requires `pvcEnabled: true` and a DEDICATED
   # `ephemeralStorageClass` so the quota isolates workspace storage from the
   # platform's own data PVCs (Postgres, …). On prod `longhorn-ephemeral`
@@ -1363,12 +1382,30 @@ workspace:
   # local-path-backed class (same provisioner, distinct name) and point
   # `ephemeralStorageClass` at it. See the storage-substrate section of
   # docs/features/workspace_pvc_branch_a_implementation.md.
+  #
+  # ONE BUCKET FOR BOTH KINDS. The quota is keyed on the storage class, and jobs
+  # and sessions share that class — there is no per-kind split. A backlog of
+  # retained session threads can therefore exhaust the count and 403 a JOB's PVC
+  # create, failing that job closed for a reason that has nothing to do with the
+  # job. If the two need isolating, give sessions their own storage class (and
+  # its own quota) rather than raising this one.
+  #
+  # Defaults re-derived 2026-08-04 for the jobs+sessions flip. Previously
+  # 200Gi / 20 — sized when only jobs held PVCs (20 × pvcSize 10Gi):
+  #     jobs:     20 concurrent × 1 claim  = 20 claims
+  #     sessions: 20 retained   × 2 claims = 40 claims  (workspace + agent pod)
+  #     total     60 claims × pvcSize 10Gi = 600Gi
+  # Session claims are NOT bounded by concurrency (see `pvcEnabled` above): they
+  # live until the thread row is deleted, so re-derive `maxCount` against your
+  # thread-retention policy, not your peak concurrent-session count.
   resourceQuota:
     enabled: false
-    # -- Max total storage summed across all workspace PVCs of the ephemeral class.
-    maxStorage: "200Gi"
-    # -- Max number of concurrent workspace PVCs of the ephemeral class.
-    maxCount: 20
+    # -- Max total storage summed across all workspace PVCs of the ephemeral
+    # class (jobs + sessions).
+    maxStorage: "600Gi"
+    # -- Max number of workspace PVCs of the ephemeral class (jobs + sessions;
+    # a session counts twice — workspace pod + agent pod).
+    maxCount: 60
   # -- NetworkPolicy restricting workspace traffic. Covers BOTH container
   # workspaces and same-cluster KubeVirt VM workspaces (selector
   # srw.io/component=agent-workspace matches both). Disabling removes the

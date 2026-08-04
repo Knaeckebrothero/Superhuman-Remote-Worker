@@ -65,6 +65,59 @@ def _thread_is_vm_tier(metadata: dict, ws_ctx: dict, vm_ctx: dict) -> bool:
     return False
 
 
+# ``ContainerProvisioner._trusted_pod_ssh_identity`` mints the thread's
+# ``_workspace_binding.backing_id`` from the PVC when — and only when — the
+# workspace pod mounts one, as ``k8s-pvc:<namespace>:<pvc-uid>``; an emptyDir
+# pod is bound to ``k8s-pod:<namespace>:<pod-uid>`` instead. That makes the
+# string the authoritative reattach signal: the PVC's UID is stable across every
+# pod recreate that reattaches the SAME volume, and changes the moment a new
+# volume is minted (first PVC-backed create, a rollback to emptyDir, or the
+# single-replica node-loss fallback discarding a wedged PVC).
+_K8S_PVC_BACKING_PREFIX = "k8s-pvc:"
+
+
+def _workspace_backing_id(metadata: dict) -> str:
+    """The thread's currently bound workspace backing id ("" when unbound)."""
+    binding = metadata.get("_workspace_binding")
+    if not isinstance(binding, dict):
+        return ""
+    backing_id = binding.get("backing_id")
+    return backing_id if isinstance(backing_id, str) else ""
+
+
+def _volume_survived_teardown(
+    prior_backing_id: str, current_backing_id: str
+) -> tuple[bool, str]:
+    """Did the restored pod come back on the volume it already had?
+
+    The container-tier twin of the VM path's ``rootdisk == "kept"``: when the
+    answer is yes, the disk already holds the workspace and extracting the older
+    S3 tarball over it would replace newer files with older ones.
+
+    Returns ``(reattached, reason)`` — the reason is log copy for the skip.
+    """
+    if not prior_backing_id.startswith(_K8S_PVC_BACKING_PREFIX):
+        # emptyDir (or never bound at all): storage died with the pod, so the
+        # S3 snapshot is the only copy and must be unrolled. This is also the
+        # mixed-fleet upgrade case — a session suspended before PVCs were
+        # enabled restores onto a brand-new empty volume.
+        return False, ""
+    if not current_backing_id:
+        # The post-create rebind is best-effort (create_workspace logs and
+        # continues when it raises), so its absence is ambiguous rather than
+        # informative. The tie goes to the volume: the generation we came in
+        # with was PVC-backed, a PVC survives every non-permanent teardown, and
+        # unrolling a stale tarball over live files is the unrecoverable
+        # mistake — a skipped extract is not.
+        return True, "binding unavailable, prior generation was PVC-backed"
+    if current_backing_id == prior_backing_id:
+        return True, "same PVC reattached"
+    # A different backing id means a different volume (or an emptyDir pod after
+    # a flag rollback): whatever the pod is mounting now, it is not the tree we
+    # suspended, so restore it from S3.
+    return False, ""
+
+
 def _resolve_ssh_port(ws_ctx: dict, vm_ctx: dict, is_vm: Optional[bool] = None) -> int:
     """Resolve the snapshot SSH port by workspace kind.
 
@@ -403,9 +456,23 @@ class WorkspaceSuspensionService:
                     )
                 return False
 
-            # Extract snapshot into the workspace
+            # Extract snapshot into the workspace. A failed extract is a failed
+            # restore: the workspace is empty or half-populated, and stamping
+            # 'ready' over it hands the dispatcher a blank tree that looks
+            # healthy. Fail visibly instead and let the caller decide.
             ssh_port = _resolve_ssh_port(ws_ctx, vm_ctx)
-            await self._extract_snapshot(job_id, ssh_host, ssh_port=ssh_port)
+            if not await self._extract_snapshot(job_id, ssh_host, ssh_port=ssh_port):
+                error_msg = "snapshot extraction failed on restore"
+                logger.error("%s (job %s)", error_msg, job_id)
+                if ws_ctx:
+                    await self._db.merge_workspace_container_context(
+                        job_id, {"status": "failed", "error": error_msg}
+                    )
+                elif vm_ctx:
+                    await self._db.merge_vm_context(
+                        job_id, {"status": "failed", "error": error_msg}
+                    )
+                return False
 
             # Mark as ready
             restored_ctx = {
@@ -442,10 +509,18 @@ class WorkspaceSuspensionService:
         ssh_host: str,
         ssh_port: int = 22,
         entity_type: str = "jobs",
-    ) -> None:
+    ) -> bool:
         """Download snapshot from S3 and extract into the pod via SSH.
 
         Mirrors ide_session.py:_extract_snapshot_to_vm (lines 782-836).
+
+        Returns:
+            True when the snapshot was downloaded AND unpacked cleanly; False
+            when the download failed or tar exited non-zero. Callers MUST NOT
+            report the workspace as restored on False — this used to return
+            None on every path, so a failed restore still stamped
+            ``status: "ready"`` and the agent went to work on an empty or
+            half-populated tree.
         """
         with tempfile.NamedTemporaryFile(
             suffix=".tar.zst", delete=True, prefix=f"restore_{entity_id[:8]}_"
@@ -461,7 +536,7 @@ class WorkspaceSuspensionService:
                     entity_type.rstrip("s"),
                     entity_id,
                 )
-                return
+                return False
 
             key_path = resolve_ssh_key_path()
             if not key_path:
@@ -482,6 +557,9 @@ class WorkspaceSuspensionService:
                     rc,
                     stderr.decode(errors="replace")[:500],
                 )
+                return False
+
+            return True
 
     async def restore(self, owner: WorkspaceOwner) -> bool:
         """Owner-keyed restore: job -> restore_workspace, session -> restore_thread_workspace."""
@@ -709,6 +787,11 @@ class WorkspaceSuspensionService:
         # lifecycle rather than the suspend that put the thread here.
         rootdisk_kept = vm_ctx.get("rootdisk") == "kept"
 
+        # Same "read it first" rule, container tier: create_workspace rebinds
+        # _workspace_binding to whatever the new pod mounts, so the identity of
+        # the volume we are coming BACK to only exists before that call.
+        prior_backing_id = _workspace_backing_id(metadata)
+
         if is_vm:
             await self._db.merge_thread_vm_context(thread_id, {"status": "restoring"})
         else:
@@ -718,6 +801,10 @@ class WorkspaceSuspensionService:
 
         try:
             ssh_host = None
+            # Container tier only; a VM restore that reaches the extract below
+            # never rides a kept disk (rootdisk_kept returned early).
+            volume_reattached = False
+            reattach_reason = ""
 
             if is_vm and self._vm_provisioner and self._vm_provisioner.is_available:
                 ok = await self._vm_provisioner.create_thread_vm(thread_id)
@@ -789,6 +876,9 @@ class WorkspaceSuspensionService:
                         metadata = {}
                 ws_ctx = metadata.get("workspace_container", {})
                 ssh_host = ws_ctx.get("pod_ip")
+                volume_reattached, reattach_reason = _volume_survived_teardown(
+                    prior_backing_id, _workspace_backing_id(metadata)
+                )
 
             if not ssh_host:
                 error_msg = "no SSH host after provisioning for restore"
@@ -803,15 +893,39 @@ class WorkspaceSuspensionService:
                     )
                 return False
 
-            # Extract snapshot into the workspace. Kept-rootdisk VM restores
-            # never reach this point (they returned right after the create
-            # above — the disk already holds the workspace and extracting a
-            # snapshot over it would replace newer files with older ones), so
-            # everything here has an S3 snapshot as its only copy.
+            # Extract snapshot into the workspace — unless the storage that came
+            # back already holds the live tree. Kept-rootdisk VM restores never
+            # reach this point (they returned right after the create above), and
+            # a PVC-backed session pod that REATTACHED its volume is that exact
+            # situation one tier down: the volume survived the teardown, so
+            # unrolling the older S3 tarball over it would replace newer files
+            # with older ones. Everything else — emptyDir pods, a freshly minted
+            # (empty) PVC, a volume discarded by the single-replica node-loss
+            # fallback — has the S3 snapshot as its only copy and must extract.
             ssh_port = _resolve_ssh_port(ws_ctx, vm_ctx, is_vm=is_vm)
-            await self._extract_snapshot(
+            if volume_reattached:
+                logger.info(
+                    "Workspace restore for thread %s rides the reattached "
+                    "volume (%s) — no snapshot extract",
+                    thread_id,
+                    reattach_reason,
+                )
+            elif not await self._extract_snapshot(
                 thread_id, ssh_host, ssh_port=ssh_port, entity_type="threads"
-            )
+            ):
+                # Same reasoning as the job path: a workspace that failed to
+                # restore must not advertise itself as ready.
+                error_msg = "snapshot extraction failed on restore"
+                logger.error("%s (thread %s)", error_msg, thread_id)
+                if is_vm:
+                    await self._db.merge_thread_vm_context(
+                        thread_id, {"status": "failed", "error": error_msg}
+                    )
+                else:
+                    await self._db.merge_thread_workspace_context(
+                        thread_id, {"status": "failed", "error": error_msg}
+                    )
+                return False
 
             restored_ctx = {
                 "status": "ready",
@@ -823,8 +937,9 @@ class WorkspaceSuspensionService:
                 await self._db.merge_thread_workspace_context(thread_id, restored_ctx)
 
             logger.info(
-                "Workspace restored from S3 for thread %s (ssh_host=%s)",
+                "Workspace restored for thread %s from %s (ssh_host=%s)",
                 thread_id,
+                "its own volume" if volume_reattached else "S3",
                 ssh_host,
             )
             return True

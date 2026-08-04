@@ -1136,8 +1136,8 @@
       "colStatus": "Status",
       "colDescription": "Description",
       "colConfig": "Config",
-      "colBranch": "Branch",
-      "colMerge": "Merge"
+      "colBranch": "Execution repository",
+      "colMerge": "Delivery"
     },
     "knowledge": {
       "totalLabel": "Total",
@@ -1210,8 +1210,7 @@
     },
     "experts": {
       "loading": "Loading experts...",
-      "emptyPrefix": "No project experts yet. Add expert configs to the",
-      "emptySuffix": "directory in the jobs repo."
+      "emptyPrefix": "No experts are linked to this project in the expert catalog."
     },
     "members": {
       "selectUser": "Select user...",
@@ -1330,7 +1329,9 @@
       "turn": "Turn {{count}}",
       "agentQuiet": "Working — no output for {{seconds}}s",
       "cloudChanges": "Cloud changes ({{count}})",
-      "cloudChangesTooltip": "Staged on {{mount}} · last staged {{stagedAt}} — click to review"
+      "cloudChangesTooltip": "Staged on {{mount}} · last staged {{stagedAt}} — click to review",
+      "cloudSyncOff": "Cloud sync off",
+      "cloudSyncOffTooltip": "Cloud sync could not start for this session. The workspace may be missing files from the cloud, and changes won't be saved back to it."
     },
     "turn": {
       "collapsedEmpty": "Tool calls only",
@@ -1439,7 +1440,7 @@
     "ended": {
       "eyebrow": "Resumable",
       "title": "Resume this session?",
-      "body": "This session is currently ended. Resume to bring the agent back online and continue where you left off.",
+      "body": "This session is ended. Type below and send to bring the agent back and continue where you left off — or resume now without typing.",
       "endedAt": "Session ended {{ date }}",
       "resume": "Resume"
     },
@@ -1504,7 +1505,9 @@
       "reconnecting": "Disconnected — reconnecting…",
       "uploading": "Uploading attachments…",
       "default": "Type a message... (Enter to send, Shift+Enter for newline)",
-      "defaultMobile": "Type a message..."
+      "defaultMobile": "Type a message...",
+      "resuming": "Resuming session…",
+      "endedSendResumes": "Type a message — sending resumes the session"
     },
     "composer": {
       "attach": "Attach",

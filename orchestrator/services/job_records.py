@@ -1,26 +1,14 @@
-"""Per-job change records on the project repo's ``main``.
+"""Structured per-job change records in PostgreSQL.
 
-docs/features/workspace_and_change_records.md (§5, §5.1, §6.5): the invariant
-is **every repo-backed job leaves exactly one record on ``main``** when it
-reaches a terminal status — jobs that merged nothing and failed jobs included
-(a failure is information, and the honest-floor culture depends on it being
-recorded). ``main`` is the index of everything the project ever did; the
-record is what merges, not the work.
+``project_jobs_repo_retirement.md`` keeps the useful invariant from
+``workspace_and_change_records.md``—every terminal job leaves one honest
+record—but moves the authority out of an agent-visible Git tree. One immutable
+``job_change_records`` row is keyed by job id; duplicate completion callbacks
+therefore no-op without listing ``retros/``.
 
-Two entry points share one renderer so the schema can never fork:
-
-* :func:`write_loop_retro` — the loop path's writer, moved here verbatim from
-  ``services.project_loops`` (which re-exports it, so the loop's import
-  surface is unchanged). Path and content are byte-identical to the
-  pre-extraction writer: ``retros/NNN-<role>-<jobid8>.md``, ``type: retro``,
-  no ``changes`` block. Pinned by tests/test_loop_merge.py.
-* :func:`write_job_record` — the general writer for every other repo-backed
-  job, called from the completion path via
-  ``services.completion.write_job_change_record``. Path
-  ``retros/<YYYYMMDD-HHMMSS>-<role>-<jobid8>.md`` — same ``retros/``
-  directory the loop prompts already point agents at, with a timestamp
-  prefix so the directory stays lexically ordered — ``type: job_record``,
-  extended frontmatter carrying the §5 ``changes:`` block.
+The Markdown renderer remains temporarily for legacy export/tests, but neither
+writer calls or commits it. ``write_loop_retro`` and ``write_job_record`` both
+insert the same structured schema through the database facade.
 
 Who writes what (§5.1) — the split that must survive every edit here:
 
@@ -38,11 +26,10 @@ handling or a loop advance.
 
 from __future__ import annotations
 
-import base64
 import json
 import logging
 import re
-from datetime import UTC, datetime
+from datetime import datetime
 from typing import Any
 
 import yaml
@@ -179,9 +166,10 @@ def derive_changes(
 
     1. ``kind: git`` — always present for a repo-backed job: the branch the
        work lived on plus the merge outcome as known by the caller.
-       ``merged`` and ``curated`` (§6.4's contracted-deliverables merge) are
-       both real merges → ``action: merge``. When no merge step ran (every
-       non-loop job today), ``action: none`` with the branch recorded.
+       ``merged`` and ``curated`` (§6.4's legacy contracted-deliverables merge)
+       are both real merges → ``action: merge``. Current isolated execution
+       and cloud-delivery outcomes use ``action: none`` here, with a separate
+       verified cloud entry when applicable.
        First-hand orchestrator knowledge → ``verified: true``.
     2. ``kind: knowledge`` — only when ``knowledge_index`` rows exist for
        this job id; the orchestrator checked its own store → ``verified:
@@ -207,16 +195,29 @@ def derive_changes(
     else:
         action = "none"
         summary = "no merge step ran; work remains on the job branch"
-    changes.append(
-        {
-            "datasource": job.get("repo_name"),
-            "kind": "git",
-            "action": action,
-            "ref": job.get("branch_name"),
-            "summary": summary,
-            "verified": True,
-        }
-    )
+    if job.get("repo_name") or job.get("branch_name"):
+        changes.append(
+            {
+                "datasource": job.get("repo_name"),
+                "kind": "git",
+                "action": action,
+                "ref": job.get("branch_name"),
+                "summary": summary,
+                "verified": True,
+            }
+        )
+
+    if merge_status == "cloud-applied":
+        changes.append(
+            {
+                "datasource": "project-cloud",
+                "kind": "cloud",
+                "action": "apply",
+                "ref": "project-folder",
+                "summary": "isolated job diff applied to the project cloud folder",
+                "verified": True,
+            }
+        )
 
     note_ids = list(knowledge_note_ids or [])[:_MAX_KNOWLEDGE_REFS]
     if note_ids:
@@ -233,6 +234,16 @@ def derive_changes(
 
     changes.extend(_agent_declared_changes(freeze))
     return changes
+
+
+def _delivery_ref(job: dict[str, Any], delivery_status: str) -> str | None:
+    """Human-safe destination pointer for the structured history row."""
+    if delivery_status == "cloud-applied":
+        return "project-cloud"
+    if delivery_status in ("merged", "curated"):
+        repo_name = job.get("repo_name")
+        return f"{repo_name}@main" if repo_name else "main"
+    return job.get("branch_name") or job.get("repo_name")
 
 
 async def fetch_job_knowledge_note_ids(
@@ -374,19 +385,15 @@ def render_job_record(
 
 
 # ---------------------------------------------------------------------------
-# Idempotence guard
+# Legacy export helper
 # ---------------------------------------------------------------------------
 
 
 async def record_exists_for_job(gitea_client: Any, repo_name: str, job_id: str) -> bool:
-    """True if ``retros/`` on ``main`` already holds a record for this job.
+    """True if a legacy ``retros/`` tree holds a record for this job.
 
-    Matches on the ``-<jobid8>.md`` suffix, so it catches both naming
-    schemes (the loop's ``NNN-`` prefix and the general timestamp prefix) —
-    this is the belt-and-braces half of the double-write guard: even if the
-    caller's loop-context skip ever misfires, an already-written retro
-    blocks a second record. Unknown state (no ``retros/`` yet, listing
-    failed) reads as "no record" — the write stays best-effort either way.
+    This is retained for migration/export tooling only. New records are
+    idempotent through ``job_change_records.job_id`` and never inspect Git.
     """
     suffix = f"-{str(job_id)[:8]}.md"
     entries = await gitea_client.list_contents(repo_name, "retros", ref="main")
@@ -404,7 +411,7 @@ async def record_exists_for_job(gitea_client: Any, repo_name: str, job_id: str) 
 
 
 async def write_loop_retro(
-    gitea_client: Any,
+    postgres_db: Any,
     job: dict[str, Any],
     *,
     ctx: dict[str, Any],
@@ -413,68 +420,62 @@ async def write_loop_retro(
     failed: bool = False,
     error: str | None = None,
     merge_notes: list[str] | None = None,
+    vector_db: Any = None,
 ) -> bool:
-    """Record a loop job's outcome as ``retros/NNN-<role>-<jobid8>.md`` on ``main``.
+    """Insert one immutable structured history row for a loop job.
 
-    Orchestrator-written AFTER the merge outcome is known, so the retro
-    carries mechanical truth (merge status + SHA) next to the agent's own
-    ``freeze_data`` completion notes — critics read this instead of trusting
-    KB self-reports from destroyed workspaces (F40). Best-effort: failures
-    must never block the loop advance.
-
-    Moved verbatim from ``services.project_loops`` (§6.5 extraction); that
-    module re-exports it, and path, frontmatter and body are byte-identical
-    to the pre-move writer — no ``changes`` block, ``type: retro``, the
-    loop's iteration/role fields. Pinned by tests/test_loop_merge.py.
-    ``merge_status`` passes through as given — the §6.4 curated merge's
-    ``curated`` renders like any other status — and its ``merge_notes``
-    (curation outcome, fallback warnings, missing contracted paths) add an
-    optional ``## Merge notes`` section; absent, the shape is unchanged.
+    The legacy function name keeps the migration narrow for callers. This
+    function no longer commits a ``retros/`` file or mutates a repository.
+    The database primary key makes retries idempotent. Best-effort: an audit
+    write must never block the loop state machine.
     """
-    repo_name = job.get("repo_name")
-    if not repo_name:
+    if postgres_db is None:
         return False
-
-    job_id = str(job.get("id"))
-    role, iteration = loop_role_iteration(job, ctx)
-
-    notes = _freeze_notes(_parse_freeze_raw(job))
-    description = (job.get("description") or "").splitlines()[0].strip()
-    content = render_job_record(
-        record_type="retro",
-        iteration=iteration,
-        role=role,
-        job_id=job_id,
-        branch=job.get("branch_name"),
-        status="failed" if failed else "completed",
-        merge_status=merge_status,
-        merge_sha=merged_sha,
-        created=datetime.now(UTC).isoformat(timespec="seconds"),
-        title=f"# Loop iter {iteration} · {role}",
-        description=description,
-        notes=notes,
-        merge_notes=merge_notes,
-        error=error if (failed and error) else None,
-    )
-
-    path = loop_retro_path(job, ctx)
-    return bool(
-        await gitea_client.change_files(
-            repo_name,
-            "main",
-            [
-                {
-                    "path": path,
-                    "content_b64": base64.b64encode(content.encode()).decode(),
-                }
-            ],
-            message=f"retro: iter {iteration:03d} {role} ({job_id[:8]}) — {merge_status}",
+    try:
+        job_id = str(job.get("id"))
+        role, iteration = loop_role_iteration(job, ctx)
+        freeze = _parse_freeze_raw(job)
+        freeze = freeze if isinstance(freeze, dict) else {}
+        note_ids = await fetch_job_knowledge_note_ids(vector_db, job)
+        delivery_status = merge_status or "none"
+        changes = derive_changes(
+            job,
+            merge_status=delivery_status,
+            merged_sha=merged_sha,
+            knowledge_note_ids=note_ids,
+            freeze=freeze,
         )
-    )
+        return bool(
+            await postgres_db.create_job_change_record(
+                job_id=job_id,
+                project_id=(str(job["project_id"]) if job.get("project_id") else None),
+                loop_id=(str(ctx["loop_id"]) if ctx.get("loop_id") else None),
+                record_type="loop_record",
+                role=role,
+                iteration=iteration,
+                status="failed" if failed else "completed",
+                repo_name=job.get("repo_name"),
+                branch_name=job.get("branch_name"),
+                delivery_status=delivery_status,
+                delivery_ref=_delivery_ref(job, delivery_status),
+                delivery_sha=merged_sha,
+                completion_notes=_freeze_notes(freeze),
+                delivery_notes=[str(note) for note in (merge_notes or [])],
+                changes=changes,
+                error=(str(error)[:_ERROR_LIMIT] if failed and error else None),
+            )
+        )
+    except Exception:
+        logger.warning(
+            "loop job record write failed for %s (non-fatal)",
+            job.get("id"),
+            exc_info=True,
+        )
+        return False
 
 
 async def write_job_record(
-    gitea_client: Any,
+    postgres_db: Any,
     job: dict[str, Any],
     *,
     status: str,
@@ -484,37 +485,30 @@ async def write_job_record(
     merged_sha: str | None = None,
     now: datetime | None = None,
 ) -> bool:
-    """Write the general per-job change record to ``retros/`` on ``main`` (§6.5).
+    """Insert the general per-job change record into PostgreSQL.
 
-    ``retros/<YYYYMMDD-HHMMSS>-<role>-<jobid8>.md`` — the same directory the
-    loop prompts already point agents at, the timestamp keeping lexical
-    ordering. ``role`` is the job's ``config_name`` (non-loop jobs have no
-    loop role).
-
-    Idempotent by job id: if ANY record file for this job is already on
-    ``main`` (a loop retro included), nothing is written — the belt half of
-    the double-write guard, under the caller's loop-context skip. Jobs with
-    no project repo return ``False`` silently and safely. ``merge_status`` /
-    ``merged_sha`` default to what the job row carries (no merge step runs
-    for non-loop jobs today; §6.4's curated merge can pass real values
-    later). Best-effort by contract: every failure is logged and swallowed.
+    ``now`` is accepted temporarily for source compatibility with legacy
+    callers, but PostgreSQL owns ``created_at``. Jobs need not have a Git
+    repository: this row is execution history, not an agent-visible file.
     """
+    del now
+    if postgres_db is None:
+        return False
     try:
-        repo_name = job.get("repo_name")
-        if not repo_name:
-            return False
         job_id = str(job.get("id"))
-
-        if await record_exists_for_job(gitea_client, repo_name, job_id):
-            logger.debug(
-                "job record for %s already on main — skipping duplicate",
-                job_id[:8],
-            )
-            return False
-
         if merge_status is None:
             row_status = job.get("merge_status")
             merge_status = str(row_status) if row_status else None
+        if merge_status is None:
+            diff_status = str(job.get("diff_status") or "")
+            if diff_status == "accepted":
+                merge_status = "cloud-applied"
+            elif diff_status == "rejected":
+                merge_status = "cloud-rejected"
+            elif job.get("repo_name"):
+                merge_status = "isolated"
+            else:
+                merge_status = "none"
 
         freeze = _parse_freeze_raw(job)
         freeze = freeze if isinstance(freeze, dict) else {}
@@ -528,39 +522,27 @@ async def write_job_record(
         )
 
         role = _sanitize_role(job.get("config_name"))
-        stamp = now or datetime.now(UTC)
-        desc_lines = (job.get("description") or "").splitlines()
-        description = desc_lines[0].strip() if desc_lines else ""
         project_id = job.get("project_id")
-        content = render_job_record(
-            record_type="job_record",
-            role=role,
-            job_id=job_id,
-            project=str(project_id) if project_id else "~",
-            branch=job.get("branch_name"),
-            status=status,
-            merge_status=merge_status or "~",
-            merge_sha=merged_sha,
-            created=stamp.isoformat(timespec="seconds"),
-            title=f"# {role} · {job_id[:8]}",
-            description=description,
-            notes=_freeze_notes(freeze),
-            changes=changes,
-            error=error if status == "failed" else None,
-        )
-
-        path = f"retros/{stamp.strftime('%Y%m%d-%H%M%S')}-{role}-{job_id[:8]}.md"
         return bool(
-            await gitea_client.change_files(
-                repo_name,
-                "main",
-                [
-                    {
-                        "path": path,
-                        "content_b64": base64.b64encode(content.encode()).decode(),
-                    }
-                ],
-                message=f"job record: {role} ({job_id[:8]}) — {status}",
+            await postgres_db.create_job_change_record(
+                job_id=job_id,
+                project_id=str(project_id) if project_id else None,
+                loop_id=None,
+                record_type="job_record",
+                role=role,
+                iteration=None,
+                status=status,
+                repo_name=job.get("repo_name"),
+                branch_name=job.get("branch_name"),
+                delivery_status=merge_status,
+                delivery_ref=_delivery_ref(job, merge_status),
+                delivery_sha=merged_sha,
+                completion_notes=_freeze_notes(freeze),
+                delivery_notes=[],
+                changes=changes,
+                error=(
+                    str(error)[:_ERROR_LIMIT] if status == "failed" and error else None
+                ),
             )
         )
     except Exception:

@@ -133,7 +133,8 @@ class TestWorkspacePodLive:
 
 
 class TestReleaseWorkspace:
-    """Owner-keyed release_workspace: snapshot (if ready) then delete pod + PVC."""
+    """Owner-keyed release_workspace: snapshot (if ready) then delete pod, and —
+    only when the caller says the work is truly over — its PVC."""
 
     def _prov(self):
         from orchestrator.services.container_provisioner import ContainerProvisioner
@@ -145,6 +146,7 @@ class TestReleaseWorkspace:
         )
         p.delete_workspace = AsyncMock(return_value=True)
         p.delete_workspace_pvc = AsyncMock(return_value=True)
+        p._delete_service = AsyncMock(return_value=True)
         snap = MagicMock()
         snap.is_available = True
         snap.capture_vm_snapshot = AsyncMock()
@@ -190,6 +192,36 @@ class TestReleaseWorkspace:
         p._k8s_available = False
         assert await p.release_workspace(WorkspaceOwner.session("t1")) is False
         p.delete_workspace.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_reclaim_volume_false_keeps_the_pvc(self):
+        """The resumable-session contract: snapshot + drop the pod, keep the volume.
+
+        ``end_thread`` without ?permanent leaves the thread in 'ended', which
+        ``resume_thread`` accepts — so destroying the volume here would hand the
+        user an empty workspace the next time they reopen a session they never
+        deleted. The pod and Service go (both are cheap to recreate); the data
+        stays.
+        """
+        p = self._prov()
+        owner = WorkspaceOwner.session("t1")
+        assert await p.release_workspace(owner, reclaim_volume=False) is True
+        # Still snapshotted + torn down — only the volume is spared.
+        p._snapshot_service.capture_vm_snapshot.assert_awaited_once()
+        p.delete_workspace.assert_awaited_once_with(owner)
+        p.delete_workspace_pvc.assert_not_called()
+        # The Service follows the pod, not the volume: recreating it on the next
+        # create_workspace is a 409-idempotent no-op, so it costs nothing to drop.
+        p._delete_service.assert_awaited_once_with(owner)
+
+    @pytest.mark.asyncio
+    async def test_reclaim_volume_defaults_to_true(self):
+        """The permanent-delete path is the default — a caller that means
+        "this work is over" needs no extra argument to reclaim storage."""
+        p = self._prov()
+        owner = WorkspaceOwner.session("t1")
+        assert await p.release_workspace(owner) is True
+        p.delete_workspace_pvc.assert_awaited_once_with(owner)
 
 
 class TestPodManifest:
@@ -655,11 +687,21 @@ class TestSecurityHardening:
         manifest = self._build_manifest()
         assert len(manifest["spec"]["containers"]) == 1
 
-    def test_workspace_data_is_emptydir(self):
-        """Workspace storage must be ephemeral (emptyDir), not persistent."""
+    def test_workspace_data_defaults_to_emptydir_without_a_claim(self):
+        """A manifest built with no PVC gets emptyDir — the flag-off default.
+
+        NOT a statement that workspace storage must be ephemeral: under
+        ``WORKSPACE_PVC_ENABLED`` both jobs and sessions are PVC-backed and the
+        builder mounts the claim instead (see TestCreateWorkspacePvc). The
+        security posture this class pins is about privilege and host access, and
+        is indifferent to which of the two volume kinds is mounted; what it does
+        pin is that a workspace never silently gets *some other* volume source
+        when the caller asked for no claim.
+        """
         manifest = self._build_manifest()
         volumes = {v["name"]: v for v in manifest["spec"]["volumes"]}
         assert "emptyDir" in volumes["workspace-data"]
+        assert "persistentVolumeClaim" not in volumes["workspace-data"]
 
     def test_ssh_key_volume_is_readonly(self):
         """SSH key volume mount must be read-only."""
@@ -1048,7 +1090,13 @@ class TestAuthenticatedWorkspaceReadiness:
 
 
 class TestCreateWorkspacePvc:
-    """Branch (a): PVC-backed job workspaces (WORKSPACE_PVC_ENABLED)."""
+    """Branch (a): PVC-backed workspaces (WORKSPACE_PVC_ENABLED).
+
+    Covers BOTH owner kinds. Sessions were scoped out of v1 on the theory that
+    they rehydrate from Postgres, but Postgres holds the conversation, not the
+    working tree — and a session's pod is idle-reaped while the thread stays
+    resumable, so emptyDir quietly destroyed files a user could still reopen.
+    """
 
     @staticmethod
     def _provisioner(pvc_enabled: bool):
@@ -1117,8 +1165,58 @@ class TestCreateWorkspacePvc:
         assert "persistentVolumeClaim" not in vols["workspace-data"]
 
     @pytest.mark.asyncio
-    async def test_pvc_mode_skips_sessions_v1_scope(self):
+    async def test_pvc_mode_creates_and_mounts_pvc_for_session(self):
+        """Sessions are PVC-backed on the same flag as jobs, under their own name.
+
+        The mirror of test_pvc_mode_creates_and_mounts_pvc_for_job, and the
+        create-side half of the invariant the reclaim rules protect: an ended
+        session can only come back to its files if those files were on a volume
+        in the first place.
+        """
         p = self._provisioner(pvc_enabled=True)
+        pod_body, pvc_body = {}, {}
+        p._core_api = self._capture_core(pod_body, pvc_body)
+
+        with patch.object(p, "_wait_for_ready", new_callable=AsyncMock) as w:
+            w.return_value = "10.42.0.100"
+            result = await p.create_workspace(
+                WorkspaceOwner.session("abcdef123456-thread-uuid")
+            )
+
+        assert result is True
+        # Session prefix (mirrors the ws-thread-* pod split so `kubectl get
+        # pod,pvc` reads straight), thread label, RWO access mode.
+        assert pvc_body["metadata"]["name"] == "pvc-ws-thread-abcdef123456"
+        assert (
+            pvc_body["metadata"]["labels"]["srw/thread-id"]
+            == "abcdef123456-thread-uuid"
+        )
+        assert pvc_body["spec"]["accessModes"] == ["ReadWriteOnce"]
+        # The pod mounts the PVC, not an emptyDir
+        vols = {v["name"]: v for v in pod_body["spec"]["volumes"]}
+        assert (
+            vols["workspace-data"]["persistentVolumeClaim"]["claimName"]
+            == "pvc-ws-thread-abcdef123456"
+        )
+        assert "emptyDir" not in vols["workspace-data"]
+
+    def test_session_name_never_collides_with_a_job_name(self):
+        """Distinct prefixes, so a job and a session sharing an id prefix can
+        never be handed each other's volume."""
+        from orchestrator.services.container_provisioner import _pvc_name_for
+
+        shared = "abcdef123456-rest"
+        assert _pvc_name_for(WorkspaceOwner.job(shared)) == "pvc-workspace-abcdef123456"
+        assert (
+            _pvc_name_for(WorkspaceOwner.session(shared))
+            == "pvc-ws-thread-abcdef123456"
+        )
+
+    @pytest.mark.asyncio
+    async def test_session_disabled_uses_emptydir_and_creates_no_pvc(self):
+        """Mixed-fleet safety: one flag governs both kinds, and a cluster that
+        hasn't flipped it keeps today's emptyDir behavior for sessions too."""
+        p = self._provisioner(pvc_enabled=False)
         pod_body = {}
         core = self._capture_core(pod_body)
         core.create_namespaced_persistent_volume_claim = MagicMock()
@@ -1126,12 +1224,32 @@ class TestCreateWorkspacePvc:
 
         with patch.object(p, "_wait_for_ready", new_callable=AsyncMock) as w:
             w.return_value = "10.42.0.100"
-            await p.create_workspace(WorkspaceOwner.session("thread-abc-123456"))
+            await p.create_workspace(WorkspaceOwner.session("abcdef123456-thread"))
 
-        # v1: sessions stay emptyDir even with the flag on (brain is in Postgres)
         core.create_namespaced_persistent_volume_claim.assert_not_called()
         vols = {v["name"]: v for v in pod_body["spec"]["volumes"]}
         assert "emptyDir" in vols["workspace-data"]
+        assert "persistentVolumeClaim" not in vols["workspace-data"]
+
+    @pytest.mark.asyncio
+    async def test_session_pvc_create_failure_aborts_before_pod(self):
+        """Fail closed for sessions too — never downgrade to emptyDir on a PVC
+        error, which would trade a visible failure for silent data loss."""
+        p = self._provisioner(pvc_enabled=True)
+        core = MagicMock()
+        core.create_namespaced_pod = MagicMock()
+        core.create_namespaced_persistent_volume_claim = MagicMock(
+            side_effect=Exception("PVC API down")
+        )
+        p._core_api = core
+
+        result = await p.create_workspace(WorkspaceOwner.session("abcdef123456-thread"))
+
+        assert result is False
+        core.create_namespaced_pod.assert_not_called()
+        updates = p._db.merge_thread_workspace_context.call_args_list[-1][0][1]
+        assert updates["status"] == "failed"
+        assert "PVC" in updates["error"]
 
     @pytest.mark.asyncio
     async def test_pvc_create_failure_aborts_before_pod(self):
@@ -1350,6 +1468,16 @@ class TestWorkspaceService:
                 return updates
         return {}
 
+    @staticmethod
+    def _ready_thread_ctx(p):
+        """_ready_ctx for a session — _set_context routes threads to the other
+        merge helper."""
+        for call in p._db.merge_thread_workspace_context.call_args_list:
+            updates = call[0][1]
+            if updates.get("status") == "ready":
+                return updates
+        return {}
+
     @pytest.mark.asyncio
     async def test_pvc_mode_creates_headless_service_and_sets_dns_host(self):
         p = self._provisioner(pvc_enabled=True)
@@ -1380,6 +1508,34 @@ class TestWorkspaceService:
         )
 
     @pytest.mark.asyncio
+    async def test_pvc_mode_creates_headless_service_for_sessions_too(self):
+        """A PVC-backed session outlives its pod by design, so it needs the
+        stable DNS at least as much as a job: the agent caches its SSH dial
+        target, and every idle-reap-then-resume hands it a new pod IP."""
+        p = self._provisioner(pvc_enabled=True)
+        svc_body = {}
+        core = MagicMock()
+        core.create_namespaced_pod = MagicMock()
+        core.create_namespaced_persistent_volume_claim = MagicMock()
+        core.create_namespaced_service = lambda **kw: svc_body.update(
+            kw.get("body", {})
+        )
+        p._core_api = core
+
+        with patch.object(p, "_wait_for_ready", new_callable=AsyncMock) as w:
+            w.return_value = "10.42.0.100"
+            ok = await p.create_workspace(WorkspaceOwner.session("abcdef123456-thread"))
+
+        assert ok is True
+        assert svc_body["metadata"]["name"] == "ws-thread-abcdef123456"
+        assert svc_body["spec"]["clusterIP"] == "None"
+        assert svc_body["spec"]["selector"]["srw/thread-id"] == "abcdef123456-thread"
+        assert (
+            self._ready_thread_ctx(p).get("host")
+            == f"ws-thread-abcdef123456.{p._namespace}.svc.cluster.local"
+        )
+
+    @pytest.mark.asyncio
     async def test_disabled_creates_no_service_and_no_host(self):
         p = self._provisioner(pvc_enabled=False)
         core = MagicMock()
@@ -1394,6 +1550,21 @@ class TestWorkspaceService:
         core.create_namespaced_service.assert_not_called()
         # emptyDir workspaces keep the IP path (no stable host)
         assert "host" not in self._ready_ctx(p)
+
+    @pytest.mark.asyncio
+    async def test_disabled_creates_no_service_for_sessions_either(self):
+        p = self._provisioner(pvc_enabled=False)
+        core = MagicMock()
+        core.create_namespaced_pod = MagicMock()
+        core.create_namespaced_service = MagicMock()
+        p._core_api = core
+
+        with patch.object(p, "_wait_for_ready", new_callable=AsyncMock) as w:
+            w.return_value = "10.42.0.100"
+            await p.create_workspace(WorkspaceOwner.session("abcdef123456-thread"))
+
+        core.create_namespaced_service.assert_not_called()
+        assert "host" not in self._ready_thread_ctx(p)
 
     @pytest.mark.asyncio
     async def test_delete_service_idempotent_on_404(self):

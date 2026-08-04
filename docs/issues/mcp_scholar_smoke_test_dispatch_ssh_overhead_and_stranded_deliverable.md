@@ -43,11 +43,11 @@ wrong-tree acceptance questions for this batch.
 
 It does **not** yet prove the exact requeue/resume credential-restoration path or
 the server-enforced required-deliverable gate. The connector still advertises
-the old MCP contract, the local k3d projected-key mode remains a development
-quirk, `delegation.enabled=false` is not a real capability gate, and the paper
-providers are broken in the deployed environment. Runtime containment remains
-separate in `job_runtime_containment_gap.md`; the successful batch now supplies
-its first main-cluster Scholar baseline.
+the old MCP contract, `delegation.enabled=false` is not a real capability gate,
+and the paper providers are broken in the deployed environment. The local k3d
+projected-key incompatibility was fixed and accepted on 2026-08-04. Runtime
+containment remains separate in `job_runtime_containment_gap.md`; the successful
+batch now supplies its first main-cluster Scholar baseline.
 
 **Severity:**
 
@@ -164,7 +164,7 @@ proven from a newly created main-cluster worker after deployment.
 | F11 | `pause_job` is a preemption primitive that immediately re-enters dispatch, while its MCP description reads like an operator hold | Confirmed live + code | P1 operator control |
 | F12 | There was no usable live steer/interrupt channel because `send_message_to_job` requires a thread ID and the job had no message thread | Confirmed live | P2 |
 | F13 | The original runs never reached Git, leaving the wrong-tree/worktree concern untested | Closed for the fresh path: five isolated job branches passed; resume remains separate | Acceptance passed |
-| F14 | The local k3d authenticated readiness gate correctly rejected the SSH key, but for a chart/dev-runtime incompatibility already described in chart comments: the root-running dev orchestrator invoked OpenSSH on a root-owned `0444` projected key | Confirmed local + source | P0 local acceptance |
+| F14 | The local k3d authenticated readiness gate correctly rejected the root-owned `0444` projected key; all SSH consumers now resolve a runtime-owned `0600` staged copy, and a real workspace handshake passed | Fixed and accepted on k3d 2026-08-04 | Closed |
 | F15 | `delegation.enabled=false` persisted in the resolved local config but did not remove or disable `spawn_subagent`; the model ignored the textual prohibition and launched three readers (33 additional LLM calls) | Confirmed local + source | P1 cost / contract |
 | F16 | Local Tavily calls were real provider errors caused by broken k3d external DNS, but `_direct_web_search` discarded the response's `error` field and reported a successful “No web results found” observation | Confirmed local provider probe + CoreDNS logs + source | P1 error semantics |
 | F17 | `search_papers` is incompatible with installed `arxiv==4.0.0`: source calls removed `Search.results()` instead of `Client.results(search)` | Fixed in checkout; installed-package tests + isolated live arXiv 4 search pass; deploy pending | P1 tool function |
@@ -173,7 +173,7 @@ proven from a newly created main-cluster worker after deployment.
 | F20 | `delegation.enabled=false` still leaves `spawn_subagent` in the bound tool definitions; the two disabled jobs made no calls only because the model obeyed prose | Confirmed live prompt/audit | P1 capability contract |
 | F21 | The generic transition todo says the stop condition comes first while requiring todo 1's review to have completed; two jobs repeated successful Git/file checks for 53 and 62 parent rounds before context compaction broke the attractor | Confirmed live + template | P1 overhead / completion risk |
 | F22 | One-shot skill delivery replaced continuous reinjection, but the passive `verify-before-done` gate rejected 50 completion calls because MiniMax repeatedly retried instead of reading the named skill | Confirmed live audit | P1 overhead; gate remained safe |
-| F23 | Main-cluster Tavily worked under heavy use; the paper job reproduced the arXiv 4 adapter error and Semantic Scholar HTTP 403, then recovered through web/arXiv pages | Source adapter/error semantics fixed; deployed S2 key is confirmed rejected and must be rotated | P1 deployment/credential acceptance |
+| F23 | Main-cluster Tavily worked under heavy use; the paper job reproduced the arXiv 4 adapter error and Semantic Scholar HTTP 403, then recovered through web/arXiv pages | Source adapter/error semantics fixed; replacement-key request submitted; optional credential acceptance deferred | Resolved for incident |
 | F24 | The connector schema remains stale after the successful batch: no `required_deliverables`, obsolete manual-assignment copy, and incorrect `get_workspace_file` semantics | Confirmed from current connector schema | P1 deployment contract |
 | F25 | Citation traceability is inconsistent across successful reports: 1,083 registered sources produced 236 engine citations, while two reports used manual links with zero or near-zero engine citation coverage | Confirmed live stats/report reads | P1 quality contract |
 | F26 | CitationEngine skipped 380 auto-embedding attempts covering 359 unique source IDs; 374 exceeded the embedding backend's 64-input limit, while the source still counted as registered | Confirmed archived worker logs + source | P1 search/evidence quality |
@@ -697,7 +697,7 @@ efficient job that produces no usable deliverable is not.
   sandbox jobs.
 - [ ] Target the requeue/resume path specifically so restored non-persisted SSH
   identity fields are proven rather than inferred from a fresh dispatch.
-- [ ] Stage the projected key into a runtime-owned `0600` identity in local and
+- [x] Stage the projected key into a runtime-owned `0600` identity in local and
   deployed environments, then pass the authenticated k3d workspace handshake.
 
 ### P0-C — restore the research-to-Git result path — main web path accepted; paper tools open
@@ -890,15 +890,13 @@ This is not a key-pair mismatch. `container_provisioner._wait_for_ready` invokes
 the OpenSSH client from the orchestrator pod. The local dev orchestrator runs as
 root; Kubernetes projects the root-owned secret with `defaultMode: 0444`; and
 OpenSSH refuses an identity owned by its own UID when group/world-readable.
-`helm/templates/orchestrator/deployment.yaml` already documents this exact dev
-case and says the key should be stage-copied to a runtime-owned `0600` file, but
-that staging path is not implemented. Production's non-root process may avoid
-OpenSSH's owner check on the root-owned file, but acceptance should use a
-runtime-owned `0600` copy in both environments rather than rely on that
-difference.
-
-This means P0-B's diagnostic/classification code is effective, but its local k3d
-deployment acceptance is still red.
+The fix is centralized in `services.resolve_ssh_key_path`: a readable key that
+is not already runtime-owned with private permissions is atomically copied to a
+process-owned `0600` identity. All production SSH consumers use that resolver;
+the projected mount remains read-only and `0444`, so the non-root image can
+still read its source. On 2026-08-04 the live Tilt orchestrator reported the
+runtime-owned private path and authenticated to a newly provisioned k3d
+workspace on the first attempt. P0-B's local deployment acceptance is green.
 
 ### 13.3 The bounded instructions did not override Scholar policy
 
@@ -1186,6 +1184,16 @@ outage cannot take the web-capable worker fleet out of service. Detailed tests
 and the credential-rotation boundary are recorded in
 `overnight_minimax_m3_scholar_batch_2026-08-03.md`.
 
+On 2026-08-04 an operator submitted a request for a replacement Semantic
+Scholar key. That external, manually reviewed request may take time. F23 is
+closed for the current correctness incident because provider failures are now
+truthful and bounded, arXiv/web fallback remains productive, and Semantic
+Scholar is not a job-readiness dependency. When the key arrives, Vault/ESO
+rotation, new-worker creation, and the probe above remain a deferred acceptance
+check. A personal introductory key is not approved as the capacity or licensing
+model for a future multi-tenant SaaS; that requires a separate provider design
+or negotiated commercial agreement.
+
 F15 is also reconfirmed. In both jobs configured with
 `delegation.enabled=false`, the bound LLM tool definitions still contained
 `spawn_subagent`. Neither model invoked it, but only because it followed the
@@ -1277,8 +1285,9 @@ should be ordered as follows:
 
 1. **Functional:** refresh the MCP schema and prove a real
    `required_deliverables` contract; enforce delegation disablement; deploy the
-   paper-provider repair, rotate the rejected Semantic Scholar key, and pass the
-   worker-image probe.
+   paper-provider repair. Run the optional Semantic Scholar worker-image probe
+   after the requested replacement credential arrives; do not block functional
+   jobs on that external provider.
 2. **Shared context/evidence:** eliminate project-memory deadlocks and
    per-consumer TTL corruption, split embedding batches, make source-index
    coverage visible, and keep phase tags immutable/exact.
@@ -1289,6 +1298,6 @@ should be ordered as follows:
 5. **Containment:** add shadow no-progress telemetry using this batch as the
    successful baseline before arming holds or ceilings.
 
-The local k3d `0444` projected-key issue can remain deferred unless local
-sandbox acceptance itself becomes a required release gate. It no longer blocks
-the main-cluster correctness result.
+The local k3d `0444` projected-key issue is closed: the staged runtime identity
+passed a real sandbox handshake on 2026-08-04. It no longer remains as a
+separate release-gate exception.

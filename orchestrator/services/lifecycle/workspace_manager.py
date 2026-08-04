@@ -58,10 +58,36 @@ _IDLE_THREAD_STATUSES = frozenset({"ended"})
 # Terminal = bound work is finished; nothing to preserve beyond an existing
 # snapshot. Reapable = the pod is no longer needed at all — the union of
 # suspendable-idle (snapshot + free) and terminal (clean up).
+#
+# READ THIS BEFORE REUSING THESE SETS FOR STORAGE: "terminal" is a statement
+# about the POD, not about the VOLUME. A thread reaches 'ended' on an ordinary
+# 30-minute idle timeout (the agent's own idle-archive handler flips it) and is
+# still RESUMABLE from there — ``resume_thread`` in main.py requires exactly
+# ``status == "ended"`` to bring the session back. So 'ended' licenses a pod
+# teardown (that is how idle suspend saves money) and MUST NEVER license a PVC
+# delete: once sessions are PVC-backed, reclaiming on 'ended' would destroy the
+# user's working tree on an idle timeout — strictly worse than the emptyDir
+# behavior the PVC replaces. The volume-side predicate is
+# ``_is_volume_reclaimable``; keep the two apart.
+# See docs/features/workspace_pvc_backed_migration.md ("thread **deleted**, not
+# merely *ended*") and workspace_pvc_branch_a_implementation.md.
 _TERMINAL_JOB_STATUSES = frozenset({"completed", "failed", "cancelled"})
 _TERMINAL_THREAD_STATUSES = frozenset({"ended"})
 _REAPABLE_JOB_STATUSES = _IDLE_JOB_STATUSES | _TERMINAL_JOB_STATUSES
 _REAPABLE_THREAD_STATUSES = _IDLE_THREAD_STATUSES | _TERMINAL_THREAD_STATUSES
+
+# PVC names the backstop sweep owns, by owner kind. The create side is the
+# source of truth — ``_pvc_name_for`` in container_provisioner.py (workspace
+# pod, both kinds) and the session-agent claim in agent_provisioner.py — so
+# these prefixes must track those two spellings. Every name is
+# ``<prefix><owner_id[:12]>``. Anything NOT matched here (the shared
+# ``srw-workspace`` agent-scratch claim, unlabeled claims, foreign names) is out
+# of scope and is never deleted by this module.
+_JOB_PVC_PREFIX = "pvc-workspace-"
+_SESSION_PVC_PREFIXES = ("pvc-ws-thread-", "pvc-agent-s-")
+# Owner ids are truncated to 12 chars in PVC names (matching the pod names), so
+# a name-derived thread reference is a prefix, not a key.
+_PVC_ID_PREFIX_LEN = 12
 
 
 def expected_workspace_shas() -> set[str]:
@@ -193,6 +219,14 @@ def infra_transient_retry_pending(metadata: dict[str, Any]) -> bool:
 
 def _pod_volume_is_ephemeral(pod: Any) -> bool:
     """True if the pod's workspace-data volume is emptyDir (vs a PVC).
+
+    Reads the pod spec, not a flag, so a mixed fleet (some emptyDir, some PVC)
+    reconciles correctly mid-cutover. ``workspace-data`` is the volume name
+    ``container_provisioner._build_pod_manifest`` uses for BOTH owner kinds —
+    job and session execution pods come off the same builder — so a PVC-backed
+    session pod is correctly reported non-ephemeral here, which is what makes it
+    skip the reap-and-restore handoff in ``delete()`` (an S3 extract could
+    otherwise roll newer on-volume files back).
 
     Defaults to True (ephemeral) when the volume can't be read — matches the
     current fleet default and keeps the reaper conservative.
@@ -395,8 +429,12 @@ class WorkspaceInstanceManager:
     def _is_terminal(self, inst: Instance) -> bool:
         """Bound work is finished (vs merely paused) — nothing to preserve
         beyond an existing snapshot. A deleted row is definitively finished,
-        so orphans count as terminal (delete() then reclaims PVC + Service,
-        and give_up() won't recreate the pod)."""
+        so orphans count as terminal (give_up() won't recreate the pod).
+
+        POD-scoped only. Whether the PVC may be DESTROYED is a strictly
+        narrower question — see ``_is_volume_reclaimable``; an 'ended' thread is
+        terminal here (its pod may go) and NOT reclaimable there (its volume
+        must stay, because the session is resumable)."""
         if inst.metadata.get("bound_row_missing"):
             return True
         job_status = inst.metadata.get("job_status")
@@ -405,6 +443,48 @@ class WorkspaceInstanceManager:
             return job_status in _TERMINAL_JOB_STATUSES
         if thread_status:
             return thread_status in _TERMINAL_THREAD_STATUSES
+        return False
+
+    def _is_volume_reclaimable(self, inst: Instance) -> bool:
+        """May we DESTROY this instance's PVC? Strictly narrower than terminal.
+
+        Pod teardown and volume reclaim are different decisions and this module
+        must not conflate them:
+
+        * **Jobs** — unchanged from the emptyDir era: a completed/failed/
+          cancelled job is finished forever, so its volume goes with it. This is
+          the "PVC dies when the job dies" guard that made Branch (a)
+          acceptable after the orphan-PV leak class of the pre-emptyDir design.
+        * **Sessions** — NO thread status reclaims. 'ended' is not death: the
+          agent's idle-archive handler ends a session after 30 idle minutes and
+          ``resume_thread`` requires precisely that status to bring it back. If
+          'ended' reclaimed the volume, an ordinary coffee break would delete
+          the user's working tree — worse than the emptyDir behavior PVCs
+          replace. A session's volume is reclaimed only when the thread itself
+          is gone. See docs/features/workspace_pvc_backed_migration.md:186-191.
+
+        ``bound_row_missing`` is the deletion signal for both kinds and the ONLY
+        one for sessions: thread deletion is a hard ``DELETE FROM threads``
+        (postgres.py ``delete_thread``), there is no 'deleted' status to read,
+        and ``list_instances`` sets this flag only when the lookup SUCCEEDED and
+        found no row. A lookup that merely failed leaves the metadata bare and
+        lands on the ``False`` fall-through below — unknown state never
+        destroys data.
+        """
+        # Row confirmed absent → the job/thread was permanently deleted. Nothing
+        # can ever restore or resume from this volume, so it is pure garbage.
+        # (The reconciler additionally age-gates orphans via ``is_reapable`` so
+        # the provisioning window — pod created, row not yet persisted — cannot
+        # be mistaken for a deletion.)
+        if inst.metadata.get("bound_row_missing"):
+            return True
+        job_status = inst.metadata.get("job_status")
+        if job_status:
+            return job_status in _TERMINAL_JOB_STATUSES
+        # Sessions (``thread_status`` present) and unknown/unbound instances both
+        # fall through: keep the volume. Fail-safe wins — a leaked 10Gi volume is
+        # an operational annoyance the backstop sweep collects once the thread is
+        # actually deleted; a deleted one is unrecoverable user data.
         return False
 
     async def is_dirty(self, inst: Instance) -> bool:
@@ -518,10 +598,16 @@ class WorkspaceInstanceManager:
 
         Ephemeral storage → delete the pod (state already unrecoverable).
         PVC-backed + non-terminal → recreate the pod against the same PVC so the
-        volume reattaches; the PVC is NOT deleted. PVC-backed + terminal → the
-        ``delete`` call below already reclaimed the PVC, so do NOT recreate
-        (recreating a pod for finished work would be pointless and would race
-        that delete). Branch (a): see workspace_pvc_branch_a_implementation.md.
+        volume reattaches; the PVC is NOT deleted. PVC-backed + terminal → do
+        NOT recreate: for a finished job the ``delete`` call below reclaimed the
+        volume too, and for an 'ended' (idle) session the volume is deliberately
+        kept but the pod is not wanted — the next ``/resume`` runs
+        ``create_workspace``, which reattaches that same claim by its
+        deterministic name. Either way a fresh pod here would be pointless (and,
+        for the job, would race the reclaim). ``_is_terminal`` is therefore the
+        right predicate for this branch, NOT ``_is_volume_reclaimable``: the
+        question is "does anyone still need a running pod", not "may the volume
+        die". Branch (a): see workspace_pvc_branch_a_implementation.md.
         """
         bound = inst.bound_to
         if not bound:
@@ -655,6 +741,11 @@ class WorkspaceInstanceManager:
         # decision) resumes with its files. PVC-backed pods skip this: their
         # state survives on the volume and an S3 extract could roll newer
         # files back. The provisioner wrote 'deleted' above; overwrite it.
+        # Sessions ride the same rule and land on the correct side of it: a
+        # PVC-backed session pod reports volume_ephemeral=False (its
+        # ``workspace-data`` volume is the claim), so it stays 'deleted' and the
+        # next attach recreates a pod that reattaches the live volume, while an
+        # emptyDir session still hands off through S3.
         # See docs/issues/vm_upgrade_pause_workspace_reaped_before_approval.md.
         if (
             not self._is_terminal(inst)
@@ -679,41 +770,69 @@ class WorkspaceInstanceManager:
                 logger.exception("Failed to mark %s suspended after reap", inst.id)
         # PVC GC (Branch a leak guard): a PVC-backed workspace keeps its volume
         # across pod recreates (suspend/restore, drift recovery, give_up
-        # reattach), so we reclaim it ONLY when the bound work is terminal —
-        # completed/failed/cancelled job, ended thread. That is the
-        # "PVC dies when the job dies" guard the emptyDir-era simplification
-        # asked for. emptyDir instances have no PVC (skip); a missing PVC is an
-        # idempotent 404. The backstop reap_orphans() sweep covers the cases
-        # this inline path can miss (pod already gone, delete failed, restart).
-        if self._is_terminal(inst) and not inst.metadata.get("volume_ephemeral", True):
+        # reattach), so we reclaim it ONLY when the volume itself is garbage:
+        # a completed/failed/cancelled JOB, or a THREAD whose row is gone
+        # (deleted). Deliberately NOT ``_is_terminal``: that set counts an
+        # 'ended' thread as terminal, and an ended thread is resumable — every
+        # 30-minute idle timeout would have destroyed the session's working
+        # tree. See ``_is_volume_reclaimable`` for the full rule.
+        # emptyDir instances have no PVC (skip); a missing PVC is an idempotent
+        # 404. The backstop reap_orphans() sweep covers the cases this inline
+        # path can miss (pod already gone, delete failed, restart) — and for
+        # sessions it is the *primary* path, since a thread is usually deleted
+        # while it has no live pod at all.
+        if self._is_volume_reclaimable(inst) and not inst.metadata.get(
+            "volume_ephemeral", True
+        ):
             try:
                 await self._provisioner.delete_workspace_pvc(owner)
                 logger.info(
-                    "Terminal workspace PVC reclaimed for %s %s",
+                    "Workspace PVC reclaimed for %s %s (work is gone, not merely idle)",
                     owner.kind,
                     owner.id,
                 )
             except Exception:
-                logger.exception("Failed to delete terminal PVC for %s", inst.id)
+                logger.exception("Failed to delete reclaimable PVC for %s", inst.id)
             # The stable-DNS Service shares the PVC's lifecycle — reclaim it too.
+            # It follows the volume, not the pod: an idle-reaped session keeps
+            # both (a resume reattaches the claim and the Service already points
+            # at the recreated pod), and recreating a Service is a 409-idempotent
+            # no-op anyway, so keeping one costs nothing.
             try:
                 await self._provisioner._delete_service(owner)
             except Exception:
-                logger.exception("Failed to delete terminal Service for %s", inst.id)
+                logger.exception("Failed to delete reclaimable Service for %s", inst.id)
 
     async def reap_orphans(self) -> int:
-        """Backstop GC: delete job workspace PVCs whose job is terminal or gone.
+        """Backstop GC: delete workspace PVCs whose owning work is gone.
 
-        The inline terminal delete (``delete()``) handles the common path, but a
+        The inline delete (``delete()``) handles the common path, but a
         PVC can outlive its pod — the pod was already gone when teardown ran, the
         inline delete failed, or the orchestrator restarted mid-teardown. Such a
         PVC never surfaces as a live ``Instance`` (it has no pod), so the
         reconciler's per-instance reap can't see it. This once-per-tick sweep
-        lists job workspace PVCs directly and deletes any whose owning job is
-        terminal (completed/failed/cancelled) or no longer exists, AND that has
-        no live pod. emptyDir fleets have no such PVCs → no-op. Runs regardless
-        of ``WORKSPACE_PVC_ENABLED`` so a rollback (flag flipped off) still
-        drains leftover PVCs as their jobs finish.
+        lists workspace PVCs directly, and for each one with no live pod applies
+        the SAME asymmetric rule as ``_is_volume_reclaimable``:
+
+        * **Job** PVCs (``pvc-workspace-*``, ``srw/job-id``) — reaped when the
+          job is terminal (completed/failed/cancelled) **or** its row is gone.
+        * **Session** PVCs (``pvc-ws-thread-*`` for the workspace pod,
+          ``pvc-agent-s-*`` for the session agent pod, both ``srw/thread-id``) —
+          reaped ONLY when the ``threads`` row is genuinely absent. Status is
+          never consulted: an 'ended' thread is resumable (30-minute idle
+          timeout ends sessions routinely), so status-based reclaim here would
+          be exactly the data-destroying bug this rule exists to prevent.
+          Because sessions are usually deleted while their pod is already gone
+          (idle-reaped), this sweep — not the inline path — is the primary
+          reclaim route for them.
+
+        Everything else is left alone: the shared ``srw-workspace`` agent-scratch
+        claim, unlabeled claims, foreign names. emptyDir fleets have no such PVCs
+        → no-op. Runs regardless of ``WORKSPACE_PVC_ENABLED`` so a rollback (flag
+        flipped off) still drains leftover PVCs as their work finishes.
+
+        Every uncertain branch keeps the volume: DB error, unreadable owner id,
+        live pod, or a row that still exists all ``continue`` without deleting.
 
         Returns the number of PVCs deleted.
         """
@@ -733,20 +852,87 @@ class WorkspaceInstanceManager:
         items = list(getattr(pvcs, "items", []) or [])
         if not items:
             return 0
-        # One pod list → the set of job ids that still have a live workspace
-        # pod. Never reap a PVC out from under a running pod; the instance path
-        # tears down pod+PVC together for those.
-        live_job_ids = {
-            (p.metadata.labels or {}).get("srw/job-id") for p in await self._list_pods()
-        }
-        live_job_ids.discard(None)
+        # One pod list → the owner ids that still have a live workspace pod.
+        # Never reap a PVC out from under a running pod; the instance path tears
+        # down pod+PVC together for those. Thread ids are also stored truncated
+        # to the PVC-name length so a name-derived reference (see below) matches
+        # a live pod whose label carries the full uuid.
+        #
+        # Note the selector only covers *workspace* pods; a session's agent pod
+        # (``srw-agent-s-*``, own claim ``pvc-agent-s-*``) is not in it. That is
+        # tolerable because the reclaim gate for sessions is "the thread row is
+        # gone" — at which point the agent pod is being torn down too — and K8s'
+        # pvc-protection finalizer holds a still-mounted claim in Terminating
+        # rather than yanking the volume out from under a running pod.
+        live_job_ids: set[str] = set()
+        live_thread_ids: set[str] = set()
+        for pod in await self._list_pods():
+            pod_labels = pod.metadata.labels or {}
+            pod_job_id = pod_labels.get("srw/job-id")
+            if pod_job_id:
+                live_job_ids.add(pod_job_id)
+            pod_thread_id = pod_labels.get("srw/thread-id")
+            if pod_thread_id:
+                live_thread_ids.add(pod_thread_id)
+                live_thread_ids.add(pod_thread_id[:_PVC_ID_PREFIX_LEN])
         reaped = 0
+        # A session can own two claims (workspace pod + agent pod); its Service
+        # is shared, so reclaim it at most once per thread.
+        services_reclaimed: set[str] = set()
         for pvc in items:
             name = pvc.metadata.name
-            job_id = (pvc.metadata.labels or {}).get("srw/job-id")
-            # v1 scope: job workspace PVCs only (pvc-workspace-*). Skip the
-            # shared agent scratch PVC, session PVCs, and anything unlabeled.
-            if not job_id or not name.startswith("pvc-workspace-"):
+            pvc_labels = pvc.metadata.labels or {}
+            job_id = pvc_labels.get("srw/job-id")
+            session_prefix = next(
+                (p for p in _SESSION_PVC_PREFIXES if name.startswith(p)), None
+            )
+            if session_prefix:
+                # Owner reference: the full thread uuid from the label (both
+                # provisioners stamp it) with the name's 12-char id suffix as a
+                # fallback, so a label-less legacy claim is still collectable
+                # rather than leaking forever. Strip by prefix length, never by
+                # splitting on '-' — a truncated uuid contains one.
+                thread_ref = (
+                    pvc_labels.get("srw/thread-id") or name[len(session_prefix) :]
+                )
+                if not thread_ref:
+                    continue
+                if (
+                    thread_ref in live_thread_ids
+                    or thread_ref[:_PVC_ID_PREFIX_LEN] in live_thread_ids
+                ):
+                    continue
+                exists = await self._thread_row_exists(thread_ref)
+                # None = lookup failed (unknown) and True = thread still there
+                # (ended sessions live here — resumable, volume stays). Only a
+                # definitive False, i.e. the row is gone, reclaims.
+                if exists is not False:
+                    continue
+                try:
+                    if await self._provisioner._delete_pvc(name):
+                        reaped += 1
+                        logger.info(
+                            "Orphan session PVC reaped: %s (thread=%s gone)",
+                            name,
+                            thread_ref,
+                        )
+                except Exception:
+                    logger.exception("Orphan PVC delete failed: %s", name)
+                if thread_ref not in services_reclaimed:
+                    services_reclaimed.add(thread_ref)
+                    try:
+                        await self._provisioner._delete_service(
+                            WorkspaceOwner.session(thread_ref)
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Orphan Service delete failed for thread %s", thread_ref
+                        )
+                continue
+            # Job workspace PVCs (pvc-workspace-*). Anything else — the shared
+            # agent-scratch PVC, unlabeled claims, foreign names — is out of
+            # scope and never touched.
+            if not job_id or not name.startswith(_JOB_PVC_PREFIX):
                 continue
             if job_id in live_job_ids:
                 continue
@@ -787,7 +973,8 @@ class WorkspaceInstanceManager:
         if reaped:
             logger.warning(
                 "Orphan PVC sweep reclaimed %d workspace PVC(s) — inline "
-                "terminal-delete missed them (pod gone / delete failed / restart)",
+                "delete missed them (pod gone / delete failed / restart, or a "
+                "deleted session whose pod was already idle-reaped)",
                 reaped,
             )
         return reaped
@@ -839,6 +1026,50 @@ class WorkspaceInstanceManager:
                 "Failed to fetch thread %s for workspace lifecycle", thread_id
             )
             return _FETCH_FAILED
+
+    async def _thread_row_exists(self, thread_ref: str) -> bool | None:
+        """Does a ``threads`` row still exist for a session PVC's owner?
+
+        Three-way, like ``_fetch_job``/``_fetch_thread``: ``True`` (row present),
+        ``False`` (lookup succeeded and found nothing — the thread was
+        permanently deleted), ``None`` (the lookup itself failed / no DB). Only a
+        definitive ``False`` may reclaim a volume; ``None`` keeps it.
+
+        This is the deletion signal for sessions, and the only one available:
+        deleting a thread is a hard ``DELETE FROM threads``
+        (``postgres.delete_thread``) — there is no 'deleted' status, and the
+        statuses that DO exist ('ended', 'suspended') are all resumable.
+
+        ``thread_ref`` is normally the full uuid from the PVC's ``srw/thread-id``
+        label, but falls back to the 12-char id embedded in the PVC name, so the
+        comparison is a left-prefix of the reference's own length rather than an
+        equality on ``id``. A prefix could in principle match a *different*
+        thread; the only consequence is "row found" → keep the volume, which is
+        the safe direction. Lower-casing matches ``uuid::text`` output for the
+        same reason: a case mismatch would read as "gone" and delete.
+        """
+        if self._db is None:
+            return None
+        ref = (thread_ref or "").strip().lower()
+        if not ref:
+            return None
+        try:
+            async with self._db.acquire() as conn:
+                row = await conn.fetchrow(
+                    # Casts are explicit so the parameter's type never has to be
+                    # inferred from an overloaded function (``length`` accepts
+                    # text and bytea) — an ambiguous Parse here would surface as
+                    # a lookup failure, i.e. a volume we then keep forever.
+                    "SELECT id FROM threads "
+                    "WHERE left(id::text, length($1::text)) = $1::text LIMIT 1",
+                    ref,
+                )
+        except Exception:
+            logger.exception(
+                "Orphan PVC sweep: thread lookup failed for %s — skipping", ref
+            )
+            return None
+        return row is not None
 
     async def _live_shared_child_exists(
         self, parent_job_id: str, pod_name: str | None

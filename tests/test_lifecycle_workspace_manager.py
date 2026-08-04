@@ -981,10 +981,21 @@ class TestGiveUp:
         )
 
 
-def _make_pvc(name: str, job_id: str | None = None):
+def _make_pvc(name: str, job_id: str | None = None, thread_id: str | None = None):
+    """A PVC as the sweep sees it: name + owner label.
+
+    ``thread_id`` stamps ``srw/thread-id`` the way both provisioners do for
+    session claims (workspace pod ``pvc-ws-thread-*``, agent pod
+    ``pvc-agent-s-*``); neither label set makes the claim foreign.
+    """
     pvc = MagicMock()
     pvc.metadata.name = name
-    pvc.metadata.labels = {"srw/job-id": job_id} if job_id else {}
+    labels: dict[str, str] = {}
+    if job_id:
+        labels["srw/job-id"] = job_id
+    if thread_id:
+        labels["srw/thread-id"] = thread_id
+    pvc.metadata.labels = labels
     return pvc
 
 
@@ -1145,7 +1156,16 @@ class TestDeleteTerminalPvc:
         container.delete_workspace_pvc.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_terminal_thread_pvc_backed_uses_session_owner(self):
+    async def test_ended_thread_keeps_its_pvc_because_it_is_resumable(self):
+        """THE session invariant: ending a session must not destroy its volume.
+
+        'ended' is terminal for the POD and not for the VOLUME. The agent's
+        idle-archive handler flips a thread to 'ended' after 30 idle minutes,
+        and ``resume_thread`` requires exactly that status to bring the session
+        back — so reclaiming here would delete a user's working tree on a coffee
+        break, which is strictly worse than the emptyDir behavior PVCs replace.
+        The pod still goes (that is how idle suspend saves money).
+        """
         mgr, container, *_ = _make_manager()
         container.delete_workspace_pvc = AsyncMock(return_value=True)
         inst = Instance(
@@ -1162,9 +1182,106 @@ class TestDeleteTerminalPvc:
         container.delete_workspace.assert_awaited_once_with(
             WorkspaceOwner.session("t1")
         )
+        container.delete_workspace_pvc.assert_not_called()
+        # The Service follows the volume here, not the pod: a resume reattaches
+        # the claim and the stable DNS should still point at it.
+        container._delete_service.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_no_thread_status_licenses_a_volume_delete(self):
+        """Not just 'ended' — no thread status at all licenses a volume delete.
+
+        'suspended' and 'active' are equally resumable, and the day someone adds
+        a new one it must default to keeping data. Only the row going away
+        reclaims (see the sibling below).
+        """
+        for status in ("ended", "suspended", "active"):
+            mgr, container, *_ = _make_manager()
+            container.delete_workspace_pvc = AsyncMock(return_value=True)
+            inst = Instance(
+                kind="workspace",
+                id="ws-thread-a",
+                bound_to="t1",
+                metadata={
+                    "labels": {"srw/thread-id": "t1"},
+                    "thread_status": status,
+                    "volume_ephemeral": False,
+                },
+            )
+            assert mgr._is_volume_reclaimable(inst) is False, status
+            await mgr.delete(inst, grace_s=0)
+            container.delete_workspace_pvc.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_deleted_thread_pvc_backed_reclaims_with_session_owner(self):
+        """The one session case that DOES reclaim: the thread row is gone.
+
+        Thread deletion is a hard ``DELETE FROM threads`` — there is no 'deleted'
+        status to read — so ``bound_row_missing`` is the only deletion signal,
+        and it is set only when the lookup succeeded and found nothing.
+        """
+        mgr, container, *_ = _make_manager()
+        container.delete_workspace_pvc = AsyncMock(return_value=True)
+        inst = Instance(
+            kind="workspace",
+            id="ws-thread-a",
+            bound_to="t1",
+            metadata={
+                "labels": {"srw/thread-id": "t1"},
+                "bound_row_missing": True,
+                "volume_ephemeral": False,
+            },
+        )
+        assert mgr._is_volume_reclaimable(inst) is True
+        await mgr.delete(inst, grace_s=0)
+        container.delete_workspace.assert_awaited_once_with(
+            WorkspaceOwner.session("t1")
+        )
         container.delete_workspace_pvc.assert_awaited_once_with(
             WorkspaceOwner.session("t1")
         )
+        container._delete_service.assert_awaited_once_with(WorkspaceOwner.session("t1"))
+
+    @pytest.mark.asyncio
+    async def test_unknown_binding_never_reclaims(self):
+        """A failed DB lookup leaves the metadata bare — and bare must mean keep.
+
+        The fall-through has to be "keep": a leaked 10Gi volume is an
+        operational annoyance the backstop sweep collects later; a deleted one
+        is unrecoverable.
+        """
+        mgr, container, *_ = _make_manager()
+        container.delete_workspace_pvc = AsyncMock(return_value=True)
+        inst = Instance(
+            kind="workspace",
+            id="ws-thread-a",
+            bound_to="t1",
+            metadata={"labels": {"srw/thread-id": "t1"}, "volume_ephemeral": False},
+        )
+        assert mgr._is_volume_reclaimable(inst) is False
+        await mgr.delete(inst, grace_s=0)
+        container.delete_workspace_pvc.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_terminal_job_still_reclaims_its_volume(self):
+        """Regression guard for the asymmetry: jobs are unchanged. A finished
+        job is finished forever, so its volume goes with it — that is the
+        "PVC dies when the job dies" guard Branch (a) shipped on.
+        (test_terminal_job_pvc_backed_deletes_pvc covers the delete() wiring;
+        this pins the predicate across the whole terminal set.)"""
+        mgr, *_ = _make_manager()
+        for status in ("completed", "failed", "cancelled"):
+            inst = Instance(
+                kind="workspace",
+                id="workspace-a",
+                bound_to="j1",
+                metadata={
+                    "labels": {"srw/job-id": "j1"},
+                    "job_status": status,
+                    "volume_ephemeral": False,
+                },
+            )
+            assert mgr._is_volume_reclaimable(inst) is True, status
 
     @pytest.mark.asyncio
     async def test_pod_delete_failure_skips_pvc_delete(self):
@@ -1321,6 +1438,180 @@ class TestReapOrphans:
         mgr, container, _, _, _ = _make_manager(k8s_available=False)
         n = await mgr.reap_orphans()
         assert n == 0
+
+
+class TestReapOrphanSessionPvcs:
+    """The session half of the backstop sweep, and the primary reclaim route for
+    sessions: a thread is normally deleted while its pod is already idle-reaped,
+    so the inline delete() path never sees it.
+
+    The rule is deliberately asymmetric with jobs — status is NEVER consulted
+    for a session, only the existence of the ``threads`` row.
+    """
+
+    @staticmethod
+    def _wire_pvcs(container, pvcs):
+        pvc_list = MagicMock()
+        pvc_list.items = pvcs
+        container._core_api.list_namespaced_persistent_volume_claim.return_value = (
+            pvc_list
+        )
+        container._delete_pvc = AsyncMock(return_value=True)
+
+    @pytest.mark.asyncio
+    async def test_reaps_workspace_pvc_whose_thread_row_is_gone(self):
+        # fetchrow returns None (no row) → the thread was permanently deleted.
+        mgr, container, _, _, _ = _make_manager(pods=[], thread_rows={})
+        self._wire_pvcs(
+            container, [_make_pvc("pvc-ws-thread-tgone", thread_id="tgone")]
+        )
+        with patch(
+            "orchestrator.services.lifecycle.workspace_manager.asyncio.to_thread",
+            side_effect=_fake_to_thread,
+        ):
+            n = await mgr.reap_orphans()
+        assert n == 1
+        container._delete_pvc.assert_awaited_once_with("pvc-ws-thread-tgone")
+        container._delete_service.assert_awaited_once_with(
+            WorkspaceOwner.session("tgone")
+        )
+
+    @pytest.mark.asyncio
+    async def test_reaps_session_agent_pvc_whose_thread_row_is_gone(self):
+        """The session agent pod's own claim (agent_provisioner) is in scope —
+        it carries the same ``srw.io/component: agent-workspace`` label, so
+        without this branch it would be listed by the sweep and then leak
+        forever."""
+        mgr, container, _, _, _ = _make_manager(pods=[], thread_rows={})
+        self._wire_pvcs(container, [_make_pvc("pvc-agent-s-tgone", thread_id="tgone")])
+        with patch(
+            "orchestrator.services.lifecycle.workspace_manager.asyncio.to_thread",
+            side_effect=_fake_to_thread,
+        ):
+            n = await mgr.reap_orphans()
+        assert n == 1
+        container._delete_pvc.assert_awaited_once_with("pvc-agent-s-tgone")
+
+    @pytest.mark.asyncio
+    async def test_both_claims_of_one_thread_share_a_single_service_delete(self):
+        mgr, container, _, _, _ = _make_manager(pods=[], thread_rows={})
+        self._wire_pvcs(
+            container,
+            [
+                _make_pvc("pvc-ws-thread-tgone", thread_id="tgone"),
+                _make_pvc("pvc-agent-s-tgone", thread_id="tgone"),
+            ],
+        )
+        with patch(
+            "orchestrator.services.lifecycle.workspace_manager.asyncio.to_thread",
+            side_effect=_fake_to_thread,
+        ):
+            n = await mgr.reap_orphans()
+        assert n == 2
+        container._delete_service.assert_awaited_once_with(
+            WorkspaceOwner.session("tgone")
+        )
+
+    @pytest.mark.asyncio
+    async def test_skips_pvc_whose_thread_still_exists(self):
+        """An 'ended' thread is still a row, and a row means resumable.
+
+        This is the sweep-side twin of
+        TestDeleteTerminalPvc::test_ended_thread_keeps_its_pvc_because_it_is_resumable
+        — status is not even read here, existence is the whole test.
+        """
+        mgr, container, _, _, _ = _make_manager(
+            pods=[], thread_rows={"tended": {"id": "tended", "status": "ended"}}
+        )
+        self._wire_pvcs(
+            container, [_make_pvc("pvc-ws-thread-tended", thread_id="tended")]
+        )
+        with patch(
+            "orchestrator.services.lifecycle.workspace_manager.asyncio.to_thread",
+            side_effect=_fake_to_thread,
+        ):
+            n = await mgr.reap_orphans()
+        assert n == 0
+        container._delete_pvc.assert_not_called()
+        container._delete_service.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_skips_pvc_with_a_live_workspace_pod(self):
+        """Never yank a volume out from under a running pod — the instance path
+        owns that teardown."""
+        pod = _make_pod(
+            "ws-thread-tlive", labels={"srw/thread-id": "tlive-full-uuid-value"}
+        )
+        mgr, container, _, _, _ = _make_manager(pods=[pod], thread_rows={})
+        self._wire_pvcs(
+            container,
+            [_make_pvc("pvc-ws-thread-tlive", thread_id="tlive-full-uuid-value")],
+        )
+        with patch(
+            "orchestrator.services.lifecycle.workspace_manager.asyncio.to_thread",
+            side_effect=_fake_to_thread,
+        ):
+            n = await mgr.reap_orphans()
+        assert n == 0
+        container._delete_pvc.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_live_pod_match_survives_the_12_char_truncation(self):
+        """A pod label carries the full uuid; an unlabeled claim only has the
+        12 chars in its name. The live check has to compare both spellings, or
+        a legacy claim would be reaped while its pod is still mounting it."""
+        pod = _make_pod(
+            "ws-thread-tlive", labels={"srw/thread-id": "tlive-full-uuid-value"}
+        )
+        mgr, container, _, _, _ = _make_manager(pods=[pod], thread_rows={})
+        self._wire_pvcs(container, [_make_pvc("pvc-ws-thread-tlive-full-u")])
+        with patch(
+            "orchestrator.services.lifecycle.workspace_manager.asyncio.to_thread",
+            side_effect=_fake_to_thread,
+        ):
+            n = await mgr.reap_orphans()
+        assert n == 0
+        container._delete_pvc.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_db_lookup_failure_does_not_delete(self):
+        """``_thread_row_exists`` → None (lookup failed) must read as "unknown",
+        never as "gone". A transient DB blip that deleted every session volume
+        in the namespace is the worst outcome this module can produce."""
+        mgr, container, _, _, db = _make_manager(pods=[])
+        db.acquire = MagicMock(side_effect=RuntimeError("db down"))
+        self._wire_pvcs(container, [_make_pvc("pvc-ws-thread-terr", thread_id="terr")])
+        with patch(
+            "orchestrator.services.lifecycle.workspace_manager.asyncio.to_thread",
+            side_effect=_fake_to_thread,
+        ):
+            n = await mgr.reap_orphans()
+        assert n == 0
+        container._delete_pvc.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_thread_row_exists_is_three_way(self):
+        mgr, _, _, _, db = _make_manager(
+            thread_rows={"tlive": {"id": "tlive", "status": "ended"}}
+        )
+        assert await mgr._thread_row_exists("tlive") is True
+        assert await mgr._thread_row_exists("tgone") is False
+        db.acquire = MagicMock(side_effect=RuntimeError("db down"))
+        assert await mgr._thread_row_exists("tlive") is None
+
+    @pytest.mark.asyncio
+    async def test_unlabeled_session_claim_is_still_collectable_by_name(self):
+        """A claim that predates the label falls back to the 12-char id in its
+        own name, so it is collectable instead of leaking forever."""
+        mgr, container, _, _, _ = _make_manager(pods=[], thread_rows={})
+        self._wire_pvcs(container, [_make_pvc("pvc-ws-thread-tgone")])
+        with patch(
+            "orchestrator.services.lifecycle.workspace_manager.asyncio.to_thread",
+            side_effect=_fake_to_thread,
+        ):
+            n = await mgr.reap_orphans()
+        assert n == 1
+        container._delete_pvc.assert_awaited_once_with("pvc-ws-thread-tgone")
 
 
 def test_pod_volume_is_ephemeral_helper():

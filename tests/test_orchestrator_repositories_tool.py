@@ -93,21 +93,30 @@ async def test_list_project_repositories_defaults_to_context_project(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_get_default_project_repository_uses_jobs_role(monkeypatch):
+async def test_get_default_project_repository_prefers_source_role(monkeypatch):
     project_id = "project-123"
     url = f"http://localhost:8085/api/projects/{project_id}/repositories"
     cap = _CapturingClient(
         {
             url: [
                 {
+                    "id": "legacy-repo",
+                    "project_id": project_id,
+                    "name": "legacy-jobs",
+                    "role": "jobs",
+                    "repo_url": "https://git.example/legacy.git",
+                    "branch": "main",
+                    "read_only": False,
+                },
+                {
                     "id": "repo-1",
                     "project_id": project_id,
                     "name": "hotel-erp",
-                    "role": "jobs",
+                    "role": "source",
                     "repo_url": "https://git.example/hotel-erp.git",
                     "branch": "develop",
                     "read_only": False,
-                }
+                },
             ]
         }
     )
@@ -123,10 +132,126 @@ async def test_get_default_project_repository_uses_jobs_role(monkeypatch):
 
     result = await get_default.ainvoke({})
 
-    assert cap.gets == [(url, {"role": "jobs"})]
+    assert cap.gets == [(url, {})]
     assert "--- repo-1 ---" in result
     assert "Name: hotel-erp" in result
     assert "Branch: develop" in result
+
+
+@pytest.mark.asyncio
+async def test_managed_knowledge_repo_is_not_mistaken_for_default_source(monkeypatch):
+    project_id = "project-123"
+    url = f"http://localhost:8085/api/projects/{project_id}/repositories"
+    cap = _CapturingClient(
+        {
+            url: [
+                {
+                    "id": "knowledge-repo",
+                    "project_id": project_id,
+                    "name": "project-123-knowledge",
+                    "role": "knowledge",
+                    "repo_url": "https://git.example/project-123-knowledge.git",
+                    "branch": "main",
+                    "read_only": False,
+                }
+            ]
+        }
+    )
+    monkeypatch.setattr(
+        "src.tools.orchestrator.repositories._get_client", lambda **kw: cap
+    )
+
+    tools = create_orchestrator_tools(
+        ToolContext(user_id="user-xyz", _project_id=project_id)
+    )
+    get_default = _tool_by_name(tools, "get_default_project_repository")
+
+    result = await get_default.ainvoke({})
+
+    assert "No writable source repository is linked" in result
+    assert "project cloud folder" in result
+    assert "project-123-knowledge" not in result
+
+
+@pytest.mark.asyncio
+async def test_legacy_jobs_repo_is_not_a_default_or_checkout_fallback(monkeypatch):
+    project_id = "project-123"
+    thread_id = "thread-1"
+    public_url = f"http://localhost:8085/api/projects/{project_id}/repositories"
+    internal_url = f"http://localhost:8085/api/agents/threads/{thread_id}/workspace"
+    legacy = {
+        "id": "legacy-repo",
+        "project_id": project_id,
+        "name": "project-123-jobs",
+        "role": "jobs",
+        "repo_url": "https://git.example/project-123-jobs.git",
+        "branch": "main",
+        "read_only": False,
+    }
+    cap = _CapturingClient(
+        {public_url: [legacy], internal_url: {"repositories": [legacy]}}
+    )
+    monkeypatch.setattr(
+        "src.tools.orchestrator.repositories._get_client", lambda **kw: cap
+    )
+
+    tools = create_orchestrator_tools(
+        ToolContext(
+            user_id="user-xyz",
+            _project_id=project_id,
+            _thread_id=thread_id,
+            workspace_manager=_workspace_manager(),
+        )
+    )
+
+    get_default = _tool_by_name(tools, "get_default_project_repository")
+    checkout = _tool_by_name(tools, "checkout_project_repository")
+    assert "No writable source repository is linked" in await get_default.ainvoke({})
+    assert "No matching repository found" in await checkout.ainvoke({})
+
+
+@pytest.mark.asyncio
+async def test_managed_repository_cannot_be_checked_out_by_explicit_id(monkeypatch):
+    project_id = "project-123"
+    thread_id = "thread-1"
+    internal_url = f"http://localhost:8085/api/agents/threads/{thread_id}/workspace"
+    cap = _CapturingClient(
+        {
+            internal_url: {
+                "repositories": [
+                    {
+                        "id": "knowledge-repo",
+                        "project_id": project_id,
+                        "name": "project-123-knowledge",
+                        "role": "knowledge",
+                        "repo_url": "https://git.example/project-123-knowledge.git",
+                        "branch": "main",
+                        "read_only": False,
+                    }
+                ]
+            }
+        }
+    )
+    monkeypatch.setattr(
+        "src.tools.orchestrator.repositories._get_client", lambda **kw: cap
+    )
+    workspace = _workspace_manager()
+    tools = create_orchestrator_tools(
+        ToolContext(
+            user_id="user-xyz",
+            _project_id=project_id,
+            _thread_id=thread_id,
+            workspace_manager=workspace,
+        )
+    )
+    checkout = _tool_by_name(tools, "checkout_project_repository")
+
+    with patch("src.managers.git_manager.GitManager.clone") as mock_clone:
+        result = await checkout.ainvoke({"repo_id": "knowledge-repo"})
+
+    mock_clone.assert_not_called()
+    assert "managed role 'knowledge'" in result
+    assert "not checkout-eligible" in result
 
 
 @pytest.mark.asyncio
@@ -162,7 +287,7 @@ async def test_checkout_project_repository_clones_internal_repo_without_printing
                         "id": "repo-1",
                         "project_id": project_id,
                         "name": "hotel-erp",
-                        "role": "jobs",
+                        "role": "source",
                         "repo_url": repo_url,
                         "branch": "main",
                         "read_only": False,
@@ -222,7 +347,7 @@ async def test_checkout_project_repository_refuses_workspace_root(monkeypatch):
                         "id": "repo-1",
                         "project_id": project_id,
                         "name": "hotel-erp",
-                        "role": "jobs",
+                        "role": "source",
                         "repo_url": "http://admin:secret@srw-gitea:3000/org/hotel-erp.git",
                         "branch": "main",
                         "read_only": False,

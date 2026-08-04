@@ -67,6 +67,12 @@ def _make_vector_db(rows: list[dict] | None = None, *, broken: bool = False):
     return db
 
 
+def _make_record_db(*, inserted: bool = True) -> MagicMock:
+    db = MagicMock()
+    db.create_job_change_record = AsyncMock(return_value=inserted)
+    return db
+
+
 def _job(**over) -> dict:
     row = {
         "id": JOB_ID,
@@ -356,38 +362,28 @@ class TestDeriveChanges:
 
 class TestWriteJobRecord:
     @pytest.mark.asyncio
-    async def test_writes_timestamped_record_to_main(self) -> None:
-        g = _make_gitea()
+    async def test_inserts_structured_record(self) -> None:
+        db = _make_record_db()
         vdb = _make_vector_db([{"note_id": "chose-jwt-over-oauth"}])
 
         ok = await write_job_record(
-            g, _job(), status="completed", vector_db=vdb, now=NOW
+            db, _job(), status="completed", vector_db=vdb, now=NOW
         )
 
         assert ok is True
-        cf = g.change_files.await_args
-        assert cf.args[0] == "project-68137e29-jobs"
-        assert cf.args[1] == "main"
-        path = cf.args[2][0]["path"]
-        assert path == "retros/20260801-091422-developer-abcdef12.md"
-        text = _written_text(g)
-        fm = _frontmatter(text)
-        assert fm["type"] == "job_record"
-        assert fm["job"] == str(JOB_ID)
-        assert fm["project"] == str(PROJECT_ID)
-        assert fm["role"] == "developer"
-        assert fm["branch"] == "job/abcdef12"
-        assert fm["status"] == "completed"
-        kinds = [c["kind"] for c in fm["changes"]]
+        kwargs = db.create_job_change_record.await_args.kwargs
+        assert kwargs["record_type"] == "job_record"
+        assert kwargs["job_id"] == str(JOB_ID)
+        assert kwargs["project_id"] == str(PROJECT_ID)
+        assert kwargs["role"] == "developer"
+        assert kwargs["branch_name"] == "job/abcdef12"
+        assert kwargs["status"] == "completed"
+        assert kwargs["delivery_status"] == "isolated"
+        kinds = [c["kind"] for c in kwargs["changes"]]
         assert kinds == ["git", "knowledge"]
-        assert fm["changes"][1]["ref"] == ["chose-jwt-over-oauth"]
-        assert fm["changes"][1]["verified"] is True
-        # Body: title, first description line only, agent notes.
-        assert f"# developer · {str(JOB_ID)[:8]}" in text
-        assert "Implement line recovery" in text
-        assert "Second line is not the title." not in text
-        assert "Shipped AC-11; tests green." in text
-        assert cf.kwargs["message"] == "job record: developer (abcdef12) — completed"
+        assert kwargs["changes"][1]["ref"] == ["chose-jwt-over-oauth"]
+        assert kwargs["changes"][1]["verified"] is True
+        assert kwargs["completion_notes"] == "Shipped AC-11; tests green."
         # The knowledge scan used the job+project-scoped knowledge_index path.
         q = vdb._conn.fetch.await_args
         assert "knowledge_index" in q.args[0]
@@ -395,102 +391,89 @@ class TestWriteJobRecord:
         assert q.args[2] == str(PROJECT_ID)
 
     @pytest.mark.asyncio
-    async def test_no_repo_is_skipped_silently(self) -> None:
-        g = _make_gitea()
-        ok = await write_job_record(g, _job(repo_name=None), status="completed")
-        assert ok is False
-        g.list_contents.assert_not_called()
-        g.change_files.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_existing_record_for_job_blocks_second_write(self) -> None:
-        """Belt-and-braces dedupe: ANY retros/*-<jobid8>.md on main — the
-        loop's NNN name included — means this job is already recorded."""
-        g = _make_gitea(
-            listing=[
-                {"name": "015-developer-abcdef12.md", "type": "file"},
-            ]
+    async def test_repo_less_job_is_still_recorded(self) -> None:
+        db = _make_record_db()
+        ok = await write_job_record(
+            db, _job(repo_name=None, branch_name=None), status="completed"
         )
-        ok = await write_job_record(g, _job(), status="completed", now=NOW)
+        assert ok is True
+        kwargs = db.create_job_change_record.await_args.kwargs
+        assert kwargs["repo_name"] is None
+        assert kwargs["changes"] == []
+        assert kwargs["delivery_status"] == "none"
+
+    @pytest.mark.asyncio
+    async def test_database_primary_key_dedupes(self) -> None:
+        db = _make_record_db(inserted=False)
+        ok = await write_job_record(db, _job(), status="completed", now=NOW)
         assert ok is False
-        g.change_files.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_other_jobs_records_do_not_block(self) -> None:
-        g = _make_gitea(
-            listing=[
-                {"name": "015-developer-99999999.md", "type": "file"},
-                {"name": "notes", "type": "dir"},
-            ]
-        )
-        ok = await write_job_record(g, _job(), status="completed", now=NOW)
-        assert ok is True
-
-    @pytest.mark.asyncio
-    async def test_missing_retros_dir_reads_as_no_record(self) -> None:
-        g = _make_gitea()
-        g.list_contents = AsyncMock(return_value=None)  # 404 — fresh repo
-        ok = await write_job_record(g, _job(), status="completed", now=NOW)
-        assert ok is True
+        db.create_job_change_record.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_vector_store_down_degrades_to_no_knowledge_entry(self) -> None:
-        g = _make_gitea()
+        db = _make_record_db()
         ok = await write_job_record(
-            g,
+            db,
             _job(),
             status="completed",
             vector_db=_make_vector_db(broken=True),
             now=NOW,
         )
         assert ok is True
-        fm = _frontmatter(_written_text(g))
-        assert [c["kind"] for c in fm["changes"]] == ["git"]
+        changes = db.create_job_change_record.await_args.kwargs["changes"]
+        assert [c["kind"] for c in changes] == ["git"]
 
     @pytest.mark.asyncio
-    async def test_failed_job_records_error_section(self) -> None:
-        g = _make_gitea()
+    async def test_failed_job_records_error(self) -> None:
+        db = _make_record_db()
         ok = await write_job_record(
-            g, _job(), status="failed", error="LLM gave up", now=NOW
+            db, _job(), status="failed", error="LLM gave up", now=NOW
         )
         assert ok is True
-        text = _written_text(g)
-        assert "status: failed" in text
-        assert text.endswith("\n## Error\n\nLLM gave up\n")
+        kwargs = db.create_job_change_record.await_args.kwargs
+        assert kwargs["status"] == "failed"
+        assert kwargs["error"] == "LLM gave up"
 
     @pytest.mark.asyncio
     async def test_completed_job_ignores_stray_error(self) -> None:
-        g = _make_gitea()
+        db = _make_record_db()
         await write_job_record(
-            g, _job(), status="completed", error="teardown blip", now=NOW
+            db, _job(), status="completed", error="teardown blip", now=NOW
         )
-        assert "## Error" not in _written_text(g)
+        assert db.create_job_change_record.await_args.kwargs["error"] is None
 
     @pytest.mark.asyncio
-    async def test_row_merge_status_lands_in_frontmatter_and_git_entry(self) -> None:
-        g = _make_gitea()
+    async def test_cloud_delivery_status_adds_verified_cloud_entry(self) -> None:
+        db = _make_record_db()
         await write_job_record(
-            g, _job(merge_status="merged"), status="completed", now=NOW
+            db,
+            _job(merge_status="cloud-applied", diff_status="accepted"),
+            status="completed",
+            now=NOW,
         )
-        fm = _frontmatter(_written_text(g))
-        assert fm["merge_status"] == "merged"
-        assert fm["changes"][0]["action"] == "merge"
+        kwargs = db.create_job_change_record.await_args.kwargs
+        assert kwargs["delivery_status"] == "cloud-applied"
+        assert kwargs["delivery_ref"] == "project-cloud"
+        assert [c["kind"] for c in kwargs["changes"]] == ["git", "cloud"]
+        assert kwargs["changes"][1]["verified"] is True
 
     @pytest.mark.asyncio
     async def test_freeze_jsonb_string_parsed_and_notes_truncated(self) -> None:
-        g = _make_gitea()
+        db = _make_record_db()
         freeze = json.dumps({"notes": "x" * 7000})
-        await write_job_record(g, _job(freeze_data=freeze), status="completed", now=NOW)
-        text = _written_text(g)
-        assert "[truncated]" in text
-        assert "x" * 6000 in text
-        assert "x" * 6001 not in text
+        await write_job_record(
+            db, _job(freeze_data=freeze), status="completed", now=NOW
+        )
+        notes = db.create_job_change_record.await_args.kwargs["completion_notes"]
+        assert notes.endswith("[truncated]")
+        assert "x" * 6000 in notes
+        assert "x" * 6001 not in notes
 
     @pytest.mark.asyncio
     async def test_agent_declared_changes_pass_through_unverified(self) -> None:
-        g = _make_gitea()
+        db = _make_record_db()
         await write_job_record(
-            g,
+            db,
             _job(
                 freeze_data={
                     "notes": "opened a PR",
@@ -509,33 +492,36 @@ class TestWriteJobRecord:
             status="completed",
             now=NOW,
         )
-        fm = _frontmatter(_written_text(g))
-        claim = fm["changes"][-1]
+        claim = db.create_job_change_record.await_args.kwargs["changes"][-1]
         assert claim["ref"] == "https://github.com/cust/api/pull/42"
         assert claim["verified"] is False
 
     @pytest.mark.asyncio
-    async def test_change_files_failure_returns_false(self) -> None:
-        g = _make_gitea(change_ok=False)
-        ok = await write_job_record(g, _job(), status="completed", now=NOW)
+    async def test_insert_failure_returns_false(self) -> None:
+        db = _make_record_db(inserted=False)
+        ok = await write_job_record(db, _job(), status="completed", now=NOW)
         assert ok is False
 
     @pytest.mark.asyncio
     async def test_writer_never_raises(self) -> None:
-        """Best-effort contract: even an exploding gitea client is swallowed."""
-        g = MagicMock()
-        g.list_contents = AsyncMock(side_effect=RuntimeError("gitea down"))
-        ok = await write_job_record(g, _job(), status="completed", now=NOW)
+        """Best-effort contract: an exploding database call is swallowed."""
+        db = _make_record_db()
+        db.create_job_change_record.side_effect = RuntimeError("database down")
+        ok = await write_job_record(db, _job(), status="completed", now=NOW)
         assert ok is False
 
     @pytest.mark.asyncio
-    async def test_config_name_sanitized_for_path(self) -> None:
-        g = _make_gitea()
+    async def test_config_name_sanitized_for_role(self) -> None:
+        db = _make_record_db()
         await write_job_record(
-            g, _job(config_name="weird role/name"), status="completed", now=NOW
+            db,
+            _job(config_name="weird role/name"),
+            status="completed",
+            now=NOW,
         )
-        path = g.change_files.await_args.args[2][0]["path"]
-        assert path == "retros/20260801-091422-weird-role-name-abcdef12.md"
+        assert (
+            db.create_job_change_record.await_args.kwargs["role"] == "weird-role-name"
+        )
 
 
 # =============================================================================
@@ -584,36 +570,37 @@ class TestRecordExistsForJob:
 class TestWriteJobChangeRecordHook:
     @pytest.mark.asyncio
     async def test_loop_jobs_are_left_to_the_loop_path(self) -> None:
-        g = _make_gitea()
+        db = _make_record_db()
         job = _job(context={"loop_id": "1a387b4d-0000-0000-0000-000000000000"})
-        ok = await write_job_change_record(job, "completed", gitea=g)
+        ok = await write_job_change_record(job, "completed", db=db)
         assert ok is False
-        g.list_contents.assert_not_called()
-        g.change_files.assert_not_called()
+        db.create_job_change_record.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_loop_stamp_in_jsonb_string_context_also_skips(self) -> None:
-        g = _make_gitea()
+        db = _make_record_db()
         job = _job(context=json.dumps({"loop_id": "1a387b4d"}))
-        ok = await write_job_change_record(job, "completed", gitea=g)
+        ok = await write_job_change_record(job, "completed", db=db)
         assert ok is False
-        g.change_files.assert_not_called()
+        db.create_job_change_record.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_non_loop_repo_job_gets_a_record(self) -> None:
-        g = _make_gitea()
-        ok = await write_job_change_record(_job(), "failed", gitea=g, error="boom")
+        db = _make_record_db()
+        ok = await write_job_change_record(_job(), "failed", db=db, error="boom")
         assert ok is True
-        text = _written_text(g)
-        assert "type: job_record" in text
-        assert "## Error" in text
+        kwargs = db.create_job_change_record.await_args.kwargs
+        assert kwargs["record_type"] == "job_record"
+        assert kwargs["error"] == "boom"
 
     @pytest.mark.asyncio
-    async def test_repo_less_job_skipped_silently(self) -> None:
-        g = _make_gitea()
-        ok = await write_job_change_record(_job(repo_name=None), "completed", gitea=g)
-        assert ok is False
-        g.change_files.assert_not_called()
+    async def test_repo_less_job_is_recorded(self) -> None:
+        db = _make_record_db()
+        ok = await write_job_change_record(
+            _job(repo_name=None, branch_name=None), "completed", db=db
+        )
+        assert ok is True
+        assert db.create_job_change_record.await_args.kwargs["repo_name"] is None
 
 
 # =============================================================================

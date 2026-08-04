@@ -1,10 +1,9 @@
 """The project's own knowledge base is indexed exactly once.
 
-Step 6 of docs/features/knowledge_base_repo_separation.md gives every new
-project a second managed repo (``project-<id8>-knowledge``) and auto-attaches
-it as a ``kb`` datasource. That datasource is a *management surface* — visible,
-listable, unlinkable — over notes that are already indexed under the project's
-own id.
+New projects get one managed repo (``project-<id8>-knowledge``) and
+auto-attach it as a ``kb`` datasource. That datasource is a *management
+surface* — visible, listable, unlinkable — over notes that are already indexed
+under the project's own id.
 
 If it were mistaken for an ordinary external KB, the sweep would index the same
 vault a second time under the datasource UUID and every note would appear twice
@@ -133,7 +132,7 @@ class TestProjectCreationProvisioning:
             )
 
     @pytest.mark.asyncio
-    async def test_creates_exactly_two_managed_repos(self):
+    async def test_creates_only_the_managed_knowledge_repo(self):
         db, gitea = self._db(), self._gitea()
 
         await self._create(db, gitea)
@@ -142,13 +141,11 @@ class TestProjectCreationProvisioning:
             call.kwargs["role"]: call.kwargs
             for call in db.add_project_repository.await_args_list
         }
-        assert set(by_role) == {"jobs", "knowledge"}
-        assert db.add_project_repository.await_count == 2
-        assert by_role["jobs"]["name"] == f"project-{ID8}-jobs"
+        assert set(by_role) == {"knowledge"}
+        assert db.add_project_repository.await_count == 1
         assert by_role["knowledge"]["name"] == f"project-{ID8}-knowledge"
         assert all(kwargs["is_managed"] for kwargs in by_role.values())
         assert [c.args[0] for c in gitea.create_repo.await_args_list] == [
-            f"project-{ID8}-jobs",
             f"project-{ID8}-knowledge",
         ]
 
@@ -187,32 +184,26 @@ class TestProjectCreationProvisioning:
         assert ID8 in db.create_datasource.await_args.kwargs["name"]
 
     @pytest.mark.asyncio
-    async def test_creator_gets_access_to_both_repos(self):
+    async def test_creator_gets_access_to_knowledge_repo(self):
         db, gitea = self._db(), self._gitea()
 
         await self._create(db, gitea)
 
         granted = {c.args[1] for c in gitea.grant_user_repo_access.await_args_list}
-        assert granted == {f"project-{ID8}-jobs", f"project-{ID8}-knowledge"}
+        assert granted == {f"project-{ID8}-knowledge"}
 
     @pytest.mark.asyncio
     async def test_gitea_hiccup_does_not_fail_project_creation(self):
-        """The knowledge repo is optional: resolve_kb_repo falls back to the
-        jobs repo, which is what every pre-separation project already does."""
+        """The knowledge repo remains optional when Gitea is unavailable."""
         db = self._db()
         gitea = self._gitea()
-        gitea.create_repo = AsyncMock(
-            side_effect=[
-                f"http://gitea/srw/project-{ID8}-jobs.git",
-                RuntimeError("502"),
-            ]
-        )
+        gitea.create_repo = AsyncMock(side_effect=RuntimeError("502"))
 
         project = await self._create(db, gitea)
 
         assert project["id"] == PROJECT_ID
         roles = [c.kwargs["role"] for c in db.add_project_repository.await_args_list]
-        assert roles == ["jobs"]
+        assert roles == []
         db.create_datasource.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -221,9 +212,7 @@ class TestProjectCreationProvisioning:
         would be worse than its absence."""
         db = self._db()
         gitea = self._gitea()
-        gitea.create_repo = AsyncMock(
-            side_effect=[f"http://gitea/srw/project-{ID8}-jobs.git", None]
-        )
+        gitea.create_repo = AsyncMock(return_value=None)
 
         project = await self._create(db, gitea)
 

@@ -250,6 +250,40 @@ class TestDeleteJobGiteaCleanup:
             )
 
     @pytest.mark.asyncio
+    async def test_legacy_stamped_shared_repo_is_never_deleted_with_job(self):
+        """Later legacy rows stored the shared repo name directly on the job.
+
+        The presence of ``repo_name`` must not make that shared project repo
+        look job-owned during migration cleanup.
+        """
+        job = {
+            "id": "12345678-1111-2222-3333-444444444444",
+            "repo_name": "project-68137e29-jobs",
+            "branch_name": "job/12345678",
+            "parent_job_id": None,
+            "project_id": "68137e29-1111-2222-3333-444444444444",
+        }
+
+        with (
+            patch(f"{MODULE}.postgres_db") as mock_db,
+            patch(f"{MODULE}.gitea_client") as mock_gitea,
+            _bypass_job_access_gate(job),
+        ):
+            mock_db.delete_job = AsyncMock(return_value=True)
+            mock_db.has_child_jobs = AsyncMock(return_value=False)
+            mock_gitea.is_initialized = True
+            mock_gitea.delete_branch = AsyncMock()
+            mock_gitea.delete_repo = AsyncMock()
+
+            result = await orch_main.delete_job(_stub_request(), str(job["id"]))
+
+        assert result == {"status": "deleted"}
+        mock_gitea.delete_branch.assert_awaited_once_with(
+            "project-68137e29-jobs", "job/12345678"
+        )
+        mock_gitea.delete_repo.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_gitea_not_initialized_skips_cleanup(self):
         """When Gitea is not initialized, cleanup is skipped entirely."""
         job = {"repo_name": "job-abc", "branch_name": None, "parent_job_id": None}

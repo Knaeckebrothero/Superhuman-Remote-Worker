@@ -185,47 +185,49 @@ class TestMergeLoopJobBranch:
 
 
 class TestWriteLoopRetro:
+    @staticmethod
+    def _db(*, inserted: bool = True) -> MagicMock:
+        db = MagicMock()
+        db.create_job_change_record = AsyncMock(return_value=inserted)
+        return db
+
     @pytest.mark.asyncio
-    async def test_writes_standardized_retro_to_main(self) -> None:
-        g = _make_gitea()
-        ctx = {"loop_role": "developer", "loop_iteration": 15}
+    async def test_writes_structured_loop_record(self) -> None:
+        db = self._db()
+        ctx = {
+            "loop_id": "1a387b4d-0000-0000-0000-000000000000",
+            "loop_role": "developer",
+            "loop_iteration": 15,
+        }
 
         ok = await write_loop_retro(
-            g,
-            _job(),
+            db,
+            _job(project_id="68137e29-0000-0000-0000-000000000000"),
             ctx=ctx,
-            merge_status="merged",
+            merge_status="cloud-applied",
             merged_sha="deadbeef" * 5,
         )
 
         assert ok is True
-        cf = g.change_files.await_args
-        assert cf.args[0] == "project-1a387b4d-jobs"
-        assert cf.args[1] == "main"
-        entry = cf.args[2][0]
-        assert entry["path"] == "retros/015-developer-abcdef12.md"
-        text = base64.b64decode(entry["content_b64"]).decode()
-        # OKF-style frontmatter carries the mechanical truth.
-        assert "type: retro" in text
-        assert "iteration: 15" in text
-        assert "role: developer" in text
-        assert f"job: {JOB_ID}" in text
-        assert "branch: job/abcdef12" in text
-        assert "merge_status: merged" in text
-        assert ("deadbeef" * 5) in text
-        # Body carries the agent's own completion notes.
-        assert "Shipped AC-11; tests green." in text
-        assert "merged" in cf.kwargs["message"]
+        kwargs = db.create_job_change_record.await_args.kwargs
+        assert kwargs["record_type"] == "loop_record"
+        assert kwargs["iteration"] == 15
+        assert kwargs["role"] == "developer"
+        assert kwargs["job_id"] == str(JOB_ID)
+        assert kwargs["delivery_status"] == "cloud-applied"
+        assert kwargs["delivery_sha"] == "deadbeef" * 5
+        assert kwargs["completion_notes"] == "Shipped AC-11; tests green."
+        assert [change["kind"] for change in kwargs["changes"]] == ["git", "cloud"]
 
     @pytest.mark.asyncio
     async def test_freeze_data_jsonb_string_is_parsed(self) -> None:
         """asyncpg returns JSONB as raw JSON strings — the retro writer must
         not crash or embed the raw JSON blob."""
-        g = _make_gitea()
+        db = self._db()
         job = _job(freeze_data=json.dumps({"notes": "String-typed freeze notes."}))
 
         ok = await write_loop_retro(
-            g,
+            db,
             job,
             ctx={"loop_role": "critic", "loop_iteration": 3},
             merge_status="empty",
@@ -233,18 +235,17 @@ class TestWriteLoopRetro:
         )
 
         assert ok is True
-        text = base64.b64decode(
-            g.change_files.await_args.args[2][0]["content_b64"]
-        ).decode()
-        assert "String-typed freeze notes." in text
-        assert '{"notes"' not in text
+        assert (
+            db.create_job_change_record.await_args.kwargs["completion_notes"]
+            == "String-typed freeze notes."
+        )
 
     @pytest.mark.asyncio
     async def test_failed_job_retro_records_failure(self) -> None:
-        g = _make_gitea()
+        db = self._db()
 
         ok = await write_loop_retro(
-            g,
+            db,
             _job(freeze_data=None),
             ctx={"loop_role": "developer", "loop_iteration": 4},
             merge_status="skipped",
@@ -254,28 +255,25 @@ class TestWriteLoopRetro:
         )
 
         assert ok is True
-        text = base64.b64decode(
-            g.change_files.await_args.args[2][0]["content_b64"]
-        ).decode()
-        assert "status: failed" in text
-        assert "agent crash-looped" in text
-        assert "(none recorded)" in text  # no freeze_data notes
+        kwargs = db.create_job_change_record.await_args.kwargs
+        assert kwargs["status"] == "failed"
+        assert kwargs["error"] == "agent crash-looped"
+        assert kwargs["completion_notes"] == "(none recorded)"
 
     @pytest.mark.asyncio
-    async def test_missing_repo_returns_false(self) -> None:
-        g = _make_gitea()
+    async def test_missing_repo_is_still_recorded(self) -> None:
+        db = self._db()
         ok = await write_loop_retro(
-            g, _job(repo_name=None), ctx={}, merge_status="merged", merged_sha=None
+            db, _job(repo_name=None), ctx={}, merge_status="no-changes", merged_sha=None
         )
-        assert ok is False
-        g.change_files.assert_not_called()
+        assert ok is True
+        assert db.create_job_change_record.await_args.kwargs["repo_name"] is None
 
     @pytest.mark.asyncio
-    async def test_change_files_failure_returns_false(self) -> None:
-        g = _make_gitea()
-        g.change_files = AsyncMock(return_value=False)
+    async def test_insert_conflict_returns_false(self) -> None:
+        db = self._db(inserted=False)
         ok = await write_loop_retro(
-            g,
+            db,
             _job(),
             ctx={"loop_iteration": 1},
             merge_status="merged",
@@ -284,15 +282,11 @@ class TestWriteLoopRetro:
         assert ok is False
 
     @pytest.mark.asyncio
-    async def test_merge_notes_render_as_their_own_section(self) -> None:
-        """§6.4: curated-merge observations (fallback warnings, missing
-        contracted paths) are ORCHESTRATOR notes — their own section, never
-        mixed into the agent's self-report. ``merge_status`` passes through
-        as given: ``curated`` renders like any other status."""
-        g = _make_gitea()
+    async def test_delivery_notes_are_structured(self) -> None:
+        db = self._db()
 
         ok = await write_loop_retro(
-            g,
+            db,
             _job(),
             ctx=CTX,
             merge_status="curated",
@@ -304,28 +298,21 @@ class TestWriteLoopRetro:
         )
 
         assert ok is True
-        text = base64.b64decode(
-            g.change_files.await_args.args[2][0]["content_b64"]
-        ).decode()
-        assert "merge_status: curated" in text
-        assert (
-            "## Merge notes\n\n"
-            "- curated merge: 1/2 contracted deliverable(s) copied to main @ deadbeef\n"
-            "- contracted deliverable NOT on the branch (not curated): docs/spec.md"
-        ) in text
-        # The agent's own notes stay where they always were.
-        assert "Shipped AC-11; tests green." in text
+        kwargs = db.create_job_change_record.await_args.kwargs
+        assert kwargs["delivery_status"] == "curated"
+        assert kwargs["delivery_notes"] == [
+            "curated merge: 1/2 contracted deliverable(s) copied to main @ deadbeef",
+            "contracted deliverable NOT on the branch (not curated): docs/spec.md",
+        ]
+        assert kwargs["completion_notes"] == "Shipped AC-11; tests green."
 
     @pytest.mark.asyncio
-    async def test_no_merge_notes_keeps_legacy_shape(self) -> None:
-        g = _make_gitea()
+    async def test_no_delivery_notes_stores_empty_array(self) -> None:
+        db = self._db()
         await write_loop_retro(
-            g, _job(), ctx=CTX, merge_status="merged", merged_sha=None
+            db, _job(), ctx=CTX, merge_status="no-changes", merged_sha=None
         )
-        text = base64.b64decode(
-            g.change_files.await_args.args[2][0]["content_b64"]
-        ).decode()
-        assert "## Merge notes" not in text
+        assert db.create_job_change_record.await_args.kwargs["delivery_notes"] == []
 
 
 class TestMergeLoopJobContribution:

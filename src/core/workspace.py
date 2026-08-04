@@ -36,7 +36,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Bounded retry for the jobs-repo clone. GitManager.clone returns None on any
+# Bounded retry for the job-repo clone. GitManager.clone returns None on any
 # failure without distinguishing transient (a momentary reachability blip during
 # an image rollout — the common case) from permanent (bad auth/URL), so we retry
 # blindly a few times: a permanent failure only costs a couple of cheap extra
@@ -583,71 +583,64 @@ class WorkspaceManager:
             self._git_manager = None
 
     def initialize_project_workspace(self) -> None:
-        """Initialize workspace from project repositories.
+        """Initialize an isolated job workspace plus project attachments.
 
-        For project jobs, the jobs repo IS the workspace root:
-        1. Clone jobs repo → workspace root
+        Project membership no longer selects a shared workspace repository:
+        1. Clone the job's own ``git_remote_url`` → workspace root
         2. Checkout job branch (create if needed)
         3. Create subdirectories
         4. Clone source/reference repos → repos/ subdirectory
         5. Update .gitignore to exclude cloned repos
+
+        ``repositories`` now means auxiliary project attachments. Legacy jobs
+        whose stored remote still names a shared jobs repo continue to work
+        because the root is resolved from the job's own URL, not from a role.
         """
-        if not self.config.repositories:
-            logger.warning(
-                "initialize_project_workspace called without repositories, falling back"
-            )
+        repo_url = self.config.git_remote_url
+        if not repo_url:
+            logger.warning("Project job has no job repo URL; using local git init")
             self.initialize()
+            self._clone_auxiliary_repos()
             return
 
-        # Find the jobs repo
-        jobs_repo = next(
-            (r for r in self.config.repositories if r["role"] == "jobs"),
-            None,
-        )
-        if not jobs_repo or not jobs_repo.get("repo_url"):
-            logger.warning(
-                "No jobs repo found in repositories, falling back to standard init"
-            )
-            self.initialize()
-            return
+        repo_path = str(repo_url).rstrip("/").rsplit("/", 1)[-1]
+        workspace_repo = {
+            "name": repo_path.removesuffix(".git") or "job-workspace",
+            "repo_url": repo_url,
+        }
 
-        # 1. Reuse or clone the jobs repo as workspace root.
+        # 1. Reuse or clone the isolated job repo as workspace root.
         #
         # A FIRST dispatch can land on an already-populated root: on the
         # container backend the scholar subjob provisions the parent's shared
-        # workspace pod and fully initializes it (jobs-repo clone + research)
+        # workspace pod and fully initializes it (job-repo clone + research)
         # before the parent ever runs, and critic/product-qa subjobs inherit a
         # populated parent workspace the same way. The agent-side reattach
         # gates are resume-only, so this path must cope on its own: cloning
         # into a non-empty root can never succeed, and retrying it just
         # produces the misleading reachability error below.
-        git_mgr = self._attach_existing_jobs_repo(jobs_repo)
+        git_mgr = self._attach_existing_workspace_repo(workspace_repo)
 
         # Empty root: clone (bounded retry+backoff — a momentary reachability
         # blip during an image rollout must not hard-fail the job on the first
         # miss; docs/done/coincident_infra_error_overrides_reported_job_outcome.md)
         if git_mgr is None:
             git_mgr = _clone_repo_with_retry(
-                jobs_repo["repo_url"], self._workspace_path, backend=self._backend
+                repo_url, self._workspace_path, backend=self._backend
             )
         if not git_mgr:
-            # F29 hardening: do NOT silently git-init here. A project job whose
-            # jobs repo won't clone is disconnected from `main`; proceeding would
-            # rebuild from scratch in a throwaway local git and lose every push
-            # on teardown — the exact run-5/6 failure, invisible because it was a
-            # warning. Fail loud instead: the raise propagates to agent._run's
-            # job-error handler (status=failed), so the loop advance counts it and
-            # rotates on rather than burning a night on work that can't land.
-            # (repo name only in the message — repo_url carries credentials.)
-            repo_name = jobs_repo.get("name", "<unknown>")
+            # Do not silently git-init here. A job whose delivery repo will not
+            # clone would rebuild in a disconnected local git and lose its work
+            # at teardown. The name is safe to log; the URL may carry credentials.
+            repo_name = workspace_repo["name"]
             raise RuntimeError(
-                f"Failed to clone project jobs repo '{repo_name}' — refusing to "
+                f"Failed to clone job workspace repo '{repo_name}' — refusing to "
                 "fall back to a disconnected git init (work would be lost on "
-                "teardown). Check jobs-repo URL reachability from this backend."
+                "teardown). Check repository reachability from this backend."
             )
 
         self._git_manager = git_mgr
-        logger.info(f"Cloned jobs repo as workspace root: {self._workspace_path}")
+        logger.info(f"Cloned job repo as workspace root: {self._workspace_path}")
 
         # 2. Checkout job branch
         branch = self.config.branch_name
@@ -670,8 +663,10 @@ class WorkspaceManager:
         self._initialized = True
         logger.info("Project workspace initialized successfully")
 
-    def _attach_existing_jobs_repo(self, jobs_repo: dict) -> Optional["GitManager"]:
-        """Attach to a pre-existing jobs-repo clone at the workspace root.
+    def _attach_existing_workspace_repo(
+        self, workspace_repo: dict
+    ) -> Optional["GitManager"]:
+        """Attach to a pre-existing job-repo clone at the workspace root.
 
         Returns None when the root is empty (the normal clone path applies).
         Raises RuntimeError when the root is populated but cannot be reused:
@@ -684,8 +679,8 @@ class WorkspaceManager:
         except ImportError:
             from src.managers.git_manager import GitManager
 
-        repo_name = jobs_repo.get("name", "<unknown>")
-        expected_url = jobs_repo["repo_url"]
+        repo_name = workspace_repo.get("name", "<unknown>")
+        expected_url = workspace_repo["repo_url"]
 
         if not self._backend.exists(".git"):
             try:
@@ -698,7 +693,7 @@ class WorkspaceManager:
             if entries:
                 raise RuntimeError(
                     f"Workspace root is not empty ({len(entries)} entries) and has "
-                    f"no git repo — refusing to clone jobs repo '{repo_name}' over "
+                    f"no git repo — refusing to clone job repo '{repo_name}' over "
                     "existing content. This usually means a pre-seeded or inherited "
                     "workspace was dispatched without resume handling."
                 )
@@ -712,7 +707,7 @@ class WorkspaceManager:
             raise RuntimeError(
                 f"Workspace root holds a git repo whose origin "
                 f"({GitManager._mask_url_static(origin)}) does not match "
-                f"project jobs repo '{repo_name}' — refusing to clone over "
+                f"expected job repo '{repo_name}' — refusing to clone over "
                 "it or push into it."
             )
         if not origin:
@@ -723,9 +718,9 @@ class WorkspaceManager:
             # reuse the repo — add_remote below restores push connectivity.
             probe = git_mgr._run_git(["remote", "get-url", "origin"])
             logger.warning(
-                "Existing jobs repo at workspace root has no readable origin "
+                "Existing job repo at workspace root has no readable origin "
                 "(rc=%s, stdout=%r, stderr=%r) — attaching and setting origin "
-                "to the project jobs repo '%s'",
+                "to the expected job repo '%s'",
                 probe.returncode,
                 GitManager._mask_url_static(probe.stdout.strip())[-200:],
                 GitManager._mask_url_static(probe.stderr.strip())[-200:],
@@ -735,7 +730,7 @@ class WorkspaceManager:
         # land in the repo config before any push.
         git_mgr.add_remote("origin", expected_url)
         logger.info(
-            "Reusing existing jobs-repo clone at workspace root "
+            "Reusing existing job-repo clone at workspace root "
             "(pre-initialized workspace, e.g. scholar-provisioned pod)"
         )
         return git_mgr
@@ -743,8 +738,8 @@ class WorkspaceManager:
     def _clone_auxiliary_repos(self) -> None:
         """Clone source/reference repositories into repos/ subdirectory.
 
-        Two roles are deliberately never cloned: ``jobs`` (it *is* the
-        workspace root) and ``knowledge`` (the KB vault is server-side —
+        Two roles are deliberately never cloned: legacy ``jobs`` (the job's
+        stored remote already owns the workspace root) and ``knowledge`` (the KB vault is server-side —
         notes are read through the KB tools and written via the
         orchestrator's materialisation endpoint, so a checkout would be a
         stale second copy nobody reads;
@@ -763,7 +758,7 @@ class WorkspaceManager:
 
         for repo in self.config.repositories:
             if repo["role"] == "jobs":
-                continue  # Jobs repo IS the workspace root
+                continue  # Legacy project workspace; never an auxiliary clone
             if repo["role"] == "knowledge":
                 continue  # KB vault is server-side; never checked out
 

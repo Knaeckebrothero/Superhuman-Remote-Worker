@@ -111,7 +111,7 @@ def patched_main(monkeypatch):
     db.get_loop_stage_member_statuses = AsyncMock(return_value={JOB_ID: "completed"})
     db.update_project_loop = AsyncMock(return_value=_loop_row())
     monkeypatch.setattr(main, "postgres_db", db)
-    monkeypatch.setattr(main, "_merge_and_retro_loop_job", AsyncMock())
+    monkeypatch.setattr(main, "_record_loop_job_outcome", AsyncMock())
     monkeypatch.setattr(main, "_notify_loop_user_questions", AsyncMock())
     monkeypatch.setattr(main, "notify_officer", AsyncMock(return_value=True))
     monkeypatch.setattr(main, "_kick_officer_event_drain", MagicMock())

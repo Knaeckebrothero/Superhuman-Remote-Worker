@@ -638,7 +638,7 @@ async def write_job_change_record(
     job: dict[str, Any],
     new_status: str,
     *,
-    gitea: Any,
+    db: Any,
     vector_db: Any = None,
     error: str | None = None,
     merge_status: str | None = None,
@@ -646,25 +646,21 @@ async def write_job_change_record(
 ) -> bool:
     """General per-job change record — the completion-path hook (§6.5).
 
-    The invariant (docs/features/workspace_and_change_records.md §5/§6.5):
-    every repo-backed job leaves exactly ONE record on the project repo's
-    ``main`` on reaching a terminal status (``completed`` | ``failed``) —
-    including jobs that merged nothing and failed jobs (a failure is
-    information). Jobs with no ``repo_name`` are skipped silently and safely.
+    Every job leaves exactly one structured database record on reaching a
+    terminal status (``completed`` | ``failed``), including jobs that deliver
+    no files and failed jobs (a failure is information).
 
     Loop jobs are skipped here: the loop advance records them itself
-    (``_merge_and_retro_loop_job`` → ``write_loop_retro``) with the merge
-    outcome it just produced — detected via the same loop-context stamp the
-    loop service keys off (``context.loop_id``, ``job_loop_id``). Belt and
-    braces, the writer is additionally idempotent by job id (an existing
-    ``retros/*-<jobid8>.md`` blocks a second write).
+    (``_record_loop_job_outcome`` → ``write_loop_retro``) with the cloud
+    delivery outcome — detected via the same loop-context stamp the
+    loop service keys off (``context.loop_id``, ``job_loop_id``). The
+    ``job_change_records.job_id`` primary key makes retries idempotent.
 
-    ``merge_status`` / ``merged_sha`` name a merge THIS transition just
-    performed (§6.6) so the record can carry it; omitted, the writer falls
-    back to whatever the job row carries.
+    ``merge_status`` / ``merged_sha`` carry a legacy merge or current delivery
+    outcome; omitted, the writer falls back to whatever the job row carries.
 
-    Thin hook by design — rendering, ``changes`` derivation and the
-    idempotence check live in ``services.job_records`` (same extraction
+    Thin hook by design — ``changes`` derivation and the insert live in
+    ``services.job_records`` (same extraction
     pattern as ``apply_deliverable_gate`` above). Best-effort: the writer
     logs and swallows its own failures; a record must never block
     completion handling.
@@ -675,7 +671,7 @@ async def write_job_change_record(
     if job_loop_id(job):
         return False
     return await write_job_record(
-        gitea,
+        db,
         job,
         status=new_status,
         error=error,
@@ -690,11 +686,15 @@ async def write_job_change_record(
 # docs/features/workspace_and_change_records.md
 # ---------------------------------------------------------------------------
 
-# Merge outcomes that mean "this job's contribution is ALREADY on main".
-# Same vocabulary as determine_job_status' coincident-error backstop above;
-# here it is the double-merge guard for a second terminal call on one job
-# (approve, then a late /complete report; a loop job re-reported).
-ALREADY_MERGED_STATUSES = ("merged", "curated")
+# Delivery outcomes that mean a second terminal callback must not attempt the
+# legacy project-repo merge compatibility path.
+ALREADY_MERGED_STATUSES = (
+    "merged",
+    "curated",
+    "cloud-applied",
+    "cloud-rejected",
+    "no-changes",
+)
 
 
 def job_has_file_contract(job: dict[str, Any]) -> bool:
@@ -722,14 +722,13 @@ def should_merge_job_contribution(
     in tests. The exclusions, in order (§6.6 "Invariants to preserve"):
 
     * anything but a successful ``completed`` — a failed job's partial
-      deliverables must not reach shared history (and the loop merge path
-      declines failed jobs identically, ``_merge_and_retro_loop_job``);
+      deliverables must not reach a destination;
     * **subjobs** — they branch ``subjob/<id>/<role>`` from the PARENT and
       land through the delegation graft, never into project ``main``;
-    * **loop jobs** — the loop advance already merged them (the retro is
-      their record);
-    * a job whose row already says ``merged``/``curated`` — the
-      double-merge backstop for a second terminal call;
+    * **loop jobs** — their isolated diff uses project-cloud delivery and the
+      loop advance owns their structured record;
+    * a job whose row already carries a terminal Git or cloud-delivery outcome
+      — the double-delivery backstop for a second terminal call;
     * no project, no project branch, or a per-job ``job-<id>`` repo (the
       agent worked directly on that repo's ``main``: nothing to merge);
     * **no file contract** — §6.6 policy: record only, the branch stays.
@@ -767,7 +766,7 @@ async def apply_terminal_job_side_effects(
     vector_db: Any = None,
     error: str | None = None,
 ) -> dict[str, Any]:
-    """Everything a job's terminal transition owes the project repo (§6.6).
+    """Run terminal compatibility delivery and persist structured history.
 
     ONE function behind BOTH terminal paths — the ``/complete`` handler and
     ``approve_job`` — so an approved job and an autonomy-``full`` job that
@@ -778,15 +777,13 @@ async def apply_terminal_job_side_effects(
 
     Two side effects, in order:
 
-    1. **Merge**, only when :func:`should_merge_job_contribution` says so —
-       i.e. a successful, non-subjob, non-loop project job carrying a FILE
-       contract. Delegates to ``merge_loop_job_contribution`` (the §6.4
-       curated merge; contracted paths only, audit PR closed unmerged) —
-       there is exactly one merge implementation. A job with **no** contract
-       is NOT merged at all: its branch stays, and the record below names it.
+    1. **Legacy merge compatibility**, only for a pre-migration job already
+       attached to a shared project repo. New roots are isolated and always
+       fail this gate; loop files use project-cloud delivery earlier in the
+       completion path.
     2. **Change record** via :func:`write_job_change_record`, carrying the
-       merge outcome this call just produced. Loop jobs are skipped inside
-       the writer (their retro is the record).
+       delivery outcome this call observed. Loop jobs are skipped inside the
+       writer because their advance owns the record.
 
     Best-effort by contract, like the record hook it replaces: every failure
     is logged and swallowed, so a Gitea outage can never fail an approval or
@@ -814,8 +811,8 @@ async def apply_terminal_job_side_effects(
         outcome["merge_skipped_reason"] = reason
         logger.info("Job %s: no terminal merge — %s", job_id[:8], reason)
     else:
-        # A raise is the same outcome as a returned merge-failed (mirrors
-        # _merge_and_retro_loop_job) — the branch kept everything either way.
+        # A raise is the same outcome as a returned merge-failed — the legacy
+        # branch kept everything either way.
         status, sha, notes = "merge-failed", None, []
         try:
             from services.project_loops import merge_loop_job_contribution
@@ -856,14 +853,14 @@ async def apply_terminal_job_side_effects(
         if await write_job_change_record(
             job,
             new_status,
-            gitea=gitea,
+            db=db,
             vector_db=vector_db,
             error=error,
             merge_status=outcome["merge_status"],
             merged_sha=outcome["merged_sha"],
         ):
             outcome["record_written"] = True
-            outcome["actions"].append("job change record written to main")
+            outcome["actions"].append("job change record written to database")
     except Exception:
         logger.warning(
             "Job %s: change-record write failed (non-fatal)", job_id, exc_info=True

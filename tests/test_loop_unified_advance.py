@@ -119,7 +119,8 @@ def _advance_patches(
     stack.enter_context(patch("main.postgres_db", db))
     stack.enter_context(
         patch(
-            "main._merge_and_retro_loop_job", AsyncMock(return_value=("skipped", None))
+            "main._record_loop_job_outcome",
+            AsyncMock(return_value=("no-changes", None)),
         )
     )
     stack.enter_context(patch("main._notify_loop_user_questions", AsyncMock()))

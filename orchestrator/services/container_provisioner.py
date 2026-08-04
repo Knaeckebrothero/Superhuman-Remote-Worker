@@ -61,16 +61,38 @@ def _env_flag(name: str, default: bool) -> bool:
     return raw.strip().lower() not in {"0", "false", "no", "off"}
 
 
+def _pvc_name_for(owner: WorkspaceOwner) -> str:
+    """Deterministic PVC name for an owner's workspace volume.
+
+    The SINGLE source of truth for both the create side (``create_workspace``)
+    and the reclaim side (``delete_workspace_pvc``, and through it the lifecycle
+    GC). Neither side may spell the name itself: a create/delete drift is the
+    worst failure mode in this file — it silently leaks volumes until the
+    storage quota rejects new PVCs with a 403 and provisioning fails closed, or
+    it deletes some other owner's data.
+
+    Jobs keep the historical ``pvc-workspace-<id[:12]>``; sessions get
+    ``pvc-ws-thread-<id[:12]>``, mirroring the pod-name split in
+    ``WorkspaceOwner.pod_name``. Truncation matches the pod name so the two
+    stay legible side by side in ``kubectl get pod,pvc``.
+    """
+    prefix = "pvc-workspace" if owner.kind == "job" else "pvc-ws-thread"
+    return f"{prefix}-{owner.id[:12]}"
+
+
 class ContainerProvisioner:
     """Workspace container provisioner using Kubernetes CoreV1Api.
 
-    Creates per-job pods with SSH server + code-server. Workspace storage is
-    ``emptyDir`` by default (dies with the pod). When ``WORKSPACE_PVC_ENABLED``
-    is set, job workspaces are PVC-backed (Branch a): the volume is named after
-    the job UUID, survives pod crashes, and reattaches by that deterministic
-    name on recreate. PVCs are reclaimed when the job reaches a terminal state
-    (completed/failed/cancelled) and retained across suspend/restore and crash
-    recovery. See docs/features/workspace_pvc_branch_a_implementation.md.
+    Creates per-owner pods (job or session) with SSH server + code-server.
+    Workspace storage is ``emptyDir`` by default (dies with the pod). When
+    ``WORKSPACE_PVC_ENABLED`` is set, BOTH kinds are PVC-backed (Branch a): the
+    volume is named after the owner UUID (``_pvc_name_for``), survives pod
+    crashes, and reattaches by that deterministic name on recreate. PVCs are
+    reclaimed when the owning work reaches a terminal state (completed/failed/
+    cancelled job; a session only once its thread is genuinely done, since an
+    ``ended`` thread is still resumable) and retained across idle reaps,
+    suspend/restore and crash recovery.
+    See docs/features/workspace_pvc_branch_a_implementation.md.
     """
 
     def __init__(self):
@@ -101,11 +123,15 @@ class ContainerProvisioner:
         self._storage_class: str = os.environ.get(
             "WORKSPACE_STORAGE_CLASS", "longhorn-ephemeral"
         )
-        # Branch (a): PVC-backed job workspaces. Default off → emptyDir (today's
-        # behavior). Scoped to jobs in v1; sessions rehydrate from Postgres and
-        # stay emptyDir. The PVC name is deterministic on the job UUID, so a
-        # recreated pod reattaches the same volume; GC happens on terminal job
-        # states. See docs/features/workspace_pvc_branch_a_implementation.md.
+        # Branch (a): PVC-backed workspaces. Default off → emptyDir (today's
+        # behavior). Covers BOTH owner kinds. Sessions were scoped out in v1 on
+        # the theory that they rehydrate from Postgres — but Postgres only holds
+        # the conversation, not the working tree, and a session's pod is reaped
+        # when it goes idle while the thread stays resumable. On emptyDir the
+        # user reopens a session whose files silently vanished. The PVC name is
+        # deterministic on the owner UUID (``_pvc_name_for``), so a recreated pod
+        # reattaches the same volume; GC happens when the owning work is
+        # terminal. See docs/features/workspace_pvc_branch_a_implementation.md.
         self._pvc_enabled: bool = _env_flag("WORKSPACE_PVC_ENABLED", False)
         self._pvc_size: str = os.environ.get("WORKSPACE_PVC_SIZE", "10Gi")
         # Single-replica node-loss fallback (Phase 3b). A REATTACH gets this
@@ -250,18 +276,22 @@ class ContainerProvisioner:
             owner.id, kind=owner.network_tier_kind
         )
 
-        # Workspace storage (Branch a): PVC-backed for jobs when
-        # WORKSPACE_PVC_ENABLED — the volume is named by the job UUID, survives
+        # Workspace storage (Branch a): PVC-backed for BOTH owner kinds when
+        # WORKSPACE_PVC_ENABLED — the volume is named by the owner UUID, survives
         # pod crashes, and reattaches by that deterministic name on recreate
         # (drift recovery, suspend/restore, give_up all funnel back through
-        # create_workspace, so 409-reuse here IS the resume path). Otherwise
-        # emptyDir — storage dies with the pod; isolation is the pod boundary.
-        # Created BEFORE the seed ConfigMap so a PVC failure leaves nothing to
-        # clean up — it is the provisioning prerequisite.
+        # create_workspace, so 409-reuse here IS the resume path). Sessions need
+        # this at least as much as jobs: their pod is reaped on idle while the
+        # thread stays resumable, so emptyDir destroys the working tree of state
+        # a user can still reopen. Otherwise emptyDir — storage dies with the
+        # pod; isolation is the pod boundary. Created BEFORE the seed ConfigMap
+        # so a PVC failure leaves nothing to clean up — it is the provisioning
+        # prerequisite (and it fails closed: never silently downgrade to
+        # emptyDir, that would trade a visible failure for silent data loss).
         pvc_name: Optional[str] = None
         pvc_reattach = False
-        if self._pvc_enabled and owner.kind == "job":
-            pvc_name = f"pvc-workspace-{owner.id[:12]}"
+        if self._pvc_enabled:
+            pvc_name = _pvc_name_for(owner)
             # Fresh recovery (Phase 3b single-replica fallback): the prior reattach
             # was wedged because the PVC's only replica is on a dead node. Delete
             # the stuck PVC (and wait for it to release) so the create below makes
@@ -271,8 +301,17 @@ class ContainerProvisioner:
             pvc_status = await self._create_pvc(
                 pvc_name,
                 size=self._pvc_size,
-                # Owner label lets the backstop reaper resolve PVC → job and
+                # Owner label lets the backstop reaper resolve PVC → owner and
                 # is a belt-and-suspenders identity check before any reattach.
+                # lifecycle's reap_orphans() sweep covers BOTH kinds: jobs via
+                # `srw/job-id` + the `pvc-workspace-` prefix, sessions via
+                # `srw/thread-id` + `pvc-ws-thread-`/`pvc-agent-s-`. The reclaim
+                # rules differ, not the coverage — a job PVC goes when the job is
+                # terminal or gone, a session's only when the `threads` row is
+                # actually absent (an `ended` thread is still resumable). And
+                # because a session's pod is usually idle-reaped long before the
+                # thread is deleted, that sweep — not the inline terminal path —
+                # is the primary reclaim route for sessions.
                 labels={owner.label_key: owner.id},
             )
             if not pvc_status:
@@ -322,10 +361,10 @@ class ContainerProvisioner:
             # the existing pod already owns its (same-named) ConfigMap.
             if created_pod is not None:
                 await self._adopt_configmap(seed_cm, created_pod)
-            # PVC-backed jobs get a stable headless Service so the agent dials a
-            # constant DNS name that survives pod recreates (reattach/recovery)
-            # instead of an ephemeral pod IP. Same gate as the PVC; lifecycle
-            # mirrors it (kept across idle reaps, deleted on terminal).
+            # PVC-backed workspaces (jobs AND sessions) get a stable headless
+            # Service so the agent dials a constant DNS name that survives pod
+            # recreates (reattach/recovery) instead of an ephemeral pod IP. Same
+            # gate as the PVC; kept across idle reaps, dropped on release.
             if pvc_name:
                 await self._create_service(owner)
             logger.info(
@@ -364,6 +403,12 @@ class ContainerProvisioner:
                 canvas_generation = None
                 if owner.kind == "session" and self._db:
                     try:
+                        # Now that sessions can be PVC-backed, this resolves the
+                        # trusted identity to the VOLUME (`k8s-pvc:…`) rather
+                        # than the pod — which is the point: the backing_id (and
+                        # so the Canvas workspace_generation) stops churning on
+                        # every pod recreate. A session that predates the PVC
+                        # switch re-binds once, from pod UID to PVC UID.
                         backing_id, fingerprint = await self._trusted_pod_ssh_identity(
                             pod_name, pvc_name=pvc_name
                         )
@@ -520,27 +565,44 @@ class ContainerProvisioner:
             return False
 
     async def delete_workspace_pvc(self, owner: WorkspaceOwner) -> bool:
-        """Delete the PVC for a job or thread workspace if one exists.
+        """Reclaim the PVC backing a job or session workspace, if one exists.
 
-        With emptyDir (default), there is no PVC — storage dies with the pod.
-        This method is kept for backward compatibility: it cleans up PVCs
-        from workspaces created before the emptyDir switch.
+        Both names are LIVE under ``WORKSPACE_PVC_ENABLED`` — jobs are
+        ``pvc-workspace-*`` and sessions ``pvc-ws-thread-*`` — so this is the
+        reclaim half of provisioning, not legacy cleanup. The name comes from
+        ``_pvc_name_for``, the same helper ``create_workspace`` uses, so the
+        create and delete sides cannot drift onto different volumes.
+
+        Destructive and irreversible: call it only when the owning work is
+        genuinely finished. An emptyDir workspace has no PVC, and a PVC already
+        gone is a 404 — both are idempotent successes.
         """
-        if owner.kind == "job":
-            pvc_name = f"pvc-workspace-{owner.id[:12]}"
-        else:
-            pvc_name = f"pvc-ws-thread-{owner.id[:12]}"
-        return await self._delete_pvc(pvc_name)
+        return await self._delete_pvc(_pvc_name_for(owner))
 
-    async def release_workspace(self, owner: "WorkspaceOwner") -> bool:
-        """Snapshot a workspace to S3, then delete the pod (and its PVC).
+    async def release_workspace(
+        self, owner: "WorkspaceOwner", *, reclaim_volume: bool = True
+    ) -> bool:
+        """Snapshot a workspace to S3, then delete the pod (and, by default, its PVC).
 
-        Owner-keyed: serves both jobs and sessions. K8s pods use emptyDir, so
-        data dies with the pod — snapshotting first enables resume (a fresh pod
-        restores from S3). Snapshot failure is non-fatal.
+        Owner-keyed: serves both jobs and sessions. On an emptyDir workspace the
+        data dies with the pod, so snapshotting first is what enables resume (a
+        fresh pod restores from S3). Snapshot failure is non-fatal.
+
+        Args:
+            reclaim_volume: When False, keep the PVC — snapshot and delete the
+                pod (and its Service), but leave the volume so a later recreate
+                reattaches the real working tree instead of an S3 approximation.
+                Required for a PVC-backed session: an ``ended`` thread is still
+                RESUMABLE, so unconditionally deleting its volume is data
+                destruction on live state a user can legitimately reopen. Pass
+                True (the default) only when the owning work is truly terminal.
+
+        The headless Service is dropped either way: it is 409-idempotent to
+        recreate on the next ``create_workspace``, so unlike the volume it costs
+        nothing to lose.
 
         Returns:
-            True if deletion succeeded.
+            True if pod deletion succeeded.
         """
         if not self._k8s_available:
             return False
@@ -576,7 +638,8 @@ class ContainerProvisioner:
                 )
 
         deleted = await self.delete_workspace(owner)
-        await self.delete_workspace_pvc(owner)
+        if reclaim_volume:
+            await self.delete_workspace_pvc(owner)
         await self._delete_service(owner)
         return deleted
 
@@ -984,7 +1047,7 @@ class ContainerProvisioner:
 
         The pod IP changes on every recreate; the agent caches its SSH dial
         target, so a recreated pod (PVC reattach / crash recovery) leaves the
-        agent dialing a dead IP and the job churns to fail-loud (see
+        agent dialing a dead IP and the work churns to fail-loud (see
         docs/issues/workspace_reattach_ephemeral_ip_reconnect_churn.md). A
         headless Service named after the pod gives a stable address
         ``<pod_name>.<ns>.svc:30022`` that always resolves (selector-matched) to
@@ -992,7 +1055,10 @@ class ContainerProvisioner:
         propagation. Headless (clusterIP=None) keeps traffic pod->pod (no DNAT),
         so workspace NetworkPolicies are unaffected, and DNS only resolves to a
         Ready pod (closes the sshd-readiness gap). Idempotent — 409 = success.
-        Lifecycle mirrors the PVC: kept across idle reaps, deleted on terminal.
+        Created with the PVC (both owner kinds) and kept across idle reaps;
+        dropped on release/terminal. Cheap to lose — the next create_workspace
+        recreates it — which is why ``release_workspace`` may drop the Service
+        while KEEPING a still-resumable owner's PVC.
         """
         if not self._k8s_available:
             return False
