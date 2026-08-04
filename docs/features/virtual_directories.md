@@ -225,7 +225,11 @@ Migration number = next free at implementation time (`0076` is contacts, renumbe
 
 ## Remaining work
 
-**Test coverage map: `tests/virtual_directories_test_coverage.md`** — what is verified, by which mechanism, and what could not be covered yet with the steps to close each gap. In priority order the open gaps are: the cloud-sync round-trip (session-only, needs a human-driven Cockpit session — this is the PII-leak scenario), a real tier upgrade with the overlay live, the two destructive resume paths the `.srw_seeded` sentinel guards, the kill-switch smoke, and subagent-reader isolation.
+**Test coverage map: `tests/virtual_directories_test_coverage.md`** — what is verified, by which mechanism, and what could not be covered yet with the steps to close each gap.
+
+The **cloud-sync round-trip (the PII-leak scenario) was gated and PASSED** on local k3d 2026-08-04, driven through Cockpit with a real contact whose notes carried a canary string: providers and sync both live, zero sync errors across turns, no canary anywhere in the cloud store, and a restart whose initial pull succeeded rather than silently disabling sync. Remaining open gaps, in priority order: a real tier upgrade with the overlay live, the two destructive resume paths the `.srw_seeded` sentinel guards, the kill-switch smoke, and subagent-reader isolation.
+
+**That gate found a bug** (`docs/issues/session_contacts_never_register_on_default_project.md`): a session whose project came from `threads.project_id` rather than a `thread_mounts` row never registers `contacts/` at all, because the client-side guard reads `project_ids` (mounts-only) while the server-side resolver handles both sources. Agents on such a session see no contacts, silently. This contradicts the Registration paragraph above and needs fixing before the contacts surface can be trusted end to end.
 
 **Slice 2** (writable `plan.md` / `todos.yaml` on a `job_documents` table, with mtime shadow reconciliation for shell writes) is designed above but not started. The `writable` / `write()` half of the provider contract and `EntryMeta.mtime` already exist and are unit-tested against fake writable providers, so Slice 2 adds a provider rather than a redesign — that tested-but-unused code is deliberate, not dead.
 
