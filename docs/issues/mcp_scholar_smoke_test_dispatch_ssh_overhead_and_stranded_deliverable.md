@@ -29,8 +29,8 @@ related:
 **Filed:** 2026-08-03 after a live MCP smoke test against the deployed SRW
 environment.
 
-**Status:** **MAIN-CLUSTER GIT PATH ACCEPTED (5/5); MCP CONTRACT, DELEGATION,
-AND PAPER-PROVIDER DEFECTS REMAIN.**
+**Status:** **MAIN-CLUSTER GIT PATH ACCEPTED (5/5); PAPER-PROVIDER SOURCE FIXED
+IN CHECKOUT; MCP CONTRACT, DELEGATION, DEPLOYMENT, AND S2 KEY ROTATION REMAIN.**
 
 The original failure chain was reproduced and its standard main-cluster path is
 now functionally recovered. P0-A (MCP/start-path provisioning) and P0-B (SSH
@@ -137,11 +137,13 @@ this checkout.
 
 ### Investigation boundary
 
-The MCP connector targets a remote SRW environment. The local `kubectl` context
-in this checkout points at an unrelated local `k3d-srw` cluster, so it was not
-used to draw conclusions about the remote agent pod or secret. No secret values
-were read, printed, or copied. Secret/key parity and the complete start path must
-still be proven against the actual connector target after deployment.
+The initial MCP run targeted a remote SRW environment and the active `kubectl`
+context then pointed at unrelated local `k3d-srw`, so the original analysis did
+not infer remote secret state from local configuration. During the 2026-08-04
+follow-up, the explicit `main` context became available and was used for
+secret-free provider handshakes and ExternalSecret metadata. No secret value was
+read, printed, copied, or committed. Replacement-key acceptance still must be
+proven from a newly created main-cluster worker after deployment.
 
 ---
 
@@ -165,13 +167,13 @@ still be proven against the actual connector target after deployment.
 | F14 | The local k3d authenticated readiness gate correctly rejected the SSH key, but for a chart/dev-runtime incompatibility already described in chart comments: the root-running dev orchestrator invoked OpenSSH on a root-owned `0444` projected key | Confirmed local + source | P0 local acceptance |
 | F15 | `delegation.enabled=false` persisted in the resolved local config but did not remove or disable `spawn_subagent`; the model ignored the textual prohibition and launched three readers (33 additional LLM calls) | Confirmed local + source | P1 cost / contract |
 | F16 | Local Tavily calls were real provider errors caused by broken k3d external DNS, but `_direct_web_search` discarded the response's `error` field and reported a successful “No web results found” observation | Confirmed local provider probe + CoreDNS logs + source | P1 error semantics |
-| F17 | `search_papers` is incompatible with installed `arxiv==4.0.0`: source calls removed `Search.results()` instead of `Client.results(search)` | Confirmed local runtime + source | P1 tool function |
+| F17 | `search_papers` is incompatible with installed `arxiv==4.0.0`: source calls removed `Search.results()` instead of `Client.results(search)` | Fixed in checkout; installed-package tests + isolated live arXiv 4 search pass; deploy pending | P1 tool function |
 | F18 | The local Scholar retried empty/broken research tools from main calls 37-55, including exact duplicate queries, and consumed 1.63M raw tokens before operator cancellation; the configured 120-tool budget and current warning-only loop detector did not contain it in time | Confirmed local audit | P0 cost / P1 function |
 | F19 | Five fresh main-cluster Scholar jobs automatically provisioned/authenticated, completed, and pushed exact deliverables to isolated job branches; project `main` was unchanged | Confirmed live, 5/5 | P0 recovery passed |
 | F20 | `delegation.enabled=false` still leaves `spawn_subagent` in the bound tool definitions; the two disabled jobs made no calls only because the model obeyed prose | Confirmed live prompt/audit | P1 capability contract |
 | F21 | The generic transition todo says the stop condition comes first while requiring todo 1's review to have completed; two jobs repeated successful Git/file checks for 53 and 62 parent rounds before context compaction broke the attractor | Confirmed live + template | P1 overhead / completion risk |
 | F22 | One-shot skill delivery replaced continuous reinjection, but the passive `verify-before-done` gate rejected 50 completion calls because MiniMax repeatedly retried instead of reading the named skill | Confirmed live audit | P1 overhead; gate remained safe |
-| F23 | Main-cluster Tavily worked under heavy use; the paper job still reproduced the arXiv 4 adapter error and Semantic Scholar HTTP 403, then recovered through web/arXiv pages | Confirmed live | P1 paper-tool function |
+| F23 | Main-cluster Tavily worked under heavy use; the paper job reproduced the arXiv 4 adapter error and Semantic Scholar HTTP 403, then recovered through web/arXiv pages | Source adapter/error semantics fixed; deployed S2 key is confirmed rejected and must be rotated | P1 deployment/credential acceptance |
 | F24 | The connector schema remains stale after the successful batch: no `required_deliverables`, obsolete manual-assignment copy, and incorrect `get_workspace_file` semantics | Confirmed from current connector schema | P1 deployment contract |
 | F25 | Citation traceability is inconsistent across successful reports: 1,083 registered sources produced 236 engine citations, while two reports used manual links with zero or near-zero engine citation coverage | Confirmed live stats/report reads | P1 quality contract |
 | F26 | CitationEngine skipped 380 auto-embedding attempts covering 359 unique source IDs; 374 exceeded the embedding backend's 64-input limit, while the source still counted as registered | Confirmed archived worker logs + source | P1 search/evidence quality |
@@ -1155,6 +1157,35 @@ searches returned HTTP 403. The Scholar adapted through web retrieval of arXiv
 pages and disclosed the limitation. The report's success is evidence for agent
 resilience, not for paper-tool correctness.
 
+The source repair landed in the checkout on 2026-08-04. All arXiv paths now use
+one reusable `arxiv.Client` and `Client.results(search)`; mocks were rewritten
+around that public boundary, an installed-package contract test was added, and
+an isolated real search passed under `arxiv==4.0.0`. Semantic Scholar calls now
+share one classified transport: 401/403 are explicit non-retryable credential
+failures, 429 is throttling, metadata lookup preserves the arXiv fallback, and
+the combined workflow discloses partial-provider failure instead of silently
+reporting zero results.
+
+A safe main-cluster probe further resolved the Semantic Scholar ambiguity. The
+worker has a normalized, non-empty API key; the keyed request returns HTTP 403,
+while the same anonymous request returns HTTP 429. The key/header, provider
+reachability, and rate path are therefore distinct: the configured credential
+is rejected and the anonymous shared pool is throttled. The `srw` Kubernetes
+Secret is ESO-owned and extracts the Vault record at
+`homelab/superhuman-remote-worker/srw-secrets`. No replacement credential exists
+in the checkout. After an operator issues and writes a new key, ESO must refresh
+and a newly created worker must pass:
+
+```bash
+python -m src.tools.research.utils.provider_health
+```
+
+The probe and agent status are secret-free. The probe is an acceptance/readiness
+command rather than a Kubernetes liveness condition, so an optional provider
+outage cannot take the web-capable worker fleet out of service. Detailed tests
+and the credential-rotation boundary are recorded in
+`overnight_minimax_m3_scholar_batch_2026-08-03.md`.
+
 F15 is also reconfirmed. In both jobs configured with
 `delegation.enabled=false`, the bound LLM tool definitions still contained
 `spawn_subagent`. Neither model invoked it, but only because it followed the
@@ -1245,8 +1276,9 @@ The ordinary main-cluster job path now produces durable results. Remaining work
 should be ordered as follows:
 
 1. **Functional:** refresh the MCP schema and prove a real
-   `required_deliverables` contract; enforce delegation disablement; repair the
-   arXiv and Semantic Scholar adapters.
+   `required_deliverables` contract; enforce delegation disablement; deploy the
+   paper-provider repair, rotate the rejected Semantic Scholar key, and pass the
+   worker-image probe.
 2. **Shared context/evidence:** eliminate project-memory deadlocks and
    per-consumer TTL corruption, split embedding batches, make source-index
    coverage visible, and keep phase tags immutable/exact.

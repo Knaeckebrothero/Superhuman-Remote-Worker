@@ -2464,6 +2464,7 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
         from src.services.embedding_service import peek_embedding_service
 
         emb_service = peek_embedding_service()
+        runtime_status = _agent.get_status() if _agent is not None else {}
         return JSONResponse(
             {
                 "mode": "persistent",
@@ -2473,6 +2474,7 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
                 "permission_mode": _session.permission_mode if _session else None,
                 "turn_count": _session.turn_count if _session else 0,
                 "message_count": len(_session.messages) if _session else 0,
+                "research_providers": runtime_status.get("research_providers"),
                 "tools": [t.name for t in _session.tools]
                 if _session and _session.tools
                 else [],

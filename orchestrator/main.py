@@ -25335,6 +25335,71 @@ async def end_thread(
     return {"status": "ended"}
 
 
+# Resume-time session-folder provisioning is fire-and-forget so /resume stays
+# fast — but the agent reads its cloud config within ~150ms of attach, while
+# provisioning needs several WebDAV round-trips (~5s measured). The attach won
+# that race every time, so the agent read NULL handle columns, got
+# ``cloud_sync_degraded``, and ran with ``workspace_sync = None`` for the
+# session's WHOLE life (persistent_app.py has no rebuild path). Registering the
+# task lets the attach paths await it instead of racing it.
+# docs/issues/session_resume_cloud_sync_race_late_provision.md
+_late_cloud_setup_tasks: dict[str, "asyncio.Task[None]"] = {}
+
+# Ceiling on how long an attach waits for in-flight session-folder
+# provisioning. Comfortably above the ~5s observed cost, low enough that a
+# wedged cloud delays a resume rather than hanging it — on timeout we fall
+# through to the pre-fix behaviour (attach, possibly degraded).
+LATE_CLOUD_SETUP_ATTACH_TIMEOUT_S = 15
+
+
+def _register_late_cloud_setup(thread_id: str, task: "asyncio.Task[None]") -> None:
+    """Publish an in-flight session-folder provisioning task for the attach
+    paths to await (see ``_await_late_cloud_setup``).
+
+    Mirrors ``_schedule_protected_engage``'s slot discipline: the done-callback
+    only clears the slot while it is still ours, so a newer registration for
+    the same thread can't be clobbered by a stale callback.
+    """
+    _late_cloud_setup_tasks[thread_id] = task
+
+    def _done(finished: "asyncio.Task[None]") -> None:
+        if _late_cloud_setup_tasks.get(thread_id) is finished:
+            _late_cloud_setup_tasks.pop(thread_id, None)
+
+    task.add_done_callback(_done)
+
+
+async def _await_late_cloud_setup(thread_id: str) -> None:
+    """Block until this thread's in-flight session-folder provisioning lands.
+
+    Call this BEFORE binding an agent and OUTSIDE the thread advisory lock —
+    it can take seconds, and holding the lock across it would stall the fresh
+    pod's own ``POST /api/agents/register``.
+
+    A no-op when nothing is registered for ``thread_id`` in this process:
+    provisioning already finished, was never needed, or ran on the other HA
+    replica. The cross-replica case doesn't strand the agent — the replica
+    that schedules the task is also the one that attaches, so the handle is
+    persisted before the attach POST goes out and every later reader (either
+    replica) sees it through the DB.
+    """
+    task = _late_cloud_setup_tasks.get(thread_id)
+    if task is None:
+        return
+    try:
+        await asyncio.wait_for(
+            asyncio.shield(task), timeout=LATE_CLOUD_SETUP_ATTACH_TIMEOUT_S
+        )
+    except Exception as e:
+        logger.warning(
+            "Thread %s: awaiting in-flight cloud session-folder provisioning "
+            "failed/timed out (%s); attaching anyway — the session may start "
+            "with cloud sync degraded.",
+            thread_id,
+            e,
+        )
+
+
 @app.post("/api/persistent/threads/{thread_id}/resume")
 async def resume_thread(
     thread_id: str,
@@ -25475,13 +25540,32 @@ async def resume_thread(
                     "Thread %s: late cloud folder provisioning failed: %s", tid, e
                 )
 
-        asyncio.create_task(_late_cloud_setup(thread_id, user, existing_session_handle))
+        _setup_task = asyncio.create_task(
+            _late_cloud_setup(thread_id, user, existing_session_handle)
+        )
+        if needs_full_provision:
+            # Only a FULL provision decides whether the agent can resolve a
+            # sync target at all, so only that case is worth making the attach
+            # wait. The share-only retry leaves both handle columns untouched
+            # — gating on it would add its cloud user-lookup cost to every
+            # resume of a thread whose share never landed (i.e. every thread
+            # whose owner has not signed into the cloud yet) for no change in
+            # what the agent can resolve.
+            _register_late_cloud_setup(thread_id, _setup_task)
 
     # Re-provision agent pod and restore workspace if suspended
     if agent_provisioner.is_available:
         config_name = canonical_config_name(thread.get("config_name", "session_base"))
 
         async def _reprovision(tid: str, cfg: str) -> None:
+            # Let any in-flight session-folder provisioning land before an
+            # agent is bound — the agent reads its cloud config within ~150ms
+            # of attach and never re-reads. Outside the advisory lock below:
+            # this can take seconds and the fresh pod's /register needs that
+            # same lock.
+            # docs/issues/session_resume_cloud_sync_race_late_provision.md
+            await _await_late_cloud_setup(tid)
+
             # Serialise concurrent provisioning attempts for the same
             # thread (docs/issues/persistent_thread_double_provisioning_race.md).
             # A concurrent /prepare or /resume on the same thread blocks

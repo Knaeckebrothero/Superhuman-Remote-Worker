@@ -241,15 +241,32 @@ def create_paper_tools(context: ToolContext) -> List[Any]:
         """
         id_type = _detect_identifier_type(identifier)
 
-        # Try Semantic Scholar first (richer metadata)
-        info = await _get_semantic_scholar_info(identifier, proxy=proxy)
-        if info:
-            return info
+        # Try Semantic Scholar first (richer metadata). Provider/auth failures
+        # remain visible while still allowing the arXiv fallback to do useful
+        # work; they must not masquerade as "paper not found".
+        from .utils.semantic_scholar_client import SemanticScholarProviderError
+
+        semantic_error = None
+        try:
+            info = await _get_semantic_scholar_info(identifier, proxy=proxy)
+        except SemanticScholarProviderError as exc:
+            semantic_error = str(exc)
+            logger.warning(semantic_error)
+        else:
+            if info:
+                return info
 
         # Fall back to arXiv for arXiv IDs
         if id_type == "arxiv" or "arxiv" in identifier.lower():
-            return await _get_arxiv_info(identifier)
+            arxiv_info = await _get_arxiv_info(identifier)
+            if semantic_error:
+                return (
+                    f"{semantic_error}\nUsing arXiv metadata fallback.\n\n{arxiv_info}"
+                )
+            return arxiv_info
 
+        if semantic_error:
+            return f"{semantic_error}\nCould not fall back to arXiv for: {identifier}"
         return f"Could not find paper info for: {identifier}"
 
     return [search_papers, download_paper, get_paper_info]
@@ -282,36 +299,23 @@ async def _search_arxiv(query: str, max_results: int) -> str:
 
 async def _search_semantic_scholar(query: str, max_results: int, *, proxy=None) -> str:
     """Search Semantic Scholar and format results."""
-    import os
-
-    import aiohttp
-
-    from .utils.network import research_request
-
-    api_key = os.getenv("SEMANTIC_SCHOLAR_API_KEY")
-    headers = {}
-    if api_key:
-        headers["x-api-key"] = api_key
-
-    url = "https://api.semanticscholar.org/graph/v1/paper/search"
-    params = {
-        "query": query,
-        "limit": max_results,
-        "fields": "title,authors,year,abstract,citationCount,openAccessPdf,externalIds,venue",
-    }
+    from .utils.semantic_scholar_client import (
+        SemanticScholarProviderError,
+        search_semantic_scholar,
+    )
 
     try:
-        async with research_request(
-            "GET", url, proxy=proxy, timeout=30, params=params, headers=headers
-        ) as resp:
-            if resp.status == 429:
-                return "Semantic Scholar rate limit hit. Try again in a few minutes or set SEMANTIC_SCHOLAR_API_KEY."
-            resp.raise_for_status()
-            data = await resp.json()
-    except ConnectionError as e:
-        return f"Semantic Scholar search error (connection): {e}"
-    except aiohttp.ClientError as e:
-        return f"Semantic Scholar search error: {e}"
+        data = await search_semantic_scholar(
+            query,
+            max_results,
+            fields=(
+                "title,authors,year,abstract,citationCount,openAccessPdf,"
+                "externalIds,venue"
+            ),
+            proxy=proxy,
+        )
+    except SemanticScholarProviderError as exc:
+        return str(exc)
 
     results = data.get("data", [])
     if not results:
@@ -374,16 +378,7 @@ async def _try_unpaywall_download(
 
 async def _get_semantic_scholar_info(identifier: str, *, proxy=None) -> Optional[str]:
     """Get paper info from Semantic Scholar."""
-    import os
-
-    import aiohttp
-
-    from .utils.network import research_request
-
-    api_key = os.getenv("SEMANTIC_SCHOLAR_API_KEY")
-    headers = {}
-    if api_key:
-        headers["x-api-key"] = api_key
+    from .utils.semantic_scholar_client import get_semantic_scholar_paper
 
     # Semantic Scholar accepts DOIs and arXiv IDs directly
     paper_id = identifier
@@ -391,26 +386,17 @@ async def _get_semantic_scholar_info(identifier: str, *, proxy=None) -> Optional
         arxiv_id = ARXIV_PATTERN.search(identifier).group()
         paper_id = f"ArXiv:{arxiv_id}"
     elif DOI_PATTERN.search(identifier):
-        paper_id = DOI_PATTERN.search(identifier).group()
+        paper_id = f"DOI:{DOI_PATTERN.search(identifier).group()}"
 
-    url = f"https://api.semanticscholar.org/graph/v1/paper/{paper_id}"
-    params = {
-        "fields": "title,authors,year,abstract,citationCount,referenceCount,openAccessPdf,externalIds,venue,publicationDate",
-    }
-
-    try:
-        async with research_request(
-            "GET", url, proxy=proxy, timeout=30, params=params, headers=headers
-        ) as resp:
-            if resp.status == 404:
-                return None
-            if resp.status == 429:
-                return "Semantic Scholar rate limit hit. Try again in a few minutes."
-            resp.raise_for_status()
-            data = await resp.json()
-    except ConnectionError:
-        return None
-    except aiohttp.ClientError:
+    data = await get_semantic_scholar_paper(
+        paper_id,
+        fields=(
+            "title,authors,year,abstract,citationCount,referenceCount,"
+            "openAccessPdf,externalIds,venue,publicationDate"
+        ),
+        proxy=proxy,
+    )
+    if data is None:
         return None
 
     ext_ids = data.get("externalIds") or {}
