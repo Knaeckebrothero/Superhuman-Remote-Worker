@@ -205,3 +205,112 @@ not this task's call.
 - **The live gate.** Run by the coordinator after both tasks pass review, against
   k3d as a real non-admin — the kill switch is deployment-wide, so it needs the
   isolated namespace, not a "just try it on dev" check.
+
+---
+
+## Task 3 — duplicate copies what the user CAN have, and says what it dropped
+
+**Added 2026-08-04 after measuring Task 1's consequence.** Task 1 made `duplicate`
+refuse a source config exceeding the copier's grants. Measured against the real
+PDP with default grants (`shell_tools=False`, `delegation=False`), that refuses
+**7 of the 11 shipped experts** — `scholar`, `developer`, `critic` (shell +
+delegation) and `bughunter`, `designer`, `designer-interactive`, `product-qa`
+(shell). `assistant`, `centurion`, `curator`, `general-worker` still pass.
+
+`scholar` is the one the route's own docstring names: *"Fork any visible expert
+into an owned copy — 'start from scholar'"*. And grants default `False` for every
+user created after migration `0030`, so this is the default new-user experience.
+
+The workflow it broke is real: duplicate `scholar`, strip the shell block, run it.
+The copy was useless until edited, but it *could* be edited. Refusing means you
+cannot reach step one without an admin granting `shell_tools` — a grant you do not
+need and should not get, for a copy you were going to strip anyway.
+
+**The repo owner chose: copy, minus what they cannot have, and name what was
+dropped.** Do not re-litigate this.
+
+### What to change
+
+`duplicate_expert` keeps the kill switch and the deny-scan, and replaces the
+*grants* refusal with a strip-and-report.
+
+Put the stripping in **`src/core/capability_grants.py`**, beside `evaluate`, not in
+`orchestrator/main.py`. The grant → config-path mapping mirrors `evaluate`'s rules
+one-for-one and the two must not drift; a copy in the route layer guarantees they
+will. Suggested shape (name it as you see fit):
+
+```python
+def strip_to_grants(fragment: dict, grants: dict) -> tuple[dict, list[str]]:
+    """Return (fragment minus what `grants` forbids, the grant keys dropped)."""
+```
+
+**Deleting the offending key is the right operation for every rule**, because
+absent means "inherit the base" and the base is the conservative floor. That holds
+for `tools.*`, for `delegation.enabled`, for `autonomy`, for
+`interactive.permission_mode`, for `workspace.backend` and for model pins.
+
+The nine rules and what each one's violation implicates:
+
+| grant | config path(s) to remove |
+|---|---|
+| `shell_tools` | `tools.shell` |
+| `delegation` | `tools.delegation` **and** `delegation.enabled` |
+| `datasource_tools` | `tools.{sql,mongodb,graph,webdav,email,mcp,repo}` |
+| `browser` | `tools.browser_direct` |
+| `catalog_authoring` | `tools.catalog_authoring` |
+| `vm_workspace` | `workspace.backend` |
+| `model_selection` | the offending model pins |
+| `autonomy_ceiling` | `autonomy` |
+| `permission_mode` | `interactive.permission_mode` |
+
+**THE SAFETY PROPERTY, and it is not optional:** after stripping, **re-run
+`evaluate`**. If any violation survives, **refuse with the 422 exactly as Task 1
+does now**. This is what makes an incomplete strip map impossible to exploit — it
+can only ever produce a false refusal, never a permitted escape. Say in a comment
+that this is why the re-check exists.
+
+Do not remove empty parent dicts if that changes meaning; do not mutate the input
+fragment in place (the caller's `src` dict is reused).
+
+### The response
+
+`duplicate` returns whatever `_create_forked_expert` returns. Add a key naming
+what was dropped — the owner's chosen shape was:
+
+```json
+{"id": "...", "dropped": ["shell", "delegation"]}
+```
+
+Report the **grant keys or the config paths**, whichever reads better to a user;
+pick one and be consistent. Additive, so no consumer breaks. Do **not** change the
+other four routes' responses.
+
+### Tests
+
+1. **Each of the nine rules strips.** Parametrised over the rules: a fragment that
+   violates exactly one grant comes back clean, with that grant reported.
+2. **Completeness, derived from the PDP — not a hand-written list.** A test that
+   iterates the grant spec (the same source `evaluate` reads) and asserts every
+   grant key which `evaluate` can flag is handled by the strip map. A hand-listed
+   test cannot catch a rule added later; this is the same hole
+   `TestGrantMapMatchesThePDP` had and had to be fixed for.
+3. **The safety re-check fires.** Force the strip map to miss (monkeypatch it to a
+   no-op, or feed a violation it does not handle) and assert the route still 422s
+   rather than creating a row.
+4. **End-to-end on the real shipped configs:** duplicating `scholar` as a
+   default-grants non-admin returns **200**, the stored row has no `tools.shell`
+   and no `tools.delegation`, and the response names both. This is the test that
+   proves the reported defect is fixed — the other three prove the mechanism.
+5. **A user WITH the grants gets an unmodified copy** — `dropped` empty and the
+   config byte-identical to the source. Otherwise stripping could be firing for
+   everyone.
+6. Task 1's kill-switch test must still pass unchanged: stripping happens *after*
+   the 403, not instead of it.
+
+### Done when
+
+- Strip-and-report is in `capability_grants.py`, the route calls it, the safety
+  re-check is in place.
+- All six test groups pass; 1, 3 and 4 are mutation-tested.
+- `duplicate` of each of the 7 previously-refused shipped experts returns 200 as a
+  default-grants non-admin. State the measured before/after in your report.
