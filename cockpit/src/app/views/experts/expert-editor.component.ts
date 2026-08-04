@@ -3,6 +3,7 @@ import {FormsModule} from '@angular/forms';
 import {ActivatedRoute, Router} from '@angular/router';
 import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
 import {ApiService} from '../../core/services/api.service';
+import type {SessionToolGroupsResponse} from '../../core/services/api.service';
 import {ModelService} from '../../core/services/model.service';
 import type {EffectiveModels, ExpertCreateRequest, ExpertUpdateRequest, GrantCatalog} from '../../core/models/api.model';
 import {AppButtonComponent} from '../../ui/button';
@@ -36,6 +37,40 @@ export function slugify(s: string): string {
 export interface ParsedConfig {
   config?: Record<string, unknown>;
   error?: string;
+}
+
+/** The tool-group preview payload for an expert being edited. */
+export interface ExpertToolPreviewRequest {
+  expert_type: 'worker' | 'session';
+  config_name: string;
+  config_override: Record<string, unknown> | null;
+}
+
+/**
+ * What to ask the preview endpoint for an expert under edit.
+ *
+ * base ⊕ fragment, never `expert_id`. Two reasons, and both are cases where the
+ * id would make the pane describe something other than what is on screen:
+ *
+ *  - on CREATE there is no id, so the answer would be the bare base and the
+ *    editor would forecast a toolset the saved expert will not have;
+ *  - on EDIT, layering the fragment on top of the stored row cannot express a
+ *    REMOVED key — `tools.shell` deleted in the editor still resolves from the
+ *    row underneath, so the pane would show a category the expert is losing.
+ *
+ * base ⊕ fragment is what an expert *is*, which makes it the only layering that
+ * answers for the form's current contents.
+ */
+export function expertToolPreviewRequest(
+  expertType: 'worker' | 'session',
+  fragment: Record<string, unknown>,
+): ExpertToolPreviewRequest {
+  return {
+    expert_type: expertType,
+    config_name: expertBaseConfigName(expertType),
+    // {} would be a no-op layer, but null says "no fragment" to a reader.
+    config_override: Object.keys(fragment).length ? fragment : null,
+  };
 }
 
 /** Parse the raw config-fragment textarea into an object (or an error string). */
@@ -290,6 +325,8 @@ interface EditorForm {
           [disabled]="false"
           [enumerateOnly]="enumerateOnly()"
           [gatedCapabilities]="gatedCapabilities()"
+          [resolved]="toolPreview()"
+          [readsResolvedToolset]="true"
         />
       </section>
 
@@ -449,6 +486,26 @@ export class ExpertEditorComponent implements OnInit {
   rawFragment = signal<Record<string, unknown>>({});
   private prefillDone = false;
 
+  /**
+   * The server's answer for "what would an agent built from THIS expert bind?".
+   *
+   * Null until the first answer lands, and null again on failure — the tools
+   * group falls back to its static per-mode list in that case, labelled, which
+   * is what this surface showed unconditionally until now.
+   */
+  toolPreview = signal<SessionToolGroupsResponse | null>(null);
+  private toolPreviewSerial = 0;
+  /**
+   * True once a resolved answer has anchored the tool switches.
+   *
+   * `applyPrefill` and this read both anchor, they race (an effect against an
+   * HTTP response), and they are not equal in authority: `prefillFromConfig`
+   * infers enablement from config names and on a real session over-reported by
+   * 24 tools, so letting it land second would downgrade the answer back to the
+   * guess this whole change removes.
+   */
+  private resolvedAnchorApplied = false;
+
   readonly models = this.modelService.models;
 
   // Capability grants → editor control-greying. undefined = loading; null = admin
@@ -524,7 +581,12 @@ export class ExpertEditorComponent implements OnInit {
     this.loadFrameworkDefaults('worker');
 
     const id = this.route.snapshot.paramMap.get('id');
-    if (!id) return;
+    if (!id) {
+      // Create: no fragment will ever arrive, so this is the only read. The
+      // answer is the bare base, which is exactly what a new expert resolves to.
+      this.loadToolPreview();
+      return;
+    }
     this.editingId.set(id);
     // Prefill from the export bundle = the RAW fragment (never the merged result).
     this.api.exportExpert(id).subscribe((bundle) => {
@@ -549,6 +611,9 @@ export class ExpertEditorComponent implements OnInit {
       const {rawRemainderText} = splitExpertConfig(cfg);
       this.form.configText = rawRemainderText;
       this.rawFragment.set(cfg); // triggers the prefill effect
+      // The only read on this path: it needs both the stored type (which picks
+      // the base) and the fragment, and neither exists until here.
+      this.loadToolPreview();
     });
   }
 
@@ -564,7 +629,10 @@ export class ExpertEditorComponent implements OnInit {
     this.form.subagentModel = (sub['model'] as string) ?? baseModel ?? '';
     this.form.sessionModel = baseModel;
 
-    this.toolsGroup()?.prefillFromConfig(frag);
+    // Skipped once the server has answered: see `resolvedAnchorApplied`. The
+    // fragment still drives every other control here — only the tool switches
+    // have a better source.
+    if (!this.resolvedAnchorApplied) this.toolsGroup()?.prefillFromConfig(frag);
     this.advancedGroup()?.prefillFromConfig(frag);
 
     const exec = this.execGroup();
@@ -605,6 +673,11 @@ export class ExpertEditorComponent implements OnInit {
     this.execGroup()?.resetAll();
     this.toolsGroup()?.resetAll();
     this.advancedGroup()?.resetAll();
+    // The base changed, so the resolved toolset did too. Ordered after the
+    // resets: they have just cleared the switches, so the incoming answer is
+    // free to re-anchor them.
+    this.resolvedAnchorApplied = false;
+    this.loadToolPreview();
     this.form.strategicModel = '';
     this.form.tacticalModel = '';
     this.form.subagentModel = '';
@@ -614,6 +687,39 @@ export class ExpertEditorComponent implements OnInit {
     this.form.strategic = '';
     this.form.tactical = '';
     this.form.summarization = '';
+  }
+
+  /**
+   * Ask the server what this expert's toolset actually resolves to.
+   *
+   * Payload rules live in `expertToolPreviewRequest`. `expert_type` there picks
+   * the base (`worker_base` / `session_base`), which is the whole reason the two
+   * expert types resolve to different toolsets — not `expert_type` itself, which
+   * selects prompt leaves.
+   *
+   * Reflects the SAVED fragment: it is re-read when the base changes (type
+   * switch) and when a stored expert loads, not on every switch click. A tick
+   * moves its own row locally and immediately; what the user cannot compute in
+   * their head is the base, the grant reasons and the counts, and those are what
+   * this fetches. `origin: "prediction"` labels it either way — no agent exists.
+   *
+   * Serial-guarded so a slow answer for a type the user has switched away from
+   * cannot paint over the current one.
+   */
+  private loadToolPreview(): void {
+    const serial = ++this.toolPreviewSerial;
+    this.api
+      .previewToolGroups(expertToolPreviewRequest(this.expertType(), this.rawFragment()))
+      .subscribe((preview) => {
+        if (serial !== this.toolPreviewSerial) return;
+        this.toolPreview.set(preview);
+        const categories = preview?.categories;
+        const group = this.toolsGroup();
+        if (categories && group && !group.hasToolEdits()) {
+          group.prefillFromResolved(categories);
+          this.resolvedAnchorApplied = true;
+        }
+      });
   }
 
   private loadFrameworkDefaults(expertType: 'worker' | 'session'): void {
