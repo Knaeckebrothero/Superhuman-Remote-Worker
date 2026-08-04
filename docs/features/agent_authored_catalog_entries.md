@@ -196,10 +196,14 @@ conversation. One dev session — grant it, ask for an expert, read back the row
 
 ## Deliberately not done
 
-- **Job-mode exposure.** Job create validates the category like any other, but
-  no job surface renders it, and job-create still has no server-computed tool
-  view at all (`preview_tool_groups` hardcodes `expert_type="session"`). Tracked
-  in [[tool_configuration_defects_and_fix_roadmap]].
+- **Job-mode exposure.** Job create validates the category like any other, and
+  since 2026-08-04 (`44c268d9`) it *does* read the server's toolset answer — so
+  if a worker expert ever declares `catalog_authoring`, the job form will render
+  it with the right state and grant reason. What is still deliberate is that
+  `worker_base` does not declare the category, so no job gets it by default.
+  Whether a worker job *should* be able to author catalogue entries is a separate
+  product call: a job runs unattended, so `dry_run` and `allow_enabled` are
+  carrying more weight there than in a session with a human in the loop.
 - **Completing `CAT_TO_GRANT`.** See the coverage note.
 - **A `duplicate_expert` fix.** That endpoint skips `_enforce_expert_save`
   entirely and so bypasses the `user_experts` kill switch for any approved user
