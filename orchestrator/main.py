@@ -11558,13 +11558,15 @@ async def resume_job(
 
     # Resume PEP (decision 9, B3): re-check the runner's CURRENT grants against the
     # job's stored config before replaying it. Placed before the resume try so a 403
-    # is not downgraded by the broad handler below (fail closed on denial). A
-    # TRANSIENT resolve/grant-check error (DB blip) proceeds — the dispatch-time
+    # is not downgraded by the broad handler below (fail closed on denial). The line
+    # that matters is "the stored configuration is unusable" vs "we could not reach
+    # storage" — NOT "known exception type" vs "unknown": a TRANSIENT failure (a DB
+    # blip reading the expert/grant rows) still proceeds, because the dispatch-time
     # check already passed minutes ago and tolerating a hiccup is cheaper than
-    # refusing a resume over it. A DETERMINISTIC resolve failure (a permanently
-    # malformed stored `tools` policy -> ToolPolicyError) fails closed instead:
-    # it would raise identically on every future resume of this job, so nothing
-    # is "standing in" for a check that can never run.
+    # refusing a resume over it; a PERMANENTLY UNUSABLE stored config fails closed
+    # instead, because the same row raises the same way on every future resume of
+    # this job, so nothing is "standing in" for a check that can never run. See the
+    # except clause below for exactly which exceptions land in which bucket.
     if await _user_experts_enabled():
         try:
             _rco = job.get("config_override")
@@ -11595,27 +11597,34 @@ async def resume_job(
             raise HTTPException(
                 status_code=403, detail=_grant_violations_detail(gd.violations)
             )
-        except ToolPolicyError as tpe:
-            # Deterministic, not transient: resolve_config raises this on a
-            # permanently-malformed stored `tools` value (e.g. `core: null`),
-            # and it will raise identically on every future resume of this
-            # job. The broad handler below exists for infra blips where the
-            # dispatch-time check "stands" as a fallback; here the check never
-            # ran at all, so nothing stands and tolerating it would be a
-            # latch, not a flakiness allowance. Fail closed. This is not a
+        except (ToolPolicyError, ValueError, FileNotFoundError) as exc:
+            # The STORED CONFIGURATION IS UNUSABLE — a different failure class
+            # from "we could not reach storage" below, not a different set of
+            # exception types to keep in sync by hand as resolve_config grows
+            # new callees. Concretely, today, this bucket is: a malformed
+            # `tools` policy (ToolPolicyError); a stored config_override /
+            # expert-row config or prompts blob that is a string but not
+            # valid JSON (json.JSONDecodeError, a ValueError subclass); a
+            # merged config missing a field load_agent_config_from_dict
+            # requires (ValueError); or an unresolvable config file / $extends
+            # target (FileNotFoundError, raised deliberately by
+            # load_and_merge_config, not from a flaky mount). Every one of
+            # these raises identically on every future resume of this job —
+            # tolerating it would be a latch, not a flakiness allowance,
+            # because the check never ran at all. Fail closed. This is not a
             # grants denial (403) — the caller's grants were never consulted —
             # so say plainly that the stored config could not be resolved.
             logger.warning(
                 "Resume PEP: stored config for job %s cannot be resolved (%s); "
                 "failing closed — the grant check could not run.",
                 job_id,
-                tpe,
+                exc,
             )
             raise HTTPException(
                 status_code=409,
                 detail=(
                     "This job's stored configuration cannot be resolved, so "
-                    "its capability grants could not be re-checked: " + str(tpe)
+                    "its capability grants could not be re-checked: " + str(exc)
                 ),
             )
         except Exception:

@@ -16,6 +16,7 @@ See docs/issues/job_resume_direct_path_skips_credential_injection.md.
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 from contextlib import asynccontextmanager
@@ -622,3 +623,63 @@ class TestResumeEndpointGrantRecheck:
 
         assert result["status"] == "resumed"
         grant_recheck_collaborators.delegate.assert_awaited_once()
+
+    def test_json_decode_error_is_a_value_error_subclass(self):
+        """Pins the assumption the widened `except` relies on rather than
+        leaving it for a reader to trust: `json.JSONDecodeError` (raised by
+        the two `json.loads` calls below — the job's own `config_override`
+        string, and an expert row's stored `config`/`prompts` string) is a
+        `ValueError` subclass, so catching `ValueError` covers it without
+        naming it. If a future Python/json release ever changed this, this
+        test — not a production incident — would be the first to notice."""
+        assert issubclass(json.JSONDecodeError, ValueError)
+
+    @pytest.mark.asyncio
+    async def test_malformed_config_override_json_fails_closed(
+        self, grant_recheck_collaborators
+    ):
+        """Reviewer-confirmed repro: a job's own `config_override` stored as
+        a string that isn't valid JSON raises `json.JSONDecodeError` at
+        `_rco = json.loads(_rco)` — BEFORE `resolve_config` is ever called,
+        a different line than the other tests in this class exercise, but
+        the same try/except, so it must land in the same 409 bucket rather
+        than the bare handler that proceeds."""
+        grant_recheck_collaborators.job["config_override"] = "{not valid json"
+
+        with pytest.raises(HTTPException) as ei:
+            await main.resume_job(MagicMock(), JOB_ID, main.JobResumeRequest())
+
+        assert ei.value.status_code == 409
+        assert "cannot be resolved" in ei.value.detail
+        # Proves *where* it failed, not just that it failed: resolve_config
+        # was never reached, because json.loads blew up two lines earlier.
+        grant_recheck_collaborators.resolve_config.assert_not_called()
+        grant_recheck_collaborators.delegate.assert_not_awaited()
+        grant_recheck_collaborators.queue_for_resume.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_unresolvable_config_name_fails_closed(
+        self, grant_recheck_collaborators, monkeypatch
+    ):
+        """Exercises the REAL `resolve_config` (swapping out the fixture's
+        stub for this one test only) with a `config_name` that resolves to
+        no file anywhere on disk, so this is the actual `FileNotFoundError`
+        `load_and_merge_config` raises (src/core/loader.py's unguarded
+        `open()` at the top of the function, hit because `resolve_config`'s
+        own internal $extends probe swallows the first attempt and retries
+        against the same missing path) — not a mocked stand-in for it.
+        """
+        from services.config_resolver import resolve_config as real_resolve_config
+
+        monkeypatch.setattr(main, "resolve_config", real_resolve_config)
+        grant_recheck_collaborators.job["config_name"] = (
+            "this-config-name-does-not-exist-anywhere-2f9c1a"
+        )
+
+        with pytest.raises(HTTPException) as ei:
+            await main.resume_job(MagicMock(), JOB_ID, main.JobResumeRequest())
+
+        assert ei.value.status_code == 409
+        assert "cannot be resolved" in ei.value.detail
+        grant_recheck_collaborators.delegate.assert_not_awaited()
+        grant_recheck_collaborators.queue_for_resume.assert_not_awaited()
