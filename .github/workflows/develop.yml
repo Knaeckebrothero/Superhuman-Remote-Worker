@@ -465,16 +465,72 @@ jobs:
 
       - name: Detect test-relevant changes
         id: test-paths
+        # Change-based testing: the full suite is large, so a docs-only or
+        # chart-only push should not pay for it. The base has to be the whole
+        # PUSH, not its tip commit.
+        #
+        # `HEAD~1` was the base until 2026-08-04, and it silently under-tested
+        # every multi-commit push: only the last commit decided. A push of six
+        # commits ending in a dependency bump reported "no Python changed" and
+        # skipped the suite while shipping Python — observed twice on 08-03/04,
+        # both times with a green tick, both times deployed. `HEAD~1` was also
+        # wrong in the dangerous DIRECTION: unresolvable base fell through to
+        # skipping. Every unknown here now runs the tests.
+        #
+        # Note the sibling `check` step deliberately keeps a different base —
+        # the last DEPLOYED sha — because it decides image rebuilds and tags,
+        # where re-running is churn (agent drains) rather than cheap insurance.
+        # Tests are the opposite trade, so the two bases differ on purpose.
         run: |
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            BASE="${{ github.event.pull_request.base.sha }}"
-          elif git rev-parse HEAD~1 &>/dev/null; then
-            BASE="HEAD~1"
-          else
+          RUN_ALL=""
+          case "${{ github.event_name }}" in
+            pull_request)
+              BASE="${{ github.event.pull_request.base.sha }}"
+              ;;
+            push)
+              # The branch tip before this push — covers every commit pushed.
+              BASE="${{ github.event.before }}"
+              case "$BASE" in
+                ''|0000000000000000000000000000000000000000)
+                  # Branch created by this push: no previous tip to diff.
+                  RUN_ALL="branch-created"
+                  ;;
+                *)
+                  if ! git cat-file -e "$BASE^{commit}" 2>/dev/null; then
+                    # Force-push rewrote history and the old tip is gone.
+                    RUN_ALL="before-sha-unreachable"
+                  elif ! git merge-base --is-ancestor "$BASE" HEAD 2>/dev/null; then
+                    # Force-push: the old tip is not in this history, so a diff
+                    # would report unrelated files in both directions.
+                    RUN_ALL="history-rewritten"
+                  fi
+                  ;;
+              esac
+              ;;
+            *)
+              # workflow_dispatch and anything else: someone asked for a run on
+              # purpose, and there is no push range to narrow it to. Note that
+              # the old code took the HEAD~1 branch here, so a manual dispatch
+              # could not force the suite either.
+              RUN_ALL="event-${{ github.event_name }}"
+              ;;
+          esac
+
+          if [ -n "$RUN_ALL" ]; then
+            echo "Test path detection: running everything ($RUN_ALL)"
+            # Empty = "no usable range"; the chart/website checks in the next
+            # step read this and fail open on an empty value.
+            echo "RANGE_BASE=" >> "$GITHUB_ENV"
             echo "python=true" >> "$GITHUB_OUTPUT"
             echo "cockpit=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+
+          # Shared by the chart/website detection in the next step, so the
+          # push-range rule is stated once rather than copied.
+          echo "RANGE_BASE=$BASE" >> "$GITHUB_ENV"
+
+          echo "Test path detection: diffing $BASE..HEAD ($(git rev-list --count "$BASE..HEAD") commit(s))"
 
           if git diff --name-only "$BASE" HEAD -- \
             'src/' 'orchestrator/' 'tests/' 'config/' 'agent.py' \
@@ -493,7 +549,7 @@ jobs:
             echo "cockpit=false" >> "$GITHUB_OUTPUT"
           fi
 
-          echo "Test path detection: python=$(grep python "$GITHUB_OUTPUT" | tail -1) cockpit=$(grep cockpit "$GITHUB_OUTPUT" | tail -1)"
+          echo "Test path detection: $(grep -E '^(python|cockpit)=' "$GITHUB_OUTPUT" | tr '\n' ' ')"
 
       - name: Detect changes against last deployed SHA per component
         id: check
@@ -656,13 +712,12 @@ jobs:
           # that CI contract cannot skip the job that executes it. Both charts
           # must remain watched: a helm-vm-cluster/-only change otherwise skips
           # the vm-cluster chart publish + fleet bump.
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            CHART_BASE="${{ github.event.pull_request.base.sha }}"
-          elif git rev-parse HEAD~1 &>/dev/null; then
-            CHART_BASE="HEAD~1"
-          else
-            CHART_BASE=""
-          fi
+          # Same push-range base the test-path step resolved (RANGE_BASE), so a
+          # chart edit five commits below the tip is not missed. This one is
+          # sharper than the test case: a false negative here skips the chart
+          # PUBLISH and the fleet bump, so dev keeps running the old chart with
+          # a green tick. Empty means "no usable range" and falls open below.
+          CHART_BASE="${RANGE_BASE:-}"
           if [ -z "$CHART_BASE" ] || [ -n "$(git diff --name-only "$CHART_BASE" HEAD -- 'helm/' 'helm-vm-cluster/' 'scripts/check-chart-created-secret.sh')" ]; then
             CHART="true"
           else
