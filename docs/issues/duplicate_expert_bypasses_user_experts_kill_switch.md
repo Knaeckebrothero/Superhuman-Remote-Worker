@@ -23,9 +23,10 @@ policy decision rather than a shape one.
 still passes `_validate_expert_fragment`, and the copy acts as its new owner. The
 harm is that an administrator's kill switch does not hold, on the one
 configuration where the grant PDP is also off.
-**Component:** `orchestrator/main.py:29128` (`duplicate_expert`), which calls
-`_create_forked_expert` (`:28999`) at `:29155`; `_enforce_expert_save` (`:5058`);
-`_user_experts_enabled` (`:4924`).
+**Component:** `orchestrator/main.py` — `duplicate_expert`, which calls
+`_create_forked_expert`; `_enforce_expert_save`; `_user_experts_enabled`.
+*Symbols, not line numbers: every number this doc originally carried had drifted
+within a day, and a stale number sends the next reader to unrelated code.*
 **Reasoned from code, verified by reading every call site; not exercised against
 a deployment with the switch off.**
 
@@ -35,9 +36,9 @@ Five routes write an expert. Four of them run the combined save gate:
 
 | Route | `_enforce_expert_save` |
 |---|---|
-| `POST /api/experts` (create) | yes — `:29037` |
-| `PUT /api/experts/{id}` (update) | yes — `:29080` |
-| `POST /api/experts/import` | yes — `:29191` |
+| `POST /api/experts` (create) | yes |
+| `PUT /api/experts/{id}` (update) | yes |
+| `POST /api/experts/import` | yes |
 | `POST /api/expert-defaults/{expert_type}/fork` | yes |
 | **`POST /api/experts/{id}/duplicate`** | **no** |
 
@@ -143,9 +144,3 @@ The doc proposed `src.get("config") or {}`. The fix passes `src["config"]` — t
 value just returned by `_validate_expert_fragment`, because that is what actually
 gets persisted and it is already canonical, which is what `_enforce_save_grants`
 expects.
-- Not exercised: flip `user_experts` off in `system_settings` on an isolated
-  namespace, duplicate a bundled expert, and confirm both that the row is created
-  today and that it is refused after the fix. The switch is deployment-wide, so
-  this needs the same isolation as
-  `docs/tests/session_tool_groups_legacy_and_error_paths_verification.md` —
-  not a "just try it on dev" check.

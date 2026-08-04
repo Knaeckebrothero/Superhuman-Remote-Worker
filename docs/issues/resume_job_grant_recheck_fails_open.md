@@ -194,6 +194,41 @@ transient reason would silently convert a tolerated blip into a refused resume.
 The code comment says so and names the structural fix (a second `try` scoped
 around the grant check) for whoever needs it.
 
+## Correction: the PEP exists TWICE, and only the endpoint was fixed
+
+This doc, its sibling plan and the fix commits all speak as if there is one site.
+There are two. `_resume_job_on_agent` (`orchestrator/main.py` ~`:3267`) is a
+near-verbatim copy of the endpoint block and still catches **only `GrantDenied`**,
+so the dispatcher path swallows an unusable stored config and re-queues the job
+every tick, forever, logging a message that does not name the cause.
+
+It is not a security regression — the exception is raised before the POST to the
+agent, so that path fails closed by accident. Filed as
+[[dispatcher_resume_pep_twin_still_fails_open]], where the real fix (de-duplicate
+into one helper returning a verdict, rather than two divergent copies) is written
+up. Found by the whole-branch review, which is the only place it could have been
+found: each task review saw one site and had no reason to look for a twin
+8,000 lines away.
+
+## No recovery path for a 409 caused by the job's own config
+
+Worth stating plainly: no endpoint can change `jobs.config_name` or
+`jobs.config_override`. The only job mutators are `/cancel`, `/pause`,
+`/agent-release` and `/snapshot/pin`. So a job whose stored config is permanently
+unresolvable is unresumable until an operator edits the row, or the user abandons
+it and creates a new one.
+
+Reachable today, not hypothetically: six bundled expert directories deleted in
+this repo's history (`researcher`, `debugger`, `unrestricted`, `writer`, `coder`,
+`doc_writer`) still resolve to `config/<name>.yaml` paths that no longer exist →
+`FileNotFoundError` → 409 on every resume.
+
+This is not a regression the fix introduced. Before it, the endpoint swallowed the
+error and `_resume_job_on_agent` then hit the identical `resolve_config` and
+returned `False`, so the job was re-queued rather than resumed. The 409 replaces an
+unbounded silent requeue with an honest refusal — but "honest" is not "recoverable",
+and a repair route is the missing piece.
+
 ## Still open, deliberately
 
 - **`yaml.YAMLError`** from a malformed **bundled on-disk** config still falls to
