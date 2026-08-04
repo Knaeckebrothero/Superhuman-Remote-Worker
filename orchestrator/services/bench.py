@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import asyncio
 import copy
-import inspect
 import json
 import logging
 import os
@@ -23,7 +22,6 @@ from typing import Any
 from uuid import UUID
 
 from services.deliverable_gate import parse_required_deliverables
-from services.job_provisioning import provision_job_repo
 from services.job_todos import build_archive_listing
 from src.core.loader import canonical_config_name, deep_merge
 
@@ -506,73 +504,6 @@ async def bench_sweeper_loop(
         except asyncio.TimeoutError:
             pass
     logger.info("Job Bench sweeper stopped")
-
-
-async def materialize_bench_job(
-    db: Any,
-    run: Mapping[str, Any],
-    task: Mapping[str, Any],
-    arm: Mapping[str, Any],
-    replicate: int,
-    *,
-    gitea_client: Any,
-    main_cloud_router: Any,
-    trigger_dispatch: Callable[[], Any],
-    provision_fn: Callable[..., Awaitable[dict[str, Any]]] = provision_job_repo,
-) -> dict[str, Any]:
-    """Create, provision, and dispatch one creator-owned bench job.
-
-    This uses the same lower-level creation funnel as ``POST /api/jobs`` and
-    the automation producer: ``PostgresDB.create_job`` followed by the shared
-    repository/grant provisioner.  The model and full-autonomy values are run
-    pins and therefore layer last; task defaults sit below arm-specific A/B
-    overrides.
-    """
-
-    payload = build_bench_job_payload(run, task, arm, replicate)
-    job = await db.create_job(
-        description=payload["description"],
-        config_name=payload["config_name"],
-        expert_id=payload.get("expert_id"),
-        config_override=payload["config_override"],
-        context={
-            **payload["context"],
-            **(
-                {"required_deliverables": payload["required_deliverables"]}
-                if payload.get("required_deliverables")
-                else {}
-            ),
-        },
-        user_id=payload["user_id"],
-        project_id=payload.get("project_id"),
-        priority=payload["priority"],
-    )
-
-    try:
-        await provision_fn(
-            job_row=job,
-            gitea_client=gitea_client,
-            postgres_db=db,
-            main_cloud_router=main_cloud_router,
-        )
-    except Exception:
-        logger.exception(
-            "Bench run %s: repo provisioning failed for job %s (non-fatal)",
-            run.get("id"),
-            job.get("id"),
-        )
-
-    try:
-        dispatched = trigger_dispatch()
-        if inspect.isawaitable(dispatched):
-            await dispatched
-    except Exception:
-        logger.exception(
-            "Bench run %s: dispatcher trigger failed for job %s (non-fatal)",
-            run.get("id"),
-            job.get("id"),
-        )
-    return job
 
 
 def build_bench_job_payload(
@@ -1074,7 +1005,6 @@ __all__ = [
     "fetch_main_requests",
     "fetch_phase_events",
     "freeze_spec",
-    "materialize_bench_job",
     "metric_summary",
     "refresh_run_ledger",
     "sweep_run",
