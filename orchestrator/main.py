@@ -11614,6 +11614,21 @@ async def resume_job(
             # because the check never ran at all. Fail closed. This is not a
             # grants denial (403) — the caller's grants were never consulted —
             # so say plainly that the stored config could not be resolved.
+            #
+            # Bare `ValueError` is deliberately broad and has ONE known
+            # overlap: `_enforce_dispatch_grants` reaches
+            # `list_grants_for_scopes`, which `json.loads` the
+            # `capability_grants.value_json` column — so a corrupted GLOBAL
+            # grant row would 409 every resume in that scope while blaming
+            # this job's own config. Accepted, not overlooked: the column is
+            # `jsonb NOT NULL` written only via `json.dumps(...)::jsonb`, so
+            # Postgres validates syntax on every write and reaching it needs
+            # DB-level corruption rather than any application path.
+            # If you ADD a call to this try block, check it cannot raise
+            # ValueError for a TRANSIENT reason — that would silently convert
+            # a tolerated blip into a refused resume. Scoping this handler to
+            # the config work alone (a second try around the grant check) is
+            # the structural fix if that ever becomes a real risk.
             logger.warning(
                 "Resume PEP: stored config for job %s cannot be resolved (%s); "
                 "failing closed — the grant check could not run.",
