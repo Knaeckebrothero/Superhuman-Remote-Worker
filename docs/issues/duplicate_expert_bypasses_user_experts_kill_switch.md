@@ -128,15 +128,44 @@ state is neither.
   than the instance. The four that already enforced it were unpinned too; they are
   not any more. Mutation-tested: removing the new call fails exactly the
   `duplicate` parameter.
-- **Live-gated**: 403 × 5 with the switch off and no row created; 422 naming
-  `shell_tools` for a non-admin duplicating a shell-declaring expert, with an
-  admin control returning 200 so the 422 cannot be a shape rejection in disguise.
-  Evidence: [[expert_write_gate_holes_live_gate_2026-08-04]].
+- **Live-gated**: 403 × 5 with the switch off and no row created, plus an admin
+  control. Evidence: [[expert_write_gate_holes_live_gate_2026-08-04]].
 
-**The decision the doc left open was taken by the repo owner: enforce the FULL
-gate**, not the kill switch alone. A user who lacks a grant the source config
-requires is refused at copy time rather than getting a copy that fails later at
-dispatch for a config they never authored.
+## The decision the doc left open, and the correction that followed
+
+The owner first chose the **full gate** — refuse a copy whose config exceeds the
+copier's grants, consistent with the other four routes. Implemented in `55080ed0`.
+
+Then it was **measured**, which should have happened before the question was asked:
+against the real PDP with default grants (`shell_tools=False`, `delegation=False`),
+refusing blocks **7 of the 11 shipped experts** — `scholar`, `developer`, `critic`
+(shell + delegation) and `bughunter`, `designer`, `designer-interactive`,
+`product-qa` (shell). Only `assistant`, `centurion`, `curator` and `general-worker
+` pass. Grants default `False` for every user created after migration `0030`, so
+that is the *default new-user experience*, and `scholar` is the expert this route's
+own docstring names: *"Fork any visible expert into an owned copy — 'start from
+scholar'"*.
+
+The workflow it broke was real: duplicate `scholar`, strip the shell block, run it.
+The copy was useless until edited, but it could be edited. Refusing removes step
+one unless an admin grants `shell_tools` — a grant the user does not need and
+should not get, for a copy they were going to strip anyway.
+
+**Final behaviour (`b0333217`): copy minus what the user cannot have, and report
+it.** `strip_to_grants` in `src/core/capability_grants.py` sits beside `evaluate`
+so the grant → config-path map cannot drift from the rules it mirrors. Deleting the
+offending key is correct for every rule because absent means *inherit the base*,
+and the base is the conservative floor.
+
+**The safety property, which is the part to preserve if this is ever touched:**
+after stripping, `evaluate` runs **again** on the stripped fragment, and any
+surviving violation still 422s. That is what makes an incomplete strip map produce
+only false refusals and never a permitted escape. Verified by deliberately breaking
+the map — the route refused rather than storing the ungranted row.
+
+The four other routes still refuse. `fork_my_expert_default` also accepts bundled
+ids, so the same 7-of-11 argument applies to it and it is **not** covered here —
+filed as its own decision.
 
 ## Historical, and how the fix differs from this doc's suggestion
 
