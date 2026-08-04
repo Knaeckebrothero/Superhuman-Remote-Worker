@@ -1852,6 +1852,7 @@ def _merged_session_tool_policy(
     expert_row: dict[str, Any] | None,
     project_overrides: dict[str, Any] | None,
     request_override: dict[str, Any] | None,
+    expert_type: str = "session",
 ) -> tuple[dict[str, list[str]], dict[str, str]]:
     """``(merged tools mapping, category -> deciding layer)``.
 
@@ -1865,6 +1866,11 @@ def _merged_session_tool_policy(
     Provenance exploits ``deep_merge``'s list-replacement rule: for
     ``tools.<category>`` the most specific layer naming the category owns it
     outright, so "which layer decided it" is the last hit down the chain.
+
+    ``expert_type`` selects which prompt/config leaf ``resolve_config`` reads and
+    was hardcoded to ``"session"`` until 2026-08-04, which is why job create had
+    no honest toolset view: asking it for a worker prediction returned a
+    session's answer, so the surface was left rendering six static rows instead.
     """
     capture: dict[str, Any] = {}
     resolve_config(
@@ -1873,7 +1879,7 @@ def _merged_session_tool_policy(
         expert_row=expert_row,
         project_overrides=project_overrides,
         request_override=request_override,
-        expert_type="session",
+        expert_type=expert_type,
         capture=capture,
     )
     merged_fragment = capture.get("merged_fragment") or {}
@@ -24534,12 +24540,16 @@ async def get_thread_tool_groups(thread_id: str, request: Request) -> dict[str, 
 
 
 class ToolGroupPreviewRequest(BaseModel):
-    """What would a session created with THIS config bind? (a prediction)"""
+    """What would a session or job created with THIS config bind? (a prediction)"""
 
     config_name: Optional[str] = None
     expert_id: Optional[str] = None
     project_id: Optional[str] = None
     config_override: Optional[dict[str, Any]] = None
+    #: Which surface is asking. ``worker`` is the job-create form and defaults
+    #: the base to ``worker_base``; ``session`` is the New Session form. Default
+    #: stays ``session`` so the shipped cockpit's payloads keep their meaning.
+    expert_type: Literal["worker", "session"] = "session"
 
 
 @app.post("/api/persistent/tool-groups/preview")
@@ -24567,9 +24577,11 @@ async def preview_tool_groups(
     both surfaces.
     """
     user = await require_approved_user(request, postgres_db)
-    base = canonical_config_name(body.config_name or "session_base")
+    is_worker = body.expert_type == "worker"
+    default_base = "worker_base" if is_worker else "session_base"
+    base = canonical_config_name(body.config_name or default_base)
     if _looks_like_uuid(base):
-        base = "session_base"
+        base = default_base
 
     expert_row = None
     project_overrides = None
@@ -24588,8 +24600,15 @@ async def preview_tool_groups(
     except Exception:
         logger.warning("Tool-group preview could not load the expert/project layer")
 
+    # The legacy branch models ONE agent's behaviour: persistent_session's
+    # re-adding of the closed group lists when no disable marker is present.
+    # Worker jobs have no such step, so on the worker surface "experts off" only
+    # means there is no expert layer to merge — the resolved path already answers
+    # that correctly. Routing a worker preview through the session legacy policy
+    # would predict appended session groups for a job that cannot hold them.
+    use_legacy = legacy and not is_worker
     try:
-        if legacy:
+        if use_legacy:
             configured, provenance = await asyncio.to_thread(
                 _legacy_session_tool_policy, base, body.config_override or None
             )
@@ -24600,6 +24619,7 @@ async def preview_tool_groups(
                 expert_row=expert_row,
                 project_overrides=project_overrides,
                 request_override=body.config_override or None,
+                expert_type=body.expert_type,
             )
     except Exception:
         logger.exception("Tool-group preview resolve failed")
@@ -24626,8 +24646,14 @@ async def preview_tool_groups(
         grants=grants,
     )
     return {
-        "source": "legacy" if legacy else "resolved",
-        **_origin_fields(_unmeasured("no agent exists for an unsaved session")),
+        "source": "legacy" if use_legacy else "resolved",
+        **_origin_fields(
+            _unmeasured(
+                "no agent exists for an unsaved job"
+                if is_worker
+                else "no agent exists for an unsaved session"
+            )
+        ),
         "enumerate_only": enumerate_only_members(),
         "tool_groups": tool_groups_from_view(view),
         "categories": view,

@@ -226,6 +226,44 @@ describe('ToolsGroupComponent rendering', () => {
     expect(rows(fixture).length).toBeGreaterThan(0);
   });
 
+  it('JOB mode renders the answer it is given, not its six static rows', () => {
+    // Job create shipped with no `resolved` binding at all, so it rendered
+    // JOB_TOOL_CATEGORIES — six rows, two states, no grant gating — while
+    // sessions got twenty-five and three states. Passing the answer has to be
+    // enough; if `mode === 'job'` still narrowed anywhere, this fails.
+    const categories: Record<string, SessionToolCategory> = {};
+    for (const key of [
+      'research', 'shell', 'core', 'knowledge', 'git', 'evaluation',
+      'delegation', 'workspace', 'citation', 'communication', 'browser_direct',
+    ]) {
+      categories[key] = cat({state: 'off'});
+    }
+    const fixture = mount({mode: 'job', resolved: response({categories})});
+
+    expect(rows(fixture)).toHaveLength(11);
+    const body = text(fixture);
+    // Assert on the METADATA description, not the label: an unknown key still
+    // renders a humanised label via `humanize()`, so "Core" appearing proves
+    // nothing about which catalogue supplied it. The description only appears
+    // when the row resolved real metadata, and the "not recognised" fallback
+    // string must be absent.
+    expect(body).toContain('Planning, progress and completion');
+    expect(body).toContain('Approve or return worker jobs with feedback');
+    expect(body).not.toContain('does not recognise');
+    expect(body).not.toContain('agentSettings.');
+  });
+
+  it('JOB mode greys a grant-blocked row instead of offering a dead checkbox', () => {
+    const fixture = mount({
+      mode: 'job',
+      resolved: response({categories: {shell: cat({state: 'off'})}}),
+      gatedCapabilities: {shell_tools: false},
+    });
+    const row = rowFor(fixture, 'Shell');
+    expect(row.classList.contains('unavailable')).toBe(true);
+    expect(row.querySelector('input[type="checkbox"]')).toBeNull();
+  });
+
   it('the LIVE pane with no answer renders no rows at all — not twelve ticked ones', () => {
     // The degraded live path: an older orchestrator 404s, the network fails,
     // or the 8s deadline trips on a read that probes an agent pod. The live
