@@ -100,6 +100,11 @@ POST   /api/automations/{automation_id}/pause                                   
 POST   /api/automations/{automation_id}/resume                                          gated:require_project_member
 POST   /api/automations/{automation_id}/run-now                                         gated:require_project_member
 GET    /api/automations/{automation_id}/runs                                            gated:require_project_member
+GET    /api/bench/runs                                                                  gated:require_approved_user
+POST   /api/bench/runs                                                                  gated:require_project_member
+GET    /api/bench/runs/{run_id}                                                         gated:require_approved_user
+POST   /api/bench/runs/{run_id}/cancel                                                  gated:require_approved_user
+GET    /api/bench/runs/{run_id}/report                                                  gated:require_approved_user
 POST   /api/citations/snapshot                                                          internal:require_internal
 GET    /api/citations/{citation_id}                                                     gated:user_can_access_job_or_thread
 GET    /api/citations/{citation_id}/drift                                               gated:user_can_access_job_or_thread
