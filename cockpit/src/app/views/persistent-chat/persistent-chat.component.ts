@@ -563,6 +563,45 @@ export function shouldPin(autoScroll: boolean, isRestoringScroll: boolean): bool
     return autoScroll && !isRestoringScroll;
 }
 
+/**
+ * Header-fold geometry. Same reason as the scroll pin above: the decision is
+ * pure and unit tested, the wiring is a browser check.
+ *
+ * Inline space the left group keeps before the actions fold: its fixed chrome
+ * (sidebar toggle, back, icon, session id, status dot + label ≈ 260px) plus a
+ * still-readable slice of the session title (≈ 120px). This is the only knob,
+ * and it means "fold once the title would be squeezed below ~120px" — NOT a
+ * pane breakpoint. The right value scales with the header's chrome, not with
+ * any device width.
+ */
+export const HEADER_LEFT_RESERVE_PX = 380;
+
+/**
+ * Slack required to unfold again. Without it the two states sit one pixel apart
+ * and a slow gutter drag flickers the header between them.
+ */
+export const HEADER_FOLD_HYSTERESIS_PX = 24;
+
+/**
+ * Whether the header's action row should collapse into the `⋮` overflow menu.
+ *
+ * `folded` is the CURRENT state and it is not decoration: folding shrinks the
+ * row to ~150px, which would otherwise "prove" there is room, unfold, overflow,
+ * and fold again. So the caller passes the row's natural (unfolded) width — the
+ * last one it measured while unfolded — and unfolding additionally demands
+ * `hysteresis` px of slack.
+ */
+export function shouldFoldHeaderActions(
+    headerInnerWidth: number,
+    actionsNaturalWidth: number,
+    folded: boolean,
+    reserve: number = HEADER_LEFT_RESERVE_PX,
+    hysteresis: number = HEADER_FOLD_HYSTERESIS_PX,
+): boolean {
+    const room = headerInnerWidth - reserve;
+    return actionsNaturalWidth + (folded ? hysteresis : 0) > room;
+}
+
 
 /**
  * Composer draft persistence — survive a full-page reload (e.g. the auth
@@ -655,7 +694,7 @@ export function clearDraft(threadId: string | null): void {
       }
 
       <!-- Header -->
-      <div class="chat-header">
+      <div class="chat-header" #chatHeaderEl>
         <div class="header-left">
           <app-sidebar-toggle />
           <a class="back-link" routerLink="/sessions">
@@ -677,15 +716,19 @@ export function clearDraft(threadId: string | null): void {
           @if (chat.threadId(); as tid) {
             <span class="header-session-id" title="Session ID">{{ tid.slice(0, 8) }}</span>
           }
-          <span class="status-dot" [class]="connectionClass()"></span>
-          <span class="status-label">{{ connectionLabel() }}</span>
+          <span class="status-dot" [class]="connectionClass()"
+                [title]="headerCompact() ? connectionLabel() : null"></span>
+          @if (!headerCompact()) {
+            <span class="status-label">{{ connectionLabel() }}</span>
+          }
         </div>
-        <div class="header-right">
+        <div class="header-right" #headerActionsEl>
           <ng-content select="[chatHeaderAction]" />
           @if (chat.isConnected()) {
-            @if (viewport.isMobile()) {
-              <!-- Mobile: fold the secondary controls into one overflow menu so
-                   the header stays a single row; Disconnect stays reachable. -->
+            @if (headerCompact()) {
+              <!-- Narrow header (mobile, or the canvas/settings pane eating the
+                   chat pane): fold the secondary controls into one overflow menu
+                   so the header stays a single row; Disconnect stays reachable. -->
               <app-icon-button
                 size="sm"
                 [ariaLabel]="'chat.header.moreActions' | transloco"
@@ -1958,6 +2001,10 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
      * element sits inside an `@if`.
      */
     private readonly messagesInner = viewChild.required<ElementRef<HTMLDivElement>>('messagesInner');
+    /** Header + its action row — measured to decide when the actions fold into
+     *  the overflow menu (see the header-fold ResizeObserver in the ctor). */
+    private readonly chatHeaderEl = viewChild.required<ElementRef<HTMLDivElement>>('chatHeaderEl');
+    private readonly headerActionsEl = viewChild.required<ElementRef<HTMLDivElement>>('headerActionsEl');
     @ViewChild('inputEl') inputEl!: ElementRef<HTMLTextAreaElement>;
     @ViewChild('fileInput') fileInput?: ElementRef<HTMLInputElement>;
     @ViewChild('cameraInput') cameraInput?: ElementRef<HTMLInputElement>;
@@ -1968,6 +2015,28 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     // Settings panel
     readonly showViewMenu = signal(false);
     readonly showCitations = signal(false);
+
+    /**
+     * Fold the header's secondary actions into the `⋮` overflow menu.
+     *
+     * Driven by the header's OWN width, not the viewport's: the chat pane shares
+     * its row with the canvas/settings pane, so a 2560px desktop can hand this
+     * header 500px. Keyed off `viewport.isMobile()` the actions simply ran past
+     * the pane edge and were clipped by the split area — the buttons neither
+     * moved nor shrank, they just stopped existing. See
+     * docs/issues/canvas_settings_pane_clips_chat_header_actions.md.
+     */
+    readonly headerCompact = computed(
+        () => this.viewport.isMobile() || this.headerActionsOverflow(),
+    );
+    /** Measured half of {@link headerCompact} — set by the header ResizeObserver. */
+    private readonly headerActionsOverflow = signal(false);
+    /**
+     * Natural width of the action row, remembered from the last render where it
+     * was NOT folded. Folding shrinks the row, which would otherwise "prove"
+     * there is room and unfold it again — this is the hysteresis anchor.
+     */
+    private headerActionsNaturalWidth = 0;
 
     // Resume state
     readonly isResuming = signal(false);
@@ -2303,6 +2372,48 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
                 container.removeEventListener('touchstart', onTouchStart);
                 container.removeEventListener('touchmove', onTouchMove);
             });
+        });
+
+        // ===== The header fold =====
+        //
+        // Same shape as the scroll pin: observe the effect, don't enumerate the
+        // causes. The header narrows for reasons this component can't see — the
+        // canvas/settings pane opening, the split gutter being dragged, the
+        // sidebar collapsing, the window resizing — so measure the box instead
+        // of subscribing to each trigger.
+        //
+        // Two targets again, and again asymmetric:
+        //   header  -> the space available (pane resize, gutter drag)
+        //   actions -> the space demanded (the IDE button appearing once the
+        //              workspace is up, citations arriving, i18n swap). The
+        //              header's own box NEVER changes when a button appears, so
+        //              observing only it would fold too late — or not at all.
+        afterNextRender(() => {
+            const header = this.chatHeaderEl().nativeElement;
+            const actions = this.headerActionsEl().nativeElement;
+
+            const evaluate = () => {
+                const compact = this.headerCompact();
+                // `.header-right` is flex: 0 0 auto, so its box is its natural
+                // width even while it overflows — no hidden probe render needed.
+                // Only trust it while unfolded: the folded row is ~150px and
+                // would "prove" there is room, then unfold, then overflow again.
+                if (!compact) this.headerActionsNaturalWidth = actions.offsetWidth;
+
+                const cs = getComputedStyle(header);
+                const inner =
+                    header.clientWidth -
+                    (parseFloat(cs.paddingLeft) || 0) -
+                    (parseFloat(cs.paddingRight) || 0);
+                this.headerActionsOverflow.set(
+                    shouldFoldHeaderActions(inner, this.headerActionsNaturalWidth, compact),
+                );
+            };
+
+            const ro = new ResizeObserver(evaluate);
+            ro.observe(header);
+            ro.observe(actions);
+            this.destroyRef.onDestroy(() => ro.disconnect());
         });
 
         // The placeholder renders inside the textarea's scroll area, so a

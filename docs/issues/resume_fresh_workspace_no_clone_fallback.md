@@ -78,6 +78,24 @@ path depends on was already absent. That deserves its own investigation — but
 the fix here must not depend on snapshots existing, because the job repo is
 the more reliable source anyway.
 
+### Follow-up evidence — five fresh main-cluster jobs, 2026-08-03/04
+
+The checkpoint omission is still systematic. Each of five concurrent Scholar
+jobs logged `Snapshot: checkpoint.db not found` exactly three times (15 warnings
+total: strategic boundary, tactical boundary, finalization). All five otherwise
+completed and pushed their reports to Gitea.
+
+This narrows the interpretation:
+
+- normal branch durability is healthy on the fresh main-cluster path;
+- the phase snapshot does not contain the checkpoint database expected by the
+  recovery code; and
+- a later fresh-workspace resume must therefore be proven through the Gitea
+  clone fallback, not assumed to recover from a phase snapshot.
+
+Evidence ledger:
+`docs/issues/overnight_minimax_m3_scholar_batch_2026-08-03.md`.
+
 ## Cost in this incident
 
 ~7 hours of LLM work re-deriving research that already existed in Gitea; the

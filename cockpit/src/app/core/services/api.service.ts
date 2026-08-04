@@ -32,6 +32,7 @@ import {
     JobAcceptOutcome,
     JobAcceptPartialFailure,
     JobAcceptResult,
+    JobCloudExportResult,
     JobCreateRequest,
     JobDiffFile,
     JobDiffSummary,
@@ -2220,25 +2221,27 @@ export class ApiService {
    *
    * See docs/done/job_cloud_export.md §3.2.
    */
-  exportJobToSharedFolder(
-    jobId: string,
-  ): Observable<{
-    job_id: string;
-    files_copied: number;
-    folder: { name: string; browser_url: string | null; webdav_url: string | null };
-  } | null> {
+  exportJobToSharedFolder(jobId: string): Observable<JobCloudExportResult | null> {
     return this.http
-      .post<{
-        job_id: string;
-        files_copied: number;
-        folder: { name: string; browser_url: string | null; webdav_url: string | null };
-      }>(`${this.baseUrl}/jobs/${jobId}/export-to-shared-folder`, {})
+      .post<JobCloudExportResult>(
+        `${this.baseUrl}/jobs/${jobId}/export-to-shared-folder`,
+        {},
+      )
       .pipe(
-        tap((result) =>
-          this.toast.success(
-            this.t('toasts.jobs.exportedToCloud', { count: result?.files_copied ?? 0 }),
-          ),
-        ),
+        tap((result) => {
+          const params = {
+            count: result?.files_copied ?? 0,
+            folder: result?.folder?.name ?? '',
+          };
+          // `shared: false` means the bytes landed but the folder isn't
+          // visible to this user yet (no cloud account until their first
+          // login), so opening it would 404. Say that instead of "success".
+          if (result && result.shared === false) {
+            this.toast.warning(this.t('toasts.jobs.exportedNotShared', params));
+          } else {
+            this.toast.success(this.t('toasts.jobs.exportedToCloud', params));
+          }
+        }),
         catchError((error) => {
           console.error(`Failed to export job ${jobId} to cloud:`, error);
           this.toast.danger(this.errors.translate(error, 'errors.jobs.exportFailed'));

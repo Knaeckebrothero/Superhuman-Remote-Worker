@@ -605,7 +605,8 @@
       "confirmDelete": "Confirm?",
       "promote": "Promote",
       "createProject": "Create Project",
-      "exportToCloud": "Open cloud folder",
+      "exportToCloud": "Export to cloud",
+      "openCloudFolder": "Open cloud folder",
       "exported": "Exported",
       "approveRequest": "Approve request"
     },
@@ -628,8 +629,8 @@
       "deleteJob": "Delete job",
       "moreActions": "More actions",
       "promoteJob": "Promote to project",
-      "exportToCloud": "Copy this job's deliverables to a shared cloud folder and open it",
-      "alreadyExported": "Already exported. Delete the cloud folder to re-export.",
+      "exportToCloud": "Copy this job's deliverables to a shared cloud folder",
+      "openCloudFolder": "Open this job's cloud folder in a new tab",
       "snapshotStats": "S3 snapshot storage",
       "snapshotAvailable": "Environment snapshot available",
       "delegationWaiting": "Waiting for delegation children to complete",
@@ -2369,7 +2370,9 @@
       "feedbackPlaceholder": "Write feedback or additional instructions for the agent...",
       "resuming": "Resuming...",
       "continueWithFeedback": "Continue with Feedback",
-      "openingCloudFolder": "Opening..."
+      "exportingToCloud": "Exporting...",
+      "exportToCloud": "Export to cloud",
+      "resyncCloudFolder": "Re-sync cloud folder"
     },
     "messages": {
       "approved": "Job approved successfully.",
@@ -2936,7 +2939,8 @@
       "approved": "Job approved",
       "vmUpgradeStarted": "VM upgrade initiated",
       "replySent": "Reply sent",
-      "exportedToCloud": "Exported {{count}} file(s) to your cloud",
+      "exportedToCloud": "Exported {{count}} file(s) to {{folder}}",
+      "exportedNotShared": "Exported {{count}} file(s) to {{folder}}, but it isn't shared with you yet — sign in to the cloud once, then re-sync.",
       "diffAccepted": "Applied {{applied}} change(s), {{deleted}} deletion(s) to the cloud folder.",
       "diffRejected": "Diff rejected; no cloud changes were made."
     },

@@ -19,6 +19,8 @@ related:
   - "[[dual_app_persistent_app_redundancy]]"
   - "[[memory_bugs]]"
   - "[[context_summarization_rework]]"
+  - "[[overnight_minimax_m3_scholar_batch_2026-08-03]]"
+  - "[[job_runtime_containment_gap]]"
 ---
 
 # Phase-model overhead: the forced-compaction amnesia loop
@@ -27,10 +29,10 @@ related:
 dive prompted by "the phase model isn't suited for small tasks (and maybe
 not for long ones either)". The root cause (P-1), the structural
 prerequisites for enlarging phases, and the behaviour change itself have
-since shipped in-tree; see §5.
-The measurements are from phase archives pulled live before the dev API
-went down; the token-side confirmation is still owed (see *Not yet
-verified*).
+since shipped in-tree; see §5. Token-side field data in §10 and the five-job
+main-cluster acceptance in §11 confirm that the original compounding curve is
+gone and that the conditional transition fast path (P-2) is now the dominant
+remaining phase defect.
 
 **Direction, decided 2026-07-31.** The split is **not** being torn down.
 Tactical phases get much larger, so a job runs roughly three phases —
@@ -259,7 +261,7 @@ The phase loop reimplemented a worse variant by accident.
   phases inherit tactical tool-result bloat — mitigated by the existing
   `clear_old_tool_results` + threshold path, and empirically survivable
   (the persistent/session runtime runs for days without a forced wipe).
-- **P-2 — ⬜ NOT STARTED. Make REVIEW-AND-ADAPT conditional.** Fast path when every
+- **P-2 — ⬜ LIVE-CONFIRMED, NOT STARTED. Make REVIEW-AND-ADAPT conditional.** Fast path when every
   tactical todo completed **and** an orchestrator/Gitea check at the boundary
   confirms the declared P1-C contract paths moved: append one outcome line to `plan.md`, stage the
   next todos, continue. Load the full block only on a failed todo, or on
@@ -280,8 +282,11 @@ The phase loop reimplemented a worse variant by accident.
 - **P-4 — 🟡 PARTIAL. Trim the per-turn floor.** The 2026-08-03 activation
   correction removed continuous `verify-before-done` injection: completion now
   requires a phase-scoped read no more than 20 LLM turns old, and other phase
-  guidance is checkpointed once per concrete phase. The remaining items are the
-  10k worker-memory budget and repeated verbatim todo bodies.
+  guidance is checkpointed once per concrete phase. The 2026-08-03/04 overnight
+  batch confirmed that continuous injection is gone, but also recorded 50
+  rejected completion calls when MiniMax retried the protected action instead
+  of performing the named read. The remaining items are gate-recovery
+  ergonomics, the 10k worker-memory budget, and repeated verbatim todo bodies.
 
 ---
 
@@ -724,26 +729,21 @@ backed officer reads (P0-A/B), proven subagent delegation.
 
 ## 9. Not yet verified
 
-- **Nothing in §5 has run on a cluster.** All of it is unit- and
-  integration-tested in-tree, and `ProgressCommitter` was exercised
-  against a real `GitManager` on a scratch repo, but no job has executed
-  against this code. The end-to-end check is a job on k3d showing commits
-  landing *between* phase boundaries and a queued reply arriving at a
-  completed todo rather than at a transition.
-- **Token attribution per phase.** All durations above are wall-clock
-  from phase archives. The token-side confirmation (`list_llm_requests`
-  on `396a5d4c`, bucketed by phase) is owed — the dev API and cluster
-  were unreachable for the whole filing session (Cloudflare 530 on
-  `api.srw.works` / `mcp.srw.works`, `kubectl --context=main` timing
-  out). Expected shape if F3/F4 are right: per-turn prompt tokens roughly
-  flat-to-rising across the job with a large constant floor, and strategic
-  turns no cheaper than tactical ones.
-- **Whether P-1 alone is sufficient** to stop the growth curve, or
-  whether P-3 is required to see it. Testable: run one contracted job
-  before/after and compare the strategic-phase duration sequence. Note
-  the TTL fix in §5 changes the P-3 baseline — the pinned pool no longer
-  grows without bound, so this should be re-measured before deciding
-  whether the policy cap is still needed.
+- **Superseded in part by §11.** Five main-cluster Scholar jobs now show progress
+  commits between boundaries, one-shot skill delivery, successful final pushes,
+  and isolated job branches. The queued-reply delivery path still needs its own
+  live steering exercise, and the local k3d SSH path remains blocked by the
+  projected-key ownership/mode quirk.
+- **Completed since filing: token attribution per phase.** The dev-cluster
+  measurement in §10 and main-cluster batch in §11 supply the formerly owed
+  request/token evidence. The original growing strategic-duration sequence is
+  gone, while retained prompt history and the final transition attractor remain
+  expensive.
+- **Completed directionally since filing: whether P-1 stops the growth curve.**
+  The post-reform cohorts in §10 and the five fresh jobs in §11 show the
+  expected non-compounding signature. P-3 still needs its own controlled
+  memory-budget experiment; the overnight batch additionally exposed a
+  project-concurrency TTL defect tracked separately.
 - Interaction between P-1 and the `message_count_threshold: 300` /
   `max_tool_calls_per_phase: 500` limits, which have never been exercised
   with un-forced boundaries. The second of those is now known to be an
@@ -828,3 +828,109 @@ the next slice should be **P-3/P-4 (injection economics), not further
 phase-structure loosening**, and the paired-run suite is needed to (a)
 give worker_base a clean post sample, (b) control night-to-night task
 drift, (c) make the ceremony numbers defensible beyond direction.
+
+## 11. Main-cluster overnight confirmation: the transition fast path is now the dominant phase defect (2026-08-04)
+
+Five MiniMax-M3 Scholar jobs ran concurrently on the main cluster after the
+2026-08-03 job-start, boundary-manifest, and skill-activation changes. All five
+completed, pushed substantive reports to isolated job branches, and left
+project `main` unchanged. Full evidence is in
+`overnight_minimax_m3_scholar_batch_2026-08-03.md`; this section records only
+what the run changes for the phase model.
+
+### The good news
+
+- P-1 remains healthy: there is no return of the forced-boundary compounding
+  curve, and prompt history survives until ordinary threshold compaction.
+- Progress commits are visible throughout the job, not only at the terminal
+  boundary. Each report was already committed before the final strategic phase.
+- The worker-visible boundary manifest is absent from every audit trail.
+- Full skill bodies are no longer injected every turn. Reads are explicit and
+  phase/action scoped.
+- Most importantly, the expensive jobs still completed. This is a successful
+  baseline, not another zero-deliverable failure.
+
+### Three phases were enough
+
+Every overnight job followed the same three-phase shape: strategic planning,
+one tactical execution phase, and strategic review/submission. The tactical
+phases contained 5, 11, 8, 6, and 7 todos respectively (mean 7.4), and every
+job produced its report without opening another logical phase. The mean was
+therefore exactly 3.0 logical phases per job.
+
+Two jobs archive-committed their tactical phase twice, raising the mechanical
+completion-event mean to 3.4. Those duplicate events did not represent new work
+and produced the phase-tag defect tracked in
+`phase_boundary_tags_are_moved_then_rejected_by_remote.md`.
+
+This is evidence for keeping plan → execute → review/submit as the default for
+bounded jobs. A new phase should correspond to a material milestone, changed
+plan, external review, or loss of coherent execution scope—not a fixed quota of
+three or four todos. The observed waste came from ceremonial and contradictory
+instructions inside the opening/closing phases, not from having too few phase
+boundaries.
+
+### P-2 is not theoretical
+
+The generic transition template still creates two pending todos:
+
+1. `REVIEW AND ADAPT`, whose completion criterion is a Git-evidenced quality
+   review and an accurate `plan.md`;
+2. `PLAN OR COMPLETE — the stop condition comes FIRST`, whose stop condition is
+   only satisfied if “the review (todo 1) confirmed their quality.”
+
+The dependency and the requested execution order conflict. Because the entire
+active todo body is appended at the salient end of every LLM request, MiniMax
+repeatedly restarted todo 2's “first” check rather than finishing todo 1. All
+file and Git tools returned successfully.
+
+Measured from the tactical-complete commit to the todo-1 completion commit:
+
+| Job | Parent calls | Raw tokens | Tool calls |
+|---|---:|---:|---:|
+| RAG evaluation control | 10 | 1,253,742 | 19 |
+| Agentic RAG, 10-turn readers | 62 | 7,731,257 | 242 |
+| Agentic RAG, 24-turn readers | 53 | 10,195,140 | 118 |
+| RAG paper review | 5 | 784,244 | 7 |
+| RAG platform comparison | 5 | 920,328 | 10 |
+| **Total** | **135** | **20,884,711** | **396** |
+
+The two matched agentic-RAG reports had already completed their tactical phases
+32 and 28 minutes before todo 1 finally closed. In the 10-turn job, 99
+`file_exists`, 34 `search_files`, 31 `git_tags`, and 31 `list_files` calls landed
+inside this one final review window. In the 24-turn job, prompts climbed above
+220k tokens while the assistant repeatedly promised to run the same stop check.
+
+Both trajectories broke immediately after threshold compaction: the next
+prompts dropped to roughly 20k tokens and the model completed todo 1. That timing
+supports a prompt-history attractor diagnosis, but it is an inference from the
+trace rather than an explicit runtime reason code.
+
+### Consequence for the next phase change
+
+Do not add another status file and do not loosen verification. Implement the
+existing P-2 direction:
+
+- derive the cheap agreement signal outside the worker-visible filesystem from
+  completed tactical todos, declared deliverables, and the current job-branch
+  Git ref;
+- when they agree, inject a small ordered closeout task: review the known
+  artifacts once, update the plan only if reality differs, then complete;
+- when they disagree, load the full Git-archaeology/adaptation block;
+- remove “stop condition first” from any todo whose condition explicitly
+  depends on a different pending todo; and
+- keep `job_complete` fail-closed on committed deliverables.
+
+This is now a larger measured token lever than reader iteration limits. In the
+matched 10-vs-24 experiment, only about 412k tokens separated reader usage; the
+two parent transition-review windows consumed 17.93M tokens combined.
+
+### P-4 caveat from the same run
+
+The action gate preserved correctness but caused 50 rejected
+`todo_complete`/`job_complete` calls before valid phase-scoped reads. This is not
+continuous skill injection. It is a recovery-interface failure: the error names
+the exact file, but the model can immediately retry the protected tool again.
+The eventual correction should keep the passive proof requirement while making
+the only valid next action clearer or temporarily exclusive. It is secondary to
+P-2 because it did not cause the 53/62-round transition loops.
