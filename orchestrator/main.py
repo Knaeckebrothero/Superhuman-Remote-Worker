@@ -11558,8 +11558,13 @@ async def resume_job(
 
     # Resume PEP (decision 9, B3): re-check the runner's CURRENT grants against the
     # job's stored config before replaying it. Placed before the resume try so a 403
-    # is not downgraded by the broad handler below (fail closed on denial). A resolve
-    # infra error proceeds — the dispatch-time grant check already passed.
+    # is not downgraded by the broad handler below (fail closed on denial). A
+    # TRANSIENT resolve/grant-check error (DB blip) proceeds — the dispatch-time
+    # check already passed minutes ago and tolerating a hiccup is cheaper than
+    # refusing a resume over it. A DETERMINISTIC resolve failure (a permanently
+    # malformed stored `tools` policy -> ToolPolicyError) fails closed instead:
+    # it would raise identically on every future resume of this job, so nothing
+    # is "standing in" for a check that can never run.
     if await _user_experts_enabled():
         try:
             _rco = job.get("config_override")
@@ -11589,6 +11594,29 @@ async def resume_job(
             logger.warning("Resume denied for job %s: %s", job_id, gd)
             raise HTTPException(
                 status_code=403, detail=_grant_violations_detail(gd.violations)
+            )
+        except ToolPolicyError as tpe:
+            # Deterministic, not transient: resolve_config raises this on a
+            # permanently-malformed stored `tools` value (e.g. `core: null`),
+            # and it will raise identically on every future resume of this
+            # job. The broad handler below exists for infra blips where the
+            # dispatch-time check "stands" as a fallback; here the check never
+            # ran at all, so nothing stands and tolerating it would be a
+            # latch, not a flakiness allowance. Fail closed. This is not a
+            # grants denial (403) — the caller's grants were never consulted —
+            # so say plainly that the stored config could not be resolved.
+            logger.warning(
+                "Resume PEP: stored config for job %s cannot be resolved (%s); "
+                "failing closed — the grant check could not run.",
+                job_id,
+                tpe,
+            )
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "This job's stored configuration cannot be resolved, so "
+                    "its capability grants could not be re-checked: " + str(tpe)
+                ),
             )
         except Exception:
             logger.exception(
