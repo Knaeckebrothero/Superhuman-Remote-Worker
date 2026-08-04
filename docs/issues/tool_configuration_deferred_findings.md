@@ -316,17 +316,31 @@ handoff items this series dropped.
    Second, removing the `resolvedToolset` binding passed all fifteen pre-existing
    job-create tests. That absence is why the defect shipped, and both creation
    forms are now pinned to pass the read in
-   `cockpit/src/app/views/create/creation-forms-read-the-resolved-toolset.spec.ts`.
+   `cockpit/src/app/views/agent-settings/toolset-surfaces-read-the-resolved-toolset.spec.ts`
+   (moved out of `views/create` when the expert editor joined it — see 8).
 
-8. **The expert editor still shows a static toolset.** It passes
-   `gatedCapabilities` and `enumerateOnly` but performs no resolved read
-   (`views/experts/expert-editor.component.ts`), so an author sees the static
-   catalogue with grant greying rather than "what an agent using this expert
-   would bind". Defensible, and not the same defect as job create was — an expert
-   is a config fragment rather than a run, and `readsResolvedToolset` stays false
-   so no could-not-be-read banner appears. But the row has an `expert_type` and
-   the preview endpoint now takes one, so the answer is available for the asking.
-   Cheapest remaining item in this register.
+8. ~~**The expert editor still shows a static toolset.**~~ **FIXED 2026-08-04
+   (`68ac7bde`).** It now reads the preview endpoint and passes `resolved` +
+   `readsResolvedToolset`, so all four toolset surfaces answer from one
+   server-side computation. Two things from doing it are worth keeping:
+
+   It asks **base ⊕ fragment, never `expert_id`**. On create there is no id, so
+   the answer would be the bare base while the saved expert gets something else.
+   On edit, layering the fragment over the stored row cannot express a key the
+   author **deleted** — `tools.shell` removed in the editor still resolves from
+   the row underneath, and the pane would keep showing a category the expert is
+   about to lose. `expertToolPreviewRequest` is an exported pure function so that
+   decision is directly testable rather than buried in a subscribe.
+
+   And a limit of source-scan guards, found by shipping into it: the first
+   version bound `[resolvedToolset]` on `app-tools-group`, whose input is named
+   `resolved` (`AgentSettingsComponent` takes the former and forwards the
+   latter). `tsc --noEmit` passed, all 1661 cockpit tests passed, and **only
+   `ng build` rejected it.** A scan cannot tell a binding from a typo, and
+   neither can the type checker: an Angular template binding is only resolved by
+   the template compiler. The spec now records that and pins the per-host input
+   names by hand. Generalises past this register — any cockpit change whose
+   evidence is "tests pass" has not tested its templates.
 
    By contrast the New Session form is now largely honest, which is worth
    recording because the two are usually lumped together:

@@ -588,7 +588,7 @@ the cockpit stops knowing names.
 | `toolGroupDefaultsConfig` | `agent-settings.types.ts:110-119` | **delete** — it exists solely to re-expand bools into name lists so they can be `deepMergeConfig`d as lists |
 | `defaultsTools` input | `tools-group.component.ts:269`, forwarded `agent-settings.component.ts:93` | **delete** — plus the `defaults_tools` API field at `orchestrator/main.py:27549`, `:27569`, `:27691`, `:27701` and the model type at `api.model.ts:119` |
 | `SESSION_TOOL_GROUP_BASE_ENABLED` | `agent-settings.types.ts:94-99` | ~~**keep**~~ → **deleted 2026-08-03**, see correction below |
-| `SESSION_TOOL_CATEGORIES` / `JOB_TOOL_CATEGORIES` / `LIVE_TOOL_CATEGORIES` | `agent-settings.types.ts:24-52` | **keep** the first two (presentation only); `LIVE_TOOL_CATEGORIES` **deleted 2026-08-03**, see below. Since 2026-08-04 both surviving lists are the READ-FAILED fallback only — both creation forms now render the server's answer when they have one, so a stale entry costs a label on a degraded path and nothing more |
+| `SESSION_TOOL_CATEGORIES` / `JOB_TOOL_CATEGORIES` / `LIVE_TOOL_CATEGORIES` | `agent-settings.types.ts:24-52` | **keep** the first two (presentation only); `LIVE_TOOL_CATEGORIES` **deleted 2026-08-03**, see below. Since 2026-08-04 both surviving lists are the READ-FAILED fallback only — all four toolset surfaces (live pane, both creation forms, expert editor) render the server's answer when they have one, so a stale entry costs a label on a degraded path and nothing more |
 | `CAT_TO_GRANT` | `tools-group.component.ts:274-278` | **keep** — category → capability-grant key, orthogonal to membership |
 
 > **Corrected 2026-08-03, at implementation.** Two rows in the table above were

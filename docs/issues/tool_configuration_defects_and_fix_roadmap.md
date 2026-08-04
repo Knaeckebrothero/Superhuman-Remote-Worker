@@ -242,12 +242,13 @@ Job create was the weakest surface: no server-computed view at all.
 > "prediction"` with a reason, rendered as a banner. What is gone is the part that
 > was fixable: the forecast is now server-computed and grant-aware on both forms.
 >
-> **Still static: the expert editor.** It passes `gatedCapabilities` and
-> `enumerateOnly` but performs no resolved read, so it shows the static
-> catalogue with grant greying. Defensible — an expert is a fragment, not a run,
-> and `readsResolvedToolset` stays false so it flies no could-not-be-read banner
-> — but it is the one authoring surface where the server's answer is still absent.
-> Cheapest remaining item in this register.
+> **The expert editor followed on 2026-08-04 (`68ac7bde`)**, which makes it
+> **four for four**: the live pane measures, and both creation forms plus the
+> expert editor forecast from the same server-side resolution. The editor was the
+> one that mattered most — an expert's toolset is what every job and session
+> built from it inherits — and it asks for `base ⊕ fragment` rather than by
+> `expert_id`, because an id layer underneath cannot express a key the author just
+> deleted. Detail in [[tool_configuration_deferred_findings]] §7.8.
 
 **Carried out of the run, not lost with it:** about forty findings triaged as
 *minor, deferred*, ten rulings settled at real cost, and three tickets that were
