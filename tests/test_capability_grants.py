@@ -4,11 +4,16 @@ matrix (User-Defined Experts, Slice 2). No DB/framework — hermetic.
 Spec: docs/done/global_expert_management.md (decisions 8, 9, 19, 21-23).
 """
 
+import copy
+
+import pytest
+
 from src.core.capability_grants import (
     CATALOG,
     evaluate,
     meet,
     resolve_grants,
+    strip_to_grants,
 )
 
 DEFAULTS = {k: v["default"] for k, v in CATALOG.items()}
@@ -295,3 +300,296 @@ def test_specialists_explicitly_opt_in_to_delegation():
         fragment = cap["merged_fragment"]
         assert fragment["delegation"]["enabled"] is True
         assert fragment["tools"]["delegation"] == ["spawn_subagent"]
+
+
+# --- strip_to_grants (2026-08-04 plan, expert-write-gate-holes, task 3) ------
+#
+# `duplicate_expert` strips a source config down to what the copier's grants
+# allow instead of refusing outright (the other four expert-write routes are
+# untouched and still refuse via `evaluate` alone). This is the pure map;
+# the route-level safety re-check (`evaluate` re-run on the stripped result,
+# 422 on any residual violation) lives in
+# orchestrator/main.py::_strip_save_grants and is exercised in
+# tests/test_capability_grants_api.py, not here.
+
+
+def _most_permissive(spec: dict) -> object:
+    """The value for this CATALOG spec that never trips a violation on its
+    own — bool True (granted), the least-restrictive enum step, or `None`
+    (list: allow-all). Type-derived, not default-derived: `browser` and
+    `datasource_tools` default True already, so a helper that assumed every
+    grant defaults False would get those two backwards."""
+    if spec["type"] == "bool":
+        return True
+    if spec["type"] == "enum":
+        return spec["order"][-1]
+    if spec["type"] == "list":
+        return None
+    raise AssertionError(f"unknown catalog type {spec['type']!r}")
+
+
+def _most_restrictive(spec: dict) -> object:
+    """The complement of `_most_permissive`: the value most likely to trip a
+    violation — bool False (denied), the most-restrictive enum step, or `[]`
+    (list: allow-nothing)."""
+    if spec["type"] == "bool":
+        return False
+    if spec["type"] == "enum":
+        return spec["order"][0]
+    if spec["type"] == "list":
+        return []
+    raise AssertionError(f"unknown catalog type {spec['type']!r}")
+
+
+def _deny_only(key: str) -> dict:
+    """Every CATALOG key at its most permissive value except `key`, which is
+    pinned to its most restrictive. Isolates one rule: a fragment that could
+    trip several rules at once only shows the one under test, because every
+    other gate's condition is `not <permissive-grant> and ...` (bool) or
+    `value_index > ceiling_index` with the ceiling at its top step (enum) —
+    both structurally False regardless of the fragment."""
+    grants = {k: _most_permissive(spec) for k, spec in CATALOG.items()}
+    grants[key] = _most_restrictive(CATALOG[key])
+    return grants
+
+
+# One fragment per rule. Each also carries an untouched "git" tool entry (or
+# equivalent) so a too-broad strip — the failure mode `strip_to_grants` exists
+# to avoid, since deleting the wrong thing is silent until this test catches
+# it — has something to be caught clobbering.
+_RULE_FRAGMENTS: dict[str, dict] = {
+    "shell_tools": {"tools": {"shell": ["run_command"], "git": ["git_status"]}},
+    "delegation": {
+        "tools": {"delegation": ["spawn_subagent"], "git": ["git_status"]},
+        "delegation": {"enabled": True, "max_depth": 3, "default_timeout": 600},
+    },
+    "datasource_tools": {
+        "tools": {
+            "sql": ["run_query"],
+            "mongodb": ["run_query"],
+            "graph": ["run_query"],
+            "webdav": ["list_files"],
+            "email": ["send_email"],
+            "mcp": ["call_tool"],
+            "repo": ["clone_repo"],
+            "git": ["git_status"],
+        }
+    },
+    "browser": {
+        "tools": {"browser_direct": ["browser_navigate"], "git": ["git_status"]}
+    },
+    "catalog_authoring": {
+        "tools": {"catalog_authoring": ["create_expert"], "git": ["git_status"]}
+    },
+    "vm_workspace": {"workspace": {"backend": "vm", "structure": ["notes/"]}},
+    "model_selection": {"llm": {"model": "gpt-5.6-sol"}},
+    "autonomy_ceiling": {"autonomy": "full"},
+    "permission_mode": {"interactive": {"permission_mode": "autonomous"}},
+}
+
+
+@pytest.mark.parametrize("grant_key", sorted(_RULE_FRAGMENTS))
+def test_each_rule_strips_and_reports_exactly_its_own_grant(grant_key):
+    """Test group 1: each of the nine rules, in isolation, comes back clean
+    with that grant (and only that grant) reported."""
+    fragment = _RULE_FRAGMENTS[grant_key]
+    grants = _deny_only(grant_key)
+
+    stripped, dropped = strip_to_grants(fragment, grants)
+
+    assert dropped == [grant_key]
+    assert evaluate(stripped, grants) == []
+
+
+def test_shell_strip_leaves_other_tool_categories_alone():
+    stripped, _ = strip_to_grants(
+        _RULE_FRAGMENTS["shell_tools"], _deny_only("shell_tools")
+    )
+    assert "shell" not in stripped["tools"]
+    assert stripped["tools"]["git"] == ["git_status"]
+
+
+def test_delegation_strip_keeps_settings_that_were_never_the_violation():
+    """The comment in `evaluate` is explicit that delegation gates on
+    `.enabled is True` or a non-empty `tools.delegation`, not on the settings
+    dict merely existing — so the strip must take `tools.delegation` and only
+    the `.enabled` flag, never the whole `delegation` dict (that would also
+    drop `max_depth`/`default_timeout`, which were never the problem)."""
+    stripped, dropped = strip_to_grants(
+        _RULE_FRAGMENTS["delegation"], _deny_only("delegation")
+    )
+    assert dropped == ["delegation"]
+    assert "delegation" not in stripped["tools"]
+    assert stripped["tools"]["git"] == ["git_status"]
+    assert "enabled" not in stripped["delegation"]
+    assert stripped["delegation"]["max_depth"] == 3
+    assert stripped["delegation"]["default_timeout"] == 600
+
+
+def test_datasource_strip_removes_every_connector_category():
+    stripped, dropped = strip_to_grants(
+        _RULE_FRAGMENTS["datasource_tools"], _deny_only("datasource_tools")
+    )
+    assert dropped == ["datasource_tools"]
+    for category in ("sql", "mongodb", "graph", "webdav", "email", "mcp", "repo"):
+        assert category not in stripped["tools"]
+    assert stripped["tools"]["git"] == ["git_status"]
+
+
+def test_model_selection_strip_drops_only_the_offending_pin():
+    """'the offending model pins' (plural, task-3 brief) — a pin already
+    inside the permitted set must survive; only the ones outside it go."""
+    fragment = {
+        "llm": {
+            "model": "allowed-model",
+            "strategic": {"model": "blocked-model"},
+            "tactical": {"model": "allowed-model"},
+        }
+    }
+    grants = {**_deny_only("model_selection"), "model_selection": ["allowed-model"]}
+
+    stripped, dropped = strip_to_grants(fragment, grants)
+
+    assert dropped == ["model_selection"]
+    assert stripped["llm"]["model"] == "allowed-model"
+    assert stripped["llm"]["tactical"]["model"] == "allowed-model"
+    assert "model" not in stripped["llm"]["strategic"]
+
+
+def test_strip_does_not_mutate_the_input_fragment():
+    fragment = _RULE_FRAGMENTS["shell_tools"]
+    before = copy.deepcopy(fragment)
+
+    strip_to_grants(fragment, _deny_only("shell_tools"))
+
+    assert fragment == before
+
+
+def test_strip_does_not_delete_an_emptied_parent_dict():
+    """`tools` becomes `{}`, not absent, once its only key is gone — the brief
+    is explicit that removing an emptied parent could change meaning."""
+    fragment = {"tools": {"shell": ["run_command"]}}
+
+    stripped, dropped = strip_to_grants(fragment, _deny_only("shell_tools"))
+
+    assert dropped == ["shell_tools"]
+    assert stripped["tools"] == {}
+
+
+def test_a_user_with_every_grant_gets_an_unmodified_copy():
+    """Test group 5: nothing is dropped, and the config is unchanged, for a
+    copier whose grants already cover a fragment that would otherwise trip
+    every one of the nine rules at once. If stripping fired regardless of
+    grants held, this would catch it."""
+    grants = {k: _most_permissive(spec) for k, spec in CATALOG.items()}
+    fragment = {
+        "tools": {
+            "shell": ["run_command"],
+            "delegation": ["spawn_subagent"],
+            "sql": ["run_query"],
+            "browser_direct": ["browser_navigate"],
+            "catalog_authoring": ["create_expert"],
+        },
+        "delegation": {"enabled": True},
+        "workspace": {"backend": "vm"},
+        "autonomy": "full",
+        "interactive": {"permission_mode": "autonomous"},
+    }
+    before = copy.deepcopy(fragment)
+
+    stripped, dropped = strip_to_grants(fragment, grants)
+
+    assert dropped == []
+    assert stripped == before
+    assert fragment == before  # still not mutated
+
+
+def test_defaults_grant_browser_and_datasource_but_deny_shell_and_delegation():
+    """Sanity check against the REAL catalog defaults (not the permissive-
+    except-one construction above): browser/datasource_tools default True
+    (granted, so untouched), shell_tools/delegation default False (denied, so
+    stripped). A completeness check that assumed every grant defaults False
+    would get browser/datasource_tools backwards."""
+    fragment = {
+        "tools": {
+            "shell": ["run_command"],
+            "delegation": ["spawn_subagent"],
+            "browser_direct": ["browser_navigate"],
+            "sql": ["run_query"],
+        },
+        "delegation": {"enabled": True},
+    }
+
+    stripped, dropped = strip_to_grants(fragment, DEFAULTS)
+
+    assert sorted(dropped) == ["delegation", "shell_tools"]
+    assert stripped["tools"]["browser_direct"] == ["browser_navigate"]
+    assert stripped["tools"]["sql"] == ["run_query"]
+
+
+def test_strip_map_handles_every_grant_the_pdp_can_flag():
+    """Test group 2: completeness, derived from the PDP — not a hand-written
+    list. Iterates CATALOG (the same source `evaluate` reads), asking for
+    each key in turn "can `evaluate` ever flag this?" by denying only that
+    key against one fragment built to trip every rule `evaluate` currently
+    has. Any key it answers yes for must come back in `strip_to_grants`'
+    `dropped`, and the result must actually be clean — not just claimed to be.
+
+    This is the same shape of hole
+    tests/test_tool_report.py::TestGrantMapMatchesThePDP had (a grant the PDP
+    enforces silently missing from an explanatory map) and was fixed the same
+    way there: derive the "does the PDP care about this key" answer from the
+    PDP itself, and check for membership, never assert equality against a
+    literal enumeration of today's nine rules. A grant added to CATALOG later
+    with a matching new `evaluate` rule is picked up automatically, with no
+    edit to this test — a hand-listed ``{"shell_tools", "delegation", ...}``
+    could not do that.
+
+    Three of the twelve CATALOG keys (`personal_default_experts`,
+    `public_datasources`, `email_autonomous_send`) are gated elsewhere, not by
+    this fragment PDP, so `evaluate` never flags them — correctly excluded via
+    the `continue` below, not via a hand-picked skip list.
+    """
+    kitchen_sink = {
+        "tools": {
+            "shell": ["run_command"],
+            "delegation": ["spawn_subagent"],
+            "sql": ["run_query"],
+            "mongodb": ["run_query"],
+            "graph": ["run_query"],
+            "webdav": ["list_files"],
+            "email": ["send_email"],
+            "mcp": ["call_tool"],
+            "repo": ["clone_repo"],
+            "browser_direct": ["browser_navigate"],
+            "catalog_authoring": ["create_expert"],
+        },
+        "delegation": {"enabled": True},
+        "workspace": {"backend": "vm"},
+        "llm": {"model": "some-model"},
+        "autonomy": "full",
+        "interactive": {"permission_mode": "autonomous"},
+    }
+    checked = 0
+    for key in CATALOG:
+        grants = _deny_only(key)
+        flagged = {v.split(":", 1)[0] for v in evaluate(kitchen_sink, grants)}
+        if key not in flagged:
+            continue  # this CATALOG key is not enforced by evaluate() at all
+        checked += 1
+        stripped, dropped = strip_to_grants(kitchen_sink, grants)
+        assert key in dropped, (
+            f"evaluate() can flag {key!r} but strip_to_grants does not "
+            "handle it — a duplicate would 422 forever with no strip "
+            "possible for this grant"
+        )
+        assert evaluate(stripped, grants) == [], (
+            f"{key!r} was reported dropped but the stripped fragment still violates it"
+        )
+    # Vacuity guard on the probe itself, not on the completeness mechanism
+    # above: every evaluate()-enforced grant known today is 9 of the 12
+    # CATALOG keys, so a `kitchen_sink` that stopped tripping most of them
+    # (e.g. a typo breaking every gate) would still leave this loop silently
+    # doing nothing. This only rejects regressions in the probe; it never
+    # fails because a NEW rule was added.
+    assert checked >= 9
