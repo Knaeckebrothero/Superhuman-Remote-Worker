@@ -20,6 +20,7 @@ import {
     ExpertDefaultsResponse,
     ExpertCreateRequest,
     ExpertDetail,
+    ExpertDuplicateResult,
     ExpertUpdateRequest,
     Skill,
     SkillCreateRequest,
@@ -651,10 +652,17 @@ export class ApiService {
   }
 
   /**
-   * Fork any visible expert (bundled or DB) into an owned copy.
+   * Fork any visible expert (bundled or DB) into an owned copy. May come
+   * back with `dropped` set: grant keys the source config needed that the
+   * caller doesn't hold, stripped rather than refusing the fork. Callers
+   * MUST surface `dropped` when non-empty — a silent strip is the exact
+   * "silent capability downgrade" decision 9 exists to prevent.
    */
-  duplicateExpert(id: string): Observable<ExpertDetail> {
-    return this.http.post<ExpertDetail>(`${this.baseUrl}/experts/${id}/duplicate`, {});
+  duplicateExpert(id: string): Observable<ExpertDuplicateResult> {
+    return this.http.post<ExpertDuplicateResult>(
+      `${this.baseUrl}/experts/${id}/duplicate`,
+      {},
+    );
   }
 
   /**
