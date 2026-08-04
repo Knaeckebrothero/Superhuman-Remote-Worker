@@ -1295,7 +1295,25 @@ class TestExpertWriteBoundary:
         )
         # The save-time PDP is stubbed so these tests see the SHAPE gate alone;
         # `test_the_pdp_reads_the_canonical_fragment` asserts what it is handed.
+        # `duplicate_expert` no longer calls `_enforce_expert_save` (task 3,
+        # 2026-08-04 plan): it runs `_enforce_expert_save_prelude` (kill switch
+        # + raw-request scan) and then `_strip_save_grants` (strip-and-report)
+        # instead, so both are stubbed here too. Without this, a shape-valid
+        # `duplicate` test added to this fixture would skip the now-dead
+        # `_enforce_expert_save` stub, fall through to the REAL prelude/grants
+        # resolution, and hit `AttributeError` on this fixture's bare
+        # `SimpleNamespace` db (no `get_system_setting`/`list_grants_for_scopes`)
+        # instead of seeing the shape gate in isolation like every other route
+        # here does. `_strip_save_grants`'s stub echoes the config back
+        # unchanged with nothing dropped — the pass-through analog of
+        # `_enforce_expert_save`'s no-op for the other four routes.
         monkeypatch.setattr(main, "_enforce_expert_save", AsyncMock())
+        monkeypatch.setattr(main, "_enforce_expert_save_prelude", AsyncMock())
+        monkeypatch.setattr(
+            main,
+            "_strip_save_grants",
+            AsyncMock(side_effect=lambda config, **_kwargs: (config, [])),
+        )
         monkeypatch.setattr(
             main, "user_visible_project_ids", AsyncMock(return_value=[])
         )
@@ -1390,6 +1408,38 @@ class TestExpertWriteBoundary:
 
         assert exc.value.status_code == 400
         db.create_expert.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_duplicate_of_a_shape_valid_config_reaches_create(self, expert_env):
+        """Guards the `expert_env` fixture itself (fix round 1, task 3): the
+        smuggle test above never reaches the save-time gate at all (it 400s
+        at shape validation, before either the old or new gate call), so it
+        cannot prove the fixture's `_enforce_expert_save_prelude`/
+        `_strip_save_grants` stubs are wired correctly. A shape-VALID
+        duplicate does reach them — without the stubs added in this fix, this
+        hits the real prelude (`_user_experts_enabled` reads
+        `postgres_db.get_system_setting`, which this fixture's bare
+        `SimpleNamespace` db does not have) and fails with `AttributeError`
+        instead of returning the forked row.
+        """
+        main, db = expert_env
+        db.get_expert_visible_by_id = AsyncMock(
+            return_value={
+                "id": "e2",
+                "owner_id": str(uuid.uuid4()),
+                "expert_type": "session",
+                "name": "shared",
+                "display_name": "Shared",
+                "icon": "smart_toy",
+                "color": "#6B7280",
+                "config": {"llm": {"model": "gemma-4-moe"}},  # nothing grant-gated
+            }
+        )
+
+        result = await main.duplicate_expert(MagicMock(), str(uuid.uuid4()))
+
+        assert result == {"id": "e1", "dropped": []}
+        db.create_expert.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_an_unresolvable_shape_is_refused_at_write_not_at_read(

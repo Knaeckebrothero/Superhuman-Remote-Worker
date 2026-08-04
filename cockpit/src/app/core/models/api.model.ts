@@ -136,6 +136,27 @@ export interface ExpertDetail extends Expert {
 }
 
 /**
+ * Response of POST /api/experts/{id}/duplicate. The forked row (same shape
+ * as ExpertDetail) plus `dropped` — not folded into ExpertDetail itself
+ * because no other expert endpoint ever sets this field.
+ *
+ * 2026-08-04 decision: a source config may need a capability grant (e.g.
+ * `shell_tools`) the copier does not hold. Duplicate strips what's ungranted
+ * rather than refusing the fork (refusing blocked "start from scholar" for
+ * every default-grants user), and reports what it removed here so the
+ * strip is never silent — see docs/done/global_expert_management.md decision 9.
+ */
+export interface ExpertDuplicateResult extends ExpertDetail {
+  /**
+   * Capability grant keys stripped from the copy because the copier doesn't
+   * hold them (e.g. `"shell_tools"`, `"delegation"`) — the same names shown
+   * in the Admin UI's grants panel. Empty or absent when nothing was
+   * stripped (the copier already held everything the source needed).
+   */
+  dropped?: string[];
+}
+
+/**
  * Create a DB-backed expert (POST /api/experts). The save-time hard-deny scan
  * runs server-side on ``config``; per-user grants are a later slice.
  */

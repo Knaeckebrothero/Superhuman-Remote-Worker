@@ -311,7 +311,7 @@ def strip_to_grants(fragment: dict, grants: dict) -> tuple[dict, list[str]]:
                     del block["model"]
         dropped.append("model_selection")
     if "autonomy_ceiling" in flagged:
-        out.pop("autonomy", None)
+        _drop_key(out, "autonomy")
         dropped.append("autonomy_ceiling")
     if "permission_mode" in flagged:
         _drop_key(out.get("interactive"), "permission_mode")
