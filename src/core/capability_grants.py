@@ -10,10 +10,23 @@ value. Deny-by-default for security keys; existing users grandfathered by the
 
 from __future__ import annotations
 
+import copy
 from typing import Any
 
 _AUTONOMY_ORDER = ["dependent", "guided", "partial", "review", "full"]
 _PERMISSION_ORDER = ["supervised", "auto_accept", "autonomous"]
+#: Every tool category the `datasource_tools` grant gates, shared by `evaluate`
+#: (the check) and `strip_to_grants` (the fix) so the two enumerations of the
+#: same seven categories cannot quietly drift apart from each other.
+_DATASOURCE_TOOL_CATEGORIES = (
+    "sql",
+    "mongodb",
+    "graph",
+    "webdav",
+    "email",
+    "mcp",
+    "repo",
+)
 
 CATALOG: dict[str, dict[str, Any]] = {
     # Lets a user fork/set a personal worker/session default.  Clearing an
@@ -177,8 +190,7 @@ def evaluate(fragment: dict, grants: dict, *, is_admin: bool = False) -> list[st
     ):
         v.append("delegation: delegation requires the delegation grant")
     if not grants.get("datasource_tools", True) and any(
-        _truthy(tools.get(k))
-        for k in ("sql", "mongodb", "graph", "webdav", "email", "mcp", "repo")
+        _truthy(tools.get(k)) for k in _DATASOURCE_TOOL_CATEGORIES
     ):
         v.append("datasource_tools: connector tools are not permitted")
     if not grants.get("browser", True) and _truthy(tools.get("browser_direct")):
@@ -214,3 +226,95 @@ def evaluate(fragment: dict, grants: dict, *, is_admin: bool = False) -> list[st
             f"permission_mode: '{inter.get('permission_mode')}' exceeds the ceiling"
         )
     return v
+
+
+def _drop_key(container: Any, key: str) -> None:
+    """Delete `key` from `container` if it is a dict and holds it. No-op
+    otherwise (absent parent, or a parent that isn't a dict) — the caller
+    never has to guard the shape first."""
+    if isinstance(container, dict):
+        container.pop(key, None)
+
+
+def strip_to_grants(fragment: dict, grants: dict) -> tuple[dict, list[str]]:
+    """Return (fragment minus what `grants` forbids, the grant keys dropped).
+
+    For `duplicate_expert` only (2026-08-04 decision,
+    docs/superpowers/plans/2026-08-04-expert-write-gate-holes.md, task 3): a
+    source config exceeding the copier's grants is stripped to what they can
+    have rather than refused outright, because the route exists to fork a
+    config the copier likely intends to edit anyway ("start from scholar") —
+    refusing blocked step one of that exact workflow for most default-grants
+    users. The other four expert-write routes are untouched and still refuse
+    via `evaluate` + a 422.
+
+    One-for-one with `evaluate`'s nine rules, and kept beside it (rather than
+    a second, route-side implementation) so the two cannot drift — `evaluate`
+    is called here, on the ORIGINAL fragment, to find what to strip.
+
+    Every rule deletes the offending key outright, never zeroes or replaces
+    it: absent means "inherit the base", and the base is the conservative
+    floor. The one exception written into the shape rather than the value:
+    `delegation` removes `tools.delegation` and only the `.enabled` flag
+    inside `delegation`, never the whole `delegation` settings dict —
+    `evaluate` gates on `.enabled is True` or a non-empty `tools.delegation`,
+    not on the settings dict merely existing, so deleting the dict would also
+    drop `max_depth`/`default_timeout`, which were never the violation.
+
+    Never deletes an emptied PARENT dict (`tools: {}` is left as `{}`, not
+    removed, if that is all that remains of it) and never mutates `fragment`
+    in place — `duplicate_expert` reuses the source bundle's dict.
+
+    THIS IS ADVISORY, NOT AUTHORITATIVE. The caller MUST re-run `evaluate` on
+    the result and refuse (422) if any violation survives — see
+    `orchestrator.main._strip_save_grants`. That re-check is the safety
+    property: an entry here that is missing or wrong can only ever produce an
+    unnecessary drop or a false refusal, never a permitted escape.
+    """
+    out = copy.deepcopy(fragment)
+    flagged = {v.split(":", 1)[0] for v in evaluate(fragment, grants)}
+    dropped: list[str] = []
+
+    if "shell_tools" in flagged:
+        _drop_key(out.get("tools"), "shell")
+        dropped.append("shell_tools")
+    if "delegation" in flagged:
+        _drop_key(out.get("tools"), "delegation")
+        _drop_key(out.get("delegation"), "enabled")
+        dropped.append("delegation")
+    if "datasource_tools" in flagged:
+        for category in _DATASOURCE_TOOL_CATEGORIES:
+            _drop_key(out.get("tools"), category)
+        dropped.append("datasource_tools")
+    if "browser" in flagged:
+        _drop_key(out.get("tools"), "browser_direct")
+        dropped.append("browser")
+    if "catalog_authoring" in flagged:
+        _drop_key(out.get("tools"), "catalog_authoring")
+        dropped.append("catalog_authoring")
+    if "vm_workspace" in flagged:
+        _drop_key(out.get("workspace"), "backend")
+        dropped.append("vm_workspace")
+    if "model_selection" in flagged:
+        allowed = grants.get("model_selection")
+        llm = out.get("llm")
+        if isinstance(llm, dict) and allowed is not None:
+            if isinstance(llm.get("model"), str) and llm["model"] not in allowed:
+                del llm["model"]
+            for tier in ("strategic", "tactical"):
+                block = llm.get(tier)
+                if (
+                    isinstance(block, dict)
+                    and isinstance(block.get("model"), str)
+                    and block["model"] not in allowed
+                ):
+                    del block["model"]
+        dropped.append("model_selection")
+    if "autonomy_ceiling" in flagged:
+        out.pop("autonomy", None)
+        dropped.append("autonomy_ceiling")
+    if "permission_mode" in flagged:
+        _drop_key(out.get("interactive"), "permission_mode")
+        dropped.append("permission_mode")
+
+    return out, dropped

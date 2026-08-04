@@ -5082,22 +5082,84 @@ async def _scan_raw_request_fragment(request: Request) -> None:
         )
 
 
+async def _resolve_user_save_grants(user: dict[str, Any]) -> dict[str, Any] | None:
+    """Resolve save-time grants for `user`, or ``None`` on an admin bypass.
+
+    Split out of the body of ``_enforce_save_grants`` so its refuse-outright
+    policy and ``_strip_save_grants``'s strip-and-report policy (the
+    ``duplicate_expert`` route only, decision 2026-08-04) resolve grants via
+    one path and cannot drift into two admin checks."""
+    if user.get("is_admin"):
+        return None
+    from services.grants_service import resolve_grants_for
+
+    return await resolve_grants_for(
+        postgres_db, user_id=str(user["id"]), project_ids=await _grant_project_ids(user)
+    )
+
+
 async def _enforce_save_grants(config: dict[str, Any], *, user: dict[str, Any]) -> None:
     """Save-time PEP (decision 9): the author's grants must cover the raw fragment.
     422 naming offending keys. Admins bypass."""
-    if user.get("is_admin"):
+    grants = await _resolve_user_save_grants(user)
+    if grants is None:
         return
     from src.core.capability_grants import evaluate
-    from services.grants_service import resolve_grants_for
 
-    grants = await resolve_grants_for(
-        postgres_db, user_id=str(user["id"]), project_ids=await _grant_project_ids(user)
-    )
     violations = evaluate(config, grants)
     if violations:
         raise HTTPException(
             status_code=422, detail=_grant_violations_detail(violations)
         )
+
+
+async def _strip_save_grants(
+    config: dict[str, Any], *, user: dict[str, Any]
+) -> tuple[dict[str, Any], list[str]]:
+    """``duplicate_expert``'s save-time grants policy (2026-08-04 decision,
+    docs/superpowers/plans/2026-08-04-expert-write-gate-holes.md, task 3):
+    strip what the copier's grants forbid from the source config instead of
+    refusing the fork outright, and report the grant keys that were dropped.
+    ``_enforce_save_grants`` above is unchanged and still refuses for the
+    other four expert-write routes — measured against the real PDP with
+    default grants, refusing here blocked 7 of the 11 shipped experts,
+    including the one the route's own docstring names ("start from scholar").
+
+    Admins bypass exactly as ``_enforce_save_grants`` does: unmodified config,
+    nothing dropped.
+
+    THE SAFETY PROPERTY, not optional: ``evaluate`` is re-run on the STRIPPED
+    result, and any violation that survives is refused with the same 422
+    ``_enforce_save_grants`` raises. This is what makes an incomplete or wrong
+    entry in ``capability_grants.strip_to_grants`` merely a false refusal,
+    never a permitted escape.
+    """
+    grants = await _resolve_user_save_grants(user)
+    if grants is None:
+        return config, []
+    from src.core.capability_grants import evaluate, strip_to_grants
+
+    stripped, dropped = strip_to_grants(config, grants)
+    residual = evaluate(stripped, grants)
+    if residual:
+        raise HTTPException(status_code=422, detail=_grant_violations_detail(residual))
+    return stripped, dropped
+
+
+async def _enforce_expert_save_prelude(request: Request) -> None:
+    """Kill-switch (403) + raw dup/non-ASCII key scan (422): the two save-time
+    checks shared by every expert-write route regardless of how its grants
+    half is enforced. ``_enforce_expert_save`` below runs this then
+    ``_enforce_save_grants``; ``duplicate_expert`` runs this then
+    ``_strip_save_grants`` instead, so the kill-switch and the scan cannot be
+    forgotten while that one route's grants policy differs from the other
+    four."""
+    if not await _user_experts_enabled():
+        raise HTTPException(
+            status_code=403,
+            detail="User-defined experts are disabled by the administrator",
+        )
+    await _scan_raw_request_fragment(request)
 
 
 async def _enforce_expert_save(
@@ -5106,12 +5168,7 @@ async def _enforce_expert_save(
     """Combined save-time gate: kill-switch (403) + raw dup/non-ASCII key scan
     (422) + capability-grant enforcement (422). Admins bypass grants, not the
     kill-switch."""
-    if not await _user_experts_enabled():
-        raise HTTPException(
-            status_code=403,
-            detail="User-defined experts are disabled by the administrator",
-        )
-    await _scan_raw_request_fragment(request)
+    await _enforce_expert_save_prelude(request)
     await _enforce_save_grants(config, user=user)
 
 
@@ -29312,16 +29369,21 @@ async def duplicate_expert(request: Request, expert_id: str) -> dict[str, Any]:
     # dict, so assigning into `src` cannot corrupt a cache or the source row.
     src["config"] = _validate_expert_fragment(src.get("config") or {})
     # Fifth of five expert-write routes. The other four call
-    # _enforce_expert_save right after validating theirs — this call is NOT
-    # optional here just because the row already existed: the kill switch is
-    # the point. Without it, a user can mint an owned DB expert by copying any
-    # VISIBLE expert (not necessarily their own) while the administrator has
-    # user_experts disabled. Full gate, not kill-switch-only: a config the
-    # copier's own grants don't cover is refused now (422 naming the grant)
-    # rather than accepted here and denied later at job dispatch for a
-    # fragment they never authored.
-    await _enforce_expert_save(request, src["config"], user=user)
-    return await _create_forked_expert(src, str(user["id"]), suffix="copy")
+    # _enforce_expert_save right after validating theirs — the kill-switch
+    # half of that is NOT optional here just because the row already existed:
+    # without it, a user can mint an owned DB expert by copying any VISIBLE
+    # expert (not necessarily their own) while the administrator has
+    # user_experts disabled. Grants are a different story on this one route
+    # (2026-08-04 decision): the source config may be another principal's and
+    # commonly needs a grant the copier does not hold and should not have to
+    # ask for — measured, that refused 7 of the 11 shipped experts, including
+    # `scholar`, this route's own advertised use ("start from scholar"). So
+    # this strips what the copier's grants forbid and reports it, instead of
+    # refusing outright the way the other four routes still do.
+    await _enforce_expert_save_prelude(request)
+    src["config"], dropped = await _strip_save_grants(src["config"], user=user)
+    forked = await _create_forked_expert(src, str(user["id"]), suffix="copy")
+    return {**forked, "dropped": dropped}
 
 
 @app.get("/api/experts/{expert_id}/export")
