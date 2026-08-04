@@ -713,7 +713,7 @@ class AuditStore:
                 off_n = len(params) + 1
                 lim_n = len(params) + 2
                 rows = await conn.fetch(
-                    f"SELECT id, job_id, timestamp, model, iteration, response, "
+                    f"SELECT id, job_id, timestamp, model, iteration, latency_ms, response, "
                     f"metrics->'token_usage' AS token_usage, "
                     f"metrics->'usage_metadata' AS usage_metadata, call_type, "
                     f"metadata->>'status' AS status, metadata->'error' AS error "
@@ -737,6 +737,8 @@ class AuditStore:
                 }
                 if r["iteration"] is not None:
                     doc["iteration"] = r["iteration"]
+                if r["latency_ms"] is not None:
+                    doc["latency_ms"] = r["latency_ms"]
                 if r["status"] is not None:
                     doc["status"] = r["status"]
                 if r["error"] is not None:
