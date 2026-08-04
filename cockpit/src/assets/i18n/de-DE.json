@@ -605,7 +605,8 @@
       "confirmDelete": "Bestätigen?",
       "promote": "Heraufstufen",
       "createProject": "Projekt erstellen",
-      "exportToCloud": "Cloud-Ordner öffnen",
+      "exportToCloud": "In die Cloud exportieren",
+      "openCloudFolder": "Cloud-Ordner öffnen",
       "exported": "Exportiert",
       "approveRequest": "Anfrage freigeben"
     },
@@ -628,8 +629,8 @@
       "deleteJob": "Auftrag löschen",
       "moreActions": "Weitere Aktionen",
       "promoteJob": "Zu Projekt heraufstufen",
-      "exportToCloud": "Ergebnisse dieses Auftrags in einen geteilten Cloud-Ordner kopieren und öffnen",
-      "alreadyExported": "Bereits exportiert. Cloud-Ordner löschen, um erneut zu exportieren.",
+      "exportToCloud": "Ergebnisse dieses Auftrags in einen geteilten Cloud-Ordner kopieren",
+      "openCloudFolder": "Cloud-Ordner dieses Auftrags in einem neuen Tab öffnen",
       "snapshotStats": "S3-Snapshot-Speicher",
       "snapshotAvailable": "Umgebungs-Snapshot verfügbar",
       "delegationWaiting": "Warte auf Abschluss der Delegations-Unteraufträge",
@@ -2369,7 +2370,9 @@
       "feedbackPlaceholder": "Feedback oder zusätzliche Anweisungen für den Agenten eingeben …",
       "resuming": "Wird fortgesetzt …",
       "continueWithFeedback": "Mit Feedback fortsetzen",
-      "openingCloudFolder": "Wird geöffnet …"
+      "exportingToCloud": "Wird exportiert …",
+      "exportToCloud": "In die Cloud exportieren",
+      "resyncCloudFolder": "Cloud-Ordner neu synchronisieren"
     },
     "messages": {
       "approved": "Job erfolgreich genehmigt.",
@@ -2936,7 +2939,8 @@
       "approved": "Job freigegeben",
       "vmUpgradeStarted": "VM-Upgrade gestartet",
       "replySent": "Antwort gesendet",
-      "exportedToCloud": "{{count}} Datei(en) in deine Cloud exportiert",
+      "exportedToCloud": "{{count}} Datei(en) nach {{folder}} exportiert",
+      "exportedNotShared": "{{count}} Datei(en) nach {{folder}} exportiert, aber der Ordner ist noch nicht für dich freigegeben — einmal in der Cloud anmelden, dann neu synchronisieren.",
       "diffAccepted": "{{applied}} Änderung(en) und {{deleted}} Löschung(en) in den Cloud-Ordner geschrieben.",
       "diffRejected": "Diff verworfen; keine Änderungen in der Cloud."
     },

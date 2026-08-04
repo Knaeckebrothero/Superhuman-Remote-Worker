@@ -9,6 +9,8 @@ import {
     draftKey,
     extractClipboardFiles,
     formatPermissionArgs,
+    HEADER_FOLD_HYSTERESIS_PX,
+    HEADER_LEFT_RESERVE_PX,
     isMicMode,
     isNearBottom,
     isStartupBannerVisible,
@@ -22,6 +24,7 @@ import {
     PersistentChatComponent,
     readingWidthToCss,
     saveDraft,
+    shouldFoldHeaderActions,
     shouldFoldToolRun,
     shouldPin,
     shouldSendOnEnter,
@@ -486,6 +489,55 @@ describe('pinTarget', () => {
         const clientHeight = 400;
         const top = pinTarget(scrollHeight, clientHeight);
         expect(isNearBottom(top, scrollHeight, clientHeight)).toBe(true);
+    });
+});
+
+/**
+ * Header fold. Pure for the same reason as the scroll pin: jsdom has no layout,
+ * so `clientWidth`/`offsetWidth` are all 0 there and the decision cannot be
+ * observed through the DOM. What this does NOT cover: that the ResizeObserver
+ * is wired to BOTH the header and the action row (observing only the header
+ * misses the IDE button appearing), and that the reserve is tuned to the real
+ * chrome. Those are browser checks — drag the canvas gutter.
+ */
+describe('shouldFoldHeaderActions', () => {
+    const R = HEADER_LEFT_RESERVE_PX;
+    const H = HEADER_FOLD_HYSTERESIS_PX;
+
+    it('keeps the row inline while the title still has its reserve', () => {
+        // 1200px header, 420px of buttons → 780 left for a 380 reserve.
+        expect(shouldFoldHeaderActions(1200, 420, false)).toBe(false);
+    });
+
+    it('folds once the actions would eat into the title reserve', () => {
+        // The reported bug: a 2560px desktop hands this header 700px because the
+        // canvas owns the rest. Pre-fix the row just ran off the pane edge.
+        expect(shouldFoldHeaderActions(700, 420, false)).toBe(true);
+    });
+
+    it('treats the reserve as exclusive — exactly filling it still fits', () => {
+        expect(shouldFoldHeaderActions(R + 420, 420, false)).toBe(false);
+        expect(shouldFoldHeaderActions(R + 420 - 1, 420, false)).toBe(true);
+    });
+
+    it('demands slack before unfolding, so a slow drag cannot flip-flop', () => {
+        const exactly = R + 420;
+        // Unfolding at the same width it folded at is the flicker: fits →
+        // unfold → the row reappears → overflows → fold → repeat.
+        expect(shouldFoldHeaderActions(exactly, 420, true)).toBe(true);
+        expect(shouldFoldHeaderActions(exactly + H, 420, true)).toBe(false);
+    });
+
+    it('scales with the action row, not with a device breakpoint', () => {
+        // A lite session (no Files/Git/IDE) keeps its buttons far longer than a
+        // workspace-backed one at the same pane width — which a media query,
+        // and the viewport check this replaced, could never express.
+        expect(shouldFoldHeaderActions(700, 160, false)).toBe(false);
+        expect(shouldFoldHeaderActions(700, 420, false)).toBe(true);
+    });
+
+    it('folds a pane too narrow for the reserve alone, whatever the row costs', () => {
+        expect(shouldFoldHeaderActions(300, 0, false)).toBe(true);
     });
 });
 

@@ -1,5 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { Job, JobStatus } from '../../core/models/api.model';
+import { JobSummary } from '../../core/models/audit.model';
+import { jobCloudAction } from './job-list.component';
 
 /**
  * Unit tests for JobListComponent utility functions.
@@ -192,6 +194,45 @@ describe('JobListComponent utilities', () => {
         'failed',
         'cancelled',
       ]);
+    });
+  });
+  describe('jobCloudAction', () => {
+    // Export and open are two clicks on purpose: the export outlives the ~5s
+    // of transient user activation, so auto-opening from its callback is
+    // popup-blocked. See docs/issues/job_cloud_export_open_blocked.md.
+    function job(overrides: Partial<JobSummary> = {}): JobSummary {
+      return {
+        id: 'j1',
+        status: 'completed',
+        created_at: new Date(0).toISOString(),
+        cloud_review_mode: 'open_folder',
+        ...overrides,
+      } as JobSummary;
+    }
+
+    it('offers export before anything has been exported', () => {
+      expect(jobCloudAction(job())).toBe('export');
+    });
+
+    it('offers open once exported and a URL is available', () => {
+      expect(
+        jobCloudAction(
+          job({ exported_at: '2026-08-04T08:19:36Z', exported_folder_url: 'https://c/f' }),
+        ),
+      ).toBe('open');
+    });
+
+    it('falls back to a plain badge when the URL is missing', () => {
+      // Cloud backend down at read time: exported, but nothing to link to.
+      expect(jobCloudAction(job({ exported_at: '2026-08-04T08:19:36Z' }))).toBe('exported');
+    });
+
+    it('offers nothing for Mode A (diff-review) jobs', () => {
+      expect(jobCloudAction(job({ cloud_review_mode: 'diff' }))).toBe('none');
+    });
+
+    it('offers nothing until the job completes', () => {
+      expect(jobCloudAction(job({ status: 'processing' }))).toBe('none');
     });
   });
 });

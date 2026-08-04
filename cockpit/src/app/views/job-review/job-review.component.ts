@@ -182,19 +182,33 @@ interface FrozenJobData {
             </div>
           }
 
-          <!-- Cloud folder preview (Mode B "open folder") -->
+          <!-- Cloud folder preview (Mode B "open folder"). Export and open are
+               two separate clicks: the export takes longer than the browser's
+               transient-activation window, so an auto-open after it would be
+               popup-blocked. -->
           @if (job()!.cloud_review_mode === 'open_folder') {
             <div class="section cloud-folder">
+              @if (job()!.exported_folder_url) {
+                <app-button
+                  variant="info"
+                  size="sm"
+                  (clicked)="openExportedFolder()"
+                >
+                  {{ 'jobReview.links.openCloudFolder' | transloco }}
+                </app-button>
+              }
               <app-button
-                variant="info"
+                [variant]="job()!.exported_at ? 'secondary' : 'info'"
                 size="sm"
                 [loading]="isExportingToCloud()"
-                (clicked)="openCloudFolder()"
+                (clicked)="exportToCloud()"
               >
                 @if (isExportingToCloud()) {
-                  {{ 'jobReview.actions.openingCloudFolder' | transloco }}
+                  {{ 'jobReview.actions.exportingToCloud' | transloco }}
+                } @else if (job()!.exported_at) {
+                  {{ 'jobReview.actions.resyncCloudFolder' | transloco }}
                 } @else {
-                  {{ 'jobReview.links.openCloudFolder' | transloco }}
+                  {{ 'jobReview.actions.exportToCloud' | transloco }}
                 }
               </app-button>
               <div class="cloud-folder-hint">
@@ -896,26 +910,27 @@ export class JobReviewComponent {
     });
   }
 
-  openCloudFolder(): void {
+  /**
+   * Copy the job's declared deliverables into its shared cloud folder. The
+   * endpoint is re-syncable, so this doubles as "re-sync" after a
+   * resume-with-feedback. Does not open the folder — that's
+   * {@link openExportedFolder}, a separate click, because the copy regularly
+   * outlives the ~5s of transient user activation a popup needs.
+   * exportJobToSharedFolder toasts success/error.
+   */
+  exportToCloud(): void {
     const jobId = this.currentJobId();
     if (!jobId) return;
 
     this.isExportingToCloud.set(true);
     this.resultMessage.set(null);
 
-    // Reuses the Mode B export endpoint, which copies the job's declared
-    // deliverables into a shared cloud folder and returns its browser URL. The
-    // endpoint is re-syncable, so re-clicking after a resume-with-feedback
-    // refreshes the same folder. exportJobToSharedFolder toasts success/error.
     this.api.exportJobToSharedFolder(jobId).subscribe((result) => {
       this.isExportingToCloud.set(false);
       if (result) {
-        const url = result.folder?.browser_url;
-        if (url) {
-          window.open(url, '_blank', 'noopener');
-        }
         this.resultIsError.set(false);
-        // Refresh so exported_at ("last synced at") reflects the sync.
+        // Refresh so exported_at ("last synced at") and exported_folder_url
+        // land — the latter is what reveals the "Open cloud folder" button.
         this.loadJob();
       } else {
         this.resultMessage.set(
@@ -924,6 +939,15 @@ export class JobReviewComponent {
         this.resultIsError.set(true);
       }
     });
+  }
+
+  /** Open the already-exported folder. Synchronous inside the click handler so
+   *  the browser keeps user activation and allows the new tab. */
+  openExportedFolder(): void {
+    const url = this.job()?.exported_folder_url;
+    if (url) {
+      window.open(url, '_blank', 'noopener');
+    }
   }
 
   /** Delegates to the shared helper — this was copy-pasted in two

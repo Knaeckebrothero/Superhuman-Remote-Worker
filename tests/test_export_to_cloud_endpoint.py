@@ -310,3 +310,89 @@ class TestDeliverablesCopy:
             result = await main.export_job_to_shared_folder(fake_request, job["id"])
         assert result["files_copied"] == 1
         assert _copied_paths(backend) == {"spec.yaml"}
+
+
+# --------------------------------------------------------------------------- #
+# Sharing
+# --------------------------------------------------------------------------- #
+
+
+class TestExportSharing:
+    """The export is only *useful* if the folder ends up visible to the caller.
+
+    Backends that can't provision accounts (Nextcloud: user_oidc materialises
+    one on first browser login) resolve to None until the user has signed in
+    once, and the endpoint then copies files into a folder nobody but the agent
+    can see. That must be reported, not swallowed.
+    """
+
+    @pytest.mark.asyncio
+    async def test_shares_with_resolved_user(self, fake_request):
+        user = _make_user()
+        job = _make_job(freeze_data={"deliverables": ["spec.yaml"]})
+        backend = FakeMainCloudBackend()
+        stack, backend, _ = _patch_endpoint(
+            user=user, job=job, backend=backend, gitea_files={"spec.yaml": b"x"}
+        )
+        with stack:
+            result = await main.export_job_to_shared_folder(fake_request, job["id"])
+        assert result["shared"] is True
+        assert [c[0] for c in backend.calls].count("share_session_folder") == 1
+
+    @pytest.mark.asyncio
+    async def test_reports_unshared_when_no_cloud_account(self, fake_request):
+        # No email and no display name = nothing the backend can resolve an
+        # account by, which is what an un-provisioned user looks like.
+        user = {"id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", "keycloak_sub": "kc-1"}
+        job = _make_job(freeze_data={"deliverables": ["spec.yaml"]})
+        backend = FakeMainCloudBackend()
+        stack, backend, db = _patch_endpoint(
+            user=user, job=job, backend=backend, gitea_files={"spec.yaml": b"x"}
+        )
+        with stack:
+            result = await main.export_job_to_shared_folder(fake_request, job["id"])
+        assert result["shared"] is False
+        assert "share_session_folder" not in [c[0] for c in backend.calls]
+        # Still a real export: files copied and the job stamped, so a re-sync
+        # after the user's first cloud login shares the same folder.
+        assert result["files_copied"] == 1
+        assert _copied_paths(backend) == {"spec.yaml"}
+        assert db.update_job_exported_folder.await_count == 1
+
+
+# --------------------------------------------------------------------------- #
+# exported_folder_url resolution
+# --------------------------------------------------------------------------- #
+
+
+class TestExportedFolderUrl:
+    """The stored handle is opaque, so the cockpit's "Open cloud folder" button
+    depends on the orchestrator resolving it into a URL on every job read —
+    the export response alone can't carry it across a page reload."""
+
+    def _with_backend(self, backend):
+        router = MagicMock()
+        router.for_backend = MagicMock(return_value=backend)
+        return patch("main.main_cloud_router", router)
+
+    def test_resolves_handle_to_url(self):
+        with self._with_backend(FakeMainCloudBackend()):
+            out = main._with_cloud_review_mode(
+                {"id": "x", "exported_folder_handle": "sessions/job-abc"}
+            )
+        assert out["exported_folder_url"] == "fake://session/sessions/job-abc"
+
+    def test_null_when_never_exported(self):
+        with self._with_backend(FakeMainCloudBackend()):
+            out = main._with_cloud_review_mode(
+                {"id": "x", "exported_folder_handle": None}
+            )
+        assert out["exported_folder_url"] is None
+
+    def test_null_when_backend_down(self):
+        # Cloud outage must degrade to "no button", not a broken link.
+        with self._with_backend(FakeMainCloudBackend(start_initialized=False)):
+            out = main._with_cloud_review_mode(
+                {"id": "x", "exported_folder_handle": "sessions/job-abc"}
+            )
+        assert out["exported_folder_url"] is None

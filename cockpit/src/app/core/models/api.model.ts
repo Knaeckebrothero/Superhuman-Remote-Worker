@@ -1522,6 +1522,14 @@ export interface Job {
   exported_folder_handle?: string | null;
   exported_at?: string | null;
   /**
+   * Backend-resolved browser URL of the Mode B export folder — the handle is
+   * opaque, so only the orchestrator can build this. Non-null exactly when
+   * `exported_at` is set AND the owning cloud backend is up. Drives the
+   * "Open cloud folder" button, which must stay reachable after the export
+   * response is gone (reload, or a popup the browser blocked).
+   */
+  exported_folder_url?: string | null;
+  /**
    * Backend-computed cloud-review routing (job_cloud_export.md). `'diff'` when
    * the job's project has a main-cloud folder (Mode A diff-review);
    * `'open_folder'` otherwise — loose jobs and default-project / no-cloud-folder
@@ -1562,6 +1570,23 @@ export interface JobCreateRequest {
   user_id?: string;
   project_id?: string;
   priority?: number;
+}
+
+/**
+ * Result of the Mode B export (`POST /api/jobs/{id}/export-to-shared-folder`).
+ * See docs/done/job_cloud_export.md §3.2.
+ */
+export interface JobCloudExportResult {
+  job_id: string;
+  files_copied: number;
+  /**
+   * False = the files were copied but the folder could not be shared with the
+   * caller, because the cloud backend has no account for them yet (Nextcloud
+   * provisions on first OIDC login). The export is real, the folder just
+   * isn't visible to them until they've signed in to the cloud once.
+   */
+  shared: boolean;
+  folder: { name: string; browser_url: string | null; webdav_url: string | null };
 }
 
 /**
