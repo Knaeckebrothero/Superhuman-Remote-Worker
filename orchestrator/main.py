@@ -8604,6 +8604,9 @@ app.add_middleware(CorrelationIdMiddleware)
 
 
 # Include routers
+from routers.bench import router as bench_router  # noqa: E402
+
+app.include_router(bench_router)
 app.include_router(bff_router)
 app.include_router(graph_router)
 app.include_router(uploads_router)
