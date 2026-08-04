@@ -14,9 +14,14 @@ related:
 
 # `resume_job`'s grant re-check fails open — a malformed stored `tools` value latches the control off while the endpoint keeps returning success
 
-**Status:** OPEN, filed 2026-08-03. **Not fixed**, deliberately — narrowing the
-handler is a policy decision that would start refusing resumes that succeed
-today.
+**Status:** **FIXED 2026-08-04** (`b71aee72`, widened by `915cb49a`, annotated by
+`4fd13de7`). Filed 2026-08-03. The policy decision this doc deferred — that
+narrowing the handler starts refusing resumes which succeed today — was taken:
+**narrow, do not invert.** The line drawn is *"the stored configuration is
+unusable"* (fail closed, **409**) versus *"we could not reach storage"* (still
+proceed), NOT "known exception type" versus "unknown". A Postgres blip must still
+not block a resume; that availability property was explicitly preserved and is
+pinned by a test asserting the transient path still proceeds.
 **Severity:** security, medium. Nothing crashes and nothing is escalated
 *directly*; a control that exists to catch a specific escalation is silently
 skipped. Exploitation requires the ability to store a malformed expert
@@ -129,3 +134,80 @@ Two things to decide with it, which is why this is a ticket rather than a patch:
   after dispatch, plant a malformed `tools` value on the expert, resume, and
   confirm from the agent's bound toolset that the narrowed grant was not applied.
   That is the demonstration that turns this from reasoned-from-code into observed.
+
+---
+
+## How it was fixed, and the two rounds it took
+
+**Round 0** caught `ToolPolicyError` only — which is what the task brief asked
+for, and it was too narrow for the brief's own intent. Review found two more
+equally permanent failures in the same `try` block:
+
+- `json.JSONDecodeError` from a `config_override` stored as a malformed JSON
+  string — note this raises at `_rco = json.loads(_rco)`, **before**
+  `resolve_config` is called at all;
+- `FileNotFoundError` from an unresolvable `base_config_name` or `$extends`
+  (`src/core/loader.py:261` unguarded `open()`, and `:276-279` raising it
+  deliberately).
+
+**Round 1** widened to `(ToolPolicyError, ValueError, FileNotFoundError)`.
+`ToolPolicyError` is itself a `ValueError` subclass, so listing it is redundant at
+runtime and kept for self-documentation; `json.JSONDecodeError` is covered as a
+`ValueError` subclass and pinned by a test that asserts exactly that rather than
+relying on the reader knowing it.
+
+### Chosen status: 409
+
+The caller's request is well-formed; the job's **stored** config is in a
+conflicting state that blocks re-verification. `403` would falsely claim the
+grants forbade it — they were never consulted — and `422` would blame the request
+body rather than server-side state. Verified no consumer switches on this
+endpoint's status codes: cockpit's `resumeJob` routes through a generic
+`catchError` that **prefers the server's `detail`** over the per-status string, so
+the user sees the real cause.
+
+### Reachability, corrected
+
+An earlier framing of these findings as *"empirically confirmed reachable"* was
+overconfident and is corrected here. `jobs.config_override`, `experts.config`,
+`experts.prompts` and `users.settings` are all `jsonb` columns written via
+`json.dumps(...)::jsonb`, so Postgres validates JSON **syntax** on every write —
+a syntactically-malformed string is not reachable through any application path,
+and the confirmation was a direct dict-poke in a test rather than a stored row.
+
+What remains **fully reachable regardless**: the original `tools.core: null` case
+(semantically bad, syntactically valid JSON, which `jsonb` stores happily) and the
+`FileNotFoundError` / missing-required-field cases, which are about file paths and
+structural completeness rather than JSON syntax. `FileNotFoundError` alone
+justifies the widening.
+
+### One known overlap, accepted
+
+Catching bare `ValueError` also covers `_enforce_dispatch_grants` →
+`list_grants_for_scopes`, which `json.loads` the `capability_grants.value_json`
+column. A corrupted **global** grant row would therefore 409 every resume in that
+scope while blaming this job's own config. Accepted rather than restructured
+around: that column is `jsonb NOT NULL` written only through `json.dumps`, so
+reaching it needs DB-level corruption. The durable risk is that this audit is a
+**snapshot** — a call added to that `try` block which raises `ValueError` for a
+transient reason would silently convert a tolerated blip into a refused resume.
+The code comment says so and names the structural fix (a second `try` scoped
+around the grant check) for whoever needs it.
+
+## Still open, deliberately
+
+- **`yaml.YAMLError`** from a malformed **bundled on-disk** config still falls to
+  the tolerant handler. It is not a `ValueError` subclass and
+  `load_and_merge_config`'s `yaml.safe_load` is unguarded. Left because a deploy
+  artifact is different in kind from a stored DB row — a broken base config would
+  also break fresh dispatch and session create, so it is unlikely to surface first
+  on resume. But note the asymmetry: a broken `worker_base.yaml` has a **far
+  larger blast radius** than one bad expert row, so "less likely" is not "less
+  severe if it happens".
+- **The `await _user_experts_enabled()` gate wrapping the whole re-check** — on a
+  deployment with user experts off, the resume-time re-check does not run at all.
+  Untouched here; it is a separate decision about whether a kill switch should
+  govern grant enforcement.
+- **No live gate.** Staging needs a job in a resumable state against a
+  permanently-unusable stored config. Covered by unit tests asserting
+  **non-dispatch** (not merely the status) in both directions.

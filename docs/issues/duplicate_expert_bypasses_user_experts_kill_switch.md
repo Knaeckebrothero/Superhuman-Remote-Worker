@@ -13,7 +13,8 @@ related:
 
 # `POST /api/experts/{id}/duplicate` skips the combined expert save gate — Duplicate still creates an owned expert while user-defined experts are administratively disabled
 
-**Status:** OPEN, filed 2026-08-03. Found while closing the expert *write*
+**Status:** **FIXED 2026-08-04** (`55080ed0`), live-gated on k3d the same day —
+[[expert_write_gate_holes_live_gate_2026-08-04]]. Filed 2026-08-03. Found while closing the expert *write*
 boundary in the tool-configuration series' fix wave — that fix landed on this
 route too (it had no tool-override validation at all, and no credential
 deny-scan), and this second gap on the same route was left because it is a
@@ -37,7 +38,7 @@ Five routes write an expert. Four of them run the combined save gate:
 | `POST /api/experts` (create) | yes — `:29037` |
 | `PUT /api/experts/{id}` (update) | yes — `:29080` |
 | `POST /api/experts/import` | yes — `:29191` |
-| `POST /api/experts/{id}/fork-default` | yes — `:29383` |
+| `POST /api/expert-defaults/{expert_type}/fork` | yes |
 | **`POST /api/experts/{id}/duplicate`** | **no** |
 
 `duplicate_expert` runs `_require_experts_db()`, `require_approved_user(...)`, a
@@ -119,11 +120,29 @@ enforce only the kill switch, and accept that a copy can carry a config its owne
 cannot run, because dispatch will say so. Pick one deliberately — the current
 state is neither.
 
-## Verification owed
+## Verification — done
 
-- No test asserts a 403 from any expert write route while the switch is off, so
-  the four routes that *do* enforce it are unpinned too. One parametrised test
-  over all five routes would close the class rather than the instance.
+- ~~No test asserts a 403 from any expert write route while the switch is off~~ —
+  now a **parametrised test over all five routes**, so the class is pinned rather
+  than the instance. The four that already enforced it were unpinned too; they are
+  not any more. Mutation-tested: removing the new call fails exactly the
+  `duplicate` parameter.
+- **Live-gated**: 403 × 5 with the switch off and no row created; 422 naming
+  `shell_tools` for a non-admin duplicating a shell-declaring expert, with an
+  admin control returning 200 so the 422 cannot be a shape rejection in disguise.
+  Evidence: [[expert_write_gate_holes_live_gate_2026-08-04]].
+
+**The decision the doc left open was taken by the repo owner: enforce the FULL
+gate**, not the kill switch alone. A user who lacks a grant the source config
+requires is refused at copy time rather than getting a copy that fails later at
+dispatch for a config they never authored.
+
+## Historical, and how the fix differs from this doc's suggestion
+
+The doc proposed `src.get("config") or {}`. The fix passes `src["config"]` — the
+value just returned by `_validate_expert_fragment`, because that is what actually
+gets persisted and it is already canonical, which is what `_enforce_save_grants`
+expects.
 - Not exercised: flip `user_experts` off in `system_settings` on an isolated
   namespace, duplicate a bundled expert, and confirm both that the row is created
   today and that it is refused after the fix. The switch is deployment-wide, so
