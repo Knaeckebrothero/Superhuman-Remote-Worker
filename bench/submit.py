@@ -53,8 +53,18 @@ def save_manifest(path: Path, manifest: dict):
     tmp.replace(path)
 
 
-def job_status(job_id: str) -> str:
-    data = get(f"/api/jobs/{job_id}")
+def job_status(job_id: str) -> str | None:
+    """Current status, or None on transient network/API failure.
+
+    A DNS blip or gateway hiccup during an overnight run must degrade to
+    "unknown, check again next poll" — an uncaught URLError here killed
+    the first baseline run 8 jobs in.
+    """
+    try:
+        data = get(f"/api/jobs/{job_id}")
+    except (ApiError, OSError) as e:
+        print(f"poll failed for {job_id} (transient, will retry): {e}", flush=True)
+        return None
     return (data.get("status") or data.get("job", {}).get("status") or "?")
 
 
@@ -63,6 +73,9 @@ def in_flight(manifest: dict) -> list[dict]:
     for entry in manifest["jobs"]:
         if entry.get("job_id") and entry.get("final_status") is None:
             status = job_status(entry["job_id"])
+            if status is None:
+                live.append(entry)  # unknown -> assume still running
+                continue
             entry["last_status"] = status
             if status in TERMINAL:
                 entry["final_status"] = status
@@ -155,6 +168,13 @@ def main():
         task, replicate = queue.pop(0)
         try:
             job_id = submit_one(task, args, replicate)
+        except OSError as e:
+            # Transient network failure: put the pair back and wait it out.
+            print(f"submit blocked by network ({e}); retrying {task['id']} "
+                  f"r{replicate} in {args.poll_seconds}s", flush=True)
+            queue.insert(0, (task, replicate))
+            time.sleep(args.poll_seconds)
+            continue
         except ApiError as e:
             print(f"SUBMIT FAILED {task['id']} r{replicate}: {e}", flush=True)
             manifest["jobs"].append({
