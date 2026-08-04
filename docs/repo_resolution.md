@@ -17,6 +17,11 @@ related:
 
 # Repository Resolution — One Repo Per Job, Subjobs as Branches
 
+> **Reaffirmed 2026-08-04:** New projects no longer receive a shared jobs
+> repository. File-producing project loops deliver through the project cloud
+> folder, and job history is stored as structured database records. See
+> [[project_jobs_repo_retirement]].
+
 This document captures the architectural decision on how jobs relate to git repositories. It supersedes the shared "jobs repo" model described in [[projects]] and simplifies the repository assumptions in [[project_knowledge_base]].
 
 ## The Problem with Shared Repos

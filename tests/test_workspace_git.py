@@ -74,10 +74,10 @@ class TestWorkspaceGitInitialization:
 
         assert ws.git_manager is None
 
-    def test_project_jobs_clone_failure_raises_not_silent_init(
+    def test_isolated_job_clone_failure_raises_not_silent_init(
         self, temp_base, monkeypatch
     ):
-        """F29 hardening: a failed jobs-repo clone must RAISE (so the job fails
+        """F29 hardening: a failed isolated-job clone must RAISE (so the job fails
         loudly and the loop advance counts it), NOT silently `git init` a
         disconnected workspace — that path rebuilt from scratch and lost every
         push on teardown in loop runs 5 & 6.
@@ -100,18 +100,12 @@ class TestWorkspaceGitInitialization:
             config=WorkspaceManagerConfig(
                 structure=["archive/"],
                 git_versioning=True,
-                repositories=[
-                    {
-                        "role": "jobs",
-                        "name": "proj-jobs",
-                        "repo_url": "http://srw-gitea:3000/x/proj-jobs.git",
-                    }
-                ],
+                git_remote_url="http://srw-gitea:3000/x/job-test.git",
             ),
             base_path=temp_base,
             backend=FilesystemTestBackend(temp_base),
         )
-        with pytest.raises(RuntimeError, match="Failed to clone project jobs repo"):
+        with pytest.raises(RuntimeError, match="Failed to clone job workspace repo"):
             ws.initialize_project_workspace()
         # Retried before giving up (bounded), then hard-failed — did NOT silently
         # fall back to a local git init.
@@ -416,10 +410,8 @@ class TestProjectWorkspacePrepopulatedRoot:
             config=WorkspaceManagerConfig(
                 structure=["archive/"],
                 git_versioning=True,
+                git_remote_url=JOBS_URL,
                 branch_name=branch,
-                repositories=[
-                    {"role": "jobs", "name": "proj-jobs", "repo_url": JOBS_URL}
-                ],
             ),
             base_path=temp_base,
             backend=FilesystemTestBackend(temp_base),
@@ -454,7 +446,7 @@ class TestProjectWorkspacePrepopulatedRoot:
         _seed_repo(temp_base, origin_url="http://srw-gitea:3000/other/elsewhere.git")
 
         ws = self._make_ws(temp_base)
-        with pytest.raises(RuntimeError, match="does not match project jobs repo"):
+        with pytest.raises(RuntimeError, match="does not match expected job repo"):
             ws.initialize_project_workspace()
         assert ws._initialized is False
 

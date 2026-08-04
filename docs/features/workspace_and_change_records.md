@@ -22,6 +22,12 @@ related:
 
 # Workspace and change records — the project repo as index, datasources as destinations (2026-08-01)
 
+> **Superseded 2026-08-04:** The shared project-repo model in this document is
+> retired by [[project_jobs_repo_retirement]]. Per-job repositories remain as
+> isolated execution surfaces; structured records move to PostgreSQL and loop
+> files land in the project cloud folder. The record schema and verification
+> distinctions below remain useful, but `main` is no longer their storage.
+
 ## 1. The idea
 
 Stated by the requester, verbatim, because every design choice below serves one of these

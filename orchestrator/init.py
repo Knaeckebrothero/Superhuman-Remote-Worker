@@ -1126,8 +1126,9 @@ async def _seed_default_projects(db) -> None:
     """Create default projects for users that don't have one.
 
     Queries users where default_project_id IS NULL, then creates a personal
-    default project for each with owner membership. No Gitea access here —
-    jobs repos are created lazily by the orchestrator at startup.
+    default project for each with owner membership. Managed knowledge-vault
+    provisioning is handled by the orchestrator; projects no longer receive a
+    shared jobs repository.
     """
     try:
         async with db.acquire() as conn:

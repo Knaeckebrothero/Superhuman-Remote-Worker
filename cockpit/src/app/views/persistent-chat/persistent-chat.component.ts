@@ -329,8 +329,16 @@ export function canComposeDuringSession(
     isConnected: boolean,
     isStartingSession: boolean,
     isDraftSession = false,
+    isEnded = false,
+    isResuming = false,
 ): boolean {
-    return isConnected || isStartingSession || isDraftSession;
+    // `isEnded` keeps the box live on a resumable session so a user can draft
+    // before bringing the agent back. Composing costs nothing; only SENDING
+    // resumes (persistent-chat.service.sendMessage), so a half-written message
+    // never reserves an agent pod + workspace. `isResuming` covers the window
+    // between that send and connect(), which isStartingSession excludes by
+    // design (it tests threadStatus !== 'ended').
+    return isConnected || isStartingSession || isDraftSession || isEnded || isResuming;
 }
 
 /**
@@ -829,6 +837,12 @@ export function clearDraft(threadId: string | null): void {
           }
           @if (chat.compaction(); as comp) {
             <app-badge tone="warning" size="sm">{{ 'chat.compactionLive.footer' | transloco:{ current: comp.currentPass > 0 ? comp.currentPass : 1, total: comp.nPasses, elapsed: compactionElapsed() } }}</app-badge>
+          }
+          @if (chat.cloudSyncDegraded()) {
+            <app-badge tone="danger" size="sm"
+                       [title]="'chat.status.cloudSyncOffTooltip' | transloco">
+              {{ 'chat.status.cloudSyncOff' | transloco }}
+            </app-badge>
           }
           @if (cloudBadgeShown()) {
             <app-badge tone="accent" size="sm" role="button"
@@ -1537,8 +1551,9 @@ export function clearDraft(threadId: string | null): void {
           </div>
         }
 
-        <!-- Ended-session end-marker + resume card — replaces the composer
-             when the thread is in 'ended' status. -->
+        <!-- Ended-session end-marker + resume card. Sits at the tail of the
+             transcript, directly above the (still-live) composer — the card is
+             the resume-without-typing path; sending resumes too. -->
         @if (chat.threadStatus() === 'ended') {
           <div class="end-marker">
             <span class="end-line"></span>
@@ -1556,9 +1571,9 @@ export function clearDraft(threadId: string | null): void {
             </div>
             <div class="resume-actions">
               <app-button variant="primary"
-                          [loading]="isResuming()"
+                          [loading]="chat.isResuming()"
                           (clicked)="resumeSession()">
-                @if (isResuming()) {
+                @if (chat.isResuming()) {
                   {{ 'chat.system.resuming' | transloco }}
                 } @else {
                   <app-icon size="sm" class="resume-icon">play_arrow</app-icon>
@@ -1615,8 +1630,11 @@ export function clearDraft(threadId: string | null): void {
         }
       }
 
-      <!-- Input -->
-      @if (chat.threadStatus() !== 'ended') {
+      <!-- Input. Rendered on an ended session too: the user can draft before
+           bringing the agent back, and the send is what resumes (see
+           canComposeDuringSession + persistent-chat.service.sendMessage).
+           This block used to be removed entirely on 'ended', which stranded a
+           half-typed message as unreadable, uneditable state. -->
       <div class="composer-wrap">
         <!-- Live token telemetry (usage.updated frames): latest context fill
              + cumulative output/reasoning for the running turn. -->
@@ -1880,7 +1898,6 @@ export function clearDraft(threadId: string | null): void {
           style="display: none;"
         />
       </div>
-      }
 
       <!-- Image preview dialog -->
       <app-dialog
@@ -2037,9 +2054,6 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
      * there is room and unfold it again — this is the hysteresis anchor.
      */
     private headerActionsNaturalWidth = 0;
-
-    // Resume state
-    readonly isResuming = signal(false);
 
     // Input state
     readonly inputFocused = signal(false);
@@ -2210,6 +2224,8 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
             this.chat.isConnected(),
             this.chat.isStartingSession(),
             this.chat.isDraftSession(),
+            this.chat.threadStatus() === 'ended',
+            this.chat.isResuming(),
         ),
     );
 
@@ -2552,6 +2568,12 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
             );
         }
         if (this.isShowingReconnectBanner()) return this.transloco.translate('chat.input.reconnecting');
+        // Sending has a side effect here (it brings the agent back), so say so
+        // rather than letting the default "Enter to send" imply it's free.
+        if (this.chat.isResuming()) return this.transloco.translate('chat.input.resuming');
+        if (this.chat.threadStatus() === 'ended') {
+            return this.transloco.translate('chat.input.endedSendResumes');
+        }
         if (this.chat.isStartingSession()) return this.transloco.translate('chat.input.sessionStarting');
         if (!this.chat.isConnected()) return this.transloco.translate('chat.input.connect');
         if (this.chat.isInterrupting()) return this.transloco.translate('chat.input.stopping');
@@ -3210,13 +3232,13 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     }
 
     async resumeSession(): Promise<void> {
-        this.isResuming.set(true);
+        // Spinner state lives on the service (chat.isResuming) so the composer
+        // gate and this button read one source — a send-triggered resume has no
+        // click to hang a local flag off.
         try {
             await this.chat.resumeSession();
         } catch (e: any) {
             this.chat.error.set(e?.error?.detail || this.transloco.translate('chat.system.resumeFailed'));
-        } finally {
-            this.isResuming.set(false);
         }
     }
 

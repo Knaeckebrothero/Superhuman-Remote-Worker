@@ -244,9 +244,21 @@ The credential is *issued to the agent for use*, not hidden from it.
 Mitigations and user responsibilities:
 - **Scope the PAT** to exactly one repo with least privilege (`Contents: write`).
   Blast radius of leakage is then that one repo.
-- **Ephemerality** — the workspace is `emptyDir` ([[workspace_storage_state_topology]]);
-  the store file is gone at teardown. The encrypted copy in Postgres is the only
-  durable one.
+- **Ephemerality** — ~~the workspace is `emptyDir`
+  ([[workspace_storage_state_topology]]); the store file is gone at teardown. The
+  encrypted copy in Postgres is the only durable one.~~
+  **⚠️ NO LONGER GUARANTEED (2026-08-04).** With `workspace.pvcEnabled` on, the
+  workspace is a PVC that survives pod teardown and reattaches by name, so **the
+  `0600` PAT store file survives too** — this mitigation silently stops applying
+  the moment the flag is flipped. It is worst for **sessions**: their volumes are
+  reclaimed only when the `threads` row is hard-deleted (an `ended` thread keeps
+  its volumes indefinitely), so a PAT written into a session workspace persists
+  for the life of the thread rather than the life of the pod. Jobs are bounded —
+  the claim goes at terminal status — but still outlive the pod. Postgres is no
+  longer the only durable copy. Treat the store file as **durable at rest on the
+  workspace volume** and rotate the PAT on datasource detach rather than relying
+  on teardown to erase it. Tracking follow-up: wipe the credential store on
+  detach/end and on volume reattach.
 - **Snapshot / log hygiene** — a workspace snapshot would capture the store
   file. Treat snapshots accordingly (same caveat as SSH keys today). URL masking
   in `GitManager` (`_mask_url_static`) already prevents the token appearing in

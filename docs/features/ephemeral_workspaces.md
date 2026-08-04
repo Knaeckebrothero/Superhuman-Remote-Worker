@@ -163,7 +163,7 @@ Already partially implemented at `main.py:4485-4505`:
 
 | Provisioner | Creates | Deletes | Snapshots before delete | Resets between jobs |
 |---|---|---|---|---|
-| **ContainerProvisioner** (K8s) | Per-job pods, `emptyDir` | `delete_workspace()` | Only for VMs at `main.py:6061` | N/A (ephemeral volume) |
+| **ContainerProvisioner** (K8s) | Per-owner pods (job **and** session), `emptyDir` by default; PVC under `workspace.pvcEnabled` | `delete_workspace()` | Only for VMs at `main.py:6061` | N/A on emptyDir; PVC-backed workspaces **reattach** instead of resetting |
 | **DockerProvisioner** (compose) | Durable host-inventory lease | Snapshot + quarantine | Yes (calls SnapshotService) | Only after explicit recreation/data reset/attestation; same-trust dev has an opt-in exception |
 | **VMProvisioner** (KubeVirt/NATS/Docker) | Per-job VMs | `delete_vm()` | Only at job completion, **not** threads | N/A (VM destroyed) |
 | **WorkspaceSuspensionService** (K8s) | Restore from snapshot | Suspend to S3 | Yes (full pattern) | N/A (pod recreated) |
@@ -177,14 +177,24 @@ The orchestrator auto-selects provisioners based on available infrastructure (`m
 
 | Aspect | Containers (ContainerProvisioner) | VMs (VMProvisioner, direct K8s) |
 |--------|-----------------------------------|----------------------------------|
-| **Provisioning** | Per-job pod, `emptyDir` volume (10Gi limit) | Per-job KubeVirt VM from template |
-| **Isolation** | Pod boundary. Storage dies with pod. | Full VM boundary. Disk via CDI DataVolume. |
+| **Provisioning** | Per-owner pod (job or session), `emptyDir` volume (10Gi limit); PVC named by owner UUID under `workspace.pvcEnabled` | Per-job KubeVirt VM from template |
+| **Isolation** | Pod boundary. Storage dies with pod — **unless PVC-backed**, in which case it survives and reattaches by name. | Full VM boundary. Disk via CDI DataVolume. |
 | **Current cleanup** | `delete_workspace()` deletes pod. No snapshot. | `delete_vm()` destroys VM. Snapshot only at job completion, not thread VMs. |
 | **Resume** | New pod + `restore_snapshot_for_resume()` from S3 | New VM + same restore path |
 | **What's needed** | Snapshot before pod deletion (Phase 2b) | `release_vm()` with snapshot (Phase 2a) |
 | **WorkspaceSuspensionService** | Already implements full suspend/restore cycle | Not used for VMs |
 
 K8s containers are already ephemeral (emptyDir). The only gap is snapshotting before deletion for resume support.
+
+> **2026-08-04 — no longer unconditional.** `workspace.pvcEnabled` PVC-backs
+> workspace pods for **both** jobs and sessions (a session additionally gets a
+> claim for its agent pod). Where that flag is on, the primary resume path is
+> **PVC reattach by name**, and the S3 snapshot demotes to a cross-node/DR
+> backstop rather than the mechanism. Job claims are reclaimed at terminal
+> status; session claims only when the thread row is hard-deleted. emptyDir
+> remains the chart default and the rollback posture, and a mixed fleet is safe —
+> the reaper reads each pod's actual volume mode.
+> See [`workspace_pvc_branch_a_implementation.md`](workspace_pvc_branch_a_implementation.md).
 
 ### Docker Compose
 

@@ -26,6 +26,21 @@ from src.core.loader import canonical_config_name
 logger = logging.getLogger(__name__)
 
 
+def _env_flag(name: str, default: bool) -> bool:
+    """Parse a boolean env var exactly the way ContainerProvisioner does.
+
+    Duplicated rather than imported to keep this module free of a
+    provisioner-to-provisioner import, but the parsing MUST stay identical:
+    session-agent PVCs are gated on the *same* ``WORKSPACE_PVC_ENABLED`` flag
+    as workspace PVCs, and a value that read as "on" for one and "off" for the
+    other would give the cluster a silent, half-applied durability setting.
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in {"0", "false", "no", "off"}
+
+
 def _normalize_config_name(config_name: str, purpose: str) -> str:
     """Guard against an expert UUID leaking into ``config_name``.
 
@@ -95,6 +110,18 @@ class AgentProvisioner:
         self._secret_name: str = os.environ.get("AGENT_SECRET", "srw")
         self._ssh_secret_name: str = os.environ.get(
             "WORKSPACE_SSH_SECRET", "vm-ssh-key"
+        )
+        # Durable /workspace for SESSION agent pods. Gated on the SAME flag,
+        # size and storage class as workspace PVCs (ContainerProvisioner) so a
+        # cluster has one storage switch, not two. Off (the default) → the
+        # emptyDir behavior this file has always had. Job agent pods are never
+        # PVC-backed: they are stateless dispatch runners whose durable state
+        # lives in the workspace pod, the job repo and Postgres. See the volume
+        # list in _build_pod_manifest for the session rationale.
+        self._pvc_enabled: bool = _env_flag("WORKSPACE_PVC_ENABLED", False)
+        self._pvc_size: str = os.environ.get("WORKSPACE_PVC_SIZE", "10Gi")
+        self._storage_class: str = os.environ.get(
+            "WORKSPACE_STORAGE_CLASS", "longhorn-ephemeral"
         )
         self._max_agents: int = int(os.environ.get("MAX_AGENTS", "10"))
         self._min_agents: int = int(os.environ.get("MIN_AGENTS", "0"))
@@ -289,6 +316,51 @@ class AgentProvisioner:
         short_id = uuid4().hex[:8]
         pod_name = f"srw-agent-{purpose[0]}-{short_id}"
 
+        # Session agents get a PVC-backed /workspace; job agents keep emptyDir.
+        # The pod name is random per provision (srw-agent-s-<8hex>), so the
+        # volume identity has to come from the *thread* instead — that is what
+        # makes a recycled agent pod (drift drain, crash, node loss, version
+        # upgrade) reattach the same data rather than boot onto empty scratch.
+        #
+        # The name is deliberately NOT `pvc-persistent-<id>`: that belongs to
+        # the legacy PersistentProvisioner pod path. Sharing one RWO claim
+        # between both paths would wedge whichever pod attached second if the
+        # two ever coexist for a single thread.
+        pvc_name: Optional[str] = None
+        if self._pvc_enabled and purpose == "session" and thread_id:
+            pvc_name = f"pvc-agent-s-{thread_id[:12]}"
+            pvc_status = await self._create_pvc(
+                pvc_name,
+                size=self._pvc_size,
+                # Full thread id (not the pod's truncated `srw/thread-id`
+                # label) — the lifecycle reaper resolves PVC → thread row by
+                # this value, and a 12-char prefix is not a thread key.
+                labels={"srw/thread-id": thread_id},
+            )
+            if not pvc_status:
+                # Fail closed. An emptyDir fallback here would hand the user a
+                # session that looks healthy and then loses its agent-local
+                # state on the next pod recycle — precisely the failure the PVC
+                # exists to prevent — with nothing in the UI to explain it.
+                # Better a visible provision failure the caller can retry.
+                logger.error(
+                    "Session agent PVC %s could not be created for thread %s — "
+                    "aborting provision instead of silently starting a "
+                    "non-durable agent pod",
+                    pvc_name,
+                    thread_id,
+                )
+                now_iso = datetime.now(timezone.utc).isoformat()
+                await self._set_thread_context(
+                    thread_id,
+                    {
+                        "status": "failed",
+                        "error": "PVC creation failed",
+                        "updated_at": now_iso,
+                    },
+                )
+                return None
+
         manifest = self._build_pod_manifest(
             pod_name=pod_name,
             purpose=purpose,
@@ -299,6 +371,7 @@ class AgentProvisioner:
             memory_request=memory_request,
             cpu_limit=cpu_limit,
             memory_limit=memory_limit,
+            pvc_name=pvc_name,
         )
 
         try:
@@ -1176,11 +1249,16 @@ class AgentProvisioner:
         cpu_limit: str,
         memory_limit: str,
         expert_id: Optional[str] = None,
+        pvc_name: Optional[str] = None,
     ) -> dict:
         """Build the Kubernetes Pod manifest for an agent.
 
         Uses ``envFrom`` to inject all keys from the shared ConfigMap and
         Secret, avoiding duplication of the 60+ env vars.
+
+        ``pvc_name`` (session agents only, when ``WORKSPACE_PVC_ENABLED`` is
+        set) backs ``/workspace`` with that claim; ``None`` keeps the emptyDir
+        this file has always used.
         """
         # Build agent command based on purpose
         if purpose == "session" and thread_id:
@@ -1368,9 +1446,22 @@ class AgentProvisioner:
         ]
 
         volumes: list[dict] = [
-            # Scratch workspace (agent connects to real workspace
-            # via SSH — this is just local temp storage)
-            {"name": "workspace", "emptyDir": {"sizeLimit": "10Gi"}},
+            # /workspace in the AGENT pod. For `sandbox`-tier sessions and for
+            # jobs this really is scratch: the authoritative workspace is the
+            # separate ws-thread-* / workspace pod the agent reaches over SSH,
+            # and nothing here is the source of truth.
+            #
+            # We persist it for sessions anyway, because that framing stopped
+            # being complete: `backend: none` / lite sessions have no workspace
+            # pod at all, so agent-local state written under /workspace is the
+            # only copy and it died with every pod recycle. Rather than make
+            # durability depend on a tier the pod can't see at manifest-build
+            # time, PVC-back /workspace for all sessions — for sandbox sessions
+            # the claim is cheap insurance over scratch; for lite sessions it is
+            # the fix. Job agents stay emptyDir (pvc_name is None for them).
+            {"name": "workspace", "persistentVolumeClaim": {"claimName": pvc_name}}
+            if pvc_name
+            else {"name": "workspace", "emptyDir": {"sizeLimit": "10Gi"}},
             {
                 "name": "vm-ssh-key",
                 "secret": {
@@ -1525,6 +1616,82 @@ class AgentProvisioner:
     # =========================================================================
     # Internal helpers
     # =========================================================================
+
+    async def _create_pvc(
+        self, pvc_name: str, size: str = "10Gi", labels: Optional[dict] = None
+    ) -> Optional[str]:
+        """Create a PVC for a session agent's ``/workspace``. Idempotent.
+
+        Returns ``"created"`` for a new volume, ``"reused"`` if the claim
+        already existed (409 — i.e. the reattach path taken by every pod
+        recycle), or ``None`` on failure. Callers must treat ``None`` as fatal
+        for the provision: see provision_agent().
+        """
+        if not self._k8s_available:
+            return None
+
+        pvc_labels = {
+            "app": "srw-agent",
+            "srw/component": "agent-workspace-pvc",
+            # The label the lifecycle reaper selects on
+            # (lifecycle/workspace_manager.py::_LABEL_SELECTOR). Without it a
+            # claim is invisible to GC and leaks storage forever once its
+            # thread is gone — the bug PersistentProvisioner._create_pvc has,
+            # which is why this does not simply reuse that helper.
+            "srw.io/component": "agent-workspace",
+        }
+        if labels:
+            pvc_labels.update(labels)
+
+        pvc_manifest = {
+            "apiVersion": "v1",
+            "kind": "PersistentVolumeClaim",
+            "metadata": {
+                "name": pvc_name,
+                "namespace": self._namespace,
+                "labels": pvc_labels,
+            },
+            "spec": {
+                "accessModes": ["ReadWriteOnce"],
+                "storageClassName": self._storage_class,
+                "resources": {"requests": {"storage": size}},
+            },
+        }
+
+        try:
+            await asyncio.to_thread(
+                self._core_api.create_namespaced_persistent_volume_claim,
+                namespace=self._namespace,
+                body=pvc_manifest,
+            )
+            logger.info(
+                "Session agent PVC created: %s (storageClass=%s, size=%s)",
+                pvc_name,
+                self._storage_class,
+                size,
+            )
+            return "created"
+        except Exception as e:
+            if hasattr(e, "status") and e.status == 409:
+                logger.debug("Session agent PVC already exists: %s", pvc_name)
+                return "reused"
+            # A 403 is (almost) always the capacity guard rather than RBAC: the
+            # orchestrator SA may create PVCs, so the Forbidden it actually
+            # hits is a ResourceQuota "exceeded quota" rejection. Say so
+            # distinctly, so an operator can tell "cluster full" from broken
+            # infra. Either way the caller still fails closed.
+            if hasattr(e, "status") and e.status == 403:
+                logger.error(
+                    "Session agent PVC %s rejected (403) — most likely the "
+                    "namespace ResourceQuota is exhausted; raise "
+                    "workspace.resourceQuota.maxStorage/maxCount or wait for "
+                    "PVCs to be reclaimed: %s",
+                    pvc_name,
+                    getattr(e, "body", e),
+                )
+                return None
+            logger.error("Failed to create session agent PVC %s: %s", pvc_name, e)
+            return None
 
     async def _set_thread_context(self, thread_id: str, updates: dict) -> None:
         """Store agent pod status in thread metadata under ``agent_pod``."""

@@ -72,6 +72,19 @@ the exact power-on timestamp.
 
 ## Workspace data is ephemeral — `pvc-ws-thread-*` does not exist
 
+> **RESOLVED 2026-08-04 — `pvc-ws-thread-*` is now created.** The gate this
+> section correctly suspected in point 2 below ("the PVC creation is gated behind
+> a config flag that is not set") was real: `WORKSPACE_PVC_ENABLED`, which at the
+> time also carried an `owner.kind == "job"` check that skipped sessions
+> entirely. That check has been removed. Under the flag a session now gets
+> `pvc-ws-thread-<tid[:12]>` for its workspace pod plus `pvc-agent-s-<tid[:12]>`
+> for its agent pod, both reclaimed only when the `threads` row is hard-deleted.
+> `delete_thread_workspace_pvc()` is therefore no longer dead code. Everything
+> below still describes the emptyDir behavior of the 2026-04-28 incident, which
+> is what any pod provisioned with the flag **off** still does — including the
+> data-impact conclusion.
+> Design: [`workspace_pvc_branch_a_implementation.md`](../features/workspace_pvc_branch_a_implementation.md).
+
 While verifying PVC survival, I found that **none of the `pvc-ws-thread-*`
 PVCs exist in the namespace.** All ten lookups returned `NotFound`. Inspecting
 the actual pod spec:
@@ -121,6 +134,12 @@ The `workspace-data` volume is `emptyDir` (10Gi limit), not a PVC. Workspace
 data was lost on 2026-04-28 17:41 UTC when the containers died. Force-deleting
 the zombie pod objects now is purely cosmetic from a data standpoint — there
 is nothing to preserve.
+
+*(2026-08-04: true for this incident and for any emptyDir-era pod. It is no
+longer a safe general rule — with `workspace.pvcEnabled` on, a stuck
+`ws-thread-*` pod backs onto `pvc-ws-thread-*` and force-deleting the pod
+preserves the data; the volume reattaches by name. Check the pod's actual
+`spec.volumes` before assuming there is nothing to lose.)*
 
 Snapshotting from a zombie pod is not possible either — `release_thread_workspace`
 needs a live pod IP and `Ready` status (line 334-347). For the current ten

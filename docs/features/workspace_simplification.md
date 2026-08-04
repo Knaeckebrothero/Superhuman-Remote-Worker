@@ -414,6 +414,18 @@ Same principle — the agent account's home directory IS the workspace:
 
 ### Storage: emptyDir, Not PVC
 
+> **PARTIALLY REVERSED (2026-08-04).** emptyDir remains the chart default and the
+> rollback posture, but `workspace.pvcEnabled` now PVC-backs **both** job and
+> session workspaces (Branch a — [`workspace_pvc_branch_a_implementation.md`](workspace_pvc_branch_a_implementation.md)).
+> The exception this section itself carved out — *"Reserve PVCs only for
+> persistent threads that must survive pod restarts"* — is what the session half
+> of that work implements: a session's pod is idle-reaped while its thread stays
+> resumable, so emptyDir was destroying files a user could still reopen. The four
+> costs tabulated below are real and were paid deliberately; the leak cost in
+> particular is answered by Delete-reclaim + inline terminal delete + a backstop
+> `reap_orphans` sweep, which is why the reversal is safe to make now and was not
+> in 2026-04.
+
 For ephemeral per-job/session workspaces, use disk-backed `emptyDir` instead of PVC:
 
 | Factor | emptyDir | PVC |
@@ -433,6 +445,9 @@ volumes:
 The container provisioner already uses emptyDir as fallback when no PVC is provided (`container_provisioner.py:590-596`). Make it the default.
 
 Reserve PVCs only for persistent threads that must survive pod restarts.
+*(2026-08-04: done — this is exactly what `workspace.pvcEnabled` now does for
+sessions, two claims each, reclaimed only on thread hard-delete. emptyDir is
+still the default when the flag is off.)*
 
 ### SSH Host Keys in Ephemeral Containers
 
@@ -572,6 +587,11 @@ All 6 phases have been implemented. **38 files changed, 3878 tests passing, 0 ne
 
 ### Phase 5: Switch to emptyDir by Default — DONE
 
+*(Still accurate as the **default**. Since 2026-08-04 `workspace.pvcEnabled`
+re-adds PVC creation to `create_workspace()` for jobs **and** sessions, so
+`delete_workspace_pvc()` is no longer backward-compat cleanup — it is the live
+reclaim half of provisioning. See the note at §Storage: emptyDir, Not PVC.)*
+
 | File | Changes |
 |------|---------|
 | `orchestrator/services/container_provisioner.py` | `create_workspace()`: removed PVC creation, uses emptyDir. `create_thread_workspace()`: same. Added `terminationGracePeriodSeconds: 120` to pod spec. `delete_workspace_pvc()` / `delete_thread_workspace_pvc()` kept for backward compat with existing PVCs. |
@@ -606,7 +626,7 @@ All 6 phases have been implemented. **38 files changed, 3878 tests passing, 0 ne
 | `docs/done/`, `docs/issues/` | Historical records of past decisions. |
 | Gitea repo/branch naming | Semantic names, not filesystem paths. |
 | Nextcloud session folders | Already use `sessions/{thread_id[:8]}`. |
-| `delete_workspace_pvc()` / `delete_thread_workspace_pvc()` methods | Kept for backward compat with existing PVCs from before the emptyDir switch. |
+| `delete_workspace_pvc()` / `delete_thread_workspace_pvc()` methods | Kept for backward compat with existing PVCs from before the emptyDir switch. *(2026-08-04: vindicated — `delete_workspace_pvc()` is live again under `workspace.pvcEnabled` and reclaims both `pvc-workspace-*` and `pvc-ws-thread-*`.)* |
 
 ### Verification
 

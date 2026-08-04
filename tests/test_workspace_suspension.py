@@ -595,12 +595,15 @@ class TestSuspendClearsMetadata:
 
 class TestRestoreExtractionFailure:
     @pytest.mark.asyncio
-    async def test_restore_snapshot_download_fails(self):
-        """Restore still marks ready even if snapshot download fails.
+    async def test_restore_snapshot_download_failure_is_not_reported_ready(self):
+        """A failed extract is a failed restore — it must never stamp 'ready'.
 
-        The pod is created successfully — extraction failure is logged as a
-        warning but the pod is still usable (agent can reinitialize workspace
-        from Gitea).
+        The pod comes up either way, which is exactly the trap: 'ready' over an
+        empty or half-populated tree hands the dispatcher a workspace that looks
+        healthy, and the agent goes to work on nothing. "The agent can
+        reinitialize from Gitea" only covers tracked files — uncommitted work,
+        and any workspace with no repo behind it, is simply gone. Fail visibly
+        and let the caller decide.
         """
         svc = make_service()
         svc._db.get_job.return_value = make_job(
@@ -610,10 +613,25 @@ class TestRestoreExtractionFailure:
 
         result = await svc.restore_workspace("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
 
-        # Restore succeeds even if extraction had issues — pod is created
-        assert result is True
+        assert result is False
         calls = svc._db.merge_workspace_container_context.call_args_list
-        assert calls[-1][0][1]["status"] == "ready"
+        assert calls[-1][0][1]["status"] == "failed"
+        assert not any(c[0][1].get("status") == "ready" for c in calls)
+
+    @pytest.mark.asyncio
+    async def test_extract_snapshot_reports_failure_instead_of_none(self):
+        """``_extract_snapshot`` returns a bool the callers can branch on.
+
+        It used to return None on every path, so a failed download and a clean
+        unpack were indistinguishable — which is how the 'ready' above got
+        stamped over a workspace that never restored.
+        """
+        svc = make_service()
+        svc._snapshot_service.download_snapshot.return_value = False
+
+        ok = await svc._extract_snapshot("job-1", "10.0.0.99", ssh_port=30022)
+
+        assert ok is False
 
     @pytest.mark.asyncio
     async def test_restore_exception_during_extract(self):
@@ -1436,3 +1454,123 @@ class TestVmRestoreEndsAtTheCreate:
 
         assert ok is True
         svc._extract_snapshot.assert_awaited_once()
+
+
+class TestSessionRestoreRidesTheReattachedVolume:
+    """The container-tier twin of the kept-rootdisk rule above.
+
+    Once a session's workspace is PVC-backed, a restore that reattaches the SAME
+    volume is not a restore at all — the tree is already there. Unrolling the
+    older S3 tarball over it would replace newer files with older ones, exactly
+    what ``rootdisk == "kept"`` prevents one tier up. The signal is the thread's
+    ``_workspace_binding.backing_id``, which ``_trusted_pod_ssh_identity`` mints
+    from the PVC's UID (``k8s-pvc:<ns>:<uid>``) and from the pod's UID
+    (``k8s-pod:…``) when there is no claim — so it is stable across every
+    reattaching recreate and changes the moment a new volume is minted.
+    """
+
+    @staticmethod
+    def _thread(backing_id=None, pod_ip="10.42.2.32"):
+        thread = make_container_thread()
+        thread["metadata"]["workspace_container"]["pod_ip"] = pod_ip
+        if backing_id is not None:
+            thread["metadata"]["_workspace_binding"] = {
+                "backing_kind": "remote",
+                "backing_id": backing_id,
+            }
+        return thread
+
+    def _svc(self, before, after):
+        """restore reads the thread twice: once before create_workspace (the
+        volume we are coming BACK to) and once after (what the new pod mounts)."""
+        svc = make_service()
+        svc._db.get_thread = AsyncMock(side_effect=[before, after])
+        svc._extract_snapshot = AsyncMock(return_value=True)
+        return svc
+
+    @pytest.mark.asyncio
+    async def test_same_pvc_reattached_skips_the_extract(self):
+        pvc = "k8s-pvc:srw:11111111-2222-3333-4444-555555555555"
+        svc = self._svc(self._thread(pvc), self._thread(pvc))
+
+        ok = await svc.restore_thread_workspace("tid-pod")
+
+        assert ok is True
+        svc._extract_snapshot.assert_not_awaited()
+        merged = {}
+        for call in svc._db.merge_thread_workspace_context.await_args_list:
+            merged.update(call.args[1])
+        assert merged["status"] == "ready"
+
+    @pytest.mark.asyncio
+    async def test_emptydir_session_still_extracts(self):
+        """Mixed-fleet upgrade path: a pod-bound (emptyDir) session's storage
+        died with the pod, so the S3 snapshot is still its only copy."""
+        svc = self._svc(
+            self._thread("k8s-pod:srw:aaaa-bbbb"),
+            self._thread("k8s-pod:srw:cccc-dddd"),
+        )
+
+        ok = await svc.restore_thread_workspace("tid-pod")
+
+        assert ok is True
+        svc._extract_snapshot.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_never_bound_session_still_extracts(self):
+        """No binding at all (a session that predates the PVC switch) is not
+        evidence of a surviving volume — extract."""
+        svc = self._svc(self._thread(), self._thread())
+
+        await svc.restore_thread_workspace("tid-pod")
+
+        svc._extract_snapshot.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_different_pvc_uid_still_extracts(self):
+        """A changed backing id means a DIFFERENT volume — a first PVC-backed
+        create, or the single-replica node-loss fallback discarding a wedged
+        claim. Whatever the pod mounts now, it is not the tree we suspended."""
+        svc = self._svc(
+            self._thread("k8s-pvc:srw:11111111-old"),
+            self._thread("k8s-pvc:srw:99999999-new"),
+        )
+
+        await svc.restore_thread_workspace("tid-pod")
+
+        svc._extract_snapshot.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_missing_binding_after_create_keeps_the_volume(self):
+        """The post-create rebind is best-effort, so its absence is ambiguous.
+        The tie goes to the volume: we came in PVC-backed, a PVC survives every
+        non-permanent teardown, and unrolling a stale tarball over live files is
+        the unrecoverable mistake — a skipped extract is not."""
+        svc = self._svc(
+            self._thread("k8s-pvc:srw:11111111-2222"),
+            self._thread(),  # rebind failed → no binding on the fresh read
+        )
+
+        ok = await svc.restore_thread_workspace("tid-pod")
+
+        assert ok is True
+        svc._extract_snapshot.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_failed_extract_is_not_reported_ready(self):
+        """The thread half of the job-path rule: a workspace that failed to
+        restore must not advertise itself as ready."""
+        svc = self._svc(
+            self._thread("k8s-pod:srw:aaaa"), self._thread("k8s-pod:srw:bbbb")
+        )
+        svc._extract_snapshot = AsyncMock(return_value=False)
+
+        ok = await svc.restore_thread_workspace("tid-pod")
+
+        assert ok is False
+        statuses = [
+            call.args[1].get("status")
+            for call in svc._db.merge_thread_workspace_context.await_args_list
+        ]
+        assert statuses[-1] == "failed"
+        assert "ready" not in statuses

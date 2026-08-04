@@ -197,14 +197,15 @@ def create_git_tools(context: ToolContext) -> List[Any]:
         especially useful after context compaction when phase history
         may not be in conversation context.
 
-        By default, only shows tags for the current job. Set all_jobs=True
-        to see tags from all jobs in a shared project repository.
+        By default, only shows tags prefixed for the current job. ``all_jobs``
+        removes that prefix filter for legacy/imported repositories; new root
+        jobs use isolated repositories, so it does not expose project history.
 
         Args:
             pattern: Glob pattern to filter tags (default: "phase-*")
                     Use "*" to list all tags.
-            all_jobs: If True, show tags from all jobs in the repo.
-                     If False (default), only show this job's tags.
+            all_jobs: If True, show every matching tag in this repository.
+                     If False (default), only show this job's prefixed tags.
 
         Returns:
             Comma-separated list of matching tags, or message if none found

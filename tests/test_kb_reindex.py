@@ -1496,14 +1496,13 @@ class TestReindexKbReconciliation:
         assert result["reconciled"] == 0
 
 
-class TestPostMergeReindexTriggerResolvesItsOwnRepo:
+class TestPostJobReindexTriggerResolvesItsOwnRepo:
     """Guard for docs/features/knowledge_base_repo_separation.md §10a.
 
     ``_reindex_project_kb`` resolves the vault repo (knowledge-role first,
     jobs as fallback) **only when it is not handed a ``repo_name``**. The
-    post-merge KB-freshness trigger used to pass ``job["repo_name"]``, which
-    is always the *jobs* repo — pinning the reindex to the wrong repo for any
-    project whose vault has moved to a knowledge repo.
+    post-job KB-freshness trigger used to pass ``job["repo_name"]``, pinning
+    the reindex to an execution repo rather than the project's knowledge repo.
 
     That failure is silent and destructive rather than loud: ``plan_reindex``
     treats every indexed path absent from the tree as a delete, so reindexing
@@ -1526,19 +1525,19 @@ class TestPostMergeReindexTriggerResolvesItsOwnRepo:
 
     def test_trigger_does_not_pin_repo_name(self):
         src = self._main_src()
-        assert "async def _kb_reindex_after_merge" in src, (
-            "post-merge KB trigger not found — if it was renamed, move this "
+        assert "async def _record_loop_job_outcome" in src, (
+            "post-job outcome hook not found — if it was renamed, move this "
             "guard with it rather than deleting it (see §10a)."
         )
-        body = src.split("async def _kb_reindex_after_merge", 1)[1][:1400]
+        body = src.split("async def _record_loop_job_outcome", 1)[1][:3000]
         assert "_reindex_project_kb(pid)" in body, (
-            "The post-merge KB trigger must call _reindex_project_kb without a "
+            "The post-job KB trigger must call _reindex_project_kb without a "
             "repo_name so it resolves the vault repo itself. Passing the job's "
-            "repo_name pins it to the jobs repo and wipes the chunk index for "
+            "repo_name pins it to an execution repo and wipes the chunk index for "
             "any project with a knowledge repo. See §10a."
         )
         assert "repo_name=" not in body, (
-            "repo_name= reappeared in the post-merge KB trigger — this is the "
+            "repo_name= reappeared in the post-job KB trigger — this is the "
             "exact §10a regression: silent chunk-index wipe."
         )
 
@@ -1547,6 +1546,6 @@ class TestPostMergeReindexTriggerResolvesItsOwnRepo:
         # feeding it the *job's* repo is never right for a project-scoped KB.
         src = self._main_src()
         assert 'repo_name=job.get("repo_name")' not in src, (
-            "A caller is passing the job's repo into a KB reindex. The job repo "
-            "is always the jobs repo; project KB resolution must win. See §10a."
+            "A caller is passing the job's execution repo into a KB reindex. "
+            "Project KB resolution must win. See §10a."
         )

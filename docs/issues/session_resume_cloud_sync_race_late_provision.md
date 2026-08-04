@@ -1,6 +1,7 @@
 # Resume races its own cloud-folder provisioning — session runs unsynced for life
 
-**Status**: FIXED (race), k3d-verified 2026-08-04 — uncommitted
+**Status**: FIXED (race + degraded-attach recovery + toast readability),
+k3d-verified 2026-08-04 — uncommitted. One item deferred, see "Still open".
 **Filed**: 2026-08-04
 **Observed on**: main dev cluster, thread `5833c729-c0cd-496f-9a40-e9b811ae0ced`
 **Severity**: the toast is *accurate* — the affected session really does run with
@@ -190,19 +191,128 @@ Agent pod log: `Cloud workspace sync coordinator started (1 mount(s))` — the
 `if cloud_cfg:` branch, not the degraded one. Zero `workspace_sync.error` rows
 on the thread; endpoint reports `cloud_sync_degraded: false`.
 
+## Follow-up 1: recovery from a degraded attach (shipped)
+
+The race fix removes the *common* cause, but any other one (cloud down at
+attach, a transient WebDAV failure) still pinned `workspace_sync = None` for
+the session's whole life. Now:
+
+- `src/api/persistent_app.py` — `_cloud_sync_retry_pending` is set at both
+  degraded-attach sites (failed initial pull, and the no-target branch).
+  `_retry_cloud_sync_start()` runs from `_loop_on_turn_start` once per turn
+  while pending, re-resolves cloud config, rebuilds the coordinator and seeds
+  it with a pull. Silent after the first failure — the toast already fired at
+  attach; only the transition back to working is announced, via a new
+  `workspace_sync.recovered` frame. Fail-closed on `protected_cloud` (F-C1):
+  never hand a protected thread a live WebDAV sync, and stop retrying, since
+  that verdict cannot change mid-session. A failed pull does NOT install the
+  coordinator — otherwise the turn-end push would run against a mount already
+  known to be broken. Cleared at attach and teardown so a pending retry can't
+  leak between threads on a pool agent.
+- `cockpit` — handles `workspace_sync.recovered`: clears `cloudSyncDegraded`,
+  dismisses the sticky toast **by its stored id** (rather than clearing every
+  toast on screen), and confirms with a success toast.
+- `cockpit` — a status-bar `Cloud sync off` badge bound to `cloudSyncDegraded`.
+  That signal previously rendered *nowhere*: the dismissible toast was the only
+  indication a session was running unsynced, so dismissing it erased all trace.
+
+Tests: `tests/test_cloud_sync_retry_after_degraded_attach.py` (9 cases) and a
+cockpit spec asserting the recovered frame clears the flag.
+
+### k3d verification
+
+Pinned a thread to the `opencloud` backend (not configured on k3d) with NULL
+handles so no target could resolve — the agent attached degraded, as intended.
+Live DOM on `https://localhost/`:
+
+```
+tone: danger
+backgroundColor: rgb(194, 178, 148)                          ← opaque --surface-2
+backgroundImage: linear-gradient(rgba(156,40,50,0.15), …)    ← tint as a LAYER
+badges: [gemma-4-moe, Turn 0, "Cloud sync off", Supervised, …]
+```
+
+Then made the target resolvable mid-session (backend back to `nextcloud`,
+handles restored, folder created) and sent one turn:
+
+```
+13:38:23  workspace_sync.error      (degraded attach)
+13:39:40  workspace_sync.recovered  {turn_id: 1}
+13:39:40  workspace_sync.pulling    {turn_id: 1}
+13:39:41  workspace_sync.pulled
+13:39:44  workspace_sync.pushing
+```
+
+Agent log: `Cloud workspace sync recovered on turn 1 (1 mount(s))`. Post-turn
+DOM: zero toasts, no `Cloud sync off` badge. A session that would have run
+unsynced for its whole life was fully syncing from its first turn.
+
+## Follow-up 2: draft-while-ended, send-to-resume (shipped)
+
+The whole composer block was removed from the DOM on `threadStatus === 'ended'`
+(an `@if` around `.composer-wrap`, not merely the `[disabled]` on the textarea —
+the disabled binding never got a chance to matter). The draft survived in
+`sessionStorage`, so text reappeared on resume, but during the outage it was
+unreachable: not editable, not even visible.
+
+Now the composer renders on an ended session and `canComposeDuringSession` gains
+two terms — `isEnded` (draft freely) and `isResuming` (don't blink out mid-send;
+`isStartingSession` tests `threadStatus !== 'ended'` and so goes false during the
+handover). **Typing never resumes.** Resume reserves an agent pod and a
+workspace, so it stays strictly send-triggered: `sendMessage` queues into the
+outbox as always, then branches to `resumeSession()` instead of `_flushOutbox()`,
+and the message rides the resume exactly like a landing-draft's first message
+rides thread creation — `connect()` preserves the outbox on a same-thread
+reconnect and `markSessionReady` flushes it. The placeholder says so
+(*"Type a message — sending resumes the session"*).
+
+The resume card stays, at the tail of the transcript directly above the composer,
+as the resume-without-typing path; only its body copy changed to stop implying
+the button is the only way back. `isResuming` moved from a component-local signal
+to the service, since a send-triggered resume has no click to hang a flag off.
+
+Known edge: the attach and mic buttons stay gated on `isConnected`, so on an
+ended session you can type but not attach — uploads genuinely need a live
+session. The card is the "resume first, then attach" path.
+
+Tests: 3 new `canComposeDuringSession` cases, plus service specs for
+send-on-ended (resume fired, `/input` NOT called, message left in the outbox)
+and for open-without-send (no `/resume`).
+
+### k3d verification
+
+On an ended session: composer present and enabled, placeholder correct, card
+present. Typed a full message — thread stayed `ended`, no `/resume` or
+`/prepare`, **zero session agent pods**. Pressed Enter:
+
+```
+POST /api/persistent/threads/490c07b8…/resume
+POST /api/sessions/490c07b8…/prepare
+PUT  /api/agents/threads/490c07b8…/status      ← agent attached
+POST /api/persistent/threads/490c07b8…/input   ← queued draft flushed
+```
+
+`thread_messages` then holds the drafted text as `human` with the agent's reply
+after it; composer back to its normal placeholder, input cleared, card gone.
+Full cockpit suite: 1661 passed.
+
 ## Still open
 
-1. **The agent can't recover from a degraded attach.** Any *other* cause (cloud
-   genuinely down at attach, a transient WebDAV failure) still pins
-   `workspace_sync = None` for the session's whole life. It should re-resolve
-   cloud config once at the next turn boundary, and the cockpit needs a matching
-   event to clear `cloudSyncDegraded` and dismiss the sticky toast.
-2. **The session folder is never shared to the user** (see above). Note the
-   create-path fix does *not* transfer: `ensure_user` cannot provision Nextcloud
-   accounts — each human must sign into the cloud once before any share can
-   land. So the recovery path is the share-only retry on a later resume, which
-   already exists; what's missing is surfacing "your cloud folder isn't shared
-   yet, sign in once" to the user instead of silently retrying forever.
+**The session folder is never shared to the user until they sign in once.**
+Confirmed root cause, and it is not fixable server-side: `NextcloudBackend.ensure_user`
+returns `resolve_user_identity(...)` with the docstring "Nextcloud's user_oidc
+app provisions on first login; no admin API." Verified on dev — after the owner
+signed into `cloud.srw.works`, the OIDC account appeared
+(`9edad2a0f55b…`, `backend: user_oidc`, matched by the email search the
+resolver uses), and the very next resume logged
+`Shared session folder 'sessions/00ae0977' with user '9edad2a0f55b…'` and
+persisted `main_cloud_share_handle`. The 214 threads still without a folder
+will get one, plus a share, on their next resume.
+
+What's missing is telling a *new* user that: today an unsigned-in owner gets a
+silent share-retry on every resume forever and an invisible cloud folder. Worth
+surfacing as "your cloud folder isn't shared yet — sign in once" rather than
+building anything server-side. Deferred until there are users beyond the owner.
 
 ## Related UI defects seen in the same report
 
@@ -214,11 +324,5 @@ on the thread; endpoint reports `cloud_sync_degraded: false`.
   opaque page background, where 20% alpha is fine — the toast is the one place it
   floats over arbitrary content and needs an opaque surface with the tint layered
   on top.
-- **Composer is disabled while a session is ended-but-resumable.**
-  `canComposeDuringSession` (`persistent-chat.component.ts:328`) returns
-  `isConnected || isStartingSession || isDraftSession`. An ended session is none of
-  those, so the `<textarea>` is `[disabled]` (`:1771`). The draft text survives (it
-  lives in the `inputText` model, which is why it reappears after resume) but
-  cannot be edited during the outage. The landing-draft state already supports
-  "type first, session starts on send" — the ended/resumable state should get the
-  same affordance.
+- **Composer is unusable while a session is ended-but-resumable.** FIXED,
+  k3d-verified — see "Follow-up 2" below.

@@ -1396,6 +1396,30 @@ describe('PersistentChatService — SSE event dispatch', () => {
         expect(service.cloudSyncDegraded()).toBe(true);
     });
 
+    it('clears cloudSyncDegraded when the agent recovers sync at a turn boundary', async () => {
+        // The agent retries the coordinator build each turn after a degraded
+        // attach (docs/issues/session_resume_cloud_sync_race_late_provision.md).
+        // Leaving the warning up after it succeeds would tell the user their
+        // edits aren't being saved when they are.
+        const {service, es} = await setup();
+        fireSseMessage(
+            es,
+            {
+                method: 'workspace_sync.error',
+                params: {op: 'provision', turn_id: 0, message: 'no target', degraded: true},
+            },
+            '1:1',
+        );
+        expect(service.cloudSyncDegraded()).toBe(true);
+
+        fireSseMessage(
+            es,
+            {method: 'workspace_sync.recovered', params: {turn_id: 1}},
+            '1:2',
+        );
+        expect(service.cloudSyncDegraded()).toBe(false);
+    });
+
     it('does NOT mark cloudSyncDegraded for a retryable per-turn workspace_sync.error', async () => {
         const {service, es} = await setup();
         fireSseMessage(
@@ -1962,6 +1986,51 @@ describe('PersistentChatService — REST sends', () => {
         expect(inputCalls).toHaveLength(0);
         expect(ctx.service.outbox().length).toBe(1);
         expect(ctx.service.outbox()[0].content).toBe('queued');
+    });
+
+    it('sendMessage on an ended thread resumes it and queues the message', async () => {
+        // Ended sessions keep the composer live so a draft can be written
+        // first. SENDING is what brings the agent back — the message rides
+        // the resume in the outbox and flushes on markSessionReady.
+        const ctx = createService();
+        ctx.mockHttp.get.mockImplementation(() =>
+            of({status: 'ended', total_turns: 0, messages: [], total: 0}),
+        );
+        await ctx.service.connect('thread-e');
+        ctx.service.threadStatus.set('ended');
+        ctx.mockHttp.post.mockClear();
+
+        await ctx.service.sendMessage('bring it back');
+
+        const resumeCalls = ctx.mockHttp.post.mock.calls.filter((c: any) =>
+            String(c[0]).endsWith('/persistent/threads/thread-e/resume'),
+        );
+        const inputCalls = ctx.mockHttp.post.mock.calls.filter((c: any) =>
+            String(c[0]).endsWith('/persistent/threads/thread-e/input'),
+        );
+        expect(resumeCalls).toHaveLength(1);
+        // Not sent yet — the agent isn't up. It waits in the outbox.
+        expect(inputCalls).toHaveLength(0);
+        expect(ctx.service.outbox().map((i) => i.content)).toEqual(['bring it back']);
+    });
+
+    it('opening an ended thread does NOT resume it — only a send does', async () => {
+        // Resume reserves an agent pod + workspace, so it must stay strictly
+        // send-triggered: merely opening the session (or typing, which reaches
+        // no service method — the component's onInputChange only writes the
+        // sessionStorage draft) leaves the thread ended.
+        const ctx = createService();
+        ctx.mockHttp.get.mockImplementation(() =>
+            of({status: 'ended', total_turns: 0, messages: [], total: 0}),
+        );
+        await ctx.service.connect('thread-t');
+        ctx.service.threadStatus.set('ended');
+
+        const resumeCalls = ctx.mockHttp.post.mock.calls.filter((c: any) =>
+            String(c[0]).endsWith('/resume'),
+        );
+        expect(resumeCalls).toHaveLength(0);
+        expect(ctx.service.isResuming()).toBe(false);
     });
 
     it('sendMessage on 409 conflict silently no-ops (server has the turn)', async () => {

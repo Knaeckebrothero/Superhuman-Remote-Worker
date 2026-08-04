@@ -437,8 +437,9 @@ def _explain_loop(loop: Dict[str, Any], jobs: List[Dict[str, Any]]) -> str:
 
     if status == "running":
         lines.append(
-            "Next action: inspect the current loop job(s) and project repository "
-            "before deciding whether the user should intervene."
+            "Next action: inspect the current loop job(s), structured delivery "
+            "records, and project cloud files before deciding whether the user "
+            "should intervene."
         )
     elif status == "paused":
         lines.append(
@@ -448,7 +449,7 @@ def _explain_loop(loop: Dict[str, Any], jobs: List[Dict[str, Any]]) -> str:
     elif status in {"failed", "stopped", "completed"}:
         lines.append(
             "Next action: review the terminal state, latest jobs, and project "
-            "repository output with the user."
+            "cloud output with the user."
         )
 
     if jobs:

@@ -1,10 +1,10 @@
 """Tests for the §6.6 terminal-transition side effects
 (docs/features/workspace_and_change_records.md).
 
-``apply_terminal_job_side_effects`` is the ONE function both terminal paths
-call — the ``/complete`` handler's 5d2 hook and ``approve_job`` — so an
-approved job and an autonomy-``full`` job that sealed itself leave identical
-traces on the project repo:
+``apply_terminal_job_side_effects`` is the ONE function both ordinary-job
+terminal paths call — the ``/complete`` handler's 5d2 hook and ``approve_job``.
+New isolated jobs write a structured database record; the curated project-repo
+merge below is retained only to characterize in-flight legacy branches:
 
 * a job carrying a FILE contract gets the §6.4 **curated merge** (contracted
   paths only, audit PR closed unmerged) + a change record;
@@ -95,14 +95,20 @@ class _FakeDB:
     LATER call can see it (that is what makes the double-merge backstop real
     across requests)."""
 
-    def __init__(self, job: dict) -> None:
+    def __init__(self, job: dict, *, project: dict | None = None) -> None:
         self.job = job
+        self.project = project
         self.merge_status_writes: list[str] = []
         self.status_writes: list[dict] = []
         self.executed: list[str] = []
+        self.records: list[dict] = []
+        self.context_writes: list[dict] = []
 
     async def get_job(self, job_id: str) -> dict:
         return self.job
+
+    async def get_project(self, project_id: str) -> dict | None:
+        return self.project
 
     async def update_job_merge_status(self, job_id, merge_status=None, **kw) -> bool:
         self.merge_status_writes.append(merge_status)
@@ -111,9 +117,26 @@ class _FakeDB:
 
     async def update_job_status(self, job_id, **kw) -> bool:
         self.status_writes.append(kw)
+        self.job.update(kw)
         return True
 
     async def update_job_cloud_diff(self, job_id, **kw) -> bool:
+        self.job.update(kw)
+        return True
+
+    async def merge_job_context(self, job_id, payload) -> bool:
+        self.context_writes.append(payload)
+        context = self.job.get("context") or {}
+        if not isinstance(context, dict):
+            context = {}
+        context.update(payload)
+        self.job["context"] = context
+        return True
+
+    async def create_job_change_record(self, **kwargs) -> bool:
+        if any(row["job_id"] == kwargs["job_id"] for row in self.records):
+            return False
+        self.records.append(kwargs)
         return True
 
     def acquire(self):
@@ -298,25 +321,21 @@ class TestApplyTerminalJobSideEffects:
         assert out["record_written"] is True
         assert out["actions"] == [
             "branch merge -> curated",
-            "job change record written to main",
+            "job change record written to database",
         ]
 
         commits = _commits(g)
-        assert len(commits) == 2
-        curated, record = commits
+        assert len(commits) == 1
+        curated = commits[0]
         # ONE commit onto main carrying ONLY the contracted deliverable.
         assert curated["branch"] == "main"
         assert curated["files"] == [(ON_BRANCH, "create")]
         assert curated["message"].startswith("curated merge: developer (abcdef12)")
-        # The record lands second, so it can name the merge it just made.
-        assert record["files"][0][0].endswith("-developer-abcdef12.md")
-        assert record["files"][0][0].startswith("retros/")
-
-        text = _record_text(g)
-        assert "merge_status: curated" in text
-        assert "merge_sha: c0ffee00" in text
-        assert f"branch: {BRANCH}" in text
-        assert "curated merge to main (c0ffee00)" in text
+        record = db.records[0]
+        assert record["delivery_status"] == "curated"
+        assert record["delivery_sha"] == "c0ffee00" * 5
+        assert record["branch_name"] == BRANCH
+        assert record["changes"][0]["action"] == "merge"
 
         # Never the full squash-merge; the audit PR closes UNMERGED.
         g.merge_pr.assert_not_called()
@@ -338,7 +357,7 @@ class TestApplyTerminalJobSideEffects:
         assert out["merge_status"] is None
         assert "no file contract" in out["merge_skipped_reason"]
         assert out["record_written"] is True
-        assert out["actions"] == ["job change record written to main"]
+        assert out["actions"] == ["job change record written to database"]
 
         # Branch untouched: nothing compared, no PR, no merge, no curation.
         g.get_compare.assert_not_called()
@@ -347,21 +366,17 @@ class TestApplyTerminalJobSideEffects:
         g.list_tree.assert_not_called()
         assert db.merge_status_writes == []
 
-        # Exactly one commit — the record — and it names the branch, so the
-        # work stays discoverable.
-        commits = _commits(g)
-        assert len(commits) == 1
-        assert commits[0]["files"][0][0].startswith("retros/")
-        text = _record_text(g)
-        assert f"branch: {BRANCH}" in text
-        assert "no merge step ran; work remains on the job branch" in text
+        assert _commits(g) == []
+        assert db.records[0]["branch_name"] == BRANCH
+        assert db.records[0]["delivery_status"] == "isolated"
 
     @pytest.mark.asyncio
     async def test_kb_only_contract_is_also_no_merge(self) -> None:
         job = _job(context={"required_deliverables": ["kb:findings"]})
         g = _make_gitea()
+        db = _FakeDB(job)
 
-        out = await apply_terminal_job_side_effects(job, "completed", gitea=g)
+        out = await apply_terminal_job_side_effects(job, "completed", gitea=g, db=db)
 
         assert out["merge_status"] is None
         g.get_compare.assert_not_called()
@@ -371,16 +386,17 @@ class TestApplyTerminalJobSideEffects:
     async def test_failed_job_records_but_does_not_merge(self) -> None:
         job = _job()
         g = _make_gitea()
+        db = _FakeDB(job)
 
         out = await apply_terminal_job_side_effects(
-            job, "failed", gitea=g, error="boom"
+            job, "failed", gitea=g, db=db, error="boom"
         )
 
         assert out["merge_status"] is None
         assert "not a successful completion" in out["merge_skipped_reason"]
         g.get_compare.assert_not_called()
         assert out["record_written"] is True
-        assert "## Error" in _record_text(g)
+        assert db.records[0]["error"] == "boom"
 
     @pytest.mark.asyncio
     async def test_non_terminal_status_does_nothing(self) -> None:
@@ -400,8 +416,9 @@ class TestApplyTerminalJobSideEffects:
     async def test_subjob_is_left_to_the_delegation_graft(self) -> None:
         job = _job(parent_job_id=uuid.uuid4(), branch_name="subjob/abcdef12/critic")
         g = _make_gitea()
+        db = _FakeDB(job)
 
-        out = await apply_terminal_job_side_effects(job, "completed", gitea=g)
+        out = await apply_terminal_job_side_effects(job, "completed", gitea=g, db=db)
 
         assert "subjob" in out["merge_skipped_reason"]
         g.get_compare.assert_not_called()
@@ -477,9 +494,9 @@ class TestBestEffort:
 
         assert out["merge_status"] == "merge-failed"
         assert out["record_written"] is True
-        assert "merge_status: merge-failed" in _record_text(g)
+        assert db.records[0]["delivery_status"] == "merge-failed"
         # Recorded, and NOT in the already-merged vocabulary — a re-run may
-        # still merge (mirrors _merge_and_retro_loop_job).
+        # still merge (legacy compatibility remains retryable).
         assert db.merge_status_writes == ["merge-failed"]
         should, _ = should_merge_job_contribution(job, "completed")
         assert should is True
@@ -488,18 +505,10 @@ class TestBestEffort:
     async def test_record_failure_does_not_raise(self) -> None:
         job = _job()
         g = _make_gitea()
-        # Kill the record write only (the curated commit already landed).
-        calls = {"n": 0}
+        db = _FakeDB(job)
+        db.create_job_change_record = AsyncMock(side_effect=RuntimeError("db down"))
 
-        async def _change_files(*a, **kw):
-            calls["n"] += 1
-            if calls["n"] == 1:
-                return True
-            raise RuntimeError("gitea down")
-
-        g.change_files = AsyncMock(side_effect=_change_files)
-
-        out = await apply_terminal_job_side_effects(job, "completed", gitea=g)
+        out = await apply_terminal_job_side_effects(job, "completed", gitea=g, db=db)
 
         assert out["merge_status"] == "curated"
         assert out["record_written"] is False
@@ -585,7 +594,8 @@ class TestApproveJobCallSite:
         assert result["status"] == "approved"
         messages = [c["message"] for c in _commits(g)]
         assert any(m.startswith("curated merge:") for m in messages)
-        assert any(m.startswith("job record:") for m in messages)
+        assert len(db.records) == 1
+        assert db.records[0]["record_type"] == "job_record"
         assert db.merge_status_writes == ["curated"]
 
     @pytest.mark.asyncio
@@ -620,7 +630,8 @@ class TestApproveJobCallSite:
 
         g.merge_pr.assert_not_called()
         g.create_pr.assert_not_called()
-        assert [c["message"].split(":")[0] for c in _commits(g)] == ["job record"]
+        assert _commits(g) == []
+        assert len(db.records) == 1
 
 
 class TestRejectStaysMergeFree:
@@ -637,6 +648,7 @@ class TestRejectStaysMergeFree:
             )
             stack.enter_context(patch("main.postgres_db", db))
             stack.enter_context(patch("main.gitea_client", g))
+            stack.enter_context(patch("main.vector_db", None))
             result = await main.reject_job_diff(MagicMock(), str(JOB_ID))
 
         assert result["diff_status"] == "rejected"
@@ -644,7 +656,212 @@ class TestRejectStaysMergeFree:
         g.create_pr.assert_not_called()
         g.merge_pr.assert_not_called()
         g.change_files.assert_not_called()
-        assert db.merge_status_writes == []
+        assert db.merge_status_writes == ["cloud-rejected"]
+        assert db.records[0]["delivery_status"] == "cloud-rejected"
+
+
+class TestLoopCloudCompletion:
+    @pytest.mark.asyncio
+    async def test_late_outage_callback_cannot_reopen_completed_loop_job(
+        self,
+    ) -> None:
+        completion_freeze = {
+            "status": "job_completed",
+            "notes": "Cloud delivery already completed.",
+        }
+        job = _job(
+            status="completed",
+            repo_name="job-abcdef12",
+            branch_name=None,
+            merge_status="cloud-applied",
+            diff_status="accepted",
+            freeze_data=completion_freeze,
+            context={
+                "loop_id": "105a6f98-134c-4077-b7e1-6d08916650d7",
+                "loop_role": "developer",
+                "loop_cloud_delivery": {
+                    "delivery_status": "cloud-applied",
+                    "needs_review": False,
+                },
+            },
+        )
+        db = _FakeDB(job)
+        body = main.JobCompleteRequest(
+            should_stop=True,
+            goal_achieved=False,
+            freeze_data={
+                "freeze_type": "llm_unavailable",
+                "next_retry_at": "2026-08-04T19:30:00+00:00",
+            },
+        )
+
+        with ExitStack() as stack:
+            _patch_complete(stack, job, _make_gitea(), db)
+            handled = await main.complete_job(MagicMock(), str(JOB_ID), body)
+
+        assert handled == {
+            "status": "handled",
+            "job_id": str(JOB_ID),
+            "new_status": "completed",
+            "actions": ["late callback ignored; job already completed"],
+        }
+        assert job["status"] == "completed"
+        assert job["freeze_data"] == completion_freeze
+        assert db.status_writes == []
+        assert db.executed == []
+
+    @pytest.mark.asyncio
+    async def test_late_outage_callback_cannot_bypass_loop_cloud_review(
+        self,
+    ) -> None:
+        completion_freeze = {
+            "status": "job_completed",
+            "notes": "The isolated diff is waiting for conflict review.",
+        }
+        job = _job(
+            status="pending_review",
+            repo_name="job-abcdef12",
+            branch_name=None,
+            merge_status="cloud-conflict",
+            diff_status="pending",
+            freeze_data=completion_freeze,
+            context={
+                "loop_id": "105a6f98-134c-4077-b7e1-6d08916650d7",
+                "loop_role": "developer",
+                "loop_cloud_delivery": {
+                    "delivery_status": "cloud-conflict",
+                    "needs_review": True,
+                },
+            },
+        )
+        db = _FakeDB(job)
+        body = main.JobCompleteRequest(
+            should_stop=True,
+            goal_achieved=False,
+            freeze_data={
+                "freeze_type": "llm_unavailable",
+                "next_retry_at": "2026-08-04T19:30:00+00:00",
+            },
+        )
+
+        with ExitStack() as stack:
+            _patch_complete(stack, job, _make_gitea(), db)
+            handled = await main.complete_job(MagicMock(), str(JOB_ID), body)
+
+        assert handled["new_status"] == "pending_review"
+        assert handled["actions"] == [
+            "late callback ignored; job already pending_review"
+        ]
+        assert job["status"] == "pending_review"
+        assert job["freeze_data"] == completion_freeze
+        assert db.status_writes == []
+        assert db.executed == []
+
+    @pytest.mark.asyncio
+    async def test_clean_loop_delivery_completes_and_advances(self) -> None:
+        job = _job(
+            status="processing",
+            repo_name="job-abcdef12",
+            branch_name=None,
+            cloud_diff_baseline_commit="a" * 40,
+            context={
+                "loop_id": "105a6f98-134c-4077-b7e1-6d08916650d7",
+                "loop_role": "developer",
+                "cloud_baseline": {"state": "ready", "entries": {}},
+            },
+        )
+        project = {
+            "id": PROJECT_ID,
+            "name": "Cloud Project",
+            "main_cloud_backend": "opencloud",
+            "main_cloud_folder_handle": "opaque",
+        }
+        db = _FakeDB(job, project=project)
+        gitea = _make_gitea()
+        body = main.JobCompleteRequest(
+            should_stop=True,
+            goal_achieved=True,
+            freeze_data=job["freeze_data"],
+        )
+        delivery_result = {
+            "delivery_status": "cloud-applied",
+            "needs_review": False,
+            "delivery_sha": "b" * 40,
+            "notes": [],
+            "applied": 1,
+            "deleted": 0,
+        }
+
+        with ExitStack() as stack:
+            _patch_complete(stack, job, gitea, db)
+            advance = stack.enter_context(
+                patch("main._advance_project_loop", new_callable=AsyncMock)
+            )
+            deliver = stack.enter_context(
+                patch(
+                    "services.job_cloud_baseline.deliver_loop_diff_to_cloud",
+                    AsyncMock(return_value=delivery_result),
+                )
+            )
+            handled = await main.complete_job(MagicMock(), str(JOB_ID), body)
+
+        assert handled["new_status"] == "completed"
+        assert job["merge_status"] == "cloud-applied"
+        assert job["context"]["loop_cloud_delivery"] == delivery_result
+        deliver.assert_awaited_once()
+        advance.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_loop_cloud_conflict_parks_without_advancing(self) -> None:
+        job = _job(
+            status="processing",
+            repo_name="job-abcdef12",
+            branch_name=None,
+            cloud_diff_baseline_commit="a" * 40,
+            context={
+                "loop_id": "105a6f98-134c-4077-b7e1-6d08916650d7",
+                "loop_role": "developer",
+                "cloud_baseline": {"state": "ready", "entries": {}},
+            },
+        )
+        project = {
+            "id": PROJECT_ID,
+            "name": "Cloud Project",
+            "main_cloud_backend": "opencloud",
+            "main_cloud_folder_handle": "opaque",
+        }
+        db = _FakeDB(job, project=project)
+        gitea = _make_gitea()
+        body = main.JobCompleteRequest(
+            should_stop=True,
+            goal_achieved=True,
+            freeze_data=job["freeze_data"],
+        )
+
+        with ExitStack() as stack:
+            _patch_complete(stack, job, gitea, db)
+            advance = stack.enter_context(
+                patch("main._advance_project_loop", new_callable=AsyncMock)
+            )
+            stack.enter_context(
+                patch(
+                    "services.job_cloud_baseline.deliver_loop_diff_to_cloud",
+                    AsyncMock(
+                        return_value={
+                            "delivery_status": "cloud-conflict",
+                            "needs_review": True,
+                            "delivery_sha": "b" * 40,
+                            "notes": ["cloud changed since baseline: report.md"],
+                        }
+                    ),
+                )
+            )
+            handled = await main.complete_job(MagicMock(), str(JOB_ID), body)
+
+        assert handled["new_status"] == "pending_review"
+        assert job["status"] == "pending_review"
+        assert job["merge_status"] == "cloud-conflict"
+        advance.assert_not_awaited()
 
 
 class TestBothPathsAgree:
@@ -658,32 +875,31 @@ class TestBothPathsAgree:
         run the identical PR ceremony — not merely "both ran"."""
         approve_job_row = _job()
         g_approve = _make_gitea()
+        db_approve = _FakeDB(approve_job_row)
         with ExitStack() as stack:
-            _patch_approve(
-                stack, approve_job_row, g_approve, _FakeDB(approve_job_row), tmp_path
-            )
+            _patch_approve(stack, approve_job_row, g_approve, db_approve, tmp_path)
             await main.approve_job(MagicMock(), str(JOB_ID), None)
 
         complete_job_row = _job(status="processing")
         g_complete = _make_gitea()
+        db_complete = _FakeDB(complete_job_row)
         body = main.JobCompleteRequest(
             should_stop=True,
             goal_achieved=True,
             freeze_data=complete_job_row["freeze_data"],
         )
         with ExitStack() as stack:
-            _patch_complete(
-                stack, complete_job_row, g_complete, _FakeDB(complete_job_row)
-            )
+            _patch_complete(stack, complete_job_row, g_complete, db_complete)
             handled = await main.complete_job(MagicMock(), str(JOB_ID), body)
 
         assert handled["new_status"] == "completed"
-        assert "job change record written to main" in handled["actions"]
+        assert "job change record written to database" in handled["actions"]
         assert "branch merge -> curated" in handled["actions"]
 
-        assert len(_commits(g_approve)) == 2  # not a vacuous comparison
+        assert len(_commits(g_approve)) == 1  # curated legacy compatibility merge
         assert _commits(g_approve) == _commits(g_complete)
         assert _ceremony(g_approve) == _ceremony(g_complete)
+        assert db_approve.records == db_complete.records
         assert approve_job_row["merge_status"] == complete_job_row["merge_status"]
         assert approve_job_row["merge_status"] == "curated"
 
@@ -691,25 +907,24 @@ class TestBothPathsAgree:
     async def test_both_paths_agree_for_a_job_with_no_contract(self, tmp_path) -> None:
         approve_job_row = _job(context={})
         g_approve = _make_gitea()
+        db_approve = _FakeDB(approve_job_row)
         with ExitStack() as stack:
-            _patch_approve(
-                stack, approve_job_row, g_approve, _FakeDB(approve_job_row), tmp_path
-            )
+            _patch_approve(stack, approve_job_row, g_approve, db_approve, tmp_path)
             await main.approve_job(MagicMock(), str(JOB_ID), None)
 
         complete_job_row = _job(status="processing", context={})
         g_complete = _make_gitea()
+        db_complete = _FakeDB(complete_job_row)
         body = main.JobCompleteRequest(
             should_stop=True,
             goal_achieved=True,
             freeze_data=complete_job_row["freeze_data"],
         )
         with ExitStack() as stack:
-            _patch_complete(
-                stack, complete_job_row, g_complete, _FakeDB(complete_job_row)
-            )
+            _patch_complete(stack, complete_job_row, g_complete, db_complete)
             await main.complete_job(MagicMock(), str(JOB_ID), body)
 
         assert _commits(g_approve) == _commits(g_complete)
-        assert len(_commits(g_approve)) == 1  # the record, nothing merged
+        assert len(_commits(g_approve)) == 0
+        assert db_approve.records == db_complete.records
         assert _ceremony(g_approve) == _ceremony(g_complete)

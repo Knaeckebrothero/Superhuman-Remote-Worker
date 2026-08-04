@@ -3,7 +3,8 @@
 Exercises PostgresDB.get_dispatchable_jobs against a real Postgres (test-
 containers) with the 0046 partial index applied, covering every WHERE branch:
 status gate, assigned-agent gate, freeze gate, cloud-baseline 'seeding' skip,
-the recursive ancestor-cascade guard, and the priority/created ordering.
+explicit failed-loop-baseline skip, legacy-loop compatibility, the recursive
+ancestor-cascade guard, and the priority/created ordering.
 
 This is a functional (result) assertion, not a plan assertion — the EXPLAIN
 before/after adoption proof is a separate one-shot artifact. Applying the
@@ -108,12 +109,32 @@ async def test_dispatchable_set_and_ordering(db):
     await _insert(
         db, 7, "created", context='{"cloud_baseline": {"state": "seeding"}}'
     )  # baseline still seeding
+    await _insert(
+        db,
+        8,
+        "created",
+        priority=4,
+        context='{"loop_id": "legacy-loop"}',
+    )  # legacy loop created before cloud baselines
+    await _insert(
+        db,
+        9,
+        "created",
+        context=('{"loop_id": "new-loop", "cloud_baseline": {"state": "failed"}}'),
+    )  # explicit new-loop baseline failure is fail-closed
+    await _insert(
+        db,
+        10,
+        "created",
+        priority=3,
+        context='{"cloud_baseline": {"state": "failed"}}',
+    )  # ordinary Mode A seed failure remains best-effort
 
     got = await db.get_dispatchable_jobs(limit=50)
     ids = [str(r["id"]) for r in got]
 
-    assert ids == [str(_u(2)), str(_u(1))], (
-        "only the two clean created/paused jobs, ordered priority DESC (10 before 5)"
+    assert ids == [str(_u(2)), str(_u(1)), str(_u(8)), str(_u(10))], (
+        "clean jobs and legacy/best-effort cases dispatch in priority order"
     )
 
 

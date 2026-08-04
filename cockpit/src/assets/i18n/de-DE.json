@@ -1136,8 +1136,8 @@
       "colStatus": "Status",
       "colDescription": "Beschreibung",
       "colConfig": "Konfiguration",
-      "colBranch": "Branch",
-      "colMerge": "Merge"
+      "colBranch": "Ausführungs-Repository",
+      "colMerge": "Zustellung"
     },
     "knowledge": {
       "totalLabel": "Gesamt",
@@ -1210,8 +1210,7 @@
     },
     "experts": {
       "loading": "Experten werden geladen...",
-      "emptyPrefix": "Noch keine Projekt-Experten. Fügen Sie Experten-Konfigurationen im",
-      "emptySuffix": "Verzeichnis des Jobs-Repos hinzu."
+      "emptyPrefix": "Diesem Projekt sind im Expertenkatalog noch keine Experten zugeordnet."
     },
     "members": {
       "selectUser": "Benutzer auswählen...",
@@ -1330,7 +1329,9 @@
       "turn": "Zug {{count}}",
       "agentQuiet": "Arbeitet — keine Ausgabe seit {{seconds}}s",
       "cloudChanges": "Cloud-Änderungen ({{count}})",
-      "cloudChangesTooltip": "Auf {{mount}} bereitgestellt · zuletzt {{stagedAt}} — zum Prüfen klicken"
+      "cloudChangesTooltip": "Auf {{mount}} bereitgestellt · zuletzt {{stagedAt}} — zum Prüfen klicken",
+      "cloudSyncOff": "Cloud-Sync aus",
+      "cloudSyncOffTooltip": "Die Cloud-Synchronisierung konnte für diese Sitzung nicht gestartet werden. Im Arbeitsbereich fehlen möglicherweise Dateien aus der Cloud, und Änderungen werden nicht zurückgespeichert."
     },
     "turn": {
       "collapsedEmpty": "Nur Werkzeugaufrufe",
@@ -1439,7 +1440,7 @@
     "ended": {
       "eyebrow": "Wiederaufnehmbar",
       "title": "Sitzung fortsetzen?",
-      "body": "Diese Sitzung ist beendet. Setze sie fort, um den Agenten wieder zu aktivieren und an der Stelle weiterzumachen, an der du aufgehört hast.",
+      "body": "Diese Sitzung ist beendet. Schreibe unten und sende, um den Agenten zurückzuholen und dort weiterzumachen, wo du aufgehört hast — oder nimm sie direkt wieder auf.",
       "endedAt": "Sitzung beendet {{ date }}",
       "resume": "Fortsetzen"
     },
@@ -1504,7 +1505,9 @@
       "reconnecting": "Getrennt — verbinde erneut…",
       "uploading": "Anhänge werden hochgeladen…",
       "default": "Nachricht eingeben... (Eingabe zum Senden, Umschalt+Eingabe für neue Zeile)",
-      "defaultMobile": "Nachricht eingeben..."
+      "defaultMobile": "Nachricht eingeben...",
+      "resuming": "Sitzung wird fortgesetzt…",
+      "endedSendResumes": "Nachricht schreiben — Senden setzt die Sitzung fort"
     },
     "composer": {
       "attach": "Anhängen",

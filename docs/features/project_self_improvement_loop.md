@@ -26,6 +26,12 @@ related:
 
 # Project Self-Improvement Loop
 
+> **Delivery update 2026-08-04:** Loop orchestration still uses the project KB
+> as its reasoning blackboard. Durable project files now hand off through the
+> project cloud folder; each loop member has an isolated execution repository
+> and terminal history is stored in PostgreSQL. See
+> [[project_jobs_repo_retirement]].
+
 > Turn the README's four-agent "self-improving loop" from a vision into a feature you can start from a project. A user creates a project, gives it a goal, attaches datasources, picks a model, sets a budget, and presses **Start**. The orchestrator then runs jobs **one at a time, continuously** — rotating Scholar → Critic → Execution — until the iteration count or deadline runs out. Agents coordinate through the **project knowledge base as a shared blackboard**. No human in the loop; you set the direction, the system iterates overnight.
 
 ## Status
