@@ -342,6 +342,13 @@ handoff items this series dropped.
    names by hand. Generalises past this register — any cockpit change whose
    evidence is "tests pass" has not tested its templates.
 
+   Live-gated on k3d as a non-admin, 6 checks:
+   [[expert_editor_resolved_toolset_gate_2026-08-04]]. The one that mattered was
+   whether a fragment can move the answer at all (it can: `browser_direct` on→off,
+   64→55 tools) — otherwise `base ⊕ fragment` would have been decoration. Also
+   confirmed there that the editor's explicit `config_name: "worker_base"` is
+   byte-identical to job create's `null`, so the two forms share one code path.
+
    By contrast the New Session form is now largely honest, which is worth
    recording because the two are usually lumped together:
    `views/session-create/session-create.component.ts:173,180` **does** pass

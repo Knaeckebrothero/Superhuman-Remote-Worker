@@ -248,7 +248,8 @@ Job create was the weakest surface: no server-computed view at all.
 > one that mattered most — an expert's toolset is what every job and session
 > built from it inherits — and it asks for `base ⊕ fragment` rather than by
 > `expert_id`, because an id layer underneath cannot express a key the author just
-> deleted. Detail in [[tool_configuration_deferred_findings]] §7.8.
+> deleted. Detail in [[tool_configuration_deferred_findings]] §7.8, live-gated on
+> k3d in [[expert_editor_resolved_toolset_gate_2026-08-04]].
 
 **Carried out of the run, not lost with it:** about forty findings triaged as
 *minor, deferred*, ten rulings settled at real cost, and three tickets that were
