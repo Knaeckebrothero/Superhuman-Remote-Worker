@@ -29259,6 +29259,16 @@ async def duplicate_expert(request: Request, expert_id: str) -> dict[str, Any]:
     # `_bundled_expert_bundle` and `_db_expert_to_bundle_src` build a fresh
     # dict, so assigning into `src` cannot corrupt a cache or the source row.
     src["config"] = _validate_expert_fragment(src.get("config") or {})
+    # Fifth of five expert-write routes. The other four call
+    # _enforce_expert_save right after validating theirs — this call is NOT
+    # optional here just because the row already existed: the kill switch is
+    # the point. Without it, a user can mint an owned DB expert by copying any
+    # VISIBLE expert (not necessarily their own) while the administrator has
+    # user_experts disabled. Full gate, not kill-switch-only: a config the
+    # copier's own grants don't cover is refused now (422 naming the grant)
+    # rather than accepted here and denied later at job dispatch for a
+    # fragment they never authored.
+    await _enforce_expert_save(request, src["config"], user=user)
     return await _create_forked_expert(src, str(user["id"]), suffix="copy")
 
 
