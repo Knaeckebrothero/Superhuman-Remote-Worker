@@ -184,6 +184,18 @@ async def _do_prepare(
     # agent is already bound, we still went through a "preparing" phase
     # before we got there.
     _emit("provisioning")
+
+    # Second attach path (the first is POST /resume's _reprovision): let any
+    # in-flight cloud session-folder provisioning land before an agent is
+    # bound, since the agent reads its cloud config within ~150ms of attach
+    # and never re-reads. Emitted "provisioning" already, so the cockpit's
+    # progress card covers the wait. Deliberately OUTSIDE the advisory lock —
+    # this can take seconds and the fresh pod's /register needs the same lock.
+    # docs/issues/session_resume_cloud_sync_race_late_provision.md
+    from main import _await_late_cloud_setup  # late import: avoid circular
+
+    await _await_late_cloud_setup(thread_id)
+
     needs_binding_wait = False
     try:
         async with db.thread_advisory_lock(thread_id):

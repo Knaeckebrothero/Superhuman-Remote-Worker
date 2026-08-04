@@ -14,7 +14,11 @@ from src.tools.research.papers import (
     _get_local_documents_dir,
     _transfer_to_workspace,
     _maybe_transfer,
+    _search_semantic_scholar,
     create_paper_tools,
+)
+from src.tools.research.utils.semantic_scholar_client import (
+    SemanticScholarProviderError,
 )
 from src.tools.research.utils.paper_types import (
     AccessStatus,
@@ -115,6 +119,24 @@ class TestSearchPapers:
             )
 
         assert "Semantic Scholar Results" in result
+
+    @pytest.mark.asyncio
+    async def test_semantic_scholar_auth_failure_is_actionable(self):
+        error = SemanticScholarProviderError(
+            "Semantic Scholar authentication failed (HTTP 403): rotate credential.",
+            category="authentication",
+            status_code=403,
+            retryable=False,
+        )
+        with patch(
+            "src.tools.research.utils.semantic_scholar_client.search_semantic_scholar",
+            new_callable=AsyncMock,
+            side_effect=error,
+        ):
+            result = await _search_semantic_scholar("test", 10)
+
+        assert "authentication failed (HTTP 403)" in result
+        assert "rotate credential" in result
 
     @pytest.mark.asyncio
     async def test_search_unknown_source(self, mock_tool_context):
@@ -328,6 +350,37 @@ class TestGetPaperInfo:
             result = await get_paper_info.ainvoke({"identifier": "1706.03762"})
 
         assert "Arxiv Paper" in result
+
+    @pytest.mark.asyncio
+    async def test_auth_failure_is_disclosed_while_arxiv_fallback_runs(
+        self, mock_tool_context
+    ):
+        tools = create_paper_tools(mock_tool_context)
+        get_paper_info = next(t for t in tools if t.name == "get_paper_info")
+        error = SemanticScholarProviderError(
+            "Semantic Scholar authentication failed (HTTP 403): rotate credential.",
+            category="authentication",
+            status_code=403,
+            retryable=False,
+        )
+
+        with (
+            patch(
+                "src.tools.research.papers._get_semantic_scholar_info",
+                new_callable=AsyncMock,
+                side_effect=error,
+            ),
+            patch(
+                "src.tools.research.papers._get_arxiv_info",
+                new_callable=AsyncMock,
+                return_value="Paper: Arxiv Paper\narXiv: 1706.03762",
+            ),
+        ):
+            result = await get_paper_info.ainvoke({"identifier": "1706.03762"})
+
+        assert "authentication failed (HTTP 403)" in result
+        assert "Using arXiv metadata fallback" in result
+        assert "Paper: Arxiv Paper" in result
 
     @pytest.mark.asyncio
     async def test_get_info_not_found(self, mock_tool_context):

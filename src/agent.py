@@ -4338,6 +4338,9 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
 
         # Embedding-path health (B4): degraded == dimension mismatch latched.
         from src.services.embedding_service import peek_embedding_service
+        from src.tools.research.utils.provider_health import (
+            get_paper_provider_health,
+        )
 
         emb_service = peek_embedding_service()
 
@@ -4359,4 +4362,11 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             "embedding": emb_service.health_snapshot()
             if emb_service is not None
             else None,
+            # Local arXiv compatibility plus the latest real Semantic Scholar
+            # result. This snapshot never triggers provider I/O and contains
+            # credential presence only, so heartbeat/status polling stays cheap
+            # and secret-free. Deployment acceptance can populate it with
+            # ``python -m src.tools.research.utils.provider_health`` inside the
+            # worker image.
+            "research_providers": get_paper_provider_health(),
         }

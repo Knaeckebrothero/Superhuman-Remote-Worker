@@ -23,6 +23,21 @@ def _install_fake_auth(monkeypatch, user_id: str = "u1") -> None:
     monkeypatch.setattr(sessions_mod, "require_approved_user", _fake, raising=True)
 
 
+def _fake_main() -> MagicMock:
+    """Stub for the ``main`` module the router pulls in via late imports.
+
+    Pre-seeds the coroutine functions those imports resolve to — a bare
+    MagicMock attribute raises ``TypeError: 'MagicMock' object can't be
+    awaited`` at the await site.
+    """
+    m = MagicMock()
+    # Attach gate: lets in-flight cloud session-folder provisioning land
+    # before an agent binds (docs/issues/
+    # session_resume_cloud_sync_race_late_provision.md).
+    m._await_late_cloud_setup = AsyncMock(return_value=None)
+    return m
+
+
 @pytest.fixture
 def app(monkeypatch):
     """Minimal FastAPI app with the sessions router mounted."""
@@ -139,7 +154,7 @@ async def test_do_prepare_emits_phases_for_warm_thread(monkeypatch):
     # Mock session_router on main.
     import sys
 
-    fake_main = MagicMock()
+    fake_main = _fake_main()
     fake_main.session_router = AsyncMock()
     fake_main.session_router.ensure_route = AsyncMock(return_value="/p/t1")
     monkeypatch.setitem(sys.modules, "main", fake_main)
@@ -212,7 +227,7 @@ async def test_do_prepare_emits_failed_when_pod_not_ready(monkeypatch):
 
     import sys
 
-    fake_main = MagicMock()
+    fake_main = _fake_main()
     fake_main.session_router = AsyncMock()
     fake_main.session_router.ensure_route = AsyncMock()
     monkeypatch.setitem(sys.modules, "main", fake_main)
@@ -296,7 +311,7 @@ async def test_do_prepare_waits_when_agent_pod_marker_in_flight(monkeypatch):
 
     import sys
 
-    fake_main = MagicMock()
+    fake_main = _fake_main()
     fake_main.session_router = AsyncMock()
     fake_main.session_router.ensure_route = AsyncMock(return_value="/p/t1")
     fake_main.ensure_session_workspace = AsyncMock(return_value=None)
@@ -383,7 +398,7 @@ async def test_do_prepare_reconciles_workspace_on_cold_start(monkeypatch):
 
     import sys
 
-    fake_main = MagicMock()
+    fake_main = _fake_main()
     fake_main.session_router = AsyncMock()
     fake_main.session_router.ensure_route = AsyncMock(return_value="/p/t1")
     fake_main.ensure_session_workspace = AsyncMock(return_value=None)
@@ -404,6 +419,101 @@ async def test_do_prepare_reconciles_workspace_on_cold_start(monkeypatch):
 
     fake_main.ensure_session_workspace.assert_called_once()
     assert fake_main.ensure_session_workspace.call_args.args[0] == "t1"
+
+
+@pytest.mark.asyncio
+async def test_do_prepare_waits_for_cloud_folder_before_binding_an_agent(monkeypatch):
+    """/prepare is the second attach path (POST /resume's _reprovision is the
+    first). The agent reads its cloud config within ~150ms of attach and never
+    re-reads, so binding ahead of in-flight session-folder provisioning leaves
+    the session with workspace_sync=None for its whole life. Ordering — gate
+    first, THEN provision — is the contract.
+    docs/issues/session_resume_cloud_sync_race_late_provision.md
+    """
+    from orchestrator.routers import sessions as sessions_mod
+
+    calls: list[str] = []
+
+    db = AsyncMock()
+    db.get_thread = AsyncMock(
+        side_effect=[
+            {
+                "id": "t1",
+                "user_id": "u1",
+                "agent_id": None,
+                "config_name": "persistent_defaults",
+                "metadata": {},
+            },
+            {
+                "id": "t1",
+                "user_id": "u1",
+                "agent_id": "agent-xyz",
+                "config_name": "persistent_defaults",
+            },
+        ]
+    )
+    db.get_agent.return_value = {
+        "id": "agent-xyz",
+        "pod_ip": "10.0.0.5",
+        "pod_port": 8001,
+        "hostname": "srw-agent-s-new",
+        "pod_uid": "uid-1",
+    }
+    lock_cm = AsyncMock()
+
+    async def _enter_lock():
+        calls.append("lock_enter")
+
+    lock_cm.__aenter__.side_effect = _enter_lock
+    lock_cm.__aexit__.return_value = False
+    db.thread_advisory_lock = MagicMock(return_value=lock_cm)
+    monkeypatch.setattr(sessions_mod, "_get_db", lambda: db, raising=False)
+
+    async def _provision(**kwargs):
+        calls.append("provision")
+
+    monkeypatch.setattr(
+        sessions_mod, "_provision_agent_for_thread", _provision, raising=True
+    )
+
+    async def _bound(*a, **k):
+        return True
+
+    async def _ready_ok(pod_ip, pod_port, timeout_s):
+        return True
+
+    monkeypatch.setattr(sessions_mod, "wait_for_binding", _bound, raising=True)
+    monkeypatch.setattr(sessions_mod, "wait_for_ready", _ready_ok, raising=True)
+
+    import sys
+
+    async def _gate(thread_id):
+        calls.append("cloud_gate")
+
+    fake_main = _fake_main()
+    fake_main._await_late_cloud_setup = _gate
+    fake_main.session_router = AsyncMock()
+    fake_main.session_router.ensure_route = AsyncMock(return_value="/p/t1")
+    fake_main.ensure_session_workspace = AsyncMock(return_value=None)
+    fake_main._session_grant_violations = AsyncMock(return_value=[])
+    fake_main._session_endpoint_violations = AsyncMock(return_value=[])
+    monkeypatch.setitem(sys.modules, "main", fake_main)
+
+    monkeypatch.setattr(
+        sessions_mod, "lifecycle_emit", lambda *a, **k: None, raising=True
+    )
+
+    await sessions_mod._do_prepare(
+        thread_id="t1",
+        user_id="u1",
+        config_name="persistent_defaults",
+        config_override=None,
+    )
+
+    # Gate first, and OUTSIDE the advisory lock — holding it across the wait
+    # would stall the fresh pod's own POST /api/agents/register, which takes
+    # that same lock.
+    assert calls == ["cloud_gate", "lock_enter", "provision"]
 
 
 @pytest.mark.asyncio
@@ -437,7 +547,7 @@ async def test_do_prepare_grant_denied_fails_fast_without_provisioning(monkeypat
 
     import sys
 
-    fake_main = MagicMock()
+    fake_main = _fake_main()
     fake_main._session_grant_violations = AsyncMock(
         return_value=["permission_mode: 'autonomous' exceeds the ceiling"]
     )
@@ -515,7 +625,7 @@ def test_connection_returns_ws_url_and_token_when_ready(monkeypatch):
     test_tokens = SessionTokenService(secret="test-secret-do-not-use", ttl_seconds=60)
     import sys
 
-    fake_main = MagicMock()
+    fake_main = _fake_main()
     fake_main.session_tokens = test_tokens
     fake_main.session_router = MagicMock()
     fake_main.session_router.ensure_route = AsyncMock(return_value="/p/t1")

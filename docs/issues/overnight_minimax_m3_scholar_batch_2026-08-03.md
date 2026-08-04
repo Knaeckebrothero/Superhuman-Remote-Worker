@@ -35,8 +35,10 @@ but non-blocking behaviors:
 
 - `delegation.enabled=false` still does not remove `spawn_subagent` from the
   model tool surface;
-- the deployed paper adapters are broken (`arxiv==4.0.0` API mismatch and
+- the deployed paper adapters were broken (`arxiv==4.0.0` API mismatch and
   Semantic Scholar HTTP 403), although the Scholar recovered through web search;
+  the source repair is now implemented, while deployment and the external
+  Semantic Scholar credential rotation remain;
 - the connector still publishes the stale MCP creation/file-reader schema;
 - the phase-transition review prompt caused two completed reports to spend
   another 53 and 62 parent LLM rounds reconciling already-successful evidence;
@@ -322,8 +324,70 @@ The paper Scholar recognized the provider failures, recorded them, switched to
 `web_search`/`extract_webpage` against arXiv pages, and produced a 20-paper-link
 report. Its methodology note discloses the fallback and reduced confidence.
 That is good agent recovery, but it does not make the paper tools healthy.
-Updating the arXiv adapter to `Client.results(search)` and resolving the Semantic
-Scholar authorization/rate-policy failure remain functional priorities.
+The source adapter is now updated as described below; deployment plus Semantic
+Scholar credential replacement and acceptance remain functional priorities.
+
+#### Paper-provider remediation implemented 2026-08-04
+
+The two failures are independent, and the source-side repair is now in this
+checkout:
+
+- `src/tools/research/utils/arxiv_client.py` owns one reusable
+  `arxiv.Client(delay_seconds=...)` and calls `Client.results(search)` for
+  search, metadata lookup, and download. `requirements.txt` now constrains the
+  reviewed contract to `arxiv>=2.1.0,<5.0.0`.
+- The arXiv unit tests no longer invent `Search.results()` on a `MagicMock`.
+  They assert calls through `Client.results(search)` and include a contract test
+  against the actually installed package. An isolated `arxiv==4.0.0` runtime
+  then completed a real one-result arXiv search through the repaired wrapper.
+- `src/tools/research/utils/semantic_scholar_client.py` is now the single
+  Semantic Scholar transport for both direct paper tools and the combined
+  research workflow. It classifies 401/403 as non-retryable authentication,
+  429 as throttling, connection failures separately, and provider 5xx responses
+  as retryable availability errors. It never includes a credential or raw
+  provider body in its agent-facing error.
+- `get_paper_info` no longer translates every Semantic Scholar HTTP error into
+  “not found.” It discloses the provider failure and still uses arXiv metadata
+  for arXiv identifiers. `research_topic` likewise includes provider warnings
+  while preserving results from the healthy provider.
+- Cached, secret-free paper-provider state is exposed on agent status. The
+  actual worker image has an explicit acceptance probe:
+
+  ```bash
+  python -m src.tools.research.utils.provider_health
+  ```
+
+  This is intentionally not a Kubernetes liveness dependency: paper providers
+  are optional and the web fallback must remain available during an external
+  outage. The command exits non-zero unless the installed arXiv contract and a
+  real low-payload Semantic Scholar handshake both pass.
+
+The live credential diagnosis is now narrower than “authorization/rate-policy
+failure.” A current main-cluster agent has a non-empty
+`SEMANTIC_SCHOLAR_API_KEY`; it has no surrounding whitespace or quotes. The
+configured-key request returns HTTP 403 with a generic forbidden response. The
+same request without the header reaches the provider but returns HTTP 429 from
+the shared anonymous pool. Therefore DNS, egress, endpoint selection, and header
+wiring work; the configured credential is rejected, revoked, suspended, or no
+longer authorized. The exact provider-side reason cannot be recovered from the
+generic response.
+
+The Kubernetes Secret is owned by External Secrets and synced from
+`homelab/superhuman-remote-worker/srw-secrets` in Vault. No replacement key is
+available in this checkout, and generating one requires the Semantic Scholar
+account/email workflow. Completion therefore requires an operator to:
+
+1. obtain a new Semantic Scholar API key and replace only the
+   `SEMANTIC_SCHOLAR_API_KEY` property through the approved Vault workflow;
+2. force the `srw` ExternalSecret to refresh rather than waiting for its hourly
+   interval;
+3. drain/recreate the agent pods, because Secret-backed environment variables
+   do not change in already-running containers; and
+4. run the worker-image probe above in a newly created agent before the next
+   paper-job acceptance run.
+
+The code-side focused gate is 129 passing tests across the arXiv client,
+Semantic Scholar transport/probe, paper/workflow tools, and worker API surface.
 
 ### Deliverable quality and citation traceability
 
@@ -472,9 +536,10 @@ Correctness-first recovery has crossed an important line: ordinary main-cluster
 Scholar jobs can now start, research, write, commit, push, and complete. The next
 work should stay separated by consequence:
 
-1. **Functional contract:** enforce `delegation.enabled=false`; repair arXiv and
-   Semantic Scholar; refresh the MCP deployment/schema and rerun one job with a
-   real server-side `required_deliverables` value.
+1. **Functional contract:** enforce `delegation.enabled=false`; deploy the
+   paper-provider source repair and rotate/probe the Semantic Scholar key;
+   refresh the MCP deployment/schema and rerun one job with a real server-side
+   `required_deliverables` value.
 2. **Shared context and evidence:** remove project-memory write-on-read
    deadlocks/per-consumer TTL corruption; split embedding batches; make citation
    traceability and source-index coverage machine-checkable; keep phase tags
