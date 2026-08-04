@@ -1492,3 +1492,145 @@ class TestExpertWriteBoundary:
         )
         config.pop("$extends", None)
         validate_tool_override_fragment(config)
+
+    # -------------------------------------------------------------------------
+    # The kill switch, pinned across the class rather than the instance
+    # -------------------------------------------------------------------------
+    #
+    # docs/issues/duplicate_expert_bypasses_user_experts_kill_switch.md: five
+    # routes write an expert, and until now `duplicate` was the only one with
+    # no save-time gate at all — an administrator's `user_experts` switch did
+    # not hold there. But the issue doc's own "Verification owed" section is
+    # explicit that no test asserted a 403 from ANY of the five while the
+    # switch was off, so the four that already called `_enforce_expert_save`
+    # were unpinned too. `kill_switch_env` is deliberately the mirror image of
+    # `expert_env` above: that fixture stubs `_enforce_expert_save` out so its
+    # tests see the shape gate alone; this one leaves it REAL, because the
+    # kill switch inside it is exactly what is under test here.
+
+    @pytest.fixture
+    def kill_switch_env(self, monkeypatch):
+        import orchestrator.main as main
+
+        db = SimpleNamespace(
+            create_expert=AsyncMock(return_value={"id": "e1"}),
+            update_expert=AsyncMock(return_value={"id": "e1"}),
+            get_expert_by_id=AsyncMock(
+                return_value={
+                    "id": "e1",
+                    "owner_id": SESSION_USER_ID,
+                    "expert_type": "session",
+                    "name": "helper",
+                    "display_name": "Helper",
+                    "icon": "smart_toy",
+                    "color": "#6B7280",
+                    "managed_key": None,
+                }
+            ),
+            get_expert_visible_by_id=AsyncMock(
+                return_value={
+                    "id": "e2",
+                    "owner_id": str(uuid.uuid4()),
+                    "expert_type": "session",
+                    "name": "shared",
+                    "display_name": "Shared",
+                    "icon": "smart_toy",
+                    "color": "#6B7280",
+                    "config": {},  # clean: a shape 400 must not mask the 403
+                }
+            ),
+            fork_and_set_user_expert_default=AsyncMock(return_value={"id": "e3"}),
+        )
+        monkeypatch.setattr(main, "postgres_db", db)
+        monkeypatch.setattr(
+            main,
+            "require_approved_user",
+            AsyncMock(return_value={"id": SESSION_USER_ID, "is_admin": False}),
+        )
+        monkeypatch.setattr(
+            main, "user_visible_project_ids", AsyncMock(return_value=[])
+        )
+        monkeypatch.setattr(
+            main, "personal_defaults_allowed", AsyncMock(return_value=True)
+        )
+        return main, db
+
+    #: The exact detail `_enforce_expert_save` raises on the kill-switch
+    #: branch. Asserting this (not just the status code) matters because
+    #: `fork_my_expert_default` has its OWN unrelated 403
+    #: ("...disabled personal default experts") a step earlier in that same
+    #: route — a status-code-only assertion could not tell the two apart.
+    KILL_SWITCH_DETAIL = "User-defined experts are disabled by the administrator"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "route_id",
+        [
+            "POST /api/experts",
+            "PUT /api/experts/{id}",
+            "POST /api/experts/import",
+            "POST /api/expert-defaults/{expert_type}/fork",
+            "POST /api/experts/{id}/duplicate",
+        ],
+    )
+    async def test_kill_switch_403s_every_write_route(
+        self, kill_switch_env, monkeypatch, route_id
+    ):
+        """One parametrised test over all five expert-write routes. Note the
+        fourth id: the issue doc and the plan both call this route
+        `POST /api/experts/{id}/fork-default`, but the actual decorator is
+        `@app.post("/api/expert-defaults/{expert_type}/fork")`
+        (`fork_my_expert_default`) — the id below names the real route so a
+        failure points somewhere that greps."""
+        main, db = kill_switch_env
+        monkeypatch.setattr(
+            main, "_user_experts_enabled", AsyncMock(return_value=False)
+        )
+        existing_id = str(uuid.uuid4())
+
+        if route_id == "POST /api/expert-defaults/{expert_type}/fork":
+            # Bypass the real resolve_root_expert (it needs a fuller DB double
+            # than this fixture provides) the same way
+            # test_fork_of_a_personal_default_rejects_a_smuggle does above.
+            selection = SimpleNamespace(
+                expert={
+                    "name": "shared",
+                    "display_name": "Shared",
+                    "expert_type": "session",
+                    "icon": "smart_toy",
+                    "color": "#6B7280",
+                    "config": {},
+                }
+            )
+            monkeypatch.setattr(
+                main, "resolve_root_expert", AsyncMock(return_value=selection)
+            )
+
+        calls = {
+            "POST /api/experts": lambda: main.create_expert(
+                MagicMock(), self._create_body(main, {})
+            ),
+            "PUT /api/experts/{id}": lambda: main.update_expert(
+                MagicMock(), existing_id, main.ExpertUpdate()
+            ),
+            "POST /api/experts/import": lambda: main.import_expert(
+                MagicMock(), self._create_body(main, {})
+            ),
+            "POST /api/expert-defaults/{expert_type}/fork": (
+                lambda: main.fork_my_expert_default(
+                    MagicMock(), "session", main.ExpertDefaultForkRequest()
+                )
+            ),
+            "POST /api/experts/{id}/duplicate": lambda: main.duplicate_expert(
+                MagicMock(), existing_id
+            ),
+        }
+
+        with pytest.raises(main.HTTPException) as exc:
+            await calls[route_id]()
+
+        assert exc.value.status_code == 403
+        assert exc.value.detail == self.KILL_SWITCH_DETAIL
+        db.create_expert.assert_not_awaited()
+        db.update_expert.assert_not_awaited()
+        db.fork_and_set_user_expert_default.assert_not_awaited()

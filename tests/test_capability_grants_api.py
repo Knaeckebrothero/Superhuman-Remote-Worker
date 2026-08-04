@@ -1,9 +1,24 @@
 """Contract tests for the orchestrator capability-grants glue (Slice 2): the
 save-time and dispatch PEP helpers in orchestrator/main.py, exercised against a
 mocked postgres_db. The pure PDP is covered in test_capability_grants.py.
+
+One route-level test lives here too
+(``test_duplicate_expert_denies_a_grant_the_source_config_requires``): the
+grants half of docs/issues/duplicate_expert_bypasses_user_experts_kill_switch.md.
+It calls the actual ``duplicate_expert`` endpoint rather than a bare helper —
+a deliberate exception to this file's usual grain — because the defect it
+pins is a *wiring* gap (the route never called the save-time PEP at all), which
+a helper-level call cannot observe. It is not in
+tests/test_tool_override_boundary.py::TestExpertWriteBoundary alongside the
+kill-switch half of the same fix: that module's docstring is explicit that its
+validator is "NOT an authorization gate" and that capability grants are a
+separate PDP pinned elsewhere, and its ``expert_env`` fixture stubs
+``_enforce_expert_save`` out specifically so those tests see the shape gate in
+isolation. This file, not that one, is the PDP's home.
 """
 
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
+from uuid import uuid4
 
 import pytest
 from fastapi import HTTPException
@@ -246,3 +261,104 @@ async def test_enforce_job_create_grants_skips_userless_and_empty(monkeypatch):
     )
     await m._enforce_job_create_grants(None, user_id=_UID, project_ids=[])
     await m._enforce_job_create_grants({}, user_id=_UID, project_ids=[])
+
+
+@pytest.mark.asyncio
+async def test_duplicate_expert_denies_a_grant_the_source_config_requires(monkeypatch):
+    """The grants half of the fifth expert-write route
+    (docs/issues/duplicate_expert_bypasses_user_experts_kill_switch.md). The
+    kill-switch half is pinned, parametrised over all five write routes, in
+    tests/test_tool_override_boundary.py::TestExpertWriteBoundary
+    (``test_kill_switch_403s_every_write_route``); this is `duplicate`
+    specifically, because it is the one route that forks a config someone
+    else authored — visibility, not ownership, is the read check, so the
+    source row's `tools.shell` grant requirement is never the copier's own to
+    have satisfied.
+
+    Both assertions matter: a 422 alone would pass if `_create_forked_expert`
+    ran first and the row merely got created anyway.
+    """
+    source_row = {
+        "id": str(uuid4()),
+        "owner_id": str(uuid4()),  # someone else's row; visible, not owned
+        "expert_type": "session",
+        "name": "shared",
+        "display_name": "Shared",
+        "icon": "smart_toy",
+        "color": "#6B7280",
+        # A real, correctly-categorised (shape-valid) shell tool list — not a
+        # smuggle — that the copier's own grants do not cover: shell_tools
+        # defaults to deny in the CATALOG.
+        "config": {"tools": {"shell": ["run_command"]}},
+    }
+    fake = AsyncMock()
+    fake.get_expert_visible_by_id = AsyncMock(return_value=source_row)
+    fake.list_grants_for_scopes = AsyncMock(
+        return_value={"user": [], "project": [], "global": []}
+    )
+    monkeypatch.setattr(m, "postgres_db", fake)
+
+    non_admin_user = {"id": _UID, "is_admin": False}
+    monkeypatch.setattr(
+        m, "require_approved_user", AsyncMock(return_value=non_admin_user)
+    )
+    monkeypatch.setattr(m, "user_visible_project_ids", AsyncMock(return_value=[]))
+    # Kill switch ON: this test isolates the grants half, not the switch.
+    monkeypatch.setattr(m, "_user_experts_enabled", AsyncMock(return_value=True))
+
+    with pytest.raises(HTTPException) as ei:
+        await m.duplicate_expert(MagicMock(), str(uuid4()))
+
+    assert ei.value.status_code == 422
+    assert "shell_tools" in ei.value.detail
+    fake.create_expert.assert_not_awaited()
+    # Non-admin path proof (the free-admin-bypass trap this task's plan calls
+    # out, tool_configuration_deferred_findings §4.1): is_admin is explicit
+    # False above, and _enforce_save_grants returns immediately for an admin
+    # WITHOUT touching the DB — so an awaited grants lookup is direct evidence
+    # this ran the non-admin branch rather than a Mock truthy-bypass quietly
+    # making the assertions above vacuous.
+    assert non_admin_user["is_admin"] is False
+    fake.list_grants_for_scopes.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_duplicate_expert_still_forks_when_the_gate_allows(monkeypatch):
+    """The new call is a gate, not a detour. Neither denial test above can
+    show the added line leaves the working case alone — one exercises the
+    switch, the other the grants 422 — so this pins the third outcome: a
+    copier who clears the kill switch and holds every grant the source needs
+    still gets the forked row back. Also guards the specific instruction to
+    pass `src["config"]` (not `src.get("config") or {}`): a typo'd name here
+    would raise before `_create_forked_expert` ever ran.
+    """
+    source_row = {
+        "id": str(uuid4()),
+        "owner_id": str(uuid4()),  # visible, still not the copier's own row
+        "expert_type": "session",
+        "name": "shared",
+        "display_name": "Shared",
+        "icon": "smart_toy",
+        "color": "#6B7280",
+        "config": {"llm": {"model": "gemma-4-moe"}},  # nothing grant-gated
+    }
+    forked_row = {"id": str(uuid4()), "name": "shared-copy"}
+    fake = AsyncMock()
+    fake.get_expert_visible_by_id = AsyncMock(return_value=source_row)
+    fake.list_grants_for_scopes = AsyncMock(
+        return_value={"user": [], "project": [], "global": []}
+    )
+    fake.create_expert = AsyncMock(return_value=forked_row)
+    monkeypatch.setattr(m, "postgres_db", fake)
+    monkeypatch.setattr(
+        m,
+        "require_approved_user",
+        AsyncMock(return_value={"id": _UID, "is_admin": False}),
+    )
+    monkeypatch.setattr(m, "user_visible_project_ids", AsyncMock(return_value=[]))
+    monkeypatch.setattr(m, "_user_experts_enabled", AsyncMock(return_value=True))
+
+    result = await m.duplicate_expert(MagicMock(), str(uuid4()))
+
+    assert result == forked_row
+    fake.create_expert.assert_awaited_once()
