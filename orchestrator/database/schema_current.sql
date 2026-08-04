@@ -417,6 +417,24 @@ COMMENT ON COLUMN public.automations.expert_id IS 'Pinned DB-backed worker exper
 
 
 --
+-- Name: bench_runs; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.bench_runs (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    name text NOT NULL,
+    status text DEFAULT 'running'::text NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    created_by uuid NOT NULL,
+    spec jsonb NOT NULL,
+    state jsonb DEFAULT '[]'::jsonb NOT NULL,
+    CONSTRAINT bench_runs_spec_check CHECK ((jsonb_typeof(spec) = 'object'::text)),
+    CONSTRAINT bench_runs_state_check CHECK ((jsonb_typeof(state) = 'array'::text)),
+    CONSTRAINT bench_runs_status_check CHECK ((status = ANY (ARRAY['running'::text, 'paused'::text, 'done'::text, 'cancelled'::text])))
+);
+
+
+--
 -- Name: canvas_origin_sessions; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -2445,6 +2463,14 @@ ALTER TABLE ONLY public.automations
 
 
 --
+-- Name: bench_runs bench_runs_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.bench_runs
+    ADD CONSTRAINT bench_runs_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: canvas_origin_sessions canvas_origin_sessions_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -4057,6 +4083,14 @@ ALTER TABLE ONLY public.automations
 
 ALTER TABLE ONLY public.automations
     ADD CONSTRAINT automations_project_id_fkey FOREIGN KEY (project_id) REFERENCES public.projects(id) ON DELETE CASCADE;
+
+
+--
+-- Name: bench_runs bench_runs_created_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.bench_runs
+    ADD CONSTRAINT bench_runs_created_by_fkey FOREIGN KEY (created_by) REFERENCES public.users(id) ON DELETE CASCADE;
 
 
 --
