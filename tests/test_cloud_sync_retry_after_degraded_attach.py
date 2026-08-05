@@ -7,7 +7,7 @@ by ``if _session.workspace_sync:`` and nothing ever rebuilt it, the session
 ran unsynced for its WHOLE life. ``_retry_cloud_sync_start`` re-resolves once
 per turn boundary so that becomes a late start instead of a total loss.
 
-docs/issues/session_resume_cloud_sync_race_late_provision.md
+docs/done/session_resume_cloud_sync_race_late_provision.md
 """
 
 from unittest.mock import AsyncMock, MagicMock, patch

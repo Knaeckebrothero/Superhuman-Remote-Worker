@@ -27,6 +27,26 @@
 > the only session PVC is the vestigial `pvc-persistent-*` describe the
 > **2026-06-10 architecture, not the current one**. Corrections are marked inline.
 
+> **UPDATE 2026-08-05 — shipped and live on dev.** Committed in `52c1ba80`,
+> deployed, and verified on the dev cluster: `pvc-ws-thread-*` and
+> `pvc-agent-s-*` claims are `Bound` for live threads. Full suite green (13 480
+> passed; the 11 failures are the 8 known local-env baseline plus 3 unrelated
+> in-flight research tests). Also fixed in the same change: `restore` no longer
+> extracts the S3 tarball over a reattached volume (it compared
+> `_workspace_binding.backing_id` before/after provisioning), and
+> `_extract_snapshot` returns `bool` so a failed restore stops reporting `ready`.
+>
+> **This does NOT mean session workspace content is safe yet.** The agent still
+> runs `rm -rf` + `git clone` on every attach
+> (`src/core/workspace.py:496-508`, reached unconditionally from
+> `src/api/persistent_session.py:552`), so it now empties a *durable* volume.
+> That is tracked as an open bug —
+> [`session_workspace_wiped_by_agent_clone_on_attach.md`](../issues/session_workspace_wiped_by_agent_clone_on_attach.md)
+> — and must be fixed before session durability can be claimed.
+>
+> Branches (b) durable VMs and (c) snapshot-hardening remain unbuilt, so this
+> brief stays in `features/` rather than `done/`.
+
 Design brief — **substantially revised 2026-06-10** after verifying the live
 architecture against code and the dev cluster. The original framing ("migrate
 workspace pods to PVCs") was too narrow and rested on a wrong assumption (that

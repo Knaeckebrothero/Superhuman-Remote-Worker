@@ -26,8 +26,32 @@ homelab soak** (ns `superhuman-remote-worker`, enabled in `a9485f21`).
 | **3b — node-loss fallback** | single-replica reattach-wedge → discard PVC → fresh volume → Gitea/checkpoint resume (extended reattach wait + kill-switch; triple-gated discard) | ✅ **BUILT + committed (`868bfd32`, 2026-06-30)** — live finding: `longhorn-ephemeral` is single-replica, so it's a fresh-volume fallback, **not** detach-wait. Homelab PVC soak now **ON** (`a9485f21`); real node-loss validation pending (single-node k3d can't trigger the stuck-attach — runbook `tests/workspace_pvc_node_loss_validation.md`). See §Phase 3b |
 | **rollout** | flag default-off in-chart; **ON in k3d dev + homelab soak**; soak → prod flip | 🔄 **homelab soak in progress** (`a9485f21`) |
 
-**Decision: LOCKED — Branch (a), scoped to job (worker/loop) pods for v1.** This
-is the chosen fork of [`workspace_pvc_backed_migration.md`](workspace_pvc_backed_migration.md).
+**Decision: LOCKED — Branch (a).** Originally scoped to job (worker/loop) pods
+for v1; **the session scope-out was lifted on 2026-08-05** (`52c1ba80`, live on
+dev). This is the chosen fork of
+[`workspace_pvc_backed_migration.md`](workspace_pvc_backed_migration.md).
+
+> **Sessions (2026-08-05).** The v1 gate `owner.kind == "job"` is gone; both
+> owner kinds now derive their claim from one `_pvc_name_for()` helper shared by
+> create and delete, so the two names can never drift. Sessions additionally get
+> `pvc-agent-s-<tid[:12]>` for the agent pod (job agent pods stay `emptyDir`).
+>
+> **The reclaim rule is asymmetric and deliberately so.** Jobs keep terminal-status
+> reclaim. Sessions reclaim *only* when the `threads` row is genuinely absent,
+> because **`ended` is resumable** — the idle-archive handler ends a session after
+> 30 idle minutes and `resume_thread` requires exactly that status. Two sites
+> treated `ended` as terminal (`_TERMINAL_THREAD_STATUSES` and `main.py`'s thread
+> release), so lifting the gate without this would have deleted a user's working
+> tree on an ordinary coffee break — strictly worse than the `emptyDir` behaviour
+> PVCs replace. `_is_volume_reclaimable()` now separates "the pod may die" from
+> "the volume may die", and every ambiguous branch keeps the volume.
+>
+> Two open items this created: the shared-quota interaction (§Phase 3a's
+> `ResourceQuota` keys on storage class, so jobs and sessions share one bucket and
+> a backlog of retained threads can 403 job PVC creation), and the credential
+> persistence noted in `scoped_git_push.md`. Session content is **still not safe**
+> until [`session_workspace_wiped_by_agent_clone_on_attach.md`](../issues/session_workspace_wiped_by_agent_clone_on_attach.md)
+> is fixed.
 Sessions and VMs (branch b) are explicit non-goals for v1 (§Non-goals).
 
 > **REVERSED for sessions (2026-08-04) — the v1 jobs-only scope no longer holds.**

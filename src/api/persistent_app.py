@@ -230,7 +230,7 @@ _turn_event_open: bool = False
 # guarded by ``if _session.workspace_sync:`` and nothing ever rebuilds it — so a
 # few-seconds-late sync target (or a transient WebDAV blip) cost the user every
 # push and pull of the session.
-# docs/issues/session_resume_cloud_sync_race_late_provision.md
+# docs/done/session_resume_cloud_sync_race_late_provision.md
 _cloud_sync_retry_pending: bool = False
 
 # Phase 2 event-log cursor. Allocated synchronously by _broadcast, then queued
@@ -5066,7 +5066,7 @@ async def _retry_cloud_sync_start(turn_id: int) -> None:
     Silent by design after the first failure — the degraded toast was already
     raised at attach, and re-broadcasting it every turn would be noise. Only
     the transition back to working is announced.
-    docs/issues/session_resume_cloud_sync_race_late_provision.md
+    docs/done/session_resume_cloud_sync_race_late_provision.md
     """
     global _cloud_sync_retry_pending
 
