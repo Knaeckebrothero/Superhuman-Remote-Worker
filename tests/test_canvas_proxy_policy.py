@@ -210,7 +210,10 @@ def test_response_replaces_security_cache_cors_and_cookie_headers() -> None:
     assert b"www-authenticate" not in values
     assert b"x-internal-key" not in values
     assert values[b"cache-control"] == b"private, no-store"
-    assert b"frame-ancestors https://cockpit.test" in values[b"content-security-policy"]
+    assert (
+        b"frame-ancestors 'self' https://cockpit.test"
+        in values[b"content-security-policy"]
+    )
     assert b"worker-src 'none'" in values[b"content-security-policy"]
     assert (
         b"sandbox allow-scripts allow-same-origin allow-forms"
@@ -218,6 +221,37 @@ def test_response_replaces_security_cache_cors_and_cookie_headers() -> None:
     )
     assert values[b"referrer-policy"] == b"no-referrer"
     assert values[b"x-content-type-options"] == b"nosniff"
+
+
+def test_csp_lets_the_app_frame_its_own_pages_without_widening_who_frames_it() -> None:
+    """The gallery shape: a shell page that iframes its own subpages.
+
+    Two directives decide this and both have to admit it — the shell's
+    ``frame-src`` for the nested load, then the subpage's own
+    ``frame-ancestors``, because the app origin now sits in that subpage's
+    ancestor chain. Admitting only the first leaves the nested document
+    refused. The trusted Cockpit origin stays required either way: the browser
+    checks every ancestor, so the outermost frame still cannot be anyone else.
+    """
+
+    response = sanitize_canvas_response_headers(
+        status_code=200,
+        headers=[(b"content-type", b"text/html; charset=utf-8")],
+        request_method="GET",
+        request_path="/pages/arrivals_queue.html",
+        public_origin=ORIGIN,
+        cockpit_origins=COCKPIT_ORIGINS,
+        entry_port=8501,
+    )
+    policy = dict(response.headers)[b"content-security-policy"]
+
+    assert b"frame-src 'self' blob:" in policy
+    assert b"frame-src 'none'" not in policy
+    assert b"frame-ancestors 'self' https://cockpit.test" in policy
+    # Only the app's own origin is added. Plugins, workers, and every other
+    # framing source stay closed.
+    assert b"object-src 'none'" in policy
+    assert b"worker-src 'none'" in policy
 
 
 def test_head_preserves_validated_representation_length_only() -> None:

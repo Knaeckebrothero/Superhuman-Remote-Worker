@@ -134,7 +134,7 @@ async def test_h11_exchange_reframes_request_and_streams_chunked_response() -> N
             assert b"set-cookie" not in response_headers
             assert response_headers[b"cache-control"] == b"private, no-store"
             assert (
-                b"frame-ancestors https://cockpit.test"
+                b"frame-ancestors 'self' https://cockpit.test"
                 in response_headers[b"content-security-policy"]
             )
             assert [chunk async for chunk in response.aiter_bytes()] == [b"world"]
