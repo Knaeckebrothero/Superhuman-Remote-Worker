@@ -217,6 +217,13 @@ _draft_title_value: Optional[str] = None
 # _loop_on_tool_result.
 _tool_inflight: bool = False
 
+# True from the UI turn.started edge until its terminal turn.completed/error
+# edge. Deliberately narrower than _turn_in_flight(): that safety helper stays
+# true through turn-end persistence/git callbacks, after the transcript turn is
+# already closed. Cockpit reattach needs the transcript lifecycle, or it can
+# incorrectly reopen a completed turn during that post-turn window.
+_turn_event_open: bool = False
+
 # Cloud sync failed to start at attach (no sync target resolved, or the initial
 # pull raised) and is worth retrying at a turn boundary. Without this the
 # session keeps ``workspace_sync = None`` for its WHOLE life — every use site is
@@ -1471,7 +1478,7 @@ async def _cleanup_failed_event_journal_attach(thread_id: str) -> None:
     """Release a partially built session after journal initialization fails."""
 
     global _session, _thread_id, _event_writer
-    global _events_epoch, _next_seq, _tool_inflight
+    global _events_epoch, _next_seq, _tool_inflight, _turn_event_open
     global _loop_user_queue, _loop_interrupt_flag, _hard_interrupt_event
     global _loop_last_user_content
 
@@ -1509,6 +1516,7 @@ async def _cleanup_failed_event_journal_attach(thread_id: str) -> None:
     _events_epoch = 0
     _next_seq = 0
     _tool_inflight = False
+    _turn_event_open = False
     _loop_user_queue = None
     _loop_interrupt_flag = None
     _hard_interrupt_event = None
@@ -1535,6 +1543,7 @@ async def _attach_session(
     base instead of the pod's boot config when provided.
     """
     global _session, _thread_id, _events_epoch, _next_seq, _tool_inflight
+    global _turn_event_open
     global _event_writer, _cloud_sync_retry_pending
 
     _cloud_sync_retry_pending = False
@@ -1994,6 +2003,7 @@ async def _attach_session(
     # cursor. A provisioning SSE opened against the pre-attach generation uses
     # the existing mid-stream epoch-change reconciliation path.
     _tool_inflight = False
+    _turn_event_open = False
     _events_epoch = 0
     _next_seq = 0
     if _session is not None and _session.postgres_conn is not None:
@@ -2270,7 +2280,7 @@ async def _terminate_session_inner(reason: str, *, mark_thread: bool = True) -> 
     global _session, _thread_id, _sessions_served, _loop_task
     global _loop_user_queue, _loop_interrupt_flag, _loop_last_user_content
     global _hard_interrupt_event
-    global _events_epoch, _next_seq, _tool_inflight
+    global _events_epoch, _next_seq, _tool_inflight, _turn_event_open
     global _event_writer, _cloud_sync_retry_pending
 
     if not _session:
@@ -2393,6 +2403,7 @@ async def _terminate_session_inner(reason: str, *, mark_thread: bool = True) -> 
     _events_epoch = 0
     _next_seq = 0
     _tool_inflight = False
+    _turn_event_open = False
     # Pool agents serve many threads; a pending retry must not leak into the
     # next session, whose attach resolves its own cloud state.
     _cloud_sync_retry_pending = False
@@ -2930,10 +2941,9 @@ async def handle_persistent_websocket(ws: WebSocket) -> None:
     #
     # running_tool: if the loop is blocked in a tool call right now, tell this
     # (re)attaching client which command is running so it can render a "running
-    # command" card instead of a blank "Connecting…". The in-flight AIMessage +
-    # tool_call lives only in memory (not persisted until the turn ends), so a
-    # cold reload mid-turn can't recover it from REST history — this welcome
-    # frame is the only channel for it.
+    # command" card instead of a blank "Connecting…". Incremental history may
+    # already carry the AIMessage + tool_call, but it cannot say that the call
+    # is still running — this welcome frame is the authoritative snapshot.
     #
     # pending_permissions: same idea for supervised gates that are still
     # waiting on an answer. The durable row survives, but REST history does
@@ -2955,6 +2965,11 @@ async def handle_persistent_websocket(ws: WebSocket) -> None:
             "permission_mode": _session.permission_mode,
             "narration_mode": _session.narration_mode,
             "turn_count": _session.turn_count,
+            # Authoritative join signal for a cold Cockpit reattach. REST can
+            # already contain an incrementally persisted prefix of this turn;
+            # the client uses (turn_in_flight, turn_count) to keep that prefix
+            # and cursor-replayed suffix in one streaming bubble.
+            "turn_in_flight": _turn_event_open,
             "message_count": len(_session.messages),
             "model": _session.config.llm.model,
             "temperature": _session.config.llm.temperature,
@@ -5103,8 +5118,11 @@ async def _retry_cloud_sync_start(turn_id: int) -> None:
 
 
 async def _loop_on_turn_start(turn_id: int) -> None:
+    global _turn_event_open
     if _session is None:
+        _turn_event_open = False
         return
+    _turn_event_open = True
     _session.turn_count = turn_id
     _broadcast("turn.started", {"turn_id": turn_id})
 
@@ -5206,6 +5224,11 @@ async def _notify_cloud_stage() -> None:
 
 
 async def _loop_on_turn_complete(turn_id: int, metrics: Optional[dict] = None) -> None:
+    global _turn_event_open
+    # This is the transcript terminal edge. Clear before any awaited cleanup so
+    # a reattach during turn-end persistence never reopens an already-completed
+    # assistant bubble merely because the broader loop is not parked yet.
+    _turn_event_open = False
     # Runs on EVERY turn exit — completed, parked on an unanswered gate,
     # interrupted, or errored (run_persistent_loop catches and still calls
     # this). Announced rows no gate ever claimed must die with the turn, or
@@ -5352,6 +5375,8 @@ async def _loop_on_error(message: str, turn_id: Optional[int] = None) -> None:
         agent's own history restore (postgres_db.get_thread_messages) so it
         never enters the LLM context.
     """
+    global _turn_event_open
+    _turn_event_open = False
     payload: Dict[str, Any] = {"message": message}
     if turn_id is not None:
         payload["turn_id"] = turn_id
