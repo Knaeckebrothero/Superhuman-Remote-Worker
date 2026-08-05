@@ -540,7 +540,7 @@ class TestTruncateArgsForEmail:
 
 class TestPermissionNotifySweeperSQL:
     @pytest.mark.asyncio
-    async def test_dedup_filter_includes_permanent_skips_and_floor(self):
+    async def test_dedup_filter_includes_permanent_skips_and_floor(self, monkeypatch):
         import asyncio
 
         import orchestrator.main as orch_main
@@ -566,8 +566,12 @@ class TestPermissionNotifySweeperSQL:
             async def __aexit__(self_inner, exc_type, exc, tb):
                 return None
 
-        orch_main.postgres_db = MagicMock()
-        orch_main.postgres_db.acquire = lambda: _Acquire()
+        # monkeypatch, not bare assignment: `postgres_db` is a module global,
+        # and a leaked MagicMock breaks every later test in the run that
+        # awaits a real DB method.
+        fake_db = MagicMock()
+        fake_db.acquire = lambda: _Acquire()
+        monkeypatch.setattr(orch_main, "postgres_db", fake_db)
 
         await orch_main.thread_permission_notify_sweeper(evt)
 
