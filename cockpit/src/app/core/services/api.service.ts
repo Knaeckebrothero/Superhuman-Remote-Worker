@@ -10,11 +10,17 @@ import {
     ColumnDef,
     DailyStatistics,
     Datasource,
+    DatasourceCatalogFilters,
+    DatasourceCatalogResponse,
     DatasourceCreateRequest,
     DatasourceIndexStatus,
     DatasourceReindexResult,
     DatasourceTestResult,
     DatasourceUpdateRequest,
+    EligibleDatasource,
+    LinkableDatasourceProjectsResponse,
+    LinkableProjectDatasourceFilters,
+    LinkableProjectDatasourcesResponse,
     SSHKeyGenerateResponse,
     Expert,
     ExpertDefaultForkResult,
@@ -807,13 +813,28 @@ export class ApiService {
     );
   }
 
-  /**
-   * Get datasources eligible to pre-select for a new job/session: the union of
-   * the caller's own datasources, global datasources, and those linked to any
-   * given project. Backs the create-job / create-session picker (explicit-only
-   * resolution means the picker selection is the only way a job gets sources).
-   */
-  getEligibleDatasources(projectIds?: string[]): Observable<Datasource[]> {
+  /** Cursor-paginated management catalog. Authorization and filtering happen
+   * before the server applies the limit, so older owned connectors are not
+   * hidden behind unrelated rows. */
+  getDatasourceCatalog(
+    filters: DatasourceCatalogFilters = {},
+  ): Observable<DatasourceCatalogResponse> {
+    let params = new HttpParams();
+    for (const [key, value] of Object.entries(filters)) {
+      if (value !== undefined && value !== null && value !== '') {
+        params = params.set(key, String(value));
+      }
+    }
+    return this.http.get<DatasourceCatalogResponse>(
+      `${this.baseUrl}/datasources/catalog`,
+      {params},
+    );
+  }
+
+  /** Get execution-authorized, scope-matching connectors for an exact project
+   * context. The server computes owner-specific `default_selected`; callers
+   * must not infer defaults from visibility or `auto_attach` alone. */
+  getEligibleDatasources(projectIds?: string[]): Observable<EligibleDatasource[]> {
     let params = new HttpParams();
     for (const pid of projectIds ?? []) {
       if (pid) {
@@ -821,13 +842,43 @@ export class ApiService {
       }
     }
     return this.http
-      .get<Datasource[]>(`${this.baseUrl}/datasources/eligible`, { params })
-      .pipe(
-        catchError((error) => {
-          console.error('Failed to fetch eligible datasources:', error);
-          return of([]);
-        }),
-      );
+      .get<EligibleDatasource[]>(`${this.baseUrl}/datasources/eligible`, { params });
+  }
+
+  /** Projects the caller may use in a connector's availability policy. Current
+   * links are included in edit mode even when they are now retained-only. */
+  getLinkableDatasourceProjects(options: {
+    datasourceId?: string;
+    q?: string;
+    cursor?: string;
+    limit?: number;
+  } = {}): Observable<LinkableDatasourceProjectsResponse> {
+    let params = new HttpParams();
+    if (options.datasourceId) params = params.set('datasource_id', options.datasourceId);
+    if (options.q) params = params.set('q', options.q);
+    if (options.cursor) params = params.set('cursor', options.cursor);
+    params = params.set('limit', String(options.limit ?? 50));
+    return this.http.get<LinkableDatasourceProjectsResponse>(
+      `${this.baseUrl}/projects/linkable-datasource-targets`,
+      {params},
+    );
+  }
+
+  /** Cursor-paginated, server-authorized connector candidates for widening a
+   * target project's links. Unlike execution eligibility, this intentionally
+   * includes caller-owned project-scoped connectors not yet linked here. */
+  getLinkableProjectDatasources(
+    projectId: string,
+    filters: LinkableProjectDatasourceFilters = {},
+  ): Observable<LinkableProjectDatasourcesResponse> {
+    let params = new HttpParams();
+    if (filters.q) params = params.set('q', filters.q);
+    if (filters.cursor) params = params.set('cursor', filters.cursor);
+    params = params.set('limit', String(filters.limit ?? 50));
+    return this.http.get<LinkableProjectDatasourcesResponse>(
+      `${this.baseUrl}/projects/${projectId}/linkable-datasources`,
+      {params},
+    );
   }
 
   /**
@@ -852,13 +903,10 @@ export class ApiService {
   /**
    * Update a datasource.
    */
-  updateDatasource(id: string, ds: DatasourceUpdateRequest): Observable<{ status: string } | null> {
-    return this.http.put<{ status: string }>(`${this.baseUrl}/datasources/${id}`, ds).pipe(
-      catchError((error) => {
-        console.error(`Failed to update datasource ${id}:`, error);
-        return of(null);
-      }),
-    );
+  updateDatasource(id: string, ds: DatasourceUpdateRequest): Observable<Datasource> {
+    // Policy and optimistic-concurrency errors must reach the form. Turning a
+    // 409/403 into null would erase the actionable server detail.
+    return this.http.put<Datasource>(`${this.baseUrl}/datasources/${id}`, ds);
   }
 
   /**

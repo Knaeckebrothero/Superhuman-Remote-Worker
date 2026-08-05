@@ -10,6 +10,7 @@ This module provides the canonical async PostgreSQL interface using asyncpg with
 This is the canonical database layer for the orchestrator.
 """
 
+import base64
 import hashlib
 import json
 import logging
@@ -63,6 +64,365 @@ _DOCKER_INVENTORY_COLUMNS = (
     "host, port, status, lease_id, owner_kind, owner_id, trust_mode, "
     "host_key_fingerprint, quarantine_reason"
 )
+
+
+def _thread_datasource_lock_key(thread_id: str) -> int:
+    """Stable, domain-separated advisory-lock key for connector delivery.
+
+    Connector selection writes and credential delivery must use the same lock
+    domain.  Keeping it separate from the general thread provisioning lock
+    also makes it safe to attach while provisioning already owns that lock.
+    """
+    digest = hashlib.blake2b(
+        b"datasource_selection:" + thread_id.encode(), digest_size=8
+    ).digest()
+    return int.from_bytes(digest, byteorder="big", signed=True)
+
+
+class DatasourcePolicyError(ValueError):
+    """Base class for datasource scope/default persistence failures."""
+
+
+class DatasourcePolicyValidationError(DatasourcePolicyError):
+    """A requested datasource policy is structurally invalid."""
+
+
+class DatasourcePolicyConflictError(DatasourcePolicyError):
+    """The caller edited a stale datasource policy revision."""
+
+
+class DatasourceProjectAuthorizationError(DatasourcePolicyError):
+    """A project-link addition lost its required owner authority."""
+
+
+class DatasourceScopeAuthorizationError(DatasourcePolicyError):
+    """A project-scoped principal attempted a cross-scope datasource mutation."""
+
+
+class DatasourceMaterializationAuthorizationError(DatasourcePolicyError):
+    """A work owner lost approval or target-project access before insert."""
+
+
+class DatasourceCatalogCursorError(ValueError):
+    """A datasource catalog/linkable-project cursor is malformed."""
+
+
+def _uuid_list(values: list[str] | tuple[str, ...] | None) -> list[UUID]:
+    """Parse and de-duplicate UUID strings while preserving request order.
+
+    Database write APIs use this only after the request layer has decided
+    whether a field was omitted. Malformed UUIDs are rejected rather than
+    silently dropped so an atomic attachment or scope edit cannot commit a
+    partial data contract.
+    """
+    result: list[UUID] = []
+    seen: set[UUID] = set()
+    for value in values or ():
+        try:
+            parsed = UUID(str(value))
+        except (TypeError, ValueError) as exc:
+            raise DatasourcePolicyValidationError(
+                "One or more connector or project identifiers are invalid"
+            ) from exc
+        if parsed not in seen:
+            seen.add(parsed)
+            result.append(parsed)
+    return result
+
+
+@asynccontextmanager
+async def _transaction_if(conn, enabled: bool):
+    """Open an asyncpg transaction only for multi-statement operations.
+
+    Single INSERT/UPDATE operations are already atomic. Avoiding a redundant
+    transaction also preserves the lightweight mocked-connection contract used
+    throughout the database unit tests.
+    """
+    if enabled:
+        async with conn.transaction():
+            yield
+    else:
+        yield
+
+
+async def _require_project_owner_for_link_additions(
+    conn,
+    project_uuids: list[UUID],
+    *,
+    authority_user_id: str | None,
+    authority_is_admin: bool,
+) -> bool | None:
+    """Lock and re-check project-owner authority for new connector links.
+
+    HTTP handlers perform the same check before entering persistence so they
+    can return useful project-specific errors. This in-transaction check is
+    the security boundary: locking the matching membership rows prevents a
+    concurrent role downgrade/removal from committing until the link write has
+    either committed or rolled back. Server-managed provisioning may omit an
+    authority identity; an authenticated admin explicitly bypasses the role
+    lookup.
+    """
+    if not project_uuids or authority_user_id is None:
+        return None
+    try:
+        authority_uuid = UUID(str(authority_user_id))
+    except (TypeError, ValueError) as exc:
+        raise DatasourceProjectAuthorizationError(
+            "Project owner role required for connector link additions"
+        ) from exc
+
+    actor = await conn.fetchrow(
+        """
+        SELECT is_admin, is_approved
+        FROM users
+        WHERE id = $1
+        FOR UPDATE
+        """,
+        authority_uuid,
+    )
+    if actor is None or not bool(actor["is_approved"]):
+        raise DatasourceProjectAuthorizationError(
+            "Project owner role required for connector link additions"
+        )
+    if bool(actor["is_admin"]):
+        return True
+
+    rows = await conn.fetch(
+        """
+        SELECT project_id
+        FROM project_members
+        WHERE user_id = $1
+          AND project_id = ANY($2::uuid[])
+          AND role = 'owner'
+        ORDER BY project_id
+        FOR UPDATE
+        """,
+        authority_uuid,
+        project_uuids,
+    )
+    authorized = {row["project_id"] for row in rows}
+    if authorized != set(project_uuids):
+        raise DatasourceProjectAuthorizationError(
+            "Project owner role required for connector link additions"
+        )
+    return False
+
+
+async def _require_project_link_mutation_authority(
+    conn,
+    project_uuid: UUID,
+    *,
+    datasource_created_by: UUID | None,
+    authority_user_id: str | None,
+    authority_is_admin: bool,
+    allow_connector_owner: bool,
+) -> None:
+    """Lock and re-check authority immediately before a link mutation.
+
+    The request-layer owner check provides an early, useful denial, but this
+    transaction-local check is the authorization boundary. The caller's admin
+    hint is deliberately not trusted: the current user row and, when needed,
+    current project-owner membership are locked before the child row changes.
+    Connector creators retain the established right to revoke their own link.
+    Trusted internal lifecycle callers may omit ``authority_user_id``.
+    """
+    del authority_is_admin
+    if authority_user_id is None:
+        return
+    try:
+        authority_uuid = UUID(str(authority_user_id))
+    except (TypeError, ValueError) as exc:
+        raise DatasourceProjectAuthorizationError(
+            "Project owner role required for connector link mutation"
+        ) from exc
+
+    actor = await conn.fetchrow(
+        """
+        SELECT is_admin, is_approved
+        FROM users
+        WHERE id = $1
+        FOR UPDATE
+        """,
+        authority_uuid,
+    )
+    if actor is None or not bool(actor["is_approved"]):
+        raise DatasourceProjectAuthorizationError(
+            "Project owner role required for connector link mutation"
+        )
+    if bool(actor["is_admin"]):
+        return
+    if allow_connector_owner and str(datasource_created_by or "") == str(
+        authority_uuid
+    ):
+        return
+
+    membership = await conn.fetchrow(
+        """
+        SELECT project_id
+        FROM project_members
+        WHERE user_id = $1
+          AND project_id = $2
+          AND role = 'owner'
+        FOR UPDATE
+        """,
+        authority_uuid,
+        project_uuid,
+    )
+    if membership is None:
+        raise DatasourceProjectAuthorizationError(
+            "Project owner role required for connector link mutation"
+        )
+
+
+async def _lock_and_validate_work_owner(
+    conn,
+    *,
+    authority_user_id: str | None,
+    materialized_user_uuid: UUID | None,
+    target_project_uuids: list[UUID],
+) -> None:
+    """Lock and re-check the effective owner at work materialization.
+
+    Datasource selection happens before the job/thread transaction. Locking the
+    current user and membership rows in the same transaction as the work insert
+    closes the interval in which an owner could be disabled or removed from a
+    target project after policy resolution but before credentials are bound to
+    durable work. Trusted ownerless system work opts out explicitly by omitting
+    ``authority_user_id``.
+    """
+    if authority_user_id is None:
+        return
+    try:
+        authority_uuid = UUID(str(authority_user_id))
+    except (TypeError, ValueError) as exc:
+        raise DatasourceMaterializationAuthorizationError(
+            "Work owner is no longer authorized"
+        ) from exc
+    if materialized_user_uuid is None or authority_uuid != materialized_user_uuid:
+        raise DatasourceMaterializationAuthorizationError(
+            "Work owner is no longer authorized"
+        )
+
+    actor = await conn.fetchrow(
+        """
+        SELECT is_admin, is_approved
+        FROM users
+        WHERE id = $1
+        FOR UPDATE
+        """,
+        authority_uuid,
+    )
+    if actor is None or not bool(actor["is_approved"]):
+        raise DatasourceMaterializationAuthorizationError(
+            "Work owner is no longer authorized"
+        )
+    if bool(actor["is_admin"]) or not target_project_uuids:
+        return
+
+    rows = await conn.fetch(
+        """
+        SELECT project_id
+        FROM project_members
+        WHERE user_id = $1
+          AND project_id = ANY($2::uuid[])
+        ORDER BY project_id
+        FOR UPDATE
+        """,
+        authority_uuid,
+        target_project_uuids,
+    )
+    if {row["project_id"] for row in rows} != set(target_project_uuids):
+        raise DatasourceMaterializationAuthorizationError(
+            "Work owner is no longer authorized"
+        )
+
+
+def _encode_page_cursor(payload: Dict[str, Any]) -> str:
+    raw = json.dumps(payload, separators=(",", ":"), default=str).encode()
+    return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+
+def _decode_page_cursor(cursor: str | None) -> Dict[str, Any] | None:
+    if not cursor:
+        return None
+    try:
+        padding = "=" * (-len(cursor) % 4)
+        decoded = base64.urlsafe_b64decode((cursor + padding).encode())
+        value = json.loads(decoded)
+    except Exception as exc:
+        raise DatasourceCatalogCursorError("Invalid pagination cursor") from exc
+    if not isinstance(value, dict):
+        raise DatasourceCatalogCursorError("Invalid pagination cursor")
+    return value
+
+
+def _normalize_policy_revision_snapshot(
+    datasource_uuids: list[UUID],
+    supplied: Dict[str, int] | None,
+    provenance: Dict[str, Any] | None,
+) -> Dict[UUID, int]:
+    """Normalize the policy snapshot required for nonempty materialization."""
+    raw = supplied
+    if raw is None and provenance is not None:
+        candidate = provenance.get("policy_revisions")
+        if isinstance(candidate, dict):
+            raw = candidate
+    if not datasource_uuids:
+        if raw not in (None, {}):
+            raise DatasourcePolicyValidationError(
+                "The connector policy revision snapshot must match the complete selection"
+            )
+        return {}
+    if raw is None:
+        raise DatasourcePolicyValidationError(
+            "A connector policy revision snapshot is required"
+        )
+    normalized: Dict[UUID, int] = {}
+    try:
+        for datasource_id, revision in raw.items():
+            parsed_id = UUID(str(datasource_id))
+            parsed_revision = int(revision)
+            if parsed_revision < 1:
+                raise ValueError
+            normalized[parsed_id] = parsed_revision
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise DatasourcePolicyValidationError(
+            "The connector policy revision snapshot is invalid"
+        ) from exc
+    if set(normalized) != set(datasource_uuids):
+        raise DatasourcePolicyValidationError(
+            "The connector policy revision snapshot must match the complete selection"
+        )
+    return normalized
+
+
+async def _lock_and_compare_policy_snapshot(
+    conn,
+    datasource_uuids: list[UUID],
+    expected_revisions: Dict[UUID, int],
+    *,
+    legacy_job_id: UUID | None = None,
+) -> None:
+    """Lock the selected policy rows through work+attachment commit."""
+    if not datasource_uuids:
+        return
+    rows = await conn.fetch(
+        """
+        SELECT id, policy_revision
+        FROM datasources
+        WHERE id = ANY($1::uuid[])
+          AND (job_id IS NULL OR job_id = $2::uuid)
+        ORDER BY id
+        FOR UPDATE
+        """,
+        sorted(datasource_uuids, key=str),
+        legacy_job_id,
+    )
+    current = {row["id"]: int(row["policy_revision"]) for row in rows}
+    if current != expected_revisions:
+        raise DatasourcePolicyConflictError(
+            "Connector policy changed; resolve the selection and try again"
+        )
 
 
 def _encrypt_optional(value: str | None) -> str | None:
@@ -973,6 +1333,11 @@ class PostgresDB:
         freeze_data: Dict[str, Any] | None = None,
         created_by_thread_id: str | None = None,
         wake_on_complete: bool = False,
+        datasource_ids: list[str] | None = None,
+        datasource_selection_provenance: Dict[str, Any] | None = None,
+        datasource_policy_revisions: Dict[str, int] | None = None,
+        authority_user_id: str | None = None,
+        authority_project_ids: list[str] | None = None,
     ) -> Dict[str, Any]:
         """Create a new job.
 
@@ -1005,6 +1370,18 @@ class PostgresDB:
             wake_on_complete: Whether this job's terminal state owes the creating
                 session a wake. Set server-side by the create endpoint, never by
                 the model — see docs/features/session_wake_on_job_completion.md.
+            datasource_ids: Complete materialized connector selection. Nonempty
+                sets are inserted into ``job_datasources`` in the same transaction
+                as the job; an empty set is authoritative after migration 0082.
+            datasource_selection_provenance: Safe audit metadata (never secrets)
+                stored under ``context.datasource_selection`` with the job row.
+            datasource_policy_revisions: Expected revision for every selected
+                connector. Required for a nonempty set (or supplied inside the
+                provenance); compared under row locks in the creation transaction.
+            authority_user_id: Effective owner to revalidate under lock. Omit
+                only for trusted ownerless system work.
+            authority_project_ids: Complete target project set whose current
+                memberships are required at the insertion linearization point.
 
         Returns:
             Created job dict with id
@@ -1013,6 +1390,35 @@ class PostgresDB:
         project_uuid = UUID(project_id) if project_id else None
         parent_uuid = UUID(parent_job_id) if parent_job_id else None
         thread_uuid = UUID(created_by_thread_id) if created_by_thread_id else None
+        datasource_uuids = _uuid_list(datasource_ids)
+        authority_project_uuids = _uuid_list(authority_project_ids)
+        policy_snapshot = _normalize_policy_revision_snapshot(
+            datasource_uuids,
+            datasource_policy_revisions,
+            datasource_selection_provenance,
+        )
+
+        if authority_user_id is not None:
+            expected_projects = {project_uuid} if project_uuid is not None else set()
+            if set(authority_project_uuids) != expected_projects:
+                raise DatasourceMaterializationAuthorizationError(
+                    "Work owner is no longer authorized"
+                )
+
+        # The immutable ID snapshot survives the junction's datasource-delete
+        # cascade. Delivery compares it with the live junction so a deleted
+        # connector fails the whole data contract instead of becoming a
+        # silently reduced selection. Always stamp new jobs, including [].
+        context = dict(context or {})
+        safe_provenance = dict(datasource_selection_provenance or {})
+        safe_provenance["datasource_ids"] = [
+            str(datasource_id) for datasource_id in datasource_uuids
+        ]
+        safe_provenance["policy_revisions"] = {
+            str(datasource_id): revision
+            for datasource_id, revision in policy_snapshot.items()
+        }
+        context["datasource_selection"] = safe_provenance
 
         # Every entry point (REST, MCP, automations, loops, delegation) funnels
         # through here, so normalize once: surrounding whitespace is never
@@ -1022,33 +1428,59 @@ class PostgresDB:
         description = (description or "").strip()
 
         async with self.acquire() as conn:
-            row = await conn.fetchrow(
-                """
-                INSERT INTO jobs (description, document_path, config_name, config_override, context, status, user_id, project_id, branch_name, parent_job_id, priority, repo_name, creation_order, worktree_path, delegation_context, expert_id, runner_kind, freeze_data, created_by_thread_id, wake_on_complete)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
-                RETURNING id, status, config_name, assigned_agent_id, user_id, project_id, parent_job_id, priority, branch_name, repo_name, created_at, updated_at, description, creation_order, worktree_path, expert_id, runner_kind, created_by_thread_id, wake_on_complete
-                """,
-                description,
-                document_path or document_dir,
-                config_name,
-                json.dumps(config_override) if config_override else None,
-                json.dumps(context) if context else None,
-                status,
-                user_uuid,
-                project_uuid,
-                branch_name,
-                parent_uuid,
-                priority,
-                repo_name,
-                creation_order,
-                worktree_path,
-                delegation_context,
-                UUID(expert_id) if expert_id else None,
-                runner_kind,
-                json.dumps(freeze_data) if freeze_data else None,
-                thread_uuid,
-                wake_on_complete,
-            )
+            async with _transaction_if(
+                conn, bool(datasource_uuids) or authority_user_id is not None
+            ):
+                await _lock_and_compare_policy_snapshot(
+                    conn,
+                    datasource_uuids,
+                    policy_snapshot,
+                    legacy_job_id=parent_uuid,
+                )
+                await _lock_and_validate_work_owner(
+                    conn,
+                    authority_user_id=authority_user_id,
+                    materialized_user_uuid=user_uuid,
+                    target_project_uuids=authority_project_uuids,
+                )
+                row = await conn.fetchrow(
+                    """
+                    INSERT INTO jobs (description, document_path, config_name, config_override, context, status, user_id, project_id, branch_name, parent_job_id, priority, repo_name, creation_order, worktree_path, delegation_context, expert_id, runner_kind, freeze_data, created_by_thread_id, wake_on_complete)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
+                    RETURNING id, status, config_name, assigned_agent_id, user_id, project_id, parent_job_id, priority, branch_name, repo_name, created_at, updated_at, description, creation_order, worktree_path, expert_id, runner_kind, created_by_thread_id, wake_on_complete
+                    """,
+                    description,
+                    document_path or document_dir,
+                    config_name,
+                    json.dumps(config_override) if config_override else None,
+                    json.dumps(context) if context else None,
+                    status,
+                    user_uuid,
+                    project_uuid,
+                    branch_name,
+                    parent_uuid,
+                    priority,
+                    repo_name,
+                    creation_order,
+                    worktree_path,
+                    delegation_context,
+                    UUID(expert_id) if expert_id else None,
+                    runner_kind,
+                    json.dumps(freeze_data) if freeze_data else None,
+                    thread_uuid,
+                    wake_on_complete,
+                )
+                if datasource_uuids:
+                    await conn.executemany(
+                        """
+                        INSERT INTO job_datasources (job_id, datasource_id)
+                        VALUES ($1, $2)
+                        """,
+                        [
+                            (row["id"], datasource_uuid)
+                            for datasource_uuid in datasource_uuids
+                        ],
+                    )
 
         return dict(row)
 
@@ -3996,16 +4428,23 @@ class PostgresDB:
         return result == "UPDATE 1"
 
     async def set_thread_datasource_ids(
-        self, thread_id: str, datasource_ids: List[str]
+        self,
+        thread_id: str,
+        datasource_ids: List[str],
+        *,
+        datasource_policy_revisions: Dict[str, int] | None = None,
+        datasource_selection_provenance: Dict[str, Any] | None = None,
     ) -> bool:
-        """Replace ``threads.metadata.datasource_ids`` with the given full set.
+        """Atomically replace a thread's complete connector selection.
 
         ``datasource_ids`` is a top-level metadata key (sibling of
         ``config_override`` — ``merge_thread_config_override`` can't touch it),
         and the live-settings protocol sends the desired FULL selection each
-        time (idempotent, matching create semantics), so this is a plain
-        replace: last write wins is the correct desired-state outcome and no
-        read-modify-write lock is needed.
+        time. For a nonempty set, this method locks every selected connector
+        and compares the exact policy revisions used by authorization before it
+        changes metadata. IDs, revisions, and safe provenance land in one JSONB
+        update, so readers cannot observe a new selection with an old audit
+        snapshot.
 
         Args:
             thread_id: Thread UUID as string
@@ -4014,29 +4453,53 @@ class PostgresDB:
         Returns:
             True if updated, False if thread not found
         """
-        import json as json_module
-
         try:
-            uuid_val = UUID(thread_id)
-        except ValueError:
+            thread_uuid = UUID(thread_id)
+        except (TypeError, ValueError):
             return False
 
-        query = (
-            "UPDATE threads "
-            "SET metadata = jsonb_set("
-            "    COALESCE(metadata, '{}'::jsonb), "
-            "    '{datasource_ids}', "
-            "    $1::jsonb"
-            "), "
-            "    last_activity = CURRENT_TIMESTAMP "
-            "WHERE id = $2"
+        datasource_uuids = _uuid_list(datasource_ids)
+        policy_snapshot = _normalize_policy_revision_snapshot(
+            datasource_uuids,
+            datasource_policy_revisions,
+            datasource_selection_provenance,
         )
+        selected_ids = [str(value) for value in datasource_uuids]
+        safe_provenance = dict(datasource_selection_provenance or {})
+        safe_provenance["datasource_ids"] = selected_ids
+        safe_provenance["policy_revisions"] = {
+            str(datasource_id): revision
+            for datasource_id, revision in policy_snapshot.items()
+        }
+        metadata_patch = {
+            "datasource_ids": selected_ids,
+            "datasource_selection": safe_provenance,
+        }
+
         async with self.acquire() as conn:
-            result = await conn.execute(
-                query,
-                json_module.dumps([str(v) for v in datasource_ids]),
-                uuid_val,
-            )
+            async with conn.transaction():
+                # Serialize every replacement, including A -> [], with the
+                # credential-delivery boundary.  Once this transaction
+                # commits, an in-flight attach can no longer deliver the old
+                # selection; either the attach completed first or it will
+                # re-read this newly committed snapshot.
+                await conn.execute(
+                    "SELECT pg_advisory_xact_lock($1)",
+                    _thread_datasource_lock_key(thread_id),
+                )
+                await _lock_and_compare_policy_snapshot(
+                    conn, datasource_uuids, policy_snapshot
+                )
+                result = await conn.execute(
+                    """
+                    UPDATE threads
+                    SET metadata = COALESCE(metadata, '{}'::jsonb) || $1::jsonb,
+                        last_activity = CURRENT_TIMESTAMP
+                    WHERE id = $2
+                    """,
+                    json.dumps(metadata_patch),
+                    thread_uuid,
+                )
 
         return result == "UPDATE 1"
 
@@ -6230,20 +6693,72 @@ class PostgresDB:
         config_name: str = "session_base",
         permission_mode: str = "supervised",
         title: str = "Untitled Session",
+        datasource_ids: list[str] | None = None,
+        datasource_selection_provenance: Dict[str, Any] | None = None,
+        datasource_policy_revisions: Dict[str, int] | None = None,
+        authority_user_id: str | None = None,
+        authority_project_ids: list[str] | None = None,
     ) -> str:
-        """Create a new persistent thread."""
-        async with self.acquire() as conn:
-            row = await conn.fetchrow(
-                """
-                INSERT INTO threads (user_id, project_id, config_name, permission_mode, title)
-                VALUES ($1, $2, $3, $4, $5) RETURNING id
-                """,
-                user_id,
-                project_id,
-                config_name,
-                permission_mode,
-                title,
+        """Create a thread with its complete connector selection in one row.
+
+        The ``datasource_ids`` metadata key is always present, including for an
+        empty selection, so inheritance can distinguish authoritative ``[]``
+        from historical threads that predate materialized selections.
+        """
+        selected_uuids = _uuid_list(datasource_ids)
+        authority_project_uuids = _uuid_list(authority_project_ids)
+        selected_ids = [str(value) for value in selected_uuids]
+        policy_snapshot = _normalize_policy_revision_snapshot(
+            selected_uuids,
+            datasource_policy_revisions,
+            datasource_selection_provenance,
+        )
+        metadata: Dict[str, Any] = {"datasource_ids": selected_ids}
+        if datasource_selection_provenance is not None:
+            safe_provenance = dict(datasource_selection_provenance)
+            safe_provenance["policy_revisions"] = {
+                str(datasource_id): revision
+                for datasource_id, revision in policy_snapshot.items()
+            }
+            metadata["datasource_selection"] = safe_provenance
+        materialized_user_uuid = UUID(user_id) if user_id else None
+        primary_project_uuid = UUID(project_id) if project_id else None
+        if (
+            authority_user_id is not None
+            and primary_project_uuid is not None
+            and primary_project_uuid not in set(authority_project_uuids)
+        ):
+            raise DatasourceMaterializationAuthorizationError(
+                "Work owner is no longer authorized"
             )
+        async with self.acquire() as conn:
+            async with _transaction_if(
+                conn, bool(selected_uuids) or authority_user_id is not None
+            ):
+                await _lock_and_compare_policy_snapshot(
+                    conn, selected_uuids, policy_snapshot
+                )
+                await _lock_and_validate_work_owner(
+                    conn,
+                    authority_user_id=authority_user_id,
+                    materialized_user_uuid=materialized_user_uuid,
+                    target_project_uuids=authority_project_uuids,
+                )
+                row = await conn.fetchrow(
+                    """
+                    INSERT INTO threads (
+                        user_id, project_id, config_name, permission_mode, title,
+                        metadata
+                    )
+                    VALUES ($1, $2, $3, $4, $5, $6::jsonb) RETURNING id
+                    """,
+                    user_id,
+                    project_id,
+                    config_name,
+                    permission_mode,
+                    title,
+                    json.dumps(metadata),
+                )
         return str(row["id"])
 
     @asynccontextmanager
@@ -6265,6 +6780,17 @@ class PostgresDB:
                 await conn.execute("SELECT pg_advisory_xact_lock($1)", key)
                 yield
                 # Lock auto-released at transaction end.
+
+    @asynccontextmanager
+    async def thread_datasource_lock(self, thread_id: str):
+        """Serialize connector selection writes with credential delivery."""
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute(
+                    "SELECT pg_advisory_xact_lock($1)",
+                    _thread_datasource_lock_key(thread_id),
+                )
+                yield
 
     async def get_thread(self, thread_id: str) -> Dict[str, Any] | None:
         """Get thread by ID."""
@@ -7190,7 +7716,8 @@ class PostgresDB:
                 f"""
                 SELECT id, name, description, type, connection_url, credentials,
                        config, cli_hint, default_branch, job_id, created_by, is_global,
-                       read_only, created_at, updated_at
+                       read_only, scope_mode, auto_attach, policy_revision,
+                       created_at, updated_at
                 FROM datasources
                 {where_clause}
                 ORDER BY created_at DESC
@@ -7200,6 +7727,407 @@ class PostgresDB:
             )
 
         return [_datasource_row_to_dict(row) for row in rows]
+
+    async def list_datasource_catalog(
+        self,
+        user_id: str,
+        visible_project_ids: list[str] | None = None,
+        *,
+        is_admin: bool = False,
+        restrict_to_projects: bool = False,
+        q: str | None = None,
+        ds_type: str | None = None,
+        project_id: str | None = None,
+        scope_mode: str | None = None,
+        auto_attach: bool | None = None,
+        visibility: str | None = None,
+        ownership: str | None = None,
+        availability: str | None = None,
+        limit: int = 50,
+        cursor: str | None = None,
+    ) -> Dict[str, Any]:
+        """Cursor-page the management catalog after authorization/filtering.
+
+        ``visible_project_ids`` must come from the caller's authenticated
+        project memberships. ``restrict_to_projects`` is used by a
+        ``project:<uuid>`` principal so creator ownership cannot escape its
+        token boundary. Complete project-link enrichment is returned only for
+        the creator/admin; shared callers see accessible associations only.
+        """
+        try:
+            owner_uuid = UUID(str(user_id))
+            visible_uuids = _uuid_list(visible_project_ids)
+            filter_project_uuid = UUID(project_id) if project_id else None
+        except (TypeError, ValueError, DatasourcePolicyValidationError):
+            return {"items": [], "next_cursor": None}
+        if scope_mode not in {None, "all", "projects"}:
+            raise DatasourcePolicyValidationError("Invalid scope_mode filter")
+        if visibility not in {None, "public", "private"}:
+            raise DatasourcePolicyValidationError("Invalid visibility filter")
+        if ownership not in {None, "mine", "shared"}:
+            raise DatasourcePolicyValidationError("Invalid ownership filter")
+        if availability not in {None, "all", "projects", "unavailable"}:
+            raise DatasourcePolicyValidationError("Invalid availability filter")
+        if (
+            filter_project_uuid
+            and not is_admin
+            and filter_project_uuid not in set(visible_uuids)
+        ):
+            return {"items": [], "next_cursor": None}
+
+        page = _decode_page_cursor(cursor)
+        cursor_created_at: datetime | None = None
+        cursor_id: UUID | None = None
+        if page is not None:
+            try:
+                cursor_created_at = datetime.fromisoformat(str(page["created_at"]))
+                cursor_id = UUID(str(page["id"]))
+                if (
+                    cursor_created_at.tzinfo is None
+                    or cursor_created_at.utcoffset() is None
+                ):
+                    raise ValueError
+            except (KeyError, TypeError, ValueError) as exc:
+                raise DatasourceCatalogCursorError("Invalid pagination cursor") from exc
+
+        conditions = ["d.job_id IS NULL"]
+        values: list[Any] = [
+            owner_uuid,
+            visible_uuids,
+            is_admin and not restrict_to_projects,
+            restrict_to_projects,
+        ]
+
+        def add_condition(template: str, value: Any) -> None:
+            values.append(value)
+            conditions.append(template.format(param=f"${len(values)}"))
+
+        if is_admin and not restrict_to_projects:
+            pass
+        elif restrict_to_projects:
+            conditions.append(
+                "EXISTS (SELECT 1 FROM project_datasources auth_pd "
+                "WHERE auth_pd.datasource_id = d.id "
+                "AND auth_pd.project_id = ANY($2::uuid[]))"
+            )
+        else:
+            conditions.append(
+                "(d.created_by = $1 OR EXISTS ("
+                "SELECT 1 FROM project_datasources auth_pd "
+                "WHERE auth_pd.datasource_id = d.id "
+                "AND auth_pd.project_id = ANY($2::uuid[])))"
+            )
+        if q and q.strip():
+            add_condition(
+                "(d.name ILIKE '%' || {param} || '%' "
+                "OR COALESCE(d.description, '') ILIKE '%' || {param} || '%')",
+                q.strip(),
+            )
+        if ds_type:
+            add_condition("d.type = {param}", ds_type)
+        if filter_project_uuid:
+            add_condition(
+                "EXISTS (SELECT 1 FROM project_datasources filter_pd "
+                "WHERE filter_pd.datasource_id = d.id "
+                "AND filter_pd.project_id = {param})",
+                filter_project_uuid,
+            )
+        if scope_mode:
+            add_condition("d.scope_mode = {param}", scope_mode)
+        if auto_attach is not None:
+            add_condition("d.auto_attach = {param}", auto_attach)
+        if visibility == "public":
+            conditions.append("d.is_global = TRUE")
+        elif visibility == "private":
+            conditions.append("d.is_global = FALSE")
+        if ownership == "mine":
+            conditions.append("d.created_by = $1")
+        elif ownership == "shared":
+            conditions.append("d.created_by IS DISTINCT FROM $1")
+        if availability == "all":
+            conditions.append("d.scope_mode = 'all'")
+        elif availability == "projects":
+            conditions.append(
+                "d.scope_mode = 'projects' AND EXISTS ("
+                "SELECT 1 FROM project_datasources availability_pd "
+                "WHERE availability_pd.datasource_id = d.id)"
+            )
+        elif availability == "unavailable":
+            conditions.append(
+                "d.scope_mode = 'projects' AND NOT EXISTS ("
+                "SELECT 1 FROM project_datasources availability_pd "
+                "WHERE availability_pd.datasource_id = d.id)"
+            )
+        if cursor_created_at is not None and cursor_id is not None:
+            values.extend([cursor_created_at, cursor_id])
+            conditions.append(
+                f"(d.created_at, d.id) < (${len(values) - 1}, ${len(values)})"
+            )
+
+        safe_limit = max(1, min(int(limit), 100))
+        values.append(safe_limit + 1)
+        where_clause = " AND ".join(conditions)
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                f"""
+                SELECT d.id, d.name, d.description, d.type, d.connection_url,
+                       d.config, d.cli_hint, d.default_branch, d.job_id,
+                       d.created_by, d.is_global, d.read_only, d.scope_mode,
+                       d.auto_attach, d.policy_revision, d.created_at,
+                       d.updated_at,
+                       CASE
+                           WHEN $3::boolean OR (
+                               NOT $4::boolean AND d.created_by = $1
+                           ) THEN
+                               COALESCE((
+                                   SELECT array_agg(pd.project_id ORDER BY pd.project_id)
+                                   FROM project_datasources pd
+                                   WHERE pd.datasource_id = d.id
+                               ), ARRAY[]::uuid[])
+                           ELSE
+                               COALESCE((
+                                   SELECT array_agg(pd.project_id ORDER BY pd.project_id)
+                                   FROM project_datasources pd
+                                   WHERE pd.datasource_id = d.id
+                                     AND pd.project_id = ANY($2::uuid[])
+                               ), ARRAY[]::uuid[])
+                       END AS project_ids
+                FROM datasources d
+                WHERE {where_clause}
+                ORDER BY d.created_at DESC, d.id DESC
+                LIMIT ${len(values)}
+                """,
+                *values,
+            )
+
+        has_more = len(rows) > safe_limit
+        page_rows = rows[:safe_limit]
+        items = [_datasource_row_to_dict(row) for row in page_rows]
+        next_cursor = None
+        if has_more and page_rows:
+            last = page_rows[-1]
+            next_cursor = _encode_page_cursor(
+                {"created_at": last["created_at"], "id": last["id"]}
+            )
+        return {"items": items, "next_cursor": next_cursor}
+
+    async def list_project_linkable_datasources(
+        self,
+        user_id: str,
+        project_id: str,
+        *,
+        is_admin: bool = False,
+        q: str | None = None,
+        limit: int = 50,
+        cursor: str | None = None,
+    ) -> Dict[str, Any]:
+        """Page canonical connectors that may be newly linked to a project.
+
+        The request layer must first establish target-project owner/admin
+        authority. Connector creators may expand their own connector at any
+        scope; a project owner may additionally link another creator's public
+        all-scope connector. Administrators may choose any otherwise eligible
+        connector. Existing links and server-owned native KB rows are excluded.
+        """
+        try:
+            user_uuid = UUID(str(user_id))
+            project_uuid = UUID(str(project_id))
+        except (TypeError, ValueError):
+            return {"items": [], "next_cursor": None}
+
+        page = _decode_page_cursor(cursor)
+        cursor_name: str | None = None
+        cursor_id: UUID | None = None
+        if page is not None:
+            try:
+                cursor_name = str(page["name"])
+                cursor_id = UUID(str(page["id"]))
+            except (KeyError, TypeError, ValueError) as exc:
+                raise DatasourceCatalogCursorError("Invalid pagination cursor") from exc
+
+        conditions = [
+            "d.job_id IS NULL",
+            "NOT (d.type = 'kb' AND d.config ? 'native_project_id')",
+            "NOT EXISTS ("
+            "SELECT 1 FROM project_datasources linked_pd "
+            "WHERE linked_pd.datasource_id = d.id "
+            "AND linked_pd.project_id = $2)",
+            "($3::boolean OR d.created_by = $1 OR ("
+            "d.is_global = TRUE AND d.scope_mode = 'all'))",
+        ]
+        values: list[Any] = [user_uuid, project_uuid, is_admin]
+        if q and q.strip():
+            values.append(q.strip())
+            conditions.append(
+                f"(d.name ILIKE '%' || ${len(values)} || '%' "
+                f"OR COALESCE(d.description, '') ILIKE '%' || ${len(values)} || '%' "
+                f"OR d.type ILIKE '%' || ${len(values)} || '%')"
+            )
+        if cursor_name is not None and cursor_id is not None:
+            values.extend([cursor_name, cursor_id])
+            conditions.append(
+                f"(LOWER(d.name), d.id) > (${len(values) - 1}, ${len(values)})"
+            )
+        safe_limit = max(1, min(int(limit), 100))
+        values.append(safe_limit + 1)
+
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                f"""
+                SELECT d.id, d.name, d.description, d.type, d.connection_url,
+                       d.config, d.cli_hint, d.default_branch, d.job_id,
+                       d.created_by, d.is_global, d.read_only, d.scope_mode,
+                       d.auto_attach, d.policy_revision, d.created_at,
+                       d.updated_at
+                FROM datasources d
+                WHERE {" AND ".join(conditions)}
+                ORDER BY LOWER(d.name), d.id
+                LIMIT ${len(values)}
+                """,
+                *values,
+            )
+
+        has_more = len(rows) > safe_limit
+        page_rows = rows[:safe_limit]
+        items = [_datasource_row_to_dict(row) for row in page_rows]
+        next_cursor = None
+        if has_more and page_rows:
+            last = page_rows[-1]
+            next_cursor = _encode_page_cursor(
+                {"name": str(last["name"]).lower(), "id": last["id"]}
+            )
+        return {"items": items, "next_cursor": next_cursor}
+
+    async def list_linkable_datasource_targets(
+        self,
+        user_id: str,
+        *,
+        datasource_id: str | None = None,
+        is_admin: bool = False,
+        restrict_project_id: str | None = None,
+        q: str | None = None,
+        limit: int = 50,
+        cursor: str | None = None,
+    ) -> Dict[str, Any]:
+        """Page projects the caller may add or must be able to retain/revoke.
+
+        Additions require project-owner authority (admins may add anywhere).
+        On edit, existing links remain visible even after the connector creator
+        loses project ownership; those rows are marked ``retained_only`` and
+        can be preserved or revoked but not re-added later. ``selected_items``
+        is an unpaginated, search-independent copy of every current link so an
+        edit form never drops hidden selections while paging ``items``.
+        """
+        try:
+            user_uuid = UUID(str(user_id))
+            datasource_uuid = UUID(datasource_id) if datasource_id else None
+            restricted_project_uuid = (
+                UUID(restrict_project_id) if restrict_project_id else None
+            )
+        except (TypeError, ValueError):
+            return {"items": [], "selected_items": [], "next_cursor": None}
+        page = _decode_page_cursor(cursor)
+        cursor_name: str | None = None
+        cursor_id: UUID | None = None
+        if page is not None:
+            try:
+                cursor_name = str(page["name"])
+                cursor_id = UUID(str(page["id"]))
+            except (KeyError, TypeError, ValueError) as exc:
+                raise DatasourceCatalogCursorError("Invalid pagination cursor") from exc
+
+        conditions = [
+            "($3::boolean OR pm.role = 'owner' OR pd.datasource_id IS NOT NULL)"
+        ]
+        values: list[Any] = [user_uuid, datasource_uuid, is_admin]
+        if restricted_project_uuid is not None:
+            values.append(restricted_project_uuid)
+            conditions.append(f"p.id = ${len(values)}")
+        if q and q.strip():
+            values.append(q.strip())
+            conditions.append(f"p.name ILIKE '%' || ${len(values)} || '%'")
+        if cursor_name is not None and cursor_id is not None:
+            values.extend([cursor_name, cursor_id])
+            conditions.append(
+                f"(LOWER(p.name), p.id) > (${len(values) - 1}, ${len(values)})"
+            )
+        safe_limit = max(1, min(int(limit), 100))
+        values.append(safe_limit + 1)
+
+        selected_rows = []
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                f"""
+                SELECT p.id, p.name, p.is_default, pm.role AS user_role,
+                       (pd.datasource_id IS NOT NULL) AS linked,
+                       (
+                           $3::boolean
+                           OR COALESCE(pm.role = 'owner', FALSE)
+                       ) AS addable,
+                       (
+                           pd.datasource_id IS NOT NULL
+                           AND NOT (
+                               $3::boolean
+                               OR COALESCE(pm.role = 'owner', FALSE)
+                           )
+                       ) AS retained_only
+                FROM projects p
+                LEFT JOIN project_members pm
+                  ON pm.project_id = p.id AND pm.user_id = $1
+                LEFT JOIN project_datasources pd
+                  ON pd.project_id = p.id AND pd.datasource_id = $2
+                WHERE {" AND ".join(conditions)}
+                ORDER BY LOWER(p.name), p.id
+                LIMIT ${len(values)}
+                """,
+                *values,
+            )
+            if datasource_uuid is not None:
+                selected_conditions = ["pd.datasource_id = $2"]
+                selected_values: list[Any] = [
+                    user_uuid,
+                    datasource_uuid,
+                    is_admin,
+                ]
+                if restricted_project_uuid is not None:
+                    selected_values.append(restricted_project_uuid)
+                    selected_conditions.append(f"p.id = ${len(selected_values)}")
+                selected_rows = await conn.fetch(
+                    f"""
+                    SELECT p.id, p.name, p.is_default, pm.role AS user_role,
+                           TRUE AS linked,
+                           (
+                               $3::boolean
+                               OR COALESCE(pm.role = 'owner', FALSE)
+                           ) AS addable,
+                           NOT (
+                               $3::boolean
+                               OR COALESCE(pm.role = 'owner', FALSE)
+                           ) AS retained_only
+                    FROM project_datasources pd
+                    JOIN projects p ON p.id = pd.project_id
+                    LEFT JOIN project_members pm
+                      ON pm.project_id = p.id AND pm.user_id = $1
+                    WHERE {" AND ".join(selected_conditions)}
+                    ORDER BY LOWER(p.name), p.id
+                    """,
+                    *selected_values,
+                )
+
+        has_more = len(rows) > safe_limit
+        page_rows = rows[:safe_limit]
+        items = [dict(row) for row in page_rows]
+        next_cursor = None
+        if has_more and page_rows:
+            last = page_rows[-1]
+            next_cursor = _encode_page_cursor(
+                {"name": str(last["name"]).lower(), "id": last["id"]}
+            )
+        return {
+            "items": items,
+            "selected_items": [dict(row) for row in selected_rows],
+            "next_cursor": next_cursor,
+        }
 
     async def get_datasource(self, datasource_id: str) -> Dict[str, Any] | None:
         """Get a single datasource by ID.
@@ -7220,7 +8148,8 @@ class PostgresDB:
                 """
                 SELECT id, name, description, type, connection_url, credentials,
                        config, cli_hint, default_branch, job_id, created_by, is_global,
-                       read_only, created_at, updated_at
+                       read_only, scope_mode, auto_attach, policy_revision,
+                       created_at, updated_at
                 FROM datasources
                 WHERE id = $1
                 """,
@@ -7243,6 +8172,11 @@ class PostgresDB:
         is_global: bool = False,
         read_only: bool | None = None,
         config: Dict[str, Any] | None = None,
+        scope_mode: str = "all",
+        auto_attach: bool = False,
+        project_ids: list[str] | None = None,
+        authority_user_id: str | None = None,
+        authority_is_admin: bool = False,
     ) -> Dict[str, Any]:
         """Create a new datasource.
 
@@ -7263,6 +8197,12 @@ class PostgresDB:
             read_only: Declared read-only flag for public datasources
                        (None = not applicable; declarative only)
             config: Non-secret type-specific configuration
+            scope_mode: Availability upper bound (``all`` or ``projects``)
+            auto_attach: Creator-owned creation-time default
+            project_ids: Initial project links, committed with the row
+            authority_user_id: Optional request actor whose target-project
+                owner role is rechecked inside the link transaction
+            authority_is_admin: Whether that request actor is an administrator
 
         Returns:
             Created datasource dict
@@ -7271,34 +8211,89 @@ class PostgresDB:
             asyncpg.UniqueViolationError: If a datasource with the same
                 name+type already exists for the same owner
         """
+        if scope_mode not in {"all", "projects"}:
+            raise DatasourcePolicyValidationError(
+                "scope_mode must be 'all' or 'projects'"
+            )
+        project_uuids = _uuid_list(project_ids)
+        if scope_mode == "projects" and not project_uuids:
+            raise DatasourcePolicyValidationError(
+                "Project-scoped connectors require at least one project"
+            )
+
         job_uuid = UUID(job_id) if job_id else None
         owner_uuid = UUID(created_by) if created_by else None
 
         async with self.acquire() as conn:
-            row = await conn.fetchrow(
-                """
-                INSERT INTO datasources (name, description, type, connection_url,
-                                         credentials, config, job_id, cli_hint,
-                                         default_branch, created_by, is_global,
-                                         read_only)
-                VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9, $10, $11, $12)
-                RETURNING id, name, description, type, connection_url, credentials,
-                          config, job_id, cli_hint, default_branch, created_by, is_global,
-                          read_only, created_at, updated_at
-                """,
-                name,
-                description,
-                ds_type,
-                connection_url,
-                _encrypt_credentials_dict(credentials),
-                json.dumps(config or {}),
-                job_uuid,
-                cli_hint,
-                default_branch,
-                owner_uuid,
-                is_global,
-                read_only,
-            )
+            async with _transaction_if(conn, bool(project_uuids)):
+                await _require_project_owner_for_link_additions(
+                    conn,
+                    project_uuids,
+                    authority_user_id=authority_user_id,
+                    authority_is_admin=authority_is_admin,
+                )
+                row = await conn.fetchrow(
+                    """
+                    INSERT INTO datasources (name, description, type, connection_url,
+                                             credentials, config, job_id, cli_hint,
+                                             default_branch, created_by, is_global,
+                                             read_only, scope_mode, auto_attach)
+                    VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9, $10,
+                            $11, $12, $13, $14)
+                    RETURNING id, name, description, type, connection_url, credentials,
+                              config, job_id, cli_hint, default_branch, created_by,
+                              is_global, read_only, scope_mode, auto_attach,
+                              policy_revision, created_at, updated_at
+                    """,
+                    name,
+                    description,
+                    ds_type,
+                    connection_url,
+                    _encrypt_credentials_dict(credentials),
+                    json.dumps(config or {}),
+                    job_uuid,
+                    cli_hint,
+                    default_branch,
+                    owner_uuid,
+                    is_global,
+                    read_only,
+                    scope_mode,
+                    auto_attach,
+                )
+                datasource_uuid = row["id"]
+                if project_uuids:
+                    # Knowledge connectors keep the existing link-level RO
+                    # invariant. Retained overrides are relevant only on
+                    # update; every row here is a new relationship.
+                    await conn.executemany(
+                        """
+                        INSERT INTO project_datasources (
+                            project_id, datasource_id, read_only
+                        ) VALUES ($1, $2, $3)
+                        """,
+                        [
+                            (
+                                project_uuid,
+                                datasource_uuid,
+                                True if ds_type == "kb" else None,
+                            )
+                            for project_uuid in project_uuids
+                        ],
+                    )
+                    # Link triggers advance policy_revision, so return the
+                    # committed policy token rather than the INSERT snapshot.
+                    row = await conn.fetchrow(
+                        """
+                        SELECT id, name, description, type, connection_url,
+                               credentials, config, job_id, cli_hint,
+                               default_branch, created_by, is_global, read_only,
+                               scope_mode, auto_attach, policy_revision,
+                               created_at, updated_at
+                        FROM datasources
+                        WHERE id = $1
+                        """,
+                        datasource_uuid,
+                    )
 
         return _datasource_row_to_dict(row)
 
@@ -7315,6 +8310,7 @@ class PostgresDB:
         is_global: bool | None = None,
         read_only: bool | None = None,
         connection_url_set: bool = False,
+        authority_project_scope_id: str | None = None,
     ) -> bool:
         """Update a datasource.
 
@@ -7339,6 +8335,16 @@ class PostgresDB:
             uuid_val = UUID(datasource_id)
         except ValueError:
             return False
+        try:
+            authority_scope_uuid = (
+                UUID(str(authority_project_scope_id))
+                if authority_project_scope_id is not None
+                else None
+            )
+        except (TypeError, ValueError) as exc:
+            raise DatasourceScopeAuthorizationError(
+                "Connector mutation exceeds the caller's project scope"
+            ) from exc
 
         updates = []
         values = []
@@ -7385,6 +8391,10 @@ class PostgresDB:
             param_count += 1
             updates.append(f"is_global = ${param_count}")
             values.append(is_global)
+            # Public visibility participates in explicit authorization. Advance
+            # the same token that creation snapshots so an unpublish between
+            # authorization and materialization cannot reuse a stale decision.
+            updates.append("policy_revision = policy_revision + 1")
 
         if read_only is not None:
             param_count += 1
@@ -7398,13 +8408,429 @@ class PostgresDB:
         values.append(uuid_val)
 
         query = f"UPDATE datasources SET {', '.join(updates)} WHERE id = ${param_count}"
+        # Keep this dependency set aligned with
+        # ``main._build_datasource_note_content``. Credential *values* never
+        # enter the note, but generic connectors expose their environment
+        # variable names. An explicit URL clear is content-changing too.
+        note_content_changed = (
+            connection_url is not None
+            or connection_url_set
+            or any(
+                value is not None
+                for value in (
+                    name,
+                    description,
+                    credentials,
+                    cli_hint,
+                    default_branch,
+                    config,
+                )
+            )
+        )
 
         async with self.acquire() as conn:
-            result = await conn.execute(query, *values)
+            async with _transaction_if(
+                conn, note_content_changed or authority_scope_uuid is not None
+            ):
+                if authority_scope_uuid is not None:
+                    scoped_row = await conn.fetchrow(
+                        """
+                        SELECT scope_mode
+                        FROM datasources
+                        WHERE id = $1
+                        FOR UPDATE
+                        """,
+                        uuid_val,
+                    )
+                    if scoped_row is None:
+                        return False
+                    scoped_links = await conn.fetch(
+                        """
+                        SELECT project_id
+                        FROM project_datasources
+                        WHERE datasource_id = $1
+                        FOR UPDATE
+                        """,
+                        uuid_val,
+                    )
+                    if scoped_row["scope_mode"] != "projects" or {
+                        row["project_id"] for row in scoped_links
+                    } != {authority_scope_uuid}:
+                        raise DatasourceScopeAuthorizationError(
+                            "Connector mutation exceeds the caller's project scope"
+                        )
+                result = await conn.execute(query, *values)
+                if result == "UPDATE 1" and note_content_changed:
+                    await conn.execute(
+                        """
+                        INSERT INTO datasource_project_reconcile_queue (
+                            project_id, datasource_id, policy_revision,
+                            attempts, next_attempt_at, last_error, updated_at
+                        )
+                        SELECT pd.project_id, d.id, d.policy_revision,
+                               0, NOW(), NULL, NOW()
+                        FROM datasources d
+                        JOIN project_datasources pd ON pd.datasource_id = d.id
+                        WHERE d.id = $1
+                        ON CONFLICT (project_id, datasource_id) DO UPDATE
+                        SET policy_revision = GREATEST(
+                                datasource_project_reconcile_queue.policy_revision,
+                                EXCLUDED.policy_revision
+                            ),
+                            claim_token = nextval(
+                                'datasource_project_reconcile_generation_seq'
+                            ),
+                            attempts = 0,
+                            next_attempt_at = NOW(),
+                            last_error = NULL,
+                            updated_at = NOW()
+                        """,
+                        uuid_val,
+                    )
 
         return result == "UPDATE 1"
 
-    async def delete_datasource(self, datasource_id: str) -> bool:
+    async def update_datasource_policy(
+        self,
+        datasource_id: str,
+        *,
+        expected_policy_revision: int,
+        scope_mode: str | None = None,
+        auto_attach: bool | None = None,
+        project_ids: list[str] | None = None,
+        authority_user_id: str | None = None,
+        authority_is_admin: bool = False,
+        authority_project_scope_id: str | None = None,
+    ) -> Dict[str, Any] | None:
+        """Atomically replace a connector's availability/default policy.
+
+        ``project_ids=None`` means preserve the complete link set; ``[]`` is
+        an explicit request to clear it. Retained junction rows are never
+        updated, so their ``linked_at``, ``read_only`` and ``description``
+        values survive a full-set edit. The request layer remains responsible
+        for authorizing additions/removals; this method owns structural
+        validation, row locking, optimistic concurrency and persistence.
+
+        Returns the updated datasource (including ``project_ids``), ``None``
+        if it does not exist, or raises :class:`DatasourcePolicyConflictError`
+        / :class:`DatasourcePolicyValidationError`.
+        """
+        return await self.update_datasource_with_policy(
+            datasource_id,
+            expected_policy_revision=expected_policy_revision,
+            scope_mode=scope_mode,
+            auto_attach=auto_attach,
+            project_ids=project_ids,
+            authority_user_id=authority_user_id,
+            authority_is_admin=authority_is_admin,
+            authority_project_scope_id=authority_project_scope_id,
+        )
+
+    async def update_datasource_with_policy(
+        self,
+        datasource_id: str,
+        *,
+        expected_policy_revision: int,
+        scope_mode: str | None = None,
+        auto_attach: bool | None = None,
+        project_ids: list[str] | None = None,
+        name: str | None = None,
+        description: str | None = None,
+        connection_url: str | None = None,
+        credentials: Dict[str, Any] | None = None,
+        cli_hint: str | None = None,
+        default_branch: str | None = None,
+        config: Dict[str, Any] | None = None,
+        is_global: bool | None = None,
+        read_only: bool | None = None,
+        connection_url_set: bool = False,
+        authority_user_id: str | None = None,
+        authority_is_admin: bool = False,
+        authority_project_scope_id: str | None = None,
+    ) -> Dict[str, Any] | None:
+        """Atomically update connector content, policy, and project links.
+
+        Policy ``None`` values mean preserve, while ``project_ids=[]`` clears
+        the desired set. Request models must reject explicit JSON null before
+        calling this persistence boundary. Retained project rows are untouched.
+        """
+        try:
+            datasource_uuid = UUID(datasource_id)
+        except ValueError as exc:
+            raise DatasourcePolicyValidationError(
+                "One or more connector or project identifiers are invalid"
+            ) from exc
+        if expected_policy_revision < 1:
+            raise DatasourcePolicyValidationError(
+                "policy_revision must be a positive integer"
+            )
+        if scope_mode is not None and scope_mode not in {"all", "projects"}:
+            raise DatasourcePolicyValidationError(
+                "scope_mode must be 'all' or 'projects'"
+            )
+        desired_project_uuids = (
+            _uuid_list(project_ids) if project_ids is not None else None
+        )
+        try:
+            authority_scope_uuid = (
+                UUID(str(authority_project_scope_id))
+                if authority_project_scope_id is not None
+                else None
+            )
+        except (TypeError, ValueError) as exc:
+            raise DatasourceScopeAuthorizationError(
+                "Connector mutation exceeds the caller's project scope"
+            ) from exc
+
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                current = await conn.fetchrow(
+                    """
+                    SELECT id, name, description, type, connection_url,
+                           credentials, config, job_id, cli_hint,
+                           default_branch, created_by, is_global, read_only,
+                           scope_mode, auto_attach, policy_revision,
+                           created_at, updated_at
+                    FROM datasources
+                    WHERE id = $1
+                    FOR UPDATE
+                    """,
+                    datasource_uuid,
+                )
+                if current is None:
+                    return None
+                if int(current["policy_revision"]) != expected_policy_revision:
+                    raise DatasourcePolicyConflictError(
+                        "Connector policy changed; reload it and try again"
+                    )
+
+                link_rows = await conn.fetch(
+                    """
+                    SELECT project_id, linked_at, read_only, description
+                    FROM project_datasources
+                    WHERE datasource_id = $1
+                    FOR UPDATE
+                    """,
+                    datasource_uuid,
+                )
+                current_project_uuids = {row["project_id"] for row in link_rows}
+                if authority_scope_uuid is not None and (
+                    current["scope_mode"] != "projects"
+                    or current_project_uuids != {authority_scope_uuid}
+                ):
+                    raise DatasourceScopeAuthorizationError(
+                        "Connector mutation exceeds the caller's project scope"
+                    )
+                resulting_project_uuids = (
+                    set(desired_project_uuids)
+                    if desired_project_uuids is not None
+                    else current_project_uuids
+                )
+                resulting_scope = scope_mode or current["scope_mode"]
+                if (
+                    current["scope_mode"] == "all"
+                    and resulting_scope == "projects"
+                    and desired_project_uuids is None
+                ):
+                    raise DatasourcePolicyValidationError(
+                        "Switching to project scope requires an explicit project list"
+                    )
+                if resulting_scope == "projects" and not resulting_project_uuids:
+                    raise DatasourcePolicyValidationError(
+                        "Project-scoped connectors require at least one project"
+                    )
+                if authority_scope_uuid is not None and (
+                    resulting_scope != "projects"
+                    or resulting_project_uuids != {authority_scope_uuid}
+                ):
+                    raise DatasourceScopeAuthorizationError(
+                        "Connector mutation exceeds the caller's project scope"
+                    )
+
+                additions = (
+                    [
+                        project_uuid
+                        for project_uuid in desired_project_uuids
+                        if project_uuid not in current_project_uuids
+                    ]
+                    if desired_project_uuids is not None
+                    else []
+                )
+                await _require_project_owner_for_link_additions(
+                    conn,
+                    additions,
+                    authority_user_id=authority_user_id,
+                    authority_is_admin=authority_is_admin,
+                )
+
+                resulting_auto_attach = (
+                    bool(auto_attach)
+                    if auto_attach is not None
+                    else bool(current["auto_attach"])
+                )
+                row_policy_changed = (
+                    resulting_scope != current["scope_mode"]
+                    or resulting_auto_attach != bool(current["auto_attach"])
+                    or (
+                        is_global is not None
+                        and bool(is_global) != bool(current["is_global"])
+                    )
+                )
+
+                updates: list[str] = []
+                values: list[Any] = []
+
+                def add_update(column: str, value: Any, *, jsonb: bool = False) -> None:
+                    values.append(value)
+                    cast = "::jsonb" if jsonb else ""
+                    updates.append(f"{column} = ${len(values)}{cast}")
+
+                if name is not None:
+                    add_update("name", name)
+                if description is not None:
+                    add_update("description", description)
+                if connection_url is not None or connection_url_set:
+                    add_update("connection_url", connection_url)
+                if credentials is not None:
+                    add_update("credentials", _encrypt_credentials_dict(credentials))
+                if cli_hint is not None:
+                    add_update("cli_hint", cli_hint)
+                if default_branch is not None:
+                    add_update("default_branch", default_branch)
+                if config is not None:
+                    add_update("config", json.dumps(config), jsonb=True)
+                if is_global is not None:
+                    add_update("is_global", is_global)
+                if read_only is not None:
+                    add_update("read_only", read_only)
+                if row_policy_changed:
+                    add_update("scope_mode", resulting_scope)
+                    add_update("auto_attach", resulting_auto_attach)
+                    updates.append("policy_revision = policy_revision + 1")
+                if updates:
+                    values.extend([datasource_uuid, expected_policy_revision])
+                    result = await conn.execute(
+                        f"""
+                        UPDATE datasources
+                        SET {", ".join(updates)}, updated_at = NOW()
+                        WHERE id = ${len(values) - 1}
+                          AND policy_revision = ${len(values)}
+                        """,
+                        *values,
+                    )
+                    if result != "UPDATE 1":
+                        raise DatasourcePolicyConflictError(
+                            "Connector policy changed; reload it and try again"
+                        )
+
+                if desired_project_uuids is not None:
+                    desired_set = set(desired_project_uuids)
+                    removals = current_project_uuids - desired_set
+                    if additions:
+                        await conn.executemany(
+                            """
+                            INSERT INTO project_datasources (
+                                project_id, datasource_id, read_only
+                            ) VALUES ($1, $2, $3)
+                            """,
+                            [
+                                (
+                                    project_uuid,
+                                    datasource_uuid,
+                                    True if current["type"] == "kb" else None,
+                                )
+                                for project_uuid in additions
+                            ],
+                        )
+                    if removals:
+                        await conn.execute(
+                            """
+                            DELETE FROM project_datasources
+                            WHERE datasource_id = $1
+                              AND project_id = ANY($2::uuid[])
+                            """,
+                            datasource_uuid,
+                            list(removals),
+                        )
+
+                # Keep this dependency set aligned with
+                # ``main._build_datasource_note_content``. Credential values
+                # stay secret; generic note content only exposes ENV names.
+                note_content_changed = (
+                    connection_url is not None
+                    or connection_url_set
+                    or any(
+                        value is not None
+                        for value in (
+                            name,
+                            description,
+                            credentials,
+                            cli_hint,
+                            default_branch,
+                            config,
+                        )
+                    )
+                )
+                if note_content_changed:
+                    await conn.execute(
+                        """
+                        INSERT INTO datasource_project_reconcile_queue (
+                            project_id, datasource_id, policy_revision,
+                            attempts, next_attempt_at, last_error, updated_at
+                        )
+                        SELECT pd.project_id, d.id, d.policy_revision,
+                               0, NOW(), NULL, NOW()
+                        FROM datasources d
+                        JOIN project_datasources pd ON pd.datasource_id = d.id
+                        WHERE d.id = $1
+                        ON CONFLICT (project_id, datasource_id) DO UPDATE
+                        SET policy_revision = GREATEST(
+                                datasource_project_reconcile_queue.policy_revision,
+                                EXCLUDED.policy_revision
+                            ),
+                            claim_token = nextval(
+                                'datasource_project_reconcile_generation_seq'
+                            ),
+                            attempts = 0,
+                            next_attempt_at = NOW(),
+                            last_error = NULL,
+                            updated_at = NOW()
+                        """,
+                        datasource_uuid,
+                    )
+
+                updated = await conn.fetchrow(
+                    """
+                    SELECT id, name, description, type, connection_url,
+                           credentials, config, job_id, cli_hint,
+                           default_branch, created_by, is_global, read_only,
+                           scope_mode, auto_attach, policy_revision,
+                           created_at, updated_at
+                    FROM datasources
+                    WHERE id = $1
+                    """,
+                    datasource_uuid,
+                )
+                final_links = await conn.fetch(
+                    """
+                    SELECT project_id
+                    FROM project_datasources
+                    WHERE datasource_id = $1
+                    ORDER BY project_id
+                    """,
+                    datasource_uuid,
+                )
+
+        result = _datasource_row_to_dict(updated)
+        result["project_ids"] = [str(row["project_id"]) for row in final_links]
+        return result
+
+    async def delete_datasource(
+        self,
+        datasource_id: str,
+        *,
+        authority_project_scope_id: str | None = None,
+    ) -> bool:
         """Delete a datasource.
 
         Args:
@@ -7417,12 +8843,50 @@ class PostgresDB:
             uuid_val = UUID(datasource_id)
         except ValueError:
             return False
+        try:
+            authority_scope_uuid = (
+                UUID(str(authority_project_scope_id))
+                if authority_project_scope_id is not None
+                else None
+            )
+        except (TypeError, ValueError) as exc:
+            raise DatasourceScopeAuthorizationError(
+                "Connector mutation exceeds the caller's project scope"
+            ) from exc
 
         async with self.acquire() as conn:
-            result = await conn.execute(
-                "DELETE FROM datasources WHERE id = $1",
-                uuid_val,
-            )
+            async with _transaction_if(conn, authority_scope_uuid is not None):
+                if authority_scope_uuid is not None:
+                    scoped_row = await conn.fetchrow(
+                        """
+                        SELECT scope_mode
+                        FROM datasources
+                        WHERE id = $1
+                        FOR UPDATE
+                        """,
+                        uuid_val,
+                    )
+                    if scoped_row is None:
+                        return False
+                    scoped_links = await conn.fetch(
+                        """
+                        SELECT project_id
+                        FROM project_datasources
+                        WHERE datasource_id = $1
+                        FOR UPDATE
+                        """,
+                        uuid_val,
+                    )
+                    if scoped_row["scope_mode"] != "projects" or {
+                        row["project_id"] for row in scoped_links
+                    } != {authority_scope_uuid}:
+                        raise DatasourceScopeAuthorizationError(
+                            "Connector mutation exceeds the caller's project scope"
+                        )
+                result = await conn.execute(
+                    "DELETE FROM datasources WHERE id = $1",
+                    uuid_val,
+                )
 
         return result == "DELETE 1"
 
@@ -7472,12 +8936,6 @@ class PostgresDB:
         setting (CLI vs tools mode) for a selected datasource that is also
         linked to that project; it never widens the result set.
 
-        Transitional: jobs created before the explicit-only migration (0026)
-        persisted their selection by cloning rows with ``datasources.job_id``
-        set. If a job has no ``job_datasources`` rows, fall back to those legacy
-        clones so in-flight jobs keep resolving. Remove once no live job
-        predates 0026.
-
         Args:
             job_id: Job UUID
             project_id: Optional project UUID (only for project_read_only)
@@ -7498,7 +8956,8 @@ class PostgresDB:
                 SELECT DISTINCT d.id, d.name, d.description, d.type,
                     d.connection_url, d.credentials, d.config,
                     d.cli_hint, d.default_branch, d.read_only,
-                    d.created_by, d.created_at, d.updated_at,
+                    d.created_by, d.is_global, d.scope_mode, d.auto_attach,
+                    d.policy_revision, d.created_at, d.updated_at,
                     pd.read_only AS project_read_only
                 FROM job_datasources jd
                 JOIN datasources d ON d.id = jd.datasource_id
@@ -7510,22 +8969,6 @@ class PostgresDB:
                 job_uuid,
                 project_uuid,
             )
-            if not rows:
-                # Transitional fallback: legacy clone-to-job-scoped rows (pre-0026).
-                rows = await conn.fetch(
-                    """
-                    SELECT DISTINCT d.id, d.name, d.description, d.type,
-                        d.connection_url, d.credentials, d.config,
-                        d.cli_hint, d.default_branch, d.read_only,
-                        d.created_by, d.created_at, d.updated_at,
-                        NULL::boolean AS project_read_only
-                    FROM datasources d
-                    WHERE d.job_id = $1
-                      AND d.type <> 'kb'
-                    ORDER BY d.type, d.name
-                    """,
-                    job_uuid,
-                )
 
         resolved = [_datasource_row_to_dict(row) for row in rows]
         await self._stamp_email_autonomous_send(resolved)
@@ -7545,8 +8988,12 @@ class PostgresDB:
         selected.
 
         ``project_ids`` is used solely to surface the project-level ``read_only``
-        setting for a selected datasource that is also linked to one of those
-        projects; it never widens the result set.
+        setting for a selected datasource that is linked to those projects; it
+        never widens the result set. Selection authorization applies all-match
+        scope before this resolver runs. For a multi-project thread, this query
+        keeps one row per selected connector and conservatively applies
+        ``BOOL_OR`` across its matching project overrides: any read-only link
+        makes the connector read-only for the combined session.
 
         Args:
             datasource_ids: Explicit datasource UUIDs attached to the thread
@@ -7575,17 +9022,21 @@ class PostgresDB:
         async with self.acquire() as conn:
             rows = await conn.fetch(
                 """
-                SELECT DISTINCT d.id, d.name, d.description, d.type,
+                SELECT d.id, d.name, d.description, d.type,
                     d.connection_url, d.credentials, d.config,
                     d.cli_hint, d.default_branch, d.read_only,
-                    d.created_by, d.created_at, d.updated_at,
-                    pd.read_only AS project_read_only
+                    d.created_by, d.is_global, d.scope_mode, d.auto_attach,
+                    d.policy_revision, d.created_at, d.updated_at,
+                    project_policy.read_only AS project_read_only
                 FROM datasources d
-                LEFT JOIN project_datasources pd
-                    ON pd.datasource_id = d.id
-                   AND pd.project_id = ANY($2::uuid[])
+                LEFT JOIN LATERAL (
+                    SELECT BOOL_OR(pd.read_only) AS read_only
+                    FROM project_datasources pd
+                    WHERE pd.datasource_id = d.id
+                      AND pd.project_id = ANY($2::uuid[])
+                ) project_policy ON TRUE
                 WHERE d.id = ANY($1::uuid[])
-                ORDER BY d.type, d.name
+                ORDER BY d.type, d.name, d.id
                 """,
                 ds_uuids,
                 proj_uuids,
@@ -7626,10 +9077,9 @@ class PostgresDB:
     async def list_job_datasource_ids(self, job_id: str) -> List[str]:
         """Return the datasource IDs explicitly attached to a job.
 
-        Reads the ``job_datasources`` junction; falls back to legacy
-        clone-to-job-scoped rows (``datasources.job_id``) for jobs created
-        before migration 0026 so parent inheritance keeps working during the
-        transition.
+        Reads only the canonical ``job_datasources`` junction. Migration 0082
+        backfills every legacy ``datasources.job_id`` relationship first, so
+        an empty result is now an authoritative explicit empty selection.
         """
         try:
             j_uuid = UUID(job_id)
@@ -7638,16 +9088,15 @@ class PostgresDB:
 
         async with self.acquire() as conn:
             rows = await conn.fetch(
-                "SELECT datasource_id FROM job_datasources WHERE job_id = $1",
+                """
+                SELECT datasource_id
+                FROM job_datasources
+                WHERE job_id = $1
+                ORDER BY linked_at, datasource_id
+                """,
                 j_uuid,
             )
-            if rows:
-                return [str(r["datasource_id"]) for r in rows]
-            legacy = await conn.fetch(
-                "SELECT id FROM datasources WHERE job_id = $1",
-                j_uuid,
-            )
-        return [str(r["id"]) for r in legacy]
+        return [str(r["datasource_id"]) for r in rows]
 
     async def list_eligible_datasources(
         self,
@@ -7656,13 +9105,14 @@ class PostgresDB:
         *,
         is_admin: bool = False,
     ) -> List[Dict[str, Any]]:
-        """Datasources a user may pre-select for a job/session (picker source).
+        """Return execution-authorized, in-scope picker rows.
 
-        Union of: datasources the user created, global datasources, and
-        datasources linked to any of ``project_ids``. Excludes legacy
-        job-scoped clones (``datasources.job_id`` set). Admins see all
-        non-job-scoped datasources. Credentials are decrypted here; callers
-        must redact before returning over REST.
+        Project-link authorization is target-bound: a private connector shared
+        through Project A is not portable into Project B or projectless work.
+        Restricted connectors use all-match semantics for multi-project work.
+        ``default_selected`` is owner-only except for the server-owned native
+        project KB marker. Credentials are decrypted here; REST callers must
+        redact them before returning the rows.
         """
         try:
             u_uuid = UUID(user_id) if user_id else None
@@ -7676,44 +9126,240 @@ class PostgresDB:
             except ValueError:
                 pass
 
-        select_cols = """
-            SELECT DISTINCT d.id, d.name, d.description, d.type,
-                d.connection_url, d.credentials, d.config, d.cli_hint,
-                d.default_branch, d.created_by, d.is_global, d.read_only,
-                d.created_at, d.updated_at
-        """
+        project_id_strings = [str(value) for value in proj_uuids]
 
         async with self.acquire() as conn:
-            if is_admin:
-                rows = await conn.fetch(
-                    select_cols
-                    + """
-                    FROM datasources d
-                    WHERE d.job_id IS NULL
-                    ORDER BY d.type, d.name
-                    """,
-                )
-            else:
-                rows = await conn.fetch(
-                    select_cols
-                    + """
-                    FROM datasources d
-                    LEFT JOIN project_datasources pd
-                        ON pd.datasource_id = d.id
-                       AND pd.project_id = ANY($2::uuid[])
-                    WHERE d.job_id IS NULL
-                      AND (
-                          d.created_by = $1
-                          OR d.is_global = true
-                          OR pd.project_id IS NOT NULL
+            rows = await conn.fetch(
+                """
+                SELECT d.id, d.name, d.description, d.type,
+                       d.connection_url, d.credentials, d.config, d.cli_hint,
+                       d.default_branch, d.created_by, d.is_global, d.read_only,
+                       d.scope_mode, d.auto_attach, d.policy_revision,
+                       d.created_at, d.updated_at,
+                       (
+                           d.auto_attach
+                           AND (
+                               d.created_by = $1
+                               OR (
+                                   d.type = 'kb'
+                                   AND d.config->>'native_project_id'
+                                       = ANY($4::text[])
+                                   AND (
+                                       $3::boolean
+                                       OR EXISTS (
+                                           SELECT 1
+                                           FROM project_members native_pm
+                                           WHERE native_pm.project_id::text =
+                                                 d.config->>'native_project_id'
+                                             AND native_pm.user_id = $1
+                                       )
+                                   )
+                               )
+                           )
+                       ) AS default_selected
+                FROM datasources d
+                WHERE d.job_id IS NULL
+                  AND (
+                      d.scope_mode = 'all'
+                      OR (
+                          d.scope_mode = 'projects'
+                          AND (
+                              (
+                                  cardinality($2::uuid[]) > 0
+                                  AND NOT EXISTS (
+                                      SELECT 1
+                                      FROM unnest($2::uuid[]) work_project_id
+                                      WHERE NOT EXISTS (
+                                          SELECT 1
+                                          FROM project_datasources scope_pd
+                                          WHERE scope_pd.datasource_id = d.id
+                                            AND scope_pd.project_id = work_project_id
+                                      )
+                                  )
+                              )
+                              OR (
+                                  d.type = 'kb'
+                                  AND d.config->>'native_project_id'
+                                      = ANY($4::text[])
+                              )
+                          )
                       )
-                    ORDER BY d.type, d.name
-                    """,
-                    u_uuid,
-                    proj_uuids,
-                )
+                  )
+                  AND (
+                      $3::boolean
+                      OR d.created_by = $1
+                      OR d.is_global = TRUE
+                      OR (
+                          cardinality($2::uuid[]) > 0
+                          AND NOT EXISTS (
+                              SELECT 1
+                              FROM unnest($2::uuid[]) work_project_id
+                              WHERE NOT EXISTS (
+                                  SELECT 1
+                                  FROM project_datasources access_pd
+                                  WHERE access_pd.datasource_id = d.id
+                                    AND access_pd.project_id = work_project_id
+                              )
+                          )
+                          AND NOT EXISTS (
+                              SELECT 1
+                              FROM unnest($2::uuid[]) work_project_id
+                              WHERE NOT EXISTS (
+                                  SELECT 1
+                                  FROM project_members access_pm
+                                  WHERE access_pm.project_id = work_project_id
+                                    AND access_pm.user_id = $1
+                              )
+                          )
+                      )
+                      OR (
+                          d.type = 'kb'
+                          AND d.config->>'native_project_id' = ANY($4::text[])
+                          AND EXISTS (
+                              SELECT 1
+                              FROM project_members native_pm
+                              WHERE native_pm.project_id::text =
+                                    d.config->>'native_project_id'
+                                AND native_pm.user_id = $1
+                          )
+                      )
+                  )
+                ORDER BY d.type, d.name, d.id
+                """,
+                u_uuid,
+                proj_uuids,
+                is_admin,
+                project_id_strings,
+            )
 
         return [_datasource_row_to_dict(row) for row in rows]
+
+    async def get_datasource_policy_rows(
+        self,
+        datasource_ids: list[str],
+        *,
+        legacy_job_id: str | None = None,
+    ) -> List[Dict[str, Any]]:
+        """Load canonical policy descriptors and all project links in one read.
+
+        The result intentionally excludes credentials. Callers use it to make
+        one authorization decision for a complete explicit/inherited set, then
+        resolve secrets only after that decision succeeds. Canonical connector
+        reads exclude historical ``datasources.job_id`` rows. A queued/resumed
+        legacy job may opt into only rows bound to that exact job; this keeps
+        migration-0082 attachments usable without making job-private rows
+        selectable by new work.
+        """
+        datasource_uuids = _uuid_list(datasource_ids)
+        if not datasource_uuids:
+            return []
+        try:
+            legacy_job_uuid = UUID(legacy_job_id) if legacy_job_id else None
+        except (TypeError, ValueError) as exc:
+            raise DatasourcePolicyValidationError(
+                "One or more connector or project identifiers are invalid"
+            ) from exc
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT d.id, d.type, d.created_by, d.is_global, d.config, d.job_id,
+                       d.scope_mode, d.auto_attach, d.policy_revision,
+                       COALESCE(
+                           array_agg(pd.project_id ORDER BY pd.project_id)
+                               FILTER (WHERE pd.project_id IS NOT NULL),
+                           ARRAY[]::uuid[]
+                       ) AS project_ids
+                FROM datasources d
+                LEFT JOIN project_datasources pd ON pd.datasource_id = d.id
+                WHERE d.id = ANY($1::uuid[])
+                  AND (d.job_id IS NULL OR d.job_id = $2::uuid)
+                GROUP BY d.id
+                """,
+                datasource_uuids,
+                legacy_job_uuid,
+            )
+        return [_datasource_row_to_dict(row) for row in rows]
+
+    async def list_default_datasource_candidates(
+        self,
+        effective_work_owner_id: str | None,
+        project_ids: list[str] | None = None,
+    ) -> List[Dict[str, Any]]:
+        """Load only rows that may participate in automatic defaulting.
+
+        Ordinary candidates must be owned by ``effective_work_owner_id`` and
+        have ``auto_attach=true``. Native project KB rows are the sole
+        ownerless/project-managed exception. The central policy service still
+        applies scope, membership, tier, and native-marker checks before it
+        returns IDs.
+        """
+        try:
+            owner_uuid = (
+                UUID(effective_work_owner_id) if effective_work_owner_id else None
+            )
+        except ValueError:
+            return []
+        project_uuids = _uuid_list(project_ids)
+        project_id_strings = [str(value) for value in project_uuids]
+        if owner_uuid is None:
+            # Userless system work must opt in through an explicit inherited
+            # selection; it never receives ambient connector defaults.
+            return []
+
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT d.id, d.type, d.created_by, d.is_global, d.config,
+                       d.scope_mode, d.auto_attach, d.policy_revision,
+                       COALESCE(
+                           array_agg(pd.project_id ORDER BY pd.project_id)
+                               FILTER (WHERE pd.project_id IS NOT NULL),
+                           ARRAY[]::uuid[]
+                       ) AS project_ids
+                FROM datasources d
+                LEFT JOIN project_datasources pd ON pd.datasource_id = d.id
+                WHERE d.job_id IS NULL
+                  AND d.auto_attach = TRUE
+                  AND (
+                      d.created_by = $1
+                      OR (
+                          d.type = 'kb'
+                          AND d.config->>'native_project_id' = ANY($2::text[])
+                      )
+                  )
+                GROUP BY d.id
+                ORDER BY d.type, d.id
+                """,
+                owner_uuid,
+                project_id_strings,
+            )
+        return [_datasource_row_to_dict(row) for row in rows]
+
+    async def user_is_member_of_projects(
+        self, user_id: str | None, project_ids: list[str] | None
+    ) -> bool:
+        """Whether ``user_id`` is currently a member of every target project."""
+        if not user_id:
+            return False
+        try:
+            user_uuid = UUID(user_id)
+            project_uuids = _uuid_list(project_ids)
+        except (ValueError, DatasourcePolicyValidationError):
+            return False
+        if not project_uuids:
+            return False
+        async with self.acquire() as conn:
+            count = await conn.fetchval(
+                """
+                SELECT COUNT(DISTINCT project_id)
+                FROM project_members
+                WHERE user_id = $1
+                  AND project_id = ANY($2::uuid[])
+                """,
+                user_uuid,
+                project_uuids,
+            )
+        return int(count or 0) == len(project_uuids)
 
     # -- Project ↔ Datasource junction (N:M) ----------------------------------
 
@@ -7723,6 +9369,9 @@ class PostgresDB:
         datasource_id: str,
         read_only: bool | None = None,
         description: str | None = None,
+        *,
+        authority_user_id: str | None = None,
+        authority_is_admin: bool = False,
     ) -> bool:
         """Link a datasource to a project with optional overrides.
 
@@ -7735,26 +9384,99 @@ class PostgresDB:
             return False
 
         async with self.acquire() as conn:
-            result = await conn.execute(
-                """
-                INSERT INTO project_datasources (project_id, datasource_id, read_only, description)
-                VALUES ($1, $2, $3, $4)
-                ON CONFLICT (project_id, datasource_id) DO UPDATE SET
-                    read_only = EXCLUDED.read_only,
-                    description = EXCLUDED.description
-                """,
-                p_uuid,
-                d_uuid,
-                read_only,
-                description,
-            )
+            async with conn.transaction():
+                datasource = await conn.fetchrow(
+                    """
+                    SELECT id, created_by, is_global, scope_mode,
+                           (
+                               type = 'kb'
+                               AND NULLIF(config->>'native_project_id', '')
+                                   IS NOT NULL
+                           ) AS is_native
+                    FROM datasources
+                    WHERE id = $1
+                    FOR UPDATE
+                    """,
+                    d_uuid,
+                )
+                if datasource is None:
+                    return False
+                existing = await conn.fetchrow(
+                    """
+                    SELECT 1
+                    FROM project_datasources
+                    WHERE project_id = $1 AND datasource_id = $2
+                    FOR UPDATE
+                    """,
+                    p_uuid,
+                    d_uuid,
+                )
+                if existing is None:
+                    actor_is_admin = await _require_project_owner_for_link_additions(
+                        conn,
+                        [p_uuid],
+                        authority_user_id=authority_user_id,
+                        authority_is_admin=authority_is_admin,
+                    )
+                    if authority_user_id is not None and (
+                        bool(datasource["is_native"])
+                        or not (
+                            actor_is_admin
+                            or str(datasource["created_by"] or "")
+                            == str(authority_user_id)
+                            or (
+                                bool(datasource["is_global"])
+                                and datasource["scope_mode"] == "all"
+                            )
+                        )
+                    ):
+                        raise DatasourceProjectAuthorizationError(
+                            "Not authorized to add this connector project link"
+                        )
+                else:
+                    # POST is an override update when the junction already
+                    # exists. Re-check current project-owner authority under
+                    # the same locks as PATCH; connector ownership alone is
+                    # intentionally insufficient for project settings.
+                    await _require_project_link_mutation_authority(
+                        conn,
+                        p_uuid,
+                        datasource_created_by=datasource.get("created_by"),
+                        authority_user_id=authority_user_id,
+                        authority_is_admin=authority_is_admin,
+                        allow_connector_owner=False,
+                    )
+                result = await conn.execute(
+                    """
+                    INSERT INTO project_datasources (
+                        project_id, datasource_id, read_only, description
+                    )
+                    VALUES ($1, $2, $3, $4)
+                    ON CONFLICT (project_id, datasource_id) DO UPDATE SET
+                        read_only = EXCLUDED.read_only,
+                        description = EXCLUDED.description
+                    """,
+                    p_uuid,
+                    d_uuid,
+                    read_only,
+                    description,
+                )
 
         return "INSERT" in result or "UPDATE" in result
 
     async def unlink_datasource_from_project(
-        self, project_id: str, datasource_id: str
+        self,
+        project_id: str,
+        datasource_id: str,
+        *,
+        authority_user_id: str | None = None,
+        authority_is_admin: bool = False,
     ) -> bool:
         """Unlink a datasource from a project.
+
+        When caller authority is supplied, current approval plus admin,
+        project-owner, or connector-creator revocation authority is checked
+        under lock in the mutation transaction.
 
         Returns True if unlinked, False if not found.
         """
@@ -7765,11 +9487,32 @@ class PostgresDB:
             return False
 
         async with self.acquire() as conn:
-            result = await conn.execute(
-                "DELETE FROM project_datasources WHERE project_id = $1 AND datasource_id = $2",
-                p_uuid,
-                d_uuid,
-            )
+            async with conn.transaction():
+                datasource = await conn.fetchrow(
+                    """
+                    SELECT id, created_by
+                    FROM datasources
+                    WHERE id = $1
+                    FOR UPDATE
+                    """,
+                    d_uuid,
+                )
+                if datasource is None:
+                    return False
+                await _require_project_link_mutation_authority(
+                    conn,
+                    p_uuid,
+                    datasource_created_by=datasource.get("created_by"),
+                    authority_user_id=authority_user_id,
+                    authority_is_admin=authority_is_admin,
+                    allow_connector_owner=True,
+                )
+                result = await conn.execute(
+                    "DELETE FROM project_datasources "
+                    "WHERE project_id = $1 AND datasource_id = $2",
+                    p_uuid,
+                    d_uuid,
+                )
 
         return result == "DELETE 1"
 
@@ -7792,6 +9535,7 @@ class PostgresDB:
                        d.type, d.connection_url, d.credentials, d.config,
                        d.cli_hint, d.default_branch,
                        d.job_id, d.created_by, d.is_global, d.read_only,
+                       d.scope_mode, d.auto_attach, d.policy_revision,
                        d.created_at, d.updated_at,
                        pd.linked_at,
                        pd.read_only AS project_read_only,
@@ -7812,6 +9556,9 @@ class PostgresDB:
         datasource_id: str,
         read_only: bool | None = ...,
         description: str | None = ...,
+        *,
+        authority_user_id: str | None = None,
+        authority_is_admin: bool = False,
     ) -> bool:
         """Update project-level overrides for a linked datasource.
 
@@ -7842,13 +9589,33 @@ class PostgresDB:
             return True
 
         async with self.acquire() as conn:
-            result = await conn.execute(
-                f"""
-                UPDATE project_datasources SET {", ".join(set_parts)}
-                WHERE project_id = $1 AND datasource_id = $2
-                """,
-                *values,
-            )
+            async with conn.transaction():
+                datasource = await conn.fetchrow(
+                    """
+                    SELECT id, created_by
+                    FROM datasources
+                    WHERE id = $1
+                    FOR UPDATE
+                    """,
+                    d_uuid,
+                )
+                if datasource is None:
+                    return False
+                await _require_project_link_mutation_authority(
+                    conn,
+                    p_uuid,
+                    datasource_created_by=datasource.get("created_by"),
+                    authority_user_id=authority_user_id,
+                    authority_is_admin=authority_is_admin,
+                    allow_connector_owner=False,
+                )
+                result = await conn.execute(
+                    f"""
+                    UPDATE project_datasources SET {", ".join(set_parts)}
+                    WHERE project_id = $1 AND datasource_id = $2
+                    """,
+                    *values,
+                )
 
         return result == "UPDATE 1"
 
@@ -7899,6 +9666,202 @@ class PostgresDB:
         for row in rows:
             out.setdefault(str(row["datasource_id"]), []).append(str(row["project_id"]))
         return out
+
+    async def claim_datasource_project_reconciliations(
+        self,
+        *,
+        limit: int = 50,
+        lease_seconds: int = 120,
+    ) -> List[Dict[str, Any]]:
+        """Claim due datasource/project knowledge reconciliation work.
+
+        Claims are revision-aware and use ``SKIP LOCKED`` so multiple
+        orchestrators can drain the queue safely. The worker must re-read the
+        current link/datasource state rather than interpreting the event as an
+        operation log.
+        """
+        safe_limit = max(1, min(int(limit), 500))
+        safe_lease = max(10, min(int(lease_seconds), 3600))
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                rows = await conn.fetch(
+                    """
+                    WITH claimed AS (
+                        SELECT project_id, datasource_id
+                        FROM datasource_project_reconcile_queue
+                        WHERE next_attempt_at <= NOW()
+                        ORDER BY next_attempt_at, updated_at
+                        FOR UPDATE SKIP LOCKED
+                        LIMIT $1
+                    )
+                    UPDATE datasource_project_reconcile_queue q
+                    SET attempts = q.attempts + 1,
+                        claim_token = nextval(
+                            'datasource_project_reconcile_generation_seq'
+                        ),
+                        next_attempt_at = NOW() + make_interval(secs => $2),
+                        updated_at = NOW()
+                    FROM claimed
+                    WHERE q.project_id = claimed.project_id
+                      AND q.datasource_id = claimed.datasource_id
+                    RETURNING q.project_id, q.datasource_id, q.policy_revision,
+                              q.claim_token, q.attempts, q.next_attempt_at,
+                              q.last_error, q.updated_at
+                    """,
+                    safe_limit,
+                    safe_lease,
+                )
+        return [dict(row) for row in rows]
+
+    async def finish_datasource_project_reconciliation(
+        self,
+        project_id: str,
+        datasource_id: str,
+        claim_token: int,
+    ) -> bool:
+        """Acknowledge one generation or atomically queue a corrective pass.
+
+        A stale worker can finish after a newer worker has already applied and
+        acknowledged the opposite state. Merely returning ``False`` when its
+        generation is absent would let the stale external write survive with
+        no queue row. This statement therefore re-enqueues current authority in
+        the same database operation whenever the guarded delete does not win.
+        """
+        try:
+            project_uuid = UUID(project_id)
+            datasource_uuid = UUID(datasource_id)
+        except ValueError:
+            return False
+        async with self.acquire() as conn:
+            removed = await conn.fetchval(
+                """
+                WITH deleted AS (
+                    DELETE FROM datasource_project_reconcile_queue
+                    WHERE project_id = $1
+                      AND datasource_id = $2
+                      AND claim_token = $3
+                    RETURNING 1
+                ), current_authority AS (
+                    SELECT COALESCE(
+                        (
+                            SELECT policy_revision
+                            FROM datasources
+                            WHERE id = $2
+                        ),
+                        1
+                    ) AS policy_revision
+                ), corrective AS (
+                    INSERT INTO datasource_project_reconcile_queue (
+                        project_id, datasource_id, policy_revision,
+                        claim_token, attempts, next_attempt_at, last_error,
+                        updated_at
+                    )
+                    SELECT $1, $2, current_authority.policy_revision,
+                           nextval(
+                               'datasource_project_reconcile_generation_seq'
+                           ), 0, NOW(), NULL, NOW()
+                    FROM current_authority
+                    WHERE NOT EXISTS (SELECT 1 FROM deleted)
+                    ON CONFLICT (project_id, datasource_id) DO UPDATE
+                    SET policy_revision = GREATEST(
+                            datasource_project_reconcile_queue.policy_revision,
+                            EXCLUDED.policy_revision
+                        ),
+                        claim_token = nextval(
+                            'datasource_project_reconcile_generation_seq'
+                        ),
+                        attempts = 0,
+                        next_attempt_at = NOW(),
+                        last_error = NULL,
+                        updated_at = NOW()
+                    RETURNING 1
+                )
+                SELECT EXISTS (SELECT 1 FROM deleted)
+                """,
+                project_uuid,
+                datasource_uuid,
+                int(claim_token),
+            )
+        return bool(removed)
+
+    async def retry_datasource_project_reconciliation(
+        self,
+        project_id: str,
+        datasource_id: str,
+        claim_token: int,
+        *,
+        safe_error: str,
+        delay_seconds: int,
+    ) -> bool:
+        """Release a failed claim or atomically queue a corrective pass."""
+        try:
+            project_uuid = UUID(project_id)
+            datasource_uuid = UUID(datasource_id)
+        except ValueError:
+            return False
+        delay = max(5, min(int(delay_seconds), 86400))
+        # This field is operational metadata, never an exception dump. Bound it
+        # defensively in case an external client includes a URL in its message.
+        error = str(safe_error or "reconciliation_failed")[:500]
+        async with self.acquire() as conn:
+            retained = await conn.fetchval(
+                """
+                WITH retained AS (
+                    UPDATE datasource_project_reconcile_queue
+                    SET next_attempt_at = NOW() + make_interval(secs => $4),
+                        last_error = $5,
+                        claim_token = nextval(
+                            'datasource_project_reconcile_generation_seq'
+                        ),
+                        updated_at = NOW()
+                    WHERE project_id = $1
+                      AND datasource_id = $2
+                      AND claim_token = $3
+                    RETURNING 1
+                ), current_authority AS (
+                    SELECT COALESCE(
+                        (
+                            SELECT policy_revision
+                            FROM datasources
+                            WHERE id = $2
+                        ),
+                        1
+                    ) AS policy_revision
+                ), corrective AS (
+                    INSERT INTO datasource_project_reconcile_queue (
+                        project_id, datasource_id, policy_revision,
+                        claim_token, attempts, next_attempt_at, last_error,
+                        updated_at
+                    )
+                    SELECT $1, $2, current_authority.policy_revision,
+                           nextval(
+                               'datasource_project_reconcile_generation_seq'
+                           ), 0, NOW(), NULL, NOW()
+                    FROM current_authority
+                    WHERE NOT EXISTS (SELECT 1 FROM retained)
+                    ON CONFLICT (project_id, datasource_id) DO UPDATE
+                    SET policy_revision = GREATEST(
+                            datasource_project_reconcile_queue.policy_revision,
+                            EXCLUDED.policy_revision
+                        ),
+                        claim_token = nextval(
+                            'datasource_project_reconcile_generation_seq'
+                        ),
+                        attempts = 0,
+                        next_attempt_at = NOW(),
+                        last_error = NULL,
+                        updated_at = NOW()
+                    RETURNING 1
+                )
+                SELECT EXISTS (SELECT 1 FROM retained)
+                """,
+                project_uuid,
+                datasource_uuid,
+                int(claim_token),
+                delay,
+                error,
+            )
+        return bool(retained)
 
     async def backfill_encrypt_datasource_credentials(self) -> Dict[str, int]:
         """One-shot migration: encrypt any plaintext ``credentials`` JSONB values.
@@ -8088,8 +10051,10 @@ class PostgresDB:
             row = await conn.fetchrow(
                 """
                 INSERT INTO datasources (name, type, connection_url, credentials,
-                                         config, created_by, is_global, read_only)
-                VALUES ($1, $2, $3, $4, $5::jsonb, NULL, TRUE, TRUE)
+                                         config, created_by, is_global, read_only,
+                                         scope_mode, auto_attach)
+                VALUES ($1, $2, $3, $4, $5::jsonb, NULL, TRUE, TRUE,
+                        'all', FALSE)
                 ON CONFLICT (name, type, COALESCE(created_by, '00000000-0000-0000-0000-000000000000'))
                 DO UPDATE SET
                     connection_url = EXCLUDED.connection_url,
@@ -8098,8 +10063,8 @@ class PostgresDB:
                     is_global = TRUE,
                     read_only = TRUE
                 RETURNING id, name, description, type, connection_url, credentials,
-                          config, created_by, is_global, read_only, created_at,
-                          updated_at
+                          config, created_by, is_global, read_only, scope_mode,
+                          auto_attach, policy_revision, created_at, updated_at
                 """,
                 name,
                 ds_type,
@@ -11616,6 +13581,39 @@ class PostgresDB:
                 # delete the project's grant rows in-band so removal stays atomic.
                 await self.delete_grants_for_scope(
                     conn, scope_kind="project", scope_id=project_id
+                )
+                # Match the connector-edit lock order (datasource parent,
+                # junction child) before the project FK cascade reaches the
+                # same rows. Stable ordering also prevents two project deletes
+                # sharing connectors from acquiring parent locks inversely.
+                await conn.fetch(
+                    """
+                    SELECT d.id
+                    FROM datasources d
+                    JOIN project_datasources pd ON pd.datasource_id = d.id
+                    WHERE pd.project_id = $1
+                    ORDER BY d.id
+                    FOR UPDATE OF d
+                    """,
+                    uuid_val,
+                )
+                # Native KB connectors are project-owned synthetic rows. Their
+                # project link would otherwise cascade away while the
+                # datasource itself survived as an unreachable orphan. Match
+                # the server-owned marker exactly and remove the datasource
+                # before deleting its project in the same transaction.
+                await conn.execute(
+                    """
+                    DELETE FROM datasources
+                    WHERE type = 'kb'
+                      AND CASE
+                          WHEN config->>'native_project_id' ~*
+                               '^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+                          THEN (config->>'native_project_id')::uuid
+                          ELSE NULL
+                      END = $1
+                    """,
+                    uuid_val,
                 )
                 result = await conn.execute(
                     "DELETE FROM projects WHERE id = $1",

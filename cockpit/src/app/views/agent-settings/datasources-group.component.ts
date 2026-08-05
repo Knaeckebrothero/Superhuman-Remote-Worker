@@ -3,11 +3,21 @@ import {TranslocoPipe} from '@jsverse/transloco';
 import {AppIconComponent} from '../../ui/icon';
 import {AppSpinnerComponent} from '../../ui/spinner';
 import {ApiService} from '../../core/services/api.service';
-import {Datasource, DatasourceIndexStatus, DatasourceType} from '../../core/models/api.model';
+import {
+  Datasource,
+  DatasourceIndexStatus,
+  DatasourceType,
+} from '../../core/models/api.model';
 
 /** A user's explicit picker selection, tagged with the datasource-set identity
  *  it was made against (so a stale tag falls back to the default). */
-export type DatasourceSelection = {key: string; ids: Set<string>} | null;
+export type DatasourceSelection = {
+  key: string;
+  ids: Set<string>;
+  /** IDs the user explicitly toggled. Untouched IDs follow current server
+   * defaults when eligibility refreshes. Optional for legacy callers/tests. */
+  touched?: Set<string>;
+} | null;
 
 export function isRepositoryDatasource(type: DatasourceType | string): boolean {
   return (type || '').toString().toLowerCase() === 'repository';
@@ -23,20 +33,56 @@ export function datasourceSetKey(datasources: {id: string}[]): string {
 
 /** Active selection: the user's tagged choice, or the default when the
  *  selection is untouched (null) or stale (made against a different datasource
- *  set). The default is all ids — except when `defaultIds` is provided (live
- *  mode: the session's currently ATTACHED set, possibly empty). */
+ *  set). The default is the server-computed `default_selected` set — except
+ *  when `defaultIds` is provided (live mode: the session's currently attached
+ *  set, possibly empty). */
 export function activeDatasourceIds(
-  datasources: {id: string}[],
+  datasources: Array<{id: string; default_selected?: boolean}>,
   selection: DatasourceSelection,
   defaultIds?: Set<string> | null,
+  serverDefaultsEnabled = false,
 ): Set<string> {
-  if (selection && selection.key === datasourceSetKey(datasources)) {
-    return selection.ids;
+  const defaults = defaultIds !== undefined && defaultIds !== null
+    ? new Set(datasources.filter(d => defaultIds.has(d.id)).map(d => d.id))
+    : serverDefaultsEnabled
+      ? new Set(datasources.filter(d => d.default_selected === true).map(d => d.id))
+      : new Set<string>();
+  if (!selection) return defaults;
+
+  // Old exact-set selections remain supported. New selections carry `touched`
+  // and reconcile per id so adding/removing one eligible connector does not
+  // wipe every deliberate choice.
+  if (!selection.touched) {
+    return selection.key === datasourceSetKey(datasources)
+      ? new Set(datasources.filter(d => selection.ids.has(d.id)).map(d => d.id))
+      : defaults;
   }
-  if (defaultIds) {
-    return new Set(datasources.filter(d => defaultIds.has(d.id)).map(d => d.id));
+  const active = new Set(defaults);
+  for (const ds of datasources) {
+    if (!selection.touched.has(ds.id)) continue;
+    if (selection.ids.has(ds.id)) active.add(ds.id);
+    else active.delete(ds.id);
   }
-  return new Set(datasources.map(d => d.id));
+  return active;
+}
+
+/** Number of selected/unselected choices that differ from the current
+ * server-computed default. This is what the Settings badge should count. */
+export function datasourceSelectionDifferenceCount(
+  datasources: Array<{id: string; default_selected?: boolean}>,
+  selection: DatasourceSelection,
+  defaultIds?: Set<string> | null,
+  serverDefaultsEnabled = false,
+): number {
+  const active = activeDatasourceIds(
+    datasources, selection, defaultIds, serverDefaultsEnabled,
+  );
+  const defaults = defaultIds !== undefined && defaultIds !== null
+    ? new Set(datasources.filter(d => defaultIds.has(d.id)).map(d => d.id))
+    : serverDefaultsEnabled
+      ? new Set(datasources.filter(d => d.default_selected === true).map(d => d.id))
+      : new Set<string>();
+  return datasources.filter(d => active.has(d.id) !== defaults.has(d.id)).length;
 }
 
 /** Selected datasource IDs to submit: the active set, minus clone-based
@@ -47,8 +93,11 @@ export function selectedDatasourceIds(
   selection: DatasourceSelection,
   isLiteBackend: boolean,
   defaultIds?: Set<string> | null,
+  serverDefaultsEnabled = false,
 ): string[] {
-  const active = activeDatasourceIds(datasources, selection, defaultIds);
+  const active = activeDatasourceIds(
+    datasources, selection, defaultIds, serverDefaultsEnabled,
+  );
   return datasources
     .filter(d => active.has(d.id) && !(isLiteBackend && isRepositoryDatasource(d.type)))
     .map(d => d.id);
@@ -62,13 +111,16 @@ export function allDatasourcesSelected(
   isLiteBackend: boolean,
   defaultIds?: Set<string> | null,
   lockedIds?: string[],
+  serverDefaultsEnabled = false,
 ): boolean {
   const locked = new Set(lockedIds ?? []);
   const selectable = datasources.filter(
     d => !(isLiteBackend && isRepositoryDatasource(d.type)) && !locked.has(d.id),
   );
   if (selectable.length === 0) return false;
-  const active = activeDatasourceIds(datasources, selection, defaultIds);
+  const active = activeDatasourceIds(
+    datasources, selection, defaultIds, serverDefaultsEnabled,
+  );
   return selectable.every(d => active.has(d.id));
 }
 
@@ -88,7 +140,7 @@ export function allDatasourcesSelected(
             type="button"
             class="select-all-btn"
             (click)="toggleAll()"
-            [disabled]="disabled() || selectableDatasources().length === 0"
+            [disabled]="disabled() || error() || selectableDatasources().length === 0"
           >{{ (allSelected() ? 'agentSettings.common.deselectAll' : 'agentSettings.common.selectAll') | transloco }}</button>
         </div>
         <div class="ds-picker">
@@ -102,13 +154,21 @@ export function allDatasourcesSelected(
                 type="checkbox"
                 [checked]="isChecked(ds)"
                 (change)="toggle(ds.id)"
-                [disabled]="disabled() || isLiteExcluded(ds) || isLocked(ds)"
+                [disabled]="disabled() || error() || isLiteExcluded(ds) || isLocked(ds)"
               >
               <app-icon size="md" class="ds-type-icon" [class]="'ds-type-' + ds.type">{{ getTypeIcon(ds.type) }}</app-icon>
               <span class="ds-info">
-                <span class="ds-name">{{ ds.name }}</span>
+                <span class="ds-name">
+                  @if (ds.unavailable) {
+                    {{ 'agentSettings.datasources.unavailableName' | transloco }}
+                  } @else {
+                    {{ ds.name }}
+                  }
+                </span>
                 @if (isLiteExcluded(ds)) {
                   <span class="ds-desc">Requires a sandbox or VM workspace</span>
+                } @else if (ds.unavailable) {
+                  <span class="ds-desc">{{ 'agentSettings.datasources.unavailableLive' | transloco }}</span>
                 } @else if (isLocked(ds)) {
                   <span class="ds-desc">{{ 'agentSettings.datasources.lockedLive' | transloco }}</span>
                 } @else if (ds.description) {
@@ -120,8 +180,8 @@ export function allDatasourcesSelected(
                   </span>
                 }
               </span>
-              <span class="ds-type-badge">
-                {{ 'datasources.filter.' + ds.type | transloco }}
+              <span class="ds-type-badge" [class.ds-rw-badge]="ds.unavailable">
+                {{ (ds.unavailable ? 'agentSettings.datasources.unavailableBadge' : 'datasources.filter.' + ds.type) | transloco }}
               </span>
               @if (ds.is_global) {
                 <span class="ds-type-badge" [class.ds-rw-badge]="ds.read_only === false">
@@ -133,6 +193,14 @@ export function allDatasourcesSelected(
             </label>
           }
         </div>
+        @if (error()) {
+          <div class="ds-error" role="alert">
+            <span>{{ 'agentSettings.datasources.loadFailed' | transloco }}</span>
+            <button type="button" class="select-all-btn" (click)="retry.emit()">
+              {{ 'agentSettings.datasources.retry' | transloco }}
+            </button>
+          </div>
+        }
       </div>
     } @else if (loading()) {
       <div class="settings-group">
@@ -143,6 +211,18 @@ export function allDatasourcesSelected(
           <app-spinner size="sm" />
 
           {{ 'agentSettings.datasources.loading' | transloco }}
+        </div>
+      </div>
+    } @else if (error()) {
+      <div class="settings-group">
+        <div class="group-header">
+          <span class="group-label">{{ 'agentSettings.datasources.group' | transloco }}</span>
+        </div>
+        <div class="ds-error" role="alert">
+          <span>{{ 'agentSettings.datasources.loadFailed' | transloco }}</span>
+          <button type="button" class="select-all-btn" (click)="retry.emit()">
+            {{ 'agentSettings.datasources.retry' | transloco }}
+          </button>
         </div>
       </div>
     }
@@ -272,6 +352,17 @@ export function allDatasourcesSelected(
       color: var(--text-muted, var(--text-muted));
       padding: 8px 0;
     }
+    .ds-error {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 8px 10px;
+      border-radius: var(--radius-control);
+      background: var(--danger-tint);
+      color: var(--danger);
+      font-size: 12px;
+    }
   `],
 })
 export class DatasourcesGroupComponent {
@@ -280,7 +371,10 @@ export class DatasourcesGroupComponent {
 
   datasources = input<Datasource[]>([]);
   loading = input(false);
+  error = input(false);
   disabled = input(false);
+  /** Stable identity of the selected project set / execution context. */
+  contextKey = input('standalone');
   /**
    * When a lite workspace backend (virtual/none) is selected, clone-based
    * repository datasources are unavailable. `kb` repositories are indexed by
@@ -290,9 +384,12 @@ export class DatasourcesGroupComponent {
   /**
    * Default selection when the user hasn't touched the picker (live mode:
    * the session's currently attached set — possibly empty). Null keeps the
-   * create-flow default of "everything eligible selected".
+   * create-flow server `default_selected` set.
    */
   initialSelectedIds = input<string[] | null>(null);
+  /** Rollout gate for create-flow `default_selected`. Explicit live-session
+   * arrays remain authoritative regardless of this flag. */
+  datasourceDefaultsEnabled = input(false);
   /**
    * Entries rendered but frozen at their current state (live mode: kb-type
    * datasources — their knowledge bindings only rewire on attach, so live
@@ -301,12 +398,15 @@ export class DatasourcesGroupComponent {
   lockedIds = input<string[]>([]);
 
   change = output<void>();
+  retry = output<void>();
 
-  // The user's explicit selection, tagged with the datasource-set identity it
-  // was made against. Null — or a stale tag (e.g. after switching project) —
-  // means "default: all eligible selected". The picker is the source of truth;
-  // explicit-only resolution attaches exactly what's checked.
-  private readonly selection = signal<{key: string; ids: Set<string>} | null>(null);
+  // The user's explicit selections are kept per execution context. Untouched
+  // rows follow the server-computed default while deliberate choices survive
+  // eligibility refreshes within that context.
+  private readonly selections = signal<Record<string, NonNullable<DatasourceSelection>>>({});
+  private readonly selection = computed<DatasourceSelection>(() =>
+    this.selections()[this.contextKey()] ?? null,
+  );
 
   /** Central index status per KB datasource id (for the still-indexing warning). */
   readonly indexStatuses = signal<Record<string, DatasourceIndexStatus>>({});
@@ -323,7 +423,12 @@ export class DatasourcesGroupComponent {
     });
   }
 
-  readonly modifiedCount = computed(() => this.getSelectedIds().length);
+  readonly modifiedCount = computed(() =>
+    datasourceSelectionDifferenceCount(
+      this.datasources(), this.selection(), this.defaultIds(),
+      this.datasourceDefaultsEnabled(),
+    ),
+  );
 
   private defaultIds(): Set<string> | null {
     const init = this.initialSelectedIds();
@@ -343,6 +448,7 @@ export class DatasourcesGroupComponent {
       this.isLiteBackend(),
       this.defaultIds(),
       this.lockedIds(),
+      this.datasourceDefaultsEnabled(),
     )
   );
 
@@ -359,21 +465,33 @@ export class DatasourcesGroupComponent {
   isChecked(ds: Datasource): boolean {
     return (
       !this.isLiteExcluded(ds) &&
-      activeDatasourceIds(this.datasources(), this.selection(), this.defaultIds()).has(ds.id)
+      activeDatasourceIds(
+        this.datasources(), this.selection(), this.defaultIds(),
+        this.datasourceDefaultsEnabled(),
+      ).has(ds.id)
     );
   }
 
   toggle(id: string): void {
     if (this.lockedIds().includes(id)) return;
     const next = new Set(
-      activeDatasourceIds(this.datasources(), this.selection(), this.defaultIds()),
+      activeDatasourceIds(
+        this.datasources(), this.selection(), this.defaultIds(),
+        this.datasourceDefaultsEnabled(),
+      ),
     );
     if (next.has(id)) {
       next.delete(id);
     } else {
       next.add(id);
     }
-    this.selection.set({key: datasourceSetKey(this.datasources()), ids: next});
+    const touched = new Set(this.selection()?.touched ?? []);
+    touched.add(id);
+    this.setCurrentSelection({
+      key: datasourceSetKey(this.datasources()),
+      ids: next,
+      touched,
+    });
     this.change.emit();
   }
 
@@ -383,6 +501,7 @@ export class DatasourcesGroupComponent {
     const selectAll = !this.allSelected();
     const active = activeDatasourceIds(
       this.datasources(), this.selection(), this.defaultIds(),
+      this.datasourceDefaultsEnabled(),
     );
     const lockedKept = this.datasources()
       .filter(d => this.isLocked(d) && active.has(d.id))
@@ -390,7 +509,10 @@ export class DatasourcesGroupComponent {
     const ids = selectAll
       ? new Set([...this.selectableDatasources().map(d => d.id), ...lockedKept])
       : new Set(lockedKept);
-    this.selection.set({key: datasourceSetKey(this.datasources()), ids});
+    const touched = new Set(
+      this.selectableDatasources().map(d => d.id),
+    );
+    this.setCurrentSelection({key: datasourceSetKey(this.datasources()), ids, touched});
     this.change.emit();
   }
 
@@ -416,6 +538,7 @@ export class DatasourcesGroupComponent {
       this.selection(),
       this.isLiteBackend(),
       this.defaultIds(),
+      this.datasourceDefaultsEnabled(),
     );
   }
 
@@ -434,6 +557,15 @@ export class DatasourcesGroupComponent {
   }
 
   resetAll(): void {
-    this.selection.set(null);
+    // A parent form reset can change the context key in the same turn. Clear
+    // every cached context so returning to the default project cannot revive
+    // an earlier touched selection.
+    this.selections.set({});
+    this.change.emit();
+  }
+
+  private setCurrentSelection(selection: NonNullable<DatasourceSelection>): void {
+    const contextKey = this.contextKey();
+    this.selections.update(all => ({...all, [contextKey]: selection}));
   }
 }

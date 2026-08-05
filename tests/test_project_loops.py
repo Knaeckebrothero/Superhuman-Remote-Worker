@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from unittest.mock import AsyncMock
 
 import pytest
+import services.project_loops as project_loops_service
 
 from services.project_loops import (
     extract_cooldown_reset_at,
@@ -48,6 +49,14 @@ def _db():
     db.list_experts_visible = AsyncMock(return_value=[])
     db.list_project_datasources = AsyncMock(return_value=[])
     return db
+
+
+@pytest.fixture(autouse=True)
+def _empty_datasource_selection(monkeypatch):
+    """Keep the broad loop protocol suite independent of connector fixtures."""
+    resolver = AsyncMock(return_value=([], {}))
+    monkeypatch.setattr(project_loops_service, "default_datasource_selection", resolver)
+    return resolver
 
 
 def _config_override(db):
@@ -91,6 +100,87 @@ async def test_model_and_backend_coexist_with_bare_invariants():
     assert co["scholar"] == {"enabled": False}
     assert co["autonomy"] == "full"
     assert co["memory"] == {"required": True}
+
+
+@pytest.mark.asyncio
+async def test_loop_materializes_only_live_owner_defaults(_empty_datasource_selection):
+    db = _db()
+    db.link_datasource_to_job = AsyncMock()
+    project_id = "22222222-2222-2222-2222-222222222222"
+    owner_id = "33333333-3333-3333-3333-333333333333"
+    selected = ["44444444-4444-4444-4444-444444444444"]
+    revisions = {selected[0]: 9}
+    _empty_datasource_selection.return_value = (selected, revisions)
+
+    await create_loop_job(
+        db,
+        _loop(
+            project_id=project_id,
+            owner_id=owner_id,
+            workspace_backend="virtual",
+        ),
+        role="scholar",
+        iteration=1,
+    )
+
+    _empty_datasource_selection.assert_awaited_once_with(
+        db,
+        owner_id,
+        [project_id],
+        "virtual",
+    )
+    kwargs = db.create_job.await_args.kwargs
+    assert kwargs["datasource_ids"] == selected
+    assert kwargs["datasource_policy_revisions"] == revisions
+    assert kwargs["authority_user_id"] == owner_id
+    assert kwargs["authority_project_ids"] == [project_id]
+    provenance = kwargs["datasource_selection_provenance"]
+    assert provenance["origin"] == "default"
+    assert provenance["creation_path"] == "project_loop"
+    assert provenance["effective_work_owner_id"] == owner_id
+    assert provenance["target_project_ids"] == [project_id]
+    assert provenance["datasource_ids"] == selected
+    assert provenance["policy_revisions"] == revisions
+    assert datetime.fromisoformat(provenance["resolved_at"]).tzinfo is not None
+    assert "credentials" not in provenance
+    db.list_project_datasources.assert_not_awaited()
+    db.link_datasource_to_job.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_loop_default_policy_denial_creates_no_job(_empty_datasource_selection):
+    db = _db()
+    _empty_datasource_selection.side_effect = RuntimeError("project access revoked")
+
+    with pytest.raises(RuntimeError, match="project access revoked"):
+        await create_loop_job(
+            db,
+            _loop(
+                project_id="22222222-2222-2222-2222-222222222222",
+                owner_id="33333333-3333-3333-3333-333333333333",
+            ),
+            role="scholar",
+            iteration=1,
+        )
+
+    db.create_job.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_ownerless_loop_materializes_authoritative_empty_selection(
+    _empty_datasource_selection,
+):
+    db = _db()
+
+    await create_loop_job(db, _loop(), role="scholar", iteration=1)
+
+    _empty_datasource_selection.assert_not_awaited()
+    kwargs = db.create_job.await_args.kwargs
+    assert kwargs["datasource_ids"] == []
+    assert kwargs["datasource_policy_revisions"] == {}
+    assert kwargs["authority_user_id"] is None
+    assert kwargs["authority_project_ids"] is None
+    assert kwargs["datasource_selection_provenance"]["origin"] == "explicit"
 
 
 class TestJobLoopId:

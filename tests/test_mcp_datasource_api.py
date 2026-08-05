@@ -200,6 +200,7 @@ async def test_update_validates_merged_shape_and_can_clear_url(monkeypatch):
     db = MagicMock()
     db.update_datasource = AsyncMock(return_value=True)
     db.list_datasource_projects = AsyncMock(return_value=[])
+    db.get_datasource = AsyncMock(return_value=existing)
 
     with (
         patch(
@@ -222,7 +223,7 @@ async def test_update_validates_merged_shape_and_can_clear_url(monkeypatch):
             ),
         )
 
-    assert result == {"status": "updated"}
+    assert result["id"] == datasource_id
     kwargs = db.update_datasource.await_args.kwargs
     assert kwargs["connection_url"] is None
     assert kwargs["connection_url_set"] is True

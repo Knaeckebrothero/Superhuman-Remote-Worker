@@ -31,6 +31,10 @@ DatasourceType = Literal[
     "ssh_key",
     "generic_file",
 ]
+DatasourceScopeMode = Literal["all", "projects"]
+DatasourceVisibility = Literal["public", "private"]
+DatasourceOwnership = Literal["mine", "shared"]
+DatasourceAvailability = Literal["all", "projects", "unavailable"]
 
 try:
     from .client import AsyncCockpitClient, MutationOutcomeUnknown
@@ -157,7 +161,7 @@ def _format_action_error(action: str, target: str, error: Exception) -> str:
 # to distinguish from a cached/deployed schema. Build provenance says which
 # source produced the pod; this small contract revision says which tool surface
 # that source promises.
-MCP_TOOL_SCHEMA_REVISION = "3"
+MCP_TOOL_SCHEMA_REVISION = "6"
 _tool_schema_cache: tuple[list[dict[str, Any]], str] | None = None
 
 
@@ -665,7 +669,7 @@ async def create_job(
     description: str,
     config_name: str = "worker_base",
     expert_id: str | None = None,
-    datasource_ids: list[str] | None = None,
+    datasource_ids: list[str] = None,  # type: ignore[assignment]
     instructions: str | None = None,
     kickoff_message: str | None = None,
     config_override: dict[str, Any] | None = None,
@@ -686,7 +690,9 @@ async def create_job(
         config_name: Base agent config (default: "worker_base")
         expert_id: Preferred database-backed expert UUID. When supplied, the
             orchestrator resolves that expert over the base config.
-        datasource_ids: Connector UUIDs to attach to the job
+        datasource_ids: Connector selection. Omit to inherit from an
+            authoritative parent or use root automatic defaults; pass [] to
+            attach none; pass IDs to request exactly those connectors.
         instructions: Additional inline markdown instructions
         kickoff_message: Opening task brief sent to the agent
         config_override: Per-job config overrides as JSON. To set the model,
@@ -1224,21 +1230,79 @@ async def list_models() -> str:
 
 
 @mcp_tool
-async def list_datasources(ds_type: DatasourceType | None = None) -> str:
-    """List configured connectors.
+async def list_datasources(
+    ds_type: DatasourceType | None = None,
+    q: str | None = None,
+    project_id: str | None = None,
+    scope_mode: DatasourceScopeMode = None,  # type: ignore[assignment]
+    auto_attach: bool = None,  # type: ignore[assignment]
+    visibility: DatasourceVisibility = None,  # type: ignore[assignment]
+    ownership: DatasourceOwnership = None,  # type: ignore[assignment]
+    availability: DatasourceAvailability = None,  # type: ignore[assignment]
+    limit: int = 50,
+    cursor: str | None = None,
+) -> str:
+    """List the authorized connector management catalog.
+
+    Results contain complete connector and project UUIDs plus the current
+    policy revision needed for safe scope/default updates. Pagination is
+    cursor-based; pass the reported next cursor unchanged to continue.
 
     Args:
-        ds_type: Filter by type (postgresql, neo4j, mongodb)
+        ds_type: Filter by canonical connector type
+        q: Search connector name or description
+        project_id: Filter to connectors linked to this authorized project
+        scope_mode: Filter by availability scope (all or projects)
+        auto_attach: Filter by the owner's automatic-default preference
+        visibility: Filter to public or private connectors
+        ownership: Filter to connectors owned by the caller or shared with them
+        availability: Filter by effective scope shape (all, projects, unavailable)
+        limit: Page size from 1 to 100 (default 50)
+        cursor: Opaque next cursor from the previous page
 
     Returns:
-        Connector list with ID, name, type, connection info, and scope
+        Connector list with full IDs, policy revisions, and next cursor
     """
     client = _get_client()
     try:
-        datasources = await client.list_datasources(ds_type=ds_type)
-        return fmt.format_datasources(datasources, type_filter=ds_type)
+        page = await client.list_datasources(
+            ds_type=ds_type,
+            q=q,
+            project_id=project_id,
+            scope_mode=scope_mode,
+            auto_attach=auto_attach,
+            visibility=visibility,
+            ownership=ownership,
+            availability=availability,
+            limit=limit,
+            cursor=cursor,
+        )
+        rendered = fmt.format_datasources(page.get("items") or [], type_filter=ds_type)
+        return f"{rendered}\n\nNext cursor: {page.get('next_cursor') or 'none'}"
     except Exception as e:
         return fmt.format_monitoring_error("list connectors", e)
+
+
+@mcp_tool
+async def get_datasource(datasource_id: str) -> str:
+    """Get one connector's exact management state.
+
+    Use this before update_datasource to load the complete connector UUID,
+    project scope, and current policy_revision. Credentials are always redacted
+    by the orchestrator.
+
+    Args:
+        datasource_id: Complete connector UUID
+
+    Returns:
+        Connector detail with full IDs and current policy revision
+    """
+    client = _get_client()
+    try:
+        datasource = await client.get_datasource(datasource_id)
+        return fmt.format_datasource_detail(datasource)
+    except Exception as e:
+        return fmt.format_monitoring_error("get connector", e)
 
 
 # =============================================================================
@@ -2097,7 +2161,7 @@ async def create_project_job(
     kickoff_message: str | None = None,
     config_override: dict[str, Any] | None = None,
     context: dict[str, Any] | None = None,
-    datasource_ids: list[str] | None = None,
+    datasource_ids: list[str] = None,  # type: ignore[assignment]
     priority: int = 5,
     required_deliverables: list[str] | None = None,
 ) -> str:
@@ -2118,7 +2182,9 @@ async def create_project_job(
             the model, use {"llm": {"model": "<model_id>"}} — e.g.
             {"llm": {"model": "codex/gpt-5.3-codex-spark"}}.
             Use the list_models tool to discover available model IDs.
-        datasource_ids: Connector IDs to attach (optional)
+        datasource_ids: Connector selection. Omit to use the project's
+            automatic defaults; pass [] to attach none; pass IDs to request
+            exactly those connectors.
         context: Additional context dictionary (optional)
         priority: Dispatch priority from 0 (low) to 10 (high), default 5
         required_deliverables: Deliverable contract — workspace-relative
@@ -2363,20 +2429,22 @@ async def create_datasource(
     connection_url: str | None = None,
     description: str | None = None,
     credentials: dict[str, Any] | None = None,
-    job_id: str | None = None,
     cli_hint: str | None = None,
     default_branch: str | None = None,
     config: dict[str, Any] | None = None,
     is_global: bool = False,
     read_only: bool | None = None,
+    scope_mode: DatasourceScopeMode = "all",
+    project_ids: list[str] = None,  # type: ignore[assignment]
+    auto_attach: bool = False,
 ) -> str:
     """Create a new connector.
 
     Supports generic, repository, kb, PostgreSQL, Neo4j, MongoDB, WebDAV,
-    email, MCP, and credential-file connectors. Omitting job_id creates a
-    user-owned unscoped connector; it does not publish it. Global publication
-    is controlled separately by is_global and requires the server-side
-    public_datasources capability.
+    email, MCP, and credential-file connectors. New connectors are canonical
+    user-owned resources; job-scoped connector creation is no longer
+    supported. Global publication is controlled separately by is_global and
+    requires the server-side public_datasources capability.
 
     Args:
         name: User-provided label
@@ -2386,7 +2454,6 @@ async def create_datasource(
         credentials: Auth details (optional). Stored values are never returned.
             Credential-file types accept credentials.files; SSH-key generation
             and interactive OAuth onboarding deliberately remain REST/UI-only.
-        job_id: Job UUID for a job-scoped connector (omit for user-owned unscoped)
         cli_hint: Suggested CLI command (optional, for generic type)
         default_branch: Branch to clone (optional, for repository type)
         config: Non-secret type-specific config. Includes kb root_path; email
@@ -2394,6 +2461,12 @@ async def create_datasource(
             unattended_send; and repository options. MCP connectors reject it.
         is_global: Publish to all users (capability-gated; default false)
         read_only: Declarative read-only setting (public defaults true; kb always true)
+        scope_mode: Availability scope. ``all`` allows every otherwise-authorized
+            work context; ``projects`` restricts use to project_ids.
+        project_ids: Full initial project scope. Omit for all scope; projects
+            mode requires a nonempty list. Explicit null is invalid.
+        auto_attach: Preselect for the creator's new work when available.
+            This is a default only and never force-attaches the connector.
 
     Returns:
         Created connector summary with masked URL
@@ -2405,12 +2478,14 @@ async def create_datasource(
         connection_url=connection_url,
         description=description,
         credentials=credentials,
-        job_id=job_id,
         cli_hint=cli_hint,
         default_branch=default_branch,
         config=config,
         is_global=is_global,
         read_only=read_only,
+        scope_mode=scope_mode,
+        project_ids=project_ids,
+        auto_attach=auto_attach,
     )
     return fmt.format_created_datasource(result)
 
@@ -2427,6 +2502,10 @@ async def update_datasource(
     config: dict[str, Any] | None = None,
     is_global: bool | None = None,
     read_only: bool | None = None,
+    scope_mode: DatasourceScopeMode = None,  # type: ignore[assignment]
+    project_ids: list[str] = None,  # type: ignore[assignment]
+    auto_attach: bool = None,  # type: ignore[assignment]
+    policy_revision: int = None,  # type: ignore[assignment]
 ) -> str:
     """Update an existing connector's connection details or metadata.
 
@@ -2443,6 +2522,13 @@ async def update_datasource(
         config: New non-secret type-specific config (optional)
         is_global: Publish/unpublish. Publishing is capability-gated (optional)
         read_only: New declarative read-only setting (optional)
+        scope_mode: New availability scope; omit to preserve it.
+        project_ids: Desired full project set. Omit to preserve links; pass []
+            to remove all links (valid only with resulting all scope).
+            Explicit null is invalid.
+        auto_attach: New owner-only default-selection preference
+        policy_revision: Revision returned by the management API. Required
+            whenever scope_mode, project_ids, or auto_attach is changed.
 
     Returns:
         Update confirmation
@@ -2459,9 +2545,23 @@ async def update_datasource(
         config=config,
         is_global=is_global,
         read_only=read_only,
+        scope_mode=scope_mode,
+        project_ids=project_ids,
+        auto_attach=auto_attach,
+        policy_revision=policy_revision,
     )
-    status = result.get("status", "unknown")
-    return f"Connector {datasource_id} updated ({status})."
+    status = result.get("status") or "updated"
+    lines = [f"Connector {datasource_id} updated ({status})."]
+    if result.get("policy_revision") is not None:
+        lines.append(f"Policy revision: {result['policy_revision']}")
+    if result.get("scope_mode") is not None:
+        lines.append(f"Availability scope: {result['scope_mode']}")
+    if result.get("auto_attach") is not None:
+        lines.append(f"Auto-attach default: {bool(result['auto_attach'])}")
+    if result.get("project_ids") is not None:
+        projects = ", ".join(str(value) for value in result["project_ids"]) or "none"
+        lines.append(f"Projects: {projects}")
+    return "\n".join(lines)
 
 
 @mcp_tool
@@ -3015,6 +3115,7 @@ async def create_persistent_thread(
     permission_mode: Literal["supervised", "auto_accept", "autonomous"] = "supervised",
     project_id: str | None = None,
     project_ids: list[str] | None = None,
+    datasource_ids: list[str] = None,  # type: ignore[assignment]
     model: str | None = None,
     temperature: float | None = None,
 ) -> str:
@@ -3041,6 +3142,8 @@ async def create_persistent_thread(
         permission_mode: Tool approval mode (supervised, auto_accept, autonomous)
         project_id: Single project UUID to scope (legacy)
         project_ids: List of project UUIDs to scope
+        datasource_ids: Connector selection. Omit to use automatic defaults;
+            pass [] for none, or IDs for exactly that authorized selection.
         model: LLM model override (e.g. "RedHatAI/gemma-4-31B-it-FP8-Dynamic")
         temperature: Temperature override
 
@@ -3055,6 +3158,7 @@ async def create_persistent_thread(
             permission_mode=permission_mode,
             project_id=project_id,
             project_ids=project_ids,
+            datasource_ids=datasource_ids,
             model=model,
             temperature=temperature,
         )

@@ -1251,9 +1251,6 @@ class TestTriggerVerificationContentTreeWiring:
             "create_job",
             AsyncMock(return_value={"id": "critic-999"}),
         )
-        monkeypatch.setattr(
-            main_module, "_propagate_datasources_to_subjob", AsyncMock()
-        )
         monkeypatch.setattr(main_module, "_trigger_dispatch", lambda: None)
         # No critic in flight — this test is about the gate, not the
         # duplicate-spawn guard (which fails closed on the non-UUID id here).
@@ -1261,6 +1258,11 @@ class TestTriggerVerificationContentTreeWiring:
             main_module.postgres_db,
             "has_live_verification_critic",
             AsyncMock(return_value=False),
+        )
+        monkeypatch.setattr(
+            main_module,
+            "_revalidate_job_datasource_selection",
+            AsyncMock(return_value=([], {})),
         )
 
         prior_round = {
@@ -1343,10 +1345,12 @@ class TestNoDuplicateCriticSpawn:
             "has_live_verification_critic",
             AsyncMock(return_value=live_critic),
         )
-        monkeypatch.setattr(main_module.postgres_db, "update_job_status", AsyncMock())
         monkeypatch.setattr(
-            main_module, "_propagate_datasources_to_subjob", AsyncMock()
+            main_module,
+            "_revalidate_job_datasource_selection",
+            AsyncMock(return_value=([], {})),
         )
+        monkeypatch.setattr(main_module.postgres_db, "update_job_status", AsyncMock())
         monkeypatch.setattr(main_module, "_trigger_dispatch", lambda: None)
         return create_job_mock
 
@@ -1409,7 +1413,9 @@ class TestNoDuplicateCriticSpawn:
             main_module.postgres_db, "create_job", AsyncMock(side_effect=_create)
         )
         monkeypatch.setattr(
-            main_module, "_propagate_datasources_to_subjob", AsyncMock()
+            main_module,
+            "_revalidate_job_datasource_selection",
+            AsyncMock(return_value=([], {})),
         )
         monkeypatch.setattr(main_module, "_trigger_dispatch", lambda: None)
 
@@ -1419,6 +1425,41 @@ class TestNoDuplicateCriticSpawn:
         )
 
         assert order == ["guard", "create"]
+
+
+class TestCriticDatasourceFailureUnblocksTarget:
+    @pytest.mark.asyncio
+    async def test_revoked_inherited_connector_escalates_target(self, monkeypatch):
+        import orchestrator.main as main_module
+        from orchestrator.main import _trigger_verification_on_complete
+
+        monkeypatch.setattr(
+            main_module.postgres_db,
+            "has_live_verification_critic",
+            AsyncMock(return_value=False),
+        )
+        monkeypatch.setattr(
+            main_module,
+            "_revalidate_job_datasource_selection",
+            AsyncMock(
+                side_effect=main_module.HTTPException(
+                    status_code=403,
+                    detail="One or more selected connectors are unavailable",
+                )
+            ),
+        )
+        escalate = AsyncMock(return_value="pending_review")
+        monkeypatch.setattr(main_module, "_escalate_target", escalate)
+
+        job = _make_completion_job(freeze_content_tree="aaa", verification_rounds=[])
+        actions: list[str] = []
+
+        await _trigger_verification_on_complete(
+            job, {"error": None, "should_stop": True}, actions
+        )
+
+        escalate.assert_awaited_once()
+        assert any("connector access changed" in action for action in actions)
 
 
 class TestDuplicateFindingIdsCannotHideABlockingFinding:
@@ -1515,9 +1556,6 @@ class TestTriggerVerificationInstructionsWiring:
 
         create_job_mock = AsyncMock(return_value={"id": "critic-999"})
         monkeypatch.setattr(main_module.postgres_db, "create_job", create_job_mock)
-        monkeypatch.setattr(
-            main_module, "_propagate_datasources_to_subjob", AsyncMock()
-        )
         monkeypatch.setattr(main_module, "_trigger_dispatch", lambda: None)
         # No critic in flight — this test is about the gate, not the
         # duplicate-spawn guard (which fails closed on the non-UUID id here).
@@ -1525,6 +1563,11 @@ class TestTriggerVerificationInstructionsWiring:
             main_module.postgres_db,
             "has_live_verification_critic",
             AsyncMock(return_value=False),
+        )
+        monkeypatch.setattr(
+            main_module,
+            "_revalidate_job_datasource_selection",
+            AsyncMock(return_value=([], {})),
         )
 
         prior_round = {
@@ -1576,14 +1619,16 @@ class TestTriggerVerificationInstructionsWiring:
 
         create_job_mock = AsyncMock(return_value={"id": "critic-999"})
         monkeypatch.setattr(main_module.postgres_db, "create_job", create_job_mock)
-        monkeypatch.setattr(
-            main_module, "_propagate_datasources_to_subjob", AsyncMock()
-        )
         monkeypatch.setattr(main_module, "_trigger_dispatch", lambda: None)
         monkeypatch.setattr(
             main_module.postgres_db,
             "has_live_verification_critic",
             AsyncMock(return_value=False),
+        )
+        monkeypatch.setattr(
+            main_module,
+            "_revalidate_job_datasource_selection",
+            AsyncMock(return_value=([], {})),
         )
 
         rounds = [

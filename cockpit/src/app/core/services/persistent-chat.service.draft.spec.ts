@@ -1,7 +1,7 @@
 /**
  * Instant-landing draft sessions (docs/features/instant_landing_session.md):
  * `/` shows an open composer with no thread; the first send creates the
- * session with a minimal body (title from the message + default project) and
+ * session with a reviewed body (title, default project, connector selection) and
  * the queued message rides the outbox into the new thread. The orchestrator
  * resolves all other settings from the owner's defaults — the client sends
  * no model / permission mode / workspace backend.
@@ -14,6 +14,7 @@ import {of, throwError} from 'rxjs';
 import {TranslocoService} from '@jsverse/transloco';
 import {draftTitleFrom, PersistentChatService} from './persistent-chat.service';
 import {ApiService} from './api.service';
+import {CapabilitiesService} from './capabilities.service';
 import {IndexedDbService} from './indexed-db.service';
 import {NotificationService} from './notification.service';
 import {AppToastService} from '../../ui/toast';
@@ -46,9 +47,17 @@ const flushTick = () => new Promise((r) => setTimeout(r, 0));
 const isThreadsCreate = (url: unknown) => String(url).endsWith('/persistent/threads');
 const isInput = (url: unknown) => String(url).endsWith('/input');
 
-function createService(opts: {projects?: any[]; createFails?: boolean} = {}) {
+function createService(opts: {
+    projects?: any[];
+    eligible?: any[];
+    createFails?: boolean;
+    policyAvailable?: boolean;
+} = {}) {
     const mockHttp: any = {
-        get: vi.fn().mockReturnValue(of({status: 'active', total_turns: 0, messages: [], total: 0})),
+        get: vi.fn().mockImplementation((url: string) => {
+            if (url.endsWith('/projects')) return of(opts.projects ?? []);
+            return of({status: 'active', total_turns: 0, messages: [], total: 0});
+        }),
         post: vi.fn().mockImplementation((url: string) => {
             if (isThreadsCreate(url)) {
                 return opts.createFails
@@ -63,7 +72,7 @@ function createService(opts: {projects?: any[]; createFails?: boolean} = {}) {
     const mockApi: any = {
         uploadToThread: vi.fn().mockReturnValue(of({thread_id: 't', files: []})),
         humanizeUploadError: vi.fn().mockReturnValue('upload failed'),
-        getProjects: vi.fn().mockReturnValue(of(opts.projects ?? [])),
+        getEligibleDatasources: vi.fn().mockReturnValue(of(opts.eligible ?? [])),
     };
     const mockCache: any = {
         getThreadCursor: vi.fn().mockResolvedValue(null),
@@ -116,6 +125,13 @@ function createService(opts: {projects?: any[]; createFails?: boolean} = {}) {
         providers: [
             {provide: HttpClient, useValue: mockHttp},
             {provide: ApiService, useValue: mockApi},
+            {
+                provide: CapabilitiesService,
+                useValue: {
+                    datasourceScopeAutoAttachAvailable: () => opts.policyAvailable ?? true,
+                    datasourceScopeAutoAttachAvailability$: of(opts.policyAvailable ?? true),
+                },
+            },
             {provide: IndexedDbService, useValue: mockCache},
             {provide: AppToastService, useValue: mockToast},
             {provide: NotificationService, useValue: mockNotifications},
@@ -176,7 +192,13 @@ describe('PersistentChatService — instant-landing draft sessions', () => {
     });
 
     it('first send creates the thread with a minimal body and carries the message', async () => {
-        const ctx = createService({projects: [{id: 'p-def', is_default: true}, {id: 'p2'}]});
+        const ctx = createService({
+            projects: [{id: 'p-def', is_default: true}, {id: 'p2'}],
+            eligible: [
+                {id: 'auto', default_selected: true},
+                {id: 'manual', default_selected: false},
+            ],
+        });
         ctx.service.enterDraftSession();
         await flushTick();
 
@@ -188,6 +210,7 @@ describe('PersistentChatService — instant-landing draft sessions', () => {
         expect(creates[0][1]).toEqual({
             title: 'fix the login bug',
             project_ids: ['p-def'],
+            datasource_ids: ['auto'],
         });
         expect(ctx.service.isDraftSession()).toBe(false);
         expect(ctx.service.threadId()).toBe('t-new');
@@ -205,6 +228,19 @@ describe('PersistentChatService — instant-landing draft sessions', () => {
         expect(ctx.service.outbox().length).toBe(0);
     });
 
+    it('selects no connector defaults while the rollout capability is unavailable', async () => {
+        const ctx = createService({
+            policyAvailable: false,
+            projects: [{id: 'p-def', is_default: true}],
+            eligible: [{id: 'auto', default_selected: true}],
+        });
+        ctx.service.enterDraftSession();
+        await flushTick();
+
+        expect(ctx.mockApi.getEligibleDatasources).not.toHaveBeenCalled();
+        expect(ctx.service.draftDatasourceIds()).toEqual([]);
+    });
+
     it('omits project_ids when there is no default project', async () => {
         const ctx = createService({projects: [{id: 'p2'}]});
         ctx.service.enterDraftSession();
@@ -213,7 +249,23 @@ describe('PersistentChatService — instant-landing draft sessions', () => {
         await ctx.service.sendMessage('hello');
         await flushTick();
 
-        expect(createPosts(ctx)[0][1]).toEqual({title: 'hello'});
+        expect(createPosts(ctx)[0][1]).toEqual({title: 'hello', datasource_ids: []});
+    });
+
+    it('lets the user opt out of reviewed draft defaults', async () => {
+        const ctx = createService({eligible: [{id: 'auto', default_selected: true}]});
+        ctx.service.enterDraftSession();
+        await flushTick();
+        expect(ctx.service.draftDatasourceIds()).toEqual(['auto']);
+
+        ctx.service.setDraftConnectorsEnabled(false);
+        await ctx.service.sendMessage('no credentials');
+        await flushTick();
+
+        expect(createPosts(ctx)[0][1]).toEqual({
+            title: 'no credentials',
+            datasource_ids: [],
+        });
     });
 
     it('a second send while the create is in flight queues without a second create', async () => {

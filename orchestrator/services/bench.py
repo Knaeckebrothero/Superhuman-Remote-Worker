@@ -559,6 +559,11 @@ def build_bench_job_payload(
         "required_deliverables": required_deliverables or None,
         "user_id": str(run["created_by"]),
         "project_id": str(spec["project_id"]) if spec.get("project_id") else None,
+        # Bench replicas must be reproducible. Never let an omitted selection
+        # resolve against ambient auto-attach preferences that can change
+        # between arms or replicas. A future connector-aware bench contract
+        # must freeze IDs/revisions once in the run spec instead.
+        "datasource_ids": [],
         "priority": int(task.get("priority", 5)),
     }
 

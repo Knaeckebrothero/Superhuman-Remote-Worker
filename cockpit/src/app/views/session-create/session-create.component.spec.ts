@@ -150,8 +150,9 @@ describe('SessionCreateComponent submit flow', () => {
     const component = fixture.componentInstance;
 
     const pending = component.createSession();
-    http.expectOne((r) => r.url.endsWith('/persistent/threads') && r.method === 'POST')
-      .flush({thread_id: 'thread-xyz'});
+    const request = http.expectOne((r) => r.url.endsWith('/persistent/threads') && r.method === 'POST');
+    expect(request.request.body.datasource_ids).toEqual([]);
+    request.flush({thread_id: 'thread-xyz'});
     await pending;
 
     expect(navigate).toHaveBeenCalledWith(['/sessions', 'thread-xyz']);

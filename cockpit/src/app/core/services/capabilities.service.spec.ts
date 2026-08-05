@@ -123,3 +123,48 @@ describe('CapabilitiesService.protectedCloudAvailable', () => {
     expect(svc.protectedCloudAvailable()).toBe(false);
   });
 });
+
+describe('CapabilitiesService.datasourceScopeAutoAttachAvailable', () => {
+  it('is true only when the deployment explicitly advertises v1', () => {
+    const svc = make({
+      is_admin: false,
+      grants: {},
+      catalog: CATALOG,
+      features: {datasource_scope_auto_attach_v1: true},
+    });
+    expect(svc.datasourceScopeAutoAttachAvailable()).toBe(true);
+  });
+
+  it('is false when the flag is false', () => {
+    const svc = make({
+      is_admin: false,
+      grants: {},
+      catalog: CATALOG,
+      features: {datasource_scope_auto_attach_v1: false},
+    });
+    expect(svc.datasourceScopeAutoAttachAvailable()).toBe(false);
+  });
+
+  it('is false when the flag is omitted', () => {
+    const svc = make({
+      is_admin: false,
+      grants: {},
+      catalog: CATALOG,
+    });
+    expect(svc.datasourceScopeAutoAttachAvailable()).toBe(false);
+  });
+
+  it('fails closed when the capabilities request fails', () => {
+    expect(make(null).datasourceScopeAutoAttachAvailable()).toBe(false);
+  });
+
+  it('fails closed while loading', () => {
+    TestBed.configureTestingModule({
+      providers: [
+        CapabilitiesService,
+        {provide: ApiService, useValue: {getMyCapabilities: () => NEVER}},
+      ],
+    });
+    expect(TestBed.inject(CapabilitiesService).datasourceScopeAutoAttachAvailable()).toBe(false);
+  });
+});

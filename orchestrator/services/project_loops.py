@@ -21,13 +21,15 @@ import base64
 import json
 import logging
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 # The legacy name remains the loop path's import surface while the safe
 # migration lands. It now inserts a structured PostgreSQL record; it does not
 # write a retro file into an agent-visible repository.
 from services.job_records import write_loop_retro as write_loop_retro
+
+from .datasource_policy import default_datasource_selection
 
 logger = logging.getLogger(__name__)
 
@@ -841,15 +843,16 @@ async def create_loop_job(
 ) -> dict[str, Any]:
     """Materialize ONE bare loop job for the given role + iteration.
 
-    DB-only (job row + context + datasource links), mirroring
+    DB-only (job row + materialized datasource links), mirroring
     ``create_job_from_automation``. The caller provisions the Gitea repo and
     nudges the dispatcher afterwards.
 
     Stamps ``context.loop_id`` (the join key for ``list_project_loop_jobs`` and
-    the ``_advance_project_loop`` hook) plus the role + iteration. Attaches the
-    project's linked datasources explicitly (option A — mirrors the cockpit
-    picker) so a repository datasource gives the execution role code continuity
-    across iterations; resolution stays explicit-only.
+    the ``_advance_project_loop`` hook) plus the role + iteration. Connector
+    defaults are resolved live for the loop owner and project at each spawn,
+    then atomically materialized with the job. Project-linked connectors that
+    are not automatic remain available for manual work but are not attached to
+    unattended loop iterations.
 
     When ``seq_index`` is given (always, when spawned through a stage), the
     stage index and post-advance ``remaining_iterations`` are ALSO stamped into
@@ -1031,6 +1034,32 @@ async def create_loop_job(
                 "loop %s: expert resolution for role %s failed: %s", loop_id, role, e
             )
 
+    target_project_ids = [project_id] if project_id else []
+
+    # Resolve immediately before materialization so every loop iteration uses
+    # the owner's current policy. The policy service applies scope/membership
+    # checks and silently filters repository defaults for lite tiers. A revoked
+    # owner or project membership raises before the job exists, preventing an
+    # unattended loop from continuing with a partial credential contract.
+    if owner_id:
+        (
+            datasource_ids,
+            datasource_policy_revisions,
+        ) = await default_datasource_selection(
+            db,
+            owner_id,
+            target_project_ids,
+            str(workspace_backend) if workspace_backend else None,
+        )
+        datasource_origin = "default"
+    else:
+        # Historical/userless internal rows have no authoritative principal
+        # from whom ambient preferences may be borrowed. Their complete,
+        # explicit selection is therefore empty.
+        datasource_ids = []
+        datasource_policy_revisions = {}
+        datasource_origin = "explicit"
+
     job = await db.create_job(
         description=description,
         config_name=config_name,
@@ -1042,37 +1071,29 @@ async def create_loop_job(
         expert_id=expert_id,
         status=status,
         freeze_data=freeze_data,
+        datasource_ids=datasource_ids,
+        datasource_selection_provenance={
+            "origin": datasource_origin,
+            "creation_path": "project_loop",
+            "effective_work_owner_id": owner_id,
+            "target_project_ids": target_project_ids,
+            "datasource_ids": datasource_ids,
+            "policy_revisions": datasource_policy_revisions,
+            "resolved_at": datetime.now(timezone.utc).isoformat(),
+        },
+        datasource_policy_revisions=datasource_policy_revisions,
+        authority_user_id=owner_id,
+        authority_project_ids=(target_project_ids if owner_id else None),
     )
     job_id = str(job["id"])
 
-    # Option A: attach the project's linked datasources explicitly.
-    if project_id:
-        try:
-            for ds in await db.list_project_datasources(project_id):
-                ds_id = ds.get("id")
-                if not ds_id:
-                    continue
-                try:
-                    await db.link_datasource_to_job(job_id, str(ds_id))
-                except Exception as e:
-                    logger.warning(
-                        "loop %s: linking datasource %s → job %s failed: %s",
-                        loop_id,
-                        ds_id,
-                        job_id,
-                        e,
-                    )
-        except Exception as e:
-            logger.warning(
-                "loop %s: listing project datasources failed: %s", loop_id, e
-            )
-
     logger.info(
-        "Project loop %s → %s job %s (iteration %s)",
+        "Project loop %s → %s job %s (iteration %s, datasource_defaults=%s)",
         loop_id,
         role,
         job_id,
         iteration,
+        len(datasource_ids),
     )
     return job
 

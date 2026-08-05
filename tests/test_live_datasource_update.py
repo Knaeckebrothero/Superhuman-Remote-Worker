@@ -21,13 +21,20 @@ core (redacted response, connected-session 409 gate), and the
 ``session_config_updated`` audit event both endpoints now emit.
 """
 
+import json
 import uuid
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from fastapi import HTTPException
 
 THREAD_ID = "11111111-2222-3333-4444-555555555555"
+USER_ID = "aaaaaaaa-1111-4111-8111-111111111111"
+DATASOURCE_A_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1"
+DATASOURCE_B_ID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb2"
+REPOSITORY_ID = "cccccccc-cccc-4ccc-8ccc-ccccccccccc3"
 
 
 # ---------------------------------------------------------------------------
@@ -41,6 +48,12 @@ def _make_db(update_result="UPDATE 1"):
     db = PostgresDB.__new__(PostgresDB)
     conn = AsyncMock()
     conn.execute = AsyncMock(return_value=update_result)
+
+    @asynccontextmanager
+    async def transaction():
+        yield
+
+    conn.transaction = MagicMock(side_effect=transaction)
     pool_cm = AsyncMock()
     pool_cm.__aenter__.return_value = conn
     pool_cm.__aexit__.return_value = False
@@ -52,32 +65,71 @@ def _make_db(update_result="UPDATE 1"):
 
 class TestSetThreadDatasourceIds:
     @pytest.mark.asyncio
-    async def test_replaces_full_set_via_jsonb_set(self):
-        import json
-
+    async def test_replaces_ids_and_policy_provenance_atomically(self):
         db, conn = _make_db()
-        ok = await db.set_thread_datasource_ids(THREAD_ID, ["ds-b", "ds-a"])
+        conn.fetch.return_value = [
+            {"id": uuid.UUID(DATASOURCE_A_ID), "policy_revision": 3},
+            {"id": uuid.UUID(DATASOURCE_B_ID), "policy_revision": 5},
+        ]
+        ok = await db.set_thread_datasource_ids(
+            THREAD_ID,
+            [DATASOURCE_B_ID, DATASOURCE_A_ID],
+            datasource_policy_revisions={
+                DATASOURCE_A_ID: 3,
+                DATASOURCE_B_ID: 5,
+            },
+            datasource_selection_provenance={"origin": "explicit"},
+        )
 
         assert ok is True
         sql = conn.execute.call_args.args[0]
-        # Plain replace of the top-level key — NOT a merge: the protocol sends
-        # the desired FULL selection each time (idempotent, create parity).
-        assert "'{datasource_ids}'" in sql
-        assert "||" not in sql
-        assert json.loads(conn.execute.call_args.args[1]) == ["ds-b", "ds-a"]
+        assert "metadata = COALESCE(metadata, '{}'::jsonb) || $1::jsonb" in sql
+        patch = json.loads(conn.execute.call_args.args[1])
+        assert patch == {
+            "datasource_ids": [DATASOURCE_B_ID, DATASOURCE_A_ID],
+            "datasource_selection": {
+                "origin": "explicit",
+                "datasource_ids": [DATASOURCE_B_ID, DATASOURCE_A_ID],
+                "policy_revisions": {
+                    DATASOURCE_B_ID: 5,
+                    DATASOURCE_A_ID: 3,
+                },
+            },
+        }
+        conn.transaction.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_empty_list_detaches_all(self):
-        import json
-
         db, conn = _make_db()
-        assert await db.set_thread_datasource_ids(THREAD_ID, []) is True
-        assert json.loads(conn.execute.call_args.args[1]) == []
+        assert (
+            await db.set_thread_datasource_ids(
+                THREAD_ID,
+                [],
+                datasource_policy_revisions={},
+                datasource_selection_provenance={"origin": "explicit"},
+            )
+            is True
+        )
+        patch = json.loads(conn.execute.call_args.args[1])
+        assert patch["datasource_ids"] == []
+        assert patch["datasource_selection"]["policy_revisions"] == {}
+        conn.fetch.assert_not_awaited()
+        assert conn.execute.await_args_list[0].args[0] == (
+            "SELECT pg_advisory_xact_lock($1)"
+        )
+        conn.transaction.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_unknown_thread_returns_false(self):
         db, _ = _make_db(update_result="UPDATE 0")
-        assert await db.set_thread_datasource_ids(THREAD_ID, ["ds-a"]) is False
+        assert (
+            await db.set_thread_datasource_ids(
+                THREAD_ID,
+                [],
+                datasource_policy_revisions={},
+            )
+            is False
+        )
 
     @pytest.mark.asyncio
     async def test_invalid_uuid_returns_false_without_query(self):
@@ -85,13 +137,53 @@ class TestSetThreadDatasourceIds:
         assert await db.set_thread_datasource_ids("not-a-uuid", ["ds-a"]) is False
         conn.execute.assert_not_called()
 
+    @pytest.mark.asyncio
+    async def test_policy_conflict_leaves_thread_metadata_unchanged(self):
+        from orchestrator.database.postgres import DatasourcePolicyConflictError
+
+        db, conn = _make_db()
+        conn.fetch.return_value = [
+            {"id": uuid.UUID(DATASOURCE_A_ID), "policy_revision": 4}
+        ]
+
+        with pytest.raises(DatasourcePolicyConflictError):
+            await db.set_thread_datasource_ids(
+                THREAD_ID,
+                [DATASOURCE_A_ID],
+                datasource_policy_revisions={DATASOURCE_A_ID: 3},
+                datasource_selection_provenance={"origin": "explicit"},
+            )
+
+        # The shared delivery/write lock is acquired before the revision
+        # snapshot. The metadata UPDATE itself is never reached.
+        assert conn.execute.await_count == 1
+        assert conn.execute.await_args.args[0] == "SELECT pg_advisory_xact_lock($1)"
+
+    @pytest.mark.asyncio
+    async def test_delivery_lock_uses_same_key_as_empty_selection_writer(self):
+        db, conn = _make_db()
+
+        async with db.thread_datasource_lock(THREAD_ID):
+            pass
+        delivery_key = conn.execute.await_args.args[1]
+
+        conn.reset_mock()
+        await db.set_thread_datasource_ids(
+            THREAD_ID,
+            [],
+            datasource_policy_revisions={},
+        )
+        writer_key = conn.execute.await_args_list[0].args[1]
+
+        assert delivery_key == writer_key
+
 
 # ---------------------------------------------------------------------------
 # agent_update_thread_config: the datasource_ids PATCH field
 # ---------------------------------------------------------------------------
 
 
-def _thread_row(user_id="user-1", backend="sandbox", metadata_extra=None):
+def _thread_row(user_id=USER_ID, backend="sandbox", metadata_extra=None):
     metadata = {"config_override": {"workspace": {"backend": backend}}}
     metadata.update(metadata_extra or {})
     return {
@@ -107,11 +199,47 @@ def patched_main(monkeypatch):
     """orchestrator.main with the PATCH endpoint's collaborators mocked."""
     import orchestrator.main as main
 
+    policy_rows = {
+        DATASOURCE_A_ID: {
+            "id": DATASOURCE_A_ID,
+            "type": "postgresql",
+            "is_global": True,
+            "scope_mode": "all",
+            "policy_revision": 1,
+            "project_ids": [],
+        },
+        DATASOURCE_B_ID: {
+            "id": DATASOURCE_B_ID,
+            "type": "postgresql",
+            "is_global": True,
+            "scope_mode": "all",
+            "policy_revision": 1,
+            "project_ids": [],
+        },
+        REPOSITORY_ID: {
+            "id": REPOSITORY_ID,
+            "type": "repository",
+            "is_global": True,
+            "scope_mode": "all",
+            "policy_revision": 1,
+            "project_ids": [],
+        },
+    }
     db = SimpleNamespace(
         get_thread=AsyncMock(return_value=_thread_row()),
-        get_user=AsyncMock(return_value={"id": "user-1", "is_admin": False}),
+        get_user=AsyncMock(
+            return_value={"id": USER_ID, "is_admin": False, "is_approved": True}
+        ),
+        user_is_member_of_projects=AsyncMock(return_value=True),
+        get_datasource_policy_rows=AsyncMock(
+            side_effect=lambda ids: [policy_rows[value] for value in ids]
+        ),
         get_datasource=AsyncMock(
-            return_value={"id": "ds-a", "type": "postgresql", "is_global": True}
+            return_value={
+                "id": DATASOURCE_A_ID,
+                "type": "postgresql",
+                "is_global": True,
+            }
         ),
         resolve_datasources_for_thread=AsyncMock(
             return_value=[
@@ -123,6 +251,7 @@ def patched_main(monkeypatch):
         record_security_event=AsyncMock(),
         resolve_api_keys_for_job=AsyncMock(return_value={}),
     )
+    db.datasource_policy_rows = policy_rows
     monkeypatch.setattr(main, "postgres_db", db)
     monkeypatch.setattr(main, "require_internal", AsyncMock())
     monkeypatch.setattr(
@@ -149,14 +278,14 @@ class TestAgentPatchDatasourceIds:
         main, db, _ = patched_main
         db.get_thread.return_value = _thread_row(backend="virtual")
         db.get_datasource.return_value = {
-            "id": "ds-repo",
+            "id": REPOSITORY_ID,
             "type": "repository",
             "is_global": True,
         }
 
         with pytest.raises(main.HTTPException) as exc:
             await main.agent_update_thread_config(
-                MagicMock(), THREAD_ID, _body(main, datasource_ids=["ds-repo"])
+                MagicMock(), THREAD_ID, _body(main, datasource_ids=[REPOSITORY_ID])
             )
         assert exc.value.status_code == 400
         assert "repository" in exc.value.detail.lower()
@@ -170,13 +299,19 @@ class TestAgentPatchDatasourceIds:
         main, db, grants = patched_main
 
         await main.agent_update_thread_config(
-            MagicMock(), THREAD_ID, _body(main, datasource_ids=["ds-a"])
+            MagicMock(), THREAD_ID, _body(main, datasource_ids=[DATASOURCE_A_ID])
         )
 
         fragment = grants.await_args.args[0]
         # RW postgresql resolved above → write tools in the checked fragment.
         assert "sql_execute" in fragment["tools"]["sql"]
-        db.set_thread_datasource_ids.assert_awaited_once_with(THREAD_ID, ["ds-a"])
+        persisted = db.set_thread_datasource_ids.await_args
+        assert persisted.args == (THREAD_ID, [DATASOURCE_A_ID])
+        assert persisted.kwargs["datasource_policy_revisions"] == {DATASOURCE_A_ID: 1}
+        provenance = persisted.kwargs["datasource_selection_provenance"]
+        assert provenance["origin"] == "explicit"
+        assert provenance["creation_path"] == "live_thread_internal"
+        assert provenance["policy_revisions"] == {DATASOURCE_A_ID: 1}
 
     @pytest.mark.asyncio
     async def test_grant_denial_prevents_persist(self, patched_main):
@@ -185,10 +320,31 @@ class TestAgentPatchDatasourceIds:
 
         with pytest.raises(main.HTTPException) as exc:
             await main.agent_update_thread_config(
-                MagicMock(), THREAD_ID, _body(main, datasource_ids=["ds-a"])
+                MagicMock(), THREAD_ID, _body(main, datasource_ids=[DATASOURCE_A_ID])
             )
         assert exc.value.status_code == 422
         db.set_thread_datasource_ids.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_policy_change_before_selection_persist_returns_conflict(
+        self, patched_main
+    ):
+        from database.postgres import DatasourcePolicyConflictError
+
+        main, db, _ = patched_main
+        db.set_thread_datasource_ids.side_effect = DatasourcePolicyConflictError(
+            "changed"
+        )
+
+        with pytest.raises(HTTPException) as exc:
+            await main.agent_update_thread_config(
+                MagicMock(),
+                THREAD_ID,
+                _body(main, datasource_ids=[DATASOURCE_A_ID]),
+            )
+
+        assert exc.value.status_code == 409
+        assert "retry" in exc.value.detail.lower()
 
     @pytest.mark.asyncio
     async def test_flip_never_persists_into_config_override(self, patched_main):
@@ -198,29 +354,53 @@ class TestAgentPatchDatasourceIds:
         main, db, _ = patched_main
 
         result = await main.agent_update_thread_config(
-            MagicMock(), THREAD_ID, _body(main, datasource_ids=["ds-a"])
+            MagicMock(), THREAD_ID, _body(main, datasource_ids=[DATASOURCE_A_ID])
         )
 
         merged = db.merge_thread_config_override.await_args.args[1]
         assert "sql" not in (merged.get("tools") or {})
-        assert result["datasource_ids"] == ["ds-a"]
+        assert result["datasource_ids"] == [DATASOURCE_A_ID]
 
     @pytest.mark.asyncio
-    async def test_ownerless_thread_normalizes_without_grant_check(self, patched_main):
-        """Ownerless/system threads keep the trusted-internal bypass (job
-        create + attach revalidation parity): dedupe only."""
+    async def test_ownerless_thread_rejects_arbitrary_connector_addition(
+        self, patched_main
+    ):
+        """An internal key is not ambient authority for an ownerless thread."""
         main, db, grants = patched_main
         db.get_thread.return_value = _thread_row(user_id=None)
 
+        with pytest.raises(HTTPException) as exc:
+            await main.agent_update_thread_config(
+                MagicMock(),
+                THREAD_ID,
+                _body(main, datasource_ids=[DATASOURCE_A_ID]),
+            )
+
+        assert exc.value.status_code == 403
+        grants.assert_not_awaited()
+        db.set_thread_datasource_ids.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_ownerless_thread_can_narrow_materialized_selection(
+        self, patched_main
+    ):
+        main, db, grants = patched_main
+        db.get_thread.return_value = _thread_row(
+            user_id=None,
+            metadata_extra={"datasource_ids": [DATASOURCE_A_ID, DATASOURCE_B_ID]},
+        )
+
         result = await main.agent_update_thread_config(
-            MagicMock(), THREAD_ID, _body(main, datasource_ids=["ds-a", "ds-a", "ds-b"])
+            MagicMock(),
+            THREAD_ID,
+            _body(main, datasource_ids=[DATASOURCE_A_ID]),
         )
 
         grants.assert_not_awaited()
-        db.set_thread_datasource_ids.assert_awaited_once_with(
-            THREAD_ID, ["ds-a", "ds-b"]
-        )
-        assert result["datasource_ids"] == ["ds-a", "ds-b"]
+        persisted = db.set_thread_datasource_ids.await_args
+        assert persisted.args == (THREAD_ID, [DATASOURCE_A_ID])
+        assert persisted.kwargs["datasource_policy_revisions"] == {DATASOURCE_A_ID: 1}
+        assert result["datasource_ids"] == [DATASOURCE_A_ID]
 
     @pytest.mark.asyncio
     async def test_no_datasource_field_means_no_datasource_write(self, patched_main):
@@ -243,7 +423,9 @@ class TestAgentPatchDatasourceIds:
             MagicMock(), THREAD_ID, _body(main, datasource_ids=[])
         )
 
-        db.set_thread_datasource_ids.assert_awaited_once_with(THREAD_ID, [])
+        persisted = db.set_thread_datasource_ids.await_args
+        assert persisted.args == (THREAD_ID, [])
+        assert persisted.kwargs["datasource_policy_revisions"] == {}
 
 
 # ---------------------------------------------------------------------------
@@ -256,7 +438,7 @@ def patched_owner(patched_main, monkeypatch):
     """patched_main plus the owner endpoint's collaborators (owner gate,
     model-transport enrichment)."""
     main, db, grants = patched_main
-    owner_user = {"id": "user-1", "is_admin": False, "auth_method": "oidc"}
+    owner_user = {"id": USER_ID, "is_admin": False, "auth_method": "oidc"}
     require_owner = AsyncMock(
         side_effect=lambda request, _db, tid: (owner_user, db.get_thread.return_value)
     )
@@ -339,14 +521,16 @@ class TestOwnerConfigPatch:
         main, db, _ = patched_owner
         db.get_thread.return_value = _thread_row(backend="virtual")
         db.get_datasource.return_value = {
-            "id": "ds-repo",
+            "id": REPOSITORY_ID,
             "type": "repository",
             "is_global": True,
         }
 
         with pytest.raises(main.HTTPException) as exc:
             await main.update_thread_config(
-                THREAD_ID, _patch_body(main, datasource_ids=["ds-repo"]), MagicMock()
+                THREAD_ID,
+                _patch_body(main, datasource_ids=[REPOSITORY_ID]),
+                MagicMock(),
             )
         assert exc.value.status_code == 400
         db.set_thread_datasource_ids.assert_not_awaited()
@@ -356,10 +540,14 @@ class TestOwnerConfigPatch:
         main, db, _ = patched_owner
 
         result = await main.update_thread_config(
-            THREAD_ID, _patch_body(main, datasource_ids=["ds-a"]), MagicMock()
+            THREAD_ID,
+            _patch_body(main, datasource_ids=[DATASOURCE_A_ID]),
+            MagicMock(),
         )
-        db.set_thread_datasource_ids.assert_awaited_once_with(THREAD_ID, ["ds-a"])
-        assert result["datasource_ids"] == ["ds-a"]
+        persisted = db.set_thread_datasource_ids.await_args
+        assert persisted.args == (THREAD_ID, [DATASOURCE_A_ID])
+        assert persisted.kwargs["datasource_policy_revisions"] == {DATASOURCE_A_ID: 1}
+        assert result["datasource_ids"] == [DATASOURCE_A_ID]
 
     @pytest.mark.asyncio
     async def test_empty_body_rejected(self, patched_owner):
@@ -394,14 +582,16 @@ class TestConfigChangeAudit:
         await main.update_thread_config(
             THREAD_ID,
             _patch_body(
-                main, {"llm": {"model": "minimax-m3"}}, datasource_ids=["ds-a"]
+                main,
+                {"llm": {"model": "minimax-m3"}},
+                datasource_ids=[DATASOURCE_A_ID],
             ),
             MagicMock(),
         )
 
         kwargs = db.record_security_event.await_args.kwargs
         assert kwargs["event_type"] == "session_config_updated"
-        assert kwargs["user_id"] == "user-1"
+        assert kwargs["user_id"] == USER_ID
         assert kwargs["resource_type"] == "thread"
         assert kwargs["resource_id"] == THREAD_ID
         # Key paths only — never values (the enriched fragment holds secrets).
@@ -432,7 +622,7 @@ class TestConfigChangeAudit:
 
         with pytest.raises(main.HTTPException):
             await main.agent_update_thread_config(
-                MagicMock(), THREAD_ID, _body(main, datasource_ids=["ds-a"])
+                MagicMock(), THREAD_ID, _body(main, datasource_ids=[DATASOURCE_A_ID])
             )
         db.record_security_event.assert_not_awaited()
 

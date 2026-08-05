@@ -620,7 +620,9 @@ def create_orchestrator_tools(context: ToolContext) -> List[Any]:
             priority: Job priority 1-10, higher = more urgent (default: 5)
             project_id: Optional project to scope the job to
             datasource_ids: Optional explicit datasource selection. Omit to
-                inherit this session's datasources; pass [] to attach none.
+                inherit the authoritative session/parent selection (or use
+                automatic defaults for a true root call); pass [] to attach
+                none, or IDs to request exactly those connectors.
             config_override: Per-job config as JSON, merged last so it wins over
                 project and expert defaults. Common knobs:
                 {"llm": {"model": "<id>"}} to pin the worker's model, and
@@ -689,6 +691,11 @@ def create_orchestrator_tools(context: ToolContext) -> List[Any]:
         # selection (server-side, keyed off thread_id below).
         if datasource_ids is not None:
             payload["datasource_ids"] = datasource_ids
+        else:
+            # Updated AI/system callers opt into central default resolution
+            # explicitly. The API still gives authoritative thread/parent
+            # inheritance higher precedence than this root-only request.
+            payload["use_datasource_defaults"] = True
         # Officer slot roster: the funnel resolves/enforces the slot and
         # stamps its model/backend onto the job config (officer_slots.py).
         # Rides jobs.context so the per-slot capacity count is a plain

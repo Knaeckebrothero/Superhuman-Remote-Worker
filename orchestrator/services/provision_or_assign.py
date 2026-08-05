@@ -48,8 +48,6 @@ async def provision_or_assign(
     """
     from main import (  # noqa: E402  (late import — see module docstring)
         _backend_from_override,
-        _build_datasource_tool_override,
-        _build_datasources_payload,
         _endpoint_violations_detail,
         _find_idle_persistent_agent,
         _grant_violations_detail,
@@ -152,19 +150,16 @@ async def provision_or_assign(
                 # to other lock-takers immediately on release.
                 idle_agent = await _find_idle_persistent_agent()
                 if idle_agent:
-                    resolved_ds = await postgres_db.resolve_datasources_for_thread(
-                        datasource_ids=ds_ids, project_ids=pids
-                    )
-                    ds_payload = _build_datasources_payload(resolved_ds)
-                    attach_co = co
-                    if resolved_ds:
-                        attach_co = _build_datasource_tool_override(resolved_ds, co)
+                    # The attach boundary re-fetches the committed thread,
+                    # reauthorizes its current connector selection, and resolves
+                    # credentials. A payload resolved here can go stale while a
+                    # concurrent live settings update changes A -> B/[].
                     ok = await _send_session_attach(
                         idle_agent,
                         tid,
-                        attach_co,
+                        co,
                         pids,
-                        datasources=ds_payload,
+                        datasources=None,
                         config_name=cfg,
                     )
                     if ok:

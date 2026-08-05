@@ -111,6 +111,67 @@ $$;
 
 
 --
+-- Name: reconcile_datasource_project_policy_change(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.reconcile_datasource_project_policy_change() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+    affected_project_id UUID;
+    affected_datasource_id UUID;
+    current_revision BIGINT;
+BEGIN
+    affected_project_id := COALESCE(NEW.project_id, OLD.project_id);
+    affected_datasource_id := COALESCE(NEW.datasource_id, OLD.datasource_id);
+
+    UPDATE datasources
+    SET policy_revision = policy_revision + 1,
+        updated_at = NOW()
+    WHERE id = affected_datasource_id
+    RETURNING policy_revision INTO current_revision;
+
+    -- A datasource cascade can remove the datasource row before this trigger
+    -- runs. Policy revision remains useful diagnostic metadata; the separate
+    -- sequence-backed claim_token is the actual stale-worker fence.
+    current_revision := COALESCE(current_revision, 1);
+
+    INSERT INTO datasource_project_reconcile_queue (
+        project_id,
+        datasource_id,
+        policy_revision,
+        attempts,
+        next_attempt_at,
+        last_error,
+        updated_at
+    ) VALUES (
+        affected_project_id,
+        affected_datasource_id,
+        current_revision,
+        0,
+        NOW(),
+        NULL,
+        NOW()
+    )
+    ON CONFLICT (project_id, datasource_id) DO UPDATE
+    SET policy_revision = GREATEST(
+            datasource_project_reconcile_queue.policy_revision,
+            EXCLUDED.policy_revision
+        ),
+        claim_token = nextval(
+            'datasource_project_reconcile_generation_seq'
+        ),
+        attempts = 0,
+        next_attempt_at = NOW(),
+        last_error = NULL,
+        updated_at = NOW();
+
+    RETURN COALESCE(NEW, OLD);
+END;
+$$;
+
+
+--
 -- Name: revoke_canvas_sessions_for_bff_session(); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -823,6 +884,49 @@ CREATE TABLE public.contacts (
 
 
 --
+-- Name: datasource_project_reconcile_generation_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.datasource_project_reconcile_generation_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: datasource_project_reconcile_queue; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.datasource_project_reconcile_queue (
+    project_id uuid NOT NULL,
+    datasource_id uuid NOT NULL,
+    policy_revision bigint NOT NULL,
+    claim_token bigint DEFAULT nextval('public.datasource_project_reconcile_generation_seq'::regclass) NOT NULL,
+    attempts integer DEFAULT 0 NOT NULL,
+    next_attempt_at timestamp with time zone DEFAULT now() NOT NULL,
+    last_error text,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT datasource_project_reconcile_queue_attempts_check CHECK ((attempts >= 0))
+);
+
+
+--
+-- Name: TABLE datasource_project_reconcile_queue; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.datasource_project_reconcile_queue IS 'Durable coalescing queue for syncing datasource/project link state to external knowledge stores.';
+
+
+--
+-- Name: COLUMN datasource_project_reconcile_queue.claim_token; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.datasource_project_reconcile_queue.claim_token IS 'Never-reused sequence token rotated on enqueue and claim; guards stale worker completion.';
+
+
+--
 -- Name: datasources; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -842,7 +946,12 @@ CREATE TABLE public.datasources (
     updated_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP,
     project_id uuid,
     config jsonb DEFAULT '{}'::jsonb NOT NULL,
-    read_only boolean
+    read_only boolean,
+    scope_mode text DEFAULT 'all'::text NOT NULL,
+    auto_attach boolean DEFAULT false NOT NULL,
+    policy_revision bigint DEFAULT 1 NOT NULL,
+    CONSTRAINT datasources_policy_revision_positive CHECK ((policy_revision > 0)),
+    CONSTRAINT datasources_scope_mode_check CHECK ((scope_mode = ANY (ARRAY['all'::text, 'projects'::text])))
 );
 
 
@@ -858,6 +967,27 @@ COMMENT ON COLUMN public.datasources.config IS 'Non-secret type-specific datasou
 --
 
 COMMENT ON COLUMN public.datasources.read_only IS 'Declared read-only flag for public (is_global) datasources. NULL = not applicable. Declarative: credentials are the enforcement boundary; kb datasources are read-only by architecture.';
+
+
+--
+-- Name: COLUMN datasources.scope_mode; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.datasources.scope_mode IS 'Execution availability upper bound: all or every selected work project.';
+
+
+--
+-- Name: COLUMN datasources.auto_attach; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.datasources.auto_attach IS 'Creator-owned creation-time default; never a runtime force attachment.';
+
+
+--
+-- Name: COLUMN datasources.policy_revision; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.datasources.policy_revision IS 'Optimistic concurrency token for scope/default/project-link policy.';
 
 
 --
@@ -2593,6 +2723,14 @@ ALTER TABLE ONLY public.contacts
 
 
 --
+-- Name: datasource_project_reconcile_queue datasource_project_reconcile_queue_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.datasource_project_reconcile_queue
+    ADD CONSTRAINT datasource_project_reconcile_queue_pkey PRIMARY KEY (project_id, datasource_id);
+
+
+--
 -- Name: datasources datasources_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -3250,6 +3388,20 @@ CREATE INDEX idx_contact_addresses_contact ON public.contact_addresses USING btr
 --
 
 CREATE INDEX idx_contacts_owner ON public.contacts USING btree (owner_user_id);
+
+
+--
+-- Name: idx_datasource_project_reconcile_due; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_datasource_project_reconcile_due ON public.datasource_project_reconcile_queue USING btree (next_attempt_at, updated_at);
+
+
+--
+-- Name: idx_datasources_auto_attach_owner; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_datasources_auto_attach_owner ON public.datasources USING btree (created_by) WHERE ((job_id IS NULL) AND (auto_attach = true));
 
 
 --
@@ -4006,6 +4158,13 @@ CREATE UNIQUE INDEX workspace_intervals_open_uq ON public.workspace_intervals US
 --
 
 CREATE INDEX workspace_intervals_pending_idx ON public.workspace_intervals USING btree (ended_at) WHERE ((ended_at IS NOT NULL) AND (materialized_at IS NULL));
+
+
+--
+-- Name: project_datasources datasource_project_policy_change; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER datasource_project_policy_change AFTER INSERT OR DELETE OR UPDATE ON public.project_datasources FOR EACH ROW EXECUTE FUNCTION public.reconcile_datasource_project_policy_change();
 
 
 --

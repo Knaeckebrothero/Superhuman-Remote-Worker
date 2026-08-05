@@ -15,6 +15,8 @@ step 1 (2026-06-11):
   the workspace and pod are torn down (memory_bugs.md B11 addendum).
 """
 
+import asyncio
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -62,11 +64,58 @@ def _reset_fake_client():
     yield
 
 
+@asynccontextmanager
+async def _noop_thread_datasource_lock():
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _patch_thread_datasource_delivery_lock():
+    with patch.object(
+        orch_main.postgres_db,
+        "thread_datasource_lock",
+        side_effect=lambda _thread_id: _noop_thread_datasource_lock(),
+    ):
+        yield
+
+
 class TestThreadCreateDefault:
     """Hole A: the request-model default."""
 
     def test_bare_thread_create_defaults_to_persistent_config(self):
         assert orch_main.ThreadCreateRequest().config_name == "session_base"
+
+    def test_explicit_datasource_default_request_is_distinct_from_omission(self):
+        request = orch_main.ThreadCreateRequest(use_datasource_defaults=True)
+
+        assert request.use_datasource_defaults is True
+        assert "datasource_ids" not in request.model_fields_set
+
+    def test_datasource_defaults_and_explicit_selection_are_mutually_exclusive(self):
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            orch_main.ThreadCreateRequest(
+                use_datasource_defaults=True,
+                datasource_ids=[],
+            )
+
+
+class TestJobCreateDatasourceDefaults:
+    def test_explicit_datasource_default_request_is_distinct_from_omission(self):
+        request = orch_main.JobCreate(
+            description="defaulted job",
+            use_datasource_defaults=True,
+        )
+
+        assert request.use_datasource_defaults is True
+        assert "datasource_ids" not in request.model_fields_set
+
+    def test_datasource_defaults_and_explicit_selection_are_mutually_exclusive(self):
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            orch_main.JobCreate(
+                description="ambiguous job",
+                use_datasource_defaults=True,
+                datasource_ids=[],
+            )
 
 
 class TestSessionWorkspaceBackendOverride:
@@ -395,6 +444,57 @@ class TestSendSessionAttachPayload:
     """Hole B, orchestrator side: the attach payload carries config_name."""
 
     @pytest.mark.asyncio
+    async def test_detach_save_cannot_finish_before_inflight_delivery(self):
+        gate = asyncio.Lock()
+        delivery_started = asyncio.Event()
+        release_delivery = asyncio.Event()
+        order: list[str] = []
+
+        @asynccontextmanager
+        async def shared_lock():
+            async with gate:
+                yield
+
+        async def fake_delivery(*_args, **_kwargs):
+            delivery_started.set()
+            await release_delivery.wait()
+            order.append("delivery")
+            return True
+
+        async def save_detach():
+            async with orch_main.postgres_db.thread_datasource_lock("tid-1"):
+                order.append("save")
+
+        with (
+            patch.object(
+                orch_main.postgres_db,
+                "thread_datasource_lock",
+                side_effect=lambda _thread_id: shared_lock(),
+            ),
+            patch.object(
+                orch_main,
+                "_send_session_attach_locked",
+                AsyncMock(side_effect=fake_delivery),
+            ),
+        ):
+            attach_task = asyncio.create_task(
+                orch_main._send_session_attach(
+                    {"id": "a1", "pod_ip": "10.0.0.1", "pod_port": 8001},
+                    "tid-1",
+                )
+            )
+            await delivery_started.wait()
+            save_task = asyncio.create_task(save_detach())
+            await asyncio.sleep(0)
+            assert not save_task.done()
+
+            release_delivery.set()
+            assert await attach_task is True
+            await save_task
+
+        assert order == ["delivery", "save"]
+
+    @pytest.mark.asyncio
     async def test_payload_carries_config_name(self):
         _FakeAsyncClient.response_status = 500  # skip the DB-binding branch
         thread = {"id": "tid-1", "user_id": None, "metadata": {}}
@@ -448,9 +548,19 @@ class TestSendSessionAttachPayload:
             ),
             patch.object(
                 orch_main,
-                "_revalidate_thread_datasource_ids",
+                "_revalidate_thread_datasource_selection",
                 AsyncMock(side_effect=denied),
             ) as revalidate,
+            patch.object(
+                orch_main,
+                "_thread_project_ids",
+                AsyncMock(return_value=[]),
+            ),
+            patch.object(
+                orch_main,
+                "_revalidate_thread_project_ids",
+                AsyncMock(return_value=[]),
+            ),
             patch.object(orch_main.httpx, "AsyncClient", _FakeAsyncClient),
         ):
             ok = await orch_main._send_session_attach(
@@ -463,7 +573,11 @@ class TestSendSessionAttachPayload:
             )
 
         assert ok is False
-        revalidate.assert_awaited_once_with(thread, [datasource_id])
+        revalidate.assert_awaited_once_with(
+            thread,
+            [datasource_id],
+            target_project_ids=[],
+        )
         assert _FakeAsyncClient.calls == []
 
     @pytest.mark.asyncio
@@ -487,8 +601,8 @@ class TestSendSessionAttachPayload:
             ),
             patch.object(
                 orch_main,
-                "_revalidate_thread_datasource_ids",
-                AsyncMock(return_value=[]),
+                "_revalidate_thread_datasource_selection",
+                AsyncMock(return_value=([], {})),
             ),
             patch.object(
                 orch_main,
@@ -514,6 +628,206 @@ class TestSendSessionAttachPayload:
         assert ok is False
         revalidate.assert_awaited_once_with(thread, [project_id])
         assert _FakeAsyncClient.calls == []
+
+    @pytest.mark.asyncio
+    async def test_attach_discards_caller_payload_and_resolves_current_selection(self):
+        stale_id = "11111111-2222-4333-8444-555555555555"
+        current_id = "66666666-7777-4888-8999-aaaaaaaaaaaa"
+        project_id = "99999999-2222-4333-8444-555555555555"
+        thread = {
+            "id": "tid-1",
+            "user_id": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+            "metadata": {"datasource_ids": [current_id]},
+        }
+        current_row = {
+            "id": current_id,
+            "type": "kb",
+            "name": "Current KB",
+            "description": None,
+            "connection_url": None,
+            "credentials": {},
+            "config": {},
+            "project_read_only": True,
+            "policy_revision": 2,
+        }
+        resolver = AsyncMock(return_value=[current_row])
+
+        _FakeAsyncClient.response_status = 500
+        with (
+            patch.object(
+                orch_main.postgres_db,
+                "get_thread",
+                AsyncMock(return_value=thread),
+            ),
+            patch.object(
+                orch_main,
+                "_thread_project_ids",
+                AsyncMock(return_value=[project_id]),
+            ),
+            patch.object(
+                orch_main,
+                "_revalidate_thread_project_ids",
+                AsyncMock(return_value=[project_id]),
+            ),
+            patch.object(
+                orch_main,
+                "_revalidate_thread_datasource_selection",
+                AsyncMock(return_value=([current_id], {current_id: 2})),
+            ),
+            patch.object(
+                orch_main.postgres_db,
+                "resolve_datasources_for_thread",
+                resolver,
+            ),
+            patch.object(orch_main, "_is_experts_db_enabled", return_value=False),
+            patch.object(orch_main.httpx, "AsyncClient", _FakeAsyncClient),
+        ):
+            ok = await orch_main._send_session_attach(
+                {"id": "a1", "pod_ip": "10.0.0.1", "pod_port": 8001},
+                "tid-1",
+                {},
+                ["stale-project"],
+                datasources=[{"type": "kb", "datasource_id": stale_id}],
+                config_name="persistent_defaults",
+            )
+
+        assert ok is False
+        resolver.assert_awaited_once_with(
+            datasource_ids=[current_id],
+            project_ids=[project_id],
+        )
+        payload = _FakeAsyncClient.calls[0]["json"]
+        assert payload["project_ids"] == [project_id]
+        assert payload["datasources"][0]["datasource_id"] == current_id
+        assert stale_id not in str(payload["datasources"])
+
+
+class TestColdSessionDatasourceDelivery:
+    @pytest.mark.asyncio
+    async def test_live_detach_commits_before_cold_handler_refetches(self):
+        datasource_a = "11111111-2222-4333-8444-555555555555"
+        state = {"datasource_ids": [datasource_a]}
+        gate = asyncio.Lock()
+        writer_entered = asyncio.Event()
+        allow_writer_commit = asyncio.Event()
+
+        @asynccontextmanager
+        async def shared_lock():
+            async with gate:
+                yield
+
+        async def current_thread(_thread_id):
+            # Return a fresh row so a pre-lock read would retain A even after
+            # the writer replaces the canonical metadata with [].
+            return {
+                "id": "tid-1",
+                "user_id": None,
+                "project_id": None,
+                "metadata": {"datasource_ids": list(state["datasource_ids"])},
+            }
+
+        async def save_detach():
+            async with orch_main.postgres_db.thread_datasource_lock("tid-1"):
+                assert state["datasource_ids"] == [datasource_a]
+                writer_entered.set()
+                await allow_writer_commit.wait()
+                state["datasource_ids"] = []
+
+        get_thread = AsyncMock(side_effect=current_thread)
+        with (
+            patch.object(
+                orch_main.postgres_db,
+                "thread_datasource_lock",
+                side_effect=lambda _thread_id: shared_lock(),
+            ),
+            patch.object(orch_main.postgres_db, "get_thread", get_thread),
+            patch.object(
+                orch_main.postgres_db,
+                "list_thread_mounts",
+                AsyncMock(return_value=[]),
+            ),
+            patch.object(orch_main, "require_internal", AsyncMock()),
+            patch.object(orch_main, "_thread_project_ids", AsyncMock(return_value=[])),
+            patch.object(
+                orch_main,
+                "_agent_canvas_workspace_capabilities",
+                return_value=(False, False, False),
+            ),
+            patch.object(
+                orch_main, "_build_agent_cloud_mount", AsyncMock(return_value=None)
+            ),
+            patch.object(orch_main, "_build_agent_cloud_sync", return_value=None),
+            patch.object(
+                orch_main, "_resolve_session_config", AsyncMock(return_value=None)
+            ),
+            patch.object(
+                orch_main,
+                "_inject_lite_workspace_config",
+                side_effect=lambda value, **_kwargs: value,
+            ),
+        ):
+            writer = asyncio.create_task(save_detach())
+            await writer_entered.wait()
+            cold_response = asyncio.create_task(
+                orch_main.agent_get_thread_workspace(object(), "tid-1")
+            )
+            await asyncio.sleep(0)
+
+            # The old implementation read A before waiting on any lock.  The
+            # cold handler must not touch canonical state while Save owns it.
+            get_thread.assert_not_awaited()
+
+            allow_writer_commit.set()
+            await writer
+            response = await cold_response
+
+        assert response["datasources"] is None
+        assert datasource_a not in str(response)
+        get_thread.assert_awaited_once_with("tid-1")
+
+    @pytest.mark.asyncio
+    async def test_attach_discards_stale_payload_after_detach_all(self):
+        stale_id = "11111111-2222-4333-8444-555555555555"
+        thread = {"id": "tid-1", "user_id": None, "metadata": {"datasource_ids": []}}
+
+        _FakeAsyncClient.response_status = 500
+        with (
+            patch.object(
+                orch_main.postgres_db,
+                "get_thread",
+                AsyncMock(return_value=thread),
+            ),
+            patch.object(
+                orch_main,
+                "_thread_project_ids",
+                AsyncMock(return_value=[]),
+            ),
+            patch.object(
+                orch_main.postgres_db,
+                "resolve_datasources_for_thread",
+                AsyncMock(return_value=[]),
+            ),
+            patch.object(orch_main, "_is_experts_db_enabled", return_value=False),
+            patch.object(orch_main.httpx, "AsyncClient", _FakeAsyncClient),
+        ):
+            ok = await orch_main._send_session_attach(
+                {"id": "a1", "pod_ip": "10.0.0.1", "pod_port": 8001},
+                "tid-1",
+                {},
+                [],
+                datasources=[{"type": "kb", "datasource_id": stale_id}],
+                config_name="persistent_defaults",
+            )
+
+        assert ok is False
+        assert _FakeAsyncClient.calls[0]["json"]["datasources"] is None
+
+    def test_warm_resume_uses_canonical_thread_mount_projects(self):
+        import inspect
+
+        source = inspect.getsource(orch_main.resume_thread)
+        assert "pids = await _thread_project_ids(tid)" in source
+        assert 'pids = thread.get("project_ids")' not in source
 
 
 class TestAttachRoutesForwardConfigName:

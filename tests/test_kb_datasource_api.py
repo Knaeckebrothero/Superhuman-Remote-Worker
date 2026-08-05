@@ -20,6 +20,7 @@ from main import (
     _revalidate_thread_datasource_ids,
     _revalidate_thread_project_ids,
     _thread_has_knowledge_scope,
+    _thread_creation_project_ids,
     _validate_kb_repository_url,
     create_datasource,
     create_thread,
@@ -440,7 +441,10 @@ async def test_delete_uses_coordinated_kb_index_and_app_row_cleanup():
         result = await delete_datasource(object(), datasource_id)
 
     assert result == {"status": "deleted"}
-    cleanup.assert_awaited_once_with(datasource_id)
+    cleanup.assert_awaited_once_with(
+        datasource_id,
+        authority_project_scope_id=None,
+    )
     db.delete_datasource.assert_not_awaited()
 
 
@@ -538,18 +542,31 @@ async def test_external_reindex_concurrency_is_bounded_across_distinct_kbs(monke
 @pytest.mark.asyncio
 async def test_thread_attachment_rejects_an_inaccessible_private_kb():
     datasource_id = UUID("11111111-2222-3333-4444-555555555555")
+    owner_id = UUID(int=1)
     db = MagicMock()
-    db.get_datasource = AsyncMock(
-        return_value={"id": datasource_id, "type": "kb", "is_global": False}
+    db.get_user = AsyncMock(
+        return_value={"id": owner_id, "is_admin": False, "is_approved": True}
+    )
+    db.get_datasource_policy_rows = AsyncMock(
+        return_value=[
+            {
+                "id": datasource_id,
+                "type": "kb",
+                "is_global": False,
+                "created_by": UUID(int=2),
+                "scope_mode": "all",
+                "policy_revision": 1,
+                "project_ids": [],
+            }
+        ]
     )
 
     with (
         patch("main.postgres_db", db),
-        patch("main.user_can_access_datasource", AsyncMock(return_value=False)),
         pytest.raises(HTTPException) as exc,
     ):
         await _authorize_thread_datasource_ids(
-            {"id": UUID(int=1)},
+            {"id": owner_id},
             [str(datasource_id)],
             workspace_backend="virtual",
         )
@@ -560,29 +577,32 @@ async def test_thread_attachment_rejects_an_inaccessible_private_kb():
 @pytest.mark.asyncio
 async def test_thread_attachment_allows_kb_but_not_clone_repo_on_lite_tier():
     datasource_id = UUID("11111111-2222-3333-4444-555555555555")
+    owner_id = UUID(int=1)
+    policy_row = {
+        "id": datasource_id,
+        "type": "kb",
+        "is_global": False,
+        "created_by": owner_id,
+        "scope_mode": "all",
+        "policy_revision": 1,
+        "project_ids": [],
+    }
     db = MagicMock()
-    db.get_datasource = AsyncMock(
-        return_value={"id": datasource_id, "type": "kb", "is_global": False}
+    db.get_user = AsyncMock(
+        return_value={"id": owner_id, "is_admin": False, "is_approved": True}
     )
-    allowed = AsyncMock(return_value=True)
+    db.get_datasource_policy_rows = AsyncMock(side_effect=lambda _ids: [policy_row])
 
-    with (
-        patch("main.postgres_db", db),
-        patch("main.user_can_access_datasource", allowed),
-    ):
+    with patch("main.postgres_db", db):
         selected = await _authorize_thread_datasource_ids(
-            {"id": UUID(int=1)},
+            {"id": owner_id},
             [str(datasource_id), str(datasource_id)],
             workspace_backend="virtual",
         )
-        db.get_datasource.return_value = {
-            "id": datasource_id,
-            "type": "repository",
-            "is_global": False,
-        }
+        policy_row["type"] = "repository"
         with pytest.raises(HTTPException) as exc:
             await _authorize_thread_datasource_ids(
-                {"id": UUID(int=1)},
+                {"id": owner_id},
                 [str(datasource_id)],
                 workspace_backend="virtual",
             )
@@ -596,18 +616,26 @@ async def test_persisted_thread_datasource_is_denied_after_access_revocation():
     datasource_id = UUID("11111111-2222-3333-4444-555555555555")
     owner_id = UUID("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
     db = MagicMock()
-    db.get_user = AsyncMock(return_value={"id": owner_id, "is_admin": False})
-    db.get_datasource = AsyncMock(
-        return_value={
-            "id": datasource_id,
-            "type": "kb",
-            "is_global": False,
-        }
+    db.get_user = AsyncMock(
+        return_value={"id": owner_id, "is_admin": False, "is_approved": True}
+    )
+    db.get_datasource_policy_rows = AsyncMock(
+        return_value=[
+            {
+                "id": datasource_id,
+                "type": "kb",
+                "is_global": False,
+                "created_by": UUID(int=2),
+                "scope_mode": "all",
+                "policy_revision": 1,
+                "project_ids": [],
+            }
+        ]
     )
 
     with (
         patch("main.postgres_db", db),
-        patch("main.user_can_access_datasource", AsyncMock(return_value=False)),
+        patch("main._thread_project_ids", AsyncMock(return_value=[])),
         pytest.raises(HTTPException) as exc,
     ):
         await _revalidate_thread_datasource_ids(
@@ -625,15 +653,25 @@ async def test_persisted_thread_revalidation_preserves_global_and_system_semanti
     datasource_id = UUID("11111111-2222-3333-4444-555555555555")
     owner_id = UUID("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
     db = MagicMock()
-    db.get_user = AsyncMock(return_value={"id": owner_id, "is_admin": False})
-    db.get_datasource = AsyncMock(
-        return_value={"id": datasource_id, "type": "kb", "is_global": True}
+    db.get_user = AsyncMock(
+        return_value={"id": owner_id, "is_admin": False, "is_approved": True}
     )
-    access = AsyncMock(return_value=False)
+    db.get_datasource_policy_rows = AsyncMock(
+        return_value=[
+            {
+                "id": datasource_id,
+                "type": "kb",
+                "is_global": True,
+                "scope_mode": "all",
+                "policy_revision": 1,
+                "project_ids": [],
+            }
+        ]
+    )
 
     with (
         patch("main.postgres_db", db),
-        patch("main.user_can_access_datasource", access),
+        patch("main._thread_project_ids", AsyncMock(return_value=[])),
     ):
         global_selection = await _revalidate_thread_datasource_ids(
             {"id": "thread-user", "user_id": owner_id},
@@ -646,8 +684,8 @@ async def test_persisted_thread_revalidation_preserves_global_and_system_semanti
 
     assert global_selection == [str(datasource_id)]
     assert system_selection == [str(datasource_id)]
-    access.assert_not_awaited()
-    db.get_user.assert_awaited_once_with(str(owner_id))
+    assert db.get_user.await_count == 2
+    db.get_user.assert_awaited_with(str(owner_id))
 
 
 @pytest.mark.asyncio
@@ -698,6 +736,54 @@ async def test_thread_creation_rejects_unavailable_project_without_enumeration()
     assert exc.value.detail == "One or more attached projects are unavailable"
     assert str(project_id) not in exc.value.detail
     db.create_thread.assert_not_awaited()
+
+
+def test_project_scoped_mcp_thread_omission_binds_to_token_project():
+    project_id = UUID("99999999-2222-3333-4444-555555555555")
+    user = {"scopes": [f"project:{project_id}"]}
+
+    assert _thread_creation_project_ids(ThreadCreateRequest(), user) == [
+        str(project_id)
+    ]
+
+
+@pytest.mark.parametrize(
+    "request_body",
+    [
+        ThreadCreateRequest(project_ids=["88888888-2222-3333-4444-555555555555"]),
+        ThreadCreateRequest(
+            project_ids=[
+                "99999999-2222-3333-4444-555555555555",
+                "88888888-2222-3333-4444-555555555555",
+            ]
+        ),
+        ThreadCreateRequest(
+            project_id="88888888-2222-3333-4444-555555555555",
+            project_ids=["99999999-2222-3333-4444-555555555555"],
+        ),
+    ],
+)
+def test_project_scoped_mcp_thread_rejects_other_or_multi_project_targets(
+    request_body,
+):
+    project_id = UUID("99999999-2222-3333-4444-555555555555")
+    user = {"scopes": [f"project:{project_id}"]}
+
+    with pytest.raises(HTTPException) as exc:
+        _thread_creation_project_ids(request_body, user)
+
+    assert exc.value.status_code == 403
+    assert exc.value.detail == "Access denied by MCP token scope"
+
+
+def test_project_scoped_mcp_thread_accepts_its_single_target():
+    project_id = UUID("99999999-2222-3333-4444-555555555555")
+    user = {"scopes": [f"project:{project_id}"]}
+
+    assert _thread_creation_project_ids(
+        ThreadCreateRequest(project_ids=[str(project_id)]),
+        user,
+    ) == [str(project_id)]
 
 
 @pytest.mark.asyncio
@@ -828,6 +914,7 @@ async def test_metadata_only_kb_edit_does_not_schedule_full_rebuild():
     db = MagicMock()
     db.update_datasource = AsyncMock(return_value=True)
     db.list_datasource_projects = AsyncMock(return_value=[])
+    db.get_datasource = AsyncMock(return_value=existing)
     pending = AsyncMock()
     schedule = MagicMock()
 
@@ -848,7 +935,7 @@ async def test_metadata_only_kb_edit_does_not_schedule_full_rebuild():
             ),
         )
 
-    assert result == {"status": "updated"}
+    assert result["id"] == datasource_id
     pending.assert_not_awaited()
     schedule.assert_not_called()
 
@@ -867,6 +954,7 @@ async def test_root_change_schedules_full_rebuild():
     db = MagicMock()
     db.update_datasource = AsyncMock(return_value=True)
     db.list_datasource_projects = AsyncMock(return_value=[])
+    db.get_datasource = AsyncMock(return_value=existing)
     pending = AsyncMock()
     schedule = MagicMock()
 

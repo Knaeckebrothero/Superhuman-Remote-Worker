@@ -18,6 +18,7 @@ MIGRATION = (
 )
 DATASOURCE_ID = "11111111-1111-1111-1111-111111111111"
 PROJECT_ID = "22222222-2222-2222-2222-222222222222"
+PROJECT_ID_B = "55555555-5555-5555-5555-555555555555"
 JOB_ID = "33333333-3333-3333-3333-333333333333"
 USER_ID = "44444444-4444-4444-4444-444444444444"
 
@@ -32,6 +33,11 @@ def _make_db(conn: AsyncMock) -> PostgresDB:
     async def acquire():
         yield conn
 
+    @asynccontextmanager
+    async def transaction():
+        yield
+
+    conn.transaction = MagicMock(side_effect=transaction)
     db.acquire = acquire
     return db
 
@@ -96,9 +102,13 @@ async def test_update_datasource_persists_explicit_config():
 
     assert await db.update_datasource(DATASOURCE_ID, config={"root_path": "handbook"})
 
-    sql, *params = conn.execute.await_args.args
+    sql, *params = conn.execute.await_args_list[0].args
     assert "config = $1::jsonb" in sql
     assert json.loads(params[0]) == {"root_path": "handbook"}
+    conn.transaction.assert_called_once()
+    assert (
+        "datasource_project_reconcile_queue" in conn.execute.await_args_list[1].args[0]
+    )
 
 
 @pytest.mark.asyncio
@@ -109,8 +119,21 @@ async def test_update_datasource_omitting_config_preserves_it():
 
     assert await db.update_datasource(DATASOURCE_ID, name="Renamed")
 
-    sql = conn.execute.await_args.args[0]
+    sql = conn.execute.await_args_list[0].args[0]
     assert "config =" not in sql
+
+
+@pytest.mark.asyncio
+async def test_update_datasource_visibility_advances_policy_revision():
+    conn = AsyncMock()
+    conn.execute.return_value = "UPDATE 1"
+    db = _make_db(conn)
+
+    assert await db.update_datasource(DATASOURCE_ID, is_global=False)
+
+    sql = conn.execute.await_args.args[0]
+    assert "is_global = $1" in sql
+    assert "policy_revision = policy_revision + 1" in sql
 
 
 @pytest.mark.asyncio
@@ -125,7 +148,7 @@ async def test_update_datasource_can_explicitly_clear_connection_url():
         connection_url_set=True,
     )
 
-    sql, *params = conn.execute.await_args.args
+    sql, *params = conn.execute.await_args_list[0].args
     assert "connection_url = $1" in sql
     assert params[0] is None
 
@@ -145,19 +168,18 @@ async def test_crud_list_and_get_queries_return_config():
 
 
 @pytest.mark.asyncio
-async def test_job_queries_return_config_in_explicit_and_legacy_paths():
+async def test_job_query_returns_config_without_legacy_fallback():
     conn = AsyncMock()
-    conn.fetch.side_effect = [[], []]
+    conn.fetch.return_value = []
     db = _make_db(conn)
 
     await db.resolve_datasources_for_job(JOB_ID, PROJECT_ID)
 
-    explicit_call, legacy_call = conn.fetch.await_args_list
+    conn.fetch.assert_awaited_once()
+    explicit_call = conn.fetch.await_args
     _assert_projects_config(explicit_call.args[0], qualified=True)
-    _assert_projects_config(legacy_call.args[0], qualified=True)
-    # External OKF KBs are explicit-only. Even a legacy/malformed row carrying
-    # datasources.job_id must never auto-attach to a job by that old fallback.
-    assert "d.type <> 'kb'" in legacy_call.args[0]
+    assert "job_datasources" in explicit_call.args[0]
+    assert "FROM datasources d" not in explicit_call.args[0]
 
 
 @pytest.mark.asyncio
@@ -174,6 +196,38 @@ async def test_thread_eligible_and_project_queries_return_config():
 
     await db.list_project_datasources(PROJECT_ID)
     _assert_projects_config(conn.fetch.await_args.args[0], qualified=True)
+
+
+@pytest.mark.asyncio
+async def test_thread_resolution_collapses_multi_project_overrides_conservatively():
+    conn = AsyncMock()
+    conn.fetch.return_value = [
+        {
+            "id": DATASOURCE_ID,
+            "name": "Application DB",
+            "type": "postgresql",
+            "credentials": "{}",
+            "config": "{}",
+            "policy_revision": 7,
+            "project_read_only": True,
+        }
+    ]
+    db = _make_db(conn)
+
+    resolved = await db.resolve_datasources_for_thread(
+        [DATASOURCE_ID], [PROJECT_ID, PROJECT_ID_B]
+    )
+
+    assert len(resolved) == 1
+    assert resolved[0]["id"] == DATASOURCE_ID
+    assert resolved[0]["policy_revision"] == 7
+    assert resolved[0]["project_read_only"] is True
+    sql, datasource_ids, project_ids = conn.fetch.await_args.args
+    assert "LEFT JOIN LATERAL" in sql
+    assert "BOOL_OR(pd.read_only)" in sql
+    assert "SELECT DISTINCT" not in sql
+    assert len(datasource_ids) == 1
+    assert {str(value) for value in project_ids} == {PROJECT_ID, PROJECT_ID_B}
 
 
 @pytest.mark.asyncio

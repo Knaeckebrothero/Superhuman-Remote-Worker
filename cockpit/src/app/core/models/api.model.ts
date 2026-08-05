@@ -300,6 +300,8 @@ export interface CredentialFileEntry {
 
 /** Non-secret, type-specific datasource configuration. */
 export interface DatasourceConfig {
+  /** Server-owned marker for a project's native knowledge connector. */
+  native_project_id?: string;
   /** Repository-relative POSIX root containing OKF Markdown notes. */
   root_path?: string;
   /** Repository: which forge this connector targets — see ``RepositoryForge``. */
@@ -325,6 +327,9 @@ export type DatasourceIndexState =
   | 'ready'
   | 'partial'
   | 'failed';
+
+/** Where a connector may be used. Project ids remain in project_datasources. */
+export type DatasourceScopeMode = 'all' | 'projects';
 
 /** Operational state of a centrally indexed OKF Knowledge Base datasource. */
 export interface DatasourceIndexStatus {
@@ -365,6 +370,9 @@ export interface Datasource {
   description: string | null;
   type: DatasourceType;
   connection_url: string | null;
+  /** True when REST returned only a sanitized display URL. Editors must omit
+   * connection_url on update until the user deliberately replaces it. */
+  connection_url_redacted?: boolean;
   /**
    * F3: credentials are never returned over REST anymore — the field is
    * stripped server-side (see `redact_datasource` in
@@ -383,8 +391,46 @@ export interface Datasource {
   /** Declared read-only flag for public datasources (null = not applicable).
    *  Declarative — credentials are the enforcement boundary. */
   read_only?: boolean | null;
+  /** Execution-context restriction. `all` includes projectless work. */
+  scope_mode?: DatasourceScopeMode;
+  /** Owner-specific creation default; never a runtime force-attachment. */
+  auto_attach?: boolean;
+  /** Optimistic-concurrency token for scope/default and project-link edits. */
+  policy_revision?: number;
+  /** Management reads expose the complete set only to an authorized manager. */
+  project_ids?: string[];
+  /** Safe catalog summary when full project associations are redacted. */
+  project_count?: number;
+  /** Client-only live-session placeholder for a persisted attachment that is
+   * no longer returned by the current eligibility read. */
+  unavailable?: boolean;
   created_at: string;
   updated_at: string;
+}
+
+/** Execution-context row. Consumers must seed from `default_selected`, not
+ * from `auto_attach`: shared/public connectors can be automatic for their
+ * owner while remaining manual for the current caller. */
+export interface EligibleDatasource extends Datasource {
+  default_selected: boolean;
+}
+
+export interface DatasourceCatalogResponse {
+  items: Datasource[];
+  next_cursor: string | null;
+}
+
+export interface DatasourceCatalogFilters {
+  q?: string;
+  type?: DatasourceType;
+  project_id?: string;
+  scope_mode?: DatasourceScopeMode;
+  auto_attach?: boolean;
+  visibility?: 'private' | 'public';
+  ownership?: 'mine' | 'shared';
+  availability?: 'all' | 'projects' | 'unavailable';
+  cursor?: string;
+  limit?: number;
 }
 
 /**
@@ -396,7 +442,6 @@ export interface DatasourceCreateRequest {
   connection_url?: string;
   description?: string;
   credentials?: Record<string, unknown>;
-  job_id?: string;
   cli_hint?: string;
   default_branch?: string;
   config?: DatasourceConfig;
@@ -404,6 +449,9 @@ export interface DatasourceCreateRequest {
   is_global?: boolean;
   /** Declared read-only flag; defaults to true server-side on publish. */
   read_only?: boolean;
+  scope_mode?: DatasourceScopeMode;
+  project_ids?: string[];
+  auto_attach?: boolean;
 }
 
 /**
@@ -421,6 +469,44 @@ export interface DatasourceUpdateRequest {
   is_global?: boolean;
   /** Declared read-only flag (kb: always true). */
   read_only?: boolean;
+  scope_mode?: DatasourceScopeMode;
+  project_ids?: string[];
+  auto_attach?: boolean;
+  /** Required whenever the policy or project set is changed. */
+  policy_revision?: number;
+}
+
+/** Project option returned by the connector-policy target picker. */
+export interface LinkableDatasourceProject {
+  id: string;
+  name: string;
+  is_default?: boolean;
+  user_role: ProjectMemberRole | null;
+  addable: boolean;
+  retained_only: boolean;
+  linked: boolean;
+  selected?: boolean;
+}
+
+export interface LinkableDatasourceProjectsResponse {
+  items: LinkableDatasourceProject[];
+  /** Every existing link, independent of the search/page in `items`. */
+  selected_items?: LinkableDatasourceProject[];
+  next_cursor: string | null;
+}
+
+/** Cursor page of connectors that may be newly linked to one target project.
+ * The server excludes existing links, native project knowledge connectors,
+ * and rows the caller is not authorized to add. */
+export interface LinkableProjectDatasourcesResponse {
+  items: Datasource[];
+  next_cursor: string | null;
+}
+
+export interface LinkableProjectDatasourceFilters {
+  q?: string;
+  cursor?: string;
+  limit?: number;
 }
 
 /**
@@ -974,6 +1060,8 @@ export interface Project {
   job_count?: number;
   repo_count?: number;
   member_count?: number;
+  /** Present on membership-aware project reads. */
+  user_role?: ProjectMemberRole;
 }
 
 /** Status of a project self-improvement loop. */
@@ -1800,6 +1888,10 @@ export type GrantCatalog = Record<string, GrantCatalogEntry>;
  * (e.g. protected cloud mode — Slice C's session-create toggle gate). */
 export interface UserCapabilityFeatures {
   protected_cloud?: boolean;
+  /** Backend supports scoped connector policy reads/writes and defaults. */
+  datasource_scope_auto_attach_v1?: boolean;
+  /** Root REST omission has crossed the compatibility gate to mean defaults. */
+  datasource_defaults_on_omission?: boolean;
 }
 
 /** GET /api/users/me/capabilities */

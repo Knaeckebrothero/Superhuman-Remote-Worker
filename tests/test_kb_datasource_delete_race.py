@@ -51,8 +51,13 @@ async def test_delete_waits_for_writer_then_stale_reindex_cannot_resurrect_index
     store = _CoordinatedStore(events)
     alive = True
 
-    async def delete_row(_datasource_id: str) -> bool:
+    async def delete_row(
+        _datasource_id: str,
+        *,
+        authority_project_scope_id: str | None = None,
+    ) -> bool:
         nonlocal alive
+        assert authority_project_scope_id is None
         events.append("app-delete")
         alive = False
         return True

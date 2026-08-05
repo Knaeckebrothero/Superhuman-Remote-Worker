@@ -1,6 +1,8 @@
 import {describe, it, expect, vi, afterEach} from 'vitest';
 
 import {
+  buildConferenceThreadCreateBody,
+  buildOfficerThreadCreateBody,
   buildSlotsSpec,
   nextWakeLabel,
   type SlotDraft,
@@ -89,5 +91,37 @@ describe('nextWakeLabel', () => {
 
   it('falls back to the raw value on garbage', () => {
     expect(nextWakeLabel('not-a-date')).toBe('not-a-date');
+  });
+});
+
+describe('officer thread create requests', () => {
+  it('explicitly requests connector defaults for the standing officer', () => {
+    expect(
+      buildOfficerThreadCreateBody(
+        'project-1',
+        'Apollo',
+        {enabled: true},
+        'model-1',
+        'high',
+      ),
+    ).toEqual({
+      title: 'Centurion — Apollo',
+      config_name: 'centurion',
+      project_ids: ['project-1'],
+      use_datasource_defaults: true,
+      config_override: {officer: {enabled: true}},
+      model: 'model-1',
+      reasoning_level: 'high',
+    });
+  });
+
+  it('explicitly requests connector defaults for a conference', () => {
+    expect(buildConferenceThreadCreateBody('project-1', 'Apollo')).toEqual({
+      title: 'Conference — Apollo',
+      config_name: 'centurion',
+      project_ids: ['project-1'],
+      use_datasource_defaults: true,
+      config_override: {officer: {conference: true}},
+    });
   });
 });

@@ -1415,18 +1415,62 @@ def format_datasources(
 
     lines = [f"Connectors ({len(datasources)}):\n"]
     for ds in datasources:
-        ds_id = str(ds.get("id", "unknown"))[:8]
+        ds_id = str(ds.get("id", "unknown"))
         name = ds.get("name", "unknown")
         ds_type = ds.get("type", "unknown")
         read_only = ds.get("read_only", True)
         job_id = ds.get("job_id")
-        scope = "job-scoped" if job_id else "global"
+        scope_mode = ds.get("scope_mode", "all")
+        project_ids = [str(value) for value in (ds.get("project_ids") or [])]
+        if job_id:
+            scope = "legacy job-scoped"
+        elif scope_mode == "projects":
+            scope = f"projects ({', '.join(project_ids) or 'none'})"
+        else:
+            scope = "all work contexts"
 
         lines.append(f"  {ds_id}  {name} ({ds_type})")
         lines.append(f"    Scope: {scope}  Read-only: {read_only}")
+        lines.append(
+            "    "
+            f"Published: {bool(ds.get('is_global'))}  "
+            f"Auto-attach default: {bool(ds.get('auto_attach'))}"
+        )
+        lines.append(f"    Policy revision: {ds.get('policy_revision', 'unknown')}")
         if job_id:
             lines.append(f"    Job: {job_id}")
 
+    return "\n".join(lines)
+
+
+def format_datasource_detail(datasource: dict[str, Any]) -> str:
+    """Format one connector's redacted management state without lossy IDs."""
+    ds_id = str(datasource.get("id", "unknown"))
+    project_ids = [str(value) for value in (datasource.get("project_ids") or [])]
+    scope_mode = datasource.get("scope_mode", "all")
+    scope = (
+        f"projects ({', '.join(project_ids) or 'none'})"
+        if scope_mode == "projects"
+        else "all work contexts"
+    )
+    lines = [
+        f"Connector: {datasource.get('name', 'unknown')}",
+        f"ID: {ds_id}",
+        f"Policy revision: {datasource.get('policy_revision', 'unknown')}",
+        f"Type: {datasource.get('type', 'unknown')}",
+        f"Scope: {scope}",
+        f"Published: {bool(datasource.get('is_global'))}",
+        f"Auto-attach default: {bool(datasource.get('auto_attach'))}",
+        f"Read-only: {datasource.get('read_only', True)}",
+    ]
+    if datasource.get("description"):
+        lines.append(f"Description: {datasource['description']}")
+    if datasource.get("connection_url"):
+        lines.append(f"URL: {_mask_url(str(datasource['connection_url']))}")
+    if datasource.get("config"):
+        lines.append(
+            "Config: " + json.dumps(datasource["config"], sort_keys=True, default=str)
+        )
     return "\n".join(lines)
 
 
@@ -2400,7 +2444,14 @@ def format_created_datasource(result: dict[str, Any]) -> str:
     read_only = result.get("read_only", True)
     url = result.get("connection_url", "")
     job_id = result.get("job_id")
-    scope = f"job-scoped ({job_id})" if job_id else "global"
+    scope_mode = result.get("scope_mode", "all")
+    project_ids = [str(value) for value in (result.get("project_ids") or [])]
+    if job_id:
+        scope = f"legacy job-scoped ({job_id})"
+    elif scope_mode == "projects":
+        scope = f"projects ({', '.join(project_ids) or 'none'})"
+    else:
+        scope = "all work contexts"
 
     lines = [
         "Connector created successfully.",
@@ -2408,8 +2459,11 @@ def format_created_datasource(result: dict[str, Any]) -> str:
         f"Name: {name}",
         f"Type: {ds_type}",
         f"Scope: {scope}",
+        f"Published: {bool(result.get('is_global'))}",
+        f"Auto-attach default: {bool(result.get('auto_attach'))}",
+        f"Policy revision: {result.get('policy_revision', 'unknown')}",
         f"Read-only: {read_only}",
-        f"URL: {_mask_url(url)}",
+        f"URL: {_mask_url(str(url or ''))}",
     ]
 
     lines.append(

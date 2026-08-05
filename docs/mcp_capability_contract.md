@@ -1,7 +1,7 @@
 # MCP Capability Contract
 
 **Status:** Authoritative for the orchestrator-facing MCP server
-**Schema revision:** 3
+**Schema revision:** 6
 **Implementation:** `orchestrator/mcp/capabilities.py`
 
 ## Authority and schema
@@ -9,7 +9,7 @@
 `TOOL_CAPABILITIES` is the single capability/risk inventory for all registered
 MCP tools. `server.py` refuses to register a tool without a matching entry, and
 the contract test requires the registered and declared name sets to be exactly
-equal (currently 104 tools).
+equal (currently 105 tools).
 
 Each entry records:
 

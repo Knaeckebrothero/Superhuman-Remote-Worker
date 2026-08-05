@@ -1,4 +1,5 @@
 import {computed, inject, Injectable, signal} from '@angular/core';
+import {ReplaySubject} from 'rxjs';
 import {ApiService} from './api.service';
 import type {GrantCatalog, UserCapabilityFeatures} from '../models/api.model';
 import {allowedEnumOptions} from '../../views/agent-settings/capability-gates';
@@ -31,6 +32,14 @@ export class CapabilitiesService {
   // null grants). Fail-closed consumers (publish gating) branch on this;
   // the permission-mode helpers keep their deliberate fail-open behavior.
   private readonly loadFailed = signal(false);
+  private readonly datasourceScopeAutoAttachAvailabilitySubject =
+    new ReplaySubject<boolean>(1);
+
+  /** Emits once the capabilities request resolves, and again after an
+   * explicit reload. Consumers can start in legacy mode, then refresh when
+   * the deployment contract is known without treating loading as enabled. */
+  readonly datasourceScopeAutoAttachAvailability$ =
+    this.datasourceScopeAutoAttachAvailabilitySubject.asObservable();
 
   constructor() {
     this.load();
@@ -42,6 +51,9 @@ export class CapabilitiesService {
       this.grants.set(c ? c.grants : null);
       if (c?.catalog) this.catalog.set(c.catalog);
       this.features.set(c?.features ?? {});
+      this.datasourceScopeAutoAttachAvailabilitySubject.next(
+        c?.features?.datasource_scope_auto_attach_v1 === true,
+      );
     });
   }
 
@@ -78,4 +90,12 @@ export class CapabilitiesService {
    * same posture as `canPublishDatasources` — the flag only flips true after
    * a successful fetch confirms it. */
   readonly protectedCloudAvailable = computed(() => !!this.features().protected_cloud);
+
+  /** Whether the datasource project-scope / auto-attach policy contract is
+   * available end-to-end. This deliberately fails closed while capabilities
+   * are loading, when the request fails, and when an older orchestrator omits
+   * the flag. Legacy connector CRUD remains available without policy fields. */
+  readonly datasourceScopeAutoAttachAvailable = computed(
+    () => this.features().datasource_scope_auto_attach_v1 === true,
+  );
 }

@@ -253,7 +253,7 @@ class TestUpdatePublishGate:
             result = await update_datasource(
                 fake_request, existing["id"], DatasourceUpdate(is_global=True)
             )
-        assert result == {"status": "updated"}
+        assert result["id"] == existing["id"]
         kwargs = fake_db.update_datasource.await_args.kwargs
         assert kwargs["is_global"] is True
         assert kwargs["read_only"] is True
@@ -267,7 +267,7 @@ class TestUpdatePublishGate:
             result = await update_datasource(
                 fake_request, existing["id"], DatasourceUpdate(is_global=False)
             )
-        assert result == {"status": "updated"}
+        assert result["id"] == existing["id"]
         fake_db.user_can_publish_datasource.assert_not_awaited()
         assert fake_db.update_datasource.await_args.kwargs["is_global"] is False
 
@@ -282,7 +282,7 @@ class TestUpdatePublishGate:
             result = await update_datasource(
                 fake_request, existing["id"], DatasourceUpdate(read_only=False)
             )
-        assert result == {"status": "updated"}
+        assert result["id"] == existing["id"]
         fake_db.user_can_publish_datasource.assert_not_awaited()
         assert fake_db.update_datasource.await_args.kwargs["read_only"] is False
 

@@ -93,7 +93,7 @@ asyncio.run(main())
 
 def test_every_registered_tool_has_exactly_one_capability_contract() -> None:
     assert _registered_tool_names() == set(TOOL_CAPABILITIES)
-    assert len(TOOL_CAPABILITIES) == 104
+    assert len(TOOL_CAPABILITIES) == 105
 
 
 def test_capability_contract_records_required_risk_and_transport_fields() -> None:
@@ -156,11 +156,11 @@ def test_health_build_info_reports_digest_provenance_and_artifact_match(
 
     info = _build_info(artifact)
 
-    assert info["tool_schema_revision"] == "3"
+    assert info["tool_schema_revision"] == "6"
     assert info["tool_schema_digest"] == schema["digest"]
     assert info["schema_artifact_digest"] == schema["digest"]
     assert info["schema_artifact_status"] == "match"
-    assert info["tool_count"] == 104
+    assert info["tool_count"] == 105
     assert info["source_revision"] == "source-test-revision"
     assert info["release_version"] == "test-release"
     assert info["artifact_digest"] == "sha256:image-test-digest"
@@ -182,6 +182,8 @@ def test_priority_job_project_and_connector_schema_drift_is_closed() -> None:
 
     job_fields = tools["create_job"]["inputSchema"]["properties"]
     assert {"expert_id", "kickoff_message", "priority", "context"} <= set(job_fields)
+    assert job_fields["datasource_ids"]["type"] == "array"
+    assert "anyOf" not in job_fields["datasource_ids"]
 
     project_job_fields = tools["create_project_job"]["inputSchema"]["properties"]
     assert {
@@ -191,6 +193,14 @@ def test_priority_job_project_and_connector_schema_drift_is_closed() -> None:
         "context",
         "required_deliverables",
     } <= set(project_job_fields)
+    assert project_job_fields["datasource_ids"]["type"] == "array"
+    assert "anyOf" not in project_job_fields["datasource_ids"]
+
+    persistent_thread_schema = tools["create_persistent_thread"]["inputSchema"]
+    persistent_thread_fields = persistent_thread_schema["properties"]
+    assert persistent_thread_fields["datasource_ids"]["type"] == "array"
+    assert "anyOf" not in persistent_thread_fields["datasource_ids"]
+    assert "datasource_ids" not in persistent_thread_schema.get("required", [])
 
     for tool_name in ("create_project", "update_project"):
         properties = tools[tool_name]["inputSchema"]["properties"]
@@ -211,10 +221,55 @@ def test_priority_job_project_and_connector_schema_drift_is_closed() -> None:
         "ssh_key",
         "generic_file",
     }
-    assert {"config", "is_global", "read_only"} <= set(connector)
+    assert {
+        "config",
+        "is_global",
+        "read_only",
+        "scope_mode",
+        "project_ids",
+        "auto_attach",
+    } <= set(connector)
+    assert "job_id" not in connector
+    assert connector["scope_mode"]["enum"] == ["all", "projects"]
+    assert connector["project_ids"]["type"] == "array"
 
     connector_update = tools["update_datasource"]["inputSchema"]["properties"]
-    assert {"config", "is_global", "read_only"} <= set(connector_update)
+    assert {
+        "config",
+        "is_global",
+        "read_only",
+        "scope_mode",
+        "project_ids",
+        "auto_attach",
+        "policy_revision",
+    } <= set(connector_update)
+    for field in ("scope_mode", "project_ids", "auto_attach", "policy_revision"):
+        assert "anyOf" not in connector_update[field]
+
+    connector_list = tools["list_datasources"]["inputSchema"]["properties"]
+    assert {
+        "ds_type",
+        "q",
+        "project_id",
+        "scope_mode",
+        "auto_attach",
+        "visibility",
+        "ownership",
+        "availability",
+        "limit",
+        "cursor",
+    } <= set(connector_list)
+    assert connector_list["scope_mode"]["enum"] == ["all", "projects"]
+    assert connector_list["visibility"]["enum"] == ["public", "private"]
+    assert connector_list["ownership"]["enum"] == ["mine", "shared"]
+    assert connector_list["availability"]["enum"] == [
+        "all",
+        "projects",
+        "unavailable",
+    ]
+
+    connector_get = tools["get_datasource"]["inputSchema"]
+    assert connector_get["required"] == ["datasource_id"]
 
 
 def test_missing_rest_workflows_have_an_explicit_decision() -> None:
