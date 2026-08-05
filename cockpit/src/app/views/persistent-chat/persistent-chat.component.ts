@@ -2065,7 +2065,7 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
      * header 500px. Keyed off `viewport.isMobile()` the actions simply ran past
      * the pane edge and were clipped by the split area — the buttons neither
      * moved nor shrank, they just stopped existing. See
-     * docs/issues/canvas_settings_pane_clips_chat_header_actions.md.
+     * docs/done/canvas_settings_pane_clips_chat_header_actions.md.
      */
     readonly headerCompact = computed(
         () => this.viewport.isMobile() || this.headerActionsOverflow(),
