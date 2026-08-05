@@ -16,12 +16,14 @@ related:
 # `kb_export` turned a note filename into a directory inside the vault, giving every note a duplicate OKF id
 
 **Filed:** 2026-07-28, from live dev logs observed while verifying the project-backlog
-pipeline. **Root cause confirmed and vault repaired:** 2026-07-29. Line numbers are
-develop @ 2026-07-29.
+pipeline. **Root cause confirmed and vault repaired:** 2026-07-29. Line numbers refreshed
+against develop @ 2026-08-05.
 
-**Status:** cause identified, prevention committed (`a9d406b4`, **not yet deployed**),
-corrupt data cleaned up (vault `project-68137e29-jobs` @ `2cc5f7c3`). One unrelated
-residual remains — see [Residual: four duplicate frontmatter ids](#residual-four-duplicate-frontmatter-ids).
+**Status: CLOSED.** Prevention shipped — `a9d406b4` is on `origin/develop` with several
+deploy commits after it, and the guard survived the KB-materialisation rework
+(`571fbc8c`). Corrupt data cleaned up (vault `project-68137e29-jobs` @ `2cc5f7c3`),
+verified at 0 nested rows. One unrelated residual is tracked separately —
+see [Residual: four duplicate frontmatter ids](#residual-four-duplicate-frontmatter-ids).
 
 ## Symptom
 
@@ -64,7 +66,7 @@ with one re-rendered copy of every note in the graph. Two things then break:
 1. **Git cannot hold a blob and a tree at one name**, so the note that path was named
    after ceases to exist as a file.
 2. **The reindexer globs `knowledge/**/*.md` recursively** (`knowledge_blob_map`,
-   `kb_reindex.py:116`), so every copy inside the vault carries the same OKF id as the
+   `kb_reindex.py:132`), so every copy inside the vault carries the same OKF id as the
    real note. One of each pair wins the `(project_id, note_id)` key; the other fails
    forever.
 
@@ -77,7 +79,7 @@ On this project it happened twice:
 
 ## Evidence chain
 
-1. `slugify()` (`src/services/knowledge_graph.py:93`) strips `/` and `.`, so
+1. `slugify()` (`src/services/knowledge_graph.py:100`) strips `/` and `.`, so
    `_dual_write_note`'s flat `knowledge/{slug}.md` cannot nest. Ruled out at source.
 2. Only three code paths write note `.md` files. `kb_index` writes exactly one
    (`index.md`); `_dual_write_note` is flat; **`kb_export` is the only one that appends
@@ -102,7 +104,7 @@ On this project it happened twice:
 
 ### Alternatives ruled out
 
-- **Orchestrator `/api/projects/{id}/knowledge/export`** (`main.py:32946`) — writes to a
+- **Orchestrator `/api/projects/{id}/knowledge/export`** — writes to a
   `tempfile.mkdtemp()`, emits wikilinks and no `description:` key. Wrong shape, wrong
   destination.
 - **`workspace_converter`** — writes to Neo4j + pgvector only, no file I/O.
@@ -151,8 +153,11 @@ emits **one line** carrying the id, both paths, and which one wins.
 `find_note_id_owner` (`knowledge_store.py`) is the diagnostic-only lookup behind it —
 keyed on `project_id`, not `kb_id`, because a pathless legacy row has no `kb_id`.
 
-Committed as `a9d406b4` with 16 regression tests. **Not deployed to dev** as of
-2026-07-29, so the tool can still create this in any project until it is.
+Committed as `a9d406b4` with 16 regression tests (`_export_dir_error`
+`knowledge_tools.py:688`, `_log_duplicate_note_id` `kb_reindex.py:321`). Pushed to
+`origin/develop` and shipped; both survived the `571fbc8c` KB-materialisation rework,
+which moved note writes to a dedicated KB repo but left `kb_export`'s
+workspace-write path — and therefore this guard — in place.
 
 ## Cleanup (executed 2026-07-29, owner-approved)
 
@@ -205,8 +210,9 @@ Rows with `path IS NULL` on this project broke down as 114 `archived`, 7 `resolv
 
 ## Verification
 
-Row-level queries only — `kb_index_watermark.status` is **not** a usable signal until
-[[kb_reindex_watermark_never_advances]] (`f3f01b5d`) is deployed:
+Row-level queries. Note `kb_index_watermark.status` was unusable while
+[[kb_reindex_watermark_never_advances]] (`f3f01b5d`) was undeployed; that fix has since
+shipped too, but the row-level checks remain the honest test:
 
 ```sql
 -- must be 0
