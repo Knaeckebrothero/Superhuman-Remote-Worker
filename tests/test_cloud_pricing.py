@@ -291,3 +291,79 @@ async def test_estimator_returns_no_cards_when_window_has_no_compute():
         [{"category": "llm", "unit": "completion-token", "quantity": 10}]
     )
     assert result == []
+
+
+@pytest.mark.asyncio
+async def test_estimator_wildcard_prices_only_typed_workspace_pod_rows():
+    now = datetime(2026, 8, 5, tzinfo=timezone.utc)
+    card = {
+        "id": "legacy-wildcard",
+        "provider": "test",
+        "display_name": "test",
+        "region": "test",
+        "currency": "USD",
+        "aggregation": "sum",
+        "source_url": "https://example.test",
+        "source_label": "test",
+        "description": "",
+        "exclusions": "",
+        "source_checked_at": now,
+        "sort_order": 1,
+    }
+    rate = {
+        "rate_card_id": "legacy-wildcard",
+        "category": "compute",
+        "resource": "*",
+        "unit": "vcpu-hour",
+        "rate": Decimal("1"),
+        "capacity_per_billing_unit": Decimal("1"),
+        "effective_from": now,
+        "source_sku": "cpu",
+    }
+
+    def typed_row(**changes):
+        row = {
+            "category": "compute",
+            "measurement_basis": "scheduler-request",
+            "cost_domain": "workload-allocation",
+            "resource_class": "kubernetes-pod",
+            "resource": "workspace_pod",
+            "unit": "vcpu-hour",
+            "attribution_scope": "customer",
+            "quantity": 2,
+        }
+        row.update(changes)
+        return row
+
+    result = await CloudCostEstimator(FakeReadPool([card], [rate])).estimate(
+        [
+            typed_row(),
+            typed_row(resource="agent_pod", quantity=100),
+            typed_row(
+                measurement_basis="guest-provisioned",
+                resource_class="virtual-machine",
+                resource="job_vm",
+                quantity=100,
+            ),
+            typed_row(attribution_scope="shared-platform", quantity=100),
+            typed_row(
+                category="storage",
+                measurement_basis="claim-requested",
+                resource_class="persistent-volume-claim",
+                resource="workspace_pvc",
+                unit="gib-hour",
+                quantity=100,
+            ),
+            # Once any typed dimension is present, incomplete rows fail closed.
+            {
+                "category": "compute",
+                "resource": "workspace_pod",
+                "unit": "vcpu-hour",
+                "quantity": 100,
+            },
+        ],
+        as_of=now,
+    )
+
+    assert result[0]["estimate"] == 2
+    assert result[0]["components"][0]["quantity"] == 2

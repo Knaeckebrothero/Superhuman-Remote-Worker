@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from uuid import uuid4
 
 import asyncpg
@@ -53,6 +54,7 @@ AUDIT_INDEXES = {
         "usage_events_dedupe_idx",
         "usage_events_user_ts_idx",
         "usage_events_ref_idx",
+        "usage_events_project_ts_idx",
     },
 }
 # Official postgres images are built --with-lz4 (required by the SET COMPRESSION
@@ -295,6 +297,352 @@ class TestAuditSchema:
             )
             n = await pool.fetchval("SELECT count(*) FROM usage_events")
             assert n == 2
+
+    async def test_usage_events_v2_schema_is_validated_and_probeable(self, pg_dsn):
+        async with _audit_pool(pg_dsn) as pool:
+            expected_columns = {
+                "period_start",
+                "period_end",
+                "measurement_basis",
+                "cost_domain",
+                "resource_class",
+                "attribution_scope",
+                "measurement_algorithm",
+                "source_capacity_value",
+                "source_capacity_unit",
+                "source_cluster",
+                "source_kind",
+                "source_uid",
+                "source_lifecycle_id",
+                "source_interval_id",
+                "event_kind",
+                "corrects_source",
+                "corrects_source_id",
+                "corrects_unit",
+                "corrects_ts",
+                "correction_group_id",
+                "correction_reason",
+                "correction_actor_id",
+                "discovered_at",
+                "payload_hash",
+            }
+            rows = await pool.fetch(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_schema='public' AND table_name='usage_events'"
+            )
+            assert expected_columns <= {row["column_name"] for row in rows}
+
+            expected_constraints = {
+                "usage_events_period_bounds_v2_check",
+                "usage_events_infra_v2_contract_check",
+                "usage_events_event_kind_v2_check",
+            }
+            constraints = await pool.fetch(
+                "SELECT conname, convalidated FROM pg_constraint "
+                "WHERE conrelid='usage_events'::regclass "
+                "AND conname = ANY($1::text[])",
+                list(expected_constraints),
+            )
+            assert {row["conname"] for row in constraints} == expected_constraints
+            assert all(row["convalidated"] for row in constraints)
+
+            triggers = await pool.fetch(
+                "SELECT tgname, pg_get_triggerdef(oid) AS definition "
+                "FROM pg_trigger WHERE tgrelid='usage_events'::regclass "
+                "AND NOT tgisinternal"
+            )
+            trigger_defs = {row["tgname"]: row["definition"] for row in triggers}
+            assert (
+                "REFERENCING NEW TABLE AS inserted_usage_events"
+                in trigger_defs["usage_events_rollup_dirty_days"]
+            )
+            assert "usage_events_append_only_v2" in trigger_defs
+            assert await pool.fetchval(
+                "SELECT to_regclass('public.usage_rollup_dirty_days') IS NOT NULL"
+            )
+            rounding_function = await pool.fetchrow(
+                "SELECT provolatile::text AS volatility, "
+                "proparallel::text AS parallel, proconfig "
+                "FROM pg_proc WHERE oid="
+                "'round_half_even_v2(numeric,integer)'::regprocedure"
+            )
+            assert rounding_function["volatility"] == "i"
+            assert rounding_function["parallel"] == "s"
+            assert "search_path=pg_catalog" in rounding_function["proconfig"]
+
+    async def test_usage_events_v2_batch_dirtying_and_append_only(self, pg_dsn):
+        async with _audit_pool(pg_dsn) as pool:
+            ties = await pool.fetchrow(
+                "SELECT "
+                "round_half_even_v2(2.5, 0) AS pos_even, "
+                "round_half_even_v2(3.5, 0) AS pos_odd, "
+                "round_half_even_v2(-2.5, 0) AS neg_even, "
+                "round_half_even_v2(-3.5, 0) AS neg_odd, "
+                "round_half_even_v2(0.0000000000000000005, 18) AS tiny_even, "
+                "round_half_even_v2(0.0000000000000000015, 18) AS tiny_odd"
+            )
+            assert tuple(ties) == (
+                Decimal("2"),
+                Decimal("4"),
+                Decimal("-2"),
+                Decimal("-4"),
+                Decimal("0"),
+                Decimal("0.000000000000000002"),
+            )
+
+            now = datetime.now(timezone.utc)
+            period_start = now.replace(hour=1, minute=0, second=0, microsecond=0)
+            period_end = period_start + timedelta(hours=1)
+            user_id, project_id, ref_id = uuid4(), uuid4(), uuid4()
+            lifecycle_id, interval_id = uuid4(), uuid4()
+            insert_sql = """
+                WITH typed AS (
+                    SELECT
+                        $1::timestamptz AS period_start,
+                        $2::timestamptz AS period_end,
+                        $3::uuid AS user_id,
+                        $4::uuid AS project_id,
+                        $5::uuid AS ref_id,
+                        $6::uuid AS lifecycle_id,
+                        $7::uuid AS interval_id,
+                        $8::text AS ref_kind,
+                        $9::text AS source_id
+                )
+                INSERT INTO usage_events (
+                    ts, user_id, project_id, ref_kind, ref_id,
+                    category, resource, quantity, unit, rate_usd, cost_usd,
+                    source, source_id, details, period_start, period_end,
+                    measurement_basis, cost_domain, resource_class,
+                    attribution_scope, measurement_algorithm,
+                    source_capacity_value, source_capacity_unit,
+                    source_cluster, source_kind, source_uid,
+                    source_lifecycle_id, source_interval_id, event_kind,
+                    payload_hash
+                )
+                SELECT
+                    typed.period_start, typed.user_id, typed.project_id,
+                    typed.ref_kind, typed.ref_id,
+                    'compute', 'workspace_pod', dimension.quantity,
+                    dimension.unit, NULL, NULL,
+                    'infra-allocation-v2', typed.source_id, '{}'::jsonb,
+                    typed.period_start, typed.period_end,
+                    'scheduler-request', 'workload-allocation',
+                    'kubernetes-pod', 'customer', 'pod-requests-test-v1',
+                    dimension.capacity, dimension.capacity_unit,
+                    'cluster-a', 'pod', 'pod-a', typed.lifecycle_id,
+                    typed.interval_id, 'usage', dimension.payload_hash
+                FROM typed
+                CROSS JOIN (
+                    VALUES
+                        (1::numeric, 'vcpu-hour', 1000::numeric,
+                         'millicore', repeat('a', 64)),
+                        (4::numeric, 'gib-hour', 4294967296::numeric,
+                         'byte', repeat('b', 64))
+                ) AS dimension(
+                    quantity, unit, capacity, capacity_unit, payload_hash
+                )
+                ON CONFLICT DO NOTHING
+            """
+            args = (
+                period_start,
+                period_end,
+                user_id,
+                project_id,
+                ref_id,
+                lifecycle_id,
+                interval_id,
+                "job",
+                "typed-batch",
+            )
+
+            assert await pool.execute(insert_sql, *args) == "INSERT 0 2"
+            revision = await pool.fetchval(
+                "SELECT revision FROM usage_rollup_dirty_days WHERE day=$1",
+                period_start.date(),
+            )
+            assert revision == 1  # one increment for the two-row statement
+
+            assert await pool.execute(insert_sql, *args) == "INSERT 0 0"
+            assert (
+                await pool.fetchval(
+                    "SELECT revision FROM usage_rollup_dirty_days WHERE day=$1",
+                    period_start.date(),
+                )
+                == 1
+            )
+
+            invalid_args = (*args[:7], None, "invalid-customer-owner")
+            with pytest.raises(asyncpg.exceptions.CheckViolationError):
+                await pool.execute(insert_sql, *invalid_args)
+
+            priced_clone_sql = """
+                INSERT INTO usage_events (
+                    ts, user_id, project_id, ref_kind, ref_id,
+                    category, resource, quantity, unit, rate_usd, cost_usd,
+                    source, source_id, details, period_start, period_end,
+                    measurement_basis, cost_domain, resource_class,
+                    attribution_scope, measurement_algorithm,
+                    source_capacity_value, source_capacity_unit,
+                    source_cluster, source_kind, source_uid,
+                    source_lifecycle_id, source_interval_id, event_kind,
+                    payload_hash
+                )
+                SELECT
+                    ts, user_id, project_id, ref_kind, ref_id,
+                    category, resource, $2::numeric, unit, $3::numeric,
+                    $4::numeric, source, $1, details, period_start, period_end,
+                    measurement_basis, cost_domain, resource_class,
+                    attribution_scope, measurement_algorithm,
+                    $5::numeric, source_capacity_unit,
+                    source_cluster, source_kind, source_uid,
+                    source_lifecycle_id, source_interval_id, event_kind,
+                    repeat('c', 64)
+                FROM usage_events
+                WHERE source_id='typed-batch' AND unit='vcpu-hour'
+                LIMIT 1
+            """
+            await pool.execute(
+                priced_clone_sql,
+                "rounded-product",
+                Decimal("0.333333333333333333"),
+                Decimal("0.1"),
+                Decimal("0.033333333333333333"),
+                Decimal("1000"),
+            )
+            with pytest.raises(asyncpg.exceptions.CheckViolationError):
+                await pool.execute(
+                    priced_clone_sql,
+                    "unrounded-product",
+                    Decimal("0.333333333333333333"),
+                    Decimal("0.1"),
+                    Decimal("0.0333333333333333333"),
+                    Decimal("1000"),
+                )
+            with pytest.raises(asyncpg.exceptions.CheckViolationError):
+                await pool.execute(
+                    priced_clone_sql,
+                    "quantity-scale-overflow",
+                    Decimal("0.0000000000000000001"),
+                    None,
+                    None,
+                    Decimal("1000"),
+                )
+            for source_id, quantity, rate, cost, capacity in (
+                (
+                    "quantity-nan",
+                    Decimal("NaN"),
+                    None,
+                    None,
+                    Decimal("1000"),
+                ),
+                (
+                    "quantity-infinity",
+                    Decimal("Infinity"),
+                    None,
+                    None,
+                    Decimal("1000"),
+                ),
+                (
+                    "capacity-nan",
+                    Decimal("1"),
+                    None,
+                    None,
+                    Decimal("NaN"),
+                ),
+                (
+                    "capacity-infinity",
+                    Decimal("1"),
+                    None,
+                    None,
+                    Decimal("Infinity"),
+                ),
+                (
+                    "rate-infinity",
+                    Decimal("1"),
+                    Decimal("Infinity"),
+                    Decimal("0"),
+                    Decimal("1000"),
+                ),
+                (
+                    "cost-nan",
+                    Decimal("1"),
+                    Decimal("0.1"),
+                    Decimal("NaN"),
+                    Decimal("1000"),
+                ),
+            ):
+                with pytest.raises(asyncpg.exceptions.CheckViolationError):
+                    await pool.execute(
+                        priced_clone_sql,
+                        source_id,
+                        quantity,
+                        rate,
+                        cost,
+                        capacity,
+                    )
+
+            correction_sql = """
+                INSERT INTO usage_events (
+                    ts, user_id, project_id, ref_kind, ref_id,
+                    category, resource, quantity, unit, rate_usd, cost_usd,
+                    source, source_id, details, period_start, period_end,
+                    measurement_basis, cost_domain, resource_class,
+                    attribution_scope, measurement_algorithm,
+                    source_capacity_value, source_capacity_unit,
+                    source_cluster, source_kind, source_uid,
+                    source_lifecycle_id, source_interval_id, event_kind,
+                    corrects_source, corrects_source_id, corrects_unit,
+                    corrects_ts, correction_group_id, correction_reason,
+                    correction_actor_id, payload_hash
+                )
+                SELECT
+                    ts, user_id, project_id, ref_kind, ref_id,
+                    category, resource, -quantity, unit, NULL, NULL,
+                    'infra-allocation-correction-v2', $1, details,
+                    period_start, period_end, measurement_basis, cost_domain,
+                    resource_class, attribution_scope, measurement_algorithm,
+                    source_capacity_value, source_capacity_unit,
+                    source_cluster, source_kind, source_uid,
+                    source_lifecycle_id, source_interval_id, 'correction',
+                    source, source_id, $2, $3, $4, 'reviewed correction',
+                    $5, repeat('d', 64)
+                FROM usage_events
+                WHERE source_id='typed-batch' AND unit='vcpu-hour'
+                LIMIT 1
+            """
+            correction_group, correction_actor = uuid4(), uuid4()
+            await pool.execute(
+                correction_sql,
+                "correction-valid",
+                "vcpu-hour",
+                period_start,
+                correction_group,
+                correction_actor,
+            )
+            with pytest.raises(asyncpg.exceptions.CheckViolationError):
+                await pool.execute(
+                    correction_sql,
+                    "correction-wrong-unit",
+                    "gib-hour",
+                    period_start,
+                    uuid4(),
+                    correction_actor,
+                )
+            with pytest.raises(asyncpg.exceptions.CheckViolationError):
+                await pool.execute(
+                    correction_sql,
+                    "correction-wrong-ts",
+                    "vcpu-hour",
+                    period_start + timedelta(microseconds=1),
+                    uuid4(),
+                    correction_actor,
+                )
+
+            with pytest.raises(asyncpg.exceptions.ObjectNotInPrerequisiteStateError):
+                await pool.execute(
+                    "UPDATE usage_events SET quantity=2 WHERE source_id=$1",
+                    "typed-batch",
+                )
 
 
 class TestAuditPartitions:

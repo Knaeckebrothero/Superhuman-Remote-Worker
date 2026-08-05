@@ -10,6 +10,7 @@ related:
   - "[[usage_monitoring_and_rate_limiting]]"
   - "[[observability_and_quotas]]"
   - "[[saas_billing_and_metering]]"
+  - "[[infrastructure_resource_metering]]"
 aliases:
   - usage dashboard
   - fleet monitor
@@ -22,7 +23,7 @@ aliases:
 > Design doc — captured 2026-06-26 from the "make the usage page actually
 > useful" conversation. This is the **read / visualization** layer on top of
 > [[usage_monitoring_and_rate_limiting]] Slice 4: that slice shipped the
-> append-only `usage_events` ledger (LLM tokens + workspace compute) and a
+> append-only `usage_events` ledger (LLM/TTS/STT point usage + workspace compute) and a
 > deliberately minimal Admin → Usage page that shows a single
 > `GROUP BY (category, unit)` rollup — "four numbers". The ledger underneath is
 > far richer than that page exposes. This doc designs the dashboard that
@@ -35,6 +36,11 @@ aliases:
 everything uncertain is a named fast-follow, decided **after** seeing the page
 rendered (the user's explicit preference: build a concrete v1, react to how it
 feels, iterate — don't over-spec the panel set upfront).
+
+**Successor correction (2026-08-05):** v1's combined "Compute-hours" headline
+adds vCPU-hours and memory GiB-hours and is retained only as a compatibility
+surface. [[infrastructure_resource_metering]] replaces it with dimensionally
+separate CPU, compute-memory, claim, and provisioned-volume cards in `/api/usage/v2`.
 
 **Driver:** Two things converged. (1) The Slice-4 page shows only a
 category×unit rollup, while the ledger records per-row `user_id`, `project_id`,

@@ -12,7 +12,8 @@ export type UsageWindow = number | {
   toIso?: string;
 };
 
-/** One (category, unit) usage aggregate row from `/api/usage`. */
+/** One legacy (category, unit) usage aggregate row from `/api/usage`.
+ * Category is required when interpreting reused units such as `gib-hour`. */
 export interface UsageCategoryRow {
   category: string;
   unit: string;
@@ -61,6 +62,52 @@ export interface UsageSummary {
   to?: string;
 }
 
+/** Decimal-safe row model returned by the dark-launched `/api/usage/v2`. */
+export interface UsageRowV2 {
+  category: string;
+  measurement_basis: 'api-consumed' | 'scheduler-request' | 'guest-provisioned'
+    | 'claim-requested' | 'volume-provisioned' | 'actual' | 'legacy-unknown';
+  cost_domain: 'external-service' | 'workload-allocation' | 'physical-asset'
+    | 'idle' | 'overhead' | 'unknown';
+  resource_class: 'llm-model' | 'kubernetes-pod' | 'virtual-machine'
+    | 'persistent-volume-claim' | 'persistent-volume' | 'unknown';
+  measurement_algorithm: string;
+  resource: string;
+  unit: string;
+  attribution_scope: 'customer' | 'shared-platform' | 'unknown';
+  quantity: string;
+  finalized_quantity: string;
+  confirmed_provisional_quantity: string;
+  unverified_projected_quantity: string | null;
+  ledger_cost: {
+    status: 'priced' | 'partially-priced' | 'unpriced';
+    currency: 'USD';
+    amount: string | null;
+    priced_quantity: string;
+    unpriced_quantity: string;
+  };
+  events: number;
+}
+
+export interface UsageSummaryV2 {
+  schema_version: 2;
+  window: {
+    start: string;
+    end: string;
+    as_of: string;
+    data_through: string | null;
+  };
+  rows: UsageRowV2[];
+  coverage: {
+    status: 'complete' | 'partial' | 'unavailable';
+    includes_provisional: boolean;
+    required_sources_ok: number;
+    required_sources_total: number;
+    unknown_ranges: Array<{start: string; end: string | null}>;
+    excluded_domains: string[];
+  };
+}
+
 const EMPTY: UsageSummary = {
   by_category: [],
   total_cost_usd: 0,
@@ -77,6 +124,9 @@ export interface UsageBreakdownRow {
   events: number;
   cost_usd: number;
   cache_hit_ratio?: number;
+  /** Legacy unit-only aggregation. It cannot distinguish the same unit emitted
+   * by multiple categories; callers must avoid assigning such a value a more
+   * specific meaning until the typed row API is available. */
   units: Record<string, UsageUnitAgg>;
 }
 export interface UsageBreakdown {
@@ -120,7 +170,10 @@ export class AdminUsageService {
   private readonly baseUrl = environment.apiUrl;
 
   readonly usage = signal<UsageSummary | null>(null);
+  readonly usageV2 = signal<UsageSummaryV2 | null>(null);
   readonly loading = signal(false);
+  private usageRequestGeneration = 0;
+  private usageV2RequestGeneration = 0;
 
   /** HttpContext carrying the page-level scope override for the view-as interceptor. */
   private scopeCtx(scope: UsageScope): HttpContext {
@@ -138,14 +191,39 @@ export class AdminUsageService {
   }
 
   loadUsage(window: UsageWindow = 30, scope: UsageScope = null): void {
+    const generation = ++this.usageRequestGeneration;
+    this.usage.set(null);
     this.loading.set(true);
     const params = this.windowParams(window);
     this.http
       .get<UsageSummary>(`${this.baseUrl}/usage`, {params, context: this.scopeCtx(scope)})
       .pipe(catchError(() => of(EMPTY)))
       .subscribe((res) => {
+        if (generation !== this.usageRequestGeneration) return;
         this.usage.set(res ?? EMPTY);
         this.loading.set(false);
+      });
+  }
+
+  /** Exercise the typed contract during dark launch. The legacy dashboard does
+   * not switch sources until v2 bootstrap/reconciliation has passed. */
+  loadUsageV2(
+    window: UsageWindow = 30,
+    scope: UsageScope = null,
+    includeNonCustomer = false,
+  ): void {
+    const generation = ++this.usageV2RequestGeneration;
+    this.usageV2.set(null);
+    let params = this.windowParams(window);
+    if (includeNonCustomer) params = params.set('include_non_customer', 'true');
+    this.http
+      .get<UsageSummaryV2>(`${this.baseUrl}/usage/v2`, {
+        params,
+        context: this.scopeCtx(scope),
+      })
+      .pipe(catchError(() => of(null)))
+      .subscribe((res) => {
+        if (generation === this.usageV2RequestGeneration) this.usageV2.set(res);
       });
   }
 

@@ -1,3 +1,17 @@
+{{- if and .Values.infrastructureMetering.shadowEnabled (not .Values.infrastructureMetering.collectorEnabled) }}
+{{- fail "infrastructureMetering.shadowEnabled requires collectorEnabled" }}
+{{- end }}
+{{- if .Values.infrastructureMetering.publicationEnabled }}
+{{- if not .Values.infrastructureMetering.collectorEnabled }}
+{{- fail "infrastructureMetering.publicationEnabled requires collectorEnabled" }}
+{{- end }}
+{{- if not .Values.infrastructureMetering.shadowEnabled }}
+{{- fail "infrastructureMetering.publicationEnabled requires shadowEnabled" }}
+{{- end }}
+{{- if not .Values.infrastructureMetering.stableClusterId }}
+{{- fail "infrastructureMetering.publicationEnabled requires stableClusterId" }}
+{{- end }}
+{{- end }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -233,6 +247,13 @@ data:
 
   # Orchestrator settings
   AUTO_ASSIGN_ENABLED: {{ .Values.orchestrator.autoAssignEnabled | quote }}
+  # Infrastructure metering dark-launch gates (Slice 0). These never grant the
+  # orchestrator Kubernetes read permissions; collector/RBAC arrives later.
+  INFRASTRUCTURE_METERING_V2_READS_ENABLED: {{ .Values.infrastructureMetering.v2ReadsEnabled | default false | quote }}
+  INFRASTRUCTURE_METERING_COLLECTOR_ENABLED: {{ .Values.infrastructureMetering.collectorEnabled | default false | quote }}
+  INFRASTRUCTURE_METERING_SHADOW_ENABLED: {{ .Values.infrastructureMetering.shadowEnabled | default false | quote }}
+  INFRASTRUCTURE_METERING_PUBLICATION_ENABLED: {{ .Values.infrastructureMetering.publicationEnabled | default false | quote }}
+  INFRASTRUCTURE_METERING_STABLE_CLUSTER_ID: {{ .Values.infrastructureMetering.stableClusterId | default "" | quote }}
 
   # Neo4j — only the Bolt URL is non-secret. Both NEO4J_USERNAME and
   # NEO4J_PASSWORD live in the Secret/Vault, mirroring the POSTGRES_USER /

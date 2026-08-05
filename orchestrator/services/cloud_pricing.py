@@ -26,6 +26,8 @@ from typing import Any, Iterable, Optional
 import asyncpg
 import httpx
 
+from .cloud_pricing_contracts import partition_v1_workspace_usage
+
 logger = logging.getLogger(__name__)
 
 AWS_CARD_ID = "aws-fargate-euc1"
@@ -341,7 +343,11 @@ class CloudCostEstimator:
             return []
         priced_at = as_of or datetime.now(timezone.utc)
         quantities: dict[tuple[str, str], Decimal] = defaultdict(Decimal)
-        for row in usage_rows:
+        # Legacy cards deliberately wildcard ``resource``. Keep their original
+        # workspace Pod scope as typed v2 VM, agent, platform, and storage rows
+        # begin sharing this estimator input. Partial typed rows fail closed.
+        selection = partition_v1_workspace_usage(usage_rows)
+        for row in selection.eligible_rows:
             quantity = _decimal(row.get("quantity"))
             category = row.get("category")
             unit = row.get("unit")
