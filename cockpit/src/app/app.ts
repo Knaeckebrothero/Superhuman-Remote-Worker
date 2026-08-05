@@ -9,14 +9,14 @@ import {ViewportService} from './core/services/viewport.service';
 import {UserService} from './core/services/user.service';
 import {SidebarService} from './core/services/sidebar.service';
 import {ActionCenterService} from './core/services/action-center.service';
-// Debug-only components
-import {PlaceholderAComponent} from './debug/components/placeholders/placeholder-a.component';
-import {PlaceholderBComponent} from './debug/components/placeholders/placeholder-b.component';
-import {PlaceholderCComponent} from './debug/components/placeholders/placeholder-c.component';
-import {DbTableComponent} from './debug/components/db-table/db-table.component';
-import {AgentActivityComponent} from './debug/components/agent-activity/agent-activity.component';
-import {RequestViewerComponent} from './debug/components/request-viewer/request-viewer.component';
-import {GraphTimelineComponent} from './debug/components/graph-timeline/graph-timeline.component';
+// Workbench-only components
+import {PlaceholderAComponent} from './workbench/components/placeholders/placeholder-a.component';
+import {PlaceholderBComponent} from './workbench/components/placeholders/placeholder-b.component';
+import {PlaceholderCComponent} from './workbench/components/placeholders/placeholder-c.component';
+import {DbTableComponent} from './workbench/components/db-table/db-table.component';
+import {AgentActivityComponent} from './workbench/components/agent-activity/agent-activity.component';
+import {RequestViewerComponent} from './workbench/components/request-viewer/request-viewer.component';
+import {GraphTimelineComponent} from './workbench/components/graph-timeline/graph-timeline.component';
 // Shared components
 import {TodoListComponent} from './views/todos/todo-list.component';
 import {ChatHistoryComponent} from './views/chat-history/chat-history.component';
@@ -29,7 +29,7 @@ import {ExpertsListComponent} from './views/experts/experts-list.component';
 import {JobReviewComponent} from './views/job-review/job-review.component';
 import {WorkspaceBrowserComponent} from './views/workspace-browser/workspace-browser.component';
 import {ProjectListPageComponent} from './views/projects/project-list.component';
-import {MemoryPanelComponent} from './debug/components/memory-panel/memory-panel.component';
+import {MemoryPanelComponent} from './workbench/components/memory-panel/memory-panel.component';
 import {InboxPageComponent} from './views/inbox/inbox-page.component';
 import {ConfigEditorComponent} from './views/config-editor/config-editor.component';
 import {EmptyCatalogBannerComponent} from './shell/empty-catalog-banner/empty-catalog-banner.component';

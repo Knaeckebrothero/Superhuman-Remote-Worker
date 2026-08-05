@@ -3,7 +3,16 @@ import { isPlatformBrowser } from '@angular/common';
 import { ComponentType, LayoutConfig } from '../layout.model';
 import { LayoutPreset } from '../layout-preset.model';
 
-const STORAGE_KEY = 'cockpit-layout';
+const STORAGE_KEY = 'workbench-layout';
+
+/**
+ * Pre-rename key. The workbench used to be the "debug" page and keyed its
+ * layout on `cockpit-layout`, which now reads backwards: Cockpit is the
+ * product, the workbench is one surface inside it. Read the old key once so
+ * existing arrangements survive the rename, then write forward under the new
+ * one. Safe to delete once no active browser still holds the legacy key.
+ */
+const LEGACY_STORAGE_KEY = 'cockpit-layout';
 
 /**
  * Returns the default 3-column layout.
@@ -214,15 +223,25 @@ export class LayoutService {
 
   /**
    * Load layout from localStorage if available.
+   *
+   * Falls back to the pre-rename key so a saved arrangement survives the
+   * debug -> workbench rename, and migrates it forward on the way through.
    */
   loadFromStorage(): void {
     if (isPlatformBrowser(this.platformId)) {
       try {
         const stored = localStorage.getItem(STORAGE_KEY);
-        if (stored) {
-          const parsed = JSON.parse(stored) as LayoutConfig;
+        const legacy = stored ? null : localStorage.getItem(LEGACY_STORAGE_KEY);
+        const raw = stored ?? legacy;
+        if (raw) {
+          const parsed = JSON.parse(raw) as LayoutConfig;
           if (this.isValidLayout(parsed)) {
             this.layout.set(parsed);
+            if (legacy) {
+              // Migrate forward, then drop the old key.
+              this.saveToStorage();
+              localStorage.removeItem(LEGACY_STORAGE_KEY);
+            }
           }
         }
       } catch {

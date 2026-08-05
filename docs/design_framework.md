@@ -68,7 +68,7 @@ Forms use reactive forms with bare `<input class="form-input">` and `<select cla
 - `simple/` (mobile-first) — 10 page components: shell, jobs, create, inbox, chat, datasources, sessions, session-create. **This is what's actually wired into routing and used in production.**
 - `pages/` (desktop) — 5 components, mostly admin (users, providers, models) plus project-detail and settings. `layout/sidebar/` exists but is **not integrated into any route** — desktop is largely a skeleton.
 
-Top-level routes (~14): `/`, `/sessions`, `/sessions/:threadId`, `/jobs`, `/create`, `/inbox`, `/projects`, `/projects/:id`, `/datasources`, `/settings`, `/admin/providers`, `/admin/models`, `/admin/users`, `/debug`, plus legacy redirects.
+Top-level routes (~14): `/`, `/sessions`, `/sessions/:threadId`, `/jobs`, `/create`, `/inbox`, `/projects`, `/projects/:id`, `/datasources`, `/settings`, `/admin/providers`, `/admin/models`, `/admin/users`, `/workbench`, plus legacy redirects.
 
 Mobile chrome: `SidebarToggleComponent` (minimal menu button). No bottom tabs, flat routing. Header bar 48 px (44 px breakpoint-adjusted).
 

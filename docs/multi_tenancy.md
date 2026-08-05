@@ -500,7 +500,7 @@ Each MCP tool today is a thin wrapper around a REST call. Once the REST endpoint
 ### Cockpit changes
 
 1. Remove the UI-only "mine" filter in `job-list.component.ts:794-798`.
-2. Add ownership-aware route guards for `/projects/:id`, `/debug/...`, etc.
+2. Add ownership-aware route guards for `/projects/:id`, `/workbench/...`, etc.
 3. Hide nav items the user can't act on.
 4. After the IDE proxy hotfix, verify the embedded IDE still works for legitimate users.
 

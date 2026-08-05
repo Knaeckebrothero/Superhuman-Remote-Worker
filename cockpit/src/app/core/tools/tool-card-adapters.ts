@@ -42,7 +42,7 @@ export function toolCardViewFromEvent(tc: ToolCallEvent): ToolCardView {
     return buildToolCardView(normalized);
 }
 
-/** Debug MongoDB audit `AuditEntry` (a tool step) → unified view-model. */
+/** Workbench MongoDB audit `AuditEntry` (a tool step) → unified view-model. */
 export function toolCardViewFromAudit(entry: AuditEntry): ToolCardView {
     const tool = entry.tool;
     // completed_at === null (with a started_at) means the call is still running.

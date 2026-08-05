@@ -53,7 +53,7 @@ export function canvasToolCardContext(
 /**
  * Source-agnostic presentational card for one agent tool call. Renders a
  * {@link ToolCardView} (built by the descriptor registry from either the live
- * session stream or the debug audit trail) with a fixed body order: raw tool
+ * session stream or the workbench audit trail) with a fixed body order: raw tool
  * name → Parameters → Result → Details → Error. Owns its own `<details>`;
  * auto-opens on error/denied. Design: `docs/features/unified_tool_cards.md`.
  */
@@ -232,7 +232,7 @@ export function canvasToolCardContext(
 })
 export class AppToolCardComponent implements OnDestroy {
     readonly view = input.required<ToolCardView>();
-    /** Force the card open regardless of status (e.g. the debug surface). */
+    /** Force the card open regardless of status (e.g. the workbench surface). */
     readonly defaultOpen = input<boolean>(false);
     readonly actionRequested = output<ToolCardAction>();
     /** Job id whose diff the host should open in the drawer it already owns. */

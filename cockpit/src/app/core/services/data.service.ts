@@ -13,7 +13,7 @@ import { JobContextService } from './job-context.service';
 import { JobSummary } from '../models/audit.model';
 
 /**
- * Job-selection state for the debug dashboard.
+ * Job-selection state for the workbench dashboard.
  *
  * Historically this also eagerly downloaded a job's entire audit/chat/graph
  * streams into IndexedDB and exposed a slider-windowed view — that bulk path
@@ -43,7 +43,7 @@ export class DataService {
     }
   }
 
-  /** Currently selected job ID — the signal every debug panel reacts to. */
+  /** Currently selected job ID — the signal every workbench panel reacts to. */
   private readonly _currentJobId = signal<string | null>(null);
   readonly currentJobId = this._currentJobId.asReadonly();
 
