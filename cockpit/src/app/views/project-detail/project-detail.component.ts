@@ -1,9 +1,11 @@
-import {ChangeDetectionStrategy, Component, computed, inject, OnDestroy, OnInit, signal} from '@angular/core';
+import {ChangeDetectionStrategy, Component, computed, DestroyRef, inject, OnDestroy, OnInit, signal} from '@angular/core';
+import {takeUntilDestroyed} from '@angular/core/rxjs-interop';
 import {ActivatedRoute, Router} from '@angular/router';
 import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
 import {MarkdownComponent} from 'ngx-markdown';
 import {stripMarkdown} from '../../core/util/strip-markdown';
 import {ApiService} from '../../core/services/api.service';
+import {CapabilitiesService} from '../../core/services/capabilities.service';
 import {UserService} from '../../core/services/user.service';
 import {ViewportService} from '../../core/services/viewport.service';
 import {SidebarToggleComponent} from '../../shell/sidebar-toggle/sidebar-toggle.component';
@@ -455,10 +457,19 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
             <div class="table-section">
               <!-- Link Datasource Form -->
               <div class="inline-form">
+                <app-input
+                  class="datasource-search"
+                  size="sm"
+                  [value]="datasourceCandidateSearch()"
+                  (valueChange)="onDatasourceCandidateSearch($event)"
+                  [placeholder]="'projectDetail.datasources.searchPlaceholder' | transloco"
+                  [disabled]="datasourceCandidatesLoading()"
+                />
                 <app-select
                   size="sm"
                   [value]="dsLinkId()"
                   (changed)="dsLinkId.set($event ?? '')"
+                  [disabled]="datasourceCandidatesLoading() || datasourceCandidatesError()"
                 >
                   <option value="">{{ 'projectDetail.datasources.selectPlaceholder' | transloco }}</option>
                   @for (ds of availableDatasources(); track ds.id) {
@@ -470,12 +481,42 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
                 <app-button
                   variant="primary"
                   size="sm"
-                  [disabled]="!dsLinkId()"
+                  [disabled]="!dsLinkId() || datasourceCandidatesLoading() || datasourceCandidatesError()"
                   (clicked)="linkDatasource()"
                 >
                   {{ 'projectDetail.datasources.link' | transloco }}
                 </app-button>
               </div>
+              @if (datasourceCandidatesLoading()) {
+                <div class="datasource-candidate-state">
+                  <app-spinner size="sm" />
+                  <span>{{ 'projectDetail.datasources.loadingCandidates' | transloco }}</span>
+                </div>
+              } @else if (datasourceCandidatesError()) {
+                <div class="datasource-candidate-state error" role="alert">
+                  <span>{{ 'projectDetail.datasources.candidatesLoadFailed' | transloco }}</span>
+                  <app-button variant="secondary" size="sm" (clicked)="loadDatasourceCandidates()">
+                    {{ 'projectDetail.datasources.retry' | transloco }}
+                  </app-button>
+                </div>
+              } @else if (availableDatasources().length === 0) {
+                <div class="datasource-candidate-state">
+                  {{ 'projectDetail.datasources.noCandidates' | transloco }}
+                </div>
+              }
+              @if (datasourceCandidatesNextCursor() && !datasourceCandidatesError()) {
+                <div class="datasource-candidate-actions">
+                  <app-button
+                    variant="secondary"
+                    size="sm"
+                    [loading]="datasourceCandidatesLoadingMore()"
+                    [disabled]="datasourceCandidatesLoadingMore()"
+                    (clicked)="loadMoreDatasourceCandidates()"
+                  >
+                    {{ 'datasources.catalog.loadMore' | transloco }}
+                  </app-button>
+                </div>
+              }
 
               @if (projectDatasources().length === 0) {
                 <div class="empty-inline">{{ 'projectDetail.datasources.empty' | transloco }}</div>
@@ -1176,6 +1217,20 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
       flex-wrap: wrap;
     }
 
+    .datasource-search { min-width: 180px; flex: 1 1 220px; }
+
+    .datasource-candidate-state {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      color: var(--text-muted);
+      font-size: 12px;
+    }
+
+    .datasource-candidate-state.error { color: var(--danger); }
+
+    .datasource-candidate-actions { display: flex; justify-content: flex-start; }
+
     /* User cell */
     .user-cell {
       display: flex;
@@ -1622,8 +1677,10 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
   private readonly route = inject(ActivatedRoute);
   private readonly router = inject(Router);
   private readonly api = inject(ApiService);
+  private readonly capabilities = inject(CapabilitiesService);
   private readonly userService = inject(UserService);
   private readonly transloco = inject(TranslocoService);
+  private readonly destroyRef = inject(DestroyRef);
   protected readonly viewport = inject(ViewportService);
 
   readonly project = signal<Project | null>(null);
@@ -1663,10 +1720,24 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
   readonly projectDatasources = signal<ProjectDatasource[]>([]);
   readonly allDatasources = signal<Datasource[]>([]);
   readonly dsLinkId = signal('');
+  readonly datasourceCandidateSearch = signal('');
+  readonly datasourceCandidatesLoading = signal(false);
+  readonly datasourceCandidatesLoadingMore = signal(false);
+  readonly datasourceCandidatesError = signal(false);
+  readonly datasourceCandidatesNextCursor = signal<string | null>(null);
+  private datasourceCandidatesRequestSerial = 0;
+  private datasourceCandidateSearchTimer: ReturnType<typeof setTimeout> | null = null;
 
   readonly availableDatasources = computed(() => {
     const linked = new Set(this.projectDatasources().map((d) => d.id));
-    return this.allDatasources().filter((d) => !linked.has(d.id));
+    const query = this.datasourceCandidateSearch().trim().toLocaleLowerCase();
+    return this.allDatasources().filter((d) => {
+      if (linked.has(d.id)) return false;
+      if (!this.canLinkDatasourceCandidate(d)) return false;
+      if (!query) return true;
+      return [d.name, d.description ?? '', d.type]
+        .some(value => value.toLocaleLowerCase().includes(query));
+    });
   });
 
   // Experts tab
@@ -1720,6 +1791,21 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
   private refreshInterval: ReturnType<typeof setInterval> | null = null;
 
   ngOnInit(): void {
+    // Start with the legacy list while capabilities are unresolved. If the v1
+    // contract becomes available (or is withdrawn after a reload), replace
+    // the candidate set from the matching source without mixing responses.
+    let lastPolicyAvailability = this.capabilities.datasourceScopeAutoAttachAvailable();
+    this.capabilities.datasourceScopeAutoAttachAvailability$
+      .pipe(takeUntilDestroyed(this.destroyRef))
+      .subscribe((available) => {
+        if (available === lastPolicyAvailability) return;
+        lastPolicyAvailability = available;
+        if (this.datasourceCandidateSearchTimer) {
+          clearTimeout(this.datasourceCandidateSearchTimer);
+          this.datasourceCandidateSearchTimer = null;
+        }
+        if (this.projectId) this.loadDatasourceCandidates(true);
+      });
     this.route.paramMap.subscribe((params) => {
       this.projectId = params.get('id') ?? '';
       if (this.projectId) this.loadAll();
@@ -1739,6 +1825,9 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
 
   ngOnDestroy(): void {
     if (this.refreshInterval) clearInterval(this.refreshInterval);
+    if (this.datasourceCandidateSearchTimer) {
+      clearTimeout(this.datasourceCandidateSearchTimer);
+    }
   }
 
   goBack(): void {
@@ -1791,14 +1880,139 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
 
   // Datasources
   loadProjectDatasources(): void {
-    this.api.getProjectDatasources(this.projectId).subscribe((ds) => this.projectDatasources.set(ds));
-    this.api.getDatasources().subscribe((ds) => this.allDatasources.set(ds));
+    this.api.getProjectDatasources(this.projectId).subscribe((ds) => {
+      this.projectDatasources.set(ds);
+      this.reconcileDatasourceSelection();
+    });
+    this.loadDatasourceCandidates();
+  }
+
+  /** Load connector candidates from the rollout-appropriate contract. V1 is
+   * target-aware and paginated; older orchestrators keep the legacy visible
+   * connector list and client-side search. */
+  loadDatasourceCandidates(reset = true): void {
+    if (!this.projectId) return;
+    const policyAvailable = this.capabilities.datasourceScopeAutoAttachAvailable();
+    if (!reset && !policyAvailable) return;
+    const cursor = reset ? null : this.datasourceCandidatesNextCursor();
+    if (!reset && !cursor) return;
+
+    const serial = ++this.datasourceCandidatesRequestSerial;
+    if (reset) {
+      this.datasourceCandidatesLoading.set(true);
+      this.datasourceCandidatesLoadingMore.set(false);
+      this.datasourceCandidatesNextCursor.set(null);
+    } else {
+      this.datasourceCandidatesLoadingMore.set(true);
+    }
+    this.datasourceCandidatesError.set(false);
+
+    if (!policyAvailable) {
+      this.api.getDatasources().subscribe({
+        next: (datasources) => {
+          if (serial !== this.datasourceCandidatesRequestSerial) return;
+          this.allDatasources.set(datasources);
+          this.datasourceCandidatesLoading.set(false);
+          this.datasourceCandidatesLoadingMore.set(false);
+          this.datasourceCandidatesNextCursor.set(null);
+          this.reconcileDatasourceSelection();
+        },
+        error: () => {
+          if (serial !== this.datasourceCandidatesRequestSerial) return;
+          this.allDatasources.set([]);
+          this.dsLinkId.set('');
+          this.datasourceCandidatesLoading.set(false);
+          this.datasourceCandidatesLoadingMore.set(false);
+          this.datasourceCandidatesNextCursor.set(null);
+        },
+      });
+      return;
+    }
+
+    this.api.getLinkableProjectDatasources(this.projectId, {
+      q: this.datasourceCandidateSearch().trim() || undefined,
+      cursor: cursor ?? undefined,
+      limit: 50,
+    }).subscribe({
+      next: (response) => {
+        if (serial !== this.datasourceCandidatesRequestSerial) return;
+        const previous = reset ? [] : this.allDatasources();
+        this.allDatasources.set([
+          ...previous,
+          ...response.items.filter(
+            incoming => !previous.some(existing => existing.id === incoming.id),
+          ),
+        ]);
+        this.datasourceCandidatesNextCursor.set(response.next_cursor);
+        this.datasourceCandidatesLoading.set(false);
+        this.datasourceCandidatesLoadingMore.set(false);
+        this.reconcileDatasourceSelection();
+      },
+      error: () => {
+        if (serial !== this.datasourceCandidatesRequestSerial) return;
+        // Fail closed: never leave stale candidate rows selectable after an
+        // authorization-aware v1 request fails.
+        this.allDatasources.set([]);
+        this.dsLinkId.set('');
+        this.datasourceCandidatesNextCursor.set(null);
+        this.datasourceCandidatesLoading.set(false);
+        this.datasourceCandidatesLoadingMore.set(false);
+        this.datasourceCandidatesError.set(true);
+      },
+    });
+  }
+
+  loadMoreDatasourceCandidates(): void {
+    this.loadDatasourceCandidates(false);
+  }
+
+  onDatasourceCandidateSearch(value: string): void {
+    this.datasourceCandidateSearch.set(value);
+    this.reconcileDatasourceSelection();
+    if (!this.capabilities.datasourceScopeAutoAttachAvailable()) return;
+
+    if (this.datasourceCandidateSearchTimer) {
+      clearTimeout(this.datasourceCandidateSearchTimer);
+    }
+    // Invalidate any older page immediately; the delayed request owns the
+    // loading flags and only its serial may publish results.
+    this.datasourceCandidatesRequestSerial += 1;
+    this.datasourceCandidatesLoading.set(true);
+    this.datasourceCandidatesLoadingMore.set(false);
+    this.datasourceCandidatesError.set(false);
+    this.datasourceCandidatesNextCursor.set(null);
+    this.datasourceCandidateSearchTimer = setTimeout(() => {
+      this.datasourceCandidateSearchTimer = null;
+      this.loadDatasourceCandidates(true);
+    }, 250);
+  }
+
+  private reconcileDatasourceSelection(): void {
+    const selected = this.dsLinkId();
+    if (selected && !this.availableDatasources().some(ds => ds.id === selected)) {
+      this.dsLinkId.set('');
+    }
+  }
+
+  /** Defence in depth for stale/mixed-version responses. The v1 endpoint is
+   * authoritative, while the legacy list was only visibility-filtered. These
+   * mirror the connector-side link rules before a row becomes selectable. */
+  private canLinkDatasourceCandidate(datasource: Datasource): boolean {
+    if (datasource.config?.native_project_id) return false;
+    const user = this.userService.currentUser();
+    if (!user) return false;
+    if (user.is_admin || datasource.created_by === user.id) return true;
+    return datasource.is_global === true && (datasource.scope_mode ?? 'all') === 'all';
   }
 
   linkDatasource(): void {
     const dsId = this.dsLinkId();
     if (!dsId) return;
-    const datasource = this.allDatasources().find((ds) => ds.id === dsId);
+    const datasource = this.availableDatasources().find((ds) => ds.id === dsId);
+    if (!datasource) {
+      this.dsLinkId.set('');
+      return;
+    }
     const settings = datasource?.type === 'kb' ? {read_only: true} : {};
     this.api.linkProjectDatasource(this.projectId, dsId, settings).subscribe((res) => {
       if (res) {

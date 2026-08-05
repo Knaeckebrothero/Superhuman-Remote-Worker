@@ -635,6 +635,7 @@ class TestLiveSessionSanitiser:
 
 SESSION_THREAD_ID = "11111111-2222-3333-4444-555555555555"
 SESSION_USER_ID = str(uuid.uuid4())
+SESSION_DATASOURCE_ID = str(uuid.uuid4())
 
 
 @pytest.fixture
@@ -673,6 +674,30 @@ def session_create_env(monkeypatch):
     )
     monkeypatch.setattr(main, "_is_experts_db_enabled", MagicMock(return_value=False))
     monkeypatch.setattr(main, "_user_experts_enabled", AsyncMock(return_value=False))
+    # Keep this endpoint-boundary fixture hermetic. The real create path also
+    # initializes cloud/Git services and schedules workspace/agent provisioning;
+    # those integrations have their own tests and can otherwise wait on local
+    # developer services here.
+    monkeypatch.setattr(
+        main,
+        "gitea_client",
+        SimpleNamespace(is_initialized=False, is_configured=False),
+    )
+    monkeypatch.setattr(
+        main.main_cloud_router,
+        "for_owner",
+        MagicMock(
+            return_value=SimpleNamespace(
+                is_initialized=False,
+                is_configured=False,
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        main, "container_provisioner", SimpleNamespace(is_available=False)
+    )
+    monkeypatch.setattr(main, "docker_provisioner", SimpleNamespace(is_available=False))
+    monkeypatch.setattr(main, "agent_provisioner", SimpleNamespace(is_available=False))
     monkeypatch.setattr(
         main, "_authorize_thread_datasource_ids", AsyncMock(return_value=[])
     )
@@ -695,6 +720,38 @@ def _persisted_thread_override(conn) -> dict:
 
 
 class TestSessionCreateBoundary:
+    @pytest.mark.asyncio
+    async def test_explicit_default_request_materializes_policy_selection(
+        self, session_create_env
+    ):
+        main, db, _, _ = session_create_env
+        resolver = AsyncMock(
+            return_value=(
+                [SESSION_DATASOURCE_ID],
+                {SESSION_DATASOURCE_ID: 7},
+            )
+        )
+
+        with patch("services.datasource_policy.default_datasource_selection", resolver):
+            await main.create_thread(
+                main.ThreadCreateRequest(
+                    title="t",
+                    use_datasource_defaults=True,
+                ),
+                MagicMock(),
+            )
+
+        resolver.assert_awaited_once_with(
+            db,
+            SESSION_USER_ID,
+            [],
+            "sandbox",
+        )
+        kwargs = db.create_thread.await_args.kwargs
+        assert kwargs["datasource_ids"] == [SESSION_DATASOURCE_ID]
+        assert kwargs["datasource_policy_revisions"] == {SESSION_DATASOURCE_ID: 7}
+        assert kwargs["datasource_selection_provenance"]["origin"] == "default"
+
     @pytest.mark.asyncio
     async def test_unticking_a_previously_discarded_category_reaches_the_thread(
         self, session_create_env
@@ -772,6 +829,18 @@ def session_patch_env(monkeypatch):
     db = SimpleNamespace(
         get_thread=AsyncMock(return_value=thread_row),
         get_user=AsyncMock(return_value={"id": SESSION_USER_ID, "is_admin": False}),
+        get_datasource_policy_rows=AsyncMock(
+            return_value=[
+                {
+                    "id": SESSION_DATASOURCE_ID,
+                    "type": "postgresql",
+                    "is_global": True,
+                    "scope_mode": "all",
+                    "policy_revision": 1,
+                    "project_ids": [],
+                }
+            ]
+        ),
         merge_thread_config_override=AsyncMock(return_value=True),
         set_thread_datasource_ids=AsyncMock(return_value=True),
         record_security_event=AsyncMock(),
@@ -838,7 +907,11 @@ class TestSessionRuntimeUpdateBoundary:
             ]
         )
         db.get_datasource = AsyncMock(
-            return_value={"id": "ds-a", "type": "postgresql", "is_global": True}
+            return_value={
+                "id": SESSION_DATASOURCE_ID,
+                "type": "postgresql",
+                "is_global": True,
+            }
         )
         with patch.object(
             main, "user_can_access_datasource", AsyncMock(return_value=True)
@@ -848,7 +921,7 @@ class TestSessionRuntimeUpdateBoundary:
                 SESSION_THREAD_ID,
                 main.AgentThreadConfigUpdateRequest(
                     config_override={"tools": {"sql": []}},
-                    datasource_ids=["ds-a"],
+                    datasource_ids=[SESSION_DATASOURCE_ID],
                 ),
             )
 

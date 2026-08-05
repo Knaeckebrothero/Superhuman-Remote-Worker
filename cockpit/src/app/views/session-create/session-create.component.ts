@@ -17,7 +17,7 @@ import {AppInputComponent} from '../../ui/input';
 import {AppChipComponent} from '../../ui/chip';
 import {AppIconComponent} from '../../ui/icon';
 import {AppFormFieldComponent} from '../../ui/form-field';
-import {EffectiveModels, ExpertDefaultsResponse} from '../../core/models/api.model';
+import {EffectiveModels, EligibleDatasource, ExpertDefaultsResponse} from '../../core/models/api.model';
 
 interface Project {
   id: string;
@@ -176,8 +176,12 @@ interface ExpertDetail extends Expert {
           [effectiveModels]="resolvedEffectiveModels()"
           [datasources]="datasources()"
           [loadingDatasources]="loadingDatasources()"
+          [datasourceLoadError]="datasourceLoadError()"
+          [datasourceContextKey]="datasourceContextKey()"
+          [datasourceDefaultsEnabled]="capabilities.datasourceScopeAutoAttachAvailable()"
           [loadingExpert]="loadingExpert()"
           [gatedCapabilities]="capabilities.grants() ?? null"
+          (retryDatasources)="loadDatasourcesList()"
         />
 
         <!-- A rejected config is correctable, so the error lands here and the
@@ -195,7 +199,12 @@ interface ExpertDetail extends Expert {
           <app-button variant="secondary" (clicked)="cancel()" [disabled]="creating()">
             {{ 'sessions.create.cancel' | transloco }}
           </app-button>
-          <app-button variant="primary" [loading]="creating()" (clicked)="createSession()">
+          <app-button
+            variant="primary"
+            [loading]="creating()"
+            [disabled]="loadingDatasources() || datasourceLoadError()"
+            (clicked)="createSession()"
+          >
             {{ creating() ? ('sessions.create.creating' | transloco) : ('sessions.create.createSession' | transloco) }}
           </app-button>
         </div>
@@ -425,8 +434,14 @@ export class SessionCreateComponent implements OnInit {
   private toolPreviewSerial = 0;
   readonly loadingExperts = signal(false);
   readonly loadingExpert = signal(false);
-  readonly datasources = signal<any[]>([]);
+  readonly datasources = signal<EligibleDatasource[]>([]);
   readonly loadingDatasources = signal(false);
+  readonly datasourceLoadError = signal(false);
+  readonly datasourceContextKey = computed(() => {
+    const ids = Array.from(this.selectedProjectIds()).sort();
+    return ids.length > 0 ? `projects:${ids.join(',')}` : 'standalone';
+  });
+  private datasourceRequestSerial = 0;
 
   constructor() {
     effect(() => {
@@ -518,17 +533,29 @@ export class SessionCreateComponent implements OnInit {
     }
   }
 
-  private loadDatasourcesList(): void {
+  loadDatasourcesList(): void {
+    const serial = ++this.datasourceRequestSerial;
     this.loadingDatasources.set(true);
-    // Eligible = owner + global + linked to any selected project. The picker
-    // pre-selects these; explicit-only resolution attaches what stays checked.
+    this.datasourceLoadError.set(false);
+    // The server applies all-project scope matching and computes owner-specific
+    // defaults for this exact session context.
     const qs = Array.from(this.selectedProjectIds())
       .map(id => `project_id=${encodeURIComponent(id)}`)
       .join('&');
     const url = `${environment.apiUrl}/datasources/eligible${qs ? '?' + qs : ''}`;
-    this.http.get<any[]>(url).subscribe({
-      next: (ds) => { this.datasources.set(ds); this.loadingDatasources.set(false); },
-      error: () => this.loadingDatasources.set(false),
+    this.http.get<EligibleDatasource[]>(url).subscribe({
+      next: (ds) => {
+        if (serial !== this.datasourceRequestSerial) return;
+        this.datasources.set(ds);
+        this.loadingDatasources.set(false);
+      },
+      error: () => {
+        if (serial !== this.datasourceRequestSerial) return;
+        // Preserve the last authorized rows and their explicit selection as
+        // read-only context; the error state blocks create until retry wins.
+        this.datasourceLoadError.set(true);
+        this.loadingDatasources.set(false);
+      },
     });
   }
 
@@ -623,6 +650,7 @@ export class SessionCreateComponent implements OnInit {
   }
 
   async createSession(): Promise<void> {
+    if (this.loadingDatasources() || this.datasourceLoadError()) return;
     this.creating.set(true);
 
     const expert = this.selectedExpert();
@@ -660,7 +688,8 @@ export class SessionCreateComponent implements OnInit {
 
     // Datasource IDs
     const dsIds = this.agentSettings?.getSelectedDatasourceIds() ?? [];
-    if (dsIds.length > 0) body['datasource_ids'] = dsIds;
+    // Empty is an explicit opt-out; omission means "apply server defaults".
+    body['datasource_ids'] = dsIds;
 
     if (this.protectedCloud() && this.protectedCloudVisible()) {
       body['protected_cloud'] = true;

@@ -113,6 +113,36 @@ async def test_create_worker_job_omits_thread_id_when_not_in_context(
 
 
 @pytest.mark.asyncio
+async def test_create_worker_job_preserves_explicit_empty_datasource_ids(
+    capturing_client,
+):
+    ctx = ToolContext(_thread_id="thread-1")
+    tools = create_orchestrator_tools(ctx)
+    create = _tool_by_name(tools, "create_worker_job")
+
+    await create.ainvoke({"description": "no connectors", "datasource_ids": []})
+
+    _, body = capturing_client.posted[0]
+    assert body["datasource_ids"] == []
+    assert "use_datasource_defaults" not in body
+
+
+@pytest.mark.asyncio
+async def test_create_worker_job_requests_defaults_when_datasources_are_unspecified(
+    capturing_client,
+):
+    ctx = ToolContext(_thread_id="thread-1")
+    tools = create_orchestrator_tools(ctx)
+    create = _tool_by_name(tools, "create_worker_job")
+
+    await create.ainvoke({"description": "inherit connectors"})
+
+    _, body = capturing_client.posted[0]
+    assert "datasource_ids" not in body
+    assert body["use_datasource_defaults"] is True
+
+
+@pytest.mark.asyncio
 async def test_worker_create_job_includes_authoritative_parent_job_id(
     capturing_client,
 ):

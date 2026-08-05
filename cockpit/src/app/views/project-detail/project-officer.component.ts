@@ -72,6 +72,40 @@ export function buildSlotsSpec(
   return Object.keys(spec).length ? spec : null;
 }
 
+/** Build the standing officer's trusted thread-create request. */
+export function buildOfficerThreadCreateBody(
+  projectId: string,
+  projectName: string,
+  officer: Record<string, unknown>,
+  model = '',
+  reasoningLevel = '',
+): Record<string, unknown> {
+  const body: Record<string, unknown> = {
+    title: `Centurion — ${projectName || 'project'}`,
+    config_name: 'centurion',
+    project_ids: [projectId],
+    use_datasource_defaults: true,
+    config_override: {officer},
+  };
+  if (model.trim()) body['model'] = model.trim();
+  if (reasoningLevel) body['reasoning_level'] = reasoningLevel;
+  return body;
+}
+
+/** Build the officer conference's trusted thread-create request. */
+export function buildConferenceThreadCreateBody(
+  projectId: string,
+  projectName: string,
+): Record<string, unknown> {
+  return {
+    title: `Conference — ${projectName || 'project'}`,
+    config_name: 'centurion',
+    project_ids: [projectId],
+    use_datasource_defaults: true,
+    config_override: {officer: {conference: true}},
+  };
+}
+
 /** "in 42 min" / "overdue 3 min" — the next-wake label. */
 export function nextWakeLabel(fireAt: string | null | undefined): string {
   if (!fireAt) return 'not scheduled (event-driven)';
@@ -455,14 +489,13 @@ export class ProjectOfficerComponent implements OnInit, OnDestroy {
     const officer: Record<string, unknown> = {enabled: true};
     const slots = buildSlotsSpec(this.slotDrafts());
     if (slots) officer['slots'] = slots;
-    const body: Record<string, unknown> = {
-      title: `Centurion — ${this.projectName() || 'project'}`,
-      config_name: 'centurion',
-      project_ids: [pid],
-      config_override: {officer},
-    };
-    if (this.fBrainModel().trim()) body['model'] = this.fBrainModel().trim();
-    if (this.fReasoning()) body['reasoning_level'] = this.fReasoning();
+    const body = buildOfficerThreadCreateBody(
+      pid,
+      this.projectName(),
+      officer,
+      this.fBrainModel(),
+      this.fReasoning(),
+    );
     try {
       const resp = await firstValueFrom(
         this.http.post<{thread_id: string}>(
@@ -498,12 +531,7 @@ export class ProjectOfficerComponent implements OnInit, OnDestroy {
       const resp = await firstValueFrom(
         this.http.post<{thread_id: string}>(
           `${environment.apiUrl}/persistent/threads`,
-          {
-            title: `Conference — ${this.projectName() || 'project'}`,
-            config_name: 'centurion',
-            project_ids: [pid],
-            config_override: {officer: {conference: true}},
-          },
+          buildConferenceThreadCreateBody(pid, this.projectName()),
         ),
       );
       await this.router.navigate(['/sessions', resp.thread_id]);

@@ -186,6 +186,7 @@ def test_job_payload_is_owned_tagged_and_deep_merged_with_pins_last():
         }
     }
     assert payload["required_deliverables"] == ["output/a.md"]
+    assert payload["datasource_ids"] == []
     assert payload["config_name"] == "worker_base"
     assert payload["config_override"] == {
         "llm": {"temperature": 0.2, "model": "pinned-model"},

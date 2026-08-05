@@ -110,11 +110,15 @@ type AgentSettingsTab = 'settings' | 'instructions' | 'advanced' | 'resolved';
           <app-datasources-group
             [datasources]="datasources()"
             [loading]="loadingDatasources()"
+            [error]="datasourceLoadError()"
+            [contextKey]="datasourceContextKey()"
             [disabled]="disabled()"
             [isLiteBackend]="mode() === 'live' ? liteBackend() : (advancedAccordion?.isLiteBackend() ?? false)"
             [initialSelectedIds]="mode() === 'live' ? initialDatasourceIds() : null"
+            [datasourceDefaultsEnabled]="datasourceDefaultsEnabled()"
             [lockedIds]="lockedDatasourceIds()"
             (change)="onChange()"
+            (retry)="retryDatasources.emit()"
           />
           @if (mode() === 'live') {
             <p class="cache-note">{{ 'agentSettings.live.datasourcesLive' | transloco }}</p>
@@ -265,6 +269,10 @@ export class AgentSettingsComponent {
   /** Available datasources. */
   datasources = input<Datasource[]>([]);
   loadingDatasources = input(false);
+  datasourceLoadError = input(false);
+  datasourceContextKey = input('standalone');
+  /** Fail-closed rollout gate for server-computed create defaults. */
+  datasourceDefaultsEnabled = input(false);
   /** Live mode: the session's currently attached selection — the picker's
    *  default when untouched (live_session_settings.md Slice B). */
   initialDatasourceIds = input<string[] | null>(null);
@@ -279,6 +287,7 @@ export class AgentSettingsComponent {
 
   /** Emitted whenever any setting changes. */
   change = output<void>();
+  retryDatasources = output<void>();
   /** Emitted when instructions content changes. */
   instructionsChange = output<string | null>();
 

@@ -180,6 +180,11 @@ class TestUpdateDatasourceRepositoryEndpoint:
             AsyncMock(side_effect=fake_update_datasource),
         )
         monkeypatch.setattr(
+            main.postgres_db,
+            "get_datasource",
+            AsyncMock(return_value={**existing_ds, "config": {"forge": "gitlab"}}),
+        )
+        monkeypatch.setattr(
             main.postgres_db, "list_datasource_projects", AsyncMock(return_value=[])
         )
         client = TestClient(main.app)
@@ -229,6 +234,11 @@ class TestUpdateDatasourceRepositoryEndpoint:
             main.postgres_db,
             "update_datasource",
             AsyncMock(side_effect=fake_update_datasource),
+        )
+        monkeypatch.setattr(
+            main.postgres_db,
+            "get_datasource",
+            AsyncMock(return_value={**existing_ds, "name": "renamed-widget"}),
         )
         monkeypatch.setattr(
             main.postgres_db, "list_datasource_projects", AsyncMock(return_value=[])

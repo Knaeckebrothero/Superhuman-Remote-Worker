@@ -8,6 +8,7 @@ this is the unit boundary for the helper.
 
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -21,6 +22,16 @@ from orchestrator.services.default_experts import ExpertSelectionError
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+@pytest.fixture(autouse=True)
+def _empty_datasource_selection(monkeypatch):
+    """Keep existing expert/translation tests focused on their own boundary."""
+    resolver = AsyncMock(return_value=([], {}))
+    monkeypatch.setattr(
+        "orchestrator.services.automations.default_datasource_selection", resolver
+    )
+    return resolver
 
 
 def _mock_db_returning_job(job_id: str = "j0000001-0000-0000-0000-000000000000"):
@@ -124,6 +135,71 @@ class TestCreateJobFromAutomation:
             db.create_job.await_args.kwargs["project_id"]
             == "cccccccc-cccc-cccc-cccc-cccccccccccc"
         )
+
+    @pytest.mark.asyncio
+    async def test_resolves_live_owner_defaults_and_materializes_them_atomically(
+        self, _empty_datasource_selection
+    ) -> None:
+        db = _mock_db_returning_job()
+        project_id = "cccccccc-cccc-cccc-cccc-cccccccccccc"
+        row = _make_automation_row(project_id=project_id)
+        selected = ["dddddddd-dddd-dddd-dddd-dddddddddddd"]
+        revisions = {selected[0]: 7}
+        _empty_datasource_selection.return_value = (selected, revisions)
+
+        await create_job_from_automation(db, row, trigger_kind="manual")
+
+        _empty_datasource_selection.assert_awaited_once_with(
+            db,
+            row["owner_id"],
+            [project_id],
+            None,
+        )
+        kwargs = db.create_job.await_args.kwargs
+        assert kwargs["datasource_ids"] == selected
+        assert kwargs["datasource_policy_revisions"] == revisions
+        assert kwargs["authority_user_id"] == row["owner_id"]
+        assert kwargs["authority_project_ids"] == [project_id]
+        provenance = kwargs["datasource_selection_provenance"]
+        assert provenance["origin"] == "default"
+        assert provenance["creation_path"] == "automation"
+        assert provenance["trigger_kind"] == "manual"
+        assert provenance["effective_work_owner_id"] == row["owner_id"]
+        assert provenance["target_project_ids"] == [project_id]
+        assert provenance["datasource_ids"] == selected
+        assert provenance["policy_revisions"] == revisions
+        assert datetime.fromisoformat(provenance["resolved_at"]).tzinfo is not None
+        assert "credentials" not in provenance
+
+    @pytest.mark.asyncio
+    async def test_passes_workspace_tier_to_default_policy(
+        self, _empty_datasource_selection
+    ) -> None:
+        db = _mock_db_returning_job()
+        row = _make_automation_row(
+            config_override={"workspace": {"backend": "virtual"}}
+        )
+
+        await create_job_from_automation(db, row)
+
+        _empty_datasource_selection.assert_awaited_once_with(
+            db,
+            row["owner_id"],
+            [],
+            "virtual",
+        )
+
+    @pytest.mark.asyncio
+    async def test_default_policy_denial_creates_no_job(
+        self, _empty_datasource_selection
+    ) -> None:
+        db = _mock_db_returning_job()
+        _empty_datasource_selection.side_effect = RuntimeError("owner revoked")
+
+        with pytest.raises(RuntimeError, match="owner revoked"):
+            await create_job_from_automation(db, _make_automation_row())
+
+        db.create_job.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_unpinned_automation_resolves_application_worker_default(

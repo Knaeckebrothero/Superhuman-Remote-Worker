@@ -243,6 +243,13 @@ agent:
   # for hosted/multi-tenant deployments without suitable isolation.
   mcpDatasourcesEnabled: "false"
   mcpStdioEnabled: "false"
+  # -- Temporary compatibility gate for REST/session requests that omit
+  # datasource_ids. Cockpit submits an explicit reviewed array; enable this
+  # after legacy clients no longer encode "none" by omission.
+  datasourceDefaultsOnOmission: "false"
+  # -- Coordinated rollout gate for the connector project-scope/auto-attach UI.
+  # Keep false until all orchestrator replicas understand the v1 API contract.
+  datasourceScopeAutoAttachV1Enabled: "false"
   # -- Enable protected cloud mode: RO-reader provisioning + capture overlay.
   # Default OFF (prod-safe); the dev/experimental values file turns it on.
   # See docs/design/cloud_access_unification.md §8 Phase 1.

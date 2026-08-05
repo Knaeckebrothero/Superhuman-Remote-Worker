@@ -68,6 +68,83 @@ describe('ApiService.transcribeVoice', () => {
   });
 });
 
+describe('ApiService datasource policy endpoints', () => {
+  let api: ApiService;
+  let httpMock: HttpTestingController;
+
+  beforeEach(() => {
+    TestBed.resetTestingModule();
+    TestBed.configureTestingModule({
+      providers: [
+        ApiService,
+        provideHttpClient(),
+        provideHttpClientTesting(),
+        {provide: AppToastService, useValue: {}},
+        {provide: TranslocoService, useValue: {translate: (k: string) => k}},
+        {provide: ErrorMessageService, useValue: {}},
+      ],
+    });
+    api = TestBed.inject(ApiService);
+    httpMock = TestBed.inject(HttpTestingController);
+  });
+
+  afterEach(() => httpMock.verify());
+
+  it('requests the filtered cursor catalog', async () => {
+    const pending = firstValueFrom(api.getDatasourceCatalog({
+      q: 'prod', availability: 'projects', auto_attach: true, ownership: 'mine', limit: 25,
+    }));
+    const req = httpMock.expectOne(r => r.url.endsWith('/datasources/catalog'));
+    expect(req.request.params.get('q')).toBe('prod');
+    expect(req.request.params.get('availability')).toBe('projects');
+    expect(req.request.params.get('auto_attach')).toBe('true');
+    expect(req.request.params.get('ownership')).toBe('mine');
+    req.flush({items: [], next_cursor: 'next'});
+    await expect(pending).resolves.toEqual({items: [], next_cursor: 'next'});
+  });
+
+  it('preserves repeated project ids and lets eligibility failures propagate', async () => {
+    const pending = firstValueFrom(api.getEligibleDatasources(['p1', 'p2']));
+    const req = httpMock.expectOne(r => r.url.endsWith('/datasources/eligible'));
+    expect(req.request.params.getAll('project_id')).toEqual(['p1', 'p2']);
+    req.flush({detail: 'unavailable'}, {status: 503, statusText: 'Unavailable'});
+    await expect(pending).rejects.toBeTruthy();
+  });
+
+  it('loads retained project targets and propagates policy-write conflicts', async () => {
+    const targets = firstValueFrom(api.getLinkableDatasourceProjects({
+      datasourceId: 'ds1', q: 'app', cursor: 'c1', limit: 20,
+    }));
+    const read = httpMock.expectOne(r => r.url.endsWith('/projects/linkable-datasource-targets'));
+    expect(read.request.params.get('datasource_id')).toBe('ds1');
+    expect(read.request.params.get('q')).toBe('app');
+    expect(read.request.params.get('cursor')).toBe('c1');
+    read.flush({items: [], next_cursor: null});
+    await targets;
+
+    const update = firstValueFrom(api.updateDatasource('ds1', {
+      scope_mode: 'projects', project_ids: ['p1'], policy_revision: 3,
+    }));
+    const write = httpMock.expectOne(r => r.url.endsWith('/datasources/ds1'));
+    write.flush({detail: 'stale policy'}, {status: 409, statusText: 'Conflict'});
+    await expect(update).rejects.toBeTruthy();
+  });
+
+  it('requests a cursor page of linkable connectors for one project', async () => {
+    const pending = firstValueFrom(api.getLinkableProjectDatasources('project-1', {
+      q: 'database', cursor: 'cursor-1', limit: 25,
+    }));
+    const req = httpMock.expectOne(
+      r => r.url.endsWith('/projects/project-1/linkable-datasources'),
+    );
+    expect(req.request.params.get('q')).toBe('database');
+    expect(req.request.params.get('cursor')).toBe('cursor-1');
+    expect(req.request.params.get('limit')).toBe('25');
+    req.flush({items: [], next_cursor: 'cursor-2'});
+    await expect(pending).resolves.toEqual({items: [], next_cursor: 'cursor-2'});
+  });
+});
+
 describe('ApiService.generateTTS', () => {
   let api: ApiService;
   let httpMock: HttpTestingController;

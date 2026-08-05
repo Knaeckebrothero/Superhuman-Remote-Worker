@@ -28,7 +28,7 @@ These tests exercise the real functions with a mocked ``postgres_db``.
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -396,6 +396,79 @@ class TestFailSubjobUnblocksParent:
         assert ("critic-uuid", "failed", "workspace gone") in patch_db["status"]
         # No unblock: parent was never transitioned to created.
         assert not any(s == "created" for _, s, _ in patch_db["status"])
+
+
+class TestScholarMaterializationFailure:
+    @pytest.mark.asyncio
+    async def test_policy_failure_releases_waiting_parent(self, monkeypatch):
+        from database.postgres import DatasourceMaterializationAuthorizationError
+        from services import completion
+
+        parent_id = "11111111-1111-4111-8111-111111111111"
+        owner_id = "22222222-2222-4222-8222-222222222222"
+        datasource_id = "33333333-3333-4333-8333-333333333333"
+        job = {
+            "id": parent_id,
+            "user_id": owner_id,
+            "description": "Research this",
+            "context": {"workspace_container": dict(READY_CONTAINER)},
+            "project_id": None,
+            "parent_job_id": None,
+        }
+
+        monkeypatch.setattr(
+            completion,
+            "resolve_scholar_config_from_disk",
+            lambda *_args, **_kwargs: {
+                "enabled": True,
+                "scholar_config": "scholar",
+            },
+        )
+        monkeypatch.setattr(
+            completion,
+            "format_scholar_instructions",
+            lambda **_kwargs: "instructions",
+        )
+        monkeypatch.setattr(
+            main,
+            "_revalidate_job_datasource_selection",
+            AsyncMock(return_value=([datasource_id], {datasource_id: 4})),
+        )
+        monkeypatch.setattr(
+            main,
+            "_datasource_selection_provenance",
+            AsyncMock(return_value={"datasource_ids": [datasource_id]}),
+        )
+        monkeypatch.setattr(
+            main.postgres_db,
+            "get_user",
+            AsyncMock(return_value={"id": owner_id}),
+        )
+        update_status = AsyncMock()
+        merge_context = AsyncMock()
+        monkeypatch.setattr(main.postgres_db, "update_job_status", update_status)
+        monkeypatch.setattr(main.postgres_db, "merge_job_context", merge_context)
+        monkeypatch.setattr(
+            main.postgres_db,
+            "create_job",
+            AsyncMock(
+                side_effect=DatasourceMaterializationAuthorizationError(
+                    "authority changed"
+                )
+            ),
+        )
+        dispatch = MagicMock()
+        monkeypatch.setattr(main, "_trigger_dispatch", dispatch)
+
+        with pytest.raises(DatasourceMaterializationAuthorizationError):
+            await main._spawn_scholar_subjob(job, "worker", {}, {})
+
+        assert [call.kwargs["status"] for call in update_status.await_args_list] == [
+            "waiting",
+            "created",
+        ]
+        merge_context.assert_awaited_once_with(parent_id, {"scholar_failed": True})
+        dispatch.assert_called_once()
 
 
 # =============================================================================

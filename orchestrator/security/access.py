@@ -33,7 +33,9 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from typing import Any, Literal
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from uuid import UUID
 
 from fastapi import HTTPException, Request
@@ -695,6 +697,109 @@ async def require_sudo_request_authority(
 # =============================================================================
 
 
+_CONNECTION_ASSIGNMENT_RE = re.compile(
+    r"(?P<prefix>(?:^|[;\s,&]))(?P<key>[A-Za-z][A-Za-z0-9_.-]*)"
+    r"(?P<separator>\s*=\s*)(?P<value>\"[^\"]*\"|'[^']*'|[^;\s,&]*)"
+)
+_SECRET_CONNECTION_KEYS = frozenset(
+    {
+        "password",
+        "passwd",
+        "pwd",
+        "secret",
+        "token",
+        "apikey",
+        "accesskey",
+        "privatekey",
+        "clientsecret",
+        "credential",
+        "credentials",
+        "signature",
+        "sig",
+        "auth",
+        "authorization",
+        "key",
+        "securitytoken",
+    }
+)
+_SECRET_CONNECTION_SUFFIXES = (
+    "password",
+    "passwd",
+    "secret",
+    "token",
+    "apikey",
+    "accesskey",
+    "privatekey",
+    "clientsecret",
+    "credential",
+    "credentials",
+    "signature",
+)
+
+
+def _is_secret_connection_key(key: str) -> bool:
+    normalized = re.sub(r"[^a-z0-9]", "", key.lower())
+    return normalized in _SECRET_CONNECTION_KEYS or normalized.endswith(
+        _SECRET_CONNECTION_SUFFIXES
+    )
+
+
+def _sanitize_datasource_connection_url(value: Any) -> tuple[str | None, bool]:
+    """Strip URL/DSN credential material before a datasource reaches REST."""
+    if value is None:
+        return None, False
+    if not isinstance(value, str):
+        return None, True
+
+    try:
+        parts = urlsplit(value)
+    except (TypeError, ValueError):
+        # An unparsable URL cannot be proven credential-free.  Hiding it is
+        # safer than returning a malformed DSN that may contain userinfo.
+        return None, True
+
+    changed = False
+    netloc = parts.netloc
+    if "@" in netloc:
+        netloc = netloc.rsplit("@", 1)[1]
+        changed = True
+
+    query_items = parse_qsl(parts.query, keep_blank_values=True)
+    safe_query_items = [
+        (key, item_value)
+        for key, item_value in query_items
+        if not _is_secret_connection_key(key)
+    ]
+    if len(safe_query_items) != len(query_items):
+        changed = True
+        query = urlencode(safe_query_items, doseq=True)
+    else:
+        # Do not normalize harmless encoding (for example %20 -> +): the
+        # redaction marker is also the edit form's "preserve existing" signal.
+        query = parts.query
+
+    fragment = parts.fragment
+    if fragment:
+        # Fragments are client-side opaque and frequently carry bearer tokens;
+        # they have no role in an agent's server-side connection target.
+        fragment = ""
+        changed = True
+
+    sanitized = urlunsplit((parts.scheme, netloc, parts.path, query, fragment))
+
+    # Also cover key=value DSNs and JDBC-style semicolon properties, which
+    # urllib intentionally treats as an opaque path rather than URL fields.
+    def _strip_assignment(match: re.Match[str]) -> str:
+        nonlocal changed
+        if not _is_secret_connection_key(match.group("key")):
+            return match.group(0)
+        changed = True
+        return f"{match.group('prefix')}{match.group('key')}{match.group('separator')}"
+
+    sanitized = _CONNECTION_ASSIGNMENT_RE.sub(_strip_assignment, sanitized)
+    return sanitized, changed or sanitized != value
+
+
 def redact_datasource(ds: dict[str, Any]) -> dict[str, Any]:
     """Return a copy of ``ds`` with the credentials field stripped.
 
@@ -707,6 +812,14 @@ def redact_datasource(ds: dict[str, Any]) -> dict[str, Any]:
         return ds
     out = dict(ds)
     out.pop("credentials", None)
+    out.pop("connection_url_redacted", None)
+    if "connection_url" in out:
+        safe_url, changed = _sanitize_datasource_connection_url(
+            out.get("connection_url")
+        )
+        out["connection_url"] = safe_url
+        if changed:
+            out["connection_url_redacted"] = True
     return out
 
 

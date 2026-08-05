@@ -12,7 +12,6 @@ import {ChatPageComponent} from './views/chat/chat-page.component';
 import {CanvasPopoutPageComponent} from './views/canvas/canvas-popout-page.component';
 import {SessionsPageComponent} from './views/sessions/sessions-page.component';
 import {SessionCreateComponent} from './views/session-create/session-create.component';
-import {DatasourcesPageComponent} from './views/datasources/datasources-page.component';
 import {ExpertsPageComponent} from './views/experts/experts-page.component';
 import {ExpertEditorComponent} from './views/experts/expert-editor.component';
 import {SkillsPageComponent} from './views/skills/skills-page.component';
@@ -44,7 +43,12 @@ export const routes: Routes = [
   { path: 'inbox', component: InboxPageComponent, canActivate: [authGuard] },
   { path: 'projects', component: ProjectListPageComponent, canActivate: [authGuard] },
   { path: 'projects/:id', component: ProjectDetailPageComponent, canActivate: [authGuard, projectAccessGuard] },
-  { path: 'datasources', component: DatasourcesPageComponent, canActivate: [authGuard] },
+  {
+    path: 'datasources',
+    loadComponent: () =>
+      import('./views/datasources/datasources-page.component').then(m => m.DatasourcesPageComponent),
+    canActivate: [authGuard],
+  },
   {
     path: 'contacts',
     loadComponent: () =>

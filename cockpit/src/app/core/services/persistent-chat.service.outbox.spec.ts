@@ -15,6 +15,7 @@ import {of, throwError, Subject} from 'rxjs';
 import {TranslocoService} from '@jsverse/transloco';
 import {PersistentChatService} from './persistent-chat.service';
 import {ApiService} from './api.service';
+import {CapabilitiesService} from './capabilities.service';
 import {IndexedDbService} from './indexed-db.service';
 import {NotificationService} from './notification.service';
 import {AppToastService} from '../../ui/toast';
@@ -113,6 +114,13 @@ function createService() {
         providers: [
             {provide: HttpClient, useValue: mockHttp},
             {provide: ApiService, useValue: mockApi},
+            {
+                provide: CapabilitiesService,
+                useValue: {
+                    datasourceScopeAutoAttachAvailable: () => true,
+                    datasourceScopeAutoAttachAvailability$: of(true),
+                },
+            },
             {provide: IndexedDbService, useValue: mockCache},
             {provide: AppToastService, useValue: mockToast},
             {provide: NotificationService, useValue: mockNotifications},

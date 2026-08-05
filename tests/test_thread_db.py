@@ -75,6 +75,8 @@ class TestCreateThread:
 
     @pytest.mark.asyncio
     async def test_passes_all_params_to_query(self):
+        user_id = "11111111-1111-4111-8111-111111111111"
+        project_id = "22222222-2222-4222-8222-222222222222"
         conn = _mock_conn()
         conn.fetchrow = AsyncMock(
             return_value={"id": UUID("aaaaaaaa-1111-2222-3333-444444444444")}
@@ -82,8 +84,8 @@ class TestCreateThread:
         db = _make_db_with_conn(conn)
 
         await db.create_thread(
-            user_id="user-1",
-            project_id="proj-1",
+            user_id=user_id,
+            project_id=project_id,
             config_name="persistent_defaults",
             permission_mode="autonomous",
             title="My Session",
@@ -91,8 +93,8 @@ class TestCreateThread:
 
         call_args = conn.fetchrow.call_args
         # Positional args after the SQL query
-        assert call_args[0][1] == "user-1"  # user_id
-        assert call_args[0][2] == "proj-1"  # project_id
+        assert call_args[0][1] == user_id  # user_id
+        assert call_args[0][2] == project_id  # project_id
         assert call_args[0][3] == "persistent_defaults"  # config_name
         assert call_args[0][4] == "autonomous"  # permission_mode
         assert call_args[0][5] == "My Session"  # title
