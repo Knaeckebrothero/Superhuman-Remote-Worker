@@ -60,9 +60,20 @@ re-pass there.
 - Gate evidence, with the numbers: [[tool_configuration_live_gates_2026-08-03]]
 - Everything triaged as deferred, plus what was settled and must not be
   re-litigated: [[tool_configuration_deferred_findings]]
-- Filed out of the run: [[resume_job_grant_recheck_fails_open]],
-  [[job_mode_reasoning_pick_silently_reset]],
-  [[duplicate_expert_bypasses_user_experts_kill_switch]]
+- Filed out of the run — **two of the three are now FIXED** (2026-08-04/05,
+  on `develop`, unpushed, live-gated on k3d):
+  - ~~[[resume_job_grant_recheck_fails_open]]~~ **FIXED** — 409 when the stored
+    config is unusable; a transient error still proceeds. Its whole-branch review
+    found the PEP exists **twice**, so
+    [[dispatcher_resume_pep_twin_still_fails_open]] is the new open half.
+  - ~~[[duplicate_expert_bypasses_user_experts_kill_switch]]~~ **FIXED** — and it
+    grew past the reported defect: the kill switch now holds on all five write
+    routes, and the *grants* half on the two copy-a-visible-expert routes
+    **strips and reports** rather than refusing, because refusing was measured to
+    block 7 of the 11 shipped experts for a default-grants user.
+  - [[job_mode_reasoning_pick_silently_reset]] — **still open**, untouched.
+- The gate for both: [[expert_write_gate_holes_live_gate_2026-08-04]]. Plan:
+  `docs/superpowers/plans/2026-08-04-expert-write-gate-holes.md`.
 
 **Owner:** unassigned.
 
@@ -81,10 +92,14 @@ re-pass there.
    one: `normalize_tool_policy` runs when the row is READ, so a shape it refuses
    (`tools.shell: true`) was storable and made the expert unresolvable
    afterwards. Covered by `TestExpertWriteBoundary`.
-   *Residual on that fifth route, filed separately:* duplicate still skips
+   ~~*Residual on that fifth route, filed separately:* duplicate still skips
    `_enforce_expert_save`, so the user-experts kill switch and the save-time
-   grants PDP do not run there —
-   [[duplicate_expert_bypasses_user_experts_kill_switch]].
+   grants PDP do not run there.~~ **CLOSED 2026-08-04** (`55080ed0`): duplicate is
+   the fifth route to run the gate, pinned by one parametrised test over all five
+   — the other four were unpinned for the kill switch too, and are not any more.
+   Live-gated: 403 × 5 with the switch off, no rows created. See
+   [[duplicate_expert_bypasses_user_experts_kill_switch]] for what the *grants*
+   half became.
 2. ~~**A per-tool code grant renders as an un-untickable ticked box.**~~
    **FIXED.** `code_granted_tools()` adds the per-*tool* tier the category map
    structurally could not see, and `compose_tool_view` gained the mirror of "off

@@ -98,7 +98,7 @@ error understating risk):
 | `GET /tool-groups` | degrades: `source: "error"` |
 | session attach | degrades: falls back to `config_name`, the expert is lost |
 | `_resume_job_on_agent` | returns `False`, which `resume_job` reads as "queue for auto-dispatch" → **HTTP 200** |
-| `resume_job`'s PEP re-check | **fails open** — this issue |
+| `resume_job`'s PEP re-check | ~~**fails open**~~ → **409, fails closed** (fixed 2026-08-04). The `_resume_job_on_agent` row above is the unfixed twin. |
 
 Three of eight hard-fail, three degrade silently, one fails soft to 200, one fails
 open. Only the last is a security control.

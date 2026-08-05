@@ -205,8 +205,12 @@ conversation. One dev session — grant it, ask for an expert, read back the row
   product call: a job runs unattended, so `dry_run` and `allow_enabled` are
   carrying more weight there than in a session with a human in the loop.
 - **Completing `CAT_TO_GRANT`.** See the coverage note.
-- **A `duplicate_expert` fix.** That endpoint skips `_enforce_expert_save`
-  entirely and so bypasses the `user_experts` kill switch for any approved user
-  with a browser — a live hole today, unrelated to these tools, filed as
-  [[duplicate_expert_bypasses_user_experts_kill_switch]]. It is the *reachable*
-  neighbour of this work and the better use of the next hour.
+- ~~**A `duplicate_expert` fix.**~~ **DONE 2026-08-04/05** — it was indeed the
+  better use of the next hour. The kill switch now holds on all five expert-write
+  routes. Relevant to *this* feature beyond the hole itself: the grants half on
+  `duplicate` and `expert-defaults/{type}/fork` now **strips and reports** rather
+  than refusing, so a config carrying `tools.catalog_authoring` copied by a user
+  without the grant lands **without** that category and says so, instead of 422ing.
+  The agent-facing tools are unaffected — they write through `POST /api/experts`,
+  `/import` and `PUT`, which all still refuse.
+  See [[duplicate_expert_bypasses_user_experts_kill_switch]].

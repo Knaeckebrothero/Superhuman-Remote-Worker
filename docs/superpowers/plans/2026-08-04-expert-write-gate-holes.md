@@ -12,6 +12,23 @@ related:
 
 # Plan — close two grant-boundary holes on the expert/resume paths
 
+**Status: COMPLETE 2026-08-05.** Four tasks, all implemented, reviewed and
+live-gated on k3d; **not pushed**. Commits: `55080ed0` (T1), `b71aee72` +
+`915cb49a` + `4fd13de7` (T2), `b0333217` + `b8c9d09e` (T3), `0edbd9bc` (T4), plus
+doc commits. Gate evidence:
+[[expert_write_gate_holes_live_gate_2026-08-04]].
+
+Tasks 3 and 4 were **not** in the original plan. They exist because the
+whole-branch review measured Task 1's consequence and found that refusing blocked
+7 of the 11 shipped experts for a default-grants user — a cost the owner had not
+been given when they ruled. That measurement was available before the question was
+asked; taking it afterwards cost a re-decision and two extra tasks. Measure the
+blast radius of a policy choice **before** putting it to the owner.
+
+Left open deliberately, each filed: [[dispatcher_resume_pep_twin_still_fails_open]]
+(the same PEP block exists twice; only the endpoint was fixed) and the absence of
+any route that can repair a job whose own stored config cannot resolve.
+
 Two independent defects, both filed 2026-08-03 out of the tool-configuration
 series, both small, both on grant-enforcement seams.
 
