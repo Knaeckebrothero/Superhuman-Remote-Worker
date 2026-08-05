@@ -82,6 +82,13 @@ export interface AssistantTurn {
     id: string;
     events: TurnEvent[];
     status: AssistantTurnStatus;
+    /**
+     * Logical persistent-loop turn number. REST history uses message UUIDs as
+     * bubble ids, while live SSE uses this number as `turn_id`; retaining both
+     * lets a cold reattach join an incrementally persisted prefix back to the
+     * still-running live turn.
+     */
+    turnNumber?: number;
     /** Model identifier, populated from the backend `turn.started.model` when present. */
     model?: string;
     startedAt: number;
