@@ -278,10 +278,13 @@ the requests we bill on.
 - *Optional convergence:* once Alertmanager is up, a soft-quota breach can also raise an
   Alertmanager alert — but the user/admin SSE+email notification (Slice 5) stays primary.
 
-## Storage metering — DEFERRED (note only)
+## Storage metering — successor design
 
-> Captured per request; not yet designed. Storage's importance is **conditional on the
-> hosting model**, which isn't decided.
+> Originally captured here as a deferred note. The implementation-ready
+> allocation design now lives in
+> [`infrastructure_resource_metering.md`](infrastructure_resource_metering.md).
+> Whether storage becomes a customer charge remains conditional on the hosting
+> model; truthful allocation visibility does not.
 
 - ~~**Workspace storage today ≈ free.**~~ **No longer true (2026-08-04).** emptyDir
   is still the chart default, but `workspace.pvcEnabled` PVC-backs both jobs and
@@ -291,19 +294,26 @@ the requests we bill on.
   pod + agent pod), and **session claims are released only when the thread row is
   hard-deleted** — an `ended` thread is resumable and keeps its volumes. So
   workspace storage no longer tracks concurrency; it tracks *retained threads*,
-  and it accumulates. That is a real GB-month line even before hosted-storage is
-  decided, and it is the first workspace-storage number worth putting on the
-  dashboard (PVC count + requested GiB by owner kind).
+  and it accumulates. That is a real retained-storage allocation even before
+  hosted storage is decided, and it is the first workspace-storage number worth
+  putting on the dashboard (PVC count, current requested GiB, and GiB-hours by
+  owner kind).
 - **The real persistent storage is elsewhere:** OpenCloud, object stores (`minio` /
-  `garage`), and PVCs if re-enabled. These are GB-month on *our* infra → meterable as
-  `category='storage'`, `unit='gib-month'` in the same ledger when we get to it.
+  `garage`), and PVCs. For PVC allocation, the
+  [`infrastructure_resource_metering.md`](infrastructure_resource_metering.md)
+  design records logical PVC demand as raw `storage/gib-hour` plus
+  `claim-hour`, and physical PV/CSI assets separately as `storage/gib-hour`
+  plus `volume-hour`. It derives GiB-month only for display and keeps claim,
+  volume, and pod lifetimes independent. Other storage services need their own
+  resource taxonomy before entering the ledger.
 - **The BYO-cloud question (open):** if a customer brings their own cloud (their
   OpenCloud / Nextcloud / S3), the storage bill sits on *their* account — not ours to
   charge. In that mode storage metering is at most for the *user's own visibility*, not
   our cost recovery. If we host their storage, it's our cost and we bill it. So how much
-  storage metering matters depends on whether hosted-storage is part of the product or
-  always BYO. **Decide before building storage metering; the ledger already has the
-  `storage` category reserved so adding it later is additive.**
+  storage metering matters for cost recovery depends on whether hosted storage is
+  part of the product or always BYO. That policy does not block allocation
+  metering; it decides whether the result is customer visibility, our internal
+  cost input, or eventually a billable measure.
 
 ## Relationship to MongoDB retirement
 
@@ -332,13 +342,17 @@ Cost driver: whether existing audit history must be preserved (dual-write + back
 
 - **Hard-stop enforcement** (block at dispatch, suspend sessions at limit) → [[saas_billing_and_metering]] Slice 2.
 - **Pre-pay wallet, deposits, debit transactions, Stripe** → [[saas_billing_and_metering]].
-- **Storage metering implementation** (deferred, see note above).
+- **Storage metering implementation** → successor feature
+  [`infrastructure_resource_metering.md`](infrastructure_resource_metering.md).
 - **Per-org / per-tenant billing** → M2 in [[multi_tenancy]].
 - **Right-sizing automation** from utilization (Track B produces the signal; acting on it is separate).
 
 ## Open questions
 
-1. Compute cost basis edge: bill on `requests` only, or `max(requests, observed)` for pods that burst past requests toward their limit? (Lean: requests only — simpler, defensible, matches node-packing.)
+1. ~~Compute cost basis edge~~ **Resolved 2026-08-05:** canonical allocation uses
+   admitted effective scheduler requests; observed utilization is a separate
+   optional overlay. See
+   [`infrastructure_resource_metering.md`](infrastructure_resource_metering.md).
 2. ~~Analytics schema management~~ **Resolved 2026-06-11**: the `migrations/audit/` family owns the schema (`usage_events` = `0002`); same runner, one source of truth.
 3. `usage_daily` mirror: push from a TimescaleDB continuous-aggregate refresh hook, or pull on an orchestrator timer? (Lean: orchestrator timer — no cross-DB triggers.)
 4. Soft-quota thresholds: fixed (80/100%) or admin-configurable per limit?

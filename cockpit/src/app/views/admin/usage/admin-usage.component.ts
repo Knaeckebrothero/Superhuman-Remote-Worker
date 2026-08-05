@@ -9,7 +9,13 @@ import {
   signal,
 } from '@angular/core';
 import {SidebarToggleComponent} from '../../../shell/sidebar-toggle/sidebar-toggle.component';
-import {AdminUsageService, BreakdownDim, UsageTsPoint, UsageWindow} from '../../../core/services/admin-usage.service';
+import {
+  AdminUsageService,
+  BreakdownDim,
+  UsageRowV2,
+  UsageTsPoint,
+  UsageWindow,
+} from '../../../core/services/admin-usage.service';
 import {ApiService} from '../../../core/services/api.service';
 import {UserService} from '../../../core/services/user.service';
 import {AgentStatistics, DailyStatistics, JobStatistics} from '../../../core/models/api.model';
@@ -17,9 +23,10 @@ import {TranslocoPipe} from '@jsverse/transloco';
 
 /**
  * Admin → Usage & Cost (Slice 4). Read-only surface over the usage_events
- * ledger via `GET /api/usage`: LLM tokens + workspace compute, aggregated by
- * (category, unit) over a selectable window. Costs are $0 until rates are
- * configured — the value today is the measured quantities + attribution.
+ * ledger via `GET /api/usage`: LLM tokens plus dimensionally separate workspace
+ * CPU and memory, aggregated by (category, unit) over a selectable window.
+ * Costs are $0 until rates are configured — the value today is the measured
+ * quantities + attribution.
  */
 @Component({
   selector: 'app-admin-usage',
@@ -63,8 +70,22 @@ import {TranslocoPipe} from '@jsverse/transloco';
             <span class="kpi-value">{{ fmtQty(tokensTotal()) }}</span></div>
           <div class="kpi-card"><span class="kpi-label">Cache hit</span>
             <span class="kpi-value">{{ fmtPct(cacheHitRatio()) }}</span></div>
-          <div class="kpi-card"><span class="kpi-label">Compute-hours</span>
-            <span class="kpi-value">{{ fmtQty(computeHours()) }}</span></div>
+          <div class="kpi-card"><span class="kpi-label">{{ 'admin.usage.vcpuHours' | transloco }}</span>
+            <span class="kpi-value">{{ fmtQty(vcpuHours()) }}</span></div>
+          <div class="kpi-card"><span class="kpi-label">{{ 'admin.usage.memoryGibHours' | transloco }}</span>
+            <span class="kpi-value">{{ fmtQty(memoryGibHours()) }}</span></div>
+          @if (hasClaimStorage()) {
+            <div class="kpi-card"><span class="kpi-label">{{ 'admin.usage.claimGibHours' | transloco }}</span>
+              <span class="kpi-value">{{ fmtQty(claimGibHours()) }}</span></div>
+            <div class="kpi-card"><span class="kpi-label">{{ 'admin.usage.claimHours' | transloco }}</span>
+              <span class="kpi-value">{{ fmtQty(claimHours()) }}</span></div>
+          }
+          @if (hasVolumeStorage()) {
+            <div class="kpi-card"><span class="kpi-label">{{ 'admin.usage.volumeGibHours' | transloco }}</span>
+              <span class="kpi-value">{{ fmtQty(volumeGibHours()) }}</span></div>
+            <div class="kpi-card"><span class="kpi-label">{{ 'admin.usage.volumeHours' | transloco }}</span>
+              <span class="kpi-value">{{ fmtQty(volumeHours()) }}</span></div>
+          }
           <div class="kpi-card"><span class="kpi-label">Events</span>
             <span class="kpi-value">{{ fmtQty(eventsTotal()) }}</span></div>
           <div class="kpi-card"><span class="kpi-label">Jobs completed</span>
@@ -234,7 +255,8 @@ import {TranslocoPipe} from '@jsverse/transloco';
                 <span class="col-role">Role</span>
                 <span class="col-num">Prompt tok.</span>
                 <span class="col-num">Compl. tok.</span>
-                <span class="col-num">Compute</span>
+                <span class="col-num">{{ 'admin.usage.vcpuHoursShort' | transloco }}</span>
+                <span class="col-num">{{ 'admin.usage.memoryGibHoursShort' | transloco }}</span>
                 <span class="col-num">Events</span>
                 <span class="col-share">Share</span>
                 <span class="col-num">Cost</span>
@@ -245,7 +267,11 @@ import {TranslocoPipe} from '@jsverse/transloco';
                   <span class="col-role">{{ r.role }}</span>
                   <span class="col-num">{{ fmtQty(r.prompt) }}</span>
                   <span class="col-num">{{ fmtQty(r.completion) }}</span>
-                  <span class="col-num">{{ fmtQty(r.compute) }}</span>
+                  <span class="col-num">{{ fmtQty(r.vcpu) }}</span>
+                  <span class="col-num"
+                    [title]="r.memory === null ? ('admin.usage.memoryBreakdownUnavailable' | transloco) : ''">
+                    {{ r.memory === null ? '—' : fmtQty(r.memory) }}
+                  </span>
                   <span class="col-num">{{ r.events }}</span>
                   <span class="col-share"><span class="share-bar" [style.width.%]="r.share * 100"></span></span>
                   <span class="col-num">{{ r.cost ? fmtCost(r.cost) : '—' }}</span>
@@ -290,7 +316,8 @@ import {TranslocoPipe} from '@jsverse/transloco';
               <div class="breakdown-header project-grid">
                 <span class="col-wide">Project</span>
                 <span class="col-num">Tokens</span>
-                <span class="col-num">Compute-hrs</span>
+                <span class="col-num">{{ 'admin.usage.vcpuHoursShort' | transloco }}</span>
+                <span class="col-num">{{ 'admin.usage.memoryGibHoursShort' | transloco }}</span>
                 <span class="col-num">Events</span>
                 <span class="col-num">Cost</span>
               </div>
@@ -298,7 +325,11 @@ import {TranslocoPipe} from '@jsverse/transloco';
                 <div class="breakdown-row project-grid">
                   <span class="col-wide">{{ r.label }}</span>
                   <span class="col-num">{{ fmtQty(r.tokens) }}</span>
-                  <span class="col-num">{{ fmtQty(r.compute) }}</span>
+                  <span class="col-num">{{ fmtQty(r.vcpu) }}</span>
+                  <span class="col-num"
+                    [title]="r.memory === null ? ('admin.usage.memoryBreakdownUnavailable' | transloco) : ''">
+                    {{ r.memory === null ? '—' : fmtQty(r.memory) }}
+                  </span>
                   <span class="col-num">{{ r.events }}</span>
                   <span class="col-num">{{ r.cost ? fmtCost(r.cost) : '—' }}</span>
                 </div>
@@ -631,7 +662,7 @@ import {TranslocoPipe} from '@jsverse/transloco';
       .breakdown-header,
       .breakdown-row {
         display: grid;
-        grid-template-columns: 1.4fr 70px 100px 100px 100px 70px 80px 80px;
+        grid-template-columns: 1.4fr 70px 100px 100px 86px 100px 70px 80px 80px;
         gap: 8px;
         align-items: center;
         padding: 8px 14px;
@@ -653,7 +684,7 @@ import {TranslocoPipe} from '@jsverse/transloco';
       .breakdown-row .col-share { position: relative; height: 6px; background: var(--surface-0); border-radius: 3px; overflow: hidden; }
       .share-bar { display: block; height: 100%; background: var(--accent-color); border-radius: 3px; }
       .model-grid { grid-template-columns: 1.6fr 96px 96px 78px 96px 70px 80px; }
-      .project-grid { grid-template-columns: 1.6fr 100px 100px 70px 80px; }
+      .project-grid { grid-template-columns: 1.6fr 100px 86px 100px 70px 80px; }
       .bar-chart {
         display: flex;
         align-items: flex-end;
@@ -894,7 +925,7 @@ import {TranslocoPipe} from '@jsverse/transloco';
         }
         .breakdown-header,
         .breakdown-row {
-          min-width: 680px;
+          min-width: 760px;
         }
         .ts-side {
           flex: 1 1 100%;
@@ -935,9 +966,38 @@ export class AdminUsageComponent implements OnInit, OnDestroy {
   readonly jobStats = signal<JobStatistics | null>(null);
   readonly agentStats = signal<AgentStatistics | null>(null);
 
-  private qty(unit: string): number {
+  private qty(category: string, unit: string): number {
     return (this.summary()?.by_category ?? [])
-      .filter((r) => r.unit === unit).reduce((s, r) => s + r.quantity, 0);
+      .filter((r) => r.category === category && r.unit === unit)
+      .reduce((s, r) => s + r.quantity, 0);
+  }
+  private typedRows(
+    category: string,
+    measurementBasis: UsageRowV2['measurement_basis'],
+    unit: string,
+  ): UsageRowV2[] | null {
+    const summary = this.usage.usageV2();
+    if (!summary) return null;
+    return summary.rows.filter((r) =>
+      r.category === category
+      && r.measurement_basis === measurementBasis
+      && r.unit === unit);
+  }
+  private typedQty(
+    category: string,
+    measurementBasis: UsageRowV2['measurement_basis'],
+    unit: string,
+  ): number | null {
+    const rows = this.typedRows(category, measurementBasis, unit);
+    if (rows === null || rows.length === 0) return null;
+    return rows.reduce((sum, row) => sum + Number(row.quantity), 0);
+  }
+  /** The legacy breakdown response is keyed by unit only. It can represent a
+   * GiB-hour as compute memory only while no other category emits that unit. */
+  private breakdownUnitBelongsTo(category: string, unit: string): boolean {
+    return (this.summary()?.by_category ?? [])
+      .filter((r) => r.unit === unit)
+      .every((r) => r.category === category);
   }
   private unitQty(
     units: Record<string, {quantity: number}> | undefined,
@@ -950,14 +1010,37 @@ export class AdminUsageComponent implements OnInit, OnDestroy {
     return total > 0 ? cachedPrompt / total : 0;
   }
   readonly promptTokens = computed(() =>
-    this.qty('prompt-token') + this.qty('cached-prompt-token'));
-  readonly cachedPromptTokens = computed(() => this.qty('cached-prompt-token'));
-  readonly completionTokens = computed(() => this.qty('completion-token'));
+    this.qty('llm', 'prompt-token') + this.qty('llm', 'cached-prompt-token'));
+  readonly cachedPromptTokens = computed(() => this.qty('llm', 'cached-prompt-token'));
+  readonly completionTokens = computed(() => this.qty('llm', 'completion-token'));
   readonly tokensTotal = computed(() => this.promptTokens() + this.completionTokens());
   readonly cacheHitRatio = computed(() =>
     this.summary()?.cache_hit_ratio
-      ?? this.cacheRatio(this.qty('prompt-token'), this.cachedPromptTokens()));
-  readonly computeHours = computed(() => this.qty('vcpu-hour') + this.qty('gib-hour'));
+      ?? this.cacheRatio(this.qty('llm', 'prompt-token'), this.cachedPromptTokens()));
+  readonly vcpuHours = computed(() =>
+    this.typedQty('compute', 'scheduler-request', 'vcpu-hour')
+      ?? this.qty('compute', 'vcpu-hour'));
+  readonly memoryGibHours = computed(() =>
+    this.typedQty('compute', 'scheduler-request', 'gib-hour')
+      ?? this.qty('compute', 'gib-hour'));
+  readonly hasClaimStorage = computed(() => {
+    const gib = this.typedRows('storage', 'claim-requested', 'gib-hour');
+    const instances = this.typedRows('storage', 'claim-requested', 'claim-hour');
+    return gib !== null && (gib.length > 0 || (instances?.length ?? 0) > 0);
+  });
+  readonly claimGibHours = computed(() =>
+    this.typedQty('storage', 'claim-requested', 'gib-hour') ?? 0);
+  readonly claimHours = computed(() =>
+    this.typedQty('storage', 'claim-requested', 'claim-hour') ?? 0);
+  readonly hasVolumeStorage = computed(() => {
+    const gib = this.typedRows('storage', 'volume-provisioned', 'gib-hour');
+    const instances = this.typedRows('storage', 'volume-provisioned', 'volume-hour');
+    return gib !== null && (gib.length > 0 || (instances?.length ?? 0) > 0);
+  });
+  readonly volumeGibHours = computed(() =>
+    this.typedQty('storage', 'volume-provisioned', 'gib-hour') ?? 0);
+  readonly volumeHours = computed(() =>
+    this.typedQty('storage', 'volume-provisioned', 'volume-hour') ?? 0);
   readonly eventsTotal = computed(() =>
     (this.summary()?.by_category ?? []).reduce((s, r) => s + r.events, 0));
 
@@ -985,7 +1068,9 @@ export class AdminUsageComponent implements OnInit, OnDestroy {
     tokens: this.unitQty(r.units, 'prompt-token')
       + this.unitQty(r.units, 'cached-prompt-token')
       + this.unitQty(r.units, 'completion-token'),
-    compute: this.unitQty(r.units, 'vcpu-hour') + this.unitQty(r.units, 'gib-hour'),
+    vcpu: this.unitQty(r.units, 'vcpu-hour'),
+    memory: this.breakdownUnitBelongsTo('compute', 'gib-hour')
+      ? this.unitQty(r.units, 'gib-hour') : null,
     events: r.events, cost: r.cost_usd,
   })));
 
@@ -998,7 +1083,9 @@ export class AdminUsageComponent implements OnInit, OnDestroy {
       prompt: this.unitQty(r.units, 'prompt-token')
         + this.unitQty(r.units, 'cached-prompt-token'),
       completion: this.unitQty(r.units, 'completion-token'),
-      compute: this.unitQty(r.units, 'vcpu-hour') + this.unitQty(r.units, 'gib-hour'),
+      vcpu: this.unitQty(r.units, 'vcpu-hour'),
+      memory: this.breakdownUnitBelongsTo('compute', 'gib-hour')
+        ? this.unitQty(r.units, 'gib-hour') : null,
       events: r.events,
       cost: r.cost_usd,
       share: r.events / max,
@@ -1227,6 +1314,7 @@ export class AdminUsageComponent implements OnInit, OnDestroy {
     const statsDays = this.currentStatsDays();
     const scope = this.scopeOverride();
     this.usage.loadUsage(usageWindow, scope);
+    this.usage.loadUsageV2(usageWindow, scope);
     this.api.getJobStatistics().subscribe((s) => this.jobStats.set(s));
     if (this.isAdmin()) this.api.getAgentStatistics().subscribe((s) => this.agentStats.set(s));
     this.usage.loadBreakdown('user', usageWindow, scope);

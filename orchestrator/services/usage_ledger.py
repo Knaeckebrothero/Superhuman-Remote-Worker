@@ -50,6 +50,17 @@ LLM_TOKEN_UNITS = (
     COMPLETION_TOKEN_UNIT,
 )
 
+# Frozen compatibility scope for the numeric v1 endpoints/cards. Preserve every
+# pre-v2 point-event category (LLM, TTS, STT) plus the original workspace
+# CPU/RAM tuple. New typed VM, agent, platform, claim, and volume rows must not
+# leak into category/unit-only aggregates where their resource class/basis would
+# be lost. Keep this fragment column-unqualified for raw and daily tables.
+V1_USAGE_COMPAT_PREDICATE = (
+    "(category IN ('llm', 'tts', 'stt') OR "
+    "(category = 'compute' AND resource = 'workspace_pod' "
+    "AND unit IN ('vcpu-hour', 'gib-hour')))"
+)
+
 
 def _dec(x: Any) -> Optional[Decimal]:
     """Coerce to Decimal for asyncpg's ``numeric`` codec (None stays None)."""
@@ -291,7 +302,7 @@ class UsageLedger:
         if self._pool is None:
             return empty
 
-        clauses = ["ts >= $1", "ts < $2"]
+        clauses = ["ts >= $1", "ts < $2", V1_USAGE_COMPAT_PREDICATE]
         params: List[Any] = [from_ts, to_ts]
         if owner_user_id is not None:
             params.append(_uuid(owner_user_id))
@@ -302,7 +313,7 @@ class UsageLedger:
                 clauses.append(f"({own} OR project_id = ANY(${len(params)}::uuid[]))")
             else:
                 clauses.append(own)
-        elif scope_project_id is not None:
+        if scope_project_id is not None:
             params.append(_uuid(scope_project_id))
             clauses.append(f"project_id = ${len(params)}")
         if ref_id is not None:
@@ -364,12 +375,19 @@ class UsageLedger:
         col = _GROUP_COLS[group_by]
         if self._pool is None:
             return []
-        clauses = ["ts >= $1", "ts < $2", f"{col} IS NOT NULL"]
+        clauses = [
+            "ts >= $1",
+            "ts < $2",
+            f"{col} IS NOT NULL",
+            V1_USAGE_COMPAT_PREDICATE,
+        ]
+        if group_by == "model":
+            clauses.append("category = 'llm'")
         params: List[Any] = [from_ts, to_ts]
         if owner_user_id is not None:
             params.append(_uuid(owner_user_id))
             clauses.append(f"user_id = ${len(params)}")  # strict self-scope
-        elif scope_project_id is not None:
+        if scope_project_id is not None:
             params.append(_uuid(scope_project_id))
             clauses.append(f"project_id = ${len(params)}")
         sql = (
@@ -420,12 +438,19 @@ class UsageLedger:
         col = _GROUP_COLS[group_by]
         if self._pool is None:
             return []
-        clauses = ["ts >= $1", "ts < $2", f"{col} IS NOT NULL"]
+        clauses = [
+            "ts >= $1",
+            "ts < $2",
+            f"{col} IS NOT NULL",
+            V1_USAGE_COMPAT_PREDICATE,
+        ]
+        if group_by == "model":
+            clauses.append("category = 'llm'")
         params: List[Any] = [from_ts, to_ts]
         if owner_user_id is not None:
             params.append(_uuid(owner_user_id))
             clauses.append(f"user_id = ${len(params)}")  # strict self-scope
-        elif scope_project_id is not None:
+        if scope_project_id is not None:
             params.append(_uuid(scope_project_id))
             clauses.append(f"project_id = ${len(params)}")
         sql = (
@@ -466,5 +491,6 @@ __all__ = [
     "CACHED_PROMPT_TOKEN_UNIT",
     "COMPLETION_TOKEN_UNIT",
     "LLM_TOKEN_UNITS",
+    "V1_USAGE_COMPAT_PREDICATE",
     "cache_hit_ratio_from_rows",
 ]

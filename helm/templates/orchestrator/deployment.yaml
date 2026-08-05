@@ -17,6 +17,8 @@ spec:
     metadata:
       labels:
         {{- include "srw.componentSelectorLabels" (dict "context" . "component" "orchestrator") | nindent 8 }}
+      annotations:
+        checksum/infrastructure-metering-gates: {{ printf "%v|%v|%v|%v|%s" .Values.infrastructureMetering.v2ReadsEnabled .Values.infrastructureMetering.collectorEnabled .Values.infrastructureMetering.shadowEnabled .Values.infrastructureMetering.publicationEnabled .Values.infrastructureMetering.stableClusterId | sha256sum | quote }}
     spec:
       serviceAccountName: {{ include "srw.fullname" . }}-orchestrator
       terminationGracePeriodSeconds: {{ .Values.orchestrator.terminationGracePeriodSeconds }}
@@ -1243,6 +1245,33 @@ spec:
                 configMapKeyRef:
                   name: {{ include "srw.configMapName" . }}
                   key: AUTO_ASSIGN_ENABLED
+            # Infrastructure metering Slice 0 dark-launch gates. All default
+            # off; setting them does not grant Kubernetes RBAC.
+            - name: INFRASTRUCTURE_METERING_V2_READS_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: INFRASTRUCTURE_METERING_V2_READS_ENABLED
+            - name: INFRASTRUCTURE_METERING_COLLECTOR_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: INFRASTRUCTURE_METERING_COLLECTOR_ENABLED
+            - name: INFRASTRUCTURE_METERING_SHADOW_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: INFRASTRUCTURE_METERING_SHADOW_ENABLED
+            - name: INFRASTRUCTURE_METERING_PUBLICATION_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: INFRASTRUCTURE_METERING_PUBLICATION_ENABLED
+            - name: INFRASTRUCTURE_METERING_STABLE_CLUSTER_ID
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: INFRASTRUCTURE_METERING_STABLE_CLUSTER_ID
             {{- with .Values.orchestrator.kbGitAllowedHosts }}
             - name: KB_GIT_ALLOWED_HOSTS
               value: {{ . | quote }}

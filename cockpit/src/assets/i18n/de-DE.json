@@ -714,7 +714,16 @@
     "usage": {
       "cacheHit": "Cache-Treffer",
       "cachedTokens": "Gecachte Tok.",
-      "pageDescCloud": "LLM-Token und Workspace-Compute werden im Nutzungs-Ledger erfasst und auf deine Sichtbarkeit begrenzt. Die kanonischen Kosten verwenden die im Ledger gespeicherten Tarife; die Cloud-Karten bewerten Compute zur Planung neu, ohne den Verlauf zu verändern.",
+      "vcpuHours": "vCPU-Stunden",
+      "memoryGibHours": "Arbeitsspeicher-GiB-Stunden",
+      "claimGibHours": "Claim-GiB-Stunden",
+      "claimHours": "PVC-Claim-Stunden",
+      "volumeGibHours": "Volume-GiB-Stunden",
+      "volumeHours": "Volume-Stunden",
+      "vcpuHoursShort": "vCPU-Std.",
+      "memoryGibHoursShort": "RAM-GiB-Std.",
+      "memoryBreakdownUnavailable": "Arbeitsspeicher ist in dieser älteren Aufschlüsselung nicht verfügbar, da GiB-Stunden nicht nach Kategorie getrennt sind.",
+      "pageDescCloud": "LLM-Token sowie Workspace-CPU- und Arbeitsspeicher-Zuweisungen werden im Nutzungs-Ledger erfasst und auf deine Sichtbarkeit begrenzt. CPU und Arbeitsspeicher bleiben getrennte Größen. Die kanonischen Kosten verwenden die im Ledger gespeicherten Tarife; die Cloud-Karten bewerten Compute zur Planung neu, ohne den Verlauf zu verändern.",
       "cloudEstimate": {
         "title": "Cloud-Vergleichsschätzung",
         "subtitle": "Aktuelle öffentliche Listenpreise für die in diesem Zeitraum angeforderten Workspace-CPU- und RAM-Ressourcen. Diese Werte dienen der Planung und sind keine Rechnungen.",

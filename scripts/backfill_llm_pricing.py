@@ -10,19 +10,19 @@ see ``services/openrouter_pricing._build_price_resolver``) was written with
 ``usage_rates``. The forward fix only prices *new* rows; this script re-prices the
 *existing* ones.
 
-It is a deliberate, manually-run **one-off** (not wired into any loop), and it
-knowingly makes an exception to the ``usage_events`` append-only invariant
-("NEVER UPDATE rows", migrations/audit/0002) — a correction, tightly scoped to
-``cost_usd IS NULL`` rows of the named resources, and idempotent (a re-run touches
-nothing once priced). Per resource it:
+It is a deliberate, manually-run **one-off** (not wired into any loop). The
+ledger remains append-only: each previously unpriced row is offset by a negative
+unpriced correction and replaced by an equal positive priced correction. The
+net quantity is unchanged, cost becomes visible, and deterministic correction
+keys make a re-run a no-op. Per resource it:
 
   1. Resolves the price the same way the forward sync does — the model catalog's
      ``params_json.pricing_id`` (or the bare id) matched against OpenRouter via
      the shared resolver — so an admin override / force-unprice is honoured.
   2. Seeds a historical ``usage_rates`` row (app DB) effective from the resource's
      earliest event, so the effective-dated rate history is complete.
-  3. UPDATEs the NULL-cost ``usage_events`` rows (auditdb), per unit:
-     ``cost_usd = quantity * rate`` (the invariant exception).
+  3. INSERTs the two additive correction rows in ``usage_events`` (auditdb), per
+     unit. The original immutable row is retained as provenance.
   4. After all resources, forces the ``usage_daily`` rollup to re-close the
      affected day span via ``UsageRollup.run_pass`` (a full-replace upsert), so
      the served numbers reflect the corrected ledger — otherwise closed days keep
@@ -67,20 +67,93 @@ from utils.db_url import build_postgres_url  # noqa: E402
 
 logger = logging.getLogger("backfill_llm_pricing")
 
-# Per-unit affected rows for a resource's NULL-cost LLM ledger rows.
+# Per-unit originals that do not yet have both deterministic correction rows.
 _AFFECTED_SQL = """
 SELECT unit, COUNT(*) AS n, MIN(ts) AS min_ts, COALESCE(SUM(quantity), 0) AS qty
-FROM usage_events
-WHERE category = 'llm' AND resource = $1 AND cost_usd IS NULL
+FROM usage_events AS original
+WHERE original.category = 'llm'
+  AND original.resource = $1
+  AND original.cost_usd IS NULL
+  AND original.source <> 'llm-pricing-correction-v1'
+  AND original.quantity >= 0
+  AND NOT (
+      EXISTS (
+          SELECT 1
+          FROM usage_events AS correction
+          WHERE correction.source = 'llm-pricing-correction-v1'
+            AND correction.source_id =
+                original.id::text || ':unpriced-reversal'
+            AND correction.unit = original.unit
+            AND correction.ts = original.ts
+      )
+      AND EXISTS (
+          SELECT 1
+          FROM usage_events AS correction
+          WHERE correction.source = 'llm-pricing-correction-v1'
+            AND correction.source_id =
+                original.id::text || ':priced-replacement'
+            AND correction.unit = original.unit
+            AND correction.ts = original.ts
+      )
+  )
 GROUP BY unit
 """
 
-# The invariant exception: set cost on the previously-unpriced rows only. Scoped
-# to (resource, unit, cost_usd IS NULL) so a re-run is a no-op.
-_REPRICE_SQL = """
-UPDATE usage_events
-SET rate_usd = $2::numeric, cost_usd = quantity * $3::numeric
-WHERE category = 'llm' AND resource = $1 AND unit = $4 AND cost_usd IS NULL
+# One statement publishes both sides of every correction atomically. If an old
+# interrupted/manual run somehow left one side behind, ON CONFLICT preserves it
+# and inserts the missing side.
+_CORRECT_SQL = """
+WITH originals AS (
+    SELECT original.*
+    FROM usage_events AS original
+    WHERE original.category = 'llm'
+      AND original.resource = $1
+      AND original.unit = $2
+      AND original.cost_usd IS NULL
+      AND original.source <> 'llm-pricing-correction-v1'
+      AND original.quantity >= 0
+), correction_rows AS (
+    SELECT
+        original.*,
+        correction.variant,
+        correction.quantity_sign
+    FROM originals AS original
+    CROSS JOIN (
+        VALUES ('unpriced-reversal'::text, -1::numeric),
+               ('priced-replacement'::text, 1::numeric)
+    ) AS correction(variant, quantity_sign)
+)
+INSERT INTO usage_events (
+    ts, user_id, project_id, ref_kind, ref_id, category, resource,
+    quantity, unit, rate_usd, cost_usd, source, source_id, details
+)
+SELECT
+    original.ts,
+    original.user_id,
+    original.project_id,
+    original.ref_kind,
+    original.ref_id,
+    original.category,
+    original.resource,
+    original.quantity * original.quantity_sign,
+    original.unit,
+    CASE WHEN original.quantity_sign > 0 THEN $3::numeric ELSE NULL END,
+    CASE
+        WHEN original.quantity_sign > 0
+        THEN original.quantity * $3::numeric
+        ELSE NULL
+    END,
+    'llm-pricing-correction-v1',
+    original.id::text || ':' || original.variant,
+    jsonb_build_object(
+        'reason', 'historical-llm-pricing-backfill',
+        'original_id', original.id,
+        'original_source', original.source,
+        'original_source_id', original.source_id,
+        'variant', original.variant
+    )
+FROM correction_rows AS original
+ON CONFLICT (source, source_id, unit, ts) DO NOTHING
 """
 
 _SEED_RATE_SQL = """
@@ -181,7 +254,7 @@ async def backfill(resources: list[str], *, apply: bool) -> int:
             if not apply:
                 continue
 
-            # 2) seed historical rate; 3) reprice the ledger (invariant exception).
+            # 2) Seed historical rate; 3) publish additive correction pairs.
             async with app_pool.acquire() as conn:
                 for r in affected:
                     await conn.execute(
@@ -194,11 +267,9 @@ async def backfill(resources: list[str], *, apply: bool) -> int:
             async with audit_pool.acquire() as conn:
                 for r in affected:
                     rate = rates[r["unit"]]
-                    tag = await conn.execute(
-                        _REPRICE_SQL, resource, rate, rate, r["unit"]
-                    )
+                    tag = await conn.execute(_CORRECT_SQL, resource, r["unit"], rate)
                     logger.info(
-                        "[%s] repriced %d %s row(s) @ %s",
+                        "[%s] inserted %d %s correction row(s) @ %s",
                         resource,
                         _status_count(tag),
                         r["unit"],

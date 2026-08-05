@@ -38,17 +38,77 @@ describe('AdminUsageComponent refresh shell', () => {
     expect(reload).toHaveBeenCalledOnce();
   });
 
-  it('tokensTotal sums prompt + cached prompt + completion token quantities', () => {
+  it('keeps token, vCPU, and compute-memory quantities dimensionally separate', () => {
     const c = TestBed.inject(AdminUsageComponent);
     (c as any).usage.usage.set({available: true, total_cost_usd: 0, cache_hit_ratio: 0.2, by_category: [
       {category: 'llm', unit: 'prompt-token', quantity: 100, cost_usd: 0, events: 1},
       {category: 'llm', unit: 'cached-prompt-token', quantity: 25, cost_usd: 0, events: 1},
       {category: 'llm', unit: 'completion-token', quantity: 25, cost_usd: 0, events: 1},
       {category: 'compute', unit: 'vcpu-hour', quantity: 2, cost_usd: 0, events: 1},
+      {category: 'compute', unit: 'gib-hour', quantity: 4, cost_usd: 0, events: 1},
+      {category: 'storage', unit: 'gib-hour', quantity: 40, cost_usd: 0, events: 1},
     ]});
     expect(c.tokensTotal()).toBe(150);
     expect(c.cacheHitRatio()).toBe(0.2);
-    expect(c.computeHours()).toBe(2);
+    expect(c.vcpuHours()).toBe(2);
+    expect(c.memoryGibHours()).toBe(4);
+    expect((c as any).computeHours).toBeUndefined();
+  });
+
+  it('keeps claim demand and physical volume storage separate in v2', () => {
+    const c = TestBed.inject(AdminUsageComponent);
+    (c as any).usage.usage.set({available: true, total_cost_usd: 0, cache_hit_ratio: 0, by_category: [
+      {category: 'storage', unit: 'gib-hour', quantity: 60, cost_usd: 0, events: 1},
+    ]});
+    expect(c.hasClaimStorage()).toBe(false);
+    expect(c.hasVolumeStorage()).toBe(false);
+
+    const row = (basis: string, unit: string, quantity: string) => ({
+      category: 'storage', measurement_basis: basis, unit, quantity,
+    });
+    (c as any).usage.usageV2.set({rows: [
+      row('claim-requested', 'gib-hour', '60'),
+      row('claim-requested', 'claim-hour', '3'),
+      row('volume-provisioned', 'gib-hour', '75'),
+      row('volume-provisioned', 'volume-hour', '2.5'),
+    ]});
+    expect(c.hasClaimStorage()).toBe(true);
+    expect(c.claimGibHours()).toBe(60);
+    expect(c.claimHours()).toBe(3);
+    expect(c.hasVolumeStorage()).toBe(true);
+    expect(c.volumeGibHours()).toBe(75);
+    expect(c.volumeHours()).toBe(2.5);
+  });
+
+  it('prefers reconciled v2 workspace rows for compute KPIs when available', () => {
+    const c = TestBed.inject(AdminUsageComponent);
+    (c as any).usage.usage.set({available: true, total_cost_usd: 0, by_category: [
+      {category: 'compute', unit: 'vcpu-hour', quantity: 2, cost_usd: 0, events: 1},
+      {category: 'compute', unit: 'gib-hour', quantity: 4, cost_usd: 0, events: 1},
+    ]});
+    const row = (unit: string, quantity: string) => ({
+      category: 'compute', measurement_basis: 'scheduler-request', unit, quantity,
+    });
+    (c as any).usage.usageV2.set({rows: [
+      row('vcpu-hour', '2.5'), row('gib-hour', '5.5'),
+    ]});
+    expect(c.vcpuHours()).toBe(2.5);
+    expect(c.memoryGibHours()).toBe(5.5);
+  });
+
+  it('does not turn missing rows in a partial v2 response into zero usage', () => {
+    const c = TestBed.inject(AdminUsageComponent);
+    (c as any).usage.usage.set({available: true, total_cost_usd: 0, by_category: [
+      {category: 'compute', unit: 'vcpu-hour', quantity: 2, cost_usd: 0, events: 1},
+      {category: 'compute', unit: 'gib-hour', quantity: 4, cost_usd: 0, events: 1},
+    ]});
+    (c as any).usage.usageV2.set({
+      rows: [],
+      coverage: {status: 'partial'},
+    });
+
+    expect(c.vcpuHours()).toBe(2);
+    expect(c.memoryGibHours()).toBe(4);
   });
 
   it('exposes provider compute estimates without folding them into canonical cost', () => {
@@ -78,13 +138,47 @@ describe('AdminUsageComponent refresh shell', () => {
         'cached-prompt-token': {quantity: 25, cost_usd: 0, events: 1},
         'completion-token': {quantity: 30, cost_usd: 0, events: 2}}},
       {key: 'u2', label: 'Bob', is_admin: false, events: 2, cost_usd: 0, units: {
-        'vcpu-hour': {quantity: 1.5, cost_usd: 0, events: 2}}},
+        'vcpu-hour': {quantity: 1.5, cost_usd: 0, events: 1},
+        'gib-hour': {quantity: 3, cost_usd: 0, events: 1}}},
     ]});
     const rows = c.userRows();
     expect(rows[0].role).toBe('Admin');
     expect(rows[0].prompt).toBe(100);
     expect(rows[0].share).toBe(1);     // max events
     expect(rows[1].share).toBe(0.5);
+    expect(rows[1].vcpu).toBe(1.5);
+    expect(rows[1].memory).toBe(3);
+    expect((rows[1] as any).compute).toBeUndefined();
+  });
+
+  it('does not label a categoryless mixed GiB-hour breakdown as memory', () => {
+    const c = TestBed.inject(AdminUsageComponent);
+    (c as any).usage.usage.set({available: true, total_cost_usd: 0, cache_hit_ratio: 0, by_category: [
+      {category: 'compute', unit: 'gib-hour', quantity: 2, cost_usd: 0, events: 1},
+      {category: 'storage', unit: 'gib-hour', quantity: 10, cost_usd: 0, events: 1},
+    ]});
+    (c as any).usage.breakdown = () => ({available: true, group_by: 'user', rows: [
+      {key: 'u1', label: 'Alice', is_admin: false, events: 2, cost_usd: 0, units: {
+        'gib-hour': {quantity: 12, cost_usd: 0, events: 2},
+      }},
+    ]});
+    expect(c.userRows()[0].memory).toBeNull();
+  });
+
+  it('splits project vCPU-hours and memory GiB-hours into separate fields', () => {
+    const c = TestBed.inject(AdminUsageComponent);
+    (c as any).usage.breakdown = (dim: string) => dim === 'project' ? ({available: true,
+      group_by: 'project', rows: [{key: 'p1', label: 'Project One', events: 2, cost_usd: 0,
+      units: {
+        'prompt-token': {quantity: 50, cost_usd: 0, events: 1},
+        'vcpu-hour': {quantity: 2, cost_usd: 0, events: 1},
+        'gib-hour': {quantity: 8, cost_usd: 0, events: 1},
+      }}]}) : null;
+    const row = c.projectRows()[0];
+    expect(row.tokens).toBe(50);
+    expect(row.vcpu).toBe(2);
+    expect(row.memory).toBe(8);
+    expect((row as any).compute).toBeUndefined();
   });
 
   it('modelRows lists per-model token and cache columns', () => {
