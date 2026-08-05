@@ -10,18 +10,22 @@ are not in tests/test_tool_override_boundary.py::TestExpertWriteBoundary
 alongside the kill-switch half of the same fix: that module's docstring is
 explicit that its validator is "NOT an authorization gate" and that
 capability grants are a separate PDP pinned elsewhere, and its
-``expert_env``/``kill_switch_env`` fixtures stub ``_enforce_expert_save_prelude``
-and ``_strip_save_grants`` out specifically so those tests see the shape gate
-(and, for the kill switch test, the real prelude) in isolation. This file,
-not that one, is the PDP's home.
+``expert_env`` fixture stubs ``_enforce_expert_save_prelude`` and
+``_strip_save_grants`` out specifically so those tests see the shape gate in
+isolation. ``kill_switch_env`` stubs **neither** — the real prelude is the
+only thing ``test_kill_switch_403s_every_write_route`` asserts, so adding the
+stubs there to "restore consistency" would silently delete that test's entire
+subject and leave it passing with the kill switch removed. This file, not that
+one, is the PDP's home.
 
 2026-08-04 (docs/superpowers/plans/2026-08-04-expert-write-gate-holes.md,
 task 3): ``duplicate_expert``'s grants half changed from refuse-outright to
 strip-and-report — measured against the real PDP with default grants, refusing
 blocked 7 of the 11 shipped experts, including ``scholar``, the route's own
-advertised use ("start from scholar"). The other four expert-write routes are
-unchanged and still refuse; ``_enforce_save_grants``'s own tests below assert
-that.
+advertised use ("start from scholar"). ``fork_my_expert_default`` followed in
+task 4 for the same reason, so the current inventory is **two routes strip,
+three refuse** (create, update, import); ``_enforce_save_grants``'s own tests
+below assert the refusing three.
 
 Task 4 of the same plan: ``fork_my_expert_default`` (``duplicate`` plus
 "select the copy as my default") carried the identical exposure and is fixed
