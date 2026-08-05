@@ -63,6 +63,10 @@ def test_verify_before_done_uses_shell_checks_only_when_available():
         md,
         ["file_exists", "read_file", "get_citation"],
     )
+    with_git = render_instruction_content(
+        md,
+        ["file_exists", "read_file", "git_diff"],
+    )
 
     assert "`run_command` with the test/build/lint command" in with_shell
     assert "`wc -w`" in with_shell
@@ -74,6 +78,11 @@ def test_verify_before_done_uses_shell_checks_only_when_available():
     assert "call `file_exists` once" in without_shell
     assert "call `read_file` once" in without_shell
     assert "repeat an unchanged evidence bundle" in without_shell
+    assert "No Git-history check is required" in without_shell
+    assert "Git history is optional orientation" in with_git
+    assert "use `git_diff` once" in with_git
+    assert "instructions.md" in without_shell
+    assert "completion_note" in without_shell
     assert "{%" not in without_shell
 
 

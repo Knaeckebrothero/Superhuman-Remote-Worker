@@ -7,6 +7,7 @@ LLM-dependent nodes are tested with mocks or integration tests.
 import pytest
 import tempfile
 import sys
+import yaml
 from pathlib import Path
 from unittest.mock import MagicMock, AsyncMock, patch
 
@@ -767,17 +768,40 @@ class TestPredefinedTodos:
     def test_transition_strategic_todos(self):
         """Test get_transition_strategic_todos returns the slim 2-todo cycle."""
         todos = get_transition_strategic_todos()
-        # De-bureaucratized transition: REVIEW+ADAPT merged, PLAN-OR-COMPLETE
-        # kept, REFLECT folded into a conditional sentence.
+        # Verification is followed by an explicitly ordered close/continue
+        # decision; technique lives in the capability-aware skill.
         assert len(todos) == 2
 
-        # Check content patterns
         contents = [t.content for t in todos]
-        assert any("review" in c.lower() for c in contents)
-        assert any("kb_" in c.lower() for c in contents)
-        assert any("plan.md" in c.lower() for c in contents)
-        assert any("job_complete" in c.lower() for c in contents)
-        assert any("next_phase_todos" in c.lower() for c in contents)
+        assert "skills/verify-before-done/SKILL.md" in contents[0]
+        assert "instructions.md" in contents[0]
+        assert "PASS" in contents[0] and "GAPS" in contents[0]
+        assert "completion_note" in contents[0]
+        assert "begin only after todo 1 is complete" in contents[1]
+        assert "job_complete" in contents[1]
+        assert "next_phase_todos" in contents[1]
+        combined = "\n".join(contents)
+        assert "git_tags" not in combined
+        assert "git_diff" not in combined
+        assert "stop condition comes FIRST" not in combined
+
+    def test_gpt_oss_transition_todos_use_same_ordered_skill_contract(self):
+        template = (
+            project_root / "config/templates/strategic_todos_transition_gpt_oss.yaml"
+        )
+        parsed = yaml.safe_load(template.read_text(encoding="utf-8"))
+        contents = [todo["content"] for todo in parsed["todos"]]
+
+        assert len(contents) == 2
+        assert "skills/verify-before-done/SKILL.md" in contents[0]
+        assert "completion_note" in contents[0]
+        assert "Start only after todo 1 is complete" in contents[1]
+        assert "job_complete" in contents[1]
+        assert "next_phase_todos" in contents[1]
+        combined = "\n".join(contents)
+        assert "git_tags" not in combined
+        assert "git_diff" not in combined
+        assert "stop condition" not in combined.lower()
 
 
 class TestTodosYamlValidation:

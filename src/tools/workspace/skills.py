@@ -78,7 +78,7 @@ def create_skill_tools(context: ToolContext) -> List[Any]:
 
         Args:
             skill_name: The skill's name exactly as shown in the available_skills
-                menu (e.g. "hello-skill").
+                menu (e.g. "verify-before-done").
 
         Returns:
             The SKILL.md body, or a friendly message if the skill is not present.

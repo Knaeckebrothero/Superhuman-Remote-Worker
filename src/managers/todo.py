@@ -387,10 +387,23 @@ class TodoManager:
         # Completed
         completed = [t for t in self._todos if t.status == TodoStatus.COMPLETED]
         if completed:
+            # A concise completion note is the handoff from the last completed
+            # task to the current one (for example final-review PASS/GAPS). Show
+            # only the latest noted todo so phase-long note history does not
+            # become another per-turn injection tax. Full notes remain in the
+            # checkpoint, Git commit, and phase archive.
+            latest_noted_todo = next(
+                (todo for todo in reversed(completed) if todo.notes), None
+            )
             lines.append("")
             lines.append("Completed:")
             for todo in completed:
                 lines.append(f"  - [x] {todo.id}: {todo.content}")
+                if todo is latest_noted_todo:
+                    note = " | ".join(" ".join(item.split()) for item in todo.notes)
+                    if len(note) > 1000:
+                        note = f"{note[:997]}..."
+                    lines.append(f"      Outcome: {note}")
 
         # In progress
         in_progress = [t for t in self._todos if t.status == TodoStatus.IN_PROGRESS]
@@ -844,12 +857,17 @@ class TodoManager:
             f"Use next_phase_todos to add new tasks."
         )
 
-    def complete_first_pending_sync(self) -> Dict[str, Any]:
+    def complete_first_pending_sync(
+        self, notes: Optional[List[str]] = None
+    ) -> Dict[str, Any]:
         """Find and complete the first pending or in-progress task.
 
         Looks for tasks in this order:
         1. First in_progress task
         2. First pending task (by priority)
+
+        Args:
+            notes: Optional completion notes to persist with the selected task.
 
         Returns:
             Dictionary with:
@@ -873,7 +891,7 @@ class TodoManager:
             target = pending[0]
 
         # Complete it
-        self.complete(target.id)
+        self.complete(target.id, notes=notes)
 
         # Check if all complete now
         is_last = self.all_complete()

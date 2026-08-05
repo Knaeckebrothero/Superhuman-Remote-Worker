@@ -354,6 +354,53 @@ class TestTodoToolWiring:
 
         assert git.commits == [f"{expected.id}: {expected.content}"]
 
+    def test_explicit_completion_note_is_durable_and_injected(self, git, clock):
+        committer = make(git, clock)
+        mgr = self._todo_manager()
+        tool = self._tool(self._context(mgr, committer))
+
+        first = mgr.list_all()[0]
+        result = tool.invoke(
+            {
+                "todo_id": first.id,
+                "completion_note": "GAPS: missing the limitations section",
+            }
+        )
+
+        assert first.notes == ["GAPS: missing the limitations section"]
+        assert "Recorded completion note" in result
+        injection = mgr.format_for_injection()
+        assert "Outcome: GAPS: missing the limitations section" in injection
+
+    def test_implicit_completion_note_is_persisted(self, git, clock):
+        committer = make(git, clock)
+        mgr = self._todo_manager()
+        tool = self._tool(self._context(mgr, committer))
+
+        first = mgr.list_all()[0]
+        tool.invoke({"completion_note": "PASS: all requested outputs verified"})
+
+        assert first.notes == ["PASS: all requested outputs verified"]
+
+    def test_oversized_completion_note_does_not_complete_todo(self, git, clock):
+        from src.tools.core.todo import MAX_COMPLETION_NOTE_CHARS
+
+        committer = make(git, clock)
+        mgr = self._todo_manager()
+        tool = self._tool(self._context(mgr, committer))
+
+        first = mgr.list_all()[0]
+        result = tool.invoke(
+            {
+                "todo_id": first.id,
+                "completion_note": "x" * (MAX_COMPLETION_NOTE_CHARS + 1),
+            }
+        )
+
+        assert "completion_note is too long" in result
+        assert first.status.value == "pending"
+        assert git.commits == []
+
     def test_no_committer_configured_is_harmless(self, git):
         """Persistent sessions leave progress_committer unset."""
         mgr = self._todo_manager()
