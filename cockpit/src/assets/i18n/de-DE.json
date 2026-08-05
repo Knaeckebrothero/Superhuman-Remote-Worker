@@ -357,7 +357,7 @@
     "skills": "Skills",
     "automations": "Automationen",
     "create": "Erstellen",
-    "debug": "Debug",
+    "workbench": "Workbench",
     "settings": "Einstellungen",
     "logout": "Abmelden",
     "admin": "Admin",
@@ -613,7 +613,7 @@
     "tooltip": {
       "collapse": "Unteraufträge einklappen",
       "expand": "Unteraufträge ausklappen",
-      "view": "In Debug-Ansicht öffnen",
+      "view": "In der Workbench öffnen",
       "workspace": "Arbeitsbereich in Gitea öffnen",
       "ideSnapshot": "Arbeitsbereich in Web-IDE öffnen (aus Snapshot)",
       "ideCode": "Arbeitsbereich in Web-IDE öffnen (nur Code)",

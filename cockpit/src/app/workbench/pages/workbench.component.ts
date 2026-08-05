@@ -5,16 +5,16 @@ import { SidebarToggleComponent } from '../../shell/sidebar-toggle/sidebar-toggl
 import { LayoutService } from '../services/layout.service';
 
 @Component({
-  selector: 'app-debug-page',
+  selector: 'app-workbench-page',
   standalone: true,
   imports: [TimelineComponent, SplitPanelComponent, SidebarToggleComponent],
   template: `
-    <div class="debug-frame">
-      <header class="debug-header">
+    <div class="workbench-frame">
+      <header class="workbench-header">
         <app-sidebar-toggle />
         <app-timeline />
       </header>
-      <main class="debug-main">
+      <main class="workbench-main">
         <app-split-panel [config]="layoutService.layout()" />
       </main>
     </div>
@@ -26,35 +26,35 @@ import { LayoutService } from '../services/layout.service';
         height: 100%;
       }
 
-      .debug-frame {
+      .workbench-frame {
         display: flex;
         flex-direction: column;
         height: 100%;
         overflow: hidden;
       }
 
-      .debug-header {
+      .workbench-header {
         display: flex;
         align-items: center;
         flex-shrink: 0;
       }
 
-      .debug-header app-sidebar-toggle {
+      .workbench-header app-sidebar-toggle {
         padding-left: 12px;
       }
 
-      .debug-header app-timeline {
+      .workbench-header app-timeline {
         flex: 1;
         min-width: 0;
       }
 
-      .debug-main {
+      .workbench-main {
         flex: 1;
         overflow: hidden;
       }
     `,
   ],
 })
-export class DebugPageComponent {
+export class WorkbenchPageComponent {
   readonly layoutService = inject(LayoutService);
 }

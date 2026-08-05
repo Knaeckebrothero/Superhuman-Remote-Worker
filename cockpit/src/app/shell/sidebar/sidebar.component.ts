@@ -5,8 +5,8 @@ import {filter, map} from 'rxjs';
 import {UserService} from '../../core/services/user.service';
 import {SidebarService} from '../../core/services/sidebar.service';
 import {ViewportService} from '../../core/services/viewport.service';
-import {LayoutService} from '../../debug/services/layout.service';
-import {LayoutPickerComponent} from '../../debug/components/layout-picker/layout-picker.component';
+import {LayoutService} from '../../workbench/services/layout.service';
+import {LayoutPickerComponent} from '../../workbench/components/layout-picker/layout-picker.component';
 import {NotificationBellComponent} from '../notification-bell/notification-bell.component';
 import {PersistentChatService} from '../../core/services/persistent-chat.service';
 import {environment} from '../../core/environment';
@@ -101,11 +101,11 @@ import {LegionMarkComponent} from '../../ui/legion-mark';
           @if (!viewport.isMobile()) {
             <a
               class="nav-link"
-              routerLink="/debug"
+              routerLink="/workbench"
               routerLinkActive="active"
             >
-              <app-icon size="md" class="nav-icon">bug_report</app-icon>
-              {{ 'nav.debug' | transloco }}
+              <app-icon size="md" class="nav-icon">view_quilt</app-icon>
+              {{ 'nav.workbench' | transloco }}
             </a>
           }
           @if (userService.currentUser()?.is_admin) {
@@ -152,7 +152,7 @@ import {LegionMarkComponent} from '../../ui/legion-mark';
           }
         </div>
 
-        @if (isDebugRoute()) {
+        @if (isWorkbenchRoute()) {
           <div class="section">
             <div class="section-title">Databases</div>
             <a class="section-link" [href]="neo4jUrl" target="_blank" rel="noopener">
@@ -401,7 +401,7 @@ import {LegionMarkComponent} from '../../ui/legion-mark';
         }
       }
 
-      /* Debug sections */
+      /* Workbench sections */
 
       .section {
         padding: 8px;
@@ -583,8 +583,8 @@ export class SidebarComponent {
     { initialValue: this.router.url },
   );
 
-  readonly isDebugRoute = computed(
-    () => this.currentUrl()?.startsWith('/debug') ?? false,
+  readonly isWorkbenchRoute = computed(
+    () => this.currentUrl()?.startsWith('/workbench') ?? false,
   );
 
   readonly giteaUrl = environment.giteaUrl;

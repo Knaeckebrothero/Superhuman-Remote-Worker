@@ -64,11 +64,12 @@ export const routes: Routes = [
   { path: 'automations', component: AutomationsPageComponent, canActivate: [authGuard] },
   { path: 'settings', component: SettingsComponent, canActivate: [authGuard] },
   { path: 'settings/api-keys', component: ApiKeysPageComponent, canActivate: [authGuard] },
-  // Admin and debug load on demand. They are large (the config, usage and
-  // grants screens alone are most of a megabyte of source, and debug pulls
-  // the graph timeline), and no ordinary session ever opens them — keeping
-  // them in the initial bundle taxed every page load to serve a handful of
-  // admin visits, and pushed the build past its initial-bundle budget.
+  // Admin and the workbench load on demand. They are large (the config, usage
+  // and grants screens alone are most of a megabyte of source, and the
+  // workbench pulls the graph timeline), and no ordinary session ever opens
+  // them — keeping them in the initial bundle taxed every page load to serve a
+  // handful of admin visits, and pushed the build past its initial-bundle
+  // budget.
   {
     path: 'admin/llm',
     loadComponent: () =>
@@ -102,14 +103,17 @@ export const routes: Routes = [
     canActivate: [authGuard, adminGuard],
   },
   {
-    path: 'debug',
+    path: 'workbench',
     loadComponent: () =>
-      import('./debug/pages/debug.component').then(m => m.DebugPageComponent),
+      import('./workbench/pages/workbench.component').then(m => m.WorkbenchPageComponent),
     canActivate: [authGuard],
   },
 
   // Redirects for old bookmarks. Jobs absorbed the standalone Create + Review
-  // surfaces, so their old top-level paths now redirect into /jobs/*.
+  // surfaces, so their old top-level paths now redirect into /jobs/*. /debug
+  // was renamed to /workbench — the surface is a customizable panel workspace,
+  // not a troubleshooting console.
+  { path: 'debug', redirectTo: 'workbench' },
   { path: 'sudo', redirectTo: 'inbox' },
   { path: 'create', redirectTo: 'jobs/new' },
   { path: 'review', redirectTo: 'jobs/review' },

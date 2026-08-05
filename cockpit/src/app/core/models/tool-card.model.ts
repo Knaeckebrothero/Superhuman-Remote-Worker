@@ -3,7 +3,7 @@ import {DiffLine} from '../util/line-diff';
 /**
  * Unified, source-agnostic view-model for an agent tool call.
  *
- * Both the live persistent-session stream (`ToolCallEvent`) and the debug
+ * Both the live persistent-session stream (`ToolCallEvent`) and the workbench
  * MongoDB audit trail (`AuditToolInfo`) map into this one shape, which a single
  * presentational component (`<app-tool-card>`) renders identically. All
  * per-tool knowledge (title, icon, which arg is the "primary" parameter, how to
@@ -51,7 +51,7 @@ export interface ToolResult {
     diffMode?: 'replace' | 'append' | 'prepend' | 'write';
     /** Lines dropped by the adapter's render cap (diff), surfaced as a footer. */
     truncatedLines?: number;
-    /** Set when `content` is only a preview of a larger result (debug side). */
+    /** Set when `content` is only a preview of a larger result (workbench side). */
     bytesTotal?: number;
 }
 

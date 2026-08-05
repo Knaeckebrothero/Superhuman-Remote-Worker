@@ -5,7 +5,7 @@ import { ApiService } from './api.service';
 import { IndexedDbService } from './indexed-db.service';
 
 /**
- * DataService is now a thin job-selection holder: the debug panels load the
+ * DataService is now a thin job-selection holder: the workbench panels load the
  * audit + chat streams lazily via their own paged trace services
  * (AuditTraceService / ChatTraceService) and graph via GraphService, all driven
  * by `currentJobId`. Nothing is eagerly downloaded here anymore — that bulk path

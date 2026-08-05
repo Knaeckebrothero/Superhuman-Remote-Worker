@@ -109,7 +109,7 @@ interface MenuSection {
           </div>
 
           <div class="menu-footer">
-            <span>Debug Cockpit v0.1.0</span>
+            <span>Workbench v0.1.0</span>
           </div>
         </div>
       }

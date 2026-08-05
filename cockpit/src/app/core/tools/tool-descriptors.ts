@@ -18,7 +18,7 @@ import {
  * Per-tool rendering knowledge — the single source of truth that replaces the
  * scattered `TOOL_LABELS` / `toolIcon` / `formatToolArgs` / `toolLabelContext`
  * / `fileEditView` (persistent chat) and `toolCategories` / `getStepBadge`
- * (debug audit) maps. A generic fallback covers unregistered tools so a new
+ * (workbench audit) maps. A generic fallback covers unregistered tools so a new
  * tool renders sanely with zero registry work.
  *
  * Design: `docs/features/unified_tool_cards.md`.

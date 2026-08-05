@@ -1361,7 +1361,7 @@ export class JobListComponent implements OnInit, OnDestroy {
   }
 
   viewJob(jobId: string): void {
-    // Use DataService to switch to this job for debug panels
+    // Use DataService to switch to this job for workbench panels
     this.data.setCurrentJob(jobId);
     this.selectedJobId.set(jobId);
   }
