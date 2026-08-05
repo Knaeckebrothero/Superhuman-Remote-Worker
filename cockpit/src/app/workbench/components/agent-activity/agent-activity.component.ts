@@ -689,7 +689,7 @@ export class AgentActivityComponent {
 
   constructor() {
     // Drive the trace off the loaded job. DataService.currentJobId is the signal
-    // the debug dashboard actually sets on selection (the timeline's dropdown ->
+    // the workbench actually sets on selection (the timeline's dropdown ->
     // data.setCurrentJob -> loadJob); jobContext.activeJobId is not populated here.
     effect(() => {
       const jobId = this.data.currentJobId();

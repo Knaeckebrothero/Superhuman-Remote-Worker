@@ -2,7 +2,7 @@ import { Component, inject, computed, effect, signal, untracked } from '@angular
 import { TranslocoPipe, TranslocoService } from '@jsverse/transloco';
 import { DataService } from '../../core/services/data.service';
 import { ChatTraceService } from '../../core/services/chat-trace.service';
-import { RequestService } from '../../debug/services/request.service';
+import { RequestService } from '../../workbench/services/request.service';
 import { ChatEntry, ChatInput, ChatToolCall } from '../../core/models/chat.model';
 import { AppButtonComponent } from '../../ui/button';
 import { AppIconButtonComponent } from '../../ui/icon-button';
@@ -849,7 +849,7 @@ export class ChatHistoryComponent {
   });
 
   constructor() {
-    // Drive the chat panel off the loaded job — the same signal the debug
+    // Drive the chat panel off the loaded job — the same signal the workbench
     // dashboard sets on selection (DataService.currentJobId). See
     // docs/features/debug_audit_view_refactor.md (Phase 2c / P3).
     effect(() => {

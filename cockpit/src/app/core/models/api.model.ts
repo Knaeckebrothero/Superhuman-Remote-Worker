@@ -1,5 +1,5 @@
 /**
- * API data models for the Debug Cockpit.
+ * API data models for the Cockpit.
  */
 
 /**

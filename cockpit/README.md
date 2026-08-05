@@ -99,7 +99,7 @@ this.toast.error(this.errors.translate(err, 'errors.jobs.createFailed'));
   - `errors.<feature>.<action>Failed` — caller-supplied fallbacks
 - **Brand names stay untranslated:** `OpenAI`, `Anthropic`, `Groq`, `Keycloak`, etc. — render verbatim in both locales.
 
-**Admin / debug surfaces stay in English** (see `src/app/debug/**`, `src/app/shared/components/statistics/**`). Not customer-facing.
+**Admin / workbench surfaces stay in English** (see `src/app/workbench/**`, `src/app/shared/components/statistics/**`). Not customer-facing.
 
 **CI checks (`npm run i18n:check`):**
 

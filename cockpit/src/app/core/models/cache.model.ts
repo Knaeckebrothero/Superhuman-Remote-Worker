@@ -5,7 +5,7 @@
 
 import { AuditEntry } from './audit.model';
 import { ChatEntry } from './chat.model';
-import { GraphDelta } from '../../debug/graph.model';
+import { GraphDelta } from '../../workbench/graph.model';
 
 /**
  * Cached audit entry with job context and index for efficient retrieval.

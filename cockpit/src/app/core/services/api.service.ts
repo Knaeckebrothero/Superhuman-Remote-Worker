@@ -77,8 +77,8 @@ import {
 } from '../models/api.model';
 import {ThreadUploadResponse, UploadInfo, UploadResponse} from '../models/file.model';
 import {AuditEntry, AuditFilterCategory, AuditResponse, JobSummary,} from '../models/audit.model';
-import {LLMRequest} from '../../debug/request.model';
-import {GraphChangeResponse} from '../../debug/graph.model';
+import {LLMRequest} from '../../workbench/request.model';
+import {GraphChangeResponse} from '../../workbench/graph.model';
 import {ChatEntry, ChatHistoryResponse} from '../models/chat.model';
 import {PendingActionCounts, ThreadDetail} from '../models/action.model';
 import {

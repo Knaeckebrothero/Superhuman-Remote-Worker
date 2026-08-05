@@ -4,7 +4,7 @@ import { ApiService } from './api.service';
 import { ChatEntry } from '../models/chat.model';
 
 /**
- * Paged, lazy chat-history data source for the debug Chat panel.
+ * Paged, lazy chat-history data source for the workbench Chat panel.
  *
  * Replaces the old eager "download the whole job into IndexedDB + slider window"
  * path (DataService) for the chat stream: fetches conversation turns from
