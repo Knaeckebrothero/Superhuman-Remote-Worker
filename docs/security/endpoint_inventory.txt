@@ -366,6 +366,7 @@ GET    /api/uploads/{upload_id}/files/{filename}                                
 GET    /api/usage                                                                       gated:require_approved_user
 GET    /api/usage/breakdown                                                             gated:require_approved_user
 GET    /api/usage/timeseries                                                            gated:require_approved_user
+GET    /api/usage/v2                                                                    gated:user_can_access_job_or_thread
 GET    /api/users                                                                       gated:require_approved_user
 POST   /api/users                                                                       admin:_require_admin
 GET    /api/users/me/capabilities                                                       gated:require_approved_user
