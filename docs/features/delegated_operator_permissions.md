@@ -80,17 +80,21 @@ settings, and organization administration follow on the same foundation.
     future design.
 11. A successful Postgres mutation and its audit record commit atomically.
     External Keycloak/fleet/provider actions instead use a durable operation or
-    outbox with `requested`, `succeeded`, and `failed` outcomes. Denied attempts
-    emit the existing best-effort security event.
+    outbox with explicit request/dispatch authorization, idempotency, and
+    staged outcomes. Denied attempts emit the existing best-effort security
+    event.
 12. Membership changes use a compound authorization with independent
     destination and affected-user legs; permission to manage project A is not
     permission to import any arbitrary account into it.
 13. Presets such as “Cost viewer” or “Project operator” expand into explicit
     assignments. A later catalog addition never silently broadens an existing
     preset assignment.
-14. Permission keys are immutable contracts with a versioned catalog lifecycle.
-    A key is not assignable until its resolver, enforcement points, audit
-    behavior, UI copy, and security matrix all exist.
+14. Permission keys are immutable contracts with a versioned, cluster-pinned
+    catalog lifecycle. A key is not assignable until its resolver, enforcement
+    points, audit behavior, UI copy, and security matrix all exist.
+15. Pending, approved, and suspended accounts are durably distinct. The legacy
+    Keycloak `user` role cannot undo suspension, and restoration is a separate
+    root-only action in v1 that never revives old operator grants.
 
 ## Why this feature exists
 
@@ -136,10 +140,12 @@ implemented as a few replacements of `_require_admin`:
   self-only (or move privileged profile changes behind an explicit management
   permission) before the protected-target invariant is considered true;
 - OIDC resolution still treats the legacy Keycloak `user` realm role as
-  approval and writes `is_approved=true` back into Postgres. Retiring that
-  migration fallback, or adding an authoritative suspension override, is a
-  hard prerequisite for `users.suspend`; otherwise a suspended legacy user can
-  reapprove themselves on their next request;
+  approval and writes `is_approved=true` back into Postgres. Phase 0 removes
+  that runtime write-through and preserves existing DB admission values at the
+  cutoff; a role-bearing but unapproved account remains pending for explicit
+  review. It also adds a durable suspension marker so pending and suspended are
+  distinguishable. Otherwise a suspended legacy user can reapprove themselves
+  on their next request;
 - `GET /api/users` is a global authenticated directory and currently exposes
   management-adjacent flags. Management pages need a separate scoped DTO and
   SQL-filtered query; the generic directory must be reviewed and reduced to the
@@ -418,6 +424,32 @@ implemented by changing the meaning of old rows. Risky catalog revisions are
 shadow-evaluated against the prior revision before activation, and decisions
 record the revision that evaluated them.
 
+### Catalog activation
+
+All replicas must evaluate the same semantics during a rolling deployment.
+Postgres therefore stores only a centrally pinned
+`management_catalog_state(active_revision, activated_at, activated_by)`; the
+immutable catalog definitions remain code-owned. Management-ready replicas
+heartbeat short-lived build/support leases in
+`management_catalog_replica_support`; inability to refresh the lease fails
+their management readiness. A release bundles the active revision plus any
+candidate revision it can shadow-evaluate.
+
+Activation is a separate step-up/root-controlled, reasoned, audited transaction
+after every unexpired serving-replica lease reports support. It flips the active
+revision and appends a cross-replica `management_catalog_changed` invalidation.
+Every management decision binds the DB-pinned revision. A replica that does not
+support it returns typed 503 for management traffic and fails management
+readiness rather than evaluating a local default. Deploy new compatible code,
+activate once, then remove old definitions in a later release; never let mixed-
+version replicas choose independently.
+
+Every management read/mutation/dispatch transaction holds
+`management_catalog_state FOR SHARE` through its decision and effect.
+Activation uses a dedicated current-root/step-up bootstrap path, takes the row
+`FOR UPDATE`, waits older decisions out, flips once, and commits the invalidation.
+It never attempts a shared-to-update lock upgrade.
+
 ### Initial catalog
 
 | Permission | Action | Allowed scopes | Phase |
@@ -425,6 +457,7 @@ record the revision that evaluated them.
 | `users.read` | View management-safe user projections | global, user | v1 |
 | `users.approve` | Admit a pending regular user | global | v1 |
 | `users.suspend` | Suspend an admitted regular user | global, user | v1 |
+| `users.restore` | Restore a suspended regular user without restoring old management grants | global, user | v1, root-only (`internal`) |
 | `capability_grants.read` | View explicit/effective capability grants | global, project, user | v1 |
 | `capability_grants.manage_user` | Set/revoke allowed capability keys on regular-user scopes | global, user | v1 |
 | `usage.read` | View usage/cost aggregates without content payloads | global, project, user | v1 |
@@ -455,7 +488,7 @@ global capability-grant management in v1.
 Permission keys determine the surface; validated constraints narrow what may be
 done within it. Constraints are not a free-form policy language.
 
-For example:
+For a future M2 organization-scoped example:
 
 ```json
 {
@@ -578,7 +611,7 @@ introduced later, deny wins.
 ### Relationship changes require both sides
 
 A relationship mutation such as adding user U to project P has two protected
-objects. It requires all of the following in one decision:
+objects. Its compound authorization requires all of the following:
 
 1. one independently sufficient `projects.manage_members` grant matching
    destination P;
@@ -595,6 +628,28 @@ users into their scope and then exercising another permission over them. The
 same pattern applies to team membership and future organization moves.
 
 ## Data model
+
+### Admission lifecycle
+
+Phase 0 adds durable `users.suspended_at` and `users.suspended_by` fields, with
+a database check that a suspended row cannot be `is_approved=true`. Until a
+later enum migration, the authoritative states are:
+
+| State | Stored form |
+|---|---|
+| pending | `is_approved=false`, `suspended_at=NULL` |
+| approved | `is_approved=true`, `suspended_at=NULL` |
+| suspended | `is_approved=false`, `suspended_at IS NOT NULL` |
+
+Every cookie, PAT, MCP, SSE, WebSocket, and internal user-auth path treats only
+the approved form as admitted. `users.approve` applies only to pending users;
+it cannot clear a suspension. A separate catalogued `users.restore` action
+clears suspension and re-admits the account, remains root-only/internal in v1,
+requires a reason, and never restores revoked management grants. The legacy
+Keycloak `user` role is ignored for runtime admission after the cutoff.
+Suspension holds the subject user row through assignment revocation and
+cancellation of their queued/claimed authorization-bound operations, so a
+dispatch worker's shared actor lock supplies the same ordering guarantee.
 
 ### Active assignments
 
@@ -626,6 +681,11 @@ CREATE TABLE management_grants (
     expires_at      TIMESTAMPTZ,
     CHECK (scope_kind IN ('global', 'user', 'project')),
     CHECK (jsonb_typeof(constraints_json) = 'object'),
+    CHECK (constraint_schema_version > 0),
+    CHECK (
+        (source_preset_key IS NULL AND source_preset_revision IS NULL) OR
+        (source_preset_key IS NOT NULL AND source_preset_revision > 0)
+    ),
     CHECK (expires_at IS NULL OR expires_at > granted_at),
     CHECK (
         (scope_kind = 'global' AND scope_id IS NULL) OR
@@ -653,10 +713,10 @@ Implementation details:
   until the user is deleted, even after the final grant is revoked. It provides
   the synchronization row and monotonic public revision; never expose Postgres
   `xmin` as a revision;
-- an approved non-admin who has never had a state row has synthetic grant
-  revision `0`; a root admin also reports grant revision `0`, with root page
-  access derived separately from a fresh root-role decision rather than a
-  fabricated assignment;
+- an approved principal who has never had a state row has synthetic grant
+  revision `0`; a root admin reports its retained state revision when one
+  exists, or `0` otherwise, while root page access is derived separately from
+  a fresh root-role decision rather than a fabricated assignment;
 - one row exists per `(subject_user_id, permission_key, scope_kind, scope_id)`;
 - `scope_id` is polymorphic, matching the existing capability-grant pattern;
   deletion services remove rows in the same transaction as their user/project/
@@ -695,23 +755,26 @@ discover its existing grant scopes, it acquires the candidate locks, then
 reloads under the actor-state lock and retries the transaction if an applicable
 scope was not locked.
 
-The complete canonical order is: lifecycle advisory locks, all involved
-`users` rows in UUID order (shared for identity-only actors, update for mutated
-targets or an assignment subject), their `management_principal_state` rows in
-UUID order, capability-policy synchronization where applicable, then
-membership and domain-resource rows. Root assignment follows the same order,
+The complete canonical order is: catalog-state shared lock, lifecycle advisory
+locks, all involved `users` rows in UUID order (shared for identity-only actors,
+update for mutated targets or an assignment subject), their
+`management_principal_state` rows in UUID order, capability-policy
+synchronization where applicable, then membership and domain-resource rows.
+Root assignment follows the same order,
 making first assignment serialize with a concurrent target mutation even when
 the state row does not yet exist. Expiry comparisons use database `NOW()`.
 Lock timeout/deadlock is retryable and never falls back to an unlocked check.
 
 User/project/scope deletion holds the exclusive lifecycle lock, discovers and
 locks every affected subject deterministically, snapshots and deletes scoped
-grants, increments every affected grant revision, appends lifecycle audit
-events, publishes post-commit permission invalidations, and deletes the
-resource in the same transaction. Expiry pruning performs the same
+grants, increments every surviving affected subject's grant revision, appends
+lifecycle audit events plus an account tombstone for a deleted subject,
+publishes post-commit invalidations, and deletes the resource in the same
+transaction. Expiry pruning performs the same
 revision/audit/invalidation protocol in bounded subject batches. All legacy
 deletion and assignment writers must use this service before any permission is
-assignable.
+assignable. Deletion also cancels queued authorization-bound operations whose
+target/scope vanished; convergence workers re-read the new desired state.
 
 This gives the database-local revocation guarantee:
 
@@ -741,7 +804,7 @@ Suggested `management_events` shape:
 | `primary_permission_key` | Queryable primary permission exercised or changed |
 | `authorization_legs_json` | Bounded list of every required leg: permission, matched grant (nullable for root), scope, target, and constraint outcome |
 | `actor_grant_revision`, `catalog_revision` | Grant/catalog basis shared by the legs; no FK so deletion does not erase history |
-| `relationship_evidence_json` | Redacted IDs/roles/versions of memberships used for a scoped decision; empty for global/user-direct decisions |
+| `relationship_evidence_json` | Redacted membership IDs/roles and row version/timestamp where available; empty for global/user-direct decisions |
 | `scope_kind`, `scope_id` | Evaluated management scope |
 | `target_type`, `target_id` | User/project/setting/etc. affected |
 | `before_json`, `after_json` | Redacted state transition; never secrets or content payloads |
@@ -806,16 +869,26 @@ effective-access preview.
 Read paths resolve an immutable server-side filter plan:
 
 ```python
-decision = await require_management_read(
-    request,
-    postgres_db,
-    permission="users.read",
-)
-rows = await management_users.list(conn, filter_plan=decision.filter_plan)
+async with postgres_db.acquire() as conn:
+    async with conn.transaction(isolation="repeatable_read"):
+        decision = await require_management_read(
+            request,
+            conn,
+            permission="users.read",
+        )
+        rows = await management_users.list(
+            conn,
+            filter_plan=decision.filter_plan,
+        )
+        await append_sensitive_read_event(conn, decision=decision, rows=rows)
 ```
 
 Filtering happens in SQL before counts, ordering, and pagination. Loading all
-rows and filtering in Python is not an acceptable enforcement point.
+rows and filtering in Python is not an acceptable enforcement point. The read
+service owns this transaction, holds the actor-state/lifecycle shared locks
+through query and required audit, and returns rows only after commit. A response
+already in network flight can still arrive after revocation; the invalidation
+channel clears it, and later requests observe the new revision.
 
 Mutation paths use one caller-owned transaction:
 
@@ -838,12 +911,14 @@ target A and accidentally mutate target B. Evaluation order is:
 
 1. Resolve an approved caller and a normalized human credential context;
    reject unknown, PAT, MCP, internal, or service-principal contexts.
-2. Resolve the immutable catalog entry and reject unavailable action/scope/
-   constraint combinations.
+2. Preflight the currently pinned immutable catalog entry and reject an
+   unsupported replica before dependency work.
 3. Perform any live Keycloak protected-target read before opening the database
    transaction; dependency failure returns a retryable 503 without mutation.
-4. Begin the transaction and lock all involved user rows, principal-state rows,
-   memberships, and target resources in the documented canonical order.
+4. Begin the transaction, lock catalog state `FOR SHARE`, re-resolve the pinned
+   entry, then lock all involved lifecycle, user, principal-state, membership,
+   and target resources in the documented canonical order. A catalog change
+   between preflight and this lock restarts/denies against the new entry.
 5. Revalidate actor approval/root state and load active grants only after the
    actor-state lock. An unshadowed root admin then takes the catalogued bypass.
 6. Derive target scope memberships from locked authoritative rows.
@@ -893,6 +968,15 @@ race and are reconciled periodically or through a future Keycloak event
 listener. Tests claim race freedom only for SRW management-grant changes, not
 for arbitrary concurrent Keycloak console changes.
 
+The root bypass on new management routes requires a current verified Keycloak
+admin role; conservative `users.is_admin=true` protects a target but is not by
+itself authority for that caller. Any SRW-mediated or reconciled transition
+into root admin revokes the subject's management grants, increments its grant
+revision, cancels queued authorization-bound operations, and audits the
+transition. Later demotion never revives those grants. An out-of-band promotion
+is protected immediately by live lookup and cleaned by login/event/periodic
+reconciliation.
+
 Suspending an operator is a root-only emergency action and atomically revokes
 their management grants with privilege-lifecycle audit events. Reapproval does
 not silently revive operator authority. A suspended account with a corrupt or
@@ -907,7 +991,7 @@ Cockpit permission summary is UX state, never an authorization cache.
 
 If caching becomes necessary later:
 
-- cache by subject plus a monotonic permission version;
+- cache by subject plus its monotonic grant revision;
 - invalidate synchronously on set/revoke;
 - use a short hard TTL as a fallback;
 - never place the authoritative assignment set only in a BFF session or access
@@ -924,6 +1008,7 @@ Suggested endpoints:
 | `GET` | `/api/admin/operators` | List users with active assignments and summaries |
 | `GET` | `/api/admin/operators/candidates` | Find approved non-admin human subjects, including existing operators |
 | `GET` | `/api/admin/management-catalog` | Return the versioned assignable catalog and explicit preset definitions |
+| `POST` | `/api/admin/management-catalog/activate` | Step-up activation of a universally supported candidate revision |
 | `GET` | `/api/admin/management-scope-targets` | Search paginated valid scope targets for one permission/scope-kind pair |
 | `GET` | `/api/admin/operators/{user_id}/permissions` | Complete assignment set, revision, and strong `ETag` |
 | `PUT` | `/api/admin/operators/{user_id}/permissions` | Atomically replace the complete explicit set; require `If-Match` and reason |
@@ -937,7 +1022,8 @@ eligible targets server-side. The catalog response carries its own immutable
 catalog revision and explicit preset expansions.
 
 The collection PUT prevents a preset or multi-row edit from partially applying.
-`GET` returns only the canonical persisted assignment representation plus
+`GET` returns only the canonical, deterministically ordered persisted
+assignment representation plus
 `ETag: "mg-<revision>"` and `Cache-Control: no-store`; catalog labels and
 time-derived `active` flags are fetched/derived separately. Every writer that
 changes a GET-visible field, including expiry pruning and scope cleanup,
@@ -975,6 +1061,7 @@ compatibility wrappers until their UI and clients migrate.
 | `GET /api/manage/users` | any of `users.read`, `users.approve`, `users.suspend` | Purpose-filtered, paginated projection with server-computed `allowed_actions`; mutation-only callers see only the minimum actionable target rows |
 | `POST /api/manage/users/{id}/approve` | `users.approve` | Approve one regular target; preserve post-commit idempotent provisioning |
 | `POST /api/manage/users/{id}/suspend` | `users.suspend` | Suspend one regular target; require confirmation/reason |
+| `POST /api/manage/users/{id}/restore` | Root admin (`users.restore` is internal in v1) | Clear a durable suspension with reason; do not restore old management grants |
 | `POST /api/manage/users/approve` | `users.approve` | Preflight all targets; reject the whole batch for any unauthorized/privileged target and audit each changed user |
 | `GET /api/manage/capability-grants` | `capability_grants.read` or `capability_grants.manage_user` | Read permission returns its eligible view; manage-only returns only target/schema/current-value data required for its authorized edits |
 | user-scope grant PUT/DELETE | `capability_grants.manage_user` | Validate protected target, constraints, and simulated post-change effective value |
@@ -1021,7 +1108,8 @@ bounded concurrency. The transaction locks all targets in UUID order,
 revalidates every target and authorization leg, and is all-or-nothing: any
 unauthorized, protected, missing, or invalid target changes none of them.
 Successful changes receive individual audit events in the same commit and the
-response reports per-target idempotent/changed status.
+response reports per-target idempotent/changed status. A suspended target is
+not pending: bulk approval rejects it and cannot act as an implicit restore.
 
 ### Admin surface classification
 
@@ -1053,16 +1141,17 @@ External actions therefore create a durable `management_operations` row and a
 Location header. The row includes operation type/system, actor, permission,
 operation class, request-time authorization legs/revisions, target, redacted
 desired state, request fingerprint, actor/route-scoped idempotency key, state,
-attempts, lease, dispatch-time authorization legs/revisions, downstream request
-ID, and safe last-error code.
+attempts, lease, request auth-method/session hash/ACR/`auth_time`, dispatch-time
+authorization legs/revisions, downstream request ID, and safe last-error code.
 
 External request endpoints require a bounded client-supplied `Idempotency-Key`.
 `(actor_user_id, route_template, key)` is unique. Reuse with the same canonical
 request fingerprint returns the existing operation/Location; reuse with a
 different fingerprint returns 409. The mapping remains at least as long as the
-configured client retry window and never expires while its operation is still
-actionable. The same key, or a stable derived child key, is propagated to a
-downstream API that supports idempotency.
+configured client retry window (24 hours after a terminal result by default)
+and never expires while its operation is still actionable. The same key, or a
+stable derived child key, is propagated to a downstream API that supports
+idempotency.
 
 `GET /api/manage/operations/{operation_id}` exposes safe status only to the
 original requester or a root admin; action-specific request endpoints return
@@ -1071,14 +1160,20 @@ that URL and never expose a downstream credential or raw provider response.
 A worker first moves a `pending`/`retry` row to leased `claimed` with
 `FOR UPDATE SKIP LOCKED` and commits. For an independently
 `authorization_bound` command, dispatch then reruns the complete current actor,
-credential, target, protected-principal, scope, and constraint decision. In one
-transaction it takes the canonical lifecycle/user/actor-state/target locks,
-locks the claimed operation, records the dispatch-time authorization basis, and
-changes `claimed -> executing`. Root grant revocation takes the conflicting
-actor-state lock and cancels that actor's queued/claimed authorization-bound
-operations before committing. Only after the executing transition commits may
-network I/O begin; an executing call may finish after revocation and is
-reconciled.
+target, protected-principal, scope, and constraint decision. Request-time
+credential assurance is fixed when the command is accepted: its validated
+method, subject/session hash, ACR, and `auth_time` remain audit evidence, but a
+worker does not require a still-live browser session or reinterpret elapsed
+queue time as a new command. Logout alone therefore does not cancel accepted
+work; account suspension or grant/target/scope change can.
+
+In one transaction the worker takes the canonical lifecycle/user/actor-state/
+target locks, locks the claimed operation, records the dispatch-time mutable
+authorization basis, and changes `claimed -> executing`. Root grant revocation
+takes the conflicting actor-state lock and cancels that actor's queued/claimed
+authorization-bound operations before committing. Only after the executing
+transition commits may network I/O begin; an executing call may finish after
+revocation and is reconciled.
 
 `state_convergence` work caused by an already committed database decision is a
 different class. User provisioning after approval, for example, rechecks the
@@ -1094,6 +1189,12 @@ success remain possible unless the downstream system supports idempotency;
 workers reconcile rather than claim exactly-once behavior. The explicit states
 are `pending`, `claimed`, `executing`, `retry`, `succeeded`, `failed`, and
 `cancelled`.
+
+Primary references:
+
+- https://www.postgresql.org/docs/current/explicit-locking.html
+- https://docs.aws.amazon.com/prescriptive-guidance/latest/cloud-design-patterns/transactional-outbox.html
+- https://docs.aws.amazon.com/wellarchitected/latest/framework/rel_prevent_interaction_failure_idempotent.html
 
 ## Usage and cost scoping
 
@@ -1131,13 +1232,35 @@ Resolution rules:
 - raw-ledger and closed-day rollup paths consume the same visibility contract
   and have parity tests;
 - the response carries the scope summary, actor grant revision, catalog
-  revision, and evaluation time used for the snapshot;
-- multi-query dashboard reads run in one repeatable-read transaction (or one
-  equivalent SQL statement) so raw, rollup, and dimension results do not
-  describe different database snapshots; the transaction remains writable
-  when its catalog audit policy requires an event before response;
+  revision, evaluation time, rollup revision/watermark, and raw-ledger upper
+  cursor used for the snapshot;
 - organization IDs are denormalized into the audit ledger when M2 lands, as
   already decided in `multi_tenancy.md`.
+
+Raw `usage_events` live in `audit_db`, while `usage_daily`, `rollup_state`, and
+`management_events` live in the app DB. The dashboard therefore must not claim
+a cross-database transaction. Phase 2 extends `rollup_state` with a monotonic
+revision that increments on every full-replace pass, even when
+`last_closed_day` is unchanged, and uses this bounded two-store protocol:
+
+1. In one app-DB repeatable-read transaction, capture rollup revision/watermark
+   and query every closed-period rollup dimension.
+2. In one audit-DB repeatable-read transaction, capture the append-only
+   ledger's upper `usage_events.id` and query every raw interval with
+   `id <= upper_cursor` using the same visibility object.
+3. In a writable app-DB transaction, lock `rollup_state FOR SHARE`, compare its
+   current revision with the captured revision, and retry the whole read if it
+   changed. If it matches, insert the required sensitive-read event carrying
+   both cursors, commit, and only then return the buffered result.
+
+The rollup writer locks `rollup_state FOR UPDATE` before changing `usage_daily`
+and advances the revision in the same transaction, so the final shared lock
+stabilizes the captured read model until audit commits. New immutable ledger
+rows above the upper cursor belong to a later snapshot. Bounded retry
+exhaustion or either database/audit failure returns typed 503 and no data. This
+is a cursor-defined, eventually complete read model—not fictitious distributed
+snapshot isolation—and late closed-day events appear after the next trailing
+re-close pass.
 
 A cost viewer can therefore see aggregate spend for project A without being
 able to open project A's jobs, prompts, or files.
@@ -1162,17 +1285,22 @@ For `capability_grants.manage_user`, the evaluator checks:
 7. both the explicit-row transition and the simulated post-change effective
    capability remain within the operator's ceiling.
 
-That simulation must serialize with every input it reads. Add a singleton
-`capability_policy_state(revision)` synchronization row. User-scope grant
-writes and membership changes take it `FOR SHARE` after the canonical
-management/user locks and then lock the target user's membership and applicable
-grant rows. Project/global grant, application-default, and project-deletion
-writers take it `FOR UPDATE`; every successful writer increments its revision.
+That simulation must serialize with every input it reads. Add a stable
+transaction advisory read/write gate for the capability-policy domain plus a
+singleton `capability_policy_state(broad_epoch)` row. User-scope grant writes
+and single-user membership changes take the shared advisory gate after the
+canonical management/user locks, then lock the target user's membership and
+applicable grant rows; their own audit event/row versions identify the local
+change and they do not update the singleton. Project/global grant,
+application-default, organization-wide membership, and project-deletion
+writers take the exclusive gate and increment `broad_epoch`. No transaction
+upgrades a shared row lock to an update lock.
+
 All existing root routes and DB helpers migrate to these connection-aware
 services before `capability_grants.manage_user` becomes assignable. This keeps
-unrelated user mutations concurrent while preventing a broader grant or
+unrelated single-user mutations concurrent while preventing a broader grant or
 membership change between simulation and commit. The decision and audit event
-record the capability-policy revision used.
+record the broad epoch and exact target rows used.
 
 The final check applies to PUT and DELETE. Capability grants are restrict-only,
 so deleting a narrow user row can fall back to a broader project/global/default
@@ -1198,8 +1326,9 @@ GET /api/manage/context
 It is available to every approved cookie-authenticated human. A regular user
 with no assignments receives a successful empty context rather than 403, with
 synthetic `grant_revision: 0`; this lets guards fail closed without treating
-ordinary users as an error case. A root admin also has grant revision `0` and
-receives root page access only after the current-role check succeeds.
+ordinary users as an error case. A root admin reports its retained grant-state
+revision (or `0` if no row exists) and receives root page access only after the
+current-role check succeeds.
 
 Response shape:
 
@@ -1243,9 +1372,16 @@ expiry, and listens for targeted `management_permissions_changed` and
 `management_scope_changed` SSE notifications. Assignment events carry the new
 grant revision. A greater revision marks state stale, clears page data, and
 causes lower-revision context/page responses to be discarded. At the same
-revision, a later `evaluated_at` may legitimately remove naturally expired
-authority. Catalog revisions are opaque: a mismatch marks the response stale
-and reloads context rather than ordering the revision strings. Scope events
+revision/catalog pair, the service retains the greatest server `evaluated_at`
+watermark and rejects an older response. The nearest-expiry timer is calculated
+relative to server `evaluated_at`; when it fires, the service first increments
+its local generation and clears affected data, then refreshes context. A
+pre-expiry same-revision response therefore cannot repaint after expiry.
+Catalog revisions are opaque: a mismatch marks the response stale and reloads
+context rather than ordering the revision strings. The centrally pinned active
+revision means this can be an in-flight transition, not replica-local policy
+choice; an incompatible replica returns 503. Catalog-change events also
+increment the local generation. Scope events
 increment a client-local generation and clear affected data because grant
 revision does not version memberships; every context and page request captures
 that generation and a response from an older generation is discarded.
@@ -1272,8 +1408,8 @@ Backend checks remain authoritative; `is_operator` is not added to the general
 The current notification feed is process-local and may turn authentication
 failure into an anonymous subscription, so it is not a revocation boundary.
 Phase 1 adds a dedicated authenticated management/account event channel backed
-by a durable Postgres invalidation outbox. Assignment, scope, session, and
-account-state transactions append monotonic events in the same commit. Each
+by a durable Postgres invalidation outbox. Assignment, catalog, scope, session,
+and account-state transactions append monotonic events in the same commit. Each
 orchestrator replica tails the outbox, using transactional `NOTIFY` only as a
 wakeup and polling to recover missed notifications; an optional NATS transport
 may accelerate fan-out but is not the source of correctness.
@@ -1334,7 +1470,9 @@ indicator, and server-derived `allowed_actions`. It excludes VM/root controls,
 included because admission operators must identify registrants; this makes
 `users.read` a PII-bearing permission and its list/export behavior is audited
 at the catalogued level. Suspension requires confirmation/reason, and bulk
-approval visibly reports per-target results. Registration notifications fan
+approval visibly reports per-target results. Pending, approved, and suspended
+are distinct badges/actions; an approve-only operator never sees a restore
+control. Registration notifications fan
 out only to root
 admins and `users.approve` operators whose resolved scope matches the pending
 target, with the minimum PII required and a `/manage/users` deep link.
@@ -1395,14 +1533,16 @@ Record two complementary trails:
 
 Each read permission has a catalogued `audit_mode`. In the initial catalog,
 `users.read`, `capability_grants.read`, and `usage.read` are
-`required_sensitive_read`: the service performs the scoped query and inserts a
-redacted event in the same writable repeatable-read transaction, commits, and
-only then returns data. Audit failure returns a typed 503 and no rows. A future
-`best_effort_read` mode may return data on audit failure only while incrementing
-an alertable metric. Minimal action-precondition projections exposed by a
-mutation permission inherit that permission's required read-audit policy. Read
-events store filters/scope, page or aggregate shape, and result count, never
-returned PII/cost rows themselves.
+`required_sensitive_read`. For app-local data, the service performs the scoped
+query and inserts a redacted event in the same writable repeatable-read
+transaction, commits, and only then returns data. Cross-store usage follows the
+cursor/watermark protocol above and still commits its app-DB audit before
+returning buffered data. Audit failure returns a typed 503 and no rows. A
+future `best_effort_read` mode may return data on audit failure only while
+incrementing an alertable metric. Minimal action-precondition projections
+exposed by a mutation permission inherit that permission's required read-audit
+policy. Read events store filters/scope, page or aggregate shape, result count,
+and relevant snapshot cursors, never returned PII/cost rows themselves.
 
 The `security_events` migration adds structured management metadata (permission,
 scope, target type/id, and safe denial/dependency code, preferably in a bounded
@@ -1484,8 +1624,11 @@ subject, issuer/client, BFF session, required ACR/age, and a short expiry.
 
 Cockpit passes that ID and an allowlisted relative return path to a
 CSRF-protected `POST /api/auth/step-up/start`; the server, not the browser,
-constructs the Keycloak authorization request. The callback performs full OIDC
-validation (signature, issuer, audience/authorized party, expiry/issued-at,
+constructs the Keycloak authorization request. The endpoint does not redirect
+the Fetch-backed XHR; it returns 200 with a server-generated, allowlisted
+`authorization_url`, and Cockpit performs an explicit top-level
+`window.location.assign(...)`. The callback performs full OIDC validation
+(signature, issuer, audience/authorized party, expiry/issued-at,
 state, and nonce), requires the same issuer/client and `sub` as the pre-step-up
 session, validates returned ACR and `auth_time` recency, and only then upgrades
 that same BFF session. The current generic auth interceptor redirects every
@@ -1591,8 +1734,9 @@ all existing PATs operator-capable.
 - Record the chosen permission key beside every delegable endpoint.
 - Make generic user profile mutation self-only and split directory,
   self-profile, and management DTOs.
-- Retire the legacy Keycloak `user`-role approval write-through (or add a
-  durable suspension override) before delegating suspension.
+- Add durable suspension fields/three-state semantics and retire the legacy
+  Keycloak `user`-role approval write-through while preserving current DB
+  admission values for explicit review.
 - Normalize all credential contexts; align cookie/Bearer/internal selection
   with CSRF; reject hybrids/unknowns; harden OIDC audience/authorized-party
   validation before any future direct-bearer management profile.
@@ -1608,6 +1752,8 @@ all existing PATs operator-capable.
   `management_events`, structured denial metadata, and operation/outbox schema.
 - Implement the versioned catalog, pure decision engine, SQL filter plans, and
   transaction-aware mutation service.
+- Add centrally pinned catalog activation, replica support leases/readiness,
+  shadow evaluation, and catalog-change invalidation for rolling deployments.
 - Implement full-set ETag assignment replacement, audit query, production
   evaluator dry run, exact-If-Match/refetch behavior, and revisioned
   expiry/pruning.
@@ -1616,9 +1762,11 @@ all existing PATs operator-capable.
 - Route all existing admission/suspension, user deletion, project deletion,
   scoped-grant cleanup, and operator expiry writers through the shared
   lifecycle services before the first assignment can be activated.
+- Add the reasoned root-only restore action; approval paths reject suspended
+  rows and restoration never revives prior assignments.
 - Add the strict least-privilege Keycloak current/composite-role verifier with
   bounded concurrency, short timeout, readiness, and 503 behavior.
-- Implement `/api/manage/context`, permission-version invalidation, and
+- Implement `/api/manage/context`, grant-revision invalidation, and
   structured problem responses.
 - Add the durable cross-replica management/account invalidation outbox,
   authenticated stream, bounded replay, and server-side connection
@@ -1702,11 +1850,16 @@ For every catalog permission and scope kind:
 - expired assignment denies;
 - constraint boundary passes and one-step-over denies;
 - two partial assignments never merge into one allow;
+- compound membership authorization succeeds with one sufficient grant per leg
+  and retains both bases; a missing/partial leg denies the whole operation;
 - independently valid broad/narrow assignments are additive under the
   documented rule;
 - `internal`/deprecated/unknown catalog entries cannot be assigned or used;
 - catalog revision changes preserve golden decisions or require an explicit
   staged migration;
+- mixed replicas use one DB-pinned catalog revision; activation refuses a
+  missing support lease, waits in-flight old-revision decisions, and an
+  incompatible replica fails management readiness;
 - root admin passes;
 - ordinary user denies;
 - operator remains `is_admin=false`.
@@ -1715,6 +1868,8 @@ For every catalog permission and scope kind:
 
 - operator cannot mutate self;
 - operator cannot mutate DB-known admin;
+- a stale `users.is_admin=true` target remains protected even when a live
+  Keycloak lookup says the role is absent;
 - operator cannot mutate a freshly Keycloak-promoted admin whose DB cache is
   still false;
 - operator cannot mutate another operator;
@@ -1729,6 +1884,11 @@ For every catalog permission and scope kind:
   exercised separately;
 - root suspension revokes operator assignments and reapproval does not revive
   them.
+- operator approval/bulk approval cannot clear a suspension; root restore is
+  reasoned and leaves prior management assignments revoked.
+- root-role promotion revokes prior operator assignments and later demotion
+  does not revive them; stale DB admin state protects but cannot take the new
+  management-route root bypass.
 
 ### Endpoint tests
 
@@ -1737,27 +1897,58 @@ For every catalog permission and scope kind:
 - generic `/api/users` cannot mutate another user or expose management-only
   fields;
 - the legacy Keycloak `user` role cannot undo a suspension;
+- pending/approved/suspended semantics agree across cookie, PAT, MCP, SSE,
+  WebSocket, and internal forwarded-user authentication;
 - operator mutations write a redacted `management_events` row atomically in a
   real-Postgres integration test; audit failure rolls back the mutation;
+- required sensitive-read audit failure returns no user/grant/usage data;
 - denied attempts write `management_denied` best-effort;
 - PAT/MCP/unknown/direct-bearer versions of the same operator deny; admin
   PAT/MCP cannot call root operator APIs;
 - cookie-plus-Bearer and cookie-plus-internal hybrids cannot select the cookie
   identity while bypassing CSRF;
+- step-up rejects wrong state/nonce/issuer/client/sub, stale `auth_time`, or
+  insufficient returned ACR; dev CORS exposes required Location/challenge
+  headers and safe body fields;
 - mixed `is_approved`/VM or unknown fields cannot smuggle a second action;
 - SQL filtering occurs before paging/counting; out-of-scope direct lookups
   follow the repository's deliberate 403/404 disclosure rule;
 - membership writes require both destination and user authority;
+- assignment versus project/user deletion races serialize on the lifecycle
+  lock; cleanup increments every subject revision, audits, and invalidates;
+- legacy root suspension/deletion/cleanup paths use the same lifecycle service;
+- assignment rejects a service principal and does not infer human eligibility
+  from `keycloak_sub` alone;
+- bulk approval rejects zero, duplicate, malformed, and over-100 target sets,
+  bounds live lookups, locks sorted, and commits all or none;
 - usage operator sees only assigned dimensions; empty visibility is never
   fleet-wide and raw/rollup results match;
+- usage snapshot retries when rollup revision changes, excludes ledger rows
+  above its cursor, records both stores' cursors, and returns no data if final
+  app-DB audit cannot commit;
 - cost access does not make `require_job_access` pass;
 - user grant operator cannot write project/global grants, affect privileged
   targets, or DELETE into an effective value above the ceiling;
-- grant-set ETag conflicts cannot lose a concurrent update;
+- an out-of-bound requested list rejects rather than being silently clipped;
+- real-Postgres races prove user-grant simulation serializes with concurrent
+  root project/global/default grant and membership changes;
+- concurrent shared capability-policy users neither deadlock on a row-lock
+  upgrade nor overlap an exclusive broad-policy writer;
+- grant-set ETag conflicts cannot lose a concurrent update; `If-Match: *` is
+  rejected and normalized PUT returns 204/no validator before canonical GET;
 - revocation waits out an older locked DB mutation and later checks deny;
-- external operations reauthorize before dispatch, deduplicate by idempotency
-  key, expose requested/succeeded/failed/cancelled stages, and reconcile an
-  ambiguous worker crash;
+- authorization-bound external operations atomically reauthorize/enter
+  executing against revocation and target promotion, while committed-state
+  convergence survives approver revocation;
+- dispatch rechecks mutable account/grant/target state while preserving the
+  request-time credential/LoA evidence; logout alone does not reinterpret an
+  already accepted command;
+- client retry keys deduplicate only matching fingerprints, conflict on key
+  reuse with different input, propagate downstream, retain their mapping, and
+  reconcile an ambiguous worker crash across every operation state;
+- two orchestrator replicas receive assignment/account invalidations; failed
+  stream auth never becomes anonymous, suspension terminates existing streams,
+  and heartbeat revalidation catches a missed event;
 - endpoint inventory recognizes and snapshots the literal permission key;
 - failed denial logging increments its security metric without changing the
   response.
@@ -1770,8 +1961,12 @@ For every catalog permission and scope kind:
   empty revision-0 regular-user context denies cleanly without a timeout;
 - one assignment exposes only its matching Manage page; partial operators see
   no root-only Admin group;
+- approve-only and suspend-only users pages expose only their actionable target
+  projections; grant-manage-only exposes editor prerequisites but not unrelated
+  grants; all exact `page_access` combinations are covered;
 - scope selectors cannot offer unauthorized targets;
-- operator editor is root-admin-only;
+- candidate/catalog/scope discovery is paginated and operator editor remains
+  root-admin-only;
 - users UI has no VM controls, shows protected-target affordances and batch
   results, and requires suspension reason;
 - grants UI distinguishes read/edit, offers only allowed targets/keys/values,
@@ -1784,10 +1979,15 @@ For every catalog permission and scope kind:
 - protected-target/out-of-scope 403 retains the page, while dependency 503 and
   stale 412 render their distinct non-empty states;
 - the generic 401 interceptor routes a typed step-up challenge through the
-  server-generated continuation, preserves only the bound draft, and never
-  replays the mutation automatically;
+  server-generated continuation URL, performs explicit top-level navigation,
+  preserves only the bound draft, and never follows/replays the mutation as an
+  XHR;
+- successful normalized assignment PUT refetches after 204 before accepting a
+  new ETag;
 - late context, user, grant, and usage responses are all rejected after a
   newer grant revision or scope-generation event;
+- scheduled expiry advances generation before refresh, and an older same-
+  revision `evaluated_at` response cannot repaint cleared data;
 - Angular signal mocks remain callable with `.set()` / `.update()`;
 - both locales pass `npm run i18n:check`, plus explicit template/CSS copy
   review.
@@ -1805,20 +2005,20 @@ Create temporary regular users for these scenarios and remove them afterward:
    privileged or out-of-scope user.
 4. **Revocation:** with one mutation intentionally held under the old revision,
    root revocation waits for it, then the operator's next request returns 403;
-   an open Cockpit session clears data/navigation without re-login.
+   an open Cockpit session on a second orchestrator replica clears data/
+   navigation without re-login.
 5. **Audit:** every successful action and assignment change is queryable with
-   actor, target, matched grant/revisions, scope, reason, and redacted
-   before/after state.
+   actor, target, all authorization legs/grants/revisions/scopes, reason, and
+   redacted before/after state.
 
 ## Open questions
 
 1. **Team timing.** Does the first customer needing cohort-scoped user
    management justify an app-side `teams` table before full M2, or should the
    feature ship with global/user/project scopes until organizations land?
-2. **Step-up deployment mapping.** Which Keycloak ACR values represent SRW's
-   required assurance levels in each deployment, and should a high-risk action
-   be disabled or fall back to fresh password authentication where no stronger
-   LoA flow is configured? It must never silently downgrade to no step-up.
+2. **Step-up deployment mapping.** Which exact Keycloak ACR values represent
+   SRW's required assurance levels in each deployment? A high-risk action stays
+   disabled until that mapping passes readiness; it never silently downgrades.
 3. **Project capability grants.** Should delegation remain permanently root-
    only, deny when any privileged principal is affected, or gain an explicit
    exclusion/provenance model?
@@ -1830,30 +2030,41 @@ Create temporary regular users for these scenarios and remove them afterward:
 
 ## Acceptance criteria
 
-- [ ] A root admin can assign/revoke explicit management permissions and scopes
-      as one ETag-protected set without changing a Keycloak role.
+- [ ] A current, step-up-authenticated root admin can assign/revoke explicit
+      management permissions and scopes as one exact-If-Match set without
+      changing a Keycloak role; normalized PUT refetches its canonical ETag.
 - [ ] An assigned user remains `is_admin=false` and gains no implicit content
       access.
+- [ ] Only a durably classified, approved non-admin human can receive an
+      assignment; service principals and ambiguous identities are rejected.
 - [ ] Generic user routes are self/directory scoped, the legacy approval
-      write-through cannot undo suspension, and credential/CSRF selection is
-      normalized before delegated mutations are enabled.
+      write-through is retired, pending/approved/suspended are durable and
+      consistent across auth paths, and credential/CSRF selection is normalized
+      before delegated mutations are enabled.
 - [ ] User, grant, and usage workflows enforce action plus scope server-side.
 - [ ] Operators cannot mutate themselves, admins, or other operators.
 - [ ] One complete assignment authorizes each required leg; constraints from
       separate assignments never merge within a leg, and membership writes
       retain successful authorization legs for both objects.
 - [ ] Capability-grant delegation is limited to explicit keys/value ceilings and
-      regular-user scopes, including simulated effective values after DELETE.
+      regular-user scopes, including serialized simulated effective values
+      after DELETE and concurrent broader-policy/membership writes.
 - [ ] PAT/MCP/direct-bearer/unknown/hybrid credentials do not inherit delegated
       management authority; high-risk actions enforce catalogued step-up.
 - [ ] A successful revocation waits out older locked Postgres mutations and all
       later checks observe the new revision without token refresh.
+- [ ] Scope deletion, expiry, and every legacy lifecycle writer use the same
+      lock/revision/audit/invalidation protocol before the first operator ships.
 - [ ] Successful Postgres mutations and audit records are atomic and queryable;
-      external effects use durable, idempotent/reconcilable operation stages.
+      required sensitive reads return no data if their audit cannot commit.
+- [ ] Authorization-bound external work crosses into `executing` atomically
+      against revocation, while committed-state convergence remains durable;
+      client retries are fingerprinted/idempotent and reconcilable.
 - [ ] Denials appear in `security_events` without turning audit failure into a
       different response, and audit failures are observable.
 - [ ] Cockpit navigation and routes reflect effective permissions but are never
-      the sole enforcement layer; revocation clears open page data.
+      the sole enforcement layer; durable cross-replica revocation/suspension
+      events clear data and terminate affected server connections.
 - [ ] Scoped usage raw/rollup queries agree and an empty visibility set cannot
       become a fleet-wide query.
 - [ ] Existing admins and ordinary users retain supported product workflows
@@ -1868,7 +2079,8 @@ Create temporary regular users for these scenarios and remove them afterward:
 - `orchestrator/security/csrf.py` and `orchestrator/security/oidc.py` — hybrid
   credential precedence and direct-token audience/authorized-party validation.
 - `orchestrator/security/access.py` — content/resource gates and admin bypasses.
-- `orchestrator/main.py` — `_require_admin`, users, grants, and usage endpoints.
+- `orchestrator/main.py` — `_require_admin`, users, grants, usage endpoints, and
+  CORS exposed-header configuration.
 - new `orchestrator/routers/management.py` and `admin_operators.py` — thin
   delegable/root enforcement points rather than more growth in `main.py`.
 - `orchestrator/services/grants_service.py` and
@@ -1882,8 +2094,13 @@ Create temporary regular users for these scenarios and remove them afterward:
   management visibility and raw/rollup parity.
 - `orchestrator/services/notification_service.py` — scope-matched registration
   notifications and management deep links.
+- `orchestrator/services/notification_feed.py` — existing process-local feed;
+  do not use its anonymous fallback as the management/account revocation path.
+- new durable invalidation outbox/tailer — cross-replica management, scope,
+  session, and account-state events plus local stream termination.
 - `orchestrator/database/postgres.py` — connection-aware authorization,
-  mutation, cleanup, revision, operation, and audit methods.
+  mutation, lifecycle/capability-policy locks, cleanup, revision, operation,
+  and audit methods.
 - `orchestrator/database/migrations/app/` — new schema; do not edit schema
   snapshots.
 - `cockpit/src/app/app.config.ts`, `app.routes.ts`, and

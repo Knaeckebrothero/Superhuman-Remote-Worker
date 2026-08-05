@@ -3474,7 +3474,9 @@ export class PersistentChatService {
                     this.toast.dismiss(this.cloudSyncDegradedToastId);
                     this.cloudSyncDegradedToastId = null;
                 }
-                this.toast.success('Cloud sync is now running for this session.');
+                this.toast.success(
+                    this.transloco.translate('toasts.sessions.cloudSyncRecovered'),
+                );
                 break;
             }
 

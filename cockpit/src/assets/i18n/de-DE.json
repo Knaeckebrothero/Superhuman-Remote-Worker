@@ -2949,6 +2949,9 @@
     },
     "ide": {
       "stopped": "IDE-Sitzung beendet"
+    },
+    "sessions": {
+      "cloudSyncRecovered": "Die Cloud-Synchronisierung läuft jetzt für diese Sitzung."
     }
   },
   "pwa": {

@@ -15,6 +15,14 @@
 --   * Monthly audit partition children beyond the migration-seeded ones —
 --     created at runtime by services/audit_partitions.py
 --     (CREATE TABLE ... (LIKE parent)) as time advances.
+--
+-- The monthly partitions below are named _p1970_01, _p1970_02, ... and bounded
+-- on 1970 dates. Those months are SYNTHETIC. The migrations seed them relative to
+-- now() (current month + 2 lookahead), so a literal dump would rename every
+-- leaf on the 1st of each month and report schema drift where none exists; the
+-- snapshot rewrites the rolling window onto a fixed epoch instead. Real
+-- databases carry the actual months. Only the count, bounds width, storage
+-- params, indexes and constraints of these leaves are meaningful here.
 -- ==============================================================================
 
 --
@@ -126,10 +134,10 @@ ALTER SEQUENCE public.agent_audit_id_seq OWNED BY public.agent_audit.id;
 SET default_table_access_method = heap;
 
 --
--- Name: agent_audit_p2026_07; Type: TABLE; Schema: public; Owner: -
+-- Name: agent_audit_p1970_01; Type: TABLE; Schema: public; Owner: -
 --
 
-CREATE TABLE public.agent_audit_p2026_07 (
+CREATE TABLE public.agent_audit_p1970_01 (
     id bigint DEFAULT nextval('public.agent_audit_id_seq'::regclass) NOT NULL,
     job_id uuid NOT NULL,
     agent_type text,
@@ -149,15 +157,15 @@ CREATE TABLE public.agent_audit_p2026_07 (
     CONSTRAINT agent_audit_pre_id_check CHECK (((event_phase = 'pre'::text) = (pre_id IS NULL)))
 )
 WITH (fillfactor='100', autovacuum_vacuum_insert_scale_factor='0.05', autovacuum_vacuum_insert_threshold='10000', autovacuum_analyze_scale_factor='0.02', autovacuum_freeze_min_age='0');
-ALTER TABLE ONLY public.agent_audit_p2026_07 ALTER COLUMN payload SET COMPRESSION lz4;
-ALTER TABLE ONLY public.agent_audit_p2026_07 ALTER COLUMN metadata SET COMPRESSION lz4;
+ALTER TABLE ONLY public.agent_audit_p1970_01 ALTER COLUMN payload SET COMPRESSION lz4;
+ALTER TABLE ONLY public.agent_audit_p1970_01 ALTER COLUMN metadata SET COMPRESSION lz4;
 
 
 --
--- Name: agent_audit_p2026_08; Type: TABLE; Schema: public; Owner: -
+-- Name: agent_audit_p1970_02; Type: TABLE; Schema: public; Owner: -
 --
 
-CREATE TABLE public.agent_audit_p2026_08 (
+CREATE TABLE public.agent_audit_p1970_02 (
     id bigint DEFAULT nextval('public.agent_audit_id_seq'::regclass) NOT NULL,
     job_id uuid NOT NULL,
     agent_type text,
@@ -177,15 +185,15 @@ CREATE TABLE public.agent_audit_p2026_08 (
     CONSTRAINT agent_audit_pre_id_check CHECK (((event_phase = 'pre'::text) = (pre_id IS NULL)))
 )
 WITH (fillfactor='100', autovacuum_vacuum_insert_scale_factor='0.05', autovacuum_vacuum_insert_threshold='10000', autovacuum_analyze_scale_factor='0.02', autovacuum_freeze_min_age='0');
-ALTER TABLE ONLY public.agent_audit_p2026_08 ALTER COLUMN payload SET COMPRESSION lz4;
-ALTER TABLE ONLY public.agent_audit_p2026_08 ALTER COLUMN metadata SET COMPRESSION lz4;
+ALTER TABLE ONLY public.agent_audit_p1970_02 ALTER COLUMN payload SET COMPRESSION lz4;
+ALTER TABLE ONLY public.agent_audit_p1970_02 ALTER COLUMN metadata SET COMPRESSION lz4;
 
 
 --
--- Name: agent_audit_p2026_09; Type: TABLE; Schema: public; Owner: -
+-- Name: agent_audit_p1970_03; Type: TABLE; Schema: public; Owner: -
 --
 
-CREATE TABLE public.agent_audit_p2026_09 (
+CREATE TABLE public.agent_audit_p1970_03 (
     id bigint DEFAULT nextval('public.agent_audit_id_seq'::regclass) NOT NULL,
     job_id uuid NOT NULL,
     agent_type text,
@@ -205,8 +213,8 @@ CREATE TABLE public.agent_audit_p2026_09 (
     CONSTRAINT agent_audit_pre_id_check CHECK (((event_phase = 'pre'::text) = (pre_id IS NULL)))
 )
 WITH (fillfactor='100', autovacuum_vacuum_insert_scale_factor='0.05', autovacuum_vacuum_insert_threshold='10000', autovacuum_analyze_scale_factor='0.02', autovacuum_freeze_min_age='0');
-ALTER TABLE ONLY public.agent_audit_p2026_09 ALTER COLUMN payload SET COMPRESSION lz4;
-ALTER TABLE ONLY public.agent_audit_p2026_09 ALTER COLUMN metadata SET COMPRESSION lz4;
+ALTER TABLE ONLY public.agent_audit_p1970_03 ALTER COLUMN payload SET COMPRESSION lz4;
+ALTER TABLE ONLY public.agent_audit_p1970_03 ALTER COLUMN metadata SET COMPRESSION lz4;
 
 
 --
@@ -289,10 +297,10 @@ ALTER SEQUENCE public.chat_history_id_seq OWNED BY public.chat_history.id;
 
 
 --
--- Name: chat_history_p2026_07; Type: TABLE; Schema: public; Owner: -
+-- Name: chat_history_p1970_01; Type: TABLE; Schema: public; Owner: -
 --
 
-CREATE TABLE public.chat_history_p2026_07 (
+CREATE TABLE public.chat_history_p1970_01 (
     id bigint DEFAULT nextval('public.chat_history_id_seq'::regclass) NOT NULL,
     job_id uuid NOT NULL,
     agent_type text,
@@ -308,16 +316,16 @@ CREATE TABLE public.chat_history_p2026_07 (
     reasoning jsonb
 )
 WITH (fillfactor='100', autovacuum_vacuum_insert_scale_factor='0.05', autovacuum_vacuum_insert_threshold='10000', autovacuum_analyze_scale_factor='0.02', autovacuum_freeze_min_age='0');
-ALTER TABLE ONLY public.chat_history_p2026_07 ALTER COLUMN inputs SET COMPRESSION lz4;
-ALTER TABLE ONLY public.chat_history_p2026_07 ALTER COLUMN response SET COMPRESSION lz4;
-ALTER TABLE ONLY public.chat_history_p2026_07 ALTER COLUMN reasoning SET COMPRESSION lz4;
+ALTER TABLE ONLY public.chat_history_p1970_01 ALTER COLUMN inputs SET COMPRESSION lz4;
+ALTER TABLE ONLY public.chat_history_p1970_01 ALTER COLUMN response SET COMPRESSION lz4;
+ALTER TABLE ONLY public.chat_history_p1970_01 ALTER COLUMN reasoning SET COMPRESSION lz4;
 
 
 --
--- Name: chat_history_p2026_08; Type: TABLE; Schema: public; Owner: -
+-- Name: chat_history_p1970_02; Type: TABLE; Schema: public; Owner: -
 --
 
-CREATE TABLE public.chat_history_p2026_08 (
+CREATE TABLE public.chat_history_p1970_02 (
     id bigint DEFAULT nextval('public.chat_history_id_seq'::regclass) NOT NULL,
     job_id uuid NOT NULL,
     agent_type text,
@@ -333,16 +341,16 @@ CREATE TABLE public.chat_history_p2026_08 (
     reasoning jsonb
 )
 WITH (fillfactor='100', autovacuum_vacuum_insert_scale_factor='0.05', autovacuum_vacuum_insert_threshold='10000', autovacuum_analyze_scale_factor='0.02', autovacuum_freeze_min_age='0');
-ALTER TABLE ONLY public.chat_history_p2026_08 ALTER COLUMN inputs SET COMPRESSION lz4;
-ALTER TABLE ONLY public.chat_history_p2026_08 ALTER COLUMN response SET COMPRESSION lz4;
-ALTER TABLE ONLY public.chat_history_p2026_08 ALTER COLUMN reasoning SET COMPRESSION lz4;
+ALTER TABLE ONLY public.chat_history_p1970_02 ALTER COLUMN inputs SET COMPRESSION lz4;
+ALTER TABLE ONLY public.chat_history_p1970_02 ALTER COLUMN response SET COMPRESSION lz4;
+ALTER TABLE ONLY public.chat_history_p1970_02 ALTER COLUMN reasoning SET COMPRESSION lz4;
 
 
 --
--- Name: chat_history_p2026_09; Type: TABLE; Schema: public; Owner: -
+-- Name: chat_history_p1970_03; Type: TABLE; Schema: public; Owner: -
 --
 
-CREATE TABLE public.chat_history_p2026_09 (
+CREATE TABLE public.chat_history_p1970_03 (
     id bigint DEFAULT nextval('public.chat_history_id_seq'::regclass) NOT NULL,
     job_id uuid NOT NULL,
     agent_type text,
@@ -358,9 +366,9 @@ CREATE TABLE public.chat_history_p2026_09 (
     reasoning jsonb
 )
 WITH (fillfactor='100', autovacuum_vacuum_insert_scale_factor='0.05', autovacuum_vacuum_insert_threshold='10000', autovacuum_analyze_scale_factor='0.02', autovacuum_freeze_min_age='0');
-ALTER TABLE ONLY public.chat_history_p2026_09 ALTER COLUMN inputs SET COMPRESSION lz4;
-ALTER TABLE ONLY public.chat_history_p2026_09 ALTER COLUMN response SET COMPRESSION lz4;
-ALTER TABLE ONLY public.chat_history_p2026_09 ALTER COLUMN reasoning SET COMPRESSION lz4;
+ALTER TABLE ONLY public.chat_history_p1970_03 ALTER COLUMN inputs SET COMPRESSION lz4;
+ALTER TABLE ONLY public.chat_history_p1970_03 ALTER COLUMN response SET COMPRESSION lz4;
+ALTER TABLE ONLY public.chat_history_p1970_03 ALTER COLUMN reasoning SET COMPRESSION lz4;
 
 
 --
@@ -452,10 +460,10 @@ ALTER SEQUENCE public.llm_requests_id_seq OWNED BY public.llm_requests.id;
 
 
 --
--- Name: llm_requests_p2026_07; Type: TABLE; Schema: public; Owner: -
+-- Name: llm_requests_p1970_01; Type: TABLE; Schema: public; Owner: -
 --
 
-CREATE TABLE public.llm_requests_p2026_07 (
+CREATE TABLE public.llm_requests_p1970_01 (
     id bigint DEFAULT nextval('public.llm_requests_id_seq'::regclass) NOT NULL,
     job_id uuid NOT NULL,
     agent_type text,
@@ -471,18 +479,18 @@ CREATE TABLE public.llm_requests_p2026_07 (
     metrics jsonb DEFAULT '{}'::jsonb NOT NULL
 )
 WITH (fillfactor='100', autovacuum_vacuum_insert_scale_factor='0.05', autovacuum_vacuum_insert_threshold='10000', autovacuum_analyze_scale_factor='0.02', autovacuum_freeze_min_age='0');
-ALTER TABLE ONLY public.llm_requests_p2026_07 ALTER COLUMN request SET COMPRESSION lz4;
-ALTER TABLE ONLY public.llm_requests_p2026_07 ALTER COLUMN response SET COMPRESSION lz4;
-ALTER TABLE ONLY public.llm_requests_p2026_07 ALTER COLUMN metadata SET COMPRESSION lz4;
-ALTER TABLE ONLY public.llm_requests_p2026_07 ALTER COLUMN auxiliary_metadata SET COMPRESSION lz4;
-ALTER TABLE ONLY public.llm_requests_p2026_07 ALTER COLUMN metrics SET COMPRESSION lz4;
+ALTER TABLE ONLY public.llm_requests_p1970_01 ALTER COLUMN request SET COMPRESSION lz4;
+ALTER TABLE ONLY public.llm_requests_p1970_01 ALTER COLUMN response SET COMPRESSION lz4;
+ALTER TABLE ONLY public.llm_requests_p1970_01 ALTER COLUMN metadata SET COMPRESSION lz4;
+ALTER TABLE ONLY public.llm_requests_p1970_01 ALTER COLUMN auxiliary_metadata SET COMPRESSION lz4;
+ALTER TABLE ONLY public.llm_requests_p1970_01 ALTER COLUMN metrics SET COMPRESSION lz4;
 
 
 --
--- Name: llm_requests_p2026_08; Type: TABLE; Schema: public; Owner: -
+-- Name: llm_requests_p1970_02; Type: TABLE; Schema: public; Owner: -
 --
 
-CREATE TABLE public.llm_requests_p2026_08 (
+CREATE TABLE public.llm_requests_p1970_02 (
     id bigint DEFAULT nextval('public.llm_requests_id_seq'::regclass) NOT NULL,
     job_id uuid NOT NULL,
     agent_type text,
@@ -498,18 +506,18 @@ CREATE TABLE public.llm_requests_p2026_08 (
     metrics jsonb DEFAULT '{}'::jsonb NOT NULL
 )
 WITH (fillfactor='100', autovacuum_vacuum_insert_scale_factor='0.05', autovacuum_vacuum_insert_threshold='10000', autovacuum_analyze_scale_factor='0.02', autovacuum_freeze_min_age='0');
-ALTER TABLE ONLY public.llm_requests_p2026_08 ALTER COLUMN request SET COMPRESSION lz4;
-ALTER TABLE ONLY public.llm_requests_p2026_08 ALTER COLUMN response SET COMPRESSION lz4;
-ALTER TABLE ONLY public.llm_requests_p2026_08 ALTER COLUMN metadata SET COMPRESSION lz4;
-ALTER TABLE ONLY public.llm_requests_p2026_08 ALTER COLUMN auxiliary_metadata SET COMPRESSION lz4;
-ALTER TABLE ONLY public.llm_requests_p2026_08 ALTER COLUMN metrics SET COMPRESSION lz4;
+ALTER TABLE ONLY public.llm_requests_p1970_02 ALTER COLUMN request SET COMPRESSION lz4;
+ALTER TABLE ONLY public.llm_requests_p1970_02 ALTER COLUMN response SET COMPRESSION lz4;
+ALTER TABLE ONLY public.llm_requests_p1970_02 ALTER COLUMN metadata SET COMPRESSION lz4;
+ALTER TABLE ONLY public.llm_requests_p1970_02 ALTER COLUMN auxiliary_metadata SET COMPRESSION lz4;
+ALTER TABLE ONLY public.llm_requests_p1970_02 ALTER COLUMN metrics SET COMPRESSION lz4;
 
 
 --
--- Name: llm_requests_p2026_09; Type: TABLE; Schema: public; Owner: -
+-- Name: llm_requests_p1970_03; Type: TABLE; Schema: public; Owner: -
 --
 
-CREATE TABLE public.llm_requests_p2026_09 (
+CREATE TABLE public.llm_requests_p1970_03 (
     id bigint DEFAULT nextval('public.llm_requests_id_seq'::regclass) NOT NULL,
     job_id uuid NOT NULL,
     agent_type text,
@@ -525,11 +533,11 @@ CREATE TABLE public.llm_requests_p2026_09 (
     metrics jsonb DEFAULT '{}'::jsonb NOT NULL
 )
 WITH (fillfactor='100', autovacuum_vacuum_insert_scale_factor='0.05', autovacuum_vacuum_insert_threshold='10000', autovacuum_analyze_scale_factor='0.02', autovacuum_freeze_min_age='0');
-ALTER TABLE ONLY public.llm_requests_p2026_09 ALTER COLUMN request SET COMPRESSION lz4;
-ALTER TABLE ONLY public.llm_requests_p2026_09 ALTER COLUMN response SET COMPRESSION lz4;
-ALTER TABLE ONLY public.llm_requests_p2026_09 ALTER COLUMN metadata SET COMPRESSION lz4;
-ALTER TABLE ONLY public.llm_requests_p2026_09 ALTER COLUMN auxiliary_metadata SET COMPRESSION lz4;
-ALTER TABLE ONLY public.llm_requests_p2026_09 ALTER COLUMN metrics SET COMPRESSION lz4;
+ALTER TABLE ONLY public.llm_requests_p1970_03 ALTER COLUMN request SET COMPRESSION lz4;
+ALTER TABLE ONLY public.llm_requests_p1970_03 ALTER COLUMN response SET COMPRESSION lz4;
+ALTER TABLE ONLY public.llm_requests_p1970_03 ALTER COLUMN metadata SET COMPRESSION lz4;
+ALTER TABLE ONLY public.llm_requests_p1970_03 ALTER COLUMN auxiliary_metadata SET COMPRESSION lz4;
+ALTER TABLE ONLY public.llm_requests_p1970_03 ALTER COLUMN metrics SET COMPRESSION lz4;
 
 
 --
@@ -641,10 +649,10 @@ ALTER SEQUENCE public.usage_events_id_seq OWNED BY public.usage_events.id;
 
 
 --
--- Name: usage_events_p2026_07; Type: TABLE; Schema: public; Owner: -
+-- Name: usage_events_p1970_01; Type: TABLE; Schema: public; Owner: -
 --
 
-CREATE TABLE public.usage_events_p2026_07 (
+CREATE TABLE public.usage_events_p1970_01 (
     id bigint DEFAULT nextval('public.usage_events_id_seq'::regclass) NOT NULL,
     ts timestamp with time zone DEFAULT now() NOT NULL,
     user_id uuid,
@@ -662,14 +670,14 @@ CREATE TABLE public.usage_events_p2026_07 (
     details jsonb DEFAULT '{}'::jsonb NOT NULL
 )
 WITH (fillfactor='100', autovacuum_vacuum_insert_scale_factor='0.05', autovacuum_vacuum_insert_threshold='10000', autovacuum_analyze_scale_factor='0.02', autovacuum_freeze_min_age='0');
-ALTER TABLE ONLY public.usage_events_p2026_07 ALTER COLUMN details SET COMPRESSION lz4;
+ALTER TABLE ONLY public.usage_events_p1970_01 ALTER COLUMN details SET COMPRESSION lz4;
 
 
 --
--- Name: usage_events_p2026_08; Type: TABLE; Schema: public; Owner: -
+-- Name: usage_events_p1970_02; Type: TABLE; Schema: public; Owner: -
 --
 
-CREATE TABLE public.usage_events_p2026_08 (
+CREATE TABLE public.usage_events_p1970_02 (
     id bigint DEFAULT nextval('public.usage_events_id_seq'::regclass) NOT NULL,
     ts timestamp with time zone DEFAULT now() NOT NULL,
     user_id uuid,
@@ -687,14 +695,14 @@ CREATE TABLE public.usage_events_p2026_08 (
     details jsonb DEFAULT '{}'::jsonb NOT NULL
 )
 WITH (fillfactor='100', autovacuum_vacuum_insert_scale_factor='0.05', autovacuum_vacuum_insert_threshold='10000', autovacuum_analyze_scale_factor='0.02', autovacuum_freeze_min_age='0');
-ALTER TABLE ONLY public.usage_events_p2026_08 ALTER COLUMN details SET COMPRESSION lz4;
+ALTER TABLE ONLY public.usage_events_p1970_02 ALTER COLUMN details SET COMPRESSION lz4;
 
 
 --
--- Name: usage_events_p2026_09; Type: TABLE; Schema: public; Owner: -
+-- Name: usage_events_p1970_03; Type: TABLE; Schema: public; Owner: -
 --
 
-CREATE TABLE public.usage_events_p2026_09 (
+CREATE TABLE public.usage_events_p1970_03 (
     id bigint DEFAULT nextval('public.usage_events_id_seq'::regclass) NOT NULL,
     ts timestamp with time zone DEFAULT now() NOT NULL,
     user_id uuid,
@@ -712,91 +720,91 @@ CREATE TABLE public.usage_events_p2026_09 (
     details jsonb DEFAULT '{}'::jsonb NOT NULL
 )
 WITH (fillfactor='100', autovacuum_vacuum_insert_scale_factor='0.05', autovacuum_vacuum_insert_threshold='10000', autovacuum_analyze_scale_factor='0.02', autovacuum_freeze_min_age='0');
-ALTER TABLE ONLY public.usage_events_p2026_09 ALTER COLUMN details SET COMPRESSION lz4;
+ALTER TABLE ONLY public.usage_events_p1970_03 ALTER COLUMN details SET COMPRESSION lz4;
 
 
 --
--- Name: agent_audit_p2026_07; Type: TABLE ATTACH; Schema: public; Owner: -
+-- Name: agent_audit_p1970_01; Type: TABLE ATTACH; Schema: public; Owner: -
 --
 
-ALTER TABLE ONLY public.agent_audit ATTACH PARTITION public.agent_audit_p2026_07 FOR VALUES FROM ('2026-07-01 00:00:00+00') TO ('2026-08-01 00:00:00+00');
-
-
---
--- Name: agent_audit_p2026_08; Type: TABLE ATTACH; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.agent_audit ATTACH PARTITION public.agent_audit_p2026_08 FOR VALUES FROM ('2026-08-01 00:00:00+00') TO ('2026-09-01 00:00:00+00');
+ALTER TABLE ONLY public.agent_audit ATTACH PARTITION public.agent_audit_p1970_01 FOR VALUES FROM ('1970-01-01 00:00:00+00') TO ('1970-02-01 00:00:00+00');
 
 
 --
--- Name: agent_audit_p2026_09; Type: TABLE ATTACH; Schema: public; Owner: -
+-- Name: agent_audit_p1970_02; Type: TABLE ATTACH; Schema: public; Owner: -
 --
 
-ALTER TABLE ONLY public.agent_audit ATTACH PARTITION public.agent_audit_p2026_09 FOR VALUES FROM ('2026-09-01 00:00:00+00') TO ('2026-10-01 00:00:00+00');
-
-
---
--- Name: chat_history_p2026_07; Type: TABLE ATTACH; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.chat_history ATTACH PARTITION public.chat_history_p2026_07 FOR VALUES FROM ('2026-07-01 00:00:00+00') TO ('2026-08-01 00:00:00+00');
+ALTER TABLE ONLY public.agent_audit ATTACH PARTITION public.agent_audit_p1970_02 FOR VALUES FROM ('1970-02-01 00:00:00+00') TO ('1970-03-01 00:00:00+00');
 
 
 --
--- Name: chat_history_p2026_08; Type: TABLE ATTACH; Schema: public; Owner: -
+-- Name: agent_audit_p1970_03; Type: TABLE ATTACH; Schema: public; Owner: -
 --
 
-ALTER TABLE ONLY public.chat_history ATTACH PARTITION public.chat_history_p2026_08 FOR VALUES FROM ('2026-08-01 00:00:00+00') TO ('2026-09-01 00:00:00+00');
-
-
---
--- Name: chat_history_p2026_09; Type: TABLE ATTACH; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.chat_history ATTACH PARTITION public.chat_history_p2026_09 FOR VALUES FROM ('2026-09-01 00:00:00+00') TO ('2026-10-01 00:00:00+00');
+ALTER TABLE ONLY public.agent_audit ATTACH PARTITION public.agent_audit_p1970_03 FOR VALUES FROM ('1970-03-01 00:00:00+00') TO ('1970-04-01 00:00:00+00');
 
 
 --
--- Name: llm_requests_p2026_07; Type: TABLE ATTACH; Schema: public; Owner: -
+-- Name: chat_history_p1970_01; Type: TABLE ATTACH; Schema: public; Owner: -
 --
 
-ALTER TABLE ONLY public.llm_requests ATTACH PARTITION public.llm_requests_p2026_07 FOR VALUES FROM ('2026-07-01 00:00:00+00') TO ('2026-08-01 00:00:00+00');
-
-
---
--- Name: llm_requests_p2026_08; Type: TABLE ATTACH; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.llm_requests ATTACH PARTITION public.llm_requests_p2026_08 FOR VALUES FROM ('2026-08-01 00:00:00+00') TO ('2026-09-01 00:00:00+00');
+ALTER TABLE ONLY public.chat_history ATTACH PARTITION public.chat_history_p1970_01 FOR VALUES FROM ('1970-01-01 00:00:00+00') TO ('1970-02-01 00:00:00+00');
 
 
 --
--- Name: llm_requests_p2026_09; Type: TABLE ATTACH; Schema: public; Owner: -
+-- Name: chat_history_p1970_02; Type: TABLE ATTACH; Schema: public; Owner: -
 --
 
-ALTER TABLE ONLY public.llm_requests ATTACH PARTITION public.llm_requests_p2026_09 FOR VALUES FROM ('2026-09-01 00:00:00+00') TO ('2026-10-01 00:00:00+00');
-
-
---
--- Name: usage_events_p2026_07; Type: TABLE ATTACH; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.usage_events ATTACH PARTITION public.usage_events_p2026_07 FOR VALUES FROM ('2026-07-01 00:00:00+00') TO ('2026-08-01 00:00:00+00');
+ALTER TABLE ONLY public.chat_history ATTACH PARTITION public.chat_history_p1970_02 FOR VALUES FROM ('1970-02-01 00:00:00+00') TO ('1970-03-01 00:00:00+00');
 
 
 --
--- Name: usage_events_p2026_08; Type: TABLE ATTACH; Schema: public; Owner: -
+-- Name: chat_history_p1970_03; Type: TABLE ATTACH; Schema: public; Owner: -
 --
 
-ALTER TABLE ONLY public.usage_events ATTACH PARTITION public.usage_events_p2026_08 FOR VALUES FROM ('2026-08-01 00:00:00+00') TO ('2026-09-01 00:00:00+00');
+ALTER TABLE ONLY public.chat_history ATTACH PARTITION public.chat_history_p1970_03 FOR VALUES FROM ('1970-03-01 00:00:00+00') TO ('1970-04-01 00:00:00+00');
 
 
 --
--- Name: usage_events_p2026_09; Type: TABLE ATTACH; Schema: public; Owner: -
+-- Name: llm_requests_p1970_01; Type: TABLE ATTACH; Schema: public; Owner: -
 --
 
-ALTER TABLE ONLY public.usage_events ATTACH PARTITION public.usage_events_p2026_09 FOR VALUES FROM ('2026-09-01 00:00:00+00') TO ('2026-10-01 00:00:00+00');
+ALTER TABLE ONLY public.llm_requests ATTACH PARTITION public.llm_requests_p1970_01 FOR VALUES FROM ('1970-01-01 00:00:00+00') TO ('1970-02-01 00:00:00+00');
+
+
+--
+-- Name: llm_requests_p1970_02; Type: TABLE ATTACH; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.llm_requests ATTACH PARTITION public.llm_requests_p1970_02 FOR VALUES FROM ('1970-02-01 00:00:00+00') TO ('1970-03-01 00:00:00+00');
+
+
+--
+-- Name: llm_requests_p1970_03; Type: TABLE ATTACH; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.llm_requests ATTACH PARTITION public.llm_requests_p1970_03 FOR VALUES FROM ('1970-03-01 00:00:00+00') TO ('1970-04-01 00:00:00+00');
+
+
+--
+-- Name: usage_events_p1970_01; Type: TABLE ATTACH; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.usage_events ATTACH PARTITION public.usage_events_p1970_01 FOR VALUES FROM ('1970-01-01 00:00:00+00') TO ('1970-02-01 00:00:00+00');
+
+
+--
+-- Name: usage_events_p1970_02; Type: TABLE ATTACH; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.usage_events ATTACH PARTITION public.usage_events_p1970_02 FOR VALUES FROM ('1970-02-01 00:00:00+00') TO ('1970-03-01 00:00:00+00');
+
+
+--
+-- Name: usage_events_p1970_03; Type: TABLE ATTACH; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.usage_events ATTACH PARTITION public.usage_events_p1970_03 FOR VALUES FROM ('1970-03-01 00:00:00+00') TO ('1970-04-01 00:00:00+00');
 
 
 --
@@ -836,27 +844,27 @@ ALTER TABLE ONLY public.agent_audit
 
 
 --
--- Name: agent_audit_p2026_07 agent_audit_p2026_07_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+-- Name: agent_audit_p1970_01 agent_audit_p1970_01_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
-ALTER TABLE ONLY public.agent_audit_p2026_07
-    ADD CONSTRAINT agent_audit_p2026_07_pkey PRIMARY KEY (id, "timestamp");
-
-
---
--- Name: agent_audit_p2026_08 agent_audit_p2026_08_pkey; Type: CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.agent_audit_p2026_08
-    ADD CONSTRAINT agent_audit_p2026_08_pkey PRIMARY KEY (id, "timestamp");
+ALTER TABLE ONLY public.agent_audit_p1970_01
+    ADD CONSTRAINT agent_audit_p1970_01_pkey PRIMARY KEY (id, "timestamp");
 
 
 --
--- Name: agent_audit_p2026_09 agent_audit_p2026_09_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+-- Name: agent_audit_p1970_02 agent_audit_p1970_02_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
-ALTER TABLE ONLY public.agent_audit_p2026_09
-    ADD CONSTRAINT agent_audit_p2026_09_pkey PRIMARY KEY (id, "timestamp");
+ALTER TABLE ONLY public.agent_audit_p1970_02
+    ADD CONSTRAINT agent_audit_p1970_02_pkey PRIMARY KEY (id, "timestamp");
+
+
+--
+-- Name: agent_audit_p1970_03 agent_audit_p1970_03_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.agent_audit_p1970_03
+    ADD CONSTRAINT agent_audit_p1970_03_pkey PRIMARY KEY (id, "timestamp");
 
 
 --
@@ -868,27 +876,27 @@ ALTER TABLE ONLY public.chat_history
 
 
 --
--- Name: chat_history_p2026_07 chat_history_p2026_07_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+-- Name: chat_history_p1970_01 chat_history_p1970_01_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
-ALTER TABLE ONLY public.chat_history_p2026_07
-    ADD CONSTRAINT chat_history_p2026_07_pkey PRIMARY KEY (id, "timestamp");
-
-
---
--- Name: chat_history_p2026_08 chat_history_p2026_08_pkey; Type: CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.chat_history_p2026_08
-    ADD CONSTRAINT chat_history_p2026_08_pkey PRIMARY KEY (id, "timestamp");
+ALTER TABLE ONLY public.chat_history_p1970_01
+    ADD CONSTRAINT chat_history_p1970_01_pkey PRIMARY KEY (id, "timestamp");
 
 
 --
--- Name: chat_history_p2026_09 chat_history_p2026_09_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+-- Name: chat_history_p1970_02 chat_history_p1970_02_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
-ALTER TABLE ONLY public.chat_history_p2026_09
-    ADD CONSTRAINT chat_history_p2026_09_pkey PRIMARY KEY (id, "timestamp");
+ALTER TABLE ONLY public.chat_history_p1970_02
+    ADD CONSTRAINT chat_history_p1970_02_pkey PRIMARY KEY (id, "timestamp");
+
+
+--
+-- Name: chat_history_p1970_03 chat_history_p1970_03_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.chat_history_p1970_03
+    ADD CONSTRAINT chat_history_p1970_03_pkey PRIMARY KEY (id, "timestamp");
 
 
 --
@@ -900,27 +908,27 @@ ALTER TABLE ONLY public.llm_requests
 
 
 --
--- Name: llm_requests_p2026_07 llm_requests_p2026_07_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+-- Name: llm_requests_p1970_01 llm_requests_p1970_01_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
-ALTER TABLE ONLY public.llm_requests_p2026_07
-    ADD CONSTRAINT llm_requests_p2026_07_pkey PRIMARY KEY (id, "timestamp");
-
-
---
--- Name: llm_requests_p2026_08 llm_requests_p2026_08_pkey; Type: CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.llm_requests_p2026_08
-    ADD CONSTRAINT llm_requests_p2026_08_pkey PRIMARY KEY (id, "timestamp");
+ALTER TABLE ONLY public.llm_requests_p1970_01
+    ADD CONSTRAINT llm_requests_p1970_01_pkey PRIMARY KEY (id, "timestamp");
 
 
 --
--- Name: llm_requests_p2026_09 llm_requests_p2026_09_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+-- Name: llm_requests_p1970_02 llm_requests_p1970_02_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
-ALTER TABLE ONLY public.llm_requests_p2026_09
-    ADD CONSTRAINT llm_requests_p2026_09_pkey PRIMARY KEY (id, "timestamp");
+ALTER TABLE ONLY public.llm_requests_p1970_02
+    ADD CONSTRAINT llm_requests_p1970_02_pkey PRIMARY KEY (id, "timestamp");
+
+
+--
+-- Name: llm_requests_p1970_03 llm_requests_p1970_03_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.llm_requests_p1970_03
+    ADD CONSTRAINT llm_requests_p1970_03_pkey PRIMARY KEY (id, "timestamp");
 
 
 --
@@ -940,27 +948,27 @@ ALTER TABLE ONLY public.usage_events
 
 
 --
--- Name: usage_events_p2026_07 usage_events_p2026_07_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+-- Name: usage_events_p1970_01 usage_events_p1970_01_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
-ALTER TABLE ONLY public.usage_events_p2026_07
-    ADD CONSTRAINT usage_events_p2026_07_pkey PRIMARY KEY (id, ts);
-
-
---
--- Name: usage_events_p2026_08 usage_events_p2026_08_pkey; Type: CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.usage_events_p2026_08
-    ADD CONSTRAINT usage_events_p2026_08_pkey PRIMARY KEY (id, ts);
+ALTER TABLE ONLY public.usage_events_p1970_01
+    ADD CONSTRAINT usage_events_p1970_01_pkey PRIMARY KEY (id, ts);
 
 
 --
--- Name: usage_events_p2026_09 usage_events_p2026_09_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+-- Name: usage_events_p1970_02 usage_events_p1970_02_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
-ALTER TABLE ONLY public.usage_events_p2026_09
-    ADD CONSTRAINT usage_events_p2026_09_pkey PRIMARY KEY (id, ts);
+ALTER TABLE ONLY public.usage_events_p1970_02
+    ADD CONSTRAINT usage_events_p1970_02_pkey PRIMARY KEY (id, ts);
+
+
+--
+-- Name: usage_events_p1970_03 usage_events_p1970_03_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.usage_events_p1970_03
+    ADD CONSTRAINT usage_events_p1970_03_pkey PRIMARY KEY (id, ts);
 
 
 --
@@ -978,17 +986,17 @@ CREATE INDEX agent_audit_job_step_idx ON ONLY public.agent_audit USING btree (jo
 
 
 --
--- Name: agent_audit_p2026_07_job_id_id_idx; Type: INDEX; Schema: public; Owner: -
+-- Name: agent_audit_p1970_01_job_id_id_idx; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX agent_audit_p2026_07_job_id_id_idx ON public.agent_audit_p2026_07 USING btree (job_id, id) WHERE (event_phase = 'pre'::text);
+CREATE INDEX agent_audit_p1970_01_job_id_id_idx ON public.agent_audit_p1970_01 USING btree (job_id, id) WHERE (event_phase = 'pre'::text);
 
 
 --
--- Name: agent_audit_p2026_07_job_id_step_type_id_idx; Type: INDEX; Schema: public; Owner: -
+-- Name: agent_audit_p1970_01_job_id_step_type_id_idx; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX agent_audit_p2026_07_job_id_step_type_id_idx ON public.agent_audit_p2026_07 USING btree (job_id, step_type, id) WHERE (event_phase = 'pre'::text);
+CREATE INDEX agent_audit_p1970_01_job_id_step_type_id_idx ON public.agent_audit_p1970_01 USING btree (job_id, step_type, id) WHERE (event_phase = 'pre'::text);
 
 
 --
@@ -999,52 +1007,52 @@ CREATE INDEX agent_audit_pre_id_idx ON ONLY public.agent_audit USING btree (pre_
 
 
 --
--- Name: agent_audit_p2026_07_pre_id_idx; Type: INDEX; Schema: public; Owner: -
+-- Name: agent_audit_p1970_01_pre_id_idx; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX agent_audit_p2026_07_pre_id_idx ON public.agent_audit_p2026_07 USING btree (pre_id) WHERE (event_phase = 'post'::text);
-
-
---
--- Name: agent_audit_p2026_08_job_id_id_idx; Type: INDEX; Schema: public; Owner: -
---
-
-CREATE INDEX agent_audit_p2026_08_job_id_id_idx ON public.agent_audit_p2026_08 USING btree (job_id, id) WHERE (event_phase = 'pre'::text);
+CREATE INDEX agent_audit_p1970_01_pre_id_idx ON public.agent_audit_p1970_01 USING btree (pre_id) WHERE (event_phase = 'post'::text);
 
 
 --
--- Name: agent_audit_p2026_08_job_id_step_type_id_idx; Type: INDEX; Schema: public; Owner: -
+-- Name: agent_audit_p1970_02_job_id_id_idx; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX agent_audit_p2026_08_job_id_step_type_id_idx ON public.agent_audit_p2026_08 USING btree (job_id, step_type, id) WHERE (event_phase = 'pre'::text);
-
-
---
--- Name: agent_audit_p2026_08_pre_id_idx; Type: INDEX; Schema: public; Owner: -
---
-
-CREATE INDEX agent_audit_p2026_08_pre_id_idx ON public.agent_audit_p2026_08 USING btree (pre_id) WHERE (event_phase = 'post'::text);
+CREATE INDEX agent_audit_p1970_02_job_id_id_idx ON public.agent_audit_p1970_02 USING btree (job_id, id) WHERE (event_phase = 'pre'::text);
 
 
 --
--- Name: agent_audit_p2026_09_job_id_id_idx; Type: INDEX; Schema: public; Owner: -
+-- Name: agent_audit_p1970_02_job_id_step_type_id_idx; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX agent_audit_p2026_09_job_id_id_idx ON public.agent_audit_p2026_09 USING btree (job_id, id) WHERE (event_phase = 'pre'::text);
-
-
---
--- Name: agent_audit_p2026_09_job_id_step_type_id_idx; Type: INDEX; Schema: public; Owner: -
---
-
-CREATE INDEX agent_audit_p2026_09_job_id_step_type_id_idx ON public.agent_audit_p2026_09 USING btree (job_id, step_type, id) WHERE (event_phase = 'pre'::text);
+CREATE INDEX agent_audit_p1970_02_job_id_step_type_id_idx ON public.agent_audit_p1970_02 USING btree (job_id, step_type, id) WHERE (event_phase = 'pre'::text);
 
 
 --
--- Name: agent_audit_p2026_09_pre_id_idx; Type: INDEX; Schema: public; Owner: -
+-- Name: agent_audit_p1970_02_pre_id_idx; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX agent_audit_p2026_09_pre_id_idx ON public.agent_audit_p2026_09 USING btree (pre_id) WHERE (event_phase = 'post'::text);
+CREATE INDEX agent_audit_p1970_02_pre_id_idx ON public.agent_audit_p1970_02 USING btree (pre_id) WHERE (event_phase = 'post'::text);
+
+
+--
+-- Name: agent_audit_p1970_03_job_id_id_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX agent_audit_p1970_03_job_id_id_idx ON public.agent_audit_p1970_03 USING btree (job_id, id) WHERE (event_phase = 'pre'::text);
+
+
+--
+-- Name: agent_audit_p1970_03_job_id_step_type_id_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX agent_audit_p1970_03_job_id_step_type_id_idx ON public.agent_audit_p1970_03 USING btree (job_id, step_type, id) WHERE (event_phase = 'pre'::text);
+
+
+--
+-- Name: agent_audit_p1970_03_pre_id_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX agent_audit_p1970_03_pre_id_idx ON public.agent_audit_p1970_03 USING btree (pre_id) WHERE (event_phase = 'post'::text);
 
 
 --
@@ -1055,24 +1063,24 @@ CREATE INDEX chat_history_job_ts_idx ON ONLY public.chat_history USING btree (jo
 
 
 --
--- Name: chat_history_p2026_07_job_id_timestamp_idx; Type: INDEX; Schema: public; Owner: -
+-- Name: chat_history_p1970_01_job_id_timestamp_idx; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX chat_history_p2026_07_job_id_timestamp_idx ON public.chat_history_p2026_07 USING btree (job_id, "timestamp");
-
-
---
--- Name: chat_history_p2026_08_job_id_timestamp_idx; Type: INDEX; Schema: public; Owner: -
---
-
-CREATE INDEX chat_history_p2026_08_job_id_timestamp_idx ON public.chat_history_p2026_08 USING btree (job_id, "timestamp");
+CREATE INDEX chat_history_p1970_01_job_id_timestamp_idx ON public.chat_history_p1970_01 USING btree (job_id, "timestamp");
 
 
 --
--- Name: chat_history_p2026_09_job_id_timestamp_idx; Type: INDEX; Schema: public; Owner: -
+-- Name: chat_history_p1970_02_job_id_timestamp_idx; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX chat_history_p2026_09_job_id_timestamp_idx ON public.chat_history_p2026_09 USING btree (job_id, "timestamp");
+CREATE INDEX chat_history_p1970_02_job_id_timestamp_idx ON public.chat_history_p1970_02 USING btree (job_id, "timestamp");
+
+
+--
+-- Name: chat_history_p1970_03_job_id_timestamp_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX chat_history_p1970_03_job_id_timestamp_idx ON public.chat_history_p1970_03 USING btree (job_id, "timestamp");
 
 
 --
@@ -1083,24 +1091,24 @@ CREATE INDEX llm_requests_job_ts_idx ON ONLY public.llm_requests USING btree (jo
 
 
 --
--- Name: llm_requests_p2026_07_job_id_timestamp_idx; Type: INDEX; Schema: public; Owner: -
+-- Name: llm_requests_p1970_01_job_id_timestamp_idx; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX llm_requests_p2026_07_job_id_timestamp_idx ON public.llm_requests_p2026_07 USING btree (job_id, "timestamp");
-
-
---
--- Name: llm_requests_p2026_08_job_id_timestamp_idx; Type: INDEX; Schema: public; Owner: -
---
-
-CREATE INDEX llm_requests_p2026_08_job_id_timestamp_idx ON public.llm_requests_p2026_08 USING btree (job_id, "timestamp");
+CREATE INDEX llm_requests_p1970_01_job_id_timestamp_idx ON public.llm_requests_p1970_01 USING btree (job_id, "timestamp");
 
 
 --
--- Name: llm_requests_p2026_09_job_id_timestamp_idx; Type: INDEX; Schema: public; Owner: -
+-- Name: llm_requests_p1970_02_job_id_timestamp_idx; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX llm_requests_p2026_09_job_id_timestamp_idx ON public.llm_requests_p2026_09 USING btree (job_id, "timestamp");
+CREATE INDEX llm_requests_p1970_02_job_id_timestamp_idx ON public.llm_requests_p1970_02 USING btree (job_id, "timestamp");
+
+
+--
+-- Name: llm_requests_p1970_03_job_id_timestamp_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX llm_requests_p1970_03_job_id_timestamp_idx ON public.llm_requests_p1970_03 USING btree (job_id, "timestamp");
 
 
 --
@@ -1125,17 +1133,17 @@ CREATE INDEX usage_events_ref_idx ON ONLY public.usage_events USING btree (ref_i
 
 
 --
--- Name: usage_events_p2026_07_ref_id_ts_idx; Type: INDEX; Schema: public; Owner: -
+-- Name: usage_events_p1970_01_ref_id_ts_idx; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX usage_events_p2026_07_ref_id_ts_idx ON public.usage_events_p2026_07 USING btree (ref_id, ts);
+CREATE INDEX usage_events_p1970_01_ref_id_ts_idx ON public.usage_events_p1970_01 USING btree (ref_id, ts);
 
 
 --
--- Name: usage_events_p2026_07_source_source_id_unit_ts_idx; Type: INDEX; Schema: public; Owner: -
+-- Name: usage_events_p1970_01_source_source_id_unit_ts_idx; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE UNIQUE INDEX usage_events_p2026_07_source_source_id_unit_ts_idx ON public.usage_events_p2026_07 USING btree (source, source_id, unit, ts);
+CREATE UNIQUE INDEX usage_events_p1970_01_source_source_id_unit_ts_idx ON public.usage_events_p1970_01 USING btree (source, source_id, unit, ts);
 
 
 --
@@ -1146,304 +1154,304 @@ CREATE INDEX usage_events_user_ts_idx ON ONLY public.usage_events USING btree (u
 
 
 --
--- Name: usage_events_p2026_07_user_id_ts_idx; Type: INDEX; Schema: public; Owner: -
+-- Name: usage_events_p1970_01_user_id_ts_idx; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX usage_events_p2026_07_user_id_ts_idx ON public.usage_events_p2026_07 USING btree (user_id, ts);
+CREATE INDEX usage_events_p1970_01_user_id_ts_idx ON public.usage_events_p1970_01 USING btree (user_id, ts);
 
 
 --
--- Name: usage_events_p2026_08_ref_id_ts_idx; Type: INDEX; Schema: public; Owner: -
+-- Name: usage_events_p1970_02_ref_id_ts_idx; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX usage_events_p2026_08_ref_id_ts_idx ON public.usage_events_p2026_08 USING btree (ref_id, ts);
+CREATE INDEX usage_events_p1970_02_ref_id_ts_idx ON public.usage_events_p1970_02 USING btree (ref_id, ts);
 
 
 --
--- Name: usage_events_p2026_08_source_source_id_unit_ts_idx; Type: INDEX; Schema: public; Owner: -
+-- Name: usage_events_p1970_02_source_source_id_unit_ts_idx; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE UNIQUE INDEX usage_events_p2026_08_source_source_id_unit_ts_idx ON public.usage_events_p2026_08 USING btree (source, source_id, unit, ts);
+CREATE UNIQUE INDEX usage_events_p1970_02_source_source_id_unit_ts_idx ON public.usage_events_p1970_02 USING btree (source, source_id, unit, ts);
 
 
 --
--- Name: usage_events_p2026_08_user_id_ts_idx; Type: INDEX; Schema: public; Owner: -
+-- Name: usage_events_p1970_02_user_id_ts_idx; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX usage_events_p2026_08_user_id_ts_idx ON public.usage_events_p2026_08 USING btree (user_id, ts);
+CREATE INDEX usage_events_p1970_02_user_id_ts_idx ON public.usage_events_p1970_02 USING btree (user_id, ts);
 
 
 --
--- Name: usage_events_p2026_09_ref_id_ts_idx; Type: INDEX; Schema: public; Owner: -
+-- Name: usage_events_p1970_03_ref_id_ts_idx; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX usage_events_p2026_09_ref_id_ts_idx ON public.usage_events_p2026_09 USING btree (ref_id, ts);
+CREATE INDEX usage_events_p1970_03_ref_id_ts_idx ON public.usage_events_p1970_03 USING btree (ref_id, ts);
 
 
 --
--- Name: usage_events_p2026_09_source_source_id_unit_ts_idx; Type: INDEX; Schema: public; Owner: -
+-- Name: usage_events_p1970_03_source_source_id_unit_ts_idx; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE UNIQUE INDEX usage_events_p2026_09_source_source_id_unit_ts_idx ON public.usage_events_p2026_09 USING btree (source, source_id, unit, ts);
+CREATE UNIQUE INDEX usage_events_p1970_03_source_source_id_unit_ts_idx ON public.usage_events_p1970_03 USING btree (source, source_id, unit, ts);
 
 
 --
--- Name: usage_events_p2026_09_user_id_ts_idx; Type: INDEX; Schema: public; Owner: -
+-- Name: usage_events_p1970_03_user_id_ts_idx; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX usage_events_p2026_09_user_id_ts_idx ON public.usage_events_p2026_09 USING btree (user_id, ts);
+CREATE INDEX usage_events_p1970_03_user_id_ts_idx ON public.usage_events_p1970_03 USING btree (user_id, ts);
 
 
 --
--- Name: agent_audit_p2026_07_job_id_id_idx; Type: INDEX ATTACH; Schema: public; Owner: -
+-- Name: agent_audit_p1970_01_job_id_id_idx; Type: INDEX ATTACH; Schema: public; Owner: -
 --
 
-ALTER INDEX public.agent_audit_job_id_idx ATTACH PARTITION public.agent_audit_p2026_07_job_id_id_idx;
+ALTER INDEX public.agent_audit_job_id_idx ATTACH PARTITION public.agent_audit_p1970_01_job_id_id_idx;
 
 
 --
--- Name: agent_audit_p2026_07_job_id_step_type_id_idx; Type: INDEX ATTACH; Schema: public; Owner: -
+-- Name: agent_audit_p1970_01_job_id_step_type_id_idx; Type: INDEX ATTACH; Schema: public; Owner: -
 --
 
-ALTER INDEX public.agent_audit_job_step_idx ATTACH PARTITION public.agent_audit_p2026_07_job_id_step_type_id_idx;
+ALTER INDEX public.agent_audit_job_step_idx ATTACH PARTITION public.agent_audit_p1970_01_job_id_step_type_id_idx;
 
 
 --
--- Name: agent_audit_p2026_07_pkey; Type: INDEX ATTACH; Schema: public; Owner: -
+-- Name: agent_audit_p1970_01_pkey; Type: INDEX ATTACH; Schema: public; Owner: -
 --
 
-ALTER INDEX public.agent_audit_pkey ATTACH PARTITION public.agent_audit_p2026_07_pkey;
+ALTER INDEX public.agent_audit_pkey ATTACH PARTITION public.agent_audit_p1970_01_pkey;
 
 
 --
--- Name: agent_audit_p2026_07_pre_id_idx; Type: INDEX ATTACH; Schema: public; Owner: -
+-- Name: agent_audit_p1970_01_pre_id_idx; Type: INDEX ATTACH; Schema: public; Owner: -
 --
 
-ALTER INDEX public.agent_audit_pre_id_idx ATTACH PARTITION public.agent_audit_p2026_07_pre_id_idx;
+ALTER INDEX public.agent_audit_pre_id_idx ATTACH PARTITION public.agent_audit_p1970_01_pre_id_idx;
 
 
 --
--- Name: agent_audit_p2026_08_job_id_id_idx; Type: INDEX ATTACH; Schema: public; Owner: -
+-- Name: agent_audit_p1970_02_job_id_id_idx; Type: INDEX ATTACH; Schema: public; Owner: -
 --
 
-ALTER INDEX public.agent_audit_job_id_idx ATTACH PARTITION public.agent_audit_p2026_08_job_id_id_idx;
+ALTER INDEX public.agent_audit_job_id_idx ATTACH PARTITION public.agent_audit_p1970_02_job_id_id_idx;
 
 
 --
--- Name: agent_audit_p2026_08_job_id_step_type_id_idx; Type: INDEX ATTACH; Schema: public; Owner: -
+-- Name: agent_audit_p1970_02_job_id_step_type_id_idx; Type: INDEX ATTACH; Schema: public; Owner: -
 --
 
-ALTER INDEX public.agent_audit_job_step_idx ATTACH PARTITION public.agent_audit_p2026_08_job_id_step_type_id_idx;
+ALTER INDEX public.agent_audit_job_step_idx ATTACH PARTITION public.agent_audit_p1970_02_job_id_step_type_id_idx;
 
 
 --
--- Name: agent_audit_p2026_08_pkey; Type: INDEX ATTACH; Schema: public; Owner: -
+-- Name: agent_audit_p1970_02_pkey; Type: INDEX ATTACH; Schema: public; Owner: -
 --
 
-ALTER INDEX public.agent_audit_pkey ATTACH PARTITION public.agent_audit_p2026_08_pkey;
+ALTER INDEX public.agent_audit_pkey ATTACH PARTITION public.agent_audit_p1970_02_pkey;
 
 
 --
--- Name: agent_audit_p2026_08_pre_id_idx; Type: INDEX ATTACH; Schema: public; Owner: -
+-- Name: agent_audit_p1970_02_pre_id_idx; Type: INDEX ATTACH; Schema: public; Owner: -
 --
 
-ALTER INDEX public.agent_audit_pre_id_idx ATTACH PARTITION public.agent_audit_p2026_08_pre_id_idx;
+ALTER INDEX public.agent_audit_pre_id_idx ATTACH PARTITION public.agent_audit_p1970_02_pre_id_idx;
 
 
 --
--- Name: agent_audit_p2026_09_job_id_id_idx; Type: INDEX ATTACH; Schema: public; Owner: -
+-- Name: agent_audit_p1970_03_job_id_id_idx; Type: INDEX ATTACH; Schema: public; Owner: -
 --
 
-ALTER INDEX public.agent_audit_job_id_idx ATTACH PARTITION public.agent_audit_p2026_09_job_id_id_idx;
+ALTER INDEX public.agent_audit_job_id_idx ATTACH PARTITION public.agent_audit_p1970_03_job_id_id_idx;
 
 
 --
--- Name: agent_audit_p2026_09_job_id_step_type_id_idx; Type: INDEX ATTACH; Schema: public; Owner: -
+-- Name: agent_audit_p1970_03_job_id_step_type_id_idx; Type: INDEX ATTACH; Schema: public; Owner: -
 --
 
-ALTER INDEX public.agent_audit_job_step_idx ATTACH PARTITION public.agent_audit_p2026_09_job_id_step_type_id_idx;
+ALTER INDEX public.agent_audit_job_step_idx ATTACH PARTITION public.agent_audit_p1970_03_job_id_step_type_id_idx;
 
 
 --
--- Name: agent_audit_p2026_09_pkey; Type: INDEX ATTACH; Schema: public; Owner: -
+-- Name: agent_audit_p1970_03_pkey; Type: INDEX ATTACH; Schema: public; Owner: -
 --
 
-ALTER INDEX public.agent_audit_pkey ATTACH PARTITION public.agent_audit_p2026_09_pkey;
+ALTER INDEX public.agent_audit_pkey ATTACH PARTITION public.agent_audit_p1970_03_pkey;
 
 
 --
--- Name: agent_audit_p2026_09_pre_id_idx; Type: INDEX ATTACH; Schema: public; Owner: -
+-- Name: agent_audit_p1970_03_pre_id_idx; Type: INDEX ATTACH; Schema: public; Owner: -
 --
 
-ALTER INDEX public.agent_audit_pre_id_idx ATTACH PARTITION public.agent_audit_p2026_09_pre_id_idx;
+ALTER INDEX public.agent_audit_pre_id_idx ATTACH PARTITION public.agent_audit_p1970_03_pre_id_idx;
 
 
 --
--- Name: chat_history_p2026_07_job_id_timestamp_idx; Type: INDEX ATTACH; Schema: public; Owner: -
+-- Name: chat_history_p1970_01_job_id_timestamp_idx; Type: INDEX ATTACH; Schema: public; Owner: -
 --
 
-ALTER INDEX public.chat_history_job_ts_idx ATTACH PARTITION public.chat_history_p2026_07_job_id_timestamp_idx;
+ALTER INDEX public.chat_history_job_ts_idx ATTACH PARTITION public.chat_history_p1970_01_job_id_timestamp_idx;
 
 
 --
--- Name: chat_history_p2026_07_pkey; Type: INDEX ATTACH; Schema: public; Owner: -
+-- Name: chat_history_p1970_01_pkey; Type: INDEX ATTACH; Schema: public; Owner: -
 --
 
-ALTER INDEX public.chat_history_pkey ATTACH PARTITION public.chat_history_p2026_07_pkey;
+ALTER INDEX public.chat_history_pkey ATTACH PARTITION public.chat_history_p1970_01_pkey;
 
 
 --
--- Name: chat_history_p2026_08_job_id_timestamp_idx; Type: INDEX ATTACH; Schema: public; Owner: -
+-- Name: chat_history_p1970_02_job_id_timestamp_idx; Type: INDEX ATTACH; Schema: public; Owner: -
 --
 
-ALTER INDEX public.chat_history_job_ts_idx ATTACH PARTITION public.chat_history_p2026_08_job_id_timestamp_idx;
+ALTER INDEX public.chat_history_job_ts_idx ATTACH PARTITION public.chat_history_p1970_02_job_id_timestamp_idx;
 
 
 --
--- Name: chat_history_p2026_08_pkey; Type: INDEX ATTACH; Schema: public; Owner: -
+-- Name: chat_history_p1970_02_pkey; Type: INDEX ATTACH; Schema: public; Owner: -
 --
 
-ALTER INDEX public.chat_history_pkey ATTACH PARTITION public.chat_history_p2026_08_pkey;
+ALTER INDEX public.chat_history_pkey ATTACH PARTITION public.chat_history_p1970_02_pkey;
 
 
 --
--- Name: chat_history_p2026_09_job_id_timestamp_idx; Type: INDEX ATTACH; Schema: public; Owner: -
+-- Name: chat_history_p1970_03_job_id_timestamp_idx; Type: INDEX ATTACH; Schema: public; Owner: -
 --
 
-ALTER INDEX public.chat_history_job_ts_idx ATTACH PARTITION public.chat_history_p2026_09_job_id_timestamp_idx;
+ALTER INDEX public.chat_history_job_ts_idx ATTACH PARTITION public.chat_history_p1970_03_job_id_timestamp_idx;
 
 
 --
--- Name: chat_history_p2026_09_pkey; Type: INDEX ATTACH; Schema: public; Owner: -
+-- Name: chat_history_p1970_03_pkey; Type: INDEX ATTACH; Schema: public; Owner: -
 --
 
-ALTER INDEX public.chat_history_pkey ATTACH PARTITION public.chat_history_p2026_09_pkey;
+ALTER INDEX public.chat_history_pkey ATTACH PARTITION public.chat_history_p1970_03_pkey;
 
 
 --
--- Name: llm_requests_p2026_07_job_id_timestamp_idx; Type: INDEX ATTACH; Schema: public; Owner: -
+-- Name: llm_requests_p1970_01_job_id_timestamp_idx; Type: INDEX ATTACH; Schema: public; Owner: -
 --
 
-ALTER INDEX public.llm_requests_job_ts_idx ATTACH PARTITION public.llm_requests_p2026_07_job_id_timestamp_idx;
+ALTER INDEX public.llm_requests_job_ts_idx ATTACH PARTITION public.llm_requests_p1970_01_job_id_timestamp_idx;
 
 
 --
--- Name: llm_requests_p2026_07_pkey; Type: INDEX ATTACH; Schema: public; Owner: -
+-- Name: llm_requests_p1970_01_pkey; Type: INDEX ATTACH; Schema: public; Owner: -
 --
 
-ALTER INDEX public.llm_requests_pkey ATTACH PARTITION public.llm_requests_p2026_07_pkey;
+ALTER INDEX public.llm_requests_pkey ATTACH PARTITION public.llm_requests_p1970_01_pkey;
 
 
 --
--- Name: llm_requests_p2026_08_job_id_timestamp_idx; Type: INDEX ATTACH; Schema: public; Owner: -
+-- Name: llm_requests_p1970_02_job_id_timestamp_idx; Type: INDEX ATTACH; Schema: public; Owner: -
 --
 
-ALTER INDEX public.llm_requests_job_ts_idx ATTACH PARTITION public.llm_requests_p2026_08_job_id_timestamp_idx;
+ALTER INDEX public.llm_requests_job_ts_idx ATTACH PARTITION public.llm_requests_p1970_02_job_id_timestamp_idx;
 
 
 --
--- Name: llm_requests_p2026_08_pkey; Type: INDEX ATTACH; Schema: public; Owner: -
+-- Name: llm_requests_p1970_02_pkey; Type: INDEX ATTACH; Schema: public; Owner: -
 --
 
-ALTER INDEX public.llm_requests_pkey ATTACH PARTITION public.llm_requests_p2026_08_pkey;
+ALTER INDEX public.llm_requests_pkey ATTACH PARTITION public.llm_requests_p1970_02_pkey;
 
 
 --
--- Name: llm_requests_p2026_09_job_id_timestamp_idx; Type: INDEX ATTACH; Schema: public; Owner: -
+-- Name: llm_requests_p1970_03_job_id_timestamp_idx; Type: INDEX ATTACH; Schema: public; Owner: -
 --
 
-ALTER INDEX public.llm_requests_job_ts_idx ATTACH PARTITION public.llm_requests_p2026_09_job_id_timestamp_idx;
+ALTER INDEX public.llm_requests_job_ts_idx ATTACH PARTITION public.llm_requests_p1970_03_job_id_timestamp_idx;
 
 
 --
--- Name: llm_requests_p2026_09_pkey; Type: INDEX ATTACH; Schema: public; Owner: -
+-- Name: llm_requests_p1970_03_pkey; Type: INDEX ATTACH; Schema: public; Owner: -
 --
 
-ALTER INDEX public.llm_requests_pkey ATTACH PARTITION public.llm_requests_p2026_09_pkey;
+ALTER INDEX public.llm_requests_pkey ATTACH PARTITION public.llm_requests_p1970_03_pkey;
 
 
 --
--- Name: usage_events_p2026_07_pkey; Type: INDEX ATTACH; Schema: public; Owner: -
+-- Name: usage_events_p1970_01_pkey; Type: INDEX ATTACH; Schema: public; Owner: -
 --
 
-ALTER INDEX public.usage_events_pkey ATTACH PARTITION public.usage_events_p2026_07_pkey;
+ALTER INDEX public.usage_events_pkey ATTACH PARTITION public.usage_events_p1970_01_pkey;
 
 
 --
--- Name: usage_events_p2026_07_ref_id_ts_idx; Type: INDEX ATTACH; Schema: public; Owner: -
+-- Name: usage_events_p1970_01_ref_id_ts_idx; Type: INDEX ATTACH; Schema: public; Owner: -
 --
 
-ALTER INDEX public.usage_events_ref_idx ATTACH PARTITION public.usage_events_p2026_07_ref_id_ts_idx;
+ALTER INDEX public.usage_events_ref_idx ATTACH PARTITION public.usage_events_p1970_01_ref_id_ts_idx;
 
 
 --
--- Name: usage_events_p2026_07_source_source_id_unit_ts_idx; Type: INDEX ATTACH; Schema: public; Owner: -
+-- Name: usage_events_p1970_01_source_source_id_unit_ts_idx; Type: INDEX ATTACH; Schema: public; Owner: -
 --
 
-ALTER INDEX public.usage_events_dedupe_idx ATTACH PARTITION public.usage_events_p2026_07_source_source_id_unit_ts_idx;
+ALTER INDEX public.usage_events_dedupe_idx ATTACH PARTITION public.usage_events_p1970_01_source_source_id_unit_ts_idx;
 
 
 --
--- Name: usage_events_p2026_07_user_id_ts_idx; Type: INDEX ATTACH; Schema: public; Owner: -
+-- Name: usage_events_p1970_01_user_id_ts_idx; Type: INDEX ATTACH; Schema: public; Owner: -
 --
 
-ALTER INDEX public.usage_events_user_ts_idx ATTACH PARTITION public.usage_events_p2026_07_user_id_ts_idx;
+ALTER INDEX public.usage_events_user_ts_idx ATTACH PARTITION public.usage_events_p1970_01_user_id_ts_idx;
 
 
 --
--- Name: usage_events_p2026_08_pkey; Type: INDEX ATTACH; Schema: public; Owner: -
+-- Name: usage_events_p1970_02_pkey; Type: INDEX ATTACH; Schema: public; Owner: -
 --
 
-ALTER INDEX public.usage_events_pkey ATTACH PARTITION public.usage_events_p2026_08_pkey;
+ALTER INDEX public.usage_events_pkey ATTACH PARTITION public.usage_events_p1970_02_pkey;
 
 
 --
--- Name: usage_events_p2026_08_ref_id_ts_idx; Type: INDEX ATTACH; Schema: public; Owner: -
+-- Name: usage_events_p1970_02_ref_id_ts_idx; Type: INDEX ATTACH; Schema: public; Owner: -
 --
 
-ALTER INDEX public.usage_events_ref_idx ATTACH PARTITION public.usage_events_p2026_08_ref_id_ts_idx;
+ALTER INDEX public.usage_events_ref_idx ATTACH PARTITION public.usage_events_p1970_02_ref_id_ts_idx;
 
 
 --
--- Name: usage_events_p2026_08_source_source_id_unit_ts_idx; Type: INDEX ATTACH; Schema: public; Owner: -
+-- Name: usage_events_p1970_02_source_source_id_unit_ts_idx; Type: INDEX ATTACH; Schema: public; Owner: -
 --
 
-ALTER INDEX public.usage_events_dedupe_idx ATTACH PARTITION public.usage_events_p2026_08_source_source_id_unit_ts_idx;
+ALTER INDEX public.usage_events_dedupe_idx ATTACH PARTITION public.usage_events_p1970_02_source_source_id_unit_ts_idx;
 
 
 --
--- Name: usage_events_p2026_08_user_id_ts_idx; Type: INDEX ATTACH; Schema: public; Owner: -
+-- Name: usage_events_p1970_02_user_id_ts_idx; Type: INDEX ATTACH; Schema: public; Owner: -
 --
 
-ALTER INDEX public.usage_events_user_ts_idx ATTACH PARTITION public.usage_events_p2026_08_user_id_ts_idx;
+ALTER INDEX public.usage_events_user_ts_idx ATTACH PARTITION public.usage_events_p1970_02_user_id_ts_idx;
 
 
 --
--- Name: usage_events_p2026_09_pkey; Type: INDEX ATTACH; Schema: public; Owner: -
+-- Name: usage_events_p1970_03_pkey; Type: INDEX ATTACH; Schema: public; Owner: -
 --
 
-ALTER INDEX public.usage_events_pkey ATTACH PARTITION public.usage_events_p2026_09_pkey;
+ALTER INDEX public.usage_events_pkey ATTACH PARTITION public.usage_events_p1970_03_pkey;
 
 
 --
--- Name: usage_events_p2026_09_ref_id_ts_idx; Type: INDEX ATTACH; Schema: public; Owner: -
+-- Name: usage_events_p1970_03_ref_id_ts_idx; Type: INDEX ATTACH; Schema: public; Owner: -
 --
 
-ALTER INDEX public.usage_events_ref_idx ATTACH PARTITION public.usage_events_p2026_09_ref_id_ts_idx;
+ALTER INDEX public.usage_events_ref_idx ATTACH PARTITION public.usage_events_p1970_03_ref_id_ts_idx;
 
 
 --
--- Name: usage_events_p2026_09_source_source_id_unit_ts_idx; Type: INDEX ATTACH; Schema: public; Owner: -
+-- Name: usage_events_p1970_03_source_source_id_unit_ts_idx; Type: INDEX ATTACH; Schema: public; Owner: -
 --
 
-ALTER INDEX public.usage_events_dedupe_idx ATTACH PARTITION public.usage_events_p2026_09_source_source_id_unit_ts_idx;
+ALTER INDEX public.usage_events_dedupe_idx ATTACH PARTITION public.usage_events_p1970_03_source_source_id_unit_ts_idx;
 
 
 --
--- Name: usage_events_p2026_09_user_id_ts_idx; Type: INDEX ATTACH; Schema: public; Owner: -
+-- Name: usage_events_p1970_03_user_id_ts_idx; Type: INDEX ATTACH; Schema: public; Owner: -
 --
 
-ALTER INDEX public.usage_events_user_ts_idx ATTACH PARTITION public.usage_events_p2026_09_user_id_ts_idx;
+ALTER INDEX public.usage_events_user_ts_idx ATTACH PARTITION public.usage_events_p1970_03_user_id_ts_idx;
 
 
 --
