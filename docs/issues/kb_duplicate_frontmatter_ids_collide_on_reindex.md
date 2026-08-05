@@ -14,7 +14,13 @@ related:
 
 **Filed:** 2026-07-29, split out of [[kb_reindex_duplicate_key_on_legacy_notes]] after
 that issue's `.md`-shaped-directory corruption was cleaned up and this residual became
-visible underneath it. Line numbers are develop @ 2026-07-29.
+visible underneath it. Line numbers refreshed against develop @ 2026-08-05.
+
+**Status: OPEN.** Still reproducible in code at HEAD — `note_fields` continues to take
+`note_id` from frontmatter, and the KB-materialisation rework (`571fbc8c`, which moved
+note writes into a dedicated KB repo) added no duplicate-id handling. The four pairs
+below were measured 2026-07-29 and have not been re-checked since; the dev cluster was
+unreachable at the time of writing.
 
 ## Symptom
 
@@ -23,7 +29,7 @@ Four `uq_knowledge_project_note` duplicate-key errors per reindex on project
 the export corruption were resolved.
 
 Unlike that issue, **the vault contains no duplicate files** — every note is at exactly
-one path. The collision is on *identity*: `note_fields` (`kb_reindex.py:191`) takes
+one path. The collision is on *identity*: `note_fields` (`kb_reindex.py:207`) takes
 `note_id` from the frontmatter, not the filename —
 
 ```python
@@ -62,11 +68,12 @@ list, so it is stable but arbitrary.
 
 Already covered on both sides:
 
-- **`kb_lint`** reports it as a `duplicate-id` ERROR finding (`gardener.py:325-335`,
+- **`kb_lint`** reports it as a `duplicate-id` ERROR finding (`gardener.py:326-336`,
   "id 'X' also used by …"). This vault has never had `kb_lint` run against it.
 - **The reindexer** now logs the condition as one readable line naming the id, both
-  paths, and which one the index holds (`_log_duplicate_note_id`, `a9d406b4`) instead of
-  the raw Postgres error. **Not yet deployed to dev.**
+  paths, and which one the index holds (`_log_duplicate_note_id`,
+  `kb_reindex.py:321`, shipped in `a9d406b4`) instead of the raw Postgres error — so a
+  fresh occurrence is readable from the log without a database session.
 
 ## Fix
 
