@@ -38,6 +38,13 @@ class CanvasViewerDatabasePrivilegeError(RuntimeError):
 # Keep this contract synchronized with the gateway-only methods on
 # CanvasViewerSessionService and with the provisioned database role.  These are
 # effective column privileges: table-level grants also satisfy the checks.
+#
+# A SELECT entry buys plain reads only.  PostgreSQL requires UPDATE on at least
+# one column for FOR SHARE/FOR UPDATE, so a gateway statement that row-locks an
+# authoritative table below fails with "permission denied" no matter how
+# complete this list is.  Gateway-only methods read those rows unlocked; adding
+# an UPDATE column to widen a lock would fail the excess-privilege attestation
+# further down, which is the intended answer, not an obstacle to route around.
 _REQUIRED_COLUMN_PRIVILEGES: tuple[tuple[str, str, str], ...] = (
     ("users", "id", "SELECT"),
     ("users", "is_admin", "SELECT"),

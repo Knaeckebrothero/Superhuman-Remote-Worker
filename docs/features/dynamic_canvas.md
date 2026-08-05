@@ -2594,12 +2594,33 @@ temporary-table capability is not represented as application-schema DDL; an
 internal database whose PUBLIC role can create in `public` is rejected and must
 be hardened by its operator.
 
+Read-only to the gateway means read-only *including row locks*. PostgreSQL
+requires `UPDATE` on at least one column for `FOR SHARE`/`FOR UPDATE`, so a
+locking read of `users`, `threads`, `srw_sessions`, or `canvases` from the
+gateway is not a stricter check — it is a guaranteed `permission denied for
+table …`, which the ASGI catch-all returns as `500 canvas_gateway_error` and
+the browser renders inside the isolated frame instead of the app. The
+gateway-only methods therefore read those four tables unlocked (`_canvas_record`,
+`_parent_session`, and `_authorized_thread` all take `for_share`), while still
+locking the viewer-owned bootstrap, attachment, and origin-session rows they
+mutate — legal exactly because the packaged grants carry `UPDATE` columns
+there. Freshness does not rest on those locks: `authenticate` re-derives parent
+session liveness, approval, thread ownership, and canvas identity with no locks
+on every proxied exchange and every revalidation tick, and revokes the origin
+session on any mismatch. Never answer a future denial by granting the gateway
+`UPDATE` on an authoritative table; that both fails the startup attestation's
+no-extra-privileges check and hands an internet-facing process a lever to block
+Canvas saves.
+
 The real-PostgreSQL migration CI now applies the packaged role script to a
 freshly migrated PostgreSQL 15 database, runs the same startup attestation as
 the gateway, rejects a broad authenticated session switched into the narrow
 role, and proves representative token reads, authoritative mutations, viewer
-deletes, sequence use, and public DDL fail with insufficient privilege. See
-[[dynamic_canvas_slice3c_verification]].
+deletes, sequence use, and public DDL fail with insufficient privilege. It also
+drives the gateway-only methods — bootstrap start, exchange, session reuse,
+authentication, and origin revocation — through a pool authenticated *as* that
+restricted role, which is the only way a statement the role may not execute
+shows up before a browser hits it. See [[dynamic_canvas_slice3c_verification]].
 
 **Trusted UI and local browser-harness closeout:** Implemented as of
 2026-07-14. It adds:
