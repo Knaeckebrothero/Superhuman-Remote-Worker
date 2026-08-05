@@ -199,8 +199,10 @@ test.describe('Dynamic Canvas production-browser conformance', () => {
     }
 
     expect(trace.applicationResponseHeaders).toHaveLength(1);
+    // Same-origin nesting is the app's own content; the canary probe above
+    // proves cross-origin framing stays blocked under this exact directive.
     expect(trace.applicationResponseHeaders[0]['content-security-policy']).toContain(
-      "frame-src 'none'",
+      "frame-src 'self' blob:",
     );
     expect(trace.applicationResponseHeaders[0]['content-security-policy']).toContain(
       "object-src 'none'",
@@ -663,8 +665,9 @@ async function handleViewerRoute(
       'cache-control': 'private, no-store',
       'content-security-policy':
         `default-src 'self'; script-src 'nonce-${nonce}'; style-src 'nonce-${nonce}'; ` +
-        "img-src 'self' data:; connect-src 'self'; frame-src 'none'; object-src 'none'; " +
-        `worker-src 'none'; child-src 'none'; frame-ancestors ${BASE_URL}; ` +
+        "img-src 'self' data:; connect-src 'self'; frame-src 'self' blob:; " +
+        "object-src 'none'; " +
+        `worker-src 'none'; frame-ancestors 'self' ${BASE_URL}; ` +
         "base-uri 'none'; form-action 'self'",
       'cross-origin-resource-policy': 'same-origin',
       'permissions-policy': deniedPermissionsPolicy(),

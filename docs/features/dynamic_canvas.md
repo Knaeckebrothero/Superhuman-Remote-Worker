@@ -1980,10 +1980,23 @@ actually required by the supported dev server), while enforcing:
 ```text
 default-src 'self' data: blob:;
 connect-src 'self' <generated same-origin wss URL>;
-frame-src 'none'; object-src 'none'; worker-src 'none';
+frame-src 'self' blob:; object-src 'none'; worker-src 'none';
 base-uri 'self'; form-action 'self';
-frame-ancestors <configured Cockpit origins>;
+frame-ancestors 'self' <configured Cockpit origins>;
 ```
+
+`frame-src 'self' blob:` admits the app framing its own pages — a shell that
+loads its subpages, a gallery, a preview pane — which reaches nothing new: a
+nested same-origin document is served by this gateway, through this session,
+under this same policy and sandbox. It takes both halves of the pair. The
+parent's `frame-src` governs the nested load, and `'self'` must also appear in
+`frame-ancestors`, because once the app frames itself the app origin sits in
+that nested document's ancestor chain; admitting only `frame-src` leaves the
+child refused with the parent's frame left blank. Anti-framing is unchanged:
+browsers check *every* ancestor, so the outermost frame must still be a
+configured Cockpit origin and a hostile page gains nothing by chaining through
+an app-origin frame. Cross-origin framing stays blocked, and the browser
+conformance canary probes exactly that.
 
 The current CSP reserves the exact same-origin WebSocket destination so the
 policy need not be weakened later, but the Slice-3 proxy still rejects every
