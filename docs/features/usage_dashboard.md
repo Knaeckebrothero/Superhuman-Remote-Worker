@@ -31,7 +31,7 @@ aliases:
 **Status:** v1 **implemented, pushed & deployed to dev** (built/verified on local k3d
 2026-06-26; pushed to `origin/develop` + rolled out to dev via `sha-fe9c9ee` 2026-06-29) — as-built record
 (commits `46040008`…`896fad8d`, tests green, deviations) in the implementation plan
-`docs/superpowers/plans/2026-06-26-usage-dashboard.md`. SDD final whole-branch review still pending; no dashboard fast-follows landed yet. **Cost note:** LLM `cost_usd` is priced from `usage_rates`, whose LLM rates are auto-seeded from OpenRouter (`openrouter_pricing.llm_pricing_sync_loop`) now that the LiteLLM gateway is removed ([[remove_litellm_proxy_and_gateway_concept]]). Cost reads "—" for compute rows (`usage_rates` has no compute rates yet — vcpu/gib-hour stay unpriced) and free homelab models (rate 0). v1 scope below;
+`docs/superpowers/plans/2026-06-26-usage-dashboard.md`. SDD final whole-branch review still pending. **Cost note:** LLM `cost_usd` is priced from `usage_rates`, whose LLM rates are auto-seeded from OpenRouter (`openrouter_pricing.llm_pricing_sync_loop`) now that the LiteLLM gateway is removed ([[remove_litellm_proxy_and_gateway_concept]]). Canonical cost reads "—" for compute rows (`usage_rates` has no compute rates yet — vcpu/gib-hour stay unpriced) and free homelab models (rate 0). **Fast-follow added 2026-08-05:** [[cloud_equivalent_usage_pricing]] shows separate STACKIT/AWS/Azure list-price estimates for the measured compute quantities; those estimates do not alter canonical ledger cost. v1 scope below;
 everything uncertain is a named fast-follow, decided **after** seeing the page
 rendered (the user's explicit preference: build a concrete v1, react to how it
 feels, iterate — don't over-spec the panel set upfront).
@@ -57,8 +57,9 @@ Grafana-style auto-refresh toggle.
 2. **Export CSV** of the current view.
 3. **Per-job LLM attribution** (the gateway never sees `job_id` today) → a true
    per-job cost line. Tracked in [[usage_monitoring_and_rate_limiting]].
-4. **Edit-Rates admin UI + seeding real rates** → turns quantity-first into real
-   dollars (the deferred [[usage_monitoring_and_rate_limiting]] "Next" item).
+4. **Edit canonical rates admin UI** remains deferred. A related planning slice,
+   **cloud-equivalent provider rate cards**, shipped 2026-08-05; it intentionally
+   reprices quantities separately instead of turning estimates into ledger cost.
 5. **Live RPM/TPM** "right now" panels — sourced from **LiteLLM's own metrics**,
    not the ledger (a separate data source).
 6. Trend **sparkline** polish to match the mockups as drawn.
@@ -78,7 +79,7 @@ new capture. Confirmed against the schema + both emitters:
 | **Compute** (`resource='workspace_pod'`) | ✅ | `vcpu-hour` + `gib-hour` = requested CPU/RAM × wall-clock; `details` has `cpu_millicores`, `mem_bytes`, `started_at`, `ended_at`, `tier`, `duration_h` |
 | **Job/thread** (`ref_id`) | compute ✅ / **LLM ❌** | gateway never sees `job_id` (fast-follow 3) |
 | **Provider** | ❌ | only the model name is stored — derivable via a catalog join, not a column (fast-follow 1) |
-| **Cost** (`cost_usd`) | LLM ✅ / compute ❌ | **Updated 2026-07-04:** LLM cost is **real** — priced from `usage_rates`, whose LLM rates are auto-seeded from OpenRouter (`openrouter_pricing`) since the LiteLLM gateway was removed ([[remove_litellm_proxy_and_gateway_concept]]). Compute stays unpriced (`usage_rates` has no compute rates yet); free homelab LLM prices at rate 0. |
+| **Cost** (`cost_usd`) | LLM ✅ / compute ❌ | **Updated 2026-08-05:** LLM cost is **real** — priced from `usage_rates`, whose LLM rates are auto-seeded from OpenRouter (`openrouter_pricing`). Canonical compute stays unpriced. `GET /api/usage.cloud_estimates` separately applies effective-dated STACKIT/AWS/Azure list-price cards to compute quantities for planning ([[cloud_equivalent_usage_pricing]]); it is not written to `cost_usd`. |
 
 **Out of scope of the ledger entirely (do not promise):** GPU/VRAM (compute
 meter is CPU+RAM only), **actual** vs **requested** utilization (no sampling),

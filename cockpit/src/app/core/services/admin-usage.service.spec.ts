@@ -44,6 +44,7 @@ describe('AdminUsageService', () => {
       by_category: [],
       total_cost_usd: 0,
       cache_hit_ratio: 0,
+      cloud_estimates: [],
       available: false,
     });
     expect(service.loading()).toBe(false);

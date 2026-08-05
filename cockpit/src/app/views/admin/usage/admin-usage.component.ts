@@ -13,6 +13,7 @@ import {AdminUsageService, BreakdownDim, UsageTsPoint, UsageWindow} from '../../
 import {ApiService} from '../../../core/services/api.service';
 import {UserService} from '../../../core/services/user.service';
 import {AgentStatistics, DailyStatistics, JobStatistics} from '../../../core/models/api.model';
+import {TranslocoPipe} from '@jsverse/transloco';
 
 /**
  * Admin → Usage & Cost (Slice 4). Read-only surface over the usage_events
@@ -24,7 +25,7 @@ import {AgentStatistics, DailyStatistics, JobStatistics} from '../../../core/mod
   selector: 'app-admin-usage',
   standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [SidebarToggleComponent],
+  imports: [SidebarToggleComponent, TranslocoPipe],
   template: `
     <div class="admin-page">
       <div class="admin-container">
@@ -54,10 +55,7 @@ import {AgentStatistics, DailyStatistics, JobStatistics} from '../../../core/mod
           </div>
         </div>
         <p class="page-desc">
-          LLM tokens and workspace compute, metered from the usage ledger and
-          scoped to your visibility — admins see the fleet, or flip
-          <em>All data</em> off to view just their own. Costs read $0 until rates
-          are configured — quantities are measured now.
+          {{ 'admin.usage.pageDescCloud' | transloco }}
         </p>
 
         <section class="kpi-row">
@@ -76,6 +74,52 @@ import {AgentStatistics, DailyStatistics, JobStatistics} from '../../../core/mod
               <span class="kpi-value">{{ agentStats()?.working ?? 0 }}</span></div>
           }
         </section>
+
+        @if (cloudEstimates().length > 0) {
+          <section class="admin-section cloud-section">
+            <div class="section-head cloud-head">
+              <div>
+                <h2 class="section-title">{{ 'admin.usage.cloudEstimate.title' | transloco }}</h2>
+                <p class="section-note">
+                  {{ 'admin.usage.cloudEstimate.subtitle' | transloco }}
+                </p>
+              </div>
+              <span class="estimate-badge">{{ 'admin.usage.cloudEstimate.computeOnly' | transloco }}</span>
+            </div>
+            <div class="cloud-grid">
+              @for (card of cloudEstimates(); track card.id) {
+                <article class="cloud-card">
+                  <div class="cloud-card-head">
+                    <div>
+                      <span class="cloud-provider">{{ card.provider }}</span>
+                      <h3>{{ card.display_name }}</h3>
+                    </div>
+                    <span class="cloud-value">{{ fmtCurrency(card.estimate, card.currency) }}</span>
+                  </div>
+                  <p class="cloud-region">{{ card.region }}</p>
+                  <p class="cloud-description">{{ card.description }}</p>
+                  <div class="cloud-components">
+                    @for (component of card.components; track component.unit) {
+                      <div class="cloud-component">
+                        <span>{{ fmtQty(component.quantity) }} {{ component.unit }}</span>
+                        <span>{{ fmtCurrency(component.amount, card.currency) }}</span>
+                      </div>
+                    }
+                  </div>
+                  <p class="cloud-formula">
+                    {{ (card.aggregation === 'max'
+                      ? 'admin.usage.cloudEstimate.formulaMax'
+                      : 'admin.usage.cloudEstimate.formulaSum') | transloco }}
+                  </p>
+                  <p class="cloud-exclusions">{{ card.exclusions }}</p>
+                  <a class="cloud-source" [href]="card.source_url" target="_blank" rel="noopener noreferrer">
+                    {{ card.source_label }}
+                  </a>
+                </article>
+              }
+            </div>
+          </section>
+        }
 
         <section class="admin-section">
           <div class="explorer-head">
@@ -392,6 +436,109 @@ import {AgentStatistics, DailyStatistics, JobStatistics} from '../../../core/mod
         border-radius: var(--radius-lg);
         padding: 24px;
         margin-bottom: 24px;
+      }
+      .cloud-head {
+        align-items: flex-start;
+      }
+      .section-note {
+        margin: 4px 0 0;
+        color: var(--text-muted);
+        font-size: 12px;
+        line-height: 1.5;
+      }
+      .estimate-badge {
+        flex: 0 0 auto;
+        padding: 4px 8px;
+        border: 1px solid var(--border-color);
+        border-radius: 999px;
+        color: var(--text-muted);
+        background: var(--surface-0);
+        font-size: 10px;
+        font-weight: 700;
+        letter-spacing: 0.6px;
+        text-transform: uppercase;
+      }
+      .cloud-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+        gap: 12px;
+      }
+      .cloud-card {
+        min-width: 0;
+        padding: 16px;
+        border: 1px solid var(--border-color);
+        border-radius: var(--radius-surface);
+        background: var(--surface-0);
+      }
+      .cloud-card-head {
+        display: flex;
+        justify-content: space-between;
+        align-items: flex-start;
+        gap: 12px;
+      }
+      .cloud-provider {
+        color: var(--text-muted);
+        font-size: 10px;
+        font-weight: 700;
+        letter-spacing: 0.7px;
+        text-transform: uppercase;
+      }
+      .cloud-card h3 {
+        margin: 3px 0 0;
+        color: var(--text-primary);
+        font-size: 13px;
+        font-weight: 650;
+      }
+      .cloud-value {
+        flex: 0 0 auto;
+        color: var(--text-primary);
+        font-size: 20px;
+        font-weight: 750;
+        font-variant-numeric: tabular-nums;
+      }
+      .cloud-region,
+      .cloud-description,
+      .cloud-formula,
+      .cloud-exclusions {
+        color: var(--text-muted);
+        font-size: 11px;
+        line-height: 1.45;
+      }
+      .cloud-region {
+        margin: 5px 0 12px;
+        font-family: 'JetBrains Mono', 'Fira Code', monospace;
+      }
+      .cloud-description {
+        min-height: 32px;
+        margin: 0 0 12px;
+      }
+      .cloud-components {
+        padding: 8px 0;
+        border-top: 1px solid var(--border-color);
+        border-bottom: 1px solid var(--border-color);
+      }
+      .cloud-component {
+        display: flex;
+        justify-content: space-between;
+        gap: 12px;
+        padding: 3px 0;
+        color: var(--text-secondary);
+        font-size: 11px;
+        font-variant-numeric: tabular-nums;
+      }
+      .cloud-formula {
+        margin: 10px 0 0;
+      }
+      .cloud-exclusions {
+        margin: 6px 0 10px;
+      }
+      .cloud-source {
+        color: var(--accent-color);
+        font-size: 11px;
+        text-decoration: none;
+      }
+      .cloud-source:hover {
+        text-decoration: underline;
       }
       .total {
         font-size: 13px;
@@ -782,6 +929,7 @@ export class AdminUsageComponent implements OnInit, OnDestroy {
 
   readonly summary = computed(() => this.usage.usage());
   readonly rows = computed(() => this.summary()?.by_category ?? []);
+  readonly cloudEstimates = computed(() => this.summary()?.cloud_estimates ?? []);
   readonly hasData = computed(() => this.rows().length > 0);
 
   readonly jobStats = signal<JobStatistics | null>(null);
@@ -1121,6 +1269,19 @@ export class AdminUsageComponent implements OnInit, OnDestroy {
 
   fmtCost(n: number): string {
     return '$' + (n ?? 0).toFixed(2);
+  }
+
+  fmtCurrency(n: number, currency: string): string {
+    try {
+      return new Intl.NumberFormat(undefined, {
+        style: 'currency',
+        currency,
+        minimumFractionDigits: 2,
+        maximumFractionDigits: 4,
+      }).format(n ?? 0);
+    } catch {
+      return `${currency} ${(n ?? 0).toFixed(2)}`;
+    }
   }
 
   fmtPct(n: number): string {

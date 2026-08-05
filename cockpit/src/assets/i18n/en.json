@@ -708,7 +708,15 @@
     },
     "usage": {
       "cacheHit": "Cache hit",
-      "cachedTokens": "Cached tok."
+      "cachedTokens": "Cached tok.",
+      "pageDescCloud": "LLM tokens and workspace compute, metered from the usage ledger and scoped to your visibility. Canonical cost uses the rates captured by the ledger; the cloud cards reprice compute for planning without changing that history.",
+      "cloudEstimate": {
+        "title": "Cloud-equivalent estimate",
+        "subtitle": "Current public list prices applied to this window's requested workspace CPU and RAM. These are planning indicators, not invoices.",
+        "computeOnly": "Compute only",
+        "formulaMax": "Dominant CPU or RAM node share sets the estimate.",
+        "formulaSum": "CPU and RAM meter estimates are added."
+      }
     },
     "providers": {
       "title": "Providers",

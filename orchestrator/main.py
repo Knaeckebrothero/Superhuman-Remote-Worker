@@ -187,6 +187,10 @@ from services.dispatch_guards import (  # noqa: E402
     vm_provisioning_decision,
 )
 from services.audit_usage import materialize_llm_usage_from_audit  # noqa: E402
+from services.cloud_pricing import (  # noqa: E402
+    CloudCostEstimator,
+    cloud_pricing_sync_loop,
+)
 from services.openrouter_pricing import llm_pricing_sync_loop  # noqa: E402
 from services.remote_image import (  # noqa: E402
     MAX_REMOTE_IMAGE_URL_CHARS,
@@ -423,6 +427,10 @@ usage_ledger: UsageLedger | None = None
 # tier). The 3 /api/usage endpoints read through it (rollup for closed days, raw
 # for the tail); a daily leader-only pass maintains the app-DB usage_daily mirror.
 usage_rollup: UsageRollup | None = None
+# Public-cloud comparison rate cards live in the app DB and reprice aggregate
+# quantities at read time. They never overwrite the canonical cost snapshotted
+# on usage_events. None only until app migrations/pool initialization completes.
+usage_cloud_estimator: CloudCostEstimator | None = None
 
 
 async def _workspace_metering_attribution(
@@ -7897,6 +7905,8 @@ async def lifespan(app: FastAPI):
         postgres_db.pool,
         usage_ledger,
     )
+    global usage_cloud_estimator
+    usage_cloud_estimator = CloudCostEstimator(postgres_db.pool)
 
     # Encrypt any legacy plaintext datasource credentials. Idempotent — once
     # all rows are v1 ciphertexts this is a fast no-op. Lives in lifespan
@@ -8293,6 +8303,13 @@ async def lifespan(app: FastAPI):
         )
     )
 
+    # Public-cloud comparison prices: AWS/Azure publish machine-readable list
+    # prices. Refresh change-only once per day; STACKIT's PDF-backed reference
+    # card is source-labelled and seeded by app migration 0082.
+    cloud_pricing_sync_task = asyncio.create_task(
+        cloud_pricing_sync_loop(_shutdown_event, postgres_db.pool)
+    )
+
     # Workspace compute metering (Slice 4b): materialize CLOSED workspace
     # intervals into the usage ledger + reconcile leaked opens. Self-disables
     # when the app pool or ledger is absent (non-load-bearing tier).
@@ -8415,6 +8432,7 @@ async def lifespan(app: FastAPI):
     await session_wake_sweeper_task
     await kb_reindex_sweeper_task
     await pricing_sync_task
+    await cloud_pricing_sync_task
     await workspace_metering_task
     await llm_usage_task
     await usage_rollup_task
@@ -19583,10 +19601,11 @@ async def get_usage(
     Reads the ``usage_events`` ledger (Slice 4). Window defaults to the last
     ``days``; ``from_date``/``to_date`` override it. Admins see the full fleet
     (optionally narrowed by an MCP ``project:`` scope); non-admins see only rows
-    they own or can see via project membership. Returns sums by (category, unit)
-    plus the headline ``total_cost_usd`` (0 while resources are unpriced) and
-    ``cache_hit_ratio`` for LLM prompt cache reads. ``available=false`` means the
-    audit tier is off — metering disabled.
+    they own or can see via project membership. Returns sums by (category, unit),
+    the canonical ``total_cost_usd``, provider-list-price ``cloud_estimates``, and
+    ``cache_hit_ratio`` for LLM prompt cache reads. Cloud estimates reprice the
+    measured quantities at read time and never mutate the ledger. ``available=false``
+    means the audit tier is off — metering disabled.
     """
     user = await require_approved_user(request, postgres_db)
     if usage_ledger is None or not usage_ledger.is_available:
@@ -19594,6 +19613,7 @@ async def get_usage(
             "by_category": [],
             "total_cost_usd": 0.0,
             "cache_hit_ratio": 0.0,
+            "cloud_estimates": [],
             "available": False,
         }
     try:
@@ -19630,6 +19650,21 @@ async def get_usage(
             )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
+    if usage_cloud_estimator is not None:
+        try:
+            result["cloud_estimates"] = await usage_cloud_estimator.estimate(
+                result.get("by_category") or []
+            )
+        except Exception:
+            # Planning estimates are strictly non-load-bearing. The measured
+            # quantities and canonical LLM cost remain useful on their own.
+            logger.warning(
+                "cloud-equivalent usage estimate failed (non-fatal)",
+                exc_info=True,
+            )
+            result["cloud_estimates"] = []
+    else:
+        result["cloud_estimates"] = []
     result["available"] = True
     result["from"] = from_ts.isoformat()
     result["to"] = to_ts.isoformat()
