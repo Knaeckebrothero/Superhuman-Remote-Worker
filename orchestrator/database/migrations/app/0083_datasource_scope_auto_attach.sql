@@ -1,8 +1,16 @@
--- migration:     0082_datasource_scope_auto_attach.sql
+-- migration:     0083_datasource_scope_auto_attach.sql
 -- description:   Add explicit connector availability scope, owner defaults,
 --                optimistic policy revisions, durable project reconciliation,
 --                and finish the legacy job-datasource association migration.
--- depends-on:    0081_job_change_records_survive_job_deletion.sql
+--                Originally authored as 0082; renumbered on merge after
+--                0082_usage_cloud_rate_cards.sql landed on the same number
+--                from a parallel branch (docs/db_migration.md
+--                §Conflict resolution: the second to merge renumbers).
+--                The two CHECK constraints land NOT VALID here and are
+--                validated by 0084 in its own transaction; the partial
+--                index on the pre-existing datasources table is built
+--                CONCURRENTLY by 0085.
+-- depends-on:    0082_usage_cloud_rate_cards.sql
 -- expected:      Proportional to datasources/project_datasources; legacy link
 --                and immutable job snapshots scan existing work once.
 -- locks:         Brief ACCESS EXCLUSIVE lock while adding datasource columns;
@@ -19,17 +27,19 @@ ALTER TABLE datasources
     ADD COLUMN auto_attach BOOLEAN NOT NULL DEFAULT FALSE,
     ADD COLUMN policy_revision BIGINT NOT NULL DEFAULT 1;
 
+-- NOT VALID so the ADD takes only a brief ACCESS EXCLUSIVE lock instead of
+-- scanning the table under it; both are enforced against new/updated rows
+-- immediately. Every row present here trivially satisfies them (the columns
+-- were just added with satisfying defaults, and the backfills below only ever
+-- write 'projects'), so 0084's VALIDATE is a formality that confirms the
+-- existing set under a non-blocking SHARE UPDATE EXCLUSIVE lock.
 ALTER TABLE datasources
     ADD CONSTRAINT datasources_scope_mode_check
-    CHECK (scope_mode IN ('all', 'projects'));
+    CHECK (scope_mode IN ('all', 'projects')) NOT VALID;
 
 ALTER TABLE datasources
     ADD CONSTRAINT datasources_policy_revision_positive
-    CHECK (policy_revision > 0);
-
-CREATE INDEX idx_datasources_auto_attach_owner
-    ON datasources (created_by)
-    WHERE job_id IS NULL AND auto_attach = TRUE;
+    CHECK (policy_revision > 0) NOT VALID;
 
 -- The reconciliation worker re-reads PostgreSQL and applies the current state
 -- to the external knowledge stores. There are deliberately no foreign keys:

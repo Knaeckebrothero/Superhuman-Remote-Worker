@@ -501,8 +501,14 @@ security-sensitive scope/default operations.
 
 ## 7. Data model
 
-Use the next available app migration (expected at design time:
-`0082_datasource_scope_auto_attach.sql`):
+Use the next available app migration. Authored as `0082` at design time, this
+shipped as `0083_datasource_scope_auto_attach.sql` — `0082` was claimed by
+`0082_usage_cloud_rate_cards.sql` from a parallel branch, and per
+docs/db_migration.md §Conflict resolution the second to merge renumbers. The
+CHECK constraints ship `NOT VALID` here and are validated by
+`0084_datasource_scope_validate_constraints.sql`; the `datasources` partial
+index is built `CONCURRENTLY` by
+`0085_datasources_auto_attach_owner_idx.notx.sql`:
 
 ```sql
 ALTER TABLE datasources
@@ -512,9 +518,15 @@ ALTER TABLE datasources
 
 ALTER TABLE datasources
     ADD CONSTRAINT datasources_scope_mode_check
-    CHECK (scope_mode IN ('all', 'projects'));
+    CHECK (scope_mode IN ('all', 'projects')) NOT VALID;
 
-CREATE INDEX idx_datasources_auto_attach_owner
+-- 0084, its own transaction: validating in the same one as the ADD would hold
+-- that statement's ACCESS EXCLUSIVE lock across the scan.
+ALTER TABLE datasources
+    VALIDATE CONSTRAINT datasources_scope_mode_check;
+
+-- 0085, outside any transaction (.notx.sql).
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_datasources_auto_attach_owner
     ON datasources (created_by)
     WHERE job_id IS NULL AND auto_attach = TRUE;
 ```
