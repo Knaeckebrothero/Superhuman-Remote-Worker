@@ -708,7 +708,15 @@
     },
     "usage": {
       "cacheHit": "Cache-Treffer",
-      "cachedTokens": "Gecachte Tok."
+      "cachedTokens": "Gecachte Tok.",
+      "pageDescCloud": "LLM-Token und Workspace-Compute werden im Nutzungs-Ledger erfasst und auf deine Sichtbarkeit begrenzt. Die kanonischen Kosten verwenden die im Ledger gespeicherten Tarife; die Cloud-Karten bewerten Compute zur Planung neu, ohne den Verlauf zu verändern.",
+      "cloudEstimate": {
+        "title": "Cloud-Vergleichsschätzung",
+        "subtitle": "Aktuelle öffentliche Listenpreise für die in diesem Zeitraum angeforderten Workspace-CPU- und RAM-Ressourcen. Diese Werte dienen der Planung und sind keine Rechnungen.",
+        "computeOnly": "Nur Compute",
+        "formulaMax": "Der dominante CPU- oder RAM-Knotenanteil bestimmt die Schätzung.",
+        "formulaSum": "Die Schätzungen der CPU- und RAM-Zähler werden addiert."
+      }
     },
     "providers": {
       "title": "Anbieter",

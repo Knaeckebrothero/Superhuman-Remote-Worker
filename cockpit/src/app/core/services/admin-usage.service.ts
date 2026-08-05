@@ -21,11 +21,41 @@ export interface UsageCategoryRow {
   events: number;
 }
 
+export interface CloudEstimateComponent {
+  category: string;
+  unit: string;
+  quantity: number;
+  rate: number;
+  capacity_per_billing_unit: number;
+  amount: number;
+  source_sku?: string | null;
+  effective_from: string;
+}
+
+/** Current provider list-price revaluation of the measured compute quantities. */
+export interface CloudEstimate {
+  id: string;
+  provider: string;
+  display_name: string;
+  region: string;
+  currency: string;
+  aggregation: 'sum' | 'max';
+  estimate: number;
+  priced_at: string;
+  source_url: string;
+  source_label: string;
+  source_checked_at?: string | null;
+  description: string;
+  exclusions: string;
+  components: CloudEstimateComponent[];
+}
+
 /** Response of `GET /api/usage` (Slice 4 usage ledger). */
 export interface UsageSummary {
   by_category: UsageCategoryRow[];
   total_cost_usd: number;
   cache_hit_ratio: number;
+  cloud_estimates?: CloudEstimate[];
   available: boolean;
   from?: string;
   to?: string;
@@ -35,6 +65,7 @@ const EMPTY: UsageSummary = {
   by_category: [],
   total_cost_usd: 0,
   cache_hit_ratio: 0,
+  cloud_estimates: [],
   available: false,
 };
 

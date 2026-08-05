@@ -51,6 +51,25 @@ describe('AdminUsageComponent refresh shell', () => {
     expect(c.computeHours()).toBe(2);
   });
 
+  it('exposes provider compute estimates without folding them into canonical cost', () => {
+    const c = TestBed.inject(AdminUsageComponent);
+    (c as any).usage.usage.set({
+      available: true,
+      total_cost_usd: 1.25,
+      cache_hit_ratio: 0,
+      by_category: [],
+      cloud_estimates: [{
+        id: 'stackit', provider: 'stackit', display_name: 'STACKIT', region: 'EU01',
+        currency: 'EUR', aggregation: 'max', estimate: 0.42, priced_at: 'now',
+        source_url: 'https://example.test', source_label: 'Price list',
+        description: 'Node share', exclusions: 'Control plane excluded', components: [],
+      }],
+    });
+    expect(c.cloudEstimates()[0].estimate).toBe(0.42);
+    expect(c.summary()?.total_cost_usd).toBe(1.25);
+    expect(c.fmtCurrency(0.42, 'EUR')).toMatch(/0[.,]42/);
+  });
+
   it('userRows derives role and per-unit columns with a share fraction', () => {
     const c = TestBed.inject(AdminUsageComponent);
     (c as any).usage.breakdown = () => ({available: true, group_by: 'user', rows: [

@@ -55,9 +55,13 @@ cost is sourced — see below):
   > priced from `usage_rates` again, whose **LLM rates (prompt/completion-token) are
   > now auto-seeded** from OpenRouter's catalog by
   > `openrouter_pricing.llm_pricing_sync_loop` — not admin-seeded, not empty.
-  > Compute rates (vcpu/gib-hour) stay unseeded, so those rows meter quantity with
-  > `cost_usd` NULL until a rate exists; an unpriced (category, resource, unit)
-  > resolves to no rate and the quantity still meters immediately.
+  > Canonical compute rates (vcpu/gib-hour) stay unseeded, so those rows meter
+  > quantity with `cost_usd` NULL until a rate exists; an unpriced (category,
+  > resource, unit) resolves to no rate and the quantity still meters immediately.
+  > **Added 2026-08-05:** [[cloud_equivalent_usage_pricing]] keeps separate,
+  > effective-dated STACKIT/AWS/Azure rate cards and reprices those quantities at
+  > read time for planning. It never writes the comparison estimate back onto
+  > `usage_events` or presents it as canonical customer spend.
 - **LLM rows — DESIGN CHANGE.** This doc sketched emitting them at the agent's
   token-capture point (`archiver.py:393`). The implementation instead **materializes them
   from the LiteLLM gateway** (poll `/spend/logs` → `category='llm'` rows). Why: the gateway
@@ -149,6 +153,7 @@ usage_events  -- monthly range-partitioned on ts (audit-store partition machiner
 | `usage_events` (high volume, time-series) | **`srw-auditdb`** (in-chart observability store) | Keeps the firehose off the control plane, ships with the product, reuses the audit store's pool/partition machinery (retention is a no-auto-deletion policy). *(Amended 2026-06-11 — was `analytics` TimescaleDB; see `database_architecture.md`.)* |
 | `usage_daily` rollup mirror (small, joinable) | **App DB** | The Cockpit dashboard must join usage with user/job/project names. The rollup task (`services/usage_rollup.py`) full-replace upserts closed days here + advances the `rollup_state` watermark; `/api/usage` serves it for closed days, raw `usage_events` for the open tail. |
 | `usage_rates` (config) | **App DB** | Small relational config; LLM rates auto-seeded from OpenRouter (`openrouter_pricing`), compute rates admin-settable. Fits the [[config_matrix_db_overrides]] DB-override pattern. |
+| `usage_rate_cards` + `usage_rate_card_rates` (comparison config) | **App DB** | Effective-dated public-cloud list-price cards used only to revalue measured quantities in `GET /api/usage`. AWS/Azure refresh from official machine-readable sources; STACKIT is source-labelled from its public PDF. See [[cloud_equivalent_usage_pricing]]. |
 | `quota_limits` (config) | **App DB** | **Planned, not built** — the rate-limiting v2 concern (`rate_limiting_and_plan_quotas.md`), scope-polymorphic `(scope_kind, scope_id, period, limit_usd, …)`. |
 
 New wiring required: **none beyond the audit-store foundation** *(amended
