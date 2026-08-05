@@ -36,6 +36,20 @@ SET client_min_messages = warning;
 SET row_security = off;
 
 --
+-- Name: btree_gist; Type: EXTENSION; Schema: -; Owner: -
+--
+
+CREATE EXTENSION IF NOT EXISTS btree_gist WITH SCHEMA public;
+
+
+--
+-- Name: EXTENSION btree_gist; Type: COMMENT; Schema: -; Owner: -
+--
+
+COMMENT ON EXTENSION btree_gist IS 'support for indexing common datatypes in GiST';
+
+
+--
 -- Name: uuid-ossp; Type: EXTENSION; Schema: -; Owner: -
 --
 
@@ -111,6 +125,390 @@ $$;
 
 
 --
+-- Name: protect_infra_usage_day_state_mutation(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.protect_infra_usage_day_state_mutation() RETURNS trigger
+    LANGUAGE plpgsql
+    SET search_path TO 'pg_catalog'
+    AS $$
+BEGIN
+    IF TG_OP = 'INSERT' THEN
+        IF NEW.state <> 'open' THEN
+            RAISE EXCEPTION
+                'infrastructure usage day state must begin open'
+                USING ERRCODE = '55000';
+        END IF;
+        RETURN NEW;
+    END IF;
+
+    IF TG_OP = 'DELETE' THEN
+        RAISE EXCEPTION
+            'infrastructure usage day state cannot be deleted'
+            USING ERRCODE = '55000';
+    END IF;
+
+    IF OLD.state = 'sealed' THEN
+        RAISE EXCEPTION
+            'sealed infrastructure usage days are immutable'
+            USING ERRCODE = '55000';
+    END IF;
+
+    IF NEW.day <> OLD.day
+       OR NEW.updated_at < OLD.updated_at
+       OR (OLD.state = 'open' AND NEW.state NOT IN ('open', 'sealing'))
+       OR (OLD.state = 'sealing' AND NEW.state NOT IN ('sealing', 'sealed'))
+    THEN
+        RAISE EXCEPTION
+            'infrastructure usage day state advances open to sealing to sealed'
+            USING ERRCODE = '55000';
+    END IF;
+
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: protect_resource_interval_revision_mutation(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.protect_resource_interval_revision_mutation() RETURNS trigger
+    LANGUAGE plpgsql
+    SET search_path TO 'pg_catalog'
+    AS $$
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        RAISE EXCEPTION
+            'resource interval revisions are retained and cannot be deleted'
+            USING ERRCODE = '55000';
+    END IF;
+
+    IF (to_jsonb(NEW)
+            - 'ended_at' - 'end_time_source' - 'end_uncertainty_us'
+            - 'end_reason' - 'last_seen_at' - 'last_confirmed_at'
+            - 'last_seen_snapshot_id' - 'materialized_through' - 'updated_at')
+       <> (to_jsonb(OLD)
+            - 'ended_at' - 'end_time_source' - 'end_uncertainty_us'
+            - 'end_reason' - 'last_seen_at' - 'last_confirmed_at'
+            - 'last_seen_snapshot_id' - 'materialized_through' - 'updated_at') THEN
+        RAISE EXCEPTION
+            'event-affecting interval revision fields are immutable'
+            USING ERRCODE = '55000';
+    END IF;
+
+    IF NEW.last_seen_at < OLD.last_seen_at
+       OR NEW.last_confirmed_at < OLD.last_confirmed_at
+       OR NEW.materialized_through < OLD.materialized_through
+       OR NEW.updated_at < OLD.updated_at
+       OR (OLD.last_seen_snapshot_id IS NOT NULL
+           AND NEW.last_seen_snapshot_id IS NULL) THEN
+        RAISE EXCEPTION
+            'interval liveness and materialization cursors are monotonic'
+            USING ERRCODE = '55000';
+    END IF;
+
+    IF OLD.ended_at IS NOT NULL THEN
+        IF NEW.ended_at IS DISTINCT FROM OLD.ended_at
+           OR NEW.end_time_source IS DISTINCT FROM OLD.end_time_source
+           OR NEW.end_uncertainty_us IS DISTINCT FROM OLD.end_uncertainty_us
+           OR NEW.end_reason IS DISTINCT FROM OLD.end_reason
+           OR NEW.last_seen_at IS DISTINCT FROM OLD.last_seen_at
+           OR NEW.last_confirmed_at IS DISTINCT FROM OLD.last_confirmed_at
+           OR NEW.last_seen_snapshot_id IS DISTINCT FROM OLD.last_seen_snapshot_id
+        THEN
+            RAISE EXCEPTION
+                'closed interval evidence and end metadata are immutable'
+                USING ERRCODE = '55000';
+        END IF;
+    ELSIF NEW.ended_at IS NULL THEN
+        IF NEW.end_time_source IS NOT NULL
+           OR NEW.end_uncertainty_us IS NOT NULL
+           OR NEW.end_reason IS NOT NULL THEN
+            RAISE EXCEPTION
+                'open intervals cannot carry end metadata'
+                USING ERRCODE = '55000';
+        END IF;
+    END IF;
+
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: protect_resource_inventory_snapshot_item_mutation(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.protect_resource_inventory_snapshot_item_mutation() RETURNS trigger
+    LANGUAGE plpgsql SECURITY DEFINER
+    SET search_path TO 'pg_catalog'
+    AS $$
+DECLARE
+    old_state TEXT;
+    new_state TEXT;
+BEGIN
+    IF TG_OP = 'INSERT' THEN
+        SELECT manifest_state INTO new_state
+        FROM public.resource_inventory_snapshots
+        WHERE id = NEW.snapshot_id
+        FOR UPDATE;
+        IF new_state = 'staging' THEN
+            RETURN NEW;
+        END IF;
+    ELSIF TG_OP = 'UPDATE' THEN
+        IF NEW.snapshot_id <> OLD.snapshot_id THEN
+            RAISE EXCEPTION
+                'snapshot items cannot move between manifests'
+                USING ERRCODE = '55000';
+        END IF;
+        SELECT manifest_state INTO old_state
+        FROM public.resource_inventory_snapshots
+        WHERE id = OLD.snapshot_id
+        FOR UPDATE;
+        SELECT manifest_state INTO new_state
+        FROM public.resource_inventory_snapshots
+        WHERE id = NEW.snapshot_id
+        FOR UPDATE;
+        IF old_state = 'staging' AND new_state = 'staging' THEN
+            RETURN NEW;
+        END IF;
+    ELSIF TG_OP = 'DELETE' THEN
+        SELECT manifest_state INTO old_state
+        FROM public.resource_inventory_snapshots
+        WHERE id = OLD.snapshot_id
+        FOR UPDATE;
+        IF old_state = 'items-expired' THEN
+            RETURN OLD;
+        END IF;
+    END IF;
+
+    RAISE EXCEPTION
+        'sealed inventory snapshot items are immutable'
+        USING ERRCODE = '55000';
+END;
+$$;
+
+
+--
+-- Name: protect_resource_inventory_snapshot_mutation(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.protect_resource_inventory_snapshot_mutation() RETURNS trigger
+    LANGUAGE plpgsql SECURITY DEFINER
+    SET search_path TO 'pg_catalog'
+    AS $$
+DECLARE
+    actual_count BIGINT;
+BEGIN
+    IF TG_OP = 'INSERT' THEN
+        IF NEW.manifest_state = 'staging' THEN
+            RETURN NEW;
+        END IF;
+        RAISE EXCEPTION
+            'inventory snapshots must begin in the staging state'
+            USING ERRCODE = '55000';
+    END IF;
+
+    IF OLD.manifest_state = 'staging'
+       AND NEW.manifest_state = 'sealed'
+       AND NEW.sealed_at IS NOT NULL
+       AND NEW.items_expired_at IS NULL
+       AND NEW.id = OLD.id
+       AND NEW.scope_epoch_id = OLD.scope_epoch_id
+       AND NEW.inventory_scope_id = OLD.inventory_scope_id
+       AND NEW.collection_started_at = OLD.collection_started_at
+       AND NEW.created_at = OLD.created_at THEN
+        SELECT count(*)
+        INTO actual_count
+        FROM public.resource_inventory_snapshot_items
+        WHERE snapshot_id = NEW.id;
+
+        IF actual_count <> NEW.item_count THEN
+            RAISE EXCEPTION
+                'snapshot % declares % items but has %',
+                NEW.id, NEW.item_count, actual_count
+                USING ERRCODE = '23514';
+        END IF;
+        RETURN NEW;
+    END IF;
+
+    IF OLD.manifest_state = 'sealed'
+       AND NEW.manifest_state = 'items-expired'
+       AND NEW.items_expired_at IS NOT NULL
+       AND NEW.items_expired_at <= statement_timestamp()
+       AND OLD.collection_completed_at
+           <= statement_timestamp() - INTERVAL '7 days'
+       AND (to_jsonb(NEW) - 'manifest_state' - 'items_expired_at')
+           = (to_jsonb(OLD) - 'manifest_state' - 'items_expired_at') THEN
+        RETURN NEW;
+    END IF;
+
+    RAISE EXCEPTION
+        'snapshot metadata may only be finalized once or mark sealed items expired'
+        USING ERRCODE = '55000';
+END;
+$$;
+
+
+--
+-- Name: protect_resource_publication_plan_event_mutation(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.protect_resource_publication_plan_event_mutation() RETURNS trigger
+    LANGUAGE plpgsql SECURITY DEFINER
+    SET search_path TO 'pg_catalog'
+    AS $$
+DECLARE
+    parent_state TEXT;
+    target_plan_id UUID;
+BEGIN
+    IF TG_OP = 'UPDATE' THEN
+        RAISE EXCEPTION
+            'publication plan events are immutable'
+            USING ERRCODE = '55000';
+    END IF;
+
+    IF TG_OP = 'DELETE' THEN
+        target_plan_id := OLD.plan_id;
+    ELSE
+        target_plan_id := NEW.plan_id;
+    END IF;
+
+    SELECT plan.state
+    INTO parent_state
+    FROM public.resource_publication_plans plan
+    WHERE plan.id = target_plan_id
+    FOR UPDATE;
+
+    IF TG_OP = 'INSERT' AND parent_state = 'planned' THEN
+        RETURN NEW;
+    END IF;
+    IF TG_OP = 'DELETE' AND parent_state = 'published' THEN
+        RETURN OLD;
+    END IF;
+
+    RAISE EXCEPTION
+        'plan events may be inserted while planned and deleted only for published retention cleanup'
+        USING ERRCODE = '55000';
+END;
+$$;
+
+
+--
+-- Name: protect_resource_publication_plan_mutation(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.protect_resource_publication_plan_mutation() RETURNS trigger
+    LANGUAGE plpgsql SECURITY DEFINER
+    SET search_path TO 'pg_catalog'
+    AS $$
+DECLARE
+    actual_count BIGINT;
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        IF OLD.state = 'published' THEN
+            RETURN OLD;
+        END IF;
+        RAISE EXCEPTION
+            'only published plans may enter the reviewed retention cleanup path'
+            USING ERRCODE = '55000';
+    END IF;
+
+    IF OLD.state <> 'planned' THEN
+        RAISE EXCEPTION
+            'published and conflict publication plans are terminal'
+            USING ERRCODE = '55000';
+    END IF;
+
+    IF (to_jsonb(NEW)
+            - 'state' - 'attempt_count' - 'last_attempt_at'
+            - 'sanitized_error' - 'published_at')
+       <> (to_jsonb(OLD)
+            - 'state' - 'attempt_count' - 'last_attempt_at'
+            - 'sanitized_error' - 'published_at') THEN
+        RAISE EXCEPTION
+            'publication plan intent and hashes are immutable'
+            USING ERRCODE = '55000';
+    END IF;
+
+    IF NEW.attempt_count < OLD.attempt_count
+       OR (OLD.last_attempt_at IS NOT NULL AND NEW.last_attempt_at IS NULL)
+       OR (OLD.last_attempt_at IS NOT NULL
+           AND NEW.last_attempt_at < OLD.last_attempt_at)
+       OR (NEW.attempt_count > OLD.attempt_count
+           AND NEW.last_attempt_at IS NULL)
+       OR (NEW.attempt_count = OLD.attempt_count
+           AND NEW.last_attempt_at IS DISTINCT FROM OLD.last_attempt_at) THEN
+        RAISE EXCEPTION
+            'publication attempt state must advance monotonically'
+            USING ERRCODE = '55000';
+    END IF;
+
+    IF NEW.state = 'published' THEN
+        SELECT count(*)
+        INTO actual_count
+        FROM public.resource_publication_plan_events event
+        WHERE event.plan_id = NEW.id;
+        IF actual_count <> NEW.expected_event_count THEN
+            RAISE EXCEPTION
+                'publication plan % cannot publish an incomplete manifest', NEW.id
+                USING ERRCODE = '23514';
+        END IF;
+    END IF;
+
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: protect_usage_rate_card_version_mutation(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.protect_usage_rate_card_version_mutation() RETURNS trigger
+    LANGUAGE plpgsql
+    SET search_path TO 'pg_catalog'
+    AS $$
+BEGIN
+    IF TG_OP = 'UPDATE'
+       AND OLD.provider_effective_to IS NULL
+       AND NEW.provider_effective_to IS NOT NULL
+       AND (to_jsonb(NEW) - 'provider_effective_to')
+           = (to_jsonb(OLD) - 'provider_effective_to') THEN
+        RETURN NEW;
+    END IF;
+    RAISE EXCEPTION
+        'usage rate-card version terms are immutable; close once and insert a successor'
+        USING ERRCODE = '55000';
+END;
+$$;
+
+
+--
+-- Name: protect_usage_rates_v2_mutation(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.protect_usage_rates_v2_mutation() RETURNS trigger
+    LANGUAGE plpgsql
+    SET search_path TO 'pg_catalog'
+    AS $$
+BEGIN
+    IF TG_OP = 'UPDATE'
+       AND OLD.effective_to IS NULL
+       AND NEW.effective_to IS NOT NULL
+       AND (to_jsonb(NEW) - 'effective_to')
+           = (to_jsonb(OLD) - 'effective_to') THEN
+        RETURN NEW;
+    END IF;
+    RAISE EXCEPTION
+        'usage_rates_v2 terms are immutable; close once and insert a successor'
+        USING ERRCODE = '55000';
+END;
+$$;
+
+
+--
 -- Name: reconcile_datasource_project_policy_change(); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -167,6 +565,22 @@ BEGIN
         updated_at = NOW();
 
     RETURN COALESCE(NEW, OLD);
+END;
+$$;
+
+
+--
+-- Name: reject_usage_rate_component_mutation(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.reject_usage_rate_component_mutation() RETURNS trigger
+    LANGUAGE plpgsql
+    SET search_path TO 'pg_catalog'
+    AS $$
+BEGIN
+    RAISE EXCEPTION
+        'usage rate-card components are immutable; insert a successor version'
+        USING ERRCODE = '55000';
 END;
 $$;
 
@@ -245,6 +659,157 @@ CREATE FUNCTION public.update_updated_at_column() RETURNS trigger
 BEGIN
     NEW.updated_at = CURRENT_TIMESTAMP;
     RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: validate_inventory_epoch_last_complete_snapshot(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.validate_inventory_epoch_last_complete_snapshot() RETURNS trigger
+    LANGUAGE plpgsql SECURITY DEFINER
+    SET search_path TO 'pg_catalog'
+    AS $$
+BEGIN
+    IF NEW.last_complete_snapshot_id IS NOT NULL
+       AND NOT EXISTS (
+           SELECT 1
+           FROM public.resource_inventory_snapshots snapshot
+           WHERE snapshot.id = NEW.last_complete_snapshot_id
+             AND snapshot.scope_epoch_id = NEW.id
+             AND snapshot.complete = TRUE
+             AND snapshot.manifest_state IN ('sealed', 'items-expired')
+       ) THEN
+        RAISE EXCEPTION
+            'last_complete_snapshot_id must reference a sealed complete snapshot in this epoch'
+            USING ERRCODE = '23503';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: validate_resource_interval_scope_identity(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.validate_resource_interval_scope_identity() RETURNS trigger
+    LANGUAGE plpgsql SECURITY DEFINER
+    SET search_path TO 'pg_catalog'
+    AS $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM public.resource_inventory_scopes scope
+        WHERE scope.id = NEW.inventory_scope_id
+          AND scope.source_cluster = NEW.source_cluster
+          AND scope.namespace IS NOT DISTINCT FROM NEW.namespace
+    ) THEN
+        RAISE EXCEPTION
+            'interval inventory scope does not match cluster/namespace identity'
+            USING ERRCODE = '23503';
+    END IF;
+    IF NEW.last_seen_snapshot_id IS NOT NULL
+       AND NOT EXISTS (
+           SELECT 1
+           FROM public.resource_inventory_snapshots snapshot
+           WHERE snapshot.id = NEW.last_seen_snapshot_id
+             AND snapshot.inventory_scope_id = NEW.inventory_scope_id
+             AND snapshot.complete = TRUE
+             AND snapshot.manifest_state IN ('sealed', 'items-expired')
+       ) THEN
+        RAISE EXCEPTION
+            'last_seen_snapshot_id must reference a sealed complete snapshot in the interval scope'
+            USING ERRCODE = '23503';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: validate_resource_publication_plan_manifest(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.validate_resource_publication_plan_manifest() RETURNS trigger
+    LANGUAGE plpgsql SECURITY DEFINER
+    SET search_path TO 'pg_catalog'
+    AS $$
+DECLARE
+    target_plan_id UUID;
+    expected_count INTEGER;
+    actual_count BIGINT;
+    minimum_ordinal INTEGER;
+    maximum_ordinal INTEGER;
+BEGIN
+    IF TG_TABLE_NAME = 'resource_publication_plans' THEN
+        target_plan_id := NEW.id;
+    ELSE
+        target_plan_id := NEW.plan_id;
+    END IF;
+
+    SELECT plan.expected_event_count
+    INTO expected_count
+    FROM public.resource_publication_plans plan
+    WHERE plan.id = target_plan_id;
+
+    SELECT count(*), min(event.ordinal), max(event.ordinal)
+    INTO actual_count, minimum_ordinal, maximum_ordinal
+    FROM public.resource_publication_plan_events event
+    WHERE event.plan_id = target_plan_id;
+
+    IF expected_count IS NULL
+       OR actual_count <> expected_count
+       OR minimum_ordinal <> 0
+       OR maximum_ordinal <> expected_count - 1 THEN
+        RAISE EXCEPTION
+            'publication plan % declares % contiguous events but has count %, ordinals %..%',
+            target_plan_id, expected_count, actual_count,
+            minimum_ordinal, maximum_ordinal
+            USING ERRCODE = '23514';
+    END IF;
+    RETURN NULL;
+END;
+$$;
+
+
+--
+-- Name: validate_usage_rate_card_component_count(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.validate_usage_rate_card_component_count() RETURNS trigger
+    LANGUAGE plpgsql SECURITY DEFINER
+    SET search_path TO 'pg_catalog'
+    AS $$
+DECLARE
+    target_version_id UUID;
+    expected_count INTEGER;
+    actual_count BIGINT;
+BEGIN
+    IF TG_TABLE_NAME = 'usage_rate_card_versions_v2' THEN
+        target_version_id := NEW.id;
+    ELSE
+        target_version_id := NEW.version_id;
+    END IF;
+
+    SELECT component_count
+    INTO expected_count
+    FROM public.usage_rate_card_versions_v2
+    WHERE id = target_version_id;
+
+    SELECT count(*)
+    INTO actual_count
+    FROM public.usage_rate_components_v2
+    WHERE version_id = target_version_id;
+
+    IF expected_count IS NULL OR actual_count <> expected_count THEN
+        RAISE EXCEPTION
+            'rate-card version % declares % components but has %',
+            target_version_id, expected_count, actual_count
+            USING ERRCODE = '23514';
+    END IF;
+    RETURN NULL;
 END;
 $$;
 
@@ -1145,6 +1710,38 @@ CREATE TABLE public.external_contacts (
 
 
 --
+-- Name: infra_metering_control; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.infra_metering_control (
+    singleton boolean DEFAULT true NOT NULL,
+    leader_generation bigint DEFAULT 0 NOT NULL,
+    cutover_state text DEFAULT 'disabled'::text NOT NULL,
+    cutover_at timestamp with time zone,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT infra_metering_control_cutover_check CHECK ((((cutover_state = 'disabled'::text) AND (cutover_at IS NULL)) OR ((cutover_state = ANY (ARRAY['preparing'::text, 'active'::text])) AND (cutover_at IS NOT NULL)))),
+    CONSTRAINT infra_metering_control_generation_check CHECK ((leader_generation >= 0)),
+    CONSTRAINT infra_metering_control_singleton_check CHECK (singleton)
+);
+
+
+--
+-- Name: infra_usage_day_state; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.infra_usage_day_state (
+    day date NOT NULL,
+    state text DEFAULT 'open'::text NOT NULL,
+    coverage_status text,
+    coverage_revision text,
+    unknown_ranges jsonb DEFAULT '[]'::jsonb NOT NULL,
+    sealed_at timestamp with time zone,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT infra_usage_day_state_shape_check CHECK (((state = ANY (ARRAY['open'::text, 'sealing'::text, 'sealed'::text])) AND ((coverage_status IS NULL) OR (coverage_status = ANY (ARRAY['complete'::text, 'partial'::text]))) AND ((coverage_status IS NULL) = (coverage_revision IS NULL)) AND ((coverage_revision IS NULL) OR (coverage_revision <> ''::text)) AND (jsonb_typeof(unknown_ranges) = 'array'::text) AND (((state = 'sealed'::text) AND (coverage_status IS NOT NULL) AND (coverage_revision IS NOT NULL) AND (sealed_at IS NOT NULL)) OR ((state <> 'sealed'::text) AND (sealed_at IS NULL)))))
+);
+
+
+--
 -- Name: job_change_records; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -1750,6 +2347,280 @@ CREATE TABLE public.projects (
 --
 
 COMMENT ON COLUMN public.projects.network_tier IS 'Workspace pod-network egress tier. Controls which CIDRs the project''s workspace pods can reach. The orchestrator emits this value as the srw.io/network-tier pod label; the matching helm NetworkPolicy (one per tier) enforces the allowlist. See docs/features/workspace_network_isolation.md §3.';
+
+
+--
+-- Name: resource_intervals; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.resource_intervals (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    inventory_scope_id uuid NOT NULL,
+    source_cluster text NOT NULL,
+    source_kind text NOT NULL,
+    source_uid text NOT NULL,
+    source_api_version text NOT NULL,
+    source_resource_version text,
+    source_lifecycle_id uuid NOT NULL,
+    revision_no bigint NOT NULL,
+    source_revision text NOT NULL,
+    namespace text,
+    name text NOT NULL,
+    category text NOT NULL,
+    resource text NOT NULL,
+    measurement_basis text NOT NULL,
+    cost_domain text NOT NULL,
+    resource_class text NOT NULL,
+    attribution_scope text NOT NULL,
+    owner_kind text,
+    owner_id text,
+    user_id uuid,
+    project_id uuid,
+    attribution_source text NOT NULL,
+    attribution_quality text NOT NULL,
+    backing_resource_uid text,
+    lifecycle_confidence text NOT NULL,
+    cpu_millicores bigint,
+    memory_bytes bigint,
+    storage_bytes bigint,
+    capacity_source text NOT NULL,
+    capacity_quality text NOT NULL,
+    measurement_algorithm text NOT NULL,
+    started_at timestamp with time zone NOT NULL,
+    start_time_source text NOT NULL,
+    start_uncertainty_us bigint NOT NULL,
+    ended_at timestamp with time zone,
+    end_time_source text,
+    end_uncertainty_us bigint,
+    last_seen_at timestamp with time zone NOT NULL,
+    last_confirmed_at timestamp with time zone NOT NULL,
+    last_seen_snapshot_id uuid,
+    materialized_through timestamp with time zone NOT NULL,
+    end_reason text,
+    details jsonb DEFAULT '{}'::jsonb NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT resource_intervals_attribution_check CHECK ((((attribution_scope = 'customer'::text) AND (owner_kind IS NOT NULL) AND (owner_kind = ANY (ARRAY['job'::text, 'thread'::text])) AND (owner_id IS NOT NULL) AND (owner_id <> ''::text) AND (user_id IS NOT NULL) AND (attribution_quality = ANY (ARRAY['exact'::text, 'derived'::text]))) OR ((attribution_scope = 'shared-platform'::text) AND (user_id IS NULL) AND (project_id IS NULL) AND (attribution_quality = ANY (ARRAY['exact'::text, 'derived'::text]))) OR ((attribution_scope = 'unknown'::text) AND (user_id IS NULL) AND (project_id IS NULL) AND (attribution_quality = ANY (ARRAY['ambiguous'::text, 'unknown'::text]))))),
+    CONSTRAINT resource_intervals_capacity_check CHECK (((revision_no > 0) AND ((cpu_millicores IS NULL) OR (cpu_millicores >= 0)) AND ((memory_bytes IS NULL) OR (memory_bytes >= 0)) AND ((storage_bytes IS NULL) OR (storage_bytes >= 0)) AND (((category = 'compute'::text) AND (cpu_millicores IS NOT NULL) AND (memory_bytes IS NOT NULL) AND (storage_bytes IS NULL)) OR ((category = 'storage'::text) AND (storage_bytes IS NOT NULL) AND (cpu_millicores IS NULL) AND (memory_bytes IS NULL))))),
+    CONSTRAINT resource_intervals_cursor_check CHECK (((last_seen_at >= started_at) AND (last_confirmed_at >= started_at) AND (materialized_through >= started_at) AND (materialized_through <= COALESCE(ended_at, last_confirmed_at)))),
+    CONSTRAINT resource_intervals_details_check CHECK ((jsonb_typeof(details) = 'object'::text)),
+    CONSTRAINT resource_intervals_dimension_check CHECK (((source_kind = ANY (ARRAY['pod'::text, 'vmi'::text, 'pvc'::text, 'volume'::text])) AND (category = ANY (ARRAY['compute'::text, 'storage'::text])) AND (measurement_basis = ANY (ARRAY['scheduler-request'::text, 'guest-provisioned'::text, 'claim-requested'::text, 'volume-provisioned'::text])) AND (cost_domain = ANY (ARRAY['workload-allocation'::text, 'physical-asset'::text, 'idle'::text, 'overhead'::text])) AND (attribution_scope = ANY (ARRAY['customer'::text, 'shared-platform'::text, 'unknown'::text])) AND ((owner_kind IS NULL) OR (owner_kind = ANY (ARRAY['job'::text, 'thread'::text, 'platform'::text, 'unknown'::text]))) AND (((source_kind = 'pod'::text) AND (category = 'compute'::text) AND (measurement_basis = 'scheduler-request'::text) AND (resource_class = 'kubernetes-pod'::text) AND (cost_domain = 'workload-allocation'::text)) OR ((source_kind = 'vmi'::text) AND (category = 'compute'::text) AND (measurement_basis = 'guest-provisioned'::text) AND (resource_class = 'virtual-machine'::text) AND (cost_domain = 'workload-allocation'::text)) OR ((source_kind = 'pvc'::text) AND (category = 'storage'::text) AND (measurement_basis = 'claim-requested'::text) AND (resource_class = 'persistent-volume-claim'::text) AND (cost_domain = 'workload-allocation'::text)) OR ((source_kind = 'volume'::text) AND (category = 'storage'::text) AND (measurement_basis = 'volume-provisioned'::text) AND (resource_class = 'persistent-volume'::text) AND (cost_domain = 'physical-asset'::text))))),
+    CONSTRAINT resource_intervals_end_metadata_check CHECK ((((ended_at IS NULL) AND (end_time_source IS NULL) AND (end_uncertainty_us IS NULL) AND (end_reason IS NULL)) OR ((ended_at IS NOT NULL) AND (end_time_source IS NOT NULL) AND (end_uncertainty_us IS NOT NULL) AND (end_reason IS NOT NULL)))),
+    CONSTRAINT resource_intervals_identity_check CHECK (((source_cluster <> ''::text) AND (source_uid <> ''::text) AND (source_api_version <> ''::text) AND (name <> ''::text) AND (resource <> ''::text) AND (resource_class <> ''::text) AND (attribution_source <> ''::text) AND (attribution_quality <> ''::text) AND (lifecycle_confidence <> ''::text) AND (capacity_source <> ''::text) AND (capacity_quality <> ''::text) AND (measurement_algorithm <> ''::text) AND (start_time_source <> ''::text) AND (source_revision ~ '^[0-9a-f]{64}$'::text) AND ((namespace IS NULL) OR (namespace <> ''::text)))),
+    CONSTRAINT resource_intervals_quality_check CHECK (((attribution_quality = ANY (ARRAY['exact'::text, 'derived'::text, 'ambiguous'::text, 'unknown'::text, 'invalid'::text])) AND (capacity_quality = ANY (ARRAY['exact'::text, 'derived'::text, 'conservative'::text, 'resize-status-unavailable'::text, 'unsupported'::text, 'unknown'::text, 'invalid'::text])) AND (attribution_quality <> 'invalid'::text) AND (capacity_quality <> ALL (ARRAY['unsupported'::text, 'unknown'::text, 'invalid'::text])) AND (lifecycle_confidence = ANY (ARRAY['backend-confirmed'::text, 'kubernetes-visible'::text, 'backend-unverified'::text])))),
+    CONSTRAINT resource_intervals_time_check CHECK (((start_uncertainty_us >= 0) AND ((end_uncertainty_us IS NULL) OR (end_uncertainty_us >= 0)) AND ((ended_at IS NULL) OR (ended_at >= started_at))))
+);
+
+
+--
+-- Name: TABLE resource_intervals; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.resource_intervals IS 'App-owned allocation interval revisions; immutable capacity/dimensions with mutable liveness/materialization cursor.';
+
+
+--
+-- Name: resource_inventory_coverage_gaps; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.resource_inventory_coverage_gaps (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    scope_epoch_id uuid NOT NULL,
+    gap_start timestamp with time zone NOT NULL,
+    gap_end timestamp with time zone,
+    reason text NOT NULL,
+    resolution text DEFAULT 'unresolved'::text NOT NULL,
+    resolution_details jsonb DEFAULT '{}'::jsonb NOT NULL,
+    resolved_at timestamp with time zone,
+    resolved_by uuid,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT resource_inventory_coverage_gaps_range_check CHECK (((gap_end IS NULL) OR (gap_end > gap_start))),
+    CONSTRAINT resource_inventory_coverage_gaps_resolution_check CHECK (((reason <> ''::text) AND (resolution = ANY (ARRAY['unresolved'::text, 'backfilled'::text, 'waived'::text])) AND (jsonb_typeof(resolution_details) = 'object'::text) AND (((resolution = 'unresolved'::text) AND (resolved_at IS NULL) AND (resolved_by IS NULL)) OR ((resolution = 'backfilled'::text) AND (resolved_at IS NOT NULL)) OR ((resolution = 'waived'::text) AND (resolved_at IS NOT NULL) AND (resolved_by IS NOT NULL)))))
+);
+
+
+--
+-- Name: resource_inventory_scope_epochs; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.resource_inventory_scope_epochs (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    scope_id uuid NOT NULL,
+    epoch_number bigint NOT NULL,
+    reliable_from timestamp with time zone,
+    required_for_rollup boolean DEFAULT false NOT NULL,
+    required_from timestamp with time zone,
+    retired_at timestamp with time zone,
+    coverage_mode text NOT NULL,
+    capture_epoch uuid,
+    last_attempt_at timestamp with time zone,
+    last_complete_at timestamp with time zone,
+    last_complete_snapshot_id uuid,
+    last_resource_version text,
+    controller_epoch text,
+    last_sequence bigint,
+    leader_generation bigint DEFAULT 0 NOT NULL,
+    continuous_since timestamp with time zone,
+    complete_through timestamp with time zone,
+    snapshot_health text DEFAULT 'initializing'::text NOT NULL,
+    continuity_health text DEFAULT 'initializing'::text NOT NULL,
+    item_health text DEFAULT 'initializing'::text NOT NULL,
+    backend_health text DEFAULT 'initializing'::text NOT NULL,
+    publication_health text DEFAULT 'initializing'::text NOT NULL,
+    consecutive_failures integer DEFAULT 0 NOT NULL,
+    last_item_count integer,
+    sanitized_error jsonb,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT resource_inventory_scope_epochs_health_check CHECK (((coverage_mode <> ''::text) AND (snapshot_health <> ''::text) AND (continuity_health <> ''::text) AND (item_health <> ''::text) AND (backend_health <> ''::text) AND (publication_health <> ''::text) AND (leader_generation >= 0) AND (consecutive_failures >= 0) AND ((last_sequence IS NULL) OR (last_sequence >= 0)) AND ((last_item_count IS NULL) OR (last_item_count >= 0)) AND ((sanitized_error IS NULL) OR (jsonb_typeof(sanitized_error) = 'object'::text)))),
+    CONSTRAINT resource_inventory_scope_epochs_midnight_check CHECK (((required_from IS NULL) OR (required_from = date_trunc('day'::text, required_from, 'UTC'::text)))),
+    CONSTRAINT resource_inventory_scope_epochs_number_check CHECK ((epoch_number > 0)),
+    CONSTRAINT resource_inventory_scope_epochs_requirement_check CHECK (((required_for_rollup AND (required_from IS NOT NULL) AND (reliable_from IS NOT NULL) AND (required_from >= reliable_from)) OR ((NOT required_for_rollup) AND (required_from IS NULL)))),
+    CONSTRAINT resource_inventory_scope_epochs_retirement_check CHECK (((retired_at IS NULL) OR (((reliable_from IS NULL) OR (retired_at >= reliable_from)) AND ((required_from IS NULL) OR (retired_at > required_from)) AND ((continuous_since IS NULL) OR (retired_at >= continuous_since)) AND ((complete_through IS NULL) OR (retired_at >= complete_through)))))
+);
+
+
+--
+-- Name: resource_inventory_scopes; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.resource_inventory_scopes (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    collector_id text NOT NULL,
+    source_cluster text NOT NULL,
+    api_resource text NOT NULL,
+    namespace text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT resource_inventory_scopes_nonempty_check CHECK (((collector_id <> ''::text) AND (source_cluster <> ''::text) AND (api_resource <> ''::text) AND ((namespace IS NULL) OR (namespace <> ''::text))))
+);
+
+
+--
+-- Name: TABLE resource_inventory_scopes; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.resource_inventory_scopes IS 'Stable metering inventory scope identity; effective requirements live in scope epochs.';
+
+
+--
+-- Name: resource_inventory_snapshot_items; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.resource_inventory_snapshot_items (
+    snapshot_id uuid NOT NULL,
+    source_kind text NOT NULL,
+    source_uid text NOT NULL,
+    revision_hash text,
+    normalized_item jsonb NOT NULL,
+    valid_for_metering boolean NOT NULL,
+    item_error jsonb,
+    CONSTRAINT resource_inventory_snapshot_items_shape_check CHECK (((source_kind <> ''::text) AND (source_uid <> ''::text) AND ((revision_hash IS NULL) OR (revision_hash ~ '^[0-9a-f]{64}$'::text)) AND (jsonb_typeof(normalized_item) = 'object'::text) AND ((item_error IS NULL) OR (jsonb_typeof(item_error) = 'object'::text)) AND ((valid_for_metering AND (revision_hash IS NOT NULL) AND (item_error IS NULL)) OR ((NOT valid_for_metering) AND (item_error IS NOT NULL)))))
+);
+
+
+--
+-- Name: resource_inventory_snapshots; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.resource_inventory_snapshots (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    scope_epoch_id uuid NOT NULL,
+    inventory_scope_id uuid NOT NULL,
+    collection_started_at timestamp with time zone NOT NULL,
+    collection_completed_at timestamp with time zone NOT NULL,
+    received_at timestamp with time zone NOT NULL,
+    source_snapshot_at timestamp with time zone,
+    complete boolean NOT NULL,
+    leader_generation bigint NOT NULL,
+    resource_version text,
+    controller_epoch text,
+    sequence bigint,
+    item_count integer NOT NULL,
+    item_digest text,
+    fatal_errors jsonb DEFAULT '[]'::jsonb NOT NULL,
+    item_errors jsonb DEFAULT '[]'::jsonb NOT NULL,
+    manifest_state text DEFAULT 'staging'::text NOT NULL,
+    sealed_at timestamp with time zone,
+    items_expired_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT resource_inventory_snapshots_manifest_state_check CHECK ((((manifest_state = 'staging'::text) AND (sealed_at IS NULL) AND (items_expired_at IS NULL)) OR ((manifest_state = 'sealed'::text) AND (sealed_at IS NOT NULL) AND (items_expired_at IS NULL)) OR ((manifest_state = 'items-expired'::text) AND (sealed_at IS NOT NULL) AND (items_expired_at IS NOT NULL) AND (items_expired_at >= sealed_at)))),
+    CONSTRAINT resource_inventory_snapshots_shape_check CHECK (((leader_generation >= 0) AND (item_count >= 0) AND ((sequence IS NULL) OR (sequence >= 0)) AND ((item_digest IS NULL) OR (item_digest ~ '^[0-9a-f]{64}$'::text)) AND (jsonb_typeof(fatal_errors) = 'array'::text) AND (jsonb_typeof(item_errors) = 'array'::text) AND ((NOT complete) OR (jsonb_array_length(fatal_errors) = 0)) AND ((manifest_state <> 'sealed'::text) OR (NOT complete) OR (item_digest IS NOT NULL)))),
+    CONSTRAINT resource_inventory_snapshots_time_check CHECK (((collection_completed_at >= collection_started_at) AND (received_at >= collection_completed_at) AND ((sealed_at IS NULL) OR (sealed_at >= received_at))))
+);
+
+
+--
+-- Name: resource_lifecycle_heads; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.resource_lifecycle_heads (
+    source_lifecycle_id uuid NOT NULL,
+    latest_revision_no bigint DEFAULT 0 NOT NULL,
+    current_interval_id uuid,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT resource_lifecycle_heads_revision_check CHECK ((latest_revision_no >= 0))
+);
+
+
+--
+-- Name: resource_publication_plan_events; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.resource_publication_plan_events (
+    plan_id uuid NOT NULL,
+    ordinal integer NOT NULL,
+    source text NOT NULL,
+    source_id text NOT NULL,
+    unit text NOT NULL,
+    ts timestamp with time zone NOT NULL,
+    event_kind text NOT NULL,
+    canonical_rate_version_id uuid,
+    row_hash text NOT NULL,
+    event_payload jsonb NOT NULL,
+    CONSTRAINT resource_publication_plan_events_shape_check CHECK (((ordinal >= 0) AND (source_id <> ''::text) AND (unit <> ''::text) AND (event_kind = ANY (ARRAY['usage'::text, 'late-usage'::text, 'correction'::text])) AND (((event_kind = ANY (ARRAY['usage'::text, 'late-usage'::text])) AND (source = 'infra-allocation-v2'::text)) OR ((event_kind = 'correction'::text) AND (source = 'infra-allocation-correction-v2'::text))) AND (row_hash ~ '^[0-9a-f]{64}$'::text) AND (jsonb_typeof(event_payload) = 'object'::text)))
+);
+
+
+--
+-- Name: resource_publication_plans; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.resource_publication_plans (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    source_interval_id uuid NOT NULL,
+    source_revision text NOT NULL,
+    plan_kind text NOT NULL,
+    plan_revision bigint DEFAULT 0 NOT NULL,
+    advances_cursor boolean NOT NULL,
+    previous_materialized_through timestamp with time zone,
+    correction_group_id uuid,
+    period_start timestamp with time zone NOT NULL,
+    period_end timestamp with time zone NOT NULL,
+    expected_event_count integer NOT NULL,
+    payload_schema_version integer NOT NULL,
+    hash_algorithm text DEFAULT 'sha256'::text NOT NULL,
+    event_set_hash text NOT NULL,
+    rate_selection_hash text NOT NULL,
+    creator_generation bigint NOT NULL,
+    state text DEFAULT 'planned'::text NOT NULL,
+    attempt_count integer DEFAULT 0 NOT NULL,
+    last_attempt_at timestamp with time zone,
+    sanitized_error jsonb,
+    published_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT resource_publication_plans_kind_check CHECK (((plan_kind = ANY (ARRAY['usage'::text, 'late-usage'::text, 'correction'::text])) AND (((plan_kind = ANY (ARRAY['usage'::text, 'late-usage'::text])) AND (plan_revision = 0) AND advances_cursor AND (previous_materialized_through IS NOT NULL) AND (correction_group_id IS NULL)) OR ((plan_kind = 'correction'::text) AND (plan_revision > 0) AND (NOT advances_cursor) AND (previous_materialized_through IS NULL) AND (correction_group_id = id))))),
+    CONSTRAINT resource_publication_plans_payload_check CHECK (((expected_event_count > 0) AND (payload_schema_version > 0) AND (hash_algorithm = 'sha256'::text) AND (source_revision ~ '^[0-9a-f]{64}$'::text) AND (event_set_hash ~ '^[0-9a-f]{64}$'::text) AND (rate_selection_hash ~ '^[0-9a-f]{64}$'::text) AND (creator_generation > 0) AND (attempt_count >= 0) AND (((attempt_count = 0) AND (last_attempt_at IS NULL)) OR ((attempt_count > 0) AND (last_attempt_at IS NOT NULL))) AND ((last_attempt_at IS NULL) OR (last_attempt_at >= created_at)) AND ((sanitized_error IS NULL) OR (jsonb_typeof(sanitized_error) = 'object'::text)))),
+    CONSTRAINT resource_publication_plans_period_check CHECK (((period_end > period_start) AND (period_end <= (date_trunc('day'::text, period_start, 'UTC'::text) + '1 day'::interval)) AND ((NOT advances_cursor) OR (previous_materialized_through = period_start)))),
+    CONSTRAINT resource_publication_plans_state_check CHECK (((state = ANY (ARRAY['planned'::text, 'published'::text, 'conflict'::text])) AND (((state = 'published'::text) AND (published_at IS NOT NULL) AND (published_at >= created_at)) OR ((state <> 'published'::text) AND (published_at IS NULL)))))
+);
+
+
+--
+-- Name: TABLE resource_publication_plans; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.resource_publication_plans IS 'Irrevocable app-side outbox plans frozen before cross-database audit publication.';
 
 
 --
@@ -2436,6 +3307,42 @@ COMMENT ON TABLE public.usage_daily IS 'Daily pre-aggregated usage rollup (app-D
 
 
 --
+-- Name: usage_daily_v2; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.usage_daily_v2 (
+    day date NOT NULL,
+    user_id uuid,
+    project_id uuid,
+    category text NOT NULL,
+    resource text NOT NULL,
+    unit text NOT NULL,
+    measurement_basis text NOT NULL,
+    resource_class text NOT NULL,
+    attribution_scope text NOT NULL,
+    cost_domain text NOT NULL,
+    measurement_algorithm text NOT NULL,
+    quantity numeric(38,18) NOT NULL,
+    cost_usd numeric(38,18),
+    priced_quantity numeric(38,18) NOT NULL,
+    unpriced_quantity numeric(38,18) NOT NULL,
+    priced_events bigint NOT NULL,
+    unpriced_events bigint NOT NULL,
+    events bigint NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT usage_daily_v2_coverage_check CHECK (((priced_events >= 0) AND (unpriced_events >= 0) AND (events >= 0) AND (events = (priced_events + unpriced_events)) AND (quantity = (priced_quantity + unpriced_quantity)) AND (quantity <> ALL (ARRAY['NaN'::numeric, 'Infinity'::numeric, '-Infinity'::numeric])) AND (priced_quantity <> ALL (ARRAY['NaN'::numeric, 'Infinity'::numeric, '-Infinity'::numeric])) AND (unpriced_quantity <> ALL (ARRAY['NaN'::numeric, 'Infinity'::numeric, '-Infinity'::numeric])) AND ((cost_usd IS NULL) OR (cost_usd <> ALL (ARRAY['NaN'::numeric, 'Infinity'::numeric, '-Infinity'::numeric]))) AND (((priced_events = 0) AND (cost_usd IS NULL)) OR ((priced_events > 0) AND (cost_usd IS NOT NULL))))),
+    CONSTRAINT usage_daily_v2_dimension_check CHECK (((category <> ''::text) AND (resource <> ''::text) AND (unit <> ''::text) AND (measurement_basis <> ''::text) AND (resource_class <> ''::text) AND (attribution_scope = ANY (ARRAY['customer'::text, 'shared-platform'::text, 'unknown'::text])) AND (cost_domain <> ''::text) AND (measurement_algorithm <> ''::text) AND (((attribution_scope = 'customer'::text) AND ((user_id IS NOT NULL) OR (project_id IS NOT NULL))) OR ((attribution_scope = ANY (ARRAY['shared-platform'::text, 'unknown'::text])) AND (user_id IS NULL) AND (project_id IS NULL)))))
+);
+
+
+--
+-- Name: TABLE usage_daily_v2; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.usage_daily_v2 IS 'Typed UTC daily usage read model with explicit priced/unpriced coverage; rebuilt from immutable audit events.';
+
+
+--
 -- Name: usage_rate_card_rates; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -2460,6 +3367,51 @@ CREATE TABLE public.usage_rate_card_rates (
 --
 
 COMMENT ON COLUMN public.usage_rate_card_rates.capacity_per_billing_unit IS 'Ledger quantity represented by one unit charged at rate. Enables bundled instance share pricing without arbitrarily splitting CPU and RAM cost.';
+
+
+--
+-- Name: usage_rate_card_versions_v2; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.usage_rate_card_versions_v2 (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    card_id text NOT NULL,
+    provider text NOT NULL,
+    target_service text NOT NULL,
+    target_region text NOT NULL,
+    currency text NOT NULL,
+    pricing_basis text NOT NULL,
+    calculator text NOT NULL,
+    aggregation_scope text NOT NULL,
+    shape_change_policy text NOT NULL,
+    provider_effective_from timestamp with time zone NOT NULL,
+    provider_effective_to timestamp with time zone,
+    source_published_at timestamp with time zone,
+    observed_at timestamp with time zone NOT NULL,
+    source_version text NOT NULL,
+    source_checksum text NOT NULL,
+    component_count integer NOT NULL,
+    component_manifest_hash text NOT NULL,
+    applicability jsonb DEFAULT '{}'::jsonb NOT NULL,
+    calculator_config jsonb DEFAULT '{}'::jsonb NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT usage_rate_card_versions_v2_aggregation_scope_check CHECK (((aggregation_scope = ANY (ARRAY['lifecycle'::text, 'concurrency-envelope'::text])) AND ((calculator = 'reference_dominant_share_v1'::text) OR (aggregation_scope = 'lifecycle'::text)) AND ((calculator <> 'reference_dominant_share_v1'::text) OR (aggregation_scope = 'concurrency-envelope'::text)))),
+    CONSTRAINT usage_rate_card_versions_v2_calculator_check CHECK ((calculator = ANY (ARRAY['linear_v1'::text, 'exact_flavor_v1'::text, 'reference_dominant_share_v1'::text, 'fargate_v1'::text, 'aci_container_group_v1'::text, 'block_volume_v1'::text, 'azure_managed_disk_v1'::text]))),
+    CONSTRAINT usage_rate_card_versions_v2_currency_check CHECK ((currency ~ '^[A-Z]{3}$'::text)),
+    CONSTRAINT usage_rate_card_versions_v2_effective_range_check CHECK (((provider_effective_to IS NULL) OR (provider_effective_to > provider_effective_from))),
+    CONSTRAINT usage_rate_card_versions_v2_json_check CHECK (((jsonb_typeof(applicability) = 'object'::text) AND (jsonb_typeof(calculator_config) = 'object'::text))),
+    CONSTRAINT usage_rate_card_versions_v2_nonempty_check CHECK (((provider <> ''::text) AND (target_service <> ''::text) AND (target_region <> ''::text) AND (source_version <> ''::text) AND (source_checksum <> ''::text) AND (component_count > 0) AND (component_manifest_hash ~ '^[0-9a-f]{64}$'::text))),
+    CONSTRAINT usage_rate_card_versions_v2_pricing_basis_check CHECK ((pricing_basis = ANY (ARRAY['historical-public-list'::text, 'current-price-scenario'::text]))),
+    CONSTRAINT usage_rate_card_versions_v2_publication_time_check CHECK (((source_published_at IS NULL) OR (observed_at >= source_published_at))),
+    CONSTRAINT usage_rate_card_versions_v2_shape_policy_check CHECK ((shape_change_policy = ANY (ARRAY['continue'::text, 'restart'::text, 'unsupported'::text])))
+);
+
+
+--
+-- Name: TABLE usage_rate_card_versions_v2; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.usage_rate_card_versions_v2 IS 'Immutable public-cloud comparison card versions and calculator applicability.';
 
 
 --
@@ -2502,6 +3454,28 @@ COMMENT ON COLUMN public.usage_rate_cards.aggregation IS 'sum = add independentl
 
 
 --
+-- Name: usage_rate_components_v2; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.usage_rate_components_v2 (
+    version_id uuid NOT NULL,
+    component text NOT NULL,
+    ordinal integer DEFAULT 0 NOT NULL,
+    source_sku text,
+    source_meter text,
+    billing_unit text NOT NULL,
+    unit_size numeric(38,18) NOT NULL,
+    unit_price numeric(38,18) NOT NULL,
+    tier_min numeric(38,18),
+    tier_max numeric(38,18),
+    included_quantity numeric(38,18),
+    source_metadata jsonb DEFAULT '{}'::jsonb NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT usage_rate_components_v2_shape_check CHECK (((component <> ''::text) AND (billing_unit <> ''::text) AND (ordinal >= 0) AND (unit_size > (0)::numeric) AND (unit_price >= (0)::numeric) AND (unit_size <> ALL (ARRAY['NaN'::numeric, 'Infinity'::numeric, '-Infinity'::numeric])) AND (unit_price <> ALL (ARRAY['NaN'::numeric, 'Infinity'::numeric, '-Infinity'::numeric])) AND ((tier_min IS NULL) OR (tier_min >= (0)::numeric)) AND ((tier_max IS NULL) OR (tier_max > (0)::numeric)) AND ((tier_min IS NULL) OR (tier_max IS NULL) OR (tier_max > tier_min)) AND ((included_quantity IS NULL) OR (included_quantity >= (0)::numeric)) AND ((tier_min IS NULL) OR (tier_min <> ALL (ARRAY['NaN'::numeric, 'Infinity'::numeric, '-Infinity'::numeric]))) AND ((tier_max IS NULL) OR (tier_max <> ALL (ARRAY['NaN'::numeric, 'Infinity'::numeric, '-Infinity'::numeric]))) AND ((included_quantity IS NULL) OR (included_quantity <> ALL (ARRAY['NaN'::numeric, 'Infinity'::numeric, '-Infinity'::numeric]))) AND (jsonb_typeof(source_metadata) = 'object'::text)))
+);
+
+
+--
 -- Name: usage_rates; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -2527,6 +3501,70 @@ COMMENT ON TABLE public.usage_rates IS 'Effective-dated $/unit price config for 
 --
 
 COMMENT ON COLUMN public.usage_rates.resource IS 'Specific resource id or ''*'' (category default). Resolver prefers the specific row, falls back to ''*''.';
+
+
+--
+-- Name: usage_rates_v2; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.usage_rates_v2 (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    cost_domain text NOT NULL,
+    measurement_basis text NOT NULL,
+    category text NOT NULL,
+    resource_class text NOT NULL,
+    resource text NOT NULL,
+    unit text NOT NULL,
+    effective_from timestamp with time zone NOT NULL,
+    effective_to timestamp with time zone,
+    usd_per_unit numeric(38,18) NOT NULL,
+    source text NOT NULL,
+    source_version text NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT usage_rates_v2_effective_range_check CHECK (((effective_to IS NULL) OR (effective_to > effective_from))),
+    CONSTRAINT usage_rates_v2_nonempty_selector_check CHECK (((cost_domain <> ''::text) AND (measurement_basis <> ''::text) AND (category <> ''::text) AND (resource_class <> ''::text) AND (resource <> ''::text) AND (resource <> '*'::text) AND (unit <> ''::text) AND (source <> ''::text) AND (source_version <> ''::text))),
+    CONSTRAINT usage_rates_v2_rate_nonnegative_check CHECK (((usd_per_unit >= (0)::numeric) AND (usd_per_unit <> ALL (ARRAY['NaN'::numeric, 'Infinity'::numeric, '-Infinity'::numeric]))))
+);
+
+
+--
+-- Name: TABLE usage_rates_v2; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.usage_rates_v2 IS 'Immutable exact-selector canonical USD ledger rates; absence means unpriced.';
+
+
+--
+-- Name: usage_rollup_day_state; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.usage_rollup_day_state (
+    day date NOT NULL,
+    applied_audit_revision bigint NOT NULL,
+    coverage_status text NOT NULL,
+    unknown_ranges jsonb DEFAULT '[]'::jsonb NOT NULL,
+    rolled_at timestamp with time zone NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT usage_rollup_day_state_shape_check CHECK (((applied_audit_revision > 0) AND (coverage_status = ANY (ARRAY['complete'::text, 'partial'::text, 'unavailable'::text])) AND (jsonb_typeof(unknown_ranges) = 'array'::text)))
+);
+
+
+--
+-- Name: usage_rollup_v2_bootstrap_state; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.usage_rollup_v2_bootstrap_state (
+    singleton boolean DEFAULT true NOT NULL,
+    status text DEFAULT 'pending'::text NOT NULL,
+    seeded_through_day date,
+    reconciled_through_day date,
+    started_at timestamp with time zone,
+    completed_at timestamp with time zone,
+    sanitized_error jsonb,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT usage_rollup_v2_bootstrap_shape_check CHECK (((status = ANY (ARRAY['pending'::text, 'running'::text, 'reconciling'::text, 'complete'::text, 'error'::text])) AND ((sanitized_error IS NULL) OR (jsonb_typeof(sanitized_error) = 'object'::text)) AND ((reconciled_through_day IS NULL) OR ((seeded_through_day IS NOT NULL) AND (reconciled_through_day <= seeded_through_day))) AND (((status = 'pending'::text) AND (started_at IS NULL) AND (seeded_through_day IS NULL) AND (reconciled_through_day IS NULL) AND (completed_at IS NULL)) OR ((status = 'running'::text) AND (started_at IS NOT NULL) AND (seeded_through_day IS NULL) AND (reconciled_through_day IS NULL) AND (completed_at IS NULL)) OR ((status = 'reconciling'::text) AND (started_at IS NOT NULL) AND (seeded_through_day IS NOT NULL) AND (completed_at IS NULL)) OR ((status = 'complete'::text) AND (started_at IS NOT NULL) AND (seeded_through_day IS NOT NULL) AND (reconciled_through_day = seeded_through_day) AND (completed_at IS NOT NULL) AND (completed_at >= started_at) AND (sanitized_error IS NULL)) OR ((status = 'error'::text) AND (completed_at IS NULL))))),
+    CONSTRAINT usage_rollup_v2_bootstrap_singleton_check CHECK (singleton)
+);
 
 
 --
@@ -2837,6 +3875,22 @@ ALTER TABLE ONLY public.external_contacts
 
 
 --
+-- Name: infra_metering_control infra_metering_control_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.infra_metering_control
+    ADD CONSTRAINT infra_metering_control_pkey PRIMARY KEY (singleton);
+
+
+--
+-- Name: infra_usage_day_state infra_usage_day_state_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.infra_usage_day_state
+    ADD CONSTRAINT infra_usage_day_state_pkey PRIMARY KEY (day);
+
+
+--
 -- Name: job_change_records job_change_records_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -3010,6 +4064,174 @@ ALTER TABLE ONLY public.projects
 
 ALTER TABLE ONLY public.config_overrides
     ADD CONSTRAINT prompt_overrides_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: resource_intervals resource_intervals_id_lifecycle_uq; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.resource_intervals
+    ADD CONSTRAINT resource_intervals_id_lifecycle_uq UNIQUE (id, source_lifecycle_id);
+
+
+--
+-- Name: resource_intervals resource_intervals_id_revision_uq; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.resource_intervals
+    ADD CONSTRAINT resource_intervals_id_revision_uq UNIQUE (id, source_revision);
+
+
+--
+-- Name: resource_intervals resource_intervals_lifecycle_no_overlap; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.resource_intervals
+    ADD CONSTRAINT resource_intervals_lifecycle_no_overlap EXCLUDE USING gist (source_lifecycle_id WITH =, tstzrange(started_at, ended_at, '[)'::text) WITH &&);
+
+
+--
+-- Name: resource_intervals resource_intervals_lifecycle_revision_uq; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.resource_intervals
+    ADD CONSTRAINT resource_intervals_lifecycle_revision_uq UNIQUE (source_lifecycle_id, revision_no);
+
+
+--
+-- Name: resource_intervals resource_intervals_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.resource_intervals
+    ADD CONSTRAINT resource_intervals_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: resource_inventory_coverage_gaps resource_inventory_coverage_gaps_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.resource_inventory_coverage_gaps
+    ADD CONSTRAINT resource_inventory_coverage_gaps_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: resource_inventory_scope_epochs resource_inventory_scope_epochs_id_scope_uq; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.resource_inventory_scope_epochs
+    ADD CONSTRAINT resource_inventory_scope_epochs_id_scope_uq UNIQUE (id, scope_id);
+
+
+--
+-- Name: resource_inventory_scope_epochs resource_inventory_scope_epochs_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.resource_inventory_scope_epochs
+    ADD CONSTRAINT resource_inventory_scope_epochs_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: resource_inventory_scope_epochs resource_inventory_scope_epochs_scope_id_epoch_number_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.resource_inventory_scope_epochs
+    ADD CONSTRAINT resource_inventory_scope_epochs_scope_id_epoch_number_key UNIQUE (scope_id, epoch_number);
+
+
+--
+-- Name: resource_inventory_scopes resource_inventory_scopes_id_cluster_uq; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.resource_inventory_scopes
+    ADD CONSTRAINT resource_inventory_scopes_id_cluster_uq UNIQUE (id, source_cluster);
+
+
+--
+-- Name: resource_inventory_scopes resource_inventory_scopes_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.resource_inventory_scopes
+    ADD CONSTRAINT resource_inventory_scopes_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: resource_inventory_snapshot_items resource_inventory_snapshot_items_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.resource_inventory_snapshot_items
+    ADD CONSTRAINT resource_inventory_snapshot_items_pkey PRIMARY KEY (snapshot_id, source_kind, source_uid);
+
+
+--
+-- Name: resource_inventory_snapshots resource_inventory_snapshots_id_epoch_uq; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.resource_inventory_snapshots
+    ADD CONSTRAINT resource_inventory_snapshots_id_epoch_uq UNIQUE (id, scope_epoch_id);
+
+
+--
+-- Name: resource_inventory_snapshots resource_inventory_snapshots_id_scope_uq; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.resource_inventory_snapshots
+    ADD CONSTRAINT resource_inventory_snapshots_id_scope_uq UNIQUE (id, inventory_scope_id);
+
+
+--
+-- Name: resource_inventory_snapshots resource_inventory_snapshots_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.resource_inventory_snapshots
+    ADD CONSTRAINT resource_inventory_snapshots_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: resource_lifecycle_heads resource_lifecycle_heads_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.resource_lifecycle_heads
+    ADD CONSTRAINT resource_lifecycle_heads_pkey PRIMARY KEY (source_lifecycle_id);
+
+
+--
+-- Name: resource_publication_plan_events resource_publication_plan_events_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.resource_publication_plan_events
+    ADD CONSTRAINT resource_publication_plan_events_pkey PRIMARY KEY (plan_id, ordinal);
+
+
+--
+-- Name: resource_publication_plan_events resource_publication_plan_events_source_source_id_unit_ts_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.resource_publication_plan_events
+    ADD CONSTRAINT resource_publication_plan_events_source_source_id_unit_ts_key UNIQUE (source, source_id, unit, ts);
+
+
+--
+-- Name: resource_publication_plans resource_publication_plans_id_kind_start_uq; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.resource_publication_plans
+    ADD CONSTRAINT resource_publication_plans_id_kind_start_uq UNIQUE (id, plan_kind, period_start);
+
+
+--
+-- Name: resource_publication_plans resource_publication_plans_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.resource_publication_plans
+    ADD CONSTRAINT resource_publication_plans_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: resource_publication_plans resource_publication_plans_source_interval_id_period_start__key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.resource_publication_plans
+    ADD CONSTRAINT resource_publication_plans_source_interval_id_period_start__key UNIQUE (source_interval_id, period_start, period_end, plan_kind, plan_revision);
 
 
 --
@@ -3213,6 +4435,14 @@ ALTER TABLE ONLY public.usage_rate_card_rates
 
 
 --
+-- Name: usage_rate_card_versions_v2 usage_rate_card_versions_v2_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.usage_rate_card_versions_v2
+    ADD CONSTRAINT usage_rate_card_versions_v2_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: usage_rate_cards usage_rate_cards_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -3221,11 +4451,51 @@ ALTER TABLE ONLY public.usage_rate_cards
 
 
 --
+-- Name: usage_rate_components_v2 usage_rate_components_v2_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.usage_rate_components_v2
+    ADD CONSTRAINT usage_rate_components_v2_pkey PRIMARY KEY (version_id, component, ordinal);
+
+
+--
 -- Name: usage_rates usage_rates_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.usage_rates
     ADD CONSTRAINT usage_rates_pkey PRIMARY KEY (category, resource, unit, effective_from);
+
+
+--
+-- Name: usage_rates_v2 usage_rates_v2_no_overlap; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.usage_rates_v2
+    ADD CONSTRAINT usage_rates_v2_no_overlap EXCLUDE USING gist (cost_domain WITH =, measurement_basis WITH =, category WITH =, resource_class WITH =, resource WITH =, unit WITH =, tstzrange(effective_from, effective_to, '[)'::text) WITH &&);
+
+
+--
+-- Name: usage_rates_v2 usage_rates_v2_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.usage_rates_v2
+    ADD CONSTRAINT usage_rates_v2_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: usage_rollup_day_state usage_rollup_day_state_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.usage_rollup_day_state
+    ADD CONSTRAINT usage_rollup_day_state_pkey PRIMARY KEY (day);
+
+
+--
+-- Name: usage_rollup_v2_bootstrap_state usage_rollup_v2_bootstrap_state_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.usage_rollup_v2_bootstrap_state
+    ADD CONSTRAINT usage_rollup_v2_bootstrap_state_pkey PRIMARY KEY (singleton);
 
 
 --
@@ -4047,6 +5317,104 @@ CREATE INDEX jobs_lease_expiry_idx ON public.jobs USING btree (lease_expires_at)
 
 
 --
+-- Name: resource_intervals_materializer_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX resource_intervals_materializer_idx ON public.resource_intervals USING btree (materialized_through, last_confirmed_at) WHERE (materialized_through < COALESCE(ended_at, last_confirmed_at));
+
+
+--
+-- Name: resource_intervals_open_lifecycle_uq; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX resource_intervals_open_lifecycle_uq ON public.resource_intervals USING btree (source_lifecycle_id) WHERE (ended_at IS NULL);
+
+
+--
+-- Name: resource_intervals_open_uq; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX resource_intervals_open_uq ON public.resource_intervals USING btree (source_cluster, source_kind, source_uid) WHERE (ended_at IS NULL);
+
+
+--
+-- Name: resource_intervals_project_time_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX resource_intervals_project_time_idx ON public.resource_intervals USING btree (project_id, started_at, ended_at) WHERE (project_id IS NOT NULL);
+
+
+--
+-- Name: resource_intervals_user_time_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX resource_intervals_user_time_idx ON public.resource_intervals USING btree (user_id, started_at, ended_at) WHERE (user_id IS NOT NULL);
+
+
+--
+-- Name: resource_inventory_coverage_gaps_open_uq; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX resource_inventory_coverage_gaps_open_uq ON public.resource_inventory_coverage_gaps USING btree (scope_epoch_id, gap_start, reason) WHERE (resolution = 'unresolved'::text);
+
+
+--
+-- Name: resource_inventory_coverage_gaps_range_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX resource_inventory_coverage_gaps_range_idx ON public.resource_inventory_coverage_gaps USING btree (scope_epoch_id, gap_start, gap_end);
+
+
+--
+-- Name: resource_inventory_scope_epochs_active_uq; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX resource_inventory_scope_epochs_active_uq ON public.resource_inventory_scope_epochs USING btree (scope_id) WHERE (retired_at IS NULL);
+
+
+--
+-- Name: resource_inventory_scope_epochs_rollup_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX resource_inventory_scope_epochs_rollup_idx ON public.resource_inventory_scope_epochs USING btree (required_from, retired_at) WHERE (required_for_rollup = true);
+
+
+--
+-- Name: resource_inventory_scopes_identity_uq; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX resource_inventory_scopes_identity_uq ON public.resource_inventory_scopes USING btree (collector_id, source_cluster, api_resource, namespace) NULLS NOT DISTINCT;
+
+
+--
+-- Name: resource_inventory_snapshots_controller_seq_uq; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX resource_inventory_snapshots_controller_seq_uq ON public.resource_inventory_snapshots USING btree (scope_epoch_id, controller_epoch, sequence) WHERE ((controller_epoch IS NOT NULL) AND (sequence IS NOT NULL));
+
+
+--
+-- Name: resource_inventory_snapshots_scope_time_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX resource_inventory_snapshots_scope_time_idx ON public.resource_inventory_snapshots USING btree (scope_epoch_id, collection_completed_at DESC);
+
+
+--
+-- Name: resource_publication_plans_interval_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX resource_publication_plans_interval_idx ON public.resource_publication_plans USING btree (source_interval_id, period_start);
+
+
+--
+-- Name: resource_publication_plans_pending_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX resource_publication_plans_pending_idx ON public.resource_publication_plans USING btree (created_at, id) WHERE (state = 'planned'::text);
+
+
+--
 -- Name: schema_migrations_dirty_idx; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -4229,10 +5597,45 @@ CREATE INDEX usage_daily_user_day_idx ON public.usage_daily USING btree (user_id
 
 
 --
+-- Name: usage_daily_v2_dims_uq; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX usage_daily_v2_dims_uq ON public.usage_daily_v2 USING btree (day, user_id, project_id, category, resource, unit, measurement_basis, resource_class, attribution_scope, cost_domain, measurement_algorithm) NULLS NOT DISTINCT;
+
+
+--
+-- Name: usage_daily_v2_project_day_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX usage_daily_v2_project_day_idx ON public.usage_daily_v2 USING btree (project_id, day) WHERE (project_id IS NOT NULL);
+
+
+--
+-- Name: usage_daily_v2_user_day_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX usage_daily_v2_user_day_idx ON public.usage_daily_v2 USING btree (user_id, day) WHERE (user_id IS NOT NULL);
+
+
+--
 -- Name: usage_rate_card_rates_lookup_idx; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX usage_rate_card_rates_lookup_idx ON public.usage_rate_card_rates USING btree (rate_card_id, category, resource, unit, effective_from DESC);
+
+
+--
+-- Name: usage_rate_card_versions_v2_select_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX usage_rate_card_versions_v2_select_idx ON public.usage_rate_card_versions_v2 USING btree (card_id, pricing_basis, provider_effective_from DESC);
+
+
+--
+-- Name: usage_rates_v2_lookup_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX usage_rates_v2_lookup_idx ON public.usage_rates_v2 USING btree (cost_domain, measurement_basis, category, resource_class, resource, unit, effective_from DESC);
 
 
 --
@@ -4254,6 +5657,76 @@ CREATE INDEX workspace_intervals_pending_idx ON public.workspace_intervals USING
 --
 
 CREATE TRIGGER datasource_project_policy_change AFTER INSERT OR DELETE OR UPDATE ON public.project_datasources FOR EACH ROW EXECUTE FUNCTION public.reconcile_datasource_project_policy_change();
+
+
+--
+-- Name: infra_usage_day_state infra_usage_day_state_one_way_seal; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER infra_usage_day_state_one_way_seal BEFORE INSERT OR DELETE OR UPDATE ON public.infra_usage_day_state FOR EACH ROW EXECUTE FUNCTION public.protect_infra_usage_day_state_mutation();
+
+
+--
+-- Name: resource_intervals resource_intervals_immutable_revision; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER resource_intervals_immutable_revision BEFORE DELETE OR UPDATE ON public.resource_intervals FOR EACH ROW EXECUTE FUNCTION public.protect_resource_interval_revision_mutation();
+
+
+--
+-- Name: resource_intervals resource_intervals_scope_identity; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER resource_intervals_scope_identity BEFORE INSERT OR UPDATE OF inventory_scope_id, source_cluster, namespace, last_seen_snapshot_id ON public.resource_intervals FOR EACH ROW EXECUTE FUNCTION public.validate_resource_interval_scope_identity();
+
+
+--
+-- Name: resource_inventory_scope_epochs resource_inventory_scope_epochs_complete_snapshot; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER resource_inventory_scope_epochs_complete_snapshot BEFORE INSERT OR UPDATE OF last_complete_snapshot_id ON public.resource_inventory_scope_epochs FOR EACH ROW EXECUTE FUNCTION public.validate_inventory_epoch_last_complete_snapshot();
+
+
+--
+-- Name: resource_inventory_snapshot_items resource_inventory_snapshot_items_staging_only; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER resource_inventory_snapshot_items_staging_only BEFORE INSERT OR DELETE OR UPDATE ON public.resource_inventory_snapshot_items FOR EACH ROW EXECUTE FUNCTION public.protect_resource_inventory_snapshot_item_mutation();
+
+
+--
+-- Name: resource_inventory_snapshots resource_inventory_snapshots_seal_only; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER resource_inventory_snapshots_seal_only BEFORE INSERT OR UPDATE ON public.resource_inventory_snapshots FOR EACH ROW EXECUTE FUNCTION public.protect_resource_inventory_snapshot_mutation();
+
+
+--
+-- Name: resource_publication_plan_events resource_publication_plan_events_frozen; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER resource_publication_plan_events_frozen BEFORE INSERT OR DELETE OR UPDATE ON public.resource_publication_plan_events FOR EACH ROW EXECUTE FUNCTION public.protect_resource_publication_plan_event_mutation();
+
+
+--
+-- Name: resource_publication_plan_events resource_publication_plan_events_manifest_complete; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE CONSTRAINT TRIGGER resource_publication_plan_events_manifest_complete AFTER INSERT ON public.resource_publication_plan_events DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.validate_resource_publication_plan_manifest();
+
+
+--
+-- Name: resource_publication_plans resource_publication_plans_frozen_intent; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER resource_publication_plans_frozen_intent BEFORE DELETE OR UPDATE ON public.resource_publication_plans FOR EACH ROW EXECUTE FUNCTION public.protect_resource_publication_plan_mutation();
+
+
+--
+-- Name: resource_publication_plans resource_publication_plans_manifest_complete; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE CONSTRAINT TRIGGER resource_publication_plans_manifest_complete AFTER INSERT ON public.resource_publication_plans DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.validate_resource_publication_plan_manifest();
 
 
 --
@@ -4331,6 +5804,41 @@ CREATE TRIGGER update_projects_updated_at BEFORE UPDATE ON public.projects FOR E
 --
 
 CREATE TRIGGER update_user_api_keys_updated_at BEFORE UPDATE ON public.user_api_keys FOR EACH ROW EXECUTE FUNCTION public.update_updated_at_column();
+
+
+--
+-- Name: usage_rate_card_versions_v2 usage_rate_card_versions_v2_immutable; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER usage_rate_card_versions_v2_immutable BEFORE DELETE OR UPDATE ON public.usage_rate_card_versions_v2 FOR EACH ROW EXECUTE FUNCTION public.protect_usage_rate_card_version_mutation();
+
+
+--
+-- Name: usage_rate_card_versions_v2 usage_rate_card_versions_v2_manifest_complete; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE CONSTRAINT TRIGGER usage_rate_card_versions_v2_manifest_complete AFTER INSERT ON public.usage_rate_card_versions_v2 DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.validate_usage_rate_card_component_count();
+
+
+--
+-- Name: usage_rate_components_v2 usage_rate_components_v2_immutable; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER usage_rate_components_v2_immutable BEFORE DELETE OR UPDATE ON public.usage_rate_components_v2 FOR EACH ROW EXECUTE FUNCTION public.reject_usage_rate_component_mutation();
+
+
+--
+-- Name: usage_rate_components_v2 usage_rate_components_v2_manifest_complete; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE CONSTRAINT TRIGGER usage_rate_components_v2_manifest_complete AFTER INSERT ON public.usage_rate_components_v2 DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.validate_usage_rate_card_component_count();
+
+
+--
+-- Name: usage_rates_v2 usage_rates_v2_immutable; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER usage_rates_v2_immutable BEFORE DELETE OR UPDATE ON public.usage_rates_v2 FOR EACH ROW EXECUTE FUNCTION public.protect_usage_rates_v2_mutation();
 
 
 --
@@ -4886,6 +6394,102 @@ ALTER TABLE ONLY public.config_overrides
 
 
 --
+-- Name: resource_intervals resource_intervals_inventory_scope_cluster_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.resource_intervals
+    ADD CONSTRAINT resource_intervals_inventory_scope_cluster_fkey FOREIGN KEY (inventory_scope_id, source_cluster) REFERENCES public.resource_inventory_scopes(id, source_cluster) ON DELETE RESTRICT;
+
+
+--
+-- Name: resource_intervals resource_intervals_last_seen_snapshot_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.resource_intervals
+    ADD CONSTRAINT resource_intervals_last_seen_snapshot_fkey FOREIGN KEY (last_seen_snapshot_id, inventory_scope_id) REFERENCES public.resource_inventory_snapshots(id, inventory_scope_id) ON DELETE RESTRICT;
+
+
+--
+-- Name: resource_intervals resource_intervals_source_lifecycle_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.resource_intervals
+    ADD CONSTRAINT resource_intervals_source_lifecycle_id_fkey FOREIGN KEY (source_lifecycle_id) REFERENCES public.resource_lifecycle_heads(source_lifecycle_id) ON DELETE RESTRICT;
+
+
+--
+-- Name: resource_inventory_coverage_gaps resource_inventory_coverage_gaps_scope_epoch_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.resource_inventory_coverage_gaps
+    ADD CONSTRAINT resource_inventory_coverage_gaps_scope_epoch_id_fkey FOREIGN KEY (scope_epoch_id) REFERENCES public.resource_inventory_scope_epochs(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: resource_inventory_scope_epochs resource_inventory_scope_epochs_last_snapshot_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.resource_inventory_scope_epochs
+    ADD CONSTRAINT resource_inventory_scope_epochs_last_snapshot_fkey FOREIGN KEY (last_complete_snapshot_id, id) REFERENCES public.resource_inventory_snapshots(id, scope_epoch_id) ON DELETE RESTRICT;
+
+
+--
+-- Name: resource_inventory_scope_epochs resource_inventory_scope_epochs_scope_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.resource_inventory_scope_epochs
+    ADD CONSTRAINT resource_inventory_scope_epochs_scope_id_fkey FOREIGN KEY (scope_id) REFERENCES public.resource_inventory_scopes(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: resource_inventory_snapshot_items resource_inventory_snapshot_items_snapshot_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.resource_inventory_snapshot_items
+    ADD CONSTRAINT resource_inventory_snapshot_items_snapshot_id_fkey FOREIGN KEY (snapshot_id) REFERENCES public.resource_inventory_snapshots(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: resource_inventory_snapshots resource_inventory_snapshots_epoch_scope_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.resource_inventory_snapshots
+    ADD CONSTRAINT resource_inventory_snapshots_epoch_scope_fkey FOREIGN KEY (scope_epoch_id, inventory_scope_id) REFERENCES public.resource_inventory_scope_epochs(id, scope_id) ON DELETE RESTRICT;
+
+
+--
+-- Name: resource_lifecycle_heads resource_lifecycle_heads_current_interval_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.resource_lifecycle_heads
+    ADD CONSTRAINT resource_lifecycle_heads_current_interval_fkey FOREIGN KEY (current_interval_id, source_lifecycle_id) REFERENCES public.resource_intervals(id, source_lifecycle_id) ON DELETE RESTRICT;
+
+
+--
+-- Name: resource_publication_plan_events resource_publication_plan_events_canonical_rate_version_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.resource_publication_plan_events
+    ADD CONSTRAINT resource_publication_plan_events_canonical_rate_version_id_fkey FOREIGN KEY (canonical_rate_version_id) REFERENCES public.usage_rates_v2(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: resource_publication_plan_events resource_publication_plan_events_plan_kind_time_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.resource_publication_plan_events
+    ADD CONSTRAINT resource_publication_plan_events_plan_kind_time_fkey FOREIGN KEY (plan_id, event_kind, ts) REFERENCES public.resource_publication_plans(id, plan_kind, period_start) ON DELETE RESTRICT;
+
+
+--
+-- Name: resource_publication_plans resource_publication_plans_interval_revision_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.resource_publication_plans
+    ADD CONSTRAINT resource_publication_plans_interval_revision_fkey FOREIGN KEY (source_interval_id, source_revision) REFERENCES public.resource_intervals(id, source_revision) ON DELETE RESTRICT;
+
+
+--
 -- Name: session_wake_events session_wake_events_thread_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -5011,6 +6615,22 @@ ALTER TABLE ONLY public.threads
 
 ALTER TABLE ONLY public.usage_rate_card_rates
     ADD CONSTRAINT usage_rate_card_rates_rate_card_id_fkey FOREIGN KEY (rate_card_id) REFERENCES public.usage_rate_cards(id) ON DELETE CASCADE;
+
+
+--
+-- Name: usage_rate_card_versions_v2 usage_rate_card_versions_v2_card_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.usage_rate_card_versions_v2
+    ADD CONSTRAINT usage_rate_card_versions_v2_card_id_fkey FOREIGN KEY (card_id) REFERENCES public.usage_rate_cards(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: usage_rate_components_v2 usage_rate_components_v2_version_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.usage_rate_components_v2
+    ADD CONSTRAINT usage_rate_components_v2_version_id_fkey FOREIGN KEY (version_id) REFERENCES public.usage_rate_card_versions_v2(id) ON DELETE RESTRICT;
 
 
 --
