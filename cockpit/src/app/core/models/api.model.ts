@@ -157,6 +157,22 @@ export interface ExpertDuplicateResult extends ExpertDetail {
 }
 
 /**
+ * Response of POST /api/expert-defaults/{type}/fork — `duplicate` plus
+ * "select the copy as my default" (task 4 of the same 2026-08-04 plan as
+ * `ExpertDuplicateResult` above). `default` is the new personal-default row,
+ * in the same summary shape `GET /api/expert-defaults` returns for a slot
+ * (not a full `ExpertDetail`: no `config`/`instructions`).
+ */
+export interface ExpertDefaultForkResult {
+  default: Expert | null;
+  source: 'user';
+  /** Same meaning as `ExpertDuplicateResult.dropped` above — the grant keys
+   *  the fork needed that this caller doesn't hold, stripped rather than
+   *  refusing the fork. Empty or absent when nothing was stripped. */
+  dropped?: string[];
+}
+
+/**
  * Create a DB-backed expert (POST /api/experts). The save-time hard-deny scan
  * runs server-side on ``config``; per-user grants are a later slice.
  */

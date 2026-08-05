@@ -17,6 +17,7 @@ import {
     DatasourceUpdateRequest,
     SSHKeyGenerateResponse,
     Expert,
+    ExpertDefaultForkResult,
     ExpertDefaultsResponse,
     ExpertCreateRequest,
     ExpertDetail,
@@ -589,8 +590,19 @@ export class ApiService {
     return this.http.delete(`${this.baseUrl}/expert-defaults/${type}`);
   }
 
-  forkPersonalExpertDefault(type: 'worker' | 'session', expertId?: string): Observable<unknown> {
-    return this.http.post(`${this.baseUrl}/expert-defaults/${type}/fork`, {
+  /**
+   * Atomically fork a visible expert (bundled or DB) and select the copy as
+   * this user's personal default. May come back with `dropped` set — same
+   * strip-and-report meaning as `duplicateExpert` above (task 4 of the same
+   * 2026-08-04 decision): grant keys the source config needed that the
+   * caller doesn't hold, stripped rather than refusing the fork. Callers
+   * MUST surface `dropped` when non-empty, same reason as `duplicateExpert`.
+   */
+  forkPersonalExpertDefault(
+    type: 'worker' | 'session',
+    expertId?: string,
+  ): Observable<ExpertDefaultForkResult> {
+    return this.http.post<ExpertDefaultForkResult>(`${this.baseUrl}/expert-defaults/${type}/fork`, {
       expert_id: expertId ?? null,
     });
   }
