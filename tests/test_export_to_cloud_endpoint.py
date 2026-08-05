@@ -9,14 +9,17 @@ copying the agent's declared deliverables instead of ``output/`` wholesale:
 * ``export_job_to_shared_folder`` — the real endpoint, driven with patched
   globals + the ``FakeMainCloudBackend``: the routing gate (project-with-cloud
   -folder → 409; default-project / loose → allowed), the deliverables copy
-  (declared paths only, paths preserved, missing skipped), and the
-  ``output/`` fallback for jobs without a deliverables list.
+  (declared paths only, missing skipped, shared wrapper directories collapsed
+  via ``_common_dir_prefix``), the ``output/`` fallback for jobs without a
+  deliverables list, folder naming/reuse, and whether the folder actually
+  ended up shared with the caller.
 
 Follows the house pattern in tests/test_job_access.py: import ``main`` (conftest
 puts orchestrator/ on sys.path) and patch its module globals.
 """
 
 import json
+import re
 from contextlib import ExitStack
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -52,6 +55,7 @@ def _make_job(**over) -> dict:
         "exported_at": None,
         "freeze_data": None,
         "repo_name": "job-682baab8",
+        "description": "Write the quarterly report",
     }
     job.update(over)
     return job
@@ -267,6 +271,9 @@ class TestDeliverablesCopy:
         with stack:
             result = await main.export_job_to_shared_folder(fake_request, job["id"])
         assert result["files_copied"] == 1
+        # `output/` is NOT collapsed here: the prefix is computed over the
+        # declared set, and root-level `gone.txt` is in it even though it turned
+        # out to be missing. Degrades to less collapsing, never to wrong paths.
         assert _copied_paths(backend) == {"output/report.md"}
 
     @pytest.mark.asyncio
@@ -295,7 +302,9 @@ class TestDeliverablesCopy:
         with stack:
             result = await main.export_job_to_shared_folder(fake_request, job["id"])
         assert result["files_copied"] == 2
-        assert _copied_paths(backend) == {"output/a.md", "output/sub/b.md"}
+        # `output/` is the shared wrapper and gets collapsed; `sub/` survives
+        # because it distinguishes b.md from a.md.
+        assert _copied_paths(backend) == {"a.md", "sub/b.md"}
 
     @pytest.mark.asyncio
     async def test_freeze_data_as_json_string(self, fake_request):
@@ -358,6 +367,201 @@ class TestExportSharing:
         assert result["files_copied"] == 1
         assert _copied_paths(backend) == {"spec.yaml"}
         assert db.update_job_exported_folder.await_count == 1
+
+
+# --------------------------------------------------------------------------- #
+# Wrapper-directory collapse
+# --------------------------------------------------------------------------- #
+
+
+class TestCommonDirPrefix:
+    def test_single_file_in_a_directory(self):
+        assert main._common_dir_prefix(["output/digest.md"]) == "output"
+
+    def test_single_file_at_root(self):
+        assert main._common_dir_prefix(["done.txt"]) == ""
+
+    def test_shared_head_only(self):
+        assert main._common_dir_prefix(["repo/src/a.py", "repo/tests/b.py"]) == "repo"
+
+    def test_nothing_shared(self):
+        assert main._common_dir_prefix(["spec.yaml", "repo/a.py"]) == ""
+
+    def test_whole_shared_path(self):
+        assert main._common_dir_prefix(["out/deep/a.md", "out/deep/b.md"]) == "out/deep"
+
+    def test_matches_whole_segments_not_string_prefixes(self):
+        # "out" is a string prefix of "output" but a different directory.
+        assert main._common_dir_prefix(["out/a.md", "output/b.md"]) == ""
+
+    def test_empty(self):
+        assert main._common_dir_prefix([]) == ""
+
+
+class TestWrapperCollapse:
+    """A folder holding one `output/` holding one file is two clicks to nothing.
+    The shared leading directories come off; anything that distinguishes files
+    stays."""
+
+    @pytest.mark.asyncio
+    async def test_collapses_lone_output_wrapper(self, fake_request):
+        user = _make_user()
+        job = _make_job(freeze_data={"deliverables": ["output/digest.md"]})
+        backend = FakeMainCloudBackend()
+        stack, backend, _ = _patch_endpoint(
+            user=user,
+            job=job,
+            backend=backend,
+            gitea_files={"output/digest.md": b"# digest"},
+        )
+        with stack:
+            result = await main.export_job_to_shared_folder(fake_request, job["id"])
+        assert result["files_copied"] == 1
+        assert _copied_paths(backend) == {"digest.md"}
+
+    @pytest.mark.asyncio
+    async def test_collapses_deep_wrapper_for_a_lone_file(self, fake_request):
+        user = _make_user()
+        job = _make_job(freeze_data={"deliverables": ["output/reports/q1.md"]})
+        backend = FakeMainCloudBackend()
+        stack, backend, _ = _patch_endpoint(
+            user=user,
+            job=job,
+            backend=backend,
+            gitea_files={"output/reports/q1.md": b"q1"},
+        )
+        with stack:
+            await main.export_job_to_shared_folder(fake_request, job["id"])
+        assert _copied_paths(backend) == {"q1.md"}
+
+    @pytest.mark.asyncio
+    async def test_keeps_structure_that_distinguishes_files(self, fake_request):
+        user = _make_user()
+        deliverables = ["repo/src/app.py", "repo/tests/test_app.py"]
+        job = _make_job(freeze_data={"deliverables": deliverables})
+        backend = FakeMainCloudBackend()
+        stack, backend, _ = _patch_endpoint(
+            user=user,
+            job=job,
+            backend=backend,
+            gitea_files={p: b"x" for p in deliverables},
+        )
+        with stack:
+            await main.export_job_to_shared_folder(fake_request, job["id"])
+        # Only the shared `repo/` head comes off.
+        assert _copied_paths(backend) == {"src/app.py", "tests/test_app.py"}
+
+    @pytest.mark.asyncio
+    async def test_root_level_deliverable_pins_everything_in_place(self, fake_request):
+        user = _make_user()
+        deliverables = ["spec.yaml", "output/report.md"]
+        job = _make_job(freeze_data={"deliverables": deliverables})
+        backend = FakeMainCloudBackend()
+        stack, backend, _ = _patch_endpoint(
+            user=user,
+            job=job,
+            backend=backend,
+            gitea_files={p: b"x" for p in deliverables},
+        )
+        with stack:
+            await main.export_job_to_shared_folder(fake_request, job["id"])
+        assert _copied_paths(backend) == {"spec.yaml", "output/report.md"}
+
+
+# --------------------------------------------------------------------------- #
+# Folder naming
+# --------------------------------------------------------------------------- #
+
+
+class TestExportFolderName:
+    """Names must be readable (a cloud root of `job-<uuid>` is unnavigable)
+    AND deterministic (the endpoint re-derives the name to find the folder on
+    a re-sync)."""
+
+    JOB = "a6fa6f2a-9101-41f4-9ccb-5a7f362dc305"
+
+    def test_slugs_the_description_and_keeps_an_id_suffix(self):
+        assert (
+            main._job_export_folder_name(self.JOB, "You maintain a daily digest.")
+            == "you-maintain-a-daily-digest-a6fa6f2a"
+        )
+
+    def test_deterministic(self):
+        a = main._job_export_folder_name(self.JOB, "Same prompt")
+        b = main._job_export_folder_name(self.JOB, "Same prompt")
+        assert a == b
+
+    def test_same_description_different_jobs_do_not_collide(self):
+        other = "11111111-2222-3333-4444-555555555555"
+        assert main._job_export_folder_name(
+            self.JOB, "Shared prompt"
+        ) != main._job_export_folder_name(other, "Shared prompt")
+
+    def test_truncates_on_a_word_boundary(self):
+        name = main._job_export_folder_name(
+            self.JOB,
+            "Implement a small Python CLI tool in this workspace, test first",
+        )
+        slug = name.rsplit("-", 1)[0]
+        assert len(slug) <= 40
+        # No half-word at the end.
+        assert slug == "implement-a-small-python-cli-tool-in"
+
+    def test_only_uses_the_first_line(self):
+        name = main._job_export_folder_name(self.JOB, "Daily digest\nSecond line")
+        assert name == "daily-digest-a6fa6f2a"
+
+    def test_folds_accents_rather_than_dropping_them(self):
+        assert main._job_export_folder_name(self.JOB, "Führe die Prüfung durch") == (
+            "fuhre-die-prufung-durch-a6fa6f2a"
+        )
+
+    def test_path_safe_charset(self):
+        name = main._job_export_folder_name(
+            self.JOB, "../../etc/passwd & <script> 100% done"
+        )
+        assert re.fullmatch(r"[a-z0-9-]+", name), name
+
+    def test_falls_back_when_nothing_slugs(self):
+        for desc in ("", "   ", "!!! ???", None):
+            assert main._job_export_folder_name(self.JOB, desc) == "job-a6fa6f2a9101"
+
+
+class TestExportFolderReuse:
+    @pytest.mark.asyncio
+    async def test_resync_reuses_the_existing_folder(self, fake_request):
+        """A job exported under the old `job-<uuid>` scheme must re-sync into
+        that same folder — re-deriving would strand it and its share."""
+        user = _make_user()
+        job = _make_job(
+            exported_folder_handle="sessions/job-682baab87864",
+            exported_at="2026-08-04T08:19:36Z",
+            freeze_data={"deliverables": ["spec.yaml"]},
+        )
+        backend = FakeMainCloudBackend()
+        stack, backend, _ = _patch_endpoint(
+            user=user, job=job, backend=backend, gitea_files={"spec.yaml": b"x"}
+        )
+        with stack:
+            result = await main.export_job_to_shared_folder(fake_request, job["id"])
+        assert result["folder"]["name"] == "job-682baab87864"
+        assert result["folder"]["path"] == "/job-682baab87864"
+
+    @pytest.mark.asyncio
+    async def test_first_export_uses_the_slugged_name(self, fake_request):
+        user = _make_user()
+        job = _make_job(
+            description="Write the quarterly report",
+            freeze_data={"deliverables": ["spec.yaml"]},
+        )
+        backend = FakeMainCloudBackend()
+        stack, backend, _ = _patch_endpoint(
+            user=user, job=job, backend=backend, gitea_files={"spec.yaml": b"x"}
+        )
+        with stack:
+            result = await main.export_job_to_shared_folder(fake_request, job["id"])
+        assert result["folder"]["name"] == "write-the-quarterly-report-682baab8"
+        assert result["folder"]["path"] == "/write-the-quarterly-report-682baab8"
 
 
 # --------------------------------------------------------------------------- #

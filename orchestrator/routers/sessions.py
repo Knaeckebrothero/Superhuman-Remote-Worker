@@ -191,7 +191,7 @@ async def _do_prepare(
     # and never re-reads. Emitted "provisioning" already, so the cockpit's
     # progress card covers the wait. Deliberately OUTSIDE the advisory lock —
     # this can take seconds and the fresh pod's /register needs the same lock.
-    # docs/issues/session_resume_cloud_sync_race_late_provision.md
+    # docs/done/session_resume_cloud_sync_race_late_provision.md
     from main import _await_late_cloud_setup  # late import: avoid circular
 
     await _await_late_cloud_setup(thread_id)

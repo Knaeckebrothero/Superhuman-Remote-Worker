@@ -1679,7 +1679,14 @@ export interface JobCloudExportResult {
    * isn't visible to them until they've signed in to the cloud once.
    */
   shared: boolean;
-  folder: { name: string; browser_url: string | null; webdav_url: string | null };
+  folder: {
+    name: string;
+    /** Path within the caller's own cloud drive — the share lands at its root,
+     *  so this is `/<name>`. Absent on orchestrators older than this field. */
+    path?: string;
+    browser_url: string | null;
+    webdav_url: string | null;
+  };
 }
 
 /**

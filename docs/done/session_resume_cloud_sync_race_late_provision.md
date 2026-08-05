@@ -1,11 +1,36 @@
 # Resume races its own cloud-folder provisioning — session runs unsynced for life
 
-**Status**: FIXED (race + degraded-attach recovery + toast readability),
-k3d-verified 2026-08-04 — uncommitted. One item deferred, see "Still open".
+**Status**: DONE — shipped and live on the dev cluster 2026-08-05.
 **Filed**: 2026-08-04
 **Observed on**: main dev cluster, thread `5833c729-c0cd-496f-9a40-e9b811ae0ced`
-**Severity**: the toast is *accurate* — the affected session really does run with
-cloud sync off for its entire life, and nothing recovers it.
+**Severity**: the toast was *accurate* — the affected session really did run with
+cloud sync off for its entire life, and nothing recovered it.
+
+Four defects, one thread of investigation:
+
+| # | Defect | Where |
+|---|--------|-------|
+| 1 | Resume's attach beats its own cloud provisioning → session unsynced for life | Fix, below |
+| 2 | A degraded attach was permanent — no rebuild path existed | Follow-up 1 |
+| 3 | Ended session had no composer; the draft was unreachable | Follow-up 2 |
+| 4 | Stale-epoch replay pinned the ended chrome over a live session | Follow-up 3 |
+
+Plus two smaller ones fixed in passing: the danger toast rendered at 20% alpha
+over the artifact pane, and `cloudSyncDegraded` rendered *nowhere* — the
+dismissible toast was the only sign a session was running unsynced.
+
+### Deployed state (verified in-cluster 2026-08-05)
+
+| Component | Image | Carries |
+|-----------|-------|---------|
+| orchestrator | `sha-dbc6ec9` | attach gate — `_await_late_cloud_setup` present in `main.py` (3×) and `routers/sessions.py` (2×) |
+| agent | `sha-03442f8` | `_retry_cloud_sync_start` + `workspace_sync.recovered`, confirmed inside a freshly-provisioned pod |
+| cockpit | `sha-03442f8` | `resumedFromEpoch`, `endedSendResumes`, `cloudSyncOff` all present in the served bundle/i18n |
+
+**Operational caveat**: long-lived session pods keep the agent image they booted
+with. `persistent-d67ee261-334` (the Better Resavio officer, 6d uptime) still
+runs pre-fix agent code and will until it is recycled — the turn-boundary sync
+recovery does not apply to it.
 
 ## Symptom
 
@@ -351,7 +376,7 @@ reproduced live: it needs a thread whose epoch tail carries journaled
 k3d thread ended mid-push without ever journaling those rows. That path is
 covered by the unit tests above rather than a live run.
 
-## Still open
+## Deferred — deliberately not built (nothing here blocks closing this doc)
 
 **The session folder is never shared to the user until they sign in once.**
 Confirmed root cause, and it is not fixable server-side: `NextcloudBackend.ensure_user`
@@ -367,17 +392,29 @@ will get one, plus a share, on their next resume.
 What's missing is telling a *new* user that: today an unsigned-in owner gets a
 silent share-retry on every resume forever and an invisible cloud folder. Worth
 surfacing as "your cloud folder isn't shared yet — sign in once" rather than
-building anything server-side. Deferred until there are users beyond the owner.
+building anything server-side. Deferred until there are users beyond the owner;
+it is a product affordance, not unfinished work on any of the four defects
+above. Split out so it stays in the backlog rather than holding this doc open:
+`docs/issues/cloud_folder_invisible_until_owner_signs_into_cloud.md`.
 
-## Related UI defects seen in the same report
+## Related UI defects from the same report (both fixed)
 
-- **Toast is translucent over the artifact pane.** `toast-container.component.scss:51`
-  sets `background: var(--danger-tint)` = `rgba(204, 70, 71, 0.20)` (dark theme,
-  `styles/themes/_theme-config.scss:152`). The toast is `position: fixed; bottom;
-  right`, so it floats over the canvas/artifact panel and the text behind bleeds
-  through at 80%. Every other `--danger-tint` consumer is an inline banner on an
-  opaque page background, where 20% alpha is fine — the toast is the one place it
-  floats over arbitrary content and needs an opaque surface with the tint layered
-  on top.
-- **Composer is unusable while a session is ended-but-resumable.** FIXED,
-  k3d-verified — see "Follow-up 2" below.
+- **Danger toast was translucent over the artifact pane.** The tone variants
+  assigned `background: var(--danger-tint)` — `rgba(204, 70, 71, 0.20)` dark,
+  `rgba(156, 40, 50, 0.15)` light (`styles/themes/_theme-config.scss:152`/`:75`)
+  — which *replaced* the opaque surface set by the base rule. The container is
+  `position: fixed; bottom; right`, so it floats over the canvas/artifact pane
+  and whatever sat behind bled through. The `*-tint` tokens are correct for
+  their ~10 other callers, which are inline banners on an opaque page
+  background; the toast is the only consumer floating over arbitrary content.
+  Fixed by painting the tint as a **layer** —
+  `background-image: linear-gradient(<tint>, <tint>)` — so the base rule's
+  `background-color` survives underneath. Verified via live computed style:
+  `backgroundColor: rgb(194, 178, 148)` with
+  `backgroundImage: linear-gradient(rgba(156,40,50,0.15), …)`.
+- **Composer was unusable while a session was ended-but-resumable.** See
+  "Follow-up 2" above.
+- **`cloudSyncDegraded` rendered nowhere.** Found while wiring Follow-up 1: the
+  signal was set in the service and read only by its own spec, so a dismissible
+  toast was the entire indication that a session was running unsynced — dismiss
+  it and every trace was gone. Now drives a `Cloud sync off` status-bar badge.

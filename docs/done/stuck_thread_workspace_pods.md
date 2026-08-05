@@ -210,9 +210,21 @@ is *why* it sits forever once it fails.
 - [x] Marked the ten orphaned `threads` rows in srw Postgres as `ended` with
       `ended_at = NOW()` on 2026-05-02. Chat history / audit rows preserved;
       Cockpit will no longer show these as live sessions.
-- [ ] Reconcile `pvc-ws-thread-*` code path — figure out why PVCs are not
-      being created and decide whether to (a) make thread workspaces really
-      persistent or (b) remove the dead code path
+- [x] Reconcile `pvc-ws-thread-*` code path — **resolved 2026-08-05 in favour of
+      (a): thread workspaces are really persistent.** The reason no PVC existed
+      was never dead code; it was the live gate
+      `container_provisioner.py` `if self._pvc_enabled and owner.kind == "job"`,
+      which forced sessions onto `emptyDir` even with `WORKSPACE_PVC_ENABLED=true`.
+      A session now gets `pvc-ws-thread-<tid[:12]>` for its workspace pod and
+      `pvc-agent-s-<tid[:12]>` for its agent pod, reclaimed only when the
+      `threads` row is genuinely deleted — an `ended` thread is resumable and
+      keeps its volumes. Shipped in `52c1ba80`, live on the dev cluster
+      (claims verified `Bound`). See
+      [`workspace_pvc_backed_migration.md`](../features/workspace_pvc_backed_migration.md).
+      **Caveat:** durable storage does not by itself stop workspace content from
+      being lost — see
+      [`session_workspace_wiped_by_agent_clone_on_attach.md`](../issues/session_workspace_wiped_by_agent_clone_on_attach.md),
+      which is still open.
 - [ ] Implement thread-workspace reaper that catches both pod-side zombies
       (`Failed`/`Unknown`) and DB-side orphans (threads with `status` in
       `{created, active, idle}` whose pod has been gone for > N minutes).

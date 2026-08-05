@@ -36,6 +36,19 @@ the row auto-classifies as `infra` in the report. With ~10-min monitoring
 lag, a duplicate D-task would have burned real money. This upgrades the fix
 from "nice to have" to "before the next long run".
 
+**Second firing, same run, 18:51:52Z** — `S3-glossary` r3 double-submitted
+**5 ms apart** (.112/.117). The twin (`c49da80e`) ran ~15 minutes and burned
+8 LLM calls before the 10-minute monitor lag caught it. Two firings in one
+30-pair run ⇒ per-tick collision probability is high whenever the replicas'
+tick phases drift into alignment; treat the advisory-lock fix as required
+before any unattended run.
+
+**Third firing, 21:18:23Z** — `S1-outbox-note` r3, twins **3 ms apart**
+(.207/.210); twin `51b1daf0` cancelled after 11 LLM calls. Final tally for
+`baseline-02`: **3 duplicate submissions in 30 pairs (10%)**, 19 stray LLM
+calls total despite active monitoring — unattended, each twin would have run
+to completion.
+
 ## Impact
 
 - Worst case: duplicate jobs = wasted LLM spend + an extra unplanned

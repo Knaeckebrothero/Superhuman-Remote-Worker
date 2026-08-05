@@ -2279,7 +2279,9 @@ export class ApiService {
         tap((result) => {
           const params = {
             count: result?.files_copied ?? 0,
-            folder: result?.folder?.name ?? '',
+            // Where it landed in the user's own cloud. Falls back to the bare
+            // name for a pre-`path` orchestrator.
+            folder: result?.folder?.path ?? result?.folder?.name ?? '',
           };
           // `shared: false` means the bytes landed but the folder isn't
           // visible to this user yet (no cloud account until their first
