@@ -1742,6 +1742,7 @@
     "deleted": "Expert deleted",
     "duplicated": "Expert duplicated",
     "duplicatedMissingGrants": "Expert duplicated, but removed because you lack these grants: {{grants}}",
+    "forkedMissingGrants": "Your new default was created, but removed because you lack these grants: {{grants}}",
     "imported": "Expert imported",
     "inUse": "Expert is in use by {{count}} job(s)",
     "saveFailed": "Save failed",

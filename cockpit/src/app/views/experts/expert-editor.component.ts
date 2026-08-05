@@ -131,6 +131,42 @@ export function buildPromptsPayload(
   return out;
 }
 
+/**
+ * Router state `settings.component.ts`'s `customizeDefaultExpert` attaches to
+ * the `/experts/{id}/edit` navigation it makes right after a successful
+ * `POST /api/expert-defaults/{type}/fork` (task 4, 2026-08-04 plan). That
+ * route can strip-and-report the same as `duplicate` (task 3) — a bundled or
+ * borrowed source config commonly needs a grant this caller doesn't hold —
+ * and the settings page unmounts immediately on success, so a banner there
+ * would flash and be gone. This is how the notice survives the navigation to
+ * land on the editor instead.
+ */
+export interface ExpertEditorNavigationState {
+  dropped?: string[];
+}
+
+/**
+ * Whether the fork this editor was just navigated FROM stripped anything,
+ * and if so which transloco key + params report it — `null` when there is
+ * nothing to say (dropped absent or empty), which is the "do not render"
+ * half of the notice: unlike `duplicateResultTranslationArgs`
+ * (experts-list.component.ts), landing on this editor is already the
+ * success signal, so a clean fork gets no message at all, only a stripped
+ * one does.
+ *
+ * Pulled out as a pure function for the same reason
+ * `duplicateResultTranslationArgs` is: unit-testable without the component's
+ * five injected services. Grant keys are passed through verbatim
+ * (comma-joined, not humanized) — same convention, matching how
+ * `admin-grants.component.ts` renders them raw in a `<code>` cell.
+ */
+export function forkNoticeTranslationArgs(
+  dropped: string[] | undefined,
+): [key: string, params: Record<string, string>] | null {
+  if (!dropped || dropped.length === 0) return null;
+  return ['experts.forkedMissingGrants', {grants: dropped.join(', ')}];
+}
+
 interface EditorForm {
   name: string;
   display_name: string;
@@ -177,6 +213,10 @@ interface EditorForm {
         <app-sidebar-toggle />
         <h1>{{ (isEdit() ? 'experts.edit' : 'experts.new') | transloco }}</h1>
       </header>
+
+      @if (forkNotice()) {
+        <div class="banner info">{{ forkNotice() }}</div>
+      }
 
       <section class="card">
         <app-form-field label="Display name" [required]="true">
@@ -452,6 +492,13 @@ interface EditorForm {
         border-radius: 6px;
         margin-bottom: 1rem;
       }
+      .banner.info {
+        background: var(--info-tint);
+        color: var(--info);
+        padding: 0.5rem 0.75rem;
+        border-radius: 6px;
+        margin-bottom: 1rem;
+      }
     `,
   ],
 })
@@ -469,6 +516,10 @@ export class ExpertEditorComponent implements OnInit {
   editingId = signal<string | null>(null);
   saving = signal(false);
   errorMessage = signal('');
+  /** Set once, from router state, when this editor was landed on right after
+   *  a fork-as-default that stripped something (see `forkNoticeTranslationArgs`
+   *  and `ExpertEditorNavigationState`). Empty when there is nothing to say. */
+  forkNotice = signal('');
   private slugTouched = false;
 
   // Async-loaded context.
@@ -555,6 +606,20 @@ export class ExpertEditorComponent implements OnInit {
   baseForGroups = computed(() => deepMergeConfig(this.frameworkDefaults(), this.rawFragment()));
 
   constructor() {
+    // Router state only exists on `Router.getCurrentNavigation()` DURING the
+    // navigation that carried it — here, in the constructor of the routed
+    // component — and is gone by `ngOnInit`. That timing is what makes this
+    // notice show up exactly once: a plain page reload starts a fresh
+    // navigation with no state, so it does not resurface on refresh the way
+    // reading `history.state` later would.
+    const navState = this.router.getCurrentNavigation()?.extras
+      .state as ExpertEditorNavigationState | undefined;
+    const notice = forkNoticeTranslationArgs(navState?.dropped);
+    if (notice) {
+      const [key, params] = notice;
+      this.forkNotice.set(this.transloco.translate(key, params));
+    }
+
     // Prefill the structured controls once the fragment is loaded AND the
     // view-children exist (defeats the ViewChild-null race on fast responses).
     effect(() => {

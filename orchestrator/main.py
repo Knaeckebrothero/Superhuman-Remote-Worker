@@ -29577,7 +29577,15 @@ async def fork_my_expert_default(
     expert_type: Literal["worker", "session"],
     body: ExpertDefaultForkRequest,
 ) -> dict[str, Any]:
-    """Atomically copy a visible expert and select the owned copy as default."""
+    """Atomically copy a visible expert and select the owned copy as default.
+
+    Two independent 403 gates precede any write, and neither is optional:
+    `personal_defaults_allowed` (this route's own switch — a personal default
+    may be disabled while user-defined experts generally are not) and then
+    the `user_experts` kill switch inside `_enforce_expert_save_prelude` (the
+    same switch every expert-write route shares). Do not reorder or merge
+    them.
+    """
     _require_experts_db()
     user = await require_approved_user(request, postgres_db)
     uid = str(user["id"])
@@ -29611,14 +29619,30 @@ async def fork_my_expert_default(
         source = _db_expert_to_bundle_src(selection.expert)
 
     source["config"] = _validate_expert_fragment(source.get("config") or {})
-    await _enforce_expert_save(request, source["config"], user=user)
+    # Same 2026-08-04 decision as duplicate_expert (task 3 of the plan above):
+    # this is `duplicate` plus "select the copy as my default", and its source
+    # config carries the identical 7-of-11 exposure — a bundled expert or
+    # another principal's DB row commonly needs a grant this caller does not
+    # hold (measured, this blocked `scholar`, the one this route's set-default
+    # UI actually offers to fork from). Strip what the caller's grants forbid
+    # and report it, instead of refusing outright. `_enforce_expert_save_prelude`
+    # still runs first (kill-switch + raw scan), unconditionally, before either
+    # gate below — `_strip_save_grants` re-runs `evaluate` on the STRIPPED
+    # result and 422s if anything survives, so an incomplete strip map can only
+    # ever produce a false refusal here, never a permitted escape.
+    await _enforce_expert_save_prelude(request)
+    source["config"], dropped = await _strip_save_grants(source["config"], user=user)
     try:
         row = await postgres_db.fork_and_set_user_expert_default(
             user_id=uid, expert_type=expert_type, source=source
         )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-    return {"default": _default_expert_summary(row), "source": "user"}
+    return {
+        "default": _default_expert_summary(row),
+        "source": "user",
+        "dropped": dropped,
+    }
 
 
 @app.get("/api/admin/expert-defaults")
