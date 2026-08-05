@@ -173,18 +173,24 @@ Pass conditions:
 - Tilt has no stale failed build for Orchestrator or Cockpit;
 - the application opens at `https://localhost/`.
 
-Confirm migration `0082` without exposing database credentials:
+Confirm the migration without exposing database credentials. Note: this run
+predates the renumber — the migration shipped as `0083` after
+`0082_usage_cloud_rate_cards.sql` claimed `0082` from a parallel branch, and it
+now lands alongside `0084_datasource_scope_validate_constraints.sql` and
+`0085_datasources_auto_attach_owner_idx.notx.sql`. The findings below are
+recorded as they occurred, under the original `0082` name.
 
 ```bash
 kubectl --context=k3d-srw -n srw exec -i statefulset/srw-postgres -- sh -lc \
   'PGPASSWORD="$POSTGRES_PASSWORD" psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -At' <<'SQL'
 SELECT filename
 FROM schema_migrations
-WHERE filename = '0082_datasource_scope_auto_attach.sql' AND success;
+WHERE filename = '0083_datasource_scope_auto_attach.sql' AND success;
 SQL
 ```
 
-Expected: exactly `0082_datasource_scope_auto_attach.sql`.
+Expected: exactly `0083_datasource_scope_auto_attach.sql` (`0082` on any
+cluster last migrated before the renumber).
 
 Corroborate the migration's safe postconditions with aggregate counts only:
 
