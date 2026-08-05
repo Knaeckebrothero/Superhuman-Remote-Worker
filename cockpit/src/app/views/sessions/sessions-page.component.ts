@@ -648,6 +648,10 @@ export class SessionsPageComponent implements OnInit {
             title: this.newTitle || 'Untitled Session',
             config_name: this.newConfig,
             permission_mode: this.newPermission,
+            // This legacy dialog has no connector picker and is no longer
+            // reachable from the New Session button. If invoked by an older
+            // host, be explicit instead of silently applying defaults.
+            datasource_ids: [],
         };
         if (this.newModel) {
             body['model'] = this.newModel;

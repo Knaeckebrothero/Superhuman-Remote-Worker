@@ -453,7 +453,11 @@ class TestVerificationTriggerGuards:
 
         create_job_mock = AsyncMock(return_value={"id": "critic-999"})
         monkeypatch.setattr(main.postgres_db, "create_job", create_job_mock)
-        monkeypatch.setattr(main, "_propagate_datasources_to_subjob", AsyncMock())
+        monkeypatch.setattr(
+            main,
+            "_revalidate_job_datasource_selection",
+            AsyncMock(return_value=([], {})),
+        )
         monkeypatch.setattr(main, "_trigger_dispatch", lambda: None)
         # No critic already in flight. Stubbed rather than left real because
         # the baseline job id is not a UUID and the guard fails CLOSED on one.

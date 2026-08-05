@@ -90,11 +90,15 @@ const APPLY_DEBOUNCE_MS = 400;
             [disabled]="!chat.isConnected()"
             [gatedCapabilities]="capabilities.grants() ?? null"
             [datasources]="pickerDatasources()"
-            [loadingDatasources]="loadingThread()"
+            [loadingDatasources]="loadingDatasources()"
+            [datasourceLoadError]="datasourceLoadError()"
+            [datasourceContextKey]="'live:' + (chat.threadId() ?? '')"
+            [datasourceDefaultsEnabled]="capabilities.datasourceScopeAutoAttachAvailable()"
             [initialDatasourceIds]="attachedIds()"
             [lockedDatasourceIds]="lockedDatasourceIds()"
             [liteBackend]="isLiteBackend()"
             (change)="onSettingsChange()"
+            (retryDatasources)="retryDatasourceLoad()"
           />
 
           <!-- Workspace tier: its own upgrade verb, not config.update -->
@@ -236,6 +240,10 @@ export class SettingsPaneComponent {
     /** Eligible datasources shown in the picker: the create-flow eligible
      *  union, minus unattached kb entries (not addable live — v1). */
     readonly pickerDatasources = signal<Datasource[]>([]);
+    readonly loadingDatasources = signal(false);
+    readonly datasourceLoadError = signal(false);
+    private datasourceProjectIds: string[] = [];
+    private datasourceRequestSerial = 0;
     /** kb entries render frozen: knowledge bindings only rewire on attach. */
     readonly lockedDatasourceIds = computed(() =>
         this.pickerDatasources().filter((ds) => ds.type === 'kb').map((ds) => ds.id),
@@ -327,6 +335,9 @@ export class SettingsPaneComponent {
 
     private loadThread(threadId: string): void {
         this.loadingThread.set(true);
+        this.loadingDatasources.set(true);
+        this.datasourceLoadError.set(false);
+        this.datasourceRequestSerial += 1;
         // EVERY per-thread anchor is dropped here, before the fetch, and the
         // baseline most of all. `lastApplied` used to survive a thread switch:
         // for the whole request window `applyChanges` would diff the NEW
@@ -387,19 +398,67 @@ export class SettingsPaneComponent {
             this.settings()?.resetDatasourceSelection();
             this.lastApplied = this.desiredState({});
 
-            // Eligible list = the create-flow union for the thread's projects
-            // (per-project failures collapse to [] in the service; attached
-            // ids missing from the picker are preserved invisibly in every
-            // dispatched set — see canonicalDatasourceIds). Unattached kb
+            // Eligible list is loaded separately so a failed context read is a
+            // visible retry state, never a believable empty picker. Attached
+            // ids missing from the picker remain preserved invisibly in every
+            // dispatched set — see canonicalDatasourceIds. Unattached kb
             // entries are hidden: knowledge bindings don't rewire live (v1).
             const projectIds = ((thread?.['project_ids'] ?? []) as string[]).map(String);
-            this.api.getEligibleDatasources(projectIds).subscribe((eligible) => {
-                this.pickerDatasources.set(
-                    (eligible ?? []).filter(
-                        (ds) => ds.type !== 'kb' || ids.includes(ds.id),
-                    ),
+            this.datasourceProjectIds = projectIds;
+            this.loadEligibleDatasources(threadId, ids, projectIds);
+        });
+    }
+
+    retryDatasourceLoad(): void {
+        const threadId = this.chat.threadId();
+        if (!threadId) return;
+        this.loadEligibleDatasources(threadId, this.attachedIds(), this.datasourceProjectIds);
+    }
+
+    private loadEligibleDatasources(
+        threadId: string,
+        attachedIds: string[],
+        projectIds: string[],
+    ): void {
+        const serial = ++this.datasourceRequestSerial;
+        this.loadingDatasources.set(true);
+        this.datasourceLoadError.set(false);
+        this.api.getEligibleDatasources(projectIds).subscribe({
+            next: (eligible) => {
+                if (serial !== this.datasourceRequestSerial || this.chat.threadId() !== threadId) return;
+                const shown = eligible.filter(
+                    ds => ds.type !== 'kb' || attachedIds.includes(ds.id),
                 );
-            });
+                const visibleIds = new Set(shown.map(ds => ds.id));
+                // A stored attachment that fell out of eligibility is a live
+                // fail-closed conflict, not something to silently preserve
+                // forever. Render a non-enumerating placeholder so the user
+                // can explicitly detach it without leaking its former name or
+                // project association.
+                const unavailable: Datasource[] = attachedIds
+                    .filter(id => !visibleIds.has(id))
+                    .map(id => ({
+                        id,
+                        name: id,
+                        description: null,
+                        type: 'generic',
+                        connection_url: null,
+                        cli_hint: null,
+                        default_branch: null,
+                        job_id: null,
+                        created_at: '',
+                        updated_at: '',
+                        unavailable: true,
+                    }));
+                this.pickerDatasources.set([...shown, ...unavailable]);
+                this.loadingDatasources.set(false);
+            },
+            error: () => {
+                if (serial !== this.datasourceRequestSerial || this.chat.threadId() !== threadId) return;
+                this.pickerDatasources.set([]);
+                this.datasourceLoadError.set(true);
+                this.loadingDatasources.set(false);
+            },
         });
     }
 

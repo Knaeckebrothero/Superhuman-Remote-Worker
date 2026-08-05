@@ -469,6 +469,40 @@
         color: var(--text-primary);
       }
 
+      .draft-connectors {
+        display: flex;
+        justify-content: center;
+        margin-top: 12px;
+        min-height: 28px;
+      }
+
+      .draft-connectors-toggle,
+      .draft-connectors-state {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        padding: 5px 10px;
+        border: 1px solid var(--border-color, var(--surface-1));
+        border-radius: var(--radius-pill, 999px);
+        background: var(--surface-0);
+        color: var(--text-secondary);
+        font-size: 12px;
+      }
+
+      .draft-connectors-toggle { cursor: pointer; }
+      .draft-connectors-toggle input { accent-color: var(--accent-color); }
+      .draft-connectors-error { color: var(--danger); }
+      .draft-connectors-error button {
+        border: 0;
+        padding: 0;
+        background: transparent;
+        color: inherit;
+        font: inherit;
+        font-weight: 600;
+        cursor: pointer;
+        text-decoration: underline;
+      }
+
       @media (max-width: 600px) {
         .suggestion-grid {
           grid-template-columns: 1fr;

@@ -1,8 +1,9 @@
 import {computed, DestroyRef, effect, inject, Injectable, NgZone, signal, untracked} from '@angular/core';
+import {takeUntilDestroyed} from '@angular/core/rxjs-interop';
 import {HttpClient} from '@angular/common/http';
 import {firstValueFrom} from 'rxjs';
 import {environment} from '../environment';
-import {ThreadCloudDiffSummary, ThreadStatus} from '../models/api.model';
+import {Project, ThreadCloudDiffSummary, ThreadStatus} from '../models/api.model';
 import {FilePreview, ThreadUploadedFile, UploadStatus} from '../models/file.model';
 import {
     AssistantTurn,
@@ -27,6 +28,7 @@ import {
     PersistentThreadTransportBridge,
 } from './persistent-thread-transport-bridge.service';
 import {CanvasService} from './canvas.service';
+import {CapabilitiesService} from './capabilities.service';
 
 /**
  * Transport architecture (post WS→SSE migration, 2026-05-13):
@@ -350,8 +352,18 @@ export class PersistentChatService {
     private readonly destroyRef = inject(DestroyRef);
     private readonly threadTransport = inject(PersistentThreadTransportBridge);
     private readonly canvas = inject(CanvasService);
+    private readonly capabilities = inject(CapabilitiesService);
 
     constructor() {
+        let datasourceDefaultsAvailable =
+            this.capabilities.datasourceScopeAutoAttachAvailable();
+        this.capabilities.datasourceScopeAutoAttachAvailability$
+            .pipe(takeUntilDestroyed(this.destroyRef))
+            .subscribe((available) => {
+                if (available === datasourceDefaultsAvailable) return;
+                datasourceDefaultsAvailable = available;
+                if (this.isDraftSession()) void this.retryDraftDefaults();
+            });
         // PersistentChatService remains the sole SSE/WebSocket lifecycle owner.
         // Canvas receives decoded invalidations through this narrow bridge and
         // may send only its typed control vocabulary back through the current
@@ -751,6 +763,13 @@ export class PersistentChatService {
     // Default project prefetched on draft entry; attached to the create body
     // if it resolved by first-send time (best-effort).
     private draftProjectIds: string[] | null = null;
+    /** Stable, reviewable default selection for the landing draft. Null while
+     * the default-project/eligibility context is unresolved. */
+    readonly draftDatasourceIds = signal<string[] | null>(null);
+    readonly draftDefaultsLoading = signal(false);
+    readonly draftDefaultsError = signal(false);
+    readonly draftConnectorsEnabled = signal(true);
+    private draftDefaultsGeneration = 0;
     private creatingFromDraft = false;
 
     // --- Session paused (idle timeout received) ---
@@ -943,20 +962,57 @@ export class PersistentChatService {
         this.sessionTitle.set(null);
         this.error.set(null);
         this.creatingFromDraft = false;
+        this.draftConnectorsEnabled.set(true);
         this.isDraftSession.set(true);
-        // Prefetch the default project (best-effort, non-blocking) so the
-        // first send can attach it — parity with the New Session form's
-        // auto-selected default project.
+        // Resolve the default project and eligible connector defaults as one
+        // fail-closed context. The composer remains usable for drafting, but
+        // Send is disabled until the user has seen this stable preselection.
+        void this.retryDraftDefaults();
+    }
+
+    async retryDraftDefaults(): Promise<void> {
+        const generation = ++this.draftDefaultsGeneration;
         this.draftProjectIds = null;
-        this.api.getProjects().subscribe({
-            next: (projects) => {
-                const def = projects.find((p) => p.is_default);
-                this.draftProjectIds = def ? [def.id] : null;
-            },
-            error: () => {
-                // Default project is a nicety; the create body omits it.
-            },
-        });
+        this.draftDatasourceIds.set(null);
+        this.draftDefaultsLoading.set(true);
+        this.draftDefaultsError.set(false);
+        this.error.set(null);
+        try {
+            // Use the raw read rather than ApiService.getProjects(), whose
+            // legacy catchError([]) would turn a security-relevant failure into
+            // a believable "no project" context.
+            const projects = await firstValueFrom(
+                this.http.get<Project[]>(`${environment.apiUrl}/projects`),
+            );
+            if (generation !== this.draftDefaultsGeneration || !this.isDraftSession()) return;
+            const defaultProject = projects.find(project => project.is_default);
+            this.draftProjectIds = defaultProject ? [defaultProject.id] : [];
+            if (this.capabilities.datasourceScopeAutoAttachAvailable()) {
+                const eligible = await firstValueFrom(
+                    this.api.getEligibleDatasources(this.draftProjectIds),
+                );
+                if (generation !== this.draftDefaultsGeneration || !this.isDraftSession()) return;
+                this.draftDatasourceIds.set(
+                    eligible.filter(ds => ds.default_selected).map(ds => ds.id),
+                );
+            } else {
+                // Loading, failed, or absent rollout capability: no implicit
+                // connector selection. The explicit draft array remains [].
+                this.draftDatasourceIds.set([]);
+            }
+        } catch {
+            if (generation !== this.draftDefaultsGeneration || !this.isDraftSession()) return;
+            this.draftDefaultsError.set(true);
+            this.error.set(this.transloco.translate('chat.draft.defaultsFailed'));
+        } finally {
+            if (generation === this.draftDefaultsGeneration) {
+                this.draftDefaultsLoading.set(false);
+            }
+        }
+    }
+
+    setDraftConnectorsEnabled(enabled: boolean): void {
+        this.draftConnectorsEnabled.set(enabled);
     }
 
     /**
@@ -968,10 +1024,17 @@ export class PersistentChatService {
      */
     private async _createFromDraftSession(firstMessage: string): Promise<void> {
         if (this.creatingFromDraft) return;
+        if (
+            this.draftDefaultsLoading() || this.draftDefaultsError() ||
+            this.draftDatasourceIds() === null
+        ) return;
         this.creatingFromDraft = true;
         this.isDraftSession.set(false);
         const body: Record<string, any> = {title: draftTitleFrom(firstMessage)};
         if (this.draftProjectIds?.length) body['project_ids'] = this.draftProjectIds;
+        body['datasource_ids'] = this.draftConnectorsEnabled()
+            ? this.draftDatasourceIds() ?? []
+            : [];
         try {
             await this.createAndConnect(body);
         } catch {

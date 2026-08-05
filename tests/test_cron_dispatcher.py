@@ -158,6 +158,17 @@ def _make_mock_db(due_row: dict | None) -> MagicMock:
     db.advance_automation_after_fire = AsyncMock()
     db.skip_automation_fire = AsyncMock()
     db.auto_disable_automation = AsyncMock()
+    # Scheduled work resolves the stored owner's live connector defaults before
+    # creating the job. These tests have no connector fixtures, so model one
+    # active owner with an empty default set.
+    db.get_user = AsyncMock(
+        return_value={
+            "id": "33333333-3333-3333-3333-333333333333",
+            "is_approved": True,
+        }
+    )
+    db.user_is_member_of_projects = AsyncMock(return_value=True)
+    db.list_default_datasource_candidates = AsyncMock(return_value=[])
     # create_job is invoked by create_job_from_automation
     db.create_job = AsyncMock(
         return_value={"id": "11111111-1111-1111-1111-111111111111"}

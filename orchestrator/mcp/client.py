@@ -19,6 +19,10 @@ from tenacity import (
 )
 
 FilterCategory = Literal["all", "messages", "tools", "errors"]
+DatasourceScopeMode = Literal["all", "projects"]
+DatasourceVisibility = Literal["public", "private"]
+DatasourceOwnership = Literal["mine", "shared"]
+DatasourceAvailability = Literal["all", "projects", "unavailable"]
 
 
 def _create_safe_read_retry_decorator():
@@ -357,13 +361,20 @@ class CockpitClient:
         context: dict[str, Any] | None = None,
         required_deliverables: list[str] | None = None,
     ) -> dict[str, Any]:
-        """Create a new job."""
+        """Create a new job.
+
+        ``datasource_ids`` is tri-state: omit it to let the server resolve
+        inheritance/defaults, pass ``[]`` to attach no connectors, or pass IDs
+        to use exactly that authorized selection.
+        """
         body: dict[str, Any] = {
             "description": description,
             "config_name": config_name,
         }
-        if datasource_ids:
+        if datasource_ids is not None:
             body["datasource_ids"] = datasource_ids
+        else:
+            body["use_datasource_defaults"] = True
         if instructions:
             body["instructions"] = instructions
         if config_override:
@@ -908,7 +919,9 @@ class AsyncCockpitClient:
             description: Natural language task description
             config_name: Expert/agent config to use
             expert_id: Preferred database-backed expert UUID
-            datasource_ids: Global datasource IDs to clone as job-scoped
+            datasource_ids: Connector selection. Omit to inherit from an
+                authoritative parent or use root defaults; pass [] to attach
+                none; pass IDs to request exactly those connectors.
             instructions: Additional inline markdown instructions
             kickoff_message: Opening task brief sent to the agent
             config_override: Per-job config overrides
@@ -930,8 +943,10 @@ class AsyncCockpitClient:
         }
         if expert_id:
             body["expert_id"] = expert_id
-        if datasource_ids:
+        if datasource_ids is not None:
             body["datasource_ids"] = datasource_ids
+        else:
+            body["use_datasource_defaults"] = True
         if instructions:
             body["instructions"] = instructions
         if kickoff_message:
@@ -1320,13 +1335,47 @@ class AsyncCockpitClient:
 
     @_create_retry_decorator()
     async def list_datasources(
-        self, ds_type: str | None = None
-    ) -> list[dict[str, Any]]:
-        """List configured datasources."""
-        params: dict[str, Any] = {}
+        self,
+        ds_type: str | None = None,
+        *,
+        q: str | None = None,
+        project_id: str | None = None,
+        scope_mode: DatasourceScopeMode | None = None,
+        auto_attach: bool | None = None,
+        visibility: DatasourceVisibility | None = None,
+        ownership: DatasourceOwnership | None = None,
+        availability: DatasourceAvailability | None = None,
+        limit: int = 50,
+        cursor: str | None = None,
+    ) -> dict[str, Any]:
+        """List the authorized, cursor-paginated connector catalog."""
+        params: dict[str, Any] = {"limit": limit}
         if ds_type:
             params["type"] = ds_type
-        resp = await self._client.get("/api/datasources", params=params)
+        if q:
+            params["q"] = q
+        if project_id:
+            params["project_id"] = project_id
+        if scope_mode:
+            params["scope_mode"] = scope_mode
+        if auto_attach is not None:
+            params["auto_attach"] = auto_attach
+        if visibility:
+            params["visibility"] = visibility
+        if ownership:
+            params["ownership"] = ownership
+        if availability:
+            params["availability"] = availability
+        if cursor:
+            params["cursor"] = cursor
+        resp = await self._client.get("/api/datasources/catalog", params=params)
+        resp.raise_for_status()
+        return resp.json()
+
+    @_create_retry_decorator()
+    async def get_datasource(self, datasource_id: str) -> dict[str, Any]:
+        """Get one authorized connector with its exact policy revision."""
+        resp = await self._client.get(f"/api/datasources/{datasource_id}")
         resp.raise_for_status()
         return resp.json()
 
@@ -1956,7 +2005,9 @@ class AsyncCockpitClient:
             description: Task description
             config_name: Expert/agent config to use
             expert_id: Preferred database-backed expert UUID
-            datasource_ids: Global datasource IDs to clone
+            datasource_ids: Connector selection. Omit to use the project's
+                automatic defaults; pass [] to attach none; pass IDs to
+                request exactly those connectors.
             instructions: Additional inline instructions
             kickoff_message: Opening task brief sent to the agent
             config_override: Per-job config overrides
@@ -1975,8 +2026,10 @@ class AsyncCockpitClient:
         }
         if expert_id:
             body["expert_id"] = expert_id
-        if datasource_ids:
+        if datasource_ids is not None:
             body["datasource_ids"] = datasource_ids
+        else:
+            body["use_datasource_defaults"] = True
         if instructions:
             body["instructions"] = instructions
         if kickoff_message:
@@ -2006,7 +2059,7 @@ class AsyncCockpitClient:
         status: str | None = None,
         default_config_name: str | None = None,
         default_config_override: dict[str, Any] | None = None,
-    ) -> dict[str, str]:
+    ) -> dict[str, Any]:
         """Update a project's metadata or defaults.
 
         Args:
@@ -2182,12 +2235,14 @@ class AsyncCockpitClient:
         connection_url: str | None = None,
         description: str | None = None,
         credentials: dict[str, Any] | None = None,
-        job_id: str | None = None,
         cli_hint: str | None = None,
         default_branch: str | None = None,
         config: dict[str, Any] | None = None,
         is_global: bool = False,
         read_only: bool | None = None,
+        scope_mode: DatasourceScopeMode = "all",
+        project_ids: list[str] | None = None,
+        auto_attach: bool = False,
     ) -> dict[str, Any]:
         """Create a new datasource.
 
@@ -2197,12 +2252,17 @@ class AsyncCockpitClient:
             connection_url: Connection string (nullable for generic)
             description: What this datasource contains
             credentials: Auth details
-            job_id: Job UUID for job-scoped; None remains user-owned/unscoped
             cli_hint: Suggested CLI command
             default_branch: Branch to clone (repository type)
             config: Non-secret type-specific configuration
             is_global: Publish for all users (capability-gated)
             read_only: Declarative public/project access hint
+            scope_mode: ``all`` for every otherwise-authorized work context,
+                or ``projects`` to restrict availability to project_ids
+            project_ids: Full initial project scope. Omit for all-scope
+                connectors; projects mode requires a nonempty list.
+            auto_attach: Preselect this connector for its owner's new work
+                wherever it is available. This never force-attaches it.
 
         Returns:
             Created datasource record with ID
@@ -2217,8 +2277,6 @@ class AsyncCockpitClient:
             body["description"] = description
         if credentials is not None:
             body["credentials"] = credentials
-        if job_id:
-            body["job_id"] = job_id
         if cli_hint is not None:
             body["cli_hint"] = cli_hint
         if default_branch is not None:
@@ -2228,6 +2286,10 @@ class AsyncCockpitClient:
         body["is_global"] = is_global
         if read_only is not None:
             body["read_only"] = read_only
+        body["scope_mode"] = scope_mode
+        if project_ids is not None:
+            body["project_ids"] = project_ids
+        body["auto_attach"] = auto_attach
         resp = await self._mutation_request("POST", "/api/datasources", json=body)
         resp.raise_for_status()
         return resp.json()
@@ -2244,6 +2306,10 @@ class AsyncCockpitClient:
         config: dict[str, Any] | None = None,
         is_global: bool | None = None,
         read_only: bool | None = None,
+        scope_mode: DatasourceScopeMode | None = None,
+        project_ids: list[str] | None = None,
+        auto_attach: bool | None = None,
+        policy_revision: int | None = None,
     ) -> dict[str, str]:
         """Update a datasource.
 
@@ -2258,6 +2324,12 @@ class AsyncCockpitClient:
             config: New non-secret type-specific configuration
             is_global: Publish/unpublish (publication is capability-gated)
             read_only: New declarative read-only hint
+            scope_mode: New availability scope. Omit to preserve it.
+            project_ids: Desired full project set. Omit to preserve existing
+                links; pass [] to remove all links (valid only with all scope).
+            auto_attach: New owner-only default-selection preference
+            policy_revision: Revision loaded by the caller. Required for a
+                scope, project-link, or auto-attach edit.
 
         Returns:
             Status dict
@@ -2281,6 +2353,14 @@ class AsyncCockpitClient:
             body["is_global"] = is_global
         if read_only is not None:
             body["read_only"] = read_only
+        if scope_mode is not None:
+            body["scope_mode"] = scope_mode
+        if project_ids is not None:
+            body["project_ids"] = project_ids
+        if auto_attach is not None:
+            body["auto_attach"] = auto_attach
+        if policy_revision is not None:
+            body["policy_revision"] = policy_revision
         resp = await self._mutation_request(
             "PUT", f"/api/datasources/{datasource_id}", json=body
         )
@@ -2611,10 +2691,16 @@ class AsyncCockpitClient:
         permission_mode: str = "supervised",
         project_id: str | None = None,
         project_ids: list[str] | None = None,
+        datasource_ids: list[str] | None = None,
         model: str | None = None,
         temperature: float | None = None,
     ) -> dict[str, Any]:
         """Create a new persistent thread.
+
+        ``datasource_ids`` is tri-state at the MCP boundary: an omitted field
+        arrives here as the internal ``None`` sentinel and requests automatic
+        defaults, while ``[]`` attaches no connectors and IDs request exactly
+        that authorized selection. The MCP schema rejects explicit JSON null.
 
         Returns:
             Dict with ``thread_id`` and ``status``.
@@ -2628,6 +2714,10 @@ class AsyncCockpitClient:
             body["project_id"] = project_id
         if project_ids:
             body["project_ids"] = project_ids
+        if datasource_ids is not None:
+            body["datasource_ids"] = datasource_ids
+        else:
+            body["use_datasource_defaults"] = True
         if model:
             body["model"] = model
         if temperature is not None:

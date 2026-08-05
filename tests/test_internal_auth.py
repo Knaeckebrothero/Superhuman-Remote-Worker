@@ -543,6 +543,44 @@ class TestDualCallableEndpoints:
         fake_db.create_job.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_ownerless_internal_thread_cannot_add_arbitrary_datasource_uuid(
+        self,
+        thread_a,
+        datasource_b,
+        fake_request,
+        fake_db,
+    ):
+        """Transport trust permits reuse, not ambient connector selection."""
+        from main import JobCreate, create_job
+
+        fake_request.headers = {"X-Internal-Key": "secret"}
+        ownerless_thread = {
+            **thread_a,
+            "user_id": None,
+            "project_id": None,
+            "metadata": {"datasource_ids": []},
+        }
+        fake_db.get_thread = AsyncMock(return_value=ownerless_thread)
+        body = JobCreate(
+            description="ownerless datasource attempt",
+            thread_id=str(thread_a["id"]),
+            datasource_ids=[str(datasource_b["id"])],
+        )
+
+        with (
+            patch.object(access_module, "_INTERNAL_KEY", "secret"),
+            patch("main.postgres_db", fake_db),
+            patch("main._thread_project_ids", AsyncMock(return_value=[])),
+            patch("main._enforce_readiness_gate", AsyncMock(return_value=None)),
+            pytest.raises(HTTPException) as exc,
+        ):
+            await create_job(fake_request, body)
+
+        assert exc.value.status_code == 403
+        assert exc.value.detail == "One or more selected connectors are unavailable"
+        fake_db.create_job.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_create_job_reauthorizes_inherited_parent_datasources(
         self,
         user_a,
@@ -563,12 +601,21 @@ class TestDualCallableEndpoints:
         body = JobCreate(
             description="inherit revoked datasource",
             parent_job_id=str(job_a["id"]),
+            use_datasource_defaults=True,
         )
 
         with (
             patch.object(access_module, "_INTERNAL_KEY", "secret"),
             patch("main.postgres_db", fake_db),
             patch("main._enforce_readiness_gate", AsyncMock(return_value=None)),
+            patch(
+                "services.datasource_policy.default_datasource_selection",
+                AsyncMock(
+                    side_effect=AssertionError(
+                        "defaults must not override parent inheritance"
+                    )
+                ),
+            ),
             pytest.raises(HTTPException) as exc,
         ):
             await create_job(fake_request, body)
@@ -693,3 +740,61 @@ class TestDualCallableEndpoints:
         assert kwargs["delegation_context"] is None
         assert kwargs["context"] == {"instructions": "keep me"}
         assert kwargs["config_override"] == {"autonomy": "full"}
+
+
+@pytest.mark.asyncio
+async def test_job_revalidation_scopes_legacy_policy_read_to_same_job(
+    job_a, user_a, fake_db
+):
+    from main import _revalidate_job_datasource_selection
+
+    datasource_id = "99999999-9999-4999-8999-999999999999"
+    fake_db.list_job_datasource_ids = AsyncMock(return_value=[datasource_id])
+    fake_db.get_user = AsyncMock(return_value=user_a)
+    authorize = AsyncMock(return_value=([datasource_id], {datasource_id: 1}))
+    job_a = {
+        **job_a,
+        "context": {
+            "datasource_selection": {"datasource_ids": [datasource_id]},
+        },
+    }
+
+    with (
+        patch("main.postgres_db", fake_db),
+        patch("main._authorize_thread_datasource_selection", authorize),
+    ):
+        selected, revisions = await _revalidate_job_datasource_selection(job_a)
+
+    assert selected == [datasource_id]
+    assert revisions == {datasource_id: 1}
+    assert authorize.await_args.kwargs["legacy_job_id"] == str(job_a["id"])
+
+
+@pytest.mark.asyncio
+async def test_job_revalidation_rejects_connector_deleted_from_live_junction(
+    job_a, user_a, fake_db
+):
+    """The immutable context snapshot survives datasource FK cascade deletion."""
+    from main import _revalidate_job_datasource_selection
+
+    datasource_id = "99999999-9999-4999-8999-999999999999"
+    fake_db.list_job_datasource_ids = AsyncMock(return_value=[])
+    fake_db.get_user = AsyncMock(return_value=user_a)
+    authorize = AsyncMock()
+    job_a = {
+        **job_a,
+        "context": {
+            "datasource_selection": {"datasource_ids": [datasource_id]},
+        },
+    }
+
+    with (
+        patch("main.postgres_db", fake_db),
+        patch("main._authorize_thread_datasource_selection", authorize),
+    ):
+        with pytest.raises(HTTPException) as exc:
+            await _revalidate_job_datasource_selection(job_a)
+
+    assert exc.value.status_code == 403
+    assert exc.value.detail == "One or more selected connectors are unavailable"
+    authorize.assert_not_awaited()

@@ -92,7 +92,10 @@ function createPane(options: {
       .fn()
       .mockReturnValue(options.toolGroups$ ?? of(options.toolGroups ?? null)),
   };
-  const capabilities = {grants: signal(options.grants ?? null)};
+  const capabilities = {
+    grants: signal(options.grants ?? null),
+    datasourceScopeAutoAttachAvailable: () => true,
+  };
   const modelService = {load: vi.fn()};
 
   TestBed.configureTestingModule({
@@ -114,12 +117,7 @@ function createPane(options: {
     getOverrides: vi.fn().mockReturnValue({}),
     // Real group defaults its selection to the attached set (via
     // initialSelectedIds); mirror that default here.
-    getSelectedDatasourceIds: vi.fn(
-      () =>
-        (options.attachedIds ?? []).filter((id) =>
-          (options.eligible ?? []).some((ds) => ds.id === id),
-        ),
-    ),
+    getSelectedDatasourceIds: vi.fn(() => options.attachedIds ?? []),
     resetDatasourceSelection: vi.fn(),
     getToolAdditions: vi.fn().mockReturnValue({} as Record<string, string[]>),
   };
@@ -190,7 +188,10 @@ function createPaneWithRealToolsGroup(toolGroups: SessionToolGroupsResponse) {
     getEligibleDatasources: vi.fn().mockReturnValue(of([])),
     getSessionToolGroups: vi.fn().mockReturnValue(of(toolGroups)),
   };
-  const capabilities = {grants: signal(null)};
+  const capabilities = {
+    grants: signal(null),
+    datasourceScopeAutoAttachAvailable: () => true,
+  };
   const modelService = {load: vi.fn()};
 
   TestBed.configureTestingModule({
@@ -368,7 +369,10 @@ describe('SettingsPaneComponent locked-on categories, from the DOM', () => {
         SettingsPaneComponent,
         {provide: PersistentChatService, useValue: chat},
         {provide: ApiService, useValue: api},
-        {provide: CapabilitiesService, useValue: {grants: signal(null)}},
+        {
+          provide: CapabilitiesService,
+          useValue: {grants: signal(null), datasourceScopeAutoAttachAvailable: () => true},
+        },
         {provide: ModelService, useValue: {load: vi.fn()}},
       ],
     });
@@ -753,19 +757,20 @@ describe('SettingsPaneComponent datasources (Slice B)', () => {
     expect(chat.updateConfig).toHaveBeenCalledExactlyOnceWith({}, ['ds-pg', 'ds-web']);
   });
 
-  it('attached ids the picker cannot show survive every dispatch', () => {
+  it('renders unavailable attached ids so an explicit uncheck can detach them', () => {
     const {component, chat, fakeSettings} = createPane({
       attachedIds: ['ds-pg', 'kb-hidden'],
       eligible: [PG, WEB],
     });
-    // Uncheck postgres; kb-hidden never rendered (not eligible/kb-hidden) —
-    // dropping it silently would detach it server-side.
+    expect(component.pickerDatasources().find(ds => ds.id === 'kb-hidden')?.unavailable)
+      .toBe(true);
+    // The user explicitly unchecks both the ordinary and unavailable rows.
     fakeSettings.getSelectedDatasourceIds.mockReturnValue([]);
 
     component.onSettingsChange();
     vi.runAllTimers();
 
-    expect(chat.updateConfig).toHaveBeenCalledExactlyOnceWith({}, ['kb-hidden']);
+    expect(chat.updateConfig).toHaveBeenCalledExactlyOnceWith({}, []);
   });
 
   it('a config-only edit sends no datasource_ids at all', () => {

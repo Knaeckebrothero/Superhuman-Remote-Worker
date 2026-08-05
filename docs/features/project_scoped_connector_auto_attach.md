@@ -1,6 +1,8 @@
 # Project-scoped connector availability and auto-attach defaults
 
-Status: **PROPOSED — research-refined 2026-08-05; not implemented**
+Status: **IMPLEMENTED 2026-08-05** — policy UI advertisement and generic REST
+omission-as-default remain behind separate default-off rollout gates described
+in section 12.2.
 Date: 2026-08-05
 Scope: orchestrator datasource persistence and authorization, job/session creation,
 system-created jobs, MCP clients, and the Cockpit connector catalog/create forms and
@@ -279,6 +281,11 @@ external credential and, for a persistent workspace, reprovisioning/restarting i
   every selected session project must be linked. A connector linked only to Project A
   is not available in an A + B session. This preserves the promise that restricting a
   connector to A does not introduce it into a context that also carries B data.
+- After that all-match authorization succeeds, multi-project resolution returns one
+  deterministic row per selected connector. Project-level `read_only` overrides are
+  combined conservatively with `BOOL_OR`: if any matched project link is read-only,
+  the connector is read-only for the combined session. Differing A/B overrides must
+  never duplicate the connector or its policy revision in the delivery payload.
 - All project IDs used for matching must already have passed the existing membership
   authorization check.
 
@@ -360,6 +367,12 @@ database, and the generic project list is capped. Add a dedicated paginated
 read. It returns typed role plus `addable`/`retained_only` state, includes current
 links on edit, and returns only authorized additions. Omit `datasource_id` for create.
 Authorization remains server-enforced on write.
+
+The response separates the searchable page (`items`, `next_cursor`) from an
+unpaginated `selected_items` array. On edit, `selected_items` contains every
+currently linked project visible within the caller's token scope regardless of
+the search term or cursor, so a paginated form cannot silently remove an off-page
+or retained-only link. It is empty when `datasource_id` is omitted.
 
 Suggested user-facing terminology is **connector**. `datasource`, `auto_attach`,
 `scope_mode`, and `project_datasources` remain internal compatibility names.
@@ -604,8 +617,10 @@ Key the queue by `(project_id, datasource_id)` and store the requested policy re
 attempt count, next attempt, and last safe error. The worker re-reads authoritative
 Postgres state: sync the note if the link still exists, delete it otherwise, then
 settle/retry with bounded backoff. This also handles delete-then-readd ordering and
-connector description changes. After commit, existing synchronous sync/delete calls
-may remain as a fast path, but the durable queue is the correctness path.
+connector description changes. The implementation does not run synchronous
+sync/delete fast paths after policy writes; only the reconciliation worker invokes
+the strict external-store callbacks, so an unfenced request cannot acknowledge or
+overwrite newer queued work.
 Datasource name/description/type-config updates that alter note content enqueue every
 current project link in bulk in the same transaction.
 
@@ -981,22 +996,32 @@ settings are never rewritten by this migration.
 Changing root-request omission from “none” to “defaults” is an API compatibility
 break. Use a temporary capability/feature gate; “deploy in order” alone is not a gate:
 
-1. Apply the additive migration, policy backfills, legacy-job-link backfill, and safe
-   query indexes. Keep omission behavior disabled.
+1. Apply the additive migration, policy backfills, legacy-job-link backfill, and
+   query indexes. Deploy the safe backend changes with both
+   `DATASOURCE_SCOPE_AUTO_ATTACH_V1_ENABLED=false` (the default) and omission
+   behavior disabled. The capabilities response advertises
+   `datasource_scope_auto_attach_v1=false`, so the Cockpit keeps the new form
+   hidden while orchestrator replicas are mixed.
 2. Deploy every orchestrator replica with scope-aware reads/writes, target-aware
    authorization, materialized-empty support, and a reported capability such as
    `datasource_scope_auto_attach_v1`. Keep a deployment flag such as
    `DATASOURCE_DEFAULTS_ON_OMISSION=false`. Do not allow mixed-version policy
    writes; older Pydantic models may silently ignore new fields.
 3. Deploy Cockpit and MCP clients that preserve explicit `[]`, guard eligibility
-   races, and hide the new form until all backend replicas advertise support.
-4. Enable connector policy editing and UI preselection. Cockpit already submits an
+   races, and hide the new form until all backend replicas advertise support. Trusted
+   MCP/AI/system callers request owner defaults explicitly with
+   `use_datasource_defaults=true`; that opt-in remains independent of the generic
+   omission gate.
+4. After every API replica and client runs the new contract, set
+   `DATASOURCE_SCOPE_AUTO_ATTACH_V1_ENABLED=true`; only then does the capability
+   advertise the UI. Roll back the flag before rolling back any backend replica.
+5. Enable connector policy editing and UI preselection. Cockpit already submits an
    explicit full set, so this does not require root omission semantics.
-5. Route loops, automations, officers, and updated MCP tools through an explicit call
+6. Route loops, automations, officers, and updated MCP tools through an explicit call
    to the central default service. Keep benchmarks/userless work explicit-empty.
-6. Measure/log legacy root clients that still omit `datasource_ids`, publish the
+7. Measure/log legacy root clients that still omit `datasource_ids`, publish the
    breaking contract, then enable omission-as-default for the REST create API.
-7. Remove the temporary gate after the compatibility window and verify native KB,
+8. Remove the temporary gate after the compatibility window and verify native KB,
    personal WebDAV, eligible/default, and empty-selection behavior.
 
 This prevents an old UI that encoded “Deselect all” by omission from unexpectedly

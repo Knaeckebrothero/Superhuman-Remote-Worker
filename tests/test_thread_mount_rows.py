@@ -267,6 +267,30 @@ async def test_project_ids_from_mounts_includes_project_default():
     assert _project_ids_from_mounts(rows) == ["p-default", "p-alpha"]
 
 
+@pytest.mark.asyncio
+async def test_thread_project_ids_preserves_scope_when_default_mount_is_unavailable():
+    """Logical connector scope must survive a failed cloud-home mount build."""
+    fake_db = _fake_db()
+    fake_db.list_thread_mounts = AsyncMock(return_value=[])
+    fake_db.get_thread = AsyncMock(
+        return_value={
+            "id": "thread-1",
+            "project_id": "p-default",
+            "metadata": {},
+        }
+    )
+    fake_db.replace_thread_mounts = AsyncMock()
+
+    with (
+        patch("main.postgres_db", fake_db),
+        patch("main._build_thread_mount_rows", AsyncMock(return_value=[])),
+    ):
+        project_ids = await main._thread_project_ids("thread-1")
+
+    assert project_ids == ["p-default"]
+    fake_db.replace_thread_mounts.assert_not_awaited()
+
+
 # ---------------------------------------------------------------------------
 # Phase 4 — session-folder skip predicate
 # ---------------------------------------------------------------------------

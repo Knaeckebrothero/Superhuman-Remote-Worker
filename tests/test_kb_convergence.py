@@ -395,6 +395,13 @@ class TestAssembleAndConvergeRunner:
 # =============================================================================
 
 
+def _configure_no_datasource_defaults(db: AsyncMock) -> None:
+    """Give loop-job tests an approved owner with no automatic connectors."""
+    db.get_user = AsyncMock(return_value={"is_approved": True})
+    db.user_is_member_of_projects = AsyncMock(return_value=True)
+    db.list_default_datasource_candidates = AsyncMock(return_value=[])
+
+
 class TestLoopCurationEnabled:
     @pytest.mark.asyncio
     async def test_create_loop_job_turns_curation_on(self):
@@ -403,6 +410,7 @@ class TestLoopCurationEnabled:
         db = AsyncMock()
         db.create_job = AsyncMock(return_value={"id": uuid.uuid4()})
         db.list_project_datasources = AsyncMock(return_value=[])
+        _configure_no_datasource_defaults(db)
         loop = {
             "id": uuid.uuid4(),
             "project_id": uuid.uuid4(),
@@ -431,6 +439,7 @@ class TestLoopKickoffSplit:
         db = AsyncMock()
         db.create_job = AsyncMock(return_value={"id": uuid.uuid4()})
         db.list_project_datasources = AsyncMock(return_value=[])
+        _configure_no_datasource_defaults(db)
         loop = {
             "id": uuid.uuid4(),
             "project_id": uuid.uuid4(),
@@ -476,6 +485,7 @@ class TestLoopExpertResolution:
         db = AsyncMock()
         db.create_job = AsyncMock(return_value={"id": uuid.uuid4()})
         db.list_project_datasources = AsyncMock(return_value=[])
+        _configure_no_datasource_defaults(db)
         return db
 
     @pytest.mark.asyncio

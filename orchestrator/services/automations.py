@@ -16,9 +16,11 @@ from __future__ import annotations
 
 import logging
 import os
+from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID
 
+from .datasource_policy import default_datasource_selection
 from .default_experts import ExpertSelectionError, resolve_root_expert
 from src.core.loader import canonical_config_name, deep_merge
 
@@ -40,6 +42,15 @@ def _uuid_text(value: Any) -> str | None:
         return str(UUID(str(value)))
     except (TypeError, ValueError, AttributeError):
         return None
+
+
+def _workspace_backend(config_override: dict[str, Any]) -> str | None:
+    """Return the explicitly selected workspace tier, if the template has one."""
+    workspace = config_override.get("workspace")
+    if not isinstance(workspace, dict):
+        return None
+    backend = workspace.get("backend")
+    return str(backend) if backend else None
 
 
 async def _resolve_worker_selection(
@@ -142,10 +153,6 @@ async def create_job_from_automation(
         "automation_trigger": trigger_kind,
     }
 
-    # NOTE: with explicit-only datasource resolution, automation-fired jobs
-    # attach no datasources (the automation row carries no selection and this
-    # is a non-UI path with no parent to inherit from). Per-automation
-    # datasource selection is a follow-up; see multi_datasource_support.md.
     project_id = automation.get("project_id")
 
     # DB-backed selections use the explicit UUID column and remain pinned.
@@ -227,22 +234,54 @@ async def create_job_from_automation(
                 "Automation expert resolution failed (using config_name): %s", e
             )
 
+    owner_id = str(automation["owner_id"])
+    target_project_ids = [str(project_id)] if project_id else []
+    workspace_backend = _workspace_backend(config_override)
+
+    # Automations intentionally store no connector selection in v1. Resolve
+    # the owner's live defaults for every fire (cron and Run now), after the
+    # effective project and workspace tier are known. The policy service also
+    # verifies that the stored owner remains approved and a member of every
+    # target project. Let that denial propagate: creating no job is safer than
+    # running an unattended automation with a reduced or over-broad contract.
+    datasource_ids, datasource_policy_revisions = await default_datasource_selection(
+        db,
+        owner_id,
+        target_project_ids,
+        workspace_backend,
+    )
+
     job = await db.create_job(
         description=automation["prompt"],
         config_name=config_name,
         config_override=config_override,
         context=context,
-        user_id=str(automation["owner_id"]),
+        user_id=owner_id,
         project_id=str(project_id) if project_id else None,
         priority=int(automation.get("priority", 5)),
         expert_id=expert_id,
+        datasource_ids=datasource_ids,
+        datasource_selection_provenance={
+            "origin": "default",
+            "creation_path": "automation",
+            "trigger_kind": trigger_kind,
+            "effective_work_owner_id": owner_id,
+            "target_project_ids": target_project_ids,
+            "datasource_ids": datasource_ids,
+            "policy_revisions": datasource_policy_revisions,
+            "resolved_at": datetime.now(timezone.utc).isoformat(),
+        },
+        datasource_policy_revisions=datasource_policy_revisions,
+        authority_user_id=owner_id,
+        authority_project_ids=target_project_ids,
     )
 
     logger.info(
-        "Automation %s fired (%s) → job %s",
+        "Automation %s fired (%s) → job %s (datasource_defaults=%s)",
         automation_id,
         trigger_kind,
         job.get("id"),
+        len(datasource_ids),
     )
     return job
 

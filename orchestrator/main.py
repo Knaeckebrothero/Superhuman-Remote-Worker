@@ -105,6 +105,14 @@ from database import (  # noqa: E402
     MIGRATIONS_VECTOR_DIR,
     MIGRATIONS_AUDIT_DIR,
 )
+from database.postgres import (  # noqa: E402
+    DatasourceCatalogCursorError,
+    DatasourceMaterializationAuthorizationError,
+    DatasourcePolicyConflictError,
+    DatasourceProjectAuthorizationError,
+    DatasourcePolicyValidationError,
+    DatasourceScopeAuthorizationError,
+)
 from security.auth import (  # noqa: E402
     get_current_user,
     require_approved_user,
@@ -1406,6 +1414,32 @@ def _mcp_datasources_enabled() -> bool:
         "1",
         "yes",
     )
+
+
+def _datasource_defaults_on_omission() -> bool:
+    """Temporary rollout gate for the root REST omission contract.
+
+    Cockpit always submits a reviewed explicit array and internal schedulers
+    call the default policy directly.  This gate protects older REST clients
+    that historically encoded "none" by omitting ``datasource_ids``.
+    """
+    return os.getenv("DATASOURCE_DEFAULTS_ON_OMISSION", "false").lower().strip() in (
+        "true",
+        "1",
+        "yes",
+    )
+
+
+def _datasource_scope_auto_attach_v1_enabled() -> bool:
+    """Coordinated rollout gate for the project-scope/auto-attach UI.
+
+    Keep this default-off until every API replica understands the additive
+    datasource contract; the Cockpit reads the corresponding capability bit
+    and leaves the new management workflow hidden while a rollout is mixed.
+    """
+    return os.getenv(
+        "DATASOURCE_SCOPE_AUTO_ATTACH_V1_ENABLED", "false"
+    ).lower().strip() in ("true", "1", "yes")
 
 
 def _mcp_stdio_enabled() -> bool:
@@ -2856,10 +2890,22 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
                 if jobs_repo and jobs_repo.get("repo_url"):
                     git_remote_url = jobs_repo["repo_url"]
 
-        # Resolve datasources for this job (job > project > global)
-        resolved_ds = await postgres_db.resolve_datasources_for_job(
-            job_id, project_id=str(job["project_id"]) if job.get("project_id") else None
-        )
+        # Reauthorize the complete materialized set immediately before any
+        # credential payload is built. Scope/link/membership revocation fails
+        # the job as one data contract; it is never silently reduced.
+        try:
+            resolved_ds = await _resolve_authorized_job_datasources(job)
+        except HTTPException:
+            logger.warning(
+                "Dispatch: connector_unavailable for job %s", job_id, exc_info=True
+            )
+            await postgres_db.update_job_status(
+                job_id,
+                status="failed",
+                error_message="connector_unavailable",
+            )
+            return False
+
         has_knowledge_scope = bool(job.get("project_id")) or any(
             str(ds.get("type") or "").lower() == "kb" for ds in (resolved_ds or [])
         )
@@ -3258,10 +3304,23 @@ async def _resume_job_on_agent(job: dict, agent: dict) -> bool:
         return False
 
     try:
-        # Re-resolve datasources in case they changed
-        resolved_ds = await postgres_db.resolve_datasources_for_job(
-            job_id, project_id=str(job["project_id"]) if job.get("project_id") else None
-        )
+        # Resume is another credential-delivery boundary. Preserve the stored
+        # set, reauthorize it as a whole, and fail closed on any revoked row.
+        try:
+            resolved_ds = await _resolve_authorized_job_datasources(job)
+        except HTTPException:
+            logger.warning(
+                "Resume dispatch: connector_unavailable for job %s",
+                job_id,
+                exc_info=True,
+            )
+            await postgres_db.update_job_status(
+                job_id,
+                status="failed",
+                error_message="connector_unavailable",
+            )
+            return False
+
         has_knowledge_scope = bool(job.get("project_id")) or any(
             str(ds.get("type") or "").lower() == "kb" for ds in (resolved_ds or [])
         )
@@ -3631,6 +3690,26 @@ async def _send_session_attach(
     datasources: Optional[list] = None,
     config_name: Optional[str] = None,
 ) -> bool:
+    """Serialize connector selection with the complete attach delivery."""
+    async with postgres_db.thread_datasource_lock(thread_id):
+        return await _send_session_attach_locked(
+            agent,
+            thread_id,
+            config_override=config_override,
+            project_ids=project_ids,
+            datasources=datasources,
+            config_name=config_name,
+        )
+
+
+async def _send_session_attach_locked(
+    agent: dict,
+    thread_id: str,
+    config_override: Optional[dict] = None,
+    project_ids: Optional[list] = None,
+    datasources: Optional[list] = None,
+    config_name: Optional[str] = None,
+) -> bool:
     """Send a session attach request to an idle persistent agent.
 
     ``config_name`` is the thread's config — pool pods boot as workers
@@ -3678,15 +3757,24 @@ async def _send_session_attach(
             _meta = {}
 
     # Datasource selections are mutable authorization grants, not frozen
-    # capabilities. Re-check the owning user's current access immediately
-    # before every warm-pool attach so a revoked project membership/link cannot
-    # keep a private datasource (including an OKF KB) alive through a persisted
-    # metadata UUID. The generic denial deliberately avoids an enumeration
+    # capabilities. The caller may have resolved a payload before this function
+    # re-fetched the thread; a concurrent A -> B/[] settings update must not let
+    # that stale payload survive. Reauthorize the current metadata selection,
+    # resolve its credentials here, and rebuild connector tool categories from
+    # that same result. The generic denial deliberately avoids an enumeration
     # oracle; datasource credentials never reach this log path.
     try:
-        await _revalidate_thread_datasource_ids(_thread, _meta.get("datasource_ids"))
         current_project_ids = await _thread_project_ids(thread_id)
         project_ids = await _revalidate_thread_project_ids(_thread, current_project_ids)
+        resolved_datasources = await _resolve_authorized_thread_datasources(
+            _thread,
+            _meta.get("datasource_ids"),
+            target_project_ids=project_ids,
+        )
+        datasources = _build_datasources_payload(resolved_datasources)
+        config_override = _build_datasource_tool_override(
+            resolved_datasources, config_override
+        )
     except HTTPException:
         logger.warning(
             "Session attach denied for thread %s: its current knowledge/data "
@@ -4270,13 +4358,11 @@ async def _inherit_parent_datasource_ids(
 
     Prefers the parent thread's persisted selection
     (``threads.metadata.datasource_ids``), then the parent job's
-    ``job_datasources``. Returns [] when neither yields a selection.
+    immutable datasource-selection snapshot. Returns [] when neither parent
+    actually exists/yields a selection; database and policy failures propagate.
     """
     if thread_id:
-        try:
-            thread = await postgres_db.get_thread(thread_id)
-        except Exception:
-            thread = None
+        thread = await postgres_db.get_thread(thread_id)
         if thread:
             meta = thread.get("metadata") or {}
             if isinstance(meta, str):
@@ -4284,37 +4370,189 @@ async def _inherit_parent_datasource_ids(
                     meta = json.loads(meta)
                 except (json.JSONDecodeError, TypeError):
                     meta = {}
-            ids = meta.get("datasource_ids") or []
-            if ids:
+            # Presence is authoritative, including an explicit empty list.
+            # Falling through on ``[]`` would resurrect the parent job's
+            # connectors and make a deliberate opt-out impossible.
+            if "datasource_ids" in meta:
+                ids = meta.get("datasource_ids") or []
                 return [str(x) for x in ids]
     if parent_job_id:
-        try:
-            return await postgres_db.list_job_datasource_ids(parent_job_id)
-        except Exception:
+        parent = await postgres_db.get_job(parent_job_id)
+        if parent is None:
             return []
+        selected, _policy_revisions = await _revalidate_job_datasource_selection(parent)
+        return selected
     return []
 
 
-async def _propagate_datasources_to_subjob(
-    parent_job_id: str, child_job_id: str
-) -> None:
-    """Copy the parent job's datasource selection to a spawned subjob.
+async def _filter_implicit_lite_datasource_ids(
+    datasource_ids: list[str], workspace_backend: str | None
+) -> list[str]:
+    """Drop clone-based repositories from an implicit/default selection.
 
-    Explicit-only resolution means a subjob otherwise resolves no datasources;
-    scholar/critic/curator run on the parent's workspace and need the same
-    DB/repo sources. These subjobs are skipped for lite backends, so no
-    repository filtering is needed here.
+    Explicit selections fail loudly in the central policy service. Inherited
+    and automatic choices are creation-time seeds, so lite tiers keep the
+    usable connectors while omitting repositories they cannot materialize.
+    Missing IDs remain in the list and therefore still fail closed when the
+    complete set is authorized.
     """
+    if workspace_backend not in LITE_BACKENDS or not datasource_ids:
+        return datasource_ids
+    rows = await postgres_db.get_datasource_policy_rows(datasource_ids)
+    repositories = {
+        str(row["id"])
+        for row in rows
+        if str(row.get("type") or "").lower() == "repository"
+    }
+    return [value for value in datasource_ids if str(value) not in repositories]
+
+
+async def _datasource_selection_provenance(
+    *,
+    datasource_ids: list[str],
+    policy_revisions: dict[str, int],
+    origin: str,
+    effective_work_owner_id: str | None,
+    actor: dict[str, Any] | None,
+    project_ids: list[str],
+    creation_path: str,
+) -> dict[str, Any]:
+    """Build the credential-free audit stamp materialized with work."""
+    return {
+        "origin": origin,
+        "creation_path": creation_path,
+        "effective_work_owner_id": effective_work_owner_id,
+        "initiating_actor_id": str(actor.get("id"))
+        if actor and actor.get("id")
+        else None,
+        "project_ids": list(project_ids),
+        "datasource_ids": list(datasource_ids),
+        "policy_revisions": dict(policy_revisions),
+        "materialized_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+async def _revalidate_job_datasource_selection(
+    job: dict[str, Any],
+) -> tuple[list[str], dict[str, int]]:
+    """Reauthorize a job and return the exact connector policy snapshot."""
+    job_id = str(job["id"])
+    selected = await postgres_db.list_job_datasource_ids(job_id)
+    job_context = job.get("context") or {}
+    if isinstance(job_context, str):
+        try:
+            job_context = json.loads(job_context)
+        except (json.JSONDecodeError, TypeError) as exc:
+            raise HTTPException(
+                status_code=403,
+                detail="One or more selected connectors are unavailable",
+            ) from exc
+    materialized = (
+        job_context.get("datasource_selection")
+        if isinstance(job_context, dict)
+        else None
+    )
+    raw_ids = None
+    if isinstance(materialized, dict):
+        # ``datasource_ids`` is the shipped provenance key.  Accept the
+        # feature-document name too so both writers share the same immutable
+        # materialization contract during rollout.
+        raw_ids = materialized.get("selected_ids", materialized.get("datasource_ids"))
     try:
-        for ds_id in await postgres_db.list_job_datasource_ids(parent_job_id):
-            await postgres_db.link_datasource_to_job(child_job_id, ds_id)
-    except Exception as e:
-        logger.warning(
-            "Failed to propagate datasources %s -> %s: %s",
-            parent_job_id,
-            child_job_id,
-            e,
+        if not isinstance(raw_ids, list):
+            raise ValueError
+        snapshot_ids = [str(UUID(str(value))) for value in raw_ids]
+        junction_ids = [str(UUID(str(value))) for value in selected]
+        if len(snapshot_ids) != len(set(snapshot_ids)):
+            raise ValueError
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=403,
+            detail="One or more selected connectors are unavailable",
+        ) from exc
+    if set(snapshot_ids) != set(junction_ids) or len(snapshot_ids) != len(junction_ids):
+        raise HTTPException(
+            status_code=403,
+            detail="One or more selected connectors are unavailable",
         )
+    selected = snapshot_ids
+    owner_id = str(job["user_id"]) if job.get("user_id") else None
+    actor = await postgres_db.get_user(owner_id) if owner_id else None
+    config_override = job.get("config_override") or {}
+    if isinstance(config_override, str):
+        try:
+            config_override = json.loads(config_override)
+        except (json.JSONDecodeError, TypeError):
+            config_override = {}
+    return await _authorize_thread_datasource_selection(
+        actor,
+        selected,
+        workspace_backend=_backend_from_override(config_override),
+        target_project_ids=([str(job["project_id"])] if job.get("project_id") else []),
+        effective_work_owner_id=owner_id,
+        trusted_system_inheritance=owner_id is None,
+        legacy_job_id=job_id,
+    )
+
+
+def _require_exact_datasource_resolution(
+    selected_ids: list[str],
+    policy_revisions: dict[str, int],
+    resolved: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    """Fail closed unless resolution matches the authorized snapshot exactly.
+
+    This is the last gate before credential payload construction.  A deleted
+    connector, a revision change, duplicate resolver rows, or any silent
+    reduction is one unavailable data contract rather than a partial attach.
+    """
+    unavailable = HTTPException(
+        status_code=403,
+        detail="One or more selected connectors are unavailable",
+    )
+    try:
+        expected_ids = [str(UUID(str(value))) for value in selected_ids]
+        expected_revisions = {
+            str(UUID(str(datasource_id))): int(revision)
+            for datasource_id, revision in policy_revisions.items()
+        }
+        rows = list(resolved or [])
+        actual_ids = [str(UUID(str(row["id"]))) for row in rows]
+        actual_revisions = {
+            str(UUID(str(row["id"]))): int(row.get("policy_revision") or 0)
+            for row in rows
+        }
+    except (KeyError, TypeError, ValueError) as exc:
+        raise unavailable from exc
+
+    if (
+        len(expected_ids) != len(set(expected_ids))
+        or len(actual_ids) != len(set(actual_ids))
+        or len(rows) != len(expected_ids)
+        or set(actual_ids) != set(expected_ids)
+        or set(expected_revisions) != set(expected_ids)
+        or actual_revisions != expected_revisions
+    ):
+        raise unavailable
+    return rows
+
+
+async def _resolve_authorized_job_datasources(
+    job: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Authorize and exactly resolve a job's immutable connector snapshot."""
+    selected, policy_revisions = await _revalidate_job_datasource_selection(job)
+    resolved = await postgres_db.resolve_datasources_for_job(
+        str(job["id"]),
+        project_id=(str(job["project_id"]) if job.get("project_id") else None),
+    )
+    return _require_exact_datasource_resolution(selected, policy_revisions, resolved)
+
+
+async def _revalidate_job_datasource_ids(job: dict[str, Any]) -> list[str]:
+    """Reauthorize a job's materialized set before credential delivery."""
+    selected, _revisions = await _revalidate_job_datasource_selection(job)
+    return selected
 
 
 def _job_needs_vm(job: dict) -> bool:
@@ -5003,6 +5241,7 @@ _PUBLIC_JOB_CONTEXT_RESERVED_KEYS = {
     "automation_trigger",
     "cloud_baseline",
     "delegation_results",
+    "datasource_selection",
     "delegation_timed_out",
     "git_remote_url",
     "graft_output_path",
@@ -6887,6 +7126,18 @@ class DatasourceCreate(BaseModel):
         description="Auth details (env_vars for generic, auth_method+token/ssh_key for repository, type-specific for managed)",
     )
     job_id: str | None = Field(None, description="Job UUID (null for global)")
+    scope_mode: Literal["all", "projects"] = Field(
+        "all",
+        description="Execution availability: everywhere or selected projects",
+    )
+    project_ids: list[str] | None = Field(
+        None,
+        description="Full project scope when scope_mode is 'projects'",
+    )
+    auto_attach: bool = Field(
+        False,
+        description="Select this connector by default in the owner's new work",
+    )
     cli_hint: str | None = Field(
         None, description="Suggested CLI command (e.g. 'psql $DATABASE_URL')"
     )
@@ -6912,6 +7163,16 @@ class DatasourceCreate(BaseModel):
             "are the enforcement boundary."
         ),
     )
+
+    @model_validator(mode="after")
+    def validate_availability_policy(self) -> "DatasourceCreate":
+        if "project_ids" in self.model_fields_set and self.project_ids is None:
+            raise ValueError("project_ids may be omitted or an array, not null")
+        if self.scope_mode == "projects" and not self.project_ids:
+            raise ValueError("project_ids is required for project-scoped connectors")
+        if self.scope_mode == "all" and self.project_ids:
+            raise ValueError("project_ids requires scope_mode='projects'")
+        return self
 
 
 class DatasourceUpdate(BaseModel):
@@ -6943,6 +7204,29 @@ class DatasourceUpdate(BaseModel):
         None,
         description="Declared read-only flag (kb: always true; declarative only)",
     )
+    scope_mode: Literal["all", "projects"] | None = Field(
+        None, description="New execution availability mode"
+    )
+    project_ids: list[str] | None = Field(
+        None, description="Desired full project scope; omission preserves links"
+    )
+    auto_attach: bool | None = Field(
+        None, description="New owner-specific default-selection preference"
+    )
+    policy_revision: int | None = Field(
+        None, ge=1, description="Optimistic concurrency token for policy edits"
+    )
+
+    @model_validator(mode="after")
+    def validate_availability_policy(self) -> "DatasourceUpdate":
+        policy_fields = {"scope_mode", "project_ids", "auto_attach"}
+        changed = policy_fields.intersection(self.model_fields_set)
+        for field_name in changed | ({"policy_revision"} & self.model_fields_set):
+            if getattr(self, field_name) is None:
+                raise ValueError(f"{field_name} may be omitted, but not null")
+        if changed and self.policy_revision is None:
+            raise ValueError("policy_revision is required for availability changes")
+        return self
 
 
 class SSHKeyGenerateRequest(BaseModel):
@@ -7103,6 +7387,13 @@ class JobCreate(BaseModel):
     datasource_ids: list[str] | None = Field(
         None, description="Connector IDs to attach to the job"
     )
+    use_datasource_defaults: bool = Field(
+        False,
+        description=(
+            "Resolve the owner's currently available automatic connector "
+            "defaults. Mutually exclusive with datasource_ids."
+        ),
+    )
     user_id: str | None = Field(None, description="User UUID who created this job")
     project_id: str | None = Field(
         None, description="Project UUID to associate this job with"
@@ -7134,6 +7425,16 @@ class JobCreate(BaseModel):
     delegation_context: str | None = Field(
         None, description="Shared context string from parent delegation"
     )
+
+    @model_validator(mode="after")
+    def reject_null_datasource_selection(self) -> "JobCreate":
+        if "datasource_ids" in self.model_fields_set and self.datasource_ids is None:
+            raise ValueError("datasource_ids may be omitted or an array, not null")
+        if self.use_datasource_defaults and "datasource_ids" in self.model_fields_set:
+            raise ValueError(
+                "use_datasource_defaults and datasource_ids are mutually exclusive"
+            )
+        return self
 
 
 class JobStartRequest(BaseModel):
@@ -8163,10 +8464,28 @@ async def lifespan(app: FastAPI):
     # this replica holds it. See services/leader_election.py.
     from database.lock_ids import LEADER_ID
     from services.checkpoint_retention import run_retention_sweeper
+    from services.datasource_reconciliation import run_datasource_project_reconciler
     from services.leader_election import is_leader, run_as_leader, run_when_leader
+
+    async def _strict_datasource_sync(
+        project_id: str, datasource: dict[str, Any]
+    ) -> None:
+        await _sync_datasource_knowledge(project_id, datasource, strict=True)
+
+    async def _strict_datasource_delete(project_id: str, datasource_id: str) -> None:
+        await _delete_datasource_knowledge(project_id, datasource_id, strict=True)
 
     leader_task = asyncio.create_task(
         run_as_leader(postgres_db, LEADER_ID, _shutdown_event)
+    )
+    datasource_reconciliation_task = asyncio.create_task(
+        run_datasource_project_reconciler(
+            postgres_db,
+            _shutdown_event,
+            is_leader.is_set,
+            sync_fn=_strict_datasource_sync,
+            delete_fn=_strict_datasource_delete,
+        )
     )
     stale_detector_task = asyncio.create_task(
         run_when_leader(stale_agent_detector, _shutdown_event)
@@ -8401,6 +8720,7 @@ async def lifespan(app: FastAPI):
     # Signal shutdown to background tasks
     _shutdown_event.set()
     await leader_task
+    await datasource_reconciliation_task
     await stale_detector_task
     await token_cleanup_task
     await session_cleanup_task
@@ -9464,81 +9784,122 @@ async def create_job(request: Request, job: JobCreate) -> dict[str, Any]:
             project_ids=[project_id] if project_id else [],
         )
 
-        # Resolve and authorize the effective selection before type inspection
-        # or job persistence. This prevents both datasource UUID attachment and
-        # a lite-tier type/name oracle. Inherited selections are re-authorized:
-        # a parent's/thread's access may have been revoked since its metadata or
-        # junction rows were written. Only a server-derived userless
-        # parent/thread origin retains the trusted datasource bypass.
-        explicit_datasource_ids: list[str] | None = None
-        if job.datasource_ids is not None:
-            if internal_principal is not None:
-                explicit_datasource_ids = await _authorize_thread_datasource_ids(
-                    internal_principal,
-                    job.datasource_ids,
-                    workspace_backend=None,
-                )
-            elif not internal_call and caller is not None:
-                explicit_datasource_ids = await _authorize_thread_datasource_ids(
-                    caller,
-                    job.datasource_ids,
-                    workspace_backend=None,
-                )
-            else:
-                explicit_datasource_ids = list(
-                    dict.fromkeys(str(value) for value in job.datasource_ids)
-                )
+        # Resolve one complete attachment set before persistence. Presence —
+        # not truthiness — distinguishes an explicit [] from omission.
+        from services.datasource_policy import default_datasource_selection
 
-        if explicit_datasource_ids is not None:
-            selected_ds_ids = explicit_datasource_ids
+        selection_actor = internal_principal if internal_call else caller
+        target_project_ids = [project_id] if project_id else []
+        lite_backend = _backend_from_override(config_override)
+        selection_was_supplied = "datasource_ids" in job.model_fields_set
+        trusted_system_origin = bool(
+            internal_call and internal_origin_bound and selection_actor is None
+        )
+
+        if selection_was_supplied:
+            selection_origin = "explicit"
+            requested_datasource_ids = job.datasource_ids or []
+            trusted_explicit_reuse = False
+            if trusted_system_origin and effective_user_id is None:
+                # An ownerless internal caller has no ambient connector
+                # authority. It may narrow an authoritative thread/parent
+                # selection, but it cannot turn the trusted-inheritance seam
+                # into an arbitrary UUID capability.
+                inherited_ids = await _inherit_parent_datasource_ids(
+                    thread_id=job.thread_id,
+                    parent_job_id=job.parent_job_id,
+                )
+                try:
+                    requested_set = {
+                        str(UUID(str(value))) for value in requested_datasource_ids
+                    }
+                    inherited_set = {str(UUID(str(value))) for value in inherited_ids}
+                except (TypeError, ValueError) as exc:
+                    raise HTTPException(
+                        status_code=403,
+                        detail="One or more selected connectors are unavailable",
+                    ) from exc
+                if not requested_set.issubset(inherited_set):
+                    raise HTTPException(
+                        status_code=403,
+                        detail="One or more selected connectors are unavailable",
+                    )
+                trusted_explicit_reuse = True
+            (
+                selected_ds_ids,
+                selected_ds_revisions,
+            ) = await _authorize_thread_datasource_selection(
+                selection_actor,
+                requested_datasource_ids,
+                workspace_backend=lite_backend,
+                target_project_ids=target_project_ids,
+                effective_work_owner_id=(
+                    str(effective_user_id) if effective_user_id else None
+                ),
+                trusted_system_inheritance=trusted_explicit_reuse,
+                legacy_job_id=str(job.parent_job_id) if job.parent_job_id else None,
+            )
         elif job.thread_id or job.parent_job_id:
-            selected_ds_ids = await _inherit_parent_datasource_ids(
+            selection_origin = "inherited"
+            inherited_ids = await _inherit_parent_datasource_ids(
                 thread_id=job.thread_id, parent_job_id=job.parent_job_id
             )
-            if internal_principal is not None:
-                selected_ds_ids = await _authorize_thread_datasource_ids(
-                    internal_principal,
+            inherited_ids = await _filter_implicit_lite_datasource_ids(
+                inherited_ids, lite_backend
+            )
+            (
+                selected_ds_ids,
+                selected_ds_revisions,
+            ) = await _authorize_thread_datasource_selection(
+                selection_actor,
+                inherited_ids,
+                workspace_backend=None,
+                target_project_ids=target_project_ids,
+                effective_work_owner_id=(
+                    str(effective_user_id) if effective_user_id else None
+                ),
+                trusted_system_inheritance=trusted_system_origin,
+                legacy_job_id=str(job.parent_job_id) if job.parent_job_id else None,
+            )
+        elif effective_user_id and (
+            job.use_datasource_defaults or _datasource_defaults_on_omission()
+        ):
+            selection_origin = "default"
+            try:
+                (
                     selected_ds_ids,
-                    workspace_backend=None,
+                    selected_ds_revisions,
+                ) = await default_datasource_selection(
+                    postgres_db,
+                    str(effective_user_id),
+                    target_project_ids,
+                    lite_backend,
                 )
-            elif not internal_call and caller is not None:
-                selected_ds_ids = await _authorize_thread_datasource_ids(
-                    caller,
-                    selected_ds_ids,
-                    workspace_backend=None,
-                )
-            else:
-                selected_ds_ids = list(
-                    dict.fromkeys(str(value) for value in selected_ds_ids)
-                )
-        else:
-            selected_ds_ids = []
+            except Exception as exc:
+                from services.datasource_policy import DatasourceUnavailableError
 
-        # Lite-tier guard: virtual/none agents have no shell-capable workspace
-        # to clone into, so a repository datasource is the tier boundary (§4).
-        # Reject at submit time with a clear 400 instead of a silent dispatch
-        # failure later. (The dispatcher re-checks resolved datasources too.)
-        lite_backend = _backend_from_override(config_override)
-        if lite_backend in LITE_BACKENDS and explicit_datasource_ids:
-            repo_names: list[str] = []
-            for ds_id in explicit_datasource_ids:
-                try:
-                    ds = await postgres_db.get_datasource(ds_id)
-                except Exception:
-                    ds = None
-                if ds and (ds.get("type") or "").lower() == "repository":
-                    repo_names.append(str(ds.get("name") or ds_id))
-            if repo_names:
-                raise HTTPException(
-                    status_code=400,
-                    detail=(
-                        f"workspace.backend='{lite_backend}' is a lite tier and "
-                        f"cannot use repository connectors "
-                        f"({', '.join(repo_names)}). Use backend='sandbox' or "
-                        f"'vm' for coding workloads, or remove the repository "
-                        f"connector."
-                    ),
-                )
+                if isinstance(exc, DatasourceUnavailableError):
+                    raise HTTPException(
+                        status_code=403,
+                        detail="One or more selected connectors are unavailable",
+                    ) from exc
+                raise
+        else:
+            selection_origin = "omitted_compat" if effective_user_id else "system_empty"
+            selected_ds_ids = []
+            selected_ds_revisions = {}
+
+        selection_provenance = await _datasource_selection_provenance(
+            datasource_ids=selected_ds_ids,
+            policy_revisions=selected_ds_revisions,
+            origin=selection_origin,
+            effective_work_owner_id=(
+                str(effective_user_id) if effective_user_id else None
+            ),
+            actor=selection_actor,
+            project_ids=target_project_ids,
+            creation_path="internal_rest" if internal_call else "user_rest",
+        )
 
         # Session ↔ job backref. `job.thread_id` is authenticated on the
         # internal path (_resolve_internal_job_creation_scope 403s on a thread
@@ -9580,6 +9941,11 @@ async def create_job(request: Request, job: JobCreate) -> dict[str, Any]:
             delegation_context=job.delegation_context,
             created_by_thread_id=creating_thread_id,
             wake_on_complete=bool(creating_thread_id),
+            datasource_ids=selected_ds_ids,
+            datasource_selection_provenance=selection_provenance,
+            datasource_policy_revisions=selected_ds_revisions,
+            authority_user_id=(str(effective_user_id) if effective_user_id else None),
+            authority_project_ids=(target_project_ids if effective_user_id else None),
         )
 
         # Create Gitea repo/branch + grant creator access + seed the Mode A
@@ -9594,48 +9960,6 @@ async def create_job(request: Request, job: JobCreate) -> dict[str, Any]:
             postgres_db=postgres_db,
             main_cloud_router=main_cloud_router,
         )
-
-        # Persist the pre-authorized selection as job_datasources links — the
-        # picker is the source of truth; resolution returns exactly these,
-        # nothing global/project force-attaches. An explicit [] opts out.
-        new_job_id = str(result["id"])
-
-        # Lite tiers can't clone repos; drop any inherited repository
-        # datasources (explicitly-attached repos were already rejected above
-        # with a 400; the dispatch guard is the final backstop).
-        if selected_ds_ids and lite_backend in LITE_BACKENDS:
-            filtered: list[str] = []
-            for ds_id in selected_ds_ids:
-                try:
-                    ds = await postgres_db.get_datasource(ds_id)
-                except Exception:
-                    ds = None
-                if ds and (ds.get("type") or "").lower() == "repository":
-                    logger.info(
-                        "Dropping repository datasource %s from lite job %s "
-                        "(backend=%s)",
-                        ds_id,
-                        new_job_id,
-                        lite_backend,
-                    )
-                    continue
-                filtered.append(ds_id)
-            selected_ds_ids = filtered
-
-        # Both explicit and inherited user-bound selections were authorized
-        # before job creation. Link only those normalized IDs. System jobs are
-        # only server-derived userless origins are the trusted bypass.
-        if selected_ds_ids:
-            for ds_id in selected_ds_ids:
-                try:
-                    await postgres_db.link_datasource_to_job(new_job_id, ds_id)
-                except Exception as e:
-                    logger.warning(
-                        "Failed to link datasource %s to job %s: %s",
-                        ds_id,
-                        new_job_id,
-                        e,
-                    )
 
         # Spawn scholar subjob if enabled (root jobs only)
         if not job.parent_job_id:
@@ -9658,6 +9982,16 @@ async def create_job(request: Request, job: JobCreate) -> dict[str, Any]:
         _trigger_dispatch()
 
         return result
+    except DatasourceMaterializationAuthorizationError as exc:
+        raise HTTPException(
+            status_code=403,
+            detail="Work owner is no longer authorized",
+        ) from exc
+    except DatasourcePolicyConflictError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail="Connector policy changed while creating work; retry the request",
+        ) from exc
     except HTTPException:
         raise
     except Exception as e:
@@ -12736,26 +13070,69 @@ async def _spawn_scholar_subjob(
         f"(scholar_config={scholar_config_name})"
     )
 
-    # Hold the parent job
-    await postgres_db.update_job_status(job_id, status="waiting")
-
-    scholar_job = await postgres_db.create_job(
-        description=scholar_description,
-        config_name=scholar_config_name,
-        config_override=scholar_override,
-        context=scholar_context,
-        parent_job_id=job_id,
-        project_id=project_id,
-        priority=10,
-        user_id=str(job["user_id"]) if job.get("user_id") else None,
-        runner_kind="lifecycle",
+    (
+        scholar_datasource_ids,
+        scholar_datasource_revisions,
+    ) = await _revalidate_job_datasource_selection(job)
+    scholar_owner_id = str(job["user_id"]) if job.get("user_id") else None
+    scholar_actor = (
+        await postgres_db.get_user(scholar_owner_id) if scholar_owner_id else None
     )
+    scholar_datasource_provenance = await _datasource_selection_provenance(
+        datasource_ids=scholar_datasource_ids,
+        policy_revisions=scholar_datasource_revisions,
+        origin="inherited",
+        effective_work_owner_id=scholar_owner_id,
+        actor=scholar_actor,
+        project_ids=[project_id] if project_id else [],
+        creation_path="scholar_lifecycle",
+    )
+
+    # Hold the parent only for the materialization window.  If the atomic
+    # datasource/owner check loses a race (or INSERT otherwise fails), release
+    # the parent before propagating the error; no child exists that could do so
+    # later through the normal scholar-completion path.
+    await postgres_db.update_job_status(job_id, status="waiting")
+    try:
+        scholar_job = await postgres_db.create_job(
+            description=scholar_description,
+            config_name=scholar_config_name,
+            config_override=scholar_override,
+            context=scholar_context,
+            parent_job_id=job_id,
+            project_id=project_id,
+            priority=10,
+            user_id=str(job["user_id"]) if job.get("user_id") else None,
+            runner_kind="lifecycle",
+            datasource_ids=scholar_datasource_ids,
+            datasource_selection_provenance=scholar_datasource_provenance,
+            datasource_policy_revisions=scholar_datasource_revisions,
+            authority_user_id=scholar_owner_id,
+            authority_project_ids=(
+                [project_id] if scholar_owner_id and project_id else []
+            ),
+        )
+    except Exception:
+        logger.exception(
+            "Scholar materialization failed for parent %s; releasing hold",
+            job_id,
+        )
+        try:
+            await postgres_db.merge_job_context(job_id, {"scholar_failed": True})
+        except Exception:
+            logger.exception(
+                "Failed to record scholar materialization failure for parent %s",
+                job_id,
+            )
+        try:
+            await postgres_db.update_job_status(job_id, status="created")
+        except Exception:
+            logger.exception("Failed to release scholar hold for parent %s", job_id)
+        _trigger_dispatch()
+        raise
 
     scholar_job_id = str(scholar_job["id"])
     short_id = scholar_job_id[:8]
-
-    # Inherit the parent's datasource selection (explicit-only resolution).
-    await _propagate_datasources_to_subjob(job_id, scholar_job_id)
 
     # Set up Gitea branch for the scholar subjob
     if gitea_client.is_initialized:
@@ -13845,23 +14222,65 @@ async def _trigger_verification_on_complete(
         f"(critic_config={critic_config}, round={len(rounds)}, max_rounds={max_rounds})"
     )
 
-    critic_job = await postgres_db.create_job(
-        description=verification_description,
-        config_name=critic_config,
-        config_override=config_override,
-        context=context,
-        parent_job_id=job_id,
-        project_id=project_id,
-        priority=10,
-        user_id=str(job["user_id"]) if job.get("user_id") else None,
-        runner_kind="lifecycle",
+    try:
+        (
+            critic_datasource_ids,
+            critic_datasource_revisions,
+        ) = await _revalidate_job_datasource_selection(job)
+    except HTTPException as exc:
+        if exc.status_code != 403:
+            raise
+        reason = (
+            "Verification could not start because the target's connector "
+            "selection is no longer authorized."
+        )
+        await _escalate_target(job_id, job, reason)
+        actions.append(f"target {job_id} escalated: connector access changed")
+        return
+    critic_owner_id = str(job["user_id"]) if job.get("user_id") else None
+    critic_actor = (
+        await postgres_db.get_user(critic_owner_id) if critic_owner_id else None
     )
+    critic_datasource_provenance = await _datasource_selection_provenance(
+        datasource_ids=critic_datasource_ids,
+        policy_revisions=critic_datasource_revisions,
+        origin="inherited",
+        effective_work_owner_id=critic_owner_id,
+        actor=critic_actor,
+        project_ids=[project_id] if project_id else [],
+        creation_path="critic_lifecycle",
+    )
+
+    try:
+        critic_job = await postgres_db.create_job(
+            description=verification_description,
+            config_name=critic_config,
+            config_override=config_override,
+            context=context,
+            parent_job_id=job_id,
+            project_id=project_id,
+            priority=10,
+            user_id=str(job["user_id"]) if job.get("user_id") else None,
+            runner_kind="lifecycle",
+            datasource_ids=critic_datasource_ids,
+            datasource_selection_provenance=critic_datasource_provenance,
+            datasource_policy_revisions=critic_datasource_revisions,
+            authority_user_id=critic_owner_id,
+            authority_project_ids=(
+                [project_id] if critic_owner_id and project_id else []
+            ),
+        )
+    except DatasourcePolicyConflictError:
+        reason = (
+            "Verification could not start because the target's connector "
+            "policy changed concurrently."
+        )
+        await _escalate_target(job_id, job, reason)
+        actions.append(f"target {job_id} escalated: connector policy changed")
+        return
 
     critic_job_id = str(critic_job["id"])
     short_id = critic_job_id[:8]
-
-    # Inherit the parent's datasource selection (explicit-only resolution).
-    await _propagate_datasources_to_subjob(job_id, critic_job_id)
 
     # Set up Gitea branch for the subjob (same logic as create_job endpoint)
     if gitea_client.is_initialized:
@@ -18590,6 +19009,89 @@ async def list_datasources(
     return redact_datasources(visible)
 
 
+@app.get("/api/datasources/catalog")
+async def list_datasource_catalog(
+    request: Request,
+    q: str | None = Query(default=None, max_length=200),
+    type: str | None = Query(default=None),
+    project_id: str | None = Query(default=None),
+    scope_mode: str | None = Query(default=None),
+    auto_attach: bool | None = Query(default=None),
+    visibility: str | None = Query(default=None),
+    ownership: str | None = Query(default=None),
+    availability: str | None = Query(default=None),
+    limit: int = Query(default=50, ge=1, le=100),
+    cursor: str | None = Query(default=None),
+) -> dict[str, Any]:
+    """Cursor-paginated connector management catalog.
+
+    Authorization and every filter are applied before the stable cursor/limit;
+    this avoids the legacy newest-100 raw-row cap hiding older owned rows.
+    """
+    user = await require_approved_user(request, postgres_db)
+    scope_project_id = mcp_scope_project_id(user)
+    if project_id:
+        await require_project_member(request, postgres_db, project_id)
+    if scope_project_id and project_id and str(project_id) != str(scope_project_id):
+        raise HTTPException(status_code=403, detail="Access denied by MCP token scope")
+
+    visible = await user_visible_project_ids(user, postgres_db)
+    visible_project_ids = [] if visible == "all" else [str(value) for value in visible]
+    if scope_project_id:
+        visible_project_ids = [str(scope_project_id)]
+    try:
+        result = await postgres_db.list_datasource_catalog(
+            str(user["id"]),
+            visible_project_ids,
+            is_admin=bool(user.get("is_admin")),
+            restrict_to_projects=bool(scope_project_id),
+            q=q,
+            ds_type=type,
+            project_id=project_id,
+            scope_mode=scope_mode,
+            auto_attach=auto_attach,
+            visibility=visibility,
+            ownership=ownership,
+            availability=availability,
+            limit=limit,
+            cursor=cursor,
+        )
+    except (DatasourcePolicyValidationError, DatasourceCatalogCursorError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    result["items"] = redact_datasources(result.get("items") or [])
+    return result
+
+
+@app.get("/api/projects/linkable-datasource-targets")
+async def list_linkable_datasource_targets(
+    request: Request,
+    datasource_id: str | None = Query(default=None),
+    q: str | None = Query(default=None, max_length=200),
+    limit: int = Query(default=50, ge=1, le=100),
+    cursor: str | None = Query(default=None),
+) -> dict[str, Any]:
+    """Projects addable to a connector policy, plus retained current links."""
+    user = await require_approved_user(request, postgres_db)
+    if datasource_id:
+        await require_datasource_owner(request, postgres_db, datasource_id)
+    try:
+        result = await postgres_db.list_linkable_datasource_targets(
+            str(user["id"]),
+            datasource_id=datasource_id,
+            is_admin=bool(user.get("is_admin")),
+            restrict_project_id=(
+                str(mcp_scope_project_id(user)) if mcp_scope_project_id(user) else None
+            ),
+            q=q,
+            limit=limit,
+            cursor=cursor,
+        )
+    except DatasourceCatalogCursorError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return result
+
+
 @app.get("/api/datasources/eligible")
 async def list_eligible_datasources(
     request: Request,
@@ -18608,7 +19110,18 @@ async def list_eligible_datasources(
     resolution the picker is the only way a job gets connectors.
     """
     user = await require_approved_user(request, postgres_db)
-    project_ids = project_id or []
+    project_ids = list(dict.fromkeys(str(value) for value in (project_id or [])))
+    scope_project_id = mcp_scope_project_id(user)
+    if scope_project_id is not None:
+        scoped_id = str(scope_project_id)
+        if project_ids and project_ids != [scoped_id]:
+            raise HTTPException(
+                status_code=403,
+                detail="Access denied by MCP token scope",
+            )
+        # Omission never widens a project-scoped principal to the projectless
+        # catalog: the token's project is the authoritative target context.
+        project_ids = [scoped_id]
     for pid in project_ids:
         await require_project_member(request, postgres_db, pid)
     try:
@@ -18625,8 +19138,38 @@ async def list_eligible_datasources(
 @app.get("/api/datasources/{datasource_id}")
 async def get_datasource(request: Request, datasource_id: str) -> dict[str, Any]:
     """Get a single connector by ID. F3: gated + credentials redacted."""
-    _, ds = await require_datasource_access(request, postgres_db, datasource_id)
+    user, ds = await require_datasource_access(request, postgres_db, datasource_id)
+    if user.get("is_admin") or str(ds.get("created_by") or "") == str(user["id"]):
+        project_ids = await postgres_db.list_datasource_projects(datasource_id)
+        scope_project_id = mcp_scope_project_id(user)
+        ds["project_ids"] = (
+            [str(scope_project_id)]
+            if scope_project_id
+            and str(scope_project_id) in {str(value) for value in project_ids}
+            else ([] if scope_project_id else project_ids)
+        )
     return redact_datasource(ds)
+
+
+async def _require_scoped_datasource_mutation(
+    user: dict[str, Any], datasource: dict[str, Any], datasource_id: str
+) -> set[str]:
+    """Keep a project-scoped token from mutating a cross-scope connector."""
+    scope_project_id = mcp_scope_project_id(user)
+    if scope_project_id is None:
+        return set()
+    project_ids = {
+        str(value)
+        for value in await postgres_db.list_datasource_projects(datasource_id)
+    }
+    if datasource.get("scope_mode") != "projects" or project_ids != {
+        str(scope_project_id)
+    }:
+        raise HTTPException(
+            status_code=403,
+            detail="Access denied by MCP token scope",
+        )
+    return project_ids
 
 
 @app.post("/api/datasources")
@@ -18638,12 +19181,12 @@ async def create_datasource(body: DatasourceCreate, request: Request) -> dict[st
             status_code=400,
             detail=f"Invalid type '{body.type}'. Must be one of: {', '.join(sorted(valid_types))}",
         )
-    if body.type == "kb" and body.job_id is not None:
+    if body.job_id is not None:
         raise HTTPException(
             status_code=400,
             detail=(
-                "OKF Knowledge Base connectors cannot set job_id; attach them "
-                "through the job's explicit connector selection"
+                "New connectors cannot set job_id; attach them through the "
+                "job's explicit connector selection"
             ),
         )
     if body.type == "mcp":
@@ -18656,6 +19199,21 @@ async def create_datasource(body: DatasourceCreate, request: Request) -> dict[st
 
     user = await require_approved_user(request, postgres_db)
     user_id = str(user["id"])
+
+    # Project scope is an execution boundary, so UUID knowledge or ordinary
+    # membership is insufficient to add a link. Creation needs management
+    # authority for every selected target before the datasource transaction.
+    project_ids = list(dict.fromkeys(str(value) for value in body.project_ids or []))
+    scope_project_id = mcp_scope_project_id(user)
+    if scope_project_id and (
+        body.scope_mode != "projects" or set(project_ids) != {str(scope_project_id)}
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="Access denied by MCP token scope",
+        )
+    for project_id in project_ids:
+        await require_project_owner(request, postgres_db, project_id)
 
     # Publish gate — is_global hands the publisher's stored credentials to
     # every user's agents (docs/features/public_datasources.md).
@@ -18759,7 +19317,19 @@ async def create_datasource(body: DatasourceCreate, request: Request) -> dict[st
             created_by=user_id,
             is_global=body.is_global,
             read_only=read_only,
+            scope_mode=body.scope_mode,
+            auto_attach=body.auto_attach,
+            project_ids=project_ids,
+            authority_user_id=user_id,
+            authority_is_admin=bool(user.get("is_admin")),
         )
+    except DatasourceProjectAuthorizationError as exc:
+        raise HTTPException(
+            status_code=403,
+            detail="Not authorized to add one or more project links",
+        ) from exc
+    except DatasourcePolicyValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     except HTTPException:
         raise
     except Exception as e:
@@ -18770,6 +19340,8 @@ async def create_datasource(body: DatasourceCreate, request: Request) -> dict[st
                 detail=f"A connector named '{body.name}' of type '{body.type}' already exists",
             ) from e
         raise HTTPException(status_code=500, detail=error_msg) from e
+    created["project_ids"] = project_ids
+
     if body.type == "kb":
         await _mark_kb_datasource_pending(str(created["id"]))
         _schedule_kb_datasource_reindex(str(created["id"]), force_full=True)
@@ -18779,10 +19351,14 @@ async def create_datasource(body: DatasourceCreate, request: Request) -> dict[st
 @app.put("/api/datasources/{datasource_id}")
 async def update_datasource(
     request: Request, datasource_id: str, body: DatasourceUpdate
-) -> dict[str, str]:
+) -> dict[str, Any]:
     """Update a connector. F3: creator/admin only; credentials are preserved."""
     user, existing_ds = await require_datasource_owner(
         request, postgres_db, datasource_id
+    )
+    scope_project_id = mcp_scope_project_id(user)
+    scoped_current_project_ids = await _require_scoped_datasource_mutation(
+        user, existing_ds, datasource_id
     )
     if existing_ds.get("type") == "mcp" and not _mcp_datasources_enabled():
         raise HTTPException(
@@ -18847,6 +19423,43 @@ async def update_datasource(
     mcp_connection_url_set = False
     reindex_required = False
     native_project = native_kb_project_id(existing_ds)
+    policy_fields = {"scope_mode", "project_ids", "auto_attach"}
+    policy_changed = bool(policy_fields.intersection(body.model_fields_set))
+    if native_project and policy_changed:
+        raise HTTPException(
+            status_code=409,
+            detail="The native project knowledge connector policy is managed by its project",
+        )
+
+    # A connector-owner may always revoke an existing link, but every newly
+    # added target requires current project-owner authority. This check is
+    # deliberately based on the desired-set diff: retained-only projects can
+    # survive an edit without being re-authorized or losing their overrides.
+    existing_project_ids: set[str] = set()
+    if policy_changed:
+        existing_project_ids = (
+            scoped_current_project_ids
+            if scope_project_id
+            else set(await postgres_db.list_datasource_projects(datasource_id))
+        )
+    if "project_ids" in body.model_fields_set:
+        desired_project_ids = set(str(value) for value in body.project_ids or [])
+        if scope_project_id and desired_project_ids != {str(scope_project_id)}:
+            raise HTTPException(
+                status_code=403,
+                detail="Access denied by MCP token scope",
+            )
+        for project_id in sorted(desired_project_ids - existing_project_ids):
+            await require_project_owner(request, postgres_db, project_id)
+    if (
+        scope_project_id
+        and "scope_mode" in body.model_fields_set
+        and body.scope_mode != "projects"
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="Access denied by MCP token scope",
+        )
     if existing_ds.get("type") == "kb" and native_project:
         # A project's own KB row is a management surface, not a remote source:
         # it has no repository URL or credentials to validate, and it is never
@@ -18963,39 +19576,129 @@ async def update_datasource(
             ),
         )
     try:
-        update_kwargs = dict(
-            datasource_id=datasource_id,
-            name=body.name,
-            description=body.description,
-            connection_url=connection_url,
-            credentials=credentials,
-            cli_hint=body.cli_hint,
-            default_branch=body.default_branch,
-            config=datasource_config,
-            is_global=body.is_global,
-            read_only=read_only,
-        )
-        if mcp_connection_url_set:
-            update_kwargs["connection_url_set"] = True
-        success = await postgres_db.update_datasource(**update_kwargs)
-        if not success:
-            raise HTTPException(
-                status_code=404, detail=f"Connector '{datasource_id}' not found"
+        policy_result: dict[str, Any] | None = None
+        content_fields = {
+            "name",
+            "description",
+            "connection_url",
+            "credentials",
+            "cli_hint",
+            "default_branch",
+            "config",
+            "is_global",
+            "read_only",
+        }
+        content_changed = bool(content_fields.intersection(body.model_fields_set))
+        if policy_changed:
+            policy_result = await postgres_db.update_datasource_with_policy(
+                datasource_id,
+                expected_policy_revision=int(body.policy_revision or 0),
+                scope_mode=(
+                    body.scope_mode if "scope_mode" in body.model_fields_set else None
+                ),
+                auto_attach=(
+                    body.auto_attach if "auto_attach" in body.model_fields_set else None
+                ),
+                project_ids=(
+                    body.project_ids if "project_ids" in body.model_fields_set else None
+                ),
+                name=body.name,
+                description=body.description,
+                connection_url=connection_url,
+                credentials=credentials,
+                cli_hint=body.cli_hint,
+                default_branch=body.default_branch,
+                config=datasource_config,
+                is_global=body.is_global,
+                read_only=read_only,
+                connection_url_set=mcp_connection_url_set,
+                authority_user_id=str(user["id"]),
+                authority_is_admin=bool(user.get("is_admin")),
+                authority_project_scope_id=(
+                    str(scope_project_id) if scope_project_id else None
+                ),
             )
+            if policy_result is None:
+                raise HTTPException(
+                    status_code=404, detail=f"Connector '{datasource_id}' not found"
+                )
 
-        # Re-sync knowledge entries for all linked projects
-        linked_projects = await postgres_db.list_datasource_projects(datasource_id)
-        if linked_projects:
-            updated_ds = await postgres_db.get_datasource(datasource_id)
-            if updated_ds:
-                for pid in linked_projects:
-                    await _sync_datasource_knowledge(pid, updated_ds)
+        if content_changed and not policy_changed:
+            update_kwargs = dict(
+                datasource_id=datasource_id,
+                name=body.name,
+                description=body.description,
+                connection_url=connection_url,
+                credentials=credentials,
+                cli_hint=body.cli_hint,
+                default_branch=body.default_branch,
+                config=datasource_config,
+                is_global=body.is_global,
+                read_only=read_only,
+            )
+            if mcp_connection_url_set:
+                update_kwargs["connection_url_set"] = True
+            if scope_project_id:
+                update_kwargs["authority_project_scope_id"] = str(scope_project_id)
+            success = await postgres_db.update_datasource(**update_kwargs)
+            if not success:
+                raise HTTPException(
+                    status_code=404, detail=f"Connector '{datasource_id}' not found"
+                )
 
         if existing_ds.get("type") == "kb" and reindex_required:
             await _mark_kb_datasource_pending(datasource_id)
             _schedule_kb_datasource_reindex(datasource_id, force_full=True)
 
-        return {"status": "updated"}
+        updated_ds = await postgres_db.get_datasource(datasource_id)
+        if not updated_ds:
+            raise HTTPException(
+                status_code=404, detail=f"Connector '{datasource_id}' not found"
+            )
+        updated_project_ids = (
+            policy_result.get("project_ids", [])
+            if policy_result is not None
+            else await postgres_db.list_datasource_projects(datasource_id)
+        )
+        updated_ds["project_ids"] = (
+            [str(scope_project_id)]
+            if scope_project_id
+            and str(scope_project_id) in {str(value) for value in updated_project_ids}
+            else ([] if scope_project_id else updated_project_ids)
+        )
+        if policy_result is not None:
+            await log_security_event(
+                postgres_db,
+                resource_type="datasource",
+                event_type="datasource_policy_updated",
+                user=user,
+                resource_id=datasource_id,
+                detail=(
+                    f"scope={existing_ds.get('scope_mode', 'all')}->"
+                    f"{updated_ds.get('scope_mode', 'all')} "
+                    f"auto={bool(existing_ds.get('auto_attach', False))}->"
+                    f"{bool(updated_ds.get('auto_attach', False))} "
+                    f"projects={len(existing_project_ids)}->"
+                    f"{len(updated_ds['project_ids'])} "
+                    f"revision={updated_ds.get('policy_revision')}"
+                ),
+                request=request,
+            )
+        return redact_datasource(updated_ds)
+    except DatasourceScopeAuthorizationError as exc:
+        raise HTTPException(
+            status_code=403,
+            detail="Access denied by MCP token scope",
+        ) from exc
+    except DatasourceProjectAuthorizationError as exc:
+        raise HTTPException(
+            status_code=403,
+            detail="Not authorized to add one or more project links",
+        ) from exc
+    except DatasourcePolicyConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except DatasourcePolicyValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     except HTTPException:
         raise
     except Exception as e:
@@ -19005,17 +19708,33 @@ async def update_datasource(
 @app.delete("/api/datasources/{datasource_id}")
 async def delete_datasource(request: Request, datasource_id: str) -> dict[str, str]:
     """Delete a connector. F3: creator/admin only."""
-    _, datasource = await require_datasource_owner(request, postgres_db, datasource_id)
-    try:
-        # Clean up knowledge entries for all linked projects before deletion
-        linked_projects = await postgres_db.list_datasource_projects(datasource_id)
-        for pid in linked_projects:
-            await _delete_datasource_knowledge(pid, datasource_id)
+    user, datasource = await require_datasource_owner(
+        request, postgres_db, datasource_id
+    )
+    from services.kb_datasources import native_kb_project_id
 
+    if native_kb_project_id(datasource):
+        raise HTTPException(
+            status_code=409,
+            detail="The project knowledge connector is managed by its project",
+        )
+    await _require_scoped_datasource_mutation(user, datasource, datasource_id)
+    scope_project_id = mcp_scope_project_id(user)
+    try:
         if datasource.get("type") == "kb":
-            success = await _delete_kb_datasource_with_index(datasource_id)
+            success = await _delete_kb_datasource_with_index(
+                datasource_id,
+                authority_project_scope_id=(
+                    str(scope_project_id) if scope_project_id else None
+                ),
+            )
         else:
-            success = await postgres_db.delete_datasource(datasource_id)
+            success = await postgres_db.delete_datasource(
+                datasource_id,
+                authority_project_scope_id=(
+                    str(scope_project_id) if scope_project_id else None
+                ),
+            )
         if not success:
             raise HTTPException(
                 status_code=404, detail=f"Connector '{datasource_id}' not found"
@@ -19023,6 +19742,11 @@ async def delete_datasource(request: Request, datasource_id: str) -> dict[str, s
         return {"status": "deleted"}
     except HTTPException:
         raise
+    except DatasourceScopeAuthorizationError as exc:
+        raise HTTPException(
+            status_code=403,
+            detail="Access denied by MCP token scope",
+        ) from exc
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
 
@@ -21033,6 +21757,17 @@ async def agent_create_thread(
             config_name=config_name,
             permission_mode=body.permission_mode,
             title=body.title,
+            datasource_ids=[],
+            datasource_selection_provenance={
+                "origin": "system_empty",
+                "creation_path": "internal_agent_thread",
+                "effective_work_owner_id": None,
+                "initiating_actor_id": None,
+                "project_ids": [],
+                "datasource_ids": [],
+                "policy_revisions": {},
+                "materialized_at": datetime.now(timezone.utc).isoformat(),
+            },
         )
 
         metadata_patch: dict[str, Any] = {}
@@ -21159,12 +21894,12 @@ async def _thread_project_ids(thread_id: str) -> list[str]:
     on the agent side.
 
     **Lazy backfill (transitional):** threads that predate the migration
-    have ``metadata.project_ids`` set but no ``thread_mounts`` rows. When
-    we see that combination we materialize the missing rows on the spot,
-    so the rest of the codebase observes ``thread_mounts`` as the single
-    source of truth from the first access onwards. Remove this fallback
-    one release after Phase 1 ships — by then every active thread has
-    been touched at least once and the JSONB key is dead.
+    have ``metadata.project_ids`` set but no ``thread_mounts`` rows. Newer
+    single-project threads also retain ``threads.project_id`` as their
+    durable logical scope even when cloud mount construction is unavailable.
+    When no mount rows exist, materialize either source on the spot where
+    possible and return the logical IDs even if the cloud transport cannot be
+    built. Connector authorization must not depend on cloud availability.
     """
     mounts = await postgres_db.list_thread_mounts(thread_id)
     ids = _project_ids_from_mounts(mounts)
@@ -21181,16 +21916,23 @@ async def _thread_project_ids(thread_id: str) -> list[str]:
             metadata = json.loads(metadata)
         except (json.JSONDecodeError, TypeError):
             metadata = {}
-    legacy_ids = metadata.get("project_ids") or []
-    if not legacy_ids:
+    fallback_ids = list(
+        dict.fromkeys(
+            [
+                *([str(thread["project_id"])] if thread.get("project_id") else []),
+                *(str(value) for value in (metadata.get("project_ids") or [])),
+            ]
+        )
+    )
+    if not fallback_ids:
         return []
     try:
-        rows = await _build_thread_mount_rows([str(p) for p in legacy_ids])
+        rows = await _build_thread_mount_rows(fallback_ids)
         if rows:
             await postgres_db.replace_thread_mounts(thread_id, rows)
             logger.info(
                 "Thread %s: backfilled %d thread_mounts row(s) from "
-                "legacy metadata.project_ids",
+                "durable project scope",
                 thread_id,
                 len(rows),
             )
@@ -21199,15 +21941,15 @@ async def _thread_project_ids(thread_id: str) -> list[str]:
             )
     except Exception as e:
         # Don't let a backfill failure prevent the caller from getting the
-        # project_ids — fall back to the legacy list so behavior matches
-        # the pre-migration era. The next access retries the backfill.
+        # project_ids — fall back to the durable logical scope. The next
+        # access retries the backfill.
         logger.warning(
             "Thread %s: thread_mounts backfill failed (%s); "
-            "returning legacy project_ids",
+            "returning durable project scope",
             thread_id,
             e,
         )
-    return [str(p) for p in legacy_ids]
+    return fallback_ids
 
 
 async def _build_default_project_mount_row(
@@ -21368,15 +22110,12 @@ async def _resolve_thread_datasources(
     by the caller. ``metadata`` still carries the explicit ``datasource_ids``
     list.
     """
-    ds_ids = await _revalidate_thread_datasource_ids(
-        thread, metadata.get("datasource_ids")
+    resolved = await _resolve_authorized_thread_datasources(
+        thread,
+        metadata.get("datasource_ids"),
+        target_project_ids=project_ids,
     )
-    if not ds_ids and not project_ids:
-        return None
-    resolved = await postgres_db.resolve_datasources_for_thread(
-        datasource_ids=ds_ids, project_ids=project_ids
-    )
-    return _build_datasources_payload(resolved)
+    return _build_datasources_payload(resolved) if resolved else None
 
 
 async def _resolve_thread_repositories(
@@ -21492,6 +22231,16 @@ async def agent_get_thread_workspace(
     allowing the agent to wait for the workspace to be ready.
     """
     await require_internal(request)
+    # This response is a credential-delivery boundary for cold/dedicated
+    # sessions.  Use the same lock as live selection replacement and do every
+    # authoritative read + response build beneath it.  Once an A -> B/[] save
+    # commits, no later cold response can deliver the old A payload.
+    async with postgres_db.thread_datasource_lock(thread_id):
+        return await _agent_get_thread_workspace_locked(thread_id)
+
+
+async def _agent_get_thread_workspace_locked(thread_id: str) -> dict[str, Any]:
+    """Build a cold-session payload from state fetched under the DS lock."""
     thread = await postgres_db.get_thread(thread_id)
     if not thread:
         raise HTTPException(status_code=404, detail="Thread not found")
@@ -22522,11 +23271,14 @@ async def _apply_thread_config_update(
     # datasource_tools-denied principal fails HERE at the PATCH, not at
     # the next attach.
     selected_ds_ids: list[str] | None = None
+    selected_ds_revisions: dict[str, int] | None = None
+    datasource_selection_provenance: dict[str, Any] | None = None
     grant_fragment = config_override
     if datasource_ids is not None:
         if thread_row is None:
             raise HTTPException(status_code=404, detail="Thread not found")
         requested_ids = [str(v) for v in datasource_ids]
+        target_project_ids = await _thread_project_ids(thread_id)
         if thread_row.get("user_id"):
             owner = await postgres_db.get_user(str(thread_row["user_id"]))
             if owner is None:
@@ -22535,19 +23287,56 @@ async def _apply_thread_config_update(
                     status_code=403,
                     detail="One or more selected connectors are unavailable",
                 )
-            selected_ds_ids = await _authorize_thread_datasource_ids(
+            (
+                selected_ds_ids,
+                selected_ds_revisions,
+            ) = await _authorize_thread_datasource_selection(
                 owner,
                 requested_ids,
                 workspace_backend=_thread_workspace_backend(thread_row),
+                target_project_ids=target_project_ids,
+                effective_work_owner_id=str(thread_row["user_id"]),
             )
         else:
-            # Ownerless/system threads keep their trusted-internal bypass
-            # (normalize only), mirroring job create + attach revalidation.
-            selected_ds_ids = list(dict.fromkeys(requested_ids))
+            # Ownerless/system threads have no ambient authority. A live edit
+            # may narrow or preserve the already-materialized set, but cannot
+            # use the trusted-inheritance seam to add an arbitrary UUID.
+            metadata = thread_row.get("metadata") or {}
+            if isinstance(metadata, str):
+                try:
+                    metadata = json.loads(metadata)
+                except (json.JSONDecodeError, TypeError):
+                    metadata = {}
+            persisted_ids = (
+                metadata.get("datasource_ids") if isinstance(metadata, dict) else []
+            ) or []
+            try:
+                requested_set = {str(UUID(str(value))) for value in requested_ids}
+                persisted_set = {str(UUID(str(value))) for value in persisted_ids}
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(
+                    status_code=403,
+                    detail="One or more selected connectors are unavailable",
+                ) from exc
+            if not requested_set.issubset(persisted_set):
+                raise HTTPException(
+                    status_code=403,
+                    detail="One or more selected connectors are unavailable",
+                )
+            (
+                selected_ds_ids,
+                selected_ds_revisions,
+            ) = await _authorize_thread_datasource_selection(
+                None,
+                requested_ids,
+                workspace_backend=_thread_workspace_backend(thread_row),
+                target_project_ids=target_project_ids,
+                trusted_system_inheritance=True,
+            )
 
         resolved_ds = await postgres_db.resolve_datasources_for_thread(
             datasource_ids=selected_ds_ids,
-            project_ids=await _thread_project_ids(thread_id),
+            project_ids=target_project_ids,
         )
         flip = _build_datasource_tool_override(resolved_ds, None)
         # THE FLIP WINS, and the order is load-bearing. It used to be the other
@@ -22566,6 +23355,19 @@ async def _apply_thread_config_update(
                 **flip.get("tools", {}),
             },
         }
+        datasource_selection_provenance = await _datasource_selection_provenance(
+            datasource_ids=selected_ds_ids,
+            policy_revisions=selected_ds_revisions,
+            origin="explicit",
+            effective_work_owner_id=(
+                str(thread_row["user_id"]) if thread_row.get("user_id") else None
+            ),
+            actor=actor,
+            project_ids=target_project_ids,
+            creation_path=(
+                "live_thread_internal" if actor is None else "live_thread_rest"
+            ),
+        )
 
     # Layer 2 (fail loud): a runtime config change must also fit the owner's
     # grants — reject a denied permission_mode/model with 422 instead of
@@ -22641,7 +23443,22 @@ async def _apply_thread_config_update(
     # directly to its live session config, and every attach path re-derives
     # them from metadata.datasource_ids.
     if selected_ds_ids is not None:
-        if not await postgres_db.set_thread_datasource_ids(thread_id, selected_ds_ids):
+        try:
+            updated = await postgres_db.set_thread_datasource_ids(
+                thread_id,
+                selected_ds_ids,
+                datasource_policy_revisions=selected_ds_revisions,
+                datasource_selection_provenance=datasource_selection_provenance,
+            )
+        except DatasourcePolicyConflictError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Connector policy changed while updating the session; "
+                    "retry the request"
+                ),
+            ) from exc
+        if not updated:
             raise HTTPException(status_code=404, detail="Thread not found")
 
     # Config-change audit (live_session_settings.md Slice C): key paths only,
@@ -23273,6 +24090,13 @@ class ThreadCreateRequest(BaseModel):
     datasource_ids: list[str] | None = Field(
         None, description="Explicit connector IDs to attach to this thread"
     )
+    use_datasource_defaults: bool = Field(
+        False,
+        description=(
+            "Resolve the owner's currently available automatic connector "
+            "defaults. Mutually exclusive with datasource_ids."
+        ),
+    )
     permission_mode: str | None = Field(
         None,
         description=(
@@ -23325,6 +24149,16 @@ class ThreadCreateRequest(BaseModel):
         ),
     )
 
+    @model_validator(mode="after")
+    def reject_null_datasource_selection(self) -> "ThreadCreateRequest":
+        if "datasource_ids" in self.model_fields_set and self.datasource_ids is None:
+            raise ValueError("datasource_ids may be omitted or an array, not null")
+        if self.use_datasource_defaults and "datasource_ids" in self.model_fields_set:
+            raise ValueError(
+                "use_datasource_defaults and datasource_ids are mutually exclusive"
+            )
+        return self
+
 
 class ThreadUpdateRequest(BaseModel):
     """Request body for updating a persistent thread's mutable metadata."""
@@ -23332,52 +24166,77 @@ class ThreadUpdateRequest(BaseModel):
     title: str | None = Field(None, description="New session title")
 
 
-async def _authorize_thread_datasource_ids(
-    user: dict[str, Any],
+async def _authorize_thread_datasource_selection(
+    user: dict[str, Any] | None,
     datasource_ids: list[str] | None,
     *,
     workspace_backend: str | None,
-) -> list[str]:
-    """Resolve and authorize an explicit persistent-session selection."""
-    selected: list[str] = []
-    seen: set[str] = set()
-    for raw_datasource_id in datasource_ids or []:
-        datasource = await postgres_db.get_datasource(raw_datasource_id)
-        if datasource is None:
-            raise HTTPException(
-                status_code=403,
-                detail="One or more selected connectors are unavailable",
-            )
-        allowed = bool(datasource.get("is_global")) or (
-            await user_can_access_datasource(user, postgres_db, datasource)
+    target_project_ids: list[str] | None = None,
+    effective_work_owner_id: str | None = None,
+    trusted_system_inheritance: bool = False,
+    legacy_job_id: str | None = None,
+) -> tuple[list[str], dict[str, int]]:
+    """Resolve one complete selection and its exact policy snapshot."""
+    from services.datasource_policy import (
+        DatasourceUnavailableError,
+        DatasourceWorkspaceTierError,
+        authorize_datasource_selection,
+    )
+
+    owner_id = effective_work_owner_id
+    if owner_id is None and user is not None:
+        owner_id = str(user.get("id")) if user.get("id") else None
+    try:
+        return await authorize_datasource_selection(
+            postgres_db,
+            user,
+            owner_id,
+            datasource_ids,
+            target_project_ids,
+            workspace_backend,
+            allow_admin_explicit_override=True,
+            trusted_system_inheritance=trusted_system_inheritance,
+            legacy_job_id=legacy_job_id,
         )
-        if not allowed:
-            raise HTTPException(
-                status_code=403,
-                detail="One or more selected connectors are unavailable",
-            )
-        if (
-            workspace_backend in LITE_BACKENDS
-            and str(datasource.get("type") or "").lower() == "repository"
-        ):
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    "Lite session backends cannot attach clone-based repository "
-                    "connectors; OKF Knowledge Base connectors remain available"
-                ),
-            )
-        normalized_id = str(datasource["id"])
-        if normalized_id not in seen:
-            selected.append(normalized_id)
-            seen.add(normalized_id)
+    except DatasourceUnavailableError as exc:
+        raise HTTPException(
+            status_code=403,
+            detail="One or more selected connectors are unavailable",
+        ) from exc
+    except DatasourceWorkspaceTierError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+async def _authorize_thread_datasource_ids(
+    user: dict[str, Any] | None,
+    datasource_ids: list[str] | None,
+    *,
+    workspace_backend: str | None,
+    target_project_ids: list[str] | None = None,
+    effective_work_owner_id: str | None = None,
+    trusted_system_inheritance: bool = False,
+    legacy_job_id: str | None = None,
+) -> list[str]:
+    """Compatibility wrapper for revalidation/live-update ID consumers."""
+    selected, _revisions = await _authorize_thread_datasource_selection(
+        user,
+        datasource_ids,
+        workspace_backend=workspace_backend,
+        target_project_ids=target_project_ids,
+        effective_work_owner_id=effective_work_owner_id,
+        trusted_system_inheritance=trusted_system_inheritance,
+        legacy_job_id=legacy_job_id,
+    )
     return selected
 
 
-async def _revalidate_thread_datasource_ids(
-    thread: dict[str, Any], datasource_ids: list[str] | None
-) -> list[str]:
-    """Re-check a persisted thread selection against its current owner access.
+async def _revalidate_thread_datasource_selection(
+    thread: dict[str, Any],
+    datasource_ids: list[str] | None,
+    *,
+    target_project_ids: list[str] | None = None,
+) -> tuple[list[str], dict[str, int]]:
+    """Re-check a persisted selection and return its current policy snapshot.
 
     Persistent metadata records which datasources were selected, not a durable
     authorization grant. A datasource link or project membership can be revoked
@@ -23393,11 +24252,23 @@ async def _revalidate_thread_datasource_ids(
     """
     selected = list(dict.fromkeys(str(value) for value in datasource_ids or []))
     if not selected:
-        return []
+        return [], {}
+
+    project_ids = (
+        list(target_project_ids)
+        if target_project_ids is not None
+        else await _thread_project_ids(str(thread["id"]))
+    )
 
     owner_id = thread.get("user_id")
     if not owner_id:
-        return selected
+        return await _authorize_thread_datasource_selection(
+            None,
+            selected,
+            workspace_backend=None,
+            target_project_ids=project_ids,
+            trusted_system_inheritance=True,
+        )
 
     owner = await postgres_db.get_user(str(owner_id))
     if owner is None:
@@ -23409,9 +24280,42 @@ async def _revalidate_thread_datasource_ids(
     # workspace_backend=None intentionally skips the create-time lite/repository
     # compatibility rule. Revalidation is only an access check and must not
     # retroactively change existing non-KB datasource behavior.
-    return await _authorize_thread_datasource_ids(
-        owner, selected, workspace_backend=None
+    return await _authorize_thread_datasource_selection(
+        owner,
+        selected,
+        workspace_backend=None,
+        target_project_ids=project_ids,
+        effective_work_owner_id=str(owner_id),
     )
+
+
+async def _revalidate_thread_datasource_ids(
+    thread: dict[str, Any], datasource_ids: list[str] | None
+) -> list[str]:
+    """Compatibility wrapper for delivery paths that need IDs only."""
+    selected, _revisions = await _revalidate_thread_datasource_selection(
+        thread, datasource_ids
+    )
+    return selected
+
+
+async def _resolve_authorized_thread_datasources(
+    thread: dict[str, Any],
+    datasource_ids: list[str] | None,
+    *,
+    target_project_ids: list[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Authorize and exactly resolve a thread connector snapshot."""
+    selected, policy_revisions = await _revalidate_thread_datasource_selection(
+        thread,
+        datasource_ids,
+        target_project_ids=target_project_ids,
+    )
+    resolved = await postgres_db.resolve_datasources_for_thread(
+        datasource_ids=selected,
+        project_ids=target_project_ids,
+    )
+    return _require_exact_datasource_resolution(selected, policy_revisions, resolved)
 
 
 async def _revalidate_thread_project_ids(
@@ -23462,6 +24366,34 @@ async def _authorize_thread_project_ids(
     return selected
 
 
+def _thread_creation_project_ids(
+    request_body: ThreadCreateRequest, user: dict[str, Any]
+) -> list[str]:
+    """Resolve requested thread projects under an MCP token's scope.
+
+    A ``project:<uuid>`` MCP token is an authoritative target binding, not
+    merely another membership grant. Omission therefore means that project,
+    while an attempt to name a different or additional project fails before
+    project or datasource policy resolution can widen the request.
+    """
+    requested = list(request_body.project_ids or [])
+    if request_body.project_id and str(request_body.project_id) not in requested:
+        requested.append(str(request_body.project_id))
+    requested = list(dict.fromkeys(str(value) for value in requested))
+
+    scoped_project = mcp_scope_project_id(user)
+    if scoped_project is None:
+        return requested
+
+    scoped_project_id = str(scoped_project)
+    if requested and requested != [scoped_project_id]:
+        raise HTTPException(
+            status_code=403,
+            detail="Access denied by MCP token scope",
+        )
+    return [scoped_project_id]
+
+
 async def _thread_has_knowledge_scope(
     *,
     project_ids: list[str] | None,
@@ -23494,12 +24426,7 @@ async def create_thread(
 
         # Project scope is needed for both selection precedence and grant
         # resolution, so authorize it before choosing the expert.
-        requested_project_ids = list(request_body.project_ids or [])
-        if (
-            request_body.project_id
-            and str(request_body.project_id) not in requested_project_ids
-        ):
-            requested_project_ids.append(str(request_body.project_id))
+        requested_project_ids = _thread_creation_project_ids(request_body, user)
         effective_project_ids = await _authorize_thread_project_ids(
             user, requested_project_ids
         )
@@ -23665,15 +24592,57 @@ async def create_thread(
         if effective_backend:
             config_override.setdefault("workspace", {})["backend"] = effective_backend
 
-        # Datasource attachment is an authorization boundary, not merely a UI
-        # picker. Resolve every requested id before persisting the thread so a
-        # caller cannot attach a private datasource by guessing/leaking its UUID.
-        # Use one generic denial for missing and inaccessible ids to avoid
-        # turning this endpoint into a datasource-enumeration oracle.
-        selected_thread_datasource_ids = await _authorize_thread_datasource_ids(
-            user,
-            request_body.datasource_ids,
-            workspace_backend=_backend_from_override(config_override),
+        # Materialize one complete selection with the thread row. Cockpit sends
+        # a reviewed array (including []); omission is temporarily gated for
+        # older API clients that encoded an opt-out by leaving the field out.
+        thread_backend = _backend_from_override(config_override)
+        if "datasource_ids" in request_body.model_fields_set:
+            thread_selection_origin = "explicit"
+            (
+                selected_thread_datasource_ids,
+                selected_thread_datasource_revisions,
+            ) = await _authorize_thread_datasource_selection(
+                user,
+                request_body.datasource_ids or [],
+                workspace_backend=thread_backend,
+                target_project_ids=effective_project_ids,
+                effective_work_owner_id=str(user["id"]),
+            )
+        elif request_body.use_datasource_defaults or _datasource_defaults_on_omission():
+            from services.datasource_policy import (
+                DatasourceUnavailableError,
+                default_datasource_selection,
+            )
+
+            thread_selection_origin = "default"
+            try:
+                (
+                    selected_thread_datasource_ids,
+                    selected_thread_datasource_revisions,
+                ) = await default_datasource_selection(
+                    postgres_db,
+                    str(user["id"]),
+                    effective_project_ids,
+                    thread_backend,
+                )
+            except DatasourceUnavailableError as exc:
+                raise HTTPException(
+                    status_code=403,
+                    detail="One or more selected connectors are unavailable",
+                ) from exc
+        else:
+            thread_selection_origin = "omitted_compat"
+            selected_thread_datasource_ids = []
+            selected_thread_datasource_revisions = {}
+
+        thread_selection_provenance = await _datasource_selection_provenance(
+            datasource_ids=selected_thread_datasource_ids,
+            policy_revisions=selected_thread_datasource_revisions,
+            origin=thread_selection_origin,
+            effective_work_owner_id=str(user["id"]),
+            actor=user,
+            project_ids=effective_project_ids,
+            creation_path="persistent_thread_rest",
         )
         # VM tier is operator-gated on top of the ``vm_workspace`` PDP grant that
         # _enforce_session_create_grants runs below: the global ``vm_workspaces``
@@ -23714,6 +24683,11 @@ async def create_thread(
             config_name=config_name,
             permission_mode=effective_permission_mode,
             title=request_body.title,
+            datasource_ids=selected_thread_datasource_ids,
+            datasource_selection_provenance=thread_selection_provenance,
+            datasource_policy_revisions=selected_thread_datasource_revisions,
+            authority_user_id=str(user["id"]),
+            authority_project_ids=effective_project_ids,
         )
 
         # Store config_override + datasource_ids in thread metadata. Project
@@ -23733,8 +24707,6 @@ async def create_thread(
             metadata_patch["expert_selection_source"] = (
                 selection.source if selection else "explicit"
             )
-        if selected_thread_datasource_ids:
-            metadata_patch["datasource_ids"] = selected_thread_datasource_ids
         if request_body.protected_cloud:
             metadata_patch["protected_cloud"] = True
         if metadata_patch:
@@ -24059,25 +25031,21 @@ async def create_thread(
                 tid: str,
                 co: dict,
                 pids: list,
-                ds_ids: list[str] | None,
+                _ds_ids: list[str] | None,
                 cfg_name: str | None = None,
             ) -> None:
-                # Resolve datasources for the thread (explicit + project + global)
-                resolved_ds = await postgres_db.resolve_datasources_for_thread(
-                    datasource_ids=ds_ids, project_ids=pids
-                )
-                ds_payload = _build_datasources_payload(resolved_ds)
-                if resolved_ds:
-                    co = _build_datasource_tool_override(resolved_ds, co)
-
                 idle_agent = await _find_idle_persistent_agent()
                 if idle_agent:
+                    # _send_session_attach re-fetches the committed thread,
+                    # reauthorizes its current selection, and resolves secrets.
+                    # Do not pre-resolve a payload that can go stale while this
+                    # background task waits for a pool agent.
                     await _send_session_attach(
                         idle_agent,
                         tid,
                         co,
                         pids,
-                        datasources=ds_payload,
+                        datasources=None,
                         config_name=cfg_name,
                     )
                 else:
@@ -24106,6 +25074,16 @@ async def create_thread(
             )
 
         return {"thread_id": thread_id, "status": "created"}
+    except DatasourceMaterializationAuthorizationError as exc:
+        raise HTTPException(
+            status_code=403,
+            detail="Work owner is no longer authorized",
+        ) from exc
+    except DatasourcePolicyConflictError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail="Connector policy changed while creating work; retry the request",
+        ) from exc
     except HTTPException:
         raise
     except Exception as e:
@@ -25872,10 +26850,9 @@ async def resume_thread(
                         if isinstance(md, dict)
                         else {}
                     )
+                    pids = await _thread_project_ids(tid)
                     include_kb_profile = await _thread_has_knowledge_scope(
-                        project_ids=(
-                            [str(cur["project_id"])] if cur.get("project_id") else None
-                        ),
+                        project_ids=pids,
                         datasource_ids=(
                             md.get("datasource_ids") if isinstance(md, dict) else None
                         ),
@@ -25888,32 +26865,17 @@ async def resume_thread(
                         else None,
                         include_kb_profile=include_kb_profile,
                     )
-                    # Pass the thread's explicit datasource selection (persisted
-                    # in metadata) — without it, explicit-only resolution returns
-                    # nothing on idle-pool resume (this path previously dropped
-                    # it). Read from the freshly-locked row (cur). NOTE: project_ids
-                    # here is the legacy thread field; deriving it from
-                    # thread_mounts is a separate latent fix.
-                    meta = cur.get("metadata") or {}
-                    if isinstance(meta, str):
-                        try:
-                            meta = json.loads(meta)
-                        except (json.JSONDecodeError, TypeError):
-                            meta = {}
-                    pids = thread.get("project_ids") or []
-                    resolved_ds = await postgres_db.resolve_datasources_for_thread(
-                        datasource_ids=meta.get("datasource_ids"),
-                        project_ids=pids,
-                    )
-                    ds_payload = _build_datasources_payload(resolved_ds)
-                    if resolved_ds:
-                        co = _build_datasource_tool_override(resolved_ds, co)
+                    # The attach boundary owns the authoritative datasource
+                    # re-read. Passing a pre-resolved payload here recreated
+                    # credentials from a stale A selection after an A -> B/[]
+                    # live edit. Canonical project IDs come from thread_mounts,
+                    # never the obsolete thread.project_ids field.
                     ok = await _send_session_attach(
                         idle_agent,
                         tid,
                         co,
                         pids,
-                        datasources=ds_payload,
+                        datasources=None,
                         config_name=cfg,
                     )
                     if ok:
@@ -33568,7 +34530,11 @@ async def my_capabilities(request: Request) -> dict:
     user = await require_approved_user(request, postgres_db)
     from src.core.capability_grants import CATALOG
 
-    features = {"protected_cloud": _is_protected_cloud_mode_enabled()}
+    features = {
+        "protected_cloud": _is_protected_cloud_mode_enabled(),
+        "datasource_scope_auto_attach_v1": (_datasource_scope_auto_attach_v1_enabled()),
+        "datasource_defaults_on_omission": _datasource_defaults_on_omission(),
+    }
     if user.get("is_admin"):
         return {
             "is_admin": True,
@@ -33653,17 +34619,15 @@ async def create_user(body: UserCreate, request: Request) -> dict[str, Any]:
                 home = await backend.get_user_home(UserId(body.email))
                 webdav_url = home.webdav_url if home else None
                 if webdav_url:
-                    ds = await postgres_db.create_datasource(
+                    await postgres_db.create_datasource(
                         name="Cloud Storage (Personal)",
                         ds_type="webdav",
                         connection_url=webdav_url,
                         description="Personal cloud storage",
                         credentials=backend.webdav_credentials,
-                    )
-                    await postgres_db.link_datasource_to_project(
-                        project_id=str(project["id"]),
-                        datasource_id=str(ds["id"]),
-                        read_only=False,
+                        scope_mode="projects",
+                        auto_attach=False,
+                        project_ids=[str(project["id"])],
                     )
             except Exception as e:
                 logger.warning(
@@ -34083,15 +35047,9 @@ async def _provision_project_knowledge_repo(
         config={"root_path": "knowledge", NATIVE_PROJECT_CONFIG_KEY: project_id},
         created_by=owner_id,
         read_only=True,
-    )
-    # read_only=True mirrors what POST /api/projects/{id}/datasources forces
-    # for every kb link. It scopes the *connector*, not the knowledge base:
-    # the project's own KB stays writable through its native binding, which is
-    # where kb_write has always targeted it.
-    await postgres_db.link_datasource_to_project(
-        project_id,
-        str(datasource["id"]),
-        read_only=True,
+        scope_mode="projects",
+        auto_attach=True,
+        project_ids=[project_id],
     )
     logger.info(
         "Provisioned knowledge repo '%s' + KB connector %s for project %s",
@@ -34648,6 +35606,31 @@ async def remove_project_repository(
 # -- Project Datasources (N:M) -----------------------------------------------
 
 
+@app.get("/api/projects/{project_id}/linkable-datasources")
+async def list_project_linkable_datasources(
+    request: Request,
+    project_id: str,
+    q: str | None = Query(default=None, max_length=200),
+    limit: int = Query(default=50, ge=1, le=100),
+    cursor: str | None = Query(default=None),
+) -> dict[str, Any]:
+    """Page connectors the caller may newly link to the target project."""
+    user, _ = await require_project_owner(request, postgres_db, project_id)
+    try:
+        result = await postgres_db.list_project_linkable_datasources(
+            str(user["id"]),
+            project_id,
+            is_admin=bool(user.get("is_admin")),
+            q=q,
+            limit=limit,
+            cursor=cursor,
+        )
+    except DatasourceCatalogCursorError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    result["items"] = redact_datasources(result.get("items") or [])
+    return result
+
+
 @app.get("/api/projects/{project_id}/datasources")
 async def list_project_datasources(
     request: Request, project_id: str
@@ -34684,9 +35667,27 @@ async def link_datasource_to_project(
         raise HTTPException(
             status_code=404, detail=f"Connector '{datasource_id}' not found"
         )
-    if not await user_can_access_datasource(user, postgres_db, ds):
+    if not (
+        ds.get("is_global") or await user_can_access_datasource(user, postgres_db, ds)
+    ):
         raise HTTPException(
             status_code=403, detail="Not authorized to link this connector"
+        )
+
+    from services.kb_datasources import native_kb_project_id
+
+    if native_kb_project_id(ds):
+        raise HTTPException(
+            status_code=409,
+            detail="The native knowledge connector cannot be linked to another project",
+        )
+    is_connector_owner = str(ds.get("created_by") or "") == str(user["id"])
+    if (ds.get("scope_mode") == "projects" or not ds.get("is_global")) and not (
+        user.get("is_admin") or is_connector_owner
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="Only the connector owner or an admin may add this project link",
         )
 
     try:
@@ -34698,16 +35699,15 @@ async def link_datasource_to_project(
             datasource_id,
             read_only=effective_read_only,
             description=body.description if body else None,
+            authority_user_id=str(user["id"]),
+            authority_is_admin=bool(user.get("is_admin")),
         )
-        # Build effective datasource dict for KB entry (apply overrides)
-        effective_ds = dict(ds)
-        if body:
-            if body.read_only is not None or ds.get("type") == "kb":
-                effective_ds["project_read_only"] = effective_read_only
-            if body.description is not None:
-                effective_ds["description"] = body.description
-        await _sync_datasource_knowledge(project_id, effective_ds)
         return {"status": "linked"}
+    except DatasourceProjectAuthorizationError as exc:
+        raise HTTPException(
+            status_code=403,
+            detail="Not authorized to add one or more project links",
+        ) from exc
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
 
@@ -34723,32 +35723,32 @@ async def update_project_datasource(
 
     Pass null to clear an override and fall back to connector defaults.
     """
-    await require_project_owner(request, postgres_db, project_id)
+    user, _ = await require_project_owner(request, postgres_db, project_id)
     ds = await postgres_db.get_datasource(datasource_id)
     if not ds:
         raise HTTPException(
             status_code=404, detail=f"Connector '{datasource_id}' not found"
         )
     effective_read_only = True if ds.get("type") == "kb" else body.read_only
-    success = await postgres_db.update_project_datasource(
-        project_id,
-        datasource_id,
-        read_only=effective_read_only,
-        description=body.description,
-    )
+    try:
+        success = await postgres_db.update_project_datasource(
+            project_id,
+            datasource_id,
+            read_only=effective_read_only,
+            description=body.description,
+            authority_user_id=str(user["id"]),
+            authority_is_admin=bool(user.get("is_admin")),
+        )
+    except DatasourceProjectAuthorizationError as exc:
+        raise HTTPException(
+            status_code=403,
+            detail="Not authorized to modify this project connector link",
+        ) from exc
     if not success:
         raise HTTPException(
             status_code=404,
             detail=f"Link between project '{project_id}' and connector '{datasource_id}' not found",
         )
-
-    # Re-sync knowledge entry with updated overrides
-    effective_ds = dict(ds)
-    if body.read_only is not None or ds.get("type") == "kb":
-        effective_ds["project_read_only"] = effective_read_only
-    if body.description is not None:
-        effective_ds["description"] = body.description
-    await _sync_datasource_knowledge(project_id, effective_ds)
 
     return {"status": "updated"}
 
@@ -34761,17 +35761,44 @@ async def unlink_datasource_from_project(
 
     Also removes the knowledge entry.
     """
-    await require_project_owner(request, postgres_db, project_id)
-    removed = await postgres_db.unlink_datasource_from_project(
-        project_id, datasource_id
-    )
+    user = await require_approved_user(request, postgres_db)
+    scope_project_id = mcp_scope_project_id(user)
+    if scope_project_id and str(scope_project_id) != str(project_id):
+        raise HTTPException(
+            status_code=403,
+            detail="Access denied by MCP token scope",
+        )
+    ds = await postgres_db.get_datasource(datasource_id)
+    if not ds:
+        raise HTTPException(status_code=404, detail="Connector not found")
+    from services.kb_datasources import native_kb_project_id
+
+    if native_kb_project_id(ds):
+        raise HTTPException(
+            status_code=409,
+            detail="The native knowledge connector link is managed by its project",
+        )
+    is_connector_owner = str(ds.get("created_by") or "") == str(user["id"])
+    if not (user.get("is_admin") or is_connector_owner):
+        await require_project_owner(request, postgres_db, project_id)
+    try:
+        removed = await postgres_db.unlink_datasource_from_project(
+            project_id,
+            datasource_id,
+            authority_user_id=str(user["id"]),
+            authority_is_admin=bool(user.get("is_admin")),
+        )
+    except DatasourceProjectAuthorizationError as exc:
+        raise HTTPException(
+            status_code=403,
+            detail="Not authorized to modify this project connector link",
+        ) from exc
     if not removed:
         raise HTTPException(
             status_code=404,
             detail=f"Link between project '{project_id}' and connector '{datasource_id}' not found",
         )
 
-    await _delete_datasource_knowledge(project_id, datasource_id)
     return {"status": "unlinked"}
 
 
@@ -35189,9 +36216,13 @@ def _build_webdav_note(name: str, desc: str, is_read_only: bool) -> str:
 
 
 async def _sync_datasource_knowledge(
-    project_id: str, datasource: dict[str, Any]
+    project_id: str,
+    datasource: dict[str, Any],
+    *,
+    strict: bool = False,
 ) -> None:
     """Create or update a connector knowledge entry in a project."""
+    failures: list[str] = []
     ds_id = str(datasource["id"]).replace("-", "")[:8]
     note_id = f"ds-{ds_id}"
     ds_name = datasource.get("name", "Unnamed")
@@ -35270,8 +36301,12 @@ async def _sync_datasource_knowledge(
                     """,
                     {"pid": project_id, "nid": note_id, "tag": tag_name},
                 )
-        except Exception as e:
-            logger.warning(f"Neo4j datasource knowledge sync failed: {e}")
+        except Exception as exc:
+            failures.append("neo4j")
+            logger.warning(
+                "Neo4j datasource knowledge sync failed error_class=%s",
+                type(exc).__name__,
+            )
 
     # Write to pgvector search index
     try:
@@ -35298,12 +36333,27 @@ async def _sync_datasource_knowledge(
                 content,
                 retrieval_messages,
             )
-    except Exception as e:
-        logger.warning(f"pgvector datasource knowledge sync failed: {e}")
+    except Exception as exc:
+        failures.append("pgvector")
+        logger.warning(
+            "pgvector datasource knowledge sync failed error_class=%s",
+            type(exc).__name__,
+        )
+
+    if strict and failures:
+        raise RuntimeError(
+            "Datasource knowledge sync failed for " + ", ".join(failures)
+        )
 
 
-async def _delete_datasource_knowledge(project_id: str, datasource_id: str) -> None:
+async def _delete_datasource_knowledge(
+    project_id: str,
+    datasource_id: str,
+    *,
+    strict: bool = False,
+) -> None:
     """Remove the knowledge entry for a datasource from a project."""
+    failures: list[str] = []
     ds_id = datasource_id.replace("-", "")[:8]
     note_id = f"ds-{ds_id}"
 
@@ -35314,8 +36364,12 @@ async def _delete_datasource_knowledge(project_id: str, datasource_id: str) -> N
                 "MATCH (n:Note {project_id: $pid, id: $nid}) DETACH DELETE n",
                 {"pid": project_id, "nid": note_id},
             )
-        except Exception as e:
-            logger.warning(f"Neo4j datasource knowledge delete failed: {e}")
+        except Exception as exc:
+            failures.append("neo4j")
+            logger.warning(
+                "Neo4j datasource knowledge delete failed error_class=%s",
+                type(exc).__name__,
+            )
 
     try:
         async with vector_db.acquire() as conn:
@@ -35324,8 +36378,17 @@ async def _delete_datasource_knowledge(project_id: str, datasource_id: str) -> N
                 project_id,
                 note_id,
             )
-    except Exception as e:
-        logger.warning(f"pgvector datasource knowledge delete failed: {e}")
+    except Exception as exc:
+        failures.append("pgvector")
+        logger.warning(
+            "pgvector datasource knowledge delete failed error_class=%s",
+            type(exc).__name__,
+        )
+
+    if strict and failures:
+        raise RuntimeError(
+            "Datasource knowledge delete failed for " + ", ".join(failures)
+        )
 
 
 @app.get("/api/projects/{project_id}/knowledge/summary")
@@ -35685,7 +36748,11 @@ async def _cancel_kb_datasource_reindexes(datasource_id: str) -> None:
         await asyncio.gather(*tasks, return_exceptions=True)
 
 
-async def _delete_kb_datasource_with_index(datasource_id: str) -> bool:
+async def _delete_kb_datasource_with_index(
+    datasource_id: str,
+    *,
+    authority_project_scope_id: str | None = None,
+) -> bool:
     """Order datasource deletion after every writer of its disposable index.
 
     The app and vector schemas live in separate databases, so this cannot be a
@@ -35703,7 +36770,10 @@ async def _delete_kb_datasource_with_index(datasource_id: str) -> bool:
     store = KnowledgeStore(db=vector_db, embedding_service=None)
     async with kb_index_lock(store, kb_id, wait=True) as lock_conn:
         await store.delete_kb_index(kb_id, conn=lock_conn)
-        return await postgres_db.delete_datasource(datasource_id)
+        return await postgres_db.delete_datasource(
+            datasource_id,
+            authority_project_scope_id=authority_project_scope_id,
+        )
 
 
 async def _reindex_project_kb(

@@ -1362,6 +1362,30 @@ export function clearDraft(threadId: string | null): void {
                   <img class="empty-mark" src="assets/icons/icon-mark.svg" alt="" />
                   <h2 class="empty-title">{{ 'chat.draft.title' | transloco }}</h2>
                   <p class="empty-subtitle">{{ 'chat.draft.subtitle' | transloco }}</p>
+                  <div class="draft-connectors" role="group" [attr.aria-label]="'chat.draft.connectorsLabel' | transloco">
+                    @if (chat.draftDefaultsLoading()) {
+                      <span class="draft-connectors-state">{{ 'chat.draft.connectorsLoading' | transloco }}</span>
+                    } @else if (chat.draftDefaultsError()) {
+                      <span class="draft-connectors-state draft-connectors-error">
+                        {{ 'chat.draft.connectorsFailed' | transloco }}
+                        <button type="button" (click)="chat.retryDraftDefaults()">
+                          {{ 'chat.draft.connectorsRetry' | transloco }}
+                        </button>
+                      </span>
+                    } @else {
+                      <label class="draft-connectors-toggle">
+                        <input
+                          type="checkbox"
+                          [checked]="chat.draftConnectorsEnabled()"
+                          (change)="chat.setDraftConnectorsEnabled($any($event.target).checked)"
+                        >
+                        <span>
+                          {{ 'chat.draft.connectorsCount'
+                            | transloco: {count: chat.draftDatasourceIds()?.length ?? 0} }}
+                        </span>
+                      </label>
+                    }
+                  </div>
                   @if (displayedSuggestions().length > 0) {
                     <div class="suggestion-grid">
                       @for (s of displayedSuggestions(); track $index) {
@@ -2602,6 +2626,11 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     // The (input)/(ngModelChange) bindings schedule CD, so a method re-reads
     // the field on every keystroke.
     canSend(): boolean {
+        if (
+            this.chat.isDraftSession() &&
+            (this.chat.draftDefaultsLoading() || this.chat.draftDefaultsError() ||
+                this.chat.draftDatasourceIds() === null)
+        ) return false;
         return canSendMessage(
             this.canCompose(),
             this.inputText,
@@ -2691,6 +2720,7 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     }
 
     send(): void {
+        if (!this.canSend()) return;
         const text = this.inputText.trim();
         if (!text && this.chat.pendingAttachments().length === 0) return;
 

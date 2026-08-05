@@ -8,6 +8,7 @@ import {ApiService} from '../../core/services/api.service';
 import {CapabilitiesService} from '../../core/services/capabilities.service';
 import {UserService} from '../../core/services/user.service';
 import {ViewportService} from '../../core/services/viewport.service';
+import {ActivatedRoute} from '@angular/router';
 import {DatasourceListComponent} from './datasource-list.component';
 
 function emailDatasource(overrides: Partial<Datasource> = {}): Datasource {
@@ -53,10 +54,16 @@ function kbDatasource(overrides: Partial<Datasource> = {}): Datasource {
   };
 }
 
-function createComponent() {
+function createComponent(policyAvailable = true, contextProjectId: string | null = null) {
   const ds = kbDatasource();
   const api = {
     getDatasources: vi.fn().mockReturnValue(of([])),
+    getDatasourceCatalog: vi.fn().mockReturnValue(of({items: [], next_cursor: null})),
+    getLinkableDatasourceProjects: vi.fn().mockReturnValue(
+      of({items: [], next_cursor: null}),
+    ),
+    getProject: vi.fn().mockReturnValue(of(null)),
+    getProjectMembers: vi.fn().mockReturnValue(of([])),
     getDatasourceIndexStatus: vi.fn().mockReturnValue(of(null)),
     createDatasource: vi.fn().mockReturnValue(of(ds)),
     updateDatasource: vi.fn().mockReturnValue(of({status: 'updated'})),
@@ -81,8 +88,20 @@ function createComponent() {
       {provide: ViewportService, useValue: {isMobile: signal(false)}},
       {provide: UserService, useValue: {currentUser}},
       {
+        provide: ActivatedRoute,
+        useValue: {
+          snapshot: {
+            queryParamMap: {get: (key: string) => key === 'project' ? contextProjectId : null},
+          },
+        },
+      },
+      {
         provide: CapabilitiesService,
-        useValue: {canPublishDatasources: () => true},
+        useValue: {
+          canPublishDatasources: () => true,
+          datasourceScopeAutoAttachAvailable: () => policyAvailable,
+          datasourceScopeAutoAttachAvailability$: of(policyAvailable),
+        },
       },
     ],
   });
@@ -113,6 +132,9 @@ describe('DatasourceListComponent OKF Knowledge Base support', () => {
       mcpEnv: [],
       is_global: false,
       read_only: true,
+      scope_mode: 'all',
+      auto_attach: false,
+      policy_revision: null,
     };
     component.gitAuthMethod = 'token';
     component.formCredentials.password = 'secret-token';
@@ -174,7 +196,7 @@ describe('DatasourceListComponent OKF Knowledge Base support', () => {
       last_success_at: '2026-07-11T12:00:00Z',
       last_error: null,
     };
-    api.getDatasources.mockReturnValue(of([ds]));
+    api.getDatasourceCatalog.mockReturnValue(of({items: [ds], next_cursor: null}));
     api.getDatasourceIndexStatus.mockReturnValue(of(status));
 
     component.refresh();
@@ -204,6 +226,7 @@ describe('DatasourceListComponent email support', () => {
   it('creates a draft-tier mailbox with imap credentials and email config, no smtp', () => {
     const {api, component} = createComponent();
     component.openCreateForm();
+    component.onScopeModeChange('all');
     component.formData.name = 'Personal Mailbox';
     component.onTypeSelect('email');
     component.formCredentials = {username: 'user@example.com', password: 'app-pass'};
@@ -265,6 +288,7 @@ describe('DatasourceListComponent email support', () => {
   it('requires username, app password, and imap host to create', () => {
     const {component} = createComponent();
     component.openCreateForm();
+    component.onScopeModeChange('all');
     component.formData.name = 'Mailbox';
     component.onTypeSelect('email');
     expect(component.canSave()).toBe(false);
@@ -562,6 +586,7 @@ describe('DatasourceListComponent repository forge selection', () => {
   it('lets an explicit forge selection override a self-hosted host', () => {
     const {api, component} = createComponent();
     component.openCreateForm();
+    component.onScopeModeChange('all');
     component.formData.name = 'Widget';
     component.formData.type = 'repository';
     component.onConnectionUrlChange('https://git.example.com/acme/widget');
@@ -579,6 +604,7 @@ describe('DatasourceListComponent repository forge selection', () => {
   it('keeps an explicit forge choice through further URL edits', () => {
     const {component} = createComponent();
     component.openCreateForm();
+    component.onScopeModeChange('all');
     component.formData.name = 'Widget';
     component.formData.type = 'repository';
     component.onForgeSelect('gitea');
@@ -621,6 +647,344 @@ describe('DatasourceListComponent repository forge selection', () => {
     expect(api.updateDatasource).toHaveBeenCalledWith(
       ds.id,
       expect.objectContaining({config: {forge: 'github'}}),
+    );
+  });
+});
+
+describe('DatasourceListComponent availability policy', () => {
+  it('passes the selected project through the server-side catalog filter', () => {
+    const {api, component} = createComponent();
+
+    component.onCatalogProjectFilter('project-a');
+
+    expect(api.getDatasourceCatalog).toHaveBeenCalledWith(
+      expect.objectContaining({project_id: 'project-a'}),
+    );
+  });
+
+  it('searches and paginates authorized catalog project choices', () => {
+    const {api, component} = createComponent();
+    const first = {
+      id: 'project-a', name: 'Application', user_role: 'owner',
+      addable: true, retained_only: false, linked: false,
+    } as const;
+    const second = {...first, id: 'project-b', name: 'Backend'};
+    api.getLinkableDatasourceProjects
+      .mockReturnValueOnce(of({items: [first], next_cursor: 'next'}))
+      .mockReturnValueOnce(of({items: [second], next_cursor: null}));
+    component.catalogProjectSearch.set('app');
+
+    component.loadCatalogProjects(true);
+    component.loadMoreCatalogProjects();
+
+    expect(api.getLinkableDatasourceProjects).toHaveBeenNthCalledWith(1, {
+      q: 'app', cursor: undefined, limit: 50,
+    });
+    expect(api.getLinkableDatasourceProjects).toHaveBeenNthCalledWith(2, {
+      q: 'app', cursor: 'next', limit: 50,
+    });
+    expect(component.catalogProjects().map(project => project.id))
+      .toEqual(['project-a', 'project-b']);
+  });
+
+  it('preselects an authorized route project outside the first target page', () => {
+    const {api, component} = createComponent(true, 'project-99');
+    api.getLinkableDatasourceProjects.mockReturnValue(of({items: [], next_cursor: 'next'}));
+    api.getProject.mockReturnValue(of({
+      id: 'project-99', name: 'Distant Project', status: 'active', is_default: false,
+      created_at: '', updated_at: '',
+    }));
+    api.getProjectMembers.mockReturnValue(of([{
+      project_id: 'project-99', user_id: 'user-1', role: 'owner', joined_at: '',
+    }]));
+
+    component.openCreateForm();
+
+    expect(component.formData.scope_mode).toBe('projects');
+    expect(component.formProjectIds()).toEqual(new Set(['project-99']));
+    expect(component.scopeTargets().map(project => project.id)).toContain('project-99');
+  });
+
+  it('uses legacy connector listing while the policy capability is unavailable', () => {
+    const {api, component, ds} = createComponent(false);
+    api.getDatasources.mockReturnValue(of([ds]));
+
+    component.refresh();
+
+    expect(api.getDatasources).toHaveBeenCalledWith(undefined, undefined);
+    expect(api.getDatasourceCatalog).not.toHaveBeenCalled();
+    expect(component.datasources()).toEqual([ds]);
+  });
+
+  it('keeps legacy create available without loading or writing policy fields', () => {
+    const {api, component} = createComponent(false);
+    component.openCreateForm();
+    component.formData.name = 'CLI docs';
+    component.formData.type = 'generic';
+    component.formData.description = 'CLI docs';
+
+    expect(api.getLinkableDatasourceProjects).not.toHaveBeenCalled();
+    expect(component.canSave()).toBe(true);
+    component.saveForm();
+
+    const payload = api.createDatasource.mock.calls[0][0];
+    expect(payload).not.toHaveProperty('scope_mode');
+    expect(payload).not.toHaveProperty('project_ids');
+    expect(payload).not.toHaveProperty('auto_attach');
+  });
+
+  it('does not write an existing policy through the legacy edit form', () => {
+    const {api, component, ds} = createComponent(false);
+    component.openEditForm({
+      ...ds,
+      scope_mode: 'projects',
+      project_ids: ['project-a'],
+      auto_attach: true,
+      policy_revision: 9,
+    });
+
+    expect(api.getLinkableDatasourceProjects).not.toHaveBeenCalled();
+    component.doSave();
+
+    const payload = api.updateDatasource.mock.calls[0][1];
+    expect(payload).not.toHaveProperty('scope_mode');
+    expect(payload).not.toHaveProperty('project_ids');
+    expect(payload).not.toHaveProperty('auto_attach');
+    expect(payload).not.toHaveProperty('policy_revision');
+  });
+
+  it('preserves an unchanged redacted connection URL and sends a deliberate replacement', () => {
+    const {api, component, ds} = createComponent();
+    api.updateDatasource.mockReturnValue(of(null));
+    const redacted = {
+      ...ds,
+      type: 'postgresql' as const,
+      connection_url: null,
+      connection_url_redacted: true,
+    };
+    component.openEditForm(redacted);
+
+    expect(component.canSave()).toBe(true);
+    component.doSave();
+    expect(api.updateDatasource.mock.calls[0][1]).not.toHaveProperty('connection_url');
+
+    component.onConnectionUrlChange('postgresql://replacement.example/app');
+    component.doSave();
+    expect(api.updateDatasource.mock.calls[1][1].connection_url)
+      .toBe('postgresql://replacement.example/app');
+  });
+
+  it('requires a deliberate scope choice and at least one project in projects mode', () => {
+    const {component} = createComponent();
+    component.openCreateForm();
+    component.formData.name = 'CLI docs';
+    component.formData.type = 'generic';
+    component.formData.description = 'CLI docs';
+
+    expect(component.canSave()).toBe(false);
+    component.onScopeModeChange('projects');
+    expect(component.canSave()).toBe(false);
+    component.formProjectIds.set(new Set(['project-1']));
+    expect(component.canSave()).toBe(true);
+  });
+
+  it('creates a project-scoped automatic connector with an explicit full project set', () => {
+    const {api, component} = createComponent();
+    component.openCreateForm();
+    component.formData.name = 'Application DB';
+    component.formData.type = 'postgresql';
+    component.formData.connection_url = 'postgresql://db/app';
+    component.onScopeModeChange('projects');
+    component.formData.auto_attach = true;
+    component.formProjectIds.set(new Set(['project-a', 'project-b']));
+
+    component.doSave();
+
+    expect(api.createDatasource).toHaveBeenCalledWith(expect.objectContaining({
+      scope_mode: 'projects',
+      project_ids: ['project-a', 'project-b'],
+      auto_attach: true,
+    }));
+  });
+
+  it('sends the loaded policy revision and preserves links when switching to all mode', () => {
+    const {api, component, ds} = createComponent();
+    component.openEditForm({
+      ...ds,
+      scope_mode: 'projects',
+      auto_attach: true,
+      policy_revision: 7,
+      project_ids: ['project-a'],
+    });
+    component.onScopeModeChange('all');
+
+    component.doSave();
+
+    expect(api.updateDatasource).toHaveBeenCalledWith(
+      ds.id,
+      expect.objectContaining({
+        scope_mode: 'all',
+        auto_attach: true,
+        policy_revision: 7,
+        project_ids: undefined,
+      }),
+    );
+  });
+
+  it('distinguishes visibility from availability labels', () => {
+    const {component, ds} = createComponent();
+    expect(component.scopeLabelKey({...ds, is_global: true})).toBe(
+      'datasources.table.scopeGlobal',
+    );
+    expect(component.availabilityLabel({...ds, scope_mode: 'projects', project_count: 2}))
+      .toBe('datasources.table.availabilityProjects');
+    expect(component.availabilityLabel({...ds, scope_mode: 'projects', project_count: 0}))
+      .toBe('datasources.table.availabilityNone');
+  });
+
+  it('does not expose a partial project count for a shared connector', () => {
+    const {component, currentUser, ds} = createComponent();
+    currentUser.set({id: 'other-user', is_admin: false});
+
+    expect(component.availabilityLabel({
+      ...ds,
+      scope_mode: 'projects',
+      project_ids: ['visible-project'],
+    })).toBe('datasources.table.availabilityScoped');
+  });
+
+  it('keeps selected projects removable when search or paging hides their row', () => {
+    const {component} = createComponent();
+    component.openCreateForm();
+    component.scopeTargets.set([{
+      id: 'project-a',
+      name: 'Application',
+      user_role: 'owner',
+      addable: true,
+      retained_only: false,
+      linked: false,
+    }]);
+    component.formProjectIds.set(new Set(['project-a', 'project-off-page']));
+
+    expect(component.selectedScopeTargets().map(project => project.name)).toEqual([
+      'Application',
+      'project-off-page',
+    ]);
+    component.toggleScopeProject(component.selectedScopeTargets()[1]);
+    expect(component.formProjectIds()).toEqual(new Set(['project-a']));
+  });
+
+  it('merges unpaginated retained links into the project picker', () => {
+    const {api, component, ds} = createComponent();
+    api.getLinkableDatasourceProjects.mockReturnValue(of({
+      items: [{
+        id: 'project-a',
+        name: 'Application',
+        user_role: 'owner',
+        addable: true,
+        retained_only: false,
+        linked: false,
+      }],
+      selected_items: [{
+        id: 'project-retained',
+        name: 'Former team',
+        user_role: null,
+        addable: false,
+        retained_only: true,
+        linked: true,
+      }],
+      next_cursor: null,
+    }));
+
+    component.openEditForm({
+      ...ds,
+      scope_mode: 'projects',
+      project_ids: [],
+      policy_revision: 3,
+    });
+
+    expect(component.formProjectIds()).toEqual(new Set(['project-retained']));
+    expect(component.scopeTargets().map(project => project.name)).toEqual([
+      'Former team',
+      'Application',
+    ]);
+  });
+
+  it('does not restore a deliberately removed final link on a search refresh', () => {
+    const {api, component, ds} = createComponent();
+    const retained = {
+      id: 'project-retained',
+      name: 'Former team',
+      user_role: null,
+      addable: false,
+      retained_only: true,
+      linked: true,
+    } as const;
+    api.getLinkableDatasourceProjects.mockReturnValue(of({
+      items: [],
+      selected_items: [retained],
+      next_cursor: null,
+    }));
+    const confirmSpy = vi.spyOn(globalThis, 'confirm').mockReturnValue(true);
+    component.openEditForm({
+      ...ds,
+      scope_mode: 'projects',
+      project_ids: [retained.id],
+      policy_revision: 3,
+    });
+
+    component.toggleScopeProject(retained);
+    component.loadScopeTargets(true);
+
+    expect(component.formProjectIds()).toEqual(new Set());
+    confirmSpy.mockRestore();
+  });
+
+  it('renders native project knowledge policy as managed and omits policy writes', () => {
+    const {api, component, ds} = createComponent();
+    component.openEditForm({
+      ...ds,
+      config: {root_path: 'vault', native_project_id: 'project-a'},
+      scope_mode: 'projects',
+      project_ids: ['project-a'],
+      auto_attach: true,
+      policy_revision: 4,
+    });
+
+    expect(component.isNativeProjectConnector()).toBe(true);
+    expect(component.canSave()).toBe(true);
+    expect(api.getLinkableDatasourceProjects).not.toHaveBeenCalled();
+    component.doSave();
+
+    const payload = api.updateDatasource.mock.calls[0][1];
+    expect(payload).not.toHaveProperty('scope_mode');
+    expect(payload).not.toHaveProperty('project_ids');
+    expect(payload).not.toHaveProperty('auto_attach');
+    expect(payload).not.toHaveProperty('policy_revision');
+  });
+
+  it('retains the returned policy revision after create-then-test', () => {
+    const {api, component, ds} = createComponent();
+    api.createDatasource.mockReturnValue(of({
+      ...ds,
+      scope_mode: 'all',
+      project_ids: [],
+      auto_attach: true,
+      policy_revision: 6,
+    }));
+    component.openCreateForm();
+    component.formData.name = 'CLI docs';
+    component.formData.type = 'generic';
+    component.formData.description = 'CLI docs';
+    component.onScopeModeChange('all');
+    component.formData.auto_attach = true;
+
+    component.testFromForm();
+    component.doSave();
+
+    expect(api.updateDatasource).toHaveBeenCalledWith(
+      ds.id,
+      expect.objectContaining({policy_revision: 6, auto_attach: true}),
     );
   });
 });

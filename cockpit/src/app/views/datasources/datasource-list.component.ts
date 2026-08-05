@@ -1,18 +1,21 @@
 import {Component, computed, DestroyRef, inject, OnInit, signal} from '@angular/core';
 import {takeUntilDestroyed} from '@angular/core/rxjs-interop';
-import {timer} from 'rxjs';
+import {forkJoin, timer} from 'rxjs';
 import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
 import {ApiService} from '../../core/services/api.service';
 import {
     CredentialFileEntry,
     Datasource,
+    DatasourceCatalogFilters,
     DatasourceConfig,
     DatasourceCreateRequest,
     DatasourceIndexStatus,
     DatasourceTestResult,
     DatasourceType,
     DatasourceUpdateRequest,
+    DatasourceScopeMode,
     EmailAccessTier,
+    LinkableDatasourceProject,
     RepositoryForge,
 } from '../../core/models/api.model';
 import {AppButtonComponent} from '../../ui/button';
@@ -31,6 +34,7 @@ import {CapabilitiesService} from '../../core/services/capabilities.service';
 import {AppMenuComponent, AppMenuItemComponent, AppMenuTriggerDirective} from '../../ui/menu';
 import {ViewportService} from '../../core/services/viewport.service';
 import {UserService} from '../../core/services/user.service';
+import {ActivatedRoute} from '@angular/router';
 
 type McpTransport = 'http' | 'sse' | 'stdio';
 type KeyValueRow = {key: string; value: string};
@@ -69,7 +73,7 @@ type KeyValueRow = {key: string; value: string};
             <app-chip
               size="sm"
               [selected]="typeFilter() === filter.value"
-              (clicked)="typeFilter.set(filter.value)"
+              (clicked)="onTypeFilter(filter.value)"
             >
               {{ filter.labelKey | transloco }}
             </app-chip>
@@ -95,6 +99,65 @@ type KeyValueRow = {key: string; value: string};
           </app-icon-button>
         </div>
       </div>
+
+      @if (capabilities.datasourceScopeAutoAttachAvailable()) {
+        <div class="catalog-filter-bar">
+          <app-input
+            size="sm"
+            [value]="catalogSearch()"
+            (valueChange)="onCatalogSearch($event)"
+            [placeholder]="'datasources.catalog.search' | transloco"
+          />
+          <div class="catalog-project-filter">
+            <app-input
+              size="sm"
+              [value]="catalogProjectSearch()"
+              (valueChange)="onCatalogProjectSearch($event)"
+              [placeholder]="'datasources.catalog.projectSearch' | transloco"
+              [disabled]="catalogProjectsLoading()"
+            />
+            <app-select
+              size="sm"
+              [value]="catalogProjectId()"
+              (changed)="onCatalogProjectFilter($event)"
+              [disabled]="catalogProjectsLoading() || catalogProjectsError()"
+            >
+              <option value="">{{ 'datasources.catalog.anyProject' | transloco }}</option>
+              @for (project of catalogProjects(); track project.id) {
+                <option [value]="project.id">{{ project.name }}</option>
+              }
+            </app-select>
+            @if (catalogProjectsLoading()) {
+              <app-spinner size="sm" />
+            } @else if (catalogProjectsNextCursor()) {
+              <app-button size="sm" variant="ghost" (clicked)="loadMoreCatalogProjects()">
+                {{ 'datasources.catalog.moreProjects' | transloco }}
+              </app-button>
+            }
+          </div>
+          <app-select size="sm" [value]="scopeFilter()" (changed)="onScopeFilter($event)">
+            <option value="all">{{ 'datasources.catalog.anyAvailability' | transloco }}</option>
+            <option value="scope-all">{{ 'datasources.catalog.everywhere' | transloco }}</option>
+            <option value="projects">{{ 'datasources.catalog.projectScoped' | transloco }}</option>
+            <option value="unavailable">{{ 'datasources.catalog.unavailable' | transloco }}</option>
+          </app-select>
+          <app-select size="sm" [value]="automaticFilter()" (changed)="onAutomaticFilter($event)">
+            <option value="all">{{ 'datasources.catalog.anyDefault' | transloco }}</option>
+            <option value="automatic">{{ 'datasources.catalog.automatic' | transloco }}</option>
+            <option value="manual">{{ 'datasources.catalog.manual' | transloco }}</option>
+          </app-select>
+          <app-select size="sm" [value]="ownershipFilter()" (changed)="onOwnershipFilter($event)">
+            <option value="all">{{ 'datasources.catalog.mineAndShared' | transloco }}</option>
+            <option value="mine">{{ 'datasources.catalog.mine' | transloco }}</option>
+            <option value="shared">{{ 'datasources.catalog.shared' | transloco }}</option>
+          </app-select>
+          <app-select size="sm" [value]="visibilityFilter()" (changed)="onVisibilityFilter($event)">
+            <option value="all">{{ 'datasources.catalog.anyVisibility' | transloco }}</option>
+            <option value="private">{{ 'datasources.catalog.private' | transloco }}</option>
+            <option value="public">{{ 'datasources.catalog.public' | transloco }}</option>
+          </app-select>
+        </div>
+      }
 
       <!-- Messages -->
       @if (successMessage()) {
@@ -215,7 +278,7 @@ type KeyValueRow = {key: string; value: string};
                   size="sm"
                   class="mono"
                   [value]="formData.connection_url"
-                  (valueChange)="formData.connection_url = $event"
+                  (valueChange)="onConnectionUrlChange($event)"
                   [placeholder]="'datasources.form.genericUrlPlaceholder' | transloco"
                   [disabled]="isSaving()"
                 />
@@ -1041,6 +1104,136 @@ type KeyValueRow = {key: string; value: string};
               </div>
             }
 
+            <!-- Policy controls are rollout-gated. Older orchestrators keep
+                 legacy connector CRUD without receiving unknown fields. -->
+            @if (capabilities.datasourceScopeAutoAttachAvailable()) {
+              <section class="availability-section" aria-labelledby="ds-availability-title">
+              <div class="availability-heading" id="ds-availability-title">
+                {{ 'datasources.form.availabilityTitle' | transloco }}
+              </div>
+              @if (isNativeProjectConnector()) {
+                <div class="native-policy">
+                  <app-icon size="sm">lock</app-icon>
+                  <span>
+                    <strong>{{ 'datasources.form.nativeProjectPolicy' | transloco }}</strong>
+                    <small>{{ 'datasources.form.nativeProjectPolicyHint' | transloco }}</small>
+                  </span>
+                </div>
+              } @else {
+                <label class="availability-option">
+                  <input
+                    type="radio"
+                    name="ds-scope-mode"
+                    [checked]="formData.scope_mode === 'all'"
+                    (change)="onScopeModeChange('all')"
+                    [disabled]="isSaving() || scopeTargetsLoading()"
+                  >
+                  <span>
+                    <strong>{{ 'datasources.form.scopeEverywhere' | transloco }}</strong>
+                    <small>{{ 'datasources.form.scopeEverywhereHint' | transloco }}</small>
+                  </span>
+                </label>
+                <label class="availability-option">
+                  <input
+                    type="radio"
+                    name="ds-scope-mode"
+                    [checked]="formData.scope_mode === 'projects'"
+                    (change)="onScopeModeChange('projects')"
+                    [disabled]="isSaving() || scopeTargetsLoading()"
+                  >
+                  <span>
+                    <strong>{{ 'datasources.form.scopeProjects' | transloco }}</strong>
+                    <small>{{ 'datasources.form.scopeProjectsHint' | transloco }}</small>
+                  </span>
+                </label>
+
+                @if (scopeTargetsLoading()) {
+                  <div class="scope-load-state"><app-spinner size="sm" /> {{ 'datasources.form.projectsLoading' | transloco }}</div>
+                } @else if (scopeTargetsError()) {
+                  <div class="scope-error" role="alert">
+                    <span>{{ 'datasources.form.projectsLoadFailed' | transloco }}</span>
+                    <app-button size="sm" variant="secondary" (clicked)="loadScopeTargets(true)">
+                      {{ 'datasources.form.retry' | transloco }}
+                    </app-button>
+                  </div>
+                } @else if (formData.scope_mode === 'projects') {
+                  <div class="project-picker">
+                    <app-input
+                      size="sm"
+                      [value]="projectSearch()"
+                      (valueChange)="onProjectSearch($event)"
+                      [placeholder]="'datasources.form.projectsSearch' | transloco"
+                      [disabled]="isSaving()"
+                    />
+                    @if (selectedScopeTargets().length > 0) {
+                      <div class="selected-project-chips">
+                        @for (project of selectedScopeTargets(); track project.id) {
+                          <app-chip
+                            size="sm"
+                            [selectable]="false"
+                            [disabled]="isSaving()"
+                            [ariaLabel]="'datasources.form.removeSelectedProject' | transloco: {name: project.name}"
+                            (clicked)="toggleScopeProject(project)"
+                          >
+                            {{ project.name }} <app-icon size="sm">close</app-icon>
+                          </app-chip>
+                        }
+                      </div>
+                    }
+                    <div class="project-options">
+                      @for (project of scopeTargets(); track project.id) {
+                        <label class="project-option" [class.retained-only]="project.retained_only">
+                          <input
+                            type="checkbox"
+                            [checked]="formProjectIds().has(project.id)"
+                            (change)="toggleScopeProject(project)"
+                            [disabled]="isSaving() || (!project.addable && !formProjectIds().has(project.id))"
+                          >
+                          <span>{{ project.name }}</span>
+                          @if (project.retained_only) {
+                            <small>{{ 'datasources.form.projectRetainedOnly' | transloco }}</small>
+                          }
+                        </label>
+                      }
+                      @if (scopeTargets().length === 0) {
+                        <span class="scope-empty">{{ 'datasources.form.projectsEmpty' | transloco }}</span>
+                      }
+                    </div>
+                    @if (scopeTargetsNextCursor()) {
+                      <app-button size="sm" variant="ghost" (clicked)="loadMoreScopeTargets()">
+                        {{ 'datasources.catalog.loadMore' | transloco }}
+                      </app-button>
+                    }
+                    <span class="scope-count">
+                      {{ 'datasources.form.projectsSelected' | transloco: {count: formProjectIds().size} }}
+                    </span>
+                  </div>
+                }
+
+                <label class="auto-attach-option">
+                  <input
+                    type="checkbox"
+                    [checked]="formData.auto_attach"
+                    (change)="formData.auto_attach = $any($event.target).checked"
+                    [disabled]="isSaving() || scopeTargetsLoading()"
+                  >
+                  <span>
+                    <strong>{{ 'datasources.form.autoAttach' | transloco }}</strong>
+                    <small>{{ 'datasources.form.autoAttachHint' | transloco }}</small>
+                  </span>
+                </label>
+                @if (formData.auto_attach && formData.scope_mode) {
+                  <div class="impact-summary">
+                    {{ (formData.scope_mode === 'all'
+                      ? 'datasources.form.autoImpactAll'
+                      : 'datasources.form.autoImpactProjects')
+                      | transloco: {count: formProjectIds().size} }}
+                  </div>
+                }
+              }
+              </section>
+            }
+
             <!-- Visibility (publish) — rendered only with the public_datasources
                  capability; the server enforces regardless. Email is never
                  publishable (the server rejects is_global for mailboxes). -->
@@ -1173,7 +1366,10 @@ type KeyValueRow = {key: string; value: string};
                 <th>{{ 'datasources.table.colType' | transloco }}</th>
                 <th>{{ 'datasources.table.colName' | transloco }}</th>
                 <th class="col-url">{{ 'datasources.table.colUrl' | transloco }}</th>
-                <th class="col-scope">{{ 'datasources.table.colScope' | transloco }}</th>
+                <th class="col-scope">{{ 'datasources.table.colVisibility' | transloco }}</th>
+                @if (capabilities.datasourceScopeAutoAttachAvailable()) {
+                  <th class="col-availability">{{ 'datasources.table.colAvailability' | transloco }}</th>
+                }
                 <th>{{ 'datasources.table.colActions' | transloco }}</th>
               </tr>
             </thead>
@@ -1247,6 +1443,16 @@ type KeyValueRow = {key: string; value: string};
                           {{ 'datasources.table.badgeRw' | transloco }}
                         </app-badge>
                       }
+                      @if (capabilities.datasourceScopeAutoAttachAvailable()) {
+                        <app-badge class="ds-scope-inline" [tone]="availabilityTone(ds)" size="xs">
+                          {{ availabilityLabel(ds) }}
+                        </app-badge>
+                        @if (isOwnedByCurrentUser(ds) && ds.auto_attach) {
+                          <app-badge class="ds-scope-inline" tone="accent" size="xs">
+                            {{ 'datasources.table.badgeAuto' | transloco }}
+                          </app-badge>
+                        }
+                      }
                     }
                   </td>
                   <td class="url-cell mono col-url">{{ ds.connection_url ? maskUrl(ds.connection_url) : '—' }}</td>
@@ -1260,6 +1466,18 @@ type KeyValueRow = {key: string; value: string};
                       </app-badge>
                     }
                   </td>
+                  @if (capabilities.datasourceScopeAutoAttachAvailable()) {
+                    <td class="col-availability">
+                      <app-badge [tone]="availabilityTone(ds)" size="xs">
+                        {{ availabilityLabel(ds) }}
+                      </app-badge>
+                      @if (isOwnedByCurrentUser(ds) && ds.auto_attach) {
+                        <app-badge tone="accent" size="xs">
+                          {{ 'datasources.table.badgeAuto' | transloco }}
+                        </app-badge>
+                      }
+                    </td>
+                  }
                   <td class="actions-cell">
                     @if (canManage(ds) && viewport.isMobile()) {
                       <!-- Mobile: collapse the row actions into a ⋯ overflow menu so the
@@ -1365,6 +1583,13 @@ type KeyValueRow = {key: string; value: string};
             </tbody>
           </table>
         </div>
+        @if (capabilities.datasourceScopeAutoAttachAvailable() && catalogNextCursor()) {
+          <div class="load-more-row">
+            <app-button variant="secondary" size="sm" [loading]="isLoadingMore()" (clicked)="loadMoreCatalog()">
+              {{ 'datasources.catalog.loadMore' | transloco }}
+            </app-button>
+          </div>
+        }
       }
     </div>
 
@@ -1489,6 +1714,25 @@ type KeyValueRow = {key: string; value: string};
         margin-left: auto;
         align-items: center;
       }
+
+      .catalog-filter-bar {
+        display: grid;
+        grid-template-columns: minmax(220px, 1fr) minmax(300px, 1.2fr) repeat(4, minmax(130px, auto));
+        gap: 8px;
+        padding: 8px 12px;
+        border-bottom: 1px solid var(--border-color, var(--surface-0));
+        background: var(--panel-header-bg);
+      }
+
+      .catalog-project-filter {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        min-width: 0;
+      }
+
+      .catalog-project-filter app-input,
+      .catalog-project-filter app-select { min-width: 0; flex: 1 1 0; }
 
       /* Messages */
       .msg {
@@ -1704,6 +1948,133 @@ type KeyValueRow = {key: string; value: string};
         gap: 20px;
       }
 
+      .availability-section {
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+        margin: 12px 0;
+        padding: 12px;
+        border: 1px solid var(--border-color, var(--surface-1));
+        border-radius: var(--radius-surface);
+        background: var(--surface-0, transparent);
+      }
+
+      .availability-heading {
+        font-size: 12px;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.4px;
+        color: var(--text-muted);
+      }
+
+      .availability-option,
+      .auto-attach-option {
+        display: flex;
+        align-items: flex-start;
+        gap: 9px;
+        cursor: pointer;
+        color: var(--text-primary);
+      }
+
+      .availability-option span,
+      .auto-attach-option span,
+      .native-policy span {
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
+      }
+
+      .availability-option strong,
+      .auto-attach-option strong {
+        font-size: 13px;
+        font-weight: 500;
+      }
+
+      .availability-option small,
+      .auto-attach-option small,
+      .native-policy small,
+      .scope-count,
+      .scope-empty,
+      .project-option small {
+        font-size: 11px;
+        color: var(--text-muted);
+      }
+
+      .project-picker {
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+        margin-left: 24px;
+      }
+
+      .project-options {
+        max-height: 180px;
+        overflow: auto;
+        display: flex;
+        flex-direction: column;
+        gap: 3px;
+      }
+
+      .project-option {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 6px 8px;
+        border-radius: var(--radius-control);
+        font-size: 12px;
+        cursor: pointer;
+      }
+
+      .project-option:hover { background: rgba(255, 255, 255, 0.03); }
+      .project-option.retained-only { color: var(--warning); }
+      .project-option small { margin-left: auto; }
+
+      .selected-project-chips {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 5px;
+      }
+
+      .selected-project-chips app-chip app-icon {
+        margin-left: 3px;
+      }
+
+      .native-policy {
+        display: flex;
+        align-items: flex-start;
+        gap: 9px;
+        padding: 8px 10px;
+        border-radius: var(--radius-control);
+        background: var(--info-tint);
+        color: var(--text-primary);
+        font-size: 13px;
+      }
+
+      .scope-load-state,
+      .scope-error {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 8px 10px;
+        font-size: 12px;
+      }
+
+      .scope-error {
+        justify-content: space-between;
+        color: var(--danger);
+        background: var(--danger-tint);
+        border-radius: var(--radius-control);
+      }
+
+      .impact-summary {
+        margin-left: 24px;
+        padding: 7px 9px;
+        border-radius: var(--radius-control);
+        background: var(--info-tint);
+        color: var(--text-secondary);
+        font-size: 11px;
+      }
+
       /* Repeatable file editor for generic_file type */
       .generic-files-editor {
         display: flex;
@@ -1812,6 +2183,12 @@ type KeyValueRow = {key: string; value: string};
         flex: 1;
         overflow: auto;
         padding: 8px;
+      }
+
+      .load-more-row {
+        display: flex;
+        justify-content: center;
+        padding: 0 12px 12px;
       }
 
       .ds-table {
@@ -1966,6 +2343,9 @@ type KeyValueRow = {key: string; value: string};
          table so it fits without horizontal scroll (the row actions collapse into a
          ⋯ overflow menu in the template). 768px matches ViewportService.isMobile(). */
       @media (max-width: 768px) {
+        .catalog-filter-bar {
+          grid-template-columns: 1fr 1fr;
+        }
         /* Filter chips: scroll sideways instead of overflowing 599px and getting
            clipped by :host{overflow:hidden}. order:1 + flex-basis:100% drops the
            strip onto its own row below the title + actions. */
@@ -2008,7 +2388,8 @@ type KeyValueRow = {key: string; value: string};
            (scope is folded into the name cell as a badge below) so Type / Name +
            the kebab fit without horizontal scroll. URL stays editable in the form. */
         .col-url,
-        .col-scope {
+        .col-scope,
+        .col-availability {
           display: none;
         }
 
@@ -2037,6 +2418,7 @@ export class DatasourceListComponent implements OnInit {
   private readonly api = inject(ApiService);
   private readonly transloco = inject(TranslocoService);
   private readonly userService = inject(UserService);
+  private readonly route = inject(ActivatedRoute, {optional: true});
   protected readonly viewport = inject(ViewportService);
   protected readonly capabilities = inject(CapabilitiesService);
   private readonly destroyRef = inject(DestroyRef);
@@ -2047,6 +2429,23 @@ export class DatasourceListComponent implements OnInit {
   readonly datasources = signal<Datasource[]>([]);
   readonly isLoading = signal(false);
   readonly typeFilter = signal<string>('all');
+  readonly catalogSearch = signal('');
+  readonly scopeFilter = signal<'all' | 'scope-all' | 'projects' | 'unavailable'>('all');
+  readonly automaticFilter = signal<'all' | 'automatic' | 'manual'>('all');
+  readonly ownershipFilter = signal<'all' | 'mine' | 'shared'>('all');
+  readonly visibilityFilter = signal<'all' | 'private' | 'public'>('all');
+  readonly catalogProjectId = signal('');
+  readonly catalogProjectSearch = signal('');
+  readonly catalogProjects = signal<LinkableDatasourceProject[]>([]);
+  readonly catalogProjectsLoading = signal(false);
+  readonly catalogProjectsError = signal(false);
+  readonly catalogProjectsNextCursor = signal<string | null>(null);
+  readonly catalogNextCursor = signal<string | null>(null);
+  readonly isLoadingMore = signal(false);
+  private catalogRequestSerial = 0;
+  private catalogSearchTimer: ReturnType<typeof setTimeout> | null = null;
+  private catalogProjectSearchTimer: ReturnType<typeof setTimeout> | null = null;
+  private catalogProjectsRequestSerial = 0;
   readonly showForm = signal(false);
   readonly editingId = signal<string | null>(null);
   /** Original datasource in edit mode — publishConfirmTier compares against it. */
@@ -2063,6 +2462,34 @@ export class DatasourceListComponent implements OnInit {
   readonly formTestResult = signal<DatasourceTestResult | null>(null);
   readonly successMessage = signal<string | null>(null);
   readonly errorMessage = signal<string | null>(null);
+
+  // Shared availability-policy form state.
+  readonly scopeTargets = signal<LinkableDatasourceProject[]>([]);
+  readonly scopeTargetsLoading = signal(false);
+  readonly scopeTargetsError = signal(false);
+  readonly scopeTargetsNextCursor = signal<string | null>(null);
+  readonly projectSearch = signal('');
+  readonly formProjectIds = signal<Set<string>>(new Set());
+  readonly selectedScopeTargets = computed<LinkableDatasourceProject[]>(() => {
+    const targets = new Map(this.scopeTargets().map(project => [project.id, project]));
+    return [...this.formProjectIds()]
+      .map(id => targets.get(id) ?? {
+        id,
+        // A selected link can fall outside the current search/page. Its UUID
+        // is still an authorized management value returned by the catalog and
+        // remains removable without silently dropping it from the full set.
+        name: id,
+        user_role: null,
+        addable: false,
+        retained_only: true,
+        linked: true,
+      })
+      .sort((left, right) => left.name.localeCompare(right.name));
+  });
+  private scopeTargetsRequestSerial = 0;
+  private contextScopeTargetRequestSerial = 0;
+  private projectSearchTimer: ReturnType<typeof setTimeout> | null = null;
+  private scopeSelectionInitialized = false;
 
   // SSH key generation state
   readonly isGeneratingKey = signal(false);
@@ -2111,6 +2538,15 @@ export class DatasourceListComponent implements OnInit {
     return type === 'repository' || type === 'kb';
   }
 
+  /** A redacted REST URL represents an existing usable secret-bearing URL,
+   * even when the sanitized display value is empty. */
+  private hasConnectionUrlForSave(): boolean {
+    return !!this.formData.connection_url.trim() || !!(
+      this.editingId() && this.editingOriginal?.connection_url_redacted &&
+      !this.connectionUrlDirty
+    );
+  }
+
   // Computed filtered list
   readonly filteredDatasources = computed(() => {
     const filter = this.typeFilter();
@@ -2149,6 +2585,13 @@ export class DatasourceListComponent implements OnInit {
   // Whether the form can be saved (method, not computed, because formData is a plain object)
   canSave(): boolean {
     if (!this.formData.name) return false;
+    if (this.capabilities.datasourceScopeAutoAttachAvailable()) {
+      if (this.scopeTargetsLoading() || this.scopeTargetsError()) return false;
+      if (this.formData.scope_mode === null) return false;
+      if (this.formData.scope_mode === 'projects' && this.formProjectIds().size === 0) {
+        return false;
+      }
+    }
     if (this.formData.type === 'generic') {
       return !!(this.formData.description);
     }
@@ -2190,12 +2633,18 @@ export class DatasourceListComponent implements OnInit {
       }
       return !!this.formData.connection_url.trim();
     }
+    if (this.formData.type === 'kb' && this.isNativeProjectConnector()) {
+      // The native project vault is not a remote repository and deliberately
+      // has no connection URL. Its ordinary metadata/root-path fields remain
+      // editable while the policy block stays project-managed.
+      return true;
+    }
     if (this.formData.type === 'repository') {
       // forge is required — self-hosted hosts don't default it, so an empty
       // selection must block save rather than let the server 400.
-      return !!this.formData.connection_url && !!this.formData.forge;
+      return this.hasConnectionUrlForSave() && !!this.formData.forge;
     }
-    return !!this.formData.connection_url;
+    return this.hasConnectionUrlForSave();
   }
 
   canTestFromForm(): boolean {
@@ -2221,6 +2670,9 @@ export class DatasourceListComponent implements OnInit {
     mcpEnv: KeyValueRow[];
     is_global: boolean;
     read_only: boolean;
+    scope_mode: DatasourceScopeMode | null;
+    auto_attach: boolean;
+    policy_revision: number | null;
   } = {
     name: '',
     type: 'generic',
@@ -2238,6 +2690,9 @@ export class DatasourceListComponent implements OnInit {
     mcpEnv: [],
     is_global: false,
     read_only: true,
+    scope_mode: null,
+    auto_attach: false,
+    policy_revision: null,
   };
 
   formCredentials: { username: string; password: string } = {
@@ -2368,9 +2823,28 @@ export class DatasourceListComponent implements OnInit {
    *  this form session. Mirrors mcpTransportDirty: stops onConnectionUrlChange
    *  from re-inferring over a deliberate choice, and is reset on open/close. */
   private forgeDirty = false;
+  private connectionUrlDirty = false;
 
   ngOnInit(): void {
+    // Capabilities are fetched asynchronously. Start in fail-closed legacy
+    // mode, then reload from the v1 catalog once the deployment explicitly
+    // confirms support. Replay makes an already-resolved capability use the
+    // right source on the initial refresh without causing a duplicate call.
+    let initialising = true;
+    this.capabilities.datasourceScopeAutoAttachAvailability$
+      .pipe(takeUntilDestroyed(this.destroyRef))
+      .subscribe((available) => {
+        if (!initialising) {
+          this.refresh();
+          if (available) this.loadCatalogProjects(true);
+          else this.resetCatalogProjectFilter();
+        }
+      });
+    initialising = false;
     this.refresh();
+    if (this.capabilities.datasourceScopeAutoAttachAvailable()) {
+      this.loadCatalogProjects(true);
+    }
     // Live-refresh KB index status while any KB is still converging. The tick is
     // a cheap no-op when nothing is indexing; an HTTP GET only fires for rows
     // actually pending/indexing, and stops once they reach a terminal status
@@ -2381,15 +2855,191 @@ export class DatasourceListComponent implements OnInit {
   }
 
   refresh(): void {
+    const serial = ++this.catalogRequestSerial;
     this.isLoading.set(true);
-    this.api.getDatasources().subscribe((datasources) => {
-      this.datasources.set(datasources);
-      this.indexStatuses.set({});
-      for (const ds of datasources) {
-        if (ds.type === 'kb') this.loadIndexStatus(ds.id);
-      }
-      this.isLoading.set(false);
+    if (!this.capabilities.datasourceScopeAutoAttachAvailable()) {
+      this.catalogNextCursor.set(null);
+      this.isLoadingMore.set(false);
+      const type = this.typeFilter() === 'all'
+        ? undefined
+        : this.typeFilter() as DatasourceType;
+      this.api.getDatasources(undefined, type).subscribe({
+        next: (rows) => {
+          if (serial !== this.catalogRequestSerial) return;
+          this.applyCatalogRows(rows, false);
+          this.isLoading.set(false);
+        },
+        error: () => {
+          if (serial !== this.catalogRequestSerial) return;
+          this.isLoading.set(false);
+          this.errorMessage.set(this.transloco.translate('datasources.catalog.loadFailed'));
+        },
+      });
+      return;
+    }
+    this.api.getDatasourceCatalog(this.catalogFilters()).subscribe({
+      next: (response) => {
+        if (serial !== this.catalogRequestSerial) return;
+        this.applyCatalogRows(response.items, false);
+        this.catalogNextCursor.set(response.next_cursor);
+        this.isLoading.set(false);
+      },
+      error: () => {
+        if (serial !== this.catalogRequestSerial) return;
+        this.isLoading.set(false);
+        this.errorMessage.set(this.transloco.translate('datasources.catalog.loadFailed'));
+      },
     });
+  }
+
+  loadMoreCatalog(): void {
+    if (!this.capabilities.datasourceScopeAutoAttachAvailable()) return;
+    const cursor = this.catalogNextCursor();
+    if (!cursor || this.isLoadingMore()) return;
+    const serial = ++this.catalogRequestSerial;
+    this.isLoadingMore.set(true);
+    this.api.getDatasourceCatalog({...this.catalogFilters(), cursor}).subscribe({
+      next: (response) => {
+        if (serial !== this.catalogRequestSerial) return;
+        this.applyCatalogRows(response.items, true);
+        this.catalogNextCursor.set(response.next_cursor);
+        this.isLoadingMore.set(false);
+      },
+      error: () => {
+        if (serial !== this.catalogRequestSerial) return;
+        this.isLoadingMore.set(false);
+        this.errorMessage.set(this.transloco.translate('datasources.catalog.loadMoreFailed'));
+      },
+    });
+  }
+
+  private catalogFilters(): DatasourceCatalogFilters {
+    const filters: DatasourceCatalogFilters = {limit: 50};
+    const q = this.catalogSearch().trim();
+    if (q) filters.q = q;
+    if (this.catalogProjectId()) filters.project_id = this.catalogProjectId();
+    if (this.typeFilter() !== 'all') filters.type = this.typeFilter() as DatasourceType;
+    if (this.scopeFilter() === 'scope-all') filters.availability = 'all';
+    if (this.scopeFilter() === 'projects') filters.availability = 'projects';
+    if (this.scopeFilter() === 'unavailable') filters.availability = 'unavailable';
+    if (this.automaticFilter() !== 'all') {
+      filters.auto_attach = this.automaticFilter() === 'automatic';
+    }
+    const ownership = this.ownershipFilter();
+    if (ownership !== 'all') filters.ownership = ownership;
+    const visibility = this.visibilityFilter();
+    if (visibility !== 'all') filters.visibility = visibility;
+    return filters;
+  }
+
+  private applyCatalogRows(rows: Datasource[], append: boolean): void {
+    const merged = append
+      ? [...this.datasources(), ...rows.filter(row => !this.datasources().some(old => old.id === row.id))]
+      : rows;
+    this.datasources.set(merged);
+    if (!append) this.indexStatuses.set({});
+    for (const ds of rows) {
+      if (ds.type === 'kb') this.loadIndexStatus(ds.id);
+    }
+  }
+
+  onTypeFilter(value: string): void {
+    this.typeFilter.set(value);
+    this.refresh();
+  }
+
+  onCatalogSearch(value: string): void {
+    this.catalogSearch.set(value);
+    if (this.catalogSearchTimer) clearTimeout(this.catalogSearchTimer);
+    this.catalogSearchTimer = setTimeout(() => this.refresh(), 250);
+  }
+
+  onCatalogProjectFilter(value: string | null): void {
+    this.catalogProjectId.set(value ?? '');
+    this.refresh();
+  }
+
+  onCatalogProjectSearch(value: string): void {
+    this.catalogProjectSearch.set(value);
+    if (this.catalogProjectSearchTimer) clearTimeout(this.catalogProjectSearchTimer);
+    this.catalogProjectSearchTimer = setTimeout(() => this.loadCatalogProjects(true), 250);
+  }
+
+  loadCatalogProjects(reset = true): void {
+    if (!this.capabilities.datasourceScopeAutoAttachAvailable()) return;
+    const cursor = reset ? null : this.catalogProjectsNextCursor();
+    if (!reset && !cursor) return;
+    const serial = ++this.catalogProjectsRequestSerial;
+    this.catalogProjectsLoading.set(true);
+    this.catalogProjectsError.set(false);
+    this.api.getLinkableDatasourceProjects({
+      q: this.catalogProjectSearch().trim() || undefined,
+      cursor: cursor ?? undefined,
+      limit: 50,
+    }).subscribe({
+      next: (response) => {
+        if (serial !== this.catalogProjectsRequestSerial) return;
+        const previous = reset ? [] : this.catalogProjects();
+        const selected = this.catalogProjects().find(
+          project => project.id === this.catalogProjectId(),
+        );
+        const incoming = response.items;
+        this.catalogProjects.set([
+          ...(selected && !incoming.some(project => project.id === selected.id)
+            ? [selected]
+            : []),
+          ...previous.filter(
+            project => !incoming.some(item => item.id === project.id) && project.id !== selected?.id,
+          ),
+          ...incoming,
+        ]);
+        this.catalogProjectsNextCursor.set(response.next_cursor);
+        this.catalogProjectsLoading.set(false);
+      },
+      error: () => {
+        if (serial !== this.catalogProjectsRequestSerial) return;
+        this.catalogProjectsLoading.set(false);
+        this.catalogProjectsError.set(true);
+      },
+    });
+  }
+
+  loadMoreCatalogProjects(): void {
+    this.loadCatalogProjects(false);
+  }
+
+  private resetCatalogProjectFilter(): void {
+    this.catalogProjectsRequestSerial += 1;
+    this.catalogProjectId.set('');
+    this.catalogProjectSearch.set('');
+    this.catalogProjects.set([]);
+    this.catalogProjectsLoading.set(false);
+    this.catalogProjectsError.set(false);
+    this.catalogProjectsNextCursor.set(null);
+  }
+
+  onScopeFilter(value: string | null): void {
+    if (value === 'scope-all' || value === 'projects' || value === 'unavailable') {
+      this.scopeFilter.set(value);
+    } else {
+      this.scopeFilter.set('all');
+    }
+    this.refresh();
+  }
+
+  onAutomaticFilter(value: string | null): void {
+    this.automaticFilter.set(value === 'automatic' || value === 'manual' ? value : 'all');
+    this.refresh();
+  }
+
+  onOwnershipFilter(value: string | null): void {
+    this.ownershipFilter.set(value === 'mine' || value === 'shared' ? value : 'all');
+    this.refresh();
+  }
+
+  onVisibilityFilter(value: string | null): void {
+    this.visibilityFilter.set(value === 'private' || value === 'public' ? value : 'all');
+    this.refresh();
   }
 
   // ===== Form Methods =====
@@ -2401,6 +3051,10 @@ export class DatasourceListComponent implements OnInit {
     this.formTestResult.set(null);
     this.cancelGenerateSshKey();
     this.closePublicKeyDialog();
+    if (this.capabilities.datasourceScopeAutoAttachAvailable()) {
+      this.loadScopeTargets(true);
+      this.loadContextScopeTarget();
+    }
   }
 
   openEditForm(ds: Datasource): void {
@@ -2428,7 +3082,13 @@ export class DatasourceListComponent implements OnInit {
       mcpEnv: [],
       is_global: ds.is_global ?? false,
       read_only: ds.read_only ?? true,
+      scope_mode: ds.scope_mode ?? 'all',
+      auto_attach: ds.auto_attach ?? false,
+      policy_revision: ds.policy_revision ?? 1,
     };
+    this.connectionUrlDirty = false;
+    this.formProjectIds.set(new Set(ds.project_ids ?? []));
+    this.scopeSelectionInitialized = (ds.project_ids?.length ?? 0) > 0;
     // F3 (docs/multi_tenancy.md): credentials never come back from the
     // API. The user re-enters them only if they want to change the stored
     // value — submitting blank fields leaves the secret untouched.
@@ -2469,6 +3129,15 @@ export class DatasourceListComponent implements OnInit {
     this.formTestResult.set(null);
     this.cancelGenerateSshKey();
     this.closePublicKeyDialog();
+    // Native project knowledge policy is server-owned and already complete in
+    // the management row. Ordinary connector edits load addable/retained
+    // targets before their controls or Save become available.
+    if (
+      this.capabilities.datasourceScopeAutoAttachAvailable() &&
+      !this.isNativeProjectConnector()
+    ) {
+      this.loadScopeTargets(true);
+    }
   }
 
   closeForm(): void {
@@ -2478,7 +3147,159 @@ export class DatasourceListComponent implements OnInit {
     this.showPublishConfirm.set(false);
     this.cancelGenerateSshKey();
     this.closePublicKeyDialog();
+    this.scopeTargetsRequestSerial += 1;
+    this.scopeTargetsLoading.set(false);
+    this.scopeTargetsError.set(false);
     this.resetFormData();
+  }
+
+  onScopeModeChange(mode: DatasourceScopeMode): void {
+    this.formData.scope_mode = mode;
+  }
+
+  isNativeProjectConnector(ds: Datasource | null = this.editingOriginal): boolean {
+    return !!ds?.config?.native_project_id;
+  }
+
+  onProjectSearch(value: string): void {
+    this.projectSearch.set(value);
+    if (this.projectSearchTimer) clearTimeout(this.projectSearchTimer);
+    this.projectSearchTimer = setTimeout(() => this.loadScopeTargets(true), 250);
+  }
+
+  loadScopeTargets(_reset = false): void {
+    if (!this.capabilities.datasourceScopeAutoAttachAvailable()) {
+      this.scopeTargetsRequestSerial += 1;
+      this.scopeTargetsLoading.set(false);
+      this.scopeTargetsError.set(false);
+      return;
+    }
+    if (!this.showForm()) return;
+    const serial = ++this.scopeTargetsRequestSerial;
+    this.scopeTargetsLoading.set(true);
+    this.scopeTargetsError.set(false);
+    this.api.getLinkableDatasourceProjects({
+      datasourceId: this.editingId() ?? undefined,
+      q: this.projectSearch().trim() || undefined,
+      limit: 50,
+    }).subscribe({
+      next: (response) => {
+        if (serial !== this.scopeTargetsRequestSerial) return;
+        const selectedItems = response.selected_items ?? [];
+        this.scopeTargets.set([
+          ...selectedItems,
+          ...response.items.filter(item => !selectedItems.some(selected => selected.id === item.id)),
+        ]);
+        this.scopeTargetsNextCursor.set(response.next_cursor);
+        if (this.editingId() && !this.scopeSelectionInitialized) {
+          const linkedSource = selectedItems.length > 0 ? selectedItems : response.items;
+          const linked = linkedSource.filter(item => item.linked || item.selected).map(item => item.id);
+          this.formProjectIds.set(new Set(linked));
+          this.scopeSelectionInitialized = true;
+        } else if (!this.editingId() && !this.scopeSelectionInitialized) {
+          const contextProjectId = this.route?.snapshot.queryParamMap.get('project');
+          if (contextProjectId && response.items.some(item => item.id === contextProjectId && item.addable)) {
+            this.formProjectIds.set(new Set([contextProjectId]));
+            this.formData.scope_mode = 'projects';
+            this.scopeSelectionInitialized = true;
+          } else if (!contextProjectId) {
+            this.scopeSelectionInitialized = true;
+          }
+        }
+        this.scopeTargetsLoading.set(false);
+      },
+      error: () => {
+        if (serial !== this.scopeTargetsRequestSerial) return;
+        this.scopeTargetsLoading.set(false);
+        this.scopeTargetsError.set(true);
+      },
+    });
+  }
+
+  loadMoreScopeTargets(): void {
+    const cursor = this.scopeTargetsNextCursor();
+    if (!cursor || this.scopeTargetsLoading()) return;
+    const serial = ++this.scopeTargetsRequestSerial;
+    this.scopeTargetsLoading.set(true);
+    this.scopeTargetsError.set(false);
+    this.api.getLinkableDatasourceProjects({
+      datasourceId: this.editingId() ?? undefined,
+      q: this.projectSearch().trim() || undefined,
+      cursor,
+      limit: 50,
+    }).subscribe({
+      next: (response) => {
+        if (serial !== this.scopeTargetsRequestSerial) return;
+        const current = this.scopeTargets();
+        const incoming = [...(response.selected_items ?? []), ...response.items];
+        this.scopeTargets.set([
+          ...current,
+          ...incoming.filter(item => !current.some(old => old.id === item.id)),
+        ]);
+        this.scopeTargetsNextCursor.set(response.next_cursor);
+        this.scopeTargetsLoading.set(false);
+      },
+      error: () => {
+        if (serial !== this.scopeTargetsRequestSerial) return;
+        this.scopeTargetsLoading.set(false);
+        this.scopeTargetsError.set(true);
+      },
+    });
+  }
+
+  /** Resolve a route-provided project independently of the first catalog
+   * page. GET project + members is enough to prove the same owner/admin
+   * authority enforced by connector creation, without widening backend APIs. */
+  private loadContextScopeTarget(): void {
+    const projectId = this.route?.snapshot.queryParamMap.get('project');
+    if (!projectId || this.editingId() || !this.showForm()) return;
+    const serial = ++this.contextScopeTargetRequestSerial;
+    forkJoin({
+      project: this.api.getProject(projectId),
+      members: this.api.getProjectMembers(projectId),
+    }).subscribe(({project, members}) => {
+      if (
+        serial !== this.contextScopeTargetRequestSerial ||
+        !this.showForm() || this.editingId() ||
+        this.route?.snapshot.queryParamMap.get('project') !== projectId
+      ) return;
+      const user = this.userService.currentUser();
+      const role = project?.user_role ?? members.find(member => member.user_id === user?.id)?.role;
+      const addable = !!project && (!!user?.is_admin || role === 'owner');
+      if (project && addable) {
+        const target: LinkableDatasourceProject = {
+          id: project.id,
+          name: project.name,
+          is_default: project.is_default,
+          user_role: role ?? null,
+          addable: true,
+          retained_only: false,
+          linked: false,
+        };
+        this.scopeTargets.update(current => current.some(item => item.id === target.id)
+          ? current.map(item => item.id === target.id ? target : item)
+          : [target, ...current]);
+        this.formProjectIds.set(new Set([projectId]));
+        this.formData.scope_mode = 'projects';
+      }
+      this.scopeSelectionInitialized = true;
+    });
+  }
+
+  toggleScopeProject(project: LinkableDatasourceProject): void {
+    const current = this.formProjectIds();
+    const next = new Set(current);
+    if (next.has(project.id)) {
+      const wasLinked = this.editingOriginal?.project_ids?.includes(project.id) ?? false;
+      if (
+        wasLinked &&
+        !confirm(this.transloco.translate('datasources.form.removeProjectWarning', {name: project.name}))
+      ) return;
+      next.delete(project.id);
+    } else if (project.addable) {
+      next.add(project.id);
+    }
+    this.formProjectIds.set(next);
   }
 
   // ===== SSH Key Generation =====
@@ -2620,6 +3441,8 @@ export class DatasourceListComponent implements OnInit {
    *  onForgeSelect): re-inferring on every keystroke would silently
    *  overwrite a deliberate choice and re-disable Save. */
   onConnectionUrlChange(value: string = this.formData.connection_url): void {
+    this.connectionUrlDirty = !this.editingOriginal ||
+      value !== (this.editingOriginal.connection_url ?? '');
     this.formData.connection_url = value;
     if (this.formData.type === 'repository' && !this.forgeDirty) {
       this.formData.forge = this.inferForgeFromUrl(value);
@@ -2666,6 +3489,35 @@ export class DatasourceListComponent implements OnInit {
     if (ds.is_global) return 'accent';
     if (ds.job_id) return 'neutral';
     return 'info';
+  }
+
+  private projectCount(ds: Datasource): number {
+    return ds.project_count ?? ds.project_ids?.length ?? 0;
+  }
+
+  availabilityLabel(ds: Datasource): string {
+    if ((ds.scope_mode ?? 'all') === 'all') {
+      return this.transloco.translate('datasources.table.availabilityAll');
+    }
+    const count = this.projectCount(ds);
+    if (count === 0) return this.transloco.translate('datasources.table.availabilityNone');
+    // Shared rows expose only caller-visible associations. A numeric subset
+    // would look like the connector's complete scope, so reserve counts for
+    // creators/admins and use the non-enumerating label for other callers.
+    const canSeeCompleteScope = this.isOwnedByCurrentUser(ds) || !!this.userService.currentUser()?.is_admin;
+    if (!canSeeCompleteScope || (ds.project_count === undefined && ds.project_ids === undefined)) {
+      return this.transloco.translate('datasources.table.availabilityScoped');
+    }
+    return this.transloco.translate('datasources.table.availabilityProjects', {count});
+  }
+
+  availabilityTone(ds: Datasource): BadgeTone {
+    if ((ds.scope_mode ?? 'all') === 'all') return 'info';
+    return this.projectCount(ds) === 0 ? 'warning' : 'neutral';
+  }
+
+  isOwnedByCurrentUser(ds: Datasource): boolean {
+    return !!ds.created_by && ds.created_by === this.userService.currentUser()?.id;
   }
 
   dsTypeTone(type: DatasourceType | string): BadgeTone {
@@ -2728,12 +3580,33 @@ export class DatasourceListComponent implements OnInit {
 
   private connectionUrlForPayload(): string | undefined {
     if (
+      this.editingId() && this.editingOriginal?.connection_url_redacted &&
+      !this.connectionUrlDirty
+    ) {
+      return undefined;
+    }
+    if (
       this.formData.type === 'mcp' &&
       this.formData.mcpTransport === 'stdio'
     ) {
       return undefined;
     }
     return this.formData.connection_url || undefined;
+  }
+
+  /** One source of truth for the create and create-then-test policy payload. */
+  private createAvailabilityPolicy(): Partial<Pick<
+    DatasourceCreateRequest,
+    'scope_mode' | 'project_ids' | 'auto_attach'
+  >> {
+    if (!this.capabilities.datasourceScopeAutoAttachAvailable()) return {};
+    return {
+      scope_mode: this.formData.scope_mode ?? undefined,
+      project_ids: this.formData.scope_mode === 'projects'
+        ? [...this.formProjectIds()]
+        : [],
+      auto_attach: this.formData.auto_attach,
+    };
   }
 
   doSave(): void {
@@ -2752,10 +3625,14 @@ export class DatasourceListComponent implements OnInit {
     const creds = this.buildCredentials();
 
     if (editId) {
+      const previousProjectIds = new Set(this.editingOriginal?.project_ids ?? []);
+      const currentProjectIds = this.formProjectIds();
+      const projectSetChanged =
+        previousProjectIds.size !== currentProjectIds.size ||
+        [...previousProjectIds].some(id => !currentProjectIds.has(id));
       const update: DatasourceUpdateRequest = {
         name: this.formData.name,
         description: this.formData.description || undefined,
-        connection_url: this.connectionUrlForPayload(),
         credentials: creds,
         cli_hint: this.formData.cli_hint || undefined,
         default_branch: this.formData.default_branch || undefined,
@@ -2765,6 +3642,21 @@ export class DatasourceListComponent implements OnInit {
           ? (this.formData.type === 'kb' ? true : this.formData.read_only)
           : undefined,
       };
+      const connectionUrl = this.connectionUrlForPayload();
+      if (connectionUrl !== undefined) update.connection_url = connectionUrl;
+      if (
+        this.capabilities.datasourceScopeAutoAttachAvailable() &&
+        !this.isNativeProjectConnector()
+      ) {
+        update.scope_mode = this.formData.scope_mode ?? undefined;
+        update.auto_attach = this.formData.auto_attach;
+        update.policy_revision = this.formData.policy_revision ?? undefined;
+        // In all-mode omission preserves existing sharing/settings links. A
+        // project-scoped update is a full-set policy edit.
+        update.project_ids = this.formData.scope_mode === 'projects' || projectSetChanged
+          ? [...currentProjectIds]
+          : undefined;
+      }
 
       this.api.updateDatasource(editId, update).subscribe({
         next: (result) => {
@@ -2801,6 +3693,7 @@ export class DatasourceListComponent implements OnInit {
         read_only: this.formData.is_global
           ? (this.formData.type === 'kb' ? true : this.formData.read_only)
           : undefined,
+        ...this.createAvailabilityPolicy(),
       };
 
       this.api.createDatasource(create).subscribe({
@@ -2851,12 +3744,25 @@ export class DatasourceListComponent implements OnInit {
         credentials: this.buildCredentials(),
         default_branch: this.formData.default_branch || undefined,
         config: this.buildTypeConfig(),
+        ...this.createAvailabilityPolicy(),
       };
 
       this.api.createDatasource(create).subscribe({
         next: (created) => {
           this.isSaving.set(false);
           if (created) {
+            const createdPolicy: Datasource = {
+              ...created,
+              scope_mode: created.scope_mode ?? create.scope_mode,
+              auto_attach: created.auto_attach ?? create.auto_attach,
+              policy_revision: created.policy_revision ?? 1,
+              project_ids: created.project_ids ?? create.project_ids ?? [],
+            };
+            this.editingOriginal = createdPolicy;
+            this.formData.scope_mode = createdPolicy.scope_mode ?? this.formData.scope_mode;
+            this.formData.auto_attach = createdPolicy.auto_attach ?? this.formData.auto_attach;
+            this.formData.policy_revision = createdPolicy.policy_revision ?? 1;
+            this.formProjectIds.set(new Set(createdPolicy.project_ids ?? []));
             this.editingId.set(created.id);
             this.refresh();
             // Now test
@@ -3285,6 +4191,9 @@ export class DatasourceListComponent implements OnInit {
       mcpEnv: [],
       is_global: false,
       read_only: true,
+      scope_mode: null,
+      auto_attach: false,
+      policy_revision: null,
     };
     this.editingOriginal = null;
     this.formCredentials = { username: '', password: '' };
@@ -3294,8 +4203,15 @@ export class DatasourceListComponent implements OnInit {
     this.envVars = [];
     this.mcpTransportDirty = false;
     this.forgeDirty = false;
+    this.connectionUrlDirty = false;
     this.kubeconfigContent = '';
     this.genericFiles = [];
+    this.formProjectIds.set(new Set());
+    this.scopeSelectionInitialized = false;
+    this.scopeTargets.set([]);
+    this.scopeTargetsNextCursor.set(null);
+    this.projectSearch.set('');
+    this.contextScopeTargetRequestSerial += 1;
   }
 
   // ===== Generic file editor =====

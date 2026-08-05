@@ -142,7 +142,7 @@ def resume_collaborators(monkeypatch, fake_conn, injector):
 
     monkeypatch.setattr(main, "_user_experts_enabled", AsyncMock(return_value=False))
     monkeypatch.setattr(
-        main.postgres_db, "resolve_datasources_for_job", AsyncMock(return_value=[])
+        main, "_resolve_authorized_job_datasources", AsyncMock(return_value=[])
     )
     monkeypatch.setattr(main, "_apply_cloud_storage_override", MagicMock())
     monkeypatch.setattr(main, "_build_datasources_payload", MagicMock(return_value=[]))
@@ -256,8 +256,8 @@ class TestResumeJobOnAgentInjection:
         self, resume_collaborators, monkeypatch
     ):
         monkeypatch.setattr(
-            main.postgres_db,
-            "resolve_datasources_for_job",
+            main,
+            "_resolve_authorized_job_datasources",
             AsyncMock(return_value=[{"type": "kb", "id": "ds-1"}]),
         )
         await main._resume_job_on_agent(_job(), _agent())

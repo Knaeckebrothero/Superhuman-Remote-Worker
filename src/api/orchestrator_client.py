@@ -1601,6 +1601,9 @@ class OrchestratorClient:
     ) -> dict[str, Any] | None:
         """Create a delegation child job via the orchestrator.
 
+        Datasource IDs are intentionally omitted: the job endpoint inherits
+        and reauthorizes the authoritative parent job's materialized selection.
+
         Args:
             description: Task description for the child job
             config_name: Agent config to use (e.g., "scholar", "developer")
@@ -1700,6 +1703,9 @@ class OrchestratorClient:
         parent_llm_override: Optional[dict[str, Any]] = None,
     ) -> Optional[dict[str, Any]]:
         """Create a critic verification job for a completed job.
+
+        Datasource IDs are intentionally omitted: the job endpoint inherits
+        and reauthorizes the target parent job's materialized selection.
 
         Loads the verification instructions template, formats it with
         target job details, and creates a new critic job via the

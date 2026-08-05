@@ -7,7 +7,7 @@ import {FileHandlingService} from '../../core/services/file-handling.service';
 import {JobArtifactService} from '../../core/services/job-artifact.service';
 import {UserService} from '../../core/services/user.service';
 import {ErrorMessageService} from '../../core/services/error-message.service';
-import {Datasource, EffectiveModels, Expert, ExpertDefaultsResponse, ExpertDetail, JobCreateRequest, Project} from '../../core/models/api.model';
+import {EffectiveModels, EligibleDatasource, Expert, ExpertDefaultsResponse, ExpertDetail, JobCreateRequest, Project} from '../../core/models/api.model';
 import {FilePreview, UploadStatus} from '../../core/models/file.model';
 import {AgentSettingsComponent} from '../agent-settings/agent-settings.component';
 import {PRIORITY_LEVELS, resolveEffectiveModels} from '../agent-settings/agent-settings.types';
@@ -288,7 +288,11 @@ import {AppTooltipDirective} from '../../ui/tooltip';
             [effectiveModels]="resolvedEffectiveModels()"
             [datasources]="availableDatasources()"
             [loadingDatasources]="isLoadingDatasources()"
+            [datasourceLoadError]="datasourceLoadError()"
+            [datasourceContextKey]="datasourceContextKey()"
+            [datasourceDefaultsEnabled]="capabilities.datasourceScopeAutoAttachAvailable()"
             [loadingExpert]="isLoadingExpertDetail()"
+            (retryDatasources)="loadDatasources()"
             (instructionsChange)="onInstructionsChange($event)"
           />
 
@@ -306,7 +310,7 @@ import {AppTooltipDirective} from '../../ui/tooltip';
               type="submit"
               variant="primary"
               [loading]="isSubmitting() || isUploading()"
-              [disabled]="!formData.description"
+              [disabled]="!formData.description || isLoadingDatasources() || datasourceLoadError()"
             >
               @if (isSubmitting()) {
                 {{ 'jobs.create.creating' | transloco }}
@@ -1202,8 +1206,13 @@ export class JobCreateComponent implements OnInit {
     return !!proj?.cloud_storage_url;
   });
 
-  readonly availableDatasources = signal<Datasource[]>([]);
+  readonly availableDatasources = signal<EligibleDatasource[]>([]);
   readonly isLoadingDatasources = signal(false);
+  readonly datasourceLoadError = signal(false);
+  readonly datasourceContextKey = computed(() =>
+    this.selectedProjectId() ? `project:${this.selectedProjectId()}` : 'standalone',
+  );
+  private datasourceRequestSerial = 0;
 
   readonly frameworkDefaults = signal<Record<string, unknown> | null>(null);
   readonly frameworkSettingsMatrix = signal<Record<string, Record<string, unknown>>>({});
@@ -1374,15 +1383,26 @@ export class JobCreateComponent implements OnInit {
     this.artifacts.instructions.set(value);
   }
 
-  private loadDatasources(): void {
+  loadDatasources(): void {
+    const serial = ++this.datasourceRequestSerial;
     this.isLoadingDatasources.set(true);
-    // Eligible = owner + global + linked to the selected project. The picker
-    // pre-selects these; explicit-only resolution attaches exactly what stays
-    // checked. Re-fetched whenever the project changes.
+    this.datasourceLoadError.set(false);
+    // The server applies execution authorization and scope for this exact
+    // project, then marks owner-specific defaults. Re-fetch on context change.
     const pid = this.selectedProjectId();
     this.api.getEligibleDatasources(pid ? [pid] : []).subscribe({
-      next: (datasources) => { this.availableDatasources.set(datasources); this.isLoadingDatasources.set(false); },
-      error: () => { this.isLoadingDatasources.set(false); },
+      next: (datasources) => {
+        if (serial !== this.datasourceRequestSerial) return;
+        this.availableDatasources.set(datasources);
+        this.isLoadingDatasources.set(false);
+      },
+      error: () => {
+        if (serial !== this.datasourceRequestSerial) return;
+        // Keep the last authorized page visible for context and retry. The
+        // picker disables edits while errored and submission remains blocked.
+        this.datasourceLoadError.set(true);
+        this.isLoadingDatasources.set(false);
+      },
     });
   }
 
@@ -1460,7 +1480,10 @@ export class JobCreateComponent implements OnInit {
   // ===== Form Submission =====
 
   async onSubmit(): Promise<void> {
-    if (!this.formData.description || this.isSubmitting() || this.isUploading()) return;
+    if (
+      !this.formData.description || this.isSubmitting() || this.isUploading() ||
+      this.isLoadingDatasources() || this.datasourceLoadError()
+    ) return;
     this.clearMessages();
 
     const files = this.filePreviews();
@@ -1495,7 +1518,8 @@ export class JobCreateComponent implements OnInit {
     if (this.kickoffMessage.trim()) request.kickoff_message = this.kickoffMessage.trim();
 
     const dsIds = this.agentSettings?.getSelectedDatasourceIds() ?? [];
-    if (dsIds.length > 0) request.datasource_ids = dsIds;
+    // Empty is an explicit opt-out; omission means "apply server defaults".
+    request.datasource_ids = dsIds;
 
     const projectId = this.selectedProjectId();
     if (projectId) request.project_id = projectId;
@@ -1581,6 +1605,7 @@ export class JobCreateComponent implements OnInit {
     this.agentSettings?.resetAll();
     const defaultProject = this.projects().find((p) => p.is_default);
     this.selectedProjectId.set(defaultProject?.id ?? this.projects()[0]?.id ?? null);
+    this.loadDatasources();
     this.loadEffectiveDefault();
     this.artifacts.reset();
   }

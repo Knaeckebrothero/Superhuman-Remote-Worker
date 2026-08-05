@@ -420,6 +420,8 @@ class TestAsyncCockpitClientPersistentThreads:
             assert body["permission_mode"] == "supervised"
             # Optional fields should NOT be in body
             assert "project_id" not in body
+            assert "datasource_ids" not in body
+            assert body["use_datasource_defaults"] is True
             assert "model" not in body
             assert result == {"thread_id": "tid-1", "status": "created"}
 
@@ -435,6 +437,7 @@ class TestAsyncCockpitClientPersistentThreads:
                 permission_mode="autonomous",
                 project_id="proj-1",
                 project_ids=["proj-1", "proj-2"],
+                datasource_ids=[],
                 model="openai/gpt-4",
                 temperature=0.7,
             )
@@ -445,6 +448,8 @@ class TestAsyncCockpitClientPersistentThreads:
             assert body["permission_mode"] == "autonomous"
             assert body["project_id"] == "proj-1"
             assert body["project_ids"] == ["proj-1", "proj-2"]
+            assert body["datasource_ids"] == []
+            assert "use_datasource_defaults" not in body
             assert body["model"] == "openai/gpt-4"
             assert body["temperature"] == 0.7
 
@@ -585,6 +590,113 @@ class TestAsyncCockpitClientPersistentThreads:
 # ============================================================================
 
 
+@pytest.mark.asyncio
+async def test_list_datasources_tool_reports_full_ids_revisions_and_cursor():
+    connector_id = "11111111-2222-4333-8444-555555555555"
+    mock_client = AsyncMock()
+    mock_client.list_datasources.return_value = {
+        "items": [
+            {
+                "id": connector_id,
+                "name": "Application database",
+                "type": "postgresql",
+                "scope_mode": "projects",
+                "project_ids": ["aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"],
+                "policy_revision": 23,
+            }
+        ],
+        "next_cursor": "opaque-next-page",
+    }
+
+    with patch.object(_mcp_server_mod, "_get_client", return_value=mock_client):
+        result = await _mcp_server_mod.list_datasources(
+            ds_type="postgresql",
+            q="application",
+            scope_mode="projects",
+            ownership="mine",
+            limit=10,
+            cursor="opaque-current-page",
+        )
+
+    mock_client.list_datasources.assert_awaited_once_with(
+        ds_type="postgresql",
+        q="application",
+        project_id=None,
+        scope_mode="projects",
+        auto_attach=None,
+        visibility=None,
+        ownership="mine",
+        availability=None,
+        limit=10,
+        cursor="opaque-current-page",
+    )
+    assert connector_id in result
+    assert "Policy revision: 23" in result
+    assert "Next cursor: opaque-next-page" in result
+
+
+@pytest.mark.asyncio
+async def test_get_datasource_tool_reports_exact_management_state():
+    connector_id = "11111111-2222-4333-8444-555555555555"
+    mock_client = AsyncMock()
+    mock_client.get_datasource.return_value = {
+        "id": connector_id,
+        "name": "Application database",
+        "type": "postgresql",
+        "scope_mode": "all",
+        "project_ids": [],
+        "policy_revision": 24,
+    }
+
+    with patch.object(_mcp_server_mod, "_get_client", return_value=mock_client):
+        result = await _mcp_server_mod.get_datasource(connector_id)
+
+    mock_client.get_datasource.assert_awaited_once_with(connector_id)
+    assert f"ID: {connector_id}" in result
+    assert "Policy revision: 24" in result
+
+
+@pytest.mark.asyncio
+async def test_update_datasource_tool_reports_new_policy_revision():
+    mock_client = AsyncMock()
+    mock_client.update_datasource.return_value = {
+        "id": "connector-1",
+        "scope_mode": "projects",
+        "project_ids": ["project-a"],
+        "auto_attach": True,
+        "policy_revision": 8,
+    }
+
+    with patch.object(_mcp_server_mod, "_get_client", return_value=mock_client):
+        result = await _mcp_server_mod.update_datasource(
+            "connector-1",
+            scope_mode="projects",
+            project_ids=["project-a"],
+            auto_attach=True,
+            policy_revision=7,
+        )
+
+    mock_client.update_datasource.assert_awaited_once_with(
+        datasource_id="connector-1",
+        name=None,
+        description=None,
+        connection_url=None,
+        credentials=None,
+        cli_hint=None,
+        default_branch=None,
+        config=None,
+        is_global=None,
+        read_only=None,
+        scope_mode="projects",
+        project_ids=["project-a"],
+        auto_attach=True,
+        policy_revision=7,
+    )
+    assert "Policy revision: 8" in result
+    assert "Availability scope: projects" in result
+    assert "Projects: project-a" in result
+
+
 class TestMcpPersistentThreadTools:
     """Tests for MCP server persistent thread tool functions.
 
@@ -616,11 +728,29 @@ class TestMcpPersistentThreadTools:
             permission_mode="supervised",
             project_id=None,
             project_ids=None,
+            datasource_ids=None,
             model=None,
             temperature=None,
         )
         assert "tid-1" in result
         assert "created" in result
+
+    @pytest.mark.asyncio
+    async def test_create_persistent_thread_forwards_explicit_empty_datasources(
+        self, mock_client
+    ):
+        create_persistent_thread = _mcp_server_mod.create_persistent_thread
+        mock_client.create_persistent_thread.return_value = {
+            "thread_id": "tid-2",
+            "status": "created",
+        }
+
+        await create_persistent_thread(datasource_ids=[])
+
+        assert (
+            mock_client.create_persistent_thread.await_args.kwargs["datasource_ids"]
+            == []
+        )
 
     @pytest.mark.asyncio
     async def test_create_persistent_thread_error(self, mock_client):

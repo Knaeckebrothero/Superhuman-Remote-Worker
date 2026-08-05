@@ -167,11 +167,10 @@ class TestProjectCreationProvisioning:
         # the authenticated Gitea URL would leak credentials through the API.
         assert kwargs["connection_url"] is None
         assert kwargs["created_by"] == OWNER_ID
-        db.link_datasource_to_project.assert_awaited_once()
-        assert db.link_datasource_to_project.await_args.args[:2] == (
-            PROJECT_ID,
-            str(DATASOURCE_ID),
-        )
+        assert kwargs["scope_mode"] == "projects"
+        assert kwargs["project_ids"] == [PROJECT_ID]
+        assert kwargs["auto_attach"] is True
+        db.link_datasource_to_project.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_datasource_name_is_unique_per_project(self):
@@ -354,6 +353,7 @@ class TestMarkerDurability:
         db = MagicMock()
         db.update_datasource = AsyncMock(return_value=True)
         db.list_datasource_projects = AsyncMock(return_value=[])
+        db.get_datasource = AsyncMock(return_value=native_kb_row())
         schedule = MagicMock()
 
         with (
@@ -385,6 +385,7 @@ class TestMarkerDurability:
         db = MagicMock()
         db.update_datasource = AsyncMock(return_value=True)
         db.list_datasource_projects = AsyncMock(return_value=[])
+        db.get_datasource = AsyncMock(return_value=native_kb_row())
 
         with (
             patch(
@@ -398,7 +399,7 @@ class TestMarkerDurability:
                 object(), str(DATASOURCE_ID), DatasourceUpdate(name="Renamed")
             )
 
-        assert result == {"status": "updated"}
+        assert str(result["id"]) == str(DATASOURCE_ID)
         assert db.update_datasource.await_args.kwargs["connection_url"] is None
 
 

@@ -24,7 +24,7 @@ import {AgentListComponent} from './views/agents/agent-list.component';
 import {JobListComponent} from './views/jobs/job-list.component';
 import {JobCreateComponent} from './views/create/job-create.component';
 import {StatisticsComponent} from './views/statistics/statistics.component';
-import {DatasourceListComponent} from './views/datasources/datasource-list.component';
+import {DatasourceListLoaderComponent} from './views/datasources/datasource-list-loader.component';
 import {ExpertsListComponent} from './views/experts/experts-list.component';
 import {JobReviewComponent} from './views/job-review/job-review.component';
 import {WorkspaceBrowserComponent} from './views/workspace-browser/workspace-browser.component';
@@ -351,7 +351,7 @@ export class App implements OnInit {
     this.registry.register({
       type: 'datasource-list',
       displayName: 'Connectors',
-      component: DatasourceListComponent,
+      component: DatasourceListLoaderComponent,
     });
 
     this.registry.register({
