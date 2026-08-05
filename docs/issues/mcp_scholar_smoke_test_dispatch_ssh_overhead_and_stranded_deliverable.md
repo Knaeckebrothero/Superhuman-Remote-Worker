@@ -171,7 +171,7 @@ proven from a newly created main-cluster worker after deployment.
 | F18 | The local Scholar retried empty/broken research tools from main calls 37-55, including exact duplicate queries, and consumed 1.63M raw tokens before operator cancellation; the configured 120-tool budget and current warning-only loop detector did not contain it in time | Confirmed local audit | P0 cost / P1 function |
 | F19 | Five fresh main-cluster Scholar jobs automatically provisioned/authenticated, completed, and pushed exact deliverables to isolated job branches; project `main` was unchanged | Confirmed live, 5/5 | P0 recovery passed |
 | F20 | `delegation.enabled=false` still leaves `spawn_subagent` in the bound tool definitions; the two disabled jobs made no calls only because the model obeyed prose | Confirmed live prompt/audit | P1 capability contract |
-| F21 | The generic transition todo says the stop condition comes first while requiring todo 1's review to have completed; two jobs repeated successful Git/file checks for 53 and 62 parent rounds before context compaction broke the attractor | Confirmed live + template | P1 overhead / completion risk |
+| F21 | The generic transition todo says the stop condition comes first while requiring todo 1's review to have completed; two jobs repeated successful Git/file checks for 53 and 62 parent rounds before context compaction broke the attractor | Ordered capability-aware skill closeout implemented 2026-08-05; live acceptance pending | P1 overhead / completion risk |
 | F22 | One-shot skill delivery replaced continuous reinjection, but the passive `verify-before-done` gate rejected 50 completion calls because MiniMax repeatedly retried instead of reading the named skill | Confirmed live audit | P1 overhead; gate remained safe |
 | F23 | Main-cluster Tavily worked under heavy use; the paper job reproduced the arXiv 4 adapter error and Semantic Scholar HTTP 403, then recovered through web/arXiv pages | Source adapter/error semantics fixed; replacement-key request submitted; optional credential acceptance deferred | Resolved for incident |
 | F24 | The connector schema remains stale after the successful batch: no `required_deliverables`, obsolete manual-assignment copy, and incorrect `get_workspace_file` semantics | Confirmed from current connector schema | P1 deployment contract |
@@ -1234,6 +1234,16 @@ completed todos, then review/complete in dependency order. It should not ask the
 model to perform a prerequisite “first” while stating that the prerequisite
 depends on a different pending todo.
 
+The in-tree repair landed on 2026-08-05. Both transition-template variants now
+require an ordered verification todo followed by a close-or-continue todo. The
+first delegates method to the capability-rendered `verify-before-done` skill and
+persists a bounded `PASS:`/`GAPS:` result in todo completion state; the second
+uses that result without rechecking. Git history is optional skill orientation,
+not a todo prerequisite, so the same contract works in virtual and Git-backed
+workspaces. `GAPS` updates the plan and stages a corrective tactical phase;
+`PASS` updates the plan and invokes `job_complete`. No new manifest or separate
+closeout skill was introduced. Focused tests pass; field acceptance remains.
+
 The action-gated verification skill also rejected 50 completion calls across the
 five jobs before the model performed a valid phase-scoped skill read. The gate
 remained safe and was not continuously injected, but the current corrective
@@ -1293,8 +1303,9 @@ should be ordered as follows:
    coverage visible, and keep phase tags immutable/exact.
 3. **Auxiliary/provider quality:** route structured tasks to a compatible model,
    expose auxiliary accounting, and normalize web/PDF ingestion failures.
-4. **Efficiency:** implement the conditional transition fast path and improve
-   passive skill-gate recovery; then tune Scholar/source budgets.
+4. **Efficiency:** deploy and live-prove the implemented ordered transition
+   closeout, then improve passive skill-gate recovery and tune Scholar/source
+   budgets.
 5. **Containment:** add shadow no-progress telemetry using this batch as the
    successful baseline before arming holds or ceilings.
 

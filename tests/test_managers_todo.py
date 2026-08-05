@@ -388,6 +388,19 @@ class TestTodoManagerDisplay:
         result = todo_manager.format_for_display()
         assert "**Completed:** 1/2" in result
 
+    def test_injection_shows_only_latest_completion_handoff(self, todo_manager):
+        """Completion outcomes survive compaction without accumulating per turn."""
+        todo_manager.add("First task")
+        todo_manager.add("Second task")
+        todo_manager.add("Decision task")
+        todo_manager.complete("todo_1", notes=["OLD: superseded result"])
+        todo_manager.complete("todo_2", notes=["PASS: current verified result"])
+
+        result = todo_manager.format_for_injection()
+
+        assert "Outcome: PASS: current verified result" in result
+        assert "OLD: superseded result" not in result
+
     def test_format_high_priority_marker(self, todo_manager):
         """Test that high priority items get marked."""
         todo_manager.add("Urgent task", priority="high")

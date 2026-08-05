@@ -14,6 +14,42 @@ verification is ~1 in 4 of all multi-agent failures — MAST, arXiv 2503.13657.)
 The rule: a completion claim rests on the **fresh output of a check you actually
 ran**, never on your own reading of your own work.
 
+## When this is the final job review
+
+Reconstruct the definition of done from the authoritative request, not from the
+agent's own plan alone:
+
+1. Read `instructions.md` and any runtime-declared required deliverables visible
+   in the job context.
+2. Turn every requested output, constraint, and acceptance criterion into a
+   concrete checklist.
+3. Use `plan.md` only as a tracking aid. If it omitted an original requirement,
+   the requirement still exists.
+4. Reconcile that checklist against the **current final artifacts**, including
+   their substantive content. A filename by itself proves only existence.
+
+{% if has_tool("git_diff") %}
+Git history is optional orientation, not a completion prerequisite. When it
+would help recover what changed, you may use `git_diff` once to locate the
+relevant artifacts. Judge completion from their current state and the original
+requirements. If Git history is unavailable or errors, skip it immediately;
+virtual workspaces can be valid without Git history.
+{% else %}
+No Git-history check is required in this workspace. Verify the current artifacts
+directly; absence of Git history is not a failed deliverable.
+{% endif %}
+
+Finish the review with one concise handoff verdict:
+
+- `PASS: <evidence and any honest verification limitations>` when no material
+  requirement needs more work.
+- `GAPS: <specific missing, incomplete, or incorrect requirements>` when another
+  execution phase is needed.
+
+When the current todo asks for it, save that verdict in `todo_complete`'s
+`completion_note`. This makes the result survive compaction and lets the next
+todo decide whether to close or continue without rerunning unchanged checks.
+
 ## The gate — four steps
 
 **1. Define "done", pick the check.** Write the concrete, observable criteria
@@ -55,8 +91,9 @@ searches.
 
 **2. Run it fresh, once.** Execute each selected check after the last relevant
 change. Independent checks may be called together in one turn. Do not rerun a
-successful check unless the artifact changed afterwards; a newly re-injected copy
-of this skill is not a reason to restart verification.
+successful check unless the verified deliverable or implementation artifact
+changed afterwards; updating tracking metadata such as `plan.md`, or receiving a
+newly re-injected copy of this skill, is not a reason to restart verification.
 
 **3. Reconcile immediately — read the actual output.** On the next decision,
 compare the returned evidence with every criterion before calling another tool.

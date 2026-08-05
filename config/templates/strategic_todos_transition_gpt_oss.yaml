@@ -1,91 +1,42 @@
-# Strategic todos for phase transitions (gpt-oss optimized)
-# Addresses known gpt-oss failure modes: skeleton trap, strategic loops,
-# false confidence, and todo_complete omission. Two todos: review-and-adapt
-# (with content checks), then plan-or-complete. The system already archives
-# every phase boundary automatically — no retrospective deliverable exists.
+# Strategic todos for phase transitions (gpt-oss optimized).
 #
-# IMPORTANT: The PLAN todo (id 2) starts with the stop condition.
-# If all deliverables are done, call job_complete. Do NOT invent new work.
+# Explicit ordering prevents the former "stop condition first" loop. The
+# capability-aware verify-before-done skill owns verification technique; these
+# todos never require Git or a shell because virtual workspaces may expose
+# neither capability.
 todos:
   - id: 1
     content: >-
-      REVIEW AND ADAPT: Check what the previous phase actually produced, then
-      REWRITE plan.md where reality diverged (do NOT append).
+      TODO 1 — VERIFY THE RESULT. Finish this todo before starting todo 2.
 
-      Use git evidence, not memory:
-      (1) Use git_tags to list the phase boundary tags
-          (<job_short_id>-phase-<N>-<type>-complete; each marks the END of that phase).
-      (2) Use git_diff between the two most recent boundary tags to see all file
-          changes (only one tag yet? diff from the "[Phase 0 Seed]" commit in
-          git_log). The completed/not-completed todo record is already in
-          archive/ — written automatically.
-      (3) CONTENT CHECK: read_file every output/ file the phase touched. Does it
-          contain substantive prose, or just headings and placeholders? Is the
-          word count reasonable (a chapter 400+ words, a section 100+)? Any
-          "*Placeholder:*" or "[TODO:" markers left?
+      Read and apply `skills/verify-before-done/SKILL.md`. Verify the current
+      outputs against instructions.md and every runtime-declared required
+      deliverable. Do not update plan.md and do not plan another phase yet.
 
-      Then REWRITE the relevant parts of plan.md in place (one write_file):
-      - Mark completed phases with actual outcomes and content assessment
-        ("Phase 2: output/chapter3.md, 1,847 words of prose" NOT "created").
-      - A phase that produced only skeletons is INCOMPLETE — add a continuation
-        phase for the real content.
-      - Remove phases no longer needed; keep every remaining phase mapped to a
-        deliverable in plan.md's "## Deliverables" section.
+      Invoke todo_complete for todo_1 with the skill's concise verdict and
+      evidence in `completion_note`, beginning with `PASS:` or `GAPS:`.
 
-      COMPLETION CRITERIA: plan.md rewritten (not appended to) with accurate,
-      content-assessed outcomes, backed by git evidence.
-
-      INSTEAD OF: Writing a separate retrospective file — the archive and git
-      history already record the phase. Instead of housekeeping phases
-      (archiving, cleanup, packaging) — the system handles those.
+      COMPLETION CRITERIA: Current evidence was checked against the original
+      requirements and the PASS/GAPS verdict was saved in the completion note.
 
   - id: 2
     content: >-
-      PLAN OR COMPLETE — The stop condition comes FIRST.
+      TODO 2 — CLOSE OR CONTINUE. Start only after todo 1 is complete. Use its
+      recorded PASS/GAPS verdict; NEVER rerun an unchanged successful check.
+      Updating plan.md does not change the verified deliverables.
 
-      === STOP CONDITION (check FIRST) ===
+      GAPS branch: rewrite the relevant part of plan.md once with the verified
+      gaps and required correction, then invoke next_phase_todos for one
+      focused tactical phase that fixes them. Do not create housekeeping,
+      archive, packaging, or status-update work.
 
-      Check plan.md's "## Deliverables" section. Use list_files('output/') and
-      read_file on EACH deliverable to confirm it is genuinely complete:
-      substantive content (not headings or placeholders), appropriate size, no
-      "*Placeholder:*" or "[TODO:" markers, matches instructions.md.
+      PASS branch: rewrite the relevant part of plan.md once to mark the actual
+      phases and deliverables complete, then invoke job_complete with the real
+      deliverable paths and any verification limitations.
 
-      If ALL deliverables pass, call job_complete with:
-      - summary: what was accomplished across all phases
-      - deliverables: list of output file paths
-      - confidence: honest, based on content quality:
-        * 0.8-1.0: all deliverables complete with substantive, verified content
-        * 0.5-0.7: most complete, some gaps or quality concerns
-        * 0.2-0.4: significant gaps, incomplete deliverables
-        * 0.0-0.2: skeleton/placeholder output, major requirements unmet
-      - notes: caveats or areas a reviewer should check
+      Choose exactly one branch. Only after job_complete or next_phase_todos
+      succeeds, invoke todo_complete for todo_2 with a concise
+      `completion_note` describing the chosen branch.
 
-      If ANY deliverable is a skeleton, placeholder, or missing, DO NOT call
-      job_complete — continue below.
-
-      === CONTINUE CONDITION ===
-
-      Call next_phase_todos with the todos for the next tactical phase — enough
-      to cover the remaining work in one phase where possible. Each
-      todo MUST produce substantive content (NEVER "create skeleton" or "add
-      headings"), name exact files, sections, and expected word counts, and be
-      completable in 1-3 tool calls. Include a verification todo that checks
-      CONTENT QUALITY, not just file existence. (The todo-guide skill at
-      skills/todo-guide/SKILL.md covers todo crafting.)
-
-      {% if has_tool("kb_write") -%}
-      If this phase surfaced a durable lesson (a decision, a failed approach and
-      why, a discovered fact), record it with one kb_write before continuing.
-      Skip this when there is nothing durable.
-      {% else -%}
-      If this phase surfaced a durable lesson (a decision, a failed approach and
-      why, a discovered fact), record it in notes/ before continuing. Skip this
-      when there is nothing durable.
-      {%- endif %}
-
-      COMPLETION CRITERIA: Either job_complete called (all deliverables verified
-      substantive) OR next_phase_todos called (work remains).
-
-      INSTEAD OF: Calling job_complete when output files contain only headings.
-      Instead of creating todos for archiving, cleanup, or packaging.
-      Instead of inventing deliverables not in instructions.md.
+      COMPLETION CRITERIA: GAPS created a corrective tactical phase, or PASS
+      completed the job. No verification loop and no invented extra work.
