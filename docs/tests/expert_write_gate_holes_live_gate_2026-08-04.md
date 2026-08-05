@@ -41,9 +41,17 @@ root is `services.…`.
 | 1b | Rows owned by the test user across check 1 | **unchanged** (1 → 1) — no write slipped past a 403 |
 | 2 | Switch ON. Non-admin duplicates a **visible** expert declaring `tools.shell`, holding no `shell_tools` grant | **200**, `dropped: ["shell_tools"]`, a row IS created, and the **stored** config has `tools.shell` removed (`tools` keys: `[]`). *Was 422 + no row under `55080ed0`.* |
 | 3 | **Control:** the same duplicate as the **admin** | **200**, `dropped: []`, and the stored config **keeps** `tools.shell` (`tools` keys: `['shell']`) |
+| 4 | **Fork-as-default** of the real bundled `scholar` as a default-grants non-admin (added 2026-08-05, task 4) | **200**, `dropped: ["shell_tools","delegation"]`; stored config has both removed; the personal default **actually points at the new row**; and `delegation.mode: light` is **preserved** — only `.enabled` was removed |
+
+Check 4 matters more than check 2 despite testing the same mechanism: fork also
+*sets the result as the user's default*, so the stored row governs every future
+worker job rather than one copy. Its last two assertions are the ones a status
+check would miss — that the default really was repointed (the route's entire
+purpose) and that the partial strip held, removing `delegation.enabled` without
+taking `delegation.mode` with it.
 
 Check 1 is the reported defect. Check 2's **stored-config** assertion is the one
-that matters most: a route reporting `dropped` while persisting the original would
+that matters most among the duplicate checks: a route reporting `dropped` while persisting the original would
 be strictly worse than the refusal it replaced — it would mint exactly the
 ungranted row this work exists to prevent, and claim it hadn't. Check 3 is what
 makes check 2 mean anything: without it, check 2 would also pass if stripping fired
