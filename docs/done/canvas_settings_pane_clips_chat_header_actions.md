@@ -1,6 +1,10 @@
 # The canvas/settings pane slides over the chat header's buttons — the header keys its layout off the *viewport*, not off the pane it actually lives in
 
-**Status:** **FIXED + BROWSER-VERIFIED on k3d 2026-08-04 · UNCOMMITTED.** Both halves shipped: the flexbox shrink chain (SCSS) and the measured fold into the existing `⋮` overflow menu (`headerCompact`). Unit tests added for the fold decision; full cockpit suite green (1650 tests); production build clean.
+**Status:** **SHIPPED + PUSHED 2026-08-04 · on develop in `b92f5e68`, deployed to dev from 2026-08-05 (`sha-42a9be2`).** Both halves are in: the flexbox shrink chain (SCSS) and the measured fold into the existing `⋮` overflow menu (`headerCompact`). Browser-verified on k3d 2026-08-04 (§Verification); unit tests cover the fold decision; production build clean. Re-checked 2026-08-05 — the header rules survived `aec2e5da` untouched and the cockpit suite is green at 1737 tests.
+
+**Filed under `done/` because the WORK shipped.** The one loose end is not a defect: `HEADER_LEFT_RESERVE_PX = 380` is *tuned by measurement against the current header chrome*, not derived from it. If the left group ever gains another permanent element, re-measure — see §Verification "Not covered here".
+
+**Caveat on the commit:** `b92f5e68` is a `feat(cloud)` commit that swept this fix up with unrelated cloud-export work — it was authored by a concurrent session running `git add -A` over a shared tree. Nothing was lost, but `git log` for this fix reads misleadingly; search by `shouldFoldHeaderActions`, not by commit subject.
 **Found:** 2026-08-04, user-reported with two screenshots — the same session at two split positions, `Disconnect` clipped mid-word in one and three more buttons gone in the other.
 **Severity:** **Medium.** Not cosmetic: the clipped controls are *unreachable*, and one of them is `Disconnect`. There was no scrollbar, no ellipsis, no overflow menu — the buttons rendered outside the pane and the split area's `overflow: hidden` ate them, so the UI gave no hint anything was missing.
 **Component:** cockpit `PersistentChatComponent` (`cockpit/src/app/views/persistent-chat/persistent-chat.component.ts` header block + `.scss` `.chat-header`) · lives inside `ChatPageComponent`'s `as-split` (`cockpit/src/app/views/chat/chat-page.component.ts:48`)
