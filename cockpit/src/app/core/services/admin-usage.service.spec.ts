@@ -1,7 +1,7 @@
 import {describe, expect, it, vi} from 'vitest';
 import {Injector, runInInjectionContext} from '@angular/core';
 import {HttpClient} from '@angular/common/http';
-import {of, throwError} from 'rxjs';
+import {of, Subject, throwError} from 'rxjs';
 import {AdminUsageService} from './admin-usage.service';
 import {VIEW_AS_OVERRIDE} from '../interceptors/view-as.interceptor';
 
@@ -48,6 +48,59 @@ describe('AdminUsageService', () => {
       available: false,
     });
     expect(service.loading()).toBe(false);
+  });
+
+  it('loads the decimal-safe v2 row contract without changing legacy state', () => {
+    const payload = {
+      schema_version: 2,
+      window: {start: 'a', end: 'b', as_of: 'b', data_through: 'b'},
+      rows: [{
+        category: 'compute', measurement_basis: 'scheduler-request',
+        cost_domain: 'workload-allocation', resource_class: 'kubernetes-pod',
+        measurement_algorithm: 'fixture-v1', resource: 'workspace_pod',
+        unit: 'vcpu-hour', attribution_scope: 'customer', quantity: '8',
+        finalized_quantity: '8', confirmed_provisional_quantity: '0',
+        unverified_projected_quantity: null,
+        ledger_cost: {status: 'unpriced', currency: 'USD', amount: null,
+          priced_quantity: '0', unpriced_quantity: '8'}, events: 1,
+      }],
+      coverage: {status: 'partial', includes_provisional: false,
+        required_sources_ok: 0, required_sources_total: 0,
+        unknown_ranges: [], excluded_domains: ['live-resource-inventory']},
+    } as const;
+    const http = {get: vi.fn().mockReturnValue(of(payload))};
+    const service = createService(http);
+
+    service.loadUsageV2(7, 'all', true);
+
+    const [url, options] = http.get.mock.calls[0];
+    expect(url).toContain('/usage/v2');
+    expect(options.params.get('days')).toBe('7');
+    expect(options.params.get('include_non_customer')).toBe('true');
+    expect(options.context.get(VIEW_AS_OVERRIDE)).toBe('all');
+    expect(service.usageV2()?.rows[0].quantity).toBe('8');
+    expect(service.usage()).toBeNull();
+  });
+
+  it('clears stale v2 data and ignores an older window response', () => {
+    const older = new Subject<any>();
+    const newer = new Subject<any>();
+    const http = {get: vi.fn().mockReturnValueOnce(older).mockReturnValueOnce(newer)};
+    const service = createService(http);
+    const payload = (quantity: string) => ({
+      schema_version: 2,
+      window: {start: 'a', end: 'b', as_of: 'b', data_through: null},
+      rows: [{quantity}],
+      coverage: {status: 'partial'},
+    });
+
+    service.loadUsageV2(7);
+    service.loadUsageV2(30);
+    expect(service.usageV2()).toBeNull();
+
+    newer.next(payload('30'));
+    older.next(payload('7'));
+    expect(service.usageV2()?.rows[0].quantity).toBe('30');
   });
 
   it('passes the requested window as the days query param', () => {

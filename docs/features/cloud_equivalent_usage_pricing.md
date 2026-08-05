@@ -29,12 +29,12 @@ AWS, Azure, or STACKIT invoice.
 - Show source, region, pricing model, and exclusions in the UI. The label is
   **Cloud-equivalent estimate**, never **bill** or **actual cost**.
 
-## Rate-card formulas
+## Legacy v1 rate-card approximations
 
 Rate cards contain effective-dated components keyed by usage category, resource,
 and unit. A specific resource wins over the `*` fallback, like `usage_rates`.
 
-### Linear resource pricing
+### Linear resource approximation
 
 AWS ECS Fargate and Azure Container Instances publish independent vCPU-hour and
 GiB-hour prices. Their estimate is:
@@ -42,6 +42,9 @@ GiB-hour prices. Their estimate is:
 ```text
 sum(quantity[unit] / capacity_per_billing_unit * rate[unit])
 ```
+
+This v1 calculation is linear over aggregate quantities; it does not yet model
+provider-supported shapes, task/group minimums, or rounding.
 
 ### Bundled reference instance
 
@@ -58,6 +61,10 @@ This is a node-share indicator. Aggregating a whole window loses concurrency and
 bin-packing information, so it is not a promise that the workload fits into that
 exact number of nodes.
 
+It is also distinct from the future concurrency change-point calculator: the v1
+card takes one `max` over whole-window aggregate CPU/RAM hours, while the hardened
+calculator integrates concurrent requested capacity slices.
+
 ## Initial cards and refresh
 
 - STACKIT SKE / g2i.4, EU01, EUR. Seeded from the current official STACKIT
@@ -71,6 +78,9 @@ exact number of nodes.
 
 Refresh is change-only and non-load-bearing. A failed provider request retains
 the newest stored rate and cannot prevent orchestrator startup or usage reads.
+The current effective dates are not a complete versioned historical catalog;
+the result is a current-list planning scenario unless the source/version coverage
+explicitly proves otherwise.
 
 ## As built
 
@@ -83,6 +93,26 @@ the newest stored rate and cannot prevent orchestrator startup or usage reads.
 - Cockpit Admin → Usage & Cost renders the cards with currency, components,
   formula, exclusions, and a link to the provider source.
 
+## Boundary of the current implementation
+
+The implemented `sum` / `max` cards are v1 planning indicators for the existing
+aggregate workspace quantities. In particular:
+
+- the aggregate STACKIT dominant-share card is a theoretical fractional lower
+  bound only with complete eligible workload coverage; otherwise it is a modeled
+  reference, never an exact VM, SKE node, or bin-packing bill;
+- the Fargate and ACI cards do not yet apply supported shapes, per-resource
+  minimum duration, or container-group rounding; and
+- aggregate rows no longer contain enough lifecycle identity to apply a
+  per-Pod, per-VM, or per-disk minimum/tier exactly.
+
+Do not add VM, PVC, PV, agent, or platform rows to these wildcard cards. The
+implementation-ready successor design in
+[`infrastructure_resource_metering.md`](infrastructure_resource_metering.md)
+adds typed resource classes, half-open periods, retained lifecycle identity,
+price provenance, estimate quality, and code-versioned provider calculators.
+Those changes must land before cards claim coverage of the new resource types.
+
 ## Exclusions and follow-ups
 
 The initial estimate covers only quantities currently present in the ledger:
@@ -90,13 +120,20 @@ workspace pod CPU and RAM. It excludes control planes, continuously running
 agent/orchestrator pods, VM workspaces, persistent disks, load balancers, public
 IP addresses, egress, tax, discounts, minimum billing increments, and provider
 free tiers. Those costs should be added only after the corresponding resource is
-metered or explicitly modelled as shared platform overhead.
+metered in its proper workload/asset domain or explicitly modeled as separate
+idle/overhead cost.
 
 Useful follow-ups:
 
-1. Add `gib-month` PVC allocation events and provider storage rate components.
+1. Add separate PVC-requested `gib-hour`/`claim-hour` and PV-provisioned
+   `gib-hour`/`volume-hour` events plus typed storage rate components; derive
+   GiB-month only as a display normalization.
 2. Meter persistent agent and VM workspace intervals.
 3. Add an admin rate-card editor and optional homelab amortization/power card.
 4. Add a separate shared-platform baseline view for control plane and always-on
    infrastructure. Do not smear that baseline across users without an explicit
    allocation policy.
+
+These resource-coverage follow-ups, together with live-interval and utilization
+semantics, are now designed in
+[`infrastructure_resource_metering.md`](infrastructure_resource_metering.md).

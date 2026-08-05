@@ -45,7 +45,12 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import asyncpg
 
-from services.usage_ledger import UsageLedger, _uuid, cache_hit_ratio_from_rows
+from services.usage_ledger import (
+    V1_USAGE_COMPAT_PREDICATE,
+    UsageLedger,
+    _uuid,
+    cache_hit_ratio_from_rows,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -481,7 +486,7 @@ class UsageRollup:
     ) -> List[Dict[str, Any]]:
         """(category, unit) sums from usage_daily — visibility mirrors
         UsageLedger.query_usage (self OR visible-project for a non-admin)."""
-        clauses = ["day >= $1", "day <= $2"]
+        clauses = ["day >= $1", "day <= $2", V1_USAGE_COMPAT_PREDICATE]
         params: List[Any] = [days[0], days[1]]
         if owner_user_id is not None:
             params.append(_uuid(owner_user_id))
@@ -492,7 +497,7 @@ class UsageRollup:
                 clauses.append(f"({own} OR project_id = ANY(${len(params)}::uuid[]))")
             else:
                 clauses.append(own)
-        elif scope_project_id is not None:
+        if scope_project_id is not None:
             params.append(_uuid(scope_project_id))
             clauses.append(f"project_id = ${len(params)}")
         sql = (
@@ -523,12 +528,19 @@ class UsageRollup:
         """(key, unit) sums — strict self-scope for a non-admin, NULL keys excluded
         (mirrors UsageLedger.query_grouped)."""
         col = _GROUP_COLS[group_by]
-        clauses = ["day >= $1", "day <= $2", f"{col} IS NOT NULL"]
+        clauses = [
+            "day >= $1",
+            "day <= $2",
+            f"{col} IS NOT NULL",
+            V1_USAGE_COMPAT_PREDICATE,
+        ]
+        if group_by == "model":
+            clauses.append("category = 'llm'")
         params: List[Any] = [days[0], days[1]]
         if owner_user_id is not None:
             params.append(_uuid(owner_user_id))
             clauses.append(f"user_id = ${len(params)}")
-        elif scope_project_id is not None:
+        if scope_project_id is not None:
             params.append(_uuid(scope_project_id))
             clauses.append(f"project_id = ${len(params)}")
         sql = (
@@ -558,12 +570,19 @@ class UsageRollup:
         """(day, key) buckets — tokens = prompt+cached+completion, mirrors
         UsageLedger.query_timeseries (already day-granular in usage_daily)."""
         col = _GROUP_COLS[group_by]
-        clauses = ["day >= $1", "day <= $2", f"{col} IS NOT NULL"]
+        clauses = [
+            "day >= $1",
+            "day <= $2",
+            f"{col} IS NOT NULL",
+            V1_USAGE_COMPAT_PREDICATE,
+        ]
+        if group_by == "model":
+            clauses.append("category = 'llm'")
         params: List[Any] = [days[0], days[1]]
         if owner_user_id is not None:
             params.append(_uuid(owner_user_id))
             clauses.append(f"user_id = ${len(params)}")
-        elif scope_project_id is not None:
+        if scope_project_id is not None:
             params.append(_uuid(scope_project_id))
             clauses.append(f"project_id = ${len(params)}")
         sql = (

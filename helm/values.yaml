@@ -202,6 +202,21 @@ orchestrator:
     minAvailable: 1
 
 # =============================================================================
+# Infrastructure allocation metering
+# =============================================================================
+# Slice 0 dark-launch controls. Every switch is independent and defaults off;
+# later slices add collector/RBAC/publication implementations behind these same
+# gates. See docs/features/infrastructure_resource_metering.md.
+infrastructureMetering:
+  v2ReadsEnabled: false
+  collectorEnabled: false
+  shadowEnabled: false
+  publicationEnabled: false
+  # Stable operator-owned installation identity. Required before publication;
+  # it must survive endpoint and credential rotation.
+  stableClusterId: ""
+
+# =============================================================================
 # Agent
 # =============================================================================
 agent:

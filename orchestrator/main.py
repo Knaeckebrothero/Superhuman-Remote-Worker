@@ -199,6 +199,17 @@ from services.cloud_pricing import (  # noqa: E402
     CloudCostEstimator,
     cloud_pricing_sync_loop,
 )
+from services.infrastructure_metering import (  # noqa: E402
+    InfrastructureMeteringSettings,
+    TypedUsageDailyRollup,
+    UsageSummaryV2,
+    UsageV2QueryService,
+    probe_schema_capabilities,
+    typed_usage_rollup_loop,
+)
+from services.infrastructure_metering.queries import (  # noqa: E402
+    visibility_from_kwargs as _usage_v2_visibility,
+)
 from services.openrouter_pricing import llm_pricing_sync_loop  # noqa: E402
 from services.remote_image import (  # noqa: E402
     MAX_REMOTE_IMAGE_URL_CHARS,
@@ -206,6 +217,7 @@ from services.remote_image import (  # noqa: E402
     fetch_remote_image,
 )
 from services.audit_partitions import (  # noqa: E402
+    ensure_partitions as ensure_audit_partitions,
     maintenance_loop as audit_maintenance_loop,
 )
 from services import workspace_metering  # noqa: E402
@@ -439,6 +451,11 @@ usage_rollup: UsageRollup | None = None
 # quantities at read time. They never overwrite the canonical cost snapshotted
 # on usage_events. None only until app migrations/pool initialization completes.
 usage_cloud_estimator: CloudCostEstimator | None = None
+# Slice 0 infrastructure-metering foundations. All gates default off; the typed
+# v2 reader additionally requires its runtime schema capability probe to pass.
+infrastructure_metering_settings = InfrastructureMeteringSettings()
+infrastructure_usage_v2: UsageV2QueryService | None = None
+infrastructure_usage_rollup: TypedUsageDailyRollup | None = None
 
 
 async def _workspace_metering_attribution(
@@ -8209,6 +8226,77 @@ async def lifespan(app: FastAPI):
     global usage_cloud_estimator
     usage_cloud_estimator = CloudCostEstimator(postgres_db.pool)
 
+    # Infrastructure metering Slice 0 is a dark launch: schemas and typed reads
+    # may be exercised independently, but no collector or publication task is
+    # started here. Both DBs are probed after migrations because app/audit
+    # migration order must never be inferred from one process's startup order.
+    # Heal the rolling current+2 partition window before the one-shot probe. If
+    # a pod first restarts after a UTC month boundary, waiting for the later
+    # maintenance task would otherwise freeze Slice 0 unavailable until another
+    # restart even though maintenance successfully creates the missing leaf.
+    if audit_db is not None and audit_ready:
+        try:
+            await ensure_audit_partitions(audit_db.pool)
+        except Exception:
+            logger.warning(
+                "Audit partition preflight failed; infrastructure metering "
+                "capability probing will remain fail-closed",
+                exc_info=True,
+            )
+    global infrastructure_metering_settings, infrastructure_usage_v2
+    global infrastructure_usage_rollup
+    infrastructure_metering_settings = InfrastructureMeteringSettings.from_env()
+    metering_capabilities = await probe_schema_capabilities(
+        postgres_db.pool,
+        audit_db.pool if (audit_db is not None and audit_ready) else None,
+    )
+    infrastructure_usage_v2 = UsageV2QueryService(
+        audit_db.pool if (audit_db is not None and audit_ready) else None,
+        metering_capabilities,
+    )
+    infrastructure_usage_rollup = (
+        TypedUsageDailyRollup(
+            audit_db.pool if (audit_db is not None and audit_ready) else None,
+            postgres_db.pool,
+        )
+        if metering_capabilities.slice0_ready
+        else None
+    )
+    if infrastructure_metering_settings.v2_reads_enabled:
+        if not metering_capabilities.slice0_ready:
+            logger.error(
+                "Infrastructure metering v2 reads requested but schema "
+                "capabilities are incomplete: %s",
+                metering_capabilities.diagnostics(),
+            )
+        elif infrastructure_usage_rollup is not None:
+            try:
+                bootstrap = await infrastructure_usage_rollup.bootstrap_state()
+                if bootstrap.read_ready:
+                    logger.info("Infrastructure metering v2 reads enabled (Slice 0)")
+                else:
+                    logger.warning(
+                        "Infrastructure metering v2 reads requested but "
+                        "bootstrap is %s; route remains unavailable",
+                        bootstrap.status.value,
+                    )
+            except Exception:
+                logger.warning(
+                    "Infrastructure metering v2 bootstrap readiness probe failed; "
+                    "route remains unavailable",
+                    exc_info=True,
+                )
+    if infrastructure_metering_settings.collector_enabled:
+        logger.warning(
+            "Infrastructure metering collector gate is set, but collection "
+            "does not start until Slice 1"
+        )
+    if infrastructure_metering_settings.publication_enabled:
+        logger.warning(
+            "Infrastructure metering publication gate is set, but Slice 0 "
+            "contains no publication path"
+        )
+
     # Encrypt any legacy plaintext datasource credentials. Idempotent — once
     # all rows are v1 ciphertexts this is a fast no-op. Lives in lifespan
     # (not init.py) because init.py is not reliably invoked at deploy time, and
@@ -8653,6 +8741,20 @@ async def lifespan(app: FastAPI):
         run_when_leader(lambda se: usage_rollup_loop(se, usage_rollup), _shutdown_event)
     )
 
+    # Typed v2 bootstrap/dirty-day reconciliation is also leader-owned and
+    # non-load-bearing. It runs while the public read gate is off so operators
+    # can enable v2 only after the durable bootstrap state reports complete.
+    infrastructure_usage_rollup_task = (
+        asyncio.create_task(
+            run_when_leader(
+                lambda se: typed_usage_rollup_loop(se, infrastructure_usage_rollup),
+                _shutdown_event,
+            )
+        )
+        if infrastructure_usage_rollup is not None
+        else None
+    )
+
     # Audit-store partition maintenance (creation + ANALYZE + lookahead alarms;
     # retention deferred — see services/audit_partitions.py). Only when the
     # audit DB is configured; otherwise the store is inactive and there is
@@ -8756,6 +8858,8 @@ async def lifespan(app: FastAPI):
     await workspace_metering_task
     await llm_usage_task
     await usage_rollup_task
+    if infrastructure_usage_rollup_task is not None:
+        await infrastructure_usage_rollup_task
     if audit_maintenance_task is not None:
         await audit_maintenance_task
 
@@ -20306,6 +20410,90 @@ def _build_timeseries(
         s["events"] += r["events"]
     ordered = sorted(series.values(), key=lambda s: s["events"], reverse=True)
     return {"days": days, "series": ordered}
+
+
+@app.get("/api/usage/v2", response_model=UsageSummaryV2)
+async def get_usage_v2(
+    request: Request,
+    days: int = Query(default=30, ge=1, le=365),
+    from_date: str | None = Query(
+        default=None, description="ISO date/datetime (UTC); overrides `days`"
+    ),
+    to_date: str | None = Query(
+        default=None, description="ISO date/datetime (UTC), exclusive"
+    ),
+    ref_id: str | None = Query(default=None, description="Filter to one job/thread id"),
+    include_non_customer: bool = Query(
+        default=False,
+        description="Fleet admins only: include shared-platform and unknown rows",
+    ),
+) -> UsageSummaryV2:
+    """Dimensionally typed usage summary (dark-launched Slice 0 contract).
+
+    The route reads finalized legacy/v2 ledger rows with Decimal-safe string
+    quantities. Live interval tails remain absent and coverage stays explicitly
+    partial until Slice 1's collectors pass their shadow gates.
+    """
+    if not infrastructure_metering_settings.v2_reads_enabled:
+        raise HTTPException(status_code=404, detail="Usage API v2 is not enabled")
+    user = await require_approved_user(request, postgres_db)
+    fleet_admin = bool(user.get("is_admin")) and mcp_scope_project_id(user) is None
+    if include_non_customer and not fleet_admin:
+        raise HTTPException(status_code=403, detail="Fleet admin access required")
+    if ref_id is not None:
+        try:
+            UUID(ref_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="invalid ref_id") from exc
+        if not await user_can_access_job_or_thread(user, postgres_db, ref_id):
+            # Do not turn a guessed ledger reference into a presence oracle.
+            raise HTTPException(status_code=404, detail="Usage reference not found")
+    if infrastructure_usage_v2 is None or not infrastructure_usage_v2.is_available:
+        raise HTTPException(status_code=503, detail="Usage API v2 schema unavailable")
+    if infrastructure_usage_rollup is None:
+        raise HTTPException(
+            status_code=503, detail="Usage API v2 bootstrap unavailable"
+        )
+    try:
+        bootstrap = await infrastructure_usage_rollup.bootstrap_state()
+    except Exception as exc:
+        logger.warning("Usage API v2 bootstrap readiness check failed", exc_info=True)
+        raise HTTPException(
+            status_code=503, detail="Usage API v2 bootstrap unavailable"
+        ) from exc
+    if not bootstrap.read_ready:
+        raise HTTPException(status_code=503, detail="Usage API v2 bootstrap incomplete")
+    now = datetime.now(timezone.utc)
+    try:
+        to_ts = _parse_utc_date(to_date) if to_date else now
+        from_ts = (
+            _parse_utc_date(from_date) if from_date else (to_ts - timedelta(days=days))
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"invalid date: {exc}") from exc
+    if to_ts <= from_ts:
+        raise HTTPException(
+            status_code=400, detail="usage window end must be after its start"
+        )
+    try:
+        visibility = _usage_v2_visibility(
+            await _visibility_kwargs_for_stats(user),
+            include_non_customer=include_non_customer,
+        )
+        return await infrastructure_usage_v2.summary(
+            from_ts=from_ts,
+            to_ts=to_ts,
+            visibility=visibility,
+            ref_id=ref_id,
+            as_of=now,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Usage API v2 query failed")
+        raise HTTPException(
+            status_code=500, detail="Usage API v2 query failed"
+        ) from exc
 
 
 @app.get("/api/usage")

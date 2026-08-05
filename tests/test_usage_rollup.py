@@ -189,6 +189,30 @@ _SEED = [
         "0.003",
         "s4",
     ),
+    # Existing pre-v2 point-event categories must survive the compatibility
+    # filter when typed infrastructure classes begin sharing the ledger.
+    (
+        datetime(2026, 2, 10, 13, tzinfo=UTC),
+        UA,
+        PP,
+        "tts",
+        "voice-a",
+        120,
+        "tts-character",
+        "0.002",
+        "speech-tts",
+    ),
+    (
+        datetime(2026, 2, 10, 14, tzinfo=UTC),
+        UA,
+        PP,
+        "stt",
+        "transcriber-a",
+        1,
+        "stt-request",
+        "0.003",
+        "speech-stt",
+    ),
     (
         datetime(2026, 3, 14, 10, tzinfo=UTC),
         UA,
@@ -502,6 +526,8 @@ class TestServingEquivalence:
         assert _norm(rolled["by_category"]) == _norm(raw["by_category"])
         assert round(rolled["total_cost_usd"], 6) == round(raw["total_cost_usd"], 6)
         assert round(rolled["cache_hit_ratio"], 6) == round(raw["cache_hit_ratio"], 6)
+        categories = {row["category"] for row in rolled["by_category"]}
+        assert {"llm", "tts", "stt", "compute"} <= categories
 
     async def test_usage_midday_window_low_partial_matches_raw(self, db):
         # from 01-20 14:00 excludes s1 (10:00) but includes s2 (15:00): the low

@@ -714,7 +714,16 @@
     "usage": {
       "cacheHit": "Cache hit",
       "cachedTokens": "Cached tok.",
-      "pageDescCloud": "LLM tokens and workspace compute, metered from the usage ledger and scoped to your visibility. Canonical cost uses the rates captured by the ledger; the cloud cards reprice compute for planning without changing that history.",
+      "vcpuHours": "vCPU-hours",
+      "memoryGibHours": "Memory GiB-hours",
+      "claimGibHours": "Claim GiB-hours",
+      "claimHours": "Claim-hours",
+      "volumeGibHours": "Volume GiB-hours",
+      "volumeHours": "Volume-hours",
+      "vcpuHoursShort": "vCPU-h",
+      "memoryGibHoursShort": "Memory GiB-h",
+      "memoryBreakdownUnavailable": "Memory is unavailable in this legacy breakdown because GiB-hours are not separated by category.",
+      "pageDescCloud": "LLM tokens and workspace CPU and memory allocations, metered from the usage ledger and scoped to your visibility. CPU and memory remain separate quantities. Canonical cost uses the rates captured by the ledger; the cloud cards reprice compute for planning without changing that history.",
       "cloudEstimate": {
         "title": "Cloud-equivalent estimate",
         "subtitle": "Current public list prices applied to this window's requested workspace CPU and RAM. These are planning indicators, not invoices.",
