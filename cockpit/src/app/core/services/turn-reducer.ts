@@ -48,6 +48,7 @@ export type ReducerAction =
         content: string;
         timestamp: number;
     }
+    | { type: 'reattach_turn'; turnId: string; timestamp: number }
     | { type: 'turn_started'; turnId: string; startedAt: number; model?: string }
     | { type: 'turn_completed'; turnId: string; finishedAt: number }
     | { type: 'turn_interrupted'; turnId: string; finishedAt: number }
@@ -192,6 +193,9 @@ export function reduce(state: ConversationState, action: ReducerAction): Convers
                 ],
             };
 
+        case 'reattach_turn':
+            return reattachTurn(state, action.turnId, action.timestamp);
+
         case 'turn_started': {
             // Defensive: if a prior turn is still marked active (e.g. its
             // `turn.completed` event was lost), close it before opening the
@@ -210,12 +214,60 @@ export function reduce(state: ConversationState, action: ReducerAction): Convers
                 });
             }
 
+            // A no-cursor cold attach replays the current turn from its
+            // turn.started frame. REST may already have painted an
+            // incrementally persisted prefix under a message UUID; rebuild
+            // that same logical turn in place from the full replay instead of
+            // appending a duplicate live bubble (and duplicating its text).
+            const turnNumber = numericTurnNumber(action.turnId);
+            const historicalIndex =
+                turnNumber === undefined
+                    ? -1
+                    : turns.findIndex(
+                          (t) =>
+                              t.kind === 'assistant' &&
+                              t.id !== action.turnId &&
+                              t.historical === true &&
+                              t.turnNumber === turnNumber,
+                      );
+            if (historicalIndex >= 0) {
+                const historical = turns[historicalIndex] as AssistantTurn;
+                const rebuilt: AssistantTurn = {
+                    ...historical,
+                    id: action.turnId,
+                    events: [],
+                    status: 'streaming',
+                    turnNumber,
+                    model: action.model ?? historical.model,
+                    startedAt: Math.min(historical.startedAt, action.startedAt),
+                    finishedAt: undefined,
+                };
+                return {
+                    ...state,
+                    turns: replaceAt(turns, historicalIndex, rebuilt),
+                    activeAssistantTurnId: action.turnId,
+                };
+            }
+
             // Idempotent: replayed turn_started just re-activates the existing turn.
             const existing = turns.find(
                 (t): t is AssistantTurn => t.kind === 'assistant' && t.id === action.turnId,
             );
             if (existing) {
-                return {...state, turns, activeAssistantTurnId: action.turnId};
+                return {
+                    ...state,
+                    turns: turns.map((turn) =>
+                        turn === existing
+                            ? {
+                                  ...existing,
+                                  status: 'streaming',
+                                  finishedAt: undefined,
+                                  model: action.model ?? existing.model,
+                              }
+                            : turn,
+                    ),
+                    activeAssistantTurnId: action.turnId,
+                };
             }
 
             const newTurn: AssistantTurn = {
@@ -223,6 +275,7 @@ export function reduce(state: ConversationState, action: ReducerAction): Convers
                 id: action.turnId,
                 events: [],
                 status: 'streaming',
+                turnNumber: numericTurnNumber(action.turnId),
                 model: action.model,
                 startedAt: action.startedAt,
             };
@@ -421,6 +474,158 @@ export function reduce(state: ConversationState, action: ReducerAction): Convers
             return state;
         }
     }
+}
+
+/**
+ * Reconcile a cold browser reattach with the agent's authoritative in-flight
+ * turn. Incremental message persistence means REST history can already contain
+ * the first half of that turn, keyed by its first message UUID and marked
+ * historical/done. Cursor replay then continues after the browser's cached
+ * event id, often into a synthetic `recovered:` turn because `turn.started`
+ * was seen before the refresh.
+ *
+ * The welcome frame supplies the missing join key (`turn_id`). Prefer the
+ * historical turn with that logical number as the visual anchor, fold any live
+ * or recovered suffix into it, and promote the result to the real live id. One
+ * logical turn therefore remains one streaming bubble; it cannot acquire a
+ * mid-turn history divider or a premature read-aloud control.
+ */
+function reattachTurn(
+    state: ConversationState,
+    turnId: string,
+    timestamp: number,
+): ConversationState {
+    const turnNumber = numericTurnNumber(turnId);
+    const historicalIndex =
+        turnNumber === undefined
+            ? -1
+            : state.turns.findIndex(
+                  (t) =>
+                      t.kind === 'assistant' &&
+                      t.historical === true &&
+                      t.turnNumber === turnNumber,
+              );
+    const exactIndex = state.turns.findIndex(
+        (t) => t.kind === 'assistant' && t.id === turnId,
+    );
+    if (exactIndex >= 0) {
+        const exact = state.turns[exactIndex] as AssistantTurn;
+        // The welcome frame and replay stream use separate transports. If the
+        // terminal replay won that race, it is newer than a welcome snapshot
+        // that still said "in flight"; never reopen it.
+        if (
+            state.activeAssistantTurnId !== turnId &&
+            (exact.status === 'done' || exact.status === 'error')
+        ) {
+            return state;
+        }
+    }
+    const activeIndex = state.activeAssistantTurnId
+        ? state.turns.findIndex(
+              (t) =>
+                  t.kind === 'assistant' &&
+                  t.id === state.activeAssistantTurnId &&
+                  t.recovered === true,
+          )
+        : -1;
+
+    // The history prefix is the stable visual anchor. Otherwise reuse the
+    // real live turn, then the recovered suffix, before creating an empty turn.
+    const anchorIndex =
+        historicalIndex >= 0
+            ? historicalIndex
+            : exactIndex >= 0
+              ? exactIndex
+              : activeIndex;
+    if (anchorIndex < 0) {
+        const turn: AssistantTurn = {
+            kind: 'assistant',
+            id: turnId,
+            events: [],
+            status: 'streaming',
+            turnNumber,
+            startedAt: timestamp,
+        };
+        return {
+            ...state,
+            turns: [...state.turns, turn],
+            activeAssistantTurnId: turnId,
+        };
+    }
+
+    const sourceIndices = [exactIndex, activeIndex]
+        .filter((index, position, all) =>
+            index >= 0 && index !== anchorIndex && all.indexOf(index) === position,
+        )
+        .sort((a, b) => a - b);
+    const anchor = state.turns[anchorIndex] as AssistantTurn;
+    let events = anchor.events;
+    let model = anchor.model;
+    let startedAt = anchor.startedAt;
+    for (const index of sourceIndices) {
+        const source = state.turns[index] as AssistantTurn;
+        events = mergeReattachedEvents(events, source.events);
+        model = source.model ?? model;
+        startedAt = Math.min(startedAt, source.startedAt);
+    }
+
+    const reconciled: AssistantTurn = {
+        ...anchor,
+        id: turnId,
+        events,
+        status: 'streaming',
+        turnNumber: turnNumber ?? anchor.turnNumber,
+        model,
+        startedAt,
+        finishedAt: undefined,
+        recovered: undefined,
+    };
+    const removed = new Set(sourceIndices);
+    return {
+        ...state,
+        turns: state.turns
+            .map((turn, index) => (index === anchorIndex ? reconciled : turn))
+            .filter((_turn, index) => !removed.has(index)),
+        activeAssistantTurnId: turnId,
+    };
+}
+
+function numericTurnNumber(turnId: string): number | undefined {
+    if (!turnId.trim()) return undefined;
+    const value = Number(turnId);
+    return Number.isSafeInteger(value) && value >= 0 ? value : undefined;
+}
+
+/** Merge id-bearing replay events without duplicating an already-rendered
+ * historical tool/thought/compaction. Text frames are deltas with no message
+ * id, so they remain ordered append-only. */
+function mergeReattachedEvents(base: TurnEvent[], suffix: TurnEvent[]): TurnEvent[] {
+    const merged = [...base];
+    for (const event of suffix) {
+        const existingIndex = merged.findIndex((candidate) => {
+            if (candidate.kind !== event.kind) return false;
+            if (event.kind === 'thought') {
+                return !!event.messageId &&
+                    candidate.kind === 'thought' &&
+                    candidate.messageId === event.messageId;
+            }
+            if (event.kind === 'text') return false;
+            return candidate.id === event.id;
+        });
+        if (existingIndex < 0) {
+            merged.push(event);
+            continue;
+        }
+        const existing = merged[existingIndex];
+        if (existing.kind === 'thought' && event.kind === 'thought') {
+            merged[existingIndex] = existing.content.includes(event.content)
+                ? existing
+                : {...event, content: existing.content + event.content};
+        } else {
+            merged[existingIndex] = {...existing, ...event} as TurnEvent;
+        }
+    }
+    return merged;
 }
 
 // ---------------------------------------------------------------------------

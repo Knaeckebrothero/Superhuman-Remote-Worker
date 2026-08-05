@@ -5,6 +5,29 @@
 **Component:** `cockpit/src/app/core/services/persistent-chat.service.ts`, `cockpit/src/app/core/services/turn-reducer.ts`
 **Severity:** Medium-high — every mid-turn page refresh or `connect()` re-run silently wiped the in-flight assistant turn from the UI, even though the agent was still streaming.
 
+## 2026-08-05 follow-up — persisted prefix split at the reattach seam
+
+Message-granular persistence later changed the cold-refresh shape: REST history
+could now paint the durable prefix of the current turn, but `historyToTurns`
+necessarily marked it historical/done while cursor replay continued the suffix
+as a second live/recovered bubble. That put a `SESSION RESUMED` divider and a
+premature read-aloud button *inside one logical assistant turn*.
+
+The reattach welcome frame now carries the agent's authoritative
+`turn_in_flight` alongside `turn_count`. Historical assistant turns retain their
+logical `turnNumber`, and Cockpit's `reattach_turn` reducer action joins the
+matching historical prefix with any live/recovered suffix, promotes it to the
+real live id, and reopens it as streaming. The turn therefore stays one bubble;
+the divider can only land after it, and read-aloud appears only once the real
+`turn.completed` closes it.
+
+A fresh client with no cursor takes the complementary path: its replay includes
+the current `turn.started`, so the reducer rebuilds the matching historical
+prefix in place from that full replay rather than concatenating two copies. The
+welcome signal uses a transcript-lifecycle flag (start → completed/error), not
+the broader teardown-safety `_turn_in_flight()` value, which remains true during
+post-turn persistence and Git callbacks.
+
 ## Resolution
 
 Approach 1 (primary) and Approach 2 (defense-in-depth) both shipped.

@@ -3665,6 +3665,77 @@ class TestHandlePersistentWebsocketReadiness:
         assert connected.is_set()
         ws.close.assert_awaited_once_with(code=4503, reason="Agent not ready")
 
+    @pytest.mark.asyncio
+    async def test_welcome_frame_reports_authoritative_in_flight_turn(self):
+        """A cold Cockpit reattach needs this join signal to merge the
+        incrementally persisted history prefix with the cursor-replayed suffix.
+        """
+        from fastapi import WebSocketDisconnect
+
+        from src.api import persistent_app as pa
+
+        ws = AsyncMock()
+        ws.receive_text.side_effect = WebSocketDisconnect()
+        session = MagicMock()
+        session.llm_with_tools = MagicMock()
+        session.permission_mode = "supervised"
+        session.narration_mode = "auto"
+        session.turn_count = 7
+        session.messages = []
+        session.config.llm.model = "gpt-test"
+        session.config.llm.temperature = 0.1
+
+        with (
+            patch("src.api.persistent_app._session", session),
+            patch("src.api.persistent_app._thread_id", "thread-1"),
+            patch("src.api.persistent_app._loop_user_queue", asyncio.Queue()),
+            patch("src.api.persistent_app._session_ready", return_value=True),
+            patch("src.api.persistent_app._turn_event_open", True),
+            patch(
+                "src.api.persistent_app._pending_permission_requests",
+                AsyncMock(return_value=[]),
+            ),
+            patch("src.api.persistent_app._ensure_persistent_loop_started"),
+            patch("src.api.persistent_app._orchestrator_client", None),
+            patch("src.api.persistent_app._ws_connected_event", None),
+        ):
+            await pa.handle_persistent_websocket(ws)
+
+        welcome = next(
+            call.args[0]
+            for call in ws.send_json.await_args_list
+            if call.args[0].get("method") == "session.state"
+        )
+        assert welcome["params"]["turn_count"] == 7
+        assert welcome["params"]["turn_in_flight"] is True
+
+    @pytest.mark.asyncio
+    async def test_reattach_flag_closes_at_transcript_terminal_edge(self):
+        """The UI flag must close before slower post-turn cleanup; the broader
+        teardown-safety helper intentionally remains true in that window.
+        """
+        from src.api import persistent_app as pa
+
+        session = SimpleNamespace(turn_count=0, workspace_sync=None)
+        with (
+            patch("src.api.persistent_app._session", session),
+            patch("src.api.persistent_app._turn_event_open", False),
+            patch("src.api.persistent_app._cloud_sync_retry_pending", False),
+            patch("src.api.persistent_app._broadcast"),
+            patch(
+                "src.api.persistent_app._retire_announced_permission_rows",
+                AsyncMock(),
+            ),
+        ):
+            await pa._loop_on_turn_start(3)
+            assert pa._turn_event_open is True
+
+            # None makes the callback return after its initial cleanup await;
+            # the lifecycle flag must already be terminal at that point.
+            pa._session = None
+            await pa._loop_on_turn_complete(3)
+            assert pa._turn_event_open is False
+
 
 class TestSessionReadyHelper:
     """_session_ready() is the single source of truth shared by /ready,

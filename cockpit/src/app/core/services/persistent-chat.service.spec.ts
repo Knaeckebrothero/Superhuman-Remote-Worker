@@ -603,6 +603,7 @@ describe('PersistentChatService — connect()', () => {
         // user turn + one collapsed assistant turn
         const assistant = turns.find(isAssistantTurn) as AssistantTurn;
         expect(assistant).toBeDefined();
+        expect(assistant.turnNumber).toBe(1);
         // Events arrive in order: thought, tool_call (now with result), text
         const kinds = assistant.events.map((e) => e.kind);
         expect(kinds).toEqual(['thought', 'tool_call', 'text']);
@@ -658,6 +659,73 @@ describe('PersistentChatService — connect()', () => {
         expect(assistantTurns[0].recovered).not.toBe(true);
         const thoughts = assistantTurns[0].events.filter((e) => e.kind === 'thought');
         expect(thoughts).toHaveLength(1);
+    });
+
+    it('rejoins a persisted in-flight prefix when the reattach welcome frame arrives', async () => {
+        const {service, mockHttp, sseInstances} = createService({
+            cursor: {epoch: 2, seq: 40},
+        });
+        mockHttp.get.mockImplementation((url: string) => {
+            if (url.endsWith('/messages')) {
+                return of({
+                    messages: [
+                        {
+                            id: 'u7',
+                            role: 'human',
+                            content: 'Revise the draft',
+                            tool_calls: null,
+                            turn_number: 7,
+                            created_at: '2026-08-05T14:00:00Z',
+                        },
+                        {
+                            id: 'a7-prefix',
+                            role: 'ai',
+                            content: 'I will apply those revisions now.',
+                            tool_calls: null,
+                            turn_number: 7,
+                            created_at: '2026-08-05T14:00:01Z',
+                        },
+                    ],
+                    total: 2,
+                });
+            }
+            return of({status: 'active', total_turns: 7});
+        });
+        await service.connect('thread-midturn');
+        fireSseOpen(sseInstances[0]);
+
+        // Replay begins after the cached turn.started frame, producing the
+        // recovered suffix seen below "SESSION RESUMED" in the regression.
+        fireSseMessage(
+            sseInstances[0],
+            {method: 'token', params: {content: 'The matrix is updated.'}},
+            '2:41',
+        );
+        (service as any)._flushDeltas();
+        expect(service.turns().filter(isAssistantTurn)).toHaveLength(2);
+
+        (service as any)._handleEvent({
+            method: 'session.state',
+            params: {turn_count: 7, turn_in_flight: true},
+        });
+
+        const assistants = service.turns().filter(isAssistantTurn) as AssistantTurn[];
+        expect(assistants).toHaveLength(1);
+        expect(assistants[0].id).toBe('7');
+        expect(assistants[0].status).toBe('streaming');
+        expect(assistants[0].historical).toBe(true);
+        expect(assistants[0].events.map((event) => (event as TextEvent).content)).toEqual([
+            'I will apply those revisions now.',
+            'The matrix is updated.',
+        ]);
+        expect(service.currentStreamingTurn()?.id).toBe('7');
+
+        (service as any)._handleEvent({
+            method: 'turn.completed',
+            params: {turn_id: 7},
+        });
+        expect(service.turns().filter(isAssistantTurn)).toHaveLength(1);
+        expect((service.turns().find(isAssistantTurn) as AssistantTurn).status).toBe('done');
     });
 
     it('passes the cached cursor as ?last_event_id=<epoch>:<seq> on initial open', async () => {

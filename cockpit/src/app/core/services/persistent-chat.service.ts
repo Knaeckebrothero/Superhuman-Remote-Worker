@@ -795,6 +795,11 @@ export class PersistentChatService {
     // refreshed with zero real data in exactly the zombie-stream case, so the
     // send-kickstart must key off this clean data-only clock.
     private sseDataLastAt = 0;
+    // True for the current explicit SSE open when replay starts from the
+    // browser's cached cursor. Only that shape has a suffix to join onto REST
+    // history; a no-cursor cold attach replays the whole in-flight turn and
+    // must not concatenate that full copy onto its persisted prefix.
+    private sseOpenedWithCursor = false;
     // Single-flight generation for _openSse. Bumped at every open attempt and in
     // disconnect(); an open whose generation is stale after its async cursor
     // fetch bails instead of installing a resurrected EventSource on a
@@ -1338,6 +1343,7 @@ export class PersistentChatService {
     private async _openSse(threadId: string): Promise<void> {
         // Drop any stale watchdog from a prior open before installing a new one.
         this._stopSseWatchdog();
+        this.sseOpenedWithCursor = false;
 
         // Single-flight guard: claim a generation up front. If a newer open (or
         // a disconnect()) supersedes us while we await the cursor, bail before
@@ -1351,6 +1357,7 @@ export class PersistentChatService {
             this.intentionalClose ||
             this.threadId() !== threadId
         ) return;
+        this.sseOpenedWithCursor = cursor != null;
 
         // ngsw-bypass keeps the Angular service worker out of the SSE path. Its
         // /api/** dataGroup otherwise buffers the stream body (which never ends),
@@ -2896,6 +2903,19 @@ export class PersistentChatService {
                 if (params['turn_count'] != null) {
                     this.turnCount.set(params['turn_count'] as number);
                 }
+                // A hard refresh rebuilds an in-flight turn's durable prefix
+                // from REST as historical/done, while cursor replay continues
+                // its suffix live. The direct welcome frame is authoritative
+                // about whether that logical turn is still running; reconcile
+                // the two halves before permission snapshots append events.
+                if (
+                    this.sseOpenedWithCursor &&
+                    params['turn_in_flight'] === true &&
+                    params['turn_count'] != null
+                ) {
+                    const turnId = String(params['turn_count']);
+                    this.dispatch({type: 'reattach_turn', turnId, timestamp: now});
+                }
                 if (params['model']) {
                     this.modelName.set(params['model'] as string);
                 }
@@ -3868,6 +3888,7 @@ export function historyToTurns(messages: HistoryMessage[]): Turn[] {
                 id: m.id,
                 events: [],
                 status: 'done',
+                turnNumber: m.turn_number ?? undefined,
                 startedAt: ts,
                 finishedAt: ts,
                 historical: true,

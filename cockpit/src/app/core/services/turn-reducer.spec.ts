@@ -121,6 +121,130 @@ describe('turn-reducer — turn lifecycle', () => {
         expect((turn.events[0] as TextEvent).content).toBe('hi');
     });
 
+    it('reattach_turn joins a historical prefix and recovered suffix into one live turn', () => {
+        const historical: AssistantTurn = {
+            kind: 'assistant',
+            id: 'history-message-uuid',
+            turnNumber: 7,
+            historical: true,
+            status: 'done',
+            startedAt: 500,
+            finishedAt: 700,
+            events: [
+                {
+                    kind: 'text',
+                    id: 'history-message-uuid.b0',
+                    content: 'I will update the draft.',
+                    status: 'done',
+                    startedAt: 500,
+                },
+            ],
+        };
+        let state = reduce(EMPTY_CONVERSATION, {
+            type: 'load_history',
+            threadId: 'thread-1',
+            turns: [
+                {kind: 'user', id: 'u7', content: 'Please update it', timestamp: 400},
+                historical,
+            ],
+        });
+        // Cursor replay resumes after turn.started, so the first new token
+        // initially lands in a recovered suffix.
+        state = reduce(state, {type: 'token', content: 'Done.', timestamp: 800});
+        expect(state.turns.filter(isAssistantTurn)).toHaveLength(2);
+
+        state = reduce(state, {type: 'reattach_turn', turnId: '7', timestamp: 900});
+
+        const assistants = state.turns.filter(isAssistantTurn);
+        expect(assistants).toHaveLength(1);
+        expect(assistants[0]).toMatchObject({
+            id: '7',
+            turnNumber: 7,
+            historical: true,
+            status: 'streaming',
+        });
+        expect(assistants[0].finishedAt).toBeUndefined();
+        expect(assistants[0].events.map((event) => event.kind)).toEqual(['text', 'text']);
+        expect((assistants[0].events[1] as TextEvent).content).toBe('Done.');
+        expect(state.activeAssistantTurnId).toBe('7');
+
+        state = reduce(state, {type: 'turn_completed', turnId: '7', finishedAt: 1000});
+        expect(state.turns.filter(isAssistantTurn)).toHaveLength(1);
+        expect((state.turns[1] as AssistantTurn).status).toBe('done');
+        expect(state.activeAssistantTurnId).toBeNull();
+    });
+
+    it('reattach_turn reopens a same-thread turn interrupted by transport teardown', () => {
+        const interrupted: AssistantTurn = {
+            kind: 'assistant',
+            id: '12',
+            turnNumber: 12,
+            events: [],
+            status: 'interrupted',
+            startedAt: 100,
+            finishedAt: 200,
+        };
+        const state = reduce(
+            {threadId: 'thread-1', turns: [interrupted], activeAssistantTurnId: null},
+            {type: 'reattach_turn', turnId: '12', timestamp: 300},
+        );
+        expect(state.turns).toHaveLength(1);
+        expect((state.turns[0] as AssistantTurn).status).toBe('streaming');
+        expect((state.turns[0] as AssistantTurn).finishedAt).toBeUndefined();
+        expect(state.activeAssistantTurnId).toBe('12');
+    });
+
+    it('reattach_turn does not reopen a turn already closed by replay', () => {
+        const state = play([
+            {type: 'turn_started', turnId: '8', startedAt: 100},
+            {type: 'token', content: 'finished', timestamp: 150},
+            {type: 'turn_completed', turnId: '8', finishedAt: 200},
+            // A stale cross-transport welcome snapshot arrives last.
+            {type: 'reattach_turn', turnId: '8', timestamp: 250},
+        ]);
+        const turn = state.turns[0] as AssistantTurn;
+        expect(turn.status).toBe('done');
+        expect(turn.finishedAt).toBe(200);
+        expect(state.activeAssistantTurnId).toBeNull();
+    });
+
+    it('turn_started rebuilds a matching historical prefix during full cold replay', () => {
+        const historical: AssistantTurn = {
+            kind: 'assistant',
+            id: 'history-message-uuid',
+            turnNumber: 4,
+            historical: true,
+            events: [
+                {
+                    kind: 'text',
+                    id: 'history-message-uuid.b0',
+                    content: 'persisted prefix',
+                    status: 'done',
+                    startedAt: 100,
+                },
+            ],
+            status: 'done',
+            startedAt: 100,
+            finishedAt: 200,
+        };
+        const state = play(
+            [
+                {type: 'turn_started', turnId: '4', startedAt: 100},
+                {type: 'token', content: 'persisted prefix', timestamp: 110},
+            ],
+            {threadId: 'thread-1', turns: [historical], activeAssistantTurnId: null},
+        );
+        const assistants = state.turns.filter(isAssistantTurn);
+        expect(assistants).toHaveLength(1);
+        expect(assistants[0]).toMatchObject({
+            id: '4',
+            turnNumber: 4,
+            historical: true,
+            status: 'streaming',
+        });
+        expect((assistants[0].events[0] as TextEvent).content).toBe('persisted prefix');
+    });
+
     it('turn_completed flips status to done and clears activeAssistantTurnId', () => {
         const state = play([
             {type: 'turn_started', turnId: 't1', startedAt: 1000},
