@@ -263,15 +263,15 @@ class CanvasViewerSessionService:
 
     @staticmethod
     async def _parent_session(
-        conn: Any, parent_session_id: UUID, user_id: str
+        conn: Any, parent_session_id: UUID, user_id: str, *, for_share: bool = True
     ) -> dict[str, Any]:
+        suffix = " FOR SHARE" if for_share else ""
         row = await conn.fetchrow(
-            """
+            f"""
             SELECT id, user_id, absolute_expires_at, revoked_at
             FROM srw_sessions
             WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL
-              AND absolute_expires_at > now()
-            FOR SHARE
+              AND absolute_expires_at > now(){suffix}
             """,
             parent_session_id,
             user_id,
@@ -286,13 +286,14 @@ class CanvasViewerSessionService:
 
     @staticmethod
     async def _authorized_thread(
-        conn: Any, *, user_id: str, thread_id: str
+        conn: Any, *, user_id: str, thread_id: str, for_share: bool = True
     ) -> dict[str, Any]:
         user = await conn.fetchrow(
             "SELECT id, is_admin, is_approved FROM users WHERE id = $1", user_id
         )
+        suffix = " FOR SHARE" if for_share else ""
         thread = await conn.fetchrow(
-            "SELECT id, user_id, metadata FROM threads WHERE id = $1 FOR SHARE",
+            f"SELECT id, user_id, metadata FROM threads WHERE id = $1{suffix}",
             thread_id,
         )
         if (
@@ -422,7 +423,18 @@ class CanvasViewerSessionService:
     async def begin_bootstrap(
         self, *, attachment_id: UUID, host_generation: UUID
     ) -> CanvasBootstrapStart:
-        """Start one browser-bound challenge without granting authorization."""
+        """Start one browser-bound challenge without granting authorization.
+
+        Gateway-only, so every read of an authoritative row here is unlocked.
+        The public gateway holds the restricted database role, which is granted
+        SELECT and nothing else on ``users``/``threads``/``srw_sessions``/
+        ``canvases``; PostgreSQL requires UPDATE on at least one column for any
+        row-locking clause, so ``FOR SHARE`` here is not a stricter check but a
+        guaranteed ``permission denied``. Nothing is lost: this method only
+        starts a challenge, and ``authenticate`` re-derives every one of these
+        facts — parent session, approval, thread ownership, canvas identity —
+        without locks on each proxied exchange before any byte is served.
+        """
 
         self._require_enabled()
         now = _now()
@@ -448,7 +460,7 @@ class CanvasViewerSessionService:
                         "Canvas bootstrap is invalid or expired",
                     )
                 current = await self._canvas_record(
-                    conn, str(identity["thread_id"]), for_share=True
+                    conn, str(identity["thread_id"]), for_share=False
                 )
                 source = _require_app_record(current)
                 row = await conn.fetchrow(
@@ -525,12 +537,13 @@ class CanvasViewerSessionService:
                         "The Cockpit session has ended",
                     )
                 await self._parent_session(
-                    conn, UUID(str(parent_id)), str(values["user_id"])
+                    conn, UUID(str(parent_id)), str(values["user_id"]), for_share=False
                 )
                 await self._authorized_thread(
                     conn,
                     user_id=str(values["user_id"]),
                     thread_id=str(values["thread_id"]),
+                    for_share=False,
                 )
                 started = await conn.execute(
                     """
@@ -709,7 +722,14 @@ class CanvasViewerSessionService:
         host_generation: UUID,
         existing_session_secret: str | None,
     ) -> CanvasBootstrapExchange:
-        """Consume one authorized exchange bound to this browser and host."""
+        """Consume one authorized exchange bound to this browser and host.
+
+        Gateway-only, so the authoritative rows are read unlocked for the same
+        reason ``begin_bootstrap`` reads them unlocked. The one-time exchange
+        is still serialized: the bootstrap and attachment rows below are taken
+        ``FOR UPDATE``, and those the restricted role may lock because it holds
+        UPDATE on their columns.
+        """
 
         self._require_enabled()
         try:
@@ -741,7 +761,7 @@ class CanvasViewerSessionService:
                         "Canvas bootstrap is invalid or expired",
                     )
                 current = await self._canvas_record(
-                    conn, str(identity["thread_id"]), for_share=True
+                    conn, str(identity["thread_id"]), for_share=False
                 )
                 source = _require_app_record(current)
                 row = await conn.fetchrow(
@@ -804,12 +824,13 @@ class CanvasViewerSessionService:
                         "The Cockpit session has ended",
                     )
                 parent = await self._parent_session(
-                    conn, UUID(str(parent_id)), str(values["user_id"])
+                    conn, UUID(str(parent_id)), str(values["user_id"]), for_share=False
                 )
                 await self._authorized_thread(
                     conn,
                     user_id=str(values["user_id"]),
                     thread_id=str(values["thread_id"]),
+                    for_share=False,
                 )
                 if (
                     current.presentation_revision

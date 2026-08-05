@@ -98,6 +98,32 @@ def _role_database_url() -> str:
     return urlunsplit((parsed.scheme, netloc, parsed.path, parsed.query, ""))
 
 
+def _apply_packaged_role_script() -> None:
+    """Reconcile the disposable gateway role from the packaged Helm SQL."""
+
+    result = subprocess.run(
+        [
+            "psql",
+            _DATABASE_URL,
+            "--no-psqlrc",
+            "--quiet",
+            "--set",
+            "ON_ERROR_STOP=1",
+            "--file",
+            str(_ROOT / "helm/files/canvas-viewer-role.sql"),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env={
+            **os.environ,
+            "CANVAS_VIEWER_POSTGRES_USER": _GATEWAY_ROLE,
+            "CANVAS_VIEWER_POSTGRES_PASSWORD": _GATEWAY_PASSWORD,
+        },
+    )
+    assert result.returncode == 0, result.stderr
+
+
 async def _drop_gateway_test_role(conn: asyncpg.Connection) -> None:
     exists = await conn.fetchval(
         "SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = $1)",
@@ -116,28 +142,7 @@ async def test_restricted_gateway_role_script_and_runtime_attestation() -> None:
     restricted: asyncpg.Connection | None = None
     try:
         await _drop_gateway_test_role(admin)
-        environment = {
-            **os.environ,
-            "CANVAS_VIEWER_POSTGRES_USER": _GATEWAY_ROLE,
-            "CANVAS_VIEWER_POSTGRES_PASSWORD": _GATEWAY_PASSWORD,
-        }
-        result = subprocess.run(
-            [
-                "psql",
-                _DATABASE_URL,
-                "--no-psqlrc",
-                "--quiet",
-                "--set",
-                "ON_ERROR_STOP=1",
-                "--file",
-                str(_ROOT / "helm/files/canvas-viewer-role.sql"),
-            ],
-            check=False,
-            capture_output=True,
-            text=True,
-            env=environment,
-        )
-        assert result.returncode == 0, result.stderr
+        _apply_packaged_role_script()
 
         # Reconciliation must also remove a stale direct database CREATE grant
         # from a previous/operator-created contract before restoring CONNECT.
@@ -147,23 +152,7 @@ async def test_restricted_gateway_role_script_and_runtime_attestation() -> None:
         await admin.execute(
             f"GRANT CREATE ON DATABASE {database_identifier} TO {_GATEWAY_ROLE}"
         )
-        result = subprocess.run(
-            [
-                "psql",
-                _DATABASE_URL,
-                "--no-psqlrc",
-                "--quiet",
-                "--set",
-                "ON_ERROR_STOP=1",
-                "--file",
-                str(_ROOT / "helm/files/canvas-viewer-role.sql"),
-            ],
-            check=False,
-            capture_output=True,
-            text=True,
-            env=environment,
-        )
-        assert result.returncode == 0, result.stderr
+        _apply_packaged_role_script()
 
         await admin.execute(f"SET ROLE {_GATEWAY_ROLE}")
         try:
@@ -499,3 +488,207 @@ async def test_postgres_viewer_lifecycle_concurrency_reuse_and_revocation(
             )
             await conn.execute("DELETE FROM users WHERE id = $1", user_id)
         await pool.close()
+
+
+async def test_gateway_role_completes_the_bootstrap_it_serves(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Run the gateway-only methods under the identity the gateway holds.
+
+    Every other test drives this service as the migration owner, which can do
+    anything, so none of them can see what the packaged grants withhold. The
+    public gateway process only ever authenticates as the restricted role, and
+    a statement that role may not execute is a 500 on the browser's first hop
+    into the isolated origin however correct the surrounding logic is.
+    """
+
+    admin = await asyncpg.connect(_DATABASE_URL)
+    owner_pool: asyncpg.Pool | None = None
+    gateway_pool: asyncpg.Pool | None = None
+    user_id = uuid4()
+    thread_id = uuid4()
+    parent_id = uuid4()
+    workspace_generation = uuid4()
+    origin_generation = uuid4()
+    source_fingerprint = "sha256:" + "b" * 64
+    try:
+        await _drop_gateway_test_role(admin)
+        _apply_packaged_role_script()
+        await admin.execute(
+            """
+            INSERT INTO users (id, display_name, is_approved, approved_at)
+            VALUES ($1, 'Canvas gateway role user', true, now())
+            """,
+            user_id,
+        )
+        await admin.execute(
+            """
+            INSERT INTO threads (id, title, user_id, status, metadata)
+            VALUES ($1, 'Canvas gateway role thread', $2, 'active', '{}'::jsonb)
+            """,
+            thread_id,
+            user_id,
+        )
+        await admin.execute(
+            """
+            INSERT INTO srw_sessions (
+                id, user_id, kc_sub, access_token, refresh_token, id_token,
+                access_expires_at, absolute_expires_at
+            ) VALUES (
+                $1, $2, $3, 'access', 'refresh', 'identity',
+                now() + interval '30 minutes', now() + interval '2 hours'
+            )
+            """,
+            parent_id,
+            user_id,
+            f"canvas-gateway-role-{user_id}",
+        )
+        await admin.execute(
+            """
+            INSERT INTO canvases (
+                thread_id, canvas_id, source, title, renderer, editable,
+                presentation_revision, source_fingerprint, origin_generation
+            ) VALUES ($1, 'main', $2::jsonb, 'Gateway role app', 'auto', false,
+                      1, $3, $4)
+            """,
+            thread_id,
+            json.dumps(
+                WorkspaceAppSource(
+                    entry_port=8501,
+                    entry_path="/demo",
+                    workspace_generation=workspace_generation,
+                ).model_dump(mode="json")
+            ),
+            source_fingerprint,
+            origin_generation,
+        )
+
+        owner_pool = await asyncpg.create_pool(_DATABASE_URL, min_size=1, max_size=4)
+        gateway_pool = await asyncpg.create_pool(
+            _role_database_url(), min_size=1, max_size=4
+        )
+        assert owner_pool is not None and gateway_pool is not None
+
+        # The attestation the gateway runs at boot passes: the role holds every
+        # column privilege the contract names. Whatever fails below therefore
+        # fails on a statement no grant in that contract can carry.
+        async with gateway_pool.acquire() as conn:
+            await attest_canvas_viewer_database_privileges(conn)
+
+        cockpit = CanvasViewerSessionService(_PoolDB(owner_pool), config=_config())
+        gateway = CanvasViewerSessionService(_PoolDB(gateway_pool), config=_config())
+
+        record = await CanvasService(_PoolDB(owner_pool)).get(str(thread_id))
+        assert record is not None
+        grant = await cockpit.create_attachment(
+            user_id=str(user_id),
+            thread_id=str(thread_id),
+            parent_session_id=parent_id,
+            embedding_origin="https://cockpit.platform.test",
+            expected_record=record,
+        )
+
+        start = await gateway.begin_bootstrap(
+            attachment_id=grant.attachment_id,
+            host_generation=origin_generation,
+        )
+        authorization = await cockpit.authorize_bootstrap(
+            attachment_id=grant.attachment_id,
+            user_id=str(user_id),
+            thread_id=str(thread_id),
+            parent_session_id=parent_id,
+            embedding_origin="https://cockpit.platform.test",
+            challenge=start.challenge,
+            ready_receipt=start.ready_receipt,
+            bridge_nonce=grant.bridge_nonce,
+        )
+        exchange = await gateway.exchange_bootstrap(
+            attachment_id=grant.attachment_id,
+            challenge=start.challenge,
+            exchange_code=authorization.exchange_code,
+            browser_binding=start.browser_binding,
+            host_generation=origin_generation,
+            existing_session_secret=None,
+        )
+        assert exchange.session_secret is not None
+
+        target = RemoteWorkspaceTarget(
+            thread_id=str(thread_id),
+            generation=workspace_generation,
+            host="workspace.integration.invalid",
+            port=22,
+            fingerprint="SHA256:" + "b" * 43,
+        )
+        monkeypatch.setattr(
+            viewer_sessions_module,
+            "resolve_remote_workspace_target",
+            lambda thread, generation: target,
+        )
+        authenticated = await gateway.authenticate(
+            session_secret=exchange.session_secret,
+            host_generation=origin_generation,
+        )
+        assert authenticated.id == exchange.session.id
+        assert authenticated.remote_target == target
+
+        # A second tab reuses the origin session, which locks it FOR UPDATE.
+        # That lock is legal for this role precisely because the packaged
+        # grants carry UPDATE columns on canvas_origin_sessions: the same
+        # PostgreSQL rule that forbids locking the authoritative tables.
+        second_grant = await cockpit.create_attachment(
+            user_id=str(user_id),
+            thread_id=str(thread_id),
+            parent_session_id=parent_id,
+            embedding_origin="https://cockpit.platform.test",
+            expected_record=record,
+        )
+        second_start = await gateway.begin_bootstrap(
+            attachment_id=second_grant.attachment_id,
+            host_generation=origin_generation,
+        )
+        second_authorization = await cockpit.authorize_bootstrap(
+            attachment_id=second_grant.attachment_id,
+            user_id=str(user_id),
+            thread_id=str(thread_id),
+            parent_session_id=parent_id,
+            embedding_origin="https://cockpit.platform.test",
+            challenge=second_start.challenge,
+            ready_receipt=second_start.ready_receipt,
+            bridge_nonce=second_grant.bridge_nonce,
+        )
+        reused = await gateway.exchange_bootstrap(
+            attachment_id=second_grant.attachment_id,
+            challenge=second_start.challenge,
+            exchange_code=second_authorization.exchange_code,
+            browser_binding=second_start.browser_binding,
+            host_generation=origin_generation,
+            existing_session_secret=exchange.session_secret,
+        )
+        assert reused.session.id == exchange.session.id
+
+        # Repointing the Canvas retires the origin: the gateway must be able to
+        # write that verdict itself, not just refuse the exchange.
+        with pytest.raises(CanvasViewerError) as stale:
+            await gateway.authenticate(
+                session_secret=exchange.session_secret,
+                host_generation=uuid4(),
+            )
+        assert stale.value.status_code == 401
+        revocation = await admin.fetchrow(
+            "SELECT revoked_at, revocation_reason FROM canvas_origin_sessions "
+            "WHERE id = $1",
+            exchange.session.id,
+        )
+        assert revocation is not None
+        assert revocation["revoked_at"] is not None
+        assert revocation["revocation_reason"] == "origin_changed"
+    finally:
+        if gateway_pool is not None:
+            await gateway_pool.close()
+        if owner_pool is not None:
+            await owner_pool.close()
+        await admin.execute("DELETE FROM threads WHERE id = $1", thread_id)
+        await admin.execute("DELETE FROM srw_sessions WHERE id = $1", parent_id)
+        await admin.execute("DELETE FROM users WHERE id = $1", user_id)
+        await _drop_gateway_test_role(admin)
+        await admin.close()
