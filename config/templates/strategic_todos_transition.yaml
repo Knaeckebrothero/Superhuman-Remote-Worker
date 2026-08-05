@@ -1,80 +1,44 @@
-# Strategic todos for phase transitions (between tactical phases)
-# Two todos: review-and-adapt, then plan-or-complete. The system already
-# archives every phase boundary automatically (todo outcomes in archive/,
-# git tag + commit + push) — no separate retrospective deliverable exists.
+# Strategic todos for phase transitions (between tactical phases).
 #
-# IMPORTANT: The PLAN todo (id 2) starts with the stop condition.
-# If all deliverables are done, call job_complete. Do NOT invent new work.
+# Keep these todos about outcomes and ordering. Verification technique belongs
+# in verify-before-done, which is rendered for the capabilities actually bound
+# to the workspace. In particular, Git history is useful when available but is
+# not a prerequisite: virtual workspaces may have no Git transport at all.
 todos:
   - id: 1
     content: >-
-      REVIEW AND ADAPT: Check what the previous tactical phase actually
-      accomplished, then update plan.md where reality diverged.
+      VERIFY THE RESULT — finish this before deciding whether to continue.
 
-      Use git evidence, not memory (memory may be wrong after compaction):
-      (1) Use git_tags to list the phase boundary tags — named
-          <job_short_id>-phase-<N>-<type>-complete; each marks the END of that phase.
-      (2) Use git_diff between the two most recent boundary tags to see every
-          file change from the phase (only one tag yet? diff from the
-          "[Phase 0 Seed]" commit shown by git_log). The completed/not-completed
-          todo record is already in archive/ — written automatically.
+      Read and apply `skills/verify-before-done/SKILL.md`. Verify the current
+      outputs against the original requirements in instructions.md and any
+      runtime-declared required deliverables. Do not update plan.md or plan
+      another phase yet.
 
-      Then rewrite the relevant parts of plan.md in place (one write_file, never
-      append a second copy):
-      - Mark completed phases with actual outcomes — what was produced, not just
-        "done" (e.g. "Phase 2: produced output/analysis.md, 15 requirements").
-      - Carry incomplete work into a continuation phase; remove phases no longer
-        needed; keep every remaining phase mapped to a deliverable in plan.md's
-        "## Deliverables" section. Update the deliverable files themselves with
-        anything this phase produced but didn't record.
+      Complete this todo with `todo_complete`. Record the skill's concise
+      verdict and evidence in `completion_note`, beginning with `PASS:` or
+      `GAPS:`.
 
-      COMPLETION CRITERIA: plan.md reflects what actually happened, backed by
-      git evidence.
-
-      INSTEAD OF: Writing a separate retrospective file — the archive and git
-      history already record the phase. Instead of adding housekeeping phases
-      (archiving, cleanup, packaging, PDF generation, status updates) — the
-      system handles those automatically.
+      COMPLETION CRITERIA: Fresh evidence has been reconciled against the
+      original requirements and a durable PASS/GAPS completion note exists.
 
   - id: 2
     content: >-
-      PLAN OR COMPLETE — the stop condition comes FIRST.
+      CLOSE OR CONTINUE — begin only after todo 1 is complete and use its
+      recorded verdict. Do not repeat a successful check unless a verified
+      deliverable changed after todo 1; updating plan.md is not a reason to
+      reverify unchanged deliverables.
 
-      === STOP CONDITION (check this FIRST) ===
+      If todo 1 recorded GAPS: update plan.md once with those verified gaps,
+      then call next_phase_todos for one focused tactical phase that repairs
+      them. Do not add housekeeping or invented work.
 
-      Check plan.md's "## Deliverables" section, then verify with list_files
-      which outputs actually exist in output/. If ALL required deliverables
-      exist AND the review (todo 1) confirmed their quality, the job is DONE.
-      Call job_complete with:
-      - summary: what was accomplished across all phases
-      - deliverables: list of output file paths
-      - confidence: your honest quality assessment (0.0-1.0)
-      - notes: caveats or areas a reviewer should check
+      If todo 1 recorded PASS: update plan.md once to mark the actual phases and
+      deliverables complete, then call job_complete with the deliverable paths
+      and any verification limitations.
 
-      The system commits, pushes to Gitea, and freezes for review automatically.
+      Take exactly one branch. After the chosen lifecycle tool succeeds,
+      complete this todo with a concise `completion_note`; do not complete it
+      before job_complete or next_phase_todos succeeds.
 
-      === CONTINUE CONDITION (only if deliverables are still missing) ===
-
-      Invoke next_phase_todos to create the next tactical phase. Target 2-5
-      todos; each must name exact files, sections, and tools, be completable in
-      1-3 tool calls, and directly advance a deliverable. Include a verification
-      todo that produces evidence. (The todo-guide skill at
-      skills/todo-guide/SKILL.md covers todo crafting.)
-
-      {% if has_tool("kb_write") -%}
-      If this phase surfaced a durable lesson — a decision, a failed approach
-      and why, a discovered fact future jobs need — record it with one kb_write
-      before continuing. Skip this when there is nothing durable.
-      {% else -%}
-      If this phase surfaced a durable lesson — a decision, a failed approach
-      and why, a discovered fact — record it in notes/ before continuing. Skip
-      this when there is nothing durable.
-      {%- endif %}
-
-      COMPLETION CRITERIA: Exactly one of job_complete or next_phase_todos
-      called.
-
-      INSTEAD OF: Creating a new phase when all deliverables already exist —
-      call job_complete. Instead of todos for archiving, cleanup, packaging, or
-      status updates — the system handles those. Instead of inventing
-      deliverables not mentioned in instructions.md.
+      COMPLETION CRITERIA: Verified gaps produced a corrective tactical phase,
+      or a verified complete result produced job completion.

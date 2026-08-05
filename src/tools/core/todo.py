@@ -19,6 +19,8 @@ from ..context import ToolContext
 
 logger = logging.getLogger(__name__)
 
+MAX_COMPLETION_NOTE_CHARS = 1000
+
 # Tool metadata for registry
 # Phase availability:
 #   - "strategic": Available only in strategic mode (planning)
@@ -155,7 +157,7 @@ def create_todo_tools(context: ToolContext) -> List[Any]:
             return f"Error staging todos: {str(e)}"
 
     @tool
-    def todo_complete(todo_id: str = "") -> str:
+    def todo_complete(todo_id: str = "", completion_note: str = "") -> str:
         """Mark a single task as complete.
 
         Call this tool AFTER you have finished working on a task.
@@ -166,6 +168,9 @@ def create_todo_tools(context: ToolContext) -> List[Any]:
             todo_id: Optional. The ID of the todo to complete (e.g., "todo_1").
                      If not provided, completes the first incomplete task
                      (in_progress first, then highest-priority pending).
+            completion_note: Optional concise outcome that later todos must retain,
+                             such as a verification verdict beginning with
+                             ``PASS:`` or ``GAPS:``. Limited to 1000 characters.
 
         This is the primary rhythm of work:
         1. Work on the current task
@@ -191,6 +196,16 @@ def create_todo_tools(context: ToolContext) -> List[Any]:
             This is detected by the graph to trigger phase transitions.
         """
         try:
+            completion_note = completion_note.strip()
+            if len(completion_note) > MAX_COMPLETION_NOTE_CHARS:
+                return (
+                    "Error: completion_note is too long "
+                    f"({len(completion_note)} characters; maximum "
+                    f"{MAX_COMPLETION_NOTE_CHARS}). Record only the concise outcome "
+                    "needed by the next todo."
+                )
+            completion_notes = [completion_note] if completion_note else None
+
             # Set by whichever completion path runs below; drives the progress
             # commit at the end of the tool.
             completed_id = ""
@@ -210,7 +225,7 @@ def create_todo_tools(context: ToolContext) -> List[Any]:
 
                 if len(ids) == 1:
                     # Single ID - use existing logic
-                    todo = todo_mgr.complete(ids[0])
+                    todo = todo_mgr.complete(ids[0], notes=completion_notes)
                     if not todo:
                         # List available todos to help the agent
                         available = todo_mgr.list_all()
@@ -258,7 +273,7 @@ def create_todo_tools(context: ToolContext) -> List[Any]:
                         )
             else:
                 # Original behavior: complete first pending task
-                result = todo_mgr.complete_first_pending_sync()
+                result = todo_mgr.complete_first_pending_sync(notes=completion_notes)
                 message = result["message"]
                 is_last = result.get("is_last_task", False)
                 completed_id = result.get("completed_id") or ""
@@ -272,6 +287,9 @@ def create_todo_tools(context: ToolContext) -> List[Any]:
             if is_last:
                 message += "\n\n[PHASE_COMPLETE] All tasks in this phase are done."
                 logger.info("Last task completed - phase transition signal sent")
+
+            if completion_note and completed_id:
+                message += f"\n\nRecorded completion note: {completion_note}"
 
             # Make the finished work durable. A completed todo is a real unit of
             # progress, so it is the honest place to commit — and the commit is

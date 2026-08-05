@@ -43,6 +43,8 @@ but non-blocking behaviors:
 - the connector still publishes the stale MCP creation/file-reader schema;
 - the phase-transition review prompt caused two completed reports to spend
   another 53 and 62 parent LLM rounds reconciling already-successful evidence;
+  its ordered capability-aware closeout repair is implemented in-tree as of
+  2026-08-05, with live acceptance pending;
 - the new passive `verify-before-done` gate is fail-closed, but MiniMax ignored
   its corrective error often enough to produce 50 rejected completion calls.
 
@@ -560,6 +562,24 @@ confirmation for the open P-2 “conditional REVIEW-AND-ADAPT” work in
 the transition should take a cheap deterministic/fast path, and the stop check
 must not be worded as preceding the review it depends on.
 
+#### Transition-closeout remediation implemented — 2026-08-05
+
+The generic and gpt-oss transition templates now express two short, ordered
+outcomes rather than embedding Git archaeology:
+
+1. apply the capability-aware `verify-before-done` skill to the original
+   instructions/runtime deliverables and persist a bounded `PASS:`/`GAPS:` todo
+   completion note;
+2. consume that note without repeating unchanged checks, then either update the
+   plan and stage one corrective phase or update the plan and complete the job.
+
+Git history is optional inside the skill and absent from both todo contracts, so
+virtual workspaces no longer receive an impossible prerequisite. The existing
+`todo-guide` gate remains responsible for crafting a corrective phase, and the
+existing `job_complete` verification gate remains fail-closed. No separate
+closeout skill or status file was added. Focused tests pass; a new live job is
+still required to close the field-acceptance part of this finding.
+
 ### Prioritized conclusions after the batch
 
 Correctness-first recovery has crossed an important line: ordinary main-cluster
@@ -578,9 +598,9 @@ work should stay separated by consequence:
 3. **Auxiliary/provider robustness:** route structured-output tasks to a
    compatible model, surface their calls/errors in MCP accounting, and normalize
    web/PDF extraction error handling.
-4. **Efficiency after correctness:** remove the circular transition ordering,
-   improve the action-gate recovery path, then tune source and phase budgets
-   from these successful baselines.
+4. **Efficiency after correctness:** deploy and live-prove the implemented
+   ordered transition closeout, improve the action-gate recovery path, then tune
+   source and phase budgets from these successful baselines.
 5. **Containment later:** use the recorded successful trajectories to design a
    no-progress guard that would catch the unchanged transition loop without
    stopping the productive research that preceded it.

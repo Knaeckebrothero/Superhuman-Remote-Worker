@@ -218,7 +218,7 @@ def test_serialize_freezes_bound_skill_md(tmp_path):
             "display_name": "T",
             "instruction_files": [
                 {
-                    "skill": "hello-skill",
+                    "skill": "word-count",
                     "trigger": "phase_start:tactical",
                     "enforce": False,
                 },
@@ -237,8 +237,8 @@ def test_serialize_freezes_bound_skill_md(tmp_path):
     )  # matrix/prompt resolvers need a dir; files absent → None
     blob = serialize_resolved_config(cfg)
     # Frozen under the skill name (not "SKILL"), independent of the catalog flag.
-    assert "hello-skill" in blob["instructions"]
-    assert "Hello Skill" in blob["instructions"]["hello-skill"]
+    assert "word-count" in blob["instructions"]
+    assert "Word Count" in blob["instructions"]["word-count"]
     assert "SKILL" not in blob["instructions"]  # no stem collision
     verify_binding = next(
         entry

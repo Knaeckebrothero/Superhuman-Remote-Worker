@@ -31,8 +31,9 @@ not for long ones either)". The root cause (P-1), the structural
 prerequisites for enlarging phases, and the behaviour change itself have
 since shipped in-tree; see §5. Token-side field data in §10 and the five-job
 main-cluster acceptance in §11 confirm that the original compounding curve is
-gone and that the conditional transition fast path (P-2) is now the dominant
-remaining phase defect.
+gone. The ordered, capability-aware P-2 closeout repair is implemented in-tree
+as of 2026-08-05; a live job still needs to prove the former final-review
+attractor is gone.
 
 **Direction, decided 2026-07-31.** The split is **not** being torn down.
 Tactical phases get much larger, so a job runs roughly three phases —
@@ -45,26 +46,27 @@ loop forcibly wiped the agent's working context at every
 strategic→tactical boundary, then mandated that the next strategic phase
 reconstruct that same state from git — charging ~15k tokens of transient
 injection for every turn of that reconstruction, on a memory tier that
-got *less* useful as the job got longer. The wipe and the memory ratchet
-are now fixed; the injection floor (P-4) and the unconditional
-reconstruction block (P-2) are not.
+got *less* useful as the job got longer. The wipe and memory ratchet are fixed,
+and the mandatory Git reconstruction block has now been replaced by an ordered
+verification-skill closeout. The remaining work is live acceptance plus the
+injection floor (P-4).
 
 ---
 
 ## 1. What this is not
 
-The first suspicion was that the transition template tells the agent to
-rewrite `plan.md` wholesale each boundary. **It does not.**
-`config/templates/strategic_todos_transition.yaml` says "rewrite the
-*relevant parts* of plan.md **in place** (one write_file, never append a
-second copy)", and todo 2 is `PLAN OR COMPLETE` with the stop condition
-first. P1-B already cut this template from ~1,800 to ~1,000 tok/turn.
+At filing, the first suspicion was that the transition template told the agent
+to rewrite `plan.md` wholesale each boundary. **It did not.** The then-current
+template said "rewrite the *relevant parts* of plan.md **in place** (one
+write_file, never append a second copy)", and todo 2 was `PLAN OR COMPLETE` with
+the stop condition first. P1-B had already cut that template from ~1,800 to
+~1,000 tok/turn. Section 12 records its 2026-08-05 replacement.
 
 The intended design — *if the tactical phase achieved its todos, check
 the results, tick them, schedule the next batch* — is what the template
-describes. The defect is that **the block is unconditional**: `git_tags`
-+ `git_diff` + a `write_file(plan.md)` are paid at every boundary whether
-or not anything diverged. There is no "phase went as planned" fast path.
+described. The defect was that **the block was unconditional**: `git_tags` +
+`git_diff` + a `write_file(plan.md)` were paid at every boundary whether or not
+anything diverged. There was no "phase went as planned" fast path.
 
 That alone would be cheap. The reason it is not cheap is §3.
 
@@ -145,27 +147,27 @@ prose summary the moment it finishes.
 
 ### F2 — The git archaeology is a *consequence* of F1, not independent bureaucracy
 
-> **Unblocked, not removed.** With F1 fixed the archaeology is no longer
-> *load-bearing* — the context it reconstructs is still there. Making the
-> block conditional so it is no longer *paid* is P-2, still open.
+> **Removed from the mandatory path 2026-08-05.** With F1 fixed the archaeology
+> was no longer load-bearing. Transition todos now delegate method to the
+> capability-aware `verify-before-done` skill; Git is optional orientation and
+> virtual workspaces are not penalized for lacking it. Live acceptance remains.
 
-`config/templates/strategic_todos_transition.yaml:14`:
+Before the 2026-08-05 repair, the template said:
 
 > Use git evidence, **not memory (memory may be wrong after
 > compaction)**
 
-The template is not being ceremonial. It is correctly working around
+That instruction was not originally ceremonial. It correctly worked around
 amnesia that the platform deliberately induced one boundary earlier.
 `git_tags` + `git_diff` between boundary tags is the cheapest honest way
 to answer "what did the last phase actually do?" *given that the answer
 was thrown away.*
 
-**Consequence for the intended design:** "tick the todos and schedule the
-next batch" is not merely missing — it is **unimplementable today**. By
-the time the strategic phase runs, the agent has been stripped of the
-context needed to know whether the todos were achieved, so it has no
-choice but to reconstruct. Any fast path added on top of F1 would be
-rubber-stamping, which is exactly what we do not want.
+**Consequence at filing:** "tick the todos and schedule the next batch" was not
+merely missing — it was unimplementable before P-1. By the time the strategic
+phase ran, the agent had been stripped of the context needed to know whether the
+todos were achieved, so it had no choice but to reconstruct. A fast path added
+on top of that state would have been rubber-stamping.
 
 ### F3 — Every one of those reconstruction turns pays a ~15k-token floor
 
@@ -261,16 +263,17 @@ The phase loop reimplemented a worse variant by accident.
   phases inherit tactical tool-result bloat — mitigated by the existing
   `clear_old_tool_results` + threshold path, and empirically survivable
   (the persistent/session runtime runs for days without a forced wipe).
-- **P-2 — ⬜ LIVE-CONFIRMED, NOT STARTED. Make REVIEW-AND-ADAPT conditional.** Fast path when every
-  tactical todo completed **and** an orchestrator/Gitea check at the boundary
-  confirms the declared P1-C contract paths moved: append one outcome line to `plan.md`, stage the
-  next todos, continue. Load the full block only on a failed todo, or on
-  a **contract/todo disagreement**. Do not materialize the derived check inside
-  the worker workspace; the former boundary status file was retired on
-  2026-08-03 after stale data deadlocked a Scholar completion. This is the anti-rubber-stamp check:
-  artifact-based rather than narrative-based, so it is simultaneously
-  cheaper and harder to fake than reading a diff. Depends on P-1 for
-  honesty.
+- **P-2 — 🟡 IMPLEMENTED IN TREE; LIVE ACCEPTANCE PENDING. Make closeout ordered
+  and capability-aware.** The two transition todos now have one dependency
+  direction: verify first, then close or continue. The first reads
+  `verify-before-done`, checks the original instructions/runtime deliverables
+  against current artifacts, and persists a bounded `PASS:`/`GAPS:` handoff in
+  todo state. The second consumes that verdict without rechecking: `GAPS`
+  updates the plan and stages a corrective phase; `PASS` updates the plan and
+  completes the job. Git is optional skill guidance, never a todo prerequisite.
+  No derived status file was reintroduced. The earlier proposed automatic
+  orchestrator/Gitea agreement fast path is now a possible later optimization,
+  not part of correctness or this prompt-loop repair.
 - **P-3 — 🟡 PARTIAL. Cap the pinned memory tier** at a fraction of
   budget (~30 %) so hybrid search always gets a share, and make
   phase-boundary extraction outcome-gated (this is P2-A from the
@@ -702,8 +705,8 @@ slice 4. It was `todo_rewind`, a genuine rewind; it is now
    all pause at phase boundaries. At three phases they collapse into
    roughly `review` and need redefining against something else.
 6. **✅ Then the behaviour change**: done — §5, slices 4 and 5.
-7. **⬜ Then P-2**, the conditional review fast path — which makes the
-   third phase cheap when nothing diverged.
+7. **🟡 Then P-2** — ordered capability-aware closeout is implemented; prove it
+   with a live completed-artifact job before marking it shipped.
 
 Note that blockers 1–4 are also exactly the prerequisites a `JobDriver`
 on runtime #2 would need. Nothing here is throwaway if the runtime
@@ -906,7 +909,7 @@ prompts dropped to roughly 20k tokens and the model completed todo 1. That timin
 supports a prompt-history attractor diagnosis, but it is an inference from the
 trace rather than an explicit runtime reason code.
 
-### Consequence for the next phase change
+### Consequence recorded from the batch (superseded in part)
 
 Do not add another status file and do not loosen verification. Implement the
 existing P-2 direction:
@@ -921,6 +924,11 @@ existing P-2 direction:
   depends on a different pending todo; and
 - keep `job_complete` fail-closed on committed deliverables.
 
+The 2026-08-05 design decision retained the ordered closeout, fail-closed
+completion, and no-status-file constraints. It replaced the proposed mandatory
+orchestrator/Git agreement path with capability-aware verification of current
+artifacts against the original request; Git is optional. See §12.
+
 This is now a larger measured token lever than reader iteration limits. In the
 matched 10-vs-24 experiment, only about 412k tokens separated reader usage; the
 two parent transition-review windows consumed 17.93M tokens combined.
@@ -934,3 +942,30 @@ the exact file, but the model can immediately retry the protected tool again.
 The eventual correction should keep the passive proof requirement while making
 the only valid next action clearer or temporarily exclusive. It is secondary to
 P-2 because it did not cause the 53/62-round transition loops.
+
+## 12. Ordered capability-aware closeout implemented (2026-08-05)
+
+The live evidence in §11 showed that the original P-2 proposal was trying to
+solve two different problems at once: correctness verification and transition
+cost. The correctness repair keeps the model review, but removes the
+unavailable-capability assumption and contradictory ordering:
+
+- `config/templates/strategic_todos_transition.yaml` and the gpt-oss variant no
+  longer prescribe `git_tags`, `git_diff`, a shell, or “stop condition first”;
+- todo 1 explicitly reads `skills/verify-before-done/SKILL.md`, checks current
+  artifacts against `instructions.md` and visible runtime deliverables, and
+  records `PASS:` or `GAPS:` in `todo_complete(completion_note=...)`;
+- todo 2 starts only after todo 1 and takes exactly one branch: update the plan
+  and call `next_phase_todos` for gaps, or update the plan and call
+  `job_complete` for a pass;
+- the verification skill now treats the original request—not the agent-authored
+  plan—as authoritative and treats Git history as optional orientation only;
+- completion notes are capped at 1,000 characters, checkpointed with todo state,
+  included in Git/archive evidence when those transports exist, and surfaced as
+  one bounded latest-outcome line in the per-turn todo reminder. This replaces
+  another worker-visible manifest without recreating its staleness problem.
+
+Focused template, skill-rendering, explicit/implicit note, injection-bounding,
+and tool-wiring tests cover the in-tree contract. A fresh virtual and sandbox
+job must still demonstrate that final review completes without the old repeated
+evidence bundle before P-2 is marked shipped.
