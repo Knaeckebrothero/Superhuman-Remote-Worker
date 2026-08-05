@@ -16237,7 +16237,7 @@ async def complete_job(
                     reset_window_seconds=LLM_OUTAGE_RESET_WINDOW_SECONDS,
                     fingerprint=llm_outage_fingerprint(_lfd),
                     repeat_key=llm_outage_repeat_key(_lfd),
-                    # TEMPORARY QUICKFIX — docs/issues/codex_stream_disconnect_shape_nudge.md
+                    # TEMPORARY QUICKFIX — docs/done/codex_stream_disconnect_shape_nudge.md
                     nudge_at_repeats=(
                         LLM_OUTAGE_REPEAT_CEILING if LLM_OUTAGE_SHAPE_NUDGE else None
                     ),

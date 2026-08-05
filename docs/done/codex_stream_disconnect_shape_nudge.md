@@ -1,10 +1,19 @@
 # Request-shape nudge for upstream stream disconnects (TEMPORARY QUICKFIX)
 
-**Status:** shipped 2026-07-30 · **Remove when:** OpenAI fixes
-[openai/codex#9995](https://github.com/openai/codex/issues/9995) (still OPEN).
+**Status:** shipped + pushed 2026-07-30 · `8e65071c` (nudge, tests, this doc) and
+`773a6b20` (codex proxy → `v7.2.110`), both on `develop`.
+**LIVE VERIFICATION: still owed** — see *What unit tests cannot tell you* below.
+**Remove when:** OpenAI fixes
+[openai/codex#9995](https://github.com/openai/codex/issues/9995) (OPEN as of
+2026-08-05).
 
 This documents a deliberate hack. It buys job survival against a provider bug we
 do not control. It is not a design we want to keep.
+
+> **Filed under `done/` because the work shipped, not because the problem is
+> solved.** The quickfix is still live in the codebase, its load-bearing premise
+> has never been confirmed in production, and the removal checklist at the bottom
+> is still outstanding. Do not read this as resolved.
 
 ## What breaks
 
@@ -125,16 +134,43 @@ covers the two integration seams, so **verify these on a live cluster**:
 Also worth eyeballing in the first real transcript: whether the agent treats the
 notice as inert, or wastes a turn replying to it / re-verifying the workspace.
 
+**As of 2026-08-05 none of this has been checked.** The cluster was unreachable
+from the authoring session (kubectl DNS timeout, MCP behind a Cloudflare 1033
+tunnel error), so neither seam has been observed even once. Concretely still owed:
+
+```bash
+# 1. did the proxy upgrade stop the credential cascade?
+kubectl -n superhuman-remote-worker logs deploy/srw-codex-proxy | grep -B1 -A5 "408 |"
+#    PASS = a 408 is NOT followed by a run of 503s
+kubectl -n superhuman-remote-worker exec deploy/srw-orchestrator -c orchestrator -- \
+  curl -s -H "Authorization: Bearer $CODEX_MANAGEMENT_KEY" \
+  http://srw-codex-proxy:8317/v0/management/auth-files
+#    PASS = status stays "active" through a 408
+
+# 2. did the nudge fire, and did it work?
+kubectl -n superhuman-remote-worker logs -l srw/managed-by=agent-provisioner \
+  | grep "Injected request-shape nudge"
+#    then: did that job continue, or die with the same 408?
+```
+
+If the nudge fires and the job still dies identically, the premise is wrong —
+revert to the force-compaction path rather than tuning the wording.
+
 ## What is NOT in scope
 
 Two adjacent items, deliberately separate:
 
-- **Context budget drift.** We compact at `CONTEXT_THRESHOLD_FRACTION = 0.80`,
-  i.e. 320k for a 400k window, plus phase-boundary compaction
-  (`compact_on_archive`), which in practice fires far earlier — `d251e513`
-  compacted at ~148k. Codex holds gpt-5.6 input to 272k (~258k after buffer)
-  against a 400k *session* cap. Our token backstop is looser than theirs.
+- **Context budget — covered elsewhere, and my first numbers here were wrong.**
+  Superseded by
+  [`codex_proxy_context_window_cap.md`](codex_proxy_context_window_cap.md),
+  which live-probed the proxy: the input ceiling is **~357–380K** (400K total),
+  and exceeding it returns a clean `400 context_too_large`, not the 408 this doc
+  is about. **272K is NOT a cap** — it is only OpenAI's long-context *pricing*
+  tier; I took it from a secondary blog on 2026-07-30 and it was wrong. That doc
+  also fixes the drift by clamping codex-routed models to 400K
+  (`CODEX_CONTEXT_WINDOW_CAP`), which puts our 80% threshold at ~320K, safely
+  under the measured wall. Nothing left to do here.
 - **Loop jobs mask this.** `determine_job_status` maps a loop job that stops with
   no recognised freeze to `completed` (`completion.py`, `is_loop_job` branch), so
   a job that failed 13 times can still report success to the loop. Worse than the
-  grinding it replaced. Needs its own fix.
+  grinding it replaced. Still open — needs its own fix.

@@ -2885,7 +2885,7 @@ class PostgresDB:
                         else 1
                     )
 
-                # >>> TEMPORARY QUICKFIX — docs/issues/codex_stream_disconnect_shape_nudge.md
+                # >>> TEMPORARY QUICKFIX — docs/done/codex_stream_disconnect_shape_nudge.md
                 # One request-shape nudge per streak. Logic lives in
                 # services.completion.llm_outage_nudge_state so it is unit-
                 # testable without a database (the latch it implements is what
