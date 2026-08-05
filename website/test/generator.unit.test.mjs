@@ -18,12 +18,14 @@ function collectEnumPaths(node, prefix = '') {
 // generator.mjs's validate() (customer-facing profile fields) or whitelist it as
 // operator-only. `databases.neo4j.edition` + `vmController.transport` are the
 // generator-validated ones; the `canvas.livePreview.viewer.*` enums are operator
-// edge-topology settings the customer config generator never surfaces.
+// edge-topology settings and `workspace.accessMode` is an operator storage
+// setting that the customer config generator never surfaces.
 const KNOWN_ENUM_PATHS = [
   'databases.neo4j.edition',
   'vmController.transport',
   'canvas.livePreview.viewer.deploymentProfile',
   'canvas.livePreview.viewer.cookieMode',
+  'workspace.accessMode',
 ];
 
 const evalInputs = {
@@ -100,6 +102,12 @@ test('production secret skeleton includes generated + placeholder keys', () => {
   const { secretSkeleton } = generate('production', prodBase);
   assert.match(secretSkeleton, /APP_ENCRYPTION_KEY: [0-9a-f]{64}/);
   assert.match(secretSkeleton, /MCP_INTERNAL_KEY: [0-9a-f]{64}/);
+  assert.match(secretSkeleton, /GARAGE_RPC_SECRET: [0-9a-f]{64}/);
+  assert.match(secretSkeleton, /GARAGE_ADMIN_TOKEN: [0-9a-f]{64}/);
+  assert.match(secretSkeleton, /SNAPSHOT_S3_ACCESS_KEY_ID: GK[0-9a-f]{24}/);
+  assert.match(secretSkeleton, /SNAPSHOT_S3_SECRET_ACCESS_KEY: [0-9a-f]{64}/);
+  assert.match(secretSkeleton, /VIRTUAL_WORKSPACE_S3_ACCESS_KEY_ID: GK[0-9a-f]{24}/);
+  assert.match(secretSkeleton, /VIRTUAL_WORKSPACE_S3_SECRET_ACCESS_KEY: [0-9a-f]{64}/);
   assert.match(secretSkeleton, /POSTGRES_PASSWORD: CHANGE_ME/);
   assert.match(secretSkeleton, /GITEA_ADMIN_PASSWORD: CHANGE_ME/);     // stub-key footgun coverage
   assert.match(secretSkeleton, /kind: Secret/);

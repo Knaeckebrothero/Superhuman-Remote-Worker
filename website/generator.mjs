@@ -167,13 +167,22 @@ function vmControllerBlock(inputs) {
 }
 
 // Secret keys for the operator-owned-Secret profiles. GENERATED keys get a
-// random value (internal secrets); USER_KEYS get CHANGE_ME placeholders (or
-// filled values when fillSecrets). These mirror the chart's non-optional
+// format-compatible random value (internal secrets); USER_KEYS get CHANGE_ME
+// placeholders (or filled values when fillSecrets). These mirror the chart's non-optional
 // secretKeyRefs for the recommended (external-services) config — the drift-gate
 // (generator.drift.test.mjs) fails CI if the chart references a key not listed
 // here. NOTE: GITEA_ADMIN_* are referenced unconditionally by the chart even
 // with external git (a documented stub-key requirement), so they must be present.
-const GENERATED = ['APP_ENCRYPTION_KEY', 'MCP_INTERNAL_KEY'];
+const GENERATED = {
+  APP_ENCRYPTION_KEY: () => randomHex(32),
+  MCP_INTERNAL_KEY: () => randomHex(32),
+  GARAGE_RPC_SECRET: () => randomHex(32),
+  GARAGE_ADMIN_TOKEN: () => randomHex(32),
+  SNAPSHOT_S3_ACCESS_KEY_ID: () => `GK${randomHex(12)}`,
+  SNAPSHOT_S3_SECRET_ACCESS_KEY: () => randomHex(32),
+  VIRTUAL_WORKSPACE_S3_ACCESS_KEY_ID: () => `GK${randomHex(12)}`,
+  VIRTUAL_WORKSPACE_S3_SECRET_ACCESS_KEY: () => randomHex(32),
+};
 const USER_KEYS = {
   evaluation: [],
   production: ['POSTGRES_USER', 'POSTGRES_PASSWORD',
@@ -191,7 +200,7 @@ function buildSecret(profile, inputs) {
   }
   const val = (k) => (inputs.fillSecrets && inputs.secretValues?.[k]) || 'CHANGE_ME';
   const data = {};
-  for (const k of GENERATED) data[k] = randomHex(32);     // random internal secrets
+  for (const [k, generateValue] of Object.entries(GENERATED)) data[k] = generateValue();
   for (const k of USER_KEYS[profile]) data[k] = val(k);
 
   const lines = ['# Pre-create this Secret before `helm install`. Every key below is',
