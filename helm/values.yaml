@@ -1529,15 +1529,24 @@ codexProxy:
   enabled: false
   # Pin a concrete upstream version — CLIProxyAPI ships multiple builds/day and
   # `latest` makes pod restarts silently change behavior. Overlays may override.
-  image: docker.io/eceasy/cli-proxy-api:v7.2.61
+  #
+  # Floor is v7.2.110 (2026-08-05, was v7.2.61). Anything older than the
+  # 2026-07-15 fix `09da52ad` (router-for-me/CLIProxyAPI#3055) charges a
+  # REQUEST-scoped `408 stream disconnected before completion` to the
+  # CREDENTIAL: the auth entry goes unavailable and every following call gets an
+  # instant `503 auth_unavailable`, which reads as a dead token and takes out
+  # unrelated jobs on the same proxy. v7.2.110 adds IsRequestScoped() and is a
+  # strict descendant of that fix. Dev has run it since 2026-07-30.
+  # docs/done/codex_stream_disconnect_shape_nudge.md
+  image: docker.io/eceasy/cli-proxy-api:v7.2.110
   storageSize: "1Gi"
-  # Upstream retries INSIDE the proxy. Default is 0, which gives the whole stack
-  # zero tolerance for a dropped upstream stream: one `408 stream disconnected
-  # before completion` flips the (single) auth entry to `status: error`, so the
-  # agent's own retries then all bounce off an instant `503 auth_unavailable`,
-  # exhaust in ~31s, and freeze the job for a 30-60min backoff pause. Absorbing
-  # the drop here is upstream of every one of those consequences.
-  # Incident: 2026-07-29 job d251e513 (docs/issues/, memory).
+  # Retries INSIDE the proxy, on 403/408/500/502/503/504. An unset key yields 0
+  # (Go zero value) despite upstream's config.example.yaml documenting 3.
+  #
+  # Only safe at 3 BECAUSE of the image floor above. Pre-#3055, retrying a 408
+  # is what burns credentials — the upstream reporter watched it take out 4 of
+  # 6, then 5 of 6 — so on an older image this value is an amplifier, not a
+  # cure. If you ever pin the image back below v7.2.110, set this to 0.
   requestRetry: 3
   # Body-level request/response logging to the pod log. OFF by default: it emits
   # full prompts AND auth headers. Flip to true only while actively catching an
