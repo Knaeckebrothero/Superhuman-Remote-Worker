@@ -2436,6 +2436,72 @@ COMMENT ON TABLE public.usage_daily IS 'Daily pre-aggregated usage rollup (app-D
 
 
 --
+-- Name: usage_rate_card_rates; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.usage_rate_card_rates (
+    rate_card_id text NOT NULL,
+    category text NOT NULL,
+    resource text DEFAULT '*'::text NOT NULL,
+    unit text NOT NULL,
+    rate numeric NOT NULL,
+    capacity_per_billing_unit numeric DEFAULT 1 NOT NULL,
+    effective_from timestamp with time zone DEFAULT now() NOT NULL,
+    source_sku text,
+    source_metadata jsonb DEFAULT '{}'::jsonb NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT usage_rate_card_rates_capacity_per_billing_unit_check CHECK ((capacity_per_billing_unit > (0)::numeric)),
+    CONSTRAINT usage_rate_card_rates_rate_check CHECK ((rate >= (0)::numeric))
+);
+
+
+--
+-- Name: COLUMN usage_rate_card_rates.capacity_per_billing_unit; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.usage_rate_card_rates.capacity_per_billing_unit IS 'Ledger quantity represented by one unit charged at rate. Enables bundled instance share pricing without arbitrarily splitting CPU and RAM cost.';
+
+
+--
+-- Name: usage_rate_cards; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.usage_rate_cards (
+    id text NOT NULL,
+    provider text NOT NULL,
+    display_name text NOT NULL,
+    region text NOT NULL,
+    currency text NOT NULL,
+    aggregation text NOT NULL,
+    source_url text NOT NULL,
+    source_label text NOT NULL,
+    description text DEFAULT ''::text NOT NULL,
+    exclusions text DEFAULT ''::text NOT NULL,
+    enabled boolean DEFAULT true NOT NULL,
+    sort_order integer DEFAULT 100 NOT NULL,
+    source_checked_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT usage_rate_cards_aggregation_check CHECK ((aggregation = ANY (ARRAY['sum'::text, 'max'::text]))),
+    CONSTRAINT usage_rate_cards_currency_check CHECK ((currency ~ '^[A-Z]{3}$'::text))
+);
+
+
+--
+-- Name: TABLE usage_rate_cards; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.usage_rate_cards IS 'Public-cloud list-price comparison cards. Estimates only: never provider invoice data and never canonical usage_events cost.';
+
+
+--
+-- Name: COLUMN usage_rate_cards.aggregation; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.usage_rate_cards.aggregation IS 'sum = add independently billed components; max = dominant-share estimate for a bundled reference instance.';
+
+
+--
 -- Name: usage_rates; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -3136,6 +3202,22 @@ ALTER TABLE ONLY public.models
 
 ALTER TABLE ONLY public.thread_mounts
     ADD CONSTRAINT uq_thread_mount_path UNIQUE (thread_id, target_path);
+
+
+--
+-- Name: usage_rate_card_rates usage_rate_card_rates_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.usage_rate_card_rates
+    ADD CONSTRAINT usage_rate_card_rates_pkey PRIMARY KEY (rate_card_id, category, resource, unit, effective_from);
+
+
+--
+-- Name: usage_rate_cards usage_rate_cards_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.usage_rate_cards
+    ADD CONSTRAINT usage_rate_cards_pkey PRIMARY KEY (id);
 
 
 --
@@ -4147,6 +4229,13 @@ CREATE INDEX usage_daily_user_day_idx ON public.usage_daily USING btree (user_id
 
 
 --
+-- Name: usage_rate_card_rates_lookup_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX usage_rate_card_rates_lookup_idx ON public.usage_rate_card_rates USING btree (rate_card_id, category, resource, unit, effective_from DESC);
+
+
+--
 -- Name: workspace_intervals_open_uq; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -4914,6 +5003,14 @@ ALTER TABLE ONLY public.threads
 
 ALTER TABLE ONLY public.threads
     ADD CONSTRAINT threads_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE SET NULL;
+
+
+--
+-- Name: usage_rate_card_rates usage_rate_card_rates_rate_card_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.usage_rate_card_rates
+    ADD CONSTRAINT usage_rate_card_rates_rate_card_id_fkey FOREIGN KEY (rate_card_id) REFERENCES public.usage_rate_cards(id) ON DELETE CASCADE;
 
 
 --
