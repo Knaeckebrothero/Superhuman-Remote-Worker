@@ -196,6 +196,43 @@ describe('Canvas live-app viewer lifecycle', () => {
     http.expectOne(request => request.url.endsWith(`/${ATTACHMENT_ONE}`)).flush(null);
   });
 
+  it('does not re-attempt a failed create while the reconciled state is unchanged', () => {
+    controller.syncPresentation(true, 'thread-1', appState(1), '"canvas:1"');
+    http.expectOne(request => request.url.endsWith('/view-attachments')).flush(
+      {detail: {code: 'canvas_precondition_failed'}},
+      {status: 412, statusText: 'Precondition Failed'},
+    );
+    expect(canvas.reconcile).toHaveBeenCalledTimes(1);
+    expect(controller.viewerStatus()).toBe('error');
+
+    // The forced reconcile lands on the same state, which re-runs the pane's
+    // presentation effect. Re-attempting here is what turns one rejected
+    // precondition into an unbounded request storm.
+    controller.syncPresentation(true, 'thread-1', appState(1), '"canvas:1"');
+
+    http.expectNone(request => request.url.endsWith('/view-attachments'));
+    expect(controller.viewerStatus()).toBe('error');
+    expect(controller.viewerErrorCode()).toBe('canvas_viewer_create_failed');
+  });
+
+  it('re-attempts as soon as the reconciled state carries a new ETag', () => {
+    controller.syncPresentation(true, 'thread-1', appState(1), '"canvas:1"');
+    http.expectOne(request => request.url.endsWith('/view-attachments')).flush(
+      {detail: {code: 'canvas_precondition_failed'}},
+      {status: 412, statusText: 'Precondition Failed'},
+    );
+
+    controller.syncPresentation(true, 'thread-1', appState(2), '"canvas:2"');
+
+    const retry = http.expectOne(request => request.url.endsWith('/view-attachments'));
+    expect(retry.request.headers.get('If-Match')).toBe('"canvas:2"');
+    retry.flush(attachment());
+    expect(controller.frameUrl()).not.toBeNull();
+
+    controller.syncPresentation(false, 'thread-1', appState(2), '"canvas:2"');
+    http.expectOne(request => request.url.endsWith(`/${ATTACHMENT_ONE}`)).flush(null);
+  });
+
   it('authorizes only an exact frame challenge and becomes ready only on the receipt', () => {
     controller.syncPresentation(true, 'thread-1', appState(1), '"canvas:1"');
     http.expectOne(request => request.url.endsWith('/view-attachments')).flush(attachment());

@@ -1727,6 +1727,90 @@ def test_office_session_mint_requires_bff_cookie_and_returns_form_contract(
     }
 
 
+def test_office_session_accepts_the_weakened_form_of_its_own_state_etag(
+    monkeypatch,
+) -> None:
+    """The Office pane holds whatever ETag the CDN handed the browser."""
+
+    from routers import canvases
+    from services.canvas_office import CollaboraConfig, WopiTokenGrant
+
+    office = _office_file()
+    source = WorkspaceFileSource(path=office.path, workspace_generation=GENERATION)
+    record = CanvasRecord(
+        thread_id=THREAD_ID,
+        canvas_id="main",
+        source=source,
+        title="Office report",
+        renderer="office",
+        editable=False,
+        alt_text=None,
+        presentation_revision=3,
+        source_fingerprint=canonical_source_fingerprint(source),
+        source_version=office.source_version,
+        origin_generation=None,
+        created_at=NOW,
+        updated_at=NOW,
+    )
+    client, _, _, _ = _route_client(monkeypatch, record=record, file=office)
+    config = CollaboraConfig(
+        enabled=True,
+        internal_url="http://collabora:9980",
+        public_origin="https://office.example.test",
+        wopi_base_url="http://orchestrator:8085",
+        cockpit_origin="https://cockpit.example.test",
+        token_ttl_seconds=36_000,
+        discovery_cache_ttl_seconds=60,
+        request_timeout_seconds=2.0,
+    )
+
+    class Discovery:
+        async def get_urlsrc(self, extension):
+            return "https://office.example.test/browser/hash/cool.html?"
+
+    class Tokens:
+        def mint(self, **kwargs):
+            return WopiTokenGrant(
+                access_token="signed-token",
+                file_id="f" * 64,
+                expires_at_ms=1_721_858_400_000,
+            )
+
+    monkeypatch.setattr(canvases, "_get_collabora_config", lambda: config)
+    monkeypatch.setattr(canvases, "_get_office_discovery", Discovery)
+    monkeypatch.setattr(canvases, "_get_wopi_token_service", lambda db: Tokens())
+
+    state_url = f"/api/persistent/threads/{THREAD_ID}/canvases/main"
+    state = client.get(state_url)
+    assert state.status_code == 200
+
+    session = client.post(
+        f"{state_url}/office-session",
+        headers={
+            "If-Match": f"W/{state.headers['etag']}",
+            "Origin": config.cockpit_origin,
+        },
+        cookies={"srw_session": "33333333-3333-4333-8333-333333333333"},
+        content=b"",
+    )
+
+    assert session.status_code == 200
+    assert session.json()["access_token"] == "signed-token"
+
+    other_state = client.post(
+        f"{state_url}/office-session",
+        headers={
+            "If-Match": 'W/"canvas:3:' + "0" * 64 + '"',
+            "Origin": config.cockpit_origin,
+        },
+        cookies={"srw_session": "33333333-3333-4333-8333-333333333333"},
+        content=b"",
+    )
+
+    assert other_state.status_code == 412
+    assert other_state.json()["detail"]["code"] == "canvas_precondition_failed"
+
+
 def test_editable_office_session_mints_write_scope_and_capability(monkeypatch) -> None:
     from routers import canvases
     from services.canvas_office import CollaboraConfig, WopiTokenGrant
@@ -1996,6 +2080,46 @@ def test_refresh_adopts_drifted_file_with_the_visible_state_etag(monkeypatch) ->
         f'"{gateway.file.source_version}"'
     )
     assert service.record.source_version == gateway.file.source_version
+
+
+def test_refresh_accepts_the_weakened_form_of_its_own_state_etag(monkeypatch) -> None:
+    """A CDN-weakened ETag names the same state; the shape gate must admit it."""
+
+    client, service, gateway, _ = _route_client(
+        monkeypatch, record=_record(editable=True)
+    )
+    gateway.file = _file(b"# Agent changed this outside Canvas\n")
+    url = f"/api/persistent/threads/{THREAD_ID}/canvases/main"
+    drifted = client.get(url)
+    assert drifted.status_code == 200
+
+    refreshed = client.post(
+        f"{url}/refresh",
+        headers={"If-Match": f"W/{drifted.headers['etag']}"},
+    )
+
+    assert refreshed.status_code == 200
+    assert refreshed.json()["presentation_revision"] == 2
+    assert service.record.source_version == gateway.file.source_version
+
+
+def test_refresh_refuses_a_weakened_etag_for_another_state(monkeypatch) -> None:
+    """Admitting the weak marker must not admit a different state."""
+
+    client, service, gateway, _ = _route_client(
+        monkeypatch, record=_record(editable=True)
+    )
+    gateway.file = _file(b"# Agent changed this outside Canvas\n")
+    url = f"/api/persistent/threads/{THREAD_ID}/canvases/main"
+
+    response = client.post(
+        f"{url}/refresh",
+        headers={"If-Match": 'W/"canvas:1:' + "0" * 64 + '"'},
+    )
+
+    assert response.status_code == 412
+    assert response.json()["detail"]["code"] == "canvas_precondition_failed"
+    assert service.record.presentation_revision == 1
 
 
 def test_refresh_rejects_a_caller_supplied_source_body(monkeypatch) -> None:
