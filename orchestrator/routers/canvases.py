@@ -32,6 +32,7 @@ from services.canvas import (
     WorkspaceAppSource,
     WorkspaceFileSource,
     build_public_canvas_representation,
+    strong_state_precondition,
 )
 from services.canvas_apps import (
     CanvasAppError,
@@ -819,7 +820,7 @@ async def create_main_canvas_view_attachment(
                 "message": "If-Match is required to attach a Canvas viewer",
             },
         )
-    if not secrets.compare_digest(expected.strip(), visible.etag):
+    if not secrets.compare_digest(strong_state_precondition(expected), visible.etag):
         raise HTTPException(
             status_code=412,
             detail={
@@ -993,7 +994,7 @@ async def create_main_canvas_office_session(
                 "message": "If-Match is required to open an Office Canvas session",
             },
         )
-    if not secrets.compare_digest(expected.strip(), visible.etag):
+    if not secrets.compare_digest(strong_state_precondition(expected), visible.etag):
         raise HTTPException(
             status_code=412,
             detail={
@@ -1548,7 +1549,8 @@ async def refresh_main_canvas(thread_id: str, request: Request) -> Response:
                 "message": "If-Match is required to refresh a Canvas",
             },
         )
-    if not re.fullmatch(r'"canvas:[0-9]+:[0-9a-f]{64}"', expected_etag.strip()):
+    expected_etag = strong_state_precondition(expected_etag)
+    if not re.fullmatch(r'"canvas:[0-9]+:[0-9a-f]{64}"', expected_etag):
         raise HTTPException(
             status_code=400,
             detail={
@@ -1655,7 +1657,8 @@ async def reset_main_canvas_origin(thread_id: str, request: Request) -> Response
                 "message": "If-Match is required to reset a Canvas origin",
             },
         )
-    if not re.fullmatch(r'"canvas:[0-9]+:[0-9a-f]{64}"', expected_etag.strip()):
+    expected_etag = strong_state_precondition(expected_etag)
+    if not re.fullmatch(r'"canvas:[0-9]+:[0-9a-f]{64}"', expected_etag):
         raise HTTPException(
             status_code=400,
             detail={

@@ -942,6 +942,86 @@ def test_attachment_route_requires_bff_cookie_and_exact_state_etag(
     assert viewer.calls[0]["expected_record"] is record
 
 
+def test_attachment_route_accepts_the_weakened_form_of_its_own_state_etag(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A compressing CDN is the only ETag the cockpit can ever echo back.
+
+    Cloudflare rewrites ``ETag: "canvas:…"`` to ``W/"canvas:…"`` whenever it
+    compresses the state response, so the browser stores — and returns in
+    ``If-Match`` — the weak form of the exact state we authorized. The digest
+    still names that representation; only the transfer encoding changed.
+    """
+
+    record = _app_record()
+    representation = build_public_canvas_representation(
+        record,
+        status="ready",
+        capabilities=CanvasCapabilities(can_create_viewer_session=True),
+    )
+    now = datetime.now(UTC)
+    attachment_id = uuid4()
+    origin = f"https://{record.origin_generation}.canvas.user-content.test"
+    grant = CanvasViewerAttachmentGrant(
+        attachment_id=attachment_id,
+        origin=origin,
+        bootstrap_url=f"{origin}/_canvas/bootstrap?attachment_id={attachment_id}",
+        bridge_nonce="b" * 43,
+        bootstrap_expires_at=now + timedelta(seconds=60),
+        expires_at=now + timedelta(minutes=20),
+        renew_after=now + timedelta(minutes=10),
+    )
+    viewer = _RouteViewerService(grant)
+    db = SimpleNamespace()
+
+    async def owner(request, current_db, thread_id):
+        return {"id": "b4444444-4444-4444-4444-444444444444"}, {
+            "id": thread_id,
+            "user_id": "b4444444-4444-4444-4444-444444444444",
+        }
+
+    async def represent(*args, **kwargs):
+        return representation
+
+    monkeypatch.setattr(canvas_routes, "_get_db", lambda: db)
+    monkeypatch.setattr(
+        canvas_routes,
+        "_get_canvas_service",
+        lambda current_db: _RouteCanvasService(record),
+    )
+    monkeypatch.setattr(canvas_routes, "_get_viewer_service", lambda current_db: viewer)
+    monkeypatch.setattr(canvas_routes, "require_thread_owner", owner)
+    monkeypatch.setattr(canvas_routes, "_represent", represent)
+    app = FastAPI()
+    app.include_router(canvas_routes.router)
+    client = TestClient(app)
+    url = f"/api/persistent/threads/{record.thread_id}/canvases/main/view-attachments"
+    headers = {
+        "Cookie": f"srw_session={uuid4()}",
+        "Origin": "https://cockpit.platform.test",
+        "Sec-Fetch-Site": "same-origin",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Dest": "empty",
+    }
+
+    weakened = client.post(
+        url, headers={**headers, "If-Match": f"W/{representation.etag}"}
+    )
+
+    assert weakened.status_code == 200
+    assert weakened.json()["attachment_id"] == str(grant.attachment_id)
+    assert len(viewer.calls) == 1
+
+    other_state = client.post(
+        url,
+        headers={**headers, "If-Match": 'W/"canvas:1:' + "0" * 64 + '"'},
+    )
+
+    assert other_state.status_code == 412
+    assert other_state.json()["detail"]["code"] == "canvas_precondition_failed"
+    assert len(viewer.calls) == 1
+
+
 def test_authorize_route_requires_exact_bff_session_origin_and_closed_schema(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

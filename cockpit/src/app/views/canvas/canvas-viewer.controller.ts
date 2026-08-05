@@ -68,6 +68,7 @@ export class CanvasViewerController {
   readonly viewerErrorCode = signal<string | null>(null);
 
   private desired: DesiredViewer | null = null;
+  private failedDesired: DesiredViewer | null = null;
   private attachment: ActiveAttachment | null = null;
   private request: Subscription | null = null;
   private requestToken: symbol | null = null;
@@ -110,6 +111,12 @@ export class CanvasViewerController {
     }
 
     if (this.request && this.requestDesired && sameDesired(this.requestDesired, desired)) return;
+    // One rejected create must not become a request storm. This effect re-runs
+    // for every reconciled state — including the unchanged state that the
+    // forced reconcile after a failure brings back — so a create that already
+    // failed for exactly this state waits for a state that actually differs,
+    // or for the explicit retry.
+    if (this.failedDesired && sameDesired(this.failedDesired, desired)) return;
     this.cancelRequest();
     this.createAttachment(desired);
   }
@@ -449,9 +456,11 @@ export class CanvasViewerController {
 
   private handleCreateError(token: symbol, error: unknown): void {
     if (this.requestToken !== token) return;
+    const failed = this.requestDesired;
     const status = httpStatus(error);
     const code = httpErrorCode(error);
     this.cancelRequest();
+    this.failedDesired = failed;
     if (status === 412 || status === 401 || status === 403 || status === 404) {
       this.canvas.reconcile();
     }
@@ -533,6 +542,7 @@ export class CanvasViewerController {
     this.cancelRequest();
     this.cancelAuthorization();
     this.clearTimers();
+    this.failedDesired = null;
     const attachment = this.attachment;
     this.attachment = null;
     this.frameWindow = null;

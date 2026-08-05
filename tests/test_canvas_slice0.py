@@ -663,6 +663,76 @@ def test_delete_route_requires_exact_etag_then_becomes_idempotent(monkeypatch) -
     assert persisted.json()["presentation_revision"] == 2
 
 
+def test_delete_route_accepts_the_weakened_form_of_its_own_etag(monkeypatch) -> None:
+    """The read path already tolerates ``W/``; every write path must agree.
+
+    A compressing CDN in front of the API rewrites our strong ETag to its weak
+    form, so that is the only value the browser holds for the state it is
+    conditioning on. Nothing about the represented state changed.
+    """
+
+    db = _FakeCanvasDB()
+    _seed_presented(db)
+    app, _ = _route_app(monkeypatch, db)
+    client = TestClient(app)
+    url = f"/api/persistent/threads/{_THREAD_ID}/canvases/main"
+
+    current = client.get(url)
+    cleared = client.delete(url, headers={"If-Match": f"W/{current.headers['etag']}"})
+
+    assert cleared.status_code == 200
+    assert cleared.json()["status"] == "cleared"
+
+
+def test_delete_route_refuses_a_weakened_etag_for_another_state(monkeypatch) -> None:
+    """Tolerating the weak marker must not loosen the digest comparison."""
+
+    db = _FakeCanvasDB()
+    _seed_presented(db)
+    app, _ = _route_app(monkeypatch, db)
+    client = TestClient(app)
+    url = f"/api/persistent/threads/{_THREAD_ID}/canvases/main"
+
+    stale = client.delete(url, headers={"If-Match": 'W/"canvas:1:' + "0" * 64 + '"'})
+    assert stale.status_code == 412
+    assert stale.json()["detail"]["code"] == "canvas_precondition_failed"
+
+    wildcard = client.delete(url, headers={"If-Match": "*"})
+    assert wildcard.status_code == 412
+    assert wildcard.json()["detail"]["code"] == "canvas_precondition_failed"
+
+
+def test_reset_origin_route_accepts_the_weakened_form_of_its_own_etag(
+    monkeypatch,
+) -> None:
+    """The shape gate must admit the weak marker the CDN prepends."""
+
+    db = _FakeCanvasDB()
+    source = WorkspaceAppSource(
+        entry_port=5173,
+        entry_path="/demo",
+        workspace_generation=_WORKSPACE_GENERATION,
+    )
+    asyncio.run(
+        CanvasService(db).set(
+            _THREAD_ID,
+            CanvasSetInput(source=source, title="Prototype"),
+        )
+    )
+    app, _ = _route_app(monkeypatch, db)
+    client = TestClient(app)
+    base = f"/api/persistent/threads/{_THREAD_ID}/canvases/main"
+
+    current = client.get(base)
+    reset = client.post(
+        f"{base}/reset-origin",
+        headers={"If-Match": f"W/{current.headers['etag']}"},
+    )
+
+    assert reset.status_code == 200
+    assert reset.json()["presentation_revision"] == 2
+
+
 def test_reset_origin_route_is_conditional_and_never_exposes_generation(
     monkeypatch,
 ) -> None:

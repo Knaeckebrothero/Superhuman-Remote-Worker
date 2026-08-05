@@ -1454,7 +1454,21 @@ domain revision used by events and content preconditions. State responses use
 `DELETE` or `refresh` of an existing row requires the exact current state tag
 in `If-Match`; missing/stale preconditions return `428`/`412`, including when
 health or caller capabilities changed. `reset-origin` uses the same exact strong
-precondition and rejects a cleared or non-live-app Canvas. The agent tool uses a
+precondition and rejects a cleared or non-live-app Canvas.
+
+"Exact" means the digest, not the wire bytes. A compressing CDN in front of the
+API rewrites the strong `ETag` it forwards into the weak form, so `W/"canvas:…"`
+is the only value a browser that read the state through one can echo back —
+`server: cloudflare` returns `W/"canvas:1:<digest>"` for the identical response
+the origin tags `"canvas:1:<digest>"`. Every state precondition therefore drops
+a leading `W/` before comparing (`strong_state_precondition`), exactly as the
+conditional `GET` has always done, and compares the full digest after that. It
+never expands `*`: these preconditions name one state, not whatever exists now.
+Miss this and the weak tag passes the conditional `GET` (`304`) while failing
+every mutation (`412`/`400`), which is a live-app viewer that reconciles and
+re-attaches forever. The Cockpit backs that up: a create rejected for one exact
+desired state is not retried for that same state until the state changes or the
+user retries. The agent tool uses a
 server-identifiable internal + delegated-user adapter and may intentionally
 replace current state under the row lock; never
 trust an actor field/header supplied by a public client to select that behavior.
