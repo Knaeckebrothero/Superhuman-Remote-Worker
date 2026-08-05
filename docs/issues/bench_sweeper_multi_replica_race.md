@@ -26,6 +26,16 @@ ledger holds exactly 2 entries. Either the status-refresh phase skews the
 timing enough, or we got lucky. No duplicates seen so far; the run monitor
 counts duplicate pairs continuously.
 
+**Update, same day 15:48Z — the race fired.** `A1-inbox-digest` r1 was
+submitted twice, `submitted_at` **2 ms apart** (15:48:33.114 / .116, one per
+replica; the replicas' tick phases converged after the 11:09Z pod restarts).
+Ledger went to 11 entries for 10 pairs, 3 jobs in flight against
+`max_in_flight=2`. The duplicate (`572649b6`) was cancelled manually before
+its first LLM call (0 requests — still provisioning), so zero token burn and
+the row auto-classifies as `infra` in the report. With ~10-min monitoring
+lag, a duplicate D-task would have burned real money. This upgrades the fix
+from "nice to have" to "before the next long run".
+
 ## Impact
 
 - Worst case: duplicate jobs = wasted LLM spend + an extra unplanned
