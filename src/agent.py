@@ -85,7 +85,7 @@ _AUTO_CONTINUE_FREEZE_TYPES = frozenset(
 )
 
 # >>> TEMPORARY QUICKFIX (2026-07-30) — delete with the upstream fix.
-# docs/issues/codex_stream_disconnect_shape_nudge.md
+# docs/done/codex_stream_disconnect_shape_nudge.md
 # Injected as a user turn when the orchestrator has seen N byte-identical
 # upstream rejections of the SAME payload. Its only job is to make the next
 # request differ, so the wording is secondary to its existence — but it has
@@ -1135,7 +1135,7 @@ class UniversalAgent:
                             f"and resumes from its checkpoint"
                         )
                         # >>> TEMPORARY QUICKFIX — remove with the upstream fix.
-                        # docs/issues/codex_stream_disconnect_shape_nudge.md
+                        # docs/done/codex_stream_disconnect_shape_nudge.md
                         # The orchestrator arms this after N byte-identical
                         # failures. Resuming replays the SAME payload, which
                         # upstream has already rejected every time; appending a

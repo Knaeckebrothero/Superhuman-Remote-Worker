@@ -1013,7 +1013,7 @@ LLM_OUTAGE_JITTER = (os.getenv("LLM_OUTAGE_JITTER") or "full").strip().lower() o
 # Incident: 2026-07-29 job d251e513 burned 13 attempts on an identical
 # `503 auth_unavailable` that failed on attempt 1 of every single re-dispatch.
 LLM_OUTAGE_REPEAT_CEILING = _env_int("LLM_OUTAGE_REPEAT_CEILING", 4)
-# >>> TEMPORARY QUICKFIX (2026-07-30) — docs/issues/codex_stream_disconnect_shape_nudge.md
+# >>> TEMPORARY QUICKFIX (2026-07-30) — docs/done/codex_stream_disconnect_shape_nudge.md
 # Spend one extra backoff cycle on a request-SHAPE change before the repeat
 # give-up fires. Exists only because OpenAI's `stream disconnected before
 # completion` (openai/codex#9995, still OPEN) is deterministic per payload: the
@@ -1130,7 +1130,7 @@ def llm_outage_nudge_state(
 ) -> tuple[bool, bool]:
     """One-shot arming for the request-shape nudge → ``(pending, attempted)``.
 
-    >>> TEMPORARY QUICKFIX — docs/issues/codex_stream_disconnect_shape_nudge.md
+    >>> TEMPORARY QUICKFIX — docs/done/codex_stream_disconnect_shape_nudge.md
 
     Pure so it can be tested without a database;
     :meth:`PostgresDB.increment_job_llm_outage_attempt` is its only caller and
@@ -1551,7 +1551,7 @@ def determine_job_status(
             repeats = int(prior.get("repeats", 0) or 0) + 1
             if repeats >= LLM_OUTAGE_REPEAT_CEILING:
                 # >>> TEMPORARY QUICKFIX — remove when the upstream 408 is fixed.
-                # docs/issues/codex_stream_disconnect_shape_nudge.md
+                # docs/done/codex_stream_disconnect_shape_nudge.md
                 # Spend ONE more cycle on a request-shape change before giving
                 # up. A byte-identical replay of a payload upstream has already
                 # rejected N times cannot succeed, but appending a short turn

@@ -700,7 +700,7 @@ class TestRepeatGiveUp:
 
 
 class TestShapeNudgeQuickfix:
-    """TEMPORARY — delete with docs/issues/codex_stream_disconnect_shape_nudge.md.
+    """TEMPORARY — delete with docs/done/codex_stream_disconnect_shape_nudge.md.
 
     Upstream rejects a byte-identical payload deterministically, so the repeat
     give-up must spend exactly ONE more cycle on a shape change before it fires.
