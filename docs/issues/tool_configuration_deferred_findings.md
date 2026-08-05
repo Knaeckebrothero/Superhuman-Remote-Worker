@@ -75,14 +75,24 @@ exposes it — `/api/projects/{id}/experts` reads the project's *Gitea repo*
 those two tables to the allowlist, read-only, is the fleet-tooling fix; its
 absence is the whole reason 1.1 needed a bespoke instrument.
 
-**1.3 Three issue docs, filed 2026-08-03 out of this run:**
+**1.3 Three issue docs, filed 2026-08-03 out of this run. Two are now FIXED
+(2026-08-04/05, unpushed, live-gated on k3d):**
 
-- [[resume_job_grant_recheck_fails_open]] — pre-existing, security-shaped, and
-  made reachable from stored data by this work.
-- [[job_mode_reasoning_pick_silently_reset]] — the probable job-mode twin of the
-  session defect fixed in this series.
-- [[duplicate_expert_bypasses_user_experts_kill_switch]] — the one expert write
-  route that still skips the combined save gate.
+- ~~[[resume_job_grant_recheck_fails_open]]~~ **FIXED** — pre-existing,
+  security-shaped, and made reachable from stored data by this work. Now 409s when
+  the stored config is unusable while still tolerating a transient failure. Its
+  review then found the same PEP block exists a **second** time on the dispatcher
+  path, still unfixed: [[dispatcher_resume_pep_twin_still_fails_open]].
+- ~~[[duplicate_expert_bypasses_user_experts_kill_switch]]~~ **FIXED**, and larger
+  than filed: the kill switch now holds on all five write routes, and the grants
+  half on `duplicate` and `expert-defaults/{type}/fork` **strips and reports**
+  instead of refusing. Refusing was measured to block **7 of the 11 shipped
+  experts** for a default-grants user, `scholar` included — which is the case both
+  routes advertise.
+- [[job_mode_reasoning_pick_silently_reset]] — **still open**, untouched. The
+  probable job-mode twin of the session defect fixed in this series.
+
+Gate: [[expert_write_gate_holes_live_gate_2026-08-04]].
 
 ---
 
@@ -242,7 +252,10 @@ handoff items this series dropped.
    back to `config_name` and loses the expert), **1 fails soft to HTTP 200**
    (`_resume_job_on_agent` returns `False`, which `resume_job` reads as
    "queue for auto-dispatch"), and **1 fails open** — the subject of
-   [[resume_job_grant_recheck_fails_open]].
+   [[resume_job_grant_recheck_fails_open]], **fixed 2026-08-04**. Note the
+   *fails-soft-to-200* row above is the dispatcher-side twin and is **still**
+   unfixed: [[dispatcher_resume_pep_twin_still_fails_open]]. This table's other
+   six rows are unchanged.
 2. **`normalize_tool_policy` sits inside a `try` that loses the filename.**
    `orchestrator/services/config_resolver.py:110` — on raise, `bundled_leaf` is
    left un-normalised and the error does not say which config file was bad.
