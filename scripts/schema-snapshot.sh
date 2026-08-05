@@ -28,6 +28,13 @@
 #   * The `-- Dumped from database version` / `-- Dumped by pg_dump version`
 #     header lines are stripped so a Postgres MINOR bump (pg15.4 -> pg15.5)
 #     doesn't churn the artifact for no schema reason.
+#   * The audit migrations seed their monthly partitions RELATIVE TO now()
+#     (`date_trunc('month', now()) + i months`), so replaying the identical
+#     migration chain in July yields _p2026_07..09 and in August _p2026_08..10.
+#     That is drift in the dump but not in the schema, and it made the CI
+#     freshness gate fail for everyone on the 1st of every month. The rolling
+#     months are canonicalized to a fixed synthetic epoch (see
+#     canonicalize_rolling_partitions).
 # Everything else pg_dump emits is deterministic for a fixed input + image, so
 # the artifact is byte-stable and reviewable as a plain diff.
 #
@@ -155,6 +162,14 @@ EOF
 --   * Monthly audit partition children beyond the migration-seeded ones —
 --     created at runtime by services/audit_partitions.py
 --     (CREATE TABLE ... (LIKE parent)) as time advances.
+--
+-- The monthly partitions below are named _p1970_01, _p1970_02, ... and bounded
+-- on 1970 dates. Those months are SYNTHETIC. The migrations seed them relative to
+-- now() (current month + 2 lookahead), so a literal dump would rename every
+-- leaf on the 1st of each month and report schema drift where none exists; the
+-- snapshot rewrites the rolling window onto a fixed epoch instead. Real
+-- databases carry the actual months. Only the count, bounds width, storage
+-- params, indexes and constraints of these leaves are meaningful here.
 EOF
       ;;
     *)
@@ -163,6 +178,59 @@ EOF
   esac
   echo "-- =============================================================================="
   echo ""
+}
+
+# Synthetic year the rolling monthly partitions are rewritten onto. Any year is
+# fine as long as it is fixed and obviously not a real data month; 1970 reads as
+# "epoch placeholder" and keeps the artifact valid, applyable SQL.
+EPOCH_YEAR=1970
+
+# Canonicalize rolling monthly partitions (`<parent>_pYYYY_MM`) onto $EPOCH_YEAR
+# so the artifact depends on the migration chain alone, never on the wall clock
+# of whoever ran the dump. Reads a dump body on stdin, writes the rewritten body
+# on stdout.
+#
+# The i-th chronologically-distinct month found becomes $EPOCH_YEAR-i, and the
+# `FOR VALUES FROM/TO` literals move with it (the last partition's exclusive
+# upper bound is the month after the last seeded one, and appears only as a
+# literal, never as a name). Correctness rests on two properties:
+#   * YYYY_MM sorts lexicographically == chronologically, so the mapping is
+#     stable across a year boundary (2026_11, 2026_12, 2027_01 -> _01, _02, _03).
+#   * The rewrite is textual and order-preserving, and every leaf of a parent
+#     shares the `<parent>_p` prefix, so the leaves stay grouped between the same
+#     neighbours pg_dump put them between — the substitution can never reorder
+#     the file.
+# A no-op for families with no such partitions (currently app and vector).
+canonicalize_rolling_partitions() {
+  local text months m y mm i=0 sed_args=() last=""
+  text="$(cat)"
+
+  months="$(grep -oE '_p[0-9]{4}_[0-9]{2}' <<<"$text" | sed 's/^_p//' | sort -u)"
+  if [[ -z "$months" ]]; then
+    printf '%s\n' "$text"
+    return 0
+  fi
+
+  while read -r m; do
+    [[ -z "$m" ]] && continue
+    i=$((i + 1))
+    y="${m%_*}"
+    mm="${m#*_}"
+    sed_args+=(-e "s/_p${y}_${mm}/_p${EPOCH_YEAR}_$(printf '%02d' "$i")/g")
+    sed_args+=(-e "s/'${y}-${mm}-01 00:00:00+00'/'${EPOCH_YEAR}-$(printf '%02d' "$i")-01 00:00:00+00'/g")
+    last="$m"
+  done <<<"$months"
+
+  # Exclusive upper bound of the final partition = the month after $last.
+  y="${last%_*}"
+  mm=$((10#${last#*_} + 1))
+  if ((mm > 12)); then
+    mm=1
+    y=$((y + 1))
+  fi
+  sed_args+=(-e "s/'${y}-$(printf '%02d' "$mm")-01 00:00:00+00'/'${EPOCH_YEAR}-$(printf '%02d' $((i + 1)))-01 00:00:00+00'/g")
+
+  printf '%s\n' "$text" | sed "${sed_args[@]}"
 }
 
 # Generate one family's artifact into $OUT_DIR (or a caller-supplied dir via
@@ -215,11 +283,13 @@ generate_one() {
   fi
 
   # Normalize: strip the random \restrict/\unrestrict lines and the version
-  # header lines; keep everything else (SETs, -- Name: banners, DDL).
+  # header lines, then pin the now()-relative monthly partitions to a fixed
+  # epoch; keep everything else (SETs, -- Name: banners, DDL).
   local body
   body="$(printf '%s\n' "$raw" \
     | grep -vE '^\\(un)?restrict ' \
-    | grep -vE '^-- Dumped (from database|by pg_dump) version ')"
+    | grep -vE '^-- Dumped (from database|by pg_dump) version ' \
+    | canonicalize_rolling_partitions)"
 
   mkdir -p "$dest_dir"
   { emit_header "$fam"; printf '%s\n' "$body"; } > "$dest"

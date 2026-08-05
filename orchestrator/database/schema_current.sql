@@ -1015,6 +1015,48 @@ CREATE TABLE public.external_contacts (
 
 
 --
+-- Name: job_change_records; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.job_change_records (
+    job_id uuid NOT NULL,
+    project_id uuid,
+    loop_id uuid,
+    record_type character varying(32) NOT NULL,
+    role character varying(200) NOT NULL,
+    iteration integer,
+    status character varying(50) NOT NULL,
+    repo_name character varying(200),
+    branch_name character varying(200),
+    delivery_status character varying(50) DEFAULT 'none'::character varying NOT NULL,
+    delivery_ref text,
+    delivery_sha text,
+    completion_notes text DEFAULT ''::text NOT NULL,
+    delivery_notes jsonb DEFAULT '[]'::jsonb NOT NULL,
+    changes jsonb DEFAULT '[]'::jsonb NOT NULL,
+    error text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT job_change_records_changes_check CHECK ((jsonb_typeof(changes) = 'array'::text)),
+    CONSTRAINT job_change_records_delivery_notes_check CHECK ((jsonb_typeof(delivery_notes) = 'array'::text)),
+    CONSTRAINT job_change_records_record_type_check CHECK (((record_type)::text = ANY ((ARRAY['job_record'::character varying, 'loop_record'::character varying])::text[])))
+);
+
+
+--
+-- Name: TABLE job_change_records; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.job_change_records IS 'One immutable terminal outcome per job. Replaces retros/*.md in shared project jobs repositories; PostgreSQL is the project-history authority.';
+
+
+--
+-- Name: COLUMN job_change_records.job_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.job_change_records.job_id IS 'Execution job identifier without a foreign key: project history survives job-row and isolated-repository cleanup.';
+
+
+--
 -- Name: job_datasources; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -2591,6 +2633,14 @@ ALTER TABLE ONLY public.external_contacts
 
 
 --
+-- Name: job_change_records job_change_records_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.job_change_records
+    ADD CONSTRAINT job_change_records_pkey PRIMARY KEY (job_id);
+
+
+--
 -- Name: job_datasources job_datasources_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -3256,6 +3306,20 @@ CREATE INDEX idx_ext_contacts_project ON public.external_contacts USING btree (p
 --
 
 CREATE INDEX idx_grants_scope ON public.capability_grants USING btree (scope_kind, scope_id);
+
+
+--
+-- Name: idx_job_change_records_loop_iteration; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_job_change_records_loop_iteration ON public.job_change_records USING btree (loop_id, iteration DESC) WHERE (loop_id IS NOT NULL);
+
+
+--
+-- Name: idx_job_change_records_project_created; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_job_change_records_project_created ON public.job_change_records USING btree (project_id, created_at DESC);
 
 
 --
@@ -4299,6 +4363,22 @@ ALTER TABLE ONLY public.canvas_snapshots
 
 ALTER TABLE ONLY public.jobs
     ADD CONSTRAINT fk_jobs_assigned_agent FOREIGN KEY (assigned_agent_id) REFERENCES public.agents(id) ON DELETE SET NULL;
+
+
+--
+-- Name: job_change_records job_change_records_loop_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.job_change_records
+    ADD CONSTRAINT job_change_records_loop_id_fkey FOREIGN KEY (loop_id) REFERENCES public.project_loops(id) ON DELETE SET NULL;
+
+
+--
+-- Name: job_change_records job_change_records_project_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.job_change_records
+    ADD CONSTRAINT job_change_records_project_id_fkey FOREIGN KEY (project_id) REFERENCES public.projects(id) ON DELETE SET NULL;
 
 
 --

@@ -2949,6 +2949,9 @@
     },
     "ide": {
       "stopped": "IDE session stopped"
+    },
+    "sessions": {
+      "cloudSyncRecovered": "Cloud sync is now running for this session."
     }
   },
   "pwa": {
