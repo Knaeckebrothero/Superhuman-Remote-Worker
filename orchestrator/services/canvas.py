@@ -525,6 +525,25 @@ def build_public_canvas_representation(
     return CanvasRepresentation(state=state, payload=payload, etag=etag)
 
 
+def strong_state_precondition(header_value: str) -> str:
+    """Return the strong form of one inbound Canvas state ``If-Match``.
+
+    A compressing CDN in front of the API rewrites the strong ``ETag`` it
+    forwards into the weak form, so ``W/"canvas:…"`` is the only value a
+    browser can echo back for a state it read through one. The digest still
+    names the exact representation we served — weakening marks the transfer
+    encoding, not the state — so drop the marker and leave the caller
+    comparing full digests, exactly as the conditional GET already does in
+    ``_if_none_match_matches``. Never expands ``*``: these preconditions name
+    one state, not "whatever exists now".
+    """
+
+    value = header_value.strip()
+    if value.startswith("W/"):
+        value = value[2:].lstrip()
+    return value
+
+
 def canvas_invalidation(
     record: CanvasRecord, *, method: Literal["canvas.updated", "canvas.cleared"]
 ) -> CanvasInvalidation:
@@ -1058,7 +1077,9 @@ class CanvasService:
                             "If-Match is required to refresh a Canvas"
                         )
                     current_etag = representation_builder(current).etag
-                    if not secrets.compare_digest(expected_etag.strip(), current_etag):
+                    if not secrets.compare_digest(
+                        strong_state_precondition(expected_etag), current_etag
+                    ):
                         raise CanvasPreconditionFailed("Canvas state ETag is stale")
 
                     resulting_version = await refresher(current, dict(thread_row))
@@ -1280,7 +1301,9 @@ class CanvasService:
                             "If-Match is required to reset a Canvas origin"
                         )
                     current_etag = representation_builder(current).etag
-                    if not secrets.compare_digest(expected_etag.strip(), current_etag):
+                    if not secrets.compare_digest(
+                        strong_state_precondition(expected_etag), current_etag
+                    ):
                         raise CanvasPreconditionFailed("Canvas state ETag is stale")
 
                     updated = await conn.fetchrow(
@@ -1355,7 +1378,9 @@ class CanvasService:
                 if require_precondition:
                     assert expected_etag is not None
                     current_etag = representation_builder(current).etag
-                    if not secrets.compare_digest(expected_etag.strip(), current_etag):
+                    if not secrets.compare_digest(
+                        strong_state_precondition(expected_etag), current_etag
+                    ):
                         raise CanvasPreconditionFailed("Canvas state ETag is stale")
 
                 cleared_row = await conn.fetchrow(
