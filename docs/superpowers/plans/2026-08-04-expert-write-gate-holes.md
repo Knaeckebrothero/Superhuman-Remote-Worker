@@ -314,3 +314,92 @@ other four routes' responses.
 - All six test groups pass; 1, 3 and 4 are mutation-tested.
 - `duplicate` of each of the 7 previously-refused shipped experts returns 200 as a
   default-grants non-admin. State the measured before/after in your report.
+
+---
+
+## Task 4 — fork-as-default strips and reports too
+
+**Added 2026-08-05.** Task 3 made `duplicate` strip-and-report. The owner has now
+ruled the same for `POST /api/expert-defaults/{expert_type}/fork`
+(`fork_my_expert_default`), which is `duplicate` plus "select the copy as my
+default" and carries the identical 7-of-11 exposure on the same shipped experts.
+
+Why it matters that a personal default is involved: `set_user_expert_default`
+requires a UUID and enforces `owner_id == caller`
+(`orchestrator/database/postgres.py:9256`), so a personal default **cannot** point
+at a bundled expert. Fork is the only one-step way to base a default on `scholar`.
+
+### What to change — server
+
+`fork_my_expert_default` currently calls `_enforce_expert_save(request,
+source["config"], user=user)`, which refuses. Route it through the **same
+strip-and-report path Task 3 added for duplicate** — reuse those helpers, do not
+write a second copy of the logic, and keep the safety re-check (strip, then
+`evaluate` again, and 422 if anything survives).
+
+Both source paths must be covered: a **bundled** source
+(`_bundled_expert_bundle`) and a **DB** source (`resolve_root_expert`).
+
+Return `dropped` alongside the existing `{"default": …, "source": "user"}`.
+Additive.
+
+**Two gates must still fire first, in this order:**
+1. `personal_defaults_allowed` → 403 *"Your administrator has disabled personal
+   default experts"*. This is a **different** switch from `user_experts`; do not
+   merge them.
+2. The `user_experts` kill switch inside the save prelude → 403.
+
+`tests/test_tool_override_boundary.py::test_kill_switch_403s_every_write_route`
+includes this route and **must still pass unchanged**. Stripping happens after
+both 403s, never instead of either.
+
+### What to change — cockpit, and read this before designing it
+
+`settings.component.ts:2807` calls `forkPersonalExpertDefault` and on success
+**navigates immediately to `/experts/{id}/edit`**. A banner on the settings page
+would flash and be gone. So a naive "add a toast" reintroduces exactly the silent
+stripping this task exists to prevent.
+
+Preferred: carry `dropped` through the navigation (router state) and surface it
+**once** on the expert editor the user lands on. The editor already reads the
+resolved toolset as of `68ac7bde`, so the notice explains *why* the toolset it is
+showing is narrower than the source's.
+
+Acceptable fallback if router state turns out awkward: when `dropped` is
+non-empty, **do not auto-navigate** — render the notice on the settings page with
+the edit action still available. When it is empty, navigate exactly as today.
+
+Either way:
+- `forkPersonalExpertDefault`'s return type is `Observable<unknown>` and the
+  handler reads `result?.default?.id` off an `any`. Give it a real type.
+- i18n key in **both** `en` and `de-DE`; `npm run i18n:check` enforces parity and
+  bans hardcoded user-facing strings.
+- Name the grant keys, matching how `admin-grants.component.ts` renders them and
+  how Task 3's duplicate banner does.
+
+### Tests
+
+1. A default-grants non-admin forks `scholar` (bundled source) → **200**, `dropped`
+   names `shell_tools` and `delegation`, and the **stored** row has neither key.
+   Assert the stored config, not just the response — a route reporting `dropped`
+   while persisting the original would be worse than the refusal it replaced.
+2. Same for a **DB** source, so the `resolve_root_expert` branch is covered.
+3. A user **with** the grants gets an unmodified fork, `dropped` empty.
+4. `personal_defaults_allowed` false → **403**, before any strip, no row.
+5. Kill switch off → **403**, before any strip, no row.
+6. The safety re-check still fires on this route: force the strip map to miss and
+   assert 422 with no row.
+7. The default really was set — the fork's whole point. Assert the personal default
+   now points at the new row.
+8. Cockpit: the notice renders when `dropped` is non-empty and does not when empty.
+
+Mutation-test 1, 5 and 6.
+
+### Done when
+
+- Both source paths strip, `dropped` is returned and reaches the user.
+- Both 403s still precede stripping; the existing kill-switch test passes unchanged.
+- `npx tsc --noEmit`, `npx vitest run`, `npm run i18n:check` and
+  **`npx ng build --configuration production`** all pass. The template compiler is
+  the only thing in this repo that validates an Angular binding.
+- Report the measured before/after for forking each of the 7 shipped experts.

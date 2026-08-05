@@ -163,9 +163,18 @@ surviving violation still 422s. That is what makes an incomplete strip map produ
 only false refusals and never a permitted escape. Verified by deliberately breaking
 the map — the route refused rather than storing the ungranted row.
 
-The four other routes still refuse. `fork_my_expert_default` also accepts bundled
-ids, so the same 7-of-11 argument applies to it and it is **not** covered here —
-filed as its own decision.
+`fork_my_expert_default` **was** covered, on 2026-08-05 (`0edbd9bc`), after the
+same measurement was put to the owner: it is `duplicate` plus "select the copy as
+my default", takes the same bundled sources, and carried the identical 7-of-11
+exposure. It reports through router state into the expert editor the user lands
+on, rather than a banner on the settings page that the redirect would have
+flashed past.
+
+**Create, update and import still refuse**, and that asymmetry is deliberate
+rather than unfinished: on those three the caller authored the config, so a
+refusal names something they can go and change. On the two copy-a-visible-expert
+routes the config is someone else's and the user's only recourse would be to ask
+for a grant they do not need.
 
 ## Historical, and how the fix differs from this doc's suggestion
 
