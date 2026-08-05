@@ -1474,7 +1474,7 @@ describe('PersistentChatService — SSE event dispatch', () => {
 
     it('clears cloudSyncDegraded when the agent recovers sync at a turn boundary', async () => {
         // The agent retries the coordinator build each turn after a degraded
-        // attach (docs/issues/session_resume_cloud_sync_race_late_provision.md).
+        // attach (docs/done/session_resume_cloud_sync_race_late_provision.md).
         // Leaving the warning up after it succeeds would tell the user their
         // edits aren't being saved when they are.
         const {service, es} = await setup();

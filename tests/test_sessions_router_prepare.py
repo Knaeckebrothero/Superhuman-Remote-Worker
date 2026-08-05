@@ -428,7 +428,7 @@ async def test_do_prepare_waits_for_cloud_folder_before_binding_an_agent(monkeyp
     re-reads, so binding ahead of in-flight session-folder provisioning leaves
     the session with workspace_sync=None for its whole life. Ordering — gate
     first, THEN provision — is the contract.
-    docs/issues/session_resume_cloud_sync_race_late_provision.md
+    docs/done/session_resume_cloud_sync_race_late_provision.md
     """
     from orchestrator.routers import sessions as sessions_mod
 

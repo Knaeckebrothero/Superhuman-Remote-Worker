@@ -969,3 +969,69 @@ Focused template, skill-rendering, explicit/implicit note, injection-bounding,
 and tool-wiring tests cover the in-tree contract. A fresh virtual and sandbox
 job must still demonstrate that final review completes without the old repeated
 evidence bundle before P-2 is marked shipped.
+
+## 13. Paired-run baselines: pre- vs post-reform batch (2026-08-05/06 — INTERIM, 27/30 in)
+
+First real use of the `bench/` suite end-to-end: `baseline-01` (30/30
+completed, submitted 08-03/04 against the pre-reform system, agent
+`sha-b8c9d09`, report computed client-side) vs `baseline-02` (bench run
+`885008dc`, the Job Bench component's first live server-side run, agent
+`sha-c5dd215` = the 08-05 reliability/bureaucracy reform batch). Identical
+pins both sides: same `tasks.yaml` task ids, `gemma-4-moe`,
+`autonomy: full`, 3 replicates, 2 in flight. Strategic share compared
+token-to-token (baseline-01's client report had no latency access).
+This is a batch diagnosis (many changes at once), not a single-variable A/B.
+
+Median [min..max] across clean completed replicates; strat% = strategic share
+of prompt tokens:
+
+| task | wall b1→b2 (min) | med_in b1→b2 (k tok) | strat% b1→b2 | b2 n |
+|---|---|---|---|---|
+| S1-outbox-note | 19.7 [18.8..26.6] → **16.3** [16..18.9] | 33.8 → **28.4** | 75.8 → **65.8** | 3 |
+| S2-outbox-verify | 20.1 [17.8..24.9] → **15.6** [14.1..15.6] | 31.2 → **28.8** | 72.2 → **64.2** | 3 |
+| S3-glossary | 28.8 [18.5..32.2] → **18.2** [17.9..20.2] | 39.1 → **30.4** | 75.7 → **55.2** | 3 |
+| S4-csv-totals | 31.5 [21.8..43.2] → 25.3 | 34.6 → 34.4 | 63.3 → 39.2 | 1* |
+| M1-retry-memo | 28.9 [21.2..29.7] → **18.8** [18.7..23.1] | 37.1 → **30.9** | 71.1 → **58.4** | 3 |
+| M2-runbook | 29.4 [17.6..32.7] → 32.2 [25.8..55.4] | 34.9 → 40.3 | 64.6 → **50.4** | 3 |
+| D1-wordfreq-kata | 135.4 [117..156] → **65.3** | 43.4 → 48.7 | 38.3 → 49.4 | 2* |
+| D2-inventory-bugfix | 79.6 [66.7..87.6] → 87.0 [75.3..87.3] | 46.2 → 46.9 | 54.6 → **27.9** | 3 |
+| R1-fusion-note | 69 [57.1..94] → 59.7 [42.4..72.8] | 43.6 → 50.1 | 23.9 → 47.2 (noisy) | 3 |
+| A1-inbox-digest | 35 [28.6..56.4] → **17.7** [17.7..19.6] | 38.8 → **30.2** | 63.8 → 64.3 | 3 |
+
+**Aggregate:** clean-completed input-token spend 134.2M (30 jobs) →
+89.8M (27 jobs) ⇒ **≈ −26% input tokens per completed job**. Every
+completion passed its deliverable gate on both sides.
+
+**Verdict so far.** The reform batch did what it set out to do: ceremony
+share dropped 8–27 points on 8/10 tasks, wall time fell 20–50% on the small
+tasks, M1 and A1 (A1 halved with a *tight* range), and per-turn median
+prompt shrank ~3–9k on every small/medium task — the P-3/P-4 injection
+economics moved without a dedicated slice. Watch-items for the final
+read: M2 (ceremony down but cost up — possibly substance replacing ritual,
+possibly flail), D2 wall slightly up, and D1's startling halving needs r3
+to confirm. R1 is the designated noise source (subjob fan-out).
+
+**Exclusions applied (protocol §9 / bench README):** WAN-uplink outage
+11:46–14:44Z on 08-05 (cluster fine, LLM egress + ingress dead): S4 r1
+failed as an outage casualty (excluded), D1 r1 survived but its wall is
+outage-inflated (wall excluded, token metrics kept). S4 r2 was the
+resume/virtual-brief bug (below) — cancelled, so S4 rests on r3 (*pending
+at time of writing, as is D1 r3*). Three sweeper-race duplicate twins
+cancelled (19 stray LLM calls total).
+
+**What the first live bench run proved and surfaced.** Proved: the run
+survived an orchestrator rollout mid-flight *and* the 3-hour WAN outage
+unattended (design §5.1), and the server report delivers latency-based
+strategic share (§5.2) — the two acceptance items k3d couldn't exercise.
+Surfaced (issue docs, all uncommitted):
+`bench_sweeper_multi_replica_race.md` (3 firings in one run, 2–5 ms apart —
+advisory-lock fix required before the next unattended run),
+`bench_infra_exclusion_misses_midflight_outages.md` (mid-flight provider
+outages classify as task failures), and — the product-priority one —
+`fresh_job_dispatched_as_resume_skips_seeding.md`: never-started jobs
+re-dispatched down the `/job/resume` lane start brief-less because the
+virtual `task_brief.md` provider is starved (`JobResumeRequest` cannot carry
+a description), which also leaves *every* legitimately resumed job serving
+an empty brief post-resume.
+
+Final numbers land here when the run closes (D1 r3, S4 r3 outstanding).

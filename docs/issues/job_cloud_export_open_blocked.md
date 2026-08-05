@@ -93,6 +93,74 @@ the one and only chance to open the folder — the chance the popup blocker ate.
 * **The toast names the destination** — `Exported {{count}} file(s) to
   {{folder}}` rather than "to your cloud".
 
+## Follow-up: folder names (2026-08-05)
+
+`job-a6fa6f2a9101` identifies a folder without describing it, and the export
+lands at the root of the user's own cloud drive, so ten exports produced ten
+unreadable siblings. `_job_export_folder_name()` now slugs the job's first
+description line and keeps a short id suffix for uniqueness —
+`you-maintain-a-daily-digest-a6fa6f2a`. Accents fold (`Führe` → `fuhre`) rather
+than being dropped, output is restricted to `[a-z0-9-]` (a safe single path
+segment for both backends), truncation lands on a word boundary, and a
+description that slugs to nothing falls back to the old `job-<id>` form.
+
+The name must stay **deterministic** because the endpoint re-derives it to find
+the folder on a re-sync. Two guards:
+
+* `description` is fixed at job creation, so a job always maps to one name.
+* A job that already has an `exported_folder_handle` reuses it verbatim instead
+  of re-deriving. Without this, the rename would have stranded every
+  already-exported folder (and its share) at the next re-sync — and it makes any
+  *future* naming change safe by construction.
+
+The response also carries `folder.path` (`/<name>`) so the toast can state where
+the files actually are rather than just naming the folder.
+
+Not done: the exports are still flat siblings at the cloud root. Grouping them
+under one per-user parent (`SRW Jobs/…`) would need a per-user folder the agent
+can write into and share once — sharing the current `sessions/` parent is not an
+option, it holds every user's folders.
+
+## Follow-up: collapse shared wrapper directories (2026-08-05)
+
+A job whose single deliverable was `output/digest.md` produced an export folder
+containing one folder containing one file — two clicks to reach one document.
+
+`_common_dir_prefix()` computes the longest **whole-segment** directory prefix
+shared by every file being copied, and the copy strips it. Both copy paths (the
+declared-deliverables list and the `output/` tree fallback) now build a source
+list first and run through one loop, so the rule is stated once:
+
+| deliverables | lands as |
+|---|---|
+| `output/digest.md` | `digest.md` |
+| `output/a.md`, `output/sub/b.md` | `a.md`, `sub/b.md` |
+| `repo/src/a.py`, `repo/tests/b.py` | `src/a.py`, `tests/b.py` |
+| `spec.yaml`, `output/report.md` | unchanged (nothing shared) |
+
+Segment-wise on purpose: `out/` and `output/` share no directory, only a string
+prefix. Structure that distinguishes files always survives — only the shared
+head comes off. A declared-but-missing deliverable still counts toward the
+prefix (it's filtered at copy time, not before), so a stale entry degrades the
+result to *less* collapsing, never to wrong paths.
+
+**Interaction with the no-prune re-sync.** v1 overwrites in place and never
+deletes, and the prefix is recomputed per call, so re-syncing a folder that was
+exported under the old shape leaves the old copy behind. Confirmed on k3d:
+
+```
+verify-deliverables-…/critic_verdict.json      <- new, collapsed
+verify-deliverables-…/job_frozen.json
+verify-deliverables-…/output/critic_verdict.json   <- stale, from the old shape
+verify-deliverables-…/output/job_frozen.json
+```
+
+Only affects folders exported before this change AND re-synced after it; fresh
+exports are clean. Fixing it properly means recording the applied prefix in the
+handle's `vendor_meta` and deleting the old prefix directory when it changes —
+deliberately not built here, because it puts a delete path into a sync endpoint
+that users may also have dropped their own files into.
+
 ## Still open
 
 `ensure_user` returning `None` is *reported* now, not *fixed*. The user must

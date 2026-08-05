@@ -16,6 +16,7 @@ import re
 import secrets
 import sys
 import time
+import unicodedata
 from contextlib import asynccontextmanager
 from pathlib import Path
 import urllib.parse
@@ -18357,6 +18358,72 @@ async def reject_job_diff(request: Request, job_id: str) -> dict[str, Any]:
     }
 
 
+_EXPORT_SLUG_STRIP = re.compile(r"[^a-z0-9]+")
+_EXPORT_SLUG_MAX = 40
+
+
+def _job_export_folder_name(job_id: str, description: str | None) -> str:
+    """Human-readable, stable folder name for a job's Mode B export.
+
+    A cloud root full of ``job-a6fa6f2a9101`` folders is unnavigable after a
+    handful of exports, so lead with a slug of the job's prompt and keep a short
+    id suffix for uniqueness (two jobs can share a description) — e.g.
+    ``you-maintain-a-daily-digest-a6fa6f2a``.
+
+    Must stay **deterministic**: the endpoint is re-syncable and re-derives this
+    name to find the folder again. ``description`` is fixed at job creation, so
+    the same job always maps to the same name. Output is restricted to
+    ``[a-z0-9-]``, which is a safe single path segment for every backend
+    (both build ``sessions/<name>`` over WebDAV).
+    """
+    short = job_id.replace("-", "")
+    # splitlines() on a blank string yields [], so index defensively.
+    lines = (description or "").strip().splitlines()
+    first_line = lines[0] if lines else ""
+    # Fold accents so "Führe" slugs to "fuhre", not "f-hre".
+    folded = (
+        unicodedata.normalize("NFKD", first_line)
+        .encode("ascii", "ignore")
+        .decode("ascii")
+    )
+    slug = _EXPORT_SLUG_STRIP.sub("-", folded.lower()).strip("-")
+    if len(slug) > _EXPORT_SLUG_MAX:
+        slug = slug[:_EXPORT_SLUG_MAX].rsplit("-", 1)[0].strip("-")
+    if not slug:
+        # Descriptions are NOT NULL but can be punctuation-only in theory.
+        return f"job-{short[:12]}"
+    return f"{slug}-{short[:8]}"
+
+
+def _common_dir_prefix(paths: list[str]) -> str:
+    """Longest whole-segment directory prefix shared by every path.
+
+    ``["output/digest.md"]`` -> ``"output"``;
+    ``["repo/src/a.py", "repo/tests/b.py"]`` -> ``"repo"``;
+    ``["spec.yaml", "repo/a.py"]`` -> ``""``.
+
+    Segment-wise, so ``["out/a.md", "output/b.md"]`` shares nothing rather than
+    the string prefix ``"out"``. The last component of each path is the
+    filename and never counts.
+    """
+    if not paths:
+        return ""
+    common = paths[0].split("/")[:-1]
+    for path in paths[1:]:
+        segments = path.split("/")[:-1]
+        keep = 0
+        while (
+            keep < len(common)
+            and keep < len(segments)
+            and common[keep] == segments[keep]
+        ):
+            keep += 1
+        common = common[:keep]
+        if not common:
+            break
+    return "/".join(common)
+
+
 @app.post("/api/jobs/{job_id}/export-to-shared-folder")
 async def export_job_to_shared_folder(request: Request, job_id: str) -> dict[str, Any]:
     """Mode B of the job cloud workflow — copy a job's deliverables into a
@@ -18366,14 +18433,20 @@ async def export_job_to_shared_folder(request: Request, job_id: str) -> dict[str
     main-cloud folder (loose jobs and default-project / no-cloud-folder jobs);
     jobs whose project *does* have a cloud folder go through the Mode A
     diff-review flow instead. Copies the agent's declared deliverables (from
-    ``freeze_data.deliverables``, preserving their workspace-relative paths;
-    falls back to ``output/`` for jobs without a deliverables list) into a
-    per-job session-style cloud folder shared with the calling user.
+    ``freeze_data.deliverables``; falls back to ``output/`` for jobs without a
+    deliverables list) into a per-job session-style cloud folder shared with the
+    calling user. Workspace-relative paths are kept **except** for the leading
+    directories every deliverable shares, which are collapsed
+    (``_common_dir_prefix``) so a lone ``output/digest.md`` opens as
+    ``digest.md`` instead of hiding a level down.
 
-    Re-syncable: the folder id is derived deterministically from the job id, so
-    a repeat call overwrites the same folder and re-stamps ``exported_at`` as
-    "last synced at" (e.g. after resume-with-feedback). v1 overwrites in place
-    and does not prune files removed between syncs.
+    Re-syncable: a repeat call overwrites the same folder and re-stamps
+    ``exported_at`` as "last synced at" (e.g. after resume-with-feedback). The
+    folder name is derived deterministically from the job, and a job that has
+    been exported before reuses its stored handle. v1 overwrites in place and
+    does not prune files removed between syncs — note that a re-sync after the
+    deliverable set changes can therefore leave files from the previous shape
+    behind, since the collapsed prefix is recomputed per call.
 
     See docs/done/job_cloud_export.md §3.2.
     """
@@ -18421,9 +18494,19 @@ async def export_job_to_shared_folder(request: Request, job_id: str) -> dict[str
 
     repo_name, branch = await resolve_job_repo(job_id)
 
-    # 1) Provision shared folder. Short stable folder name from the job id
-    #    keeps it distinguishable in the user's cloud root.
-    folder_session_id = f"job-{job_id.replace('-', '')[:12]}"
+    # 1) Provision shared folder. A job that has been exported before keeps the
+    #    folder it already has — re-deriving the name would strand the old
+    #    folder (and its share) whenever the naming scheme changes, which it did
+    #    once already when these went from `job-<uuid>` to slugged names.
+    previous_handle = job.get("exported_folder_handle")
+    if previous_handle:
+        folder_session_id = (
+            SessionFolderHandle.from_db(previous_handle, backend=backend.backend_id)
+            .native_id.rstrip("/")
+            .split("/")[-1]
+        )
+    else:
+        folder_session_id = _job_export_folder_name(job_id, job.get("description"))
     try:
         folder_handle = await backend.ensure_session_folder(
             session_id=folder_session_id
@@ -18489,16 +18572,27 @@ async def export_job_to_shared_folder(request: Request, job_id: str) -> dict[str
             str(p).strip() for p in freeze_data["deliverables"] if str(p).strip()
         ]
 
-    async def _copy_deliverable(path: str) -> None:
+    async def _list_tree(src_dir: str) -> list[str]:
+        """Repo-relative paths of every file under ``src_dir``, recursively."""
+        found: list[str] = []
+        entries = await gitea_client.list_contents(repo_name, src_dir, ref=branch)
+        for entry in entries or []:
+            entry_type = entry.get("type")
+            if entry_type == "dir":
+                found.extend(await _list_tree(entry["path"]))
+            elif entry_type == "file":
+                found.append(entry["path"])
+        return found
+
+    async def _copy(rel: str, dest: str, *, required: bool) -> None:
         nonlocal files_copied
-        # Declared paths are workspace-root-relative, matching the job's Gitea
-        # repo layout. Reject path escapes defensively.
-        rel = path.lstrip("/")
-        if not rel or ".." in rel.split("/"):
-            logger.warning("Mode B export: skipping unsafe deliverable path %r", path)
-            return
         file_bytes = await gitea_client.get_file_bytes(repo_name, rel, ref=branch)
         if file_bytes is None:
+            if required:
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"Failed to read '{rel}' from Gitea.",
+                )
             # Declared but absent from the repo (e.g. a directory entry or a
             # workspace-only artifact). Skip fail-soft rather than 502.
             logger.warning(
@@ -18507,44 +18601,40 @@ async def export_job_to_shared_folder(request: Request, job_id: str) -> dict[str
                 repo_name,
             )
             return
-        await backend.put_session_file(folder_handle, path=rel, content=file_bytes)
+        await backend.put_session_file(folder_handle, path=dest, content=file_bytes)
         files_copied += 1
-
-    async def _copy_tree(src_dir: str) -> None:
-        nonlocal files_copied
-        entries = await gitea_client.list_contents(repo_name, src_dir, ref=branch)
-        if not entries:
-            return
-        for entry in entries:
-            entry_path = entry["path"]
-            entry_type = entry.get("type")
-            if entry_type == "dir":
-                await _copy_tree(entry_path)
-                continue
-            if entry_type != "file":
-                continue
-            file_bytes = await gitea_client.get_file_bytes(
-                repo_name, entry_path, ref=branch
-            )
-            if file_bytes is None:
-                raise HTTPException(
-                    status_code=502,
-                    detail=f"Failed to read '{entry_path}' from Gitea.",
-                )
-            await backend.put_session_file(
-                folder_handle,
-                path=entry_path,
-                content=file_bytes,
-            )
-            files_copied += 1
 
     try:
         if deliverables:
-            for deliverable_path in deliverables:
-                await _copy_deliverable(deliverable_path)
+            # Declared paths are workspace-root-relative, matching the job's
+            # Gitea repo layout. Reject path escapes defensively.
+            sources: list[str] = []
+            for declared in deliverables:
+                rel = declared.lstrip("/")
+                if not rel or ".." in rel.split("/"):
+                    logger.warning(
+                        "Mode B export: skipping unsafe deliverable path %r", declared
+                    )
+                    continue
+                sources.append(rel)
+            # A declared-but-missing deliverable is not fatal (see _copy).
+            required = False
         else:
             # No declared deliverables (older jobs) — copy output/ wholesale.
-            await _copy_tree("output")
+            sources = await _list_tree("output")
+            required = True
+
+        # Collapse the wrapper directories every file shares, so a job whose one
+        # deliverable is output/digest.md lands as digest.md at the folder root
+        # rather than behind two clicks. Structure that actually distinguishes
+        # files survives — repo/src/a.py + repo/tests/b.py only lose `repo/`.
+        prefix = _common_dir_prefix(sources)
+        for rel in sources:
+            await _copy(
+                rel,
+                rel[len(prefix) + 1 :] if prefix else rel,
+                required=required,
+            )
     except HTTPException:
         raise
     except CloudBackendError as e:
@@ -18576,6 +18666,10 @@ async def export_job_to_shared_folder(request: Request, job_id: str) -> dict[str
         "shared": bool(resolved_user_id),
         "folder": {
             "name": folder_session_id,
+            # Where the caller will actually find it: the share lands at the
+            # root of their own cloud drive, so the folder name IS the path.
+            # Sent explicitly so the cockpit doesn't have to assume that.
+            "path": f"/{folder_session_id}",
             "browser_url": backend.get_session_folder_browser_url(folder_handle),
             "webdav_url": backend.get_session_folder_webdav_url(folder_handle),
         },
@@ -26964,7 +27058,7 @@ async def end_thread(
 # ``cloud_sync_degraded``, and ran with ``workspace_sync = None`` for the
 # session's WHOLE life (persistent_app.py has no rebuild path). Registering the
 # task lets the attach paths await it instead of racing it.
-# docs/issues/session_resume_cloud_sync_race_late_provision.md
+# docs/done/session_resume_cloud_sync_race_late_provision.md
 _late_cloud_setup_tasks: dict[str, "asyncio.Task[None]"] = {}
 
 # Ceiling on how long an attach waits for in-flight session-folder
@@ -27185,7 +27279,7 @@ async def resume_thread(
             # of attach and never re-reads. Outside the advisory lock below:
             # this can take seconds and the fresh pod's /register needs that
             # same lock.
-            # docs/issues/session_resume_cloud_sync_race_late_provision.md
+            # docs/done/session_resume_cloud_sync_race_late_provision.md
             await _await_late_cloud_setup(tid)
 
             # Serialise concurrent provisioning attempts for the same
