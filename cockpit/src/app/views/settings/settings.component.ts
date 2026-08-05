@@ -13,6 +13,7 @@ import {
 import {ModelService} from '../../core/services/model.service';
 import {CapabilitiesService} from '../../core/services/capabilities.service';
 import {I18nService, SupportedLang} from '../../core/services/i18n.service';
+import type {ExpertEditorNavigationState} from '../experts/expert-editor.component';
 import {
     ApiKeyProvider,
     CodexStatus,
@@ -2805,10 +2806,18 @@ export class SettingsComponent implements OnInit {
     const sourceId = slot?.effective?.id;
     this.defaultExpertBusy.set(type);
     this.apiService.forkPersonalExpertDefault(type, sourceId).subscribe({
-      next: (result: any) => {
-        const id = result?.default?.id;
+      next: (result) => {
+        const id = result.default?.id;
         this.loadExpertDefaults();
-        if (id) this.router.navigate(['/experts', id, 'edit']);
+        // Carry `dropped` through the navigation (router state) rather than
+        // a toast here: this page unmounts immediately on success, so a
+        // banner on IT would flash and be gone before anyone could read it.
+        // The editor the user lands on surfaces it once instead — see
+        // `forkNoticeTranslationArgs` there.
+        if (id) {
+          const state: ExpertEditorNavigationState = {dropped: result.dropped};
+          this.router.navigate(['/experts', id, 'edit'], {state});
+        }
       },
       error: () => this.defaultExpertBusy.set(null),
     });

@@ -4,6 +4,7 @@ import {
   expertBaseConfigName,
   expertEditorMode,
   expertToolPreviewRequest,
+  forkNoticeTranslationArgs,
   parseConfigText,
   slugify,
 } from './expert-editor.component';
@@ -100,5 +101,36 @@ describe('buildPromptsPayload', () => {
       'job',
     );
     expect(out).toEqual({persona: 'P', tactical: 'T'});
+  });
+});
+
+// Task 4 (2026-08-04 plan): landing here right after `fork_my_expert_default`
+// stripped something must surface it once, via router state — see
+// ExpertEditorNavigationState and the constructor read in
+// expert-editor.component.ts. Unlike duplicateResultTranslationArgs
+// (experts-list.component.ts), a clean fork has nothing to say: arriving on
+// this page already IS the success signal, so only the stripped case renders
+// anything at all.
+describe('forkNoticeTranslationArgs', () => {
+  it('renders nothing when dropped is absent', () => {
+    expect(forkNoticeTranslationArgs(undefined)).toBeNull();
+  });
+
+  it('renders nothing when dropped is empty', () => {
+    expect(forkNoticeTranslationArgs([])).toBeNull();
+  });
+
+  it('names the missing grants, joined, when something was dropped', () => {
+    expect(forkNoticeTranslationArgs(['shell_tools', 'delegation'])).toEqual([
+      'experts.forkedMissingGrants',
+      {grants: 'shell_tools, delegation'},
+    ]);
+  });
+
+  it('handles a single dropped grant without a trailing separator', () => {
+    expect(forkNoticeTranslationArgs(['shell_tools'])).toEqual([
+      'experts.forkedMissingGrants',
+      {grants: 'shell_tools'},
+    ]);
   });
 });

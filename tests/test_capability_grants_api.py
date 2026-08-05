@@ -2,26 +2,38 @@
 save-time and dispatch PEP helpers in orchestrator/main.py, exercised against a
 mocked postgres_db. The pure PDP is covered in test_capability_grants.py.
 
-Route-level ``duplicate_expert`` tests live here too — a deliberate exception
-to this file's usual grain, because the routing/wiring details they pin
-(whether the save-time gate runs at all, and now which *policy* it runs) can't
-be observed from a bare helper call. They are not in
-tests/test_tool_override_boundary.py::TestExpertWriteBoundary alongside the
-kill-switch half of the same fix: that module's docstring is explicit that its
-validator is "NOT an authorization gate" and that capability grants are a
-separate PDP pinned elsewhere, and its ``expert_env`` fixture stubs
-``_enforce_expert_save`` out specifically so those tests see the shape gate in
-isolation. This file, not that one, is the PDP's home.
+Route-level ``duplicate_expert`` and ``fork_my_expert_default`` tests live
+here too — a deliberate exception to this file's usual grain, because the
+routing/wiring details they pin (whether the save-time gate runs at all, and
+now which *policy* it runs) can't be observed from a bare helper call. They
+are not in tests/test_tool_override_boundary.py::TestExpertWriteBoundary
+alongside the kill-switch half of the same fix: that module's docstring is
+explicit that its validator is "NOT an authorization gate" and that
+capability grants are a separate PDP pinned elsewhere, and its
+``expert_env``/``kill_switch_env`` fixtures stub ``_enforce_expert_save_prelude``
+and ``_strip_save_grants`` out specifically so those tests see the shape gate
+(and, for the kill switch test, the real prelude) in isolation. This file,
+not that one, is the PDP's home.
 
-2026-08-04 (docs/superpowers/plans/2026-08-04-expert-write-gate-holes.md, task
-3): ``duplicate_expert``'s grants half changed from refuse-outright to
+2026-08-04 (docs/superpowers/plans/2026-08-04-expert-write-gate-holes.md,
+task 3): ``duplicate_expert``'s grants half changed from refuse-outright to
 strip-and-report — measured against the real PDP with default grants, refusing
 blocked 7 of the 11 shipped experts, including ``scholar``, the route's own
 advertised use ("start from scholar"). The other four expert-write routes are
 unchanged and still refuse; ``_enforce_save_grants``'s own tests below assert
 that.
+
+Task 4 of the same plan: ``fork_my_expert_default`` (``duplicate`` plus
+"select the copy as my default") carried the identical exposure and is fixed
+the same way, reusing the exact same two helpers rather than a second
+implementation. It has an extra, EARLIER, and INDEPENDENT 403 gate
+(``personal_defaults_allowed`` — a different switch from ``user_experts``),
+which must still fire, in order, before any stripping — see the tests below
+that pin each gate closing without the other.
 """
 
+from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 from uuid import uuid4
 
@@ -594,6 +606,387 @@ async def test_previously_refused_shipped_experts_now_fork_for_default_grants(
     stored = fake.create_expert.await_args.kwargs["config"]
     # The stored config must actually be clean against the same default
     # grants, not merely have a `dropped` list that claims so.
+    from src.core.capability_grants import CATALOG, evaluate
+
+    default_grants = {k: v["default"] for k, v in CATALOG.items()}
+    assert evaluate(stored, default_grants) == []
+
+
+# =============================================================================
+# fork_my_expert_default (task 4 of the 2026-08-04 plan): `duplicate` plus
+# "select the copy as my default", reusing duplicate_expert's exact two
+# helpers (`_enforce_expert_save_prelude` + `_strip_save_grants`) rather than
+# a second implementation. Its extra wrinkle: an earlier, INDEPENDENT 403 gate
+# (`personal_defaults_allowed` — a different switch from `user_experts`) that
+# must still fire, in order, before any stripping.
+# =============================================================================
+
+
+def _fake_fork_row(*, user_id, expert_type, source):
+    """What a real `fork_and_set_user_expert_default` would return: a fresh
+    experts row shaped for `_default_expert_summary`. A fresh id per call so
+    a test can tell "the new row" apart from the source or anything else."""
+    return {
+        "id": str(uuid4()),
+        "name": f"{source['name']}-default",
+        "display_name": f"{source['display_name']} (My Default)",
+        "expert_type": expert_type,
+        "owner_id": user_id,
+        "description": source.get("description"),
+        "icon": source.get("icon", "smart_toy"),
+        "color": source.get("color", "#6B7280"),
+        "tags": source.get("tags") or [],
+        "is_global": False,
+        "managed_key": None,
+        "config": source.get("config") or {},
+    }
+
+
+def _fork_env(
+    monkeypatch,
+    *,
+    grant_rows=(),
+    is_admin=False,
+    personal_defaults_ok: bool | None = None,
+    kill_switch_on=True,
+):
+    """Shared scaffold, the fork_my_expert_default mirror of `_duplicate_env`
+    above. `personal_defaults_ok=None` (the default) leaves
+    `personal_defaults_allowed` UNSTUBBED — it runs for real against this
+    same fake grants DB, which is a stronger test than stubbing it whenever a
+    test doesn't need to isolate that gate specifically (empty/default grants
+    resolve `personal_default_experts` to its catalog default, True, and an
+    admin short-circuits it without touching the DB either way). Pass an
+    explicit bool only to isolate that gate from the kill switch and the
+    strip, the way the two 403 tests below do.
+    """
+    fake = AsyncMock()
+    fake.list_grants_for_scopes = AsyncMock(
+        return_value={"user": list(grant_rows), "project": [], "global": []}
+    )
+    fake.fork_and_set_user_expert_default = AsyncMock(
+        side_effect=lambda **kw: _fake_fork_row(**kw)
+    )
+    monkeypatch.setattr(m, "postgres_db", fake)
+    monkeypatch.setattr(
+        m,
+        "require_approved_user",
+        AsyncMock(return_value={"id": _UID, "is_admin": is_admin}),
+    )
+    monkeypatch.setattr(m, "user_visible_project_ids", AsyncMock(return_value=[]))
+    monkeypatch.setattr(
+        m, "_user_experts_enabled", AsyncMock(return_value=kill_switch_on)
+    )
+    if personal_defaults_ok is not None:
+        monkeypatch.setattr(
+            m,
+            "personal_defaults_allowed",
+            AsyncMock(return_value=personal_defaults_ok),
+        )
+    return fake
+
+
+def _db_selection(config: dict) -> SimpleNamespace:
+    """An `ExpertSelection`-shaped double for the `resolve_root_expert`
+    branch of `source` — the route only ever reads `.expert`."""
+    return SimpleNamespace(
+        expert={
+            "id": str(uuid4()),
+            "owner_id": str(uuid4()),
+            "expert_type": "session",
+            "name": "shared",
+            "display_name": "Shared",
+            "icon": "smart_toy",
+            "color": "#6B7280",
+            "config": config,
+        }
+    )
+
+
+@pytest.mark.asyncio
+async def test_fork_my_expert_default_strips_a_bundled_source_and_reports_it(
+    monkeypatch,
+):
+    """Test group 1: a default-grants non-admin forks `scholar` — a BUNDLED
+    (disk) source, reached via `_bundled_expert_bundle`, not a DB row — and
+    gets 200 with `dropped` naming both grants scholar's real config.yaml
+    needs (shell_tools, delegation) that default grants withhold. The stored
+    row is read back from the mock's own call args, not the response, and
+    must actually lack both: a route that reports `dropped` while persisting
+    the original would be worse than the refusal it replaced.
+    """
+    fake = _fork_env(monkeypatch, grant_rows=[])
+
+    result = await m.fork_my_expert_default(
+        MagicMock(), "worker", m.ExpertDefaultForkRequest(expert_id="scholar")
+    )
+
+    assert set(result["dropped"]) == {"shell_tools", "delegation"}
+    assert result["source"] == "user"
+    stored = fake.fork_and_set_user_expert_default.await_args.kwargs["source"]["config"]
+    assert "shell" not in stored.get("tools", {})
+    assert "delegation" not in stored.get("tools", {})
+    assert "enabled" not in stored.get("delegation", {})
+    # delegation.mode is not the violation (only .enabled is) and must survive
+    # — proof the strip did not take the whole settings dict.
+    assert stored["delegation"]["mode"] == "light"
+
+
+@pytest.mark.asyncio
+async def test_fork_my_expert_default_strips_a_db_source_and_reports_it(monkeypatch):
+    """Test group 2: the OTHER path to `source` — `resolve_root_expert`,
+    a DB row (no explicit `expert_id` posted, so this resolves someone else's
+    personal or the application default), not a bundled one. Same
+    strip-and-report outcome, proving the fix covers both branches."""
+    fake = _fork_env(monkeypatch, grant_rows=[])
+    monkeypatch.setattr(
+        m,
+        "resolve_root_expert",
+        AsyncMock(
+            return_value=_db_selection(
+                {"tools": {"shell": ["run_command"], "git": ["git_status"]}}
+            )
+        ),
+    )
+
+    result = await m.fork_my_expert_default(
+        MagicMock(), "session", m.ExpertDefaultForkRequest()
+    )
+
+    assert result["dropped"] == ["shell_tools"]
+    stored = fake.fork_and_set_user_expert_default.await_args.kwargs["source"]["config"]
+    assert stored == {"tools": {"git": ["git_status"]}}
+
+
+@pytest.mark.asyncio
+async def test_fork_my_expert_default_holder_of_the_grant_gets_an_unmodified_fork(
+    monkeypatch,
+):
+    """Test group 3: a user who already holds what the source needs must get
+    it back byte-for-byte, with `dropped` empty — otherwise stripping could be
+    firing unconditionally and the two tests above would not be able to tell
+    the difference."""
+    config = {"tools": {"shell": ["run_command"], "git": ["git_status"]}}
+    fake = _fork_env(
+        monkeypatch, grant_rows=[{"key": "shell_tools", "value_json": True}]
+    )
+    monkeypatch.setattr(
+        m, "resolve_root_expert", AsyncMock(return_value=_db_selection(config))
+    )
+
+    result = await m.fork_my_expert_default(
+        MagicMock(), "session", m.ExpertDefaultForkRequest()
+    )
+
+    assert result["dropped"] == []
+    assert (
+        fake.fork_and_set_user_expert_default.await_args.kwargs["source"]["config"]
+        == config
+    )
+
+
+@pytest.mark.asyncio
+async def test_fork_my_expert_default_403s_when_personal_defaults_are_disabled(
+    monkeypatch,
+):
+    """Test group 4, gate 1: `personal_defaults_allowed` is this route's OWN
+    switch, independent of the shared `user_experts` kill switch (next test).
+    Isolated here (`personal_defaults_ok=False`, stubbed directly) so the
+    assertions below are unambiguous: neither the source (`resolve_root_expert`)
+    nor the grants DB (which stripping would need) are ever touched, proving
+    the gate returns before either — "before any strip" the brief asks for,
+    not just "eventually a 403 somewhere".
+    """
+    fake = _fork_env(monkeypatch, personal_defaults_ok=False)
+    resolve_mock = AsyncMock(
+        return_value=_db_selection({"tools": {"shell": ["run_command"]}})
+    )
+    monkeypatch.setattr(m, "resolve_root_expert", resolve_mock)
+
+    with pytest.raises(HTTPException) as ei:
+        await m.fork_my_expert_default(
+            MagicMock(), "worker", m.ExpertDefaultForkRequest()
+        )
+
+    assert ei.value.status_code == 403
+    assert ei.value.detail == "Your administrator has disabled personal default experts"
+    fake.fork_and_set_user_expert_default.assert_not_awaited()
+    fake.list_grants_for_scopes.assert_not_awaited()
+    resolve_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_fork_my_expert_default_403s_when_the_kill_switch_is_off(monkeypatch):
+    """Test group 5, gate 2 — the shared switch, not this route's own.
+    Already parametrised across all five expert-write routes in
+    tests/test_tool_override_boundary.py::test_kill_switch_403s_every_write_route
+    (which must keep passing unchanged); this pins the same property from the
+    strip-and-report side of this file, so a change that reordered the two
+    gates or ran the strip before either would be caught from both angles.
+    `personal_defaults_ok=True` is stubbed directly (not left real) so the
+    grants DB is untouched by gate 1 here, and the "never awaited" assertion
+    below unambiguously means the strip itself never ran — the source
+    (`resolve_root_expert`) DOES run first (unchanged pre-existing order: a
+    bad/missing source is a 404/422 regardless of the kill switch), so unlike
+    the gate-1 test above, this one does not assert that call away.
+    """
+    fake = _fork_env(monkeypatch, personal_defaults_ok=True, kill_switch_on=False)
+    monkeypatch.setattr(
+        m,
+        "resolve_root_expert",
+        AsyncMock(return_value=_db_selection({"tools": {"shell": ["run_command"]}})),
+    )
+
+    with pytest.raises(HTTPException) as ei:
+        await m.fork_my_expert_default(
+            MagicMock(), "worker", m.ExpertDefaultForkRequest()
+        )
+
+    assert ei.value.status_code == 403
+    assert ei.value.detail == "User-defined experts are disabled by the administrator"
+    fake.fork_and_set_user_expert_default.assert_not_awaited()
+    fake.list_grants_for_scopes.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_fork_my_expert_default_safety_recheck_fires_when_the_strip_map_misses(
+    monkeypatch,
+):
+    """Test group 6 — THE SAFETY PROPERTY, same as duplicate_expert's version
+    of this test above. `strip_to_grants` is forced to a no-op (as if a rule
+    were missing from its map); `_strip_save_grants` must still re-run
+    `evaluate` on whatever comes back and refuse (422) rather than let the
+    route persist a config its own grants forbid.
+    """
+    import src.core.capability_grants as capability_grants
+
+    monkeypatch.setattr(
+        capability_grants,
+        "strip_to_grants",
+        lambda fragment, grants: (fragment, []),  # claims nothing to drop
+    )
+    fake = _fork_env(monkeypatch, grant_rows=[])
+
+    with pytest.raises(HTTPException) as ei:
+        await m.fork_my_expert_default(
+            MagicMock(), "worker", m.ExpertDefaultForkRequest(expert_id="scholar")
+        )
+
+    assert ei.value.status_code == 422
+    assert "shell_tools" in ei.value.detail
+    fake.fork_and_set_user_expert_default.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_fork_my_expert_default_actually_sets_the_personal_default(
+    monkeypatch,
+):
+    """Test group 7 — the fork's whole point, not merely a side effect of it.
+    A tiny stateful double (not just an AsyncMock recording call args) so an
+    independent read AFTER the route returns proves the write actually took:
+    the personal-default pointer now names the SAME id the response reports,
+    and resolves to the STRIPPED config, not the source's original.
+    """
+    fake = _fork_env(monkeypatch, grant_rows=[])
+    pointer: dict[str, Any] = {"row": None}
+
+    async def _fork_and_set(*, user_id, expert_type, source):
+        row = _fake_fork_row(user_id=user_id, expert_type=expert_type, source=source)
+        pointer["row"] = row
+        return row
+
+    async def _get_user_expert_default(*, user_id, expert_type):
+        return pointer["row"]
+
+    fake.fork_and_set_user_expert_default = AsyncMock(side_effect=_fork_and_set)
+    fake.get_user_expert_default = AsyncMock(side_effect=_get_user_expert_default)
+
+    before = await fake.get_user_expert_default(user_id=_UID, expert_type="worker")
+    assert before is None
+
+    result = await m.fork_my_expert_default(
+        MagicMock(), "worker", m.ExpertDefaultForkRequest(expert_id="scholar")
+    )
+
+    after = await fake.get_user_expert_default(user_id=_UID, expert_type="worker")
+    assert after is not None
+    assert after["id"] == result["default"]["id"]
+    assert "shell" not in after["config"].get("tools", {})
+    assert "delegation" not in after["config"].get("tools", {})
+
+
+@pytest.mark.asyncio
+async def test_fork_my_expert_default_admin_bypasses_and_reports_nothing_dropped(
+    monkeypatch,
+):
+    """`_resolve_user_save_grants` returns `None` for an admin — the bypass
+    sentinel both `_enforce_save_grants` and `_strip_save_grants` share (see
+    that helper's own docstring in orchestrator/main.py). Admins must get an
+    unstripped fork of `scholar` with `dropped: []`, not merely happen to
+    pass because an admin's resolved grants are permissive. The grants DB is
+    never touched — the same non-vacuous-admin-path proof
+    test_duplicate_expert_admin_copier_bypasses_and_reports_nothing_dropped
+    above uses, and here it also covers `personal_defaults_allowed`'s own
+    `is_admin` short-circuit, left real (not stubbed) for this one test.
+    """
+    fake = _fork_env(monkeypatch, is_admin=True)
+    # The untouched fragment to compare against — fetched the same way the
+    # route does, rather than a hand-copied literal that could drift from the
+    # real config.yaml (as `tools.shell` already has once: `cancel_command`
+    # joined `run_command` there since this file's other admin-bypass test
+    # was last touched).
+    expected = m._validate_expert_fragment(
+        m._bundled_expert_bundle("scholar")["config"]
+    )
+
+    result = await m.fork_my_expert_default(
+        MagicMock(), "worker", m.ExpertDefaultForkRequest(expert_id="scholar")
+    )
+
+    assert result["dropped"] == []
+    stored = fake.fork_and_set_user_expert_default.await_args.kwargs["source"]["config"]
+    assert stored == expected
+    fake.list_grants_for_scopes.assert_not_awaited()
+
+
+#: Mirrors _PREVIOUSLY_REFUSED_SHIPPED_EXPERTS's expert_type for each shipped
+#: expert (derived from each config.yaml's own $extends — worker_base vs
+#: session_base), since fork_my_expert_default takes expert_type as a path
+#: param the bundled branch cross-checks against the source.
+_SHIPPED_EXPERT_TYPE = {
+    "scholar": "worker",
+    "developer": "worker",
+    "critic": "worker",
+    "bughunter": "worker",
+    "designer": "worker",
+    "designer-interactive": "session",
+    "product-qa": "worker",
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("expert_id", sorted(_PREVIOUSLY_REFUSED_SHIPPED_EXPERTS))
+async def test_previously_refused_shipped_experts_now_fork_as_default(
+    monkeypatch, expert_id
+):
+    """The measured before/after for forking each of the 7 shipped experts as
+    a personal default, same measurement as duplicate_expert's version of
+    this test above (this route shared the exact same refuse-outright call
+    before this fix, so the "before" — 422, nothing stored — is identical).
+    After: 200, `dropped` is exactly the grant set the brief measured, and
+    the stored config is actually clean against the same default grants, not
+    merely reported as such.
+    """
+    fake = _fork_env(monkeypatch, grant_rows=[])
+
+    result = await m.fork_my_expert_default(
+        MagicMock(),
+        _SHIPPED_EXPERT_TYPE[expert_id],
+        m.ExpertDefaultForkRequest(expert_id=expert_id),
+    )
+
+    assert set(result["dropped"]) == _PREVIOUSLY_REFUSED_SHIPPED_EXPERTS[expert_id]
+    stored = fake.fork_and_set_user_expert_default.await_args.kwargs["source"]["config"]
     from src.core.capability_grants import CATALOG, evaluate
 
     default_grants = {k: v["default"] for k, v in CATALOG.items()}
