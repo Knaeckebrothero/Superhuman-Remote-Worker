@@ -314,7 +314,7 @@ have retry.
 
 ## Related
 
-- `docs/issues/spawn_subagent_fanout_trips_delegation_batch_watchdog.md` — the
+- `docs/done/spawn_subagent_fanout_trips_delegation_batch_watchdog.md` — the
   *other* delegation failure mode; fixed and verified live 2026-07-29.
 - `docs/done/transient_408_stream_disconnect_misclassified_as_permanent.md` —
   the parent-side 408 fix that Finding 1 shows does not reach readers.

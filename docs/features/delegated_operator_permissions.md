@@ -414,6 +414,12 @@ Permissions are code-catalogued, like capability grants. Each entry defines:
 Unknown database rows never grant authority. The grant-management API rejects
 unknown permission keys, scope kinds, and constraint fields.
 
+`internal` entries are implemented/catalogued root-only actions and cannot be
+placed in an operator assignment. `assignable` entries may be delegated.
+`deprecated` rows no longer authorize operators and cannot be newly assigned;
+any temporary root compatibility endpoint and assignment migration are
+explicit. Unknown entries are never executable.
+
 Permission keys are immutable security contracts. A released key may be
 narrowed compatibly, but it must never be reused or silently broadened to cover
 a new action. Broader behavior receives a new key. Moving an entry to
@@ -454,6 +460,10 @@ It never attempts a shared-to-update lock upgrade.
 
 | Permission | Action | Allowed scopes | Phase |
 |---|---|---|---|
+| `operators.read` | View operator candidates, assignments, catalog, and dry-run previews | global | v1, root-only (`internal`) |
+| `operators.manage` | Replace/revoke operator assignment sets | global | v1, root-only (`internal`, high risk) |
+| `management_catalog.activate` | Activate a cluster-supported catalog revision | global | v1, root-only (`internal`, high risk) |
+| `management_events.read` | Query delegated-management audit history | global | v1, root-only (`internal`) |
 | `users.read` | View management-safe user projections | global, user | v1 |
 | `users.approve` | Admit a pending regular user | global | v1 |
 | `users.suspend` | Suspend an admitted regular user | global, user | v1 |
@@ -812,6 +822,11 @@ Suggested `management_events` shape:
 | `request_id`, `route_template`, `http_method`, `client_ip` | Investigation correlation; network metadata is untrusted |
 | `retention_class` | `privilege_lifecycle`, `operator_mutation`, or `sensitive_read` |
 
+Index `created_at`, `(actor_user_id, created_at)`, `(target_type, target_id,
+created_at)`, and `(primary_permission_key, created_at)` for the supported
+reader. Do not add a general GIN index over redacted before/after or
+authorization-leg JSON without a measured query and privacy review.
+
 For a successful database mutation, the resource change and audit event commit
 in one transaction. If the audit insert fails, the mutation fails. This differs
 from denied-access logging: a failed security-event insert must never turn a
@@ -1038,7 +1053,8 @@ RFC 9110's restriction on returning a validator when PUT transformed the
 submitted representation. The transaction still calculates a redacted diff
 and increments the subject revision once. Individual-row endpoints are
 unnecessary in v1. Reference:
-https://www.rfc-editor.org/rfc/rfc9110.html#section-9.3.4.
+https://www.rfc-editor.org/rfc/rfc9110.html#section-9.3.4 and
+https://www.rfc-editor.org/rfc/rfc6585.html#section-3.
 
 Every mutation requires a normalized reason. Root operator administration uses
 a fresh interactive root-admin gate with the same credential and step-up
@@ -1087,6 +1103,7 @@ All management errors use stable machine-readable problem codes (RFC 9457
 `application/problem+json`) without exposing the matched policy trace. Cockpit
 uses those codes to distinguish forbidden, stale revision, dependency
 unavailable, validation failure, and empty data.
+Reference: https://www.rfc-editor.org/rfc/rfc9457.html.
 
 Mutation permission does not imply the independent general read permission.
 Instead, an action contract returns only the minimum target identity and
@@ -1151,7 +1168,9 @@ different fingerprint returns 409. The mapping remains at least as long as the
 configured client retry window (24 hours after a terminal result by default)
 and never expires while its operation is still actionable. The same key, or a
 stable derived child key, is propagated to a downstream API that supports
-idempotency.
+idempotency. After resolving the same approved human actor, retry lookup may
+return that actor's existing safe operation reference even if current authority
+would no longer permit a new command; it never creates another effect.
 
 `GET /api/manage/operations/{operation_id}` exposes safe status only to the
 original requester or a root admin; action-specific request endpoints return
@@ -1419,8 +1438,9 @@ with `Last-Event-ID`, and makes a client reload context if its replay cursor is
 too old. Every live SSE/WebSocket/session connection is registered locally by
 subject/session. A suspension or session-revocation event reaches every replica
 and terminates matching connections; periodic heartbeat revalidation catches a
-missed event and closes a no-longer-approved session. Permission/scope events
-clear management data but do not substitute for the backend's per-request
+missed event and closes a no-longer-approved session within a configurable
+maximum of 30 seconds. Permission/scope events clear management data but do not
+substitute for the backend's per-request
 authorization. Client clearing is therefore privacy UX, while server-side
 request/connection checks remain the enforcement boundary.
 
@@ -1532,7 +1552,8 @@ Record two complementary trails:
   `event_type=management_denied`.
 
 Each read permission has a catalogued `audit_mode`. In the initial catalog,
-`users.read`, `capability_grants.read`, and `usage.read` are
+`operators.read`, `management_events.read`, `users.read`,
+`capability_grants.read`, and `usage.read` are
 `required_sensitive_read`. For app-local data, the service performs the scoped
 query and inserts a redacted event in the same writable repeatable-read
 transaction, commits, and only then returns data. Cross-store usage follows the
@@ -1601,10 +1622,11 @@ route relies on `_require_admin` alone.
 ### Step-up authentication
 
 Catalog entries can define `required_acr` and `max_auth_age_seconds`. Operator
-assignment/revocation, provider credentials, security settings, break-glass,
-management-credential creation, and destructive fleet actions require recent
-strong authentication. The BFF preserves validated `acr` and original
-`auth_time`; refreshing an access token does not refresh authentication age.
+assignment/revocation, suspended-user restoration, provider credentials,
+security settings, break-glass, management-credential creation, and destructive
+fleet actions require recent strong authentication. The BFF preserves validated
+`acr` and original `auth_time`; refreshing an access token does not refresh
+authentication age.
 Before Phase 1 enables assignment mutation, each deployment must map SRW's
 logical assurance levels to exact accepted Keycloak ACR values. Missing or
 weaker mapping disables that action and fails readiness for the feature; it
@@ -1695,6 +1717,8 @@ all existing PATs operator-capable.
     transaction lock shared through mutation and audit.
 16. **No exactly-once fiction:** external actions are at-least-once and
     reconcilable unless the downstream system supplies idempotency.
+17. **No approval-as-restore:** suspended state is durable; approval and legacy
+    Keycloak roles cannot clear it, and root restoration cannot revive grants.
 
 ## Rollout and compatibility
 
@@ -1854,7 +1878,8 @@ For every catalog permission and scope kind:
   and retains both bases; a missing/partial leg denies the whole operation;
 - independently valid broad/narrow assignments are additive under the
   documented rule;
-- `internal`/deprecated/unknown catalog entries cannot be assigned or used;
+- internal entries reject assignment but remain usable by the current root
+  path; deprecated/unknown rows never authorize an operator;
 - catalog revision changes preserve golden decisions or require an explicit
   staged migration;
 - mixed replicas use one DB-pinned catalog revision; activation refuses a

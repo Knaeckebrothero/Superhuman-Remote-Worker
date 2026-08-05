@@ -22,6 +22,7 @@ from services.browser_stream_config import (
 from services.canvas import (
     BrowserSource,
     CanvasMutation,
+    CanvasPreconditionFailed,
     CanvasService,
     CanvasSetInput,
 )
@@ -332,6 +333,7 @@ async def commit_browser_canvas(
     prepared: PreparedBrowser,
     *,
     title: str,
+    expected_presentation_revision: int | None = None,
 ) -> CanvasMutation:
     """Revalidate the selected target and idempotently stage its browser."""
 
@@ -350,20 +352,28 @@ async def commit_browser_canvas(
         ) from exc
 
     normalized_title = title.strip() or "Shared browser"
-    return await CanvasService(db).set_if_changed(
-        thread_id,
-        CanvasSetInput(
-            source=BrowserSource(
-                browser_generation=prepared.browser_generation,
+    try:
+        return await CanvasService(db).set_if_changed(
+            thread_id,
+            CanvasSetInput(
+                source=BrowserSource(
+                    browser_generation=prepared.browser_generation,
+                ),
+                title=normalized_title,
+                renderer="auto",
+                editable=False,
+                alt_text=None,
+                source_version=None,
+                new_app=False,
             ),
-            title=normalized_title,
-            renderer="auto",
-            editable=False,
-            alt_text=None,
-            source_version=None,
-            new_app=False,
-        ),
-    )
+            expected_presentation_revision=expected_presentation_revision,
+        )
+    except CanvasPreconditionFailed as exc:
+        raise BrowserCanvasError(
+            409,
+            "canvas_presentation_changed",
+            "The Canvas presentation changed while the browser was starting",
+        ) from exc
 
 
 __all__ = [

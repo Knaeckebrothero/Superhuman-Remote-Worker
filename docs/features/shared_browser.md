@@ -137,6 +137,22 @@ surfaced six usability defects, all fixed on develop
   touch. None of this makes an *unattended* agent pass reCAPTCHA — the goal is
   that a human holding the baton can.
 
+### Canvas replacement guard (2026-08-05)
+
+Real session use exposed a destructive-looking toolbar edge: **Open browser**
+immediately replaced a clean file or live-app presentation on the one `main`
+Canvas. The source itself was not deleted, but Cockpit had no history or
+restore action, so returning to it required asking the agent to present it
+again.
+
+Cockpit now asks for confirmation before a user-initiated browser open replaces
+any non-browser presentation. Empty Canvas and already-presented browser opens
+remain one click, and unsaved editors remain blocked. The approval is bound to
+the exact thread, source key, and presentation revision; a concurrent agent
+update cancels it instead of letting stale approval replace newer content.
+Durable presentation history and multiple named canvases remain the larger
+Slice-6 design rather than being approximated with browser-local state.
+
 Still deferred are the stage-2 VM artifact run and deployment-specific VM
 binding/routing attestation. Live prompt-driven handoff also needs a working
 LLM endpoint, and this host's k3d CNI prevented a replacement orchestrator pod
@@ -430,9 +446,10 @@ workspace is ready because `open` owns provisioning; lite sessions and
 unattested or unroutable VM contexts fail closed.
 
 **`POST /api/persistent/threads/{tid}/browser/open`** — the one recovery and
-cold-start path (idempotent). Its public body may supply only a title; a public
-caller requests the user as initial holder when a new browser generation is
-created. The internal agent Canvas adapter calls the same service with the
+cold-start path (idempotent). Its public body may supply a title and the
+optional `expected_presentation_revision` the user approved replacing; a
+public caller requests the user as initial holder when a new browser generation
+is created. The internal agent Canvas adapter calls the same service with the
 agent as creation-time holder without exposing that choice in the public API.
 Re-opening an existing generation never flips its current baton:
 
@@ -449,7 +466,9 @@ Re-opening an existing generation never flips its current baton:
 4. Set the canvas presentation source to the private concrete
    `{type: "browser", browser_generation: <uuid>}` through the existing Canvas
    control plane. An atomic compare-and-no-op write keeps retries on the same
-   generation at the same presentation revision.
+   generation at the same presentation revision. When the public request
+   carries an expected revision, the same row lock rejects a stale approval
+   with `canvas_presentation_changed` before replacing the presentation.
 5. Return the ordinary generation-redacted `CanvasPublicState` plus its strong
    `ETag` and a boolean mutation header. The first `STATE` stream message
    carries the private generation, viewport, and current page state only inside
@@ -515,11 +534,11 @@ The implemented renderer fills the `browser` Canvas source
   below). Ignored/not sent while the agent drives.
 - **"Open browser" affordances**: a button in the canvas empty state and an
   always-present toolbar icon (visible when the capability allows). Clicking
-  while other content is staged switches the canvas source (standard
-  single-main-canvas semantics). Staged cold-start progress: "Starting
-  workspace… → Starting browser… → connected". On lite backends the button is
-  disabled with an explanatory tooltip. Failure → explicit error state with
-  retry.
+  while other content is staged asks for confirmation, then switches the
+  canvas source (standard single-main-canvas semantics). Staged cold-start
+  progress: "Starting workspace… → Starting browser… → connected". On lite
+  backends the button is disabled with an explanatory tooltip. Failure →
+  explicit error state with retry.
 - **Reconnect**: WS drop → "Reconnecting…" overlay with backoff; if the
   daemon reports/implies a dead generation → **ended** state with a restart
   button (→ `open`). The popout window and main tab may both attach (frames

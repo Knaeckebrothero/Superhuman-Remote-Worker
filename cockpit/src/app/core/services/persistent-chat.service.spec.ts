@@ -1782,6 +1782,31 @@ describe('PersistentChatService — gone_beyond_horizon recovery', () => {
         expect(firstSse.close).toHaveBeenCalled();
         expect(ctx.sseInstances.length).toBeGreaterThanOrEqual(2);
     });
+
+    it('re-reads thread status on re-anchor, healing a stale "ended"', async () => {
+        // An epoch bump means a new agent attached, so an 'ended' status the
+        // client is still holding — e.g. from a terminal frame replayed off the
+        // previous epoch's tail — is stale by definition. loadHistory restores
+        // the transcript but never touches thread meta, so without this the
+        // ended UI stays pinned over a live, streaming session for good.
+        const ctx = createService({cursor: {epoch: 1, seq: 5, threadId: 'thread-s', updatedAt: ''} as any});
+        ctx.mockHttp.get.mockImplementation(() =>
+            of({status: 'active', total_turns: 0, messages: [], total: 0}),
+        );
+        await ctx.service.connect('thread-s');
+        const firstSse = ctx.sseInstances[0];
+        fireSseOpen(firstSse);
+
+        ctx.service.threadStatus.set('ended');
+
+        fireSseNamedEvent(firstSse, 'gone_beyond_horizon', {
+            method: 'gone_beyond_horizon',
+            params: {epoch: 2, server_seq: 7, reason: 'epoch_bumped_mid_stream'},
+        }, '2:7');
+        await new Promise((r) => setTimeout(r, 0));
+
+        expect(ctx.service.threadStatus()).toBe('active');
+    });
 });
 
 describe('PersistentChatService — SSE error handling', () => {
@@ -2107,6 +2132,55 @@ describe('PersistentChatService — REST sends', () => {
         );
         expect(resumeCalls).toHaveLength(0);
         expect(ctx.service.isResuming()).toBe(false);
+    });
+
+    it('ignores a replayed session.ended from the epoch we resumed past', async () => {
+        // A resume reopens the SSE while the thread is still on its OLD epoch,
+        // so the server streams that epoch's tail — which ends in the
+        // idle_timeout/ended pair that put us there. Applying it pins the
+        // ended UI (end marker, resume card, "sending resumes" placeholder)
+        // over a live, streaming session and never clears.
+        const ctx = createService();
+        ctx.mockHttp.get.mockImplementation(() =>
+            of({status: 'ended', total_turns: 0, messages: [], total: 0}),
+        );
+        ctx.mockCache.getThreadCursor.mockResolvedValue({epoch: 9, seq: 40});
+        await ctx.service.connect('thread-r');
+        ctx.mockHttp.get.mockImplementation(() =>
+            of({status: 'active', total_turns: 0, messages: [], total: 0}),
+        );
+
+        await ctx.service.resumeSession();
+        const es = ctx.sseInstances[ctx.sseInstances.length - 1];
+        fireSseOpen(es);
+
+        // Old epoch's tail replays.
+        fireSseMessage(es, {method: 'session.idle_timeout', params: {timeout_minutes: 30}}, '9:41');
+        fireSseMessage(es, {method: 'session.ended', params: {}}, '9:42');
+        expect(ctx.service.threadStatus()).not.toBe('ended');
+
+        // A genuine terminal frame on the NEW epoch must still land.
+        fireSseMessage(es, {method: 'session.ended', params: {}}, '10:7');
+        expect(ctx.service.threadStatus()).toBe('ended');
+    });
+
+    it('applies a terminal frame that carries no event id', async () => {
+        // Can't prove staleness without an id — never swallow a live end.
+        const ctx = createService();
+        ctx.mockHttp.get.mockImplementation(() =>
+            of({status: 'ended', total_turns: 0, messages: [], total: 0}),
+        );
+        ctx.mockCache.getThreadCursor.mockResolvedValue({epoch: 9, seq: 40});
+        await ctx.service.connect('thread-n');
+        ctx.mockHttp.get.mockImplementation(() =>
+            of({status: 'active', total_turns: 0, messages: [], total: 0}),
+        );
+        await ctx.service.resumeSession();
+        const es = ctx.sseInstances[ctx.sseInstances.length - 1];
+        fireSseOpen(es);
+
+        fireSseMessage(es, {method: 'session.ended', params: {}});
+        expect(ctx.service.threadStatus()).toBe('ended');
     });
 
     it('sendMessage on 409 conflict silently no-ops (server has the turn)', async () => {

@@ -131,13 +131,21 @@ def route_client(monkeypatch):
         )
         return PreparedBrowser(_BROWSER_GENERATION, _target())
 
-    async def commit(received_db, thread_id, prepared, *, title):
+    async def commit(
+        received_db,
+        thread_id,
+        prepared,
+        *,
+        title,
+        expected_presentation_revision,
+    ):
         committed_calls.append(
             {
                 "db": received_db,
                 "thread_id": thread_id,
                 "prepared": prepared,
                 "title": title,
+                "expected_presentation_revision": expected_presentation_revision,
             }
         )
         return mutation
@@ -179,13 +187,21 @@ def test_ready_open_returns_redacted_canvas_state_and_headers(
         record=_record(revision=3, title="Research browser"),
     )
 
-    async def commit(received_db, thread_id, prepared, *, title):
+    async def commit(
+        received_db,
+        thread_id,
+        prepared,
+        *,
+        title,
+        expected_presentation_revision,
+    ):
         route_client.committed_calls.append(
             {
                 "db": received_db,
                 "thread_id": thread_id,
                 "prepared": prepared,
                 "title": title,
+                "expected_presentation_revision": expected_presentation_revision,
             }
         )
         return mutation
@@ -194,7 +210,10 @@ def test_ready_open_returns_redacted_canvas_state_and_headers(
 
     response = route_client.client.post(
         f"/api/persistent/threads/{_THREAD_ID}/browser/open",
-        json={"title": "  Research browser  "},
+        json={
+            "title": "  Research browser  ",
+            "expected_presentation_revision": 2,
+        },
     )
 
     assert response.status_code == 200
@@ -218,6 +237,7 @@ def test_ready_open_returns_redacted_canvas_state_and_headers(
     assert "38801" not in serialized
     assert route_client.prepared_calls[0]["initial_baton"] == "user"
     assert route_client.committed_calls[-1]["title"] == "Research browser"
+    assert route_client.committed_calls[-1]["expected_presentation_revision"] == 2
     assert route_client.owner_calls == [_THREAD_ID, _THREAD_ID, _THREAD_ID]
 
 
@@ -442,8 +462,10 @@ async def test_commit_revalidates_target_before_writing(monkeypatch):
         def __init__(self, received_db):
             assert received_db is db
 
-        async def set_if_changed(self, thread_id, presentation):
-            calls.append((thread_id, presentation))
+        async def set_if_changed(
+            self, thread_id, presentation, *, expected_presentation_revision
+        ):
+            calls.append((thread_id, presentation, expected_presentation_revision))
             return CanvasMutation(changed=True, record=_record())
 
     monkeypatch.setattr(
@@ -468,6 +490,37 @@ async def test_commit_revalidates_target_before_writing(monkeypatch):
     assert presentation.alt_text is None
     assert presentation.source_version is None
     assert presentation.new_app is False
+    assert calls[0][2] is None
+
+
+@pytest.mark.asyncio
+async def test_commit_maps_a_stale_canvas_revision_to_a_typed_conflict(monkeypatch):
+    db = _RouteDB(_thread())
+
+    class FakeCanvasService:
+        def __init__(self, received_db):
+            assert received_db is db
+
+        async def set_if_changed(self, *args, **kwargs):
+            del args, kwargs
+            raise browser_canvas.CanvasPreconditionFailed("stale")
+
+    monkeypatch.setattr(
+        browser_canvas, "browser_capability", lambda thread: _capability()
+    )
+    monkeypatch.setattr(browser_canvas, "CanvasService", FakeCanvasService)
+
+    with pytest.raises(browser_canvas.BrowserCanvasError) as error:
+        await browser_canvas.commit_browser_canvas(
+            db,
+            _THREAD_ID,
+            PreparedBrowser(_BROWSER_GENERATION, _target()),
+            title="Shared browser",
+            expected_presentation_revision=7,
+        )
+
+    assert error.value.status_code == 409
+    assert error.value.code == "canvas_presentation_changed"
 
 
 @pytest.mark.asyncio
@@ -479,9 +532,11 @@ async def test_commit_rejects_workspace_change_without_writing(monkeypatch):
         def __init__(self, received_db):
             del received_db
 
-        async def set_if_changed(self, thread_id, presentation):
+        async def set_if_changed(
+            self, thread_id, presentation, *, expected_presentation_revision
+        ):
             nonlocal written
-            del thread_id, presentation
+            del thread_id, presentation, expected_presentation_revision
             written = True
 
     def changed(thread, target):

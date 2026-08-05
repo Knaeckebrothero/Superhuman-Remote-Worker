@@ -89,6 +89,7 @@ export class CanvasService {
   private browserOpenTimer: ReturnType<typeof setTimeout> | null = null;
   private browserOpenStartedAt = 0;
   private browserOpenTitle: string | undefined;
+  private browserOpenExpectedPresentationRevision: number | undefined;
   private officeTurnAdapter: CanvasOfficeTurnAdapter | null = null;
   private lastOfficeRuntimeUpdate:
     | {readonly threadId: string; readonly revision: number; readonly sourceVersion: string}
@@ -188,7 +189,7 @@ export class CanvasService {
   }
 
   /** Open or recover the one shared browser for the selected thread. */
-  openBrowser(title?: string): void {
+  openBrowser(title?: string, expectedPresentationRevision?: number): void {
     if (this.browserOpenToken) return;
     const threadId = this.threadId();
     const capability = this.browserCapability();
@@ -200,6 +201,8 @@ export class CanvasService {
 
     const normalizedTitle = title?.trim();
     this.browserOpenTitle = normalizedTitle || undefined;
+    this.browserOpenExpectedPresentationRevision =
+      expectedPresentationRevision ?? this.state()?.presentation_revision;
     this.browserOpenStartedAt = Date.now();
     this.browserOpenError.set(null);
     const token = Symbol('canvas-browser-open');
@@ -210,7 +213,10 @@ export class CanvasService {
   /** Retry the last bounded open attempt without multiplying active work. */
   retryOpenBrowser(): void {
     if (this.browserOpenToken || this.browserOpenStatus() !== 'error') return;
-    this.openBrowser(this.browserOpenTitle);
+    this.openBrowser(
+      this.browserOpenTitle,
+      this.browserOpenExpectedPresentationRevision,
+    );
   }
 
   /**
@@ -452,10 +458,16 @@ export class CanvasService {
     const url =
       `${environment.apiUrl}/persistent/threads/${encodeURIComponent(threadId)}` +
       '/browser/open';
+    const body: {title: string | null; expected_presentation_revision?: number} = {
+      title: this.browserOpenTitle ?? null,
+    };
+    if (this.browserOpenExpectedPresentationRevision !== undefined) {
+      body.expected_presentation_revision = this.browserOpenExpectedPresentationRevision;
+    }
     let subscription: Subscription;
     subscription = this.http.post<CanvasState>(
       url,
-      {title: this.browserOpenTitle ?? null},
+      body,
       {observe: 'response'},
     ).subscribe({
       next: response => {
@@ -475,11 +487,16 @@ export class CanvasService {
       error: (error: unknown) => {
         if (!this.isCurrentBrowserOpen(token, threadId)) return;
         const requestError = toCanvasRequestError(error);
+        const errorCode = requestError.code ?? 'browser_open_failed';
         this.failBrowserOpen(
           token,
           threadId,
-          requestError.code ?? 'browser_open_failed',
+          errorCode,
         );
+        // A conditional replacement conflict proves our presentation is
+        // stale even if its invalidation was missed. Pull the winning state so
+        // the next user click confirms against what is actually on stage.
+        if (errorCode === 'canvas_presentation_changed') this.reconcile();
       },
       complete: () => {
         if (
@@ -559,6 +576,7 @@ export class CanvasService {
     this.browserOpenSubscription = null;
     this.browserOpenStatus.set('idle');
     this.browserOpenError.set(null);
+    this.browserOpenExpectedPresentationRevision = undefined;
   }
 
   private failBrowserOpen(token: symbol, threadId: string, code: string): void {
@@ -781,6 +799,7 @@ export class CanvasService {
     this.clearBrowserOpenTimer();
     this.browserOpenStartedAt = 0;
     this.browserOpenTitle = undefined;
+    this.browserOpenExpectedPresentationRevision = undefined;
   }
 
   private isCurrentRequest(token: symbol, threadId: string): boolean {

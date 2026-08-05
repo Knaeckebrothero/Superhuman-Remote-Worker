@@ -9,7 +9,10 @@ import {ErrorMessageService} from '../../core/services/error-message.service';
 import {PersistentChatService} from '../../core/services/persistent-chat.service';
 import {ViewportService} from '../../core/services/viewport.service';
 import {AppToastService} from '../../ui/toast';
-import {ChatPageComponent} from './chat-page.component';
+import {
+  browserReplacementTargetMatches,
+  ChatPageComponent,
+} from './chat-page.component';
 
 function createFixture(options: {draft?: boolean; threadId?: string} = {}): {
   component: ChatPageComponent;
@@ -340,6 +343,107 @@ describe('ChatPageComponent Canvas route selection', () => {
     expect(component.browserActionTooltipKey()).toBe('canvas.browser.open.dirty');
     component.openSharedBrowser();
     expect(canvas.openBrowser).toHaveBeenCalledOnce();
+  });
+
+  it('confirms before replacing a clean non-browser presentation', () => {
+    const {component, canvas} = createFixture({threadId: 'thread-1'});
+    component.ngOnInit();
+    TestBed.tick();
+    canvas.browserCapability.set({
+      feature_enabled: true,
+      can_open_browser: true,
+      workspace_ready: true,
+      reason: null,
+    });
+    canvas.state.set(presentedState(4));
+    TestBed.tick();
+
+    component.openSharedBrowser();
+
+    expect(component.browserReplacementTarget()).toEqual({
+      threadId: 'thread-1',
+      presentationRevision: 4,
+      sourceKey: 'workspace_file:output/report.md',
+    });
+    expect(canvas.openBrowser).not.toHaveBeenCalled();
+
+    component.confirmSharedBrowserReplacement();
+
+    expect(component.browserReplacementTarget()).toBeNull();
+    expect(component.canvasOpen()).toBe(true);
+    expect(canvas.openBrowser).toHaveBeenCalledOnce();
+    expect(canvas.openBrowser).toHaveBeenCalledWith(undefined, 4);
+  });
+
+  it('cancels replacement when the Canvas changes while confirmation is open', () => {
+    const {component, canvas} = createFixture({threadId: 'thread-1'});
+    component.ngOnInit();
+    TestBed.tick();
+    canvas.browserCapability.set({
+      feature_enabled: true,
+      can_open_browser: true,
+      workspace_ready: true,
+      reason: null,
+    });
+    canvas.state.set(presentedState(4));
+    TestBed.tick();
+    component.openSharedBrowser();
+
+    canvas.state.set(presentedState(5));
+    TestBed.tick();
+
+    expect(component.browserReplacementTarget()).toBeNull();
+    component.confirmSharedBrowserReplacement();
+    expect(canvas.openBrowser).not.toHaveBeenCalled();
+  });
+
+  it('does not confirm when opening an already-presented browser', () => {
+    const {component, canvas} = createFixture({threadId: 'thread-1'});
+    component.ngOnInit();
+    TestBed.tick();
+    canvas.browserCapability.set({
+      feature_enabled: true,
+      can_open_browser: true,
+      workspace_ready: true,
+      reason: null,
+    });
+    canvas.state.set({
+      ...presentedState(6),
+      source: {type: 'browser'},
+      title: 'Shared browser',
+      renderer: 'auto',
+      source_version: null,
+      capabilities: {
+        can_edit: false,
+        can_pop_out: true,
+        can_take_control: true,
+        can_stream_browser: true,
+      },
+    });
+    TestBed.tick();
+
+    component.openSharedBrowser();
+
+    expect(component.browserReplacementTarget()).toBeNull();
+    expect(canvas.openBrowser).toHaveBeenCalledOnce();
+    expect(canvas.openBrowser).toHaveBeenCalledWith(undefined, 6);
+  });
+
+  it('matches replacement approval to the exact thread, revision, and source', () => {
+    const target = {
+      threadId: 'thread-1',
+      presentationRevision: 4,
+      sourceKey: 'workspace_file:output/report.md',
+    };
+
+    expect(browserReplacementTargetMatches(target, 'thread-1', presentedState(4))).toBe(true);
+    expect(browserReplacementTargetMatches(target, 'thread-2', presentedState(4))).toBe(false);
+    expect(browserReplacementTargetMatches(target, 'thread-1', presentedState(5))).toBe(false);
+    expect(browserReplacementTargetMatches(
+      target,
+      'thread-1',
+      presentedState(4, 'output/other.md'),
+    )).toBe(false);
   });
 
   it('keeps an unsupported feature-visible browser action disabled with its reason', () => {

@@ -401,6 +401,36 @@ async def test_browser_set_if_changed_is_idempotent_but_ordinary_set_is_not() ->
 
 
 @pytest.mark.asyncio
+async def test_browser_set_if_changed_rejects_a_stale_presentation_revision() -> None:
+    db = _FakeCanvasDB()
+    service = CanvasService(db)
+    presented = await service.set(_THREAD_ID, _file_set())
+    assert presented.record is not None
+
+    with pytest.raises(CanvasPreconditionFailed):
+        await service.set_if_changed(
+            _THREAD_ID,
+            _browser_set(),
+            expected_presentation_revision=presented.record.presentation_revision + 1,
+        )
+
+    unchanged = await service.get(_THREAD_ID)
+    assert unchanged is not None
+    assert isinstance(unchanged.source, WorkspaceFileSource)
+    assert unchanged.presentation_revision == presented.record.presentation_revision
+
+    replaced = await service.set_if_changed(
+        _THREAD_ID,
+        _browser_set(),
+        expected_presentation_revision=presented.record.presentation_revision,
+    )
+    assert replaced.changed is True
+    assert replaced.record is not None
+    assert isinstance(replaced.record.source, BrowserSource)
+    assert replaced.record.presentation_revision == 2
+
+
+@pytest.mark.asyncio
 async def test_browser_set_if_changed_serializes_concurrent_missing_row() -> None:
     db = _FakeCanvasDB()
     callbacks: list[int] = []

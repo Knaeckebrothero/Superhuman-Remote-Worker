@@ -688,8 +688,9 @@ class CanvasService:
         presentation: CanvasSetInput,
         *,
         canvas_id: str = MAIN_CANVAS_ID,
+        expected_presentation_revision: int | None = None,
     ) -> CanvasMutation:
-        """Idempotently stage one Browser source under a missing-row-safe lock."""
+        """Idempotently and conditionally stage one Browser presentation."""
 
         self._require_main(canvas_id)
         if (
@@ -733,6 +734,13 @@ class CanvasService:
                     canvas_id,
                 )
                 current = CanvasRecord.from_row(row) if row is not None else None
+                if expected_presentation_revision is not None and (
+                    current is None
+                    or current.presentation_revision != expected_presentation_revision
+                ):
+                    raise CanvasPreconditionFailed(
+                        "Canvas presentation changed while the browser was starting"
+                    )
                 if (
                     current is not None
                     and current.source == source

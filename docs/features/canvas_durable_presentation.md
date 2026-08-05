@@ -20,10 +20,15 @@ related:
 
 # Canvas Durable Presentation — surviving workspace death
 
-**Status:** IMPLEMENTED — Parts 1 and 2 plus the §6 UI fix built and
-unit-covered 2026-07-28; the §11.1 chart auto-default landed and was confirmed
-live 2026-07-29. All of it exercised on k3d against live Garage. §12 records
-what was and was **not** confirmed on the cluster.
+**Status:** SHIPPED — Parts 1 and 2 plus the §6 UI fix built and unit-covered
+2026-07-28 (`0f2bcddc`); the §11.1 chart auto-default landed and was confirmed
+live 2026-07-29. Re-checked 2026-08-05 after a week of unrelated churn and
+still green (§12.1). §12 records what was and was **not** confirmed on the
+cluster.
+
+**Anchors in this document are symbols, not line numbers.** 332 commits landed
+in the week after filing and every line reference in the original draft had
+rotted. Cite `file::symbol` here; it survives refactors and stays greppable.
 **Parent:** `docs/features/dynamic_canvas.md` (authority for Canvas
 architecture). This document **amends** that authority: §1 changes one of its
 founding constraints and must be accepted or rejected explicitly.
@@ -37,12 +42,12 @@ canvas gateway, the wildcard edge, multi-canvas slots, restore history.
 
 ## 1. The architectural departure (sign-off required)
 
-`dynamic_canvas.md` is built on one bet, stated in its own words at `:139`:
+`dynamic_canvas.md` is built on one bet, stated in its own words:
 
 > PostgreSQL stores the durable presentation selection: what logical source is
 > presented — not a copy of its bytes.
 
-and enforced at `:1295`:
+and enforced in its file-response contract:
 
 > Do not serve one file by unpacking the whole suspended-workspace tarball. For
 > an inactive remote workspace, v1 reports `unavailable`. This is the honest
@@ -55,8 +60,8 @@ copy. That is a real, permanent widening of the feature's data model, and it is
 the reason this document exists rather than a commit.
 
 The authority anticipated this exact move and pre-authorized its shape without
-committing to it (`:1341`, "Optional immutable published copies"; the Slice 6
-list at `:2750`). What follows is a decision to exercise that option now, at a
+committing to it (its "Optional immutable published copies" section, and the
+Slice 6 list). What follows is a decision to exercise that option now, at a
 deliberately smaller scope than the sketch: one current copy, not a
 content-addressed archive with restore history.
 
@@ -75,7 +80,7 @@ content-addressed archive with restore history.
 - **No new endpoint, no new origin, no new auth path.** The existing
   content route serves snapshot bytes under the existing owner check and the
   existing response headers, including the locked `sandbox` CSP for HTML
-  renderers (`routers/canvases.py:1161-1165`).
+  renderers (`routers/canvases.py::_content_headers`).
 
 ### What changes, and what it obliges us to
 
@@ -93,7 +98,7 @@ content-addressed archive with restore history.
    remediation in §4.5.
 4. **Canvas durability now depends on the object store being configured.**
    Every shipped overlay has one — the bundled Garage under Tilt, external
-   MinIO on the dev cluster (`deployment/values-experimental.yaml:249`). The
+   MinIO on the dev cluster (`s3.endpoint` in `values-experimental.yaml`). The
    chart's own default was `garage.enabled: false`, which meant a consumer who
    configured nothing got a Canvas that silently never remembered anything;
    §11.1 records how that was closed (`garage.enabled` is now tri-state,
@@ -112,7 +117,7 @@ content-addressed archive with restore history.
 Persist the workspace SSH host key on the PVC so the canvas generation stops
 rotating. One line in `docker/workspace-entrypoint.sh`, zero canvas changes,
 and the pointer would survive a pod restart intact. Rejected for two reasons:
-it contradicts a deliberate trust posture stated in that file at `:42`
+it contradicts a deliberate trust posture stated in that file's section 2a comment
 ("Host identity must not live below the agent-owned home directory"), and — the
 decisive one — it does nothing for the case that dominates the user's day.
 A sleeping workspace has no host key to pin. See §2.4.
@@ -154,18 +159,18 @@ platform has, not merely across a PVC reattach.
 ### 2.3 Why the generation moved
 
 The workspace SSH host key lives on a pod-private `emptyDir`
-(`docker/workspace-entrypoint.sh:47`), and the entrypoint says so outright:
+(`docker/workspace-entrypoint.sh` (`HOST_KEY_DIR`)), and the entrypoint says so outright:
 "a new pod/container receives a new key and the provisioner rotates the paired
 Canvas generation". `bind_thread_workspace_backing` mints a fresh generation
 whenever the backing id **or** the pinned fingerprint changes
-(`orchestrator/database/postgres.py:3356-3369`). A rebuilt workspace always
+(`postgres.py::bind_thread_workspace_backing`). A rebuilt workspace always
 changes the fingerprint.
 
 ### 2.4 The workspace is down more than it is up
 
 That same workspace **re-suspended roughly 30 minutes after being resumed**,
 leaving the namespace with zero `ws-thread` pods. Idle sessions route through
-`_suspend_thread_resources` (`orchestrator/main.py:4961`), which snapshots to S3
+`_suspend_thread_resources` (`main.py::_suspend_thread_resources`), which snapshots to S3
 and deletes the pod.
 
 This is the sequencing argument. Part 2 only helps in the minority of wall-clock
@@ -181,10 +186,10 @@ all. Part 2 is the upgrade from "frozen copy" to "live, editable canvas".
 
 `canvases` (migration `0058_canvases.sql`) is thread-scoped and survives
 everything. The cockpit re-fetches it on thread select and auto-opens the pane
-(`chat-page.component.ts:303-351`). Nothing about canvas state is memory-only.
+(`chat-page.component.ts`, the canvas auto-open effect). Nothing about canvas state is memory-only.
 
 What breaks is the pin. `WorkspaceFileSource` carries
-`{path, workspace_generation}` (`services/canvas.py:69-75`), and every read
+`{path, workspace_generation}` (`services/canvas.py::WorkspaceFileSource`), and every read
 demands the current generation match:
 
 ```
@@ -201,12 +206,12 @@ this work removes.
 ### 3.2 The failure UI misreports the failure
 
 With `status: "unavailable"`, `syncPresentation` bails at
-`canvas-content.controller.ts:66-71` and calls `clearVisual()`, which sets
-`displayRenderer = 'unsupported'` (`:228-230`). `effectiveRenderer()` falls
+`canvas-content.controller.ts::syncPresentation` and calls `clearVisual()`, which sets
+`displayRenderer = 'unsupported'` (`clearVisual`). `effectiveRenderer()` falls
 through to that display value for every file renderer
-(`canvas-pane.component.ts:448-456`), and `rendererLabel()` prints it
-(`:486-488`) next to a `sourceKindLabel()` that correctly reads "File"
-(`:491-500`).
+(`canvas-pane.component.ts::effectiveRenderer`), and `rendererLabel()` prints it
+(`rendererLabel`) next to a `sourceKindLabel()` that correctly reads "File"
+(`sourceKindLabel`).
 
 Net user-visible result, over the correct file path:
 
@@ -231,14 +236,14 @@ handles image-sized payloads far better than `bytea`, and it keeps document
 content out of a database this deployment has overflowed before.
 
 Transport is the existing `SnapshotService` blob API — `put_blob` / `get_blob` /
-`delete_blob` (`services/snapshot_service.py:287`, `:315`, `:344`) — the same
+`delete_blob` (`snapshot_service.py::put_blob` / `get_blob` / `delete_blob`) — the same
 seam the job-log archive uses. No new client, no new credentials, no new bucket.
 
 **Key scheme:** `canvas/<thread_id>/<canvas_id>/<sha256-hex>`, written with
 `put_blob`.
 
 Explicitly **not** `save_blob`'s content-addressed
-`<prefix>/<sha[:2]>/<sha>` scheme (`:253`), despite it being the closer-looking
+`<prefix>/<sha[:2]>/<sha>` scheme (`save_blob`), despite it being the closer-looking
 fit. Content addressing makes two threads presenting byte-identical files share
 one object, which breaks this feature in two ways: clearing one canvas would
 delete bytes another thread still points at, and — across users — object
@@ -283,7 +288,7 @@ Notes on the shape:
 - Keyed `(thread_id, canvas_id)`, not `thread_id`, so multi-canvas (Slice 6)
   does not need a second migration.
 - `renderer` carries **no** CHECK, matching `canvases.renderer`
-  (`0058_canvases.sql:17`) — renderer vocabulary stays app-enforced so adding
+  (`0058_canvases.sql`) — renderer vocabulary stays app-enforced so adding
   one never needs a migration.
 - `object_key` is stored rather than derived from `source_version`. It is
   derivable today, but storing it survives a future prefix or scheme change
@@ -301,7 +306,7 @@ disappeared. Size is bounded upstream anyway (§4.5).
 Excluded, deliberately:
 
 - **`office`** — bytes reach Collabora through the WOPI read path
-  (`routers/wopi.py:427`), with write semantics attached. Read-only offline
+  (`routers/wopi.py::get_file`), with write semantics attached. Read-only offline
   Office is a coherent follow-up, not this slice.
 - **`workspace_app`** and **`browser`** — there are no published bytes; a port
   or a live browser generation cannot be snapshotted, and the user has
@@ -315,9 +320,9 @@ capture costs no extra workspace read:
 
 | trigger | service entry point |
 |---|---|
-| agent `set_canvas` | `CanvasService.set` / `set_if_changed` (`services/canvas.py:563`, `:636`) |
-| `POST /main/refresh` | `CanvasService.refresh_file` (`:966`) |
-| user save, `PUT /main/content` | `CanvasService.edit_file` (`:744`) |
+| agent `set_canvas` | `CanvasService.set` / `set_if_changed` (`services/canvas.py::set` / `set_if_changed`) |
+| `POST /main/refresh` | `CanvasService.refresh_file` (`refresh_file`) |
+| user save, `PUT /main/content` | `CanvasService.edit_file` (`edit_file`) |
 
 Capture is **best-effort and non-fatal**: a snapshot write failure logs and is
 swallowed, never failing the publish. This matches the codebase's
@@ -335,7 +340,7 @@ Any disagreement means the snapshot is stale; it is ignored, not repaired.
 Because of this, capture ordering relative to the row update is irrelevant — a
 half-written or superseded snapshot can never be served.
 
-**State path** (`_represent`, `routers/canvases.py:537`): where the current code
+**State path** (`routers/canvases.py::_represent`): where the current code
 maps `workspace_unavailable` / `workspace_generation_changed` /
 `canvas_file_not_found` to `status = "unavailable"` (`:584-589`), it first looks
 for a matching snapshot. On a hit: `status = "ready"`,
@@ -343,7 +348,7 @@ for a matching snapshot. On a hit: `status = "ready"`,
 `can_pop_out = true`, and `content_url` is emitted as usual. On a miss: today's
 `unavailable`, unchanged.
 
-**Content path** (`get_main_canvas_content`, `:1142`): `_verify_content_identity`
+**Content path** (`get_main_canvas_content`): `_verify_content_identity`
 against the live row runs **first and unchanged**, so the caller must already
 present the correct revision, fingerprint, and version — a snapshot can never be
 addressed independently of the current presentation. Only when
@@ -353,10 +358,10 @@ the identical `_content_headers` output including the HTML CSP, plus
 `X-Canvas-Content-Origin: snapshot` for operators. `If-None-Match`, `Range`, and
 `HEAD` behave exactly as on the live path — same bytes, same validators.
 
-The post-read owner re-admission (`:1190`) is retained on the snapshot path.
+The post-read owner re-admission (`the post-read owner re-admission`) is retained on the snapshot path.
 
 **When the object store is unavailable or the object is missing**, `get_blob`
-returns `None` (`snapshot_service.py:315` swallows and logs) and the request
+returns `None` (`snapshot_service.py::get_blob` swallows and logs) and the request
 falls through to today's `unavailable` path. A snapshot never turns a working
 canvas into a broken one; the worst case is the behavior that exists now.
 
@@ -364,8 +369,8 @@ canvas into a broken one; the worst case is the behavior that exists now.
 
 **Size needs no meaningful new limit.** The canvas already refuses to
 materialize anything larger than its renderer allows — 2 MiB text/HTML, 25 MiB
-image, 50 MiB absolute (`canvas_files.py:56-59`, applied per path in
-`_workspace_read_limit`, `:320-333`). The bytes are therefore *already* bounded
+image, 50 MiB absolute (`canvas_files.py` MAX_* constants, applied per path in
+`_workspace_read_limit`, `_workspace_read_limit`). The bytes are therefore *already* bounded
 before capture ever sees them, and the 1 GB case is structurally impossible: it
 could never have been presented in the first place. `CANVAS_SNAPSHOT_MAX_BYTES`
 exists as a redundant guard and an operator brake, defaulting to
@@ -379,7 +384,7 @@ each publish. No history, no versions, no GC job in the steady state.
 **Deletion** happens in three places, and only the first is subtle:
 
 1. `clear_canvas` — an **explicit** row delete inside `CanvasService.clear`'s
-   existing locked transaction (`services/canvas.py:1161`), because clearing
+   existing locked transaction (`services/canvas.py::clear`), because clearing
    nulls the source on the `canvases` row rather than deleting it, so the FK
    cascade does not fire.
 2. Canvas-row or thread deletion — the FK cascade removes the row.
@@ -396,7 +401,7 @@ orphan.
 key scheme is deterministic and thread-scoped, so a bounded sweep —
 list `canvas/<thread_id>/`, delete anything not named by that thread's row — is
 straightforward to add to the existing `SnapshotService.run_gc`
-(`snapshot_service.py:905`) if orphan volume ever justifies it. Until then the
+(`snapshot_service.py::run_gc`) if orphan volume ever justifies it. Until then the
 failure is logged and finite: at most one leaked object per failed delete, each
 capped at 50 MiB.
 
@@ -409,14 +414,14 @@ content_origin: Literal["workspace", "snapshot"] | None = None
 ```
 
 Deliberately **not** a new `CanvasStatus` value. The cockpit type guard gates on
-`CANVAS_STATUSES.has(value['status'])` (`canvas.service.ts:932`, `:999-1000`);
+`CANVAS_STATUSES.has(value['status'])` (`canvas.service.ts`, `CANVAS_STATUSES` + `isCanvasState`);
 an unknown status fails `isCanvasState`, the whole state object is dropped, and
 the pane goes blank. An unknown *field* is ignored by the same guard. So under
 rollout skew, an old cockpit against a new orchestrator renders the document
 with no offline banner — degraded, correct, and not a blank pane.
 
 The field is inside the state payload and therefore inside the ETag
-(`build_public_canvas_representation`, `services/canvas.py:497-505`). That is
+(`services/canvas.py::build_public_canvas_representation`). That is
 intended: when the workspace wakes and the origin flips back to `workspace`, the
 ETag changes and clients re-fetch.
 
@@ -444,7 +449,7 @@ and the thread currently has a ready workspace: read `source.path` under the
 
 The generation pin exists so that a stale presentation "can never silently
 serve new bytes or a replacement source under its old rendering context"
-(`dynamic_canvas.md:1273-1275`). Re-pinning on byte-identity preserves that property
+(`dynamic_canvas.md`, the workspace-file gateway section). Re-pinning on byte-identity preserves that property
 exactly, and by a stronger mechanism: the served bytes are proven identical by
 sha256 rather than inferred from workspace identity.
 
@@ -460,7 +465,7 @@ rebuilt workspace is a genuinely different thing, and no hash can say otherwise.
 ### 5.3 Why the revision must be bumped
 
 `canonical_source_fingerprint` includes `workspace_generation`
-(`services/canvas.py:419-427`). Re-pinning necessarily changes
+(`services/canvas.py::canonical_source_fingerprint`). Re-pinning necessarily changes
 `source_fingerprint`, which is embedded in `content_url` and enforced by
 `_verify_content_identity`. Old content URLs must therefore be invalidated, and
 the revision bump plus `canvas.updated` is the existing mechanism for exactly
@@ -723,6 +728,11 @@ no PVC — the same shape as the `b1758f38` post-mortem.
   depend on that issue**, and prod's suspend → restore path is unaffected —
   which is also what `b1758f38` in §2.2 demonstrates, since that thread really
   did restore from S3.
+
+  **Unblocked 2026-08-05** (`52c1ba80`): `resolve_ssh_key_path` now stages a
+  runtime-owned `0600` copy, so suspend works on k3d and this criterion is
+  verifiable there for the first time. Left open rather than claimed — nobody
+  has run it. It is the cheapest remaining item in this document.
 - **Criterion 14 (changed bytes → `source_changed`).** The live attempt was
   invalid: `workspace_container.status` had already flipped to `deleted`, so the
   read failed as unavailable before any hash comparison. Covered by
@@ -752,3 +762,34 @@ scheme succeeded against live Garage.
 after a file leaves that file's stored copy in place until the Canvas is cleared
 or another file is published. Consistent with "clearing is the delete
 affordance", but worth revisiting if it ever surprises someone.
+
+### 12.1 Re-check after a week of churn (2026-08-05)
+
+332 commits landed on `develop` between the canvas commit and this check,
+including two unrelated canvas fixes that touch the same files:
+
+- `51db3570` — Cloudflare rewrites the strong state ETag to `W/"canvas:…"`, so
+  every mutation refused the only value a browser could echo back. Added
+  `strong_state_precondition`, which drops the weak marker at all seven
+  precondition sites. Adjacent to this feature's `If-Match` story (§4.6) but
+  orthogonal: the full-digest comparison is unchanged, so the requirement that
+  the `visible_builder` closures rebuild an identical representation still
+  holds exactly as written.
+- `27235e71` — the canvas gateway's restricted role cannot lock rows it only
+  holds `SELECT` on. Viewer-session path only; no durability surface.
+
+Confirmed still true today:
+
+- **461 canvas tests pass** (up from 440 — the two fixes brought their own),
+  including all 24 in `tests/test_canvas_snapshots.py`.
+- `canvas_snapshots`, `CanvasSnapshotStore`, the `content_origin` field, and
+  the re-pin path are all intact and unmodified by the churn.
+- **Chart auto-default still resolves correctly** against today's overlays,
+  which matters because `values-experimental.yaml` moved substantially:
+  dev-cluster render yields **0** Garage resources with
+  `S3_ENDPOINT` pointing at external MinIO, bare chart defaults yield **9**
+  Garage resources pointing at the bundled service.
+
+Not re-run: the live k3d session walk from §12. The cluster has moved on by
+~330 commits, and the unit + render coverage above is what actually pins this
+feature's behavior.

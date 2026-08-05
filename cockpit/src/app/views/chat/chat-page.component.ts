@@ -20,12 +20,34 @@ import {PersistentChatService} from '../../core/services/persistent-chat.service
 import {AppToastService} from '../../ui/toast';
 import {ErrorMessageService} from '../../core/services/error-message.service';
 import {CanvasService} from '../../core/services/canvas.service';
+import {CanvasState} from '../../core/models/canvas.model';
 import {ViewportService} from '../../core/services/viewport.service';
 import {AppIconComponent} from '../../ui/icon';
 import {AppIconButtonComponent} from '../../ui/icon-button';
+import {AppButtonComponent} from '../../ui/button';
+import {AppDialogComponent} from '../../ui/dialog';
 import {CanvasPaneComponent} from '../canvas/canvas-pane.component';
 import {canvasSourceKey} from '../canvas/canvas-rendering';
 import {SettingsPaneComponent} from './settings-pane.component';
+
+export interface BrowserReplacementTarget {
+    readonly threadId: string;
+    readonly presentationRevision: number;
+    readonly sourceKey: string;
+}
+
+/** Keep a replacement confirmation scoped to the presentation the user saw. */
+export function browserReplacementTargetMatches(
+    target: BrowserReplacementTarget,
+    threadId: string | null,
+    state: CanvasState | null,
+): boolean {
+    return threadId === target.threadId &&
+        state?.status !== 'cleared' &&
+        state?.source?.type !== 'browser' &&
+        state?.presentation_revision === target.presentationRevision &&
+        canvasSourceKey(state) === target.sourceKey;
+}
 
 @Component({
     selector: 'app-chat-page',
@@ -38,6 +60,8 @@ import {SettingsPaneComponent} from './settings-pane.component';
         SettingsPaneComponent,
         AppIconComponent,
         AppIconButtonComponent,
+        AppButtonComponent,
+        AppDialogComponent,
     ],
     template: `
       @if (canvasAvailable()) {
@@ -112,6 +136,22 @@ import {SettingsPaneComponent} from './settings-pane.component';
           }
         </as-split-area>
       </as-split>
+
+      <app-dialog
+        [open]="browserReplacementTarget() !== null"
+        (closed)="cancelSharedBrowserReplacement()"
+        [title]="'canvas.browser.open.replace.title' | transloco"
+        size="sm">
+        <p>{{ 'canvas.browser.open.replace.body' | transloco }}</p>
+        <ng-container appDialogActions>
+          <app-button variant="ghost" (clicked)="cancelSharedBrowserReplacement()">
+            {{ 'common.cancel' | transloco }}
+          </app-button>
+          <app-button variant="warning" (clicked)="confirmSharedBrowserReplacement()">
+            {{ 'canvas.browser.open.replace.confirm' | transloco }}
+          </app-button>
+        </ng-container>
+      </app-dialog>
     `,
     styles: `
       :host {
@@ -215,6 +255,8 @@ export class ChatPageComponent implements OnInit, OnDestroy {
     readonly settingsOpen = signal(false);
     /** Mobile-only: settings takes the full screen (canvasFocus analogue). */
     readonly settingsFocus = signal(false);
+    /** Exact non-browser presentation awaiting destructive replacement approval. */
+    readonly browserReplacementTarget = signal<BrowserReplacementTarget | null>(null);
     /** A new canvas source arrived while settings held the pane — badge the
      *  canvas toggle instead of stealing (live_session_settings.md Slice A). */
     readonly canvasPending = signal(false);
@@ -349,6 +391,22 @@ export class ChatPageComponent implements OnInit, OnDestroy {
             }
             this.configureSplitterAccessibility();
         });
+
+        // A confirmation must never authorize replacement of a presentation
+        // that arrived after the user clicked Open browser.
+        effect(() => {
+            const target = this.browserReplacementTarget();
+            if (
+                target &&
+                (!browserReplacementTargetMatches(
+                    target,
+                    this.canvas.threadId(),
+                    this.canvas.state(),
+                ) || this.browserActionDisabled())
+            ) {
+                this.browserReplacementTarget.set(null);
+            }
+        });
     }
 
     /** Open the settings pane (header action / status chips). Takes the right
@@ -404,8 +462,48 @@ export class ChatPageComponent implements OnInit, OnDestroy {
 
     openSharedBrowser(): void {
         if (this.browserActionDisabled()) return;
+        const state = this.canvas.state();
+        const threadId = this.canvas.threadId();
+        const sourceKey = canvasSourceKey(state);
+        if (
+            threadId &&
+            state &&
+            sourceKey &&
+            state.status !== 'cleared' &&
+            state.source?.type !== 'browser'
+        ) {
+            this.browserReplacementTarget.set({
+                threadId,
+                presentationRevision: state.presentation_revision,
+                sourceKey,
+            });
+            return;
+        }
+        this.startSharedBrowser(state?.presentation_revision);
+    }
+
+    cancelSharedBrowserReplacement(): void {
+        this.browserReplacementTarget.set(null);
+    }
+
+    confirmSharedBrowserReplacement(): void {
+        const target = this.browserReplacementTarget();
+        this.browserReplacementTarget.set(null);
+        if (
+            !target ||
+            this.browserActionDisabled() ||
+            !browserReplacementTargetMatches(
+                target,
+                this.canvas.threadId(),
+                this.canvas.state(),
+            )
+        ) return;
+        this.startSharedBrowser(target.presentationRevision);
+    }
+
+    private startSharedBrowser(expectedPresentationRevision?: number): void {
         this.openCanvas(true);
-        this.canvas.openBrowser();
+        this.canvas.openBrowser(undefined, expectedPresentationRevision);
     }
 
     returnToChat(): void {
