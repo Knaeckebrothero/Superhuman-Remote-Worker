@@ -83,7 +83,19 @@ non-root (conflicts with Tilt's `/app` sync).
 
 - [x] Diagnosed + verified empirically (2026-06-22)
 - [x] Misleading chart comment corrected (`deployment.yaml`, `vm-ssh-key` volume)
-- [ ] Dev fix (stage-copy to `0600`) — **deferred**; prod unaffected, low priority
+- [x] **FIXED 2026-08-05** (`52c1ba80`) — `resolve_ssh_key_path` now stages a
+      readable-but-not-private key to an atomic runtime-owned `0600` copy and
+      returns that path, which is exactly the "Fix" shape proposed below. Works
+      as root *or* `srw`; the projected Secret stays read-only at `0444`, so the
+      chart is unchanged and paramiko is unaffected. Covered by
+      `tests/test_ssh_key_path.py`. The k3d orchestrator now logs zero
+      `0444`/"too open" errors.
+
+**Follow-up owed:** the suspend → S3 → restore cycle should now actually
+complete on k3d. That was the one acceptance criterion
+`docs/features/canvas_durable_presentation.md` §12 could not verify locally
+(criterion 13, worked around with pod deletion + re-provision). Running a real
+suspend/restore there would close it for free.
 - Re-confirmed still live on k3d 2026-06-30 while verifying
   `ide_settings_sweeper_probes_stale_workspace_endpoints.md`. The snapshot and
   `ide_settings` sweeps share a *no-eviction* root cause — both keep dialing

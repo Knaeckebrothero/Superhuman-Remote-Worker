@@ -296,6 +296,61 @@ POST /api/persistent/threads/490c07b8…/input   ← queued draft flushed
 after it; composer back to its normal placeholder, input cleared, card gone.
 Full cockpit suite: 1661 passed.
 
+## Follow-up 3: ended UI pinned over a live session (shipped)
+
+Reported after Follow-up 2 shipped: send-to-resume worked, the session came back
+and streamed — but the end marker, resume card and *"sending resumes the
+session"* placeholder stayed on screen for the rest of the session (seen on dev
+`5833c729` at Turn 7, mid-stream).
+
+**Pre-existing bug, newly easy to hit.** The RESUME button takes the identical
+`resumeSession()` path; Follow-up 2 only made the wrong state permanently
+visible (before, the composer was absent so there was less to look wrong).
+
+Mechanism. A resume reopens the SSE *before* the agent attaches, so the client
+is still anchored to the thread's OLD epoch. The stream generator polls
+
+```sql
+SELECT seq, kind, payload FROM thread_events
+ WHERE thread_id=$1 AND epoch=$2 AND seq > $3 ORDER BY seq ASC LIMIT 500
+```
+
+and happily streams that epoch's remaining tail — whose last rows are
+`session.idle_timeout` + `session.ended`. `_handleSseFrame` dispatches them with
+no epoch check, so `threadStatus` is set back to `'ended'` *after*
+`loadThreadMeta` had correctly read `created`. The epoch bump is only noticed
+later, on the idle recheck (`THREAD_EVENTS_EPOCH_RECHECK_S`), which emits
+`gone_beyond_horizon`; the client re-anchors and live frames flow again — but
+`_handleGoneBeyondHorizon` reloads *history* only, never thread meta, and
+nothing else re-reads status. Result: live streaming session, ended chrome,
+forever.
+
+Two guards, both client-side:
+
+- **Resume watermark.** `resumeSession()` records the epoch it is resuming
+  *from* (read from the persisted cursor) before anything reconnects;
+  `session.ended` / `session.idle_timeout` frames whose `id:` epoch is at or
+  below it are dropped as describing a session life already superseded. A frame
+  with no parseable id is always applied — never swallow a live end. The
+  watermark is deliberately **not** cleared in `disconnect()` (which `connect()`
+  calls first, and would therefore wipe it before the replay it exists to
+  suppress); it clears on a genuine thread switch instead.
+- **Self-heal on re-anchor.** `_handleGoneBeyondHorizon` now also awaits
+  `loadThreadMeta`. An epoch bump means a new agent attached, so any `'ended'`
+  the client is holding is stale by definition — this recovers a view that
+  already applied a replayed frame.
+
+Tests: replayed-vs-live terminal frames after a resume, id-less frame still
+applied, and the re-anchor status refresh. Full cockpit suite 1743 passed.
+
+Verified on k3d only as a **regression check** — send-to-resume still clears the
+ended chrome end-to-end (card, end marker and placeholder all gone once the
+agent is up, drafted message delivered). The replay ordering itself was not
+reproduced live: it needs a thread whose epoch tail carries journaled
+`session.*` rows *and* a client cursor sitting behind them, and the available
+k3d thread ended mid-push without ever journaling those rows. That path is
+covered by the unit tests above rather than a live run.
+
 ## Still open
 
 **The session folder is never shared to the user until they sign in once.**

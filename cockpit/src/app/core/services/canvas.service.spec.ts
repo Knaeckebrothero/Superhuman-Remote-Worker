@@ -624,22 +624,25 @@ describe('CanvasService', () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date('2026-07-22T10:00:00Z'));
     service.selectThread('thread-1');
-    http.expectOne(req => req.url.includes('/thread-1/canvases/main')).flush(null, {
-      status: 204,
-      statusText: 'No Content',
-    });
+    http.expectOne(req => req.url.includes('/thread-1/canvases/main')).flush(
+      canvasState(4, {status: 'ready'}),
+      {headers: {ETag: '"canvas:4:file"'}},
+    );
     http.expectOne(req => req.url.endsWith('/thread-1/browser/capability')).flush(
       browserCapability({workspace_ready: false}),
     );
     const sender = vi.fn().mockReturnValue(true);
     transport.attachControlSender(sender);
 
-    service.openBrowser('Research browser');
+    service.openBrowser('Research browser', 4);
     service.openBrowser('Duplicate click');
     expect(service.browserOpenStatus()).toBe('workspace');
     const provisioning = http.expectOne(req => req.url.endsWith('/thread-1/browser/open'));
     expect(provisioning.request.method).toBe('POST');
-    expect(provisioning.request.body).toEqual({title: 'Research browser'});
+    expect(provisioning.request.body).toEqual({
+      title: 'Research browser',
+      expected_presentation_revision: 4,
+    });
     provisioning.flush(
       {status: 'provisioning'},
       {status: 202, statusText: 'Accepted', headers: {'Retry-After': '2'}},
@@ -654,7 +657,11 @@ describe('CanvasService', () => {
     expect(service.browserOpenStatus()).toBe('browser');
 
     const opened = http.expectOne(req => req.url.endsWith('/thread-1/browser/open'));
-    opened.flush(canvasState(1, {
+    expect(opened.request.body).toEqual({
+      title: 'Research browser',
+      expected_presentation_revision: 4,
+    });
+    opened.flush(canvasState(5, {
       source: {type: 'browser'},
       title: 'Research browser',
       renderer: 'auto',
@@ -668,7 +675,7 @@ describe('CanvasService', () => {
       },
     }), {
       headers: {
-        ETag: '"canvas:1:browser"',
+        ETag: '"canvas:5:browser"',
         'X-Canvas-Mutation-Changed': 'true',
       },
     });
@@ -676,11 +683,11 @@ describe('CanvasService', () => {
     expect(service.browserOpenStatus()).toBe('idle');
     expect(service.browserOpenError()).toBeNull();
     expect(service.state()?.source).toEqual({type: 'browser'});
-    expect(service.stateEtag()).toBe('"canvas:1:browser"');
+    expect(service.stateEtag()).toBe('"canvas:5:browser"');
     expect(sender).toHaveBeenCalledWith('thread-1', {
       method: 'canvas.presentation_updated',
       canvas_id: 'main',
-      presentation_revision: 1,
+      presentation_revision: 5,
     });
   });
 
@@ -776,6 +783,37 @@ describe('CanvasService', () => {
       {status: 503, statusText: 'Unavailable'},
     );
     expect(service.browserOpenError()).toBe('browser_gone');
+  });
+
+  it('reconciles the winning Canvas after a conditional browser-open conflict', () => {
+    service.selectThread('thread-1');
+    http.expectOne(req => req.url.includes('/thread-1/canvases/main')).flush(
+      canvasState(4, {status: 'ready'}),
+      {headers: {ETag: '"canvas:4:file"'}},
+    );
+    http.expectOne(req => req.url.endsWith('/thread-1/browser/capability')).flush(
+      browserCapability(),
+    );
+
+    service.openBrowser(undefined, 4);
+    const open = http.expectOne(req => req.url.endsWith('/thread-1/browser/open'));
+    expect(open.request.body).toEqual({
+      title: null,
+      expected_presentation_revision: 4,
+    });
+    open.flush(
+      {detail: {code: 'canvas_presentation_changed'}},
+      {status: 409, statusText: 'Conflict'},
+    );
+
+    expect(service.browserOpenStatus()).toBe('error');
+    expect(service.browserOpenError()).toBe('canvas_presentation_changed');
+    http.expectOne(req => req.url.includes('/thread-1/canvases/main')).flush(
+      canvasState(5, {title: 'New agent presentation', status: 'ready'}),
+      {headers: {ETag: '"canvas:5:new"'}},
+    );
+    expect(service.state()?.presentation_revision).toBe(5);
+    expect(service.state()?.title).toBe('New agent presentation');
   });
 
   it('times out cold provisioning after five minutes with a retryable error', () => {

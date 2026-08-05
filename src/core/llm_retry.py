@@ -32,7 +32,7 @@ them — bias for retry, but do not retry blindly:
 * over-eager ``transient`` loops forever
   (docs/done/agent_infinite_retry_on_permanent_llm_errors.md)
 
-See docs/issues/llm_retry_and_fallback_reimplemented_per_call_site.md.
+See docs/done/llm_retry_and_fallback_reimplemented_per_call_site.md.
 """
 
 import asyncio
@@ -646,7 +646,7 @@ def initial_error_freeze_fields(
 # with four different backoff schedules, and two of them (the light subagent
 # readers and the auxiliary tasks) had no loop at all — a single transient 408
 # killed both readers of a parallel fan-out on critic job 37c418d2.
-# docs/issues/llm_retry_and_fallback_reimplemented_per_call_site.md
+# docs/done/llm_retry_and_fallback_reimplemented_per_call_site.md
 # ---------------------------------------------------------------------------
 
 # Verdicts that another identical attempt could plausibly clear. `permanent`,

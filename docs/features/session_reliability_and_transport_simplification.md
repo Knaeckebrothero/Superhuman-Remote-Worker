@@ -1,7 +1,19 @@
 # Session Reliability & Transport Simplification
 
-**Status**: PROPOSED (refined)
-**Date**: 2026-07-06 (v2 — same day, post-review)
+**Status**: PARTIALLY SHIPPED — Phases 1–4 live on `develop`; Phases 5–6 not
+started. Not a candidate for `docs/done/` until those land.
+**Date**: 2026-07-06 (v2 — same day, post-review); status refreshed 2026-08-05
+**Phase state** (verified against the tree, 2026-08-05):
+
+| Phase | State | Marker checked |
+|---|---|---|
+| 1 — zombie-epoch SSE (server) | shipped | `thread_event_stream epoch bump` in `main.py`; observed live on dev (`45→46` on thread `b1758f38`) |
+| 2 — send-liveness kickstart | shipped | `_armSendKickstart` in `persistent-chat.service.ts` |
+| 3 — outbox | shipped, + stalled-queue follow-up (§"Stalled queue") | `outbox`, `outboxStalled`, `retryQueuedSends`, `discardQueuedSend` |
+| 4 — de-flicker generation | shipped | `_flushDeltas`, 5 call sites |
+| 5 — on-demand per-session SSE | **not started** | — |
+| 6 — retire control WebSocket | **not started** | no `threads/{thread_id}/control` endpoint; `_installControlWs` still live (5 refs) |
+
 **Provenance**: v1 drafted from a two-agent code investigation; v2 refined via a
 20-agent workflow — 4 codebase deep-dives + 4 web best-practice sweeps
 (SSE architecture, streaming-LLM rendering, background-tab recovery,

@@ -1,8 +1,27 @@
 # Project-scoped connector availability and auto-attach defaults
 
-Status: **IMPLEMENTED 2026-08-05** — policy UI advertisement and generic REST
-omission-as-default remain behind separate default-off rollout gates described
-in section 12.2.
+Status: **IMPLEMENTED 2026-08-05; LIVE VALIDATION PARTIAL** — policy UI
+advertisement and generic REST omission-as-default remain behind separate
+default-off rollout gates described in section 12.2.
+
+A k3d/Playwright acceptance run on 2026-08-05 exercised all three rollout
+profiles (R0/R1/R2) against the `aec2e5da` build and found **no product
+failures in 35 assertions**. Confirmed live: the R0 disabled posture, the owner
+eligibility/default matrix (0 deviations across 30 cells), the member matrix
+(no cross-owner default expansion in either eligibility or R2 omission), job and
+thread materialization corroborated against `job_datasources` /
+`jobs.context.datasource_selection` / `threads.metadata`, the full raw
+validation contract (9 probes → 422), stale-revision 409, the native project KB
+lock (rescope/relink/delete all 409), existing-work immutability, final-unlink
+non-widening, and the complete R2 omission semantics.
+
+**Not yet live-accepted.** Automations, project loops, retained-only links,
+workspace-tier filtering, public/shared policy, delegation inheritance, MCP
+transport, and the dispatch-revocation boundary are still unproven on a
+deployment — several are blocked on missing prerequisites (an authenticated MCP
+client, a `public_datasources` grant, documented dispatch/batch fault hooks).
+Per-row results, evidence and three follow-up findings:
+[`docs/done/project_scoped_connector_auto_attach_k3d_playwright_validation.md`](../done/project_scoped_connector_auto_attach_k3d_playwright_validation.md).
 Date: 2026-08-05
 Scope: orchestrator datasource persistence and authorization, job/session creation,
 system-created jobs, MCP clients, and the Cockpit connector catalog/create forms and
