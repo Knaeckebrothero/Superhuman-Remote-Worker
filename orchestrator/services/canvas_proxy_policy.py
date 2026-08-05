@@ -786,10 +786,19 @@ def _gateway_csp(
         "style-src 'self' 'unsafe-inline'; "
         "img-src 'self' data: blob:; font-src 'self' data:; "
         f"connect-src 'self' {public_origin.websocket_origin}; "
-        "frame-src 'none'; object-src 'none'; worker-src 'none'; "
+        # An app framing its own pages is a normal shape (galleries, previews,
+        # doc viewers) and reaches nothing new: a nested same-origin document
+        # is served by this gateway, through this session, under this same
+        # policy and sandbox. It takes both halves — the parent's frame-src for
+        # the nested load, and 'self' in frame-ancestors because the app origin
+        # then sits in that nested document's ancestor chain. Admitting only
+        # frame-src leaves the child refused. Anti-framing is intact: browsers
+        # check every ancestor, so the outermost frame must still be a Cockpit
+        # origin and a hostile page gains nothing by chaining through one.
+        "frame-src 'self' blob:; object-src 'none'; worker-src 'none'; "
         "base-uri 'self'; form-action 'self'; "
         "sandbox allow-scripts allow-same-origin allow-forms; "
-        f"frame-ancestors {' '.join(ancestors)}"
+        f"frame-ancestors 'self' {' '.join(ancestors)}"
     )
     return policy.encode("ascii")
 
