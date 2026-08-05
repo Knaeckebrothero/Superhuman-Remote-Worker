@@ -359,7 +359,7 @@ class TestReaderLLMRetry:
     Both readers of critic job 37c418d2 died on a single 408 stream-disconnect:
     the parent execute node's classify+retry never covered them, because a light
     reader is a graph-less in-process harness.
-    docs/issues/llm_retry_and_fallback_reimplemented_per_call_site.md
+    docs/done/llm_retry_and_fallback_reimplemented_per_call_site.md
     """
 
     @pytest.mark.asyncio

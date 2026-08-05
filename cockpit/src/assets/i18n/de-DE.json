@@ -184,6 +184,11 @@
         "action": "Browser öffnen",
         "explanation": "Öffnen Sie einen Browser, den Sie gemeinsam mit dem Agenten verwenden können.",
         "dirty": "Speichern oder verwerfen Sie Ihre Canvas-Änderungen, bevor Sie den Browser öffnen. Dadurch wird die aktuelle Ansicht ersetzt.",
+        "replace": {
+          "title": "Aktuellen Canvas ersetzen?",
+          "body": "Beim Öffnen des geteilten Browsers wird die aktuelle Canvas-Präsentation ersetzt. Das zugrunde liegende Element wird nicht gelöscht, muss aber vom Agenten erneut präsentiert werden, bevor Sie dorthin zurückkehren können.",
+          "confirm": "Durch Browser ersetzen"
+        },
         "retry": "Erneut versuchen",
         "phase": {
           "workspace": "Workspace wird gestartet…",

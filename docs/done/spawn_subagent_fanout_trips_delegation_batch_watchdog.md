@@ -9,8 +9,17 @@ tags:
 
 # Deep `spawn_subagent` fan-outs blow the 120 s delegation batch watchdog — mislabeled "Tool batch repeatedly timed out — workspace may be wedged" and the job fails
 
-**Status:** FIX BUILT 2026-07-18 (all three layers, unit-tested; see
-"Fix implemented" below). Awaiting commit + rollout.
+**Status:** RESOLVED. Fix built 2026-07-18 (all three layers, unit-tested; see
+"Fix implemented" below) and confirmed shipped + live on 2026-07-29: the
+working tree is clean for `src/tools/delegation/`, `config/worker_base.yaml`
+and `src/graph.py`, the wall-clock deadline landed in `89ef4a96`, and the live
+values are `tool_category_timeouts.delegation: 600`
+(`config/worker_base.yaml:253`) and `delegation.light.timeout_seconds: 240`
+(`:429`).
+
+**Note on paths below:** `config/defaults.yaml` was renamed to
+`config/worker_base.yaml` in `57430a2a`, so every `config/defaults.yaml`
+reference in this document is historical. Line numbers are as-of-writing.
 **Severity:** medium — intermittent (only deep fan-outs); each hit wastes a
 loop iteration, burns ~6 discarded reader LLM runs, bumps
 `consecutive_failures` toward the loop cap, and emits an error that
@@ -81,6 +90,22 @@ turn cut off → synthesis; slow tool turn cut off → paired ToolMessages +
 synthesis; `timeout_seconds=0` unbounded; hung synthesis falls back to
 last text). Scholar/developer expert configs only set `mode`/
 `allow_writes`, so the new defaults reach them via deep merge.
+
+## Aftermath — a *different* delegation failure mode, same tool
+
+This fix bounds how long a reader may run. It does not give a reader any
+ability to survive a provider error, and on 2026-07-28 critic job `37c418d2`
+lost **both** readers of a parallel fan-out to a single 408 stream-disconnect:
+`light_runner` caught only `asyncio.TimeoutError`, so any provider failure
+propagated out and became the string "Error: subagent failed". Readers gained
+classify-and-retry in
+`docs/done/llm_retry_and_fallback_reimplemented_per_call_site.md`.
+
+The two interact, and the interaction is the interesting part: the reader's
+retry budget has to fit *inside* the wall-clock deadline this document
+established, and `asyncio.TimeoutError` must never be retried — here the
+timeout **is** the deadline, and retrying it would silently reopen exactly the
+fan-out-discarded failure fixed above.
 
 ## Related
 

@@ -215,7 +215,7 @@ class TestAuxRetryBeforeFallback:
     Before this, aux had no retry, so the fallback was doing retry's job: one
     transient blip on the cheap aux model instantly rerouted the call to the
     expensive main model and lit the aux-degraded heartbeat flag.
-    docs/issues/llm_retry_and_fallback_reimplemented_per_call_site.md
+    docs/done/llm_retry_and_fallback_reimplemented_per_call_site.md
     """
 
     @pytest.mark.asyncio

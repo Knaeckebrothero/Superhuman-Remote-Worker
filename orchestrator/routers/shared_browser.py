@@ -57,6 +57,7 @@ class BrowserOpenRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     title: str | None = Field(default=None, max_length=200)
+    expected_presentation_revision: int | None = Field(default=None, ge=1)
 
 
 def _raise_browser_error(error: BrowserCanvasError) -> None:
@@ -128,6 +129,7 @@ async def open_shared_browser(
             thread_id,
             prepared,
             title=(body.title or "").strip() or "Shared browser",
+            expected_presentation_revision=body.expected_presentation_revision,
         )
     except BrowserCanvasError as exc:
         _raise_browser_error(exc)

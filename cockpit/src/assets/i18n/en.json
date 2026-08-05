@@ -184,6 +184,11 @@
         "action": "Open browser",
         "explanation": "Open a browser that you and the agent can use together.",
         "dirty": "Save or discard your Canvas edits before opening the browser. Opening it replaces the current stage.",
+        "replace": {
+          "title": "Replace the current Canvas?",
+          "body": "Opening the shared browser replaces the current Canvas presentation. The underlying item is not deleted, but the agent must present it again before you can return to it.",
+          "confirm": "Replace with browser"
+        },
         "retry": "Retry",
         "phase": {
           "workspace": "Starting workspace…",

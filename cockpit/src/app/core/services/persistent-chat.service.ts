@@ -896,6 +896,9 @@ export class PersistentChatService {
             // wholesale — unless we're carrying it across a create/reprovision
             // (createAndConnect), where the queued sends belong to *this* thread.
             if (!opts.carryOutbox) this.outbox.set([]);
+            // Genuine thread switch: a resume watermark from the previous
+            // thread would suppress a real terminal frame on this one.
+            this.resumedFromEpoch = null;
             // Same gate for the VM-session flag: createAndConnect sets it before
             // calling connect(carryOutbox), so only a real switch clears it. A
             // backend='vm' lifecycle event re-asserts it for the resume path.
@@ -1534,9 +1537,15 @@ export class PersistentChatService {
         // dispatch error doesn't lose our place — the SSE replay logic
         // tolerates re-receiving the same seq (it'll just be a no-op given
         // the seq > $3 guard server-side).
+        this.currentFrameEpoch = null;
         if (event.lastEventId) {
             const tid = this.threadId();
             if (tid) this._saveCursor(tid, event.lastEventId);
+            const colon = event.lastEventId.indexOf(':');
+            if (colon > 0) {
+                const parsed = Number(event.lastEventId.slice(0, colon));
+                if (Number.isFinite(parsed)) this.currentFrameEpoch = parsed;
+            }
         }
 
         let frame: { method: string; params?: Record<string, unknown> };
@@ -1604,7 +1613,49 @@ export class PersistentChatService {
             await this.cache.deleteThreadCursor(tid);
         }
         if (!this._isCurrentConnect(tid, generation)) return;
+        // An epoch bump means a new agent attached, so any 'ended' status we
+        // are still holding is stale by definition — re-read it. Self-heals a
+        // view that already applied a replayed terminal frame (loadHistory
+        // above restores the transcript but never touches thread meta).
+        await this.loadThreadMeta(tid, generation);
+        if (!this._isCurrentConnect(tid, generation)) return;
         await this._openSse(tid);
+    }
+
+    /** Epoch of the frame currently being dispatched, parsed from the SSE
+     *  `id:` line. Null for frames that carried no usable id. */
+    private currentFrameEpoch: number | null = null;
+
+    /**
+     * Epoch the thread was on when we last resumed it. A resume reconnects the
+     * SSE while the thread is still on its OLD epoch (the agent hasn't attached
+     * yet), so the server replays that epoch's remaining tail — which ends in
+     * `session.idle_timeout` + `session.ended`. Those describe a session life
+     * we have already superseded; applying them pins the ended UI over a live,
+     * streaming session, and nothing re-reads status afterwards. Frames at or
+     * below this watermark are ignored by the terminal-lifecycle handlers.
+     */
+    private resumedFromEpoch: number | null = null;
+
+    /**
+     * True when the terminal lifecycle frame being dispatched belongs to a
+     * session life we have already resumed past.
+     *
+     * A resume reopens the SSE while the thread is still on its OLD epoch —
+     * the agent hasn't attached and bumped it yet — so the server's
+     * `WHERE epoch = $2 AND seq > $3` poll streams that epoch's remaining
+     * tail, whose last two rows are `session.idle_timeout` + `session.ended`.
+     * Applying them re-pins the ended UI (end marker, resume card, "sending
+     * resumes the session" placeholder) over a session that is live and
+     * streaming, and nothing re-reads thread status afterwards, so it sticks
+     * for the rest of the session.
+     */
+    private _isSupersededLifecycleFrame(): boolean {
+        if (this.resumedFromEpoch === null) return false;
+        // No id on the frame → can't prove it's stale; apply it. A live
+        // terminal frame is the one case we must never swallow.
+        if (this.currentFrameEpoch === null) return false;
+        return this.currentFrameEpoch <= this.resumedFromEpoch;
     }
 
     private _saveCursor(threadId: string, lastEventId: string): void {
@@ -2159,6 +2210,11 @@ export class PersistentChatService {
         this.protectedMountName.set(null);
         this.cloudStagedAt.set(null);
         this.cloudDiffPanelOpen.set(false);
+        // NOTE: resumedFromEpoch is deliberately NOT cleared here. connect()
+        // calls disconnect() first, and a resume sets the watermark *before*
+        // connect() — clearing it here would wipe it before the reopened
+        // stream replays the very frames it exists to suppress. Cleared on a
+        // genuine thread switch instead (connect's cold path).
     }
 
     /**
@@ -2179,6 +2235,19 @@ export class PersistentChatService {
         const generation = this.connectGeneration;
         this.isSessionPaused.set(false);
         this.isResuming.set(true);
+        // Watermark the epoch we're resuming FROM, before anything reconnects.
+        // The reopened stream replays that epoch's tail — ending in the
+        // idle_timeout/ended pair that put us here — and those frames must not
+        // re-pin the ended UI over the live session. Cleared on a genuine
+        // thread switch (connect's cold path) and on disconnect().
+        try {
+            const cursor = await this.cache.getThreadCursor(threadId);
+            if (cursor && Number.isFinite(cursor.epoch)) {
+                this.resumedFromEpoch = cursor.epoch;
+            }
+        } catch {
+            // No cursor (fresh load) → nothing to replay past; leave it null.
+        }
         try {
             try {
                 await firstValueFrom(
@@ -3344,6 +3413,7 @@ export class PersistentChatService {
             }
 
             case 'session.ended':
+                if (this._isSupersededLifecycleFrame()) break;
                 this._systemMessage('Session ended.');
                 this.isWaitingForInput.set(false);
                 this.threadStatus.set('ended');
@@ -3351,6 +3421,7 @@ export class PersistentChatService {
                 break;
 
             case 'session.idle_timeout':
+                if (this._isSupersededLifecycleFrame()) break;
                 this._systemMessage(
                     `Session paused after ${(params['timeout_minutes'] as number) || 30} minutes of inactivity. Your work has been saved.`,
                 );
