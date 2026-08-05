@@ -102,6 +102,60 @@ def _isolate_declared_provenance_env(monkeypatch):
 
 
 # =============================================================================
+# Orchestrator module-singleton hygiene
+# =============================================================================
+#
+# orchestrator/main.py owns process-wide singletons (``postgres_db`` and
+# friends). A test that swaps one in with a bare assignment rather than
+# monkeypatch leaks it into every test that runs after it in the same process,
+# and the failure surfaces hundreds of tests later in a file that never touched
+# the global — e.g. a leaked ``MagicMock`` postgres_db turning an unrelated
+# ``await postgres_db.<method>()`` into "MagicMock can't be used in 'await'".
+# Snapshot the identities around every test and put them back, so a missing
+# restore stays local to the test that made it.
+#
+# ``main`` and ``orchestrator.main`` are distinct module objects here (both
+# import roots are on sys.path), so both are guarded.
+
+_ORCH_MAIN_MODULE_NAMES = ("main", "orchestrator.main")
+_ORCH_MAIN_SINGLETONS = (
+    "postgres_db",
+    "workspace_suspension_service",
+    "persistent_provisioner",
+    "email_service",
+    "headless_notifications",
+)
+
+
+@pytest.fixture(autouse=True)
+def _restore_orchestrator_singletons():
+    modules = []
+    for name in _ORCH_MAIN_MODULE_NAMES:
+        module = sys.modules.get(name)
+        if module is not None and not any(module is seen for seen in modules):
+            modules.append(module)
+
+    snapshots = [
+        (
+            module,
+            {
+                name: getattr(module, name)
+                for name in _ORCH_MAIN_SINGLETONS
+                if hasattr(module, name)
+            },
+        )
+        for module in modules
+    ]
+    try:
+        yield
+    finally:
+        for module, snapshot in snapshots:
+            for name, value in snapshot.items():
+                if getattr(module, name, None) is not value:
+                    setattr(module, name, value)
+
+
+# =============================================================================
 # F1 multi-tenancy fixture — three users, two projects, jobs/threads/sessions
 # =============================================================================
 #
