@@ -28,7 +28,9 @@ blocking it should be taken before the next bench campaign.
   `deliverable_lost_to_nested_repo_commit_and_stranded_mode_a_job.md`:
   219/220 Mode A jobs stranded, zero exports ever. Direction already decided
   (retire Mode A per `docs/features/workspace_and_change_records.md` §6.3),
-  needs execution.
+  needs execution. (Defect 1 of that doc is **closed 08-06** — fix `22b2511e`
+  deployed, blast radius settled as universal across a ~32 h window, not
+  conditional as two earlier passes claimed. Residue promoted to P1 above.)
 - ~~Stale-agent detector SQL crash~~ — **resolved + deployed to prod 07-12**
   (`docs/done/stale_agent_detector_sql_crash_disables_recovery_sweeps.md`);
   open residue = job-execution-lease stages 4–5 and two feature docs
@@ -43,6 +45,7 @@ blocking it should be taken before the next bench campaign.
 | [homelab_wan_outage_severs_cluster_from_own_llm](homelab_wan_outage_severs_cluster_from_own_llm.md) | Cheap CoreDNS rewrite makes every job immune to WAN outages (08-05 cost a 3 h cluster-wide LLM blackout + 1 job). |
 | [embedding_batch_overflow_skips_citation_source_embeddings](embedding_batch_overflow_skips_citation_source_embeddings.md) | OPEN. P1 research-quality and load defect.** Source registration |
 | [phase_boundary_tags_are_moved_then_rejected_by_remote](phase_boundary_tags_are_moved_then_rejected_by_remote.md) | OPEN. P1 phase evidence / Git observability defect.** Branch |
+| [deliverable_lost_to_nested_repo…](deliverable_lost_to_nested_repo_commit_and_stranded_mode_a_job.md) (Defect 1 residue) | **Blocks the bench thread.** The gate and critic verify against the *remote branch*, so a failed push is indistinguishable from a lazy agent — the 08-01/08-02 CWD-banner outage burned all 5 of `cd3bfe52`'s critic rounds and both of `bbce4bed`'s bounces on phantom findings, and any future transport failure will corrupt bench results the same way. Fix: hold on `has_unpushed_commits()` at seal instead of emitting findings. Also: 5 of 6 `git_mgr.push()` call sites in `src/core/phase.py` still discard the return value. |
 | [job_finalization_decisions_held_only_in_process_memory](job_finalization_decisions_held_only_in_process_memory.md) | Orchestrator restart mid-finalization loses decisions (restarts happen on every deploy). |
 | [pod_oom_kill_protection](pod_oom_kill_protection.md) | Umbrella for the recurring OOM incident class. |
 
