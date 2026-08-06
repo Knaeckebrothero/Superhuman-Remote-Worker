@@ -41,6 +41,18 @@ from src.persistent_graph import (
 # ---------------------------------------------------------------------------
 
 
+def _prompt_body(content: str) -> str:
+    """The system prompt minus its trailing current-date line.
+
+    run_persistent_loop stamps every system message with a date (see
+    ``src/core/loader.with_current_date``), so prompt-identity assertions
+    compare bodies rather than whole strings.
+    """
+    return "\n".join(
+        line for line in content.split("\n") if not line.startswith("Current date:")
+    ).rstrip()
+
+
 def _make_callbacks(**overrides) -> PersistentLoopCallbacks:
     """Build a PersistentLoopCallbacks with sane defaults (all no-op)."""
     defaults = dict(
@@ -191,7 +203,7 @@ class TestRunPersistentLoopSystemPrompt:
         )
 
         assert isinstance(messages[0], SystemMessage)
-        assert messages[0].content == "You are helpful."
+        assert _prompt_body(messages[0].content) == "You are helpful."
 
     @pytest.mark.asyncio
     async def test_inserts_system_message_when_first_is_not_system(self):
@@ -218,7 +230,7 @@ class TestRunPersistentLoopSystemPrompt:
         )
 
         assert isinstance(messages[0], SystemMessage)
-        assert messages[0].content == "system"
+        assert _prompt_body(messages[0].content) == "system"
 
     @pytest.mark.asyncio
     async def test_does_not_insert_when_system_message_present(self):
@@ -285,7 +297,7 @@ class TestRunPersistentLoopSystemPrompt:
 
         # Mutated in place — same object (persistence identity), new content.
         assert messages[0] is existing_sys
-        assert messages[0].content == "rebuilt prompt"
+        assert _prompt_body(messages[0].content) == "rebuilt prompt"
 
     @pytest.mark.asyncio
     async def test_empty_rebuilt_prompt_does_not_clobber_messages0(self):
@@ -318,7 +330,123 @@ class TestRunPersistentLoopSystemPrompt:
             get_current_system_prompt=lambda: "",
         )
 
-        assert messages[0].content == "attach-time prompt"
+        assert _prompt_body(messages[0].content) == "attach-time prompt"
+
+    @pytest.mark.asyncio
+    async def test_system_prompt_carries_current_date(self):
+        """Every turn's system message states today's date and weekday.
+
+        Without it the agent cannot resolve "today" and reaches for a shell to
+        run `date` — which the lite workspace tiers do not have.
+        """
+        from datetime import datetime, timezone
+
+        messages: List[BaseMessage] = []
+        call_count = 0
+
+        async def _input():
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return "hi"
+            raise asyncio.CancelledError
+
+        await run_persistent_loop(
+            llm_with_tools=_make_streaming_llm(_make_llm_response()),
+            tools=[],
+            context_manager=AsyncMock(
+                ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
+            ),
+            config=_make_config(),
+            system_prompt="You are helpful.",
+            callbacks=_make_callbacks(get_user_input=_input),
+            messages=messages,
+        )
+
+        now = datetime.now(timezone.utc)
+        assert f"Current date: {now:%Y-%m-%d}" in messages[0].content
+        # The weekday is the load-bearing part — "open on Sundays" is
+        # unanswerable from the calendar date alone.
+        assert f"{now:%A}" in messages[0].content
+
+    @pytest.mark.asyncio
+    async def test_stale_date_refreshed_on_next_turn(self):
+        """A session outliving its creation day gets the date re-stamped.
+
+        Threads here run for weeks; a date baked in at setup would have the
+        agent answering "today" questions against session-creation day.
+        """
+        from datetime import datetime, timezone
+
+        stale = "Current date: 1999-01-01 (Friday, UTC)"
+        existing_sys = SystemMessage(content=f"attach-time prompt\n\n{stale}")
+        messages: List[BaseMessage] = [existing_sys]
+
+        call_count = 0
+
+        async def _input():
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return "hi"
+            raise asyncio.CancelledError
+
+        await run_persistent_loop(
+            llm_with_tools=_make_streaming_llm(_make_llm_response()),
+            tools=[],
+            context_manager=AsyncMock(
+                ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
+            ),
+            config=_make_config(),
+            system_prompt="attach-time prompt",
+            callbacks=_make_callbacks(get_user_input=_input),
+            messages=messages,
+        )
+
+        # Same object (persistence identity), stale date gone, body intact.
+        assert messages[0] is existing_sys
+        assert stale not in messages[0].content
+        assert f"Current date: {datetime.now(timezone.utc):%Y-%m-%d}" in (
+            messages[0].content
+        )
+        assert _prompt_body(messages[0].content) == "attach-time prompt"
+
+    @pytest.mark.asyncio
+    async def test_date_refresh_does_not_displace_trailing_floor(self):
+        """The managed product guide stays the tail of the system message.
+
+        The date line is rewritten in place, not moved to the end — the guide
+        is deliberately last so it sits closest to the current turn.
+        """
+        floor = "</managed_product_guide>"
+        existing_sys = SystemMessage(
+            content=f"body\n\nCurrent date: 1999-01-01 (Friday, UTC)\n\n{floor}"
+        )
+        messages: List[BaseMessage] = [existing_sys]
+
+        call_count = 0
+
+        async def _input():
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return "hi"
+            raise asyncio.CancelledError
+
+        await run_persistent_loop(
+            llm_with_tools=_make_streaming_llm(_make_llm_response()),
+            tools=[],
+            context_manager=AsyncMock(
+                ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
+            ),
+            config=_make_config(),
+            system_prompt="body",
+            callbacks=_make_callbacks(get_user_input=_input),
+            messages=messages,
+        )
+
+        assert messages[0].content.rstrip().endswith(floor)
+        assert "1999-01-01" not in messages[0].content
 
 
 # ---------------------------------------------------------------------------
@@ -3167,7 +3295,12 @@ class TestToolExecutionLoop:
 
         assert result.tool_calls_made == 0
         callbacks.on_tool_result.assert_called_once()
-        assert "not found" in callbacks.on_tool_result.call_args[0][1]
+        # The message names the cause rather than only the symptom, so the
+        # model can re-plan instead of retrying — see
+        # _unavailable_tool_message and TestUnboundToolSkipsThePermissionGate.
+        body = callbacks.on_tool_result.call_args[0][1]
+        assert "No tool named 'nonexistent' exists" in body
+        assert "Do not retry" in body
 
     @pytest.mark.asyncio
     async def test_tool_exception_handled(self):

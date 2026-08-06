@@ -336,3 +336,263 @@ class TestBatchAnnounce:
         assert ("gate", "tc_1") in timeline
         # Both tools ran despite announce failure
         assert tool.ainvoke.await_count == 2
+
+
+async def _run_turn_with_named_calls(
+    *,
+    calls: list[tuple[str, str]],
+    messages: list[BaseMessage],
+    permission_check,
+    announce_permission_batch=None,
+):
+    """Drive one turn whose AIMessage carries ``calls`` as (tool_name, id).
+
+    Only ``web_search`` is bound, so any other name models a tool the agent
+    asked for that the capability gate never bound.
+    """
+    response_with_tools = AIMessage(
+        content="",
+        tool_calls=[
+            {"name": name, "args": {"query": "x"}, "id": call_id}
+            for name, call_id in calls
+        ],
+    )
+    final_response = AIMessage(content="Done.")
+
+    call_count = 0
+
+    async def _astream(_messages, **kw):
+        nonlocal call_count
+        call_count += 1
+        yield response_with_tools if call_count == 1 else final_response
+
+    llm = AsyncMock()
+    llm.reasoning = None
+    llm.astream = _astream
+
+    tool = _make_tool("web_search", "Results: Paris.")
+
+    turns = 0
+
+    async def _input():
+        nonlocal turns
+        turns += 1
+        if turns == 1:
+            return "go"
+        raise asyncio.CancelledError
+
+    callbacks = _make_callbacks(
+        get_user_input=_input,
+        permission_check=permission_check,
+        announce_permission_batch=announce_permission_batch,
+    )
+
+    await run_persistent_loop(
+        llm_with_tools=llm,
+        tools=[tool],
+        context_manager=AsyncMock(
+            ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
+        ),
+        config=_make_config(),
+        system_prompt="sys",
+        callbacks=callbacks,
+        messages=messages,
+    )
+    return tool
+
+
+class TestUnboundToolSkipsThePermissionGate:
+    """A tool that binds to nothing must be rejected before it is gated.
+
+    The live bug: a supervised session called `shell_execute` on a workspace
+    tier with no shell. The existence check sat *after* the gate, so the user
+    was shown an approval card for a tool that could not run either way and the
+    turn blocked ~53s on that round-trip before reporting "not found".
+    """
+
+    @pytest.mark.asyncio
+    async def test_unbound_tool_is_never_gated(self):
+        gated = []
+
+        async def _permission_check(tool_name, tool_args, tool_call_id):
+            gated.append(tool_name)
+            return PermissionOutcome.APPROVED
+
+        messages: list[BaseMessage] = []
+        await _run_turn_with_named_calls(
+            calls=[("shell_execute", "tc_0")],
+            messages=messages,
+            permission_check=_permission_check,
+        )
+
+        assert gated == [], f"phantom tool reached the permission gate: {gated}"
+
+    @pytest.mark.asyncio
+    async def test_unbound_tool_is_never_announced(self):
+        announced = []
+
+        async def announce(calls):
+            announced.extend(c["name"] for c in calls)
+
+        async def _permission_check(tool_name, tool_args, tool_call_id):
+            return PermissionOutcome.APPROVED
+
+        messages: list[BaseMessage] = []
+        await _run_turn_with_named_calls(
+            calls=[("shell_execute", "tc_0"), ("web_search", "tc_1")],
+            messages=messages,
+            permission_check=_permission_check,
+            announce_permission_batch=announce,
+        )
+
+        # The real tool is still announced; the phantom raises no card.
+        assert announced == ["web_search"], announced
+
+    @pytest.mark.asyncio
+    async def test_announce_still_called_when_every_call_is_unbound(self):
+        """The hook also retires the previous batch's rows — never skip it."""
+        announced_batches = []
+
+        async def announce(calls):
+            announced_batches.append([c["name"] for c in calls])
+
+        async def _permission_check(tool_name, tool_args, tool_call_id):
+            return PermissionOutcome.APPROVED
+
+        messages: list[BaseMessage] = []
+        await _run_turn_with_named_calls(
+            calls=[("shell_execute", "tc_0")],
+            messages=messages,
+            permission_check=_permission_check,
+            announce_permission_batch=announce,
+        )
+
+        assert announced_batches == [[]], announced_batches
+
+    @pytest.mark.asyncio
+    async def test_error_names_the_reason_not_just_not_found(self):
+        async def _permission_check(tool_name, tool_args, tool_call_id):
+            return PermissionOutcome.APPROVED
+
+        messages: list[BaseMessage] = []
+        await _run_turn_with_named_calls(
+            calls=[("shell_execute", "tc_0")],
+            messages=messages,
+            permission_check=_permission_check,
+        )
+
+        body = str(next(m for m in messages if isinstance(m, ToolMessage)).content)
+        # Names the capability and that it is absent here — enough for the
+        # model to re-plan rather than retry.
+        assert "shell" in body
+        assert "not available in this session" in body
+        assert "Do not retry" in body
+
+    @pytest.mark.asyncio
+    async def test_unknown_name_reported_as_nonexistent(self):
+        async def _permission_check(tool_name, tool_args, tool_call_id):
+            return PermissionOutcome.APPROVED
+
+        messages: list[BaseMessage] = []
+        await _run_turn_with_named_calls(
+            calls=[("totally_made_up_tool", "tc_0")],
+            messages=messages,
+            permission_check=_permission_check,
+        )
+
+        body = str(next(m for m in messages if isinstance(m, ToolMessage)).content)
+        assert "No tool named 'totally_made_up_tool' exists" in body
+
+    @pytest.mark.asyncio
+    async def test_bound_sibling_in_same_batch_still_runs(self):
+        """Rejecting a phantom must not disturb the real calls beside it."""
+        gated = []
+
+        async def _permission_check(tool_name, tool_args, tool_call_id):
+            gated.append(tool_name)
+            return PermissionOutcome.APPROVED
+
+        messages: list[BaseMessage] = []
+        tool = await _run_turn_with_named_calls(
+            calls=[("shell_execute", "tc_0"), ("web_search", "tc_1")],
+            messages=messages,
+            permission_check=_permission_check,
+        )
+
+        assert gated == ["web_search"]
+        tool.ainvoke.assert_awaited_once()
+        bodies = {
+            m.tool_call_id: str(m.content)
+            for m in messages
+            if isinstance(m, ToolMessage)
+        }
+        assert "not available in this session" in bodies["tc_0"]
+        assert "Results: Paris." in bodies["tc_1"]
+
+    @pytest.mark.asyncio
+    async def test_failed_call_still_surfaces_to_the_client(self):
+        """on_tool_start/on_tool_result stay paired so the UI renders it."""
+        started, results = [], []
+
+        async def _on_tool_start(name, args, call_id):
+            started.append(name)
+
+        async def _on_tool_result(name, result, call_id, is_error=False):
+            results.append((name, is_error))
+
+        async def _permission_check(tool_name, tool_args, tool_call_id):
+            return PermissionOutcome.APPROVED
+
+        messages: list[BaseMessage] = []
+        response_calls = [("shell_execute", "tc_0")]
+        callbacks_seen = {}
+
+        async def announce(calls):
+            callbacks_seen["announced"] = [c["name"] for c in calls]
+
+        # Re-drive with custom start/result callbacks.
+        final_response = AIMessage(content="Done.")
+        response_with_tools = AIMessage(
+            content="",
+            tool_calls=[{"name": n, "args": {}, "id": i} for n, i in response_calls],
+        )
+        call_count = 0
+
+        async def _astream(_messages, **kw):
+            nonlocal call_count
+            call_count += 1
+            yield response_with_tools if call_count == 1 else final_response
+
+        llm = AsyncMock()
+        llm.reasoning = None
+        llm.astream = _astream
+
+        turns = 0
+
+        async def _input():
+            nonlocal turns
+            turns += 1
+            if turns == 1:
+                return "go"
+            raise asyncio.CancelledError
+
+        await run_persistent_loop(
+            llm_with_tools=llm,
+            tools=[_make_tool("web_search", "r")],
+            context_manager=AsyncMock(
+                ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
+            ),
+            config=_make_config(),
+            system_prompt="sys",
+            callbacks=_make_callbacks(
+                get_user_input=_input,
+                permission_check=_permission_check,
+                on_tool_start=_on_tool_start,
+                on_tool_result=_on_tool_result,
+                announce_permission_batch=announce,
+            ),
+            messages=messages,
+        )
+
+        assert started == ["shell_execute"]
+        assert results == [("shell_execute", True)]

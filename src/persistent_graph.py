@@ -37,6 +37,7 @@ from .core.context import (
     scrub_history_tool_call_arguments,
 )
 from .core.llm_retry import _classify_llm_error, _extract_rate_limit_delay
+from .core.loader import with_current_date
 from .core.summarizer import count_text_tokens
 from .core.workspace_backend import WorkspaceUnavailableError
 from .core.workspace_injection import find_tail_injection_anchor
@@ -83,6 +84,45 @@ def _injection_anchor_index(messages: List[BaseMessage]) -> int:
     ``find_tail_injection_anchor``.
     """
     return find_tail_injection_anchor(messages)
+
+
+# Registry categories whose internal name would read oddly back to the model.
+_CATEGORY_LABELS = {
+    "browser_direct": "browser",
+    "workspace": "workspace file",
+}
+
+
+def _unavailable_tool_message(tool_name: str) -> str:
+    """Explain why a called tool is not here, rather than just that it isn't.
+
+    A bare "Tool 'X' not found" is a dead end: it names no cause and offers no
+    alternative, so the model's cheapest next move is to try again or stall. The
+    common case is not a hallucinated name but a real tool the capability gate
+    removed — ``filter_tools_by_backend`` drops the whole ``shell`` /
+    ``browser_direct`` / ``git`` categories on the lite workspace tiers — so
+    naming that lets the model re-plan on the tools it actually holds.
+    """
+    from src.tools.registry import TOOL_REGISTRY
+
+    meta = TOOL_REGISTRY.get(tool_name)
+    if meta is None:
+        detail = f"No tool named '{tool_name}' exists."
+    else:
+        # Registry category names are internal identifiers; say them the way a
+        # reader would ("browser", not "browser_direct").
+        raw = meta.get("category") or ""
+        category = _CATEGORY_LABELS.get(raw, raw.replace("_", " ")) or "this kind of"
+        detail = (
+            f"'{tool_name}' is a {category} tool, and {category} tools are not "
+            f"available in this session — this workspace tier or configuration "
+            f"does not provide them."
+        )
+    return (
+        f"{detail} The tools listed in this request are the only ones that exist "
+        f"here. Do not retry this call: either accomplish the task with an "
+        f"available tool, or tell the user the capability is unavailable."
+    )
 
 
 def _charter_injection_enabled(config: Any) -> bool:
@@ -780,9 +820,11 @@ async def run_persistent_loop(
     extraction_interval = memory_config.observer_interval if memory_config else 5
     _last_extraction_turn = 0
 
-    # Send system prompt as first message if not already present
+    # Send system prompt as first message if not already present. Re-stamp the
+    # date: a resumed session's prompt was built whenever the session was
+    # created, which may be many days ago.
     if not messages or not isinstance(messages[0], SystemMessage):
-        messages.insert(0, SystemMessage(content=system_prompt))
+        messages.insert(0, SystemMessage(content=with_current_date(system_prompt)))
 
     logger.info(
         f"Persistent loop started with {len(tools)} tools, "
@@ -837,11 +879,25 @@ async def run_persistent_loop(
         # toggles, workspace upgrades), but messages[0] was written once at
         # loop start — mutate it in place (preserving message identity for
         # persistence) so the model actually sees the rebuilt prompt.
-        if get_current_system_prompt:
-            current_prompt = get_current_system_prompt()
+        #
+        # The date line is refreshed on the same pass, and unconditionally: a
+        # session routinely outlives the day it was created on (threads here run
+        # for weeks), so a date baked in at setup goes stale and the agent
+        # answers "today" questions against session-creation day — or goes
+        # looking for a shell to run `date`. with_current_date is idempotent and
+        # day-granular, so this rewrites messages[0] at most once per
+        # session-day rather than once per turn.
+        current_prompt = (
+            get_current_system_prompt() if get_current_system_prompt else None
+        )
+        if not current_prompt and messages and isinstance(messages[0], SystemMessage):
+            current_prompt = messages[0].content
+        # Restored history can in principle carry list-shaped content; date
+        # stamping is a nicety and must never take the session loop down.
+        if current_prompt and isinstance(current_prompt, str):
+            current_prompt = with_current_date(current_prompt)
             if (
-                current_prompt
-                and messages
+                messages
                 and isinstance(messages[0], SystemMessage)
                 and messages[0].content != current_prompt
             ):
@@ -2236,11 +2292,18 @@ async def _execute_turn(
             break
 
         # Announce the whole batch up front so the client can show every
-        # pending call at once. Soft-fail: if this breaks, the per-call gate
-        # path below still inserts and prompts exactly as before.
+        # pending call at once. Names that resolve to no tool are filtered out:
+        # they are rejected below without ever reaching the gate, so announcing
+        # one would raise an approval card asking the user to authorize a tool
+        # that cannot run whatever they answer. Soft-fail: if this breaks, the
+        # per-call gate path below still inserts and prompts exactly as before.
+        # Still called when the filtered list is empty: the announce hook also
+        # retires any previous batch's pending rows, and skipping it outright
+        # would leave those behind.
         if callbacks.announce_permission_batch is not None:
+            gateable = [tc for tc in response.tool_calls if tc.get("name") in tool_map]
             try:
-                await callbacks.announce_permission_batch(response.tool_calls)
+                await callbacks.announce_permission_batch(gateable)
             except Exception as e:
                 logger.warning("Permission batch announce failed: %s", e)
 
@@ -2270,6 +2333,36 @@ async def _execute_turn(
             tool_name = tool_call["name"]
             tool_args = tool_call.get("args", {})
             tool_call_id = tool_call["id"]
+
+            # Resolve the tool BEFORE gating it. A name that binds to nothing
+            # cannot run whichever way the user answers, so gating first spends
+            # a real approval round-trip on a phantom: in supervised mode the
+            # user was shown a card for a tool that does not exist and the turn
+            # blocked on it (~53s observed on a session that called
+            # shell_execute against a shell-less workspace tier). Rejecting here
+            # also keeps on_tool_start/on_tool_result paired, so the failed call
+            # still renders in the UI.
+            tool = tool_map.get(tool_name)
+            if tool is None:
+                error_result = _unavailable_tool_message(tool_name)
+                logger.info(
+                    "Unbound tool %s called (%d tools bound) — rejecting before "
+                    "the permission gate",
+                    tool_name,
+                    len(tool_map),
+                )
+                await callbacks.on_tool_start(tool_name, tool_args, tool_call_id)
+                messages.append(
+                    _ensure_msg_id(
+                        ToolMessage(content=error_result, tool_call_id=tool_call_id)
+                    )
+                )
+                await callbacks.on_tool_result(
+                    tool_name, error_result, tool_call_id, is_error=True
+                )
+                messages_added += 1
+                await _persist(messages[-1])
+                continue
 
             # Permission check. Three-state: an unanswered gate is neither
             # consent nor refusal — never fabricate a decision the user did
@@ -2316,22 +2409,7 @@ async def _execute_turn(
             # Notify client
             await callbacks.on_tool_start(tool_name, tool_args, tool_call_id)
 
-            # Execute tool
-            tool = tool_map.get(tool_name)
-            if tool is None:
-                error_result = f"Tool '{tool_name}' not found"
-                messages.append(
-                    _ensure_msg_id(
-                        ToolMessage(content=error_result, tool_call_id=tool_call_id)
-                    )
-                )
-                await callbacks.on_tool_result(
-                    tool_name, error_result, tool_call_id, is_error=True
-                )
-                messages_added += 1
-                await _persist(messages[-1])
-                continue
-
+            # Execute tool (resolved above, before the permission gate)
             is_error = False
             try:
                 result = await tool.ainvoke(tool_args)
