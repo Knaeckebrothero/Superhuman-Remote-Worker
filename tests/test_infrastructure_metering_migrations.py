@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+import json
 from pathlib import Path
 import re
 from uuid import uuid4
@@ -11,11 +13,38 @@ from uuid import uuid4
 import asyncpg
 import pytest
 
+from orchestrator.services.infrastructure_metering.inventory import (
+    InventoryConflictError,
+    InventoryContractError,
+    InventoryFenceError,
+    InventoryItem,
+    InventoryRecoveryRequired,
+    InventoryScopeIdentity,
+    InventoryStore,
+    SanitizedInventoryError,
+    ShadowComparison,
+    ShadowComparisonStatus,
+    SnapshotFinalization,
+    TransportNonceClaim,
+    WatchEventKind,
+    WatchIntervalMutationContext,
+    WatchMutationAction,
+    WatchObjectEvent,
+    inventory_manifest_digest,
+)
+from orchestrator.services.infrastructure_metering.pod_intervals import (
+    PodIntervalReconciler,
+)
+
 
 ROOT = Path(__file__).parents[1]
 APP_MIGRATION = (
     ROOT
     / "orchestrator/database/migrations/app/0086_infrastructure_metering_foundations.sql"
+)
+APP_INGESTION_MIGRATION = (
+    ROOT
+    / "orchestrator/database/migrations/app/0087_inventory_ingestion_foundations.sql"
 )
 AUDIT_EXPANSION = (
     ROOT
@@ -60,6 +89,126 @@ def app_pg_dsn() -> str:
         container.stop()
 
 
+def _transport(kind: str, *, nonce=None) -> TransportNonceClaim:
+    return TransportNonceClaim(
+        collector_id="kubernetes",
+        request_nonce=nonce or uuid4(),
+        request_kind=kind,
+        request_digest="9" * 64,
+    )
+
+
+def _workspace_pod_item(
+    *,
+    owner_id,
+    source_uid: str,
+    name: str,
+    revision_hash: str,
+    transition_at: datetime,
+    accrues: bool = True,
+    overhead_cpu_millicores: int = 0,
+    overhead_memory_bytes: int = 0,
+) -> InventoryItem:
+    def iso(value: datetime) -> str:
+        return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+    return InventoryItem(
+        source_kind="pod",
+        source_uid=source_uid,
+        revision_hash=revision_hash,
+        valid_for_metering=True,
+        normalized_item={
+            "source_kind": "pod",
+            "uid": source_uid,
+            "api_version": "v1",
+            "resource_version": "rv-object",
+            "namespace": "workers",
+            "name": name,
+            "labels": {
+                "app": "srw-workspace",
+                "srw/component": "workspace",
+                "srw/job-id": str(owner_id),
+            },
+            "lifecycle": {
+                "accrues": accrues,
+                "terminal": False,
+                "creation_timestamp": iso(transition_at - timedelta(minutes=1)),
+                "start_time": iso(transition_at) if accrues else None,
+                "pod_scheduled_condition": {
+                    "status": "True" if accrues else "False",
+                    "last_transition_time": iso(transition_at),
+                },
+            },
+            "capacity": {
+                "cpu_millicores": 750,
+                "memory_bytes": 2 * 1024**3,
+                "capacity_quality": "exact",
+                "measurement_algorithm": "pod-requests-test-v1",
+                "overhead_cpu_millicores": overhead_cpu_millicores,
+                "overhead_memory_bytes": overhead_memory_bytes,
+            },
+        },
+    )
+
+
+async def _insert_open_test_interval(
+    conn: asyncpg.Connection,
+    *,
+    inventory_scope_id,
+    source_cluster: str,
+    namespace: str,
+    source_uid: str,
+    source_revision: str,
+    observed_at: datetime,
+    lifecycle_id=None,
+    revision_no: int = 1,
+):
+    lifecycle_id = lifecycle_id or uuid4()
+    interval_id = uuid4()
+    if revision_no == 1:
+        await conn.execute(
+            "INSERT INTO resource_lifecycle_heads (source_lifecycle_id) VALUES ($1)",
+            lifecycle_id,
+        )
+    await conn.execute(
+        "INSERT INTO resource_intervals ("
+        "id, inventory_scope_id, source_cluster, source_kind, source_uid, "
+        "source_api_version, source_resource_version, source_lifecycle_id, "
+        "revision_no, source_revision, namespace, name, category, resource, "
+        "measurement_basis, cost_domain, resource_class, attribution_scope, "
+        "owner_kind, owner_id, attribution_source, attribution_quality, "
+        "lifecycle_confidence, cpu_millicores, memory_bytes, capacity_source, "
+        "capacity_quality, measurement_algorithm, started_at, "
+        "start_time_source, start_uncertainty_us, last_seen_at, "
+        "last_confirmed_at, materialized_through) VALUES ("
+        "$1, $2, $3, 'pod', $4, 'v1', 'rv-test', $5, $6, $7, $8, $4, "
+        "'compute', 'vcpu', 'scheduler-request', 'workload-allocation', "
+        "'kubernetes-pod', 'shared-platform', 'platform', 'platform', "
+        "'test-fixture', 'exact', 'kubernetes-visible', 1000, 1073741824, "
+        "'scheduler-request', 'exact', 'test-v1', $9, 'inventory-receipt', "
+        "0, $10, $10, $9)",
+        interval_id,
+        inventory_scope_id,
+        source_cluster,
+        source_uid,
+        lifecycle_id,
+        revision_no,
+        source_revision,
+        namespace,
+        observed_at - timedelta(minutes=1),
+        observed_at,
+    )
+    await conn.execute(
+        "UPDATE resource_lifecycle_heads SET latest_revision_no=$2, "
+        "current_interval_id=$3, updated_at=statement_timestamp() "
+        "WHERE source_lifecycle_id=$1",
+        lifecycle_id,
+        revision_no,
+        interval_id,
+    )
+    return interval_id
+
+
 def test_app_migration_has_inventory_and_restrict_relationships() -> None:
     sql = APP_MIGRATION.read_text()
 
@@ -89,6 +238,46 @@ def test_app_migration_has_inventory_and_restrict_relationships() -> None:
     assert "INTERVAL '7 days'" in sql
     assert "ON DELETE CASCADE" not in sql
     assert sql.count("ON DELETE RESTRICT") >= 10
+
+
+def test_app_ingestion_migration_has_fenced_replay_and_watch_contracts() -> None:
+    sql = APP_INGESTION_MIGRATION.read_text()
+    compact = _compact(sql)
+
+    for table in (
+        "resource_inventory_ingest_tickets",
+        "resource_inventory_transport_nonces",
+        "resource_inventory_watch_sessions",
+        "resource_inventory_watch_events",
+        "resource_inventory_shadow_comparisons",
+    ):
+        assert f"CREATE TABLE {table}" in sql
+    assert "PRIMARY KEY (collector_id, request_nonce)" in sql
+    assert "resource_inventory_transport_nonces_expiry_idx" in sql
+    assert "max_snapshot_bytes" in sql
+    assert "staged_bytes" in sql
+    assert "resource_inventory_snapshot_item_size_bytes" in sql
+    assert "resource_inventory_watch_events_session_ordinal_uq" in sql
+    assert "resource_inventory_watch_sessions_live_scope_idx" in sql
+    assert "expected_resource_version" in sql
+    assert "event_type = 'bookmark'" in compact
+    assert "event_type = 'history-lost'" in compact
+    assert "mutation_action = 'history-gap'" in compact
+    assert "resource_inventory_watch_events_immutable" in sql
+    assert "resource_inventory_watch_sessions_one_way" in sql
+    assert "recovery_from_epoch_id" in sql
+    assert "resource_inventory_shadow_comparisons_unresolved_idx" in sql
+    assert "legacy_started_at" in sql
+    assert "observed_start_time_source" in sql
+    assert "observed_start_uncertainty_us" in sql
+    assert "start_delta_us" in sql
+    assert "'lifetime-mismatch'" in sql
+    assert "'start-semantics'" in sql
+    assert "inventory watch event interval/gap postcondition failed" in sql
+    assert "manifest_state = 'staging-expired'" in sql
+    assert "INTERVAL '24 hours'" in sql
+    assert sql.count("INTERVAL '7 days'") >= 4
+    assert "only expired unbound inventory ingest tickets may be deleted" in sql
 
 
 def test_interval_constraints_bind_identity_dimensions_and_time() -> None:
@@ -300,10 +489,1788 @@ def test_migration_heads_are_unique_and_snapshots_are_not_the_contract() -> None
     for files in (app_files, audit_files):
         prefixes = [path.name.split("_", 1)[0] for path in files]
         assert len(prefixes) == len(set(prefixes))
-    assert app_files[-1].name == APP_MIGRATION.name
+    assert app_files[-1].name == APP_INGESTION_MIGRATION.name
     assert audit_files[-1].name == AUDIT_PROJECT_INDEX.name
     assert "schema_current" not in APP_MIGRATION.read_text()
+    assert "schema_current" not in APP_INGESTION_MIGRATION.read_text()
     assert "audit_schema_current" not in AUDIT_EXPANSION.read_text()
+
+
+@pytest.mark.asyncio
+async def test_app_ingestion_migration_applies_after_slice0_on_postgres16(
+    app_pg_dsn: str,
+) -> None:
+    dbname = f"metering_ingest_{uuid4().hex[:12]}"
+    admin = await asyncpg.connect(app_pg_dsn)
+    try:
+        await admin.execute(f'CREATE DATABASE "{dbname}"')
+    finally:
+        await admin.close()
+
+    conn = await asyncpg.connect(_swap_db(app_pg_dsn, dbname))
+    try:
+        await conn.execute('CREATE EXTENSION "uuid-ossp"')
+        await conn.execute("CREATE TABLE usage_rate_cards (id TEXT PRIMARY KEY)")
+        await conn.execute(
+            "CREATE TABLE rollup_state (name TEXT PRIMARY KEY, last_closed_day DATE)"
+        )
+        await conn.execute(APP_MIGRATION.read_text())
+        await conn.execute(APP_INGESTION_MIGRATION.read_text())
+
+        tables = await conn.fetch(
+            "SELECT tablename FROM pg_tables WHERE schemaname='public' "
+            "AND tablename LIKE 'resource_inventory_%'"
+        )
+        names = {row["tablename"] for row in tables}
+        assert "resource_inventory_transport_nonces" in names
+        assert "resource_inventory_watch_sessions" in names
+        assert "resource_inventory_watch_events" in names
+
+        await conn.execute(
+            "UPDATE infra_metering_control SET leader_generation=1, "
+            "updated_at=statement_timestamp() WHERE singleton"
+        )
+        with pytest.raises(asyncpg.ObjectNotInPrerequisiteStateError):
+            await conn.execute(
+                "UPDATE infra_metering_control SET leader_generation=0 WHERE singleton"
+            )
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_snapshot_ticket_turns_abandoned_watch_into_recovery_gap(
+    app_pg_dsn: str,
+) -> None:
+    dbname = f"metering_abandoned_{uuid4().hex[:12]}"
+    admin = await asyncpg.connect(app_pg_dsn)
+    try:
+        await admin.execute(f'CREATE DATABASE "{dbname}"')
+    finally:
+        await admin.close()
+    dsn = _swap_db(app_pg_dsn, dbname)
+    setup = await asyncpg.connect(dsn)
+    pool = None
+    try:
+        await setup.execute('CREATE EXTENSION "uuid-ossp"')
+        await setup.execute("CREATE TABLE usage_rate_cards (id TEXT PRIMARY KEY)")
+        await setup.execute(
+            "CREATE TABLE rollup_state (name TEXT PRIMARY KEY, last_closed_day DATE)"
+        )
+        await setup.execute(APP_MIGRATION.read_text())
+        await setup.execute(APP_INGESTION_MIGRATION.read_text())
+
+        pool = await asyncpg.create_pool(dsn, min_size=1, max_size=4)
+        store = InventoryStore(pool)
+        generation = await store.activate_generation()
+        scope_id, epoch_id = uuid4(), uuid4()
+        scope = InventoryScopeIdentity(
+            collector_id="kubernetes",
+            source_cluster="cluster-a",
+            api_resource="core/v1/pods",
+            namespace="workers",
+        )
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO resource_inventory_scopes "
+                "(id, collector_id, source_cluster, api_resource, namespace) "
+                "VALUES ($1, $2, $3, $4, $5)",
+                scope_id,
+                scope.collector_id,
+                scope.source_cluster,
+                scope.api_resource,
+                scope.namespace,
+            )
+            await conn.execute(
+                "INSERT INTO resource_inventory_scope_epochs "
+                "(id, scope_id, epoch_number, coverage_mode) "
+                "VALUES ($1, $2, 1, 'list-watch')",
+                epoch_id,
+                scope_id,
+            )
+
+        baseline_ticket = await store.issue_ingest_ticket(
+            epoch_id,
+            "1" * 64,
+            scope=scope,
+            transport=_transport("snapshot-ticket"),
+            require_healthy_continuity=True,
+        )
+        baseline_snapshot = uuid4()
+        await store.begin_snapshot(
+            baseline_ticket.token,
+            baseline_ticket.id,
+            baseline_snapshot,
+            datetime.now(timezone.utc),
+            scope=scope,
+            transport=_transport("snapshot-begin"),
+        )
+        await store.stage_items(
+            baseline_ticket.token,
+            baseline_ticket.id,
+            baseline_snapshot,
+            (),
+            scope=scope,
+            transport=_transport("snapshot-items"),
+        )
+        await store.finalize_snapshot(
+            baseline_ticket.token,
+            baseline_ticket.id,
+            baseline_snapshot,
+            SnapshotFinalization(
+                collection_completed_at=datetime.now(timezone.utc),
+                complete=True,
+                item_count=0,
+                item_digest=inventory_manifest_digest(()),
+                resource_version="rv-list",
+            ),
+            scope=scope,
+            transport=_transport("snapshot-finalize"),
+            reconcile_intervals=False,
+        )
+        session = await store.issue_watch_session(
+            epoch_id,
+            "2" * 64,
+            "rv-list",
+            scope=scope,
+            transport=_transport("watch-session"),
+            max_events=10,
+            max_bytes=100,
+        )
+        await store.apply_watch_event(
+            session.token,
+            session.id,
+            uuid4(),
+            "3" * 64,
+            "rv-list",
+            WatchObjectEvent(
+                WatchEventKind.BOOKMARK,
+                "rv-watch",
+                datetime.now(timezone.utc),
+                1,
+            ),
+            scope=scope,
+            transport=_transport("watch-event"),
+        )
+
+        abandoned_claim = _transport("snapshot-ticket")
+        with pytest.raises(InventoryRecoveryRequired, match="broken WATCH"):
+            await store.issue_ingest_ticket(
+                epoch_id,
+                "4" * 64,
+                scope=scope,
+                transport=abandoned_claim,
+            )
+
+        async with pool.acquire() as conn:
+            gap = await conn.fetchrow(
+                "SELECT id, gap_start, gap_end, reason, resolution_details "
+                "FROM resource_inventory_coverage_gaps "
+                "WHERE scope_epoch_id=$1",
+                epoch_id,
+            )
+            epoch = await conn.fetchrow(
+                "SELECT continuity_health, backend_health, last_resource_version, "
+                "sanitized_error FROM resource_inventory_scope_epochs WHERE id=$1",
+                epoch_id,
+            )
+            assert gap["reason"] == "watch-session-abandoned"
+            assert gap["gap_end"] is None
+            gap_details = json.loads(gap["resolution_details"])
+            epoch_error = json.loads(epoch["sanitized_error"])
+            assert gap_details["watch_session_id"] == str(session.id)
+            assert gap_details["server_committed_resource_version"] == ("rv-watch")
+            assert epoch["continuity_health"] == "gap"
+            assert epoch["backend_health"] == "degraded"
+            assert epoch["last_resource_version"] == "rv-watch"
+            assert epoch_error["coverage_gap_id"] == str(gap["id"])
+            assert await conn.fetchval(
+                "SELECT consumed_at IS NULL FROM resource_inventory_watch_sessions "
+                "WHERE id=$1",
+                session.id,
+            )
+            assert not await conn.fetchval(
+                "SELECT EXISTS (SELECT 1 FROM resource_inventory_ingest_tickets "
+                "WHERE request_digest=$1)",
+                "4" * 64,
+            )
+            assert await conn.fetchval(
+                "SELECT EXISTS (SELECT 1 FROM resource_inventory_transport_nonces "
+                "WHERE collector_id=$1 AND request_nonce=$2)",
+                abandoned_claim.collector_id,
+                abandoned_claim.request_nonce,
+            )
+
+        # This reason is generated only by snapshot admission; a collector may
+        # not forge it through the public WATCH-finish contract.
+        with pytest.raises(InventoryContractError, match="gap reason"):
+            await store.record_watch_gap(
+                session.token,
+                session.id,
+                uuid4(),
+                "5" * 64,
+                "rv-watch",
+                gap_reason="watch-session-abandoned",
+                scope=scope,
+                transport=_transport("watch-history-lost"),
+            )
+
+        # HTTP snapshot admission rechecks continuity while holding the epoch
+        # lock, closing the race with a WATCH request that records a gap after
+        # the service's initial epoch read. Direct diagnostic callers retain
+        # the default opt-out used by the retention fixtures below.
+        gap_epoch_claim = _transport("snapshot-ticket")
+        with pytest.raises(InventoryRecoveryRequired, match="healthy continuity"):
+            await store.issue_ingest_ticket(
+                epoch_id,
+                "5" * 64,
+                scope=scope,
+                transport=gap_epoch_claim,
+                require_healthy_continuity=True,
+            )
+        async with pool.acquire() as conn:
+            assert not await conn.fetchval(
+                "SELECT EXISTS (SELECT 1 FROM resource_inventory_ingest_tickets "
+                "WHERE request_digest=$1)",
+                "5" * 64,
+            )
+            assert not await conn.fetchval(
+                "SELECT EXISTS (SELECT 1 FROM resource_inventory_transport_nonces "
+                "WHERE collector_id=$1 AND request_nonce=$2)",
+                gap_epoch_claim.collector_id,
+                gap_epoch_claim.request_nonce,
+            )
+
+        recovery = await store.start_watch_recovery_epoch(
+            epoch_id,
+            scope=scope,
+            transport=_transport("scope-recovery"),
+        )
+        recovery_ticket = await store.issue_ingest_ticket(
+            recovery.scope_epoch_id,
+            "6" * 64,
+            scope=scope,
+            transport=_transport("snapshot-ticket"),
+        )
+        recovery_snapshot = uuid4()
+        await store.begin_snapshot(
+            recovery_ticket.token,
+            recovery_ticket.id,
+            recovery_snapshot,
+            datetime.now(timezone.utc),
+            scope=scope,
+            transport=_transport("snapshot-begin"),
+        )
+        await store.stage_items(
+            recovery_ticket.token,
+            recovery_ticket.id,
+            recovery_snapshot,
+            (),
+            scope=scope,
+            transport=_transport("snapshot-items"),
+        )
+        await store.finalize_snapshot(
+            recovery_ticket.token,
+            recovery_ticket.id,
+            recovery_snapshot,
+            SnapshotFinalization(
+                collection_completed_at=datetime.now(timezone.utc),
+                complete=True,
+                item_count=0,
+                item_digest=inventory_manifest_digest(()),
+                resource_version="rv-recovered",
+            ),
+            scope=scope,
+            transport=_transport("snapshot-finalize"),
+            reconcile_intervals=False,
+        )
+        async with pool.acquire() as conn:
+            assert await conn.fetchval(
+                "SELECT gap_end IS NOT NULL FROM resource_inventory_coverage_gaps "
+                "WHERE id=$1",
+                gap["id"],
+            )
+        assert await store.deactivate_generation(generation)
+    finally:
+        if pool is not None:
+            await pool.close()
+        if not setup.is_closed():
+            await setup.close()
+        admin = await asyncpg.connect(app_pg_dsn)
+        try:
+            await admin.execute(f'DROP DATABASE IF EXISTS "{dbname}" WITH (FORCE)')
+        finally:
+            await admin.close()
+
+
+@pytest.mark.asyncio
+async def test_pod_reconciler_revalidates_attribution_and_lifetime_evidence(
+    app_pg_dsn: str,
+) -> None:
+    dbname = f"metering_pods_{uuid4().hex[:12]}"
+    admin = await asyncpg.connect(app_pg_dsn)
+    try:
+        await admin.execute(f'CREATE DATABASE "{dbname}"')
+    finally:
+        await admin.close()
+    dsn = _swap_db(app_pg_dsn, dbname)
+    setup = await asyncpg.connect(dsn)
+    pool = None
+    try:
+        await setup.execute('CREATE EXTENSION "uuid-ossp"')
+        await setup.execute("CREATE TABLE usage_rate_cards (id TEXT PRIMARY KEY)")
+        await setup.execute(
+            "CREATE TABLE rollup_state (name TEXT PRIMARY KEY, last_closed_day DATE)"
+        )
+        await setup.execute(APP_MIGRATION.read_text())
+        await setup.execute(APP_INGESTION_MIGRATION.read_text())
+        await setup.execute(
+            "CREATE TABLE jobs ("
+            "id UUID PRIMARY KEY, user_id UUID, project_id UUID, "
+            "context JSONB NOT NULL DEFAULT '{}'::jsonb)"
+        )
+        await setup.execute(
+            "CREATE TABLE threads ("
+            "id UUID PRIMARY KEY, user_id UUID, project_id UUID, "
+            "metadata JSONB NOT NULL DEFAULT '{}'::jsonb)"
+        )
+        await setup.execute(
+            "CREATE TABLE workspace_intervals ("
+            "id BIGSERIAL PRIMARY KEY, owner_kind TEXT NOT NULL, "
+            "owner_id UUID NOT NULL, cpu_millicores BIGINT NOT NULL, "
+            "mem_bytes BIGINT NOT NULL, started_at TIMESTAMPTZ NOT NULL, "
+            "ended_at TIMESTAMPTZ)"
+        )
+
+        scope_id, epoch_id = uuid4(), uuid4()
+        scope = InventoryScopeIdentity(
+            collector_id="kubernetes",
+            source_cluster="cluster-pods",
+            api_resource="core/v1/pods",
+            namespace="workers",
+        )
+        await setup.execute(
+            "INSERT INTO resource_inventory_scopes "
+            "(id, collector_id, source_cluster, api_resource, namespace) "
+            "VALUES ($1, $2, $3, $4, $5)",
+            scope_id,
+            scope.collector_id,
+            scope.source_cluster,
+            scope.api_resource,
+            scope.namespace,
+        )
+        await setup.execute(
+            "INSERT INTO resource_inventory_scope_epochs "
+            "(id, scope_id, epoch_number, coverage_mode) "
+            "VALUES ($1, $2, 1, 'list-watch')",
+            epoch_id,
+            scope_id,
+        )
+        await setup.close()
+
+        pool = await asyncpg.create_pool(dsn, min_size=1, max_size=4)
+        store = InventoryStore(
+            pool,
+            max_batch_bytes=100_000,
+            max_snapshot_items=100,
+            max_snapshot_bytes=1_000_000,
+        )
+        assert await store.activate_generation() == 1
+        reconciler = PodIntervalReconciler(shadow_enabled=True)
+
+        generic_ticket = await store.issue_ingest_ticket(
+            epoch_id,
+            "e" * 64,
+            scope=scope,
+            transport=_transport("snapshot-ticket"),
+        )
+        generic_snapshot_id = uuid4()
+        generic_collection_start = datetime.now(timezone.utc)
+        await store.begin_snapshot(
+            generic_ticket.token,
+            generic_ticket.id,
+            generic_snapshot_id,
+            generic_collection_start,
+            scope=scope,
+            transport=_transport("snapshot-begin"),
+        )
+        assert (
+            await store.stage_items(
+                generic_ticket.token,
+                generic_ticket.id,
+                generic_snapshot_id,
+                (),
+                scope=scope,
+                transport=_transport("snapshot-items"),
+            )
+        ).total == 0
+        generic_legacy_start = datetime.now(timezone.utc) - timedelta(minutes=2)
+        generic_observed_start = generic_legacy_start + timedelta(seconds=30)
+        generic_comparison = ShadowComparison(
+            source_uid="generic-shadow-lifetime",
+            status=ShadowComparisonStatus.LIFETIME_MISMATCH,
+            reason_code="start-semantics",
+            explained=False,
+            comparison_at=datetime.now(timezone.utc),
+            owner_trusted=True,
+            owner_kind="job",
+            owner_id=uuid4(),
+            legacy_interval_id=1,
+            legacy_cpu_millicores=700,
+            legacy_memory_bytes=2 * 1024**3 - 64 * 1024**2,
+            legacy_started_at=generic_legacy_start,
+            observed_cpu_millicores=750,
+            observed_memory_bytes=2 * 1024**3,
+            observed_started_at=generic_observed_start,
+            observed_start_time_source="app-db-received",
+            observed_start_uncertainty_us=30_000_000,
+            start_delta_us=30_000_000,
+        )
+        first_generic_stage = await store.stage_shadow_comparisons(
+            generic_ticket.token,
+            generic_ticket.id,
+            generic_snapshot_id,
+            (generic_comparison,),
+            scope=scope,
+            transport=_transport("snapshot-shadow"),
+        )
+        assert (first_generic_stage.inserted, first_generic_stage.total) == (1, 1)
+        replayed_generic_stage = await store.stage_shadow_comparisons(
+            generic_ticket.token,
+            generic_ticket.id,
+            generic_snapshot_id,
+            (generic_comparison,),
+            scope=scope,
+            transport=_transport("snapshot-shadow"),
+        )
+        assert (replayed_generic_stage.inserted, replayed_generic_stage.total) == (
+            0,
+            1,
+        )
+        with pytest.raises(InventoryConflictError, match="shadow comparison"):
+            await store.stage_shadow_comparisons(
+                generic_ticket.token,
+                generic_ticket.id,
+                generic_snapshot_id,
+                (
+                    replace(
+                        generic_comparison, observed_start_uncertainty_us=30_000_001
+                    ),
+                ),
+                scope=scope,
+                transport=_transport("snapshot-shadow"),
+            )
+        await store.finalize_snapshot(
+            generic_ticket.token,
+            generic_ticket.id,
+            generic_snapshot_id,
+            SnapshotFinalization(
+                collection_completed_at=datetime.now(timezone.utc),
+                complete=True,
+                item_count=0,
+                item_digest=inventory_manifest_digest(()),
+                resource_version="rv-generic-shadow",
+            ),
+            scope=scope,
+            transport=_transport("snapshot-finalize"),
+        )
+        async with pool.acquire() as conn:
+            generic_persisted = await conn.fetchrow(
+                "SELECT legacy_started_at, observed_started_at, "
+                "observed_start_time_source, observed_start_uncertainty_us, "
+                "start_delta_us, status, explained "
+                "FROM resource_inventory_shadow_comparisons "
+                "WHERE snapshot_id=$1 AND source_uid='generic-shadow-lifetime'",
+                generic_snapshot_id,
+            )
+        assert generic_persisted["legacy_started_at"] == generic_legacy_start
+        assert generic_persisted["observed_started_at"] == generic_observed_start
+        assert generic_persisted["observed_start_time_source"] == "app-db-received"
+        assert generic_persisted["observed_start_uncertainty_us"] == 30_000_000
+        assert generic_persisted["start_delta_us"] == 30_000_000
+        assert generic_persisted["status"] == "lifetime-mismatch"
+        assert generic_persisted["explained"] is False
+
+        snapshot_number = 0
+
+        async def complete_snapshot(
+            items: tuple[InventoryItem, ...], *, compare: bool = False
+        ):
+            nonlocal snapshot_number
+            snapshot_number += 1
+            request_digest = f"{snapshot_number:064x}"
+            ticket = await store.issue_ingest_ticket(
+                epoch_id,
+                request_digest,
+                scope=scope,
+                transport=_transport("snapshot-ticket"),
+            )
+            snapshot_id = uuid4()
+            collection_started_at = datetime.now(timezone.utc)
+            await store.begin_snapshot(
+                ticket.token,
+                ticket.id,
+                snapshot_id,
+                collection_started_at,
+                scope=scope,
+                transport=_transport("snapshot-begin"),
+            )
+            await store.stage_items(
+                ticket.token,
+                ticket.id,
+                snapshot_id,
+                items,
+                scope=scope,
+                transport=_transport("snapshot-items"),
+            )
+            result = await store.finalize_snapshot(
+                ticket.token,
+                ticket.id,
+                snapshot_id,
+                SnapshotFinalization(
+                    collection_completed_at=datetime.now(timezone.utc),
+                    complete=True,
+                    item_count=len(items),
+                    item_digest=inventory_manifest_digest(items),
+                    resource_version=f"rv-list-{snapshot_number}",
+                ),
+                scope=scope,
+                transport=_transport("snapshot-finalize"),
+                interval_mutator=reconciler.apply_snapshot,
+                observation_hook=(reconciler.observe_snapshot if compare else None),
+            )
+            async with pool.acquire() as conn:
+                received_at = await conn.fetchval(
+                    "SELECT received_at FROM resource_inventory_snapshots WHERE id=$1",
+                    snapshot_id,
+                )
+            return result, snapshot_id, received_at
+
+        owner_id, user_id, project_id = uuid4(), uuid4(), uuid4()
+        pod_name = "workspace-attribution-test"
+        lifecycle_transition = datetime.now(timezone.utc) - timedelta(minutes=2)
+        same_hash_item = _workspace_pod_item(
+            owner_id=owner_id,
+            source_uid="pod-attribution",
+            name=pod_name,
+            revision_hash="a" * 64,
+            transition_at=lifecycle_transition,
+            overhead_cpu_millicores=50,
+            overhead_memory_bytes=64 * 1024**2,
+        )
+
+        _, first_snapshot_id, first_received_at = await complete_snapshot(
+            (same_hash_item,)
+        )
+        async with pool.acquire() as conn:
+            initial = await conn.fetchrow(
+                "SELECT * FROM resource_intervals "
+                "WHERE source_uid='pod-attribution' AND ended_at IS NULL"
+            )
+        assert initial["attribution_scope"] == "unknown"
+        assert initial["started_at"] == first_received_at
+        assert initial["start_time_source"] == "app-db-received"
+        expected_uncertainty = first_received_at - lifecycle_transition
+        expected_uncertainty_us = (
+            expected_uncertainty.days * 86_400_000_000
+            + expected_uncertainty.seconds * 1_000_000
+            + expected_uncertainty.microseconds
+        )
+        assert initial["start_uncertainty_us"] == expected_uncertainty_us
+        assert initial["start_uncertainty_us"] > 0
+        assert initial["last_seen_snapshot_id"] == first_snapshot_id
+        unknown_interval_id = initial["id"]
+
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO jobs (id, user_id, project_id, context) VALUES ("
+                "$1, $2, $3, jsonb_build_object('workspace_container', "
+                "jsonb_build_object('pod_name', $4::text, "
+                "'namespace', 'workers'))) ",
+                owner_id,
+                user_id,
+                project_id,
+                pod_name,
+            )
+        _, _, customer_received_at = await complete_snapshot((same_hash_item,))
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT * FROM resource_intervals "
+                "WHERE source_uid='pod-attribution' ORDER BY revision_no"
+            )
+        assert len(rows) == 2
+        assert rows[0]["id"] == unknown_interval_id
+        assert rows[0]["ended_at"] == customer_received_at
+        assert rows[0]["end_reason"] == "attribution-changed"
+        assert rows[1]["attribution_scope"] == "customer"
+        assert rows[1]["owner_id"] == str(owner_id)
+        assert rows[1]["user_id"] == user_id
+        assert rows[1]["project_id"] == project_id
+        assert rows[1]["attribution_source"] == "app-db-owner-binding"
+        assert rows[1]["started_at"] == customer_received_at
+        customer_interval_id = rows[1]["id"]
+
+        _, _, confirmation_received_at = await complete_snapshot((same_hash_item,))
+        async with pool.acquire() as conn:
+            confirmed = await conn.fetchrow(
+                "SELECT id, last_confirmed_at FROM resource_intervals "
+                "WHERE source_uid='pod-attribution' AND ended_at IS NULL"
+            )
+            assert (
+                await conn.fetchval(
+                    "SELECT count(*) FROM resource_intervals "
+                    "WHERE source_uid='pod-attribution'"
+                )
+                == 2
+            )
+        assert confirmed["id"] == customer_interval_id
+        assert confirmed["last_confirmed_at"] == confirmation_received_at
+
+        async with pool.acquire() as conn:
+            await conn.execute("DELETE FROM jobs WHERE id=$1", owner_id)
+        _, _, unknown_received_at = await complete_snapshot((same_hash_item,))
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT * FROM resource_intervals "
+                "WHERE source_uid='pod-attribution' ORDER BY revision_no"
+            )
+        assert len(rows) == 3
+        assert rows[1]["ended_at"] == unknown_received_at
+        assert rows[1]["end_reason"] == "attribution-changed"
+        assert rows[2]["attribution_scope"] == "unknown"
+        assert rows[2]["started_at"] == unknown_received_at
+
+        legacy_started_at = first_received_at - timedelta(seconds=30)
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO jobs (id, user_id, project_id, context) VALUES ("
+                "$1, $2, $3, jsonb_build_object('workspace_container', "
+                "jsonb_build_object('pod_name', $4::text, "
+                "'namespace', 'workers'))) ",
+                owner_id,
+                user_id,
+                project_id,
+                pod_name,
+            )
+            await conn.execute(
+                "INSERT INTO workspace_intervals "
+                "(owner_kind, owner_id, cpu_millicores, mem_bytes, started_at) "
+                "VALUES ('job', $1, 700, $2, $3)",
+                owner_id,
+                2 * 1024**3 - 64 * 1024**2,
+                legacy_started_at,
+            )
+        _, shadow_snapshot_id, shadow_received_at = await complete_snapshot(
+            (same_hash_item,), compare=True
+        )
+        async with pool.acquire() as conn:
+            shadow = await conn.fetchrow(
+                "SELECT * FROM resource_inventory_shadow_comparisons "
+                "WHERE snapshot_id=$1 AND source_uid='pod-attribution'",
+                shadow_snapshot_id,
+            )
+        assert shadow["status"] == "lifetime-mismatch"
+        assert shadow["reason_code"] == "start-semantics"
+        assert shadow["explained"] is False
+        assert shadow["observed_cpu_millicores"] - shadow["legacy_cpu_millicores"] == 50
+        assert (
+            shadow["observed_memory_bytes"] - shadow["legacy_memory_bytes"]
+            == 64 * 1024**2
+        )
+        assert shadow["legacy_started_at"] == legacy_started_at
+        assert shadow["observed_started_at"] == shadow_received_at
+        assert shadow["observed_start_time_source"] == "app-db-received"
+        assert shadow["observed_start_uncertainty_us"] == 0
+        shadow_delta = shadow_received_at - legacy_started_at
+        assert shadow["start_delta_us"] == (
+            shadow_delta.days * 86_400_000_000
+            + shadow_delta.seconds * 1_000_000
+            + shadow_delta.microseconds
+        )
+
+        pending_owner, added_owner, modified_owner = uuid4(), uuid4(), uuid4()
+        pending_name = "workspace-watch-modified"
+        pending_item = _workspace_pod_item(
+            owner_id=pending_owner,
+            source_uid="pod-watch-modified",
+            name=pending_name,
+            revision_hash="b" * 64,
+            transition_at=datetime.now(timezone.utc) - timedelta(seconds=1),
+            accrues=False,
+        )
+        _, _, baseline_received_at = await complete_snapshot(
+            (same_hash_item, pending_item)
+        )
+
+        added_name = "workspace-watch-added"
+        added_transition = baseline_received_at + timedelta(seconds=1)
+        modified_transition = baseline_received_at + timedelta(seconds=2)
+        added_item = _workspace_pod_item(
+            owner_id=added_owner,
+            source_uid="pod-watch-added",
+            name=added_name,
+            revision_hash="c" * 64,
+            transition_at=added_transition,
+        )
+        modified_item = _workspace_pod_item(
+            owner_id=modified_owner,
+            source_uid="pod-watch-modified",
+            name=pending_name,
+            revision_hash="d" * 64,
+            transition_at=modified_transition,
+        )
+        async with pool.acquire() as conn:
+            for watch_owner, watch_user, watch_project, watch_name in (
+                (added_owner, uuid4(), uuid4(), added_name),
+                (modified_owner, uuid4(), uuid4(), pending_name),
+            ):
+                await conn.execute(
+                    "INSERT INTO jobs (id, user_id, project_id, context) VALUES ("
+                    "$1, $2, $3, jsonb_build_object('workspace_container', "
+                    "jsonb_build_object('pod_name', $4::text, "
+                    "'namespace', 'workers'))) ",
+                    watch_owner,
+                    watch_user,
+                    watch_project,
+                    watch_name,
+                )
+            async with conn.transaction():
+                added_interval_id = await reconciler.apply_watch(
+                    conn,
+                    WatchIntervalMutationContext(
+                        scope_epoch_id=epoch_id,
+                        inventory_scope_id=scope_id,
+                        source_cluster=scope.source_cluster,
+                        namespace=scope.namespace,
+                        event_type=WatchEventKind.ADDED,
+                        received_at=baseline_received_at + timedelta(seconds=3),
+                        existing_interval_id=None,
+                        existing_source_revision=None,
+                    ),
+                    added_item,
+                )
+                modified_interval_id = await reconciler.apply_watch(
+                    conn,
+                    WatchIntervalMutationContext(
+                        scope_epoch_id=epoch_id,
+                        inventory_scope_id=scope_id,
+                        source_cluster=scope.source_cluster,
+                        namespace=scope.namespace,
+                        event_type=WatchEventKind.MODIFIED,
+                        received_at=baseline_received_at + timedelta(seconds=4),
+                        existing_interval_id=None,
+                        existing_source_revision=None,
+                    ),
+                    modified_item,
+                )
+            watch_rows = await conn.fetch(
+                "SELECT id, source_uid, started_at, start_time_source, "
+                "start_uncertainty_us FROM resource_intervals "
+                "WHERE id=ANY($1::uuid[]) ORDER BY source_uid",
+                [added_interval_id, modified_interval_id],
+            )
+        by_uid = {row["source_uid"]: row for row in watch_rows}
+        assert by_uid["pod-watch-added"]["id"] == added_interval_id
+        assert by_uid["pod-watch-added"]["started_at"] == added_transition
+        assert (
+            by_uid["pod-watch-added"]["start_time_source"] == "pod-scheduled-transition"
+        )
+        assert by_uid["pod-watch-added"]["start_uncertainty_us"] == 0
+        assert by_uid["pod-watch-modified"]["id"] == modified_interval_id
+        assert by_uid["pod-watch-modified"]["started_at"] == modified_transition
+        assert (
+            by_uid["pod-watch-modified"]["start_time_source"]
+            == "pod-scheduled-transition"
+        )
+        assert by_uid["pod-watch-modified"]["start_uncertainty_us"] == 0
+    finally:
+        if not setup.is_closed():
+            await setup.close()
+        if pool is not None:
+            await pool.close()
+        admin = await asyncpg.connect(app_pg_dsn)
+        try:
+            await admin.execute(f'DROP DATABASE IF EXISTS "{dbname}" WITH (FORCE)')
+        finally:
+            await admin.close()
+
+
+@pytest.mark.asyncio
+async def test_inventory_store_snapshot_watch_and_recovery_are_atomic(
+    app_pg_dsn: str,
+) -> None:
+    dbname = f"metering_store_{uuid4().hex[:12]}"
+    admin = await asyncpg.connect(app_pg_dsn)
+    try:
+        await admin.execute(f'CREATE DATABASE "{dbname}"')
+    finally:
+        await admin.close()
+    dsn = _swap_db(app_pg_dsn, dbname)
+    setup = await asyncpg.connect(dsn)
+    try:
+        await setup.execute('CREATE EXTENSION "uuid-ossp"')
+        await setup.execute("CREATE TABLE usage_rate_cards (id TEXT PRIMARY KEY)")
+        await setup.execute(
+            "CREATE TABLE rollup_state (name TEXT PRIMARY KEY, last_closed_day DATE)"
+        )
+        await setup.execute(APP_MIGRATION.read_text())
+        await setup.execute(APP_INGESTION_MIGRATION.read_text())
+    finally:
+        await setup.close()
+
+    pool = await asyncpg.create_pool(dsn, min_size=1, max_size=4)
+    assert pool is not None
+    scope_id, epoch_id = uuid4(), uuid4()
+    scope = InventoryScopeIdentity(
+        collector_id="kubernetes",
+        source_cluster="cluster-a",
+        api_resource="core/v1/pods",
+        namespace="workers",
+    )
+    original_proof = datetime.now(timezone.utc) - timedelta(minutes=2)
+    revisions = {key: key * 64 for key in ("a", "b", "c", "d")}
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO resource_inventory_scopes "
+            "(id, collector_id, source_cluster, api_resource, namespace) "
+            "VALUES ($1, $2, $3, $4, $5)",
+            scope_id,
+            scope.collector_id,
+            scope.source_cluster,
+            scope.api_resource,
+            scope.namespace,
+        )
+        await conn.execute(
+            "INSERT INTO resource_inventory_scope_epochs "
+            "(id, scope_id, epoch_number, coverage_mode) "
+            "VALUES ($1, $2, 1, 'list-watch')",
+            epoch_id,
+            scope_id,
+        )
+        interval_ids = {}
+        for uid, revision in (
+            ("present", revisions["a"]),
+            ("absent", revisions["b"]),
+            ("invalid", revisions["c"]),
+        ):
+            interval_ids[uid] = await _insert_open_test_interval(
+                conn,
+                inventory_scope_id=scope_id,
+                source_cluster=scope.source_cluster,
+                namespace=scope.namespace or "",
+                source_uid=uid,
+                source_revision=revision,
+                observed_at=original_proof,
+            )
+
+    leader = InventoryStore(
+        pool,
+        max_batch_bytes=100_000,
+        max_snapshot_items=100,
+        max_snapshot_bytes=1_000_000,
+    )
+    consumer = InventoryStore(
+        pool,
+        max_batch_bytes=100_000,
+        max_snapshot_items=100,
+        max_snapshot_bytes=1_000_000,
+    )
+    generation = await leader.activate_generation()
+    assert generation == 1
+
+    ticket = await leader.issue_ingest_ticket(
+        epoch_id,
+        "1" * 64,
+        scope=scope,
+        transport=_transport("snapshot-ticket"),
+    )
+    snapshot_id = uuid4()
+    started_at = datetime.now(timezone.utc) - timedelta(seconds=5)
+    await consumer.begin_snapshot(
+        ticket.token,
+        ticket.id,
+        snapshot_id,
+        started_at,
+        scope=scope,
+        transport=_transport("snapshot-begin"),
+    )
+    items = (
+        InventoryItem(
+            "pod",
+            "present",
+            revisions["a"],
+            {"source_kind": "pod", "uid": "present", "namespace": "workers"},
+            True,
+        ),
+        InventoryItem(
+            "pod",
+            "invalid",
+            None,
+            {"source_kind": "pod", "uid": "invalid", "namespace": "workers"},
+            False,
+            SanitizedInventoryError("capacity-invalid"),
+        ),
+        InventoryItem(
+            "pod",
+            "new",
+            revisions["d"],
+            {"source_kind": "pod", "uid": "new", "namespace": "workers"},
+            True,
+        ),
+    )
+    first_stage_claim = _transport("snapshot-items")
+    staged = await consumer.stage_items(
+        ticket.token,
+        ticket.id,
+        snapshot_id,
+        items,
+        scope=scope,
+        transport=first_stage_claim,
+    )
+    assert (staged.inserted, staged.total) == (3, 3)
+    with pytest.raises(InventoryConflictError, match="nonce"):
+        await consumer.stage_items(
+            ticket.token,
+            ticket.id,
+            snapshot_id,
+            items,
+            scope=scope,
+            transport=first_stage_claim,
+        )
+    replay_stage = await consumer.stage_items(
+        ticket.token,
+        ticket.id,
+        snapshot_id,
+        items,
+        scope=scope,
+        transport=_transport("snapshot-items"),
+    )
+    assert (replay_stage.inserted, replay_stage.total) == (0, 3)
+
+    async def mutate_snapshot(conn, context, item):
+        if context.existing_source_revision == item.revision_hash:
+            assert context.existing_interval_id is not None
+            return await conn.fetchval(
+                "UPDATE resource_intervals SET last_seen_at=$2, "
+                "last_confirmed_at=$2, updated_at=statement_timestamp() "
+                "WHERE id=$1 RETURNING id",
+                context.existing_interval_id,
+                context.received_at,
+            )
+        assert item.source_uid == "new"
+        return await _insert_open_test_interval(
+            conn,
+            inventory_scope_id=context.inventory_scope_id,
+            source_cluster=context.source_cluster,
+            namespace=context.namespace or "",
+            source_uid=item.source_uid,
+            source_revision=item.revision_hash or "",
+            observed_at=context.received_at,
+        )
+
+    observed_uids = []
+
+    async def compare_snapshot(conn, context, item):
+        observed_uids.append(item.source_uid)
+        await conn.execute(
+            "INSERT INTO resource_inventory_shadow_comparisons ("
+            "snapshot_id, inventory_scope_id, source_uid, owner_trusted, "
+            "status, reason_code, explained, comparison_at) VALUES ("
+            "$1, $2, $3, FALSE, $4, $5, TRUE, $6)",
+            context.snapshot_id,
+            context.inventory_scope_id,
+            item.source_uid,
+            "invalid-observation" if not item.valid_for_metering else "matched",
+            "capacity-invalid" if not item.valid_for_metering else "exact-match",
+            context.received_at,
+        )
+
+    final = SnapshotFinalization(
+        collection_completed_at=datetime.now(timezone.utc) - timedelta(seconds=1),
+        complete=True,
+        item_count=len(items),
+        item_digest=inventory_manifest_digest(items),
+        resource_version="rv-list",
+    )
+    reconciled = await consumer.finalize_snapshot(
+        ticket.token,
+        ticket.id,
+        snapshot_id,
+        final,
+        scope=scope,
+        transport=_transport("snapshot-finalize"),
+        interval_mutator=mutate_snapshot,
+        observation_hook=compare_snapshot,
+    )
+    assert reconciled.closed_intervals == 1
+    assert reconciled.invalid_items == 1
+    assert reconciled.confirmed_intervals == 2
+    assert reconciled.shadow_comparisons == 3
+    assert set(observed_uids) == {"present", "invalid", "new"}
+
+    replayed = await consumer.finalize_snapshot(
+        ticket.token,
+        ticket.id,
+        snapshot_id,
+        final,
+        scope=scope,
+        transport=_transport("snapshot-finalize"),
+    )
+    assert replayed.replayed
+    async with pool.acquire() as conn:
+        snapshot = await conn.fetchrow(
+            "SELECT received_at, manifest_state FROM resource_inventory_snapshots "
+            "WHERE id=$1",
+            snapshot_id,
+        )
+        assert snapshot["manifest_state"] == "sealed"
+        invalid = await conn.fetchrow(
+            "SELECT last_seen_at, last_confirmed_at, ended_at "
+            "FROM resource_intervals WHERE id=$1",
+            interval_ids["invalid"],
+        )
+        assert invalid["ended_at"] is None
+        assert invalid["last_seen_at"] == snapshot["received_at"]
+        assert invalid["last_confirmed_at"] == original_proof
+        assert await conn.fetchval(
+            "SELECT ended_at IS NOT NULL FROM resource_intervals WHERE id=$1",
+            interval_ids["absent"],
+        )
+        assert (
+            await conn.fetchval(
+                "SELECT count(*) FROM resource_inventory_shadow_comparisons "
+                "WHERE snapshot_id=$1",
+                snapshot_id,
+            )
+            == 3
+        )
+        with pytest.raises(asyncpg.ObjectNotInPrerequisiteStateError):
+            await conn.execute(
+                "UPDATE resource_inventory_shadow_comparisons SET explained=FALSE "
+                "WHERE snapshot_id=$1",
+                snapshot_id,
+            )
+
+    incomplete_ticket = await leader.issue_ingest_ticket(
+        epoch_id,
+        "2" * 64,
+        scope=scope,
+        transport=_transport("snapshot-ticket"),
+    )
+    incomplete_id = uuid4()
+    await consumer.begin_snapshot(
+        incomplete_ticket.token,
+        incomplete_ticket.id,
+        incomplete_id,
+        datetime.now(timezone.utc),
+        scope=scope,
+        transport=_transport("snapshot-begin"),
+    )
+    assert (
+        await consumer.stage_items(
+            incomplete_ticket.token,
+            incomplete_ticket.id,
+            incomplete_id,
+            (),
+            scope=scope,
+            transport=_transport("snapshot-items"),
+        )
+    ).total == 0
+    incomplete = await consumer.finalize_snapshot(
+        incomplete_ticket.token,
+        incomplete_ticket.id,
+        incomplete_id,
+        SnapshotFinalization(
+            collection_completed_at=datetime.now(timezone.utc),
+            complete=False,
+            item_count=0,
+            item_digest=None,
+            fatal_errors=(SanitizedInventoryError("collector-timeout"),),
+        ),
+        scope=scope,
+        transport=_transport("snapshot-finalize"),
+    )
+    assert not incomplete.complete and incomplete.closed_intervals == 0
+    async with pool.acquire() as conn:
+        assert await conn.fetchval(
+            "SELECT ended_at IS NULL FROM resource_intervals WHERE id=$1",
+            interval_ids["present"],
+        )
+        assert await conn.fetchval(
+            "SELECT last_complete_snapshot_id=$1 "
+            "FROM resource_inventory_scope_epochs WHERE id=$2",
+            snapshot_id,
+            epoch_id,
+        )
+
+    bounded_ticket = await leader.issue_ingest_ticket(
+        epoch_id,
+        "3" * 64,
+        scope=scope,
+        transport=_transport("snapshot-ticket"),
+        max_snapshot_bytes=80,
+    )
+    bounded_id = uuid4()
+    await consumer.begin_snapshot(
+        bounded_ticket.token,
+        bounded_ticket.id,
+        bounded_id,
+        datetime.now(timezone.utc),
+        scope=scope,
+        transport=_transport("snapshot-begin"),
+    )
+    failed_claim = _transport("snapshot-items")
+    with pytest.raises(InventoryContractError, match="cumulative byte"):
+        await consumer.stage_items(
+            bounded_ticket.token,
+            bounded_ticket.id,
+            bounded_id,
+            (items[0],),
+            scope=scope,
+            transport=failed_claim,
+        )
+    async with pool.acquire() as conn:
+        assert (
+            await conn.fetchval(
+                "SELECT count(*) FROM resource_inventory_snapshot_items "
+                "WHERE snapshot_id=$1",
+                bounded_id,
+            )
+            == 0
+        )
+        assert (
+            await conn.fetchval(
+                "SELECT count(*) FROM resource_inventory_transport_nonces "
+                "WHERE collector_id=$1 AND request_nonce=$2",
+                failed_claim.collector_id,
+                failed_claim.request_nonce,
+            )
+            == 0
+        )
+
+    inventory_only_ticket = await leader.issue_ingest_ticket(
+        epoch_id,
+        "b" * 64,
+        scope=scope,
+        transport=_transport("snapshot-ticket"),
+    )
+    inventory_only_id = uuid4()
+    await consumer.begin_snapshot(
+        inventory_only_ticket.token,
+        inventory_only_ticket.id,
+        inventory_only_id,
+        datetime.now(timezone.utc),
+        scope=scope,
+        transport=_transport("snapshot-begin"),
+    )
+    await consumer.stage_items(
+        inventory_only_ticket.token,
+        inventory_only_ticket.id,
+        inventory_only_id,
+        (),
+        scope=scope,
+        transport=_transport("snapshot-items"),
+    )
+    inventory_only = await consumer.finalize_snapshot(
+        inventory_only_ticket.token,
+        inventory_only_ticket.id,
+        inventory_only_id,
+        SnapshotFinalization(
+            collection_completed_at=datetime.now(timezone.utc),
+            complete=True,
+            item_count=0,
+            item_digest=inventory_manifest_digest(()),
+            resource_version="rv-inventory-only",
+        ),
+        scope=scope,
+        transport=_transport("snapshot-finalize"),
+        reconcile_intervals=False,
+    )
+    assert inventory_only.closed_intervals == 0
+    assert inventory_only.observed_intervals == 0
+    assert inventory_only.shadow_comparisons == 0
+    async with pool.acquire() as conn:
+        assert await conn.fetchval(
+            "SELECT ended_at IS NULL FROM resource_intervals WHERE id=$1",
+            interval_ids["present"],
+        )
+
+    session = await leader.issue_watch_session(
+        epoch_id,
+        "4" * 64,
+        "rv-inventory-only",
+        scope=scope,
+        transport=_transport("watch-session"),
+        max_events=10,
+        max_bytes=100,
+    )
+    before_bookmark = None
+    async with pool.acquire() as conn:
+        before_bookmark = await conn.fetchval(
+            "SELECT last_confirmed_at FROM resource_intervals WHERE id=$1",
+            interval_ids["present"],
+        )
+    bookmark = await consumer.apply_watch_event(
+        session.token,
+        session.id,
+        uuid4(),
+        "5" * 64,
+        "rv-inventory-only",
+        WatchObjectEvent(
+            WatchEventKind.BOOKMARK,
+            "rv-bookmark",
+            datetime.now(timezone.utc),
+            1,
+        ),
+        scope=scope,
+        transport=_transport("watch-event"),
+    )
+    assert bookmark.mutation_action is WatchMutationAction.BOOKMARK
+    async with pool.acquire() as conn:
+        assert (
+            await conn.fetchval(
+                "SELECT last_confirmed_at FROM resource_intervals WHERE id=$1",
+                interval_ids["present"],
+            )
+            == before_bookmark
+        )
+
+    not_applicable = InventoryItem(
+        "pod",
+        "platform-pod",
+        "e" * 64,
+        {"source_kind": "pod", "uid": "platform-pod", "namespace": "workers"},
+        True,
+    )
+
+    async def ignore_non_workspace(_conn, _context, _item):
+        return None
+
+    ignored = await consumer.apply_watch_event(
+        session.token,
+        session.id,
+        uuid4(),
+        "6" * 64,
+        "rv-bookmark",
+        WatchObjectEvent(
+            WatchEventKind.ADDED,
+            "rv-platform",
+            datetime.now(timezone.utc),
+            1,
+            item=not_applicable,
+        ),
+        scope=scope,
+        transport=_transport("watch-event"),
+        interval_mutator=ignore_non_workspace,
+    )
+    assert ignored.mutation_action is WatchMutationAction.NOT_APPLICABLE
+
+    # Simulate a lost HTTP response after the server committed this cursor.
+    # The collector still reports its last acknowledged cursor plus the
+    # attempted cursor; gap persistence must accept either server outcome and
+    # force recovery instead of guessing whether the mutation landed.
+    ambiguous_apply = await consumer.apply_watch_event(
+        session.token,
+        session.id,
+        uuid4(),
+        "7" * 64,
+        "rv-platform",
+        WatchObjectEvent(
+            WatchEventKind.BOOKMARK,
+            "rv-attempted",
+            datetime.now(timezone.utc),
+            1,
+        ),
+        scope=scope,
+        transport=_transport("watch-event"),
+    )
+    assert ambiguous_apply.resource_version == "rv-attempted"
+    history_event_id = uuid4()
+    history = await consumer.record_watch_gap(
+        session.token,
+        session.id,
+        history_event_id,
+        "8" * 64,
+        "rv-platform",
+        gap_reason="ambiguous-watch-apply",
+        alternate_expected_resource_version="rv-attempted",
+        scope=scope,
+        transport=_transport("watch-history-lost"),
+    )
+    assert history.mutation_action is WatchMutationAction.HISTORY_GAP
+    assert history.resource_version == "rv-attempted"
+    replayed_history = await consumer.record_watch_gap(
+        session.token,
+        session.id,
+        history_event_id,
+        "8" * 64,
+        "rv-platform",
+        gap_reason="ambiguous-watch-apply",
+        alternate_expected_resource_version="rv-attempted",
+        scope=scope,
+        transport=_transport("watch-history-lost"),
+    )
+    assert replayed_history.replayed
+    async with pool.acquire() as conn:
+        assert await conn.fetchval(
+            "SELECT reason='ambiguous-watch-apply' "
+            "FROM resource_inventory_coverage_gaps WHERE id=$1",
+            history.coverage_gap_id,
+        )
+    recovery = await leader.start_watch_recovery_epoch(
+        epoch_id,
+        scope=scope,
+        transport=_transport("scope-recovery"),
+    )
+    assert recovery.recovery_from_epoch_id == epoch_id
+    recovery_ticket = await leader.issue_ingest_ticket(
+        recovery.scope_epoch_id,
+        "9" * 64,
+        scope=scope,
+        transport=_transport("snapshot-ticket"),
+    )
+    recovery_snapshot = uuid4()
+    await consumer.begin_snapshot(
+        recovery_ticket.token,
+        recovery_ticket.id,
+        recovery_snapshot,
+        datetime.now(timezone.utc),
+        scope=scope,
+        transport=_transport("snapshot-begin"),
+    )
+    await consumer.stage_items(
+        recovery_ticket.token,
+        recovery_ticket.id,
+        recovery_snapshot,
+        (),
+        scope=scope,
+        transport=_transport("snapshot-items"),
+    )
+    await consumer.finalize_snapshot(
+        recovery_ticket.token,
+        recovery_ticket.id,
+        recovery_snapshot,
+        SnapshotFinalization(
+            collection_completed_at=datetime.now(timezone.utc),
+            complete=True,
+            item_count=0,
+            item_digest=inventory_manifest_digest(()),
+            resource_version="rv-recovered",
+        ),
+        scope=scope,
+        transport=_transport("snapshot-finalize"),
+    )
+    resumed = await leader.issue_watch_session(
+        recovery.scope_epoch_id,
+        "a" * 64,
+        "rv-recovered",
+        scope=scope,
+        transport=_transport("watch-session"),
+    )
+    assert resumed.scope_epoch_id == recovery.scope_epoch_id
+    finishable = await leader.issue_watch_session(
+        recovery.scope_epoch_id,
+        "b" * 64,
+        "rv-recovered",
+        scope=scope,
+        transport=_transport("watch-session"),
+    )
+    # Symmetric ambiguous-ACK case: the attempted apply did not commit, so the
+    # server still has the collector's acknowledged cursor. Persisting the gap
+    # and replaying it must use that actual server cursor, not the attempted one.
+    not_committed_event_id = uuid4()
+    not_committed_history = await consumer.record_watch_gap(
+        resumed.token,
+        resumed.id,
+        not_committed_event_id,
+        "b" * 64,
+        "rv-recovered",
+        gap_reason="ambiguous-watch-apply",
+        alternate_expected_resource_version="rv-not-committed",
+        scope=scope,
+        transport=_transport("watch-history-lost"),
+    )
+    assert not_committed_history.resource_version == "rv-recovered"
+    not_committed_replay = await consumer.record_watch_gap(
+        resumed.token,
+        resumed.id,
+        not_committed_event_id,
+        "b" * 64,
+        "rv-recovered",
+        gap_reason="ambiguous-watch-apply",
+        alternate_expected_resource_version="rv-not-committed",
+        scope=scope,
+        transport=_transport("watch-history-lost"),
+    )
+    assert not_committed_replay.replayed
+    assert not_committed_replay.resource_version == "rv-recovered"
+    async with pool.acquire() as conn:
+        not_committed_details = await conn.fetchrow(
+            "SELECT event.expected_resource_version, "
+            "gap.resolution_details->>'collector_committed_resource_version' "
+            "AS collector_cursor, "
+            "gap.resolution_details->>'attempted_resource_version' "
+            "AS attempted_cursor, "
+            "gap.resolution_details->>'server_committed_resource_version' "
+            "AS server_cursor "
+            "FROM resource_inventory_watch_events event "
+            "JOIN resource_inventory_coverage_gaps gap "
+            "ON gap.id=event.coverage_gap_id "
+            "WHERE event.watch_session_id=$1 AND event.id=$2",
+            resumed.id,
+            not_committed_event_id,
+        )
+    assert not_committed_details["expected_resource_version"] == "rv-recovered"
+    assert not_committed_details["collector_cursor"] == "rv-recovered"
+    assert not_committed_details["attempted_cursor"] == "rv-not-committed"
+    assert not_committed_details["server_cursor"] == "rv-recovered"
+    assert await consumer.finish_watch_session(
+        finishable.token,
+        finishable.id,
+        scope=scope,
+        transport=_transport("watch-finish"),
+    )
+    assert not await consumer.finish_watch_session(
+        finishable.token,
+        finishable.id,
+        scope=scope,
+        transport=_transport("watch-finish"),
+    )
+    async with pool.acquire() as conn:
+        gap = await conn.fetchrow(
+            "SELECT gap_end, resolution FROM resource_inventory_coverage_gaps "
+            "WHERE id=$1",
+            history.coverage_gap_id,
+        )
+        assert gap["gap_end"] is not None
+        assert gap["resolution"] == "unresolved"
+
+    abandoned_ticket = await leader.issue_ingest_ticket(
+        recovery.scope_epoch_id,
+        "c" * 64,
+        scope=scope,
+        transport=_transport("snapshot-ticket"),
+    )
+    abandoned_snapshot_id = uuid4()
+    await consumer.begin_snapshot(
+        abandoned_ticket.token,
+        abandoned_ticket.id,
+        abandoned_snapshot_id,
+        datetime.now(timezone.utc),
+        scope=scope,
+        transport=_transport("snapshot-begin"),
+    )
+    abandoned_item = InventoryItem(
+        "pod",
+        "abandoned",
+        "f" * 64,
+        {"source_kind": "pod", "uid": "abandoned", "namespace": "workers"},
+        True,
+    )
+    await consumer.stage_items(
+        abandoned_ticket.token,
+        abandoned_ticket.id,
+        abandoned_snapshot_id,
+        (abandoned_item,),
+        scope=scope,
+        transport=_transport("snapshot-items"),
+    )
+    unbound_ticket = await leader.issue_ingest_ticket(
+        recovery.scope_epoch_id,
+        "d" * 64,
+        scope=scope,
+        transport=_transport("snapshot-ticket"),
+    )
+
+    retained_tables = (
+        "resource_inventory_scopes",
+        "resource_inventory_scope_epochs",
+        "resource_inventory_coverage_gaps",
+        "resource_intervals",
+        "resource_publication_plans",
+        "resource_publication_plan_events",
+    )
+    async with pool.acquire() as conn:
+        retained_before = {
+            table: int(await conn.fetchval(f"SELECT count(*) FROM {table}"))
+            for table in retained_tables
+        }
+        snapshot_count_before = int(
+            await conn.fetchval("SELECT count(*) FROM resource_inventory_snapshots")
+        )
+        with pytest.raises(asyncpg.ObjectNotInPrerequisiteStateError):
+            await conn.execute(
+                "DELETE FROM resource_inventory_ingest_tickets WHERE id=$1",
+                unbound_ticket.id,
+            )
+        with pytest.raises(asyncpg.ObjectNotInPrerequisiteStateError):
+            await conn.execute(
+                "UPDATE resource_inventory_snapshots SET "
+                "manifest_state='staging-expired', "
+                "items_expired_at=statement_timestamp() WHERE id=$1",
+                abandoned_snapshot_id,
+            )
+
+        for table in (
+            "resource_inventory_snapshots",
+            "resource_inventory_shadow_comparisons",
+            "resource_inventory_watch_events",
+            "resource_inventory_watch_sessions",
+            "resource_inventory_ingest_tickets",
+            "resource_inventory_transport_nonces",
+        ):
+            await conn.execute(f"ALTER TABLE {table} DISABLE TRIGGER USER")
+        try:
+            await conn.execute(
+                "UPDATE resource_inventory_snapshots SET "
+                "collection_started_at=collection_started_at-INTERVAL '40 days', "
+                "collection_completed_at=collection_completed_at-INTERVAL '40 days', "
+                "received_at=received_at-INTERVAL '40 days', "
+                "sealed_at=sealed_at-INTERVAL '40 days', "
+                "created_at=created_at-INTERVAL '40 days' WHERE id=$1",
+                snapshot_id,
+            )
+            await conn.execute(
+                "UPDATE resource_inventory_snapshots SET "
+                "collection_started_at=collection_started_at-INTERVAL '2 days', "
+                "collection_completed_at=collection_completed_at-INTERVAL '2 days', "
+                "received_at=received_at-INTERVAL '2 days', "
+                "created_at=created_at-INTERVAL '2 days' WHERE id=$1",
+                abandoned_snapshot_id,
+            )
+            await conn.execute(
+                "UPDATE resource_inventory_shadow_comparisons SET "
+                "comparison_at=comparison_at-INTERVAL '40 days', "
+                "created_at=created_at-INTERVAL '40 days' WHERE snapshot_id=$1",
+                snapshot_id,
+            )
+            await conn.execute(
+                "UPDATE resource_inventory_watch_events SET "
+                "collector_observed_at=collector_observed_at-INTERVAL '40 days', "
+                "received_at=received_at-INTERVAL '40 days', "
+                "created_at=created_at-INTERVAL '40 days' "
+                "WHERE watch_session_id=$1",
+                session.id,
+            )
+            await conn.execute(
+                "UPDATE resource_inventory_watch_sessions SET "
+                "created_at=created_at-INTERVAL '40 days', "
+                "updated_at=updated_at-INTERVAL '40 days', "
+                "expires_at=expires_at-INTERVAL '40 days', "
+                "consumed_at=consumed_at-INTERVAL '40 days' "
+                "WHERE id=ANY($1::uuid[])",
+                [session.id, resumed.id],
+            )
+            await conn.execute(
+                "UPDATE resource_inventory_ingest_tickets SET "
+                "created_at=created_at-INTERVAL '2 days', "
+                "expires_at=expires_at-INTERVAL '2 days', "
+                "bound_at=bound_at-INTERVAL '2 days' "
+                "WHERE id=ANY($1::uuid[])",
+                [abandoned_ticket.id, unbound_ticket.id],
+            )
+            await conn.execute(
+                "UPDATE resource_inventory_transport_nonces SET "
+                "received_at=received_at-INTERVAL '40 days', "
+                "expires_at=expires_at-INTERVAL '40 days'"
+            )
+        finally:
+            for table in reversed(
+                (
+                    "resource_inventory_snapshots",
+                    "resource_inventory_shadow_comparisons",
+                    "resource_inventory_watch_events",
+                    "resource_inventory_watch_sessions",
+                    "resource_inventory_ingest_tickets",
+                    "resource_inventory_transport_nonces",
+                )
+            ):
+                await conn.execute(f"ALTER TABLE {table} ENABLE TRIGGER USER")
+
+    assert await leader.purge_expired_transport_nonces(limit=2) == 2
+    assert await leader.purge_expired_transport_nonces(limit=10_000) > 0
+
+    purge_totals = {
+        "sealed": 0,
+        "abandoned": 0,
+        "items": 0,
+        "shadow": 0,
+        "events": 0,
+        "sessions": 0,
+        "tickets": 0,
+    }
+    for _ in range(10):
+        purged = await leader.purge_diagnostics(generation, limit=2)
+        purge_totals["sealed"] += purged.sealed_snapshots_expired
+        purge_totals["abandoned"] += purged.abandoned_snapshots_expired
+        purge_totals["items"] += purged.snapshot_items_deleted
+        purge_totals["shadow"] += purged.shadow_comparisons_deleted
+        purge_totals["events"] += purged.watch_events_deleted
+        purge_totals["sessions"] += purged.watch_sessions_deleted
+        purge_totals["tickets"] += purged.unbound_tickets_deleted
+        if not purged.might_have_more:
+            break
+    else:
+        pytest.fail("bounded inventory retention did not drain")
+
+    assert purge_totals == {
+        "sealed": 1,
+        "abandoned": 1,
+        "items": 4,
+        "shadow": 3,
+        "events": 5,
+        "sessions": 2,
+        "tickets": 1,
+    }
+    async with pool.acquire() as conn:
+        assert {
+            table: int(await conn.fetchval(f"SELECT count(*) FROM {table}"))
+            for table in retained_tables
+        } == retained_before
+        assert (
+            await conn.fetchval("SELECT count(*) FROM resource_inventory_snapshots")
+            == snapshot_count_before
+        )
+        assert await conn.fetchval(
+            "SELECT manifest_state='items-expired' "
+            "FROM resource_inventory_snapshots WHERE id=$1",
+            snapshot_id,
+        )
+        assert await conn.fetchval(
+            "SELECT manifest_state='staging-expired' "
+            "FROM resource_inventory_snapshots WHERE id=$1",
+            abandoned_snapshot_id,
+        )
+        assert not await conn.fetchval(
+            "SELECT EXISTS (SELECT 1 FROM resource_inventory_snapshot_items "
+            "WHERE snapshot_id=ANY($1::uuid[]))",
+            [snapshot_id, abandoned_snapshot_id],
+        )
+        assert not await conn.fetchval(
+            "SELECT EXISTS (SELECT 1 FROM resource_inventory_watch_events "
+            "WHERE watch_session_id=$1)",
+            session.id,
+        )
+        assert not await conn.fetchval(
+            "SELECT EXISTS (SELECT 1 FROM resource_inventory_watch_sessions "
+            "WHERE id=ANY($1::uuid[]))",
+            [session.id, resumed.id],
+        )
+        assert not await conn.fetchval(
+            "SELECT EXISTS (SELECT 1 FROM resource_inventory_ingest_tickets "
+            "WHERE id=$1)",
+            unbound_ticket.id,
+        )
+        assert await conn.fetchval(
+            "SELECT EXISTS (SELECT 1 FROM resource_inventory_ingest_tickets "
+            "WHERE id=$1)",
+            abandoned_ticket.id,
+        )
+        with pytest.raises(asyncpg.ObjectNotInPrerequisiteStateError):
+            await conn.execute(
+                "UPDATE resource_inventory_snapshots SET item_count=0 WHERE id=$1",
+                abandoned_snapshot_id,
+            )
+
+    mismatch_ticket = await leader.issue_ingest_ticket(
+        recovery.scope_epoch_id,
+        "e" * 64,
+        scope=scope,
+        transport=_transport("snapshot-ticket"),
+    )
+    mismatch_snapshot_id = uuid4()
+    await consumer.begin_snapshot(
+        mismatch_ticket.token,
+        mismatch_ticket.id,
+        mismatch_snapshot_id,
+        datetime.now(timezone.utc),
+        scope=scope,
+        transport=_transport("snapshot-begin"),
+    )
+    await consumer.finalize_snapshot(
+        mismatch_ticket.token,
+        mismatch_ticket.id,
+        mismatch_snapshot_id,
+        SnapshotFinalization(
+            collection_completed_at=datetime.now(timezone.utc),
+            complete=False,
+            item_count=0,
+            item_digest=None,
+            fatal_errors=(SanitizedInventoryError("resource-version-mismatch"),),
+        ),
+        scope=scope,
+        transport=_transport("snapshot-finalize"),
+        reconcile_intervals=False,
+    )
+    async with pool.acquire() as conn:
+        mismatch_gap = await conn.fetchrow(
+            "SELECT gap.reason, epoch.continuity_health "
+            "FROM resource_inventory_coverage_gaps gap "
+            "JOIN resource_inventory_scope_epochs epoch "
+            "ON epoch.id=gap.scope_epoch_id "
+            "WHERE gap.scope_epoch_id=$1 "
+            "AND gap.reason='list-resource-version-mismatch'",
+            recovery.scope_epoch_id,
+        )
+        assert mismatch_gap["continuity_health"] == "gap"
+
+    second_recovery = await leader.start_watch_recovery_epoch(
+        recovery.scope_epoch_id,
+        scope=scope,
+        transport=_transport("scope-recovery"),
+    )
+    second_recovery_ticket = await leader.issue_ingest_ticket(
+        second_recovery.scope_epoch_id,
+        "f" * 64,
+        scope=scope,
+        transport=_transport("snapshot-ticket"),
+    )
+    second_recovery_snapshot = uuid4()
+    await consumer.begin_snapshot(
+        second_recovery_ticket.token,
+        second_recovery_ticket.id,
+        second_recovery_snapshot,
+        datetime.now(timezone.utc),
+        scope=scope,
+        transport=_transport("snapshot-begin"),
+    )
+    await consumer.finalize_snapshot(
+        second_recovery_ticket.token,
+        second_recovery_ticket.id,
+        second_recovery_snapshot,
+        SnapshotFinalization(
+            collection_completed_at=datetime.now(timezone.utc),
+            complete=True,
+            item_count=0,
+            item_digest=inventory_manifest_digest(()),
+            resource_version="rv-second-recovery",
+        ),
+        scope=scope,
+        transport=_transport("snapshot-finalize"),
+        reconcile_intervals=False,
+    )
+    async with pool.acquire() as conn:
+        closed_mismatch_gap = await conn.fetchrow(
+            "SELECT gap_end, resolution "
+            "FROM resource_inventory_coverage_gaps "
+            "WHERE scope_epoch_id=$1 "
+            "AND reason='list-resource-version-mismatch'",
+            recovery.scope_epoch_id,
+        )
+        assert closed_mismatch_gap["gap_end"] is not None
+        assert closed_mismatch_gap["resolution"] == "unresolved"
+
+    assert await leader.deactivate_generation(generation)
+    with pytest.raises(InventoryFenceError, match="not active locally"):
+        await leader.purge_diagnostics(generation)
+    async with pool.acquire() as conn:
+        assert (
+            await conn.fetchval(
+                "SELECT leader_generation FROM infra_metering_control WHERE singleton"
+            )
+            == generation
+        )
+    await pool.close()
 
 
 @pytest.mark.asyncio
@@ -346,7 +2313,9 @@ async def test_app_composite_foreign_keys_fail_closed_on_postgres16(
             epoch_b,
             scope_b,
         )
-        observed = datetime.now(timezone.utc).replace(microsecond=0)
+        observed = (datetime.now(timezone.utc) - timedelta(days=1)).replace(
+            hour=12, minute=0, second=0, microsecond=0
+        )
         collection_started = observed - timedelta(seconds=1)
         with pytest.raises(asyncpg.ObjectNotInPrerequisiteStateError):
             await conn.execute(

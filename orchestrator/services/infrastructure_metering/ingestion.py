@@ -1,0 +1,671 @@
+"""Authenticated orchestration service for dedicated inventory collectors.
+
+This is an app-DB shadow path only.  It owns scope creation, grant issuance,
+strict wire-to-store projection, and Pod interval hooks; it cannot publish audit
+usage events or change the durable cutover state.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from dataclasses import replace
+from datetime import timedelta
+import logging
+import re
+from typing import Any, Literal, TypeVar, cast
+import asyncpg
+from pydantic import BaseModel
+from starlette.requests import Request
+
+from .config import InfrastructureMeteringSettings
+from .ingestion_http import (
+    AuthenticatedIngestionModel,
+    IngestionRequestError,
+    authenticate_ingestion_model,
+)
+from .ingestion_types import (
+    InventoryItemWire,
+    InventoryScopeWire,
+    InventorySnapshotBegin,
+    InventorySnapshotFinalize,
+    InventorySnapshotItemBatch,
+    InventoryTicketRequest,
+    InventoryTicketResponse,
+    InventoryWatchApply,
+    InventoryWatchFinish,
+    SNAPSHOT_BATCH_BODY_LIMIT,
+    SNAPSHOT_METADATA_BODY_LIMIT,
+    TICKET_BODY_LIMIT,
+    WATCH_BODY_LIMIT,
+    validate_normalized_pod_payload,
+)
+from .inventory import (
+    InventoryConflictError,
+    InventoryContractError,
+    InventoryFenceError,
+    InventoryItem,
+    InventoryRecoveryRequired,
+    InventoryScopeIdentity,
+    InventoryStore,
+    InventoryTicketError,
+    SanitizedInventoryError,
+    SnapshotFinalization,
+    TransportNonceClaim,
+    WatchEventKind,
+    WatchObjectEvent,
+    canonical_request_digest,
+)
+from .pod_intervals import PodIntervalReconciler
+
+
+_SAFE_ERROR_CODE = re.compile(r"^[a-z][a-z0-9-]{0,63}$")
+_M = TypeVar("_M", bound=BaseModel)
+
+logger = logging.getLogger(__name__)
+
+_CLEANUP_BATCH_LIMIT = 1_000
+_MAX_CLEANUP_PASSES = 10
+
+IngestionOperation = Literal[
+    "ticket",
+    "snapshot_begin",
+    "snapshot_items",
+    "snapshot_finalize",
+    "watch_apply",
+    "watch_finish",
+]
+
+
+class InfrastructureIngestionService:
+    """Fail-closed HTTP-to-transaction adapter for one stable installation."""
+
+    def __init__(
+        self,
+        pool: asyncpg.Pool,
+        store: InventoryStore,
+        settings: InfrastructureMeteringSettings,
+        *,
+        ingestion_key: str | bytes,
+        collector_id: str = "kubernetes-pods",
+    ) -> None:
+        settings.validate()
+        if not settings.collector_enabled:
+            raise ValueError("collector service requires its feature gate")
+        key = (
+            ingestion_key.encode()
+            if isinstance(ingestion_key, str)
+            else bytes(ingestion_key)
+        )
+        if len(key) < 32:
+            raise ValueError("infrastructure metering ingestion key must be 32+ bytes")
+        self._pool = pool
+        self.store = store
+        self.settings = settings
+        self._ingestion_key = key
+        self._collector_id = collector_id
+        self._pod_reconciler = PodIntervalReconciler(
+            shadow_enabled=settings.shadow_enabled
+        )
+
+    async def _authenticated(
+        self,
+        request: Request,
+        model_type: type[_M],
+        *,
+        request_kind: str,
+        maximum_bytes: int,
+    ) -> tuple[_M, AuthenticatedIngestionModel]:
+        authenticated = await authenticate_ingestion_model(
+            request,
+            key=self._ingestion_key,
+            model_type=model_type,
+            request_kind=request_kind,
+            maximum_bytes=maximum_bytes,
+        )
+        if authenticated.collector_id != self._collector_id:
+            raise IngestionRequestError(401, "invalid collector authentication")
+        return cast(_M, authenticated.model), authenticated
+
+    def _scope(
+        self, wire: InventoryScopeWire, collector_id: str
+    ) -> InventoryScopeIdentity:
+        if (
+            wire.cluster_scoped
+            or wire.source_cluster != self.settings.stable_cluster_id
+            or wire.api_resource != "core/v1/pods"
+            or wire.namespace not in self.settings.namespace_allowlist
+        ):
+            raise IngestionRequestError(403, "collector scope is not allowed")
+        return InventoryScopeIdentity(
+            collector_id=collector_id,
+            source_cluster=wire.source_cluster,
+            api_resource=wire.api_resource,
+            namespace=wire.namespace,
+        )
+
+    async def _ensure_scope_epoch(
+        self, scope: InventoryScopeIdentity
+    ) -> asyncpg.Record:
+        """Create or resolve the active epoch under the current DB generation."""
+
+        async with self._pool.acquire() as conn:
+            async with conn.transaction():
+                generation = int(
+                    await conn.fetchval(
+                        "SELECT leader_generation FROM infra_metering_control "
+                        "WHERE singleton = TRUE FOR SHARE"
+                    )
+                    or 0
+                )
+                if generation <= 0:
+                    raise IngestionRequestError(503, "metering leader is unavailable")
+                await conn.execute(
+                    "INSERT INTO resource_inventory_scopes ("
+                    "collector_id, source_cluster, api_resource, namespace) "
+                    "VALUES ($1, $2, $3, $4) "
+                    "ON CONFLICT (collector_id, source_cluster, api_resource, "
+                    "namespace) DO NOTHING",
+                    scope.collector_id,
+                    scope.source_cluster,
+                    scope.api_resource,
+                    scope.namespace,
+                )
+                scope_row = await conn.fetchrow(
+                    "SELECT id FROM resource_inventory_scopes "
+                    "WHERE collector_id=$1 AND source_cluster=$2 "
+                    "AND api_resource=$3 AND namespace IS NOT DISTINCT FROM $4 "
+                    "FOR UPDATE",
+                    scope.collector_id,
+                    scope.source_cluster,
+                    scope.api_resource,
+                    scope.namespace,
+                )
+                if scope_row is None:
+                    raise InventoryContractError("inventory scope upsert failed")
+                epoch = await conn.fetchrow(
+                    "SELECT * FROM resource_inventory_scope_epochs "
+                    "WHERE scope_id=$1 AND retired_at IS NULL FOR UPDATE",
+                    scope_row["id"],
+                )
+                if epoch is None:
+                    next_number = await conn.fetchval(
+                        "SELECT COALESCE(max(epoch_number), 0) + 1 "
+                        "FROM resource_inventory_scope_epochs WHERE scope_id=$1",
+                        scope_row["id"],
+                    )
+                    epoch_id = await conn.fetchval(
+                        "INSERT INTO resource_inventory_scope_epochs ("
+                        "scope_id, epoch_number, coverage_mode, "
+                        "leader_generation) VALUES ($1, $2, 'list-watch', $3) "
+                        "RETURNING id",
+                        scope_row["id"],
+                        next_number,
+                        generation,
+                    )
+                    epoch = await conn.fetchrow(
+                        "SELECT * FROM resource_inventory_scope_epochs "
+                        "WHERE id=$1 FOR UPDATE",
+                        epoch_id,
+                    )
+                if epoch is None:
+                    raise InventoryContractError("inventory scope epoch is unavailable")
+                return epoch
+
+    async def _require_generation(self, generation: int) -> None:
+        current = await self._pool.fetchval(
+            "SELECT leader_generation FROM infra_metering_control "
+            "WHERE singleton = TRUE"
+        )
+        if int(current or -1) != generation:
+            raise IngestionRequestError(409, "metering generation is stale")
+
+    @staticmethod
+    def _item_error_code(item: InventoryItemWire) -> str:
+        value = item.normalized.get("normalization_error")
+        if isinstance(value, str) and _SAFE_ERROR_CODE.fullmatch(value):
+            return value
+        diagnostics = item.normalized.get("diagnostics")
+        if isinstance(diagnostics, list):
+            for diagnostic in diagnostics:
+                if not isinstance(diagnostic, dict):
+                    continue
+                value = diagnostic.get("code")
+                if isinstance(value, str) and _SAFE_ERROR_CODE.fullmatch(value):
+                    return value
+        return "invalid-item"
+
+    @classmethod
+    def _inventory_item(cls, item: InventoryItemWire) -> InventoryItem:
+        normalized = item.normalized
+        try:
+            validate_normalized_pod_payload(normalized)
+        except ValueError as exc:
+            raise IngestionRequestError(
+                400, "normalized Pod payload is invalid"
+            ) from exc
+        if (
+            item.kind != "pod"
+            or normalized.get("uid") != item.uid
+            or normalized.get("namespace") != item.scope.namespace
+            or normalized.get("valid_for_metering") is not item.valid_for_metering
+            or normalized.get("revision_hash") != item.revision_hash
+        ):
+            raise IngestionRequestError(400, "normalized item identity mismatch")
+        source_kind = normalized.get("source_kind")
+        if source_kind != item.kind:
+            raise IngestionRequestError(400, "normalized item identity mismatch")
+        return InventoryItem(
+            source_kind=item.kind,
+            source_uid=item.uid,
+            revision_hash=item.revision_hash,
+            normalized_item=normalized,
+            valid_for_metering=item.valid_for_metering,
+            item_error=(
+                None
+                if item.valid_for_metering
+                else SanitizedInventoryError(code=cls._item_error_code(item))
+            ),
+        )
+
+    async def ticket(self, request: Request) -> dict[str, Any]:
+        model, authenticated = await self._authenticated(
+            request,
+            InventoryTicketRequest,
+            request_kind="snapshot-ticket",
+            maximum_bytes=TICKET_BODY_LIMIT,
+        )
+        scope = self._scope(model.scope, authenticated.collector_id)
+        epoch = await self._ensure_scope_epoch(scope)
+        claim = authenticated.transport_claim
+        if model.intent == "watch-session":
+            if not self.settings.shadow_enabled:
+                raise IngestionRequestError(403, "watch ingestion is not enabled")
+            generation = int(
+                await self._pool.fetchval(
+                    "SELECT leader_generation FROM infra_metering_control "
+                    "WHERE singleton = TRUE"
+                )
+                or 0
+            )
+            fresh_list = (
+                generation > 0
+                and int(epoch["leader_generation"]) == generation
+                and epoch["last_complete_snapshot_id"] is not None
+                and await self._pool.fetchval(
+                    "SELECT TRUE FROM resource_inventory_snapshots "
+                    "WHERE id=$1 AND scope_epoch_id=$2 AND leader_generation=$3 "
+                    "AND complete AND manifest_state='sealed'",
+                    epoch["last_complete_snapshot_id"],
+                    epoch["id"],
+                    generation,
+                )
+            )
+            if not fresh_list:
+                raise IngestionRequestError(409, "fresh inventory list is required")
+            claim = replace(claim, request_kind="watch-session")
+            grant = await self.store.issue_watch_session(
+                epoch["id"],
+                canonical_request_digest(authenticated.body),
+                model.starting_resource_version or "",
+                scope=scope,
+                transport=claim,
+            )
+            response = InventoryTicketResponse(
+                ticket_id=grant.id,
+                ticket_token=grant.token,
+                leader_generation=grant.leader_generation,
+                expires_at=grant.expires_at,
+                last_resource_version=grant.starting_resource_version,
+            )
+            return response.model_dump(mode="json")
+
+        if epoch["continuity_health"] == "gap":
+            recovery_claim = replace(claim, request_kind="scope-recovery")
+            await self.store.start_watch_recovery_epoch(
+                epoch["id"], scope=scope, transport=recovery_claim
+            )
+            # The recovery transition consumed this signed nonce. A normal
+            # retry obtains a fresh signature and binds its ticket to the new
+            # epoch without conflating both side effects.
+            raise IngestionRequestError(409, "inventory recovery started; retry")
+        grant = await self.store.issue_ingest_ticket(
+            epoch["id"],
+            canonical_request_digest(authenticated.body),
+            scope=scope,
+            transport=claim,
+            require_healthy_continuity=True,
+            ttl=timedelta(seconds=self.settings.ingestion_ticket_ttl_seconds),
+            max_snapshot_items=self.settings.max_snapshot_items,
+            max_snapshot_bytes=self.settings.max_snapshot_bytes,
+        )
+        response = InventoryTicketResponse(
+            ticket_id=grant.id,
+            ticket_token=grant.token,
+            leader_generation=grant.leader_generation,
+            expires_at=grant.expires_at,
+            last_resource_version=epoch["last_resource_version"],
+        )
+        return response.model_dump(mode="json")
+
+    async def snapshot_begin(self, request: Request) -> dict[str, Any]:
+        model, authenticated = await self._authenticated(
+            request,
+            InventorySnapshotBegin,
+            request_kind="snapshot-begin",
+            maximum_bytes=SNAPSHOT_METADATA_BODY_LIMIT,
+        )
+        if model.collector_id != authenticated.collector_id:
+            raise IngestionRequestError(403, "collector identity mismatch")
+        scope = self._scope(model.scope, authenticated.collector_id)
+        handle = await self.store.begin_snapshot(
+            model.ticket_token,
+            model.ticket_id,
+            model.snapshot_id,
+            model.collection_started_at,
+            scope=scope,
+            transport=authenticated.transport_claim,
+            controller_epoch=model.controller_epoch,
+            sequence=model.sequence,
+        )
+        return {
+            "snapshot_id": str(handle.snapshot_id),
+            "leader_generation": handle.leader_generation,
+            "replayed": handle.replayed,
+        }
+
+    async def snapshot_items(self, request: Request) -> dict[str, Any]:
+        model, authenticated = await self._authenticated(
+            request,
+            InventorySnapshotItemBatch,
+            request_kind="snapshot-items",
+            maximum_bytes=SNAPSHOT_BATCH_BODY_LIMIT,
+        )
+        scope = self._scope(model.scope, authenticated.collector_id)
+        items = [self._inventory_item(item) for item in model.items]
+        result = await self.store.stage_items(
+            model.ticket_token,
+            model.ticket_id,
+            model.snapshot_id,
+            items,
+            scope=scope,
+            transport=authenticated.transport_claim,
+        )
+        return {"inserted": result.inserted, "total": result.total}
+
+    async def snapshot_finalize(self, request: Request) -> dict[str, Any]:
+        model, authenticated = await self._authenticated(
+            request,
+            InventorySnapshotFinalize,
+            request_kind="snapshot-finalize",
+            maximum_bytes=SNAPSHOT_METADATA_BODY_LIMIT,
+        )
+        if model.shadow_enabled != self.settings.shadow_enabled:
+            raise IngestionRequestError(
+                409, "collector shadow mode does not match the server"
+            )
+        scope = self._scope(model.scope, authenticated.collector_id)
+        finalization = SnapshotFinalization(
+            collection_completed_at=model.collection_completed_at,
+            source_snapshot_at=model.source_snapshot_at,
+            complete=model.complete,
+            resource_version=model.resource_version,
+            item_count=model.item_count,
+            item_digest=model.item_digest,
+            controller_epoch=model.controller_epoch,
+            sequence=model.sequence,
+            fatal_errors=tuple(
+                SanitizedInventoryError(code=error.error_class)
+                for error in model.fatal_errors
+            ),
+        )
+        result = await self.store.finalize_snapshot(
+            model.ticket_token,
+            model.ticket_id,
+            model.snapshot_id,
+            finalization,
+            scope=scope,
+            transport=authenticated.transport_claim,
+            interval_mutator=(
+                self._pod_reconciler.apply_snapshot
+                if self.settings.shadow_enabled
+                else None
+            ),
+            observation_hook=(
+                self._pod_reconciler.observe_snapshot
+                if self.settings.shadow_enabled
+                else None
+            ),
+            reconcile_intervals=self.settings.shadow_enabled,
+        )
+        return {
+            "snapshot_id": str(result.snapshot_id),
+            "complete": result.complete,
+            "present_items": result.present_items,
+            "invalid_items": result.invalid_items,
+            "confirmed_intervals": result.confirmed_intervals,
+            "closed_intervals": result.closed_intervals,
+            "pending_valid_items": result.pending_valid_items,
+            "shadow_comparisons": result.shadow_comparisons,
+            "replayed": result.replayed,
+        }
+
+    async def watch_apply(self, request: Request) -> dict[str, Any]:
+        model, authenticated = await self._authenticated(
+            request,
+            InventoryWatchApply,
+            request_kind="watch-event",
+            maximum_bytes=WATCH_BODY_LIMIT,
+        )
+        if not self.settings.shadow_enabled:
+            raise IngestionRequestError(403, "watch ingestion is not enabled")
+        await self._require_generation(model.leader_generation)
+        observation = model.observation
+        scope = self._scope(observation.scope, authenticated.collector_id)
+        item = (
+            None if observation.item is None else self._inventory_item(observation.item)
+        )
+        lifecycle = {} if item is None else item.normalized_item.get("lifecycle", {})
+        terminal = isinstance(lifecycle, dict) and lifecycle.get("terminal") is True
+        event_kind = WatchEventKind(observation.event_type)
+        event = WatchObjectEvent(
+            event_type=event_kind,
+            resource_version=observation.resource_version,
+            collector_observed_at=observation.collector_observed_at,
+            event_bytes=observation.source_event_bytes,
+            item=(
+                item
+                if event_kind in {WatchEventKind.ADDED, WatchEventKind.MODIFIED}
+                else None
+            ),
+            source_kind=(
+                item.source_kind
+                if event_kind is WatchEventKind.DELETED and item
+                else None
+            ),
+            source_uid=(
+                item.source_uid
+                if event_kind is WatchEventKind.DELETED and item
+                else None
+            ),
+            terminal=(
+                terminal
+                if event_kind in {WatchEventKind.ADDED, WatchEventKind.MODIFIED}
+                else False
+            ),
+        )
+        result = await self.store.apply_watch_event(
+            model.ticket_token,
+            model.ticket_id,
+            model.event_id,
+            authenticated.transport_claim.request_digest,
+            model.expected_resource_version,
+            event,
+            scope=scope,
+            transport=authenticated.transport_claim,
+            interval_mutator=(
+                self._pod_reconciler.apply_watch
+                if self.settings.shadow_enabled
+                else None
+            ),
+        )
+        return {
+            "event_id": str(result.event_id),
+            "resource_version": result.resource_version,
+            "mutation_action": str(result.mutation_action),
+            "session_consumed": result.session_consumed,
+            "replayed": result.replayed,
+        }
+
+    async def watch_finish(self, request: Request) -> dict[str, Any]:
+        model, authenticated = await self._authenticated(
+            request,
+            InventoryWatchFinish,
+            request_kind="watch-finish",
+            maximum_bytes=WATCH_BODY_LIMIT,
+        )
+        if not self.settings.shadow_enabled:
+            raise IngestionRequestError(403, "watch ingestion is not enabled")
+        await self._require_generation(model.leader_generation)
+        scope = self._scope(model.scope, authenticated.collector_id)
+        if model.history_lost:
+            assert model.history_event_id is not None
+            assert model.gap_reason is not None
+            claim: TransportNonceClaim = replace(
+                authenticated.transport_claim, request_kind="watch-history-lost"
+            )
+            result = await self.store.record_watch_gap(
+                model.ticket_token,
+                model.ticket_id,
+                model.history_event_id,
+                authenticated.transport_claim.request_digest,
+                model.committed_resource_version,
+                gap_reason=model.gap_reason.value,
+                alternate_expected_resource_version=(model.ambiguous_resource_version),
+                scope=scope,
+                transport=claim,
+                event_bytes=0,
+                collector_observed_at=model.completed_at,
+            )
+            return {
+                "history_lost": True,
+                "coverage_gap_id": (
+                    str(result.coverage_gap_id) if result.coverage_gap_id else None
+                ),
+                "replayed": result.replayed,
+            }
+        consumed = await self.store.finish_watch_session(
+            model.ticket_token,
+            model.ticket_id,
+            scope=scope,
+            transport=authenticated.transport_claim,
+        )
+        return {"history_lost": False, "consumed": consumed}
+
+
+async def dispatch_ingestion_request(
+    service: InfrastructureIngestionService | None,
+    operation: IngestionOperation,
+    request: Request,
+) -> dict[str, Any]:
+    """Call one fixed ingestion operation with a sanitized failure contract."""
+
+    if service is None:
+        raise IngestionRequestError(503, "infrastructure ingestion is unavailable")
+    handler = cast(Any, getattr(service, operation))
+    try:
+        return cast(dict[str, Any], await handler(request))
+    except IngestionRequestError:
+        raise
+    except InventoryContractError as exc:
+        raise IngestionRequestError(400, "invalid inventory contract") from exc
+    except InventoryFenceError as exc:
+        raise IngestionRequestError(409, "inventory generation conflict") from exc
+    except InventoryRecoveryRequired as exc:
+        raise IngestionRequestError(409, "inventory recovery required") from exc
+    except InventoryConflictError as exc:
+        raise IngestionRequestError(409, "inventory state conflict") from exc
+    except InventoryTicketError as exc:
+        raise IngestionRequestError(409, "inventory grant unavailable") from exc
+    except asyncpg.PostgresError as exc:
+        raise IngestionRequestError(
+            503, "infrastructure ingestion is unavailable"
+        ) from exc
+
+
+async def run_inventory_generation_loop(
+    stop: asyncio.Event,
+    store: InventoryStore,
+    *,
+    cleanup_interval_seconds: float = 300.0,
+    snapshot_item_retention: timedelta = timedelta(days=7),
+    diagnostic_retention: timedelta = timedelta(days=35),
+    abandoned_staging_retention: timedelta = timedelta(hours=24),
+) -> None:
+    """Own one database fencing generation for exactly one leader tenure.
+
+    Cleanup is deliberately bounded per wake-up so a backlog cannot monopolize
+    the singleton leader.  A full batch is drained again immediately, up to the
+    pass cap; anything left is safely picked up on the next interval.
+    """
+
+    if cleanup_interval_seconds <= 0:
+        raise ValueError("cleanup interval must be positive")
+    generation = await store.activate_generation()
+    logger.info(
+        "infrastructure inventory generation activated generation=%s", generation
+    )
+    try:
+        while not stop.is_set():
+            nonce_more = True
+            diagnostics_more = True
+            for _ in range(_MAX_CLEANUP_PASSES):
+                if stop.is_set():
+                    break
+                if nonce_more:
+                    try:
+                        nonce_count = await store.purge_expired_transport_nonces(
+                            limit=_CLEANUP_BATCH_LIMIT
+                        )
+                        nonce_more = nonce_count == _CLEANUP_BATCH_LIMIT
+                    except Exception as exc:
+                        nonce_more = False
+                        logger.warning(
+                            "infrastructure inventory nonce cleanup failed class=%s",
+                            type(exc).__name__,
+                        )
+                if diagnostics_more:
+                    try:
+                        purge_result = await store.purge_diagnostics(
+                            generation,
+                            snapshot_item_retention=snapshot_item_retention,
+                            diagnostic_retention=diagnostic_retention,
+                            abandoned_staging_retention=(abandoned_staging_retention),
+                            limit=_CLEANUP_BATCH_LIMIT,
+                        )
+                        diagnostics_more = purge_result.might_have_more
+                    except Exception as exc:
+                        diagnostics_more = False
+                        logger.warning(
+                            "infrastructure inventory diagnostic cleanup failed "
+                            "class=%s",
+                            type(exc).__name__,
+                        )
+                if not nonce_more and not diagnostics_more:
+                    break
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=cleanup_interval_seconds)
+            except TimeoutError:
+                pass
+    finally:
+        await store.deactivate_generation(generation)
+        logger.info(
+            "infrastructure inventory generation deactivated generation=%s",
+            generation,
+        )
+
+
+__all__ = [
+    "InfrastructureIngestionService",
+    "dispatch_ingestion_request",
+    "run_inventory_generation_loop",
+]

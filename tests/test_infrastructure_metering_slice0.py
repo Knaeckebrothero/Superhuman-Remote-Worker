@@ -12,6 +12,10 @@ from orchestrator.services.infrastructure_metering.capabilities import (
     REQUIRED_APP_TABLES,
     REQUIRED_APP_TRIGGER_RELATIONS,
     REQUIRED_APP_TRIGGERS,
+    REQUIRED_SLICE1_APP_INDEXES,
+    REQUIRED_SLICE1_APP_TABLES,
+    REQUIRED_SLICE1_APP_TRIGGER_RELATIONS,
+    REQUIRED_SLICE1_APP_TRIGGERS,
     REQUIRED_AUDIT_COLUMNS,
     REQUIRED_AUDIT_CONSTRAINTS,
     REQUIRED_AUDIT_INDEXES,
@@ -50,17 +54,22 @@ def _read_capabilities() -> MeteringSchemaCapabilities:
 
 
 class _CapabilityPool:
-    def __init__(self, *, app: bool, append_mode: str = "O"):
+    def __init__(self, *, app: bool, append_mode: str = "O", slice1: bool = False):
         self.app = app
         self.append_mode = append_mode
+        self.slice1 = slice1
 
     async def fetch(self, sql, *params):
         wanted = set(params[0]) if params else set()
         if "information_schema.tables" in sql:
             present = REQUIRED_APP_TABLES if self.app else REQUIRED_AUDIT_TABLES
+            if self.app and self.slice1:
+                present |= REQUIRED_SLICE1_APP_TABLES
             return [{"table_name": name} for name in wanted & present]
         if "pg_indexes" in sql:
             present = REQUIRED_APP_INDEXES if self.app else REQUIRED_AUDIT_INDEXES
+            if self.app and self.slice1:
+                present |= REQUIRED_SLICE1_APP_INDEXES
             return [{"indexname": name} for name in wanted & present]
         if "information_schema.columns" in sql:
             return [{"column_name": name} for name in wanted & REQUIRED_AUDIT_COLUMNS]
@@ -68,13 +77,18 @@ class _CapabilityPool:
             return [{"conname": name} for name in wanted & REQUIRED_AUDIT_CONSTRAINTS]
         if "FROM pg_trigger" in sql:
             if self.app:
+                relations = dict(REQUIRED_APP_TRIGGER_RELATIONS)
+                if self.slice1:
+                    relations.update(REQUIRED_SLICE1_APP_TRIGGER_RELATIONS)
                 return [
                     {
                         "tgname": name,
                         "enabled": "O",
-                        "relname": REQUIRED_APP_TRIGGER_RELATIONS[name],
+                        "relname": relations[name],
                     }
-                    for name in wanted & REQUIRED_APP_TRIGGERS
+                    for name in wanted
+                    & (REQUIRED_APP_TRIGGERS | REQUIRED_SLICE1_APP_TRIGGERS)
+                    if name in relations
                 ]
             return [
                 {
@@ -114,6 +128,14 @@ async def test_capability_probe_requires_normal_write_triggers_and_seed_rows():
     assert capabilities.append_only_trigger
     assert capabilities.app_seed_rows_ready
     assert capabilities.slice0_ready
+    assert not capabilities.slice1_inventory_ready
+
+    capabilities = await probe_schema_capabilities(
+        _CapabilityPool(app=True, slice1=True),  # type: ignore[arg-type]
+        None,
+    )
+    assert capabilities.slice1_inventory_ready
+    assert not capabilities.slice0_ready
 
 
 def test_settings_are_off_by_default_and_publication_fails_closed():
@@ -144,6 +166,7 @@ def test_settings_accept_only_explicit_boolean_values():
             "INFRASTRUCTURE_METERING_SHADOW_ENABLED": "true",
             "INFRASTRUCTURE_METERING_PUBLICATION_ENABLED": "yes",
             "INFRASTRUCTURE_METERING_STABLE_CLUSTER_ID": " dev-cluster ",
+            "INFRASTRUCTURE_METERING_NAMESPACE_ALLOWLIST": "srw",
         }
     )
     assert settings.publication_enabled
@@ -152,6 +175,70 @@ def test_settings_accept_only_explicit_boolean_values():
     with pytest.raises(ValueError, match="stable cluster id"):
         InfrastructureMeteringSettings.from_env(
             {"INFRASTRUCTURE_METERING_STABLE_CLUSTER_ID": "not a cluster/id"}
+        )
+
+
+def test_slice1_collector_settings_are_bounded_and_fail_closed():
+    settings = InfrastructureMeteringSettings.from_env(
+        {
+            "INFRASTRUCTURE_METERING_COLLECTOR_ENABLED": "true",
+            "INFRASTRUCTURE_METERING_STABLE_CLUSTER_ID": "dev-cluster",
+            "INFRASTRUCTURE_METERING_NAMESPACE_ALLOWLIST": "srw,agents,srw",
+            "INFRASTRUCTURE_METERING_LIST_PAGE_SIZE": "250",
+            "INFRASTRUCTURE_METERING_MAX_SNAPSHOT_ITEMS": "25000",
+            "INFRASTRUCTURE_METERING_SNAPSHOT_ITEM_RETENTION_DAYS": "14",
+            "INFRASTRUCTURE_METERING_DIAGNOSTIC_RETENTION_DAYS": "42",
+            "INFRASTRUCTURE_METERING_CLEANUP_INTERVAL_SECONDS": "120",
+        }
+    )
+    assert settings.namespace_allowlist == ("srw", "agents")
+    assert settings.list_page_size == 250
+    assert settings.max_snapshot_items == 25_000
+    assert settings.snapshot_item_retention_days == 14
+    assert settings.diagnostic_retention_days == 42
+    assert settings.cleanup_interval_seconds == 120
+
+    with pytest.raises(ValueError, match="stable cluster id"):
+        InfrastructureMeteringSettings.from_env(
+            {"INFRASTRUCTURE_METERING_COLLECTOR_ENABLED": "true"}
+        )
+    with pytest.raises(ValueError, match="at least one namespace"):
+        InfrastructureMeteringSettings.from_env(
+            {
+                "INFRASTRUCTURE_METERING_COLLECTOR_ENABLED": "true",
+                "INFRASTRUCTURE_METERING_STABLE_CLUSTER_ID": "dev-cluster",
+            }
+        )
+    with pytest.raises(ValueError, match="in-process collection is not implemented"):
+        InfrastructureMeteringSettings.from_env(
+            {
+                "INFRASTRUCTURE_METERING_COLLECTOR_ENABLED": "true",
+                "INFRASTRUCTURE_METERING_STABLE_CLUSTER_ID": "dev-cluster",
+                "INFRASTRUCTURE_METERING_NAMESPACE_ALLOWLIST": "srw",
+                "INFRASTRUCTURE_METERING_DEPLOYMENT_MODE": "in-process",
+            }
+        )
+    with pytest.raises(ValueError, match="invalid Kubernetes namespaces"):
+        InfrastructureMeteringSettings.from_env(
+            {"INFRASTRUCTURE_METERING_NAMESPACE_ALLOWLIST": "srw,Not_Valid"}
+        )
+    with pytest.raises(ValueError, match="between 15 and 86400"):
+        InfrastructureMeteringSettings.from_env(
+            {"INFRASTRUCTURE_METERING_RELIST_INTERVAL_SECONDS": "1"}
+        )
+    with pytest.raises(ValueError, match="stale-after"):
+        InfrastructureMeteringSettings.from_env(
+            {
+                "INFRASTRUCTURE_METERING_RELIST_INTERVAL_SECONDS": "600",
+                "INFRASTRUCTURE_METERING_STALE_AFTER_SECONDS": "300",
+            }
+        )
+    with pytest.raises(ValueError, match="diagnostic retention"):
+        InfrastructureMeteringSettings.from_env(
+            {
+                "INFRASTRUCTURE_METERING_SNAPSHOT_ITEM_RETENTION_DAYS": "30",
+                "INFRASTRUCTURE_METERING_DIAGNOSTIC_RETENTION_DAYS": "14",
+            }
         )
 
 
@@ -735,3 +822,26 @@ async def test_usage_v2_does_not_echo_server_contract_failures_as_client_errors(
 
     assert raised.value.status_code == 500
     assert raised.value.detail == "Usage API v2 query failed"
+
+
+def test_internal_inventory_ingestion_routes_are_hidden_from_openapi():
+    import main as orchestrator_main
+
+    prefix = "/api/internal/infrastructure-metering/v1"
+    expected = {
+        f"{prefix}/tickets",
+        f"{prefix}/snapshots/begin",
+        f"{prefix}/snapshots/items",
+        f"{prefix}/snapshots/finalize",
+        f"{prefix}/watch/apply",
+        f"{prefix}/watch/finish",
+    }
+    routes = {
+        route.path: route
+        for route in orchestrator_main.app.routes
+        if getattr(route, "path", "") in expected
+    }
+
+    assert set(routes) == expected
+    assert all(route.methods == {"POST"} for route in routes.values())
+    assert all(not route.include_in_schema for route in routes.values())

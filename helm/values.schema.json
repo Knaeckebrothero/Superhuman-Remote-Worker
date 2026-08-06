@@ -171,6 +171,54 @@
         "collectorEnabled": { "type": "boolean" },
         "shadowEnabled": { "type": "boolean" },
         "publicationEnabled": { "type": "boolean" },
+        "deploymentMode": {
+          "type": "string",
+          "enum": ["dedicated", "in-process"]
+        },
+        "namespaceAllowlist": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$"
+          },
+          "uniqueItems": true
+        },
+        "relistIntervalSeconds": { "type": "integer", "minimum": 15, "maximum": 86400 },
+        "staleAfterSeconds": { "type": "integer", "minimum": 30, "maximum": 604800 },
+        "listPageSize": { "type": "integer", "minimum": 1, "maximum": 5000 },
+        "scopeConcurrency": { "type": "integer", "minimum": 1, "maximum": 32 },
+        "watchQueueSize": { "type": "integer", "minimum": 100, "maximum": 1000000 },
+        "maxSnapshotItems": { "type": "integer", "minimum": 1, "maximum": 1000000 },
+        "maxSnapshotBytes": { "type": "integer", "minimum": 1048576, "maximum": 1073741824 },
+        "ingestionTicketTtlSeconds": { "type": "integer", "minimum": 10, "maximum": 600 },
+        "snapshotItemRetentionDays": { "type": "integer", "minimum": 7, "maximum": 365 },
+        "diagnosticRetentionDays": { "type": "integer", "minimum": 7, "maximum": 3650 },
+        "cleanupIntervalSeconds": { "type": "integer", "minimum": 30, "maximum": 3600 },
+        "ingestionSecretName": { "type": "string" },
+        "ingestionSecretKey": { "type": "string", "minLength": 1 },
+        "networkPolicy": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "allowUnrestrictedEgress": { "type": "boolean" },
+            "apiServerCidrs": {
+              "type": "array",
+              "items": { "type": "string", "minLength": 1 },
+              "uniqueItems": true
+            },
+            "dnsNamespace": {
+              "type": "string",
+              "pattern": "^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$"
+            },
+            "dnsPodSelector": {
+              "type": "object",
+              "minProperties": 1,
+              "additionalProperties": { "type": "string", "minLength": 1 }
+            }
+          },
+          "additionalProperties": false
+        },
+        "resources": { "type": "object" },
         "stableClusterId": {
           "type": "string",
           "maxLength": 128,
