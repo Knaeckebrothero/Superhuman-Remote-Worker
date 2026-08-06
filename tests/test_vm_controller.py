@@ -68,10 +68,31 @@ _mock_k8s_client.CustomObjectsApi = MagicMock  # type: ignore[attr-defined]
 _mock_k8s.client = _mock_k8s_client  # type: ignore[attr-defined]
 _mock_k8s.config = _mock_k8s_config  # type: ignore[attr-defined]
 _mock_k8s_config.load_incluster_config = MagicMock()  # type: ignore[attr-defined]
-sys.modules["kubernetes"] = _mock_k8s
-sys.modules["kubernetes.client"] = _mock_k8s_client
-sys.modules["kubernetes.config"] = _mock_k8s_config
-sys.modules["kubernetes.client.exceptions"] = _mock_k8s_exc
+
+_K8S_STUB_MODULES = {
+    "kubernetes": _mock_k8s,
+    "kubernetes.client": _mock_k8s_client,
+    "kubernetes.config": _mock_k8s_config,
+    "kubernetes.client.exceptions": _mock_k8s_exc,
+}
+# Whatever was there before us — the real client is a declared orchestrator
+# dependency, so on a full-suite run this is usually the genuine package.
+_REAL_K8S_MODULES = {name: sys.modules.get(name) for name in _K8S_STUB_MODULES}
+
+
+def _install_k8s_stubs() -> None:
+    sys.modules.update(_K8S_STUB_MODULES)
+
+
+def _restore_k8s_modules() -> None:
+    for name, real in _REAL_K8S_MODULES.items():
+        if real is None:
+            sys.modules.pop(name, None)
+        else:
+            sys.modules[name] = real
+
+
+_install_k8s_stubs()
 
 # --- nats -------------------------------------------------------------------
 _mock_nats = types.ModuleType("nats")
@@ -89,6 +110,27 @@ from vm.controller.controller import (  # noqa: E402
     VM_NAMESPACE,
     VMController,
 )
+
+_restore_k8s_modules()
+
+
+@pytest.fixture(autouse=True, scope="module")
+def _kubernetes_stubs_live_for_this_module():
+    """Keep the stubs installed only while THIS module's tests run.
+
+    The controller imports ``kubernetes`` lazily inside its methods (``init_k8s``
+    and every ``except ApiException`` site), so the stubs must be live during the
+    tests — but leaving them in ``sys.modules`` for the whole session shadowed the
+    real client for everyone else, and the stub is missing attributes the real one
+    has (``load_kube_config``, ``CoreV1Api``). That broke
+    ``tests/test_infrastructure_metering_collector_runtime.py`` on full-suite runs.
+    """
+
+    _install_k8s_stubs()
+    try:
+        yield
+    finally:
+        _restore_k8s_modules()
 
 
 # =============================================================================
