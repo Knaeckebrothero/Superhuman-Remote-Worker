@@ -1243,9 +1243,16 @@ CREATE FUNCTION public.resource_inventory_snapshot_item_size_bytes(source_kind t
          + octet_length(source_kind)::BIGINT
          + octet_length(source_uid)::BIGINT
          + COALESCE(octet_length(revision_hash), 0)::BIGINT
-         + pg_column_size(normalized_item)::BIGINT
-         + COALESCE(pg_column_size(item_error), 0)::BIGINT
+         + octet_length(normalized_item::TEXT)::BIGINT
+         + COALESCE(octet_length(item_error::TEXT), 0)::BIGINT
 $$;
+
+
+--
+-- Name: FUNCTION resource_inventory_snapshot_item_size_bytes(source_kind text, source_uid text, revision_hash text, normalized_item jsonb, item_error jsonb); Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON FUNCTION public.resource_inventory_snapshot_item_size_bytes(source_kind text, source_uid text, revision_hash text, normalized_item jsonb, item_error jsonb) IS 'Deterministic logical payload bytes for snapshot bounds; never physical TOAST size.';
 
 
 --
