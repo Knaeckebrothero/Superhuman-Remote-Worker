@@ -40,6 +40,16 @@ def test_dedicated_metering_collector_renders_only_with_scoped_pod_reads():
             "env"
         ]
     }
+    disabled_configmap = next(
+        item
+        for item in disabled_objects
+        if item["kind"] == "ConfigMap"
+        and "INFRASTRUCTURE_METERING_MAX_SNAPSHOT_BYTES" in item.get("data", {})
+    )
+    assert (
+        disabled_configmap["data"]["INFRASTRUCTURE_METERING_MAX_SNAPSHOT_BYTES"]
+        == "67108864"
+    )
     assert (
         disabled_env["INFRASTRUCTURE_METERING_INGESTION_KEY"]["valueFrom"][
             "secretKeyRef"

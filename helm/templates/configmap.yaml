@@ -276,7 +276,7 @@ data:
   INFRASTRUCTURE_METERING_SCOPE_CONCURRENCY: {{ .Values.infrastructureMetering.scopeConcurrency | default 2 | quote }}
   INFRASTRUCTURE_METERING_WATCH_QUEUE_SIZE: {{ .Values.infrastructureMetering.watchQueueSize | default 10000 | quote }}
   INFRASTRUCTURE_METERING_MAX_SNAPSHOT_ITEMS: {{ .Values.infrastructureMetering.maxSnapshotItems | default 50000 | quote }}
-  INFRASTRUCTURE_METERING_MAX_SNAPSHOT_BYTES: {{ .Values.infrastructureMetering.maxSnapshotBytes | default 67108864 | quote }}
+  INFRASTRUCTURE_METERING_MAX_SNAPSHOT_BYTES: {{ .Values.infrastructureMetering.maxSnapshotBytes | default 67108864 | int64 | quote }}
   INFRASTRUCTURE_METERING_INGESTION_TICKET_TTL_SECONDS: {{ .Values.infrastructureMetering.ingestionTicketTtlSeconds | default 600 | quote }}
   INFRASTRUCTURE_METERING_SNAPSHOT_ITEM_RETENTION_DAYS: {{ .Values.infrastructureMetering.snapshotItemRetentionDays | default 7 | quote }}
   INFRASTRUCTURE_METERING_DIAGNOSTIC_RETENTION_DAYS: {{ .Values.infrastructureMetering.diagnosticRetentionDays | default 35 | quote }}
