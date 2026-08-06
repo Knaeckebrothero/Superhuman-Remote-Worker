@@ -8,6 +8,7 @@ Output: one line per endpoint in stable sort order:
 Classifications:
   gated:<gate>     — at least one known gate call in the body or signature
   admin:_require_admin
+  internal:<gate>  — authenticated non-user service boundary
   public:<reason>  — opt-out via `# nosec: public <reason>` comment on the
                      line immediately above the decorator
   unscoped         — no gate found; would fail the C2 snapshot test
@@ -45,8 +46,12 @@ HTTP_METHODS = {"get", "post", "put", "patch", "delete"}
 # are also gates — even an auth-only gate beats no gate. P4b added
 # ``require_internal`` (shared-secret bootstrap for agent ↔ orchestrator)
 # and ``require_internal_or_job_access`` (hybrid: agent key bypasses user
-# auth, otherwise normal job access check).
+# auth, otherwise normal job access check). Infrastructure-metering routes use
+# a separate HMAC-signed collector credential; their shared dispatch boundary
+# authenticates the exact method, path, body digest, timestamp, and nonce before
+# invoking an ingestion operation.
 GATE_NAMES = {
+    "_dispatch_infrastructure_ingestion",
     "_require_admin",
     "is_internal_call",
     "require_approved_user",
@@ -239,6 +244,7 @@ def _classify(
         "user_can_access_datasource": 1,
         "user_can_access_ide_entity": 1,
         "_require_admin": 2,
+        "_dispatch_infrastructure_ingestion": 2,
         "require_internal": 2,
         "is_internal_call": 2,
         "require_approved_user": 3,
@@ -246,7 +252,11 @@ def _classify(
     primary = sorted(gates, key=lambda g: priority.get(g, 99))[0]
     if primary == "_require_admin":
         return f"admin:{primary}"
-    if primary in ("require_internal", "is_internal_call"):
+    if primary in (
+        "_dispatch_infrastructure_ingestion",
+        "require_internal",
+        "is_internal_call",
+    ):
         return f"internal:{primary}"
     return f"gated:{primary}"
 
@@ -356,7 +366,7 @@ def render_manifest(endpoints: list[Endpoint]) -> str:
         "# Classifications:\n"
         "#   gated:<gate>           — protected by a require_* / user_can_access_* helper\n"
         "#   admin:_require_admin   — admin-only\n"
-        "#   internal:<helper>      — P4b shared-secret (X-Internal-Key) — agent ↔ orchestrator\n"
+        "#   internal:<helper>      — authenticated non-user service boundary\n"
         "#   public:<reason>        — opt-out via `# nosec: public <reason>` on line above decorator\n"
         "#   unscoped               — no gate detected; CI snapshot test will fail\n"
         "\n"
