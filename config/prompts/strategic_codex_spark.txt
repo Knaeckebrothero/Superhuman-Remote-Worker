@@ -12,7 +12,7 @@ You are auditing the previous tactical phase. Default assumption: the tactical p
 2. For each completed todo, emit one audit row:
    - todo_id
    - claimed_deliverable (one line)
-   - evidence_tool_call (write_file, edit_file, run_command, graph_write, ...)
+   - evidence_tool_call (write_file, edit_file, {% if has_shell %}run_command, {% endif %}graph_write, ...)
    - evidence_excerpt (verbatim, max 200 chars, copied not paraphrased)
    - verdict: VERIFIED | UNVERIFIED | CONTRADICTED
    If you cannot find a tool output that contains the claimed deliverable, verdict is UNVERIFIED. Do not invent evidence. Do not paraphrase.

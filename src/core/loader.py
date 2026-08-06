@@ -10,8 +10,9 @@ import logging
 import os
 import re
 from dataclasses import dataclass, field, fields as dataclass_fields
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 import yaml
 from langchain_core.language_models import BaseChatModel
@@ -947,6 +948,34 @@ class FileResolver:
 PromptResolver = FileResolver
 
 
+def _has_shell_tools(tool_set: Set[str]) -> bool:
+    """Whether a real shell-execution tool is actually bound for this agent.
+
+    Derived from ``TOOL_REGISTRY``'s ``category`` rather than a hardcoded name
+    list: the shell tools are mid-rename (one job toolset shared by
+    sessions/MCP/officers, no aliases), and a stale name list here would
+    silently re-open the prompt blocks this gates — the exact failure mode the
+    gate exists to prevent.
+
+    ``grant: "code"`` members of the category are excluded. Those are appended
+    by the agent *after* ``filter_tools_by_backend``, so they are bound on
+    shell-less tiers too — ``srw_cloud_status`` rides in on any active cloud
+    mount. It reports on a mount rather than executing anything, and counting it
+    as proof of a shell would re-open these blocks on precisely the lite-tier
+    sessions they exist to protect.
+    """
+    from src.tools.registry import TOOL_REGISTRY
+
+    for name in tool_set:
+        meta = TOOL_REGISTRY.get(name)
+        if not meta or meta.get("category") != "shell":
+            continue
+        if meta.get("grant") == "code":
+            continue
+        return True
+    return False
+
+
 def render_instruction_content(
     content: str,
     tool_names: List[str],
@@ -956,6 +985,7 @@ def render_instruction_content(
     """Render Jinja2 template markers in instruction file content.
 
     Supports ``{% if has_tool("kb_write") %}`` conditionals,
+    ``{% if has_shell %}`` for blocks that only make sense with a shell,
     ``{% if cli_datasources %}`` for read-write datasource access,
     ``{% if protected_cloud %}`` for the protected-cloud honesty block, and
     ``{{ tools }}`` variable access.  Non-templated content (no ``{%``
@@ -990,6 +1020,7 @@ def render_instruction_content(
     return template.render(
         tools=tool_names,
         has_tool=lambda name: name in tool_set,
+        has_shell=_has_shell_tools(tool_set),
         cli_datasources=list(ds_set),
         has_cli_datasource=lambda ds_type: ds_type in ds_set,
         protected_cloud=protected_cloud,
@@ -4178,6 +4209,52 @@ def scheduled_work_system_floor(
     )
 
 
+# Prefix of the date line every system prompt carries. Kept distinct so
+# ``with_current_date`` can find a stale line and rewrite it where it stands,
+# without disturbing the rest of the prompt.
+_CURRENT_DATE_PREFIX = "Current date:"
+
+
+def current_date_line() -> str:
+    """The one-line UTC date stamp appended to every system prompt.
+
+    The weekday is the load-bearing part, not decoration: opening hours,
+    schedules and "is it a business day" questions are unanswerable without it.
+    An agent that cannot resolve "today" reaches for a shell to run ``date`` —
+    and on the lite workspace tiers there is no shell to reach for.
+    """
+    now = datetime.now(timezone.utc)
+    return f"{_CURRENT_DATE_PREFIX} {now:%Y-%m-%d} ({now:%A}, UTC)"
+
+
+def with_current_date(prompt: str) -> str:
+    """Refresh the prompt's current-date line, appending one if absent.
+
+    An existing line is rewritten *in place* rather than moved to the tail: the
+    managed product guide is deliberately the last thing in the interactive
+    prompt (see ``get_phase_system_prompt``), and the per-turn refresh must not
+    displace it.
+
+    Idempotent, which is what makes that refresh cheap — callers re-apply it
+    without tracking whether a date is already there, and an unchanged date
+    returns the original string so the caller's identity check stays cheap too.
+
+    Day granularity rather than clock time is deliberate. The system message is
+    the head of the provider prompt-cache prefix, so a per-turn timestamp would
+    invalidate that cache on every single turn; a date changes at most once per
+    session-day. Agents needing wall-clock precision still have their tools.
+    """
+    fresh = current_date_line()
+    lines = prompt.split("\n")
+    for i, line in enumerate(lines):
+        if line.startswith(_CURRENT_DATE_PREFIX):
+            if line == fresh:
+                return prompt
+            lines[i] = fresh
+            return "\n".join(lines)
+    return prompt.rstrip() + "\n\n" + fresh
+
+
 def get_phase_system_prompt(
     config: AgentConfig,
     is_strategic: bool,
@@ -4297,6 +4374,10 @@ def get_phase_system_prompt(
         if scheduled_work_floor:
             rendered = f"{rendered}\n\n{scheduled_work_floor}"
 
+        # Stamped before the product-guide floor so the floor stays the tail.
+        # persistent_graph rewrites this line in place on later turns.
+        rendered = with_current_date(rendered)
+
         # Keep the freshness rule at the end of the trusted system message.
         # Long resumed histories and tail-injected memory otherwise put many
         # tokens between this rule and the current turn.
@@ -4382,7 +4463,7 @@ def get_phase_system_prompt(
         level = config.llm.reasoning_level or "high"
         rendered = f"Reasoning: {level}\n\n{rendered}"
 
-    return rendered
+    return with_current_date(rendered)
 
 
 def load_instructions(config: AgentConfig, model: str = "") -> str:

@@ -58,7 +58,7 @@ Rule: Use notes/ to persist important facts and decisions. If you don't write it
 15. Complete todos one at a time. Each todo_complete call must reflect verified work for that specific todo. Never batch-complete multiple todos in a single call to skip past blockers.
 </constraints>
 
-{% if cli_datasources -%}
+{% if cli_datasources and has_shell -%}
 <datasource_access>
 This job has read-write datasource access via named connections. Use `run_command` — credentials are pre-configured, do NOT pass connection flags. Check datasources.md for the exact connection names.
 {% if has_cli_datasource("postgresql") -%}

@@ -13,7 +13,7 @@ You are auditing the previous tactical phase. Your default assumption is that th
 2. **For each completed todo, emit one audit row:**
    - `todo_id`: <id>
    - `claimed_deliverable`: <one-line description of what the todo said it would produce>
-   - `evidence_tool_call`: <tool name whose output proves the work happened — e.g. write_file, edit_file, run_command, graph_write>
+   - `evidence_tool_call`: <tool name whose output proves the work happened — e.g. write_file, edit_file, {% if has_shell %}run_command, {% endif %}graph_write>
    - `evidence_excerpt`: <verbatim excerpt from that tool's output, max 200 chars, COPIED not paraphrased>
    - `verdict`: `VERIFIED` | `UNVERIFIED` | `CONTRADICTED`
 
