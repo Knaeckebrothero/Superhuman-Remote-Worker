@@ -8,7 +8,7 @@
 # Classifications:
 #   gated:<gate>           — protected by a require_* / user_can_access_* helper
 #   admin:_require_admin   — admin-only
-#   internal:<helper>      — P4b shared-secret (X-Internal-Key) — agent ↔ orchestrator
+#   internal:<helper>      — authenticated non-user service boundary
 #   public:<reason>        — opt-out via `# nosec: public <reason>` on line above decorator
 #   unscoped               — no gate detected; CI snapshot test will fail
 
@@ -152,6 +152,12 @@ POST   /api/experts/{expert_id}/duplicate                                       
 GET    /api/experts/{expert_id}/export                                                  gated:require_approved_user
 GET    /api/graph/changes/{job_id}                                                      gated:require_job_access
 GET    /api/health                                                                      public:k8s-liveness-probe
+POST   /api/internal/infrastructure-metering/v1/snapshots/begin                         internal:_dispatch_infrastructure_ingestion
+POST   /api/internal/infrastructure-metering/v1/snapshots/finalize                      internal:_dispatch_infrastructure_ingestion
+POST   /api/internal/infrastructure-metering/v1/snapshots/items                         internal:_dispatch_infrastructure_ingestion
+POST   /api/internal/infrastructure-metering/v1/tickets                                 internal:_dispatch_infrastructure_ingestion
+POST   /api/internal/infrastructure-metering/v1/watch/apply                             internal:_dispatch_infrastructure_ingestion
+POST   /api/internal/infrastructure-metering/v1/watch/finish                            internal:_dispatch_infrastructure_ingestion
 POST   /api/internal/mcp-token-create                                                   internal:require_internal
 POST   /api/internal/mcp-token-verify                                                   internal:require_internal
 DELETE /api/internal/persistent/threads/{thread_id}/canvases/main                       gated:require_thread_owner
