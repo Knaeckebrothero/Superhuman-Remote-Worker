@@ -1375,6 +1375,28 @@ async def code_server_settings_sweeper(shutdown_event: asyncio.Event) -> None:
                 workspaces, container_provisioner, postgres_db
             )
             if workspaces:
+                # Dial-target visibility: stable Service DNS survives pod
+                # restarts; raw IPs are legacy rows predating the headless
+                # Service and go stale with the pod.
+                _dns_dials = sum(
+                    1
+                    for w in workspaces
+                    if str(
+                        (
+                            (_coerce_context(w.get("context")) or {}).get(
+                                "workspace_container"
+                            )
+                            or {}
+                        ).get("host")
+                        or ""
+                    ).endswith(".svc.cluster.local")
+                )
+                logger.info(
+                    "IDE settings sweeper: %d workspace(s), %d dialed via "
+                    "stable service DNS",
+                    len(workspaces),
+                    _dns_dials,
+                )
                 count = await reconcile_ide_settings(store, workspaces, pull_ide_config)
                 if count:
                     logger.info("IDE settings sweeper: synced %d file(s)", count)

@@ -225,17 +225,24 @@ class OpenVsxClassifier:
 def resolve_ssh_target(context: dict) -> Optional[tuple[str, int]]:
     """Resolve a workspace context to an ``(ssh_host, ssh_port)`` pair.
 
-    Mirrors the precedence the snapshot/suspension path uses, extended to
-    restored IDE sessions: container → VM, preferring an in-cluster pod IP over a
-    VM's Tailscale ssh_host. Returns None when no reachable target exists.
+    Container → restored IDE session → VM. For container workspaces the
+    stable per-workspace Service DNS (``workspace_container.host``, the
+    headless Service from `7fb9e9e2`) is preferred over the ephemeral
+    ``pod_ip``: a workspace pod that restarted keeps its Service name but not
+    its IP, and dialing the stale IP was the residual "No route to host"
+    source in the sweeper (docs/done/
+    ide_settings_sweeper_probes_stale_workspace_endpoints.md, residual
+    hardening). ``pod_ip`` stays as the fallback for legacy context rows that
+    predate the headless Service. Returns None when no reachable target
+    exists.
     """
     ws = context.get("workspace_container") or {}
     vm = context.get("vm") or {}
     ide = context.get("ide_session") or {}
 
     host = (
-        ws.get("pod_ip")
-        or ws.get("host")
+        ws.get("host")
+        or ws.get("pod_ip")
         or ide.get("pod_ip")
         or vm.get("ssh_host")
         or vm.get("pod_ip")
@@ -243,7 +250,7 @@ def resolve_ssh_target(context: dict) -> Optional[tuple[str, int]]:
     if not host:
         return None
 
-    if ws.get("pod_ip") or ws.get("host"):
+    if ws.get("host") or ws.get("pod_ip"):
         port = ws.get("port") or DEFAULT_WS_SSH_PORT
     elif ide.get("pod_ip"):
         port = ide.get("ssh_port") or DEFAULT_WS_SSH_PORT
