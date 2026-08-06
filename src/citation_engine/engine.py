@@ -1352,10 +1352,83 @@ class CitationEngine:
             self._chunker = SemanticChunker(embedding_service=None)
         return self._chunker
 
+    @staticmethod
+    def _classify_embed_failure(error: Exception) -> str:
+        """Typed reason for a persisted embedding failure.
+
+        Distinguishes what the old generic "skipping" collapse could not:
+        invalid vectors, config mismatches, exhausted transient retries and
+        provider rejections each need a different recovery.
+        """
+        from src.services.embedding_service import (
+            EmbeddingDimensionError,
+            EmbeddingInvalidVectorError,
+        )
+
+        if isinstance(error, EmbeddingInvalidVectorError):
+            return "invalid_vector"
+        if isinstance(error, EmbeddingDimensionError):
+            return "dimension_mismatch"
+        status = getattr(error, "status_code", None)
+        if status == 429 or (isinstance(status, int) and status >= 500):
+            return "transient_exhausted"
+        if isinstance(status, int):
+            return "provider_rejected"
+        return "error"
+
+    async def _set_embedding_state(
+        self,
+        source_id: int,
+        status: str,
+        *,
+        reason_type: str | None = None,
+        reason: str | None = None,
+        chunks: int | None = None,
+    ) -> None:
+        """Persist per-source embedding state on sources.metadata (fix 5).
+
+        Registration keeps succeeding either way — but a source that missed
+        its embedding is no longer indistinguishable from an indexed one.
+        Best-effort: state bookkeeping must never break the embed path.
+        """
+        state: dict[str, Any] = {
+            "status": status,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        if reason_type:
+            state["reason_type"] = reason_type
+        if reason:
+            state["reason"] = str(reason)[:500]
+        if chunks is not None:
+            state["chunks"] = chunks
+        try:
+            await self.db.execute(
+                """
+                UPDATE sources
+                SET metadata = jsonb_set(
+                    COALESCE(metadata, '{}'::jsonb),
+                    '{embedding_state}',
+                    $2::jsonb
+                )
+                WHERE id = $1
+                """,
+                source_id,
+                json.dumps(state),
+            )
+        except Exception as e:  # noqa: BLE001 — bookkeeping is best-effort
+            log.warning(f"Could not persist embedding state for [{source_id}]: {e}")
+
     async def _auto_embed_source(
         self, source_id: int, content: str, job_uuid: uuid.UUID
     ) -> None:
-        """Auto-embed source content after registration. Silently skips on failure."""
+        """Auto-embed source content after registration.
+
+        Registration still never fails on an embedding problem, but the
+        failure is no longer silent: it lands typed on the source row
+        (``metadata.embedding_state``) and in citation statistics, so
+        semantic-search coverage is observable and backfillable
+        (scripts/backfill_source_embeddings.py).
+        """
         service = self._get_embedding_service()
         if not service:
             return
@@ -1371,7 +1444,14 @@ class CitationEngine:
                 return
             await self._embed_source_content(source_id, content, job_uuid, service)
         except Exception as e:
-            log.warning(f"Auto-embed failed for source [{source_id}], skipping: {e}")
+            reason_type = self._classify_embed_failure(e)
+            log.warning(
+                f"Auto-embed failed for source [{source_id}] "
+                f"({reason_type}), skipping: {e}"
+            )
+            await self._set_embedding_state(
+                source_id, "failed", reason_type=reason_type, reason=str(e)
+            )
 
     async def _embed_source_content(
         self,
@@ -1413,6 +1493,7 @@ class CitationEngine:
                 )
 
         log.info(f"Embedded source [{source_id}]: {len(chunks)} chunks")
+        await self._set_embedding_state(source_id, "complete", chunks=len(chunks))
         return len(chunks)
 
     async def reindex_source(self, source_id: int) -> int:
@@ -1809,7 +1890,42 @@ class CitationEngine:
         }
         stats["citations"]["total"] = sum(stats["citations"]["by_status"].values())
 
+        # Embedding index coverage (fix 5): a source count alone says nothing
+        # about whether semantic search can actually see those sources.
+        try:
+            missing = await self.db.fetchval(
+                """
+                SELECT COUNT(*) FROM job_sources js
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM source_embeddings se
+                    WHERE se.source_id = js.source_id AND se.job_id = js.job_id
+                )
+                """
+            )
+            embedded_sources = await self.db.fetchval(
+                "SELECT COUNT(DISTINCT source_id) FROM source_embeddings"
+            )
+            failed_rows = await self.db.fetch(
+                """
+                SELECT metadata->'embedding_state'->>'reason_type' AS reason_type,
+                       COUNT(*) AS count
+                FROM sources
+                WHERE metadata->'embedding_state'->>'status' = 'failed'
+                GROUP BY 1
+                """
+            )
+            stats["sources"]["embedding_coverage"] = {
+                "embedded_sources": embedded_sources or 0,
+                "job_source_pairs_missing_embeddings": missing or 0,
+                "failed_by_reason": {
+                    (r["reason_type"] or "error"): r["count"] for r in failed_rows
+                },
+            }
+        except Exception as e:  # noqa: BLE001 — stats must not fail the caller
+            log.warning(f"Embedding coverage stats unavailable: {e}")
+
         log.debug(
-            f"Statistics: {stats['sources']['total']} sources, {stats['citations']['total']} citations"
+            f"Statistics: {stats['sources']['total']} sources, "
+            f"{stats['citations']['total']} citations"
         )
         return stats

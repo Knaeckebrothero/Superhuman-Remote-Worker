@@ -18,9 +18,22 @@ aliases:
 
 **Filed:** 2026-08-04 from the five-job main-cluster overnight Scholar batch.
 
-**Status:** **OPEN. P1 research-quality and load defect.** Source registration
-and direct citations continue, so jobs can complete, but semantic/hybrid source
-search operates over a substantially incomplete embedding index.
+**Status:** **FIX SHIPPED 2026-08-06 (batch #3) — operational backfill still
+owed.** Fixes 1–5 built at the single seam: `EmbeddingService.embed_batch`
+now splits at a configurable provider cap (`EMBEDDING_MAX_BATCH_SIZE`,
+default 64) with global order preserved, retries transient classes only
+(shared `llm_retry` policy; deterministic 422/400 pinned via `never_retry`),
+rejects NaN/Inf vectors with typed `EmbeddingInvalidVectorError`, and the
+CitationEngine persists per-source `metadata.embedding_state`
+(complete/failed + typed reason) surfaced in `get_statistics()` as
+`sources.embedding_coverage`. Fix 6 shipped as
+`scripts/backfill_source_embeddings.py` (dry-run default / `--apply`).
+Verified: `tests/test_embedding_batch_limit.py` 13/13 against a mock
+64-cap-422 provider (TEI-exact), and the backfill dry-run against the k3d
+vector DB reported the live gap (54 (job, source) pairs across 5 jobs).
+**Remaining:** run the backfill with `--apply` against the main cluster
+(where the 359 skipped sources live) and re-run a source-heavy job to
+confirm zero oversize 422s (final acceptance criterion).
 
 ## Live evidence
 
