@@ -232,6 +232,88 @@ def test_unstick_no_longer_requires_all_children_failed():
     assert "verification_rounds" in sql
 
 
+class TestUnstickReviewingParentsWallclock:
+    """The wall-clock arm — fix direction 2 of
+    docs/issues/rejected_verdict_livelocks_critic_and_wedges_parent.md.
+    """
+
+    @pytest.mark.asyncio
+    async def test_sql_targets_live_critics_with_distinct_message(self):
+        conn = AsyncMock()
+        conn.fetch = AsyncMock(
+            return_value=[{"id": "p1", "user_id": "u1", "config_name": "scholar"}]
+        )
+        db = _make_db(conn)
+
+        rows = await db.unstick_reviewing_parents_wallclock(60)
+
+        assert rows == [{"id": "p1", "user_id": "u1", "config_name": "scholar"}]
+        args = conn.fetch.await_args.args
+        sql = args[0]
+        # The complement of the dead-critic arm: requires a LIVE critic
+        # (EXISTS, not NOT EXISTS) so the two arms stay disjoint, and carries
+        # the distinct did-not-render-a-verdict message.
+        assert "status = 'pending_review'" in sql
+        assert "p.status = 'reviewing'" in sql
+        assert "make_interval" in sql
+        assert "AND EXISTS" in sql
+        assert "NOT EXISTS" not in sql
+        assert "critic did not render a verdict in" in sql
+        assert "RETURNING" in sql
+        assert args[1] == 60
+
+    def test_both_arms_share_the_live_critic_status_set(self):
+        """The EXISTS/NOT EXISTS predicates must agree on what "live" means,
+        or a critic status could fall through both arms (or into both)."""
+        from orchestrator.database.postgres import PostgresDB
+
+        live_set = "'created', 'processing', 'paused', 'waiting',"
+        assert live_set in PostgresDB._UNSTICK_REVIEWING_SQL
+        assert live_set in PostgresDB._UNSTICK_REVIEWING_WALLCLOCK_SQL
+
+    @pytest.mark.asyncio
+    async def test_tick_runs_wallclock_arm_when_enabled(self):
+        db = AsyncMock()
+        db.cancel_stale_verification_subjobs = AsyncMock(return_value=0)
+        db.unstick_reviewing_parents = AsyncMock(return_value=[])
+        db.unstick_reviewing_parents_wallclock = AsyncMock(
+            return_value=[{"id": "p9", "user_id": "u9", "config_name": "scholar"}]
+        )
+        notifier = AsyncMock()
+
+        cancelled, unstuck = await _sweep_tick(
+            db,
+            stale_hours=6,
+            grace_minutes=30,
+            notifier=notifier,
+            wallclock_minutes=60,
+        )
+
+        assert (cancelled, unstuck) == (0, 1)
+        db.unstick_reviewing_parents_wallclock.assert_awaited_once_with(60)
+        notifier.notify_review_returned_to_manual.assert_awaited_once_with(
+            user_id="u9", job_id="p9", config_name="scholar"
+        )
+
+    @pytest.mark.asyncio
+    async def test_tick_skips_wallclock_arm_by_default_and_when_disabled(self):
+        for wallclock in (None, 0):
+            db = AsyncMock()
+            db.cancel_stale_verification_subjobs = AsyncMock(return_value=0)
+            db.unstick_reviewing_parents = AsyncMock(return_value=[])
+            notifier = AsyncMock()
+
+            kwargs = {}
+            if wallclock is not None:
+                kwargs["wallclock_minutes"] = wallclock
+            cancelled, unstuck = await _sweep_tick(
+                db, stale_hours=6, grace_minutes=30, notifier=notifier, **kwargs
+            )
+
+            assert (cancelled, unstuck) == (0, 0)
+            db.unstick_reviewing_parents_wallclock.assert_not_awaited()
+
+
 def test_sweeper_reaps_waiting_critics_and_still_reaps_paused():
     """`waiting` critics are orphans of the retired inter-round parking
     mechanism (docs/issues/stale_critic_waiting_status_escapes_reaper.md) and

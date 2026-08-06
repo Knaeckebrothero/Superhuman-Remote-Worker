@@ -5271,11 +5271,35 @@ async def _provision_parent_workspace_for_scholar(job: dict, parent_id: str) -> 
         },
     )
     if res.outcome is EnsureOutcome.FAILED:
-        await _fail_subjob_and_unblock_parent(
-            job,
-            "Shared parent workspace could not be created for the research "
-            "phase (see orchestrator logs for image/resource/RBAC details).",
+        # create_workspace records the concrete failure in the parent's
+        # context before returning False — surface it on the job row instead
+        # of punting operators to the orchestrator logs (the dispatcher's own
+        # sandbox arm already does this; see the EnsureOutcome.FAILED branch
+        # in _try_dispatch_pending_jobs).
+        reason = None
+        try:
+            refreshed_parent = await postgres_db.get_job(parent_id)
+            refreshed_ctx = (refreshed_parent or {}).get("context") or {}
+            if isinstance(refreshed_ctx, str):
+                refreshed_ctx = json.loads(refreshed_ctx)
+            reason = (refreshed_ctx.get("workspace_container") or {}).get("error")
+        except Exception:
+            logger.warning(
+                "Dispatcher: could not refresh failed parent workspace context "
+                "for scholar %s (parent %s)",
+                scholar_id,
+                parent_id,
+                exc_info=True,
+            )
+        detail = (
+            f"Shared parent workspace failed: {reason}"
+            if reason
+            else (
+                "Shared parent workspace could not be created for the research "
+                "phase (see orchestrator logs for image/resource/RBAC details)."
+            )
         )
+        await _fail_subjob_and_unblock_parent(job, detail)
         return "fail"
     if res.outcome is EnsureOutcome.PENDING:
         logger.info(
@@ -16441,6 +16465,7 @@ async def complete_job(
         is_curation_enabled,
         is_late_completion_report,
         is_verification_enabled,
+        should_persist_completion_freeze,
         should_reset_recovery_counter,
     )
 
@@ -16530,17 +16555,29 @@ async def complete_job(
         # Write freeze_data from the completion report.
         # The orchestrator is the single authority for DB writes — agents
         # report freeze_data in the completion payload, we persist it.
+        # EXCEPT on a workspace_unavailable completion: an agent that died
+        # before its graph ran echoes the job's PREVIOUS freeze back at us,
+        # and persisting that stale blob before the recovery arm's pause left
+        # the job paused-but-invisible to the dispatcher
+        # (docs/issues/recovery_pause_repersists_stale_freeze_invisible_job.md).
         if result.get("freeze_data"):
-            job["freeze_data"] = result["freeze_data"]
-            try:
-                async with postgres_db.acquire() as conn:
-                    await conn.execute(
-                        "UPDATE jobs SET freeze_data = $1::jsonb WHERE id = $2::uuid",
-                        json.dumps(result["freeze_data"]),
-                        job_id,
-                    )
-            except Exception as e:
-                logger.warning(f"Failed to write freeze_data for {job_id}: {e}")
+            if should_persist_completion_freeze(result):
+                job["freeze_data"] = result["freeze_data"]
+                try:
+                    async with postgres_db.acquire() as conn:
+                        await conn.execute(
+                            "UPDATE jobs SET freeze_data = $1::jsonb WHERE id = $2::uuid",
+                            json.dumps(result["freeze_data"]),
+                            job_id,
+                        )
+                except Exception as e:
+                    logger.warning(f"Failed to write freeze_data for {job_id}: {e}")
+            else:
+                logger.info(
+                    "Job %s: skipping freeze_data persist on "
+                    "workspace_unavailable completion (echoed stale freeze)",
+                    job_id,
+                )
 
         # Clear any remaining queued_replies from job context on completion.
         # The agent may have consumed them during phase transitions.

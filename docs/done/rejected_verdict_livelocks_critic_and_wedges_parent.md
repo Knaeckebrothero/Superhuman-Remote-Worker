@@ -41,9 +41,26 @@ implemented end to end:
   rejected submissions; sent to manual review. Last rejection: …", critic
   row `context.verdict_rejections = 3`, orchestrator WARNING "Verification
   escalated target …" logged.
-- Fix direction 2 (the wall-clock watchdog arm for live-critic reviews,
-  `_UNSTICK_REVIEWING_SQL`) remains OPEN as the backstop — not built in
-  this batch.
+- **Fix direction 2 BUILT 2026-08-06 (batch #2):**
+  `PostgresDB.unstick_reviewing_parents_wallclock` +
+  `_UNSTICK_REVIEWING_WALLCLOCK_SQL` — the complement of the dead-critic
+  arm (requires a LIVE critic via EXISTS over the same live-status set, so
+  the two arms stay disjoint), gated on `p.updated_at` older than a
+  config-gated ceiling (`REVIEWING_WALLCLOCK_CEILING_MINUTES`, default 60,
+  0 disables), with the distinct message "critic did not render a verdict
+  in N minutes". Wired as step 3 of the stale-verification sweeper's tick
+  (off for direct `_sweep_tick` callers, on in the production loop);
+  escalated parents notify the owner like the dead-critic arm. The critic
+  itself is left alone — the verdict-rejection cap bounds the common
+  livelock at the source and the stale-subjob horizon reaps survivors.
+  Tests: `TestUnstickReviewingParentsWallclock`
+  (tests/test_stale_verification_sweeper.py) + 3 real-Postgres behavioral
+  tests (tests/test_unstick_reviewing_parents_ledger.py: live critic past
+  ceiling escalates with the distinct message; under-ceiling review
+  untouched; dead-critic parents left to the other arm). Live k3d: a
+  synthetic reviewing parent (updated_at −75 min) with a live 'processing'
+  critic child was escalated by the in-cluster sweeper's next tick with the
+  wall-clock message (2026-08-06).
 **Originally:** Observed live. UNFIXED. Manually cancelled after 105 minutes.
 **Severity:** **high** — unbounded cost and an indefinitely wedged parent. The
 parent sits in `reviewing` with no deadline and no operator signal.

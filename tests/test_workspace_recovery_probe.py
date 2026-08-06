@@ -27,6 +27,7 @@ if str(project_root) not in sys.path:
 from orchestrator.services.completion import (  # noqa: E402
     handle_pod_workspace_recovery,
     probe_workspace_ssh,
+    should_persist_completion_freeze,
     should_reset_recovery_counter,
 )
 
@@ -101,7 +102,7 @@ class TestShouldResetRecoveryCounter:
 
 def _make_deps(*, pod_alive: bool, pause_ok: bool = True):
     db = AsyncMock()
-    db.pause_job.return_value = pause_ok
+    db.pause_job_shed_freeze.return_value = pause_ok
     delete_workspace = AsyncMock()
     trigger_dispatch = MagicMock()
 
@@ -216,7 +217,7 @@ class TestHandlePodWorkspaceRecovery:
         kwargs = db.update_job_status.await_args.kwargs
         assert kwargs["status"] == "failed"
         assert kwargs["freeze_data"]["recovery_attempts"] == 4
-        db.pause_job.assert_not_awaited()
+        db.pause_job_shed_freeze.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_no_dispatch_when_pause_loses_race(self):
@@ -236,3 +237,65 @@ class TestHandlePodWorkspaceRecovery:
         )
 
         trigger_dispatch.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_recovery_pause_sheds_freeze(self):
+        """The recovery pause must leave the job dispatchable.
+
+        A bare pause_job keeps any row-level freeze_data, and paused +
+        freeze_data set is invisible to get_dispatchable_jobs — the job
+        `52949749` wedge. The arm must route through the stash-and-clear
+        pause (docs/issues/recovery_pause_repersists_stale_freeze_invisible_job.md).
+        """
+        db, delete_workspace, trigger_dispatch, probe = _make_deps(pod_alive=False)
+        job = _job()
+
+        result = await handle_pod_workspace_recovery(
+            job,
+            job["id"],
+            _ERROR,
+            db=db,
+            delete_workspace=delete_workspace,
+            trigger_dispatch=trigger_dispatch,
+            probe=probe,
+        )
+
+        db.pause_job_shed_freeze.assert_awaited_once_with(job["id"])
+        db.pause_job.assert_not_awaited()
+        assert result["new_status"] == "paused"
+        trigger_dispatch.assert_called_once()
+
+
+# =============================================================================
+# should_persist_completion_freeze
+# =============================================================================
+
+
+class TestShouldPersistCompletionFreeze:
+    """A workspace_unavailable completion can only ECHO a stale freeze."""
+
+    def test_workspace_unavailable_blocks_persist(self):
+        result = {
+            "error": {"type": "workspace_unavailable", "message": "gone"},
+            "freeze_data": {"freeze_type": "job_complete"},
+        }
+        assert should_persist_completion_freeze(result) is False
+
+    def test_no_error_persists(self):
+        assert (
+            should_persist_completion_freeze(
+                {"freeze_data": {"freeze_type": "phase_boundary"}}
+            )
+            is True
+        )
+
+    def test_other_error_type_still_persists(self):
+        """An llm_outage-style freeze on an errored completion is genuine."""
+        result = {
+            "error": {"type": "llm_outage", "message": "provider down"},
+            "freeze_data": {"freeze_type": "llm_outage"},
+        }
+        assert should_persist_completion_freeze(result) is True
+
+    def test_non_dict_error_persists(self):
+        assert should_persist_completion_freeze({"error": "boom"}) is True

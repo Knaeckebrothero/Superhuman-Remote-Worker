@@ -9,7 +9,28 @@ tags:
 
 # Issue — boot-failed completion re-persists a stale freeze; recovery pause leaves the job paused-but-invisible
 
-**Status:** Observed 2026-07-26 on dev (job `52949749`), manually unwedged.
+**Status:** **FIXED 2026-08-06 (batch #2)** — both layers, exactly as proposed
+below:
+1. Root cause: `complete_job` now gates the freeze persist on
+   `should_persist_completion_freeze(result)` (orchestrator/services/
+   completion.py) — a `workspace_unavailable` completion can only ECHO the
+   previous freeze, so it is not persisted (logged instead). Deliberately
+   narrow: errored completions with a genuinely new freeze (llm_outage
+   backoff) still persist.
+2. Invariant: `handle_pod_workspace_recovery` pauses via the new
+   `PostgresDB.pause_job_shed_freeze` — `pause_job`'s `status='processing'`
+   CAS (the double-dispatch gate) plus `queue_job_for_resume`'s
+   stash-and-clear shape (freeze → `context.last_freeze_data`, column
+   NULLed), so the paused-implies-dispatchable invariant holds regardless of
+   what earlier steps persisted. Manual/user pauses keep the plain
+   `pause_job` (mid-run pauses legitimately keep freeze_data).
+Tests: `TestShouldPersistCompletionFreeze` +
+`test_recovery_pause_sheds_freeze` (tests/test_workspace_recovery_probe.py).
+Not live-exercised (would need a boot-failed agent echoing a stale freeze);
+the DB shape is the same stash-and-clear already live-proven by the
+critic-freeze wedge fix (batch #1, `d3a16617`).
+
+**Originally:** Observed 2026-07-26 on dev (job `52949749`), manually unwedged.
 Not yet fixed. Work on `develop`.
 
 **One line:** an agent that dies before its graph runs can echo the job's

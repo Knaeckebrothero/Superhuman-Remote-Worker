@@ -458,6 +458,24 @@ def should_reset_recovery_counter(container_ctx: dict[str, Any], error: Any) -> 
     return True
 
 
+def should_persist_completion_freeze(result: dict[str, Any]) -> bool:
+    """False when a completion report's freeze_data must NOT be persisted.
+
+    An agent that dies before its graph runs (``workspace_unavailable``) can
+    only ECHO the job's previous freeze back in its completion payload — it
+    froze nothing new. Persisting that echo before the recovery arm's pause
+    re-wedges the job: paused + freeze_data set is invisible to
+    ``get_dispatchable_jobs`` (partial-index contract, migration 0046).
+    Deliberately narrow — an errored completion with a genuinely new freeze
+    (e.g. an llm_outage backoff freeze) must keep persisting.
+    docs/issues/recovery_pause_repersists_stale_freeze_invisible_job.md
+    """
+    error = result.get("error")
+    return not (
+        isinstance(error, dict) and error.get("type") == "workspace_unavailable"
+    )
+
+
 async def handle_pod_workspace_recovery(
     job: dict[str, Any],
     job_id: str,
@@ -584,10 +602,15 @@ async def handle_pod_workspace_recovery(
             f"re-dispatch for reattach (attempt {attempts}/{cap})"
         )
 
-    # pause_job clears the agent + flips to paused (→ resume=True on
-    # re-dispatch). Gate the dispatch on the processing→paused transition so
-    # a duplicate completion can't double-dispatch.
-    if await db.pause_job(job_id):
+    # The pause clears the agent + flips to paused (→ resume=True on
+    # re-dispatch) AND sheds any row-level freeze into
+    # context.last_freeze_data: paused + freeze_data set is invisible to
+    # get_dispatchable_jobs, so a freeze surviving this transition would park
+    # the job forever
+    # (docs/issues/recovery_pause_repersists_stale_freeze_invisible_job.md).
+    # Gate the dispatch on the processing→paused transition so a duplicate
+    # completion can't double-dispatch.
+    if await db.pause_job_shed_freeze(job_id):
         trigger_dispatch()
     return {
         "status": "handled",
