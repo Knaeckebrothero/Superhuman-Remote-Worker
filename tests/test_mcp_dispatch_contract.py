@@ -3,7 +3,7 @@
 import ast
 from pathlib import Path
 
-from orchestrator.services.formatters import format_created_job
+from src.shared.orch_surface.formatters import format_created_job
 
 
 SERVER_PATH = Path(__file__).parent.parent / "orchestrator" / "mcp" / "server.py"

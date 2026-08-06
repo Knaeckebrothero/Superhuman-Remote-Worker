@@ -10,8 +10,8 @@ tags:
   - sessions
 aliases:
   - unified tool surface
-  - shared tool catalogue
-  - one catalogue
+  - shared job toolset
+  - job management toolset
 related:
   - "[[orchestrator_tool_surface_fragmentation]]"
   - "[[source_tree_unification]]"
@@ -21,345 +21,271 @@ related:
   - "[[officer_blind_reads_and_worker_bureaucracy]]"
 ---
 
-# Unified Orchestrator Tool Surface
+# One Job-Management Toolset
 
-**Date:** 2026-08-06
-**Status:** DRAFT — design for review; execution not started.
+**Date:** 2026-08-06 (re-scoped same day from a full-catalogue unification draft, per Legate)
+**Status:** DECIDED — all four §6 decisions ratified by the Legate 2026-08-06.
+**S1 DONE 2026-08-06**, live-verified on k3d: tools/list schema digest identical
+before/after (`sha256:f9593213…`), 105 tools, prod image builds with in-image
+schema bake + double-client smoke, 125 affected tests green, Tilt loop rebuilt
+and rolled the new layout. Next: S2 (job descriptors + MCP adapter).
 **Findings authority:** `docs/issues/orchestrator_tool_surface_fragmentation.md`
-(F1–F9, verified 2026-08-03). This doc is the execution plan for the decision
-recorded there: *stop maintaining separate orchestrator tool surfaces* (Legate,
-2026-08-03 — "otherwise we have 20 different ways agents interact with the
-orchestrator and that's a maintenance nightmare").
-**Supersedes:** `shared_application_action_layer.md` (2026-07-08) — same core
-idea ("own product-level tool semantics once, expose through thin adapters"),
-now grounded in the verified inventory and sequenced against the source-tree
-flattening. `application_tool_surface_baseline.md` remains useful as the
-2026-07-08 inventory snapshot.
+(F1–F9, verified 2026-08-03).
+**Supersedes:** `shared_application_action_layer.md` (2026-07-08) for the job
+domain; `application_tool_surface_baseline.md` stays as the inventory snapshot.
 
 ---
 
 ## 1. Goal
 
-One tool catalogue, defined once, consumed by every LLM-facing runtime. When
-this feature is done:
+**One job-management toolset that sessions, MCP and the officers share.**
+(Legate, 2026-08-06.)
 
-- **Adding a tool is one edit**: a descriptor (handler + metadata) in the shared
-  package. The MCP registration, the LangChain tool, the session tool-group
-  lists, and the cockpit type mirror are all derived from it. Today the same
-  change is ~9 synchronised edits on the agent side plus 3 more for MCP parity
-  (issue F6).
-- **Equipping a caller is config, not code**: "give the officer what an operator
-  has" becomes naming a category group in `config/experts/centurion/config.yaml`.
-  Today it is impossible — the officer's runtime cannot reach 98 of the 133
-  tool names because their bodies were never written on his side (issue §3).
-- **The vocabulary is one vocabulary**: the same operation has the same name,
-  description, and output format whether called from Claude Code over MCP, a
-  persistent session, an officer, or (later) a worker. Today nine operations
-  are spelled differently per surface and even the six shared names format
-  output differently (issue F3/F9).
-- **Project-scoped callers are scoped**: agent-side calls carry
-  `X-MCP-Scope: project:<uuid>` so an officer's job lists cover his century,
-  not the whole user-visible fleet (issue F5; conference finding F1).
+Not a unification of everything: MCP keeps its operator tools (project CRUD,
+datasources, DB introspection, sudo, session admin) as its own surface, and the
+officer does not inherit them — he doesn't need to create projects. What gets
+straightened out is the job domain specifically, because that is where all
+three callers do *the same work* — dispatch, supervise, investigate, decide —
+with three hand-written vocabularies today: 12 agent-side tools for the
+officer, a 14-name session kit, ~30 MCP tools, nine of them the same
+operations under different names, and every observability read missing outside
+MCP (the night-1 blind-reads incident).
 
-The immediate product payoff is the Centurion: his night-1 false convictions
-came from a kit with every verb that *changes* a job and almost none that
-*observes* one. The structural payoff is that the next 50 tools cost one file
-each.
+When this is done:
+
+- The job toolset is defined **once** — one name, one description, one output
+  format per operation — and every surface registers from that definition.
+- Which subset a caller gets is **config** (officer YAML, session tool groups,
+  MCP as today), not per-surface reimplementation.
+- Officers and sessions gain the reads they're missing (log, audit, chat,
+  todos, diff, messages, frozen state, shell state); MCP loses nothing and
+  gains the two supervision verbs it never had (`steer_job`, `get_stuck_jobs`
+  it already has — so just steer).
+- Project-scoped callers are scoped server-side (`X-MCP-Scope`), so an
+  officer's `list_jobs` covers his century, not the whole visible fleet.
 
 ## 2. Where we are (verified 2026-08-06)
 
-Two hand-written LLM-facing surfaces over the same REST API with the same
-credentials and the same server-side guards:
+Same API, same credentials, same guards on every path — the split is unwritten
+client code, not permissions (issue F1/F2). Key facts:
 
-| Surface | Definition | Tools | Consumers |
+- Agent-side `orchestrator` category: 35 tools; officer gets 12
+  (`config/experts/centurion/config.yaml:67-79`) — every mutating verb, almost
+  no reads. Sessions with the *Fleet Management* switch on get a fixed 14-name
+  kit appended at runtime (`src/api/persistent_session.py:1471-1487`); legacy
+  sessions count as on. `steer_worker_job`/`get_stuck_jobs` are selectable by
+  expert YAML but unreachable from the UI (presentation list drift —
+  `src/core/session_tool_overrides.py`).
+- MCP: 105 tools in `orchestrator/mcp/server.py`; bodies are thin
+  (`client.get_*()` + `format_*()`). The client (`mcp/client.py`, 109 methods)
+  and formatter layer (`services/formatters.py`, stdlib-only) live in the
+  orchestrator package, which the agent image doesn't ship — that packaging
+  choice is the whole barrier (issue F8). The MCP image itself hand-grafts
+  `formatters.py` via Dockerfile COPY (`docker/Dockerfile.mcp:62-68`).
+- Nine operations are spelled differently per surface (`get_job` /
+  `get_worker_job`, …) while hitting the same routes (issue F9).
+- `X-MCP-Scope: project:<uuid>` narrowing exists server-side and agent-side
+  tools never send it (issue F5).
+
+## 3. The toolset
+
+The single source of truth once built; until then this table is the alignment
+artifact. Canonical names are the MCP spellings (they have consumers outside
+this repo); the legacy agent-side spellings are **renamed in place — no
+aliases, no deprecation cycle** (Legate 2026-08-06). The rename sweep of
+in-repo configs and tests rides S3; DB-stored configs naming legacy spellings
+get a one-time scan (§8). "Default" = granted without per-caller
+config: `S` sessions (job groups on), `O` officer, `M` MCP. Anything can still
+be granted or removed per expert/session config — defaults are just the
+starting kit.
+
+### job_control (writes)
+
+| Canonical | Replaces | Default | Notes |
 |---|---|---|---|
-| MCP server | `orchestrator/mcp/server.py` (105 `@mcp_tool`) + `mcp/client.py` (109 typed methods) + `services/formatters.py` (~85 `format_*`) | 105 | Claude Code, external MCP clients |
-| Agent `orchestrator` category | `src/tools/orchestrator/{jobs,projects,repositories,workflows,catalog}.py` — closures over `ToolContext`, private ad-hoc formatting | 35 | persistent sessions, officers, conferences |
+| `create_job` | `create_worker_job` | S O M | keeps `slot=` (officer roster) and `required_deliverables` |
+| `cancel_job` | `cancel_worker_job` | S O M | |
+| `pause_job` | `pause_worker_job` | S O M | |
+| `resume_job_with_feedback` | `resume_worker_job` | S O M | the destructive re-plan verb; description keeps the steer-vs-resume warning |
+| `approve_job` | `approve_worker_job` | S O M | |
+| `steer_job` | `steer_worker_job` | S O M | today agent-only; **new on MCP** — guidance lane, non-destructive |
+| `send_message_to_job` | — | S O M | today MCP-only; the mailbox write behind the same guard steer already passes |
+| `assign_job`, `promote_job`, `delete_job` | — | M | operator verbs; stay MCP-default-only, grantable elsewhere by explicit config |
 
-- **The packaging asymmetry is the entire barrier** (issue F8). The orchestrator
-  image ships `orchestrator/` + `src/` and imports `src.core.*` freely
-  (`docker/Dockerfile.orchestrator:79-85`). The agent image ships only `src/`
-  (`docker/Dockerfile.agent:135-137`) — it cannot import the MCP client or the
-  formatter layer. The MCP image hand-grafts `services/formatters.py` +
-  `security/anti_framing.py` via Dockerfile COPY (`docker/Dockerfile.mcp:62-68`)
-  and reaches them through a fallback import dance.
-- **Who gets what today**: the officer gets 12 names
-  (`config/experts/centurion/config.yaml:67-79`). A session whose *Fleet
-  Management* switch is on gets a fixed 14-name kit force-appended at runtime
-  (`src/api/persistent_session.py:1471-1487`); sessions created before the
-  switch existed count as on (marker-absent = enabled,
-  `persistent_session.py:161-176`). Neither kit contains a single
-  observability read beyond the two Gitea file readers.
-- **Correction to the issue doc**: the 14-name list in
-  `src/core/session_tool_overrides.py` is now *presentation-only* (the four UI
-  switches); request-boundary validation moved to
-  `src/core/tool_policy.validate_tool_override_fragment`, which accepts any
-  registry-true name. So `steer_worker_job` / `get_stuck_jobs` /
-  `checkout_project_repository` are unreachable *from the UI*, but an expert
-  YAML or a raw API fragment can grant them. The drift is a UI gap, not a
-  policy gate.
-- **The missing 98 names** are catalogued in the issue doc's appendix. The
-  high-value block for supervision is all read-only: job log, audit trail,
-  chat history, todos, diffs, commits, message threads, frozen state, shell
-  state, LLM requests.
-- `orchestrator/services/formatters.py` imports stdlib only (`json`, `re`,
-  `typing`) — it can ship in the agent image at zero dependency cost.
-- `src/` is a real package (`src/__init__.py` exists) and the orchestrator
-  already imports ~20 modules from it. Shipping shared code *in `src/`* is the
-  established arrangement, not a new invention.
+### job_inspection (reads)
 
-## 3. Design
+| Canonical | Replaces | Default | Notes |
+|---|---|---|---|
+| `list_jobs` | `list_worker_jobs` | S O M | scope-aware (§4.4) |
+| `get_job` | `get_worker_job` | S O M | |
+| `get_job_summary` | — | S O M | |
+| `get_job_progress` | — | S O M | |
+| `get_job_log` | — | S O M | |
+| `get_frozen_job` | — | S O M | |
+| `get_job_diff` | — | S O M | |
+| `get_job_file` | `get_job_workspace_file` | S O M | Gitea-backed; staleness header stays |
+| `list_job_files` | `list_job_workspace_files` | S O M | |
+| `list_job_commits` | — | S O M | |
+| `get_current_todos`, `get_todos`, `get_todo_archive`, `list_todo_archives` | — | S O M | adopted as-is; folding the four into fewer tools is a later cleanup |
+| `get_workspace_overview` | — | S O M | |
+| `get_shell_state` | — | S O M | the only live (pod-proxied) read; VM workspaces off-mesh — honest error there |
+| `list_message_threads`, `get_message_thread` | — | S O M | closes F2: the officer can finally read the mailbox he writes into |
+| `get_audit_trail`, `search_audit` | — | S O M | |
+| `get_chat_history` | — | S O M | |
+| `get_stuck_jobs` | — | S O M | already both; becomes UI-selectable via generated lists |
+| `list_llm_requests`, `get_llm_request` | — | O M | debugging-grade; default-off for sessions, on for the officer (his job is diagnosing workers) |
+| `get_audit_timerange`, `get_audit_bulk`, `get_chat_bulk` | — | M | bulk/operator variants |
 
-### 3.1 The shared package: `src/shared/`
+~35 operations total. Everything else on either surface — `get_session_context`,
+`get_current_project`, `list_project_jobs`, repositories, catalog, workflows,
+knowledge, projects/datasources/sessions/db/sudo admin — **does not move**.
 
-Create `src/shared/orch_surface/` (working name; final name is Decision 1):
+## 4. Design
 
-```
-src/shared/
-  __init__.py
-  orch_surface/
-    __init__.py
-    client.py        # moved from orchestrator/mcp/client.py (109 methods)
-    formatters.py    # moved from orchestrator/services/formatters.py
-    context.py       # CallerCtx: user_id, project_id, thread_id, surface
-    categories.py    # shared category vocabulary + group definitions
-    descriptors/     # one module per domain: jobs.py, audit.py, projects.py, …
-    adapters/
-      mcp.py         # FastMCP registration from descriptors
-      langchain.py   # agent-runtime @tool generation from descriptors
-      manifest.py    # generated allowlists / cockpit types / docs
-```
+### 4.1 Shared package: `src/shared/orch_surface/`
 
-Why `src/shared/` and not a new top-level package (Decision 1 rationale):
+Move `orchestrator/mcp/client.py` and `orchestrator/services/formatters.py`
+into `src/shared/orch_surface/` **wholesale** (moving whole files is less
+surgery than splitting them; the non-job MCP tools simply import from the new
+home). `src/` ships in all three images today — agent and orchestrator already
+COPY it; the MCP image swaps its per-file formatter graft for
+`COPY src/shared` (+ a Tiltfile sync line), killing the fallback-import dance.
+This is also exactly where the source-tree flattening
+(`source_tree_unification.md`, decided) puts shared code — the package is born
+in its final home, and the flattening census regenerates around it.
 
-- It works in **all three images today**: agent and orchestrator images already
-  ship `src/`; the MCP image adds one `COPY src/shared /app/src/shared` line
-  (plus `src/__init__.py`) — the same graft mechanism it already uses for
-  formatters, minus the per-file cherry-picking. The formatters fallback-import
-  dance dies; one canonical path (`src.shared.orch_surface…`) everywhere.
-- It is **exactly where the source-tree flattening wants it**. The flattening
-  plan (`source_tree_unification.md`, decided, awaiting green-light) targets
-  `src/{agent,orchestrator,mcp_server,vm_controller,shared}` and already
-  amended *formatters.py → shared/*. Building here now means the flattening
-  sweep moves nothing for this package — it is born in its final home. The
-  flattening census (step 0) regenerates its manifest at execution time, so
-  landing this first is additive, not conflicting.
-- Import constraints (enforced by review now, import-linter once the flattening
-  lands): stdlib + `httpx` only; **no langchain, no langgraph, no imports from
-  `src.core`/`src.tools`/`orchestrator.*`**. The adapters are the only modules
-  allowed to know about their runtime's framework, and the langchain adapter is
-  imported only by the agent runtime.
+Constraints: stdlib + `httpx` only; no langchain/langgraph; no imports from
+`src.core`/`src.tools`/`orchestrator.*`. Adapters are the only
+framework-aware modules, and the langchain adapter is imported only by the
+agent runtime.
 
-### 3.2 One descriptor, N adapters
+### 4.2 One descriptor per job tool, three adapters
 
-Each tool is defined once as an async handler plus metadata. Sketch:
+Each toolset row becomes one async handler + metadata in
+`src/shared/orch_surface/jobs/`:
 
 ```python
-# src/shared/orch_surface/descriptors/audit.py
-@descriptor(
-    category="job_inspection",
-    surfaces={"mcp", "session", "officer"},
-    grant="explicit",                       # carried into the agent registry
-    aliases=(),                             # legacy spellings, see §3.5
-)
+@descriptor(group="job_inspection", default={"session", "officer", "mcp"},
+            grant="explicit")
 async def get_audit_trail(client: SurfaceClient, ctx: CallerCtx,
                           job_id: str, limit: int = 50) -> str:
     """Get the audit trail for a job: tool calls, decisions, transitions…"""
-    data = await client.get_audit_trail(job_id, limit=limit)
-    return fmt.format_audit_trail(data)
+    return fmt.format_audit_trail(await client.get_audit_trail(job_id, limit=limit))
 ```
 
-The handler owns the client call *and* the formatter call, so output is
-byte-identical on every surface. Both runtimes already derive schemas from
-signatures + docstrings (FastMCP and LangChain `@tool` alike), so the
-descriptor needs no second schema language — this is Decision 2's
-recommendation: **Python descriptors, no YAML manifest**.
+The handler owns the client call and the formatter call → identical output on
+every surface. Both runtimes already derive schemas from signatures +
+docstrings, so no second schema language.
 
-Adapters:
+- **MCP adapter**: registers the job descriptors with FastMCP; the other ~70
+  MCP tools keep their existing hand-written bodies (now importing client +
+  formatters from the shared package). `steer_job` appears as a new MCP tool.
+- **LangChain adapter**: `create_orchestrator_tools(context)` keeps its
+  signature; the job tools in `src/tools/orchestrator/jobs.py` are replaced by
+  the descriptor loop. The same change renames every in-repo reference —
+  centurion YAML, the session runtime append list, the sitrep prompt text,
+  tests — since there are no aliases to bridge. The
+  project/repository/catalog/workflow tool files stay as they are.
+- **Manifest generation**: the session tool-group lists (`job_control`,
+  `job_inspection` as UI switches), the cockpit
+  `agent-settings.types.ts` mirror, and a markdown catalogue under `docs/` are
+  generated; the hand-list in `session_tool_overrides.py` and its mirror test
+  go away for the job groups.
 
-- **MCP** (`adapters/mcp.py`): registers every descriptor with `"mcp"` in
-  `surfaces` under its canonical name; binds `client` from the MCP auth
-  context exactly as `_get_client()` does today. `orchestrator/mcp/server.py`
-  shrinks to auth + transport + the registration loop.
-- **Agent runtime** (`adapters/langchain.py`): `create_orchestrator_tools(context)`
-  keeps its signature but becomes a loop: for each descriptor whose surfaces
-  admit the caller, wrap the handler in a LangChain `@tool`, binding the client
-  from `ToolContext` (`user_id`, and `project_id` for scope — §3.4). The five
-  files under `src/tools/orchestrator/` are deleted.
-- **Manifest** (`adapters/manifest.py`): generates the session tool-group
-  lists, the cockpit `agent-settings.types.ts` mirror, and a markdown catalogue
-  under `docs/`. CI diffs the generated files; the hand-maintained
-  `SESSION_TOOL_OVERRIDE_NAMES` and its mirror test are deleted.
+Descriptor metadata feeds the existing agent registry (category, `grant`,
+phases) so phase-gating and `validate_tool_override_fragment` see one world.
 
-Metadata carried per descriptor: `category`, `surfaces`
-(`mcp` / `session` / `officer` / `worker` — operator-only judgment is recorded
-here per tool, e.g. `query_table` and `reload_experts` stay `{"mcp"}`), `grant`
-(`code`/`explicit`, feeding the existing registry classification), `phases`
-(worker runtime), `aliases`.
+### 4.3 Groups and config
 
-### 3.3 Category re-carve
+Two new groups take the job slice out of the flat `orchestrator` category,
+which lives on for the untouched non-job tools (`get_session_context`,
+projects, repositories). Because `validate_tool_override_fragment` rejects
+names filed under the wrong category, every in-repo config that lists job
+tools under `orchestrator:` flips in the same commit — the validator makes the
+rename atomic by construction. Centurion config flips to:
 
-The flat 35-tool `orchestrator` category and the flat 105-tool MCP server both
-dissolve into shared groups. Proposed set (exact membership is the S2
-descriptor table, reviewed as a generated catalogue doc):
+```yaml
+tools:
+  job_control: true      # per-tool defaults from the descriptor table
+  job_inspection: true
+  orchestrator: [get_session_context]   # plus the untouched non-job tools he keeps
+```
 
-- `job_control` — create/cancel/pause/resume/approve/steer (+ MCP-only
-  assign/promote/delete marked operator)
-- `job_inspection` — log, audit, chat, todos, archives, diff, commits, files,
-  frozen state, shell state, LLM requests, message threads
-- `fleet` — agents, stats, stuck jobs
-- `projects` — current/get/list, members (writes operator), project jobs
-- `repositories` — today's three
-- `datasources`, `sessions`, `db_admin`, `sudo` — MCP-only at first; recorded
-  in `surfaces`, available to grant later without new code
-- `catalog`, `workflows`, `catalog_authoring` — as today, now shared
-
-Back-compat: the config key `orchestrator` keeps resolving as an alias for the
-union of the groups a caller's surface admits, so existing expert YAMLs and the
-Fleet Management switch keep working unchanged until re-pointed.
-
-Explicit non-merge: the agent's workspace-local `knowledge` tools (`kb_*`)
-talk to the stores directly and are **not** part of this surface; the MCP
-knowledge tools remain REST-backed catalogue entries. Unifying those two
-mechanisms is a different feature.
-
-### 3.4 Project scoping
+### 4.4 Project scoping
 
 The shared client sends `X-MCP-Scope: project:<uuid>` whenever `CallerCtx`
-carries a single project binding. Officers always do; sessions do when
-project-bound (multi-project sessions send none, unchanged behaviour). The
-server side already consumes it (`mcp_scope_project_id()` AND-filter) — this is
-purely finishing the client half. Fixes fleet-wide `list_worker_jobs` leakage
-without touching any endpoint.
-
-### 3.5 Naming convergence (issue F9)
-
-Canonical names are the MCP spellings (`get_job`, `create_job`, `cancel_job`,
-…): they have external consumers (Claude Code configs beyond this repo), the
-agent-side spellings live in repo-controlled YAML. The nine renamed pairs
-become one descriptor each with the legacy `*_worker_job` / `*_workspace_*`
-spelling in `aliases`; the langchain adapter registers aliases as deprecated
-synonyms (same handler), the manifest marks them, and after one deprecation
-cycle the aliases drop. Centurion/session configs flip to canonical names in
-S5. This is Decision 5, option (a) — the alias table is ~9 lines.
-
-### 3.6 Relationship to tool deferral
-
-Deferral (`project_tool_deferral`, unbuilt) is what eventually makes "grant the
-whole catalogue" affordable per-caller; it is **not** a prerequisite (Decision
-4). Groups are sized for a resident-schema world now — the officer's post-S5
-kit lands around ~30 resident tools, well inside session budgets — and S7
-flips breadth later without re-carving.
-
-## 4. What each caller ends up with
-
-- **Officer (Centurion)**: `job_control` + `job_inspection` + `projects` +
-  `fleet` reads + existing catalogue groups — the operator's investigation kit
-  with operator-only writes excluded via `surfaces`. Night-1's missing reads
-  (log/audit/chat/todos/diff/messages) all present. Scoped to his century.
-- **Sessions**: Fleet Management switch maps to `job_control` (+ the reads it
-  already implied); `job_inspection` + `projects` + `repositories` reads become
-  default-on for project-scoped sessions (Decision 3 — product call). The
-  three UI-unreachable tools become selectable because the switch lists are
-  generated from the same descriptors.
-- **MCP / Claude Code**: vocabulary unchanged (canonical names *are* the MCP
-  names); output text unchanged through S2's byte-compat gate; gains category
-  tags in tool annotations.
-- **Workers**: no default change. `surfaces` gains a `worker` value so the
-  delegation-adjacent subset can be granted per-expert later; actually turning
-  any group on for workers is its own product decision.
-- **Conferences**: inherit whatever the officer's expert grants — the S9
-  conference finding F1 (user-wide reach) is closed by §3.4 scoping, not by a
-  separate kit.
+carries a single project binding — officers always, sessions when
+project-bound, MCP as its auth already does. Server side already consumes it;
+this is finishing the client half. Fixes the officer's fleet-wide job lists
+(conference finding F1) with no endpoint changes.
 
 ## 5. Slices
 
 | # | Slice | Depends on | Acceptance |
 |---|-------|-----------|------------|
-| S1 | Move `mcp/client.py` + `services/formatters.py` into `src/shared/orch_surface/`; MCP + orchestrator switch imports; Dockerfile.mcp graft becomes `COPY src/shared`; Tiltfile `srw-mcp` sync adds `src/shared/` | — | MCP `tools/list` artifact byte-identical (`schema_artifact.py` bake); all three images build; k3d MCP health + one smoke call green; Tilt edit-signal lands for a `src/shared` touch |
-| S2 | Descriptor registry + MCP adapter; the 105 server bodies become descriptors (start with jobs/audit domains, finish the tail mechanically) | S1 | 105 registrations, names + schemas + output text unchanged (artifact diff + recorded sample-call diffs); server.py contains no per-tool bodies |
-| S3 | LangChain adapter replaces `src/tools/orchestrator/*`; registry metadata sourced from descriptors | S2 | The 35 agent names resolve (canonical or alias); `tests/test_orchestrator_jobs_tool.py` + session tool tests green; officer k3d smoke turns a wake with the same 12 tools |
-| S4 | Generated manifests: session groups, cockpit types, catalogue doc; delete `SESSION_TOOL_OVERRIDE_NAMES` hand-list + mirror test | S3 | Generated-file CI check; steer/stuck/checkout selectable in Settings→Tools; cockpit vitest green |
-| S5 | Category re-carve + config flips: centurion + session_base name the new groups (canonical spellings); `orchestrator` key aliased | S4 | k3d: officer reads log/audit/chat/todos/diff/messages on a live worker job; session toggles honoured end-to-end; existing expert YAMLs unmodified still resolve |
-| S6 | Scope header in the shared client | S1 (can ride any later slice) | k3d: officer `list_jobs` returns only century jobs; unscoped session behaviour unchanged |
-| S7 | Deferral for the shared catalogue | `project_tool_deferral` | Officer reaches the full catalogue within resident-schema budget |
+| S1 | Move client + formatters to `src/shared/orch_surface/`; all imports switch; `Dockerfile.mcp` graft → `COPY src/shared`; Tiltfile sync line | — | MCP `tools/list` byte-identical (`schema_artifact.py` bake); three images build; MCP restarts on a `src/shared` touch in Tilt |
+| S2 | Job descriptors + MCP adapter for the toolset rows; `steer_job` lands on MCP | S1 | Existing MCP job tools name/schema/output-identical (artifact + recorded sample-call diff); steer_job smoke on k3d |
+| S3 | LangChain adapter replaces the 12 agent job tools + in-repo rename sweep (centurion YAML, session append list, sitrep text, tests) | S2 | Canonical names resolve; `grep -r` finds no legacy spelling in-repo; updated `tests/test_orchestrator_jobs_tool.py` + session tool tests green; officer k3d turn works on new names |
+| S4 | Generated group lists + cockpit mirror for `job_control`/`job_inspection` | S3 | Generated-file CI check; the toolset selectable in Settings→Tools; cockpit vitest green |
+| S5 | Config flips: centurion + session groups per the §3 defaults | S4 | k3d: officer reads log/audit/chat/todos/diff/messages on a live worker job; session switch walk-through |
+| S6 | Scope header in the shared client | S1 | k3d: officer `list_jobs` returns only century jobs; unscoped sessions unchanged |
 
-S1–S3 are mechanical and carry the risk; S5 is the officer payoff; S6 is small
-and can land right after S1 if the officer returns early.
+The officer stopgap (hand-writing ~8 readers into today's `jobs.py`) stays
+rejected: the Resavio officer is held pending the `project_officers` migration,
+and S1–S3 are mechanical.
 
-**Stopgap track (not recommended, kept for the record):** hand-writing ~8
-readers into `src/tools/orchestrator/jobs.py` buys the officer eyes in ~a day
-if he must come off hold before S1–S3 land. The bodies would target the same
-routes and be deleted at S3. Since the Resavio officer is deliberately held
-pending the `project_officers` migration anyway, the recommendation is to skip
-the stopgap and land the real thing.
+## 6. Decisions — all ratified by the Legate 2026-08-06
 
-## 6. Decisions
-
-1. **Package placement** — RECOMMENDED: `src/shared/orch_surface/` (rationale
-   §3.1: works in all images today, is the flattening's target layout, kills
-   the MCP graft dance). **OPEN — Legate.**
-2. **Descriptor format** — RECOMMENDED: Python decorators/dataclasses, no YAML
-   manifest (both runtimes already derive schemas from signatures; a manifest
-   would be a second schema language with codegen anyway). **OPEN — Legate.**
-3. **Default session grant** — RECOMMENDED: `job_inspection` + `projects` +
-   `repositories` reads default-on for project-scoped sessions; `job_control`
-   stays behind the Fleet Management switch; capability grants remain the PDP
-   either way. **OPEN — Legate (product call).**
-4. **Does S7 (deferral) block S5 (re-carve)?** — RECOMMENDED: no; size groups
-   resident, let deferral widen later. **OPEN — Legate.**
-5. **Name convergence** — RECOMMENDED: canonical = MCP spellings, legacy
-   agent-side names as deprecated aliases for one cycle (§3.5). **OPEN —
-   Legate.**
+1. **Package placement** — `src/shared/orch_surface/` (§4.1). **DECIDED.**
+2. **Descriptor format** — Python decorators, no YAML manifest. **DECIDED.**
+3. **Session defaults** — both `job_control` and `job_inspection` ride the
+   existing Fleet Management switch (one user-facing concept: "manage jobs
+   from this session"), with `job_inspection` additionally default-on for
+   project-scoped sessions. **DECIDED.**
+4. **Name convergence** — canonical = MCP spellings, **hard rename, no
+   aliases, no deprecation cycle** (amended from the drafted alias
+   recommendation). **DECIDED.**
 
 ## 7. Verification
 
-- **Byte-compat harness (S1/S2 gate):** bake `tools/list` via the existing
-  `orchestrator/mcp/schema_artifact.py` + `image_smoke.py` path before and
-  after each slice; additionally record a fixed sample-call transcript (one
-  read per domain against a k3d fixture job) and diff the rendered text. MCP
-  consumers see zero drift until the deliberate S5 config flips.
-- **Per-slice unit gates:** `pytest tests/test_orchestrator_jobs_tool.py
-  tests/test_session_tool_group_mirror.py` (until S4 replaces the latter),
-  `ruff check src/ orchestrator/ tests/`, cockpit `vitest` for the generated
-  types, full `pytest tests/ -x -q` at slice boundaries (baseline: 8 known
-  local env failures).
-- **k3d end-to-end (S5/S6 gate):** provision a smoke officer against a live
-  worker job; verify each new read returns real data; verify scoped listing;
-  walk a session through Settings→Tools enabling `job_inspection`; run the
-  README smoke path to catch collateral.
-- **Tilt discipline:** every slice's edit-signal check (uvicorn reload / MCP
-  watchfiles restart) — the MCP resource must visibly restart on a
-  `src/shared/` touch, else the sync line is wrong (the known
-  partial-edits trap).
+- **Byte-compat gate (S1/S2):** `schema_artifact.py` + `image_smoke.py`
+  tools/list bake before/after; recorded sample-call transcript (one call per
+  toolset row against a k3d fixture job) diffed on rendered text.
+- **Unit gates:** `pytest tests/test_orchestrator_jobs_tool.py`, session
+  tool-group tests, `ruff`, cockpit vitest for generated types; full suite at
+  slice boundaries (local baseline: 8 known env failures).
+- **k3d end-to-end (S5/S6):** officer supervises a live worker job using the
+  new reads; scoped listing; session switch walk; README smoke path.
+- **Tilt discipline:** MCP resource must visibly restart on a `src/shared/`
+  edit (the known partial-edits trap).
 
 ## 8. Risks
 
-- **Output drift breaking MCP consumers** — the harness above; S2 migrates
-  domains incrementally with the diff gate per domain.
-- **Expert YAML / stored session config breakage** — aliases (§3.3, §3.5) keep
-  every existing spelling resolving; S5 flips only in-repo configs; DB-backed
-  expert rows are re-validated against the registry which now knows aliases.
-- **Flattening collision** — mitigated by building in the flattening's own
-  target location; the census regenerates manifests; if flattening goes first
-  instead, this feature's S1 becomes "move into the already-existing shared/".
-- **Agent image weight / dependency creep** — formatters are stdlib-only
-  (verified); the client is httpx-only; the import constraint in §3.1 keeps it
-  that way, enforced by import-linter post-flattening.
-- **Two registries during S2–S3** (descriptors + legacy `TOOL_REGISTRY`) — the
-  langchain adapter feeds descriptor metadata *into* `TOOL_REGISTRY` so
-  phase-gating, grant classification, and `validate_tool_override_fragment`
-  see one world; the legacy hand entries are deleted with S3.
-- **Session context budget** — post-S5 officer/session kits grow to ~30
-  resident tools; acceptable now, S7 is the structural answer if defaults
-  widen further.
+- **MCP output drift** → the byte-compat gate per slice; job domain migrates
+  with recorded diffs, everything else untouched.
+- **Legacy spellings in stored config** → in-repo references flip atomically
+  in S3 (validator-enforced). DB-stored expert rows and session
+  `config_override.tools` fragments may still name `*_worker_job` /
+  `*_workspace_*` tools: S3 includes a one-time scan of those tables; hits are
+  rewritten to canonical names (dev first, prod rows before rollout). The
+  boundary validator fails loud (400), not silent, on anything missed.
+- **Flattening collision** → built in the flattening's target location; if
+  flattening runs first, S1 becomes a no-op move.
+- **Agent image weight** → client is httpx-only, formatters stdlib-only
+  (verified); import constraints keep it that way.
+- **Two registries during S2–S3** → descriptor metadata is fed into
+  `TOOL_REGISTRY`; legacy entries deleted with S3.
 
 ## 9. Non-goals
 
-- The agent **lifecycle** client (`src/api/orchestrator_client.py` —
-  register/heartbeat/completion) stays separate: machine-to-machine, different
-  auth story.
-- The cockpit's `api.service.ts` is untouched.
-- No endpoint behaviour changes — this is client-side consolidation only.
-- Workspace-local `kb_*` tools stay a separate mechanism (§3.3).
-- Turning any group on for **workers** by default.
+- Unifying the non-job MCP domains (projects, datasources, knowledge, session
+  admin, DB introspection, sudo, models/catalog) — they stay MCP-only surfaces;
+  the officer does not need to create projects.
+- The agent lifecycle client (`src/api/orchestrator_client.py`) — different
+  auth story, machine-to-machine.
+- Cockpit `api.service.ts`; any endpoint behaviour change.
+- Workspace-local `kb_*` tools (direct store access, different mechanism).
+- Full-catalogue descriptor migration and tool deferral
+  (`project_tool_deferral`) — worthwhile later; not needed for a ~35-tool set.
+- Turning job tools on for **workers** by default (`default` sets make room
+  for it; enabling it is its own product decision).

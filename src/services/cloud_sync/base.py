@@ -53,6 +53,39 @@ def _should_ignore(rel_path: str) -> bool:
     return False
 
 
+def _normalize_dav_listing(raw: list, webdav_base_path: str) -> list[dict]:
+    """Shape a webdav3 ``list(get_info=True)`` result for the sync algorithm.
+
+    Shared by the Nextcloud and OpenCloud transports (it was duplicated).
+    Strips the server-absolute prefix down to mount-relative paths and
+    coerces ``size`` (webdav3 reports it as a string, absent for
+    collections) to ``int | None``.
+    """
+    out: list[dict] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        raw_path = item.get("path", "")
+        if raw_path.startswith(webdav_base_path):
+            rel = raw_path[len(webdav_base_path) :]
+        else:
+            rel = raw_path.strip("/")
+        size = item.get("size")
+        try:
+            size_int: Optional[int] = int(size) if size not in (None, "") else None
+        except (TypeError, ValueError):
+            size_int = None
+        out.append(
+            {
+                "path": rel,
+                "etag": item.get("etag", "") or "",
+                "isdir": bool(item.get("isdir")),
+                "size": size_int,
+            }
+        )
+    return out
+
+
 class WorkspaceSyncBase(abc.ABC):
     """Bidirectional workspace ↔ cloud-folder sync.
 
@@ -92,6 +125,14 @@ class WorkspaceSyncBase(abc.ABC):
         self._remote_state: dict[str, str] = {}
         self._remote_dirs: set[str] = set()
         self._pushed_sizes: dict[str, int] = {}
+        # One-shot guard for priming the dedup dicts from the remote tree.
+        # All state above is process memory: a fresh agent pod used to
+        # re-upload (and re-download) the whole mount because it had no way
+        # to know the cloud already held identical content. Set by the first
+        # pull (whose listing doubles as the seed) or by _seed_remote_state
+        # on a push that runs before any pull.
+        # docs/issues/session_turn_end_cloud_push_blocks_queued_input.md
+        self._remote_seeded: bool = False
 
         self._poll_task: Optional[asyncio.Task] = None
         self._running = False
@@ -111,11 +152,16 @@ class WorkspaceSyncBase(abc.ABC):
         """Upload ``local_path`` to remote ``rel_path``. Parent dirs already exist."""
 
     @abc.abstractmethod
-    async def _list_remote_files(self) -> list[dict]:
-        """List the session folder recursively.
+    async def _list_remote_files(self, rel_dir: str = "") -> list[dict]:
+        """List ONE remote directory level (``rel_dir`` is mount-relative).
 
         Returns a list of dicts shaped
-        ``{"path": <rel>, "etag": <str>, "isdir": <bool>}``.
+        ``{"path": <rel>, "etag": <str>, "isdir": <bool>, "size": <int|None>}``
+        where ``path`` is relative to the MOUNT ROOT, not to ``rel_dir``.
+        WebDAV ``list`` is a Depth-1 PROPFIND, so this is a single level;
+        recursion lives in ``_list_remote_tree``. Implementations returning
+        more than the requested level (test doubles list recursively) are
+        fine — the tree walk dedups.
         """
 
     @abc.abstractmethod
@@ -151,6 +197,99 @@ class WorkspaceSyncBase(abc.ABC):
             if mount_rel_path
             else self._mount_subdir
         )
+
+    async def _list_remote_tree(self) -> list[dict]:
+        """Recursively list the mount via per-directory ``_list_remote_files``.
+
+        The old single ``_list_remote_files()`` call was documented as
+        recursive but backed by a Depth-1 PROPFIND, which silently limited
+        pull (and now dedup seeding) to ROOT-LEVEL files — cloud-side edits
+        under ``output/`` etc. never reached the agent. Ignored subtrees are
+        pruned before descending; the visited set drops entries echoing the
+        listed collection itself (WebDAV servers include it) and keeps
+        fully-recursive test doubles from double-listing.
+        """
+        out: list[dict] = []
+        seen_files: set[str] = set()
+        visited: set[str] = set()
+        stack: list[str] = [""]
+        while stack:
+            rel_dir = stack.pop()
+            if rel_dir in visited:
+                continue
+            visited.add(rel_dir)
+            for item in await self._list_remote_files(rel_dir):
+                path = (item.get("path") or "").strip("/")
+                if not path or path == rel_dir:
+                    continue
+                if item.get("isdir"):
+                    if not _should_ignore(f"{path}/") and path not in visited:
+                        stack.append(path)
+                    continue
+                if path not in seen_files:
+                    seen_files.add(path)
+                    out.append({**item, "path": path})
+        return out
+
+    async def _seed_remote_state(self) -> None:
+        """One-shot: prime push dedup from the remote tree's sizes.
+
+        A fresh agent pod starts with empty in-memory dedup state and used
+        to re-upload the entire mount on its first push — minutes of serial
+        WebDAV round-trips. Recording each remote file's size as the
+        last-pushed size makes the first push skip everything the cloud
+        already holds at the same size: the documented size-dedup tradeoff
+        (a same-size, different-content change is missed until the size
+        moves), extended across pod recycles instead of newly invented.
+
+        Normally the attach/turn-start pull has already seeded (shared
+        ``_remote_seeded`` flag); this covers a push that runs before any
+        pull succeeded. Fail-soft and single-shot: on listing failure the
+        push simply runs unseeded, which is the old behavior.
+        """
+        if self._remote_seeded:
+            return
+        self._remote_seeded = True
+        try:
+            items = await self._list_remote_tree()
+        except Exception as e:
+            logger.debug("Remote dedup seeding skipped: %s", e)
+            return
+        seeded = 0
+        for item in items:
+            path = item.get("path", "")
+            if not path or _should_ignore(path):
+                continue
+            size = item.get("size")
+            if path not in self._pushed_sizes and isinstance(size, int) and size >= 0:
+                self._pushed_sizes[path] = size
+                seeded += 1
+        if seeded:
+            logger.info("Seeded push dedup from %d remote file size(s)", seeded)
+
+    async def _local_size(self, rel_path: str) -> Optional[int]:
+        """Byte size of the workspace copy of ``rel_path``, or None if absent.
+
+        Backend ``stat()`` reports 0 for missing paths, so a 0 answer gets an
+        ``is_file`` confirmation — otherwise an empty remote file would be
+        recorded as in-sync against a local copy that does not exist.
+        """
+        if self._backend:
+            backend_path = self._backend_path(rel_path)
+            try:
+                size = await asyncio.to_thread(self._backend.stat, backend_path)
+                if size == 0 and not await asyncio.to_thread(
+                    self._backend.is_file, backend_path
+                ):
+                    return None
+                return size
+            except Exception:
+                return None
+        local_path = self._workspace_path / rel_path
+        try:
+            return local_path.stat().st_size if local_path.is_file() else None
+        except OSError:
+            return None
 
     def _walk_backend_files(self) -> list[str]:
         """Recursively list files from the remote workspace backend.
@@ -189,6 +328,7 @@ class WorkspaceSyncBase(abc.ABC):
         pushed: list[str] = []
         try:
             await self._ensure_ready()
+            await self._seed_remote_state()
             if self._backend:
                 pushed = await self._push_via_backend(strict=strict)
             else:
@@ -210,6 +350,19 @@ class WorkspaceSyncBase(abc.ABC):
             if _should_ignore(rel_path):
                 continue
             try:
+                prev_size = self._pushed_sizes.get(rel_path)
+                if prev_size is not None:
+                    # stat() is one round-trip with no payload — read the
+                    # (possibly large) file only when its size moved. stat()
+                    # reports 0 for vanished paths, which mismatches any
+                    # tracked nonzero size and falls through to the read;
+                    # that read's failure is the per-file skip below.
+                    cur_size = await asyncio.to_thread(
+                        self._backend.stat,  # type: ignore[union-attr]
+                        self._backend_path(rel_path),
+                    )
+                    if cur_size == prev_size:
+                        continue
                 content = await asyncio.to_thread(
                     self._backend.read_file,  # type: ignore[union-attr]
                     self._backend_path(rel_path),
@@ -218,7 +371,6 @@ class WorkspaceSyncBase(abc.ABC):
                 if isinstance(content, str):
                     content = content.encode("utf-8")
 
-                prev_size = self._pushed_sizes.get(rel_path)
                 if prev_size is not None and len(content) == prev_size:
                     continue
 
@@ -258,6 +410,15 @@ class WorkspaceSyncBase(abc.ABC):
                 prev_mtime = self._local_state.get(rel_path)
                 if prev_mtime is not None and mtime <= prev_mtime:
                     continue
+                if prev_mtime is None:
+                    # First sighting by this instance. A seeded size match
+                    # means the cloud already holds this content — record
+                    # the mtime so the normal dedup takes over, skip the
+                    # upload (fresh-pod full re-upload fix, local mode).
+                    seeded = self._pushed_sizes.get(rel_path)
+                    if seeded is not None and local_path.stat().st_size == seeded:
+                        self._local_state[rel_path] = mtime
+                        continue
 
                 try:
                     remote_dir = str(Path(rel_path).parent)
@@ -282,12 +443,15 @@ class WorkspaceSyncBase(abc.ABC):
         try:
             await self._ensure_ready()
             try:
-                remote_files = await self._list_remote_files()
+                remote_files = await self._list_remote_tree()
             except Exception:
                 if strict:
                     raise
                 # Folder doesn't exist yet — nothing to pull
                 return pulled
+            # A successful listing doubles as the dedup seed (the reconcile
+            # below records sizes/etags), so a later push needn't re-list.
+            self._remote_seeded = True
 
             for item in remote_files:
                 path = item.get("path", "")
@@ -300,6 +464,28 @@ class WorkspaceSyncBase(abc.ABC):
                 prev_etag = self._remote_state.get(path)
                 if prev_etag and etag == prev_etag:
                     continue
+
+                if not prev_etag:
+                    # First sighting by this instance (fresh pod). If the
+                    # workspace copy already matches by size, record it as
+                    # in-sync instead of re-downloading the whole mount on
+                    # every pod recycle — which also clobbered any unpushed
+                    # local edit with a stale same-size cloud copy. Size is
+                    # the same heuristic push dedup has always used.
+                    size = item.get("size")
+                    if isinstance(size, int) and size >= 0:
+                        local_size = await self._local_size(path)
+                        if local_size == size:
+                            self._remote_state[path] = etag
+                            self._pushed_sizes[path] = size
+                            if not self._backend:
+                                try:
+                                    self._local_state[path] = (
+                                        (self._workspace_path / path).stat().st_mtime
+                                    )
+                                except OSError:
+                                    pass
+                            continue
 
                 try:
                     if self._backend:

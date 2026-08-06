@@ -23,7 +23,18 @@ aliases:
 > **pinned task set × replicates × arms**, executed and reported entirely
 > server-side.
 
-**Status:** Design, 2026-08-04. Motivated by two field failures of the
+**Status:** v1 SHIPPED and field-proven, 2026-08-06. First live run
+(`baseline-02`, run `885008dc`, 30 pairs) validated §5 acceptance: unattended
+completion through an orchestrator rollout *and* a 3-hour WAN outage (§5.1),
+server-computed latency-based strategic share (§5.2), infra-exclusion
+exercised for real (§5.4), k3d create→sweep→report smoke (§5.5). Still open:
+§5.3 two-arm run (next: the P-4 floor-trim A/B). Field findings + operating
+notes: `docs/issues/phase_model_overhead_amnesia_loop.md` §13,
+`bench/README.md` "Operating notes", and the three bench issue docs
+(sweeper multi-replica race — fix required before the next unattended run —
+infra-exclusion gap, resume-lane brief starvation).
+
+Originally: Design, 2026-08-04. Motivated by two field failures of the
 laptop runner in one night (machine shutdown, no home network): the runner
 must live where the jobs live. v0 CLI + stopgap pod exist; this component
 replaces both.

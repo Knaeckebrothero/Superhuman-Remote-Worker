@@ -137,15 +137,17 @@ class TestCreateThread:
 class TestGetThread:
     """Tests for get_thread method."""
 
+    TID = "5833c729-c0cd-496f-9a40-e9b811ae0ced"
+
     @pytest.mark.asyncio
     async def test_returns_dict_for_existing_thread(self):
-        row = {"id": "tid-1", "user_id": "user-1", "status": "active"}
+        row = {"id": self.TID, "user_id": "user-1", "status": "active"}
         conn = _mock_conn()
         conn.fetchrow = AsyncMock(return_value=row)
         db = _make_db_with_conn(conn)
 
-        result = await db.get_thread("tid-1")
-        assert result == {"id": "tid-1", "user_id": "user-1", "status": "active"}
+        result = await db.get_thread(self.TID)
+        assert result == {"id": self.TID, "user_id": "user-1", "status": "active"}
 
     @pytest.mark.asyncio
     async def test_returns_none_for_nonexistent(self):
@@ -153,8 +155,22 @@ class TestGetThread:
         conn.fetchrow = AsyncMock(return_value=None)
         db = _make_db_with_conn(conn)
 
-        result = await db.get_thread("nonexistent")
+        result = await db.get_thread("cccccccc-0000-4000-8000-000000000000")
         assert result is None
+
+    @pytest.mark.asyncio
+    async def test_malformed_id_is_none_not_dataerror(self):
+        """The id is user-supplied path input on every thread route; an
+        8-char prefix used to hit the uuid bind and 500. It must resolve to
+        None (the caller's 404) without ever touching the pool.
+        docs/issues/session_turn_end_cloud_push_blocks_queued_input.md"""
+        conn = _mock_conn()
+        conn.fetchrow = AsyncMock()
+        db = _make_db_with_conn(conn)
+
+        assert await db.get_thread("5833c729") is None
+        assert await db.get_thread("not-a-uuid") is None
+        conn.fetchrow.assert_not_awaited()
 
 
 # =============================================================================

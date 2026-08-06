@@ -57,7 +57,9 @@ class LocalFsWorkspaceSync(WorkspaceSyncBase):
         dst.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(local_path, dst)
 
-    async def _list_remote_files(self) -> list[dict]:
+    async def _list_remote_files(self, rel_dir: str = "") -> list[dict]:
+        # Deliberately ignores ``rel_dir`` and lists recursively — the base
+        # tree walk dedups, and this double exercises exactly that tolerance.
         out: list[dict] = []
         if not self._remote_root.exists():
             return out
@@ -66,7 +68,9 @@ class LocalFsWorkspaceSync(WorkspaceSyncBase):
                 continue
             rel = str(p.relative_to(self._remote_root))
             etag = hashlib.sha256(p.read_bytes()).hexdigest()
-            out.append({"path": rel, "etag": etag, "isdir": False})
+            out.append(
+                {"path": rel, "etag": etag, "isdir": False, "size": p.stat().st_size}
+            )
         return out
 
     async def _download_file(self, rel_path: str, local_path: str) -> None:
@@ -103,7 +107,7 @@ class FailingLocalFsWorkspaceSync(LocalFsWorkspaceSync):
             raise RuntimeError(self._message)
         await super()._upload_file(rel_path, local_path)
 
-    async def _list_remote_files(self) -> list[dict]:
+    async def _list_remote_files(self, rel_dir: str = "") -> list[dict]:
         if self._fail_on == "pull":
             raise RuntimeError(self._message)
-        return await super()._list_remote_files()
+        return await super()._list_remote_files(rel_dir)

@@ -20,6 +20,7 @@ class FakeSync(WorkspaceSyncBase):
         self.mkdirs: list[str] = []
         self.downloads: list[tuple[str, str]] = []
         self.ready_calls = 0
+        self.list_calls: list[str] = []
         self._listing = remote_listing or []
 
     async def _ensure_ready(self) -> None:
@@ -31,7 +32,8 @@ class FakeSync(WorkspaceSyncBase):
     async def _upload_file(self, rel_path: str, local_path: str) -> None:
         self.uploads.append((rel_path, local_path))
 
-    async def _list_remote_files(self) -> list[dict]:
+    async def _list_remote_files(self, rel_dir: str = "") -> list[dict]:
+        self.list_calls.append(rel_dir)
         return list(self._listing)
 
     async def _download_file(self, rel_path: str, local_path: str) -> None:
@@ -225,3 +227,191 @@ async def test_pull_write_back_does_not_hit_the_virtual_prefix(tmp_path: Path):
     await sync._pull_file_to_backend("contacts/anna-weber.md", "etag-1")
 
     assert (tmp_path / "contacts" / "anna-weber.md").read_text() == "remote-content"
+
+
+# ---------------------------------------------------------------------------
+# Fresh-pod economics: recursive remote tree, dedup seeding, reconcile.
+# All dedup state is process memory, so a recycled agent pod used to
+# re-upload (and re-download) the whole mount.
+# docs/issues/session_turn_end_cloud_push_blocks_queued_input.md
+# ---------------------------------------------------------------------------
+
+
+class DepthFakeSync(FakeSync):
+    """Depth-1 primitive like real WebDAV: one directory level per call,
+    keyed by ``rel_dir``, echoing the listed collection like real servers."""
+
+    def __init__(self, *args, tree: dict[str, list[dict]], **kwargs):
+        super().__init__(*args, **kwargs)
+        self._tree = tree
+
+    async def _list_remote_files(self, rel_dir: str = "") -> list[dict]:
+        self.list_calls.append(rel_dir)
+        echo = [{"path": rel_dir, "etag": "", "isdir": True}] if rel_dir else []
+        return echo + list(self._tree.get(rel_dir, []))
+
+
+@pytest.mark.asyncio
+async def test_pull_walks_subdirectories(tmp_path: Path):
+    """Cloud-side edits under output/ etc. must reach the agent. The old
+    single Depth-1 listing meant pull only ever saw root-level files."""
+    sync = DepthFakeSync(
+        tmp_path,
+        tree={
+            "": [
+                {"path": "a.txt", "etag": "v1", "isdir": False},
+                {"path": "output/", "etag": "", "isdir": True},
+            ],
+            "output": [
+                {"path": "output/nested.md", "etag": "v2", "isdir": False},
+            ],
+        },
+    )
+    pulled = await sync.pull()
+    assert set(pulled) == {"a.txt", "output/nested.md"}
+    assert sync.list_calls == ["", "output"]
+
+
+@pytest.mark.asyncio
+async def test_pull_prunes_ignored_subtrees(tmp_path: Path):
+    """repos/, .git/ etc. are never descended into — no wasted PROPFINDs,
+    no pulling content the push side refuses to touch."""
+    sync = DepthFakeSync(
+        tmp_path,
+        tree={
+            "": [
+                {"path": "repos/", "etag": "", "isdir": True},
+                {"path": "keep.txt", "etag": "v1", "isdir": False},
+            ],
+            "repos": [
+                {"path": "repos/x.py", "etag": "v9", "isdir": False},
+            ],
+        },
+    )
+    pulled = await sync.pull()
+    assert pulled == ["keep.txt"]
+    assert "repos" not in sync.list_calls
+
+
+@pytest.mark.asyncio
+async def test_pull_reconciles_matching_size_without_download(tmp_path: Path):
+    """Fresh pod, workspace already equals the cloud: pull must record the
+    etags and sizes WITHOUT re-downloading the mount (or clobbering it)."""
+    (tmp_path / "a.txt").write_text("hi")
+    sync = FakeSync(
+        tmp_path,
+        remote_listing=[{"path": "a.txt", "etag": "v1", "isdir": False, "size": 2}],
+    )
+    pulled = await sync.pull()
+    assert pulled == []
+    assert sync.downloads == []
+    assert sync._remote_state == {"a.txt": "v1"}
+    assert sync._pushed_sizes == {"a.txt": 2}
+
+    # The reconcile seeded push dedup too: nothing to upload.
+    pushed = await sync.push()
+    assert pushed == []
+
+    # A REAL remote change (new etag) still pulls.
+    sync._listing = [{"path": "a.txt", "etag": "v2", "isdir": False, "size": 2}]
+    pulled = await sync.pull()
+    assert pulled == ["a.txt"]
+
+
+@pytest.mark.asyncio
+async def test_pull_downloads_when_local_size_differs(tmp_path: Path):
+    (tmp_path / "a.txt").write_text("hi")  # 2 bytes locally
+    sync = FakeSync(
+        tmp_path,
+        remote_listing=[{"path": "a.txt", "etag": "v1", "isdir": False, "size": 7}],
+    )
+    pulled = await sync.pull()
+    assert pulled == ["a.txt"]
+
+
+@pytest.mark.asyncio
+async def test_pull_downloads_when_local_file_missing(tmp_path: Path):
+    """A zero-byte remote file with no local copy must still materialize —
+    stat() reporting 0 for missing paths must not read as 'in sync'."""
+    sync = FakeSync(
+        tmp_path,
+        remote_listing=[{"path": "empty.txt", "etag": "v1", "isdir": False, "size": 0}],
+    )
+    pulled = await sync.pull()
+    assert pulled == ["empty.txt"]
+
+
+@pytest.mark.asyncio
+async def test_push_seeds_dedup_from_remote_sizes(tmp_path: Path):
+    """Push before any successful pull (degraded attach): the one-shot seed
+    primes size dedup from the remote listing, so a fresh pod skips every
+    file the cloud already holds at the same size."""
+    (tmp_path / "same.txt").write_text("hi")  # matches remote size 2
+    (tmp_path / "changed.txt").write_text("hello")  # remote has 2, local 5
+    sync = FakeSync(
+        tmp_path,
+        remote_listing=[
+            {"path": "same.txt", "etag": "v1", "isdir": False, "size": 2},
+            {"path": "changed.txt", "etag": "v2", "isdir": False, "size": 2},
+        ],
+    )
+    pushed = await sync.push()
+    assert pushed == ["changed.txt"]
+
+    # One-shot: the listing is not re-fetched on later pushes.
+    calls_after_first = len(sync.list_calls)
+    await sync.push()
+    assert len(sync.list_calls) == calls_after_first
+
+
+@pytest.mark.asyncio
+async def test_push_seeding_failure_falls_back_to_full_push(tmp_path: Path):
+    """Listing failure (folder not provisioned yet) must not kill the push —
+    it just runs unseeded, which is the old behavior."""
+    (tmp_path / "a.txt").write_text("hi")
+
+    class ListingFails(FakeSync):
+        async def _list_remote_files(self, rel_dir: str = "") -> list[dict]:
+            raise RuntimeError("PROPFIND 404")
+
+    sync = ListingFails(tmp_path)
+    pushed = await sync.push()
+    assert pushed == ["a.txt"]
+
+
+@pytest.mark.asyncio
+async def test_push_backend_seeded_skip_uses_stat_not_read(tmp_path: Path):
+    """Backend mode: a size-tracked, unchanged file costs one stat() and no
+    read_file() — the per-turn walk must not transfer unchanged content."""
+    from tests._fs_backend import FilesystemTestBackend
+
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / "big.bin").write_bytes(b"x" * 1024)
+    backend = FilesystemTestBackend(ws)
+
+    reads: list[str] = []
+    orig_read = backend.read_file
+
+    def counting_read(path, binary=False):
+        reads.append(path)
+        return orig_read(path, binary)
+
+    backend.read_file = counting_read  # type: ignore[method-assign]
+
+    sync = FakeSync(
+        tmp_path,
+        workspace_backend=backend,
+        remote_listing=[
+            {"path": "big.bin", "etag": "v1", "isdir": False, "size": 1024}
+        ],
+    )
+    pushed = await sync.push()
+    assert pushed == []
+    assert reads == []
+
+    # Size moved → read + upload again.
+    (ws / "big.bin").write_bytes(b"x" * 2048)
+    pushed = await sync.push()
+    assert pushed == ["big.bin"]
+    assert reads == ["big.bin"]

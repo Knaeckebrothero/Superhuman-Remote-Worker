@@ -708,6 +708,23 @@ export class PersistentChatService {
      * spinning forever.
      */
     readonly outboxStalled = signal(false);
+    /**
+     * Sends the server has ACCEPTED whose turn hasn't started yet. The agent
+     * 200s `/input` after persisting + enqueueing; if its loop is busy (e.g.
+     * the previous turn's cloud push is still flushing) nothing reaches the
+     * stream until `turn.started` — which used to read as a swallowed
+     * message: outbox empty, no active turn, composer back to idle/mic.
+     * +1 per accepted POST (not the 409-duplicate path), −1 on
+     * `turn.started` (clamped), zeroed by terminal frames and teardown.
+     * docs/issues/session_turn_end_cloud_push_blocks_queued_input.md
+     */
+    readonly pendingTurnCount = signal(0);
+    /** True while an accepted send waits for its turn to start — drives the
+     *  working placeholder, spinner and dots so a queued input is visibly
+     *  alive instead of apparently swallowed. */
+    readonly isAwaitingTurn = computed(
+        () => this.pendingTurnCount() > 0 && !this.isStreaming(),
+    );
     // Single-flight guard for _flushOutbox (one POST in flight per tab).
     private flushingOutbox = false;
     // localId of the item whose POST is currently in flight (skipped by
@@ -896,6 +913,9 @@ export class PersistentChatService {
             // wholesale — unless we're carrying it across a create/reprovision
             // (createAndConnect), where the queued sends belong to *this* thread.
             if (!opts.carryOutbox) this.outbox.set([]);
+            // Accepted-send accounting is per-thread; a carried count would
+            // pin the new thread's composer on "working".
+            this.pendingTurnCount.set(0);
             // Genuine thread switch: a resume watermark from the previous
             // thread would suppress a real terminal frame on this one.
             this.resumedFromEpoch = null;
@@ -2125,6 +2145,10 @@ export class PersistentChatService {
         this.controlWsOpening = false;
         this.intentionalClose = true;
         this.isCreating.set(false);
+        // An accepted send may still be running server-side, but with the
+        // transport down there is no turn.started to clear it — never leave
+        // the composer stuck on "working" after a teardown.
+        this.pendingTurnCount.set(0);
         if (this.controlWsReconnectTimer) {
             clearTimeout(this.controlWsReconnectTimer);
             this.controlWsReconnectTimer = null;
@@ -2493,6 +2517,12 @@ export class PersistentChatService {
                     // 200 or 409 dup — the turn is live server-side. Remove by
                     // localId (never positionally: the head may have shifted)
                     // and keep the bubble; SSE renders the turn.
+                    if (result.status !== 409) {
+                        // Accepted-and-queued: keep the send visibly alive
+                        // until its turn.started lands. (A 409's turn is
+                        // already in flight — isStreaming covers it.)
+                        this.pendingTurnCount.update((c) => c + 1);
+                    }
                     this._removeFromOutbox(head.localId);
                     // The send that produced any stall banner just landed, so
                     // the banner is now lying. Clear both.
@@ -3043,6 +3073,10 @@ export class PersistentChatService {
                 break;
 
             case 'turn.started': {
+                // The awaited turn is live — isStreaming takes over from the
+                // awaiting state. Clamped: a turn can start without a tracked
+                // accept (other tab, injected input, reload mid-queue).
+                this.pendingTurnCount.update((c) => Math.max(0, c - 1));
                 const turnId = String(params['turn_id'] ?? makeLocalId('turn'));
                 this.turnCount.update((c) => c + 1);
                 this.dispatch({
@@ -3239,6 +3273,10 @@ export class PersistentChatService {
                 this.isInterrupting.set(false);
                 this.runningTool.set(null);
                 this.compaction.set(null);
+                // Conservative reset: a queued send may still run after the
+                // failed turn, but its turn.started decrement is clamped —
+                // better a missing awaiting state than one stuck forever.
+                this.pendingTurnCount.set(0);
                 this._systemMessage(`⚠ ${this.sanitizeError(params['message'] as string)}`);
                 break;
             }
@@ -3247,6 +3285,7 @@ export class PersistentChatService {
                 this._closeActiveTurnIfAny('turn_interrupted');
                 this.isInterrupting.set(false);
                 this.runningTool.set(null);
+                this.pendingTurnCount.set(0);
                 break;
 
             case 'mode.changed':
@@ -3416,6 +3455,7 @@ export class PersistentChatService {
                 if (this._isSupersededLifecycleFrame()) break;
                 this._systemMessage('Session ended.');
                 this.isWaitingForInput.set(false);
+                this.pendingTurnCount.set(0);
                 this.threadStatus.set('ended');
                 this.endedAt.set(new Date().toISOString());
                 break;
@@ -3426,6 +3466,7 @@ export class PersistentChatService {
                     `Session paused after ${(params['timeout_minutes'] as number) || 30} minutes of inactivity. Your work has been saved.`,
                 );
                 this.isWaitingForInput.set(false);
+                this.pendingTurnCount.set(0);
                 this.threadStatus.set('ended');
                 this.endedAt.set(new Date().toISOString());
                 break;

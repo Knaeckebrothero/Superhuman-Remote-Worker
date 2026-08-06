@@ -696,8 +696,7 @@ jobs:
             docker/Dockerfile.orchestrator)
           COCKPIT_PATHS=(cockpit/ docker/Dockerfile.cockpit
             docker/cockpit-nginx.conf docker/cockpit-canvas-env.sh)
-          MCP_PATHS=(orchestrator/mcp/ orchestrator/services/formatters.py
-            orchestrator/services/__init__.py
+          MCP_PATHS=(orchestrator/mcp/ src/shared/
             orchestrator/security/__init__.py
             orchestrator/security/anti_framing.py docker/Dockerfile.mcp)
           # docker/browser-exec is COPY'd into the workspace image at build time
