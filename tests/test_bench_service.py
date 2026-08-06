@@ -2,17 +2,21 @@
 
 from __future__ import annotations
 
+import asyncio
 import copy
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from services.bench import (
+    BenchStore,
     build_bench_job_payload,
     build_submission_queue,
     freeze_spec,
     sweep_run,
+    sweep_tick,
 )
 
 RUN_ID = "11111111-1111-1111-1111-111111111111"
@@ -79,9 +83,25 @@ class FakeStore:
         self.run = copy.deepcopy(run)
         self.tagged_jobs = copy.deepcopy(tagged_jobs or [])
         self.saves: list[dict] = []
+        self._sweep_lock = asyncio.Lock()
 
     async def list_tagged_jobs(self, _run_id: str) -> list[dict]:
         return copy.deepcopy(self.tagged_jobs)
+
+    async def list_running_runs(self) -> list[dict]:
+        return [copy.deepcopy(self.run)] if self.run["status"] == "running" else []
+
+    @asynccontextmanager
+    async def try_sweep_lock(self):
+        """Emulate pg_try_advisory_lock: non-blocking claim, loser gets False."""
+        if self._sweep_lock.locked():
+            yield False
+            return
+        await self._sweep_lock.acquire()
+        try:
+            yield True
+        finally:
+            self._sweep_lock.release()
 
     async def save_run(
         self,
@@ -319,3 +339,110 @@ async def test_restart_reconstructs_job_created_before_ledger_commit():
     assert await sweep_run(store, store.run, create_job) == 0
     create_job.assert_not_awaited()
     assert store.run["state"][0]["job_id"] == "job-in-crash-window"
+
+
+@pytest.mark.asyncio
+async def test_concurrent_ticks_submit_once_across_replicas():
+    """Two replicas' sweepers fired 2-5 ms apart and double-submitted the same
+    (task, arm, replicate). The advisory claim makes the loser a no-op.
+    docs/issues/bench_sweeper_multi_replica_race.md
+    """
+    store = FakeStore(_run(max_in_flight=2))
+    first_submit = asyncio.Event()
+    release = asyncio.Event()
+    created_ids = iter(["job-1", "job-2"])
+
+    async def create_job(_run, _task, _arm, _replicate):
+        first_submit.set()
+        await release.wait()  # hold replica A inside the locked tick
+        return {"id": next(created_ids), "status": "created"}
+
+    replica_a = asyncio.create_task(sweep_tick(store, create_job))
+    await first_submit.wait()  # A now holds the claim, mid-submission
+
+    assert await sweep_tick(store, create_job) == 0, "replica B swept under A's lock"
+
+    release.set()
+    assert await replica_a == 2
+    assert [entry["job_id"] for entry in store.run["state"]] == ["job-1", "job-2"]
+    pairs = [(e["task"], e["arm"], e["replicate"]) for e in store.run["state"]]
+    assert len(pairs) == len(set(pairs)), "duplicate (task, arm, replicate) pair"
+
+
+@pytest.mark.asyncio
+async def test_sweep_lock_is_released_between_ticks():
+    store = FakeStore(_run(max_in_flight=1))
+    create_job = AsyncMock(side_effect=[{"id": "job-1", "status": "created"}])
+    assert await sweep_tick(store, create_job) == 1
+
+    store.tagged_jobs = [_tagged(store.run["state"][0], "completed")]
+    create_job.side_effect = [{"id": "job-2", "status": "created"}]
+    assert await sweep_tick(store, create_job) == 1  # lock was not leaked
+
+
+@pytest.mark.asyncio
+async def test_sweep_lock_released_when_a_run_sweep_raises():
+    store = FakeStore(_run(max_in_flight=1))
+    boom = AsyncMock(side_effect=RuntimeError("job service down"))
+    assert await sweep_tick(store, boom) == 0  # per-run isolation, not a raise
+
+    create_job = AsyncMock(return_value={"id": "job-1", "status": "created"})
+    assert await sweep_tick(store, create_job) == 1  # next tick still claims
+
+
+@pytest.mark.asyncio
+async def test_tick_without_lock_support_still_sweeps():
+    """Narrow stores without try_sweep_lock (older fakes) must keep working."""
+
+    class NarrowStore(FakeStore):
+        try_sweep_lock = None  # a narrow fake that predates the lock method
+
+    store = NarrowStore(_run(max_in_flight=1))
+    create_job = AsyncMock(return_value={"id": "job-1", "status": "created"})
+    assert await sweep_tick(store, create_job) == 1
+
+
+@pytest.mark.asyncio
+async def test_bench_store_claim_is_session_scoped_and_released():
+    """Claim and release must ride ONE held connection — PostgresDB.fetchval
+    grabs a fresh pooled connection per call, which would unlock a different
+    session and leak the lock for the winner's connection lifetime."""
+    conn = AsyncMock()
+    conn.fetchval.side_effect = [True, True]
+    acquires = 0
+
+    @asynccontextmanager
+    async def acquire():
+        nonlocal acquires
+        acquires += 1
+        yield conn
+
+    db = MagicMock()
+    db.acquire = acquire
+
+    async with BenchStore(db).try_sweep_lock() as claimed:
+        assert claimed is True
+
+    assert acquires == 1, "claim and release must share one session"
+    claim_call, release_call = conn.fetchval.await_args_list
+    assert "pg_try_advisory_lock" in claim_call.args[0]
+    assert "pg_advisory_xact_lock" not in claim_call.args[0]  # tick has no txn
+    assert "pg_advisory_unlock" in release_call.args[0]
+    assert claim_call.args[1] == release_call.args[1] == "bench_sweep"
+
+
+@pytest.mark.asyncio
+async def test_bench_store_loser_issues_no_unlock():
+    conn = AsyncMock()
+    conn.fetchval.return_value = False
+
+    @asynccontextmanager
+    async def acquire():
+        yield conn
+
+    db = MagicMock()
+    db.acquire = acquire
+
+    async with BenchStore(db).try_sweep_lock() as claimed:
+        assert claimed is False
+    assert conn.fetchval.await_count == 1  # never unlock a lock we don't hold
