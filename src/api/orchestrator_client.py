@@ -1369,6 +1369,19 @@ class OrchestratorClient:
         if response.status_code == 409:
             detail = response.json().get("detail", {})
             errors = detail.get("errors") if isinstance(detail, dict) else None
+            if isinstance(detail, dict) and detail.get("escalated"):
+                # The orchestrator hit the per-critic rejection cap and
+                # escalated the target to a human — the usual "correct and
+                # resubmit" instruction must become a stop order or the
+                # critic livelocks (rejected_verdict_livelocks_critic_and_
+                # wedges_parent.md).
+                err = VerdictRecordingError(
+                    "verdict rejected and the review has been escalated to a "
+                    "human after repeated invalid submissions:\n- "
+                    + "\n- ".join(errors or [str(detail)])
+                )
+                err.escalated = True
+                raise err
             raise VerdictRecordingError(
                 "verdict rejected:\n- " + "\n- ".join(errors or [str(detail)])
             )

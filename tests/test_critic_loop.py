@@ -883,3 +883,42 @@ class TestVerdictDurability:
         assert "error" in result.lower()
         assert "not recorded" in result.lower()
         assert get_verdict_data("c5") is None
+
+    @pytest.mark.asyncio
+    async def test_escalated_rejection_returns_stop_order_not_resubmit(self):
+        """Rejection-cap escalation: the tool must STOP the resubmit loop.
+
+        When the orchestrator flags the 409 as escalated (per-critic rejection
+        cap reached, target already sent to manual review), returning the
+        usual "must be corrected and resubmitted" string is the livelock —
+        the model obeys it forever (189 iterations / 105 min live).
+        docs/issues/rejected_verdict_livelocks_critic_and_wedges_parent.md
+        """
+        from unittest.mock import AsyncMock
+
+        from src.api.orchestrator_client import VerdictRecordingError
+        from src.tools.context import ToolContext
+        from src.tools.evaluation.evaluation_tools import (
+            create_evaluation_tools,
+            get_verdict_data,
+        )
+
+        err = VerdictRecordingError(
+            "verdict rejected and the review has been escalated to a human "
+            "after repeated invalid submissions:\n- Cannot return a job with "
+            "no findings"
+        )
+        err.escalated = True
+        ctx = ToolContext(_job_id="c6", config={})
+        ctx.orchestrator_client = AsyncMock()
+        ctx.orchestrator_client.record_verification_round = AsyncMock(side_effect=err)
+        _, return_with_feedback = create_evaluation_tools(ctx)
+
+        result = await return_with_feedback.ainvoke(
+            {"job_id": "t1", "feedback": "bad", "findings": []}
+        )
+
+        assert "escalated to a human" in result
+        assert "Do NOT resubmit" in result
+        assert "must be corrected and resubmitted" not in result
+        assert get_verdict_data("c6") is None

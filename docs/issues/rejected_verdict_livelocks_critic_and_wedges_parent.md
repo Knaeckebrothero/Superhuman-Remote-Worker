@@ -11,7 +11,31 @@ tags:
 **Filed:** 2026-08-01, from the verification live-gate re-run
 (dev target `40efbb39-0890-40fa-a464-6e3d6bd92832`, critic
 `245889ac-6d5b-4771-bd5a-5f47fd1b7e31`).
-**Status:** Observed live. UNFIXED. Manually cancelled after 105 minutes.
+**Status:** FIXED 2026-08-06 (batch fix session) — fix direction 1
+implemented end to end:
+- **Cap**: `_record_verification_round_impl` counts 409-rejected
+  submissions per critic via the new atomic
+  `PostgresDB.increment_verdict_rejections` (single-statement
+  read-and-increment on the CRITIC's `context.verdict_rejections`; a fresh
+  critic per round naturally resets it). At `_MAX_VERDICT_REJECTIONS = 3`
+  the TARGET is escalated through `_escalate_target` (so loop jobs still
+  get `completed`, not `pending_review` — the loop-wedge guard is
+  inherited) with the rejection reason, and the 409 carries
+  `"escalated": true`.
+- **Stop order**: the agent-side client (`orchestrator_client`) turns an
+  escalated 409 into a `VerdictRecordingError` with `.escalated = True`,
+  and the `return_job_with_feedback`/`approve_job` tool wrapper then tells
+  the model "escalated to a human reviewer. Do NOT resubmit" instead of
+  "must be corrected and resubmitted" — killing the resubmit loop itself,
+  not just the wedged parent.
+- **Tests**: `tests/test_verification_flow.py` (below-cap → plain 409s and
+  no escalation; 3rd rejection → escalation with target row + reason,
+  ledger untouched; counter is per-critic) and
+  `tests/test_critic_loop.py::test_escalated_rejection_returns_stop_order_not_resubmit`.
+- Fix direction 2 (the wall-clock watchdog arm for live-critic reviews,
+  `_UNSTICK_REVIEWING_SQL`) remains OPEN as the backstop — not built in
+  this batch.
+**Originally:** Observed live. UNFIXED. Manually cancelled after 105 minutes.
 **Severity:** **high** — unbounded cost and an indefinitely wedged parent. The
 parent sits in `reviewing` with no deadline and no operator signal.
 **Component:** `orchestrator/database/postgres.py:4940`
