@@ -22651,6 +22651,135 @@ async def record_verification_round(
     )
 
 
+def _parse_completion_decision(job: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Extract ``context.completion_decision`` with the defensive JSONB parse.
+
+    asyncpg returns JSONB as a string on the app pool (no codec registered) —
+    same trap as ``_record_verification_round_impl``'s critic context parse.
+    """
+    ctx = (job or {}).get("context")
+    if isinstance(ctx, str):
+        try:
+            ctx = json.loads(ctx)
+        except (json.JSONDecodeError, ValueError):
+            ctx = {}
+    if not isinstance(ctx, dict):
+        return None
+    decision = ctx.get("completion_decision")
+    return decision if isinstance(decision, dict) else None
+
+
+async def _record_completion_decision_impl(
+    *,
+    postgres_db: Any,
+    job_id: str,
+    tool_call_id: str,
+    summary: str,
+    deliverables: list[Any],
+    confidence: float,
+    notes: str | None,
+) -> dict[str, Any]:
+    """Validate and durably journal one job_complete decision.
+
+    Journal-before-observe (docs/issues/
+    job_finalization_decisions_held_only_in_process_memory.md): the agent's
+    ``job_complete`` tool must not return to the model until the decision is
+    committed here. Idempotency key is ``(job_id, tool_call_id)`` — a replay
+    of the same tool call (ToolNode re-execution after a checkpoint gap)
+    short-circuits to the stored record; a NEW tool_call_id (a genuine later
+    decision, e.g. round 2 after a critic return) overwrites. Split out of
+    the route so the logic is testable without HTTP.
+    """
+    if not tool_call_id:
+        raise HTTPException(status_code=400, detail="tool_call_id is required")
+
+    job = await postgres_db.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+
+    if job.get("status") in ("completed", "failed", "cancelled"):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Job {job_id} is already terminal "
+                f"({job.get('status')}); refusing to journal a completion "
+                f"decision for it."
+            ),
+        )
+
+    existing = _parse_completion_decision(job)
+    if existing and existing.get("tool_call_id") == tool_call_id:
+        # Same tool call re-executed after a crash — the journal already has
+        # this decision; replay is a no-op.
+        return {"recorded": True, "replay": True, "decision": existing}
+
+    decision = {
+        "tool_call_id": tool_call_id,
+        "summary": str(summary or ""),
+        "deliverables": [str(d) for d in (deliverables or [])],
+        "confidence": max(0.0, min(1.0, float(confidence))),
+        "recorded_at": datetime.now(timezone.utc).isoformat(),
+        "job_id": str(job_id),
+    }
+    if notes:
+        decision["notes"] = str(notes)
+
+    if not await postgres_db.set_completion_decision(job_id, decision):
+        # The CAS lost: the job vanished or flipped terminal under us.
+        raise HTTPException(
+            status_code=409,
+            detail=f"Job {job_id} changed state while journaling the decision",
+        )
+
+    logger.info(
+        f"Journaled completion decision for job {job_id} "
+        f"(tool_call_id={tool_call_id}, confidence={decision['confidence']}, "
+        f"{len(decision['deliverables'])} deliverable(s))"
+    )
+    return {"recorded": True, "replay": False, "decision": decision}
+
+
+@app.post("/api/jobs/{job_id}/completion-decision")
+async def record_completion_decision(request: Request, job_id: str) -> dict[str, Any]:
+    """Durably journal the agent's job_complete decision on the job row.
+
+    **Internal** (P4b) — requires ``X-Internal-Key``. Ingress strips this path.
+    Called by the worker's ``job_complete`` tool BEFORE it returns, so the
+    decision survives any agent restart (journal-before-observe — the sibling
+    of ``/verification/rounds`` for the worker's own terminating decision).
+    """
+    await require_internal(request)
+    body = await request.json()
+    try:
+        confidence = float(body.get("confidence", 1.0))
+    except (TypeError, ValueError):
+        confidence = 1.0
+    return await _record_completion_decision_impl(
+        postgres_db=postgres_db,
+        job_id=job_id,
+        tool_call_id=str(body.get("tool_call_id") or ""),
+        summary=str(body.get("summary") or ""),
+        deliverables=body.get("deliverables") or [],
+        confidence=confidence,
+        notes=body.get("notes"),
+    )
+
+
+@app.get("/api/jobs/{job_id}/completion-decision")
+async def get_completion_decision(request: Request, job_id: str) -> dict[str, Any]:
+    """Read back the journaled job_complete decision (or null).
+
+    **Internal** (P4b) — requires ``X-Internal-Key``. Used by the agent's
+    resume hydration so a restarted process re-seeds its in-memory cache from
+    the durable record instead of treating "I decided" as "no decision".
+    """
+    await require_internal(request)
+    job = await postgres_db.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+    return {"decision": _parse_completion_decision(job)}
+
+
 @app.get("/api/citations/{citation_id}")
 async def get_citation_detail(request: Request, citation_id: int) -> dict[str, Any]:
     """Get full citation record with source info and verification details.

@@ -2601,6 +2601,48 @@ class PostgresDB:
 
         return result == "UPDATE 1"
 
+    async def set_completion_decision(
+        self, job_id: str, decision: Dict[str, Any]
+    ) -> bool:
+        """Durably journal a job_complete decision on the job's own row.
+
+        Journal-before-observe (docs/issues/
+        job_finalization_decisions_held_only_in_process_memory.md): the agent's
+        ``job_complete`` tool calls this THROUGH the orchestrator before it
+        returns to the model, so the decision survives any restart. One atomic
+        statement on the ``jobs`` row — the later status transition updates the
+        same row, so decision and status can never diverge across a partial
+        write. CAS-guarded on non-terminal status: a stale agent must not
+        rewrite the journal of a job that already reached a terminal state.
+
+        Args:
+            job_id: Job UUID as string
+            decision: Decision record (tool_call_id, summary, deliverables,
+                confidence, optional notes, recorded_at)
+
+        Returns:
+            True if journaled; False if the job is missing, terminal, or the
+            id is invalid.
+        """
+        import json as json_module
+
+        try:
+            uuid_val = UUID(job_id)
+        except ValueError:
+            return False
+
+        query = (
+            "UPDATE jobs "
+            "SET context = COALESCE(context, '{}'::jsonb) "
+            "    || jsonb_build_object('completion_decision', $1::jsonb), "
+            "    updated_at = CURRENT_TIMESTAMP "
+            "WHERE id = $2 AND status NOT IN ('completed', 'failed', 'cancelled')"
+        )
+        async with self.acquire() as conn:
+            result = await conn.execute(query, json_module.dumps(decision), uuid_val)
+
+        return result == "UPDATE 1"
+
     async def append_queued_reply(self, job_id: str, reply: Dict[str, Any]) -> bool:
         """Atomically append one reply object to ``context.queued_replies``.
 
@@ -6544,13 +6586,29 @@ class PostgresDB:
         }
 
     async def queue_job_for_resume(
-        self, job_id: str, context_merge: Dict[str, Any] | None = None
+        self,
+        job_id: str,
+        context_merge: Dict[str, Any] | None = None,
+        *,
+        void_completion_decision: bool = True,
     ) -> bool:
         """Park a job as 'paused' (dispatchable) in ONE statement.
 
         Merges ``context_merge`` (``queued_feedback`` and friends), flips the
         status, unassigns the agent, and sheds the row-level freeze — stashing
         it in ``context.last_freeze_data`` for observability first.
+
+        ``void_completion_decision`` (default True) also drops
+        ``context.completion_decision`` in the same statement: a resume that
+        demands NEW work (critic return, reviewer feedback, human reply) voids
+        the journaled job_complete decision, otherwise the round-2 agent's
+        resume hydration would re-seed round 1's decision and finalize the new
+        round with the old report. Pass False only for pure re-provisioning
+        parks where the job is NOT being sent back for more work (e.g. the
+        missing-workspace requeue on manual assign) — there the journaled
+        decision must survive the restart; losing it is the exact defect
+        docs/issues/job_finalization_decisions_held_only_in_process_memory.md
+        describes.
 
         Clearing the freeze is the whole point. ``get_dispatchable_jobs``
         requires ``freeze_data IS NULL`` (partial-index contract, 0046), so a
@@ -6570,14 +6628,16 @@ class PostgresDB:
             job_uuid = UUID(job_id)
         except ValueError:
             return False
+        # Fixed literal chosen by a bool — not caller data; safe to inline.
+        drop_decision = " - 'completion_decision'" if void_completion_decision else ""
         async with self.acquire() as conn:
             row = await conn.fetchrow(
-                """
+                f"""
                 UPDATE jobs
-                   SET context = COALESCE(context, '{}'::jsonb)
+                   SET context = (COALESCE(context, '{{}}'::jsonb){drop_decision})
                                  || $2::jsonb
                                  || CASE
-                                        WHEN freeze_data IS NULL THEN '{}'::jsonb
+                                        WHEN freeze_data IS NULL THEN '{{}}'::jsonb
                                         ELSE jsonb_build_object(
                                             'last_freeze_data', freeze_data
                                         )

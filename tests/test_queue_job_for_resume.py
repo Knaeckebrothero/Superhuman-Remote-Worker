@@ -222,6 +222,76 @@ async def test_unknown_job_is_a_no_op(db):
     assert await db.queue_job_for_resume("not-a-uuid") is False
 
 
+DECISION = {
+    "tool_call_id": "call-round1",
+    "summary": "Round 1 delivered.",
+    "deliverables": ["output/report.md"],
+    "confidence": 0.9,
+    "recorded_at": "2026-08-06T20:00:00+00:00",
+    "job_id": JOB,
+}
+
+
+@pytest.mark.asyncio
+async def test_feedback_resume_voids_completion_decision(db):
+    """A resume that demands NEW work must drop the journaled decision — the
+    round-2 agent's hydration would otherwise re-seed round 1's decision and
+    finalize the new round with the old report.
+    See docs/issues/job_finalization_decisions_held_only_in_process_memory.md.
+    """
+    assert await db.set_completion_decision(JOB, DECISION)
+
+    assert await db.queue_job_for_resume(JOB, {"queued_feedback": "do more"})
+
+    async with db.acquire() as conn:
+        ctx = await db_context(conn, JOB)
+    assert "completion_decision" not in ctx
+    # Sibling keys and the feedback merge must survive the subtraction.
+    assert ctx["queued_feedback"] == "do more"
+    assert ctx["loop_id"] == "b15dc68f"
+
+
+@pytest.mark.asyncio
+async def test_provisioning_requeue_preserves_completion_decision(db):
+    """The missing-workspace requeue is a pure re-park, not a new round —
+    losing the decision there is the exact defect the journal exists to fix."""
+    assert await db.set_completion_decision(JOB, DECISION)
+
+    assert await db.queue_job_for_resume(JOB, void_completion_decision=False)
+
+    async with db.acquire() as conn:
+        ctx = await db_context(conn, JOB)
+    assert ctx["completion_decision"]["tool_call_id"] == "call-round1"
+    assert ctx["completion_decision"]["summary"] == "Round 1 delivered."
+
+
+@pytest.mark.asyncio
+async def test_set_completion_decision_round_trips(db):
+    assert await db.set_completion_decision(JOB, DECISION)
+
+    async with db.acquire() as conn:
+        ctx = await db_context(conn, JOB)
+    assert ctx["completion_decision"] == DECISION
+    # Sibling context keys untouched (atomic top-level merge).
+    assert ctx["loop_id"] == "b15dc68f"
+
+
+@pytest.mark.asyncio
+async def test_set_completion_decision_refuses_terminal_job(db):
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE jobs SET status = 'completed' WHERE id = $1", UUID(JOB)
+        )
+
+    assert await db.set_completion_decision(JOB, DECISION) is False
+
+    async with db.acquire() as conn:
+        ctx = await db_context(conn, JOB)
+    assert "completion_decision" not in ctx, (
+        "a stale agent must not rewrite the journal of a terminal job"
+    )
+
+
 async def db_context(conn, job_id: str) -> dict:
     """Read a job's context as a dict (asyncpg returns JSONB as a str)."""
     raw = await conn.fetchval("SELECT context FROM jobs WHERE id = $1", UUID(job_id))

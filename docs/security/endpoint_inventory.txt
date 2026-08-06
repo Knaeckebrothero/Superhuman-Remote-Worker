@@ -62,6 +62,12 @@ POST   /api/admin/usage/v2/coverage-gaps/{gap_id}/waive                         
 POST   /api/admin/usage/v2/infrastructure-corrections                                   unscoped
 GET    /api/admin/usage/v2/infrastructure-cutover                                       unscoped
 POST   /api/admin/usage/v2/infrastructure-cutover/prepare                               unscoped
+GET    /api/admin/usage/v2/storage-activation                                           unscoped
+POST   /api/admin/usage/v2/storage-activation/{measurement_basis}/schedule              unscoped
+POST   /api/admin/usage/v2/storage-activation/{measurement_basis}/shadow                unscoped
+GET    /api/admin/usage/v2/storage-assets/backend-unverified                            unscoped
+GET    /api/admin/usage/v2/storage-assets/{asset_id}                                    unscoped
+POST   /api/admin/usage/v2/storage-assets/{asset_id}/destroy                            unscoped
 GET    /api/admin/users                                                                 admin:_require_admin
 POST   /api/admin/users/approve                                                         admin:_require_admin
 PATCH  /api/admin/users/{user_id}                                                       admin:_require_admin
@@ -186,6 +192,8 @@ GET    /api/jobs/{job_id}/chat/entry/{entry_id}                                 
 GET    /api/jobs/{job_id}/citations                                                     gated:require_job_access
 GET    /api/jobs/{job_id}/citations/stats                                               gated:require_job_access
 POST   /api/jobs/{job_id}/complete                                                      internal:require_internal
+GET    /api/jobs/{job_id}/completion-decision                                           internal:require_internal
+POST   /api/jobs/{job_id}/completion-decision                                           internal:require_internal
 GET    /api/jobs/{job_id}/datasources                                                   gated:require_job_access
 GET    /api/jobs/{job_id}/diff                                                          gated:require_job_access
 GET    /api/jobs/{job_id}/diff/{file_path:path}                                         gated:require_job_access

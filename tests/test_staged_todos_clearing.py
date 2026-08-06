@@ -6,6 +6,8 @@ Verifies that:
 """
 
 import pytest
+
+from tests._tool_invoke import invoke_tool
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -73,12 +75,13 @@ class TestJobCompleteClears:
         ctx = make_context(todo_mgr)
         job_complete = self._get_job_complete(ctx)
 
-        result = await job_complete.ainvoke(
+        result = await invoke_tool(
+            job_complete,
             {
                 "summary": "Job is done.",
                 "deliverables": ["output/result.md"],
                 "confidence": 0.9,
-            }
+            },
         )
 
         # Should NOT contain the old rejection error
@@ -97,12 +100,13 @@ class TestJobCompleteClears:
         ctx = make_context(todo_mgr)
         job_complete = self._get_job_complete(ctx)
 
-        result = await job_complete.ainvoke(
+        result = await invoke_tool(
+            job_complete,
             {
                 "summary": "Job is done.",
                 "deliverables": ["output/result.md"],
                 "confidence": 0.9,
-            }
+            },
         )
 
         assert "ERROR" not in result

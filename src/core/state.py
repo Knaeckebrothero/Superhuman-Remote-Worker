@@ -87,6 +87,20 @@ class UniversalAgentState(TypedDict):
     is_strategic_phase: bool  # True = strategic mode, False = tactical mode
     phase_number: int  # Increments at each phase transition
     is_final_phase: bool  # True when job_complete called, awaiting todo completion
+
+    # Finalization-decision mirrors (journal-before-observe). Written by the
+    # audited tool node AFTER the decision was durably journaled through the
+    # orchestrator, so any checkpoint containing the tool result also carries
+    # the decision. Mirrors of the durable record, never the source of truth:
+    # jobs.context.completion_decision / the target's verification ledger are.
+    # Nulled on feedback resume — a new round voids the old decision.
+    completion_decision: Optional[Dict[str, Any]]  # journaled job_complete payload
+    verdict_decision: Optional[Dict[str, Any]]  # journaled critic verdict (cache)
+
+    # Exactly-once guard for archive_phase: "<phase_number>:<strategic|tactical>"
+    # of the last archived phase instance. A transition rejection retries the
+    # completion; this stops the retry re-archiving the same boundary.
+    last_archived_phase: Optional[str]
     turn_count: int  # LLM call counter (for memory extraction interval)
     phase_instruction_injections: List[str]  # Once-per-phase instruction keys
     last_observed_turn: int  # Last turn when memory extraction ran
@@ -192,6 +206,9 @@ def create_initial_state(
         is_strategic_phase=True,
         phase_number=1,
         is_final_phase=False,
+        completion_decision=None,
+        verdict_decision=None,
+        last_archived_phase=None,
         turn_count=0,
         phase_instruction_injections=[],
         last_observed_turn=0,
