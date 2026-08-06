@@ -140,6 +140,15 @@ def create_evaluation_tools(context: ToolContext) -> List[Any]:
             )
         except Exception as e:  # VerdictRecordingError and anything unexpected
             logger.error(f"Verdict recording failed for {target_job_id}: {e}")
+            if getattr(e, "escalated", False):
+                # Rejection cap reached — the orchestrator already escalated
+                # the target to a human. Telling the model to resubmit here
+                # is the livelock; issue a stop order instead.
+                return (
+                    f"Error: the verdict was NOT recorded and this review has "
+                    f"been escalated to a human reviewer. Do NOT resubmit a "
+                    f"verdict; wrap up and complete the critic job.\n{e}"
+                )
             return (
                 f"Error: the verdict was NOT recorded and must be corrected and "
                 f"resubmitted.\n{e}"

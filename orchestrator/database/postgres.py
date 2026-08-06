@@ -2819,6 +2819,37 @@ class PostgresDB:
             new_count = await conn.fetchval(query, uuid_val)
         return int(new_count) if new_count is not None else 0
 
+    async def increment_verdict_rejections(self, job_id: str) -> int:
+        """Atomically increment ``context.verdict_rejections`` on a CRITIC row.
+
+        Counts 409-rejected verdict submissions so the orchestrator can stop
+        a critic that keeps resubmitting invalid verdicts and escalate its
+        target instead. Single-statement read-and-increment (same shape as
+        ``increment_job_memory_retry``) so racing submissions cannot stall
+        the counter. A fresh critic is spawned every round, so the per-critic
+        count naturally resets each round. Returns the new count, or 0 if the
+        job was not found / id was invalid.
+        docs/issues/rejected_verdict_livelocks_critic_and_wedges_parent.md
+        """
+        try:
+            uuid_val = UUID(job_id)
+        except ValueError:
+            return 0
+
+        query = (
+            "UPDATE jobs "
+            "SET context = jsonb_set("
+            "        COALESCE(context, '{}'::jsonb), '{verdict_rejections}', "
+            "        to_jsonb(COALESCE((context->>'verdict_rejections')::int, 0) + 1)"
+            "    ), "
+            "    updated_at = CURRENT_TIMESTAMP "
+            "WHERE id = $1 "
+            "RETURNING (context->>'verdict_rejections')::int"
+        )
+        async with self.acquire() as conn:
+            new_count = await conn.fetchval(query, uuid_val)
+        return int(new_count) if new_count is not None else 0
+
     async def increment_job_llm_outage_attempt(
         self,
         job_id: str,

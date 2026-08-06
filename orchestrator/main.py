@@ -22370,6 +22370,15 @@ async def store_citation_snapshot(request: Request) -> dict[str, Any]:
     return {"snapshot_blob_key": key, "size_bytes": len(data)}
 
 
+# Bounded verdict-submission retries per critic: each 409 tells the model to
+# "correct and resubmit", and a critic that cannot render a valid verdict
+# resubmits forever (189 iterations / 105 min in the live incident) while its
+# parent sits wedged in 'reviewing'. A fresh critic is spawned every round, so
+# the per-critic count naturally resets each round.
+# docs/issues/rejected_verdict_livelocks_critic_and_wedges_parent.md
+_MAX_VERDICT_REJECTIONS = 3
+
+
 async def _record_verification_round_impl(
     *,
     postgres_db: Any,
@@ -22488,6 +22497,19 @@ async def _record_verification_round_impl(
     errors = validate_verdict_call(asserted_verdict, opened, open_before)
     errors += validate_dispositions(dispositions, open_before)
     if errors:
+        rejections = await postgres_db.increment_verdict_rejections(critic_job_id)
+        if rejections >= _MAX_VERDICT_REJECTIONS:
+            reason = (
+                f"Critic {critic_job_id} failed to render a valid verdict "
+                f"after {rejections} rejected submissions; sent to manual "
+                f"review. Last rejection: " + "; ".join(errors)
+            )
+            await _escalate_target(target_job_id, target, reason)
+            # `escalated` tells the agent-side client to stop the critic's
+            # resubmit loop (its retry instruction becomes a stop order).
+            raise HTTPException(
+                status_code=409, detail={"errors": errors, "escalated": True}
+            )
         raise HTTPException(status_code=409, detail={"errors": errors})
 
     assigned = assign_ids(opened, rounds)

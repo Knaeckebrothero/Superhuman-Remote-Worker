@@ -28,7 +28,12 @@ def ledger_state():
     ``TARGET_ID`` — the ordinary case, where the critic really was spawned for
     the job it is writing to.
     """
-    return {"rounds": [], "freeze_data": None, "critic_targets": {}}
+    return {
+        "rounds": [],
+        "freeze_data": None,
+        "critic_targets": {},
+        "rejections": {},
+    }
 
 
 @pytest.fixture
@@ -43,6 +48,11 @@ def fake_db(ledger_state):
             return 0
         ledger_state["rounds"].append(record)
         return len(ledger_state["rounds"])
+
+    async def _incr_rejections(job_id):
+        counts = ledger_state["rejections"]
+        counts[job_id] = counts.get(job_id, 0) + 1
+        return counts[job_id]
 
     async def _get_job(job_id):
         if job_id == TARGET_ID:
@@ -64,6 +74,7 @@ def fake_db(ledger_state):
 
     db.append_verification_round = AsyncMock(side_effect=_append)
     db.get_job = AsyncMock(side_effect=_get_job)
+    db.increment_verdict_rejections = AsyncMock(side_effect=_incr_rejections)
     return db
 
 
@@ -141,6 +152,84 @@ class TestRecordVerificationRound:
                 head_commit="aaa",
             )
         assert exc.value.status_code == 409
+
+    @staticmethod
+    async def _submit_invalid(fake_db, critic_job_id: str):
+        """One guaranteed-rejected submission (returned with no findings)."""
+        from fastapi import HTTPException
+
+        from orchestrator.main import _record_verification_round_impl
+
+        with pytest.raises(HTTPException) as exc:
+            await _record_verification_round_impl(
+                postgres_db=fake_db,
+                target_job_id="t1",
+                critic_job_id=critic_job_id,
+                asserted_verdict="returned",
+                opened=[],
+                dispositions=[],
+                head_commit="aaa",
+            )
+        assert exc.value.status_code == 409
+        return exc.value
+
+    @pytest.mark.asyncio
+    async def test_rejections_below_cap_do_not_escalate(self, fake_db, monkeypatch):
+        """Two invalid submissions: plain 409s, no escalation, empty ledger.
+        docs/issues/rejected_verdict_livelocks_critic_and_wedges_parent.md
+        """
+        import orchestrator.main as main_module
+
+        escalate = AsyncMock()
+        monkeypatch.setattr(main_module, "_escalate_target", escalate)
+
+        for _ in range(2):
+            exc = await self._submit_invalid(fake_db, "c1")
+            assert not exc.detail.get("escalated")
+
+        escalate.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_third_rejection_escalates_target_with_reason(
+        self, fake_db, ledger_state, monkeypatch
+    ):
+        """The cap: rejection 3 escalates the TARGET (via _escalate_target,
+        which stays loop-aware) and flags the 409 so the agent-side client
+        turns its retry instruction into a stop order."""
+        import orchestrator.main as main_module
+
+        escalate = AsyncMock()
+        monkeypatch.setattr(main_module, "_escalate_target", escalate)
+
+        await self._submit_invalid(fake_db, "c1")
+        await self._submit_invalid(fake_db, "c1")
+        exc = await self._submit_invalid(fake_db, "c1")
+
+        assert exc.detail.get("escalated") is True
+        escalate.assert_awaited_once()
+        args = escalate.await_args.args
+        assert args[0] == "t1"
+        assert args[1]["id"] == "t1"  # the already-fetched target row
+        assert "3 rejected submissions" in args[2]
+        assert "Cannot return a job with no findings" in args[2]
+        assert ledger_state["rounds"] == []  # nothing was ever recorded
+
+    @pytest.mark.asyncio
+    async def test_rejection_counter_is_per_critic(self, fake_db, monkeypatch):
+        """A fresh critic (new round) starts at zero — c1 exhausting the cap
+        must not poison c2."""
+        import orchestrator.main as main_module
+
+        escalate = AsyncMock()
+        monkeypatch.setattr(main_module, "_escalate_target", escalate)
+
+        for _ in range(3):
+            await self._submit_invalid(fake_db, "c1")
+        assert escalate.await_count == 1
+
+        exc = await self._submit_invalid(fake_db, "c2")
+        assert not exc.detail.get("escalated")
+        assert escalate.await_count == 1
 
     @pytest.mark.asyncio
     async def test_missing_disposition_raises_409(self, fake_db, ledger_state):
