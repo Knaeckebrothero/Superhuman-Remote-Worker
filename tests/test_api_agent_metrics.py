@@ -1,9 +1,12 @@
 """Unit tests for heartbeat metric collection in agent entrypoints."""
 
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
+
+import pytest
 
 from src.api import app as worker_app
 from src.api import dual_app
+from src.services.recall_store import memory_health
 from src.tools.context import ToolContext
 
 
@@ -71,3 +74,37 @@ class TestDualAppMetrics:
             assert result["cpu_percent"] == 3.5
         finally:
             dual_app._agent = original_agent
+
+
+class TestMemoryHealthMetrics:
+    """Contained memory-failure counters ride the heartbeat metrics dict."""
+
+    @pytest.fixture(autouse=True)
+    def _reset_health(self):
+        memory_health.reset()
+        yield
+        memory_health.reset()
+
+    @staticmethod
+    def _metrics(module):
+        with patch.dict("sys.modules", {"psutil": _build_fake_psutil()}):
+            return module._get_agent_metrics()
+
+    @pytest.mark.parametrize("module", [worker_app, dual_app], ids=["worker", "dual"])
+    def test_memory_included_when_counters_nonzero(self, module):
+        memory_health.increment("retrieval_deadlock")
+        memory_health.increment("access_stats_deadlock")
+        memory_health.increment("access_stats_deadlock")
+
+        result = self._metrics(module)
+
+        assert result["memory"] == {
+            "retrieval_deadlock": 1,
+            "access_stats_deadlock": 2,
+        }
+
+    @pytest.mark.parametrize("module", [worker_app, dual_app], ids=["worker", "dual"])
+    def test_memory_omitted_when_counters_zero(self, module):
+        result = self._metrics(module)
+        assert result is not None
+        assert "memory" not in result

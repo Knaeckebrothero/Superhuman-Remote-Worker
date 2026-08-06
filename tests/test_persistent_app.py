@@ -96,6 +96,25 @@ class TestGetAgentMetrics:
             result = _get_agent_metrics()
         assert result is None
 
+    def test_memory_health_included_when_counters_nonzero(self):
+        """Contained memory-store failure counters ride the metrics dict."""
+        from src.services.recall_store import memory_health
+
+        mock_psutil = MagicMock()
+        mock_psutil.Process.return_value.memory_info.return_value.rss = 1_048_576
+        mock_psutil.Process.return_value.cpu_percent.return_value = 1.0
+
+        memory_health.reset()
+        try:
+            with patch.dict("sys.modules", {"psutil": mock_psutil}):
+                assert "memory" not in (_get_agent_metrics() or {})
+
+                memory_health.increment("access_stats_deadlock")
+                result = _get_agent_metrics()
+            assert result["memory"] == {"access_stats_deadlock": 1}
+        finally:
+            memory_health.reset()
+
 
 # ---------------------------------------------------------------------------
 # 3.1b inflight_tool_call() — running-command snapshot for (re)attach
