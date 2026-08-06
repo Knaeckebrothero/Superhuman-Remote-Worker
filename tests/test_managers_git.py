@@ -18,7 +18,7 @@ project_root = Path(__file__).parent.parent
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
-from src.managers.git_manager import GitManager  # noqa: E402
+from src.managers.git_manager import GitManager, TagInvariantViolation  # noqa: E402
 
 
 @pytest.fixture
@@ -559,6 +559,118 @@ class TestGitManagerTag:
         """Test tag returns False when inactive."""
         result = git_manager.tag("test")
         assert result is False
+
+
+class TestGitManagerTagIdempotency:
+    """Tests for create-once tag semantics (audit-boundary tags never move)."""
+
+    def test_retag_same_commit_is_noop(self, initialized_git, temp_workspace):
+        """Re-tagging the same name at the same commit succeeds without moving."""
+        (temp_workspace / "work.txt").write_text("work")
+        initialized_git.commit("Phase work")
+        assert initialized_git.tag("phase-tag") is True
+        head = initialized_git.get_current_commit()
+        assert head is not None
+
+        assert initialized_git.tag("phase-tag") is True
+        assert initialized_git.resolve_tag_commit("phase-tag") == head
+
+    def test_retag_at_new_commit_refuses_to_move(
+        self, initialized_git, temp_workspace, caplog
+    ):
+        """An existing tag at a different commit is never moved."""
+        (temp_workspace / "one.txt").write_text("one")
+        initialized_git.commit("First completion")
+        assert initialized_git.tag("phase-tag", message="boundary") is True
+        original = initialized_git.resolve_tag_commit("phase-tag")
+        assert original is not None
+
+        (temp_workspace / "two.txt").write_text("two")
+        initialized_git.commit("Second completion")
+
+        with caplog.at_level(logging.ERROR, logger="src.managers.git_manager"):
+            assert initialized_git.tag("phase-tag") is False
+
+        assert "Phase tag invariant violation" in caplog.text
+        assert initialized_git.resolve_tag_commit("phase-tag") == original
+        assert initialized_git.get_current_commit() != original
+
+    def test_invariant_violation_carries_shas(self):
+        """TagInvariantViolation exposes tag name and both commits."""
+        exc = TagInvariantViolation("t1", "aaa111", "bbb222")
+        assert isinstance(exc, RuntimeError)
+        assert exc.tag_name == "t1"
+        assert exc.existing_sha == "aaa111"
+        assert exc.head_sha == "bbb222"
+        assert "aaa111" in str(exc)
+        assert "bbb222" in str(exc)
+
+    def test_resolve_tag_commit_missing_tag(self, initialized_git):
+        """Resolving a nonexistent tag returns None."""
+        assert initialized_git.resolve_tag_commit("no-such-tag") is None
+
+
+class TestGitManagerPushRef:
+    """Tests for per-ref tag delivery and the tags=False push default."""
+
+    def test_push_ref_delivers_exactly_that_tag(
+        self, initialized_git, temp_workspace, bare_remote
+    ):
+        """push_ref delivers the named tag and nothing else."""
+        initialized_git.add_remote("origin", str(bare_remote))
+        (temp_workspace / "work.txt").write_text("work")
+        initialized_git.commit("Phase work")
+        assert initialized_git.tag("phase-1-complete") is True
+        assert initialized_git.tag("phase-2-complete") is True
+
+        assert initialized_git.push_ref("refs/tags/phase-1-complete") is True
+
+        result = subprocess.run(
+            ["git", "tag", "-l"], cwd=bare_remote, capture_output=True, text=True
+        )
+        remote_tags = result.stdout.split()
+        assert "phase-1-complete" in remote_tags
+        assert "phase-2-complete" not in remote_tags
+
+    def test_push_ref_without_remote(self, initialized_git):
+        """push_ref returns False when no remote is configured."""
+        assert initialized_git.push_ref("refs/tags/anything") is False
+
+    def test_push_default_omits_tags(
+        self, initialized_git, temp_workspace, bare_remote
+    ):
+        """push() no longer sprays tags; push_ref delivers them per-ref."""
+        initialized_git.add_remote("origin", str(bare_remote))
+        (temp_workspace / "work.txt").write_text("work")
+        initialized_git.commit("Phase work")
+        assert initialized_git.tag("phase-tag") is True
+
+        assert initialized_git.push() is True
+        result = subprocess.run(
+            ["git", "tag", "-l"], cwd=bare_remote, capture_output=True, text=True
+        )
+        assert "phase-tag" not in result.stdout.split()
+
+        assert initialized_git.push_ref("refs/tags/phase-tag") is True
+        result = subprocess.run(
+            ["git", "tag", "-l"], cwd=bare_remote, capture_output=True, text=True
+        )
+        assert "phase-tag" in result.stdout.split()
+
+    def test_push_tags_true_still_pushes_tags(
+        self, initialized_git, temp_workspace, bare_remote
+    ):
+        """Explicit tags=True keeps the push-all-tags behavior."""
+        initialized_git.add_remote("origin", str(bare_remote))
+        (temp_workspace / "work.txt").write_text("work")
+        initialized_git.commit("Phase work")
+        assert initialized_git.tag("explicit-tag") is True
+
+        assert initialized_git.push(tags=True) is True
+        result = subprocess.run(
+            ["git", "tag", "-l"], cwd=bare_remote, capture_output=True, text=True
+        )
+        assert "explicit-tag" in result.stdout.split()
 
 
 class TestGitManagerListTags:
@@ -1348,8 +1460,6 @@ class TestGitManagerBackendPush:
             # auto-detect branch → git branch --show-current
             "Exit code: 0\n--- stdout ---\nmain",
             # git push -u origin main
-            "Exit code: 0\n(no output)",
-            # git push origin --tags
             "Exit code: 0\n(no output)",
         ]
         gm = GitManager(Path("/tmp/ws"), backend=backend)

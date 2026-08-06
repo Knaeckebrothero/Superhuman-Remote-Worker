@@ -18,7 +18,31 @@ aliases:
 
 **Filed:** 2026-08-04 from the five-job main-cluster overnight Scholar batch.
 
-**Status:** **OPEN. P1 phase evidence / Git observability defect.** Branch
+**Status:** **CORE FIXED 2026-08-06 (batch #2)** — fix directions 1-3 built
+(src/managers/git_manager.py + src/core/phase.py):
+- `tag()` is create-once idempotent: no `-f`; an existing tag at the current
+  HEAD commit is a no-op success; an existing tag elsewhere logs the typed
+  `TagInvariantViolation` ("refusing to move an audit boundary") and returns
+  False — the original ref is never moved. New `resolve_tag_commit()`
+  plumbing.
+- `_complete_phase_with_git` reordered commit → tag → push, so the boundary
+  tag dereferences to the phase-completion commit it claims to delimit.
+- Tag delivery is per-ref: new `push_ref("refs/tags/<name>")` pushes exactly
+  the new tag; `push()`'s `tags` default flipped to False, ending the
+  `--tags` spray that retried every historical tag (and pushed unrelated
+  tags from the shared project repo / external repos). The two job-completion
+  tag sites push their exact ref the same way.
+Tests: create-once/no-op/violation + push_ref + no-spray pins
+(tests/test_managers_git.py), tag-dereferences-to-completion-commit +
+double-completion idempotency (tests/test_phase_git.py).
+Remaining OPEN (adjacent, not this defect): fix direction 4 — the graph can
+still archive the same phase instance twice (the duplicate transition that
+*triggered* the moves; now harmless to tags but still a graph exactly-once
+gap) — and direction 5 (strategic review consuming orchestrator phase events
+instead of assuming tags), which is softened now that a tag, when present,
+is guaranteed current.
+
+**Originally:** OPEN. P1 phase evidence / Git observability defect. Branch
 commits and deliverables remained safe, but remote phase tags can describe an
 earlier boundary than the branch history the worker actually completed.
 
