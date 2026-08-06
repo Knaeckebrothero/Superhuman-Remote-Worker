@@ -216,6 +216,15 @@ infrastructureMetering:
   # the durable state reaches active.
   cutoverEnabled: false
   publicationEnabled: false
+  # Slice 2 storage classes remain independently dark-launched. Inventory can
+  # be enabled without reconciliation, and reconciliation without publication.
+  # The global collector/shadow/publication gates remain mandatory masters.
+  pvcInventoryEnabled: false
+  pvInventoryEnabled: false
+  pvcShadowEnabled: false
+  pvShadowEnabled: false
+  pvcPublicationEnabled: false
+  pvPublicationEnabled: false
   # Stable operator-owned installation identity. Required before collection or
   # publication; it must survive endpoint and credential rotation.
   stableClusterId: ""
@@ -236,8 +245,22 @@ infrastructureMetering:
   snapshotItemRetentionDays: 7
   diagnosticRetentionDays: 35
   cleanupIntervalSeconds: 300
-  ingestionSecretName: "" # defaults to the chart's main application Secret
+  # Empty in chart-managed mode creates a dedicated preserved Secret readable
+  # only by the collector and orchestrator. External secret modes must provide
+  # a distinct Secret name; the main application Secret is rejected.
+  ingestionSecretName: ""
   ingestionSecretKey: INFRASTRUCTURE_METERING_INGESTION_KEY
+  # PV identities use a separate, non-rotating HMAC key. In chart-managed
+  # secret mode, an empty name creates a dedicated preserved Secret. Other
+  # secret modes must name a separately provisioned Secret. The key version
+  # becomes part of every durable identity and is required before PV inventory.
+  volumeIdentitySecretName: ""
+  volumeIdentitySecretKey: INFRASTRUCTURE_METERING_VOLUME_IDENTITY_KEY
+  volumeIdentityKeyVersion: ""
+  # Exact, operator-owned PV pricing classifications. These rules are stored
+  # immutably by the orchestrator; collector labels and StorageClass parameters
+  # can never select a priced resource. Empty means quantity-only/unpriced.
+  volumeResourceMappings: []
   networkPolicy:
     # Egress-deny cannot infer every distribution's API-server address. Enable
     # after supplying the control-plane CIDRs used by this cluster. DNS is

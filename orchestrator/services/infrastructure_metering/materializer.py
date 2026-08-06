@@ -844,6 +844,29 @@ def _interval_details(interval: Mapping[str, Any]) -> dict[str, Any]:
     for field_name in fields:
         value = interval.get(field_name)
         details[field_name] = None if value is None else str(value)
+    raw = interval.get("details")
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise PublicationContractError("interval details are invalid JSON") from exc
+    if raw is not None and not isinstance(raw, Mapping):
+        raise PublicationContractError("interval details must be an object")
+    for field_name in (
+        "storage_asset_id",
+        "identity_scheme",
+        "identity_key_version",
+        "mapping_version",
+        "mapping_fingerprint",
+    ):
+        if raw is None or field_name not in raw:
+            continue
+        value = raw.get(field_name)
+        if value is not None and not isinstance(value, str):
+            raise PublicationContractError(
+                f"interval storage provenance {field_name} must be text"
+            )
+        details[field_name] = value
     return details
 
 
@@ -908,6 +931,7 @@ def _build_cursor_plan(
         for rate in rate_rows
     ]
     rates_by_unit = _rates_by_unit(rate_versions)
+    force_unpriced = str(interval["resource"]) == "unmapped_block_volume"
     selected_rates: dict[str, CanonicalRateVersion | None] = {}
     boundaries = [
         publishable_end,
@@ -918,9 +942,12 @@ def _build_cursor_plan(
         ),
     ]
     for dimension in dimensions:
-        selected, boundary = _select_rate_and_boundary(
-            rates_by_unit.get(dimension.unit, ()), segment_start
-        )
+        if force_unpriced:
+            selected, boundary = None, None
+        else:
+            selected, boundary = _select_rate_and_boundary(
+                rates_by_unit.get(dimension.unit, ()), segment_start
+            )
         selected_rates[dimension.unit] = selected
         if boundary is not None:
             boundaries.append(boundary)
@@ -964,6 +991,26 @@ def _build_cursor_plan(
         )
 
     details = _interval_details(interval)
+    resource = str(interval["resource"])
+    mapping_version = details.get("mapping_version")
+    mapping_fingerprint = details.get("mapping_fingerprint")
+    if resource.startswith("block_volume_"):
+        if (
+            not isinstance(mapping_version, str)
+            or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,63}", mapping_version)
+            is None
+            or not isinstance(mapping_fingerprint, str)
+            or _HASH_RE.fullmatch(mapping_fingerprint) is None
+        ):
+            raise PublicationContractError(
+                "mapped storage interval lacks immutable mapping provenance"
+            )
+    elif resource == "unmapped_block_volume" and (
+        mapping_version is not None or mapping_fingerprint is not None
+    ):
+        raise PublicationContractError(
+            "unmapped storage interval carries mapping provenance"
+        )
     if discovery_evidence is not None:
         details["discovery_evidence"] = dict(discovery_evidence)
     events: list[PlannedUsageEvent] = []

@@ -173,6 +173,12 @@
         "shadowEnabled": { "type": "boolean" },
         "cutoverEnabled": { "type": "boolean" },
         "publicationEnabled": { "type": "boolean" },
+        "pvcInventoryEnabled": { "type": "boolean" },
+        "pvInventoryEnabled": { "type": "boolean" },
+        "pvcShadowEnabled": { "type": "boolean" },
+        "pvShadowEnabled": { "type": "boolean" },
+        "pvcPublicationEnabled": { "type": "boolean" },
+        "pvPublicationEnabled": { "type": "boolean" },
         "deploymentMode": {
           "type": "string",
           "enum": ["dedicated", "in-process"]
@@ -198,6 +204,44 @@
         "cleanupIntervalSeconds": { "type": "integer", "minimum": 30, "maximum": 3600 },
         "ingestionSecretName": { "type": "string" },
         "ingestionSecretKey": { "type": "string", "minLength": 1 },
+        "volumeIdentitySecretName": { "type": "string" },
+        "volumeIdentitySecretKey": { "type": "string", "minLength": 1 },
+        "volumeIdentityKeyVersion": {
+          "type": "string",
+          "maxLength": 64,
+          "pattern": "^$|^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$"
+        },
+        "volumeResourceMappings": {
+          "type": "array",
+          "maxItems": 100,
+          "items": {
+            "type": "object",
+            "required": ["mappingVersion", "storageClass", "csiDriver", "volumeMode", "resource"],
+            "properties": {
+              "mappingVersion": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$"
+              },
+              "storageClass": {
+                "type": "string",
+                "maxLength": 253,
+                "pattern": "^$|^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?(?:\\.[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?)*$"
+              },
+              "csiDriver": {
+                "type": "string",
+                "maxLength": 253,
+                "pattern": "^$|^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?(?:\\.[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?)*$"
+              },
+              "volumeMode": { "type": "string", "enum": ["filesystem", "block"] },
+              "resource": {
+                "type": "string",
+                "maxLength": 128,
+                "pattern": "^block_volume_[a-z0-9_]+$"
+              }
+            },
+            "additionalProperties": false
+          }
+        },
         "networkPolicy": {
           "type": "object",
           "properties": {

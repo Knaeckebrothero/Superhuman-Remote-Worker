@@ -9,6 +9,7 @@ Prorating their already-rounded stored quantity here would overstate precision.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -137,12 +138,17 @@ class UsageV2QueryService:
         app_pool: asyncpg.Pool | None = None,
         *,
         source_aware_reads_enabled: bool = False,
+        enabled_resources: Sequence[str] = ("workspace_pod",),
     ):
         self._audit = audit_pool
         self._capabilities = capabilities
         self._source_aware_reads_enabled = source_aware_reads_enabled
         self._source_aware = (
-            SourceAwareUsageReadModel(audit_pool, app_pool)
+            SourceAwareUsageReadModel(
+                audit_pool,
+                app_pool,
+                enabled_resources=enabled_resources,
+            )
             if source_aware_reads_enabled
             and audit_pool is not None
             and app_pool is not None

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
 from enum import StrEnum
@@ -28,7 +29,28 @@ _SAFETY_LAG = timedelta(minutes=15)
 _DEFAULT_ENABLED_RESOURCES = ("workspace_pod",)
 _RESOURCE_API_RESOURCES = {
     "workspace_pod": frozenset({"core/v1/pods"}),
+    "workspace_pvc": frozenset({"core/v1/persistentvolumeclaims"}),
+    "session_workspace_pvc": frozenset({"core/v1/persistentvolumeclaims"}),
+    "session_agent_pvc": frozenset({"core/v1/persistentvolumeclaims"}),
+    "persistent_agent_pvc": frozenset({"core/v1/persistentvolumeclaims"}),
+    "vm_rootdisk_claim": frozenset({"core/v1/persistentvolumeclaims"}),
+    "golden_image_pvc": frozenset({"core/v1/persistentvolumeclaims"}),
+    "platform_pvc": frozenset({"core/v1/persistentvolumeclaims"}),
+    "unclassified_pvc": frozenset({"core/v1/persistentvolumeclaims"}),
+    "unmapped_block_volume": frozenset({"core/v1/persistentvolumes"}),
 }
+_MAPPED_VOLUME_RESOURCE_RE = re.compile(r"^block_volume_[a-z0-9_]+$")
+
+
+def _resource_api_resources(resource: str) -> frozenset[str] | None:
+    mapped = _RESOURCE_API_RESOURCES.get(resource)
+    if mapped is not None:
+        return mapped
+    if _MAPPED_VOLUME_RESOURCE_RE.fullmatch(resource):
+        return frozenset({"core/v1/persistentvolumes"})
+    return None
+
+
 _MANIFEST_VERSION = 1
 
 
@@ -104,6 +126,26 @@ _GAPS_SQL = """
 /* infra-seal:gaps */
 SELECT id, scope_epoch_id, gap_start, gap_end, resolution
 FROM resource_inventory_coverage_gaps
+WHERE scope_epoch_id = ANY($1::uuid[])
+  AND gap_start < $3
+  AND (gap_end IS NULL OR gap_end > $2)
+ORDER BY scope_epoch_id, gap_start, id
+"""
+
+_STORAGE_GAPS_SQL = """
+/* infra-seal:storage-gaps */
+SELECT id, scope_epoch_id, gap_start, gap_end, resolution
+FROM resource_inventory_coverage_gaps
+WHERE scope_epoch_id = ANY($1::uuid[])
+  AND gap_start < $3
+  AND (gap_end IS NULL OR gap_end > $2)
+
+UNION ALL
+
+SELECT id, scope_epoch_id, gap_start, gap_end,
+       CASE WHEN resolution = 'unresolved' THEN 'unresolved'
+            ELSE 'waived' END AS resolution
+FROM storage_asset_coverage_gaps
 WHERE scope_epoch_id = ANY($1::uuid[])
   AND gap_start < $3
   AND (gap_end IS NULL OR gap_end > $2)
@@ -449,7 +491,11 @@ class InfrastructureUsageDaySealer:
             raise ValueError("day sealer requires a non-empty resource allowlist")
         if safety_lag < timedelta(0):
             raise ValueError("day sealer safety lag cannot be negative")
-        unsupported = sorted(set(resources) - _RESOURCE_API_RESOURCES.keys())
+        unsupported = sorted(
+            resource
+            for resource in set(resources)
+            if _resource_api_resources(resource) is None
+        )
         if unsupported:
             raise ValueError(
                 "day sealer has no inventory-scope mapping for: "
@@ -458,6 +504,10 @@ class InfrastructureUsageDaySealer:
         self._app = app_pool
         self._sealing_enabled = sealing_enabled
         self._enabled_resources = resources
+        self._include_storage_asset_gaps = any(
+            "core/v1/persistentvolumes" in (_resource_api_resources(resource) or ())
+            for resource in resources
+        )
         self._safety_lag = safety_lag
 
     def _require_enabled(self) -> None:
@@ -507,7 +557,14 @@ class InfrastructureUsageDaySealer:
                 if not scope_ids:
                     raise DaySealingBlocked("no-required-inventory-source")
                 epoch_ids = [row["id"] for row in epochs]
-                gaps = await conn.fetch(_GAPS_SQL, epoch_ids, seal_start, day_end)
+                gaps = await conn.fetch(
+                    _STORAGE_GAPS_SQL
+                    if self._include_storage_asset_gaps
+                    else _GAPS_SQL,
+                    epoch_ids,
+                    seal_start,
+                    day_end,
+                )
 
                 await conn.execute(_ENSURE_DAY_SQL, day)
                 current = await conn.fetchrow(_LOCK_DAY_SQL, day)
@@ -649,7 +706,10 @@ class InfrastructureUsageDaySealer:
         manifest: list[dict[str, Any]] = []
         missing_by_epoch: dict[str, list[tuple[datetime, datetime]]] = {}
         enabled_api_resources = set().union(
-            *(_RESOURCE_API_RESOURCES[resource] for resource in self._enabled_resources)
+            *(
+                _resource_api_resources(resource) or frozenset()
+                for resource in self._enabled_resources
+            )
         )
         for row in epochs:
             api_resource = str(row.get("api_resource") or "")

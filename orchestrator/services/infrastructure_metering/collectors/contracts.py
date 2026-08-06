@@ -38,6 +38,20 @@ _FORBIDDEN_NORMALIZED_KEYS = frozenset(
         "string_data",
         "storage_class_parameters",
         "csi_volume_attributes",
+        "volume_handle",
+        "volumehandle",
+        "volume_attributes",
+        "volumeattributes",
+        "controller_publish_secret_ref",
+        "controllerpublishsecretref",
+        "controller_expand_secret_ref",
+        "controllerexpandsecretref",
+        "node_publish_secret_ref",
+        "nodepublishsecretref",
+        "node_stage_secret_ref",
+        "nodestagesecretref",
+        "node_expand_secret_ref",
+        "nodeexpandsecretref",
     }
 )
 

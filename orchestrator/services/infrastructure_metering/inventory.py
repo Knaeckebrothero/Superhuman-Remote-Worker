@@ -664,6 +664,72 @@ SnapshotObservationHook = Callable[
 
 
 @dataclass(frozen=True)
+class SnapshotCompletionContext:
+    """One complete sealed-manifest candidate before absence reconciliation."""
+
+    snapshot_id: UUID
+    scope_epoch_id: UUID
+    inventory_scope_id: UUID
+    source_cluster: str
+    namespace: str | None
+    received_at: datetime
+
+
+SnapshotCompletionHook = Callable[
+    [asyncpg.Connection, SnapshotCompletionContext],
+    Awaitable[None],
+]
+
+
+@dataclass(frozen=True)
+class SnapshotAbsenceMutationContext:
+    """One open interval absent from a complete authoritative LIST.
+
+    Most resource kinds use the generic absence close below. Physical storage
+    assets are different: a Kubernetes PV object may disappear while a
+    ``Retain`` backend disk still exists. A resource-specific hook can consume
+    that absence and persist the conservative backend-unverified transition
+    before the generic closer handles the remaining intervals.
+    """
+
+    snapshot_id: UUID
+    scope_epoch_id: UUID
+    inventory_scope_id: UUID
+    source_cluster: str
+    namespace: str | None
+    received_at: datetime
+
+
+SnapshotAbsenceMutator = Callable[
+    [asyncpg.Connection, SnapshotAbsenceMutationContext, asyncpg.Record],
+    Awaitable[bool],
+]
+
+
+@dataclass(frozen=True)
+class WatchDeletionMutationContext:
+    """Resource-specific context for a trusted Kubernetes DELETED event."""
+
+    scope_epoch_id: UUID
+    inventory_scope_id: UUID
+    source_cluster: str
+    namespace: str | None
+    received_at: datetime
+    source_kind: str
+    source_uid: str
+
+
+WatchDeletionMutator = Callable[
+    [
+        asyncpg.Connection,
+        WatchDeletionMutationContext,
+        asyncpg.Record | None,
+    ],
+    Awaitable[tuple[WatchMutationAction, UUID | None]],
+]
+
+
+@dataclass(frozen=True)
 class WatchCommitResult:
     watch_session_id: UUID
     event_id: UUID
@@ -2461,6 +2527,8 @@ class InventoryStore:
         epoch: asyncpg.Record,
         received_at: datetime,
         observation_hook: SnapshotObservationHook | None,
+        *,
+        require_shadow_comparison: bool,
     ) -> None:
         """Run optional object-by-object shadow diagnostics for every staged UID."""
         if observation_hook is None:
@@ -2532,18 +2600,87 @@ class InventoryStore:
                     ),
                 )
                 await observation_hook(conn, context, item)
-                comparison_exists = await conn.fetchval(
-                    "SELECT TRUE FROM resource_inventory_shadow_comparisons "
-                    "WHERE snapshot_id=$1 AND source_uid=$2",
-                    snapshot_id,
-                    item.source_uid,
-                )
-                if not comparison_exists:
-                    raise InventoryConflictError(
-                        "snapshot observation hook omitted its comparison row"
+                if require_shadow_comparison:
+                    comparison_exists = await conn.fetchval(
+                        "SELECT TRUE FROM resource_inventory_shadow_comparisons "
+                        "WHERE snapshot_id=$1 AND source_uid=$2",
+                        snapshot_id,
+                        item.source_uid,
                     )
+                    if not comparison_exists:
+                        raise InventoryConflictError(
+                            "snapshot observation hook omitted its comparison row"
+                        )
                 last_kind = item.source_kind
                 last_uid = item.source_uid
+
+    async def _apply_snapshot_absence_mutations(
+        self,
+        conn: asyncpg.Connection,
+        snapshot_id: UUID,
+        epoch: asyncpg.Record,
+        received_at: datetime,
+        absence_mutator: SnapshotAbsenceMutator | None,
+    ) -> int:
+        """Let a resource-specific policy consume complete-LIST absences.
+
+        The generic absence UPDATE remains the default authority. A consumed
+        row must be durably closed and relinquish its lifecycle head inside the
+        hook transaction; this prevents a buggy storage policy from silently
+        converting an absent object into an immortal open interval.
+        """
+
+        if absence_mutator is None:
+            return 0
+        consumed = 0
+        last_id: UUID | None = None
+        while True:
+            rows = await conn.fetch(
+                "SELECT interval.* FROM resource_intervals AS interval "
+                "WHERE interval.inventory_scope_id=$1 "
+                "AND interval.ended_at IS NULL "
+                "AND $3 >= interval.last_confirmed_at "
+                "AND ($4::uuid IS NULL OR interval.id > $4) "
+                "AND NOT EXISTS (SELECT 1 "
+                "FROM resource_inventory_snapshot_items AS item "
+                "WHERE item.snapshot_id=$2 "
+                "AND item.source_kind=interval.source_kind "
+                "AND item.source_uid=interval.source_uid) "
+                "ORDER BY interval.id LIMIT $5 FOR UPDATE",
+                epoch["scope_id"],
+                snapshot_id,
+                received_at,
+                last_id,
+                self.max_batch_items,
+            )
+            if not rows:
+                return consumed
+            for row in rows:
+                context = SnapshotAbsenceMutationContext(
+                    snapshot_id=snapshot_id,
+                    scope_epoch_id=epoch["id"],
+                    inventory_scope_id=epoch["scope_id"],
+                    source_cluster=str(epoch["source_cluster"]),
+                    namespace=epoch["namespace"],
+                    received_at=received_at,
+                )
+                if await absence_mutator(conn, context, row):
+                    postcondition = await conn.fetchval(
+                        "SELECT TRUE FROM resource_intervals AS interval "
+                        "WHERE interval.id=$1 AND interval.ended_at IS NOT NULL "
+                        "AND NOT EXISTS (SELECT 1 "
+                        "FROM resource_lifecycle_heads AS head "
+                        "WHERE head.source_lifecycle_id="
+                        "interval.source_lifecycle_id "
+                        "AND head.current_interval_id=interval.id)",
+                        row["id"],
+                    )
+                    if not postcondition:
+                        raise InventoryConflictError(
+                            "absence mutator did not close interval and clear head"
+                        )
+                    consumed += 1
+                last_id = row["id"]
 
     async def finalize_snapshot(
         self,
@@ -2556,6 +2693,9 @@ class InventoryStore:
         transport: TransportNonceClaim,
         interval_mutator: SnapshotIntervalMutator | None = None,
         observation_hook: SnapshotObservationHook | None = None,
+        completion_hook: SnapshotCompletionHook | None = None,
+        absence_mutator: SnapshotAbsenceMutator | None = None,
+        require_shadow_comparison: bool = True,
         reconcile_intervals: bool = True,
     ) -> ReconciliationResult:
         if final.item_count > self.max_snapshot_items:
@@ -2564,10 +2704,10 @@ class InventoryStore:
             [error.as_dict() for error in final.fatal_errors]
         )
         if not reconcile_intervals and (
-            interval_mutator is not None or observation_hook is not None
+            interval_mutator is not None or absence_mutator is not None
         ):
             raise InventoryContractError(
-                "inventory-only finalization cannot run reconciliation hooks"
+                "inventory-only finalization cannot mutate resource intervals"
             )
 
         async with self._pool.acquire() as conn:
@@ -2656,13 +2796,27 @@ class InventoryStore:
                             received_at,
                             interval_mutator,
                         )
-                    await self._apply_snapshot_observations(
+                await self._apply_snapshot_observations(
+                    conn,
+                    snapshot_id,
+                    epoch,
+                    received_at,
+                    observation_hook,
+                    require_shadow_comparison=require_shadow_comparison,
+                )
+                if final.complete and completion_hook is not None:
+                    await completion_hook(
                         conn,
-                        snapshot_id,
-                        epoch,
-                        received_at,
-                        observation_hook,
+                        SnapshotCompletionContext(
+                            snapshot_id=snapshot_id,
+                            scope_epoch_id=epoch["id"],
+                            inventory_scope_id=epoch["scope_id"],
+                            source_cluster=str(epoch["source_cluster"]),
+                            namespace=epoch["namespace"],
+                            received_at=received_at,
+                        ),
                     )
+                if reconcile_intervals:
                     counts = await conn.fetchrow(
                         _RECONCILIATION_COUNTS_SQL,
                         snapshot_id,
@@ -2715,6 +2869,13 @@ class InventoryStore:
                         final.complete,
                         received_at,
                     )
+                    custom_closed = await self._apply_snapshot_absence_mutations(
+                        conn,
+                        snapshot_id,
+                        epoch,
+                        received_at,
+                        absence_mutator,
+                    )
                     closed_row = await conn.fetchrow(
                         _CLOSE_ABSENT_SQL,
                         snapshot_id,
@@ -2722,8 +2883,9 @@ class InventoryStore:
                         received_at,
                         final.complete,
                     )
-                    closed = int(closed_row["closed_count"])
-                    if int(closed_row["cleared_head_count"]) != closed:
+                    generic_closed = int(closed_row["closed_count"])
+                    closed = custom_closed + generic_closed
+                    if int(closed_row["cleared_head_count"]) != generic_closed:
                         raise InventoryConflictError(
                             "closed interval did not own its lifecycle head"
                         )
@@ -3012,6 +3174,7 @@ class InventoryStore:
         scope: InventoryScopeIdentity,
         transport: TransportNonceClaim,
         interval_mutator: WatchIntervalMutator | None = None,
+        deletion_mutator: WatchDeletionMutator | None = None,
     ) -> WatchCommitResult:
         """Atomically apply one object/BOOKMARK and CAS the opaque cursor."""
         if not _HASH_RE.fullmatch(request_digest):
@@ -3086,12 +3249,44 @@ class InventoryStore:
                 if event.event_type is WatchEventKind.BOOKMARK:
                     action = WatchMutationAction.BOOKMARK
                 elif event.event_type is WatchEventKind.DELETED or event.terminal:
-                    action, affected_interval_id = await self._close_watch_interval(
-                        conn,
-                        interval,
-                        received_at,
-                        terminal=event.terminal,
-                    )
+                    if (
+                        event.event_type is WatchEventKind.DELETED
+                        and deletion_mutator is not None
+                    ):
+                        deletion_context = WatchDeletionMutationContext(
+                            scope_epoch_id=session["scope_epoch_id"],
+                            inventory_scope_id=epoch["scope_id"],
+                            source_cluster=str(epoch["source_cluster"]),
+                            namespace=epoch["namespace"],
+                            received_at=received_at,
+                            source_kind=str(source_kind),
+                            source_uid=str(source_uid),
+                        )
+                        action, affected_interval_id = await deletion_mutator(
+                            conn,
+                            deletion_context,
+                            interval,
+                        )
+                        if action not in {
+                            WatchMutationAction.CLOSE,
+                            WatchMutationAction.ALREADY_ABSENT,
+                        }:
+                            raise InventoryContractError(
+                                "watch deletion mutator returned an invalid action"
+                            )
+                        if affected_interval_id is not None and not isinstance(
+                            affected_interval_id, UUID
+                        ):
+                            raise InventoryContractError(
+                                "watch deletion mutator returned an invalid interval"
+                            )
+                    else:
+                        action, affected_interval_id = await self._close_watch_interval(
+                            conn,
+                            interval,
+                            received_at,
+                            terminal=event.terminal,
+                        )
                 else:
                     assert event.item is not None
                     if not event.item.valid_for_metering:
@@ -3562,10 +3757,16 @@ __all__ = [
     "SnapshotObservationContext",
     "SnapshotObservationHook",
     "SnapshotFinalization",
+    "SnapshotCompletionContext",
+    "SnapshotCompletionHook",
+    "SnapshotAbsenceMutationContext",
+    "SnapshotAbsenceMutator",
     "SnapshotHandle",
     "StageResult",
     "TransportNonceClaim",
     "WatchCommitResult",
+    "WatchDeletionMutationContext",
+    "WatchDeletionMutator",
     "WatchEventKind",
     "WatchIntervalMutationContext",
     "WatchIntervalMutator",

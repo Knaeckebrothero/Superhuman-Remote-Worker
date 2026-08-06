@@ -1277,6 +1277,46 @@ spec:
                 configMapKeyRef:
                   name: {{ include "srw.configMapName" . }}
                   key: INFRASTRUCTURE_METERING_PUBLICATION_ENABLED
+            - name: INFRASTRUCTURE_METERING_PVC_INVENTORY_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: INFRASTRUCTURE_METERING_PVC_INVENTORY_ENABLED
+            - name: INFRASTRUCTURE_METERING_PV_INVENTORY_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: INFRASTRUCTURE_METERING_PV_INVENTORY_ENABLED
+            - name: INFRASTRUCTURE_METERING_PVC_SHADOW_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: INFRASTRUCTURE_METERING_PVC_SHADOW_ENABLED
+            - name: INFRASTRUCTURE_METERING_PV_SHADOW_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: INFRASTRUCTURE_METERING_PV_SHADOW_ENABLED
+            - name: INFRASTRUCTURE_METERING_PVC_PUBLICATION_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: INFRASTRUCTURE_METERING_PVC_PUBLICATION_ENABLED
+            - name: INFRASTRUCTURE_METERING_PV_PUBLICATION_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: INFRASTRUCTURE_METERING_PV_PUBLICATION_ENABLED
+            - name: INFRASTRUCTURE_METERING_VOLUME_IDENTITY_KEY_VERSION
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: INFRASTRUCTURE_METERING_VOLUME_IDENTITY_KEY_VERSION
+            - name: INFRASTRUCTURE_METERING_VOLUME_RESOURCE_MAPPINGS_JSON
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: INFRASTRUCTURE_METERING_VOLUME_RESOURCE_MAPPINGS_JSON
             - name: INFRASTRUCTURE_METERING_STABLE_CLUSTER_ID
               valueFrom:
                 configMapKeyRef:
@@ -1350,7 +1390,7 @@ spec:
             - name: INFRASTRUCTURE_METERING_INGESTION_KEY
               valueFrom:
                 secretKeyRef:
-                  name: {{ .Values.infrastructureMetering.ingestionSecretName | default (include "srw.secretName" .) }}
+                  name: {{ .Values.infrastructureMetering.ingestionSecretName | default (printf "%s-infra-ingestion" (include "srw.fullname" .) | trunc 63 | trimSuffix "-") }}
                   key: {{ .Values.infrastructureMetering.ingestionSecretKey | default "INFRASTRUCTURE_METERING_INGESTION_KEY" }}
                   optional: {{ not .Values.infrastructureMetering.collectorEnabled }}
             {{- with .Values.orchestrator.kbGitAllowedHosts }}
