@@ -31,39 +31,79 @@ Reference job: `bbce4bed-79be-4e36-bbb1-9dd12ce43dcf` — project `Better Resavi
 
 | # | Defect | State |
 | --- | --- | --- |
-| 1 | `CWD:` banner leaks into git stdout → `push()` uses it as a branch name | **FIXED** `22b2511e`, deployed + verified live. **Trigger still unknown** — see the open question below. |
+| 1 | `CWD:` banner leaks into git stdout → `push()` uses it as a branch name | **FIXED** `22b2511e`, deployed + verified live. Blast radius **resolved 2026-08-06: universal, not conditional** — every backend git push failed for ~32 h. See below. |
 | 2 | `write_file` and the shell resolve relative paths against different roots | **MITIGATED** `6ee90376` — writes now report the resolved absolute path. Resolution semantics deliberately unchanged. |
 | 3 | Mode A cloud review has never produced a diff | **OPEN, deferred by decision** — superseded by `workspace_and_change_records.md` §6.3; do not repair the mirror. |
 
 Shipped: `22b2511e` (parser fix), `d7e05c39` (`push()` logs why it declines),
 `6ee90376` (absolute paths in write results). Full suite green at the time of each.
 
-### The one open question
+### Blast radius — RESOLVED 2026-08-06: it was universal, not conditional
 
-**Why does the banner break some jobs and not others?** The bug is real and reproducible
-(k3d before/after, plus a direct unit-level demonstration), but it is **not universal**, and
-that is unexplained. Inside the same broken window — first affected image deployed
-2026-08-01 ~17:29Z, fix deployed 2026-08-02 18:47Z (`2c59ebaf`) — job `cd3bfe52` pushed
-normally (Gitea reflog: pushes at 08-02 09:33, 14:48, 17:16) while `bbce4bed` landed nothing
-across 13 hours.
+Two earlier readings of this doc claimed the bug fired *conditionally* and that only
+`bbce4bed` was attributable. **Both were wrong.** Every backend-routed git push failed for
+the whole window. The original claim in `22b2511e`'s commit message was right.
 
-Ruled out as of 2026-08-06:
+**Window (UTC): 2026-08-01 ~12:2xZ → 2026-08-02 18:47Z, ~32 hours.**
+`f41970ae` is stamped `2026-08-01T12:41:31+02:00` = **10:41:31Z** — the `+02:00` offset is
+what produced the wrong window in the previous two passes. The first observed casualty logs
+a failure at **08-01 12:33Z**, which bounds the first affected image. Fix `22b2511e`
+(`2026-08-02T20:30:19+02:00` = 18:30:19Z) reached the cluster at 18:47Z.
 
-- **Deploy lag.** Every dev image from `sha-bab1467` (08-01 17:29) onward contains
-  `f41970ae`; `bbce4bed`'s own audit shows the banner in its shell output.
-- **Commit dates ≠ push dates.** Gitea reflogs confirm genuine `push` entries landing inside
-  the window, not a later flush.
-- **A conditional banner.** `shell_run`'s formatting block emits `CWD:` unconditionally on
-  the normal completion path (`remote.py:1456-1461`), and the sentinel always carries `$PWD`
-  as a third field (`build_sentinel_command`, `shell_manager.py:54`), so `resolved_cwd` is
-  always populated.
+**Why it cannot be conditional (code proof).** Running the pre-fix parser
+(`git show 22b2511e^:src/managers/git_manager.py`) over every shape `shell_run` can emit,
+*all* of them poison the branch name — including the `(no output)` and `CWD: (unknown)`
+variants, because the `elif rest.strip() == "(no output)"` arm no longer matches once a
+header precedes it. There is no input for which the old parser returns a clean branch when
+the banner is present. And nothing gates the banner: `shell_run` emits it unconditionally on
+the normal completion path (`remote.py:1456-1461`), the sentinel always carries `$PWD`
+(`shell_manager.py:54`), and `GitManager` is constructed with the workspace backend at every
+site (`workspace.py:440/467/574/702`, `agent.py:2364`), so `_use_backend` is true whenever
+the workspace has a shell — i.e. always, for remote workspaces.
 
-Not yet examined: whether `_use_backend` is false on some paths
-(`git_manager.py:86` — `backend is not None and backend.supports_shell`); whether the
-per-job-repo/`main` layout behaves differently from the project-repo/`job/<id>` layout that
-`bbce4bed` used; and whether `shell_run`'s early-return paths (colliding command, interactive
-prompt, still-running) matter. Note the fix is correct regardless of the trigger — this
-question is about blast radius and about whether a sibling bug still lurks on the same seam.
+The surrounding guards are all banner-*tolerant*, which is why the failure reached the actual
+push instead of being declined earlier: `is_active` uses `backend.exists()`, and `has_remote`
+tests only `returncode == 0`. Only `push()` consumed the poisoned *stdout*.
+
+**Observed casualties.** `git_manager.py:813` is the pre-fix line number of the push warning
+(`845` after the fix), so the log line dates the code the pod was running:
+
+| Job | Config | Failures in log | First seen |
+| --- | --- | --- | --- |
+| `40efbb39` | worker_base | 26 | 08-01 12:33Z |
+| `bbce4bed` | developer | (archive is a tail) — proven via banner in `freeze_data.head_commit` | 08-01 14:42Z+ |
+| `cd3bfe52` | worker_base | 16 | 08-02 09:34Z |
+| `42fb6e42` | scholar | 35 | 08-02 11:18Z |
+| `09c3f309` | critic | 11 | 08-02 12:29Z |
+
+Five for five: **every** in-window job whose archive covers the period shows the failure. No
+in-window job was found unaffected. Post-fix jobs show none — `6a53d303` (08-05) has an
+archive that provably covers git activity (`git_manager.py:995`, current-code line number)
+with zero push failures. Roughly **13 jobs were created inside the window**, plus any
+long-runners spanning it; the five above are the ones with surviving evidence.
+
+**How the "conditional" misreading happened** — worth recording, because both failure modes
+will recur:
+
+1. *Gitea reflog entries were read as successful pushes.* `cd3bfe52` was cited as the
+   decisive counter-example on the strength of reflog timestamps. Its own log shows 16
+   failures, and its critic (`09c3f309`) independently reported the remote tree was
+   "BYTE-IDENTICAL to the Round-1 baseline (single commit …, single blob … README.md 42 B)".
+   Nothing ever landed.
+2. *`get_job_log` serves S3 **tails**, not full logs.* `bbce4bed`'s archive is 83 lines
+   covering only its final minutes. **A zero-match on `get_job_log` is not evidence of
+   health** — check the archive covers the period first (grep for a line you know must exist).
+
+**The compounding cost, which is the real lesson.** Every downstream verification layer
+worked correctly and still could not diagnose this, because the failing layer logged an empty
+string. The deliverable gate bounced `bbce4bed` twice and sealed it `pending_review` —
+correctly, the file genuinely was not on the branch. `cd3bfe52` burned its full 5-round
+critic loop and ended "Round limit reached (5) with 6 finding(s) still open"; its critic's
+own remediation instruction was "commit+push all 9 deliverable files … Local-write success
+alone does NOT satisfy acceptance criteria". Every finding was an artifact of the push bug.
+`40efbb39` ended "critic pipeline died". Two agents spent thousands of audit entries trying
+to fix files that were already written correctly. A verification loop that cannot see *why* a
+push failed will confidently attribute the failure to the work.
 
 ---
 
@@ -141,31 +181,26 @@ The damage lands in `push()`, which uses that stdout as a branch name —
 bbce4bed started at 14:42 on 2026-08-01, two hours after `f41970ae`, and ran 13 hours across
 8 phases without landing a commit.
 
-> **CORRECTION (2026-08-03, refined 2026-08-06).** An earlier revision of this doc — and
-> commit `22b2511e`'s message — claimed this broke *every* phase-boundary push cluster-wide
-> from 2026-08-01 onward. **That is wrong: it fires conditionally.**
+> **RETRACTED CORRECTIONS (2026-08-03 and an 08-06 refinement).** Two earlier revisions of
+> this doc claimed the bug fired *conditionally* and that `22b2511e`'s "every push,
+> cluster-wide" message was an over-claim. **Both retractions were themselves wrong, and the
+> original claim stands.** Kept here because the two mistakes are instructive:
 >
-> The decisive evidence is a job *inside* the broken window that pushed fine. The affected
-> window is 2026-08-01 ~17:29Z (first image carrying `f41970ae`) → 2026-08-02 18:47Z (fix
-> deployed, `2c59ebaf`). Within it, Gitea's reflog for `job-cd3bfe52` records genuine `push`
-> entries at 08-02 09:33, 14:48 and 17:16, while `bbce4bed` landed nothing across 13 hours on
-> the same cluster.
+> - The **08-03** pass cited four jobs that pushed fine "inside" the window (`becf5f64`,
+>   `5347c057`, `08e0006e`, `8e2c05cf`). All four were *post-fix*: the fix deployed 08-02 at
+>   18:47Z, not 08-03 at 19:59Z (that later rollout was a different image, `a1d9268`).
+> - The **08-06** pass then leaned on `job-cd3bfe52`'s Gitea reflog as a job that pushed
+>   inside the window. Its own agent log shows 16 `git push failed:` warnings, and its critic
+>   found the remote still held a single 42-byte `README.md`. The reflog entries were not
+>   successful deliverable pushes.
 >
-> Two tempting explanations are both dead — see "The one open question" at the top of this
-> doc for the full ruled-out list. In particular the 08-03 measurements that originally
-> prompted this correction (`becf5f64`, `5347c057`, `08e0006e`, `8e2c05cf`) turned out to be
-> *post-fix* jobs: the fix deployed on 08-02 at 18:47Z, not on 08-03 at 19:59Z as first
-> assumed — that later rollout was a different image (`a1d9268`). Those four prove nothing;
-> `cd3bfe52` is the case that carries the argument.
->
-> The fix is correct regardless of the trigger. Treat the trigger as open.
+> See "Blast radius — RESOLVED" at the top for the code proof and the casualty table.
 
-**Attributable damage, as far as verified:** bbce4bed lost its deliverable to this (its own
-`freeze_data.head_commit` carries the pollution signature). Three other jobs in the window
-have branches holding only the seed commit and zero `output/` files — `42fb6e42`,
-`f9f167a4`, and `40efbb39` — but only circumstantially: none has been traced to a push
-failure, and `40efbb39` carries an unrelated critic-pipeline error. Counting them as
-casualties would repeat the over-claim.
+**Attributable damage:** all five in-window jobs with surviving log coverage — `40efbb39`,
+`bbce4bed`, `cd3bfe52`, `42fb6e42`, `09c3f309`. `f9f167a4` is also in-window but its archive
+does not cover the period either way. Roughly 13 jobs were created during the ~32-hour
+window; absent full logs, the five above are what can be evidenced rather than the limit of
+what was hit.
 
 It stayed invisible because the parser also hardcoded `stderr=""`, so the one log line it
 produced read `git push failed: ` with nothing after the colon.
@@ -575,6 +610,13 @@ and thereby locked out of Mode B — so when its jobs produce deliverables in `o
   so the orchestrator can refuse, rather than logging into an archive that is truncated by
   the time anyone looks. `has_unpushed_commits()` (`git_manager.py:832`) already exists and
   needs no network round-trip, so the seal path can cheaply assert "nothing left behind".
+- **Tell the verification loop that transport failed, not the work.** This is the expensive
+  one, now that the blast radius is known: the deliverable gate and the critic both compare
+  *the remote branch* against the contract, so a push failure is indistinguishable from a
+  lazy agent. `cd3bfe52` burned all 5 critic rounds and `bbce4bed` both deliverable-gate
+  bounces re-doing work that was already correct on disk. If `has_unpushed_commits()` is true
+  at seal time, the gate should report "unpushed work present — transport failure" and hold,
+  instead of emitting findings that send an agent to rewrite finished files.
 
 **Defect 2 (the one that made it undiagnosable).** Do not change resolution semantics —
 making the file tools cwd-relative would put writes at the mercy of mutable shell state and
