@@ -16,9 +16,11 @@ a dark launch through app migration `0088`. The dedicated Kubernetes Pod
 collector, namespace-scoped RBAC, authenticated and generation-fenced ingestion,
 exact LIST/WATCH continuity recovery, app-DB workspace Pod intervals, immutable
 shadow comparisons, and bounded retention are present; all runtime gates still
-default off. There is no v2 audit publication, interval-tail/rollup handoff,
-billing cutover, VM collection, or PVC/PV collection. This is not production
-billing readiness.
+default off. Deterministic ordinary-usage segmentation, frozen publication
+plans, strict audit insert/verify, and fenced cursor finalization exist as
+unwired dark code; no runtime publisher can start. There is no late/correction
+publication, interval-tail/rollup handoff, billing cutover, VM collection, or
+PVC/PV collection. This is not production billing readiness.
 
 **Triggered by:** adding public-cloud comparison rate cards exposed that the
 ledger's existing `vcpu-hour` / `gib-hour` arithmetic is sound, but its resource
@@ -1817,8 +1819,9 @@ auth matrix, free/unpriced/partial cost tests, and legacy price exclusion pass.
 
 ### Slice 1 — Kubernetes collector and workspace cutover
 
-**Partially implemented (shadow-only foundation).** The implemented part is
-deliberately incapable of publishing usage events:
+**Partially implemented (shadow foundation plus unwired publication
+mechanics).** The deployed runtime remains incapable of publishing usage
+events:
 
 - A dedicated, database-free Pod collector Deployment and ServiceAccount, with
   namespace-scoped `get/list/watch` Pod RBAC, bounded normalized payloads, and
@@ -1845,12 +1848,19 @@ deliberately incapable of publishing usage events:
   items for at least 7 days and WATCH/session plus shadow-comparison diagnostics
   for 35 days; abandoned incomplete staging manifests become cleanup-eligible
   after 24 hours while their metadata remains authoritative.
+- Unwired strict publication primitives split ordinary workspace Pod intervals
+  at UTC day and immutable-rate boundaries, freeze exact rate/unpriced choices
+  and canonical hashes in app-DB plans, bulk insert plus verify the complete
+  audit batch, and generation-fence the app cursor CAS. Missing partitions stay
+  pending, hash conflicts become terminal, and replay after the audit commit is
+  idempotent. The constructor gate defaults off and no lifespan task starts it.
 
 **Remaining before Slice 1 exit:** prove a healthy shadow observation window
-and resolve every unexplained comparison; implement strict audit publication,
+and resolve every unexplained comparison; complete late/correction publication,
 interval-tail reads, source-aware rollup handoff, legacy integrity repair/drain,
-the crash-resumable cutover barrier, and removal of the legacy blind 24-hour
-closure. Publication and cutover gates must remain off until those checks pass.
+the crash-resumable cutover barrier, publisher runtime wiring, and removal of the
+legacy blind 24-hour closure. Publication and cutover gates must remain off until
+those checks pass.
 
 Depends on Slice 0. Exit: fenced shadow coverage, legacy integrity/drain,
 cutover crash matrix, and workspace quantity reconciliation pass.
