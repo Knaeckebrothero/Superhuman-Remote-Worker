@@ -2765,6 +2765,24 @@ def create_archive_phase_node(
         is_strategic = state.get("is_strategic_phase", True)
         messages = state.get("messages", [])
 
+        # Exactly-once guard per phase INSTANCE (docs/issues/
+        # phase_boundary_tags_are_moved_then_rejected_by_remote.md, fix
+        # direction 4): a rejected transition routes back to execute, and the
+        # retried completion re-enters this node with the SAME phase number —
+        # re-archiving an already-emptied todo list, re-marking the plan,
+        # re-snapshotting and re-extracting memories for a boundary that
+        # already happened. The key is checkpointed, so the guard holds
+        # across a same-lineage resume; a successful transition changes
+        # phase_number and naturally re-arms it.
+        instance_key = f"{phase_number}:{'strategic' if is_strategic else 'tactical'}"
+        if state.get("last_archived_phase") == instance_key:
+            logger.info(
+                f"[{job_id}] Phase instance {instance_key} already archived — "
+                f"exactly-once guard skipping duplicate archive side effects "
+                f"(transition retry after a rejection)"
+            )
+            return {}
+
         current_phase = plan_manager.get_current_phase()
         logger.info(f"[{job_id}] Archiving phase: {current_phase}")
 
@@ -3032,6 +3050,7 @@ def create_archive_phase_node(
             )
             return {
                 "messages": compacted_messages + [message],
+                "last_archived_phase": instance_key,
             }
 
         logger.debug(
@@ -3039,6 +3058,7 @@ def create_archive_phase_node(
         )
         return {
             "messages": [message],
+            "last_archived_phase": instance_key,
         }
 
     return archive_phase

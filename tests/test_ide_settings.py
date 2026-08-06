@@ -284,6 +284,44 @@ class TestResolveSshTarget:
         assert resolve_ssh_target({}) is None
         assert resolve_ssh_target({"workspace_container": {}}) is None
 
+    def test_stable_service_dns_preferred_over_pod_ip(self):
+        """A restarted workspace pod keeps its Service name, not its IP —
+        dialing the stale IP was the sweeper's residual 'No route to host'
+        source. The stable DNS must win when both are present."""
+        ctx = {
+            "workspace_container": {
+                "status": "ready",
+                "host": "workspace-965b0935-309.srw.svc.cluster.local",
+                "pod_ip": "10.42.0.99",
+                "port": 30022,
+            }
+        }
+        assert resolve_ssh_target(ctx) == (
+            "workspace-965b0935-309.srw.svc.cluster.local",
+            30022,
+        )
+
+    def test_legacy_pod_ip_only_row_still_resolves(self):
+        ctx = {
+            "workspace_container": {
+                "status": "ready",
+                "pod_ip": "10.0.0.5",
+                "port": 30022,
+            }
+        }
+        assert resolve_ssh_target(ctx) == ("10.0.0.5", 30022)
+
+    def test_host_only_row_uses_default_port(self):
+        ctx = {
+            "workspace_container": {
+                "status": "ready",
+                "host": "workspace-abc.srw.svc.cluster.local",
+            }
+        }
+        host, port = resolve_ssh_target(ctx)
+        assert host == "workspace-abc.srw.svc.cluster.local"
+        assert port > 0
+
 
 class TestBuildSeedScript:
     def test_empty_files_is_noop_script(self):

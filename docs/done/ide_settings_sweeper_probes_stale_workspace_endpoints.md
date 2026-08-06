@@ -27,7 +27,11 @@ Tests: `TestEvictDeadWorkspaces` + `TestSweeperRegistrationShape`
 sweeper cycle logged **zero** dead-endpoint probes and the one live session
 workspace still synced (see cycle evidence in the session log,
 docs/issues/BACKLOG.md). Option 4 (dial the stable Service DNS instead of
-`pod_ip`) remains open as hardening; it is orthogonal to the leak.
+`pod_ip`) **closed 2026-08-06 (batch #3)**: `resolve_ssh_target` now prefers
+`workspace_container.host` (the headless-Service DNS from `7fb9e9e2`) over
+the ephemeral `pod_ip` (legacy-row fallback kept), and the sweeper logs its
+dial mix per cycle — live k3d: "IDE settings sweeper: 1 workspace(s), 1
+dialed via stable service DNS". Nothing remains open in this doc.
 
 **Originally:** Filed + diagnosed (2026-06-27, during the loop-job `19707fa1` OOM investigation; promoted out of a sub-note in `audit_metadata_config_duplication_ooms_orchestrator.md`). Not yet fixed — but live-verified on k3d 2026-06-30 (27 leaked records actively probed across both replicas; see § Live k3d verification). The IDE-settings background sweeper rebuilds its worklist from a query that selects workspace records purely on a stale JSONB `status`, with no parent-job/thread-status or pod-liveness filter, and nothing clears that status when a session ends or a pod dies — so dead records accumulate forever and the sweeper serially SSH-dials each one every cycle ("No route to host", ~3 s apiece), on every replica. Re-verified 2026-07-02 (main cluster) — still live and unfixed: the sweeper is still probing dead endpoints on main — **67 distinct dead `:30022` IPs** in a recent 400-line log window (vs 27 on k3d 2026-06-30).
 
