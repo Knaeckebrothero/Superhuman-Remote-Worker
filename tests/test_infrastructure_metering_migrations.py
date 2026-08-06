@@ -8,13 +8,16 @@ from decimal import Decimal
 import json
 from pathlib import Path
 import re
+from types import SimpleNamespace
 from uuid import uuid4
 
 import asyncpg
 import pytest
 
+from orchestrator.database.migrate import discover
 from orchestrator.services.infrastructure_metering.materializer import (
     InfrastructureUsageMaterializer,
+    PublicationConflictError,
 )
 from orchestrator.services.infrastructure_metering.inventory import (
     InventoryConflictError,
@@ -38,6 +41,14 @@ from orchestrator.services.infrastructure_metering.inventory import (
 from orchestrator.services.infrastructure_metering.pod_intervals import (
     PodIntervalReconciler,
 )
+from orchestrator.services.infrastructure_metering.queries import UsageVisibility
+from orchestrator.services.infrastructure_metering.read_model import (
+    SourceAwareUsageReadModel,
+)
+from orchestrator.services.infrastructure_metering.sealer import (
+    DaySealDisposition,
+    InfrastructureUsageDaySealer,
+)
 from orchestrator.services.usage_ledger import StrictUsagePublishResult
 
 
@@ -53,6 +64,34 @@ APP_INGESTION_MIGRATION = (
 APP_INGESTION_SIZE_FIX = (
     ROOT
     / "orchestrator/database/migrations/app/0088_inventory_ingestion_logical_size.sql"
+)
+APP_PLAN_PERIOD_INDEX = (
+    ROOT
+    / "orchestrator/database/migrations/app/0089_infrastructure_plan_period_idx.notx.sql"
+)
+APP_INTERVAL_OVERLAP_INDEX = (
+    ROOT
+    / "orchestrator/database/migrations/app/0090_infrastructure_interval_overlap_idx.notx.sql"
+)
+APP_COMPLETE_SNAPSHOT_RECEIVED_INDEX = (
+    ROOT
+    / "orchestrator/database/migrations/app/0091_inventory_complete_received_idx.notx.sql"
+)
+APP_INVALID_WATCH_RECEIVED_INDEX = (
+    ROOT
+    / "orchestrator/database/migrations/app/0092_inventory_invalid_watch_received_idx.notx.sql"
+)
+APP_DAY_SEQUENCE_BACKFILL_PREP = (
+    ROOT
+    / "orchestrator/database/migrations/app/0092z_infrastructure_day_sequence_backfill_prep.sql"
+)
+APP_TERMINAL_EVIDENCE_MIGRATION = (
+    ROOT
+    / "orchestrator/database/migrations/app/0100_infrastructure_terminal_evidence_single_boundary.sql"
+)
+APP_REFERENCED_RATE_GUARD_MIGRATION = (
+    ROOT
+    / "orchestrator/database/migrations/app/0101_usage_rates_v2_referenced_range_guard.sql"
 )
 AUDIT_EXPANSION = (
     ROOT
@@ -81,6 +120,35 @@ def _swap_db(dsn: str, dbname: str) -> str:
     if "?" in tail:
         query = "?" + tail.split("?", 1)[1]
     return f"{head}/{dbname}{query}"
+
+
+def test_migration_discovery_orders_emergency_interstitial_versions(
+    tmp_path: Path,
+) -> None:
+    for name in (
+        "0093_later.sql",
+        "0092_base.sql",
+        "0092z_bridge.sql",
+        "0091_before.sql",
+    ):
+        (tmp_path / name).write_text("SELECT 1;\n")
+
+    assert [path.name for path in discover(tmp_path)] == [
+        "0091_before.sql",
+        "0092_base.sql",
+        "0092z_bridge.sql",
+        "0093_later.sql",
+    ]
+
+
+def test_migration_discovery_rejects_duplicate_interstitial_version(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "0092z_first.sql").write_text("SELECT 1;\n")
+    (tmp_path / "0092z_second.sql").write_text("SELECT 2;\n")
+
+    with pytest.raises(RuntimeError, match="duplicate migration prefix '0092z'"):
+        discover(tmp_path)
 
 
 @pytest.fixture(scope="module")
@@ -300,6 +368,48 @@ def test_app_ingestion_size_fix_uses_logical_json_bytes() -> None:
     assert "pg_column_size" not in function_body
 
 
+def test_app_read_and_seal_indexes_are_online_and_source_specific() -> None:
+    plan_sql = APP_PLAN_PERIOD_INDEX.read_text()
+    interval_sql = APP_INTERVAL_OVERLAP_INDEX.read_text()
+    snapshot_sql = APP_COMPLETE_SNAPSHOT_RECEIVED_INDEX.read_text()
+    watch_sql = APP_INVALID_WATCH_RECEIVED_INDEX.read_text()
+    sql = plan_sql + interval_sql + snapshot_sql + watch_sql
+    compact = _compact(sql)
+
+    assert "transactional: no" in sql
+    assert plan_sql.count("CREATE INDEX CONCURRENTLY IF NOT EXISTS") == 1
+    assert interval_sql.count("CREATE INDEX CONCURRENTLY IF NOT EXISTS") == 1
+    assert snapshot_sql.count("CREATE INDEX CONCURRENTLY IF NOT EXISTS") == 1
+    assert watch_sql.count("CREATE INDEX CONCURRENTLY IF NOT EXISTS") == 1
+    assert "resource_publication_plans_period_idx" in sql
+    assert "tstzrange(period_start, period_end, '[)')" in compact
+    assert "resource_intervals_overlap_idx" in sql
+    assert "tstzrange(started_at, ended_at, '[)')" in compact
+    assert "resource_inventory_snapshots_complete_received_idx" in sql
+    assert (
+        "ON resource_inventory_snapshots (scope_epoch_id, received_at, id)" in compact
+    )
+    assert (
+        "WHERE complete IS TRUE AND manifest_state IN ('sealed', 'items-expired')"
+        in compact
+    )
+    assert "resource_inventory_watch_events_invalid_received_idx" in sql
+    assert (
+        "ON resource_inventory_watch_events (scope_epoch_id, received_at, id)"
+        in compact
+    )
+    assert (
+        "WHERE valid_for_metering IS FALSE "
+        "AND mutation_action = 'presence-invalid'" in compact
+    )
+    assert "depends-on:    0090_infrastructure_interval_overlap_idx.notx.sql" in (
+        snapshot_sql
+    )
+    assert "depends-on:    0091_inventory_complete_received_idx.notx.sql" in watch_sql
+    assert snapshot_sql.count("INVALID index") == 1
+    assert watch_sql.count("INVALID index") == 1
+
+
 def test_interval_constraints_bind_identity_dimensions_and_time() -> None:
     sql = _compact(APP_MIGRATION.read_text())
 
@@ -495,26 +605,243 @@ def test_audit_project_window_index_documents_partitioned_build() -> None:
 
 
 def test_migration_heads_are_unique_and_snapshots_are_not_the_contract() -> None:
-    app_files = sorted(
-        (ROOT / "orchestrator/database/migrations/app").glob(
-            "[0-9][0-9][0-9][0-9]_*.sql"
-        )
-    )
-    audit_files = sorted(
-        (ROOT / "orchestrator/database/migrations/audit").glob(
-            "[0-9][0-9][0-9][0-9]_*.sql"
-        )
-    )
+    app_files = discover(ROOT / "orchestrator/database/migrations/app")
+    audit_files = discover(ROOT / "orchestrator/database/migrations/audit")
 
     for files in (app_files, audit_files):
         prefixes = [path.name.split("_", 1)[0] for path in files]
         assert len(prefixes) == len(set(prefixes))
-    assert app_files[-1].name == APP_INGESTION_SIZE_FIX.name
+    assert app_files[-1].name == APP_REFERENCED_RATE_GUARD_MIGRATION.name
     assert audit_files[-1].name == AUDIT_PROJECT_INDEX.name
     assert "schema_current" not in APP_MIGRATION.read_text()
     assert "schema_current" not in APP_INGESTION_MIGRATION.read_text()
     assert "schema_current" not in APP_INGESTION_SIZE_FIX.read_text()
+    assert "schema_current" not in APP_PLAN_PERIOD_INDEX.read_text()
+    assert "schema_current" not in APP_INTERVAL_OVERLAP_INDEX.read_text()
+    assert "schema_current" not in APP_COMPLETE_SNAPSHOT_RECEIVED_INDEX.read_text()
+    assert "schema_current" not in APP_INVALID_WATCH_RECEIVED_INDEX.read_text()
+    assert "schema_current" not in APP_DAY_SEQUENCE_BACKFILL_PREP.read_text()
+    assert "schema_current" not in APP_TERMINAL_EVIDENCE_MIGRATION.read_text()
+    assert "schema_current" not in APP_REFERENCED_RATE_GUARD_MIGRATION.read_text()
     assert "audit_schema_current" not in AUDIT_EXPANSION.read_text()
+
+
+def test_referenced_rate_range_guard_is_bounded_and_conflict_aware() -> None:
+    sql = _compact(APP_REFERENCED_RATE_GUARD_MIGRATION.read_text())
+
+    assert (
+        "depends-on: 0100_infrastructure_terminal_evidence_single_boundary.sql" in sql
+    )
+    assert "LOCK TABLE usage_rates_v2 IN SHARE ROW EXCLUSIVE MODE" in sql
+    assert (
+        "LOCK TABLE resource_publication_plan_events IN SHARE ROW EXCLUSIVE MODE" in sql
+    )
+    assert "resource_publication_plan_events_rate_reference_idx" in sql
+    assert "plan.state IN ('planned', 'published', 'conflict')" in sql
+    assert "plan.period_end > NEW.effective_to" in sql
+    assert sql.count("CREATE TRIGGER usage_rates_v2_referenced_range_guard") == 1
+    assert "BEFORE UPDATE OF effective_to ON usage_rates_v2" in sql
+    assert "ERRCODE = '55000'" in sql
+
+
+@pytest.mark.asyncio
+async def test_referenced_rate_guard_allows_boundary_close_and_blocks_retained_plans(
+    app_pg_dsn: str,
+) -> None:
+    dbname = f"metering_rate_guard_{uuid4().hex[:12]}"
+    admin = await asyncpg.connect(app_pg_dsn)
+    try:
+        await admin.execute(f'CREATE DATABASE "{dbname}"')
+    finally:
+        await admin.close()
+
+    conn = await asyncpg.connect(_swap_db(app_pg_dsn, dbname))
+    try:
+        await conn.execute('CREATE EXTENSION "uuid-ossp"')
+        await conn.execute("CREATE TABLE usage_rate_cards (id TEXT PRIMARY KEY)")
+        await conn.execute(
+            "CREATE TABLE rollup_state (name TEXT PRIMARY KEY, last_closed_day DATE)"
+        )
+        await conn.execute(APP_MIGRATION.read_text())
+
+        scope_id = uuid4()
+        await conn.execute(
+            "INSERT INTO resource_inventory_scopes "
+            "(id, collector_id, source_cluster, api_resource, namespace) "
+            "VALUES ($1, 'test', 'cluster-a', 'pods', 'workers')",
+            scope_id,
+        )
+        period_end = datetime(2026, 8, 6, 12, tzinfo=timezone.utc)
+        period_start = period_end - timedelta(hours=1)
+        interval_id = await _insert_open_test_interval(
+            conn,
+            inventory_scope_id=scope_id,
+            source_cluster="cluster-a",
+            namespace="workers",
+            source_uid="rate-guard-pod",
+            source_revision="a" * 64,
+            observed_at=period_end,
+        )
+
+        async def insert_rate(resource: str) -> object:
+            rate_id = uuid4()
+            await conn.execute(
+                "INSERT INTO usage_rates_v2 ("
+                "id, cost_domain, measurement_basis, category, resource_class, "
+                "resource, unit, effective_from, usd_per_unit, source, "
+                "source_version) VALUES ("
+                "$1, 'workload-allocation', 'scheduler-request', 'compute', "
+                "'kubernetes-pod', $2, 'vcpu-hour', $3, 0.25, "
+                "'test', 'v1')",
+                rate_id,
+                resource,
+                period_start - timedelta(days=1),
+            )
+            return rate_id
+
+        ordinary_rate = await insert_rate("ordinary-resource")
+        correction_rate = await insert_rate("correction-resource")
+
+        async def insert_plan(kind: str, rate_id: object, source_id: str) -> object:
+            plan_id = uuid4()
+            correction = kind == "correction"
+            async with conn.transaction():
+                await conn.execute(
+                    "INSERT INTO resource_publication_plans ("
+                    "id, source_interval_id, source_revision, plan_kind, "
+                    "plan_revision, advances_cursor, previous_materialized_through, "
+                    "correction_group_id, period_start, period_end, "
+                    "expected_event_count, payload_schema_version, event_set_hash, "
+                    "rate_selection_hash, creator_generation) VALUES ("
+                    "$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 1, 1, $11, $12, 1)",
+                    plan_id,
+                    interval_id,
+                    "a" * 64,
+                    kind,
+                    1 if correction else 0,
+                    not correction,
+                    None if correction else period_start,
+                    plan_id if correction else None,
+                    period_start,
+                    period_end,
+                    "b" * 64,
+                    "c" * 64,
+                )
+                await conn.execute(
+                    "INSERT INTO resource_publication_plan_events ("
+                    "plan_id, ordinal, source, source_id, unit, ts, event_kind, "
+                    "canonical_rate_version_id, row_hash, event_payload) VALUES ("
+                    "$1, 0, $2, $3, 'vcpu-hour', $4, $5, $6, $7, $8::jsonb)",
+                    plan_id,
+                    (
+                        "infra-allocation-correction-v2"
+                        if correction
+                        else "infra-allocation-v2"
+                    ),
+                    source_id,
+                    period_start,
+                    kind,
+                    rate_id,
+                    "d" * 64 if correction else "e" * 64,
+                    json.dumps(
+                        (
+                            {
+                                "quantity": "-4",
+                                "corrects_source": "infra-allocation-v2",
+                                "corrects_source_id": "ordinary-event",
+                                "corrects_unit": "vcpu-hour",
+                                "corrects_ts": period_start.isoformat(
+                                    timespec="microseconds"
+                                ).replace("+00:00", "Z"),
+                            }
+                            if correction
+                            else {"quantity": "10"}
+                        )
+                    ),
+                )
+            return plan_id
+
+        ordinary_plan = await insert_plan("usage", ordinary_rate, "ordinary-event")
+        correction_plan = await insert_plan(
+            "correction", correction_rate, "correction-event"
+        )
+        await conn.execute(
+            "UPDATE resource_publication_plans SET state='published', "
+            "attempt_count=1, last_attempt_at=statement_timestamp(), "
+            "published_at=statement_timestamp() WHERE id=$1",
+            ordinary_plan,
+        )
+
+        await conn.execute(APP_REFERENCED_RATE_GUARD_MIGRATION.read_text())
+
+        def negative_candidate(quantity: str) -> SimpleNamespace:
+            payload = {
+                "quantity": quantity,
+                "corrects_source": "infra-allocation-v2",
+                "corrects_source_id": "ordinary-event",
+                "corrects_unit": "vcpu-hour",
+                "corrects_ts": period_start.isoformat(timespec="microseconds").replace(
+                    "+00:00", "Z"
+                ),
+                "details": {
+                    "corrects_quantity": "10",
+                    "corrects_payload_hash": "e" * 64,
+                },
+            }
+            return SimpleNamespace(
+                id=uuid4(),
+                source_interval_id=interval_id,
+                events=(SimpleNamespace(event=SimpleNamespace(payload=payload)),),
+            )
+
+        await InfrastructureUsageMaterializer._validate_correction_negative_bounds(
+            conn, negative_candidate("-3")
+        )
+        with pytest.raises(PublicationConflictError, match="exceed original quantity"):
+            await InfrastructureUsageMaterializer._validate_correction_negative_bounds(
+                conn, negative_candidate("-7")
+            )
+
+        unsafe_close = period_end - timedelta(microseconds=1)
+        for rate_id in (ordinary_rate, correction_rate):
+            with pytest.raises(asyncpg.ObjectNotInPrerequisiteStateError):
+                await conn.execute(
+                    "UPDATE usage_rates_v2 SET effective_to=$1 WHERE id=$2",
+                    unsafe_close,
+                    rate_id,
+                )
+
+        await conn.execute(
+            "UPDATE resource_publication_plans SET state='conflict', "
+            "attempt_count=1, last_attempt_at=statement_timestamp(), "
+            "sanitized_error='{}'::jsonb WHERE id=$1",
+            correction_plan,
+        )
+        with pytest.raises(asyncpg.ObjectNotInPrerequisiteStateError):
+            await conn.execute(
+                "UPDATE usage_rates_v2 SET effective_to=$1 WHERE id=$2",
+                unsafe_close,
+                correction_rate,
+            )
+
+        for rate_id in (ordinary_rate, correction_rate):
+            await conn.execute(
+                "UPDATE usage_rates_v2 SET effective_to=$1 WHERE id=$2",
+                period_end,
+                rate_id,
+            )
+        closed = await conn.fetchval(
+            "SELECT count(*) FROM usage_rates_v2 WHERE effective_to=$1",
+            period_end,
+        )
+        assert closed == 2
+    finally:
+        await conn.close()
+        admin = await asyncpg.connect(app_pg_dsn)
+        try:
+            await admin.execute(f'DROP DATABASE IF EXISTS "{dbname}" WITH (FORCE)')
+        finally:
+            await admin.close()
 
 
 @pytest.mark.asyncio
@@ -538,6 +865,10 @@ async def test_app_ingestion_migration_applies_after_slice0_on_postgres16(
         await conn.execute(APP_MIGRATION.read_text())
         await conn.execute(APP_INGESTION_MIGRATION.read_text())
         await conn.execute(APP_INGESTION_SIZE_FIX.read_text())
+        await conn.execute(APP_PLAN_PERIOD_INDEX.read_text())
+        await conn.execute(APP_INTERVAL_OVERLAP_INDEX.read_text())
+        await conn.execute(APP_COMPLETE_SNAPSHOT_RECEIVED_INDEX.read_text())
+        await conn.execute(APP_INVALID_WATCH_RECEIVED_INDEX.read_text())
 
         await conn.execute(
             "CREATE TEMP TABLE inventory_size_probe ("
@@ -570,6 +901,16 @@ async def test_app_ingestion_migration_applies_after_slice0_on_postgres16(
         assert "resource_inventory_transport_nonces" in names
         assert "resource_inventory_watch_sessions" in names
         assert "resource_inventory_watch_events" in names
+        indexes = {
+            row["indexname"]
+            for row in await conn.fetch(
+                "SELECT indexname FROM pg_indexes WHERE schemaname='public'"
+            )
+        }
+        assert "resource_publication_plans_period_idx" in indexes
+        assert "resource_intervals_overlap_idx" in indexes
+        assert "resource_inventory_snapshots_complete_received_idx" in indexes
+        assert "resource_inventory_watch_events_invalid_received_idx" in indexes
 
         await conn.execute(
             "UPDATE infra_metering_control SET leader_generation=1, "
@@ -842,6 +1183,236 @@ async def test_snapshot_ticket_turns_abandoned_watch_into_recovery_gap(
             await pool.close()
         if not setup.is_closed():
             await setup.close()
+        admin = await asyncpg.connect(app_pg_dsn)
+        try:
+            await admin.execute(f'DROP DATABASE IF EXISTS "{dbname}" WITH (FORCE)')
+        finally:
+            await admin.close()
+
+
+@pytest.mark.asyncio
+async def test_day_sealer_executes_against_postgres16(app_pg_dsn: str) -> None:
+    dbname = f"metering_sealer_{uuid4().hex[:12]}"
+    admin = await asyncpg.connect(app_pg_dsn)
+    try:
+        await admin.execute(f'CREATE DATABASE "{dbname}"')
+    finally:
+        await admin.close()
+
+    dsn = _swap_db(app_pg_dsn, dbname)
+    setup = await asyncpg.connect(dsn)
+    pool = None
+    try:
+        await setup.execute('CREATE EXTENSION "uuid-ossp"')
+        await setup.execute("CREATE TABLE usage_rate_cards (id TEXT PRIMARY KEY)")
+        await setup.execute(
+            "CREATE TABLE rollup_state (name TEXT PRIMARY KEY, last_closed_day DATE)"
+        )
+        await setup.execute(APP_MIGRATION.read_text())
+        await setup.execute(APP_INGESTION_MIGRATION.read_text())
+        await setup.execute(APP_INGESTION_SIZE_FIX.read_text())
+        await setup.execute(APP_PLAN_PERIOD_INDEX.read_text())
+        await setup.execute(APP_INTERVAL_OVERLAP_INDEX.read_text())
+        await setup.execute(APP_COMPLETE_SNAPSHOT_RECEIVED_INDEX.read_text())
+        await setup.execute(APP_INVALID_WATCH_RECEIVED_INDEX.read_text())
+
+        day = datetime.now(timezone.utc).date() - timedelta(days=2)
+        day_start = datetime.combine(day, datetime.min.time(), tzinfo=timezone.utc)
+        day_end = day_start + timedelta(days=1)
+        scope_id = uuid4()
+        await setup.execute(
+            "UPDATE infra_metering_control SET leader_generation=1, "
+            "cutover_state='active', cutover_at=$1, "
+            "updated_at=statement_timestamp() WHERE singleton",
+            day_start,
+        )
+        await setup.execute(
+            "INSERT INTO resource_inventory_scopes "
+            "(id, collector_id, source_cluster, api_resource, namespace) "
+            "VALUES ($1, 'kubernetes', 'test-cluster', 'core/v1/pods', 'workers')",
+            scope_id,
+        )
+        epoch_id = await setup.fetchval(
+            "INSERT INTO resource_inventory_scope_epochs ("
+            "scope_id, epoch_number, reliable_from, required_for_rollup, "
+            "required_from, coverage_mode, leader_generation, continuous_since, "
+            "complete_through, snapshot_health, continuity_health, item_health, "
+            "backend_health, publication_health) VALUES ("
+            "$1, 1, $2, TRUE, $2, 'list-watch', 1, $2, $3, "
+            "'healthy', 'healthy', 'healthy', 'healthy', 'initializing') "
+            "RETURNING id",
+            scope_id,
+            day_start,
+            day_end,
+        )
+        # This fixture exercises the sealer's SQL evidence query rather than
+        # the already-covered ticket/finalization path. Bypass only the ingest
+        # fence while installing an otherwise valid immutable boundary proof.
+        await setup.execute(
+            "ALTER TABLE resource_inventory_snapshots DISABLE TRIGGER "
+            "resource_inventory_snapshots_generation_fence"
+        )
+        snapshot_id = await setup.fetchval(
+            "INSERT INTO resource_inventory_snapshots ("
+            "scope_epoch_id, inventory_scope_id, collection_started_at, "
+            "collection_completed_at, received_at, complete, leader_generation, "
+            "item_count) VALUES ($1, $2, $3, $3, $3, FALSE, 1, 0) "
+            "RETURNING id",
+            epoch_id,
+            scope_id,
+            day_end - timedelta(seconds=1),
+        )
+        await setup.execute(
+            "UPDATE resource_inventory_snapshots SET "
+            "collection_completed_at=$2, received_at=$2, complete=TRUE, "
+            "item_digest=$3, manifest_state='sealed', sealed_at=$2 "
+            "WHERE id=$1",
+            snapshot_id,
+            day_end,
+            "0" * 64,
+        )
+        await setup.execute(
+            "ALTER TABLE resource_inventory_snapshots ENABLE TRIGGER "
+            "resource_inventory_snapshots_generation_fence"
+        )
+
+        pool = await asyncpg.create_pool(dsn, min_size=1, max_size=2)
+        sealer = InfrastructureUsageDaySealer(pool, sealing_enabled=True)
+        first = await sealer.seal_day(day, 1)
+        replay = await sealer.seal_day(day, 1)
+
+        persisted = await setup.fetchrow(
+            "SELECT state, coverage_status, coverage_revision, unknown_ranges "
+            "FROM infra_usage_day_state WHERE day=$1",
+            day,
+        )
+        assert first.disposition is DaySealDisposition.SEALED
+        assert replay.disposition is DaySealDisposition.ALREADY_SEALED
+        assert replay.coverage_revision == first.coverage_revision
+        assert persisted is not None
+        assert persisted["state"] == "sealed"
+        assert persisted["coverage_status"] == "complete"
+        assert persisted["coverage_revision"] == first.coverage_revision
+        assert persisted["unknown_ranges"] == "[]"
+    finally:
+        if pool is not None:
+            await pool.close()
+        await setup.close()
+        admin = await asyncpg.connect(app_pg_dsn)
+        try:
+            await admin.execute(f'DROP DATABASE IF EXISTS "{dbname}" WITH (FORCE)')
+        finally:
+            await admin.close()
+
+
+@pytest.mark.asyncio
+async def test_source_aware_read_sql_executes_against_postgres16(
+    app_pg_dsn: str,
+) -> None:
+    dbname = f"metering_reader_{uuid4().hex[:12]}"
+    admin = await asyncpg.connect(app_pg_dsn)
+    try:
+        await admin.execute(f'CREATE DATABASE "{dbname}"')
+    finally:
+        await admin.close()
+
+    dsn = _swap_db(app_pg_dsn, dbname)
+    setup = await asyncpg.connect(dsn)
+    pool = None
+    try:
+        await setup.execute('CREATE EXTENSION "uuid-ossp"')
+        await setup.execute("CREATE TABLE usage_rate_cards (id TEXT PRIMARY KEY)")
+        await setup.execute(
+            "CREATE TABLE rollup_state (name TEXT PRIMARY KEY, last_closed_day DATE)"
+        )
+        await setup.execute(APP_MIGRATION.read_text())
+        await setup.execute(APP_INGESTION_MIGRATION.read_text())
+        await setup.execute(APP_INGESTION_SIZE_FIX.read_text())
+        await setup.execute(APP_PLAN_PERIOD_INDEX.read_text())
+        await setup.execute(APP_INTERVAL_OVERLAP_INDEX.read_text())
+        await setup.execute(APP_COMPLETE_SNAPSHOT_RECEIVED_INDEX.read_text())
+        await setup.execute(APP_INVALID_WATCH_RECEIVED_INDEX.read_text())
+        await setup.execute(
+            "CREATE FUNCTION round_half_even_v2(value numeric, scale integer) "
+            "RETURNS numeric LANGUAGE sql IMMUTABLE STRICT AS "
+            "'SELECT round(value, scale)'"
+        )
+        await setup.execute(
+            "CREATE TABLE usage_events ("
+            "ts TIMESTAMPTZ NOT NULL, user_id UUID, project_id UUID, "
+            "ref_kind TEXT, ref_id UUID, category TEXT NOT NULL, "
+            "resource TEXT NOT NULL, quantity NUMERIC NOT NULL, unit TEXT NOT NULL, "
+            "rate_usd NUMERIC, cost_usd NUMERIC, source TEXT NOT NULL, "
+            "period_start TIMESTAMPTZ, period_end TIMESTAMPTZ, "
+            "measurement_basis TEXT, cost_domain TEXT, resource_class TEXT, "
+            "attribution_scope TEXT, measurement_algorithm TEXT, "
+            "source_capacity_value BIGINT, source_capacity_unit TEXT, "
+            "event_kind TEXT)"
+        )
+
+        from_ts = datetime.combine(
+            datetime.now(timezone.utc).date() - timedelta(days=2),
+            datetime.min.time(),
+            tzinfo=timezone.utc,
+        )
+        to_ts = from_ts + timedelta(hours=1)
+        scope_id = uuid4()
+        user_id = uuid4()
+        await setup.execute(
+            "UPDATE infra_metering_control SET leader_generation=1, "
+            "cutover_state='active', cutover_at=$1, "
+            "updated_at=statement_timestamp() WHERE singleton",
+            from_ts,
+        )
+        await setup.execute(
+            "INSERT INTO resource_inventory_scopes "
+            "(id, collector_id, source_cluster, api_resource, namespace) "
+            "VALUES ($1, 'kubernetes', 'test-cluster', 'core/v1/pods', 'workers')",
+            scope_id,
+        )
+        await setup.execute(
+            "INSERT INTO resource_inventory_scope_epochs ("
+            "scope_id, epoch_number, reliable_from, required_for_rollup, "
+            "required_from, coverage_mode, leader_generation, continuous_since, "
+            "complete_through, snapshot_health, continuity_health, item_health, "
+            "backend_health, publication_health) VALUES ("
+            "$1, 1, $2, TRUE, $2, 'list-watch', 1, $2, $3, "
+            "'healthy', 'healthy', 'healthy', 'healthy', 'healthy')",
+            scope_id,
+            from_ts,
+            to_ts,
+        )
+        await setup.execute(
+            "INSERT INTO usage_events ("
+            "ts, user_id, category, resource, quantity, unit, rate_usd, "
+            "cost_usd, source, measurement_basis, cost_domain, resource_class, "
+            "attribution_scope, measurement_algorithm) VALUES ("
+            "$1, $2, 'llm', 'openrouter/test', 100, 'tokens', 0.000001, "
+            "0.0001, 'openrouter', 'api-consumed', 'external-service', "
+            "'llm-model', 'customer', 'provider-reported-v1')",
+            from_ts + timedelta(minutes=30),
+            user_id,
+        )
+
+        pool = await asyncpg.create_pool(dsn, min_size=1, max_size=2)
+        summary = await SourceAwareUsageReadModel(pool, pool).summary(
+            from_ts=from_ts,
+            to_ts=to_ts,
+            visibility=UsageVisibility(),
+            as_of=to_ts,
+        )
+
+        assert summary.coverage.status == "complete"
+        assert summary.window.data_through == to_ts
+        assert len(summary.rows) == 1
+        assert summary.rows[0].quantity == "100"
+        assert summary.rows[0].finalized_quantity == "100"
+        assert summary.rows[0].confirmed_provisional_quantity == "0"
+        assert summary.rows[0].ledger_cost.amount == "0.0001"
+    finally:
+        if pool is not None:
+            await pool.close()
+        await setup.close()
         admin = await asyncpg.connect(app_pg_dsn)
         try:
             await admin.execute(f'DROP DATABASE IF EXISTS "{dbname}" WITH (FORCE)')
@@ -1357,8 +1928,10 @@ async def test_pod_reconciler_revalidates_attribution_and_lifetime_evidence(
                 "WHERE snapshot_id=$1 AND source_uid='pod-attribution'",
                 shadow_snapshot_id,
             )
-        assert shadow["status"] == "lifetime-mismatch"
-        assert shadow["reason_code"] == "start-semantics"
+        # Capacity divergence is the primary blocker. Lifetime evidence is
+        # still persisted below, but it must not hide a quantity mismatch.
+        assert shadow["status"] == "capacity-mismatch"
+        assert shadow["reason_code"] == "capacity-difference"
         assert shadow["explained"] is False
         assert shadow["observed_cpu_millicores"] - shadow["legacy_cpu_millicores"] == 50
         assert (
@@ -1517,7 +2090,7 @@ async def test_inventory_store_snapshot_watch_and_recovery_are_atomic(
         namespace="workers",
     )
     original_proof = datetime.now(timezone.utc) - timedelta(minutes=2)
-    revisions = {key: key * 64 for key in ("a", "b", "c", "d")}
+    revisions = {key: key * 64 for key in ("a", "b", "c", "d", "e")}
     async with pool.acquire() as conn:
         await conn.execute(
             "INSERT INTO resource_inventory_scopes "
@@ -1614,6 +2187,13 @@ async def test_inventory_store_snapshot_watch_and_recovery_are_atomic(
             },
             True,
         ),
+        InventoryItem(
+            "pod",
+            "platform",
+            revisions["e"],
+            {"source_kind": "pod", "uid": "platform", "namespace": "workers"},
+            True,
+        ),
     )
     first_stage_claim = _transport("snapshot-items")
     staged = await consumer.stage_items(
@@ -1624,7 +2204,7 @@ async def test_inventory_store_snapshot_watch_and_recovery_are_atomic(
         scope=scope,
         transport=first_stage_claim,
     )
-    assert (staged.inserted, staged.total) == (3, 3)
+    assert (staged.inserted, staged.total) == (4, 4)
     with pytest.raises(InventoryConflictError, match="nonce"):
         await consumer.stage_items(
             ticket.token,
@@ -1642,9 +2222,11 @@ async def test_inventory_store_snapshot_watch_and_recovery_are_atomic(
         scope=scope,
         transport=_transport("snapshot-items"),
     )
-    assert (replay_stage.inserted, replay_stage.total) == (0, 3)
+    assert (replay_stage.inserted, replay_stage.total) == (0, 4)
 
     async def mutate_snapshot(conn, context, item):
+        if item.source_uid == "platform":
+            return None
         if context.existing_source_revision == item.revision_hash:
             assert context.existing_interval_id is not None
             return await conn.fetchval(
@@ -1669,6 +2251,12 @@ async def test_inventory_store_snapshot_watch_and_recovery_are_atomic(
 
     async def compare_snapshot(conn, context, item):
         observed_uids.append(item.source_uid)
+        if item.source_uid == "platform":
+            status, reason = "not-applicable", "non-workspace-pod"
+        elif not item.valid_for_metering:
+            status, reason = "invalid-observation", "capacity-invalid"
+        else:
+            status, reason = "matched", "exact-match"
         await conn.execute(
             "INSERT INTO resource_inventory_shadow_comparisons ("
             "snapshot_id, inventory_scope_id, source_uid, owner_trusted, "
@@ -1677,8 +2265,8 @@ async def test_inventory_store_snapshot_watch_and_recovery_are_atomic(
             context.snapshot_id,
             context.inventory_scope_id,
             item.source_uid,
-            "invalid-observation" if not item.valid_for_metering else "matched",
-            "capacity-invalid" if not item.valid_for_metering else "exact-match",
+            status,
+            reason,
             context.received_at,
         )
 
@@ -1702,8 +2290,9 @@ async def test_inventory_store_snapshot_watch_and_recovery_are_atomic(
     assert reconciled.closed_intervals == 1
     assert reconciled.invalid_items == 1
     assert reconciled.confirmed_intervals == 2
-    assert reconciled.shadow_comparisons == 3
-    assert set(observed_uids) == {"present", "invalid", "new"}
+    assert reconciled.pending_valid_items == 0
+    assert reconciled.shadow_comparisons == 4
+    assert set(observed_uids) == {"present", "invalid", "new", "platform"}
 
     replayed = await consumer.finalize_snapshot(
         ticket.token,
@@ -1739,7 +2328,7 @@ async def test_inventory_store_snapshot_watch_and_recovery_are_atomic(
                 "WHERE snapshot_id=$1",
                 snapshot_id,
             )
-            == 3
+            == 4
         )
         with pytest.raises(asyncpg.ObjectNotInPrerequisiteStateError):
             await conn.execute(
@@ -2313,8 +2902,8 @@ async def test_inventory_store_snapshot_watch_and_recovery_are_atomic(
     assert purge_totals == {
         "sealed": 1,
         "abandoned": 1,
-        "items": 4,
-        "shadow": 3,
+        "items": 5,
+        "shadow": 4,
         "events": 5,
         "sessions": 2,
         "tickets": 1,

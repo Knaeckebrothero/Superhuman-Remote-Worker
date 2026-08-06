@@ -48,6 +48,34 @@ _MEM_UNITS: Dict[str, int] = {
 AttributionFn = Callable[[str, str], Awaitable[Optional[Dict[str, Any]]]]
 
 
+async def _legacy_metering_allowed(db: Any) -> bool:
+    """Fail closed after the durable v2 cutover barrier exists.
+
+    Standalone/legacy test databases may contain ``workspace_intervals`` without
+    the infrastructure-metering control table; that is the only case treated as
+    the pre-cutover compatibility mode.  A real control lookup failure is not a
+    reason to reopen the legacy writer.
+    """
+
+    try:
+        relation = await db.fetchval(
+            "SELECT to_regclass('public.infra_metering_control')::text"
+        )
+        if relation is None:
+            return True
+        state = await db.fetchval(
+            "SELECT cutover_state FROM infra_metering_control WHERE singleton = TRUE"
+        )
+        return state == "disabled"
+    except Exception:
+        logger.warning(
+            "workspace metering: cutover fence lookup failed; legacy writer "
+            "remains disabled",
+            exc_info=True,
+        )
+        return False
+
+
 def parse_cpu_millicores(cpu: str) -> int:
     """K8s CPU quantity → millicores. '500m' → 500, '2' → 2000, '2000m' → 2000."""
     s = str(cpu).strip()
@@ -78,6 +106,11 @@ async def open_interval(
     if db is None:
         return
     try:
+        if not await _legacy_metering_allowed(db):
+            logger.debug(
+                "workspace metering: legacy open suppressed after cutover barrier"
+            )
+            return
         cm = parse_cpu_millicores(cpu)
         mb = parse_mem_bytes(memory)
         await db.execute(
@@ -179,6 +212,11 @@ async def materialize_and_reconcile(
        re-emit, and the stamp prevents reprocessing.
     """
     if db is None or ledger is None or not ledger.is_available:
+        return {"materialized": 0, "reconciled": 0}
+    if not await _legacy_metering_allowed(db):
+        # The cutover coordinator owns strict legacy integrity/drain from the
+        # first preparing transaction onward.  In particular, never run the
+        # old blind 24-hour close behind that barrier.
         return {"materialized": 0, "reconciled": 0}
 
     reconciled = 0

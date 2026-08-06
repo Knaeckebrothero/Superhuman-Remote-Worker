@@ -168,8 +168,10 @@
       "type": "object",
       "properties": {
         "v2ReadsEnabled": { "type": "boolean" },
+        "sourceAwareReadsEnabled": { "type": "boolean" },
         "collectorEnabled": { "type": "boolean" },
         "shadowEnabled": { "type": "boolean" },
+        "cutoverEnabled": { "type": "boolean" },
         "publicationEnabled": { "type": "boolean" },
         "deploymentMode": {
           "type": "string",

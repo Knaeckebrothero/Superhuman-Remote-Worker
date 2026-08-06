@@ -201,12 +201,34 @@ from services.cloud_pricing import (  # noqa: E402
     cloud_pricing_sync_loop,
 )
 from services.infrastructure_metering import (  # noqa: E402
+    CoverageGapWaiverService,
     InfrastructureMeteringSettings,
+    InfrastructureMeteringRuntime,
+    InfrastructureUsageDaySealer,
+    InfrastructureUsageMaterializer,
+    InfrastructureWorkspaceCutover,
+    LegacyWorkspaceUsageLedgerAdapter,
     TypedUsageDailyRollup,
     UsageSummaryV2,
     UsageV2QueryService,
     probe_schema_capabilities,
+    infrastructure_metering_runtime_loop,
     typed_usage_rollup_loop,
+)
+from services.infrastructure_metering.coverage import (  # noqa: E402
+    CoverageGapConflict,
+    CoverageGapContractError,
+    CoverageGapNotFound,
+)
+from services.infrastructure_metering.cutover import (  # noqa: E402
+    CutoverBlocked,
+    CutoverConflictError,
+    CutoverContractError,
+    CutoverFenceError,
+    CutoverStatus,
+)
+from services.infrastructure_metering.read_model import (  # noqa: E402
+    UsageReadCutoverInactive,
 )
 from services.infrastructure_metering.queries import (  # noqa: E402
     visibility_from_kwargs as _usage_v2_visibility,
@@ -220,6 +242,13 @@ from services.infrastructure_metering.ingestion_http import (  # noqa: E402
     IngestionRequestError,
 )
 from services.infrastructure_metering.inventory import InventoryStore  # noqa: E402
+from services.infrastructure_metering.materializer import (  # noqa: E402
+    CorrectionRequestDelta,
+    PublicationConflictError,
+    PublicationContractError,
+    PublicationDisabledError,
+    PublicationFenceError,
+)
 from services.openrouter_pricing import llm_pricing_sync_loop  # noqa: E402
 from services.remote_image import (  # noqa: E402
     MAX_REMOTE_IMAGE_URL_CHARS,
@@ -232,6 +261,8 @@ from services.audit_partitions import (  # noqa: E402
 )
 from services import workspace_metering  # noqa: E402
 from services.usage_ledger import (  # noqa: E402
+    StrictUsageConflict,
+    StrictUsageLedgerError,
     UsageLedger,
     UsageRates,
     cache_hit_ratio_from_rows,
@@ -468,6 +499,11 @@ infrastructure_usage_v2: UsageV2QueryService | None = None
 infrastructure_usage_rollup: TypedUsageDailyRollup | None = None
 infrastructure_inventory_store: InventoryStore | None = None
 infrastructure_ingestion_service: InfrastructureIngestionService | None = None
+infrastructure_workspace_cutover: InfrastructureWorkspaceCutover | None = None
+infrastructure_usage_materializer: InfrastructureUsageMaterializer | None = None
+infrastructure_usage_day_sealer: InfrastructureUsageDaySealer | None = None
+infrastructure_metering_runtime: InfrastructureMeteringRuntime | None = None
+infrastructure_coverage_waivers: CoverageGapWaiverService | None = None
 
 
 async def _workspace_metering_attribution(
@@ -8221,9 +8257,11 @@ async def lifespan(app: FastAPI):
     # both pools + the schema are ready. Emitters (compute / LLM materialization)
     # and /api/usage read this singleton.
     global usage_ledger
+    audit_usage_pool = audit_db.pool if (audit_db is not None and audit_ready) else None
+    canonical_usage_rates = UsageRates(postgres_db.pool)
     usage_ledger = UsageLedger(
-        audit_db.pool if (audit_db is not None and audit_ready) else None,
-        UsageRates(postgres_db.pool),
+        audit_usage_pool,
+        canonical_usage_rates,
     )
     # Rollup over the ledger (Phase 6 / D-1): aggregates the auditdb usage_events
     # firehose into the app-DB usage_daily mirror (+ rollup_state watermark) and
@@ -8238,11 +8276,9 @@ async def lifespan(app: FastAPI):
     global usage_cloud_estimator
     usage_cloud_estimator = CloudCostEstimator(postgres_db.pool)
 
-    # Infrastructure metering remains a dark launch: Slice 0 typed reads and
-    # the Slice 1 inventory/shadow collector may be exercised independently,
-    # but publication is not implemented. Both DBs are probed after migrations
-    # because app/audit migration order must never be inferred from one
-    # process's startup order.
+    # Infrastructure metering paths are independently gated and additionally
+    # schema-probed. Both DBs are probed after migrations because app/audit
+    # migration order must never be inferred from one process's startup order.
     # Heal the rolling current+2 partition window before the one-shot probe. If
     # a pod first restarts after a UTC month boundary, waiting for the later
     # maintenance task would otherwise freeze Slice 0 unavailable until another
@@ -8259,18 +8295,25 @@ async def lifespan(app: FastAPI):
     global infrastructure_metering_settings, infrastructure_usage_v2
     global infrastructure_usage_rollup, infrastructure_inventory_store
     global infrastructure_ingestion_service
+    global infrastructure_workspace_cutover, infrastructure_usage_materializer
+    global infrastructure_usage_day_sealer, infrastructure_metering_runtime
+    global infrastructure_coverage_waivers
     infrastructure_metering_settings = InfrastructureMeteringSettings.from_env()
     metering_capabilities = await probe_schema_capabilities(
         postgres_db.pool,
         audit_db.pool if (audit_db is not None and audit_ready) else None,
     )
     infrastructure_usage_v2 = UsageV2QueryService(
-        audit_db.pool if (audit_db is not None and audit_ready) else None,
+        audit_usage_pool,
         metering_capabilities,
+        postgres_db.pool,
+        source_aware_reads_enabled=(
+            infrastructure_metering_settings.source_aware_reads_enabled
+        ),
     )
     infrastructure_usage_rollup = (
         TypedUsageDailyRollup(
-            audit_db.pool if (audit_db is not None and audit_ready) else None,
+            audit_usage_pool,
             postgres_db.pool,
         )
         if metering_capabilities.slice0_ready
@@ -8376,11 +8419,85 @@ async def lifespan(app: FastAPI):
                     if infrastructure_metering_settings.shadow_enabled
                     else "inventory-only",
                 )
-    if infrastructure_metering_settings.publication_enabled:
-        logger.warning(
-            "Infrastructure metering publication gate is set, but publication "
-            "is not implemented; no infrastructure usage will be published"
+
+    infrastructure_workspace_cutover = None
+    infrastructure_usage_materializer = None
+    infrastructure_usage_day_sealer = None
+    infrastructure_metering_runtime = None
+    infrastructure_coverage_waivers = None
+    if metering_capabilities.slice1_runtime_ready:
+        infrastructure_coverage_waivers = CoverageGapWaiverService(postgres_db.pool)
+        if (
+            infrastructure_metering_settings.stable_cluster_id
+            and infrastructure_metering_settings.namespace_allowlist
+            and audit_usage_pool is not None
+        ):
+            legacy_cutover_ledger = LegacyWorkspaceUsageLedgerAdapter(
+                audit_usage_pool,
+                usage_ledger,
+                canonical_usage_rates,
+            )
+            infrastructure_workspace_cutover = InfrastructureWorkspaceCutover(
+                postgres_db.pool,
+                legacy_cutover_ledger,
+                source_cluster=infrastructure_metering_settings.stable_cluster_id,
+                namespace_allowlist=(
+                    infrastructure_metering_settings.namespace_allowlist
+                ),
+                max_scope_age=timedelta(
+                    seconds=infrastructure_metering_settings.stale_after_seconds
+                ),
+            )
+        if infrastructure_metering_settings.publication_enabled:
+            infrastructure_usage_materializer = InfrastructureUsageMaterializer(
+                postgres_db.pool,
+                usage_ledger,
+                publication_enabled=True,
+            )
+            infrastructure_usage_day_sealer = InfrastructureUsageDaySealer(
+                postgres_db.pool,
+                sealing_enabled=True,
+            )
+        if (
+            infrastructure_workspace_cutover is not None
+            or infrastructure_usage_materializer is not None
+            or infrastructure_usage_day_sealer is not None
+        ):
+            infrastructure_metering_runtime = InfrastructureMeteringRuntime(
+                postgres_db.pool,
+                cutover=infrastructure_workspace_cutover,
+                materializer=infrastructure_usage_materializer,
+                sealer=infrastructure_usage_day_sealer,
+            )
+    elif (
+        infrastructure_metering_settings.cutover_enabled
+        or infrastructure_metering_settings.publication_enabled
+        or infrastructure_metering_settings.source_aware_reads_enabled
+    ):
+        logger.error(
+            "Infrastructure metering Slice 1 runtime requested but schema "
+            "capabilities are incomplete: %s",
+            metering_capabilities.diagnostics(),
         )
+
+    if (
+        infrastructure_metering_settings.cutover_enabled
+        and infrastructure_workspace_cutover is None
+    ):
+        logger.error(
+            "Infrastructure metering cutover requested but its stable source, "
+            "audit ledger, or runtime schema is unavailable"
+        )
+    if infrastructure_metering_settings.publication_enabled:
+        if infrastructure_usage_materializer is None:
+            logger.error(
+                "Infrastructure metering publication requested but runtime "
+                "capabilities are unavailable"
+            )
+        else:
+            logger.info(
+                "Infrastructure metering strict publication enabled for workspace_pod"
+            )
 
     # Encrypt any legacy plaintext datasource credentials. Idempotent — once
     # all rows are v1 ciphertexts this is a fast no-op. Lives in lifespan
@@ -8638,7 +8755,12 @@ async def lifespan(app: FastAPI):
     from database.lock_ids import LEADER_ID
     from services.checkpoint_retention import run_retention_sweeper
     from services.datasource_reconciliation import run_datasource_project_reconciler
-    from services.leader_election import is_leader, run_as_leader, run_when_leader
+    from services.leader_election import (
+        get_leader_generation,
+        is_leader,
+        run_as_leader,
+        run_when_leader,
+    )
 
     async def _strict_datasource_sync(
         project_id: str, datasource: dict[str, Any]
@@ -8648,33 +8770,76 @@ async def lifespan(app: FastAPI):
     async def _strict_datasource_delete(project_id: str, datasource_id: str) -> None:
         await _delete_datasource_knowledge(project_id, datasource_id, strict=True)
 
-    leader_task = asyncio.create_task(
-        run_as_leader(postgres_db, LEADER_ID, _shutdown_event)
+    async def _allocate_metering_generation(conn: Any) -> int:
+        generation = await conn.fetchval(
+            "UPDATE infra_metering_control "
+            "SET leader_generation=leader_generation+1, "
+            "updated_at=statement_timestamp() "
+            "WHERE singleton=TRUE RETURNING leader_generation"
+        )
+        if generation is None:
+            raise RuntimeError("infrastructure metering control row is missing")
+        return int(generation)
+
+    # Allocate the infrastructure fencing token on the exact advisory-lock
+    # session, before is_leader becomes visible to any singleton loop. This
+    # gives collector, cutover, publisher, and sealer one shared tenure token.
+    metering_generation_callback = (
+        _allocate_metering_generation
+        if metering_capabilities.slice1_inventory_ready
+        else None
     )
+    leader_task = asyncio.create_task(
+        run_as_leader(
+            postgres_db,
+            LEADER_ID,
+            _shutdown_event,
+            on_acquired=metering_generation_callback,
+        )
+    )
+
+    async def _inventory_generation_coro(stop: asyncio.Event) -> None:
+        generation = get_leader_generation()
+        if generation is None:
+            raise RuntimeError("metering leader generation is unavailable")
+        await run_inventory_generation_loop(
+            stop,
+            infrastructure_inventory_store,
+            generation=generation,
+            cleanup_interval_seconds=(
+                infrastructure_metering_settings.cleanup_interval_seconds
+            ),
+            snapshot_item_retention=timedelta(
+                days=(infrastructure_metering_settings.snapshot_item_retention_days)
+            ),
+            diagnostic_retention=timedelta(
+                days=infrastructure_metering_settings.diagnostic_retention_days
+            ),
+        )
+
     infrastructure_inventory_generation_task = (
         asyncio.create_task(
             run_when_leader(
-                lambda stop: run_inventory_generation_loop(
-                    stop,
-                    infrastructure_inventory_store,
-                    cleanup_interval_seconds=(
-                        infrastructure_metering_settings.cleanup_interval_seconds
-                    ),
-                    snapshot_item_retention=timedelta(
-                        days=(
-                            infrastructure_metering_settings.snapshot_item_retention_days
-                        )
-                    ),
-                    diagnostic_retention=timedelta(
-                        days=(
-                            infrastructure_metering_settings.diagnostic_retention_days
-                        )
-                    ),
-                ),
+                _inventory_generation_coro,
                 _shutdown_event,
             )
         )
         if infrastructure_inventory_store is not None
+        else None
+    )
+
+    infrastructure_metering_runtime_task = (
+        asyncio.create_task(
+            run_when_leader(
+                lambda stop: infrastructure_metering_runtime_loop(
+                    stop,
+                    infrastructure_metering_runtime,
+                    get_leader_generation,
+                ),
+                _shutdown_event,
+            )
+        )
+        if infrastructure_metering_runtime is not None
         else None
     )
     datasource_reconciliation_task = asyncio.create_task(
@@ -8832,11 +8997,14 @@ async def lifespan(app: FastAPI):
     # intervals into the usage ledger + reconcile leaked opens. Self-disables
     # when the app pool or ledger is absent (non-load-bearing tier).
     workspace_metering_task = asyncio.create_task(
-        workspace_metering.workspace_metering_loop(
+        run_when_leader(
+            lambda stop: workspace_metering.workspace_metering_loop(
+                stop,
+                postgres_db,
+                usage_ledger,
+                _workspace_metering_attribution,
+            ),
             _shutdown_event,
-            postgres_db,
-            usage_ledger,
-            _workspace_metering_attribution,
         )
     )
 
@@ -8973,6 +9141,8 @@ async def lifespan(app: FastAPI):
     await usage_rollup_task
     if infrastructure_usage_rollup_task is not None:
         await infrastructure_usage_rollup_task
+    if infrastructure_metering_runtime_task is not None:
+        await infrastructure_metering_runtime_task
     if audit_maintenance_task is not None:
         await audit_maintenance_task
 
@@ -20644,6 +20814,301 @@ async def _dispatch_infrastructure_ingestion(
         ) from exc
 
 
+class InfrastructureCutoverPrepareRequest(BaseModel):
+    idempotency_key: UUID
+    reason: str = Field(min_length=1, max_length=1024)
+
+
+class InfrastructureCoverageWaiverRequest(BaseModel):
+    idempotency_key: UUID
+    reason: str = Field(min_length=1, max_length=2048)
+
+
+class InfrastructureCorrectionDeltaRequest(BaseModel):
+    source: Literal["infra-allocation-v2"]
+    source_id: str = Field(min_length=1, max_length=256)
+    unit: str = Field(min_length=1, max_length=64)
+    ts: datetime
+    expected_payload_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    quantity: Decimal
+    payload_overrides: dict[str, Any] = Field(default_factory=dict)
+    inherit_rate: bool = True
+    canonical_rate_version_id: UUID | None = None
+
+
+class InfrastructureCorrectionRequest(BaseModel):
+    idempotency_key: UUID
+    reason: str = Field(min_length=1, max_length=2048)
+    deltas: list[InfrastructureCorrectionDeltaRequest] = Field(
+        min_length=1,
+        max_length=100,
+    )
+
+
+async def _require_infrastructure_fleet_admin(request: Request) -> dict[str, Any]:
+    """Require an unscoped admin acting with the real fleet view."""
+
+    admin = await _require_admin(request)
+    if not admin.get("is_admin") or mcp_scope_project_id(admin) is not None:
+        await log_security_event(
+            postgres_db,
+            event_type="admin_denied",
+            user=admin,
+            resource_type="admin_endpoint",
+            resource_id=getattr(getattr(request, "url", None), "path", None),
+            detail="Fleet admin access required",
+            request=request,
+        )
+        raise HTTPException(status_code=403, detail="Fleet admin access required")
+    return admin
+
+
+def _infrastructure_leader_generation() -> int:
+    from services.leader_election import get_leader_generation, is_leader
+
+    generation = get_leader_generation()
+    if not is_leader.is_set() or generation is None:
+        raise HTTPException(
+            status_code=409,
+            detail="Infrastructure metering leader is unavailable; retry",
+            headers={"Retry-After": "1"},
+        )
+    return generation
+
+
+def _cutover_status_payload(status: CutoverStatus) -> dict[str, Any]:
+    return {
+        "state": status.state,
+        "phase": status.phase.value,
+        "leader_generation": status.leader_generation,
+        "cutover_at": status.cutover_at,
+        "request_id": status.request_id,
+        "actor_id": status.actor_id,
+        "reason": status.reason,
+        "unplanned_intervals": status.unplanned_intervals,
+        "planned": status.planned,
+        "published": status.published,
+        "conflicts": status.conflicts,
+        "open_legacy_intervals": status.open_legacy_intervals,
+        "cutover_error": status.cutover_error,
+    }
+
+
+@app.get("/api/admin/usage/v2/infrastructure-cutover")
+async def get_infrastructure_metering_cutover(request: Request) -> dict[str, Any]:
+    await _require_infrastructure_fleet_admin(request)
+    if infrastructure_workspace_cutover is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Infrastructure metering cutover is unavailable",
+        )
+    try:
+        return _cutover_status_payload(await infrastructure_workspace_cutover.status())
+    except Exception as exc:
+        logger.exception("Infrastructure metering cutover status failed")
+        raise HTTPException(
+            status_code=500,
+            detail="Infrastructure metering cutover status failed",
+        ) from exc
+
+
+@app.post("/api/admin/usage/v2/infrastructure-cutover/prepare")
+async def prepare_infrastructure_metering_cutover(
+    request: Request,
+    body: InfrastructureCutoverPrepareRequest,
+) -> dict[str, Any]:
+    admin = await _require_infrastructure_fleet_admin(request)
+    if not infrastructure_metering_settings.cutover_enabled:
+        raise HTTPException(
+            status_code=404,
+            detail="Infrastructure metering cutover is not enabled",
+        )
+    if infrastructure_workspace_cutover is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Infrastructure metering cutover is unavailable",
+        )
+    generation = _infrastructure_leader_generation()
+    try:
+        status = await infrastructure_workspace_cutover.prepare(
+            generation,
+            actor_id=UUID(str(admin["id"])),
+            reason=body.reason,
+            idempotency_key=body.idempotency_key,
+        )
+    except CutoverContractError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except (CutoverBlocked, CutoverConflictError, CutoverFenceError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("Infrastructure metering cutover prepare failed")
+        raise HTTPException(
+            status_code=500,
+            detail="Infrastructure metering cutover prepare failed",
+        ) from exc
+    await log_security_event(
+        postgres_db,
+        event_type="infrastructure_metering_cutover_prepared",
+        user=admin,
+        resource_type="infrastructure_metering_cutover",
+        resource_id=str(body.idempotency_key),
+        detail=f"phase={status.phase.value} cutover_at={status.cutover_at}",
+        request=request,
+    )
+    return _cutover_status_payload(status)
+
+
+@app.post("/api/admin/usage/v2/coverage-gaps/{gap_id}/waive")
+async def waive_infrastructure_metering_coverage_gap(
+    request: Request,
+    gap_id: UUID,
+    body: InfrastructureCoverageWaiverRequest,
+) -> dict[str, Any]:
+    admin = await _require_infrastructure_fleet_admin(request)
+    if infrastructure_coverage_waivers is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Infrastructure metering coverage waivers are unavailable",
+        )
+    try:
+        result = await infrastructure_coverage_waivers.waive(
+            gap_id,
+            UUID(str(admin["id"])),
+            body.reason,
+            body.idempotency_key,
+        )
+    except CoverageGapNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except CoverageGapConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except CoverageGapContractError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("Infrastructure metering coverage waiver failed")
+        raise HTTPException(
+            status_code=500,
+            detail="Infrastructure metering coverage waiver failed",
+        ) from exc
+    await log_security_event(
+        postgres_db,
+        event_type=(
+            "infrastructure_metering_coverage_waiver_replayed"
+            if result.replayed
+            else "infrastructure_metering_coverage_gap_waived"
+        ),
+        user=admin,
+        resource_type="infrastructure_metering_coverage_gap",
+        resource_id=str(result.gap_id),
+        detail=(
+            f"idempotency_key={result.idempotency_key} "
+            f"degraded_days={len(result.degraded_days)}"
+        ),
+        request=request,
+    )
+    return {
+        "gap_id": result.gap_id,
+        "actor_id": result.actor_id,
+        "idempotency_key": result.idempotency_key,
+        "reason": result.reason,
+        "resolved_at": result.resolved_at,
+        "replayed": result.replayed,
+        "degraded_days": [
+            {
+                "day": item.day,
+                "coverage_sequence": item.coverage_sequence,
+                "coverage_revision": item.coverage_revision,
+                "unknown_start": item.added_range[0],
+                "unknown_end": item.added_range[1],
+            }
+            for item in result.degraded_days
+        ],
+    }
+
+
+@app.post("/api/admin/usage/v2/infrastructure-corrections")
+async def create_infrastructure_metering_correction(
+    request: Request,
+    body: InfrastructureCorrectionRequest,
+) -> dict[str, Any]:
+    admin = await _require_infrastructure_fleet_admin(request)
+    if not infrastructure_metering_settings.publication_enabled:
+        raise HTTPException(
+            status_code=404,
+            detail="Infrastructure metering publication is not enabled",
+        )
+    if infrastructure_usage_materializer is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Infrastructure metering correction workflow is unavailable",
+        )
+    generation = _infrastructure_leader_generation()
+    try:
+        plan = await infrastructure_usage_materializer.create_correction(
+            generation,
+            tuple(
+                CorrectionRequestDelta(
+                    source=delta.source,
+                    source_id=delta.source_id,
+                    unit=delta.unit,
+                    ts=delta.ts,
+                    expected_payload_hash=delta.expected_payload_hash,
+                    quantity=delta.quantity,
+                    payload_overrides=delta.payload_overrides,
+                    inherit_rate=delta.inherit_rate,
+                    canonical_rate_version_id=delta.canonical_rate_version_id,
+                )
+                for delta in body.deltas
+            ),
+            correction_reason=body.reason,
+            correction_actor_id=UUID(str(admin["id"])),
+            correction_id=body.idempotency_key,
+        )
+    except (PublicationContractError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except (
+        PublicationConflictError,
+        PublicationFenceError,
+        StrictUsageConflict,
+    ) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except PublicationDisabledError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except StrictUsageLedgerError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Infrastructure metering audit ledger is unavailable",
+        ) from exc
+    except Exception as exc:
+        logger.exception("Infrastructure metering correction creation failed")
+        raise HTTPException(
+            status_code=500,
+            detail="Infrastructure metering correction creation failed",
+        ) from exc
+    await log_security_event(
+        postgres_db,
+        event_type="infrastructure_metering_correction_reviewed",
+        user=admin,
+        resource_type="infrastructure_metering_correction",
+        resource_id=str(plan.id),
+        detail=(
+            f"state={plan.state} revision={plan.plan_revision} "
+            f"events={len(plan.events)} event_set_hash={plan.event_set_hash}"
+        ),
+        request=request,
+    )
+    return {
+        "plan_id": plan.id,
+        "correction_group_id": plan.correction_group_id,
+        "state": plan.state,
+        "plan_revision": plan.plan_revision,
+        "period_start": plan.period_start,
+        "period_end": plan.period_end,
+        "event_count": len(plan.events),
+        "event_set_hash": plan.event_set_hash,
+        "rate_selection_hash": plan.rate_selection_hash,
+    }
+
+
 @app.post(
     "/api/internal/infrastructure-metering/v1/tickets",
     include_in_schema=False,
@@ -20710,11 +21175,12 @@ async def get_usage_v2(
         description="Fleet admins only: include shared-platform and unknown rows",
     ),
 ) -> UsageSummaryV2:
-    """Dimensionally typed usage summary (dark-launched Slice 0 contract).
+    """Dimensionally typed usage summary with a gated source-aware handoff.
 
-    The route reads finalized legacy/v2 ledger rows with Decimal-safe string
-    quantities. Live interval tails remain absent and coverage stays explicitly
-    partial until Slice 1's collectors pass their shadow gates.
+    The default path reads finalized ledger rows with Decimal-safe string
+    quantities. Once the independent source-aware gate is enabled after the
+    durable cutover, the same route combines sealed daily rows, verified audit
+    fragments, and confirmed provisional interval tails.
     """
     if not infrastructure_metering_settings.v2_reads_enabled:
         raise HTTPException(status_code=404, detail="Usage API v2 is not enabled")
@@ -20771,6 +21237,11 @@ async def get_usage_v2(
         )
     except HTTPException:
         raise
+    except UsageReadCutoverInactive as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Infrastructure usage cutover is not active",
+        ) from exc
     except Exception as exc:
         logger.exception("Usage API v2 query failed")
         raise HTTPException(

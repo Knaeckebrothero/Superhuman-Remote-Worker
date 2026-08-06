@@ -356,14 +356,24 @@ class ShadowComparison:
             0,
         }:
             raise InventoryContractError("matched comparison has a start mismatch")
-        if status is ShadowComparisonStatus.LIFETIME_MISMATCH and (
-            self.explained
-            or self.reason_code not in {"start-semantics", "start-evidence-missing"}
-            or self.start_delta_us == 0
-        ):
-            raise InventoryContractError(
-                "lifetime mismatch must remain unexplained with mismatched evidence"
+        if status is ShadowComparisonStatus.LIFETIME_MISMATCH:
+            unexplained = not self.explained and self.reason_code in {
+                "start-semantics",
+                "start-evidence-missing",
+            }
+            bounded = (
+                self.explained
+                and self.reason_code == "bounded-start-semantics"
+                and self.start_delta_us is not None
+                and self.start_delta_us > 0
+                and self.observed_start_time_source == "app-db-received"
+                and self.observed_start_uncertainty_us is not None
+                and self.start_delta_us <= self.observed_start_uncertainty_us
             )
+            if self.start_delta_us == 0 or not (unexplained or bounded):
+                raise InventoryContractError(
+                    "lifetime mismatch requires unresolved or bounded start evidence"
+                )
         for value in (
             self.legacy_interval_id,
             self.legacy_cpu_millicores,
@@ -969,8 +979,12 @@ WITH item_counts AS (
 ), pending AS (
     SELECT count(*) AS pending_valid_items
     FROM resource_inventory_snapshot_items AS item
+    LEFT JOIN resource_inventory_shadow_comparisons AS comparison
+      ON comparison.snapshot_id = item.snapshot_id
+     AND comparison.source_uid = item.source_uid
     WHERE item.snapshot_id = $1
       AND item.valid_for_metering
+      AND (comparison.status IS NULL OR comparison.status <> 'not-applicable')
       AND NOT EXISTS (
           SELECT 1 FROM resource_intervals AS interval
           WHERE interval.inventory_scope_id = $2
@@ -1043,6 +1057,29 @@ WITH updated AS (
 SELECT count(*) AS observed_intervals,
        count(*) FILTER (WHERE confirmed) AS confirmed_intervals
 FROM updated
+"""
+
+_LINK_PRESENT_CLOSURES_SQL = """
+/* infra-inventory:link-present-closures */
+WITH linked AS (
+    UPDATE resource_intervals AS interval
+    SET last_seen_at = GREATEST(interval.last_seen_at, $3),
+        last_seen_snapshot_id = $1,
+        updated_at = statement_timestamp()
+    FROM resource_inventory_snapshot_items AS item
+    WHERE item.snapshot_id = $1
+      AND item.valid_for_metering IS TRUE
+      AND interval.inventory_scope_id = $2
+      AND interval.source_kind = item.source_kind
+      AND interval.source_uid = item.source_uid
+      AND interval.ended_at = $3
+      AND interval.end_time_source = 'app-db-received'
+      AND interval.end_reason IN ('not-applicable', 'terminal-or-unscheduled')
+      AND interval.last_seen_at <= $3
+      AND interval.last_seen_snapshot_id IS DISTINCT FROM $1
+    RETURNING interval.id
+)
+SELECT count(*) FROM linked
 """
 
 _CLOSE_ABSENT_SQL = """
@@ -1159,17 +1196,41 @@ class InventoryStore:
     def active_generation(self) -> int | None:
         return self._active_generation
 
-    async def activate_generation(self) -> int:
-        """Atomically fence prior leaders and activate this store instance."""
+    async def activate_generation(self, expected_generation: int | None = None) -> int:
+        """Activate this store for one leader-tenure generation.
+
+        ``expected_generation`` is supplied by the advisory-lock acquisition
+        callback in production, so every singleton metering component adopts
+        the same token.  The no-argument form remains useful for isolated store
+        tests and explicitly increments the durable fence itself.
+        """
         async with self._generation_lock:
             async with self._pool.acquire() as conn:
                 async with conn.transaction():
-                    generation = await conn.fetchval(
-                        "UPDATE infra_metering_control "
-                        "SET leader_generation = leader_generation + 1, "
-                        "updated_at = statement_timestamp() "
-                        "WHERE singleton = TRUE RETURNING leader_generation"
-                    )
+                    if expected_generation is None:
+                        generation = await conn.fetchval(
+                            "UPDATE infra_metering_control "
+                            "SET leader_generation = leader_generation + 1, "
+                            "updated_at = statement_timestamp() "
+                            "WHERE singleton = TRUE RETURNING leader_generation"
+                        )
+                    else:
+                        if (
+                            isinstance(expected_generation, bool)
+                            or not isinstance(expected_generation, int)
+                            or expected_generation <= 0
+                        ):
+                            raise InventoryFenceError(
+                                "metering generation must be a positive integer"
+                            )
+                        generation = await conn.fetchval(
+                            "SELECT leader_generation FROM infra_metering_control "
+                            "WHERE singleton = TRUE FOR SHARE"
+                        )
+                        if int(generation or -1) != expected_generation:
+                            raise InventoryFenceError(
+                                "metering leader generation changed before adoption"
+                            )
                     if generation is None:
                         raise InventoryFenceError("infra metering control row missing")
             self._active_generation = int(generation)
@@ -2640,6 +2701,13 @@ class InventoryStore:
                     _canonical_json(summary),
                 )
                 if reconcile_intervals:
+                    if final.complete:
+                        await conn.fetchval(
+                            _LINK_PRESENT_CLOSURES_SQL,
+                            snapshot_id,
+                            epoch["scope_id"],
+                            received_at,
+                        )
                     observed = await conn.fetchrow(
                         _OBSERVE_PRESENT_SQL,
                         snapshot_id,
@@ -3088,6 +3156,8 @@ class InventoryStore:
                                 raise InventoryConflictError(
                                     "not-applicable watch item retained an open interval"
                                 )
+                            if interval is not None:
+                                affected_interval_id = interval["id"]
                             action = WatchMutationAction.NOT_APPLICABLE
                         else:
                             if not isinstance(affected_interval_id, UUID):

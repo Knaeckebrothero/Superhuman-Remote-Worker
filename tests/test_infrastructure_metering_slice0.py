@@ -1,5 +1,6 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+import inspect
 from unittest.mock import AsyncMock, MagicMock
 from uuid import UUID, uuid4
 
@@ -8,14 +9,20 @@ from fastapi import HTTPException
 from pydantic import ValidationError
 
 from orchestrator.services.infrastructure_metering.capabilities import (
-    REQUIRED_APP_INDEXES,
+    REQUIRED_APP_INDEX_RELATIONS,
     REQUIRED_APP_TABLES,
     REQUIRED_APP_TRIGGER_RELATIONS,
     REQUIRED_APP_TRIGGERS,
-    REQUIRED_SLICE1_APP_INDEXES,
+    REQUIRED_AUDIT_INDEX_RELATIONS,
+    REQUIRED_SLICE1_APP_INDEX_RELATIONS,
     REQUIRED_SLICE1_APP_TABLES,
     REQUIRED_SLICE1_APP_TRIGGER_RELATIONS,
     REQUIRED_SLICE1_APP_TRIGGERS,
+    REQUIRED_SLICE1_RUNTIME_APP_COLUMNS,
+    REQUIRED_SLICE1_RUNTIME_APP_CONSTRAINT_RELATIONS,
+    REQUIRED_SLICE1_RUNTIME_APP_INDEX_RELATIONS,
+    REQUIRED_SLICE1_RUNTIME_APP_TABLES,
+    REQUIRED_SLICE1_RUNTIME_APP_TRIGGER_RELATIONS,
     REQUIRED_AUDIT_COLUMNS,
     REQUIRED_AUDIT_CONSTRAINTS,
     REQUIRED_AUDIT_INDEXES,
@@ -53,11 +60,77 @@ def _read_capabilities() -> MeteringSchemaCapabilities:
     )
 
 
+def test_cutover_wiring_uses_configured_inventory_freshness() -> None:
+    import main as orchestrator_main
+
+    source = inspect.getsource(orchestrator_main.lifespan)
+    assert "max_scope_age=timedelta(" in source
+    assert "seconds=infrastructure_metering_settings.stale_after_seconds" in source
+
+
+def _source_aware_capabilities(*, slice1: bool) -> MeteringSchemaCapabilities:
+    return MeteringSchemaCapabilities(
+        app_tables=(
+            REQUIRED_APP_TABLES
+            | (
+                REQUIRED_SLICE1_APP_TABLES | REQUIRED_SLICE1_RUNTIME_APP_TABLES
+                if slice1
+                else frozenset()
+            )
+        ),
+        app_indexes=(
+            frozenset(REQUIRED_APP_INDEX_RELATIONS)
+            | (
+                frozenset(REQUIRED_SLICE1_APP_INDEX_RELATIONS)
+                | frozenset(REQUIRED_SLICE1_RUNTIME_APP_INDEX_RELATIONS)
+                if slice1
+                else frozenset()
+            )
+        ),
+        app_triggers=(
+            REQUIRED_APP_TRIGGERS
+            | (
+                REQUIRED_SLICE1_APP_TRIGGERS
+                | frozenset(REQUIRED_SLICE1_RUNTIME_APP_TRIGGER_RELATIONS)
+                if slice1
+                else frozenset()
+            )
+        ),
+        app_columns=(REQUIRED_SLICE1_RUNTIME_APP_COLUMNS if slice1 else frozenset()),
+        app_constraints=(
+            frozenset(REQUIRED_SLICE1_RUNTIME_APP_CONSTRAINT_RELATIONS)
+            if slice1
+            else frozenset()
+        ),
+        audit_tables=REQUIRED_AUDIT_TABLES,
+        audit_columns=REQUIRED_AUDIT_COLUMNS,
+        audit_constraints=REQUIRED_AUDIT_CONSTRAINTS,
+        audit_indexes=REQUIRED_AUDIT_INDEXES,
+        app_seed_rows_ready=True,
+        half_even_function=True,
+        dirty_day_trigger=True,
+        append_only_trigger=True,
+        target_partitions_ready=True,
+    )
+
+
 class _CapabilityPool:
-    def __init__(self, *, app: bool, append_mode: str = "O", slice1: bool = False):
+    def __init__(
+        self,
+        *,
+        app: bool,
+        append_mode: str = "O",
+        slice1: bool = False,
+        slice1_runtime: bool = False,
+        unusable_indexes: set[str] | None = None,
+        wrong_relation_indexes: set[str] | None = None,
+    ):
         self.app = app
         self.append_mode = append_mode
         self.slice1 = slice1
+        self.slice1_runtime = slice1_runtime
+        self.unusable_indexes = unusable_indexes or set()
+        self.wrong_relation_indexes = wrong_relation_indexes or set()
 
     async def fetch(self, sql, *params):
         wanted = set(params[0]) if params else set()
@@ -65,29 +138,70 @@ class _CapabilityPool:
             present = REQUIRED_APP_TABLES if self.app else REQUIRED_AUDIT_TABLES
             if self.app and self.slice1:
                 present |= REQUIRED_SLICE1_APP_TABLES
+            if self.app and self.slice1_runtime:
+                present |= REQUIRED_SLICE1_RUNTIME_APP_TABLES
             return [{"table_name": name} for name in wanted & present]
-        if "pg_indexes" in sql:
-            present = REQUIRED_APP_INDEXES if self.app else REQUIRED_AUDIT_INDEXES
+        if "FROM pg_catalog.pg_index" in sql:
+            assert "index_state.indisvalid" in sql
+            assert "index_state.indisready" in sql
+            assert "index_state.indislive" in sql
+            relations = (
+                dict(REQUIRED_APP_INDEX_RELATIONS)
+                if self.app
+                else dict(REQUIRED_AUDIT_INDEX_RELATIONS)
+            )
             if self.app and self.slice1:
-                present |= REQUIRED_SLICE1_APP_INDEXES
-            return [{"indexname": name} for name in wanted & present]
+                relations.update(REQUIRED_SLICE1_APP_INDEX_RELATIONS)
+            if self.app and self.slice1_runtime:
+                relations.update(REQUIRED_SLICE1_RUNTIME_APP_INDEX_RELATIONS)
+            return [
+                {
+                    "indexname": name,
+                    "tablename": (
+                        "wrong_relation"
+                        if name in self.wrong_relation_indexes
+                        else relations[name]
+                    ),
+                }
+                for name in wanted & set(relations) - self.unusable_indexes
+            ]
         if "information_schema.columns" in sql:
+            if self.app:
+                if not self.slice1_runtime:
+                    return []
+                return [
+                    {"table_name": table, "column_name": column}
+                    for item in REQUIRED_SLICE1_RUNTIME_APP_COLUMNS
+                    for table, column in [item.split(".", 1)]
+                    if table in wanted
+                ]
             return [{"column_name": name} for name in wanted & REQUIRED_AUDIT_COLUMNS]
         if "pg_constraint" in sql:
+            if self.app:
+                if not self.slice1_runtime:
+                    return []
+                return [
+                    {"conname": name, "relname": relation}
+                    for name, relation in (
+                        REQUIRED_SLICE1_RUNTIME_APP_CONSTRAINT_RELATIONS.items()
+                    )
+                    if name in wanted
+                ]
             return [{"conname": name} for name in wanted & REQUIRED_AUDIT_CONSTRAINTS]
         if "FROM pg_trigger" in sql:
             if self.app:
                 relations = dict(REQUIRED_APP_TRIGGER_RELATIONS)
                 if self.slice1:
                     relations.update(REQUIRED_SLICE1_APP_TRIGGER_RELATIONS)
+                if self.slice1_runtime:
+                    relations.update(REQUIRED_SLICE1_RUNTIME_APP_TRIGGER_RELATIONS)
                 return [
                     {
                         "tgname": name,
                         "enabled": "O",
                         "relname": relations[name],
                     }
-                    for name in wanted
-                    & (REQUIRED_APP_TRIGGERS | REQUIRED_SLICE1_APP_TRIGGERS)
+                    for name in wanted & set(relations)
                     if name in relations
                 ]
             return [
@@ -138,6 +252,90 @@ async def test_capability_probe_requires_normal_write_triggers_and_seed_rows():
     assert not capabilities.slice0_ready
 
 
+@pytest.mark.asyncio
+async def test_capability_probe_separates_inventory_from_slice1_runtime():
+    audit = _CapabilityPool(app=False, append_mode="A")
+    inventory_only = await probe_schema_capabilities(
+        _CapabilityPool(app=True, slice1=True),  # type: ignore[arg-type]
+        audit,  # type: ignore[arg-type]
+    )
+    assert inventory_only.slice1_inventory_ready
+    assert not inventory_only.slice1_runtime_ready
+    assert "infra_usage_day_state.coverage_sequence" in (
+        inventory_only.missing_slice1_runtime_app_columns
+    )
+
+    complete = await probe_schema_capabilities(
+        _CapabilityPool(  # type: ignore[arg-type]
+            app=True,
+            slice1=True,
+            slice1_runtime=True,
+        ),
+        audit,  # type: ignore[arg-type]
+    )
+    assert complete.slice1_runtime_ready
+
+
+@pytest.mark.parametrize(
+    "index_name",
+    [
+        "resource_publication_plans_period_idx",
+        "resource_intervals_overlap_idx",
+    ],
+)
+@pytest.mark.asyncio
+async def test_capability_probe_rejects_unusable_concurrent_index(index_name):
+    capabilities = await probe_schema_capabilities(
+        _CapabilityPool(
+            app=True,
+            slice1=True,
+            unusable_indexes={index_name},
+        ),  # type: ignore[arg-type]
+        None,
+    )
+
+    assert index_name in capabilities.missing_app_indexes
+    assert not capabilities.slice1_inventory_ready
+
+
+@pytest.mark.parametrize(
+    "index_name",
+    [
+        "resource_inventory_snapshots_complete_received_idx",
+        "resource_inventory_watch_events_invalid_received_idx",
+    ],
+)
+@pytest.mark.asyncio
+async def test_capability_probe_rejects_unusable_slice1_sealing_index(index_name):
+    capabilities = await probe_schema_capabilities(
+        _CapabilityPool(
+            app=True,
+            slice1=True,
+            unusable_indexes={index_name},
+        ),  # type: ignore[arg-type]
+        None,
+    )
+
+    assert index_name in capabilities.missing_slice1_app_indexes
+    assert not capabilities.slice1_inventory_ready
+
+
+@pytest.mark.asyncio
+async def test_capability_probe_rejects_expected_index_on_wrong_relation():
+    index_name = "resource_intervals_overlap_idx"
+    capabilities = await probe_schema_capabilities(
+        _CapabilityPool(
+            app=True,
+            slice1=True,
+            wrong_relation_indexes={index_name},
+        ),  # type: ignore[arg-type]
+        None,
+    )
+
+    assert index_name in capabilities.missing_app_indexes
+    assert not capabilities.slice1_inventory_ready
+
+
 def test_settings_are_off_by_default_and_publication_fails_closed():
     assert InfrastructureMeteringSettings.from_env({}) == (
         InfrastructureMeteringSettings()
@@ -176,6 +374,33 @@ def test_settings_accept_only_explicit_boolean_values():
         InfrastructureMeteringSettings.from_env(
             {"INFRASTRUCTURE_METERING_STABLE_CLUSTER_ID": "not a cluster/id"}
         )
+
+
+def test_cutover_and_source_aware_read_gates_are_independent_and_fail_closed():
+    with pytest.raises(ValueError, match="source-aware reads require v2 reads"):
+        InfrastructureMeteringSettings.from_env(
+            {"INFRASTRUCTURE_METERING_SOURCE_AWARE_READS_ENABLED": "true"}
+        )
+
+    with pytest.raises(ValueError, match="cutover requires collector, shadow"):
+        InfrastructureMeteringSettings.from_env(
+            {"INFRASTRUCTURE_METERING_CUTOVER_ENABLED": "true"}
+        )
+
+    settings = InfrastructureMeteringSettings.from_env(
+        {
+            "INFRASTRUCTURE_METERING_V2_READS_ENABLED": "true",
+            "INFRASTRUCTURE_METERING_SOURCE_AWARE_READS_ENABLED": "true",
+            "INFRASTRUCTURE_METERING_COLLECTOR_ENABLED": "true",
+            "INFRASTRUCTURE_METERING_SHADOW_ENABLED": "true",
+            "INFRASTRUCTURE_METERING_CUTOVER_ENABLED": "true",
+            "INFRASTRUCTURE_METERING_STABLE_CLUSTER_ID": "dev-cluster",
+            "INFRASTRUCTURE_METERING_NAMESPACE_ALLOWLIST": "srw",
+        }
+    )
+    assert settings.source_aware_reads_enabled is True
+    assert settings.cutover_enabled is True
+    assert settings.publication_enabled is False
 
 
 def test_slice1_collector_settings_are_bounded_and_fail_closed():
@@ -594,6 +819,44 @@ async def test_v2_service_refuses_reads_without_audit_capability():
         )
 
 
+def test_source_aware_service_requires_both_slice0_and_slice1_readiness():
+    audit = _AuditPool([])
+    app = MagicMock()
+    slice0_only = UsageV2QueryService(
+        audit,
+        _source_aware_capabilities(slice1=False),
+        app,
+        source_aware_reads_enabled=True,
+    )
+    ready = UsageV2QueryService(
+        audit,
+        _source_aware_capabilities(slice1=True),
+        app,
+        source_aware_reads_enabled=True,
+    )
+    missing_app_pool = UsageV2QueryService(
+        audit,
+        _source_aware_capabilities(slice1=True),
+        source_aware_reads_enabled=True,
+    )
+
+    assert slice0_only.source_aware_reads_enabled is True
+    assert slice0_only.is_available is False
+    assert ready.is_available is True
+    assert missing_app_pool.is_available is False
+
+
+def test_legacy_v2_readiness_is_unchanged_while_source_aware_gate_is_off():
+    service = UsageV2QueryService(
+        _AuditPool([]),
+        _read_capabilities(),
+        source_aware_reads_enabled=False,
+    )
+
+    assert service.source_aware_reads_enabled is False
+    assert service.is_available is True
+
+
 @pytest.mark.asyncio
 async def test_usage_v2_route_is_hidden_while_its_gate_is_off(monkeypatch):
     import main as orchestrator_main
@@ -845,3 +1108,287 @@ def test_internal_inventory_ingestion_routes_are_hidden_from_openapi():
     assert set(routes) == expected
     assert all(route.methods == {"POST"} for route in routes.values())
     assert all(not route.include_in_schema for route in routes.values())
+
+
+@pytest.mark.asyncio
+async def test_infrastructure_admin_operations_require_real_fleet_view(monkeypatch):
+    import main as orchestrator_main
+
+    request = MagicMock()
+    request.url.path = "/api/admin/usage/v2/infrastructure-cutover"
+    audit = AsyncMock()
+    monkeypatch.setattr(orchestrator_main, "log_security_event", audit)
+    monkeypatch.setattr(
+        orchestrator_main,
+        "_require_admin",
+        AsyncMock(
+            return_value={
+                "id": str(uuid4()),
+                "real_is_admin": True,
+                "is_admin": False,
+            }
+        ),
+    )
+
+    with pytest.raises(HTTPException) as raised:
+        await orchestrator_main._require_infrastructure_fleet_admin(request)
+
+    assert raised.value.status_code == 403
+    assert audit.await_args.kwargs["event_type"] == "admin_denied"
+
+    monkeypatch.setattr(
+        orchestrator_main,
+        "_require_admin",
+        AsyncMock(
+            return_value={
+                "id": str(uuid4()),
+                "real_is_admin": True,
+                "is_admin": True,
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        orchestrator_main, "mcp_scope_project_id", lambda _user: uuid4()
+    )
+    with pytest.raises(HTTPException) as scoped:
+        await orchestrator_main._require_infrastructure_fleet_admin(request)
+    assert scoped.value.status_code == 403
+    assert audit.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_cutover_prepare_is_explicit_gated_idempotent_admin_operation(
+    monkeypatch,
+):
+    import main as orchestrator_main
+    from orchestrator.services.infrastructure_metering.cutover import (
+        CutoverPhase,
+        CutoverStatus,
+    )
+
+    actor_id, request_id = uuid4(), uuid4()
+    request = MagicMock()
+    request.url.path = "/api/admin/usage/v2/infrastructure-cutover/prepare"
+    monkeypatch.setattr(
+        orchestrator_main,
+        "_require_infrastructure_fleet_admin",
+        AsyncMock(return_value={"id": str(actor_id), "is_admin": True}),
+    )
+    monkeypatch.setattr(
+        orchestrator_main,
+        "infrastructure_metering_settings",
+        InfrastructureMeteringSettings(cutover_enabled=True),
+    )
+    monkeypatch.setattr(
+        orchestrator_main, "_infrastructure_leader_generation", lambda: 9
+    )
+    status = CutoverStatus(
+        state="preparing",
+        phase=CutoverPhase.LEGACY_DRAINING,
+        leader_generation=9,
+        cutover_at=datetime(2026, 8, 6, 12, tzinfo=timezone.utc),
+        request_id=request_id,
+        actor_id=actor_id,
+        reason="reviewed shadow window",
+        unplanned_intervals=1,
+        planned=0,
+        published=0,
+        conflicts=0,
+        open_legacy_intervals=0,
+        cutover_error=None,
+    )
+    coordinator = MagicMock()
+    coordinator.prepare = AsyncMock(return_value=status)
+    monkeypatch.setattr(
+        orchestrator_main, "infrastructure_workspace_cutover", coordinator
+    )
+    audit = AsyncMock()
+    monkeypatch.setattr(orchestrator_main, "log_security_event", audit)
+
+    result = await orchestrator_main.prepare_infrastructure_metering_cutover(
+        request,
+        orchestrator_main.InfrastructureCutoverPrepareRequest(
+            idempotency_key=request_id,
+            reason="reviewed shadow window",
+        ),
+    )
+
+    coordinator.prepare.assert_awaited_once_with(
+        9,
+        actor_id=actor_id,
+        reason="reviewed shadow window",
+        idempotency_key=request_id,
+    )
+    assert result["phase"] == "legacy-draining"
+    assert result["request_id"] == request_id
+    assert audit.await_args.kwargs["event_type"] == (
+        "infrastructure_metering_cutover_prepared"
+    )
+
+
+@pytest.mark.asyncio
+async def test_coverage_waiver_route_maps_result_and_audits(monkeypatch):
+    import main as orchestrator_main
+    from orchestrator.services.infrastructure_metering.coverage import (
+        CoverageDayDegradation,
+        CoverageGapWaiverResult,
+    )
+
+    actor_id, gap_id, request_id = uuid4(), uuid4(), uuid4()
+    resolved_at = datetime(2026, 8, 6, 12, tzinfo=timezone.utc)
+    request = MagicMock()
+    request.url.path = f"/api/admin/usage/v2/coverage-gaps/{gap_id}/waive"
+    monkeypatch.setattr(
+        orchestrator_main,
+        "_require_infrastructure_fleet_admin",
+        AsyncMock(return_value={"id": str(actor_id), "is_admin": True}),
+    )
+    service = MagicMock()
+    service.waive = AsyncMock(
+        return_value=CoverageGapWaiverResult(
+            gap_id=gap_id,
+            actor_id=actor_id,
+            idempotency_key=request_id,
+            reason="durable journal unavailable",
+            resolved_at=resolved_at,
+            replayed=False,
+            degraded_days=(
+                CoverageDayDegradation(
+                    day=resolved_at.date(),
+                    coverage_sequence=2,
+                    coverage_revision="waiver-v1:revision",
+                    added_range=(resolved_at, resolved_at + timedelta(minutes=5)),
+                ),
+            ),
+        )
+    )
+    monkeypatch.setattr(orchestrator_main, "infrastructure_coverage_waivers", service)
+    audit = AsyncMock()
+    monkeypatch.setattr(orchestrator_main, "log_security_event", audit)
+
+    result = await orchestrator_main.waive_infrastructure_metering_coverage_gap(
+        request,
+        gap_id,
+        orchestrator_main.InfrastructureCoverageWaiverRequest(
+            idempotency_key=request_id,
+            reason="durable journal unavailable",
+        ),
+    )
+
+    service.waive.assert_awaited_once_with(
+        gap_id,
+        actor_id,
+        "durable journal unavailable",
+        request_id,
+    )
+    assert result["degraded_days"][0]["coverage_sequence"] == 2
+    assert audit.await_args.kwargs["event_type"] == (
+        "infrastructure_metering_coverage_gap_waived"
+    )
+
+
+@pytest.mark.asyncio
+async def test_correction_route_is_idempotent_fleet_admin_operation(monkeypatch):
+    import main as orchestrator_main
+
+    actor_id, correction_id = uuid4(), uuid4()
+    period_start = datetime(2026, 8, 5, tzinfo=timezone.utc)
+    period_end = period_start + timedelta(hours=1)
+    request = MagicMock()
+    request.url.path = "/api/admin/usage/v2/infrastructure-corrections"
+    monkeypatch.setattr(
+        orchestrator_main,
+        "_require_infrastructure_fleet_admin",
+        AsyncMock(return_value={"id": str(actor_id), "is_admin": True}),
+    )
+    monkeypatch.setattr(
+        orchestrator_main,
+        "infrastructure_metering_settings",
+        InfrastructureMeteringSettings(
+            collector_enabled=True,
+            shadow_enabled=True,
+            publication_enabled=True,
+            stable_cluster_id="dev-cluster",
+            namespace_allowlist=("srw",),
+        ),
+    )
+    monkeypatch.setattr(
+        orchestrator_main, "_infrastructure_leader_generation", lambda: 11
+    )
+    plan = MagicMock(
+        id=correction_id,
+        correction_group_id=correction_id,
+        state="planned",
+        plan_revision=2,
+        period_start=period_start,
+        period_end=period_end,
+        events=(object(), object()),
+        event_set_hash="a" * 64,
+        rate_selection_hash="b" * 64,
+    )
+    materializer = MagicMock()
+    materializer.create_correction = AsyncMock(return_value=plan)
+    monkeypatch.setattr(
+        orchestrator_main, "infrastructure_usage_materializer", materializer
+    )
+    audit = AsyncMock()
+    monkeypatch.setattr(orchestrator_main, "log_security_event", audit)
+    original_ts = datetime(2026, 8, 5, tzinfo=timezone.utc)
+
+    result = await orchestrator_main.create_infrastructure_metering_correction(
+        request,
+        orchestrator_main.InfrastructureCorrectionRequest(
+            idempotency_key=correction_id,
+            reason="reviewed attribution repair",
+            deltas=[
+                orchestrator_main.InfrastructureCorrectionDeltaRequest(
+                    source="infra-allocation-v2",
+                    source_id="original-source-id",
+                    unit="vcpu-hour",
+                    ts=original_ts,
+                    expected_payload_hash="c" * 64,
+                    quantity=Decimal("-4"),
+                ),
+                orchestrator_main.InfrastructureCorrectionDeltaRequest(
+                    source="infra-allocation-v2",
+                    source_id="original-source-id",
+                    unit="vcpu-hour",
+                    ts=original_ts,
+                    expected_payload_hash="c" * 64,
+                    quantity=Decimal("4"),
+                    payload_overrides={"user_id": str(uuid4())},
+                ),
+            ],
+        ),
+    )
+
+    call = materializer.create_correction.await_args
+    assert call.args[0] == 11
+    assert [delta.quantity for delta in call.args[1]] == [Decimal("-4"), Decimal("4")]
+    assert call.kwargs == {
+        "correction_reason": "reviewed attribution repair",
+        "correction_actor_id": actor_id,
+        "correction_id": correction_id,
+    }
+    assert result["plan_id"] == correction_id
+    assert result["event_count"] == 2
+    assert audit.await_args.kwargs["event_type"] == (
+        "infrastructure_metering_correction_reviewed"
+    )
+
+
+def test_infrastructure_admin_routes_are_explicit_and_publicly_documented():
+    import main as orchestrator_main
+
+    expected = {
+        "/api/admin/usage/v2/infrastructure-cutover": {"GET"},
+        "/api/admin/usage/v2/infrastructure-cutover/prepare": {"POST"},
+        "/api/admin/usage/v2/coverage-gaps/{gap_id}/waive": {"POST"},
+        "/api/admin/usage/v2/infrastructure-corrections": {"POST"},
+    }
+    routes = {
+        route.path: route.methods
+        for route in orchestrator_main.app.routes
+        if getattr(route, "path", "") in expected
+    }
+    assert routes == expected

@@ -46,32 +46,91 @@ REQUIRED_SLICE1_APP_TABLES = frozenset(
     }
 )
 
-REQUIRED_APP_INDEXES = frozenset(
+# The collector/shadow schema can be deployed and exercised independently of
+# the irreversible workspace cutover.  Keep the final Slice 1 runtime contract
+# separate so a rolling deployment on 0087--0092 can never start publication
+# merely because inventory collection is healthy.
+REQUIRED_SLICE1_RUNTIME_APP_TABLES = frozenset(
     {
-        "resource_inventory_scope_epochs_active_uq",
-        "resource_intervals_materializer_idx",
-        "resource_intervals_open_lifecycle_uq",
-        "resource_intervals_open_uq",
-        "resource_publication_plans_pending_idx",
-        "usage_daily_v2_dims_uq",
-        "usage_rates_v2_lookup_idx",
+        "legacy_workspace_cutover_plan_events",
+        "legacy_workspace_cutover_plans",
     }
 )
 
-REQUIRED_SLICE1_APP_INDEXES = frozenset(
+REQUIRED_SLICE1_RUNTIME_APP_COLUMNS = frozenset(
     {
-        "resource_intervals_open_scope_identity_idx",
-        "resource_inventory_ingest_tickets_expiry_idx",
-        "resource_inventory_snapshots_sealed_retention_idx",
-        "resource_inventory_snapshots_staging_retention_idx",
-        "resource_inventory_shadow_comparisons_latest_idx",
-        "resource_inventory_shadow_comparisons_unresolved_idx",
-        "resource_inventory_transport_nonces_expiry_idx",
-        "resource_inventory_watch_events_gap_idx",
-        "resource_inventory_watch_events_scope_uid_idx",
-        "resource_inventory_watch_sessions_live_idx",
-        "resource_inventory_watch_sessions_retention_idx",
+        "infra_metering_control.barrier_committed_at",
+        "infra_metering_control.cutover_actor_id",
+        "infra_metering_control.cutover_error",
+        "infra_metering_control.cutover_phase",
+        "infra_metering_control.cutover_reason",
+        "infra_metering_control.cutover_request_id",
+        "infra_metering_control.cutover_requested_at",
+        "infra_metering_control.legacy_drained_at",
+        "infra_metering_control.activated_at",
+        "infra_usage_day_state.coverage_sequence",
+        "usage_rollup_day_state.infra_coverage_revision",
     }
+)
+
+REQUIRED_APP_INDEX_RELATIONS = {
+    "resource_inventory_scope_epochs_active_uq": "resource_inventory_scope_epochs",
+    "resource_intervals_materializer_idx": "resource_intervals",
+    "resource_intervals_overlap_idx": "resource_intervals",
+    "resource_intervals_open_lifecycle_uq": "resource_intervals",
+    "resource_intervals_open_uq": "resource_intervals",
+    "resource_publication_plans_pending_idx": "resource_publication_plans",
+    "resource_publication_plans_period_idx": "resource_publication_plans",
+    "usage_daily_v2_dims_uq": "usage_daily_v2",
+    "usage_rates_v2_lookup_idx": "usage_rates_v2",
+}
+REQUIRED_APP_INDEXES = frozenset(REQUIRED_APP_INDEX_RELATIONS)
+
+REQUIRED_SLICE1_APP_INDEX_RELATIONS = {
+    "resource_intervals_open_scope_identity_idx": "resource_intervals",
+    "resource_inventory_ingest_tickets_expiry_idx": (
+        "resource_inventory_ingest_tickets"
+    ),
+    "resource_inventory_snapshots_complete_received_idx": (
+        "resource_inventory_snapshots"
+    ),
+    "resource_inventory_snapshots_sealed_retention_idx": (
+        "resource_inventory_snapshots"
+    ),
+    "resource_inventory_snapshots_staging_retention_idx": (
+        "resource_inventory_snapshots"
+    ),
+    "resource_inventory_shadow_comparisons_latest_idx": (
+        "resource_inventory_shadow_comparisons"
+    ),
+    "resource_inventory_shadow_comparisons_unresolved_idx": (
+        "resource_inventory_shadow_comparisons"
+    ),
+    "resource_inventory_transport_nonces_expiry_idx": (
+        "resource_inventory_transport_nonces"
+    ),
+    "resource_inventory_watch_events_gap_idx": "resource_inventory_watch_events",
+    "resource_inventory_watch_events_invalid_received_idx": (
+        "resource_inventory_watch_events"
+    ),
+    "resource_inventory_watch_events_scope_uid_idx": (
+        "resource_inventory_watch_events"
+    ),
+    "resource_inventory_watch_sessions_live_idx": ("resource_inventory_watch_sessions"),
+    "resource_inventory_watch_sessions_retention_idx": (
+        "resource_inventory_watch_sessions"
+    ),
+}
+REQUIRED_SLICE1_APP_INDEXES = frozenset(REQUIRED_SLICE1_APP_INDEX_RELATIONS)
+
+REQUIRED_SLICE1_RUNTIME_APP_INDEX_RELATIONS = {
+    "legacy_workspace_cutover_plans_pending_idx": ("legacy_workspace_cutover_plans"),
+    "resource_publication_plan_events_rate_reference_idx": (
+        "resource_publication_plan_events"
+    ),
+}
+REQUIRED_SLICE1_RUNTIME_APP_INDEXES = frozenset(
+    REQUIRED_SLICE1_RUNTIME_APP_INDEX_RELATIONS
 )
 
 REQUIRED_APP_TRIGGER_RELATIONS = {
@@ -117,18 +176,71 @@ REQUIRED_SLICE1_APP_TRIGGER_RELATIONS = {
 }
 REQUIRED_SLICE1_APP_TRIGGERS = frozenset(REQUIRED_SLICE1_APP_TRIGGER_RELATIONS)
 
+REQUIRED_SLICE1_RUNTIME_APP_TRIGGER_RELATIONS = {
+    "infra_metering_control_cutover_one_way": "infra_metering_control",
+    "infra_metering_control_legacy_drain_immutable": "infra_metering_control",
+    "resource_inventory_scope_epochs_boundary_insert_lock": (
+        "resource_inventory_scope_epochs"
+    ),
+    "resource_inventory_scope_epochs_boundary_update_lock": (
+        "resource_inventory_scope_epochs"
+    ),
+    "resource_inventory_scope_epochs_boundary_insert": (
+        "resource_inventory_scope_epochs"
+    ),
+    "resource_inventory_scope_epochs_boundary_update": (
+        "resource_inventory_scope_epochs"
+    ),
+    "workspace_intervals_cutover_open_barrier": "workspace_intervals",
+    "workspace_intervals_cutover_insert_lock": "workspace_intervals",
+    "resource_intervals_cutover_serialization": "resource_intervals",
+    "resource_lifecycle_heads_cutover_serialization": "resource_lifecycle_heads",
+    "resource_intervals_snapshot_end_single_boundary_guard": "resource_intervals",
+    "resource_inventory_watch_events_terminal_evidence_guard": (
+        "resource_inventory_watch_events"
+    ),
+    "usage_rates_v2_referenced_range_guard": "usage_rates_v2",
+    "legacy_workspace_cutover_plans_frozen": "legacy_workspace_cutover_plans",
+    "legacy_workspace_cutover_plan_events_frozen": (
+        "legacy_workspace_cutover_plan_events"
+    ),
+    "legacy_workspace_cutover_plan_manifest_complete": (
+        "legacy_workspace_cutover_plans"
+    ),
+    "legacy_workspace_cutover_plan_event_manifest_complete": (
+        "legacy_workspace_cutover_plan_events"
+    ),
+}
+REQUIRED_SLICE1_RUNTIME_APP_TRIGGERS = frozenset(
+    REQUIRED_SLICE1_RUNTIME_APP_TRIGGER_RELATIONS
+)
+
+REQUIRED_SLICE1_RUNTIME_APP_CONSTRAINT_RELATIONS = {
+    "infra_metering_control_cutover_phase_check": "infra_metering_control",
+    "infra_metering_control_cutover_error_check": "infra_metering_control",
+    "infra_metering_control_cutover_request_uq": "infra_metering_control",
+    "legacy_workspace_cutover_plans_shape_check": ("legacy_workspace_cutover_plans"),
+    "legacy_workspace_cutover_plan_events_shape_check": (
+        "legacy_workspace_cutover_plan_events"
+    ),
+    "infra_usage_day_state_coverage_sequence_check": "infra_usage_day_state",
+    "usage_rollup_day_state_infra_revision_check": "usage_rollup_day_state",
+}
+REQUIRED_SLICE1_RUNTIME_APP_CONSTRAINTS = frozenset(
+    REQUIRED_SLICE1_RUNTIME_APP_CONSTRAINT_RELATIONS
+)
+
 REQUIRED_AUDIT_TRIGGER_RELATIONS = {
     "usage_events_rollup_dirty_days": "usage_events",
     "usage_events_append_only_v2": "usage_events",
 }
 
-REQUIRED_AUDIT_INDEXES = frozenset(
-    {
-        "usage_events_dedupe_idx",
-        "usage_events_project_ts_idx",
-        "usage_rollup_dirty_days_pkey",
-    }
-)
+REQUIRED_AUDIT_INDEX_RELATIONS = {
+    "usage_events_dedupe_idx": "usage_events",
+    "usage_events_project_ts_idx": "usage_events",
+    "usage_rollup_dirty_days_pkey": "usage_rollup_dirty_days",
+}
+REQUIRED_AUDIT_INDEXES = frozenset(REQUIRED_AUDIT_INDEX_RELATIONS)
 
 REQUIRED_AUDIT_CONSTRAINTS = frozenset(
     {
@@ -173,6 +285,8 @@ class MeteringSchemaCapabilities:
     app_tables: frozenset[str] = frozenset()
     app_indexes: frozenset[str] = frozenset()
     app_triggers: frozenset[str] = frozenset()
+    app_columns: frozenset[str] = frozenset()
+    app_constraints: frozenset[str] = frozenset()
     audit_tables: frozenset[str] = frozenset()
     audit_columns: frozenset[str] = frozenset()
     audit_constraints: frozenset[str] = frozenset()
@@ -194,6 +308,26 @@ class MeteringSchemaCapabilities:
     @property
     def missing_slice1_app_triggers(self) -> frozenset[str]:
         return REQUIRED_SLICE1_APP_TRIGGERS - self.app_triggers
+
+    @property
+    def missing_slice1_runtime_app_tables(self) -> frozenset[str]:
+        return REQUIRED_SLICE1_RUNTIME_APP_TABLES - self.app_tables
+
+    @property
+    def missing_slice1_runtime_app_indexes(self) -> frozenset[str]:
+        return REQUIRED_SLICE1_RUNTIME_APP_INDEXES - self.app_indexes
+
+    @property
+    def missing_slice1_runtime_app_triggers(self) -> frozenset[str]:
+        return REQUIRED_SLICE1_RUNTIME_APP_TRIGGERS - self.app_triggers
+
+    @property
+    def missing_slice1_runtime_app_columns(self) -> frozenset[str]:
+        return REQUIRED_SLICE1_RUNTIME_APP_COLUMNS - self.app_columns
+
+    @property
+    def missing_slice1_runtime_app_constraints(self) -> frozenset[str]:
+        return REQUIRED_SLICE1_RUNTIME_APP_CONSTRAINTS - self.app_constraints
 
     @property
     def missing_app_tables(self) -> frozenset[str]:
@@ -260,6 +394,20 @@ class MeteringSchemaCapabilities:
             and not self.missing_slice1_app_triggers
         )
 
+    @property
+    def slice1_runtime_ready(self) -> bool:
+        """Full audit/publication/cutover contract introduced through 0101."""
+
+        return (
+            self.slice0_ready
+            and self.slice1_inventory_ready
+            and not self.missing_slice1_runtime_app_tables
+            and not self.missing_slice1_runtime_app_indexes
+            and not self.missing_slice1_runtime_app_triggers
+            and not self.missing_slice1_runtime_app_columns
+            and not self.missing_slice1_runtime_app_constraints
+        )
+
     def diagnostics(self) -> dict[str, Any]:
         return {
             "slice0_ready": self.slice0_ready,
@@ -277,9 +425,25 @@ class MeteringSchemaCapabilities:
             "append_only_trigger": self.append_only_trigger,
             "target_partitions_ready": self.target_partitions_ready,
             "slice1_inventory_ready": self.slice1_inventory_ready,
+            "slice1_runtime_ready": self.slice1_runtime_ready,
             "missing_slice1_app_tables": sorted(self.missing_slice1_app_tables),
             "missing_slice1_app_indexes": sorted(self.missing_slice1_app_indexes),
             "missing_slice1_app_triggers": sorted(self.missing_slice1_app_triggers),
+            "missing_slice1_runtime_app_tables": sorted(
+                self.missing_slice1_runtime_app_tables
+            ),
+            "missing_slice1_runtime_app_indexes": sorted(
+                self.missing_slice1_runtime_app_indexes
+            ),
+            "missing_slice1_runtime_app_triggers": sorted(
+                self.missing_slice1_runtime_app_triggers
+            ),
+            "missing_slice1_runtime_app_columns": sorted(
+                self.missing_slice1_runtime_app_columns
+            ),
+            "missing_slice1_runtime_app_constraints": sorted(
+                self.missing_slice1_runtime_app_constraints
+            ),
         }
 
 
@@ -298,19 +462,64 @@ async def _table_names(pool: asyncpg.Pool | None, wanted: frozenset[str]) -> set
     return {str(row["table_name"]) for row in rows}
 
 
-async def _index_names(pool: asyncpg.Pool | None, wanted: frozenset[str]) -> set[str]:
+async def _qualified_column_names(
+    pool: asyncpg.Pool | None,
+    wanted: frozenset[str],
+) -> set[str]:
+    if pool is None or not wanted:
+        return set()
+    tables = sorted({item.split(".", 1)[0] for item in wanted})
+    try:
+        rows = await pool.fetch(
+            "SELECT table_name, column_name FROM information_schema.columns "
+            "WHERE table_schema = 'public' AND table_name = ANY($1::text[])",
+            tables,
+        )
+    except Exception:
+        logger.warning("metering schema app-column probe failed", exc_info=True)
+        return set()
+    return {
+        f"{row['table_name']}.{row['column_name']}"
+        for row in rows
+        if f"{row['table_name']}.{row['column_name']}" in wanted
+    }
+
+
+async def _index_names(
+    pool: asyncpg.Pool | None,
+    wanted: Mapping[str, str],
+) -> set[str]:
     if pool is None:
         return set()
     try:
         rows = await pool.fetch(
-            "SELECT indexname FROM pg_indexes "
-            "WHERE schemaname = 'public' AND indexname = ANY($1::text[])",
+            "SELECT index_relation.relname AS indexname, "
+            "indexed_relation.relname AS tablename "
+            "FROM pg_catalog.pg_index AS index_state "
+            "JOIN pg_catalog.pg_class AS index_relation "
+            "ON index_relation.oid = index_state.indexrelid "
+            "JOIN pg_catalog.pg_namespace AS index_namespace "
+            "ON index_namespace.oid = index_relation.relnamespace "
+            "JOIN pg_catalog.pg_class AS indexed_relation "
+            "ON indexed_relation.oid = index_state.indrelid "
+            "JOIN pg_catalog.pg_namespace AS indexed_namespace "
+            "ON indexed_namespace.oid = indexed_relation.relnamespace "
+            "WHERE index_namespace.nspname = 'public' "
+            "AND indexed_namespace.nspname = 'public' "
+            "AND index_relation.relname = ANY($1::text[]) "
+            "AND index_state.indisvalid "
+            "AND index_state.indisready "
+            "AND index_state.indislive",
             list(wanted),
         )
     except Exception:
         logger.warning("metering schema index probe failed", exc_info=True)
         return set()
-    return {str(row["indexname"]) for row in rows}
+    return {
+        str(row["indexname"])
+        for row in rows
+        if str(row["tablename"]) == wanted.get(str(row["indexname"]))
+    }
 
 
 async def _enabled_trigger_names(
@@ -340,23 +549,68 @@ async def _enabled_trigger_names(
     }
 
 
+async def _validated_constraint_names(
+    pool: asyncpg.Pool | None,
+    wanted: Mapping[str, str],
+) -> set[str]:
+    if pool is None:
+        return set()
+    try:
+        rows = await pool.fetch(
+            "SELECT constraint_state.conname, relation.relname "
+            "FROM pg_catalog.pg_constraint AS constraint_state "
+            "JOIN pg_catalog.pg_class AS relation "
+            "ON relation.oid = constraint_state.conrelid "
+            "JOIN pg_catalog.pg_namespace AS namespace "
+            "ON namespace.oid = relation.relnamespace "
+            "WHERE namespace.nspname = 'public' "
+            "AND constraint_state.convalidated "
+            "AND constraint_state.conname = ANY($1::text[])",
+            list(wanted),
+        )
+    except Exception:
+        logger.warning("metering schema app-constraint probe failed", exc_info=True)
+        return set()
+    return {
+        str(row["conname"])
+        for row in rows
+        if str(row["relname"]) == wanted.get(str(row["conname"]))
+    }
+
+
 async def probe_schema_capabilities(
     app_pool: asyncpg.Pool | None,
     audit_pool: asyncpg.Pool | None,
 ) -> MeteringSchemaCapabilities:
     """Probe both databases; absence remains a normal, fail-closed state."""
     app_tables = await _table_names(
-        app_pool, REQUIRED_APP_TABLES | REQUIRED_SLICE1_APP_TABLES
+        app_pool,
+        REQUIRED_APP_TABLES
+        | REQUIRED_SLICE1_APP_TABLES
+        | REQUIRED_SLICE1_RUNTIME_APP_TABLES,
     )
     app_indexes = await _index_names(
-        app_pool, REQUIRED_APP_INDEXES | REQUIRED_SLICE1_APP_INDEXES
+        app_pool,
+        REQUIRED_APP_INDEX_RELATIONS
+        | REQUIRED_SLICE1_APP_INDEX_RELATIONS
+        | REQUIRED_SLICE1_RUNTIME_APP_INDEX_RELATIONS,
     )
     app_triggers = await _enabled_trigger_names(
         app_pool,
-        REQUIRED_APP_TRIGGER_RELATIONS | REQUIRED_SLICE1_APP_TRIGGER_RELATIONS,
+        REQUIRED_APP_TRIGGER_RELATIONS
+        | REQUIRED_SLICE1_APP_TRIGGER_RELATIONS
+        | REQUIRED_SLICE1_RUNTIME_APP_TRIGGER_RELATIONS,
+    )
+    app_columns = await _qualified_column_names(
+        app_pool,
+        REQUIRED_SLICE1_RUNTIME_APP_COLUMNS,
+    )
+    app_constraints = await _validated_constraint_names(
+        app_pool,
+        REQUIRED_SLICE1_RUNTIME_APP_CONSTRAINT_RELATIONS,
     )
     audit_tables = await _table_names(audit_pool, REQUIRED_AUDIT_TABLES)
-    audit_indexes = await _index_names(audit_pool, REQUIRED_AUDIT_INDEXES)
+    audit_indexes = await _index_names(audit_pool, REQUIRED_AUDIT_INDEX_RELATIONS)
     audit_columns: set[str] = set()
     audit_constraints: set[str] = set()
     app_seed_rows_ready = False
@@ -429,6 +683,8 @@ async def probe_schema_capabilities(
         app_tables=frozenset(app_tables),
         app_indexes=frozenset(app_indexes),
         app_triggers=frozenset(app_triggers),
+        app_columns=frozenset(app_columns),
+        app_constraints=frozenset(app_constraints),
         audit_tables=frozenset(audit_tables),
         audit_columns=frozenset(audit_columns),
         audit_constraints=frozenset(audit_constraints),
