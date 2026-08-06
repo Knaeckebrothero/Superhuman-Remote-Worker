@@ -18,10 +18,8 @@ blocking it should be taken before the next bench campaign.
 | doc | why now |
 |---|---|
 | [gitea_admin_credential_in_every_agent_workspace](gitea_admin_credential_in_every_agent_workspace.md) | **Security.** The Gitea admin credential lands in every agent workspace. Blast radius: any job/agent can act as git admin. |
-| [fresh_job_dispatched_as_resume_skips_seeding](fresh_job_dispatched_as_resume_skips_seeding.md) | **Active regression (08-05).** Never-started jobs routed down `/job/resume` start brief-less and strand; every legit resume serves an empty virtual br |
 | [session_workspace_wiped_by_agent_clone_on_attach](session_workspace_wiped_by_agent_clone_on_attach.md) | **Data loss.** Unguarded `rm -rf`+clone on attach now wipes a *durable* PVC. Fix = port the job-path content probe. |
 | [lifecycle_session_agents_without_thread_never_drain](lifecycle_session_agents_without_thread_never_drain.md) | **Active resource leak.** Session agents without a thread never drain — pods accumulate until manual cleanup. |
-| [rejected_verdict_livelocks_critic_and_wedges_parent](rejected_verdict_livelocks_critic_and_wedges_parent.md) | **Live critic wedge.** Rejected verdict livelocks the critic and wedges the parent (105 min before manual cancel). Same family: stale_critic_waiting_s |
 | [project_scoped_memory_deadlocks_under_parallel_jobs](project_scoped_memory_deadlocks_under_parallel_jobs.md) | **P1-rated concurrency defect** in project-scoped memory under parallel jobs — directly undermines multi-job projects. |
 
 ### P0-adjacent, tracked outside this directory
@@ -42,23 +40,18 @@ blocking it should be taken before the next bench campaign.
 
 | doc | why |
 |---|---|
-| [bench_sweeper_multi_replica_race](bench_sweeper_multi_replica_race.md) | **Blocks the main measurement thread** — 3 duplicate submissions in 30 pairs (10%) on 2 replicas; advisory lock required before the next unattended ru |
 | [homelab_wan_outage_severs_cluster_from_own_llm](homelab_wan_outage_severs_cluster_from_own_llm.md) | Cheap CoreDNS rewrite makes every job immune to WAN outages (08-05 cost a 3 h cluster-wide LLM blackout + 1 job). |
 | [embedding_batch_overflow_skips_citation_source_embeddings](embedding_batch_overflow_skips_citation_source_embeddings.md) | OPEN. P1 research-quality and load defect.** Source registration |
 | [phase_boundary_tags_are_moved_then_rejected_by_remote](phase_boundary_tags_are_moved_then_rejected_by_remote.md) | OPEN. P1 phase evidence / Git observability defect.** Branch |
-| [critic_feedback_resume_parent_freeze_data_wedge](critic_feedback_resume_parent_freeze_data_wedge.md) | Confirmed in code + live DB; part of the critic-wedge family. |
-| [resume_fresh_workspace_no_clone_fallback](resume_fresh_workspace_no_clone_fallback.md) | CONFIRMED in code + live incident 2026-07-25. UNFIXED. |
 | [job_finalization_decisions_held_only_in_process_memory](job_finalization_decisions_held_only_in_process_memory.md) | Orchestrator restart mid-finalization loses decisions (restarts happen on every deploy). |
 | [pod_oom_kill_protection](pod_oom_kill_protection.md) | Umbrella for the recurring OOM incident class. |
-| [reviewing_parent_pod_reaped_under_critic](reviewing_parent_pod_reaped_under_critic.md) | Filed + diagnosed 2026-07-04, on the **main cluster** (ns `superhuman-remote-worker`), investigating a batch of failed research-loop jobs. **Not fixed |
-| [stale_critic_waiting_status_escapes_reaper](stale_critic_waiting_status_escapes_reaper.md) | CONFIRMED in code + live DB on dev 2026-07-18. UNFIXED. |
 
 ## P2 — real but bounded (open, workaround exists or blast radius small)
 
 | doc | status |
 |---|---|
 | [bench_infra_exclusion_misses_midflight_outages](bench_infra_exclusion_misses_midflight_outages.md) | Open, analysis-level workaround exists. Found 2026-08-05 during |
-| [k3d_workspace_ssh_key_rejected](k3d_workspace_ssh_key_rejected.md) | Open, environment-only (k3d cluster `srw`). Dev cluster unaffected |
+| [rejected_verdict_livelocks…](rejected_verdict_livelocks_critic_and_wedges_parent.md) | Cap + escalation + stop-order **FIXED 08-06**; only the fix-direction-2 wall-clock watchdog arm (backstop for live-critic reviews) remains open. |
 | [dispatcher_resume_pep_twin_still_fails_open](dispatcher_resume_pep_twin_still_fails_open.md) | OPEN, filed 2026-08-04 by the whole-branch review of the fix for |
 | [registered_tools_no_config_can_grant](registered_tools_no_config_can_grant.md) | OPEN, diagnosed 2026-08-02 — the *invisible* half is fixed, the ten |
 | [kb_duplicate_frontmatter_ids_collide_on_reindex](kb_duplicate_frontmatter_ids_collide_on_reindex.md) | OPEN.** Still reproducible in code at HEAD — `note_fields` continues to take |
@@ -191,3 +184,117 @@ Quick wins: the engineering is done; what remains is shipping and verification.
 *(Closed/resolved docs are deliberately not listed; the sweep counted 34
 clearly closed. Rebuild the mechanical tail anytime by re-running the
 status sweep.)*
+
+## Session log 2026-08-06 (batch fix session)
+
+Autonomous ~3.5 h implementation session on `develop` (local k3d verification
+via Tilt). Six tasks, eight commits, nothing pushed. Recurring theme: several
+"UNFIXED" docs were already fixed at HEAD — always re-verify a doc's Status
+against code before building.
+
+**Task 0 — k3d job path (`k3d_workspace_ssh_key_rejected`, now docs/done/)** —
+commit `ca5b681e` (docs only; the code fix pre-existed). Root cause was NOT
+key drift: `4f27f581` (08-03) added the SSH-auth readiness gate, exposing that
+the chart projects the Secret key 0444, which root-running OpenSSH refuses
+("bad permissions" → the quoted error was ssh's truncated known-hosts
+warning). `52c1ba80` (08-04, hours after filing) added the 0600 staging fix
+(`_stage_runtime_ssh_key`) and nobody re-ran a job. Verified: staged-key probe
+from the orchestrator pod exits 0; smoke job `58ba61ef` (plain POST
+/api/jobs) provisioned (SSH auth attempts=1), processed, made LLM calls, and
+COMPLETED; all later smoke jobs provisioned identically. Residual papercut
+kept in the doc: provisioning failures write `failed` with an empty `error`
+column.
+
+**Task 1 — critic freeze_data wedge (`critic_feedback_resume_parent_freeze_data_wedge`, now docs/done/)** —
+commit `45f615dd`. Already fixed at HEAD by `4dba9836` (07-22,
+`queue_job_for_resume` clears `freeze_data`); audited every sibling resume
+path clean (blocking-message/urgent/LLM-triage, explicit Resume, sudo
+approve/deny, deliverable-gate). Added the missing regression pins: DB-level
+critic-flavored test (real Postgres via testcontainers —
+`test_critic_returned_resume_clears_freeze_so_dispatcher_sees_job`) and a
+seam pin (`test_returned_resume_routes_through_freeze_clearing_write`; the
+old wiring test stubbed `_internal_resume_job` wholesale). Verified:
+`pytest tests/test_queue_job_for_resume.py tests/test_verification_flow.py`
+(76 passed). Residual same-class defect tracked separately in
+`recovery_pause_repersists_stale_freeze_invisible_job.md` (`pause_job` keeps
+freeze_data).
+
+**Task 2 — bench sweeper race (`bench_sweeper_multi_replica_race`, now docs/done/)** —
+commit `ac4173fc`. `sweep_tick` now claims session-scoped
+`pg_try_advisory_lock(hashtext('bench_sweep'))`, claim+release on ONE held
+pool connection (`BenchStore.try_sweep_lock`); loser skips the tick; key
+mirrored in `database/lock_ids.py`. Verified: 6 new unit tests (two
+concurrent ticks → single submission + unique (task,arm,replicate); release
+between ticks and under a raising sweep; loser never unlocks; one-session
+contract); live k3d run `e2233fba` (1×1×1) → sweeper submitted exactly one
+job (`50a7fa16`, completed), single ledger entry. Note: the doc's claim that
+leader election has "no precedent" is stale — `run_when_leader` exists; the
+sweeper escaped that audit because it starts from a router lifespan.
+
+**Task 3 — resume-lane brief starvation (`fresh_job_dispatched_as_resume_skips_seeding`, now docs/done/)** —
+commit `66169c2c` (+ `6132789e` endpoint-inventory regen). (a) dispatcher +
+admin-assign use `resume_lane_applies` + `PostgresDB.job_has_checkpoint`
+(there is NO `jobs.started_at` column — checkpoint presence is the probe;
+fails open to the resume lane on sqlite/probe-error). (b) the virtual
+`task_brief.md` provider reads `_job_metadata` LIVE, and resumes with no
+description backfill from the new internal `GET /api/jobs/{id}/brief`
+(agent-DB fallback, non-fatal). (c) tripwire
+`_note_resume_without_checkpoint`: ERROR + hydration + Phase-0 seed commit.
+Verified: 71 unit tests across dispatch_guards/manual-assign/phase0-seed;
+live k3d: paused never-started row `d8f004fa` → "dispatching via the fresh
+/job/start lane" and its first LLM request contained description + kickoff +
+Task Brief header (audit `llm_requests` probe `t|t|t`); paused mid-run →
+resume lane + "hydrated task brief on resume (description=123 chars)".
+
+**Task 4 — critic lifecycle bundle** — commits `1d7ceaa6` (docs) +
+`e6c16d40` (code). (b) `stale_critic_waiting_status_escapes_reaper` and
+(c) `reviewing_parent_pod_reaped_under_critic` were ALREADY FIXED at HEAD
+(`f2d054bd`, `656b31ec`) with tests — docs closed to docs/done/ with the
+deviation note for (b) ('waiting' sits in the top-level filter by design;
+do not narrow it back). (a) rejected-verdict cap implemented:
+`increment_verdict_rejections` (atomic, per-critic row), cap 3 in
+`_record_verification_round_impl`, escalation via `_escalate_target`
+(loop-aware), 409 flagged `escalated: true`, agent client turns it into a
+stop order ("Do NOT resubmit") instead of the livelocking retry
+instruction. Verified: `pytest tests/test_verification_flow.py
+tests/test_critic_loop.py` (108 passed). NOT live-exercised (would need a
+real 3× invalid-verdict critic); fix direction 2 (wall-clock watchdog arm
+for live-critic reviews) deliberately remains OPEN — doc stays in
+docs/issues/ with the split Status.
+
+**Task 5 (stretch) — resume clone fallback (`resume_fresh_workspace_no_clone_fallback`, now docs/done/)** —
+commit `e3996909`. The pod-handoff clone gate already existed but was dead
+code: `JobResumeRequest` had no `git_remote_url` and the orchestrator never
+sent it. Threaded the remote through the resume wire (payload + model + both
+handlers) and added `workspace_init_path=reattach|clone|snapshot|existing`
+logs plus a WARNING on blank-init-under-resume. Verified: 4 new wire tests;
+live k3d: `ed7f93b4` paused mid-run, workspace pod+PVC+Service deleted,
+released → resume lane → "Pod handoff: cloning workspace" →
+`workspace_init_path=clone` → fresh workspace contained the repo files.
+Bonus finding while rigging this: a job re-queued after terminal `failed`
+has pruned checkpoints, so the new lane probe correctly sends it down the
+FRESH lane, which also clones the repo (`58ba61ef` observed live) — both
+lanes now recover history.
+
+**Environment observations (not fixed, worth knowing):**
+- Every orchestrator image rebuild on this k3d cluster causes a rocky
+  ~5-10 min rollout: health probes time out (3s) while the app churns
+  through startup + the `ide_settings` sweeper hammers dead workspace IPs
+  ("No route to host" spam), kubelet restarts the container 2-3× before it
+  settles. Low CPU throughout — smells like event-loop starvation during
+  startup, pre-existing (the pre-session pod restarted the same way).
+- A requeue after a workspace-provisioning failure replays the recorded
+  failure from `context.workspace_container.status='failed'` until that key
+  is shed (`shed_workspace_context` / `context - 'workspace_container'`) —
+  by design, but easy to trip over when hand-requeueing.
+- Synthetic SQL-inserted job rows fail dispatch with `connector_unavailable`
+  unless `context.datasource_selection.selected_ids` matches the junction
+  table (fail-closed materialization contract) — use the API to create test
+  jobs, or include `{"datasource_selection": {"selected_ids": []}}`.
+
+**Pytest**: full suite after all commits = 11 failed / 14178+ passed
+(`13 failed` pre-inventory-fix − inventory − a metering flake that passes on
+rerun). All 11 residuals are pre-existing env noise on this py3.14 host
+(local-Postgres-required `test_database_phase1`, the `test_mcp_manager` /
+`test_mcp_agent_wiring` stack, `tools/research` installed-client contracts)
+— none touch modules changed this session; memory baseline was ~8 on py313.
