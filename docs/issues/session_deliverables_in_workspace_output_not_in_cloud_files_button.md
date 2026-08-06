@@ -1,6 +1,11 @@
 # Session deliverables saved to `output/` aren't reachable from the "Files" (cloud) button — only via the full IDE
 
 **Status:** Filed — root cause confirmed on live session `7692637b-9c60-4698-9875-b57ec34e66a6` (main cluster, cloud-mounted). **Reconfirmed + deeper root cause filed 2026-07-10** on dev session `e979d520-35a5-4eeb-a9c1-4f6e1be1b2fd` (default project): under the `rclone_mount` driver the shared session folder is an orphan (created + shared, but never mounted or synced) and the Files button points straight at it — see the **Update 2026-07-10** section below. **Reconfirmed again 2026-07-20** on dev session `accfbc56`: the orphan is *not always empty* — a transient pre-mount sync can leave a **frozen partial snapshot** (there, `documents/` + `skills/`), which is worse UX than empty; current line refs re-verified. See **Update 2026-07-20**. Still unfixed.
+**Sweep addendum (2026-08-06):** still present at HEAD. A general
+skip-legacy-folder mechanism has since been built (Phase 4,
+`_setup_main_cloud` → `_should_skip_session_folder`) but it explicitly hard-returns
+False for `rclone_mount` — so under the production-default driver the orphan
+folder behavior is unchanged and proposed fix (5) remains unapplied.
 **Found:** 2026-06-26. User asked the agent to build Excel lists; the agent produced them, but none appeared under the session's **Files** button — they had to be downloaded through the **IDE**.
 **Severity:** Medium. Silent usability gap: the agent's actual deliverables are invisible via the primary "Files" affordance, so a non-technical user concludes nothing was produced. Found in a real customer-style task.
 **Component:** agent deliverable convention (`config/templates/instructions.md`, strategic/tactical prompts) · cockpit Files button (`persistent-chat.component.ts` `openSessionFiles()`) · cloud rclone mount vs local workspace dirs · orchestrator session-folder provisioning (`orchestrator/main.py`: `_setup_main_cloud`, `_should_skip_session_folder`, `_build_agent_cloud_mount`, `_resolve_cloud_session_url`) · rclone mount vs legacy sync coordinator (`src/api/persistent_app.py` `cloud_mount_active` gate)

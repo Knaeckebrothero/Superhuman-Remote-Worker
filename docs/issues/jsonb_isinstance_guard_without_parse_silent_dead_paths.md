@@ -11,8 +11,14 @@ tags:
 
 **Filed:** 2026-07-27, found while auditing persistence conventions for the
 verification redesign.
-**Status:** Mechanism CONFIRMED in code. Individual instances tagged below —
-some verified dead by inspection, one needs a live check. UNFIXED.
+**Status:** Mechanism CONFIRMED in code. 1 of 4 instances fixed (sweep-verified
+at HEAD 2026-08-06): Site 4 (cockpit snapshot status) closed by `0ba7c754`
+(`asRecord()` in `cockpit/src/app/core/util/job-status.ts`, applied + tested).
+Sites 1–3 (VM status 404 at main.py:12183, VM freeze-on-pause at main.py:11060,
+subjob repo provisioning at services/job_provisioning.py:186 — the latter's
+call sites grew from 2 to 4) are byte-for-byte unchanged. A shared coercion
+helper `_get_vm_context()` now exists (main.py:4756, 10+ call sites) — exactly
+the recommended fix — but was never applied to sites 1–2.
 **Severity:** medium — no data loss, but features that appear implemented are
 silently inert, and one path raises.
 **Component:** `orchestrator/database/postgres.py:400-418`, plus the call

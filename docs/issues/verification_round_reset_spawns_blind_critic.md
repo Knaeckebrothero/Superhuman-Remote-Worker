@@ -16,6 +16,14 @@ The revision **corrected two misdiagnoses in the first version** — see
 [Corrections](#corrections-to-the-first-version-of-this-doc).
 **Status:** **FIXED AND SHIPPED** — rewritten fail-closed on `develop`
 (32 commits `c9f3cf1a..928ed60b`, pushed and deployed to dev 2026-07-28).
+Sweep precision (2026-08-06): one slice never landed — Slice 1 item 2, the
+graph.py drain-vs-verdict overwrite guard (the drain block still
+unconditionally sets `freeze_data = upgrade_freeze`; zero commits touched it
+in the cited range, and test_graph.py pins the overwrite as intended). Row 1
+of the fail-open table is closed in PRACTICE by Slice 2's
+journal-before-observe verdict write, not by that guard. The no-progress
+short-circuit (item 11) is live but measured near-zero-sensitivity; the
+denylist→allowlist inversion for NON_DELIVERABLE_PATHS stays open.
 Live gate run 2026-07-29/30: **partial pass** — brief delivery, the
 round-recording endpoint and `content_tree` capture are all confirmed working
 in production; cross-round `content_tree` stability is still unmeasured. Open

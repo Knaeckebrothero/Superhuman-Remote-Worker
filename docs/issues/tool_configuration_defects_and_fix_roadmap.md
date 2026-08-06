@@ -21,8 +21,12 @@ related:
 
 # Tool configuration — consolidated defect register and fix roadmap
 
-**Status:** IMPLEMENTED **and live-gated** 2026-08-02/03 on `develop`, **not
-pushed**. Phases 0–3 are done; each of the eight tasks went implement →
+**Status:** IMPLEMENTED **and live-gated** 2026-08-02/03 on `develop`
+(sweep-verified at HEAD 2026-08-06; the earlier "not pushed" note is stale —
+the branch has since been pushed). Still open, exactly as recorded below:
+Phase 2's literal YAML migration (config/session_base.yaml still `shell: []`,
+not `false`) and the job-create reasoning-reset twin
+(job_mode_reasoning_pick_silently_reset.md). Phases 0–3 are done; each of the eight tasks went implement →
 adversarial review → fix → scoped re-review. The final whole-branch review
 returned four merge blockers and **all four are now closed** — three by the fix
 wave, the fourth by six live gates across three rounds, every one passing (one

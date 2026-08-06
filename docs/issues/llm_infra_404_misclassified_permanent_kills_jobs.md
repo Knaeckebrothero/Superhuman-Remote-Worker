@@ -1,8 +1,12 @@
 # Infra-level 404 (HTML body) misclassified as permanent — bypasses the entire LLM outage stack
 
-**Status:** Slices 1–3 BUILT (2026-07-18), unit-tested (`test_graph_helpers.py`
-+38 assertions incl. new `TestInfraEdgeHelpers`; `test_llm_outage_resilience.py`
-+2), lint clean. Slice 4 (reranker parity) not built. Owed: k3d e2e per the
+**Status:** Slices 1–3 SHIPPED (committed; sweep-verified at HEAD 2026-08-06 —
+`test_graph_helpers.py` 129 green incl. `TestInfraEdgeHelpers`). The code has
+since RELOCATED from `src/graph.py` to `src/core/llm_retry.py` (thin re-export
+shim left behind; see `docs/done/llm_retry_and_fallback_reimplemented_per_call_site.md`)
+— a Slice-1 comment there self-cites this doc. Slice 4 (reranker parity:
+`_is_transient` still treats only 5xx/429 as transient, no 404-body-shape
+check) confirmed still NOT built. Owed: k3d e2e (live outage replay) per the
 verification section below.
 
 ## Incident (2026-07-17, dev cluster)

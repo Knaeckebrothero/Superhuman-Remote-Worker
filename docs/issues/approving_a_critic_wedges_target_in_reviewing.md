@@ -11,9 +11,15 @@ tags:
 # Approving a *critic* job from the UI wedges its target in `reviewing` forever
 
 **Filed:** 2026-07-27, found while auditing the verification subsystem.
-**Status:** CONFIRMED reachable in code. Not observed live — a DB check is
-proposed below. UNFIXED.
-**Severity:** medium — a permanent, silent wedge. The target never reaches a
+**Status:** CONFIRMED reachable in code, unchanged at HEAD (sweep-verified
+2026-08-06: approve_job still has no verification-critic check). Fix items 1
+and 3 remain open. The SEVERITY claim is corrected though: the wedge is no
+longer permanent — `unstick_reviewing_parents` (commit `f2d054bd`, the
+ledger-aware watchdog) flips a target back to `pending_review` after the
+grace window when its critic left no ledger row, which a UI-approved critic
+never does. Bounded ~30 min, a side effect of the fail-closed rewrite, not a
+deliberate fix here. Severity medium → low.
+**Original severity claim:** medium — a permanent, silent wedge. The target never reaches a
 terminal state and no watchdog can rescue it, but it takes an unusual
 operator action to trigger.
 **Component:** `orchestrator/main.py:10928-11099` (`approve_job`),

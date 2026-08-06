@@ -22,7 +22,7 @@ Severity overview:
 | B5 | KB injection block has no token budget | MED | ~0.5 d | open |
 | B6 | Memory table is grow-only — nothing ever deletes rows | MED (slow burn) | policy + ~0.5 d | open |
 | B7 | KB dual-write drift, fail-open (note in Neo4j, invisible to retrieval) | MED-LOW | ~0.5 d | open |
-| B8 | Neo4j-down kills pgvector-only KB injection too | LOW-MED | small | open |
+| B8 | Neo4j-down kills pgvector-only KB injection too | LOW-MED | small | **fixed incidentally** — `ToolContext.has_knowledge()` now gates on the pgvector store alone (OKF slice-3 PR4c, `src/tools/context.py`); Neo4j fully optional. Never cross-linked here at the time (sweep-verified 2026-08-06) |
 | B9 | Dead/misleading config keys (tuning no-ops) | LOW (hygiene) | ~1 h | **✅ keys deleted 2026-06-10** (PR #112) — enum nits still open |
 | B10 | Injection-strip prefix registry is silently fragile | LOW (latent) | test guard | open |
 | B11 | End-Session button (detach path) skips final extraction — only `/done` + idle extract | MED | small now / Phase-1 `capture()` properly | ✅ CLOSED 2026-06-11: capture wired (slice 5) + orchestrator detach-then-delete for the k8s ✕-route; both live-verified (archive route + DELETE route w/ extraction before teardown) |

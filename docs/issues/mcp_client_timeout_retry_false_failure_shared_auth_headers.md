@@ -9,8 +9,16 @@ tags:
 
 # MCP client: 30s timeout + retry reports slow mutations as failed, and auth headers live on a shared global client
 
-**Status:** Filed 2026-08-01 from the VM-session re-gate teardown (dev,
-`sha-99c9aba`). Mechanism verified in code + a full request trace; not yet fixed.
+**Status:** Filed 2026-08-01; PARTIALLY FIXED since (sweep-verified at HEAD
+2026-08-06). The client relocated to `src/shared/orch_surface/client.py`
+(commit `99b87008`, the shared-orch-surface extraction — the doc's
+`orchestrator/mcp/client.py` path is gone). Defect 3 (shared mutable auth
+headers) FIXED via per-request `_RequestScopeAuth` ContextVar auth; defect 2
+(retry of non-idempotent mutations) FIXED via exactly-once
+`_mutation_request()` + `MutationOutcomeUnknown` (~25 mutation sites routed
+through it; retries now decorate reads only). Defect 1 (flat 30.0s client
+timeout vs the ~30s teardown budget) NOT fixed — softened by defect 2's
+ambiguous-outcome semantics, but the root timeout mismatch stands.
 
 **One line:** `AsyncCockpitClient` gives every orchestrator call a 30.0s budget
 and retries timeouts up to 3×; a mutation that takes >30s server-side (observed:

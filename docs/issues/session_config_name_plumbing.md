@@ -1,6 +1,13 @@
 # Persistent sessions can silently run on the worker YAML (config_name plumbing)
 
-**Status**: FIXED + LIVE-VERIFIED on k3d 2026-06-11 (same day as found):
+**Status**: Holes A + B FIXED + LIVE-VERIFIED on k3d 2026-06-11 — but the
+2026-08-06 sweep found a FOURTH, never-patched `_send_session_attach` call
+site this doc missed: `orchestrator/routers/sessions.py:363`
+(`_provision_agent_for_thread`, the pool-attach branch of
+`POST /api/sessions/{id}/prepare`) still omits `config_name=`. Masked when
+DB-backed experts are enabled (independent re-resolution); reproduces Hole B
+when experts are off/unresolvable. Needs `config_name=config_name` there
+before this doc can close. Original fix record:
 - Hole A: `ThreadCreateRequest.config_name` default flipped to
   `"persistent_defaults"` (orchestrator/main.py). Verified: bare
   `POST /api/persistent/threads` → thread row stores `persistent_defaults`.

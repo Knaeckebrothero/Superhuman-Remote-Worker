@@ -12,7 +12,14 @@ tags:
 **Observed in:** Job `aab9a1a2-bfc1-4748-987d-edb6f8e648ed` ("Organize docs (oss 120b)")
 **Model:** `gpt-oss-120b`
 **Date:** 2026-02-15
-**Status:** Needs fix
+**Status:** PARTIALLY addressed (sweep-verified at HEAD 2026-08-06). The core
+bug (search_files false-negative on file paths) is FIXED via the backend
+refactor — the production backend shells out to server-side `grep -rn`
+(`src/core/backends/remote.py:931`), which has no file-vs-directory pitfall
+(residual: `backends/scratch.py` still uses `rglob`). `job_complete` now has a
+deliverable-existence validation gate (`src/tools/core/job.py`). The five other
+design proposals (workspace_archive.md, sources/→documents/ template fix,
+planning-loop circuit breaker, search dedup, blocker-TTL) remain unbuilt.
 
 ## Summary
 

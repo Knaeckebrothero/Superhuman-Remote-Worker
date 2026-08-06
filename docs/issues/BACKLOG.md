@@ -53,7 +53,7 @@ blocking it should be taken before the next bench campaign.
 | [project_scoped_memory_deadlocks_under_parallel_jobs](project_scoped_memory_deadlocks_under_parallel_jobs.md) | Containment tier **SHIPPED 08-06 (batch #2)** — ordered locking + contained/retried access stats + heartbeat telemetry. OPEN: the semantic per-consumer TTL model (criterion 3) and pinned-budget share (criterion 5). |
 | [phase_boundary_tags_are_moved_then_rejected_by_remote](phase_boundary_tags_are_moved_then_rejected_by_remote.md) | Core **FIXED 08-06 (batch #2)** — create-once tags at completion commits, per-ref push, no `--tags` spray. OPEN residuals: duplicate phase-completion transition (graph exactly-once) + tag-independent review evidence. |
 | [dispatcher_resume_pep_twin_still_fails_open](dispatcher_resume_pep_twin_still_fails_open.md) | OPEN, filed 2026-08-04 by the whole-branch review of the fix for |
-| [registered_tools_no_config_can_grant](registered_tools_no_config_can_grant.md) | OPEN, diagnosed 2026-08-02 — the *invisible* half is fixed, the ten |
+| [registered_tools_no_config_can_grant](registered_tools_no_config_can_grant.md) | OPEN — sweep-corrected 08-06: items 1 (curator kb_lint/kb_index) + 3 (`catalog_authoring`) ARE shipped; truly unreachable now = the `delegate_work` pair; tests/lint (items 4-5) unbuilt |
 | [kb_duplicate_frontmatter_ids_collide_on_reindex](kb_duplicate_frontmatter_ids_collide_on_reindex.md) | OPEN.** Still reproducible in code at HEAD — `note_fields` continues to take |
 | [memory_noise](memory_noise.md) | Open |
 | [litellm_reranker_model_unregistered](litellm_reranker_model_unregistered.md) | Open · root cause confirmed · non-fatal (memory degrades gracefully) |
@@ -95,7 +95,6 @@ blocking it should be taken before the next bench campaign.
 | [dual_app_persistent_app_redundancy](dual_app_persistent_app_redundancy.md) | 🔴 **OPEN** — structural debt, filed for a deliberate later fix. |
 | [failed_job_pvc_reclaimed_without_grace_period](failed_job_pvc_reclaimed_without_grace_period.md) | Designed 2026-07-25 from the job-`52949749` salvage. Not yet |
 | [gitmanager_local_git_fallback](gitmanager_local_git_fallback.md) | Open — deferred hardening. Filed 2026-06-11 (fallout from the |
-| [jobs_repo_clone_collision_on_first_dispatch_to_populated_workspace](jobs_repo_clone_collision_on_first_dispatch_to_populated_workspace.md) | FIX COMMITTED 2026-07-18 as `47c65582` on `develop`, NOT YET |
 | [loop_critic_producer_identity_bias](loop_critic_producer_identity_bias.md) | OPEN / backlog. Not scheduled. Low urgency (see "Why this is latent, |
 | [phases](phases.md) | Open |
 | [remove_workspace_md_vestiges](remove_workspace_md_vestiges.md) | Backlog — deferred cleanup. Filed 2026-06-03. |
@@ -107,76 +106,48 @@ blocking it should be taken before the next bench campaign.
 ## Built but unshipped — finished work awaiting commit / deploy / live gate
 
 Quick wins: the engineering is done; what remains is shipping and verification.
+*(Batch #3 sweep, 2026-08-06: 19 of the 22 rows that used to sit here were
+verified SHIPPED at HEAD — every "uncommitted" claim had in fact landed,
+mostly under rebased SHAs — and moved to docs/done/ with evidence notes. The
+three rows below are what actually remains.)*
 
 | doc | status |
 |---|---|
-| [cockpit_session_scroll_pin_misses_late_height_changes](cockpit_session_scroll_pin_misses_late_height_changes.md) | RO FIX BUILT + BROWSER-VERIFIED on k3d 2026-07-15 · UNCOMMITTED.** Fix 1 (the ResizeObserver detector), Fix 2 (the handler + `pinTarget`), Fix 3 (the |
-| [codex_cached_tokens_not_metered](codex_cached_tokens_not_metered.md) | root-caused + FIX BUILT 2026-07-10 (uncommitted). Extraction fix across 4 files, unit-tested; k3d live-verification steps below. |
-| [codex_proxy_context_window_cap](codex_proxy_context_window_cap.md) | BUILT 2026-07-10, uncommitted** — code + helm + unit tests + DB re-seed done; needs an agent image rebuild to deploy. Diagnosed from session `4b82e6db |
-| [codex_session_gateway_baseurl_401](codex_session_gateway_baseurl_401.md) | FIX IMPLEMENTED** (develop, uncommitted) · root cause confirmed + empirically verified on dev · fix + RED-verified regression tests green locally (161 |
-| [expert_prompts_shadowed_by_family_variants](expert_prompts_shadowed_by_family_variants.md) | Part 1 **implemented, verified on k3d, and committed** (2026-06-25). |
-| [jobs_repo_clone_timeout_abandons_healthy_transfer](jobs_repo_clone_timeout_abandons_healthy_transfer.md) | fix implemented on `develop` 2026-07-19 (clone wait-and-verify in |
-| [llm_infra_404_misclassified_permanent_kills_jobs](llm_infra_404_misclassified_permanent_kills_jobs.md) | Slices 1–3 BUILT (2026-07-18), unit-tested (`test_graph_helpers.py` |
-| [openrouter_auxiliary_crashes_session_via_memory_reranker](openrouter_auxiliary_crashes_session_via_memory_reranker.md) | investigated + fix decided + **IMPLEMENTED & k3d-verified 2026-07-03 |
-| [openrouter_auxiliary_misrouted_to_openai](openrouter_auxiliary_misrouted_to_openai.md) | ROOT-CAUSED + FIXED (uncommitted on `develop`); unit-tested; live |
-| [persistent_session_idle_expiry_message_swallow](persistent_session_idle_expiry_message_swallow.md) | Fix implemented on `fix/bff-idle-session-message-swallow` (2026-06-23) · root cause **confirmed + isolated to the idle branch** + **reproduced end-to- |
-| [remove_litellm_proxy_and_gateway_concept](remove_litellm_proxy_and_gateway_concept.md) | REMOVAL IMPLEMENTED.** We removed the self-hosted LiteLLM proxy and, with it, the "route all LLM traffic through a self-hosted gateway" concept — **fo |
-| [remove_local_browser_fallback](remove_local_browser_fallback.md) | Implemented on develop 2026-06-11 — full inventory removed (plus |
-| [reranker_transient_fault_hard_fails_job](reranker_transient_fault_hard_fails_job.md) | investigated 2026-07-04; **fix A+B IMPLEMENTED 2026-07-05** — bounded transient-only retry in `RerankerScorer._rerank` (2 extra attempts, exponential |
-| [session_empty_response_gpt5_codex_stop](session_empty_response_gpt5_codex_stop.md) | Mitigation implemented 2026-06-23** (develop, branch `fix/session-empty-response-retry`) · root cause **isolated, not synthetically reproducible** (≈1 |
-| [session_reliability_investigation_index](session_reliability_investigation_index.md) | All docs listed here are **uncommitted on `develop`** as of 2026-07-02 (except where a doc notes its own fix has been implemented). |
-| [session_silent_failure_audit](session_silent_failure_audit.md) | 2026-06-12 — #1, #2, #3, #8, #9, #10, #11, #12, #13, #14, #16 **implemented** (same day, unit-verified: pytest + vitest green, not yet cluster-verifie |
-| [session_turn_end_cloud_push_blocks_queued_input](session_turn_end_cloud_push_blocks_queued_input.md) | FIX BUILT 2026-08-06 — see "The fix" below. Live repro on dev |
-| [session_uploads_never_extract_archives](session_uploads_never_extract_archives.md) | IMPLEMENTED 2026-08-02 on `develop`, not pushed and not |
-| [shell_cwd_drifts_and_the_anchor_is_unreachable](shell_cwd_drifts_and_the_anchor_is_unreachable.md) | IMPLEMENTED** in `f41970ae` (all four slices, 15 files) and documented in `e7d29b2d`, |
-| [subjob_inherits_stale_workspace_container_snapshot](subjob_inherits_stale_workspace_container_snapshot.md) | FIX IMPLEMENTED + k3d-verified 2026-07-10, UNCOMMITTED. Root cause |
-| [tool_configuration_defects_and_fix_roadmap](tool_configuration_defects_and_fix_roadmap.md) | IMPLEMENTED **and live-gated** 2026-08-02/03 on `develop`, **not |
-| [vm_ssh_readiness_probe_unroutable_from_orchestrator](vm_ssh_readiness_probe_unroutable_from_orchestrator.md) | IMPLEMENTED (2026-07-09, uncommitted on `develop`) — root cause confirmed |
+| [llm_infra_404_misclassified_permanent_kills_jobs](llm_infra_404_misclassified_permanent_kills_jobs.md) | Slices 1–3 SHIPPED (code since relocated to `src/core/llm_retry.py`); Slice 4 (reranker parity) not built; k3d e2e outage replay owed |
+| [session_reliability_investigation_index](session_reliability_investigation_index.md) | Index doc — accurate as written (spot-checked 08-06; its one ✅ claim verified; the CLAUDE.md routing staleness it flags is still true) |
+| [tool_configuration_defects_and_fix_roadmap](tool_configuration_defects_and_fix_roadmap.md) | Phases 0–3 shipped + pushed; open: Phase 2 literal YAML sweep (`session_base.yaml` still `shell: []`) + the job-mode reasoning-reset twin |
 
 ## Diagnosed / investigated, unranked (triage when touching the area)
 
+*(Batch #3 sweep, 2026-08-06: 18 rows verified fully shipped/superseded and
+moved to docs/done/; the corrected rows below carry the sweep's precise
+status.)*
+
 | doc | status |
 |---|---|
-| [agent_tool_fixed_vocabularies_invisible_to_model](agent_tool_fixed_vocabularies_invisible_to_model.md) | DIAGNOSED 2026-07-15 from live evidence + code audit (3-agent sweep) · P0–P5 BUILT + verified 2026-07-15 · UNCOMMITTED.** The failure was *observed*, |
-| [approving_a_critic_wedges_target_in_reviewing](approving_a_critic_wedges_target_in_reviewing.md) | CONFIRMED reachable in code. Not observed live — a DB check is |
-| [bound_skill_missing_from_resume_blob_deadlocks_phase_transition](bound_skill_missing_from_resume_blob_deadlocks_phase_transition.md) | Delivery-path defect CONFIRMED in code + live incident |
-| [critic_brief_lands_in_shared_workspace_and_misleads_target](critic_brief_lands_in_shared_workspace_and_misleads_target.md) | Observed live. Root cause is a direct interaction between two |
-| [datasource_cli_mode_dead_on_remote](datasource_cli_mode_dead_on_remote.md) | Diagnosed 2026-07-16 (live_session_settings.md P0.5 verification). |
-| [deprecate_docker_compose_stack](deprecate_docker_compose_stack.md) | Proposed. Migration to local k3d verified end-to-end 2026-05-28. |
-| [dev_snapshot_ssh_key_perms_0444](dev_snapshot_ssh_key_perms_0444.md) | - [x] Diagnosed + verified empirically (2026-06-22) |
-| [drain_freeze_overwrites_critic_verdict](drain_freeze_overwrites_critic_verdict.md) | CONFIRMED in code. No live incident identified yet — but the |
-| [feedback_resume_restricted_closure_toolset](feedback_resume_restricted_closure_toolset.md) | Observed 2026-07-26 on dev (job `52949749`, round-2 correction). |
-| [git_push_fails_silently_via_workspace_backend](git_push_fails_silently_via_workspace_backend.md) | Root cause found for the *silence*. The underlying push failure is |
+| [agent_tool_fixed_vocabularies_invisible_to_model](agent_tool_fixed_vocabularies_invisible_to_model.md) | P0–P5 BUILT + **COMMITTED `781285c9`** (sweep 08-06; 41/41 vocab tests green). Open: `sudo_request_status` Literal miss on REST/MCP filters + the disclosed tier-3 left-to-dos |
+| [approving_a_critic_wedges_target_in_reviewing](approving_a_critic_wedges_target_in_reviewing.md) | Reachable, unfixed — but severity downgraded to low (sweep 08-06): the ledger-aware unstick sweeper (`f2d054bd`) bounds the wedge at the grace window; no longer permanent |
+| [bound_skill_missing_from_resume_blob_deadlocks_phase_transition](bound_skill_missing_from_resume_blob_deadlocks_phase_transition.md) | Delivery-path defect CONFIRMED in code + live incident; still a silent skip at HEAD (re-verified 08-06) |
+| [deprecate_docker_compose_stack](deprecate_docker_compose_stack.md) | Proposed. Migration to local k3d verified end-to-end 2026-05-28; zero acceptance criteria executed yet (re-verified 08-06) |
+| [drain_freeze_overwrites_critic_verdict](drain_freeze_overwrites_critic_verdict.md) | Overwrite still in code, but consequence structurally prevented for BOTH decision classes (critic ledger + batch #3 completion journal); severity low, guard = defense-in-depth |
+| [feedback_resume_restricted_closure_toolset](feedback_resume_restricted_closure_toolset.md) | Observed 2026-07-26 on dev (job `52949749`, round-2 correction); not yet root-caused (re-verified 08-06) |
+| [git_push_fails_silently_via_workspace_backend](git_push_fails_silently_via_workspace_backend.md) | Silence mechanism FIXED (`22b2511e`, landed via the sibling nested-repo doc — cross-linked 08-06); job `40efbb39`'s real push cause still undiagnosed |
 | [ide_settings_sweeper_probes_stale_workspace_endpoints](ide_settings_sweeper_probes_stale_workspace_endpoints.md) | **FIXED 08-06 (batch #2)** + live-verified (worklist 48→1, zero dead-endpoint probes, evictor + leader gate). Residual hardening only: dial the stable Service DNS instead of pod_ip. |
-| [jsonb_isinstance_guard_without_parse_silent_dead_paths](jsonb_isinstance_guard_without_parse_silent_dead_paths.md) | Mechanism CONFIRMED in code. Individual instances tagged below — |
-| [local_e2e_testing](local_e2e_testing.md) | response** (published by simulator): |
-| [loop_advance_nonatomic_wedges_loop](loop_advance_nonatomic_wedges_loop.md) | investigated 2026-07-05 — root cause confirmed end-to-end from the live wedge, incident recovered by hand; **fix 2 (sweeper self-heal) IMPLEMENTED & k |
-| [loop_job_workspace_lost_wedged_in_recovery](loop_job_workspace_lost_wedged_in_recovery.md) | Investigated on the live main cluster + a 5-agent code audit (2026-06-29). The recovery state machine is now **fully traced at code level** and the me |
-| [loop_subagent_forensics](loop_subagent_forensics.md) | Analysis / findings.** The `spawn_subagent` light fan-out is **LIVE and working** on the |
-| [main_cloud](main_cloud.md) | Audit / issues log — *not* a design doc. Captured 2026-06-05; **resolutions tracked inline (per-issue Status lines + the Status column below); last up |
-| [maxsessions_parallel_tools_false_workspace_death](maxsessions_parallel_tools_false_workspace_death.md) | Designed 2026-07-24 from the 2026-07-23 incident (job `52949749`, |
-| [mcp_client_timeout_retry_false_failure_shared_auth_headers](mcp_client_timeout_retry_false_failure_shared_auth_headers.md) | Filed 2026-08-01 from the VM-session re-gate teardown (dev, |
-| [orchestrator_mongodb_cascading_failure_resilience](orchestrator_mongodb_cascading_failure_resilience.md) | Architectural gap. Surfaced during the 2026-05-12 outage |
-| [orchestrator_tool_surface_fragmentation](orchestrator_tool_surface_fragmentation.md) | decided and in execution — see |
-| [persistent_session_runaway_generation_context_explosion](persistent_session_runaway_generation_context_explosion.md) | (updated 2026-06-11):** the *wedge* and the surrounding hardening are |
-| [persistent_session_swallowed_sends_and_truncated_history](persistent_session_swallowed_sends_and_truncated_history.md) | Root cause verified (all three). Fixes not started. |
+| [jsonb_isinstance_guard_without_parse_silent_dead_paths](jsonb_isinstance_guard_without_parse_silent_dead_paths.md) | 1 of 4 instances fixed (site 4 cockpit, `0ba7c754`); sites 1–3 byte-for-byte unchanged; `_get_vm_context()` helper exists but unapplied to sites 1–2 |
+| [loop_advance_nonatomic_wedges_loop](loop_advance_nonatomic_wedges_loop.md) | Superseded by Loop Unified Engine Phase 1 (07-19): atomicity achieved by the barrier rewrite; heal + age gate survive under new names; UI stalled badge still unbuilt |
+| [mcp_client_timeout_retry_false_failure_shared_auth_headers](mcp_client_timeout_retry_false_failure_shared_auth_headers.md) | Defects 2+3 FIXED via `99b87008` (client now `src/shared/orch_surface/`); defect 1 (flat 30s client timeout) open |
+| [orchestrator_tool_surface_fragmentation](orchestrator_tool_surface_fragmentation.md) | decided and in execution — S1 committed `99b87008`; next S2 (see unified_orchestrator_tool_surface.md) |
 | [phase_model_overhead_amnesia_loop](phase_model_overhead_amnesia_loop.md) | 🟡 **IN PROGRESS** — filed 2026-07-31 after a code-side deep |
 | ~~recovery_pause_repersists_stale_freeze_invisible_job~~ | **FIXED 08-06 (batch #2)**, moved to docs/done/ — completion freeze-echo guard + `pause_job_shed_freeze` on the recovery arm. |
 | [results](results.md) | pending_review, confidence 1.0 |
-| [scholar_selfprovisioned_workspace_misclassified_as_inherited](scholar_selfprovisioned_workspace_misclassified_as_inherited.md) | ROOT CAUSE CONFIRMED on live local k3d 2026-07-13 **and observed on |
-| [session_deliverables_in_workspace_output_not_in_cloud_files_button](session_deliverables_in_workspace_output_not_in_cloud_files_button.md) | Filed — root cause confirmed on live session `7692637b-9c60-4698-9875-b57ec34e66a6` (main cluster, cloud-mounted). **Reconfirmed + deeper root cause f |
-| [session_turn_hard_fails_on_transient_llm_outage](session_turn_hard_fails_on_transient_llm_outage.md) | investigated 2026-07-10 from session `4b82e6db`. **Track 0 (codex-proxy memory bump) SHIPPED + live** — `helm/values.yaml` codex-proxy limit 256Mi→2Gi |
-| [session_vm_backend_never_attaches](session_vm_backend_never_attaches.md) | Diagnosed 2026-07-26 from live dev thread |
-| [snapshot_restore_dead_for_jobs](snapshot_restore_dead_for_jobs.md) | Filed from a 5-agent code audit (2026-06-29) prompted by job `19707fa1`. **Confirmed at code level, not fixed.** This is the systemic sibling of `loop |
-| [subjob_trigger](subjob_trigger.md) | `pending_review` (should have been `reviewing` with critic spawned) |
-| [task_clearance_user_feedback](task_clearance_user_feedback.md) | Needs fix |
-| [transient_db_error_hard_fails_job_and_destroys_vm](transient_db_error_hard_fails_job_and_destroys_vm.md) | CONFIRMED against live dev (`--context main`). |
-| [vm_guest_boots_to_emergency_shell](vm_guest_boots_to_emergency_shell.md) | Observed 2026-07-26 on dev, VM |
-| [vm_session_thread_repo_clone_unroutable_gitea_url](vm_session_thread_repo_clone_unroutable_gitea_url.md) | Filed 2026-08-01 from the VM-session re-gate (dev, image `sha-99c9aba`, |
-| [vm_upgrade_pause_workspace_reaped_before_approval](vm_upgrade_pause_workspace_reaped_before_approval.md) | investigated 2026-07-08 from a live incident on the main cluster |
-| [vm_workspace_snapshot_unreachable_from_orchestrator](vm_workspace_snapshot_unreachable_from_orchestrator.md) | Found 2026-07-28 during the live gate of `6d66f7c4`; scope widened |
-| [web_search_masks_tavily_errors_as_no_results](web_search_masks_tavily_errors_as_no_results.md) | Filed — root cause confirmed on the live main cluster. The *quota* instance was fixed operationally (Tavily key usage limit raised, 2026-06-26); the * |
-| [workspace_suspension_infers_tier_from_metadata_presence](workspace_suspension_infers_tier_from_metadata_presence.md) | Found 2026-07-27 while fixing Defect 1 of |
+| [session_deliverables_in_workspace_output_not_in_cloud_files_button](session_deliverables_in_workspace_output_not_in_cloud_files_button.md) | Still present at HEAD (sweep 08-06): the Phase-4 skip mechanism explicitly excludes `rclone_mount`, so the default-driver orphan folder is unchanged |
+| [snapshot_restore_dead_for_jobs](snapshot_restore_dead_for_jobs.md) | Confirmed at code level, not fixed; A/B decision still unmade (re-verified 08-06: `check_idle_all` still has zero live callers, reap path still snapshot→delete) |
+| [task_clearance_user_feedback](task_clearance_user_feedback.md) | Core search_files bug fixed via the backend refactor (server-side grep); 5 design proposals unbuilt |
+| [transient_db_error_hard_fails_job_and_destroys_vm](transient_db_error_hard_fails_job_and_destroys_vm.md) | All 8 defects shipped + tested; the 2 named live-gate items (NetworkPolicy egress-block, VM Defect-1b reaper interaction) still owed (re-verified 08-06) |
+| [vm_guest_boots_to_emergency_shell](vm_guest_boots_to_emergency_shell.md) | Root cause undetermined; proposed no-register-timeout guard still absent (re-verified 08-06) |
+| [vm_session_thread_repo_clone_unroutable_gitea_url](vm_session_thread_repo_clone_unroutable_gitea_url.md) | Defect site confirmed live at HEAD (08-06): thread/session path still stores raw `git_remote_url`; the job path's `externalize_gitea_url` rewrite was never applied to it |
+| [vm_workspace_snapshot_unreachable_from_orchestrator](vm_workspace_snapshot_unreachable_from_orchestrator.md) | Partial fix shipped (`ed26ebfa`, skipped-capture honesty); persistent-rootdisk flag still default-off; live gate owed (re-verified 08-06) |
+| [web_search_masks_tavily_errors_as_no_results](web_search_masks_tavily_errors_as_no_results.md) | Error-masking defect verbatim unchanged at HEAD (re-verified 08-06): `_direct_web_search` still ignores `response["error"]` |
 
 ## No machine-readable status line (mostly notes/designs — triage on touch)
 
