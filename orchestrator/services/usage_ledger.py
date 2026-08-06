@@ -243,6 +243,68 @@ class StrictUsageEvent:
 
 
 @dataclass(frozen=True)
+class StrictUsageExpectation:
+    """Read-only verification contract for one immutable ledger row.
+
+    The full dedupe key is mandatory. ``expected_fields`` may contain any
+    allowlisted immutable ``usage_events`` column, enabling the cutover drain
+    to verify legacy rows that predate ``payload_hash`` while typed callers can
+    demand the complete frozen payload.
+    """
+
+    source: str
+    source_id: str
+    unit: str
+    ts: datetime
+    expected_fields: Mapping[str, Any]
+
+    def __post_init__(self) -> None:
+        if not self.source or not self.source_id or not self.unit:
+            raise ValueError("strict usage expectation requires a full dedupe key")
+        timestamp = self.ts
+        if timestamp.tzinfo is None or timestamp.utcoffset() is None:
+            raise ValueError("strict usage expectation ts must be timezone-aware")
+        timestamp = timestamp.astimezone(timezone.utc)
+        fields = dict(self.expected_fields)
+        if not fields:
+            raise ValueError("strict usage expectation requires immutable fields")
+        unknown = fields.keys() - set(_STRICT_USAGE_EVENT_FIELDS)
+        if unknown:
+            raise ValueError(
+                "strict usage expectation has unknown field(s): "
+                + ", ".join(sorted(unknown))
+            )
+        canonical_ts = timestamp.isoformat(timespec="microseconds").replace(
+            "+00:00", "Z"
+        )
+        key_values = {
+            "source": self.source,
+            "source_id": self.source_id,
+            "unit": self.unit,
+            "ts": canonical_ts,
+        }
+        for name, expected in key_values.items():
+            if (
+                name in fields
+                and _normalize_verified_value(name, fields[name]) != expected
+            ):
+                raise ValueError(
+                    f"strict usage expectation {name} differs from its dedupe key"
+                )
+        object.__setattr__(self, "ts", timestamp)
+        object.__setattr__(self, "expected_fields", fields)
+
+    @property
+    def dedupe_key(self) -> tuple[str, str, str, str]:
+        return (
+            self.source,
+            self.source_id,
+            self.unit,
+            self.ts.isoformat(timespec="microseconds").replace("+00:00", "Z"),
+        )
+
+
+@dataclass(frozen=True)
 class StrictUsagePublishResult:
     expected: int
     inserted: int
@@ -327,6 +389,45 @@ FROM unnest(
 ON CONFLICT (source, source_id, unit, ts) DO NOTHING
 """
 
+_LEGACY_FROZEN_EVENT_FIELDS = frozenset(
+    {
+        "ts",
+        "user_id",
+        "project_id",
+        "ref_kind",
+        "ref_id",
+        "category",
+        "resource",
+        "quantity",
+        "unit",
+        "rate_usd",
+        "cost_usd",
+        "source",
+        "source_id",
+        "details",
+    }
+)
+
+_STRICT_LEGACY_INSERT_SQL = """
+/* strict-usage:insert-expected */
+INSERT INTO usage_events (
+    ts, user_id, project_id, ref_kind, ref_id, category, resource,
+    quantity, unit, rate_usd, cost_usd, source, source_id, details
+)
+SELECT
+    event.ts, event.user_id, event.project_id, event.ref_kind, event.ref_id,
+    event.category, event.resource, event.quantity, event.unit,
+    event.rate_usd, event.cost_usd, event.source, event.source_id,
+    event.details
+FROM jsonb_to_recordset($1::jsonb) AS event(
+    ts timestamptz, user_id uuid, project_id uuid, ref_kind text, ref_id uuid,
+    category text, resource text, quantity numeric, unit text,
+    rate_usd numeric, cost_usd numeric, source text, source_id text,
+    details jsonb
+)
+ON CONFLICT (source, source_id, unit, ts) DO NOTHING
+"""
+
 _STRICT_ATTACHED_PARTITIONS_SQL = """
 /* strict-usage:attached-partitions */
 SELECT child.relname
@@ -407,6 +508,174 @@ LEFT JOIN usage_events actual
 ORDER BY expected.source, expected.source_id, expected.unit, expected.ts
 """
 
+_STRICT_EXPECTATION_VERIFY_SQL = """
+/* strict-usage:verify-expected */
+WITH expected AS (
+    SELECT *
+    FROM jsonb_to_recordset($1::jsonb) AS item(
+        ordinal integer, source text, source_id text, unit text,
+        ts timestamptz
+    )
+)
+SELECT
+    expected.ordinal,
+    expected.source,
+    expected.source_id,
+    expected.unit,
+    to_char(expected.ts AT TIME ZONE 'UTC',
+            'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS ts,
+    actual.id IS NOT NULL AS present,
+    CASE WHEN actual.id IS NULL THEN NULL
+         ELSE to_jsonb(actual) - 'id'
+    END AS actual_payload
+FROM expected
+LEFT JOIN usage_events AS actual
+  ON actual.source = expected.source
+ AND actual.source_id = expected.source_id
+ AND actual.unit = expected.unit
+ AND actual.ts = expected.ts
+ORDER BY expected.ordinal
+"""
+
+_VERIFIED_NUMERIC_FIELDS = frozenset(
+    {"quantity", "rate_usd", "cost_usd", "source_capacity_value"}
+)
+_VERIFIED_UUID_FIELDS = frozenset(
+    {
+        "user_id",
+        "project_id",
+        "ref_id",
+        "source_lifecycle_id",
+        "source_interval_id",
+        "correction_group_id",
+        "correction_actor_id",
+    }
+)
+_VERIFIED_TIMESTAMP_FIELDS = frozenset(
+    {"ts", "period_start", "period_end", "corrects_ts", "discovered_at"}
+)
+
+
+def _canonical_verified_timestamp(value: Any) -> str:
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, str):
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise ValueError("verified timestamp is invalid") from exc
+    else:
+        raise ValueError("verified timestamp must be datetime or text")
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError("verified timestamp must be timezone-aware")
+    return (
+        parsed.astimezone(timezone.utc)
+        .isoformat(timespec="microseconds")
+        .replace("+00:00", "Z")
+    )
+
+
+def _normalize_verified_json(value: Any) -> Any:
+    if value is None or isinstance(value, bool | str):
+        return value
+    if isinstance(value, Decimal | int | float):
+        try:
+            number = Decimal(str(value))
+        except Exception as exc:
+            raise ValueError("verified JSON number is invalid") from exc
+        if not number.is_finite():
+            raise ValueError("verified JSON number must be finite")
+        return Decimal(0) if number.is_zero() else number.normalize()
+    if isinstance(value, Mapping):
+        return tuple(
+            (str(key), _normalize_verified_json(child))
+            for key, child in sorted(value.items(), key=lambda item: str(item[0]))
+        )
+    if isinstance(value, (list, tuple)):
+        return tuple(_normalize_verified_json(child) for child in value)
+    raise ValueError(f"unsupported verified JSON value: {type(value).__name__}")
+
+
+def _normalize_verified_value(field_name: str, value: Any) -> Any:
+    if value is None:
+        return None
+    if field_name in _VERIFIED_NUMERIC_FIELDS:
+        try:
+            parsed = Decimal(str(value))
+        except Exception as exc:
+            raise ValueError(f"{field_name} is not an exact decimal") from exc
+        if not parsed.is_finite():
+            raise ValueError(f"{field_name} must be finite")
+        return Decimal(0) if parsed.is_zero() else parsed.normalize()
+    if field_name in _VERIFIED_UUID_FIELDS:
+        return str(uuid.UUID(str(value)))
+    if field_name in _VERIFIED_TIMESTAMP_FIELDS:
+        return _canonical_verified_timestamp(value)
+    if field_name == "details":
+        if isinstance(value, str):
+            try:
+                value = json.loads(value, parse_float=Decimal, parse_int=Decimal)
+            except json.JSONDecodeError as exc:
+                raise ValueError("verified details is invalid JSON") from exc
+        return _normalize_verified_json(value)
+    return value
+
+
+def _decoded_json_object(value: Any) -> Mapping[str, Any]:
+    if isinstance(value, str):
+        decoded = json.loads(value, parse_float=Decimal, parse_int=Decimal)
+    else:
+        decoded = value
+    if not isinstance(decoded, Mapping):
+        raise StrictUsageConflict("audit verification payload is not an object")
+    return decoded
+
+
+def _verified_wire_value(field_name: str, value: Any) -> Any:
+    if field_name == "details":
+        if isinstance(value, str):
+            return json.loads(value)
+        return value
+    normalized = _normalize_verified_value(field_name, value)
+    if isinstance(normalized, Decimal):
+        return format(normalized, "f")
+    return normalized
+
+
+def _verify_expectation_rows(
+    expectations: Sequence[StrictUsageExpectation],
+    rows: Sequence[Mapping[str, Any]],
+) -> int:
+    if len(rows) != len(expectations):
+        raise StrictUsageConflict(
+            "audit verification returned an incomplete expectation set"
+        )
+    conflicts: list[str] = []
+    verified = 0
+    for ordinal, expectation in enumerate(expectations):
+        row = rows[ordinal]
+        if int(row["ordinal"]) != ordinal or not bool(row["present"]):
+            conflicts.append("/".join(expectation.dedupe_key) + ":missing")
+            continue
+        actual = _decoded_json_object(row["actual_payload"])
+        mismatched = []
+        for field_name, expected_value in expectation.expected_fields.items():
+            if field_name not in actual or _normalize_verified_value(
+                field_name, actual.get(field_name)
+            ) != _normalize_verified_value(field_name, expected_value):
+                mismatched.append(field_name)
+        if mismatched:
+            conflicts.append(
+                "/".join(expectation.dedupe_key) + ":" + ",".join(sorted(mismatched))
+            )
+        else:
+            verified += 1
+    if conflicts:
+        raise StrictUsageConflict(
+            "audit row missing or immutable field mismatch: " + "; ".join(conflicts[:3])
+        )
+    return verified
+
 
 class UsageLedger:
     """Write + raw-read surface for the ``usage_events`` ledger (auditdb)."""
@@ -418,6 +687,167 @@ class UsageLedger:
     @property
     def is_available(self) -> bool:
         return self._pool is not None
+
+    async def verify_frozen_events(
+        self, events: Sequence[StrictUsageEvent]
+    ) -> StrictUsagePublishResult:
+        """Verify complete typed payloads without inserting or repairing rows."""
+
+        return await self.verify_expected_events(
+            [
+                StrictUsageExpectation(
+                    source=str(event.payload["source"]),
+                    source_id=str(event.payload["source_id"]),
+                    unit=str(event.payload["unit"]),
+                    ts=event.timestamp,
+                    expected_fields=dict(event.payload),
+                )
+                for event in events
+            ]
+        )
+
+    async def verify_expected_events(
+        self, expectations: Sequence[StrictUsageExpectation]
+    ) -> StrictUsagePublishResult:
+        """Strictly verify existing rows by full key and immutable fields.
+
+        This read-only path is shared by typed correction planning and the
+        legacy cutover drain.  It never performs an insert, rate lookup, or
+        best-effort fallback.
+        """
+
+        if self._pool is None:
+            raise StrictUsageLedgerError("audit usage ledger is unavailable")
+        if not expectations:
+            raise ValueError("strict usage verification requires expectations")
+        keys = [expectation.dedupe_key for expectation in expectations]
+        if len(set(keys)) != len(keys):
+            raise ValueError("strict usage verification contains duplicate keys")
+
+        partitions = {
+            f"usage_events_p{item.ts.year:04d}_{item.ts.month:02d}"
+            for item in expectations
+        }
+        key_payload = json.dumps(
+            [
+                {
+                    "ordinal": ordinal,
+                    "source": item.source,
+                    "source_id": item.source_id,
+                    "unit": item.unit,
+                    "ts": item.dedupe_key[3],
+                }
+                for ordinal, item in enumerate(expectations)
+            ],
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+
+        async with self._pool.acquire() as conn:
+            async with conn.transaction(isolation="repeatable_read", readonly=True):
+                attached_rows = await conn.fetch(
+                    _STRICT_ATTACHED_PARTITIONS_SQL, sorted(partitions)
+                )
+                attached = {str(row["relname"]) for row in attached_rows}
+                missing = sorted(partitions - attached)
+                if missing:
+                    raise StrictUsagePartitionMissing(missing)
+                rows = await conn.fetch(_STRICT_EXPECTATION_VERIFY_SQL, key_payload)
+
+        verified = _verify_expectation_rows(expectations, rows)
+        return StrictUsagePublishResult(
+            expected=len(expectations),
+            inserted=0,
+            verified=verified,
+        )
+
+    async def publish_expected_events(
+        self, expectations: Sequence[StrictUsageExpectation]
+    ) -> StrictUsagePublishResult:
+        """Atomically repair frozen legacy 14-column rows and verify them.
+
+        Unlike :meth:`record_events`, this cutover-only boundary accepts
+        already-rated payloads, performs no mutable rate lookup, and rolls the
+        complete batch back if any pre-existing dedupe key differs.
+        """
+
+        if self._pool is None:
+            raise StrictUsageLedgerError("audit usage ledger is unavailable")
+        if not expectations:
+            raise ValueError("strict legacy publication requires expectations")
+        keys = [expectation.dedupe_key for expectation in expectations]
+        if len(set(keys)) != len(keys):
+            raise ValueError("strict legacy publication contains duplicate keys")
+        for expectation in expectations:
+            fields = set(expectation.expected_fields)
+            if fields != _LEGACY_FROZEN_EVENT_FIELDS:
+                missing = sorted(_LEGACY_FROZEN_EVENT_FIELDS - fields)
+                extra = sorted(fields - _LEGACY_FROZEN_EVENT_FIELDS)
+                problems = []
+                if missing:
+                    problems.append("missing " + ", ".join(missing))
+                if extra:
+                    problems.append("unknown " + ", ".join(extra))
+                raise ValueError(
+                    "strict legacy payload must freeze all 14 columns: "
+                    + "; ".join(problems)
+                )
+
+        partitions = {
+            f"usage_events_p{item.ts.year:04d}_{item.ts.month:02d}"
+            for item in expectations
+        }
+        payload_rows = [
+            {
+                field_name: _verified_wire_value(
+                    field_name,
+                    expectation.expected_fields[field_name],
+                )
+                for field_name in _LEGACY_FROZEN_EVENT_FIELDS
+            }
+            for expectation in expectations
+        ]
+        frozen_payload = json.dumps(
+            payload_rows,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        key_payload = json.dumps(
+            [
+                {
+                    "ordinal": ordinal,
+                    "source": item.source,
+                    "source_id": item.source_id,
+                    "unit": item.unit,
+                    "ts": item.dedupe_key[3],
+                }
+                for ordinal, item in enumerate(expectations)
+            ],
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+
+        async with self._pool.acquire() as conn:
+            async with conn.transaction():
+                attached_rows = await conn.fetch(
+                    _STRICT_ATTACHED_PARTITIONS_SQL, sorted(partitions)
+                )
+                attached = {str(row["relname"]) for row in attached_rows}
+                missing = sorted(partitions - attached)
+                if missing:
+                    raise StrictUsagePartitionMissing(missing)
+                status = await conn.execute(_STRICT_LEGACY_INSERT_SQL, frozen_payload)
+                inserted = int(str(status).split()[-1])
+                rows = await conn.fetch(_STRICT_EXPECTATION_VERIFY_SQL, key_payload)
+                verified = _verify_expectation_rows(expectations, rows)
+
+        return StrictUsagePublishResult(
+            expected=len(expectations),
+            inserted=inserted,
+            verified=verified,
+        )
 
     async def publish_frozen_events(
         self, events: Sequence[StrictUsageEvent]
@@ -781,6 +1211,12 @@ class UsageLedger:
 
 
 __all__ = [
+    "StrictUsageConflict",
+    "StrictUsageEvent",
+    "StrictUsageExpectation",
+    "StrictUsageLedgerError",
+    "StrictUsagePartitionMissing",
+    "StrictUsagePublishResult",
     "UsageEvent",
     "UsageRates",
     "UsageLedger",

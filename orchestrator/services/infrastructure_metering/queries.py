@@ -18,6 +18,7 @@ from typing import Any
 import asyncpg
 
 from .capabilities import MeteringSchemaCapabilities
+from .read_model import SourceAwareUsageReadModel
 from .types import (
     UsageCoverageV2,
     UsageRowV2,
@@ -133,13 +134,37 @@ class UsageV2QueryService:
         self,
         audit_pool: asyncpg.Pool | None,
         capabilities: MeteringSchemaCapabilities,
+        app_pool: asyncpg.Pool | None = None,
+        *,
+        source_aware_reads_enabled: bool = False,
     ):
         self._audit = audit_pool
         self._capabilities = capabilities
+        self._source_aware_reads_enabled = source_aware_reads_enabled
+        self._source_aware = (
+            SourceAwareUsageReadModel(audit_pool, app_pool)
+            if source_aware_reads_enabled
+            and audit_pool is not None
+            and app_pool is not None
+            else None
+        )
 
     @property
     def is_available(self) -> bool:
-        return self._audit is not None and self._capabilities.v2_reads_ready
+        legacy_ready = self._audit is not None and self._capabilities.v2_reads_ready
+        if not self._source_aware_reads_enabled:
+            return legacy_ready
+        return (
+            legacy_ready
+            and self._source_aware is not None
+            and self._capabilities.slice1_runtime_ready
+        )
+
+    @property
+    def source_aware_reads_enabled(self) -> bool:
+        """Expose the selected path without weakening its schema readiness gate."""
+
+        return self._source_aware_reads_enabled
 
     @property
     def capability_diagnostics(self) -> dict[str, Any]:
@@ -158,6 +183,16 @@ class UsageV2QueryService:
             raise RuntimeError("usage v2 schema is unavailable")
         if to_ts <= from_ts:
             raise ValueError("usage window end must be after its start")
+
+        if self._source_aware_reads_enabled:
+            assert self._source_aware is not None
+            return await self._source_aware.summary(
+                from_ts=from_ts,
+                to_ts=to_ts,
+                visibility=visibility,
+                ref_id=ref_id,
+                as_of=as_of,
+            )
 
         clauses: list[str] = []
         params: list[Any] = [

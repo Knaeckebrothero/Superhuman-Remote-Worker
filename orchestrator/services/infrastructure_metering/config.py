@@ -61,12 +61,14 @@ class InfrastructureMeteringSettings:
     ``publication_enabled`` is intentionally the strictest gate. Merely
     enabling v2 reads or shadow collection can never cause ledger writes.
     Runtime schema/source capability checks provide a second, independent
-    publication fence once Slice 1 adds the publisher.
+    publication fence around the Slice 1 publisher.
     """
 
     v2_reads_enabled: bool = False
+    source_aware_reads_enabled: bool = False
     collector_enabled: bool = False
     shadow_enabled: bool = False
+    cutover_enabled: bool = False
     publication_enabled: bool = False
     stable_cluster_id: str = ""
     deployment_mode: Literal["dedicated", "in-process"] = "dedicated"
@@ -98,8 +100,16 @@ class InfrastructureMeteringSettings:
             )
         settings = cls(
             v2_reads_enabled=_flag(env, "INFRASTRUCTURE_METERING_V2_READS_ENABLED"),
+            source_aware_reads_enabled=_flag(
+                env,
+                "INFRASTRUCTURE_METERING_SOURCE_AWARE_READS_ENABLED",
+            ),
             collector_enabled=_flag(env, "INFRASTRUCTURE_METERING_COLLECTOR_ENABLED"),
             shadow_enabled=_flag(env, "INFRASTRUCTURE_METERING_SHADOW_ENABLED"),
+            cutover_enabled=_flag(
+                env,
+                "INFRASTRUCTURE_METERING_CUTOVER_ENABLED",
+            ),
             publication_enabled=_flag(
                 env, "INFRASTRUCTURE_METERING_PUBLICATION_ENABLED"
             ),
@@ -224,6 +234,35 @@ class InfrastructureMeteringSettings:
                 "infrastructure metering diagnostic retention must be greater "
                 "than or equal to snapshot-item retention"
             )
+        if self.source_aware_reads_enabled and not self.v2_reads_enabled:
+            raise ValueError(
+                "infrastructure metering source-aware reads require v2 reads"
+            )
+        if self.source_aware_reads_enabled:
+            missing: list[str] = []
+            if not self.collector_enabled:
+                missing.append("collector")
+            if not self.shadow_enabled:
+                missing.append("shadow")
+            if not self.stable_cluster_id:
+                missing.append("stable cluster id")
+            if missing:
+                raise ValueError(
+                    "infrastructure metering source-aware reads require "
+                    + ", ".join(missing)
+                )
+        if self.cutover_enabled:
+            missing = []
+            if not self.collector_enabled:
+                missing.append("collector")
+            if not self.shadow_enabled:
+                missing.append("shadow")
+            if not self.stable_cluster_id:
+                missing.append("stable cluster id")
+            if missing:
+                raise ValueError(
+                    "infrastructure metering cutover requires " + ", ".join(missing)
+                )
         if self.publication_enabled:
             missing: list[str] = []
             if not self.collector_enabled:

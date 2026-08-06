@@ -105,6 +105,13 @@ class _AuditConnection:
         return self.snapshot_rows if self.snapshot_rows is not None else self.pool.rows
 
     async def fetch(self, sql, *args):
+        if "typed-rollup:seed-event-free-dirty" in sql:
+            inserted = []
+            for day in args[0]:
+                if day not in self.pool.dirty:
+                    self.pool.dirty[day] = 1
+                    inserted.append({"day": day})
+            return inserted
         if "typed-rollup:pending-dirty" in sql:
             days, revisions, through_day, limit = args
             applied = dict(zip(days, revisions))
@@ -215,6 +222,32 @@ class _AppConnection:
                 for day, state in sorted(self.pool.applied.items())
                 if day <= through_day
             ]
+        if "typed-rollup:stale-coverage-revisions" in sql:
+            through_day, limit = args
+            if self.pool.cutover_day is None:
+                return []
+            return [
+                {"day": day}
+                for day, coverage in sorted(self.pool.coverage.items())
+                if day <= through_day
+                and day >= self.pool.cutover_day
+                and coverage["state"] == "sealed"
+                and day in self.pool.applied
+                and self.pool.applied[day].get("infra_coverage_revision")
+                != coverage.get("coverage_revision")
+            ][:limit]
+        if "typed-rollup:missing-rollup-days" in sql:
+            through_day, limit = args
+            if self.pool.cutover_day is None:
+                return []
+            return [
+                {"day": day}
+                for day, coverage in sorted(self.pool.coverage.items())
+                if day <= through_day
+                and day >= self.pool.cutover_day
+                and coverage["state"] == "sealed"
+                and day not in self.pool.applied
+            ][:limit]
         if "typed-rollup:app-day-rows" in sql:
             return copy.deepcopy(self.pool.daily.get(args[0], []))
         raise AssertionError(f"unexpected app fetch: {sql}")
@@ -242,14 +275,26 @@ class _AppConnection:
 
     async def fetchval(self, sql, *args):
         if "typed-rollup:cas-day-state" in sql:
-            day, revision, coverage_status, unknown_ranges = args
+            (
+                day,
+                revision,
+                coverage_status,
+                unknown_ranges,
+                infra_coverage_revision,
+            ) = args
             current = self.pool.applied.get(day)
-            if current is not None and current["revision"] >= revision:
-                return None
+            if current is not None:
+                if current["revision"] > revision or (
+                    current["revision"] == revision
+                    and current.get("infra_coverage_revision")
+                    == infra_coverage_revision
+                ):
+                    return None
             self.pool.applied[day] = {
                 "revision": revision,
                 "coverage_status": coverage_status,
                 "unknown_ranges": json.loads(unknown_ranges),
+                "infra_coverage_revision": infra_coverage_revision,
             }
             return revision
         if "typed-rollup:advance-watermark" in sql:
@@ -555,6 +600,7 @@ async def test_repeatable_read_race_leaves_higher_revision_for_next_pass():
 
     assert first.applied == 1
     assert app.applied[day]["revision"] == 1
+    assert app.applied[day]["infra_coverage_revision"] is None
     assert app.daily[day][0]["quantity"] == Decimal(1)
     assert audit.transaction_options[0] == {
         "isolation": "repeatable_read",
@@ -666,13 +712,81 @@ async def test_infrastructure_day_requires_an_explicit_seal():
     app.coverage[day] = {
         "state": "sealed",
         "coverage_status": "partial",
+        "coverage_revision": "coverage-revision-1",
         "unknown_ranges": [{"start": "2026-08-01T01:00:00Z"}],
     }
     result = await TypedUsageDailyRollup(audit, app)._apply_snapshot(snapshot)
     assert result.disposition is ApplyDisposition.APPLIED
     assert app.applied[day]["coverage_status"] == "partial"
     assert app.applied[day]["unknown_ranges"] == app.coverage[day]["unknown_ranges"]
+    assert app.applied[day]["infra_coverage_revision"] == "coverage-revision-1"
     assert app.watermark == day
+
+
+@pytest.mark.asyncio
+async def test_sealed_day_without_a_coverage_revision_fails_closed():
+    day = date(2026, 8, 1)
+    app = _AppPool()
+    app.coverage[day] = {
+        "state": "sealed",
+        "coverage_status": "complete",
+        "coverage_revision": None,
+        "unknown_ranges": [],
+    }
+    snapshot = AuditDaySnapshot(
+        day,
+        1,
+        (DailyUsageRow.from_record(_aggregate_row(has_infrastructure_v2=True)),),
+        requires_infrastructure_seal=True,
+    )
+
+    with pytest.raises(RollupContractError, match="no coverage revision"):
+        await TypedUsageDailyRollup(_AuditPool(), app)._apply_snapshot(snapshot)
+
+    assert app.applied == {}
+    assert app.daily == {}
+
+
+@pytest.mark.asyncio
+async def test_coverage_only_revision_change_reapplies_same_audit_revision():
+    day = date(2026, 8, 1)
+    audit = _AuditPool(
+        {day: [_aggregate_row(has_infrastructure_v2=True)]},
+        {day: 1},
+    )
+    app = _AppPool()
+    app.cutover_day = day
+    app.coverage[day] = {
+        "state": "sealed",
+        "coverage_status": "complete",
+        "coverage_revision": "coverage-revision-1",
+        "unknown_ranges": [],
+    }
+    rollup = TypedUsageDailyRollup(audit, app)
+
+    first = await rollup.run_pass(through_day=day, limit=1)
+    assert first.applied == 1
+    assert app.applied[day]["revision"] == 1
+    assert app.applied[day]["infra_coverage_revision"] == "coverage-revision-1"
+
+    app.coverage[day] = {
+        "state": "sealed",
+        "coverage_status": "partial",
+        "coverage_revision": "coverage-revision-2",
+        "unknown_ranges": [{"start": "2026-08-01T12:00:00Z"}],
+    }
+    second = await rollup.run_pass(through_day=day, limit=1)
+
+    assert second.selected == 1
+    assert second.applied == 1
+    assert second.stale == 0
+    assert app.applied[day] == {
+        "revision": 1,
+        "coverage_status": "partial",
+        "unknown_ranges": [{"start": "2026-08-01T12:00:00Z"}],
+        "infra_coverage_revision": "coverage-revision-2",
+    }
+    assert len(app.daily[day]) == 1
 
 
 @pytest.mark.asyncio
@@ -727,6 +841,67 @@ async def test_event_free_pass_advances_only_when_no_infra_seal_is_required():
     result = await TypedUsageDailyRollup(audit, app).run_pass(through_day=next_day)
     assert result.blocked_day == next_day
     assert app.watermark == through
+
+
+@pytest.mark.asyncio
+async def test_event_free_sealed_day_is_seeded_and_rolls_exact_coverage_revision():
+    day = date(2026, 8, 3)
+    audit = _AuditPool()
+    app = _AppPool()
+    app.cutover_day = day
+    app.coverage[day] = {
+        "state": "sealed",
+        "coverage_status": "partial",
+        "coverage_revision": "event-free-coverage-revision",
+        "unknown_ranges": [{"start": "2026-08-03T12:00:00Z"}],
+    }
+
+    result = await TypedUsageDailyRollup(audit, app).run_pass(
+        through_day=day,
+        limit=1,
+    )
+
+    assert result.selected == 1
+    assert result.applied == 1
+    assert result.rows == 0
+    assert audit.dirty[day] == 1
+    assert app.applied[day] == {
+        "revision": 1,
+        "coverage_status": "partial",
+        "unknown_ranges": [{"start": "2026-08-03T12:00:00Z"}],
+        "infra_coverage_revision": "event-free-coverage-revision",
+    }
+    assert app.daily[day] == []
+    assert app.watermark == day
+
+
+@pytest.mark.asyncio
+async def test_event_free_day_seeding_remains_bounded_and_pending():
+    first_day = date(2026, 8, 3)
+    second_day = first_day + timedelta(days=1)
+    audit = _AuditPool()
+    app = _AppPool()
+    app.cutover_day = first_day
+    for day in (first_day, second_day):
+        app.coverage[day] = {
+            "state": "sealed",
+            "coverage_status": "complete",
+            "coverage_revision": f"coverage-{day.isoformat()}",
+            "unknown_ranges": [],
+        }
+    rollup = TypedUsageDailyRollup(audit, app)
+
+    first = await rollup.run_pass(through_day=second_day, limit=1)
+    assert first.selected == first.applied == 1
+    assert set(app.applied) == {first_day}
+    assert set(audit.dirty) == {first_day}
+    assert app.watermark == first_day
+
+    second = await rollup.run_pass(through_day=second_day, limit=1)
+    assert second.selected == second.applied == 1
+    assert set(app.applied) == {first_day, second_day}
+    assert set(audit.dirty) == {first_day, second_day}
+    assert app.watermark == second_day
 
 
 @pytest.mark.asyncio
@@ -821,11 +996,13 @@ async def test_empty_bootstrap_requires_day_seals_after_cutover():
     app.coverage[cutover] = {
         "state": "sealed",
         "coverage_status": "complete",
+        "coverage_revision": "cutover-coverage-revision",
         "unknown_ranges": [],
     }
     app.coverage[through] = {
         "state": "sealed",
         "coverage_status": "complete",
+        "coverage_revision": "through-coverage-revision",
         "unknown_ranges": [],
     }
     result = await TypedUsageDailyRollup(audit, app).run_bootstrap_step(

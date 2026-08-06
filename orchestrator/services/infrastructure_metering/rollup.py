@@ -9,9 +9,10 @@ The correctness boundary is split in two:
 
 * one read-only, repeatable-read audit snapshot selects dirty revisions and
   aggregates each complete UTC day; and
-* one app transaction claims a strictly newer revision, full-replaces that
-  day's rows, copies its sealed coverage decision, and advances the watermark
-  only when no unsealed infrastructure day would be crossed.
+* one app transaction claims a newer audit revision or a changed sealed
+  coverage revision, full-replaces that day's rows, copies the exact coverage
+  decision, and advances the watermark only when no unsealed infrastructure
+  day would be crossed.
 
 An audit insert racing the snapshot increments the dirty revision outside that
 snapshot.  The app records only the revision it actually read, so the higher
@@ -29,7 +30,7 @@ from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from enum import StrEnum
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Mapping, Sequence
 
 import asyncpg
 
@@ -91,6 +92,47 @@ _APPLIED_REVISIONS_SQL = """
 SELECT day, applied_audit_revision
 FROM usage_rollup_day_state
 WHERE day <= $1
+"""
+
+_STALE_COVERAGE_REVISIONS_SQL = """
+/* typed-rollup:stale-coverage-revisions */
+SELECT rollup.day
+FROM usage_rollup_day_state AS rollup
+JOIN infra_usage_day_state AS infra ON infra.day = rollup.day
+JOIN infra_metering_control AS control ON control.singleton = TRUE
+WHERE rollup.day <= $1
+  AND control.cutover_state IN ('preparing', 'active')
+  AND control.cutover_at IS NOT NULL
+  AND rollup.day >= (control.cutover_at AT TIME ZONE 'UTC')::date
+  AND infra.state = 'sealed'
+  AND rollup.infra_coverage_revision IS DISTINCT FROM infra.coverage_revision
+ORDER BY rollup.day
+LIMIT $2
+"""
+
+_MISSING_ROLLUP_DAYS_SQL = """
+/* typed-rollup:missing-rollup-days */
+SELECT infra.day
+FROM infra_usage_day_state AS infra
+JOIN infra_metering_control AS control ON control.singleton = TRUE
+LEFT JOIN usage_rollup_day_state AS rollup ON rollup.day = infra.day
+WHERE infra.day <= $1
+  AND control.cutover_state IN ('preparing', 'active')
+  AND control.cutover_at IS NOT NULL
+  AND infra.day >= (control.cutover_at AT TIME ZONE 'UTC')::date
+  AND infra.state = 'sealed'
+  AND rollup.day IS NULL
+ORDER BY infra.day
+LIMIT $2
+"""
+
+_SEED_EVENT_FREE_DIRTY_SQL = """
+/* typed-rollup:seed-event-free-dirty */
+INSERT INTO usage_rollup_dirty_days (day, revision, updated_at)
+SELECT candidate.day, 1, now()
+FROM unnest($1::date[]) AS candidate(day)
+ON CONFLICT (day) DO NOTHING
+RETURNING day
 """
 
 _PENDING_DIRTY_SQL = """
@@ -220,7 +262,7 @@ ORDER BY
 
 _DAY_COVERAGE_SQL = """
 /* typed-rollup:day-coverage */
-SELECT state, coverage_status, unknown_ranges
+SELECT state, coverage_status, coverage_revision, unknown_ranges
 FROM infra_usage_day_state
 WHERE day = $1
 FOR SHARE
@@ -230,17 +272,25 @@ _CAS_DAY_STATE_SQL = """
 /* typed-rollup:cas-day-state */
 INSERT INTO usage_rollup_day_state (
     day, applied_audit_revision, coverage_status, unknown_ranges,
+    infra_coverage_revision,
     rolled_at, updated_at
 )
-VALUES ($1, $2, $3, $4::jsonb, now(), now())
+VALUES ($1, $2, $3, $4::jsonb, $5, now(), now())
 ON CONFLICT (day) DO UPDATE SET
     applied_audit_revision = EXCLUDED.applied_audit_revision,
     coverage_status = EXCLUDED.coverage_status,
     unknown_ranges = EXCLUDED.unknown_ranges,
+    infra_coverage_revision = EXCLUDED.infra_coverage_revision,
     rolled_at = EXCLUDED.rolled_at,
     updated_at = now()
 WHERE usage_rollup_day_state.applied_audit_revision
-      < EXCLUDED.applied_audit_revision
+          < EXCLUDED.applied_audit_revision
+   OR (
+        usage_rollup_day_state.applied_audit_revision
+            = EXCLUDED.applied_audit_revision
+        AND usage_rollup_day_state.infra_coverage_revision
+            IS DISTINCT FROM EXCLUDED.infra_coverage_revision
+   )
 RETURNING applied_audit_revision
 """
 
@@ -879,9 +929,16 @@ class TypedUsageDailyRollup:
         limit = _bounded_limit(limit)
         target = through_day or _closeable_day(now or datetime.now(timezone.utc))
         try:
+            await self._seed_missing_rollup_days(target, limit)
             applied_revisions = await self._applied_revisions(target)
+            coverage_refresh_days = await self._stale_coverage_revision_days(
+                target, limit
+            )
             snapshots = await self._read_pending_snapshots(
-                applied_revisions, target, limit
+                applied_revisions,
+                target,
+                limit,
+                coverage_refresh_days=coverage_refresh_days,
             )
             applied = stale = rows = 0
             watermark: date | None = None
@@ -916,7 +973,7 @@ class TypedUsageDailyRollup:
             # Once every dirty revision through the close boundary is applied,
             # close event-free days too. The cutover-aware seal query below is
             # what makes this empty-ledger shortcut safe.
-            if not await self._has_pending_revision(target):
+            if not await self._has_pending_work(target):
                 blocked_day, advanced = await self._advance_watermark_through(target)
                 watermark = advanced or watermark
                 if blocked_day is not None:
@@ -992,7 +1049,7 @@ class TypedUsageDailyRollup:
                     rollup=rollup_result,
                     blocked_day=rollup_result.blocked_day,
                 )
-            if await self._has_pending_revision(seeded_through):
+            if await self._has_pending_work(seeded_through):
                 return BootstrapStepResult(
                     True,
                     BootstrapStatus.RECONCILING,
@@ -1031,7 +1088,7 @@ class TypedUsageDailyRollup:
             # A final revision comparison closes the race between the earlier
             # rollup pass and reconciliation. A later insert remains ordinary
             # dirty-day work after bootstrap, exactly like any other late row.
-            if await self._has_pending_revision(seeded_through):
+            if await self._has_pending_work(seeded_through):
                 return BootstrapStepResult(
                     True,
                     BootstrapStatus.RECONCILING,
@@ -1080,11 +1137,58 @@ class TypedUsageDailyRollup:
         rows = await self._app.fetch(_APPLIED_REVISIONS_SQL, through_day)
         return {row["day"]: int(row["applied_audit_revision"]) for row in rows}
 
+    async def _seed_missing_rollup_days(self, through_day: date, limit: int) -> None:
+        """Give sealed event-free days a positive, replay-safe audit revision."""
+
+        assert self._app is not None and self._audit is not None
+        rows = await self._app.fetch(
+            _MISSING_ROLLUP_DAYS_SQL,
+            through_day,
+            _bounded_limit(limit),
+        )
+        days: list[date] = []
+        for row in rows:
+            day = row["day"]
+            if not isinstance(day, date) or isinstance(day, datetime):
+                raise RollupContractError("missing rollup day is invalid")
+            if days and day <= days[-1]:
+                raise RollupContractError(
+                    "missing rollup days are not strictly ordered"
+                )
+            days.append(day)
+        if not days:
+            return
+        async with self._audit.acquire() as conn:
+            await conn.fetch(_SEED_EVENT_FREE_DIRTY_SQL, days)
+
+    async def _stale_coverage_revision_days(
+        self, through_day: date, limit: int
+    ) -> tuple[date, ...]:
+        assert self._app is not None
+        rows = await self._app.fetch(
+            _STALE_COVERAGE_REVISIONS_SQL,
+            through_day,
+            _bounded_limit(limit),
+        )
+        days: list[date] = []
+        for row in rows:
+            day = row["day"]
+            if not isinstance(day, date):
+                raise RollupContractError("stale coverage revision has invalid day")
+            if days and day <= days[-1]:
+                raise RollupContractError(
+                    "stale coverage revision days are not strictly ordered"
+                )
+            days.append(day)
+        return tuple(days)
+
     async def _read_pending_snapshots(
         self,
         applied_revisions: Mapping[date, int],
         through_day: date,
         limit: int,
+        *,
+        coverage_refresh_days: Sequence[date] = (),
     ) -> tuple[AuditDaySnapshot, ...]:
         assert self._audit is not None
         items = sorted(applied_revisions.items())
@@ -1099,11 +1203,38 @@ class TypedUsageDailyRollup:
                     through_day,
                     limit,
                 )
+                selected: dict[date, int] = {
+                    item["day"]: int(item["revision"]) for item in dirty
+                }
+                for day in coverage_refresh_days:
+                    if len(selected) >= limit:
+                        break
+                    if day in selected:
+                        continue
+                    current = await conn.fetchrow(
+                        "/* typed-rollup:dirty-revision */ "
+                        "SELECT revision FROM usage_rollup_dirty_days WHERE day = $1",
+                        day,
+                    )
+                    if current is None:
+                        raise RollupContractError(
+                            "coverage refresh has no retained audit revision"
+                        )
+                    revision = int(current["revision"])
+                    applied = applied_revisions.get(day)
+                    if applied is None or revision < applied:
+                        raise RollupContractError(
+                            "coverage refresh audit revision precedes app state"
+                        )
+                    selected[day] = revision
+
                 snapshots = []
-                for item in dirty:
+                for day, revision in sorted(selected.items()):
                     snapshots.append(
                         await self._read_snapshot_in_transaction(
-                            conn, item["day"], int(item["revision"])
+                            conn,
+                            day,
+                            revision,
                         )
                     )
                 return tuple(snapshots)
@@ -1165,12 +1296,21 @@ class TypedUsageDailyRollup:
                     if coverage_row is not None
                     else []
                 )
+                infra_coverage_revision: str | None = None
+                if coverage_row is not None:
+                    raw_revision = coverage_row["coverage_revision"]
+                    if not isinstance(raw_revision, str) or not raw_revision:
+                        raise RollupContractError(
+                            "sealed infrastructure day has no coverage revision"
+                        )
+                    infra_coverage_revision = raw_revision
                 claimed = await conn.fetchval(
                     _CAS_DAY_STATE_SQL,
                     snapshot.day,
                     snapshot.revision,
                     coverage_status,
                     json.dumps(unknown_ranges, separators=(",", ":")),
+                    infra_coverage_revision,
                 )
                 if claimed is None:
                     return DayApplyResult(
@@ -1274,6 +1414,31 @@ class TypedUsageDailyRollup:
                     1,
                 )
                 return row is not None
+
+    async def _has_pending_coverage_revision(self, through_day: date) -> bool:
+        assert self._app is not None
+        row = await self._app.fetchrow(
+            _STALE_COVERAGE_REVISIONS_SQL,
+            through_day,
+            1,
+        )
+        return row is not None
+
+    async def _has_missing_rollup_day(self, through_day: date) -> bool:
+        assert self._app is not None
+        row = await self._app.fetchrow(
+            _MISSING_ROLLUP_DAYS_SQL,
+            through_day,
+            1,
+        )
+        return row is not None
+
+    async def _has_pending_work(self, through_day: date) -> bool:
+        if await self._has_pending_revision(through_day):
+            return True
+        if await self._has_pending_coverage_revision(through_day):
+            return True
+        return await self._has_missing_rollup_day(through_day)
 
     async def _has_dirty_after(self, through_day: date, cursor: date | None) -> bool:
         assert self._audit is not None

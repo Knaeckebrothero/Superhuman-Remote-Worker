@@ -78,6 +78,85 @@ CREATE TYPE public.sudo_request_status AS ENUM (
 
 
 --
+-- Name: enforce_inventory_epoch_required_boundary(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.enforce_inventory_epoch_required_boundary() RETURNS trigger
+    LANGUAGE plpgsql SECURITY DEFINER
+    SET search_path TO 'pg_catalog'
+    AS $$
+DECLARE
+    durable_state TEXT;
+    durable_cutover TIMESTAMPTZ;
+BEGIN
+    SELECT cutover_state, cutover_at
+    INTO durable_state, durable_cutover
+    FROM public.infra_metering_control
+    WHERE singleton = TRUE
+    FOR SHARE;
+
+    IF TG_OP = 'UPDATE'
+       AND OLD.required_for_rollup
+       AND OLD.required_from IS NOT NULL
+       AND OLD.required_from = durable_cutover
+       AND (NEW.required_for_rollup IS DISTINCT FROM OLD.required_for_rollup
+            OR NEW.required_from IS DISTINCT FROM OLD.required_from) THEN
+        RAISE EXCEPTION 'initial cutover inventory boundary is immutable'
+            USING ERRCODE = '55000';
+    END IF;
+
+    IF NEW.required_from IS NULL
+       OR NEW.required_from = date_trunc('day', NEW.required_from, 'UTC') THEN
+        RETURN NEW;
+    END IF;
+
+    IF durable_state NOT IN ('preparing', 'active')
+       OR durable_cutover IS NULL
+       OR NEW.required_from IS DISTINCT FROM durable_cutover THEN
+        RAISE EXCEPTION
+            'inventory requirement must begin at UTC midnight or durable cutover'
+            USING ERRCODE = '23514';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: enforce_legacy_workspace_cutover_barrier(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.enforce_legacy_workspace_cutover_barrier() RETURNS trigger
+    LANGUAGE plpgsql SECURITY DEFINER
+    SET search_path TO 'pg_catalog'
+    AS $$
+DECLARE
+    current_state TEXT;
+BEGIN
+    IF TG_OP = 'UPDATE' THEN
+        IF OLD.ended_at IS NOT NULL
+           AND NEW.ended_at IS DISTINCT FROM OLD.ended_at THEN
+            RAISE EXCEPTION 'closed legacy workspace end is immutable'
+                USING ERRCODE = '55000';
+        END IF;
+        RETURN NEW;
+    END IF;
+
+    SELECT cutover_state INTO current_state
+    FROM public.infra_metering_control
+    WHERE singleton = TRUE
+    FOR SHARE;
+
+    IF current_state IS NULL OR current_state <> 'disabled' THEN
+        RAISE EXCEPTION 'legacy workspace inserts are disabled by metering cutover'
+            USING ERRCODE = '55000';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
 -- Name: enforce_resource_inventory_item_fence(); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -213,6 +292,56 @@ $$;
 
 
 --
+-- Name: lock_inventory_epoch_boundary_statement(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.lock_inventory_epoch_boundary_statement() RETURNS trigger
+    LANGUAGE plpgsql SECURITY DEFINER
+    SET search_path TO 'pg_catalog'
+    AS $$
+DECLARE
+    control_exists BOOLEAN;
+BEGIN
+    SELECT TRUE INTO control_exists
+    FROM public.infra_metering_control
+    WHERE singleton = TRUE
+    FOR SHARE;
+
+    IF control_exists IS DISTINCT FROM TRUE THEN
+        RAISE EXCEPTION 'infra metering control row is missing'
+            USING ERRCODE = '55000';
+    END IF;
+    RETURN NULL;
+END;
+$$;
+
+
+--
+-- Name: lock_legacy_workspace_insert_statement(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.lock_legacy_workspace_insert_statement() RETURNS trigger
+    LANGUAGE plpgsql SECURITY DEFINER
+    SET search_path TO 'pg_catalog'
+    AS $$
+DECLARE
+    control_exists BOOLEAN;
+BEGIN
+    SELECT TRUE INTO control_exists
+    FROM public.infra_metering_control
+    WHERE singleton = TRUE
+    FOR SHARE;
+
+    IF control_exists IS DISTINCT FROM TRUE THEN
+        RAISE EXCEPTION 'infra metering control row is missing'
+            USING ERRCODE = '55000';
+    END IF;
+    RETURN NULL;
+END;
+$$;
+
+
+--
 -- Name: notify_canvas_origin_session_change(); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -260,6 +389,90 @@ $$;
 
 
 --
+-- Name: protect_infra_metering_cutover_mutation(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.protect_infra_metering_cutover_mutation() RETURNS trigger
+    LANGUAGE plpgsql
+    SET search_path TO 'pg_catalog'
+    AS $$
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        RAISE EXCEPTION 'infra metering cutover control cannot be deleted'
+            USING ERRCODE = '55000';
+    END IF;
+
+    IF OLD.cutover_request_id IS NOT NULL AND (
+        NEW.cutover_request_id IS DISTINCT FROM OLD.cutover_request_id
+        OR NEW.cutover_actor_id IS DISTINCT FROM OLD.cutover_actor_id
+        OR NEW.cutover_reason IS DISTINCT FROM OLD.cutover_reason
+        OR NEW.cutover_requested_at IS DISTINCT FROM OLD.cutover_requested_at
+        OR NEW.barrier_committed_at IS DISTINCT FROM OLD.barrier_committed_at
+        OR NEW.cutover_at IS DISTINCT FROM OLD.cutover_at
+    ) THEN
+        RAISE EXCEPTION 'infrastructure metering cutover identity/barrier is immutable'
+            USING ERRCODE = '55000';
+    END IF;
+
+    IF OLD.cutover_state = 'disabled' THEN
+        IF NEW.cutover_state = 'disabled' THEN
+            IF NEW.cutover_phase <> 'disabled' THEN
+                RAISE EXCEPTION 'disabled metering cutover phase is immutable'
+                    USING ERRCODE = '55000';
+            END IF;
+        ELSIF NEW.cutover_state = 'preparing' THEN
+            IF NEW.cutover_phase <> 'legacy-draining'
+               OR NEW.cutover_request_id IS NULL
+               OR NEW.cutover_at IS NULL THEN
+                RAISE EXCEPTION 'cutover must enter preparing at legacy-draining'
+                    USING ERRCODE = '55000';
+            END IF;
+        ELSE
+            RAISE EXCEPTION 'cutover advances disabled to preparing only'
+                USING ERRCODE = '55000';
+        END IF;
+    ELSIF OLD.cutover_state = 'preparing' THEN
+        IF NEW.cutover_state = 'preparing' THEN
+            IF NOT (
+                NEW.cutover_phase = OLD.cutover_phase
+                OR (OLD.cutover_phase = 'legacy-draining'
+                    AND NEW.cutover_phase = 'ready-to-activate')
+            ) THEN
+                RAISE EXCEPTION 'preparing cutover phase cannot move backwards'
+                    USING ERRCODE = '55000';
+            END IF;
+            IF OLD.legacy_drained_at IS NOT NULL
+               AND NEW.legacy_drained_at IS DISTINCT FROM OLD.legacy_drained_at THEN
+                RAISE EXCEPTION 'legacy drain completion is immutable'
+                    USING ERRCODE = '55000';
+            END IF;
+        ELSIF NEW.cutover_state = 'active' THEN
+            IF OLD.cutover_phase <> 'ready-to-activate'
+               OR NEW.cutover_phase <> 'active'
+               OR NEW.activated_at IS NULL THEN
+                RAISE EXCEPTION 'cutover activates only after durable legacy drain'
+                    USING ERRCODE = '55000';
+            END IF;
+        ELSE
+            RAISE EXCEPTION 'preparing cutover cannot be disabled or replaced'
+                USING ERRCODE = '55000';
+        END IF;
+    ELSE
+        IF NEW.cutover_state IS DISTINCT FROM OLD.cutover_state
+           OR NEW.cutover_phase IS DISTINCT FROM OLD.cutover_phase
+           OR NEW.legacy_drained_at IS DISTINCT FROM OLD.legacy_drained_at
+           OR NEW.activated_at IS DISTINCT FROM OLD.activated_at THEN
+            RAISE EXCEPTION 'active infrastructure metering cutover is irreversible'
+                USING ERRCODE = '55000';
+        END IF;
+    END IF;
+
+    RETURN NEW;
+END;
+$$;
+
+
+--
 -- Name: protect_infra_metering_generation_mutation(); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -284,6 +497,25 @@ $$;
 
 
 --
+-- Name: protect_infra_metering_legacy_drain_completion(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.protect_infra_metering_legacy_drain_completion() RETURNS trigger
+    LANGUAGE plpgsql
+    SET search_path TO 'pg_catalog'
+    AS $$
+BEGIN
+    IF OLD.legacy_drained_at IS NOT NULL
+       AND NEW.legacy_drained_at IS DISTINCT FROM OLD.legacy_drained_at THEN
+        RAISE EXCEPTION 'legacy drain completion is immutable'
+            USING ERRCODE = '55000';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
 -- Name: protect_infra_usage_day_state_mutation(); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -293,36 +525,136 @@ CREATE FUNCTION public.protect_infra_usage_day_state_mutation() RETURNS trigger
     AS $$
 BEGIN
     IF TG_OP = 'INSERT' THEN
-        IF NEW.state <> 'open' THEN
+        IF NEW.state <> 'open' OR NEW.coverage_sequence <> 0 THEN
             RAISE EXCEPTION
-                'infrastructure usage day state must begin open'
+                'infrastructure usage day state must begin open at sequence zero'
                 USING ERRCODE = '55000';
         END IF;
         RETURN NEW;
     END IF;
 
     IF TG_OP = 'DELETE' THEN
-        RAISE EXCEPTION
-            'infrastructure usage day state cannot be deleted'
+        RAISE EXCEPTION 'infrastructure usage day state cannot be deleted'
+            USING ERRCODE = '55000';
+    END IF;
+
+    IF NEW.day IS DISTINCT FROM OLD.day
+       OR NEW.updated_at < OLD.updated_at THEN
+        RAISE EXCEPTION 'infrastructure usage day identity/time is immutable'
             USING ERRCODE = '55000';
     END IF;
 
     IF OLD.state = 'sealed' THEN
-        RAISE EXCEPTION
-            'sealed infrastructure usage days are immutable'
-            USING ERRCODE = '55000';
+        IF NEW.state <> 'sealed'
+           OR NEW.sealed_at IS DISTINCT FROM OLD.sealed_at
+           OR NEW.coverage_sequence <> OLD.coverage_sequence + 1
+           OR NEW.coverage_revision IS NULL
+           OR NEW.coverage_revision = ''
+           OR NEW.coverage_revision IS NOT DISTINCT FROM OLD.coverage_revision
+           OR NOT (OLD.unknown_ranges <@ NEW.unknown_ranges)
+           OR jsonb_array_length(NEW.unknown_ranges)
+                < jsonb_array_length(OLD.unknown_ranges)
+           OR EXISTS (
+                SELECT 1
+                FROM jsonb_array_elements(NEW.unknown_ranges) AS item(value)
+                GROUP BY item.value
+                HAVING count(*) > 1
+           )
+           OR NOT (
+                (OLD.coverage_status = 'complete'
+                    AND NEW.coverage_status = 'partial'
+                    AND jsonb_array_length(NEW.unknown_ranges) > 0)
+                OR
+                (OLD.coverage_status = 'partial'
+                    AND NEW.coverage_status = 'partial'
+                    AND jsonb_array_length(NEW.unknown_ranges)
+                        > jsonb_array_length(OLD.unknown_ranges))
+           ) THEN
+            RAISE EXCEPTION
+                'sealed infrastructure day may only gain fail-closed unknown ranges'
+                USING ERRCODE = '55000';
+        END IF;
+        RETURN NEW;
     END IF;
 
-    IF NEW.day <> OLD.day
-       OR NEW.updated_at < OLD.updated_at
-       OR (OLD.state = 'open' AND NEW.state NOT IN ('open', 'sealing'))
-       OR (OLD.state = 'sealing' AND NEW.state NOT IN ('sealing', 'sealed'))
-    THEN
+    IF (OLD.state = 'open' AND NEW.state NOT IN ('open', 'sealing'))
+       OR (OLD.state = 'sealing' AND NEW.state NOT IN ('sealing', 'sealed')) THEN
         RAISE EXCEPTION
             'infrastructure usage day state advances open to sealing to sealed'
             USING ERRCODE = '55000';
     END IF;
 
+    IF NEW.state = 'sealed' THEN
+        IF OLD.state <> 'sealing' OR NEW.coverage_sequence NOT IN (0, 1) THEN
+            RAISE EXCEPTION 'initial infrastructure day seal is invalid'
+                USING ERRCODE = '55000';
+        END IF;
+        NEW.coverage_sequence := 1;
+    ELSIF NEW.coverage_sequence <> 0 THEN
+        RAISE EXCEPTION 'unsealed infrastructure day has a coverage revision'
+            USING ERRCODE = '55000';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: protect_legacy_workspace_cutover_plan_event_mutation(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.protect_legacy_workspace_cutover_plan_event_mutation() RETURNS trigger
+    LANGUAGE plpgsql
+    SET search_path TO 'pg_catalog'
+    AS $$
+DECLARE
+    parent_state TEXT;
+BEGIN
+    IF TG_OP <> 'INSERT' THEN
+        RAISE EXCEPTION 'legacy workspace cutover plan events are immutable'
+            USING ERRCODE = '55000';
+    END IF;
+    SELECT state INTO parent_state
+    FROM public.legacy_workspace_cutover_plans
+    WHERE id = NEW.plan_id
+    FOR SHARE;
+    IF parent_state IS DISTINCT FROM 'planned' THEN
+        RAISE EXCEPTION 'legacy workspace cutover plan no longer accepts events'
+            USING ERRCODE = '55000';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: protect_legacy_workspace_cutover_plan_mutation(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.protect_legacy_workspace_cutover_plan_mutation() RETURNS trigger
+    LANGUAGE plpgsql
+    SET search_path TO 'pg_catalog'
+    AS $$
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        RAISE EXCEPTION 'legacy workspace cutover plans cannot be deleted'
+            USING ERRCODE = '55000';
+    END IF;
+    IF (to_jsonb(NEW)
+            - 'state' - 'attempt_count' - 'last_attempt_generation'
+            - 'last_attempt_at' - 'sanitized_error' - 'published_at')
+       <> (to_jsonb(OLD)
+            - 'state' - 'attempt_count' - 'last_attempt_generation'
+            - 'last_attempt_at' - 'sanitized_error' - 'published_at') THEN
+        RAISE EXCEPTION 'legacy workspace cutover plan intent is immutable'
+            USING ERRCODE = '55000';
+    END IF;
+    IF OLD.state <> 'planned'
+       OR NEW.state NOT IN ('planned', 'published', 'conflict')
+       OR NEW.attempt_count < OLD.attempt_count THEN
+        RAISE EXCEPTION 'legacy workspace cutover plan terminal/retry state is invalid'
+            USING ERRCODE = '55000';
+    END IF;
     RETURN NEW;
 END;
 $$;
@@ -336,12 +668,23 @@ CREATE FUNCTION public.protect_resource_interval_revision_mutation() RETURNS tri
     LANGUAGE plpgsql
     SET search_path TO 'pg_catalog'
     AS $$
+DECLARE
+    snapshot_end_link BOOLEAN;
 BEGIN
     IF TG_OP = 'DELETE' THEN
         RAISE EXCEPTION
             'resource interval revisions are retained and cannot be deleted'
             USING ERRCODE = '55000';
     END IF;
+
+    snapshot_end_link := OLD.ended_at IS NOT NULL
+        AND OLD.end_time_source = 'app-db-received'
+        AND OLD.end_reason IN ('not-applicable', 'terminal-or-unscheduled')
+        AND OLD.last_seen_at <= OLD.ended_at
+        AND NEW.last_seen_at = GREATEST(OLD.last_seen_at, OLD.ended_at)
+        AND NEW.last_seen_snapshot_id IS NOT NULL
+        AND NEW.last_seen_snapshot_id
+            IS DISTINCT FROM OLD.last_seen_snapshot_id;
 
     IF (to_jsonb(NEW)
             - 'ended_at' - 'end_time_source' - 'end_uncertainty_us'
@@ -372,9 +715,11 @@ BEGIN
            OR NEW.end_time_source IS DISTINCT FROM OLD.end_time_source
            OR NEW.end_uncertainty_us IS DISTINCT FROM OLD.end_uncertainty_us
            OR NEW.end_reason IS DISTINCT FROM OLD.end_reason
-           OR NEW.last_seen_at IS DISTINCT FROM OLD.last_seen_at
            OR NEW.last_confirmed_at IS DISTINCT FROM OLD.last_confirmed_at
-           OR NEW.last_seen_snapshot_id IS DISTINCT FROM OLD.last_seen_snapshot_id
+           OR (NOT snapshot_end_link AND (
+                NEW.last_seen_at IS DISTINCT FROM OLD.last_seen_at
+                OR NEW.last_seen_snapshot_id
+                    IS DISTINCT FROM OLD.last_seen_snapshot_id))
         THEN
             RAISE EXCEPTION
                 'closed interval evidence and end metadata are immutable'
@@ -1132,6 +1477,41 @@ $$;
 
 
 --
+-- Name: protect_usage_rate_v2_referenced_range(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.protect_usage_rate_v2_referenced_range() RETURNS trigger
+    LANGUAGE plpgsql SECURITY DEFINER
+    SET search_path TO 'pg_catalog'
+    AS $$
+DECLARE
+    blocking_plan UUID;
+BEGIN
+    IF OLD.effective_to IS NULL AND NEW.effective_to IS NOT NULL THEN
+        SELECT plan.id
+        INTO blocking_plan
+        FROM public.resource_publication_plan_events AS event
+        JOIN public.resource_publication_plans AS plan
+          ON plan.id = event.plan_id
+        WHERE event.canonical_rate_version_id = OLD.id
+          AND plan.state IN ('planned', 'published', 'conflict')
+          AND plan.period_end > NEW.effective_to
+        ORDER BY plan.period_end DESC, plan.id
+        LIMIT 1;
+
+        IF blocking_plan IS NOT NULL THEN
+            RAISE EXCEPTION
+                'usage rate % cannot close before retained publication plan % ends',
+                OLD.id, blocking_plan
+                USING ERRCODE = '55000';
+        END IF;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
 -- Name: protect_usage_rates_v2_mutation(); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -1320,6 +1700,55 @@ $$;
 
 
 --
+-- Name: serialize_resource_interval_statement_with_cutover(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.serialize_resource_interval_statement_with_cutover() RETURNS trigger
+    LANGUAGE plpgsql SECURITY DEFINER
+    SET search_path TO 'pg_catalog'
+    AS $$
+DECLARE
+    control_exists BOOLEAN;
+BEGIN
+    SELECT TRUE INTO control_exists
+    FROM public.infra_metering_control
+    WHERE singleton = TRUE
+    FOR SHARE;
+    IF control_exists IS DISTINCT FROM TRUE THEN
+        RAISE EXCEPTION 'infra metering control row is missing'
+            USING ERRCODE = '55000';
+    END IF;
+    RETURN NULL;
+END;
+$$;
+
+
+--
+-- Name: serialize_resource_lifecycle_head_with_cutover(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.serialize_resource_lifecycle_head_with_cutover() RETURNS trigger
+    LANGUAGE plpgsql SECURITY DEFINER
+    SET search_path TO 'pg_catalog'
+    AS $$
+DECLARE
+    control_exists BOOLEAN;
+BEGIN
+    SELECT TRUE INTO control_exists
+    FROM public.infra_metering_control
+    WHERE singleton = TRUE
+    FOR SHARE;
+
+    IF control_exists IS DISTINCT FROM TRUE THEN
+        RAISE EXCEPTION 'infra metering control row is missing'
+            USING ERRCODE = '55000';
+    END IF;
+    RETURN NULL;
+END;
+$$;
+
+
+--
 -- Name: update_updated_at_column(); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -1361,6 +1790,81 @@ $$;
 
 
 --
+-- Name: validate_inventory_watch_terminal_interval_evidence(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.validate_inventory_watch_terminal_interval_evidence() RETURNS trigger
+    LANGUAGE plpgsql SECURITY DEFINER
+    SET search_path TO 'pg_catalog'
+    AS $$
+DECLARE
+    evidence_ok BOOLEAN;
+BEGIN
+    IF NEW.mutation_action <> 'not-applicable'
+       OR NEW.affected_interval_id IS NULL THEN
+        RETURN NEW;
+    END IF;
+
+    SELECT TRUE INTO evidence_ok
+    FROM public.resource_inventory_scope_epochs epoch
+    JOIN public.resource_intervals interval
+      ON interval.inventory_scope_id = epoch.scope_id
+    WHERE epoch.id = NEW.scope_epoch_id
+      AND interval.id = NEW.affected_interval_id
+      AND interval.source_kind = NEW.source_kind
+      AND interval.source_uid = NEW.source_uid
+      AND interval.ended_at = NEW.received_at
+      AND interval.end_time_source = 'app-db-received'
+      AND interval.end_reason IN ('not-applicable', 'terminal-or-unscheduled');
+
+    IF evidence_ok IS DISTINCT FROM TRUE THEN
+        RAISE EXCEPTION
+            'not-applicable WATCH evidence does not match its terminal interval'
+            USING ERRCODE = '55000';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: validate_legacy_workspace_cutover_plan_manifest(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.validate_legacy_workspace_cutover_plan_manifest() RETURNS trigger
+    LANGUAGE plpgsql SECURITY DEFINER
+    SET search_path TO 'pg_catalog'
+    AS $$
+DECLARE
+    target_plan UUID;
+    expected_count INTEGER;
+    actual_count INTEGER;
+    min_ordinal INTEGER;
+    max_ordinal INTEGER;
+BEGIN
+    target_plan := COALESCE(
+        (to_jsonb(NEW) ->> 'id')::UUID,
+        (to_jsonb(NEW) ->> 'plan_id')::UUID
+    );
+    SELECT expected_event_count INTO expected_count
+    FROM public.legacy_workspace_cutover_plans WHERE id = target_plan;
+    SELECT count(*), min(ordinal), max(ordinal)
+    INTO actual_count, min_ordinal, max_ordinal
+    FROM public.legacy_workspace_cutover_plan_events
+    WHERE plan_id = target_plan;
+    IF expected_count IS NULL
+       OR actual_count <> expected_count
+       OR min_ordinal <> 0
+       OR max_ordinal <> expected_count - 1 THEN
+        RAISE EXCEPTION 'legacy workspace cutover plan manifest is incomplete'
+            USING ERRCODE = '55000';
+    END IF;
+    RETURN NULL;
+END;
+$$;
+
+
+--
 -- Name: validate_resource_interval_scope_identity(); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -1392,6 +1896,70 @@ BEGIN
         RAISE EXCEPTION
             'last_seen_snapshot_id must reference a sealed complete snapshot in the interval scope'
             USING ERRCODE = '23503';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: validate_resource_interval_snapshot_end_evidence(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.validate_resource_interval_snapshot_end_evidence() RETURNS trigger
+    LANGUAGE plpgsql SECURITY DEFINER
+    SET search_path TO 'pg_catalog'
+    AS $$
+DECLARE
+    evidence_ok BOOLEAN;
+    boundary_already_linked BOOLEAN;
+BEGIN
+    IF OLD.ended_at IS NULL
+       OR (NEW.last_seen_at IS NOT DISTINCT FROM OLD.last_seen_at
+           AND NEW.last_seen_snapshot_id
+                IS NOT DISTINCT FROM OLD.last_seen_snapshot_id) THEN
+        RETURN NEW;
+    END IF;
+
+    SELECT EXISTS (
+        SELECT 1
+        FROM public.resource_inventory_snapshots snapshot
+        WHERE snapshot.id = OLD.last_seen_snapshot_id
+          AND snapshot.inventory_scope_id = OLD.inventory_scope_id
+          AND snapshot.complete = TRUE
+          AND snapshot.manifest_state IN ('sealed', 'items-expired')
+          AND snapshot.received_at = OLD.ended_at
+    ) INTO boundary_already_linked;
+
+    IF boundary_already_linked THEN
+        RAISE EXCEPTION
+            'closed interval already has immutable terminal snapshot evidence'
+            USING ERRCODE = '55000';
+    END IF;
+
+    SELECT TRUE INTO evidence_ok
+    FROM public.resource_inventory_snapshots snapshot
+    JOIN public.resource_inventory_snapshot_items item
+      ON item.snapshot_id = snapshot.id
+     AND item.source_kind = OLD.source_kind
+     AND item.source_uid = OLD.source_uid
+     AND item.valid_for_metering = TRUE
+    WHERE OLD.end_time_source = 'app-db-received'
+      AND OLD.end_reason IN ('not-applicable', 'terminal-or-unscheduled')
+      AND OLD.last_seen_at <= OLD.ended_at
+      AND NEW.last_seen_at = GREATEST(OLD.last_seen_at, OLD.ended_at)
+      AND NEW.last_seen_snapshot_id = snapshot.id
+      AND NEW.last_seen_snapshot_id
+            IS DISTINCT FROM OLD.last_seen_snapshot_id
+      AND snapshot.inventory_scope_id = OLD.inventory_scope_id
+      AND snapshot.complete = TRUE
+      AND snapshot.manifest_state IN ('sealed', 'items-expired')
+      AND snapshot.received_at = OLD.ended_at;
+
+    IF evidence_ok IS DISTINCT FROM TRUE THEN
+        RAISE EXCEPTION
+            'closed interval snapshot evidence does not match its terminal boundary'
+            USING ERRCODE = '55000';
     END IF;
     RETURN NEW;
 END;
@@ -2389,7 +2957,18 @@ CREATE TABLE public.infra_metering_control (
     cutover_state text DEFAULT 'disabled'::text NOT NULL,
     cutover_at timestamp with time zone,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    cutover_phase text DEFAULT 'disabled'::text NOT NULL,
+    cutover_request_id uuid,
+    cutover_actor_id uuid,
+    cutover_reason text,
+    cutover_requested_at timestamp with time zone,
+    barrier_committed_at timestamp with time zone,
+    legacy_drained_at timestamp with time zone,
+    activated_at timestamp with time zone,
+    cutover_error jsonb,
     CONSTRAINT infra_metering_control_cutover_check CHECK ((((cutover_state = 'disabled'::text) AND (cutover_at IS NULL)) OR ((cutover_state = ANY (ARRAY['preparing'::text, 'active'::text])) AND (cutover_at IS NOT NULL)))),
+    CONSTRAINT infra_metering_control_cutover_error_check CHECK (((cutover_error IS NULL) OR (jsonb_typeof(cutover_error) = 'object'::text))),
+    CONSTRAINT infra_metering_control_cutover_phase_check CHECK ((((cutover_state = 'disabled'::text) AND (cutover_phase = 'disabled'::text) AND (cutover_at IS NULL) AND (cutover_request_id IS NULL) AND (cutover_actor_id IS NULL) AND (cutover_reason IS NULL) AND (cutover_requested_at IS NULL) AND (barrier_committed_at IS NULL) AND (legacy_drained_at IS NULL) AND (activated_at IS NULL) AND (cutover_error IS NULL)) OR ((cutover_state = 'preparing'::text) AND (cutover_phase = ANY (ARRAY['legacy-draining'::text, 'ready-to-activate'::text])) AND (cutover_at IS NOT NULL) AND (cutover_request_id IS NOT NULL) AND (cutover_actor_id IS NOT NULL) AND (cutover_reason IS NOT NULL) AND (cutover_reason = btrim(cutover_reason)) AND ((char_length(cutover_reason) >= 1) AND (char_length(cutover_reason) <= 1024)) AND (cutover_reason !~ '[[:cntrl:]]'::text) AND (cutover_requested_at IS NOT NULL) AND (barrier_committed_at IS NOT NULL) AND (cutover_requested_at = cutover_at) AND (barrier_committed_at = cutover_at) AND (((cutover_phase = 'legacy-draining'::text) AND (legacy_drained_at IS NULL)) OR ((cutover_phase = 'ready-to-activate'::text) AND (legacy_drained_at IS NOT NULL) AND (legacy_drained_at >= cutover_at))) AND (activated_at IS NULL)) OR ((cutover_state = 'active'::text) AND (cutover_phase = 'active'::text) AND (cutover_at IS NOT NULL) AND (cutover_request_id IS NOT NULL) AND (cutover_actor_id IS NOT NULL) AND (cutover_reason IS NOT NULL) AND (cutover_reason = btrim(cutover_reason)) AND ((char_length(cutover_reason) >= 1) AND (char_length(cutover_reason) <= 1024)) AND (cutover_reason !~ '[[:cntrl:]]'::text) AND (cutover_requested_at IS NOT NULL) AND (barrier_committed_at IS NOT NULL) AND (cutover_requested_at = cutover_at) AND (barrier_committed_at = cutover_at) AND (legacy_drained_at IS NOT NULL) AND (legacy_drained_at >= cutover_at) AND (activated_at IS NOT NULL) AND (activated_at >= legacy_drained_at)))),
     CONSTRAINT infra_metering_control_generation_check CHECK ((leader_generation >= 0)),
     CONSTRAINT infra_metering_control_singleton_check CHECK (singleton)
 );
@@ -2407,6 +2986,8 @@ CREATE TABLE public.infra_usage_day_state (
     unknown_ranges jsonb DEFAULT '[]'::jsonb NOT NULL,
     sealed_at timestamp with time zone,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    coverage_sequence bigint DEFAULT 0 NOT NULL,
+    CONSTRAINT infra_usage_day_state_coverage_sequence_check CHECK ((((state = 'sealed'::text) AND (coverage_sequence > 0)) OR ((state <> 'sealed'::text) AND (coverage_sequence = 0)))),
     CONSTRAINT infra_usage_day_state_shape_check CHECK (((state = ANY (ARRAY['open'::text, 'sealing'::text, 'sealed'::text])) AND ((coverage_status IS NULL) OR (coverage_status = ANY (ARRAY['complete'::text, 'partial'::text]))) AND ((coverage_status IS NULL) = (coverage_revision IS NULL)) AND ((coverage_revision IS NULL) OR (coverage_revision <> ''::text)) AND (jsonb_typeof(unknown_ranges) = 'array'::text) AND (((state = 'sealed'::text) AND (coverage_status IS NOT NULL) AND (coverage_revision IS NOT NULL) AND (sealed_at IS NOT NULL)) OR ((state <> 'sealed'::text) AND (sealed_at IS NULL)))))
 );
 
@@ -2613,6 +3194,47 @@ CREATE VIEW public.job_summary AS
     j.error_message,
     j.runner_kind
    FROM public.jobs j;
+
+
+--
+-- Name: legacy_workspace_cutover_plan_events; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.legacy_workspace_cutover_plan_events (
+    plan_id uuid NOT NULL,
+    ordinal integer NOT NULL,
+    source text NOT NULL,
+    source_id text NOT NULL,
+    unit text NOT NULL,
+    ts timestamp with time zone NOT NULL,
+    row_hash text NOT NULL,
+    event_payload jsonb NOT NULL,
+    CONSTRAINT legacy_workspace_cutover_plan_events_shape_check CHECK (((ordinal = ANY (ARRAY[0, 1])) AND (source = 'orchestrator'::text) AND (source_id <> ''::text) AND (unit = ANY (ARRAY['vcpu-hour'::text, 'gib-hour'::text])) AND (row_hash ~ '^[0-9a-f]{64}$'::text) AND (jsonb_typeof(event_payload) = 'object'::text)))
+);
+
+
+--
+-- Name: legacy_workspace_cutover_plans; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.legacy_workspace_cutover_plans (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    workspace_interval_id bigint NOT NULL,
+    cutover_request_id uuid NOT NULL,
+    expected_event_count integer DEFAULT 2 NOT NULL,
+    payload_schema_version integer DEFAULT 1 NOT NULL,
+    hash_algorithm text DEFAULT 'sha256'::text NOT NULL,
+    event_set_hash text NOT NULL,
+    creator_generation bigint NOT NULL,
+    state text DEFAULT 'planned'::text NOT NULL,
+    attempt_count integer DEFAULT 0 NOT NULL,
+    last_attempt_generation bigint,
+    last_attempt_at timestamp with time zone,
+    sanitized_error jsonb,
+    published_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT legacy_workspace_cutover_plans_shape_check CHECK (((expected_event_count = 2) AND (payload_schema_version = 1) AND (hash_algorithm = 'sha256'::text) AND (event_set_hash ~ '^[0-9a-f]{64}$'::text) AND (creator_generation > 0) AND (state = ANY (ARRAY['planned'::text, 'published'::text, 'conflict'::text])) AND (attempt_count >= 0) AND (((attempt_count = 0) AND (last_attempt_generation IS NULL) AND (last_attempt_at IS NULL)) OR ((attempt_count > 0) AND (last_attempt_generation IS NOT NULL) AND (last_attempt_generation > 0) AND (last_attempt_at IS NOT NULL))) AND ((sanitized_error IS NULL) OR (jsonb_typeof(sanitized_error) = 'object'::text)) AND (((state = 'published'::text) AND (published_at IS NOT NULL)) OR ((state <> 'published'::text) AND (published_at IS NULL)))))
+);
 
 
 --
@@ -3178,7 +3800,6 @@ CREATE TABLE public.resource_inventory_scope_epochs (
     recovery_from_epoch_id uuid,
     require_after_recovery boolean DEFAULT false NOT NULL,
     CONSTRAINT resource_inventory_scope_epochs_health_check CHECK (((coverage_mode <> ''::text) AND (snapshot_health <> ''::text) AND (continuity_health <> ''::text) AND (item_health <> ''::text) AND (backend_health <> ''::text) AND (publication_health <> ''::text) AND (leader_generation >= 0) AND (consecutive_failures >= 0) AND ((last_sequence IS NULL) OR (last_sequence >= 0)) AND ((last_item_count IS NULL) OR (last_item_count >= 0)) AND ((sanitized_error IS NULL) OR (jsonb_typeof(sanitized_error) = 'object'::text)))),
-    CONSTRAINT resource_inventory_scope_epochs_midnight_check CHECK (((required_from IS NULL) OR (required_from = date_trunc('day'::text, required_from, 'UTC'::text)))),
     CONSTRAINT resource_inventory_scope_epochs_number_check CHECK ((epoch_number > 0)),
     CONSTRAINT resource_inventory_scope_epochs_recovery_shape_check CHECK ((((recovery_from_epoch_id IS NULL) AND (NOT require_after_recovery)) OR ((recovery_from_epoch_id IS NOT NULL) AND (recovery_from_epoch_id <> id)))),
     CONSTRAINT resource_inventory_scope_epochs_requirement_check CHECK (((required_for_rollup AND (required_from IS NOT NULL) AND (reliable_from IS NOT NULL) AND (required_from >= reliable_from)) OR ((NOT required_for_rollup) AND (required_from IS NULL)))),
@@ -3238,7 +3859,7 @@ CREATE TABLE public.resource_inventory_shadow_comparisons (
     CONSTRAINT resource_inventory_shadow_comparisons_capacity_check CHECK (((((legacy_interval_id IS NULL) AND (legacy_cpu_millicores IS NULL) AND (legacy_memory_bytes IS NULL)) OR ((legacy_interval_id IS NOT NULL) AND (legacy_cpu_millicores IS NOT NULL) AND (legacy_memory_bytes IS NOT NULL) AND (legacy_cpu_millicores >= 0) AND (legacy_memory_bytes >= 0))) AND ((observed_cpu_millicores IS NULL) OR (observed_cpu_millicores >= 0)) AND ((observed_memory_bytes IS NULL) OR (observed_memory_bytes >= 0)))),
     CONSTRAINT resource_inventory_shadow_comparisons_lifetime_check CHECK (((((observed_started_at IS NULL) AND (observed_start_time_source IS NULL) AND (observed_start_uncertainty_us IS NULL)) OR ((observed_started_at IS NOT NULL) AND (observed_start_time_source IS NOT NULL) AND (observed_start_time_source <> ''::text) AND (observed_start_uncertainty_us IS NOT NULL) AND (observed_start_uncertainty_us >= 0))) AND ((start_delta_us IS NULL) OR ((legacy_started_at IS NOT NULL) AND (observed_started_at IS NOT NULL) AND (start_delta_us = ((EXTRACT(epoch FROM (observed_started_at - legacy_started_at)) * (1000000)::numeric))::bigint))))),
     CONSTRAINT resource_inventory_shadow_comparisons_owner_check CHECK (((owner_trusted AND (owner_kind = ANY (ARRAY['job'::text, 'thread'::text])) AND (owner_id IS NOT NULL)) OR ((NOT owner_trusted) AND (owner_kind IS NULL) AND (owner_id IS NULL)))),
-    CONSTRAINT resource_inventory_shadow_comparisons_status_check CHECK (((status = ANY (ARRAY['matched'::text, 'capacity-mismatch'::text, 'owner-mismatch'::text, 'legacy-missing'::text, 'invalid-observation'::text, 'not-applicable'::text, 'lifetime-mismatch'::text])) AND (reason_code ~ '^[a-z0-9][a-z0-9._-]{0,63}$'::text) AND ((status <> 'matched'::text) OR (start_delta_us IS NULL) OR (start_delta_us = 0)) AND ((status <> 'lifetime-mismatch'::text) OR ((NOT explained) AND (reason_code = ANY (ARRAY['start-semantics'::text, 'start-evidence-missing'::text])) AND ((start_delta_us IS NULL) OR (start_delta_us <> 0)))))),
+    CONSTRAINT resource_inventory_shadow_comparisons_status_check CHECK (((status = ANY (ARRAY['matched'::text, 'capacity-mismatch'::text, 'owner-mismatch'::text, 'legacy-missing'::text, 'invalid-observation'::text, 'not-applicable'::text, 'lifetime-mismatch'::text])) AND (reason_code ~ '^[a-z0-9][a-z0-9._-]{0,63}$'::text) AND ((status <> 'matched'::text) OR (start_delta_us IS NULL) OR (start_delta_us = 0)) AND ((status <> 'lifetime-mismatch'::text) OR (((NOT explained) AND (reason_code = ANY (ARRAY['start-semantics'::text, 'start-evidence-missing'::text])) AND ((start_delta_us IS NULL) OR (start_delta_us <> 0))) OR (explained AND (reason_code = 'bounded-start-semantics'::text) AND (start_delta_us > 0) AND (observed_start_time_source = 'app-db-received'::text) AND (observed_start_uncertainty_us IS NOT NULL) AND (start_delta_us <= observed_start_uncertainty_us)))))),
     CONSTRAINT resource_inventory_shadow_comparisons_uid_check CHECK ((source_uid <> ''::text))
 );
 
@@ -3353,7 +3974,7 @@ CREATE TABLE public.resource_inventory_watch_events (
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     CONSTRAINT resource_inventory_watch_events_common_check CHECK (((ordinal > 0) AND ((event_bytes > 0) OR ((event_type = 'history-lost'::text) AND (event_bytes = 0))) AND (expected_resource_version <> ''::text) AND (expected_resource_version <> '0'::text) AND ((resource_version IS NULL) OR ((resource_version <> ''::text) AND (resource_version <> '0'::text))) AND ((revision_hash IS NULL) OR (revision_hash ~ '^[0-9a-f]{64}$'::text)) AND ((normalized_item IS NULL) OR (jsonb_typeof(normalized_item) = 'object'::text)) AND ((item_error IS NULL) OR (jsonb_typeof(item_error) = 'object'::text)))),
     CONSTRAINT resource_inventory_watch_events_digest_check CHECK ((request_digest ~ '^[0-9a-f]{64}$'::text)),
-    CONSTRAINT resource_inventory_watch_events_interval_action_check CHECK ((((mutation_action = ANY (ARRAY['confirm'::text, 'open'::text, 'revise'::text, 'close'::text])) AND (affected_interval_id IS NOT NULL)) OR (mutation_action = 'presence-invalid'::text) OR ((mutation_action = ANY (ARRAY['not-applicable'::text, 'already-absent'::text, 'bookmark'::text, 'history-gap'::text])) AND (affected_interval_id IS NULL)))),
+    CONSTRAINT resource_inventory_watch_events_interval_action_check CHECK ((((mutation_action = ANY (ARRAY['confirm'::text, 'open'::text, 'revise'::text, 'close'::text])) AND (affected_interval_id IS NOT NULL)) OR (mutation_action = 'presence-invalid'::text) OR (mutation_action = 'not-applicable'::text) OR ((mutation_action = ANY (ARRAY['already-absent'::text, 'bookmark'::text, 'history-gap'::text])) AND (affected_interval_id IS NULL)))),
     CONSTRAINT resource_inventory_watch_events_shape_check CHECK ((((event_type = ANY (ARRAY['added'::text, 'modified'::text])) AND (resource_version IS NOT NULL) AND (source_kind = ANY (ARRAY['pod'::text, 'vmi'::text, 'pvc'::text, 'volume'::text])) AND (source_uid IS NOT NULL) AND (source_uid <> ''::text) AND (normalized_item IS NOT NULL) AND (valid_for_metering IS NOT NULL) AND ((valid_for_metering AND (revision_hash IS NOT NULL) AND (item_error IS NULL) AND (mutation_action = ANY (ARRAY['confirm'::text, 'open'::text, 'revise'::text, 'not-applicable'::text, 'close'::text, 'already-absent'::text]))) OR ((NOT valid_for_metering) AND (item_error IS NOT NULL) AND (mutation_action = ANY (ARRAY['presence-invalid'::text, 'close'::text, 'already-absent'::text])))) AND (coverage_gap_id IS NULL)) OR ((event_type = 'deleted'::text) AND (resource_version IS NOT NULL) AND (source_kind = ANY (ARRAY['pod'::text, 'vmi'::text, 'pvc'::text, 'volume'::text])) AND (source_uid IS NOT NULL) AND (source_uid <> ''::text) AND (revision_hash IS NULL) AND (normalized_item IS NULL) AND (valid_for_metering IS NULL) AND (item_error IS NULL) AND (mutation_action = ANY (ARRAY['close'::text, 'already-absent'::text])) AND (coverage_gap_id IS NULL)) OR ((event_type = 'bookmark'::text) AND (resource_version IS NOT NULL) AND (source_kind IS NULL) AND (source_uid IS NULL) AND (revision_hash IS NULL) AND (normalized_item IS NULL) AND (valid_for_metering IS NULL) AND (item_error IS NULL) AND (mutation_action = 'bookmark'::text) AND (affected_interval_id IS NULL) AND (coverage_gap_id IS NULL)) OR ((event_type = 'history-lost'::text) AND (resource_version IS NULL) AND (source_kind IS NULL) AND (source_uid IS NULL) AND (revision_hash IS NULL) AND (normalized_item IS NULL) AND (valid_for_metering IS NULL) AND (item_error IS NULL) AND (mutation_action = 'history-gap'::text) AND (affected_interval_id IS NULL) AND (coverage_gap_id IS NOT NULL))))
 );
 
@@ -4396,8 +5017,17 @@ CREATE TABLE public.usage_rollup_day_state (
     unknown_ranges jsonb DEFAULT '[]'::jsonb NOT NULL,
     rolled_at timestamp with time zone NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    infra_coverage_revision text,
+    CONSTRAINT usage_rollup_day_state_infra_revision_check CHECK (((infra_coverage_revision IS NULL) OR (infra_coverage_revision <> ''::text))),
     CONSTRAINT usage_rollup_day_state_shape_check CHECK (((applied_audit_revision > 0) AND (coverage_status = ANY (ARRAY['complete'::text, 'partial'::text, 'unavailable'::text])) AND (jsonb_typeof(unknown_ranges) = 'array'::text)))
 );
+
+
+--
+-- Name: COLUMN usage_rollup_day_state.infra_coverage_revision; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.usage_rollup_day_state.infra_coverage_revision IS 'Exact infra_usage_day_state.coverage_revision consumed by this full-day rollup; NULL only for legacy-only/pre-cutover days.';
 
 
 --
@@ -4726,6 +5356,14 @@ ALTER TABLE ONLY public.external_contacts
 
 
 --
+-- Name: infra_metering_control infra_metering_control_cutover_request_uq; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.infra_metering_control
+    ADD CONSTRAINT infra_metering_control_cutover_request_uq UNIQUE (cutover_request_id);
+
+
+--
 -- Name: infra_metering_control infra_metering_control_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -4763,6 +5401,38 @@ ALTER TABLE ONLY public.job_datasources
 
 ALTER TABLE ONLY public.jobs
     ADD CONSTRAINT jobs_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: legacy_workspace_cutover_plan_events legacy_workspace_cutover_plan_even_source_source_id_unit_ts_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.legacy_workspace_cutover_plan_events
+    ADD CONSTRAINT legacy_workspace_cutover_plan_even_source_source_id_unit_ts_key UNIQUE (source, source_id, unit, ts);
+
+
+--
+-- Name: legacy_workspace_cutover_plan_events legacy_workspace_cutover_plan_events_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.legacy_workspace_cutover_plan_events
+    ADD CONSTRAINT legacy_workspace_cutover_plan_events_pkey PRIMARY KEY (plan_id, ordinal);
+
+
+--
+-- Name: legacy_workspace_cutover_plans legacy_workspace_cutover_plans_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.legacy_workspace_cutover_plans
+    ADD CONSTRAINT legacy_workspace_cutover_plans_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: legacy_workspace_cutover_plans legacy_workspace_cutover_plans_workspace_interval_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.legacy_workspace_cutover_plans
+    ADD CONSTRAINT legacy_workspace_cutover_plans_workspace_interval_id_key UNIQUE (workspace_interval_id);
 
 
 --
@@ -6272,6 +6942,13 @@ CREATE INDEX jobs_lease_expiry_idx ON public.jobs USING btree (lease_expires_at)
 
 
 --
+-- Name: legacy_workspace_cutover_plans_pending_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX legacy_workspace_cutover_plans_pending_idx ON public.legacy_workspace_cutover_plans USING btree (created_at, id) WHERE (state = 'planned'::text);
+
+
+--
 -- Name: resource_intervals_materializer_idx; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -6297,6 +6974,13 @@ CREATE INDEX resource_intervals_open_scope_identity_idx ON public.resource_inter
 --
 
 CREATE UNIQUE INDEX resource_intervals_open_uq ON public.resource_intervals USING btree (source_cluster, source_kind, source_uid) WHERE (ended_at IS NULL);
+
+
+--
+-- Name: resource_intervals_overlap_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX resource_intervals_overlap_idx ON public.resource_intervals USING gist (tstzrange(started_at, ended_at, '[)'::text));
 
 
 --
@@ -6377,6 +7061,13 @@ CREATE INDEX resource_inventory_shadow_comparisons_unresolved_idx ON public.reso
 
 
 --
+-- Name: resource_inventory_snapshots_complete_received_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX resource_inventory_snapshots_complete_received_idx ON public.resource_inventory_snapshots USING btree (scope_epoch_id, received_at, id) WHERE ((complete IS TRUE) AND (manifest_state = ANY (ARRAY['sealed'::text, 'items-expired'::text])));
+
+
+--
 -- Name: resource_inventory_snapshots_controller_seq_uq; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -6419,6 +7110,13 @@ CREATE INDEX resource_inventory_watch_events_gap_idx ON public.resource_inventor
 
 
 --
+-- Name: resource_inventory_watch_events_invalid_received_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX resource_inventory_watch_events_invalid_received_idx ON public.resource_inventory_watch_events USING btree (scope_epoch_id, received_at, id) WHERE ((valid_for_metering IS FALSE) AND (mutation_action = 'presence-invalid'::text));
+
+
+--
 -- Name: resource_inventory_watch_events_scope_uid_idx; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -6447,6 +7145,13 @@ CREATE INDEX resource_inventory_watch_sessions_retention_idx ON public.resource_
 
 
 --
+-- Name: resource_publication_plan_events_rate_reference_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX resource_publication_plan_events_rate_reference_idx ON public.resource_publication_plan_events USING btree (canonical_rate_version_id, plan_id) WHERE (canonical_rate_version_id IS NOT NULL);
+
+
+--
 -- Name: resource_publication_plans_interval_idx; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -6458,6 +7163,13 @@ CREATE INDEX resource_publication_plans_interval_idx ON public.resource_publicat
 --
 
 CREATE INDEX resource_publication_plans_pending_idx ON public.resource_publication_plans USING btree (created_at, id) WHERE (state = 'planned'::text);
+
+
+--
+-- Name: resource_publication_plans_period_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX resource_publication_plans_period_idx ON public.resource_publication_plans USING gist (tstzrange(period_start, period_end, '[)'::text));
 
 
 --
@@ -6706,6 +7418,20 @@ CREATE TRIGGER datasource_project_policy_change AFTER INSERT OR DELETE OR UPDATE
 
 
 --
+-- Name: infra_metering_control infra_metering_control_cutover_one_way; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER infra_metering_control_cutover_one_way BEFORE DELETE OR UPDATE ON public.infra_metering_control FOR EACH ROW EXECUTE FUNCTION public.protect_infra_metering_cutover_mutation();
+
+
+--
+-- Name: infra_metering_control infra_metering_control_legacy_drain_immutable; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER infra_metering_control_legacy_drain_immutable BEFORE UPDATE OF legacy_drained_at ON public.infra_metering_control FOR EACH ROW EXECUTE FUNCTION public.protect_infra_metering_legacy_drain_completion();
+
+
+--
 -- Name: infra_metering_control infra_metering_control_monotonic_generation; Type: TRIGGER; Schema: public; Owner: -
 --
 
@@ -6717,6 +7443,41 @@ CREATE TRIGGER infra_metering_control_monotonic_generation BEFORE DELETE OR UPDA
 --
 
 CREATE TRIGGER infra_usage_day_state_one_way_seal BEFORE INSERT OR DELETE OR UPDATE ON public.infra_usage_day_state FOR EACH ROW EXECUTE FUNCTION public.protect_infra_usage_day_state_mutation();
+
+
+--
+-- Name: legacy_workspace_cutover_plan_events legacy_workspace_cutover_plan_event_manifest_complete; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE CONSTRAINT TRIGGER legacy_workspace_cutover_plan_event_manifest_complete AFTER INSERT ON public.legacy_workspace_cutover_plan_events DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.validate_legacy_workspace_cutover_plan_manifest();
+
+
+--
+-- Name: legacy_workspace_cutover_plan_events legacy_workspace_cutover_plan_events_frozen; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER legacy_workspace_cutover_plan_events_frozen BEFORE INSERT OR DELETE OR UPDATE ON public.legacy_workspace_cutover_plan_events FOR EACH ROW EXECUTE FUNCTION public.protect_legacy_workspace_cutover_plan_event_mutation();
+
+
+--
+-- Name: legacy_workspace_cutover_plans legacy_workspace_cutover_plan_manifest_complete; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE CONSTRAINT TRIGGER legacy_workspace_cutover_plan_manifest_complete AFTER INSERT OR UPDATE ON public.legacy_workspace_cutover_plans DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.validate_legacy_workspace_cutover_plan_manifest();
+
+
+--
+-- Name: legacy_workspace_cutover_plans legacy_workspace_cutover_plans_frozen; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER legacy_workspace_cutover_plans_frozen BEFORE DELETE OR UPDATE ON public.legacy_workspace_cutover_plans FOR EACH ROW EXECUTE FUNCTION public.protect_legacy_workspace_cutover_plan_mutation();
+
+
+--
+-- Name: resource_intervals resource_intervals_cutover_serialization; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER resource_intervals_cutover_serialization BEFORE INSERT OR UPDATE ON public.resource_intervals FOR EACH STATEMENT EXECUTE FUNCTION public.serialize_resource_interval_statement_with_cutover();
 
 
 --
@@ -6734,10 +7495,45 @@ CREATE TRIGGER resource_intervals_scope_identity BEFORE INSERT OR UPDATE OF inve
 
 
 --
+-- Name: resource_intervals resource_intervals_snapshot_end_single_boundary_guard; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER resource_intervals_snapshot_end_single_boundary_guard BEFORE UPDATE OF last_seen_at, last_seen_snapshot_id ON public.resource_intervals FOR EACH ROW EXECUTE FUNCTION public.validate_resource_interval_snapshot_end_evidence();
+
+
+--
 -- Name: resource_inventory_ingest_tickets resource_inventory_ingest_tickets_one_way; Type: TRIGGER; Schema: public; Owner: -
 --
 
 CREATE TRIGGER resource_inventory_ingest_tickets_one_way BEFORE INSERT OR DELETE OR UPDATE ON public.resource_inventory_ingest_tickets FOR EACH ROW EXECUTE FUNCTION public.protect_resource_inventory_ingest_ticket_mutation();
+
+
+--
+-- Name: resource_inventory_scope_epochs resource_inventory_scope_epochs_boundary_insert; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER resource_inventory_scope_epochs_boundary_insert BEFORE INSERT ON public.resource_inventory_scope_epochs FOR EACH ROW EXECUTE FUNCTION public.enforce_inventory_epoch_required_boundary();
+
+
+--
+-- Name: resource_inventory_scope_epochs resource_inventory_scope_epochs_boundary_insert_lock; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER resource_inventory_scope_epochs_boundary_insert_lock BEFORE INSERT ON public.resource_inventory_scope_epochs FOR EACH STATEMENT EXECUTE FUNCTION public.lock_inventory_epoch_boundary_statement();
+
+
+--
+-- Name: resource_inventory_scope_epochs resource_inventory_scope_epochs_boundary_update; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER resource_inventory_scope_epochs_boundary_update BEFORE UPDATE OF required_for_rollup, required_from ON public.resource_inventory_scope_epochs FOR EACH ROW EXECUTE FUNCTION public.enforce_inventory_epoch_required_boundary();
+
+
+--
+-- Name: resource_inventory_scope_epochs resource_inventory_scope_epochs_boundary_update_lock; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER resource_inventory_scope_epochs_boundary_update_lock BEFORE UPDATE OF required_for_rollup, required_from ON public.resource_inventory_scope_epochs FOR EACH STATEMENT EXECUTE FUNCTION public.lock_inventory_epoch_boundary_statement();
 
 
 --
@@ -6797,10 +7593,24 @@ CREATE TRIGGER resource_inventory_watch_events_immutable BEFORE INSERT OR DELETE
 
 
 --
+-- Name: resource_inventory_watch_events resource_inventory_watch_events_terminal_evidence_guard; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER resource_inventory_watch_events_terminal_evidence_guard BEFORE INSERT ON public.resource_inventory_watch_events FOR EACH ROW EXECUTE FUNCTION public.validate_inventory_watch_terminal_interval_evidence();
+
+
+--
 -- Name: resource_inventory_watch_sessions resource_inventory_watch_sessions_one_way; Type: TRIGGER; Schema: public; Owner: -
 --
 
 CREATE TRIGGER resource_inventory_watch_sessions_one_way BEFORE INSERT OR DELETE OR UPDATE ON public.resource_inventory_watch_sessions FOR EACH ROW EXECUTE FUNCTION public.protect_resource_inventory_watch_session_mutation();
+
+
+--
+-- Name: resource_lifecycle_heads resource_lifecycle_heads_cutover_serialization; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER resource_lifecycle_heads_cutover_serialization BEFORE INSERT OR UPDATE ON public.resource_lifecycle_heads FOR EACH STATEMENT EXECUTE FUNCTION public.serialize_resource_lifecycle_head_with_cutover();
 
 
 --
@@ -6941,6 +7751,27 @@ CREATE CONSTRAINT TRIGGER usage_rate_components_v2_manifest_complete AFTER INSER
 --
 
 CREATE TRIGGER usage_rates_v2_immutable BEFORE DELETE OR UPDATE ON public.usage_rates_v2 FOR EACH ROW EXECUTE FUNCTION public.protect_usage_rates_v2_mutation();
+
+
+--
+-- Name: usage_rates_v2 usage_rates_v2_referenced_range_guard; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER usage_rates_v2_referenced_range_guard BEFORE UPDATE OF effective_to ON public.usage_rates_v2 FOR EACH ROW EXECUTE FUNCTION public.protect_usage_rate_v2_referenced_range();
+
+
+--
+-- Name: workspace_intervals workspace_intervals_cutover_insert_lock; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER workspace_intervals_cutover_insert_lock BEFORE INSERT ON public.workspace_intervals FOR EACH STATEMENT EXECUTE FUNCTION public.lock_legacy_workspace_insert_statement();
+
+
+--
+-- Name: workspace_intervals workspace_intervals_cutover_open_barrier; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER workspace_intervals_cutover_open_barrier BEFORE INSERT OR UPDATE ON public.workspace_intervals FOR EACH ROW EXECUTE FUNCTION public.enforce_legacy_workspace_cutover_barrier();
 
 
 --
@@ -7293,6 +8124,22 @@ ALTER TABLE ONLY public.jobs
 
 ALTER TABLE ONLY public.jobs
     ADD CONSTRAINT jobs_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE SET NULL;
+
+
+--
+-- Name: legacy_workspace_cutover_plan_events legacy_workspace_cutover_plan_events_plan_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.legacy_workspace_cutover_plan_events
+    ADD CONSTRAINT legacy_workspace_cutover_plan_events_plan_id_fkey FOREIGN KEY (plan_id) REFERENCES public.legacy_workspace_cutover_plans(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: legacy_workspace_cutover_plans legacy_workspace_cutover_plans_workspace_interval_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.legacy_workspace_cutover_plans
+    ADD CONSTRAINT legacy_workspace_cutover_plans_workspace_interval_id_fkey FOREIGN KEY (workspace_interval_id) REFERENCES public.workspace_intervals(id) ON DELETE RESTRICT;
 
 
 --

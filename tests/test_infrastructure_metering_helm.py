@@ -51,6 +51,13 @@ def test_dedicated_metering_collector_renders_only_with_scoped_pod_reads():
         == "67108864"
     )
     assert (
+        disabled_configmap["data"]["INFRASTRUCTURE_METERING_SOURCE_AWARE_READS_ENABLED"]
+        == "false"
+    )
+    assert (
+        disabled_configmap["data"]["INFRASTRUCTURE_METERING_CUTOVER_ENABLED"] == "false"
+    )
+    assert (
         disabled_env["INFRASTRUCTURE_METERING_INGESTION_KEY"]["valueFrom"][
             "secretKeyRef"
         ]["optional"]
@@ -232,6 +239,32 @@ def test_metering_collector_helm_guards_fail_closed():
     )
     assert invalid_retention.returncode != 0
     assert "must be greater than or equal" in invalid_retention.stderr
+
+    source_aware_without_v2 = subprocess.run(
+        base
+        + [
+            "--set",
+            "infrastructureMetering.sourceAwareReadsEnabled=true",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert source_aware_without_v2.returncode != 0
+    assert "requires v2ReadsEnabled" in source_aware_without_v2.stderr
+
+    cutover_without_shadow = subprocess.run(
+        base
+        + [
+            "--set",
+            "infrastructureMetering.cutoverEnabled=true",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert cutover_without_shadow.returncode != 0
+    assert "require collectorEnabled" in cutover_without_shadow.stderr
 
 
 @pytest.mark.skipif(shutil.which("helm") is None, reason="Helm is not installed")

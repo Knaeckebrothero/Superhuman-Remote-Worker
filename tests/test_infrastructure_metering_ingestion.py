@@ -24,6 +24,7 @@ from orchestrator.services.infrastructure_metering.ingestion_types import (
     InventoryItemWire,
     InventorySnapshotFinalize,
     InventoryTicketRequest,
+    InventoryWatchApply,
     InventoryWatchFinish,
 )
 from orchestrator.services.infrastructure_metering.collectors.contracts import (
@@ -37,6 +38,8 @@ from orchestrator.services.infrastructure_metering.inventory import (
     InventoryRecoveryRequired,
     InventoryScopeIdentity,
     TransportNonceClaim,
+    WatchEventKind,
+    WatchMutationAction,
 )
 
 
@@ -324,6 +327,77 @@ async def test_watch_finish_forwards_typed_ambiguous_gap_to_store():
     assert kwargs["gap_reason"] == "ambiguous-watch-apply"
     assert kwargs["alternate_expected_resource_version"] == "18"
     assert kwargs["transport"].request_kind == "watch-history-lost"
+
+
+@pytest.mark.asyncio
+async def test_watch_apply_maps_uppercase_kubernetes_event_to_durable_kind():
+    model = InventoryWatchApply.model_validate(
+        {
+            "ticket_id": uuid4(),
+            "ticket_token": "t" * 32,
+            "leader_generation": 7,
+            "event_id": uuid4(),
+            "expected_resource_version": "17",
+            "observation": {
+                "scope": {
+                    "source_cluster": "dev-cluster",
+                    "api_resource": "core/v1/pods",
+                    "namespace": "srw",
+                    "cluster_scoped": False,
+                },
+                "event_type": "BOOKMARK",
+                "resource_version": "18",
+                "source_event_bytes": 64,
+                "collector_observed_at": datetime(2026, 8, 5, 12, tzinfo=timezone.utc),
+                "confirms_presence": False,
+                "item": None,
+            },
+        }
+    )
+    scope = InventoryScopeIdentity(
+        collector_id="kubernetes-pods",
+        source_cluster="dev-cluster",
+        api_resource="core/v1/pods",
+        namespace="srw",
+    )
+    claim = TransportNonceClaim(
+        collector_id="kubernetes-pods",
+        request_nonce=uuid4(),
+        request_kind="watch-event",
+        request_digest="a" * 64,
+    )
+    store = SimpleNamespace(
+        apply_watch_event=AsyncMock(
+            return_value=SimpleNamespace(
+                event_id=model.event_id,
+                resource_version="18",
+                mutation_action=WatchMutationAction.BOOKMARK,
+                session_consumed=False,
+                replayed=False,
+            )
+        )
+    )
+    service = object.__new__(InfrastructureIngestionService)
+    service.settings = _settings(shadow_enabled=True)
+    service.store = store
+    service._pod_reconciler = SimpleNamespace(apply_watch=AsyncMock())
+    service._authenticated = AsyncMock(  # type: ignore[method-assign]
+        return_value=(
+            model,
+            SimpleNamespace(
+                collector_id="kubernetes-pods",
+                transport_claim=claim,
+            ),
+        )
+    )
+    service._require_generation = AsyncMock()  # type: ignore[method-assign]
+    service._scope = lambda *_args: scope  # type: ignore[method-assign]
+
+    result = await service.watch_apply(SimpleNamespace())  # type: ignore[arg-type]
+
+    assert result["resource_version"] == "18"
+    event = store.apply_watch_event.await_args.args[5]
+    assert event.event_type is WatchEventKind.BOOKMARK
 
 
 @pytest.mark.asyncio

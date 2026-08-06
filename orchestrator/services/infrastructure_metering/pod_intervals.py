@@ -255,6 +255,16 @@ class _IntervalStart:
     evidence_source: str | None = None
 
 
+def _timestamp_text(value: datetime) -> str:
+    """Render one already-validated UTC instant for immutable diagnostics."""
+
+    return (
+        value.astimezone(timezone.utc)
+        .isoformat(timespec="microseconds")
+        .replace("+00:00", "Z")
+    )
+
+
 class PodIntervalReconciler:
     """Typed snapshot/WATCH mutation hooks used by ``InventoryStore``."""
 
@@ -314,6 +324,59 @@ class PodIntervalReconciler:
             source="app-db-received",
             uncertainty_us=uncertainty,
             evidence_source=evidence_source,
+        )
+
+    @staticmethod
+    async def _canonical_start(
+        conn: asyncpg.Connection,
+        start: _IntervalStart,
+    ) -> tuple[_IntervalStart, dict[str, Any] | None]:
+        """Clamp a delayed first observation to the durable cutover barrier.
+
+        Resource-interval statements serialize with the cutover control row.  A
+        WATCH event that loses that race can still carry a continuously proven
+        PodScheduled transition before the barrier.  That lifecycle evidence is
+        useful diagnostically, but admitting it as the publication cursor would
+        create an interval the post-cutover materializer can never select.
+        """
+
+        control = await conn.fetchrow(
+            "SELECT cutover_state, cutover_at FROM infra_metering_control "
+            "WHERE singleton=TRUE FOR SHARE"
+        )
+        if control is None:
+            raise InventoryConflictError("infrastructure metering control row missing")
+        state = str(control["cutover_state"])
+        if state == "disabled":
+            return start, None
+        if state not in {"preparing", "active"}:
+            raise InventoryContractError("infrastructure cutover state is invalid")
+        cutover_at = control["cutover_at"]
+        if (
+            not isinstance(cutover_at, datetime)
+            or cutover_at.tzinfo is None
+            or cutover_at.utcoffset() is None
+        ):
+            raise InventoryContractError("infrastructure cutover timestamp is invalid")
+        cutover_at = cutover_at.astimezone(timezone.utc)
+        if start.started_at >= cutover_at:
+            return start, None
+
+        diagnostic = {
+            "cutover_at": _timestamp_text(cutover_at),
+            "observed_started_at": _timestamp_text(start.started_at),
+            "observed_start_time_source": start.source,
+            "observed_start_uncertainty_us": start.uncertainty_us,
+            "observed_start_evidence_source": start.evidence_source,
+        }
+        return (
+            _IntervalStart(
+                started_at=cutover_at,
+                source="cutover-barrier",
+                uncertainty_us=0,
+                evidence_source=start.evidence_source,
+            ),
+            diagnostic,
         )
 
     @staticmethod
@@ -586,14 +649,6 @@ class PodIntervalReconciler:
             status = ShadowComparisonStatus.LEGACY_MISSING
             reason = "legacy-open-missing"
             explained = False
-        elif start_delta_us != 0:
-            status = ShadowComparisonStatus.LIFETIME_MISMATCH
-            reason = (
-                "start-semantics"
-                if start_delta_us is not None
-                else "start-evidence-missing"
-            )
-            explained = False
         elif not (
             int(legacy["cpu_millicores"]) == observed_cpu
             and int(legacy["mem_bytes"]) == observed_memory
@@ -601,12 +656,43 @@ class PodIntervalReconciler:
             status = ShadowComparisonStatus.CAPACITY_MISMATCH
             cpu_delta = observed_cpu - int(legacy["cpu_millicores"])
             memory_delta = observed_memory - int(legacy["mem_bytes"])
+            bounded_start = (
+                start_delta_us is not None
+                and start_delta_us >= 0
+                and observed_start_source == "app-db-received"
+                and observed_start_uncertainty is not None
+                and start_delta_us <= observed_start_uncertainty
+            )
             explained = (
                 cpu_delta == projection.overhead_cpu_millicores
                 and memory_delta == projection.overhead_memory_bytes
                 and (cpu_delta > 0 or memory_delta > 0)
+                and (start_delta_us == 0 or bounded_start)
             )
-            reason = "admission-overhead" if explained else "capacity-difference"
+            reason = (
+                "admission-overhead-bounded-start"
+                if explained and start_delta_us != 0
+                else "admission-overhead"
+                if explained
+                else "capacity-difference"
+            )
+        elif start_delta_us != 0:
+            bounded_start = (
+                start_delta_us is not None
+                and start_delta_us > 0
+                and observed_start_source == "app-db-received"
+                and observed_start_uncertainty is not None
+                and start_delta_us <= observed_start_uncertainty
+            )
+            status = ShadowComparisonStatus.LIFETIME_MISMATCH
+            reason = (
+                "bounded-start-semantics"
+                if bounded_start
+                else "start-semantics"
+                if start_delta_us is not None
+                else "start-evidence-missing"
+            )
+            explained = bounded_start
         else:
             status = ShadowComparisonStatus.MATCHED
             reason = "capacity-and-start-match"
@@ -656,6 +742,7 @@ class PodIntervalReconciler:
         projection: WorkspacePodProjection,
         owner: _Owner | None,
     ) -> UUID:
+        start, cutover_clamp = await PodIntervalReconciler._canonical_start(conn, start)
         lifecycle_id = uuid5(
             NAMESPACE_URL,
             f"srw-resource:{source_cluster}:pod:{item.source_uid}",
@@ -685,6 +772,8 @@ class PodIntervalReconciler:
         }
         if start.evidence_source is not None:
             details_payload["start_evidence_source"] = start.evidence_source
+        if cutover_clamp is not None:
+            details_payload["cutover_start_clamp"] = cutover_clamp
         if owner is None:
             details_payload["attribution_diagnostic"] = "owner-unresolved"
         details = json.dumps(

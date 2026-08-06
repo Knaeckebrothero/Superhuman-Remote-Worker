@@ -122,8 +122,10 @@ orchestrator:
 # not overwrite it while syncing the main application Secret from Vault.
 infrastructureMetering:
   v2ReadsEnabled: false
+  sourceAwareReadsEnabled: false
   collectorEnabled: true
   shadowEnabled: false
+  cutoverEnabled: false
   publicationEnabled: false
   stableClusterId: "srw-main-dev"
   ingestionSecretName: "srw-infra-metering-ingestion"

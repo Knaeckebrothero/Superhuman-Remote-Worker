@@ -37,6 +37,18 @@ _STARTUP_JITTER_SECONDS = 3.0
 # import this and gate their per-tick work on it. Module-level = per-process =
 # per-replica, which is exactly what we want.
 is_leader = asyncio.Event()
+_leader_generation: int | None = None
+
+
+def get_leader_generation() -> int | None:
+    """Return the database fencing generation for this local leader tenure.
+
+    The value is populated by ``on_acquired`` before :data:`is_leader` becomes
+    visible.  Callers must still validate it in the same transaction as every
+    durable mutation; this accessor is only the local half of the fence.
+    """
+
+    return _leader_generation
 
 
 async def _sleep_or_shutdown(seconds: float, shutdown_event: asyncio.Event) -> None:
@@ -47,7 +59,13 @@ async def _sleep_or_shutdown(seconds: float, shutdown_event: asyncio.Event) -> N
         return
 
 
-async def run_as_leader(db: Any, lock_id: int, shutdown_event: asyncio.Event) -> None:
+async def run_as_leader(
+    db: Any,
+    lock_id: int,
+    shutdown_event: asyncio.Event,
+    *,
+    on_acquired: Callable[[Any], Awaitable[int | None]] | None = None,
+) -> None:
     """Contend for leadership and hold it for this process's lifetime.
 
     Parameters
@@ -59,6 +77,8 @@ async def run_as_leader(db: Any, lock_id: int, shutdown_event: asyncio.Event) ->
     shutdown_event:
         Cooperative shutdown flag; the loop exits cleanly when set.
     """
+    global _leader_generation
+
     backoff = _RECONNECT_MIN_SECONDS
     # Anti-thundering-herd: stagger co-booting replicas so they don't all
     # contend for the lock on the same tick.
@@ -80,6 +100,18 @@ async def run_as_leader(db: Any, lock_id: int, shutdown_event: asyncio.Event) ->
             backoff = _RECONNECT_MIN_SECONDS
 
             if got:
+                generation = None
+                if on_acquired is not None:
+                    generation = await on_acquired(conn)
+                    if (
+                        isinstance(generation, bool)
+                        or not isinstance(generation, int)
+                        or generation <= 0
+                    ):
+                        raise RuntimeError(
+                            "leader acquisition callback returned an invalid generation"
+                        )
+                _leader_generation = generation
                 logger.info("leader_election: acquired leadership (lock %s)", lock_id)
                 is_leader.set()
                 try:
@@ -95,6 +127,7 @@ async def run_as_leader(db: Any, lock_id: int, shutdown_event: asyncio.Event) ->
                         await conn.fetchval("SELECT 1")
                 finally:
                     is_leader.clear()
+                    _leader_generation = None
                     try:
                         await conn.execute("SELECT pg_advisory_unlock($1)", lock_id)
                     except Exception:
@@ -108,10 +141,12 @@ async def run_as_leader(db: Any, lock_id: int, shutdown_event: asyncio.Event) ->
                 await _sleep_or_shutdown(_POLL_INTERVAL_SECONDS, shutdown_event)
         except asyncio.CancelledError:
             is_leader.clear()
+            _leader_generation = None
             raise
         except Exception as e:
             # Connection lost / DB blip: step down and reconnect with backoff.
             is_leader.clear()
+            _leader_generation = None
             logger.warning(
                 "leader_election: connection lost (%s); stepping down, retry in %.1fs",
                 e,
@@ -130,6 +165,7 @@ async def run_as_leader(db: Any, lock_id: int, shutdown_event: asyncio.Event) ->
         backoff = min(backoff * 2, _RECONNECT_MAX_SECONDS)
 
     is_leader.clear()
+    _leader_generation = None
     logger.info("leader_election: shutdown")
 
 

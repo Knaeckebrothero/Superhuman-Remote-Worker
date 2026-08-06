@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import json
 from unittest.mock import AsyncMock
 from uuid import UUID, uuid4
 
@@ -8,11 +9,13 @@ import pytest
 
 from orchestrator.services.infrastructure_metering.inventory import (
     InventoryItem,
+    SnapshotIntervalMutationContext,
     WatchEventKind,
     WatchIntervalMutationContext,
 )
 from orchestrator.services.infrastructure_metering.pod_intervals import (
     PodIntervalReconciler,
+    _IntervalStart,
     project_workspace_pod,
 )
 
@@ -147,6 +150,56 @@ def test_projects_only_sane_normalized_lifecycle_timestamps():
 
 
 @pytest.mark.asyncio
+async def test_repeat_observation_confirms_trusted_owner_interval_in_place():
+    received_at = datetime(2026, 8, 6, 9, tzinfo=timezone.utc)
+    interval_id = uuid4()
+    user_id, project_id = uuid4(), uuid4()
+    item = _item()
+    conn = AsyncMock()
+    conn.fetchrow.side_effect = [
+        {
+            "id": OWNER_ID,
+            "user_id": user_id,
+            "project_id": project_id,
+            "pod_name": "workspace-11111111",
+            "namespace": "srw",
+        },
+        {
+            "id": interval_id,
+            "source_revision": item.revision_hash,
+            "attribution_scope": "customer",
+            "owner_kind": "job",
+            "owner_id": str(OWNER_ID),
+            "user_id": user_id,
+            "project_id": project_id,
+            "attribution_source": "app-db-owner-binding",
+            "attribution_quality": "exact",
+        },
+    ]
+    conn.fetchval.return_value = interval_id
+
+    reconciled = await PodIntervalReconciler(shadow_enabled=True).apply_snapshot(
+        conn,
+        SnapshotIntervalMutationContext(
+            snapshot_id=uuid4(),
+            scope_epoch_id=uuid4(),
+            inventory_scope_id=uuid4(),
+            source_cluster="cluster-a",
+            namespace="srw",
+            received_at=received_at,
+            existing_interval_id=interval_id,
+            existing_source_revision=item.revision_hash,
+        ),
+        item,
+    )
+
+    assert reconciled == interval_id
+    assert conn.fetchval.await_count == 1
+    assert conn.execute.await_count == 0
+    assert "last_confirmed_at=GREATEST" in conn.fetchval.await_args.args[0]
+
+
+@pytest.mark.asyncio
 async def test_watch_does_not_infer_absence_from_expired_snapshot_items():
     received_at = datetime(2026, 8, 6, 9, tzinfo=timezone.utc)
     transition_at = received_at - timedelta(seconds=5)
@@ -196,3 +249,92 @@ async def test_watch_does_not_infer_absence_from_expired_snapshot_items():
     assert start.source == "app-db-received"
     assert start.uncertainty_us == 5_000_000
     assert conn.fetchval.await_count == 0
+
+
+@pytest.mark.asyncio
+async def test_open_interval_clamps_delayed_watch_start_to_cutover_barrier():
+    cutover_at = datetime(2026, 8, 6, 9, tzinfo=timezone.utc)
+    observed_start = cutover_at - timedelta(seconds=2)
+    received_at = cutover_at + timedelta(seconds=3)
+    conn = AsyncMock()
+    conn.fetchrow.return_value = {
+        "cutover_state": "preparing",
+        "cutover_at": cutover_at,
+    }
+    conn.fetchval.side_effect = [1, True]
+    item = _item(
+        lifecycle={
+            "accrues": True,
+            "terminal": False,
+            "creation_timestamp": (observed_start - timedelta(seconds=1)).isoformat(),
+            "pod_scheduled_condition": {
+                "status": "True",
+                "last_transition_time": observed_start.isoformat(),
+            },
+        }
+    )
+
+    interval_id = await PodIntervalReconciler._open_interval(
+        conn,
+        inventory_scope_id=uuid4(),
+        source_cluster="cluster-a",
+        received_at=received_at,
+        start=_IntervalStart(
+            started_at=observed_start,
+            source="pod-scheduled-transition",
+            uncertainty_us=0,
+            evidence_source="continuous-watch-proof",
+        ),
+        item=item,
+        projection=project_workspace_pod(item),
+        owner=None,
+    )
+
+    assert isinstance(interval_id, UUID)
+    interval_insert = conn.execute.await_args_list[1]
+    assert interval_insert.args[23] == cutover_at
+    assert interval_insert.args[24] == "cutover-barrier"
+    assert interval_insert.args[25] == 0
+    details = json.loads(interval_insert.args[28])
+    assert details["start_evidence_source"] == "continuous-watch-proof"
+    assert details["cutover_start_clamp"] == {
+        "cutover_at": "2026-08-06T09:00:00.000000Z",
+        "observed_started_at": "2026-08-06T08:59:58.000000Z",
+        "observed_start_time_source": "pod-scheduled-transition",
+        "observed_start_uncertainty_us": 0,
+        "observed_start_evidence_source": "continuous-watch-proof",
+    }
+
+
+@pytest.mark.asyncio
+async def test_open_interval_keeps_post_cutover_watch_start_unchanged():
+    cutover_at = datetime(2026, 8, 6, 9, tzinfo=timezone.utc)
+    observed_start = cutover_at + timedelta(seconds=1)
+    conn = AsyncMock()
+    conn.fetchrow.return_value = {
+        "cutover_state": "active",
+        "cutover_at": cutover_at,
+    }
+    conn.fetchval.side_effect = [1, True]
+    item = _item()
+
+    await PodIntervalReconciler._open_interval(
+        conn,
+        inventory_scope_id=uuid4(),
+        source_cluster="cluster-a",
+        received_at=observed_start + timedelta(seconds=1),
+        start=_IntervalStart(
+            started_at=observed_start,
+            source="pod-scheduled-transition",
+            uncertainty_us=0,
+            evidence_source="continuous-watch-proof",
+        ),
+        item=item,
+        projection=project_workspace_pod(item),
+        owner=None,
+    )
+
+    interval_insert = conn.execute.await_args_list[1]
+    assert interval_insert.args[23] == observed_start
+    assert interval_insert.args[24] == "pod-scheduled-transition"
+    assert "cutover_start_clamp" not in json.loads(interval_insert.args[28])
