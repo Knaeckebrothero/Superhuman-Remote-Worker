@@ -36,6 +36,16 @@ REQUIRED_APP_TABLES = frozenset(
 
 REQUIRED_AUDIT_TABLES = frozenset({"usage_events", "usage_rollup_dirty_days"})
 
+REQUIRED_SLICE1_APP_TABLES = frozenset(
+    {
+        "resource_inventory_ingest_tickets",
+        "resource_inventory_shadow_comparisons",
+        "resource_inventory_transport_nonces",
+        "resource_inventory_watch_events",
+        "resource_inventory_watch_sessions",
+    }
+)
+
 REQUIRED_APP_INDEXES = frozenset(
     {
         "resource_inventory_scope_epochs_active_uq",
@@ -45,6 +55,22 @@ REQUIRED_APP_INDEXES = frozenset(
         "resource_publication_plans_pending_idx",
         "usage_daily_v2_dims_uq",
         "usage_rates_v2_lookup_idx",
+    }
+)
+
+REQUIRED_SLICE1_APP_INDEXES = frozenset(
+    {
+        "resource_intervals_open_scope_identity_idx",
+        "resource_inventory_ingest_tickets_expiry_idx",
+        "resource_inventory_snapshots_sealed_retention_idx",
+        "resource_inventory_snapshots_staging_retention_idx",
+        "resource_inventory_shadow_comparisons_latest_idx",
+        "resource_inventory_shadow_comparisons_unresolved_idx",
+        "resource_inventory_transport_nonces_expiry_idx",
+        "resource_inventory_watch_events_gap_idx",
+        "resource_inventory_watch_events_scope_uid_idx",
+        "resource_inventory_watch_sessions_live_idx",
+        "resource_inventory_watch_sessions_retention_idx",
     }
 )
 
@@ -72,6 +98,24 @@ REQUIRED_APP_TRIGGER_RELATIONS = {
     "usage_rate_components_v2_immutable": "usage_rate_components_v2",
 }
 REQUIRED_APP_TRIGGERS = frozenset(REQUIRED_APP_TRIGGER_RELATIONS)
+
+REQUIRED_SLICE1_APP_TRIGGER_RELATIONS = {
+    "infra_metering_control_monotonic_generation": "infra_metering_control",
+    "resource_inventory_ingest_tickets_one_way": ("resource_inventory_ingest_tickets"),
+    "resource_inventory_shadow_comparisons_immutable": (
+        "resource_inventory_shadow_comparisons"
+    ),
+    "resource_inventory_snapshot_items_generation_fence": (
+        "resource_inventory_snapshot_items"
+    ),
+    "resource_inventory_snapshots_generation_fence": ("resource_inventory_snapshots"),
+    "resource_inventory_transport_nonces_immutable": (
+        "resource_inventory_transport_nonces"
+    ),
+    "resource_inventory_watch_events_immutable": "resource_inventory_watch_events",
+    "resource_inventory_watch_sessions_one_way": ("resource_inventory_watch_sessions"),
+}
+REQUIRED_SLICE1_APP_TRIGGERS = frozenset(REQUIRED_SLICE1_APP_TRIGGER_RELATIONS)
 
 REQUIRED_AUDIT_TRIGGER_RELATIONS = {
     "usage_events_rollup_dirty_days": "usage_events",
@@ -140,6 +184,18 @@ class MeteringSchemaCapabilities:
     target_partitions_ready: bool = False
 
     @property
+    def missing_slice1_app_tables(self) -> frozenset[str]:
+        return REQUIRED_SLICE1_APP_TABLES - self.app_tables
+
+    @property
+    def missing_slice1_app_indexes(self) -> frozenset[str]:
+        return REQUIRED_SLICE1_APP_INDEXES - self.app_indexes
+
+    @property
+    def missing_slice1_app_triggers(self) -> frozenset[str]:
+        return REQUIRED_SLICE1_APP_TRIGGERS - self.app_triggers
+
+    @property
     def missing_app_tables(self) -> frozenset[str]:
         return REQUIRED_APP_TABLES - self.app_tables
 
@@ -190,6 +246,20 @@ class MeteringSchemaCapabilities:
             and self.target_partitions_ready
         )
 
+    @property
+    def slice1_inventory_ready(self) -> bool:
+        """App-DB collector readiness, independent of the optional audit tier."""
+
+        return (
+            not self.missing_app_tables
+            and not self.missing_app_indexes
+            and not self.missing_app_triggers
+            and self.app_seed_rows_ready
+            and not self.missing_slice1_app_tables
+            and not self.missing_slice1_app_indexes
+            and not self.missing_slice1_app_triggers
+        )
+
     def diagnostics(self) -> dict[str, Any]:
         return {
             "slice0_ready": self.slice0_ready,
@@ -206,6 +276,10 @@ class MeteringSchemaCapabilities:
             "dirty_day_trigger": self.dirty_day_trigger,
             "append_only_trigger": self.append_only_trigger,
             "target_partitions_ready": self.target_partitions_ready,
+            "slice1_inventory_ready": self.slice1_inventory_ready,
+            "missing_slice1_app_tables": sorted(self.missing_slice1_app_tables),
+            "missing_slice1_app_indexes": sorted(self.missing_slice1_app_indexes),
+            "missing_slice1_app_triggers": sorted(self.missing_slice1_app_triggers),
         }
 
 
@@ -271,10 +345,15 @@ async def probe_schema_capabilities(
     audit_pool: asyncpg.Pool | None,
 ) -> MeteringSchemaCapabilities:
     """Probe both databases; absence remains a normal, fail-closed state."""
-    app_tables = await _table_names(app_pool, REQUIRED_APP_TABLES)
-    app_indexes = await _index_names(app_pool, REQUIRED_APP_INDEXES)
+    app_tables = await _table_names(
+        app_pool, REQUIRED_APP_TABLES | REQUIRED_SLICE1_APP_TABLES
+    )
+    app_indexes = await _index_names(
+        app_pool, REQUIRED_APP_INDEXES | REQUIRED_SLICE1_APP_INDEXES
+    )
     app_triggers = await _enabled_trigger_names(
-        app_pool, REQUIRED_APP_TRIGGER_RELATIONS
+        app_pool,
+        REQUIRED_APP_TRIGGER_RELATIONS | REQUIRED_SLICE1_APP_TRIGGER_RELATIONS,
     )
     audit_tables = await _table_names(audit_pool, REQUIRED_AUDIT_TABLES)
     audit_indexes = await _index_names(audit_pool, REQUIRED_AUDIT_INDEXES)

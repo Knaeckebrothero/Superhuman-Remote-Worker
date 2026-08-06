@@ -1,6 +1,21 @@
 {{- if and .Values.infrastructureMetering.shadowEnabled (not .Values.infrastructureMetering.collectorEnabled) }}
 {{- fail "infrastructureMetering.shadowEnabled requires collectorEnabled" }}
 {{- end }}
+{{- if and .Values.infrastructureMetering.collectorEnabled (not .Values.infrastructureMetering.stableClusterId) }}
+{{- fail "infrastructureMetering.collectorEnabled requires stableClusterId" }}
+{{- end }}
+{{- if and .Values.infrastructureMetering.collectorEnabled (ne (.Values.infrastructureMetering.deploymentMode | default "dedicated") "dedicated") }}
+{{- fail "infrastructureMetering.collectorEnabled currently requires deploymentMode=dedicated" }}
+{{- end }}
+{{- if and .Values.infrastructureMetering.collectorEnabled (not .Values.infrastructureMetering.networkPolicy.enabled) (not .Values.infrastructureMetering.networkPolicy.allowUnrestrictedEgress) }}
+{{- fail "infrastructureMetering.collectorEnabled requires networkPolicy.enabled or explicit networkPolicy.allowUnrestrictedEgress=true" }}
+{{- end }}
+{{- if lt (int .Values.infrastructureMetering.staleAfterSeconds) (int .Values.infrastructureMetering.relistIntervalSeconds) }}
+{{- fail "infrastructureMetering.staleAfterSeconds must be greater than or equal to relistIntervalSeconds" }}
+{{- end }}
+{{- if lt (int .Values.infrastructureMetering.diagnosticRetentionDays) (int .Values.infrastructureMetering.snapshotItemRetentionDays) }}
+{{- fail "infrastructureMetering.diagnosticRetentionDays must be greater than or equal to snapshotItemRetentionDays" }}
+{{- end }}
 {{- if .Values.infrastructureMetering.publicationEnabled }}
 {{- if not .Values.infrastructureMetering.collectorEnabled }}
 {{- fail "infrastructureMetering.publicationEnabled requires collectorEnabled" }}
@@ -247,13 +262,25 @@ data:
 
   # Orchestrator settings
   AUTO_ASSIGN_ENABLED: {{ .Values.orchestrator.autoAssignEnabled | quote }}
-  # Infrastructure metering dark-launch gates (Slice 0). These never grant the
-  # orchestrator Kubernetes read permissions; collector/RBAC arrives later.
+  # Infrastructure metering gates and bounded Slice 1 collection settings.
   INFRASTRUCTURE_METERING_V2_READS_ENABLED: {{ .Values.infrastructureMetering.v2ReadsEnabled | default false | quote }}
   INFRASTRUCTURE_METERING_COLLECTOR_ENABLED: {{ .Values.infrastructureMetering.collectorEnabled | default false | quote }}
   INFRASTRUCTURE_METERING_SHADOW_ENABLED: {{ .Values.infrastructureMetering.shadowEnabled | default false | quote }}
   INFRASTRUCTURE_METERING_PUBLICATION_ENABLED: {{ .Values.infrastructureMetering.publicationEnabled | default false | quote }}
   INFRASTRUCTURE_METERING_STABLE_CLUSTER_ID: {{ .Values.infrastructureMetering.stableClusterId | default "" | quote }}
+  INFRASTRUCTURE_METERING_DEPLOYMENT_MODE: {{ .Values.infrastructureMetering.deploymentMode | default "dedicated" | quote }}
+  INFRASTRUCTURE_METERING_NAMESPACE_ALLOWLIST: {{ concat (list .Release.Namespace) (.Values.infrastructureMetering.namespaceAllowlist | default list) | uniq | join "," | quote }}
+  INFRASTRUCTURE_METERING_RELIST_INTERVAL_SECONDS: {{ .Values.infrastructureMetering.relistIntervalSeconds | default 300 | quote }}
+  INFRASTRUCTURE_METERING_STALE_AFTER_SECONDS: {{ .Values.infrastructureMetering.staleAfterSeconds | default 900 | quote }}
+  INFRASTRUCTURE_METERING_LIST_PAGE_SIZE: {{ .Values.infrastructureMetering.listPageSize | default 500 | quote }}
+  INFRASTRUCTURE_METERING_SCOPE_CONCURRENCY: {{ .Values.infrastructureMetering.scopeConcurrency | default 2 | quote }}
+  INFRASTRUCTURE_METERING_WATCH_QUEUE_SIZE: {{ .Values.infrastructureMetering.watchQueueSize | default 10000 | quote }}
+  INFRASTRUCTURE_METERING_MAX_SNAPSHOT_ITEMS: {{ .Values.infrastructureMetering.maxSnapshotItems | default 50000 | quote }}
+  INFRASTRUCTURE_METERING_MAX_SNAPSHOT_BYTES: {{ .Values.infrastructureMetering.maxSnapshotBytes | default 67108864 | quote }}
+  INFRASTRUCTURE_METERING_INGESTION_TICKET_TTL_SECONDS: {{ .Values.infrastructureMetering.ingestionTicketTtlSeconds | default 600 | quote }}
+  INFRASTRUCTURE_METERING_SNAPSHOT_ITEM_RETENTION_DAYS: {{ .Values.infrastructureMetering.snapshotItemRetentionDays | default 7 | quote }}
+  INFRASTRUCTURE_METERING_DIAGNOSTIC_RETENTION_DAYS: {{ .Values.infrastructureMetering.diagnosticRetentionDays | default 35 | quote }}
+  INFRASTRUCTURE_METERING_CLEANUP_INTERVAL_SECONDS: {{ .Values.infrastructureMetering.cleanupIntervalSeconds | default 300 | quote }}
 
   # Neo4j — only the Bolt URL is non-secret. Both NEO4J_USERNAME and
   # NEO4J_PASSWORD live in the Secret/Vault, mirroring the POSTGRES_USER /

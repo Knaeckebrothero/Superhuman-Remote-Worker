@@ -204,17 +204,56 @@ orchestrator:
 # =============================================================================
 # Infrastructure allocation metering
 # =============================================================================
-# Slice 0 dark-launch controls. Every switch is independent and defaults off;
-# later slices add collector/RBAC/publication implementations behind these same
-# gates. See docs/features/infrastructure_resource_metering.md.
+# Gated infrastructure allocation metering. Slice 1 can run the dedicated Pod
+# collector and shadow reconciliation without publishing customer usage.
 infrastructureMetering:
   v2ReadsEnabled: false
   collectorEnabled: false
   shadowEnabled: false
   publicationEnabled: false
-  # Stable operator-owned installation identity. Required before publication;
-  # it must survive endpoint and credential rotation.
+  # Stable operator-owned installation identity. Required before collection or
+  # publication; it must survive endpoint and credential rotation.
   stableClusterId: ""
+  deploymentMode: dedicated
+  # The release namespace is always included. Add separate workspace/agent
+  # namespaces here; each receives its own namespace-scoped RoleBinding.
+  namespaceAllowlist: []
+  relistIntervalSeconds: 300
+  staleAfterSeconds: 900
+  listPageSize: 500
+  scopeConcurrency: 2
+  watchQueueSize: 10000
+  maxSnapshotItems: 50000
+  maxSnapshotBytes: 67108864
+  ingestionTicketTtlSeconds: 600
+  # Raw snapshot items are diagnostic scaffolding, not the durable accounting
+  # record. Immutable manifests remain after their children expire.
+  snapshotItemRetentionDays: 7
+  diagnosticRetentionDays: 35
+  cleanupIntervalSeconds: 300
+  ingestionSecretName: "" # defaults to the chart's main application Secret
+  ingestionSecretKey: INFRASTRUCTURE_METERING_INGESTION_KEY
+  networkPolicy:
+    # Egress-deny cannot infer every distribution's API-server address. Enable
+    # after supplying the control-plane CIDRs used by this cluster. DNS is
+    # restricted to the selected kube-system resolver Pods; adjust the selector
+    # for distributions that do not use the standard CoreDNS label.
+    enabled: false
+    # Explicit break-glass acknowledgement for clusters where a supported
+    # egress NetworkPolicy cannot be installed. Enabling the collector with
+    # both this and `enabled` false is rejected at template time.
+    allowUnrestrictedEgress: false
+    apiServerCidrs: []
+    dnsNamespace: kube-system
+    dnsPodSelector:
+      k8s-app: kube-dns
+  resources:
+    requests:
+      cpu: 25m
+      memory: 64Mi
+    limits:
+      cpu: 250m
+      memory: 256Mi
 
 # =============================================================================
 # Agent
