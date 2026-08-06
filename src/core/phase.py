@@ -918,11 +918,11 @@ def finalize_job(
                 git_mgr.commit("Job completed (autonomy=full)", allow_empty=True)
                 phase_num = state.get("phase_number", 0)
                 short_id = job_id[:8]
-                git_mgr.tag(
-                    f"{short_id}-job-completed-phase-{phase_num}",
-                    "Job auto-completed (full autonomy)",
-                )
+                tag_name = f"{short_id}-job-completed-phase-{phase_num}"
+                tag_ok = git_mgr.tag(tag_name, "Job auto-completed (full autonomy)")
                 git_mgr.push()
+                if tag_ok:
+                    git_mgr.push_ref(f"refs/tags/{tag_name}")
             except Exception as e:
                 logger.warning(f"[{job_id}] Final git push failed: {e}")
 
@@ -990,11 +990,11 @@ def finalize_job(
             git_mgr.commit("Job frozen for review", allow_empty=True)
             phase_num = state.get("phase_number", 0)
             short_id = job_id[:8]
-            git_mgr.tag(
-                f"{short_id}-job-frozen-phase-{phase_num}",
-                "Job frozen for human review",
-            )
+            tag_name = f"{short_id}-job-frozen-phase-{phase_num}"
+            tag_ok = git_mgr.tag(tag_name, "Job frozen for human review")
             git_mgr.push()
+            if tag_ok:
+                git_mgr.push_ref(f"refs/tags/{tag_name}")
         except Exception as e:
             logger.warning(f"[{job_id}] Final git push failed: {e}")
 
@@ -1056,13 +1056,8 @@ def _complete_phase_with_git(
         return
 
     try:
-        # Create tag for completed phase (namespaced by job short ID)
-        short_id = job_id[:8]
-        tag_name = f"{short_id}-phase-{phase_number}-{phase_type}-complete"
-        git_mgr.tag(tag_name, f"Phase {phase_number} {phase_type} complete")
-        logger.debug(f"Created git tag: {tag_name}")
-
-        # Commit any pending changes from this phase
+        # Commit any pending changes from this phase first so the tag marks
+        # the completion commit itself
         commit_msg = (
             f"[Phase {phase_number} {phase_type.title()}] Complete - "
             f"archived {todos_archived} todos"
@@ -1070,10 +1065,19 @@ def _complete_phase_with_git(
         git_mgr.commit(commit_msg, allow_empty=True)
         logger.debug(f"Committed phase completion: {commit_msg}")
 
-        # Push to remote for workspace delivery
+        # Tag the completion commit (namespaced by job short ID, create-once)
+        short_id = job_id[:8]
+        tag_name = f"{short_id}-phase-{phase_number}-{phase_type}-complete"
+        tag_ok = git_mgr.tag(tag_name, f"Phase {phase_number} {phase_type} complete")
+        logger.debug(f"Tagged phase completion: {tag_name} (ok={tag_ok})")
+
+        # Push to remote for workspace delivery, then deliver the tag as an
+        # exact ref; on a tag invariant violation the ref stays local
         branch = git_mgr.current_branch()
         logger.debug(f"Pushing phase completion to branch: {branch}")
         git_mgr.push()
+        if tag_ok:
+            git_mgr.push_ref(f"refs/tags/{tag_name}")
 
     except Exception as e:
         logger.warning(f"Git operations failed during phase transition: {e}")

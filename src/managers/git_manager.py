@@ -42,6 +42,27 @@ _STILL_RUNNING_MARKER = "--- still running ---"
 _COLLIDING_MARKER = "previous command still running"
 
 
+class TagInvariantViolation(RuntimeError):
+    """A phase-boundary tag already exists at a different commit.
+
+    Phase tags are audit boundaries: once created they must never move.
+    Carries the tag name plus both commits for diagnostics.
+    """
+
+    def __init__(
+        self,
+        tag_name: str,
+        existing_sha: Optional[str],
+        head_sha: Optional[str],
+    ):
+        self.tag_name = tag_name
+        self.existing_sha = existing_sha
+        self.head_sha = head_sha
+        super().__init__(
+            f"tag {tag_name} already at {existing_sha}, HEAD is {head_sha}"
+        )
+
+
 class GitManager:
     """Manages git operations for a workspace directory.
 
@@ -477,21 +498,39 @@ class GitManager:
             return False
 
     def tag(self, tag_name: str, message: Optional[str] = None) -> bool:
-        """Create a git tag at current HEAD.
+        """Create a git tag at current HEAD (create-once, never moved).
+
+        Phase tags are audit boundaries: if the tag already exists at the
+        current HEAD commit this is a no-op; if it exists at a different
+        commit the call logs a TagInvariantViolation and refuses to move it.
 
         Args:
             tag_name: Tag name (e.g., "phase-2-tactical-complete")
             message: Optional tag message (creates annotated tag if provided)
 
         Returns:
-            True if successful, False otherwise
+            True if the tag exists at HEAD (created or already there),
+            False otherwise
         """
         if not self.is_active:
             logger.debug("Git not active, skipping tag")
             return False
 
         try:
-            args = ["tag", "-f"]
+            existing_sha = self.resolve_tag_commit(tag_name)
+            if existing_sha:
+                head_sha = self.get_current_commit()
+                if existing_sha == head_sha:
+                    logger.debug(f"Tag {tag_name} already at {head_sha}, no-op")
+                    return True
+                violation = TagInvariantViolation(tag_name, existing_sha, head_sha)
+                logger.error(
+                    f"Phase tag invariant violation: {violation} "
+                    f"— refusing to move an audit boundary"
+                )
+                return False
+
+            args = ["tag"]
             if message:
                 args.extend(["-a", tag_name, "-m", message])
             else:
@@ -508,6 +547,35 @@ class GitManager:
         except Exception as e:
             logger.error(f"Failed to create tag: {e}")
             return False
+
+    def resolve_tag_commit(self, tag_name: str) -> Optional[str]:
+        """Resolve a tag to the commit SHA it points at.
+
+        Dereferences annotated tags to the tagged commit.
+
+        Args:
+            tag_name: Tag name to resolve
+
+        Returns:
+            Commit SHA, or None if the tag doesn't exist (or on error)
+        """
+        if not self.is_active:
+            return None
+
+        try:
+            result = self._run_git(
+                [
+                    "rev-parse",
+                    "--verify",
+                    "--quiet",
+                    f"refs/tags/{tag_name}" + "^{commit}",
+                ]
+            )
+            if result.returncode != 0:
+                return None
+            return result.stdout.strip() or None
+        except Exception:
+            return None
 
     def list_tags(self, pattern: Optional[str] = None) -> List[str]:
         """List git tags, optionally filtered by pattern.
@@ -796,7 +864,7 @@ class GitManager:
             return False
 
     def push(
-        self, remote: str = "origin", branch: Optional[str] = None, tags: bool = True
+        self, remote: str = "origin", branch: Optional[str] = None, tags: bool = False
     ) -> bool:
         """Push commits and optionally tags to remote.
 
@@ -807,10 +875,14 @@ class GitManager:
         of the six call sites also discard the return value. See
         docs/issues/deliverable_lost_to_nested_repo_commit_and_stranded_mode_a_job.md.
 
+        Tag delivery is normally per-ref via push_ref() so one rejected
+        historical tag can't spoil every subsequent push; tags=True remains
+        available for explicitly pushing all tags.
+
         Args:
             remote: Remote name (default: "origin")
             branch: Branch to push (auto-detected if None)
-            tags: Also push tags (default: True)
+            tags: Also push all tags (default: False)
 
         Returns:
             True if push succeeded, False otherwise
@@ -860,6 +932,44 @@ class GitManager:
 
         except Exception as e:
             logger.warning(f"Push failed: {e}")
+            return False
+
+    def push_ref(self, ref: str, remote: str = "origin") -> bool:
+        """Push a single exact ref (e.g. "refs/tags/<name>") to the remote.
+
+        Delivers phase-boundary tags one at a time instead of spraying every
+        historical tag via ``git push --tags``.
+
+        Args:
+            ref: Fully qualified ref to push (e.g. "refs/tags/<name>")
+            remote: Remote name (default: "origin")
+
+        Returns:
+            True if the push succeeded, False otherwise
+        """
+        if not self.is_active:
+            logger.warning(
+                f"push_ref skipped — git not active: {self._inactive_reason()}"
+            )
+            return False
+        if not self.has_remote(remote):
+            logger.warning(
+                f"push_ref skipped — no '{remote}' remote configured "
+                f"(at {self._remote_cwd or self._workspace_path})"
+            )
+            return False
+
+        try:
+            result = self._run_git(["push", remote, f"{ref}:{ref}"], timeout=120)
+            if result.returncode != 0:
+                logger.warning(f"git push {ref} failed: {result.stderr}")
+                return False
+
+            logger.debug(f"Pushed {ref} to {remote}")
+            return True
+
+        except Exception as e:
+            logger.warning(f"Push of {ref} failed: {e}")
             return False
 
     def has_unpushed_commits(
