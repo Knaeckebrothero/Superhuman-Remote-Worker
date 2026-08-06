@@ -17,6 +17,7 @@ import os
 import random
 import statistics
 from collections.abc import Awaitable, Callable, Mapping, Sequence
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID
@@ -33,6 +34,9 @@ TERMINAL_JOB_STATUSES = frozenset(
 TERMINAL_RUN_STATUSES = frozenset({"done", "cancelled"})
 TAIL_ANOMALY_FRACTION = 0.15
 SWEEP_SECONDS = int(os.getenv("BENCH_SWEEP_SECONDS", "30"))
+# Cross-replica sweep claim, hashed server-side via hashtext(). Mirrored in
+# orchestrator/database/lock_ids.py for the collision audit.
+BENCH_SWEEP_LOCK = "bench_sweep"
 
 CreateJobFn = Callable[
     [dict[str, Any], dict[str, Any], dict[str, Any], int],
@@ -144,6 +148,40 @@ class BenchStore:
                 """
             )
         return [_record_dict(row) or {} for row in rows]
+
+    @asynccontextmanager
+    async def try_sweep_lock(self):
+        """Claim the cross-replica sweeper tick; yields False when another
+        replica holds it.
+
+        Session-scoped (``pg_try_advisory_lock``), not xact-scoped: the tick
+        spans many independent statements on other pool connections, so the
+        claim must outlive any single transaction. Claim and release run on
+        the SAME held connection — ``PostgresDB.fetchval`` acquires a fresh
+        pooled connection per call, which would unlock a different session.
+        asyncpg's pool reset backstops a lost release when the connection is
+        returned. See docs/issues/bench_sweeper_multi_replica_race.md.
+        """
+        async with self.db.acquire() as conn:
+            claimed = bool(
+                await conn.fetchval(
+                    "SELECT pg_try_advisory_lock(hashtext($1))", BENCH_SWEEP_LOCK
+                )
+            )
+            try:
+                yield claimed
+            finally:
+                if claimed:
+                    try:
+                        await conn.fetchval(
+                            "SELECT pg_advisory_unlock(hashtext($1))",
+                            BENCH_SWEEP_LOCK,
+                        )
+                    except Exception:  # pragma: no cover — session already gone
+                        logger.warning(
+                            "Bench sweep lock release failed; the session's "
+                            "end frees it"
+                        )
 
     async def save_run(
         self,
@@ -469,16 +507,39 @@ async def sweep_run(
     return created
 
 
-async def sweep_tick(store: BenchStore, create_job_fn: CreateJobFn) -> int:
-    """Sweep every running run once, isolating failures per run."""
+@asynccontextmanager
+async def _try_sweep_lock(store: Any):
+    """Claim the tick, tolerating narrow test stores without the method."""
+    claim = getattr(type(store), "try_sweep_lock", None)
+    if claim is None:
+        yield True
+        return
+    async with store.try_sweep_lock() as claimed:
+        yield bool(claimed)
 
-    created = 0
-    for run in await store.list_running_runs():
-        try:
-            created += await sweep_run(store, run, create_job_fn)
-        except Exception:
-            logger.exception("Bench run %s sweep failed", run.get("id"))
-    return created
+
+async def sweep_tick(store: BenchStore, create_job_fn: CreateJobFn) -> int:
+    """Sweep every running run once, isolating failures per run.
+
+    Cross-replica guard: only the replica that claims the advisory lock
+    sweeps; the loser skips the whole tick and retries next tick. Two
+    orchestrator replicas both ran this loop and double-submitted
+    (task, arm, replicate) pairs 2-5 ms apart — see
+    docs/issues/bench_sweeper_multi_replica_race.md.
+    """
+
+    async with _try_sweep_lock(store) as claimed:
+        if not claimed:
+            logger.debug("Bench sweep tick skipped: another replica holds the lock")
+            return 0
+
+        created = 0
+        for run in await store.list_running_runs():
+            try:
+                created += await sweep_run(store, run, create_job_fn)
+            except Exception:
+                logger.exception("Bench run %s sweep failed", run.get("id"))
+        return created
 
 
 async def bench_sweeper_loop(

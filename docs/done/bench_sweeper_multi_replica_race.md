@@ -1,6 +1,23 @@
 # Job Bench sweeper: no multi-replica claim — duplicate-submission race
 
-**Status:** Open, low-severity. Found 2026-08-05 during `baseline-02`, the
+**Status:** FIXED 2026-08-06 (batch fix session) — option 1 implemented:
+`sweep_tick` now runs under a session-scoped
+`pg_try_advisory_lock(hashtext('bench_sweep'))` claimed and released on ONE
+held pool connection (`BenchStore.try_sweep_lock`); the loser skips the whole
+tick. Key mirrored in `orchestrator/database/lock_ids.py`. Unit tests:
+`tests/test_bench_service.py` (two concurrent ticks → single submission +
+unique (task, arm, replicate) pairs; release between ticks; release under a
+raising sweep; loser issues no unlock; claim+release share one session —
+`PostgresDB.fetchval` would unlock a different pooled session). Live k3d
+check 2026-08-06: run `e2233fba` (1 task × 1 arm × 1 replicate) → sweeper
+submitted exactly 1 job (`50a7fa16`) through the locked tick, single ledger
+entry — the lock does not starve a single-replica deploy. Option 3's claim
+("no leader-election precedent") was stale — `run_when_leader` exists and
+wraps ~15 main.py loops; the bench sweeper escaped that audit because it
+starts from a *router* lifespan. The advisory lock is the tighter local fix;
+wrapping the router lifespan in `run_when_leader` remains a valid alternative
+if the sweeper ever grows more ticks.
+**Originally:** Open, low-severity. Found 2026-08-05 during `baseline-02`, the
 component's first live run on dev (the k3d smoke was single-replica, so this
 never had a chance to show).
 
