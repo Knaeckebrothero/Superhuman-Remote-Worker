@@ -40,6 +40,24 @@ def preemption_blocked_reason(
     return None
 
 
+def resume_lane_applies(job: dict[str, Any], *, has_checkpoint: bool) -> bool:
+    """True → dispatch via ``/job/resume``; False → fresh ``/job/start``.
+
+    Only a 'paused' job that actually RAN may take the resume lane. A
+    paused-but-never-started job re-dispatched as a resume reaches the agent
+    with no description/deliverables/kickoff — ``JobResumeRequest`` carries
+    none of them — so it starts brief-less and strands. The caller resolves
+    ``has_checkpoint`` (``PostgresDB.job_has_checkpoint``); when checkpoint
+    presence is unknowable (sqlite backend) that probe fails open to True,
+    preserving today's behavior — the agent-side brief hydration + tripwire
+    cover that half. See
+    docs/issues/fresh_job_dispatched_as_resume_skips_seeding.md.
+    """
+    if str(job.get("status") or "") != "paused":
+        return False
+    return has_checkpoint
+
+
 # VM provisioning decision outcomes — the dispatcher performs the I/O each names.
 VM_PROVISION = "provision"  # (re)create the VM (retries remain)
 VM_PARK_EXHAUSTED = "park_exhausted"  # retries used up → mark failed + park

@@ -20,8 +20,30 @@ from orchestrator.services.dispatch_guards import (
     VM_RECYCLE,
     VM_WAIT,
     preemption_blocked_reason,
+    resume_lane_applies,
     vm_provisioning_decision,
 )
+
+
+class TestResumeLaneApplies:
+    """Lane choice: /job/resume only for paused jobs that actually ran.
+
+    A paused-but-never-started job dispatched as a resume reaches the agent
+    brief-less (JobResumeRequest has no description/deliverables/kickoff) and
+    strands. See docs/issues/fresh_job_dispatched_as_resume_skips_seeding.md.
+    """
+
+    def test_paused_with_checkpoint_resumes(self):
+        assert resume_lane_applies({"status": "paused"}, has_checkpoint=True)
+
+    def test_paused_without_checkpoint_takes_fresh_lane(self):
+        assert not resume_lane_applies({"status": "paused"}, has_checkpoint=False)
+
+    def test_non_paused_statuses_never_resume(self):
+        for status in ("created", "failed", "processing", "", None):
+            assert not resume_lane_applies(
+                {"status": status}, has_checkpoint=True
+            ), status
 
 
 class TestPreemptionBlockedReason:

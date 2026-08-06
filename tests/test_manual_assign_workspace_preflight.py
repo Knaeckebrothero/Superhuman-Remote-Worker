@@ -104,3 +104,43 @@ class TestManualAssignWorkspacePreflight:
         main.postgres_db.shed_workspace_context.assert_not_awaited()
         main._dispatch_job_to_agent.assert_awaited_once()
         main._trigger_dispatch.assert_not_called()
+
+
+class TestAssignLaneChoice:
+    """Paused jobs only take /job/resume when a checkpoint proves they ran.
+
+    A paused-but-never-started job routed down /job/resume starts brief-less
+    (docs/issues/fresh_job_dispatched_as_resume_skips_seeding.md).
+    """
+
+    @pytest.mark.asyncio
+    async def test_paused_with_checkpoint_uses_resume_lane(
+        self, collaborators, monkeypatch
+    ):
+        monkeypatch.setattr(
+            main.postgres_db, "job_has_checkpoint", AsyncMock(return_value=True)
+        )
+        main.postgres_db.get_job.return_value = _job("paused", workspace_status="ready")
+        main.postgres_db.get_agent.return_value = _agent()
+
+        result = await main.assign_job_to_agent(MagicMock(), JOB_ID, AGENT_ID)
+
+        assert result["status"] == "assigned"
+        main._resume_job_on_agent.assert_awaited_once()
+        main._dispatch_job_to_agent.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_paused_never_started_job_uses_the_fresh_lane(
+        self, collaborators, monkeypatch
+    ):
+        monkeypatch.setattr(
+            main.postgres_db, "job_has_checkpoint", AsyncMock(return_value=False)
+        )
+        main.postgres_db.get_job.return_value = _job("paused", workspace_status="ready")
+        main.postgres_db.get_agent.return_value = _agent()
+
+        result = await main.assign_job_to_agent(MagicMock(), JOB_ID, AGENT_ID)
+
+        assert result["status"] == "assigned"
+        main._dispatch_job_to_agent.assert_awaited_once()
+        main._resume_job_on_agent.assert_not_awaited()

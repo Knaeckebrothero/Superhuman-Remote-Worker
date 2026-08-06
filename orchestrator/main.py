@@ -193,6 +193,7 @@ from services.dispatch_guards import (  # noqa: E402
     VM_RECYCLE,
     VM_WAIT,
     preemption_blocked_reason,
+    resume_lane_applies,
     vm_provisioning_decision,
 )
 from services.audit_usage import materialize_llm_usage_from_audit  # noqa: E402
@@ -7108,9 +7109,19 @@ async def _try_dispatch_pending_jobs() -> None:
                         job_id,
                     )
                     continue
-                if job["status"] == "paused":
+                if resume_lane_applies(
+                    job,
+                    has_checkpoint=await postgres_db.job_has_checkpoint(job_id),
+                ):
                     success = await _resume_job_on_agent(job, agent)
                 else:
+                    if job["status"] == "paused":
+                        logger.info(
+                            "Dispatcher: job %s is paused with no checkpoint — "
+                            "never started; dispatching via the fresh "
+                            "/job/start lane",
+                            job_id,
+                        )
                     success = await _dispatch_job_to_agent(job, agent)
 
                 if success:
@@ -19438,10 +19449,21 @@ async def assign_job_to_agent(
                 detail="Agent has no pod IP configured",
             )
 
-        # Use resume path for paused jobs, start path for new/failed
-        if job["status"] == "paused":
+        # Use resume path for paused jobs that actually ran, start path for
+        # new/failed — and for paused-but-never-started jobs, whose resume
+        # would skip task-brief seeding (fresh_job_dispatched_as_resume_
+        # skips_seeding.md).
+        if resume_lane_applies(
+            job, has_checkpoint=await postgres_db.job_has_checkpoint(job_id)
+        ):
             success = await _resume_job_on_agent(job, agent)
         else:
+            if job["status"] == "paused":
+                logger.info(
+                    "Assign: job %s is paused with no checkpoint — never "
+                    "started; dispatching via the fresh /job/start lane",
+                    job_id,
+                )
             success = await _dispatch_job_to_agent(job, agent)
 
         if not success:
@@ -25379,6 +25401,35 @@ async def get_job_workspace_status(request: Request, job_id: str) -> dict[str, A
         "namespace": wc.get("namespace"),
         "ssh_key_path": os.environ.get("SSH_KEY_PATH"),
         "git_remote_url": wc.get("git_remote_url"),
+    }
+
+
+@app.get("/api/jobs/{job_id}/brief")
+async def get_job_brief(request: Request, job_id: str) -> dict[str, Any]:
+    """Brief fields for the agent's virtual ``task_brief.md``. **Internal** —
+    requires ``X-Internal-Key``.
+
+    ``JobResumeRequest`` carries no description/deliverables/kickoff, so a
+    resumed job would serve an empty brief for the rest of its life; the agent
+    backfills from here on resume
+    (docs/issues/fresh_job_dispatched_as_resume_skips_seeding.md).
+    """
+    await require_internal(request)
+    job = await postgres_db.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    context = job.get("context") or {}
+    if isinstance(context, str):
+        try:
+            context = json.loads(context)
+        except (json.JSONDecodeError, TypeError):
+            context = {}
+
+    return {
+        "description": job.get("description") or "",
+        "required_deliverables": context.get("required_deliverables"),
+        "kickoff_message": context.get("kickoff_message"),
     }
 
 

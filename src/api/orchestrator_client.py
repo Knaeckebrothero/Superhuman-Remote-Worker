@@ -836,6 +836,31 @@ class OrchestratorClient:
             logger.debug(f"Failed to get job workspace status: {e}")
             return None
 
+    async def get_job_brief(self, job_id: str) -> dict | None:
+        """Fetch the job's task-brief fields (internal ``/brief`` endpoint).
+
+        ``JobResumeRequest`` carries no description/required_deliverables/
+        kickoff_message, so a resumed agent backfills them from here before
+        serving the virtual ``task_brief.md``
+        (docs/issues/fresh_job_dispatched_as_resume_skips_seeding.md).
+
+        Returns:
+            Dict {description, required_deliverables, kickoff_message}, or
+            None on failure.
+        """
+        if not self._client:
+            await self.connect()
+
+        url = f"{self.orchestrator_url}/api/jobs/{job_id}/brief"
+        try:
+            response = await self._client.get(url)
+            if response.status_code == 200:
+                return response.json()
+            return None
+        except Exception as e:
+            logger.debug(f"Failed to get job brief: {e}")
+            return None
+
     async def get_thread_lifecycle(self, thread_id: str) -> dict | None:
         """Fetch minimal lifecycle fields for the agent's status watchdog.
 
