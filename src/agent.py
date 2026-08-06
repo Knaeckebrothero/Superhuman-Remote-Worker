@@ -841,6 +841,13 @@ class UniversalAgent:
         self._datasource_clients = {}
         logger.info(f"Processing job {job_id}")
 
+        # JobResumeRequest ships no description/deliverables/kickoff, so a
+        # resumed job would serve an empty virtual task_brief.md for the rest
+        # of its life. Backfill from the orchestrator/DB before the brief
+        # provider registers (fresh_job_dispatched_as_resume_skips_seeding.md).
+        if resume and not self._job_metadata.get("description"):
+            await self._hydrate_job_brief(job_id)
+
         # Wire archiver + job context into AuxiliaryLLM for auxiliary call logging
         if self._auxiliary_llm:
             from src.core.archiver import get_archiver as _get_archiver_for_aux
@@ -1052,6 +1059,10 @@ class UniversalAgent:
                     workspace_path=str(self._workspace_manager.path),
                     metadata=updated_metadata,
                 )
+
+            if resume and graph_input is not None:
+                # Every lookup failed: resume=True with nothing to resume from.
+                await self._note_resume_without_checkpoint(job_id, previous_status)
 
             # Inject feedback into graph state via aupdate_state
             # This sets resume_feedback so route_entry routes to restore_from_feedback
@@ -3368,6 +3379,76 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
         self._agent_seed_files["README.md"] = content
         logger.debug("Wrote job README.md to workspace")
 
+    async def _hydrate_job_brief(self, job_id: str) -> None:
+        """Backfill description/required_deliverables/kickoff_message.
+
+        ``JobResumeRequest`` carries none of them, so a resumed job would
+        serve an empty virtual ``task_brief.md`` for the rest of its life.
+        Sources: orchestrator internal ``/brief`` endpoint first, the agent's
+        own DB handle second; both non-fatal. Never overwrites fields the
+        dispatch already provided.
+        docs/issues/fresh_job_dispatched_as_resume_skips_seeding.md
+        """
+        row = None
+        if self._orchestrator_client:
+            try:
+                row = await self._orchestrator_client.get_job_brief(job_id)
+            except Exception as e:
+                logger.warning(
+                    f"[{job_id}] brief hydration via orchestrator failed: {e}"
+                )
+        if not row and self.postgres_conn:
+            try:
+                import json as _json
+                import uuid as _uuid
+
+                job = await self.postgres_conn.jobs.get(_uuid.UUID(job_id))
+                ctx = (job or {}).get("context") or {}
+                if isinstance(ctx, str):
+                    ctx = _json.loads(ctx)
+                row = {
+                    "description": (job or {}).get("description"),
+                    "required_deliverables": ctx.get("required_deliverables"),
+                    "kickoff_message": ctx.get("kickoff_message"),
+                }
+            except Exception as e:
+                logger.warning(f"[{job_id}] brief hydration via DB failed: {e}")
+        keys = ("description", "required_deliverables", "kickoff_message")
+        if not row or not any(row.get(k) for k in keys):
+            logger.error(
+                f"[{job_id}] resume: task brief could not be hydrated — the "
+                f"virtual task_brief.md will serve empty"
+            )
+            return
+        if self._job_metadata is None:
+            self._job_metadata = {}
+        for key in keys:
+            if row.get(key) and not self._job_metadata.get(key):
+                self._job_metadata[key] = row[key]
+        logger.info(
+            f"[{job_id}] hydrated task brief on resume "
+            f"(description={len(row.get('description') or '')} chars)"
+        )
+
+    async def _note_resume_without_checkpoint(
+        self, job_id: str, previous_status: Optional[str]
+    ) -> None:
+        """Tripwire: ``resume=True`` but no checkpoint or snapshot was found.
+
+        The orchestrator routed a job with nothing to resume down the
+        ``/job/resume`` lane — almost always a never-started job (that lane
+        ships no brief fields). Fall toward fresh seeding: backfill the brief
+        and commit the Phase-0 seed the fresh path would have committed.
+        docs/issues/fresh_job_dispatched_as_resume_skips_seeding.md
+        """
+        logger.error(
+            f"[{job_id}] resume=True but no checkpoint or snapshot was found "
+            f"(previous_status={previous_status!r}) — treating as a fresh "
+            f"start; the job was probably dispatched down the wrong lane"
+        )
+        await self._hydrate_job_brief(job_id)
+        self._commit_workspace_seed(job_id)
+
     def _commit_workspace_seed(self, job_id: str) -> None:
         """Commit and push the seeded workspace as the Phase 0 baseline.
 
@@ -3431,13 +3512,15 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
         from .core.virtual_dirs import build_instruction_providers
         from .core.deliverables import format_deliverable_contract_block
 
-        metadata = self._job_metadata or {}
-
+        # Providers read self._job_metadata LIVE (not a bound alias): resume
+        # hydration may replace or backfill it after these closures are
+        # registered, and a stale alias would serve an empty brief forever
+        # (docs/issues/fresh_job_dispatched_as_resume_skips_seeding.md).
         def _uploaded_instructions():
             # Priority inline > upload (the template is the caller's fallback).
             # Inline is read live so it survives the resume path; upload content
             # was resolved eagerly at boot because its I/O is async.
-            inline = metadata.get("instructions")
+            inline = (self._job_metadata or {}).get("instructions")
             if inline and inline.strip():
                 return inline
             return self._resolved_instructions_md
@@ -3447,8 +3530,9 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             return render_instruction_content(content, loaded_tool_names)
 
         def _task_brief():
-            description = metadata.get("description", "")
-            kickoff_message = metadata.get("kickoff_message", "")
+            meta = self._job_metadata or {}
+            description = meta.get("description", "")
+            kickoff_message = meta.get("kickoff_message", "")
             parts = [f"# Task Brief\n\n## Description\n\n{description}"]
             if kickoff_message:
                 parts.append(f"\n\n## Kickoff Message\n\n{kickoff_message}")
@@ -3456,7 +3540,7 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             # manifest as an explicit block — workers can't be held to a floor
             # they were never shown. Empty string when the job has no manifest.
             contract_block = format_deliverable_contract_block(
-                metadata.get("required_deliverables")
+                meta.get("required_deliverables")
             )
             if contract_block:
                 parts.append(contract_block)

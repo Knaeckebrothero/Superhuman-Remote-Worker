@@ -1732,6 +1732,41 @@ class PostgresDB:
             )
         return result == "UPDATE 1"
 
+    async def job_has_checkpoint(self, thread_id: str) -> bool:
+        """Whether a LangGraph checkpoint exists for this job (thread_id=job_id).
+
+        Lane-choice probe for the dispatcher: a paused job with no checkpoint
+        never actually ran, so it must re-dispatch through the fresh
+        ``/job/start`` lane instead of ``/job/resume``
+        (docs/issues/fresh_job_dispatched_as_resume_skips_seeding.md).
+
+        Fails OPEN (True → resume lane, today's behavior): only a positive
+        "no checkpoint" verdict may flip the lane. sqlite-backed deployments
+        keep checkpoints on the agent where this DB cannot see them, and a
+        transient probe error must not turn a mid-flight job into a fresh
+        start — the agent-side brief hydration + tripwire cover those.
+        """
+        if os.getenv("CHECKPOINTER_BACKEND", "sqlite").strip().lower() != "postgres":
+            return True
+        try:
+            async with self.acquire() as conn:
+                return bool(
+                    await conn.fetchval(
+                        "SELECT EXISTS (SELECT 1 FROM checkpoints "
+                        "WHERE thread_id = $1)",
+                        thread_id,
+                    )
+                )
+        except Exception as e:
+            logger.warning(
+                "job_has_checkpoint: probe failed for %s (%s: %s) — assuming a "
+                "checkpoint exists (resume lane)",
+                thread_id,
+                type(e).__name__,
+                e,
+            )
+            return True
+
     async def delete_checkpoint_thread(self, thread_id: str) -> int:
         """Prune LangGraph checkpoint rows for a terminal job (thread_id=job_id).
 

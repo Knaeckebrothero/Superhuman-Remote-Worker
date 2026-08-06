@@ -1,6 +1,35 @@
 # Never-started job dispatched via /job/resume → virtual task brief serves empty
 
-**Status:** Open — the one genuine product regression surfaced by `baseline-02`
+**Status:** FIXED 2026-08-06 (batch fix session) — all three complementary
+fixes landed:
+(a) **Lane choice**: the dispatcher and the admin-assign route now dispatch a
+paused job via `/job/resume` only when a LangGraph checkpoint proves it ran
+(`dispatch_guards.resume_lane_applies` + `PostgresDB.job_has_checkpoint`;
+note: there is no `jobs.started_at` column, so checkpoint presence is the
+never-started probe). The probe fails OPEN to the resume lane (sqlite
+checkpointer backend / probe error → today's behavior), so only a positive
+"no checkpoint" verdict flips the lane; fixes (b)+(c) cover those deploys.
+(b) **Brief hydration**: the virtual `task_brief.md` provider now reads
+`self._job_metadata` LIVE (the old bound alias went stale on dict
+replacement), and on resume with no description the agent backfills
+description/required_deliverables/kickoff_message from the orchestrator's new
+internal `GET /api/jobs/{id}/brief` (agent DB handle as fallback; both
+non-fatal, never overwrites dispatch-provided fields).
+(c) **Tripwire**: `resume=True` with no checkpoint AND no snapshot →
+`_note_resume_without_checkpoint`: ERROR log + brief hydration + the Phase-0
+seed commit the fresh path would have made.
+**Tests**: `tests/test_dispatch_guards.py::TestResumeLaneApplies`,
+`tests/test_manual_assign_workspace_preflight.py::TestAssignLaneChoice`,
+`tests/test_workspace_phase0_seed.py::TestTaskBriefHydration` (incl. the
+live-read regression and the literal resume-metadata shape) +
+`TestResumeWithoutCheckpointTripwire`.
+**Live k3d 2026-08-06**: paused never-started row `d8f004fa` → dispatcher log
+"paused with no checkpoint — never started; dispatching via the fresh
+/job/start lane"; its first LLM request contained the description, kickoff
+and Task Brief header (audit `llm_requests` probe `t|t|t`). Then paused
+mid-processing (checkpoint present) → resume lane, and the resuming agent
+logged "hydrated task brief on resume (description=123 chars)".
+**Originally:** Open — the one genuine product regression surfaced by `baseline-02`
 (2026-08-05). Job `6cf03bf3-c1f5-44f2-8544-0a494faec08d` (bench `S4-csv-totals`
 r2) emailed its owner "Task Brief is Empty - Action Required" and froze in
 `waiting_for_reply`, despite `jobs.description` holding the full task text.
