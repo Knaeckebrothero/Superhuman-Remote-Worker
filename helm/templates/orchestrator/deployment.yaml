@@ -18,7 +18,7 @@ spec:
       labels:
         {{- include "srw.componentSelectorLabels" (dict "context" . "component" "orchestrator") | nindent 8 }}
       annotations:
-        checksum/infrastructure-metering-gates: {{ printf "%v|%v|%v|%v|%s" .Values.infrastructureMetering.v2ReadsEnabled .Values.infrastructureMetering.collectorEnabled .Values.infrastructureMetering.shadowEnabled .Values.infrastructureMetering.publicationEnabled .Values.infrastructureMetering.stableClusterId | sha256sum | quote }}
+        checksum/infrastructure-metering-gates: {{ toJson .Values.infrastructureMetering | sha256sum | quote }}
     spec:
       serviceAccountName: {{ include "srw.fullname" . }}-orchestrator
       terminationGracePeriodSeconds: {{ .Values.orchestrator.terminationGracePeriodSeconds }}
@@ -1272,6 +1272,77 @@ spec:
                 configMapKeyRef:
                   name: {{ include "srw.configMapName" . }}
                   key: INFRASTRUCTURE_METERING_STABLE_CLUSTER_ID
+            - name: INFRASTRUCTURE_METERING_DEPLOYMENT_MODE
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: INFRASTRUCTURE_METERING_DEPLOYMENT_MODE
+            - name: INFRASTRUCTURE_METERING_NAMESPACE_ALLOWLIST
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: INFRASTRUCTURE_METERING_NAMESPACE_ALLOWLIST
+            - name: INFRASTRUCTURE_METERING_RELIST_INTERVAL_SECONDS
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: INFRASTRUCTURE_METERING_RELIST_INTERVAL_SECONDS
+            - name: INFRASTRUCTURE_METERING_STALE_AFTER_SECONDS
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: INFRASTRUCTURE_METERING_STALE_AFTER_SECONDS
+            - name: INFRASTRUCTURE_METERING_LIST_PAGE_SIZE
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: INFRASTRUCTURE_METERING_LIST_PAGE_SIZE
+            - name: INFRASTRUCTURE_METERING_SCOPE_CONCURRENCY
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: INFRASTRUCTURE_METERING_SCOPE_CONCURRENCY
+            - name: INFRASTRUCTURE_METERING_WATCH_QUEUE_SIZE
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: INFRASTRUCTURE_METERING_WATCH_QUEUE_SIZE
+            - name: INFRASTRUCTURE_METERING_MAX_SNAPSHOT_ITEMS
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: INFRASTRUCTURE_METERING_MAX_SNAPSHOT_ITEMS
+            - name: INFRASTRUCTURE_METERING_MAX_SNAPSHOT_BYTES
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: INFRASTRUCTURE_METERING_MAX_SNAPSHOT_BYTES
+            - name: INFRASTRUCTURE_METERING_INGESTION_TICKET_TTL_SECONDS
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: INFRASTRUCTURE_METERING_INGESTION_TICKET_TTL_SECONDS
+            - name: INFRASTRUCTURE_METERING_SNAPSHOT_ITEM_RETENTION_DAYS
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: INFRASTRUCTURE_METERING_SNAPSHOT_ITEM_RETENTION_DAYS
+            - name: INFRASTRUCTURE_METERING_DIAGNOSTIC_RETENTION_DAYS
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: INFRASTRUCTURE_METERING_DIAGNOSTIC_RETENTION_DAYS
+            - name: INFRASTRUCTURE_METERING_CLEANUP_INTERVAL_SECONDS
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: INFRASTRUCTURE_METERING_CLEANUP_INTERVAL_SECONDS
+            - name: INFRASTRUCTURE_METERING_INGESTION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.infrastructureMetering.ingestionSecretName | default (include "srw.secretName" .) }}
+                  key: {{ .Values.infrastructureMetering.ingestionSecretKey | default "INFRASTRUCTURE_METERING_INGESTION_KEY" }}
+                  optional: {{ not .Values.infrastructureMetering.collectorEnabled }}
             {{- with .Values.orchestrator.kbGitAllowedHosts }}
             - name: KB_GIT_ALLOWED_HOSTS
               value: {{ . | quote }}

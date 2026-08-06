@@ -210,6 +210,15 @@ from services.infrastructure_metering import (  # noqa: E402
 from services.infrastructure_metering.queries import (  # noqa: E402
     visibility_from_kwargs as _usage_v2_visibility,
 )
+from services.infrastructure_metering.ingestion import (  # noqa: E402
+    InfrastructureIngestionService,
+    dispatch_ingestion_request,
+    run_inventory_generation_loop,
+)
+from services.infrastructure_metering.ingestion_http import (  # noqa: E402
+    IngestionRequestError,
+)
+from services.infrastructure_metering.inventory import InventoryStore  # noqa: E402
 from services.openrouter_pricing import llm_pricing_sync_loop  # noqa: E402
 from services.remote_image import (  # noqa: E402
     MAX_REMOTE_IMAGE_URL_CHARS,
@@ -456,6 +465,8 @@ usage_cloud_estimator: CloudCostEstimator | None = None
 infrastructure_metering_settings = InfrastructureMeteringSettings()
 infrastructure_usage_v2: UsageV2QueryService | None = None
 infrastructure_usage_rollup: TypedUsageDailyRollup | None = None
+infrastructure_inventory_store: InventoryStore | None = None
+infrastructure_ingestion_service: InfrastructureIngestionService | None = None
 
 
 async def _workspace_metering_attribution(
@@ -8226,10 +8237,11 @@ async def lifespan(app: FastAPI):
     global usage_cloud_estimator
     usage_cloud_estimator = CloudCostEstimator(postgres_db.pool)
 
-    # Infrastructure metering Slice 0 is a dark launch: schemas and typed reads
-    # may be exercised independently, but no collector or publication task is
-    # started here. Both DBs are probed after migrations because app/audit
-    # migration order must never be inferred from one process's startup order.
+    # Infrastructure metering remains a dark launch: Slice 0 typed reads and
+    # the Slice 1 inventory/shadow collector may be exercised independently,
+    # but publication is not implemented. Both DBs are probed after migrations
+    # because app/audit migration order must never be inferred from one
+    # process's startup order.
     # Heal the rolling current+2 partition window before the one-shot probe. If
     # a pod first restarts after a UTC month boundary, waiting for the later
     # maintenance task would otherwise freeze Slice 0 unavailable until another
@@ -8244,7 +8256,8 @@ async def lifespan(app: FastAPI):
                 exc_info=True,
             )
     global infrastructure_metering_settings, infrastructure_usage_v2
-    global infrastructure_usage_rollup
+    global infrastructure_usage_rollup, infrastructure_inventory_store
+    global infrastructure_ingestion_service
     infrastructure_metering_settings = InfrastructureMeteringSettings.from_env()
     metering_capabilities = await probe_schema_capabilities(
         postgres_db.pool,
@@ -8286,15 +8299,86 @@ async def lifespan(app: FastAPI):
                     "route remains unavailable",
                     exc_info=True,
                 )
+    infrastructure_inventory_store = None
+    infrastructure_ingestion_service = None
     if infrastructure_metering_settings.collector_enabled:
-        logger.warning(
-            "Infrastructure metering collector gate is set, but collection "
-            "does not start until Slice 1"
-        )
+        if not metering_capabilities.slice1_inventory_ready:
+            logger.error(
+                "Infrastructure metering collection requested but Slice 1 "
+                "inventory capabilities are incomplete: %s",
+                metering_capabilities.diagnostics(),
+            )
+        else:
+            ingestion_key = os.environ.get("INFRASTRUCTURE_METERING_INGESTION_KEY", "")
+            try:
+                candidate_store = InventoryStore(
+                    postgres_db.pool,
+                    max_batch_items=500,
+                    max_batch_bytes=min(
+                        2 * 1024 * 1024,
+                        infrastructure_metering_settings.max_snapshot_bytes,
+                    ),
+                    max_snapshot_items=(
+                        infrastructure_metering_settings.max_snapshot_items
+                    ),
+                    max_snapshot_bytes=(
+                        infrastructure_metering_settings.max_snapshot_bytes
+                    ),
+                    max_error_items=2_000,
+                    ticket_ttl=timedelta(
+                        seconds=(
+                            infrastructure_metering_settings.ingestion_ticket_ttl_seconds
+                        )
+                    ),
+                    watch_session_ttl=timedelta(
+                        seconds=(
+                            infrastructure_metering_settings.ingestion_ticket_ttl_seconds
+                        )
+                    ),
+                    max_watch_events=(
+                        # Reserve one durable control-event slot so an
+                        # ambiguous final object-event ACK can still record a
+                        # history gap instead of being blocked by the bound it
+                        # may have just reached.
+                        infrastructure_metering_settings.watch_queue_size + 1
+                    ),
+                    max_watch_event_bytes=min(
+                        2 * 1024 * 1024,
+                        infrastructure_metering_settings.max_snapshot_bytes,
+                    ),
+                    max_watch_bytes=(
+                        # The history-gap control event is zero-byte, but an
+                        # extra byte keeps the session live when the last
+                        # allowed source event lands exactly on the collector
+                        # byte ceiling and its response is lost.
+                        infrastructure_metering_settings.max_snapshot_bytes + 1
+                    ),
+                )
+                candidate_service = InfrastructureIngestionService(
+                    postgres_db.pool,
+                    candidate_store,
+                    infrastructure_metering_settings,
+                    ingestion_key=ingestion_key,
+                )
+            except (TypeError, ValueError):
+                logger.error(
+                    "Infrastructure metering ingestion configuration is invalid; "
+                    "collector requests remain unavailable",
+                    exc_info=True,
+                )
+            else:
+                infrastructure_inventory_store = candidate_store
+                infrastructure_ingestion_service = candidate_service
+                logger.info(
+                    "Infrastructure metering ingestion enabled mode=%s",
+                    "shadow"
+                    if infrastructure_metering_settings.shadow_enabled
+                    else "inventory-only",
+                )
     if infrastructure_metering_settings.publication_enabled:
         logger.warning(
-            "Infrastructure metering publication gate is set, but Slice 0 "
-            "contains no publication path"
+            "Infrastructure metering publication gate is set, but publication "
+            "is not implemented; no infrastructure usage will be published"
         )
 
     # Encrypt any legacy plaintext datasource credentials. Idempotent — once
@@ -8566,6 +8650,32 @@ async def lifespan(app: FastAPI):
     leader_task = asyncio.create_task(
         run_as_leader(postgres_db, LEADER_ID, _shutdown_event)
     )
+    infrastructure_inventory_generation_task = (
+        asyncio.create_task(
+            run_when_leader(
+                lambda stop: run_inventory_generation_loop(
+                    stop,
+                    infrastructure_inventory_store,
+                    cleanup_interval_seconds=(
+                        infrastructure_metering_settings.cleanup_interval_seconds
+                    ),
+                    snapshot_item_retention=timedelta(
+                        days=(
+                            infrastructure_metering_settings.snapshot_item_retention_days
+                        )
+                    ),
+                    diagnostic_retention=timedelta(
+                        days=(
+                            infrastructure_metering_settings.diagnostic_retention_days
+                        )
+                    ),
+                ),
+                _shutdown_event,
+            )
+        )
+        if infrastructure_inventory_store is not None
+        else None
+    )
     datasource_reconciliation_task = asyncio.create_task(
         run_datasource_project_reconciler(
             postgres_db,
@@ -8822,6 +8932,8 @@ async def lifespan(app: FastAPI):
     # Signal shutdown to background tasks
     _shutdown_event.set()
     await leader_task
+    if infrastructure_inventory_generation_task is not None:
+        await infrastructure_inventory_generation_task
     await datasource_reconciliation_task
     await stale_detector_task
     await token_cleanup_task
@@ -20410,6 +20522,82 @@ def _build_timeseries(
         s["events"] += r["events"]
     ordered = sorted(series.values(), key=lambda s: s["events"], reverse=True)
     return {"days": days, "series": ordered}
+
+
+async def _dispatch_infrastructure_ingestion(
+    operation: Literal[
+        "ticket",
+        "snapshot_begin",
+        "snapshot_items",
+        "snapshot_finalize",
+        "watch_apply",
+        "watch_finish",
+    ],
+    request: Request,
+) -> dict[str, Any]:
+    try:
+        return await dispatch_ingestion_request(
+            infrastructure_ingestion_service,
+            operation,
+            request,
+        )
+    except IngestionRequestError as exc:
+        headers = {"Retry-After": "1"} if exc.status_code in {409, 503} else None
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail=exc.code,
+            headers=headers,
+        ) from exc
+
+
+@app.post(
+    "/api/internal/infrastructure-metering/v1/tickets",
+    include_in_schema=False,
+)
+async def infrastructure_metering_ticket(request: Request) -> dict[str, Any]:
+    return await _dispatch_infrastructure_ingestion("ticket", request)
+
+
+@app.post(
+    "/api/internal/infrastructure-metering/v1/snapshots/begin",
+    include_in_schema=False,
+)
+async def infrastructure_metering_snapshot_begin(request: Request) -> dict[str, Any]:
+    return await _dispatch_infrastructure_ingestion("snapshot_begin", request)
+
+
+@app.post(
+    "/api/internal/infrastructure-metering/v1/snapshots/items",
+    include_in_schema=False,
+)
+async def infrastructure_metering_snapshot_items(request: Request) -> dict[str, Any]:
+    return await _dispatch_infrastructure_ingestion("snapshot_items", request)
+
+
+@app.post(
+    "/api/internal/infrastructure-metering/v1/snapshots/finalize",
+    include_in_schema=False,
+)
+async def infrastructure_metering_snapshot_finalize(
+    request: Request,
+) -> dict[str, Any]:
+    return await _dispatch_infrastructure_ingestion("snapshot_finalize", request)
+
+
+@app.post(
+    "/api/internal/infrastructure-metering/v1/watch/apply",
+    include_in_schema=False,
+)
+async def infrastructure_metering_watch_apply(request: Request) -> dict[str, Any]:
+    return await _dispatch_infrastructure_ingestion("watch_apply", request)
+
+
+@app.post(
+    "/api/internal/infrastructure-metering/v1/watch/finish",
+    include_in_schema=False,
+)
+async def infrastructure_metering_watch_finish(request: Request) -> dict[str, Any]:
+    return await _dispatch_infrastructure_ingestion("watch_finish", request)
 
 
 @app.get("/api/usage/v2", response_model=UsageSummaryV2)

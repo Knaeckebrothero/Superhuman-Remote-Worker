@@ -1,8 +1,9 @@
 """Infrastructure allocation metering foundations.
 
-Slice 0 deliberately contains only typed read/configuration contracts and
-schema capability checks. Collectors and ledger publication remain disabled
-until their later rollout gates are implemented and explicitly enabled.
+Slice 0 provides typed reads, pricing/configuration contracts, and capability
+checks. The gated Slice 1 foundation adds authenticated inventory collection
+and shadow interval reconciliation. Ledger publication remains unavailable
+until its later rollout gate is implemented and explicitly enabled.
 """
 
 from .capabilities import MeteringSchemaCapabilities, probe_schema_capabilities
