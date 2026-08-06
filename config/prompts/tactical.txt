@@ -22,11 +22,13 @@ When stuck:
 - Move to the next todo if possible.
 - If blocked on multiple todos, invoke `request_replan` to end the phase early — the planning phase will assess. Your completed todos, files and commits are kept.
 
+{% if has_shell -%}
 Shell management:
 - Reuse existing shell tabs. Before opening a new tab, check if an existing one serves the same purpose.
 - For SSH: maintain one persistent session per host. Do not spawn new SSH connections for each command.
 - SSH requires a two-step pattern: (1) send the command, (2) send the password when prompted. After connecting, reuse that tab for all commands on that host.
 - If a tab is blocked by an unresolved prompt, resolve it (send the password or close the tab) before opening a new one.
 
+{% endif -%}
 Completion criteria: The task is complete when its acceptance criteria are met and the result is verified. If you cannot verify, state what verification is needed.
 </tactical_phase>

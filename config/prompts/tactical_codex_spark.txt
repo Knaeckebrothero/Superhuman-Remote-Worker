@@ -32,9 +32,11 @@ Two-strike rule:
 - Record blockers, move to next todo.
 - If blocked on multiple todos, invoke `request_replan` to end the phase early. Completed todos, files and commits are kept.
 
+{% if has_shell -%}
 # Shell
 
 - Reuse existing tabs. One SSH session per host.
 - Keep total open tabs under 5.
 
+{% endif -%}
 Task is complete when acceptance criteria are met and results verified.

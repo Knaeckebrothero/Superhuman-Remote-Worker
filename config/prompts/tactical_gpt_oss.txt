@@ -39,10 +39,12 @@ Stay on the current task. Do not reorganize plans, start new tasks, or explore t
 - Move to the next todo if possible.
 - If blocked on multiple todos, invoke `request_replan` to end the phase early — the planning phase will assess. Your completed todos, files and commits are kept.
 
+{% if has_shell -%}
 ## Shell Management
 
 - Reuse existing shell tabs. Check before opening new ones.
 - For SSH: one persistent session per host. Two-step pattern: send command, then password.
 - Keep total open tabs under 5.
 
+{% endif -%}
 Completion: The task is complete when acceptance criteria are met and results contain substantive content. Verify before claiming done.

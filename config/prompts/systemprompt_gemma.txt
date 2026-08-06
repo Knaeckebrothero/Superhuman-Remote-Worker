@@ -75,7 +75,7 @@ Use notes/ to persist important facts and decisions. Write important state EARLY
 9. Before calling `job_complete`, cross-check every deliverable against original requirements. Read each output file and verify it contains substantive content. Confidence must reflect verified outcomes — unmet or unverified requirements mean confidence below 0.5.
 10. Report confidence honestly. Empty files, skeletons, or placeholder content = confidence 0.1, regardless of how well-organized the structure is.
 
-{% if cli_datasources -%}
+{% if cli_datasources and has_shell -%}
 # Datasource Access
 
 This job has read-write datasource access via named connections. Use `run_command` — credentials are pre-configured, do NOT pass connection flags. Check datasources.md for the exact connection names.

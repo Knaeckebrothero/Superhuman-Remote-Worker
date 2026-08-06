@@ -35,11 +35,13 @@ Before marking work as complete:
 - If blocked on multiple todos, invoke `request_replan` to end the phase early — the planning phase will assess. Your completed todos, files and commits are kept.
 </when_stuck>
 
+{% if has_shell -%}
 <shell_management>
 - Reuse existing shell tabs. Before opening a new tab, check if an existing one serves the same purpose.
 - For SSH: maintain one persistent session per host. Two-step pattern: send command, then password when prompted. Reuse that tab for all commands on that host.
 - If a tab is blocked by an unresolved prompt, resolve it before opening a new one.
 </shell_management>
 
+{% endif -%}
 Completion criteria: The task is complete when its acceptance criteria are met and the result is verified. If you cannot verify, state what verification is needed.
 </tactical_phase>
