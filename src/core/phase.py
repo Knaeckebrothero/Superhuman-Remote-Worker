@@ -829,8 +829,21 @@ def finalize_job(
     job_id = state.get("job_id", "unknown")
     autonomy = getattr(config, "autonomy", "partial") if config else "partial"
 
-    # Check for deferred verdict data (from critic evaluation tools)
+    # Check for deferred verdict data (from critic evaluation tools). The
+    # module dict is a process cache; the checkpointed ``verdict_decision``
+    # channel (mirrored by the audited tool node) recovers a restarted
+    # critic's verdict so its freeze carries the real verdict instead of
+    # falling into the no-verdict escalation below. The ledger on the TARGET
+    # job stays authoritative either way (_resolve_critic_outcome).
     verdict = get_verdict_data(job_id)
+    if not verdict:
+        state_verdict = state.get("verdict_decision")
+        if isinstance(state_verdict, dict) and state_verdict:
+            logger.info(
+                f"[{job_id}] Recovered critic verdict from graph state "
+                f"(process cache empty after restart)"
+            )
+            verdict = state_verdict
     if verdict:
         clear_verdict_data(job_id)
         # Also clear final_phase_data if set (evaluation tools set it to trigger finalize_job)
@@ -854,18 +867,58 @@ def finalize_job(
             f"target {metadata['verification_target']} to a human."
         )
 
-    # Get the final phase data (set by job_complete tool)
+    # Get the final phase data. Durable-first order: the process dict is only
+    # a cache — after a restart the checkpointed ``completion_decision``
+    # channel (mirrored by the audited tool node when job_complete journaled
+    # the decision) is what survives; resume hydration re-seeds the dict from
+    # the DB record before the graph even runs.
     final_data = get_final_phase_data(job_id)
+    if not final_data:
+        state_decision = state.get("completion_decision")
+        if isinstance(state_decision, dict) and state_decision:
+            logger.info(
+                f"[{job_id}] Recovered completion decision from graph state "
+                f"(process cache empty after restart, tool_call_id="
+                f"{state_decision.get('tool_call_id')})"
+            )
+            final_data = state_decision
 
     if not final_data:
-        # Fallback data if not found (shouldn't happen)
-        logger.warning(f"[{job_id}] No final phase data found, using defaults")
-        final_data = {
-            "summary": "Job completed",
-            "deliverables": [],
-            "confidence": 1.0,
-            "job_id": job_id,
-        }
+        if metadata.get("verification_target"):
+            # No-verdict critic (the ERROR above already fired): complete with
+            # an HONEST minimal report so the orchestrator's ledger lookup
+            # escalates the target. This is the fail-closed design — but the
+            # report must say what actually happened, not fabricate a
+            # confident "Job completed" with an empty deliverable list.
+            final_data = {
+                "summary": (
+                    "Critic finished without a durably recorded verdict; "
+                    "the orchestrator will escalate the target for manual "
+                    "review."
+                ),
+                "deliverables": [],
+                "confidence": 0.0,
+                "job_id": job_id,
+            }
+        else:
+            # Worker with NO recorded decision anywhere (cache, graph state,
+            # resume hydration). Fabricating a placeholder report here is the
+            # exact defect of docs/issues/
+            # job_finalization_decisions_held_only_in_process_memory.md —
+            # fail loudly back to the model instead, which re-issues
+            # job_complete (journaled + idempotent) and recovers.
+            logger.error(
+                f"[{job_id}] Finalization triggered but NO completion "
+                f"decision was found (process cache, graph state and resume "
+                f"hydration all empty). Refusing to fabricate a completion "
+                f"report."
+            )
+            return reject_transition(
+                state,
+                "Cannot finalize: no recorded completion decision was found "
+                "for this job. Call job_complete again with your summary, "
+                "deliverables and confidence to finish the job.",
+            )
 
     # Clear the final phase data
     clear_final_phase_data(job_id)
@@ -1186,18 +1239,22 @@ def on_strategic_phase_complete(
     job_id = state.get("job_id", "unknown")
     phase_number = state.get("phase_number", 0)
 
-    # Check if this is the final phase (job_complete was called)
+    # Check if this is the final phase (job_complete was called). The process
+    # dict is a cache; ``is_final_phase`` and ``completion_decision`` are the
+    # checkpointed mirrors written by the audited tool node when the decision
+    # was durably journaled — they make this trigger survive a restart.
     is_final = state.get("is_final_phase", False)
-    final_data = get_final_phase_data(job_id)
+    final_data = get_final_phase_data(job_id) or state.get("completion_decision")
 
     if is_final or final_data:
         logger.info(f"[{job_id}] Final phase detected, completing job")
         return finalize_job(state, workspace, todo_manager, config=config)
 
-    # Check for deferred verdict data (critic evaluation tools)
+    # Check for deferred verdict data (critic evaluation tools; same
+    # cache-plus-checkpointed-mirror pattern as above)
     from ..tools.evaluation.evaluation_tools import get_verdict_data
 
-    verdict_data = get_verdict_data(job_id)
+    verdict_data = get_verdict_data(job_id) or state.get("verdict_decision")
     if verdict_data:
         logger.info(f"[{job_id}] Verdict detected, finalizing critic job")
         return finalize_job(state, workspace, todo_manager, config=config)

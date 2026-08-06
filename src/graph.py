@@ -4043,11 +4043,25 @@ def create_restore_from_feedback_node(
         # Include remove markers + compacted messages + feedback message
         result_messages = remove_markers + actual_messages + [feedback_message]
 
+        # A feedback resume demands NEW work, so any journaled finalization
+        # decision from the previous round is void: clear the process caches
+        # (a loop-mode agent resumes in the SAME process, where the audited
+        # tool node would otherwise re-mirror the stale decision every batch)
+        # and null the checkpointed mirrors. The orchestrator drops the
+        # durable ``context.completion_decision`` in queue_job_for_resume.
+        from .tools.core.job import clear_final_phase_data
+        from .tools.evaluation.evaluation_tools import clear_verdict_data
+
+        clear_final_phase_data(job_id)
+        clear_verdict_data(job_id)
+
         return {
             "messages": result_messages,
             "resume_feedback": None,  # Clear — consumed
             "resume_reason": None,  # Clear — consumed
             "is_final_phase": False,
+            "completion_decision": None,  # Void — new round, new decision
+            "verdict_decision": None,  # Void — new round, new decision
             "should_stop": False,
             "goal_achieved": False,
             "is_strategic_phase": True,
@@ -4834,9 +4848,45 @@ def create_audited_tool_node(
             except Exception as e:
                 logger.warning(f"[{job_id}] Queued-reply delivery failed: {e}")
 
+        # Finalization-decision mirror (journal-before-observe step 3, docs/
+        # issues/job_finalization_decisions_held_only_in_process_memory.md):
+        # the module dicts are populated only AFTER the orchestrator durably
+        # committed the decision, so mirroring them into checkpointed state
+        # here means any checkpoint that contains the tool result also
+        # contains the decision — a restart can no longer separate them.
+        # Riding the node's own update (instead of a Command return from
+        # inside the tool) keeps this wrapper's result post-processing intact
+        # and gives the mirror single-writer semantics per super-step, so no
+        # append reducer is needed. Re-asserted on every batch on purpose:
+        # after resume hydration re-seeds the cache, the next batch restores
+        # the state mirror too.
+        result.update(_decision_state_mirror(job_id))
+
         return result
 
     return audited_tools
+
+
+def _decision_state_mirror(job_id: str) -> Dict[str, Any]:
+    """State updates mirroring any journaled finalization decision.
+
+    Reads the process caches that ``job_complete`` / the verdict tools
+    populate only after their durable write succeeded. Returns ``{}`` when no
+    decision exists, so callers can merge unconditionally.
+    """
+    from .tools.core.job import get_final_phase_data
+    from .tools.evaluation.evaluation_tools import get_verdict_data
+
+    updates: Dict[str, Any] = {}
+    final_decision = get_final_phase_data(job_id)
+    verdict_decision = get_verdict_data(job_id)
+    if final_decision:
+        updates["completion_decision"] = final_decision
+    if verdict_decision:
+        updates["verdict_decision"] = verdict_decision
+    if updates:
+        updates["is_final_phase"] = True
+    return updates
 
 
 # =============================================================================

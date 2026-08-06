@@ -19,6 +19,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from tests._tool_invoke import invoke_tool
+
 from src.core.workspace_backend import WorkspaceUnavailableError
 from src.tools.core.job import _final_phase_data, create_job_tools
 
@@ -62,12 +64,13 @@ class TestWorkspaceDeathPropagates:
         mark_complete, job_complete = _tools(_dead_workspace())
 
         with pytest.raises(WorkspaceUnavailableError):
-            await job_complete.ainvoke(
+            await invoke_tool(
+                job_complete,
                 {
                     "summary": "Delivered the theme candidate.",
                     "deliverables": ["theme_program/theme_overview.md"],
                     "confidence": 0.98,
-                }
+                },
             )
 
     @pytest.mark.asyncio
@@ -97,12 +100,13 @@ class TestWorkspaceDeathPropagates:
         mark_complete, job_complete = _tools(ws)
 
         with pytest.raises(WorkspaceUnavailableError):
-            await job_complete.ainvoke(
+            await invoke_tool(
+                job_complete,
                 {
                     "summary": "Delivered the theme candidate.",
                     "deliverables": ["theme_program/theme_overview.md"],
                     "confidence": 0.98,
-                }
+                },
             )
 
     @pytest.mark.asyncio
@@ -112,12 +116,13 @@ class TestWorkspaceDeathPropagates:
         ws.exists.side_effect = RuntimeError("something mundane broke")
         mark_complete, job_complete = _tools(ws)
 
-        result = await job_complete.ainvoke(
+        result = await invoke_tool(
+            job_complete,
             {
                 "summary": "Delivered the theme candidate.",
                 "deliverables": ["theme_program/theme_overview.md"],
                 "confidence": 0.98,
-            }
+            },
         )
         assert isinstance(result, str)
         assert "something mundane broke" in result

@@ -18,6 +18,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from tests._tool_invoke import invoke_tool
+
 project_root = Path(__file__).parent.parent
 src_path = project_root / "src"
 if str(src_path) not in sys.path:
@@ -63,6 +65,9 @@ def _job_tools(workspace, job_id="job-deliverables-test"):
     context.has_workspace.return_value = True
     context.workspace_manager = workspace
     context.has_todo.return_value = False
+    # MagicMock would auto-create a non-awaitable client and trip the
+    # journal-before-observe POST; None takes the in-memory-only path.
+    context.orchestrator_client = None
     return create_job_tools(context)
 
 
@@ -144,12 +149,13 @@ class TestJobCompleteF14:
         workspace.write_file("repo/output/data.json", "d" * 200)
         _, job_complete = _job_tools(workspace)
 
-        result = await job_complete.ainvoke(
+        result = await invoke_tool(
+            job_complete,
             {
                 "summary": "All deliverables shipped.",
                 "deliverables": ["output/report.md", "output/data.json"],
                 "confidence": 0.9,
-            }
+            },
         )
         assert "ERROR" not in result
         assert "Phase marked as final" in result
@@ -159,12 +165,13 @@ class TestJobCompleteF14:
     async def test_prefixed_paths_accepted_when_files_unprefixed(self, workspace):
         workspace.write_file("output/report.md", "r" * 200)
         _, job_complete = _job_tools(workspace)
-        result = await job_complete.ainvoke(
+        result = await invoke_tool(
+            job_complete,
             {
                 "summary": "Done.",
                 "deliverables": ["repo/output/report.md"],
                 "confidence": 0.95,
-            }
+            },
         )
         assert "ERROR" not in result
         assert "Phase marked as final" in result
@@ -172,12 +179,13 @@ class TestJobCompleteF14:
     @pytest.mark.asyncio
     async def test_genuinely_missing_file_still_rejected(self, workspace):
         _, job_complete = _job_tools(workspace)
-        result = await job_complete.ainvoke(
+        result = await invoke_tool(
+            job_complete,
             {
                 "summary": "Done.",
                 "deliverables": ["output/never_written.md"],
                 "confidence": 0.9,
-            }
+            },
         )
         assert "ERROR" in result
         assert "does not exist" in result
@@ -187,12 +195,13 @@ class TestJobCompleteF14:
         """kb: entries are validated server-side by the gate, never against
         the workspace — they must not fail the seal here."""
         _, job_complete = _job_tools(workspace)
-        result = await job_complete.ainvoke(
+        result = await invoke_tool(
+            job_complete,
             {
                 "summary": "Done.",
                 "deliverables": ["kb:century-findings"],
                 "confidence": 0.9,
-            }
+            },
         )
         assert "ERROR" not in result
         assert "Phase marked as final" in result

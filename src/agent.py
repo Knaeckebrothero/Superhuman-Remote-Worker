@@ -1075,6 +1075,11 @@ class UniversalAgent:
                         "should_stop": False,
                         "goal_achieved": False,
                         "is_final_phase": False,
+                        # A feedback resume voids any journaled finalization
+                        # decision from the previous round (restore_from_feedback
+                        # clears the process caches too).
+                        "completion_decision": None,
+                        "verdict_decision": None,
                     },
                     as_node="__start__",
                 )
@@ -1175,6 +1180,32 @@ class UniversalAgent:
                     logger.warning(
                         f"[{job_id}] Failed to clear stop flags on auto-continue "
                         f"resume (job may re-freeze without progress): {e}"
+                    )
+
+            # Durable-first resume hydration (journal-before-observe):
+            # a restarted process lost the in-memory completion decision, so
+            # re-seed the cache from the journaled record. Never on feedback
+            # resumes — those demand new work and the decision is void (the
+            # orchestrator also drops it in queue_job_for_resume). Never on
+            # fresh dispatches — a fresh run must not inherit a stale
+            # decision and insta-finalize. Non-fatal: without it the
+            # checkpointed state mirror and the model's own re-issued
+            # job_complete (idempotent) still recover.
+            if resume and not feedback and self._orchestrator_client:
+                try:
+                    decision = (
+                        await self._orchestrator_client.fetch_completion_decision(
+                            job_id
+                        )
+                    )
+                    if decision:
+                        from .tools.core.job import seed_final_phase_data
+
+                        seed_final_phase_data(job_id, decision)
+                except Exception as e:
+                    logger.warning(
+                        f"[{job_id}] Completion-decision hydration failed "
+                        f"(non-fatal, state mirror still applies): {e}"
                     )
 
             if stream:
