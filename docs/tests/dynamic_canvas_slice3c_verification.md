@@ -6,6 +6,21 @@ does not enable the viewer or claim production-browser/edge acceptance.
 
 **Feature:** `docs/features/dynamic_canvas.md`
 
+**Correction (2026-08-05).** The third bullet below — "the role has exactly the
+columns required by gateway bootstrap, exchange, session authentication,
+workspace-target revalidation, and revocation" — was true and still not
+sufficient, and the gap only surfaced when the viewer was first exercised end
+to end on dev. A privilege contract names columns; PostgreSQL also requires
+`UPDATE` on at least one column for `FOR SHARE`/`FOR UPDATE`, so the `FOR SHARE`
+reads that `begin_bootstrap` and `exchange_bootstrap` took on `canvases`,
+`threads`, and `srw_sessions` were denied outright and every bootstrap returned
+`500 canvas_gateway_error`. Nothing in this checkpoint could have caught it:
+the attestation passes, and every test here runs as the migration owner, which
+can lock anything. Fixed in `27235e71` (those methods read authoritative rows
+unlocked) and the integration suite now drives the gateway-only methods through
+a pool authenticated *as* the restricted role. See
+`docs/done/canvas_live_preview_blocked_by_etag_row_lock_and_frame_src.md`.
+
 ## What this checkpoint proves
 
 - the isolated-origin gateway cannot inherit `DATABASE_URL`, `POSTGRES_*`, or
