@@ -233,6 +233,17 @@ _turn_event_open: bool = False
 # docs/done/session_resume_cloud_sync_race_late_provision.md
 _cloud_sync_retry_pending: bool = False
 
+# The turn-end cloud push runs as a background task so the loop can park —
+# and the next queued input can start its turn — without waiting on WebDAV
+# round-trips (a fresh pod's first push took minutes and made queued sends
+# look swallowed). Awaited by the next turn's start hook before its pull
+# (strict push(N)→pull(N+1) ordering per mount, never a concurrent walk of
+# the same dedup state) and by every teardown path before the final
+# push_all/aclose. At most one task is pending at a time: the only spawner
+# runs after the previous turn's task was awaited.
+# docs/issues/session_turn_end_cloud_push_blocks_queued_input.md
+_pending_cloud_push_task: Optional[asyncio.Task] = None
+
 # Phase 2 event-log cursor. Allocated synchronously by _broadcast, then queued
 # through one ordered writer so a later sequence can never become visible in
 # Postgres before an earlier queued sequence. Each DB-backed runtime attach
@@ -2339,9 +2350,12 @@ async def _terminate_session_inner(reason: str, *, mark_thread: bool = True) -> 
         await _update_thread_status("ended")
 
     # Final cloud sync + drop secrets. No more background polling to stop:
-    # Phase 1 moved sync to turn boundaries via the coordinator.
+    # Phase 1 moved sync to turn boundaries via the coordinator. The last
+    # turn's background push must land first — never two concurrent walks of
+    # one mount, and never an aclose under an in-flight push.
     if _session.workspace_sync:
         try:
+            await _await_pending_cloud_push()
             await _session.workspace_sync.push_all()
             await _session.workspace_sync.pull_all()
         except Exception as e:
@@ -5054,6 +5068,40 @@ async def _resilient_cloud_sync(op: str, runner, turn_id: int) -> bool:
     return False
 
 
+async def _run_turn_end_cloud_push(sync: Any, turn_id: int) -> None:
+    """Body of the background turn-end push task.
+
+    Same retry/backoff and the same ``workspace_sync.pushing/pushed/error``
+    broadcasts as the old inline await — only the scheduling changed. Takes
+    the coordinator as an argument (not via ``_session``) so a teardown that
+    nulls the session mid-flight can't turn this into an AttributeError.
+    """
+    _broadcast("workspace_sync.pushing", {"turn_id": turn_id})
+    if await _resilient_cloud_sync("push", sync.push_all, turn_id):
+        _broadcast("workspace_sync.pushed", {"turn_id": turn_id})
+
+
+async def _await_pending_cloud_push() -> None:
+    """Wait out the background turn-end push, if one is in flight.
+
+    Failure handling lives inside the task (``_resilient_cloud_sync`` never
+    raises), so this only guards against the task machinery itself; a broken
+    push must delay the next pull, not kill the turn or the teardown that
+    called us.
+    """
+    global _pending_cloud_push_task
+    task = _pending_cloud_push_task
+    _pending_cloud_push_task = None
+    if task is None:
+        return
+    try:
+        await task
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.warning("Turn-end cloud push task failed", exc_info=True)
+
+
 async def _retry_cloud_sync_start(turn_id: int) -> None:
     """Re-attempt a cloud sync that failed to start at attach.
 
@@ -5131,6 +5179,13 @@ async def _loop_on_turn_start(turn_id: int) -> None:
     # the pull below so a recovered session syncs from this turn on.
     if _cloud_sync_retry_pending and _session.workspace_sync is None:
         await _retry_cloud_sync_start(turn_id)
+
+    # The previous turn's push may still be flushing in the background —
+    # wait it out before pulling so each mount keeps strict push→pull
+    # ordering (and the pull's remote listing reflects the last turn's
+    # writes). This is where a too-fast reply pays the push cost: inside a
+    # started turn, visibly, instead of in an invisible pre-turn queue.
+    await _await_pending_cloud_push()
 
     # Phase 1 of cloud_collaboration_model.md §9: pull cloud-side edits
     # before the turn runs so the agent sees the latest user-side state.
@@ -5268,16 +5323,24 @@ async def _loop_on_turn_complete(turn_id: int, metrics: Optional[dict] = None) -
     if turn_id <= 3 and _session.postgres_conn:
         await _auto_title_after_first_turn()
 
-    # Phase 1 of cloud_collaboration_model.md §9: push the agent's edits
-    # to every mounted cloud surface BEFORE the next turn can accept input.
-    # On transient failure we retry+surface via workspace_sync.error rather
-    # than letting the exception kill the loop.
+    # Phase 1 of cloud_collaboration_model.md §9: push the agent's edits to
+    # every mounted cloud surface. Runs as a BACKGROUND task — the old inline
+    # await here held the loop for the whole push (minutes on a fresh pod),
+    # after turn.completed had already gone out, so queued input sat in an
+    # invisible pre-turn limbo. The next turn's start hook awaits the task
+    # before its pull, preserving push→pull ordering per mount; teardown
+    # awaits it before the final sync. Retry + workspace_sync.* broadcasts
+    # are unchanged inside _run_turn_end_cloud_push.
+    # docs/issues/session_turn_end_cloud_push_blocks_queued_input.md
     if _session.workspace_sync:
-        _broadcast("workspace_sync.pushing", {"turn_id": turn_id})
-        if await _resilient_cloud_sync(
-            "push", _session.workspace_sync.push_all, turn_id
-        ):
-            _broadcast("workspace_sync.pushed", {"turn_id": turn_id})
+        global _pending_cloud_push_task
+        # Only reachable with no task pending (turn start awaited it), but a
+        # future caller must never let two pushes walk one mount concurrently.
+        await _await_pending_cloud_push()
+        _pending_cloud_push_task = asyncio.create_task(
+            _run_turn_end_cloud_push(_session.workspace_sync, turn_id),
+            name=f"cloud-push-turn-{turn_id}",
+        )
 
     # Slice C (design §5): ping the orchestrator to stage the protected
     # session's upperdir diff to S3. Fire-and-forget — never blocks the next
@@ -6827,8 +6890,11 @@ async def _handle_archive(ws: WebSocket) -> None:
             return
 
         # 0. Final cloud sync. No background poll to stop after Phase 1.
+        # Await the last turn's background push first (same contract as
+        # _terminate_session): no concurrent walk, no aclose under a push.
         if _session.workspace_sync:
             try:
+                await _await_pending_cloud_push()
                 await _session.workspace_sync.push_all()
                 await _session.workspace_sync.pull_all()
             except Exception as e:

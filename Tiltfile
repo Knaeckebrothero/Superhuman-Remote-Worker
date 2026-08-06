@@ -224,21 +224,23 @@ docker_build(
         ]),
         # Layout matches the Dockerfile's COPYs:
         #   orchestrator/mcp/   → /app/
-        #   orchestrator/services/formatters.py  → /app/services/formatters.py
+        #   src/shared/         → /app/src/shared/   (client + formatters)
         #   orchestrator/security/anti_framing.py → /app/security/anti_framing.py
-        # The services/__init__.py is copied during build and is small +
-        # rarely touched, so it falls into the same sync — `formatters.py`
-        # is the only file outside mcp/ that's imported by server.py.
+        # The watchfiles CMD watches /app recursively, so synced shared-package
+        # edits restart the server like any mcp/ edit.
         sync('orchestrator/mcp/', '/app/'),
-        sync('orchestrator/services/formatters.py', '/app/services/formatters.py'),
+        sync('src/shared/', '/app/src/shared/'),
         sync('orchestrator/security/anti_framing.py', '/app/security/anti_framing.py'),
     ],
     ignore=[
         '**/__pycache__',
         '**/*.pyc',
         '**/*.pyo',
-        # Cross-component dirs the mcp build doesn't care about.
-        'src/',
+        # Cross-component dirs the mcp build doesn't care about. `src` uses
+        # `*` (not trailing `/`) so the `!` negation below can re-include the
+        # shared package the image ships.
+        'src/*',
+        '!src/shared',
         'config/',
         'cockpit/',
         'helm/',
@@ -258,12 +260,7 @@ docker_build(
         'orchestrator/database/',
         'orchestrator/dispatch/',
         'orchestrator/routers/',
-        # services/ uses `*` (not trailing `/`) so `!` negation can
-        # re-include specific files. Excluding the dir outright would
-        # prune the descent and break negation.
-        'orchestrator/services/*',
-        '!orchestrator/services/formatters.py',
-        '!orchestrator/services/__init__.py',
+        'orchestrator/services/',
         'orchestrator/main.py',
         'orchestrator/requirements.txt',
         'docker/Dockerfile.orchestrator*',

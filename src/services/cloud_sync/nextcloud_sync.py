@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 from urllib.parse import urlparse
 
-from .base import WorkspaceSyncBase
+from .base import WorkspaceSyncBase, _normalize_dav_listing
 
 if TYPE_CHECKING:
     from ...core.workspace_backend import WorkspaceBackend
@@ -73,26 +73,10 @@ class NextcloudWorkspaceSync(WorkspaceSyncBase):
             local_path=local_path,
         )
 
-    async def _list_remote_files(self) -> list[dict]:
+    async def _list_remote_files(self, rel_dir: str = "") -> list[dict]:
         client = self._get_client()
-        raw = await asyncio.to_thread(client.list, "/", get_info=True)
-        out: list[dict] = []
-        for item in raw:
-            if not isinstance(item, dict):
-                continue
-            raw_path = item.get("path", "")
-            if raw_path.startswith(self._webdav_base_path):
-                rel = raw_path[len(self._webdav_base_path) :]
-            else:
-                rel = raw_path.strip("/")
-            out.append(
-                {
-                    "path": rel,
-                    "etag": item.get("etag", "") or "",
-                    "isdir": bool(item.get("isdir")),
-                }
-            )
-        return out
+        raw = await asyncio.to_thread(client.list, rel_dir or "/", get_info=True)
+        return _normalize_dav_listing(raw, self._webdav_base_path)
 
     async def _download_file(self, rel_path: str, local_path: str) -> None:
         client = self._get_client()

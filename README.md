@@ -459,7 +459,7 @@ What to watch for in the Tilt UI / pod logs to confirm an edit actually took eff
 
 - **Orchestrator** (`orchestrator/*.py`, `src/*.py`, `config/*`): orchestrator pod log shows `WatchFiles detected changes in '/app/...'` followed by a uvicorn worker re-import. Hit `kubectl ... curl http://localhost:8085/api/health` to confirm.
 - **Cockpit** (`cockpit/src/**/*.ts|html|scss`): cockpit pod log shows `Component update sent to client(s)` (CSS) or `Page reload required` (TS/HTML). Browser auto-refreshes within ~5 s. If `[vite] connected.` is missing from the browser console, the HMR WebSocket dropped — refresh.
-- **MCP** (`orchestrator/mcp/*.py`, `orchestrator/services/formatters.py`): mcp pod log shows `watchfiles: N changes detected` followed by the FastMCP banner with the (potentially updated) server name. `/health` returns 200 within ~10 s.
+- **MCP** (`orchestrator/mcp/*.py`, `src/shared/`): mcp pod log shows `watchfiles: N changes detected` followed by the FastMCP banner with the (potentially updated) server name. `/health` returns 200 within ~10 s.
 - **Agent** (`src/*.py`, `config/*`, `agent.py`): srw-agent image rebuilds (visible in Tilt UI), helm upgrade fans the new `tilt-<hash>` tag into `srw-config`'s `PERSISTENT_AGENT_IMAGE`, Stakater Reloader rolls the orchestrator, **next** session/job picks up the new code. Existing agent pods are unaffected (they hold the old image — agent pods are per-job, not long-running).
 - **Requirements / Dockerfile edits**: trigger `fall_back_on` → full image rebuild + roll. Cold rebuild is ~3-5 min the first time after a `tilt down`; warm is ~10-20 s thanks to the cache mounts in `Dockerfile.*.dev`.
 

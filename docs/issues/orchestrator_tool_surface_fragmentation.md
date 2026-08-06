@@ -13,9 +13,14 @@ registry — with thin per-runtime adapters, so that MCP, persistent sessions, o
 and workers select from *the same* catalogue instead of each maintaining a private
 subset of it.
 
-**Status:** proposed, unbuilt. Filed 2026-08-03 out of the officer-instrument
-investigation. Prerequisite for, and partly subsumed by, `project_tool_deferral`
-(unbuilt) — deferral is what makes a large shared catalogue affordable per-caller.
+**Status:** decided and in execution — see
+`docs/features/unified_orchestrator_tool_surface.md` (2026-08-06), which
+re-scoped the proposal to **one shared job-management toolset** (not a
+full-catalogue unification) and records the ratified decisions; this file
+remains the findings record. Filed 2026-08-03 out of the officer-instrument
+investigation. The full-catalogue idea and `project_tool_deferral` (unbuilt)
+stay related background — deferral is what would make a large shared catalogue
+affordable per-caller.
 Related: `officer_blind_reads_and_worker_bureaucracy.md` (F1–F3 are symptoms of this
 issue), `agent_tool_fixed_vocabularies_invisible_to_model.md`,
 `docs/features/centurion.md` §4.

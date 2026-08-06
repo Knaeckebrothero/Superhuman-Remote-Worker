@@ -8,7 +8,7 @@ See docs/issues/mcp_knowledge_notes_confidence_percent_format_crash.md.
 
 import pytest
 
-from orchestrator.services.formatters import (
+from src.shared.orch_surface.formatters import (
     _fmt_confidence,
     format_frozen_job,
     format_job_detail,

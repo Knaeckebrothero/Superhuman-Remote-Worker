@@ -79,3 +79,31 @@ absent from v1 — they change as the repo changes, which breaks pinning.
 - **Cost attribution is main-loop only.** The reporter counts
   `call_type=main` requests; auxiliary calls (memory extraction, curation)
   are not in the ceremony numbers, matching the §10 methodology.
+
+## Operating notes (from `baseline-02`, the first live server-side run)
+
+- **Auth:** the orchestrator wants the token in the `Authorization: Bearer`
+  slot (`X-MCP-Token` alone 401s on every route). `bench/_api.py` sends both.
+- **Run row shape:** `state` on `/api/bench/runs/{id}` is the submission
+  ledger itself — a JSON **list**, not `{jobs: [...]}`.
+- **Reading requests:** `/api/jobs/{id}/llm-requests` returns
+  `{entries, total, ...}` — parse `entries` (and prefer `total` over
+  `len(entries)`); `requests`/`items` do not exist.
+- **Ledger staleness:** an entry's `final_status` freezes at the sweeper's
+  first terminal observation. Cancelling a job *after* that leaves the old
+  label (e.g. `waiting_for_reply`) in the ledger — check the job row for
+  truth.
+- **`waiting_for_reply` counts as terminal** to the sweeper: a parked job
+  frees its in-flight slot; the run does not block on it.
+- **Multi-replica orchestrators double-submit:** with 2 replicas the tick
+  race fired 3×/30 pairs (twins 2–5 ms apart). Until the advisory-lock fix
+  lands (`docs/issues/bench_sweeper_multi_replica_race.md`), watch a running
+  run for duplicate (task, arm, replicate) pairs and cancel the younger twin
+  (`PUT /api/jobs/{id}/cancel`).
+- **Reports heal retroactively:** the report endpoint recomputes from audit
+  rows at read time, so a run that finished during an observability gap
+  yields full metrics afterwards — nothing is lost by not watching.
+- **Mid-flight provider outages** classify as task failures, not infra
+  (`docs/issues/bench_infra_exclusion_misses_midflight_outages.md`) — scan
+  per-job request timelines for ≫retry-ceiling gaps before trusting a
+  failed row.

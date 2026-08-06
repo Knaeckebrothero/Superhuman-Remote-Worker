@@ -17,6 +17,11 @@ from typing import Any, Literal
 from fastmcp import FastMCP
 from starlette.responses import JSONResponse
 
+# Shared-surface imports resolve identically in-repo (repo root on sys.path)
+# and in-image (/app/src/shared), so no fallback chain is needed for them.
+from src.shared.orch_surface import formatters as fmt
+from src.shared.orch_surface.client import AsyncCockpitClient, MutationOutcomeUnknown
+
 DatasourceType = Literal[
     "generic",
     "repository",
@@ -37,27 +42,9 @@ DatasourceOwnership = Literal["mine", "shared"]
 DatasourceAvailability = Literal["all", "projects", "unavailable"]
 
 try:
-    from .client import AsyncCockpitClient, MutationOutcomeUnknown
-except ImportError:
-    from client import (  # type: ignore[no-redef]
-        AsyncCockpitClient,
-        MutationOutcomeUnknown,
-    )
-
-try:
     from .capabilities import TOOL_CAPABILITIES
 except ImportError:
     from capabilities import TOOL_CAPABILITIES  # type: ignore[no-redef]
-
-try:
-    from ..services import formatters as fmt
-except ImportError:
-    try:
-        from services import formatters as fmt  # type: ignore[no-redef]
-    except ImportError:
-        import importlib
-
-        fmt = importlib.import_module("orchestrator.services.formatters")  # type: ignore[assignment]
 
 # Conditional auth: HTTP transport uses token verification, stdio skips it
 _transport = os.environ.get("MCP_TRANSPORT", "http").lower()

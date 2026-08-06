@@ -32,7 +32,7 @@ from typing import TYPE_CHECKING, Awaitable, Callable, Optional, TypeVar
 from urllib.parse import urlparse
 
 from ..keycloak_token import KeycloakTokenClient
-from .base import WorkspaceSyncBase
+from .base import WorkspaceSyncBase, _normalize_dav_listing
 
 if TYPE_CHECKING:
     from ...core.workspace_backend import WorkspaceBackend
@@ -203,29 +203,13 @@ class OpenCloudWorkspaceSync(WorkspaceSyncBase):
 
         await self._with_401_retry(_run)
 
-    async def _list_remote_files(self) -> list[dict]:
+    async def _list_remote_files(self, rel_dir: str = "") -> list[dict]:
         async def _run():
             client = await self._dav()
-            return await asyncio.to_thread(client.list, "/", get_info=True)
+            return await asyncio.to_thread(client.list, rel_dir or "/", get_info=True)
 
         raw = await self._with_401_retry(_run)
-        out: list[dict] = []
-        for item in raw:
-            if not isinstance(item, dict):
-                continue
-            raw_path = item.get("path", "")
-            if raw_path.startswith(self._webdav_base_path):
-                rel = raw_path[len(self._webdav_base_path) :]
-            else:
-                rel = raw_path.strip("/")
-            out.append(
-                {
-                    "path": rel,
-                    "etag": item.get("etag", "") or "",
-                    "isdir": bool(item.get("isdir")),
-                }
-            )
-        return out
+        return _normalize_dav_listing(raw, self._webdav_base_path)
 
     async def _download_file(self, rel_path: str, local_path: str) -> None:
         async def _run():

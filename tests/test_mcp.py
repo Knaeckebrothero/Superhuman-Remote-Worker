@@ -24,8 +24,9 @@ import pytest
 #      does NOT trigger the SDK's ``import mcp.types`` chain.
 #   2. Setting MCP_TRANSPORT=stdio to skip server-side auth setup that would
 #      try to import additional orchestrator modules.
-#   3. Adding the orchestrator dir to sys.path so bare imports like
-#      ``from services.formatters import ...`` resolve correctly.
+#   3. Adding the orchestrator dir to sys.path so ``from mcp import server``
+#      below resolves to orchestrator/mcp (deliberately shadowing the SDK's
+#      ``mcp`` — which is exactly why fastmcp must be pre-mocked first).
 # ---------------------------------------------------------------------------
 
 _orchestrator_dir = os.path.join(os.path.dirname(__file__), "..", "orchestrator")
@@ -128,7 +129,7 @@ class TestFormatPersistentThreads:
     """Tests for format_persistent_threads."""
 
     def setup_method(self):
-        from services.formatters import format_persistent_threads
+        from src.shared.orch_surface.formatters import format_persistent_threads
 
         self.fmt = format_persistent_threads
 
@@ -166,7 +167,7 @@ class TestFormatPersistentThreadDetail:
     """Tests for format_persistent_thread_detail."""
 
     def setup_method(self):
-        from services.formatters import format_persistent_thread_detail
+        from src.shared.orch_surface.formatters import format_persistent_thread_detail
 
         self.fmt = format_persistent_thread_detail
 
@@ -245,7 +246,7 @@ class TestFormatCreatedThread:
     """Tests for format_created_thread."""
 
     def setup_method(self):
-        from services.formatters import format_created_thread
+        from src.shared.orch_surface.formatters import format_created_thread
 
         self.fmt = format_created_thread
 
@@ -271,7 +272,7 @@ class TestFormatPersistentThreadMessages:
     """Tests for format_persistent_thread_messages."""
 
     def setup_method(self):
-        from services.formatters import format_persistent_thread_messages
+        from src.shared.orch_surface.formatters import format_persistent_thread_messages
 
         self.fmt = format_persistent_thread_messages
 
@@ -341,7 +342,7 @@ class TestFormatPersistentThreadIde:
     """Tests for format_persistent_thread_ide."""
 
     def setup_method(self):
-        from services.formatters import format_persistent_thread_ide
+        from src.shared.orch_surface.formatters import format_persistent_thread_ide
 
         self.fmt = format_persistent_thread_ide
 
@@ -369,7 +370,7 @@ class TestFormatThreadActionResult:
     """Tests for format_thread_action_result."""
 
     def setup_method(self):
-        from services.formatters import format_thread_action_result
+        from src.shared.orch_surface.formatters import format_thread_action_result
 
         self.fmt = format_thread_action_result
 
@@ -398,7 +399,7 @@ class TestAsyncCockpitClientPersistentThreads:
 
     @pytest.fixture
     def client(self):
-        from mcp.client import AsyncCockpitClient
+        from src.shared.orch_surface.client import AsyncCockpitClient
 
         c = AsyncCockpitClient(base_url="http://localhost:8085")
         return c
@@ -1064,7 +1065,7 @@ class TestAsyncCockpitClientAuditChatBulk:
 
     @pytest.fixture
     def client(self):
-        from mcp.client import AsyncCockpitClient
+        from src.shared.orch_surface.client import AsyncCockpitClient
 
         return AsyncCockpitClient(base_url="http://localhost:8085")
 

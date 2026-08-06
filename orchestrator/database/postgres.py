@@ -6793,7 +6793,17 @@ class PostgresDB:
                 yield
 
     async def get_thread(self, thread_id: str) -> Dict[str, Any] | None:
-        """Get thread by ID."""
+        """Get thread by ID.
+
+        ``thread_id`` is user-supplied path input on every thread route; a
+        malformed id (e.g. an 8-char prefix) resolves to None — the caller's
+        404 — instead of leaking an asyncpg DataError 500 out of the UUID
+        bind. docs/issues/session_turn_end_cloud_push_blocks_queued_input.md
+        """
+        try:
+            UUID(str(thread_id))
+        except (ValueError, TypeError):
+            return None
         async with self.acquire() as conn:
             row = await conn.fetchrow(
                 "SELECT * FROM threads WHERE id = $1",
