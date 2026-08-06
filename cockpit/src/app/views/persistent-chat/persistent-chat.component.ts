@@ -812,6 +812,27 @@ export function clearDraft(threadId: string | null): void {
             <app-button variant="ghost" size="sm" (clicked)="disconnectAndLeave()">
               {{ 'chat.header.disconnect' | transloco }}
             </app-button>
+          } @else if (chat.cloudSessionUrl() || chat.ncSessionFolder()) {
+            <!-- Asleep/ended session. Every other header action drives the live
+                 agent, so the isConnected() gate above is right for them — but
+                 Files just opens an external cloud URL that loadThreadMeta has
+                 already resolved, and it is the one deliverable surface a user
+                 comes back to a dead session for. Keep it reachable. -->
+            @if (headerCompact()) {
+              <app-icon-button
+                size="sm"
+                [ariaLabel]="'chat.header.filesButton' | transloco"
+                [tooltip]="'chat.header.filesTooltip' | transloco"
+                (clicked)="openSessionFiles()"
+              >
+                <app-icon size="sm">cloud</app-icon>
+              </app-icon-button>
+            } @else {
+              <button class="ide-btn" (click)="openSessionFiles()" [title]="'chat.header.filesTooltip' | transloco">
+                <app-icon size="sm" class="ide-icon">cloud</app-icon>
+                {{ 'chat.header.filesButton' | transloco }}
+              </button>
+            }
           }
         </div>
       </div>
