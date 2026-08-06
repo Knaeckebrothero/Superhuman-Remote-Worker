@@ -1612,6 +1612,54 @@ class PostgresDB:
 
         return result == "UPDATE 1"
 
+    async def pause_job_shed_freeze(self, job_id: str) -> bool:
+        """``pause_job`` that also sheds a row-level freeze (stash-and-clear).
+
+        For pause transitions that must leave the job DISPATCHABLE — the
+        workspace-recovery arm re-queues the job for auto-dispatch, and
+        ``get_dispatchable_jobs`` requires ``freeze_data IS NULL``
+        (partial-index contract, 0046). A freeze surviving this transition
+        parks the job paused-but-invisible forever
+        (docs/issues/recovery_pause_repersists_stale_freeze_invisible_job.md).
+        The freeze is stashed into ``context.last_freeze_data`` first, same
+        shape as ``queue_job_for_resume``.
+
+        Keeps ``pause_job``'s ``status = 'processing'`` CAS — callers gate
+        re-dispatch on the returned bool to stop duplicate completions from
+        double-dispatching. A user/manual mid-run pause should keep using
+        ``pause_job``: shedding is only correct when the pause feeds back
+        into dispatch.
+
+        Returns:
+            True iff the processing→paused transition happened here.
+        """
+        try:
+            uuid_val = UUID(job_id)
+        except ValueError:
+            return False
+
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                """
+                UPDATE jobs
+                SET status = 'paused',
+                    assigned_agent_id = NULL,
+                    context = COALESCE(context, '{}'::jsonb)
+                              || CASE
+                                     WHEN freeze_data IS NULL THEN '{}'::jsonb
+                                     ELSE jsonb_build_object(
+                                         'last_freeze_data', freeze_data
+                                     )
+                                 END,
+                    freeze_data = NULL,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = $1 AND status = 'processing'
+                """,
+                uuid_val,
+            )
+
+        return result == "UPDATE 1"
+
     async def update_job_status(
         self,
         job_id: str,
@@ -5688,6 +5736,68 @@ class PostgresDB:
             rows = await conn.fetch(
                 self._UNSTICK_REVIEWING_SQL,
                 grace_minutes,
+            )
+        return [dict(r) for r in rows]
+
+    # Wall-clock twin of _UNSTICK_REVIEWING_SQL for the case it deliberately
+    # excludes: a critic that is ALIVE and will never finish (livelock — 189
+    # iterations over 105 minutes in the field case). Requires a live critic
+    # (EXISTS mirrors the other arm's NOT EXISTS, keeping the two disjoint)
+    # and a distinct message, per fix direction 2 of
+    # docs/issues/rejected_verdict_livelocks_critic_and_wedges_parent.md.
+    # No ledger check here: a recorded verdict flips the parent out of
+    # 'reviewing' promptly, and any wedge that keeps it 'reviewing' for the
+    # whole generous ceiling deserves escalation regardless.
+    _UNSTICK_REVIEWING_WALLCLOCK_SQL = """
+        UPDATE jobs AS p
+           SET status = 'pending_review',
+               error_message = 'Automated verification did not complete '
+                               || '(critic did not render a verdict in '
+                               || ($1::int)::text
+                               || ' minutes); returned to manual review.',
+               updated_at = CURRENT_TIMESTAMP
+         WHERE p.status = 'reviewing'
+           AND p.updated_at
+               < CURRENT_TIMESTAMP - make_interval(mins => $1::int)
+           AND EXISTS (
+                 SELECT 1 FROM jobs c
+                  WHERE c.parent_job_id = p.id
+                    AND c.context->>'verification_target' IS NOT NULL
+                    AND c.status IN (
+                        'created', 'processing', 'paused', 'waiting',
+                        'waiting_for_reply'
+                    )
+               )
+        RETURNING p.id, p.user_id, p.config_name
+    """
+
+    async def unstick_reviewing_parents_wallclock(
+        self, ceiling_minutes: int
+    ) -> List[Dict[str, Any]]:
+        """Escalate parents stuck in 'reviewing' under a LIVE critic.
+
+        The dead-critic arm above never fires while a critic child is alive,
+        so a livelocked critic (rejected-verdict loop, model that cannot
+        build the call) wedged its parent indefinitely. Past a generous
+        wall-clock ceiling the parent goes to 'pending_review' with a message
+        naming the live-critic case — distinct from the "critic pipeline
+        died" arm so operators can tell which failure they are looking at.
+
+        The critic itself is left alone: the verdict-rejection cap
+        (increment_verdict_rejections) bounds the common livelock at the
+        source, and the stale-subjob horizon reaps whatever survives.
+
+        Args:
+            ceiling_minutes: wall-clock ceiling on ``updated_at`` age. The
+                caller gates on its config (0 disables the arm there).
+
+        Returns:
+            One dict ``{id, user_id, config_name}`` per escalated parent.
+        """
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                self._UNSTICK_REVIEWING_WALLCLOCK_SQL,
+                ceiling_minutes,
             )
         return [dict(r) for r in rows]
 

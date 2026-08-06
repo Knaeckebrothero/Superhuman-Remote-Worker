@@ -43,6 +43,16 @@ STALE_HOURS = int(os.getenv("STALE_VERIFICATION_HOURS", "6"))
 # in-flight verdict; the real gate is "no non-failed/cancelled critic exists".
 REVIEWING_STUCK_MINUTES = int(os.getenv("REVIEWING_STUCK_GRACE_MINUTES", "30"))
 
+# Wall-clock ceiling (minutes) for the LIVE-critic arm: a parent still in
+# 'reviewing' past this even though its critic is alive escalates to
+# pending_review with a distinct "critic did not render a verdict" message
+# (fix direction 2 of rejected_verdict_livelocks_critic_and_wedges_parent.md).
+# Generous by design — a healthy long review must never be pre-empted; the
+# verdict-rejection cap bounds the common livelock much earlier. 0 disables.
+REVIEWING_WALLCLOCK_CEILING_MINUTES = int(
+    os.getenv("REVIEWING_WALLCLOCK_CEILING_MINUTES", "60")
+)
+
 
 async def stale_verification_sweeper_loop(
     db: Any, shutdown_event: asyncio.Event
@@ -50,15 +60,19 @@ async def stale_verification_sweeper_loop(
     """Reap orphaned verification subjobs until ``shutdown_event`` is set."""
     logger.info(
         "Stale verification sweeper started (tick=%ds, stale_hours=%d, "
-        "reviewing_grace_min=%d)",
+        "reviewing_grace_min=%d, wallclock_ceiling_min=%d)",
         TICK_SECONDS,
         STALE_HOURS,
         REVIEWING_STUCK_MINUTES,
+        REVIEWING_WALLCLOCK_CEILING_MINUTES,
     )
     while not shutdown_event.is_set():
         try:
             cancelled, unstuck = await _sweep_tick(
-                db, STALE_HOURS, REVIEWING_STUCK_MINUTES
+                db,
+                STALE_HOURS,
+                REVIEWING_STUCK_MINUTES,
+                wallclock_minutes=REVIEWING_WALLCLOCK_CEILING_MINUTES,
             )
             if cancelled:
                 logger.info(
@@ -90,6 +104,7 @@ async def _sweep_tick(
     stale_hours: int,
     grace_minutes: int,
     notifier: Any = None,
+    wallclock_minutes: int | None = None,
 ) -> tuple[int, int]:
     """Run one sweep. Returns ``(cancelled_subjobs, unstuck_parents)``.
 
@@ -97,17 +112,34 @@ async def _sweep_tick(
     'paused' orphan terminal at the stale horizon). Step 2 then un-sticks any
     parent whose critic pipeline is now dead and notifies its owner. Ordering
     matters: a critic cancelled in Step 1 makes its parent eligible in Step 2
-    on this same tick.
+    on this same tick. Step 3 (the wall-clock arm, only when
+    ``wallclock_minutes`` > 0 — the loop passes the module config; direct
+    callers default to off) escalates parents whose critic is ALIVE but has
+    rendered no verdict for the whole ceiling; its count is folded into the
+    returned ``unstuck_parents``.
     """
     cancelled = await db.cancel_stale_verification_subjobs(stale_hours)
 
     unstuck_rows = await db.unstick_reviewing_parents(grace_minutes)
-    if unstuck_rows and notifier is None:
+
+    escalated_rows: list[dict[str, Any]] = []
+    if wallclock_minutes and wallclock_minutes > 0:
+        escalated_rows = await db.unstick_reviewing_parents_wallclock(wallclock_minutes)
+        for row in escalated_rows:
+            logger.warning(
+                "Verification wall-clock ceiling (%d min) hit for parent %s — "
+                "live critic rendered no verdict; escalated to pending_review",
+                wallclock_minutes,
+                row.get("id"),
+            )
+
+    all_rows = list(unstuck_rows) + escalated_rows
+    if all_rows and notifier is None:
         # Lazy import keeps the sweeper's test import free of the
         # notification_service dependency (tests always inject a notifier).
         from services.notification_service import notification_service as notifier
 
-    for row in unstuck_rows:
+    for row in all_rows:
         try:
             await notifier.notify_review_returned_to_manual(
                 user_id=str(row["user_id"]),
@@ -120,4 +152,4 @@ async def _sweep_tick(
                 row.get("id"),
             )
 
-    return cancelled, len(unstuck_rows)
+    return cancelled, len(all_rows)

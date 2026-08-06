@@ -562,3 +562,104 @@ async def test_cas_does_not_touch_non_reviewing_targets(db):
 
     assert rows == []
     assert await _status(db, target) == "processing"
+
+
+# ---------------------------------------------------------------------------
+# Wall-clock arm (unstick_reviewing_parents_wallclock) — the LIVE-critic
+# backstop, fix direction 2 of
+# docs/issues/rejected_verdict_livelocks_critic_and_wedges_parent.md.
+# ---------------------------------------------------------------------------
+
+WALLCLOCK_MINUTES = 60
+
+
+@pytest.mark.asyncio
+async def test_wallclock_escalates_live_critic_past_ceiling(db):
+    """A parent stuck in 'reviewing' for the whole ceiling while its critic is
+    ALIVE (the livelocked-critic shape: 189 iterations / 105 min in the field
+    case) escalates with the distinct did-not-render-a-verdict message —
+    exactly the case the dead-critic arm deliberately never touches."""
+    target = uuid4()
+    critic = uuid4()
+    await _insert_job(
+        db,
+        job_id=target,
+        status="reviewing",
+        updated_minutes_ago=75,  # past the 60min ceiling
+        context={},
+    )
+    await _insert_job(
+        db,
+        job_id=critic,
+        status="processing",  # alive the whole time
+        parent_job_id=target,
+        context={"verification_target": str(target)},
+        created_minutes_ago=75,
+    )
+
+    # The dead-critic arm must decline (live critic exists) …
+    assert await db.unstick_reviewing_parents(grace_minutes=GRACE_MINUTES) == []
+    assert await _status(db, target) == "reviewing"
+
+    # … while the wall-clock arm fires with its own message.
+    rows = await db.unstick_reviewing_parents_wallclock(WALLCLOCK_MINUTES)
+
+    assert [str(r["id"]) for r in rows] == [str(target)]
+    assert await _status(db, target) == "pending_review"
+    async with db.acquire() as conn:
+        msg = await conn.fetchval(
+            "SELECT error_message FROM jobs WHERE id = $1", target
+        )
+    assert "critic did not render a verdict in 60 minutes" in msg
+    assert "critic pipeline died" not in msg
+
+
+@pytest.mark.asyncio
+async def test_wallclock_leaves_healthy_long_review_under_ceiling(db):
+    """A live review younger than the ceiling is never pre-empted."""
+    target = uuid4()
+    critic = uuid4()
+    await _insert_job(
+        db,
+        job_id=target,
+        status="reviewing",
+        updated_minutes_ago=45,  # past the dead-arm grace, under the ceiling
+        context={},
+    )
+    await _insert_job(
+        db,
+        job_id=critic,
+        status="processing",
+        parent_job_id=target,
+        context={"verification_target": str(target)},
+        created_minutes_ago=45,
+    )
+
+    assert await db.unstick_reviewing_parents_wallclock(WALLCLOCK_MINUTES) == []
+    assert await _status(db, target) == "reviewing"
+
+
+@pytest.mark.asyncio
+async def test_wallclock_ignores_dead_critic_parents(db):
+    """No live critic → that is the dead-critic arm's case, not this one;
+    the two arms stay disjoint so each wedge gets its own message."""
+    target = uuid4()
+    critic = uuid4()
+    await _insert_job(
+        db,
+        job_id=target,
+        status="reviewing",
+        updated_minutes_ago=120,
+        context={},
+    )
+    await _insert_job(
+        db,
+        job_id=critic,
+        status="failed",
+        parent_job_id=target,
+        context={"verification_target": str(target)},
+        created_minutes_ago=120,
+    )
+
+    assert await db.unstick_reviewing_parents_wallclock(WALLCLOCK_MINUTES) == []
+    assert await _status(db, target) == "reviewing"

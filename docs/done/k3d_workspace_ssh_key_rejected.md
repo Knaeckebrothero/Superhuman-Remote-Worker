@@ -21,9 +21,13 @@ staged key → exit 0; smoke job `58ba61ef` (plain POST /api/jobs) provisioned
 calls, and **completed**; three later jobs provisioned the same way
 (1-attempt SSH auth each). Dev was never affected because its non-root
 production image passes OpenSSH's other-uid special case.
-Residual papercut kept open in this doc's Impact section: a provisioning
-failure writes only `failed` + empty `error` column (reason lives solely in
-orchestrator logs).
+Residual papercut RESOLVED 2026-08-06 (batch #2): the dispatcher's sandbox
+arm had already gained a context-refresh that surfaces the provisioner's
+recorded reason into `jobs.error_message` (`4f27f581`, 08-03 — likely after
+this incident's observation); batch #2 closed the remaining generic-message
+path, `_provision_parent_workspace_for_scholar`, which now reads the
+parent's `context.workspace_container.error` and writes "Shared parent
+workspace failed: <reason>" instead of punting to orchestrator logs.
 **Originally:** Open, environment-only (k3d cluster `srw`). Dev cluster unaffected
 (jobs provisioned fine there the same day). Filed 2026-08-04 during the Job
 Bench k3d smoke.
