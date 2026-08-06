@@ -11,10 +11,14 @@ tags:
 
 # Application infrastructure allocation metering
 
-**Status:** Slice 0 implemented as a dark launch on 2026-08-05. Schema, typed
-contracts/read gate, bootstrap rollup, pricing interfaces, and dimensional UI
-foundations are present; all runtime gates default off. Collectors, RBAC, and
-publication remain disabled for Slice 1.
+**Status:** Slice 0 and the shadow-only foundation of Slice 1 are implemented as
+a dark launch through app migration `0087`. The dedicated Kubernetes Pod
+collector, namespace-scoped RBAC, authenticated and generation-fenced ingestion,
+exact LIST/WATCH continuity recovery, app-DB workspace Pod intervals, immutable
+shadow comparisons, and bounded retention are present; all runtime gates still
+default off. There is no v2 audit publication, interval-tail/rollup handoff,
+billing cutover, VM collection, or PVC/PV collection. This is not production
+billing readiness.
 
 **Triggered by:** adding public-cloud comparison rate cards exposed that the
 ledger's existing `vcpu-hour` / `gib-hour` arithmetic is sound, but its resource
@@ -486,6 +490,12 @@ This is a logical wire/typing envelope, not a requirement to accumulate the
 whole `items` array in process memory. Kubernetes pages and VM chunks normalize
 directly into bounded staging rows; the final envelope metadata commits only
 after the declared count and digest verify.
+
+An incomplete Kubernetes LIST publishes metadata and sanitized diagnostics
+only: locally observed positive rows may refresh the collector's bounded resize
+cache, but no partial item manifest is uploaded. Repeated failures use bounded
+exponential retry up to the configured relist interval (capped at five minutes),
+preventing a failing scope from generating unbounded non-authoritative rows.
 
 `complete=true` is legal only when the collector has read the whole exact scope.
 It cannot accompany fatal identity/decode errors, missing continuation pages, an
@@ -1641,6 +1651,13 @@ infrastructureMetering:
   watchQueueSize: 10000
   maxSnapshotItems: 50000
   maxSnapshotBytes: 67108864
+  snapshotItemRetentionDays: 7
+  diagnosticRetentionDays: 35
+  cleanupIntervalSeconds: 300
+  networkPolicy:
+    enabled: false
+    allowUnrestrictedEgress: false
+    apiServerCidrs: []
   materializerBatchSize: 100
   utilization:
     prometheusUrl: ""
@@ -1664,10 +1681,22 @@ each allowlisted namespace. Storage mapping additionally needs reviewed
 cluster-scoped read of StorageClasses and, when enabled, CSIDrivers. PV inventory
 is cluster-scoped and remains behind its own flag/ClusterRole. The VM collector
 needs read-only VM/VMI/DataVolume/PVC verbs in its namespace. No collector needs
-Secret read. NetworkPolicies allow only Kubernetes API and authenticated
-ingestion/VM-controller paths. Store only normalized allowlisted fields; never
-persist Pod environment, Secret refs, arbitrary annotations, StorageClass
-parameters, CSI credentials/attributes/handles, or raw controller payloads.
+Secret read. Enabling the collector requires an egress NetworkPolicy with
+explicit API-server CIDRs unless the operator sets the named unrestricted-egress
+break-glass acknowledgement. The normal policy allows only cluster DNS, the
+Kubernetes API, and authenticated ingestion. The ingestion Secret is required
+at orchestrator startup while collection is enabled, and Secret-aware rolling
+reload keeps the collector and orchestrator on the same rotated key. Store only
+normalized allowlisted fields; never persist Pod environment, Secret refs,
+arbitrary annotations, StorageClass parameters, CSI credentials/attributes/
+handles, or raw controller payloads.
+
+The server validates the exact normalized Pod shape recursively before JSONB
+staging; a generic JSON-safe mapping or denylist is not sufficient. Signed
+content-digest headers are authenticated before the ASGI body is read, the
+exact bounded body is verified afterward, and the public Traefik ingress always
+denies `/api/internal/infrastructure-metering` while collection is enabled. Any
+tunnel that bypasses the chart ingress must mirror that path deny at its edge.
 
 LIST staging is bounded by page/item/byte limits, client QPS/burst, jittered
 scope concurrency, and `Retry-After` aware 429 backoff. A full watch queue marks
@@ -1712,6 +1741,11 @@ expansion, audit `0004` for separately validated checks plus retained-day
 bootstrap seeding, and audit `0005` for the raw project/window index. PostgreSQL
 16 cannot build that partitioned-parent index concurrently; `0005` documents
 its blocking maintenance-window requirement for large retained ledgers.
+
+The shadow-only Slice 1 foundation adds app `0087`: one-use ingestion tickets,
+transport replay nonces, WATCH sessions/events, recovery-epoch metadata,
+workspace comparison diagnostics, and database-enforced retention terminals.
+It adds no audit publication or cutover path.
 
 1. **Expand audit first.** Add nullable v2 event fields/checks and create future
    partitions. Existing writers/readers continue to work. A runtime capability
@@ -1781,10 +1815,40 @@ auth matrix, free/unpriced/partial cost tests, and legacy price exclusion pass.
 
 ### Slice 1 — Kubernetes collector and workspace cutover
 
-- Pod LIST/WATCH, effective-request library, complete snapshot state, and shadow
-  diagnostics.
-- Strict publisher, interval-tail reads, source-aware rollup, durable cutover,
-  and removal of blind 24-hour closure.
+**Partially implemented (shadow-only foundation).** The implemented part is
+deliberately incapable of publishing usage events:
+
+- A dedicated, database-free Pod collector Deployment and ServiceAccount, with
+  namespace-scoped `get/list/watch` Pod RBAC, bounded normalized payloads, and
+  fail-closed egress configuration (or an explicit unrestricted-egress
+  break-glass acknowledgement).
+- HMAC-authenticated internal POST ingestion with replay nonces, short-lived
+  one-use tickets, leader-generation fencing, pre-body signed-digest
+  authentication, request/body/spool bounds, strict server-side Pod payload
+  allowlisting, public-ingress denial, coordinated Secret reload, and idempotent
+  event identities.
+- Paginated LIST, including exact relists at an existing server-committed
+  resource version, serial WATCH event/cursor transactions, typed
+  history/queue/protocol/size/ambiguity gaps, and fail-closed recovery relists.
+  Only a complete LIST proves absence.
+- Incomplete LISTs upload metadata/diagnostics but no partial item rows and back
+  off to the periodic relist bound, avoiding non-authoritative staging growth.
+- Kubernetes-compatible Pod effective-request normalization, with a bounded
+  in-process prior-request cache for conservative resize fallback; cache loss on
+  restart remains a visible invalid observation rather than an optimistic
+  decrease. Complete snapshot reconciliation, shadow-only workspace Pod
+  intervals, DB-validated ownership, and immutable object-level comparisons
+  with the legacy meter are also present.
+- Leader-fenced bounded cleanup. Defaults retain sealed normalized snapshot
+  items for at least 7 days and WATCH/session plus shadow-comparison diagnostics
+  for 35 days; abandoned incomplete staging manifests become cleanup-eligible
+  after 24 hours while their metadata remains authoritative.
+
+**Remaining before Slice 1 exit:** prove a healthy shadow observation window
+and resolve every unexplained comparison; implement strict audit publication,
+interval-tail reads, source-aware rollup handoff, legacy integrity repair/drain,
+the crash-resumable cutover barrier, and removal of the legacy blind 24-hour
+closure. Publication and cutover gates must remain off until those checks pass.
 
 Depends on Slice 0. Exit: fenced shadow coverage, legacy integrity/drain,
 cutover crash matrix, and workspace quantity reconciliation pass.
