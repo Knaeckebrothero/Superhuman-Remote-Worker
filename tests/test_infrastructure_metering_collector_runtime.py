@@ -7,6 +7,8 @@ from copy import deepcopy
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 import json
+import sys
+import types
 from typing import Any
 from uuid import UUID
 
@@ -1097,8 +1099,18 @@ async def test_namespace_operations_respect_configured_concurrency(monkeypatch) 
 
 
 def test_kubeconfig_fallback_requires_explicit_in_process_mode(monkeypatch) -> None:
-    from kubernetes import client as kubernetes_client
-    from kubernetes import config as kubernetes_config
+    # Stand up our own ``kubernetes`` modules instead of patching the installed
+    # client: other test modules stub the package in ``sys.modules``, so whatever
+    # the loader imports at runtime depends on which files were collected. The
+    # two entry points below are the entire surface this loader touches.
+    kubernetes_module = types.ModuleType("kubernetes")
+    kubernetes_client = types.ModuleType("kubernetes.client")
+    kubernetes_config = types.ModuleType("kubernetes.config")
+    kubernetes_module.client = kubernetes_client  # type: ignore[attr-defined]
+    kubernetes_module.config = kubernetes_config  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "kubernetes", kubernetes_module)
+    monkeypatch.setitem(sys.modules, "kubernetes.client", kubernetes_client)
+    monkeypatch.setitem(sys.modules, "kubernetes.config", kubernetes_config)
 
     fallback_calls: list[bool] = []
 
@@ -1109,9 +1121,13 @@ def test_kubeconfig_fallback_requires_explicit_in_process_mode(monkeypatch) -> N
         fallback_calls.append(True)
 
     sentinel = object()
-    monkeypatch.setattr(kubernetes_config, "load_incluster_config", fail_incluster)
-    monkeypatch.setattr(kubernetes_config, "load_kube_config", load_fallback)
-    monkeypatch.setattr(kubernetes_client, "CoreV1Api", lambda: sentinel)
+    monkeypatch.setattr(
+        kubernetes_config, "load_incluster_config", fail_incluster, raising=False
+    )
+    monkeypatch.setattr(
+        kubernetes_config, "load_kube_config", load_fallback, raising=False
+    )
+    monkeypatch.setattr(kubernetes_client, "CoreV1Api", lambda: sentinel, raising=False)
 
     with pytest.raises(CollectorConfigurationError, match="requires in-cluster"):
         _load_kubernetes_core_api("dedicated")
