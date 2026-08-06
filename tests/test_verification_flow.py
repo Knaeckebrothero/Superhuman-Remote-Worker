@@ -1900,6 +1900,55 @@ class TestHandleCriticVerdictOnCompleteWiring:
         assert "high" in feedback
 
     @pytest.mark.asyncio
+    async def test_returned_resume_routes_through_freeze_clearing_write(
+        self, monkeypatch
+    ):
+        """The parent of a 'returned' verdict always arrives frozen
+        (``job_complete``), and ``get_dispatchable_jobs`` requires
+        ``freeze_data IS NULL`` — so the critic resume MUST go through
+        ``queue_job_for_resume``, the single write that sheds the freeze.
+        The test above stubs ``_internal_resume_job`` wholesale, so it alone
+        cannot see a regression back to a hand-rolled UPDATE that forgets
+        the clear. This pins the seam one level deeper.
+        See docs/done/critic_feedback_resume_parent_freeze_data_wedge.md
+        (write contract locked against real Postgres in
+        tests/test_queue_job_for_resume.py).
+        """
+        import orchestrator.main as main_module
+        from orchestrator.main import _handle_critic_verdict_on_complete
+
+        target = _make_target_job(
+            rounds=[
+                {
+                    "round": 1,
+                    "critic_job_id": "critic-1",
+                    "verdict": "returned",
+                    "asserted_verdict": "returned",
+                    "opened": [
+                        {"id": "F1", "severity": "high", "claim": "missing tests"}
+                    ],
+                    "dispositions": [],
+                    "ts": "t",
+                }
+            ]
+        )
+        monkeypatch.setattr(
+            main_module.postgres_db, "get_job", AsyncMock(return_value=target)
+        )
+        queue_mock = AsyncMock(return_value=True)
+        monkeypatch.setattr(main_module.postgres_db, "queue_job_for_resume", queue_mock)
+        monkeypatch.setattr(main_module, "_trigger_dispatch", MagicMock())
+
+        await _handle_critic_verdict_on_complete(_make_critic_job(), [])
+
+        queue_mock.assert_awaited_once()
+        args = queue_mock.await_args.args
+        assert args[0] == "target-1"
+        updates = args[1]
+        assert "F1" in updates["queued_feedback"]
+        assert updates["queued_feedback_reason"]
+
+    @pytest.mark.asyncio
     async def test_returned_finding_without_severity_still_resumes_target(
         self, monkeypatch
     ):

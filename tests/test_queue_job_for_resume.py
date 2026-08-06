@@ -24,7 +24,14 @@ from testcontainers.postgres import PostgresContainer
 from orchestrator.database.postgres import PostgresDB
 
 JOB = "9b760af1-a693-4652-a50c-aca46542ab48"
+TARGET = "7c1275d8-2f9f-4a2b-9b58-6a1f6f6b2f10"
 AGENT = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+
+JOB_COMPLETE_FREEZE = {
+    "job_id": TARGET,
+    "summary": "done, ready for review",
+    "freeze_type": "job_complete",
+}
 
 BLOCKING_FREEZE = {
     "job_id": JOB,
@@ -143,6 +150,67 @@ async def test_resume_without_feedback_still_sheds_freeze(db):
     assert row["status"] == "paused"
     assert row["freeze_data"] is None
     assert len(await db.get_dispatchable_jobs()) == 1
+
+
+@pytest.mark.asyncio
+async def test_critic_returned_resume_clears_freeze_so_dispatcher_sees_job(db):
+    """The critic-'returned' arm resumes the reviewing parent through this
+    same write. The parent always arrives frozen (``job_complete`` freeze from
+    its own completion), so keeping the blob would park it paused-but-invisible
+    after every review round-trip on non-full autonomy.
+    See docs/done/critic_feedback_resume_parent_freeze_data_wedge.md.
+    """
+    async with db.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO jobs (id, status, assigned_agent_id, context, freeze_data)
+            VALUES ($1, 'reviewing', $2, $3::jsonb, $4::jsonb)
+            """,
+            UUID(TARGET),
+            UUID(AGENT),
+            json.dumps(
+                {
+                    "verification_rounds": [
+                        {"round": 1, "critic_job_id": "c-1", "verdict": "returned"}
+                    ]
+                }
+            ),
+            json.dumps(JOB_COMPLETE_FREEZE),
+        )
+
+    assert await db.queue_job_for_resume(
+        TARGET,
+        {
+            "queued_feedback": "## Open findings\n- **F1** (high): missing tests",
+            "queued_feedback_reason": (
+                "The critic reviewed the completed work and returned it with "
+                "open findings; address them."
+            ),
+        },
+    )
+
+    async with db.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT status, assigned_agent_id, freeze_data FROM jobs WHERE id = $1",
+            UUID(TARGET),
+        )
+        ctx = await db_context(conn, TARGET)
+    assert row["status"] == "paused"
+    assert row["assigned_agent_id"] is None
+    assert row["freeze_data"] is None
+
+    # The seeded blocking-message job is 'waiting_for_reply', so the returned
+    # parent must be the one dispatchable row.
+    dispatchable = await db.get_dispatchable_jobs()
+    assert [str(j["id"]) for j in dispatchable] == [TARGET], (
+        "a parent resumed by a critic 'returned' verdict must satisfy the "
+        "dispatcher's freeze_data IS NULL contract"
+    )
+
+    # The review ledger must survive the context merge, and the shed freeze
+    # stays observable.
+    assert ctx["verification_rounds"][0]["critic_job_id"] == "c-1"
+    assert ctx["last_freeze_data"]["freeze_type"] == "job_complete"
 
 
 @pytest.mark.asyncio
