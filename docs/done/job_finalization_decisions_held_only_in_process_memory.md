@@ -10,7 +10,48 @@ tags:
 # The two decisions that can end a job live only in process RAM, with no write-ahead record
 
 **Filed:** 2026-07-27, generalised from the verification audit.
-**Status:** CONFIRMED in code. UNFIXED.
+**Status:** **FIXED 2026-08-06 (batch #3) — journal-before-observe implemented
+end-to-end and both k3d kill-tests PASSED.**
+
+- **Durable write inside the tool call:** `job_complete` journals the decision
+  through the orchestrator (`POST /api/jobs/{id}/completion-decision`,
+  internal-key, `_record_completion_decision_impl`) BEFORE returning to the
+  model; idempotent on `(job_id, tool_call_id)` (LangChain
+  `InjectedToolCallId`; replay short-circuits, a new id overwrites), CAS-
+  guarded against terminal rows (`PostgresDB.set_completion_decision`, one
+  atomic statement on the jobs row — the later status transition updates the
+  same row, so decision and status cannot diverge). A failed journal write
+  reports NOT-recorded to the model; nothing local is populated first.
+- **Durable-first read at finalize:** the module dicts are demoted to caches.
+  `finalize_job` falls back to the checkpointed mirrors
+  (`completion_decision` / `verdict_decision` state channels, written by the
+  audited tool node in the same super-step as the tool result), and agent
+  resume hydrates the cache from `GET .../completion-decision`
+  (`seed_final_phase_data`; never on feedback resumes — those void the
+  decision, and `queue_job_for_resume` drops the DB record in the same
+  statement, opt-out `void_completion_decision=False` for the
+  re-provisioning park).
+- **`is_final_phase` is implemented, not deleted:** the audited tool node
+  sets it (with the mirrors) once a decision is durably journaled, so the
+  finalize trigger survives restarts.
+- **The placeholder fabrication is dead:** a worker finalizing with NO
+  decision anywhere now gets a loud `reject_transition` telling the model to
+  re-issue `job_complete`; a no-verdict critic completes with an HONEST
+  zero-confidence report (never "Job completed"/1.0) and the orchestrator
+  escalates from the ledger as designed.
+
+**Verified:** `tests/test_completion_decision_journal.py` (20) +
+real-Postgres `tests/test_queue_job_for_resume.py` extensions (4). Live k3d
+kill-tests 2026-08-06: **worker** — job `965b0935` journaled at 22:30:08,
+agent pod force-killed the same second (freeze report never delivered, job
+stayed `processing`), re-dispatched at 22:31:57, logged `Hydrated completion
+decision … (tool_call_id=chatcmpl-tool-8b6e53f38020c2e7)`, froze with the
+ORIGINAL summary field-for-field and reached `reviewing`; **critic** —
+verdict round journaled on the target ledger at 22:37:02, critic pod killed
++1s, re-dispatched, logged `Recovered critic verdict from graph state
+(process cache empty after restart)`, produced the proper APPROVED verdict
+freeze, and the orchestrator resolved the target `pending_review` from the
+ledger — no blind escalation, no inversion.
 **Severity:** **high** — every restart path converts "I decided" into "no
 decision was made", and each consumer has its own (mostly wrong) idea of what
 "no decision" means.

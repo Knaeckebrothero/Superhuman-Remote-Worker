@@ -70,6 +70,19 @@ class VerdictRecordingError(Exception):
     """
 
 
+class CompletionDecisionError(Exception):
+    """The job_complete decision could not be durably journaled.
+
+    Sibling of ``VerdictRecordingError`` for the worker's own terminating
+    decision (journal-before-observe, docs/issues/
+    job_finalization_decisions_held_only_in_process_memory.md): a decision
+    that is not persisted must never be reported to the model as accepted,
+    because a restart would then convert "I decided" into "no decision was
+    made". Raised by ``record_completion_decision`` on any failure instead of
+    the house best-effort convention (return None/False).
+    """
+
+
 class CanvasClientError(RuntimeError):
     """A model-safe failure from a delegated Dynamic Canvas request.
 
@@ -1388,6 +1401,71 @@ class OrchestratorClient:
         raise VerdictRecordingError(
             f"HTTP {response.status_code}: {response.text[:200]}"
         )
+
+    async def record_completion_decision(
+        self,
+        job_id: str,
+        tool_call_id: str,
+        summary: str,
+        deliverables: list,
+        confidence: float,
+        notes: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Durably journal the job_complete decision before the tool returns.
+
+        Journal-before-observe: the sibling of ``record_verification_round``
+        for the worker's own terminating decision. Idempotent on
+        ``(job_id, tool_call_id)`` — a ToolNode re-execution of the same call
+        after a checkpoint gap returns the stored record (``replay: true``).
+        Raises CompletionDecisionError on any failure so the tool reports
+        NOT-recorded to the model instead of a false success.
+        """
+        if not self._client:
+            await self.connect()
+
+        url = f"{self.orchestrator_url}/api/jobs/{job_id}/completion-decision"
+        payload = {
+            "tool_call_id": tool_call_id,
+            "summary": summary,
+            "deliverables": deliverables,
+            "confidence": confidence,
+            "notes": notes,
+        }
+        try:
+            response = await self._client.post(url, json=payload)
+        except httpx.RequestError as e:
+            raise CompletionDecisionError(f"network error: {e}") from e
+
+        if response.status_code == 200:
+            return response.json()
+        raise CompletionDecisionError(
+            f"HTTP {response.status_code}: {response.text[:200]}"
+        )
+
+    async def fetch_completion_decision(self, job_id: str) -> Optional[dict[str, Any]]:
+        """Read back the journaled job_complete decision, or None.
+
+        Best-effort by design (unlike the write path): used by resume
+        hydration, where a fetch failure must degrade to "no cached decision"
+        — the durable record still exists and the graph-state mirror /
+        model re-decision paths remain.
+        """
+        if not self._client:
+            await self.connect()
+
+        url = f"{self.orchestrator_url}/api/jobs/{job_id}/completion-decision"
+        try:
+            response = await self._client.get(url)
+            if response.status_code == 200:
+                decision = response.json().get("decision")
+                return decision if isinstance(decision, dict) else None
+            logger.warning(
+                f"Completion-decision fetch for {job_id} returned "
+                f"HTTP {response.status_code}"
+            )
+        except httpx.RequestError as e:
+            logger.warning(f"Completion-decision fetch for {job_id} failed: {e}")
+        return None
 
     async def resume_job(
         self,
