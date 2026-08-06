@@ -12,10 +12,18 @@ tags:
 
 **Filed:** 2026-07-27, found while auditing
 `verification_round_reset_spawns_blind_critic.md`.
-**Status:** CONFIRMED in code. No live incident identified yet — but the
-failure is silent by construction, so absence of evidence is expected.
-UNFIXED.
-**Severity:** **high** — converts an explicit "returned, severity high" into
+**Status:** CONFIRMED in code and the overwrite is still there at HEAD
+(sweep-verified 2026-08-06) — but the CONSEQUENCE is now structurally
+prevented for both decision classes: critic verdicts are durably journaled on
+the target's ledger inside the verdict tool (`_submit_verdict` →
+`record_verification_round`; `_resolve_critic_outcome` reads only the
+ledger), and as of batch #3 (2026-08-06) job_complete decisions are likewise
+journaled on the job row (`context.completion_decision`, see
+`job_finalization_decisions_held_only_in_process_memory.md`) — a drain freeze
+can clobber the freeze BLOB, not the decision. The guard/reorder/WARNING
+fixes remain worth doing as defense-in-depth for any other decision-bearing
+freeze. Severity downgraded high → low.
+**Original severity claim (pre-journal):** **high** — converts an explicit "returned, severity high" into
 an approval, with **no log line anywhere** recording that a verdict existed.
 Triggered by ordinary deploys.
 **Component:** `src/graph.py:3604-3636`, `src/core/phase.py:796-798`.

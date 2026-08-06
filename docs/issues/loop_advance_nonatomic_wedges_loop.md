@@ -1,6 +1,18 @@
 # A non-atomic loop advance wedges the whole project loop (running + current_job_id=NULL)
 
-**Status:** investigated 2026-07-05 — root cause confirmed end-to-end from the live wedge, incident recovered by hand; **fix 2 (sweeper self-heal) IMPLEMENTED & k3d-verified 2026-07-05**; regression found same day (the heal raced healthy in-flight advances and double-spawned iteration 14 — see "Regression" section) and **CLOSED by the age gate, implemented 2026-07-05**: the heal now only fires when the NULL-pointer state is older than `PROJECT_LOOP_HEAL_GRACE_SECONDS` (default 600 s) — Python pre-check on the row's `updated_at` plus an authoritative DB-clock guard inside `heal_project_loop_pointer` (`AND updated_at < now() - make_interval(secs => $6)`). Tests: `tests/test_project_loop_sweeper.py` `TestHealAgeGate` (+5: fresh-NULL deferred silently before any DB reads, stale heals, naive-timestamp handling, unknown-age defers to the SQL guard, sweep-tick no-advance on fresh wedge). Fixes 1 (advance atomicity, incl. guarding tx C) and 3 (UI stalled badge) still open.
+**Status (sweep-corrected 2026-08-06):** the named functions
+(`heal_project_loop_pointer`, `claim_project_loop_advance`) were DELETED
+2026-07-19 by the Loop Unified Engine Phase 1 rewrite
+(`docs/features/loop_unified_engine.md`, migration 0063), which replaced the
+whole 3-transaction `current_job_id` rotate with an atomic
+`current_stage_jobs` barrier claim (`claim_project_loop_stage_barrier`) —
+fix 1 (atomicity) is now structurally achieved by that rewrite, not by this
+doc's patch. The heal behavior + age gate SURVIVE under new names
+(`heal_project_loop_stage`, `_heal_wedged_loop`, same
+`PROJECT_LOOP_HEAL_GRACE_SECONDS`; `TestHealAgeGate` still pins the 5 cases,
+41 tests in the file). Fix 3 (UI stalled badge) remains genuinely unbuilt.
+Read loop_unified_engine.md before touching any code pointer below.
+**Original record:** investigated 2026-07-05 — root cause confirmed end-to-end from the live wedge, incident recovered by hand; **fix 2 (sweeper self-heal) IMPLEMENTED & k3d-verified 2026-07-05**; regression found same day (the heal raced healthy in-flight advances and double-spawned iteration 14 — see "Regression" section) and **CLOSED by the age gate, implemented 2026-07-05**: the heal now only fires when the NULL-pointer state is older than `PROJECT_LOOP_HEAL_GRACE_SECONDS` (default 600 s) — Python pre-check on the row's `updated_at` plus an authoritative DB-clock guard inside `heal_project_loop_pointer` (`AND updated_at < now() - make_interval(secs => $6)`). Tests: `tests/test_project_loop_sweeper.py` `TestHealAgeGate` (+5: fresh-NULL deferred silently before any DB reads, stale heals, naive-timestamp handling, unknown-age defers to the SQL guard, sweep-tick no-advance on fresh wedge). Fixes 1 (advance atomicity, incl. guarding tx C) and 3 (UI stalled badge) still open.
 **Severity:** high for the RSI loop — one interrupted advance silently stops the entire self-improvement loop indefinitely (the observed loop was dead ~12 h before anyone noticed)
 **Component:** `orchestrator/main.py` `_advance_project_loop` / `_spawn_loop_job`, `orchestrator/database/postgres.py` loop methods, `orchestrator/services/project_loop_sweeper.py`, `cockpit/.../project-loop.component.ts`
 **Observed on:** main cluster (`superhuman-remote-worker`), loop `105a6f98-134c-4077-b7e1-6d08916650d7` (project `68137e29` "Better Resavio")

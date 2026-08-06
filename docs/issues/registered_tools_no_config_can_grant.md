@@ -20,8 +20,15 @@ related:
 
 # Ten registered tools have no reachable grant path — and five curation prompts unconditionally order the curator to call two of them
 
-**Status:** OPEN, diagnosed 2026-08-02 — the *invisible* half is fixed, the ten
-tools are unchanged.
+**Status:** OPEN, diagnosed 2026-08-02 — the *invisible* half is fixed. The
+2026-08-06 sweep corrected the tally: this line used to say "the ten tools are
+unchanged", which contradicts §3a below and the code — item 1 (kb_lint/kb_index
+→ curator) IS shipped (`bc129cca`, config/experts/curator/config.yaml) and
+item 3 (the six `*_bundle` tools) IS shipped via the new `catalog_authoring`
+category (`a1d92680`, live-gated). Still genuinely unreachable at HEAD:
+item 2's pair (`delegate_work`/`resume_delegation_child`,
+worker_base.yaml `delegation: []` unchanged). Items 4 (inverse reachability
+test) and 5 (prompt lint) remain unbuilt.
 
 **Shipped** 2026-08-02/03 on `develop` (not pushed;
 [[tool_configuration_defects_and_fix_roadmap]] is the register), all of it
