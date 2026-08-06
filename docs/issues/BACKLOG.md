@@ -18,9 +18,6 @@ blocking it should be taken before the next bench campaign.
 | doc | why now |
 |---|---|
 | [gitea_admin_credential_in_every_agent_workspace](gitea_admin_credential_in_every_agent_workspace.md) | **Security.** The Gitea admin credential lands in every agent workspace. Blast radius: any job/agent can act as git admin. |
-| [session_workspace_wiped_by_agent_clone_on_attach](session_workspace_wiped_by_agent_clone_on_attach.md) | **Data loss.** Unguarded `rm -rf`+clone on attach now wipes a *durable* PVC. Fix = port the job-path content probe. |
-| [lifecycle_session_agents_without_thread_never_drain](lifecycle_session_agents_without_thread_never_drain.md) | **Active resource leak.** Session agents without a thread never drain — pods accumulate until manual cleanup. |
-| [project_scoped_memory_deadlocks_under_parallel_jobs](project_scoped_memory_deadlocks_under_parallel_jobs.md) | **P1-rated concurrency defect** in project-scoped memory under parallel jobs — directly undermines multi-job projects. |
 
 ### P0-adjacent, tracked outside this directory
 
@@ -44,7 +41,6 @@ blocking it should be taken before the next bench campaign.
 |---|---|
 | [homelab_wan_outage_severs_cluster_from_own_llm](homelab_wan_outage_severs_cluster_from_own_llm.md) | Cheap CoreDNS rewrite makes every job immune to WAN outages (08-05 cost a 3 h cluster-wide LLM blackout + 1 job). |
 | [embedding_batch_overflow_skips_citation_source_embeddings](embedding_batch_overflow_skips_citation_source_embeddings.md) | OPEN. P1 research-quality and load defect.** Source registration |
-| [phase_boundary_tags_are_moved_then_rejected_by_remote](phase_boundary_tags_are_moved_then_rejected_by_remote.md) | OPEN. P1 phase evidence / Git observability defect.** Branch |
 | [deliverable_lost_to_nested_repo…](deliverable_lost_to_nested_repo_commit_and_stranded_mode_a_job.md) (Defect 1 residue) | **Blocks the bench thread.** The gate and critic verify against the *remote branch*, so a failed push is indistinguishable from a lazy agent — the 08-01/08-02 CWD-banner outage burned all 5 of `cd3bfe52`'s critic rounds and both of `bbce4bed`'s bounces on phantom findings, and any future transport failure will corrupt bench results the same way. Fix: hold on `has_unpushed_commits()` at seal instead of emitting findings. Also: 5 of 6 `git_mgr.push()` call sites in `src/core/phase.py` still discard the return value. |
 | [job_finalization_decisions_held_only_in_process_memory](job_finalization_decisions_held_only_in_process_memory.md) | Orchestrator restart mid-finalization loses decisions (restarts happen on every deploy). |
 | [pod_oom_kill_protection](pod_oom_kill_protection.md) | Umbrella for the recurring OOM incident class. |
@@ -54,7 +50,8 @@ blocking it should be taken before the next bench campaign.
 | doc | status |
 |---|---|
 | [bench_infra_exclusion_misses_midflight_outages](bench_infra_exclusion_misses_midflight_outages.md) | Open, analysis-level workaround exists. Found 2026-08-05 during |
-| [rejected_verdict_livelocks…](rejected_verdict_livelocks_critic_and_wedges_parent.md) | Cap + escalation + stop-order **FIXED 08-06**; only the fix-direction-2 wall-clock watchdog arm (backstop for live-critic reviews) remains open. |
+| [project_scoped_memory_deadlocks_under_parallel_jobs](project_scoped_memory_deadlocks_under_parallel_jobs.md) | Containment tier **SHIPPED 08-06 (batch #2)** — ordered locking + contained/retried access stats + heartbeat telemetry. OPEN: the semantic per-consumer TTL model (criterion 3) and pinned-budget share (criterion 5). |
+| [phase_boundary_tags_are_moved_then_rejected_by_remote](phase_boundary_tags_are_moved_then_rejected_by_remote.md) | Core **FIXED 08-06 (batch #2)** — create-once tags at completion commits, per-ref push, no `--tags` spray. OPEN residuals: duplicate phase-completion transition (graph exactly-once) + tag-independent review evidence. |
 | [dispatcher_resume_pep_twin_still_fails_open](dispatcher_resume_pep_twin_still_fails_open.md) | OPEN, filed 2026-08-04 by the whole-branch review of the fix for |
 | [registered_tools_no_config_can_grant](registered_tools_no_config_can_grant.md) | OPEN, diagnosed 2026-08-02 — the *invisible* half is fixed, the ten |
 | [kb_duplicate_frontmatter_ids_collide_on_reindex](kb_duplicate_frontmatter_ids_collide_on_reindex.md) | OPEN.** Still reproducible in code at HEAD — `note_fields` continues to take |
@@ -89,6 +86,7 @@ blocking it should be taken before the next bench campaign.
 | doc | status |
 |---|---|
 | [agent_egress_networkpolicy_enablement](agent_egress_networkpolicy_enablement.md) | Open — the policy is implemented and shipped **default-off |
+| [lifecycle_session_agents_without_thread_never_drain](lifecycle_session_agents_without_thread_never_drain.md) | CONTAINED 08-06 (batch #2): the guarded reap was already committed (`46ea64d2`) + live-verified twice on k3d (synthetic thread-less orphan reaped at grace+tick; healthy parked session untouched). Doc stays open for the unified-lifecycle proper fix only. |
 | [agent_fast_freeze_on_dead_workspace](agent_fast_freeze_on_dead_workspace.md) | Designed 2026-07-04, not yet implemented. Work on `develop`. |
 | [cloud_folder_invisible_until_owner_signs_into_cloud](cloud_folder_invisible_until_owner_signs_into_cloud.md) | OPEN — root-caused, deliberately not built. Deferred 2026-08-05. |
 | [datasource_legacy_dead_code](datasource_legacy_dead_code.md) | Open — cleanup, no functional impact. Filed 2026-06-11 |
@@ -149,7 +147,7 @@ Quick wins: the engineering is done; what remains is shipping and verification.
 | [drain_freeze_overwrites_critic_verdict](drain_freeze_overwrites_critic_verdict.md) | CONFIRMED in code. No live incident identified yet — but the |
 | [feedback_resume_restricted_closure_toolset](feedback_resume_restricted_closure_toolset.md) | Observed 2026-07-26 on dev (job `52949749`, round-2 correction). |
 | [git_push_fails_silently_via_workspace_backend](git_push_fails_silently_via_workspace_backend.md) | Root cause found for the *silence*. The underlying push failure is |
-| [ide_settings_sweeper_probes_stale_workspace_endpoints](ide_settings_sweeper_probes_stale_workspace_endpoints.md) | Filed + diagnosed (2026-06-27, during the loop-job `19707fa1` OOM investigation; promoted out of a sub-note in `audit_metadata_config_duplication_ooms |
+| [ide_settings_sweeper_probes_stale_workspace_endpoints](ide_settings_sweeper_probes_stale_workspace_endpoints.md) | **FIXED 08-06 (batch #2)** + live-verified (worklist 48→1, zero dead-endpoint probes, evictor + leader gate). Residual hardening only: dial the stable Service DNS instead of pod_ip. |
 | [jsonb_isinstance_guard_without_parse_silent_dead_paths](jsonb_isinstance_guard_without_parse_silent_dead_paths.md) | Mechanism CONFIRMED in code. Individual instances tagged below — |
 | [local_e2e_testing](local_e2e_testing.md) | response** (published by simulator): |
 | [loop_advance_nonatomic_wedges_loop](loop_advance_nonatomic_wedges_loop.md) | investigated 2026-07-05 — root cause confirmed end-to-end from the live wedge, incident recovered by hand; **fix 2 (sweeper self-heal) IMPLEMENTED & k |
@@ -163,7 +161,7 @@ Quick wins: the engineering is done; what remains is shipping and verification.
 | [persistent_session_runaway_generation_context_explosion](persistent_session_runaway_generation_context_explosion.md) | (updated 2026-06-11):** the *wedge* and the surrounding hardening are |
 | [persistent_session_swallowed_sends_and_truncated_history](persistent_session_swallowed_sends_and_truncated_history.md) | Root cause verified (all three). Fixes not started. |
 | [phase_model_overhead_amnesia_loop](phase_model_overhead_amnesia_loop.md) | 🟡 **IN PROGRESS** — filed 2026-07-31 after a code-side deep |
-| [recovery_pause_repersists_stale_freeze_invisible_job](recovery_pause_repersists_stale_freeze_invisible_job.md) | Observed 2026-07-26 on dev (job `52949749`), manually unwedged. |
+| ~~recovery_pause_repersists_stale_freeze_invisible_job~~ | **FIXED 08-06 (batch #2)**, moved to docs/done/ — completion freeze-echo guard + `pause_job_shed_freeze` on the recovery arm. |
 | [results](results.md) | pending_review, confidence 1.0 |
 | [scholar_selfprovisioned_workspace_misclassified_as_inherited](scholar_selfprovisioned_workspace_misclassified_as_inherited.md) | ROOT CAUSE CONFIRMED on live local k3d 2026-07-13 **and observed on |
 | [session_deliverables_in_workspace_output_not_in_cloud_files_button](session_deliverables_in_workspace_output_not_in_cloud_files_button.md) | Filed — root cause confirmed on live session `7692637b-9c60-4698-9875-b57ec34e66a6` (main cluster, cloud-mounted). **Reconfirmed + deeper root cause f |
@@ -318,3 +316,145 @@ rerun). All 11 residuals are pre-existing env noise on this py3.14 host
   `pending_review` carrying the rejection reason; critic
   `context.verdict_rejections = 3`; "Verification escalated target …"
   WARNING logged. Test critic cancelled afterwards.
+
+## Session log 2026-08-06 (batch #2)
+
+Autonomous ~3.5 h implementation session on `develop` (local k3d via Tilt),
+evening after batch #1. Six tasks, seven commits, nothing pushed. Batch #1's
+lesson held again: one of the six "unfixed" P0s was already fixed at HEAD.
+Subagent-driven: 6 recon agents + 3 worktree implementers; final
+verification + commits from the main loop. Note for future batches: the
+Agent tool's worktrees are created from MAIN, not develop — all three
+implementers had to be redirected to `git checkout --detach <develop-sha>`.
+
+**Task 0 (hygiene)** — commit `2b081109`. The usage-v2 metering endpoints
+(`bad31b0a`) landed without the mandatory inventory regen, so
+`test_endpoint_inventory` failed ×2 at HEAD (baseline 13 failed vs batch
+#1's closing 11). Regenerated via `scripts/check_endpoint_auth.py --write`.
+
+**Task 1 — session workspace wiped on attach (P0 data loss)** — commit
+`33fe6684`; doc → docs/done/. Ported the job path's guard to
+`PersistentSession._attach_existing_workspace`: probe the real backend
+before `initialize()` — `.git` → attach handle in place; git-less content
+(list_dir minus lost+found) → `_initialize_git()` around the files;
+genuinely empty → normal clone. Probe failures preserve. Every attach logs
+`session_workspace_init_path=fresh|reattach|attach-content`. Live k3d
+(thread `1131cea3`): fresh attach logged `=fresh` + cloned; a probe file
+survived BOTH detach shapes — agent-pod delete → orphan-sweep `ended` →
+resume, and idle-suspend → resume — each reattach logging `=reattach`,
+file intact. 8 new tests (guard + wiring).
+
+**Task 2 — session agents without a thread never drain (P0)** — no code
+needed: the guarded reap was ALREADY COMMITTED at HEAD (`46ea64d2`,
+06-23) — the doc's "uncommitted, pending review" was stale. Live-verified
+both arms on k3d: (a) negative control — a healthy thread-bound parked
+session sat ≥9 min across ~9 detector ticks, `intents={}`, untouched;
+(b) a real orphan (thread_id nulled under a live heartbeating agent) was
+stamped +25 s and its pod gone within grace+tick (attribution shared with
+the orphan-thread teardown, hence:) (c) a synthetic THREAD-LESS orphan
+(fake hostname, heartbeat kept fresh) was stamped +23 s and reaped at
+stamp+5:00 exactly — "Reaped orphaned session agent … deleted=True" —
+with no thread anywhere in the shape, only the reap can claim it. Doc
+status corrected (stays open solely for the unified-lifecycle proper fix);
+BACKLOG row moved P0 → P3.
+
+**Task 3 — project-memory deadlocks, containment tier (P0)** — commit
+`33e326a5`. `decrement_ttl` + the access-stat write now lock rows via
+id-ordered `SELECT … FOR UPDATE` CTEs; the access-stat write moved to
+`_record_access_stats` (sorted ids, deadlock-only bounded retry, ALWAYS
+contained — an uncaught deadlock here used to abort the whole retrieval,
+which was the bulk of the 138); `MemoryHealth` counters ride the heartbeat
+as `metrics["memory"]` into `agents.metadata`. Tests: mock-level shape/
+retry/containment pins + a real pgvector testcontainers concurrency suite
+(two stores, one project, opposite-order hammering, exact accounting) +
+heartbeat wiring pins ×3 apps. Live: the new-image verification job ran
+with zero deadlock/containment lines. The semantic per-consumer TTL model
+stays open in the doc (criterion 3); BACKLOG row moved P0 → P2.
+
+**Task 4 — residuals bundle** — commit `ef2d7c4d`; two docs → docs/done/.
+(a) `complete_job` gates freeze persist on
+`should_persist_completion_freeze` (a `workspace_unavailable` completion
+can only echo a stale blob); the recovery arm pauses via the new
+`pause_job_shed_freeze` (processing-CAS + stash-and-clear) so
+paused-implies-dispatchable holds. (b)
+`_provision_parent_workspace_for_scholar` now surfaces the provisioner's
+recorded error on the job row (the dispatcher's own arm was already fixed
+by `4f27f581`; the done-doc's papercut note updated). (c) The wall-clock
+watchdog arm: `unstick_reviewing_parents_wallclock` — EXISTS-live-critic
+complement of the dead-critic arm, `REVIEWING_WALLCLOCK_CEILING_MINUTES`
+(default 60, 0 disables), distinct "critic did not render a verdict in N
+minutes" message, sweeper tick step 3 + owner notify. Tests: 45 unit + 26
+real-Postgres (3 new wall-clock behavioral). Live k3d: a synthetic
+reviewing parent (updated_at −75 m) with a live 'processing' critic was
+escalated on the next in-cluster tick with the exact message + WARNING.
+
+**Task 5 — ide_settings sweeper dials dead workspaces** — commit
+`1e01c893`; doc → docs/done/. Worklist gains parent-status gates (jobs
+NOT IN terminal, threads NOT IN ended/deleted) — live worklist collapsed
+48 rows (24/24 jobs terminal, 22/24 threads ended) → 1 (the live
+session); new `evict_dead_workspaces` probes container rows via
+`workspace_pod_live` and clears confirmed-dead context; the
+`delete_workspace` 404 branch (the leak) now clears status + pod_ip; the
+sweeper is `run_when_leader`-gated (disabled branch parks). Live k3d:
+before = 275 "No route to host"/90 min; after = ZERO dead-endpoint probes
+across all observed cycles, and the evictor fired on two planted dead-pod
+rows ("evicting thread … workspace pod confirmed dead"). Live pulls of
+the real session workspace ran clean; an affirmative "synced N file(s)"
+line was not observed because newest-mtime-wins kept existing store
+content — merge semantics untouched by this fix and pinned by the
+existing unit tests. Rollouts visibly calmer (the serial dial stall was
+part of the rocky-rollout pattern batch #1 recorded). Residual hardening
+kept in the doc: dial the stable Service DNS instead of pod_ip.
+
+**Task 6 (stretch) — phase tags moved then rejected** — commit
+`78899407`. `tag()` is create-once (no `-f`; no-op at same HEAD; typed
+`TagInvariantViolation` ERROR + refusal on divergence), commit-then-tag in
+`_complete_phase_with_git`, per-ref delivery via new `push_ref`
+(`push()` default `tags=False` — no more `--tags` spray incl. external
+repos). Live k3d A/B: old-image job `803df0bd`'s
+`phase-1-tactical-complete` dereferences to the todo commit BEFORE the
+completion commit (defect live); new-image job `012ea267`'s three tags
+dereference EXACTLY to their completion commits; zero already-exists/
+invariant lines in its agent logs. Residuals kept in the doc: the
+duplicate phase-completion transition (graph exactly-once) + tag-
+independent review evidence.
+
+**Commits (7, in order):** `2b081109` inventory regen · `33fe6684`
+session-wipe guard · `ef2d7c4d` residuals bundle · `33e326a5` memory
+containment · `78899407` phase tags · `1e01c893` ide sweeper · plus this
+docs/BACKLOG commit. Nothing staged beyond these; `HomeLab/` and the
+strategy session's parallel commits (`171e7e06` et al., interleaved on
+develop mid-session) left untouched. NOTE: that session also REBASED the
+unpushed stack mid-flight, renaming every SHA once already — until the
+branch is pushed, the commit SUBJECTS above are the stable identifiers,
+not these hashes.
+
+**Pytest**: baseline at session start = 13 failed / 14351 passed
+(batch #1's 11 env-noise residuals + the 2 inventory breaks). Final =
+**11 failed / 14410 passed** — failure diff vs baseline is exactly the
+two inventory tests fixed; the 11 residuals are the same known env-noise
+set (local-Postgres `test_database_phase1`, the `test_mcp_manager`/
+`test_mcp_agent_wiring` stack, `tools/research` installed-client
+contracts). +59 net new passing tests.
+
+**Environment notes for the next batch:**
+- Agent-tool worktrees base on MAIN — detach onto the develop SHA before
+  implementing (bit all three implementers).
+- `git mv` after editing a file stages the PRE-EDIT blob; `git add` the
+  moved path explicitly or the commit silently carries old content (bit
+  this session twice).
+- Tilt syncs every orchestrator edit immediately — batch such edits;
+  expect multi-ReplicaSet churn windows; pool agent pods keep old images
+  until recycled, so verify fixes by runtime log lines, not image tags
+  (the ConfigMap tag updates before existing pods do).
+- Session-path verification rig that works end-to-end via API only:
+  POST /api/persistent/threads (id_token auth per the smoke-auth recipe)
+  → agent attaches server-side without any WebSocket client; delete the
+  agent pod or wait for idle-suspend to force detach; POST …/resume
+  re-attaches. Synthetic SQL rows work for sweeper/watchdog arms (insert
+  reviewing-parent + live-critic pairs; thread rows with dead-pod
+  container context — use status='awaiting_user' to dodge the session
+  reconciler re-provisioning them, which 'active' triggers).
+- Test jobs left on the cluster: `803df0bd`, `012ea267` (both
+  pending_review, deliberate A/B pair), session thread `1131cea3` (live),
+  `0870dec3` (ended). Safe to clean.

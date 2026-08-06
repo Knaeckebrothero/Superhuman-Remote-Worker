@@ -11,18 +11,41 @@ related:
 
 # Agents wedged in `session` with no thread are never drained
 
-**Status:** 🔴 **OPEN / ACTIVE** — this specific gap is still unfixed as of
-2026-06-23 (several *adjacent* lifecycle bugs have shipped fixes; this one has
-not). Until the stopgap below deploys, manual `kubectl delete pod` of the wedged
-session pod is the only *live* remediation. The **proper solution** — the
-unified-lifecycle root-cause fix ([[unified_instance_lifecycle]]:
-orchestrator-set *intent* vs agent-reported *observation*, so a 5s heartbeat
-can't re-assert `session` over an orchestrator drain) — **has been postponed
-twice** (2026-05-09 and 2026-06-12; see the *Deferral log* below). A targeted
-**guarded-reap stopgap** (option A under *Proposed fix*, actuated via pod-delete
-— `reap_orphaned_session_agents`) was implemented 2026-06-23 (uncommitted,
-pending review); it is explicitly **not** the proper solution and does not
-discharge the deferral.
+**Status:** 🟡 **CONTAINED — stopgap COMMITTED and LIVE-VERIFIED; proper fix
+still owed.** Corrected 2026-08-06 (batch #2): the guarded-reap stopgap is NOT
+uncommitted — it shipped in `46ea64d2` (2026-06-23,
+`PostgresDB.reap_orphaned_session_agents` at postgres.py + the
+`stale_agent_detector` wiring in main.py, grace 5 min via the DB-stamped
+`intents.session_orphaned_at`, leader-gated, tests in
+tests/test_idle_timeout.py / test_stale_agent_detector.py /
+test_sweeps_real_postgres.py). This doc's "uncommitted, pending review"
+wording was stale.
+
+**Live k3d verification 2026-08-06 (batch #2), both arms:**
+- *Negative control:* a healthy thread-bound session agent (`3ead19bc`,
+  thread `0870dec3`) sat parked ≥9 min across ~9 detector ticks with
+  `intents = {}` — never stamped, never reaped.
+- *Real orphan:* nulling that row's `thread_id` (live agent kept
+  re-asserting 'session' via heartbeat) got `session_orphaned_at` stamped
+  25 s later; the pod was gone within the grace+tick window and the row aged
+  offline with the stamp cleared by the recovered-rows arm. (Attribution
+  ambiguous with the orphaned-thread teardown, hence the second round.)
+- *Synthetic thread-less orphan* (`bbbb2222`, fake hostname, heartbeat kept
+  fresh by a driver so `mark_stale_agents_offline` could not pre-empt):
+  stamped at +23 s, and at stamp+5:00 exactly the detector logged
+  `Reaped orphaned session agent bbbb2222… (pod=batch2-fake-orphan-pod,
+  deleted=True): 'session' with no thread/job past grace` — no thread
+  existed anywhere in this shape, so only the reap can claim it.
+
+The **proper solution** — the unified-lifecycle root-cause fix
+([[unified_instance_lifecycle]]: orchestrator-set *intent* vs agent-reported
+*observation*, so a heartbeat can't re-assert `session` over an orchestrator
+drain) — remains open and **has been postponed twice** (2026-05-09 and
+2026-06-12; see the *Deferral log* below). The reconciler also still
+re-stamps the (ignored) drain intent every 60s for the whole grace window —
+noise, bounded by the reap. This doc stays open for the proper fix, but it
+is no longer an active resource leak: wedged pods now live ≤ ~6 minutes,
+not ~50 deploys.
 
 **2026-07-30 adjacent fix:** the *attached* variant of gap #1 is closed —
 dual_app's heartbeat handler now delegates session drains to
