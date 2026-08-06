@@ -4387,3 +4387,106 @@ describe('PersistentChatService — session wake on job completion', () => {
         expect(turns.filter(isAssistantTurn)).toHaveLength(1);
     });
 });
+
+describe('PersistentChatService — awaiting-turn state (queued input visibility)', () => {
+    // An accepted /input whose turn hasn't started yet used to be invisible:
+    // outbox empty, no active turn — composer back to idle/mic while the agent
+    // was still flushing the previous turn's cloud push. pendingTurnCount is
+    // the client-side ledger that keeps the send visibly alive.
+    // docs/issues/session_turn_end_cloud_push_blocks_queued_input.md
+    let originalEs: any;
+    let originalWs: any;
+
+    beforeEach(() => {
+        originalEs = (globalThis as any).EventSource;
+        originalWs = (globalThis as any).WebSocket;
+    });
+
+    afterEach(() => {
+        (globalThis as any).EventSource = originalEs;
+        (globalThis as any).WebSocket = originalWs;
+        vi.clearAllMocks();
+    });
+
+    async function readySession() {
+        const ctx = createService();
+        ctx.mockHttp.get.mockImplementation(() =>
+            of({status: 'active', total_turns: 0, messages: [], total: 0}),
+        );
+        await ctx.service.connect('thread-w');
+        fireSseOpen(ctx.sseInstances[0]);
+        fireSseMessage(ctx.sseInstances[0], {method: 'ready', params: {}}, '1:1');
+        ctx.mockHttp.post.mockClear();
+        return ctx;
+    }
+
+    it('an accepted send with no active turn sets isAwaitingTurn', async () => {
+        const ctx = await readySession();
+        await ctx.service.sendMessage('professor feedback');
+        await Promise.resolve();
+
+        expect(ctx.service.outbox()).toEqual([]); // accepted, left the outbox
+        expect(ctx.service.pendingTurnCount()).toBe(1);
+        expect(ctx.service.isAwaitingTurn()).toBe(true);
+        expect(ctx.service.isStreaming()).toBe(false);
+    });
+
+    it('turn.started hands off to isStreaming and clears the awaiting state', async () => {
+        const ctx = await readySession();
+        await ctx.service.sendMessage('hello');
+        await Promise.resolve();
+        expect(ctx.service.isAwaitingTurn()).toBe(true);
+
+        fireSseMessage(ctx.sseInstances[0], {method: 'turn.started', params: {turn_id: 1}}, '1:2');
+
+        expect(ctx.service.pendingTurnCount()).toBe(0);
+        expect(ctx.service.isAwaitingTurn()).toBe(false);
+        expect(ctx.service.isStreaming()).toBe(true);
+    });
+
+    it('a 409 duplicate does not inflate the ledger', async () => {
+        const ctx = await readySession();
+        ctx.mockHttp.post.mockImplementation((url: string) =>
+            String(url).endsWith('/input')
+                ? throwError(() => ({status: 409}))
+                : of({}),
+        );
+        await ctx.service.sendMessage('dupe');
+        await Promise.resolve();
+
+        expect(ctx.service.outbox()).toEqual([]); // 409 still drains the item
+        expect(ctx.service.pendingTurnCount()).toBe(0);
+        expect(ctx.service.isAwaitingTurn()).toBe(false);
+    });
+
+    it('an unstarted turn can never decrement below zero', async () => {
+        const ctx = await readySession();
+        // turn.started with no tracked accept (other tab / injected input).
+        fireSseMessage(ctx.sseInstances[0], {method: 'turn.started', params: {turn_id: 1}}, '1:2');
+        expect(ctx.service.pendingTurnCount()).toBe(0);
+    });
+
+    it('session.ended zeroes the ledger', async () => {
+        const ctx = await readySession();
+        await ctx.service.sendMessage('bye');
+        await Promise.resolve();
+        expect(ctx.service.pendingTurnCount()).toBe(1);
+
+        fireSseMessage(ctx.sseInstances[0], {method: 'session.ended', params: {}}, '1:2');
+
+        expect(ctx.service.pendingTurnCount()).toBe(0);
+        expect(ctx.service.isAwaitingTurn()).toBe(false);
+    });
+
+    it('disconnect zeroes the ledger — never a composer stuck on working', async () => {
+        const ctx = await readySession();
+        await ctx.service.sendMessage('going away');
+        await Promise.resolve();
+        expect(ctx.service.pendingTurnCount()).toBe(1);
+
+        ctx.service.disconnect();
+
+        expect(ctx.service.pendingTurnCount()).toBe(0);
+        expect(ctx.service.isAwaitingTurn()).toBe(false);
+    });
+});

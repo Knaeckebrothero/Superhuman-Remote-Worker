@@ -1408,6 +1408,25 @@ export function clearDraft(threadId: string | null): void {
           }
         }
 
+        <!-- Accepted-but-not-yet-started turn: the agent queued the input
+             (e.g. the previous turn's cloud push is still flushing). Shown
+             standalone because no turn object exists until turn.started —
+             without it the queued send reads as swallowed. -->
+        @if (chat.isAwaitingTurn()) {
+          <div class="message message-assistant turn-bubble">
+            <div class="avatar">
+              <app-icon size="sm" class="avatar-icon">smart_toy</app-icon>
+            </div>
+            <div class="message-body turn-body">
+              <div class="thinking">
+                <span class="thinking-dot"></span>
+                <span class="thinking-dot"></span>
+                <span class="thinking-dot"></span>
+              </div>
+            </div>
+          </div>
+        }
+
         <ng-template #startupCardTpl>
           <div class="startup-card">
             <div class="startup-card-head">
@@ -1891,7 +1910,7 @@ export function clearDraft(threadId: string | null): void {
                 (click)="chat.isStreaming() ? chat.interrupt() : send()"
                 [disabled]="chat.isInterrupting() || (!chat.isStreaming() && !canSend())"
               >
-                @if (isPendingSend() || chat.isInterrupting()) {
+                @if (isPendingSend() || chat.isInterrupting() || chat.isAwaitingTurn()) {
                   <span class="action-spinner"></span>
                 } @else if (chat.isStreaming()) {
                   <app-icon size="sm" class="action-icon">stop</app-icon>
@@ -2601,7 +2620,12 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         if (this.chat.isStartingSession()) return this.transloco.translate('chat.input.sessionStarting');
         if (!this.chat.isConnected()) return this.transloco.translate('chat.input.connect');
         if (this.chat.isInterrupting()) return this.transloco.translate('chat.input.stopping');
-        if (this.chat.isStreaming()) return this.transloco.translate('chat.input.working');
+        // isAwaitingTurn: the send is accepted but its turn hasn't started
+        // (agent still flushing the previous turn) — same "working" surface,
+        // or the queued message reads as swallowed.
+        if (this.chat.isStreaming() || this.chat.isAwaitingTurn()) {
+            return this.transloco.translate('chat.input.working');
+        }
         if (this.chat.isUploadingAttachments()) return this.transloco.translate('chat.input.uploading');
         // Mobile keyboards send newline on Enter, so the desktop key hints are wrong there.
         return this.transloco.translate(
@@ -2643,7 +2667,10 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     micMode(): boolean {
         return isMicMode(
             this.hasAudioInput(),
-            this.chat.isStreaming() || this.chat.isInterrupting() || this.isPendingSend(),
+            this.chat.isStreaming() ||
+                this.chat.isInterrupting() ||
+                this.isPendingSend() ||
+                this.chat.isAwaitingTurn(),
             this.inputText,
             this.chat.pendingAttachments().length,
         );

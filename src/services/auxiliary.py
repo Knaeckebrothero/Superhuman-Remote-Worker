@@ -2120,6 +2120,14 @@ def _format_messages_for_extraction(messages: List[BaseMessage]) -> str:
 
         role = _get_message_role(msg)
         content = msg.content if hasattr(msg, "content") else ""
+        # Responses-API models return list-of-blocks content; .strip() on it
+        # killed extraction every turn (AttributeError, contained). Flatten
+        # with the summarizer helper, which also keeps base64 image payloads
+        # out of the extraction prompt.
+        if not isinstance(content, str):
+            from src.core.image_tokens import content_to_summary_text
+
+            content = content_to_summary_text(content)
 
         if not content or not content.strip():
             continue

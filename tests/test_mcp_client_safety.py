@@ -8,7 +8,7 @@ import inspect
 import httpx
 import pytest
 
-from orchestrator.mcp.client import AsyncCockpitClient, MutationOutcomeUnknown
+from src.shared.orch_surface.client import AsyncCockpitClient, MutationOutcomeUnknown
 
 
 @pytest.mark.asyncio
