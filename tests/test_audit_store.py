@@ -33,6 +33,9 @@ from types import SimpleNamespace  # noqa: E402
 from orchestrator.database.migrate import run_migrations  # noqa: E402
 from orchestrator.database.postgres import MIGRATIONS_AUDIT_DIR  # noqa: E402
 from orchestrator.services import audit_partitions, workspace_metering  # noqa: E402
+from orchestrator.services.infrastructure_metering.materializer import (  # noqa: E402
+    build_usage_plan,
+)
 from orchestrator.services.usage_ledger import (  # noqa: E402
     UsageEvent,
     UsageLedger,
@@ -832,6 +835,85 @@ class TestUsageLedger:
             )
             assert await ledger.record_events([ev2]) == 1
             assert await pool.fetchval("SELECT count(*) FROM usage_events") == 2
+
+    async def test_strict_frozen_infrastructure_batch_round_trip(self, pg_dsn):
+        async with _audit_pool(pg_dsn) as pool:
+            now = datetime.now(timezone.utc)
+            start = now.replace(day=1, hour=1, minute=0, second=0, microsecond=0)
+            interval_id, lifecycle_id = uuid4(), uuid4()
+            owner_id, user_id, project_id = uuid4(), uuid4(), uuid4()
+            interval = {
+                "id": interval_id,
+                "source_cluster": "test-cluster",
+                "source_kind": "pod",
+                "source_uid": "pod-strict-ledger",
+                "source_lifecycle_id": lifecycle_id,
+                "revision_no": 1,
+                "source_revision": "a" * 64,
+                "namespace": "tests",
+                "name": "workspace-strict-ledger",
+                "category": "compute",
+                "resource": "workspace_pod",
+                "measurement_basis": "scheduler-request",
+                "cost_domain": "workload-allocation",
+                "resource_class": "kubernetes-pod",
+                "attribution_scope": "customer",
+                "owner_kind": "job",
+                "owner_id": str(owner_id),
+                "user_id": user_id,
+                "project_id": project_id,
+                "attribution_source": "test-owner",
+                "attribution_quality": "exact",
+                "backing_resource_uid": None,
+                "lifecycle_confidence": "kubernetes-visible",
+                "cpu_millicores": 2000,
+                "memory_bytes": 4 * 1024**3,
+                "storage_bytes": None,
+                "capacity_source": "test-requests",
+                "capacity_quality": "exact",
+                "measurement_algorithm": "pod-requests-test-v1",
+                "started_at": start,
+                "start_time_source": "test",
+                "start_uncertainty_us": 0,
+                "ended_at": start + timedelta(hours=1),
+                "end_time_source": "test-close",
+                "end_uncertainty_us": 0,
+                "last_seen_at": start + timedelta(hours=1),
+                "last_confirmed_at": start + timedelta(hours=1),
+                "materialized_through": start,
+                "end_reason": "test",
+            }
+            plan = build_usage_plan(interval, (), creator_generation=1)
+            assert plan is not None
+            ledger = UsageLedger(pool, UsageRates(None))
+            events = [item.event for item in plan.events]
+
+            first = await ledger.publish_frozen_events(events)
+            replay = await ledger.publish_frozen_events(events)
+
+            assert (first.inserted, first.verified) == (2, 2)
+            assert (replay.inserted, replay.verified) == (0, 2)
+            rows = await pool.fetch(
+                "SELECT unit, quantity, payload_hash FROM usage_events "
+                "WHERE source='infra-allocation-v2' AND source_id=$1 "
+                "ORDER BY unit",
+                events[0].payload["source_id"],
+            )
+            assert [(row["unit"], row["quantity"]) for row in rows] == [
+                ("gib-hour", Decimal("4")),
+                ("vcpu-hour", Decimal("2")),
+            ]
+            assert {row["payload_hash"] for row in rows} == {
+                event.row_hash for event in events
+            }
+            assert (
+                await pool.fetchval(
+                    "SELECT revision FROM usage_rollup_dirty_days "
+                    "WHERE day=($1 AT TIME ZONE 'UTC')::date",
+                    start,
+                )
+                == 1
+            )
 
     async def test_rate_snapshot(self, pg_dsn):
         async with _audit_pool(pg_dsn) as pool:

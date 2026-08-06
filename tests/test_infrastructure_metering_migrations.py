@@ -13,6 +13,9 @@ from uuid import uuid4
 import asyncpg
 import pytest
 
+from orchestrator.services.infrastructure_metering.materializer import (
+    InfrastructureUsageMaterializer,
+)
 from orchestrator.services.infrastructure_metering.inventory import (
     InventoryConflictError,
     InventoryContractError,
@@ -35,6 +38,7 @@ from orchestrator.services.infrastructure_metering.inventory import (
 from orchestrator.services.infrastructure_metering.pod_intervals import (
     PodIntervalReconciler,
 )
+from orchestrator.services.usage_ledger import StrictUsagePublishResult
 
 
 ROOT = Path(__file__).parents[1]
@@ -833,6 +837,147 @@ async def test_snapshot_ticket_turns_abandoned_watch_into_recovery_gap(
                 gap["id"],
             )
         assert await store.deactivate_generation(generation)
+    finally:
+        if pool is not None:
+            await pool.close()
+        if not setup.is_closed():
+            await setup.close()
+        admin = await asyncpg.connect(app_pg_dsn)
+        try:
+            await admin.execute(f'DROP DATABASE IF EXISTS "{dbname}" WITH (FORCE)')
+        finally:
+            await admin.close()
+
+
+@pytest.mark.asyncio
+async def test_strict_materializer_freezes_and_finalizes_on_postgres16(
+    app_pg_dsn: str,
+) -> None:
+    dbname = f"metering_publish_{uuid4().hex[:12]}"
+    admin = await asyncpg.connect(app_pg_dsn)
+    try:
+        await admin.execute(f'CREATE DATABASE "{dbname}"')
+    finally:
+        await admin.close()
+    dsn = _swap_db(app_pg_dsn, dbname)
+    setup = await asyncpg.connect(dsn)
+    pool = None
+    try:
+        await setup.execute('CREATE EXTENSION "uuid-ossp"')
+        await setup.execute("CREATE TABLE usage_rate_cards (id TEXT PRIMARY KEY)")
+        await setup.execute(
+            "CREATE TABLE rollup_state (name TEXT PRIMARY KEY, last_closed_day DATE)"
+        )
+        await setup.execute(APP_MIGRATION.read_text())
+        await setup.execute(APP_INGESTION_MIGRATION.read_text())
+        await setup.execute(APP_INGESTION_SIZE_FIX.read_text())
+
+        cutover = datetime(2026, 8, 5, 10, tzinfo=timezone.utc)
+        scope_id, lifecycle_id, interval_id = uuid4(), uuid4(), uuid4()
+        owner_id, user_id, project_id = uuid4(), uuid4(), uuid4()
+        await setup.execute(
+            "UPDATE infra_metering_control SET leader_generation=7, "
+            "cutover_state='active', cutover_at=$1, "
+            "updated_at=statement_timestamp() WHERE singleton",
+            cutover,
+        )
+        await setup.execute(
+            "INSERT INTO resource_inventory_scopes "
+            "(id, collector_id, source_cluster, api_resource, namespace) "
+            "VALUES ($1, 'kubernetes', 'cluster-a', 'core/v1/pods', 'workers')",
+            scope_id,
+        )
+        await setup.execute(
+            "INSERT INTO resource_lifecycle_heads "
+            "(source_lifecycle_id, latest_revision_no) VALUES ($1, 1)",
+            lifecycle_id,
+        )
+        await setup.execute(
+            "INSERT INTO resource_intervals ("
+            "id, inventory_scope_id, source_cluster, source_kind, source_uid, "
+            "source_api_version, source_lifecycle_id, revision_no, "
+            "source_revision, namespace, name, category, resource, "
+            "measurement_basis, cost_domain, resource_class, "
+            "attribution_scope, owner_kind, owner_id, user_id, project_id, "
+            "attribution_source, attribution_quality, lifecycle_confidence, "
+            "cpu_millicores, memory_bytes, capacity_source, capacity_quality, "
+            "measurement_algorithm, started_at, start_time_source, "
+            "start_uncertainty_us, ended_at, end_time_source, "
+            "end_uncertainty_us, last_seen_at, last_confirmed_at, "
+            "materialized_through, end_reason, details) VALUES ("
+            "$1, $2, 'cluster-a', 'pod', 'pod-a', 'v1', $3, 1, $4, "
+            "'workers', 'workspace-a', 'compute', 'workspace_pod', "
+            "'scheduler-request', 'workload-allocation', 'kubernetes-pod', "
+            "'customer', 'job', $5, $6, $7, 'job-label-db', 'exact', "
+            "'kubernetes-visible', 2000, $8, 'pod-requests-v1', 'exact', "
+            "'kubernetes-pod-requests-v1', $9, 'cutover-barrier', 0, $10, "
+            "'backend-close', 0, $10, $10, $9, 'cutover-test', '{}'::jsonb)",
+            interval_id,
+            scope_id,
+            lifecycle_id,
+            "a" * 64,
+            str(owner_id),
+            user_id,
+            project_id,
+            4 * 1024**3,
+            cutover,
+            cutover + timedelta(hours=1),
+        )
+        await setup.execute(
+            "UPDATE resource_lifecycle_heads SET current_interval_id=$1 "
+            "WHERE source_lifecycle_id=$2",
+            interval_id,
+            lifecycle_id,
+        )
+        await setup.close()
+
+        class StrictLedgerStub:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            async def publish_frozen_events(self, events):
+                self.calls += 1
+                return StrictUsagePublishResult(
+                    expected=len(events), inserted=len(events), verified=len(events)
+                )
+
+        pool = await asyncpg.create_pool(dsn, min_size=1, max_size=4)
+        ledger = StrictLedgerStub()
+        materializer = InfrastructureUsageMaterializer(
+            pool,
+            ledger,  # type: ignore[arg-type]
+            publication_enabled=True,
+            batch_size=5,
+        )
+
+        plans = await materializer.plan_batch(7)
+        assert len(plans) == 1
+        assert len(plans[0].events) == 2
+        assert (
+            await pool.fetchval(
+                "SELECT count(*) FROM resource_publication_plan_events "
+                "WHERE plan_id=$1",
+                plans[0].id,
+            )
+            == 2
+        )
+        pending = await materializer.next_pending_plan()
+        assert pending == plans[0]
+
+        published = await materializer.publish_one(7)
+        assert published is not None and published.cursor_advanced
+        assert ledger.calls == 1
+        assert await pool.fetchval(
+            "SELECT materialized_through FROM resource_intervals WHERE id=$1",
+            interval_id,
+        ) == cutover + timedelta(hours=1)
+        state = await pool.fetchrow(
+            "SELECT state, attempt_count, sanitized_error "
+            "FROM resource_publication_plans WHERE id=$1",
+            plans[0].id,
+        )
+        assert tuple(state) == ("published", 1, None)
+        assert await materializer.publish_one(7) is None
     finally:
         if pool is not None:
             await pool.close()
