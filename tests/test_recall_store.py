@@ -12,7 +12,8 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 import pytest_asyncio
 
-from src.services.recall_store import MemoryRecord, RecallStore
+import src.services.recall_store as recall_store_module
+from src.services.recall_store import MemoryRecord, RecallStore, memory_health
 
 
 # =============================================================================
@@ -820,6 +821,115 @@ class TestStats:
 
         stats = await store.get_stats()
         assert stats["total"] == 0
+
+
+# =============================================================================
+# Deadlock containment (docs/issues/project_scoped_memory_deadlocks_under_
+# parallel_jobs.md) — deterministic id-ordered locking, bounded retry of the
+# access-stat write, containment, and MemoryHealth counters.
+# =============================================================================
+
+
+class DeadlockDetectedError(Exception):
+    """Stands in for asyncpg's DeadlockDetectedError.
+
+    The production code matches on ``type(e).__name__`` so it does not have to
+    import asyncpg's exception tree, so this stub must carry the real name.
+    """
+
+
+class TestDeadlockContainment:
+    """Ordered locking + contained/retried/counted concurrency failures."""
+
+    @pytest.fixture(autouse=True)
+    def _reset_health(self, monkeypatch):
+        monkeypatch.setattr(recall_store_module, "_ACCESS_STAT_RETRY_DELAYS", (0, 0))
+        memory_health.reset()
+        yield
+        memory_health.reset()
+
+    @pytest.mark.asyncio
+    async def test_decrement_ttl_locks_in_id_order(self, store, mock_db):
+        """decrement_ttl acquires row locks via an id-ordered FOR UPDATE CTE."""
+        mock_db.fetchval.return_value = 4
+        count = await store.decrement_ttl()
+        sql = mock_db.fetchval.call_args[0][0]
+        assert "ORDER BY id" in sql
+        assert "FOR UPDATE" in sql
+        assert "valid_to IS NULL" in sql
+        assert count == 4
+
+    @pytest.mark.asyncio
+    async def test_decrement_ttl_counts_deadlock_and_reraises(self, store, mock_db):
+        """A TTL-decrement deadlock is counted, then re-raised (callers contain)."""
+        mock_db.fetchval.side_effect = DeadlockDetectedError("deadlock detected")
+        with pytest.raises(DeadlockDetectedError):
+            await store.decrement_ttl()
+        assert memory_health.snapshot() == {"ttl_decrement_deadlock": 1}
+
+    @pytest.mark.asyncio
+    async def test_access_stats_sorts_ids_and_locks_in_order(self, store, mock_db):
+        """The access-stat write sorts ids and locks via an ordered CTE."""
+        ids = sorted([uuid.uuid4() for _ in range(3)], reverse=True)
+        await store._record_access_stats(ids)
+        sql = mock_db.execute.call_args[0][0]
+        assert "ORDER BY id" in sql
+        assert "FOR UPDATE" in sql
+        assert mock_db.execute.call_args[0][1] == sorted(ids)
+
+    @pytest.mark.asyncio
+    async def test_access_stats_retries_deadlock_then_succeeds(self, store, mock_db):
+        """Two deadlocks then success → three attempts, no raise, counted."""
+        mock_db.execute.side_effect = [
+            DeadlockDetectedError("deadlock detected"),
+            DeadlockDetectedError("deadlock detected"),
+            None,
+        ]
+        await store._record_access_stats([uuid.uuid4()])
+        assert mock_db.execute.await_count == 3
+        assert memory_health.snapshot() == {"access_stats_deadlock": 2}
+
+    @pytest.mark.asyncio
+    async def test_access_stats_failure_never_aborts_retrieval(self, store, mock_db):
+        """hybrid_search still returns the fetched rows when every access-stat
+        attempt deadlocks."""
+        rows = [
+            {"id": uuid.uuid4(), "content": f"m{i}", "token_count": 5} for i in range(3)
+        ]
+        mock_db.fetch.return_value = rows
+        mock_db.execute.side_effect = DeadlockDetectedError("deadlock detected")
+
+        results = await store.hybrid_search("query", [0.1] * 1536)
+
+        assert len(results) == 3
+        assert mock_db.execute.await_count == 3  # bounded: initial + 2 retries
+        assert memory_health.snapshot() == {"access_stats_deadlock": 3}
+
+    @pytest.mark.asyncio
+    async def test_access_stats_non_deadlock_contained_without_retry(
+        self, store, mock_db
+    ):
+        """A non-deadlock error is contained on the first attempt, no retry."""
+        mock_db.execute.side_effect = ValueError("boom")
+        await store._record_access_stats([uuid.uuid4()])
+        assert mock_db.execute.await_count == 1
+        assert memory_health.snapshot() == {"access_stats_error": 1}
+
+    @pytest.mark.asyncio
+    async def test_hybrid_search_counts_retrieval_deadlock(self, store, mock_db):
+        """A deadlocked RRF read is counted, then re-raised (outer containment)."""
+        mock_db.fetch.side_effect = DeadlockDetectedError("deadlock detected")
+        with pytest.raises(DeadlockDetectedError):
+            await store.hybrid_search("query", [0.1] * 1536)
+        assert memory_health.snapshot() == {"retrieval_deadlock": 1}
+
+    def test_snapshot_none_when_all_zero(self):
+        """Healthy store reports no payload at all."""
+        assert memory_health.snapshot() is None
+        memory_health.increment("retrieval_deadlock")
+        assert memory_health.snapshot() == {"retrieval_deadlock": 1}
+        memory_health.reset()
+        assert memory_health.snapshot() is None
 
 
 # =============================================================================

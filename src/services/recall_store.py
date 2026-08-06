@@ -33,6 +33,7 @@ Usage:
     ```
 """
 
+import asyncio
 import logging
 import uuid
 from dataclasses import dataclass, field
@@ -257,6 +258,53 @@ class MemoryRecord:
             superseded_by=row.get("superseded_by"),
             similarity=row.get("similarity"),
         )
+
+
+# Sleep between access-stat write retries after a deadlock. Module-level so
+# tests can zero it; length bounds the retry count (len + 1 attempts total).
+_ACCESS_STAT_RETRY_DELAYS = (0.05, 0.15)
+
+
+def _is_deadlock(exc: BaseException) -> bool:
+    """Match asyncpg's DeadlockDetectedError without importing asyncpg."""
+    return type(exc).__name__ == "DeadlockDetectedError"
+
+
+class MemoryHealth:
+    """Process-wide counters for contained memory-store failures.
+
+    Concurrent same-project jobs deadlock on the shared memory rows (138
+    contained retrieval deadlocks in one five-job batch — see
+    docs/issues/project_scoped_memory_deadlocks_under_parallel_jobs.md).
+    Containment keeps the jobs alive but was visible only in pod logs; these
+    counters ride the agent heartbeat into ``agents.metadata`` so contained
+    degradation reaches operator telemetry. Counting only — never control flow.
+    """
+
+    _KINDS = (
+        "ttl_decrement_deadlock",
+        "access_stats_deadlock",
+        "access_stats_error",
+        "retrieval_deadlock",
+    )
+
+    def __init__(self) -> None:
+        self._counts: Dict[str, int] = dict.fromkeys(self._KINDS, 0)
+
+    def increment(self, kind: str) -> None:
+        self._counts[kind] = self._counts.get(kind, 0) + 1
+
+    def snapshot(self) -> Optional[Dict[str, int]]:
+        """Nonzero counters only; None when all zero (healthy = no payload)."""
+        counts = {kind: n for kind, n in self._counts.items() if n}
+        return counts or None
+
+    def reset(self) -> None:
+        """Zero all counters (tests)."""
+        self._counts = dict.fromkeys(self._KINDS, 0)
+
+
+memory_health = MemoryHealth()
 
 
 class RecallStore:
@@ -979,22 +1027,38 @@ class RecallStore:
 
         Called once per turn in the execute node, before memory retrieval.
 
+        Locks the target rows in id order before updating: concurrent
+        same-project consumers otherwise acquire the overlapping tuple locks
+        in divergent orders and deadlock. A residual DeadlockDetectedError is
+        counted for telemetry and re-raised — callers already contain it.
+
         Returns:
             Number of memories whose TTL was decremented
         """
         scope_clause, scope_val = self._scope_where(1)
-        result = await self.db.fetchval(
-            f"""
-            WITH updated AS (
-                UPDATE memories
-                SET remaining_turns = remaining_turns - 1
-                WHERE {scope_clause} AND remaining_turns > 0 AND valid_to IS NULL
-                RETURNING id
+        try:
+            result = await self.db.fetchval(
+                f"""
+                WITH target AS (
+                    SELECT id FROM memories
+                    WHERE {scope_clause} AND remaining_turns > 0 AND valid_to IS NULL
+                    ORDER BY id
+                    FOR UPDATE
+                ), updated AS (
+                    UPDATE memories m
+                    SET remaining_turns = m.remaining_turns - 1
+                    FROM target t
+                    WHERE m.id = t.id
+                    RETURNING m.id
+                )
+                SELECT COUNT(*) FROM updated
+                """,
+                scope_val,
             )
-            SELECT COUNT(*) FROM updated
-            """,
-            scope_val,
-        )
+        except Exception as e:
+            if _is_deadlock(e):
+                memory_health.increment("ttl_decrement_deadlock")
+            raise
         return result or 0
 
     async def boost_ttl(self, memory_id: uuid.UUID, turns: int) -> bool:
@@ -1090,21 +1154,26 @@ class RecallStore:
             func_name = "memory_hybrid_search"
             scope_val = self.job_id
 
-        rows = await self.db.fetch(
-            f"""
-            SELECT * FROM {func_name}(
-                $1, $2, $3, $4, $5, $6, $7, importance_floor => $8
+        try:
+            rows = await self.db.fetch(
+                f"""
+                SELECT * FROM {func_name}(
+                    $1, $2, $3, $4, $5, $6, $7, importance_floor => $8
+                )
+                """,
+                query_text,
+                query_embedding,
+                scope_val,
+                match_count,
+                dense_weight,
+                sparse_weight,
+                recency_weight,
+                importance_floor,
             )
-            """,
-            query_text,
-            query_embedding,
-            scope_val,
-            match_count,
-            dense_weight,
-            sparse_weight,
-            recency_weight,
-            importance_floor,
-        )
+        except Exception as e:
+            if _is_deadlock(e):
+                memory_health.increment("retrieval_deadlock")
+            raise
 
         # Update access tracking. This deliberately does NOT re-arm
         # remaining_turns any more.
@@ -1132,16 +1201,7 @@ class RecallStore:
         # docstring claims: set at write, or by an explicit boost_ttl, decayed
         # once per turn.
         if rows:
-            ids = [row["id"] for row in rows]
-            await self.db.execute(
-                """
-                UPDATE memories
-                SET access_count = access_count + 1,
-                    last_accessed = CURRENT_TIMESTAMP
-                WHERE id = ANY($1)
-                """,
-                ids,
-            )
+            await self._record_access_stats([row["id"] for row in rows])
 
         results = [MemoryRecord.from_row(dict(row)) for row in rows]
 
@@ -1159,6 +1219,54 @@ class RecallStore:
             )
 
         return results
+
+    async def _record_access_stats(self, ids: List[Any]) -> None:
+        """Best-effort access_count/last_accessed bump for retrieved rows.
+
+        Sorted ids feeding an id-ordered FOR UPDATE lock CTE keep concurrent
+        consumers' lock acquisition aligned; a residual DeadlockDetectedError
+        gets a bounded retry (one attempt per _ACCESS_STAT_RETRY_DELAYS entry).
+        Every failure is contained and counted — losing one access-stat update
+        is better than losing the retrieval it annotates.
+        """
+        ordered = sorted(ids)
+        attempts = len(_ACCESS_STAT_RETRY_DELAYS) + 1
+        for attempt in range(1, attempts + 1):
+            try:
+                await self.db.execute(
+                    """
+                    WITH target AS (
+                        SELECT id FROM memories
+                        WHERE id = ANY($1)
+                        ORDER BY id
+                        FOR UPDATE
+                    )
+                    UPDATE memories m
+                    SET access_count = m.access_count + 1,
+                        last_accessed = CURRENT_TIMESTAMP
+                    FROM target t
+                    WHERE m.id = t.id
+                    """,
+                    ordered,
+                )
+                return
+            except Exception as e:
+                if _is_deadlock(e):
+                    memory_health.increment("access_stats_deadlock")
+                    if attempt < attempts:
+                        await asyncio.sleep(_ACCESS_STAT_RETRY_DELAYS[attempt - 1])
+                        continue
+                else:
+                    memory_health.increment("access_stats_error")
+                logger.warning(
+                    "Memory access-stat write failed (contained, attempt %d/%d): "
+                    "%s: %s",
+                    attempt,
+                    attempts,
+                    type(e).__name__,
+                    e,
+                )
+                return
 
     async def retrieve(
         self,

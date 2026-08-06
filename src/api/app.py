@@ -315,7 +315,27 @@ def _get_agent_metrics() -> Optional[Dict[str, Any]]:
     if aux is not None:
         metrics["aux"] = aux
 
+    # Contained memory-store failures (deadlock containment). Best-effort;
+    # never fail heartbeat.
+    memory = _memory_health_for_heartbeat()
+    if memory is not None:
+        metrics["memory"] = memory
+
     return metrics or None
+
+
+def _memory_health_for_heartbeat() -> Optional[Dict[str, Any]]:
+    """Contained memory-store failure counters for the heartbeat.
+
+    Returns None while every counter is zero so the healthy common case adds
+    no payload (and the orchestrator persists nothing new).
+    """
+    try:
+        from src.services.recall_store import memory_health
+
+        return memory_health.snapshot()
+    except Exception:
+        return None
 
 
 def _aux_health_for_heartbeat() -> Optional[Dict[str, Any]]:
