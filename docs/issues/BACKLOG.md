@@ -298,3 +298,20 @@ rerun). All 11 residuals are pre-existing env noise on this py3.14 host
 (local-Postgres-required `test_database_phase1`, the `test_mcp_manager` /
 `test_mcp_agent_wiring` stack, `tools/research` installed-client contracts)
 — none touch modules changed this session; memory baseline was ~8 on py313.
+
+### Addendum (same session, later): the two deferred live exercises ran
+
+- **Task 1 live criterion met organically**: job `d3a16617`
+  (`autonomy: review` + `verification.enabled`) → completed → `reviewing` →
+  critic `6a21f0f5` dispatched; `returned` verdict (1 finding) recorded on
+  the ledger; critic completed on its own → "Queued job … for auto-dispatch
+  with feedback" → re-dispatched **4 s later**; parent freeze cleared
+  (`last_freeze_data.freeze_type=job_complete` stashed) and the round-2
+  agent's LLM context carried the finding text. The wedge is dead
+  end-to-end.
+- **Task 4(a) live criterion met**: round-2 critic `7f086fe8` pinned
+  pre-dispatch; three invalid verdict POSTs against the real endpoint →
+  409, 409, then 409 + `"escalated": true`; target `d3a16617` →
+  `pending_review` carrying the rejection reason; critic
+  `context.verdict_rejections = 3`; "Verification escalated target …"
+  WARNING logged. Test critic cancelled afterwards.
