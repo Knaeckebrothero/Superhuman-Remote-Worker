@@ -38,6 +38,27 @@ Reference job: `bbce4bed-79be-4e36-bbb1-9dd12ce43dcf` — project `Better Resavi
 Shipped: `22b2511e` (parser fix), `d7e05c39` (`push()` logs why it declines),
 `6ee90376` (absolute paths in write results). Full suite green at the time of each.
 
+**This doc stays in `docs/issues/` — the investigation is closed but the work is not.** Still
+open, in priority order:
+
+1. **Defect 3 / Mode A** — 219/220 jobs stranded, zero exports ever. Deferred by decision to
+   `workspace_and_change_records.md` §6.3 (retire the mirror rather than repair it). Tracked
+   as P0-adjacent in `BACKLOG.md`.
+2. **Transport failure must not read as a lazy agent** — the gate and the critic both verify
+   against the remote branch, so this bug cost `cd3bfe52` five critic rounds and `bbce4bed`
+   both bounces. See *Suggested fixes*. Unbuilt.
+3. **Push return values are still discarded** at five of six call sites in `src/core/phase.py`
+   (545, 739, 925, 997, 1076); only 1123 checks. A phase boundary whose push returned `False`
+   is still treated as complete. Unbuilt.
+4. **Defect 2's anchoring change** — making every `shell_execute` start at the workspace root
+   (unconditional cwd restore, with a foreign-session carve-out) was designed but not built.
+   Only the reporting half shipped.
+
+Two jobs remain parked on findings that were artifacts of this bug: `cd3bfe52` (`pending_review`,
+"Round limit reached (5) with 6 finding(s) still open") and `bbce4bed` (`pending_review`,
+deliverable-gate bounce cap). Their content is recoverable from `llm_requests` — see
+`reference_audit_recovery_llm_requests_not_agent_audit`.
+
 ### Blast radius — RESOLVED 2026-08-06: it was universal, not conditional
 
 Two earlier readings of this doc claimed the bug fired *conditionally* and that only
