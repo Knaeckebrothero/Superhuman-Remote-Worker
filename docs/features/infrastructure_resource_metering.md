@@ -11,16 +11,18 @@ tags:
 
 # Application infrastructure allocation metering
 
-**Status:** Slice 0 and the shadow-only foundation of Slice 1 are implemented as
-a dark launch through app migration `0088`. The dedicated Kubernetes Pod
-collector, namespace-scoped RBAC, authenticated and generation-fenced ingestion,
-exact LIST/WATCH continuity recovery, app-DB workspace Pod intervals, immutable
-shadow comparisons, and bounded retention are present; all runtime gates still
-default off. Deterministic ordinary-usage segmentation, frozen publication
-plans, strict audit insert/verify, and fenced cursor finalization exist as
-unwired dark code; no runtime publisher can start. There is no late/correction
-publication, interval-tail/rollup handoff, billing cutover, VM collection, or
-PVC/PV collection. This is not production billing readiness.
+**Status:** Slice 0 and the Slice 1 workspace-Pod implementation are complete as
+gated code through app migration `0101`. The dedicated Kubernetes collector,
+authenticated and generation-fenced LIST/WATCH ingestion, interval and shadow
+reconciliation, crash-resumable legacy cutover, strict ordinary/late/correction
+publication, day sealing, typed rollup handoff, and source-aware reads are wired
+into the leader-owned runtime. Fleet-admin cutover, coverage-waiver, and
+append-only correction workflows are present. Every runtime gate still defaults
+off, no durable production cutover has been performed, and collection, shadow,
+v2 reads, cutover, publication, and source-aware reads remain independently
+controlled. Slice 2 VM and PVC/PV collection is not implemented. Slice 1 is
+ready for its controlled shadow/activation runbook, not an automatic billing
+switch.
 
 **Triggered by:** adding public-cloud comparison rate cards exposed that the
 ledger's existing `vcpu-hour` / `gib-hour` arithmetic is sound, but its resource
@@ -1026,11 +1028,12 @@ quantity, rate, and cost. Negative quantities are allowed only for a typed
 `event_kind=correction` row that references the full original `(source,
 source_id, unit, ts)` key, uses its old dimensions, shares a
 `correction_group_id` with any positive replacement delta, and carries an
-operator/reason audit trail; `usage` and `late-usage` are non-negative. V1
-supports automatic late usage backed by a durable hook/journal, but not manual
-alteration of an existing event. Such a conflict blocks/marks coverage for
-operator resolution until the reviewed correction workflow ships; nobody
-mutates or deletes a published row.
+operator/reason audit trail; `usage` and `late-usage` are non-negative. Late
+usage requires durable post-period discovery evidence from a complete snapshot,
+complete absence proof, or authenticated WATCH receipt. Reviewed manual repair
+uses the fleet-admin correction endpoint, a UUID idempotency key,
+immutable-original hash verification, and append-only signed deltas. Changed
+intent on replay is a conflict; nobody mutates or deletes a published row.
 
 Hashing uses SHA-256 over a versioned ordered field list. Timestamps are UTC
 RFC3339 at exactly microsecond precision; UUIDs are lowercase; Decimal values
@@ -1303,11 +1306,13 @@ existing endpoint's numbers to decimal strings would be a wire break.
 `GET /api/usage/v2` is the new primary summary and returns explicit dimensions,
 finality, price coverage, and freshness:
 
-The Slice 0 dark-launch implementation intentionally exposes only existing
-point-event ledger rows. It reports partial coverage and a null `data_through`;
-it does not infer absent Pods/VMs/PVCs as zero or prorate legacy end-stamped
-workspace rows. Slice 1 switches complete UTC days to `usage_daily_v2` and adds
-confirmed interval tails at partial boundaries.
+With source-aware reads disabled, the Slice 0 adapter intentionally exposes only
+existing point-event ledger rows. It reports partial coverage and a null
+`data_through`; it does not infer absent Pods/VMs/PVCs as zero or prorate legacy
+end-stamped workspace rows. With the independent gate enabled after an active
+durable cutover, the Slice 1 reader switches complete UTC days to
+`usage_daily_v2`, adds confirmed interval tails at partial boundaries, and fails
+closed on inconsistent plans or coverage state.
 
 ```json
 {
@@ -1612,7 +1617,9 @@ adding more branches to the legacy workspace file:
 | `collectors/vm_controller.py` | HTTP/NATS VM snapshot validation and normalization |
 | `reconciler.py` | Transactional snapshot reconciliation and interval revisions |
 | `materializer.py` | Day/rate segmentation and strict ledger publication |
-| `queries.py` | Rolled-day plus interval-tail read model and coverage |
+| `sealer.py` | Generation-fenced coverage proof and immutable UTC-day sealing |
+| `read_model.py` | Rolled-day plus interval-tail finality, pricing, and coverage |
+| `queries.py` | Public compatibility adapter and explicit source-aware read gate |
 
 Existing integration points and their intended deltas are explicit:
 
@@ -1744,12 +1751,34 @@ bootstrap seeding, and audit `0005` for the raw project/window index. PostgreSQL
 16 cannot build that partitioned-parent index concurrently; `0005` documents
 its blocking maintenance-window requirement for large retained ledgers.
 
-The shadow-only Slice 1 foundation adds app `0087`: one-use ingestion tickets,
+The Slice 1 inventory foundation adds app `0087`: one-use ingestion tickets,
 transport replay nonces, WATCH sessions/events, recovery-epoch metadata,
 workspace comparison diagnostics, and database-enforced retention terminals.
 App `0088` makes snapshot byte accounting use logical JSON bytes rather than
-TOAST-dependent physical sizes. Neither migration adds an audit publication or
-cutover path.
+TOAST-dependent physical sizes. App `0089` and `0090` add online GiST overlap
+indexes for publication-plan periods and resource intervals. App `0091` and
+`0092` add online partial indexes for complete snapshot boundary evidence and
+invalid-presence WATCH receipts used by day sealing. Capability probing requires
+all four indexes, verifies that each index is valid/ready/live and attached to
+the expected public relation, and therefore fails closed after an interrupted
+concurrent build.
+
+App `0093` adds the one-way workspace cutover state machine, strict legacy-drain
+outbox, and exact infrastructure coverage revision consumed by typed rollup.
+The emergency interstitial `0092z` safely prepares pre-`0093` databases that
+already contain sealed Slice 0 day rows; it is a no-op once `0093` is present.
+The immutable `0094` hardens request identity, partial-day activation, cutover
+barriers, LIST start semantics, and monotonic seal degradation. Apps `0095`,
+`0096`, and `0097` impose a single control-first lock order across inventory
+epochs, legacy workspace writes/drain completion, and lifecycle heads. Apps
+`0098`, `0099`, and `0100` add append-only LIST/WATCH terminal evidence,
+including exact equal-timestamp closure and a one-way single-boundary link that
+survives snapshot-item expiry. App `0101` prevents closing an immutable
+canonical rate before the end of any retained ordinary, correction, or
+terminal-conflict publication plan that references it. Runtime capability
+probing requires the final tables, columns, constraints, indexes, triggers,
+audit contract, and seed rows before cutover, publication, or source-aware reads
+can become available.
 
 1. **Expand audit first.** Add nullable v2 event fields/checks and create future
    partitions. Existing writers/readers continue to work. A runtime capability
@@ -1819,9 +1848,9 @@ auth matrix, free/unpriced/partial cost tests, and legacy price exclusion pass.
 
 ### Slice 1 — Kubernetes collector and workspace cutover
 
-**Partially implemented (shadow foundation plus unwired publication
-mechanics).** The deployed runtime remains incapable of publishing usage
-events:
+**Implemented behind independent rollout gates.** The default deployment remains
+incapable of publishing usage events because publication and cutover both
+default off:
 
 - A dedicated, database-free Pod collector Deployment and ServiceAccount, with
   namespace-scoped `get/list/watch` Pod RBAC, bounded normalized payloads, and
@@ -1848,19 +1877,70 @@ events:
   items for at least 7 days and WATCH/session plus shadow-comparison diagnostics
   for 35 days; abandoned incomplete staging manifests become cleanup-eligible
   after 24 hours while their metadata remains authoritative.
-- Unwired strict publication primitives split ordinary workspace Pod intervals
-  at UTC day and immutable-rate boundaries, freeze exact rate/unpriced choices
-  and canonical hashes in app-DB plans, bulk insert plus verify the complete
-  audit batch, and generation-fence the app cursor CAS. Missing partitions stay
-  pending, hash conflicts become terminal, and replay after the audit commit is
-  idempotent. The constructor gate defaults off and no lifespan task starts it.
+- Strict publication splits ordinary workspace Pod intervals at UTC day and
+  immutable-rate boundaries, freezes exact rate/unpriced choices and canonical
+  hashes in app-DB plans, bulk inserts plus verifies the complete audit batch,
+  and generation-fences the app cursor CAS. Missing partitions stay pending,
+  hash conflicts become terminal, and replay after the audit commit is
+  idempotent. Durable post-period LIST/WATCH evidence drives late-usage plans;
+  reviewed fleet-admin corrections verify immutable originals and publish
+  append-only signed deltas with idempotent request identity. Corrections mirror
+  the audit shape contract before freezing, preserve original dimensions for
+  negative deltas, prevent cumulative over-reversal, and row-lock both original
+  events and referenced canonical rates across plan insertion.
+- The source-aware summary reader uses one read-only repeatable-read app snapshot
+  to combine sealed/rolled whole days, typed audit boundary fragments, verified
+  published plans, and confirmed provisional interval tails. It shares exact
+  integer-microsecond capacity arithmetic with publication, preserves
+  priced/free/unpriced distinctions, enforces visibility on every source, and
+  refuses to run without an active durable cutover. Immutable rolled-day state
+  is authoritative for rolled spans; mutable epoch health applies only to the
+  live tail, durable gaps remain localized, and freshness freezes coverage at
+  the last complete proof instead of invalidating earlier confirmed time.
+- The day sealer generation-fences the active cutover, required scope
+  epochs, continuity gaps, interval cursors, and unresolved plans before an
+  atomic `open -> sealing -> sealed` transition with a deterministic coverage
+  revision. It verifies tied baseline manifests, every manifest in the known
+  interval, the earliest complete end-boundary manifest, invalid WATCH state
+  carried into the day, and invalid WATCH receipts inside the known interval;
+  missing boundary evidence fails closed. The ordinary planner shares the same
+  day row, preventing new intent from racing behind a committed seal.
+- The fleet-admin cutover endpoint preflights and strictly repairs/verifies every
+  bounded legacy interval before taking one database-clock barrier. It requires
+  fresh healthy scope proof and exact current shadow comparisons, closes legacy
+  opens, clamps racing post-barrier Pod observations, drains the frozen legacy
+  outbox, and activates exactly once. Database triggers make the barrier one-way,
+  reject post-cutover legacy inserts, and serialize control, epoch, interval,
+  and lifecycle-head mutations in a deadlock-free order.
+- The leader-owned bounded runtime resumes a requested cutover, adopts frozen
+  plans before creating new intent, publishes ordinary/late/correction plans,
+  seals eligible days, and leaves typed rollup to cross only a sealed coverage
+  revision. Collection, cutover, publication, and source-aware reads each retain
+  an independent fail-closed flag and schema capability gate.
 
-**Remaining before Slice 1 exit:** prove a healthy shadow observation window
-and resolve every unexplained comparison; complete late/correction publication,
-interval-tail reads, source-aware rollup handoff, legacy integrity repair/drain,
-the crash-resumable cutover barrier, publisher runtime wiring, and removal of the
-legacy blind 24-hour closure. Publication and cutover gates must remain off until
-those checks pass.
+**Local k3d evidence (2026-08-06):** the final Slice 1 image and app head `0101`
+were exercised through all-off, inventory-only, and shadow configurations. The
+live `0101` checksum matched its pinned regression. Inventory-only produced a
+complete sealed 15-item Pod snapshot without interval reconciliation, changed
+neither the comparison count nor any publication state, and reported healthy
+snapshot, continuity, item, and backend state. During the shadow transition,
+generation/mode conflicts while the orchestrator rolled failed closed with HTTP
+409 and recovered through the next complete LIST. That LIST reconciled all 15
+items with zero invalid or pending-valid items and zero resource intervals; all
+15 comparisons were explained `not-applicable / non-workspace-pod`. The active
+WATCH session then committed 46 events with HTTP 200. V2 reads, source-aware
+reads, cutover, and publication stayed disabled throughout; no publication plan
+or typed infrastructure audit event was created. The test release was restored
+to all six gates off, with collector resources absent, zero resource intervals,
+and the durable cutover state still `disabled`.
+
+**Operational activation remains:** deploy the final schema/code with every
+irreversible gate off, observe a healthy shadow window, and resolve every
+unexplained comparison. A fleet administrator may then explicitly prepare the
+one-way cutover, observe strict legacy drain and initial publication, and enable
+source-aware reads only after rollup/sealing reconciliation. These are rollout
+gates, not missing Slice 1 implementation. Publication and cutover remain off
+until that operator evidence and approval exist.
 
 Depends on Slice 0. Exit: fenced shadow coverage, legacy integrity/drain,
 cutover crash matrix, and workspace quantity reconciliation pass.

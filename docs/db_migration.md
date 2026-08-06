@@ -352,6 +352,17 @@ ls "$dir"/*.sql | xargs -n1 basename | awk -F_ '{print $1}' | sort | uniq -d | g
 
 **Insertion policy.** Always append. If you "need" to insert between `0007` and `0008`, write `0042_fix_thing_from_0007.sql` instead. Inserting between applied migrations breaks every downstream environment.
 
+The sole exception is an emergency, checksum-preserving bridge named
+`NNNN[a-z]_description.sql` (for example `0092z_backfill_guard.sql`). Use one
+only when an immutable later migration cannot run safely on a valid earlier
+schema and a normal appended migration cannot execute before the failure. The
+bridge must be idempotent in both positions: it runs before the affected
+migration on environments that have not reached it, but an environment already
+past that point discovers and applies the bridge later. The runner orders the
+full version token lexicographically and CI requires that token to be unique.
+This is an incident-recovery mechanism, not a branching or routine insertion
+scheme; its migration tests must cover both database states.
+
 **Renaming policy.** Never rename a migration after it has been applied to any environment. The runner checksums file content and refuses checksum drift on applied rows. If a name is wrong, write a new migration that supersedes it.
 
 **Reserved numbers.** `0030_capability_grants.sql` is the User-Defined Experts Slice 2 migration (capability grants) — see `docs/done/global_expert_management.md`. The Slice-1 note originally reserved `0029` for grants, but `0029` was later claimed by `0029_add_mistral_provider.sql`, so grants landed at `0030`. Reserved by note rather than a placeholder file on purpose: the runner checksums applied migrations, so a committed-then-edited placeholder would later trip the drift guard.
