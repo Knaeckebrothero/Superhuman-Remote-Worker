@@ -88,6 +88,12 @@ def test_dedicated_metering_collector_renders_only_with_scoped_pod_reads():
         item for item in collector_objects if item["kind"] == "Deployment"
     )
     assert deployment["spec"]["replicas"] == 1
+    assert deployment["spec"]["template"]["spec"]["securityContext"] == {
+        "runAsNonRoot": True,
+        "runAsUser": 999,
+        "runAsGroup": 999,
+        "seccompProfile": {"type": "RuntimeDefault"},
+    }
     assert deployment["metadata"]["annotations"]["reloader.stakater.com/auto"] == (
         "true"
     )
