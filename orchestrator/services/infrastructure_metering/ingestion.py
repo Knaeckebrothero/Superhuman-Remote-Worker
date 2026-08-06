@@ -1,8 +1,8 @@
 """Authenticated orchestration service for dedicated inventory collectors.
 
-This is an app-DB shadow path only.  It owns scope creation, grant issuance,
-strict wire-to-store projection, and Pod interval hooks; it cannot publish audit
-usage events or change the durable cutover state.
+This is an app-DB shadow path only. It owns scope creation, grant issuance,
+strict wire-to-store projection, and typed Pod/PVC/PV lifecycle hooks; it cannot
+publish audit usage events or change a durable publication cutover state.
 """
 
 from __future__ import annotations
@@ -38,6 +38,8 @@ from .ingestion_types import (
     TICKET_BODY_LIMIT,
     WATCH_BODY_LIMIT,
     validate_normalized_pod_payload,
+    validate_normalized_pvc_payload,
+    validate_normalized_pv_payload,
 )
 from .inventory import (
     InventoryConflictError,
@@ -56,6 +58,7 @@ from .inventory import (
     canonical_request_digest,
 )
 from .pod_intervals import PodIntervalReconciler
+from .storage_intervals import StorageIntervalReconciler
 
 
 _SAFE_ERROR_CODE = re.compile(r"^[a-z][a-z0-9-]{0,63}$")
@@ -65,6 +68,10 @@ logger = logging.getLogger(__name__)
 
 _CLEANUP_BATCH_LIMIT = 1_000
 _MAX_CLEANUP_PASSES = 10
+
+_POD_API_RESOURCE = "core/v1/pods"
+_PVC_API_RESOURCE = "core/v1/persistentvolumeclaims"
+_PV_API_RESOURCE = "core/v1/persistentvolumes"
 
 IngestionOperation = Literal[
     "ticket",
@@ -106,6 +113,9 @@ class InfrastructureIngestionService:
         self._pod_reconciler = PodIntervalReconciler(
             shadow_enabled=settings.shadow_enabled
         )
+        self._storage_reconciler = StorageIntervalReconciler(
+            shadow_enabled=(settings.pvc_shadow_enabled or settings.pv_shadow_enabled)
+        )
 
     async def _authenticated(
         self,
@@ -129,12 +139,26 @@ class InfrastructureIngestionService:
     def _scope(
         self, wire: InventoryScopeWire, collector_id: str
     ) -> InventoryScopeIdentity:
-        if (
-            wire.cluster_scoped
-            or wire.source_cluster != self.settings.stable_cluster_id
-            or wire.api_resource != "core/v1/pods"
-            or wire.namespace not in self.settings.namespace_allowlist
-        ):
+        allowed = False
+        if wire.source_cluster == self.settings.stable_cluster_id:
+            if wire.api_resource == _POD_API_RESOURCE:
+                allowed = (
+                    not wire.cluster_scoped
+                    and wire.namespace in self.settings.namespace_allowlist
+                )
+            elif wire.api_resource == _PVC_API_RESOURCE:
+                allowed = (
+                    self.settings.pvc_inventory_enabled
+                    and not wire.cluster_scoped
+                    and wire.namespace in self.settings.namespace_allowlist
+                )
+            elif wire.api_resource == _PV_API_RESOURCE:
+                allowed = (
+                    self.settings.pv_inventory_enabled
+                    and wire.cluster_scoped
+                    and wire.namespace is None
+                )
+        if not allowed:
             raise IngestionRequestError(403, "collector scope is not allowed")
         return InventoryScopeIdentity(
             collector_id=collector_id,
@@ -142,6 +166,15 @@ class InfrastructureIngestionService:
             api_resource=wire.api_resource,
             namespace=wire.namespace,
         )
+
+    def _scope_shadow_enabled(self, scope: InventoryScopeIdentity) -> bool:
+        if scope.api_resource == _POD_API_RESOURCE:
+            return self.settings.shadow_enabled
+        if scope.api_resource == _PVC_API_RESOURCE:
+            return self.settings.pvc_shadow_enabled
+        if scope.api_resource == _PV_API_RESOURCE:
+            return self.settings.pv_shadow_enabled
+        return False
 
     async def _ensure_scope_epoch(
         self, scope: InventoryScopeIdentity
@@ -238,13 +271,23 @@ class InfrastructureIngestionService:
     def _inventory_item(cls, item: InventoryItemWire) -> InventoryItem:
         normalized = item.normalized
         try:
-            validate_normalized_pod_payload(normalized)
+            if item.scope.api_resource == _POD_API_RESOURCE:
+                validate_normalized_pod_payload(normalized)
+                expected_kind = "pod"
+            elif item.scope.api_resource == _PVC_API_RESOURCE:
+                validate_normalized_pvc_payload(normalized)
+                expected_kind = "pvc"
+            elif item.scope.api_resource == _PV_API_RESOURCE:
+                validate_normalized_pv_payload(normalized)
+                expected_kind = "volume"
+            else:
+                raise ValueError("unsupported inventory API resource")
         except ValueError as exc:
             raise IngestionRequestError(
-                400, "normalized Pod payload is invalid"
+                400, "normalized inventory payload is invalid"
             ) from exc
         if (
-            item.kind != "pod"
+            item.kind != expected_kind
             or normalized.get("uid") != item.uid
             or normalized.get("namespace") != item.scope.namespace
             or normalized.get("valid_for_metering") is not item.valid_for_metering
@@ -278,7 +321,7 @@ class InfrastructureIngestionService:
         epoch = await self._ensure_scope_epoch(scope)
         claim = authenticated.transport_claim
         if model.intent == "watch-session":
-            if not self.settings.shadow_enabled:
+            if not self._scope_shadow_enabled(scope):
                 raise IngestionRequestError(403, "watch ingestion is not enabled")
             generation = int(
                 await self._pool.fetchval(
@@ -399,11 +442,12 @@ class InfrastructureIngestionService:
             request_kind="snapshot-finalize",
             maximum_bytes=SNAPSHOT_METADATA_BODY_LIMIT,
         )
-        if model.shadow_enabled != self.settings.shadow_enabled:
+        scope = self._scope(model.scope, authenticated.collector_id)
+        scope_shadow_enabled = self._scope_shadow_enabled(scope)
+        if model.shadow_enabled != scope_shadow_enabled:
             raise IngestionRequestError(
                 409, "collector shadow mode does not match the server"
             )
-        scope = self._scope(model.scope, authenticated.collector_id)
         finalization = SnapshotFinalization(
             collection_completed_at=model.collection_completed_at,
             source_snapshot_at=model.source_snapshot_at,
@@ -418,6 +462,22 @@ class InfrastructureIngestionService:
                 for error in model.fatal_errors
             ),
         )
+        interval_mutator = None
+        observation_hook = None
+        completion_hook = None
+        absence_mutator = None
+        if scope_shadow_enabled:
+            if scope.api_resource == _POD_API_RESOURCE:
+                interval_mutator = self._pod_reconciler.apply_snapshot
+                observation_hook = self._pod_reconciler.observe_snapshot
+            elif scope.api_resource == _PVC_API_RESOURCE:
+                interval_mutator = self._storage_reconciler.apply_snapshot
+                observation_hook = self._storage_reconciler.observe_snapshot
+            elif scope.api_resource == _PV_API_RESOURCE:
+                interval_mutator = self._storage_reconciler.apply_snapshot
+                observation_hook = self._storage_reconciler.observe_snapshot
+                completion_hook = self._storage_reconciler.complete_snapshot
+                absence_mutator = self._storage_reconciler.apply_absence
         result = await self.store.finalize_snapshot(
             model.ticket_token,
             model.ticket_id,
@@ -425,17 +485,12 @@ class InfrastructureIngestionService:
             finalization,
             scope=scope,
             transport=authenticated.transport_claim,
-            interval_mutator=(
-                self._pod_reconciler.apply_snapshot
-                if self.settings.shadow_enabled
-                else None
-            ),
-            observation_hook=(
-                self._pod_reconciler.observe_snapshot
-                if self.settings.shadow_enabled
-                else None
-            ),
-            reconcile_intervals=self.settings.shadow_enabled,
+            interval_mutator=interval_mutator,
+            observation_hook=observation_hook,
+            completion_hook=completion_hook,
+            absence_mutator=absence_mutator,
+            require_shadow_comparison=scope_shadow_enabled,
+            reconcile_intervals=scope_shadow_enabled,
         )
         return {
             "snapshot_id": str(result.snapshot_id),
@@ -456,11 +511,11 @@ class InfrastructureIngestionService:
             request_kind="watch-event",
             maximum_bytes=WATCH_BODY_LIMIT,
         )
-        if not self.settings.shadow_enabled:
-            raise IngestionRequestError(403, "watch ingestion is not enabled")
         await self._require_generation(model.leader_generation)
         observation = model.observation
         scope = self._scope(observation.scope, authenticated.collector_id)
+        if not self._scope_shadow_enabled(scope):
+            raise IngestionRequestError(403, "watch ingestion is not enabled")
         item = (
             None if observation.item is None else self._inventory_item(observation.item)
         )
@@ -497,6 +552,16 @@ class InfrastructureIngestionService:
                 else False
             ),
         )
+        interval_mutator = (
+            self._pod_reconciler.apply_watch
+            if scope.api_resource == _POD_API_RESOURCE
+            else self._storage_reconciler.apply_watch
+        )
+        deletion_mutator = (
+            self._storage_reconciler.apply_deletion
+            if scope.api_resource == _PV_API_RESOURCE
+            else None
+        )
         result = await self.store.apply_watch_event(
             model.ticket_token,
             model.ticket_id,
@@ -506,11 +571,8 @@ class InfrastructureIngestionService:
             event,
             scope=scope,
             transport=authenticated.transport_claim,
-            interval_mutator=(
-                self._pod_reconciler.apply_watch
-                if self.settings.shadow_enabled
-                else None
-            ),
+            interval_mutator=interval_mutator,
+            deletion_mutator=deletion_mutator,
         )
         return {
             "event_id": str(result.event_id),
@@ -527,10 +589,10 @@ class InfrastructureIngestionService:
             request_kind="watch-finish",
             maximum_bytes=WATCH_BODY_LIMIT,
         )
-        if not self.settings.shadow_enabled:
-            raise IngestionRequestError(403, "watch ingestion is not enabled")
         await self._require_generation(model.leader_generation)
         scope = self._scope(model.scope, authenticated.collector_id)
+        if not self._scope_shadow_enabled(scope):
+            raise IngestionRequestError(403, "watch ingestion is not enabled")
         if model.history_lost:
             assert model.history_event_id is not None
             assert model.gap_reason is not None

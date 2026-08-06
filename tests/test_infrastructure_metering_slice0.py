@@ -68,6 +68,80 @@ def test_cutover_wiring_uses_configured_inventory_freshness() -> None:
     assert "seconds=infrastructure_metering_settings.stale_after_seconds" in source
 
 
+def test_storage_publication_resources_require_effective_activation() -> None:
+    import main as orchestrator_main
+    from orchestrator.services.infrastructure_metering.storage_assets import (
+        StorageActivation,
+    )
+
+    settings = InfrastructureMeteringSettings(
+        collector_enabled=True,
+        shadow_enabled=True,
+        publication_enabled=True,
+        pvc_inventory_enabled=True,
+        pv_inventory_enabled=True,
+        pvc_shadow_enabled=True,
+        pv_shadow_enabled=True,
+        pvc_publication_enabled=True,
+        pv_publication_enabled=True,
+        volume_identity_key_version="storage-v1",
+        stable_cluster_id="dev-cluster",
+        namespace_allowlist=("srw",),
+    )
+    capabilities = MagicMock(
+        slice2_claim_inventory_ready=True,
+        slice2_volume_inventory_ready=True,
+        storage_identity_key_version="storage-v1",
+    )
+    boundary = datetime(2026, 8, 7, tzinfo=timezone.utc)
+    before = StorageActivation(
+        measurement_basis="claim-requested",
+        state="active",
+        activated_at=boundary,
+        database_time=boundary - timedelta(microseconds=1),
+    )
+    effective_claim = StorageActivation(
+        measurement_basis="claim-requested",
+        state="active",
+        activated_at=boundary,
+        database_time=boundary,
+    )
+    effective_volume = StorageActivation(
+        measurement_basis="volume-provisioned",
+        state="active",
+        activated_at=boundary,
+        database_time=boundary + timedelta(hours=1),
+    )
+
+    assert orchestrator_main._capability_gated_infrastructure_publication_resources(
+        settings,
+        capabilities,
+        claim_activation=before,
+        volume_activation=None,
+    ) == ("workspace_pod",)
+    enabled = orchestrator_main._capability_gated_infrastructure_publication_resources(
+        settings,
+        capabilities,
+        claim_activation=effective_claim,
+        volume_activation=effective_volume,
+        mapped_volume_resources=("block_volume_longhorn_ephemeral",),
+    )
+    assert enabled == (
+        "workspace_pod",
+        *orchestrator_main._INFRASTRUCTURE_PVC_RESOURCES,
+        *orchestrator_main._INFRASTRUCTURE_PV_RESOURCES,
+        "block_volume_longhorn_ephemeral",
+    )
+    capabilities.storage_identity_key_version = "another-key"
+    assert orchestrator_main._capability_gated_infrastructure_publication_resources(
+        settings,
+        capabilities,
+        claim_activation=effective_claim,
+        volume_activation=effective_volume,
+        mapped_volume_resources=("block_volume_longhorn_ephemeral",),
+    ) == ("workspace_pod", *orchestrator_main._INFRASTRUCTURE_PVC_RESOURCES)
+
+
 def _source_aware_capabilities(*, slice1: bool) -> MeteringSchemaCapabilities:
     return MeteringSchemaCapabilities(
         app_tables=(
@@ -401,6 +475,99 @@ def test_cutover_and_source_aware_read_gates_are_independent_and_fail_closed():
     assert settings.source_aware_reads_enabled is True
     assert settings.cutover_enabled is True
     assert settings.publication_enabled is False
+
+
+def test_slice2_storage_gates_are_independent_and_fail_closed():
+    defaults = InfrastructureMeteringSettings.from_env({})
+    assert defaults.pvc_inventory_enabled is False
+    assert defaults.pv_inventory_enabled is False
+    assert defaults.pvc_shadow_enabled is False
+    assert defaults.pv_shadow_enabled is False
+    assert defaults.pvc_publication_enabled is False
+    assert defaults.pv_publication_enabled is False
+    assert defaults.volume_identity_key_version == ""
+
+    with pytest.raises(ValueError, match="PVC inventory requires its collector"):
+        InfrastructureMeteringSettings.from_env(
+            {"INFRASTRUCTURE_METERING_PVC_INVENTORY_ENABLED": "true"}
+        )
+
+    collector_env = {
+        "INFRASTRUCTURE_METERING_COLLECTOR_ENABLED": "true",
+        "INFRASTRUCTURE_METERING_STABLE_CLUSTER_ID": "dev-cluster",
+        "INFRASTRUCTURE_METERING_NAMESPACE_ALLOWLIST": "srw",
+    }
+    with pytest.raises(ValueError, match="requires a volume identity key version"):
+        InfrastructureMeteringSettings.from_env(
+            {
+                **collector_env,
+                "INFRASTRUCTURE_METERING_PV_INVENTORY_ENABLED": "true",
+            }
+        )
+    with pytest.raises(ValueError, match="volume identity key version must be"):
+        InfrastructureMeteringSettings.from_env(
+            {
+                "INFRASTRUCTURE_METERING_VOLUME_IDENTITY_KEY_VERSION": "bad/key",
+            }
+        )
+    with pytest.raises(ValueError, match="PVC shadow mode requires global shadow"):
+        InfrastructureMeteringSettings.from_env(
+            {
+                **collector_env,
+                "INFRASTRUCTURE_METERING_PVC_INVENTORY_ENABLED": "true",
+                "INFRASTRUCTURE_METERING_PVC_SHADOW_ENABLED": "true",
+            }
+        )
+    with pytest.raises(ValueError, match="PVC publication requires global publication"):
+        InfrastructureMeteringSettings.from_env(
+            {
+                **collector_env,
+                "INFRASTRUCTURE_METERING_SHADOW_ENABLED": "true",
+                "INFRASTRUCTURE_METERING_PVC_INVENTORY_ENABLED": "true",
+                "INFRASTRUCTURE_METERING_PVC_SHADOW_ENABLED": "true",
+                "INFRASTRUCTURE_METERING_PVC_PUBLICATION_ENABLED": "true",
+            }
+        )
+
+    settings = InfrastructureMeteringSettings.from_env(
+        {
+            **collector_env,
+            "INFRASTRUCTURE_METERING_SHADOW_ENABLED": "true",
+            "INFRASTRUCTURE_METERING_PUBLICATION_ENABLED": "true",
+            "INFRASTRUCTURE_METERING_PVC_INVENTORY_ENABLED": "true",
+            "INFRASTRUCTURE_METERING_PV_INVENTORY_ENABLED": "true",
+            "INFRASTRUCTURE_METERING_PVC_SHADOW_ENABLED": "true",
+            "INFRASTRUCTURE_METERING_PV_SHADOW_ENABLED": "true",
+            "INFRASTRUCTURE_METERING_PVC_PUBLICATION_ENABLED": "true",
+            "INFRASTRUCTURE_METERING_PV_PUBLICATION_ENABLED": "true",
+            "INFRASTRUCTURE_METERING_VOLUME_IDENTITY_KEY_VERSION": "storage-v1",
+            "INFRASTRUCTURE_METERING_VOLUME_RESOURCE_MAPPINGS_JSON": (
+                '[{"mappingVersion":"longhorn-v1",'
+                '"storageClass":"longhorn-ephemeral",'
+                '"csiDriver":"driver.longhorn.io",'
+                '"volumeMode":"filesystem",'
+                '"resource":"block_volume_longhorn_ephemeral"}]'
+            ),
+        }
+    )
+    assert settings.pvc_publication_enabled is True
+    assert settings.pv_publication_enabled is True
+    assert settings.volume_identity_key_version == "storage-v1"
+    assert settings.volume_resource_mappings[0].resource == (
+        "block_volume_longhorn_ephemeral"
+    )
+
+    with pytest.raises(ValueError, match="contain exactly"):
+        InfrastructureMeteringSettings.from_env(
+            {
+                **collector_env,
+                "INFRASTRUCTURE_METERING_VOLUME_RESOURCE_MAPPINGS_JSON": (
+                    '[{"mappingVersion":"v1","storageClass":"standard",'
+                    '"csiDriver":"","volumeMode":"filesystem",'
+                    '"resource":"block_volume_local","wildcard":"no"}]'
+                ),
+            }
+        )
 
 
 def test_slice1_collector_settings_are_bounded_and_fail_closed():
@@ -1385,6 +1552,10 @@ def test_infrastructure_admin_routes_are_explicit_and_publicly_documented():
         "/api/admin/usage/v2/infrastructure-cutover/prepare": {"POST"},
         "/api/admin/usage/v2/coverage-gaps/{gap_id}/waive": {"POST"},
         "/api/admin/usage/v2/infrastructure-corrections": {"POST"},
+        "/api/admin/usage/v2/storage-activation": {"GET"},
+        "/api/admin/usage/v2/storage-activation/{measurement_basis}/shadow": {"POST"},
+        "/api/admin/usage/v2/storage-activation/{measurement_basis}/schedule": {"POST"},
+        "/api/admin/usage/v2/storage-assets/{asset_id}/destroy": {"POST"},
     }
     routes = {
         route.path: route.methods
@@ -1392,3 +1563,307 @@ def test_infrastructure_admin_routes_are_explicit_and_publicly_documented():
         if getattr(route, "path", "") in expected
     }
     assert routes == expected
+
+
+@pytest.mark.asyncio
+async def test_storage_activation_routes_are_explicit_and_audited(monkeypatch):
+    import main as orchestrator_main
+    from orchestrator.services.infrastructure_metering.storage_assets import (
+        StorageActivation,
+    )
+
+    actor_id = uuid4()
+    request = MagicMock()
+    request.url.path = "/api/admin/usage/v2/storage-activation/claim-requested/shadow"
+    monkeypatch.setattr(
+        orchestrator_main,
+        "_require_infrastructure_fleet_admin",
+        AsyncMock(return_value={"id": str(actor_id), "is_admin": True}),
+    )
+    monkeypatch.setattr(
+        orchestrator_main,
+        "infrastructure_metering_settings",
+        InfrastructureMeteringSettings(
+            collector_enabled=True,
+            pvc_inventory_enabled=True,
+            stable_cluster_id="dev-cluster",
+            namespace_allowlist=("srw",),
+        ),
+    )
+    now = datetime(2026, 8, 6, 12, tzinfo=timezone.utc)
+    store = MagicMock()
+    store.enter_shadow = AsyncMock(
+        return_value=StorageActivation(
+            measurement_basis="claim-requested",
+            state="shadow",
+            activated_at=None,
+            database_time=now,
+        )
+    )
+    monkeypatch.setattr(orchestrator_main, "infrastructure_storage_assets", store)
+    audit = AsyncMock()
+    monkeypatch.setattr(orchestrator_main, "log_security_event", audit)
+
+    result = await orchestrator_main.enter_infrastructure_storage_shadow(
+        request,
+        "claim-requested",
+        orchestrator_main.InfrastructureStorageActivationRequest(
+            reason="inventory soak is healthy"
+        ),
+    )
+
+    store.enter_shadow.assert_awaited_once_with("claim-requested")
+    assert result["state"] == "shadow"
+    assert result["effective"] is False
+    assert audit.await_args.kwargs["event_type"] == (
+        "infrastructure_storage_shadow_entered"
+    )
+
+
+@pytest.mark.asyncio
+async def test_storage_activation_schedule_is_generation_fenced(monkeypatch):
+    import main as orchestrator_main
+    from orchestrator.services.infrastructure_metering.storage_assets import (
+        StorageActivation,
+    )
+
+    actor_id = uuid4()
+    request = MagicMock()
+    request.url.path = "/api/admin/usage/v2/storage-activation/claim-requested/schedule"
+    monkeypatch.setattr(
+        orchestrator_main,
+        "_require_infrastructure_fleet_admin",
+        AsyncMock(return_value={"id": str(actor_id), "is_admin": True}),
+    )
+    monkeypatch.setattr(
+        orchestrator_main,
+        "_infrastructure_leader_generation",
+        MagicMock(return_value=9),
+    )
+    monkeypatch.setattr(
+        orchestrator_main,
+        "infrastructure_metering_settings",
+        InfrastructureMeteringSettings(
+            collector_enabled=True,
+            shadow_enabled=True,
+            pvc_inventory_enabled=True,
+            pvc_shadow_enabled=True,
+            stable_cluster_id="dev-cluster",
+            namespace_allowlist=("srw",),
+        ),
+    )
+    boundary = datetime(2026, 8, 7, tzinfo=timezone.utc)
+    store = MagicMock()
+    store.schedule_activation = AsyncMock(
+        return_value=StorageActivation(
+            measurement_basis="claim-requested",
+            state="active",
+            activated_at=boundary,
+            database_time=boundary - timedelta(hours=1),
+        )
+    )
+    monkeypatch.setattr(orchestrator_main, "infrastructure_storage_assets", store)
+    monkeypatch.setattr(orchestrator_main, "log_security_event", AsyncMock())
+
+    await orchestrator_main.schedule_infrastructure_storage_activation(
+        request,
+        "claim-requested",
+        orchestrator_main.InfrastructureStorageActivationScheduleRequest(
+            reason="shadow proof reviewed",
+            activated_at=boundary,
+        ),
+    )
+
+    store.schedule_activation.assert_awaited_once_with(
+        measurement_basis="claim-requested",
+        activated_at=boundary,
+        source_cluster="dev-cluster",
+        namespaces=("srw",),
+        max_scope_age=timedelta(seconds=900),
+        expected_generation=9,
+        identity_key_version=None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_storage_destruction_assertion_is_idempotent_and_audited(monkeypatch):
+    import main as orchestrator_main
+    from orchestrator.services.infrastructure_metering.storage_assets import (
+        BackendDestructionResult,
+    )
+
+    actor_id, asset_id, request_id, assertion_id = (
+        uuid4(),
+        uuid4(),
+        uuid4(),
+        uuid4(),
+    )
+    effective_at = datetime(2026, 8, 6, 12, tzinfo=timezone.utc)
+    request = MagicMock()
+    request.url.path = f"/api/admin/usage/v2/storage-assets/{asset_id}/destroy"
+    monkeypatch.setattr(
+        orchestrator_main,
+        "_require_infrastructure_fleet_admin",
+        AsyncMock(return_value={"id": str(actor_id), "is_admin": True}),
+    )
+    store = MagicMock()
+    store.assert_destroyed = AsyncMock(
+        return_value=BackendDestructionResult(
+            assertion_id=assertion_id,
+            idempotency_key=request_id,
+            asset_id=asset_id,
+            effective_at=effective_at,
+            request_hash="b" * 64,
+            replayed=True,
+        )
+    )
+    monkeypatch.setattr(orchestrator_main, "infrastructure_storage_assets", store)
+    audit = AsyncMock()
+    monkeypatch.setattr(orchestrator_main, "log_security_event", audit)
+
+    body = orchestrator_main.InfrastructureStorageDestructionRequest(
+        idempotency_key=request_id,
+        effective_at=effective_at,
+        evidence_kind="operator-attested",
+        evidence_digest="a" * 64,
+        reason_code="provider-console-review",
+        reason="reviewed by the fleet operator",
+    )
+    result = await orchestrator_main.assert_infrastructure_storage_asset_destroyed(
+        request,
+        asset_id,
+        body,
+    )
+
+    store.assert_destroyed.assert_awaited_once_with(
+        idempotency_key=request_id,
+        asset_id=asset_id,
+        effective_at=effective_at,
+        evidence_kind="operator-attested",
+        evidence_digest="a" * 64,
+        actor_kind="user",
+        actor_id=actor_id,
+        reason_code="provider-console-review",
+    )
+    assert result["replayed"] is True
+    assert audit.await_args.kwargs["event_type"] == (
+        "infrastructure_storage_destruction_replayed"
+    )
+
+
+@pytest.mark.asyncio
+async def test_storage_asset_operator_list_and_detail_are_safe_and_bounded(
+    monkeypatch,
+):
+    import main as orchestrator_main
+    from orchestrator.services.infrastructure_metering.storage_assets import (
+        BackendUnverifiedAssetPage,
+        BackendUnverifiedAssetRecord,
+        StorageAssetDetailRecord,
+        StorageAssetGapDetail,
+        StorageAssetIncarnationDetail,
+    )
+
+    asset_id, gap_id, epoch_id = uuid4(), uuid4(), uuid4()
+    now = datetime(2026, 8, 6, 12, tzinfo=timezone.utc)
+    request = MagicMock()
+    request.url.path = "/api/admin/usage/v2/storage-assets/backend-unverified"
+    require_admin = AsyncMock(return_value={"id": str(uuid4()), "is_admin": True})
+    monkeypatch.setattr(
+        orchestrator_main,
+        "_require_infrastructure_fleet_admin",
+        require_admin,
+    )
+    record = BackendUnverifiedAssetRecord(
+        asset_id=asset_id,
+        source_cluster="dev-cluster",
+        identity_scheme="csi-hmac-sha256-v1",
+        identity_key_version="storage-v1",
+        csi_driver="driver.example.test",
+        first_observed_at=now - timedelta(hours=1),
+        last_observed_at=now - timedelta(minutes=5),
+        backend_unverified_at=now,
+        gap_id=gap_id,
+        gap_start=now,
+        reason_code="retain-pv-absent",
+        storage_class_name="standard",
+        reclaim_policy="retain",
+        backend_deletion_finalizer_observed=True,
+        volume_mode="filesystem",
+        capacity_bytes=4 * 1024**3,
+        detached_at=now,
+        detach_reason="pv-deleted",
+    )
+    detail = StorageAssetDetailRecord(
+        asset_id=asset_id,
+        source_cluster="dev-cluster",
+        identity_scheme="csi-hmac-sha256-v1",
+        identity_key_version="storage-v1",
+        csi_driver="driver.example.test",
+        lifecycle_state="backend-unverified",
+        first_observed_at=now - timedelta(hours=1),
+        last_observed_at=now - timedelta(minutes=5),
+        backend_unverified_at=now,
+        destroyed_at=None,
+        incarnations=(
+            StorageAssetIncarnationDetail(
+                storage_class_name="standard",
+                reclaim_policy="retain",
+                backend_deletion_finalizer_observed=True,
+                volume_mode="filesystem",
+                capacity_bytes=4 * 1024**3,
+                first_observed_at=now - timedelta(hours=1),
+                last_observed_at=now - timedelta(minutes=5),
+                detached_at=now,
+                detach_reason="pv-deleted",
+            ),
+        ),
+        gaps=(
+            StorageAssetGapDetail(
+                gap_id=gap_id,
+                scope_epoch_id=epoch_id,
+                gap_start=now,
+                gap_end=None,
+                reason_code="retain-pv-absent",
+                resolution="unresolved",
+                resolution_assertion_id=None,
+                resolved_at=None,
+            ),
+        ),
+        assertions=(),
+        history_truncated=False,
+    )
+    store = MagicMock()
+    store.list_backend_unverified = AsyncMock(
+        return_value=BackendUnverifiedAssetPage(items=(record,), next_cursor=asset_id)
+    )
+    store.read_asset_detail = AsyncMock(return_value=detail)
+    monkeypatch.setattr(orchestrator_main, "infrastructure_storage_assets", store)
+
+    listed = (
+        await orchestrator_main.list_infrastructure_backend_unverified_storage_assets(
+            request,
+            limit=25,
+            cursor=None,
+        )
+    )
+    rendered = await orchestrator_main.get_infrastructure_storage_asset_detail(
+        request,
+        asset_id,
+        history_limit=25,
+    )
+
+    store.list_backend_unverified.assert_awaited_once_with(
+        limit=25,
+        after_asset_id=None,
+    )
+    store.read_asset_detail.assert_awaited_once_with(
+        asset_id=asset_id,
+        history_limit=25,
+    )
+    assert listed["items"][0]["asset_id"] == asset_id
+    assert rendered["gaps"][0]["gap_id"] == gap_id
+    serialized = repr((listed, rendered)).lower()
+    assert "volume_handle" not in serialized
+    assert "volume_attributes" not in serialized
+    assert require_admin.await_count == 2

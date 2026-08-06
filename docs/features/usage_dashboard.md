@@ -37,14 +37,23 @@ everything uncertain is a named fast-follow, decided **after** seeing the page
 rendered (the user's explicit preference: build a concrete v1, react to how it
 feels, iterate — don't over-spec the panel set upfront).
 
-**Successor correction (2026-08-05):** v1's combined "Compute-hours" headline
-adds vCPU-hours and memory GiB-hours and is retained only as a compatibility
-surface. [[infrastructure_resource_metering]] replaces it with dimensionally
-separate CPU, compute-memory, claim, and provisioned-volume cards in `/api/usage/v2`.
+**Successor implementation state (2026-08-06):** the Cockpit client and
+`/api/usage/v2` now implement dimensionally separate CPU, compute-memory,
+logical-claim, and physical-volume cards with decimal-safe quantities, finality,
+coverage, and priced/free/unpriced distinctions. The UI probes this contract but
+continues to serve the v1 compatibility data while the v2-read gate is off.
+Infrastructure-metering Slice 1 is code-complete, but durable cutover,
+publication, and source-aware reads remain disabled. Slice 2 PVC/PV quantity and
+lifecycle code is now implementation-complete through app migration `0102`, and
+its live k3d inventory/shadow exercise passed without creating intervals,
+publication plans, or audit events. All six storage gates remain off in main
+dev. Claim/volume cards therefore stay empty on the serving path until
+inventory, shadow validation, activation, publication, and v2 reads are
+deliberately enabled.
 
 **Driver:** Two things converged. (1) The Slice-4 page shows only a
 category×unit rollup, while the ledger records per-row `user_id`, `project_id`,
-`resource` (model), `ref_id` (job/thread, compute only), `ts`, and token /
+`resource` (model), `ref_id` (job/thread), `ts`, and token /
 compute quantities — so "who is driving consumption, on which models, over
 time" is *already in the data* but unsurfaced. (2) Two HTML mockups were drawn
 (`SRW-Command-Deck.html` = a live **Fleet monitor**; `SRW-Usage-Cost-Ledger.html`
@@ -61,13 +70,15 @@ Grafana-style auto-refresh toggle.
 1. **By-provider** breakdown — the one dimension needing new capture (stamp
    provider onto LLM rows via a model→catalog lookup + a one-time backfill).
 2. **Export CSV** of the current view.
-3. **Per-job LLM attribution** (the gateway never sees `job_id` today) → a true
-   per-job cost line. Tracked in [[usage_monitoring_and_rate_limiting]].
+3. **Per-job LLM cost line in the job-detail UI.** Backend attribution now
+   records job/thread `ref_kind` + `ref_id`; the dedicated job-detail surface is
+   still deferred.
 4. **Edit canonical rates admin UI** remains deferred. A related planning slice,
    **cloud-equivalent provider rate cards**, shipped 2026-08-05; it intentionally
    reprices quantities separately instead of turning estimates into ledger cost.
-5. **Live RPM/TPM** "right now" panels — sourced from **LiteLLM's own metrics**,
-   not the ledger (a separate data source).
+5. **Live RPM/TPM** "right now" panels — requires a separate live telemetry
+   source; the durable ledger is intentionally not an instantaneous metrics
+   stream.
 6. Trend **sparkline** polish to match the mockups as drawn.
 
 ## What we already record (the queryable substrate)
@@ -79,22 +90,22 @@ new capture. Confirmed against the schema + both emitters:
 | Dimension | Recorded? | Notes |
 |---|---|---|
 | **When** (`ts`) | ✅ | request start (LLM) / interval end (compute) |
-| **User** (`user_id`) | ✅ | LLM via scoped key; compute via owner attribution. Fleet-key-fallback LLM traffic is unattributed (null) |
-| **Project** (`project_id`) | ✅ | same caveat |
+| **User** (`user_id`) | ✅ | LLM job/thread ownership is resolved from the audit row; compute uses validated owner attribution. Deleted owners may remain unattributed. |
+| **Project** (`project_id`) | ✅ | Same ownership-resolution caveat. |
 | **Model** (`resource`) | ✅ (LLM) | model group/name; tokens split `prompt-token` / `completion-token` |
 | **Compute** (`resource='workspace_pod'`) | ✅ | `vcpu-hour` + `gib-hour` = requested CPU/RAM × wall-clock; `details` has `cpu_millicores`, `mem_bytes`, `started_at`, `ended_at`, `tier`, `duration_h` |
-| **Job/thread** (`ref_id`) | compute ✅ / **LLM ❌** | gateway never sees `job_id` (fast-follow 3) |
+| **Job/thread** (`ref_id`) | compute ✅ / LLM ✅ | `audit_usage.py` preserves worker job IDs and persistent-session thread IDs. |
 | **Provider** | ❌ | only the model name is stored — derivable via a catalog join, not a column (fast-follow 1) |
 | **Cost** (`cost_usd`) | LLM ✅ / compute ❌ | **Updated 2026-08-05:** LLM cost is **real** — priced from `usage_rates`, whose LLM rates are auto-seeded from OpenRouter (`openrouter_pricing`). Canonical compute stays unpriced. `GET /api/usage.cloud_estimates` separately applies effective-dated STACKIT/AWS/Azure list-price cards to compute quantities for planning ([[cloud_equivalent_usage_pricing]]); it is not written to `cost_usd`. |
 
-**Out of scope of the ledger entirely (do not promise):** GPU/VRAM (compute
-meter is CPU+RAM only), **actual** vs **requested** utilization (no sampling),
-agent-pod compute, VM-tier compute (container/sandbox tier only), and embeddings /
-whisper / TTS (non-chat traffic). **Updated 2026-06-29 — the coverage gap narrowed:**
-**codex + system-provider (minimax/openrouter) models now route through the gateway
-and meter** ([[route_all_models_through_litellm_gateway]] P1–P2, live on dev);
-**gemini still bypasses** (not yet canaried). So "any model not routed through the
-gateway" is now a shrinking set, not the whole paid lane.
+**Out of scope of the active ledger (do not promise):** GPU/VRAM, sampled actual
+utilization, agent/VM compute, PVC/PV storage, shared-platform overhead, and any
+provider call that never reaches the `llm_requests` audit trail. The implemented
+infrastructure successor still measures allocated/requested quantities, not
+utilization. PVC logical demand and PV physical assets are implemented but dark;
+agent/VM and shared-platform classes remain unimplemented as described in
+[[infrastructure_resource_metering]]. Unmapped physical volumes are explicitly
+unpriced rather than displayed as free.
 
 ## Locked decisions
 
@@ -215,10 +226,13 @@ data itself is already in the agent registry.
 
 - **[[usage_monitoring_and_rate_limiting]]** — the parent. Slice 4 built the
   ledger + the minimal page; this is the visualization layer over it. The
-  fast-follows here (provider stamp, per-job LLM attribution, edit-rates/real $)
+  fast-follows here (provider stamp, per-job detail UI, edit-rates/real $)
   are the same deferred items that doc's "Next" / "Deferred" sections name —
   this doc is where they get a UI home.
 - **[[observability_and_quotas]]** — owns the `usage_events` schema this reads.
+- **[[infrastructure_resource_metering]]** — owns the typed v2 successor,
+  Kubernetes lifecycle metering, storage/VM roadmap, and the gates that keep
+  it from replacing the v1 read path before reconciliation and cutover.
 - **[[saas_billing_and_metering]]** — the eventual dollar-billing consumer; this
   page stays quantity-first and does not pre-empt it.
 
@@ -227,11 +241,12 @@ data itself is already in the agent registry.
 - `SRW-Command-Deck.html` / `SRW-Usage-Cost-Ledger.html` (repo root) — the source
   mockups this fuses.
 - `orchestrator/services/usage_ledger.py` — `query_usage` (the read to extend).
-- `orchestrator/services/litellm_gateway.py` `materialize_llm_usage` /
-  `orchestrator/services/workspace_metering.py` — the emitters that define the
-  queryable dimensions.
+- `orchestrator/services/audit_usage.py` — LLM audit-trail materialization and
+  job/thread owner attribution.
+- `orchestrator/services/workspace_metering.py` — the active compatibility
+  workspace emitter.
+- `orchestrator/services/infrastructure_metering/` — the gated typed successor
+  implemented through workspace-Pod Slice 1.
 - `cockpit/src/app/views/admin/usage/admin-usage.component.ts` — the page to grow.
 - `cockpit/src/app/debug/components/timeline/timeline.component.ts` — the
   `autoRefreshEnabled()` toggle pattern to reuse.
-</content>
-</invoke>

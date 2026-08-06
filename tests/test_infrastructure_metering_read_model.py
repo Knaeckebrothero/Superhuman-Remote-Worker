@@ -175,6 +175,7 @@ def _epoch(
         "item_health": "healthy",
         "backend_health": "healthy",
         "publication_health": "healthy",
+        "api_resource": "core/v1/pods",
     }
     row.update(overrides)
     return row
@@ -271,6 +272,7 @@ class _AppConnection:
                 "infra-read:rates",
                 "infra-read:epochs",
                 "infra-read:gaps",
+                "infra-read:storage-gaps",
                 "infra-read:day-states",
             )
         ):
@@ -403,6 +405,71 @@ async def test_epoch_queries_begin_after_the_immutable_rollup_boundary():
         call for call in app.connection.calls if "infra-read:epochs" in call[1]
     )
     assert params == (rolled_cutoff, to_ts)
+
+
+@pytest.mark.asyncio
+async def test_storage_reads_include_asset_gaps_only_for_enabled_pv_resources():
+    control = {
+        "cutover_state": "active",
+        "cutover_at": START,
+        "last_closed_day": None,
+    }
+    app = _AppPool(control)
+    app.connection.fetch = AsyncMock(
+        side_effect=app.connection.fetch,
+    )
+    model = SourceAwareUsageReadModel(
+        _AuditPool(),
+        app,
+        enabled_resources=("workspace_pod", "block_volume_local_path"),
+    )
+
+    # Make the epoch query return one PV epoch so the gap query is exercised.
+    original_fetch = app.connection.fetch.side_effect
+
+    async def fetch(sql: str, *params: Any):
+        if "infra-read:epochs" in sql:
+            app.connection._record("fetch", sql, params)
+            return [_epoch(api_resource="core/v1/persistentvolumes")]
+        return await original_fetch(sql, *params)
+
+    app.connection.fetch.side_effect = fetch
+    await model.read_app_snapshot(
+        from_ts=START,
+        to_ts=END,
+        visibility=UsageVisibility(),
+    )
+
+    gap_sql = next(
+        sql
+        for _operation, sql, _params in app.connection.calls
+        if "infra-read:storage-gaps" in sql
+    )
+    assert "storage_asset_coverage_gaps" in gap_sql
+
+
+@pytest.mark.asyncio
+async def test_required_storage_scope_fails_closed_until_resource_is_enabled():
+    snapshot = _snapshot(
+        epochs=(_epoch(api_resource="core/v1/persistentvolumeclaims"),),
+    )
+    audit = _AuditPool()
+    model = SourceAwareUsageReadModel(audit, _AppPool(None))
+    model.read_app_snapshot = AsyncMock(return_value=snapshot)  # type: ignore[method-assign]
+
+    result = await model.summary(
+        from_ts=START,
+        to_ts=END,
+        visibility=UsageVisibility(),
+        as_of=END,
+    )
+
+    assert result.coverage.status == "partial"
+    assert result.coverage.required_sources_ok == 0
+    assert result.coverage.required_sources_total == 1
+    assert [item.model_dump() for item in result.coverage.unknown_ranges] == [
+        {"start": START, "end": END}
+    ]
 
 
 @pytest.mark.asyncio

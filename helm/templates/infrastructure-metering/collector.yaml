@@ -1,6 +1,9 @@
 {{- if and .Values.infrastructureMetering.collectorEnabled (eq (.Values.infrastructureMetering.deploymentMode | default "dedicated") "dedicated") }}
 {{- $fullName := include "srw.fullname" . -}}
 {{- $collectorName := printf "%s-infra-collector" $fullName -}}
+{{- $pvReaderName := printf "%s-pv-reader" $collectorName | trunc 63 | trimSuffix "-" -}}
+{{- $defaultIngestionSecretName := printf "%s-infra-ingestion" $fullName | trunc 63 | trimSuffix "-" -}}
+{{- $defaultVolumeIdentitySecretName := printf "%s-infra-volume-identity" $fullName | trunc 63 | trimSuffix "-" -}}
 {{- $namespaces := concat (list .Release.Namespace) (.Values.infrastructureMetering.namespaceAllowlist | default list) | uniq -}}
 {{- if and .Values.infrastructureMetering.networkPolicy.enabled (not .Values.infrastructureMetering.networkPolicy.apiServerCidrs) }}
 {{- fail "infrastructureMetering.networkPolicy.enabled requires apiServerCidrs" }}
@@ -26,6 +29,11 @@ rules:
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["get", "list", "watch"]
+  {{- if $.Values.infrastructureMetering.pvcInventoryEnabled }}
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get", "list", "watch"]
+  {{- end }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -42,6 +50,34 @@ subjects:
   - kind: ServiceAccount
     name: {{ $collectorName }}
     namespace: {{ $.Release.Namespace }}
+{{- end }}
+{{- if .Values.infrastructureMetering.pvInventoryEnabled }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ $pvReaderName }}
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "infra-collector") | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["persistentvolumes"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ $pvReaderName }}
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "infra-collector") | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ $pvReaderName }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $collectorName }}
+    namespace: {{ .Release.Namespace }}
 {{- end }}
 ---
 apiVersion: apps/v1
@@ -94,6 +130,31 @@ spec:
               value: "dedicated"
             - name: INFRASTRUCTURE_METERING_SHADOW_ENABLED
               value: {{ .Values.infrastructureMetering.shadowEnabled | quote }}
+            - name: INFRASTRUCTURE_METERING_PVC_INVENTORY_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: INFRASTRUCTURE_METERING_PVC_INVENTORY_ENABLED
+            - name: INFRASTRUCTURE_METERING_PV_INVENTORY_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: INFRASTRUCTURE_METERING_PV_INVENTORY_ENABLED
+            - name: INFRASTRUCTURE_METERING_PVC_SHADOW_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: INFRASTRUCTURE_METERING_PVC_SHADOW_ENABLED
+            - name: INFRASTRUCTURE_METERING_PV_SHADOW_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: INFRASTRUCTURE_METERING_PV_SHADOW_ENABLED
+            - name: INFRASTRUCTURE_METERING_VOLUME_IDENTITY_KEY_VERSION
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: INFRASTRUCTURE_METERING_VOLUME_IDENTITY_KEY_VERSION
             - name: INFRASTRUCTURE_METERING_COLLECTOR_ID
               value: kubernetes-pods
             - name: INFRASTRUCTURE_METERING_ORCHESTRATOR_URL
@@ -101,8 +162,15 @@ spec:
             - name: INFRASTRUCTURE_METERING_INGESTION_KEY
               valueFrom:
                 secretKeyRef:
-                  name: {{ .Values.infrastructureMetering.ingestionSecretName | default (include "srw.secretName" .) }}
+                  name: {{ .Values.infrastructureMetering.ingestionSecretName | default $defaultIngestionSecretName }}
                   key: {{ .Values.infrastructureMetering.ingestionSecretKey | default "INFRASTRUCTURE_METERING_INGESTION_KEY" }}
+            {{- if .Values.infrastructureMetering.pvInventoryEnabled }}
+            - name: INFRASTRUCTURE_METERING_VOLUME_IDENTITY_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.infrastructureMetering.volumeIdentitySecretName | default $defaultVolumeIdentitySecretName }}
+                  key: {{ .Values.infrastructureMetering.volumeIdentitySecretKey | default "INFRASTRUCTURE_METERING_VOLUME_IDENTITY_KEY" }}
+            {{- end }}
             - name: INFRASTRUCTURE_METERING_STABLE_CLUSTER_ID
               valueFrom:
                 configMapKeyRef:

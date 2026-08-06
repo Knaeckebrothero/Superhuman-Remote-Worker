@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock
 from uuid import uuid4
 
 import pytest
+from pydantic import ValidationError
 
 from orchestrator.services.infrastructure_metering.config import (
     InfrastructureMeteringSettings,
@@ -32,6 +33,10 @@ from orchestrator.services.infrastructure_metering.collectors.contracts import (
 )
 from orchestrator.services.infrastructure_metering.collectors.pod_normalization import (
     normalize_pod,
+)
+from orchestrator.services.infrastructure_metering.collectors.storage_normalization import (
+    normalize_pv,
+    normalize_pvc,
 )
 from orchestrator.services.infrastructure_metering.inventory import (
     InventoryFenceError,
@@ -150,6 +155,115 @@ def test_server_binds_normalized_pod_identity_validity_and_revision():
         InfrastructureIngestionService._inventory_item(wire)
 
 
+def _storage_wire(normalized, *, api_resource: str, cluster_scoped: bool):
+    return {
+        "scope": {
+            "source_cluster": "dev-cluster",
+            "api_resource": api_resource,
+            "namespace": None if cluster_scoped else "srw",
+            "cluster_scoped": cluster_scoped,
+        },
+        "snapshot_id": uuid4(),
+        "kind": normalized.kind,
+        "uid": normalized.uid,
+        "revision_hash": normalized.revision_hash,
+        "valid_for_metering": normalized.valid_for_metering,
+        "normalized": normalized_payload(normalized),
+    }
+
+
+def test_server_accepts_strict_pvc_and_raw_free_pv_projections():
+    pvc = normalize_pvc(
+        {
+            "apiVersion": "v1",
+            "kind": "PersistentVolumeClaim",
+            "metadata": {
+                "uid": "claim-uid",
+                "name": "pvc-workspace-11111111-222",
+                "namespace": "srw",
+                "resourceVersion": "4",
+                "labels": {"app": "srw-workspace"},
+            },
+            "spec": {
+                "resources": {"requests": {"storage": "20Gi"}},
+                "accessModes": ["ReadWriteOnce"],
+            },
+        }
+    )
+    pvc_wire = InventoryItemWire.model_validate(
+        _storage_wire(
+            pvc,
+            api_resource="core/v1/persistentvolumeclaims",
+            cluster_scoped=False,
+        )
+    )
+    assert InfrastructureIngestionService._inventory_item(pvc_wire).source_kind == "pvc"
+
+    pv = normalize_pv(
+        {
+            "apiVersion": "v1",
+            "kind": "PersistentVolume",
+            "metadata": {
+                "uid": "pv-uid",
+                "name": "pv-name",
+                "resourceVersion": "5",
+            },
+            "spec": {
+                "capacity": {"storage": "25Gi"},
+                "persistentVolumeReclaimPolicy": "Retain",
+                "csi": {
+                    "driver": "driver.example.test",
+                    "volumeHandle": "provider-secret-handle",
+                    "volumeAttributes": {"private": "must-not-persist"},
+                },
+            },
+        },
+        source_cluster="dev-cluster",
+        identity_key=b"k" * 32,
+        identity_key_version="key-v1",
+    )
+    payload = _storage_wire(
+        pv,
+        api_resource="core/v1/persistentvolumes",
+        cluster_scoped=True,
+    )
+    encoded = json.dumps(payload, default=str)
+    assert "provider-secret-handle" not in encoded
+    assert "must-not-persist" not in encoded
+    pv_wire = InventoryItemWire.model_validate(payload)
+    projected = InfrastructureIngestionService._inventory_item(pv_wire)
+    assert projected.source_kind == "volume"
+    assert projected.source_uid == pv.uid
+
+    payload["normalized"]["volume_identity"]["volumeHandle"] = "leak"
+    with pytest.raises(ValidationError, match="forbidden"):
+        InventoryItemWire.model_validate(payload)
+
+
+def test_server_rejects_storage_resource_kind_and_scope_confusion():
+    pvc = normalize_pvc(
+        {
+            "kind": "PersistentVolumeClaim",
+            "metadata": {
+                "uid": "claim-uid",
+                "name": "claim",
+                "namespace": "srw",
+            },
+            "spec": {"resources": {"requests": {"storage": "1Gi"}}},
+        }
+    )
+    payload = _storage_wire(
+        pvc,
+        api_resource="core/v1/persistentvolumes",
+        cluster_scoped=True,
+    )
+    payload["scope"]["namespace"] = None
+    payload["kind"] = "pvc"
+    wire = InventoryItemWire.model_validate(payload)
+    with pytest.raises(IngestionRequestError, match="payload is invalid"):
+        InfrastructureIngestionService._inventory_item(wire)
+
+
 @pytest.mark.asyncio
 async def test_snapshot_finalize_rejects_mixed_shadow_rollout_before_mutation():
     service = object.__new__(InfrastructureIngestionService)
@@ -165,6 +279,183 @@ async def test_snapshot_finalize_rejects_mixed_shadow_rollout_before_mutation():
         await service.snapshot_finalize(SimpleNamespace())  # type: ignore[arg-type]
 
     assert raised.value.status_code == 409
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("api_resource", "namespace", "cluster_scoped", "physical_volume"),
+    (
+        ("core/v1/persistentvolumeclaims", "srw", False, False),
+        ("core/v1/persistentvolumes", None, True, True),
+    ),
+)
+async def test_storage_snapshot_finalize_wires_exact_lifecycle_hooks(
+    api_resource: str,
+    namespace: str | None,
+    cluster_scoped: bool,
+    physical_volume: bool,
+):
+    model = InventorySnapshotFinalize.model_validate(
+        {
+            "ticket_id": uuid4(),
+            "ticket_token": "t" * 32,
+            "snapshot_id": uuid4(),
+            "scope": {
+                "source_cluster": "dev-cluster",
+                "api_resource": api_resource,
+                "namespace": namespace,
+                "cluster_scoped": cluster_scoped,
+            },
+            "shadow_enabled": True,
+            "collection_completed_at": datetime(2026, 8, 5, 12, tzinfo=timezone.utc),
+            "complete": True,
+            "resource_version": "17",
+            "item_count": 0,
+            "item_digest": (
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            ),
+            "fatal_errors": [],
+        }
+    )
+    settings = InfrastructureMeteringSettings(
+        collector_enabled=True,
+        shadow_enabled=True,
+        pvc_inventory_enabled=True,
+        pv_inventory_enabled=True,
+        pvc_shadow_enabled=True,
+        pv_shadow_enabled=True,
+        volume_identity_key_version="storage-v1",
+        stable_cluster_id="dev-cluster",
+        namespace_allowlist=("srw",),
+    )
+    store = SimpleNamespace(
+        finalize_snapshot=AsyncMock(
+            return_value=SimpleNamespace(
+                snapshot_id=model.snapshot_id,
+                complete=True,
+                present_items=0,
+                invalid_items=0,
+                confirmed_intervals=0,
+                closed_intervals=0,
+                pending_valid_items=0,
+                shadow_comparisons=0,
+                replayed=False,
+            )
+        )
+    )
+    storage = SimpleNamespace(
+        apply_snapshot=AsyncMock(),
+        observe_snapshot=AsyncMock(),
+        complete_snapshot=AsyncMock(),
+        apply_absence=AsyncMock(),
+    )
+    service = object.__new__(InfrastructureIngestionService)
+    service.settings = settings
+    service.store = store
+    service._storage_reconciler = storage
+    service._pod_reconciler = SimpleNamespace()
+    service._authenticated = AsyncMock(  # type: ignore[method-assign]
+        return_value=(
+            model,
+            SimpleNamespace(
+                collector_id="kubernetes-pods",
+                transport_claim=TransportNonceClaim(
+                    collector_id="kubernetes-pods",
+                    request_nonce=uuid4(),
+                    request_kind="snapshot-finalize",
+                    request_digest="a" * 64,
+                ),
+            ),
+        )
+    )
+
+    await service.snapshot_finalize(SimpleNamespace())  # type: ignore[arg-type]
+
+    kwargs = store.finalize_snapshot.await_args.kwargs
+    assert kwargs["interval_mutator"] == storage.apply_snapshot
+    assert kwargs["observation_hook"] == storage.observe_snapshot
+    assert kwargs["reconcile_intervals"] is True
+    assert kwargs["require_shadow_comparison"] is True
+    assert (kwargs["completion_hook"] == storage.complete_snapshot) is physical_volume
+    assert (kwargs["absence_mutator"] == storage.apply_absence) is physical_volume
+
+
+@pytest.mark.asyncio
+async def test_pvc_inventory_only_snapshot_cannot_mutate_lifecycles():
+    model = InventorySnapshotFinalize.model_validate(
+        {
+            "ticket_id": uuid4(),
+            "ticket_token": "t" * 32,
+            "snapshot_id": uuid4(),
+            "scope": {
+                "source_cluster": "dev-cluster",
+                "api_resource": "core/v1/persistentvolumeclaims",
+                "namespace": "srw",
+                "cluster_scoped": False,
+            },
+            "shadow_enabled": False,
+            "collection_completed_at": datetime(2026, 8, 5, 12, tzinfo=timezone.utc),
+            "complete": True,
+            "resource_version": "17",
+            "item_count": 0,
+            "item_digest": (
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            ),
+            "fatal_errors": [],
+        }
+    )
+    settings = InfrastructureMeteringSettings(
+        collector_enabled=True,
+        shadow_enabled=True,
+        pvc_inventory_enabled=True,
+        pvc_shadow_enabled=False,
+        stable_cluster_id="dev-cluster",
+        namespace_allowlist=("srw",),
+    )
+    store = SimpleNamespace(
+        finalize_snapshot=AsyncMock(
+            return_value=SimpleNamespace(
+                snapshot_id=model.snapshot_id,
+                complete=True,
+                present_items=0,
+                invalid_items=0,
+                confirmed_intervals=0,
+                closed_intervals=0,
+                pending_valid_items=0,
+                shadow_comparisons=0,
+                replayed=False,
+            )
+        )
+    )
+    service = object.__new__(InfrastructureIngestionService)
+    service.settings = settings
+    service.store = store
+    service._storage_reconciler = SimpleNamespace()
+    service._pod_reconciler = SimpleNamespace()
+    service._authenticated = AsyncMock(  # type: ignore[method-assign]
+        return_value=(
+            model,
+            SimpleNamespace(
+                collector_id="kubernetes-pods",
+                transport_claim=TransportNonceClaim(
+                    collector_id="kubernetes-pods",
+                    request_nonce=uuid4(),
+                    request_kind="snapshot-finalize",
+                    request_digest="a" * 64,
+                ),
+            ),
+        )
+    )
+
+    await service.snapshot_finalize(SimpleNamespace())  # type: ignore[arg-type]
+
+    kwargs = store.finalize_snapshot.await_args.kwargs
+    assert kwargs["interval_mutator"] is None
+    assert kwargs["observation_hook"] is None
+    assert kwargs["completion_hook"] is None
+    assert kwargs["absence_mutator"] is None
+    assert kwargs["reconcile_intervals"] is False
+    assert kwargs["require_shadow_comparison"] is False
 
 
 @pytest.mark.asyncio

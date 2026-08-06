@@ -93,6 +93,9 @@ APP_REFERENCED_RATE_GUARD_MIGRATION = (
     ROOT
     / "orchestrator/database/migrations/app/0101_usage_rates_v2_referenced_range_guard.sql"
 )
+APP_STORAGE_FOUNDATION_MIGRATION = (
+    ROOT / "orchestrator/database/migrations/app/0102_storage_asset_foundations.sql"
+)
 AUDIT_EXPANSION = (
     ROOT
     / "orchestrator/database/migrations/audit/0003_infrastructure_usage_events_v2.sql"
@@ -611,7 +614,7 @@ def test_migration_heads_are_unique_and_snapshots_are_not_the_contract() -> None
     for files in (app_files, audit_files):
         prefixes = [path.name.split("_", 1)[0] for path in files]
         assert len(prefixes) == len(set(prefixes))
-    assert app_files[-1].name == APP_REFERENCED_RATE_GUARD_MIGRATION.name
+    assert app_files[-1].name == APP_STORAGE_FOUNDATION_MIGRATION.name
     assert audit_files[-1].name == AUDIT_PROJECT_INDEX.name
     assert "schema_current" not in APP_MIGRATION.read_text()
     assert "schema_current" not in APP_INGESTION_MIGRATION.read_text()
@@ -623,6 +626,7 @@ def test_migration_heads_are_unique_and_snapshots_are_not_the_contract() -> None
     assert "schema_current" not in APP_DAY_SEQUENCE_BACKFILL_PREP.read_text()
     assert "schema_current" not in APP_TERMINAL_EVIDENCE_MIGRATION.read_text()
     assert "schema_current" not in APP_REFERENCED_RATE_GUARD_MIGRATION.read_text()
+    assert "schema_current" not in APP_STORAGE_FOUNDATION_MIGRATION.read_text()
     assert "audit_schema_current" not in AUDIT_EXPANSION.read_text()
 
 

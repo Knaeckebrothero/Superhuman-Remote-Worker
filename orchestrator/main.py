@@ -208,6 +208,7 @@ from services.infrastructure_metering import (  # noqa: E402
     InfrastructureUsageMaterializer,
     InfrastructureWorkspaceCutover,
     LegacyWorkspaceUsageLedgerAdapter,
+    MeteringSchemaCapabilities,
     TypedUsageDailyRollup,
     UsageSummaryV2,
     UsageV2QueryService,
@@ -248,6 +249,20 @@ from services.infrastructure_metering.materializer import (  # noqa: E402
     PublicationContractError,
     PublicationDisabledError,
     PublicationFenceError,
+)
+from services.infrastructure_metering.storage_assets import (  # noqa: E402
+    BackendDestructionResult,
+    BackendUnverifiedAssetPage,
+    StorageAssetDetailRecord,
+    StorageActivation,
+    StorageActivationNotReady,
+    StorageAssetConflict,
+    StorageAssetContractError,
+    StorageAssetNotFound,
+    StorageAssetStore,
+)
+from services.infrastructure_metering.storage_mapping import (  # noqa: E402
+    StorageResourceMappingStore,
 )
 from services.openrouter_pricing import llm_pricing_sync_loop  # noqa: E402
 from services.remote_image import (  # noqa: E402
@@ -504,6 +519,77 @@ infrastructure_usage_materializer: InfrastructureUsageMaterializer | None = None
 infrastructure_usage_day_sealer: InfrastructureUsageDaySealer | None = None
 infrastructure_metering_runtime: InfrastructureMeteringRuntime | None = None
 infrastructure_coverage_waivers: CoverageGapWaiverService | None = None
+infrastructure_storage_assets: StorageAssetStore | None = None
+infrastructure_storage_mapping: StorageResourceMappingStore | None = None
+
+_INFRASTRUCTURE_PVC_RESOURCES = (
+    "workspace_pvc",
+    "session_workspace_pvc",
+    "session_agent_pvc",
+    "persistent_agent_pvc",
+    "vm_rootdisk_claim",
+    "golden_image_pvc",
+    "platform_pvc",
+    "unclassified_pvc",
+)
+_INFRASTRUCTURE_PV_RESOURCES = ("unmapped_block_volume",)
+
+
+def _enabled_infrastructure_publication_resources(
+    settings: InfrastructureMeteringSettings,
+    *,
+    mapped_volume_resources: tuple[str, ...] = (),
+) -> tuple[str, ...]:
+    """Return exact class gates without broadening the workspace default."""
+
+    resources = ["workspace_pod"]
+    if settings.pvc_publication_enabled:
+        resources.extend(_INFRASTRUCTURE_PVC_RESOURCES)
+    if settings.pv_publication_enabled:
+        resources.extend((*_INFRASTRUCTURE_PV_RESOURCES, *mapped_volume_resources))
+    return tuple(dict.fromkeys(resources))
+
+
+def _storage_activation_is_effective(activation: StorageActivation | None) -> bool:
+    """Require both the one-way state and its database-owned UTC boundary."""
+
+    return bool(
+        activation is not None
+        and activation.state == "active"
+        and activation.activated_at is not None
+        and activation.database_time is not None
+        and activation.database_time >= activation.activated_at
+    )
+
+
+def _capability_gated_infrastructure_publication_resources(
+    settings: InfrastructureMeteringSettings,
+    capabilities: MeteringSchemaCapabilities,
+    *,
+    claim_activation: StorageActivation | None = None,
+    volume_activation: StorageActivation | None = None,
+    mapped_volume_resources: tuple[str, ...] = (),
+    volume_mapping_ready: bool = True,
+) -> tuple[str, ...]:
+    """Narrow requested classes to schema- and activation-safe resources."""
+
+    resources = ["workspace_pod"]
+    if (
+        settings.pvc_publication_enabled
+        and capabilities.slice2_claim_inventory_ready
+        and _storage_activation_is_effective(claim_activation)
+    ):
+        resources.extend(_INFRASTRUCTURE_PVC_RESOURCES)
+    if (
+        settings.pv_publication_enabled
+        and volume_mapping_ready
+        and capabilities.slice2_volume_inventory_ready
+        and capabilities.storage_identity_key_version
+        == settings.volume_identity_key_version
+        and _storage_activation_is_effective(volume_activation)
+    ):
+        resources.extend((*_INFRASTRUCTURE_PV_RESOURCES, *mapped_volume_resources))
+    return tuple(dict.fromkeys(resources))
 
 
 async def _workspace_metering_attribution(
@@ -8298,11 +8384,84 @@ async def lifespan(app: FastAPI):
     global infrastructure_workspace_cutover, infrastructure_usage_materializer
     global infrastructure_usage_day_sealer, infrastructure_metering_runtime
     global infrastructure_coverage_waivers
+    global infrastructure_storage_assets
+    global infrastructure_storage_mapping
     infrastructure_metering_settings = InfrastructureMeteringSettings.from_env()
     metering_capabilities = await probe_schema_capabilities(
         postgres_db.pool,
         audit_db.pool if (audit_db is not None and audit_ready) else None,
     )
+    infrastructure_storage_mapping = None
+    registered_storage_resources: tuple[str, ...] = ()
+    configured_storage_resources = tuple(
+        dict.fromkeys(
+            rule.resource
+            for rule in infrastructure_metering_settings.volume_resource_mappings
+        )
+    )
+    storage_mapping_ready = not infrastructure_metering_settings.pv_inventory_enabled
+    if metering_capabilities.slice2_volume_schema_ready:
+        candidate_storage_mapping = StorageResourceMappingStore(postgres_db.pool)
+        try:
+            await candidate_storage_mapping.register(
+                infrastructure_metering_settings.volume_resource_mappings
+            )
+            registered_storage_resources = await candidate_storage_mapping.resources()
+        except Exception:
+            logger.error(
+                "Infrastructure storage resource mapping registration failed; "
+                "PV collection/publication remain unavailable",
+                exc_info=True,
+            )
+            storage_mapping_ready = False
+        else:
+            infrastructure_storage_mapping = candidate_storage_mapping
+            storage_mapping_ready = True
+    infrastructure_storage_assets = None
+    claim_storage_activation: StorageActivation | None = None
+    volume_storage_activation: StorageActivation | None = None
+    if metering_capabilities.slice2_volume_schema_ready:
+        candidate_storage_assets = StorageAssetStore(postgres_db.pool)
+        try:
+            (
+                claim_storage_activation,
+                volume_storage_activation,
+            ) = await candidate_storage_assets.read_activations()
+        except Exception:
+            logger.warning(
+                "Infrastructure storage activation probe failed; storage "
+                "operations remain unavailable",
+                exc_info=True,
+            )
+        else:
+            infrastructure_storage_assets = candidate_storage_assets
+    requested_infrastructure_resources = _enabled_infrastructure_publication_resources(
+        infrastructure_metering_settings,
+        mapped_volume_resources=tuple(
+            dict.fromkeys(
+                (*configured_storage_resources, *registered_storage_resources)
+            )
+        ),
+    )
+    enabled_infrastructure_resources = (
+        _capability_gated_infrastructure_publication_resources(
+            infrastructure_metering_settings,
+            metering_capabilities,
+            claim_activation=claim_storage_activation,
+            volume_activation=volume_storage_activation,
+            mapped_volume_resources=registered_storage_resources,
+            volume_mapping_ready=storage_mapping_ready,
+        )
+    )
+    unavailable_infrastructure_resources = sorted(
+        set(requested_infrastructure_resources) - set(enabled_infrastructure_resources)
+    )
+    if unavailable_infrastructure_resources:
+        logger.error(
+            "Infrastructure storage publication requested before its schema, "
+            "identity, or activation boundary is ready; excluded resources=%s",
+            ",".join(unavailable_infrastructure_resources),
+        )
     infrastructure_usage_v2 = UsageV2QueryService(
         audit_usage_pool,
         metering_capabilities,
@@ -8310,6 +8469,7 @@ async def lifespan(app: FastAPI):
         source_aware_reads_enabled=(
             infrastructure_metering_settings.source_aware_reads_enabled
         ),
+        enabled_resources=enabled_infrastructure_resources,
     )
     infrastructure_usage_rollup = (
         TypedUsageDailyRollup(
@@ -8346,10 +8506,38 @@ async def lifespan(app: FastAPI):
     infrastructure_inventory_store = None
     infrastructure_ingestion_service = None
     if infrastructure_metering_settings.collector_enabled:
+        collection_capability_errors: list[str] = []
         if not metering_capabilities.slice1_inventory_ready:
+            collection_capability_errors.append("Slice 1 Pod inventory")
+        if (
+            infrastructure_metering_settings.pvc_inventory_enabled
+            and not metering_capabilities.slice2_claim_inventory_ready
+        ):
+            collection_capability_errors.append("Slice 2 PVC inventory")
+        if (
+            infrastructure_metering_settings.pv_inventory_enabled
+            and not metering_capabilities.slice2_volume_schema_ready
+        ):
+            collection_capability_errors.append("Slice 2 PV lifecycle schema")
+        if (
+            infrastructure_metering_settings.pv_inventory_enabled
+            and not storage_mapping_ready
+        ):
+            collection_capability_errors.append("Slice 2 PV resource mapping")
+        if (
+            infrastructure_metering_settings.pv_inventory_enabled
+            and metering_capabilities.storage_identity_key_registered
+            and metering_capabilities.storage_identity_key_version
+            != infrastructure_metering_settings.volume_identity_key_version
+        ):
+            collection_capability_errors.append(
+                "Slice 2 PV identity key version mismatch"
+            )
+        if collection_capability_errors:
             logger.error(
-                "Infrastructure metering collection requested but Slice 1 "
-                "inventory capabilities are incomplete: %s",
+                "Infrastructure metering collection requested but capabilities "
+                "are incomplete (%s): %s",
+                ", ".join(collection_capability_errors),
                 metering_capabilities.diagnostics(),
             )
         else:
@@ -8453,10 +8641,12 @@ async def lifespan(app: FastAPI):
                 postgres_db.pool,
                 usage_ledger,
                 publication_enabled=True,
+                enabled_resources=enabled_infrastructure_resources,
             )
             infrastructure_usage_day_sealer = InfrastructureUsageDaySealer(
                 postgres_db.pool,
                 sealing_enabled=True,
+                enabled_resources=enabled_infrastructure_resources,
             )
         if (
             infrastructure_workspace_cutover is not None
@@ -8496,7 +8686,8 @@ async def lifespan(app: FastAPI):
             )
         else:
             logger.info(
-                "Infrastructure metering strict publication enabled for workspace_pod"
+                "Infrastructure metering strict publication enabled resources=%s",
+                ",".join(enabled_infrastructure_resources),
             )
 
     # Encrypt any legacy plaintext datasource credentials. Idempotent — once
@@ -20845,6 +21036,25 @@ class InfrastructureCorrectionRequest(BaseModel):
     )
 
 
+class InfrastructureStorageActivationRequest(BaseModel):
+    reason: str = Field(min_length=1, max_length=2048)
+
+
+class InfrastructureStorageActivationScheduleRequest(
+    InfrastructureStorageActivationRequest
+):
+    activated_at: datetime
+
+
+class InfrastructureStorageDestructionRequest(BaseModel):
+    idempotency_key: UUID
+    effective_at: datetime
+    evidence_kind: Literal["operator-attested"]
+    evidence_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    reason_code: str = Field(pattern=r"^[a-z0-9][a-z0-9._-]{0,63}$")
+    reason: str = Field(min_length=1, max_length=2048)
+
+
 async def _require_infrastructure_fleet_admin(request: Request) -> dict[str, Any]:
     """Require an unscoped admin acting with the real fleet view."""
 
@@ -20892,6 +21102,409 @@ def _cutover_status_payload(status: CutoverStatus) -> dict[str, Any]:
         "open_legacy_intervals": status.open_legacy_intervals,
         "cutover_error": status.cutover_error,
     }
+
+
+def _storage_activation_payload(activation: StorageActivation) -> dict[str, Any]:
+    return {
+        "measurement_basis": activation.measurement_basis,
+        "state": activation.state,
+        "activated_at": activation.activated_at,
+        "database_time": activation.database_time,
+        "effective": _storage_activation_is_effective(activation),
+    }
+
+
+def _storage_basis_inventory_enabled(
+    measurement_basis: Literal["claim-requested", "volume-provisioned"],
+) -> bool:
+    if measurement_basis == "claim-requested":
+        return infrastructure_metering_settings.pvc_inventory_enabled
+    return infrastructure_metering_settings.pv_inventory_enabled
+
+
+def _storage_basis_shadow_enabled(
+    measurement_basis: Literal["claim-requested", "volume-provisioned"],
+) -> bool:
+    if measurement_basis == "claim-requested":
+        return infrastructure_metering_settings.pvc_shadow_enabled
+    return infrastructure_metering_settings.pv_shadow_enabled
+
+
+@app.get("/api/admin/usage/v2/storage-activation")
+async def get_infrastructure_storage_activation(
+    request: Request,
+) -> dict[str, Any]:
+    await _require_infrastructure_fleet_admin(request)
+    if infrastructure_storage_assets is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Infrastructure storage metering is unavailable",
+        )
+    try:
+        claim, volume = await infrastructure_storage_assets.read_activations()
+    except Exception as exc:
+        logger.exception("Infrastructure storage activation status failed")
+        raise HTTPException(
+            status_code=500,
+            detail="Infrastructure storage activation status failed",
+        ) from exc
+    return {
+        "activations": [
+            _storage_activation_payload(claim),
+            _storage_activation_payload(volume),
+        ],
+        "configuration": {
+            "claim_inventory_enabled": (
+                infrastructure_metering_settings.pvc_inventory_enabled
+            ),
+            "claim_shadow_enabled": (
+                infrastructure_metering_settings.pvc_shadow_enabled
+            ),
+            "claim_publication_enabled": (
+                infrastructure_metering_settings.pvc_publication_enabled
+            ),
+            "volume_inventory_enabled": (
+                infrastructure_metering_settings.pv_inventory_enabled
+            ),
+            "volume_shadow_enabled": (
+                infrastructure_metering_settings.pv_shadow_enabled
+            ),
+            "volume_publication_enabled": (
+                infrastructure_metering_settings.pv_publication_enabled
+            ),
+        },
+    }
+
+
+@app.post("/api/admin/usage/v2/storage-activation/{measurement_basis}/shadow")
+async def enter_infrastructure_storage_shadow(
+    request: Request,
+    measurement_basis: Literal["claim-requested", "volume-provisioned"],
+    body: InfrastructureStorageActivationRequest,
+) -> dict[str, Any]:
+    admin = await _require_infrastructure_fleet_admin(request)
+    if not _storage_basis_inventory_enabled(measurement_basis):
+        raise HTTPException(
+            status_code=404,
+            detail="Infrastructure storage inventory is not enabled for this basis",
+        )
+    if infrastructure_storage_assets is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Infrastructure storage metering is unavailable",
+        )
+    try:
+        activation = await infrastructure_storage_assets.enter_shadow(measurement_basis)
+    except StorageAssetContractError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except (StorageActivationNotReady, StorageAssetConflict) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("Infrastructure storage shadow transition failed")
+        raise HTTPException(
+            status_code=500,
+            detail="Infrastructure storage shadow transition failed",
+        ) from exc
+    await log_security_event(
+        postgres_db,
+        event_type="infrastructure_storage_shadow_entered",
+        user=admin,
+        resource_type="infrastructure_storage_activation",
+        resource_id=measurement_basis,
+        detail=f"state={activation.state} reason={body.reason}",
+        request=request,
+    )
+    return _storage_activation_payload(activation)
+
+
+@app.post("/api/admin/usage/v2/storage-activation/{measurement_basis}/schedule")
+async def schedule_infrastructure_storage_activation(
+    request: Request,
+    measurement_basis: Literal["claim-requested", "volume-provisioned"],
+    body: InfrastructureStorageActivationScheduleRequest,
+) -> dict[str, Any]:
+    admin = await _require_infrastructure_fleet_admin(request)
+    if not _storage_basis_shadow_enabled(measurement_basis):
+        raise HTTPException(
+            status_code=404,
+            detail="Infrastructure storage shadow mode is not enabled for this basis",
+        )
+    if infrastructure_storage_assets is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Infrastructure storage metering is unavailable",
+        )
+    generation = _infrastructure_leader_generation()
+    try:
+        activation = await infrastructure_storage_assets.schedule_activation(
+            measurement_basis=measurement_basis,
+            activated_at=body.activated_at,
+            source_cluster=infrastructure_metering_settings.stable_cluster_id,
+            namespaces=(
+                infrastructure_metering_settings.namespace_allowlist
+                if measurement_basis == "claim-requested"
+                else ()
+            ),
+            max_scope_age=timedelta(
+                seconds=infrastructure_metering_settings.stale_after_seconds
+            ),
+            expected_generation=generation,
+            identity_key_version=(
+                infrastructure_metering_settings.volume_identity_key_version
+                if measurement_basis == "volume-provisioned"
+                else None
+            ),
+        )
+    except StorageAssetContractError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except (StorageActivationNotReady, StorageAssetConflict) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("Infrastructure storage activation scheduling failed")
+        raise HTTPException(
+            status_code=500,
+            detail="Infrastructure storage activation scheduling failed",
+        ) from exc
+    await log_security_event(
+        postgres_db,
+        event_type="infrastructure_storage_activation_scheduled",
+        user=admin,
+        resource_type="infrastructure_storage_activation",
+        resource_id=measurement_basis,
+        detail=(f"activated_at={activation.activated_at} reason={body.reason}"),
+        request=request,
+    )
+    return _storage_activation_payload(activation)
+
+
+def _storage_destruction_payload(
+    result: BackendDestructionResult,
+) -> dict[str, Any]:
+    return {
+        "assertion_id": result.assertion_id,
+        "idempotency_key": result.idempotency_key,
+        "asset_id": result.asset_id,
+        "effective_at": result.effective_at,
+        "request_hash": result.request_hash,
+        "replayed": result.replayed,
+    }
+
+
+def _backend_unverified_storage_payload(
+    page: BackendUnverifiedAssetPage,
+) -> dict[str, Any]:
+    return {
+        "items": [
+            {
+                "asset_id": item.asset_id,
+                "source_cluster": item.source_cluster,
+                "identity_scheme": item.identity_scheme,
+                "identity_key_version": item.identity_key_version,
+                "csi_driver": item.csi_driver,
+                "first_observed_at": item.first_observed_at,
+                "last_observed_at": item.last_observed_at,
+                "backend_unverified_at": item.backend_unverified_at,
+                "gap_id": item.gap_id,
+                "gap_start": item.gap_start,
+                "reason_code": item.reason_code,
+                "storage_class_name": item.storage_class_name,
+                "reclaim_policy": item.reclaim_policy,
+                "backend_deletion_finalizer_observed": (
+                    item.backend_deletion_finalizer_observed
+                ),
+                "volume_mode": item.volume_mode,
+                "capacity_bytes": item.capacity_bytes,
+                "detached_at": item.detached_at,
+                "detach_reason": item.detach_reason,
+            }
+            for item in page.items
+        ],
+        "next_cursor": page.next_cursor,
+    }
+
+
+def _storage_asset_detail_payload(
+    item: StorageAssetDetailRecord,
+) -> dict[str, Any]:
+    return {
+        "asset_id": item.asset_id,
+        "source_cluster": item.source_cluster,
+        "identity_scheme": item.identity_scheme,
+        "identity_key_version": item.identity_key_version,
+        "csi_driver": item.csi_driver,
+        "lifecycle_state": item.lifecycle_state,
+        "first_observed_at": item.first_observed_at,
+        "last_observed_at": item.last_observed_at,
+        "backend_unverified_at": item.backend_unverified_at,
+        "destroyed_at": item.destroyed_at,
+        "history_truncated": item.history_truncated,
+        "incarnations": [
+            {
+                "storage_class_name": row.storage_class_name,
+                "reclaim_policy": row.reclaim_policy,
+                "backend_deletion_finalizer_observed": (
+                    row.backend_deletion_finalizer_observed
+                ),
+                "volume_mode": row.volume_mode,
+                "capacity_bytes": row.capacity_bytes,
+                "first_observed_at": row.first_observed_at,
+                "last_observed_at": row.last_observed_at,
+                "detached_at": row.detached_at,
+                "detach_reason": row.detach_reason,
+            }
+            for row in item.incarnations
+        ],
+        "gaps": [
+            {
+                "gap_id": row.gap_id,
+                "scope_epoch_id": row.scope_epoch_id,
+                "gap_start": row.gap_start,
+                "gap_end": row.gap_end,
+                "reason_code": row.reason_code,
+                "resolution": row.resolution,
+                "resolution_assertion_id": row.resolution_assertion_id,
+                "resolved_at": row.resolved_at,
+            }
+            for row in item.gaps
+        ],
+        "assertions": [
+            {
+                "assertion_id": row.assertion_id,
+                "effective_at": row.effective_at,
+                "evidence_kind": row.evidence_kind,
+                "evidence_digest": row.evidence_digest,
+                "actor_kind": row.actor_kind,
+                "actor_id": row.actor_id,
+                "reason_code": row.reason_code,
+                "created_at": row.created_at,
+            }
+            for row in item.assertions
+        ],
+    }
+
+
+@app.get("/api/admin/usage/v2/storage-assets/backend-unverified")
+async def list_infrastructure_backend_unverified_storage_assets(
+    request: Request,
+    limit: int = Query(default=100, ge=1, le=200),
+    cursor: UUID | None = Query(default=None),
+) -> dict[str, Any]:
+    await _require_infrastructure_fleet_admin(request)
+    if infrastructure_storage_assets is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Infrastructure storage metering is unavailable",
+        )
+    try:
+        page = await infrastructure_storage_assets.list_backend_unverified(
+            limit=limit,
+            after_asset_id=cursor,
+        )
+    except StorageAssetContractError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("Infrastructure backend-unverified asset listing failed")
+        raise HTTPException(
+            status_code=500,
+            detail="Infrastructure backend-unverified asset listing failed",
+        ) from exc
+    return _backend_unverified_storage_payload(page)
+
+
+@app.get("/api/admin/usage/v2/storage-assets/{asset_id}")
+async def get_infrastructure_storage_asset_detail(
+    request: Request,
+    asset_id: UUID,
+    history_limit: int = Query(default=100, ge=1, le=200),
+) -> dict[str, Any]:
+    await _require_infrastructure_fleet_admin(request)
+    if infrastructure_storage_assets is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Infrastructure storage metering is unavailable",
+        )
+    try:
+        item = await infrastructure_storage_assets.read_asset_detail(
+            asset_id=asset_id,
+            history_limit=history_limit,
+        )
+    except StorageAssetNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except StorageAssetContractError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("Infrastructure storage asset detail failed")
+        raise HTTPException(
+            status_code=500,
+            detail="Infrastructure storage asset detail failed",
+        ) from exc
+    return _storage_asset_detail_payload(item)
+
+
+@app.post("/api/admin/usage/v2/storage-assets/{asset_id}/destroy")
+async def assert_infrastructure_storage_asset_destroyed(
+    request: Request,
+    asset_id: UUID,
+    body: InfrastructureStorageDestructionRequest,
+) -> dict[str, Any]:
+    admin = await _require_infrastructure_fleet_admin(request)
+    if infrastructure_storage_assets is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Infrastructure storage metering is unavailable",
+        )
+    try:
+        result = await infrastructure_storage_assets.assert_destroyed(
+            idempotency_key=body.idempotency_key,
+            asset_id=asset_id,
+            effective_at=body.effective_at,
+            evidence_kind=body.evidence_kind,
+            evidence_digest=body.evidence_digest,
+            actor_kind="user",
+            actor_id=UUID(str(admin["id"])),
+            reason_code=body.reason_code,
+        )
+    except StorageAssetNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except StorageAssetContractError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except StorageAssetConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except asyncpg.ForeignKeyViolationError as exc:
+        raise HTTPException(status_code=404, detail="Storage asset not found") from exc
+    except (
+        asyncpg.CheckViolationError,
+        asyncpg.ExclusionViolationError,
+        asyncpg.ObjectNotInPrerequisiteStateError,
+        asyncpg.UniqueViolationError,
+    ) as exc:
+        raise HTTPException(
+            status_code=409,
+            detail="Storage destruction assertion conflicts with its lifecycle",
+        ) from exc
+    except Exception as exc:
+        logger.exception("Infrastructure storage destruction assertion failed")
+        raise HTTPException(
+            status_code=500,
+            detail="Infrastructure storage destruction assertion failed",
+        ) from exc
+    await log_security_event(
+        postgres_db,
+        event_type=(
+            "infrastructure_storage_destruction_replayed"
+            if result.replayed
+            else "infrastructure_storage_destroyed"
+        ),
+        user=admin,
+        resource_type="infrastructure_storage_asset",
+        resource_id=str(asset_id),
+        detail=(
+            f"assertion_id={result.assertion_id} evidence={body.evidence_kind} "
+            f"reason_code={body.reason_code} reason={body.reason}"
+        ),
+        request=request,
+    )
+    return _storage_destruction_payload(result)
 
 
 @app.get("/api/admin/usage/v2/infrastructure-cutover")

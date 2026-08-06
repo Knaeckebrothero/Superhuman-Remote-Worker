@@ -1,8 +1,8 @@
 """Raw-JSON adapter for the synchronous Kubernetes Python client.
 
 Generated client models are intentionally bypassed.  Metering must see newer
-Pod fields that may not exist in the pinned client, and a raw response lets us
-enforce byte limits before decoding it into an object graph.
+resource fields that may not exist in the pinned client, and a raw response
+lets us enforce byte limits before decoding it into an object graph.
 """
 
 from __future__ import annotations
@@ -136,8 +136,18 @@ def _next(iterator: Iterator[KubernetesWatchEvent]) -> tuple[bool, Any]:
         return False, None
 
 
-class RawKubernetesPodClient:
-    """Exact-scope Pod LIST/WATCH adapter with no server-side selector."""
+_RESOURCE_METHODS = {
+    ("core/v1/pods", False): "list_namespaced_pod",
+    (
+        "core/v1/persistentvolumeclaims",
+        False,
+    ): "list_namespaced_persistent_volume_claim",
+    ("core/v1/persistentvolumes", True): "list_persistent_volume",
+}
+
+
+class RawKubernetesClient:
+    """Exact-scope Pod/PVC/PV LIST/WATCH adapter with no selector."""
 
     def __init__(
         self,
@@ -152,12 +162,18 @@ class RawKubernetesPodClient:
         self._max_watch_event_bytes = max_watch_event_bytes
         self._request_timeout_seconds = request_timeout_seconds
 
-    @staticmethod
-    def _validate_scope(scope: InventoryScope) -> None:
-        if scope.api_resource != "core/v1/pods" or scope.cluster_scoped:
+    def _operation(self, scope: InventoryScope) -> tuple[Any, dict[str, Any]]:
+        method_name = _RESOURCE_METHODS.get((scope.api_resource, scope.cluster_scoped))
+        if method_name is None:
             raise ValueError(
-                "RawKubernetesPodClient accepts namespaced Pod scopes only"
+                "RawKubernetesClient accepts namespaced Pod/PVC scopes or "
+                "cluster-scoped PV scopes only"
             )
+        method = getattr(self._core_api, method_name, None)
+        if not callable(method):
+            raise ValueError("Kubernetes CoreV1 API lacks the requested operation")
+        kwargs = {} if scope.cluster_scoped else {"namespace": scope.namespace}
+        return method, kwargs
 
     async def list_resources(
         self,
@@ -167,7 +183,7 @@ class RawKubernetesPodClient:
         continue_token: str | None,
         resource_version: str | None,
     ) -> KubernetesListPage:
-        self._validate_scope(scope)
+        operation, scope_kwargs = self._operation(scope)
         if resource_version == "0" or (
             resource_version is not None and not resource_version
         ):
@@ -179,8 +195,8 @@ class RawKubernetesPodClient:
 
         def request() -> bytes:
             try:
-                response = self._core_api.list_namespaced_pod(
-                    namespace=scope.namespace,
+                response = operation(
+                    **scope_kwargs,
                     limit=limit,
                     _continue=continue_token,
                     resource_version=resource_version,
@@ -229,7 +245,7 @@ class RawKubernetesPodClient:
         allow_bookmarks: bool,
         timeout_seconds: int | None,
     ) -> AsyncIterator[KubernetesWatchEvent]:
-        self._validate_scope(scope)
+        operation, scope_kwargs = self._operation(scope)
 
         async def stream() -> AsyncIterator[KubernetesWatchEvent]:
             iterator: Iterator[KubernetesWatchEvent] | None = None
@@ -238,8 +254,8 @@ class RawKubernetesPodClient:
             try:
                 open_task = asyncio.create_task(
                     asyncio.to_thread(
-                        self._core_api.list_namespaced_pod,
-                        namespace=scope.namespace,
+                        operation,
+                        **scope_kwargs,
                         watch=True,
                         allow_watch_bookmarks=allow_bookmarks,
                         resource_version=resource_version,
@@ -312,4 +328,8 @@ class RawKubernetesPodClient:
         return stream()
 
 
-__all__ = ["RawKubernetesPodClient"]
+class RawKubernetesPodClient(RawKubernetesClient):
+    """Backward-compatible client name retained for existing Pod runtimes."""
+
+
+__all__ = ["RawKubernetesClient", "RawKubernetesPodClient"]

@@ -15,6 +15,7 @@ separate gate and this module never writes either database.
 from __future__ import annotations
 
 import json
+import re
 import uuid
 from collections import defaultdict
 from dataclasses import dataclass
@@ -46,6 +47,30 @@ _INFRA_SOURCES = (
     "infra-allocation-correction-v2",
 )
 _DEFAULT_ENABLED_RESOURCES = ("workspace_pod",)
+_RESOURCE_API_RESOURCES = {
+    "workspace_pod": frozenset({"core/v1/pods"}),
+    "workspace_pvc": frozenset({"core/v1/persistentvolumeclaims"}),
+    "session_workspace_pvc": frozenset({"core/v1/persistentvolumeclaims"}),
+    "session_agent_pvc": frozenset({"core/v1/persistentvolumeclaims"}),
+    "persistent_agent_pvc": frozenset({"core/v1/persistentvolumeclaims"}),
+    "vm_rootdisk_claim": frozenset({"core/v1/persistentvolumeclaims"}),
+    "golden_image_pvc": frozenset({"core/v1/persistentvolumeclaims"}),
+    "platform_pvc": frozenset({"core/v1/persistentvolumeclaims"}),
+    "unclassified_pvc": frozenset({"core/v1/persistentvolumeclaims"}),
+    "unmapped_block_volume": frozenset({"core/v1/persistentvolumes"}),
+}
+_MAPPED_VOLUME_RESOURCE_RE = re.compile(r"^block_volume_[a-z0-9_]+$")
+
+
+def _resource_api_resources(resource: str) -> frozenset[str] | None:
+    mapped = _RESOURCE_API_RESOURCES.get(resource)
+    if mapped is not None:
+        return mapped
+    if _MAPPED_VOLUME_RESOURCE_RE.fullmatch(resource):
+        return frozenset({"core/v1/persistentvolumes"})
+    return None
+
+
 _BASE_EXCLUDED_DOMAINS = (
     "node-assets",
     "idle",
@@ -260,8 +285,9 @@ _EPOCHS_SQL = """
 SELECT epoch.id, epoch.scope_id, epoch.required_from, epoch.retired_at,
        epoch.complete_through, epoch.snapshot_health,
        epoch.continuity_health, epoch.item_health, epoch.backend_health,
-       epoch.publication_health
+       epoch.publication_health, scope.api_resource
 FROM resource_inventory_scope_epochs AS epoch
+JOIN resource_inventory_scopes AS scope ON scope.id = epoch.scope_id
 WHERE epoch.required_for_rollup = TRUE
   AND epoch.required_from < $2
   AND (epoch.retired_at IS NULL OR epoch.retired_at > $1)
@@ -277,6 +303,27 @@ WHERE gap.scope_epoch_id = ANY($1::uuid[])
   AND gap.gap_start < $3
   AND (gap.gap_end IS NULL OR gap.gap_end > $2)
 ORDER BY gap.gap_start, gap.id
+"""
+
+_STORAGE_GAPS_SQL = """
+/* infra-read:storage-gaps */
+SELECT gap.scope_epoch_id, gap.gap_start, gap.gap_end, gap.resolution
+FROM resource_inventory_coverage_gaps AS gap
+WHERE gap.scope_epoch_id = ANY($1::uuid[])
+  AND gap.resolution <> 'backfilled'
+  AND gap.gap_start < $3
+  AND (gap.gap_end IS NULL OR gap.gap_end > $2)
+
+UNION ALL
+
+SELECT gap.scope_epoch_id, gap.gap_start, gap.gap_end,
+       CASE WHEN gap.resolution = 'unresolved' THEN 'unresolved'
+            ELSE 'waived' END AS resolution
+FROM storage_asset_coverage_gaps AS gap
+WHERE gap.scope_epoch_id = ANY($1::uuid[])
+  AND gap.gap_start < $3
+  AND (gap.gap_end IS NULL OR gap.gap_end > $2)
+ORDER BY gap_start
 """
 
 _DAY_STATES_SQL = """
@@ -846,9 +893,28 @@ class SourceAwareUsageReadModel:
         resources = tuple(dict.fromkeys(str(item) for item in enabled_resources))
         if not resources or any(not item for item in resources):
             raise ValueError("enabled_resources must contain non-empty names")
+        unsupported = sorted(
+            resource
+            for resource in set(resources)
+            if _resource_api_resources(resource) is None
+        )
+        if unsupported:
+            raise ValueError(
+                "usage read model has no inventory-scope mapping for: "
+                + ", ".join(unsupported)
+            )
         self._audit = audit_pool
         self._app = app_pool
         self._enabled_resources = resources
+        self._enabled_api_resources = frozenset().union(
+            *(
+                _resource_api_resources(resource) or frozenset()
+                for resource in resources
+            )
+        )
+        self._include_storage_asset_gaps = (
+            "core/v1/persistentvolumes" in self._enabled_api_resources
+        )
 
     async def read_app_snapshot(
         self,
@@ -1008,7 +1074,11 @@ class SourceAwareUsageReadModel:
                     epoch_ids = [row["id"] for row in epochs]
                     if epoch_ids:
                         gaps = await conn.fetch(
-                            _GAPS_SQL,
+                            (
+                                _STORAGE_GAPS_SQL
+                                if self._include_storage_asset_gaps
+                                else _GAPS_SQL
+                            ),
                             epoch_ids,
                             coverage_start,
                             to_ts,
@@ -1753,10 +1823,17 @@ class SourceAwareUsageReadModel:
                 if effective_end <= effective_start:
                     continue
                 saw_effective_epoch = True
+                source_enabled = (
+                    str(epoch.get("api_resource") or "") in self._enabled_api_resources
+                )
                 item_healthy = str(epoch.get("item_health")) == "healthy"
                 continuity_healthy = str(epoch.get("continuity_health")) == "healthy"
                 epoch_gaps = gaps_by_epoch.get(epoch_id, ())
-                if not item_healthy or (not continuity_healthy and not epoch_gaps):
+                if (
+                    not source_enabled
+                    or not item_healthy
+                    or (not continuity_healthy and not epoch_gaps)
+                ):
                     # Persisted gap rows are the interval-specific continuity
                     # evidence.  Do not let the epoch's mutable aggregate
                     # ``gap`` health retroactively invalidate otherwise known

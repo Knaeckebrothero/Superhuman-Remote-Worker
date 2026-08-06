@@ -157,6 +157,44 @@ $$;
 
 
 --
+-- Name: enforce_resource_interval_storage_activation(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.enforce_resource_interval_storage_activation() RETURNS trigger
+    LANGUAGE plpgsql SECURITY DEFINER
+    SET search_path TO 'pg_catalog'
+    AS $$
+DECLARE
+    activation_state TEXT;
+    activation_time  TIMESTAMPTZ;
+BEGIN
+    IF NEW.measurement_basis NOT IN (
+        'claim-requested', 'volume-provisioned'
+    ) THEN
+        RETURN NEW;
+    END IF;
+
+    SELECT activation.state, activation.activated_at
+    INTO activation_state, activation_time
+    FROM public.storage_metering_activation AS activation
+    WHERE activation.measurement_basis = NEW.measurement_basis
+    FOR SHARE;
+
+    IF activation_state IS DISTINCT FROM 'active'
+       OR activation_time IS NULL
+       OR statement_timestamp() < activation_time
+       OR NEW.started_at < activation_time THEN
+        RAISE EXCEPTION
+            'storage interval basis % is not active at its clamped boundary',
+            NEW.measurement_basis
+            USING ERRCODE = '55000';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
 -- Name: enforce_resource_inventory_item_fence(); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -595,6 +633,21 @@ BEGIN
             USING ERRCODE = '55000';
     END IF;
     RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: protect_infrastructure_storage_resource_mapping(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.protect_infrastructure_storage_resource_mapping() RETURNS trigger
+    LANGUAGE plpgsql
+    SET search_path TO 'pg_catalog'
+    AS $$
+BEGIN
+    RAISE EXCEPTION 'storage resource mappings are append-only'
+        USING ERRCODE = '55000';
 END;
 $$;
 
@@ -1454,6 +1507,398 @@ $$;
 
 
 --
+-- Name: protect_storage_asset_coverage_gap_mutation(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.protect_storage_asset_coverage_gap_mutation() RETURNS trigger
+    LANGUAGE plpgsql SECURITY DEFINER
+    SET search_path TO 'pg_catalog'
+    AS $$
+DECLARE
+    asset_state TEXT;
+    lifecycle_id UUID;
+    first_seen  TIMESTAMPTZ;
+    last_seen   TIMESTAMPTZ;
+    evidence_ok BOOLEAN;
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        RAISE EXCEPTION 'storage asset coverage gaps cannot be deleted'
+            USING ERRCODE = '55000';
+    ELSIF TG_OP = 'INSERT' THEN
+        SELECT asset.lifecycle_state, asset.first_observed_at,
+               asset.last_observed_at
+        INTO asset_state, first_seen, last_seen
+        FROM public.storage_volume_assets AS asset
+        WHERE asset.id = NEW.asset_id
+        FOR UPDATE;
+        IF asset_state IS NULL OR asset_state = 'destroyed'
+           OR NEW.gap_start < first_seen
+           OR NEW.gap_start < last_seen
+           OR NEW.resolution <> 'unresolved' THEN
+            RAISE EXCEPTION 'storage asset gap cannot open for this lifecycle'
+                USING ERRCODE = '55000';
+        END IF;
+        RETURN NEW;
+    END IF;
+
+    IF OLD.resolution <> 'unresolved'
+       OR NEW.id IS DISTINCT FROM OLD.id
+       OR NEW.asset_id IS DISTINCT FROM OLD.asset_id
+       OR NEW.scope_epoch_id IS DISTINCT FROM OLD.scope_epoch_id
+       OR NEW.gap_start IS DISTINCT FROM OLD.gap_start
+       OR NEW.reason_code IS DISTINCT FROM OLD.reason_code
+       OR NEW.created_at IS DISTINCT FROM OLD.created_at
+       OR NEW.resolution NOT IN ('reobserved', 'destroyed-confirmed')
+       OR NEW.gap_end IS NULL
+       OR NEW.resolved_at IS NULL
+       OR NEW.updated_at < OLD.updated_at THEN
+        RAISE EXCEPTION 'storage asset gap resolution is immutable or invalid'
+            USING ERRCODE = '55000';
+    END IF;
+
+    IF NEW.resolution = 'destroyed-confirmed' THEN
+        SELECT TRUE INTO evidence_ok
+        FROM public.storage_backend_assertions AS assertion
+        WHERE assertion.id = NEW.resolution_assertion_id
+          AND assertion.asset_id = OLD.asset_id
+          AND assertion.effective_at = NEW.gap_end;
+        IF evidence_ok IS DISTINCT FROM TRUE THEN
+            RAISE EXCEPTION 'storage asset gap destruction evidence is invalid'
+                USING ERRCODE = '55000';
+        END IF;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: protect_storage_backend_assertion_mutation(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.protect_storage_backend_assertion_mutation() RETURNS trigger
+    LANGUAGE plpgsql SECURITY DEFINER
+    SET search_path TO 'pg_catalog'
+    AS $$
+DECLARE
+    prior       public.storage_backend_assertions%ROWTYPE;
+    asset_state TEXT;
+    lifecycle_id UUID;
+    first_seen  TIMESTAMPTZ;
+    last_seen   TIMESTAMPTZ;
+    open_start  TIMESTAMPTZ;
+BEGIN
+    IF TG_OP IN ('UPDATE', 'DELETE') THEN
+        RAISE EXCEPTION 'storage backend assertions are append-only'
+            USING ERRCODE = '55000';
+    END IF;
+
+    SELECT * INTO prior
+    FROM public.storage_backend_assertions AS assertion
+    WHERE assertion.idempotency_key = NEW.idempotency_key;
+    IF FOUND THEN
+        IF prior.asset_id IS DISTINCT FROM NEW.asset_id
+           OR prior.assertion_kind IS DISTINCT FROM NEW.assertion_kind
+           OR prior.request_hash IS DISTINCT FROM NEW.request_hash
+           OR prior.effective_at IS DISTINCT FROM NEW.effective_at
+           OR prior.evidence_kind IS DISTINCT FROM NEW.evidence_kind
+           OR prior.evidence_digest IS DISTINCT FROM NEW.evidence_digest
+           OR prior.actor_kind IS DISTINCT FROM NEW.actor_kind
+           OR prior.actor_id IS DISTINCT FROM NEW.actor_id
+           OR prior.reason_code IS DISTINCT FROM NEW.reason_code THEN
+            RAISE EXCEPTION
+                'storage assertion idempotency replay changed immutable intent'
+                USING ERRCODE = '23505';
+        END IF;
+        RETURN NEW;
+    END IF;
+
+    SELECT asset.lifecycle_state, asset.source_lifecycle_id,
+           asset.first_observed_at, asset.last_observed_at
+    INTO asset_state, lifecycle_id, first_seen, last_seen
+    FROM public.storage_volume_assets AS asset
+    WHERE asset.id = NEW.asset_id
+    FOR UPDATE;
+    IF asset_state IS NULL OR asset_state <> 'backend-unverified'
+       OR NEW.effective_at < first_seen
+       OR NEW.effective_at < last_seen
+       OR NEW.effective_at > statement_timestamp() THEN
+        RAISE EXCEPTION 'storage destruction assertion is outside the lifecycle'
+            USING ERRCODE = '55000';
+    END IF;
+
+    SELECT gap.gap_start INTO open_start
+    FROM public.storage_asset_coverage_gaps AS gap
+    WHERE gap.asset_id = NEW.asset_id AND gap.resolution = 'unresolved'
+    FOR UPDATE;
+    IF open_start IS NULL THEN
+        RAISE EXCEPTION 'storage destruction requires an unresolved backend gap'
+            USING ERRCODE = '55000';
+    END IF;
+    IF NEW.effective_at < open_start THEN
+        RAISE EXCEPTION 'storage destruction predates the backend-unknown gap'
+            USING ERRCODE = '55000';
+    END IF;
+    IF EXISTS (
+        SELECT 1 FROM public.storage_volume_incarnations AS incarnation
+        WHERE incarnation.asset_id = NEW.asset_id
+          AND incarnation.detached_at IS NULL
+    ) OR EXISTS (
+        SELECT 1 FROM public.resource_intervals AS interval
+        WHERE interval.source_lifecycle_id = lifecycle_id
+          AND interval.ended_at IS NULL
+    ) THEN
+        RAISE EXCEPTION 'storage destruction requires a detached closed lifecycle'
+            USING ERRCODE = '55000';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: protect_storage_identity_key_state(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.protect_storage_identity_key_state() RETURNS trigger
+    LANGUAGE plpgsql
+    SET search_path TO 'pg_catalog'
+    AS $$
+BEGIN
+    IF TG_OP <> 'INSERT' THEN
+        RAISE EXCEPTION 'storage identity key state is immutable'
+            USING ERRCODE = '55000';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: protect_storage_metering_activation(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.protect_storage_metering_activation() RETURNS trigger
+    LANGUAGE plpgsql
+    SET search_path TO 'pg_catalog'
+    AS $$
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        RAISE EXCEPTION 'storage activation rows cannot be deleted'
+            USING ERRCODE = '55000';
+    ELSIF TG_OP = 'INSERT' THEN
+        IF NEW.state <> 'disabled' OR NEW.activated_at IS NOT NULL THEN
+            RAISE EXCEPTION 'storage activation rows must begin disabled'
+                USING ERRCODE = '55000';
+        END IF;
+        RETURN NEW;
+    END IF;
+
+    IF NEW.measurement_basis IS DISTINCT FROM OLD.measurement_basis
+       OR NEW.created_at IS DISTINCT FROM OLD.created_at THEN
+        RAISE EXCEPTION 'storage activation identity is immutable'
+            USING ERRCODE = '55000';
+    END IF;
+
+    IF OLD.state = 'disabled' AND NEW.state = 'shadow'
+       AND NEW.activated_at IS NULL THEN
+        NEW.updated_at := statement_timestamp();
+        RETURN NEW;
+    END IF;
+
+    IF OLD.state = 'shadow' AND NEW.state = 'active'
+       AND NEW.activated_at IS NOT NULL
+       AND NEW.activated_at = date_trunc('day', NEW.activated_at, 'UTC')
+       AND NEW.activated_at > statement_timestamp() THEN
+        NEW.updated_at := statement_timestamp();
+        RETURN NEW;
+    END IF;
+
+    IF NEW.state IS NOT DISTINCT FROM OLD.state
+       AND NEW.activated_at IS NOT DISTINCT FROM OLD.activated_at
+       AND NEW.updated_at IS NOT DISTINCT FROM OLD.updated_at THEN
+        RETURN NEW;
+    END IF;
+
+    RAISE EXCEPTION
+        'storage activation permits only disabled -> shadow -> future active'
+        USING ERRCODE = '55000';
+END;
+$$;
+
+
+--
+-- Name: protect_storage_shadow_observation_mutation(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.protect_storage_shadow_observation_mutation() RETURNS trigger
+    LANGUAGE plpgsql SECURITY DEFINER
+    SET search_path TO 'pg_catalog'
+    AS $$
+DECLARE
+    snapshot_state   TEXT;
+    activation_state TEXT;
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        SELECT snapshot.manifest_state INTO snapshot_state
+        FROM public.resource_inventory_snapshots AS snapshot
+        WHERE snapshot.id = OLD.snapshot_id
+          AND snapshot.inventory_scope_id = OLD.inventory_scope_id
+        FOR SHARE;
+        IF snapshot_state IN ('items-expired', 'staging-expired')
+           AND OLD.observed_at <= statement_timestamp() - INTERVAL '7 days'
+           AND OLD.created_at <= statement_timestamp() - INTERVAL '7 days' THEN
+            RETURN OLD;
+        END IF;
+        RAISE EXCEPTION
+            'storage shadow deletion requires an expired manifest and seven-day floor'
+            USING ERRCODE = '55000';
+    ELSIF TG_OP = 'UPDATE' THEN
+        RAISE EXCEPTION 'storage shadow observations are immutable'
+            USING ERRCODE = '55000';
+    END IF;
+
+    SELECT snapshot.manifest_state
+    INTO snapshot_state
+    FROM public.resource_inventory_snapshots AS snapshot
+    JOIN public.resource_inventory_ingest_tickets AS ticket
+      ON ticket.id = snapshot.ingest_ticket_id
+    JOIN public.infra_metering_control AS control ON control.singleton = TRUE
+    WHERE snapshot.id = NEW.snapshot_id
+      AND snapshot.inventory_scope_id = NEW.inventory_scope_id
+      AND snapshot.leader_generation = control.leader_generation
+      AND ticket.bound_snapshot_id = snapshot.id
+      AND ticket.consumed_at IS NULL
+      AND ticket.expires_at > statement_timestamp();
+
+    SELECT activation.state
+    INTO activation_state
+    FROM public.storage_metering_activation AS activation
+    WHERE activation.measurement_basis = NEW.measurement_basis
+    FOR SHARE;
+
+    IF snapshot_state IS DISTINCT FROM 'staging'
+       OR activation_state NOT IN ('shadow', 'active') THEN
+        RAISE EXCEPTION 'storage shadow observation fence failed'
+            USING ERRCODE = '55000';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: protect_storage_volume_asset_mutation(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.protect_storage_volume_asset_mutation() RETURNS trigger
+    LANGUAGE plpgsql SECURITY DEFINER
+    SET search_path TO 'pg_catalog'
+    AS $$
+DECLARE
+    transition_ok BOOLEAN;
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        RAISE EXCEPTION 'storage volume assets cannot be deleted'
+            USING ERRCODE = '55000';
+    END IF;
+
+    IF NEW.id IS DISTINCT FROM OLD.id
+       OR NEW.source_cluster IS DISTINCT FROM OLD.source_cluster
+       OR NEW.asset_digest IS DISTINCT FROM OLD.asset_digest
+       OR NEW.identity_key_version IS DISTINCT FROM OLD.identity_key_version
+       OR NEW.identity_scheme IS DISTINCT FROM OLD.identity_scheme
+       OR NEW.csi_driver IS DISTINCT FROM OLD.csi_driver
+       OR NEW.source_lifecycle_id IS DISTINCT FROM OLD.source_lifecycle_id
+       OR NEW.first_observed_at IS DISTINCT FROM OLD.first_observed_at
+       OR NEW.created_at IS DISTINCT FROM OLD.created_at THEN
+        RAISE EXCEPTION 'storage volume asset identity is immutable'
+            USING ERRCODE = '55000';
+    END IF;
+
+    IF NEW.last_observed_at < OLD.last_observed_at
+       OR NEW.updated_at < OLD.updated_at THEN
+        RAISE EXCEPTION 'storage volume asset cursors are monotonic'
+            USING ERRCODE = '55000';
+    END IF;
+
+    IF OLD.lifecycle_state = 'destroyed' THEN
+        IF NEW IS DISTINCT FROM OLD THEN
+            RAISE EXCEPTION 'destroyed storage volume assets are immutable'
+                USING ERRCODE = '55000';
+        END IF;
+        RETURN NEW;
+    END IF;
+
+    IF NEW.lifecycle_state = 'backend-unverified' THEN
+        SELECT TRUE INTO transition_ok
+        FROM public.storage_asset_coverage_gaps AS gap
+        WHERE gap.asset_id = OLD.id AND gap.resolution = 'unresolved';
+    ELSIF NEW.lifecycle_state = 'visible'
+          AND OLD.lifecycle_state = 'backend-unverified' THEN
+        SELECT TRUE INTO transition_ok
+        FROM public.storage_asset_coverage_gaps AS gap
+        WHERE gap.asset_id = OLD.id AND gap.resolution = 'reobserved'
+        ORDER BY gap.gap_end DESC LIMIT 1;
+    ELSIF NEW.lifecycle_state = 'destroyed' THEN
+        SELECT TRUE INTO transition_ok
+        FROM public.storage_backend_assertions AS assertion
+        WHERE assertion.id = NEW.destruction_assertion_id
+          AND assertion.asset_id = OLD.id
+          AND assertion.effective_at = NEW.destroyed_at;
+    ELSE
+        transition_ok := NEW.lifecycle_state = OLD.lifecycle_state;
+    END IF;
+
+    IF transition_ok IS DISTINCT FROM TRUE THEN
+        RAISE EXCEPTION 'storage volume asset transition lacks durable evidence'
+            USING ERRCODE = '55000';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: protect_storage_volume_incarnation_mutation(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.protect_storage_volume_incarnation_mutation() RETURNS trigger
+    LANGUAGE plpgsql
+    SET search_path TO 'pg_catalog'
+    AS $$
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        RAISE EXCEPTION 'storage volume incarnations cannot be deleted'
+            USING ERRCODE = '55000';
+    END IF;
+    IF NEW.id IS DISTINCT FROM OLD.id
+       OR NEW.asset_id IS DISTINCT FROM OLD.asset_id
+       OR NEW.inventory_scope_id IS DISTINCT FROM OLD.inventory_scope_id
+       OR NEW.source_cluster IS DISTINCT FROM OLD.source_cluster
+       OR NEW.pv_uid IS DISTINCT FROM OLD.pv_uid
+       OR NEW.pv_name IS DISTINCT FROM OLD.pv_name
+       OR NEW.first_observed_at IS DISTINCT FROM OLD.first_observed_at
+       OR NEW.created_at IS DISTINCT FROM OLD.created_at THEN
+        RAISE EXCEPTION 'storage volume incarnation identity is immutable'
+            USING ERRCODE = '55000';
+    END IF;
+    IF NEW.last_observed_at < OLD.last_observed_at
+       OR NEW.updated_at < OLD.updated_at
+       OR (OLD.backend_deletion_finalizer_observed
+           AND NOT NEW.backend_deletion_finalizer_observed)
+       OR (OLD.detached_at IS NOT NULL AND NEW IS DISTINCT FROM OLD)
+       OR (OLD.detached_at IS NULL AND NEW.detached_at IS NOT NULL
+           AND NEW.detached_at < OLD.last_observed_at) THEN
+        RAISE EXCEPTION 'storage volume incarnation lifecycle is not monotonic'
+            USING ERRCODE = '55000';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
 -- Name: protect_usage_rate_card_version_mutation(); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -1742,6 +2187,68 @@ BEGIN
     IF control_exists IS DISTINCT FROM TRUE THEN
         RAISE EXCEPTION 'infra metering control row is missing'
             USING ERRCODE = '55000';
+    END IF;
+    RETURN NULL;
+END;
+$$;
+
+
+--
+-- Name: transition_storage_asset_for_destruction(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.transition_storage_asset_for_destruction() RETURNS trigger
+    LANGUAGE plpgsql SECURITY DEFINER
+    SET search_path TO 'pg_catalog'
+    AS $$
+BEGIN
+    UPDATE public.storage_asset_coverage_gaps
+    SET gap_end = NEW.effective_at,
+        resolution = 'destroyed-confirmed',
+        resolution_assertion_id = NEW.id,
+        resolved_at = statement_timestamp(),
+        updated_at = statement_timestamp()
+    WHERE asset_id = NEW.asset_id AND resolution = 'unresolved';
+
+    UPDATE public.storage_volume_incarnations
+    SET detached_at = GREATEST(last_observed_at, NEW.effective_at),
+        detach_reason = 'backend-destroyed',
+        updated_at = statement_timestamp()
+    WHERE asset_id = NEW.asset_id AND detached_at IS NULL;
+
+    UPDATE public.storage_volume_assets
+    SET lifecycle_state = 'destroyed',
+        destroyed_at = NEW.effective_at,
+        destruction_assertion_id = NEW.id,
+        updated_at = statement_timestamp()
+    WHERE id = NEW.asset_id;
+    RETURN NULL;
+END;
+$$;
+
+
+--
+-- Name: transition_storage_asset_for_gap(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.transition_storage_asset_for_gap() RETURNS trigger
+    LANGUAGE plpgsql SECURITY DEFINER
+    SET search_path TO 'pg_catalog'
+    AS $$
+BEGIN
+    IF TG_OP = 'INSERT' THEN
+        UPDATE public.storage_volume_assets
+        SET lifecycle_state = 'backend-unverified',
+            backend_unverified_at = NEW.gap_start,
+            updated_at = statement_timestamp()
+        WHERE id = NEW.asset_id;
+    ELSIF NEW.resolution = 'reobserved' THEN
+        UPDATE public.storage_volume_assets
+        SET lifecycle_state = 'visible',
+            backend_unverified_at = NULL,
+            last_observed_at = GREATEST(last_observed_at, NEW.gap_end),
+            updated_at = statement_timestamp()
+        WHERE id = NEW.asset_id;
     END IF;
     RETURN NULL;
 END;
@@ -2989,6 +3496,24 @@ CREATE TABLE public.infra_usage_day_state (
     coverage_sequence bigint DEFAULT 0 NOT NULL,
     CONSTRAINT infra_usage_day_state_coverage_sequence_check CHECK ((((state = 'sealed'::text) AND (coverage_sequence > 0)) OR ((state <> 'sealed'::text) AND (coverage_sequence = 0)))),
     CONSTRAINT infra_usage_day_state_shape_check CHECK (((state = ANY (ARRAY['open'::text, 'sealing'::text, 'sealed'::text])) AND ((coverage_status IS NULL) OR (coverage_status = ANY (ARRAY['complete'::text, 'partial'::text]))) AND ((coverage_status IS NULL) = (coverage_revision IS NULL)) AND ((coverage_revision IS NULL) OR (coverage_revision <> ''::text)) AND (jsonb_typeof(unknown_ranges) = 'array'::text) AND (((state = 'sealed'::text) AND (coverage_status IS NOT NULL) AND (coverage_revision IS NOT NULL) AND (sealed_at IS NOT NULL)) OR ((state <> 'sealed'::text) AND (sealed_at IS NULL)))))
+);
+
+
+--
+-- Name: infrastructure_storage_resource_mappings; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.infrastructure_storage_resource_mappings (
+    source_cluster text NOT NULL,
+    storage_class_name text,
+    csi_driver text,
+    volume_mode text NOT NULL,
+    resource text NOT NULL,
+    mapping_version text NOT NULL,
+    rule_fingerprint character(64) NOT NULL,
+    registered_at timestamp with time zone DEFAULT statement_timestamp() NOT NULL,
+    CONSTRAINT infrastructure_storage_resource_mappings_output_check CHECK (((resource ~ '^block_volume_[a-z0-9_]+$'::text) AND (length(resource) <= 128) AND (mapping_version ~ '^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$'::text) AND (rule_fingerprint ~ '^[0-9a-f]{64}$'::text))),
+    CONSTRAINT infrastructure_storage_resource_mappings_selector_check CHECK (((source_cluster ~ '^[A-Za-z0-9][A-Za-z0-9._:-]{0,254}$'::text) AND ((storage_class_name IS NULL) OR ((storage_class_name ~ '^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?(\.[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?)*$'::text) AND (length(storage_class_name) <= 253) AND (storage_class_name <> ALL (ARRAY['unknown'::text, 'unmapped'::text, 'any'::text])))) AND ((csi_driver IS NULL) OR ((csi_driver ~ '^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?(\.[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?)*$'::text) AND (length(csi_driver) <= 253) AND (csi_driver <> ALL (ARRAY['unknown'::text, 'unmapped'::text, 'any'::text])))) AND (volume_mode = ANY (ARRAY['filesystem'::text, 'block'::text]))))
 );
 
 
@@ -4343,6 +4868,211 @@ COMMENT ON COLUMN public.srw_sessions.last_seen_at IS 'Idle timeout anchor: vali
 
 
 --
+-- Name: storage_asset_coverage_gaps; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.storage_asset_coverage_gaps (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    asset_id uuid NOT NULL,
+    scope_epoch_id uuid NOT NULL,
+    gap_start timestamp with time zone NOT NULL,
+    gap_end timestamp with time zone,
+    reason_code text NOT NULL,
+    resolution text DEFAULT 'unresolved'::text NOT NULL,
+    resolution_assertion_id uuid,
+    resolved_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT storage_asset_coverage_gaps_range_check CHECK (((gap_end IS NULL) OR (gap_end >= gap_start))),
+    CONSTRAINT storage_asset_coverage_gaps_reason_check CHECK ((reason_code ~ '^[a-z0-9][a-z0-9._-]{0,63}$'::text)),
+    CONSTRAINT storage_asset_coverage_gaps_resolution_check CHECK ((((resolution = 'unresolved'::text) AND (gap_end IS NULL) AND (resolution_assertion_id IS NULL) AND (resolved_at IS NULL)) OR ((resolution = 'reobserved'::text) AND (gap_end IS NOT NULL) AND (resolution_assertion_id IS NULL) AND (resolved_at IS NOT NULL)) OR ((resolution = 'destroyed-confirmed'::text) AND (gap_end IS NOT NULL) AND (resolution_assertion_id IS NOT NULL) AND (resolved_at IS NOT NULL))))
+);
+
+
+--
+-- Name: TABLE storage_asset_coverage_gaps; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.storage_asset_coverage_gaps IS 'Per-asset backend-unverified ranges, separate from collector-wide coverage gaps.';
+
+
+--
+-- Name: storage_backend_assertions; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.storage_backend_assertions (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    idempotency_key uuid NOT NULL,
+    asset_id uuid NOT NULL,
+    assertion_kind text DEFAULT 'backend-destroyed'::text NOT NULL,
+    request_hash text NOT NULL,
+    effective_at timestamp with time zone NOT NULL,
+    evidence_kind text NOT NULL,
+    evidence_digest text NOT NULL,
+    actor_kind text NOT NULL,
+    actor_id uuid,
+    reason_code text NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT storage_backend_assertions_shape_check CHECK (((assertion_kind = 'backend-destroyed'::text) AND (request_hash ~ '^[0-9a-f]{64}$'::text) AND (evidence_digest ~ '^[0-9a-f]{64}$'::text) AND (evidence_kind = ANY (ARRAY['csi-confirmed'::text, 'provider-confirmed'::text, 'delete-finalizer-confirmed'::text, 'operator-attested'::text])) AND (((actor_kind = 'user'::text) AND (actor_id IS NOT NULL)) OR ((actor_kind = 'service'::text) AND (actor_id IS NULL))) AND (reason_code ~ '^[a-z0-9][a-z0-9._-]{0,63}$'::text)))
+);
+
+
+--
+-- Name: TABLE storage_backend_assertions; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.storage_backend_assertions IS 'Append-only idempotent evidence that a physical backend was destroyed.';
+
+
+--
+-- Name: storage_identity_key_state; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.storage_identity_key_state (
+    singleton boolean DEFAULT true NOT NULL,
+    key_version text NOT NULL,
+    key_fingerprint text NOT NULL,
+    algorithm text DEFAULT 'hmac-sha256-v1'::text NOT NULL,
+    registered_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT storage_identity_key_state_shape_check CHECK (((key_version ~ '^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$'::text) AND (key_fingerprint ~ '^[0-9a-f]{64}$'::text) AND (algorithm = 'hmac-sha256-v1'::text))),
+    CONSTRAINT storage_identity_key_state_singleton_check CHECK (singleton)
+);
+
+
+--
+-- Name: TABLE storage_identity_key_state; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.storage_identity_key_state IS 'Fingerprint and version of the dedicated stable volume-identity HMAC key; key material and raw CSI handles are never persisted.';
+
+
+--
+-- Name: storage_metering_activation; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.storage_metering_activation (
+    measurement_basis text NOT NULL,
+    state text DEFAULT 'disabled'::text NOT NULL,
+    activated_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT storage_metering_activation_basis_check CHECK ((measurement_basis = ANY (ARRAY['claim-requested'::text, 'volume-provisioned'::text]))),
+    CONSTRAINT storage_metering_activation_state_check CHECK ((((state = ANY (ARRAY['disabled'::text, 'shadow'::text])) AND (activated_at IS NULL)) OR ((state = 'active'::text) AND (activated_at IS NOT NULL) AND (activated_at = date_trunc('day'::text, activated_at, 'UTC'::text)))))
+);
+
+
+--
+-- Name: TABLE storage_metering_activation; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.storage_metering_activation IS 'Forward-only per-basis shadow/activation boundary; storage intervals are database-clamped to activated_at.';
+
+
+--
+-- Name: storage_shadow_observations; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.storage_shadow_observations (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    snapshot_id uuid NOT NULL,
+    inventory_scope_id uuid NOT NULL,
+    source_kind text NOT NULL,
+    source_uid text NOT NULL,
+    measurement_basis text NOT NULL,
+    asset_id uuid,
+    storage_bytes bigint,
+    resource text NOT NULL,
+    mapping_version text,
+    mapping_fingerprint character(64),
+    attribution_scope text NOT NULL,
+    owner_kind text,
+    owner_id text,
+    disposition text NOT NULL,
+    reason_code text NOT NULL,
+    observed_at timestamp with time zone NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT storage_shadow_observations_identity_check CHECK (((source_uid <> ''::text) AND (length(source_uid) <= 256) AND (resource <> ''::text) AND (length(resource) <= 255) AND (reason_code ~ '^[a-z0-9][a-z0-9._-]{0,63}$'::text) AND (((mapping_version IS NULL) AND (mapping_fingerprint IS NULL)) OR ((source_kind = 'volume'::text) AND (resource ~ '^block_volume_[a-z0-9_]+$'::text) AND (mapping_version ~ '^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$'::text) AND (mapping_fingerprint ~ '^[0-9a-f]{64}$'::text))) AND (((source_kind = 'pvc'::text) AND (measurement_basis = 'claim-requested'::text) AND (asset_id IS NULL)) OR ((source_kind = 'volume'::text) AND (measurement_basis = 'volume-provisioned'::text))))),
+    CONSTRAINT storage_shadow_observations_shape_check CHECK (((attribution_scope = ANY (ARRAY['customer'::text, 'shared-platform'::text, 'unknown'::text])) AND (((attribution_scope = 'customer'::text) AND (owner_kind = ANY (ARRAY['job'::text, 'thread'::text])) AND (owner_id IS NOT NULL) AND (owner_id <> ''::text)) OR ((attribution_scope = 'shared-platform'::text) AND (owner_kind = 'platform'::text) AND (owner_id IS NULL)) OR ((attribution_scope = 'unknown'::text) AND (owner_kind IS NULL) AND (owner_id IS NULL))) AND (disposition = ANY (ARRAY['eligible-unpriced'::text, 'not-applicable'::text, 'invalid'::text, 'identity-ambiguous'::text, 'backend-unverified'::text])) AND ((storage_bytes IS NULL) OR (storage_bytes >= 0)) AND ((disposition <> 'eligible-unpriced'::text) OR (storage_bytes IS NOT NULL)) AND ((source_kind <> 'volume'::text) OR (disposition = ANY (ARRAY['invalid'::text, 'identity-ambiguous'::text])) OR (asset_id IS NOT NULL))))
+);
+
+
+--
+-- Name: TABLE storage_shadow_observations; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.storage_shadow_observations IS 'Non-publishable storage classifications with no interval or publication-plan relationship.';
+
+
+--
+-- Name: storage_volume_assets; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.storage_volume_assets (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    source_cluster text NOT NULL,
+    asset_digest text NOT NULL,
+    identity_key_version text NOT NULL,
+    identity_scheme text NOT NULL,
+    csi_driver text,
+    source_lifecycle_id uuid NOT NULL,
+    lifecycle_state text DEFAULT 'visible'::text NOT NULL,
+    first_observed_at timestamp with time zone NOT NULL,
+    last_observed_at timestamp with time zone NOT NULL,
+    backend_unverified_at timestamp with time zone,
+    destroyed_at timestamp with time zone,
+    destruction_assertion_id uuid,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT storage_volume_assets_identity_check CHECK (((source_cluster <> ''::text) AND (length(source_cluster) <= 255) AND (asset_digest ~ '^[0-9a-f]{64}$'::text) AND (((identity_scheme = 'csi-hmac-sha256-v1'::text) AND (csi_driver ~ '^[A-Za-z0-9][A-Za-z0-9._-]{0,252}$'::text)) OR ((identity_scheme = 'pv-uid-v1'::text) AND (csi_driver IS NULL))))),
+    CONSTRAINT storage_volume_assets_state_check CHECK ((((lifecycle_state = 'visible'::text) AND (backend_unverified_at IS NULL) AND (destroyed_at IS NULL) AND (destruction_assertion_id IS NULL)) OR ((lifecycle_state = 'backend-unverified'::text) AND (backend_unverified_at IS NOT NULL) AND (destroyed_at IS NULL) AND (destruction_assertion_id IS NULL)) OR ((lifecycle_state = 'destroyed'::text) AND (destroyed_at IS NOT NULL) AND (destruction_assertion_id IS NOT NULL)))),
+    CONSTRAINT storage_volume_assets_time_check CHECK (((last_observed_at >= first_observed_at) AND ((backend_unverified_at IS NULL) OR (backend_unverified_at >= first_observed_at)) AND ((destroyed_at IS NULL) OR (destroyed_at >= first_observed_at))))
+);
+
+
+--
+-- Name: TABLE storage_volume_assets; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.storage_volume_assets IS 'Physical storage lifecycle keyed only by an opaque HMAC digest; PV UID belongs to an incarnation, not the billable asset.';
+
+
+--
+-- Name: storage_volume_incarnations; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.storage_volume_incarnations (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    asset_id uuid NOT NULL,
+    inventory_scope_id uuid NOT NULL,
+    source_cluster text NOT NULL,
+    pv_uid text NOT NULL,
+    pv_name text NOT NULL,
+    storage_class_name text,
+    reclaim_policy text NOT NULL,
+    backend_deletion_finalizer_observed boolean DEFAULT false NOT NULL,
+    volume_mode text NOT NULL,
+    capacity_bytes bigint NOT NULL,
+    bound_claim_uid text,
+    source_resource_version text,
+    first_observed_at timestamp with time zone NOT NULL,
+    last_observed_at timestamp with time zone NOT NULL,
+    detached_at timestamp with time zone,
+    detach_reason text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT storage_volume_incarnations_identity_check CHECK (((source_cluster <> ''::text) AND (pv_uid <> ''::text) AND (pv_name <> ''::text) AND (length(pv_uid) <= 256) AND (length(pv_name) <= 253) AND ((storage_class_name IS NULL) OR ((storage_class_name <> ''::text) AND (length(storage_class_name) <= 253))) AND ((bound_claim_uid IS NULL) OR ((bound_claim_uid <> ''::text) AND (length(bound_claim_uid) <= 256))) AND ((source_resource_version IS NULL) OR ((source_resource_version <> ''::text) AND (length(source_resource_version) <= 255))))),
+    CONSTRAINT storage_volume_incarnations_shape_check CHECK (((reclaim_policy = ANY (ARRAY['delete'::text, 'retain'::text, 'recycle'::text, 'unknown'::text])) AND (volume_mode = ANY (ARRAY['filesystem'::text, 'block'::text, 'unknown'::text])) AND (capacity_bytes >= 0) AND (last_observed_at >= first_observed_at) AND (((detached_at IS NULL) AND (detach_reason IS NULL)) OR ((detached_at IS NOT NULL) AND (detach_reason = ANY (ARRAY['pv-deleted'::text, 'reimported'::text, 'backend-destroyed'::text])) AND (detached_at >= last_observed_at)))))
+);
+
+
+--
+-- Name: TABLE storage_volume_incarnations; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.storage_volume_incarnations IS 'Kubernetes PV incarnations attached to one durable physical-volume asset; contains no CSI handle or attributes.';
+
+
+--
 -- Name: sudo_approval_requests; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -5380,6 +6110,22 @@ ALTER TABLE ONLY public.infra_usage_day_state
 
 
 --
+-- Name: infrastructure_storage_resource_mappings infrastructure_storage_resource_mappings_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.infrastructure_storage_resource_mappings
+    ADD CONSTRAINT infrastructure_storage_resource_mappings_pkey PRIMARY KEY (rule_fingerprint);
+
+
+--
+-- Name: infrastructure_storage_resource_mappings infrastructure_storage_resource_mappings_selector_uq; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.infrastructure_storage_resource_mappings
+    ADD CONSTRAINT infrastructure_storage_resource_mappings_selector_uq UNIQUE NULLS NOT DISTINCT (source_cluster, storage_class_name, csi_driver, volume_mode);
+
+
+--
 -- Name: job_change_records job_change_records_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -5921,6 +6667,150 @@ ALTER TABLE ONLY public.srw_pre_auth_states
 
 ALTER TABLE ONLY public.srw_sessions
     ADD CONSTRAINT srw_sessions_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: storage_asset_coverage_gaps storage_asset_coverage_gaps_no_overlap; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.storage_asset_coverage_gaps
+    ADD CONSTRAINT storage_asset_coverage_gaps_no_overlap EXCLUDE USING gist (asset_id WITH =, tstzrange(gap_start, gap_end, '[)'::text) WITH &&);
+
+
+--
+-- Name: storage_asset_coverage_gaps storage_asset_coverage_gaps_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.storage_asset_coverage_gaps
+    ADD CONSTRAINT storage_asset_coverage_gaps_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: storage_backend_assertions storage_backend_assertions_asset_uq; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.storage_backend_assertions
+    ADD CONSTRAINT storage_backend_assertions_asset_uq UNIQUE (asset_id);
+
+
+--
+-- Name: storage_backend_assertions storage_backend_assertions_idempotency_uq; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.storage_backend_assertions
+    ADD CONSTRAINT storage_backend_assertions_idempotency_uq UNIQUE (idempotency_key);
+
+
+--
+-- Name: storage_backend_assertions storage_backend_assertions_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.storage_backend_assertions
+    ADD CONSTRAINT storage_backend_assertions_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: storage_identity_key_state storage_identity_key_state_key_fingerprint_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.storage_identity_key_state
+    ADD CONSTRAINT storage_identity_key_state_key_fingerprint_key UNIQUE (key_fingerprint);
+
+
+--
+-- Name: storage_identity_key_state storage_identity_key_state_key_version_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.storage_identity_key_state
+    ADD CONSTRAINT storage_identity_key_state_key_version_key UNIQUE (key_version);
+
+
+--
+-- Name: storage_identity_key_state storage_identity_key_state_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.storage_identity_key_state
+    ADD CONSTRAINT storage_identity_key_state_pkey PRIMARY KEY (singleton);
+
+
+--
+-- Name: storage_metering_activation storage_metering_activation_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.storage_metering_activation
+    ADD CONSTRAINT storage_metering_activation_pkey PRIMARY KEY (measurement_basis);
+
+
+--
+-- Name: storage_shadow_observations storage_shadow_observations_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.storage_shadow_observations
+    ADD CONSTRAINT storage_shadow_observations_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: storage_shadow_observations storage_shadow_observations_snapshot_identity_uq; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.storage_shadow_observations
+    ADD CONSTRAINT storage_shadow_observations_snapshot_identity_uq UNIQUE (snapshot_id, source_kind, source_uid);
+
+
+--
+-- Name: storage_volume_assets storage_volume_assets_destruction_assertion_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.storage_volume_assets
+    ADD CONSTRAINT storage_volume_assets_destruction_assertion_id_key UNIQUE (destruction_assertion_id);
+
+
+--
+-- Name: storage_volume_assets storage_volume_assets_identity_uq; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.storage_volume_assets
+    ADD CONSTRAINT storage_volume_assets_identity_uq UNIQUE (source_cluster, asset_digest);
+
+
+--
+-- Name: storage_volume_assets storage_volume_assets_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.storage_volume_assets
+    ADD CONSTRAINT storage_volume_assets_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: storage_volume_assets storage_volume_assets_source_lifecycle_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.storage_volume_assets
+    ADD CONSTRAINT storage_volume_assets_source_lifecycle_id_key UNIQUE (source_lifecycle_id);
+
+
+--
+-- Name: storage_volume_incarnations storage_volume_incarnations_no_overlap; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.storage_volume_incarnations
+    ADD CONSTRAINT storage_volume_incarnations_no_overlap EXCLUDE USING gist (asset_id WITH =, tstzrange(first_observed_at, detached_at, '[)'::text) WITH &&);
+
+
+--
+-- Name: storage_volume_incarnations storage_volume_incarnations_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.storage_volume_incarnations
+    ADD CONSTRAINT storage_volume_incarnations_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: storage_volume_incarnations storage_volume_incarnations_pv_uid_uq; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.storage_volume_incarnations
+    ADD CONSTRAINT storage_volume_incarnations_pv_uid_uq UNIQUE (source_cluster, pv_uid);
 
 
 --
@@ -6935,6 +7825,13 @@ CREATE INDEX idx_users_keycloak_sub ON public.users USING btree (keycloak_sub);
 
 
 --
+-- Name: infrastructure_storage_resource_mappings_resource_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX infrastructure_storage_resource_mappings_resource_idx ON public.infrastructure_storage_resource_mappings USING btree (resource, source_cluster);
+
+
+--
 -- Name: jobs_lease_expiry_idx; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -7177,6 +8074,55 @@ CREATE INDEX resource_publication_plans_period_idx ON public.resource_publicatio
 --
 
 CREATE INDEX schema_migrations_dirty_idx ON public.schema_migrations USING btree (filename) WHERE (success = false);
+
+
+--
+-- Name: storage_asset_coverage_gaps_open_uq; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX storage_asset_coverage_gaps_open_uq ON public.storage_asset_coverage_gaps USING btree (asset_id) WHERE (resolution = 'unresolved'::text);
+
+
+--
+-- Name: storage_asset_coverage_gaps_range_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX storage_asset_coverage_gaps_range_idx ON public.storage_asset_coverage_gaps USING btree (asset_id, gap_start, gap_end, id);
+
+
+--
+-- Name: storage_shadow_observations_latest_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX storage_shadow_observations_latest_idx ON public.storage_shadow_observations USING btree (inventory_scope_id, source_kind, source_uid, observed_at DESC);
+
+
+--
+-- Name: storage_shadow_observations_retention_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX storage_shadow_observations_retention_idx ON public.storage_shadow_observations USING btree (observed_at, id);
+
+
+--
+-- Name: storage_volume_assets_state_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX storage_volume_assets_state_idx ON public.storage_volume_assets USING btree (lifecycle_state, source_cluster, id);
+
+
+--
+-- Name: storage_volume_incarnations_active_asset_uq; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX storage_volume_incarnations_active_asset_uq ON public.storage_volume_incarnations USING btree (asset_id) WHERE (detached_at IS NULL);
+
+
+--
+-- Name: storage_volume_incarnations_asset_time_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX storage_volume_incarnations_asset_time_idx ON public.storage_volume_incarnations USING btree (asset_id, first_observed_at, detached_at, id);
 
 
 --
@@ -7446,6 +8392,13 @@ CREATE TRIGGER infra_usage_day_state_one_way_seal BEFORE INSERT OR DELETE OR UPD
 
 
 --
+-- Name: infrastructure_storage_resource_mappings infrastructure_storage_resource_mappings_append_only; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER infrastructure_storage_resource_mappings_append_only BEFORE DELETE OR UPDATE ON public.infrastructure_storage_resource_mappings FOR EACH ROW EXECUTE FUNCTION public.protect_infrastructure_storage_resource_mapping();
+
+
+--
 -- Name: legacy_workspace_cutover_plan_events legacy_workspace_cutover_plan_event_manifest_complete; Type: TRIGGER; Schema: public; Owner: -
 --
 
@@ -7499,6 +8452,13 @@ CREATE TRIGGER resource_intervals_scope_identity BEFORE INSERT OR UPDATE OF inve
 --
 
 CREATE TRIGGER resource_intervals_snapshot_end_single_boundary_guard BEFORE UPDATE OF last_seen_at, last_seen_snapshot_id ON public.resource_intervals FOR EACH ROW EXECUTE FUNCTION public.validate_resource_interval_snapshot_end_evidence();
+
+
+--
+-- Name: resource_intervals resource_intervals_storage_activation_guard; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER resource_intervals_storage_activation_guard BEFORE INSERT ON public.resource_intervals FOR EACH ROW EXECUTE FUNCTION public.enforce_resource_interval_storage_activation();
 
 
 --
@@ -7639,6 +8599,69 @@ CREATE TRIGGER resource_publication_plans_frozen_intent BEFORE DELETE OR UPDATE 
 --
 
 CREATE CONSTRAINT TRIGGER resource_publication_plans_manifest_complete AFTER INSERT ON public.resource_publication_plans DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.validate_resource_publication_plan_manifest();
+
+
+--
+-- Name: storage_asset_coverage_gaps storage_asset_coverage_gaps_lifecycle_guard; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER storage_asset_coverage_gaps_lifecycle_guard BEFORE INSERT OR DELETE OR UPDATE ON public.storage_asset_coverage_gaps FOR EACH ROW EXECUTE FUNCTION public.protect_storage_asset_coverage_gap_mutation();
+
+
+--
+-- Name: storage_asset_coverage_gaps storage_asset_coverage_gaps_transition; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER storage_asset_coverage_gaps_transition AFTER INSERT OR UPDATE OF resolution ON public.storage_asset_coverage_gaps FOR EACH ROW EXECUTE FUNCTION public.transition_storage_asset_for_gap();
+
+
+--
+-- Name: storage_backend_assertions storage_backend_assertions_append_only; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER storage_backend_assertions_append_only BEFORE INSERT OR DELETE OR UPDATE ON public.storage_backend_assertions FOR EACH ROW EXECUTE FUNCTION public.protect_storage_backend_assertion_mutation();
+
+
+--
+-- Name: storage_backend_assertions storage_backend_assertions_transition; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER storage_backend_assertions_transition AFTER INSERT ON public.storage_backend_assertions FOR EACH ROW EXECUTE FUNCTION public.transition_storage_asset_for_destruction();
+
+
+--
+-- Name: storage_identity_key_state storage_identity_key_state_immutable; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER storage_identity_key_state_immutable BEFORE DELETE OR UPDATE ON public.storage_identity_key_state FOR EACH ROW EXECUTE FUNCTION public.protect_storage_identity_key_state();
+
+
+--
+-- Name: storage_metering_activation storage_metering_activation_one_way; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER storage_metering_activation_one_way BEFORE INSERT OR DELETE OR UPDATE ON public.storage_metering_activation FOR EACH ROW EXECUTE FUNCTION public.protect_storage_metering_activation();
+
+
+--
+-- Name: storage_shadow_observations storage_shadow_observations_immutable; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER storage_shadow_observations_immutable BEFORE INSERT OR DELETE OR UPDATE ON public.storage_shadow_observations FOR EACH ROW EXECUTE FUNCTION public.protect_storage_shadow_observation_mutation();
+
+
+--
+-- Name: storage_volume_assets storage_volume_assets_lifecycle_guard; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER storage_volume_assets_lifecycle_guard BEFORE DELETE OR UPDATE ON public.storage_volume_assets FOR EACH ROW EXECUTE FUNCTION public.protect_storage_volume_asset_mutation();
+
+
+--
+-- Name: storage_volume_incarnations storage_volume_incarnations_lifecycle_guard; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER storage_volume_incarnations_lifecycle_guard BEFORE DELETE OR UPDATE ON public.storage_volume_incarnations FOR EACH ROW EXECUTE FUNCTION public.protect_storage_volume_incarnation_mutation();
 
 
 --
@@ -8556,6 +9579,94 @@ ALTER TABLE ONLY public.skills
 
 ALTER TABLE ONLY public.srw_sessions
     ADD CONSTRAINT srw_sessions_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
+
+
+--
+-- Name: storage_asset_coverage_gaps storage_asset_coverage_gaps_assertion_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.storage_asset_coverage_gaps
+    ADD CONSTRAINT storage_asset_coverage_gaps_assertion_fkey FOREIGN KEY (resolution_assertion_id) REFERENCES public.storage_backend_assertions(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: storage_asset_coverage_gaps storage_asset_coverage_gaps_asset_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.storage_asset_coverage_gaps
+    ADD CONSTRAINT storage_asset_coverage_gaps_asset_id_fkey FOREIGN KEY (asset_id) REFERENCES public.storage_volume_assets(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: storage_asset_coverage_gaps storage_asset_coverage_gaps_scope_epoch_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.storage_asset_coverage_gaps
+    ADD CONSTRAINT storage_asset_coverage_gaps_scope_epoch_id_fkey FOREIGN KEY (scope_epoch_id) REFERENCES public.resource_inventory_scope_epochs(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: storage_backend_assertions storage_backend_assertions_asset_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.storage_backend_assertions
+    ADD CONSTRAINT storage_backend_assertions_asset_id_fkey FOREIGN KEY (asset_id) REFERENCES public.storage_volume_assets(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: storage_shadow_observations storage_shadow_observations_asset_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.storage_shadow_observations
+    ADD CONSTRAINT storage_shadow_observations_asset_id_fkey FOREIGN KEY (asset_id) REFERENCES public.storage_volume_assets(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: storage_shadow_observations storage_shadow_observations_snapshot_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.storage_shadow_observations
+    ADD CONSTRAINT storage_shadow_observations_snapshot_fkey FOREIGN KEY (snapshot_id, inventory_scope_id) REFERENCES public.resource_inventory_snapshots(id, inventory_scope_id) ON DELETE RESTRICT;
+
+
+--
+-- Name: storage_volume_assets storage_volume_assets_destruction_assertion_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.storage_volume_assets
+    ADD CONSTRAINT storage_volume_assets_destruction_assertion_fkey FOREIGN KEY (destruction_assertion_id) REFERENCES public.storage_backend_assertions(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: storage_volume_assets storage_volume_assets_identity_key_version_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.storage_volume_assets
+    ADD CONSTRAINT storage_volume_assets_identity_key_version_fkey FOREIGN KEY (identity_key_version) REFERENCES public.storage_identity_key_state(key_version) ON DELETE RESTRICT;
+
+
+--
+-- Name: storage_volume_assets storage_volume_assets_source_lifecycle_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.storage_volume_assets
+    ADD CONSTRAINT storage_volume_assets_source_lifecycle_id_fkey FOREIGN KEY (source_lifecycle_id) REFERENCES public.resource_lifecycle_heads(source_lifecycle_id) ON DELETE RESTRICT;
+
+
+--
+-- Name: storage_volume_incarnations storage_volume_incarnations_asset_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.storage_volume_incarnations
+    ADD CONSTRAINT storage_volume_incarnations_asset_id_fkey FOREIGN KEY (asset_id) REFERENCES public.storage_volume_assets(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: storage_volume_incarnations storage_volume_incarnations_scope_cluster_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.storage_volume_incarnations
+    ADD CONSTRAINT storage_volume_incarnations_scope_cluster_fkey FOREIGN KEY (inventory_scope_id, source_cluster) REFERENCES public.resource_inventory_scopes(id, source_cluster) ON DELETE RESTRICT;
 
 
 --

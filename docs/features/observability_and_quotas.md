@@ -35,6 +35,21 @@ IMPLEMENTED + k3d-verified (2026-06-22)** as **Slice 4 of
 detail). This doc stays the **schema + decisions source of truth** (`usage_events`,
 `usage_rates`, the rate table, the open-interval reconciler) — the implementation note just
 below records what's built, what's deferred, and the one design change.
+
+**Successor state (2026-08-06):**
+[`infrastructure_resource_metering.md`](infrastructure_resource_metering.md)
+Slices 0–2 are implemented through app migration `0102`. In addition to the
+typed v2 ledger/read model and Slice 1 workspace-Pod path, Slice 2 adds separate
+PVC logical-demand and PV physical-asset lifecycles, opaque HMAC CSI identity,
+retained/backend-unverified coverage gaps, exact immutable operator mapping,
+and audited backend-destruction assertions. The compatibility ledger remains
+authoritative: chart defaults keep every gate off, main-dev values request Pod
+inventory only, all six storage gates are off, and no durable cutover or
+infrastructure-v2 publication has occurred. Focused Slice 2 code/database checks
+and its live k3d inventory→shadow→all-off exercise passed with publication
+disabled. Agent/VM, shared-platform, provider storage-rate, and utilization
+coverage remain later slices.
+
 **Triggered by:** Approaching enterprise/SaaS readiness. Before plans/billing exist we
 need (a) per-user cost attribution that works on *any* cluster (homelab today, AWS
 later), and (b) basic infra-ops monitoring. Locked in conversation that this round is
@@ -43,8 +58,8 @@ later), and (b) basic infra-ops monitoring. Locked in conversation that this rou
 ## Implementation note (2026-06-22) — what the rate-limiting Slice 4 built
 
 The ledger this doc designed now exists, built as Slice 4 of
-[[usage_monitoring_and_rate_limiting]] (the gateway from its Slices 1–3 changed where LLM
-cost is sourced — see below):
+[[usage_monitoring_and_rate_limiting]]. Later removal of the proxy/gateway and
+the audit-based materializer changed where LLM cost is sourced — see below:
 
 - **`usage_events`** — shipped verbatim from this doc's schema as
   `migrations/audit/0002_usage_events.sql` (monthly-partitioned on `ts` in `srw-auditdb`,
@@ -62,21 +77,25 @@ cost is sourced — see below):
   > effective-dated STACKIT/AWS/Azure rate cards and reprices those quantities at
   > read time for planning. It never writes the comparison estimate back onto
   > `usage_events` or presents it as canonical customer spend.
-- **LLM rows — DESIGN CHANGE.** This doc sketched emitting them at the agent's
-  token-capture point (`archiver.py:393`). The implementation instead **materializes them
-  from the LiteLLM gateway** (poll `/spend/logs` → `category='llm'` rows). Why: the gateway
-  (Slices 1–3) now exists, and the scoped key gives **clean per-user/project identity** at
-  the gateway (the agent has `job_id` but not `user_id`; the gateway has user/project but
-  not `job_id`). Trade-off: LLM rows attribute to user/project but **not** job (per-job LLM
-  is a deferred follow-up — tag requests with `job_id` via gateway metadata).
-- **Workspace compute** — open/close intervals exactly as designed here, via a
-  `workspace_intervals` (`app/0034`) bookkeeping table + a materialize-and-reconcile loop
-  (requests × wall-clock → `vcpu-hour` + `gib-hour`). **Container/sandbox tier only**;
-  agent-pod compute (Slice 2 here) + VM tier are deferred.
+- **LLM rows — DESIGN CHANGE.** The current implementation materializes token
+  usage from the `llm_requests` audit trail through
+  `orchestrator/services/audit_usage.py`; it no longer depends on a proxy or
+  gateway. Worker job IDs and persistent-session thread IDs resolve to
+  user/project attribution and are retained as `ref_kind` / `ref_id`, so
+  per-job/thread ledger queries are supported. The ledger snapshots rates from
+  the OpenRouter-seeded `usage_rates` table.
+- **Workspace compute** — the active compatibility writer uses
+  `workspace_intervals` (`app/0034`) and requests × wall-clock to emit
+  `vcpu-hour` + `gib-hour`. Its typed successor is implemented through Slice 1,
+  but remains behind the durable cutover/publication gates. Agent-pod and VM
+  compute are still deferred.
 - **Cockpit "Usage" view** (this doc's Slice 4) — shipped, reads `GET /api/usage`.
-- **Deferred:** query metering (Slice 3 here), soft-quota *alerts* (Slice 5 here), the
-  `usage_daily` rollup mirror, agent-pod + VM compute, per-job LLM attribution. The
-  `quota_limits` table is unbuilt; note the **rate-limiting doc already ships a different,
+- **Deferred:** query metering (Slice 3 here), soft-quota *alerts* (Slice 5
+  here), agent/VM compute, PVC/PV rollout/publication and provider pricing, and
+  utilization overlays. The legacy
+  `usage_daily` rollup and typed `usage_daily_v2` machinery are built; the latter
+  is gated with the infrastructure-v2 path. The `quota_limits` table is unbuilt;
+  note the **rate-limiting doc already ships a different,
   enforcing daily quota** (its Slice 3, orchestrator-driven freeze) — distinct from this
   doc's planned soft-alert quota.
 
@@ -213,11 +232,14 @@ double-count on the next sweep.
 
 ## Slices (each independently shippable)
 
-> **Implementation status (2026-06-22):** the ledger foundation + workspace compute
-> (Slice 1), the LLM half of Slice 2 (gateway-sourced), and the Cockpit view (Slice 4)
-> are **built** as Slice 4 of [[usage_monitoring_and_rate_limiting]] — see the
-> implementation note near the top. **Deferred:** agent-pod compute (Slice 2), query
-> metering (Slice 3), soft-quota alerts (Slice 5), the `usage_daily` rollup. The slice
+> **Implementation status (updated 2026-08-06):** the ledger foundation,
+> audit-sourced LLM usage, legacy workspace compute, both rollup models, and the
+> Cockpit view are built. The typed successor is implemented through
+> infrastructure-metering Slice 2/app `0102`: workspace Pods plus separate PVC
+> demand and PV/backend assets. It has not crossed its durable cutover, and all
+> storage collection/reconciliation/publication gates remain off in main dev.
+> **Deferred:** agent/VM coverage, PVC/PV production rollout and provider rate
+> cards, query metering, utilization overlays, and soft-quota alerts. The slice
 > text below is the original design record.
 
 Each metering slice ships with at least a raw read endpoint so numbers can be verified;
@@ -280,11 +302,27 @@ the requests we bill on.
 
 ## Storage metering — successor design
 
-> Originally captured here as a deferred note. The implementation-ready
-> allocation design now lives in
+> Originally captured here as a deferred note. The allocation design and its
+> completed Slice 0–2 substrate now live in
 > [`infrastructure_resource_metering.md`](infrastructure_resource_metering.md).
+> PVC/PV collection, lifecycle, activation, read/seal, and publication code is
+> implementation-complete behind Slice 2 dark-launch gates; live k3d validation
+> passed with publication disabled, all storage gates remain off in main dev,
+> and no storage event has become billing-authoritative.
 > Whether storage becomes a customer charge remains conditional on the hosting
 > model; truthful allocation visibility does not.
+
+The implementation keeps logical PVC demand (`claim-requested`) non-additive
+with provisioned PV/backend assets (`volume-provisioned`). CSI handles are HMAC'd
+inside the collector and never persisted. Physical tiers come only from exact,
+immutable operator-owned cluster/StorageClass/CSI-driver/volume-mode rules; the
+collector does not read StorageClass parameters or CSIDriver objects, and
+`unmapped_block_volume` is always unpriced. Any PV disappearance freezes at the
+last proof and opens a backend-unverified gap until an audited fleet-admin
+operator assertion closes it. Automated provider evidence, non-CSI reimport
+deduplication, and provider rate cards are not implemented yet; a scheduled
+activation also requires an orchestrator rollout after its UTC boundary so the
+fixed enabled-resource set is rebuilt.
 
 - ~~**Workspace storage today ≈ free.**~~ **No longer true (2026-08-04).** emptyDir
   is still the chart default, but `workspace.pvcEnabled` PVC-backs both jobs and
@@ -354,7 +392,8 @@ Cost driver: whether existing audit history must be preserved (dual-write + back
    optional overlay. See
    [`infrastructure_resource_metering.md`](infrastructure_resource_metering.md).
 2. ~~Analytics schema management~~ **Resolved 2026-06-11**: the `migrations/audit/` family owns the schema (`usage_events` = `0002`); same runner, one source of truth.
-3. `usage_daily` mirror: push from a TimescaleDB continuous-aggregate refresh hook, or pull on an orchestrator timer? (Lean: orchestrator timer — no cross-DB triggers.)
+3. ~~`usage_daily` mirror transport~~ **Resolved 2026-07-03:** the orchestrator
+   timer pulls and full-replaces the app-DB rollup; no cross-DB trigger is used.
 4. Soft-quota thresholds: fixed (80/100%) or admin-configurable per limit?
 5. Homelab compute rate: derive empirically from pdu power now, or ship a placeholder and calibrate later?
 6. Do we meter LLM cost for **BYOK** users (user supplies their own API key)? Then there's no LLM cost *to us* — meter for their visibility only, or skip?
@@ -368,5 +407,3 @@ Cost driver: whether existing audit history must be preserved (dual-write + back
 - `HomeLab/deployments_unmanaged/pdu-scraper/` — the existing `analytics` writer + power data for rate calibration.
 - `HomeLab/cluster_migration.md:109` — the unchecked "Install Rancher monitoring chart" item Track B resumes.
 - OpenRouter markup model: https://openrouter.ai/docs/use-cases/byok
-</content>
-</invoke>

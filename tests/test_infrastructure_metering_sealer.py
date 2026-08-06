@@ -138,7 +138,7 @@ class _Connection:
     async def fetch(self, sql: str, *_args: Any) -> list[dict[str, Any]]:
         if "infra-seal:epochs" in sql:
             return copy.deepcopy(self.pool.epochs)
-        if "infra-seal:gaps" in sql:
+        if "infra-seal:gaps" in sql or "infra-seal:storage-gaps" in sql:
             return copy.deepcopy(self.pool.gaps)
         raise AssertionError(f"unexpected sealer fetch: {sql}")
 
@@ -791,6 +791,21 @@ async def test_required_scope_must_match_enabled_resource_mapping() -> None:
         await _sealer(app).seal_day(DAY, 7)
 
     assert raised.value.code == "required-source-not-enabled"
+
+
+@pytest.mark.asyncio
+async def test_mapped_volume_resource_enables_pv_scope_and_storage_gap_path() -> None:
+    app = _AppPool()
+    app.epochs[0]["api_resource"] = "core/v1/persistentvolumes"
+    sealer = InfrastructureUsageDaySealer(
+        app,  # type: ignore[arg-type]
+        sealing_enabled=True,
+        enabled_resources=("workspace_pod", "block_volume_local_path"),
+    )
+
+    result = await sealer.seal_day(DAY, 7)
+
+    assert result.coverage_status == "complete"
 
 
 @pytest.mark.asyncio
