@@ -980,6 +980,187 @@ class TestSetupWorkspace:
         assert call_kwargs[1]["host"] == "override-host"
 
 
+class _ShellProbeBackend:
+    """Shell-capable fake over a tmp dir that records shell_run calls.
+
+    ``supports_shell=True`` is what arms both of ``initialize()``'s
+    ``rm -rf`` sites, so any recorded ``rm -rf`` call is the wipe the
+    attach guard exists to prevent.
+    """
+
+    supports_shell = True
+
+    def __init__(self, root):
+        self._root = root
+        self.root = str(root)
+        self.shell_calls: list[str] = []
+
+    def exists(self, rel: str) -> bool:
+        return (self._root / rel).exists()
+
+    def list_dir(self, path: str = "") -> list[str]:
+        return [p.name for p in (self._root / path).iterdir()]
+
+    def mkdir(self, rel: str) -> None:
+        (self._root / rel).mkdir(parents=True, exist_ok=True)
+
+    def shell_run(self, cmd: str, **kwargs) -> str:
+        self.shell_calls.append(cmd)
+        return "Exit code: 0\n(no output)"
+
+
+class TestAttachExistingWorkspaceGuard:
+    """The session attach guard ported from the job path.
+
+    Regression pins for
+    docs/issues/session_workspace_wiped_by_agent_clone_on_attach.md: an
+    attach onto a content-bearing PVC must never reach ``initialize()``'s
+    ``rm -rf`` + re-clone.
+    """
+
+    def _session_with_manager(self, tmp_path, git_remote_url=None):
+        from src.core.workspace import WorkspaceManager, WorkspaceManagerConfig
+
+        session = _make_session(config=_make_config())
+        backend = _ShellProbeBackend(tmp_path)
+        session.workspace_manager = WorkspaceManager(
+            job_id=session.thread_id,
+            base_path=str(tmp_path),
+            config=WorkspaceManagerConfig(
+                base_path=str(tmp_path),
+                structure=["output"],
+                git_versioning=True,
+                git_remote_url=git_remote_url,
+            ),
+            backend=backend,
+        )
+        return session, backend
+
+    def test_git_tree_is_preserved_and_reattached(self, tmp_path):
+        """A `.git` workspace gets a handle attached — no wipe, no clone."""
+        (tmp_path / ".git").mkdir()
+        (tmp_path / "user_data.txt").write_text("precious")
+        session, backend = self._session_with_manager(
+            tmp_path, git_remote_url="http://gitea/thread.git"
+        )
+
+        result = session._attach_existing_workspace(backend, "http://gitea/thread.git")
+
+        assert result == "reattach"
+        assert session.workspace_manager.git_manager is not None
+        assert session.workspace_manager._initialized is True
+        assert (tmp_path / "user_data.txt").read_text() == "precious"
+        assert not any("rm -rf" in c for c in backend.shell_calls)
+        assert not any("clone" in c for c in backend.shell_calls)
+
+    def test_empty_root_falls_through_to_initialize(self, tmp_path):
+        """A genuinely empty root returns None so the caller clones fresh."""
+        session, backend = self._session_with_manager(tmp_path)
+
+        assert session._attach_existing_workspace(backend, None) is None
+
+    def test_lost_and_found_still_counts_as_empty(self, tmp_path):
+        (tmp_path / "lost+found").mkdir()
+        session, backend = self._session_with_manager(tmp_path)
+
+        assert session._attach_existing_workspace(backend, None) is None
+
+    def test_gitless_content_initializes_git_in_place(self, tmp_path):
+        """Content without `.git` (e.g. pre-attach uploads) is kept."""
+        (tmp_path / "upload.pdf").write_text("doc")
+        session, backend = self._session_with_manager(
+            tmp_path, git_remote_url="http://gitea/thread.git"
+        )
+
+        result = session._attach_existing_workspace(backend, "http://gitea/thread.git")
+
+        assert result == "attach-content"
+        assert session.workspace_manager._initialized is True
+        assert (tmp_path / "upload.pdf").read_text() == "doc"
+        assert (tmp_path / "output").is_dir()
+        assert not any("rm -rf" in c for c in backend.shell_calls)
+
+    def test_probe_failure_fails_safe_to_preserve(self, tmp_path):
+        """A broken probe must NOT fall through to the destructive init."""
+        session, backend = self._session_with_manager(tmp_path)
+        backend.exists = MagicMock(side_effect=RuntimeError("ssh flake"))
+
+        result = session._attach_existing_workspace(backend, None)
+
+        assert result == "reattach"
+        assert not any("rm -rf" in c for c in backend.shell_calls)
+
+    def test_non_shell_backend_bypasses_guard(self, tmp_path):
+        session, backend = self._session_with_manager(tmp_path)
+        lite = MagicMock()
+        lite.supports_shell = False
+
+        assert session._attach_existing_workspace(lite, None) is None
+
+
+class TestSetupWorkspaceGuardWiring:
+    """_setup_workspace consults the guard before initialize()."""
+
+    @pytest.mark.asyncio
+    async def test_fresh_backend_still_initializes(self):
+        mock_remote = MagicMock()
+        mock_remote.connect = MagicMock()
+        mock_remote.supports_shell = True
+        mock_remote.exists = MagicMock(return_value=False)
+        mock_remote.list_dir = MagicMock(return_value=[])
+
+        cfg = _make_config(
+            ws_backend="sandbox",
+            ws_remote={"host": "10.0.0.1", "port": 22, "key_path": "/key"},
+        )
+        session = _make_session(config=cfg)
+        with (
+            patch("src.api.persistent_session.WorkspaceManager") as MockWM,
+            patch("src.api.persistent_session.WorkspaceManagerConfig"),
+            patch.dict(
+                "sys.modules",
+                {
+                    "src.core.backends.remote": MagicMock(
+                        RemoteBackend=MagicMock(return_value=mock_remote)
+                    )
+                },
+            ),
+        ):
+            MockWM.return_value.path = "/tmp/test"
+            MockWM.return_value.initialize = MagicMock()
+            await session._setup_workspace()
+            MockWM.return_value.initialize.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_content_bearing_backend_skips_initialize(self):
+        mock_remote = MagicMock()
+        mock_remote.connect = MagicMock()
+        mock_remote.supports_shell = True
+        mock_remote.exists = MagicMock(return_value=True)
+
+        cfg = _make_config(
+            ws_backend="sandbox",
+            ws_remote={"host": "10.0.0.1", "port": 22, "key_path": "/key"},
+        )
+        session = _make_session(config=cfg)
+        with (
+            patch("src.api.persistent_session.WorkspaceManager") as MockWM,
+            patch("src.api.persistent_session.WorkspaceManagerConfig"),
+            patch.dict(
+                "sys.modules",
+                {
+                    "src.core.backends.remote": MagicMock(
+                        RemoteBackend=MagicMock(return_value=mock_remote)
+                    )
+                },
+            ),
+        ):
+            MockWM.return_value.path = "/tmp/test"
+            MockWM.return_value.initialize = MagicMock()
+            await session._setup_workspace()
+            MockWM.return_value.initialize.assert_not_called()
+
+
 # ---------------------------------------------------------------------------
 # 2.4.1 _setup_cloud_mount() — protected overlay-failure fail-safe (F-M6)
 # ---------------------------------------------------------------------------

@@ -157,6 +157,11 @@ _CANVAS_SKILL_MANIFEST_OWNER = "srw-present-with-canvas-v1"
 # value instead of sleeping through the real 60s.
 _CLOUD_OVERLAY_MONITOR_INTERVAL_SECONDS = 60.0
 
+# Entries that can exist in a genuinely-fresh workspace root and must not
+# make the attach guard treat it as content-bearing (ext4 PVCs grow a
+# lost+found at mount).
+_BENIGN_WORKSPACE_ENTRIES = frozenset({"lost+found"})
+
 
 def _fleet_management_enabled(config: Any) -> bool:
     """Return whether SRW control-plane tools should be exposed.
@@ -549,11 +554,105 @@ class PersistentSession:
             config=ws_config,
             backend=workspace_backend,
         )
-        self.workspace_manager.initialize()
+        preserve_path = self._attach_existing_workspace(
+            workspace_backend, git_remote_url
+        )
+        if preserve_path:
+            logger.info(
+                f"[thread {self.thread_id}] session_workspace_init_path="
+                f"{preserve_path} — existing content preserved (no wipe, no clone)"
+            )
+        else:
+            logger.info(f"[thread {self.thread_id}] session_workspace_init_path=fresh")
+            self.workspace_manager.initialize()
         self._deploy_instruction_files()
         logger.info(
             f"Workspace created at {self.workspace_manager.path} (backend=remote)"
         )
+
+    def _attach_existing_workspace(
+        self, backend: Any, git_remote_url: Optional[str]
+    ) -> Optional[str]:
+        """Content probe ported from the job path's reattach guard.
+
+        ``WorkspaceManager.initialize()`` empties the workspace root before
+        cloning (``git clone`` needs an empty target). Session workspaces are
+        PVC-backed and orchestrator-restored, so on attach any existing
+        content belongs to THIS thread and must be preserved — the thread's
+        Gitea repo only ever holds the scaffold, so the wipe is unrecoverable
+        (docs/issues/session_workspace_wiped_by_agent_clone_on_attach.md).
+
+        Mirrors ``src/agent.py``'s G2 reattach + resume-existing branches: a
+        ``.git`` tree gets a git handle attached in place (no clone, no
+        wipe); a git-less but content-bearing root gets git initialized
+        around it (the clone inside ``_initialize_git`` fails on a non-empty
+        target and falls back to ``git init``, same as the job path). Probe
+        failures count as content: wrongly skipping the wipe degrades git,
+        wrongly wiping loses user data.
+
+        Returns the preserve path taken (for logging), or None when the root
+        is genuinely empty and the caller should run ``initialize()``.
+        """
+        if not getattr(backend, "supports_shell", False):
+            return None
+
+        has_git: Optional[bool]
+        try:
+            has_git = backend.exists(".git")
+        except Exception as e:
+            logger.warning(
+                f"[thread {self.thread_id}] workspace .git probe failed "
+                f"(treating as content-bearing, skipping init): {e}"
+            )
+            has_git = None
+
+        if has_git is False:
+            entries: Optional[List[str]]
+            try:
+                entries = [
+                    name
+                    for name in backend.list_dir("")
+                    if name not in _BENIGN_WORKSPACE_ENTRIES
+                ]
+            except Exception as e:
+                logger.warning(
+                    f"[thread {self.thread_id}] workspace content probe failed "
+                    f"(treating as content-bearing, skipping init): {e}"
+                )
+                entries = None
+            if entries is not None and not entries:
+                return None
+
+            # Content-bearing but git-less (e.g. uploads landed before first
+            # attach, or a partial restore): initialize git around the
+            # existing files instead of wiping them.
+            if (
+                self.workspace_manager.config.git_versioning
+                and self.workspace_manager.git_manager is None
+            ):
+                self.workspace_manager._initialize_git()
+            for subdir in self.workspace_manager.config.structure:
+                try:
+                    backend.mkdir(subdir)
+                except Exception:
+                    pass
+            self.workspace_manager._initialized = True
+            return "attach-content"
+
+        # `.git` present (or unknowable): attach a handle to the existing
+        # repo — no clone (the dir is non-empty), no rm -rf.
+        if (
+            self.workspace_manager.config.git_versioning
+            and self.workspace_manager.git_manager is None
+        ):
+            from ..managers.git_manager import GitManager
+
+            git_mgr = GitManager(self.workspace_manager.path, backend=backend)
+            self.workspace_manager._git_manager = git_mgr
+            if git_remote_url:
+                git_mgr.add_remote("origin", git_remote_url)
+        self.workspace_manager._initialized = True
+        return "reattach"
 
     async def _setup_cloud_mount(
         self, cloud_mount_cfg: Optional[Dict[str, Any]]
