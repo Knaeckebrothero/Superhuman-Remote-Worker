@@ -1,6 +1,28 @@
 # Session workspace wiped by the agent's `rm -rf` + clone on every attach
 
-**Status: OPEN.** Diagnosed 2026-08-04 on the dev cluster. The durability half
+**Status: FIXED 2026-08-06 (batch #2) + live-verified on k3d.** The job path's
+content-probe guard is ported to the session attach path as
+`PersistentSession._attach_existing_workspace` (src/api/persistent_session.py):
+on every attach it probes the REAL backend before `initialize()` —
+`.git` present → attach a git handle in place (no wipe, no clone);
+git-less but content-bearing (probed via `list_dir` minus `lost+found`;
+covers pre-attach uploads and partial restores) → `_initialize_git()` around
+the existing files; genuinely empty → the old fresh `initialize()` (clone).
+Probe failures fail SAFE toward preserving (a wrong skip degrades git; a
+wrong wipe loses user data). Both of `initialize()`'s `rm -rf` sites are now
+unreachable for content-bearing session workspaces; the lite/virtual branch
+never armed them (no shell). Observability: every attach logs
+`session_workspace_init_path=fresh|reattach|attach-content`.
+Tests: `TestAttachExistingWorkspaceGuard` + `TestSetupWorkspaceGuardWiring`
+(tests/test_persistent_session.py). Live k3d proof (thread `1131cea3`):
+fresh session logged `=fresh` + cloned the scaffold; a probe file written to
+the workspace survived agent-pod delete → orphan-sweep `ended` → resume →
+new pod logged `=reattach — existing content preserved (no wipe, no clone)`
+and the file was intact — the exact end/resume cycle that wiped the field
+case. Residual gaps below (node loss, single S3 snapshot key, sandbox-tier
+uploads, PAT-on-PVC) remain open and are unchanged by this fix.
+
+**Originally: OPEN.** Diagnosed 2026-08-04 on the dev cluster. The durability half
 (PVC-backed session workspaces) shipped in `52c1ba80` and is live; **this bug is
 not fixed and now empties a durable volume instead of an ephemeral one.**
 
