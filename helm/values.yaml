@@ -208,8 +208,13 @@ orchestrator:
 # collector and shadow reconciliation without publishing customer usage.
 infrastructureMetering:
   v2ReadsEnabled: false
+  sourceAwareReadsEnabled: false
   collectorEnabled: false
   shadowEnabled: false
+  # Enables the authenticated one-shot fleet-admin cutover request surface.
+  # It does not choose a barrier automatically and may be disabled again after
+  # the durable state reaches active.
+  cutoverEnabled: false
   publicationEnabled: false
   # Stable operator-owned installation identity. Required before collection or
   # publication; it must survive endpoint and credential rotation.

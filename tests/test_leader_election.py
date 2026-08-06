@@ -58,10 +58,23 @@ async def test_run_as_leader_sets_then_clears(pg_dsn):
     db = _FakeDB(pool)
     leader_election.is_leader.clear()
     shutdown = asyncio.Event()
-    task = asyncio.create_task(leader_election.run_as_leader(db, LEADER_ID, shutdown))
+
+    async def allocate_generation(conn):
+        assert await conn.fetchval("SELECT 1") == 1
+        return 7
+
+    task = asyncio.create_task(
+        leader_election.run_as_leader(
+            db,
+            LEADER_ID,
+            shutdown,
+            on_acquired=allocate_generation,
+        )
+    )
     try:
         await asyncio.wait_for(leader_election.is_leader.wait(), timeout=15)
         assert leader_election.is_leader.is_set()
+        assert leader_election.get_leader_generation() == 7
         # The lock is genuinely held: an independent connection cannot acquire it.
         probe = await asyncpg.connect(pg_dsn)
         try:
@@ -73,6 +86,7 @@ async def test_run_as_leader_sets_then_clears(pg_dsn):
         shutdown.set()
         await asyncio.wait_for(task, timeout=15)
     assert not leader_election.is_leader.is_set()
+    assert leader_election.get_leader_generation() is None
     await pool.close()
 
 

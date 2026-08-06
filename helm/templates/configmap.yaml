@@ -1,6 +1,9 @@
 {{- if and .Values.infrastructureMetering.shadowEnabled (not .Values.infrastructureMetering.collectorEnabled) }}
 {{- fail "infrastructureMetering.shadowEnabled requires collectorEnabled" }}
 {{- end }}
+{{- if and .Values.infrastructureMetering.sourceAwareReadsEnabled (not .Values.infrastructureMetering.v2ReadsEnabled) }}
+{{- fail "infrastructureMetering.sourceAwareReadsEnabled requires v2ReadsEnabled" }}
+{{- end }}
 {{- if and .Values.infrastructureMetering.collectorEnabled (not .Values.infrastructureMetering.stableClusterId) }}
 {{- fail "infrastructureMetering.collectorEnabled requires stableClusterId" }}
 {{- end }}
@@ -25,6 +28,17 @@
 {{- end }}
 {{- if not .Values.infrastructureMetering.stableClusterId }}
 {{- fail "infrastructureMetering.publicationEnabled requires stableClusterId" }}
+{{- end }}
+{{- end }}
+{{- if or .Values.infrastructureMetering.cutoverEnabled .Values.infrastructureMetering.sourceAwareReadsEnabled }}
+{{- if not .Values.infrastructureMetering.collectorEnabled }}
+{{- fail "infrastructureMetering cutover/source-aware reads require collectorEnabled" }}
+{{- end }}
+{{- if not .Values.infrastructureMetering.shadowEnabled }}
+{{- fail "infrastructureMetering cutover/source-aware reads require shadowEnabled" }}
+{{- end }}
+{{- if not .Values.infrastructureMetering.stableClusterId }}
+{{- fail "infrastructureMetering cutover/source-aware reads require stableClusterId" }}
 {{- end }}
 {{- end }}
 apiVersion: v1
@@ -264,8 +278,10 @@ data:
   AUTO_ASSIGN_ENABLED: {{ .Values.orchestrator.autoAssignEnabled | quote }}
   # Infrastructure metering gates and bounded Slice 1 collection settings.
   INFRASTRUCTURE_METERING_V2_READS_ENABLED: {{ .Values.infrastructureMetering.v2ReadsEnabled | default false | quote }}
+  INFRASTRUCTURE_METERING_SOURCE_AWARE_READS_ENABLED: {{ .Values.infrastructureMetering.sourceAwareReadsEnabled | default false | quote }}
   INFRASTRUCTURE_METERING_COLLECTOR_ENABLED: {{ .Values.infrastructureMetering.collectorEnabled | default false | quote }}
   INFRASTRUCTURE_METERING_SHADOW_ENABLED: {{ .Values.infrastructureMetering.shadowEnabled | default false | quote }}
+  INFRASTRUCTURE_METERING_CUTOVER_ENABLED: {{ .Values.infrastructureMetering.cutoverEnabled | default false | quote }}
   INFRASTRUCTURE_METERING_PUBLICATION_ENABLED: {{ .Values.infrastructureMetering.publicationEnabled | default false | quote }}
   INFRASTRUCTURE_METERING_STABLE_CLUSTER_ID: {{ .Values.infrastructureMetering.stableClusterId | default "" | quote }}
   INFRASTRUCTURE_METERING_DEPLOYMENT_MODE: {{ .Values.infrastructureMetering.deploymentMode | default "dedicated" | quote }}

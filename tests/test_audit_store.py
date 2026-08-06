@@ -37,6 +37,8 @@ from orchestrator.services.infrastructure_metering.materializer import (  # noqa
     build_usage_plan,
 )
 from orchestrator.services.usage_ledger import (  # noqa: E402
+    StrictUsageConflict,
+    StrictUsageExpectation,
     UsageEvent,
     UsageLedger,
     UsageRates,
@@ -914,6 +916,142 @@ class TestUsageLedger:
                 )
                 == 1
             )
+
+    async def test_strict_legacy_batch_insert_replay_and_conflict(self, pg_dsn):
+        async with _audit_pool(pg_dsn) as pool:
+            ledger = UsageLedger(pool, UsageRates(None))
+            now = datetime.now(timezone.utc)
+            user_id, project_id, job_id = uuid4(), uuid4(), uuid4()
+
+            def expectation(
+                *,
+                source_id: str,
+                unit: str,
+                quantity: Decimal,
+                rate_usd: Decimal,
+                cost_usd: Decimal,
+            ) -> StrictUsageExpectation:
+                fields = {
+                    "ts": now,
+                    "user_id": user_id,
+                    "project_id": project_id,
+                    "ref_kind": "job",
+                    "ref_id": job_id,
+                    "category": "compute",
+                    "resource": "workspace_pod",
+                    "quantity": quantity,
+                    "unit": unit,
+                    "rate_usd": rate_usd,
+                    "cost_usd": cost_usd,
+                    "source": "orchestrator",
+                    "source_id": source_id,
+                    "details": {
+                        "duration_h": "1.000000",
+                        "metering_path": "legacy-cutover",
+                    },
+                }
+                return StrictUsageExpectation(
+                    source="orchestrator",
+                    source_id=source_id,
+                    unit=unit,
+                    ts=now,
+                    expected_fields=fields,
+                )
+
+            source_id = f"workspace:{job_id}"
+            expected = [
+                expectation(
+                    source_id=source_id,
+                    unit="vcpu-hour",
+                    quantity=Decimal("2"),
+                    rate_usd=Decimal("0.10"),
+                    cost_usd=Decimal("0.20"),
+                ),
+                expectation(
+                    source_id=source_id,
+                    unit="gib-hour",
+                    quantity=Decimal("4"),
+                    rate_usd=Decimal("0.02"),
+                    cost_usd=Decimal("0.08"),
+                ),
+            ]
+
+            first = await ledger.publish_expected_events(expected)
+            replay = await ledger.publish_expected_events(expected)
+
+            assert (first.expected, first.inserted, first.verified) == (2, 2, 2)
+            assert (replay.expected, replay.inserted, replay.verified) == (2, 0, 2)
+            rows = await pool.fetch(
+                "SELECT unit, quantity, rate_usd, cost_usd, event_kind, "
+                "payload_hash FROM usage_events "
+                "WHERE source='orchestrator' AND source_id=$1 ORDER BY unit",
+                source_id,
+            )
+            assert [
+                (
+                    row["unit"],
+                    row["quantity"],
+                    row["rate_usd"],
+                    row["cost_usd"],
+                    row["event_kind"],
+                    row["payload_hash"],
+                )
+                for row in rows
+            ] == [
+                (
+                    "gib-hour",
+                    Decimal("4"),
+                    Decimal("0.02"),
+                    Decimal("0.08"),
+                    None,
+                    None,
+                ),
+                (
+                    "vcpu-hour",
+                    Decimal("2"),
+                    Decimal("0.10"),
+                    Decimal("0.20"),
+                    None,
+                    None,
+                ),
+            ]
+
+            conflicting_fields = dict(expected[0].expected_fields)
+            conflicting_fields["quantity"] = Decimal("3")
+            conflict = StrictUsageExpectation(
+                source=expected[0].source,
+                source_id=expected[0].source_id,
+                unit=expected[0].unit,
+                ts=expected[0].ts,
+                expected_fields=conflicting_fields,
+            )
+            fresh_source_id = f"workspace:{uuid4()}"
+            fresh = expectation(
+                source_id=fresh_source_id,
+                unit="vcpu-hour",
+                quantity=Decimal("1"),
+                rate_usd=Decimal("0.10"),
+                cost_usd=Decimal("0.10"),
+            )
+
+            with pytest.raises(StrictUsageConflict, match="quantity"):
+                await ledger.publish_expected_events([fresh, conflict])
+
+            assert (
+                await pool.fetchval(
+                    "SELECT count(*) FROM usage_events "
+                    "WHERE source='orchestrator' AND source_id=$1",
+                    fresh_source_id,
+                )
+                == 0
+            )
+            assert await pool.fetchval(
+                "SELECT quantity FROM usage_events "
+                "WHERE source='orchestrator' AND source_id=$1 "
+                "AND unit='vcpu-hour' AND ts=$2",
+                source_id,
+                now,
+            ) == Decimal("2")
 
     async def test_rate_snapshot(self, pg_dsn):
         async with _audit_pool(pg_dsn) as pool:

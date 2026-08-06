@@ -6,6 +6,7 @@ from uuid import uuid4
 import pytest
 
 from orchestrator.services.infrastructure_metering.inventory import (
+    _RECONCILIATION_COUNTS_SQL,
     InventoryContractError,
     InventoryItem,
     InventoryPurgeResult,
@@ -24,6 +25,14 @@ from orchestrator.services.infrastructure_metering.inventory import (
 
 
 NOW = datetime(2026, 8, 5, 12, 0, tzinfo=timezone.utc)
+
+
+def test_pending_items_only_exclude_explicit_not_applicable_comparisons() -> None:
+    compact = " ".join(_RECONCILIATION_COUNTS_SQL.split())
+
+    assert "LEFT JOIN resource_inventory_shadow_comparisons" in compact
+    assert "comparison.status IS NULL" in compact
+    assert "comparison.status <> 'not-applicable'" in compact
 
 
 def _valid(uid: str, revision: str = "a" * 64) -> InventoryItem:
@@ -159,13 +168,48 @@ def test_shadow_comparison_preserves_and_validates_lifetime_evidence() -> None:
     assert payload["observed_started_at"] == NOW.isoformat()
     assert payload["start_delta_us"] == 5_000_000
 
-    with pytest.raises(InventoryContractError, match="remain unexplained"):
+    bounded = ShadowComparison(
+        source_uid="pod-1",
+        status=ShadowComparisonStatus.LIFETIME_MISMATCH,
+        reason_code="bounded-start-semantics",
+        explained=True,
+        comparison_at=NOW,
+        owner_trusted=True,
+        owner_kind="job",
+        owner_id=uuid4(),
+        legacy_interval_id=8,
+        legacy_cpu_millicores=500,
+        legacy_memory_bytes=1024,
+        legacy_started_at=legacy_started_at,
+        observed_cpu_millicores=500,
+        observed_memory_bytes=1024,
+        observed_started_at=NOW,
+        observed_start_time_source="app-db-received",
+        observed_start_uncertainty_us=5_000_000,
+        start_delta_us=5_000_000,
+    )
+    assert bounded.explained is True
+
+    with pytest.raises(InventoryContractError, match="bounded start evidence"):
         ShadowComparison(
             source_uid="pod-1",
             status=ShadowComparisonStatus.LIFETIME_MISMATCH,
-            reason_code="start-semantics",
+            reason_code="bounded-start-semantics",
             explained=True,
             comparison_at=NOW,
+            owner_trusted=True,
+            owner_kind="job",
+            owner_id=uuid4(),
+            legacy_interval_id=9,
+            legacy_cpu_millicores=500,
+            legacy_memory_bytes=1024,
+            legacy_started_at=legacy_started_at,
+            observed_cpu_millicores=500,
+            observed_memory_bytes=1024,
+            observed_started_at=NOW,
+            observed_start_time_source="app-db-received",
+            observed_start_uncertainty_us=4_999_999,
+            start_delta_us=5_000_000,
         )
 
 

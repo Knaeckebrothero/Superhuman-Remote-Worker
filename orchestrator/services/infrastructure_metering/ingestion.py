@@ -466,7 +466,11 @@ class InfrastructureIngestionService:
         )
         lifecycle = {} if item is None else item.normalized_item.get("lifecycle", {})
         terminal = isinstance(lifecycle, dict) and lifecycle.get("terminal") is True
-        event_kind = WatchEventKind(observation.event_type)
+        # Kubernetes' watch API uses uppercase wire event names, while the
+        # durable inventory model stores canonical lowercase values.  Resolve
+        # the already-Literal-validated wire value by enum member name rather
+        # than trying to parse it as the enum's persisted value.
+        event_kind = WatchEventKind[observation.event_type]
         event = WatchObjectEvent(
             event_type=event_kind,
             resource_version=observation.resource_version,
@@ -596,6 +600,7 @@ async def run_inventory_generation_loop(
     stop: asyncio.Event,
     store: InventoryStore,
     *,
+    generation: int | None = None,
     cleanup_interval_seconds: float = 300.0,
     snapshot_item_retention: timedelta = timedelta(days=7),
     diagnostic_retention: timedelta = timedelta(days=35),
@@ -610,7 +615,7 @@ async def run_inventory_generation_loop(
 
     if cleanup_interval_seconds <= 0:
         raise ValueError("cleanup interval must be positive")
-    generation = await store.activate_generation()
+    generation = await store.activate_generation(generation)
     logger.info(
         "infrastructure inventory generation activated generation=%s", generation
     )

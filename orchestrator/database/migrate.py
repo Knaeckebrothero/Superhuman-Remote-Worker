@@ -1,6 +1,6 @@
 """SQL migration runner.
 
-Apply numbered SQL files from ``orchestrator/database/migrations/{app,vector}/``
+Apply versioned SQL files from ``orchestrator/database/migrations/{app,vector}/``
 in lexicographic order, tracked in a ``schema_migrations`` table on each DB.
 Design rationale and operational runbook live in ``docs/db_migration.md``.
 """
@@ -70,10 +70,21 @@ def _is_notx(path: Path) -> bool:
 
 
 def discover(migrations_dir: Path) -> list[Path]:
-    """List migrations in apply order. Reject obviously malformed names early."""
+    """List migrations in apply order. Reject duplicate versions early.
+
+    Normal migrations use ``NNNN_``.  A lowercase suffix (``NNNNa_``) is an
+    exceptional interstitial version used only to repair an immutable later
+    migration for databases that have not reached it yet.  The interstitial
+    itself must also be safe when discovered by databases already past it.
+    """
     if not migrations_dir.is_dir():
         raise RuntimeError(f"migrations dir not found: {migrations_dir}")
-    files = sorted(migrations_dir.glob("[0-9][0-9][0-9][0-9]_*.sql"))
+    files = sorted(
+        (
+            *migrations_dir.glob("[0-9][0-9][0-9][0-9]_*.sql"),
+            *migrations_dir.glob("[0-9][0-9][0-9][0-9][a-z]_*.sql"),
+        )
+    )
     seen: dict[str, Path] = {}
     for path in files:
         prefix = path.name.split("_", 1)[0]
