@@ -114,6 +114,28 @@ orchestrator:
   pdb:
     minAvailable: 1
 # -----------------------------------------------------------------------------
+# Infrastructure allocation metering — Slice 1 inventory-only soak
+# -----------------------------------------------------------------------------
+# The collector may inventory Pods but cannot publish usage while shadow and
+# publication remain disabled. The stable identity must survive chart/image
+# rotations. The ingestion Secret is operator-managed out of band so ESO does
+# not overwrite it while syncing the main application Secret from Vault.
+infrastructureMetering:
+  v2ReadsEnabled: false
+  collectorEnabled: true
+  shadowEnabled: false
+  publicationEnabled: false
+  stableClusterId: "srw-main-dev"
+  ingestionSecretName: "srw-infra-metering-ingestion"
+  networkPolicy:
+    enabled: true
+    allowUnrestrictedEgress: false
+    apiServerCidrs:
+      - "10.43.0.1/32"
+      - "10.0.50.101/32"
+      - "10.0.50.102/32"
+      - "10.0.50.103/32"
+# -----------------------------------------------------------------------------
 # Secrets — External Secrets Operator (Vault-backed)
 # -----------------------------------------------------------------------------
 externalSecrets:
