@@ -12854,10 +12854,14 @@ class PostgresDB:
         """Return active IDE-enabled workspaces (jobs + threads).
 
         Used by the code-server settings sweeper to know which workspaces to pull
-        config from. A workspace counts as active when it has a ready container,
-        a ready VM, or an active/idle restored IDE session. Each row is
-        ``{"entity_type", "id", "user_id", "context"}``; ``context`` is the raw
-        JSONB (jobs.context / threads.metadata) and may be a JSON string.
+        config from. A workspace counts as active when its parent job/thread is
+        non-terminal AND it has a ready container, a ready VM, or an active/idle
+        restored IDE session. The parent-status gate keeps stale JSONB on
+        terminal parents (e.g. a pod that died without a teardown clearing
+        ``workspace_container.status``) from re-entering the sweep forever. Each
+        row is ``{"entity_type", "id", "user_id", "context"}``; ``context`` is
+        the raw JSONB (jobs.context / threads.metadata) and may be a JSON
+        string.
         """
         out: List[Dict[str, Any]] = []
         async with self.acquire() as conn:
@@ -12865,9 +12869,10 @@ class PostgresDB:
                 """
                 SELECT id, user_id, context
                 FROM jobs
-                WHERE context->'ide_session'->>'status' IN ('active', 'idle')
-                   OR context->'workspace_container'->>'status' = 'ready'
-                   OR context->'vm'->>'status' = 'ready'
+                WHERE status NOT IN ('completed', 'failed', 'cancelled')
+                  AND (context->'ide_session'->>'status' IN ('active', 'idle')
+                       OR context->'workspace_container'->>'status' = 'ready'
+                       OR context->'vm'->>'status' = 'ready')
                 """
             )
             for r in job_rows:
@@ -12883,9 +12888,10 @@ class PostgresDB:
                 """
                 SELECT id, user_id, metadata
                 FROM threads
-                WHERE metadata->'ide_session'->>'status' IN ('active', 'idle')
-                   OR metadata->'workspace_container'->>'status' = 'ready'
-                   OR metadata->'vm'->>'status' = 'ready'
+                WHERE status NOT IN ('ended', 'deleted')
+                  AND (metadata->'ide_session'->>'status' IN ('active', 'idle')
+                       OR metadata->'workspace_container'->>'status' = 'ready'
+                       OR metadata->'vm'->>'status' = 'ready')
                 """
             )
             for r in thread_rows:

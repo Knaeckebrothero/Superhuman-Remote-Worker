@@ -498,6 +498,75 @@ def _coerce_context(context: Any) -> dict:
     return context or {}
 
 
+async def evict_dead_workspaces(
+    workspaces: list[dict], provisioner: Any, db: Any
+) -> list[dict]:
+    """Drop container-backed worklist rows whose workspace pod is confirmed dead.
+
+    The worklist selects on JSONB workspace status, which can stay ``'ready'``
+    forever when a pod dies without a teardown clearing it. Before the sweeper
+    serially SSH-dials each row, probe container-backed entries (those whose
+    ``workspace_container`` carries a ``pod_name``/``pod_ip``) via
+    ``provisioner.workspace_pod_live``: a confirmed-dead pod (``False``) gets
+    ``{"status": "deleted", "pod_ip": None}`` merged into its entity's
+    ``workspace_container`` context — so it drops out of the next worklist —
+    and the row is evicted from this cycle. ``True``/``None`` (alive / can't
+    tell) keeps the row; VM-backed rows pass through untouched. Any error while
+    probing a row keeps it — the evictor must never abort the sweep.
+    """
+    from services.workspace_lifecycle import WorkspaceOwner
+
+    kept: list[dict] = []
+    for ws in workspaces:
+        entity_type = ws.get("entity_type")
+        try:
+            container = _coerce_context(ws.get("context")).get("workspace_container")
+            if not isinstance(container, dict) or not (
+                container.get("pod_name") or container.get("pod_ip")
+            ):
+                kept.append(ws)
+                continue
+            owner = (
+                WorkspaceOwner.job(str(ws["id"]))
+                if entity_type == "job"
+                else WorkspaceOwner.session(str(ws["id"]))
+            )
+            live = await provisioner.workspace_pod_live(owner)
+        except Exception as e:  # noqa: BLE001 — a probe blip must not kill the sweep
+            logger.warning(
+                "ide_settings: liveness probe failed for %s %s — keeping row (%s)",
+                entity_type,
+                ws.get("id"),
+                e,
+            )
+            kept.append(ws)
+            continue
+        if live is False:
+            logger.warning(
+                "ide_settings: evicting %s %s from sweep — workspace pod confirmed "
+                "dead; clearing stale container status",
+                entity_type,
+                ws.get("id"),
+            )
+            updates = {"status": "deleted", "pod_ip": None}
+            try:
+                if entity_type == "job":
+                    await db.merge_workspace_container_context(str(ws["id"]), updates)
+                else:
+                    await db.merge_thread_workspace_context(str(ws["id"]), updates)
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    "ide_settings: failed to clear stale container context for "
+                    "%s %s — %s",
+                    entity_type,
+                    ws.get("id"),
+                    e,
+                )
+        else:
+            kept.append(ws)
+    return kept
+
+
 async def reconcile_ide_settings(
     store: IdeSettingsStore, workspaces: list[dict], pull_fn: PullFn
 ) -> int:
