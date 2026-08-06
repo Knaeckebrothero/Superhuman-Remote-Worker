@@ -1,6 +1,9 @@
 # Cloud-equivalent usage pricing
 
-Status: implemented in the working tree (2026-08-05); deployment pending
+Status: v1 implemented and deployed. The typed infrastructure successor is
+implemented through Slice 2/app migration `0102`, but remains dark-launched;
+the serving cloud cards still price only the active v1 aggregate workspace
+quantities.
 
 ## Why
 
@@ -107,11 +110,26 @@ aggregate workspace quantities. In particular:
   per-Pod, per-VM, or per-disk minimum/tier exactly.
 
 Do not add VM, PVC, PV, agent, or platform rows to these wildcard cards. The
-implementation-ready successor design in
+typed successor substrate in
 [`infrastructure_resource_metering.md`](infrastructure_resource_metering.md)
-adds typed resource classes, half-open periods, retained lifecycle identity,
-price provenance, estimate quality, and code-versioned provider calculators.
-Those changes must land before cards claim coverage of the new resource types.
+now provides typed resource classes, half-open workspace-Pod periods, retained
+lifecycle identity, price provenance, estimate quality, and code-versioned
+calculator contracts. PVC/PV collection and lifecycle code now exists behind
+Slice 2's dark-launch gates; agent/VM collection does not. Pricing coverage must
+still not expand until the relevant inventory has completed shadow validation,
+publication/source-aware reads are deliberately activated, and a provider
+adapter is tested for that exact resource class.
+
+**Current integration state (2026-08-06):** `/api/usage` and its v1 cards remain
+authoritative. `/api/usage/v2`, typed calculators, the Slice 1 workspace-Pod
+path, and Slice 2 PVC/PV quantity paths are implemented, but v2 reads,
+source-aware reads, cutover, and publication are disabled. Slice 2's immutable
+operator registry maps only exact `(cluster, StorageClass, CSI driver, volume
+mode)` selectors. No collector-supplied parameters can select a price, and an
+unmapped volume is forced unpriced. The local k3d PVC/PV inventory/shadow gate
+has passed, but no storage quantities were published or added to the serving
+cards. Provider storage rate cards and fixtures remain Slice 5; VM pricing
+remains downstream of Slice 3.
 
 ## Exclusions and follow-ups
 
@@ -125,9 +143,10 @@ idle/overhead cost.
 
 Useful follow-ups:
 
-1. Add separate PVC-requested `gib-hour`/`claim-hour` and PV-provisioned
-   `gib-hour`/`volume-hour` events plus typed storage rate components; derive
-   GiB-month only as a display normalization.
+1. Shadow-validate and activate the implemented PVC-requested
+   `gib-hour`/`claim-hour` and PV-provisioned `gib-hour`/`volume-hour` paths, then
+   add typed provider storage-rate components; derive GiB-month only as a
+   display normalization.
 2. Meter persistent agent and VM workspace intervals.
 3. Add an admin rate-card editor and optional homelab amortization/power card.
 4. Add a separate shared-platform baseline view for control plane and always-on

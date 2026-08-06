@@ -167,6 +167,82 @@ def test_plan_splits_on_any_unit_rate_boundary_and_snapshots_free_rate() -> None
     assert rows["gib-hour"]["cost_usd"] == "0"
 
 
+def test_unmapped_physical_volume_is_forcibly_unpriced() -> None:
+    rates = (
+        _rate(
+            "73000000-0000-0000-0000-000000000007",
+            "gib-hour",
+            "999",
+            START - timedelta(days=1),
+        ),
+        _rate(
+            "74000000-0000-0000-0000-000000000007",
+            "volume-hour",
+            "999",
+            START - timedelta(days=1),
+        ),
+    )
+    plan = build_usage_plan(
+        _interval(
+            source_kind="volume",
+            category="storage",
+            resource="unmapped_block_volume",
+            measurement_basis="volume-provisioned",
+            cost_domain="physical-asset",
+            resource_class="persistent-volume",
+            cpu_millicores=None,
+            memory_bytes=None,
+            storage_bytes=4 * 1024**3,
+        ),
+        rates,
+        creator_generation=7,
+        plan_id=PLAN_ID,
+    )
+
+    assert plan is not None
+    assert {event.event.payload["unit"] for event in plan.events} == {
+        "gib-hour",
+        "volume-hour",
+    }
+    for event in plan.events:
+        assert event.canonical_rate_version_id is None
+        assert event.event.payload["rate_usd"] is None
+        assert event.event.payload["cost_usd"] is None
+
+
+def test_mapped_physical_volume_requires_and_exports_rule_provenance() -> None:
+    interval = _interval(
+        source_kind="volume",
+        category="storage",
+        resource="block_volume_local_path",
+        measurement_basis="volume-provisioned",
+        cost_domain="physical-asset",
+        resource_class="persistent-volume",
+        cpu_millicores=None,
+        memory_bytes=None,
+        storage_bytes=4 * 1024**3,
+        details={
+            "mapping_version": "local-v1",
+            "mapping_fingerprint": "b" * 64,
+            "storage_asset_id": str(INTERVAL_ID),
+        },
+    )
+    plan = build_usage_plan(interval, (), creator_generation=7, plan_id=PLAN_ID)
+
+    assert plan is not None
+    for event in plan.events:
+        assert event.event.payload["details"]["mapping_version"] == "local-v1"
+        assert event.event.payload["details"]["mapping_fingerprint"] == "b" * 64
+
+    with pytest.raises(PublicationContractError, match="mapping provenance"):
+        build_usage_plan(
+            {**interval, "details": {}},
+            (),
+            creator_generation=7,
+            plan_id=PLAN_ID,
+        )
+
+
 def test_open_interval_publishes_only_complete_confirmed_utc_days() -> None:
     open_row = _interval(
         started_at=datetime(2026, 8, 5, tzinfo=UTC),

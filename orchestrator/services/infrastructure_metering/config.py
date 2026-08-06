@@ -4,12 +4,20 @@ from __future__ import annotations
 
 import os
 import re
+import json
 from dataclasses import dataclass
 from typing import Literal, Mapping
+
+from .storage_mapping import (
+    StorageResourceMappingContractError,
+    StorageResourceMappingRule,
+    validate_storage_resource_mapping_set,
+)
 
 _TRUE = frozenset({"1", "true", "yes", "on"})
 _FALSE = frozenset({"", "0", "false", "no", "off"})
 _STABLE_CLUSTER_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+_VOLUME_IDENTITY_KEY_VERSION = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$")
 _KUBERNETES_NAMESPACE = re.compile(r"^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$")
 
 
@@ -54,6 +62,61 @@ def _namespace_allowlist(source: Mapping[str, str]) -> tuple[str, ...]:
     return namespaces
 
 
+def _volume_resource_mappings(
+    source: Mapping[str, str],
+    *,
+    source_cluster: str,
+) -> tuple[StorageResourceMappingRule, ...]:
+    name = "INFRASTRUCTURE_METERING_VOLUME_RESOURCE_MAPPINGS_JSON"
+    raw = source.get(name, "[]").strip() or "[]"
+    if len(raw.encode("utf-8")) > 65_536:
+        raise ValueError(f"{name} must be at most 65536 UTF-8 bytes")
+    try:
+        decoded = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{name} must be valid JSON") from exc
+    if not isinstance(decoded, list) or len(decoded) > 100:
+        raise ValueError(f"{name} must be an array with at most 100 rules")
+    if decoded and not source_cluster:
+        raise ValueError(f"{name} requires a stable cluster id")
+    expected = {
+        "mappingVersion",
+        "storageClass",
+        "csiDriver",
+        "volumeMode",
+        "resource",
+    }
+    rules: list[StorageResourceMappingRule] = []
+    for index, item in enumerate(decoded):
+        if not isinstance(item, dict) or set(item) != expected:
+            raise ValueError(
+                f"{name}[{index}] must contain exactly: " + ", ".join(sorted(expected))
+            )
+        storage_class = item["storageClass"]
+        csi_driver = item["csiDriver"]
+        if storage_class == "":
+            storage_class = None
+        if csi_driver == "":
+            csi_driver = None
+        try:
+            rules.append(
+                StorageResourceMappingRule(
+                    source_cluster=source_cluster,
+                    storage_class_name=storage_class,
+                    csi_driver=csi_driver,
+                    volume_mode=item["volumeMode"],
+                    resource=item["resource"],
+                    mapping_version=item["mappingVersion"],
+                )
+            )
+        except (StorageResourceMappingContractError, TypeError) as exc:
+            raise ValueError(f"{name}[{index}] is invalid: {exc}") from exc
+    try:
+        return validate_storage_resource_mapping_set(rules)
+    except StorageResourceMappingContractError as exc:
+        raise ValueError(f"{name} is invalid: {exc}") from exc
+
+
 @dataclass(frozen=True)
 class InfrastructureMeteringSettings:
     """Independent dark-launch gates; every gate defaults to off.
@@ -70,6 +133,14 @@ class InfrastructureMeteringSettings:
     shadow_enabled: bool = False
     cutover_enabled: bool = False
     publication_enabled: bool = False
+    pvc_inventory_enabled: bool = False
+    pv_inventory_enabled: bool = False
+    pvc_shadow_enabled: bool = False
+    pv_shadow_enabled: bool = False
+    pvc_publication_enabled: bool = False
+    pv_publication_enabled: bool = False
+    volume_identity_key_version: str = ""
+    volume_resource_mappings: tuple[StorageResourceMappingRule, ...] = ()
     stable_cluster_id: str = ""
     deployment_mode: Literal["dedicated", "in-process"] = "dedicated"
     namespace_allowlist: tuple[str, ...] = ()
@@ -98,6 +169,9 @@ class InfrastructureMeteringSettings:
                 "INFRASTRUCTURE_METERING_DEPLOYMENT_MODE must be "
                 "'dedicated' or 'in-process'"
             )
+        stable_cluster_id = env.get(
+            "INFRASTRUCTURE_METERING_STABLE_CLUSTER_ID", ""
+        ).strip()
         settings = cls(
             v2_reads_enabled=_flag(env, "INFRASTRUCTURE_METERING_V2_READS_ENABLED"),
             source_aware_reads_enabled=_flag(
@@ -113,9 +187,28 @@ class InfrastructureMeteringSettings:
             publication_enabled=_flag(
                 env, "INFRASTRUCTURE_METERING_PUBLICATION_ENABLED"
             ),
-            stable_cluster_id=env.get(
-                "INFRASTRUCTURE_METERING_STABLE_CLUSTER_ID", ""
+            pvc_inventory_enabled=_flag(
+                env, "INFRASTRUCTURE_METERING_PVC_INVENTORY_ENABLED"
+            ),
+            pv_inventory_enabled=_flag(
+                env, "INFRASTRUCTURE_METERING_PV_INVENTORY_ENABLED"
+            ),
+            pvc_shadow_enabled=_flag(env, "INFRASTRUCTURE_METERING_PVC_SHADOW_ENABLED"),
+            pv_shadow_enabled=_flag(env, "INFRASTRUCTURE_METERING_PV_SHADOW_ENABLED"),
+            pvc_publication_enabled=_flag(
+                env, "INFRASTRUCTURE_METERING_PVC_PUBLICATION_ENABLED"
+            ),
+            pv_publication_enabled=_flag(
+                env, "INFRASTRUCTURE_METERING_PV_PUBLICATION_ENABLED"
+            ),
+            volume_identity_key_version=env.get(
+                "INFRASTRUCTURE_METERING_VOLUME_IDENTITY_KEY_VERSION", ""
             ).strip(),
+            volume_resource_mappings=_volume_resource_mappings(
+                env,
+                source_cluster=stable_cluster_id,
+            ),
+            stable_cluster_id=stable_cluster_id,
             deployment_mode=deployment_mode,
             namespace_allowlist=_namespace_allowlist(env),
             relist_interval_seconds=_bounded_int(
@@ -207,10 +300,83 @@ class InfrastructureMeteringSettings:
                 "infrastructure metering stable cluster id must be 1-128 "
                 "characters using letters, digits, '.', '_', ':', or '-'"
             )
+        if self.volume_identity_key_version and not (
+            _VOLUME_IDENTITY_KEY_VERSION.fullmatch(self.volume_identity_key_version)
+        ):
+            raise ValueError(
+                "infrastructure metering volume identity key version must be "
+                "1-64 characters using letters, digits, '.', '_', ':', or '-'"
+            )
+        validate_storage_resource_mapping_set(self.volume_resource_mappings)
+        if any(
+            rule.source_cluster != self.stable_cluster_id
+            for rule in self.volume_resource_mappings
+        ):
+            raise ValueError(
+                "infrastructure storage resource mappings must use the stable "
+                "cluster id"
+            )
         if self.shadow_enabled and not self.collector_enabled:
             raise ValueError(
                 "infrastructure metering shadow mode requires its collector"
             )
+        if self.pvc_inventory_enabled and not self.collector_enabled:
+            raise ValueError(
+                "infrastructure metering PVC inventory requires its collector"
+            )
+        if self.pv_inventory_enabled and not self.collector_enabled:
+            raise ValueError(
+                "infrastructure metering PV inventory requires its collector"
+            )
+        if self.pv_inventory_enabled and not self.volume_identity_key_version:
+            raise ValueError(
+                "infrastructure metering PV inventory requires a volume identity "
+                "key version"
+            )
+        if self.pvc_shadow_enabled:
+            missing: list[str] = []
+            if not self.pvc_inventory_enabled:
+                missing.append("PVC inventory")
+            if not self.shadow_enabled:
+                missing.append("global shadow mode")
+            if missing:
+                raise ValueError(
+                    "infrastructure metering PVC shadow mode requires "
+                    + ", ".join(missing)
+                )
+        if self.pv_shadow_enabled:
+            missing = []
+            if not self.pv_inventory_enabled:
+                missing.append("PV inventory")
+            if not self.shadow_enabled:
+                missing.append("global shadow mode")
+            if missing:
+                raise ValueError(
+                    "infrastructure metering PV shadow mode requires "
+                    + ", ".join(missing)
+                )
+        if self.pvc_publication_enabled:
+            missing = []
+            if not self.publication_enabled:
+                missing.append("global publication")
+            if not self.pvc_shadow_enabled:
+                missing.append("PVC shadow mode")
+            if missing:
+                raise ValueError(
+                    "infrastructure metering PVC publication requires "
+                    + ", ".join(missing)
+                )
+        if self.pv_publication_enabled:
+            missing = []
+            if not self.publication_enabled:
+                missing.append("global publication")
+            if not self.pv_shadow_enabled:
+                missing.append("PV shadow mode")
+            if missing:
+                raise ValueError(
+                    "infrastructure metering PV publication requires "
+                    + ", ".join(missing)
+                )
         if self.collector_enabled and not self.stable_cluster_id:
             raise ValueError(
                 "infrastructure metering collector requires a stable cluster id"

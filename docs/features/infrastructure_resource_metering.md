@@ -11,18 +11,16 @@ tags:
 
 # Application infrastructure allocation metering
 
-**Status:** Slice 0 and the Slice 1 workspace-Pod implementation are complete as
-gated code through app migration `0101`. The dedicated Kubernetes collector,
-authenticated and generation-fenced LIST/WATCH ingestion, interval and shadow
-reconciliation, crash-resumable legacy cutover, strict ordinary/late/correction
-publication, day sealing, typed rollup handoff, and source-aware reads are wired
-into the leader-owned runtime. Fleet-admin cutover, coverage-waiver, and
-append-only correction workflows are present. Every runtime gate still defaults
-off, no durable production cutover has been performed, and collection, shadow,
-v2 reads, cutover, publication, and source-aware reads remain independently
-controlled. Slice 2 VM and PVC/PV collection is not implemented. Slice 1 is
-ready for its controlled shadow/activation runbook, not an automatic billing
-switch.
+**Status:** Slices 0, 1, and 2 are implementation-complete as gated code through
+app migration `0102`. The Slice 1 workspace-Pod path remains as described below.
+Slice 2 adds independent PVC-demand and PV/backend-asset inventory,
+reconciliation, activation, shadow, publication, coverage, and pricing fences.
+Every chart gate still defaults off, the main-dev configuration keeps all six
+storage gates off, no durable production cutover has been performed, and the
+compatibility ledger remains authoritative. Focused code, chart, migration, and
+database verification and the live Slice 2 k3d inventory→shadow→all-off
+exercise have passed. Slice 3 agent/VM collection is the next implementation
+slice. None of these milestones is an automatic billing switch.
 
 **Triggered by:** adding public-cloud comparison rate cards exposed that the
 ledger's existing `vcpu-hour` / `gib-hour` arithmetic is sound, but its resource
@@ -40,6 +38,31 @@ application or platform infrastructure cost.
   — current workspace/session PVC identities and reclaim rules.
 - [`vm_workspace_persistence_reconciliation.md`](vm_workspace_persistence_reconciliation.md)
   — VM/root-disk lifecycle ownership.
+
+## Current implementation snapshot (2026-08-06)
+
+| Layer | Current state |
+|---|---|
+| Active compatibility path | The existing `usage_events` ledger, legacy workspace interval writer, `/api/usage`, and cloud-equivalent v1 cards remain the serving path. No billing authority moved during this work. |
+| Slice 0 | Typed audit/app schemas, immutable canonical/provider rate versions, decimal-safe `/api/usage/v2`, dimensional Cockpit cards, capability probes, bootstrap state, and independent feature gates are implemented. |
+| Slice 1 | The workspace-Pod collector, authenticated LIST/WATCH ingestion, lifecycle intervals, shadow comparison, strict ordinary/late/correction publication, sealing, typed rollup, source-aware reads, and crash-resumable cutover are implemented through app migration `0101`. |
+| Slice 2 | PVC logical-demand and PV physical-asset collection, separate lifecycle state, retained/backend-unverified gaps, opaque CSI identity, immutable exact resource mapping, operator destruction assertions, activation controls, typed reads/sealing, and publication-plan integration are implemented through app migration `0102`. |
+| Repository deployment posture | Chart defaults keep every base and storage gate off. `deployment/values-experimental.yaml` enables **Pod inventory only** for main dev; PVC/PV inventory, their shadow/publication gates, v2 reads, source-aware reads, cutover, and global publication remain off. |
+| Verification | Slice 1's Python, Helm, schema, race, and k3d inventory→shadow→all-off evidence remains valid. Slice 2 focused Python/Helm tests, PostgreSQL migration/schema replay, and a live k3d PVC/PV inventory→shadow→all-off exercise have passed with publication disabled. |
+| Billing state | No durable cutover has occurred. No infrastructure v2 event publication is enabled, and the new path must not be presented as an invoice or customer charge. |
+| Next | Implement Slice 3 agent/VM metering. Main-dev Pod inventory can continue soaking independently; storage inventory/shadow still requires a deliberate operational rollout. |
+
+### Roadmap checkpoint
+
+| Delivery slice | State | Remaining gate |
+|---|---|---|
+| 0 — schemas and dimensional UI | **Implemented / dark-launched** | Enable v2 reads only after capability/bootstrap checks and the Slice 1 source transition are ready. |
+| 1 — Kubernetes workspace Pods | **Implementation and local k3d verification complete** | Main-dev inventory soak, then real-workspace shadow reconciliation; publication and one-way cutover still require explicit operator approval. |
+| 2 — PVC claims and PV/CSI volumes | **Implementation and local k3d verification complete / dark-launched** | Run a controlled main-dev inventory/shadow soak before activation. Provider storage rate cards remain Slice 5. |
+| 3 — agents and VMs | **Next to implement** | Add agent identities and authenticated VM-controller lifecycle transport/publication. |
+| 4 — shared platform completeness | **Not implemented** | Classify platform/unknown workload and expose overhead without smearing it across customers. |
+| 5 — provider calculator hardening | **Framework only** | Add occurrence/concurrency/storage-specific calculators and provider fixtures after their resource classes exist. |
+| 6 — actual-utilization overlay | **Not implemented** | Add Prometheus-backed efficiency views while keeping requested allocation canonical. |
 
 ## Summary
 
@@ -74,9 +97,10 @@ storage are an optional utilization overlay and must never silently replace the
 allocation ledger. Customer billing may consume finalized quantities later, but
 this feature does not declare every measured quantity billable.
 
-## Current truth
+## Compatibility-path truth and original gaps
 
-The current workspace meter does this correctly for one closed sandbox interval:
+The still-authoritative compatibility workspace meter does this correctly for
+one closed sandbox interval:
 
 ```text
 vcpu_hours = requested_cpu_cores * duration_hours
@@ -87,7 +111,10 @@ A sandbox workspace requesting 8 vCPU and 16 GiB for one hour emits two rows:
 `8 vcpu-hour` and `16 gib-hour`. A 4 GiB workspace running for one hour emits
 `4 gib-hour` plus its independent CPU quantity.
 
-The gaps are substantial:
+The following list records the gaps that motivated this design. Slices 0–2 now
+address the UI, live-window, workspace-Pod, and PVC/PV items in dark-launched
+code, but they do not change the serving/billing path while their rollout gates
+remain off:
 
 1. Cockpit adds vCPU-hours and GiB-hours into one "Compute-hours" number. The
    ledger keeps them separate, but the headline and user/project breakdowns are
@@ -363,21 +390,27 @@ asset ID with HMAC-SHA-256 and a stable metering identity key; importing the sam
 retained disk under a new PV UID must resume one asset lifecycle and one fixed
 fee, not create a second disk.
 
-Kubernetes alone cannot prove destruction of an external disk after a `Retain`
-PV object itself is deleted. Transition the durable asset to
-`backend-unverified`, freeze confirmed accrual at the last proof, and expose the
-unknown tail separately. Close only from provider/CSI inventory or an audited
-operator destruction assertion. For Delete-policy CSI volumes, PV absence is
-`backend-confirmed` only when the relevant deletion finalizer was observed and
-the cluster/external provisioner version guarantees backend deletion; older
-supported clusters remain `kubernetes-visible`. Do not project an orphan into
-the ledger forever and do not report disappearance as zero cost.
+Kubernetes alone cannot prove destruction of an external disk after its PV
+object disappears. The implemented v1 path therefore treats `Retain`, `Delete`,
+and unknown-policy disappearances conservatively: detach the incarnation,
+transition the durable asset to `backend-unverified`, freeze confirmed accrual
+at the last proof, and expose the unknown tail as a coverage gap. A fleet-admin
+operator may close that gap through the audited `operator-attested` backend
+destruction endpoint. The lower-level evidence contract can later accept an
+authenticated provider/CSI assertion, but that transport is not implemented
+yet; observing a deletion finalizer alone is not treated as destruction proof.
+Do not project an orphan into the ledger forever and do not report
+disappearance as zero cost.
 
 PVC expansion and PV capacity changes split their respective revisions at the
 observed change time. Do not use `PVC.status.allocatedResources` as actual disk
-capacity. Map a volume's `(source_cluster, StorageClass, CSI driver)` to a typed
-resource class; an unknown mapping remains metered but cannot be priced as a
-generic block disk.
+capacity. Map a volume's exact
+`(source_cluster, StorageClass, CSI driver, volume mode)` selector through an
+immutable operator-owned rule to a typed resource class. The collector never
+reads StorageClass parameters or CSIDriver objects to pick a priced tier. A
+missing exact rule resolves to `unmapped_block_volume`, remains
+quantity-visible, and is forced unpriced even if an accidental wildcard or
+rate row exists.
 
 `GiB-month` is display-only:
 
@@ -1257,13 +1290,16 @@ window.
 - When a PV is unbound, released, or retained, change attribution to shared or
   unknown and continue its physical-asset interval. Do not charge that tail to
   the deleted claim owner.
-- If a Retain PV object disappears without backend deletion proof, detach the PV
+- If any PV object disappears without backend deletion proof, detach the PV
   incarnation but leave the durable asset `backend-unverified`, freeze confirmed
-  accrual, and open a coverage gap. Provider/CSI inventory or an audited operator
-  assertion—not wall-clock projection—resolves it.
-- Resolve resource class from cluster, StorageClass, CSI driver, volume mode,
-  and relevant topology/tier fields. An unmapped class is quantity-only and
-  appears in price coverage gaps.
+  accrual, and open a coverage gap. The implemented fleet-admin
+  `operator-attested` assertion resolves it; authenticated provider/CSI evidence
+  is a future transport, never a wall-clock projection.
+- Resolve resource class only from an exact, immutable operator-owned
+  cluster/StorageClass/CSI-driver/volume-mode rule. Do not read StorageClass
+  parameters, arbitrary topology, or CSIDriver objects into the trust boundary.
+  `unmapped_block_volume` is quantity-only, forced unpriced, and appears in price
+  coverage gaps.
 - Replication overhead and physically used bytes are utilization/asset details,
   not invented multipliers on logical claim demand.
 
@@ -1613,9 +1649,12 @@ adding more branches to the legacy workspace file:
 |---|---|
 | `types.py` | Inventory envelopes/items, typed dimensions, health/finality enums |
 | `quantities.py` / `pod_requests.py` | Kubernetes parsing, effective requests, Decimal integration |
-| `collectors/kubernetes.py` | Per-scope LIST/WATCH state machines for Pods/PVCs/PVs |
+| `collectors/kubernetes.py`, `kubernetes_client.py`, and `collector_runtime.py` | Per-scope bounded LIST/WATCH state machines for Pods, PVCs, and PVs |
+| `collectors/storage_normalization.py` | Strict PVC/PV allowlisting, quantity parsing, and HMAC CSI identity derivation without retaining raw handles |
 | `collectors/vm_controller.py` | HTTP/NATS VM snapshot validation and normalization |
-| `reconciler.py` | Transactional snapshot reconciliation and interval revisions |
+| `ingestion.py`, `pod_intervals.py`, and `storage_intervals.py` | Transactional snapshot/WATCH reconciliation and basis-specific interval revisions |
+| `storage_assets.py` | Durable PV assets/incarnations, identity-key registration, activation, backend gaps, and fleet-admin evidence operations |
+| `storage_mapping.py` | Immutable exact operator mappings and forced-unpriced unmapped resolution |
 | `materializer.py` | Day/rate segmentation and strict ledger publication |
 | `sealer.py` | Generation-fenced coverage proof and immutable UTC-day sealing |
 | `read_model.py` | Rolled-day plus interval-tail finality, pricing, and coverage |
@@ -1636,13 +1675,21 @@ Existing integration points and their intended deltas are explicit:
 | `cockpit/src/app/core/services/admin-usage.service.ts` + `cockpit/src/app/views/admin/usage/admin-usage.component.ts` | V2 decimal models, dimensional cards, coverage/finality, current allocation, and estimate quality |
 | `helm/` | Dedicated collector Deployment/ServiceAccount, scoped RBAC, NetworkPolicies, values validation, and scrape/alert rules |
 
+Slice 2's schema lands in app migration
+`0102_storage_asset_foundations.sql`. It adds independent claim/volume
+activation state, the immutable storage-resource registry and identity-key
+fingerprint, PV asset/incarnation state, backend coverage gaps and destruction
+assertions, and storage shadow observations. `capabilities.py`, `read_model.py`,
+`sealer.py`, and `materializer.py` fail closed unless those contracts and the
+configured identity/mapping provenance agree.
+
 App/audit migrations, both Cockpit i18n files, and the corresponding Python,
 Vitest, transport, chart, and integration tests are in scope. Reference schema
 snapshots remain generated/reference artifacts and are not hand-edited.
 
 ## Configuration, RBAC, and operations
 
-Proposed Helm values keep rollout state explicit:
+The implemented Helm values keep rollout state explicit:
 
 ```yaml
 infrastructureMetering:
@@ -1652,7 +1699,14 @@ infrastructureMetering:
   stableClusterId: ""
   deploymentMode: dedicated
   namespaceAllowlist: []
+  pvcInventoryEnabled: false
   pvInventoryEnabled: false
+  pvcShadowEnabled: false
+  pvShadowEnabled: false
+  pvcPublicationEnabled: false
+  pvPublicationEnabled: false
+  volumeIdentityKeyVersion: ""
+  volumeResourceMappings: []
   relistIntervalSeconds: 300
   staleAfterSeconds: 900
   listPageSize: 500
@@ -1677,6 +1731,25 @@ identity, and survives endpoint/credential rotation. Values validate that
 publication cannot start without collectors, non-empty cluster identity,
 migrated audit capability, and at least one complete required snapshot.
 
+PVC and PV inventory, shadow reconciliation, and publication are independently
+gated in addition to their global master gates. Physical-volume inventory also
+requires a non-rotating HMAC identity key and configured key version. Claim and
+volume activation each follow `disabled -> shadow -> active`, with `active`
+scheduled at a future UTC midnight only after the current collector generation
+has a fresh, complete, item-for-item shadow proof. Because the enabled resource
+allowlist is intentionally fixed per process, the operator must restart/roll the
+orchestrator after a scheduled activation boundary; a stale process fails
+read/seal coverage closed rather than silently omitting newly active storage.
+
+The safe per-basis rollout order is deliberately asymmetric: enable and verify
+inventory first; while inventory remains on, use the fleet-admin `.../shadow`
+operation to advance the database activation row from `disabled` to `shadow`;
+only then enable the global and PVC/PV Helm shadow gates and roll the
+orchestrator. Enabling configuration shadow while the durable row is still
+`disabled` is rejected by the database shadow-observation fence. After a clean
+shadow window, the fleet-admin schedule operation may set a future UTC-midnight
+activation; publication and serving-read gates remain separate decisions.
+
 The production chart uses a dedicated read-only collector Deployment and
 ServiceAccount rather than granting the internet-facing orchestrator broad Pod
 and PV visibility. The collector has no audit/app DB credentials; it sends only
@@ -1686,11 +1759,15 @@ after the cursor+mutation transaction. Local development may run the same typed
 collector in-process behind an explicit non-production value.
 
 Namespace collectors get least-privilege `get/list/watch` for Pods and PVCs in
-each allowlisted namespace. Storage mapping additionally needs reviewed
-cluster-scoped read of StorageClasses and, when enabled, CSIDrivers. PV inventory
-is cluster-scoped and remains behind its own flag/ClusterRole. The VM collector
-needs read-only VM/VMI/DataVolume/PVC verbs in its namespace. No collector needs
-Secret read. Enabling the collector requires an egress NetworkPolicy with
+each allowlisted namespace. PV inventory is cluster-scoped and remains behind
+its own flag and separately rendered ClusterRole. Storage classification uses
+exact operator-owned rules delivered only to the orchestrator, so the collector
+does **not** read StorageClasses, StorageClass parameters, or CSIDrivers and gets
+no RBAC for them. The VM collector needs read-only
+VM/VMI/DataVolume/PVC verbs in its namespace. No collector needs general Secret
+read; its projected ingestion and PV-identity Secrets are dedicated to this
+transport and separated from the application Secret. Enabling the collector
+requires an egress NetworkPolicy with
 explicit API-server CIDRs unless the operator sets the named unrestricted-egress
 break-glass acknowledgement. The normal policy allows only cluster DNS, the
 Kubernetes API, and authenticated ingestion. The ingestion Secret is required
@@ -1698,7 +1775,8 @@ at orchestrator startup while collection is enabled, and Secret-aware rolling
 reload keeps the collector and orchestrator on the same rotated key. Store only
 normalized allowlisted fields; never persist Pod environment, Secret refs,
 arbitrary annotations, StorageClass parameters, CSI credentials/attributes/
-handles, or raw controller payloads.
+handles, or raw controller payloads. Raw CSI handles exist only long enough to
+derive the keyed digest inside the collector process.
 
 The server validates the exact normalized Pod shape recursively before JSONB
 staging; a generic JSON-safe mapping or denylist is not sufficient. Signed
@@ -1779,6 +1857,16 @@ terminal-conflict publication plan that references it. Runtime capability
 probing requires the final tables, columns, constraints, indexes, triggers,
 audit contract, and seed rows before cutover, publication, or source-aware reads
 can become available.
+
+Slice 2 adds app `0102`: independent claim/volume activation rows and interval
+guards; an immutable exact storage-resource mapping registry; the singleton
+HMAC identity-key version/fingerprint; physical-volume assets and PV
+incarnations; backend-unverified gaps and append-only destruction assertions;
+and basis-specific shadow observations. Database triggers reject activation
+backdating, identity-key mutation, mapping mutation, impossible asset/gap
+lifecycle transitions, and publication before the matching activation boundary.
+Capability probing checks this full contract and the exact configured key
+version before PV shadow/publication can become available.
 
 1. **Expand audit first.** Add nullable v2 event fields/checks and create future
    partitions. Existing writers/readers continue to work. A runtime capability
@@ -1947,12 +2035,91 @@ cutover crash matrix, and workspace quantity reconciliation pass.
 
 ### Slice 2 — claim and volume storage
 
-- PVC collectors, attribution, `gib-hour`/`claim-hour`, and UI.
-- Separately gated PV collector, CSI/StorageClass mapping,
-  `gib-hour`/`volume-hour`, and retained/backend-unverified behavior.
+**Implementation and local k3d verification complete behind independent
+dark-launch gates.** App migration `0102` and the Slice 1 LIST/WATCH substrate
+now provide:
 
-Depends on Slice 1. Quantity may ship explicitly unpriced; a storage card ships
-only with its typed adapter/provenance and provider fixtures.
+- Strict PVC and PV normalization with separate inventory scopes. PVC demand is
+  keyed by immutable claim UID and emits `claim-requested` `gib-hour` plus
+  `claim-hour`; provisioned storage is a distinct physical-asset lifecycle that
+  emits `volume-provisioned` `gib-hour` plus `volume-hour`. Binding, resize,
+  reattribution, release, and deletion split only the affected basis.
+- A dedicated non-rotating HMAC identity key for CSI volumes. Raw
+  `volumeHandle`, CSI attributes, StorageClass parameters, and arbitrary
+  metadata never enter ingestion, inventory JSON, database rows, logs, or APIs.
+  PV UID is an explicit fallback/incarnation identity, not a substitute for a
+  durable CSI asset when a handle exists.
+- Independent PVC/PV inventory, shadow, and publication gates under the global
+  masters, plus separate forward-only claim and volume activation rows. A
+  generation-fenced fresh complete shadow snapshot is required before either
+  basis can be scheduled at a future UTC-midnight boundary; collection alone
+  cannot create publishable intervals.
+- Immutable, exact operator-owned mappings over source cluster, nullable
+  StorageClass, nullable CSI driver, and volume mode. Rules and fingerprints are
+  stored server-side and are never sent to the collector. Missing rules resolve
+  to `unmapped_block_volume`; materialization forces that resource unpriced even
+  if a matching rate row exists. A mapped interval carries immutable mapping
+  version/fingerprint provenance and splits forward if its resolved class
+  changes.
+- Durable PV asset/incarnation state and conservative disappearance handling.
+  Any PV that vanishes without authenticated backend proof becomes detached and
+  `backend-unverified`; confirmed accrual freezes and a storage coverage gap
+  opens. Fleet admins have bounded list/detail APIs and an idempotent,
+  append-only `operator-attested` destruction assertion that can close only a
+  detached asset with the matching open gap and closed interval.
+- Storage-aware read/seal/materialization coverage. Required PVC/PV sources and
+  backend gaps participate in finality; dynamic mapped volume resources are
+  recognized by their PV source, while unmapped resources remain quantity-only.
+  Existing Slice 0 logical-claim and physical-volume Cockpit cards need no new
+  UI shape.
+
+Chart and main-dev defaults keep all six storage gates off, and global
+publication remains off. Focused Python/Helm tests, PostgreSQL migration replay,
+schema generation, identity/mapping safety checks, lifecycle races, and
+read/seal/materializer coverage have passed.
+
+**Local k3d evidence (2026-08-06):** app migration `0102` deployed in about
+101 ms. Inventory-only collection produced healthy PVC and PV scopes over the
+existing 15 bound claims/volumes without creating assets, shadow rows,
+intervals, plans, or audit events. Shadow mode plus two isolated PVC/Pod
+fixtures exercised PVC/PV LIST and WATCH and produced 17 durable PV assets and
+17 incarnations. All observed volumes resolved through the one exact
+`local-path`/filesystem mapping and shared its immutable mapping fingerprint.
+Normalized snapshot and WATCH payloads contained no raw `volumeHandle`,
+`hostPath`, or k3s storage path. Storage intervals, publication plans, and
+typed infrastructure audit events remained zero throughout.
+
+The exercise caught and fixed a chart wiring defect: mapping JSON was rendered
+into the ConfigMap but was not injected into the orchestrator Deployment, so
+otherwise valid volumes remained `unmapped_block_volume`. The regression test
+now verifies that the orchestrator receives the mapping while the collector
+does not. It also confirmed the intended activation fence: Helm shadow mode
+cannot write observations until the per-basis database activation row has
+entered `shadow`. After validation, every Helm collection, shadow, publication,
+cutover, and v2-read gate was restored to off, collector/RBAC resources and the
+fixture namespace were removed, and the orchestrator was healthy. The local
+database activation rows remain forward-only `shadow` with no activation
+timestamp; publication is still impossible with configuration gates off.
+
+Known v1 limits are explicit:
+
+- There is no authenticated automated provider/CSI destruction-evidence
+  transport yet. The operator assertion is the only enabled closure path, so
+  even a Delete-policy PV with an observed finalizer remains conservative.
+- A non-CSI/static volume reimported under a new PV UID cannot be deduplicated;
+  the old fallback asset stays backend-unverified and the new UID starts another
+  asset. Stable reimport deduplication is available only for HMAC'd CSI identity.
+- Enabled resource classes are fixed for the process lifetime. After a
+  scheduled storage activation becomes effective, roll the orchestrator so the
+  enabled read/seal set is rebuilt; an old process reports partial/unknown
+  coverage instead of treating the source as zero.
+- Slice 2 meters quantities and mapping provenance but does not add STACKIT,
+  AWS, or Azure storage rates. Provider storage rate cards and fixtures remain
+  Slice 5, so quantity may intentionally remain unpriced.
+
+Depends on Slice 1. Implementation/local-verification exit has passed. A
+controlled operational inventory/shadow window with publication disabled is a
+remaining deployment gate, not unfinished Slice 2 code.
 
 ### Slice 3 — agents and VMs
 
@@ -2024,11 +2191,11 @@ prerequisites, and rollback drill pass.
   separately.
 - PVC expansion and delayed PV resize split independently. A retained PV
   continues volume-hours after claim deletion under shared/unknown attribution.
-- Deleting a Retain PV freezes its durable asset as backend-unverified; importing
-  the same HMAC'd CSI asset under a new PV UID does not create a second lifecycle
-  or fixed fee. Delete-policy tests distinguish older clusters without backend
-  finalizer proof from capable newer clusters, and an authenticated provider/
-  operator destruction assertion closes exactly once.
+- Any PV disappearance without backend proof freezes its durable asset as
+  backend-unverified; importing the same HMAC'd CSI asset under a new PV UID does
+  not create a second lifecycle or fixed fee. Delete-policy and Retain-policy
+  cases both stay conservative, and an audited operator destruction assertion
+  closes exactly once. Automated authenticated provider evidence is deferred.
 - A VM root PVC is counted once; its DataVolume is not a second disk. Pending,
   raw-block, RWX, platform, persistent-session, and golden-image cases are
   classified or explicitly unsupported/unknown.

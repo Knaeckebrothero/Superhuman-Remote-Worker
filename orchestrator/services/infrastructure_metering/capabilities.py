@@ -230,6 +230,133 @@ REQUIRED_SLICE1_RUNTIME_APP_CONSTRAINTS = frozenset(
     REQUIRED_SLICE1_RUNTIME_APP_CONSTRAINT_RELATIONS
 )
 
+# Slice 2 storage inventory is independently dark-launched. Claim demand needs
+# only the forward activation/shadow contract; physical-volume inventory also
+# requires opaque asset identity and retained-backend evidence. Keep these sets
+# separate so granting cluster-scoped PV RBAC can never be inferred from PVC
+# schema readiness.
+REQUIRED_SLICE2_CLAIM_APP_TABLES = frozenset(
+    {
+        "storage_metering_activation",
+        "storage_shadow_observations",
+    }
+)
+
+REQUIRED_SLICE2_VOLUME_APP_TABLES = frozenset(
+    {
+        "infrastructure_storage_resource_mappings",
+        "storage_asset_coverage_gaps",
+        "storage_backend_assertions",
+        "storage_identity_key_state",
+        "storage_volume_assets",
+        "storage_volume_incarnations",
+    }
+)
+
+REQUIRED_SLICE2_CLAIM_APP_INDEX_RELATIONS = {
+    "storage_shadow_observations_snapshot_identity_uq": ("storage_shadow_observations"),
+    "storage_shadow_observations_latest_idx": "storage_shadow_observations",
+}
+REQUIRED_SLICE2_CLAIM_APP_INDEXES = frozenset(REQUIRED_SLICE2_CLAIM_APP_INDEX_RELATIONS)
+
+REQUIRED_SLICE2_VOLUME_APP_INDEX_RELATIONS = {
+    "infrastructure_storage_resource_mappings_pkey": (
+        "infrastructure_storage_resource_mappings"
+    ),
+    "infrastructure_storage_resource_mappings_selector_uq": (
+        "infrastructure_storage_resource_mappings"
+    ),
+    "infrastructure_storage_resource_mappings_resource_idx": (
+        "infrastructure_storage_resource_mappings"
+    ),
+    "storage_volume_assets_identity_uq": "storage_volume_assets",
+    "storage_volume_assets_state_idx": "storage_volume_assets",
+    "storage_volume_incarnations_pv_uid_uq": "storage_volume_incarnations",
+    "storage_volume_incarnations_active_asset_uq": "storage_volume_incarnations",
+    "storage_asset_coverage_gaps_open_uq": "storage_asset_coverage_gaps",
+    "storage_asset_coverage_gaps_range_idx": "storage_asset_coverage_gaps",
+    "storage_backend_assertions_idempotency_uq": "storage_backend_assertions",
+    "storage_backend_assertions_asset_uq": "storage_backend_assertions",
+}
+REQUIRED_SLICE2_VOLUME_APP_INDEXES = frozenset(
+    REQUIRED_SLICE2_VOLUME_APP_INDEX_RELATIONS
+)
+
+REQUIRED_SLICE2_CLAIM_APP_TRIGGER_RELATIONS = {
+    "storage_metering_activation_one_way": "storage_metering_activation",
+    "resource_intervals_storage_activation_guard": "resource_intervals",
+    "storage_shadow_observations_immutable": "storage_shadow_observations",
+}
+REQUIRED_SLICE2_CLAIM_APP_TRIGGERS = frozenset(
+    REQUIRED_SLICE2_CLAIM_APP_TRIGGER_RELATIONS
+)
+
+REQUIRED_SLICE2_VOLUME_APP_TRIGGER_RELATIONS = {
+    "infrastructure_storage_resource_mappings_append_only": (
+        "infrastructure_storage_resource_mappings"
+    ),
+    "storage_identity_key_state_immutable": "storage_identity_key_state",
+    "storage_volume_assets_lifecycle_guard": "storage_volume_assets",
+    "storage_volume_incarnations_lifecycle_guard": "storage_volume_incarnations",
+    "storage_asset_coverage_gaps_lifecycle_guard": "storage_asset_coverage_gaps",
+    "storage_asset_coverage_gaps_transition": "storage_asset_coverage_gaps",
+    "storage_backend_assertions_append_only": "storage_backend_assertions",
+    "storage_backend_assertions_transition": "storage_backend_assertions",
+}
+REQUIRED_SLICE2_VOLUME_APP_TRIGGERS = frozenset(
+    REQUIRED_SLICE2_VOLUME_APP_TRIGGER_RELATIONS
+)
+
+REQUIRED_SLICE2_CLAIM_APP_CONSTRAINT_RELATIONS = {
+    "storage_metering_activation_basis_check": "storage_metering_activation",
+    "storage_metering_activation_state_check": "storage_metering_activation",
+    "storage_shadow_observations_snapshot_fkey": "storage_shadow_observations",
+    "storage_shadow_observations_snapshot_identity_uq": ("storage_shadow_observations"),
+    "storage_shadow_observations_identity_check": "storage_shadow_observations",
+    "storage_shadow_observations_shape_check": "storage_shadow_observations",
+}
+REQUIRED_SLICE2_CLAIM_APP_CONSTRAINTS = frozenset(
+    REQUIRED_SLICE2_CLAIM_APP_CONSTRAINT_RELATIONS
+)
+
+REQUIRED_SLICE2_VOLUME_APP_CONSTRAINT_RELATIONS = {
+    "infrastructure_storage_resource_mappings_pkey": (
+        "infrastructure_storage_resource_mappings"
+    ),
+    "infrastructure_storage_resource_mappings_selector_uq": (
+        "infrastructure_storage_resource_mappings"
+    ),
+    "infrastructure_storage_resource_mappings_selector_check": (
+        "infrastructure_storage_resource_mappings"
+    ),
+    "infrastructure_storage_resource_mappings_output_check": (
+        "infrastructure_storage_resource_mappings"
+    ),
+    "storage_identity_key_state_singleton_check": "storage_identity_key_state",
+    "storage_identity_key_state_shape_check": "storage_identity_key_state",
+    "storage_volume_assets_identity_uq": "storage_volume_assets",
+    "storage_volume_assets_identity_check": "storage_volume_assets",
+    "storage_volume_assets_time_check": "storage_volume_assets",
+    "storage_volume_assets_state_check": "storage_volume_assets",
+    "storage_volume_assets_destruction_assertion_fkey": "storage_volume_assets",
+    "storage_volume_incarnations_scope_cluster_fkey": ("storage_volume_incarnations"),
+    "storage_volume_incarnations_pv_uid_uq": "storage_volume_incarnations",
+    "storage_volume_incarnations_identity_check": "storage_volume_incarnations",
+    "storage_volume_incarnations_shape_check": "storage_volume_incarnations",
+    "storage_volume_incarnations_no_overlap": "storage_volume_incarnations",
+    "storage_asset_coverage_gaps_reason_check": "storage_asset_coverage_gaps",
+    "storage_asset_coverage_gaps_range_check": "storage_asset_coverage_gaps",
+    "storage_asset_coverage_gaps_resolution_check": "storage_asset_coverage_gaps",
+    "storage_asset_coverage_gaps_no_overlap": "storage_asset_coverage_gaps",
+    "storage_asset_coverage_gaps_assertion_fkey": "storage_asset_coverage_gaps",
+    "storage_backend_assertions_idempotency_uq": "storage_backend_assertions",
+    "storage_backend_assertions_asset_uq": "storage_backend_assertions",
+    "storage_backend_assertions_shape_check": "storage_backend_assertions",
+}
+REQUIRED_SLICE2_VOLUME_APP_CONSTRAINTS = frozenset(
+    REQUIRED_SLICE2_VOLUME_APP_CONSTRAINT_RELATIONS
+)
+
 REQUIRED_AUDIT_TRIGGER_RELATIONS = {
     "usage_events_rollup_dirty_days": "usage_events",
     "usage_events_append_only_v2": "usage_events",
@@ -296,6 +423,9 @@ class MeteringSchemaCapabilities:
     dirty_day_trigger: bool = False
     append_only_trigger: bool = False
     target_partitions_ready: bool = False
+    storage_activation_seed_rows_ready: bool = False
+    storage_identity_key_registered: bool = False
+    storage_identity_key_version: str | None = None
 
     @property
     def missing_slice1_app_tables(self) -> frozenset[str]:
@@ -328,6 +458,38 @@ class MeteringSchemaCapabilities:
     @property
     def missing_slice1_runtime_app_constraints(self) -> frozenset[str]:
         return REQUIRED_SLICE1_RUNTIME_APP_CONSTRAINTS - self.app_constraints
+
+    @property
+    def missing_slice2_claim_app_tables(self) -> frozenset[str]:
+        return REQUIRED_SLICE2_CLAIM_APP_TABLES - self.app_tables
+
+    @property
+    def missing_slice2_claim_app_indexes(self) -> frozenset[str]:
+        return REQUIRED_SLICE2_CLAIM_APP_INDEXES - self.app_indexes
+
+    @property
+    def missing_slice2_claim_app_triggers(self) -> frozenset[str]:
+        return REQUIRED_SLICE2_CLAIM_APP_TRIGGERS - self.app_triggers
+
+    @property
+    def missing_slice2_claim_app_constraints(self) -> frozenset[str]:
+        return REQUIRED_SLICE2_CLAIM_APP_CONSTRAINTS - self.app_constraints
+
+    @property
+    def missing_slice2_volume_app_tables(self) -> frozenset[str]:
+        return REQUIRED_SLICE2_VOLUME_APP_TABLES - self.app_tables
+
+    @property
+    def missing_slice2_volume_app_indexes(self) -> frozenset[str]:
+        return REQUIRED_SLICE2_VOLUME_APP_INDEXES - self.app_indexes
+
+    @property
+    def missing_slice2_volume_app_triggers(self) -> frozenset[str]:
+        return REQUIRED_SLICE2_VOLUME_APP_TRIGGERS - self.app_triggers
+
+    @property
+    def missing_slice2_volume_app_constraints(self) -> frozenset[str]:
+        return REQUIRED_SLICE2_VOLUME_APP_CONSTRAINTS - self.app_constraints
 
     @property
     def missing_app_tables(self) -> frozenset[str]:
@@ -408,6 +570,37 @@ class MeteringSchemaCapabilities:
             and not self.missing_slice1_runtime_app_constraints
         )
 
+    @property
+    def slice2_claim_inventory_ready(self) -> bool:
+        """Namespaced claim shadow/inventory schema, without publication."""
+
+        return (
+            self.slice1_inventory_ready
+            and not self.missing_slice2_claim_app_tables
+            and not self.missing_slice2_claim_app_indexes
+            and not self.missing_slice2_claim_app_triggers
+            and not self.missing_slice2_claim_app_constraints
+            and self.storage_activation_seed_rows_ready
+        )
+
+    @property
+    def slice2_volume_schema_ready(self) -> bool:
+        """Cluster-volume schema readiness, independent of key registration."""
+
+        return (
+            self.slice2_claim_inventory_ready
+            and not self.missing_slice2_volume_app_tables
+            and not self.missing_slice2_volume_app_indexes
+            and not self.missing_slice2_volume_app_triggers
+            and not self.missing_slice2_volume_app_constraints
+        )
+
+    @property
+    def slice2_volume_inventory_ready(self) -> bool:
+        """Volume schema plus registered stable identity-key provenance."""
+
+        return self.slice2_volume_schema_ready and self.storage_identity_key_registered
+
     def diagnostics(self) -> dict[str, Any]:
         return {
             "slice0_ready": self.slice0_ready,
@@ -443,6 +636,38 @@ class MeteringSchemaCapabilities:
             ),
             "missing_slice1_runtime_app_constraints": sorted(
                 self.missing_slice1_runtime_app_constraints
+            ),
+            "slice2_claim_inventory_ready": self.slice2_claim_inventory_ready,
+            "slice2_volume_schema_ready": self.slice2_volume_schema_ready,
+            "slice2_volume_inventory_ready": self.slice2_volume_inventory_ready,
+            "storage_activation_seed_rows_ready": (
+                self.storage_activation_seed_rows_ready
+            ),
+            "storage_identity_key_registered": self.storage_identity_key_registered,
+            "storage_identity_key_version": self.storage_identity_key_version,
+            "missing_slice2_claim_app_tables": sorted(
+                self.missing_slice2_claim_app_tables
+            ),
+            "missing_slice2_claim_app_indexes": sorted(
+                self.missing_slice2_claim_app_indexes
+            ),
+            "missing_slice2_claim_app_triggers": sorted(
+                self.missing_slice2_claim_app_triggers
+            ),
+            "missing_slice2_claim_app_constraints": sorted(
+                self.missing_slice2_claim_app_constraints
+            ),
+            "missing_slice2_volume_app_tables": sorted(
+                self.missing_slice2_volume_app_tables
+            ),
+            "missing_slice2_volume_app_indexes": sorted(
+                self.missing_slice2_volume_app_indexes
+            ),
+            "missing_slice2_volume_app_triggers": sorted(
+                self.missing_slice2_volume_app_triggers
+            ),
+            "missing_slice2_volume_app_constraints": sorted(
+                self.missing_slice2_volume_app_constraints
             ),
         }
 
@@ -587,19 +812,25 @@ async def probe_schema_capabilities(
         app_pool,
         REQUIRED_APP_TABLES
         | REQUIRED_SLICE1_APP_TABLES
-        | REQUIRED_SLICE1_RUNTIME_APP_TABLES,
+        | REQUIRED_SLICE1_RUNTIME_APP_TABLES
+        | REQUIRED_SLICE2_CLAIM_APP_TABLES
+        | REQUIRED_SLICE2_VOLUME_APP_TABLES,
     )
     app_indexes = await _index_names(
         app_pool,
         REQUIRED_APP_INDEX_RELATIONS
         | REQUIRED_SLICE1_APP_INDEX_RELATIONS
-        | REQUIRED_SLICE1_RUNTIME_APP_INDEX_RELATIONS,
+        | REQUIRED_SLICE1_RUNTIME_APP_INDEX_RELATIONS
+        | REQUIRED_SLICE2_CLAIM_APP_INDEX_RELATIONS
+        | REQUIRED_SLICE2_VOLUME_APP_INDEX_RELATIONS,
     )
     app_triggers = await _enabled_trigger_names(
         app_pool,
         REQUIRED_APP_TRIGGER_RELATIONS
         | REQUIRED_SLICE1_APP_TRIGGER_RELATIONS
-        | REQUIRED_SLICE1_RUNTIME_APP_TRIGGER_RELATIONS,
+        | REQUIRED_SLICE1_RUNTIME_APP_TRIGGER_RELATIONS
+        | REQUIRED_SLICE2_CLAIM_APP_TRIGGER_RELATIONS
+        | REQUIRED_SLICE2_VOLUME_APP_TRIGGER_RELATIONS,
     )
     app_columns = await _qualified_column_names(
         app_pool,
@@ -607,7 +838,9 @@ async def probe_schema_capabilities(
     )
     app_constraints = await _validated_constraint_names(
         app_pool,
-        REQUIRED_SLICE1_RUNTIME_APP_CONSTRAINT_RELATIONS,
+        REQUIRED_SLICE1_RUNTIME_APP_CONSTRAINT_RELATIONS
+        | REQUIRED_SLICE2_CLAIM_APP_CONSTRAINT_RELATIONS
+        | REQUIRED_SLICE2_VOLUME_APP_CONSTRAINT_RELATIONS,
     )
     audit_tables = await _table_names(audit_pool, REQUIRED_AUDIT_TABLES)
     audit_indexes = await _index_names(audit_pool, REQUIRED_AUDIT_INDEX_RELATIONS)
@@ -618,6 +851,9 @@ async def probe_schema_capabilities(
     dirty_trigger = False
     append_only_trigger = False
     target_partitions_ready = False
+    storage_activation_seed_rows_ready = False
+    storage_identity_key_registered = False
+    storage_identity_key_version: str | None = None
     if app_pool is not None and not (REQUIRED_APP_TABLES - app_tables):
         try:
             app_seed_rows_ready = bool(
@@ -632,6 +868,33 @@ async def probe_schema_capabilities(
             )
         except Exception:
             logger.warning("metering app seed-row probe failed", exc_info=True)
+    if app_pool is not None and "storage_metering_activation" in app_tables:
+        try:
+            storage_activation_seed_rows_ready = bool(
+                await app_pool.fetchval(
+                    "SELECT count(*) = 2 "
+                    "AND count(*) FILTER (WHERE measurement_basis = "
+                    "'claim-requested') = 1 "
+                    "AND count(*) FILTER (WHERE measurement_basis = "
+                    "'volume-provisioned') = 1 "
+                    "FROM storage_metering_activation"
+                )
+            )
+        except Exception:
+            logger.warning(
+                "metering storage activation seed probe failed", exc_info=True
+            )
+    if app_pool is not None and "storage_identity_key_state" in app_tables:
+        try:
+            identity_key = await app_pool.fetchrow(
+                "SELECT key_version FROM storage_identity_key_state "
+                "WHERE singleton AND algorithm = 'hmac-sha256-v1'"
+            )
+            storage_identity_key_registered = identity_key is not None
+            if identity_key is not None:
+                storage_identity_key_version = str(identity_key["key_version"])
+        except Exception:
+            logger.warning("metering storage identity-key probe failed", exc_info=True)
     if audit_pool is not None and "usage_events" in audit_tables:
         try:
             rows = await audit_pool.fetch(
@@ -694,4 +957,7 @@ async def probe_schema_capabilities(
         dirty_day_trigger=dirty_trigger,
         append_only_trigger=append_only_trigger,
         target_partitions_ready=target_partitions_ready,
+        storage_activation_seed_rows_ready=storage_activation_seed_rows_ready,
+        storage_identity_key_registered=storage_identity_key_registered,
+        storage_identity_key_version=storage_identity_key_version,
     )

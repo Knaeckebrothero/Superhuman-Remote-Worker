@@ -1,4 +1,4 @@
-"""Dedicated, database-free Kubernetes Pod inventory collector runtime.
+"""Dedicated, database-free Kubernetes Pod/PVC/PV inventory runtime.
 
 The runtime deliberately has only two authorities: namespace-scoped read access
 to the Kubernetes API and an HMAC-authenticated internal HTTP client.  Raw API
@@ -40,8 +40,9 @@ from .collectors import (
     WatchObservation,
     WatchOutcome,
 )
-from .collectors.kubernetes_client import RawKubernetesPodClient
+from .collectors.kubernetes_client import RawKubernetesClient
 from .collectors.pod_normalization import PodEffectiveRequest, normalize_pod
+from .collectors.storage_normalization import normalize_pv, normalize_pvc
 from .config import InfrastructureMeteringSettings
 from .ingestion_types import (
     InventoryItemWire,
@@ -71,6 +72,8 @@ WATCH_APPLY_PATH = f"{API_PREFIX}/watch/apply"
 WATCH_FINISH_PATH = f"{API_PREFIX}/watch/finish"
 
 POD_API_RESOURCE = "core/v1/pods"
+PVC_API_RESOURCE = "core/v1/persistentvolumeclaims"
+PV_API_RESOURCE = "core/v1/persistentvolumes"
 MAX_RESPONSE_BYTES = 1024 * 1024
 MAX_BATCH_ITEMS = 500
 MAX_FATAL_ERRORS = 1_000
@@ -612,7 +615,11 @@ class CollectorCycleResult:
 
 
 class KubernetesPodCollectorRuntime:
-    """Coordinates bounded LIST/WATCH scopes with phased HTTP ingestion."""
+    """Coordinates bounded Pod/PVC/PV LIST/WATCH scopes and ingestion.
+
+    The historical class name remains a compatibility alias for tests and the
+    image entry point; the runtime itself is resource-dispatched.
+    """
 
     def __init__(
         self,
@@ -621,6 +628,7 @@ class KubernetesPodCollectorRuntime:
         collector_id: str,
         kubernetes_client: Any,
         transport: IngestionTransport,
+        volume_identity_key: str | bytes | None = None,
         monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         settings.validate()
@@ -635,6 +643,17 @@ class KubernetesPodCollectorRuntime:
         self._client = kubernetes_client
         self._transport = transport
         self._monotonic = monotonic
+        if isinstance(volume_identity_key, str):
+            volume_identity_key = volume_identity_key.encode("utf-8")
+        self._volume_identity_key = (
+            None if volume_identity_key is None else bytes(volume_identity_key)
+        )
+        if self._settings.pv_inventory_enabled and (
+            self._volume_identity_key is None or len(self._volume_identity_key) < 32
+        ):
+            raise CollectorConfigurationError(
+                "PV inventory requires a 32+ byte volume identity key"
+            )
         self._effective_requests = _EffectiveRequestCache(settings.max_snapshot_items)
         self._limits = CollectorLimits(
             list_page_size=settings.list_page_size,
@@ -670,28 +689,62 @@ class KubernetesPodCollectorRuntime:
     ) -> KubernetesCollectionEngine:
         factory = (lambda: snapshot_id) if snapshot_id is not None else uuid4
 
-        def normalize_with_history(raw: Any) -> Any:
-            uid = _raw_pod_uid(raw)
-            previous_request = (
-                self._effective_requests.get(scope, uid) if uid is not None else None
+        if scope.api_resource == POD_API_RESOURCE:
+
+            def normalizer(raw: Any) -> Any:
+                uid = _raw_pod_uid(raw)
+                previous_request = (
+                    self._effective_requests.get(scope, uid)
+                    if uid is not None
+                    else None
+                )
+                normalized = normalize_pod(raw, previous_request=previous_request)
+                if (
+                    normalized.valid_for_metering
+                    and normalized.effective_request is not None
+                ):
+                    normalized_requests[normalized.uid] = normalized.effective_request
+                else:
+                    normalized_requests.pop(normalized.uid, None)
+                return normalized
+
+        elif scope.api_resource == PVC_API_RESOURCE:
+            normalizer = normalize_pvc
+        elif scope.api_resource == PV_API_RESOURCE:
+            if self._volume_identity_key is None:
+                raise CollectorConfigurationError(
+                    "PV normalization requires its identity key"
+                )
+
+            def normalizer(raw: Any) -> Any:
+                return normalize_pv(
+                    raw,
+                    source_cluster=scope.source_cluster,
+                    identity_key=self._volume_identity_key,
+                    identity_key_version=self._settings.volume_identity_key_version,
+                )
+
+        else:
+            raise CollectorConfigurationError(
+                "unsupported infrastructure inventory API resource"
             )
-            normalized = normalize_pod(raw, previous_request=previous_request)
-            if (
-                normalized.valid_for_metering
-                and normalized.effective_request is not None
-            ):
-                normalized_requests[normalized.uid] = normalized.effective_request
-            else:
-                normalized_requests.pop(normalized.uid, None)
-            return normalized
 
         return KubernetesCollectionEngine(
             self._client,
-            normalize_with_history,
+            normalizer,
             collector_id=self._collector_id,
             limits=self._limits,
             snapshot_id_factory=factory,
         )
+
+    def _scope_shadow_enabled(self, scope: InventoryScope) -> bool:
+        if scope.api_resource == POD_API_RESOURCE:
+            return self._settings.shadow_enabled
+        if scope.api_resource == PVC_API_RESOURCE:
+            return self._settings.pvc_shadow_enabled
+        if scope.api_resource == PV_API_RESOURCE:
+            return self._settings.pv_shadow_enabled
+        return False
 
     async def _post_model(self, path: str, model: BaseModel) -> bytes:
         return await self._transport.post(path, _model_payload(model))
@@ -738,6 +791,7 @@ class KubernetesPodCollectorRuntime:
             snapshot_id=snapshot_id,
         )
         with _SnapshotSpool(self._settings.max_snapshot_bytes) as spool:
+            pod_scope = scope.api_resource == POD_API_RESOURCE
             normalized_requests: dict[str, PodEffectiveRequest] = {}
             valid_updates: dict[str, PodEffectiveRequest] = {}
             seen_uids: set[str] = set()
@@ -746,7 +800,7 @@ class KubernetesPodCollectorRuntime:
                 spool.append(item)
                 seen_uids.add(item.uid)
                 request = normalized_requests.pop(item.uid, None)
-                if item.valid_for_metering:
+                if item.valid_for_metering and pod_scope:
                     if request is None:
                         raise CollectorRuntimeError("missing-effective-request")
                     valid_updates[item.uid] = request
@@ -767,16 +821,17 @@ class KubernetesPodCollectorRuntime:
                 # historical state instead of observing current Kubernetes.
                 resource_version=(
                     ticket.last_resource_version
-                    if self._settings.shadow_enabled
+                    if self._scope_shadow_enabled(scope)
                     else None
                 ),
             )
-            self._effective_requests.reconcile_list(
-                scope,
-                seen_uids=seen_uids,
-                valid_updates=valid_updates,
-                complete=snapshot.complete,
-            )
+            if pod_scope:
+                self._effective_requests.reconcile_list(
+                    scope,
+                    seen_uids=seen_uids,
+                    valid_updates=valid_updates,
+                    complete=snapshot.complete,
+                )
             if snapshot.item_count != spool.item_count:
                 raise CollectorRuntimeError("snapshot-spool-count-mismatch")
 
@@ -814,7 +869,7 @@ class KubernetesPodCollectorRuntime:
                 _snapshot_finalize_wire(
                     published_snapshot,
                     ticket=ticket,
-                    shadow_enabled=self._settings.shadow_enabled,
+                    shadow_enabled=self._scope_shadow_enabled(scope),
                 ),
             )
             await self._post_model(SNAPSHOT_FINALIZE_PATH, finalize)
@@ -836,6 +891,7 @@ class KubernetesPodCollectorRuntime:
         )
         starting_cursor = ticket.last_resource_version or resource_version
         expected_cursor = starting_cursor
+        pod_scope = scope.api_resource == POD_API_RESOURCE
         normalized_requests: dict[str, PodEffectiveRequest] = {}
 
         async def apply_observation(observation: WatchObservation) -> None:
@@ -855,7 +911,7 @@ class KubernetesPodCollectorRuntime:
                 },
             )
             await self._post_model(WATCH_APPLY_PATH, request)
-            if observation.item is not None:
+            if pod_scope and observation.item is not None:
                 if observation.event_type == WatchEventType.DELETED:
                     self._effective_requests.remove(scope, observation.item.uid)
                     normalized_requests.pop(observation.item.uid, None)
@@ -907,7 +963,7 @@ class KubernetesPodCollectorRuntime:
 
         cursor = snapshot.resource_version
         assert cursor is not None
-        if not self._settings.shadow_enabled:
+        if not self._scope_shadow_enabled(scope):
             # Collector-only mode can inventory and seal snapshots, but WATCH
             # mutations require the shadow interval mutator.  Do not let a
             # collector gate alone mutate interval state.
@@ -960,7 +1016,7 @@ class KubernetesPodCollectorRuntime:
                 )
                 if result.snapshot_complete:
                     consecutive_failures = 0
-                    if not self._settings.shadow_enabled:
+                    if not self._scope_shadow_enabled(scope):
                         await _wait_or_stop(
                             stop,
                             float(self._settings.relist_interval_seconds),
@@ -991,23 +1047,49 @@ class KubernetesPodCollectorRuntime:
                 await _wait_or_stop(stop, float(delay))
 
     async def run(self, stop: asyncio.Event) -> None:
-        """Run all allowlisted namespaces with bounded operation concurrency."""
+        """Run every enabled exact resource scope with bounded concurrency."""
 
         semaphore = asyncio.Semaphore(self._settings.scope_concurrency)
+        scopes = [
+            InventoryScope(
+                self._settings.stable_cluster_id,
+                POD_API_RESOURCE,
+                namespace,
+            )
+            for namespace in self._settings.namespace_allowlist
+        ]
+        if self._settings.pvc_inventory_enabled:
+            scopes.extend(
+                InventoryScope(
+                    self._settings.stable_cluster_id,
+                    PVC_API_RESOURCE,
+                    namespace,
+                )
+                for namespace in self._settings.namespace_allowlist
+            )
+        if self._settings.pv_inventory_enabled:
+            scopes.append(
+                InventoryScope(
+                    self._settings.stable_cluster_id,
+                    PV_API_RESOURCE,
+                    None,
+                    cluster_scoped=True,
+                )
+            )
         tasks = [
             asyncio.create_task(
                 self._scope_loop(
-                    InventoryScope(
-                        self._settings.stable_cluster_id,
-                        POD_API_RESOURCE,
-                        namespace,
-                    ),
+                    scope,
                     stop=stop,
                     semaphore=semaphore,
                 ),
-                name=f"infrastructure-metering-{namespace}",
+                name=(
+                    "infrastructure-metering-"
+                    f"{scope.api_resource.rsplit('/', 1)[-1]}-"
+                    f"{scope.namespace or 'cluster'}"
+                ),
             )
-            for namespace in self._settings.namespace_allowlist
+            for scope in scopes
         ]
         try:
             await stop.wait()
@@ -1070,7 +1152,7 @@ def _build_runtime_from_env(
     )
     try:
         core_api = _load_kubernetes_core_api(settings.deployment_mode)
-        raw_client = RawKubernetesPodClient(
+        raw_client = RawKubernetesClient(
             core_api,
             max_page_bytes=min(8 * 1024 * 1024, settings.max_snapshot_bytes),
             max_watch_event_bytes=min(2 * 1024 * 1024, settings.max_snapshot_bytes),
@@ -1080,6 +1162,11 @@ def _build_runtime_from_env(
             collector_id=collector_id,
             kubernetes_client=raw_client,
             transport=http_transport,
+            volume_identity_key=(
+                os.environ.get("INFRASTRUCTURE_METERING_VOLUME_IDENTITY_KEY", "")
+                if settings.pv_inventory_enabled
+                else None
+            ),
         )
     except Exception:
         # Construction happened before the async context can take ownership.

@@ -127,6 +127,12 @@ infrastructureMetering:
   shadowEnabled: false
   cutoverEnabled: false
   publicationEnabled: false
+  pvcInventoryEnabled: false
+  pvInventoryEnabled: false
+  pvcShadowEnabled: false
+  pvShadowEnabled: false
+  pvcPublicationEnabled: false
+  pvPublicationEnabled: false
   stableClusterId: "srw-main-dev"
   ingestionSecretName: "srw-infra-metering-ingestion"
   networkPolicy:

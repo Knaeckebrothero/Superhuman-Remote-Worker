@@ -1,6 +1,59 @@
 {{- if and .Values.infrastructureMetering.shadowEnabled (not .Values.infrastructureMetering.collectorEnabled) }}
 {{- fail "infrastructureMetering.shadowEnabled requires collectorEnabled" }}
 {{- end }}
+{{- if and .Values.infrastructureMetering.pvcInventoryEnabled (not .Values.infrastructureMetering.collectorEnabled) }}
+{{- fail "infrastructureMetering.pvcInventoryEnabled requires collectorEnabled" }}
+{{- end }}
+{{- if and .Values.infrastructureMetering.pvInventoryEnabled (not .Values.infrastructureMetering.collectorEnabled) }}
+{{- fail "infrastructureMetering.pvInventoryEnabled requires collectorEnabled" }}
+{{- end }}
+{{- if and .Values.infrastructureMetering.pvInventoryEnabled (not .Values.infrastructureMetering.volumeIdentityKeyVersion) }}
+{{- fail "infrastructureMetering.pvInventoryEnabled requires volumeIdentityKeyVersion" }}
+{{- end }}
+{{- if and .Values.infrastructureMetering.collectorEnabled (not .Values.secrets.create) (not .Values.infrastructureMetering.ingestionSecretName) }}
+{{- fail "infrastructureMetering.collectorEnabled requires ingestionSecretName outside chart-managed secret mode" }}
+{{- end }}
+{{- if and .Values.infrastructureMetering.collectorEnabled .Values.infrastructureMetering.ingestionSecretName (eq .Values.infrastructureMetering.ingestionSecretName (include "srw.secretName" .)) }}
+{{- fail "infrastructureMetering.ingestionSecretName must be separate from the application Secret" }}
+{{- end }}
+{{- if and .Values.infrastructureMetering.pvInventoryEnabled (not .Values.secrets.create) (not .Values.infrastructureMetering.volumeIdentitySecretName) }}
+{{- fail "infrastructureMetering.pvInventoryEnabled requires volumeIdentitySecretName outside chart-managed secret mode" }}
+{{- end }}
+{{- if and .Values.infrastructureMetering.pvInventoryEnabled .Values.infrastructureMetering.volumeIdentitySecretName (eq .Values.infrastructureMetering.volumeIdentitySecretName (include "srw.secretName" .)) }}
+{{- fail "infrastructureMetering.volumeIdentitySecretName must be separate from the application Secret" }}
+{{- end }}
+{{- if .Values.infrastructureMetering.pvcShadowEnabled }}
+{{- if not .Values.infrastructureMetering.pvcInventoryEnabled }}
+{{- fail "infrastructureMetering.pvcShadowEnabled requires pvcInventoryEnabled" }}
+{{- end }}
+{{- if not .Values.infrastructureMetering.shadowEnabled }}
+{{- fail "infrastructureMetering.pvcShadowEnabled requires shadowEnabled" }}
+{{- end }}
+{{- end }}
+{{- if .Values.infrastructureMetering.pvShadowEnabled }}
+{{- if not .Values.infrastructureMetering.pvInventoryEnabled }}
+{{- fail "infrastructureMetering.pvShadowEnabled requires pvInventoryEnabled" }}
+{{- end }}
+{{- if not .Values.infrastructureMetering.shadowEnabled }}
+{{- fail "infrastructureMetering.pvShadowEnabled requires shadowEnabled" }}
+{{- end }}
+{{- end }}
+{{- if .Values.infrastructureMetering.pvcPublicationEnabled }}
+{{- if not .Values.infrastructureMetering.publicationEnabled }}
+{{- fail "infrastructureMetering.pvcPublicationEnabled requires publicationEnabled" }}
+{{- end }}
+{{- if not .Values.infrastructureMetering.pvcShadowEnabled }}
+{{- fail "infrastructureMetering.pvcPublicationEnabled requires pvcShadowEnabled" }}
+{{- end }}
+{{- end }}
+{{- if .Values.infrastructureMetering.pvPublicationEnabled }}
+{{- if not .Values.infrastructureMetering.publicationEnabled }}
+{{- fail "infrastructureMetering.pvPublicationEnabled requires publicationEnabled" }}
+{{- end }}
+{{- if not .Values.infrastructureMetering.pvShadowEnabled }}
+{{- fail "infrastructureMetering.pvPublicationEnabled requires pvShadowEnabled" }}
+{{- end }}
+{{- end }}
 {{- if and .Values.infrastructureMetering.sourceAwareReadsEnabled (not .Values.infrastructureMetering.v2ReadsEnabled) }}
 {{- fail "infrastructureMetering.sourceAwareReadsEnabled requires v2ReadsEnabled" }}
 {{- end }}
@@ -283,6 +336,14 @@ data:
   INFRASTRUCTURE_METERING_SHADOW_ENABLED: {{ .Values.infrastructureMetering.shadowEnabled | default false | quote }}
   INFRASTRUCTURE_METERING_CUTOVER_ENABLED: {{ .Values.infrastructureMetering.cutoverEnabled | default false | quote }}
   INFRASTRUCTURE_METERING_PUBLICATION_ENABLED: {{ .Values.infrastructureMetering.publicationEnabled | default false | quote }}
+  INFRASTRUCTURE_METERING_PVC_INVENTORY_ENABLED: {{ .Values.infrastructureMetering.pvcInventoryEnabled | default false | quote }}
+  INFRASTRUCTURE_METERING_PV_INVENTORY_ENABLED: {{ .Values.infrastructureMetering.pvInventoryEnabled | default false | quote }}
+  INFRASTRUCTURE_METERING_PVC_SHADOW_ENABLED: {{ .Values.infrastructureMetering.pvcShadowEnabled | default false | quote }}
+  INFRASTRUCTURE_METERING_PV_SHADOW_ENABLED: {{ .Values.infrastructureMetering.pvShadowEnabled | default false | quote }}
+  INFRASTRUCTURE_METERING_PVC_PUBLICATION_ENABLED: {{ .Values.infrastructureMetering.pvcPublicationEnabled | default false | quote }}
+  INFRASTRUCTURE_METERING_PV_PUBLICATION_ENABLED: {{ .Values.infrastructureMetering.pvPublicationEnabled | default false | quote }}
+  INFRASTRUCTURE_METERING_VOLUME_IDENTITY_KEY_VERSION: {{ .Values.infrastructureMetering.volumeIdentityKeyVersion | default "" | quote }}
+  INFRASTRUCTURE_METERING_VOLUME_RESOURCE_MAPPINGS_JSON: {{ .Values.infrastructureMetering.volumeResourceMappings | default list | toJson | quote }}
   INFRASTRUCTURE_METERING_STABLE_CLUSTER_ID: {{ .Values.infrastructureMetering.stableClusterId | default "" | quote }}
   INFRASTRUCTURE_METERING_DEPLOYMENT_MODE: {{ .Values.infrastructureMetering.deploymentMode | default "dedicated" | quote }}
   INFRASTRUCTURE_METERING_NAMESPACE_ALLOWLIST: {{ concat (list .Release.Namespace) (.Values.infrastructureMetering.namespaceAllowlist | default list) | uniq | join "," | quote }}

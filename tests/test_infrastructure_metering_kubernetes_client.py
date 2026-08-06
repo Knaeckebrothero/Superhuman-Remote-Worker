@@ -15,11 +15,16 @@ from orchestrator.services.infrastructure_metering.collectors.contracts import (
     WatchProtocolFailure,
 )
 from orchestrator.services.infrastructure_metering.collectors.kubernetes_client import (
+    RawKubernetesClient,
     RawKubernetesPodClient,
 )
 
 
 SCOPE = InventoryScope("dev-cluster", "core/v1/pods", "srw")
+PVC_SCOPE = InventoryScope("dev-cluster", "core/v1/persistentvolumeclaims", "srw")
+PV_SCOPE = InventoryScope(
+    "dev-cluster", "core/v1/persistentvolumes", None, cluster_scoped=True
+)
 
 
 class _Response:
@@ -51,8 +56,20 @@ class _CoreApi:
     def __init__(self, responses: list[_Response]):
         self.responses = responses
         self.calls: list[dict[str, Any]] = []
+        self.operations: list[str] = []
 
     def list_namespaced_pod(self, **kwargs):
+        self.operations.append("pod")
+        self.calls.append(kwargs)
+        return self.responses.pop(0)
+
+    def list_namespaced_persistent_volume_claim(self, **kwargs):
+        self.operations.append("pvc")
+        self.calls.append(kwargs)
+        return self.responses.pop(0)
+
+    def list_persistent_volume(self, **kwargs):
+        self.operations.append("pv")
         self.calls.append(kwargs)
         return self.responses.pop(0)
 
@@ -114,6 +131,85 @@ async def test_raw_client_requests_an_exact_nonzero_resource_version():
 
     assert api.calls[0]["resource_version"] == "17"
     assert api.calls[0]["resource_version_match"] == "Exact"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("scope", "operation", "namespaced"),
+    [
+        (SCOPE, "pod", True),
+        (PVC_SCOPE, "pvc", True),
+        (PV_SCOPE, "pv", False),
+    ],
+)
+async def test_general_raw_client_dispatches_each_supported_list_scope(
+    scope: InventoryScope, operation: str, namespaced: bool
+) -> None:
+    body = json.dumps({"metadata": {"resourceVersion": "17"}, "items": []}).encode()
+    api = _CoreApi([_Response(body)])
+
+    await RawKubernetesClient(api).list_resources(
+        scope=scope,
+        limit=500,
+        continue_token=None,
+        resource_version=None,
+    )
+
+    assert api.operations == [operation]
+    assert ("namespace" in api.calls[0]) is namespaced
+    if namespaced:
+        assert api.calls[0]["namespace"] == "srw"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("scope", "operation"),
+    [(PVC_SCOPE, "pvc"), (PV_SCOPE, "pv")],
+)
+async def test_general_raw_client_dispatches_storage_watch_scopes(
+    scope: InventoryScope, operation: str
+) -> None:
+    response = _Response(
+        b"",
+        segments=[
+            json.dumps(
+                {
+                    "type": "BOOKMARK",
+                    "object": {"metadata": {"resourceVersion": "18"}},
+                }
+            ).encode()
+            + b"\n"
+        ],
+    )
+    api = _CoreApi([response])
+
+    events = [
+        event
+        async for event in RawKubernetesClient(api).watch_resources(
+            scope=scope,
+            resource_version="17",
+            allow_bookmarks=True,
+            timeout_seconds=30,
+        )
+    ]
+
+    assert api.operations == [operation]
+    assert [event.event_type for event in events] == [WatchEventType.BOOKMARK]
+    assert events[0].resource_version == "18"
+
+
+@pytest.mark.asyncio
+async def test_general_raw_client_rejects_wrong_scope_for_known_resource() -> None:
+    wrong = InventoryScope("dev-cluster", "core/v1/persistentvolumes", "srw")
+    client = RawKubernetesClient(_CoreApi([]))
+
+    with pytest.raises(ValueError, match="Pod/PVC scopes"):
+        await client.list_resources(
+            scope=wrong,
+            limit=500,
+            continue_token=None,
+            resource_version=None,
+        )
 
 
 @pytest.mark.asyncio

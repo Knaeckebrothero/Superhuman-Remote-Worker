@@ -18,6 +18,14 @@ from pydantic import (
 
 from .collectors.contracts import WatchGapReason, normalized_payload
 from .collectors.pod_normalization import ALLOWED_POD_LABELS, POD_REQUESTS_ALGORITHM
+from .collectors.storage_normalization import (
+    ALLOWED_PV_FINALIZERS,
+    ALLOWED_STORAGE_LABELS,
+    CSI_VOLUME_IDENTITY_SCHEME,
+    PVC_STORAGE_REQUEST_ALGORITHM,
+    PV_STORAGE_CAPACITY_ALGORITHM,
+    PV_UID_IDENTITY_SCHEME,
+)
 
 
 _CLUSTER_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
@@ -273,6 +281,225 @@ def validate_normalized_pod_payload(value: dict[str, Any]) -> dict[str, Any]:
     return value
 
 
+class _StorageQuantityEvidence(_StrictModel):
+    original: str = Field(min_length=1, max_length=128)
+    decimal_value: str = Field(min_length=1, max_length=128)
+    normalized_value: int = Field(ge=0, le=2**63 - 1)
+    normalized_unit: Literal["byte"]
+
+
+class _StorageCapacity(_StrictModel):
+    storage_bytes: int = Field(ge=0, le=2**63 - 1)
+    source: Literal["pvc-requested-storage", "pv-provisioned-capacity"]
+    measurement_algorithm: Literal[
+        PVC_STORAGE_REQUEST_ALGORITHM,
+        PV_STORAGE_CAPACITY_ALGORITHM,
+    ]
+
+
+class _StorageLifecycle(_StrictModel):
+    phase: str | None = Field(default=None, max_length=64)
+    accrues: Literal[True]
+    deletion_requested: bool
+    creation_timestamp: str | None = Field(default=None, max_length=64)
+    deletion_timestamp: str | None = Field(default=None, max_length=64)
+
+
+class _PVStorageLifecycle(_StorageLifecycle):
+    has_deletion_protection_finalizer: bool
+
+
+class _StorageDiagnostic(_StrictModel):
+    code: str = Field(pattern=r"^[a-z][a-z0-9-]{0,63}$")
+    path: str = Field(min_length=1, max_length=512)
+
+
+class _StorageOwnerReference(_StrictModel):
+    kind: str = Field(min_length=1, max_length=128)
+    uid: str = Field(min_length=1, max_length=256)
+    name: str = Field(min_length=1, max_length=253)
+
+
+class _StorageBasePayload(_StrictModel):
+    api_version: str = Field(min_length=1, max_length=64)
+    name: str = Field(min_length=1, max_length=253)
+    uid: str = Field(min_length=1, max_length=256)
+    resource_version: str | None = Field(default=None, max_length=1024)
+    labels: dict[str, str]
+    owner_references: list[_StorageOwnerReference] = Field(max_length=1_000)
+    lifecycle: _StorageLifecycle
+    capacity: _StorageCapacity | None
+    capacity_evidence: _StorageQuantityEvidence | None
+    storage_class: str | None = Field(default=None, max_length=253)
+    access_modes: list[str] = Field(max_length=32)
+    volume_mode: str | None = Field(default=None, max_length=64)
+    measurement_algorithm: Literal[
+        PVC_STORAGE_REQUEST_ALGORITHM,
+        PV_STORAGE_CAPACITY_ALGORITHM,
+    ]
+    diagnostics: list[_StorageDiagnostic] = Field(max_length=2_000)
+    valid_for_metering: bool
+    revision_hash: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+
+    @field_validator("labels")
+    @classmethod
+    def labels_are_allowlisted(cls, value: dict[str, str]) -> dict[str, str]:
+        if len(value) > len(ALLOWED_STORAGE_LABELS):
+            raise ValueError("too many storage attribution labels")
+        for key, label_value in value.items():
+            if key not in ALLOWED_STORAGE_LABELS:
+                raise ValueError("storage attribution label is not allowlisted")
+            if len(label_value) > 63 or any(char.isspace() for char in label_value):
+                raise ValueError("storage attribution label value is invalid")
+        return value
+
+    @field_validator("access_modes")
+    @classmethod
+    def access_modes_are_bounded(cls, value: list[str]) -> list[str]:
+        if value != sorted(set(value)):
+            raise ValueError("storage access modes must be unique and sorted")
+        if any(not item or len(item) > 64 or item != item.strip() for item in value):
+            raise ValueError("storage access mode is invalid")
+        return value
+
+    @model_validator(mode="after")
+    def capacity_matches_validity(self) -> "_StorageBasePayload":
+        if self.valid_for_metering:
+            if (
+                self.capacity is None
+                or self.capacity_evidence is None
+                or self.revision_hash is None
+            ):
+                raise ValueError("meterable storage payload lacks capacity or revision")
+            if self.capacity.storage_bytes != self.capacity_evidence.normalized_value:
+                raise ValueError("storage capacity differs from quantity evidence")
+            if self.capacity.measurement_algorithm != self.measurement_algorithm:
+                raise ValueError("storage capacity algorithm differs from payload")
+        elif self.revision_hash is not None:
+            raise ValueError("invalid storage payload cannot claim a revision")
+        return self
+
+
+class _NormalizedPVCPayload(_StorageBasePayload):
+    source_kind: Literal["pvc"]
+    namespace: str = Field(min_length=1, max_length=253)
+    bound_volume_name: str | None = Field(default=None, max_length=253)
+    measurement_basis: Literal["claim-requested"]
+    measurement_algorithm: Literal[PVC_STORAGE_REQUEST_ALGORITHM]
+
+    @model_validator(mode="after")
+    def pvc_capacity_contract(self) -> "_NormalizedPVCPayload":
+        if self.capacity is not None:
+            if (
+                self.capacity.source != "pvc-requested-storage"
+                or self.capacity.measurement_algorithm != PVC_STORAGE_REQUEST_ALGORITHM
+            ):
+                raise ValueError("PVC capacity has the wrong provenance")
+        return self
+
+
+class _VolumeIdentity(_StrictModel):
+    scheme: Literal[CSI_VOLUME_IDENTITY_SCHEME, PV_UID_IDENTITY_SCHEME]
+    key_version: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$")
+    key_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    durable_asset_id: str = Field(min_length=1, max_length=256)
+    pv_uid: str = Field(min_length=1, max_length=256)
+
+    @model_validator(mode="after")
+    def identity_matches_scheme(self) -> "_VolumeIdentity":
+        if self.scheme == CSI_VOLUME_IDENTITY_SCHEME:
+            if not re.fullmatch(r"[0-9a-f]{64}", self.durable_asset_id):
+                raise ValueError("CSI durable asset identity is invalid")
+        elif self.durable_asset_id != self.pv_uid:
+            raise ValueError("fallback durable asset identity must be the PV UID")
+        return self
+
+
+class _VolumeClaimReference(_StrictModel):
+    uid: str = Field(min_length=1, max_length=256)
+    namespace: str = Field(min_length=1, max_length=253)
+    name: str = Field(min_length=1, max_length=253)
+
+
+class _NormalizedPVPayload(_StorageBasePayload):
+    source_kind: Literal["volume"]
+    namespace: None
+    lifecycle: _PVStorageLifecycle
+    volume_identity: _VolumeIdentity
+    reclaim_policy: str | None = Field(default=None, max_length=64)
+    finalizers: list[
+        Literal[
+            "external-provisioner.volume.kubernetes.io/finalizer",
+            "kubernetes.io/pv-controller",
+            "kubernetes.io/pv-protection",
+        ]
+    ] = Field(max_length=len(ALLOWED_PV_FINALIZERS))
+    claim_reference: _VolumeClaimReference | None
+    csi_driver: str | None = Field(default=None, max_length=253)
+    measurement_basis: Literal["volume-provisioned"]
+    measurement_algorithm: Literal[PV_STORAGE_CAPACITY_ALGORITHM]
+    mapping_state: Literal["unmapped"]
+    resource: Literal["unmapped_block_volume"]
+
+    @field_validator("finalizers")
+    @classmethod
+    def finalizers_are_unique_and_sorted(cls, value: list[str]) -> list[str]:
+        if value != sorted(set(value)):
+            raise ValueError("PV finalizers must be unique and sorted")
+        return value
+
+    @model_validator(mode="after")
+    def pv_identity_and_capacity_contract(self) -> "_NormalizedPVPayload":
+        if self.uid != self.volume_identity.durable_asset_id:
+            raise ValueError("PV inventory UID differs from durable asset identity")
+        if self.volume_identity.scheme == CSI_VOLUME_IDENTITY_SCHEME:
+            if not self.csi_driver:
+                raise ValueError("CSI volume identity requires a driver")
+        elif self.csi_driver is not None:
+            raise ValueError("PV UID fallback cannot claim a CSI driver")
+        if self.capacity is not None:
+            if (
+                self.capacity.source != "pv-provisioned-capacity"
+                or self.capacity.measurement_algorithm != PV_STORAGE_CAPACITY_ALGORITHM
+            ):
+                raise ValueError("PV capacity has the wrong provenance")
+        return self
+
+
+class _NormalizedStorageFallback(_StrictModel):
+    source_kind: Literal["pvc", "volume"]
+    uid: str = Field(min_length=1, max_length=256)
+    namespace: str | None = Field(default=None, max_length=253)
+    valid_for_metering: Literal[False]
+    revision_hash: None
+    normalization_error: str = Field(pattern=r"^[a-z][a-z0-9-]{0,63}$")
+
+
+_NORMALIZED_PVC_PAYLOAD = TypeAdapter(
+    _NormalizedPVCPayload | _NormalizedStorageFallback
+)
+_NORMALIZED_PV_PAYLOAD = TypeAdapter(_NormalizedPVPayload | _NormalizedStorageFallback)
+
+
+def validate_normalized_pvc_payload(value: dict[str, Any]) -> dict[str, Any]:
+    """Recursively validate the only PVC JSONB shapes accepted by ingestion."""
+
+    parsed = _NORMALIZED_PVC_PAYLOAD.validate_python(value)
+    if isinstance(parsed, _NormalizedStorageFallback) and parsed.source_kind != "pvc":
+        raise ValueError("PVC fallback carries the wrong source kind")
+    return value
+
+
+def validate_normalized_pv_payload(value: dict[str, Any]) -> dict[str, Any]:
+    """Recursively validate the raw-handle-free PV JSONB ingestion shape."""
+
+    parsed = _NORMALIZED_PV_PAYLOAD.validate_python(value)
+    if isinstance(parsed, _NormalizedStorageFallback):
+        if parsed.source_kind != "volume" or parsed.namespace is not None:
+            raise ValueError("PV fallback carries an invalid exact-scope identity")
+    return value
+
+
 class InventoryTicketRequest(_StrictModel):
     scope: InventoryScopeWire
     intent: Literal["snapshot", "watch-session"]
@@ -523,4 +750,6 @@ __all__ = [
     "WATCH_BODY_LIMIT",
     "WatchObservationWire",
     "validate_normalized_pod_payload",
+    "validate_normalized_pvc_payload",
+    "validate_normalized_pv_payload",
 ]
