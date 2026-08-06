@@ -46,6 +46,10 @@ APP_INGESTION_MIGRATION = (
     ROOT
     / "orchestrator/database/migrations/app/0087_inventory_ingestion_foundations.sql"
 )
+APP_INGESTION_SIZE_FIX = (
+    ROOT
+    / "orchestrator/database/migrations/app/0088_inventory_ingestion_logical_size.sql"
+)
 AUDIT_EXPANSION = (
     ROOT
     / "orchestrator/database/migrations/audit/0003_infrastructure_usage_events_v2.sql"
@@ -280,6 +284,18 @@ def test_app_ingestion_migration_has_fenced_replay_and_watch_contracts() -> None
     assert "only expired unbound inventory ingest tickets may be deleted" in sql
 
 
+def test_app_ingestion_size_fix_uses_logical_json_bytes() -> None:
+    sql = APP_INGESTION_SIZE_FIX.read_text()
+    function_body = sql.split("AS $$", 1)[1]
+
+    assert (
+        "CREATE OR REPLACE FUNCTION resource_inventory_snapshot_item_size_bytes" in sql
+    )
+    assert "octet_length(normalized_item::TEXT)" in function_body
+    assert "octet_length(item_error::TEXT)" in function_body
+    assert "pg_column_size" not in function_body
+
+
 def test_interval_constraints_bind_identity_dimensions_and_time() -> None:
     sql = _compact(APP_MIGRATION.read_text())
 
@@ -489,10 +505,11 @@ def test_migration_heads_are_unique_and_snapshots_are_not_the_contract() -> None
     for files in (app_files, audit_files):
         prefixes = [path.name.split("_", 1)[0] for path in files]
         assert len(prefixes) == len(set(prefixes))
-    assert app_files[-1].name == APP_INGESTION_MIGRATION.name
+    assert app_files[-1].name == APP_INGESTION_SIZE_FIX.name
     assert audit_files[-1].name == AUDIT_PROJECT_INDEX.name
     assert "schema_current" not in APP_MIGRATION.read_text()
     assert "schema_current" not in APP_INGESTION_MIGRATION.read_text()
+    assert "schema_current" not in APP_INGESTION_SIZE_FIX.read_text()
     assert "audit_schema_current" not in AUDIT_EXPANSION.read_text()
 
 
@@ -516,6 +533,30 @@ async def test_app_ingestion_migration_applies_after_slice0_on_postgres16(
         )
         await conn.execute(APP_MIGRATION.read_text())
         await conn.execute(APP_INGESTION_MIGRATION.read_text())
+        await conn.execute(APP_INGESTION_SIZE_FIX.read_text())
+
+        await conn.execute(
+            "CREATE TEMP TABLE inventory_size_probe ("
+            "source_kind TEXT, source_uid TEXT, revision_hash TEXT, "
+            "normalized_item JSONB, item_error JSONB)"
+        )
+        returning_bytes = await conn.fetchval(
+            "WITH inserted AS ("
+            "INSERT INTO inventory_size_probe SELECT "
+            "'pod', 'toast-probe', repeat('0', 64), "
+            "jsonb_build_object('payload', repeat('compressible-value-', 2000)), "
+            "NULL RETURNING *) "
+            "SELECT resource_inventory_snapshot_item_size_bytes("
+            "source_kind, source_uid, revision_hash, normalized_item, item_error) "
+            "FROM inserted"
+        )
+        stored_bytes = await conn.fetchval(
+            "SELECT resource_inventory_snapshot_item_size_bytes("
+            "source_kind, source_uid, revision_hash, normalized_item, item_error) "
+            "FROM inventory_size_probe"
+        )
+        assert returning_bytes == stored_bytes
+        assert returning_bytes > 30_000
 
         tables = await conn.fetch(
             "SELECT tablename FROM pg_tables WHERE schemaname='public' "
@@ -559,6 +600,7 @@ async def test_snapshot_ticket_turns_abandoned_watch_into_recovery_gap(
         )
         await setup.execute(APP_MIGRATION.read_text())
         await setup.execute(APP_INGESTION_MIGRATION.read_text())
+        await setup.execute(APP_INGESTION_SIZE_FIX.read_text())
 
         pool = await asyncpg.create_pool(dsn, min_size=1, max_size=4)
         store = InventoryStore(pool)
@@ -824,6 +866,7 @@ async def test_pod_reconciler_revalidates_attribution_and_lifetime_evidence(
         )
         await setup.execute(APP_MIGRATION.read_text())
         await setup.execute(APP_INGESTION_MIGRATION.read_text())
+        await setup.execute(APP_INGESTION_SIZE_FIX.read_text())
         await setup.execute(
             "CREATE TABLE jobs ("
             "id UUID PRIMARY KEY, user_id UUID, project_id UUID, "
@@ -1315,6 +1358,7 @@ async def test_inventory_store_snapshot_watch_and_recovery_are_atomic(
         )
         await setup.execute(APP_MIGRATION.read_text())
         await setup.execute(APP_INGESTION_MIGRATION.read_text())
+        await setup.execute(APP_INGESTION_SIZE_FIX.read_text())
     finally:
         await setup.close()
 
@@ -1414,7 +1458,15 @@ async def test_inventory_store_snapshot_watch_and_recovery_are_atomic(
             "pod",
             "new",
             revisions["d"],
-            {"source_kind": "pod", "uid": "new", "namespace": "workers"},
+            {
+                "source_kind": "pod",
+                "uid": "new",
+                "namespace": "workers",
+                # Cross PostgreSQL's TOAST threshold. Before migration 0088,
+                # INSERT ... RETURNING counted this expanded datum while the
+                # ticket trigger compared its compressed stored form.
+                "diagnostic_padding": "compressible-value-" * 2_000,
+            },
             True,
         ),
     )

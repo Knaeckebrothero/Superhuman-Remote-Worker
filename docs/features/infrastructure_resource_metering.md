@@ -12,7 +12,7 @@ tags:
 # Application infrastructure allocation metering
 
 **Status:** Slice 0 and the shadow-only foundation of Slice 1 are implemented as
-a dark launch through app migration `0087`. The dedicated Kubernetes Pod
+a dark launch through app migration `0088`. The dedicated Kubernetes Pod
 collector, namespace-scoped RBAC, authenticated and generation-fenced ingestion,
 exact LIST/WATCH continuity recovery, app-DB workspace Pod intervals, immutable
 shadow comparisons, and bounded retention are present; all runtime gates still
@@ -1745,7 +1745,9 @@ its blocking maintenance-window requirement for large retained ledgers.
 The shadow-only Slice 1 foundation adds app `0087`: one-use ingestion tickets,
 transport replay nonces, WATCH sessions/events, recovery-epoch metadata,
 workspace comparison diagnostics, and database-enforced retention terminals.
-It adds no audit publication or cutover path.
+App `0088` makes snapshot byte accounting use logical JSON bytes rather than
+TOAST-dependent physical sizes. Neither migration adds an audit publication or
+cutover path.
 
 1. **Expand audit first.** Add nullable v2 event fields/checks and create future
    partitions. Existing writers/readers continue to work. A runtime capability
