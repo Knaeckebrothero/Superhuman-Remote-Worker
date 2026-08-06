@@ -35,12 +35,17 @@ aliases:
 Tests: create-once/no-op/violation + push_ref + no-spray pins
 (tests/test_managers_git.py), tag-dereferences-to-completion-commit +
 double-completion idempotency (tests/test_phase_git.py).
-Remaining OPEN (adjacent, not this defect): fix direction 4 — the graph can
-still archive the same phase instance twice (the duplicate transition that
-*triggered* the moves; now harmless to tags but still a graph exactly-once
-gap) — and direction 5 (strategic review consuming orchestrator phase events
-instead of assuming tags), which is softened now that a tag, when present,
-is guaranteed current.
+Fix direction 4 **closed 2026-08-06 (batch #3)**: `archive_phase` carries an
+exactly-once guard keyed on the checkpointed
+`last_archived_phase = "<phase_number>:<type>"` — the rejection-retry route
+(transition rejected → execute → re-completion) no longer re-archives the
+same boundary (re-archive/re-snapshot/re-extract all skipped, INFO
+"already archived — exactly-once guard"); a successful transition changes
+the phase number and re-arms it. Pinned by
+tests/test_archive_phase_exactly_once.py (4).
+Remaining OPEN (adjacent, not this defect): direction 5 (strategic review
+consuming orchestrator phase events instead of assuming tags), softened now
+that a tag, when present, is guaranteed current.
 
 **Originally:** OPEN. P1 phase evidence / Git observability defect. Branch
 commits and deliverables remained safe, but remote phase tags can describe an
