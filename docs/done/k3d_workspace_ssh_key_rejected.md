@@ -1,6 +1,30 @@
 # k3d: workspace pods reject the provisioner's SSH key (all jobs fail pre-dispatch)
 
-**Status:** Open, environment-only (k3d cluster `srw`). Dev cluster unaffected
+**Status:** RESOLVED — root-caused + live-verified 2026-08-06 (batch fix
+session). Not key drift at all: the Secret was internally consistent
+(`srw-vm-ssh-key` private key == offered fingerprint `SHA256:y7t/35gU/…` ==
+the pod's installed `authorized_keys`). The real chain: `4f27f581`
+(08-03 12:21) ADDED the SSH-auth readiness gate (`wait_for_agent_ssh`) to
+`_wait_for_ready` — before it the provisioner returned pod IP on K8s-ready
+without probing auth. The probe then failed because the chart projects the
+Secret key as **0444** and root-running OpenSSH refuses a group/other-readable
+identity file ("bad permissions → Permission denied (publickey)") — the doc's
+quoted error tail was just ssh's known-hosts warning line, truncated by log
+formatting. Timeline fits exactly: last success 08-02 18:40, gate landed
+08-03 12:21, first failure 08-03 14:47. The FIX also already landed:
+`52c1ba80` (08-04 22:36) added `_stage_runtime_ssh_key`
+(`resolve_ssh_key_path` stages an atomic runtime-owned 0600 copy) + its
+tests — hours AFTER this doc was filed, and nobody re-ran a job.
+Live verification 2026-08-06: manual probe from the orchestrator pod with the
+staged key → exit 0; smoke job `58ba61ef` (plain POST /api/jobs) provisioned
+("Workspace SSH authenticated … attempts=1"), reached `processing`, made LLM
+calls, and **completed**; three later jobs provisioned the same way
+(1-attempt SSH auth each). Dev was never affected because its non-root
+production image passes OpenSSH's other-uid special case.
+Residual papercut kept open in this doc's Impact section: a provisioning
+failure writes only `failed` + empty `error` column (reason lives solely in
+orchestrator logs).
+**Originally:** Open, environment-only (k3d cluster `srw`). Dev cluster unaffected
 (jobs provisioned fine there the same day). Filed 2026-08-04 during the Job
 Bench k3d smoke.
 
