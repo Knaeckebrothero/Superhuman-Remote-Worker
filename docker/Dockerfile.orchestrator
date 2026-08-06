@@ -55,7 +55,9 @@ ENV PYTHONUNBUFFERED=1 \
     SRW_DOCUMENTATION_URL=${SRW_DOCUMENTATION_URL}
 
 # Create non-root user early so COPY --chown can reference it
-RUN groupadd -r srw && useradd -r -g srw srw
+# Keep the runtime identity numeric and stable: Kubernetes cannot prove that a
+# named image user satisfies runAsNonRoot, and the collector Pod pins this ID.
+RUN groupadd -r -g 999 srw && useradd -r -u 999 -g srw srw
 
 WORKDIR /app
 
