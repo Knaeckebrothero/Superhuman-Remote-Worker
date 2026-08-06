@@ -18,14 +18,16 @@ function collectEnumPaths(node, prefix = '') {
 // generator.mjs's validate() (customer-facing profile fields) or whitelist it as
 // operator-only. `databases.neo4j.edition` + `vmController.transport` are the
 // generator-validated ones; the `canvas.livePreview.viewer.*` enums are operator
-// edge-topology settings and `workspace.accessMode` is an operator storage
-// setting that the customer config generator never surfaces.
+// edge-topology settings, `workspace.accessMode` is an operator storage setting,
+// and `infrastructureMetering.deploymentMode` is an operator rollout setting.
+// The customer config generator never surfaces those operator-only values.
 const KNOWN_ENUM_PATHS = [
   'databases.neo4j.edition',
   'vmController.transport',
   'canvas.livePreview.viewer.deploymentProfile',
   'canvas.livePreview.viewer.cookieMode',
   'workspace.accessMode',
+  'infrastructureMetering.deploymentMode',
 ];
 
 const evalInputs = {
