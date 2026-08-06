@@ -432,3 +432,129 @@ contracts). +59 net new passing tests.
 - Test jobs left on the cluster: `803df0bd`, `012ea267` (both
   pending_review, deliberate A/B pair), session thread `1131cea3` (live),
   `0870dec3` (ended). Safe to clean.
+
+## Session log 2026-08-06 (batch #3)
+
+Autonomous ~4.5 h implementation session on `develop` (local k3d via Tilt),
+night after batch #2. Four tasks, five commits, nothing pushed by this
+session. Mid-session a parallel actor pushed the pre-existing 19-commit
+stack to origin (origin/develop == pre-batch-#3 HEAD) and edited
+`.github/workflows/*` in the shared working tree — those files were left
+strictly unstaged.
+
+**Task 1 (main) — finalization decisions journal
+(`job_finalization_decisions_held_only_in_process_memory`, now docs/done/)**
+— commit `fix(finalization): journal-before-observe — job-ending decisions
+survive restarts`. The two job-terminating decisions lived only in
+module-level dicts; any restart converted "I decided" into "no decision"
+and phase.py fabricated a placeholder report. Now: `job_complete` journals
+the decision on the job row through the orchestrator BEFORE returning
+(`POST/GET /api/jobs/{id}/completion-decision`, idempotent on
+`(job_id, tool_call_id)` via `InjectedToolCallId`, CAS vs terminal rows,
+one atomic statement on the row the status transition later updates); the
+audited tool node mirrors journaled decisions into checkpointed state
+(`completion_decision`/`verdict_decision` + a real `is_final_phase=True` —
+the flag was never set anywhere before); finalize reads cache →
+checkpointed mirror; resume hydrates the cache from the durable record
+(never on feedback resumes — `queue_job_for_resume` voids the journal in
+the same statement, opt-out for the re-provisioning park); the placeholder
+fabrication is dead (worker → loud reject_transition; no-verdict critic →
+honest zero-confidence report + ledger escalation). Verified: 20 new unit
+tests + 4 real-Postgres pins + endpoint-inventory regen, and BOTH k3d
+kill-tests: worker job `965b0935` — journal at 22:30:08, pod force-killed
+the same second (freeze report never delivered), re-dispatch at 22:31:57
+logged `Hydrated completion decision … (tool_call_id=chatcmpl-tool-8b6e…)`
+and froze with the ORIGINAL summary field-for-field; critic `97c2dcd6` —
+ledger round at 22:37:02, pod killed +1s, resumed critic logged `Recovered
+critic verdict from graph state (process cache empty after restart)`,
+rebuilt the APPROVED verdict freeze, orchestrator resolved the target
+`pending_review` from the ledger. No migration needed (JSONB context).
+
+**Task 2 — embedding batch overflow
+(`embedding_batch_overflow_skips_citation_source_embeddings`, stays in
+issues/ for the ops tail)** — commit `fix(embeddings): split batches at the
+provider cap`. `EmbeddingService.embed_batch` is now THE batching seam:
+order-preserving slices ≤ `EMBEDDING_MAX_BATCH_SIZE` (default 64 = the TEI
+limit), transient-only retry via the shared `llm_retry` policy with
+deterministic 422/400 pinned `never_retry` (the shared classifier defaults
+unknown 4xx to "transient" — caught by the new tests), typed
+`EmbeddingInvalidVectorError` for NaN/Inf, per-source
+`metadata.embedding_state` (complete/failed + typed reason),
+`embedding_coverage` in citation statistics, and
+`scripts/backfill_source_embeddings.py` (dry-run default). Verified: 13
+unit tests against a mock 64-cap-422 provider; backfill dry-run against
+the k3d vector DB reported the live gap (54 (job, source) pairs across 5
+jobs). Owed: `--apply` run against main (where the 359 skipped sources
+live) + a source-heavy re-run for the zero-422 acceptance criterion.
+
+**Task 3 — doc-truth sweep** — commit `docs(sweep): batch #3 doc-truth
+sweep`. 8 read-only sonnet agents verified 83 docs (every
+BUILT/IMPLEMENTED/uncommitted claim + both ambiguous BACKLOG tiers)
+against HEAD. Tally: **52 confirmed shipped/archive → docs/done/** with
+inline evidence notes · **15 statuses corrected** in place · **16 verified
+accurate** (no edit) · **0 vanished** — every "uncommitted" claim had
+actually landed, mostly under rebased SHAs. The surprising failure mode
+was the OPPOSITE of the feared one: two docs claimed unbuilt work that was
+fully built (`codex_session_gateway_baseurl_401` superseded-but-resolved;
+`session_turn_hard_fails_on_transient_llm_outage` tracks 1+2 shipped), and
+two memory-index conflicts resolved in favor of the code (tool-enum-vocab
+fix committed `781285c9`; tool-surface S1 committed `99b87008`). Four NEW
+gaps discovered and recorded: `_send_session_attach` 4th call site missing
+`config_name=` (sessions.py:363), `sudo_request_status` REST/MCP filters
+never Literal-typed, `registered_tools` doc self-contradiction (resolved),
+`mcp_client` defect 1 (flat 30s timeout) still open. BACKLOG tables
+pruned: Built-but-unshipped 22 → 3 rows; Diagnosed 40 → 23 rows. Memory
+index corrected (3 files + 4 MEMORY.md lines).
+
+**Task 4 — batch-#2 residuals** — commit `fix(residuals): sweeper dials
+stable Service DNS; archive_phase exactly-once`. (a) `resolve_ssh_target`
+prefers `workspace_container.host` (headless-Service DNS, survives pod
+restarts) over the ephemeral `pod_ip` (legacy fallback kept); per-cycle
+dial-mix log line live on k3d: "IDE settings sweeper: 1 workspace(s), 1
+dialed via stable service DNS" — ide_settings done-doc now fully closed.
+(b) `archive_phase` exactly-once per phase instance via the checkpointed
+`last_archived_phase` key: the rejection-retry route no longer re-archives
+the same boundary (phase-tags doc direction 4 closed; direction 5 is the
+doc's last residual). 4+3 new tests; new agent image content-verified on
+k3d (`tilt-7c7fa845` carries guard + journal).
+
+**Commits (5, in order):** `docs(sweep): batch #3 doc-truth sweep — 52
+verified-shipped docs to done/, 15 status corrections` ·
+`fix(embeddings): split batches at the provider cap — citation sources
+index again` · `fix(finalization): journal-before-observe — job-ending
+decisions survive restarts` · `fix(residuals): sweeper dials stable
+Service DNS; archive_phase exactly-once` · plus this docs/BACKLOG commit.
+Subjects are the stable identifiers until push. Nothing else staged; the
+parallel session's `.github/workflows/*` edits and `HomeLab/` left
+untouched.
+
+**Pytest**: baseline at session start = 11 failed (batch #2's known
+env-noise set). Final = **11 failed / 14542 passed / 26 skipped** — the
+failure set is byte-identical (local-Postgres `test_database_phase1`, the
+`test_mcp_manager`/`test_mcp_agent_wiring` stack, `tools/research`
+installed-client contracts); zero regressions from this batch. +132 net
+new passing tests vs batch #2's close (44 new test functions from this
+session: 20 journal + 4 real-PG queue + 13 embedding + 4 archive-guard +
+3 ide-target, plus parametrizations and the parallel session's
+contributions).
+
+**Environment notes for the next batch:**
+- Read-only sweep agents share the main working tree — one misread my
+  in-flight main-loop edits as "unauthorized subagent changes" and spent
+  effort re-verifying around them. Brief such agents explicitly that the
+  main loop edits files concurrently.
+- A parallel actor can push origin and edit the working tree mid-session:
+  re-check `git status` before every staging step; the explicit-path
+  staging rule (never `git add -A`) is what kept the workflow edits out.
+- Kill-test rig (reusable, scripts in the batch-#3 scratchpad pattern):
+  API-created job with `config_override {autonomy: review, verification:
+  {enabled: true}}`; watcher greps agent logs for "marked as final phase"
+  (worker) or orchestrator logs for the verification-rounds POST (critic),
+  then `kubectl delete pod --grace-period=0 --force`; orphan re-dispatch
+  landed in ~2 min. Transient `kubectl run` pod (`imgcheck-*`) is the
+  cheap way to content-verify a freshly built image tag.
+- The verdict POST → checkpoint window is tight (~1s) but the checkpoint
+  captured the tool result even with the same-second kill — the
+  state-mirror recovery path is reachable in practice, not just in theory.
+- Test jobs left on the cluster: `965b0935` (pending_review, the kill-test
+  A/B pair's target) + critic `97c2dcd6` (completed). Safe to clean.
