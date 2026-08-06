@@ -11,7 +11,37 @@ tags:
 # Resume onto a fresh workspace never falls back to cloning the job repo — the agent silently restarts the job from zero
 
 **Filed:** 2026-07-27, from job `52949749` ("historische Kernwerke") on dev.
-**Status:** CONFIRMED in code + live incident 2026-07-25. UNFIXED.
+**Status:** FIXED 2026-08-06 (batch fix session). Root cause in today's code
+shape: a pod-handoff clone gate ALREADY existed in `_setup_job_workspace`
+(`resume and metadata.get("git_remote_url") and no .git → GitManager.clone`),
+but it was **dead code on every orchestrator-driven resume** —
+`JobResumeRequest` had no `git_remote_url` field and `_resume_job_on_agent`
+never sent it, so the gate's key was always absent. Fix = thread the remote
+through the resume wire: `_resume_job_on_agent` now sends
+`git_remote_url` (from `context.git_remote_url`, VM-scoped
+`externalize_gitea_url` rewrite mirroring the fresh path's F29),
+`JobResumeRequest` carries it, and both resume handlers (`dual_app.py` +
+legacy `app.py`) copy it into the agent metadata. Fix proposal 2 also done:
+every resume exit of `_setup_job_workspace` now logs
+`workspace_init_path=reattach|clone|snapshot|existing`, and a resume that
+falls through to blank init logs a WARNING
+(`workspace_init_path=blank`). Proposal 3 (refuse instead of restart) was
+NOT built — with the clone fallback reachable the blank tail now only
+triggers when the job repo is genuinely absent.
+**Tests:** `tests/test_resume_endpoint_delegation.py::TestResumePayloadGitRemote`
+(payload carries/omits the remote) and `tests/test_resume_git_remote_wire.py`
+(dual_app handler forwards it into `process_job` metadata).
+**Live k3d 2026-08-06:** job `ed7f93b4` paused mid-run with checkpoints
+intact, its workspace pod+PVC+Service force-deleted (the PVC-reclaim
+shape), then released for re-dispatch → resume lane → agent logs
+`hydrated task brief on resume` → `Pod handoff: cloning workspace` →
+`workspace_init_path=clone` → the fresh workspace contained the repo's
+files (`.git`, README, seed marker). Related lane note: a paused job whose
+checkpoints were pruned at a terminal state now takes the FRESH `/job/start`
+lane (batch-session lane fix), which clones the job repo through
+`WorkspaceManager._initialize_git` — observed live on `58ba61ef` — so both
+lanes now recover the repo instead of blank-initing.
+**Originally:** CONFIRMED in code + live incident 2026-07-25. UNFIXED.
 **Severity:** **high** — total, silent loss of work continuity. The agent
 believes it is starting a new job and re-plans from scratch while the entire
 committed history sits intact in Gitea.

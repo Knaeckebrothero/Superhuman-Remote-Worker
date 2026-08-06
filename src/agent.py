@@ -2337,8 +2337,11 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             )
 
         # VM recovery: seed fresh VM workspace from last snapshot if needed
+        _seeded_from_snapshot = False
         if resume and workspace_backend and workspace_backend.supports_shell:
-            self._reseed_from_snapshot_if_fresh(job_id, workspace_backend)
+            _seeded_from_snapshot = self._reseed_from_snapshot_if_fresh(
+                job_id, workspace_backend
+            )
 
         # G2: reattached remote workspace (PVC reattach on crash-recovery). The
         # working tree already lives on the REMOTE backend root, so the
@@ -2394,6 +2397,7 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                 max_todos=self.config.phase_settings.max_todos,
                 model_name=self.config.llm.model,
             )
+            logger.info(f"[{job_id}] workspace_init_path=reattach")
             logger.debug(
                 f"Resumed job {job_id} on reattached workspace at "
                 f"{workspace_backend.root}"
@@ -2462,6 +2466,7 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                     max_todos=self.config.phase_settings.max_todos,
                     model_name=self.config.llm.model,
                 )
+                logger.info(f"[{job_id}] workspace_init_path=clone")
                 logger.info(f"Pod handoff complete for job {job_id}")
                 return metadata or {}
             logger.warning(
@@ -2475,6 +2480,10 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
         # `rm -rf`. Probing a virtual file instead would answer "unseeded"
         # forever and wipe every git-less resume.
         if resume and workspace_is_seeded(self._workspace_manager.backend):
+            logger.info(
+                f"[{job_id}] workspace_init_path="
+                f"{'snapshot' if _seeded_from_snapshot else 'existing'}"
+            )
             logger.info(f"Resuming job {job_id} with existing workspace")
             # instructions.md is virtual (docs/features/virtual_directories.md)
             # and cannot go missing; the upload source (if any) was already
@@ -2511,6 +2520,16 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             return metadata or {}
 
         # Initialize workspace (creates directories)
+        if resume:
+            # Every resume source struck out: no reattached tree, no job-repo
+            # clone (git_remote_url absent or clone failed), no snapshot.
+            # Loudly distinguishable from a legitimate first dispatch —
+            # docs/issues/resume_fresh_workspace_no_clone_fallback.md.
+            logger.warning(
+                f"[{job_id}] workspace_init_path=blank — resume found no "
+                f"reattached tree, no clonable job repo, and no phase "
+                f"snapshot; starting from an empty workspace"
+            )
         if metadata.get("repositories"):
             self._workspace_manager.initialize_project_workspace()
         else:

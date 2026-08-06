@@ -683,3 +683,34 @@ class TestResumeEndpointGrantRecheck:
         assert "cannot be resolved" in ei.value.detail
         grant_recheck_collaborators.delegate.assert_not_awaited()
         grant_recheck_collaborators.queue_for_resume.assert_not_awaited()
+
+
+class TestResumePayloadGitRemote:
+    """The resume payload must carry the job repo remote.
+
+    Without it the agent's pod-handoff clone fallback
+    (``metadata["git_remote_url"]`` gate in ``_setup_job_workspace``) can
+    never fire, so a resume onto a fresh workspace with no snapshot silently
+    restarts from a blank tree
+    (docs/issues/resume_fresh_workspace_no_clone_fallback.md).
+    """
+
+    @pytest.mark.asyncio
+    async def test_resume_payload_carries_git_remote_for_pod_handoff(
+        self, resume_collaborators
+    ):
+        job = _job(context={"git_remote_url": "http://srw-gitea:3000/srw/job-1.git"})
+
+        assert await main._resume_job_on_agent(job, _agent()) is True
+
+        assert (
+            _posted_payload()["git_remote_url"] == "http://srw-gitea:3000/srw/job-1.git"
+        )
+
+    @pytest.mark.asyncio
+    async def test_resume_payload_omits_git_remote_when_job_has_none(
+        self, resume_collaborators
+    ):
+        assert await main._resume_job_on_agent(_job(), _agent()) is True
+
+        assert "git_remote_url" not in _posted_payload()

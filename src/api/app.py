@@ -1108,6 +1108,10 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
             resume_metadata["datasources"] = request.datasources
         if request.project_id:
             resume_metadata["project_id"] = request.project_id
+        if request.git_remote_url:
+            # Feeds the pod-handoff clone fallback in _setup_job_workspace
+            # (resume_fresh_workspace_no_clone_fallback.md).
+            resume_metadata["git_remote_url"] = request.git_remote_url
         if delegation_results:
             resume_metadata["delegation_results"] = delegation_results
 
