@@ -600,3 +600,149 @@ class TestKillSwitchMaterialization:
         assert not (tmp_path / "instructions.md").exists()
         assert not (tmp_path / "task_brief.md").exists()
         assert "instructions.md" not in agent._agent_seed_files
+
+
+class TestTaskBriefHydration:
+    """Resume-lane brief starvation
+    (docs/issues/fresh_job_dispatched_as_resume_skips_seeding.md).
+
+    JobResumeRequest ships no description/required_deliverables/kickoff, so
+    the resume path must (1) serve the brief from LIVE ``_job_metadata`` — a
+    bound alias goes stale when hydration replaces the dict — and (2)
+    backfill those fields from the orchestrator or the agent's DB handle.
+    """
+
+    def test_brief_reads_job_metadata_live(self, tmp_path):
+        ws = WorkspaceManager(job_id="t", backend=RemoteLikeBackend(tmp_path))
+        agent = _bare_agent(ws)
+        agent._job_metadata = {}
+
+        agent._deploy_instruction_files([])
+        # REPLACE (not mutate) the dict after provider registration: the old
+        # `metadata = self._job_metadata or {}` alias bound a different empty
+        # dict here and served an empty brief forever.
+        agent._job_metadata = {"description": "Sum the CSV"}
+
+        assert "Sum the CSV" in ws.read_file("task_brief.md")
+
+    def test_resume_metadata_shape_serves_empty_brief_without_hydration(self, tmp_path):
+        """The literal dual_app /job/resume metadata shape — documents the bug
+        hydration exists to fix."""
+        ws = WorkspaceManager(job_id="t", backend=RemoteLikeBackend(tmp_path))
+        agent = _bare_agent(ws)
+        agent._job_metadata = {
+            "config_upload_id": "u1",
+            "config_override": {},
+            "datasources": [],
+            "project_id": "p1",
+        }
+
+        agent._deploy_instruction_files([])
+
+        assert ws.read_file("task_brief.md") == "# Task Brief\n\n## Description\n\n"
+
+    @pytest.mark.asyncio
+    async def test_hydration_backfills_description_deliverables_and_kickoff(
+        self, tmp_path
+    ):
+        ws = WorkspaceManager(job_id="t", backend=RemoteLikeBackend(tmp_path))
+        agent = _bare_agent(ws)
+        agent._job_metadata = {}
+        agent._orchestrator_client = SimpleNamespace(
+            get_job_brief=AsyncMock(
+                return_value={
+                    "description": "Sum the CSV",
+                    "required_deliverables": ["output/a.md"],
+                    "kickoff_message": "Start with the header row.",
+                }
+            )
+        )
+        agent.postgres_conn = None
+
+        await agent._hydrate_job_brief("job-1")
+        agent._deploy_instruction_files([])
+
+        brief = ws.read_file("task_brief.md")
+        assert "Sum the CSV" in brief
+        assert "## Kickoff Message" in brief
+        assert "Start with the header row." in brief
+        assert "output/a.md" in brief
+
+    @pytest.mark.asyncio
+    async def test_hydration_never_overwrites_present_fields(self):
+        agent = _bare_agent(MagicMock())
+        agent._job_metadata = {"description": "fresh dispatch text"}
+        agent._orchestrator_client = SimpleNamespace(
+            get_job_brief=AsyncMock(
+                return_value={"description": "stale db text", "kickoff_message": "K"}
+            )
+        )
+        agent.postgres_conn = None
+
+        await agent._hydrate_job_brief("job-1")
+
+        assert agent._job_metadata["description"] == "fresh dispatch text"
+        assert agent._job_metadata["kickoff_message"] == "K"  # absent → backfilled
+
+    @pytest.mark.asyncio
+    async def test_hydration_falls_back_to_postgres_when_the_client_fails(self):
+        agent = _bare_agent(MagicMock())
+        agent._job_metadata = {}
+        agent._orchestrator_client = SimpleNamespace(
+            get_job_brief=AsyncMock(side_effect=RuntimeError("orchestrator down"))
+        )
+        # context arrives as a JSON string from the raw driver
+        agent.postgres_conn = SimpleNamespace(
+            jobs=SimpleNamespace(
+                get=AsyncMock(
+                    return_value={
+                        "description": "From the DB",
+                        "context": '{"required_deliverables": ["output/a.md"]}',
+                    }
+                )
+            )
+        )
+
+        await agent._hydrate_job_brief("11111111-1111-1111-1111-111111111111")
+
+        assert agent._job_metadata["description"] == "From the DB"
+        assert agent._job_metadata["required_deliverables"] == ["output/a.md"]
+
+    @pytest.mark.asyncio
+    async def test_hydration_failure_is_non_fatal_and_logs_error(self, caplog):
+        import logging
+
+        agent = _bare_agent(MagicMock())
+        agent._job_metadata = {}
+        agent._orchestrator_client = None
+        agent.postgres_conn = None
+
+        with caplog.at_level(logging.ERROR):
+            await agent._hydrate_job_brief("job-1")
+
+        assert any("could not be hydrated" in r.getMessage() for r in caplog.records)
+        assert agent._job_metadata == {}
+
+
+class TestResumeWithoutCheckpointTripwire:
+    """resume=True with nothing to resume from is always a routing bug —
+    it must scream (ERROR) and fall toward fresh seeding, not silently start
+    a blank job."""
+
+    @pytest.mark.asyncio
+    async def test_tripwire_logs_error_hydrates_and_seeds(self, caplog):
+        import logging
+
+        agent = _bare_agent(MagicMock())
+        agent._hydrate_job_brief = AsyncMock()
+        agent._commit_workspace_seed = MagicMock()
+
+        with caplog.at_level(logging.ERROR):
+            await agent._note_resume_without_checkpoint("job-1", "paused")
+
+        errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert len(errors) == 1
+        assert "resume=True" in errors[0].getMessage()
+        assert "'paused'" in errors[0].getMessage()
+        agent._hydrate_job_brief.assert_awaited_once_with("job-1")
+        agent._commit_workspace_seed.assert_called_once_with("job-1")
