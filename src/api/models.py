@@ -393,6 +393,14 @@ class JobResumeRequest(BaseModel):
         description="Job status before resume. Graceful stops (cancelled, paused, pending_review, waiting) "
         "skip snapshot recovery; crashes (processing, failed) use snapshot recovery.",
     )
+    git_remote_url: Optional[str] = Field(
+        default=None,
+        description=(
+            "Job repo remote for the pod-handoff clone fallback: a resume "
+            "onto a fresh workspace with no snapshot clones the job's own "
+            "Gitea repo instead of starting blank (set by orchestrator)."
+        ),
+    )
     delegation_results: Optional[Dict[str, Any]] = Field(
         default=None,
         description="Results from completed delegation children (set by orchestrator when "

@@ -3635,6 +3635,20 @@ async def _resume_job_on_agent(job: dict, agent: dict) -> bool:
         queued_feedback_reason = job_context.pop("queued_feedback_reason", None)
         delegation_results = job_context.pop("delegation_results", None)
 
+        # The per-job Gitea remote. Without it the agent's pod-handoff clone
+        # (resume onto a fresh workspace with no snapshot) can never fire and
+        # the job silently restarts from a blank tree
+        # (docs/issues/resume_fresh_workspace_no_clone_fallback.md). VM
+        # workspaces cannot resolve the cluster-internal Gitea host, so
+        # mirror the fresh path's VM-scoped rewrite (F29).
+        git_remote_url = job_context.get("git_remote_url")
+        if (
+            git_remote_url
+            and vm_ctx.get("status") == "ready"
+            and vm_ctx.get("ssh_host")
+        ):
+            git_remote_url = externalize_gitea_url(git_remote_url)
+
         resume_payload = {
             "job_id": job_id,
             "config_name": canonical_config_name(
@@ -3645,6 +3659,7 @@ async def _resume_job_on_agent(job: dict, agent: dict) -> bool:
             "datasources": datasources_payload,
             "project_id": str(job["project_id"]) if job.get("project_id") else None,
             "previous_status": job.get("status"),
+            "git_remote_url": git_remote_url,
         }
         if queued_feedback:
             resume_payload["feedback"] = queued_feedback
@@ -7117,8 +7132,9 @@ async def _try_dispatch_pending_jobs() -> None:
                 else:
                     if job["status"] == "paused":
                         logger.info(
-                            "Dispatcher: job %s is paused with no checkpoint — "
-                            "never started; dispatching via the fresh "
+                            "Dispatcher: job %s is paused with no checkpoint "
+                            "to resume from (never started, or pruned at a "
+                            "terminal state) — dispatching via the fresh "
                             "/job/start lane",
                             job_id,
                         )
@@ -19460,8 +19476,9 @@ async def assign_job_to_agent(
         else:
             if job["status"] == "paused":
                 logger.info(
-                    "Assign: job %s is paused with no checkpoint — never "
-                    "started; dispatching via the fresh /job/start lane",
+                    "Assign: job %s is paused with no checkpoint to resume "
+                    "from (never started, or pruned at a terminal state) — "
+                    "dispatching via the fresh /job/start lane",
                     job_id,
                 )
             success = await _dispatch_job_to_agent(job, agent)

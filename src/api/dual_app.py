@@ -1190,6 +1190,12 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
                     resume_metadata["datasources"] = request.datasources
                 if request.project_id:
                     resume_metadata["project_id"] = request.project_id
+                if request.git_remote_url:
+                    # Feeds the pod-handoff clone fallback in
+                    # _setup_job_workspace (resume_fresh_workspace_no_clone_
+                    # fallback.md) — without it a fresh workspace with no
+                    # snapshot starts blank.
+                    resume_metadata["git_remote_url"] = request.git_remote_url
 
                 _agent._orchestrator_client = _orchestrator_client
                 final_state = None
