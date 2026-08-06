@@ -30,12 +30,13 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 import asyncpg
 
@@ -113,6 +114,139 @@ class UsageEvent:
     rate_usd: Any = None
     cost_usd: Any = None
     details: Dict[str, Any] = field(default_factory=dict)
+
+
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_STRICT_USAGE_EVENT_FIELDS = (
+    "ts",
+    "user_id",
+    "project_id",
+    "ref_kind",
+    "ref_id",
+    "category",
+    "resource",
+    "quantity",
+    "unit",
+    "rate_usd",
+    "cost_usd",
+    "source",
+    "source_id",
+    "details",
+    "period_start",
+    "period_end",
+    "measurement_basis",
+    "cost_domain",
+    "resource_class",
+    "attribution_scope",
+    "measurement_algorithm",
+    "source_capacity_value",
+    "source_capacity_unit",
+    "source_cluster",
+    "source_kind",
+    "source_uid",
+    "source_lifecycle_id",
+    "source_interval_id",
+    "event_kind",
+    "corrects_source",
+    "corrects_source_id",
+    "corrects_unit",
+    "corrects_ts",
+    "correction_group_id",
+    "correction_reason",
+    "correction_actor_id",
+    "discovered_at",
+    "payload_hash",
+)
+
+
+class StrictUsageLedgerError(RuntimeError):
+    """A frozen infrastructure batch was not durably verified."""
+
+
+class StrictUsagePartitionMissing(StrictUsageLedgerError):
+    """One or more target monthly audit partitions are not attached."""
+
+    def __init__(self, partitions: Sequence[str]):
+        self.partitions = tuple(sorted(set(partitions)))
+        super().__init__(
+            "missing attached audit partition(s): " + ", ".join(self.partitions)
+        )
+
+
+class StrictUsageConflict(StrictUsageLedgerError):
+    """A deterministic audit key exists with a different frozen payload."""
+
+
+@dataclass(frozen=True)
+class StrictUsageEvent:
+    """One already-rated and already-hashed v2 infrastructure audit row.
+
+    Unlike :class:`UsageEvent`, this contract never resolves a mutable rate and
+    never falls back to best-effort per-row inserts.  The payload is the exact
+    frozen JSON object held by the app-side publication plan.
+    """
+
+    payload: Mapping[str, Any]
+    row_hash: str
+
+    def __post_init__(self) -> None:
+        payload = dict(self.payload)
+        missing = set(_STRICT_USAGE_EVENT_FIELDS) - payload.keys()
+        extra = payload.keys() - set(_STRICT_USAGE_EVENT_FIELDS)
+        if missing or extra:
+            problems: list[str] = []
+            if missing:
+                problems.append("missing " + ", ".join(sorted(missing)))
+            if extra:
+                problems.append("unknown " + ", ".join(sorted(extra)))
+            raise ValueError("invalid frozen usage payload: " + "; ".join(problems))
+        if not _SHA256_RE.fullmatch(self.row_hash):
+            raise ValueError("frozen usage row_hash must be lowercase SHA-256")
+        if payload["payload_hash"] != self.row_hash:
+            raise ValueError("frozen usage payload_hash does not match row_hash")
+        if payload["source"] not in {
+            "infra-allocation-v2",
+            "infra-allocation-correction-v2",
+        }:
+            raise ValueError("strict usage event must use an infrastructure source")
+        if not payload["source_id"] or not payload["unit"]:
+            raise ValueError("strict usage event requires source_id and unit")
+        timestamp = self.timestamp
+        if (
+            timestamp.isoformat(timespec="microseconds").replace("+00:00", "Z")
+            != payload["ts"]
+        ):
+            raise ValueError("strict usage event ts must be canonical UTC microseconds")
+        object.__setattr__(self, "payload", payload)
+
+    @property
+    def timestamp(self) -> datetime:
+        raw = self.payload.get("ts")
+        if not isinstance(raw, str):
+            raise ValueError("strict usage event ts must be text")
+        try:
+            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise ValueError("strict usage event ts is invalid") from exc
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            raise ValueError("strict usage event ts must be timezone-aware")
+        return parsed.astimezone(timezone.utc)
+
+    @property
+    def dedupe_key(self) -> tuple[str, str, str, str]:
+        return (
+            str(self.payload["source"]),
+            str(self.payload["source_id"]),
+            str(self.payload["unit"]),
+            str(self.payload["ts"]),
+        )
+
+
+@dataclass(frozen=True)
+class StrictUsagePublishResult:
+    expected: int
+    inserted: int
+    verified: int
 
 
 class UsageRates:
@@ -193,6 +327,86 @@ FROM unnest(
 ON CONFLICT (source, source_id, unit, ts) DO NOTHING
 """
 
+_STRICT_ATTACHED_PARTITIONS_SQL = """
+/* strict-usage:attached-partitions */
+SELECT child.relname
+FROM pg_inherits inheritance
+JOIN pg_class child ON child.oid = inheritance.inhrelid
+WHERE inheritance.inhparent = 'public.usage_events'::regclass
+  AND child.relname = ANY($1::text[])
+  AND NOT inheritance.inhdetachpending
+"""
+
+_STRICT_INSERT_SQL = """
+/* strict-usage:insert-frozen */
+INSERT INTO usage_events (
+    ts, user_id, project_id, ref_kind, ref_id, category, resource,
+    quantity, unit, rate_usd, cost_usd, source, source_id, details,
+    period_start, period_end, measurement_basis, cost_domain,
+    resource_class, attribution_scope, measurement_algorithm,
+    source_capacity_value, source_capacity_unit, source_cluster,
+    source_kind, source_uid, source_lifecycle_id, source_interval_id,
+    event_kind, corrects_source, corrects_source_id, corrects_unit,
+    corrects_ts, correction_group_id, correction_reason,
+    correction_actor_id, discovered_at, payload_hash
+)
+SELECT
+    event.ts, event.user_id, event.project_id, event.ref_kind, event.ref_id,
+    event.category, event.resource, event.quantity, event.unit,
+    event.rate_usd, event.cost_usd, event.source, event.source_id,
+    event.details, event.period_start, event.period_end,
+    event.measurement_basis, event.cost_domain, event.resource_class,
+    event.attribution_scope, event.measurement_algorithm,
+    event.source_capacity_value, event.source_capacity_unit,
+    event.source_cluster, event.source_kind, event.source_uid,
+    event.source_lifecycle_id, event.source_interval_id, event.event_kind,
+    event.corrects_source, event.corrects_source_id, event.corrects_unit,
+    event.corrects_ts, event.correction_group_id, event.correction_reason,
+    event.correction_actor_id, event.discovered_at, event.payload_hash
+FROM jsonb_to_recordset($1::jsonb) AS event(
+    ts timestamptz, user_id uuid, project_id uuid, ref_kind text, ref_id uuid,
+    category text, resource text, quantity numeric, unit text,
+    rate_usd numeric, cost_usd numeric, source text, source_id text,
+    details jsonb, period_start timestamptz, period_end timestamptz,
+    measurement_basis text, cost_domain text, resource_class text,
+    attribution_scope text, measurement_algorithm text,
+    source_capacity_value numeric, source_capacity_unit text,
+    source_cluster text, source_kind text, source_uid text,
+    source_lifecycle_id uuid, source_interval_id uuid, event_kind text,
+    corrects_source text, corrects_source_id text, corrects_unit text,
+    corrects_ts timestamptz, correction_group_id uuid,
+    correction_reason text, correction_actor_id uuid,
+    discovered_at timestamptz, payload_hash text
+)
+ON CONFLICT (source, source_id, unit, ts) DO NOTHING
+"""
+
+_STRICT_VERIFY_SQL = """
+/* strict-usage:verify-frozen */
+WITH expected AS (
+    SELECT *
+    FROM jsonb_to_recordset($1::jsonb) AS item(
+        source text, source_id text, unit text, ts timestamptz,
+        payload_hash text
+    )
+)
+SELECT
+    expected.source,
+    expected.source_id,
+    expected.unit,
+    to_char(expected.ts AT TIME ZONE 'UTC',
+            'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS ts,
+    expected.payload_hash AS expected_hash,
+    actual.payload_hash AS actual_hash
+FROM expected
+LEFT JOIN usage_events actual
+  ON actual.source = expected.source
+ AND actual.source_id = expected.source_id
+ AND actual.unit = expected.unit
+ AND actual.ts = expected.ts
+ORDER BY expected.source, expected.source_id, expected.unit, expected.ts
+"""
+
 
 class UsageLedger:
     """Write + raw-read surface for the ``usage_events`` ledger (auditdb)."""
@@ -204,6 +418,89 @@ class UsageLedger:
     @property
     def is_available(self) -> bool:
         return self._pool is not None
+
+    async def publish_frozen_events(
+        self, events: Sequence[StrictUsageEvent]
+    ) -> StrictUsagePublishResult:
+        """Atomically insert and verify a frozen infrastructure batch.
+
+        This is deliberately separate from :meth:`record_events`: it never
+        resolves rates, never falls back to per-row writes, and never swallows
+        an exception.  Replays are successful only when every deterministic
+        audit key already carries the exact frozen payload hash.
+        """
+        if self._pool is None:
+            raise StrictUsageLedgerError("audit usage ledger is unavailable")
+        if not events:
+            raise ValueError("strict usage publication requires at least one event")
+
+        keys = [event.dedupe_key for event in events]
+        if len(set(keys)) != len(keys):
+            raise ValueError("strict usage publication contains duplicate keys")
+
+        partitions = {
+            f"usage_events_p{event.timestamp.year:04d}_{event.timestamp.month:02d}"
+            for event in events
+        }
+        frozen_payload = json.dumps(
+            [dict(event.payload) for event in events],
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        expected_payload = json.dumps(
+            [
+                {
+                    "source": event.payload["source"],
+                    "source_id": event.payload["source_id"],
+                    "unit": event.payload["unit"],
+                    "ts": event.payload["ts"],
+                    "payload_hash": event.row_hash,
+                }
+                for event in events
+            ],
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+
+        async with self._pool.acquire() as conn:
+            async with conn.transaction():
+                attached_rows = await conn.fetch(
+                    _STRICT_ATTACHED_PARTITIONS_SQL, sorted(partitions)
+                )
+                attached = {str(row["relname"]) for row in attached_rows}
+                missing = sorted(partitions - attached)
+                if missing:
+                    raise StrictUsagePartitionMissing(missing)
+
+                status = await conn.execute(_STRICT_INSERT_SQL, frozen_payload)
+                inserted = int(str(status).split()[-1])
+                verified_rows = await conn.fetch(_STRICT_VERIFY_SQL, expected_payload)
+                if len(verified_rows) != len(events):
+                    raise StrictUsageConflict(
+                        "audit verification returned an incomplete key set"
+                    )
+                conflicts = [
+                    (
+                        str(row["source"]),
+                        str(row["source_id"]),
+                        str(row["unit"]),
+                        str(row["ts"]),
+                    )
+                    for row in verified_rows
+                    if row["actual_hash"] is None
+                    or row["actual_hash"] != row["expected_hash"]
+                ]
+                if conflicts:
+                    rendered = ", ".join("/".join(key) for key in conflicts[:3])
+                    raise StrictUsageConflict(
+                        f"audit row missing or payload hash mismatch: {rendered}"
+                    )
+
+        return StrictUsagePublishResult(
+            expected=len(events), inserted=inserted, verified=len(verified_rows)
+        )
 
     async def record_events(self, events: Sequence[UsageEvent]) -> int:
         """Idempotently insert a batch; returns the count *actually* inserted.
