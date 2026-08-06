@@ -1344,7 +1344,11 @@ async def code_server_settings_sweeper(shutdown_event: asyncio.Event) -> None:
         "true",
         "yes",
     ):
+        # Park instead of returning: run_when_leader re-creates a loop that
+        # exits on its next poll (~1s), which would respawn+log this every
+        # second for the whole leadership tenure.
         logger.info("Code-server settings sweeper disabled (IDE_SETTINGS_SYNC_ENABLED)")
+        await shutdown_event.wait()
         return
 
     from services.ide_settings import (
@@ -1352,6 +1356,7 @@ async def code_server_settings_sweeper(shutdown_event: asyncio.Event) -> None:
         OpenVsxClassifier,
         _coerce_context,
         capture_ide_profile,
+        evict_dead_workspaces,
         list_ide_extensions,
         pull_ide_config,
         reconcile_extensions,
@@ -1366,6 +1371,9 @@ async def code_server_settings_sweeper(shutdown_event: asyncio.Event) -> None:
     while not shutdown_event.is_set():
         try:
             workspaces = await postgres_db.list_active_ide_workspaces()
+            workspaces = await evict_dead_workspaces(
+                workspaces, container_provisioner, postgres_db
+            )
             if workspaces:
                 count = await reconcile_ide_settings(store, workspaces, pull_ide_config)
                 if count:
@@ -9139,8 +9147,11 @@ async def lifespan(app: FastAPI):
         run_when_leader(ide_session_ttl_sweeper, _shutdown_event)
     )
     ws_sweeper_task = asyncio.create_task(workspace_idle_sweeper(_shutdown_event))
+    # Leader-gated: serially SSH-dials every active workspace and captures IDE
+    # profiles to per-user S3 keys — two replicas would double-dial each
+    # workspace and race the signature-gated capture.
     ide_settings_sweeper_task = asyncio.create_task(
-        code_server_settings_sweeper(_shutdown_event)
+        run_when_leader(code_server_settings_sweeper, _shutdown_event)
     )
     gc_sweeper_task = asyncio.create_task(snapshot_gc_sweeper(_shutdown_event))
     imap_task = asyncio.create_task(run_when_leader(imap_poll_loop, _shutdown_event))

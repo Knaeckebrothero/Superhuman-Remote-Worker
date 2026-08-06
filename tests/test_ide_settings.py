@@ -11,6 +11,8 @@ on not clobbering sibling keys through that shallow merge.
 """
 
 import base64
+import json
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -24,6 +26,7 @@ from orchestrator.services.ide_settings import (
     build_seed_script,
     build_signature_script,
     capture_ide_profile,
+    evict_dead_workspaces,
     parse_extensions_list,
     parse_signature,
     parse_pull_output,
@@ -983,3 +986,143 @@ class TestCaptureBytesExtension:
         # only globalStorage tarred; the bytes folder was never resolved
         assert tarred == [GLOBAL_STORAGE_DIR]
         assert n == 1
+
+
+JOB_ID = "22222222-2222-2222-2222-222222222222"
+THREAD_ID = "33333333-3333-3333-3333-333333333333"
+
+
+def _container_row(entity_type, entity_id, **container_extra):
+    container = {"status": "ready", "pod_ip": "10.42.0.9", **container_extra}
+    return {
+        "entity_type": entity_type,
+        "id": entity_id,
+        "user_id": UID,
+        "context": {"workspace_container": container},
+    }
+
+
+def _evict_mocks(live):
+    provisioner = MagicMock()
+    provisioner.workspace_pod_live = AsyncMock(return_value=live)
+    db = MagicMock()
+    db.merge_workspace_container_context = AsyncMock(return_value=True)
+    db.merge_thread_workspace_context = AsyncMock(return_value=True)
+    return provisioner, db
+
+
+class TestEvictDeadWorkspaces:
+    @pytest.mark.asyncio
+    async def test_dead_job_pod_is_evicted_and_context_cleared(self):
+        provisioner, db = _evict_mocks(live=False)
+        row = _container_row("job", JOB_ID)
+
+        kept = await evict_dead_workspaces([row], provisioner, db)
+
+        assert kept == []
+        owner = provisioner.workspace_pod_live.await_args.args[0]
+        assert (owner.kind, owner.id) == ("job", JOB_ID)
+        db.merge_workspace_container_context.assert_awaited_once_with(
+            JOB_ID, {"status": "deleted", "pod_ip": None}
+        )
+        db.merge_thread_workspace_context.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_dead_thread_pod_is_evicted_via_thread_merge(self):
+        provisioner, db = _evict_mocks(live=False)
+        row = _container_row("thread", THREAD_ID)
+        # Worklist contexts may arrive as JSON strings — must still be probed.
+        row["context"] = json.dumps(row["context"])
+
+        kept = await evict_dead_workspaces([row], provisioner, db)
+
+        assert kept == []
+        owner = provisioner.workspace_pod_live.await_args.args[0]
+        assert (owner.kind, owner.id) == ("session", THREAD_ID)
+        db.merge_thread_workspace_context.assert_awaited_once_with(
+            THREAD_ID, {"status": "deleted", "pod_ip": None}
+        )
+        db.merge_workspace_container_context.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_live_pod_is_kept(self):
+        provisioner, db = _evict_mocks(live=True)
+        row = _container_row("job", JOB_ID)
+
+        kept = await evict_dead_workspaces([row], provisioner, db)
+
+        assert kept == [row]
+        db.merge_workspace_container_context.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_unknown_liveness_is_treated_as_live(self):
+        provisioner, db = _evict_mocks(live=None)
+        row = _container_row("job", JOB_ID)
+
+        kept = await evict_dead_workspaces([row], provisioner, db)
+
+        assert kept == [row]
+        db.merge_workspace_container_context.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_probe_exception_keeps_the_row(self):
+        provisioner, db = _evict_mocks(live=False)
+        provisioner.workspace_pod_live = AsyncMock(side_effect=RuntimeError("api down"))
+        row = _container_row("job", JOB_ID)
+
+        kept = await evict_dead_workspaces([row], provisioner, db)
+
+        assert kept == [row]
+        db.merge_workspace_container_context.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_vm_row_passes_through_unprobed(self):
+        provisioner, db = _evict_mocks(live=False)
+        row = {
+            "entity_type": "job",
+            "id": JOB_ID,
+            "user_id": UID,
+            "context": {"vm": {"status": "ready", "ssh_host": "vm-1"}},
+        }
+
+        kept = await evict_dead_workspaces([row], provisioner, db)
+
+        assert kept == [row]
+        provisioner.workspace_pod_live.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_merge_failure_still_evicts_the_dead_row(self):
+        provisioner, db = _evict_mocks(live=False)
+        db.merge_workspace_container_context = AsyncMock(
+            side_effect=RuntimeError("db blip")
+        )
+        dead = _container_row("job", JOB_ID)
+        alive_row = _container_row("thread", THREAD_ID)
+        provisioner.workspace_pod_live = AsyncMock(side_effect=[False, True])
+
+        kept = await evict_dead_workspaces([dead, alive_row], provisioner, db)
+
+        assert kept == [alive_row]
+
+
+class TestSweeperRegistrationShape:
+    def test_settings_sweeper_is_leader_gated(self):
+        import inspect
+
+        import main as orchestrator_main
+
+        source = inspect.getsource(orchestrator_main.lifespan)
+        assert (
+            "run_when_leader(code_server_settings_sweeper, _shutdown_event)" in source
+        )
+
+    def test_disabled_sweeper_parks_instead_of_returning(self):
+        # A bare return would make run_when_leader respawn (and log) the
+        # disabled sweeper every poll second for the whole leadership tenure.
+        import inspect
+
+        import main as orchestrator_main
+
+        source = inspect.getsource(orchestrator_main.code_server_settings_sweeper)
+        disabled_branch = source.split("from services.ide_settings import")[0]
+        assert "await shutdown_event.wait()" in disabled_branch
