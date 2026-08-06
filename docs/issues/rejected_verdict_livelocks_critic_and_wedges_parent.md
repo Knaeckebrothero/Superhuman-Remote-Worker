@@ -32,6 +32,15 @@ implemented end to end:
   no escalation; 3rd rejection → escalation with target row + reason,
   ledger untouched; counter is per-critic) and
   `tests/test_critic_loop.py::test_escalated_rejection_returns_stop_order_not_resubmit`.
+- **Live k3d 2026-08-06 (follow-up):** round-2 critic `7f086fe8` of target
+  `d3a16617` was pinned pre-dispatch and three invalid verdict submissions
+  were POSTed against the real endpoint (unknown finding id + missing F1
+  disposition): #1 and #2 → plain 409 with the model-facing errors; **#3 →
+  409 with `"escalated": true`**, target flipped to `pending_review` with
+  `error_message` = "Critic … failed to render a valid verdict after 3
+  rejected submissions; sent to manual review. Last rejection: …", critic
+  row `context.verdict_rejections = 3`, orchestrator WARNING "Verification
+  escalated target …" logged.
 - Fix direction 2 (the wall-clock watchdog arm for live-critic reviews,
   `_UNSTICK_REVIEWING_SQL`) remains OPEN as the backstop — not built in
   this batch.

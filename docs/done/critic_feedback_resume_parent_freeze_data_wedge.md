@@ -29,6 +29,17 @@ seam pin in `tests/test_verification_flow.py`
 (`test_returned_resume_routes_through_freeze_clearing_write`) — the existing
 wiring test stubbed `_internal_resume_job` wholesale, so nothing pinned the
 critic path to the freeze-clearing write.
+**Live k3d round-trip 2026-08-06 (batch fix session, follow-up):** job
+`d3a16617` (`autonomy: review`, `verification.enabled`) completed →
+`reviewing`, critic `6a21f0f5` spawned and dispatched; a `returned` verdict
+with one finding was recorded on the ledger; the critic completed
+organically → orchestrator log sequence at 18:44:25–29: "Critic … returned
+target … (1 open finding(s))" → "Queued job … for auto-dispatch with
+feedback" → "Dispatch: resumed job … on agent …" — **4 seconds from verdict
+to re-dispatch**. Parent row after the verdict: `freeze_data IS NULL`,
+`context.last_freeze_data.freeze_type = job_complete`, and the round-2
+agent's LLM context contained the finding text (audit `llm_requests`
+probe). The pre-fix wedge state (paused-but-invisible) never occurred.
 **Residual (separate docs):** (1) the two live victims below predate the fix —
 if never manually unwedged, they still need the one-off
 `UPDATE jobs SET freeze_data = NULL`; the code fix does not retroactively
