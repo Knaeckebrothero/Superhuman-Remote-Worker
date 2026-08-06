@@ -9,8 +9,32 @@ tags:
 
 # Critic "returned with feedback" wedges the parent: `_internal_resume_job` keeps `freeze_data`, so the paused parent is invisible to the dispatcher forever
 
-**Status:** ROOT CAUSE CONFIRMED in code + live DB on dev (namespace
-`superhuman-remote-worker`, context `main`) 2026-07-18. UNFIXED.
+**Status:** FIXED — resolved incidentally by `4dba9836` (2026-07-22), the same
+commit that fixed the blocking-message sibling
+(`docs/done/blocking_message_reply_keeps_freeze_data.md`): it replaced
+`_internal_resume_job`'s inline UPDATE with `PostgresDB.queue_job_for_resume`,
+which sets `freeze_data = NULL` (and stashes the blob to
+`context.last_freeze_data`). The critic-"returned" arm reaches it via
+`_internal_resume_job`, so it got the fix transitively.
+**Audit 2026-08-06 (batch fix session):** all sibling resume paths the doc
+lists verified clean at HEAD — blocking-message/urgent/LLM-triage resume
+(via the same wrapper), explicit-Resume `_queue_for_dispatch`
+(`queue_job_for_resume`), sudo VM-upgrade approve (`main.py` inline
+`freeze_data = NULL`), sudo-denial resume (inline `freeze_data = NULL`),
+deliverable-gate bounce (`deliverable_gate.queue_resume`). Regression tests
+added the same day: DB-level critic-flavored test in
+`tests/test_queue_job_for_resume.py`
+(`test_critic_returned_resume_clears_freeze_so_dispatcher_sees_job`) and a
+seam pin in `tests/test_verification_flow.py`
+(`test_returned_resume_routes_through_freeze_clearing_write`) — the existing
+wiring test stubbed `_internal_resume_job` wholesale, so nothing pinned the
+critic path to the freeze-clearing write.
+**Residual (separate docs):** (1) the two live victims below predate the fix —
+if never manually unwedged, they still need the one-off
+`UPDATE jobs SET freeze_data = NULL`; the code fix does not retroactively
+clear rows. (2) The same defect class survives in `PostgresDB.pause_job`
+(no freeze clear) — tracked in
+`docs/issues/recovery_pause_repersists_stale_freeze_invisible_job.md`.
 **Severity:** high — every review round-trip on a non-`full`-autonomy job
 silently dead-ends; the job looks "Paused" in the cockpit and nothing ever
 picks it up.
