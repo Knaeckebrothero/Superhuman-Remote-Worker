@@ -25,6 +25,48 @@ Reference job: `bbce4bed-79be-4e36-bbb1-9dd12ce43dcf` — project `Better Resavi
 2026-08-01T14:42:32Z, sealed `pending_review` 2026-08-02T03:27:59Z after 8 phases and
 ~13 hours.
 
+---
+
+## Status at a glance (2026-08-06)
+
+| # | Defect | State |
+| --- | --- | --- |
+| 1 | `CWD:` banner leaks into git stdout → `push()` uses it as a branch name | **FIXED** `22b2511e`, deployed + verified live. **Trigger still unknown** — see the open question below. |
+| 2 | `write_file` and the shell resolve relative paths against different roots | **MITIGATED** `6ee90376` — writes now report the resolved absolute path. Resolution semantics deliberately unchanged. |
+| 3 | Mode A cloud review has never produced a diff | **OPEN, deferred by decision** — superseded by `workspace_and_change_records.md` §6.3; do not repair the mirror. |
+
+Shipped: `22b2511e` (parser fix), `d7e05c39` (`push()` logs why it declines),
+`6ee90376` (absolute paths in write results). Full suite green at the time of each.
+
+### The one open question
+
+**Why does the banner break some jobs and not others?** The bug is real and reproducible
+(k3d before/after, plus a direct unit-level demonstration), but it is **not universal**, and
+that is unexplained. Inside the same broken window — first affected image deployed
+2026-08-01 ~17:29Z, fix deployed 2026-08-02 18:47Z (`2c59ebaf`) — job `cd3bfe52` pushed
+normally (Gitea reflog: pushes at 08-02 09:33, 14:48, 17:16) while `bbce4bed` landed nothing
+across 13 hours.
+
+Ruled out as of 2026-08-06:
+
+- **Deploy lag.** Every dev image from `sha-bab1467` (08-01 17:29) onward contains
+  `f41970ae`; `bbce4bed`'s own audit shows the banner in its shell output.
+- **Commit dates ≠ push dates.** Gitea reflogs confirm genuine `push` entries landing inside
+  the window, not a later flush.
+- **A conditional banner.** `shell_run`'s formatting block emits `CWD:` unconditionally on
+  the normal completion path (`remote.py:1456-1461`), and the sentinel always carries `$PWD`
+  as a third field (`build_sentinel_command`, `shell_manager.py:54`), so `resolved_cwd` is
+  always populated.
+
+Not yet examined: whether `_use_backend` is false on some paths
+(`git_manager.py:86` — `backend is not None and backend.supports_shell`); whether the
+per-job-repo/`main` layout behaves differently from the project-repo/`job/<id>` layout that
+`bbce4bed` used; and whether `shell_run`'s early-return paths (colliding command, interactive
+prompt, still-running) matter. Note the fix is correct regardless of the trigger — this
+question is about blast radius and about whether a sibling bug still lurks on the same seam.
+
+---
+
 ## The agent did nothing wrong with the path
 
 Worth stating plainly, because two plausible-sounding theories are both false.
@@ -69,7 +111,7 @@ form is *without* it — and `resolve_workspace_deliverable` accepts either form
 jobs writing `repo/output/…` and this one writing `output/…` are the same contracted
 artifact. The agent wrote the canonical path it was given.
 
-## Defect 1 — SOLVED: `f41970ae` broke every git command through the workspace backend
+## Defect 1 — SOLVED: `f41970ae`'s `CWD:` banner leaks into git command stdout
 
 **Root cause found and fixed 2026-08-02 (`22b2511e`).** It is a regression introduced by the
 cwd-anchoring fix itself.
@@ -99,24 +141,24 @@ The damage lands in `push()`, which uses that stdout as a branch name —
 bbce4bed started at 14:42 on 2026-08-01, two hours after `f41970ae`, and ran 13 hours across
 8 phases without landing a commit.
 
-> **CORRECTION (2026-08-03).** An earlier revision of this doc — and commit `22b2511e`'s
-> message — claimed this broke *every* phase-boundary push cluster-wide from 2026-08-01
-> 12:41 onward. **That is wrong.** Measured against the dev cluster after the fix rolled out
-> at 19:59Z on 08-03, many jobs pushed normally throughout the supposed window:
+> **CORRECTION (2026-08-03, refined 2026-08-06).** An earlier revision of this doc — and
+> commit `22b2511e`'s message — claimed this broke *every* phase-boundary push cluster-wide
+> from 2026-08-01 onward. **That is wrong: it fires conditionally.**
 >
-> | repo | commits landed | window |
-> | --- | --- | --- |
-> | `job-becf5f64` | 102 | 08-02 22:05 → 08-03 01:15 |
-> | `job-5347c057` | 39 | 08-03 09:00 → 12:24 |
-> | `job-08e0006e` | 19 | 08-03 17:20 → 17:53 |
-> | `job-8e2c05cf` | 17 | 08-03 19:06 → 19:37 (pre-rollout) |
+> The decisive evidence is a job *inside* the broken window that pushed fine. The affected
+> window is 2026-08-01 ~17:29Z (first image carrying `f41970ae`) → 2026-08-02 18:47Z (fix
+> deployed, `2c59ebaf`). Within it, Gitea's reflog for `job-cd3bfe52` records genuine `push`
+> entries at 08-02 09:33, 14:48 and 17:16, while `bbce4bed` landed nothing across 13 hours on
+> the same cluster.
 >
-> The bug is real and reproducible — verified before/after on k3d, see below — but it fires
-> **conditionally**, and the trigger is not yet identified. `resolved_cwd` is only populated
-> when the tmux sentinel line carries a third field (`remote.py:1359`), and `shell_run` has
-> several early-return paths that never reach the banner-formatting block, so the `CWD:` line
-> is not present on every result. Do not rely on the blast-radius claim; treat the trigger as
-> an open question.
+> Two tempting explanations are both dead — see "The one open question" at the top of this
+> doc for the full ruled-out list. In particular the 08-03 measurements that originally
+> prompted this correction (`becf5f64`, `5347c057`, `08e0006e`, `8e2c05cf`) turned out to be
+> *post-fix* jobs: the fix deployed on 08-02 at 18:47Z, not on 08-03 at 19:59Z as first
+> assumed — that later rollout was a different image (`a1d9268`). Those four prove nothing;
+> `cd3bfe52` is the case that carries the argument.
+>
+> The fix is correct regardless of the trigger. Treat the trigger as open.
 
 **Attributable damage, as far as verified:** bbce4bed lost its deliverable to this (its own
 `freeze_data.head_commit` carries the pollution signature). Three other jobs in the window
