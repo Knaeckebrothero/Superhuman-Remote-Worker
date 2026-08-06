@@ -11,7 +11,24 @@ tags:
 
 # `reviewing`/`pending_review` parents get their workspace pod reaped out from under a live critic
 
-**Status:** Filed + diagnosed 2026-07-04, on the **main cluster** (ns `superhuman-remote-worker`), investigating a batch of failed research-loop jobs. **Not fixed.** This is a **recurrence of the known "Bug 1" in
+**Status:** FIXED at HEAD — landed in `656b31ec`, verified by audit
+2026-08-06 (batch fix session). Fix option 1 (the precise guard) was taken,
+in BOTH managers: `is_reapable`/`is_idle` in
+`orchestrator/services/lifecycle/workspace_manager.py` AND `vm_manager.py`
+return False when `inst.metadata["has_live_shared_child"]` is set;
+`list_instances` stamps that flag via `_live_shared_child_exists`, which
+matches a non-terminal child job whose
+`context.workspace_container.pod_name` equals this pod (pod_name, not
+pod_ip — stable across restores; delegation children get their own pods so
+the guard stays narrow). Fail-safe: DB error → assume a child exists → do
+not reap. `reviewing` deliberately REMAINS in the idle/reapable status set;
+the guard handles the dependency precisely (the rewritten comment block in
+workspace_manager.py explains why that is now safe). Tests:
+`tests/test_lifecycle_workspace_manager.py`
+(`test_reviewing_pod_with_shared_child_flagged_not_reapable` + control +
+query-skip) and VM twins in `tests/test_lifecycle_vm_manager.py` (incl. the
+fail-safe branch).
+**Originally:** Filed + diagnosed 2026-07-04, on the **main cluster** (ns `superhuman-remote-worker`), investigating a batch of failed research-loop jobs. **Not fixed.** This is a **recurrence of the known "Bug 1" in
 [`critic_failure_leaves_parent_job_stuck_reviewing.md`](critic_failure_leaves_parent_job_stuck_reviewing.md)** (§2026-06-22, "the reaper kills a workspace a live subjob is sharing"), now with two new wrinkles: (a) `"reviewing"` was *added* to the reapable status set, widening the trigger; (b) the failure signature is now a headless-Service `NXDOMAIN` (`Name or service not known`) rather than June's raw-pod-IP `No route to host`.
 
 **Found:** 2026-07-04, project loop "Run 8" (Research 1–4). Deployed orchestrator image `sha-fe10ea6` (deploy `e453016c`).
