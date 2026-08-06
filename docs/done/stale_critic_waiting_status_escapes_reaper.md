@@ -8,7 +8,26 @@ tags:
 
 # A critic in `waiting` whose parent terminally fails is never reaped — `cancel_stale_verification_subjobs` only matches `created`/`paused`
 
-**Status:** CONFIRMED in code + live DB on dev 2026-07-18. UNFIXED.
+**Status:** FIXED at HEAD — landed in `f2d054bd`, verified by audit
+2026-08-06 (batch fix session). Implemented **more broadly** than this doc
+prescribed, deliberately: `'waiting'` sits in the TOP-LEVEL status filter of
+`_CANCEL_STALE_VERIFICATION_SQL` (postgres.py, hoisted class constant), so it
+reaches BOTH the parent-terminal arm (what this doc asked for) AND the
+age-based arm (what this doc said to avoid). The in-code comment justifies
+the deviation: under the fail-closed verification design a critic is never
+parked in `waiting` between rounds any more — a fresh critic is spawned every
+round (`_trigger_verification_on_complete`) — so a `waiting` critic is
+unconditionally an orphan of the retired mechanism, not a legitimate
+inter-round wait. This doc's caveat was written 2026-07-18 against the
+pre-fail-closed design; its premise is gone. Tests already cover both arms:
+`tests/test_stale_verification_outage_exemption.py`
+(`test_stale_waiting_critic_is_reaped`,
+`test_fresh_waiting_critic_survives_staleness` — real Postgres) and
+`tests/test_stale_verification_sweeper.py`
+(`test_sweeper_reaps_waiting_critics_and_still_reaps_paused`). Do NOT
+"narrow it back" to the doc's original prescription — that would re-leak
+orphaned waiting critics and contradict a passing test.
+**Originally:** CONFIRMED in code + live DB on dev 2026-07-18. UNFIXED.
 **Severity:** low-medium — leaks a zombie `waiting` job row per incident
 (confusing in the cockpit, counts against project job lists), no compute
 burned.
