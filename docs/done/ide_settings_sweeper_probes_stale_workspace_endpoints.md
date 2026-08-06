@@ -1,6 +1,35 @@
 # IDE-settings sweeper serially SSH-probes stale, never-evicted workspace endpoints
 
-**Status:** Filed + diagnosed (2026-06-27, during the loop-job `19707fa1` OOM investigation; promoted out of a sub-note in `audit_metadata_config_duplication_ooms_orchestrator.md`). **Not yet fixed — but live-verified on k3d 2026-06-30** (27 leaked records actively probed across both replicas; see § Live k3d verification). The IDE-settings background sweeper rebuilds its worklist from a query that selects workspace records purely on a stale JSONB `status`, with no parent-job/thread-status or pod-liveness filter, and nothing clears that status when a session ends or a pod dies — so dead records accumulate forever and the sweeper serially SSH-dials each one every cycle ("No route to host", ~3 s apiece), on every replica. **Re-verified 2026-07-02 (main cluster) — still live and unfixed:** the sweeper is still probing dead endpoints on main — **67 distinct dead `:30022` IPs** in a recent 400-line log window (vs 27 on k3d 2026-06-30). Code has drifted since this doc was written — `list_active_ide_workspaces` is now at `orchestrator/database/postgres.py:6708` (this doc cites `:6529-6576`); re-locate the cited line refs before implementing the fix.
+**Status: FIXED 2026-08-06 (batch #2) + live-verified on k3d.** Four layers,
+matching fix options 1+2+3 below:
+1. **Eviction at the source** — `list_active_ide_workspaces` gained parent-status
+   gates: jobs `status NOT IN ('completed','failed','cancelled')`, threads
+   `status NOT IN ('ended','deleted')`. On the k3d cluster this collapsed the
+   worklist from **48 rows (24 jobs — ALL terminal — + 24 threads, 22 ended)
+   to 1 row — the single live session**.
+2. **Pod-liveness eviction** — new `evict_dead_workspaces` (services/
+   ide_settings.py) runs after the worklist fetch: container-backed rows are
+   probed via `workspace_pod_live` (tri-state; `None` = assume live);
+   confirmed-dead pods get `{"status": "deleted", "pod_ip": None}` merged into
+   their entity's `workspace_container` context and drop out permanently.
+3. **Teardown clears the context** — `ContainerProvisioner.delete_workspace`'s
+   404 branch (pod already gone — the leak) now also writes
+   `{"status": "deleted", "pod_ip": None}`; the normal path drops the dead
+   `pod_ip` too.
+4. **Leader-gated** — the sweeper registration is wrapped in `run_when_leader`
+   like its `ide_session_ttl_sweeper` sibling (the disabled-env branch parks on
+   `shutdown_event.wait()` so the wrapper can't respawn-spam it).
+Tests: `TestEvictDeadWorkspaces` + `TestSweeperRegistrationShape`
+(tests/test_ide_settings.py), `delete_workspace` 404-merge pins
+(tests/test_container_provisioner.py), and a real-Postgres worklist suite
+(tests/test_ide_workspace_worklist_real_postgres.py). Live k3d before/after:
+275 "No route to host" lines in a 90-min window before; after deploy, a full
+sweeper cycle logged **zero** dead-endpoint probes and the one live session
+workspace still synced (see cycle evidence in the session log,
+docs/issues/BACKLOG.md). Option 4 (dial the stable Service DNS instead of
+`pod_ip`) remains open as hardening; it is orthogonal to the leak.
+
+**Originally:** Filed + diagnosed (2026-06-27, during the loop-job `19707fa1` OOM investigation; promoted out of a sub-note in `audit_metadata_config_duplication_ooms_orchestrator.md`). Not yet fixed — but live-verified on k3d 2026-06-30 (27 leaked records actively probed across both replicas; see § Live k3d verification). The IDE-settings background sweeper rebuilds its worklist from a query that selects workspace records purely on a stale JSONB `status`, with no parent-job/thread-status or pod-liveness filter, and nothing clears that status when a session ends or a pod dies — so dead records accumulate forever and the sweeper serially SSH-dials each one every cycle ("No route to host", ~3 s apiece), on every replica. Re-verified 2026-07-02 (main cluster) — still live and unfixed: the sweeper is still probing dead endpoints on main — **67 distinct dead `:30022` IPs** in a recent 400-line log window (vs 27 on k3d 2026-06-30).
 
 **Found:** 2026-06-27. Surfaced on the **main cluster** (ns `superhuman-remote-worker`) while investigating job `19707fa1`'s orchestrator OOM — the logs were full of serial `10.42.x.x:30022` "No route to host" probes against long-dead workspace endpoints. Independent of (and not a cause of) that OOM.
 

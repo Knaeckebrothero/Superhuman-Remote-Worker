@@ -1610,13 +1610,15 @@ class TestDeleteWorkspace:
 
         assert result is True
         mock_core_api.delete_namespaced_pod.assert_called_once()
-        # Verify context set to deleted
+        # Verify context set to deleted and the stale IP dropped
         context_call = provisioner._db.merge_workspace_container_context.call_args
-        assert context_call[0][1]["status"] == "deleted"
+        assert context_call[0][1] == {"status": "deleted", "pod_ip": None}
 
     @pytest.mark.asyncio
     async def test_delete_workspace_already_gone(self):
-        """Deleting a non-existent pod returns True (idempotent)."""
+        """Deleting a non-existent pod returns True (idempotent) and still
+        clears the stale container context — a pod that died on its own leaves
+        status='ready' + a dead pod_ip behind otherwise."""
         from orchestrator.services.container_provisioner import (
             ContainerProvisioner,
         )
@@ -1624,6 +1626,7 @@ class TestDeleteWorkspace:
         provisioner = ContainerProvisioner()
         provisioner._k8s_available = True
         provisioner._db = MagicMock()
+        provisioner._db.merge_workspace_container_context = AsyncMock(return_value=True)
 
         mock_404 = MagicMock()
         mock_404.status = 404
@@ -1641,6 +1644,9 @@ class TestDeleteWorkspace:
             WorkspaceOwner.job("test-job-123456")
         )
         assert result is True
+        provisioner._db.merge_workspace_container_context.assert_awaited_once_with(
+            "test-job-123456", {"status": "deleted", "pod_ip": None}
+        )
 
     @pytest.mark.asyncio
     async def test_delete_workspace_not_available(self):

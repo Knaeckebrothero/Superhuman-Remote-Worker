@@ -79,6 +79,7 @@ SWEEPS = [
         lambda db: db.unstick_reviewing_parents(grace_minutes=30),
     ),
     ("list_due_llm_outage_jobs", lambda db: db.list_due_llm_outage_jobs(limit=50)),
+    ("list_active_ide_workspaces", lambda db: db.list_active_ide_workspaces()),
     (
         "get_available_agents",
         lambda db: db.get_available_agents(limit=5, cooldown_seconds=30),

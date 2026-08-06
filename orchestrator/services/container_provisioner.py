@@ -540,13 +540,15 @@ class ContainerProvisioner:
                 owner.id,
             )
             await self._delete_seed_configmap(pod_name)
-            await self._set_context(owner, {"status": "deleted"})
+            await self._set_context(owner, {"status": "deleted", "pod_ip": None})
             # Close the compute-metering interval (Slice 4b) — pod gone, billing
             # stops. Best-effort; the loop's reconciler bounds any missed close.
             await workspace_metering.close_interval(self._db, owner)
             return True
         except Exception as e:
-            # 404 is fine — pod already gone
+            # 404 is fine — pod already gone. Still clear the context: a pod
+            # that died on its own leaves status='ready' + a stale pod_ip
+            # behind, and sweeps keyed on that JSONB would dial it forever.
             if hasattr(e, "status") and e.status == 404:
                 logger.debug(
                     "Workspace container already deleted: %s (%s %s)",
@@ -554,6 +556,7 @@ class ContainerProvisioner:
                     owner.kind,
                     owner.id,
                 )
+                await self._set_context(owner, {"status": "deleted", "pod_ip": None})
                 await workspace_metering.close_interval(self._db, owner)
                 return True
             logger.error(
