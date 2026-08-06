@@ -174,6 +174,7 @@ POST   /api/jobs/{job_id}/assign/{agent_id}                                     
 GET    /api/jobs/{job_id}/audit                                                         gated:require_job_access
 GET    /api/jobs/{job_id}/audit/step/{step_id}                                          gated:require_job_access
 GET    /api/jobs/{job_id}/audit/timerange                                               gated:require_job_access
+GET    /api/jobs/{job_id}/brief                                                         internal:require_internal
 PUT    /api/jobs/{job_id}/cancel                                                        gated:require_internal_or_job_access
 GET    /api/jobs/{job_id}/change-record                                                 gated:require_job_access
 GET    /api/jobs/{job_id}/chat                                                          gated:require_job_access
