@@ -19,7 +19,35 @@ aliases:
 
 **Filed:** 2026-08-04 from the five-job main-cluster overnight Scholar batch.
 
-**Status:** **OPEN. P1 concurrency / context-quality defect.** The failures are
+**Status:** **CONTAINMENT TIER SHIPPED 2026-08-06 (batch #2); the semantic
+per-consumer model below remains OPEN.** What shipped (src/services/
+recall_store.py):
+- `decrement_ttl()` and the access-stat write both lock their target rows via
+  an id-ordered `SELECT … FOR UPDATE` CTE feeding the UPDATE — concurrent
+  consumers acquire overlapping tuple locks in one deterministic order, which
+  removes the lock-order cycles behind the 138 observed deadlocks.
+- The access-stat write moved into `_record_access_stats()`: ids sorted,
+  bounded deadlock-only retry (`_ACCESS_STAT_RETRY_DELAYS`, 3 attempts), and
+  EVERY failure contained — a lost access-count bump can no longer abort an
+  otherwise-successful retrieval (previously an uncaught deadlock here threw
+  away the already-fetched rows; that was the bulk of the count).
+- Contained-error counters (`MemoryHealth` singleton: ttl_decrement_deadlock,
+  access_stats_deadlock, access_stats_error, retrieval_deadlock) ride the
+  agent heartbeat as `metrics["memory"]` into `agents.metadata` — operator
+  telemetry, not just pod logs (acceptance criterion 6).
+Tests: `TestDeadlockContainment` (tests/test_recall_store.py, mock-level SQL
+shape/retry/containment) + tests/test_recall_store_concurrency.py (real
+pgvector-Postgres via testcontainers + the real vector migrations: two
+concurrent stores over one project, zero unhandled errors, exact access-count
+accounting under opposite-order hammering). Heartbeat wiring pinned for all
+three app variants.
+Still OPEN (out of batch scope, deliberately): the correct per-consumer
+delivery model — acceptance criterion 3 (one job's turns must not decrement
+another's remaining injection lifetime) is NOT met by containment; shared TTL
+still ages ~N× faster under N parallel consumers. Criterion 5 (stable
+relevance-budget share under pinned-pool pressure) also remains open (P-3).
+
+**Originally:** OPEN. P1 concurrency / context-quality defect. The failures are
 contained, so all five jobs completed, but affected turns silently lose the
 shared memory retriever and collectively place heavy avoidable write pressure on
 Postgres.
