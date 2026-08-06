@@ -78,6 +78,141 @@ CREATE TYPE public.sudo_request_status AS ENUM (
 
 
 --
+-- Name: enforce_resource_inventory_item_fence(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.enforce_resource_inventory_item_fence() RETURNS trigger
+    LANGUAGE plpgsql SECURITY DEFINER
+    SET search_path TO 'pg_catalog'
+    AS $$
+DECLARE
+    target_snapshot_id UUID;
+    fence_ok BOOLEAN;
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        RETURN OLD;
+    END IF;
+    target_snapshot_id := NEW.snapshot_id;
+
+    SELECT TRUE INTO fence_ok
+    FROM public.resource_inventory_snapshots snapshot
+    JOIN public.resource_inventory_scope_epochs epoch
+      ON epoch.id = snapshot.scope_epoch_id
+    JOIN public.resource_inventory_ingest_tickets ticket
+      ON ticket.id = snapshot.ingest_ticket_id
+     AND ticket.scope_epoch_id = snapshot.scope_epoch_id
+    JOIN public.infra_metering_control control ON control.singleton = TRUE
+    WHERE snapshot.id = target_snapshot_id
+      AND snapshot.manifest_state = 'staging'
+      AND epoch.retired_at IS NULL
+      AND snapshot.leader_generation = control.leader_generation
+      AND ticket.leader_generation = control.leader_generation
+      AND ticket.bound_snapshot_id = snapshot.id
+      AND ticket.consumed_at IS NULL
+      AND ticket.expires_at > statement_timestamp();
+
+    IF fence_ok IS DISTINCT FROM TRUE THEN
+        RAISE EXCEPTION 'snapshot item ingestion fence failed'
+            USING ERRCODE = '55000';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: enforce_resource_inventory_snapshot_fence(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.enforce_resource_inventory_snapshot_fence() RETURNS trigger
+    LANGUAGE plpgsql SECURITY DEFINER
+    SET search_path TO 'pg_catalog'
+    AS $$
+DECLARE
+    current_generation BIGINT;
+    epoch_retired_at TIMESTAMPTZ;
+    ticket_generation BIGINT;
+    ticket_expires_at TIMESTAMPTZ;
+    ticket_bound_snapshot_id UUID;
+    ticket_consumed_at TIMESTAMPTZ;
+    ticket_max_items INTEGER;
+    ticket_max_bytes BIGINT;
+    ticket_staged_bytes BIGINT;
+    actual_staged_bytes BIGINT;
+BEGIN
+    IF TG_OP = 'UPDATE'
+       AND (
+            (OLD.manifest_state = 'sealed'
+                AND NEW.manifest_state = 'items-expired')
+            OR (OLD.manifest_state = 'staging'
+                AND NEW.manifest_state = 'staging-expired')
+       ) THEN
+        RETURN NEW;
+    END IF;
+
+    SELECT leader_generation INTO current_generation
+    FROM public.infra_metering_control
+    WHERE singleton = TRUE;
+
+    SELECT retired_at INTO epoch_retired_at
+    FROM public.resource_inventory_scope_epochs
+    WHERE id = NEW.scope_epoch_id;
+
+    SELECT leader_generation, expires_at, bound_snapshot_id, consumed_at,
+           max_snapshot_items, max_snapshot_bytes, staged_bytes
+    INTO ticket_generation, ticket_expires_at,
+         ticket_bound_snapshot_id, ticket_consumed_at,
+         ticket_max_items, ticket_max_bytes, ticket_staged_bytes
+    FROM public.resource_inventory_ingest_tickets
+    WHERE id = NEW.ingest_ticket_id
+      AND scope_epoch_id = NEW.scope_epoch_id;
+
+    IF current_generation IS NULL
+       OR epoch_retired_at IS NOT NULL
+       OR NEW.ingest_ticket_id IS NULL
+       OR ticket_generation IS NULL
+       OR NEW.leader_generation <> current_generation
+       OR ticket_generation <> current_generation
+       OR ticket_consumed_at IS NOT NULL
+       OR ticket_expires_at <= statement_timestamp()
+       OR (ticket_bound_snapshot_id IS NOT NULL
+           AND ticket_bound_snapshot_id <> NEW.id) THEN
+        RAISE EXCEPTION
+            'snapshot ingestion ticket/generation/scope epoch fence failed'
+            USING ERRCODE = '55000';
+    END IF;
+
+    IF TG_OP = 'UPDATE'
+       AND OLD.manifest_state = 'staging'
+       AND NEW.manifest_state = 'sealed' THEN
+        SELECT COALESCE(sum(
+            public.resource_inventory_snapshot_item_size_bytes(
+                item.source_kind, item.source_uid, item.revision_hash,
+                item.normalized_item, item.item_error
+            )
+        ), 0)
+        INTO actual_staged_bytes
+        FROM public.resource_inventory_snapshot_items item
+        WHERE item.snapshot_id = NEW.id;
+
+        IF NEW.leader_generation IS DISTINCT FROM OLD.leader_generation
+            OR NEW.ingest_ticket_id IS DISTINCT FROM OLD.ingest_ticket_id
+            OR ticket_bound_snapshot_id IS DISTINCT FROM NEW.id
+            OR jsonb_typeof(NEW.reconciliation_summary)
+                IS DISTINCT FROM 'object'
+            OR NEW.item_count > ticket_max_items
+            OR ticket_staged_bytes <> actual_staged_bytes
+            OR actual_staged_bytes > ticket_max_bytes THEN
+            RAISE EXCEPTION 'snapshot fence identity/bounds failed at seal'
+                USING ERRCODE = '55000';
+        END IF;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
 -- Name: notify_canvas_origin_session_change(); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -118,6 +253,30 @@ BEGIN
                 'status', NEW.status
             )::text
         );
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: protect_infra_metering_generation_mutation(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.protect_infra_metering_generation_mutation() RETURNS trigger
+    LANGUAGE plpgsql
+    SET search_path TO 'pg_catalog'
+    AS $$
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        RAISE EXCEPTION 'infra metering control cannot be deleted'
+            USING ERRCODE = '55000';
+    END IF;
+    IF NEW.singleton IS DISTINCT FROM OLD.singleton
+       OR NEW.leader_generation < OLD.leader_generation
+       OR NEW.updated_at < OLD.updated_at THEN
+        RAISE EXCEPTION 'infra metering generation is monotonic'
+            USING ERRCODE = '55000';
     END IF;
     RETURN NEW;
 END;
@@ -237,6 +396,176 @@ $$;
 
 
 --
+-- Name: protect_resource_inventory_ingest_ticket_mutation(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.protect_resource_inventory_ingest_ticket_mutation() RETURNS trigger
+    LANGUAGE plpgsql SECURITY DEFINER
+    SET search_path TO 'pg_catalog'
+    AS $$
+DECLARE
+    current_generation BIGINT;
+    epoch_retired_at TIMESTAMPTZ;
+    snapshot_ticket_id UUID;
+    actual_staged_bytes BIGINT;
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        IF OLD.bound_snapshot_id IS NULL
+           AND OLD.bound_at IS NULL
+           AND OLD.consumed_at IS NULL
+           AND OLD.expires_at <= statement_timestamp() THEN
+            RETURN OLD;
+        END IF;
+        RAISE EXCEPTION
+            'only expired unbound inventory ingest tickets may be deleted'
+            USING ERRCODE = '55000';
+    END IF;
+
+    SELECT leader_generation INTO current_generation
+    FROM public.infra_metering_control WHERE singleton = TRUE;
+    SELECT retired_at INTO epoch_retired_at
+    FROM public.resource_inventory_scope_epochs WHERE id = NEW.scope_epoch_id;
+
+    IF current_generation IS NULL
+       OR epoch_retired_at IS NOT NULL
+       OR NEW.leader_generation <> current_generation THEN
+        RAISE EXCEPTION 'inventory ingest ticket generation/scope fence failed'
+            USING ERRCODE = '55000';
+    END IF;
+
+    IF TG_OP = 'INSERT' THEN
+        IF NEW.bound_snapshot_id IS NOT NULL
+           OR NEW.bound_at IS NOT NULL
+           OR NEW.consumed_at IS NOT NULL
+           OR NEW.staged_bytes <> 0
+           OR NEW.expires_at <= statement_timestamp() THEN
+            RAISE EXCEPTION 'new inventory ingest ticket must be live and unbound'
+                USING ERRCODE = '55000';
+        END IF;
+        RETURN NEW;
+    END IF;
+
+    IF (to_jsonb(NEW)
+            - 'bound_snapshot_id' - 'bound_at' - 'consumed_at' - 'staged_bytes')
+       <> (to_jsonb(OLD)
+            - 'bound_snapshot_id' - 'bound_at' - 'consumed_at' - 'staged_bytes') THEN
+        RAISE EXCEPTION 'inventory ingest ticket request identity is immutable'
+            USING ERRCODE = '55000';
+    END IF;
+
+    IF OLD.bound_snapshot_id IS NULL
+       AND OLD.bound_at IS NULL
+       AND OLD.consumed_at IS NULL
+       AND NEW.bound_snapshot_id IS NOT NULL
+       AND NEW.bound_at IS NOT NULL
+       AND NEW.consumed_at IS NULL
+       AND NEW.staged_bytes = OLD.staged_bytes
+       AND NEW.expires_at > statement_timestamp() THEN
+        SELECT ingest_ticket_id INTO snapshot_ticket_id
+        FROM public.resource_inventory_snapshots
+        WHERE id = NEW.bound_snapshot_id
+          AND scope_epoch_id = NEW.scope_epoch_id;
+        IF snapshot_ticket_id = NEW.id THEN
+            RETURN NEW;
+        END IF;
+    END IF;
+
+    IF OLD.bound_snapshot_id IS NOT NULL
+       AND NEW.bound_snapshot_id = OLD.bound_snapshot_id
+       AND NEW.bound_at = OLD.bound_at
+       AND OLD.consumed_at IS NULL
+       AND NEW.consumed_at IS NULL
+       AND NEW.staged_bytes >= OLD.staged_bytes
+       AND NEW.staged_bytes <= NEW.max_snapshot_bytes
+       AND NEW.expires_at > statement_timestamp() THEN
+        SELECT COALESCE(sum(
+            public.resource_inventory_snapshot_item_size_bytes(
+                item.source_kind, item.source_uid, item.revision_hash,
+                item.normalized_item, item.item_error
+            )
+        ), 0)
+        INTO actual_staged_bytes
+        FROM public.resource_inventory_snapshot_items item
+        WHERE item.snapshot_id = NEW.bound_snapshot_id;
+        IF actual_staged_bytes = NEW.staged_bytes THEN
+            RETURN NEW;
+        END IF;
+    END IF;
+
+    IF OLD.bound_snapshot_id IS NOT NULL
+       AND NEW.bound_snapshot_id = OLD.bound_snapshot_id
+       AND NEW.bound_at = OLD.bound_at
+       AND NEW.staged_bytes = OLD.staged_bytes
+       AND OLD.consumed_at IS NULL
+       AND NEW.consumed_at IS NOT NULL
+       AND NEW.consumed_at <= NEW.expires_at
+       AND NEW.expires_at > statement_timestamp() THEN
+        RETURN NEW;
+    END IF;
+
+    RAISE EXCEPTION 'inventory ingest ticket transition is invalid'
+        USING ERRCODE = '55000';
+END;
+$$;
+
+
+--
+-- Name: protect_resource_inventory_shadow_comparison_mutation(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.protect_resource_inventory_shadow_comparison_mutation() RETURNS trigger
+    LANGUAGE plpgsql SECURITY DEFINER
+    SET search_path TO 'pg_catalog'
+    AS $$
+DECLARE
+    snapshot_is_staging BOOLEAN;
+    snapshot_state TEXT;
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        SELECT snapshot.manifest_state
+        INTO snapshot_state
+        FROM public.resource_inventory_snapshots snapshot
+        WHERE snapshot.id = OLD.snapshot_id
+          AND snapshot.inventory_scope_id = OLD.inventory_scope_id
+        FOR SHARE;
+        IF snapshot_state IN ('items-expired', 'staging-expired')
+           AND OLD.comparison_at
+                <= statement_timestamp() - INTERVAL '7 days'
+           AND OLD.created_at
+                <= statement_timestamp() - INTERVAL '7 days' THEN
+            RETURN OLD;
+        END IF;
+        RAISE EXCEPTION
+            'shadow comparisons require an expired manifest and seven-day floor'
+            USING ERRCODE = '55000';
+    ELSIF TG_OP = 'UPDATE' THEN
+        RAISE EXCEPTION 'inventory shadow comparison rows are immutable'
+            USING ERRCODE = '55000';
+    END IF;
+
+    SELECT snapshot.manifest_state = 'staging'
+    INTO snapshot_is_staging
+    FROM public.resource_inventory_snapshots snapshot
+    JOIN public.resource_inventory_ingest_tickets ticket
+      ON ticket.id = snapshot.ingest_ticket_id
+    JOIN public.infra_metering_control control ON control.singleton = TRUE
+    WHERE snapshot.id = NEW.snapshot_id
+      AND snapshot.inventory_scope_id = NEW.inventory_scope_id
+      AND snapshot.leader_generation = control.leader_generation
+      AND ticket.bound_snapshot_id = snapshot.id
+      AND ticket.consumed_at IS NULL
+      AND ticket.expires_at > statement_timestamp();
+
+    IF snapshot_is_staging IS DISTINCT FROM TRUE THEN
+        RAISE EXCEPTION 'shadow comparison snapshot fence failed'
+            USING ERRCODE = '55000';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
 -- Name: protect_resource_inventory_snapshot_item_mutation(); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -278,13 +607,13 @@ BEGIN
         FROM public.resource_inventory_snapshots
         WHERE id = OLD.snapshot_id
         FOR UPDATE;
-        IF old_state = 'items-expired' THEN
+        IF old_state IN ('items-expired', 'staging-expired') THEN
             RETURN OLD;
         END IF;
     END IF;
 
     RAISE EXCEPTION
-        'sealed inventory snapshot items are immutable'
+        'inventory snapshot items are immutable outside an expiry terminal'
         USING ERRCODE = '55000';
 END;
 $$;
@@ -337,15 +666,332 @@ BEGIN
        AND NEW.manifest_state = 'items-expired'
        AND NEW.items_expired_at IS NOT NULL
        AND NEW.items_expired_at <= statement_timestamp()
-       AND OLD.collection_completed_at
-           <= statement_timestamp() - INTERVAL '7 days'
+       AND OLD.sealed_at <= statement_timestamp() - INTERVAL '7 days'
+       AND (to_jsonb(NEW) - 'manifest_state' - 'items_expired_at')
+           = (to_jsonb(OLD) - 'manifest_state' - 'items_expired_at') THEN
+        RETURN NEW;
+    END IF;
+
+    IF OLD.manifest_state = 'staging'
+       AND NEW.manifest_state = 'staging-expired'
+       AND NOT OLD.complete
+       AND NOT NEW.complete
+       AND NEW.sealed_at IS NULL
+       AND NEW.items_expired_at IS NOT NULL
+       AND NEW.items_expired_at <= statement_timestamp()
+       AND OLD.created_at <= statement_timestamp() - INTERVAL '24 hours'
+       AND (
+            OLD.ingest_ticket_id IS NULL
+            OR EXISTS (
+                SELECT 1
+                FROM public.resource_inventory_ingest_tickets ticket
+                WHERE ticket.id = OLD.ingest_ticket_id
+                  AND ticket.scope_epoch_id = OLD.scope_epoch_id
+                  AND ticket.bound_snapshot_id = OLD.id
+                  AND ticket.expires_at <= statement_timestamp()
+            )
+       )
        AND (to_jsonb(NEW) - 'manifest_state' - 'items_expired_at')
            = (to_jsonb(OLD) - 'manifest_state' - 'items_expired_at') THEN
         RETURN NEW;
     END IF;
 
     RAISE EXCEPTION
-        'snapshot metadata may only be finalized once or mark sealed items expired'
+        'snapshot metadata may only be finalized once or enter an expiry terminal'
+        USING ERRCODE = '55000';
+END;
+$$;
+
+
+--
+-- Name: protect_resource_inventory_transport_nonce_mutation(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.protect_resource_inventory_transport_nonce_mutation() RETURNS trigger
+    LANGUAGE plpgsql SECURITY DEFINER
+    SET search_path TO 'pg_catalog'
+    AS $$
+DECLARE
+    current_generation BIGINT;
+    epoch_retired_at TIMESTAMPTZ;
+BEGIN
+    IF TG_OP = 'UPDATE' THEN
+        RAISE EXCEPTION 'inventory transport nonce claims are immutable'
+            USING ERRCODE = '55000';
+    END IF;
+    IF TG_OP = 'DELETE' THEN
+        IF OLD.expires_at > statement_timestamp() THEN
+            RAISE EXCEPTION 'live inventory transport nonce cannot be deleted'
+                USING ERRCODE = '55000';
+        END IF;
+        RETURN OLD;
+    END IF;
+
+    SELECT leader_generation INTO current_generation
+    FROM public.infra_metering_control WHERE singleton = TRUE;
+    SELECT retired_at INTO epoch_retired_at
+    FROM public.resource_inventory_scope_epochs WHERE id = NEW.scope_epoch_id;
+    IF current_generation IS NULL
+       OR epoch_retired_at IS NOT NULL
+       OR NEW.leader_generation <> current_generation
+       OR NEW.received_at > statement_timestamp()
+       OR NEW.expires_at <= statement_timestamp() THEN
+        RAISE EXCEPTION 'inventory transport nonce generation/scope fence failed'
+            USING ERRCODE = '55000';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: protect_resource_inventory_watch_event_mutation(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.protect_resource_inventory_watch_event_mutation() RETURNS trigger
+    LANGUAGE plpgsql SECURITY DEFINER
+    SET search_path TO 'pg_catalog'
+    AS $$
+DECLARE
+    session_row public.resource_inventory_watch_sessions%ROWTYPE;
+    current_generation BIGINT;
+    epoch_scope_id UUID;
+    epoch_retired_at TIMESTAMPTZ;
+    epoch_resource_version TEXT;
+    postcondition_ok BOOLEAN;
+    deletion_allowed BOOLEAN;
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        SELECT (session.consumed_at IS NOT NULL
+                    OR session.expires_at <= statement_timestamp())
+               AND COALESCE(session.consumed_at, session.expires_at)
+                    <= statement_timestamp() - INTERVAL '7 days'
+        INTO deletion_allowed
+        FROM public.resource_inventory_watch_sessions session
+        WHERE session.id = OLD.watch_session_id
+          AND session.scope_epoch_id = OLD.scope_epoch_id
+        FOR SHARE;
+        IF deletion_allowed IS TRUE THEN
+            RETURN OLD;
+        END IF;
+        RAISE EXCEPTION
+            'watch events require a seven-day terminal session floor'
+            USING ERRCODE = '55000';
+    ELSIF TG_OP = 'UPDATE' THEN
+        RAISE EXCEPTION 'inventory watch event rows are immutable'
+            USING ERRCODE = '55000';
+    END IF;
+
+    SELECT * INTO session_row
+    FROM public.resource_inventory_watch_sessions
+    WHERE id = NEW.watch_session_id
+      AND scope_epoch_id = NEW.scope_epoch_id
+    FOR UPDATE;
+    SELECT leader_generation INTO current_generation
+    FROM public.infra_metering_control WHERE singleton = TRUE;
+    SELECT scope_id, retired_at, last_resource_version
+    INTO epoch_scope_id, epoch_retired_at, epoch_resource_version
+    FROM public.resource_inventory_scope_epochs
+    WHERE id = NEW.scope_epoch_id;
+
+    IF session_row.id IS NULL
+       OR session_row.consumed_at IS NOT NULL
+       OR session_row.expires_at <= statement_timestamp()
+       OR epoch_retired_at IS NOT NULL
+       OR current_generation IS NULL
+       OR session_row.leader_generation <> current_generation
+       OR NEW.ordinal <> session_row.committed_events + 1
+       OR NEW.expected_resource_version
+            IS DISTINCT FROM session_row.last_resource_version
+       OR NEW.expected_resource_version
+            IS DISTINCT FROM epoch_resource_version
+       OR NEW.event_bytes > session_row.max_bytes
+                              - session_row.committed_bytes
+       OR NEW.received_at > statement_timestamp() THEN
+        RAISE EXCEPTION 'inventory watch event cursor/session fence failed'
+            USING ERRCODE = '55000';
+    END IF;
+
+    IF NEW.mutation_action IN ('confirm', 'open', 'revise') THEN
+        SELECT TRUE INTO postcondition_ok
+        FROM public.resource_intervals interval
+        WHERE interval.id = NEW.affected_interval_id
+          AND interval.inventory_scope_id = epoch_scope_id
+          AND interval.source_kind = NEW.source_kind
+          AND interval.source_uid = NEW.source_uid
+          AND interval.source_revision = NEW.revision_hash
+          AND interval.ended_at IS NULL
+          AND interval.last_seen_at >= NEW.received_at
+          AND interval.last_confirmed_at >= NEW.received_at;
+    ELSIF NEW.mutation_action = 'presence-invalid'
+          AND NEW.affected_interval_id IS NOT NULL THEN
+        SELECT TRUE INTO postcondition_ok
+        FROM public.resource_intervals interval
+        WHERE interval.id = NEW.affected_interval_id
+          AND interval.inventory_scope_id = epoch_scope_id
+          AND interval.source_kind = NEW.source_kind
+          AND interval.source_uid = NEW.source_uid
+          AND interval.ended_at IS NULL
+          AND interval.last_seen_at >= NEW.received_at;
+    ELSIF NEW.mutation_action = 'close' THEN
+        SELECT TRUE INTO postcondition_ok
+        FROM public.resource_intervals interval
+        WHERE interval.id = NEW.affected_interval_id
+          AND interval.inventory_scope_id = epoch_scope_id
+          AND interval.source_kind = NEW.source_kind
+          AND interval.source_uid = NEW.source_uid
+          AND interval.ended_at = NEW.received_at;
+    ELSIF NEW.mutation_action IN ('already-absent', 'not-applicable') THEN
+        SELECT NOT EXISTS (
+            SELECT 1 FROM public.resource_intervals interval
+            WHERE interval.inventory_scope_id = epoch_scope_id
+              AND interval.source_kind = NEW.source_kind
+              AND interval.source_uid = NEW.source_uid
+              AND interval.ended_at IS NULL
+        ) INTO postcondition_ok;
+    ELSIF NEW.mutation_action = 'history-gap' THEN
+        SELECT TRUE INTO postcondition_ok
+        FROM public.resource_inventory_coverage_gaps gap
+        WHERE gap.id = NEW.coverage_gap_id
+          AND gap.scope_epoch_id = NEW.scope_epoch_id
+          AND gap.resolution = 'unresolved'
+          AND gap.gap_start <= NEW.received_at;
+    ELSE
+        -- BOOKMARK and an invalid item without an existing interval have no
+        -- object mutation, by design.
+        postcondition_ok := TRUE;
+    END IF;
+
+    IF postcondition_ok IS DISTINCT FROM TRUE THEN
+        RAISE EXCEPTION 'inventory watch event interval/gap postcondition failed'
+            USING ERRCODE = '55000';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: protect_resource_inventory_watch_session_mutation(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.protect_resource_inventory_watch_session_mutation() RETURNS trigger
+    LANGUAGE plpgsql SECURITY DEFINER
+    SET search_path TO 'pg_catalog'
+    AS $$
+DECLARE
+    current_generation BIGINT;
+    epoch_retired_at TIMESTAMPTZ;
+    epoch_resource_version TEXT;
+    committed_event public.resource_inventory_watch_events%ROWTYPE;
+    hit_limit BOOLEAN;
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        IF (OLD.consumed_at IS NOT NULL
+                OR OLD.expires_at <= statement_timestamp())
+           AND COALESCE(OLD.consumed_at, OLD.expires_at)
+                <= statement_timestamp() - INTERVAL '7 days'
+           AND NOT EXISTS (
+                SELECT 1
+                FROM public.resource_inventory_watch_events event
+                WHERE event.watch_session_id = OLD.id
+           ) THEN
+            RETURN OLD;
+        END IF;
+        RAISE EXCEPTION
+            'watch sessions require a seven-day terminal floor and no events'
+            USING ERRCODE = '55000';
+    END IF;
+
+    SELECT leader_generation INTO current_generation
+    FROM public.infra_metering_control WHERE singleton = TRUE;
+    SELECT retired_at, last_resource_version
+    INTO epoch_retired_at, epoch_resource_version
+    FROM public.resource_inventory_scope_epochs
+    WHERE id = NEW.scope_epoch_id;
+
+    IF current_generation IS NULL
+       OR epoch_retired_at IS NOT NULL
+       OR NEW.leader_generation <> current_generation THEN
+        RAISE EXCEPTION 'inventory watch session generation/scope fence failed'
+            USING ERRCODE = '55000';
+    END IF;
+
+    IF TG_OP = 'INSERT' THEN
+        IF NEW.starting_resource_version IS DISTINCT FROM epoch_resource_version
+           OR NEW.last_resource_version IS DISTINCT FROM epoch_resource_version
+           OR NEW.committed_events <> 0
+           OR NEW.committed_bytes <> 0
+           OR NEW.consumed_at IS NOT NULL
+           OR NEW.termination_reason IS NOT NULL
+           OR NEW.expires_at <= statement_timestamp() THEN
+            RAISE EXCEPTION 'new watch session must bind the committed cursor'
+                USING ERRCODE = '55000';
+        END IF;
+        RETURN NEW;
+    END IF;
+
+    IF OLD.consumed_at IS NOT NULL
+       OR (to_jsonb(NEW)
+            - 'last_resource_version' - 'committed_events'
+            - 'committed_bytes' - 'termination_reason'
+            - 'consumed_at' - 'updated_at')
+          <> (to_jsonb(OLD)
+            - 'last_resource_version' - 'committed_events'
+            - 'committed_bytes' - 'termination_reason'
+            - 'consumed_at' - 'updated_at')
+       OR NEW.updated_at < OLD.updated_at THEN
+        RAISE EXCEPTION 'inventory watch session identity is immutable'
+            USING ERRCODE = '55000';
+    END IF;
+
+    -- A clean shutdown consumes the grant without inventing an event/cursor.
+    IF NEW.committed_events = OLD.committed_events
+       AND NEW.committed_bytes = OLD.committed_bytes
+       AND NEW.last_resource_version = OLD.last_resource_version
+       AND NEW.termination_reason = 'completed'
+       AND NEW.consumed_at IS NOT NULL
+       AND NEW.consumed_at <= NEW.expires_at
+       AND NEW.expires_at > statement_timestamp() THEN
+        RETURN NEW;
+    END IF;
+
+    SELECT event.* INTO committed_event
+    FROM public.resource_inventory_watch_events event
+    WHERE event.watch_session_id = NEW.id
+      AND event.ordinal = NEW.committed_events;
+
+    hit_limit := NEW.committed_events = NEW.max_events
+                 OR NEW.committed_bytes = NEW.max_bytes;
+    IF committed_event.id IS NOT NULL
+       AND NEW.expires_at > statement_timestamp()
+       AND NEW.committed_events = OLD.committed_events + 1
+       AND NEW.committed_bytes = OLD.committed_bytes
+                                     + committed_event.event_bytes
+       AND committed_event.expected_resource_version
+             = OLD.last_resource_version
+       AND NEW.last_resource_version = COALESCE(
+            committed_event.resource_version, OLD.last_resource_version
+       )
+       AND (
+            (committed_event.event_type = 'history-lost'
+                AND NEW.last_resource_version = OLD.last_resource_version
+                AND NEW.termination_reason = 'history-lost'
+                AND NEW.consumed_at IS NOT NULL)
+            OR (committed_event.event_type <> 'history-lost'
+                AND hit_limit
+                AND NEW.termination_reason = 'limit-reached'
+                AND NEW.consumed_at IS NOT NULL)
+            OR (committed_event.event_type <> 'history-lost'
+                AND NOT hit_limit
+                AND NEW.termination_reason IS NULL
+                AND NEW.consumed_at IS NULL)
+       )
+       AND (NEW.consumed_at IS NULL OR NEW.consumed_at <= NEW.expires_at) THEN
+        RETURN NEW;
+    END IF;
+
+    RAISE EXCEPTION 'inventory watch session transition is invalid'
         USING ERRCODE = '55000';
 END;
 $$;
@@ -582,6 +1228,23 @@ BEGIN
         'usage rate-card components are immutable; insert a successor version'
         USING ERRCODE = '55000';
 END;
+$$;
+
+
+--
+-- Name: resource_inventory_snapshot_item_size_bytes(text, text, text, jsonb, jsonb); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.resource_inventory_snapshot_item_size_bytes(source_kind text, source_uid text, revision_hash text, normalized_item jsonb, item_error jsonb) RETURNS bigint
+    LANGUAGE sql IMMUTABLE
+    SET search_path TO 'pg_catalog'
+    AS $$
+    SELECT 64::BIGINT
+         + octet_length(source_kind)::BIGINT
+         + octet_length(source_uid)::BIGINT
+         + COALESCE(octet_length(revision_hash), 0)::BIGINT
+         + pg_column_size(normalized_item)::BIGINT
+         + COALESCE(pg_column_size(item_error), 0)::BIGINT
 $$;
 
 
@@ -2441,6 +3104,38 @@ CREATE TABLE public.resource_inventory_coverage_gaps (
 
 
 --
+-- Name: resource_inventory_ingest_tickets; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.resource_inventory_ingest_tickets (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    nonce_hash text NOT NULL,
+    scope_epoch_id uuid NOT NULL,
+    leader_generation bigint NOT NULL,
+    request_digest text NOT NULL,
+    max_snapshot_items integer NOT NULL,
+    max_snapshot_bytes bigint NOT NULL,
+    staged_bytes bigint DEFAULT 0 NOT NULL,
+    expires_at timestamp with time zone NOT NULL,
+    bound_snapshot_id uuid,
+    bound_at timestamp with time zone,
+    consumed_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT resource_inventory_ingest_tickets_generation_check CHECK (((leader_generation > 0) AND (max_snapshot_items > 0) AND (max_snapshot_bytes > 0) AND (staged_bytes >= 0) AND (staged_bytes <= max_snapshot_bytes))),
+    CONSTRAINT resource_inventory_ingest_tickets_hash_check CHECK (((nonce_hash ~ '^[0-9a-f]{64}$'::text) AND (request_digest ~ '^[0-9a-f]{64}$'::text))),
+    CONSTRAINT resource_inventory_ingest_tickets_state_check CHECK ((((bound_snapshot_id IS NULL) AND (bound_at IS NULL) AND (consumed_at IS NULL)) OR ((bound_snapshot_id IS NOT NULL) AND (bound_at IS NOT NULL)))),
+    CONSTRAINT resource_inventory_ingest_tickets_time_check CHECK (((expires_at > created_at) AND ((bound_at IS NULL) OR (bound_at >= created_at)) AND ((consumed_at IS NULL) OR (consumed_at >= bound_at)) AND ((consumed_at IS NULL) OR (consumed_at <= expires_at))))
+);
+
+
+--
+-- Name: TABLE resource_inventory_ingest_tickets; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.resource_inventory_ingest_tickets IS 'Hashed one-time collector tickets bound to one scope epoch, generation, request digest, and snapshot.';
+
+
+--
 -- Name: resource_inventory_scope_epochs; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -2473,9 +3168,12 @@ CREATE TABLE public.resource_inventory_scope_epochs (
     sanitized_error jsonb,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    recovery_from_epoch_id uuid,
+    require_after_recovery boolean DEFAULT false NOT NULL,
     CONSTRAINT resource_inventory_scope_epochs_health_check CHECK (((coverage_mode <> ''::text) AND (snapshot_health <> ''::text) AND (continuity_health <> ''::text) AND (item_health <> ''::text) AND (backend_health <> ''::text) AND (publication_health <> ''::text) AND (leader_generation >= 0) AND (consecutive_failures >= 0) AND ((last_sequence IS NULL) OR (last_sequence >= 0)) AND ((last_item_count IS NULL) OR (last_item_count >= 0)) AND ((sanitized_error IS NULL) OR (jsonb_typeof(sanitized_error) = 'object'::text)))),
     CONSTRAINT resource_inventory_scope_epochs_midnight_check CHECK (((required_from IS NULL) OR (required_from = date_trunc('day'::text, required_from, 'UTC'::text)))),
     CONSTRAINT resource_inventory_scope_epochs_number_check CHECK ((epoch_number > 0)),
+    CONSTRAINT resource_inventory_scope_epochs_recovery_shape_check CHECK ((((recovery_from_epoch_id IS NULL) AND (NOT require_after_recovery)) OR ((recovery_from_epoch_id IS NOT NULL) AND (recovery_from_epoch_id <> id)))),
     CONSTRAINT resource_inventory_scope_epochs_requirement_check CHECK (((required_for_rollup AND (required_from IS NOT NULL) AND (reliable_from IS NOT NULL) AND (required_from >= reliable_from)) OR ((NOT required_for_rollup) AND (required_from IS NULL)))),
     CONSTRAINT resource_inventory_scope_epochs_retirement_check CHECK (((retired_at IS NULL) OR (((reliable_from IS NULL) OR (retired_at >= reliable_from)) AND ((required_from IS NULL) OR (retired_at > required_from)) AND ((continuous_since IS NULL) OR (retired_at >= continuous_since)) AND ((complete_through IS NULL) OR (retired_at >= complete_through)))))
 );
@@ -2501,6 +3199,48 @@ CREATE TABLE public.resource_inventory_scopes (
 --
 
 COMMENT ON TABLE public.resource_inventory_scopes IS 'Stable metering inventory scope identity; effective requirements live in scope epochs.';
+
+
+--
+-- Name: resource_inventory_shadow_comparisons; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.resource_inventory_shadow_comparisons (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    snapshot_id uuid NOT NULL,
+    inventory_scope_id uuid NOT NULL,
+    source_uid text NOT NULL,
+    owner_kind text,
+    owner_id uuid,
+    owner_trusted boolean DEFAULT false NOT NULL,
+    legacy_interval_id bigint,
+    legacy_cpu_millicores bigint,
+    legacy_memory_bytes bigint,
+    legacy_started_at timestamp with time zone,
+    observed_cpu_millicores bigint,
+    observed_memory_bytes bigint,
+    observed_started_at timestamp with time zone,
+    observed_start_time_source text,
+    observed_start_uncertainty_us bigint,
+    start_delta_us bigint,
+    status text NOT NULL,
+    reason_code text NOT NULL,
+    explained boolean DEFAULT false NOT NULL,
+    comparison_at timestamp with time zone NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT resource_inventory_shadow_comparisons_capacity_check CHECK (((((legacy_interval_id IS NULL) AND (legacy_cpu_millicores IS NULL) AND (legacy_memory_bytes IS NULL)) OR ((legacy_interval_id IS NOT NULL) AND (legacy_cpu_millicores IS NOT NULL) AND (legacy_memory_bytes IS NOT NULL) AND (legacy_cpu_millicores >= 0) AND (legacy_memory_bytes >= 0))) AND ((observed_cpu_millicores IS NULL) OR (observed_cpu_millicores >= 0)) AND ((observed_memory_bytes IS NULL) OR (observed_memory_bytes >= 0)))),
+    CONSTRAINT resource_inventory_shadow_comparisons_lifetime_check CHECK (((((observed_started_at IS NULL) AND (observed_start_time_source IS NULL) AND (observed_start_uncertainty_us IS NULL)) OR ((observed_started_at IS NOT NULL) AND (observed_start_time_source IS NOT NULL) AND (observed_start_time_source <> ''::text) AND (observed_start_uncertainty_us IS NOT NULL) AND (observed_start_uncertainty_us >= 0))) AND ((start_delta_us IS NULL) OR ((legacy_started_at IS NOT NULL) AND (observed_started_at IS NOT NULL) AND (start_delta_us = ((EXTRACT(epoch FROM (observed_started_at - legacy_started_at)) * (1000000)::numeric))::bigint))))),
+    CONSTRAINT resource_inventory_shadow_comparisons_owner_check CHECK (((owner_trusted AND (owner_kind = ANY (ARRAY['job'::text, 'thread'::text])) AND (owner_id IS NOT NULL)) OR ((NOT owner_trusted) AND (owner_kind IS NULL) AND (owner_id IS NULL)))),
+    CONSTRAINT resource_inventory_shadow_comparisons_status_check CHECK (((status = ANY (ARRAY['matched'::text, 'capacity-mismatch'::text, 'owner-mismatch'::text, 'legacy-missing'::text, 'invalid-observation'::text, 'not-applicable'::text, 'lifetime-mismatch'::text])) AND (reason_code ~ '^[a-z0-9][a-z0-9._-]{0,63}$'::text) AND ((status <> 'matched'::text) OR (start_delta_us IS NULL) OR (start_delta_us = 0)) AND ((status <> 'lifetime-mismatch'::text) OR ((NOT explained) AND (reason_code = ANY (ARRAY['start-semantics'::text, 'start-evidence-missing'::text])) AND ((start_delta_us IS NULL) OR (start_delta_us <> 0)))))),
+    CONSTRAINT resource_inventory_shadow_comparisons_uid_check CHECK ((source_uid <> ''::text))
+);
+
+
+--
+-- Name: TABLE resource_inventory_shadow_comparisons; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.resource_inventory_shadow_comparisons IS 'Per-snapshot workspace shadow comparisons, immutable until the manifest and diagnostic horizons expire; reason_code contains no free-form customer data.';
 
 
 --
@@ -2544,10 +3284,114 @@ CREATE TABLE public.resource_inventory_snapshots (
     sealed_at timestamp with time zone,
     items_expired_at timestamp with time zone,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
-    CONSTRAINT resource_inventory_snapshots_manifest_state_check CHECK ((((manifest_state = 'staging'::text) AND (sealed_at IS NULL) AND (items_expired_at IS NULL)) OR ((manifest_state = 'sealed'::text) AND (sealed_at IS NOT NULL) AND (items_expired_at IS NULL)) OR ((manifest_state = 'items-expired'::text) AND (sealed_at IS NOT NULL) AND (items_expired_at IS NOT NULL) AND (items_expired_at >= sealed_at)))),
+    ingest_ticket_id uuid,
+    reconciliation_summary jsonb,
+    CONSTRAINT resource_inventory_snapshots_manifest_state_check CHECK ((((manifest_state = 'staging'::text) AND (sealed_at IS NULL) AND (items_expired_at IS NULL)) OR ((manifest_state = 'sealed'::text) AND (sealed_at IS NOT NULL) AND (items_expired_at IS NULL)) OR ((manifest_state = 'items-expired'::text) AND (sealed_at IS NOT NULL) AND (items_expired_at IS NOT NULL) AND (items_expired_at >= sealed_at)) OR ((manifest_state = 'staging-expired'::text) AND (NOT complete) AND (sealed_at IS NULL) AND (items_expired_at IS NOT NULL) AND (items_expired_at >= created_at)))),
+    CONSTRAINT resource_inventory_snapshots_reconciliation_summary_check CHECK ((((ingest_ticket_id IS NULL) AND (reconciliation_summary IS NULL)) OR ((manifest_state = ANY (ARRAY['staging'::text, 'staging-expired'::text])) AND (reconciliation_summary IS NULL)) OR ((manifest_state = ANY (ARRAY['sealed'::text, 'items-expired'::text])) AND (jsonb_typeof(reconciliation_summary) = 'object'::text)))),
     CONSTRAINT resource_inventory_snapshots_shape_check CHECK (((leader_generation >= 0) AND (item_count >= 0) AND ((sequence IS NULL) OR (sequence >= 0)) AND ((item_digest IS NULL) OR (item_digest ~ '^[0-9a-f]{64}$'::text)) AND (jsonb_typeof(fatal_errors) = 'array'::text) AND (jsonb_typeof(item_errors) = 'array'::text) AND ((NOT complete) OR (jsonb_array_length(fatal_errors) = 0)) AND ((manifest_state <> 'sealed'::text) OR (NOT complete) OR (item_digest IS NOT NULL)))),
-    CONSTRAINT resource_inventory_snapshots_time_check CHECK (((collection_completed_at >= collection_started_at) AND (received_at >= collection_completed_at) AND ((sealed_at IS NULL) OR (sealed_at >= received_at))))
+    CONSTRAINT resource_inventory_snapshots_time_check CHECK (((collection_completed_at >= collection_started_at) AND ((sealed_at IS NULL) OR (sealed_at >= received_at))))
 );
+
+
+--
+-- Name: resource_inventory_transport_nonces; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.resource_inventory_transport_nonces (
+    collector_id text NOT NULL,
+    request_nonce uuid NOT NULL,
+    request_kind text NOT NULL,
+    request_digest text NOT NULL,
+    scope_epoch_id uuid NOT NULL,
+    leader_generation bigint NOT NULL,
+    received_at timestamp with time zone DEFAULT now() NOT NULL,
+    expires_at timestamp with time zone NOT NULL,
+    CONSTRAINT resource_inventory_transport_nonces_identity_check CHECK (((collector_id ~ '^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$'::text) AND (request_kind ~ '^[a-z0-9][a-z0-9._-]{0,63}$'::text) AND (request_digest ~ '^[0-9a-f]{64}$'::text) AND (leader_generation > 0))),
+    CONSTRAINT resource_inventory_transport_nonces_time_check CHECK ((expires_at > received_at))
+);
+
+
+--
+-- Name: TABLE resource_inventory_transport_nonces; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.resource_inventory_transport_nonces IS 'Immutable HMAC request nonce claims retained through a replay window; expired rows are removed in bounded batches.';
+
+
+--
+-- Name: resource_inventory_watch_events; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.resource_inventory_watch_events (
+    watch_session_id uuid NOT NULL,
+    id uuid NOT NULL,
+    scope_epoch_id uuid NOT NULL,
+    ordinal integer NOT NULL,
+    request_digest text NOT NULL,
+    event_type text NOT NULL,
+    expected_resource_version text NOT NULL,
+    resource_version text,
+    source_kind text,
+    source_uid text,
+    revision_hash text,
+    normalized_item jsonb,
+    valid_for_metering boolean,
+    item_error jsonb,
+    mutation_action text NOT NULL,
+    affected_interval_id uuid,
+    coverage_gap_id uuid,
+    event_bytes bigint NOT NULL,
+    collector_observed_at timestamp with time zone,
+    received_at timestamp with time zone NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT resource_inventory_watch_events_common_check CHECK (((ordinal > 0) AND ((event_bytes > 0) OR ((event_type = 'history-lost'::text) AND (event_bytes = 0))) AND (expected_resource_version <> ''::text) AND (expected_resource_version <> '0'::text) AND ((resource_version IS NULL) OR ((resource_version <> ''::text) AND (resource_version <> '0'::text))) AND ((revision_hash IS NULL) OR (revision_hash ~ '^[0-9a-f]{64}$'::text)) AND ((normalized_item IS NULL) OR (jsonb_typeof(normalized_item) = 'object'::text)) AND ((item_error IS NULL) OR (jsonb_typeof(item_error) = 'object'::text)))),
+    CONSTRAINT resource_inventory_watch_events_digest_check CHECK ((request_digest ~ '^[0-9a-f]{64}$'::text)),
+    CONSTRAINT resource_inventory_watch_events_interval_action_check CHECK ((((mutation_action = ANY (ARRAY['confirm'::text, 'open'::text, 'revise'::text, 'close'::text])) AND (affected_interval_id IS NOT NULL)) OR (mutation_action = 'presence-invalid'::text) OR ((mutation_action = ANY (ARRAY['not-applicable'::text, 'already-absent'::text, 'bookmark'::text, 'history-gap'::text])) AND (affected_interval_id IS NULL)))),
+    CONSTRAINT resource_inventory_watch_events_shape_check CHECK ((((event_type = ANY (ARRAY['added'::text, 'modified'::text])) AND (resource_version IS NOT NULL) AND (source_kind = ANY (ARRAY['pod'::text, 'vmi'::text, 'pvc'::text, 'volume'::text])) AND (source_uid IS NOT NULL) AND (source_uid <> ''::text) AND (normalized_item IS NOT NULL) AND (valid_for_metering IS NOT NULL) AND ((valid_for_metering AND (revision_hash IS NOT NULL) AND (item_error IS NULL) AND (mutation_action = ANY (ARRAY['confirm'::text, 'open'::text, 'revise'::text, 'not-applicable'::text, 'close'::text, 'already-absent'::text]))) OR ((NOT valid_for_metering) AND (item_error IS NOT NULL) AND (mutation_action = ANY (ARRAY['presence-invalid'::text, 'close'::text, 'already-absent'::text])))) AND (coverage_gap_id IS NULL)) OR ((event_type = 'deleted'::text) AND (resource_version IS NOT NULL) AND (source_kind = ANY (ARRAY['pod'::text, 'vmi'::text, 'pvc'::text, 'volume'::text])) AND (source_uid IS NOT NULL) AND (source_uid <> ''::text) AND (revision_hash IS NULL) AND (normalized_item IS NULL) AND (valid_for_metering IS NULL) AND (item_error IS NULL) AND (mutation_action = ANY (ARRAY['close'::text, 'already-absent'::text])) AND (coverage_gap_id IS NULL)) OR ((event_type = 'bookmark'::text) AND (resource_version IS NOT NULL) AND (source_kind IS NULL) AND (source_uid IS NULL) AND (revision_hash IS NULL) AND (normalized_item IS NULL) AND (valid_for_metering IS NULL) AND (item_error IS NULL) AND (mutation_action = 'bookmark'::text) AND (affected_interval_id IS NULL) AND (coverage_gap_id IS NULL)) OR ((event_type = 'history-lost'::text) AND (resource_version IS NULL) AND (source_kind IS NULL) AND (source_uid IS NULL) AND (revision_hash IS NULL) AND (normalized_item IS NULL) AND (valid_for_metering IS NULL) AND (item_error IS NULL) AND (mutation_action = 'history-gap'::text) AND (affected_interval_id IS NULL) AND (coverage_gap_id IS NOT NULL))))
+);
+
+
+--
+-- Name: TABLE resource_inventory_watch_events; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.resource_inventory_watch_events IS 'One-event receipts coupling a UID mutation, BOOKMARK, or history gap to one opaque cursor CAS; immutable until their terminal session passes retention.';
+
+
+--
+-- Name: resource_inventory_watch_sessions; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.resource_inventory_watch_sessions (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    nonce_hash text NOT NULL,
+    scope_epoch_id uuid NOT NULL,
+    leader_generation bigint NOT NULL,
+    request_digest text NOT NULL,
+    starting_resource_version text NOT NULL,
+    last_resource_version text NOT NULL,
+    max_events integer NOT NULL,
+    max_bytes bigint NOT NULL,
+    committed_events integer DEFAULT 0 NOT NULL,
+    committed_bytes bigint DEFAULT 0 NOT NULL,
+    expires_at timestamp with time zone NOT NULL,
+    termination_reason text,
+    consumed_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT resource_inventory_watch_sessions_bounds_check CHECK (((leader_generation > 0) AND (max_events > 0) AND (max_bytes > 0) AND (committed_events >= 0) AND (committed_events <= max_events) AND (committed_bytes >= 0) AND (committed_bytes <= max_bytes))),
+    CONSTRAINT resource_inventory_watch_sessions_cursor_check CHECK (((starting_resource_version <> ''::text) AND (starting_resource_version <> '0'::text) AND (last_resource_version <> ''::text) AND (last_resource_version <> '0'::text))),
+    CONSTRAINT resource_inventory_watch_sessions_hash_check CHECK (((nonce_hash ~ '^[0-9a-f]{64}$'::text) AND (request_digest ~ '^[0-9a-f]{64}$'::text))),
+    CONSTRAINT resource_inventory_watch_sessions_state_check CHECK ((((consumed_at IS NULL) AND (termination_reason IS NULL)) OR ((consumed_at IS NOT NULL) AND (termination_reason = ANY (ARRAY['completed'::text, 'limit-reached'::text, 'history-lost'::text]))))),
+    CONSTRAINT resource_inventory_watch_sessions_time_check CHECK (((expires_at > created_at) AND ((consumed_at IS NULL) OR (consumed_at >= created_at)) AND ((consumed_at IS NULL) OR (consumed_at <= expires_at))))
+);
+
+
+--
+-- Name: TABLE resource_inventory_watch_sessions; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.resource_inventory_watch_sessions IS 'Hashed bounded WATCH grants bound to one scope epoch, leader generation, starting cursor, event count, bytes, and expiry; terminal diagnostics may be pruned child-first after the hard floor.';
 
 
 --
@@ -4115,6 +4959,30 @@ ALTER TABLE ONLY public.resource_inventory_coverage_gaps
 
 
 --
+-- Name: resource_inventory_ingest_tickets resource_inventory_ingest_tickets_id_scope_uq; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.resource_inventory_ingest_tickets
+    ADD CONSTRAINT resource_inventory_ingest_tickets_id_scope_uq UNIQUE (id, scope_epoch_id);
+
+
+--
+-- Name: resource_inventory_ingest_tickets resource_inventory_ingest_tickets_nonce_hash_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.resource_inventory_ingest_tickets
+    ADD CONSTRAINT resource_inventory_ingest_tickets_nonce_hash_key UNIQUE (nonce_hash);
+
+
+--
+-- Name: resource_inventory_ingest_tickets resource_inventory_ingest_tickets_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.resource_inventory_ingest_tickets
+    ADD CONSTRAINT resource_inventory_ingest_tickets_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: resource_inventory_scope_epochs resource_inventory_scope_epochs_id_scope_uq; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -4128,6 +4996,14 @@ ALTER TABLE ONLY public.resource_inventory_scope_epochs
 
 ALTER TABLE ONLY public.resource_inventory_scope_epochs
     ADD CONSTRAINT resource_inventory_scope_epochs_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: resource_inventory_scope_epochs resource_inventory_scope_epochs_recovery_uq; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.resource_inventory_scope_epochs
+    ADD CONSTRAINT resource_inventory_scope_epochs_recovery_uq UNIQUE (recovery_from_epoch_id);
 
 
 --
@@ -4155,6 +5031,22 @@ ALTER TABLE ONLY public.resource_inventory_scopes
 
 
 --
+-- Name: resource_inventory_shadow_comparisons resource_inventory_shadow_comparisons_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.resource_inventory_shadow_comparisons
+    ADD CONSTRAINT resource_inventory_shadow_comparisons_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: resource_inventory_shadow_comparisons resource_inventory_shadow_comparisons_snapshot_uid_uq; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.resource_inventory_shadow_comparisons
+    ADD CONSTRAINT resource_inventory_shadow_comparisons_snapshot_uid_uq UNIQUE (snapshot_id, source_uid);
+
+
+--
 -- Name: resource_inventory_snapshot_items resource_inventory_snapshot_items_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -4179,11 +5071,67 @@ ALTER TABLE ONLY public.resource_inventory_snapshots
 
 
 --
+-- Name: resource_inventory_snapshots resource_inventory_snapshots_ingest_ticket_uq; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.resource_inventory_snapshots
+    ADD CONSTRAINT resource_inventory_snapshots_ingest_ticket_uq UNIQUE (ingest_ticket_id);
+
+
+--
 -- Name: resource_inventory_snapshots resource_inventory_snapshots_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.resource_inventory_snapshots
     ADD CONSTRAINT resource_inventory_snapshots_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: resource_inventory_transport_nonces resource_inventory_transport_nonces_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.resource_inventory_transport_nonces
+    ADD CONSTRAINT resource_inventory_transport_nonces_pkey PRIMARY KEY (collector_id, request_nonce);
+
+
+--
+-- Name: resource_inventory_watch_events resource_inventory_watch_events_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.resource_inventory_watch_events
+    ADD CONSTRAINT resource_inventory_watch_events_pkey PRIMARY KEY (watch_session_id, id);
+
+
+--
+-- Name: resource_inventory_watch_events resource_inventory_watch_events_session_ordinal_uq; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.resource_inventory_watch_events
+    ADD CONSTRAINT resource_inventory_watch_events_session_ordinal_uq UNIQUE (watch_session_id, ordinal);
+
+
+--
+-- Name: resource_inventory_watch_sessions resource_inventory_watch_sessions_id_epoch_uq; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.resource_inventory_watch_sessions
+    ADD CONSTRAINT resource_inventory_watch_sessions_id_epoch_uq UNIQUE (id, scope_epoch_id);
+
+
+--
+-- Name: resource_inventory_watch_sessions resource_inventory_watch_sessions_nonce_hash_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.resource_inventory_watch_sessions
+    ADD CONSTRAINT resource_inventory_watch_sessions_nonce_hash_key UNIQUE (nonce_hash);
+
+
+--
+-- Name: resource_inventory_watch_sessions resource_inventory_watch_sessions_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.resource_inventory_watch_sessions
+    ADD CONSTRAINT resource_inventory_watch_sessions_pkey PRIMARY KEY (id);
 
 
 --
@@ -5331,6 +6279,13 @@ CREATE UNIQUE INDEX resource_intervals_open_lifecycle_uq ON public.resource_inte
 
 
 --
+-- Name: resource_intervals_open_scope_identity_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX resource_intervals_open_scope_identity_idx ON public.resource_intervals USING btree (inventory_scope_id, source_kind, source_uid) WHERE (ended_at IS NULL);
+
+
+--
 -- Name: resource_intervals_open_uq; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -5366,6 +6321,13 @@ CREATE INDEX resource_inventory_coverage_gaps_range_idx ON public.resource_inven
 
 
 --
+-- Name: resource_inventory_ingest_tickets_expiry_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX resource_inventory_ingest_tickets_expiry_idx ON public.resource_inventory_ingest_tickets USING btree (expires_at, id) WHERE (consumed_at IS NULL);
+
+
+--
 -- Name: resource_inventory_scope_epochs_active_uq; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -5387,6 +6349,27 @@ CREATE UNIQUE INDEX resource_inventory_scopes_identity_uq ON public.resource_inv
 
 
 --
+-- Name: resource_inventory_shadow_comparisons_latest_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX resource_inventory_shadow_comparisons_latest_idx ON public.resource_inventory_shadow_comparisons USING btree (inventory_scope_id, source_uid, comparison_at DESC);
+
+
+--
+-- Name: resource_inventory_shadow_comparisons_retention_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX resource_inventory_shadow_comparisons_retention_idx ON public.resource_inventory_shadow_comparisons USING btree (comparison_at, id);
+
+
+--
+-- Name: resource_inventory_shadow_comparisons_unresolved_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX resource_inventory_shadow_comparisons_unresolved_idx ON public.resource_inventory_shadow_comparisons USING btree (inventory_scope_id, comparison_at DESC, snapshot_id) WHERE (explained = false);
+
+
+--
 -- Name: resource_inventory_snapshots_controller_seq_uq; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -5398,6 +6381,62 @@ CREATE UNIQUE INDEX resource_inventory_snapshots_controller_seq_uq ON public.res
 --
 
 CREATE INDEX resource_inventory_snapshots_scope_time_idx ON public.resource_inventory_snapshots USING btree (scope_epoch_id, collection_completed_at DESC);
+
+
+--
+-- Name: resource_inventory_snapshots_sealed_retention_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX resource_inventory_snapshots_sealed_retention_idx ON public.resource_inventory_snapshots USING btree (sealed_at, id) WHERE (manifest_state = 'sealed'::text);
+
+
+--
+-- Name: resource_inventory_snapshots_staging_retention_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX resource_inventory_snapshots_staging_retention_idx ON public.resource_inventory_snapshots USING btree (created_at, id) WHERE (manifest_state = 'staging'::text);
+
+
+--
+-- Name: resource_inventory_transport_nonces_expiry_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX resource_inventory_transport_nonces_expiry_idx ON public.resource_inventory_transport_nonces USING btree (expires_at, collector_id, request_nonce);
+
+
+--
+-- Name: resource_inventory_watch_events_gap_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX resource_inventory_watch_events_gap_idx ON public.resource_inventory_watch_events USING btree (coverage_gap_id) WHERE (coverage_gap_id IS NOT NULL);
+
+
+--
+-- Name: resource_inventory_watch_events_scope_uid_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX resource_inventory_watch_events_scope_uid_idx ON public.resource_inventory_watch_events USING btree (scope_epoch_id, source_kind, source_uid, received_at DESC) WHERE (source_uid IS NOT NULL);
+
+
+--
+-- Name: resource_inventory_watch_sessions_live_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX resource_inventory_watch_sessions_live_idx ON public.resource_inventory_watch_sessions USING btree (expires_at, id) WHERE (consumed_at IS NULL);
+
+
+--
+-- Name: resource_inventory_watch_sessions_live_scope_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX resource_inventory_watch_sessions_live_scope_idx ON public.resource_inventory_watch_sessions USING btree (scope_epoch_id, created_at, id) WHERE (consumed_at IS NULL);
+
+
+--
+-- Name: resource_inventory_watch_sessions_retention_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX resource_inventory_watch_sessions_retention_idx ON public.resource_inventory_watch_sessions USING btree (COALESCE(consumed_at, expires_at), id);
 
 
 --
@@ -5660,6 +6699,13 @@ CREATE TRIGGER datasource_project_policy_change AFTER INSERT OR DELETE OR UPDATE
 
 
 --
+-- Name: infra_metering_control infra_metering_control_monotonic_generation; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER infra_metering_control_monotonic_generation BEFORE DELETE OR UPDATE ON public.infra_metering_control FOR EACH ROW EXECUTE FUNCTION public.protect_infra_metering_generation_mutation();
+
+
+--
 -- Name: infra_usage_day_state infra_usage_day_state_one_way_seal; Type: TRIGGER; Schema: public; Owner: -
 --
 
@@ -5681,10 +6727,31 @@ CREATE TRIGGER resource_intervals_scope_identity BEFORE INSERT OR UPDATE OF inve
 
 
 --
+-- Name: resource_inventory_ingest_tickets resource_inventory_ingest_tickets_one_way; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER resource_inventory_ingest_tickets_one_way BEFORE INSERT OR DELETE OR UPDATE ON public.resource_inventory_ingest_tickets FOR EACH ROW EXECUTE FUNCTION public.protect_resource_inventory_ingest_ticket_mutation();
+
+
+--
 -- Name: resource_inventory_scope_epochs resource_inventory_scope_epochs_complete_snapshot; Type: TRIGGER; Schema: public; Owner: -
 --
 
 CREATE TRIGGER resource_inventory_scope_epochs_complete_snapshot BEFORE INSERT OR UPDATE OF last_complete_snapshot_id ON public.resource_inventory_scope_epochs FOR EACH ROW EXECUTE FUNCTION public.validate_inventory_epoch_last_complete_snapshot();
+
+
+--
+-- Name: resource_inventory_shadow_comparisons resource_inventory_shadow_comparisons_immutable; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER resource_inventory_shadow_comparisons_immutable BEFORE INSERT OR DELETE OR UPDATE ON public.resource_inventory_shadow_comparisons FOR EACH ROW EXECUTE FUNCTION public.protect_resource_inventory_shadow_comparison_mutation();
+
+
+--
+-- Name: resource_inventory_snapshot_items resource_inventory_snapshot_items_generation_fence; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER resource_inventory_snapshot_items_generation_fence BEFORE INSERT OR UPDATE ON public.resource_inventory_snapshot_items FOR EACH ROW EXECUTE FUNCTION public.enforce_resource_inventory_item_fence();
 
 
 --
@@ -5695,10 +6762,38 @@ CREATE TRIGGER resource_inventory_snapshot_items_staging_only BEFORE INSERT OR D
 
 
 --
+-- Name: resource_inventory_snapshots resource_inventory_snapshots_generation_fence; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER resource_inventory_snapshots_generation_fence BEFORE INSERT OR UPDATE ON public.resource_inventory_snapshots FOR EACH ROW EXECUTE FUNCTION public.enforce_resource_inventory_snapshot_fence();
+
+
+--
 -- Name: resource_inventory_snapshots resource_inventory_snapshots_seal_only; Type: TRIGGER; Schema: public; Owner: -
 --
 
 CREATE TRIGGER resource_inventory_snapshots_seal_only BEFORE INSERT OR UPDATE ON public.resource_inventory_snapshots FOR EACH ROW EXECUTE FUNCTION public.protect_resource_inventory_snapshot_mutation();
+
+
+--
+-- Name: resource_inventory_transport_nonces resource_inventory_transport_nonces_immutable; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER resource_inventory_transport_nonces_immutable BEFORE INSERT OR DELETE OR UPDATE ON public.resource_inventory_transport_nonces FOR EACH ROW EXECUTE FUNCTION public.protect_resource_inventory_transport_nonce_mutation();
+
+
+--
+-- Name: resource_inventory_watch_events resource_inventory_watch_events_immutable; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER resource_inventory_watch_events_immutable BEFORE INSERT OR DELETE OR UPDATE ON public.resource_inventory_watch_events FOR EACH ROW EXECUTE FUNCTION public.protect_resource_inventory_watch_event_mutation();
+
+
+--
+-- Name: resource_inventory_watch_sessions resource_inventory_watch_sessions_one_way; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER resource_inventory_watch_sessions_one_way BEFORE INSERT OR DELETE OR UPDATE ON public.resource_inventory_watch_sessions FOR EACH ROW EXECUTE FUNCTION public.protect_resource_inventory_watch_session_mutation();
 
 
 --
@@ -6426,6 +7521,22 @@ ALTER TABLE ONLY public.resource_inventory_coverage_gaps
 
 
 --
+-- Name: resource_inventory_ingest_tickets resource_inventory_ingest_tickets_scope_epoch_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.resource_inventory_ingest_tickets
+    ADD CONSTRAINT resource_inventory_ingest_tickets_scope_epoch_id_fkey FOREIGN KEY (scope_epoch_id) REFERENCES public.resource_inventory_scope_epochs(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: resource_inventory_ingest_tickets resource_inventory_ingest_tickets_snapshot_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.resource_inventory_ingest_tickets
+    ADD CONSTRAINT resource_inventory_ingest_tickets_snapshot_fkey FOREIGN KEY (bound_snapshot_id, scope_epoch_id) REFERENCES public.resource_inventory_snapshots(id, scope_epoch_id) ON DELETE RESTRICT;
+
+
+--
 -- Name: resource_inventory_scope_epochs resource_inventory_scope_epochs_last_snapshot_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -6434,11 +7545,27 @@ ALTER TABLE ONLY public.resource_inventory_scope_epochs
 
 
 --
+-- Name: resource_inventory_scope_epochs resource_inventory_scope_epochs_recovery_from_epoch_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.resource_inventory_scope_epochs
+    ADD CONSTRAINT resource_inventory_scope_epochs_recovery_from_epoch_id_fkey FOREIGN KEY (recovery_from_epoch_id) REFERENCES public.resource_inventory_scope_epochs(id) ON DELETE RESTRICT;
+
+
+--
 -- Name: resource_inventory_scope_epochs resource_inventory_scope_epochs_scope_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.resource_inventory_scope_epochs
     ADD CONSTRAINT resource_inventory_scope_epochs_scope_id_fkey FOREIGN KEY (scope_id) REFERENCES public.resource_inventory_scopes(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: resource_inventory_shadow_comparisons resource_inventory_shadow_comparisons_snapshot_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.resource_inventory_shadow_comparisons
+    ADD CONSTRAINT resource_inventory_shadow_comparisons_snapshot_fkey FOREIGN KEY (snapshot_id, inventory_scope_id) REFERENCES public.resource_inventory_snapshots(id, inventory_scope_id) ON DELETE RESTRICT;
 
 
 --
@@ -6455,6 +7582,54 @@ ALTER TABLE ONLY public.resource_inventory_snapshot_items
 
 ALTER TABLE ONLY public.resource_inventory_snapshots
     ADD CONSTRAINT resource_inventory_snapshots_epoch_scope_fkey FOREIGN KEY (scope_epoch_id, inventory_scope_id) REFERENCES public.resource_inventory_scope_epochs(id, scope_id) ON DELETE RESTRICT;
+
+
+--
+-- Name: resource_inventory_snapshots resource_inventory_snapshots_ingest_ticket_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.resource_inventory_snapshots
+    ADD CONSTRAINT resource_inventory_snapshots_ingest_ticket_fkey FOREIGN KEY (ingest_ticket_id, scope_epoch_id) REFERENCES public.resource_inventory_ingest_tickets(id, scope_epoch_id) ON DELETE RESTRICT;
+
+
+--
+-- Name: resource_inventory_transport_nonces resource_inventory_transport_nonces_scope_epoch_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.resource_inventory_transport_nonces
+    ADD CONSTRAINT resource_inventory_transport_nonces_scope_epoch_id_fkey FOREIGN KEY (scope_epoch_id) REFERENCES public.resource_inventory_scope_epochs(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: resource_inventory_watch_events resource_inventory_watch_events_affected_interval_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.resource_inventory_watch_events
+    ADD CONSTRAINT resource_inventory_watch_events_affected_interval_id_fkey FOREIGN KEY (affected_interval_id) REFERENCES public.resource_intervals(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: resource_inventory_watch_events resource_inventory_watch_events_coverage_gap_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.resource_inventory_watch_events
+    ADD CONSTRAINT resource_inventory_watch_events_coverage_gap_id_fkey FOREIGN KEY (coverage_gap_id) REFERENCES public.resource_inventory_coverage_gaps(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: resource_inventory_watch_events resource_inventory_watch_events_session_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.resource_inventory_watch_events
+    ADD CONSTRAINT resource_inventory_watch_events_session_fkey FOREIGN KEY (watch_session_id, scope_epoch_id) REFERENCES public.resource_inventory_watch_sessions(id, scope_epoch_id) ON DELETE RESTRICT;
+
+
+--
+-- Name: resource_inventory_watch_sessions resource_inventory_watch_sessions_scope_epoch_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.resource_inventory_watch_sessions
+    ADD CONSTRAINT resource_inventory_watch_sessions_scope_epoch_id_fkey FOREIGN KEY (scope_epoch_id) REFERENCES public.resource_inventory_scope_epochs(id) ON DELETE RESTRICT;
 
 
 --
