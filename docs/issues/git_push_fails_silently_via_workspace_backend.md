@@ -12,8 +12,16 @@ tags:
 
 **Filed:** 2026-08-01, from the verification live-gate re-run
 (dev job `40efbb39-0890-40fa-a464-6e3d6bd92832`).
-**Status:** Root cause found for the *silence*. The underlying push failure is
-still unexplained — its reason was discarded by the bug below. UNFIXED.
+**Status:** The *silence* mechanism this doc names (`_parse_shell_run_output`
+hardcoding `stderr=""`) is FIXED at HEAD (sweep-verified 2026-08-06):
+`22b2511e` (08-02) landed `stderr="" if exit_code == 0 else stdout` in
+git_manager.py — shipped under the sibling investigation
+`deliverable_lost_to_nested_repo_commit_and_stranded_mode_a_job.md`, whose
+commit message independently reproduces this doc's exact symptom; never
+cross-linked here until now. STILL OPEN: this doc's own motivating incident —
+job `40efbb39`'s underlying push failure — was never re-diagnosed (its
+timestamps likely PREdate the CWD-banner regression that `22b2511e` targets),
+so Fix direction #3 ("re-run and capture the real push error") stands.
 **Severity:** **high** — total, silent loss of a job's deliverables, with the
 job reporting success. Everything downstream that reads the repo (critic,
 cockpit, deliverable gate, cloud export, any re-clone) sees an empty
