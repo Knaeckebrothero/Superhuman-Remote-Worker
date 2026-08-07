@@ -1375,14 +1375,14 @@
       "discard": "Verwerfen"
     },
     "rewind": {
-      "button": "Rewind to here",
-      "title": "Rewind session",
-      "body": "Go back to before this message? Messages after this point are hidden from the conversation (kept in the audit trail). Files return to their state at that point.",
-      "caveat": "Commands with external effects (network calls, deployments) can't be undone.",
-      "both": "Restore conversation and files",
-      "conversation": "Restore conversation only",
-      "code": "Restore files only",
-      "summarize": "Summarize up to here"
+      "button": "Bis hierher zurückspulen",
+      "title": "Sitzung zurückspulen",
+      "body": "Zur Zeit vor dieser Nachricht zurückkehren? Nachrichten nach diesem Punkt werden aus der Unterhaltung ausgeblendet (bleiben im Audit-Protokoll erhalten). Dateien kehren zu ihrem damaligen Stand zurück.",
+      "caveat": "Befehle mit externen Auswirkungen (Netzwerkaufrufe, Deployments) lassen sich nicht rückgängig machen.",
+      "both": "Unterhaltung und Dateien wiederherstellen",
+      "conversation": "Nur Unterhaltung wiederherstellen",
+      "code": "Nur Dateien wiederherstellen",
+      "summarize": "Bis hierher zusammenfassen"
     },
     "diff": {
       "replace": "Diff",
