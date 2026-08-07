@@ -15303,7 +15303,7 @@ async def _trigger_verification_on_complete(
     # delivered — an infrastructure fault reported as a work fault. That is not
     # hypothetical: on dev job 40efbb39 it cost a 105-minute critic livelock and
     # a verdict that misdiagnosed the failure entirely
-    # (docs/issues/git_push_fails_silently_via_workspace_backend.md).
+    # (docs/done/git_push_fails_silently_via_workspace_backend.md).
     #
     # Checked BEFORE the gate on purpose. The gate compares `content_tree`,
     # which here describes a tree that was never pushed, so its no-progress
@@ -23547,7 +23547,7 @@ async def store_citation_snapshot(request: Request) -> dict[str, Any]:
 # resubmits forever (189 iterations / 105 min in the live incident) while its
 # parent sits wedged in 'reviewing'. A fresh critic is spawned every round, so
 # the per-critic count naturally resets each round.
-# docs/issues/rejected_verdict_livelocks_critic_and_wedges_parent.md
+# docs/done/rejected_verdict_livelocks_critic_and_wedges_parent.md
 _MAX_VERDICT_REJECTIONS = 3
 
 

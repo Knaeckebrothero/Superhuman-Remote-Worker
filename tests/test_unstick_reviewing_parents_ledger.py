@@ -567,7 +567,7 @@ async def test_cas_does_not_touch_non_reviewing_targets(db):
 # ---------------------------------------------------------------------------
 # Wall-clock arm (unstick_reviewing_parents_wallclock) — the LIVE-critic
 # backstop, fix direction 2 of
-# docs/issues/rejected_verdict_livelocks_critic_and_wedges_parent.md.
+# docs/done/rejected_verdict_livelocks_critic_and_wedges_parent.md.
 # ---------------------------------------------------------------------------
 
 WALLCLOCK_MINUTES = 60

@@ -203,7 +203,7 @@ for the working tree, which is exactly the confusion that produced this bug.
 
 That makes this the **second** defect from a single root, and the other one is
 already filed:
-`docs/issues/critic_brief_lands_in_shared_workspace_and_misleads_target.md` —
+`docs/done/critic_brief_lands_in_shared_workspace_and_misleads_target.md` —
 the critic's brief is written as `instructions.md` into the same shared root, so
 the target reads it and concludes it is the reviewer. Same mechanism, different
 victim: one inherits the subjob's **branch**, the other inherits its

@@ -26,7 +26,13 @@ short-circuit (item 11) is live but measured near-zero-sensitivity; the
 denylist→allowlist inversion for NON_DELIVERABLE_PATHS stays open.
 Live gate run 2026-07-29/30: **partial pass** — brief delivery, the
 round-recording endpoint and `content_tree` capture are all confirmed working
-in production; cross-round `content_tree` stability is still unmeasured. Open
+in production. Cross-round `content_tree` stability was **measured 2026-08-01**
+and the guard has near-zero sensitivity on a verification round (the critic
+writes its verdict artifacts into the target's own `output/`, so the hashed
+tree moves every round regardless of worker progress) — hence the allowlist
+inversion above. Still never observed: the loop **converging** (return → fix →
+approve); two live-gate attempts died before round 2 on unrelated
+infrastructure. Open
 follow-ups, the settled-questions record and the live-gate results are in
 `docs/issues/verification_fail_closed_followups.md`. This document is retained
 as the incident analysis and design rationale.
