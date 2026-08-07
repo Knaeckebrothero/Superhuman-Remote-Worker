@@ -310,9 +310,7 @@ class TestEvaluate:
         assert report["skipped"] is True
         # The agent's own reason is carried through, not replaced by a generic
         # one — it is what reaches the stamp an operator reads.
-        assert (
-            report["reason"] == "The job-ending git push failed at job completion."
-        )
+        assert report["reason"] == "The job-ending git push failed at job completion."
 
     @pytest.mark.asyncio
     async def test_undelivered_without_a_reason_still_skips(self):
