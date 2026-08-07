@@ -31,10 +31,16 @@ sessions: let the user pick a message they sent earlier, revert the session to t
 point, and re-drive from there with a different prompt. The model is Claude Code's
 `/rewind`.
 
-> **Status (2026-08-07): IMPLEMENTED on develop — k3d live gate PASSED**
+> **Status (2026-08-07): DONE — implemented on develop, k3d live gate PASSED**
 > (backend/API/WS surfaces; see [k3d results](#live-gate--k3d-results-2026-08-07)).
-> Cockpit-UI items (second-tab repaint, affordance/dialog/composer) remain for
-> the dev cockpit gate.
+> Archived to `docs/done/` with the execution plan
+> (`2026-08-07-session-rewind-plan.md`). At archive time the 20 commits are
+> **on `develop`, unpushed**. Remaining after push + dev deploy: the cockpit-UI
+> gate items (second-tab repaint, mid-stream interrupt, deep rewind past
+> compaction, affordance/dialog/composer), listed under the dev checklist below.
+> Code comments (incl. migration 0110's DB column comment, which is applied and
+> immutable) reference this doc's old `docs/features/` path — intentional,
+> not drift to "fix".
 > Implementation complete across all tasks (Tasks 1–9 merged develop; Task 10 docs
 > + live-gate checklist below). The design call happened 2026-08-07; the result is
 > the [Decided design](#decided-design-2026-08-07) section below. The concept capture,

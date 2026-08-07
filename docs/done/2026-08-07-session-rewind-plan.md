@@ -1,5 +1,16 @@
 # Session Rewind Implementation Plan
 
+> **EXECUTED 2026-08-07 — archived.** All 10 tasks completed via
+> subagent-driven development on `develop` (14 feature commits `59e5185f..2622a11e`
+> interleaved with unrelated work, + 5 final-review fix-wave commits
+> `00060bce..f0c636dd`, + k3d gate docs `e8c65586`). Every task passed a
+> spec+quality review; the final whole-branch review's 1 Critical + 3 Important
+> findings were fixed and re-review-verified. Live-gated on local k3d the same
+> day (see `session_rewind.md` §Live gate — k3d results). Two owner-approved
+> deviations from this plan's literal text: validation precedes the interrupt
+> (Task 5), and the detached 409 fires only on live agent bindings (Task 7).
+> This document is the frozen execution record.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Let a session owner pick an earlier user message and revert the session to just before it — conversation, workspace files, or both — plus a "summarize up to here" action, per the decided design in `docs/features/session_rewind.md` (§Decided design, 2026-08-07).
