@@ -160,28 +160,30 @@ COMMENT ON COLUMN public.knowledge_index.priority IS 'Backlog rank: 0=high, 1=no
 --
 
 CREATE FUNCTION public.knowledge_chunk_hybrid_search(query_text text, query_embedding public.vector, kb_ids_param uuid[], version_param text DEFAULT NULL::text, match_count integer DEFAULT 15, dense_weight double precision DEFAULT 0.6, sparse_weight double precision DEFAULT 0.3, recency_weight double precision DEFAULT 0.1, rrf_k integer DEFAULT 60) RETURNS SETOF public.knowledge_index
-    LANGUAGE sql
+    LANGUAGE plpgsql
     SET "hnsw.iterative_scan" TO 'relaxed_order'
-    AS $$
+    AS $_$
+BEGIN
+RETURN QUERY EXECUTE $q$
 -- Dense arm: top chunks by vector distance (HNSW), collapsed to the best-ranked
--- chunk per note. Over-fetch match_count * 4 chunks so a note whose best chunk
+-- chunk per note. Over-fetch $5 * 4 chunks so a note whose best chunk
 -- ranks behind several other notes' chunks still survives the collapse.
 WITH dense AS (
     SELECT mid, MIN(rank_ix) AS rank_ix FROM (
         SELECT c.note_row AS mid,
                ROW_NUMBER() OVER (
                    ORDER BY subvector(c.embedding, 1, 4000)::halfvec(4000)
-                            <=> subvector(query_embedding, 1, 4000)::halfvec(4000)
+                            <=> subvector($2, 1, 4000)::halfvec(4000)
                ) AS rank_ix
         FROM knowledge_chunks c
         JOIN knowledge_index ki ON ki.id = c.note_row
-        WHERE c.kb_id = ANY(kb_ids_param)
+        WHERE c.kb_id = ANY($3)
           AND ki.status = 'active'
           AND c.embedding IS NOT NULL
-          AND (version_param IS NULL OR c.embedding_version = version_param)
+          AND ($4 IS NULL OR c.embedding_version = $4)
         ORDER BY subvector(c.embedding, 1, 4000)::halfvec(4000)
-                 <=> subvector(query_embedding, 1, 4000)::halfvec(4000)
-        LIMIT match_count * 4
+                 <=> subvector($2, 1, 4000)::halfvec(4000)
+        LIMIT $5 * 4
     ) ranked_chunks
     GROUP BY mid
 ),
@@ -190,16 +192,16 @@ sparse AS (
     SELECT mid, MIN(rank_ix) AS rank_ix FROM (
         SELECT c.note_row AS mid,
                ROW_NUMBER() OVER (
-                   ORDER BY ts_rank_cd(c.search_doc, websearch_to_tsquery('english', query_text)) DESC
+                   ORDER BY ts_rank_cd(c.search_doc, websearch_to_tsquery('english', $1)) DESC
                ) AS rank_ix
         FROM knowledge_chunks c
         JOIN knowledge_index ki ON ki.id = c.note_row
-        WHERE c.kb_id = ANY(kb_ids_param)
+        WHERE c.kb_id = ANY($3)
           AND ki.status = 'active'
-          AND (version_param IS NULL OR c.embedding_version = version_param)
-          AND c.search_doc @@ websearch_to_tsquery('english', query_text)
-        ORDER BY ts_rank_cd(c.search_doc, websearch_to_tsquery('english', query_text)) DESC
-        LIMIT match_count * 4
+          AND ($4 IS NULL OR c.embedding_version = $4)
+          AND c.search_doc @@ websearch_to_tsquery('english', $1)
+        ORDER BY ts_rank_cd(c.search_doc, websearch_to_tsquery('english', $1)) DESC
+        LIMIT $5 * 4
     ) ranked_chunks
     GROUP BY mid
 ),
@@ -208,25 +210,27 @@ sparse AS (
 recent AS (
     SELECT ki.id AS mid, ROW_NUMBER() OVER (ORDER BY ki.modified_at DESC) AS rank_ix
     FROM knowledge_index ki
-    WHERE ki.kb_id = ANY(kb_ids_param) AND ki.status = 'active'
+    WHERE ki.kb_id = ANY($3) AND ki.status = 'active'
       AND EXISTS (
           SELECT 1 FROM knowledge_chunks c
           WHERE c.note_row = ki.id
-            AND (version_param IS NULL OR c.embedding_version = version_param)
+            AND ($4 IS NULL OR c.embedding_version = $4)
       )
-    ORDER BY rank_ix LIMIT match_count
+    ORDER BY rank_ix LIMIT $5
 )
 SELECT ki.* FROM (
     SELECT COALESCE(d.mid, s.mid, r.mid) AS mid,
-        COALESCE(1.0 / (rrf_k + d.rank_ix), 0.0) * dense_weight +
-        COALESCE(1.0 / (rrf_k + s.rank_ix), 0.0) * sparse_weight +
-        COALESCE(1.0 / (rrf_k + r.rank_ix), 0.0) * recency_weight AS rrf_score
+        COALESCE(1.0 / ($9 + d.rank_ix), 0.0) * $6 +
+        COALESCE(1.0 / ($9 + s.rank_ix), 0.0) * $7 +
+        COALESCE(1.0 / ($9 + r.rank_ix), 0.0) * $8 AS rrf_score
     FROM dense d
              FULL OUTER JOIN sparse s ON d.mid = s.mid
              FULL OUTER JOIN recent r ON COALESCE(d.mid, s.mid) = r.mid) ranked
                      JOIN knowledge_index ki ON ranked.mid = ki.id
-ORDER BY ranked.rrf_score DESC LIMIT match_count
-$$;
+ORDER BY ranked.rrf_score DESC LIMIT $5
+$q$ USING query_text, query_embedding, kb_ids_param, version_param, match_count, dense_weight, sparse_weight, recency_weight, rrf_k;
+END;
+$_$;
 
 
 --
@@ -234,39 +238,43 @@ $$;
 --
 
 CREATE FUNCTION public.knowledge_hybrid_search(query_text text, query_embedding public.vector, project_id_param uuid, match_count integer DEFAULT 10, dense_weight double precision DEFAULT 0.6, sparse_weight double precision DEFAULT 0.3, recency_weight double precision DEFAULT 0.1, rrf_k integer DEFAULT 50) RETURNS SETOF public.knowledge_index
-    LANGUAGE sql
+    LANGUAGE plpgsql
     SET "hnsw.iterative_scan" TO 'relaxed_order'
-    AS $$
+    AS $_$
+BEGIN
+RETURN QUERY EXECUTE $q$
 WITH dense AS (
-    SELECT id, ROW_NUMBER() OVER (ORDER BY subvector(embedding, 1, 4000)::halfvec(4000) <=> subvector(query_embedding, 1, 4000)::halfvec(4000)) AS rank_ix
+    SELECT id, ROW_NUMBER() OVER (ORDER BY subvector(embedding, 1, 4000)::halfvec(4000) <=> subvector($2, 1, 4000)::halfvec(4000)) AS rank_ix
     FROM knowledge_index
-    WHERE project_id = project_id_param AND status = 'active' AND embedding IS NOT NULL
-    ORDER BY rank_ix LIMIT match_count * 2
+    WHERE project_id = $3 AND status = 'active' AND embedding IS NOT NULL
+    ORDER BY rank_ix LIMIT $4 * 2
 ),
 sparse AS (
-    SELECT id, ROW_NUMBER() OVER (ORDER BY ts_rank_cd(search_doc, websearch_to_tsquery('english', query_text)) DESC) AS rank_ix
+    SELECT id, ROW_NUMBER() OVER (ORDER BY ts_rank_cd(search_doc, websearch_to_tsquery('english', $1)) DESC) AS rank_ix
     FROM knowledge_index
-    WHERE project_id = project_id_param AND status = 'active'
-      AND search_doc @@ websearch_to_tsquery('english', query_text)
-    ORDER BY rank_ix LIMIT match_count * 2
+    WHERE project_id = $3 AND status = 'active'
+      AND search_doc @@ websearch_to_tsquery('english', $1)
+    ORDER BY rank_ix LIMIT $4 * 2
 ),
 recent AS (
     SELECT id, ROW_NUMBER() OVER (ORDER BY modified_at DESC) AS rank_ix
     FROM knowledge_index
-    WHERE project_id = project_id_param AND status = 'active'
-    ORDER BY rank_ix LIMIT match_count
+    WHERE project_id = $3 AND status = 'active'
+    ORDER BY rank_ix LIMIT $4
 )
 SELECT ki.* FROM (
     SELECT COALESCE(d.id, s.id, r.id) AS mid,
-        COALESCE(1.0 / (rrf_k + d.rank_ix), 0.0) * dense_weight +
-        COALESCE(1.0 / (rrf_k + s.rank_ix), 0.0) * sparse_weight +
-        COALESCE(1.0 / (rrf_k + r.rank_ix), 0.0) * recency_weight AS rrf_score
+        COALESCE(1.0 / ($8 + d.rank_ix), 0.0) * $5 +
+        COALESCE(1.0 / ($8 + s.rank_ix), 0.0) * $6 +
+        COALESCE(1.0 / ($8 + r.rank_ix), 0.0) * $7 AS rrf_score
     FROM dense d
              FULL OUTER JOIN sparse s ON d.id = s.id
              FULL OUTER JOIN recent r ON COALESCE(d.id, s.id) = r.id) ranked
                      JOIN knowledge_index ki ON ranked.mid = ki.id
-ORDER BY ranked.rrf_score DESC LIMIT match_count
-$$;
+ORDER BY ranked.rrf_score DESC LIMIT $4
+$q$ USING query_text, query_embedding, project_id_param, match_count, dense_weight, sparse_weight, recency_weight, rrf_k;
+END;
+$_$;
 
 
 --
@@ -307,41 +315,45 @@ $$;
 --
 
 CREATE FUNCTION public.knowledge_multi_project_hybrid_search(query_text text, query_embedding public.vector, project_ids_param uuid[], match_count integer DEFAULT 10, dense_weight double precision DEFAULT 0.6, sparse_weight double precision DEFAULT 0.3, recency_weight double precision DEFAULT 0.1, rrf_k integer DEFAULT 50) RETURNS SETOF public.knowledge_index
-    LANGUAGE sql
+    LANGUAGE plpgsql
     SET "hnsw.iterative_scan" TO 'relaxed_order'
-    AS $$
+    AS $_$
+BEGIN
+RETURN QUERY EXECUTE $q$
 WITH dense AS (
-    SELECT id, ROW_NUMBER() OVER (ORDER BY subvector(embedding, 1, 4000)::halfvec(4000) <=> subvector(query_embedding, 1, 4000)::halfvec(4000)) AS rank_ix
+    SELECT id, ROW_NUMBER() OVER (ORDER BY subvector(embedding, 1, 4000)::halfvec(4000) <=> subvector($2, 1, 4000)::halfvec(4000)) AS rank_ix
     FROM knowledge_index
-    WHERE project_id = ANY(project_ids_param) AND status = 'active' AND embedding IS NOT NULL
-    ORDER BY rank_ix LIMIT match_count * 2
+    WHERE project_id = ANY($3) AND status = 'active' AND embedding IS NOT NULL
+    ORDER BY rank_ix LIMIT $4 * 2
 ),
 sparse AS (
-    SELECT id, ROW_NUMBER() OVER (ORDER BY ts_rank_cd(search_doc, websearch_to_tsquery('english', query_text)) DESC) AS rank_ix
+    SELECT id, ROW_NUMBER() OVER (ORDER BY ts_rank_cd(search_doc, websearch_to_tsquery('english', $1)) DESC) AS rank_ix
     FROM knowledge_index
-    WHERE project_id = ANY(project_ids_param) AND status = 'active'
-      AND search_doc @@ websearch_to_tsquery('english', query_text)
-    ORDER BY rank_ix LIMIT match_count * 2
+    WHERE project_id = ANY($3) AND status = 'active'
+      AND search_doc @@ websearch_to_tsquery('english', $1)
+    ORDER BY rank_ix LIMIT $4 * 2
 ),
 recent AS (
     SELECT id, ROW_NUMBER() OVER (ORDER BY modified_at DESC) AS rank_ix
     FROM knowledge_index
-    WHERE project_id = ANY(project_ids_param) AND status = 'active'
-    ORDER BY rank_ix LIMIT match_count
+    WHERE project_id = ANY($3) AND status = 'active'
+    ORDER BY rank_ix LIMIT $4
 )
 SELECT ki.*
 FROM (SELECT COALESCE(d.id, s.id, r.id)                           AS mid,
-             COALESCE(1.0 / (rrf_k + d.rank_ix), 0.0) * dense_weight +
-        COALESCE(1.0 / (rrf_k + s.rank_ix), 0.0) * sparse_weight +
-        COALESCE(1.0 / (rrf_k + r.rank_ix), 0.0) * recency_weight AS rrf_score
+             COALESCE(1.0 / ($8 + d.rank_ix), 0.0) * $5 +
+        COALESCE(1.0 / ($8 + s.rank_ix), 0.0) * $6 +
+        COALESCE(1.0 / ($8 + r.rank_ix), 0.0) * $7 AS rrf_score
     FROM dense d
     FULL OUTER JOIN sparse s ON d.id = s.id
     FULL OUTER JOIN recent r ON COALESCE(d.id, s.id) = r.id
 ) ranked
 JOIN knowledge_index ki ON ranked.mid = ki.id
 ORDER BY ranked.rrf_score DESC
-LIMIT match_count
-$$;
+LIMIT $4
+$q$ USING query_text, query_embedding, project_ids_param, match_count, dense_weight, sparse_weight, recency_weight, rrf_k;
+END;
+$_$;
 
 
 --
@@ -383,63 +395,67 @@ CREATE TABLE public.memories (
 --
 
 CREATE FUNCTION public.memory_hybrid_search(query_text text, query_embedding public.vector, job_id_param uuid, match_count integer DEFAULT 10, dense_weight double precision DEFAULT 0.6, sparse_weight double precision DEFAULT 0.3, recency_weight double precision DEFAULT 0.1, rrf_k integer DEFAULT 50, importance_floor double precision DEFAULT 0.0) RETURNS SETOF public.memories
-    LANGUAGE sql
+    LANGUAGE plpgsql
     SET "hnsw.iterative_scan" TO 'relaxed_order'
-    AS $$
+    AS $_$
+BEGIN
+RETURN QUERY EXECUTE $q$
 WITH dense AS (
     SELECT id, ROW_NUMBER() OVER (ORDER BY best_dist) AS rank_ix
     FROM (
         SELECT id, MIN(dist) AS best_dist
         FROM (
             -- Content embedding matches
-            (SELECT id, subvector(embedding, 1, 4000)::halfvec(4000) <=> subvector(query_embedding, 1, 4000)::halfvec(4000) AS dist
-            FROM memories WHERE job_id = job_id_param AND embedding IS NOT NULL AND importance >= importance_floor
+            (SELECT id, subvector(embedding, 1, 4000)::halfvec(4000) <=> subvector($2, 1, 4000)::halfvec(4000) AS dist
+            FROM memories WHERE job_id = $3 AND embedding IS NOT NULL AND importance >= $9
                 AND (remaining_turns IS NULL OR remaining_turns <= 0)
                 AND valid_to IS NULL
-            ORDER BY dist LIMIT match_count * 3)
+            ORDER BY dist LIMIT $4 * 3)
 
             UNION ALL
 
             -- Trigger phrase embedding matches → parent memory_id
-            (SELECT rm.memory_id AS id, subvector(rm.embedding, 1, 4000)::halfvec(4000) <=> subvector(query_embedding, 1, 4000)::halfvec(4000) AS dist
+            (SELECT rm.memory_id AS id, subvector(rm.embedding, 1, 4000)::halfvec(4000) <=> subvector($2, 1, 4000)::halfvec(4000) AS dist
             FROM memory_retrieval_messages rm
             INNER JOIN memories m ON rm.memory_id = m.id
-            WHERE m.job_id = job_id_param AND rm.embedding IS NOT NULL AND m.importance >= importance_floor
+            WHERE m.job_id = $3 AND rm.embedding IS NOT NULL AND m.importance >= $9
                 AND (m.remaining_turns IS NULL OR m.remaining_turns <= 0)
                 AND m.valid_to IS NULL
-            ORDER BY dist LIMIT match_count * 5)
+            ORDER BY dist LIMIT $4 * 5)
         ) all_matches
         GROUP BY id
     ) best_per_memory
-    LIMIT match_count * 2
+    LIMIT $4 * 2
 ),
 sparse AS (
-    SELECT id, ROW_NUMBER() OVER (ORDER BY ts_rank_cd(sparse_keywords, websearch_to_tsquery('english', query_text)) DESC) AS rank_ix
-    FROM memories WHERE job_id = job_id_param AND sparse_keywords @@ websearch_to_tsquery('english', query_text) AND importance >= importance_floor
+    SELECT id, ROW_NUMBER() OVER (ORDER BY ts_rank_cd(sparse_keywords, websearch_to_tsquery('english', $1)) DESC) AS rank_ix
+    FROM memories WHERE job_id = $3 AND sparse_keywords @@ websearch_to_tsquery('english', $1) AND importance >= $9
         AND (remaining_turns IS NULL OR remaining_turns <= 0)
         AND valid_to IS NULL
-    ORDER BY rank_ix LIMIT match_count * 2
+    ORDER BY rank_ix LIMIT $4 * 2
 ),
 recent AS (
     SELECT id, ROW_NUMBER() OVER (ORDER BY created_at DESC) AS rank_ix
-    FROM memories WHERE job_id = job_id_param AND importance >= importance_floor
+    FROM memories WHERE job_id = $3 AND importance >= $9
         AND (remaining_turns IS NULL OR remaining_turns <= 0)
         AND valid_to IS NULL
-    ORDER BY rank_ix LIMIT match_count
+    ORDER BY rank_ix LIMIT $4
 )
 SELECT memories.* FROM (
     SELECT COALESCE(d.id, s.id, r.id) AS mid,
-        COALESCE(1.0 / (rrf_k + d.rank_ix), 0.0) * dense_weight +
-        COALESCE(1.0 / (rrf_k + s.rank_ix), 0.0) * sparse_weight +
-        COALESCE(1.0 / (rrf_k + r.rank_ix), 0.0) * recency_weight AS rrf_score
+        COALESCE(1.0 / ($8 + d.rank_ix), 0.0) * $5 +
+        COALESCE(1.0 / ($8 + s.rank_ix), 0.0) * $6 +
+        COALESCE(1.0 / ($8 + r.rank_ix), 0.0) * $7 AS rrf_score
     FROM dense d
     FULL OUTER JOIN sparse s ON d.id = s.id
     FULL OUTER JOIN recent r ON COALESCE(d.id, s.id) = r.id
 ) ranked
 JOIN memories ON ranked.mid = memories.id
 ORDER BY ranked.rrf_score DESC
-LIMIT match_count
-$$;
+LIMIT $4
+$q$ USING query_text, query_embedding, job_id_param, match_count, dense_weight, sparse_weight, recency_weight, rrf_k, importance_floor;
+END;
+$_$;
 
 
 --
@@ -447,62 +463,66 @@ $$;
 --
 
 CREATE FUNCTION public.memory_multi_project_hybrid_search(query_text text, query_embedding public.vector, project_ids_param uuid[], match_count integer DEFAULT 10, dense_weight double precision DEFAULT 0.6, sparse_weight double precision DEFAULT 0.3, recency_weight double precision DEFAULT 0.1, rrf_k integer DEFAULT 50, importance_floor double precision DEFAULT 0.0) RETURNS SETOF public.memories
-    LANGUAGE sql
+    LANGUAGE plpgsql
     SET "hnsw.iterative_scan" TO 'relaxed_order'
-    AS $$
+    AS $_$
+BEGIN
+RETURN QUERY EXECUTE $q$
 WITH dense AS (
     SELECT id, ROW_NUMBER() OVER (ORDER BY best_dist) AS rank_ix
     FROM (
         SELECT id, MIN(dist) AS best_dist
         FROM (
             -- Content embedding matches
-            (SELECT id, subvector(embedding, 1, 4000)::halfvec(4000) <=> subvector(query_embedding, 1, 4000)::halfvec(4000) AS dist
-            FROM memories WHERE project_id = ANY(project_ids_param) AND embedding IS NOT NULL AND importance >= importance_floor
+            (SELECT id, subvector(embedding, 1, 4000)::halfvec(4000) <=> subvector($2, 1, 4000)::halfvec(4000) AS dist
+            FROM memories WHERE project_id = ANY($3) AND embedding IS NOT NULL AND importance >= $9
                 AND (remaining_turns IS NULL OR remaining_turns <= 0)
                 AND valid_to IS NULL
-            ORDER BY dist LIMIT match_count * 3)
+            ORDER BY dist LIMIT $4 * 3)
 
             UNION ALL
 
             -- Trigger phrase embedding matches → parent memory_id
-            (SELECT rm.memory_id AS id, subvector(rm.embedding, 1, 4000)::halfvec(4000) <=> subvector(query_embedding, 1, 4000)::halfvec(4000) AS dist
+            (SELECT rm.memory_id AS id, subvector(rm.embedding, 1, 4000)::halfvec(4000) <=> subvector($2, 1, 4000)::halfvec(4000) AS dist
             FROM memory_retrieval_messages rm
             INNER JOIN memories m ON rm.memory_id = m.id
-            WHERE m.project_id = ANY(project_ids_param) AND rm.embedding IS NOT NULL AND m.importance >= importance_floor
+            WHERE m.project_id = ANY($3) AND rm.embedding IS NOT NULL AND m.importance >= $9
                 AND (m.remaining_turns IS NULL OR m.remaining_turns <= 0)
                 AND m.valid_to IS NULL
-            ORDER BY dist LIMIT match_count * 5)
+            ORDER BY dist LIMIT $4 * 5)
         ) all_matches
         GROUP BY id
     ) best_per_memory
-    LIMIT match_count * 2
+    LIMIT $4 * 2
 ),
 sparse AS (
-    SELECT id, ROW_NUMBER() OVER (ORDER BY ts_rank_cd(sparse_keywords, websearch_to_tsquery('english', query_text)) DESC) AS rank_ix
-    FROM memories WHERE project_id = ANY(project_ids_param) AND sparse_keywords @@ websearch_to_tsquery('english', query_text) AND importance >= importance_floor
+    SELECT id, ROW_NUMBER() OVER (ORDER BY ts_rank_cd(sparse_keywords, websearch_to_tsquery('english', $1)) DESC) AS rank_ix
+    FROM memories WHERE project_id = ANY($3) AND sparse_keywords @@ websearch_to_tsquery('english', $1) AND importance >= $9
         AND (remaining_turns IS NULL OR remaining_turns <= 0)
         AND valid_to IS NULL
-    ORDER BY rank_ix LIMIT match_count * 2
+    ORDER BY rank_ix LIMIT $4 * 2
 ),
 recent AS (
     SELECT id, ROW_NUMBER() OVER (ORDER BY created_at DESC) AS rank_ix
-    FROM memories WHERE project_id = ANY(project_ids_param) AND importance >= importance_floor
+    FROM memories WHERE project_id = ANY($3) AND importance >= $9
         AND (remaining_turns IS NULL OR remaining_turns <= 0)
         AND valid_to IS NULL
-    ORDER BY rank_ix LIMIT match_count
+    ORDER BY rank_ix LIMIT $4
 )
 SELECT memories.*
 FROM (SELECT COALESCE(d.id, s.id, r.id)                                AS mid,
-             COALESCE(1.0 / (rrf_k + d.rank_ix), 0.0) * dense_weight +
-             COALESCE(1.0 / (rrf_k + s.rank_ix), 0.0) * sparse_weight +
-             COALESCE(1.0 / (rrf_k + r.rank_ix), 0.0) * recency_weight AS rrf_score
+             COALESCE(1.0 / ($8 + d.rank_ix), 0.0) * $5 +
+             COALESCE(1.0 / ($8 + s.rank_ix), 0.0) * $6 +
+             COALESCE(1.0 / ($8 + r.rank_ix), 0.0) * $7 AS rrf_score
       FROM dense d
                FULL OUTER JOIN sparse s ON d.id = s.id
                FULL OUTER JOIN recent r ON COALESCE(d.id, s.id) = r.id) ranked
 JOIN memories ON ranked.mid = memories.id
 ORDER BY ranked.rrf_score DESC
-LIMIT match_count
-$$;
+LIMIT $4
+$q$ USING query_text, query_embedding, project_ids_param, match_count, dense_weight, sparse_weight, recency_weight, rrf_k, importance_floor;
+END;
+$_$;
 
 
 --
@@ -510,62 +530,66 @@ $$;
 --
 
 CREATE FUNCTION public.memory_project_hybrid_search(query_text text, query_embedding public.vector, project_id_param uuid, match_count integer DEFAULT 10, dense_weight double precision DEFAULT 0.6, sparse_weight double precision DEFAULT 0.3, recency_weight double precision DEFAULT 0.1, rrf_k integer DEFAULT 50, importance_floor double precision DEFAULT 0.0) RETURNS SETOF public.memories
-    LANGUAGE sql
+    LANGUAGE plpgsql
     SET "hnsw.iterative_scan" TO 'relaxed_order'
-    AS $$
+    AS $_$
+BEGIN
+RETURN QUERY EXECUTE $q$
 WITH dense AS (
     SELECT id, ROW_NUMBER() OVER (ORDER BY best_dist) AS rank_ix
     FROM (
         SELECT id, MIN(dist) AS best_dist
         FROM (
             -- Content embedding matches
-            (SELECT id, subvector(embedding, 1, 4000)::halfvec(4000) <=> subvector(query_embedding, 1, 4000)::halfvec(4000) AS dist
-            FROM memories WHERE project_id = project_id_param AND embedding IS NOT NULL AND importance >= importance_floor
+            (SELECT id, subvector(embedding, 1, 4000)::halfvec(4000) <=> subvector($2, 1, 4000)::halfvec(4000) AS dist
+            FROM memories WHERE project_id = $3 AND embedding IS NOT NULL AND importance >= $9
                 AND (remaining_turns IS NULL OR remaining_turns <= 0)
                 AND valid_to IS NULL
-            ORDER BY dist LIMIT match_count * 3)
+            ORDER BY dist LIMIT $4 * 3)
 
             UNION ALL
 
             -- Trigger phrase embedding matches → parent memory_id
-            (SELECT rm.memory_id AS id, subvector(rm.embedding, 1, 4000)::halfvec(4000) <=> subvector(query_embedding, 1, 4000)::halfvec(4000) AS dist
+            (SELECT rm.memory_id AS id, subvector(rm.embedding, 1, 4000)::halfvec(4000) <=> subvector($2, 1, 4000)::halfvec(4000) AS dist
             FROM memory_retrieval_messages rm
             INNER JOIN memories m ON rm.memory_id = m.id
-            WHERE m.project_id = project_id_param AND rm.embedding IS NOT NULL AND m.importance >= importance_floor
+            WHERE m.project_id = $3 AND rm.embedding IS NOT NULL AND m.importance >= $9
                 AND (m.remaining_turns IS NULL OR m.remaining_turns <= 0)
                 AND m.valid_to IS NULL
-            ORDER BY dist LIMIT match_count * 5)
+            ORDER BY dist LIMIT $4 * 5)
         ) all_matches
         GROUP BY id
     ) best_per_memory
-    LIMIT match_count * 2
+    LIMIT $4 * 2
 ),
 sparse AS (
-    SELECT id, ROW_NUMBER() OVER (ORDER BY ts_rank_cd(sparse_keywords, websearch_to_tsquery('english', query_text)) DESC) AS rank_ix
-    FROM memories WHERE project_id = project_id_param AND sparse_keywords @@ websearch_to_tsquery('english', query_text) AND importance >= importance_floor
+    SELECT id, ROW_NUMBER() OVER (ORDER BY ts_rank_cd(sparse_keywords, websearch_to_tsquery('english', $1)) DESC) AS rank_ix
+    FROM memories WHERE project_id = $3 AND sparse_keywords @@ websearch_to_tsquery('english', $1) AND importance >= $9
         AND (remaining_turns IS NULL OR remaining_turns <= 0)
         AND valid_to IS NULL
-    ORDER BY rank_ix LIMIT match_count * 2
+    ORDER BY rank_ix LIMIT $4 * 2
 ),
 recent AS (
     SELECT id, ROW_NUMBER() OVER (ORDER BY created_at DESC) AS rank_ix
-    FROM memories WHERE project_id = project_id_param AND importance >= importance_floor
+    FROM memories WHERE project_id = $3 AND importance >= $9
         AND (remaining_turns IS NULL OR remaining_turns <= 0)
         AND valid_to IS NULL
-    ORDER BY rank_ix LIMIT match_count
+    ORDER BY rank_ix LIMIT $4
 )
 SELECT memories.* FROM (
     SELECT COALESCE(d.id, s.id, r.id) AS mid,
-        COALESCE(1.0 / (rrf_k + d.rank_ix), 0.0) * dense_weight +
-        COALESCE(1.0 / (rrf_k + s.rank_ix), 0.0) * sparse_weight +
-        COALESCE(1.0 / (rrf_k + r.rank_ix), 0.0) * recency_weight AS rrf_score
+        COALESCE(1.0 / ($8 + d.rank_ix), 0.0) * $5 +
+        COALESCE(1.0 / ($8 + s.rank_ix), 0.0) * $6 +
+        COALESCE(1.0 / ($8 + r.rank_ix), 0.0) * $7 AS rrf_score
     FROM dense d
     FULL OUTER JOIN sparse s ON d.id = s.id
     FULL OUTER JOIN recent r ON COALESCE(d.id, s.id) = r.id
 ) ranked
                            JOIN memories ON ranked.mid = memories.id
-ORDER BY ranked.rrf_score DESC LIMIT match_count
-$$;
+ORDER BY ranked.rrf_score DESC LIMIT $4
+$q$ USING query_text, query_embedding, project_id_param, match_count, dense_weight, sparse_weight, recency_weight, rrf_k, importance_floor;
+END;
+$_$;
 
 
 --
