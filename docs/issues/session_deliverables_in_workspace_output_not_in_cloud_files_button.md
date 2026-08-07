@@ -1,6 +1,11 @@
 # Session deliverables saved to `output/` aren't reachable from the "Files" (cloud) button — only via the full IDE
 
-**Status:** Filed — root cause confirmed on live session `7692637b-9c60-4698-9875-b57ec34e66a6` (main cluster, cloud-mounted). **Reconfirmed + deeper root cause filed 2026-07-10** on dev session `e979d520-35a5-4eeb-a9c1-4f6e1be1b2fd` (default project): under the `rclone_mount` driver the shared session folder is an orphan (created + shared, but never mounted or synced) and the Files button points straight at it — see the **Update 2026-07-10** section below. **Reconfirmed again 2026-07-20** on dev session `accfbc56`: the orphan is *not always empty* — a transient pre-mount sync can leave a **frozen partial snapshot** (there, `documents/` + `skills/`), which is worse UX than empty; current line refs re-verified. See **Update 2026-07-20**. Still unfixed.
+**Status:** OPEN, **re-scoped 2026-08-07** — the reachability half is fixed
+(`8da4b27c` + `af1ed9f8`); what remains is content sync, and the mechanism analysis
+below is about OpenCloud/`rclone_mount`, a backend this deployment no longer runs.
+**Start from the Update 2026-08-07 section**, not from the older ones.
+
+**Status (historical):** Filed — root cause confirmed on live session `7692637b-9c60-4698-9875-b57ec34e66a6` (main cluster, cloud-mounted). **Reconfirmed + deeper root cause filed 2026-07-10** on dev session `e979d520-35a5-4eeb-a9c1-4f6e1be1b2fd` (default project): under the `rclone_mount` driver the shared session folder is an orphan (created + shared, but never mounted or synced) and the Files button points straight at it — see the **Update 2026-07-10** section below. **Reconfirmed again 2026-07-20** on dev session `accfbc56`: the orphan is *not always empty* — a transient pre-mount sync can leave a **frozen partial snapshot** (there, `documents/` + `skills/`), which is worse UX than empty; current line refs re-verified. See **Update 2026-07-20**. Still unfixed.
 **Sweep addendum (2026-08-06):** still present at HEAD. A general
 skip-legacy-folder mechanism has since been built (Phase 4,
 `_setup_main_cloud` → `_should_skip_session_folder`) but it explicitly hard-returns
@@ -115,6 +120,48 @@ kubectl --context main get pods -n superhuman-remote-worker -o wide | grep ws-th
 # mounts on the pod (expect ONLY /cloud/home):
 #   kubectl --context main exec -n superhuman-remote-worker <pod> -- mount | grep fuse
 ```
+
+## Update 2026-08-07 — the backend changed; everything above describes OpenCloud
+
+**Read this before trusting the mechanism sections above.** The dev cluster
+migrated OpenCloud → Nextcloud on 2026-08-02/03. Every analysis above — the
+`rclone_mount` driver, `/cloud/home`, Personal Spaces, drive ids, the
+`cloud_mount_active` gate that nulls `cloud_cfg`, the `_should_skip_session_folder`
+hard-`return False` — is about a backend this deployment **no longer runs**. The
+symptom persists; the stated cause no longer applies as written. Treat the
+2026-07-10 and 2026-07-20 updates as history, not as a pickup point.
+
+What is measured under Nextcloud (2026-08-07, all five threads carrying a session
+handle):
+
+| Thread | Status | Synced entries | Newest |
+|---|---|---|---|
+| `5833c729` | active | 48, incl. `output/expose_…md` (27 KB) + `feedback.md` | 08-06 12:32 |
+| `c90f83b7` | active | 44, incl. `documents/external/` | 08-06 11:59 |
+| `4ad107ad` | **active** | **0** | — |
+| `00ae0977` | ended | **0** | — |
+| `1930dec9` | ended | 22, but *all placed by a manual restore* | 08-06 11:34 |
+
+Two corrections this forces on the framing above:
+
+1. **"Deliverables in `output/` never reach the cloud" is now too strong.**
+   `5833c729` has a 27 KB `output/` deliverable sitting in its session folder. The
+   workspace→session-folder path works for some sessions.
+2. **The failure is inconsistent, and the discriminator is unknown.** `4ad107ad` is
+   *active* with zero synced entries; `5833c729` is *active* and syncing fine. It is
+   not simply ended-vs-active, and it is not simply "the orphan is never a sync
+   target" — for two threads it plainly is one.
+
+So the open question is no longer "why does the session folder never receive
+anything" (the 07-10/07-20 framing) but **"what makes it receive content for some
+sessions and not others under Nextcloud"**. Start there.
+
+Separately, the *reachability* half of this ticket is now fixed and is out of scope
+here: the Files button no longer disappears on an asleep session (`8da4b27c`), and
+session folders that were never shared are swept by
+`scripts/backfill_session_folder_shares.py` (`af1ed9f8`). Full write-up in
+`docs/done/session_cloud_folder_unreachable_when_asleep_and_unshared.md`. What
+remains in this ticket is content only.
 
 ## Proposed fixes (options — pick one or combine)
 
