@@ -1,9 +1,43 @@
 # Session deliverables saved to `output/` aren't reachable from the "Files" (cloud) button — only via the full IDE
 
-**Status:** OPEN, **re-scoped 2026-08-07** — the reachability half is fixed
-(`8da4b27c` + `af1ed9f8`); what remains is content sync, and the mechanism analysis
-below is about OpenCloud/`rclone_mount`, a backend this deployment no longer runs.
-**Start from the Update 2026-08-07 section**, not from the older ones.
+**Status:** **DONE — closed 2026-08-07 by end-to-end test on k3d.** Not reproducible.
+A file written to `output/` now lands in the shared cloud session folder, and the
+Files button opens that folder, including while the session is asleep. Everything
+below the "Update 2026-08-07" heading is the evidence; everything above it describes
+an OpenCloud/`rclone_mount` mechanism this deployment no longer runs and is kept only
+as history. **Read the closing test first.**
+
+## Closing test (k3d, 2026-08-07)
+
+The last open gate was a configuration nobody had checked: a thread whose
+`project_default` mount makes `_should_skip_session_folder` skip the session folder,
+leaving the button pointing at the *project* folder, where `output/` might not land.
+
+**That configuration cannot occur.** `_should_skip_session_folder` hard-returns
+`False` when `CLOUD_WORKSPACE_DRIVER == "rclone_mount"`, and both k3d and the main
+dev cluster run `rclone_mount`. The skip branch is unreachable as deployed, so the
+button never resolves to the project folder. Verified in the running k3d image, not
+just in source.
+
+Confirmed by building the exact case anyway — thread `3173dfe5`, default project,
+`session_base`, autonomous:
+
+| Check | Result |
+|---|---|
+| mount kind | `project_default` — the case in question |
+| session folder still provisioned? | **yes**, `sessions/3173dfe5` (skip did not fire) |
+| shared with owner? | yes, share id 64 |
+| agent wrote `output/cloud_sync_gate.md` | yes, 1 `write_file`, turn completed |
+| file present in the cloud folder? | **yes** — `/output/cloud_sync_gate.md`, 16 B |
+| content over WebDAV | `GATE OK 3173dfe5` — exact match |
+| `cloud_session_url` (what the button opens) | `https://cloud.localhost/apps/files/?dir=/3173dfe5` — the **session** folder |
+
+Sync was not instant: `output/` appeared roughly 80 s after the turn completed, on a
+later push cycle, after `skills/` had streamed up in stages. A check immediately
+after the turn will show an empty folder and read as a failure — wait for a push
+cycle before concluding anything.
+
+Test thread deleted afterwards.
 
 **Status (historical):** Filed — root cause confirmed on live session `7692637b-9c60-4698-9875-b57ec34e66a6` (main cluster, cloud-mounted). **Reconfirmed + deeper root cause filed 2026-07-10** on dev session `e979d520-35a5-4eeb-a9c1-4f6e1be1b2fd` (default project): under the `rclone_mount` driver the shared session folder is an orphan (created + shared, but never mounted or synced) and the Files button points straight at it — see the **Update 2026-07-10** section below. **Reconfirmed again 2026-07-20** on dev session `accfbc56`: the orphan is *not always empty* — a transient pre-mount sync can leave a **frozen partial snapshot** (there, `documents/` + `skills/`), which is worse UX than empty; current line refs re-verified. See **Update 2026-07-20**. Still unfixed.
 **Sweep addendum (2026-08-06):** still present at HEAD. A general
