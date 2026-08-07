@@ -3207,7 +3207,10 @@ async def handle_persistent_websocket(ws: WebSocket) -> None:
                     await _ws_send(
                         ws,
                         "error",
-                        {"message": "Session no longer active"},
+                        {
+                            "message": "Session no longer active",
+                            "request_id": data.get("request_id"),
+                        },
                     )
                     continue
                 asyncio.create_task(_handle_rewind(ws, data), name="handle-rewind")
@@ -6268,7 +6271,8 @@ async def _handle_rewind(ws: WebSocket, data: Dict[str, Any]) -> None:
     resolve+validate target (a pure validation error must not disturb an
     in-flight turn or queued input) → interrupt+wait → drain queue → git
     forward-restore (fallible, gates everything) → DB sweep+ledger →
-    in-memory truncate/rehydrate → events-epoch bump → acks. Bash side
+    in-memory truncate/rehydrate → narrow resweep (mops up any straggler
+    written during the interrupt wait) → events-epoch bump → acks. Bash side
     effects and non-git sessions degrade exactly like Claude Code:
     conversation-only. From the sweep onward a broad exception handler
     guarantees the initiator always gets a terminal frame — the DB write may
@@ -6382,6 +6386,24 @@ async def _handle_rewind(ws: WebSocket, data: Dict[str, Any]) -> None:
                 await _err("Workspace restore could not be committed")
                 return
             restore_commit_sha = git_mgr.get_current_commit()
+            if restore_commit_sha:
+                # Best-effort mapping write (same non-fatal shape as
+                # _loop_on_workspace_commit). record_turn_commit's INSERT ...
+                # ON CONFLICT (thread_id, seq) DO UPDATE keys on the
+                # *current* (pre-sweep) MAX(seq) — i.e. the abandoned tip's
+                # own row — so this upsert overwrites that newest stale
+                # mapping in place. Without it, a second rewind (or any
+                # resolve_restore_commit lookup) landing between the
+                # abandoned tip's seq and the next post-rewind turn-commit
+                # would resolve to the abandoned tree instead of the one we
+                # just restored to.
+                try:
+                    await conn.record_turn_commit(_thread_id, restore_commit_sha)
+                except Exception:
+                    logger.warning(
+                        "record_turn_commit failed after rewind restore (non-fatal)",
+                        exc_info=True,
+                    )
 
         # From here on the DB sweep is one await away from being committed and
         # durable — an unexpected exception (e.g. the session detaching mid-op)
@@ -6435,6 +6457,23 @@ async def _handle_rewind(ws: WebSocket, data: Dict[str, Any]) -> None:
                         )
                 _session.turn_count = result["surviving_turn"]
                 _loop_last_user_content[0] = ""
+
+                # 6b. Narrow resweep: step 2's interrupt-wait can run for up
+                #     to 60s, long enough for the very turn being interrupted
+                #     to still land a completion INSERT after step 5's sweep
+                #     already ran. Idempotent (rewound_at IS NULL guard) — a
+                #     normal run with no stragglers sweeps 0 rows. Not a
+                #     second apply_rewind: that would append a duplicate
+                #     thread_rewinds ledger row for the same rewind.
+                stray_count = await conn.resweep_rewind(_thread_id, from_seq)
+                if stray_count > 0:
+                    logger.warning(
+                        "Rewind resweep caught %d stray row(s) written during "
+                        "the interrupt wait (thread=%s from_seq=%s)",
+                        stray_count,
+                        _thread_id,
+                        from_seq,
+                    )
 
                 # 7. New event generation → every SSE viewer takes the
                 #    existing gone_beyond_horizon repaint against the
@@ -6508,132 +6547,150 @@ async def _handle_rewind(ws: WebSocket, data: Dict[str, Any]) -> None:
 async def _handle_compact(
     ws: WebSocket, focus: str = "", boundary_message_id: Optional[str] = None
 ) -> None:
-    """Handle /compact command — trigger manual context compaction."""
-    try:
-        if not _session or not _session.context_manager:
-            await _ws_send(ws, "error", {"message": "Session not ready"})
-            return
+    """Handle /compact command — trigger manual context compaction.
 
-        from ..llm.response_guards import strip_removal_markers
+    Serialized against `rewind` via the shared `_rewind_lock`: compaction
+    rewrites `_session.messages` in place and persists a boundary-keyed
+    summary row, so a rewind sweeping the transcript underneath a
+    still-running manual compaction (or the reverse) would race the same
+    in-memory list and the same seq-keyed rows. Applies equally to a plain
+    `/compact` (`boundary_message_id=None`) — any manual compaction racing a
+    rewind hits the same hazard, not just the rewind sheet's "Summarize up
+    to here".
+    """
+    if _rewind_lock.locked():
+        await _ws_send(
+            ws,
+            "error",
+            {"message": "A rewind is in progress — try again when it finishes"},
+        )
+        return
+    async with _rewind_lock:
+        try:
+            if not _session or not _session.context_manager:
+                await _ws_send(ws, "error", {"message": "Session not ready"})
+                return
 
-        ctx_mgr = _session.context_manager
+            from ..llm.response_guards import strip_removal_markers
 
-        # Manual compaction can run before the first loop start — make sure
-        # progress frames flow either way (idempotent setter; getattr for
-        # test doubles that stub the context manager).
-        _cb_setter = getattr(ctx_mgr, "set_progress_callback", None)
-        if callable(_cb_setter):
-            _cb_setter(_loop_compaction_progress)
+            ctx_mgr = _session.context_manager
 
-        # "Summarize up to here" (session rewind's sibling action): map the
-        # chosen message to keep_recent_override = the number of messages from
-        # it (inclusive) to the end, counted on the same basis
-        # summarize_and_compact uses (workspace injections excluded — they are
-        # filtered before keep_recent applies).
-        keep_recent_override = None
-        if boundary_message_id:
-            from ..core.workspace_injection import is_workspace_injection_message
-            from ..database.postgres_db import _coerce_row_id
+            # Manual compaction can run before the first loop start — make sure
+            # progress frames flow either way (idempotent setter; getattr for
+            # test doubles that stub the context manager).
+            _cb_setter = getattr(ctx_mgr, "set_progress_callback", None)
+            if callable(_cb_setter):
+                _cb_setter(_loop_compaction_progress)
 
-            target_uuid = str(_coerce_row_id(boundary_message_id))
-            cut_index = None
-            for i, m in enumerate(_session.messages):
-                mid = getattr(m, "id", None)
-                if mid and str(_coerce_row_id(mid)) == target_uuid:
-                    cut_index = i
-                    break
-            if cut_index is None:
+            # "Summarize up to here" (session rewind's sibling action): map the
+            # chosen message to keep_recent_override = the number of messages from
+            # it (inclusive) to the end, counted on the same basis
+            # summarize_and_compact uses (workspace injections excluded — they are
+            # filtered before keep_recent applies).
+            keep_recent_override = None
+            if boundary_message_id:
+                from ..core.workspace_injection import is_workspace_injection_message
+                from ..database.postgres_db import _coerce_row_id
+
+                target_uuid = str(_coerce_row_id(boundary_message_id))
+                cut_index = None
+                for i, m in enumerate(_session.messages):
+                    mid = getattr(m, "id", None)
+                    if mid and str(_coerce_row_id(mid)) == target_uuid:
+                        cut_index = i
+                        break
+                if cut_index is None:
+                    await _ws_send(
+                        ws,
+                        "error",
+                        {
+                            "message": "That message is no longer in working "
+                            "context — it may already be summarized"
+                        },
+                    )
+                    return
+                keep_recent_override = sum(
+                    1
+                    for m in _session.messages[cut_index:]
+                    if not is_workspace_injection_message(m)
+                )
+
+            before_count = len(_session.messages)
+            runs_before = getattr(ctx_mgr, "compaction_runs", 0)
+            result = await ctx_mgr.summarize_and_compact(
+                messages=_session.messages,
+                auxiliary=_session.auxiliary_llm,
+                max_summary_length=getattr(
+                    _session.config.context_management, "max_summary_length", 10000
+                ),
+                keep_recent_override=keep_recent_override,
+                trigger="manual",
+                focus=focus or None,
+            )
+            # summarize_and_compact returns a LangGraph reducer delta; this
+            # transport has no reducer, so strip the RemoveMessage markers before
+            # adopting. Leaking them into _session.messages made every later LLM
+            # call false-detect a compaction and re-persist the same summary row
+            # (the duplicate-banner bug, 2026-06-12).
+            _session.messages[:] = strip_removal_markers(result)
+            after_count = len(_session.messages)
+
+            runs_after = getattr(ctx_mgr, "compaction_runs", 0)
+            compacted_now = (
+                isinstance(runs_before, int)
+                and isinstance(runs_after, int)
+                and runs_after > runs_before
+            )
+            if compacted_now:
+                # A summary was actually produced: journal the completion
+                # (broadcast, not ws-only — SSE replay must be able to clear the
+                # progress UI after a reload) and persist the role='summary'
+                # checkpoint row.
+                summary_text = extract_summary_text(_session.messages)
+                await _record_compaction(
+                    summary_text, before_count, after_count, trigger="manual", ws=None
+                )
+            else:
+                # No-op (below thresholds / nothing to fold): transient notice to
+                # the requesting client only — no banner row, no journal entry.
+                # summary=None tells the cockpit to render a system line instead
+                # of a banner. Extracting + re-persisting the *previous* summary
+                # here was another duplicate-banner source.
+                turn = _session.turn_count if _session else None
                 await _ws_send(
                     ws,
-                    "error",
+                    "context.compacted",
                     {
-                        "message": "That message is no longer in working "
-                        "context — it may already be summarized"
+                        "before": before_count,
+                        "after": after_count,
+                        "trigger": "manual",
+                        "summary": None,
+                        "turn": turn if isinstance(turn, int) else None,
                     },
                 )
-                return
-            keep_recent_override = sum(
-                1
-                for m in _session.messages[cut_index:]
-                if not is_workspace_injection_message(m)
+            logger.info(
+                f"Manual compaction: {before_count} → {after_count} messages "
+                f"(summarized={compacted_now})"
             )
 
-        before_count = len(_session.messages)
-        runs_before = getattr(ctx_mgr, "compaction_runs", 0)
-        result = await ctx_mgr.summarize_and_compact(
-            messages=_session.messages,
-            auxiliary=_session.auxiliary_llm,
-            max_summary_length=getattr(
-                _session.config.context_management, "max_summary_length", 10000
-            ),
-            keep_recent_override=keep_recent_override,
-            trigger="manual",
-            focus=focus or None,
-        )
-        # summarize_and_compact returns a LangGraph reducer delta; this
-        # transport has no reducer, so strip the RemoveMessage markers before
-        # adopting. Leaking them into _session.messages made every later LLM
-        # call false-detect a compaction and re-persist the same summary row
-        # (the duplicate-banner bug, 2026-06-12).
-        _session.messages[:] = strip_removal_markers(result)
-        after_count = len(_session.messages)
-
-        runs_after = getattr(ctx_mgr, "compaction_runs", 0)
-        compacted_now = (
-            isinstance(runs_before, int)
-            and isinstance(runs_after, int)
-            and runs_after > runs_before
-        )
-        if compacted_now:
-            # A summary was actually produced: journal the completion
-            # (broadcast, not ws-only — SSE replay must be able to clear the
-            # progress UI after a reload) and persist the role='summary'
-            # checkpoint row.
-            summary_text = extract_summary_text(_session.messages)
-            await _record_compaction(
-                summary_text, before_count, after_count, trigger="manual", ws=None
-            )
-        else:
-            # No-op (below thresholds / nothing to fold): transient notice to
-            # the requesting client only — no banner row, no journal entry.
-            # summary=None tells the cockpit to render a system line instead
-            # of a banner. Extracting + re-persisting the *previous* summary
-            # here was another duplicate-banner source.
-            turn = _session.turn_count if _session else None
-            await _ws_send(
-                ws,
-                "context.compacted",
-                {
-                    "before": before_count,
-                    "after": after_count,
-                    "trigger": "manual",
-                    "summary": None,
-                    "turn": turn if isinstance(turn, int) else None,
-                },
-            )
-        logger.info(
-            f"Manual compaction: {before_count} → {after_count} messages "
-            f"(summarized={compacted_now})"
-        )
-
-        # Commit + push workspace to Gitea on compaction (natural checkpoint boundary)
-        if _session.workspace_manager:
-            git_mgr = getattr(_session.workspace_manager, "git_manager", None)
-            if git_mgr and git_mgr.is_active:
-                try:
-                    if git_mgr.has_uncommitted_changes():
-                        if git_mgr.commit(
-                            f"Compaction checkpoint ({before_count} → {after_count} msgs)"
-                        ):
-                            sha = git_mgr.get_current_commit()
-                            if sha:
-                                await _loop_on_workspace_commit(sha)
-                    git_mgr.push()
-                except Exception as e:
-                    logger.debug(f"Git push on compaction failed (non-fatal): {e}")
-    except Exception as e:
-        logger.warning(f"Compaction failed: {e}")
-        await _ws_send(ws, "error", {"message": f"Compaction failed: {e}"})
+            # Commit + push workspace to Gitea on compaction (natural checkpoint boundary)
+            if _session.workspace_manager:
+                git_mgr = getattr(_session.workspace_manager, "git_manager", None)
+                if git_mgr and git_mgr.is_active:
+                    try:
+                        if git_mgr.has_uncommitted_changes():
+                            if git_mgr.commit(
+                                f"Compaction checkpoint ({before_count} → {after_count} msgs)"
+                            ):
+                                sha = git_mgr.get_current_commit()
+                                if sha:
+                                    await _loop_on_workspace_commit(sha)
+                        git_mgr.push()
+                    except Exception as e:
+                        logger.debug(f"Git push on compaction failed (non-fatal): {e}")
+        except Exception as e:
+            logger.warning(f"Compaction failed: {e}")
+            await _ws_send(ws, "error", {"message": f"Compaction failed: {e}"})
 
 
 def _scrub_secret_values(fragment: Any) -> Any:

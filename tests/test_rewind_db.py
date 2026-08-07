@@ -101,6 +101,32 @@ def test_apply_rewind_code_mode_skips_sweep():
     assert sweep_calls == []
 
 
+def test_resweep_rewind_sweeps_remaining_strays():
+    conn = _FakeConn(fetchval_returns=[2])
+    db = _db_with(conn)
+    out = asyncio.run(
+        db.resweep_rewind("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", from_seq=42)
+    )
+    assert out == 2
+    (_, query, args) = conn.calls[0]
+    assert "SET rewound_at = now()" in query
+    assert "seq >= $2" in query
+    assert "rewound_at IS NULL" in query
+    assert args == ("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", 42)
+    # Narrow mop-up, not a second rewind: no ledger insert, no surviving-turn
+    # readback — just the one UPDATE.
+    assert len(conn.calls) == 1
+
+
+def test_resweep_rewind_idempotent_when_nothing_stray():
+    conn = _FakeConn(fetchval_returns=[0])
+    db = _db_with(conn)
+    out = asyncio.run(
+        db.resweep_rewind("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", from_seq=42)
+    )
+    assert out == 0
+
+
 def test_record_turn_commit_upserts_at_max_seq():
     conn = _FakeConn()
     db = _db_with(conn)
