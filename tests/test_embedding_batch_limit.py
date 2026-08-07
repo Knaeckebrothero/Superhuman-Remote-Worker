@@ -75,7 +75,9 @@ def _service(provider: FakeProvider, monkeypatch, cap_env: str | None = None):
         api_key="k",
         expected_dimensions=DIM,
     )
-    service._client = SimpleNamespace(embeddings=SimpleNamespace(create=provider.create))
+    service._client = SimpleNamespace(
+        embeddings=SimpleNamespace(create=provider.create)
+    )
     return service
 
 
