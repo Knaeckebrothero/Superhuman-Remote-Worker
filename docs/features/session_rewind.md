@@ -31,7 +31,10 @@ sessions: let the user pick a message they sent earlier, revert the session to t
 point, and re-drive from there with a different prompt. The model is Claude Code's
 `/rewind`.
 
-> **Status (2026-08-07): IMPLEMENTED on develop — dev live gate pending.**
+> **Status (2026-08-07): IMPLEMENTED on develop — k3d live gate PASSED**
+> (backend/API/WS surfaces; see [k3d results](#live-gate--k3d-results-2026-08-07)).
+> Cockpit-UI items (second-tab repaint, affordance/dialog/composer) remain for
+> the dev cockpit gate.
 > Implementation complete across all tasks (Tasks 1–9 merged develop; Task 10 docs
 > + live-gate checklist below). The design call happened 2026-08-07; the result is
 > the [Decided design](#decided-design-2026-08-07) section below. The concept capture,
@@ -228,6 +231,46 @@ repaint. Rewind during streaming is allowed — the server interrupts first.
   snapshot commit exists, push stays fast-forward, degraded matrix.
 - **Live gate on dev** before calling it shipped: real session, rewind
   mid-conversation, Gitea history stays linear, other-viewer repaint observed.
+
+## Live gate — k3d results (2026-08-07)
+
+Executed against the local k3d stack (`srw` namespace, tilt-built images from
+this branch), driving real provisioned sessions over the agent WS and the
+orchestrator REST API. Per checklist item below:
+
+1. **PASS (k3d).** Sandbox session, two file-edit turns (`story.txt` version
+   A → B), WS rewind `mode=both` to the version-B prompt: ack carried the
+   prompt + `restored_to_sha`, the file reverted to `version A`, git history
+   stayed strictly linear (`Auto-commit turn 2 → Auto-commit turn 3 →
+   Rewind: pre-rewind snapshot → Rewind: restore workspace`), and
+   `thread_turn_commits` was re-pointed at the restore commit (the
+   final-review Critical fix observed live: seq 566 `0bccb655 → 3ec23492`).
+   In-memory truncate proven behaviorally on a second session: after
+   rewinding away a "reply banana" exchange, the agent answered "pineapple"
+   to "what was the last word I asked for?" and `turn_count` resumed at 1.
+2. **Not run live** (needs a real cockpit browser session). Server mechanics
+   verified: epoch bump + `rewind.done` journaled at `(new_epoch, 1)` on
+   both paths; cockpit cache-clear paths are vitest-covered.
+3. **Not run live** (timing-dependent); interrupt-then-rewind is unit-covered.
+4. **Not run live**; deep-rewind rehydrate fallback is unit-covered.
+5. **PASS (k3d).** Seeded ended thread: conversation rewind 200 (swept=2,
+   prompt echoed), filtered reads shrink, re-target → 404, code mode → 400,
+   `status=active`+agent → 409, ended thread with STALE `agent_id` → 200
+   (the stale-binding fix observed live), epoch bumped per rewind with
+   `rewind.done` rows at `(1,1)` and `(2,1)`, malformed id → 404.
+6. **PASS (k3d).** Lite session `mode=code` → "no version history" error with
+   `request_id`; conversation rewind on the same session works.
+7. **PARTIAL (k3d).** Boundary accepted, keep-window computed, summarization
+   plan logged (89-token prefix) — the summary LLM round-trip was still
+   pending on a slow aux upstream when the gate closed (same pipeline as
+   ordinary `/compact`; boundary math is unit-covered incl. injections).
+   Bonus from the stall: a rewind sent mid-compaction was refused instantly —
+   the final-review lock-serialization fix observed live.
+8. **PASS (k3d).** Zero PREPARE/DataError/rewind-related tracebacks in
+   orchestrator + agent logs across all scenarios.
+
+Residual for the dev cockpit gate: items 2/3/4 and the cockpit UI surface
+(affordance, dialog, composer refill, IndexedDB truncate-then-reload).
 
 ## Live gate checklist (dev)
 
