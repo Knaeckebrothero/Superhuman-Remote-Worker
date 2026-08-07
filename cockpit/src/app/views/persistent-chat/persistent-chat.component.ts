@@ -50,6 +50,7 @@ import {
     ToolCallEvent,
     Turn,
     TurnEvent,
+    UserTurn,
 } from '../../core/models/turn.model';
 import {ToolCardView} from '../../core/models/tool-card.model';
 import {toolCardViewFromEvent} from '../../core/tools/tool-card-adapters';
@@ -1176,6 +1177,15 @@ export function clearDraft(threadId: string | null): void {
                     </div>
                   }
                 </div>
+                @if (turn.historical && !chat.outboxIds().has(turn.id)) {
+                  <button type="button"
+                          class="rewind-btn"
+                          [attr.aria-label]="'chat.rewind.button' | transloco"
+                          [title]="'chat.rewind.button' | transloco"
+                          (click)="openRewindSheet(turn)">
+                    <app-icon size="sm">history</app-icon>
+                  </button>
+                }
               </div>
             }
             @case ('assistant') {
@@ -1974,6 +1984,41 @@ export function clearDraft(threadId: string | null): void {
           <img [src]="url" [alt]="imagePreviewName()" class="image-preview-img" />
         }
       </app-dialog>
+
+      <!-- Rewind action dialog -->
+      <app-dialog
+        [open]="rewindTarget() !== null"
+        (closed)="closeRewindSheet()"
+        [title]="'chat.rewind.title' | transloco"
+        size="sm">
+        <p class="rewind-quote">"{{ rewindQuote() }}"</p>
+        <p>{{ 'chat.rewind.body' | transloco }}</p>
+        <p class="rewind-caveat">{{ 'chat.rewind.caveat' | transloco }}</p>
+        <ng-container appDialogActions>
+          <app-button variant="warning" size="sm"
+                      [disabled]="chat.rewindInFlight()"
+                      (clicked)="confirmRewind('both')">
+            {{ 'chat.rewind.both' | transloco }}
+          </app-button>
+          <app-button variant="warning" size="sm"
+                      [disabled]="chat.rewindInFlight()"
+                      (clicked)="confirmRewind('conversation')">
+            {{ 'chat.rewind.conversation' | transloco }}
+          </app-button>
+          <app-button variant="info" size="sm"
+                      [disabled]="chat.rewindInFlight()"
+                      (clicked)="confirmRewind('code')">
+            {{ 'chat.rewind.code' | transloco }}
+          </app-button>
+          <app-button variant="info" size="sm"
+                      (clicked)="confirmSummarizeUpTo()">
+            {{ 'chat.rewind.summarize' | transloco }}
+          </app-button>
+          <app-button variant="ghost" size="sm" (clicked)="closeRewindSheet()">
+            {{ 'common.cancel' | transloco }}
+          </app-button>
+        </ng-container>
+      </app-dialog>
     </div>
   `,
     styleUrls: ['./persistent-chat.component.scss'],
@@ -2345,6 +2390,21 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
             if (!threadId || this.inputText.trim()) return;
             const draft = loadDraft(threadId);
             if (draft) this.inputText = draft;
+        });
+
+        // Rewind hands the un-sent prompt back for edit-and-resend. Plain
+        // ngModel field: assign + saveDraft by hand (no ngModelChange fires),
+        // same trap denyOffer documents.
+        effect(() => {
+            const prompt = this.chat.rewindPrefill();
+            if (prompt === null) return;
+            this.inputText = prompt;
+            saveDraft(this.chat.threadId(), this.inputText);
+            this.chat.rewindPrefill.set(null);
+            setTimeout(() => {
+                this.inputEl?.nativeElement?.focus();
+                this.autoResizeInput();
+            });
         });
 
         // Elapsed-timer tick, only while a compaction is in flight.
@@ -3205,6 +3265,38 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
             this.inputEl?.nativeElement?.focus();
             this.autoResizeInput();
         });
+    }
+
+    /** The user turn the rewind sheet is open for (null = closed). */
+    rewindTarget = signal<UserTurn | null>(null);
+
+    openRewindSheet(turn: UserTurn): void {
+        this.rewindTarget.set(turn);
+    }
+
+    closeRewindSheet(): void {
+        this.rewindTarget.set(null);
+    }
+
+    confirmRewind(mode: 'both' | 'conversation' | 'code'): void {
+        const target = this.rewindTarget();
+        if (!target) return;
+        this.chat.rewind(target.id, mode);
+        this.rewindTarget.set(null);
+    }
+
+    confirmSummarizeUpTo(): void {
+        const target = this.rewindTarget();
+        if (!target) return;
+        this.chat.summarizeUpTo(target.id);
+        this.rewindTarget.set(null);
+    }
+
+    /** First 160 chars of the target prompt for the dialog header quote
+     *  (avoids importing SlicePipe into this standalone component). */
+    rewindQuote(): string {
+        const text = this.rewindTarget()?.content || '';
+        return text.length > 160 ? text.slice(0, 160) + '…' : text;
     }
 
     onKeydown(event: KeyboardEvent): void {
