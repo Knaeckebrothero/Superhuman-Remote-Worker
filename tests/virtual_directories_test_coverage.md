@@ -4,8 +4,9 @@ Companion to `docs/features/virtual_directories.md`. Records exactly what is
 verified, by which mechanism, and — the point of this file — **what could not be
 covered yet**, why, and how to close each gap.
 
-Last updated 2026-08-01, after the Slice 1 dev live gate (agent image
-`sha-f41970a`, job `97c7a8aa`).
+Last updated 2026-08-07 (kill switch removed — §1.1, §2.4). Before that,
+2026-08-01, after the Slice 1 dev live gate (agent image `sha-f41970a`,
+job `97c7a8aa`).
 
 Feature scope built so far: **Slice 1** — read-only providers for `tools/`,
 `contacts/`, `instructions.md`, `task_brief.md`, served through
@@ -26,9 +27,10 @@ provider ships.
 | Listings + search | `tests/test_virtual_overlay.py` | root listing merge + dedupe against a real leftover; listing inside a prefix comes from the provider; flat trees (nothing below a virtual entry); search scoped to a named entry does not leak sibling hits; root search merges real + virtual; `SEARCH_RESULT_HARD_CAP` applied to the merged set; `read_all()` fast path **and** the fallback for providers without it |
 | Mutation rules | `tests/test_virtual_overlay.py` | all 7 mutations rejected on a read-only prefix; `move` rejected from either endpoint; **copy-out virtual→real allowed**; writable providers accept `write_file`/`append_file` and still reject delete; provider write failure becomes a readable error |
 | Providers | `tests/test_virtual_providers.py` (26) | `ToolsProvider` renders byte-identically to `generate_tool_index` / `generate_tool_description`; **live tool list read per call** (no snapshot); `SingleFileProvider` renders lazily; instruction precedence inline → upload → template; `ContactsProvider` slug collisions, README index, one fetch per TTL window, stale-serve on failure, cold-cache error, empty-project render |
-| Wiring, kill switch, sweep | `tests/test_virtual_dirs_wiring.py` (23) | manager wraps/does-not-wrap per `VIRTUAL_DIRS_ENABLED`; registration serves through the manager; marker-checked legacy `tools/` sweep (delete generated / preserve user-owned / non-fatal); legacy write helpers deleted; **deferred tools keep FULL docstrings after `apply_description_overrides` rebinds** (the placebo-test regression — fixture is a genuine `defer_to_workspace` tool with a `model_copy`-capable double, plus guards so it cannot go vacuous); `swap_backend` keeps the overlay in front of the new backend; tripwires pinning the production probe and swap call sites; `workspace.py` constructs when loaded **outside its package** |
+| Wiring, kill switch, sweep | `tests/test_virtual_dirs_wiring.py` (23) | manager always wraps the backend (the `VIRTUAL_DIRS_ENABLED` gate was removed 2026-08-07 — see the row below); registration serves through the manager; marker-checked legacy `tools/` sweep (delete generated / preserve user-owned / non-fatal); legacy write helpers deleted; **deferred tools keep FULL docstrings after `apply_description_overrides` rebinds** (the placebo-test regression — fixture is a genuine `defer_to_workspace` tool with a `model_copy`-capable double, plus guards so it cannot go vacuous); `swap_backend` keeps the overlay in front of the new backend; tripwires pinning the production probe and swap call sites; `workspace.py` constructs when loaded **outside its package** |
 | Seeded-content sentinel | `tests/test_virtual_dirs_wiring.py`, `tests/test_workspace_phase0_seed.py` | `.srw_seeded` round-trips through the manager; a **virtual** file cannot mask an unseeded workspace; a legacy workspace with only `task_brief.md` still reads seeded (safe degradation); an empty workspace reads unseeded |
-| Kill-switch rollback | `tests/test_workspace_phase0_seed.py:474+` | with the switch off, `instructions.md` and `task_brief.md` are materialized as real files, so the job's first `HumanMessage` is never empty |
+| No kill switch (2026-08-07) | `tests/test_workspace_phase0_seed.py::TestInstructionFilesAreNeverWritten`, `tests/test_virtual_dirs_wiring.py::test_virtual_dirs_enabled_is_inert` | `VIRTUAL_DIRS_ENABLED` is inert — setting it does **not** bring the overlay down; the instruction files are served and never written (real backend or seed files); a manager without an overlay is unconstructible. Pins the *removal*, so a reintroduced flag fails loudly rather than quietly restoring the write path that reopened `critic_brief_lands_in_shared_workspace_and_misleads_target` |
+| Boot guarantee that replaced it | `tests/test_graph.py::TestInitStrategicTodosNode` | a taskless boot **raises** (whitespace included) instead of starting the agent with an empty brief; `instructions.md` alone missing stays a normal boot |
 | Cloud sync isolation | `tests/cloud_sync/test_base.py` (20) | a registered provider's files **never enter the sync walk** — enforced structurally by unwrapping in `WorkspaceSyncBase.__init__`, not by ignore patterns |
 | Contacts endpoint + resolver | `tests/test_contacts_internal_endpoint.py` (2), `tests/test_resolve_project_for_agent.py` (7) | internal-key gate; exactly-one-of `job_id`/`thread_id`; project resolved **server-side** (job branch, thread-via-`thread_mounts`, thread-via-column fallback, malformed UUID → `None`) |
 
@@ -134,18 +136,30 @@ seeded content plus at least one phase snapshot — not reproducible in-process.
 Also worth covering once: a **legacy** workspace (seeded before `.srw_seeded`
 existed, carrying only a real `task_brief.md`) must still read as seeded.
 
-### 2.4 Kill-switch smoke on a real job
+### 2.4 ~~Kill-switch smoke on a real job~~ — **obsolete 2026-08-07**
 
-**Why it matters.** With `VIRTUAL_DIRS_ENABLED=false` the write path is deleted,
-so the fallback materialization is the only thing standing between the switch and
-an agent that is never told its task.
+The gap was: with `VIRTUAL_DIRS_ENABLED=false` the fallback materialization was
+the only thing between the switch and an agent never told its task, and nothing
+asserted what the first `HumanMessage` actually contained on a real run.
 
-**Why it isn't covered.** Unit tests assert the two files are written; nothing
-asserts what the agent's **first message actually contains** on a real run.
+**The switch is gone** (`a4929b17`). Its "off" position wrote `instructions.md`
+and `task_brief.md` into the workspace root, which on a workspace-inheriting
+subjob dropped the critic's brief where the *target* reads it — reopening
+`docs/done/critic_brief_lands_in_shared_workspace_and_misleads_target.md` every
+time the lever was pulled. A rollback whose off position reintroduces a
+high-severity defect is not a rollback.
 
-**How to close.** One worker job with the switch off; read the first
-`HumanMessage` from the audit trail and confirm it carries the task brief and
-instructions, not just the strategic-mode boilerplate.
+What replaced it is stronger than the smoke test this gap asked for:
+`src/graph.py` now **raises** when `task_brief.md` and `instructions.md` both
+resolve empty, so a taskless boot cannot happen silently on *any* path —
+overlay failure, missed registration, lost rebind — not just the one the flag
+covered. Unit-pinned in `tests/test_graph.py::TestInitStrategicTodosNode`
+(including whitespace-only content, the realistic overlay failure).
+
+**Residual, much smaller:** nothing asserts the first `HumanMessage` on a real
+run *contains the brief* — only that an empty one aborts. A job that boots with
+a wrong-but-non-empty brief would pass. Low value; the failure mode is visible
+in the first turn.
 
 ### 2.5 Subagent reader isolation
 
@@ -193,3 +207,9 @@ so `WorkspaceManager.initialize()` creates an **empty real `tools/` directory**
 that nothing writes to. Harmless — the overlay owns the whole prefix, and the
 boot sweep correctly leaves it alone because it carries no generated marker — but
 it is dead scaffolding and should be dropped from `structure`.
+
+## Related coverage maps
+
+- `tests/verification_delivery_test_coverage.md` — the verification gate and the
+  delivery-failure chain, including the boot guarantee (§1.5) that replaced this
+  feature's kill switch.
