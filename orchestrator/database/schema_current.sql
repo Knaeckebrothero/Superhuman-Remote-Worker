@@ -78,6 +78,568 @@ CREATE TYPE public.sudo_request_status AS ENUM (
 
 
 --
+-- Name: append_agent_metering_binding_event(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.append_agent_metering_binding_event() RETURNS trigger
+    LANGUAGE plpgsql SECURITY DEFINER
+    SET search_path TO 'pg_catalog'
+    AS $$
+BEGIN
+    INSERT INTO public.agent_metering_binding_events (
+        agent_id, revision, agent_present, pod_uid, hostname,
+        identity_state, attribution_scope, owner_kind, owner_id,
+        user_id, project_id, reason_code, transition_source, effective_at
+    ) VALUES (
+        NEW.agent_id, NEW.revision, NEW.agent_present, NEW.pod_uid, NEW.hostname,
+        NEW.identity_state, NEW.attribution_scope, NEW.owner_kind, NEW.owner_id,
+        NEW.user_id, NEW.project_id, NEW.reason_code, NEW.transition_source,
+        NEW.effective_at
+    );
+    RETURN NULL;
+END;
+$$;
+
+
+--
+-- Name: close_compute_intervals_at_epoch_retirement(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.close_compute_intervals_at_epoch_retirement() RETURNS trigger
+    LANGUAGE plpgsql SECURITY DEFINER
+    SET search_path TO 'pg_catalog'
+    AS $$
+BEGIN
+    IF OLD.retired_at IS NULL AND NEW.retired_at IS NOT NULL THEN
+        PERFORM activation.activation_key
+        FROM public.compute_metering_epoch_authorities AS authority
+        JOIN public.compute_metering_activation AS activation
+          ON activation.activation_key = authority.activation_key
+        WHERE authority.inventory_scope_epoch_id = OLD.id
+        ORDER BY activation.activation_key
+        FOR SHARE OF activation;
+
+        IF EXISTS (
+            SELECT 1
+            FROM public.resource_intervals AS interval
+            WHERE interval.compute_scope_epoch_id = OLD.id
+              AND interval.ended_at IS NULL
+              AND (interval.started_at > NEW.retired_at
+                   OR interval.last_seen_at > NEW.retired_at
+                   OR interval.last_confirmed_at > NEW.retired_at
+                   OR interval.materialized_through > NEW.retired_at)
+        ) THEN
+            RAISE EXCEPTION
+                'compute interval evidence leads epoch retirement clock'
+                USING ERRCODE = '55000';
+        END IF;
+
+        UPDATE public.resource_intervals AS interval
+        SET ended_at = NEW.retired_at,
+            end_time_source = 'inventory-epoch-retired',
+            end_uncertainty_us = 0,
+            end_reason = 'inventory-epoch-retired',
+            updated_at = statement_timestamp()
+        WHERE interval.compute_scope_epoch_id = OLD.id
+          AND interval.ended_at IS NULL;
+
+        UPDATE public.resource_lifecycle_heads AS head
+        SET current_interval_id = NULL,
+            updated_at = statement_timestamp()
+        WHERE head.current_interval_id IN (
+            SELECT interval.id
+            FROM public.resource_intervals AS interval
+            WHERE interval.compute_scope_epoch_id = OLD.id
+              AND interval.ended_at = NEW.retired_at
+              AND interval.end_reason = 'inventory-epoch-retired'
+        );
+    ELSIF OLD.retired_at IS NOT NULL
+          AND NEW.retired_at IS DISTINCT FROM OLD.retired_at THEN
+        RAISE EXCEPTION 'inventory epoch retirement is immutable'
+            USING ERRCODE = '55000';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: converge_agent_metering_binding(uuid, text); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.converge_agent_metering_binding(target_agent_id uuid, requested_transition_source text) RETURNS void
+    LANGUAGE plpgsql SECURITY DEFINER
+    SET search_path TO 'pg_catalog'
+    AS $_$
+DECLARE
+    agent_row          RECORD;
+    current_row        RECORD;
+    job_row            RECORD;
+    thread_row         RECORD;
+    agent_found        BOOLEAN;
+    initial_pod_uid    TEXT;
+    normalized_pod_uid TEXT;
+    normalized_host    TEXT;
+    duplicate_count    BIGINT;
+    next_present       BOOLEAN;
+    next_identity      TEXT;
+    next_scope         TEXT;
+    next_owner_kind    TEXT;
+    next_owner_id      UUID;
+    next_user_id       UUID;
+    next_project_id    UUID;
+    next_reason        TEXT;
+    transition_at      TIMESTAMPTZ;
+BEGIN
+    IF requested_transition_source IS NULL
+       OR requested_transition_source !~ '^[a-z0-9][a-z0-9._-]{0,63}$' THEN
+        RAISE EXCEPTION 'agent metering transition source is invalid'
+            USING ERRCODE = '22023';
+    END IF;
+
+    -- Every convergence path uses Pod identity then agent identity lock order.
+    -- Re-read after either wait so a job/thread trigger cannot overwrite a
+    -- newer registration transition with the agent row it saw before waiting.
+    SELECT agent.id, agent.pod_uid, agent.hostname,
+           agent.current_job_id, agent.thread_id
+    INTO agent_row
+    FROM public.agents AS agent
+    WHERE agent.id = target_agent_id;
+    agent_found := FOUND;
+    IF agent_found THEN
+        initial_pod_uid := NULLIF(btrim(agent_row.pod_uid), '');
+        IF initial_pod_uid IS NOT NULL
+           AND length(initial_pod_uid) <= 256 THEN
+            PERFORM pg_advisory_xact_lock(
+                hashtextextended(
+                    'srw-agent-metering-pod:' || initial_pod_uid,
+                    0
+                )
+            );
+        END IF;
+    END IF;
+    PERFORM pg_advisory_xact_lock(
+        hashtextextended(
+            'srw-agent-metering-agent:' || target_agent_id::TEXT,
+            0
+        )
+    );
+    SELECT agent.id, agent.pod_uid, agent.hostname,
+           agent.current_job_id, agent.thread_id
+    INTO agent_row
+    FROM public.agents AS agent
+    WHERE agent.id = target_agent_id;
+    agent_found := FOUND;
+
+    IF NOT agent_found THEN
+        SELECT * INTO current_row
+        FROM public.agent_metering_pod_identity_state
+        WHERE agent_id = target_agent_id
+        FOR UPDATE;
+        IF NOT FOUND THEN
+            RETURN;
+        END IF;
+        normalized_pod_uid := current_row.pod_uid;
+        normalized_host := current_row.hostname;
+        next_present := FALSE;
+        next_identity := 'missing';
+        next_scope := 'unknown';
+        next_owner_kind := NULL;
+        next_owner_id := NULL;
+        next_user_id := NULL;
+        next_project_id := NULL;
+        next_reason := 'agent-row-deleted';
+    ELSE
+        normalized_pod_uid := NULLIF(btrim(agent_row.pod_uid), '');
+        IF normalized_pod_uid IS NOT NULL
+           AND length(normalized_pod_uid) > 256 THEN
+            normalized_pod_uid := NULL;
+        END IF;
+        normalized_host := NULLIF(btrim(agent_row.hostname), '');
+        IF normalized_host IS NOT NULL AND length(normalized_host) > 255 THEN
+            normalized_host := NULL;
+        END IF;
+        next_present := TRUE;
+        next_owner_kind := NULL;
+        next_owner_id := NULL;
+        next_user_id := NULL;
+        next_project_id := NULL;
+
+        IF normalized_pod_uid IS NULL THEN
+            next_identity := 'missing';
+            next_scope := 'unknown';
+            next_reason := 'missing-pod-uid';
+        ELSE
+            -- The caller already holds the observed Pod-identity lock. Agent
+            -- row triggers additionally pre-lock both old and new UIDs, so
+            -- simultaneous re-registrations cannot form a peer-state cycle.
+            SELECT count(*) INTO duplicate_count
+            FROM public.agents AS peer
+            WHERE NULLIF(btrim(peer.pod_uid), '') = normalized_pod_uid;
+
+            IF duplicate_count > 1 THEN
+                next_identity := 'duplicate';
+                next_scope := 'unknown';
+                next_reason := 'duplicate-pod-uid';
+            ELSIF agent_row.current_job_id IS NOT NULL
+                  AND agent_row.thread_id IS NOT NULL THEN
+                next_identity := 'valid';
+                next_scope := 'unknown';
+                next_reason := 'dual-owner-conflict';
+            ELSIF agent_row.current_job_id IS NOT NULL THEN
+                SELECT job.id, job.user_id, job.project_id,
+                       job.status, job.assigned_agent_id
+                INTO job_row
+                FROM public.jobs AS job
+                WHERE job.id = agent_row.current_job_id;
+                IF FOUND
+                   AND job_row.status = 'processing'
+                   AND job_row.assigned_agent_id = target_agent_id
+                   AND job_row.user_id IS NOT NULL THEN
+                    next_identity := 'valid';
+                    next_scope := 'customer';
+                    next_owner_kind := 'job';
+                    next_owner_id := job_row.id;
+                    next_user_id := job_row.user_id;
+                    next_project_id := job_row.project_id;
+                    next_reason := 'job-mutual-binding';
+                ELSE
+                    next_identity := 'valid';
+                    next_scope := 'unknown';
+                    next_reason := 'job-binding-conflict';
+                END IF;
+            ELSIF agent_row.thread_id IS NOT NULL THEN
+                SELECT thread.id, thread.user_id, thread.project_id,
+                       thread.status, thread.agent_id
+                INTO thread_row
+                FROM public.threads AS thread
+                WHERE thread.id = agent_row.thread_id;
+                IF FOUND
+                   AND thread_row.status IN ('active', 'awaiting_user')
+                   AND thread_row.agent_id = target_agent_id
+                   AND thread_row.user_id IS NOT NULL THEN
+                    next_identity := 'valid';
+                    next_scope := 'customer';
+                    next_owner_kind := 'thread';
+                    next_owner_id := thread_row.id;
+                    next_user_id := thread_row.user_id;
+                    next_project_id := thread_row.project_id;
+                    next_reason := 'thread-mutual-binding';
+                ELSE
+                    next_identity := 'valid';
+                    next_scope := 'unknown';
+                    next_reason := 'thread-binding-conflict';
+                END IF;
+            ELSE
+                next_identity := 'valid';
+                next_scope := 'shared-platform';
+                next_reason := 'unbound-agent';
+            END IF;
+        END IF;
+    END IF;
+
+    SELECT * INTO current_row
+    FROM public.agent_metering_pod_identity_state
+    WHERE agent_id = target_agent_id
+    FOR UPDATE;
+
+    IF NOT FOUND THEN
+        transition_at := clock_timestamp();
+        INSERT INTO public.agent_metering_pod_identity_state (
+            agent_id, agent_present, pod_uid, hostname, identity_state,
+            attribution_scope, owner_kind, owner_id, user_id, project_id,
+            reason_code, transition_source, revision, effective_at
+        ) VALUES (
+            target_agent_id, next_present, normalized_pod_uid, normalized_host,
+            next_identity, next_scope, next_owner_kind, next_owner_id,
+            next_user_id, next_project_id, next_reason,
+            requested_transition_source, 1, transition_at
+        );
+        RETURN;
+    END IF;
+
+    IF current_row.agent_present IS NOT DISTINCT FROM next_present
+       AND current_row.pod_uid IS NOT DISTINCT FROM normalized_pod_uid
+       AND current_row.hostname IS NOT DISTINCT FROM normalized_host
+       AND current_row.identity_state IS NOT DISTINCT FROM next_identity
+       AND current_row.attribution_scope IS NOT DISTINCT FROM next_scope
+       AND current_row.owner_kind IS NOT DISTINCT FROM next_owner_kind
+       AND current_row.owner_id IS NOT DISTINCT FROM next_owner_id
+       AND current_row.user_id IS NOT DISTINCT FROM next_user_id
+       AND current_row.project_id IS NOT DISTINCT FROM next_project_id
+       AND current_row.reason_code IS NOT DISTINCT FROM next_reason THEN
+        RETURN;
+    END IF;
+
+    -- statement_timestamp() is fixed before any advisory/row-lock wait. A
+    -- concurrent statement may therefore resume after a newer revision while
+    -- still carrying an older timestamp. Sample the wall clock only after the
+    -- current head is locked and clamp it to the durable head so revisions can
+    -- never move effective_at or updated_at backwards.
+    transition_at := GREATEST(clock_timestamp(), current_row.effective_at);
+    UPDATE public.agent_metering_pod_identity_state
+    SET agent_present = next_present,
+        pod_uid = normalized_pod_uid,
+        hostname = normalized_host,
+        identity_state = next_identity,
+        attribution_scope = next_scope,
+        owner_kind = next_owner_kind,
+        owner_id = next_owner_id,
+        user_id = next_user_id,
+        project_id = next_project_id,
+        reason_code = next_reason,
+        transition_source = requested_transition_source,
+        revision = current_row.revision + 1,
+        effective_at = transition_at,
+        updated_at = transition_at
+    WHERE agent_id = target_agent_id;
+END;
+$_$;
+
+
+--
+-- Name: converge_agent_metering_from_agent_row(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.converge_agent_metering_from_agent_row() RETURNS trigger
+    LANGUAGE plpgsql SECURITY DEFINER
+    SET search_path TO 'pg_catalog'
+    AS $$
+DECLARE
+    old_pod_uid TEXT;
+    new_pod_uid TEXT;
+    locked_uid  TEXT;
+    peer_id     UUID;
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        old_pod_uid := NULLIF(btrim(OLD.pod_uid), '');
+    ELSE
+        new_pod_uid := NULLIF(btrim(NEW.pod_uid), '');
+        IF TG_OP = 'UPDATE' THEN
+            old_pod_uid := NULLIF(btrim(OLD.pod_uid), '');
+        END IF;
+    END IF;
+
+    -- A row update is already visible to its own trigger but not to a
+    -- concurrent peer. Lock both sides in lexical order before touching any
+    -- metering head; this prevents old-UID peer convergence deadlocks.
+    FOR locked_uid IN
+        SELECT candidate.uid
+        FROM (
+            SELECT old_pod_uid AS uid
+            UNION
+            SELECT new_pod_uid AS uid
+        ) AS candidate
+        WHERE candidate.uid IS NOT NULL AND length(candidate.uid) <= 256
+        ORDER BY candidate.uid
+    LOOP
+        PERFORM pg_advisory_xact_lock(
+            hashtextextended(
+                'srw-agent-metering-pod:' || locked_uid,
+                0
+            )
+        );
+    END LOOP;
+
+    IF TG_OP = 'DELETE' THEN
+        PERFORM public.converge_agent_metering_binding(
+            OLD.id, 'agents-delete'
+        );
+        -- Do not row-lock peers here. The outer DELETE already owns OLD's
+        -- tuple lock, while a concurrent peer mutation owns its own tuple
+        -- lock before its AFTER trigger can wait on the Pod advisory lock.
+        -- Waiting for that peer row would invert those locks and deadlock;
+        -- SKIP LOCKED, conversely, can leave the survivor permanently marked
+        -- duplicate. The Pod advisory lock serializes changes for this UID,
+        -- and a plain MVCC read lets this transaction converge committed
+        -- peers without waiting. A concurrent peer mutation runs its own
+        -- trigger after this transaction releases the UID lock and is the
+        -- final-state repair.
+        FOR peer_id IN
+            SELECT agent.id FROM public.agents AS agent
+            WHERE old_pod_uid IS NOT NULL
+              AND NULLIF(btrim(agent.pod_uid), '') = old_pod_uid
+            ORDER BY agent.id
+        LOOP
+            PERFORM public.converge_agent_metering_binding(
+                peer_id, 'agents-delete-peer'
+            );
+        END LOOP;
+        RETURN OLD;
+    END IF;
+
+    PERFORM public.converge_agent_metering_binding(
+        NEW.id,
+        CASE WHEN TG_OP = 'INSERT' THEN 'agents-insert' ELSE 'agents-update' END
+    );
+    -- Peer discovery intentionally remains a non-locking MVCC read; see the
+    -- DELETE path above for the row-lock/advisory-lock ordering contract.
+    FOR peer_id IN
+        SELECT agent.id FROM public.agents AS agent
+        WHERE agent.id <> NEW.id
+          AND ((new_pod_uid IS NOT NULL
+                AND NULLIF(btrim(agent.pod_uid), '') = new_pod_uid)
+               OR (old_pod_uid IS NOT NULL
+                AND NULLIF(btrim(agent.pod_uid), '') = old_pod_uid))
+        ORDER BY agent.id
+    LOOP
+        PERFORM public.converge_agent_metering_binding(
+            peer_id, 'agents-identity-peer'
+        );
+    END LOOP;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: converge_agent_metering_from_job_row(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.converge_agent_metering_from_job_row() RETURNS trigger
+    LANGUAGE plpgsql SECURITY DEFINER
+    SET search_path TO 'pg_catalog'
+    AS $$
+DECLARE
+    target_job_id UUID;
+    old_agent_id  UUID;
+    new_agent_id  UUID;
+    locked_uid    TEXT;
+    peer_id       UUID;
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        target_job_id := OLD.id;
+        old_agent_id := OLD.assigned_agent_id;
+    ELSIF TG_OP = 'INSERT' THEN
+        target_job_id := NEW.id;
+        new_agent_id := NEW.assigned_agent_id;
+    ELSE
+        target_job_id := NEW.id;
+        old_agent_id := OLD.assigned_agent_id;
+        new_agent_id := NEW.assigned_agent_id;
+    END IF;
+
+    -- One owner transition may converge more than one inconsistent/transitional
+    -- agent row. Advisory locks live until transaction end, so acquiring them
+    -- indirectly in agent UUID order can conflict with the lexical old/new UID
+    -- order used by an agent-row trigger. Prelock the complete visible UID set
+    -- lexically before touching any metering head. Concurrent agent mutations
+    -- include their old UID in the same lock protocol and perform the final
+    -- repair after this transaction when their uncommitted row was not visible.
+    FOR locked_uid IN
+        SELECT candidate.uid
+        FROM (
+            SELECT DISTINCT NULLIF(btrim(agent.pod_uid), '') AS uid
+            FROM public.agents AS agent
+            WHERE agent.current_job_id = target_job_id
+               OR agent.id = old_agent_id
+               OR agent.id = new_agent_id
+        ) AS candidate
+        WHERE candidate.uid IS NOT NULL AND length(candidate.uid) <= 256
+        ORDER BY candidate.uid
+    LOOP
+        PERFORM pg_advisory_xact_lock(
+            hashtextextended(
+                'srw-agent-metering-pod:' || locked_uid,
+                0
+            )
+        );
+    END LOOP;
+
+    FOR peer_id IN
+        SELECT agent.id FROM public.agents AS agent
+        WHERE agent.current_job_id = target_job_id
+           OR agent.id = old_agent_id
+           OR agent.id = new_agent_id
+        ORDER BY agent.id
+    LOOP
+        PERFORM public.converge_agent_metering_binding(
+            peer_id,
+            CASE WHEN TG_OP = 'INSERT' THEN 'jobs-insert'
+                 WHEN TG_OP = 'DELETE' THEN 'jobs-delete'
+                 ELSE 'jobs-update' END
+        );
+    END LOOP;
+    IF TG_OP = 'DELETE' THEN
+        RETURN OLD;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: converge_agent_metering_from_thread_row(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.converge_agent_metering_from_thread_row() RETURNS trigger
+    LANGUAGE plpgsql SECURITY DEFINER
+    SET search_path TO 'pg_catalog'
+    AS $$
+DECLARE
+    target_thread_id UUID;
+    old_agent_id     UUID;
+    new_agent_id     UUID;
+    locked_uid       TEXT;
+    peer_id          UUID;
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        target_thread_id := OLD.id;
+        old_agent_id := OLD.agent_id;
+    ELSIF TG_OP = 'INSERT' THEN
+        target_thread_id := NEW.id;
+        new_agent_id := NEW.agent_id;
+    ELSE
+        target_thread_id := NEW.id;
+        old_agent_id := OLD.agent_id;
+        new_agent_id := NEW.agent_id;
+    END IF;
+
+    -- Match the job-trigger lock contract: collect every currently visible Pod
+    -- identity first and acquire the transaction locks in one lexical order.
+    FOR locked_uid IN
+        SELECT candidate.uid
+        FROM (
+            SELECT DISTINCT NULLIF(btrim(agent.pod_uid), '') AS uid
+            FROM public.agents AS agent
+            WHERE agent.thread_id = target_thread_id
+               OR agent.id = old_agent_id
+               OR agent.id = new_agent_id
+        ) AS candidate
+        WHERE candidate.uid IS NOT NULL AND length(candidate.uid) <= 256
+        ORDER BY candidate.uid
+    LOOP
+        PERFORM pg_advisory_xact_lock(
+            hashtextextended(
+                'srw-agent-metering-pod:' || locked_uid,
+                0
+            )
+        );
+    END LOOP;
+
+    FOR peer_id IN
+        SELECT agent.id FROM public.agents AS agent
+        WHERE agent.thread_id = target_thread_id
+           OR agent.id = old_agent_id
+           OR agent.id = new_agent_id
+        ORDER BY agent.id
+    LOOP
+        PERFORM public.converge_agent_metering_binding(
+            peer_id,
+            CASE WHEN TG_OP = 'INSERT' THEN 'threads-insert'
+                 WHEN TG_OP = 'DELETE' THEN 'threads-delete'
+                 ELSE 'threads-update' END
+        );
+    END LOOP;
+    IF TG_OP = 'DELETE' THEN
+        RETURN OLD;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
 -- Name: enforce_inventory_epoch_required_boundary(); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -157,6 +719,97 @@ $$;
 
 
 --
+-- Name: enforce_resource_interval_compute_epoch_authority(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.enforce_resource_interval_compute_epoch_authority() RETURNS trigger
+    LANGUAGE plpgsql SECURITY DEFINER
+    SET search_path TO 'pg_catalog'
+    AS $$
+DECLARE
+    required_key         TEXT;
+    activation_state     TEXT;
+    activation_boundary  TIMESTAMPTZ;
+    epoch_retired_at     TIMESTAMPTZ;
+    authority_boundary   TIMESTAMPTZ;
+BEGIN
+    IF NEW.source_kind = 'pod'
+       AND NEW.category = 'compute'
+       AND NEW.resource = 'agent_pod' THEN
+        required_key := 'agent_pod';
+    ELSIF NEW.source_kind = 'pod'
+          AND NEW.category = 'compute'
+          AND NEW.resource = 'workspace_pod'
+          AND NEW.details->>'product_class' = 'ide-session' THEN
+        required_key := 'ide_workspace_pod';
+    ELSIF NEW.source_kind = 'vmi'
+          AND NEW.category = 'compute'
+          AND NEW.resource = 'workspace_vm' THEN
+        required_key := 'workspace_vm';
+    ELSE
+        RETURN NEW;
+    END IF;
+
+    IF TG_OP = 'UPDATE'
+       AND NEW.compute_scope_epoch_id IS DISTINCT FROM OLD.compute_scope_epoch_id THEN
+        RAISE EXCEPTION 'compute interval epoch binding is immutable'
+            USING ERRCODE = '55000';
+    END IF;
+
+    SELECT epoch.retired_at
+    INTO epoch_retired_at
+    FROM public.resource_inventory_scope_epochs AS epoch
+    JOIN public.resource_inventory_scopes AS scope
+      ON scope.id = epoch.scope_id
+    WHERE epoch.id = NEW.compute_scope_epoch_id
+      AND epoch.scope_id = NEW.inventory_scope_id
+      AND scope.source_cluster = NEW.source_cluster
+    FOR SHARE OF epoch;
+
+    SELECT activation.state, activation.activated_at
+    INTO activation_state, activation_boundary
+    FROM public.compute_metering_activation AS activation
+    WHERE activation.activation_key = required_key
+    FOR SHARE;
+
+    SELECT authority.effective_from
+    INTO authority_boundary
+    FROM public.compute_metering_epoch_authorities AS authority
+    WHERE authority.activation_key = required_key
+      AND authority.inventory_scope_id = NEW.inventory_scope_id
+      AND authority.inventory_scope_epoch_id = NEW.compute_scope_epoch_id;
+
+    IF activation_state IS DISTINCT FROM 'active'
+       OR activation_boundary IS NULL
+       OR statement_timestamp() < activation_boundary
+       OR authority_boundary IS NULL
+       OR statement_timestamp() < authority_boundary
+       OR NEW.started_at < GREATEST(activation_boundary, authority_boundary) THEN
+        RAISE EXCEPTION
+            'compute product class % lacks bound exact epoch authority',
+            required_key
+            USING ERRCODE = '55000';
+    END IF;
+
+    IF TG_OP = 'INSERT' AND epoch_retired_at IS NOT NULL THEN
+        RAISE EXCEPTION 'compute interval exact epoch is retired'
+            USING ERRCODE = '55000';
+    END IF;
+    IF epoch_retired_at IS NOT NULL
+       AND (NEW.last_seen_at > epoch_retired_at
+            OR NEW.last_confirmed_at > epoch_retired_at
+            OR NEW.materialized_through > epoch_retired_at
+            OR (NEW.ended_at IS NOT NULL
+                AND NEW.ended_at > epoch_retired_at)) THEN
+        RAISE EXCEPTION 'compute interval mutation exceeds epoch retirement'
+            USING ERRCODE = '55000';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
 -- Name: enforce_resource_interval_storage_activation(); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -165,8 +818,11 @@ CREATE FUNCTION public.enforce_resource_interval_storage_activation() RETURNS tr
     SET search_path TO 'pg_catalog'
     AS $$
 DECLARE
-    activation_state TEXT;
-    activation_time  TIMESTAMPTZ;
+    global_state     TEXT;
+    global_boundary  TIMESTAMPTZ;
+    source_state     TEXT;
+    source_boundary  TIMESTAMPTZ;
+    effective_boundary TIMESTAMPTZ;
 BEGIN
     IF NEW.measurement_basis NOT IN (
         'claim-requested', 'volume-provisioned'
@@ -174,19 +830,33 @@ BEGIN
         RETURN NEW;
     END IF;
 
-    SELECT activation.state, activation.activated_at
-    INTO activation_state, activation_time
-    FROM public.storage_metering_activation AS activation
-    WHERE activation.measurement_basis = NEW.measurement_basis
-    FOR SHARE;
+    SELECT global_activation.state, global_activation.activated_at,
+           source_activation.state, source_activation.activated_at
+    INTO global_state, global_boundary, source_state, source_boundary
+    FROM public.resource_inventory_scopes AS scope
+    JOIN public.storage_metering_source_requirements AS requirement
+      ON requirement.inventory_scope_id = scope.id
+     AND requirement.measurement_basis = NEW.measurement_basis
+     AND requirement.collector_id = scope.collector_id
+     AND requirement.source_cluster = scope.source_cluster
+     AND requirement.requirement_role = 'quantity'
+    JOIN public.storage_metering_source_activations AS source_activation
+      ON source_activation.measurement_basis = requirement.measurement_basis
+     AND source_activation.collector_id = requirement.collector_id
+     AND source_activation.source_cluster = requirement.source_cluster
+    JOIN public.storage_metering_activation AS global_activation
+      ON global_activation.measurement_basis = requirement.measurement_basis
+    WHERE scope.id = NEW.inventory_scope_id
+    FOR SHARE OF source_activation, global_activation;
 
-    IF activation_state IS DISTINCT FROM 'active'
-       OR activation_time IS NULL
-       OR statement_timestamp() < activation_time
-       OR NEW.started_at < activation_time THEN
+    effective_boundary := GREATEST(global_boundary, source_boundary);
+    IF global_state IS DISTINCT FROM 'active'
+       OR source_state IS DISTINCT FROM 'active'
+       OR effective_boundary IS NULL
+       OR statement_timestamp() < effective_boundary
+       OR NEW.started_at < effective_boundary THEN
         RAISE EXCEPTION
-            'storage interval basis % is not active at its clamped boundary',
-            NEW.measurement_basis
+            'storage interval source is not active at its clamped boundary'
             USING ERRCODE = '55000';
     END IF;
     RETURN NEW;
@@ -427,6 +1097,493 @@ $$;
 
 
 --
+-- Name: protect_agent_metering_binding_event_mutation(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.protect_agent_metering_binding_event_mutation() RETURNS trigger
+    LANGUAGE plpgsql
+    SET search_path TO 'pg_catalog'
+    AS $$
+BEGIN
+    RAISE EXCEPTION 'agent metering binding events are append-only'
+        USING ERRCODE = '55000';
+END;
+$$;
+
+
+--
+-- Name: protect_agent_metering_identity_state_mutation(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.protect_agent_metering_identity_state_mutation() RETURNS trigger
+    LANGUAGE plpgsql
+    SET search_path TO 'pg_catalog'
+    AS $$
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        RAISE EXCEPTION 'agent metering identity state cannot be deleted'
+            USING ERRCODE = '55000';
+    ELSIF TG_OP = 'INSERT' THEN
+        IF NEW.revision <> 1 THEN
+            RAISE EXCEPTION 'agent metering identity state must begin at revision 1'
+                USING ERRCODE = '55000';
+        END IF;
+        RETURN NEW;
+    END IF;
+
+    IF NEW.agent_id IS DISTINCT FROM OLD.agent_id
+       OR NEW.created_at IS DISTINCT FROM OLD.created_at
+       OR NEW.revision <> OLD.revision + 1
+       OR NEW.effective_at < OLD.effective_at
+       OR NEW.updated_at < OLD.updated_at THEN
+        RAISE EXCEPTION 'agent metering identity state transition is invalid'
+            USING ERRCODE = '55000';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: protect_compute_epoch_promotion_request(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.protect_compute_epoch_promotion_request() RETURNS trigger
+    LANGUAGE plpgsql SECURITY DEFINER
+    SET search_path TO 'pg_catalog'
+    AS $$
+BEGIN
+    IF TG_OP <> 'INSERT' THEN
+        RAISE EXCEPTION 'compute epoch promotion requests are immutable'
+            USING ERRCODE = '55000';
+    END IF;
+    IF NEW.promoted_at IS DISTINCT FROM statement_timestamp()
+       OR NEW.created_at IS DISTINCT FROM statement_timestamp() THEN
+        RAISE EXCEPTION 'compute epoch promotion must use the database clock'
+            USING ERRCODE = '55000';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: protect_compute_metering_activation(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.protect_compute_metering_activation() RETURNS trigger
+    LANGUAGE plpgsql SECURITY DEFINER
+    SET search_path TO 'pg_catalog'
+    AS $$
+DECLARE
+    requirement_count BIGINT;
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        RAISE EXCEPTION 'compute activation rows cannot be deleted'
+            USING ERRCODE = '55000';
+    ELSIF TG_OP = 'INSERT' THEN
+        IF NEW.state <> 'disabled' OR NEW.activated_at IS NOT NULL THEN
+            RAISE EXCEPTION 'compute activation rows must begin disabled'
+                USING ERRCODE = '55000';
+        END IF;
+        RETURN NEW;
+    END IF;
+
+    IF NEW.activation_key IS DISTINCT FROM OLD.activation_key
+       OR NEW.created_at IS DISTINCT FROM OLD.created_at THEN
+        RAISE EXCEPTION 'compute activation identity is immutable'
+            USING ERRCODE = '55000';
+    END IF;
+
+    IF OLD.state = 'disabled' AND NEW.state = 'shadow'
+       AND NEW.activated_at IS NULL THEN
+        NEW.updated_at := statement_timestamp();
+        RETURN NEW;
+    END IF;
+
+    IF OLD.state = 'shadow' AND NEW.state = 'active'
+       AND NEW.activated_at IS NOT NULL
+       AND NEW.activated_at = date_trunc('day', NEW.activated_at, 'UTC')
+       AND NEW.activated_at > statement_timestamp() THEN
+        SELECT count(*)
+        INTO requirement_count
+        FROM public.compute_metering_scope_requirements AS requirement
+        WHERE requirement.activation_key = OLD.activation_key;
+        IF requirement_count = 0 OR EXISTS (
+            SELECT 1
+            FROM public.compute_metering_scope_requirements AS requirement
+            LEFT JOIN public.compute_metering_epoch_authorities AS authority
+              ON authority.activation_key = requirement.activation_key
+             AND authority.inventory_scope_id = requirement.inventory_scope_id
+             AND authority.inventory_scope_epoch_id =
+                 requirement.inventory_scope_epoch_id
+             AND authority.authority_sequence = 1
+             AND authority.effective_from = requirement.required_from
+            LEFT JOIN public.resource_inventory_scope_epochs AS epoch
+              ON epoch.id = requirement.inventory_scope_epoch_id
+             AND epoch.scope_id = requirement.inventory_scope_id
+            WHERE requirement.activation_key = OLD.activation_key
+              AND (requirement.required_from IS DISTINCT FROM NEW.activated_at
+                   OR authority.id IS NULL
+                   OR epoch.id IS NULL
+                   OR epoch.retired_at IS NOT NULL
+                   OR NOT epoch.required_for_rollup
+                   OR epoch.required_from IS NULL
+                   OR epoch.required_from > requirement.required_from)
+        ) THEN
+            RAISE EXCEPTION
+                'compute activation requires audited exact epoch authority'
+                USING ERRCODE = '55000';
+        END IF;
+        NEW.updated_at := statement_timestamp();
+        RETURN NEW;
+    END IF;
+
+    IF NEW.state IS NOT DISTINCT FROM OLD.state
+       AND NEW.activated_at IS NOT DISTINCT FROM OLD.activated_at
+       AND NEW.updated_at IS NOT DISTINCT FROM OLD.updated_at THEN
+        RETURN NEW;
+    END IF;
+
+    RAISE EXCEPTION
+        'compute activation permits only disabled -> shadow -> future active'
+        USING ERRCODE = '55000';
+END;
+$$;
+
+
+--
+-- Name: protect_compute_metering_epoch_authority(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.protect_compute_metering_epoch_authority() RETURNS trigger
+    LANGUAGE plpgsql SECURITY DEFINER
+    SET search_path TO 'pg_catalog'
+    AS $$
+DECLARE
+    activation_state       TEXT;
+    activation_boundary    TIMESTAMPTZ;
+    request_key            TEXT;
+    request_kind           TEXT;
+    request_collector      TEXT;
+    request_cluster        TEXT;
+    request_promoted_at    TIMESTAMPTZ;
+    current_generation     BIGINT;
+    scope_resource         TEXT;
+    scope_namespace        TEXT;
+    epoch_recovery_from    UUID;
+    epoch_retired_at       TIMESTAMPTZ;
+    previous_epoch_id      UUID;
+    previous_sequence      BIGINT;
+    previous_retired_at    TIMESTAMPTZ;
+    snapshot_item_count    BIGINT;
+    snapshot_generation    BIGINT;
+    snapshot_is_proof      BOOLEAN;
+    shadow_count           BIGINT;
+    missing_shadow_count   BIGINT;
+    orphan_shadow_count    BIGINT;
+    lineage_reaches_prior  BOOLEAN;
+BEGIN
+    IF TG_OP <> 'INSERT' THEN
+        RAISE EXCEPTION 'compute epoch authorities are append-only'
+            USING ERRCODE = '55000';
+    END IF;
+
+    SELECT epoch.recovery_from_epoch_id, epoch.retired_at,
+           scope.api_resource, scope.namespace
+    INTO epoch_recovery_from, epoch_retired_at,
+         scope_resource, scope_namespace
+    FROM public.resource_inventory_scope_epochs AS epoch
+    JOIN public.resource_inventory_scopes AS scope
+      ON scope.id = epoch.scope_id
+     AND scope.collector_id = NEW.collector_id
+     AND scope.source_cluster = NEW.source_cluster
+    WHERE epoch.id = NEW.inventory_scope_epoch_id
+      AND epoch.scope_id = NEW.inventory_scope_id
+    FOR SHARE OF epoch;
+
+    SELECT activation.state, activation.activated_at
+    INTO activation_state, activation_boundary
+    FROM public.compute_metering_activation AS activation
+    WHERE activation.activation_key = NEW.activation_key
+    FOR SHARE;
+
+    SELECT request.activation_key, request.request_kind,
+           request.collector_id, request.source_cluster, request.promoted_at
+    INTO request_key, request_kind, request_collector, request_cluster,
+         request_promoted_at
+    FROM public.compute_metering_epoch_promotion_requests AS request
+    WHERE request.id = NEW.promotion_request_id
+    FOR SHARE;
+
+    SELECT control.leader_generation
+    INTO current_generation
+    FROM public.infra_metering_control AS control
+    WHERE control.singleton = TRUE
+    FOR SHARE;
+
+    IF epoch_retired_at IS NOT NULL
+       OR request_key IS DISTINCT FROM NEW.activation_key
+       OR request_collector IS DISTINCT FROM NEW.collector_id
+       OR request_cluster IS DISTINCT FROM NEW.source_cluster
+       OR scope_namespace IS NULL
+       OR NOT (
+            (NEW.activation_key IN ('agent_pod', 'ide_workspace_pod')
+             AND NEW.collector_id = 'kubernetes-pods'
+             AND scope_resource = 'core/v1/pods')
+            OR (NEW.activation_key = 'workspace_vm'
+                AND NEW.collector_id = 'kubevirt-vmis'
+                AND scope_resource =
+                    'kubevirt.io/v1/virtualmachineinstances')
+       ) THEN
+        RAISE EXCEPTION 'compute epoch authority identity is invalid'
+            USING ERRCODE = '55000';
+    END IF;
+
+    IF NEW.authority_sequence = 1 THEN
+        IF activation_state IS DISTINCT FROM 'shadow'
+           OR request_kind IS DISTINCT FROM 'initial-activation'
+           OR epoch_recovery_from IS NOT NULL
+           OR NOT EXISTS (
+                SELECT 1
+                FROM public.compute_metering_scope_requirements AS requirement
+                WHERE requirement.activation_key = NEW.activation_key
+                  AND requirement.collector_id = NEW.collector_id
+                  AND requirement.source_cluster = NEW.source_cluster
+                  AND requirement.inventory_scope_id = NEW.inventory_scope_id
+                  AND requirement.inventory_scope_epoch_id =
+                      NEW.inventory_scope_epoch_id
+                  AND requirement.required_from = NEW.effective_from
+           ) THEN
+            RAISE EXCEPTION 'initial compute epoch authority is invalid'
+                USING ERRCODE = '55000';
+        END IF;
+    ELSE
+        SELECT prior.inventory_scope_epoch_id, prior.authority_sequence,
+               epoch.retired_at
+        INTO previous_epoch_id, previous_sequence, previous_retired_at
+        FROM public.compute_metering_epoch_authorities AS prior
+        JOIN public.resource_inventory_scope_epochs AS epoch
+          ON epoch.id = prior.inventory_scope_epoch_id
+         AND epoch.scope_id = prior.inventory_scope_id
+        WHERE prior.id = NEW.previous_authority_id
+          AND prior.activation_key = NEW.activation_key
+          AND prior.inventory_scope_id = NEW.inventory_scope_id
+        FOR SHARE OF epoch;
+
+        WITH RECURSIVE lineage AS (
+            SELECT epoch.id, epoch.scope_id, epoch.recovery_from_epoch_id,
+                   ARRAY[epoch.id]::UUID[] AS path, 1 AS depth
+            FROM public.resource_inventory_scope_epochs AS epoch
+            WHERE epoch.id = NEW.inventory_scope_epoch_id
+              AND epoch.scope_id = NEW.inventory_scope_id
+            UNION ALL
+            SELECT predecessor.id, predecessor.scope_id,
+                   predecessor.recovery_from_epoch_id,
+                   lineage.path || predecessor.id,
+                   lineage.depth + 1
+            FROM lineage
+            JOIN public.resource_inventory_scope_epochs AS predecessor
+              ON predecessor.id = lineage.recovery_from_epoch_id
+             AND predecessor.scope_id = NEW.inventory_scope_id
+            WHERE lineage.depth < 10000
+              AND NOT predecessor.id = ANY(lineage.path)
+        )
+        SELECT EXISTS (
+            SELECT 1 FROM lineage WHERE id = previous_epoch_id
+        ) INTO lineage_reaches_prior;
+
+        IF activation_state IS DISTINCT FROM 'active'
+           OR activation_boundary IS NULL
+           OR statement_timestamp() < activation_boundary
+           OR request_kind IS DISTINCT FROM 'recovery-rollover'
+           OR previous_sequence IS NULL
+           OR NEW.authority_sequence <> previous_sequence + 1
+           OR epoch_recovery_from IS DISTINCT FROM NEW.predecessor_epoch_id
+           OR previous_retired_at IS NULL
+           OR previous_retired_at > NEW.effective_from
+           OR lineage_reaches_prior IS DISTINCT FROM TRUE
+           OR NEW.effective_from IS DISTINCT FROM request_promoted_at THEN
+            RAISE EXCEPTION 'compute recovery epoch lineage is invalid'
+                USING ERRCODE = '55000';
+        END IF;
+    END IF;
+
+    SELECT snapshot.item_count, snapshot.leader_generation,
+           snapshot.complete
+           AND snapshot.manifest_state = 'sealed'
+           AND epoch.last_complete_snapshot_id = snapshot.id
+    INTO snapshot_item_count, snapshot_generation, snapshot_is_proof
+    FROM public.resource_inventory_snapshots AS snapshot
+    JOIN public.resource_inventory_scope_epochs AS epoch
+      ON epoch.id = snapshot.scope_epoch_id
+     AND epoch.scope_id = snapshot.inventory_scope_id
+    WHERE snapshot.id = NEW.proof_snapshot_id
+      AND snapshot.scope_epoch_id = NEW.inventory_scope_epoch_id
+      AND snapshot.inventory_scope_id = NEW.inventory_scope_id
+    FOR SHARE OF epoch;
+
+    SELECT count(*)
+    INTO shadow_count
+    FROM public.compute_shadow_observations AS observation
+    WHERE observation.snapshot_id = NEW.proof_snapshot_id
+      AND observation.inventory_scope_id = NEW.inventory_scope_id
+      AND observation.activation_key = NEW.activation_key;
+
+    SELECT count(*)
+    INTO missing_shadow_count
+    FROM public.resource_inventory_snapshot_items AS item
+    WHERE item.snapshot_id = NEW.proof_snapshot_id
+      AND NOT EXISTS (
+          SELECT 1
+          FROM public.compute_shadow_observations AS observation
+          WHERE observation.snapshot_id = item.snapshot_id
+            AND observation.activation_key = NEW.activation_key
+            AND observation.source_kind = item.source_kind
+            AND observation.source_uid = item.source_uid
+      );
+
+    SELECT count(*)
+    INTO orphan_shadow_count
+    FROM public.compute_shadow_observations AS observation
+    WHERE observation.snapshot_id = NEW.proof_snapshot_id
+      AND observation.activation_key = NEW.activation_key
+      AND NOT EXISTS (
+          SELECT 1
+          FROM public.resource_inventory_snapshot_items AS item
+          WHERE item.snapshot_id = observation.snapshot_id
+            AND item.source_kind = observation.source_kind
+            AND item.source_uid = observation.source_uid
+      );
+
+    IF snapshot_is_proof IS DISTINCT FROM TRUE
+       OR snapshot_generation IS DISTINCT FROM NEW.proof_generation
+       OR current_generation IS DISTINCT FROM NEW.proof_generation
+       OR shadow_count IS DISTINCT FROM snapshot_item_count
+       OR missing_shadow_count <> 0
+       OR orphan_shadow_count <> 0 THEN
+        RAISE EXCEPTION
+            'compute epoch authority requires an exact item-for-item proof'
+            USING ERRCODE = '55000';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: protect_compute_metering_scope_requirement(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.protect_compute_metering_scope_requirement() RETURNS trigger
+    LANGUAGE plpgsql SECURITY DEFINER
+    SET search_path TO 'pg_catalog'
+    AS $$
+DECLARE
+    activation_state TEXT;
+    scope_resource   TEXT;
+    scope_namespace  TEXT;
+    epoch_is_current BOOLEAN;
+BEGIN
+    IF TG_OP <> 'INSERT' THEN
+        RAISE EXCEPTION 'compute scope requirements are immutable'
+            USING ERRCODE = '55000';
+    END IF;
+
+    SELECT activation.state, scope.api_resource, scope.namespace,
+           epoch.retired_at IS NULL
+    INTO activation_state, scope_resource, scope_namespace, epoch_is_current
+    FROM public.compute_metering_activation AS activation
+    JOIN public.resource_inventory_scopes AS scope
+      ON scope.id = NEW.inventory_scope_id
+     AND scope.collector_id = NEW.collector_id
+     AND scope.source_cluster = NEW.source_cluster
+    JOIN public.resource_inventory_scope_epochs AS epoch
+      ON epoch.id = NEW.inventory_scope_epoch_id
+     AND epoch.scope_id = scope.id
+    WHERE activation.activation_key = NEW.activation_key
+    FOR SHARE OF activation, epoch;
+
+    IF activation_state IS DISTINCT FROM 'shadow' THEN
+        RAISE EXCEPTION
+            'compute scope requirements can be added only while shadow'
+            USING ERRCODE = '55000';
+    END IF;
+    IF epoch_is_current IS DISTINCT FROM TRUE THEN
+        RAISE EXCEPTION
+            'compute scope requirement must name the exact current epoch'
+            USING ERRCODE = '55000';
+    END IF;
+    IF NEW.required_from <= statement_timestamp() THEN
+        RAISE EXCEPTION 'compute scope requirement boundary must be future'
+            USING ERRCODE = '55000';
+    END IF;
+    IF NOT (
+        (NEW.activation_key IN ('agent_pod', 'ide_workspace_pod')
+         AND NEW.collector_id = 'kubernetes-pods'
+         AND scope_resource = 'core/v1/pods'
+         AND scope_namespace IS NOT NULL)
+        OR (NEW.activation_key = 'workspace_vm'
+            AND NEW.collector_id = 'kubevirt-vmis'
+            AND scope_resource =
+                'kubevirt.io/v1/virtualmachineinstances'
+            AND scope_namespace IS NOT NULL)
+    ) THEN
+        RAISE EXCEPTION 'compute scope requirement does not match its class'
+            USING ERRCODE = '55000';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: protect_compute_shadow_observation_mutation(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.protect_compute_shadow_observation_mutation() RETURNS trigger
+    LANGUAGE plpgsql SECURITY DEFINER
+    SET search_path TO 'pg_catalog'
+    AS $$
+DECLARE
+    snapshot_state   TEXT;
+    activation_state TEXT;
+BEGIN
+    IF TG_OP IN ('UPDATE', 'DELETE') THEN
+        RAISE EXCEPTION 'compute shadow observations are immutable'
+            USING ERRCODE = '55000';
+    END IF;
+
+    SELECT snapshot.manifest_state
+    INTO snapshot_state
+    FROM public.resource_inventory_snapshots AS snapshot
+    JOIN public.resource_inventory_ingest_tickets AS ticket
+      ON ticket.id = snapshot.ingest_ticket_id
+    JOIN public.infra_metering_control AS control ON control.singleton = TRUE
+    WHERE snapshot.id = NEW.snapshot_id
+      AND snapshot.inventory_scope_id = NEW.inventory_scope_id
+      AND snapshot.leader_generation = control.leader_generation
+      AND ticket.bound_snapshot_id = snapshot.id
+      AND ticket.consumed_at IS NULL
+      AND ticket.expires_at > statement_timestamp();
+
+    SELECT activation.state
+    INTO activation_state
+    FROM public.compute_metering_activation AS activation
+    WHERE activation.activation_key = NEW.activation_key
+    FOR SHARE;
+
+    IF snapshot_state IS DISTINCT FROM 'staging'
+       OR activation_state NOT IN ('shadow', 'active') THEN
+        RAISE EXCEPTION 'compute shadow observation fence failed'
+            USING ERRCODE = '55000';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
 -- Name: protect_infra_metering_cutover_mutation(); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -648,6 +1805,35 @@ CREATE FUNCTION public.protect_infrastructure_storage_resource_mapping() RETURNS
 BEGIN
     RAISE EXCEPTION 'storage resource mappings are append-only'
         USING ERRCODE = '55000';
+END;
+$$;
+
+
+--
+-- Name: protect_inventory_epoch_recovery_identity(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.protect_inventory_epoch_recovery_identity() RETURNS trigger
+    LANGUAGE plpgsql SECURITY DEFINER
+    SET search_path TO 'pg_catalog'
+    AS $$
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        RAISE EXCEPTION 'inventory epochs cannot be deleted'
+            USING ERRCODE = '55000';
+    END IF;
+    IF NEW.id IS DISTINCT FROM OLD.id
+       OR NEW.scope_id IS DISTINCT FROM OLD.scope_id
+       OR NEW.epoch_number IS DISTINCT FROM OLD.epoch_number
+       OR NEW.coverage_mode IS DISTINCT FROM OLD.coverage_mode
+       OR NEW.capture_epoch IS DISTINCT FROM OLD.capture_epoch
+       OR NEW.recovery_from_epoch_id IS DISTINCT FROM OLD.recovery_from_epoch_id
+       OR NEW.require_after_recovery IS DISTINCT FROM OLD.require_after_recovery
+    THEN
+        RAISE EXCEPTION 'inventory epoch recovery identity is immutable'
+            USING ERRCODE = '55000';
+    END IF;
+    RETURN NEW;
 END;
 $$;
 
@@ -1728,6 +2914,238 @@ $$;
 
 
 --
+-- Name: protect_storage_metering_source_activation(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.protect_storage_metering_source_activation() RETURNS trigger
+    LANGUAGE plpgsql SECURITY DEFINER
+    SET search_path TO 'pg_catalog'
+    AS $$
+DECLARE
+    quantity_count     BIGINT;
+    attribution_count  BIGINT;
+    global_state       TEXT;
+    global_boundary    TIMESTAMPTZ;
+    claim_state        TEXT;
+    claim_boundary     TIMESTAMPTZ;
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        RAISE EXCEPTION 'storage source activation rows cannot be deleted'
+            USING ERRCODE = '55000';
+    ELSIF TG_OP = 'INSERT' THEN
+        IF NEW.state <> 'disabled' OR NEW.activated_at IS NOT NULL THEN
+            RAISE EXCEPTION 'storage source activation rows must begin disabled'
+                USING ERRCODE = '55000';
+        END IF;
+        RETURN NEW;
+    END IF;
+
+    IF NEW.measurement_basis IS DISTINCT FROM OLD.measurement_basis
+       OR NEW.collector_id IS DISTINCT FROM OLD.collector_id
+       OR NEW.source_cluster IS DISTINCT FROM OLD.source_cluster
+       OR NEW.created_at IS DISTINCT FROM OLD.created_at THEN
+        RAISE EXCEPTION 'storage source activation identity is immutable'
+            USING ERRCODE = '55000';
+    END IF;
+
+    IF OLD.state = 'disabled' AND NEW.state = 'shadow'
+       AND NEW.activated_at IS NULL THEN
+        SELECT
+            count(*) FILTER (WHERE requirement_role = 'quantity'),
+            count(*) FILTER (WHERE requirement_role = 'attribution')
+        INTO quantity_count, attribution_count
+        FROM public.storage_metering_source_requirements AS requirement
+        WHERE requirement.measurement_basis = OLD.measurement_basis
+          AND requirement.collector_id = OLD.collector_id
+          AND requirement.source_cluster = OLD.source_cluster;
+
+        IF quantity_count = 0
+           OR (OLD.measurement_basis = 'claim-requested'
+               AND attribution_count <> 0)
+           OR (OLD.measurement_basis = 'volume-provisioned'
+               AND attribution_count = 0) THEN
+            RAISE EXCEPTION
+                'storage source activation requires an exact scope set'
+                USING ERRCODE = '55000';
+        END IF;
+        NEW.updated_at := statement_timestamp();
+        RETURN NEW;
+    END IF;
+
+    IF OLD.state = 'shadow' AND NEW.state = 'active'
+       AND NEW.activated_at IS NOT NULL
+       AND NEW.activated_at = date_trunc('day', NEW.activated_at, 'UTC')
+       AND NEW.activated_at > statement_timestamp() THEN
+        SELECT activation.state, activation.activated_at
+        INTO global_state, global_boundary
+        FROM public.storage_metering_activation AS activation
+        WHERE activation.measurement_basis = OLD.measurement_basis
+        FOR SHARE;
+        IF global_state IS DISTINCT FROM 'active'
+           OR global_boundary IS NULL
+           OR global_boundary > NEW.activated_at THEN
+            RAISE EXCEPTION
+                'global storage basis must have an equal or earlier activation boundary'
+                USING ERRCODE = '55000';
+        END IF;
+
+        IF OLD.measurement_basis = 'volume-provisioned' THEN
+            SELECT activation.state, activation.activated_at
+            INTO claim_state, claim_boundary
+            FROM public.storage_metering_source_activations AS activation
+            WHERE activation.measurement_basis = 'claim-requested'
+              AND activation.collector_id = OLD.collector_id
+              AND activation.source_cluster = OLD.source_cluster
+            FOR SHARE;
+            IF claim_state IS DISTINCT FROM 'active'
+               OR claim_boundary IS NULL
+               OR claim_boundary > NEW.activated_at THEN
+                RAISE EXCEPTION
+                    'matching claim source must activate before volume source'
+                    USING ERRCODE = '55000';
+            END IF;
+
+            IF EXISTS (
+                (SELECT requirement.inventory_scope_id
+                 FROM public.storage_metering_source_requirements AS requirement
+                 WHERE requirement.measurement_basis = 'volume-provisioned'
+                   AND requirement.collector_id = OLD.collector_id
+                   AND requirement.source_cluster = OLD.source_cluster
+                   AND requirement.requirement_role = 'attribution')
+                EXCEPT
+                (SELECT requirement.inventory_scope_id
+                 FROM public.storage_metering_source_requirements AS requirement
+                 WHERE requirement.measurement_basis = 'claim-requested'
+                   AND requirement.collector_id = OLD.collector_id
+                   AND requirement.source_cluster = OLD.source_cluster
+                   AND requirement.requirement_role = 'quantity')
+            ) OR EXISTS (
+                (SELECT requirement.inventory_scope_id
+                 FROM public.storage_metering_source_requirements AS requirement
+                 WHERE requirement.measurement_basis = 'claim-requested'
+                   AND requirement.collector_id = OLD.collector_id
+                   AND requirement.source_cluster = OLD.source_cluster
+                   AND requirement.requirement_role = 'quantity')
+                EXCEPT
+                (SELECT requirement.inventory_scope_id
+                 FROM public.storage_metering_source_requirements AS requirement
+                 WHERE requirement.measurement_basis = 'volume-provisioned'
+                   AND requirement.collector_id = OLD.collector_id
+                   AND requirement.source_cluster = OLD.source_cluster
+                   AND requirement.requirement_role = 'attribution')
+            ) THEN
+                RAISE EXCEPTION
+                    'volume attribution requirements must exactly match claim quantity requirements'
+                    USING ERRCODE = '55000';
+            END IF;
+        END IF;
+
+        -- The runtime proves freshness and item identity before promotion.
+        -- This trigger independently requires that every frozen input was
+        -- promoted in the same transaction (or at an earlier boundary).
+        PERFORM epoch.id
+        FROM public.storage_metering_source_requirements AS requirement
+        JOIN public.resource_inventory_scope_epochs AS epoch
+          ON epoch.scope_id = requirement.inventory_scope_id
+         AND epoch.retired_at IS NULL
+        WHERE requirement.measurement_basis = OLD.measurement_basis
+          AND requirement.collector_id = OLD.collector_id
+          AND requirement.source_cluster = OLD.source_cluster
+        ORDER BY requirement.requirement_role,
+                 requirement.inventory_scope_id
+        FOR SHARE OF epoch;
+
+        IF EXISTS (
+            SELECT 1
+            FROM public.storage_metering_source_requirements AS requirement
+            LEFT JOIN public.resource_inventory_scope_epochs AS epoch
+              ON epoch.scope_id = requirement.inventory_scope_id
+             AND epoch.retired_at IS NULL
+            WHERE requirement.measurement_basis = OLD.measurement_basis
+              AND requirement.collector_id = OLD.collector_id
+              AND requirement.source_cluster = OLD.source_cluster
+              AND (epoch.id IS NULL
+                   OR NOT epoch.required_for_rollup
+                   OR epoch.required_from IS NULL
+                   OR epoch.required_from > NEW.activated_at)
+        ) THEN
+            RAISE EXCEPTION
+                'storage source activation requires every exact scope to be promoted'
+                USING ERRCODE = '55000';
+        END IF;
+
+        NEW.updated_at := statement_timestamp();
+        RETURN NEW;
+    END IF;
+
+    IF NEW.state IS NOT DISTINCT FROM OLD.state
+       AND NEW.activated_at IS NOT DISTINCT FROM OLD.activated_at
+       AND NEW.updated_at IS NOT DISTINCT FROM OLD.updated_at THEN
+        RETURN NEW;
+    END IF;
+
+    RAISE EXCEPTION
+        'storage source activation permits only disabled -> shadow -> future active'
+        USING ERRCODE = '55000';
+END;
+$$;
+
+
+--
+-- Name: protect_storage_metering_source_requirement(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.protect_storage_metering_source_requirement() RETURNS trigger
+    LANGUAGE plpgsql SECURITY DEFINER
+    SET search_path TO 'pg_catalog'
+    AS $$
+DECLARE
+    activation_state TEXT;
+    api_resource     TEXT;
+BEGIN
+    IF TG_OP <> 'INSERT' THEN
+        RAISE EXCEPTION 'storage source requirements are immutable'
+            USING ERRCODE = '55000';
+    END IF;
+
+    SELECT activation.state, scope.api_resource
+    INTO activation_state, api_resource
+    FROM public.storage_metering_source_activations AS activation
+    JOIN public.resource_inventory_scopes AS scope
+      ON scope.id = NEW.inventory_scope_id
+     AND scope.collector_id = activation.collector_id
+     AND scope.source_cluster = activation.source_cluster
+    WHERE activation.measurement_basis = NEW.measurement_basis
+      AND activation.collector_id = NEW.collector_id
+      AND activation.source_cluster = NEW.source_cluster
+    FOR SHARE OF activation;
+
+    IF activation_state IS DISTINCT FROM 'disabled' THEN
+        RAISE EXCEPTION
+            'storage source requirements can be added only while disabled'
+            USING ERRCODE = '55000';
+    END IF;
+
+    IF NOT (
+        (NEW.measurement_basis = 'claim-requested'
+            AND NEW.requirement_role = 'quantity'
+            AND api_resource = 'core/v1/persistentvolumeclaims')
+        OR (NEW.measurement_basis = 'volume-provisioned'
+            AND NEW.requirement_role = 'quantity'
+            AND api_resource = 'core/v1/persistentvolumes')
+        OR (NEW.measurement_basis = 'volume-provisioned'
+            AND NEW.requirement_role = 'attribution'
+            AND api_resource = 'core/v1/persistentvolumeclaims')
+    ) THEN
+        RAISE EXCEPTION 'storage source requirement role/resource mismatch'
+            USING ERRCODE = '55000';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
 -- Name: protect_storage_shadow_observation_mutation(); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -1736,8 +3154,9 @@ CREATE FUNCTION public.protect_storage_shadow_observation_mutation() RETURNS tri
     SET search_path TO 'pg_catalog'
     AS $$
 DECLARE
-    snapshot_state   TEXT;
-    activation_state TEXT;
+    snapshot_state TEXT;
+    global_state   TEXT;
+    source_state   TEXT;
 BEGIN
     IF TG_OP = 'DELETE' THEN
         SELECT snapshot.manifest_state INTO snapshot_state
@@ -1758,28 +3177,39 @@ BEGIN
             USING ERRCODE = '55000';
     END IF;
 
-    SELECT snapshot.manifest_state
-    INTO snapshot_state
+    SELECT snapshot.manifest_state,
+           global_activation.state, source_activation.state
+    INTO snapshot_state, global_state, source_state
     FROM public.resource_inventory_snapshots AS snapshot
     JOIN public.resource_inventory_ingest_tickets AS ticket
       ON ticket.id = snapshot.ingest_ticket_id
     JOIN public.infra_metering_control AS control ON control.singleton = TRUE
+    JOIN public.resource_inventory_scopes AS scope
+      ON scope.id = snapshot.inventory_scope_id
+    JOIN public.storage_metering_source_requirements AS requirement
+      ON requirement.inventory_scope_id = scope.id
+     AND requirement.measurement_basis = NEW.measurement_basis
+     AND requirement.collector_id = scope.collector_id
+     AND requirement.source_cluster = scope.source_cluster
+     AND requirement.requirement_role = 'quantity'
+    JOIN public.storage_metering_source_activations AS source_activation
+      ON source_activation.measurement_basis = requirement.measurement_basis
+     AND source_activation.collector_id = requirement.collector_id
+     AND source_activation.source_cluster = requirement.source_cluster
+    JOIN public.storage_metering_activation AS global_activation
+      ON global_activation.measurement_basis = requirement.measurement_basis
     WHERE snapshot.id = NEW.snapshot_id
       AND snapshot.inventory_scope_id = NEW.inventory_scope_id
       AND snapshot.leader_generation = control.leader_generation
       AND ticket.bound_snapshot_id = snapshot.id
       AND ticket.consumed_at IS NULL
-      AND ticket.expires_at > statement_timestamp();
-
-    SELECT activation.state
-    INTO activation_state
-    FROM public.storage_metering_activation AS activation
-    WHERE activation.measurement_basis = NEW.measurement_basis
-    FOR SHARE;
+      AND ticket.expires_at > statement_timestamp()
+    FOR SHARE OF source_activation, global_activation;
 
     IF snapshot_state IS DISTINCT FROM 'staging'
-       OR activation_state NOT IN ('shadow', 'active') THEN
-        RAISE EXCEPTION 'storage shadow observation fence failed'
+       OR global_state NOT IN ('shadow', 'active')
+       OR source_state NOT IN ('shadow', 'active') THEN
+        RAISE EXCEPTION 'storage shadow observation source fence failed'
             USING ERRCODE = '55000';
     END IF;
     RETURN NEW;
@@ -2038,6 +3468,62 @@ BEGIN
     RETURN COALESCE(NEW, OLD);
 END;
 $$;
+
+
+--
+-- Name: record_compute_authority_confirmation_gap(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.record_compute_authority_confirmation_gap() RETURNS trigger
+    LANGUAGE plpgsql SECURITY DEFINER
+    SET search_path TO 'pg_catalog'
+    AS $$
+DECLARE
+    authority_gap_start TIMESTAMPTZ;
+BEGIN
+    IF NEW.authority_sequence = 1 THEN
+        authority_gap_start := NEW.effective_from;
+    ELSE
+        SELECT epoch.retired_at
+        INTO authority_gap_start
+        FROM public.resource_inventory_scope_epochs AS epoch
+        WHERE epoch.id = NEW.predecessor_epoch_id
+          AND epoch.scope_id = NEW.inventory_scope_id
+        FOR SHARE;
+
+        IF authority_gap_start IS NULL THEN
+            RAISE EXCEPTION
+                'compute authority confirmation gap requires predecessor retirement'
+                USING ERRCODE = '55000';
+        END IF;
+    END IF;
+
+    INSERT INTO public.resource_inventory_coverage_gaps (
+        scope_epoch_id, gap_start, reason, resolution_details
+    ) VALUES (
+        NEW.inventory_scope_epoch_id,
+        authority_gap_start,
+        'compute-authority-awaiting-confirmation:' || NEW.activation_key,
+        pg_catalog.jsonb_build_object(
+            'code', 'compute-authority-awaiting-confirmation',
+            'activation_key', NEW.activation_key,
+            'authority_id', NEW.id,
+            'previous_authority_id', NEW.previous_authority_id,
+            'promotion_request_id', NEW.promotion_request_id,
+            'authority_effective_from', NEW.effective_from
+        )
+    );
+
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: FUNCTION record_compute_authority_confirmation_gap(); Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON FUNCTION public.record_compute_authority_confirmation_gap() IS 'Opens a fail-closed coverage gap until a post-authority complete LIST confirms exact interval binding.';
 
 
 --
@@ -2560,6 +4046,72 @@ $$;
 
 
 SET default_table_access_method = heap;
+
+--
+-- Name: agent_metering_binding_events; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.agent_metering_binding_events (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    agent_id uuid NOT NULL,
+    revision bigint NOT NULL,
+    agent_present boolean NOT NULL,
+    pod_uid text,
+    hostname text,
+    identity_state text NOT NULL,
+    attribution_scope text NOT NULL,
+    owner_kind text,
+    owner_id uuid,
+    user_id uuid,
+    project_id uuid,
+    reason_code text NOT NULL,
+    transition_source text NOT NULL,
+    effective_at timestamp with time zone NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT agent_metering_binding_events_attribution_check CHECK (((attribution_scope = ANY (ARRAY['customer'::text, 'shared-platform'::text, 'unknown'::text])) AND (((attribution_scope = 'customer'::text) AND agent_present AND (identity_state = 'valid'::text) AND (owner_kind = ANY (ARRAY['job'::text, 'thread'::text])) AND (owner_id IS NOT NULL) AND (user_id IS NOT NULL)) OR ((attribution_scope = 'shared-platform'::text) AND agent_present AND (identity_state = 'valid'::text) AND (owner_kind IS NULL) AND (owner_id IS NULL) AND (user_id IS NULL) AND (project_id IS NULL)) OR ((attribution_scope = 'unknown'::text) AND (owner_kind IS NULL) AND (owner_id IS NULL) AND (user_id IS NULL) AND (project_id IS NULL))))),
+    CONSTRAINT agent_metering_binding_events_identity_check CHECK (((revision > 0) AND ((pod_uid IS NULL) OR ((pod_uid <> ''::text) AND (length(pod_uid) <= 256))) AND ((hostname IS NULL) OR ((hostname <> ''::text) AND (length(hostname) <= 255))) AND (identity_state = ANY (ARRAY['valid'::text, 'missing'::text, 'duplicate'::text])) AND (reason_code ~ '^[a-z0-9][a-z0-9._-]{0,63}$'::text) AND (transition_source ~ '^[a-z0-9][a-z0-9._-]{0,63}$'::text)))
+);
+
+
+--
+-- Name: TABLE agent_metering_binding_events; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.agent_metering_binding_events IS 'Append-only revisions of mutually validated agent Pod identity and job/thread attribution.';
+
+
+--
+-- Name: agent_metering_pod_identity_state; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.agent_metering_pod_identity_state (
+    agent_id uuid NOT NULL,
+    agent_present boolean NOT NULL,
+    pod_uid text,
+    hostname text,
+    identity_state text NOT NULL,
+    attribution_scope text NOT NULL,
+    owner_kind text,
+    owner_id uuid,
+    user_id uuid,
+    project_id uuid,
+    reason_code text NOT NULL,
+    transition_source text NOT NULL,
+    revision bigint NOT NULL,
+    effective_at timestamp with time zone NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT agent_metering_pod_identity_state_attribution_check CHECK (((attribution_scope = ANY (ARRAY['customer'::text, 'shared-platform'::text, 'unknown'::text])) AND (((attribution_scope = 'customer'::text) AND agent_present AND (identity_state = 'valid'::text) AND (owner_kind = ANY (ARRAY['job'::text, 'thread'::text])) AND (owner_id IS NOT NULL) AND (user_id IS NOT NULL)) OR ((attribution_scope = 'shared-platform'::text) AND agent_present AND (identity_state = 'valid'::text) AND (owner_kind IS NULL) AND (owner_id IS NULL) AND (user_id IS NULL) AND (project_id IS NULL)) OR ((attribution_scope = 'unknown'::text) AND (owner_kind IS NULL) AND (owner_id IS NULL) AND (user_id IS NULL) AND (project_id IS NULL))))),
+    CONSTRAINT agent_metering_pod_identity_state_identity_check CHECK (((revision > 0) AND ((pod_uid IS NULL) OR ((pod_uid <> ''::text) AND (length(pod_uid) <= 256))) AND ((hostname IS NULL) OR ((hostname <> ''::text) AND (length(hostname) <= 255))) AND (identity_state = ANY (ARRAY['valid'::text, 'missing'::text, 'duplicate'::text])) AND (reason_code ~ '^[a-z0-9][a-z0-9._-]{0,63}$'::text) AND (transition_source ~ '^[a-z0-9][a-z0-9._-]{0,63}$'::text) AND ((agent_present AND (identity_state = ANY (ARRAY['valid'::text, 'duplicate'::text])) AND (pod_uid IS NOT NULL)) OR (agent_present AND (identity_state = 'missing'::text) AND (pod_uid IS NULL)) OR ((NOT agent_present) AND (identity_state = 'missing'::text)))))
+);
+
+
+--
+-- Name: TABLE agent_metering_pod_identity_state; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.agent_metering_pod_identity_state IS 'Current converged agent Pod identity and attribution head, including missing/duplicate ambiguity and deletion tombstones.';
+
 
 --
 -- Name: agents; Type: TABLE; Schema: public; Owner: -
@@ -3114,6 +4666,152 @@ COMMENT ON COLUMN public.cloud_ro_mounts.staged_at IS 'when the current epoch wa
 --
 
 COMMENT ON COLUMN public.cloud_ro_mounts.staged_summary IS 'manifest counts + content signature for the current epoch (entry lists live in S3); NULL when nothing staged';
+
+
+--
+-- Name: compute_metering_activation; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.compute_metering_activation (
+    activation_key text NOT NULL,
+    state text DEFAULT 'disabled'::text NOT NULL,
+    activated_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT compute_metering_activation_key_check CHECK ((activation_key = ANY (ARRAY['agent_pod'::text, 'ide_workspace_pod'::text, 'workspace_vm'::text]))),
+    CONSTRAINT compute_metering_activation_state_check CHECK ((((state = ANY (ARRAY['disabled'::text, 'shadow'::text])) AND (activated_at IS NULL)) OR ((state = 'active'::text) AND (activated_at IS NOT NULL) AND (activated_at = date_trunc('day'::text, activated_at, 'UTC'::text)))))
+);
+
+
+--
+-- Name: TABLE compute_metering_activation; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.compute_metering_activation IS 'Forward-only activation boundaries for agent Pods, IDE workspace Pods, and VMI compute.';
+
+
+--
+-- Name: compute_metering_epoch_authorities; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.compute_metering_epoch_authorities (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    activation_key text NOT NULL,
+    collector_id text NOT NULL,
+    source_cluster text NOT NULL,
+    inventory_scope_id uuid NOT NULL,
+    inventory_scope_epoch_id uuid NOT NULL,
+    previous_authority_id uuid,
+    predecessor_epoch_id uuid,
+    authority_sequence bigint NOT NULL,
+    effective_from timestamp with time zone NOT NULL,
+    proof_snapshot_id uuid NOT NULL,
+    proof_generation bigint NOT NULL,
+    promotion_request_id uuid NOT NULL,
+    created_at timestamp with time zone DEFAULT statement_timestamp() NOT NULL,
+    CONSTRAINT compute_epoch_authorities_sequence_check CHECK (((authority_sequence > 0) AND (proof_generation > 0) AND (((authority_sequence = 1) AND (previous_authority_id IS NULL) AND (predecessor_epoch_id IS NULL)) OR ((authority_sequence > 1) AND (previous_authority_id IS NOT NULL) AND (predecessor_epoch_id IS NOT NULL)))))
+);
+
+
+--
+-- Name: TABLE compute_metering_epoch_authorities; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.compute_metering_epoch_authorities IS 'Append-only per-class exact-epoch authority; effective end is the bound inventory epoch retired_at and gaps are never inherited.';
+
+
+--
+-- Name: compute_metering_epoch_promotion_requests; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.compute_metering_epoch_promotion_requests (
+    id uuid NOT NULL,
+    activation_key text NOT NULL,
+    request_kind text NOT NULL,
+    collector_id text NOT NULL,
+    source_cluster text NOT NULL,
+    request_digest text NOT NULL,
+    actor_id uuid NOT NULL,
+    audit_reason text NOT NULL,
+    promoted_at timestamp with time zone NOT NULL,
+    created_at timestamp with time zone DEFAULT statement_timestamp() NOT NULL,
+    CONSTRAINT compute_epoch_promotion_requests_identity_check CHECK (((collector_id ~ '^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$'::text) AND (source_cluster ~ '^[A-Za-z0-9][A-Za-z0-9._:-]{0,254}$'::text) AND (request_digest ~ '^[0-9a-f]{64}$'::text) AND ((length(btrim(audit_reason)) >= 1) AND (length(btrim(audit_reason)) <= 2048)) AND (promoted_at = created_at))),
+    CONSTRAINT compute_epoch_promotion_requests_kind_check CHECK ((request_kind = ANY (ARRAY['initial-activation'::text, 'recovery-rollover'::text])))
+);
+
+
+--
+-- Name: TABLE compute_metering_epoch_promotion_requests; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.compute_metering_epoch_promotion_requests IS 'Immutable fleet-admin idempotency and audit ledger for initial and recovery compute epoch promotion.';
+
+
+--
+-- Name: compute_metering_scope_requirements; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.compute_metering_scope_requirements (
+    activation_key text NOT NULL,
+    collector_id text NOT NULL,
+    source_cluster text NOT NULL,
+    inventory_scope_id uuid NOT NULL,
+    required_from timestamp with time zone NOT NULL,
+    created_at timestamp with time zone DEFAULT statement_timestamp() NOT NULL,
+    inventory_scope_epoch_id uuid NOT NULL,
+    CONSTRAINT compute_metering_scope_requirements_boundary_check CHECK ((required_from = date_trunc('day'::text, required_from, 'UTC'::text)))
+);
+
+
+--
+-- Name: TABLE compute_metering_scope_requirements; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.compute_metering_scope_requirements IS 'Immutable exact inventory scopes and per-class boundary proven when one Slice 3 compute class is activated.';
+
+
+--
+-- Name: COLUMN compute_metering_scope_requirements.inventory_scope_epoch_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.compute_metering_scope_requirements.inventory_scope_epoch_id IS 'Exact immutable inventory epoch whose class-specific shadow proof authorized this scope; epoch rollover fails closed in v1.';
+
+
+--
+-- Name: compute_shadow_observations; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.compute_shadow_observations (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    activation_key text NOT NULL,
+    snapshot_id uuid NOT NULL,
+    inventory_scope_id uuid NOT NULL,
+    source_kind text NOT NULL,
+    source_uid text NOT NULL,
+    resource text NOT NULL,
+    product_class text NOT NULL,
+    cpu_millicores bigint,
+    memory_bytes bigint,
+    attribution_scope text NOT NULL,
+    owner_kind text,
+    owner_id uuid,
+    user_id uuid,
+    project_id uuid,
+    disposition text NOT NULL,
+    reason_code text NOT NULL,
+    observed_at timestamp with time zone NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT compute_shadow_observations_attribution_check CHECK (((attribution_scope = ANY (ARRAY['customer'::text, 'shared-platform'::text, 'unknown'::text])) AND (((attribution_scope = 'customer'::text) AND (owner_kind = ANY (ARRAY['job'::text, 'thread'::text])) AND (owner_id IS NOT NULL) AND (user_id IS NOT NULL)) OR ((attribution_scope = 'shared-platform'::text) AND (owner_kind = 'platform'::text) AND (owner_id IS NULL) AND (user_id IS NULL) AND (project_id IS NULL)) OR ((attribution_scope = 'unknown'::text) AND (owner_kind IS NULL) AND (owner_id IS NULL) AND (user_id IS NULL) AND (project_id IS NULL))) AND (disposition = ANY (ARRAY['eligible-unpriced'::text, 'not-applicable'::text, 'invalid'::text, 'identity-ambiguous'::text])))),
+    CONSTRAINT compute_shadow_observations_capacity_check CHECK ((((cpu_millicores IS NULL) OR (cpu_millicores >= 0)) AND ((memory_bytes IS NULL) OR (memory_bytes >= 0)) AND (((disposition = 'eligible-unpriced'::text) AND (cpu_millicores IS NOT NULL) AND (memory_bytes IS NOT NULL)) OR (disposition <> 'eligible-unpriced'::text)))),
+    CONSTRAINT compute_shadow_observations_identity_check CHECK (((source_uid <> ''::text) AND (length(source_uid) <= 256) AND (resource <> ''::text) AND (length(resource) <= 128) AND (product_class ~ '^[a-z0-9][a-z0-9._-]{0,63}$'::text) AND (reason_code ~ '^[a-z0-9][a-z0-9._-]{0,63}$'::text) AND (((activation_key = 'agent_pod'::text) AND (source_kind = 'pod'::text) AND (resource = 'agent_pod'::text)) OR ((activation_key = 'ide_workspace_pod'::text) AND (source_kind = 'pod'::text) AND (resource = 'workspace_pod'::text) AND (product_class = 'ide-session'::text)) OR ((activation_key = 'workspace_vm'::text) AND (source_kind = 'vmi'::text) AND (resource = 'workspace_vm'::text)))))
+);
+
+
+--
+-- Name: TABLE compute_shadow_observations; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.compute_shadow_observations IS 'Immutable non-publishable per-item compute shadow classifications; no ledger relationship.';
 
 
 --
@@ -4217,8 +5915,10 @@ CREATE TABLE public.resource_intervals (
     details jsonb DEFAULT '{}'::jsonb NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    compute_scope_epoch_id uuid,
     CONSTRAINT resource_intervals_attribution_check CHECK ((((attribution_scope = 'customer'::text) AND (owner_kind IS NOT NULL) AND (owner_kind = ANY (ARRAY['job'::text, 'thread'::text])) AND (owner_id IS NOT NULL) AND (owner_id <> ''::text) AND (user_id IS NOT NULL) AND (attribution_quality = ANY (ARRAY['exact'::text, 'derived'::text]))) OR ((attribution_scope = 'shared-platform'::text) AND (user_id IS NULL) AND (project_id IS NULL) AND (attribution_quality = ANY (ARRAY['exact'::text, 'derived'::text]))) OR ((attribution_scope = 'unknown'::text) AND (user_id IS NULL) AND (project_id IS NULL) AND (attribution_quality = ANY (ARRAY['ambiguous'::text, 'unknown'::text]))))),
     CONSTRAINT resource_intervals_capacity_check CHECK (((revision_no > 0) AND ((cpu_millicores IS NULL) OR (cpu_millicores >= 0)) AND ((memory_bytes IS NULL) OR (memory_bytes >= 0)) AND ((storage_bytes IS NULL) OR (storage_bytes >= 0)) AND (((category = 'compute'::text) AND (cpu_millicores IS NOT NULL) AND (memory_bytes IS NOT NULL) AND (storage_bytes IS NULL)) OR ((category = 'storage'::text) AND (storage_bytes IS NOT NULL) AND (cpu_millicores IS NULL) AND (memory_bytes IS NULL))))),
+    CONSTRAINT resource_intervals_compute_scope_epoch_shape_check CHECK ((((((source_kind = 'pod'::text) AND (category = 'compute'::text) AND (resource = 'agent_pod'::text)) OR ((source_kind = 'pod'::text) AND (category = 'compute'::text) AND (resource = 'workspace_pod'::text) AND (COALESCE((details ->> 'product_class'::text), ''::text) = 'ide-session'::text)) OR ((source_kind = 'vmi'::text) AND (category = 'compute'::text) AND (resource = 'workspace_vm'::text))) AND (compute_scope_epoch_id IS NOT NULL)) OR ((NOT (((source_kind = 'pod'::text) AND (category = 'compute'::text) AND (resource = 'agent_pod'::text)) OR ((source_kind = 'pod'::text) AND (category = 'compute'::text) AND (resource = 'workspace_pod'::text) AND (COALESCE((details ->> 'product_class'::text), ''::text) = 'ide-session'::text)) OR ((source_kind = 'vmi'::text) AND (category = 'compute'::text) AND (resource = 'workspace_vm'::text)))) AND (compute_scope_epoch_id IS NULL)))),
     CONSTRAINT resource_intervals_cursor_check CHECK (((last_seen_at >= started_at) AND (last_confirmed_at >= started_at) AND (materialized_through >= started_at) AND (materialized_through <= COALESCE(ended_at, last_confirmed_at)))),
     CONSTRAINT resource_intervals_details_check CHECK ((jsonb_typeof(details) = 'object'::text)),
     CONSTRAINT resource_intervals_dimension_check CHECK (((source_kind = ANY (ARRAY['pod'::text, 'vmi'::text, 'pvc'::text, 'volume'::text])) AND (category = ANY (ARRAY['compute'::text, 'storage'::text])) AND (measurement_basis = ANY (ARRAY['scheduler-request'::text, 'guest-provisioned'::text, 'claim-requested'::text, 'volume-provisioned'::text])) AND (cost_domain = ANY (ARRAY['workload-allocation'::text, 'physical-asset'::text, 'idle'::text, 'overhead'::text])) AND (attribution_scope = ANY (ARRAY['customer'::text, 'shared-platform'::text, 'unknown'::text])) AND ((owner_kind IS NULL) OR (owner_kind = ANY (ARRAY['job'::text, 'thread'::text, 'platform'::text, 'unknown'::text]))) AND (((source_kind = 'pod'::text) AND (category = 'compute'::text) AND (measurement_basis = 'scheduler-request'::text) AND (resource_class = 'kubernetes-pod'::text) AND (cost_domain = 'workload-allocation'::text)) OR ((source_kind = 'vmi'::text) AND (category = 'compute'::text) AND (measurement_basis = 'guest-provisioned'::text) AND (resource_class = 'virtual-machine'::text) AND (cost_domain = 'workload-allocation'::text)) OR ((source_kind = 'pvc'::text) AND (category = 'storage'::text) AND (measurement_basis = 'claim-requested'::text) AND (resource_class = 'persistent-volume-claim'::text) AND (cost_domain = 'workload-allocation'::text)) OR ((source_kind = 'volume'::text) AND (category = 'storage'::text) AND (measurement_basis = 'volume-provisioned'::text) AND (resource_class = 'persistent-volume'::text) AND (cost_domain = 'physical-asset'::text))))),
@@ -4234,6 +5934,20 @@ CREATE TABLE public.resource_intervals (
 --
 
 COMMENT ON TABLE public.resource_intervals IS 'App-owned allocation interval revisions; immutable capacity/dimensions with mutable liveness/materialization cursor.';
+
+
+--
+-- Name: COLUMN resource_intervals.compute_scope_epoch_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.resource_intervals.compute_scope_epoch_id IS 'Exact promoted Slice 3 inventory epoch authorizing this immutable compute interval revision; NULL for every other resource class.';
+
+
+--
+-- Name: CONSTRAINT resource_intervals_compute_scope_epoch_shape_check ON resource_intervals; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON CONSTRAINT resource_intervals_compute_scope_epoch_shape_check ON public.resource_intervals IS 'Requires exact promoted compute epoch binding only for agent Pods, IDE Pods, and workspace VMIs; NULL product classes cannot bypass the shape.';
 
 
 --
@@ -4328,7 +6042,7 @@ CREATE TABLE public.resource_inventory_scope_epochs (
     CONSTRAINT resource_inventory_scope_epochs_number_check CHECK ((epoch_number > 0)),
     CONSTRAINT resource_inventory_scope_epochs_recovery_shape_check CHECK ((((recovery_from_epoch_id IS NULL) AND (NOT require_after_recovery)) OR ((recovery_from_epoch_id IS NOT NULL) AND (recovery_from_epoch_id <> id)))),
     CONSTRAINT resource_inventory_scope_epochs_requirement_check CHECK (((required_for_rollup AND (required_from IS NOT NULL) AND (reliable_from IS NOT NULL) AND (required_from >= reliable_from)) OR ((NOT required_for_rollup) AND (required_from IS NULL)))),
-    CONSTRAINT resource_inventory_scope_epochs_retirement_check CHECK (((retired_at IS NULL) OR (((reliable_from IS NULL) OR (retired_at >= reliable_from)) AND ((required_from IS NULL) OR (retired_at > required_from)) AND ((continuous_since IS NULL) OR (retired_at >= continuous_since)) AND ((complete_through IS NULL) OR (retired_at >= complete_through)))))
+    CONSTRAINT resource_inventory_scope_epochs_retirement_check CHECK (((retired_at IS NULL) OR (((reliable_from IS NULL) OR (retired_at >= reliable_from)) AND ((continuous_since IS NULL) OR (retired_at >= continuous_since)) AND ((complete_through IS NULL) OR (retired_at >= complete_through)))))
 );
 
 
@@ -4966,6 +6680,52 @@ CREATE TABLE public.storage_metering_activation (
 --
 
 COMMENT ON TABLE public.storage_metering_activation IS 'Forward-only per-basis shadow/activation boundary; storage intervals are database-clamped to activated_at.';
+
+
+--
+-- Name: storage_metering_source_activations; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.storage_metering_source_activations (
+    measurement_basis text NOT NULL,
+    collector_id text NOT NULL,
+    source_cluster text NOT NULL,
+    state text DEFAULT 'disabled'::text NOT NULL,
+    activated_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT statement_timestamp() NOT NULL,
+    updated_at timestamp with time zone DEFAULT statement_timestamp() NOT NULL,
+    CONSTRAINT storage_metering_source_activations_identity_check CHECK (((measurement_basis = ANY (ARRAY['claim-requested'::text, 'volume-provisioned'::text])) AND (collector_id ~ '^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$'::text) AND (source_cluster ~ '^[A-Za-z0-9][A-Za-z0-9._:-]{0,254}$'::text))),
+    CONSTRAINT storage_metering_source_activations_state_check CHECK ((((state = ANY (ARRAY['disabled'::text, 'shadow'::text])) AND (activated_at IS NULL)) OR ((state = 'active'::text) AND (activated_at IS NOT NULL) AND (activated_at = date_trunc('day'::text, activated_at, 'UTC'::text)))))
+);
+
+
+--
+-- Name: TABLE storage_metering_source_activations; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.storage_metering_source_activations IS 'Forward-only storage boundary for one measurement basis, collector, and source cluster; the per-basis activation remains the global master.';
+
+
+--
+-- Name: storage_metering_source_requirements; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.storage_metering_source_requirements (
+    measurement_basis text NOT NULL,
+    collector_id text NOT NULL,
+    source_cluster text NOT NULL,
+    inventory_scope_id uuid NOT NULL,
+    requirement_role text NOT NULL,
+    created_at timestamp with time zone DEFAULT statement_timestamp() NOT NULL,
+    CONSTRAINT storage_metering_source_requirements_role_check CHECK ((requirement_role = ANY (ARRAY['quantity'::text, 'attribution'::text])))
+);
+
+
+--
+-- Name: TABLE storage_metering_source_requirements; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.storage_metering_source_requirements IS 'Immutable exact quantity/attribution inventory-scope set frozen when a storage source enters shadow.';
 
 
 --
@@ -5979,6 +7739,30 @@ ALTER TABLE ONLY public.workspace_intervals ALTER COLUMN id SET DEFAULT nextval(
 
 
 --
+-- Name: agent_metering_binding_events agent_metering_binding_events_agent_revision_uq; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.agent_metering_binding_events
+    ADD CONSTRAINT agent_metering_binding_events_agent_revision_uq UNIQUE (agent_id, revision);
+
+
+--
+-- Name: agent_metering_binding_events agent_metering_binding_events_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.agent_metering_binding_events
+    ADD CONSTRAINT agent_metering_binding_events_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: agent_metering_pod_identity_state agent_metering_pod_identity_state_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.agent_metering_pod_identity_state
+    ADD CONSTRAINT agent_metering_pod_identity_state_pkey PRIMARY KEY (agent_id);
+
+
+--
 -- Name: agents agents_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -6064,6 +7848,94 @@ ALTER TABLE ONLY public.capability_grants
 
 ALTER TABLE ONLY public.cloud_ro_mounts
     ADD CONSTRAINT cloud_ro_mounts_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: compute_metering_epoch_authorities compute_epoch_authorities_epoch_uq; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.compute_metering_epoch_authorities
+    ADD CONSTRAINT compute_epoch_authorities_epoch_uq UNIQUE (activation_key, inventory_scope_id, inventory_scope_epoch_id);
+
+
+--
+-- Name: compute_metering_epoch_authorities compute_epoch_authorities_id_scope_uq; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.compute_metering_epoch_authorities
+    ADD CONSTRAINT compute_epoch_authorities_id_scope_uq UNIQUE (id, activation_key, inventory_scope_id);
+
+
+--
+-- Name: compute_metering_epoch_authorities compute_epoch_authorities_request_scope_uq; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.compute_metering_epoch_authorities
+    ADD CONSTRAINT compute_epoch_authorities_request_scope_uq UNIQUE (promotion_request_id, inventory_scope_id);
+
+
+--
+-- Name: compute_metering_epoch_authorities compute_epoch_authorities_sequence_uq; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.compute_metering_epoch_authorities
+    ADD CONSTRAINT compute_epoch_authorities_sequence_uq UNIQUE (activation_key, inventory_scope_id, authority_sequence);
+
+
+--
+-- Name: compute_metering_activation compute_metering_activation_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.compute_metering_activation
+    ADD CONSTRAINT compute_metering_activation_pkey PRIMARY KEY (activation_key);
+
+
+--
+-- Name: compute_metering_epoch_authorities compute_metering_epoch_authorities_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.compute_metering_epoch_authorities
+    ADD CONSTRAINT compute_metering_epoch_authorities_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: compute_metering_epoch_promotion_requests compute_metering_epoch_promotion_requests_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.compute_metering_epoch_promotion_requests
+    ADD CONSTRAINT compute_metering_epoch_promotion_requests_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: compute_metering_scope_requirements compute_metering_scope_requirements_epoch_uq; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.compute_metering_scope_requirements
+    ADD CONSTRAINT compute_metering_scope_requirements_epoch_uq UNIQUE (activation_key, inventory_scope_epoch_id);
+
+
+--
+-- Name: compute_metering_scope_requirements compute_metering_scope_requirements_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.compute_metering_scope_requirements
+    ADD CONSTRAINT compute_metering_scope_requirements_pkey PRIMARY KEY (activation_key, inventory_scope_id);
+
+
+--
+-- Name: compute_shadow_observations compute_shadow_observations_item_uq; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.compute_shadow_observations
+    ADD CONSTRAINT compute_shadow_observations_item_uq UNIQUE (snapshot_id, activation_key, source_kind, source_uid);
+
+
+--
+-- Name: compute_shadow_observations compute_shadow_observations_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.compute_shadow_observations
+    ADD CONSTRAINT compute_shadow_observations_pkey PRIMARY KEY (id);
 
 
 --
@@ -6507,6 +8379,14 @@ ALTER TABLE ONLY public.resource_inventory_scopes
 
 
 --
+-- Name: resource_inventory_scopes resource_inventory_scopes_source_identity_uq; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.resource_inventory_scopes
+    ADD CONSTRAINT resource_inventory_scopes_source_identity_uq UNIQUE (id, collector_id, source_cluster);
+
+
+--
 -- Name: resource_inventory_shadow_comparisons resource_inventory_shadow_comparisons_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -6792,6 +8672,22 @@ ALTER TABLE ONLY public.storage_identity_key_state
 
 ALTER TABLE ONLY public.storage_metering_activation
     ADD CONSTRAINT storage_metering_activation_pkey PRIMARY KEY (measurement_basis);
+
+
+--
+-- Name: storage_metering_source_activations storage_metering_source_activations_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.storage_metering_source_activations
+    ADD CONSTRAINT storage_metering_source_activations_pkey PRIMARY KEY (measurement_basis, collector_id, source_cluster);
+
+
+--
+-- Name: storage_metering_source_requirements storage_metering_source_requirements_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.storage_metering_source_requirements
+    ADD CONSTRAINT storage_metering_source_requirements_pkey PRIMARY KEY (measurement_basis, collector_id, source_cluster, inventory_scope_id, requirement_role);
 
 
 --
@@ -7131,6 +9027,34 @@ ALTER TABLE ONLY public.workspace_intervals
 
 
 --
+-- Name: agent_metering_binding_events_owner_time_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX agent_metering_binding_events_owner_time_idx ON public.agent_metering_binding_events USING btree (owner_kind, owner_id, effective_at, id) WHERE (attribution_scope = 'customer'::text);
+
+
+--
+-- Name: agent_metering_binding_events_pod_time_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX agent_metering_binding_events_pod_time_idx ON public.agent_metering_binding_events USING btree (pod_uid, effective_at, id) WHERE (pod_uid IS NOT NULL);
+
+
+--
+-- Name: agent_metering_pod_identity_state_owner_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX agent_metering_pod_identity_state_owner_idx ON public.agent_metering_pod_identity_state USING btree (owner_kind, owner_id) WHERE (attribution_scope = 'customer'::text);
+
+
+--
+-- Name: agent_metering_pod_identity_state_pod_uid_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX agent_metering_pod_identity_state_pod_uid_idx ON public.agent_metering_pod_identity_state USING btree (pod_uid, agent_id) WHERE (agent_present AND (pod_uid IS NOT NULL));
+
+
+--
 -- Name: cloud_ro_mounts_status_idx; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -7149,6 +9073,55 @@ CREATE UNIQUE INDEX cloud_ro_mounts_thread_idx ON public.cloud_ro_mounts USING b
 --
 
 CREATE INDEX cloud_ro_mounts_user_idx ON public.cloud_ro_mounts USING btree (user_id);
+
+
+--
+-- Name: compute_epoch_authorities_current_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX compute_epoch_authorities_current_idx ON public.compute_metering_epoch_authorities USING btree (activation_key, inventory_scope_id, authority_sequence DESC);
+
+
+--
+-- Name: compute_epoch_authorities_epoch_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX compute_epoch_authorities_epoch_idx ON public.compute_metering_epoch_authorities USING btree (inventory_scope_epoch_id, activation_key, effective_from);
+
+
+--
+-- Name: compute_epoch_promotion_requests_activation_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX compute_epoch_promotion_requests_activation_idx ON public.compute_metering_epoch_promotion_requests USING btree (activation_key, promoted_at DESC, id);
+
+
+--
+-- Name: compute_metering_scope_requirements_epoch_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX compute_metering_scope_requirements_epoch_idx ON public.compute_metering_scope_requirements USING btree (inventory_scope_epoch_id, activation_key, required_from);
+
+
+--
+-- Name: compute_metering_scope_requirements_scope_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX compute_metering_scope_requirements_scope_idx ON public.compute_metering_scope_requirements USING btree (inventory_scope_id, activation_key, required_from);
+
+
+--
+-- Name: compute_shadow_observations_latest_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX compute_shadow_observations_latest_idx ON public.compute_shadow_observations USING btree (activation_key, inventory_scope_id, source_kind, source_uid, observed_at DESC);
+
+
+--
+-- Name: compute_shadow_observations_retention_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX compute_shadow_observations_retention_idx ON public.compute_shadow_observations USING btree (observed_at, id);
 
 
 --
@@ -7929,6 +9902,13 @@ CREATE INDEX legacy_workspace_cutover_plans_pending_idx ON public.legacy_workspa
 
 
 --
+-- Name: resource_intervals_compute_scope_epoch_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX resource_intervals_compute_scope_epoch_idx ON public.resource_intervals USING btree (compute_scope_epoch_id, started_at, id) WHERE (compute_scope_epoch_id IS NOT NULL);
+
+
+--
 -- Name: resource_intervals_materializer_idx; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -8171,6 +10151,13 @@ CREATE UNIQUE INDEX storage_asset_coverage_gaps_open_uq ON public.storage_asset_
 --
 
 CREATE INDEX storage_asset_coverage_gaps_range_idx ON public.storage_asset_coverage_gaps USING btree (asset_id, gap_start, gap_end, id);
+
+
+--
+-- Name: storage_metering_source_requirements_scope_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX storage_metering_source_requirements_scope_idx ON public.storage_metering_source_requirements USING btree (inventory_scope_id, measurement_basis, requirement_role);
 
 
 --
@@ -8440,6 +10427,132 @@ CREATE INDEX workspace_intervals_pending_idx ON public.workspace_intervals USING
 
 
 --
+-- Name: agents agent_metering_agents_delete; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER agent_metering_agents_delete AFTER DELETE ON public.agents FOR EACH ROW EXECUTE FUNCTION public.converge_agent_metering_from_agent_row();
+
+
+--
+-- Name: agents agent_metering_agents_insert; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER agent_metering_agents_insert AFTER INSERT ON public.agents FOR EACH ROW EXECUTE FUNCTION public.converge_agent_metering_from_agent_row();
+
+
+--
+-- Name: agents agent_metering_agents_update; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER agent_metering_agents_update AFTER UPDATE OF pod_uid, hostname, current_job_id, thread_id ON public.agents FOR EACH ROW EXECUTE FUNCTION public.converge_agent_metering_from_agent_row();
+
+
+--
+-- Name: agent_metering_binding_events agent_metering_binding_events_append_only; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER agent_metering_binding_events_append_only BEFORE DELETE OR UPDATE ON public.agent_metering_binding_events FOR EACH ROW EXECUTE FUNCTION public.protect_agent_metering_binding_event_mutation();
+
+
+--
+-- Name: jobs agent_metering_jobs_delete; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER agent_metering_jobs_delete AFTER DELETE ON public.jobs FOR EACH ROW EXECUTE FUNCTION public.converge_agent_metering_from_job_row();
+
+
+--
+-- Name: jobs agent_metering_jobs_insert; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER agent_metering_jobs_insert AFTER INSERT ON public.jobs FOR EACH ROW EXECUTE FUNCTION public.converge_agent_metering_from_job_row();
+
+
+--
+-- Name: jobs agent_metering_jobs_update; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER agent_metering_jobs_update AFTER UPDATE OF status, assigned_agent_id, user_id, project_id ON public.jobs FOR EACH ROW EXECUTE FUNCTION public.converge_agent_metering_from_job_row();
+
+
+--
+-- Name: agent_metering_pod_identity_state agent_metering_pod_identity_state_journal; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER agent_metering_pod_identity_state_journal AFTER INSERT OR UPDATE ON public.agent_metering_pod_identity_state FOR EACH ROW EXECUTE FUNCTION public.append_agent_metering_binding_event();
+
+
+--
+-- Name: agent_metering_pod_identity_state agent_metering_pod_identity_state_one_way; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER agent_metering_pod_identity_state_one_way BEFORE INSERT OR DELETE OR UPDATE ON public.agent_metering_pod_identity_state FOR EACH ROW EXECUTE FUNCTION public.protect_agent_metering_identity_state_mutation();
+
+
+--
+-- Name: threads agent_metering_threads_delete; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER agent_metering_threads_delete AFTER DELETE ON public.threads FOR EACH ROW EXECUTE FUNCTION public.converge_agent_metering_from_thread_row();
+
+
+--
+-- Name: threads agent_metering_threads_insert; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER agent_metering_threads_insert AFTER INSERT ON public.threads FOR EACH ROW EXECUTE FUNCTION public.converge_agent_metering_from_thread_row();
+
+
+--
+-- Name: threads agent_metering_threads_update; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER agent_metering_threads_update AFTER UPDATE OF status, agent_id, user_id, project_id ON public.threads FOR EACH ROW EXECUTE FUNCTION public.converge_agent_metering_from_thread_row();
+
+
+--
+-- Name: compute_metering_epoch_authorities compute_epoch_authority_confirmation_gap; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER compute_epoch_authority_confirmation_gap AFTER INSERT ON public.compute_metering_epoch_authorities FOR EACH ROW EXECUTE FUNCTION public.record_compute_authority_confirmation_gap();
+
+
+--
+-- Name: compute_metering_epoch_promotion_requests compute_epoch_promotion_requests_immutable; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER compute_epoch_promotion_requests_immutable BEFORE INSERT OR DELETE OR UPDATE ON public.compute_metering_epoch_promotion_requests FOR EACH ROW EXECUTE FUNCTION public.protect_compute_epoch_promotion_request();
+
+
+--
+-- Name: compute_metering_activation compute_metering_activation_one_way; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER compute_metering_activation_one_way BEFORE INSERT OR DELETE OR UPDATE ON public.compute_metering_activation FOR EACH ROW EXECUTE FUNCTION public.protect_compute_metering_activation();
+
+
+--
+-- Name: compute_metering_epoch_authorities compute_metering_epoch_authorities_immutable; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER compute_metering_epoch_authorities_immutable BEFORE INSERT OR DELETE OR UPDATE ON public.compute_metering_epoch_authorities FOR EACH ROW EXECUTE FUNCTION public.protect_compute_metering_epoch_authority();
+
+
+--
+-- Name: compute_metering_scope_requirements compute_metering_scope_requirements_immutable; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER compute_metering_scope_requirements_immutable BEFORE INSERT OR DELETE OR UPDATE ON public.compute_metering_scope_requirements FOR EACH ROW EXECUTE FUNCTION public.protect_compute_metering_scope_requirement();
+
+
+--
+-- Name: compute_shadow_observations compute_shadow_observations_immutable; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER compute_shadow_observations_immutable BEFORE INSERT OR DELETE OR UPDATE ON public.compute_shadow_observations FOR EACH ROW EXECUTE FUNCTION public.protect_compute_shadow_observation_mutation();
+
+
+--
 -- Name: project_datasources datasource_project_policy_change; Type: TRIGGER; Schema: public; Owner: -
 --
 
@@ -8510,6 +10623,13 @@ CREATE TRIGGER legacy_workspace_cutover_plans_frozen BEFORE DELETE OR UPDATE ON 
 
 
 --
+-- Name: resource_intervals resource_intervals_compute_epoch_authority_guard; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER resource_intervals_compute_epoch_authority_guard BEFORE INSERT OR UPDATE ON public.resource_intervals FOR EACH ROW EXECUTE FUNCTION public.enforce_resource_interval_compute_epoch_authority();
+
+
+--
 -- Name: resource_intervals resource_intervals_cutover_serialization; Type: TRIGGER; Schema: public; Owner: -
 --
 
@@ -8542,6 +10662,20 @@ CREATE TRIGGER resource_intervals_snapshot_end_single_boundary_guard BEFORE UPDA
 --
 
 CREATE TRIGGER resource_intervals_storage_activation_guard BEFORE INSERT ON public.resource_intervals FOR EACH ROW EXECUTE FUNCTION public.enforce_resource_interval_storage_activation();
+
+
+--
+-- Name: resource_inventory_scope_epochs resource_inventory_epochs_compute_retirement; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER resource_inventory_epochs_compute_retirement BEFORE UPDATE OF retired_at ON public.resource_inventory_scope_epochs FOR EACH ROW EXECUTE FUNCTION public.close_compute_intervals_at_epoch_retirement();
+
+
+--
+-- Name: resource_inventory_scope_epochs resource_inventory_epochs_recovery_identity_immutable; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER resource_inventory_epochs_recovery_identity_immutable BEFORE DELETE OR UPDATE ON public.resource_inventory_scope_epochs FOR EACH ROW EXECUTE FUNCTION public.protect_inventory_epoch_recovery_identity();
 
 
 --
@@ -8724,6 +10858,20 @@ CREATE TRIGGER storage_identity_key_state_immutable BEFORE DELETE OR UPDATE ON p
 --
 
 CREATE TRIGGER storage_metering_activation_one_way BEFORE INSERT OR DELETE OR UPDATE ON public.storage_metering_activation FOR EACH ROW EXECUTE FUNCTION public.protect_storage_metering_activation();
+
+
+--
+-- Name: storage_metering_source_activations storage_metering_source_activations_one_way; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER storage_metering_source_activations_one_way BEFORE INSERT OR DELETE OR UPDATE ON public.storage_metering_source_activations FOR EACH ROW EXECUTE FUNCTION public.protect_storage_metering_source_activation();
+
+
+--
+-- Name: storage_metering_source_requirements storage_metering_source_requirements_immutable; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER storage_metering_source_requirements_immutable BEFORE INSERT OR DELETE OR UPDATE ON public.storage_metering_source_requirements FOR EACH ROW EXECUTE FUNCTION public.protect_storage_metering_source_requirement();
 
 
 --
@@ -9038,6 +11186,118 @@ ALTER TABLE ONLY public.canvases
 
 ALTER TABLE ONLY public.capability_grants
     ADD CONSTRAINT capability_grants_granted_by_fkey FOREIGN KEY (granted_by) REFERENCES public.users(id) ON DELETE SET NULL;
+
+
+--
+-- Name: compute_metering_epoch_authorities compute_epoch_authorities_epoch_scope_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.compute_metering_epoch_authorities
+    ADD CONSTRAINT compute_epoch_authorities_epoch_scope_fkey FOREIGN KEY (inventory_scope_epoch_id, inventory_scope_id) REFERENCES public.resource_inventory_scope_epochs(id, scope_id) ON DELETE RESTRICT;
+
+
+--
+-- Name: compute_metering_epoch_authorities compute_epoch_authorities_predecessor_scope_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.compute_metering_epoch_authorities
+    ADD CONSTRAINT compute_epoch_authorities_predecessor_scope_fkey FOREIGN KEY (predecessor_epoch_id, inventory_scope_id) REFERENCES public.resource_inventory_scope_epochs(id, scope_id) ON DELETE RESTRICT;
+
+
+--
+-- Name: compute_metering_epoch_authorities compute_epoch_authorities_previous_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.compute_metering_epoch_authorities
+    ADD CONSTRAINT compute_epoch_authorities_previous_fkey FOREIGN KEY (previous_authority_id, activation_key, inventory_scope_id) REFERENCES public.compute_metering_epoch_authorities(id, activation_key, inventory_scope_id) ON DELETE RESTRICT;
+
+
+--
+-- Name: compute_metering_epoch_authorities compute_epoch_authorities_proof_epoch_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.compute_metering_epoch_authorities
+    ADD CONSTRAINT compute_epoch_authorities_proof_epoch_fkey FOREIGN KEY (proof_snapshot_id, inventory_scope_epoch_id) REFERENCES public.resource_inventory_snapshots(id, scope_epoch_id) ON DELETE RESTRICT;
+
+
+--
+-- Name: compute_metering_epoch_authorities compute_epoch_authorities_proof_scope_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.compute_metering_epoch_authorities
+    ADD CONSTRAINT compute_epoch_authorities_proof_scope_fkey FOREIGN KEY (proof_snapshot_id, inventory_scope_id) REFERENCES public.resource_inventory_snapshots(id, inventory_scope_id) ON DELETE RESTRICT;
+
+
+--
+-- Name: compute_metering_epoch_authorities compute_epoch_authorities_scope_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.compute_metering_epoch_authorities
+    ADD CONSTRAINT compute_epoch_authorities_scope_fkey FOREIGN KEY (inventory_scope_id, collector_id, source_cluster) REFERENCES public.resource_inventory_scopes(id, collector_id, source_cluster) ON DELETE RESTRICT;
+
+
+--
+-- Name: compute_metering_epoch_authorities compute_metering_epoch_authorities_activation_key_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.compute_metering_epoch_authorities
+    ADD CONSTRAINT compute_metering_epoch_authorities_activation_key_fkey FOREIGN KEY (activation_key) REFERENCES public.compute_metering_activation(activation_key) ON DELETE RESTRICT;
+
+
+--
+-- Name: compute_metering_epoch_authorities compute_metering_epoch_authorities_promotion_request_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.compute_metering_epoch_authorities
+    ADD CONSTRAINT compute_metering_epoch_authorities_promotion_request_id_fkey FOREIGN KEY (promotion_request_id) REFERENCES public.compute_metering_epoch_promotion_requests(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: compute_metering_epoch_promotion_requests compute_metering_epoch_promotion_requests_activation_key_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.compute_metering_epoch_promotion_requests
+    ADD CONSTRAINT compute_metering_epoch_promotion_requests_activation_key_fkey FOREIGN KEY (activation_key) REFERENCES public.compute_metering_activation(activation_key) ON DELETE RESTRICT;
+
+
+--
+-- Name: compute_metering_scope_requirements compute_metering_scope_requirements_activation_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.compute_metering_scope_requirements
+    ADD CONSTRAINT compute_metering_scope_requirements_activation_fkey FOREIGN KEY (activation_key) REFERENCES public.compute_metering_activation(activation_key) ON DELETE RESTRICT;
+
+
+--
+-- Name: compute_metering_scope_requirements compute_metering_scope_requirements_epoch_scope_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.compute_metering_scope_requirements
+    ADD CONSTRAINT compute_metering_scope_requirements_epoch_scope_fkey FOREIGN KEY (inventory_scope_epoch_id, inventory_scope_id) REFERENCES public.resource_inventory_scope_epochs(id, scope_id) ON DELETE RESTRICT;
+
+
+--
+-- Name: compute_metering_scope_requirements compute_metering_scope_requirements_scope_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.compute_metering_scope_requirements
+    ADD CONSTRAINT compute_metering_scope_requirements_scope_fkey FOREIGN KEY (inventory_scope_id, collector_id, source_cluster) REFERENCES public.resource_inventory_scopes(id, collector_id, source_cluster) ON DELETE RESTRICT;
+
+
+--
+-- Name: compute_shadow_observations compute_shadow_observations_activation_key_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.compute_shadow_observations
+    ADD CONSTRAINT compute_shadow_observations_activation_key_fkey FOREIGN KEY (activation_key) REFERENCES public.compute_metering_activation(activation_key) ON DELETE RESTRICT;
+
+
+--
+-- Name: compute_shadow_observations compute_shadow_observations_snapshot_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.compute_shadow_observations
+    ADD CONSTRAINT compute_shadow_observations_snapshot_fkey FOREIGN KEY (snapshot_id, inventory_scope_id) REFERENCES public.resource_inventory_snapshots(id, inventory_scope_id) ON DELETE RESTRICT;
 
 
 --
@@ -9449,6 +11709,14 @@ ALTER TABLE ONLY public.config_overrides
 
 
 --
+-- Name: resource_intervals resource_intervals_compute_scope_epoch_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.resource_intervals
+    ADD CONSTRAINT resource_intervals_compute_scope_epoch_fkey FOREIGN KEY (compute_scope_epoch_id, inventory_scope_id) REFERENCES public.resource_inventory_scope_epochs(id, scope_id) ON DELETE RESTRICT;
+
+
+--
 -- Name: resource_intervals resource_intervals_inventory_scope_cluster_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -9694,6 +11962,30 @@ ALTER TABLE ONLY public.storage_asset_coverage_gaps
 
 ALTER TABLE ONLY public.storage_backend_assertions
     ADD CONSTRAINT storage_backend_assertions_asset_id_fkey FOREIGN KEY (asset_id) REFERENCES public.storage_volume_assets(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: storage_metering_source_activations storage_metering_source_activations_measurement_basis_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.storage_metering_source_activations
+    ADD CONSTRAINT storage_metering_source_activations_measurement_basis_fkey FOREIGN KEY (measurement_basis) REFERENCES public.storage_metering_activation(measurement_basis) ON DELETE RESTRICT;
+
+
+--
+-- Name: storage_metering_source_requirements storage_metering_source_requirements_activation_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.storage_metering_source_requirements
+    ADD CONSTRAINT storage_metering_source_requirements_activation_fkey FOREIGN KEY (measurement_basis, collector_id, source_cluster) REFERENCES public.storage_metering_source_activations(measurement_basis, collector_id, source_cluster) ON DELETE RESTRICT;
+
+
+--
+-- Name: storage_metering_source_requirements storage_metering_source_requirements_scope_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.storage_metering_source_requirements
+    ADD CONSTRAINT storage_metering_source_requirements_scope_fkey FOREIGN KEY (inventory_scope_id, collector_id, source_cluster) REFERENCES public.resource_inventory_scopes(id, collector_id, source_cluster) ON DELETE RESTRICT;
 
 
 --
