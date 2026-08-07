@@ -43,6 +43,8 @@ and no log line saying a verdict was lost.
 (a round counter resetting). The actual defect is broader; the name is kept
 because other docs and memory link to it.
 
+**Test coverage:** `tests/verification_delivery_test_coverage.md`.
+
 ## Symptom
 
 Job `52949749` was returned by its critic in round 1 (9 issues, severity
