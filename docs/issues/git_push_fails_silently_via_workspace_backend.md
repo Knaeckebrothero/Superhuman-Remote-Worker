@@ -212,10 +212,40 @@ including the contrast case that a *delivered* completion still spawns (so the
 check reads the flag rather than always firing) and the loop-job status case.
 Mutation-checked.
 
-**Still not done:** the **deliverable gate** does not read `delivery_failed`, so
-it can still fail a job for missing deliverables that exist but were not
-delivered. It is a separate surface and, unlike the verification trigger, does
-not have the freeze record in hand — its own slice, not a line.
+**Deliverable gate — shipped 2026-08-07, and it is what makes the above bite.**
+`evaluate_deliverable_gate` now returns `{"skipped": True, …}` when the freeze
+carries `delivery_failed`, carrying the agent's own reason through to the
+context stamp.
+
+This was first triaged as a lower-priority separate slice. That was wrong, and
+the ordering is why: the gate runs at `orchestrator/main.py` **before**
+verification, and a bounce **early-returns** — *"Skip the status write,
+notifications, subjob graft, critic/curator spawns and loop advance"*. So for
+any job carrying a `required_deliverables` manifest, an undelivered completion
+was bounced by the gate and never reached the verification escalation at all.
+Worse than a wrong report: the bounce calls `queue_resume`, telling the agent
+to produce files it already produced, onto a workspace pod that may no longer
+exist.
+
+The fix is a fifth member of a category the gate already models rather than a
+new branch. It already fails open on Gitea unavailable, repo unresolvable, tree
+unreadable, and KB-unverifiable, under a house rule stated in its own code:
+*"never block a seal on infrastructure the worker cannot fix."* A failed push is
+squarely that class; it evaded the four existing cases only because it is the
+one infrastructure failure that looks like a **clean read** — the tree is
+perfectly readable, it is merely empty.
+
+Tests: `test_undelivered_completion_skips`,
+`test_undelivered_without_a_reason_still_skips`,
+`test_delivered_completion_is_still_evaluated` (contrast — the check reads the
+flag rather than skipping every completion), and
+`TestRunGate::test_undelivered_completion_does_not_bounce`, which pins the
+composition: asserting the skip at the evaluate level alone would leave the
+ordering — the thing that was actually broken — unproven. Mutation-checked.
+
+**Still not done:** nothing surfaces `delivery_failed` in the cockpit *beyond*
+`error_message`, and no alerting fires on it. Both are optional; the incident
+class is now reported rather than misattributed, which was the point.
 
 ## Related
 
