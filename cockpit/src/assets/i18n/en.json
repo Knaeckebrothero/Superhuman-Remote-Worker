@@ -1374,6 +1374,16 @@
       "retry": "Retry",
       "discard": "Discard"
     },
+    "rewind": {
+      "button": "Rewind to here",
+      "title": "Rewind session",
+      "body": "Go back to before this message? Messages after this point are hidden from the conversation (kept in the audit trail). Files return to their state at that point.",
+      "caveat": "Commands with external effects (network calls, deployments) can't be undone.",
+      "both": "Restore conversation and files",
+      "conversation": "Restore conversation only",
+      "code": "Restore files only",
+      "summarize": "Summarize up to here"
+    },
     "diff": {
       "replace": "Diff",
       "append": "Appended",

@@ -647,6 +647,26 @@
         flex-direction: row-reverse;
       }
 
+      .rewind-btn {
+        opacity: 0;
+        transition: opacity 0.15s ease;
+        background: none;
+        border: none;
+        cursor: pointer;
+        color: var(--text-secondary);
+        padding: 2px;
+        align-self: center;
+
+        &:hover {
+          color: var(--text-primary);
+        }
+      }
+
+      .message-user:hover .rewind-btn,
+      .rewind-btn:focus-visible {
+        opacity: 1;
+      }
+
       .message-assistant, .message-system {
         align-self: flex-start;
       }
