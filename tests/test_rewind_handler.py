@@ -278,3 +278,80 @@ def test_rewind_drains_pending_queue(monkeypatch):
     )
 
     assert pa._loop_user_queue.empty()
+
+
+def test_compact_boundary_maps_to_keep_recent(monkeypatch):
+    """boundary_message_id=X → keep_recent_override counts non-injection
+    messages from X (inclusive) to the end."""
+    from src.api import persistent_app as app_mod
+
+    target = _human("msg_b", "keep from here")
+    msgs = [
+        _human("msg_a", "old"),
+        AIMessage(content="old reply"),
+        target,
+        AIMessage(content="recent reply"),
+    ]
+    captured = {}
+
+    async def _fake_summarize(**kwargs):
+        captured.update(kwargs)
+        return list(kwargs["messages"])
+
+    ctx_mgr = MagicMock()
+    ctx_mgr.summarize_and_compact = AsyncMock(side_effect=_fake_summarize)
+    ctx_mgr.compaction_runs = 0
+    session = SimpleNamespace(
+        messages=msgs,
+        turn_count=4,
+        context_manager=ctx_mgr,
+        auxiliary_llm=MagicMock(),
+        config=SimpleNamespace(
+            context_management=SimpleNamespace(max_summary_length=10000)
+        ),
+        workspace_manager=None,
+        postgres_conn=MagicMock(),
+    )
+    monkeypatch.setattr(app_mod, "_session", session)
+    ws_sent = []
+
+    async def _fake_ws_send(ws, method, params):
+        ws_sent.append((method, params))
+
+    monkeypatch.setattr(app_mod, "_ws_send", _fake_ws_send)
+
+    asyncio.run(app_mod._handle_compact(MagicMock(), "", boundary_message_id="msg_b"))
+
+    assert ctx_mgr.summarize_and_compact.await_count == 1
+    assert captured["keep_recent_override"] == 2  # target + 1 later message
+
+
+def test_compact_boundary_unknown_id_errors(monkeypatch):
+    from src.api import persistent_app as app_mod
+
+    ctx_mgr = MagicMock()
+    ctx_mgr.summarize_and_compact = AsyncMock()
+    session = SimpleNamespace(
+        messages=[_human("msg_a", "x")],
+        context_manager=ctx_mgr,
+        auxiliary_llm=MagicMock(),
+        config=SimpleNamespace(
+            context_management=SimpleNamespace(max_summary_length=10000)
+        ),
+        workspace_manager=None,
+        postgres_conn=MagicMock(),
+    )
+    monkeypatch.setattr(app_mod, "_session", session)
+    ws_sent = []
+
+    async def _fake_ws_send(ws, method, params):
+        ws_sent.append((method, params))
+
+    monkeypatch.setattr(app_mod, "_ws_send", _fake_ws_send)
+
+    asyncio.run(
+        app_mod._handle_compact(MagicMock(), "", boundary_message_id="msg_missing")
+    )
+
+    ctx_mgr.summarize_and_compact.assert_not_awaited()
+    assert [m for m, _ in ws_sent if m == "error"]
