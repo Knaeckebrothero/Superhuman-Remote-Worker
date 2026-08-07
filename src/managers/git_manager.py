@@ -290,6 +290,33 @@ class GitManager:
             logger.error(f"Failed to commit: {e}")
             return False
 
+    def restore_tree(self, commit_sha: str) -> bool:
+        """Make worktree + index exactly match ``commit_sha``'s tree.
+
+        Forward restore for session rewind: HEAD does not move (no
+        ``reset --hard`` — that would strand the branch behind the Gitea
+        remote and break the fast-forward push). ``read-tree -u --reset``
+        is the one porcelain-adjacent verb that also DELETES files that are
+        tracked now but absent at the target (``checkout <sha> -- .``
+        leaves them behind). The caller commits the abandoned state first,
+        so everything current is tracked and nothing is lost.
+
+        Returns True on success; False on any git failure (bad SHA,
+        inactive repo). Does not commit — callers follow with commit().
+        """
+        if not self.is_active:
+            logger.debug("Git not active, skipping restore_tree")
+            return False
+        try:
+            result = self._run_git(["read-tree", "-u", "--reset", commit_sha])
+            if result.returncode != 0:
+                logger.warning(f"git read-tree failed: {result.stderr}")
+                return False
+            return True
+        except Exception as e:
+            logger.error(f"Failed to restore tree: {e}")
+            return False
+
     def log(self, max_count: int = 10, oneline: bool = True) -> str:
         """Get commit history.
 
