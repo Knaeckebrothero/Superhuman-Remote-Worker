@@ -7,7 +7,8 @@ Output: one line per endpoint in stable sort order:
 
 Classifications:
   gated:<gate>     — at least one known gate call in the body or signature
-  admin:_require_admin
+  admin:<gate>     — admin-only (`_require_admin`, or the fleet-scoped
+                     `_require_infrastructure_fleet_admin` wrapper)
   internal:<gate>  — authenticated non-user service boundary
   public:<reason>  — opt-out via `# nosec: public <reason>` comment on the
                      line immediately above the decorator
@@ -49,10 +50,15 @@ HTTP_METHODS = {"get", "post", "put", "patch", "delete"}
 # auth, otherwise normal job access check). Infrastructure-metering routes use
 # a separate HMAC-signed collector credential; their shared dispatch boundary
 # authenticates the exact method, path, body digest, timestamp, and nonce before
-# invoking an ingestion operation.
+# invoking an ingestion operation. The metering *admin* routes wrap
+# ``_require_admin`` in ``_require_infrastructure_fleet_admin``, which
+# additionally rejects project-scoped MCP admins (403) so activation boundaries
+# can only be moved by a real fleet admin; main.py does not follow local
+# helpers (see _collect_module), so that wrapper has to be named here.
 GATE_NAMES = {
     "_dispatch_infrastructure_ingestion",
     "_require_admin",
+    "_require_infrastructure_fleet_admin",
     "is_internal_call",
     "require_approved_user",
     "require_internal",
@@ -74,6 +80,18 @@ GATE_NAMES = {
     # BFF cookie-session resolver — raises 401 when there is no valid session.
     # Auth-only, same tier as require_approved_user.
     "get_current_user",
+}
+
+
+# main.py does not follow local helpers in general (see _collect_module for
+# why). These names are the audited exception: each is a thin dispatch boundary
+# shared by a back-compat route and its explicit twin, and each calls the gate
+# as its first statement. Following only these — never every module-level def —
+# keeps the conflation risk the blanket rule guards against, because a bare call
+# to anything not listed here is still not followed.
+FOLLOW_LOCAL_MAIN = {
+    "_enter_infrastructure_storage_source_shadow",
+    "_schedule_infrastructure_storage_source_activation",
 }
 
 
@@ -244,13 +262,14 @@ def _classify(
         "user_can_access_datasource": 1,
         "user_can_access_ide_entity": 1,
         "_require_admin": 2,
+        "_require_infrastructure_fleet_admin": 2,
         "_dispatch_infrastructure_ingestion": 2,
         "require_internal": 2,
         "is_internal_call": 2,
         "require_approved_user": 3,
     }
     primary = sorted(gates, key=lambda g: priority.get(g, 99))[0]
-    if primary == "_require_admin":
+    if primary in ("_require_admin", "_require_infrastructure_fleet_admin"):
         return f"admin:{primary}"
     if primary in (
         "_dispatch_infrastructure_ingestion",
@@ -290,14 +309,16 @@ def _collect_module(
     ``app_var`` walks a single FastAPI instance (main.py); otherwise every
     ``APIRouter`` in the module is walked with its prefix applied.
 
-    Local-helper following is deliberately router-only. The routers are small,
+    Local-helper following is router-first. The routers are small,
     single-purpose modules where a private wrapper around a gate is
-    unambiguous. main.py is not: its handlers call large shared helpers that
-    reach a gate somewhere downstream, and following those conflates "this
-    handler's gate" with "a gate reachable from here" — which then outranks the
-    real label and reports admin-only and internal-only endpoints as ordinary
-    resource-gated ones. Keeping main.py on direct calls + Depends preserves
-    every classification the manifest already carried.
+    unambiguous, so every module-level def is followable. main.py is not: its
+    handlers call large shared helpers that reach a gate somewhere downstream,
+    and following those conflates "this handler's gate" with "a gate reachable
+    from here" — which then outranks the real label and reports admin-only and
+    internal-only endpoints as ordinary resource-gated ones. main.py therefore
+    follows only the audited ``FOLLOW_LOCAL_MAIN`` names, which preserves every
+    classification the manifest already carried while letting a thin
+    delegating route report the gate its dispatch target enforces.
     """
     source = path.read_text()
     source_lines = source.splitlines()
@@ -305,7 +326,13 @@ def _collect_module(
     route_vars = {app_var: ""} if app_var else _router_prefixes(tree)
     if not route_vars:
         return []
-    local_funcs = None if app_var else _local_functions(tree)
+    local_funcs = _local_functions(tree)
+    if app_var:
+        local_funcs = {
+            name: node
+            for name, node in local_funcs.items()
+            if name in FOLLOW_LOCAL_MAIN
+        }
     endpoints: list[Endpoint] = []
     for node in ast.walk(tree):
         if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -365,7 +392,8 @@ def render_manifest(endpoints: list[Endpoint]) -> str:
         "#\n"
         "# Classifications:\n"
         "#   gated:<gate>           — protected by a require_* / user_can_access_* helper\n"
-        "#   admin:_require_admin   — admin-only\n"
+        "#   admin:<gate>           — admin-only; the fleet-scoped variant also\n"
+        "#                            rejects project-scoped MCP admins\n"
         "#   internal:<helper>      — authenticated non-user service boundary\n"
         "#   public:<reason>        — opt-out via `# nosec: public <reason>` on line above decorator\n"
         "#   unscoped               — no gate detected; CI snapshot test will fail\n"
