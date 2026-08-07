@@ -154,21 +154,39 @@ unknown. It is neither.
    belong to sessions that never wrote a file. Always check the write count before
    calling an empty folder broken.
 
-So the open question is not "why does the session folder never receive anything"
-(the 07-10/07-20 framing), nor "why is it inconsistent across sessions". It is the
-much narrower: **why did `1930dec9` alone fail to sync?** What rules out the easy
-answers:
+3. **The one real failure is already-known and already-fixed.** `1930dec9` is a
+   residual casualty of `docs/done/session_resume_cloud_sync_race_late_provision.md`
+   — defect 1 there is "resume's attach beats its own cloud provisioning → session
+   unsynced for life", and its severity note says "nothing recovered it". Not a
+   defect of *this* ticket.
 
-- Not pre-cutover-ness. `5833c729` was also created 08-01 under OpenCloud and syncs.
-- Not "never ran after its folder existed". The folder appeared 08-03 20:53; the
-  thread ran turns on 08-04 08:34–08:37 and wrote five files in them. None synced.
+The dates settle it. Both threads were created 08-01, so age is not the
+discriminator — whether they ran a turn after the fix went live is:
 
-Best remaining hypothesis, **unconfirmed**: `5833c729` was re-attached repeatedly
-through 08-06, rebuilding its sync config against the Nextcloud target, while
-`1930dec9`'s last attach predates the cutover. The 08-04 turns argue against the
-simple form of that, so start by pulling the `cloud_sync` payload each thread was
-attached with (`_build_agent_cloud_sync` → `persistent_app.py:_attach_from_cfg`)
-rather than by re-reading the mechanism sections above.
+| | last LLM call | vs. the fix | outcome |
+|---|---|---|---|
+| fix `f0415ea7` (orchestrator attach gate) | — | 08-04 12:00 UTC | — |
+| fix `52c1ba80` (agent `_retry_cloud_sync_start`) | — | 08-04 20:36 UTC | — |
+| `1930dec9` | 08-04 **08:37** UTC | before both | never synced |
+| `5833c729` | 08-05 **22:47** UTC | after both | recovered, syncs |
+
+That also disposes of the objection that `1930dec9` ran turns after its folder
+existed: those turns were 08:34–08:37, hours before either fix, on an agent that
+never re-reads its sync config once attached degraded.
+
+### So what is actually left in this ticket?
+
+Possibly nothing. The original complaint — "deliverables in `output/` are not
+reachable from the Files button" — is **not reproducible on a post-fix session**:
+`5833c729` has its 27 KB `output/` deliverable in the shared session folder, and
+the Files button reaches it (now including when the session is asleep, per
+`8da4b27c`). That is what "Proposed fix 3" below asked for, arrived at via the
+cloud-sync work rather than a dedicated export.
+
+Before closing it, one case is **untested**: a thread whose `project_default` mount
+causes `_should_skip_session_folder` to skip the session folder entirely. There the
+Files button resolves to the project folder instead, and whether `output/` lands
+*there* was never checked. Verify that, and this ticket can move to `done/`.
 
 Separately, the *reachability* half of this ticket is now fixed and is out of scope
 here: the Files button no longer disappears on an asleep session (`8da4b27c`), and
