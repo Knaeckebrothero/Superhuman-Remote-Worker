@@ -133,6 +133,20 @@ infrastructureMetering:
   pvShadowEnabled: false
   pvcPublicationEnabled: false
   pvPublicationEnabled: false
+  idePodShadowEnabled: false
+  agentPodShadowEnabled: false
+  idePodPublicationEnabled: false
+  agentPodPublicationEnabled: false
+  vmInventoryEnabled: false
+  vmShadowEnabled: false
+  vmPublicationEnabled: false
+  vmPvcInventoryEnabled: false
+  vmPvInventoryEnabled: false
+  vmPvcShadowEnabled: false
+  vmPvShadowEnabled: false
+  vmPvcPublicationEnabled: false
+  vmPvPublicationEnabled: false
+  vmPvClusterWideRbacAcknowledged: false
   stableClusterId: "srw-main-dev"
   ingestionSecretName: "srw-infra-metering-ingestion"
   networkPolicy:

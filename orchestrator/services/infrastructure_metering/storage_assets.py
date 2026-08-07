@@ -31,6 +31,7 @@ _UTC = timezone.utc
 _HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 _KEY_VERSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$")
 _CLUSTER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,254}$")
+_COLLECTOR_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _CSI_SOURCE_UID_RE = re.compile(r"^[0-9a-f]{64}$")
 _CSI_DRIVER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,252}$")
 _REASON_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
@@ -38,6 +39,8 @@ _KEY_FINGERPRINT_CONTEXT = b"srw-infrastructure-volume-identity-key-fingerprint-
 _PV_FALLBACK_CONTEXT = b"srw-infrastructure-pv-uid-asset-digest-v1\x00"
 _ASSERTION_HASH_CONTEXT = b"srw-storage-backend-destruction-request-v1\x00"
 _LIFECYCLE_NAMESPACE = UUID("ea97b917-f523-5bde-b675-271f7038e5d2")
+_MEASUREMENT_BASES = frozenset({"claim-requested", "volume-provisioned"})
+_REQUIREMENT_ROLES = frozenset({"quantity", "attribution"})
 
 
 class StorageAssetError(RuntimeError):
@@ -76,6 +79,32 @@ class StorageActivation:
     measurement_basis: str
     state: str
     activated_at: datetime | None
+    database_time: datetime | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class StorageSourceRequirementSpec:
+    api_resource: str
+    namespace: str | None
+    requirement_role: str
+
+
+@dataclass(frozen=True, slots=True)
+class StorageSourceRequirement:
+    inventory_scope_id: UUID
+    api_resource: str
+    namespace: str | None
+    requirement_role: str
+
+
+@dataclass(frozen=True, slots=True)
+class StorageSourceActivation:
+    measurement_basis: str
+    collector_id: str
+    source_cluster: str
+    state: str
+    activated_at: datetime | None
+    requirements: tuple[StorageSourceRequirement, ...] = ()
     database_time: datetime | None = None
 
 
@@ -215,6 +244,72 @@ WHERE measurement_basis = $1
 FOR SHARE
 """
 
+_ACTIVATION_UPDATE_SQL = """
+/* storage-assets:lock-activation-for-update */
+SELECT measurement_basis, state, activated_at,
+       statement_timestamp() AS database_time
+FROM storage_metering_activation
+WHERE measurement_basis = $1
+FOR UPDATE
+"""
+
+_SOURCE_ACTIVATION_SQL = """
+/* storage-assets:lock-source-activation */
+SELECT measurement_basis, collector_id, source_cluster, state, activated_at,
+       statement_timestamp() AS database_time
+FROM storage_metering_source_activations
+WHERE measurement_basis = $1 AND collector_id = $2 AND source_cluster = $3
+FOR SHARE
+"""
+
+_SOURCE_ACTIVATION_UPDATE_SQL = """
+/* storage-assets:lock-source-activation-for-update */
+SELECT measurement_basis, collector_id, source_cluster, state, activated_at,
+       statement_timestamp() AS database_time
+FROM storage_metering_source_activations
+WHERE measurement_basis = $1 AND collector_id = $2 AND source_cluster = $3
+FOR UPDATE
+"""
+
+_SOURCE_REQUIREMENTS_SQL = """
+/* storage-assets:read-source-requirements */
+SELECT requirement.inventory_scope_id, requirement.requirement_role,
+       scope.api_resource, scope.namespace
+FROM storage_metering_source_requirements AS requirement
+JOIN resource_inventory_scopes AS scope
+  ON scope.id = requirement.inventory_scope_id
+ AND scope.collector_id = requirement.collector_id
+ AND scope.source_cluster = requirement.source_cluster
+WHERE requirement.measurement_basis = $1
+  AND requirement.collector_id = $2
+  AND requirement.source_cluster = $3
+ORDER BY requirement.requirement_role, requirement.inventory_scope_id
+"""
+
+_EFFECTIVE_SOURCE_ACTIVATION_SQL = """
+/* storage-assets:lock-effective-source-activation */
+SELECT global_activation.state AS global_state,
+       global_activation.activated_at AS global_activated_at,
+       source_activation.state AS source_state,
+       source_activation.activated_at AS source_activated_at,
+       statement_timestamp() AS database_time
+FROM resource_inventory_scopes AS scope
+JOIN storage_metering_source_requirements AS requirement
+  ON requirement.inventory_scope_id = scope.id
+ AND requirement.measurement_basis = $1
+ AND requirement.collector_id = scope.collector_id
+ AND requirement.source_cluster = scope.source_cluster
+ AND requirement.requirement_role = 'quantity'
+JOIN storage_metering_source_activations AS source_activation
+  ON source_activation.measurement_basis = requirement.measurement_basis
+ AND source_activation.collector_id = requirement.collector_id
+ AND source_activation.source_cluster = requirement.source_cluster
+JOIN storage_metering_activation AS global_activation
+  ON global_activation.measurement_basis = requirement.measurement_basis
+WHERE scope.id = $2
+FOR SHARE OF source_activation, global_activation
+"""
+
 _INSERT_KEY_SQL = """
 /* storage-assets:register-key */
 INSERT INTO storage_identity_key_state (
@@ -289,6 +384,71 @@ def _reason(value: Any, name: str = "reason_code") -> str:
     if not isinstance(value, str) or not _REASON_RE.fullmatch(value):
         raise StorageAssetContractError(f"{name} is invalid")
     return value
+
+
+def _measurement_basis(value: Any) -> str:
+    if not isinstance(value, str) or value not in _MEASUREMENT_BASES:
+        raise StorageAssetContractError("measurement_basis is unsupported")
+    return value
+
+
+def _source_identity(collector_id: Any, source_cluster: Any) -> tuple[str, str]:
+    if not isinstance(collector_id, str) or not _COLLECTOR_RE.fullmatch(collector_id):
+        raise StorageAssetContractError("collector_id is invalid")
+    if not isinstance(source_cluster, str) or not _CLUSTER_RE.fullmatch(source_cluster):
+        raise StorageAssetContractError("source_cluster is invalid")
+    return collector_id, source_cluster
+
+
+def _midnight(value: Any, name: str = "activated_at") -> datetime:
+    boundary = _utc(value, name)
+    if boundary.hour or boundary.minute or boundary.second or boundary.microsecond:
+        raise StorageAssetContractError(f"{name} must be a UTC midnight")
+    return boundary
+
+
+def _requirement_specs(
+    requirements: tuple[StorageSourceRequirementSpec, ...],
+) -> tuple[StorageSourceRequirementSpec, ...]:
+    if not isinstance(requirements, tuple) or not requirements:
+        raise StorageAssetContractError("source requirements must be a nonempty tuple")
+    normalized: list[StorageSourceRequirementSpec] = []
+    identities: set[tuple[str, str | None, str]] = set()
+    for requirement in requirements:
+        if not isinstance(requirement, StorageSourceRequirementSpec):
+            raise StorageAssetContractError("source requirement is invalid")
+        api_resource = _text(
+            requirement.api_resource,
+            "api_resource",
+            maximum=255,
+        )
+        namespace = requirement.namespace
+        if namespace is not None:
+            namespace = _text(namespace, "namespace", maximum=253)
+        role = requirement.requirement_role
+        if not isinstance(role, str) or role not in _REQUIREMENT_ROLES:
+            raise StorageAssetContractError("requirement_role is invalid")
+        identity = (api_resource, namespace, role)
+        if identity in identities:
+            raise StorageAssetContractError("source requirements contain duplicates")
+        identities.add(identity)
+        normalized.append(
+            StorageSourceRequirementSpec(
+                api_resource=api_resource,
+                namespace=namespace,
+                requirement_role=role,
+            )
+        )
+    return tuple(
+        sorted(
+            normalized,
+            key=lambda item: (
+                item.requirement_role,
+                item.api_resource,
+                "" if item.namespace is None else item.namespace,
+            ),
+        )
+    )
 
 
 def volume_identity_key_fingerprint(identity_key: bytes | str) -> str:
@@ -396,31 +556,152 @@ async def register_storage_identity_key(
     return inserted is None
 
 
+def _source_requirement_from_row(row: Mapping[str, Any]) -> StorageSourceRequirement:
+    return StorageSourceRequirement(
+        inventory_scope_id=_uuid(row["inventory_scope_id"], "inventory_scope_id"),
+        api_resource=str(row["api_resource"]),
+        namespace=(None if row.get("namespace") is None else str(row["namespace"])),
+        requirement_role=str(row["requirement_role"]),
+    )
+
+
+def _source_activation_from_row(
+    row: Mapping[str, Any],
+    *,
+    requirements: tuple[StorageSourceRequirement, ...] = (),
+) -> StorageSourceActivation:
+    activated_at = row.get("activated_at")
+    database_time = row.get("database_time")
+    return StorageSourceActivation(
+        measurement_basis=_measurement_basis(str(row["measurement_basis"])),
+        collector_id=str(row["collector_id"]),
+        source_cluster=str(row["source_cluster"]),
+        state=str(row["state"]),
+        activated_at=(
+            None if activated_at is None else _utc(activated_at, "activated_at")
+        ),
+        requirements=requirements,
+        database_time=(
+            None if database_time is None else _utc(database_time, "database_time")
+        ),
+    )
+
+
+async def read_storage_source_activation(
+    conn: asyncpg.Connection,
+    *,
+    measurement_basis: str,
+    collector_id: str,
+    source_cluster: str,
+) -> StorageSourceActivation:
+    """Lock and return one source activation plus its frozen requirements."""
+
+    basis = _measurement_basis(measurement_basis)
+    collector, cluster = _source_identity(collector_id, source_cluster)
+    row = await conn.fetchrow(_SOURCE_ACTIVATION_SQL, basis, collector, cluster)
+    if row is None:
+        raise StorageActivationNotReady("storage source activation row is missing")
+    requirement_rows = await conn.fetch(
+        _SOURCE_REQUIREMENTS_SQL,
+        basis,
+        collector,
+        cluster,
+    )
+    requirements = tuple(
+        _source_requirement_from_row(requirement) for requirement in requirement_rows
+    )
+    return _source_activation_from_row(row, requirements=requirements)
+
+
+async def _read_storage_source_activation_for_update(
+    conn: asyncpg.Connection,
+    *,
+    measurement_basis: str,
+    collector_id: str,
+    source_cluster: str,
+) -> StorageSourceActivation:
+    basis = _measurement_basis(measurement_basis)
+    collector, cluster = _source_identity(collector_id, source_cluster)
+    row = await conn.fetchrow(
+        _SOURCE_ACTIVATION_UPDATE_SQL,
+        basis,
+        collector,
+        cluster,
+    )
+    if row is None:
+        raise StorageActivationNotReady("storage source activation row is missing")
+    requirement_rows = await conn.fetch(
+        _SOURCE_REQUIREMENTS_SQL,
+        basis,
+        collector,
+        cluster,
+    )
+    return _source_activation_from_row(
+        row,
+        requirements=tuple(
+            _source_requirement_from_row(requirement)
+            for requirement in requirement_rows
+        ),
+    )
+
+
+async def read_storage_source_activations(
+    conn: asyncpg.Connection,
+) -> tuple[StorageSourceActivation, ...]:
+    """Return every registered storage source in stable identity order."""
+
+    identities = await conn.fetch(
+        "SELECT measurement_basis,collector_id,source_cluster "
+        "FROM storage_metering_source_activations "
+        "ORDER BY measurement_basis,collector_id,source_cluster"
+    )
+    return tuple(
+        [
+            await read_storage_source_activation(
+                conn,
+                measurement_basis=str(row["measurement_basis"]),
+                collector_id=str(row["collector_id"]),
+                source_cluster=str(row["source_cluster"]),
+            )
+            for row in identities
+        ]
+    )
+
+
 async def lock_storage_activation(
     conn: asyncpg.Connection,
     *,
     measurement_basis: str,
+    inventory_scope_id: UUID,
     observed_started_at: datetime,
 ) -> datetime:
-    """Lock an active basis and return its publication-safe clamped start."""
+    """Lock the global and exact quantity-source boundary, then clamp start."""
 
-    if measurement_basis not in {"claim-requested", "volume-provisioned"}:
-        raise StorageAssetContractError("measurement_basis is unsupported")
+    basis = _measurement_basis(measurement_basis)
+    scope_id = _uuid(inventory_scope_id, "inventory_scope_id")
     observed = _utc(observed_started_at, "observed_started_at")
-    row = await conn.fetchrow(_ACTIVATION_SQL, measurement_basis)
+    row = await conn.fetchrow(_EFFECTIVE_SOURCE_ACTIVATION_SQL, basis, scope_id)
     if row is None:
-        raise StorageActivationNotReady("storage activation row is missing")
-    activation_time = row.get("activated_at")
+        raise StorageActivationNotReady(
+            "storage quantity scope has no source activation"
+        )
+    global_time = row.get("global_activated_at")
+    source_time = row.get("source_activated_at")
     database_time = row.get("database_time")
     if (
-        str(row.get("state")) != "active"
-        or activation_time is None
+        str(row.get("global_state")) != "active"
+        or str(row.get("source_state")) != "active"
+        or global_time is None
+        or source_time is None
         or database_time is None
     ):
-        raise StorageActivationNotReady("storage basis is not active")
-    boundary = _utc(activation_time, "activated_at")
+        raise StorageActivationNotReady("storage source is not active")
+    boundary = max(
+        _utc(global_time, "global_activated_at"),
+        _utc(source_time, "source_activated_at"),
+    )
     if _utc(database_time, "database_time") < boundary:
-        raise StorageActivationNotReady("storage activation boundary is in the future")
+        raise StorageActivationNotReady("storage source boundary is in the future")
     return max(observed, boundary)
 
 
@@ -428,9 +709,28 @@ async def read_storage_activation(
     conn: asyncpg.Connection,
     measurement_basis: str,
 ) -> StorageActivation:
-    if measurement_basis not in {"claim-requested", "volume-provisioned"}:
-        raise StorageAssetContractError("measurement_basis is unsupported")
-    row = await conn.fetchrow(_ACTIVATION_SQL, measurement_basis)
+    basis = _measurement_basis(measurement_basis)
+    row = await conn.fetchrow(_ACTIVATION_SQL, basis)
+    if row is None:
+        raise StorageActivationNotReady("storage activation row is missing")
+    return StorageActivation(
+        measurement_basis=str(row["measurement_basis"]),
+        state=str(row["state"]),
+        activated_at=(
+            _utc(row["activated_at"], "activated_at")
+            if row.get("activated_at") is not None
+            else None
+        ),
+        database_time=_utc(row["database_time"], "database_time"),
+    )
+
+
+async def _read_storage_activation_for_update(
+    conn: asyncpg.Connection,
+    measurement_basis: str,
+) -> StorageActivation:
+    basis = _measurement_basis(measurement_basis)
+    row = await conn.fetchrow(_ACTIVATION_UPDATE_SQL, basis)
     if row is None:
         raise StorageActivationNotReady("storage activation row is missing")
     return StorageActivation(
@@ -468,6 +768,156 @@ async def advance_storage_activation_to_shadow(
         state=str(row["state"]),
         activated_at=None,
         database_time=_utc(row["database_time"], "database_time"),
+    )
+
+
+async def _ensure_storage_activation_shadow_or_active(
+    conn: asyncpg.Connection,
+    measurement_basis: str,
+) -> StorageActivation:
+    current = await _read_storage_activation_for_update(conn, measurement_basis)
+    if current.state in {"shadow", "active"}:
+        return current
+    if current.state != "disabled":
+        raise StorageAssetConflict("global storage basis has an invalid state")
+    return await advance_storage_activation_to_shadow(conn, measurement_basis)
+
+
+async def advance_storage_source_activation_to_shadow(
+    conn: asyncpg.Connection,
+    *,
+    measurement_basis: str,
+    collector_id: str,
+    source_cluster: str,
+    requirements: tuple[StorageSourceRequirementSpec, ...],
+) -> StorageSourceActivation:
+    """Resolve/freeze exact scope identities and atomically enter shadow."""
+
+    basis = _measurement_basis(measurement_basis)
+    collector, cluster = _source_identity(collector_id, source_cluster)
+    requested = _requirement_specs(requirements)
+    await _ensure_storage_activation_shadow_or_active(conn, basis)
+    resolved: list[StorageSourceRequirement] = []
+    for requirement in requested:
+        scope = await conn.fetchrow(
+            "SELECT scope.id,scope.api_resource,scope.namespace "
+            "FROM resource_inventory_scopes AS scope "
+            "JOIN resource_inventory_scope_epochs AS epoch "
+            "ON epoch.scope_id=scope.id AND epoch.retired_at IS NULL "
+            "WHERE scope.collector_id=$1 AND scope.source_cluster=$2 "
+            "AND scope.api_resource=$3 "
+            "AND scope.namespace IS NOT DISTINCT FROM $4 "
+            "FOR SHARE OF scope,epoch",
+            collector,
+            cluster,
+            requirement.api_resource,
+            requirement.namespace,
+        )
+        if scope is None:
+            raise StorageAssetConflict(
+                "storage source requirement has no exact active inventory scope"
+            )
+        resolved.append(
+            StorageSourceRequirement(
+                inventory_scope_id=_uuid(scope["id"], "inventory_scope_id"),
+                api_resource=str(scope["api_resource"]),
+                namespace=(
+                    None if scope["namespace"] is None else str(scope["namespace"])
+                ),
+                requirement_role=requirement.requirement_role,
+            )
+        )
+    expected = tuple(
+        sorted(
+            resolved,
+            key=lambda item: (item.requirement_role, str(item.inventory_scope_id)),
+        )
+    )
+    inserted = await conn.fetchrow(
+        "INSERT INTO storage_metering_source_activations ("
+        "measurement_basis,collector_id,source_cluster"
+        ") VALUES ($1,$2,$3) ON CONFLICT DO NOTHING "
+        "RETURNING measurement_basis,collector_id,source_cluster,state,"
+        "activated_at,statement_timestamp() AS database_time",
+        basis,
+        collector,
+        cluster,
+    )
+    if inserted is not None:
+        for requirement in expected:
+            await conn.execute(
+                "INSERT INTO storage_metering_source_requirements ("
+                "measurement_basis,collector_id,source_cluster,"
+                "inventory_scope_id,requirement_role"
+                ") VALUES ($1,$2,$3,$4,$5)",
+                basis,
+                collector,
+                cluster,
+                requirement.inventory_scope_id,
+                requirement.requirement_role,
+            )
+
+    current = await _read_storage_source_activation_for_update(
+        conn,
+        measurement_basis=basis,
+        collector_id=collector,
+        source_cluster=cluster,
+    )
+    actual = tuple(
+        StorageSourceRequirement(
+            inventory_scope_id=requirement.inventory_scope_id,
+            api_resource=requirement.api_resource,
+            namespace=requirement.namespace,
+            requirement_role=requirement.requirement_role,
+        )
+        for requirement in current.requirements
+    )
+    if actual != expected:
+        raise StorageAssetConflict(
+            "storage source already has another exact requirement set"
+        )
+    if current.state == "shadow":
+        return current
+    if current.state != "disabled":
+        raise StorageAssetConflict("storage source activation has passed shadow")
+
+    row = await conn.fetchrow(
+        "UPDATE storage_metering_source_activations SET state='shadow' "
+        "WHERE measurement_basis=$1 AND collector_id=$2 AND source_cluster=$3 "
+        "AND state='disabled' RETURNING measurement_basis,collector_id,"
+        "source_cluster,state,activated_at,"
+        "statement_timestamp() AS database_time",
+        basis,
+        collector,
+        cluster,
+    )
+    if row is None:
+        replay = await _read_storage_source_activation_for_update(
+            conn,
+            measurement_basis=basis,
+            collector_id=collector,
+            source_cluster=cluster,
+        )
+        if (
+            replay.state == "shadow"
+            and tuple(
+                StorageSourceRequirement(
+                    inventory_scope_id=requirement.inventory_scope_id,
+                    api_resource=requirement.api_resource,
+                    namespace=requirement.namespace,
+                    requirement_role=requirement.requirement_role,
+                )
+                for requirement in replay.requirements
+            )
+            == expected
+        ):
+            return replay
+        raise StorageAssetConflict("storage source activation changed during shadow")
+    return await read_storage_source_activation(
+        conn,
+        measurement_basis=basis,
+        collector_id=collector,
+        source_cluster=cluster,
     )
 
 
@@ -527,6 +977,275 @@ async def schedule_storage_activation(
         state=str(row["state"]),
         activated_at=_utc(row["activated_at"], "activated_at"),
         database_time=_utc(row["database_time"], "database_time"),
+    )
+
+
+async def schedule_storage_source_activation(
+    conn: asyncpg.Connection,
+    *,
+    measurement_basis: str,
+    collector_id: str,
+    source_cluster: str,
+    activated_at: datetime,
+    max_scope_age: timedelta,
+    expected_generation: int,
+    identity_key_version: str | None = None,
+) -> StorageSourceActivation:
+    """Prove every frozen scope, promote its epoch, and schedule the source.
+
+    Callers must own a transaction. The exact requirement rows are frozen at
+    the shadow transition, every epoch is locked here, and the activation CAS
+    occurs only after the full item-for-item proof succeeds.
+    """
+
+    basis = _measurement_basis(measurement_basis)
+    collector, cluster = _source_identity(collector_id, source_cluster)
+    boundary = _midnight(activated_at)
+    if not isinstance(max_scope_age, timedelta) or max_scope_age <= timedelta(0):
+        raise StorageAssetContractError("max_scope_age must be positive")
+    if (
+        isinstance(expected_generation, bool)
+        or not isinstance(expected_generation, int)
+        or expected_generation <= 0
+    ):
+        raise StorageAssetContractError("expected_generation must be positive")
+
+    # One lock order for every scheduler: global basis, target source, then
+    # matching claim source (for volumes), followed by scope epochs.
+    global_activation = await _read_storage_activation_for_update(conn, basis)
+    source_activation = await _read_storage_source_activation_for_update(
+        conn,
+        measurement_basis=basis,
+        collector_id=collector,
+        source_cluster=cluster,
+    )
+    if source_activation.database_time is None:
+        raise StorageActivationNotReady("storage source DB clock is unavailable")
+    if source_activation.state == "active":
+        if (
+            source_activation.activated_at == boundary
+            and global_activation.state == "active"
+            and global_activation.activated_at is not None
+            and global_activation.activated_at <= boundary
+        ):
+            return source_activation
+        raise StorageAssetConflict("storage source has another activation boundary")
+    if source_activation.state != "shadow":
+        raise StorageAssetConflict("storage source must enter shadow before activation")
+    if boundary <= source_activation.database_time:
+        raise StorageAssetContractError("activated_at must be a future UTC midnight")
+
+    if global_activation.state == "shadow":
+        global_activation = await schedule_storage_activation(
+            conn,
+            measurement_basis=basis,
+            activated_at=boundary,
+        )
+    elif (
+        global_activation.state != "active"
+        or global_activation.activated_at is None
+        or global_activation.activated_at > boundary
+    ):
+        raise StorageAssetConflict(
+            "global storage basis must have an equal or earlier activation boundary"
+        )
+
+    if basis == "volume-provisioned":
+        if not isinstance(identity_key_version, str) or not _KEY_VERSION_RE.fullmatch(
+            identity_key_version
+        ):
+            raise StorageAssetContractError(
+                "volume activation requires its configured identity key version"
+            )
+        key_registered = await conn.fetchval(
+            "SELECT TRUE FROM storage_identity_key_state "
+            "WHERE singleton AND algorithm='hmac-sha256-v1' AND key_version=$1",
+            identity_key_version,
+        )
+        if not key_registered:
+            raise StorageAssetConflict(
+                "volume identity key has not been observed in shadow inventory"
+            )
+        claim_activation = await _read_storage_source_activation_for_update(
+            conn,
+            measurement_basis="claim-requested",
+            collector_id=collector,
+            source_cluster=cluster,
+        )
+        if (
+            claim_activation.state != "active"
+            or claim_activation.activated_at is None
+            or claim_activation.activated_at > boundary
+        ):
+            raise StorageAssetConflict(
+                "matching claim source must activate before volume source"
+            )
+        claim_quantity = {
+            requirement.inventory_scope_id
+            for requirement in claim_activation.requirements
+            if requirement.requirement_role == "quantity"
+        }
+        volume_attribution = {
+            requirement.inventory_scope_id
+            for requirement in source_activation.requirements
+            if requirement.requirement_role == "attribution"
+        }
+        if not claim_quantity or volume_attribution != claim_quantity:
+            raise StorageAssetConflict(
+                "volume attribution requirements must exactly match claim quantity requirements"
+            )
+
+    current_generation = await conn.fetchval(
+        "SELECT leader_generation FROM infra_metering_control "
+        "WHERE singleton=TRUE FOR SHARE"
+    )
+    if current_generation is None or int(current_generation) != expected_generation:
+        raise StorageAssetConflict(
+            "storage activation shadow proof is from another collector generation"
+        )
+    database_time = _utc(
+        await conn.fetchval("SELECT statement_timestamp()"),
+        "database_time",
+    )
+    freshness_floor = database_time - max_scope_age
+    rows = await conn.fetch(
+        "SELECT requirement.inventory_scope_id,requirement.requirement_role,"
+        "scope.api_resource,scope.namespace,epoch.id AS epoch_id,"
+        "epoch.required_for_rollup,epoch.required_from,epoch.reliable_from,"
+        "epoch.continuous_since,epoch.last_complete_at,epoch.snapshot_health,"
+        "epoch.item_health,epoch.continuity_health,epoch.backend_health,"
+        "epoch.leader_generation,"
+        "snapshot.leader_generation AS snapshot_leader_generation,"
+        "snapshot.item_count,snapshot.complete,snapshot.manifest_state,"
+        "snapshot.received_at,"
+        "(SELECT count(*) FROM storage_shadow_observations observation "
+        " WHERE observation.snapshot_id=snapshot.id "
+        " AND observation.inventory_scope_id=scope.id) AS shadow_count,"
+        "(SELECT count(*) FROM resource_inventory_snapshot_items item "
+        " WHERE item.snapshot_id=snapshot.id AND NOT EXISTS ("
+        "  SELECT 1 FROM storage_shadow_observations observation "
+        "  WHERE observation.snapshot_id=item.snapshot_id "
+        "  AND observation.inventory_scope_id=scope.id "
+        "  AND observation.source_kind=item.source_kind "
+        "  AND observation.source_uid=item.source_uid"
+        " )) AS missing_shadow_count,"
+        "(SELECT count(*) FROM storage_shadow_observations observation "
+        " WHERE observation.snapshot_id=snapshot.id "
+        " AND observation.inventory_scope_id=scope.id AND NOT EXISTS ("
+        "  SELECT 1 FROM resource_inventory_snapshot_items item "
+        "  WHERE item.snapshot_id=observation.snapshot_id "
+        "  AND item.source_kind=observation.source_kind "
+        "  AND item.source_uid=observation.source_uid"
+        " )) AS orphan_shadow_count "
+        "FROM storage_metering_source_requirements AS requirement "
+        "JOIN resource_inventory_scopes AS scope "
+        "ON scope.id=requirement.inventory_scope_id "
+        "AND scope.collector_id=requirement.collector_id "
+        "AND scope.source_cluster=requirement.source_cluster "
+        "JOIN resource_inventory_scope_epochs AS epoch "
+        "ON epoch.scope_id=scope.id AND epoch.retired_at IS NULL "
+        "LEFT JOIN resource_inventory_snapshots AS snapshot "
+        "ON snapshot.id=epoch.last_complete_snapshot_id "
+        "WHERE requirement.measurement_basis=$1 "
+        "AND requirement.collector_id=$2 "
+        "AND requirement.source_cluster=$3 "
+        "ORDER BY requirement.requirement_role,requirement.inventory_scope_id "
+        "FOR UPDATE OF epoch",
+        basis,
+        collector,
+        cluster,
+    )
+    selected = {
+        (
+            _uuid(row["inventory_scope_id"], "inventory_scope_id"),
+            str(row["requirement_role"]),
+        ): row
+        for row in rows
+    }
+    expected = {
+        (requirement.inventory_scope_id, requirement.requirement_role)
+        for requirement in source_activation.requirements
+    }
+    if set(selected) != expected or not expected:
+        raise StorageAssetConflict(
+            "storage activation lacks an active required inventory scope"
+        )
+
+    for identity in sorted(expected, key=lambda value: (value[1], str(value[0]))):
+        row = selected[identity]
+        if (
+            row["reliable_from"] is None
+            or row["reliable_from"] > boundary
+            or row["continuous_since"] is None
+            or row["continuous_since"] > boundary
+            or row["last_complete_at"] is None
+            or row["last_complete_at"] < freshness_floor
+            or row["snapshot_health"] != "healthy"
+            or row["item_health"] != "healthy"
+            or row["continuity_health"] != "healthy"
+            or row["backend_health"] != "healthy"
+            or row["leader_generation"] != expected_generation
+            or row["snapshot_leader_generation"] != expected_generation
+            or row["complete"] is not True
+            or row["manifest_state"] != "sealed"
+            or row["received_at"] is None
+            or int(row["shadow_count"] or 0) != int(row["item_count"] or 0)
+            or int(row["missing_shadow_count"] or 0) != 0
+            or int(row["orphan_shadow_count"] or 0) != 0
+        ):
+            raise StorageAssetConflict(
+                "storage activation requires a fresh item-for-item shadow snapshot"
+            )
+
+        if row["required_for_rollup"]:
+            required_from = row["required_from"]
+            if required_from is None or required_from > boundary:
+                raise StorageAssetConflict(
+                    "storage inventory scope has a later required boundary"
+                )
+            continue
+        promoted = await conn.fetchval(
+            "UPDATE resource_inventory_scope_epochs SET "
+            "required_for_rollup=TRUE,required_from=$2,"
+            "updated_at=statement_timestamp() WHERE id=$1 "
+            "AND retired_at IS NULL AND required_for_rollup=FALSE RETURNING TRUE",
+            row["epoch_id"],
+            boundary,
+        )
+        if not promoted:
+            raise StorageAssetConflict(
+                "storage inventory scope changed during activation"
+            )
+
+    updated = await conn.fetchrow(
+        "UPDATE storage_metering_source_activations "
+        "SET state='active',activated_at=$4 "
+        "WHERE measurement_basis=$1 AND collector_id=$2 AND source_cluster=$3 "
+        "AND state='shadow' RETURNING measurement_basis,collector_id,"
+        "source_cluster,state,activated_at,"
+        "statement_timestamp() AS database_time",
+        basis,
+        collector,
+        cluster,
+        boundary,
+    )
+    if updated is None:
+        replay = await read_storage_source_activation(
+            conn,
+            measurement_basis=basis,
+            collector_id=collector,
+            source_cluster=cluster,
+        )
+        if replay.state == "active" and replay.activated_at == boundary:
+            return replay
+        if replay.state == "active":
+            raise StorageAssetConflict("storage source has another activation boundary")
+        raise StorageAssetConflict("storage source changed during activation")
+    return await read_storage_source_activation(
+        conn,
+        measurement_basis=basis,
+        collector_id=collector,
+        source_cluster=cluster,
     )
 
 
@@ -1431,11 +2150,37 @@ class StorageAssetStore:
                 volume = await read_storage_activation(conn, "volume-provisioned")
                 return claim, volume
 
+    async def source_status(self) -> tuple[StorageSourceActivation, ...]:
+        """Return all per-source states and their exact requirement sets."""
+
+        async with self._app.acquire() as conn:
+            # Status helpers take SHARE locks for a self-consistent view.
+            async with conn.transaction(isolation="repeatable_read"):
+                return await read_storage_source_activations(conn)
+
     async def enter_shadow(self, measurement_basis: str) -> StorageActivation:
         async with self._app.acquire() as conn:
             async with conn.transaction():
                 return await advance_storage_activation_to_shadow(
                     conn, measurement_basis
+                )
+
+    async def enter_source_shadow(
+        self,
+        *,
+        measurement_basis: str,
+        collector_id: str,
+        source_cluster: str,
+        requirements: tuple[StorageSourceRequirementSpec, ...],
+    ) -> StorageSourceActivation:
+        async with self._app.acquire() as conn:
+            async with conn.transaction():
+                return await advance_storage_source_activation_to_shadow(
+                    conn,
+                    measurement_basis=measurement_basis,
+                    collector_id=collector_id,
+                    source_cluster=source_cluster,
+                    requirements=requirements,
                 )
 
     async def schedule_activation(
@@ -1465,6 +2210,30 @@ class StorageAssetStore:
                     conn,
                     measurement_basis=measurement_basis,
                     activated_at=activated_at,
+                )
+
+    async def schedule_source_activation(
+        self,
+        *,
+        measurement_basis: str,
+        collector_id: str,
+        source_cluster: str,
+        activated_at: datetime,
+        max_scope_age: timedelta,
+        expected_generation: int,
+        identity_key_version: str | None = None,
+    ) -> StorageSourceActivation:
+        async with self._app.acquire() as conn:
+            async with conn.transaction():
+                return await schedule_storage_source_activation(
+                    conn,
+                    measurement_basis=measurement_basis,
+                    collector_id=collector_id,
+                    source_cluster=source_cluster,
+                    activated_at=activated_at,
+                    max_scope_age=max_scope_age,
+                    expected_generation=expected_generation,
+                    identity_key_version=identity_key_version,
                 )
 
     async def assert_destroyed(
@@ -1539,9 +2308,13 @@ __all__ = [
     "StorageAssetIncarnationDetail",
     "StorageAssetNotFound",
     "StorageAssetStore",
+    "StorageSourceActivation",
+    "StorageSourceRequirement",
+    "StorageSourceRequirementSpec",
     "VolumeAssetRecord",
     "VolumeIncarnationRecord",
     "advance_storage_activation_to_shadow",
+    "advance_storage_source_activation_to_shadow",
     "assert_backend_destroyed",
     "backend_destruction_request_hash",
     "derive_volume_asset_identity",
@@ -1552,9 +2325,12 @@ __all__ = [
     "open_backend_unverified_gap",
     "promote_storage_scope_epochs",
     "read_storage_activation",
+    "read_storage_source_activation",
+    "read_storage_source_activations",
     "read_storage_asset_detail",
     "register_storage_identity_key",
     "resolve_backend_gap_reobserved",
     "schedule_storage_activation",
+    "schedule_storage_source_activation",
     "volume_identity_key_fingerprint",
 ]

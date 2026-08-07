@@ -130,6 +130,19 @@ _CORRECTION_DIMENSION_FIELDS = (
 )
 _AUDIT_NUMERIC_LIMIT = 10**20
 _MAX_CORRECTION_EVENTS = 100
+_COMPUTE_RESOURCE_ACTIVATIONS = {
+    "agent_pod": "agent_pod",
+    "workspace_vm": "workspace_vm",
+}
+_IDE_WORKSPACE_PRODUCT_CLASS = "ide-session"
+_STORAGE_MEASUREMENT_BASES = frozenset({"claim-requested", "volume-provisioned"})
+_STORAGE_REQUIREMENT_API_RESOURCES = {
+    ("claim-requested", "quantity"): "core/v1/persistentvolumeclaims",
+    ("volume-provisioned", "quantity"): "core/v1/persistentvolumes",
+    ("volume-provisioned", "attribution"): "core/v1/persistentvolumeclaims",
+}
+_COLLECTOR_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+_SOURCE_CLUSTER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,254}$")
 
 
 class PublicationError(RuntimeError):
@@ -152,12 +165,163 @@ class PublicationContractError(PublicationError, ValueError):
     """An interval, rate, or frozen plan violates the publication contract."""
 
 
+@dataclass(frozen=True, order=True, slots=True)
+class StoragePublicationAuthority:
+    """One process-approved storage quantity authority.
+
+    Namespace/scope membership remains database-owned by the immutable 0105
+    requirement set.  This process policy deliberately stops at the stable
+    source identity so one primary-cluster publication gate cannot authorize a
+    distinct ``kubevirt-storage`` source that happens to emit the same resource
+    name.
+    """
+
+    measurement_basis: str
+    collector_id: str
+    source_cluster: str
+
+    def __post_init__(self) -> None:
+        if self.measurement_basis not in _STORAGE_MEASUREMENT_BASES:
+            raise PublicationContractError(
+                "storage publication authority measurement_basis is unsupported"
+            )
+        if not _COLLECTOR_ID_RE.fullmatch(self.collector_id):
+            raise PublicationContractError(
+                "storage publication authority collector_id is invalid"
+            )
+        if not _SOURCE_CLUSTER_RE.fullmatch(self.source_cluster):
+            raise PublicationContractError(
+                "storage publication authority source_cluster is invalid"
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class StoragePublicationPolicy:
+    """Immutable per-process allowlist for independently gated storage sources."""
+
+    authorities: tuple[StoragePublicationAuthority, ...] = ()
+
+    def __post_init__(self) -> None:
+        try:
+            normalized = tuple(sorted(set(self.authorities)))
+        except TypeError as exc:
+            raise PublicationContractError(
+                "storage publication policy authorities are invalid"
+            ) from exc
+        if any(
+            not isinstance(authority, StoragePublicationAuthority)
+            for authority in normalized
+        ):
+            raise PublicationContractError(
+                "storage publication policy requires typed authorities"
+            )
+        object.__setattr__(self, "authorities", normalized)
+
+    def allows(
+        self,
+        *,
+        measurement_basis: str,
+        collector_id: str,
+        source_cluster: str,
+    ) -> bool:
+        return (
+            StoragePublicationAuthority(
+                measurement_basis=measurement_basis,
+                collector_id=collector_id,
+                source_cluster=source_cluster,
+            )
+            in self.authorities
+        )
+
+    def sql_columns(self) -> tuple[list[str], list[str], list[str]]:
+        return (
+            [authority.measurement_basis for authority in self.authorities],
+            [authority.collector_id for authority in self.authorities],
+            [authority.source_cluster for authority in self.authorities],
+        )
+
+
 def _aware_utc(value: Any, field: str) -> datetime:
     if not isinstance(value, datetime):
         raise PublicationContractError(f"{field} must be a datetime")
     if value.tzinfo is None or value.utcoffset() is None:
         raise PublicationContractError(f"{field} must be timezone-aware")
     return value.astimezone(timezone.utc)
+
+
+@dataclass(frozen=True, order=True, slots=True)
+class StorageCoverageRequirement:
+    """One immutable 0105 scope requirement for an active storage source.
+
+    Quantity requirements authorize publication. Attribution requirements are
+    coverage-only dependencies: a PV can be billed without publishing PVC
+    quantity, but its PVC evidence must still be complete so ownership remains
+    trustworthy. Keeping the role on the identity prevents a PVC attribution
+    scope from being mistaken for a claim publication authority.
+    """
+
+    measurement_basis: str
+    collector_id: str
+    source_cluster: str
+    inventory_scope_id: UUID
+    requirement_role: str
+    effective_from: datetime
+
+    def __post_init__(self) -> None:
+        # Reuse the exact stable-source validation used by the process policy.
+        StoragePublicationAuthority(
+            measurement_basis=self.measurement_basis,
+            collector_id=self.collector_id,
+            source_cluster=self.source_cluster,
+        )
+        try:
+            scope_id = (
+                self.inventory_scope_id
+                if isinstance(self.inventory_scope_id, UUID)
+                else UUID(str(self.inventory_scope_id))
+            )
+        except (TypeError, ValueError, AttributeError) as exc:
+            raise PublicationContractError(
+                "storage coverage requirement inventory_scope_id is invalid"
+            ) from exc
+        if (
+            self.measurement_basis,
+            self.requirement_role,
+        ) not in _STORAGE_REQUIREMENT_API_RESOURCES:
+            raise PublicationContractError(
+                "storage coverage requirement basis/role is invalid"
+            )
+        object.__setattr__(self, "inventory_scope_id", scope_id)
+        object.__setattr__(
+            self,
+            "effective_from",
+            _aware_utc(self.effective_from, "storage requirement effective_from"),
+        )
+
+    @property
+    def authority(self) -> StoragePublicationAuthority:
+        return StoragePublicationAuthority(
+            measurement_basis=self.measurement_basis,
+            collector_id=self.collector_id,
+            source_cluster=self.source_cluster,
+        )
+
+    @property
+    def expected_api_resource(self) -> str:
+        return _STORAGE_REQUIREMENT_API_RESOURCES[
+            (self.measurement_basis, self.requirement_role)
+        ]
+
+    @classmethod
+    def from_mapping(cls, row: Mapping[str, Any]) -> StorageCoverageRequirement:
+        return cls(
+            measurement_basis=str(row.get("measurement_basis") or ""),
+            collector_id=str(row.get("collector_id") or ""),
+            source_cluster=str(row.get("source_cluster") or ""),
+            inventory_scope_id=row.get("inventory_scope_id"),
+            requirement_role=str(row.get("requirement_role") or ""),
+            effective_from=row.get("effective_from"),
+        )
 
 
 def _timestamp_text(value: datetime) -> str:
@@ -868,6 +1032,37 @@ def _interval_details(interval: Mapping[str, Any]) -> dict[str, Any]:
             )
         details[field_name] = value
     return details
+
+
+def _details_object(value: Any, field: str) -> Mapping[str, Any]:
+    if value is None:
+        return {}
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise PublicationContractError(f"{field} are invalid JSON") from exc
+    if not isinstance(value, Mapping):
+        raise PublicationContractError(f"{field} must be an object")
+    return value
+
+
+def _compute_activation_key(
+    resource: Any,
+    details: Any,
+    *,
+    details_field: str,
+) -> str | None:
+    resource_name = str(resource)
+    activation_key = _COMPUTE_RESOURCE_ACTIVATIONS.get(resource_name)
+    if activation_key is not None:
+        return activation_key
+    if resource_name != "workspace_pod":
+        return None
+    product_class = _details_object(details, details_field).get("product_class")
+    if product_class == _IDE_WORKSPACE_PRODUCT_CLASS:
+        return "ide_workspace_pod"
+    return None
 
 
 def _build_cursor_plan(
@@ -1587,6 +1782,162 @@ WHERE singleton = TRUE
 FOR SHARE
 """
 
+_STORAGE_CANDIDATE_FENCE_MARKER = (
+    "/* infra-publication:storage-source-candidate-fence */"
+)
+_COMPUTE_CANDIDATE_FENCE_MARKER = "/* infra-publication:compute-candidate-fence */"
+_COMPUTE_CANDIDATE_DISABLED_SQL = """
+  AND NOT (
+      (interval.source_kind = 'pod'
+       AND interval.category = 'compute'
+       AND interval.resource = 'agent_pod')
+      OR (interval.source_kind = 'pod'
+          AND interval.category = 'compute'
+          AND interval.resource = 'workspace_pod'
+          AND COALESCE(interval.details->>'product_class', '') = 'ide-session')
+      OR (interval.source_kind = 'vmi'
+          AND interval.category = 'compute'
+          AND interval.resource = 'workspace_vm')
+  )
+"""
+_COMPUTE_CANDIDATE_FENCE_SQL = """
+  AND (
+      CASE
+          WHEN interval.source_kind = 'pod'
+               AND interval.category = 'compute'
+               AND interval.resource = 'agent_pod'
+              THEN 'agent_pod'
+          WHEN interval.source_kind = 'pod'
+               AND interval.category = 'compute'
+               AND interval.resource = 'workspace_pod'
+               AND interval.details->>'product_class' = 'ide-session'
+              THEN 'ide_workspace_pod'
+          WHEN interval.source_kind = 'vmi'
+               AND interval.category = 'compute'
+               AND interval.resource = 'workspace_vm'
+              THEN 'workspace_vm'
+          ELSE NULL
+      END IS NULL
+      OR EXISTS (
+          SELECT 1
+          FROM compute_metering_epoch_authorities AS compute_authority
+          JOIN resource_inventory_scope_epochs AS compute_epoch
+            ON compute_epoch.id = compute_authority.inventory_scope_epoch_id
+           AND compute_epoch.scope_id =
+               compute_authority.inventory_scope_id
+          JOIN compute_metering_activation AS compute_activation
+            ON compute_activation.activation_key =
+               compute_authority.activation_key
+          WHERE compute_authority.activation_key = CASE
+                    WHEN interval.resource = 'agent_pod' THEN 'agent_pod'
+                    WHEN interval.resource = 'workspace_pod'
+                        THEN 'ide_workspace_pod'
+                    ELSE 'workspace_vm'
+                END
+            AND compute_authority.inventory_scope_id =
+                interval.inventory_scope_id
+            AND compute_authority.inventory_scope_epoch_id =
+                interval.compute_scope_epoch_id
+            AND compute_activation.state = 'active'
+            AND compute_activation.activated_at IS NOT NULL
+            AND statement_timestamp() >= GREATEST(
+                compute_activation.activated_at,
+                compute_authority.effective_from
+            )
+            AND interval.started_at >= GREATEST(
+                compute_activation.activated_at,
+                compute_authority.effective_from
+            )
+            AND interval.materialized_through >= GREATEST(
+                compute_activation.activated_at,
+                compute_authority.effective_from
+            )
+            AND interval.materialized_through <
+                COALESCE(compute_epoch.retired_at, 'infinity'::timestamptz)
+            AND COALESCE(interval.ended_at, interval.last_confirmed_at) <=
+                COALESCE(compute_epoch.retired_at, 'infinity'::timestamptz)
+      )
+  )
+"""
+_STORAGE_CANDIDATE_DISABLED_SQL = """
+  AND interval.measurement_basis NOT IN (
+      'claim-requested', 'volume-provisioned'
+  )
+"""
+_STORAGE_CANDIDATE_FENCE_SQL = """
+  AND (
+      interval.measurement_basis NOT IN (
+          'claim-requested', 'volume-provisioned'
+      )
+      OR EXISTS (
+          SELECT 1
+          FROM resource_inventory_scopes AS storage_scope
+          JOIN storage_metering_source_requirements AS storage_requirement
+            ON storage_requirement.inventory_scope_id = storage_scope.id
+           AND storage_requirement.measurement_basis = interval.measurement_basis
+           AND storage_requirement.collector_id = storage_scope.collector_id
+           AND storage_requirement.source_cluster = storage_scope.source_cluster
+           AND storage_requirement.requirement_role = 'quantity'
+          JOIN storage_metering_source_activations AS storage_source_activation
+            ON storage_source_activation.measurement_basis =
+               storage_requirement.measurement_basis
+           AND storage_source_activation.collector_id =
+               storage_requirement.collector_id
+           AND storage_source_activation.source_cluster =
+               storage_requirement.source_cluster
+          JOIN storage_metering_activation AS storage_global_activation
+            ON storage_global_activation.measurement_basis =
+               storage_requirement.measurement_basis
+          JOIN unnest($5::text[], $6::text[], $7::text[])
+               AS storage_policy(
+                   measurement_basis, collector_id, source_cluster
+               )
+            ON storage_policy.measurement_basis =
+               storage_requirement.measurement_basis
+           AND storage_policy.collector_id = storage_requirement.collector_id
+           AND storage_policy.source_cluster = storage_requirement.source_cluster
+          WHERE storage_scope.id = interval.inventory_scope_id
+            AND storage_scope.source_cluster = interval.source_cluster
+            AND storage_source_activation.state = 'active'
+            AND storage_source_activation.activated_at IS NOT NULL
+            AND storage_global_activation.state = 'active'
+            AND storage_global_activation.activated_at IS NOT NULL
+            AND statement_timestamp() >= GREATEST(
+                storage_source_activation.activated_at,
+                storage_global_activation.activated_at
+            )
+            AND interval.materialized_through >= GREATEST(
+                storage_source_activation.activated_at,
+                storage_global_activation.activated_at
+            )
+      )
+  )
+"""
+
+
+def _candidate_intervals_sql(
+    *,
+    compute_policy_enabled: bool = False,
+    storage_policy_enabled: bool,
+) -> str:
+    sql = _CANDIDATE_INTERVALS_SQL.replace(
+        _COMPUTE_CANDIDATE_FENCE_MARKER,
+        (
+            _COMPUTE_CANDIDATE_FENCE_SQL
+            if compute_policy_enabled
+            else _COMPUTE_CANDIDATE_DISABLED_SQL
+        ),
+    )
+    return sql.replace(
+        _STORAGE_CANDIDATE_FENCE_MARKER,
+        (
+            _STORAGE_CANDIDATE_FENCE_SQL
+            if storage_policy_enabled
+            else _STORAGE_CANDIDATE_DISABLED_SQL
+        ),
+    )
+
+
 _CANDIDATE_INTERVALS_SQL = """
 /* infra-publication:candidates */
 SELECT interval.*,
@@ -1691,6 +2042,10 @@ LEFT JOIN LATERAL (
     LIMIT 1
 ) AS successor_watch ON TRUE
 WHERE interval.resource = ANY($1::text[])
+  AND ($4::boolean OR interval.resource <> 'workspace_pod'
+       OR COALESCE(interval.details->>'product_class', '') <> 'ide-session')
+/* infra-publication:compute-candidate-fence */
+/* infra-publication:storage-source-candidate-fence */
   AND interval.materialized_through >= $2
   AND interval.materialized_through < CASE
         WHEN interval.ended_at IS NOT NULL THEN interval.ended_at
@@ -1725,6 +2080,76 @@ SELECT *
 FROM resource_intervals
 WHERE id = $1 AND source_revision = $2
 FOR UPDATE
+"""
+
+_PUBLICATION_INTERVAL_FENCE_SQL = """
+/* infra-publication:publication-interval-fence */
+SELECT *
+FROM resource_intervals
+WHERE id = $1 AND source_revision = $2
+FOR SHARE
+"""
+
+_COMPUTE_EPOCH_SET_LOCK_SQL = """
+/* infra-publication:compute-epoch-set-lock */
+SELECT requirement.activation_key, epoch.id
+FROM compute_metering_epoch_authorities AS requirement
+JOIN resource_inventory_scope_epochs AS epoch
+  ON epoch.id = requirement.inventory_scope_epoch_id
+ AND epoch.scope_id = requirement.inventory_scope_id
+WHERE requirement.activation_key = ANY($1::text[])
+ORDER BY epoch.id, requirement.activation_key
+FOR SHARE OF epoch
+"""
+
+_COMPUTE_EXACT_EPOCH_FENCE_SQL = """
+/* infra-publication:compute-exact-epoch-fence */
+SELECT authority.effective_from,
+       epoch.id AS inventory_scope_epoch_id,
+       epoch.retired_at
+FROM compute_metering_epoch_authorities AS authority
+JOIN resource_inventory_scope_epochs AS epoch
+  ON epoch.id = authority.inventory_scope_epoch_id
+ AND epoch.scope_id = authority.inventory_scope_id
+WHERE authority.activation_key = $1
+  AND authority.inventory_scope_id = $2
+  AND authority.inventory_scope_epoch_id = $3
+FOR SHARE OF epoch
+"""
+
+_COMPUTE_ACTIVATION_FENCE_SQL = """
+/* infra-publication:compute-activation-fence */
+SELECT activation_key, state, activated_at,
+       statement_timestamp() AS database_time
+FROM compute_metering_activation
+WHERE activation_key = $1
+FOR SHARE
+"""
+
+_STORAGE_PUBLICATION_FENCE_SQL = """
+/* infra-publication:storage-source-fence */
+SELECT scope.collector_id, scope.source_cluster,
+       requirement.requirement_role,
+       source_activation.state AS source_state,
+       source_activation.activated_at AS source_activated_at,
+       global_activation.state AS global_state,
+       global_activation.activated_at AS global_activated_at,
+       statement_timestamp() AS database_time
+FROM resource_inventory_scopes AS scope
+JOIN storage_metering_source_requirements AS requirement
+  ON requirement.inventory_scope_id = scope.id
+ AND requirement.collector_id = scope.collector_id
+ AND requirement.source_cluster = scope.source_cluster
+ AND requirement.measurement_basis = $2
+ AND requirement.requirement_role = 'quantity'
+JOIN storage_metering_source_activations AS source_activation
+  ON source_activation.measurement_basis = requirement.measurement_basis
+ AND source_activation.collector_id = requirement.collector_id
+ AND source_activation.source_cluster = requirement.source_cluster
+JOIN storage_metering_activation AS global_activation
+  ON global_activation.measurement_basis = requirement.measurement_basis
+WHERE scope.id = $1
+FOR SHARE OF scope, requirement, source_activation, global_activation
 """
 
 _NEXT_CORRECTION_REVISION_SQL = """
@@ -2229,6 +2654,8 @@ class InfrastructureUsageMaterializer:
         publication_enabled: bool = False,
         batch_size: int = 100,
         enabled_resources: Sequence[str] = ("workspace_pod",),
+        ide_workspace_pod_enabled: bool = False,
+        storage_publication_policy: StoragePublicationPolicy | None = None,
     ) -> None:
         if batch_size <= 0 or batch_size > 1000:
             raise ValueError("materializer batch_size must be between 1 and 1000")
@@ -2240,12 +2667,245 @@ class InfrastructureUsageMaterializer:
         self._publication_enabled = publication_enabled
         self._batch_size = batch_size
         self._enabled_resources = resources
+        self._ide_workspace_pod_enabled = bool(ide_workspace_pod_enabled)
+        if storage_publication_policy is not None and not isinstance(
+            storage_publication_policy, StoragePublicationPolicy
+        ):
+            raise ValueError("materializer storage_publication_policy must be typed")
+        self._storage_publication_policy = (
+            storage_publication_policy or StoragePublicationPolicy()
+        )
 
     def _require_enabled(self) -> None:
         if not self._publication_enabled:
             raise PublicationDisabledError(
                 "infrastructure publication runtime gate is disabled"
             )
+
+    def _require_class_enabled(
+        self,
+        *,
+        resource: Any,
+        activation_key: str | None,
+        context: str,
+    ) -> None:
+        resource_name = str(resource)
+        if resource_name not in self._enabled_resources:
+            raise PublicationDisabledError(
+                f"{context} resource {resource_name!r} publication gate is disabled"
+            )
+        if (
+            activation_key == "ide_workspace_pod"
+            and not self._ide_workspace_pod_enabled
+        ):
+            raise PublicationDisabledError(
+                f"{context} IDE workspace Pod publication gate is disabled"
+            )
+
+    def _enabled_compute_activation_keys(self) -> tuple[str, ...]:
+        keys: list[str] = []
+        if "agent_pod" in self._enabled_resources:
+            keys.append("agent_pod")
+        if (
+            "workspace_pod" in self._enabled_resources
+            and self._ide_workspace_pod_enabled
+        ):
+            keys.append("ide_workspace_pod")
+        if "workspace_vm" in self._enabled_resources:
+            keys.append("workspace_vm")
+        return tuple(keys)
+
+    async def _lock_compute_publication_epochs(
+        self,
+        conn: asyncpg.Connection,
+    ) -> None:
+        """Pre-lock exact epochs before any interval row in a write path."""
+
+        keys = self._enabled_compute_activation_keys()
+        if keys:
+            await conn.fetch(_COMPUTE_EPOCH_SET_LOCK_SQL, list(keys))
+
+    async def _enforce_plan_publication_fence(
+        self,
+        conn: asyncpg.Connection,
+        interval: Mapping[str, Any],
+        plan: FrozenPublicationPlan,
+    ) -> None:
+        """Recheck source/event class gates and compute activation in-app DB.
+
+        Candidate selection is not a publication boundary: a pending plan may
+        survive a rollout that disables its class, and reviewed corrections
+        may intentionally change resource dimensions.  Every freeze and every
+        audit attempt therefore validates both the immutable source interval
+        and all frozen event targets under the current process gates.  Compute
+        activation is re-read under a row lock so a historical correction
+        cannot manufacture pre-activation usage.
+        """
+
+        required_activations: set[str] = set()
+        interval_key = _compute_activation_key(
+            interval["resource"],
+            interval.get("details"),
+            details_field="interval details",
+        )
+        self._require_class_enabled(
+            resource=interval["resource"],
+            activation_key=interval_key,
+            context="source interval",
+        )
+        if interval_key is not None:
+            required_activations.add(interval_key)
+
+        measurement_basis = str(interval["measurement_basis"])
+        storage_activation: Mapping[str, Any] | None = None
+        if measurement_basis in _STORAGE_MEASUREMENT_BASES:
+            if not self._storage_publication_policy.authorities:
+                raise PublicationDisabledError(
+                    "storage source publication policy is disabled"
+                )
+            storage_activation = await conn.fetchrow(
+                _STORAGE_PUBLICATION_FENCE_SQL,
+                interval["inventory_scope_id"],
+                measurement_basis,
+            )
+            if storage_activation is None:
+                raise PublicationDisabledError(
+                    "storage source lacks an exact quantity activation requirement"
+                )
+            collector_id = str(storage_activation["collector_id"])
+            source_cluster = str(storage_activation["source_cluster"])
+            if str(interval["source_cluster"]) != source_cluster:
+                raise PublicationDisabledError(
+                    "storage interval source does not match its inventory authority"
+                )
+            if not self._storage_publication_policy.allows(
+                measurement_basis=measurement_basis,
+                collector_id=collector_id,
+                source_cluster=source_cluster,
+            ):
+                raise PublicationDisabledError(
+                    "storage source publication gate is disabled for "
+                    f"{measurement_basis}/{collector_id}/{source_cluster}"
+                )
+            if (
+                storage_activation.get("requirement_role") != "quantity"
+                or storage_activation.get("source_state") != "active"
+                or storage_activation.get("global_state") != "active"
+                or storage_activation.get("source_activated_at") is None
+                or storage_activation.get("global_activated_at") is None
+                or storage_activation.get("database_time") is None
+            ):
+                raise PublicationDisabledError(
+                    "storage source activation is not active"
+                )
+            source_boundary = _aware_utc(
+                storage_activation["source_activated_at"],
+                "storage source activated_at",
+            )
+            global_boundary = _aware_utc(
+                storage_activation["global_activated_at"],
+                "storage global activated_at",
+            )
+            database_time = _aware_utc(
+                storage_activation["database_time"],
+                "storage activation database_time",
+            )
+            effective_boundary = max(source_boundary, global_boundary)
+            if database_time < effective_boundary:
+                raise PublicationDisabledError(
+                    "storage source activation is not effective"
+                )
+            if plan.period_start < effective_boundary:
+                raise PublicationDisabledError(
+                    "storage publication plan predates its source activation"
+                )
+
+        for planned in plan.events:
+            payload = planned.event.payload
+            if storage_activation is not None and (
+                str(payload.get("measurement_basis")) != measurement_basis
+                or str(payload.get("source_cluster"))
+                != str(storage_activation["source_cluster"])
+            ):
+                raise PublicationDisabledError(
+                    "storage publication event changed its activated source authority"
+                )
+            event_key = _compute_activation_key(
+                payload["resource"],
+                payload.get("details"),
+                details_field="publication event details",
+            )
+            self._require_class_enabled(
+                resource=payload["resource"],
+                activation_key=event_key,
+                context="publication event",
+            )
+            if event_key is not None:
+                required_activations.add(event_key)
+
+        for activation_key in sorted(required_activations):
+            exact_epoch = await conn.fetchrow(
+                _COMPUTE_EXACT_EPOCH_FENCE_SQL,
+                activation_key,
+                interval["inventory_scope_id"],
+                interval["compute_scope_epoch_id"],
+            )
+            activation = await conn.fetchrow(
+                _COMPUTE_ACTIVATION_FENCE_SQL,
+                activation_key,
+            )
+            if exact_epoch is None or exact_epoch["effective_from"] is None:
+                raise PublicationDisabledError(
+                    f"compute class {activation_key!r} exact epoch is not active"
+                )
+            if (
+                activation is None
+                or activation["state"] != "active"
+                or activation["activated_at"] is None
+                or activation["database_time"] is None
+            ):
+                raise PublicationDisabledError(
+                    f"compute class {activation_key!r} activation is not active"
+                )
+            activated_at = _aware_utc(
+                activation["activated_at"],
+                f"{activation_key} activated_at",
+            )
+            authority_boundary = _aware_utc(
+                exact_epoch["effective_from"],
+                f"{activation_key} epoch authority effective_from",
+            )
+            database_time = _aware_utc(
+                activation["database_time"],
+                f"{activation_key} database_time",
+            )
+            effective_boundary = max(
+                activated_at,
+                authority_boundary,
+            )
+            if database_time < effective_boundary:
+                raise PublicationDisabledError(
+                    f"compute class {activation_key!r} activation is not effective"
+                )
+            if (
+                _aware_utc(interval["started_at"], "interval started_at")
+                < effective_boundary
+                or plan.period_start < effective_boundary
+            ):
+                raise PublicationDisabledError(
+                    f"compute class {activation_key!r} plan predates activation "
+                    "or exact epoch authority"
+                )
+            retired_at = exact_epoch["retired_at"]
+            if retired_at is not None:
+                authority_end = _aware_utc(
+                    retired_at,
+                    f"{activation_key} epoch retired_at",
+                )
+                if plan.period_end > authority_end:
+                    raise PublicationDisabledError(
+                        f"compute class {activation_key!r} plan exceeds exact epoch"
+                    )
 
     @staticmethod
     def _validate_control(
@@ -2397,6 +3057,7 @@ class InfrastructureUsageMaterializer:
         async with self._app.acquire() as conn:
             async with conn.transaction():
                 self._validate_control(await conn.fetchrow(_CONTROL_SQL), generation)
+                await self._lock_compute_publication_epochs(conn)
                 interval = await conn.fetchrow(
                     _LOCK_INTERVAL_SQL,
                     plan.source_interval_id,
@@ -2406,6 +3067,7 @@ class InfrastructureUsageMaterializer:
                     raise PublicationConflictError(
                         "publication interval revision disappeared"
                     )
+                await self._enforce_plan_publication_fence(conn, interval, plan)
                 await conn.execute(_ENSURE_DAY_STATE_SQL, plan.period_start.date())
                 day_state = await conn.fetchrow(
                     _DAY_STATE_SQL,
@@ -2853,13 +3515,33 @@ class InfrastructureUsageMaterializer:
                 cutover_at = self._validate_control(
                     await conn.fetchrow(_CONTROL_SQL), generation
                 )
-                intervals = await conn.fetch(
-                    _CANDIDATE_INTERVALS_SQL,
+                await self._lock_compute_publication_epochs(conn)
+                candidate_args: list[Any] = [
                     list(self._enabled_resources),
                     cutover_at,
                     self._batch_size,
+                    self._ide_workspace_pod_enabled,
+                ]
+                storage_policy_enabled = bool(
+                    self._storage_publication_policy.authorities
+                )
+                if storage_policy_enabled:
+                    candidate_args.extend(
+                        self._storage_publication_policy.sql_columns()
+                    )
+                intervals = await conn.fetch(
+                    _candidate_intervals_sql(
+                        compute_policy_enabled=bool(
+                            self._enabled_compute_activation_keys()
+                        ),
+                        storage_policy_enabled=storage_policy_enabled,
+                    ),
+                    *candidate_args,
                 )
                 for interval in intervals:
+                    # The SQL subtype predicate is an efficient selector, not
+                    # the safety boundary. Recheck the frozen source/events so
+                    # alternate review/freeze paths share the same contract.
                     cursor = _aware_utc(
                         interval["materialized_through"], "materialized_through"
                     )
@@ -2926,6 +3608,7 @@ class InfrastructureUsageMaterializer:
                         )
                     if plan is None:
                         continue
+                    await self._enforce_plan_publication_fence(conn, interval, plan)
                     if plan.plan_kind == "late-usage":
                         old_revision = day_state.get("coverage_revision")
                         old_sequence = day_state.get("coverage_sequence")
@@ -3001,6 +3684,23 @@ class InfrastructureUsageMaterializer:
         if plan is None:
             return None
 
+        # Pending intent can outlive a rollout/configuration change.  Fence it
+        # again immediately before audit I/O instead of assuming selection-time
+        # gates still describe the running process.
+        async with self._app.acquire() as conn:
+            async with conn.transaction():
+                await self._lock_compute_publication_epochs(conn)
+                interval = await conn.fetchrow(
+                    _PUBLICATION_INTERVAL_FENCE_SQL,
+                    plan.source_interval_id,
+                    plan.source_revision,
+                )
+                if interval is None:
+                    raise PublicationConflictError(
+                        "pending publication interval revision disappeared"
+                    )
+                await self._enforce_plan_publication_fence(conn, interval, plan)
+
         try:
             audit_result = await self._ledger.publish_frozen_events(
                 [item.event for item in plan.events]
@@ -3066,6 +3766,7 @@ class InfrastructureUsageMaterializer:
         async with self._app.acquire() as conn:
             async with conn.transaction():
                 self._validate_control(await conn.fetchrow(_CONTROL_SQL), generation)
+                await self._lock_compute_publication_epochs(conn)
                 current = await conn.fetchrow(_LOCK_PLAN_SQL, plan.id)
                 if current is None:
                     raise PublicationConflictError("publication plan disappeared")
@@ -3126,6 +3827,9 @@ __all__ = [
     "PublicationError",
     "PublicationFenceError",
     "PublicationResult",
+    "StorageCoverageRequirement",
+    "StoragePublicationAuthority",
+    "StoragePublicationPolicy",
     "build_correction_plan",
     "build_late_usage_plan",
     "build_usage_plan",

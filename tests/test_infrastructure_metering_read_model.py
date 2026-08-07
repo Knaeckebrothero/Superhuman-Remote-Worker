@@ -14,6 +14,8 @@ import pytest
 from orchestrator.services.infrastructure_metering.materializer import (
     CorrectionDelta,
     FrozenPublicationPlan,
+    StoragePublicationAuthority,
+    StoragePublicationPolicy,
     build_correction_plan,
     build_late_usage_plan,
     build_usage_plan,
@@ -41,6 +43,21 @@ NEW_OWNER_ID = UUID("31000000-0000-0000-0000-000000000003")
 NEW_USER_ID = UUID("41000000-0000-0000-0000-000000000004")
 NEW_PROJECT_ID = UUID("51000000-0000-0000-0000-000000000005")
 COVERAGE_REVISION = "coverage-revision-1"
+
+
+def _storage_policy(
+    *authorities: tuple[str, str, str],
+) -> StoragePublicationPolicy:
+    return StoragePublicationPolicy(
+        authorities=tuple(
+            StoragePublicationAuthority(
+                measurement_basis=basis,
+                collector_id=collector_id,
+                source_cluster=source_cluster,
+            )
+            for basis, collector_id, source_cluster in authorities
+        )
+    )
 
 
 def _interval(**overrides: Any) -> dict[str, Any]:
@@ -115,6 +132,8 @@ def _snapshot(
     plans: tuple[FrozenPublicationPlan, ...] = (),
     rate_rows: tuple[dict[str, Any], ...] = (),
     epochs: tuple[dict[str, Any], ...] = (),
+    storage_requirements: tuple[dict[str, Any], ...] = (),
+    compute_requirements: tuple[dict[str, Any], ...] = (),
     gaps: tuple[dict[str, Any], ...] = (),
     day_states: tuple[dict[str, Any], ...] = (),
 ) -> AppUsageReadSnapshot:
@@ -127,8 +146,10 @@ def _snapshot(
         plans=plans,
         rate_rows=rate_rows,
         epochs=epochs,
+        storage_requirements=storage_requirements,
         gaps=gaps,
         day_states=day_states,
+        compute_requirements=compute_requirements,
     )
 
 
@@ -176,9 +197,60 @@ def _epoch(
         "backend_health": "healthy",
         "publication_health": "healthy",
         "api_resource": "core/v1/pods",
+        "collector_id": "kubernetes-pods",
+        "source_cluster": "main-dev",
+        "namespace": "srw",
     }
     row.update(overrides)
     return row
+
+
+def _storage_requirement(
+    *,
+    measurement_basis: str = "claim-requested",
+    collector_id: str = "kubernetes-pods",
+    source_cluster: str = "main-dev",
+    inventory_scope_id: UUID = SCOPE_ID,
+    requirement_role: str = "quantity",
+    effective_from: datetime = START,
+) -> dict[str, Any]:
+    return {
+        "measurement_basis": measurement_basis,
+        "collector_id": collector_id,
+        "source_cluster": source_cluster,
+        "inventory_scope_id": inventory_scope_id,
+        "requirement_role": requirement_role,
+        "effective_from": effective_from,
+    }
+
+
+def _compute_requirement(
+    *,
+    activation_key: str = "agent_pod",
+    epoch_id: UUID = EPOCH_ID,
+    retired_at: datetime | None = None,
+    authority_sequence: int = 1,
+    authority_effective_from: datetime = START,
+    complete_through: datetime | None = None,
+) -> dict[str, Any]:
+    return {
+        "activation_key": activation_key,
+        "activated_at": START,
+        "inventory_scope_id": SCOPE_ID,
+        "inventory_scope_epoch_id": epoch_id,
+        "authority_sequence": authority_sequence,
+        "authority_effective_from": authority_effective_from,
+        "retired_at": retired_at,
+        "complete_through": complete_through or retired_at or END,
+        "snapshot_health": "healthy",
+        "continuity_health": "healthy",
+        "item_health": "healthy",
+        "backend_health": "healthy",
+        "api_resource": "core/v1/pods",
+        "collector_id": "kubernetes-pods",
+        "source_cluster": "main-dev",
+        "namespace": "srw",
+    }
 
 
 def _day_state(
@@ -271,6 +343,7 @@ class _AppConnection:
                 "infra-read:plan-events",
                 "infra-read:rates",
                 "infra-read:epochs",
+                "infra-read:storage-requirements",
                 "infra-read:gaps",
                 "infra-read:storage-gaps",
                 "infra-read:day-states",
@@ -306,9 +379,16 @@ async def _summarize(
     audit_rows: list[dict[str, Any]] | None = None,
     visibility: UsageVisibility | None = None,
     ref_id: str | None = None,
+    enabled_resources: tuple[str, ...] = ("workspace_pod",),
+    storage_publication_policy: StoragePublicationPolicy | None = None,
 ):
     audit = _AuditPool(audit_rows)
-    model = SourceAwareUsageReadModel(audit, _AppPool(None))
+    model = SourceAwareUsageReadModel(
+        audit,
+        _AppPool(None),
+        enabled_resources=enabled_resources,
+        storage_publication_policy=storage_publication_policy,
+    )
     model.read_app_snapshot = AsyncMock(return_value=snapshot)  # type: ignore[method-assign]
     result = await model.summary(
         from_ts=from_ts,
@@ -449,6 +529,100 @@ async def test_storage_reads_include_asset_gaps_only_for_enabled_pv_resources():
 
 
 @pytest.mark.asyncio
+async def test_live_storage_tails_use_and_recheck_exact_source_policy():
+    control = {
+        "cutover_state": "active",
+        "cutover_at": START,
+        "last_closed_day": None,
+    }
+    app = _AppPool(control)
+    app.connection.fetch = AsyncMock(side_effect=app.connection.fetch)
+    policy = _storage_policy(("claim-requested", "kubernetes-pods", "main-dev"))
+    model = SourceAwareUsageReadModel(
+        _AuditPool(),
+        app,
+        enabled_resources=("workspace_pod", "workspace_pvc"),
+        storage_publication_policy=policy,
+    )
+    unauthorized = _interval(
+        inventory_scope_id=SCOPE_ID,
+        source_kind="pvc",
+        resource="workspace_pvc",
+        measurement_basis="claim-requested",
+        category="storage",
+        resource_class="persistent-volume-claim",
+        cpu_millicores=None,
+        memory_bytes=None,
+        storage_bytes=4 * 1024**3,
+        inventory_collector_id="kubevirt-storage",
+        inventory_source_cluster="main-dev",
+        inventory_namespace="srw",
+    )
+    authorized = {
+        **unauthorized,
+        "id": UUID("10000000-0000-0000-0000-000000000011"),
+        "inventory_collector_id": "kubernetes-pods",
+    }
+    original_fetch = app.connection.fetch.side_effect
+
+    async def fetch(sql: str, *params: Any):
+        if "infra-read:intervals" in sql:
+            app.connection._record("fetch", sql, params)
+            return [unauthorized, authorized]
+        return await original_fetch(sql, *params)
+
+    app.connection.fetch.side_effect = fetch
+    snapshot = await model.read_app_snapshot(
+        from_ts=START,
+        to_ts=END,
+        visibility=UsageVisibility(),
+    )
+
+    assert [row["id"] for row in snapshot.intervals] == [authorized["id"]]
+    assert model._storage_tail_row_is_authorized(
+        {
+            "source_measurement_basis": "claim-requested",
+            "inventory_collector_id": "kubernetes-pods",
+            "inventory_source_cluster": "main-dev",
+            "interval_source_cluster": "main-dev",
+        },
+        basis_field="source_measurement_basis",
+    )
+    assert not model._storage_tail_row_is_authorized(
+        {
+            "source_measurement_basis": "claim-requested",
+            "inventory_collector_id": "kubevirt-storage",
+            "inventory_source_cluster": "main-dev",
+            "interval_source_cluster": "main-dev",
+        },
+        basis_field="source_measurement_basis",
+    )
+    assert not model._storage_tail_row_is_authorized(
+        {
+            "source_measurement_basis": "claim-requested",
+            "inventory_collector_id": "kubernetes-pods",
+            "inventory_source_cluster": "vm-cluster",
+            "interval_source_cluster": "vm-cluster",
+        },
+        basis_field="source_measurement_basis",
+    )
+    for marker in (
+        "infra-read:intervals",
+        "infra-read:plan-headers",
+        "infra-read:correction-plan-headers",
+    ):
+        _operation, sql, params = next(
+            call for call in app.connection.calls if marker in call[1]
+        )
+        assert "unnest($4::text[], $5::text[], $6::text[])" in sql
+        assert params[3:6] == (
+            ["claim-requested"],
+            ["kubernetes-pods"],
+            ["main-dev"],
+        )
+
+
+@pytest.mark.asyncio
 async def test_required_storage_scope_fails_closed_until_resource_is_enabled():
     snapshot = _snapshot(
         epochs=(_epoch(api_resource="core/v1/persistentvolumeclaims"),),
@@ -467,6 +641,278 @@ async def test_required_storage_scope_fails_closed_until_resource_is_enabled():
     assert result.coverage.status == "partial"
     assert result.coverage.required_sources_ok == 0
     assert result.coverage.required_sources_total == 1
+    assert [item.model_dump() for item in result.coverage.unknown_ranges] == [
+        {"start": START, "end": END}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_identical_storage_api_resources_require_exact_authority():
+    other_epoch_id = UUID("70000000-0000-0000-0000-000000000008")
+    other_scope_id = UUID("60000000-0000-0000-0000-000000000008")
+    policy = _storage_policy(("claim-requested", "kubernetes-pods", "main-dev"))
+    snapshot = _snapshot(
+        epochs=(
+            _epoch(
+                api_resource="core/v1/persistentvolumeclaims",
+                collector_id="kubernetes-pods",
+            ),
+            _epoch(
+                id=other_epoch_id,
+                scope_id=other_scope_id,
+                api_resource="core/v1/persistentvolumeclaims",
+                collector_id="kubevirt-storage",
+            ),
+        ),
+        storage_requirements=(_storage_requirement(),),
+    )
+
+    result, _ = await _summarize(
+        snapshot,
+        enabled_resources=("workspace_pvc",),
+        storage_publication_policy=policy,
+    )
+
+    assert result.coverage.status == "partial"
+    assert result.coverage.required_sources_ok == 1
+    assert result.coverage.required_sources_total == 2
+    assert result.window.data_through == START
+    assert [item.model_dump() for item in result.coverage.unknown_ranges] == [
+        {"start": START, "end": END}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_missing_policy_required_storage_source_is_never_complete_zero():
+    policy = _storage_policy(("claim-requested", "kubevirt-storage", "vm-cluster"))
+
+    result, _ = await _summarize(
+        _snapshot(epochs=(_epoch(),)),
+        enabled_resources=("workspace_pod", "workspace_pvc"),
+        storage_publication_policy=policy,
+    )
+
+    assert result.coverage.status == "partial"
+    assert result.coverage.required_sources_ok == 1
+    assert result.coverage.required_sources_total == 2
+    assert result.window.data_through == START
+    assert [item.model_dump() for item in result.coverage.unknown_ranges] == [
+        {"start": START, "end": END}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_storage_epoch_boundary_replacement_preserves_complete_window():
+    boundary = START + timedelta(minutes=30)
+    replacement_epoch_id = UUID("70000000-0000-0000-0000-000000000009")
+    policy = _storage_policy(("claim-requested", "kubernetes-pods", "main-dev"))
+    snapshot = _snapshot(
+        epochs=(
+            _epoch(
+                api_resource="core/v1/persistentvolumeclaims",
+                retired_at=boundary,
+                complete_through=boundary,
+            ),
+            _epoch(
+                id=replacement_epoch_id,
+                api_resource="core/v1/persistentvolumeclaims",
+                required_from=boundary,
+                complete_through=END,
+            ),
+        ),
+        storage_requirements=(_storage_requirement(),),
+    )
+
+    result, _ = await _summarize(
+        snapshot,
+        enabled_resources=("workspace_pvc",),
+        storage_publication_policy=policy,
+    )
+
+    assert result.coverage.status == "complete"
+    assert result.coverage.required_sources_ok == 1
+    assert result.coverage.required_sources_total == 1
+    assert result.window.data_through == END
+
+
+@pytest.mark.asyncio
+async def test_compute_exact_epoch_retirement_cannot_inherit_healthy_successor() -> (
+    None
+):
+    boundary = START + timedelta(minutes=30)
+    successor_id = UUID("70000000-0000-0000-0000-00000000000a")
+    snapshot = _snapshot(
+        epochs=(
+            _epoch(retired_at=boundary, complete_through=boundary),
+            _epoch(
+                id=successor_id,
+                required_from=boundary,
+                complete_through=END,
+            ),
+        ),
+        compute_requirements=(_compute_requirement(retired_at=boundary),),
+    )
+
+    result, _ = await _summarize(
+        snapshot,
+        enabled_resources=("workspace_pod", "agent_pod"),
+    )
+
+    assert result.coverage.status == "partial"
+    assert result.coverage.required_sources_ok == 1
+    assert result.coverage.required_sources_total == 2
+    assert result.window.data_through == boundary
+    assert [item.model_dump() for item in result.coverage.unknown_ranges] == [
+        {"start": boundary, "end": END}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_compute_recovery_authority_resumes_without_bridging_gap() -> None:
+    retirement = START + timedelta(minutes=25)
+    promoted_at = retirement + timedelta(minutes=5)
+    successor_id = UUID("70000000-0000-0000-0000-00000000000b")
+    snapshot = _snapshot(
+        epochs=(
+            _epoch(retired_at=retirement, complete_through=retirement),
+            _epoch(
+                id=successor_id,
+                required_from=retirement,
+                complete_through=END,
+            ),
+        ),
+        compute_requirements=(
+            _compute_requirement(retired_at=retirement),
+            _compute_requirement(
+                epoch_id=successor_id,
+                authority_sequence=2,
+                authority_effective_from=promoted_at,
+                complete_through=END,
+            ),
+        ),
+    )
+
+    result, _ = await _summarize(
+        snapshot,
+        enabled_resources=("workspace_pod", "agent_pod"),
+    )
+
+    assert result.coverage.status == "partial"
+    assert result.coverage.required_sources_ok == 1
+    assert result.coverage.required_sources_total == 2
+    assert result.window.data_through == retirement
+    assert [item.model_dump() for item in result.coverage.unknown_ranges] == [
+        {"start": retirement, "end": promoted_at}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_agent_authority_gap_does_not_degrade_legacy_workspace_coverage() -> None:
+    gap_start = START + timedelta(minutes=10)
+    gap_end = gap_start + timedelta(minutes=5)
+    snapshot = _snapshot(
+        epochs=(_epoch(),),
+        gaps=(
+            {
+                "scope_epoch_id": EPOCH_ID,
+                "gap_start": gap_start,
+                "gap_end": gap_end,
+                "resolution": "waived",
+                "reason": ("compute-authority-awaiting-confirmation:agent_pod"),
+            },
+        ),
+    )
+
+    result, _ = await _summarize(
+        snapshot,
+        enabled_resources=("workspace_pod",),
+    )
+
+    assert result.coverage.status == "complete"
+    assert result.coverage.unknown_ranges == []
+
+
+@pytest.mark.asyncio
+async def test_pv_only_coverage_uses_pvc_as_attribution_not_claim_quantity():
+    pv_scope_id = UUID("60000000-0000-0000-0000-000000000020")
+    pvc_scope_id = UUID("60000000-0000-0000-0000-000000000021")
+    policy = _storage_policy(("volume-provisioned", "kubernetes-pods", "main-dev"))
+    snapshot = _snapshot(
+        epochs=(
+            _epoch(
+                id=UUID("70000000-0000-0000-0000-000000000020"),
+                scope_id=pv_scope_id,
+                api_resource="core/v1/persistentvolumes",
+                namespace=None,
+            ),
+            _epoch(
+                id=UUID("70000000-0000-0000-0000-000000000021"),
+                scope_id=pvc_scope_id,
+                api_resource="core/v1/persistentvolumeclaims",
+            ),
+        ),
+        storage_requirements=(
+            _storage_requirement(
+                measurement_basis="volume-provisioned",
+                inventory_scope_id=pv_scope_id,
+            ),
+            _storage_requirement(
+                measurement_basis="volume-provisioned",
+                inventory_scope_id=pvc_scope_id,
+                requirement_role="attribution",
+            ),
+        ),
+    )
+
+    result, _ = await _summarize(
+        snapshot,
+        enabled_resources=("block_volume_local_path",),
+        storage_publication_policy=policy,
+    )
+
+    assert result.coverage.status == "complete"
+    assert result.coverage.required_sources_ok == 2
+    assert result.coverage.required_sources_total == 2
+    assert result.window.data_through == END
+
+
+@pytest.mark.asyncio
+async def test_pv_only_coverage_fails_closed_without_pvc_attribution_epoch():
+    pv_scope_id = UUID("60000000-0000-0000-0000-000000000022")
+    pvc_scope_id = UUID("60000000-0000-0000-0000-000000000023")
+    policy = _storage_policy(("volume-provisioned", "kubernetes-pods", "main-dev"))
+    snapshot = _snapshot(
+        epochs=(
+            _epoch(
+                id=UUID("70000000-0000-0000-0000-000000000022"),
+                scope_id=pv_scope_id,
+                api_resource="core/v1/persistentvolumes",
+                namespace=None,
+            ),
+        ),
+        storage_requirements=(
+            _storage_requirement(
+                measurement_basis="volume-provisioned",
+                inventory_scope_id=pv_scope_id,
+            ),
+            _storage_requirement(
+                measurement_basis="volume-provisioned",
+                inventory_scope_id=pvc_scope_id,
+                requirement_role="attribution",
+            ),
+        ),
+    )
+
+    result, _ = await _summarize(
+        snapshot,
+        enabled_resources=("block_volume_local_path",),
+        storage_publication_policy=policy,
+    )
+
+    assert result.coverage.status == "partial"
+    assert result.coverage.required_sources_ok == 1
+    assert result.coverage.required_sources_total == 2
+    assert result.window.data_through == START
     assert [item.model_dump() for item in result.coverage.unknown_ranges] == [
         {"start": START, "end": END}
     ]
@@ -793,11 +1239,11 @@ async def test_visibility_and_ref_are_applied_to_app_and_audit_sources():
         call for call in app.connection.calls if "infra-read:intervals" in call[1]
     )
     assert "interval.attribution_scope = 'customer'" in interval_sql
-    assert "interval.user_id = $4" in interval_sql
-    assert "interval.project_id = ANY($5::uuid[])" in interval_sql
-    assert "interval.project_id = $6" in interval_sql
-    assert "interval.owner_id = $7" in interval_sql
-    assert interval_params[3:] == (
+    assert "interval.user_id = $7" in interval_sql
+    assert "interval.project_id = ANY($8::uuid[])" in interval_sql
+    assert "interval.project_id = $9" in interval_sql
+    assert "interval.owner_id = $10" in interval_sql
+    assert interval_params[6:] == (
         USER_ID,
         [visible_project],
         scoped_project,
@@ -812,7 +1258,7 @@ async def test_visibility_and_ref_are_applied_to_app_and_audit_sources():
     assert "visible_event.event_payload ->> 'user_id'" in correction_sql
     assert "visible_event.event_payload ->> 'project_id'" in correction_sql
     assert "visible_event.event_payload ->> 'ref_id'" in correction_sql
-    assert correction_params[3:] == (
+    assert correction_params[6:] == (
         str(USER_ID),
         [str(visible_project)],
         str(scoped_project),

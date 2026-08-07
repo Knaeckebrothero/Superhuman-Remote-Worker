@@ -22,6 +22,10 @@ from orchestrator.services.infrastructure_metering.collector_runtime import (
     TICKETS_PATH,
     WATCH_APPLY_PATH,
     WATCH_FINISH_PATH,
+    PVC_API_RESOURCE,
+    PV_API_RESOURCE,
+    VM_STORAGE_COLLECTOR_ID,
+    VMI_API_RESOURCE,
     CollectorConfigurationError,
     CollectorRuntimeError,
     IngestionTransportError,
@@ -29,6 +33,7 @@ from orchestrator.services.infrastructure_metering.collector_runtime import (
     SignedIngestionHttpClient,
     _SnapshotSpool,
     _load_kubernetes_core_api,
+    _new_vm_controller_epoch,
     _snapshot_begin_wire,
     _snapshot_finalize_wire,
     _watch_finish_wire,
@@ -60,6 +65,9 @@ from orchestrator.services.infrastructure_metering.ingestion_types import (
     InventoryTicketResponse,
     InventoryWatchFinish,
 )
+from orchestrator.services.infrastructure_metering.storage_assets import (
+    volume_identity_key_fingerprint,
+)
 from orchestrator.services.infrastructure_metering.transport import (
     NONCE_HEADER,
     canonical_json_bytes,
@@ -69,6 +77,17 @@ from orchestrator.services.infrastructure_metering.transport import (
 
 SCOPE = InventoryScope("cluster-a", "core/v1/pods", "workers")
 TICKET_TOKEN = "t" * 32
+
+
+def test_vm_controller_epoch_changes_on_same_pod_process_restart() -> None:
+    first = _new_vm_controller_epoch("collector-pod-uid")
+    second = _new_vm_controller_epoch("collector-pod-uid")
+
+    assert first.startswith("collector-pod-uid:")
+    assert second.startswith("collector-pod-uid:")
+    assert first != second
+    with pytest.raises(CollectorConfigurationError, match="POD_UID"):
+        _new_vm_controller_epoch("  ")
 
 
 def _settings(
@@ -142,6 +161,31 @@ def _pod(
                 }
             ],
         },
+    }
+
+
+def _vmi(*, resource_version: str = "21") -> dict[str, Any]:
+    return {
+        "apiVersion": "kubevirt.io/v1",
+        "kind": "VirtualMachineInstance",
+        "metadata": {
+            "name": "agent-vm-job-1",
+            "namespace": "agent-vms",
+            "uid": "vmi-uid-1",
+            "resourceVersion": resource_version,
+            "creationTimestamp": "2026-08-05T08:00:00Z",
+            "labels": {
+                "srw.io/owner-kind": "job",
+                "srw.io/owner-id": "00000000-0000-0000-0000-000000000001",
+            },
+        },
+        "spec": {
+            "domain": {
+                "cpu": {"cores": 2, "sockets": 1, "threads": 1},
+                "memory": {"guest": "4Gi"},
+            }
+        },
+        "status": {"phase": "Running", "nodeName": "vm-node-a"},
     }
 
 
@@ -271,6 +315,307 @@ async def test_snapshot_ticket_precedes_list_and_upload_is_phased_and_safe() -> 
     assert finalize["item_digest"] == begin["item_digest"]
     assert finalize["shadow_enabled"] is True
     assert "raw-secret-marker" not in json.dumps(transport.calls)
+
+
+@pytest.mark.asyncio
+async def test_vmi_snapshot_carries_controller_epoch_and_monotonic_sequence() -> None:
+    settings = InfrastructureMeteringSettings(
+        collector_enabled=True,
+        stable_cluster_id="vm-cluster",
+        namespace_allowlist=("agent-vms",),
+        vm_inventory_enabled=True,
+        vm_stable_cluster_id="vm-cluster",
+        vm_namespace="agent-vms",
+        relist_interval_seconds=15,
+        stale_after_seconds=30,
+        watch_queue_size=100,
+        max_snapshot_items=1_000,
+        max_snapshot_bytes=2 * 1024 * 1024,
+    )
+    kubernetes_client = _FakeKubernetesClient(
+        pages={
+            None: KubernetesListPage(
+                items=[_vmi()],
+                byte_count=1_000,
+                resource_version="vmi-list-rv",
+            )
+        }
+    )
+    transport = _FakeIngestionTransport()
+    runtime = KubernetesPodCollectorRuntime(
+        settings=settings,
+        collector_id="kubevirt-vmis",
+        kubernetes_client=kubernetes_client,
+        transport=transport,
+        controller_epoch="collector-pod-uid",
+    )
+    scope = InventoryScope("vm-cluster", VMI_API_RESOURCE, "agent-vms")
+
+    first = await runtime.collect_snapshot(scope)
+    await runtime.collect_snapshot(scope)
+
+    assert first.controller_epoch == "collector-pod-uid"
+    assert first.sequence == 0
+    tickets = [payload for path, payload in transport.calls if path == TICKETS_PATH]
+    begins = [
+        payload for path, payload in transport.calls if path == SNAPSHOT_BEGIN_PATH
+    ]
+    assert [ticket["sequence"] for ticket in tickets] == [0, 1]
+    assert all(ticket["controller_epoch"] == "collector-pod-uid" for ticket in tickets)
+    assert [begin["sequence"] for begin in begins] == [0, 1]
+    assert kubernetes_client.list_calls[0]["scope"].api_resource == VMI_API_RESOURCE
+
+
+@pytest.mark.asyncio
+async def test_remote_vm_server_config_does_not_replace_local_pod_scopes(
+    monkeypatch,
+) -> None:
+    settings = replace(
+        _settings(namespaces=("workers-a", "workers-b")),
+        pvc_inventory_enabled=True,
+        pv_inventory_enabled=True,
+        volume_identity_key_version="test-v1",
+        vm_inventory_enabled=True,
+        vm_stable_cluster_id="vm-cluster",
+        vm_namespace="agent-vms",
+    )
+    runtime = KubernetesPodCollectorRuntime(
+        settings=settings,
+        collector_id="kubernetes-pods",
+        kubernetes_client=_FakeKubernetesClient(),
+        transport=_FakeIngestionTransport(),
+        volume_identity_key=b"v" * 32,
+    )
+    visited: set[tuple[str, str | None]] = set()
+
+    class _Incomplete:
+        complete = False
+
+    async def fake_collect(scope: InventoryScope) -> Any:
+        visited.add((scope.api_resource, scope.namespace))
+        return _Incomplete()
+
+    monkeypatch.setattr(runtime, "collect_snapshot", fake_collect)
+    stop = asyncio.Event()
+
+    async def stop_later() -> None:
+        await asyncio.sleep(0.01)
+        stop.set()
+
+    await asyncio.gather(runtime.run(stop), stop_later())
+
+    assert visited == {
+        ("core/v1/pods", "workers-a"),
+        ("core/v1/pods", "workers-b"),
+        ("core/v1/persistentvolumeclaims", "workers-a"),
+        ("core/v1/persistentvolumeclaims", "workers-b"),
+        ("core/v1/persistentvolumes", None),
+    }
+
+
+@pytest.mark.asyncio
+async def test_vm_storage_collector_owns_only_exact_remote_pvc_and_pv_scopes(
+    monkeypatch,
+) -> None:
+    settings = replace(
+        _settings(namespaces=("workers-a", "workers-b")),
+        pvc_inventory_enabled=True,
+        vm_pvc_inventory_enabled=True,
+        vm_pv_inventory_enabled=True,
+        vm_pvc_shadow_enabled=True,
+        vm_pv_shadow_enabled=True,
+        vm_pv_cluster_wide_rbac_acknowledged=True,
+        vm_stable_cluster_id="vm-cluster",
+        vm_namespace="agent-vms",
+        volume_identity_key_version="storage-v1",
+    )
+    runtime = KubernetesPodCollectorRuntime(
+        settings=settings,
+        collector_id=VM_STORAGE_COLLECTOR_ID,
+        kubernetes_client=_FakeKubernetesClient(),
+        transport=_FakeIngestionTransport(),
+        volume_identity_key=b"i" * 32,
+    )
+    visited: set[tuple[str, str | None, bool, str]] = set()
+
+    class _Incomplete:
+        complete = False
+
+    async def fake_collect(scope: InventoryScope) -> Any:
+        visited.add(
+            (
+                scope.api_resource,
+                scope.namespace,
+                scope.cluster_scoped,
+                scope.source_cluster,
+            )
+        )
+        return _Incomplete()
+
+    monkeypatch.setattr(runtime, "collect_snapshot", fake_collect)
+    stop = asyncio.Event()
+
+    async def stop_later() -> None:
+        await asyncio.sleep(0.01)
+        stop.set()
+
+    await asyncio.gather(runtime.run(stop), stop_later())
+
+    assert visited == {
+        (PVC_API_RESOURCE, "agent-vms", False, "vm-cluster"),
+        (PV_API_RESOURCE, None, True, "vm-cluster"),
+    }
+    pvc_scope = InventoryScope("vm-cluster", PVC_API_RESOURCE, "agent-vms")
+    pv_scope = InventoryScope("vm-cluster", PV_API_RESOURCE, None, cluster_scoped=True)
+    assert runtime._scope_shadow_enabled(pvc_scope) is True
+    assert runtime._scope_shadow_enabled(pv_scope) is True
+    assert runtime._snapshot_controller_identity(pvc_scope) == (None, None)
+    assert runtime._snapshot_controller_identity(pv_scope) == (None, None)
+    assert (
+        runtime._scope_configured(
+            InventoryScope("vm-cluster", PVC_API_RESOURCE, "other")
+        )
+        is False
+    )
+    assert (
+        runtime._scope_configured(
+            InventoryScope("vm-cluster", VMI_API_RESOURCE, "agent-vms")
+        )
+        is False
+    )
+
+
+def test_vm_storage_collector_requires_its_gates_and_only_pv_requires_identity_key():
+    pvc_settings = replace(
+        _settings(),
+        vm_pvc_inventory_enabled=True,
+        vm_stable_cluster_id="vm-cluster",
+        vm_namespace="agent-vms",
+    )
+    runtime = KubernetesPodCollectorRuntime(
+        settings=pvc_settings,
+        collector_id=VM_STORAGE_COLLECTOR_ID,
+        kubernetes_client=_FakeKubernetesClient(),
+        transport=_FakeIngestionTransport(),
+    )
+    assert runtime._volume_identity_key is None
+
+    pv_settings = replace(
+        pvc_settings,
+        vm_pv_inventory_enabled=True,
+        vm_pv_cluster_wide_rbac_acknowledged=True,
+        volume_identity_key_version="storage-v1",
+    )
+    with pytest.raises(CollectorConfigurationError, match="volume identity key"):
+        KubernetesPodCollectorRuntime(
+            settings=pv_settings,
+            collector_id=VM_STORAGE_COLLECTOR_ID,
+            kubernetes_client=_FakeKubernetesClient(),
+            transport=_FakeIngestionTransport(),
+        )
+    with pytest.raises(CollectorConfigurationError, match="only the VMI collector"):
+        KubernetesPodCollectorRuntime(
+            settings=pvc_settings,
+            collector_id=VM_STORAGE_COLLECTOR_ID,
+            kubernetes_client=_FakeKubernetesClient(),
+            transport=_FakeIngestionTransport(),
+            controller_epoch="must-not-exist",
+        )
+    with pytest.raises(CollectorConfigurationError, match="identity is unsupported"):
+        KubernetesPodCollectorRuntime(
+            settings=pvc_settings,
+            collector_id="typo-storage",
+            kubernetes_client=_FakeKubernetesClient(),
+            transport=_FakeIngestionTransport(),
+        )
+
+
+@pytest.mark.asyncio
+async def test_vm_storage_pv_uses_volume_identity_key_not_ingestion_hmac() -> None:
+    identity_key = b"volume-identity-key-material-32b!!"
+    raw_handle = "provider-private-volume-handle"
+    settings = replace(
+        _settings(shadow=False),
+        vm_pv_inventory_enabled=True,
+        vm_pv_cluster_wide_rbac_acknowledged=True,
+        vm_stable_cluster_id="vm-cluster",
+        vm_namespace="agent-vms",
+        volume_identity_key_version="storage-v1",
+    )
+    kubernetes_client = _FakeKubernetesClient(
+        pages={
+            None: KubernetesListPage(
+                items=[
+                    {
+                        "apiVersion": "v1",
+                        "kind": "PersistentVolume",
+                        "metadata": {
+                            "uid": "pv-kubernetes-uid",
+                            "name": "pv-a",
+                            "resourceVersion": "21",
+                        },
+                        "spec": {
+                            "capacity": {"storage": "8Gi"},
+                            "persistentVolumeReclaimPolicy": "Retain",
+                            "csi": {
+                                "driver": "csi.example.test",
+                                "volumeHandle": raw_handle,
+                            },
+                        },
+                    }
+                ],
+                byte_count=1_000,
+                resource_version="pv-list-rv",
+            )
+        }
+    )
+    transport = _FakeIngestionTransport()
+    runtime = KubernetesPodCollectorRuntime(
+        settings=settings,
+        collector_id=VM_STORAGE_COLLECTOR_ID,
+        kubernetes_client=kubernetes_client,
+        transport=transport,
+        volume_identity_key=identity_key,
+    )
+
+    await runtime.collect_snapshot(
+        InventoryScope("vm-cluster", PV_API_RESOURCE, None, cluster_scoped=True)
+    )
+
+    batch = next(
+        payload for path, payload in transport.calls if path == SNAPSHOT_ITEMS_PATH
+    )
+    normalized = batch["items"][0]["normalized"]
+    identity = normalized["volume_identity"]
+    assert identity["key_version"] == "storage-v1"
+    assert identity["key_fingerprint"] == volume_identity_key_fingerprint(identity_key)
+    assert raw_handle not in json.dumps(transport.calls)
+    ticket = next(payload for path, payload in transport.calls if path == TICKETS_PATH)
+    assert ticket["controller_epoch"] is None
+    assert ticket["sequence"] is None
+
+
+def test_vmi_collector_identity_requires_vm_gate_and_process_epoch() -> None:
+    with pytest.raises(CollectorConfigurationError, match="requires VM inventory"):
+        KubernetesPodCollectorRuntime(
+            settings=_settings(),
+            collector_id="kubevirt-vmis",
+            kubernetes_client=_FakeKubernetesClient(),
+            transport=_FakeIngestionTransport(),
+            controller_epoch="pod:process",
+        )
+    with pytest.raises(CollectorConfigurationError, match="controller epoch"):
+        KubernetesPodCollectorRuntime(
+            settings=replace(
+                _settings(),
+                vm_inventory_enabled=True,
+                vm_stable_cluster_id="vm-cluster",
+                vm_namespace="agent-vms",
+            ),
+            collector_id="kubevirt-vmis",
+            kubernetes_client=_FakeKubernetesClient(),
+            transport=_FakeIngestionTransport(),
+        )
 
 
 @pytest.mark.asyncio

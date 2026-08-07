@@ -6,6 +6,9 @@ metadata:
     {{- include "srwvm.componentLabels" (dict "context" . "component" "vm-controller") | nindent 4 }}
 spec:
   replicas: {{ .Values.vmController.replicas }}
+  # Lifecycle create/delete locking is process-local; avoid rollout overlap.
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       {{- include "srwvm.componentSelectorLabels" (dict "context" . "component" "vm-controller") | nindent 6 }}
@@ -53,6 +56,13 @@ spec:
               value: {{ .Values.vmController.vmStorageClass | quote }}
             - name: VM_DISK_SIZE
               value: {{ .Values.vmController.vmDiskSize | quote }}
+            {{- if .Values.vmController.lifecycleAuthSecretName }}
+            - name: VM_LIFECYCLE_HMAC_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.vmController.lifecycleAuthSecretName | quote }}
+                  key: {{ .Values.vmController.lifecycleAuthSecretKey | default "VM_LIFECYCLE_HMAC_SECRET" | quote }}
+            {{- end }}
             # Golden-image boot acceleration
             # (docs/features/vm_golden_image_boot_acceleration.md)
             - name: VM_GOLDEN_IMAGE_ENABLED

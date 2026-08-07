@@ -23,6 +23,7 @@ from orchestrator.services.infrastructure_metering.ingestion_http import (
 )
 from orchestrator.services.infrastructure_metering.ingestion_types import (
     InventoryItemWire,
+    InventoryScopeWire,
     InventorySnapshotFinalize,
     InventoryTicketRequest,
     InventoryWatchApply,
@@ -37,6 +38,9 @@ from orchestrator.services.infrastructure_metering.collectors.pod_normalization 
 from orchestrator.services.infrastructure_metering.collectors.storage_normalization import (
     normalize_pv,
     normalize_pvc,
+)
+from orchestrator.services.infrastructure_metering.collectors.vmi_normalization import (
+    normalize_vmi,
 )
 from orchestrator.services.infrastructure_metering.inventory import (
     InventoryFenceError,
@@ -121,6 +125,47 @@ def _meterable_item() -> dict:
     }
 
 
+def _meterable_vmi_item() -> dict:
+    vmi = normalize_vmi(
+        {
+            "apiVersion": "kubevirt.io/v1",
+            "kind": "VirtualMachineInstance",
+            "metadata": {
+                "name": "agent-vm-job-1",
+                "namespace": "agent-vms",
+                "uid": "vmi-uid-1",
+                "resourceVersion": "21",
+                "creationTimestamp": "2026-08-05T11:59:00Z",
+                "labels": {
+                    "srw.io/owner-kind": "job",
+                    "srw.io/owner-id": "00000000-0000-0000-0000-000000000001",
+                },
+            },
+            "spec": {
+                "domain": {
+                    "cpu": {"cores": 2, "sockets": 1, "threads": 1},
+                    "memory": {"guest": "4Gi"},
+                }
+            },
+            "status": {"phase": "Running", "nodeName": "vm-node-a"},
+        }
+    )
+    return {
+        "scope": {
+            "source_cluster": "vm-cluster",
+            "api_resource": "kubevirt.io/v1/virtualmachineinstances",
+            "namespace": "agent-vms",
+            "cluster_scoped": False,
+        },
+        "snapshot_id": uuid4(),
+        "kind": "vmi",
+        "uid": vmi.uid,
+        "revision_hash": vmi.revision_hash,
+        "valid_for_metering": True,
+        "normalized": normalized_payload(vmi),
+    }
+
+
 def test_server_accepts_only_the_allowlisted_normalized_pod_projection():
     valid = InventoryItemWire.model_validate(_meterable_item())
     projected = InfrastructureIngestionService._inventory_item(valid)
@@ -145,6 +190,237 @@ def test_server_accepts_only_the_allowlisted_normalized_pod_projection():
         with pytest.raises(IngestionRequestError, match="payload is invalid") as exc:
             InfrastructureIngestionService._inventory_item(wire)
         assert exc.value.status_code == 400
+
+
+def test_server_accepts_strict_vmi_projection_and_exact_remote_scope() -> None:
+    wire = InventoryItemWire.model_validate(_meterable_vmi_item())
+    projected = InfrastructureIngestionService._inventory_item(wire)
+    assert projected.source_kind == "vmi"
+
+    service = object.__new__(InfrastructureIngestionService)
+    service.settings = InfrastructureMeteringSettings(
+        collector_enabled=True,
+        stable_cluster_id="dev-cluster",
+        namespace_allowlist=("srw",),
+        vm_inventory_enabled=True,
+        vm_stable_cluster_id="vm-cluster",
+        vm_namespace="agent-vms",
+    )
+    service._collector_id = "kubernetes-pods"
+    scope = service._scope(wire.scope, "kubevirt-vmis")
+    assert scope.source_cluster == "vm-cluster"
+    assert scope.api_resource == "kubevirt.io/v1/virtualmachineinstances"
+    with pytest.raises(IngestionRequestError, match="scope is not allowed"):
+        service._scope(wire.scope, "kubernetes-pods")
+
+
+def test_remote_collector_requires_a_distinct_hmac_key() -> None:
+    settings = InfrastructureMeteringSettings(
+        collector_enabled=True,
+        stable_cluster_id="dev-cluster",
+        namespace_allowlist=("srw",),
+        vm_inventory_enabled=True,
+        vm_stable_cluster_id="vm-cluster",
+        vm_namespace="agent-vms",
+    )
+    with pytest.raises(ValueError, match="keys must be distinct"):
+        InfrastructureIngestionService(
+            None,  # type: ignore[arg-type]
+            None,  # type: ignore[arg-type]
+            settings,
+            ingestion_key=b"p" * 32,
+            additional_ingestion_keys={"kubevirt-vmis": b"p" * 32},
+        )
+
+
+def test_vm_storage_hmac_and_scope_are_distinct_from_local_and_vmi_authorities():
+    settings = InfrastructureMeteringSettings(
+        collector_enabled=True,
+        shadow_enabled=True,
+        pvc_inventory_enabled=True,
+        pv_inventory_enabled=True,
+        vm_inventory_enabled=True,
+        vm_pvc_inventory_enabled=True,
+        vm_pv_inventory_enabled=True,
+        vm_pvc_shadow_enabled=True,
+        vm_pv_shadow_enabled=True,
+        vm_pv_cluster_wide_rbac_acknowledged=True,
+        vm_stable_cluster_id="vm-cluster",
+        vm_namespace="agent-vms",
+        stable_cluster_id="dev-cluster",
+        namespace_allowlist=("srw",),
+        volume_identity_key_version="storage-v1",
+    )
+    service = InfrastructureIngestionService(
+        None,  # type: ignore[arg-type]
+        None,  # type: ignore[arg-type]
+        settings,
+        ingestion_key=b"p" * 32,
+        additional_ingestion_keys={
+            "kubevirt-vmis": b"v" * 32,
+            "kubevirt-storage": b"s" * 32,
+        },
+    )
+    assert set(service._ingestion_keys) == {
+        "kubernetes-pods",
+        "kubevirt-vmis",
+        "kubevirt-storage",
+    }
+    assert service._vm_storage_reconciler.interval_mutations_enabled is True
+
+    remote_pvc = InventoryScopeWire(
+        source_cluster="vm-cluster",
+        api_resource="core/v1/persistentvolumeclaims",
+        namespace="agent-vms",
+        cluster_scoped=False,
+    )
+    remote_pv = InventoryScopeWire(
+        source_cluster="vm-cluster",
+        api_resource="core/v1/persistentvolumes",
+        namespace=None,
+        cluster_scoped=True,
+    )
+    pvc_scope = service._scope(remote_pvc, "kubevirt-storage")
+    pv_scope = service._scope(remote_pv, "kubevirt-storage")
+    assert service._scope_shadow_enabled(pvc_scope) is True
+    assert service._scope_shadow_enabled(pv_scope) is True
+
+    rejected = (
+        (remote_pvc, "kubevirt-vmis"),
+        (remote_pv, "kubevirt-vmis"),
+        (remote_pvc, "kubernetes-pods"),
+        (
+            InventoryScopeWire(
+                source_cluster="vm-cluster",
+                api_resource="core/v1/persistentvolumeclaims",
+                namespace="other",
+                cluster_scoped=False,
+            ),
+            "kubevirt-storage",
+        ),
+        (
+            InventoryScopeWire(
+                source_cluster="other-cluster",
+                api_resource="core/v1/persistentvolumes",
+                namespace=None,
+                cluster_scoped=True,
+            ),
+            "kubevirt-storage",
+        ),
+    )
+    for wire, collector_id in rejected:
+        with pytest.raises(IngestionRequestError, match="scope is not allowed"):
+            service._scope(wire, collector_id)
+
+    # Local storage remains owned by the primary identity and its original
+    # source/namespace gates.
+    local_pvc = InventoryScopeWire(
+        source_cluster="dev-cluster",
+        api_resource="core/v1/persistentvolumeclaims",
+        namespace="srw",
+        cluster_scoped=False,
+    )
+    assert service._scope(local_pvc, "kubernetes-pods").collector_id == (
+        "kubernetes-pods"
+    )
+    with pytest.raises(IngestionRequestError, match="scope is not allowed"):
+        service._scope(local_pvc, "kubevirt-storage")
+
+    with pytest.raises(ValueError, match="keys must be distinct"):
+        InfrastructureIngestionService(
+            None,  # type: ignore[arg-type]
+            None,  # type: ignore[arg-type]
+            settings,
+            ingestion_key=b"p" * 32,
+            additional_ingestion_keys={
+                "kubevirt-vmis": b"x" * 32,
+                "kubevirt-storage": b"x" * 32,
+            },
+        )
+
+
+@pytest.mark.asyncio
+async def test_vm_storage_shadow_wires_source_activation_reconciler() -> None:
+    model = InventorySnapshotFinalize.model_validate(
+        {
+            "ticket_id": uuid4(),
+            "ticket_token": "t" * 32,
+            "snapshot_id": uuid4(),
+            "scope": {
+                "source_cluster": "vm-cluster",
+                "api_resource": "core/v1/persistentvolumeclaims",
+                "namespace": "agent-vms",
+                "cluster_scoped": False,
+            },
+            "shadow_enabled": True,
+            "collection_completed_at": datetime(2026, 8, 5, 12, tzinfo=timezone.utc),
+            "complete": True,
+            "resource_version": "17",
+            "item_count": 0,
+            "item_digest": (
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            ),
+            "fatal_errors": [],
+        }
+    )
+    settings = InfrastructureMeteringSettings(
+        collector_enabled=True,
+        shadow_enabled=True,
+        vm_pvc_inventory_enabled=True,
+        vm_pvc_shadow_enabled=True,
+        vm_stable_cluster_id="vm-cluster",
+        vm_namespace="agent-vms",
+        stable_cluster_id="dev-cluster",
+        namespace_allowlist=("srw",),
+    )
+    store = SimpleNamespace(
+        finalize_snapshot=AsyncMock(
+            return_value=SimpleNamespace(
+                snapshot_id=model.snapshot_id,
+                complete=True,
+                present_items=0,
+                invalid_items=0,
+                confirmed_intervals=0,
+                closed_intervals=0,
+                pending_valid_items=0,
+                shadow_comparisons=0,
+                replayed=False,
+            )
+        )
+    )
+    service = InfrastructureIngestionService(
+        None,  # type: ignore[arg-type]
+        store,  # type: ignore[arg-type]
+        settings,
+        ingestion_key=b"p" * 32,
+        additional_ingestion_keys={"kubevirt-storage": b"s" * 32},
+    )
+    service._authenticated = AsyncMock(  # type: ignore[method-assign]
+        return_value=(
+            model,
+            SimpleNamespace(
+                collector_id="kubevirt-storage",
+                transport_claim=TransportNonceClaim(
+                    collector_id="kubevirt-storage",
+                    request_nonce=uuid4(),
+                    request_kind="snapshot-finalize",
+                    request_digest="a" * 64,
+                ),
+            ),
+        )
+    )
+
+    await service.snapshot_finalize(SimpleNamespace())  # type: ignore[arg-type]
+
+    kwargs = store.finalize_snapshot.await_args.kwargs
+    assert kwargs["interval_mutator"] == service._vm_storage_reconciler.apply_snapshot
+    assert kwargs["observation_hook"].__self__ is service._vm_storage_reconciler
+    assert kwargs["absence_mutator"] is None
+    assert kwargs["reconcile_intervals"] is True
+    assert service._vm_storage_reconciler.interval_mutations_enabled is True
+    assert settings.publication_enabled is False
+    assert settings.pvc_publication_enabled is False
+    assert settings.pv_publication_enabled is False
 
 
 def test_server_binds_normalized_pod_identity_validity_and_revision():
@@ -549,6 +825,81 @@ async def test_snapshot_ticket_rechecks_continuity_at_store_admission():
         store.issue_ingest_ticket.await_args.kwargs["require_healthy_continuity"]
         is True
     )
+
+
+@pytest.mark.asyncio
+async def test_vmi_ticket_fences_controller_restart_into_recovery_epoch():
+    scope = InventoryScopeIdentity(
+        collector_id="kubevirt-vmis",
+        source_cluster="vm-cluster",
+        api_resource="kubevirt.io/v1/virtualmachineinstances",
+        namespace="agent-vms",
+    )
+    model = InventoryTicketRequest.model_validate(
+        {
+            "scope": {
+                "source_cluster": scope.source_cluster,
+                "api_resource": scope.api_resource,
+                "namespace": scope.namespace,
+                "cluster_scoped": False,
+            },
+            "intent": "snapshot",
+            "snapshot_id": uuid4(),
+            "controller_epoch": "new-collector-pod-uid",
+            "sequence": 0,
+        }
+    )
+    claim = TransportNonceClaim(
+        collector_id=scope.collector_id,
+        request_nonce=uuid4(),
+        request_kind="snapshot-ticket",
+        request_digest="9" * 64,
+    )
+    epoch_id = uuid4()
+    store = SimpleNamespace(
+        start_controller_epoch_recovery=AsyncMock(),
+        issue_ingest_ticket=AsyncMock(),
+    )
+    service = object.__new__(InfrastructureIngestionService)
+    service.settings = InfrastructureMeteringSettings(
+        collector_enabled=True,
+        stable_cluster_id="dev-cluster",
+        namespace_allowlist=("srw",),
+        vm_inventory_enabled=True,
+        vm_stable_cluster_id="vm-cluster",
+        vm_namespace="agent-vms",
+    )
+    service.store = store
+    service._authenticated = AsyncMock(  # type: ignore[method-assign]
+        return_value=(
+            model,
+            SimpleNamespace(
+                collector_id=scope.collector_id,
+                body=b"{}",
+                transport_claim=claim,
+            ),
+        )
+    )
+    service._scope = lambda *_args: scope  # type: ignore[method-assign]
+    service._ensure_scope_epoch = AsyncMock(  # type: ignore[method-assign]
+        return_value={
+            "id": epoch_id,
+            "continuity_health": "healthy",
+            "controller_epoch": "old-collector-pod-uid",
+            "last_sequence": 12,
+        }
+    )
+
+    with pytest.raises(IngestionRequestError, match="recovery started") as raised:
+        await service.ticket(SimpleNamespace())  # type: ignore[arg-type]
+
+    assert raised.value.status_code == 409
+    store.start_controller_epoch_recovery.assert_awaited_once()
+    recovery_claim = store.start_controller_epoch_recovery.await_args.kwargs[
+        "transport"
+    ]
+    assert recovery_claim.request_kind == "controller-epoch-change"
+    store.issue_ingest_ticket.assert_not_awaited()
 
 
 @pytest.mark.asyncio

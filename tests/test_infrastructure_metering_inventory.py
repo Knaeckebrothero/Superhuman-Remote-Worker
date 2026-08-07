@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 from uuid import uuid4
 
 import pytest
 
 from orchestrator.services.infrastructure_metering.inventory import (
     _RECONCILIATION_COUNTS_SQL,
+    InventoryConflictError,
     InventoryContractError,
     InventoryItem,
     InventoryPurgeResult,
@@ -113,6 +116,149 @@ def test_watch_events_require_positive_bounded_identity_evidence() -> None:
         source_uid="uid-1",
     )
     assert deleted.identity == ("pod", "uid-1")
+
+
+class _AsyncContext:
+    def __init__(self, value=None) -> None:
+        self.value = value
+
+    async def __aenter__(self):
+        return self.value
+
+    async def __aexit__(self, *_args):
+        return False
+
+
+def _dark_watch_store():
+    session_id = uuid4()
+    epoch_id = uuid4()
+    scope_id = uuid4()
+    event_id = uuid4()
+    session = {
+        "id": session_id,
+        "scope_epoch_id": epoch_id,
+        "leader_generation": 7,
+        "last_resource_version": "rv-1",
+        "committed_events": 0,
+        "committed_bytes": 0,
+        "max_events": 100,
+        "max_bytes": 1_000_000,
+        "consumed_at": None,
+    }
+    epoch = {
+        "id": epoch_id,
+        "scope_id": scope_id,
+        "source_cluster": "cluster-a",
+        "namespace": "workers",
+        "collector_id": "kubernetes",
+        "last_resource_version": "rv-1",
+    }
+    stored = {
+        "id": event_id,
+        "event_type": "modified",
+        "resource_version": "rv-2",
+        "expected_resource_version": "rv-1",
+        "mutation_action": "not-applicable",
+        "received_at": NOW,
+        "affected_interval_id": None,
+        "coverage_gap_id": None,
+    }
+    conn = SimpleNamespace()
+
+    async def fetchrow(sql, *_args):
+        if "INSERT INTO resource_inventory_watch_events" in sql:
+            return stored
+        if "FROM resource_inventory_watch_sessions" in sql:
+            return session
+        if "FROM resource_inventory_watch_events" in sql:
+            return None
+        if "FROM resource_intervals" in sql:
+            return None
+        raise AssertionError(f"unexpected fetchrow SQL: {sql}")
+
+    async def fetchval(sql, *_args):
+        if "statement_timestamp" in sql:
+            return NOW
+        if "SELECT TRUE FROM resource_intervals" in sql:
+            return False
+        if "UPDATE resource_inventory_scope_epochs" in sql:
+            return True
+        raise AssertionError(f"unexpected fetchval SQL: {sql}")
+
+    conn.fetchrow = AsyncMock(side_effect=fetchrow)
+    conn.fetchval = AsyncMock(side_effect=fetchval)
+    conn.execute = AsyncMock()
+    conn.transaction = lambda: _AsyncContext()
+    pool = SimpleNamespace(acquire=lambda: _AsyncContext(conn))
+    store = InventoryStore(pool)
+    store._lock_watch_session = AsyncMock(return_value=(session, epoch))
+    store._claim_transport_nonce = AsyncMock()
+    scope = InventoryScopeIdentity(
+        collector_id="kubernetes",
+        source_cluster="cluster-a",
+        api_resource="core/v1/pods",
+        namespace="workers",
+    )
+    transport = TransportNonceClaim(
+        collector_id="kubernetes",
+        request_nonce=uuid4(),
+        request_kind="watch-event",
+        request_digest="a" * 64,
+    )
+    event = WatchObjectEvent(
+        event_type=WatchEventKind.MODIFIED,
+        resource_version="rv-2",
+        collector_observed_at=NOW,
+        event_bytes=10,
+        item=_valid("uid-1"),
+    )
+    return store, conn, session_id, event_id, scope, transport, event
+
+
+@pytest.mark.asyncio
+async def test_inventory_only_watch_runs_dark_hook_without_interval_sql() -> None:
+    store, conn, session_id, event_id, scope, transport, event = _dark_watch_store()
+    mutator = AsyncMock(return_value=None)
+
+    result = await store.apply_watch_event(
+        "t" * 32,
+        session_id,
+        event_id,
+        "a" * 64,
+        "rv-1",
+        event,
+        scope=scope,
+        transport=transport,
+        interval_mutator=mutator,
+        reconcile_intervals=False,
+    )
+
+    assert result.mutation_action.value == "not-applicable"
+    mutator.assert_awaited_once()
+    assert mutator.await_args.args[1].existing_interval_id is None
+    assert not any(
+        "UPDATE resource_intervals" in str(call.args[0])
+        for call in conn.execute.await_args_list
+    )
+
+
+@pytest.mark.asyncio
+async def test_inventory_only_watch_rejects_mutator_returned_interval() -> None:
+    store, _conn, session_id, event_id, scope, transport, event = _dark_watch_store()
+
+    with pytest.raises(InventoryConflictError, match="returned an interval"):
+        await store.apply_watch_event(
+            "t" * 32,
+            session_id,
+            event_id,
+            "a" * 64,
+            "rv-1",
+            event,
+            scope=scope,
+            transport=transport,
+            interval_mutator=AsyncMock(return_value=uuid4()),
+            reconcile_intervals=False,
+        )
 
 
 def test_scope_and_snapshot_contracts_do_not_accept_caller_receipt_time() -> None:

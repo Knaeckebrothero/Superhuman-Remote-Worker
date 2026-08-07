@@ -101,6 +101,68 @@ def _pvc_item(
     )
 
 
+def _vm_rootdisk_item(
+    *,
+    owner_kind: str = "job",
+    owner_id: UUID = OWNER_ID,
+    name: str | None = None,
+    labels: dict[str, str] | None = None,
+) -> InventoryItem:
+    return _pvc_item(
+        name=name or f"agent-vm-{owner_id}-rootdisk",
+        labels=labels
+        or {
+            "srw.io/rootdisk": "true",
+            "srw.io/owner-kind": owner_kind,
+            "srw.io/owner-id": str(owner_id),
+            # Historical controller label: identifier-only for both kinds.
+            "job-id": str(owner_id),
+        },
+    )
+
+
+def _vm_rootdisk_owner_row(
+    *,
+    owner_kind: str = "job",
+    owner_id: UUID = OWNER_ID,
+    vm_name: str | None = None,
+    namespace: str = "srw",
+    vm_status: str = "deleted",
+    context_owner_kind: str | None = None,
+    context_owner_id: UUID | None = None,
+    rootdisk_pvc_uid: str | None = "claim-uid-1",
+    identity_authenticated: bool | None = True,
+    provision_generation: str | None = "00000000-0000-4000-8000-000000000001",
+    identity_provision_generation: str | None = (
+        "00000000-0000-4000-8000-000000000001"
+    ),
+) -> dict[str, object]:
+    vm_context: dict[str, object] = {
+        "status": vm_status,
+        "vm_name": f"agent-vm-{owner_id}" if vm_name is None else vm_name,
+        "namespace": namespace,
+    }
+    if identity_authenticated is not None:
+        vm_context["identity_authenticated"] = identity_authenticated
+    if provision_generation is not None:
+        vm_context["provision_generation"] = provision_generation
+    if identity_provision_generation is not None:
+        vm_context["identity_provision_generation"] = identity_provision_generation
+    if rootdisk_pvc_uid is not None:
+        vm_context["rootdisk_pvc_uid"] = rootdisk_pvc_uid
+    if context_owner_kind is not None:
+        vm_context["owner_kind"] = context_owner_kind
+    if context_owner_id is not None:
+        vm_context["owner_id"] = str(context_owner_id)
+    return {
+        "owner_kind": owner_kind,
+        "owner_id": owner_id,
+        "user_id": USER_ID,
+        "project_id": PROJECT_ID,
+        "vm_context": vm_context,
+    }
+
+
 def _volume_item(
     *,
     source_uid: str = "c" * 64,
@@ -282,7 +344,7 @@ def test_untrusted_or_noncanonical_claim_owner_hints_remain_unknown(
             {"srw.io/rootdisk": "true", "srw/job-id": str(OWNER_ID)},
             "vm_rootdisk_claim",
             "unknown",
-            "vm-owner-awaits-slice3",
+            "vm-owner-hint-missing",
         ),
         (
             "golden-image-claim",
@@ -320,6 +382,122 @@ def test_vm_platform_and_unknown_claim_classification_is_explicit(
     assert projection.static_attribution is not None
     assert projection.static_attribution.scope == scope
     assert projection.classification_reason == reason
+
+
+@pytest.mark.parametrize("owner_kind", ["job", "thread"])
+@pytest.mark.parametrize("rootdisk_marker", [True, False])
+def test_vm_rootdisk_requires_canonical_owner_and_exact_deterministic_name(
+    owner_kind: str,
+    rootdisk_marker: bool,
+) -> None:
+    labels = {
+        "srw.io/owner-kind": owner_kind,
+        "srw.io/owner-id": str(OWNER_ID),
+        "job-id": str(OWNER_ID),
+    }
+    if rootdisk_marker:
+        labels["srw.io/rootdisk"] = "true"
+
+    projection = project_storage_item(
+        _vm_rootdisk_item(owner_kind=owner_kind, labels=labels)
+    )
+
+    assert projection.source_kind == "pvc"
+    assert projection.resource == "vm_rootdisk_claim"
+    assert projection.owner_hint is not None
+    assert projection.owner_hint.kind == owner_kind
+    assert projection.owner_hint.id == OWNER_ID
+    assert projection.static_attribution is None
+    assert not projection.attribution_ambiguous
+
+
+@pytest.mark.parametrize(
+    ("labels", "name", "reason"),
+    [
+        (
+            {"srw.io/rootdisk": "true", "srw.io/owner-id": str(OWNER_ID)},
+            f"agent-vm-{OWNER_ID}-rootdisk",
+            "vm-owner-hint-missing",
+        ),
+        (
+            {
+                "srw.io/rootdisk": "true",
+                "srw.io/owner-kind": "customer",
+                "srw.io/owner-id": str(OWNER_ID),
+            },
+            f"agent-vm-{OWNER_ID}-rootdisk",
+            "vm-owner-hint-invalid",
+        ),
+        (
+            {
+                "srw.io/rootdisk": "true",
+                "srw.io/owner-kind": "job",
+                "srw.io/owner-id": "11111111-2222-4333-8444-55555555555",
+            },
+            f"agent-vm-{OWNER_ID}-rootdisk",
+            "vm-owner-hint-invalid",
+        ),
+        (
+            {
+                "srw.io/rootdisk": "true",
+                "srw.io/owner-kind": "job",
+                "srw.io/owner-id": str(OWNER_ID),
+            },
+            "agent-vm-spoofed-rootdisk",
+            "vm-rootdisk-name-mismatch",
+        ),
+        (
+            {
+                "srw.io/rootdisk": "true",
+                "srw.io/owner-kind": "job",
+                "srw.io/owner-id": str(OWNER_ID),
+                "job-id": str(USER_ID),
+            },
+            f"agent-vm-{OWNER_ID}-rootdisk",
+            "vm-owner-hint-conflict",
+        ),
+        (
+            {
+                "srw.io/rootdisk": "true",
+                "srw.io/owner-kind": "thread",
+                "srw.io/owner-id": str(OWNER_ID),
+                "srw/job-id": str(OWNER_ID),
+            },
+            f"agent-vm-{OWNER_ID}-rootdisk",
+            "vm-owner-hint-conflict",
+        ),
+        (
+            {
+                "srw.io/rootdisk": "false",
+                "srw.io/owner-kind": "job",
+                "srw.io/owner-id": str(OWNER_ID),
+            },
+            f"agent-vm-{OWNER_ID}-rootdisk",
+            "vm-rootdisk-classification-conflict",
+        ),
+        (
+            {
+                "srw.io/rootdisk": "true",
+                "srw.io/golden-image": "true",
+                "srw.io/owner-kind": "job",
+                "srw.io/owner-id": str(OWNER_ID),
+            },
+            f"agent-vm-{OWNER_ID}-rootdisk",
+            "vm-rootdisk-classification-conflict",
+        ),
+    ],
+)
+def test_missing_invalid_or_conflicting_vm_rootdisk_hints_remain_unknown(
+    labels: dict[str, str], name: str, reason: str
+) -> None:
+    projection = project_storage_item(_vm_rootdisk_item(name=name, labels=labels))
+
+    assert projection.resource == "vm_rootdisk_claim"
+    assert projection.owner_hint is None
+    assert projection.static_attribution is not None
+    assert projection.static_attribution.scope == "unknown"
+    assert projection.classification_reason == reason
+    assert projection.attribution_ambiguous
 
 
 def test_pending_unmounted_and_deletion_requested_claims_still_accrue() -> None:
@@ -364,6 +542,137 @@ async def test_claim_customer_attribution_requires_live_app_database_owner() -> 
     unresolved = await reconciler._resolve_claim_owner(conn, projection)
     assert unresolved.scope == "unknown"
     assert unresolved.reason_code == "owner-row-missing"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("owner_kind", "vm_status"),
+    [("job", "deleted"), ("thread", "suspended")],
+)
+async def test_vm_rootdisk_owner_uses_persisted_context_without_vmi_liveness(
+    owner_kind: str,
+    vm_status: str,
+) -> None:
+    projection = project_storage_item(_vm_rootdisk_item(owner_kind=owner_kind))
+    conn = AsyncMock()
+    conn.fetchrow.return_value = _vm_rootdisk_owner_row(
+        owner_kind=owner_kind,
+        vm_status=vm_status,
+        context_owner_kind=owner_kind,
+        context_owner_id=OWNER_ID,
+    )
+
+    attribution = await StorageIntervalReconciler._resolve_claim_owner(conn, projection)
+
+    assert attribution.scope == "customer"
+    assert attribution.owner_kind == owner_kind
+    assert attribution.owner_id == OWNER_ID
+    assert attribution.user_id == USER_ID
+    assert attribution.project_id == PROJECT_ID
+    assert attribution.source == "app-db-vm-rootdisk-owner-identity"
+    assert attribution.reason_code == f"{owner_kind}-vm-rootdisk-identity"
+    query = conn.fetchrow.await_args.args[0]
+    assert f"FROM {'jobs' if owner_kind == 'job' else 'threads'}" in query
+    assert "virtualmachine" not in query.lower()
+    assert "datavolume" not in query.lower()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("row", "reason"),
+    [
+        (None, "owner-row-missing"),
+        (
+            _vm_rootdisk_owner_row(owner_id=USER_ID),
+            "owner-row-identity-mismatch",
+        ),
+        (
+            {**_vm_rootdisk_owner_row(), "vm_context": None},
+            "vm-context-missing",
+        ),
+        (
+            _vm_rootdisk_owner_row(identity_authenticated=False),
+            "vm-identity-unauthenticated",
+        ),
+        (
+            _vm_rootdisk_owner_row(provision_generation=None),
+            "vm-identity-generation-missing",
+        ),
+        (
+            _vm_rootdisk_owner_row(
+                identity_provision_generation=("00000000-0000-4000-8000-000000000002")
+            ),
+            "vm-identity-generation-mismatch",
+        ),
+        (
+            _vm_rootdisk_owner_row(vm_name="agent-vm-spoofed"),
+            "vm-name-mismatch",
+        ),
+        (_vm_rootdisk_owner_row(vm_name=""), "vm-name-mismatch"),
+        (
+            _vm_rootdisk_owner_row(namespace="another-namespace"),
+            "vm-namespace-mismatch",
+        ),
+        (
+            _vm_rootdisk_owner_row(rootdisk_pvc_uid=None),
+            "rootdisk-pvc-uid-missing",
+        ),
+        (
+            _vm_rootdisk_owner_row(rootdisk_pvc_uid="replaced-claim-uid"),
+            "rootdisk-pvc-uid-mismatch",
+        ),
+        (
+            _vm_rootdisk_owner_row(rootdisk_pvc_uid="invalid uid"),
+            "rootdisk-pvc-uid-invalid",
+        ),
+        (
+            _vm_rootdisk_owner_row(context_owner_kind="thread"),
+            "vm-owner-identity-mismatch",
+        ),
+        (
+            _vm_rootdisk_owner_row(context_owner_kind=""),
+            "vm-owner-identity-mismatch",
+        ),
+        (
+            _vm_rootdisk_owner_row(context_owner_id=USER_ID),
+            "vm-owner-identity-mismatch",
+        ),
+    ],
+)
+async def test_spoofed_vm_rootdisk_owner_or_context_remains_unknown(
+    row: dict[str, object] | None,
+    reason: str,
+) -> None:
+    projection = project_storage_item(_vm_rootdisk_item())
+    conn = AsyncMock()
+    conn.fetchrow.return_value = row
+
+    attribution = await StorageIntervalReconciler._resolve_claim_owner(conn, projection)
+
+    assert attribution.scope == "unknown"
+    assert attribution.owner_id is None
+    assert attribution.user_id is None
+    assert attribution.project_id is None
+    assert attribution.reason_code == reason
+
+
+@pytest.mark.asyncio
+async def test_unresolved_vm_rootdisk_hint_never_queries_owner_or_vm_state() -> None:
+    projection = project_storage_item(
+        _vm_rootdisk_item(
+            labels={
+                "srw.io/rootdisk": "true",
+                "srw.io/owner-kind": "job",
+            }
+        )
+    )
+    conn = AsyncMock()
+
+    attribution = await StorageIntervalReconciler._resolve_claim_owner(conn, projection)
+
+    assert attribution.scope == "unknown"
+    assert attribution.reason_code == "vm-owner-hint-missing"
+    conn.fetchrow.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -579,6 +888,45 @@ async def test_disabled_activation_leaves_valid_claim_inventory_only() -> None:
 
 
 @pytest.mark.asyncio
+async def test_dark_remote_reconciler_never_consults_activation_or_opens_interval():
+    context = SnapshotIntervalMutationContext(
+        snapshot_id=uuid4(),
+        scope_epoch_id=uuid4(),
+        inventory_scope_id=uuid4(),
+        source_cluster="vm-cluster",
+        namespace="agent-vms",
+        received_at=RECEIVED_AT,
+        existing_interval_id=None,
+        existing_source_revision=None,
+    )
+    conn = AsyncMock()
+    conn.fetchrow.return_value = {
+        "id": OWNER_ID,
+        "user_id": USER_ID,
+        "project_id": PROJECT_ID,
+    }
+    read_activation = AsyncMock(
+        side_effect=AssertionError("remote dark source consulted activation")
+    )
+
+    with patch(
+        "orchestrator.services.infrastructure_metering.storage_intervals."
+        "read_storage_activation",
+        read_activation,
+    ):
+        interval_id = await StorageIntervalReconciler(
+            interval_mutations_enabled=False
+        ).apply_snapshot(conn, context, _pvc_item())
+
+    assert interval_id is None
+    read_activation.assert_not_awaited()
+    assert not any(
+        "resource_intervals" in str(call.args[0])
+        for call in conn.execute.await_args_list
+    )
+
+
+@pytest.mark.asyncio
 async def test_unchanged_storage_crosses_activation_at_exact_boundary() -> None:
     boundary = datetime(2026, 8, 7, tzinfo=timezone.utc)
     received_at = boundary + timedelta(minutes=5)
@@ -618,7 +966,7 @@ async def test_unchanged_storage_crosses_activation_at_exact_boundary() -> None:
         patch(
             "orchestrator.services.infrastructure_metering.storage_intervals."
             "lock_storage_activation",
-            AsyncMock(return_value=received_at),
+            AsyncMock(return_value=boundary),
         ),
     ):
         started_at = await StorageIntervalReconciler._first_active_start(
@@ -643,7 +991,7 @@ async def test_unchanged_storage_crosses_activation_at_exact_boundary() -> None:
         patch(
             "orchestrator.services.infrastructure_metering.storage_intervals."
             "lock_storage_activation",
-            AsyncMock(return_value=received_at),
+            AsyncMock(return_value=boundary),
         ),
     ):
         fallback = await StorageIntervalReconciler._first_active_start(
@@ -773,6 +1121,36 @@ async def test_retain_snapshot_absence_freezes_at_last_proof_and_opens_gap() -> 
 
 
 @pytest.mark.asyncio
+async def test_dark_remote_absence_hook_cannot_close_supplied_interval() -> None:
+    interval = {
+        "id": uuid4(),
+        "source_kind": "volume",
+        "source_lifecycle_id": uuid4(),
+        "last_confirmed_at": RECEIVED_AT,
+        "details": json.dumps(
+            {"storage_asset_id": str(uuid4()), "reclaim_policy": "retain"}
+        ),
+    }
+    context = SnapshotAbsenceMutationContext(
+        snapshot_id=uuid4(),
+        scope_epoch_id=uuid4(),
+        inventory_scope_id=uuid4(),
+        source_cluster="vm-cluster",
+        namespace=None,
+        received_at=RECEIVED_AT,
+    )
+    conn = AsyncMock()
+
+    consumed = await StorageIntervalReconciler(
+        interval_mutations_enabled=False
+    ).apply_absence(conn, context, interval)
+
+    assert consumed is False
+    conn.fetchrow.assert_not_awaited()
+    conn.fetchval.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_delete_policy_absence_stays_unknown_without_versioned_proof() -> None:
     interval_id, lifecycle_id, asset_id = uuid4(), uuid4(), uuid4()
     last_confirmed = RECEIVED_AT - timedelta(minutes=1)
@@ -871,6 +1249,67 @@ async def test_complete_volume_snapshot_detaches_absent_retain_incarnation() -> 
         asset_id=asset_id,
         scope_epoch_id=context.scope_epoch_id,
         gap_start=last_observed,
+        reason_code="retain-pv-disappeared",
+    )
+
+
+@pytest.mark.asyncio
+async def test_dark_remote_deletion_detaches_asset_but_cannot_close_interval() -> None:
+    incarnation_id, asset_id, supplied_interval_id = uuid4(), uuid4(), uuid4()
+    last_observed = RECEIVED_AT - timedelta(seconds=10)
+    context = WatchDeletionMutationContext(
+        scope_epoch_id=uuid4(),
+        inventory_scope_id=uuid4(),
+        source_cluster="vm-cluster",
+        namespace=None,
+        received_at=RECEIVED_AT,
+        source_kind="volume",
+        source_uid="c" * 64,
+    )
+    conn = AsyncMock()
+    conn.fetchrow.return_value = {
+        "incarnation_id": incarnation_id,
+        "asset_id": asset_id,
+        "pv_uid": "pv-object-uid-1",
+        "reclaim_policy": "retain",
+        "backend_deletion_finalizer_observed": False,
+        "last_observed_at": last_observed,
+        "identity_scheme": "csi-hmac-sha256-v1",
+        "asset_digest": "c" * 64,
+    }
+    conn.fetchval.return_value = True
+    gap = AsyncMock()
+    supplied_last_confirmed = RECEIVED_AT - timedelta(minutes=1)
+    supplied_interval = {
+        "id": supplied_interval_id,
+        "last_confirmed_at": supplied_last_confirmed,
+    }
+
+    with patch(
+        "orchestrator.services.infrastructure_metering.storage_intervals."
+        "open_backend_unverified_gap",
+        gap,
+    ):
+        action, interval_id = await StorageIntervalReconciler(
+            interval_mutations_enabled=False
+        ).apply_deletion(conn, context, supplied_interval)
+
+    assert action is WatchMutationAction.ALREADY_ABSENT
+    assert interval_id is None
+    assert conn.fetchrow.await_count == 1
+    assert conn.fetchval.await_args.args[1:] == (
+        incarnation_id,
+        supplied_last_confirmed,
+    )
+    assert all(
+        "UPDATE resource_intervals" not in str(call.args[0])
+        for call in conn.fetchrow.await_args_list
+    )
+    gap.assert_awaited_once_with(
+        conn,
+        asset_id=asset_id,
+        scope_epoch_id=context.scope_epoch_id,
+        gap_start=supplied_last_confirmed,
         reason_code="retain-pv-disappeared",
     )
 

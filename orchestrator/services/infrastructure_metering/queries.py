@@ -19,6 +19,7 @@ from typing import Any
 import asyncpg
 
 from .capabilities import MeteringSchemaCapabilities
+from .materializer import StoragePublicationPolicy
 from .read_model import SourceAwareUsageReadModel
 from .types import (
     UsageCoverageV2,
@@ -139,6 +140,8 @@ class UsageV2QueryService:
         *,
         source_aware_reads_enabled: bool = False,
         enabled_resources: Sequence[str] = ("workspace_pod",),
+        ide_workspace_pod_enabled: bool = False,
+        storage_publication_policy: StoragePublicationPolicy | None = None,
     ):
         self._audit = audit_pool
         self._capabilities = capabilities
@@ -148,6 +151,8 @@ class UsageV2QueryService:
                 audit_pool,
                 app_pool,
                 enabled_resources=enabled_resources,
+                ide_workspace_pod_enabled=ide_workspace_pod_enabled,
+                storage_publication_policy=storage_publication_policy,
             )
             if source_aware_reads_enabled
             and audit_pool is not None

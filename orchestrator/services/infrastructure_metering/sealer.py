@@ -24,11 +24,20 @@ from uuid import UUID
 
 import asyncpg
 
+from .materializer import (
+    PublicationContractError,
+    StorageCoverageRequirement,
+    StoragePublicationAuthority,
+    StoragePublicationPolicy,
+)
+
 _UTC = timezone.utc
 _SAFETY_LAG = timedelta(minutes=15)
 _DEFAULT_ENABLED_RESOURCES = ("workspace_pod",)
 _RESOURCE_API_RESOURCES = {
     "workspace_pod": frozenset({"core/v1/pods"}),
+    "agent_pod": frozenset({"core/v1/pods"}),
+    "workspace_vm": frozenset({"kubevirt.io/v1/virtualmachineinstances"}),
     "workspace_pvc": frozenset({"core/v1/persistentvolumeclaims"}),
     "session_workspace_pvc": frozenset({"core/v1/persistentvolumeclaims"}),
     "session_agent_pvc": frozenset({"core/v1/persistentvolumeclaims"}),
@@ -40,6 +49,16 @@ _RESOURCE_API_RESOURCES = {
     "unmapped_block_volume": frozenset({"core/v1/persistentvolumes"}),
 }
 _MAPPED_VOLUME_RESOURCE_RE = re.compile(r"^block_volume_[a-z0-9_]+$")
+_STORAGE_BASIS_BY_API_RESOURCE = {
+    "core/v1/persistentvolumeclaims": "claim-requested",
+    "core/v1/persistentvolumes": "volume-provisioned",
+}
+_COMPUTE_API_RESOURCE = {
+    "agent_pod": "core/v1/pods",
+    "ide_workspace_pod": "core/v1/pods",
+    "workspace_vm": "kubevirt.io/v1/virtualmachineinstances",
+}
+_COMPUTE_AUTHORITY_GAP_PREFIX = "compute-authority-awaiting-confirmation:"
 
 
 def _resource_api_resources(resource: str) -> frozenset[str] | None:
@@ -105,7 +124,8 @@ _EPOCHS_SQL = """
 /* infra-seal:epochs */
 SELECT epoch.id, epoch.scope_id, epoch.required_from, epoch.reliable_from,
        epoch.continuous_since, epoch.complete_through, epoch.retired_at,
-       scope.api_resource
+       scope.api_resource, scope.collector_id, scope.source_cluster,
+       scope.namespace
 FROM resource_inventory_scope_epochs AS epoch
 JOIN resource_inventory_scopes AS scope ON scope.id = epoch.scope_id
 WHERE epoch.required_for_rollup = TRUE
@@ -113,6 +133,85 @@ WHERE epoch.required_for_rollup = TRUE
   AND (epoch.retired_at IS NULL OR epoch.retired_at > $1)
 ORDER BY epoch.scope_id, epoch.required_from, epoch.id
 FOR SHARE OF epoch
+"""
+
+_COMPUTE_REQUIREMENTS_SQL = """
+/* infra-seal:compute-requirements */
+SELECT requirement.activation_key, requirement.inventory_scope_id,
+       authority.inventory_scope_epoch_id, authority.authority_sequence,
+       authority.effective_from AS authority_effective_from,
+       epoch.reliable_from, epoch.continuous_since, epoch.complete_through,
+       epoch.retired_at, epoch.snapshot_health, epoch.continuity_health,
+       epoch.item_health, epoch.backend_health,
+       scope.api_resource, scope.collector_id, scope.source_cluster,
+       scope.namespace
+FROM compute_metering_scope_requirements AS requirement
+LEFT JOIN compute_metering_epoch_authorities AS authority
+  ON authority.activation_key = requirement.activation_key
+ AND authority.inventory_scope_id = requirement.inventory_scope_id
+LEFT JOIN resource_inventory_scope_epochs AS epoch
+  ON epoch.id = authority.inventory_scope_epoch_id
+ AND epoch.scope_id = authority.inventory_scope_id
+JOIN resource_inventory_scopes AS scope
+  ON scope.id = requirement.inventory_scope_id
+WHERE requirement.activation_key = ANY($1::text[])
+ORDER BY requirement.activation_key, requirement.inventory_scope_id,
+         authority.authority_sequence
+"""
+
+_COMPUTE_EPOCH_SET_LOCK_SQL = """
+/* infra-seal:compute-epoch-set-lock */
+SELECT authority.activation_key, epoch.id
+FROM compute_metering_epoch_authorities AS authority
+JOIN resource_inventory_scope_epochs AS epoch
+  ON epoch.id = authority.inventory_scope_epoch_id
+ AND epoch.scope_id = authority.inventory_scope_id
+WHERE authority.activation_key = ANY($1::text[])
+ORDER BY epoch.id, authority.activation_key
+FOR SHARE OF epoch
+"""
+
+_COMPUTE_ACTIVATIONS_SQL = """
+/* infra-seal:compute-activations */
+SELECT activation_key, state, activated_at,
+       statement_timestamp() AS database_time
+FROM compute_metering_activation
+WHERE activation_key = ANY($1::text[])
+ORDER BY activation_key
+"""
+
+_STORAGE_REQUIREMENTS_SQL = """
+/* infra-seal:storage-requirements */
+SELECT requirement.measurement_basis, requirement.collector_id,
+       requirement.source_cluster, requirement.inventory_scope_id,
+       requirement.requirement_role,
+       GREATEST(
+           source_activation.activated_at,
+           global_activation.activated_at
+       ) AS effective_from
+FROM storage_metering_source_requirements AS requirement
+JOIN storage_metering_source_activations AS source_activation
+  ON source_activation.measurement_basis = requirement.measurement_basis
+ AND source_activation.collector_id = requirement.collector_id
+ AND source_activation.source_cluster = requirement.source_cluster
+JOIN storage_metering_activation AS global_activation
+  ON global_activation.measurement_basis = requirement.measurement_basis
+JOIN unnest($1::text[], $2::text[], $3::text[])
+     AS storage_policy(measurement_basis, collector_id, source_cluster)
+  ON storage_policy.measurement_basis = requirement.measurement_basis
+ AND storage_policy.collector_id = requirement.collector_id
+ AND storage_policy.source_cluster = requirement.source_cluster
+WHERE source_activation.state = 'active'
+  AND source_activation.activated_at IS NOT NULL
+  AND global_activation.state = 'active'
+  AND global_activation.activated_at IS NOT NULL
+  AND statement_timestamp() >= GREATEST(
+      source_activation.activated_at,
+      global_activation.activated_at
+  )
+ORDER BY requirement.measurement_basis, requirement.collector_id,
+         requirement.source_cluster, requirement.requirement_role,
+         requirement.inventory_scope_id
 """
 
 _SEALED_DAY_SQL = """
@@ -124,7 +223,7 @@ WHERE day = $1 AND state = 'sealed'
 
 _GAPS_SQL = """
 /* infra-seal:gaps */
-SELECT id, scope_epoch_id, gap_start, gap_end, resolution
+SELECT id, scope_epoch_id, gap_start, gap_end, resolution, reason
 FROM resource_inventory_coverage_gaps
 WHERE scope_epoch_id = ANY($1::uuid[])
   AND gap_start < $3
@@ -134,7 +233,7 @@ ORDER BY scope_epoch_id, gap_start, id
 
 _STORAGE_GAPS_SQL = """
 /* infra-seal:storage-gaps */
-SELECT id, scope_epoch_id, gap_start, gap_end, resolution
+SELECT id, scope_epoch_id, gap_start, gap_end, resolution, reason
 FROM resource_inventory_coverage_gaps
 WHERE scope_epoch_id = ANY($1::uuid[])
   AND gap_start < $3
@@ -144,7 +243,8 @@ UNION ALL
 
 SELECT id, scope_epoch_id, gap_start, gap_end,
        CASE WHEN resolution = 'unresolved' THEN 'unresolved'
-            ELSE 'waived' END AS resolution
+            ELSE 'waived' END AS resolution,
+       NULL::text AS reason
 FROM storage_asset_coverage_gaps
 WHERE scope_epoch_id = ANY($1::uuid[])
   AND gap_start < $3
@@ -171,12 +271,35 @@ _INTERVAL_BLOCKER_SQL = """
 /* infra-seal:interval-blocker */
 SELECT interval.id
 FROM resource_intervals AS interval
+LEFT JOIN resource_inventory_scopes AS source_scope
+  ON source_scope.id = interval.inventory_scope_id
 WHERE interval.resource = ANY($3::text[])
+  AND ($4::boolean OR interval.resource <> 'workspace_pod'
+       OR COALESCE(interval.details->>'product_class', '') <> 'ide-session')
   AND interval.started_at < $2
   AND COALESCE(interval.ended_at, 'infinity'::timestamptz) > $1
-  AND interval.materialized_through < LEAST(
-      $2,
-      COALESCE(interval.ended_at, $2)
+  AND (
+      (
+          interval.measurement_basis IN (
+              'claim-requested', 'volume-provisioned'
+          )
+          AND NOT EXISTS (
+              SELECT 1
+              FROM unnest($5::text[], $6::text[], $7::text[])
+                   AS storage_policy(
+                       measurement_basis, collector_id, source_cluster
+                   )
+              WHERE storage_policy.measurement_basis =
+                    interval.measurement_basis
+                AND storage_policy.collector_id = source_scope.collector_id
+                AND storage_policy.source_cluster = source_scope.source_cluster
+                AND source_scope.source_cluster = interval.source_cluster
+          )
+      )
+      OR interval.materialized_through < LEAST(
+          $2,
+          COALESCE(interval.ended_at, $2)
+      )
   )
 ORDER BY interval.id
 LIMIT 1
@@ -187,10 +310,33 @@ _PLAN_BLOCKER_SQL = """
 SELECT plan.id
 FROM resource_publication_plans AS plan
 JOIN resource_intervals AS interval ON interval.id = plan.source_interval_id
+LEFT JOIN resource_inventory_scopes AS source_scope
+  ON source_scope.id = interval.inventory_scope_id
 WHERE interval.resource = ANY($3::text[])
+  AND ($4::boolean OR interval.resource <> 'workspace_pod'
+       OR COALESCE(interval.details->>'product_class', '') <> 'ide-session')
   AND tstzrange(plan.period_start, plan.period_end, '[)')
       && tstzrange($1, $2, '[)')
-  AND plan.state <> 'published'
+  AND (
+      (
+          interval.measurement_basis IN (
+              'claim-requested', 'volume-provisioned'
+          )
+          AND NOT EXISTS (
+              SELECT 1
+              FROM unnest($5::text[], $6::text[], $7::text[])
+                   AS storage_policy(
+                       measurement_basis, collector_id, source_cluster
+                   )
+              WHERE storage_policy.measurement_basis =
+                    interval.measurement_basis
+                AND storage_policy.collector_id = source_scope.collector_id
+                AND storage_policy.source_cluster = source_scope.source_cluster
+                AND source_scope.source_cluster = interval.source_cluster
+          )
+      )
+      OR plan.state <> 'published'
+  )
 ORDER BY plan.period_start, plan.id
 LIMIT 1
 """
@@ -484,6 +630,8 @@ class InfrastructureUsageDaySealer:
         *,
         sealing_enabled: bool = False,
         enabled_resources: Sequence[str] = _DEFAULT_ENABLED_RESOURCES,
+        ide_workspace_pod_enabled: bool = False,
+        storage_publication_policy: StoragePublicationPolicy | None = None,
         safety_lag: timedelta = _SAFETY_LAG,
     ) -> None:
         resources = tuple(dict.fromkeys(str(value) for value in enabled_resources))
@@ -504,11 +652,32 @@ class InfrastructureUsageDaySealer:
         self._app = app_pool
         self._sealing_enabled = sealing_enabled
         self._enabled_resources = resources
+        self._ide_workspace_pod_enabled = bool(ide_workspace_pod_enabled)
+        if storage_publication_policy is None:
+            storage_publication_policy = StoragePublicationPolicy()
+        if not isinstance(storage_publication_policy, StoragePublicationPolicy):
+            raise ValueError(
+                "storage_publication_policy must be a StoragePublicationPolicy"
+            )
+        self._storage_publication_policy = storage_publication_policy
         self._include_storage_asset_gaps = any(
             "core/v1/persistentvolumes" in (_resource_api_resources(resource) or ())
             for resource in resources
         )
         self._safety_lag = safety_lag
+
+    def _enabled_compute_activation_keys(self) -> tuple[str, ...]:
+        keys: list[str] = []
+        if "agent_pod" in self._enabled_resources:
+            keys.append("agent_pod")
+        if (
+            "workspace_pod" in self._enabled_resources
+            and self._ide_workspace_pod_enabled
+        ):
+            keys.append("ide_workspace_pod")
+        if "workspace_vm" in self._enabled_resources:
+            keys.append("workspace_vm")
+        return tuple(keys)
 
     def _require_enabled(self) -> None:
         if not self._sealing_enabled:
@@ -552,11 +721,52 @@ class InfrastructureUsageDaySealer:
                     raise DaySealingBlocked("day-not-closeable")
                 seal_start = max(day_start, cutover_at)
 
+                storage_requirements: Sequence[Mapping[str, Any]] = ()
+                if self._storage_publication_policy.authorities:
+                    storage_requirements = await conn.fetch(
+                        _STORAGE_REQUIREMENTS_SQL,
+                        *self._storage_publication_policy.sql_columns(),
+                    )
+                compute_requirements: Sequence[Mapping[str, Any]] = ()
+                compute_activations: Sequence[Mapping[str, Any]] = ()
+                compute_keys = self._enabled_compute_activation_keys()
+                if compute_keys:
+                    # Exact epochs precede activation reads in the canonical
+                    # scheduler/ingestion/sealer lock order.
+                    await conn.fetch(
+                        _COMPUTE_EPOCH_SET_LOCK_SQL,
+                        list(compute_keys),
+                    )
+                    compute_requirements = await conn.fetch(
+                        _COMPUTE_REQUIREMENTS_SQL,
+                        list(compute_keys),
+                    )
+                    compute_activations = await conn.fetch(
+                        _COMPUTE_ACTIVATIONS_SQL,
+                        list(compute_keys),
+                    )
+                # Requirements are immutable and activations are one-way, so
+                # this proof needs no activation-row lock. Acquire epoch locks
+                # only after reading the exact set and avoid inverting the
+                # activation scheduler's global/source -> epoch lock order.
                 epochs = await conn.fetch(_EPOCHS_SQL, seal_start, day_end)
                 scope_ids = {str(row["scope_id"]) for row in epochs}
                 if not scope_ids:
-                    raise DaySealingBlocked("no-required-inventory-source")
-                epoch_ids = [row["id"] for row in epochs]
+                    raise DaySealingBlocked(
+                        "required-storage-source-missing"
+                        if self._storage_publication_policy.authorities
+                        else "no-required-inventory-source"
+                    )
+                epoch_ids = list(
+                    dict.fromkeys(
+                        [row["id"] for row in epochs]
+                        + [
+                            row["inventory_scope_epoch_id"]
+                            for row in compute_requirements
+                            if row.get("inventory_scope_epoch_id") is not None
+                        ]
+                    )
+                )
                 gaps = await conn.fetch(
                     _STORAGE_GAPS_SQL
                     if self._include_storage_asset_gaps
@@ -581,16 +791,42 @@ class InfrastructureUsageDaySealer:
 
                 epoch_manifest, missing_by_epoch = self._validate_epochs(
                     epochs,
+                    storage_requirements=storage_requirements,
                     seal_start=seal_start,
                     day_end=day_end,
                 )
-                gap_manifest, unknown_ranges, evidence_by_epoch = self._validate_gaps(
+                compute_manifest, compute_missing_by_authority = (
+                    self._validate_compute_requirements(
+                        compute_activations,
+                        compute_requirements,
+                        epochs=epochs,
+                        seal_start=seal_start,
+                        day_end=day_end,
+                    )
+                )
+                (
+                    gap_manifest,
+                    unknown_ranges,
+                    evidence_by_epoch,
+                    evidence_by_compute_authority,
+                ) = self._validate_gaps(
                     gaps,
                     seal_start=seal_start,
                     day_end=day_end,
+                    enabled_compute_keys=frozenset(compute_keys),
                 )
                 for epoch_id, missing_ranges in missing_by_epoch.items():
                     evidence = evidence_by_epoch.get(epoch_id, ())
+                    if any(
+                        not _range_is_covered(missing, evidence)
+                        for missing in missing_ranges
+                    ):
+                        raise DaySealingBlocked("required-source-incomplete")
+                for authority, missing_ranges in compute_missing_by_authority.items():
+                    _activation_key, epoch_id = authority
+                    evidence = tuple(
+                        evidence_by_compute_authority.get(authority, ())
+                    ) + tuple(evidence_by_epoch.get(epoch_id, ()))
                     if any(
                         not _range_is_covered(missing, evidence)
                         for missing in missing_ranges
@@ -615,6 +851,8 @@ class InfrastructureUsageDaySealer:
                     seal_start,
                     day_end,
                     list(self._enabled_resources),
+                    self._ide_workspace_pod_enabled,
+                    *self._storage_publication_policy.sql_columns(),
                 ):
                     raise DaySealingBlocked("interval-materialization-incomplete")
                 if await conn.fetchrow(
@@ -622,6 +860,8 @@ class InfrastructureUsageDaySealer:
                     seal_start,
                     day_end,
                     list(self._enabled_resources),
+                    self._ide_workspace_pod_enabled,
+                    *self._storage_publication_policy.sql_columns(),
                 ):
                     raise DaySealingBlocked("publication-plan-unresolved")
 
@@ -633,7 +873,17 @@ class InfrastructureUsageDaySealer:
                     "seal_start": seal_start,
                     "day_end": day_end,
                     "enabled_resources": list(self._enabled_resources),
+                    "ide_workspace_pod_enabled": (self._ide_workspace_pod_enabled),
+                    "storage_publication_authorities": [
+                        {
+                            "measurement_basis": authority.measurement_basis,
+                            "collector_id": authority.collector_id,
+                            "source_cluster": authority.source_cluster,
+                        }
+                        for authority in self._storage_publication_policy.authorities
+                    ],
                     "epochs": epoch_manifest,
+                    "compute_authorities": compute_manifest,
                     "gaps": gap_manifest,
                     "coverage_status": coverage_status,
                     "unknown_ranges": [
@@ -693,10 +943,180 @@ class InfrastructureUsageDaySealer:
             required_scopes=None,
         )
 
+    @staticmethod
+    def _validate_compute_requirements(
+        activations: Sequence[Mapping[str, Any]],
+        requirements: Sequence[Mapping[str, Any]],
+        *,
+        epochs: Sequence[Mapping[str, Any]],
+        seal_start: datetime,
+        day_end: datetime,
+    ) -> tuple[
+        list[dict[str, Any]],
+        dict[tuple[str, str], list[tuple[datetime, datetime]]],
+    ]:
+        del epochs  # Authority rows carry their exact bound epoch proof.
+        activation_by_key: dict[str, Mapping[str, Any]] = {}
+        for activation in activations:
+            key = str(activation.get("activation_key") or "")
+            if key not in _COMPUTE_API_RESOURCE or key in activation_by_key:
+                raise DaySealingContractError(
+                    "compute activation set is invalid or duplicated"
+                )
+            activation_by_key[key] = activation
+
+        requirements_by_key: dict[str, dict[UUID, list[Mapping[str, Any]]]] = {}
+        for requirement in requirements:
+            key = str(requirement.get("activation_key") or "")
+            if key not in _COMPUTE_API_RESOURCE:
+                raise DaySealingContractError(
+                    "compute requirement activation key is invalid"
+                )
+            scope_id = UUID(
+                _uuid_text(
+                    requirement.get("inventory_scope_id"),
+                    "compute requirement scope_id",
+                )
+            )
+            requirements_by_key.setdefault(key, {}).setdefault(scope_id, []).append(
+                requirement
+            )
+
+        manifest: list[dict[str, Any]] = []
+        missing_by_authority: dict[
+            tuple[str, str], list[tuple[datetime, datetime]]
+        ] = {}
+        for key, activation in sorted(activation_by_key.items()):
+            activated_at = activation.get("activated_at")
+            database_time = activation.get("database_time")
+            if activation.get("state") != "active" or activated_at is None:
+                continue
+            activated_at = _aware_utc(activated_at, f"{key} activated_at")
+            if activated_at >= day_end:
+                continue
+            if (
+                database_time is None
+                or _aware_utc(database_time, f"{key} database_time") < activated_at
+            ):
+                raise DaySealingBlocked("required-compute-activation-not-effective")
+            class_scopes = requirements_by_key.get(key, {})
+            if not class_scopes:
+                raise DaySealingBlocked("required-compute-source-missing")
+            for scope_id, scope_authorities in sorted(
+                class_scopes.items(), key=lambda item: str(item[0])
+            ):
+                effective_required_start = max(seal_start, activated_at)
+                coverage_cursor = effective_required_start
+                seen_epochs: set[UUID] = set()
+                ordered = sorted(
+                    scope_authorities,
+                    key=lambda row: int(row.get("authority_sequence") or 0),
+                )
+                if not any(
+                    row.get("inventory_scope_epoch_id") is not None for row in ordered
+                ):
+                    raise DaySealingBlocked("required-compute-exact-epoch-missing")
+                for authority in ordered:
+                    raw_epoch_id = authority.get("inventory_scope_epoch_id")
+                    raw_effective_from = authority.get("authority_effective_from")
+                    if raw_epoch_id is None or raw_effective_from is None:
+                        continue
+                    epoch_id = UUID(
+                        _uuid_text(raw_epoch_id, "compute authority epoch_id")
+                    )
+                    if epoch_id in seen_epochs:
+                        raise DaySealingContractError(
+                            "compute epoch authority is duplicated"
+                        )
+                    seen_epochs.add(epoch_id)
+                    if (
+                        str(authority.get("api_resource") or "")
+                        != _COMPUTE_API_RESOURCE[key]
+                    ):
+                        raise DaySealingBlocked("required-compute-exact-epoch-invalid")
+                    authority_effective_from = _aware_utc(
+                        raw_effective_from,
+                        f"{key} authority_effective_from",
+                    )
+                    effective_start = max(
+                        effective_required_start,
+                        authority_effective_from,
+                    )
+                    retired_at = (
+                        None
+                        if authority.get("retired_at") is None
+                        else _aware_utc(
+                            authority["retired_at"],
+                            f"{key} retired_at",
+                        )
+                    )
+                    effective_end = min(day_end, retired_at or day_end)
+                    epoch_id_text = str(epoch_id)
+                    if effective_end <= effective_required_start:
+                        continue
+                    if effective_start >= day_end:
+                        continue
+                    if effective_start > coverage_cursor:
+                        # Recovery authority stores one durable successor gap
+                        # beginning at predecessor retirement. Attribute the
+                        # discontinuity to that successor so the exact row can
+                        # be bounded by a later LIST and explicitly waived.
+                        missing_by_authority.setdefault(
+                            (key, epoch_id_text), []
+                        ).append((coverage_cursor, effective_start))
+                    reliable_from = authority.get("reliable_from")
+                    continuous_since = authority.get("continuous_since")
+                    if (
+                        reliable_from is None
+                        or _aware_utc(reliable_from, "reliable_from") > effective_start
+                        or continuous_since is None
+                        or _aware_utc(continuous_since, "continuous_since")
+                        > effective_start
+                    ):
+                        raise DaySealingBlocked("required-compute-exact-epoch-invalid")
+                    complete_through = authority.get("complete_through")
+                    complete_end = effective_start
+                    if complete_through is not None:
+                        complete_end = max(
+                            effective_start,
+                            min(
+                                effective_end,
+                                _aware_utc(
+                                    complete_through,
+                                    "complete_through",
+                                ),
+                            ),
+                        )
+                    if complete_end < effective_end:
+                        missing_by_authority.setdefault(
+                            (key, epoch_id_text), []
+                        ).append((complete_end, effective_end))
+                    coverage_cursor = max(coverage_cursor, effective_end)
+                    manifest.append(
+                        {
+                            "activation_key": key,
+                            "activated_at": activated_at,
+                            "inventory_scope_id": str(scope_id),
+                            "inventory_scope_epoch_id": epoch_id_text,
+                            "authority_sequence": int(authority["authority_sequence"]),
+                            "authority_effective_from": authority_effective_from,
+                            "retired_at": retired_at,
+                            "effective_start": effective_start,
+                        }
+                    )
+                if coverage_cursor < day_end:
+                    # A retired authority cannot be silently inherited by an
+                    # unpromoted healthy successor. Promotion must precede
+                    # sealing; internal authority gaps are handled above via
+                    # their durable predecessor gap evidence.
+                    raise DaySealingBlocked("required-compute-exact-epoch-retired")
+        return manifest, missing_by_authority
+
     def _validate_epochs(
         self,
         epochs: Sequence[Mapping[str, Any]],
         *,
+        storage_requirements: Sequence[Mapping[str, Any]] = (),
         seal_start: datetime,
         day_end: datetime,
     ) -> tuple[
@@ -711,10 +1131,98 @@ class InfrastructureUsageDaySealer:
                 for resource in self._enabled_resources
             )
         )
+        expected_storage_authorities = set(self._storage_publication_policy.authorities)
+        typed_requirements: set[StorageCoverageRequirement] = set()
+        try:
+            for row in storage_requirements:
+                requirement = StorageCoverageRequirement.from_mapping(row)
+                if requirement in typed_requirements:
+                    raise DaySealingContractError(
+                        "storage coverage requirement is duplicated"
+                    )
+                if requirement.authority not in expected_storage_authorities:
+                    raise DaySealingContractError(
+                        "storage coverage requirement is outside process policy"
+                    )
+                typed_requirements.add(requirement)
+        except PublicationContractError as exc:
+            raise DaySealingContractError(
+                "storage coverage requirement is invalid"
+            ) from exc
+
+        requirements_by_authority: dict[
+            StoragePublicationAuthority, list[StorageCoverageRequirement]
+        ] = {}
+        for requirement in typed_requirements:
+            requirements_by_authority.setdefault(requirement.authority, []).append(
+                requirement
+            )
+        for authority in expected_storage_authorities:
+            authority_requirements = requirements_by_authority.get(authority, ())
+            if not authority_requirements:
+                raise DaySealingBlocked("required-storage-source-missing")
+            roles = {
+                requirement.requirement_role for requirement in authority_requirements
+            }
+            expected_roles = (
+                {"quantity"}
+                if authority.measurement_basis == "claim-requested"
+                else {"quantity", "attribution"}
+            )
+            if roles != expected_roles:
+                raise DaySealingBlocked("required-storage-requirement-incomplete")
+
+        active_requirements = tuple(
+            requirement
+            for requirement in typed_requirements
+            if requirement.effective_from < day_end
+        )
+        requirements_by_scope: dict[UUID, list[StorageCoverageRequirement]] = {}
+        for requirement in active_requirements:
+            requirements_by_scope.setdefault(requirement.inventory_scope_id, []).append(
+                requirement
+            )
+
+        epochs_by_scope: dict[UUID, list[Mapping[str, Any]]] = {}
         for row in epochs:
-            api_resource = str(row.get("api_resource") or "")
-            if api_resource not in enabled_api_resources:
-                raise DaySealingBlocked("required-source-not-enabled")
+            scope_id = UUID(_uuid_text(row["scope_id"], "epoch.scope_id"))
+            epochs_by_scope.setdefault(scope_id, []).append(row)
+
+        # Every exact quantity or attribution scope must have structurally
+        # continuous epoch coverage from its authority boundary through the
+        # day. A PV quantity epoch alone is never sufficient for volume
+        # attribution completeness.
+        for scope_id, requirements in requirements_by_scope.items():
+            required_start = max(
+                seal_start,
+                min(requirement.effective_from for requirement in requirements),
+            )
+            if required_start >= day_end:
+                continue
+            coverage_cursor = required_start
+            for row in sorted(
+                epochs_by_scope.get(scope_id, ()),
+                key=lambda item: item["required_from"],
+            ):
+                epoch_start = max(
+                    required_start,
+                    _aware_utc(row["required_from"], "required_from"),
+                )
+                epoch_end = min(
+                    day_end,
+                    day_end
+                    if row.get("retired_at") is None
+                    else _aware_utc(row["retired_at"], "retired_at"),
+                )
+                if epoch_end <= epoch_start:
+                    continue
+                if epoch_start > coverage_cursor:
+                    raise DaySealingBlocked("required-source-incomplete")
+                coverage_cursor = max(coverage_cursor, epoch_end)
+            if coverage_cursor < day_end:
+                raise DaySealingBlocked("required-storage-source-missing")
+
+        for row in epochs:
             required_from = _aware_utc(row["required_from"], "required_from")
             retired_at = (
                 None
@@ -723,6 +1231,58 @@ class InfrastructureUsageDaySealer:
             )
             effective_start = max(seal_start, required_from)
             effective_end = min(day_end, retired_at or day_end)
+            if effective_end <= effective_start:
+                continue
+            api_resource = str(row.get("api_resource") or "")
+            collector_id = row.get("collector_id")
+            source_cluster = row.get("source_cluster")
+            namespace = row.get("namespace")
+            if (
+                not isinstance(collector_id, str)
+                or not collector_id
+                or not isinstance(source_cluster, str)
+                or not source_cluster
+                or (namespace is not None and not isinstance(namespace, str))
+                or namespace == ""
+            ):
+                raise DaySealingContractError(
+                    "required inventory scope identity is invalid"
+                )
+            scope_id = UUID(_uuid_text(row["scope_id"], "epoch.scope_id"))
+            storage_basis = _STORAGE_BASIS_BY_API_RESOURCE.get(api_resource)
+            scope_requirements = requirements_by_scope.get(scope_id, ())
+            if storage_basis is None:
+                if api_resource not in enabled_api_resources:
+                    raise DaySealingBlocked("required-source-not-enabled")
+            else:
+                if not scope_requirements:
+                    if api_resource not in enabled_api_resources:
+                        raise DaySealingBlocked("required-source-not-enabled")
+                    raise DaySealingBlocked("required-storage-authority-not-enabled")
+                for requirement in scope_requirements:
+                    if (
+                        requirement.collector_id != collector_id
+                        or requirement.source_cluster != source_cluster
+                        or requirement.expected_api_resource != api_resource
+                    ):
+                        raise DaySealingContractError(
+                            "storage coverage requirement scope mismatch"
+                        )
+                    quantity_resource = (
+                        requirement.expected_api_resource
+                        if requirement.requirement_role == "quantity"
+                        else "core/v1/persistentvolumes"
+                    )
+                    if quantity_resource not in enabled_api_resources:
+                        raise DaySealingBlocked("required-source-not-enabled")
+                effective_start = max(
+                    effective_start,
+                    min(
+                        requirement.effective_from for requirement in scope_requirements
+                    ),
+                )
+                if effective_end <= effective_start:
+                    continue
             reliable_from = row.get("reliable_from")
             continuous_since = row.get("continuous_since")
             if (
@@ -750,8 +1310,34 @@ class InfrastructureUsageDaySealer:
             manifest.append(
                 {
                     "id": epoch_id,
-                    "scope_id": _uuid_text(row["scope_id"], "epoch.scope_id"),
+                    "scope_id": str(scope_id),
                     "api_resource": api_resource,
+                    "measurement_basis": (
+                        None
+                        if not scope_requirements
+                        else (
+                            scope_requirements[0].measurement_basis
+                            if len(
+                                {
+                                    requirement.measurement_basis
+                                    for requirement in scope_requirements
+                                }
+                            )
+                            == 1
+                            else None
+                        )
+                    ),
+                    "storage_requirements": [
+                        {
+                            "measurement_basis": requirement.measurement_basis,
+                            "requirement_role": requirement.requirement_role,
+                            "effective_from": requirement.effective_from,
+                        }
+                        for requirement in sorted(scope_requirements)
+                    ],
+                    "collector_id": collector_id,
+                    "source_cluster": source_cluster,
+                    "namespace": namespace,
                     "required_from": required_from,
                     "reliable_from": _aware_utc(reliable_from, "reliable_from"),
                     "continuous_since": _aware_utc(
@@ -776,15 +1362,26 @@ class InfrastructureUsageDaySealer:
         *,
         seal_start: datetime,
         day_end: datetime,
+        enabled_compute_keys: frozenset[str] = frozenset(),
     ) -> tuple[
         list[dict[str, Any]],
         tuple[tuple[datetime, datetime], ...],
         dict[str, list[tuple[datetime, datetime]]],
+        dict[tuple[str, str], list[tuple[datetime, datetime]]],
     ]:
         manifest: list[dict[str, Any]] = []
         waived: list[tuple[datetime, datetime]] = []
         evidence_by_epoch: dict[str, list[tuple[datetime, datetime]]] = {}
+        evidence_by_compute_authority: dict[
+            tuple[str, str], list[tuple[datetime, datetime]]
+        ] = {}
         for row in gaps:
+            reason = str(row.get("reason") or "")
+            compute_key: str | None = None
+            if reason.startswith(_COMPUTE_AUTHORITY_GAP_PREFIX):
+                compute_key = reason.removeprefix(_COMPUTE_AUTHORITY_GAP_PREFIX)
+                if compute_key not in enabled_compute_keys:
+                    continue
             resolution = str(row["resolution"])
             gap_start = _aware_utc(row["gap_start"], "gap_start")
             gap_end = (
@@ -802,7 +1399,12 @@ class InfrastructureUsageDaySealer:
             elif resolution != "backfilled":
                 raise DaySealingContractError("coverage gap has unknown resolution")
             epoch_id = _uuid_text(row["scope_epoch_id"], "gap.scope_epoch_id")
-            evidence_by_epoch.setdefault(epoch_id, []).append(clipped)
+            if compute_key is None:
+                evidence_by_epoch.setdefault(epoch_id, []).append(clipped)
+            else:
+                evidence_by_compute_authority.setdefault(
+                    (compute_key, epoch_id), []
+                ).append(clipped)
             manifest.append(
                 {
                     "id": _uuid_text(row["id"], "gap.id"),
@@ -810,9 +1412,15 @@ class InfrastructureUsageDaySealer:
                     "start": gap_start,
                     "end": gap_end,
                     "resolution": resolution,
+                    "reason": reason or None,
                 }
             )
-        return manifest, _merge_ranges(waived), evidence_by_epoch
+        return (
+            manifest,
+            _merge_ranges(waived),
+            evidence_by_epoch,
+            evidence_by_compute_authority,
+        )
 
 
 __all__ = [

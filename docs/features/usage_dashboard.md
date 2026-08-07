@@ -37,19 +37,24 @@ everything uncertain is a named fast-follow, decided **after** seeing the page
 rendered (the user's explicit preference: build a concrete v1, react to how it
 feels, iterate — don't over-spec the panel set upfront).
 
-**Successor implementation state (2026-08-06):** the Cockpit client and
+**Successor implementation state (2026-08-07):** the Cockpit client and
 `/api/usage/v2` now implement dimensionally separate CPU, compute-memory,
 logical-claim, and physical-volume cards with decimal-safe quantities, finality,
 coverage, and priced/free/unpriced distinctions. The UI probes this contract but
 continues to serve the v1 compatibility data while the v2-read gate is off.
-Infrastructure-metering Slice 1 is code-complete, but durable cutover,
-publication, and source-aware reads remain disabled. Slice 2 PVC/PV quantity and
-lifecycle code is now implementation-complete through app migration `0102`, and
-its live k3d inventory/shadow exercise passed without creating intervals,
-publication plans, or audit events. All six storage gates remain off in main
-dev. Claim/volume cards therefore stay empty on the serving path until
-inventory, shadow validation, activation, publication, and v2 reads are
-deliberately enabled.
+The repository's infrastructure-metering Slices 1–3 are implementation-complete
+through app migration `0114`, including workspace and agent/IDE Pod intervals,
+PVC/PV lifecycles, authenticated VM/VMI capture, and exact root-storage
+attribution. Its all-off k3d dark upgrade passed without enabling publication,
+cutover, v2 reads, source-aware reads, storage, or Slice 3 sources. Main dev has
+not received that package: it still runs `sha-95d2a10`, has migrations through
+`0102`, and enables Pod inventory only. Live VM object normalizers passed
+read-only validation, but the live VM cluster's old controller and absent
+collector leave the VMI/root-storage rollout and shadow approval pending.
+Compatibility `/api/usage`, its ledger, and v1 cards therefore remain
+authoritative; the typed agent/VM and claim/volume cards stay off the serving
+path until each
+source is deliberately shadow-approved and publication/read gates are enabled.
 
 **Driver:** Two things converged. (1) The Slice-4 page shows only a
 category×unit rollup, while the ledger records per-row `user_id`, `project_id`,
@@ -102,10 +107,12 @@ new capture. Confirmed against the schema + both emitters:
 utilization, agent/VM compute, PVC/PV storage, shared-platform overhead, and any
 provider call that never reaches the `llm_requests` audit trail. The implemented
 infrastructure successor still measures allocated/requested quantities, not
-utilization. PVC logical demand and PV physical assets are implemented but dark;
-agent/VM and shared-platform classes remain unimplemented as described in
-[[infrastructure_resource_metering]]. Unmapped physical volumes are explicitly
-unpriced rather than displayed as free.
+utilization. PVC/PV plus agent/IDE/VM/VMI/root-storage capture is implemented but
+dark and not operationally shadow-approved; shared-platform classification
+remains unimplemented Slice 4 work as described in
+[[infrastructure_resource_metering]]. Provider calculator adapters are still
+incomplete Slice 5 work. Unmapped physical volumes are explicitly unpriced
+rather than displayed as free.
 
 ## Locked decisions
 
@@ -246,7 +253,7 @@ data itself is already in the agent registry.
 - `orchestrator/services/workspace_metering.py` — the active compatibility
   workspace emitter.
 - `orchestrator/services/infrastructure_metering/` — the gated typed successor
-  implemented through workspace-Pod Slice 1.
+  implemented through agent/IDE/VM and root-storage Slice 3.
 - `cockpit/src/app/views/admin/usage/admin-usage.component.ts` — the page to grow.
 - `cockpit/src/app/debug/components/timeline/timeline.component.ts` — the
   `autoRefreshEnabled()` toggle pattern to reuse.

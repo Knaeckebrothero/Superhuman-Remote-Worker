@@ -67,6 +67,7 @@ configure_logging(
     disable_uvicorn_access=True,
 )
 
+from dataclasses import replace  # noqa: E402
 from datetime import date, datetime, timedelta, timezone  # noqa: E402
 from decimal import Decimal  # noqa: E402
 from collections.abc import Coroutine, Mapping  # noqa: E402
@@ -538,6 +539,8 @@ infrastructure_storage_assets: StorageAssetStore | None = None
 infrastructure_storage_mapping: StorageResourceMappingStore | None = None
 infrastructure_compute_activation: ComputeActivationStore | None = None
 infrastructure_compute_scope_diagnostics: dict[str, str] = {}
+infrastructure_durable_compute_activation_keys: frozenset[str] = frozenset()
+infrastructure_durable_reporting_policy_ready = False
 infrastructure_storage_source_activation_ready = False
 
 _INFRASTRUCTURE_PVC_RESOURCES = (
@@ -602,6 +605,40 @@ def _storage_source_activation_is_effective(
         and activation.database_time
         >= max(activation.activated_at, global_activation.activated_at)
         and global_activation.database_time >= global_activation.activated_at
+    )
+
+
+def _storage_activation_is_durable(activation: StorageActivation | None) -> bool:
+    """Return whether a one-way storage activation has been scheduled."""
+
+    return bool(
+        activation is not None
+        and activation.state == "active"
+        and activation.activated_at is not None
+    )
+
+
+def _storage_source_activation_is_durable(
+    activation: StorageSourceActivation | None,
+    global_activation: StorageActivation | None,
+) -> bool:
+    """Return whether an exact source and its global basis are one-way active."""
+
+    return bool(
+        activation is not None
+        and _storage_activation_is_durable(global_activation)
+        and activation.state == "active"
+        and activation.activated_at is not None
+    )
+
+
+def _compute_activation_is_durable(activation: ComputeActivation | None) -> bool:
+    """Return whether a compute class crossed the one-way scheduling step."""
+
+    return bool(
+        activation is not None
+        and activation.state == "active"
+        and activation.activated_at is not None
     )
 
 
@@ -769,6 +806,202 @@ def _storage_source_configuration_errors(
             if configured_identities != frozen_identities:
                 errors.append(f"{label} frozen inventory scope set")
     return tuple(errors)
+
+
+def _durable_storage_reporting_policy(
+    *,
+    claim_activation: StorageActivation | None,
+    volume_activation: StorageActivation | None,
+    source_activations: tuple[StorageSourceActivation, ...],
+) -> StoragePublicationPolicy:
+    """Build the read/seal source set from irreversible database activation.
+
+    Current Helm publication booleans and VM lifecycle credentials remain
+    write-safety inputs. Losing either must not make already-published history
+    disappear from typed reads or from a day-sealing completeness decision.
+    """
+
+    global_by_basis = {
+        "claim-requested": claim_activation,
+        "volume-provisioned": volume_activation,
+    }
+    return StoragePublicationPolicy(
+        tuple(
+            StoragePublicationAuthority(
+                measurement_basis=activation.measurement_basis,
+                collector_id=activation.collector_id,
+                source_cluster=activation.source_cluster,
+            )
+            for activation in source_activations
+            if _storage_source_activation_is_durable(
+                activation,
+                global_by_basis.get(activation.measurement_basis),
+            )
+        )
+    )
+
+
+def _durable_infrastructure_reporting_resources(
+    capabilities: MeteringSchemaCapabilities,
+    *,
+    mapped_volume_resources: tuple[str, ...] = (),
+    volume_mapping_ready: bool = True,
+    compute_activations: Mapping[str, ComputeActivation] | None = None,
+    storage_reporting_policy: StoragePublicationPolicy | None = None,
+) -> tuple[str, ...]:
+    """Build the historical read/seal class set from durable activation.
+
+    Unlike publication, this policy is not reversible. If a durable class
+    exists but its schema or immutable volume mapping registry is unavailable,
+    fail wiring closed instead of returning an allowlist that silently omits
+    that history.
+    """
+
+    resources = ["workspace_pod"]
+    activations = compute_activations or {}
+    durable_compute = {
+        key
+        for key, activation in activations.items()
+        if _compute_activation_is_durable(activation)
+    }
+    if durable_compute and not capabilities.slice3_compute_inventory_ready:
+        raise ValueError("durable compute reporting schema is unavailable")
+    if "agent_pod" in durable_compute:
+        resources.append("agent_pod")
+    if "workspace_vm" in durable_compute:
+        resources.append("workspace_vm")
+
+    storage_policy = storage_reporting_policy or StoragePublicationPolicy()
+    durable_claim = any(
+        authority.measurement_basis == "claim-requested"
+        for authority in storage_policy.authorities
+    )
+    durable_volume = any(
+        authority.measurement_basis == "volume-provisioned"
+        for authority in storage_policy.authorities
+    )
+    if (
+        durable_claim or durable_volume
+    ) and not capabilities.slice3_storage_lifecycle_ready:
+        raise ValueError("durable storage reporting schema is unavailable")
+    if durable_claim:
+        resources.extend(_INFRASTRUCTURE_PVC_RESOURCES)
+    if durable_volume:
+        if not capabilities.slice2_volume_inventory_ready:
+            raise ValueError("durable volume reporting schema is unavailable")
+        if not volume_mapping_ready:
+            raise ValueError("durable volume mapping registry is unavailable")
+        resources.extend((*_INFRASTRUCTURE_PV_RESOURCES, *mapped_volume_resources))
+    return tuple(dict.fromkeys(resources))
+
+
+def _durable_collection_settings(
+    settings: InfrastructureMeteringSettings,
+    *,
+    compute_activations: Mapping[str, ComputeActivation] | None = None,
+    claim_activation: StorageActivation | None = None,
+    volume_activation: StorageActivation | None = None,
+    source_activations: tuple[StorageSourceActivation, ...] = (),
+) -> InfrastructureMeteringSettings:
+    """Keep active-class mutation routes armed while their source is enabled.
+
+    Helm inventory booleans still control whether the source exists. If an
+    operator turns off only a shadow boolean for a database-active class, the
+    server keeps requiring shadow ingestion. A stale collector then gets a
+    visible mode mismatch and coverage freezes instead of accepting healthy
+    inventory that silently omits specialized intervals.
+    """
+
+    activations = compute_activations or {}
+    force_agent = bool(
+        settings.collector_enabled
+        and _compute_activation_is_durable(activations.get("agent_pod"))
+    )
+    force_ide = bool(
+        settings.collector_enabled
+        and _compute_activation_is_durable(activations.get("ide_workspace_pod"))
+    )
+    force_vm = bool(
+        settings.vm_inventory_enabled
+        and _compute_activation_is_durable(activations.get("workspace_vm"))
+    )
+
+    global_by_basis = {
+        "claim-requested": claim_activation,
+        "volume-provisioned": volume_activation,
+    }
+    durable_storage = {
+        (
+            activation.measurement_basis,
+            activation.collector_id,
+            activation.source_cluster,
+        )
+        for activation in source_activations
+        if _storage_source_activation_is_durable(
+            activation,
+            global_by_basis.get(activation.measurement_basis),
+        )
+    }
+    force_primary_claim = bool(
+        settings.pvc_inventory_enabled
+        and (
+            "claim-requested",
+            "kubernetes-pods",
+            settings.stable_cluster_id,
+        )
+        in durable_storage
+    )
+    force_primary_volume = bool(
+        settings.pv_inventory_enabled
+        and (
+            "volume-provisioned",
+            "kubernetes-pods",
+            settings.stable_cluster_id,
+        )
+        in durable_storage
+    )
+    force_vm_claim = bool(
+        settings.vm_pvc_inventory_enabled
+        and (
+            "claim-requested",
+            "kubevirt-storage",
+            settings.vm_stable_cluster_id,
+        )
+        in durable_storage
+    )
+    force_vm_volume = bool(
+        settings.vm_pv_inventory_enabled
+        and (
+            "volume-provisioned",
+            "kubevirt-storage",
+            settings.vm_stable_cluster_id,
+        )
+        in durable_storage
+    )
+    forced = any(
+        (
+            force_agent,
+            force_ide,
+            force_vm,
+            force_primary_claim,
+            force_primary_volume,
+            force_vm_claim,
+            force_vm_volume,
+        )
+    )
+    if not forced:
+        return settings
+    return replace(
+        settings,
+        shadow_enabled=(settings.shadow_enabled or force_agent or force_ide),
+        agent_pod_shadow_enabled=settings.agent_pod_shadow_enabled or force_agent,
+        ide_pod_shadow_enabled=settings.ide_pod_shadow_enabled or force_ide,
+        vm_shadow_enabled=settings.vm_shadow_enabled or force_vm,
+        pvc_shadow_enabled=settings.pvc_shadow_enabled or force_primary_claim,
+        pv_shadow_enabled=settings.pv_shadow_enabled or force_primary_volume,
+        vm_pvc_shadow_enabled=settings.vm_pvc_shadow_enabled or force_vm_claim,
+        vm_pv_shadow_enabled=settings.vm_pv_shadow_enabled or force_vm_volume,
+    )
 
 
 def _requested_storage_publication_policy(
@@ -8797,6 +9030,8 @@ async def lifespan(app: FastAPI):
     global infrastructure_storage_mapping
     global infrastructure_compute_activation
     global infrastructure_compute_scope_diagnostics
+    global infrastructure_durable_compute_activation_keys
+    global infrastructure_durable_reporting_policy_ready
     global infrastructure_storage_source_activation_ready
     infrastructure_metering_settings = InfrastructureMeteringSettings.from_env()
     metering_capabilities = await probe_schema_capabilities(
@@ -8839,6 +9074,7 @@ async def lifespan(app: FastAPI):
     claim_storage_activation: StorageActivation | None = None
     volume_storage_activation: StorageActivation | None = None
     storage_source_activations: tuple[StorageSourceActivation, ...] = ()
+    storage_reporting_state_ready = True
     if metering_capabilities.slice2_volume_schema_ready:
         candidate_storage_assets = StorageAssetStore(postgres_db.pool)
         try:
@@ -8852,6 +9088,7 @@ async def lifespan(app: FastAPI):
                 "operations remain unavailable",
                 exc_info=True,
             )
+            storage_reporting_state_ready = False
         else:
             infrastructure_storage_assets = candidate_storage_assets
             if metering_capabilities.slice3_storage_lifecycle_ready:
@@ -8862,13 +9099,17 @@ async def lifespan(app: FastAPI):
                 except Exception:
                     logger.warning(
                         "Infrastructure storage source activation probe failed; "
-                        "source publication remains unavailable",
+                        "source publication and historical reporting remain "
+                        "unavailable",
                         exc_info=True,
                     )
+                    storage_reporting_state_ready = False
     infrastructure_compute_activation = None
     infrastructure_compute_scope_diagnostics = {}
+    infrastructure_durable_compute_activation_keys = frozenset()
     compute_activations: dict[str, ComputeActivation] = {}
     publication_compute_activations: dict[str, ComputeActivation] = {}
+    compute_reporting_state_ready = True
     if metering_capabilities.slice3_compute_inventory_ready:
         candidate_compute_activation = ComputeActivationStore(postgres_db.pool)
         try:
@@ -8876,21 +9117,26 @@ async def lifespan(app: FastAPI):
             compute_scope_requirements = (
                 await candidate_compute_activation.requirements()
             )
-            compute_epoch_authorities = (
-                await candidate_compute_activation.authorities()
-            )
+            compute_epoch_authorities = await candidate_compute_activation.authorities()
         except Exception:
             logger.warning(
                 "Infrastructure compute activation probe failed; Slice 3 "
-                "activation operations remain unavailable",
+                "activation operations and historical reporting remain "
+                "unavailable",
                 exc_info=True,
             )
+            compute_reporting_state_ready = False
         else:
             infrastructure_compute_activation = candidate_compute_activation
             compute_activations = {
                 activation.activation_key: activation
                 for activation in compute_activation_rows
             }
+            infrastructure_durable_compute_activation_keys = frozenset(
+                key
+                for key, activation in compute_activations.items()
+                if _compute_activation_is_durable(activation)
+            )
             publication_compute_activations = dict(compute_activations)
             for activation in compute_activation_rows:
                 source_cluster, namespaces, collector_id = _compute_scope_configuration(
@@ -8924,9 +9170,7 @@ async def lifespan(app: FastAPI):
                     activation.activation_key,
                     diagnostic,
                 )
-    vm_lifecycle_authenticated = bool(
-        nats_bridge.lifecycle_identity_authenticated
-    )
+    vm_lifecycle_authenticated = bool(nats_bridge.lifecycle_identity_authenticated)
     if (
         infrastructure_metering_settings.vm_publication_enabled
         or infrastructure_metering_settings.vm_pvc_publication_enabled
@@ -8986,6 +9230,34 @@ async def lifespan(app: FastAPI):
             publication_compute_activations.get("ide_workspace_pod")
         )
     )
+    durable_ide_reporting_enabled = _compute_activation_is_durable(
+        compute_activations.get("ide_workspace_pod")
+    )
+    durable_reporting_policy_ready = bool(
+        compute_reporting_state_ready and storage_reporting_state_ready
+    )
+    try:
+        durable_storage_reporting_policy = _durable_storage_reporting_policy(
+            claim_activation=claim_storage_activation,
+            volume_activation=volume_storage_activation,
+            source_activations=storage_source_activations,
+        )
+        durable_reporting_resources = _durable_infrastructure_reporting_resources(
+            metering_capabilities,
+            mapped_volume_resources=registered_storage_resources,
+            volume_mapping_ready=storage_mapping_ready,
+            compute_activations=compute_activations,
+            storage_reporting_policy=durable_storage_reporting_policy,
+        )
+    except (PublicationContractError, ValueError) as exc:
+        durable_reporting_policy_ready = False
+        durable_storage_reporting_policy = StoragePublicationPolicy()
+        durable_reporting_resources = ("workspace_pod",)
+        logger.error(
+            "Infrastructure historical reporting policy is unavailable: %s",
+            exc,
+        )
+    infrastructure_durable_reporting_policy_ready = durable_reporting_policy_ready
     if (
         infrastructure_metering_settings.ide_pod_publication_enabled
         and not ide_publication_ready
@@ -9020,16 +9292,20 @@ async def lifespan(app: FastAPI):
                 for authority in unavailable_storage_authorities
             ),
         )
-    infrastructure_usage_v2 = UsageV2QueryService(
-        audit_usage_pool,
-        metering_capabilities,
-        postgres_db.pool,
-        source_aware_reads_enabled=(
-            infrastructure_metering_settings.source_aware_reads_enabled
-        ),
-        enabled_resources=enabled_infrastructure_resources,
-        ide_workspace_pod_enabled=ide_publication_ready,
-        storage_publication_policy=enabled_storage_publication_policy,
+    infrastructure_usage_v2 = (
+        UsageV2QueryService(
+            audit_usage_pool,
+            metering_capabilities,
+            postgres_db.pool,
+            source_aware_reads_enabled=(
+                infrastructure_metering_settings.source_aware_reads_enabled
+            ),
+            enabled_resources=durable_reporting_resources,
+            ide_workspace_pod_enabled=durable_ide_reporting_enabled,
+            storage_publication_policy=durable_storage_reporting_policy,
+        )
+        if durable_reporting_policy_ready
+        else None
     )
     infrastructure_usage_rollup = (
         TypedUsageDailyRollup(
@@ -9040,7 +9316,12 @@ async def lifespan(app: FastAPI):
         else None
     )
     if infrastructure_metering_settings.v2_reads_enabled:
-        if not metering_capabilities.slice0_ready:
+        if not durable_reporting_policy_ready:
+            logger.error(
+                "Infrastructure metering v2 reads requested but durable "
+                "historical reporting policy is unavailable"
+            )
+        elif not metering_capabilities.slice0_ready:
             logger.error(
                 "Infrastructure metering v2 reads requested but schema "
                 "capabilities are incomplete: %s",
@@ -9063,6 +9344,13 @@ async def lifespan(app: FastAPI):
                     "route remains unavailable",
                     exc_info=True,
                 )
+    collection_runtime_settings = _durable_collection_settings(
+        infrastructure_metering_settings,
+        compute_activations=compute_activations,
+        claim_activation=claim_storage_activation,
+        volume_activation=volume_storage_activation,
+        source_activations=storage_source_activations,
+    )
     infrastructure_inventory_store = None
     infrastructure_ingestion_service = None
     if infrastructure_metering_settings.collector_enabled:
@@ -9107,16 +9395,16 @@ async def lifespan(app: FastAPI):
                 "Slice 2 PV identity key version mismatch"
             )
         if (
-            infrastructure_metering_settings.ide_pod_shadow_enabled
-            or infrastructure_metering_settings.agent_pod_shadow_enabled
-            or infrastructure_metering_settings.vm_inventory_enabled
+            collection_runtime_settings.ide_pod_shadow_enabled
+            or collection_runtime_settings.agent_pod_shadow_enabled
+            or collection_runtime_settings.vm_inventory_enabled
         ) and not metering_capabilities.slice3_compute_inventory_ready:
             collection_capability_errors.append("Slice 3 compute inventory")
         if (
-            infrastructure_metering_settings.pvc_shadow_enabled
-            or infrastructure_metering_settings.pv_shadow_enabled
-            or infrastructure_metering_settings.vm_pvc_shadow_enabled
-            or infrastructure_metering_settings.vm_pv_shadow_enabled
+            collection_runtime_settings.pvc_shadow_enabled
+            or collection_runtime_settings.pv_shadow_enabled
+            or collection_runtime_settings.vm_pvc_shadow_enabled
+            or collection_runtime_settings.vm_pv_shadow_enabled
             or infrastructure_metering_settings.pvc_publication_enabled
             or infrastructure_metering_settings.pv_publication_enabled
             or infrastructure_metering_settings.vm_pvc_publication_enabled
@@ -9128,7 +9416,7 @@ async def lifespan(app: FastAPI):
         elif metering_capabilities.slice3_storage_lifecycle_ready:
             collection_capability_errors.extend(
                 _storage_source_configuration_errors(
-                    infrastructure_metering_settings,
+                    collection_runtime_settings,
                     storage_source_activations,
                 )
             )
@@ -9156,6 +9444,11 @@ async def lifespan(app: FastAPI):
             try:
                 candidate_store = InventoryStore(
                     postgres_db.pool,
+                    max_collector_clock_skew=timedelta(
+                        seconds=(
+                            infrastructure_metering_settings.max_collector_clock_skew_seconds
+                        )
+                    ),
                     max_batch_items=500,
                     max_batch_bytes=min(
                         2 * 1024 * 1024,
@@ -9200,7 +9493,7 @@ async def lifespan(app: FastAPI):
                 candidate_service = InfrastructureIngestionService(
                     postgres_db.pool,
                     candidate_store,
-                    infrastructure_metering_settings,
+                    collection_runtime_settings,
                     ingestion_key=ingestion_key,
                     additional_ingestion_keys=additional_ingestion_keys or None,
                 )
@@ -9216,7 +9509,7 @@ async def lifespan(app: FastAPI):
                 logger.info(
                     "Infrastructure metering ingestion enabled mode=%s",
                     "shadow"
-                    if infrastructure_metering_settings.shadow_enabled
+                    if collection_runtime_settings.shadow_enabled
                     else "inventory-only",
                 )
 
@@ -9248,7 +9541,10 @@ async def lifespan(app: FastAPI):
                     seconds=infrastructure_metering_settings.stale_after_seconds
                 ),
             )
-        if infrastructure_metering_settings.publication_enabled:
+        if (
+            infrastructure_metering_settings.publication_enabled
+            and durable_reporting_policy_ready
+        ):
             infrastructure_usage_materializer = InfrastructureUsageMaterializer(
                 postgres_db.pool,
                 usage_ledger,
@@ -9260,9 +9556,9 @@ async def lifespan(app: FastAPI):
             infrastructure_usage_day_sealer = InfrastructureUsageDaySealer(
                 postgres_db.pool,
                 sealing_enabled=True,
-                enabled_resources=enabled_infrastructure_resources,
-                ide_workspace_pod_enabled=ide_publication_ready,
-                storage_publication_policy=enabled_storage_publication_policy,
+                enabled_resources=durable_reporting_resources,
+                ide_workspace_pod_enabled=durable_ide_reporting_enabled,
+                storage_publication_policy=durable_storage_reporting_policy,
             )
         if (
             infrastructure_workspace_cutover is not None
@@ -9271,7 +9567,11 @@ async def lifespan(app: FastAPI):
         ):
             infrastructure_metering_runtime = InfrastructureMeteringRuntime(
                 postgres_db.pool,
-                cutover=infrastructure_workspace_cutover,
+                cutover=(
+                    infrastructure_workspace_cutover
+                    if durable_reporting_policy_ready
+                    else None
+                ),
                 materializer=infrastructure_usage_materializer,
                 sealer=infrastructure_usage_day_sealer,
             )
@@ -21727,9 +22027,7 @@ class InfrastructureComputeActivationScheduleRequest(
     activated_at: datetime
 
 
-class InfrastructureComputeEpochRolloverRequest(
-    InfrastructureComputeActivationRequest
-):
+class InfrastructureComputeEpochRolloverRequest(InfrastructureComputeActivationRequest):
     idempotency_key: UUID
 
 
@@ -21888,6 +22186,8 @@ def _compute_epoch_promotion_payload(
 def _compute_class_shadow_enabled(
     activation_key: str,
 ) -> bool:
+    if activation_key in infrastructure_durable_compute_activation_keys:
+        return True
     if activation_key == "agent_pod":
         return infrastructure_metering_settings.agent_pod_shadow_enabled
     if activation_key == "ide_workspace_pod":
@@ -22276,8 +22576,7 @@ async def get_infrastructure_compute_activation(
             _compute_activation_payload(activation) for activation in activations
         ],
         "epoch_authorities": [
-            _compute_epoch_authority_payload(authority)
-            for authority in authorities
+            _compute_epoch_authority_payload(authority) for authority in authorities
         ],
         "configuration": {
             activation.activation_key: {
@@ -22290,9 +22589,7 @@ async def get_infrastructure_compute_activation(
                 "publication_enabled": _compute_class_publication_enabled(
                     activation.activation_key
                 ),
-                "scope_compatible": (
-                    activation.activation_key not in diagnostics
-                ),
+                "scope_compatible": (activation.activation_key not in diagnostics),
                 "scope_diagnostic": diagnostics.get(activation.activation_key),
             }
             for activation in activations
@@ -22431,20 +22728,18 @@ async def rollover_infrastructure_compute_epoch(
     )
     generation = _infrastructure_leader_generation()
     try:
-        promotion = (
-            await infrastructure_compute_activation.promote_recovery_epochs(
-                activation_key=activation_key,
-                source_cluster=source_cluster,
-                namespaces=namespaces,
-                max_scope_age=timedelta(
-                    seconds=infrastructure_metering_settings.stale_after_seconds
-                ),
-                expected_generation=generation,
-                request_id=body.idempotency_key,
-                actor_id=UUID(str(admin["id"])),
-                audit_reason=body.reason,
-                collector_id=collector_id,
-            )
+        promotion = await infrastructure_compute_activation.promote_recovery_epochs(
+            activation_key=activation_key,
+            source_cluster=source_cluster,
+            namespaces=namespaces,
+            max_scope_age=timedelta(
+                seconds=infrastructure_metering_settings.stale_after_seconds
+            ),
+            expected_generation=generation,
+            request_id=body.idempotency_key,
+            actor_id=UUID(str(admin["id"])),
+            audit_reason=body.reason,
+            collector_id=collector_id,
         )
     except ComputeActivationContractError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -22729,6 +23024,11 @@ async def prepare_infrastructure_metering_cutover(
         raise HTTPException(
             status_code=404,
             detail="Infrastructure metering cutover is not enabled",
+        )
+    if not infrastructure_durable_reporting_policy_ready:
+        raise HTTPException(
+            status_code=503,
+            detail="Infrastructure historical reporting policy is unavailable",
         )
     if infrastructure_workspace_cutover is None:
         raise HTTPException(

@@ -225,6 +225,36 @@ infrastructureMetering:
   pvShadowEnabled: false
   pvcPublicationEnabled: false
   pvPublicationEnabled: false
+  # Slice 3 compute classes reuse Pod inventory where possible but cannot
+  # inherit an already-active workspace cutover. Each class has its own
+  # shadow/publication gate and durable activation boundary.
+  idePodShadowEnabled: false
+  agentPodShadowEnabled: false
+  idePodPublicationEnabled: false
+  agentPodPublicationEnabled: false
+  # Remote KubeVirt inventory uses a dedicated authenticated collector
+  # identity. These remain dark until its transport and controller journal are
+  # configured and validated on the VM cluster.
+  vmInventoryEnabled: false
+  vmShadowEnabled: false
+  vmPublicationEnabled: false
+  # Root-disk storage is collected by a second VM-cluster identity so the VMI
+  # credential can never authorize PVC/PV observations. These inventory and
+  # shadow gates are independent of both VMI compute and local-cluster storage.
+  vmPvcInventoryEnabled: false
+  vmPvInventoryEnabled: false
+  vmPvcShadowEnabled: false
+  vmPvShadowEnabled: false
+  # Remote storage publication is authorized only by the main orchestrator.
+  # The VM-cluster collectors remain database-free and cannot enable it.
+  vmPvcPublicationEnabled: false
+  vmPvPublicationEnabled: false
+  # Kubernetes PVs are cluster-scoped. Enabling remote PV inventory grants the
+  # dedicated storage collector visibility of every PV in the VM cluster, so
+  # the server and remote chart both require this explicit acknowledgement.
+  vmPvClusterWideRbacAcknowledged: false
+  vmStableClusterId: ""
+  vmNamespace: ""
   # Stable operator-owned installation identity. Required before collection or
   # publication; it must survive endpoint and credential rotation.
   stableClusterId: ""
@@ -234,6 +264,9 @@ infrastructureMetering:
   namespaceAllowlist: []
   relistIntervalSeconds: 300
   staleAfterSeconds: 900
+  # Remote lifecycle timestamps are evidence only. VMI scheduled transitions
+  # outside this app-receipt skew window cannot become exact interval starts.
+  maxCollectorClockSkewSeconds: 300
   listPageSize: 500
   scopeConcurrency: 2
   watchQueueSize: 10000
@@ -250,6 +283,28 @@ infrastructureMetering:
   # a distinct Secret name; the main application Secret is rejected.
   ingestionSecretName: ""
   ingestionSecretKey: INFRASTRUCTURE_METERING_INGESTION_KEY
+  # The VM-cluster collector uses an independently rotated HMAC credential.
+  # Provision the same key into this Secret and the remote VM-cluster Secret;
+  # this chart never copies credentials between clusters.
+  vmIngestionSecretName: ""
+  vmIngestionSecretKey: INFRASTRUCTURE_METERING_VMI_INGESTION_KEY
+  # Remote PVC/PV inventory has its own rotated ingestion credential. Keep it
+  # separate from the application, local collector, VMI, and durable-volume
+  # identity Secrets; this chart never copies credentials between clusters.
+  vmStorageIngestionSecretName: ""
+  vmStorageIngestionSecretKey: INFRASTRUCTURE_METERING_VM_STORAGE_INGESTION_KEY
+  # Controller lifecycle identity uses a fourth, dedicated credential. It is
+  # intentionally never read from the application or collector Secrets because
+  # dynamic guests/collectors must not be able to forge VM commands or admitted
+  # UID evidence. Provision the same key independently on the VM cluster.
+  vmLifecycleAuthSecretName: ""
+  vmLifecycleAuthSecretKey: VM_LIFECYCLE_HMAC_SECRET
+  # Optional authenticated route for a collector in another cluster. Prefer a
+  # private tunnel; when this is enabled, TLS and an explicit source-CIDR
+  # allowlist remain mandatory in addition to per-request HMAC authentication.
+  remoteIngress:
+    enabled: false
+    sourceCidrs: []
   # PV identities use a separate, non-rotating HMAC key. In chart-managed
   # secret mode, an empty name creates a dedicated preserved Secret. Other
   # secret modes must name a separately provisioned Secret. The key version
@@ -2091,6 +2146,13 @@ vmController:
     pullPolicy: Always
   service:
     port: 8080
+  # -- Dedicated shared HMAC credential for lifecycle commands and identity
+  # responses. The Secret must exist in the controller namespace and contain
+  # the same value as infrastructureMetering.vmLifecycleAuthSecretName in the
+  # orchestrator namespace. It must never be an application/collector Secret.
+  # Empty preserves legacy provisioning but VM compute/storage is unattributed.
+  lifecycleAuthSecretName: ""
+  lifecycleAuthSecretKey: VM_LIFECYCLE_HMAC_SECRET
   # -- Default VM image — override per-job via the orchestrator API.
   # When empty, defaults to ghcr.io/knaeckebrothero/superhuman-remote-worker-agent-vm-base:v<Chart.AppVersion>
   # so the VM base tracks the chart release. Set explicitly to pin a specific tag.

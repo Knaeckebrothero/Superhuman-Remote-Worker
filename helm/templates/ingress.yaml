@@ -9,6 +9,7 @@
 {{- $neo4jHost   := include "srw.neo4jBrowserHost" . -}}
 {{- $pgadminHost := include "srw.pgadminHost" . -}}
 {{- $dozzleHost  := include "srw.dozzleHost" . -}}
+{{- $remoteIngress := .Values.infrastructureMetering.remoteIngress | default dict -}}
 # Cockpit web UI
 apiVersion: networking.k8s.io/v1
 kind: Ingress
@@ -284,6 +285,54 @@ spec:
                   number: 8085
 {{- end }}
 {{- if and .Values.infrastructureMetering.collectorEnabled (eq (.Values.ingress.className | default "traefik") "traefik") }}
+{{- if ($remoteIngress.enabled | default false) }}
+---
+# Opt-in cross-cluster collector route. Source filtering is only the outer
+# network fence; every request still requires its dedicated VMI or storage HMAC
+# credential and is read through the application's bounded ingestion contract.
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: {{ $fullName }}-allow-remote-infra-metering
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "orchestrator") | nindent 4 }}
+spec:
+  ipWhiteList:
+    sourceRange:
+      {{- toYaml $remoteIngress.sourceCidrs | nindent 6 }}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ $fullName }}-api-ingress-remote-infra-metering
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "orchestrator") | nindent 4 }}
+  annotations:
+    {{- if .Values.ingress.tls.issuerName }}
+    cert-manager.io/cluster-issuer: {{ .Values.ingress.tls.issuerName }}
+    {{- end }}
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+    traefik.ingress.kubernetes.io/router.tls: "true"
+    traefik.ingress.kubernetes.io/router.priority: "140"
+    traefik.ingress.kubernetes.io/router.middlewares: {{ .Release.Namespace }}-{{ $fullName }}-allow-remote-infra-metering@kubernetescrd
+spec:
+  ingressClassName: {{ .Values.ingress.className }}
+  tls:
+    - hosts:
+        - {{ $apiHost }}
+      secretName: {{ $fullName }}-api-tls
+  rules:
+    - host: {{ $apiHost }}
+      http:
+        paths:
+          - path: /api/internal/infrastructure-metering
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ $fullName }}-orchestrator
+                port:
+                  number: 8085
+{{- end }}
 ---
 # Signed metadata and the claimed digest are authenticated before a bounded
 # body read, then the exact body is verified. This route is never browser-facing,

@@ -150,6 +150,16 @@ spec:
                 configMapKeyRef:
                   name: {{ include "srw.configMapName" . }}
                   key: INFRASTRUCTURE_METERING_PV_SHADOW_ENABLED
+            - name: INFRASTRUCTURE_METERING_IDE_POD_SHADOW_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: INFRASTRUCTURE_METERING_IDE_POD_SHADOW_ENABLED
+            - name: INFRASTRUCTURE_METERING_AGENT_POD_SHADOW_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: INFRASTRUCTURE_METERING_AGENT_POD_SHADOW_ENABLED
             - name: INFRASTRUCTURE_METERING_VOLUME_IDENTITY_KEY_VERSION
               valueFrom:
                 configMapKeyRef:

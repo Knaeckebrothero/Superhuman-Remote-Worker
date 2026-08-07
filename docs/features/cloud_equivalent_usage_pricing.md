@@ -1,8 +1,10 @@
 # Cloud-equivalent usage pricing
 
-Status: v1 implemented and deployed. The typed infrastructure successor is
-implemented through Slice 2/app migration `0102`, but remains dark-launched;
-the serving cloud cards still price only the active v1 aggregate workspace
+Status: v1 implemented and deployed. The repository's typed infrastructure
+successor is implementation-complete through Slice 3/app migration `0114` and
+has passed a dark k3d upgrade, but remains dark-launched. Main dev still runs
+`sha-95d2a10` with app migrations through `0102` and Pod inventory only; the
+serving cloud cards still price only the active v1 aggregate workspace
 quantities.
 
 ## Why
@@ -114,22 +116,27 @@ typed successor substrate in
 [`infrastructure_resource_metering.md`](infrastructure_resource_metering.md)
 now provides typed resource classes, half-open workspace-Pod periods, retained
 lifecycle identity, price provenance, estimate quality, and code-versioned
-calculator contracts. PVC/PV collection and lifecycle code now exists behind
-Slice 2's dark-launch gates; agent/VM collection does not. Pricing coverage must
-still not expand until the relevant inventory has completed shadow validation,
-publication/source-aware reads are deliberately activated, and a provider
+calculator contracts. PVC/PV collection and lifecycle code exists behind Slice
+2's gates; Slice 3 now also implements gated agent/IDE Pod intervals,
+authenticated VM/VMI lifecycle capture, and exact root-storage attribution.
+None is automatically eligible for pricing. Coverage must not expand until the
+relevant source has completed operational inventory/shadow validation,
+publication and source-aware reads are deliberately activated, and a provider
 adapter is tested for that exact resource class.
 
-**Current integration state (2026-08-06):** `/api/usage` and its v1 cards remain
-authoritative. `/api/usage/v2`, typed calculators, the Slice 1 workspace-Pod
-path, and Slice 2 PVC/PV quantity paths are implemented, but v2 reads,
-source-aware reads, cutover, and publication are disabled. Slice 2's immutable
-operator registry maps only exact `(cluster, StorageClass, CSI driver, volume
-mode)` selectors. No collector-supplied parameters can select a price, and an
-unmapped volume is forced unpriced. The local k3d PVC/PV inventory/shadow gate
-has passed, but no storage quantities were published or added to the serving
-cards. Provider storage rate cards and fixtures remain Slice 5; VM pricing
-remains downstream of Slice 3.
+**Current integration state (2026-08-07):** `/api/usage`, the compatibility
+ledger, and the v1 cards remain authoritative. Repository code and local k3d
+validation now cover the typed API/calculator substrate plus Slices 1–3 through
+app migration `0114`. The k3d dark upgrade passed with every publication,
+cutover, v2-read, source-aware-read, storage, and Slice 3 gate off, so it emitted
+no new authoritative quantities. Main dev has not received that package: it
+still runs `sha-95d2a10`, has app migrations through `0102`, and enables Pod
+inventory only. Live VM objects have been normalized read-only, but the live VM
+cluster still has its old controller and no collector; its agent/IDE/VMI/root
+storage rollout and shadow approval remain pending. Slice 2's immutable operator
+registry continues to admit only exact `(cluster, StorageClass, CSI driver,
+volume mode)` selectors; unmapped volumes are unpriced. Provider storage and VM
+rate adapters/fixtures remain incomplete Slice 5 work.
 
 ## Exclusions and follow-ups
 
@@ -139,17 +146,21 @@ agent/orchestrator pods, VM workspaces, persistent disks, load balancers, public
 IP addresses, egress, tax, discounts, minimum billing increments, and provider
 free tiers. Those costs should be added only after the corresponding resource is
 metered in its proper workload/asset domain or explicitly modeled as separate
-idle/overhead cost.
+idle/overhead cost. Slice 3 capture code does not change that serving-card
+boundary while its sources are dark and unapproved.
 
 Useful follow-ups:
 
-1. Shadow-validate and activate the implemented PVC-requested
+1. Operationally shadow-validate and activate the implemented PVC-requested
    `gib-hour`/`claim-hour` and PV-provisioned `gib-hour`/`volume-hour` paths, then
-   add typed provider storage-rate components; derive GiB-month only as a
+   finish typed provider storage-rate components; derive GiB-month only as a
    display normalization.
-2. Meter persistent agent and VM workspace intervals.
-3. Add an admin rate-card editor and optional homelab amortization/power card.
-4. Add a separate shared-platform baseline view for control plane and always-on
+2. Roll out and shadow-approve the implemented agent/IDE and VM/VMI/root-storage
+   sources before enabling their publication or pricing.
+3. Implement Slice 4 shared-platform completeness.
+4. Complete the Slice 5 provider calculator adapters and fixtures, then add an
+   admin rate-card editor and optional homelab amortization/power card.
+5. Add a separate shared-platform baseline view for control plane and always-on
    infrastructure. Do not smear that baseline across users without an explicit
    allocation policy.
 

@@ -1,3 +1,4 @@
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 import inspect
@@ -66,6 +67,8 @@ def test_cutover_wiring_uses_configured_inventory_freshness() -> None:
     source = inspect.getsource(orchestrator_main.lifespan)
     assert "max_scope_age=timedelta(" in source
     assert "seconds=infrastructure_metering_settings.stale_after_seconds" in source
+    assert "max_collector_clock_skew=timedelta(" in source
+    assert "infrastructure_metering_settings.max_collector_clock_skew_seconds" in source
 
 
 def test_storage_publication_resources_require_effective_activation() -> None:
@@ -91,6 +94,7 @@ def test_storage_publication_resources_require_effective_activation() -> None:
     capabilities = MagicMock(
         slice2_claim_inventory_ready=True,
         slice2_volume_inventory_ready=True,
+        slice3_storage_lifecycle_ready=True,
         storage_identity_key_version="storage-v1",
     )
     boundary = datetime(2026, 8, 7, tzinfo=timezone.utc)
@@ -112,19 +116,69 @@ def test_storage_publication_resources_require_effective_activation() -> None:
         activated_at=boundary,
         database_time=boundary + timedelta(hours=1),
     )
+    before_source = orchestrator_main.StorageSourceActivation(
+        measurement_basis="claim-requested",
+        collector_id="kubernetes-pods",
+        source_cluster="dev-cluster",
+        state="active",
+        activated_at=boundary,
+        database_time=boundary - timedelta(microseconds=1),
+    )
+    effective_claim_source = orchestrator_main.StorageSourceActivation(
+        measurement_basis="claim-requested",
+        collector_id="kubernetes-pods",
+        source_cluster="dev-cluster",
+        state="active",
+        activated_at=boundary,
+        database_time=boundary,
+    )
+    effective_volume_source = orchestrator_main.StorageSourceActivation(
+        measurement_basis="volume-provisioned",
+        collector_id="kubernetes-pods",
+        source_cluster="dev-cluster",
+        state="active",
+        activated_at=boundary,
+        database_time=boundary + timedelta(hours=1),
+    )
+    requested_policy = orchestrator_main._requested_storage_publication_policy(settings)
 
-    assert orchestrator_main._capability_gated_infrastructure_publication_resources(
-        settings,
+    before_policy = orchestrator_main._capability_gated_storage_publication_policy(
+        requested_policy,
         capabilities,
         claim_activation=before,
-        volume_activation=None,
-    ) == ("workspace_pod",)
-    enabled = orchestrator_main._capability_gated_infrastructure_publication_resources(
-        settings,
+        volume_activation=effective_volume,
+        source_activations={
+            ("claim-requested", "kubernetes-pods", "dev-cluster"): before_source,
+        },
+        volume_mapping_ready=True,
+        volume_identity_key_matches=True,
+    )
+    assert before_policy.authorities == ()
+    enabled_policy = orchestrator_main._capability_gated_storage_publication_policy(
+        requested_policy,
         capabilities,
         claim_activation=effective_claim,
         volume_activation=effective_volume,
+        source_activations={
+            (
+                "claim-requested",
+                "kubernetes-pods",
+                "dev-cluster",
+            ): effective_claim_source,
+            (
+                "volume-provisioned",
+                "kubernetes-pods",
+                "dev-cluster",
+            ): effective_volume_source,
+        },
+        volume_mapping_ready=True,
+        volume_identity_key_matches=True,
+    )
+    enabled = orchestrator_main._capability_gated_infrastructure_publication_resources(
+        settings,
+        capabilities,
         mapped_volume_resources=("block_volume_longhorn_ephemeral",),
+        storage_publication_policy=enabled_policy,
     )
     assert enabled == (
         "workspace_pod",
@@ -136,10 +190,177 @@ def test_storage_publication_resources_require_effective_activation() -> None:
     assert orchestrator_main._capability_gated_infrastructure_publication_resources(
         settings,
         capabilities,
-        claim_activation=effective_claim,
-        volume_activation=effective_volume,
         mapped_volume_resources=("block_volume_longhorn_ephemeral",),
+        storage_publication_policy=enabled_policy,
     ) == ("workspace_pod", *orchestrator_main._INFRASTRUCTURE_PVC_RESOURCES)
+
+
+def test_durable_reporting_policy_survives_write_gate_and_auth_loss() -> None:
+    import main as orchestrator_main
+
+    boundary = datetime(2026, 8, 8, tzinfo=timezone.utc)
+    before_boundary = boundary - timedelta(hours=1)
+    claim = orchestrator_main.StorageActivation(
+        measurement_basis="claim-requested",
+        state="active",
+        activated_at=boundary,
+        database_time=before_boundary,
+    )
+    volume = orchestrator_main.StorageActivation(
+        measurement_basis="volume-provisioned",
+        state="active",
+        activated_at=boundary,
+        database_time=before_boundary,
+    )
+    sources = (
+        orchestrator_main.StorageSourceActivation(
+            measurement_basis="claim-requested",
+            collector_id="kubernetes-pods",
+            source_cluster="main-dev",
+            state="active",
+            activated_at=boundary,
+            database_time=before_boundary,
+        ),
+        orchestrator_main.StorageSourceActivation(
+            measurement_basis="volume-provisioned",
+            collector_id="kubevirt-storage",
+            source_cluster="vm-cluster",
+            state="active",
+            activated_at=boundary,
+            database_time=before_boundary,
+        ),
+    )
+    storage_policy = orchestrator_main._durable_storage_reporting_policy(
+        claim_activation=claim,
+        volume_activation=volume,
+        source_activations=sources,
+    )
+    assert storage_policy.authorities == (
+        orchestrator_main.StoragePublicationAuthority(
+            "claim-requested", "kubernetes-pods", "main-dev"
+        ),
+        orchestrator_main.StoragePublicationAuthority(
+            "volume-provisioned", "kubevirt-storage", "vm-cluster"
+        ),
+    )
+
+    compute = {
+        key: orchestrator_main.ComputeActivation(
+            activation_key=key,
+            state="active",
+            activated_at=boundary,
+            database_time=before_boundary,
+        )
+        for key in ("agent_pod", "ide_workspace_pod", "workspace_vm")
+    }
+    capabilities = MagicMock(
+        slice3_compute_inventory_ready=True,
+        slice3_storage_lifecycle_ready=True,
+        slice2_volume_inventory_ready=True,
+    )
+    resources = orchestrator_main._durable_infrastructure_reporting_resources(
+        capabilities,
+        mapped_volume_resources=("block_volume_stackit",),
+        compute_activations=compute,
+        storage_reporting_policy=storage_policy,
+    )
+    assert resources == (
+        "workspace_pod",
+        "agent_pod",
+        "workspace_vm",
+        *orchestrator_main._INFRASTRUCTURE_PVC_RESOURCES,
+        *orchestrator_main._INFRASTRUCTURE_PV_RESOURCES,
+        "block_volume_stackit",
+    )
+    assert orchestrator_main._compute_activation_is_durable(
+        compute["ide_workspace_pod"]
+    )
+
+    # Current write controls remain independently dark and unauthenticated.
+    settings = InfrastructureMeteringSettings()
+    assert orchestrator_main._enabled_infrastructure_publication_resources(
+        settings,
+        mapped_volume_resources=("block_volume_stackit",),
+    ) == ("workspace_pod",)
+    assert (
+        orchestrator_main._requested_storage_publication_policy(
+            settings,
+            vm_lifecycle_authenticated=False,
+        ).authorities
+        == ()
+    )
+
+
+def test_durable_volume_reporting_fails_closed_without_mapping_registry() -> None:
+    import main as orchestrator_main
+
+    capabilities = MagicMock(
+        slice3_compute_inventory_ready=True,
+        slice3_storage_lifecycle_ready=True,
+        slice2_volume_inventory_ready=True,
+    )
+    policy = orchestrator_main.StoragePublicationPolicy(
+        (
+            orchestrator_main.StoragePublicationAuthority(
+                "volume-provisioned", "kubernetes-pods", "main-dev"
+            ),
+        )
+    )
+    with pytest.raises(ValueError, match="mapping registry"):
+        orchestrator_main._durable_infrastructure_reporting_resources(
+            capabilities,
+            volume_mapping_ready=False,
+            storage_reporting_policy=policy,
+        )
+
+
+def test_storage_shadow_configuration_must_match_frozen_source_scopes() -> None:
+    import main as orchestrator_main
+    from services.infrastructure_metering.storage_assets import (
+        StorageSourceRequirement,
+    )
+
+    settings = InfrastructureMeteringSettings(
+        collector_enabled=True,
+        shadow_enabled=True,
+        pvc_inventory_enabled=True,
+        pvc_shadow_enabled=True,
+        stable_cluster_id="dev-cluster",
+        namespace_allowlist=("srw",),
+    )
+    assert orchestrator_main._storage_source_configuration_errors(settings, ()) == (
+        "primary/claim-requested durable source shadow activation",
+    )
+
+    activation = orchestrator_main.StorageSourceActivation(
+        measurement_basis="claim-requested",
+        collector_id="kubernetes-pods",
+        source_cluster="dev-cluster",
+        state="shadow",
+        activated_at=None,
+        requirements=(
+            StorageSourceRequirement(
+                inventory_scope_id=uuid4(),
+                api_resource="core/v1/persistentvolumeclaims",
+                namespace="srw",
+                requirement_role="quantity",
+            ),
+        ),
+        database_time=datetime(2026, 8, 7, tzinfo=timezone.utc),
+    )
+    assert (
+        orchestrator_main._storage_source_configuration_errors(
+            settings,
+            (activation,),
+        )
+        == ()
+    )
+
+    expanded = replace(settings, namespace_allowlist=("srw", "new-namespace"))
+    assert orchestrator_main._storage_source_configuration_errors(
+        expanded,
+        (activation,),
+    ) == ("primary/claim-requested frozen inventory scope set",)
 
 
 def _source_aware_capabilities(*, slice1: bool) -> MeteringSchemaCapabilities:
@@ -570,6 +791,153 @@ def test_slice2_storage_gates_are_independent_and_fail_closed():
         )
 
 
+def test_vm_storage_dark_gates_are_independent_and_cannot_activate(monkeypatch):
+    import main as orchestrator_main
+
+    defaults = InfrastructureMeteringSettings.from_env({})
+    assert defaults.vm_pvc_inventory_enabled is False
+    assert defaults.vm_pv_inventory_enabled is False
+    assert defaults.vm_pvc_shadow_enabled is False
+    assert defaults.vm_pv_shadow_enabled is False
+    assert defaults.vm_pvc_publication_enabled is False
+    assert defaults.vm_pv_publication_enabled is False
+    assert defaults.vm_pv_cluster_wide_rbac_acknowledged is False
+
+    base = {
+        "INFRASTRUCTURE_METERING_COLLECTOR_ENABLED": "true",
+        "INFRASTRUCTURE_METERING_STABLE_CLUSTER_ID": "dev-cluster",
+        "INFRASTRUCTURE_METERING_NAMESPACE_ALLOWLIST": "srw",
+        "INFRASTRUCTURE_METERING_VM_STABLE_CLUSTER_ID": "vm-cluster",
+        "INFRASTRUCTURE_METERING_VM_NAMESPACE": "agent-vms",
+    }
+    with pytest.raises(ValueError, match="cluster-wide PV RBAC acknowledgement"):
+        InfrastructureMeteringSettings.from_env(
+            {
+                **base,
+                "INFRASTRUCTURE_METERING_VM_PV_INVENTORY_ENABLED": "true",
+                "INFRASTRUCTURE_METERING_VOLUME_IDENTITY_KEY_VERSION": "storage-v1",
+            }
+        )
+    with pytest.raises(ValueError, match="volume identity key version"):
+        InfrastructureMeteringSettings.from_env(
+            {
+                **base,
+                "INFRASTRUCTURE_METERING_VM_PV_INVENTORY_ENABLED": "true",
+                "INFRASTRUCTURE_METERING_VM_PV_CLUSTER_WIDE_RBAC_ACKNOWLEDGED": "true",
+            }
+        )
+    with pytest.raises(ValueError, match="VM PVC shadow mode requires global shadow"):
+        InfrastructureMeteringSettings.from_env(
+            {
+                **base,
+                "INFRASTRUCTURE_METERING_VM_PVC_INVENTORY_ENABLED": "true",
+                "INFRASTRUCTURE_METERING_VM_PVC_SHADOW_ENABLED": "true",
+            }
+        )
+    with pytest.raises(ValueError, match="VM PVC publication requires"):
+        InfrastructureMeteringSettings.from_env(
+            {
+                **base,
+                "INFRASTRUCTURE_METERING_SHADOW_ENABLED": "true",
+                "INFRASTRUCTURE_METERING_VM_PVC_INVENTORY_ENABLED": "true",
+                "INFRASTRUCTURE_METERING_VM_PVC_SHADOW_ENABLED": "true",
+                "INFRASTRUCTURE_METERING_VM_PVC_PUBLICATION_ENABLED": "true",
+            }
+        )
+
+    settings = InfrastructureMeteringSettings.from_env(
+        {
+            **base,
+            "INFRASTRUCTURE_METERING_SHADOW_ENABLED": "true",
+            "INFRASTRUCTURE_METERING_VM_PVC_INVENTORY_ENABLED": "true",
+            "INFRASTRUCTURE_METERING_VM_PV_INVENTORY_ENABLED": "true",
+            "INFRASTRUCTURE_METERING_VM_PVC_SHADOW_ENABLED": "true",
+            "INFRASTRUCTURE_METERING_VM_PV_SHADOW_ENABLED": "true",
+            "INFRASTRUCTURE_METERING_VM_PV_CLUSTER_WIDE_RBAC_ACKNOWLEDGED": "true",
+            "INFRASTRUCTURE_METERING_VOLUME_IDENTITY_KEY_VERSION": "storage-v1",
+        }
+    )
+    monkeypatch.setattr(orchestrator_main, "infrastructure_metering_settings", settings)
+
+    # The existing activation API intentionally remains local-cluster-only.
+    # Remote dark gates cannot make either measurement basis schedulable.
+    assert (
+        orchestrator_main._storage_basis_inventory_enabled("claim-requested") is False
+    )
+    assert (
+        orchestrator_main._storage_basis_inventory_enabled("volume-provisioned")
+        is False
+    )
+    assert settings.pvc_publication_enabled is False
+    assert settings.pv_publication_enabled is False
+
+
+def test_slice3_compute_gates_are_independent_and_fail_closed():
+    defaults = InfrastructureMeteringSettings.from_env({})
+    assert defaults.ide_pod_shadow_enabled is False
+    assert defaults.agent_pod_shadow_enabled is False
+    assert defaults.ide_pod_publication_enabled is False
+    assert defaults.agent_pod_publication_enabled is False
+    assert defaults.vm_inventory_enabled is False
+    assert defaults.vm_shadow_enabled is False
+    assert defaults.vm_publication_enabled is False
+
+    collector_env = {
+        "INFRASTRUCTURE_METERING_COLLECTOR_ENABLED": "true",
+        "INFRASTRUCTURE_METERING_STABLE_CLUSTER_ID": "dev-cluster",
+        "INFRASTRUCTURE_METERING_NAMESPACE_ALLOWLIST": "srw",
+    }
+    with pytest.raises(ValueError, match="agent Pod shadow mode requires"):
+        InfrastructureMeteringSettings.from_env(
+            {
+                **collector_env,
+                "INFRASTRUCTURE_METERING_AGENT_POD_SHADOW_ENABLED": "true",
+            }
+        )
+    with pytest.raises(ValueError, match="IDE Pod publication requires"):
+        InfrastructureMeteringSettings.from_env(
+            {
+                **collector_env,
+                "INFRASTRUCTURE_METERING_SHADOW_ENABLED": "true",
+                "INFRASTRUCTURE_METERING_IDE_POD_SHADOW_ENABLED": "true",
+                "INFRASTRUCTURE_METERING_IDE_POD_PUBLICATION_ENABLED": "true",
+            }
+        )
+    with pytest.raises(ValueError, match="VM inventory requires VM stable"):
+        InfrastructureMeteringSettings.from_env(
+            {
+                **collector_env,
+                "INFRASTRUCTURE_METERING_VM_INVENTORY_ENABLED": "true",
+            }
+        )
+    with pytest.raises(ValueError, match="VM namespace must be"):
+        InfrastructureMeteringSettings.from_env(
+            {"INFRASTRUCTURE_METERING_VM_NAMESPACE": "Not_Valid"}
+        )
+
+    settings = InfrastructureMeteringSettings.from_env(
+        {
+            **collector_env,
+            "INFRASTRUCTURE_METERING_SHADOW_ENABLED": "true",
+            "INFRASTRUCTURE_METERING_PUBLICATION_ENABLED": "true",
+            "INFRASTRUCTURE_METERING_IDE_POD_SHADOW_ENABLED": "true",
+            "INFRASTRUCTURE_METERING_AGENT_POD_SHADOW_ENABLED": "true",
+            "INFRASTRUCTURE_METERING_IDE_POD_PUBLICATION_ENABLED": "true",
+            "INFRASTRUCTURE_METERING_AGENT_POD_PUBLICATION_ENABLED": "true",
+            "INFRASTRUCTURE_METERING_VM_INVENTORY_ENABLED": "true",
+            "INFRASTRUCTURE_METERING_VM_SHADOW_ENABLED": "true",
+            "INFRASTRUCTURE_METERING_VM_PUBLICATION_ENABLED": "true",
+            "INFRASTRUCTURE_METERING_VM_STABLE_CLUSTER_ID": "vm-dev",
+            "INFRASTRUCTURE_METERING_VM_NAMESPACE": "srw-vms",
+        }
+    )
+    assert settings.agent_pod_publication_enabled is True
+    assert settings.ide_pod_publication_enabled is True
+    assert settings.vm_publication_enabled is True
+    assert settings.vm_stable_cluster_id == "vm-dev"
+    assert settings.vm_namespace == "srw-vms"
+
+
 def test_slice1_collector_settings_are_bounded_and_fail_closed():
     settings = InfrastructureMeteringSettings.from_env(
         {
@@ -581,6 +949,7 @@ def test_slice1_collector_settings_are_bounded_and_fail_closed():
             "INFRASTRUCTURE_METERING_SNAPSHOT_ITEM_RETENTION_DAYS": "14",
             "INFRASTRUCTURE_METERING_DIAGNOSTIC_RETENTION_DAYS": "42",
             "INFRASTRUCTURE_METERING_CLEANUP_INTERVAL_SECONDS": "120",
+            "INFRASTRUCTURE_METERING_MAX_COLLECTOR_CLOCK_SKEW_SECONDS": "45",
         }
     )
     assert settings.namespace_allowlist == ("srw", "agents")
@@ -589,6 +958,7 @@ def test_slice1_collector_settings_are_bounded_and_fail_closed():
     assert settings.snapshot_item_retention_days == 14
     assert settings.diagnostic_retention_days == 42
     assert settings.cleanup_interval_seconds == 120
+    assert settings.max_collector_clock_skew_seconds == 45
 
     with pytest.raises(ValueError, match="stable cluster id"):
         InfrastructureMeteringSettings.from_env(
@@ -617,6 +987,10 @@ def test_slice1_collector_settings_are_bounded_and_fail_closed():
     with pytest.raises(ValueError, match="between 15 and 86400"):
         InfrastructureMeteringSettings.from_env(
             {"INFRASTRUCTURE_METERING_RELIST_INTERVAL_SECONDS": "1"}
+        )
+    with pytest.raises(ValueError, match="between 1 and 3600"):
+        InfrastructureMeteringSettings.from_env(
+            {"INFRASTRUCTURE_METERING_MAX_COLLECTOR_CLOCK_SKEW_SECONDS": "3601"}
         )
     with pytest.raises(ValueError, match="stale-after"):
         InfrastructureMeteringSettings.from_env(
@@ -1347,6 +1721,11 @@ async def test_cutover_prepare_is_explicit_gated_idempotent_admin_operation(
         InfrastructureMeteringSettings(cutover_enabled=True),
     )
     monkeypatch.setattr(
+        orchestrator_main,
+        "infrastructure_durable_reporting_policy_ready",
+        True,
+    )
+    monkeypatch.setattr(
         orchestrator_main, "_infrastructure_leader_generation", lambda: 9
     )
     status = CutoverStatus(
@@ -1555,6 +1934,18 @@ def test_infrastructure_admin_routes_are_explicit_and_publicly_documented():
         "/api/admin/usage/v2/storage-activation": {"GET"},
         "/api/admin/usage/v2/storage-activation/{measurement_basis}/shadow": {"POST"},
         "/api/admin/usage/v2/storage-activation/{measurement_basis}/schedule": {"POST"},
+        (
+            "/api/admin/usage/v2/storage-source-activation/"
+            "{source}/{measurement_basis}/shadow"
+        ): {"POST"},
+        (
+            "/api/admin/usage/v2/storage-source-activation/"
+            "{source}/{measurement_basis}/schedule"
+        ): {"POST"},
+        "/api/admin/usage/v2/compute-activation": {"GET"},
+        "/api/admin/usage/v2/compute-activation/{activation_key}/shadow": {"POST"},
+        "/api/admin/usage/v2/compute-activation/{activation_key}/schedule": {"POST"},
+        "/api/admin/usage/v2/compute-activation/{activation_key}/rollover": {"POST"},
         "/api/admin/usage/v2/storage-assets/{asset_id}/destroy": {"POST"},
     }
     routes = {
@@ -1570,6 +1961,7 @@ async def test_storage_activation_routes_are_explicit_and_audited(monkeypatch):
     import main as orchestrator_main
     from orchestrator.services.infrastructure_metering.storage_assets import (
         StorageActivation,
+        StorageSourceActivation,
     )
 
     actor_id = uuid4()
@@ -1592,15 +1984,28 @@ async def test_storage_activation_routes_are_explicit_and_audited(monkeypatch):
     )
     now = datetime(2026, 8, 6, 12, tzinfo=timezone.utc)
     store = MagicMock()
-    store.enter_shadow = AsyncMock(
-        return_value=StorageActivation(
+    store.enter_source_shadow = AsyncMock(
+        return_value=StorageSourceActivation(
             measurement_basis="claim-requested",
+            collector_id="kubernetes-pods",
+            source_cluster="dev-cluster",
             state="shadow",
             activated_at=None,
             database_time=now,
         )
     )
+    store.read_activations = AsyncMock(
+        return_value=(
+            StorageActivation("claim-requested", "shadow", None, now),
+            StorageActivation("volume-provisioned", "disabled", None, now),
+        )
+    )
     monkeypatch.setattr(orchestrator_main, "infrastructure_storage_assets", store)
+    monkeypatch.setattr(
+        orchestrator_main,
+        "infrastructure_storage_source_activation_ready",
+        True,
+    )
     audit = AsyncMock()
     monkeypatch.setattr(orchestrator_main, "log_security_event", audit)
 
@@ -1612,7 +2017,18 @@ async def test_storage_activation_routes_are_explicit_and_audited(monkeypatch):
         ),
     )
 
-    store.enter_shadow.assert_awaited_once_with("claim-requested")
+    store.enter_source_shadow.assert_awaited_once_with(
+        measurement_basis="claim-requested",
+        collector_id="kubernetes-pods",
+        source_cluster="dev-cluster",
+        requirements=(
+            orchestrator_main.StorageSourceRequirementSpec(
+                api_resource="core/v1/persistentvolumeclaims",
+                namespace="srw",
+                requirement_role="quantity",
+            ),
+        ),
+    )
     assert result["state"] == "shadow"
     assert result["effective"] is False
     assert audit.await_args.kwargs["event_type"] == (
@@ -1625,6 +2041,7 @@ async def test_storage_activation_schedule_is_generation_fenced(monkeypatch):
     import main as orchestrator_main
     from orchestrator.services.infrastructure_metering.storage_assets import (
         StorageActivation,
+        StorageSourceActivation,
     )
 
     actor_id = uuid4()
@@ -1654,15 +2071,38 @@ async def test_storage_activation_schedule_is_generation_fenced(monkeypatch):
     )
     boundary = datetime(2026, 8, 7, tzinfo=timezone.utc)
     store = MagicMock()
-    store.schedule_activation = AsyncMock(
-        return_value=StorageActivation(
+    store.schedule_source_activation = AsyncMock(
+        return_value=StorageSourceActivation(
             measurement_basis="claim-requested",
+            collector_id="kubernetes-pods",
+            source_cluster="dev-cluster",
             state="active",
             activated_at=boundary,
             database_time=boundary - timedelta(hours=1),
         )
     )
+    store.read_activations = AsyncMock(
+        return_value=(
+            StorageActivation(
+                "claim-requested",
+                "active",
+                boundary,
+                boundary - timedelta(hours=1),
+            ),
+            StorageActivation(
+                "volume-provisioned",
+                "disabled",
+                None,
+                boundary - timedelta(hours=1),
+            ),
+        )
+    )
     monkeypatch.setattr(orchestrator_main, "infrastructure_storage_assets", store)
+    monkeypatch.setattr(
+        orchestrator_main,
+        "infrastructure_storage_source_activation_ready",
+        True,
+    )
     monkeypatch.setattr(orchestrator_main, "log_security_event", AsyncMock())
 
     await orchestrator_main.schedule_infrastructure_storage_activation(
@@ -1674,14 +2114,309 @@ async def test_storage_activation_schedule_is_generation_fenced(monkeypatch):
         ),
     )
 
-    store.schedule_activation.assert_awaited_once_with(
+    store.schedule_source_activation.assert_awaited_once_with(
         measurement_basis="claim-requested",
-        activated_at=boundary,
+        collector_id="kubernetes-pods",
         source_cluster="dev-cluster",
-        namespaces=("srw",),
+        activated_at=boundary,
         max_scope_age=timedelta(seconds=900),
         expected_generation=9,
         identity_key_version=None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_vm_volume_source_shadow_freezes_quantity_and_attribution_scopes(
+    monkeypatch,
+):
+    import main as orchestrator_main
+    from orchestrator.services.infrastructure_metering.storage_assets import (
+        StorageActivation,
+        StorageSourceActivation,
+    )
+
+    request = MagicMock()
+    request.url.path = (
+        "/api/admin/usage/v2/storage-source-activation/vm/volume-provisioned/shadow"
+    )
+    monkeypatch.setattr(
+        orchestrator_main,
+        "_require_infrastructure_fleet_admin",
+        AsyncMock(return_value={"id": str(uuid4()), "is_admin": True}),
+    )
+    monkeypatch.setattr(
+        orchestrator_main,
+        "infrastructure_metering_settings",
+        InfrastructureMeteringSettings(
+            collector_enabled=True,
+            vm_pvc_inventory_enabled=True,
+            vm_pv_inventory_enabled=True,
+            vm_stable_cluster_id="vm-dev-cluster",
+            vm_namespace="srw-vms",
+        ),
+    )
+    now = datetime(2026, 8, 6, 12, tzinfo=timezone.utc)
+    store = MagicMock()
+    store.enter_source_shadow = AsyncMock(
+        return_value=StorageSourceActivation(
+            measurement_basis="volume-provisioned",
+            collector_id="kubevirt-storage",
+            source_cluster="vm-dev-cluster",
+            state="shadow",
+            activated_at=None,
+            database_time=now,
+        )
+    )
+    store.read_activations = AsyncMock(
+        return_value=(
+            StorageActivation("claim-requested", "shadow", None, now),
+            StorageActivation("volume-provisioned", "shadow", None, now),
+        )
+    )
+    monkeypatch.setattr(orchestrator_main, "infrastructure_storage_assets", store)
+    monkeypatch.setattr(
+        orchestrator_main,
+        "infrastructure_storage_source_activation_ready",
+        True,
+    )
+    audit = AsyncMock()
+    monkeypatch.setattr(orchestrator_main, "log_security_event", audit)
+
+    result = await orchestrator_main.enter_infrastructure_storage_source_shadow(
+        request,
+        "vm",
+        "volume-provisioned",
+        orchestrator_main.InfrastructureStorageActivationRequest(
+            reason="remote inventory proof reviewed"
+        ),
+    )
+
+    store.enter_source_shadow.assert_awaited_once_with(
+        measurement_basis="volume-provisioned",
+        collector_id="kubevirt-storage",
+        source_cluster="vm-dev-cluster",
+        requirements=(
+            orchestrator_main.StorageSourceRequirementSpec(
+                api_resource="core/v1/persistentvolumes",
+                namespace=None,
+                requirement_role="quantity",
+            ),
+            orchestrator_main.StorageSourceRequirementSpec(
+                api_resource="core/v1/persistentvolumeclaims",
+                namespace="srw-vms",
+                requirement_role="attribution",
+            ),
+        ),
+    )
+    assert result["collector_id"] == "kubevirt-storage"
+    assert result["effective"] is False
+    assert audit.await_args.kwargs["resource_id"] == "vm:volume-provisioned"
+
+
+@pytest.mark.asyncio
+async def test_compute_activation_shadow_is_class_gated_and_audited(monkeypatch):
+    import main as orchestrator_main
+    from orchestrator.services.infrastructure_metering.compute_activation import (
+        ComputeActivation,
+    )
+
+    actor_id = uuid4()
+    request = MagicMock()
+    request.url.path = "/api/admin/usage/v2/compute-activation/agent_pod/shadow"
+    monkeypatch.setattr(
+        orchestrator_main,
+        "_require_infrastructure_fleet_admin",
+        AsyncMock(return_value={"id": str(actor_id), "is_admin": True}),
+    )
+    monkeypatch.setattr(
+        orchestrator_main,
+        "infrastructure_metering_settings",
+        InfrastructureMeteringSettings(
+            collector_enabled=True,
+            stable_cluster_id="dev-cluster",
+            namespace_allowlist=("srw",),
+        ),
+    )
+    now = datetime(2026, 8, 6, 12, tzinfo=timezone.utc)
+    store = MagicMock()
+    store.enter_shadow = AsyncMock(
+        return_value=ComputeActivation(
+            activation_key="agent_pod",
+            state="shadow",
+            activated_at=None,
+            database_time=now,
+        )
+    )
+    monkeypatch.setattr(orchestrator_main, "infrastructure_compute_activation", store)
+    audit = AsyncMock()
+    monkeypatch.setattr(orchestrator_main, "log_security_event", audit)
+
+    result = await orchestrator_main.enter_infrastructure_compute_shadow(
+        request,
+        "agent_pod",
+        orchestrator_main.InfrastructureComputeActivationRequest(
+            reason="agent shadow soak approved"
+        ),
+    )
+
+    store.enter_shadow.assert_awaited_once_with("agent_pod")
+    assert result["state"] == "shadow"
+    assert result["effective"] is False
+    assert audit.await_args.kwargs["event_type"] == (
+        "infrastructure_compute_shadow_entered"
+    )
+
+
+@pytest.mark.asyncio
+async def test_vm_compute_shadow_transition_requires_inventory_not_shadow_config(
+    monkeypatch,
+):
+    import main as orchestrator_main
+    from orchestrator.services.infrastructure_metering.compute_activation import (
+        ComputeActivation,
+    )
+
+    request = MagicMock()
+    request.url.path = "/api/admin/usage/v2/compute-activation/workspace_vm/shadow"
+    actor_id = uuid4()
+    monkeypatch.setattr(
+        orchestrator_main,
+        "_require_infrastructure_fleet_admin",
+        AsyncMock(return_value={"id": str(actor_id), "is_admin": True}),
+    )
+    store = MagicMock()
+    store.enter_shadow = AsyncMock(
+        return_value=ComputeActivation(
+            activation_key="workspace_vm",
+            state="shadow",
+            activated_at=None,
+            database_time=datetime(2026, 8, 6, 12, tzinfo=timezone.utc),
+        )
+    )
+    monkeypatch.setattr(orchestrator_main, "infrastructure_compute_activation", store)
+    monkeypatch.setattr(orchestrator_main, "log_security_event", AsyncMock())
+
+    base = InfrastructureMeteringSettings(
+        collector_enabled=True,
+        stable_cluster_id="dev-cluster",
+        namespace_allowlist=("srw",),
+    )
+    monkeypatch.setattr(orchestrator_main, "infrastructure_metering_settings", base)
+    with pytest.raises(HTTPException) as missing_inventory:
+        await orchestrator_main.enter_infrastructure_compute_shadow(
+            request,
+            "workspace_vm",
+            orchestrator_main.InfrastructureComputeActivationRequest(
+                reason="inventory must precede durable shadow"
+            ),
+        )
+    assert missing_inventory.value.status_code == 404
+    store.enter_shadow.assert_not_awaited()
+
+    monkeypatch.setattr(
+        orchestrator_main,
+        "infrastructure_metering_settings",
+        replace(
+            base,
+            vm_inventory_enabled=True,
+            vm_stable_cluster_id="vm-cluster",
+            vm_namespace="agent-vms",
+        ),
+    )
+    result = await orchestrator_main.enter_infrastructure_compute_shadow(
+        request,
+        "workspace_vm",
+        orchestrator_main.InfrastructureComputeActivationRequest(
+            reason="inventory verified before enabling shadow config"
+        ),
+    )
+    assert result["state"] == "shadow"
+    store.enter_shadow.assert_awaited_once_with("workspace_vm")
+
+
+@pytest.mark.asyncio
+async def test_vm_compute_activation_uses_remote_scope_and_collector(monkeypatch):
+    import main as orchestrator_main
+    from orchestrator.services.infrastructure_metering.compute_activation import (
+        ComputeActivation,
+        ComputeActivationScheduleResult,
+        ComputeEpochPromotion,
+    )
+
+    request = MagicMock()
+    request.url.path = "/api/admin/usage/v2/compute-activation/workspace_vm/schedule"
+    actor_id = uuid4()
+    monkeypatch.setattr(
+        orchestrator_main,
+        "_require_infrastructure_fleet_admin",
+        AsyncMock(return_value={"id": str(actor_id), "is_admin": True}),
+    )
+    monkeypatch.setattr(
+        orchestrator_main,
+        "_infrastructure_leader_generation",
+        MagicMock(return_value=11),
+    )
+    monkeypatch.setattr(
+        orchestrator_main,
+        "infrastructure_metering_settings",
+        InfrastructureMeteringSettings(
+            collector_enabled=True,
+            shadow_enabled=True,
+            vm_inventory_enabled=True,
+            vm_shadow_enabled=True,
+            stable_cluster_id="dev-cluster",
+            namespace_allowlist=("srw",),
+            vm_stable_cluster_id="vm-cluster",
+            vm_namespace="agent-vms",
+        ),
+    )
+    boundary = datetime(2026, 8, 8, tzinfo=timezone.utc)
+    request_id = uuid4()
+    store = MagicMock()
+    store.schedule_activation = AsyncMock(
+        return_value=ComputeActivationScheduleResult(
+            activation=ComputeActivation(
+                activation_key="workspace_vm",
+                state="active",
+                activated_at=boundary,
+                database_time=boundary - timedelta(hours=1),
+            ),
+            promotion=ComputeEpochPromotion(
+                request_id=request_id,
+                activation_key="workspace_vm",
+                request_kind="initial-activation",
+                promoted_at=boundary - timedelta(hours=1),
+                actor_id=actor_id,
+                audit_reason="remote VMI shadow proof reviewed",
+                replayed=False,
+                authorities=(),
+            ),
+        )
+    )
+    monkeypatch.setattr(orchestrator_main, "infrastructure_compute_activation", store)
+    monkeypatch.setattr(orchestrator_main, "log_security_event", AsyncMock())
+
+    await orchestrator_main.schedule_infrastructure_compute_activation(
+        request,
+        "workspace_vm",
+        orchestrator_main.InfrastructureComputeActivationScheduleRequest(
+            idempotency_key=request_id,
+            reason="remote VMI shadow proof reviewed",
+            activated_at=boundary,
+        ),
+    )
+
+    store.schedule_activation.assert_awaited_once_with(
+        activation_key="workspace_vm",
+        activated_at=boundary,
+        source_cluster="vm-cluster",
+        namespaces=("agent-vms",),
+        max_scope_age=timedelta(seconds=900),
+        expected_generation=11,
+        request_id=request_id,
+        actor_id=actor_id,
+        audit_reason="remote VMI shadow proof reviewed",
+        collector_id="kubevirt-vmis",
     )
 
 
