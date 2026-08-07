@@ -393,7 +393,7 @@ Audit activity ran from `2026-08-03T08:34:39.808Z` through
 | 19 | 08:42:22 | Second `web_search` |
 | 20-30 | 08:43:21-08:47:15 | Wrote a 3,573-character `notes/task.md`, loaded citation skill after an enforced failure, registered citations, and continued todo ceremony |
 | 31 | 08:47:38 | Wrote the final 4,248-character `output/report.md`; the requested object-level task was substantively complete |
-| 34 | 08:48:55 | Tried unavailable `shell_execute` despite the explicit virtual/no-upgrade constraint |
+| 34 | 08:48:55 | Tried unavailable `shell_execute` — *not* defiance of the virtual/no-upgrade constraint: the prompt advertised shell while the capability gate had already dropped it (CLOSED `f36a9713`, see below) |
 | 35-55 | 08:49:03-08:55:22 | Repeated almost identical `file_exists`, `read_file`, and `search_files` verification bundles; remaining verification todo never completed |
 | 56 | 08:56:15 | Final file/list checks around cancellation |
 
@@ -480,6 +480,14 @@ proved the headings existed. The exact sequence explains why:
 2. Request 34 tried to translate the writing check from the
    `verify-before-done` skill into `wc`/`grep`, but called unavailable
    `shell_execute` on the virtual workspace.
+   **CLOSED 2026-08-06** (`f36a9713`, `docs/done/session_calls_absent_shell_tool_and_cannot_resolve_today.md`):
+   this was not the model ignoring the constraint — the prompt advertised shell
+   unconditionally while the backend capability gate had already dropped the
+   category, and "shell **tabs**" is persistent-mode wording, which is why it
+   reached for `shell_execute` specifically. Shell guidance is now gated on
+   `{% if has_shell %}`, and an unbound call is rejected before the permission
+   gate with a message naming the cause. The remaining findings in this section
+   (3 and 4 below) are untouched by that fix.
 3. The fallback used `search_files` with grep-style expressions such as
    `^## [1-3]\.` and `^## `. The virtual backend implements case-folded **literal
    substring** search (`needle in line`), while the SSH backend invokes grep and

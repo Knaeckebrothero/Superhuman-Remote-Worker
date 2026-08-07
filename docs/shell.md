@@ -106,6 +106,18 @@ shell:
 - **`persistent`**: Exposes `shell_execute` + `shell_read`. Full tab management, keys mode
   (incl. C-c), async mode. For capable models / interactive terminal workflows.
 
+**No shell at all on the lite tiers.** `virtual` and `none` declare
+`supports_shell = False`, so `filter_tools_by_backend` drops the entire `shell`
+category (along with `browser_direct` and `git`) regardless of mode. Prompt text
+that talks about shell must therefore be wrapped in `{% if has_shell %}` — the
+Jinja conditional is available in every template rendered through
+`render_instruction_content`, and is backed by `loader._has_shell_tools`, which
+reads the registry category rather than a tool-name list. Ungated shell guidance
+had an agent calling `shell_execute` on a `virtual` workspace and burning a turn
+on a tool that was never bound: `docs/done/session_calls_absent_shell_tool_and_cannot_resolve_today.md`.
+Note that `srw_cloud_status` sits in the `shell` category but is `grant: "code"`
+and is re-appended *after* the capability gate, so it does not imply a shell.
+
 ### `run_command` Tool Design
 
 The model sees a simple stateless tool:
