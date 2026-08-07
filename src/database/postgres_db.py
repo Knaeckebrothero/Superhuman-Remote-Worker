@@ -601,6 +601,37 @@ class PostgresDB:
             "surviving_turn": int(surviving_turn or 0),
         }
 
+    async def resweep_rewind(self, thread_id: str, from_seq: int) -> int:
+        """Narrow, idempotent mop-up sweep for stragglers past a rewind.
+
+        `_handle_rewind`'s hard-interrupt wait (up to 60s) can overlap a
+        turn-completion INSERT already in flight: a message at/after
+        `from_seq` can land *after* `apply_rewind`'s sweep already ran,
+        leaving a live, un-tombstoned stray racing the just-truncated
+        in-memory view. Same shape and same `rewound_at IS NULL` guard as
+        `apply_rewind`'s sweep, so a normal run with no stragglers touches 0
+        rows. Deliberately not a second `apply_rewind` call — this must not
+        append a second `thread_rewinds` ledger row for what is mop-up of
+        the *same* rewind, not a new one.
+        """
+        async with self.acquire() as conn:
+            swept = await conn.fetchval(
+                """
+                WITH swept AS (
+                    UPDATE thread_messages
+                    SET rewound_at = now()
+                    WHERE thread_id = $1
+                      AND seq >= $2
+                      AND rewound_at IS NULL
+                    RETURNING 1
+                )
+                SELECT COUNT(*) FROM swept
+                """,
+                thread_id,
+                from_seq,
+            )
+        return int(swept or 0)
+
     async def record_turn_commit(self, thread_id: str, commit_sha: str) -> None:
         """Map the workspace commit that just landed to the transcript position.
 

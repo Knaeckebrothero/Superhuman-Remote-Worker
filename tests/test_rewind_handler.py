@@ -61,6 +61,8 @@ def _mk_session(messages, git_active=False):
         return_value={"rewind_id": "r-1", "swept": 4, "surviving_turn": 2}
     )
     conn.resolve_restore_commit = AsyncMock(return_value="sha-target")
+    conn.record_turn_commit = AsyncMock()
+    conn.resweep_rewind = AsyncMock(return_value=0)
     git_mgr = MagicMock()
     git_mgr.is_active = git_active
     git_mgr.commit = MagicMock(return_value=True)
@@ -278,6 +280,112 @@ def test_rewind_drains_pending_queue(monkeypatch):
     )
 
     assert pa._loop_user_queue.empty()
+
+
+def test_rewind_both_mode_records_restore_commit_mapping(monkeypatch):
+    """Fix 1: after a successful code-mode restore, the new commit is mapped
+    via record_turn_commit so a later restore-target lookup (e.g. a second
+    rewind) resolves against the just-restored tree, not the abandoned one —
+    record_turn_commit's own ON CONFLICT upsert overwrites that stale row."""
+    target = _human("m", "x")
+    session, conn, _ = _mk_session([target], git_active=True)
+    conn.get_live_message.return_value = {"seq": 3, "role": "human", "content": "x"}
+    app_mod, ws_sent = _patched_app(monkeypatch, session)
+
+    _run_rewind(
+        app_mod, MagicMock(), {"message_id": "m", "mode": "both", "request_id": "r"}
+    )
+
+    conn.record_turn_commit.assert_awaited_once_with("tid-1", "sha-restore")
+    acks = [p for m, p in ws_sent if m == "rewind.ack"]
+    assert acks and acks[0]["restored_to_sha"] == "sha-target"
+
+
+def test_rewind_resweeps_after_truncate_before_epoch_bump(monkeypatch):
+    """Fix 4: the narrow resweep runs after apply_rewind's sweep/truncate and
+    before the events-epoch bump — it mops up any straggler INSERT that
+    landed during the interrupt wait, without a second ledger row."""
+    target = _human("m", "x")
+    session, conn, _ = _mk_session([target])
+    conn.get_live_message.return_value = {"seq": 3, "role": "human", "content": "x"}
+    order = []
+
+    async def _apply_rewind(*a, **kw):
+        order.append("apply_rewind")
+        return {"rewind_id": "r-1", "swept": 4, "surviving_turn": 2}
+
+    async def _resweep(*a, **kw):
+        order.append("resweep_rewind")
+        return 0
+
+    conn.apply_rewind = AsyncMock(side_effect=_apply_rewind)
+    conn.resweep_rewind = AsyncMock(side_effect=_resweep)
+    app_mod, ws_sent = _patched_app(monkeypatch, session)
+
+    async def _epoch_bump(*a, **kw):
+        order.append("epoch_bump")
+        return 7
+
+    monkeypatch.setattr(
+        app_mod, "_resolve_event_journal_epoch", AsyncMock(side_effect=_epoch_bump)
+    )
+
+    _run_rewind(
+        app_mod,
+        MagicMock(),
+        {"message_id": "m", "mode": "conversation", "request_id": "r"},
+    )
+
+    assert order == ["apply_rewind", "resweep_rewind", "epoch_bump"]
+    conn.resweep_rewind.assert_awaited_once_with("tid-1", 3)
+    acks = [p for m, p in ws_sent if m == "rewind.ack"]
+    assert acks  # the (0-stray) resweep must not block the normal ack path
+
+
+def test_rewind_resweep_logs_warning_when_it_catches_strays(monkeypatch, caplog):
+    """A non-zero resweep count is a real (if rare) anomaly — worth a log
+    line even though it self-heals, so a stray isn't silently invisible."""
+    import logging
+
+    target = _human("m", "x")
+    session, conn, _ = _mk_session([target])
+    conn.get_live_message.return_value = {"seq": 3, "role": "human", "content": "x"}
+    conn.resweep_rewind = AsyncMock(return_value=2)
+    app_mod, ws_sent = _patched_app(monkeypatch, session)
+
+    with caplog.at_level(logging.WARNING, logger="src.api.persistent_app"):
+        _run_rewind(
+            app_mod,
+            MagicMock(),
+            {"message_id": "m", "mode": "conversation", "request_id": "r"},
+        )
+
+    assert any("resweep" in rec.message.lower() for rec in caplog.records)
+
+
+def test_compact_refuses_while_rewind_lock_held(monkeypatch):
+    """Fix 3: compaction (manual /compact or 'Summarize up to here') must not
+    interleave with a rewind — it refuses immediately while the shared
+    _rewind_lock is held rather than racing the same in-memory message list
+    and seq-keyed rows a rewind sweeps/truncates."""
+    from src.api import persistent_app as app_mod
+
+    ws_sent = []
+
+    async def _fake_ws_send(ws, method, params):
+        ws_sent.append((method, params))
+
+    monkeypatch.setattr(app_mod, "_ws_send", _fake_ws_send)
+
+    async def _run():
+        async with app_mod._rewind_lock:
+            await app_mod._handle_compact(MagicMock(), "")
+
+    asyncio.run(_run())
+
+    errors = [p for m, p in ws_sent if m == "error"]
+    assert errors
+    assert "rewind is in progress" in errors[0]["message"].lower()
 
 
 def test_compact_boundary_maps_to_keep_recent(monkeypatch):
