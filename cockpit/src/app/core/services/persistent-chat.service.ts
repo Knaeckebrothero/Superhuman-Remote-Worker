@@ -1644,6 +1644,15 @@ export class PersistentChatService {
             this.sse.close();
             this.sse = null;
         }
+        // Clear the (append-only) cache before reloading — mirrors
+        // _reloadAfterRewind's ordering. Epoch bumps are rare (a new agent
+        // attach, or a rewind tombstoning rows server-side), so a full
+        // refetch here is cheap; but once the epoch has moved, the cache's
+        // append-only assumption no longer holds — a stale local copy could
+        // otherwise survive a naive merge into the freshly loaded history.
+        await this.cache.clearThreadMessages(tid);
+        await this.cache.deleteThreadCursor(tid);
+        if (!this._isCurrentConnect(tid, generation)) return;
         // Reload transcript so visible history doesn't have a silent gap.
         await this.loadHistory(tid, generation);
         if (!this._isCurrentConnect(tid, generation)) return;
@@ -2963,9 +2972,27 @@ export class PersistentChatService {
     }
 
     /** Rewind the session to just before an earlier user message.
-     *  Returns the request_id echoed on the rewind.ack / error frame. */
+     *  Returns the request_id echoed on the rewind.ack / error frame.
+     *
+     *  Unlike other control verbs, rewind must never ride _sendControl's
+     *  queue-and-replay fallback: that path exists so a click made while the
+     *  socket is reconnecting still lands once it's back — fine for
+     *  idempotent-ish verbs, wrong for a destructive one. A queued rewind
+     *  frame could replay against a session the user resumed much later for
+     *  an unrelated reason. So the control WS must already be OPEN, or this
+     *  refuses outright instead of deferring. */
     rewind(messageId: string, mode: 'both' | 'conversation' | 'code'): string {
         const requestId = crypto.randomUUID();
+        if (this.controlWs?.readyState !== WebSocket.OPEN) {
+            this.error.set(
+                'Session connection is down — reconnect before rewinding',
+            );
+            this.rewindInFlight.set(false);
+            return requestId;
+        }
+        // Arm the fallback only once we know the frame is actually going out
+        // now (not queued for later) — nothing to disarm on the refusal path
+        // above since it's never armed there.
         this.rewindInFlight.set(true);
         this.pendingRewindRequestId = requestId;
         this._armRewindAckFallback();
