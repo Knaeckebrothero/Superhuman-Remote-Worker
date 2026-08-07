@@ -6506,7 +6506,7 @@ class PostgresDB:
                 """
                 SELECT GREATEST(
                     (SELECT MAX(created_at) FROM thread_messages
-                      WHERE thread_id = $1),
+                      WHERE thread_id = $1 AND rewound_at IS NULL),
                     (SELECT MAX(sent_at) FROM session_wake_events
                       WHERE thread_id = $1 AND source = 'timer'
                         AND state = 'sent')
@@ -7796,7 +7796,7 @@ class PostgresDB:
         query = (
             "SELECT id, role, content, tool_calls, turn_number, metrics, "
             "tool_call_id, thinking, created_at FROM thread_messages "
-            "WHERE thread_id = $1 "
+            "WHERE thread_id = $1 AND rewound_at IS NULL "
             "ORDER BY created_at ASC, turn_number ASC, id ASC"
         )
         params: List[Any] = [thread_id]
@@ -7808,6 +7808,102 @@ class PostgresDB:
         async with self.acquire() as conn:
             rows = await conn.fetch(query, *params)
         return [self._thread_message_to_dict(r) for r in rows]
+
+    async def get_live_thread_message(
+        self, thread_id: str, message_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """Rewind-target lookup: the row must exist and not be tombstoned."""
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT seq, role, content FROM thread_messages "
+                "WHERE thread_id = $1 AND id = $2 AND rewound_at IS NULL",
+                thread_id,
+                message_id,
+            )
+        if row is None:
+            return None
+        return {"seq": row["seq"], "role": row["role"], "content": row["content"]}
+
+    async def apply_thread_rewind(
+        self, thread_id: str, from_seq: int, actor: str
+    ) -> Dict[str, Any]:
+        """Detached (conversation-only) rewind, orchestrator-side.
+
+        One advisory-locked transaction: tombstone sweep, thread_rewinds
+        ledger, events_epoch bump (so any open SSE viewer takes the
+        gone_beyond_horizon repaint), and a rewind.done thread_events row in
+        the NEW epoch (so those viewers also clear their IndexedDB message
+        cache — the repaint alone merges append-only and would keep showing
+        the swept rows). Writing thread_events here is safe precisely
+        because the thread is detached: there is no agent event-writer to
+        collide with.
+        """
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute(
+                    "SELECT pg_advisory_xact_lock(hashtext($1))",
+                    f"thread_rewind:{thread_id}",
+                )
+                swept = await conn.fetchval(
+                    """
+                    WITH swept AS (
+                        UPDATE thread_messages
+                        SET rewound_at = now()
+                        WHERE thread_id = $1
+                          AND seq >= $2
+                          AND rewound_at IS NULL
+                        RETURNING 1
+                    )
+                    SELECT COUNT(*) FROM swept
+                    """,
+                    thread_id,
+                    from_seq,
+                )
+                row = await conn.fetchrow(
+                    """
+                    INSERT INTO thread_rewinds
+                        (thread_id, from_seq, mode, actor, swept_count)
+                    VALUES ($1, $2, 'conversation', $3, $4)
+                    RETURNING id
+                    """,
+                    thread_id,
+                    from_seq,
+                    actor,
+                    swept or 0,
+                )
+                surviving_turn = await conn.fetchval(
+                    """
+                    SELECT COALESCE(MAX(turn_number), 0)
+                    FROM thread_messages
+                    WHERE thread_id = $1
+                      AND rewound_at IS NULL
+                      AND role NOT IN ('summary', 'error')
+                    """,
+                    thread_id,
+                )
+                new_epoch = await conn.fetchval(
+                    """
+                    UPDATE threads
+                    SET events_epoch = events_epoch + 1
+                    WHERE id = $1
+                    RETURNING events_epoch
+                    """,
+                    thread_id,
+                )
+                await conn.execute(
+                    """
+                    INSERT INTO thread_events (thread_id, epoch, seq, kind, payload)
+                    VALUES ($1, $2, 1, 'rewind.done',
+                            jsonb_build_object('mode', 'conversation'))
+                    """,
+                    thread_id,
+                    new_epoch,
+                )
+        return {
+            "rewind_id": str(row["id"]),
+            "swept": int(swept or 0),
+            "surviving_turn": int(surviving_turn or 0),
+        }
 
     async def get_thread_messages_page(
         self,
@@ -7831,7 +7927,7 @@ class PostgresDB:
         rows exist beyond the window in the paging direction (older for
         ``before``, newer for ``after``).
         """
-        clauses = ["thread_id = $1"]
+        clauses = ["thread_id = $1", "rewound_at IS NULL"]
         params: List[Any] = [thread_id]
         if before is not None:
             params.append(before)
@@ -7873,7 +7969,8 @@ class PostgresDB:
         """Get total message count for a thread."""
         async with self.acquire() as conn:
             return await conn.fetchval(
-                "SELECT COUNT(*) FROM thread_messages WHERE thread_id = $1",
+                "SELECT COUNT(*) FROM thread_messages "
+                "WHERE thread_id = $1 AND rewound_at IS NULL",
                 thread_id,
             )
 
