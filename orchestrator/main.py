@@ -222,6 +222,16 @@ from services.infrastructure_metering.coverage import (  # noqa: E402
     CoverageGapContractError,
     CoverageGapNotFound,
 )
+from services.infrastructure_metering.compute_activation import (  # noqa: E402
+    ComputeActivation,
+    ComputeActivationConflict,
+    ComputeActivationContractError,
+    ComputeActivationNotReady,
+    ComputeActivationStore,
+    ComputeEpochAuthority,
+    ComputeEpochPromotion,
+    compute_scope_configuration_diagnostic,
+)
 from services.infrastructure_metering.cutover import (  # noqa: E402
     CutoverBlocked,
     CutoverConflictError,
@@ -250,6 +260,8 @@ from services.infrastructure_metering.materializer import (  # noqa: E402
     PublicationContractError,
     PublicationDisabledError,
     PublicationFenceError,
+    StoragePublicationAuthority,
+    StoragePublicationPolicy,
 )
 from services.infrastructure_metering.storage_assets import (  # noqa: E402
     BackendDestructionResult,
@@ -261,6 +273,8 @@ from services.infrastructure_metering.storage_assets import (  # noqa: E402
     StorageAssetContractError,
     StorageAssetNotFound,
     StorageAssetStore,
+    StorageSourceActivation,
+    StorageSourceRequirementSpec,
 )
 from services.infrastructure_metering.storage_mapping import (  # noqa: E402
     StorageResourceMappingStore,
@@ -522,6 +536,9 @@ infrastructure_metering_runtime: InfrastructureMeteringRuntime | None = None
 infrastructure_coverage_waivers: CoverageGapWaiverService | None = None
 infrastructure_storage_assets: StorageAssetStore | None = None
 infrastructure_storage_mapping: StorageResourceMappingStore | None = None
+infrastructure_compute_activation: ComputeActivationStore | None = None
+infrastructure_compute_scope_diagnostics: dict[str, str] = {}
+infrastructure_storage_source_activation_ready = False
 
 _INFRASTRUCTURE_PVC_RESOURCES = (
     "workspace_pvc",
@@ -544,9 +561,13 @@ def _enabled_infrastructure_publication_resources(
     """Return exact class gates without broadening the workspace default."""
 
     resources = ["workspace_pod"]
-    if settings.pvc_publication_enabled:
+    if settings.agent_pod_publication_enabled:
+        resources.append("agent_pod")
+    if settings.vm_publication_enabled:
+        resources.append("workspace_vm")
+    if settings.pvc_publication_enabled or settings.vm_pvc_publication_enabled:
         resources.extend(_INFRASTRUCTURE_PVC_RESOURCES)
-    if settings.pv_publication_enabled:
+    if settings.pv_publication_enabled or settings.vm_pv_publication_enabled:
         resources.extend((*_INFRASTRUCTURE_PV_RESOURCES, *mapped_volume_resources))
     return tuple(dict.fromkeys(resources))
 
@@ -563,31 +584,338 @@ def _storage_activation_is_effective(activation: StorageActivation | None) -> bo
     )
 
 
+def _storage_source_activation_is_effective(
+    activation: StorageSourceActivation | None,
+    global_activation: StorageActivation | None,
+) -> bool:
+    """Require both the global master and exact source boundary to be effective."""
+
+    return bool(
+        activation is not None
+        and global_activation is not None
+        and activation.state == "active"
+        and global_activation.state == "active"
+        and activation.activated_at is not None
+        and global_activation.activated_at is not None
+        and activation.database_time is not None
+        and global_activation.database_time is not None
+        and activation.database_time
+        >= max(activation.activated_at, global_activation.activated_at)
+        and global_activation.database_time >= global_activation.activated_at
+    )
+
+
+def _storage_source_configuration(
+    source: Literal["primary", "vm"],
+    measurement_basis: Literal["claim-requested", "volume-provisioned"],
+    settings: InfrastructureMeteringSettings | None = None,
+) -> tuple[str, str, tuple[StorageSourceRequirementSpec, ...]]:
+    """Resolve one operator-facing source to its immutable inventory contract."""
+
+    resolved_settings = settings or infrastructure_metering_settings
+    if source == "primary":
+        collector_id = "kubernetes-pods"
+        source_cluster = resolved_settings.stable_cluster_id
+        namespaces = resolved_settings.namespace_allowlist
+    else:
+        collector_id = "kubevirt-storage"
+        source_cluster = resolved_settings.vm_stable_cluster_id
+        namespaces = (resolved_settings.vm_namespace,)
+
+    requirements: list[StorageSourceRequirementSpec] = []
+    if measurement_basis == "claim-requested":
+        requirements.extend(
+            StorageSourceRequirementSpec(
+                api_resource="core/v1/persistentvolumeclaims",
+                namespace=namespace,
+                requirement_role="quantity",
+            )
+            for namespace in namespaces
+        )
+    else:
+        requirements.append(
+            StorageSourceRequirementSpec(
+                api_resource="core/v1/persistentvolumes",
+                namespace=None,
+                requirement_role="quantity",
+            )
+        )
+        requirements.extend(
+            StorageSourceRequirementSpec(
+                api_resource="core/v1/persistentvolumeclaims",
+                namespace=namespace,
+                requirement_role="attribution",
+            )
+            for namespace in namespaces
+        )
+    return collector_id, source_cluster, tuple(requirements)
+
+
+def _storage_source_inventory_enabled(
+    source: Literal["primary", "vm"],
+    measurement_basis: Literal["claim-requested", "volume-provisioned"],
+) -> bool:
+    settings = infrastructure_metering_settings
+    if source == "primary":
+        claim_enabled = settings.pvc_inventory_enabled
+        volume_enabled = settings.pv_inventory_enabled
+    else:
+        claim_enabled = settings.vm_pvc_inventory_enabled
+        volume_enabled = settings.vm_pv_inventory_enabled
+    return (
+        claim_enabled
+        if measurement_basis == "claim-requested"
+        else (claim_enabled and volume_enabled)
+    )
+
+
+def _storage_source_shadow_enabled(
+    source: Literal["primary", "vm"],
+    measurement_basis: Literal["claim-requested", "volume-provisioned"],
+) -> bool:
+    settings = infrastructure_metering_settings
+    if source == "primary":
+        claim_enabled = settings.pvc_shadow_enabled
+        volume_enabled = settings.pv_shadow_enabled
+    else:
+        claim_enabled = settings.vm_pvc_shadow_enabled
+        volume_enabled = settings.vm_pv_shadow_enabled
+    return (
+        claim_enabled
+        if measurement_basis == "claim-requested"
+        else (claim_enabled and volume_enabled)
+    )
+
+
+def _storage_source_publication_enabled(
+    source: Literal["primary", "vm"],
+    measurement_basis: Literal["claim-requested", "volume-provisioned"],
+) -> bool:
+    settings = infrastructure_metering_settings
+    if source == "primary":
+        return (
+            settings.pvc_publication_enabled
+            if measurement_basis == "claim-requested"
+            else settings.pv_publication_enabled
+        )
+    return (
+        settings.vm_pvc_publication_enabled
+        if measurement_basis == "claim-requested"
+        else settings.vm_pv_publication_enabled
+    )
+
+
+def _storage_source_shadow_requested(
+    settings: InfrastructureMeteringSettings,
+    source: Literal["primary", "vm"],
+    measurement_basis: Literal["claim-requested", "volume-provisioned"],
+) -> bool:
+    if source == "primary":
+        return (
+            settings.pvc_shadow_enabled
+            if measurement_basis == "claim-requested"
+            else settings.pv_shadow_enabled
+        )
+    return (
+        settings.vm_pvc_shadow_enabled
+        if measurement_basis == "claim-requested"
+        else settings.vm_pv_shadow_enabled
+    )
+
+
+def _storage_source_configuration_errors(
+    settings: InfrastructureMeteringSettings,
+    activations: tuple[StorageSourceActivation, ...],
+) -> tuple[str, ...]:
+    """Reject configured shadow writers that outgrow their frozen scope set."""
+
+    by_identity = {
+        (
+            activation.measurement_basis,
+            activation.collector_id,
+            activation.source_cluster,
+        ): activation
+        for activation in activations
+    }
+    errors: list[str] = []
+    for source in ("primary", "vm"):
+        for basis in ("claim-requested", "volume-provisioned"):
+            if not _storage_source_shadow_requested(settings, source, basis):
+                continue
+            collector_id, source_cluster, configured = _storage_source_configuration(
+                source, basis, settings
+            )
+            activation = by_identity.get((basis, collector_id, source_cluster))
+            label = f"{source}/{basis}"
+            if activation is None or activation.state == "disabled":
+                errors.append(f"{label} durable source shadow activation")
+                continue
+            configured_identities = {
+                (
+                    requirement.api_resource,
+                    requirement.namespace,
+                    requirement.requirement_role,
+                )
+                for requirement in configured
+            }
+            frozen_identities = {
+                (
+                    requirement.api_resource,
+                    requirement.namespace,
+                    requirement.requirement_role,
+                )
+                for requirement in activation.requirements
+            }
+            if configured_identities != frozen_identities:
+                errors.append(f"{label} frozen inventory scope set")
+    return tuple(errors)
+
+
+def _requested_storage_publication_policy(
+    settings: InfrastructureMeteringSettings,
+    *,
+    vm_lifecycle_authenticated: bool = False,
+) -> StoragePublicationPolicy:
+    """Build the fixed-per-process exact source allowlist from independent gates."""
+
+    authorities: list[StoragePublicationAuthority] = []
+    for enabled, measurement_basis, collector_id, source_cluster in (
+        (
+            settings.pvc_publication_enabled,
+            "claim-requested",
+            "kubernetes-pods",
+            settings.stable_cluster_id,
+        ),
+        (
+            settings.pv_publication_enabled,
+            "volume-provisioned",
+            "kubernetes-pods",
+            settings.stable_cluster_id,
+        ),
+        (
+            settings.vm_pvc_publication_enabled,
+            "claim-requested",
+            "kubevirt-storage",
+            settings.vm_stable_cluster_id,
+        ),
+        (
+            settings.vm_pv_publication_enabled,
+            "volume-provisioned",
+            "kubevirt-storage",
+            settings.vm_stable_cluster_id,
+        ),
+    ):
+        is_vm_authority = collector_id == "kubevirt-storage"
+        if enabled and (not is_vm_authority or vm_lifecycle_authenticated):
+            authorities.append(
+                StoragePublicationAuthority(
+                    measurement_basis=measurement_basis,
+                    collector_id=collector_id,
+                    source_cluster=source_cluster,
+                )
+            )
+    return StoragePublicationPolicy(tuple(authorities))
+
+
+def _capability_gated_storage_publication_policy(
+    requested: StoragePublicationPolicy,
+    capabilities: MeteringSchemaCapabilities,
+    *,
+    claim_activation: StorageActivation | None,
+    volume_activation: StorageActivation | None,
+    source_activations: Mapping[tuple[str, str, str], StorageSourceActivation],
+    volume_mapping_ready: bool,
+    volume_identity_key_matches: bool,
+) -> StoragePublicationPolicy:
+    """Remove any source whose schema, identity, or boundary is not ready."""
+
+    if not capabilities.slice3_storage_lifecycle_ready:
+        return StoragePublicationPolicy()
+    enabled: list[StoragePublicationAuthority] = []
+    for authority in requested.authorities:
+        global_activation = (
+            claim_activation
+            if authority.measurement_basis == "claim-requested"
+            else volume_activation
+        )
+        source_activation = source_activations.get(
+            (
+                authority.measurement_basis,
+                authority.collector_id,
+                authority.source_cluster,
+            )
+        )
+        if not _storage_source_activation_is_effective(
+            source_activation,
+            global_activation,
+        ):
+            continue
+        if authority.measurement_basis == "volume-provisioned" and (
+            not volume_mapping_ready or not volume_identity_key_matches
+        ):
+            continue
+        enabled.append(authority)
+    return StoragePublicationPolicy(tuple(enabled))
+
+
+def _compute_activation_is_effective(
+    activation: ComputeActivation | None,
+) -> bool:
+    return bool(
+        activation is not None
+        and activation.state == "active"
+        and activation.activated_at is not None
+        and activation.database_time is not None
+        and activation.database_time >= activation.activated_at
+    )
+
+
 def _capability_gated_infrastructure_publication_resources(
     settings: InfrastructureMeteringSettings,
     capabilities: MeteringSchemaCapabilities,
     *,
-    claim_activation: StorageActivation | None = None,
-    volume_activation: StorageActivation | None = None,
     mapped_volume_resources: tuple[str, ...] = (),
     volume_mapping_ready: bool = True,
+    compute_activations: Mapping[str, ComputeActivation] | None = None,
+    storage_publication_policy: StoragePublicationPolicy | None = None,
+    vm_lifecycle_authenticated: bool = False,
 ) -> tuple[str, ...]:
     """Narrow requested classes to schema- and activation-safe resources."""
 
     resources = ["workspace_pod"]
+    activations = compute_activations or {}
+    storage_policy = storage_publication_policy or StoragePublicationPolicy()
     if (
-        settings.pvc_publication_enabled
-        and capabilities.slice2_claim_inventory_ready
-        and _storage_activation_is_effective(claim_activation)
+        settings.agent_pod_publication_enabled
+        and capabilities.slice3_compute_inventory_ready
+        and _compute_activation_is_effective(activations.get("agent_pod"))
+    ):
+        resources.append("agent_pod")
+    if (
+        settings.vm_publication_enabled
+        and vm_lifecycle_authenticated
+        and capabilities.slice3_compute_inventory_ready
+        and _compute_activation_is_effective(activations.get("workspace_vm"))
+    ):
+        resources.append("workspace_vm")
+    if (
+        any(
+            authority.measurement_basis == "claim-requested"
+            for authority in storage_policy.authorities
+        )
+        and capabilities.slice3_storage_lifecycle_ready
     ):
         resources.extend(_INFRASTRUCTURE_PVC_RESOURCES)
     if (
-        settings.pv_publication_enabled
+        any(
+            authority.measurement_basis == "volume-provisioned"
+            for authority in storage_policy.authorities
+        )
         and volume_mapping_ready
         and capabilities.slice2_volume_inventory_ready
         and capabilities.storage_identity_key_version
         == settings.volume_identity_key_version
-        and _storage_activation_is_effective(volume_activation)
+        and capabilities.slice3_storage_lifecycle_ready
     ):
         resources.extend((*_INFRASTRUCTURE_PV_RESOURCES, *mapped_volume_resources))
     return tuple(dict.fromkeys(resources))
@@ -8467,10 +8795,16 @@ async def lifespan(app: FastAPI):
     global infrastructure_coverage_waivers
     global infrastructure_storage_assets
     global infrastructure_storage_mapping
+    global infrastructure_compute_activation
+    global infrastructure_compute_scope_diagnostics
+    global infrastructure_storage_source_activation_ready
     infrastructure_metering_settings = InfrastructureMeteringSettings.from_env()
     metering_capabilities = await probe_schema_capabilities(
         postgres_db.pool,
         audit_db.pool if (audit_db is not None and audit_ready) else None,
+    )
+    infrastructure_storage_source_activation_ready = (
+        metering_capabilities.slice3_storage_lifecycle_ready
     )
     infrastructure_storage_mapping = None
     registered_storage_resources: tuple[str, ...] = ()
@@ -8480,7 +8814,10 @@ async def lifespan(app: FastAPI):
             for rule in infrastructure_metering_settings.volume_resource_mappings
         )
     )
-    storage_mapping_ready = not infrastructure_metering_settings.pv_inventory_enabled
+    storage_mapping_ready = not (
+        infrastructure_metering_settings.pv_inventory_enabled
+        or infrastructure_metering_settings.vm_pv_inventory_enabled
+    )
     if metering_capabilities.slice2_volume_schema_ready:
         candidate_storage_mapping = StorageResourceMappingStore(postgres_db.pool)
         try:
@@ -8501,6 +8838,7 @@ async def lifespan(app: FastAPI):
     infrastructure_storage_assets = None
     claim_storage_activation: StorageActivation | None = None
     volume_storage_activation: StorageActivation | None = None
+    storage_source_activations: tuple[StorageSourceActivation, ...] = ()
     if metering_capabilities.slice2_volume_schema_ready:
         candidate_storage_assets = StorageAssetStore(postgres_db.pool)
         try:
@@ -8516,6 +8854,112 @@ async def lifespan(app: FastAPI):
             )
         else:
             infrastructure_storage_assets = candidate_storage_assets
+            if metering_capabilities.slice3_storage_lifecycle_ready:
+                try:
+                    storage_source_activations = (
+                        await candidate_storage_assets.source_status()
+                    )
+                except Exception:
+                    logger.warning(
+                        "Infrastructure storage source activation probe failed; "
+                        "source publication remains unavailable",
+                        exc_info=True,
+                    )
+    infrastructure_compute_activation = None
+    infrastructure_compute_scope_diagnostics = {}
+    compute_activations: dict[str, ComputeActivation] = {}
+    publication_compute_activations: dict[str, ComputeActivation] = {}
+    if metering_capabilities.slice3_compute_inventory_ready:
+        candidate_compute_activation = ComputeActivationStore(postgres_db.pool)
+        try:
+            compute_activation_rows = await candidate_compute_activation.status()
+            compute_scope_requirements = (
+                await candidate_compute_activation.requirements()
+            )
+            compute_epoch_authorities = (
+                await candidate_compute_activation.authorities()
+            )
+        except Exception:
+            logger.warning(
+                "Infrastructure compute activation probe failed; Slice 3 "
+                "activation operations remain unavailable",
+                exc_info=True,
+            )
+        else:
+            infrastructure_compute_activation = candidate_compute_activation
+            compute_activations = {
+                activation.activation_key: activation
+                for activation in compute_activation_rows
+            }
+            publication_compute_activations = dict(compute_activations)
+            for activation in compute_activation_rows:
+                source_cluster, namespaces, collector_id = _compute_scope_configuration(
+                    activation.activation_key
+                )
+                diagnostic = compute_scope_configuration_diagnostic(
+                    activation,
+                    compute_scope_requirements,
+                    source_cluster=source_cluster,
+                    namespaces=namespaces,
+                    collector_id=collector_id,
+                    authorities=compute_epoch_authorities,
+                )
+                if diagnostic is None:
+                    continue
+                infrastructure_compute_scope_diagnostics[activation.activation_key] = (
+                    diagnostic
+                )
+                publication_compute_activations[activation.activation_key] = (
+                    ComputeActivation(
+                        activation_key=activation.activation_key,
+                        state="disabled",
+                        activated_at=None,
+                        database_time=activation.database_time,
+                    )
+                )
+                logger.error(
+                    "Infrastructure compute class %s is incompatible with "
+                    "its configured exact scope; interval mutation and "
+                    "publication remain disabled: %s",
+                    activation.activation_key,
+                    diagnostic,
+                )
+    vm_lifecycle_authenticated = bool(
+        nats_bridge.lifecycle_identity_authenticated
+    )
+    if (
+        infrastructure_metering_settings.vm_publication_enabled
+        or infrastructure_metering_settings.vm_pvc_publication_enabled
+        or infrastructure_metering_settings.vm_pv_publication_enabled
+    ) and not vm_lifecycle_authenticated:
+        logger.error(
+            "VM compute/storage publication requested without authenticated "
+            "lifecycle identity; remote publication authorities remain disabled"
+        )
+    requested_storage_publication_policy = _requested_storage_publication_policy(
+        infrastructure_metering_settings,
+        vm_lifecycle_authenticated=vm_lifecycle_authenticated,
+    )
+    storage_source_activation_map = {
+        (
+            activation.measurement_basis,
+            activation.collector_id,
+            activation.source_cluster,
+        ): activation
+        for activation in storage_source_activations
+    }
+    enabled_storage_publication_policy = _capability_gated_storage_publication_policy(
+        requested_storage_publication_policy,
+        metering_capabilities,
+        claim_activation=claim_storage_activation,
+        volume_activation=volume_storage_activation,
+        source_activations=storage_source_activation_map,
+        volume_mapping_ready=storage_mapping_ready,
+        volume_identity_key_matches=(
+            metering_capabilities.storage_identity_key_version
+            == infrastructure_metering_settings.volume_identity_key_version
+        ),
+    )
     requested_infrastructure_resources = _enabled_infrastructure_publication_resources(
         infrastructure_metering_settings,
         mapped_volume_resources=tuple(
@@ -8528,20 +8972,53 @@ async def lifespan(app: FastAPI):
         _capability_gated_infrastructure_publication_resources(
             infrastructure_metering_settings,
             metering_capabilities,
-            claim_activation=claim_storage_activation,
-            volume_activation=volume_storage_activation,
             mapped_volume_resources=registered_storage_resources,
             volume_mapping_ready=storage_mapping_ready,
+            compute_activations=publication_compute_activations,
+            storage_publication_policy=enabled_storage_publication_policy,
+            vm_lifecycle_authenticated=vm_lifecycle_authenticated,
         )
     )
+    ide_publication_ready = bool(
+        infrastructure_metering_settings.ide_pod_publication_enabled
+        and metering_capabilities.slice3_compute_inventory_ready
+        and _compute_activation_is_effective(
+            publication_compute_activations.get("ide_workspace_pod")
+        )
+    )
+    if (
+        infrastructure_metering_settings.ide_pod_publication_enabled
+        and not ide_publication_ready
+    ):
+        logger.error(
+            "Infrastructure IDE Pod publication requested before its schema "
+            "or activation boundary is ready; IDE intervals remain excluded"
+        )
     unavailable_infrastructure_resources = sorted(
         set(requested_infrastructure_resources) - set(enabled_infrastructure_resources)
     )
     if unavailable_infrastructure_resources:
         logger.error(
-            "Infrastructure storage publication requested before its schema, "
+            "Infrastructure resource publication requested before its schema, "
             "identity, or activation boundary is ready; excluded resources=%s",
             ",".join(unavailable_infrastructure_resources),
+        )
+    unavailable_storage_authorities = tuple(
+        authority
+        for authority in requested_storage_publication_policy.authorities
+        if authority not in enabled_storage_publication_policy.authorities
+    )
+    if unavailable_storage_authorities:
+        logger.error(
+            "Infrastructure storage publication requested before its exact "
+            "source schema, identity, or activation boundary is ready; "
+            "excluded authorities=%s",
+            ",".join(
+                f"{authority.measurement_basis}/"
+                f"{authority.collector_id}/"
+                f"{authority.source_cluster}"
+                for authority in unavailable_storage_authorities
+            ),
         )
     infrastructure_usage_v2 = UsageV2QueryService(
         audit_usage_pool,
@@ -8551,6 +9028,8 @@ async def lifespan(app: FastAPI):
             infrastructure_metering_settings.source_aware_reads_enabled
         ),
         enabled_resources=enabled_infrastructure_resources,
+        ide_workspace_pod_enabled=ide_publication_ready,
+        storage_publication_policy=enabled_storage_publication_policy,
     )
     infrastructure_usage_rollup = (
         TypedUsageDailyRollup(
@@ -8596,23 +9075,62 @@ async def lifespan(app: FastAPI):
         ):
             collection_capability_errors.append("Slice 2 PVC inventory")
         if (
+            infrastructure_metering_settings.vm_pvc_inventory_enabled
+            and not metering_capabilities.slice2_claim_inventory_ready
+        ):
+            collection_capability_errors.append("Slice 3 VM PVC inventory")
+        if (
             infrastructure_metering_settings.pv_inventory_enabled
             and not metering_capabilities.slice2_volume_schema_ready
         ):
             collection_capability_errors.append("Slice 2 PV lifecycle schema")
         if (
-            infrastructure_metering_settings.pv_inventory_enabled
-            and not storage_mapping_ready
+            infrastructure_metering_settings.vm_pv_inventory_enabled
+            and not metering_capabilities.slice2_volume_schema_ready
         ):
-            collection_capability_errors.append("Slice 2 PV resource mapping")
+            collection_capability_errors.append("Slice 3 VM PV lifecycle schema")
         if (
             infrastructure_metering_settings.pv_inventory_enabled
+            or infrastructure_metering_settings.vm_pv_inventory_enabled
+        ) and not storage_mapping_ready:
+            collection_capability_errors.append("Slice 2 PV resource mapping")
+        if (
+            (
+                infrastructure_metering_settings.pv_inventory_enabled
+                or infrastructure_metering_settings.vm_pv_inventory_enabled
+            )
             and metering_capabilities.storage_identity_key_registered
             and metering_capabilities.storage_identity_key_version
             != infrastructure_metering_settings.volume_identity_key_version
         ):
             collection_capability_errors.append(
                 "Slice 2 PV identity key version mismatch"
+            )
+        if (
+            infrastructure_metering_settings.ide_pod_shadow_enabled
+            or infrastructure_metering_settings.agent_pod_shadow_enabled
+            or infrastructure_metering_settings.vm_inventory_enabled
+        ) and not metering_capabilities.slice3_compute_inventory_ready:
+            collection_capability_errors.append("Slice 3 compute inventory")
+        if (
+            infrastructure_metering_settings.pvc_shadow_enabled
+            or infrastructure_metering_settings.pv_shadow_enabled
+            or infrastructure_metering_settings.vm_pvc_shadow_enabled
+            or infrastructure_metering_settings.vm_pv_shadow_enabled
+            or infrastructure_metering_settings.pvc_publication_enabled
+            or infrastructure_metering_settings.pv_publication_enabled
+            or infrastructure_metering_settings.vm_pvc_publication_enabled
+            or infrastructure_metering_settings.vm_pv_publication_enabled
+        ) and not metering_capabilities.slice3_storage_lifecycle_ready:
+            collection_capability_errors.append(
+                "Slice 3 exact-source storage lifecycle"
+            )
+        elif metering_capabilities.slice3_storage_lifecycle_ready:
+            collection_capability_errors.extend(
+                _storage_source_configuration_errors(
+                    infrastructure_metering_settings,
+                    storage_source_activations,
+                )
             )
         if collection_capability_errors:
             logger.error(
@@ -8623,6 +9141,18 @@ async def lifespan(app: FastAPI):
             )
         else:
             ingestion_key = os.environ.get("INFRASTRUCTURE_METERING_INGESTION_KEY", "")
+            additional_ingestion_keys: dict[str, str] = {}
+            if infrastructure_metering_settings.vm_inventory_enabled:
+                additional_ingestion_keys["kubevirt-vmis"] = os.environ.get(
+                    "INFRASTRUCTURE_METERING_VMI_INGESTION_KEY", ""
+                )
+            if (
+                infrastructure_metering_settings.vm_pvc_inventory_enabled
+                or infrastructure_metering_settings.vm_pv_inventory_enabled
+            ):
+                additional_ingestion_keys["kubevirt-storage"] = os.environ.get(
+                    "INFRASTRUCTURE_METERING_VM_STORAGE_INGESTION_KEY", ""
+                )
             try:
                 candidate_store = InventoryStore(
                     postgres_db.pool,
@@ -8672,6 +9202,7 @@ async def lifespan(app: FastAPI):
                     candidate_store,
                     infrastructure_metering_settings,
                     ingestion_key=ingestion_key,
+                    additional_ingestion_keys=additional_ingestion_keys or None,
                 )
             except (TypeError, ValueError):
                 logger.error(
@@ -8723,11 +9254,15 @@ async def lifespan(app: FastAPI):
                 usage_ledger,
                 publication_enabled=True,
                 enabled_resources=enabled_infrastructure_resources,
+                ide_workspace_pod_enabled=ide_publication_ready,
+                storage_publication_policy=enabled_storage_publication_policy,
             )
             infrastructure_usage_day_sealer = InfrastructureUsageDaySealer(
                 postgres_db.pool,
                 sealing_enabled=True,
                 enabled_resources=enabled_infrastructure_resources,
+                ide_workspace_pod_enabled=ide_publication_ready,
+                storage_publication_policy=enabled_storage_publication_policy,
             )
         if (
             infrastructure_workspace_cutover is not None
@@ -14757,6 +15292,32 @@ async def _trigger_verification_on_complete(
     rounds = _verification_rounds(job)
     max_rounds = verification_config.get("max_rounds", 3)
     content_tree = freeze_data.get("content_tree")
+
+    # Nothing was delivered, so there is nothing to review. The agent sets this
+    # when its job-ending push does not land (src/core/phase.py,
+    # _push_job_ending_state): the deliverables exist only on a pod about to be
+    # reclaimed, and the job repository is empty or stale.
+    #
+    # A critic here would clone that repository, correctly observe the
+    # deliverable missing, and return the job for work that EXISTS but was never
+    # delivered — an infrastructure fault reported as a work fault. That is not
+    # hypothetical: on dev job 40efbb39 it cost a 105-minute critic livelock and
+    # a verdict that misdiagnosed the failure entirely
+    # (docs/issues/git_push_fails_silently_via_workspace_backend.md).
+    #
+    # Checked BEFORE the gate on purpose. The gate compares `content_tree`,
+    # which here describes a tree that was never pushed, so its no-progress
+    # reasoning is meaningless on this input — and its round-cap escalation
+    # would report the wrong reason even when it fires.
+    if freeze_data.get("delivery_failed"):
+        reason = (
+            freeze_data.get("delivery_error")
+            or "The job-ending git push failed; deliverables were not delivered."
+        )
+        reason = f"Verification skipped — {reason}"
+        await _escalate_target(job_id, job, reason)
+        actions.append(f"target {job_id} escalated: {reason}")
+        return
 
     action, reason = _verification_gate_decision(rounds, content_tree, max_rounds)
     if action == "escalate":
@@ -21155,6 +21716,23 @@ class InfrastructureStorageActivationScheduleRequest(
     activated_at: datetime
 
 
+class InfrastructureComputeActivationRequest(BaseModel):
+    reason: str = Field(min_length=1, max_length=2048)
+
+
+class InfrastructureComputeActivationScheduleRequest(
+    InfrastructureComputeActivationRequest
+):
+    idempotency_key: UUID
+    activated_at: datetime
+
+
+class InfrastructureComputeEpochRolloverRequest(
+    InfrastructureComputeActivationRequest
+):
+    idempotency_key: UUID
+
+
 class InfrastructureStorageDestructionRequest(BaseModel):
     idempotency_key: UUID
     effective_at: datetime
@@ -21223,20 +21801,144 @@ def _storage_activation_payload(activation: StorageActivation) -> dict[str, Any]
     }
 
 
+def _storage_source_activation_payload(
+    activation: StorageSourceActivation,
+    global_activation: StorageActivation | None,
+) -> dict[str, Any]:
+    return {
+        "measurement_basis": activation.measurement_basis,
+        "collector_id": activation.collector_id,
+        "source_cluster": activation.source_cluster,
+        "state": activation.state,
+        "activated_at": activation.activated_at,
+        "database_time": activation.database_time,
+        "effective": _storage_source_activation_is_effective(
+            activation,
+            global_activation,
+        ),
+        "requirements": [
+            {
+                "inventory_scope_id": requirement.inventory_scope_id,
+                "api_resource": requirement.api_resource,
+                "namespace": requirement.namespace,
+                "role": requirement.requirement_role,
+            }
+            for requirement in activation.requirements
+        ],
+    }
+
+
+def _compute_activation_payload(activation: ComputeActivation) -> dict[str, Any]:
+    effective = (
+        activation.state == "active"
+        and activation.activated_at is not None
+        and activation.database_time is not None
+        and activation.database_time >= activation.activated_at
+    )
+    return {
+        "activation_key": activation.activation_key,
+        "state": activation.state,
+        "activated_at": activation.activated_at,
+        "database_time": activation.database_time,
+        "effective": effective,
+    }
+
+
+def _compute_epoch_authority_payload(
+    authority: ComputeEpochAuthority,
+) -> dict[str, Any]:
+    return {
+        "id": authority.id,
+        "activation_key": authority.activation_key,
+        "collector_id": authority.collector_id,
+        "source_cluster": authority.source_cluster,
+        "inventory_scope_id": authority.inventory_scope_id,
+        "inventory_scope_epoch_id": authority.inventory_scope_epoch_id,
+        "previous_authority_id": authority.previous_authority_id,
+        "predecessor_epoch_id": authority.predecessor_epoch_id,
+        "authority_sequence": authority.authority_sequence,
+        "effective_from": authority.effective_from,
+        "effective_to": authority.effective_to,
+        "proof_snapshot_id": authority.proof_snapshot_id,
+        "proof_generation": authority.proof_generation,
+        "promotion_request_id": authority.promotion_request_id,
+        "namespace": authority.namespace,
+        "is_current_epoch": authority.is_current_epoch,
+    }
+
+
+def _compute_epoch_promotion_payload(
+    promotion: ComputeEpochPromotion,
+) -> dict[str, Any]:
+    return {
+        "request_id": promotion.request_id,
+        "activation_key": promotion.activation_key,
+        "request_kind": promotion.request_kind,
+        "promoted_at": promotion.promoted_at,
+        "actor_id": promotion.actor_id,
+        "audit_reason": promotion.audit_reason,
+        "replayed": promotion.replayed,
+        "authorities": [
+            _compute_epoch_authority_payload(authority)
+            for authority in promotion.authorities
+        ],
+    }
+
+
+def _compute_class_shadow_enabled(
+    activation_key: str,
+) -> bool:
+    if activation_key == "agent_pod":
+        return infrastructure_metering_settings.agent_pod_shadow_enabled
+    if activation_key == "ide_workspace_pod":
+        return infrastructure_metering_settings.ide_pod_shadow_enabled
+    return infrastructure_metering_settings.vm_shadow_enabled
+
+
+def _compute_class_inventory_enabled(
+    activation_key: str,
+) -> bool:
+    if activation_key == "workspace_vm":
+        return infrastructure_metering_settings.vm_inventory_enabled
+    return infrastructure_metering_settings.collector_enabled
+
+
+def _compute_class_publication_enabled(
+    activation_key: str,
+) -> bool:
+    if activation_key == "agent_pod":
+        return infrastructure_metering_settings.agent_pod_publication_enabled
+    if activation_key == "ide_workspace_pod":
+        return infrastructure_metering_settings.ide_pod_publication_enabled
+    return infrastructure_metering_settings.vm_publication_enabled
+
+
+def _compute_scope_configuration(
+    activation_key: str,
+) -> tuple[str, tuple[str, ...], str]:
+    if activation_key == "workspace_vm":
+        return (
+            infrastructure_metering_settings.vm_stable_cluster_id,
+            (infrastructure_metering_settings.vm_namespace,),
+            "kubevirt-vmis",
+        )
+    return (
+        infrastructure_metering_settings.stable_cluster_id,
+        infrastructure_metering_settings.namespace_allowlist,
+        "kubernetes-pods",
+    )
+
+
 def _storage_basis_inventory_enabled(
     measurement_basis: Literal["claim-requested", "volume-provisioned"],
 ) -> bool:
-    if measurement_basis == "claim-requested":
-        return infrastructure_metering_settings.pvc_inventory_enabled
-    return infrastructure_metering_settings.pv_inventory_enabled
+    return _storage_source_inventory_enabled("primary", measurement_basis)
 
 
 def _storage_basis_shadow_enabled(
     measurement_basis: Literal["claim-requested", "volume-provisioned"],
 ) -> bool:
-    if measurement_basis == "claim-requested":
-        return infrastructure_metering_settings.pvc_shadow_enabled
-    return infrastructure_metering_settings.pv_shadow_enabled
+    return _storage_source_shadow_enabled("primary", measurement_basis)
 
 
 @app.get("/api/admin/usage/v2/storage-activation")
@@ -21251,6 +21953,11 @@ async def get_infrastructure_storage_activation(
         )
     try:
         claim, volume = await infrastructure_storage_assets.read_activations()
+        source_activations = (
+            await infrastructure_storage_assets.source_status()
+            if infrastructure_storage_source_activation_ready
+            else ()
+        )
     except Exception as exc:
         logger.exception("Infrastructure storage activation status failed")
         raise HTTPException(
@@ -21262,6 +21969,14 @@ async def get_infrastructure_storage_activation(
             _storage_activation_payload(claim),
             _storage_activation_payload(volume),
         ],
+        "source_activations": [
+            _storage_source_activation_payload(
+                activation,
+                claim if activation.measurement_basis == "claim-requested" else volume,
+            )
+            for activation in source_activations
+        ],
+        "source_activation_ready": infrastructure_storage_source_activation_ready,
         "configuration": {
             "claim_inventory_enabled": (
                 infrastructure_metering_settings.pvc_inventory_enabled
@@ -21281,29 +21996,67 @@ async def get_infrastructure_storage_activation(
             "volume_publication_enabled": (
                 infrastructure_metering_settings.pv_publication_enabled
             ),
+            "sources": {
+                source: {
+                    basis: {
+                        "inventory_enabled": _storage_source_inventory_enabled(
+                            source,
+                            basis,
+                        ),
+                        "shadow_enabled": _storage_source_shadow_enabled(
+                            source,
+                            basis,
+                        ),
+                        "publication_enabled": (
+                            _storage_source_publication_enabled(source, basis)
+                        ),
+                    }
+                    for basis in ("claim-requested", "volume-provisioned")
+                }
+                for source in ("primary", "vm")
+            },
         },
     }
 
 
-@app.post("/api/admin/usage/v2/storage-activation/{measurement_basis}/shadow")
-async def enter_infrastructure_storage_shadow(
+async def _enter_infrastructure_storage_source_shadow(
     request: Request,
+    source: Literal["primary", "vm"],
     measurement_basis: Literal["claim-requested", "volume-provisioned"],
     body: InfrastructureStorageActivationRequest,
+    *,
+    event_type: str,
+    resource_id: str,
 ) -> dict[str, Any]:
     admin = await _require_infrastructure_fleet_admin(request)
-    if not _storage_basis_inventory_enabled(measurement_basis):
+    if not _storage_source_inventory_enabled(source, measurement_basis):
         raise HTTPException(
             status_code=404,
-            detail="Infrastructure storage inventory is not enabled for this basis",
+            detail=(
+                "Infrastructure storage inventory is not enabled for this "
+                "source and basis"
+            ),
         )
-    if infrastructure_storage_assets is None:
+    if (
+        infrastructure_storage_assets is None
+        or not infrastructure_storage_source_activation_ready
+    ):
         raise HTTPException(
             status_code=503,
-            detail="Infrastructure storage metering is unavailable",
+            detail="Infrastructure storage source activation is unavailable",
         )
+    collector_id, source_cluster, requirements = _storage_source_configuration(
+        source,
+        measurement_basis,
+    )
     try:
-        activation = await infrastructure_storage_assets.enter_shadow(measurement_basis)
+        activation = await infrastructure_storage_assets.enter_source_shadow(
+            measurement_basis=measurement_basis,
+            collector_id=collector_id,
+            source_cluster=source_cluster,
+            requirements=requirements,
+        )
+        claim, volume = await infrastructure_storage_assets.read_activations()
     except StorageAssetContractError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except (StorageActivationNotReady, StorageAssetConflict) as exc:
@@ -21316,44 +22069,96 @@ async def enter_infrastructure_storage_shadow(
         ) from exc
     await log_security_event(
         postgres_db,
-        event_type="infrastructure_storage_shadow_entered",
+        event_type=event_type,
         user=admin,
         resource_type="infrastructure_storage_activation",
-        resource_id=measurement_basis,
-        detail=f"state={activation.state} reason={body.reason}",
+        resource_id=resource_id,
+        detail=(
+            f"collector_id={collector_id} source_cluster={source_cluster} "
+            f"state={activation.state} reason={body.reason}"
+        ),
         request=request,
     )
-    return _storage_activation_payload(activation)
+    return _storage_source_activation_payload(
+        activation,
+        claim if measurement_basis == "claim-requested" else volume,
+    )
 
 
-@app.post("/api/admin/usage/v2/storage-activation/{measurement_basis}/schedule")
-async def schedule_infrastructure_storage_activation(
+@app.post("/api/admin/usage/v2/storage-activation/{measurement_basis}/shadow")
+async def enter_infrastructure_storage_shadow(
     request: Request,
     measurement_basis: Literal["claim-requested", "volume-provisioned"],
+    body: InfrastructureStorageActivationRequest,
+) -> dict[str, Any]:
+    """Compatibility route for the primary-cluster storage authority."""
+
+    return await _enter_infrastructure_storage_source_shadow(
+        request,
+        "primary",
+        measurement_basis,
+        body,
+        event_type="infrastructure_storage_shadow_entered",
+        resource_id=measurement_basis,
+    )
+
+
+@app.post(
+    "/api/admin/usage/v2/storage-source-activation/{source}/{measurement_basis}/shadow"
+)
+async def enter_infrastructure_storage_source_shadow(
+    request: Request,
+    source: Literal["primary", "vm"],
+    measurement_basis: Literal["claim-requested", "volume-provisioned"],
+    body: InfrastructureStorageActivationRequest,
+) -> dict[str, Any]:
+    return await _enter_infrastructure_storage_source_shadow(
+        request,
+        source,
+        measurement_basis,
+        body,
+        event_type="infrastructure_storage_source_shadow_entered",
+        resource_id=f"{source}:{measurement_basis}",
+    )
+
+
+async def _schedule_infrastructure_storage_source_activation(
+    request: Request,
+    source: Literal["primary", "vm"],
+    measurement_basis: Literal["claim-requested", "volume-provisioned"],
     body: InfrastructureStorageActivationScheduleRequest,
+    *,
+    event_type: str,
+    resource_id: str,
 ) -> dict[str, Any]:
     admin = await _require_infrastructure_fleet_admin(request)
-    if not _storage_basis_shadow_enabled(measurement_basis):
+    if not _storage_source_shadow_enabled(source, measurement_basis):
         raise HTTPException(
             status_code=404,
-            detail="Infrastructure storage shadow mode is not enabled for this basis",
+            detail=(
+                "Infrastructure storage shadow mode is not enabled for this "
+                "source and basis"
+            ),
         )
-    if infrastructure_storage_assets is None:
+    if (
+        infrastructure_storage_assets is None
+        or not infrastructure_storage_source_activation_ready
+    ):
         raise HTTPException(
             status_code=503,
-            detail="Infrastructure storage metering is unavailable",
+            detail="Infrastructure storage source activation is unavailable",
         )
+    collector_id, source_cluster, _requirements = _storage_source_configuration(
+        source,
+        measurement_basis,
+    )
     generation = _infrastructure_leader_generation()
     try:
-        activation = await infrastructure_storage_assets.schedule_activation(
+        activation = await infrastructure_storage_assets.schedule_source_activation(
             measurement_basis=measurement_basis,
+            collector_id=collector_id,
+            source_cluster=source_cluster,
             activated_at=body.activated_at,
-            source_cluster=infrastructure_metering_settings.stable_cluster_id,
-            namespaces=(
-                infrastructure_metering_settings.namespace_allowlist
-                if measurement_basis == "claim-requested"
-                else ()
-            ),
             max_scope_age=timedelta(
                 seconds=infrastructure_metering_settings.stale_after_seconds
             ),
@@ -21364,6 +22169,7 @@ async def schedule_infrastructure_storage_activation(
                 else None
             ),
         )
+        claim, volume = await infrastructure_storage_assets.read_activations()
     except StorageAssetContractError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except (StorageActivationNotReady, StorageAssetConflict) as exc:
@@ -21376,14 +22182,293 @@ async def schedule_infrastructure_storage_activation(
         ) from exc
     await log_security_event(
         postgres_db,
-        event_type="infrastructure_storage_activation_scheduled",
+        event_type=event_type,
         user=admin,
         resource_type="infrastructure_storage_activation",
-        resource_id=measurement_basis,
-        detail=(f"activated_at={activation.activated_at} reason={body.reason}"),
+        resource_id=resource_id,
+        detail=(
+            f"collector_id={collector_id} source_cluster={source_cluster} "
+            f"activated_at={activation.activated_at} reason={body.reason}"
+        ),
         request=request,
     )
-    return _storage_activation_payload(activation)
+    return _storage_source_activation_payload(
+        activation,
+        claim if measurement_basis == "claim-requested" else volume,
+    )
+
+
+@app.post("/api/admin/usage/v2/storage-activation/{measurement_basis}/schedule")
+async def schedule_infrastructure_storage_activation(
+    request: Request,
+    measurement_basis: Literal["claim-requested", "volume-provisioned"],
+    body: InfrastructureStorageActivationScheduleRequest,
+) -> dict[str, Any]:
+    """Compatibility route for the primary-cluster storage authority."""
+
+    return await _schedule_infrastructure_storage_source_activation(
+        request,
+        "primary",
+        measurement_basis,
+        body,
+        event_type="infrastructure_storage_activation_scheduled",
+        resource_id=measurement_basis,
+    )
+
+
+@app.post(
+    "/api/admin/usage/v2/storage-source-activation/"
+    "{source}/{measurement_basis}/schedule"
+)
+async def schedule_infrastructure_storage_source_activation(
+    request: Request,
+    source: Literal["primary", "vm"],
+    measurement_basis: Literal["claim-requested", "volume-provisioned"],
+    body: InfrastructureStorageActivationScheduleRequest,
+) -> dict[str, Any]:
+    return await _schedule_infrastructure_storage_source_activation(
+        request,
+        source,
+        measurement_basis,
+        body,
+        event_type="infrastructure_storage_source_activation_scheduled",
+        resource_id=f"{source}:{measurement_basis}",
+    )
+
+
+@app.get("/api/admin/usage/v2/compute-activation")
+async def get_infrastructure_compute_activation(
+    request: Request,
+) -> dict[str, Any]:
+    await _require_infrastructure_fleet_admin(request)
+    if infrastructure_compute_activation is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Infrastructure compute metering is unavailable",
+        )
+    try:
+        activations = await infrastructure_compute_activation.status()
+        requirements = await infrastructure_compute_activation.requirements()
+        authorities = await infrastructure_compute_activation.authorities()
+    except Exception as exc:
+        logger.exception("Infrastructure compute activation status failed")
+        raise HTTPException(
+            status_code=500,
+            detail="Infrastructure compute activation status failed",
+        ) from exc
+    diagnostics: dict[str, str] = {}
+    for activation in activations:
+        source_cluster, namespaces, collector_id = _compute_scope_configuration(
+            activation.activation_key
+        )
+        diagnostic = compute_scope_configuration_diagnostic(
+            activation,
+            requirements,
+            source_cluster=source_cluster,
+            namespaces=namespaces,
+            collector_id=collector_id,
+            authorities=authorities,
+        )
+        if diagnostic is not None:
+            diagnostics[activation.activation_key] = diagnostic
+    return {
+        "activations": [
+            _compute_activation_payload(activation) for activation in activations
+        ],
+        "epoch_authorities": [
+            _compute_epoch_authority_payload(authority)
+            for authority in authorities
+        ],
+        "configuration": {
+            activation.activation_key: {
+                "inventory_enabled": _compute_class_inventory_enabled(
+                    activation.activation_key
+                ),
+                "shadow_enabled": _compute_class_shadow_enabled(
+                    activation.activation_key
+                ),
+                "publication_enabled": _compute_class_publication_enabled(
+                    activation.activation_key
+                ),
+                "scope_compatible": (
+                    activation.activation_key not in diagnostics
+                ),
+                "scope_diagnostic": diagnostics.get(activation.activation_key),
+            }
+            for activation in activations
+        },
+    }
+
+
+@app.post("/api/admin/usage/v2/compute-activation/{activation_key}/shadow")
+async def enter_infrastructure_compute_shadow(
+    request: Request,
+    activation_key: Literal["agent_pod", "ide_workspace_pod", "workspace_vm"],
+    body: InfrastructureComputeActivationRequest,
+) -> dict[str, Any]:
+    admin = await _require_infrastructure_fleet_admin(request)
+    if not _compute_class_inventory_enabled(activation_key):
+        raise HTTPException(
+            status_code=404,
+            detail="Infrastructure compute inventory is not enabled for this class",
+        )
+    if infrastructure_compute_activation is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Infrastructure compute metering is unavailable",
+        )
+    try:
+        activation = await infrastructure_compute_activation.enter_shadow(
+            activation_key
+        )
+    except ComputeActivationContractError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except (ComputeActivationNotReady, ComputeActivationConflict) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("Infrastructure compute shadow transition failed")
+        raise HTTPException(
+            status_code=500,
+            detail="Infrastructure compute shadow transition failed",
+        ) from exc
+    await log_security_event(
+        postgres_db,
+        event_type="infrastructure_compute_shadow_entered",
+        user=admin,
+        resource_type="infrastructure_compute_activation",
+        resource_id=activation_key,
+        detail=f"state={activation.state} reason={body.reason}",
+        request=request,
+    )
+    return _compute_activation_payload(activation)
+
+
+@app.post("/api/admin/usage/v2/compute-activation/{activation_key}/schedule")
+async def schedule_infrastructure_compute_activation(
+    request: Request,
+    activation_key: Literal["agent_pod", "ide_workspace_pod", "workspace_vm"],
+    body: InfrastructureComputeActivationScheduleRequest,
+) -> dict[str, Any]:
+    admin = await _require_infrastructure_fleet_admin(request)
+    if not _compute_class_shadow_enabled(activation_key):
+        raise HTTPException(
+            status_code=404,
+            detail="Infrastructure compute shadow mode is not enabled for this class",
+        )
+    if infrastructure_compute_activation is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Infrastructure compute metering is unavailable",
+        )
+    source_cluster, namespaces, collector_id = _compute_scope_configuration(
+        activation_key
+    )
+    generation = _infrastructure_leader_generation()
+    try:
+        scheduled = await infrastructure_compute_activation.schedule_activation(
+            activation_key=activation_key,
+            activated_at=body.activated_at,
+            source_cluster=source_cluster,
+            namespaces=namespaces,
+            max_scope_age=timedelta(
+                seconds=infrastructure_metering_settings.stale_after_seconds
+            ),
+            expected_generation=generation,
+            request_id=body.idempotency_key,
+            actor_id=UUID(str(admin["id"])),
+            audit_reason=body.reason,
+            collector_id=collector_id,
+        )
+    except ComputeActivationContractError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except (ComputeActivationNotReady, ComputeActivationConflict) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("Infrastructure compute activation scheduling failed")
+        raise HTTPException(
+            status_code=500,
+            detail="Infrastructure compute activation scheduling failed",
+        ) from exc
+    await log_security_event(
+        postgres_db,
+        event_type="infrastructure_compute_activation_scheduled",
+        user=admin,
+        resource_type="infrastructure_compute_activation",
+        resource_id=activation_key,
+        detail=(
+            f"request_id={scheduled.promotion.request_id} "
+            f"activated_at={scheduled.activation.activated_at} "
+            f"replayed={scheduled.promotion.replayed} reason={body.reason}"
+        ),
+        request=request,
+    )
+    payload = _compute_activation_payload(scheduled.activation)
+    payload["promotion"] = _compute_epoch_promotion_payload(scheduled.promotion)
+    return payload
+
+
+@app.post("/api/admin/usage/v2/compute-activation/{activation_key}/rollover")
+async def rollover_infrastructure_compute_epoch(
+    request: Request,
+    activation_key: Literal["agent_pod", "ide_workspace_pod", "workspace_vm"],
+    body: InfrastructureComputeEpochRolloverRequest,
+) -> dict[str, Any]:
+    """Promote fresh post-recovery epochs without inheriting a retired epoch."""
+
+    admin = await _require_infrastructure_fleet_admin(request)
+    if not _compute_class_shadow_enabled(activation_key):
+        raise HTTPException(
+            status_code=404,
+            detail="Infrastructure compute shadow mode is not enabled for this class",
+        )
+    if infrastructure_compute_activation is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Infrastructure compute metering is unavailable",
+        )
+    source_cluster, namespaces, collector_id = _compute_scope_configuration(
+        activation_key
+    )
+    generation = _infrastructure_leader_generation()
+    try:
+        promotion = (
+            await infrastructure_compute_activation.promote_recovery_epochs(
+                activation_key=activation_key,
+                source_cluster=source_cluster,
+                namespaces=namespaces,
+                max_scope_age=timedelta(
+                    seconds=infrastructure_metering_settings.stale_after_seconds
+                ),
+                expected_generation=generation,
+                request_id=body.idempotency_key,
+                actor_id=UUID(str(admin["id"])),
+                audit_reason=body.reason,
+                collector_id=collector_id,
+            )
+        )
+    except ComputeActivationContractError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except (ComputeActivationNotReady, ComputeActivationConflict) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("Infrastructure compute epoch rollover failed")
+        raise HTTPException(
+            status_code=500,
+            detail="Infrastructure compute epoch rollover failed",
+        ) from exc
+    await log_security_event(
+        postgres_db,
+        event_type="infrastructure_compute_epoch_rolled_over",
+        user=admin,
+        resource_type="infrastructure_compute_epoch_authority",
+        resource_id=activation_key,
+        detail=(
+            f"request_id={promotion.request_id} promoted_at={promotion.promoted_at} "
+            f"replayed={promotion.replayed} reason={body.reason}"
+        ),
+        request=request,
+    )
+    return _compute_epoch_promotion_payload(promotion)
 
 
 def _storage_destruction_payload(
