@@ -31,21 +31,25 @@ sessions: let the user pick a message they sent earlier, revert the session to t
 point, and re-drive from there with a different prompt. The model is Claude Code's
 `/rewind`.
 
-> **Status (2026-07-15): PARKED — concept capture only. No decisions taken.**
-> This doc deliberately stops short of choosing an implementation. It exists to
-> preserve the prior-art research and the architecture mapping so the eventual design
-> call is fast, and to record *why* the call is being deferred.
+> **Status (2026-08-07): DECIDED — design approved, implementation next.**
+> The design call happened 2026-08-07 (owner-driven brainstorm); the result is the
+> [Decided design](#decided-design-2026-08-07) section below. The concept capture,
+> prior art, and design space are kept beneath it as the record.
 >
-> **Sequenced behind two pieces of work, both by owner decision (2026-07-15):**
-> 1. [[source_tree_unification]] — the src-layout flatten. Every file anchor in this
->    doc is pre-flatten and will move.
-> 2. **The message-model unification** — [[unified_message_store]], tracked as Phase 7
->    of [[database_roadmap]] (the last open phase). This is the load-bearing one:
->    rewind is a *transcript* operation, and unification decides what the transcript
->    model even is. See [Why this is sequenced](#why-this-is-sequenced-behind-the-unification).
->
-> When those land, the follow-up is a design call over the [design space](#the-design-space--all-undecided)
-> below, then an execution plan.
+> **The 2026-07-15 parking was un-parked by owner decision, with both sequenced
+> dependencies still unlanded** (re-verified 2026-08-07):
+> 1. [[source_tree_unification]] — never happened; `src/` layout unchanged, so this
+>    doc's anchors remain valid (line numbers drifted; key ones re-verified below).
+> 2. [[unified_message_store]] / [[database_roadmap]] Phase 7 — still "NOT decided";
+>    Phase 7 is the roadmap's only open phase. Rewind therefore designs against the
+>    **current** `thread_messages` model, choosing semantics Phase 7 can adopt rather
+>    than fight: a linear tombstone marker (`rewound_at`), not a branch dimension.
+>    If Phase 7's canonical shape lands later, the marker column migrates with it.
+> 3. [[persistent_session_source_of_truth]] Plans 2–4 — still pending, so the
+>    in-memory-authority wrinkle below still binds: an attached session must mutate
+>    agent memory, not just the DB. The design truncates in place (fidelity-
+>    preserving) for the common case; only deep rewinds past the live compaction
+>    boundary fall back to the lossy rehydrate.
 
 ## Motivation
 
@@ -66,6 +70,162 @@ session (which throws away everything).
 This matters more for us than for a CLI: our sessions are long-lived, durable, and
 resumable across pods. A bad turn is a *persistent* liability, not something you drop
 by closing a terminal.
+
+---
+
+## Decided design (2026-08-07)
+
+Approved section-by-section in the 2026-08-07 brainstorm. Decisions against the
+[design space](#the-design-space--resolved-2026-08-07-kept-for-the-record):
+
+| Axis | Decision |
+|---|---|
+| Scope (v1) | **Full Claude Code parity**: independent restore modes (both / conversation / code) + a summarize action in one action sheet |
+| A — transcript semantics | **A2 linear + tombstones** (`rewound_at` marker; one timeline in the UI; history preserved, un-tombstoning possible later). A3 branching rejected: exceeds parity, front-runs Phase 7, ~3–5× the bill |
+| B — apply point | **Split by state**: attached → live WS verb, truncate in-memory in place; detached → DB-only, next attach rehydrates. Always-rehydrate (the Plan-2 shape) rejected for now: transcript round-trip is still lossy for live state |
+| C — workspace revert | **C3 via the existing per-turn auto-commits** (`src/persistent_graph.py:1001` already commits after every tool-executing turn — the doc's assumed cost of C3 evaporated). Forward-restore commits, never `reset --hard` |
+| D — UX surface | **D1 inline** "Rewind to here" on each user message → action sheet. Dedicated picker is a fast-follow if long-session navigation hurts |
+| Summarize twin | **One action** ("Summarize up to here") instead of Claude Code's TUI-cursor-specific pair — deliberate, owner-approved parity deviation. Wired through the existing `compact` verb with an explicit boundary; not a rewind (no tombstones, no ledger row) |
+| Ownership | Owner-only, both surfaces |
+| Retention | Tombstones + ledger kept forever under the Phase-6 no-deletion policy; revisit with its retention clocks |
+
+### Data model — one migration
+
+Migration number picked at push time (collision hazard — duplicate prefixes
+hard-fail the runner; re-check the free number right before pushing).
+
+1. **`thread_messages.rewound_at TIMESTAMPTZ NULL`** + partial index
+   `(thread_id, seq) WHERE rewound_at IS NULL`. "Rewind to message X" tombstones
+   **X and everything after it** (`seq >= X.seq`) — X is being *un-sent*; its text
+   refills the composer. Live readers add `WHERE rewound_at IS NULL`; audit/debug
+   surfaces stay unfiltered. Post-rewind messages take higher `seq` and sort
+   correctly; no renumbering. (In-place `UPDATE` is consistent with the existing
+   write pattern — `save_thread_message` is already an `ON CONFLICT (id) DO UPDATE`
+   upsert; the store's invariant is *never delete*, not *never update*.)
+2. **`thread_rewinds` ledger** — one row per rewind: `thread_id, from_seq,
+   mode ('both'|'conversation'|'code'), actor, abandoned_sha, restored_to_sha,
+   restore_commit_sha, created_at`. Audit trail + un-rewind metadata + workspace
+   record.
+3. **`thread_turn_commits` map** — `(thread_id, seq, commit_sha)` PK
+   `(thread_id, seq)`, written agent-side immediately after the existing per-turn
+   auto-commit (and the compaction checkpoint commit) succeeds: "workspace state
+   after transcript `seq <= N`". Restore target for a rewind to `S` = row with
+   the largest `seq < S`. No backfill — code-restore coverage starts at deploy.
+
+**Compaction self-consistency under seq-sweep** (the interaction the design space
+flagged as "work through, don't assert"): a summary row written *after* X has
+`seq > X.seq` → swept; the originals it summarized have `seq < X.seq` → survive;
+rehydration falls back to them (or an older surviving summary). A summary written
+*before* X survives and stays valid. No special-casing needed.
+
+**Deep-rewind consequence:** if X predates the live compaction boundary, the
+attached agent's in-memory list no longer contains X — truncate-in-place is
+impossible and that case falls back to rehydrate-from-transcript (accepting the
+fidelity cost on the rare deep rewind; shallow rewinds keep full fidelity).
+
+**`seq` stays server-side:** the cockpit sends the message row id it already has
+(`UserTurn.id`); the server resolves it via `get_seq_for_message_id`
+(`src/database/postgres_db.py:489`).
+
+### Flow — attached (WS `rewind` verb)
+
+Sibling of `undo`/`interrupt` (`src/api/persistent_app.py:3169`/`:3072`), payload
+`{message_id, mode}`, owner-only, serialized by the session loop:
+
+1. **Hard-interrupt** any in-flight turn (existing tri-state machinery,
+   `persistent_app.py:190–215`); drain the pending input queue.
+2. Resolve `message_id → seq`.
+3. **Code before conversation** — git is the fallible op, so it gates: if `mode`
+   includes code, run the workspace restore; on failure abort with the error —
+   nothing tombstoned, workspace left at a harmless snapshot commit.
+4. If `mode` includes conversation: one transaction — single-statement sweep
+   `UPDATE thread_messages SET rewound_at = now() WHERE thread_id = $1 AND
+   seq >= $2 AND rewound_at IS NULL` + ledger insert. Then fix in-memory state:
+   truncate in place (common case) or rehydrate via `_restore_session_messages`
+   (`persistent_app.py:5787`) for deep rewinds. Reset `turn_count` to the
+   surviving turns.
+5. **Bump `events_epoch`** → all viewers take the existing `GONE_BEYOND_HORIZON`
+   repaint (IndexedDB refreshes through the same path). The initiating client's
+   ack carries the original prompt text for the composer refill.
+
+### Flow — detached (orchestrator REST)
+
+`POST /api/agents/threads/{id}/rewind`, owner-only, advisory-locked: same sweep +
+ledger + epoch bump, orchestrator-side; next attach rehydrates from the filtered
+transcript. **Code modes are rejected when detached** ("resume the session to
+restore files") — no agent holds the workspace, and released workspaces may have
+no filesystem at all. v1 carries no deferred-restore state machine.
+
+### Workspace restore — always forward, never `reset --hard`
+
+`reset --hard` would strand the branch behind Gitea and break the throttled
+fast-forward push. Instead:
+
+1. Commit the abandoned state as a **pre-rewind snapshot** (`add -A` + commit) —
+   nothing is ever lost in git either.
+2. Make worktree+index exactly the target tree — *including deleting files
+   created since* (`git read-tree -u --reset <sha>` semantics; `checkout <sha>
+   -- .` would leave them behind) — and commit as **"Rewind: restore to turn N"**.
+3. History stays linear and pushable; both SHAs land in the ledger.
+
+Degraded-mode matrix (drives which action-sheet options are enabled, with
+tooltip reasons):
+
+| Session state | Code restore |
+|---|---|
+| `git_versioning=False` (lite/virtual) | Unavailable — conversation-only, labeled |
+| No mapped commit `< target seq` | Unavailable for that message |
+| VM tier | Works (local git on the persistent rootdisk; push best-effort as today) |
+| Detached | Rejected — resume first |
+
+Known granularity caveat: a *failed* auto-commit bleeds that turn's file changes
+into the next successful commit, so restore granularity degrades at commit
+boundaries — it never restores a state that didn't exist. Bash side effects
+against external systems remain out of scope (stated in the UI copy), same
+posture as Claude Code.
+
+### UX (cockpit)
+
+Hover/kebab action **"Rewind to here"** on each user message → action sheet:
+*Restore conversation and files / Restore conversation only / Restore files only
+/ Summarize up to here / Cancel*, options disabled per the matrix. Confirmation
+copy: *"Messages after this point are hidden from the conversation (kept in the
+audit trail). Files return to their state after turn N. Commands with external
+effects can't be undone."* On success: turns collapse via the epoch repaint, the
+composer prefills with the original prompt, focus lands there. Non-owner viewers
+see no affordance and just repaint. Rewind during streaming is allowed — the
+server interrupts first.
+
+### Failure containment
+
+- Git-fail → abort pre-sweep; state unchanged (snapshot commit is harmless).
+- Sweep-fail after git success → files restored, conversation intact; error
+  surfaced; retry idempotent (re-checkout of the same tree is a no-op commit).
+- Double-fire serialized (session loop / advisory lock).
+
+### Testing
+
+- **Unit:** sweep boundary semantics (X inclusive; summary rows after/before X;
+  idempotent re-sweep), turn→commit resolution (gaps, no-commit turns,
+  failed-commit drift), ledger writes.
+- **Integration (CI Py3.12 is the gate):** attached shallow rewind (in-memory
+  truncate, no lossy round-trip), deep rewind past the compaction boundary
+  (rehydrate path), detached rewind + re-attach hydration, epoch-bump repaint,
+  all three modes, owner enforcement, mid-stream interrupt-then-rewind.
+- **Workspace:** forward-restore including deletion of since-created files,
+  snapshot commit exists, push stays fast-forward, degraded matrix.
+- **Live gate on dev** before calling it shipped: real session, rewind
+  mid-conversation, Gitea history stays linear, other-viewer repaint observed.
+
+### Read-path filter checklist (plan-time)
+
+Every `SELECT` on `thread_messages` gets classified **live** (add the filter) vs
+**audit** (leave unfiltered) during implementation planning — grep-able by
+design. Known live readers: the agent rehydrate history query, the cockpit
+history read (`orchestrator/database/postgres.py` `get_thread_messages_history`),
+the compaction-boundary reads (latest *live* summary), session-wake reads, and
+the MCP thread-message reads. Known audit readers stay unfiltered: debug/audit
+views, exports that promise completeness.
 
 ---
 
@@ -183,9 +343,11 @@ useful sketch of the workspace-revert shape, not a foundation to build on as-is.
 
 ---
 
-## The design space — all undecided
+## The design space — RESOLVED 2026-08-07, kept for the record
 
-Recorded as options with trade-offs. **Nothing here is chosen.**
+Recorded as options with trade-offs. **Every axis is now decided** — see the
+[Decided design](#decided-design-2026-08-07) table. Kept because the rejected
+options' reasoning is part of the decision.
 
 ### Axis A — transcript revert semantics
 
@@ -260,7 +422,7 @@ The append-only invariant has to give somewhere. Three shapes:
 
 ---
 
-## Why this is sequenced behind the unification
+## Why this was sequenced behind the unification (historical — un-parked 2026-08-07)
 
 Not just scheduling — there's a real design dependency, and it runs through Axis A.
 
@@ -288,7 +450,7 @@ semantics, it just moves every file this doc cites. Hence: capture now, decide l
 
 ---
 
-## Open questions for the eventual design call
+## Open questions for the eventual design call (ANSWERED 2026-08-07 — see Decided design)
 
 1. **Scope of v1** — conversation-only (Axis C1), or conversation + workspace in the
    first cut?
@@ -310,7 +472,13 @@ semantics, it just moves every file this doc cites. Hence: capture now, decide l
 ## Appendix — code anchors (as of 2026-07-15, pre-flatten)
 
 Recorded so the mapping doesn't have to be redone. **All of these move in
-[[source_tree_unification]].**
+[[source_tree_unification]].** Re-verified 2026-08-07: layout unchanged, line
+numbers drifted; current values for the load-bearing ones —
+`get_seq_for_message_id` → `postgres_db.py:489`, `undo` verb →
+`persistent_app.py:3169` (`interrupt` `:3072`, `compact` `:3151`),
+`file_checkpoints` → `persistent_session.py:264`, `_restore_session_messages` →
+`persistent_app.py:5787`, per-turn auto-commit → `persistent_graph.py:1001`
+(compaction checkpoint commit `:1509`), `get_head_commit` → `workspace.py:419`.
 
 **Session loop / turn execution**
 - `src/persistent_graph.py:533` — `run_persistent_loop` (outer loop)
