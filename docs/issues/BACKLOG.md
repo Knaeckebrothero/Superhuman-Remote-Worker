@@ -44,6 +44,7 @@ blocking it should be taken before the next bench campaign.
 | [deliverable_lost_to_nested_repo…](deliverable_lost_to_nested_repo_commit_and_stranded_mode_a_job.md) (Defect 1 residue) | **Blocks the bench thread.** The gate and critic verify against the *remote branch*, so a failed push is indistinguishable from a lazy agent — the 08-01/08-02 CWD-banner outage burned all 5 of `cd3bfe52`'s critic rounds and both of `bbce4bed`'s bounces on phantom findings, and any future transport failure will corrupt bench results the same way. Fix: hold on `has_unpushed_commits()` at seal instead of emitting findings. Also: 5 of 6 `git_mgr.push()` call sites in `src/core/phase.py` still discard the return value. |
 | [pod_oom_kill_protection](pod_oom_kill_protection.md) | Umbrella for the recurring OOM incident class. |
 | [kb_reindex_sync_dns_retries_stall_orchestrator_liveness](kb_reindex_sync_dns_retries_stall_orchestrator_liveness.md) | NEW 08-07 (P-4 bench night-watch): KB materialization routes every agent note through the tiktoken chunker; cold vocab cache + DNS failure = sync retries ON the event loop → liveness killed the orchestrator and orphan-paused the in-flight job pair. Grows with vault size; dev exposure on any egress blip. Fixes: bake vocab into image, reindex off-loop, fail-fast on first DNS error. |
+| [hnsw_indexes_never_used_inside_hybrid_search_functions](hnsw_indexes_never_used_inside_hybrid_search_functions.md) | NEW 08-07 (job `204d0ed1` subagent-timeout investigation): **B2's unfinished half.** The halfvec HNSW indexes exist, but all six hybrid-search SQL functions seq-scan anyway — `kb_search` 12–14 s, memory retrieval 22–46 s, against 1.9–3.5 s for the *identical* body hoisted to a top-level PREPARE (index scan). B2's "planner-gated hedge" has never fired at any scope size; k3d missed it because btree+sort really is fast when small. Per-turn tax on every job and session (~60 s/turn of memory+KB injection in `204d0ed1`), and it is what blew the 240 s light-reader deadline. Mechanism bisected (see doc's ruled-out list). **No config fix** — `enable_seqscan=off` doesn't flip it either, so the index path is never *considered*, not merely out-costed; must change the SQL or call path. Est. ~half a day DB-only (plpgsql + dynamic EXECUTE keeps signatures, no app change) after 1–2 h of experiment. Exact planner reason still open. |
 
 *(~~job_finalization_decisions_held_only_in_process_memory~~ — **FIXED 08-06
 (batch #3)**, moved to docs/done/: journal-before-observe end-to-end, both
@@ -93,7 +94,7 @@ hydration; critic verdict survived via the checkpointed mirror + ledger.)*
 | [agent_egress_networkpolicy_enablement](agent_egress_networkpolicy_enablement.md) | Open — the policy is implemented and shipped **default-off |
 | [lifecycle_session_agents_without_thread_never_drain](lifecycle_session_agents_without_thread_never_drain.md) | CONTAINED 08-06 (batch #2): the guarded reap was already committed (`46ea64d2`) + live-verified twice on k3d (synthetic thread-less orphan reaped at grace+tick; healthy parked session untouched). Doc stays open for the unified-lifecycle proper fix only. |
 | [agent_fast_freeze_on_dead_workspace](agent_fast_freeze_on_dead_workspace.md) | Designed 2026-07-04, not yet implemented. Work on `develop`. |
-| [cloud_folder_invisible_until_owner_signs_into_cloud](cloud_folder_invisible_until_owner_signs_into_cloud.md) | OPEN — root-caused, deliberately not built. Deferred 2026-08-05. |
+| [cloud_folder_invisible_until_owner_signs_into_cloud](cloud_folder_invisible_until_owner_signs_into_cloud.md) | OPEN (narrowed 08-07) — historical hole swept by `scripts/backfill_session_folder_shares.py`; retry only fired on resume, so ended threads stayed unshared. User-facing affordance still unbuilt. |
 | [datasource_legacy_dead_code](datasource_legacy_dead_code.md) | Open — cleanup, no functional impact. Filed 2026-06-11 |
 | [db_schema_hygiene](db_schema_hygiene.md) | open — first slice landed on `develop` (`f4160780`, 2026-06-11); |
 | [delegation_light_mode_missing](delegation_light_mode_missing.md) | Open. Enhancement / design gap, **not** a regression — the existing |
@@ -144,7 +145,6 @@ status.)*
 | [phase_model_overhead_amnesia_loop](phase_model_overhead_amnesia_loop.md) | 🟡 **IN PROGRESS** — filed 2026-07-31 after a code-side deep |
 | ~~recovery_pause_repersists_stale_freeze_invisible_job~~ | **FIXED 08-06 (batch #2)**, moved to docs/done/ — completion freeze-echo guard + `pause_job_shed_freeze` on the recovery arm. |
 | [results](results.md) | pending_review, confidence 1.0 |
-| [session_deliverables_in_workspace_output_not_in_cloud_files_button](session_deliverables_in_workspace_output_not_in_cloud_files_button.md) | Still present at HEAD (sweep 08-06): the Phase-4 skip mechanism explicitly excludes `rclone_mount`, so the default-driver orphan folder is unchanged |
 | [snapshot_restore_dead_for_jobs](snapshot_restore_dead_for_jobs.md) | Confirmed at code level, not fixed; A/B decision still unmade (re-verified 08-06: `check_idle_all` still has zero live callers, reap path still snapshot→delete) |
 | [task_clearance_user_feedback](task_clearance_user_feedback.md) | Core search_files bug fixed via the backend refactor (server-side grep); 5 design proposals unbuilt |
 | [transient_db_error_hard_fails_job_and_destroys_vm](transient_db_error_hard_fails_job_and_destroys_vm.md) | All 8 defects shipped + tested; the 2 named live-gate items (NetworkPolicy egress-block, VM Defect-1b reaper interaction) still owed (re-verified 08-06) |
@@ -559,3 +559,68 @@ contributions).
   state-mirror recovery path is reachable in practice, not just in theory.
 - Test jobs left on the cluster: `965b0935` (pending_review, the kill-test
   A/B pair's target) + critic `97c2dcd6` (completed). Safe to clean.
+
+## Session log 2026-08-06 (shell-gating + date injection)
+
+Short interactive session, started from a user question about one dev-cluster
+session — *"why did the agent try to use a shell tool if he doesn't even have
+access to it?"* Session `c90f83b7` (`session_base`, supervised, `virtual`
+backend) called `shell_execute`, waited 53 s, got `Tool 'shell_execute' not
+found`, and could not answer whether a steam railway runs *today*. Diagnosis
+found three defects, all fixed, committed `f36a9713` and pushed to
+`origin/develop` by a parallel actor mid-session. Full writeup:
+`docs/done/session_calls_absent_shell_tool_and_cannot_resolve_today.md`.
+
+**What was actually wrong.** The capability gate was correct — `virtual`
+declares `supports_shell=False` and `session_base` has `tools.shell: []`, so
+60 requested tools bound down to 43 with zero shell. What failed was
+everything around it: (1) the prompt advertised shell unconditionally in every
+family variant, and in *persistent-mode wording* ("shell **tabs**"), which is
+why the model reached for `shell_execute` rather than `run_command` — the
+prompt named the flavour; (2) nothing anywhere injected the current date, so
+an agent asked about "heute" needed a shell to run `date` — this was the only
+defect that changed the user-visible answer; (3) the tool-existence check sat
+*after* the permission gate, so a supervised user was shown an approval card
+for a tool that could not run either way, which is where the 53 s went.
+
+**Fixes.** `with_current_date()` stamps `Current date: YYYY-MM-DD (Weekday,
+UTC)` into both branches of `get_phase_system_prompt`, re-stamped every turn by
+`persistent_graph` (sessions run for weeks — a date baked in at setup freezes
+on creation day). Day granularity is deliberate: the system message heads the
+provider prompt-cache prefix, so a per-turn timestamp would bust the cache
+every turn. Rewritten in place, not appended, so the product-guide floor stays
+the tail. New `{% if has_shell %}` gate across 4 interactive + 7 tactical + 3
+strategic + 10 datasource-CLI blocks, backed by `_has_shell_tools` reading the
+registry category (the shell tools are mid-rename; a name list would rot).
+`tool_map.get()` moved above the permission gate, batch announce filtered to
+bound names, and `_unavailable_tool_message` now names the cause and says "do
+not retry".
+
+**Verification.** New `tests/test_prompt_shell_gating.py` runs against the
+*shipped* templates (a synthetic template would not have caught this), plus 3
+date tests and 7 gate-ordering tests — **6 of those 7 fail against pristine
+HEAD**, checked in a throwaway worktree, so they catch the old behaviour rather
+than describe it. Full suite 14154 passed / 12 failed, the 12 being the known
+environment set. k3d smoke passed on two `virtual` sessions: autonomous
+answered the date question with zero tool calls (audited reasoning trace: *"The
+current date provided in the system prompt is 2026-08-06 (Thursday, UTC)"*);
+pushed to run `date`, the model *did* emit `shell_execute` and the log shows
+`rejecting before the permission gate`, recovering in one turn without
+retrying; the supervised repeat left **no** `thread_permission_requests` row
+for the phantom.
+
+**Two traps worth carrying forward:**
+- `srw_cloud_status` is `category: "shell"` but `grant: "code"` and is
+  re-appended *after* `filter_tools_by_backend`, so "any shell-category tool ⇒
+  has shell" re-opens the gated blocks on exactly the virtual-tier-with-cloud
+  sessions the gate protects.
+- `{% endif -%}` strips the whitespace after it, eating a following blank line.
+  Put the blank inside the block, and prove the gate is a no-op by diffing
+  rendered output against `git show HEAD:<file>` with a shell bound — it must
+  be byte-identical.
+- Tilt built a partial edit again (image had `_CATEGORY_LABELS` used but not
+  defined — a latent `NameError` behind a healthy-looking tag). md5sum image
+  contents against the working tree before trusting any smoke result.
+
+**Left open:** the worker path's tool-not-found handling (LangGraph `ToolNode`
+in `src/graph.py`) was not touched — this fix is the session loop only.
