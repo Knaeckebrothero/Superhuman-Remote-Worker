@@ -747,6 +747,12 @@ export class PersistentChatService {
     // --- File undo ---
     readonly undoAvailable = signal(false);
 
+    // --- Rewind (docs/features/session_rewind.md) ---
+    /** Prompt text handed back by rewind.ack — the component moves it into
+     *  the composer (edit-and-resend) and clears the signal. */
+    readonly rewindPrefill = signal<string | null>(null);
+    readonly rewindInFlight = signal<boolean>(false);
+
     // --- Cloud sync degraded (initial cloud->workspace seed failed) ---
     /**
      * True when this session's initial cloud->workspace sync failed: the
@@ -1640,6 +1646,18 @@ export class PersistentChatService {
         await this.loadThreadMeta(tid, generation);
         if (!this._isCurrentConnect(tid, generation)) return;
         await this._openSse(tid);
+    }
+
+    /** Full transcript repaint after a rewind: drop the (append-only)
+     *  cache + cursor, then reload from the server's filtered history. */
+    private async _reloadAfterRewind(): Promise<void> {
+        const tid = this.threadId();
+        if (!tid) return;
+        const generation = this.connectGeneration;
+        await this.cache.clearThreadMessages(tid);
+        await this.cache.deleteThreadCursor(tid);
+        if (!this._isCurrentConnect(tid, generation)) return;
+        await this.loadHistory(tid, generation);
     }
 
     /** Epoch of the frame currently being dispatched, parsed from the SSE
@@ -2918,6 +2936,29 @@ export class PersistentChatService {
         return requestId;
     }
 
+    /** Rewind the session to just before an earlier user message.
+     *  Returns the request_id echoed on the rewind.ack / error frame. */
+    rewind(messageId: string, mode: 'both' | 'conversation' | 'code'): string {
+        const requestId = crypto.randomUUID();
+        this.rewindInFlight.set(true);
+        this._sendControl({
+            method: 'rewind',
+            message_id: messageId,
+            mode,
+            request_id: requestId,
+        });
+        return requestId;
+    }
+
+    /** "Summarize up to here" — manual compaction bounded at a message. */
+    summarizeUpTo(messageId: string): void {
+        this._sendControl({
+            method: 'compact',
+            focus: '',
+            boundary_message_id: messageId,
+        });
+    }
+
     /** Upgrade a lite (virtual) session to a real workspace tier.
      *
      * Provisions the workspace, seeds it from the live object-store prefix,
@@ -3634,6 +3675,30 @@ export class PersistentChatService {
                 );
                 break;
 
+            case 'rewind.ack': {
+                this.rewindInFlight.set(false);
+                const prompt = params['prompt'] as string | undefined;
+                if (prompt) this.rewindPrefill.set(prompt);
+                // Truncate-then-reload: the IndexedDB cache is append-only
+                // (loadHistory merges ?after=), so tombstoned rows must be
+                // dropped explicitly or they re-render forever.
+                void this._reloadAfterRewind();
+                break;
+            }
+
+            case 'rewind.done': {
+                // Journaled all-viewer signal (arrives via SSE in the new
+                // epoch). Idempotent with the initiator's ack-driven reload.
+                void this._reloadAfterRewind();
+                break;
+            }
+
+            case 'rewind.files_restored': {
+                this.rewindInFlight.set(false);
+                this._systemMessage('Workspace files restored to the selected point.');
+                break;
+            }
+
             case 'workspace_sync.error': {
                 const op = (params['op'] as string) || 'sync';
                 // The initial cloud->workspace seed failed (degraded:true,
@@ -3676,6 +3741,7 @@ export class PersistentChatService {
             }
 
             case 'error': {
+                this.rewindInFlight.set(false);
                 // P0.3: config.update denials carry the orchestrator's detail
                 // (e.g. the capability-grant reason) — show it, not just the
                 // generic headline.
