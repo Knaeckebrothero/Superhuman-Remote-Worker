@@ -7812,14 +7812,28 @@ class PostgresDB:
     async def get_live_thread_message(
         self, thread_id: str, message_id: str
     ) -> Optional[Dict[str, Any]]:
-        """Rewind-target lookup: the row must exist and not be tombstoned."""
-        async with self.acquire() as conn:
-            row = await conn.fetchrow(
-                "SELECT seq, role, content FROM thread_messages "
-                "WHERE thread_id = $1 AND id = $2 AND rewound_at IS NULL",
-                thread_id,
-                message_id,
-            )
+        """Rewind-target lookup: the row must exist and not be tombstoned.
+
+        ``message_id`` here must already be a genuine row UUID. Unlike the
+        agent-side twin (``src/database/postgres_db.py::get_live_message``),
+        which coerces any caller-supplied id via ``_coerce_row_id`` before
+        querying, this orchestrator path has no such coercion — a malformed
+        id (e.g. a stale/prefixed in-memory id leaking into a detached-rewind
+        request body) fails the UUID cast, client-side or server-side. Either
+        way that just means "not a real row", so it's folded into the same
+        ``None`` the endpoint already turns into 404, instead of surfacing as
+        an unhandled 500.
+        """
+        try:
+            async with self.acquire() as conn:
+                row = await conn.fetchrow(
+                    "SELECT seq, role, content FROM thread_messages "
+                    "WHERE thread_id = $1 AND id = $2 AND rewound_at IS NULL",
+                    thread_id,
+                    message_id,
+                )
+        except (ValueError, asyncpg.exceptions.DataError):
+            return None
         if row is None:
             return None
         return {"seq": row["seq"], "role": row["role"], "content": row["content"]}
