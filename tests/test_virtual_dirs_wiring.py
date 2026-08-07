@@ -1,3 +1,5 @@
+import pytest
+
 from src.core.backends.overlay import VirtualOverlayBackend
 from src.core.virtual_dirs import (
     SingleFileProvider,
@@ -35,12 +37,22 @@ class CopyableFakeTool:
         return clone
 
 
-def _manager(tmp_path, monkeypatch, enabled="true"):
-    monkeypatch.setenv("VIRTUAL_DIRS_ENABLED", enabled)
+# Distinguishes "caller wants the default backend" from an explicit None,
+# which is the only way to get a manager with no overlay.
+_UNSET = object()
+
+
+def _manager(tmp_path, monkeypatch=None, backend=_UNSET):
+    """A manager with the overlay, unless ``backend=None`` is asked for.
+
+    There is no enable/disable flag any more — the overlay is unconditional
+    when there is a backend to wrap. The only overlay-less manager is a
+    backend-less one.
+    """
     return WorkspaceManager(
         job_id="job-1",
         config=WorkspaceManagerConfig(base_path=str(tmp_path)),
-        backend=FilesystemTestBackend(tmp_path),
+        backend=FilesystemTestBackend(tmp_path) if backend is _UNSET else backend,
     )
 
 
@@ -49,10 +61,18 @@ def test_manager_wraps_backend_in_overlay(tmp_path, monkeypatch):
     assert isinstance(ws.backend, VirtualOverlayBackend)
 
 
-def test_kill_switch_leaves_backend_unwrapped(tmp_path, monkeypatch):
-    ws = _manager(tmp_path, monkeypatch, enabled="false")
-    assert not isinstance(ws.backend, VirtualOverlayBackend)
-    assert ws.virtual_overlay is None
+def test_virtual_dirs_enabled_is_inert(tmp_path, monkeypatch):
+    """The kill switch is gone; setting it must not bring the overlay down.
+
+    Its "off" position materialized instructions.md / task_brief.md into the
+    workspace root, which on a workspace-inheriting subjob put the critic's
+    brief where the target reads it. Pinned here so a reintroduced flag fails
+    loudly instead of quietly restoring that write path.
+    """
+    monkeypatch.setenv("VIRTUAL_DIRS_ENABLED", "false")
+    ws = _manager(tmp_path)
+    assert isinstance(ws.backend, VirtualOverlayBackend)
+    assert ws.virtual_overlay is not None
 
 
 def test_registered_provider_serves_reads_through_the_manager(tmp_path, monkeypatch):
@@ -64,9 +84,19 @@ def test_registered_provider_serves_reads_through_the_manager(tmp_path, monkeypa
     assert "tools/" in ws.backend.list_dir("")
 
 
-def test_register_is_a_noop_when_disabled(tmp_path, monkeypatch):
-    ws = _manager(tmp_path, monkeypatch, enabled="false")
-    ws.register_virtual_provider(ToolsProvider(lambda: []))  # must not raise
+def test_every_manager_has_an_overlay(tmp_path):
+    """There is no way to construct a manager without one.
+
+    ``backend=None`` raises in the constructor, and nothing reassigns
+    ``_virtual_overlay`` afterwards, so ``virtual_overlay is None`` is not a
+    reachable state. The guards that used to handle it are gone; this pins the
+    invariant they were guarding.
+    """
+    with pytest.raises(TypeError, match="requires a backend"):
+        _manager(tmp_path, backend=None)
+
+    ws = _manager(tmp_path)
+    assert ws.virtual_overlay is not None
 
 
 def test_sweep_removes_generated_tools_dir(tmp_path):
@@ -189,11 +219,22 @@ def test_swap_backend_keeps_the_overlay_in_front_of_the_new_backend(
     assert ws.read_file("notes.md") == "upgraded"
 
 
-def test_swap_backend_without_an_overlay_still_swaps(tmp_path, monkeypatch):
-    ws = _manager(tmp_path, monkeypatch, enabled="false")
-    new_backend = FilesystemTestBackend(tmp_path)
-    ws.swap_backend(new_backend)
-    assert ws.backend is new_backend
+def test_swap_backend_keeps_serving_through_the_overlay(tmp_path):
+    """The overlay-less swap branch is gone; the overlay must survive a swap.
+
+    Replaces test_swap_backend_without_an_overlay_still_swaps, whose state is
+    no longer constructible.
+    """
+    ws = _manager(tmp_path)
+    ws.register_virtual_provider(ToolsProvider(lambda: [FakeTool("read_file", "R.")]))
+
+    new_root = tmp_path / "new"
+    new_root.mkdir()
+    ws.swap_backend(FilesystemTestBackend(new_root))
+
+    assert ws.virtual_overlay is not None
+    assert ws.backend is ws.virtual_overlay
+    assert "R." in ws.read_file("tools/read_file.md")
 
 
 def test_swap_backend_does_not_unwrap_a_stand_in_backend(tmp_path, monkeypatch):

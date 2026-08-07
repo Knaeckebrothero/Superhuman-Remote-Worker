@@ -539,16 +539,20 @@ class TestReseedFromSnapshotIfFresh:
         snapshot_mgr.recover_to_phase.assert_called_once()
 
 
-class TestKillSwitchMaterialization:
-    """VIRTUAL_DIRS_ENABLED=false must be a rollback, not an outage.
+class TestInstructionFilesAreNeverWritten:
+    """instructions.md / task_brief.md must never land in the workspace root.
 
-    src/graph.py composes the job's FIRST HumanMessage from task_brief.md +
-    instructions.md. With the overlay off, register_virtual_provider() is a
-    no-op and the old write path is deleted, so both reads raised
-    FileNotFoundError and the agent started never having been told what its job
-    is. An emergency lever whose failure mode is "the agent forgets the task"
-    is not a safe lever, so the disabled path materializes exactly those two
-    files.
+    Writing them there is what dropped a critic's brief into the root its
+    TARGET reads from, on every subjob that inherits its parent's workspace —
+    docs/done/critic_brief_lands_in_shared_workspace_and_misleads_target.md.
+    That write path was the "off" position of VIRTUAL_DIRS_ENABLED; the flag
+    and the path are both gone.
+
+    The guarantee the flag was standing in for — never boot an agent that was
+    never told its task — now lives in src/graph.py, which raises instead of
+    warning when both briefs resolve empty. That covers every way the overlay
+    can fail, where the flag covered exactly one. See
+    tests/test_graph.py::TestInitStrategicTodosNode::test_taskless_boot_raises.
     """
 
     def _agent(self, tmp_path):
@@ -560,46 +564,39 @@ class TestKillSwitchMaterialization:
         }
         return ws, agent
 
-    def test_instruction_files_are_real_when_the_switch_is_off(
-        self, tmp_path, monkeypatch
-    ):
-        monkeypatch.setenv("VIRTUAL_DIRS_ENABLED", "false")
-        ws, agent = self._agent(tmp_path)
-        assert ws.virtual_overlay is None
-
-        agent._deploy_instruction_files([])
-
-        assert ws.read_file("instructions.md") == "CUSTOM USER BRIEF"
-        assert "Ship the thing" in ws.read_file("task_brief.md")
-        # Real files on the real backend, not an overlay illusion.
-        assert (tmp_path / "instructions.md").exists()
-        assert (tmp_path / "task_brief.md").exists()
-
-    def test_materialized_files_are_re_asserted_on_reconnect(
-        self, tmp_path, monkeypatch
-    ):
-        """A re-provisioned pod loses them, so they must be seed files again."""
-        monkeypatch.setenv("VIRTUAL_DIRS_ENABLED", "false")
-        ws, agent = self._agent(tmp_path)
-
-        agent._deploy_instruction_files([])
-
-        assert set(agent._agent_seed_files) >= {"instructions.md", "task_brief.md"}
-
-    def test_nothing_is_materialized_when_the_overlay_is_on(
-        self, tmp_path, monkeypatch
-    ):
-        monkeypatch.setenv("VIRTUAL_DIRS_ENABLED", "true")
+    def test_served_but_never_written(self, tmp_path):
         ws, agent = self._agent(tmp_path)
         assert ws.virtual_overlay is not None
 
         agent._deploy_instruction_files([])
 
-        # Served, never written — the whole point of the feature.
+        # Readable through the manager...
+        assert ws.read_file("instructions.md") == "CUSTOM USER BRIEF"
+        assert "Ship the thing" in ws.read_file("task_brief.md")
+        # ...and absent from the real backend, which is the whole point.
+        assert not (tmp_path / "instructions.md").exists()
+        assert not (tmp_path / "task_brief.md").exists()
+        # Not seed files either — nothing to re-assert on SSH reconnect.
+        assert "instructions.md" not in agent._agent_seed_files
+        assert "task_brief.md" not in agent._agent_seed_files
+
+    def test_the_kill_switch_is_gone(self, tmp_path, monkeypatch):
+        """VIRTUAL_DIRS_ENABLED must be inert — no route back to the write path.
+
+        Pins the removal rather than the removal's side effects: if someone
+        reintroduces the flag, the overlay disappears here and the write path
+        comes back with it, taking the shared-workspace defect along.
+        """
+        monkeypatch.setenv("VIRTUAL_DIRS_ENABLED", "false")
+        ws, agent = self._agent(tmp_path)
+
+        assert ws.virtual_overlay is not None, "the flag is still being consulted"
+
+        agent._deploy_instruction_files([])
+
         assert ws.read_file("instructions.md") == "CUSTOM USER BRIEF"
         assert not (tmp_path / "instructions.md").exists()
         assert not (tmp_path / "task_brief.md").exists()
-        assert "instructions.md" not in agent._agent_seed_files
 
 
 class TestTaskBriefHydration:

@@ -11,15 +11,41 @@ tags:
 **Filed:** 2026-07-31, from the live gate of the fail-closed verification
 rewrite (dev job `6df02f64-b4d7-477e-877d-ba570610d54d`).
 
-**Closed by the 2026-08-06 doc-truth sweep (batch #3):** Precondition eliminated by virtual_directories Slice 1 (instructions.md/task_brief.md served virtually, live-gated 2026-08-01) — the collision is unreachable on the default path. Coincidental fix: neither proposed direction was taken; VIRTUAL_DIRS_ENABLED=false fallback would reopen this exact bug.
+**Status:** **FIXED.** Closed in two steps, and the second one is what makes it
+stay closed.
 
-**Status:** Observed live. Root cause is a direct interaction between two
-correct-in-isolation designs. UNFIXED.
-**Severity:** **high** — a worker agent can conclude it is the reviewer and
-spend rounds trying to render verdicts it has no tools for. Costs whole rounds
-and can prevent a job from ever converging.
+1. **2026-08-01 — precondition eliminated, coincidentally.** The
+   virtual-directories migration (Slice 1, live-gated) made `instructions.md`
+   and `task_brief.md` in-process virtual files, served per agent and never
+   written to the workspace. Neither proposed fix direction was taken; the
+   collision simply became unreachable on the default path. Recorded by the
+   2026-08-06 doc-truth sweep (batch #3).
+2. **2026-08-07 — the reopen path removed.** That same sweep noted the catch:
+   `VIRTUAL_DIRS_ENABLED=false` materialized both files back into the workspace
+   root and **would reopen this exact bug**. A kill switch whose "off" position
+   reintroduces a high-severity defect is not a rollback. The flag,
+   `materialize_single_file_providers`, and the disabled-path branch in
+   `_deploy_instruction_files` are all deleted — there is now no route back to
+   the write.
+
+**Severity (as filed):** **high** — a worker agent can conclude it is the
+reviewer and spend rounds trying to render verdicts it has no tools for. Costs
+whole rounds and can prevent a job from ever converging.
+
 **Component:** `orchestrator/main.py` (critic spawn, `context["instructions"]`),
-`src/agent.py` (~2209, `instructions.md` write), critic workspace inheritance.
+`src/agent.py` (`instructions.md` write — deleted), critic workspace
+inheritance.
+
+> **The sharing itself is unchanged.** `inherits_parent_workspace` is still live
+> (`orchestrator/main.py:4649`, `:4896`, `:13805`, `:13808`). Of the three known
+> consequences of that one shared root, two are now closed — the *branch* half
+> by `ensure_job_branch`
+> (`docs/issues/resumed_job_inherits_subjob_git_branch.md`) and the
+> *instructions* half here. The third is still open: the critic writes its
+> verdict artifacts (`output/critic_verdict.json`,
+> `output/verification_report*.json`) into the **target's** `output/`, which is
+> what keeps the verification no-progress guard inert. See
+> `docs/issues/verification_fail_closed_followups.md`.
 
 ## What happened
 
@@ -63,7 +89,14 @@ verdict=returned…"), on a job that is not a critic and cannot render verdicts.
    brief was discarded, so the collision could not occur — **the correct fix
    created the exposure.**
 
-## Fix directions
+## Fix directions (as proposed — none was taken)
+
+Kept for the reasoning, not as a plan. What actually closed this was a
+migration done for unrelated reasons: making the file virtual removes the
+shared-root write entirely, which is a stronger version of option 1 (there is
+no file to collide, rather than a file with a distinct name). Option 2 remains
+worth doing on its own merits — the critic still writes its verdict artifacts
+into the target's `output/`.
 
 1. **Namespace the file.** Write a critic's brief as
    `instructions_critic_<job_id>.md`, or under a per-subjob directory, so it
@@ -80,6 +113,17 @@ verdict=returned…"), on a job that is not a critic and cannot render verdicts.
    of guarantee this codebase has learned not to buy.
 
 Options 1 and 2 are real fixes; 1 is the one to ship first.
+
+**What shipped instead:** `instructions.md` / `task_brief.md` became in-process
+virtual files (`src/core/virtual_dirs/`), registered per agent on its own
+`WorkspaceManager` and served from that agent's own job metadata. Two agents
+sharing one filesystem now serve two different briefs from two different
+processes, and neither is on disk for the other to find. Then the
+`VIRTUAL_DIRS_ENABLED` escape hatch was removed so the write cannot come back,
+with the guarantee it existed for — never boot an agent that was never told its
+task — moved into `src/graph.py`, which now raises instead of warning when both
+briefs resolve empty. That covers every way the overlay can fail, where the flag
+covered one.
 
 ## Related
 
