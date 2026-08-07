@@ -5225,7 +5225,8 @@ CREATE TABLE public.thread_messages (
     provider_raw jsonb,
     additional_kwargs jsonb,
     response_metadata jsonb,
-    seq bigint NOT NULL
+    seq bigint NOT NULL,
+    rewound_at timestamp with time zone
 );
 
 
@@ -5269,6 +5270,13 @@ COMMENT ON COLUMN public.thread_messages.provider_raw IS 'Verbatim provider resp
 --
 
 COMMENT ON COLUMN public.thread_messages.seq IS 'Monotonic per-row insertion order (global BIGSERIAL). The resume cursor: a role=''summary'' row records metrics.boundary_seq = seq of the last message it covers, and resume loads summary + rows with seq > boundary_seq. Backfilled in ≈ insertion order on existing rows; strictly monotonic for new rows.';
+
+
+--
+-- Name: COLUMN thread_messages.rewound_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.thread_messages.rewound_at IS 'Set when a session rewind supersedes this row (seq >= the rewind''s from_seq). Live conversation readers filter rewound_at IS NULL; the row itself is never deleted. See docs/features/session_rewind.md.';
 
 
 --
@@ -5428,6 +5436,51 @@ COMMENT ON COLUMN public.thread_permission_requests.tool_call_id IS 'The LangCha
 --
 
 COMMENT ON COLUMN public.thread_permission_requests.decided_by IS 'User id, MCP token id, or "system" (for timeout-driven expiry).';
+
+
+--
+-- Name: thread_rewinds; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.thread_rewinds (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    thread_id uuid NOT NULL,
+    from_seq bigint NOT NULL,
+    mode text NOT NULL,
+    actor text,
+    swept_count integer DEFAULT 0 NOT NULL,
+    abandoned_sha text,
+    restored_to_sha text,
+    restore_commit_sha text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT thread_rewinds_mode_check CHECK ((mode = ANY (ARRAY['both'::text, 'conversation'::text, 'code'::text])))
+);
+
+
+--
+-- Name: TABLE thread_rewinds; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.thread_rewinds IS 'One row per session rewind: the audit trail, un-tombstone metadata, and the workspace SHAs of the forward-restore. Append-only.';
+
+
+--
+-- Name: thread_turn_commits; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.thread_turn_commits (
+    thread_id uuid NOT NULL,
+    seq bigint NOT NULL,
+    commit_sha text NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: TABLE thread_turn_commits; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.thread_turn_commits IS 'Workspace state after transcript seq <= N: written right after each per-turn auto-commit / compaction checkpoint commit succeeds. The restore target for a rewind to seq S is the row with the largest seq < S. seq 0 = the pre-first-message workspace.';
 
 
 --
@@ -6894,6 +6947,22 @@ ALTER TABLE ONLY public.thread_permission_requests
 
 
 --
+-- Name: thread_rewinds thread_rewinds_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.thread_rewinds
+    ADD CONSTRAINT thread_rewinds_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: thread_turn_commits thread_turn_commits_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.thread_turn_commits
+    ADD CONSTRAINT thread_turn_commits_pkey PRIMARY KEY (thread_id, seq);
+
+
+--
 -- Name: threads threads_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -7713,6 +7782,13 @@ CREATE INDEX idx_thread_messages_thread_seq ON public.thread_messages USING btre
 
 
 --
+-- Name: idx_thread_messages_thread_seq_live; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_thread_messages_thread_seq_live ON public.thread_messages USING btree (thread_id, seq) WHERE (rewound_at IS NULL);
+
+
+--
 -- Name: idx_thread_messages_thread_turn_created; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -7731,6 +7807,13 @@ CREATE INDEX idx_thread_mounts_source_ref ON public.thread_mounts USING btree (s
 --
 
 CREATE INDEX idx_thread_mounts_thread ON public.thread_mounts USING btree (thread_id);
+
+
+--
+-- Name: idx_thread_rewinds_thread; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_thread_rewinds_thread ON public.thread_rewinds USING btree (thread_id, created_at DESC);
 
 
 --
