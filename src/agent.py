@@ -3604,21 +3604,14 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
         for provider in instruction_providers:
             self._workspace_manager.register_virtual_provider(provider)
 
-        # Kill switch: with VIRTUAL_DIRS_ENABLED off there is no overlay, the
-        # registration above is a no-op, and the old write path is deleted — so
-        # instructions.md / task_brief.md would exist nowhere and graph.py's
-        # first HumanMessage (composed from both) would be empty. Materialize
-        # exactly those two so the switch is a genuine rollback rather than a
-        # way to start an agent that was never told its task. Seeding them also
-        # restores their re-assertion on SSH reconnect, as before the migration.
-        if self._workspace_manager.virtual_overlay is None:
-            from .core.virtual_dirs import materialize_single_file_providers
-
-            self._agent_seed_files.update(
-                materialize_single_file_providers(
-                    self._workspace_manager, instruction_providers
-                )
-            )
+        # There is deliberately no materialize-to-disk fallback here. Writing
+        # these two into the workspace root is what dropped a critic's brief
+        # into the root its TARGET reads from, on every subjob that inherits
+        # its parent's workspace
+        # (docs/done/critic_brief_lands_in_shared_workspace_and_misleads_target.md).
+        # The fallback existed to stop an agent booting with no task; graph.py
+        # now refuses to start when both briefs resolve empty, which covers
+        # every cause rather than the single one this branch handled.
 
         # todo_guide is now the bundled "todo-guide" skill, bound via instruction_files
         # (before_tool:next_phase_todos) and materialized in the loop below — no matrix

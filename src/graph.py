@@ -473,12 +473,41 @@ def create_init_strategic_todos_node(
         except FileNotFoundError:
             task_brief = ""
 
-        # Read instructions for context (backward compat — removed in Phase 0)
+        # Read instructions for context (optional: the inline/expert channel)
         try:
             instructions = workspace.read_file("instructions.md")
         except FileNotFoundError:
             instructions = ""
-            logger.warning(f"[{job_id}] instructions.md not found")
+
+        # Refuse to start an agent that was never told its task.
+        #
+        # Both files are served by in-process virtual providers
+        # (docs/features/virtual_directories.md) and are never on disk, so
+        # every way the overlay can fail — a provider raising, a missed
+        # registration, a backend swap that loses the rebind — surfaces right
+        # here as two empty reads. The composed HumanMessage below then
+        # degrades to its boilerplate tail ("You are starting in strategic
+        # mode…") with no task in it, and the agent runs a full job against
+        # instructions it never received, producing confident work on the wrong
+        # thing. That failure used to be one WARNING line.
+        #
+        # This check is what replaced VIRTUAL_DIRS_ENABLED. The kill switch
+        # guarded exactly one route to this state (overlay off => nothing
+        # materialized) by writing the two files to disk — which, on a subjob
+        # sharing its parent's workspace, dropped the critic's brief into the
+        # root the target reads from and convinced the target it was the
+        # reviewer (docs/done/critic_brief_lands_in_shared_workspace_and_misleads_target.md).
+        # A lever whose "off" position reintroduces a high-severity defect is
+        # not a rollback. Failing closed here covers every cause instead of one,
+        # and cannot corrupt a shared workspace to do it.
+        if not task_brief.strip() and not instructions.strip():
+            raise RuntimeError(
+                f"[{job_id}] Refusing to start: no task description available. "
+                "Both task_brief.md and instructions.md resolved empty — the "
+                "virtual instruction providers did not serve content. Starting "
+                "anyway would run the job against an empty brief. See "
+                "docs/features/virtual_directories.md."
+            )
 
         # Load predefined strategic todos from config template
         strategic_todos = get_initial_strategic_todos(config, tool_names=tool_names)

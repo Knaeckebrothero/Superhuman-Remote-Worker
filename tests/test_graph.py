@@ -733,22 +733,66 @@ class TestInitStrategicTodosNode:
         todos = managers["todo"].list_all()
         assert len(todos) == 4  # Predefined strategic todos
 
-    def test_handles_missing_instructions(self, managers, mock_config):
-        """Test handling when instructions.md doesn't exist."""
+    def test_missing_instructions_is_fine_when_the_brief_is_there(
+        self, managers, mock_config
+    ):
+        """instructions.md is optional; task_brief.md alone is a real task.
+
+        Only the case where the agent has NO task description at all is fatal
+        (see ``test_taskless_boot_raises``). instructions.md is the optional
+        expert/inline channel, so its absence must stay a normal boot.
+        """
+        managers["workspace"].write_file(
+            "task_brief.md", "# Task Brief\n\n## Description\n\nShip the thing."
+        )
+
         node = create_init_strategic_todos_node(
             managers["workspace"], managers["todo"], mock_config
         )
 
-        state = {"job_id": "test-123"}
-        result = node(state)
+        result = node({"job_id": "test-123"})
 
-        # Should still work with strategic mode message
-        assert "messages" in result
+        assert "Ship the thing" in result["messages"][0].content
         assert "strategic mode" in result["messages"][0].content
+        assert len(managers["todo"].list_all()) == 4
 
-        # Should still load strategic todos
-        todos = managers["todo"].list_all()
-        assert len(todos) == 4
+    def test_taskless_boot_raises(self, managers, mock_config):
+        """No brief and no instructions must abort the boot, not warn.
+
+        Both files are served by in-process virtual providers
+        (docs/features/virtual_directories.md). If the overlay ever fails to
+        serve them — provider raises, registration missed, a backend swap loses
+        the rebind — every read here returns empty and the composed first
+        HumanMessage degrades to the boilerplate "You are starting in strategic
+        mode" with no task in it. The agent then runs a full job against a task
+        it was never told, and the only prior signal was one WARNING line.
+
+        This is the guarantee that replaced VIRTUAL_DIRS_ENABLED: it holds for
+        every cause, where the kill switch covered exactly one.
+        """
+        node = create_init_strategic_todos_node(
+            managers["workspace"], managers["todo"], mock_config
+        )
+
+        with pytest.raises(RuntimeError, match="no task description"):
+            node({"job_id": "test-123"})
+
+    def test_whitespace_only_brief_is_still_taskless(self, managers, mock_config):
+        """A provider that renders blank must not pass the check.
+
+        The realistic overlay failure returns "" or whitespace, not a missing
+        file — an emptiness check that only tested existence would sail past
+        exactly the case it is here to catch.
+        """
+        managers["workspace"].write_file("task_brief.md", "   \n\n\t\n")
+        managers["workspace"].write_file("instructions.md", "")
+
+        node = create_init_strategic_todos_node(
+            managers["workspace"], managers["todo"], mock_config
+        )
+
+        with pytest.raises(RuntimeError, match="no task description"):
+            node({"job_id": "test-123"})
 
 
 class TestPredefinedTodos:
@@ -1282,6 +1326,9 @@ class TestPhaseAlternationCycle:
         managers["memory"].write(
             "# Project Memory\n\n## Findings\n\n- Important fact 1"
         )
+
+        # Every real job boots with a task; init now refuses without one.
+        managers["workspace"].write_file("instructions.md", "# Task\n\nExtract data.")
 
         # Initialize strategic phase
         init_node = create_init_strategic_todos_node(

@@ -123,19 +123,19 @@ divergence with round progress. Discarded.
 commits with the four `NON_DELIVERABLE_PATHS` excluded — i.e. exactly what the
 guard hashes — twelve paths moved in a single round:
 
-| Path | Written by | Changes every round? |
-|---|---|---|
-| `instructions.md` | the critic's brief, re-rendered per round | yes |
-| `output/critic_verdict.json` | critic | yes |
-| `output/verification_report.json` | critic | yes |
-| `output/verification_report_round_N.json` | critic, N in the name | yes |
-| `tools/{approve_job,return_job_with_feedback,shell_execute,spawn_subagent}.md` | critic's tool docs | yes |
-| `knowledge/<per-round-note>.md` | KB note per round | yes |
-| `plan.md` | agent bookkeeping | yes |
-| `task_brief.md` | agent bookkeeping | yes |
-| `output/glossary.md` | **the deliverable** | only on real progress |
+| Path | Written by | Changes every round? | Still a mover today? |
+|---|---|---|---|
+| `output/critic_verdict.json` | critic | yes | **yes** |
+| `output/verification_report.json` | critic | yes | **yes** |
+| `output/verification_report_round_N.json` | critic, N in the name | yes | **yes** |
+| `knowledge/<per-round-note>.md` | KB note per round | yes | **yes** |
+| `plan.md` | agent bookkeeping | yes | **yes** |
+| `instructions.md` | the critic's brief, re-rendered per round | yes | no — now virtual |
+| `task_brief.md` | agent bookkeeping | yes | no — now virtual |
+| `tools/{approve_job,return_job_with_feedback,shell_execute,spawn_subagent}.md` | critic's tool docs | yes | no — now virtual |
+| `output/glossary.md` | **the deliverable** | only on real progress | n/a |
 
-Eleven of the twelve move whether or not the worker did anything. So on a
+Eleven of the twelve moved whether or not the worker did anything. So on a
 verification round the tree is **guaranteed** to move: the critic writes into
 the same tree the guard hashes, so it moves the hash by existing. The guard
 cannot fire, ever, on the only path it was built for.
@@ -143,22 +143,45 @@ cannot fire, ever, on the only path it was built for.
 It was silent on job 2 for the right reason by luck — `output/glossary.md` did
 change each round — but its sensitivity is zero regardless.
 
-Note the two fixes interlock. `instructions.md`, `output/critic_verdict.json`,
-`output/verification_report*.json` and `tools/*.md` are in the target's tree
-**only** because of the shared workspace
-(`critic_brief_lands_in_shared_workspace_and_misleads_target.md`). Giving the
-critic its own workspace removes those. It does not remove `plan.md`,
-`task_brief.md`, `knowledge/` or `workspace.md`, which are enough on their own
+> **Correction, 2026-08-05.** The measurement above is from job `6df02f64`
+> (2026-07-30), which predates the virtual-directories migration.
+> `instructions.md`, `task_brief.md` and `tools/*.md` are no longer real files
+> — they are served per-agent, in-process, and never written
+> (`docs/features/virtual_directories.md`). So the count is **five movers, not
+> eight**. The evidence was visible during the 08-01 re-run and missed at the
+> time: that run's workspace listing shows no `instructions.md`, no
+> `task_brief.md` and no `tools/`.
+>
+> **The conclusion is unchanged.** The critic still writes its verdict
+> artifacts into the *target's* `output/`, and `plan.md` still churns, so the
+> tree still moves every round regardless of worker progress and the guard
+> still has zero sensitivity. Only the supporting count shrank.
+
+Note the two fixes interlock. `output/critic_verdict.json` and
+`output/verification_report*.json` are in the target's tree **only** because of
+the shared workspace — the last of the three known consequences of that root
+still open, now that the branch half (`ensure_job_branch`) and the instructions
+half (`docs/done/critic_brief_lands_in_shared_workspace_and_misleads_target.md`)
+are both closed. Giving the critic its own workspace removes them. It does not
+remove `plan.md`, `knowledge/` or `workspace.md`, which are enough on their own
 to keep the guard inert.
 
 ### Required fix (was a standing recommendation)
 
 **Invert the denylist to an allowlist** — hash `output/` minus the two
 completion files, and nothing else. This was written up as *"if a fifth
-tree-mover ever appears, do not extend the denylist"*. Eight have now been
-observed in three classes, so the trigger has fired. An allowlist makes a newly
-added bookkeeping path default to *ignored* rather than to silently breaking the
+tree-mover ever appears, do not extend the denylist"*. Five have been observed
+that still stand today (eight before the virtual-directories migration retired
+three), so the trigger has fired either way. An allowlist makes a newly added
+bookkeeping path default to *ignored* rather than to silently breaking the
 guard, and it is robust whether or not the critic ever gets its own workspace.
+
+Note that the allowlist does **not** fall out of the virtual-dirs migration:
+the movers it retired were the incidental ones. The ones that remain are the
+critic's own verdict artifacts, which land in `output/` — inside the very
+prefix an allowlist would hash. Scoping to `output/` alone is therefore not
+sufficient; the allowlist has to exclude the critic's artifacts by name, or the
+critic has to stop writing into the target's tree.
 
 Five corrections to a denylist whose failure mode is silent is the signal to
 change the approach, not to extend the list.

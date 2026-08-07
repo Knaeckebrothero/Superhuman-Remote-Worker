@@ -1,7 +1,7 @@
 """Virtual directory providers. See docs/features/virtual_directories.md."""
 
 import logging
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Optional
 
 from ..backends.overlay import unwrap_backend
 from .contacts_provider import ContactsProvider
@@ -43,56 +43,6 @@ def build_instruction_providers(
     ]
 
 
-def materialize_single_file_providers(workspace_manager, providers) -> Dict[str, str]:
-    """Write file-prefix providers as real files. Kill-switch fallback only.
-
-    ``VIRTUAL_DIRS_ENABLED=false`` installs no overlay and makes
-    ``register_virtual_provider`` a no-op, while the old materialization path is
-    deleted. Without this, ``instructions.md`` and ``task_brief.md`` exist
-    nowhere, and ``src/graph.py`` — which composes the job's FIRST
-    ``HumanMessage`` from both — starts the agent having never been told what
-    its job is. An emergency lever whose failure mode is "the agent forgets the
-    task" is not a rollback, so the disabled path materializes exactly the
-    single-file providers.
-
-    Directory providers (``tools/``, ``contacts/``) are deliberately NOT
-    materialized: their renderers are the documented degradation (deferred
-    tools fall back to short descriptions, contacts are simply absent), and
-    resurrecting the write path is what this feature removed.
-
-    Never raises — a failed write is logged and skipped, exactly like the
-    materialization it replaces.
-
-    Returns:
-        ``{path: content}`` for what was written, so the caller can register
-        them as agent seed files (re-asserted on SSH reconnect).
-    """
-    written: Dict[str, str] = {}
-    for provider in providers:
-        if getattr(provider, "is_dir", True):
-            continue
-        path = provider.prefix
-        try:
-            content = provider.read(path)
-        except Exception as e:
-            logger.warning("Kill-switch materialization: %s render failed: %s", path, e)
-            continue
-        if content is None:
-            continue
-        try:
-            workspace_manager.write_file(path, content)
-        except Exception as e:
-            logger.warning("Kill-switch materialization: %s write failed: %s", path, e)
-            continue
-        written[path] = content
-    if written:
-        logger.info(
-            "VIRTUAL_DIRS_ENABLED is off — materialized %s as real files",
-            ", ".join(sorted(written)),
-        )
-    return written
-
-
 def sweep_legacy_tools_dir(backend: Any) -> bool:
     """Delete a leftover materialized ``tools/`` directory. Never raises.
 
@@ -126,7 +76,6 @@ __all__ = [
     "SingleFileProvider",
     "ToolsProvider",
     "build_instruction_providers",
-    "materialize_single_file_providers",
     "sweep_legacy_tools_dir",
     "unwrap_backend",
 ]
