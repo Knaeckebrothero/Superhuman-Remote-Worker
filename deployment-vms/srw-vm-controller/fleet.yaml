@@ -49,7 +49,7 @@ helm:
       orchestrator:
         # Independently-built component identity; CI updates this from
         # changes.outputs.orchestrator-sha, never the VM chart AppVersion.
-        tag: "sha-95d2a10"
+        tag: "sha-a4d1fab"
         digest: ""
       vmController:
         tag: "sha-61ce7db"
