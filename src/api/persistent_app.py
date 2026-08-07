@@ -3154,9 +3154,14 @@ async def handle_persistent_websocket(ws: WebSocket) -> None:
                     )
 
             elif method == "compact":
-                # Manual compaction trigger (/compact command)
+                # Manual compaction (/compact command, or the rewind action
+                # sheet's "Summarize up to here" with boundary_message_id).
                 focus = data.get("focus", "")
-                asyncio.create_task(_handle_compact(ws, focus))
+                asyncio.create_task(
+                    _handle_compact(
+                        ws, focus, boundary_message_id=data.get("boundary_message_id")
+                    )
+                )
 
             elif method == "archive":
                 # End session (/done command)
@@ -6500,7 +6505,9 @@ async def _handle_rewind(ws: WebSocket, data: Dict[str, Any]) -> None:
         )
 
 
-async def _handle_compact(ws: WebSocket, focus: str = "") -> None:
+async def _handle_compact(
+    ws: WebSocket, focus: str = "", boundary_message_id: Optional[str] = None
+) -> None:
     """Handle /compact command — trigger manual context compaction."""
     try:
         if not _session or not _session.context_manager:
@@ -6518,6 +6525,39 @@ async def _handle_compact(ws: WebSocket, focus: str = "") -> None:
         if callable(_cb_setter):
             _cb_setter(_loop_compaction_progress)
 
+        # "Summarize up to here" (session rewind's sibling action): map the
+        # chosen message to keep_recent_override = the number of messages from
+        # it (inclusive) to the end, counted on the same basis
+        # summarize_and_compact uses (workspace injections excluded — they are
+        # filtered before keep_recent applies).
+        keep_recent_override = None
+        if boundary_message_id:
+            from ..core.workspace_injection import is_workspace_injection_message
+            from ..database.postgres_db import _coerce_row_id
+
+            target_uuid = str(_coerce_row_id(boundary_message_id))
+            cut_index = None
+            for i, m in enumerate(_session.messages):
+                mid = getattr(m, "id", None)
+                if mid and str(_coerce_row_id(mid)) == target_uuid:
+                    cut_index = i
+                    break
+            if cut_index is None:
+                await _ws_send(
+                    ws,
+                    "error",
+                    {
+                        "message": "That message is no longer in working "
+                        "context — it may already be summarized"
+                    },
+                )
+                return
+            keep_recent_override = sum(
+                1
+                for m in _session.messages[cut_index:]
+                if not is_workspace_injection_message(m)
+            )
+
         before_count = len(_session.messages)
         runs_before = getattr(ctx_mgr, "compaction_runs", 0)
         result = await ctx_mgr.summarize_and_compact(
@@ -6526,6 +6566,7 @@ async def _handle_compact(ws: WebSocket, focus: str = "") -> None:
             max_summary_length=getattr(
                 _session.config.context_management, "max_summary_length", 10000
             ),
+            keep_recent_override=keep_recent_override,
             trigger="manual",
             focus=focus or None,
         )
