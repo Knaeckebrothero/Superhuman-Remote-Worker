@@ -7,7 +7,8 @@
 #
 # Classifications:
 #   gated:<gate>           — protected by a require_* / user_can_access_* helper
-#   admin:_require_admin   — admin-only
+#   admin:<gate>           — admin-only; the fleet-scoped variant also
+#                            rejects project-scoped MCP admins
 #   internal:<helper>      — authenticated non-user service boundary
 #   public:<reason>        — opt-out via `# nosec: public <reason>` on line above decorator
 #   unscoped               — no gate detected; CI snapshot test will fail
@@ -58,16 +59,22 @@ GET    /api/admin/system-settings/user_experts                                  
 PUT    /api/admin/system-settings/user_experts                                          admin:_require_admin
 GET    /api/admin/system-settings/vm_workspaces                                         admin:_require_admin
 PUT    /api/admin/system-settings/vm_workspaces                                         admin:_require_admin
-POST   /api/admin/usage/v2/coverage-gaps/{gap_id}/waive                                 unscoped
-POST   /api/admin/usage/v2/infrastructure-corrections                                   unscoped
-GET    /api/admin/usage/v2/infrastructure-cutover                                       unscoped
-POST   /api/admin/usage/v2/infrastructure-cutover/prepare                               unscoped
-GET    /api/admin/usage/v2/storage-activation                                           unscoped
-POST   /api/admin/usage/v2/storage-activation/{measurement_basis}/schedule              unscoped
-POST   /api/admin/usage/v2/storage-activation/{measurement_basis}/shadow                unscoped
-GET    /api/admin/usage/v2/storage-assets/backend-unverified                            unscoped
-GET    /api/admin/usage/v2/storage-assets/{asset_id}                                    unscoped
-POST   /api/admin/usage/v2/storage-assets/{asset_id}/destroy                            unscoped
+GET    /api/admin/usage/v2/compute-activation                                           admin:_require_infrastructure_fleet_admin
+POST   /api/admin/usage/v2/compute-activation/{activation_key}/rollover                 admin:_require_infrastructure_fleet_admin
+POST   /api/admin/usage/v2/compute-activation/{activation_key}/schedule                 admin:_require_infrastructure_fleet_admin
+POST   /api/admin/usage/v2/compute-activation/{activation_key}/shadow                   admin:_require_infrastructure_fleet_admin
+POST   /api/admin/usage/v2/coverage-gaps/{gap_id}/waive                                 admin:_require_infrastructure_fleet_admin
+POST   /api/admin/usage/v2/infrastructure-corrections                                   admin:_require_infrastructure_fleet_admin
+GET    /api/admin/usage/v2/infrastructure-cutover                                       admin:_require_infrastructure_fleet_admin
+POST   /api/admin/usage/v2/infrastructure-cutover/prepare                               admin:_require_infrastructure_fleet_admin
+GET    /api/admin/usage/v2/storage-activation                                           admin:_require_infrastructure_fleet_admin
+POST   /api/admin/usage/v2/storage-activation/{measurement_basis}/schedule              admin:_require_infrastructure_fleet_admin
+POST   /api/admin/usage/v2/storage-activation/{measurement_basis}/shadow                admin:_require_infrastructure_fleet_admin
+GET    /api/admin/usage/v2/storage-assets/backend-unverified                            admin:_require_infrastructure_fleet_admin
+GET    /api/admin/usage/v2/storage-assets/{asset_id}                                    admin:_require_infrastructure_fleet_admin
+POST   /api/admin/usage/v2/storage-assets/{asset_id}/destroy                            admin:_require_infrastructure_fleet_admin
+POST   /api/admin/usage/v2/storage-source-activation/{source}/{measurement_basis}/schedule admin:_require_infrastructure_fleet_admin
+POST   /api/admin/usage/v2/storage-source-activation/{source}/{measurement_basis}/shadow admin:_require_infrastructure_fleet_admin
 GET    /api/admin/users                                                                 admin:_require_admin
 POST   /api/admin/users/approve                                                         admin:_require_admin
 PATCH  /api/admin/users/{user_id}                                                       admin:_require_admin
@@ -87,6 +94,7 @@ POST   /api/agents/threads/{thread_id}/messages                                 
 POST   /api/agents/threads/{thread_id}/officer/notify                                   internal:require_internal
 POST   /api/agents/threads/{thread_id}/officer/wake                                     internal:require_internal
 POST   /api/agents/threads/{thread_id}/release-agent                                    internal:require_internal
+POST   /api/agents/threads/{thread_id}/rewind                                           gated:require_thread_owner
 PUT    /api/agents/threads/{thread_id}/status                                           internal:require_internal
 POST   /api/agents/threads/{thread_id}/suspend                                          internal:require_internal
 POST   /api/agents/threads/{thread_id}/upgrade-to-vm                                    internal:require_internal
