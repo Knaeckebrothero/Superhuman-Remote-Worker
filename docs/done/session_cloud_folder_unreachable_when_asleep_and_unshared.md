@@ -88,21 +88,30 @@ Four of the five are explained: two synced their deliverables correctly, and two
 empty because those sessions never wrote a file at all. An empty folder is not
 by itself evidence of a sync defect — check the write count first.
 
-That leaves exactly **one** unexplained failure, this thread. It is not a general
-"sync is inconsistent" fault, and the scope is much narrower than it first appeared.
-What makes `1930dec9` resist the obvious explanations:
+That leaves exactly one failure — and it is **not a new defect**. `1930dec9` is a
+residual casualty of the resume/cloud-sync race in
+`docs/done/session_resume_cloud_sync_race_late_provision.md`, whose defect 1 is
+literally "resume's attach beats its own cloud provisioning → session unsynced for
+life" and whose severity note says "nothing recovered it".
 
-- Not simply pre-cutover. It was created 08-01 under OpenCloud — but so was
-  `5833c729`, which syncs fine.
-- Not simply "never ran after the folder existed". Its folder was created 08-03
-  20:53 and it ran turns on 08-04 08:34–08:37, after that, writing five files in
-  the process. None reached the folder.
+The dates settle it. Both threads were created 08-01, so age is not the
+discriminator — **whether they ran a turn after the fix went live** is:
 
-The plausible remaining difference is that `5833c729` was re-attached repeatedly
-through 08-06 while `1930dec9`'s last attach predates the cutover, so its sync
-config was never rebuilt against the Nextcloud target — but **this was not
-confirmed**, and the 08-04 turns argue against the simple form of it. Tracked in
-`docs/issues/session_deliverables_in_workspace_output_not_in_cloud_files_button.md`.
+| | last LLM call | relative to the fix | outcome |
+|---|---|---|---|
+| fix `f0415ea7` (orchestrator attach gate) | — | 08-04 12:00 UTC | — |
+| fix `52c1ba80` (agent `_retry_cloud_sync_start`) | — | 08-04 20:36 UTC | — |
+| `1930dec9` | 08-04 **08:37** UTC | before both | never synced |
+| `5833c729` | 08-05 **22:47** UTC | after both | recovered, syncs |
+
+This also answers the objection that `1930dec9` ran turns on 08-04 *after* its
+folder was created (08-03 20:53) and still did not sync. Those turns ran at
+08:34–08:37, three hours before the orchestrator fix and twelve before the agent
+one, on an agent that — per that doc — "never re-reads" its sync config once
+attached degraded. Writing five files in them could not have helped.
+
+No open question remains here. A session attached after 08-05 syncs; this one
+ended 08-05 08:03 without ever running under fixed code.
 
 ## Recovering the lost files
 
