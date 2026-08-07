@@ -542,7 +542,9 @@ def freeze_for_review(
                 f"Frozen at {phase_type} phase {phase_number} boundary",
                 allow_empty=True,
             )
-            git_mgr.push()
+            _push_job_ending_state(
+                git_mgr, job_id, freeze_data, "phase-boundary freeze"
+            )
         except Exception as e:
             logger.warning(f"[{job_id}] Git push failed at freeze: {e}")
 
@@ -736,7 +738,7 @@ def _finalize_with_verdict(
                 f"Critic verdict: {verdict_type} for target {target_job_id}",
                 allow_empty=True,
             )
-            git_mgr.push()
+            _push_job_ending_state(git_mgr, job_id, freeze_data, "critic verdict")
         except Exception as e:
             logger.warning(f"[{job_id}] Git push failed at verdict: {e}")
 
@@ -761,6 +763,78 @@ def _finalize_with_verdict(
         },
         freeze_data=freeze_data,
     )
+
+
+# Set on a freeze/completion record when the job-ending push did not land.
+# ABSENT means delivered — nothing ever writes these False, so a reader can
+# treat presence as the signal without worrying about which writer ran.
+DELIVERY_FAILED_KEY = "delivery_failed"
+DELIVERY_ERROR_KEY = "delivery_error"
+
+
+def _push_job_ending_state(
+    git_mgr,
+    job_id: str,
+    record: Optional[dict],
+    label: str,
+) -> bool:
+    """Push at a job-ending boundary, and record it loudly when it fails.
+
+    ``GitManager.push()`` returns False on failure and every job-ending caller
+    here used to discard it, so a job whose deliverables never left the pod
+    finished indistinguishable from one that delivered cleanly — reporting
+    success at confidence 1.0 while the pod was reclaimed with the only copy of
+    the work. A parser regression made every push of a whole job fail exactly
+    that way, 26 times, invisibly, for a day
+    (docs/issues/git_push_fails_silently_via_workspace_backend.md).
+
+    The push is deliberately NOT retried: ``push()`` already logs its own
+    reason, and the pod is going away either way. The point is that the failure
+    reaches the freeze record the ORCHESTRATOR stores, so the critic, the
+    deliverable gate and the cockpit can distinguish "the repository is empty
+    because delivery failed" from "the repository is empty because the agent
+    produced nothing" — two states that look identical from outside and call
+    for opposite responses.
+
+    ``push()`` returns False for three different reasons and only one is a lost
+    deliverable, so the other two are screened out first. Marking a job with no
+    remote — a legitimate configuration — as undelivered would be a false alarm
+    on every such run, which is worse than the silence being replaced.
+
+    Like ``_capture_content_tree``, the marker reaches only the returned
+    ``record``, never the on-disk JSON: the file is written and committed
+    before the push whose outcome this is. That is unavoidable and harmless —
+    the orchestrator's copy is the one that outlives the pod.
+
+    Returns:
+        True if the push landed. False for a real failure *and* for the
+        screened-out cases, which are not failures — read ``record`` for the
+        distinction, not this value.
+    """
+    if not (git_mgr and getattr(git_mgr, "is_active", False)):
+        return False
+    try:
+        if not git_mgr.has_remote("origin"):
+            return False
+    except Exception:  # noqa: BLE001 — a probe failure is not a delivery failure
+        return False
+
+    if git_mgr.push():
+        return True
+
+    logger.error(
+        f"[{job_id}] {label}: the final git push did NOT land. The workspace is "
+        f"now the only copy of this job's deliverables, and its pod is about to "
+        f"be reclaimed. The reason is in the git push warning logged just above."
+    )
+    if record is not None:
+        record[DELIVERY_FAILED_KEY] = True
+        record[DELIVERY_ERROR_KEY] = (
+            f"The job-ending git push failed at {label}. Deliverables were not "
+            f"delivered to the job repository, so the repository is empty or "
+            f"stale by failure — not because none were produced."
+        )
+    return False
 
 
 def _capture_content_tree(workspace: "WorkspaceManager") -> Optional[str]:
@@ -973,7 +1047,9 @@ def finalize_job(
                 short_id = job_id[:8]
                 tag_name = f"{short_id}-job-completed-phase-{phase_num}"
                 tag_ok = git_mgr.tag(tag_name, "Job auto-completed (full autonomy)")
-                git_mgr.push()
+                _push_job_ending_state(
+                    git_mgr, job_id, completion_data, "job completion"
+                )
                 if tag_ok:
                     git_mgr.push_ref(f"refs/tags/{tag_name}")
             except Exception as e:
@@ -1045,7 +1121,7 @@ def finalize_job(
             short_id = job_id[:8]
             tag_name = f"{short_id}-job-frozen-phase-{phase_num}"
             tag_ok = git_mgr.tag(tag_name, "Job frozen for human review")
-            git_mgr.push()
+            _push_job_ending_state(git_mgr, job_id, freeze_data, "job freeze")
             if tag_ok:
                 git_mgr.push_ref(f"refs/tags/{tag_name}")
         except Exception as e:

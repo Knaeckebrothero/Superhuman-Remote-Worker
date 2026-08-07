@@ -12,22 +12,40 @@ tags:
 
 **Filed:** 2026-08-01, from the verification live-gate re-run
 (dev job `40efbb39-0890-40fa-a464-6e3d6bd92832`).
-**Status:** The *silence* mechanism this doc names (`_parse_shell_run_output`
-hardcoding `stderr=""`) is FIXED at HEAD (sweep-verified 2026-08-06):
-`22b2511e` (08-02) landed `stderr="" if exit_code == 0 else stdout` in
-git_manager.py — shipped under the sibling investigation
-`deliverable_lost_to_nested_repo_commit_and_stranded_mode_a_job.md`, whose
-commit message independently reproduces this doc's exact symptom; never
-cross-linked here until now. STILL OPEN: this doc's own motivating incident —
-job `40efbb39`'s underlying push failure — was never re-diagnosed (its
-timestamps likely PREdate the CWD-banner regression that `22b2511e` targets),
-so Fix direction #3 ("re-run and capture the real push error") stands.
+**Status:** Cause **FIXED**; consequence-handling **FIXED 2026-08-07**.
+
+- **The silence** (`_parse_shell_run_output` hardcoding `stderr=""`) — FIXED by
+  `22b2511e` (08-02), which landed `stderr="" if exit_code == 0 else stdout`.
+  Shipped under the sibling investigation
+  `deliverable_lost_to_nested_repo_commit_and_stranded_mode_a_job.md`, whose
+  commit message independently reproduces this doc's exact symptom.
+- **The push failure itself** — FIXED by the same commit, and it *is* this
+  doc's incident. `f41970ae` added a `CWD: <path>` line to `shell_run`'s
+  output; the parser assumed the payload marker was the first line after
+  `Exit code:` and otherwise returned the whole banner as `stdout`. `push()`
+  does `branch = result.stdout.strip()`, so it pushed
+  `"CWD: /home/agent-host/workspace\n--- stdout ---\nmain"` as a refspec —
+  `fatal: invalid refspec`, every time.
+- **A failed push was still not treated as a failure** — FIXED 2026-08-07; see
+  "Fix" below.
+
+> **Correction (2026-08-07) to the 2026-08-06 sweep entry.** The sweep recorded
+> that job `40efbb39`'s failure *"likely PREdates the CWD-banner regression"*,
+> leaving fix direction #3 ("re-run and capture the real push error") standing.
+> That is a timezone slip, and it is worth naming because it made a solved
+> incident look open. `f41970ae` was committed `2026-08-01 12:41:31 **+0200**`
+> = **10:41:31 UTC**. The job's log timestamps are UTC (`…Z`): it started 11:26
+> and its first push failed 11:27:13 — **45 minutes after** the regression
+> landed, on the image built from that very commit (`sha-f41970a`, verified as
+> the deployed `AGENT_IMAGE` at the time). Same cause. Fix direction #3 is
+> discharged; nothing needs re-diagnosing.
+
 **Severity:** **high** — total, silent loss of a job's deliverables, with the
 job reporting success. Everything downstream that reads the repo (critic,
 cockpit, deliverable gate, cloud export, any re-clone) sees an empty
 repository.
-**Component:** `src/managers/git_manager.py:1219` (`_parse_shell_run_output`),
-`src/managers/git_manager.py:813` (`push`).
+**Component:** `src/managers/git_manager.py` (`_parse_shell_run_output`,
+`push`), `src/core/phase.py` (completion-time push handling).
 
 ## What happened
 
@@ -123,6 +141,58 @@ job that pushed cleanly — until a reader opens the repo and finds it empty.
    existed at first push.
 
 Fix 1 before 3 — without it the next occurrence is equally mute.
+
+## Fix (shipped)
+
+**1 — shipped `22b2511e` (08-02).** `_parse_shell_run_output` now locates the
+payload marker instead of assuming its position, and mirrors output into
+`stderr` on a non-zero exit. Same commit fixed the cause it was hiding (the
+`CWD:` banner read as a branch name) and made branch detection fall back to
+`main` on an *empty* result, not only a non-zero exit.
+
+**3 — discharged, not owed.** The real push error is known:
+`fatal: invalid refspec`, from pushing the banner as a branch. See the
+timezone correction in the status block — this doc's incident is the same one
+`22b2511e` reproduced, not an earlier separate failure.
+
+**2 — shipped 2026-08-07.** `_push_job_ending_state` in `src/core/phase.py`
+replaces the bare `git_mgr.push()` at all four job-ending sites
+(`freeze_for_review`, `_finalize_with_verdict`, and both `finalize_job`
+branches). On a failed push it logs at **ERROR** and sets `delivery_failed` /
+`delivery_error` on the freeze record the orchestrator persists, so a reader
+can tell an empty repository *by failure* from one the agent never filled.
+
+Three deliberate choices:
+
+- **It does not retry.** `push()` already logged its reason and the pod is
+  being reclaimed either way; a retry would add latency to a job that is
+  ending, not recover the work.
+- **It does not touch `confidence`.** Confidence is the agent's assessment of
+  the *work*, which a delivery failure says nothing about. Downgrading it would
+  corrupt an honest signal to carry an unrelated one.
+- **It screens out the two non-failures first.** `push()` returns False for
+  "git inactive", "no remote configured", and "the push failed" alike. Marking
+  a remote-less job — a legitimate configuration — as undelivered would be a
+  false alarm on every such run, which is worse than the silence it replaces.
+  `test_no_remote_is_not_a_delivery_failure` pins this.
+
+Like `content_tree`, the marker reaches only the record the orchestrator
+stores, never the on-disk `job_frozen.json`: that file is written and committed
+*before* the push whose outcome it would describe. Unavoidable, and harmless —
+the orchestrator's copy is the one that outlives the pod.
+
+`_complete_phase_with_git` (the per-phase boundary) is deliberately untouched:
+a mid-job phase push that fails is recoverable, since the next boundary or the
+job-ending push carries the same commits. Only the endings are terminal.
+
+Tests: `tests/test_phase_delivery_failure.py`. Mutation-checked — disabling the
+recording fails the three positive tests, so they are load-bearing rather than
+satisfied by the surrounding code.
+
+**Still not done:** surfacing `delivery_failed` beyond the freeze record — into
+the job's `error_message`, the cockpit, and the deliverable gate, which is what
+fix direction 2 asked for "at minimum". The agent side now reports it; nothing
+downstream reads it yet.
 
 ## Related
 
