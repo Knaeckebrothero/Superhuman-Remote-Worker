@@ -516,6 +516,7 @@ def _ensure_persistent_loop_started(
             on_error=_loop_on_error,
             check_interrupt=_loop_check_interrupt,
             on_workspace_upgrade_needed=_loop_on_workspace_upgrade_needed,
+            on_workspace_commit=_loop_on_workspace_commit,
             on_context_compacted=_loop_on_context_compacted,
             persist_message=_loop_persist_message,
             archive_llm_call=_loop_archive_llm_call,
@@ -5298,6 +5299,20 @@ async def _notify_cloud_stage() -> None:
         logger.debug(f"cloud-stage ping failed (non-fatal): {e}")
 
 
+async def _loop_on_workspace_commit(sha: str) -> None:
+    """Record a workspace commit against the current transcript position.
+
+    Best-effort: a miss only degrades rewind code-restore granularity for
+    this turn (the resolver falls back to the previous mapped commit).
+    """
+    if _session is None or _session.postgres_conn is None or _thread_id is None:
+        return
+    try:
+        await _session.postgres_conn.record_turn_commit(_thread_id, sha)
+    except Exception:
+        logger.warning("record_turn_commit failed (non-fatal)", exc_info=True)
+
+
 async def _loop_on_turn_complete(turn_id: int, metrics: Optional[dict] = None) -> None:
     global _turn_event_open
     # This is the transcript terminal edge. Clear before any awaited cleanup so
@@ -6308,9 +6323,12 @@ async def _handle_compact(ws: WebSocket, focus: str = "") -> None:
             if git_mgr and git_mgr.is_active:
                 try:
                     if git_mgr.has_uncommitted_changes():
-                        git_mgr.commit(
+                        if git_mgr.commit(
                             f"Compaction checkpoint ({before_count} → {after_count} msgs)"
-                        )
+                        ):
+                            sha = git_mgr.get_current_commit()
+                            if sha:
+                                await _loop_on_workspace_commit(sha)
                     git_mgr.push()
                 except Exception as e:
                     logger.debug(f"Git push on compaction failed (non-fatal): {e}")

@@ -524,6 +524,12 @@ class PersistentLoopCallbacks:
         Callable[[Dict[str, Any]], Awaitable[None]]
     ] = None
 
+    # Awaited with the new HEAD SHA after every successful workspace commit
+    # (per-turn auto-commit + compaction checkpoint). Feeds the
+    # thread_turn_commits map that session rewind's code-restore resolves
+    # against. Optional: worker-job transports don't wire it.
+    on_workspace_commit: Optional[Callable[[str], Awaitable[None]]] = None
+
     # Deprecated alias for on_workspace_upgrade_needed (the original sudo→VM
     # name). Kept so older constructors / tests keep working; reconciled into
     # on_workspace_upgrade_needed by __post_init__.
@@ -1017,6 +1023,18 @@ async def run_persistent_loop(
                                 logger.warning(
                                     f"Turn {turn_id}: workspace auto-commit failed"
                                 )
+                            elif callbacks.on_workspace_commit:
+                                sha = git_mgr.get_current_commit()
+                                if sha:
+                                    try:
+                                        await callbacks.on_workspace_commit(sha)
+                                    except Exception:
+                                        logger.warning(
+                                            f"Turn {turn_id}: turn-commit mapping "
+                                            "failed (rewind code-restore loses this "
+                                            "granularity point)",
+                                            exc_info=True,
+                                        )
                     except Exception:
                         logger.warning(
                             f"Turn {turn_id}: workspace auto-commit raised",
@@ -1522,9 +1540,24 @@ async def _execute_turn(
                 if git_mgr and git_mgr.is_active:
                     try:
                         if git_mgr.has_uncommitted_changes():
-                            git_mgr.commit(
-                                f"Auto-compaction checkpoint ({pre_compact_len} → {len(messages)} msgs)"
-                            )
+                            if (
+                                git_mgr.commit(
+                                    f"Auto-compaction checkpoint ({pre_compact_len} → {len(messages)} msgs)"
+                                )
+                                and callbacks.on_workspace_commit
+                            ):
+                                sha = git_mgr.get_current_commit()
+                                if sha:
+                                    try:
+                                        await callbacks.on_workspace_commit(sha)
+                                    except Exception:
+                                        logger.warning(
+                                            "Auto-compaction checkpoint: "
+                                            "turn-commit mapping failed (rewind "
+                                            "code-restore loses this granularity "
+                                            "point)",
+                                            exc_info=True,
+                                        )
                         git_mgr.push()
                     except Exception as e:
                         logger.debug(
