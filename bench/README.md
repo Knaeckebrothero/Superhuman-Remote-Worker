@@ -107,3 +107,33 @@ absent from v1 — they change as the repo changes, which breaks pinning.
   (`docs/issues/bench_infra_exclusion_misses_midflight_outages.md`) — scan
   per-job request timelines for ≫retry-ceiling gaps before trusting a
   failed row.
+
+## Operating notes (from `p4-floor-trim-01` + `s4m2-rerun-01`, 2026-08-07)
+
+- **Two-arm runs:** `submit.py --server` builds a single arm only. For A/Bs,
+  build the spec yourself (tasks from `tasks.yaml`, `arms: [{name, model,
+  config_override}, ...]`) and POST `/api/bench/runs` directly. The sweeper
+  schedules arms adjacent within each replicate's shuffled wave — that
+  adjacency is what neutralizes time-varying confounds (pool growth,
+  contention), so never split arms across runs or clusters.
+- **Running on k3d:** mint the test id_token per the auth memo (admin-cli
+  password grant, use `id_token` not `access_token`); `POST /api/projects`
+  requires `user_id` in the body. Give memory-sensitive experiments a
+  `project_id` in the spec — without a shared project the pool stays empty
+  and memory-related treatments measure nothing.
+- **`max_in_flight` can be raised mid-run** via
+  `jsonb_set(spec,'{max_in_flight}', ...)` on the run row — the sweeper
+  re-reads the spec every tick. It is an operational knob, not a pin; note
+  the change in the analysis (contention shifts absolute walls). Observed:
+  effective concurrency lands ~1 below the setting (dispatch cooldowns +
+  pair staggering), so mif 2→4 bought ~1.5×, not 2×.
+- **Cross-cluster wall poisoning:** concurrent bench runs on k3d and dev
+  share the same LLM server — each inflates the other's walls (~2× per-req
+  latency observed). Within-run A/Bs survive (symmetric); single-arm runs
+  meant for wall comparison must not overlap another run. Token/request
+  metrics are contention-immune.
+- **Stuck-watch calibration:** D-family tasks legitimately exceed 3.5 h
+  under contention; triage stuck alerts by iteration cadence in agent logs
+  (advancing ≈30–60 s/turn = grinding, not wedged) before intervening. A
+  bench job struggling on its task is *data*; only infra wedges get
+  rescued/excluded.
