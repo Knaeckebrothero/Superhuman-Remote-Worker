@@ -108,6 +108,14 @@ const SSE_WATCHDOG_TIMEOUT_MS = 45000;
 // (replay-from-cursor) which re-delivers the durable turn boundary.
 const INTERRUPT_ACK_TIMEOUT_MS = 8000;
 
+// A rewind's direct-to-socket ack can legitimately take a while: the backend
+// waits up to 60s server-side for an in-flight turn to interrupt before it
+// can even start the sweep, then does git work (checkpoint restore). Give it
+// noticeably more room than a plain interrupt before assuming the ack was
+// lost (e.g. a WS drop/reconnect between send and ack) and un-wedging the
+// rewindInFlight-gated UI client-side.
+const REWIND_ACK_TIMEOUT_MS = 90_000;
+
 // After a send is accepted (POST 200, or 409 turn_in_flight — a duplicate that
 // still streams), the reply must begin arriving over SSE. If no SSE *data*
 // frame lands within this window the receive path is presumed dead (zombie
@@ -807,6 +815,16 @@ export class PersistentChatService {
     // an interrupt POST (lost ack frame). Armed in interrupt(), cleared by the
     // isInterrupting invariant effect.
     private interruptFallbackTimer: ReturnType<typeof setTimeout> | null = null;
+    // One-shot fallback: force-clear rewindInFlight if rewind.ack (direct to
+    // the initiator's socket only) never arrives. Armed in rewind(), cleared
+    // by rewind.ack / rewind.files_restored / a request_id-matching error,
+    // and on connect()/disconnect() teardown (see REWIND_ACK_TIMEOUT_MS).
+    private rewindAckFallbackTimer: ReturnType<typeof setTimeout> | null = null;
+    // request_id of the rewind currently in flight, so the generic 'error'
+    // case can clear rewindInFlight only for a matching rewind — an
+    // unrelated in-flight error (e.g. a concurrent config.update denial)
+    // must not prematurely re-enable the rewind UI.
+    private pendingRewindRequestId: string | null = null;
     // One-shot send-liveness kickstart: force a reopen if a send is accepted
     // but no SSE data frame follows (see SEND_KICKSTART_TIMEOUT_MS). Armed in
     // _postInput, cleared in disconnect().
@@ -937,6 +955,10 @@ export class PersistentChatService {
             this.cloudSessionUrl.set(null);
             this.tasks.set([]);
             this.undoAvailable.set(false);
+            this.rewindInFlight.set(false);
+            this.rewindPrefill.set(null);
+            this.pendingRewindRequestId = null;
+            this._clearRewindAckFallback();
             this.isSessionPaused.set(false);
             this.runningTool.set(null);
             this.citationsByCid.set(new Map());
@@ -2246,6 +2268,10 @@ export class PersistentChatService {
         this.endedAt.set(null);
         this.tasks.set([]);
         this.undoAvailable.set(false);
+        this.rewindInFlight.set(false);
+        this.rewindPrefill.set(null);
+        this.pendingRewindRequestId = null;
+        this._clearRewindAckFallback();
         this.isSessionPaused.set(false);
         this._protectedCloud.set(false);
         this.cloudChangesCount.set(0);
@@ -2941,6 +2967,8 @@ export class PersistentChatService {
     rewind(messageId: string, mode: 'both' | 'conversation' | 'code'): string {
         const requestId = crypto.randomUUID();
         this.rewindInFlight.set(true);
+        this.pendingRewindRequestId = requestId;
+        this._armRewindAckFallback();
         this._sendControl({
             method: 'rewind',
             message_id: messageId,
@@ -2957,6 +2985,32 @@ export class PersistentChatService {
             focus: '',
             boundary_message_id: messageId,
         });
+    }
+
+    /** Arm the one-shot stuck-"Rewinding…" fallback (see rewind() and
+     *  REWIND_ACK_TIMEOUT_MS). Mirrors _armInterruptFallback. */
+    private _armRewindAckFallback(): void {
+        this._clearRewindAckFallback();
+        this.rewindAckFallbackTimer = setTimeout(() => {
+            this.rewindAckFallbackTimer = null;
+            if (this.rewindInFlight()) {
+                console.warn(
+                    '[persistent-chat] rewind.ack not seen within ' +
+                    `${REWIND_ACK_TIMEOUT_MS}ms — clearing rewindInFlight`
+                );
+                this.rewindInFlight.set(false);
+                this.pendingRewindRequestId = null;
+            }
+        }, REWIND_ACK_TIMEOUT_MS);
+    }
+
+    /** Cancel the stuck-"Rewinding…" fallback timer if armed. Mirrors
+     *  _clearInterruptFallback. */
+    private _clearRewindAckFallback(): void {
+        if (this.rewindAckFallbackTimer) {
+            clearTimeout(this.rewindAckFallbackTimer);
+            this.rewindAckFallbackTimer = null;
+        }
     }
 
     /** Upgrade a lite (virtual) session to a real workspace tier.
@@ -3676,6 +3730,8 @@ export class PersistentChatService {
                 break;
 
             case 'rewind.ack': {
+                this._clearRewindAckFallback();
+                this.pendingRewindRequestId = null;
                 this.rewindInFlight.set(false);
                 const prompt = params['prompt'] as string | undefined;
                 if (prompt) this.rewindPrefill.set(prompt);
@@ -3694,6 +3750,8 @@ export class PersistentChatService {
             }
 
             case 'rewind.files_restored': {
+                this._clearRewindAckFallback();
+                this.pendingRewindRequestId = null;
                 this.rewindInFlight.set(false);
                 this._systemMessage('Workspace files restored to the selected point.');
                 break;
@@ -3741,7 +3799,17 @@ export class PersistentChatService {
             }
 
             case 'error': {
-                this.rewindInFlight.set(false);
+                // Only clear rewindInFlight for the rewind that raised this
+                // error — the backend echoes request_id on every rewind
+                // error, so an unrelated in-flight error (e.g. a concurrent
+                // config.update denial) can't prematurely re-enable the UI
+                // while the real rewind is still pending.
+                const errorRequestId = params['request_id'] as string | undefined;
+                if (errorRequestId && errorRequestId === this.pendingRewindRequestId) {
+                    this._clearRewindAckFallback();
+                    this.pendingRewindRequestId = null;
+                    this.rewindInFlight.set(false);
+                }
                 // P0.3: config.update denials carry the orchestrator's detail
                 // (e.g. the capability-grant reason) — show it, not just the
                 // generic headline.
