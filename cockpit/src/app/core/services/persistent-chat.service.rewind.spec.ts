@@ -132,6 +132,78 @@ describe('PersistentChatService rewind', () => {
 });
 
 /**
+ * Fix 6 (final review): rewind must never ride _sendControl's
+ * queue-and-replay fallback. Other control verbs are fine to queue while the
+ * socket reconnects, but a queued rewind could fire against a session the
+ * user resumed much later for an unrelated reason — destructive verbs must
+ * be sent now or refused, never deferred.
+ */
+describe('PersistentChatService — rewind refuses to queue when the control WS is down', () => {
+    it('controlWs = null: no frame queued on controlOutbox, flag stays false, error is set', () => {
+        const {service} = createService();
+        service.threadId.set('thread-rw');
+        (service as any).controlWs = null;
+
+        const requestId = service.rewind('row-1', 'conversation');
+
+        expect(requestId).toBeTruthy();
+        expect((service as any).controlOutbox).toEqual([]);
+        expect(service.rewindInFlight()).toBe(false);
+        expect(service.error()).toBe(
+            'Session connection is down — reconnect before rewinding',
+        );
+    });
+
+    it('controlWs present but not OPEN (e.g. CONNECTING): same refusal, no queueing', () => {
+        const {service} = createService();
+        service.threadId.set('thread-rw');
+        const connecting = createMockWs();
+        connecting.readyState = WebSocket.CONNECTING;
+        (service as any).controlWs = connecting;
+
+        service.rewind('row-1', 'both');
+
+        expect(connecting.send).not.toHaveBeenCalled();
+        expect((service as any).controlOutbox).toEqual([]);
+        expect(service.rewindInFlight()).toBe(false);
+        expect(service.error()).toBe(
+            'Session connection is down — reconnect before rewinding',
+        );
+    });
+
+    it('does not arm the ack-fallback timer on refusal (nothing to disarm later)', async () => {
+        vi.useFakeTimers();
+        try {
+            const {service} = createService();
+            service.threadId.set('thread-rw');
+            (service as any).controlWs = null;
+
+            service.rewind('row-1', 'conversation');
+
+            const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+            await vi.advanceTimersByTimeAsync(90_001);
+            expect(warnSpy).not.toHaveBeenCalled();
+            warnSpy.mockRestore();
+        } finally {
+            vi.useRealTimers();
+        }
+    });
+
+    it('a normal open-socket rewind is unaffected: still sends and flags in-flight', () => {
+        const {service} = createService();
+        const live = createMockWs();
+        service.threadId.set('thread-rw');
+        (service as any).controlWs = live;
+
+        service.rewind('row-1', 'conversation');
+
+        expect(live.send).toHaveBeenCalledTimes(1);
+        expect(service.rewindInFlight()).toBe(true);
+        expect(service.error()).toBeNull();
+    });
+});
+
+/**
  * Fix round 1 (review finding): rewindInFlight used to be set only in
  * rewind() and cleared only by rewind.ack / rewind.files_restored / a
  * blanket 'error' — but the ack is WS-direct to the originating socket

@@ -1742,9 +1742,14 @@ describe('PersistentChatService — gone_beyond_horizon recovery', () => {
 
         // Re-anchored to the reported tail rather than dropped — this is what
         // stops the replay-from-0 that re-renders loaded turns as a duplicate
-        // "live" copy (the SESSION RESUMED double-render).
+        // "live" copy (the SESSION RESUMED double-render). deleteThreadCursor
+        // IS called once, ahead of the reload (Fix 2: an unconditional
+        // clear-cache-before-reload step — see the "clears the message cache"
+        // test below) — but setThreadCursor's re-anchor runs after it and
+        // wins, so the cursor still ends up pinned to the reported tail, not
+        // dropped.
         expect(ctx.mockCache.setThreadCursor).toHaveBeenCalledWith('thread-g', 2, 7);
-        expect(ctx.mockCache.deleteThreadCursor).not.toHaveBeenCalled();
+        expect(stored).toEqual({epoch: 2, seq: 7, threadId: 'thread-g', updatedAt: ''});
         expect(firstSse.close).toHaveBeenCalled();
 
         // History was reloaded — an additional GET /messages after the initial.
@@ -1806,6 +1811,37 @@ describe('PersistentChatService — gone_beyond_horizon recovery', () => {
         await new Promise((r) => setTimeout(r, 0));
 
         expect(ctx.service.threadStatus()).toBe('active');
+    });
+
+    it('clears the message cache before reloading history (Fix 2)', async () => {
+        // A missed rewind.done (client offline/reconnecting when it fired)
+        // otherwise leaves swept rows sitting in IndexedDB forever — the next
+        // gone_beyond_horizon repaint is the self-heal, but only if it clears
+        // the append-only cache before merging in the freshly loaded history.
+        const ctx = createService({cursor: {epoch: 1, seq: 5, threadId: 'thread-clear', updatedAt: ''} as any});
+        const order: string[] = [];
+        ctx.mockCache.clearThreadMessages.mockImplementation(async (tid: string) => {
+            if (tid === 'thread-clear') order.push('clear');
+        });
+        ctx.mockHttp.get.mockImplementation((url: string) => {
+            if (String(url).endsWith('/persistent/threads/thread-clear/messages')) {
+                order.push('history-get');
+            }
+            return of({status: 'active', total_turns: 0, messages: [], total: 0});
+        });
+        await ctx.service.connect('thread-clear');
+        const firstSse = ctx.sseInstances[0];
+        fireSseOpen(firstSse);
+        order.length = 0; // only care about ordering from here on
+
+        fireSseNamedEvent(firstSse, 'gone_beyond_horizon', {
+            method: 'gone_beyond_horizon',
+            params: {epoch: 2, server_seq: 7, reason: 'epoch_mismatch'},
+        }, '2:7');
+        await new Promise((r) => setTimeout(r, 0));
+
+        expect(ctx.mockCache.clearThreadMessages).toHaveBeenCalledWith('thread-clear');
+        expect(order).toEqual(['clear', 'history-get']);
     });
 });
 
