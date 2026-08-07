@@ -132,29 +132,43 @@ symptom persists; the stated cause no longer applies as written. Treat the
 2026-07-10 and 2026-07-20 updates as history, not as a pickup point.
 
 What is measured under Nextcloud (2026-08-07, all five threads carrying a session
-handle):
+handle), cross-checked against whether each session ever called a file-writing tool
+(`write_file` / `edit_file` / `create_directory`, counted from `llm_requests`):
 
-| Thread | Status | Synced entries | Newest |
-|---|---|---|---|
-| `5833c729` | active | 48, incl. `output/expose_…md` (27 KB) + `feedback.md` | 08-06 12:32 |
-| `c90f83b7` | active | 44, incl. `documents/external/` | 08-06 11:59 |
-| `4ad107ad` | **active** | **0** | — |
-| `00ae0977` | ended | **0** | — |
-| `1930dec9` | ended | 22, but *all placed by a manual restore* | 08-06 11:34 |
+| Thread | Turns | File writes | Synced entries | Verdict |
+|---|---|---|---|---|
+| `5833c729` | 16 | yes | 48, incl. `output/expose_…md` (27 KB) | correct |
+| `c90f83b7` | 2 | yes | 44, incl. `documents/external/` | correct |
+| `4ad107ad` | 7 | **0** | 0 | correct — nothing to sync |
+| `00ae0977` | 2 | **0** | 0 | correct — nothing to sync |
+| `1930dec9` | 12 | **11 files** | 22, *all from a manual restore* | **broken** |
 
-Two corrections this forces on the framing above:
+This forces two corrections on the framing above — and one on an earlier draft of
+this very section, which claimed the failure was widespread and the discriminator
+unknown. It is neither.
 
-1. **"Deliverables in `output/` never reach the cloud" is now too strong.**
-   `5833c729` has a 27 KB `output/` deliverable sitting in its session folder. The
-   workspace→session-folder path works for some sessions.
-2. **The failure is inconsistent, and the discriminator is unknown.** `4ad107ad` is
-   *active* with zero synced entries; `5833c729` is *active* and syncing fine. It is
-   not simply ended-vs-active, and it is not simply "the orphan is never a sync
-   target" — for two threads it plainly is one.
+1. **"Deliverables in `output/` never reach the cloud" is too strong.** `5833c729`
+   has a 27 KB `output/` deliverable in its session folder. The
+   workspace→session-folder path works.
+2. **An empty folder is not evidence of a defect.** Two of the three empty folders
+   belong to sessions that never wrote a file. Always check the write count before
+   calling an empty folder broken.
 
-So the open question is no longer "why does the session folder never receive
-anything" (the 07-10/07-20 framing) but **"what makes it receive content for some
-sessions and not others under Nextcloud"**. Start there.
+So the open question is not "why does the session folder never receive anything"
+(the 07-10/07-20 framing), nor "why is it inconsistent across sessions". It is the
+much narrower: **why did `1930dec9` alone fail to sync?** What rules out the easy
+answers:
+
+- Not pre-cutover-ness. `5833c729` was also created 08-01 under OpenCloud and syncs.
+- Not "never ran after its folder existed". The folder appeared 08-03 20:53; the
+  thread ran turns on 08-04 08:34–08:37 and wrote five files in them. None synced.
+
+Best remaining hypothesis, **unconfirmed**: `5833c729` was re-attached repeatedly
+through 08-06, rebuilding its sync config against the Nextcloud target, while
+`1930dec9`'s last attach predates the cutover. The 08-04 turns argue against the
+simple form of that, so start by pulling the `cloud_sync` payload each thread was
+attached with (`_build_agent_cloud_sync` → `persistent_app.py:_attach_from_cfg`)
+rather than by re-reading the mechanism sections above.
 
 Separately, the *reachability* half of this ticket is now fixed and is out of scope
 here: the Files button no longer disappears on an asleep session (`8da4b27c`), and
