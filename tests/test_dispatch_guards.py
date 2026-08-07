@@ -41,9 +41,9 @@ class TestResumeLaneApplies:
 
     def test_non_paused_statuses_never_resume(self):
         for status in ("created", "failed", "processing", "", None):
-            assert not resume_lane_applies(
-                {"status": status}, has_checkpoint=True
-            ), status
+            assert not resume_lane_applies({"status": status}, has_checkpoint=True), (
+                status
+            )
 
 
 class TestPreemptionBlockedReason:
