@@ -1412,6 +1412,126 @@ class TestTriggerVerificationContentTreeWiring:
         assert update_mock.call_args.kwargs["status"] == "completed"
 
 
+class TestUndeliveredCompletionSkipsTheCritic:
+    """A completion whose job-ending push failed must not spawn a critic.
+
+    The agent marks the freeze ``delivery_failed`` when the final push does not
+    land (src/core/phase.py, _push_job_ending_state). The deliverables then
+    exist only on a pod about to be reclaimed, and the job repository is empty
+    or stale — so a critic would clone that repo, correctly observe the
+    deliverable missing, and return the job for work that EXISTS but was never
+    delivered. On dev job `40efbb39` that misdiagnosis cost a 105-minute
+    livelock and a verdict describing an infrastructure fault as a work fault
+    (docs/issues/git_push_fails_silently_via_workspace_backend.md).
+
+    Escalating instead is both cheaper and more accurate, and routing it
+    through ``_escalate_target`` puts the real reason in ``error_message``
+    where an operator and the cockpit can see it — with the loop-job status
+    rule already handled there.
+    """
+
+    @staticmethod
+    def _undelivered(job):
+        job["freeze_data"]["delivery_failed"] = True
+        job["freeze_data"]["delivery_error"] = (
+            "The job-ending git push failed at job completion."
+        )
+        return job
+
+    @pytest.mark.asyncio
+    async def test_undelivered_completion_escalates_instead_of_spawning(
+        self, monkeypatch
+    ):
+        import orchestrator.main as main_module
+        from orchestrator.main import _trigger_verification_on_complete
+
+        update_mock = AsyncMock()
+        create_mock = AsyncMock(return_value={"id": "critic-999"})
+        monkeypatch.setattr(main_module.postgres_db, "update_job_status", update_mock)
+        monkeypatch.setattr(main_module.postgres_db, "create_job", create_mock)
+
+        # No prior rounds: the gate would otherwise say "spawn", so an escalation
+        # here can only come from the delivery check.
+        job = self._undelivered(
+            _make_completion_job(freeze_content_tree="aaa", verification_rounds=[])
+        )
+        actions: list[str] = []
+
+        await _trigger_verification_on_complete(
+            job, {"error": None, "should_stop": True}, actions
+        )
+
+        create_mock.assert_not_awaited()
+        update_mock.assert_awaited_once()
+        assert update_mock.call_args.kwargs["status"] == "pending_review"
+        reason = update_mock.call_args.kwargs["error_message"].lower()
+        assert "deliver" in reason or "push" in reason
+        assert any("escalated" in a for a in actions)
+
+    @pytest.mark.asyncio
+    async def test_delivered_completion_still_spawns(self, monkeypatch):
+        """Contrast: proves the check reads the flag rather than always firing."""
+        import orchestrator.main as main_module
+        from orchestrator.main import _trigger_verification_on_complete
+
+        update_mock = AsyncMock()
+        monkeypatch.setattr(main_module.postgres_db, "update_job_status", update_mock)
+        monkeypatch.setattr(
+            main_module.postgres_db,
+            "create_job",
+            AsyncMock(return_value={"id": "critic-999"}),
+        )
+        monkeypatch.setattr(main_module, "_trigger_dispatch", lambda: None)
+        monkeypatch.setattr(
+            main_module.postgres_db,
+            "has_live_verification_critic",
+            AsyncMock(return_value=False),
+        )
+        monkeypatch.setattr(
+            main_module,
+            "_revalidate_job_datasource_selection",
+            AsyncMock(return_value=([], {})),
+        )
+
+        job = _make_completion_job(freeze_content_tree="aaa", verification_rounds=[])
+        actions: list[str] = []
+
+        await _trigger_verification_on_complete(
+            job, {"error": None, "should_stop": True}, actions
+        )
+
+        update_mock.assert_not_awaited()
+        assert any("critic job" in a and "created" in a for a in actions)
+
+    @pytest.mark.asyncio
+    async def test_undelivered_loop_job_escalates_to_completed(self, monkeypatch):
+        """The loop-job status rule must hold on this path too, or the loop wedges."""
+        import orchestrator.main as main_module
+        from orchestrator.main import _trigger_verification_on_complete
+
+        update_mock = AsyncMock()
+        monkeypatch.setattr(main_module.postgres_db, "update_job_status", update_mock)
+        monkeypatch.setattr(
+            main_module.postgres_db,
+            "create_job",
+            AsyncMock(return_value={"id": "critic-999"}),
+        )
+
+        job = self._undelivered(
+            _make_completion_job(
+                freeze_content_tree="aaa", verification_rounds=[], is_loop=True
+            )
+        )
+        actions: list[str] = []
+
+        await _trigger_verification_on_complete(
+            job, {"error": None, "should_stop": True}, actions
+        )
+
+        update_mock.assert_awaited_once()
+        assert update_mock.call_args.kwargs["status"] == "completed"
+
+
 class TestNoDuplicateCriticSpawn:
     """``complete_job`` deliberately accepts entry statuses
     processing/reviewing/pending_review/completed, so a retried ``/complete``

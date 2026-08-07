@@ -189,10 +189,33 @@ Tests: `tests/test_phase_delivery_failure.py`. Mutation-checked — disabling th
 recording fails the three positive tests, so they are load-bearing rather than
 satisfied by the surrounding code.
 
-**Still not done:** surfacing `delivery_failed` beyond the freeze record — into
-the job's `error_message`, the cockpit, and the deliverable gate, which is what
-fix direction 2 asked for "at minimum". The agent side now reports it; nothing
-downstream reads it yet.
+**Propagation — shipped 2026-08-07.** `_trigger_verification_on_complete`
+(`orchestrator/main.py`) now escalates instead of spawning a critic when the
+completion freeze carries `delivery_failed`. Nothing was delivered, so there is
+nothing to review: a critic would clone the empty repository, correctly observe
+the deliverable missing, and return the job for work that exists but was never
+delivered — the exact misdiagnosis that cost job `40efbb39` a 105-minute critic
+livelock (`rejected_verdict_livelocks_critic_and_wedges_parent.md`).
+
+The check sits **before** `_verification_gate_decision`, deliberately: that gate
+compares `content_tree`, which here describes a tree that was never pushed, so
+its no-progress reasoning is meaningless on this input and its round-cap
+escalation would report the wrong reason even when it fires.
+
+Routing through `_escalate_target` also discharges the rest of fix direction 2
+without new surface: it already writes the reason to the job's `error_message`
+— which is what the cockpit displays — and already applies the loop-job status
+rule (`completed`, never `pending_review`, or the loop's advance hook wedges).
+
+Tests: `tests/test_verification_flow.py::TestUndeliveredCompletionSkipsTheCritic`,
+including the contrast case that a *delivered* completion still spawns (so the
+check reads the flag rather than always firing) and the loop-job status case.
+Mutation-checked.
+
+**Still not done:** the **deliverable gate** does not read `delivery_failed`, so
+it can still fail a job for missing deliverables that exist but were not
+delivered. It is a separate surface and, unlike the verification trigger, does
+not have the freeze record in hand — its own slice, not a line.
 
 ## Related
 
