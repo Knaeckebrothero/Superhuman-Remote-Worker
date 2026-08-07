@@ -98,6 +98,42 @@ async def test_rewind_endpoint_rejects_live_agent(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_rewind_endpoint_allows_ended_thread_with_stale_agent_id(monkeypatch):
+    """mark_orphaned_threads_ended / agent_update_thread_status's ended branch
+
+    both leave ``agent_id`` populated on real ended threads — only a LIVE
+    binding (status not suspended/ended) justifies the 409.
+    """
+    from orchestrator import main as orch_main
+
+    async def _fake_owner(request, db, thread_id):
+        return (
+            {"id": "user-1"},
+            {"id": thread_id, "agent_id": "agent-9", "status": "ended"},
+        )
+
+    monkeypatch.setattr(orch_main, "require_thread_owner", _fake_owner)
+    fake_db = MagicMock()
+    fake_db.get_live_thread_message = AsyncMock(
+        return_value={"seq": 8, "role": "human", "content": "the prompt"}
+    )
+    fake_db.apply_thread_rewind = AsyncMock(
+        return_value={"rewind_id": "r1", "swept": 3, "surviving_turn": 1}
+    )
+    monkeypatch.setattr(orch_main, "postgres_db", fake_db)
+
+    out = await orch_main.rewind_thread_detached(
+        "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        MagicMock(),
+        orch_main.ThreadRewindRequest(message_id="m1", mode="conversation"),
+    )
+    assert out == {"rewind_id": "r1", "swept": 3, "prompt": "the prompt"}
+    fake_db.apply_thread_rewind.assert_awaited_once_with(
+        "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", from_seq=8, actor="user-1"
+    )
+
+
+@pytest.mark.asyncio
 async def test_rewind_endpoint_rejects_code_mode(monkeypatch):
     from orchestrator import main as orch_main
 
