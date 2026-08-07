@@ -176,7 +176,7 @@ class TestRecordVerificationRound:
     @pytest.mark.asyncio
     async def test_rejections_below_cap_do_not_escalate(self, fake_db, monkeypatch):
         """Two invalid submissions: plain 409s, no escalation, empty ledger.
-        docs/issues/rejected_verdict_livelocks_critic_and_wedges_parent.md
+        docs/done/rejected_verdict_livelocks_critic_and_wedges_parent.md
         """
         import orchestrator.main as main_module
 
@@ -1422,7 +1422,7 @@ class TestUndeliveredCompletionSkipsTheCritic:
     deliverable missing, and return the job for work that EXISTS but was never
     delivered. On dev job `40efbb39` that misdiagnosis cost a 105-minute
     livelock and a verdict describing an infrastructure fault as a work fault
-    (docs/issues/git_push_fails_silently_via_workspace_backend.md).
+    (docs/done/git_push_fails_silently_via_workspace_backend.md).
 
     Escalating instead is both cheaper and more accurate, and routing it
     through ``_escalate_target`` puts the real reason in ``error_message``

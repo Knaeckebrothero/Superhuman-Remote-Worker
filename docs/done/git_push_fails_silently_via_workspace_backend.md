@@ -251,7 +251,7 @@ class is now reported rather than misattributed, which was the point.
 
 - `docs/issues/verification_fail_closed_followups.md` — the live gate that
   surfaced this.
-- `docs/issues/resumed_job_inherits_subjob_git_branch.md` — the other way a
+- `docs/done/resumed_job_inherits_subjob_git_branch.md` — the other way a
   job's committed work becomes invisible to every reader. Same blast radius,
   different mechanism: there the push succeeded to an unread ref, here the push
   never happened at all.

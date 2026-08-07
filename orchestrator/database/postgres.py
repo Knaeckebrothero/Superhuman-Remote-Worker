@@ -2919,7 +2919,7 @@ class PostgresDB:
         the counter. A fresh critic is spawned every round, so the per-critic
         count naturally resets each round. Returns the new count, or 0 if the
         job was not found / id was invalid.
-        docs/issues/rejected_verdict_livelocks_critic_and_wedges_parent.md
+        docs/done/rejected_verdict_livelocks_critic_and_wedges_parent.md
         """
         try:
             uuid_val = UUID(job_id)
@@ -5786,7 +5786,7 @@ class PostgresDB:
     # iterations over 105 minutes in the field case). Requires a live critic
     # (EXISTS mirrors the other arm's NOT EXISTS, keeping the two disjoint)
     # and a distinct message, per fix direction 2 of
-    # docs/issues/rejected_verdict_livelocks_critic_and_wedges_parent.md.
+    # docs/done/rejected_verdict_livelocks_critic_and_wedges_parent.md.
     # No ledger check here: a recorded verdict flips the parent out of
     # 'reviewing' promptly, and any wedge that keeps it 'reviewing' for the
     # whole generous ceiling deserves escalation regardless.

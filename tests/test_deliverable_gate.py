@@ -293,7 +293,7 @@ class TestEvaluate:
         perfectly readable, it is just empty, which is why the four existing
         skip cases do not catch it.
 
-        docs/issues/git_push_fails_silently_via_workspace_backend.md
+        docs/done/git_push_fails_silently_via_workspace_backend.md
         """
         job = make_job(
             manifest=["output/a.md"],

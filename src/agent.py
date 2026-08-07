@@ -205,7 +205,7 @@ def ensure_job_branch(
     ``get_workspace_file``, and any later re-clone) still reads ``main`` and
     correctly reports the work missing.
 
-    See docs/issues/resumed_job_inherits_subjob_git_branch.md — job
+    See docs/done/resumed_job_inherits_subjob_git_branch.md — job
     6df02f64, where a ``## Sources`` append was committed and pushed to
     ``subjob/50dee4ae/critic`` and was never visible on ``main``.
 

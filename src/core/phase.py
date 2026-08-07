@@ -786,7 +786,7 @@ def _push_job_ending_state(
     success at confidence 1.0 while the pod was reclaimed with the only copy of
     the work. A parser regression made every push of a whole job fail exactly
     that way, 26 times, invisibly, for a day
-    (docs/issues/git_push_fails_silently_via_workspace_backend.md).
+    (docs/done/git_push_fails_silently_via_workspace_backend.md).
 
     The push is deliberately NOT retried: ``push()`` already logs its own
     reason, and the pod is going away either way. The point is that the failure

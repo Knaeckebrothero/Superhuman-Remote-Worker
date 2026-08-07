@@ -234,7 +234,7 @@ def test_unstick_no_longer_requires_all_children_failed():
 
 class TestUnstickReviewingParentsWallclock:
     """The wall-clock arm — fix direction 2 of
-    docs/issues/rejected_verdict_livelocks_critic_and_wedges_parent.md.
+    docs/done/rejected_verdict_livelocks_critic_and_wedges_parent.md.
     """
 
     @pytest.mark.asyncio
