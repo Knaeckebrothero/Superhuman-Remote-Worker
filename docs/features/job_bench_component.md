@@ -23,16 +23,20 @@ aliases:
 > **pinned task set × replicates × arms**, executed and reported entirely
 > server-side.
 
-**Status:** v1 SHIPPED and field-proven, 2026-08-06. First live run
-(`baseline-02`, run `885008dc`, 30 pairs) validated §5 acceptance: unattended
-completion through an orchestrator rollout *and* a 3-hour WAN outage (§5.1),
-server-computed latency-based strategic share (§5.2), infra-exclusion
-exercised for real (§5.4), k3d create→sweep→report smoke (§5.5). Still open:
-§5.3 two-arm run (next: the P-4 floor-trim A/B). Field findings + operating
-notes: `docs/issues/phase_model_overhead_amnesia_loop.md` §13,
-`bench/README.md` "Operating notes", and the three bench issue docs
-(sweeper multi-replica race — fix required before the next unattended run —
-infra-exclusion gap, resume-lane brief starvation).
+**Status:** v1 SHIPPED, field-proven, **all §5 acceptance criteria closed
+2026-08-07**. First live run (`baseline-02`, run `885008dc`, 30 pairs)
+validated §5.1 (unattended through an orchestrator rollout *and* a 3-hour
+WAN outage), §5.2 (server-computed latency-based strategic share), §5.4
+(infra-exclusion exercised for real), §5.5 (k3d smoke). §5.3 closed by the
+**P-4 floor-trim A/B** (k3d run `e2721227`, 36 jobs, two arms via
+`config_override`, per-arm report grouping) — verdict in
+`docs/issues/phase_model_overhead_amnesia_loop.md` §14; same day the
+sweeper race lock survived its first unattended dev run (2 replicas,
+`37c36e6e`, zero twins). Field findings + operating notes: strategy doc
+§13/§14, `bench/README.md` "Operating notes". v1.1 candidates observed in
+the field: mid-flight-outage classification (`max_request_gap_minutes`),
+a `max_in_flight` update endpoint (raised via direct `jsonb_set` mid-run
+2026-08-07 — worked, sweeper re-reads per tick, but deserves API surface).
 
 Originally: Design, 2026-08-04. Motivated by two field failures of the
 laptop runner in one night (machine shutdown, no home network): the runner
