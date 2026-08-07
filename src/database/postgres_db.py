@@ -399,6 +399,7 @@ class PostgresDB:
             FROM thread_messages
             WHERE thread_id = $1
               AND role NOT IN ('summary', 'error')
+              AND rewound_at IS NULL
         """
         params: List[Any] = [thread_id]
         if seq_gt is not None:
@@ -466,6 +467,7 @@ class PostgresDB:
             FROM thread_messages
             WHERE thread_id = $1
               AND role = 'summary'
+              AND rewound_at IS NULL
             ORDER BY turn_number DESC NULLS LAST, created_at DESC
             LIMIT 1
         """
@@ -500,11 +502,151 @@ class PostgresDB:
         ``boundary_seq`` unset and falls back to ``boundary_turn``.
         """
         row = await self.fetchrow(
-            "SELECT seq FROM thread_messages WHERE thread_id = $1 AND id = $2",
+            "SELECT seq FROM thread_messages "
+            "WHERE thread_id = $1 AND id = $2 AND rewound_at IS NULL",
             thread_id,
             _coerce_row_id(msg_id),
         )
         return row["seq"] if row else None
+
+    async def get_live_message(
+        self, thread_id: str, msg_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """Resolve a message id to its live row (seq/role/content).
+
+        The rewind target lookup: returns ``None`` for unknown ids AND for
+        rows already tombstoned by an earlier rewind — a rewound-away message
+        is not a valid rewind target.
+        """
+        row = await self.fetchrow(
+            "SELECT seq, role, content FROM thread_messages "
+            "WHERE thread_id = $1 AND id = $2 AND rewound_at IS NULL",
+            thread_id,
+            _coerce_row_id(msg_id),
+        )
+        if row is None:
+            return None
+        return {"seq": row["seq"], "role": row["role"], "content": row["content"]}
+
+    async def apply_rewind(
+        self,
+        thread_id: str,
+        from_seq: int,
+        mode: str,
+        actor: Optional[str] = None,
+        abandoned_sha: Optional[str] = None,
+        restored_to_sha: Optional[str] = None,
+        restore_commit_sha: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Tombstone the tail at ``seq >= from_seq`` and ledger the rewind.
+
+        One transaction: the sweep (skipped for mode='code' — files-only
+        rewinds leave the transcript untouched), the ``thread_rewinds``
+        ledger insert, and the surviving-turn readback the caller uses to
+        reset ``turn_count``. Idempotent re-run sweeps 0 rows (the
+        ``rewound_at IS NULL`` guard) but does append a second ledger row —
+        callers serialize (session loop / advisory lock).
+        """
+        if mode not in ("both", "conversation", "code"):
+            raise ValueError(f"invalid rewind mode: {mode}")
+        swept = 0
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                if mode in ("both", "conversation"):
+                    swept = await conn.fetchval(
+                        """
+                        WITH swept AS (
+                            UPDATE thread_messages
+                            SET rewound_at = now()
+                            WHERE thread_id = $1
+                              AND seq >= $2
+                              AND rewound_at IS NULL
+                            RETURNING 1
+                        )
+                        SELECT COUNT(*) FROM swept
+                        """,
+                        thread_id,
+                        from_seq,
+                    )
+                row = await conn.fetchrow(
+                    """
+                    INSERT INTO thread_rewinds
+                        (thread_id, from_seq, mode, actor, swept_count,
+                         abandoned_sha, restored_to_sha, restore_commit_sha)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                    RETURNING id
+                    """,
+                    thread_id,
+                    from_seq,
+                    mode,
+                    actor,
+                    swept or 0,
+                    abandoned_sha,
+                    restored_to_sha,
+                    restore_commit_sha,
+                )
+                surviving_turn = await conn.fetchval(
+                    """
+                    SELECT COALESCE(MAX(turn_number), 0)
+                    FROM thread_messages
+                    WHERE thread_id = $1
+                      AND rewound_at IS NULL
+                      AND role NOT IN ('summary', 'error')
+                    """,
+                    thread_id,
+                )
+        return {
+            "rewind_id": str(row["id"]),
+            "swept": int(swept or 0),
+            "surviving_turn": int(surviving_turn or 0),
+        }
+
+    async def record_turn_commit(self, thread_id: str, commit_sha: str) -> None:
+        """Map the workspace commit that just landed to the transcript position.
+
+        seq = MAX(seq) over the thread's rows at commit time (0 before the
+        first message — the pre-conversation workspace state, a valid restore
+        target for a rewind to the very first message). Two commits at the
+        same transcript position (e.g. a compaction checkpoint right after a
+        turn commit) collapse to the later SHA — the newest workspace state
+        for that position is the correct restore target.
+        """
+        async with self.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO thread_turn_commits (thread_id, seq, commit_sha)
+                SELECT $1,
+                       COALESCE(MAX(seq), 0),
+                       $2
+                FROM thread_messages
+                WHERE thread_id = $1
+                ON CONFLICT (thread_id, seq) DO UPDATE
+                    SET commit_sha = EXCLUDED.commit_sha,
+                        created_at = now()
+                """,
+                thread_id,
+                commit_sha,
+            )
+
+    async def resolve_restore_commit(
+        self, thread_id: str, before_seq: int
+    ) -> Optional[str]:
+        """Workspace SHA for 'state before the message at before_seq'.
+
+        The newest mapped commit strictly below the target: the workspace as
+        it stood after every turn that survives the rewind. ``None`` = no
+        coverage (thread predates the feature) — code restore unavailable.
+        """
+        return await self.fetchval(
+            """
+            SELECT commit_sha FROM thread_turn_commits
+            WHERE thread_id = $1 AND seq < $2
+            ORDER BY seq DESC
+            LIMIT 1
+            """,
+            thread_id,
+            before_seq,
+        )
 
     async def save_thread_message(
         self,
