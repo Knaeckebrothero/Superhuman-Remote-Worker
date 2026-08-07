@@ -44,10 +44,13 @@ llm:
 
 workspace:
   structure:
+    # No tools/ here: the whole prefix is a virtual directory served from the
+    # live tool registry (docs/features/virtual_directories.md). Listing it
+    # made initialize() create an empty real directory that nothing ever wrote
+    # to — dead scaffolding the virtual-dirs live gate flagged.
     - archive/
     - output/
     - reference/
-    - tools/
   instructions_template: instructions.md
   initial_files: {}
   max_read_words: 25000

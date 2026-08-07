@@ -43,9 +43,9 @@ PASSED, evidenced by the job's audit trail plus direct `kubectl exec` inspection
 
 **Tool-layer boundary confirmed directly:** the workspace pod's real `/home/agent-host/workspace` contains `.srw_seeded`, `README.md`, `plan.md`, `my_tools_copy.md`, `archive/`, `knowledge/`, `output/`, `reference/`, `skills/`, `.git/` — and **no** `instructions.md`, **no** `task_brief.md`, **no** `contacts/`. Stronger evidence than the planned `run_command("ls")` check, which could not run (`worker_base` ships `tools.shell: []`).
 
-**Not exercised, still owed:** the tier-upgrade path (virtual→sandbox mid-job); the cloud-sync scenario (session-only — MCP has no session chat-send, so it needs a human-driven Cockpit session with contacts linked and sync on); the same-pod resume and git-less-resume scenarios; and the `VIRTUAL_DIRS_ENABLED=false` rollback smoke.
+**Not exercised, still owed:** the tier-upgrade path (virtual→sandbox mid-job); the cloud-sync scenario (session-only — MCP has no session chat-send, so it needs a human-driven Cockpit session with contacts linked and sync on); and the same-pod resume and git-less-resume scenarios. (The `VIRTUAL_DIRS_ENABLED=false` rollback smoke is no longer owed — the flag was removed 2026-08-07; see "No kill switch".)
 
-**Gate finding (minor):** `config/worker_base.yaml:50` still lists `tools/` in the workspace `structure`, so `initialize()` creates an empty real `tools/` directory that nothing writes to. Harmless — the overlay owns the whole prefix and the boot sweep correctly leaves it alone (no generated marker) — but it is dead scaffolding and should be dropped from `structure`.
+**Gate finding (minor) — FIXED 2026-08-07:** `config/worker_base.yaml` listed `tools/` in the workspace `structure`, so `initialize()` created an empty real `tools/` directory that nothing wrote to. Harmless — the overlay owns the whole prefix and the boot sweep correctly left it alone (no generated marker) — but it was dead scaffolding. Dropped from `structure`.
 
 ## Motivation
 
@@ -208,7 +208,33 @@ Migration number = next free at implementation time (`0076` is contacts, renumbe
 | Sentinel probe on a virtual path | Probes read `.srw_seeded` through `unwrap_backend`, never a virtual path; a fresh pod still reads as unseeded, and a seeded one still reads as seeded |
 | Real leftover collides with a prefix | Shadowed by design; `tools/` converged by the boot sweep, `instructions.md`/`task_brief.md` left in place |
 | **Workspace-tier swap mid-run** (virtual → sandbox, container → VM) | `WorkspaceManager.swap_backend()` rebinds the overlay onto the new backend, keeping every registered provider. Assigning `_backend` directly leaves the overlay wrapping the disconnected old backend and 404s every virtual path — including the deferred-tool docs — with no way to repair it by re-registering |
-| `VIRTUAL_DIRS_ENABLED=false` | Overlay not installed. The two **single-file** providers (`instructions.md`, `task_brief.md`) are materialized as real files at boot and registered as agent seed files, so the switch is a genuine rollback: `src/graph.py` composes the job's first `HumanMessage` from both, and without this the agent starts never having been told its task. **Directory** providers are *not* materialized — `tools/` deferred docs degrade to short descriptions and `contacts/` is simply absent (resurrecting that write path is what this feature removed). Slice 2 paths fall back to real files with DB rows ignored. Emergency switch, not a supported mode |
+| `VIRTUAL_DIRS_ENABLED` | **Removed 2026-08-07.** The variable is inert; the overlay is unconditional. See "No kill switch" below |
+| Overlay serves nothing (provider raises, registration missed, rebind lost) | `src/graph.py` **raises** at `init_strategic_todos` when `task_brief.md` and `instructions.md` both resolve empty. An agent that was never told its task refuses to start instead of running blind |
+
+### No kill switch
+
+The overlay had an escape hatch, `VIRTUAL_DIRS_ENABLED`. Its "off" position
+materialized `instructions.md` and `task_brief.md` into the workspace root — and
+on any subjob that inherits its parent's workspace (every verification critic,
+every scholar), that dropped the critic's brief into the root the **target**
+reads from, convincing the target it was the reviewer
+(`docs/done/critic_brief_lands_in_shared_workspace_and_misleads_target.md`,
+severity high).
+
+A lever whose "off" position reintroduces a high-severity defect is not a
+rollback. It was also insurance against a failure that stayed unguarded on the
+primary path: if the overlay itself failed with the flag *on*, the agent booted
+taskless just the same, and the only signal was one WARNING line.
+
+So the flag, `materialize_single_file_providers`, and the disabled-path branch
+in `_deploy_instruction_files` were deleted, and the guarantee the flag stood in
+for was moved to where it covers every cause: `src/graph.py` refuses to start a
+job with no task description. Rollback is now a redeploy, and the failure mode
+is loud rather than silent-and-confident.
+
+`WorkspaceManager` rejects a `None` backend at construction and never reassigns
+`_virtual_overlay`, so `virtual_overlay is None` is unreachable; the guards that
+handled it are gone too.
 
 ## Testing
 
@@ -217,7 +243,7 @@ Migration number = next free at implementation time (`0076` is contacts, renumbe
 - **InstructionsProvider:** upload/inline beats template; template renders with `has_tool()` conditionals; **sentinel probes see `inner`** — a wiped workspace with a virtual `task_brief.md` still classifies as unseeded (the regression that would reopen the unseeded-workspace bug), *and* a seeded-then-resumed workspace still classifies as seeded (the mirror regression: no writer left ⇒ every resume rewinds). A tripwire test pins the production probe call sites, not just the helper, on both legs.
 - **Cloud sync:** a registered virtual provider's files never appear in the sync walk — the walk is proven against the real backend, so `SYNC_IGNORE_PATTERNS` is not what stands between contacts and the user's cloud folder.
 - **Backend swap:** after a tier upgrade, a provider registered before the swap still serves, and `overlay.inner is` the new backend.
-- **Kill switch:** with `VIRTUAL_DIRS_ENABLED=false`, `instructions.md` and `task_brief.md` exist as real files and `src/graph.py`'s first message is non-empty.
+- **No kill switch (2026-08-07):** `VIRTUAL_DIRS_ENABLED=false` is inert — the overlay is still installed (`test_virtual_dirs_enabled_is_inert`); the instruction files are served and never written, on the real backend or as seed files (`TestInstructionFilesAreNeverWritten`); a manager without an overlay is unconstructible (`test_every_manager_has_an_overlay`); and a taskless boot raises rather than warns, including on whitespace-only content (`TestInitStrategicTodosNode::test_taskless_boot_raises`, `::test_whitespace_only_brief_is_still_taskless`). `instructions.md` absent while `task_brief.md` has content stays a normal boot — the optional channel must not become fatal.
 - **ContactsProvider:** rendering matches the contacts format + README index; deterministic slug collisions; one fetch per TTL window; stale-serve and no-cache-error paths; empty-project case.
 - **Slice 2:** write-through round-trip (agent write → DB row → orchestrator read); `PlanManager` unchanged and still passing; phase snapshot captures virtual `plan.md` into `archive/`; orchestrator display path reads DB with **no workspace pod running**; mtime reconciliation both directions (newer ingested, older discarded, file deleted); write-failure surfaces a retryable tool error; checkpoint restore writes through the provider.
 - **Boot sweeps:** marker → deleted; no marker → preserved + logged; errors non-fatal.
@@ -252,3 +278,4 @@ Skills migration (scripts are shell-executed and need real files) · shell visib
 - **2026-07-30:** A workspace-tier swap must go through `WorkspaceManager.swap_backend()`; assigning `_backend` directly disconnects the overlay and 404s every virtual path for the rest of the run. (Final-review fix wave.)
 - **2026-07-30:** `VIRTUAL_DIRS_ENABLED=false` materializes `instructions.md` + `task_brief.md` as real files. An emergency lever whose failure mode is "the agent is never told its task" is not a rollback. Directory providers stay unmaterialized — that write path is what this feature deleted. (Final-review fix wave.)
 - **2026-07-30:** The spec's "delete real `instructions.md`/`task_brief.md` copies unconditionally at boot" sweep is **withdrawn**, not deferred: it would delete a legacy workspace's only proof of seeding. (Final-review fix wave.)
+- **2026-08-07:** `VIRTUAL_DIRS_ENABLED` **removed**, reversing the 2026-07-30 entry above. Materializing the two instruction files was meant to keep the lever from being an outage, but on a subjob that inherits its parent's workspace it wrote the critic's brief into the root the target reads from — reopening a high-severity defect (`docs/done/critic_brief_lands_in_shared_workspace_and_misleads_target.md`) every time the lever was pulled. It was also insurance against a failure that stayed unguarded with the flag *on*: an overlay that serves nothing boots the agent taskless either way. The guarantee moved to `src/graph.py`, which now raises when both briefs resolve empty — covering every cause instead of one — and the flag, `materialize_single_file_providers`, and the disabled-path branch were deleted. Rollback is a redeploy. (User.)

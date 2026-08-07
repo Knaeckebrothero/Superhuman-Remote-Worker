@@ -302,21 +302,28 @@ class WorkspaceManager:
         # Virtual directories: wrap the real backend so registered prefixes
         # (tools/, contacts/, instructions.md) are served from live state.
         # See docs/features/virtual_directories.md.
-        self._virtual_overlay: Optional["VirtualOverlayBackend"] = None
-        if backend is not None and os.getenv(
-            "VIRTUAL_DIRS_ENABLED", "true"
-        ).lower() not in ("false", "0", "no"):
-            try:
-                from .backends.overlay import VirtualOverlayBackend
-            except ImportError:
-                # Loaded directly (tests use spec_from_file_location to bypass
-                # package __init__ side effects), so there is no parent package.
-                from src.core.backends.overlay import VirtualOverlayBackend
+        # Unconditional, and there is no opt-out. `backend is None` already
+        # raised above and nothing reassigns `_virtual_overlay` afterwards
+        # (`swap_backend` rebinds it in place), so every manager has an overlay
+        # for its whole life.
+        #
+        # This was gated on VIRTUAL_DIRS_ENABLED until 2026-08-07. The flag's
+        # "off" position materialized instructions.md / task_brief.md into the
+        # workspace root, which on a subjob sharing its parent's workspace put
+        # the critic's brief where the TARGET reads it — see
+        # docs/done/critic_brief_lands_in_shared_workspace_and_misleads_target.md.
+        # It guarded against an agent booting with no task; src/graph.py now
+        # guarantees that directly by refusing to start when both briefs resolve
+        # empty, which covers every cause rather than this one.
+        try:
+            from .backends.overlay import VirtualOverlayBackend
+        except ImportError:
+            # Loaded directly (tests use spec_from_file_location to bypass
+            # package __init__ side effects), so there is no parent package.
+            from src.core.backends.overlay import VirtualOverlayBackend
 
-            self._virtual_overlay = VirtualOverlayBackend(backend)
-            self._backend = self._virtual_overlay
-        else:
-            self._backend = backend
+        self._virtual_overlay: "VirtualOverlayBackend" = VirtualOverlayBackend(backend)
+        self._backend = self._virtual_overlay
 
         # Git manager (created during initialize if git_versioning enabled)
         self._git_manager: Optional["GitManager"] = None
@@ -334,17 +341,17 @@ class WorkspaceManager:
 
     @property
     def virtual_overlay(self):
-        """The virtual overlay, or None when VIRTUAL_DIRS_ENABLED is off."""
+        """The virtual overlay. Always present — see the constructor."""
         return self._virtual_overlay
 
     def register_virtual_provider(self, provider) -> None:
-        """Register a virtual directory provider. No-op when disabled."""
-        if self._virtual_overlay is None:
-            logger.debug(
-                "VIRTUAL_DIRS_ENABLED is off — ignoring provider %s",
-                getattr(provider, "prefix", "?"),
-            )
-            return
+        """Register a virtual directory provider.
+
+        Always registers: there is no flag that turns the overlay off, and a
+        manager cannot exist without one. The guard this used to carry made a
+        dropped provider silent, which is the wrong failure for a path that
+        serves the agent its own instructions.
+        """
         self._virtual_overlay.register(provider)
 
     def swap_backend(self, new_backend: "WorkspaceBackend") -> None:
@@ -378,11 +385,8 @@ class WorkspaceManager:
             from src.core.backends.overlay import unwrap_backend
 
         new_backend = unwrap_backend(new_backend)
-        if self._virtual_overlay is not None:
-            self._virtual_overlay.rebind(new_backend)
-            self._backend = self._virtual_overlay
-        else:
-            self._backend = new_backend
+        self._virtual_overlay.rebind(new_backend)
+        self._backend = self._virtual_overlay
 
     @property
     def path(self) -> Path:

@@ -2759,8 +2759,9 @@ class _SwappableWM:
 
     @property
     def virtual_overlay(self):
-        # Virtual dirs are irrelevant to this test double; behave like the
-        # real WorkspaceManager does when VIRTUAL_DIRS_ENABLED is off.
+        # Virtual dirs are irrelevant to this test double. The real
+        # WorkspaceManager always has an overlay now, but nothing on the path
+        # under test reads this — it exists only to satisfy attribute access.
         return None
 
     def register_virtual_provider(self, provider):
