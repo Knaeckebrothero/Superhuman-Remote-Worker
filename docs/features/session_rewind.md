@@ -31,9 +31,10 @@ sessions: let the user pick a message they sent earlier, revert the session to t
 point, and re-drive from there with a different prompt. The model is Claude Code's
 `/rewind`.
 
-> **Status (2026-08-07): DECIDED — design approved, implementation next.**
-> The design call happened 2026-08-07 (owner-driven brainstorm); the result is the
-> [Decided design](#decided-design-2026-08-07) section below. The concept capture,
+> **Status (2026-08-07): IMPLEMENTED on develop — dev live gate pending.**
+> Implementation complete across all tasks (Tasks 1–9 merged develop; Task 10 docs
+> + live-gate checklist below). The design call happened 2026-08-07; the result is
+> the [Decided design](#decided-design-2026-08-07) section below. The concept capture,
 > prior art, and design space are kept beneath it as the record.
 >
 > **The 2026-07-15 parking was un-parked by owner decision, with both sequenced
@@ -122,6 +123,8 @@ rehydration falls back to them (or an older surviving summary). A summary writte
 attached agent's in-memory list no longer contains X — truncate-in-place is
 impossible and that case falls back to rehydrate-from-transcript (accepting the
 fidelity cost on the rare deep rewind; shallow rewinds keep full fidelity).
+Deep rewinds that cannot rehydrate the live context error out instead of acking
+(the sweep stays durable; reattach heals).
 
 **`seq` stays server-side:** the cockpit sends the message row id it already has
 (`UserTurn.id`); the server resolves it via `get_seq_for_message_id`
@@ -132,9 +135,11 @@ fidelity cost on the rare deep rewind; shallow rewinds keep full fidelity).
 Sibling of `undo`/`interrupt` (`src/api/persistent_app.py:3169`/`:3072`), payload
 `{message_id, mode}`, owner-only, serialized by the session loop:
 
-1. **Hard-interrupt** any in-flight turn (existing tri-state machinery,
+1. **Resolve and validate the target** via `get_live_message` — resolve `message_id → seq`;
+   reject unknown, tombstoned, or non-human messages without mutating the in-flight turn.
+   (A pure validation error must not kill an in-flight turn — owner decision, 2026-08-07.)
+2. **Hard-interrupt** any in-flight turn (existing tri-state machinery,
    `persistent_app.py:190–215`); drain the pending input queue.
-2. Resolve `message_id → seq`.
 3. **Code before conversation** — git is the fallible op, so it gates: if `mode`
    includes code, run the workspace restore; on failure abort with the error —
    nothing tombstoned, workspace left at a harmless snapshot commit.
@@ -155,6 +160,9 @@ ledger + epoch bump, orchestrator-side; next attach rehydrates from the filtered
 transcript. **Code modes are rejected when detached** ("resume the session to
 restore files") — no agent holds the workspace, and released workspaces may have
 no filesystem at all. v1 carries no deferred-restore state machine.
+The detached REST endpoint 409s only on a LIVE agent binding (`agent_id` set AND
+status not in suspended/ended) — stale bindings on ended threads do not block
+detached rewind.
 
 ### Workspace restore — always forward, never `reset --hard`
 
@@ -216,6 +224,28 @@ server interrupts first.
   snapshot commit exists, push stays fast-forward, degraded matrix.
 - **Live gate on dev** before calling it shipped: real session, rewind
   mid-conversation, Gitea history stays linear, other-viewer repaint observed.
+
+## Live gate checklist (dev)
+
+Run against a real dev session before calling this shipped:
+
+1. Sandbox session, ≥4 turns with file edits → rewind (both) to turn 2:
+   transcript truncates, composer prefills, files revert, Gitea history is
+   LINEAR (snapshot + restore commits, no force-push), turn_count resumes at 2.
+2. Second browser tab on the same thread repaints (no stale tail from
+   IndexedDB) after the rewind.
+3. Rewind mid-stream: the in-flight turn interrupts first.
+4. Deep rewind: force a compaction (/compact), then rewind past the boundary
+   → rehydrate path, summary row superseded, no dangling banner.
+5. Detached: end the session → POST /api/agents/threads/{id}/rewind
+   (conversation) → 200; re-open the thread → truncated history; code mode →
+   400; live thread → 409.
+6. Lite session: code buttons answer with the no-version-history error;
+   conversation rewind works.
+7. Summarize up to here: banner appears, earlier turns fold into the summary,
+   the chosen message and everything after stay verbatim.
+8. asyncpg smoke: watch orchestrator + agent logs for PREPARE errors on the
+   new statements during 1-7.
 
 ### Read-path filter checklist (plan-time)
 
