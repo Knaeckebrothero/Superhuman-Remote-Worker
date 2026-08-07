@@ -1039,3 +1039,103 @@ Run closed 2026-08-06 ~00:3xZ: 33 ledger entries, 28/30 pairs completed,
 1 outage failure, 1 bug casualty, 3 cancelled twins. Next per strategy-doc
 protocol: a P-4 floor-trim two-arm A/B against this baseline, and re-run
 S4/M2 replicates once the resume-lane fix lands.
+
+### §13-addendum — S4/M2 re-replicates (2026-08-07, dev run `37c36e6e`)
+
+3 fresh replicates each, single baseline arm, identical pins, **no project**
+(pool-less parity with b1/b2). Caveats: image = `sha-571ba85` (b2's reforms
+*plus* the three 08-06 fix batches), and **walls are not comparable** — the
+run shared the LLM with the concurrently running k3d P-4 A/B (per-request
+latency ≈2×), so only token/request metrics are read.
+
+- **S4 — reliability answered, and the n=1 caveat resolved.** 3/3 completed
+  (b2's 1/3 was outage + resume-bug infra, both fixed). Honest post-reform
+  medians: med_in **33.0k** [29.7..34.0] (b1 34.6), requests **52** [47..66]
+  (b2-r3: 69), input total **1.58M** [1.35..2.16] (b2-r3: 2.18M),
+  strat_tok **57.3%** [49.3..65.3]. b2-r3's 39.2% was a lucky draw — the
+  real post-reform S4 ceremony share is ≈57%, a modest −6pts vs b1's 63.3,
+  not the dramatic drop n=1 suggested. Cost clearly down vs the b2 sample.
+- **M2 — the watch item stands, now better characterized.** Distribution is
+  persistently two-moded: light runs (52 req / 1.76M, like b2 r2/r3) vs
+  heavy runs (95 req / 4.1–4.2M; b2 r1 was 115/5.10M). 2 of 3 fresh
+  replicates were heavy. Heavy mode pairs with LOW strategic share
+  (22.9%/24.2%) — it is **tactical elaboration, not transition ceremony**:
+  the reform removed the ritual (strat share median 57.3 vs b1 64.6) but
+  M2's open-ended deliverable ("write a runbook") sometimes invites a long
+  tactical build-out. Verdict needs the owed transcript skim of a heavy run
+  (what fills the ~40 extra tactical requests), not more replicates.
+
+## 14. P-4 floor-trim two-arm A/B (2026-08-07, k3d run `e2721227`) — VERDICT: ADOPT
+
+First two-arm bench run (closes Job Bench §5.3). Design: 9 tasks (R1
+dropped as the designated noise source) × 2 replicates × arms **baseline**
+(defaults) vs **floor-trim** (`memory.budget_tokens 10000→4000`,
+`max_memories_per_injection 150→50`), gemma-4-moe, autonomy full, both arms
+sharing one fresh project so the memory pool is real and grows (F4's
+production shape; pool reached 251+ memories by mid-run — baseline arm
+measured injecting ~9.7k tok/turn vs trim's ~3.6k at saturation, the
+treatment live both ways in agent logs). The sweeper's arm-adjacent
+scheduling neutralizes the pool-growth confound by construction. Ran on
+local k3d (arm-vs-arm is internally controlled; walls not comparable to
+dev baselines).
+
+**Headline: 18/18 vs 18/18 completed — perfect deliverable parity — at
+−20.7% input tokens per job** (4.59M → 3.64M). Robustness cuts strengthen
+it: **replicate-2-only (steady-state pool) −28.7%**; M2-excluded −26.4%;
+both −28.1%. Total requests 1948 → 1608 (−17.5%): the trim produces
+**fewer turns, not just cheaper turns** — less injected memory scaffolding
+means less flail, most visibly D1 (requests −39%, wall −45% with
+non-overlapping ranges [200.6..237.8] vs [118.1..122.1]) and S3 (requests
+−32%, wall −49%, strategic share UP 45% because tactical grinding
+collapsed).
+
+Per-task medians (n=2/2 per cell; wall annotations below):
+
+| task | wall b→f (min) | med_in b→f (k) | req b→f | strat_tok% b→f |
+|---|---|---|---|---|
+| A1 | 21 → **15.7** | 33.4 → **29.1** | 54 → **42** | 73.1 → 66.5 |
+| D1 | 219.2 → **120.1*** | 50.5 → 47 | 308 → **188** | 29 → 27.8 |
+| D2 | 189.9 → 161.8 | 48.9 → **44.5** | 250 → **204** | 19.4 → 20.9 |
+| M1 | 43 → 34.4 | 39.2 → 36.6 | 84 → 68 | 48.6 → 64.3 |
+| M2† | 20.9 → 32 | 33.5 → 35.7 | 56 → 89 | 66.8 → 45.7 |
+| S1‡ | 19.6 → 26.1 | 30.1 → 31.3 | 48 → 65 | 64.2 → 52.5 |
+| S2 | 18.5 → 15.7 | 30.1 → 29.1 | 48 → 48 | 75.2 → 69.2 |
+| S3 | 38.2 → **19.6** | 33.6 → 31.9 | 71 → **48** | 48.5 → **70.3** |
+| S4 | 17.9 → 17.5 | 33.3 → 32.4 | 57 → 52 | 66.7 → 59.5 |
+
+\* non-overlapping ranges. † M2's floor-trim r1 was the orphan-pause
+casualty of the kb_reindex incident (walls + requests contaminated), and
+M2 is the known two-moded task — its cell is the run's least trustworthy.
+‡ S1 is the one genuine counter-signal (trim did +37% requests on a small
+task, n=2) — watch, don't over-read. Strategic share moves both directions
+by task and both are the same mechanism: where tactical flail collapsed
+(S3, M1) the strategic share rose; where strategic turns were dominated by
+the injection floor (A1, S1, S2, S4, M2) trimming shrank them and the
+share fell.
+
+Run annotations: M2 r1 pair walls +2–3 min from the orphan-pause incident
+(symmetric); replicate-2 tail ran at `max_in_flight` 4 (raised mid-run,
+operational knob) concurrently with the dev S4/M2 re-replicates ⇒ higher
+LLM contention, absolute walls inflated symmetrically; D1/D2 baseline r2
+crossed 3.5 h under that contention while iterating normally.
+
+**Decision: adopt the trim as the worker default** (`worker_base.yaml`
+`memory.budget_tokens: 4000`, `max_memories_per_injection: 50` — applied
+2026-08-07). At steady-state pools — which is what mature projects look
+like — this is ≈29% of per-job input spend for zero measured quality cost,
+larger than the entire 08-05 reform batch (−21%). Optional follow-ups, not
+gates: a confirming two-arm on dev once convenient; the owed M2 heavy-mode
+transcript skim; S1 re-check at n≥3 in the next canary run. P-3 (pinned-
+tier cap inside the budget) remains open and now guards a 4k block.
+
+**Deliberately NOT flipped: `session_base.yaml` stays at 10000/150.** This
+evidence does not transfer: the A/B measured the worker loop (deliverable-
+gated, autonomous, completion-parity measurable). Session recall failures
+are user-visible ("you forgot what I told you yesterday") and invisible to
+every instrument we have — no session bench, no gates, no parity metric —
+so a session trim would pocket measurable savings while risking
+unmeasurable quality loss. The mechanism (tier-1 saturation) does transfer,
+which is why the prior is that 10k over-provisions sessions too — but the
+safe session levers are P-3 (cap the pinned tier so relevance retrieval
+always keeps budget share: quality up at equal cost) and, if cost pressure
+warrants, a dogfood trim on one account before any default change.
