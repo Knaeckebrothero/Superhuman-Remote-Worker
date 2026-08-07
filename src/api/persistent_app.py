@@ -204,6 +204,10 @@ _loop_interrupt_flag: Optional[str] = None
 _hard_interrupt_event: Optional[asyncio.Event] = None
 _loop_last_user_content: List[str] = [""]
 
+# Serializes rewinds: two concurrent rewind frames on one session would race
+# the sweep/truncate pair. Second caller gets an error, not a queue.
+_rewind_lock: asyncio.Lock = asyncio.Lock()
+
 # The LLM-free draft title written at submit time (_early_title_from_prompt), so
 # the authoritative after-turn pass knows it may overwrite *this* value while
 # still leaving a manual rename untouched. None once no draft is outstanding
@@ -3192,6 +3196,16 @@ async def handle_persistent_websocket(ws: WebSocket) -> None:
                         "error",
                         {"message": "No checkpoints available to undo"},
                     )
+
+            elif method == "rewind":
+                if _session is None:
+                    await _ws_send(
+                        ws,
+                        "error",
+                        {"message": "Session no longer active"},
+                    )
+                    continue
+                asyncio.create_task(_handle_rewind(ws, data), name="handle-rewind")
 
             else:
                 await _ws_send(ws, "error", {"message": f"Unknown method: {method}"})
@@ -6240,6 +6254,189 @@ async def _save_turn_ai_messages(
         await client.save_thread_messages(thread_id, rows)
     except Exception as e:
         logger.warning(f"Failed to save turn messages (non-fatal): {e}")
+
+
+async def _handle_rewind(ws: WebSocket, data: Dict[str, Any]) -> None:
+    """Rewind the session to just before an earlier user message.
+
+    docs/features/session_rewind.md §Flow — attached. Order is load-bearing:
+    interrupt → resolve+validate target → git forward-restore (fallible,
+    gates everything) → DB sweep+ledger → in-memory truncate/rehydrate →
+    events-epoch bump → acks. Bash side effects and non-git sessions degrade
+    exactly like Claude Code: conversation-only.
+    """
+    global _loop_interrupt_flag, _events_epoch, _next_seq
+
+    request_id = data.get("request_id")
+
+    async def _err(message: str) -> None:
+        await _ws_send(ws, "error", {"message": message, "request_id": request_id})
+
+    if _session is None or _session.postgres_conn is None or _thread_id is None:
+        await _err("Session no longer active")
+        return
+    mode = data.get("mode", "conversation")
+    if mode not in ("both", "conversation", "code"):
+        await _err(f"Invalid rewind mode: {mode}")
+        return
+    message_id = data.get("message_id")
+    if not message_id:
+        await _err("rewind requires message_id")
+        return
+
+    if _rewind_lock.locked():
+        await _err("A rewind is already in progress")
+        return
+    async with _rewind_lock:
+        conn = _session.postgres_conn
+
+        # 1. Interrupt any in-flight turn (same policy as the interrupt verb:
+        #    graceful while a tool is mid-invoke, hard otherwise) and wait for
+        #    the loop to park. _turn_event_open is the turn-in-flight signal.
+        if _turn_event_open:
+            _loop_interrupt_flag = "graceful" if _tool_inflight else "hard"
+            if _loop_interrupt_flag == "hard" and _hard_interrupt_event is not None:
+                _hard_interrupt_event.set()
+            deadline = asyncio.get_event_loop().time() + 60.0
+            while _turn_event_open:
+                if asyncio.get_event_loop().time() > deadline:
+                    await _err("Could not interrupt the running turn — try again")
+                    return
+                await asyncio.sleep(0.1)
+
+        # 2. Drain queued inputs: their rows sit past the sweep boundary and
+        #    are about to be tombstoned; processing them post-rewind would
+        #    resurrect the abandoned timeline.
+        if _loop_user_queue is not None:
+            while True:
+                try:
+                    _loop_user_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+
+        # 3. Resolve + validate the target.
+        row = await conn.get_live_message(_thread_id, message_id)
+        if row is None:
+            await _err("Message not found (it may already be rewound)")
+            return
+        if row["role"] != "human":
+            await _err("Rewind targets must be user messages")
+            return
+        from_seq = row["seq"]
+        prompt = row["content"] or ""
+
+        # 4. Workspace forward-restore — fallible, so it gates the sweep.
+        abandoned_sha = None
+        restored_to_sha = None
+        restore_commit_sha = None
+        if mode in ("both", "code"):
+            ws_mgr = _session.workspace_manager
+            git_mgr = getattr(ws_mgr, "git_manager", None) if ws_mgr else None
+            if not (git_mgr and git_mgr.is_active):
+                await _err(
+                    "This session has no version history — file restore is "
+                    "unavailable (conversation-only rewind still works)"
+                )
+                return
+            restored_to_sha = await conn.resolve_restore_commit(_thread_id, from_seq)
+            if not restored_to_sha:
+                await _err(
+                    "No workspace checkpoint exists before this message — "
+                    "file restore is unavailable for this target"
+                )
+                return
+            # Snapshot the abandoned state first: nothing is ever lost in git.
+            if not git_mgr.commit("Rewind: pre-rewind snapshot"):
+                await _err("Could not snapshot the current workspace state")
+                return
+            abandoned_sha = git_mgr.get_current_commit()
+            if not git_mgr.restore_tree(restored_to_sha):
+                await _err(
+                    "Workspace restore failed — files are unchanged (a "
+                    "snapshot commit was kept); conversation was not rewound"
+                )
+                return
+            if not git_mgr.commit(
+                f"Rewind: restore workspace to {restored_to_sha[:12]}"
+            ):
+                await _err("Workspace restore could not be committed")
+                return
+            restore_commit_sha = git_mgr.get_current_commit()
+
+        # 5. Sweep + ledger (one transaction). mode='code' ledgers only.
+        result = await conn.apply_rewind(
+            _thread_id,
+            from_seq=from_seq,
+            mode=mode,
+            actor="ws_client",
+            abandoned_sha=abandoned_sha,
+            restored_to_sha=restored_to_sha,
+            restore_commit_sha=restore_commit_sha,
+        )
+
+        # 6. Fix in-memory state (transcript-changing modes only).
+        # _coerce_row_id maps in-memory `msg_…` ids to the row UUIDs the
+        # frontend sends; restored-prefix messages carry no id (the HF-7
+        # resume diet drops the column) and correctly fall through to the
+        # deep-rewind path.
+        if mode in ("both", "conversation"):
+            from ..database.postgres_db import _coerce_row_id
+
+            target_uuid = str(_coerce_row_id(message_id))
+            cut_index = None
+            for i, m in enumerate(_session.messages):
+                mid = getattr(m, "id", None)
+                if mid and str(_coerce_row_id(mid)) == target_uuid:
+                    cut_index = i
+                    break
+            if cut_index is not None:
+                # Shallow rewind: fidelity-preserving in-place truncate.
+                del _session.messages[cut_index:]
+            else:
+                # Deep rewind (target predates the live compaction boundary,
+                # or the prefix was restored without ids): rebuild from the
+                # now-filtered transcript.
+                _session.messages.clear()
+                await _restore_session_messages()
+            _session.turn_count = result["surviving_turn"]
+            _loop_last_user_content[0] = ""
+
+            # 7. New event generation → every SSE viewer takes the existing
+            #    gone_beyond_horizon repaint against the filtered history.
+            try:
+                _events_epoch = await _resolve_event_journal_epoch(conn, _thread_id)
+                _next_seq = 0
+            except Exception:
+                logger.warning(
+                    "Rewind epoch bump failed — viewers repaint on next attach",
+                    exc_info=True,
+                )
+
+        # 8. Acks: direct to the initiator (no _seq), then the journaled
+        #    all-viewer signal in the NEW epoch.
+        await _ws_send(
+            ws,
+            "rewind.ack",
+            {
+                "request_id": request_id,
+                "message_id": message_id,
+                "mode": mode,
+                "prompt": prompt,
+                "swept": result["swept"],
+                "restored_to_sha": restored_to_sha,
+            },
+        )
+        if mode in ("both", "conversation"):
+            _broadcast("rewind.done", {"message_id": message_id, "mode": mode})
+        else:
+            _broadcast("rewind.files_restored", {"restored_to_sha": restored_to_sha})
+        logger.info(
+            "Rewind applied: thread=%s mode=%s from_seq=%s swept=%s",
+            _thread_id,
+            mode,
+            from_seq,
+            result["swept"],
+        )
 
 
 async def _handle_compact(ws: WebSocket, focus: str = "") -> None:
