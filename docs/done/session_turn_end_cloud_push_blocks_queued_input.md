@@ -187,10 +187,39 @@ this change stashed (in-flight MCP-migration work + known py3.14 env noise).
 This validates the risky webdav3 assumptions the unit fakes can't: subdir
 listing path shapes, string `size` props, collection self-echo.
 
+**Session-level k3d smoke (2026-08-07, thread `ebbbcd03`, lite/virtual tier
+— same as the dev repro; model gemma-4-moe; agent image verified to contain
+the fix before running). All criteria pass:**
+
+- *Queued input starts instantly* (criterion 2): input sent mid-turn queued
+  (`Persistent loop already running`); `turn.completed`(1) 16:45:40.672 →
+  `turn.started`(2) **16:45:40.693 — a 21 ms gap**. Pre-fix that gap was the
+  entire push, which here ran 2m01s (28 files; k3d Nextcloud ≈ 4 s/PUT) —
+  in the background: `Turn 1 complete` 16:45:40, `Synced 28 file(s)`
+  16:47:41. Push→pull ordering held (`pushed` .168 → `pulling` .176).
+- *Steady-state turn-end push*: 3.4 s, zero uploads (`pushing` 16:48:26.982
+  → `pushed` 16:48:30.377, no `Synced` line).
+- *Fresh pod* (criterion 1): pod deleted → graceful teardown (thread
+  `ended`) → resume → new pod's attach pull downloaded **0 files**
+  (reconciled all 28 by size, no `Pulled` line); the next file-touching
+  turn pushed **exactly 1 file** 9 s after `Turn 3 complete`, and the
+  appended line was verified present in Nextcloud. Pre-fix: 28 re-uploads
+  (~2 min here, 3 min on dev) on the turn-close path.
+- *Subdir cloud edit pulled* (criterion 4, end-to-end): a WebDAV PUT of a
+  marker into `output/note_02.md` from outside the session; the next turn
+  logged `Pulled 2 file(s)` and the agent answered the marker verbatim.
+- *Short id* (criterion 5): `GET /api/persistent/threads/ebbbcd03` → 404.
+
+Two benign observations: (a) a pull re-downloads files this same instance
+just pushed — push doesn't record the PUT's new etag, and the size
+reconcile only covers never-seen paths — a content-identical echo of ~1
+download per edited file; capturing response etags on upload would remove
+it. (b) k3d's Nextcloud is slow per WebDAV request (~4 s), so the first
+turn-start listing there costs ~40 s; dev's Nextcloud does the same in
+seconds.
+
 ## Verification owed after deploy
 
-- Session-level k3d/dev smoke of criterion 2's wall-clock behavior: send a
-  message seconds after a heavy turn completes on a fresh pod → turn starts
-  promptly, composer shows working/spinner while queued.
-- Dev-cluster check on thread `5833c729`: reply latency after idle recycle,
-  and `Pulled` lines showing subdir files when edited in Nextcloud.
+- Cockpit awaiting-spinner visual on a real browser (vitest-covered; worth
+  one glance on dev).
+- Dev-cluster check on thread `5833c729`: reply latency after idle recycle.

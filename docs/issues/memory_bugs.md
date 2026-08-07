@@ -16,7 +16,7 @@ Severity overview:
 | # | Bug | Severity | Effort | Status |
 |---|---|---|---|---|
 | B1 | Persistent memory extraction broken 3 ways (phantom config attrs) | **HIGH** | ~1 h | **✅ fixed 2026-06-10** (PR #111) + **live-verified on k3d 2026-06-11** |
-| B2 | 4096-dim HNSW indexes silently skipped → seq-scan retrieval | **HIGH** | 0.5–1 d | **✅ fixed 2026-06-11** (migrations vector/0002–0005, subvector-4000 halfvec — see section for premise corrections) + verified on k3d |
+| B2 | 4096-dim HNSW indexes silently skipped → seq-scan retrieval | **HIGH** | 0.5–1 d | **⚠️ REOPENED 2026-08-07 — half-fixed.** Indexes shipped 2026-06-11 (migrations vector/0002–0005, subvector-4000 halfvec) and are valid, but the deployed functions **never choose them** — retrieval is still a scan at 30 k rows (12–46 s/call). See the reopen note at the end of this section → [hnsw_indexes_never_used_inside_hybrid_search_functions](hnsw_indexes_never_used_inside_hybrid_search_functions.md) |
 | B3 | Assembler enabled-but-never-called in persistent sessions | MED-HIGH | 5 min (honesty) / ~1 d (wire) | **honesty fix ✅ 2026-06-10** (PR #112) — wire-vs-retire deferred to overhaul Phase 5 |
 | B4 | No embedding-dimension guard → silent total memory outage | MED | ~2 h | **✅ fixed 2026-06-11** (guard + probe + /status in EmbeddingService) |
 | B5 | KB injection block has no token budget | MED | ~0.5 d | open |
@@ -327,6 +327,21 @@ cast ORDER BY shape, and `memory_hybrid_search` returns the B1 thread's
 rows correctly ranked (RRF intact). Dev/prod pick the migrations up at
 next orchestrator deploy (builds are sub-second at 942/3332/169 rows).
 `ef_search` tuning remains Phase 3 of the overhaul — now actually possible.
+
+> **⚠️ REOPENED 2026-08-07 — the fix is half-done.** The indexes exist and are
+> valid, but **the deployed functions never choose them**, so premise correction 2's
+> "large scopes flip to HNSW" has never actually happened. Measured live on the main
+> dev cluster at 30 k chunks / 29 k memories: `knowledge_chunk_hybrid_search`
+> 12–14 s and `memory_project_hybrid_search` 22–46 s, both on a scan
+> (`auto_explain`: `Parallel Seq Scan on knowledge_chunks`, and the `memories` dense
+> arm on `idx_memories_project_importance`) — against **1.9–3.5 s for the identical
+> function body hoisted to a top-level `PREPARE`**, which does use
+> `idx_knowledge_chunks_embedding`. So the query shape is fine; the function wrapper
+> loses the index. The k3d verification above passed honestly — the `EXPLAIN` was run
+> on the cast ORDER BY shape *at top level*, not through the function, and at 942/3332
+> rows btree+sort is genuinely optimal, so the defect could not show. Full bisection
+> (what is and isn't the cause), measurements and repro:
+> [`hnsw_indexes_never_used_inside_hybrid_search_functions.md`](hnsw_indexes_never_used_inside_hybrid_search_functions.md).
 
 ---
 
