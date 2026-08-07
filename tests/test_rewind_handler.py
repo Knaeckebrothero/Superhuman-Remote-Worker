@@ -355,3 +355,65 @@ def test_compact_boundary_unknown_id_errors(monkeypatch):
 
     ctx_mgr.summarize_and_compact.assert_not_awaited()
     assert [m for m, _ in ws_sent if m == "error"]
+
+
+def test_compact_boundary_excludes_injections_from_keep_count(monkeypatch):
+    """Workspace injection messages must not be counted in keep_recent_override."""
+    from src.api import persistent_app as app_mod
+    from src.core.workspace_injection import create_instruction_tool_messages
+
+    # Create real instruction injection messages (AIMessage + ToolMessage pair)
+    pre_injection_ai, pre_injection_tool = create_instruction_tool_messages(
+        ".instructions", "pre-boundary instructions"
+    )
+    post_injection_ai, post_injection_tool = create_instruction_tool_messages(
+        ".instructions", "post-boundary instructions"
+    )
+
+    target = _human("msg_target", "keep from here")
+    msgs = [
+        _human("msg_a", "old"),
+        AIMessage(content="old reply"),
+        pre_injection_ai,
+        pre_injection_tool,
+        target,
+        AIMessage(content="recent reply"),
+        post_injection_ai,
+        post_injection_tool,
+    ]
+    captured = {}
+
+    async def _fake_summarize(**kwargs):
+        captured.update(kwargs)
+        return list(kwargs["messages"])
+
+    ctx_mgr = MagicMock()
+    ctx_mgr.summarize_and_compact = AsyncMock(side_effect=_fake_summarize)
+    ctx_mgr.compaction_runs = 0
+    session = SimpleNamespace(
+        messages=msgs,
+        turn_count=8,
+        context_manager=ctx_mgr,
+        auxiliary_llm=MagicMock(),
+        config=SimpleNamespace(
+            context_management=SimpleNamespace(max_summary_length=10000)
+        ),
+        workspace_manager=None,
+        postgres_conn=MagicMock(),
+    )
+    monkeypatch.setattr(app_mod, "_session", session)
+    ws_sent = []
+
+    async def _fake_ws_send(ws, method, params):
+        ws_sent.append((method, params))
+
+    monkeypatch.setattr(app_mod, "_ws_send", _fake_ws_send)
+
+    asyncio.run(
+        app_mod._handle_compact(MagicMock(), "", boundary_message_id="msg_target")
+    )
+
+    assert ctx_mgr.summarize_and_compact.await_count == 1
+    # keep_recent should be 2: the target + the one non-injection msg after it
+    # (post_injection_ai and post_injection_tool must NOT be counted)
+    assert captured["keep_recent_override"] == 2
