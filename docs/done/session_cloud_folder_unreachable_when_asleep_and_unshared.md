@@ -72,26 +72,37 @@ placeholder `README.md` and one `skills/` entry — a frozen snapshot from sessi
 start — and the agent's actual output never reached it.
 
 But this is **not** a blanket "sessions never sync". Measured across all five
-Nextcloud session folders on 2026-08-07:
+Nextcloud session folders on 2026-08-07, cross-checked against whether each session
+ever called a file-writing tool (`write_file` / `edit_file` / `create_directory`,
+counted from `llm_requests`):
 
-| Thread | Status | Synced entries | Newest |
-|---|---|---|---|
-| `5833c729` | active | 48 (incl. `output/`, `feedback.md`) | 08-06 12:32 |
-| `c90f83b7` | active | 44 (incl. `documents/external/`) | 08-06 11:59 |
-| `4ad107ad` | **active** | **0** | — |
-| `00ae0977` | ended | **0** | — |
-| `1930dec9` | ended | 22 — *all of them placed by the manual restore below* | 08-06 11:34 |
+| Thread | Turns | File writes | Synced entries | Verdict |
+|---|---|---|---|---|
+| `5833c729` | 16 | yes | 48 (incl. a 27 KB `output/` deliverable) | correct |
+| `c90f83b7` | 2 | yes | 44 (incl. `documents/external/`) | correct |
+| `4ad107ad` | 7 | **0** | 0 | correct — nothing to sync |
+| `00ae0977` | 2 | **0** | 0 | correct — nothing to sync |
+| `1930dec9` | 12 | **11 files** | 22, *all from the manual restore below* | **broken** |
 
-So sync demonstrably works — `5833c729` has a 27 KB deliverable from `output/` in
-its folder — and demonstrably does not for others, including `4ad107ad`, which is
-*active* and has nothing at all. **The discriminator was not determined**; do not
-assume it is the ended/active distinction, since both groups appear on both sides.
+Four of the five are explained: two synced their deliverables correctly, and two are
+empty because those sessions never wrote a file at all. An empty folder is not
+by itself evidence of a sync defect — check the write count first.
 
-That is the open question for
-`docs/issues/session_deliverables_in_workspace_output_not_in_cloud_files_button.md`,
-whose existing analysis is written against the OpenCloud/rclone driver and does not
-describe this. Whoever picks it up should start from the table above rather than
-from that doc's mechanism section.
+That leaves exactly **one** unexplained failure, this thread. It is not a general
+"sync is inconsistent" fault, and the scope is much narrower than it first appeared.
+What makes `1930dec9` resist the obvious explanations:
+
+- Not simply pre-cutover. It was created 08-01 under OpenCloud — but so was
+  `5833c729`, which syncs fine.
+- Not simply "never ran after the folder existed". Its folder was created 08-03
+  20:53 and it ran turns on 08-04 08:34–08:37, after that, writing five files in
+  the process. None reached the folder.
+
+The plausible remaining difference is that `5833c729` was re-attached repeatedly
+through 08-06 while `1930dec9`'s last attach predates the cutover, so its sync
+config was never rebuilt against the Nextcloud target — but **this was not
+confirmed**, and the 08-04 turns argue against the simple form of it. Tracked in
+`docs/issues/session_deliverables_in_workspace_output_not_in_cloud_files_button.md`.
 
 ## Recovering the lost files
 
