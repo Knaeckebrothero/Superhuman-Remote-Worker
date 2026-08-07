@@ -20,6 +20,81 @@ def test_orchestrator_live_readers_filter_tombstones():
         assert "rewound_at IS NULL" in src, f"{meth} must filter tombstones"
 
 
+def test_get_live_thread_message_malformed_id_returns_none_not_500():
+    """Fix 8: the orchestrator twin has no _coerce_row_id (that's agent-side
+    only) — a malformed id must resolve to None, which the endpoint already
+    turns into 404, instead of an unhandled 500 from the uuid codec."""
+    import asyncpg
+
+    from orchestrator.database.postgres import PostgresDB
+
+    class _FakeConn:
+        async def fetchrow(self, q, *a):
+            raise asyncpg.exceptions.InvalidTextRepresentationError(
+                "invalid input syntax for type uuid"
+            )
+
+    class _FakeAcquire:
+        async def __aenter__(self):
+            return _FakeConn()
+
+        async def __aexit__(self, *exc):
+            return False
+
+    db = PostgresDB.__new__(PostgresDB)
+    db.acquire = lambda: _FakeAcquire()
+
+    out = asyncio.run(db.get_live_thread_message("tid-1", "msg_not_a_real_uuid"))
+    assert out is None
+
+
+def test_get_live_thread_message_client_side_value_error_returns_none():
+    """Some asyncpg versions/paths raise the plain stdlib ValueError from
+    uuid.UUID() client-side, before ever reaching the server — must be
+    caught the same as the server-side DataError path above."""
+    from orchestrator.database.postgres import PostgresDB
+
+    class _FakeConn:
+        async def fetchrow(self, q, *a):
+            raise ValueError("badly formed hexadecimal UUID string")
+
+    class _FakeAcquire:
+        async def __aenter__(self):
+            return _FakeConn()
+
+        async def __aexit__(self, *exc):
+            return False
+
+    db = PostgresDB.__new__(PostgresDB)
+    db.acquire = lambda: _FakeAcquire()
+
+    out = asyncio.run(db.get_live_thread_message("tid-1", "msg_not_a_real_uuid"))
+    assert out is None
+
+
+def test_get_live_thread_message_happy_path_returns_row():
+    from orchestrator.database.postgres import PostgresDB
+
+    class _FakeConn:
+        async def fetchrow(self, q, *a):
+            return {"seq": 8, "role": "human", "content": "the prompt"}
+
+    class _FakeAcquire:
+        async def __aenter__(self):
+            return _FakeConn()
+
+        async def __aexit__(self, *exc):
+            return False
+
+    db = PostgresDB.__new__(PostgresDB)
+    db.acquire = lambda: _FakeAcquire()
+
+    out = asyncio.run(
+        db.get_live_thread_message("tid-1", "11111111-1111-1111-1111-111111111111")
+    )
+    assert out == {"seq": 8, "role": "human", "content": "the prompt"}
+
+
 def test_apply_thread_rewind_locks_sweeps_bumps_and_journals():
     from orchestrator.database.postgres import PostgresDB
 
