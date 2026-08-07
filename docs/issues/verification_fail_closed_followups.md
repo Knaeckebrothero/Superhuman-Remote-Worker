@@ -299,30 +299,18 @@ Ranked. None blocks anything.
 
 ## 3. Test-coverage gaps
 
-All verified harmless; each is a missing pin rather than a defect.
+**Moved and re-verified.** The full map — what is pinned, what is not, what is
+deliberately uncovered, and which guards were mutation-checked — now lives in
+`tests/verification_delivery_test_coverage.md`, alongside the same map for the
+delivery-failure chain.
 
-- No test for a malformed `job_id` on `append_verification_round` (untested
-  guard branch, inherited from the helper it clones).
-- No test pins that a disposition naming an unknown or already-resolved id is a
-  no-op.
-- No test pins that an `opened` entry with a falsy id is dropped from the fold.
-- `_verification_rounds`' string-coercion branch is untested — the asyncpg
-  JSONB-as-string path every ledger read depends on. Failure mode is loud and
-  fail-closed (empty list → escalate).
-- The head-commit-authority tests cover `freeze_data` as dict and `None` but not
-  the string-JSON form `_parse_freeze_data` also handles.
-- The route wrapper (`@app.post` / `request.json`) is untested; only the impl
-  function is exercised.
-- `tests/test_autonomy.py`'s three-round test has no vacuity guard asserting an
-  `archive/` path actually reached HEAD; its sibling does. The strong test leans
-  on the weak one.
-- `tests/test_autonomy.py::test_a_real_content_change_moves_the_value` still
-  uses `MagicMock()` for the todo manager, against that file's own new
-  "no mocks on the workspace side" rule. Harmless (it asserts inequality), but
-  inconsistent — and mocking that collaborator is what hid the inert guard.
-- `TestCompleteJobCriticStatus::test_critic_returned_gets_waiting` still passes
-  but exercises a path no production caller reaches now that a returned verdict
-  freezes `completed`.
+The nine gaps that used to be listed here were re-checked against the suite on
+2026-08-07: two had been closed (disposition-unknown-id, and the three-round
+vacuity guard), seven still stand, and two new ones were added from the
+delivery work. The highest-value one is new: **nothing pins that
+`delivery_failed` survives the agent→orchestrator transport** — both ends are
+tested, the wire between them is not, which is precisely the shape of the three
+inert-guard incidents this subsystem keeps producing.
 
 ## 4. Hygiene
 

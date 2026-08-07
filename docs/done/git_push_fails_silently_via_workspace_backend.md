@@ -247,6 +247,14 @@ ordering — the thing that was actually broken — unproven. Mutation-checked.
 `error_message`, and no alerting fires on it. Both are optional; the incident
 class is now reported rather than misattributed, which was the point.
 
+## Test coverage
+
+`tests/verification_delivery_test_coverage.md` — what is pinned for this
+chain and what is not. The one gap worth knowing: nothing tests that
+`delivery_failed` survives the agent→orchestrator transport. Both ends are
+covered; if the completion payload ever drops unknown freeze keys, both stay
+green and the whole chain silently reverts.
+
 ## Related
 
 - `docs/issues/verification_fail_closed_followups.md` — the live gate that
