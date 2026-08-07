@@ -239,11 +239,39 @@ async def evaluate_deliverable_gate(
         ``unverified`` entries (kb: without a working KB lookup) never count
         as missing.
     """
-    from services.completion import _parse_context
+    from services.completion import _parse_context, _parse_freeze_data
 
     manifest = parse_required_deliverables(_parse_context(job))
     if not manifest:
         return {"skipped": True, "reason": "no manifest"}
+
+    # Nothing reached the repository, so "missing from the repository" says
+    # nothing about what the agent produced. The agent sets this when its
+    # job-ending push does not land (src/core/phase.py,
+    # _push_job_ending_state): the deliverables exist, on a workspace pod about
+    # to be reclaimed, and Gitea is empty or stale.
+    #
+    # Without this the gate reads every manifest entry as missing and BOUNCES —
+    # resuming the agent to produce files it already produced, onto a workspace
+    # that may no longer exist (see run_deliverable_gate). That bounce also
+    # early-returns in the caller, so it preempts the verification escalation
+    # that would otherwise report the real reason.
+    #
+    # This belongs with the four skips below rather than beside them: it is the
+    # same graceful-degradation rule ("never block a seal on infrastructure the
+    # worker cannot fix"), and it is invisible to the others only because it is
+    # the one infrastructure failure that looks like a CLEAN read — the tree is
+    # readable, it is merely empty.
+    # docs/issues/git_push_fails_silently_via_workspace_backend.md
+    freeze = _parse_freeze_data(job) or {}
+    if isinstance(freeze, dict) and freeze.get("delivery_failed"):
+        return {
+            "skipped": True,
+            "reason": str(
+                freeze.get("delivery_error")
+                or "the job-ending push failed; deliverables were not delivered"
+            ),
+        }
 
     if gitea is None or not getattr(gitea, "is_initialized", False):
         return {"skipped": True, "reason": "gitea unavailable"}

@@ -279,6 +279,69 @@ class TestEvaluate:
         assert report["skipped"] is True
 
     @pytest.mark.asyncio
+    async def test_undelivered_completion_skips(self):
+        """A failed job-ending push is infrastructure, not a missing deliverable.
+
+        The agent sets ``delivery_failed`` when its final push does not land
+        (src/core/phase.py, _push_job_ending_state). The files exist; they are
+        on a workspace pod about to be reclaimed, and Gitea is empty or stale.
+
+        This gate reads Gitea, so without the check every manifest entry reads
+        "missing" and the job is bounced back to the agent to produce files it
+        already produced — onto a workspace that may no longer exist. It is the
+        one infrastructure failure that looks like a CLEAN read: the tree is
+        perfectly readable, it is just empty, which is why the four existing
+        skip cases do not catch it.
+
+        docs/issues/git_push_fails_silently_via_workspace_backend.md
+        """
+        job = make_job(
+            manifest=["output/a.md"],
+            freeze_data={
+                "freeze_type": "job_complete",
+                "delivery_failed": True,
+                "delivery_error": "The job-ending git push failed at job completion.",
+            },
+        )
+        # A readable, EMPTY tree — exactly what an undelivered job leaves behind.
+        report = await evaluate_deliverable_gate(
+            job, db=make_db(), gitea=make_gitea([])
+        )
+        assert report["skipped"] is True
+        # The agent's own reason is carried through, not replaced by a generic
+        # one — it is what reaches the stamp an operator reads.
+        assert (
+            report["reason"] == "The job-ending git push failed at job completion."
+        )
+
+    @pytest.mark.asyncio
+    async def test_undelivered_without_a_reason_still_skips(self):
+        """delivery_error is optional; the flag alone must be enough."""
+        job = make_job(
+            manifest=["output/a.md"],
+            freeze_data={"freeze_type": "job_complete", "delivery_failed": True},
+        )
+        report = await evaluate_deliverable_gate(
+            job, db=make_db(), gitea=make_gitea([])
+        )
+        assert report["skipped"] is True
+        assert "push" in str(report["reason"]).lower()
+
+    @pytest.mark.asyncio
+    async def test_delivered_completion_is_still_evaluated(self):
+        """Contrast: the check must read the flag, not skip every completion."""
+        job = make_job(
+            manifest=["output/a.md"],
+            freeze_data={"freeze_type": "job_complete"},
+        )
+        report = await evaluate_deliverable_gate(
+            job, db=make_db(), gitea=make_gitea([])
+        )
+        assert report.get("skipped") is not True
+        assert report["passed"] is False
+        assert report["missing"] == ["output/a.md"]
+
+    @pytest.mark.asyncio
     async def test_kb_entries_verified_and_fail_open(self):
         job = make_job(
             manifest=["kb:present-note", "kb:absent-note"],
@@ -309,6 +372,46 @@ class TestEvaluate:
 
 
 class TestRunGate:
+    @pytest.mark.asyncio
+    async def test_undelivered_completion_does_not_bounce(self):
+        """The composition that makes the skip worth having.
+
+        A bounce here early-returns in the caller (orchestrator/main.py, right
+        after apply_deliverable_gate), skipping the status write, the subjob
+        graft, the critic spawn and the loop advance. So before this skip
+        existed, an undelivered job with a manifest was bounced back to redo
+        work it had already done, and never reached the verification escalation
+        that would have reported the real reason.
+
+        Asserting only ``report["skipped"]`` at the evaluate level would leave
+        that ordering unproven.
+        """
+        job = make_job(
+            manifest=["output/a.md", "output/b.md"],
+            freeze_data={
+                "freeze_type": "job_complete",
+                "delivery_failed": True,
+                "delivery_error": "The job-ending git push failed at job completion.",
+            },
+        )
+        db = make_db()
+        queue_resume = AsyncMock()
+
+        new_status, actions, bounced = await run_deliverable_gate(
+            job,
+            completion_result(),
+            "completed",
+            db=db,
+            gitea=make_gitea([]),  # readable but empty — the undelivered shape
+            queue_resume=queue_resume,
+        )
+
+        assert bounced is False
+        assert new_status == "completed"
+        queue_resume.assert_not_awaited()
+        stamp = stamped(db)
+        assert stamp["skipped"] is True
+
     @pytest.mark.asyncio
     async def test_pass_seals_and_stamps(self):
         job = make_job(manifest=["output/a.md"])
