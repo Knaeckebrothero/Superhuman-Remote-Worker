@@ -6260,10 +6260,14 @@ async def _handle_rewind(ws: WebSocket, data: Dict[str, Any]) -> None:
     """Rewind the session to just before an earlier user message.
 
     docs/features/session_rewind.md §Flow — attached. Order is load-bearing:
-    interrupt → resolve+validate target → git forward-restore (fallible,
-    gates everything) → DB sweep+ledger → in-memory truncate/rehydrate →
-    events-epoch bump → acks. Bash side effects and non-git sessions degrade
-    exactly like Claude Code: conversation-only.
+    resolve+validate target (a pure validation error must not disturb an
+    in-flight turn or queued input) → interrupt+wait → drain queue → git
+    forward-restore (fallible, gates everything) → DB sweep+ledger →
+    in-memory truncate/rehydrate → events-epoch bump → acks. Bash side
+    effects and non-git sessions degrade exactly like Claude Code:
+    conversation-only. From the sweep onward a broad exception handler
+    guarantees the initiator always gets a terminal frame — the DB write may
+    already be committed by the time anything fails.
     """
     global _loop_interrupt_flag, _events_epoch, _next_seq
 
@@ -6290,7 +6294,21 @@ async def _handle_rewind(ws: WebSocket, data: Dict[str, Any]) -> None:
     async with _rewind_lock:
         conn = _session.postgres_conn
 
-        # 1. Interrupt any in-flight turn (same policy as the interrupt verb:
+        # 1. Resolve + validate the target FIRST. A pure validation error must
+        #    not kill the in-flight turn or discard queued inputs — cheap to do
+        #    ahead of the interrupt since the rewind lock excludes the only
+        #    writer that could tombstone this row concurrently.
+        row = await conn.get_live_message(_thread_id, message_id)
+        if row is None:
+            await _err("Message not found (it may already be rewound)")
+            return
+        if row["role"] != "human":
+            await _err("Rewind targets must be user messages")
+            return
+        from_seq = row["seq"]
+        prompt = row["content"] or ""
+
+        # 2. Interrupt any in-flight turn (same policy as the interrupt verb:
         #    graceful while a tool is mid-invoke, hard otherwise) and wait for
         #    the loop to park. _turn_event_open is the turn-in-flight signal.
         if _turn_event_open:
@@ -6304,7 +6322,15 @@ async def _handle_rewind(ws: WebSocket, data: Dict[str, Any]) -> None:
                     return
                 await asyncio.sleep(0.1)
 
-        # 2. Drain queued inputs: their rows sit past the sweep boundary and
+        # The wait above can run for up to 60s — long enough for an
+        # out-of-band teardown (drain, watchdog, REST detach) to tear the
+        # session down underneath us. Re-validate before touching anything
+        # that assumes it's still alive.
+        if _session is None or _session.postgres_conn is None or _thread_id is None:
+            await _err("Session no longer active")
+            return
+
+        # 3. Drain queued inputs: their rows sit past the sweep boundary and
         #    are about to be tombstoned; processing them post-rewind would
         #    resurrect the abandoned timeline.
         if _loop_user_queue is not None:
@@ -6313,17 +6339,6 @@ async def _handle_rewind(ws: WebSocket, data: Dict[str, Any]) -> None:
                     _loop_user_queue.get_nowait()
                 except asyncio.QueueEmpty:
                     break
-
-        # 3. Resolve + validate the target.
-        row = await conn.get_live_message(_thread_id, message_id)
-        if row is None:
-            await _err("Message not found (it may already be rewound)")
-            return
-        if row["role"] != "human":
-            await _err("Rewind targets must be user messages")
-            return
-        from_seq = row["seq"]
-        prompt = row["content"] or ""
 
         # 4. Workspace forward-restore — fallible, so it gates the sweep.
         abandoned_sha = None
@@ -6363,73 +6378,119 @@ async def _handle_rewind(ws: WebSocket, data: Dict[str, Any]) -> None:
                 return
             restore_commit_sha = git_mgr.get_current_commit()
 
-        # 5. Sweep + ledger (one transaction). mode='code' ledgers only.
-        result = await conn.apply_rewind(
-            _thread_id,
-            from_seq=from_seq,
-            mode=mode,
-            actor="ws_client",
-            abandoned_sha=abandoned_sha,
-            restored_to_sha=restored_to_sha,
-            restore_commit_sha=restore_commit_sha,
-        )
+        # From here on the DB sweep is one await away from being committed and
+        # durable — an unexpected exception (e.g. the session detaching mid-op)
+        # must not leave the initiator hanging with no terminal frame at all.
+        try:
+            # 5. Sweep + ledger (one transaction). mode='code' ledgers only.
+            result = await conn.apply_rewind(
+                _thread_id,
+                from_seq=from_seq,
+                mode=mode,
+                actor="ws_client",
+                abandoned_sha=abandoned_sha,
+                restored_to_sha=restored_to_sha,
+                restore_commit_sha=restore_commit_sha,
+            )
 
-        # 6. Fix in-memory state (transcript-changing modes only).
-        # _coerce_row_id maps in-memory `msg_…` ids to the row UUIDs the
-        # frontend sends; restored-prefix messages carry no id (the HF-7
-        # resume diet drops the column) and correctly fall through to the
-        # deep-rewind path.
-        if mode in ("both", "conversation"):
-            from ..database.postgres_db import _coerce_row_id
+            # 6. Fix in-memory state (transcript-changing modes only).
+            # _coerce_row_id maps in-memory `msg_…` ids to the row UUIDs the
+            # frontend sends; restored-prefix messages carry no id (the HF-7
+            # resume diet drops the column) and correctly fall through to the
+            # deep-rewind path.
+            rehydrate_failed = False
+            if mode in ("both", "conversation"):
+                from ..database.postgres_db import _coerce_row_id
 
-            target_uuid = str(_coerce_row_id(message_id))
-            cut_index = None
-            for i, m in enumerate(_session.messages):
-                mid = getattr(m, "id", None)
-                if mid and str(_coerce_row_id(mid)) == target_uuid:
-                    cut_index = i
-                    break
-            if cut_index is not None:
-                # Shallow rewind: fidelity-preserving in-place truncate.
-                del _session.messages[cut_index:]
+                target_uuid = str(_coerce_row_id(message_id))
+                cut_index = None
+                for i, m in enumerate(_session.messages):
+                    mid = getattr(m, "id", None)
+                    if mid and str(_coerce_row_id(mid)) == target_uuid:
+                        cut_index = i
+                        break
+                if cut_index is not None:
+                    # Shallow rewind: fidelity-preserving in-place truncate.
+                    del _session.messages[cut_index:]
+                else:
+                    # Deep rewind (target predates the live compaction
+                    # boundary, or the prefix was restored without ids):
+                    # rebuild from the now-filtered transcript. This read can
+                    # silently come back short (pod-restart id loss, a
+                    # transient DB blip _restore_session_messages swallows) —
+                    # an empty result is only legitimate when nothing
+                    # survives the rewind, so retry once and otherwise treat
+                    # it as a failure rather than falsely acking amnesia.
+                    _session.messages.clear()
+                    await _restore_session_messages()
+                    if not _session.messages and result["surviving_turn"] > 0:
+                        await _restore_session_messages()
+                        rehydrate_failed = (
+                            not _session.messages and result["surviving_turn"] > 0
+                        )
+                _session.turn_count = result["surviving_turn"]
+                _loop_last_user_content[0] = ""
+
+                # 7. New event generation → every SSE viewer takes the
+                #    existing gone_beyond_horizon repaint against the
+                #    filtered history.
+                try:
+                    _events_epoch = await _resolve_event_journal_epoch(conn, _thread_id)
+                    _next_seq = 0
+                except Exception:
+                    logger.warning(
+                        "Rewind epoch bump failed — viewers repaint on next attach",
+                        exc_info=True,
+                    )
+
+                if rehydrate_failed:
+                    # The DB sweep is already committed and durable — other
+                    # viewers still need to repaint to the filtered
+                    # transcript — but the initiator's own context came back
+                    # empty air, so they get an error instead of a
+                    # false-success ack.
+                    _broadcast("rewind.done", {"message_id": message_id, "mode": mode})
+                    logger.warning(
+                        "Rewind rehydrate came back empty after sweep "
+                        "(thread=%s from_seq=%s surviving_turn=%s)",
+                        _thread_id,
+                        from_seq,
+                        result["surviving_turn"],
+                    )
+                    await _err(
+                        "Rewind applied, but reloading the live context "
+                        "failed — close and re-open the session to pick it up"
+                    )
+                    return
+
+            # 8. Acks: direct to the initiator (no _seq), then the journaled
+            #    all-viewer signal in the NEW epoch.
+            await _ws_send(
+                ws,
+                "rewind.ack",
+                {
+                    "request_id": request_id,
+                    "message_id": message_id,
+                    "mode": mode,
+                    "prompt": prompt,
+                    "swept": result["swept"],
+                    "restored_to_sha": restored_to_sha,
+                },
+            )
+            if mode in ("both", "conversation"):
+                _broadcast("rewind.done", {"message_id": message_id, "mode": mode})
             else:
-                # Deep rewind (target predates the live compaction boundary,
-                # or the prefix was restored without ids): rebuild from the
-                # now-filtered transcript.
-                _session.messages.clear()
-                await _restore_session_messages()
-            _session.turn_count = result["surviving_turn"]
-            _loop_last_user_content[0] = ""
-
-            # 7. New event generation → every SSE viewer takes the existing
-            #    gone_beyond_horizon repaint against the filtered history.
-            try:
-                _events_epoch = await _resolve_event_journal_epoch(conn, _thread_id)
-                _next_seq = 0
-            except Exception:
-                logger.warning(
-                    "Rewind epoch bump failed — viewers repaint on next attach",
-                    exc_info=True,
+                _broadcast(
+                    "rewind.files_restored", {"restored_to_sha": restored_to_sha}
                 )
-
-        # 8. Acks: direct to the initiator (no _seq), then the journaled
-        #    all-viewer signal in the NEW epoch.
-        await _ws_send(
-            ws,
-            "rewind.ack",
-            {
-                "request_id": request_id,
-                "message_id": message_id,
-                "mode": mode,
-                "prompt": prompt,
-                "swept": result["swept"],
-                "restored_to_sha": restored_to_sha,
-            },
-        )
-        if mode in ("both", "conversation"):
-            _broadcast("rewind.done", {"message_id": message_id, "mode": mode})
-        else:
-            _broadcast("rewind.files_restored", {"restored_to_sha": restored_to_sha})
+        except Exception as e:
+            logger.exception(
+                "Rewind failed after the sweep gate: thread=%s from_seq=%s",
+                _thread_id,
+                from_seq,
+            )
+            await _err(f"Rewind failed: {e}")
+            return
         logger.info(
             "Rewind applied: thread=%s mode=%s from_seq=%s swept=%s",
             _thread_id,

@@ -149,6 +149,15 @@ def test_rewind_deep_falls_back_to_rehydrate(monkeypatch):
     msgs = [_human("msg_other", "x"), AIMessage(content="y")]
     session, conn, _ = _mk_session(msgs)
     conn.get_live_message.return_value = {"seq": 5, "role": "human", "content": "old"}
+    # Nothing survives this rewind, so an empty post-rehydrate transcript is the
+    # legitimate outcome (not the amnesia case covered by
+    # test_rewind_deep_rehydrate_failure_sends_error_not_ack below) — the
+    # empty+retry post-condition must not fire.
+    conn.apply_rewind.return_value = {
+        "rewind_id": "r-1",
+        "swept": 2,
+        "surviving_turn": 0,
+    }
     app_mod, ws_sent = _patched_app(monkeypatch, session)
 
     _run_rewind(
@@ -159,6 +168,53 @@ def test_rewind_deep_falls_back_to_rehydrate(monkeypatch):
 
     assert session.messages == []  # cleared…
     app_mod._restore_session_messages.assert_awaited_once()  # …and rehydrated
+    acks = [p for m, p in ws_sent if m == "rewind.ack"]
+    assert acks  # legitimate empty transcript still acks normally
+
+
+def test_rewind_deep_rehydrate_failure_sends_error_not_ack(monkeypatch):
+    # Same shape as the deep-rewind test above, but surviving_turn=2 (the
+    # _mk_session/apply_rewind default): turns are supposed to survive, yet
+    # the (mocked, side-effect-free) rehydrate leaves messages empty — the
+    # amnesia case Finding 1 guards against. DB sweep is already committed;
+    # the initiator must get an error instead of a false-success ack.
+    msgs = [_human("msg_other", "x"), AIMessage(content="y")]
+    session, conn, _ = _mk_session(msgs)
+    conn.get_live_message.return_value = {"seq": 5, "role": "human", "content": "old"}
+    app_mod, ws_sent = _patched_app(monkeypatch, session)
+
+    _run_rewind(
+        app_mod,
+        MagicMock(),
+        {"message_id": "msg_gone", "mode": "conversation", "request_id": "rq3"},
+    )
+
+    assert app_mod._restore_session_messages.await_count == 2  # initial + one retry
+    assert not [p for m, p in ws_sent if m == "rewind.ack"]
+    errors = [p for m, p in ws_sent if m == "error"]
+    assert errors
+    app_mod._broadcast.assert_called_once()
+    assert app_mod._broadcast.call_args.args[0] == "rewind.done"
+
+
+def test_rewind_validates_target_before_interrupting(monkeypatch):
+    session, conn, _ = _mk_session([_human("m", "x")])
+    conn.get_live_message.return_value = None  # invalid target
+    app_mod, ws_sent = _patched_app(monkeypatch, session, turn_open=True)
+    from src.api import persistent_app as pa
+
+    pa._loop_user_queue.put_nowait("queued-input")
+
+    _run_rewind(
+        app_mod,
+        MagicMock(),
+        {"message_id": "m", "mode": "conversation", "request_id": "r"},
+    )
+
+    errors = [p for m, p in ws_sent if m == "error"]
+    assert errors
+    assert pa._loop_interrupt_flag is None  # interrupt path never entered
+    assert pa._loop_user_queue.qsize() == 1  # drain never ran — item still queued
 
 
 def test_rewind_code_mode_requires_git(monkeypatch):
