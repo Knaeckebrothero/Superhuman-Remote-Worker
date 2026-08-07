@@ -194,7 +194,7 @@ system's response to that must be bounded regardless.
 
 ## Related
 
-- `docs/issues/git_push_fails_silently_via_workspace_backend.md` — why the
+- `docs/done/git_push_fails_silently_via_workspace_backend.md` — why the
   deliverable was missing, i.e. what put the critic in this position.
 - `docs/issues/verification_fail_closed_followups.md` — the live gate.
 - `docs/issues/critic_failure_leaves_parent_job_stuck_reviewing.md` — the

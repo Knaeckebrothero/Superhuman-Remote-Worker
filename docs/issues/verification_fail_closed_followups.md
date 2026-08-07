@@ -78,7 +78,7 @@ answer is worse than the worry. See "Cross-round `content_tree`" below.
 **Two new defects found by the live run**, both filed separately, neither
 caused by this change:
 
-- `docs/issues/resumed_job_inherits_subjob_git_branch.md` — reported from
+- `docs/done/resumed_job_inherits_subjob_git_branch.md` — reported from
   this gate as an `edit_file` append that silently does not survive the
   job-completed → feedback-resume boundary. Since root-caused to something
   wider, and **fixed** (`ensure_job_branch`, `src/agent.py`): a job resumed onto
@@ -88,7 +88,7 @@ caused by this change:
   one-paragraph fix never landed on the ref the reviewer reads; the reviewer
   correctly kept reporting it missing. This defeats the remediation path
   generally, not just for verification.
-- `docs/issues/critic_brief_lands_in_shared_workspace_and_misleads_target.md` —
+- `docs/done/critic_brief_lands_in_shared_workspace_and_misleads_target.md` —
   the critic inherits the parent's workspace, so its brief is written as
   `instructions.md` into the root the *target* reads from. The target then
   believes it is the reviewer and tries to call verdict tools it does not have.
@@ -240,8 +240,28 @@ inconsistent call rather than of the common round-2 shape.
 
 **Still unmeasured after two attempts:** the loop converging (return → fix →
 approve). Both runs died before round 2 for unrelated infrastructure reasons.
-Fix the silent-push defect first — a third attempt without it will fail the same
-way.
+
+### State as of 2026-08-07 — what a third run needs
+
+All three blockers the re-run surfaced are now closed, so a third attempt is
+worth making. What changed since:
+
+| Blocker from the re-run | State |
+|---|---|
+| Silent push failure (the run's actual killer) | **FIXED.** Cause was the `CWD:` banner parsed as a branch name (`22b2511e`); the empty `git push failed: ` reason is fixed in the same commit. Consequences handled: freeze marked `delivery_failed` (`abe4d1d1`), deliverable gate skips instead of bouncing (`233b2649`), verification escalates instead of spawning a critic against an empty repo (`728214bf`). `docs/done/git_push_fails_silently_via_workspace_backend.md` |
+| Critic livelock on a rejected verdict | **FIXED 08-06.** Per-critic rejection cap (`increment_verdict_rejections`, `_MAX_VERDICT_REJECTIONS = 3`) escalates through `_escalate_target`; the tool now tells the model "do NOT resubmit" instead of "correct and resubmit", killing the loop itself. Plus `_UNSTICK_REVIEWING_WALLCLOCK_SQL`, the live-critic twin the old watchdog deliberately excluded. `docs/done/rejected_verdict_livelocks_critic_and_wedges_parent.md` |
+| Fixture executed both staged rounds in one pass | **NOT fixed — this is on whoever runs it.** Rewrite the fixture first (see above): round 1's gap must be something the agent *cannot* close alone. |
+
+Two further caveats for the run itself:
+
+- **The shared workspace is still shared.** `inherits_parent_workspace` is
+  unchanged, so the critic still writes `critic_verdict.json` and
+  `verification_report*.json` into the target's `output/`. Expect the
+  no-progress guard to stay silent; it is not what the run is measuring.
+- **Measure the right thing.** The goal is one clean two-round convergence:
+  round 1 returns with a blocking finding, round 2 fixes exactly that, round 2's
+  critic approves. Record both rounds' `content_tree` values and the final
+  status. Anything else the run surfaces is a bonus, as it was twice already.
 
 ---
 

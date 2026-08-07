@@ -892,7 +892,7 @@ class TestVerdictDurability:
         cap reached, target already sent to manual review), returning the
         usual "must be corrected and resubmitted" string is the livelock —
         the model obeys it forever (189 iterations / 105 min live).
-        docs/issues/rejected_verdict_livelocks_critic_and_wedges_parent.md
+        docs/done/rejected_verdict_livelocks_critic_and_wedges_parent.md
         """
         from unittest.mock import AsyncMock
 

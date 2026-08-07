@@ -262,7 +262,7 @@ async def evaluate_deliverable_gate(
     # worker cannot fix"), and it is invisible to the others only because it is
     # the one infrastructure failure that looks like a CLEAN read — the tree is
     # readable, it is merely empty.
-    # docs/issues/git_push_fails_silently_via_workspace_backend.md
+    # docs/done/git_push_fails_silently_via_workspace_backend.md
     freeze = _parse_freeze_data(job) or {}
     if isinstance(freeze, dict) and freeze.get("delivery_failed"):
         return {

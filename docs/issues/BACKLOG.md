@@ -41,7 +41,7 @@ blocking it should be taken before the next bench campaign.
 |---|---|
 | [homelab_wan_outage_severs_cluster_from_own_llm](homelab_wan_outage_severs_cluster_from_own_llm.md) | Cheap CoreDNS rewrite makes every job immune to WAN outages (08-05 cost a 3 h cluster-wide LLM blackout + 1 job). |
 | [embedding_batch_overflow_skips_citation_source_embeddings](embedding_batch_overflow_skips_citation_source_embeddings.md) | **FIX SHIPPED 08-06 (batch #3)** — batching seam + transient-only retry + NaN guard + typed per-source state + coverage stats + backfill script (k3d dry-run: 54 pairs / 5 jobs). Owed: `--apply` run on main + live re-run acceptance. |
-| [deliverable_lost_to_nested_repo…](deliverable_lost_to_nested_repo_commit_and_stranded_mode_a_job.md) (Defect 1 residue) | **Blocks the bench thread.** The gate and critic verify against the *remote branch*, so a failed push is indistinguishable from a lazy agent — the 08-01/08-02 CWD-banner outage burned all 5 of `cd3bfe52`'s critic rounds and both of `bbce4bed`'s bounces on phantom findings, and any future transport failure will corrupt bench results the same way. Fix: hold on `has_unpushed_commits()` at seal instead of emitting findings. Also: 5 of 6 `git_mgr.push()` call sites in `src/core/phase.py` still discard the return value. |
+| [deliverable_lost_to_nested_repo…](deliverable_lost_to_nested_repo_commit_and_stranded_mode_a_job.md) (Defect 1 residue) | **Largely closed 08-07** — a failed push is no longer indistinguishable from a lazy agent. `push()`'s return is consumed at all four job-ending sites and sets `delivery_failed` on the freeze (`abe4d1d1`); the deliverable gate skips instead of bouncing (`233b2649`) and the verification trigger escalates instead of spawning a critic (`728214bf`), so the phantom-findings path that burned `cd3bfe52`'s 5 critic rounds and both of `bbce4bed`'s bounces is cut. Chosen mechanism is the freeze flag rather than this doc's proposed `has_unpushed_commits()` hold at seal — same failure mode, and it also carries the reason to `error_message`. **Open:** the seal-time `has_unpushed_commits()` check would additionally catch a push that never ran at all (vs. ran and failed); `_complete_phase_with_git` still discards its return by design (mid-job boundaries are recoverable). |
 | [pod_oom_kill_protection](pod_oom_kill_protection.md) | Umbrella for the recurring OOM incident class. |
 | [kb_reindex_sync_dns_retries_stall_orchestrator_liveness](kb_reindex_sync_dns_retries_stall_orchestrator_liveness.md) | NEW 08-07 (P-4 bench night-watch): KB materialization routes every agent note through the tiktoken chunker; cold vocab cache + DNS failure = sync retries ON the event loop → liveness killed the orchestrator and orphan-paused the in-flight job pair. Grows with vault size; dev exposure on any egress blip. Fixes: bake vocab into image, reindex off-loop, fail-fast on first DNS error. |
 | [hnsw_indexes_never_used_inside_hybrid_search_functions](hnsw_indexes_never_used_inside_hybrid_search_functions.md) | NEW 08-07 (job `204d0ed1` subagent-timeout investigation): **B2's unfinished half.** The halfvec HNSW indexes exist, but all six hybrid-search SQL functions seq-scan anyway — `kb_search` 12–14 s, memory retrieval 22–46 s, against 1.9–3.5 s for the *identical* body hoisted to a top-level PREPARE (index scan). B2's "planner-gated hedge" has never fired at any scope size; k3d missed it because btree+sort really is fast when small. Per-turn tax on every job and session (~60 s/turn of memory+KB injection in `204d0ed1`), and it is what blew the 240 s light-reader deadline. Mechanism bisected (see doc's ruled-out list). **No config fix** — `enable_seqscan=off` doesn't flip it either, so the index path is never *considered*, not merely out-costed; must change the SQL or call path. Est. ~half a day DB-only (plpgsql + dynamic EXECUTE keeps signatures, no app change) after 1–2 h of experiment. Exact planner reason still open. |
@@ -137,7 +137,6 @@ status.)*
 | [deprecate_docker_compose_stack](deprecate_docker_compose_stack.md) | Proposed. Migration to local k3d verified end-to-end 2026-05-28; zero acceptance criteria executed yet (re-verified 08-06) |
 | [drain_freeze_overwrites_critic_verdict](drain_freeze_overwrites_critic_verdict.md) | Overwrite still in code, but consequence structurally prevented for BOTH decision classes (critic ledger + batch #3 completion journal); severity low, guard = defense-in-depth |
 | [feedback_resume_restricted_closure_toolset](feedback_resume_restricted_closure_toolset.md) | Observed 2026-07-26 on dev (job `52949749`, round-2 correction); not yet root-caused (re-verified 08-06) |
-| [git_push_fails_silently_via_workspace_backend](git_push_fails_silently_via_workspace_backend.md) | Silence mechanism FIXED (`22b2511e`, landed via the sibling nested-repo doc — cross-linked 08-06); job `40efbb39`'s real push cause still undiagnosed |
 | [jsonb_isinstance_guard_without_parse_silent_dead_paths](jsonb_isinstance_guard_without_parse_silent_dead_paths.md) | 1 of 4 instances fixed (site 4 cockpit, `0ba7c754`); sites 1–3 byte-for-byte unchanged; `_get_vm_context()` helper exists but unapplied to sites 1–2 |
 | [loop_advance_nonatomic_wedges_loop](loop_advance_nonatomic_wedges_loop.md) | Superseded by Loop Unified Engine Phase 1 (07-19): atomicity achieved by the barrier rewrite; heal + age gate survive under new names; UI stalled badge still unbuilt |
 | [mcp_client_timeout_retry_false_failure_shared_auth_headers](mcp_client_timeout_retry_false_failure_shared_auth_headers.md) | Defects 2+3 FIXED via `99b87008` (client now `src/shared/orch_surface/`); defect 1 (flat 30s client timeout) open |
@@ -624,3 +623,43 @@ for the phantom.
 
 **Left open:** the worker path's tool-not-found handling (LangGraph `ToolNode`
 in `src/graph.py`) was not touched — this fix is the session loop only.
+
+## Session log 2026-08-07 (delivery-failure chain)
+
+Closed `git_push_fails_silently_via_workspace_backend` → `docs/done/`, and
+retired its "job `40efbb39`'s real push cause still undiagnosed" row. That row
+was wrong on a timezone: the 08-06 sweep read `f41970ae`'s local-time commit
+stamp (`12:41:31 +0200`) against the job's UTC log timestamps and concluded the
+incident predated the CWD-banner regression. `12:41 +0200` is `10:41 UTC`; the
+job first failed to push at `11:27 UTC`, 45 minutes later, on the image built
+from that very commit (`sha-f41970a`). Same cause, already diagnosed by
+`22b2511e`. Nothing was owed.
+
+What was genuinely open was the *consequence* handling — a failed push was not
+treated as a failure anywhere. Four commits close that end to end:
+
+| Layer | Before | Now |
+|---|---|---|
+| `src/core/phase.py` | `push()`'s return discarded at all four job-ending sites | ERROR log + `delivery_failed` / `delivery_error` on the freeze record (`abe4d1d1`) |
+| deliverable gate | every manifest entry read "missing" → **bounced** the agent to redo work it had already done | fifth fail-open skip case, carrying the agent's reason (`233b2649`) |
+| verification trigger | spawned a critic against an empty repo → returned the job for undelivered work | escalates with the real reason (`728214bf`) |
+| `_escalate_target` | — | reason lands in `error_message`; loop jobs stay terminal (inherited) |
+
+Ordering mattered more than the individual guards: the deliverable gate runs
+*before* verification and a bounce early-returns, so until `233b2649` landed,
+`728214bf` could never fire for any job carrying a `required_deliverables`
+manifest. Triaging the gate as "a separate, lower-priority slice" was wrong.
+
+Also shipped in the same session (`a4929b17`): `VIRTUAL_DIRS_ENABLED` removed.
+Its "off" position materialized `instructions.md` / `task_brief.md` into the
+workspace root, which on a workspace-inheriting subjob reopened
+`critic_brief_lands_in_shared_workspace_and_misleads_target` every time the
+lever was pulled. The guarantee it stood in for — never boot an agent with no
+task — moved to `src/graph.py`, which now raises instead of warning when both
+briefs resolve empty, covering every cause rather than that one.
+
+**Still owed, and unchanged by any of this:** the verification loop has never
+been observed converging (return → fix → approve). Two live-gate attempts died
+before round 2 on unrelated infrastructure — the second on the silent-push
+defect above, which is now fixed. See
+`verification_fail_closed_followups.md` for what a third run needs.

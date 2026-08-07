@@ -40,7 +40,7 @@ inheritance.
 > (`orchestrator/main.py:4649`, `:4896`, `:13805`, `:13808`). Of the three known
 > consequences of that one shared root, two are now closed — the *branch* half
 > by `ensure_job_branch`
-> (`docs/issues/resumed_job_inherits_subjob_git_branch.md`) and the
+> (`docs/done/resumed_job_inherits_subjob_git_branch.md`) and the
 > *instructions* half here. The third is still open: the critic writes its
 > verdict artifacts (`output/critic_verdict.json`,
 > `output/verification_report*.json`) into the **target's** `output/`, which is
@@ -130,5 +130,5 @@ covered one.
 - `docs/issues/verification_round_reset_spawns_blind_critic.md` — the rewrite
   whose brief-delivery fix created this exposure.
 - `docs/issues/verification_fail_closed_followups.md` — live-gate results.
-- `docs/issues/resumed_job_inherits_subjob_git_branch.md` — the other
+- `docs/done/resumed_job_inherits_subjob_git_branch.md` — the other
   defect the same run surfaced.
