@@ -29871,7 +29871,11 @@ async def rewind_thread_detached(
     authority is live and a DB-only sweep would diverge it → 409.
     """
     user, thread = await require_thread_owner(request, postgres_db, thread_id)
-    if thread.get("agent_id"):
+    # mark_orphaned_threads_ended and agent_update_thread_status's ended
+    # branch both leave a stale agent_id on real ended threads — status must
+    # gate the check too, mirroring update_thread_config's established
+    # "connected" predicate, or every ended thread would 409 forever.
+    if thread.get("agent_id") and thread.get("status") not in ("suspended", "ended"):
         raise HTTPException(
             status_code=409,
             detail="Session is live — rewind from the session connection",
