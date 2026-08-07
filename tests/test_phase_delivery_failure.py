@@ -121,9 +121,7 @@ class TestFinalizeJobRecordsDeliveryFailure:
         seed_final_data()
         ws = make_workspace(pushed=True)
 
-        result = finalize_job(
-            make_state(), ws, MagicMock(), config=make_config("full")
-        )
+        result = finalize_job(make_state(), ws, MagicMock(), config=make_config("full"))
 
         assert DELIVERY_FAILED_KEY not in result.freeze_data
         assert DELIVERY_ERROR_KEY not in result.freeze_data
@@ -138,9 +136,7 @@ class TestFinalizeJobRecordsDeliveryFailure:
         seed_final_data()
         ws = make_workspace(pushed=False, has_remote=False)
 
-        result = finalize_job(
-            make_state(), ws, MagicMock(), config=make_config("full")
-        )
+        result = finalize_job(make_state(), ws, MagicMock(), config=make_config("full"))
 
         assert DELIVERY_FAILED_KEY not in result.freeze_data
         ws.git_manager.push.assert_not_called()
@@ -151,9 +147,7 @@ class TestFinalizeJobRecordsDeliveryFailure:
         ws = make_workspace(pushed=False)
         ws.git_manager.is_active = False
 
-        result = finalize_job(
-            make_state(), ws, MagicMock(), config=make_config("full")
-        )
+        result = finalize_job(make_state(), ws, MagicMock(), config=make_config("full"))
 
         assert DELIVERY_FAILED_KEY not in result.freeze_data
 
