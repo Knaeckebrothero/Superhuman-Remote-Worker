@@ -130,3 +130,120 @@ describe('PersistentChatService rewind', () => {
         expect(frame.boundary_message_id).toBe('row-2');
     });
 });
+
+/**
+ * Fix round 1 (review finding): rewindInFlight used to be set only in
+ * rewind() and cleared only by rewind.ack / rewind.files_restored / a
+ * blanket 'error' — but the ack is WS-direct to the originating socket
+ * only, so a drop/reconnect between send and ack lost it forever, and an
+ * unrelated in-flight error (e.g. a concurrent config.update denial) could
+ * clear it prematurely. Mirrors the file's own interrupt()/
+ * _armInterruptFallback/_clearInterruptFallback self-healing pattern; see
+ * "PersistentChatService — interrupt self-healing" in the main spec for the
+ * precedent this borrows its style from.
+ */
+describe('PersistentChatService — rewind self-healing', () => {
+    beforeEach(() => {
+        vi.useFakeTimers();
+    });
+
+    afterEach(() => {
+        vi.useRealTimers();
+    });
+
+    it('force-clears rewindInFlight if rewind.ack never arrives (lost/dropped frame)', async () => {
+        const {service} = createService();
+        const live = createMockWs();
+        service.threadId.set('thread-rw');
+        (service as any).controlWs = live;
+
+        service.rewind('row-1', 'conversation');
+        expect(service.rewindInFlight()).toBe(true);
+
+        // No rewind.ack / rewind.files_restored / matching error arrives —
+        // the fallback fires at REWIND_ACK_TIMEOUT_MS (90s) and un-wedges
+        // the UI rather than leaving "Rewinding…" stuck forever.
+        await vi.advanceTimersByTimeAsync(90_001);
+
+        expect(service.rewindInFlight()).toBe(false);
+    });
+
+    it('does not fire the fallback once rewind.ack has already cleared it', async () => {
+        const {service} = createService();
+        const live = createMockWs();
+        service.threadId.set('thread-rw');
+        (service as any).controlWs = live;
+
+        const requestId = service.rewind('row-1', 'conversation');
+        (service as any)._handleEvent({
+            method: 'rewind.ack',
+            params: {request_id: requestId, message_id: 'row-1', mode: 'conversation'},
+        });
+        expect(service.rewindInFlight()).toBe(false);
+
+        // The ack disarmed the timer — advancing past the deadline must not
+        // resurrect rewindInFlight or throw from a stale callback.
+        await vi.advanceTimersByTimeAsync(90_001);
+        expect(service.rewindInFlight()).toBe(false);
+    });
+
+    it('error only clears rewindInFlight for the matching request_id', () => {
+        const {service} = createService();
+        const live = createMockWs();
+        service.threadId.set('thread-rw');
+        (service as any).controlWs = live;
+
+        const requestId = service.rewind('row-1', 'conversation');
+        expect(service.rewindInFlight()).toBe(true);
+
+        // An unrelated in-flight request's error (e.g. a concurrent
+        // config.update denial) must not prematurely re-enable the UI.
+        (service as any)._handleEvent({
+            method: 'error',
+            params: {message: 'denied', request_id: 'unrelated-request'},
+        });
+        expect(service.rewindInFlight()).toBe(true);
+
+        (service as any)._handleEvent({
+            method: 'error',
+            params: {message: 'rewind failed', request_id: requestId},
+        });
+        expect(service.rewindInFlight()).toBe(false);
+    });
+
+    it('an error with no request_id at all leaves rewindInFlight untouched', () => {
+        const {service} = createService();
+        const live = createMockWs();
+        service.threadId.set('thread-rw');
+        (service as any).controlWs = live;
+
+        service.rewind('row-1', 'conversation');
+        (service as any)._handleEvent({method: 'error', params: {message: 'boom'}});
+
+        expect(service.rewindInFlight()).toBe(true);
+    });
+
+    it('disconnect() resets rewindInFlight/rewindPrefill left over from a mid-flight rewind', async () => {
+        // The scenario the Important finding described: a WS drop/reconnect
+        // between send and ack. disconnect() must not leave the flag wedged.
+        const {service} = createService();
+        const live = createMockWs();
+        service.threadId.set('thread-rw');
+        (service as any).controlWs = live;
+
+        service.rewind('row-1', 'conversation');
+        expect(service.rewindInFlight()).toBe(true);
+
+        service.disconnect();
+
+        expect(service.rewindInFlight()).toBe(false);
+        expect(service.rewindPrefill()).toBeNull();
+
+        // The armed fallback timer was disarmed too — advancing past its
+        // deadline must not warn or touch state again.
+        const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+        await vi.advanceTimersByTimeAsync(90_001);
+        expect(warnSpy).not.toHaveBeenCalled();
+        warnSpy.mockRestore();
+    });
+});
