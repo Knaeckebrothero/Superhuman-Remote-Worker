@@ -1,6 +1,6 @@
 # HNSW indexes exist but are never used inside the hybrid-search SQL functions — every dense retrieval is still a scan
 
-**Status:** Filed — root cause bisected and measured on the live main dev cluster (`superhuman-remote-worker/srw-pgvector-0`, `srw_vector`). Unfixed. No code changed. **No configuration fix exists** — every GUC lever has been tried and failed, and the indexes are present and valid; the fix must change the SQL or the call path (~half a day, DB-only, after 1–2 h of experiment).
+**Status:** **FIX BUILT + TESTED on k3d, NOT deployed, UNCOMMITTED** — migration `0017_hybrid_search_plpgsql_dynamic_execute.sql` (+ regenerated `vector_schema_current.sql`). Root cause bisected on the live main dev cluster; candidates A/B benchmarked on a production-scale k3d harness; fix applied through the real orchestrator migration runner and verified semantically identical on real data. KB path **fixed** (~10×). Memory path **partially fixed** (~6×) — the `memories` content arm has a *second, independent* defect (TOAST-blind costing) that 0017 cannot reach; see below, still open. Also open before prod: ANN-vs-exact recall at scale. Nothing deployed to the dev or prod clusters.
 **Found:** 2026-08-07, investigating why the 3-way `spawn_subagent` fan-out in job `204d0ed1-e997-4fa3-9de2-2526c2b26eea` (Loop iter 4 · SCHOLAR) timed out with zero deliverables.
 **Severity:** **HIGH.** `kb_search` costs ~12–14 s and a memory retrieval ~22–46 s on this cluster, against ~1–3.5 s for the identical query when it reaches the index. This is a per-turn tax on *every* job and session, and it is what actually killed the fan-out. It grows with store size.
 **Component:** `orchestrator/database/migrations/vector/0002_hybrid_search_halfvec_casts.sql` (the six re-created hybrid-search functions) · `src/services/knowledge_store.py:1666` `search_chunks` · the RecallStore retrieval path.
@@ -106,12 +106,17 @@ lever has now been tried and failed (`plan_cache_mode`,
 present and valid, so there is nothing to rebuild or `ANALYZE`. The fix has to change
 the SQL or the call path.
 
-**Still not pinned:** *why* the path is unavailable in this context. Leading
-candidate is that the `SET` clause makes the `LANGUAGE sql` function non-inlinable,
-so the body is planned through the plan cache against parameter placeholders and the
-index's ordering operator can never be matched. That is a hypothesis, not a
-measurement — but note it now has to explain *unavailability*, not mis-costing, which
-rules out any explanation that reduces to "the planner thought the scan was cheaper."
+**Mechanism (best-supported, after the k3d experiment below).** The `SET`-clause /
+inlining hypothesis is **disproven** — removing it changes nothing (Candidate B).
+What fits all the evidence: a `LANGUAGE sql` function body is planned once against
+parameter *placeholders*, and with a placeholder on the probe side the HNSW ordering
+operator cannot be matched, so the index path is structurally absent. The top-level
+`PREPARE` tests escape this because `EXECUTE` uses a **custom** plan for its first
+executions, folding the parameters to constants. `plan_cache_mode = force_custom_plan`
+does not rescue the function because it governs prepared statements and plpgsql
+cached plans — a plain SQL function's body plan goes through a different path and is
+not covered. A dynamic `EXECUTE` sidesteps the whole thing with a one-shot plan.
+The last step is still inference; the *behaviour* is measured.
 
 ### Why B2 recorded this as fixed
 
@@ -147,37 +152,136 @@ The memory path is the expensive one because it runs on *every* turn. In job
 Across ~45 iterations that is a large fraction of the job's 165-minute runtime spent
 scanning pgvector.
 
-## Fix
+## Fix — BUILT: migration `0017_hybrid_search_plpgsql_dynamic_execute.sql`
 
-Rough cost: **~half a day, DB-only**, after **1–2 h** of experiment. There is no
-one-line fix — see the `enable_seqscan` result above — but there is very likely no
-application change either.
+**Converts all six functions to `plpgsql` with a dynamic `EXECUTE`.** Signatures,
+argument names, defaults, return types and `SET` clauses unchanged, so no caller
+moves. Bodies are the deployed text verbatim with named parameters mechanically
+rewritten to positional `$n` (generated, not hand-transcribed).
 
-Spend the first 1–2 h pinning the mechanism rather than guessing: create renamed
-copies of *one* function on the dev DB in each shape below and time them. That is
-decisive and cheap, and it picks the option for you.
+**It fully fixes the knowledge/KB path and only partially fixes the memory path** —
+see "Second defect" below, which the build surfaced and which 0017 cannot reach.
 
-1. **Convert to `plpgsql` with a dynamic `EXECUTE`** — *recommended first try.* A
-   dynamic `EXECUTE` is planned as its own top-level statement, and a top-level
-   statement with these exact parameters is the configuration measured at 1.9–3.5 s.
-   Signatures stay identical, so `search_chunks` and the RecallStore call sites do
-   not change: one new migration, no application code, no image rebuild, revertible
-   by a follow-up migration. Small blast radius for a ~10× win.
-2. **Hoist the arms into the application layer** — *fallback.* The only option
-   actually **proven** to work, since the top-level `PREPARE` measured above is
-   literally what the app would issue. But 1–2 days: touches `search_chunks` and the
-   RecallStore, and the RRF fusion has to be reimplemented and tested in Python.
-3. **Drop the `SET hnsw.iterative_scan` clause so the function can inline** —
-   cheapest to try, most speculative. Carries a trap: B2 added that clause
-   deliberately, because with the default `off` a filtered HNSW scan can silently
-   return short. It must be **moved** onto the connection (an asyncpg pool `init`
-   callback), not deleted, or you trade a latency bug for a correctness bug.
+| function | before | after | dense-arm plan after |
+|---|---|---|---|
+| `knowledge_chunk_hybrid_search` | 5.0 / 5.5 / 5.9 s | **0.52 / 0.59 / 0.61 s** | `Index Scan` ✅ |
+| `memory_project_hybrid_search` | 8.8 / 9.1 / 9.7 s | **1.3 / 1.6 / 1.9 s** | trigger arm `Index Scan` ✅ · content arm still `Seq Scan` ❌ |
+
+### Verification performed (k3d, 2026-08-07)
+
+- **Applies through the real runner.** Orchestrator boot path:
+  `✓ 0017_hybrid_search_plpgsql_dynamic_execute.sql (3 ms)`, row in
+  `schema_migrations` with checksum; all six functions report `plpgsql` in the live
+  k3d `srw_vector`.
+- **Semantically identical on real data.** Old shape recreated under `_old` names
+  alongside the migrated ones on k3d's real `srw_vector` (142 chunks / 1,588
+  memories — small enough that *both* shapes run exact scans, so any diff would be a
+  rewrite bug): **0 ordered mismatches**, identical row counts and identical
+  ordering, for both `knowledge_chunk_hybrid_search` and
+  `memory_project_hybrid_search`. Temp functions dropped after.
+- **Edge paths.** Omitted optional args (defaults) → 15 rows; `version_param = NULL`
+  (the `IS NULL` branch) → 50 rows; non-matching kb + tsquery → 0 rows, no error.
+- `ruff check` + `ruff format --check` clean; `pytest -k "knowledge or memory or
+  recall or vector or migration"` → **1192 passed, 3 skipped**.
+- `scripts/schema-snapshot.sh` re-run; `vector_schema_current.sql` regenerated.
+
+### The measurement that picked this shape
+
+Run on a purpose-seeded k3d scratch DB (see the harness below) at production
+parity — 32,900 chunks in the primary kb + 980 in a second, same halfvec HNSW index
+(`m=16, ef_construction=64`), pgvector 0.8.2. Three runs each:
+
+| shape | latency | dense-arm plan |
+|---|---|---|
+| Control — dense arm as a top-level `PREPARE` | 21 ms | `Index Scan using idx_knowledge_chunks_embedding` |
+| **Baseline — the deployed function, verbatim** | **5.0 / 5.5 / 5.9 s** | **`Parallel Seq Scan on knowledge_chunks`** |
+| **Candidate A — `plpgsql` + dynamic `EXECUTE`** | **0.48 / 0.52 / 0.88 s** ✅ | **`Index Scan using idx_knowledge_chunks_embedding`** |
+| Candidate B — same SQL body, `SET` clause removed | 4.8 / 4.9 / 5.9 s ❌ | `Parallel Seq Scan on knowledge_chunks` |
+
+Two results worth carrying forward. **Candidate A works** — that is the fix, and it
+is now measured rather than inferred. **Candidate B does not** — dropping the `SET`
+clause so the function can inline changes nothing, which kills the leading hypothesis
+and removes the "cheapest thing to try" from the list entirely. Don't spend time on
+it.
+
+Remaining option if A somehow disappoints on real data: **hoist the arms into the
+application layer** (`search_chunks` + RecallStore issue them as ordinary
+parameterized asyncpg statements and fuse RRF in Python). The control row above is
+effectively that shape, so it is known-good — but it is 1–2 days and moves logic out
+of SQL. Hold it as the fallback.
+
+## Second defect — `memories` dense content arm, TOAST-blind costing (OPEN)
+
+Surfaced while verifying 0017. It is **independent of the function wrapper** and
+0017 cannot fix it. Filed here because it is the same investigation and the same
+symptom, but it needs its own work.
+
+After 0017 the memory functions are only ~6× better, and all of that comes from the
+trigger-phrase arm. The content arm still scans:
+
+```
+->  Index Scan using idx_memory_retrieval_messages_embedding_halfvec on ... rm     ✅
+->  Seq Scan on memories memories_1  (rows=29000, actual time=0.058..1085.245)     ❌
+```
+
+1,085 ms of a 1,108 ms call. It is not the wrapper: the **same arm, isolated at top
+level, with a literal probe, no parameters and no filters** still seq-scans. Forced
+with `enable_seqscan=off` the index works and takes **15.5 ms vs 1,143 ms — 74×**.
+
+The cause is cost estimation, not availability. The planner prices the HNSW path at
+`cost=3985.61` and the seq scan at `cost=2106`, so it picks the scan — but
+`memories.embedding` is a 4096-dim vector stored out-of-line in TOAST, and the
+seq-scan cost model counts only main-heap pages. It never sees the ~1.1 s of
+detoasting 29,000 vectors. `knowledge_chunks` escapes this because its inline
+`content` text makes the heap bigger, so scanning is priced high enough for the index
+to win.
+
+Levers tried and rejected (do not re-test):
+
+- **`ALTER FUNCTION … SET enable_seqscan = off`** — measured, does **not** work. It
+  does not force the *ordering* path; the planner just switches to the btree
+  `idx_memories_project_valid` and still reads all 29,000 rows. 1386 → 1169 ms.
+- **`hnsw.iterative_scan = off`** (to lower the estimated index cost) — still a seq
+  scan. Also unsafe: B2 added `relaxed_order` deliberately so a filtered scan can't
+  return short.
+- No GUC combination selects HNSW here; `enable_indexscan=off` would kill the HNSW
+  path too, since that is also an index scan.
+
+Likely direction: restructure the content arm so the ANN lookup is its own statement
+against real bounds, or hoist that one arm into the application layer (the
+already-proven shape). Not attempted.
+
+### Open: ANN recall at scale is NOT yet verified
+
+Two different questions, only one of them closed.
+
+**Closed — is the rewrite semantically faithful?** Yes. Proven on real k3d data where
+both shapes run exact scans: 0 ordered mismatches (see Verification above).
+
+**Still open — does approximate ANN return the same rows as the exact scan it
+replaces?** The real-data test above cannot answer this, precisely *because* both
+shapes ran exact there. At production scale the migrated function takes the HNSW
+index and the old one did not, so on the main cluster this is genuinely
+exact → approximate. That is what B2 intended when it built the indexes, but
+intended ≠ measured.
+
+The k3d harness cannot answer it either: its vectors are `random()` in `[0,1)`, so
+every vector sits in the positive orthant and distances concentrate (observed spread
+0.000–0.247, σ=0.035). Top-K ordering there is noise — a baseline-vs-migrated diff on
+that data showed 24/50, which is meaningless, not alarming.
+
+**Close it before this reaches prod**: on the main dev cluster, create the migrated
+shape under a renamed copy alongside the deployed function (additive DDL, nothing
+deployed changes, droppable in one statement) and diff top-50 `note_id` sets over a
+sample of real queries at 30.7k chunks. Tune `hnsw.ef_search` if recall is short —
+B2 noted it is unset everywhere and that is still true.
 
 Whatever lands, gate it on the A/B in the measurement table — same call, before and
 after, with `auto_explain` confirming an `Index Scan using idx_*_embedding`.
-**Verify at production scale on the dev cluster**: k3d at ~1–3 k rows will show
-nothing, which is exactly how this got past B2 in June. Migration hygiene: new
-numbered file under `migrations/vector/`, never edit `vector_schema.sql`, regen
+**Verify at production scale**: k3d *as it stands* (142 chunks) shows nothing, which
+is how this got past B2 in June — but a seeded scratch DB reproduces it faithfully,
+so the check does not require the live cluster. Migration hygiene: new numbered file
+under `migrations/vector/`, never edit `vector_schema.sql`, regen
 `schema_current.sql` after. Also worth setting `hnsw.ef_search` once an index path is
 actually live; B2 noted it is absent everywhere and that stays true.
 
@@ -185,7 +289,28 @@ actually live; B2 noted it is absent everywhere and that stays true.
 symptom only: raise `delegation.light.timeout_seconds` above 240 and cap per-turn
 tool-call concurrency, so a fan-out stops dying inside its first `kb_search` batch.
 
-### Reproduce
+### Harness: reproduce the bug on k3d (no live-cluster access needed)
+
+Left standing on k3d as database **`hnsw_exp`** (846 MB; `srw_vector` untouched at
+142 chunks). Drop with
+`kubectl --context=k3d-srw -n srw exec srw-pgvector-0 -- psql -U srw -d postgres -c 'DROP DATABASE hnsw_exp;'`.
+
+To rebuild from scratch: create the DB, `CREATE EXTENSION vector` + `uuid-ossp`,
+`pg_dump -s -t knowledge_chunks -t knowledge_index` from `srw_vector` and load it,
+then insert ~4,700 notes and 7 chunks each with
+`(SELECT array_agg(random()::real)::vector(4096) FROM generate_series(1,4096))`
+(~5.6 s for 33 k rows). Two gotchas: drop the HNSW index before bulk insert and
+recreate after, and set `max_parallel_maintenance_workers = 0` for the build — the
+pod's small `/dev/shm` makes a parallel build die with *"could not resize shared
+memory segment … No space left on device"*. Serial build takes ~43 s.
+Then `ANALYZE` both tables and load the deployed function via
+`pg_get_functiondef`.
+
+**Always run the control first** — the dense arm as a top-level `PREPARE`. If the
+control does not pick the index, the dataset is too small and any "fast" result below
+is meaningless. That control is the guard B2's k3d verification lacked.
+
+### Reproduce (live main cluster)
 
 ```bash
 kubectl --context=main -n superhuman-remote-worker exec -i srw-pgvector-0 -- \
