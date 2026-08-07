@@ -672,11 +672,27 @@ jobs:
           SHA_WORKSPACE=$(extract_sha workspace)
           # VM image SHAs live in fleet.yaml — vmController as a bare tag
           # (image.vmController.tag), agent-vm-base embedded in the
-          # defaultVmImage URL (vmController.defaultVmImage). yq is preinstalled
-          # on ubuntu-latest. Empty result → has_changes treats as "rebuild",
-          # which is the safe default.
-          SHA_VM_CONTROLLER=$(yq '.helm.values.image.vmController.tag' deployment-vms/srw-vm-controller/fleet.yaml 2>/dev/null | grep -oP 'sha-\K[0-9a-f]{7}' | head -1)
-          SHA_VM_BASE=$(yq '.helm.values.vmController.defaultVmImage' deployment-vms/srw-vm-controller/fleet.yaml 2>/dev/null | grep -oP 'sha-\K[0-9a-f]{7}' | head -1)
+          # defaultVmImage URL (vmController.defaultVmImage).
+          #
+          # An EMPTY result is fail-open on purpose: it means nothing is deployed
+          # yet, and has_changes correctly treats that as "rebuild". A MISSING
+          # TOOL is not the same thing, but `yq ... 2>/dev/null` makes the two
+          # indistinguishable — so on a runner without yq, every VM job would
+          # rebuild on every run, silently and expensively. yq is preinstalled on
+          # ubuntu-latest and baked into the self-hosted runner image
+          # (docker/Dockerfile.ci-runner); if it is absent, something is broken
+          # and we want to hear about it rather than pay for it.
+          command -v yq >/dev/null 2>&1 || {
+            echo "::error::yq not found on this runner. It is preinstalled on ubuntu-latest and baked into docker/Dockerfile.ci-runner — if you see this, the runner image is broken."
+            exit 1
+          }
+          VM_FLEET=deployment-vms/srw-vm-controller/fleet.yaml
+          test -f "$VM_FLEET" || {
+            echo "::error::$VM_FLEET is missing — cannot resolve deployed VM SHAs."
+            exit 1
+          }
+          SHA_VM_CONTROLLER=$(yq '.helm.values.image.vmController.tag' "$VM_FLEET" | grep -oP 'sha-\K[0-9a-f]{7}' | head -1)
+          SHA_VM_BASE=$(yq '.helm.values.vmController.defaultVmImage' "$VM_FLEET" | grep -oP 'sha-\K[0-9a-f]{7}' | head -1)
 
           echo "Deployed SHAs:"
           echo "  agent=$SHA_AGENT  orchestrator=$SHA_ORCHESTRATOR  cockpit=$SHA_COCKPIT"
@@ -1015,6 +1031,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Free disk space
+        # Hosted runners have ~14 GiB free and these jobs need more. Self-hosted
+        # runners do not need it, and the heavy variants below delete
+        # /opt/hostedtoolcache, which is where setup-* install. Guarded rather
+        # than deleted so the hosted fallback (gh variable delete CI_RUNNER_LABEL)
+        # still works.
+        if: runner.environment == 'github-hosted'
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
       - uses: docker/setup-buildx-action@v3
@@ -1416,6 +1438,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Free disk space
+        # Hosted runners have ~14 GiB free and these jobs need more. Self-hosted
+        # runners do not need it, and the heavy variants below delete
+        # /opt/hostedtoolcache, which is where setup-* install. Guarded rather
+        # than deleted so the hosted fallback (gh variable delete CI_RUNNER_LABEL)
+        # still works.
+        if: runner.environment == 'github-hosted'
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
             /usr/local/share/boost /usr/local/share/chromium \
@@ -1424,12 +1452,33 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y qemu-system-x86 qemu-utils genisoimage
-      - name: Enable KVM
+      - name: Enable KVM (hosted runner udev rule)
+        # Hosted runners ship /dev/kvm as root:kvm with no world access, so this
+        # udev rule is how the runner user reaches it. Inside a container there is
+        # no udevd: the rule file goes nowhere and `udevadm control` fails. There,
+        # access comes from the pod spec instead — privileged + a /dev/kvm
+        # CharDevice hostPath, see HomeLab deployments_managed/arc-runners-kvm/.
+        # (Measured on node4: /dev/kvm is gid 36, mode 0666.)
+        if: runner.environment == 'github-hosted'
         run: |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
+
+      - name: Verify KVM is usable
+        # Runs on BOTH runner types, unconditionally. stage1.pkr.hcl and
+        # stage2.pkr.hcl set accelerator = "kvm", and without acceleration packer
+        # does not fail — it silently falls back to TCG and burns the entire
+        # 75-90 minute timeout. Fail in five seconds instead.
+        #
+        # KVM_GET_API_VERSION = _IO(KVMIO=0xAE, 0) = 0xAE00. Opening the device
+        # and getting an answer proves the permissions AND that the host kernel's
+        # KVM subsystem is reachable from in here, which `ls` alone does not.
+        run: |
+          set -euo pipefail
           ls -la /dev/kvm
+          id
+          python3 -c "import fcntl,os;fd=os.open('/dev/kvm',os.O_RDWR);print('KVM_GET_API_VERSION =',fcntl.ioctl(fd,0xAE00,0))"
       - uses: hashicorp/setup-packer@main
         with:
           version: latest
@@ -1560,6 +1609,12 @@ jobs:
           fi
           ls -la files/
       - name: Free disk space
+        # Hosted runners have ~14 GiB free and these jobs need more. Self-hosted
+        # runners do not need it, and the heavy variants below delete
+        # /opt/hostedtoolcache, which is where setup-* install. Guarded rather
+        # than deleted so the hosted fallback (gh variable delete CI_RUNNER_LABEL)
+        # still works.
+        if: runner.environment == 'github-hosted'
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
             /usr/local/share/boost /usr/local/share/chromium \
@@ -1568,12 +1623,33 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y qemu-system-x86 qemu-utils genisoimage
-      - name: Enable KVM
+      - name: Enable KVM (hosted runner udev rule)
+        # Hosted runners ship /dev/kvm as root:kvm with no world access, so this
+        # udev rule is how the runner user reaches it. Inside a container there is
+        # no udevd: the rule file goes nowhere and `udevadm control` fails. There,
+        # access comes from the pod spec instead — privileged + a /dev/kvm
+        # CharDevice hostPath, see HomeLab deployments_managed/arc-runners-kvm/.
+        # (Measured on node4: /dev/kvm is gid 36, mode 0666.)
+        if: runner.environment == 'github-hosted'
         run: |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
+
+      - name: Verify KVM is usable
+        # Runs on BOTH runner types, unconditionally. stage1.pkr.hcl and
+        # stage2.pkr.hcl set accelerator = "kvm", and without acceleration packer
+        # does not fail — it silently falls back to TCG and burns the entire
+        # 75-90 minute timeout. Fail in five seconds instead.
+        #
+        # KVM_GET_API_VERSION = _IO(KVMIO=0xAE, 0) = 0xAE00. Opening the device
+        # and getting an answer proves the permissions AND that the host kernel's
+        # KVM subsystem is reachable from in here, which `ls` alone does not.
+        run: |
+          set -euo pipefail
           ls -la /dev/kvm
+          id
+          python3 -c "import fcntl,os;fd=os.open('/dev/kvm',os.O_RDWR);print('KVM_GET_API_VERSION =',fcntl.ioctl(fd,0xAE00,0))"
       - uses: hashicorp/setup-packer@main
         with:
           version: latest
