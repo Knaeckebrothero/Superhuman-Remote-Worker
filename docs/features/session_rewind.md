@@ -176,8 +176,8 @@ fast-forward push. Instead:
    -- .` would leave them behind) — and commit as **"Rewind: restore to turn N"**.
 3. History stays linear and pushable; both SHAs land in the ledger.
 
-Degraded-mode matrix (drives which action-sheet options are enabled, with
-tooltip reasons):
+Degraded-mode matrix (the intended per-option availability; v1 enforces it
+server-side and surfaces a clear error rather than pre-disabling — see §UX):
 
 | Session state | Code restore |
 |---|---|
@@ -196,13 +196,17 @@ posture as Claude Code.
 
 Hover/kebab action **"Rewind to here"** on each user message → action sheet:
 *Restore conversation and files / Restore conversation only / Restore files only
-/ Summarize up to here / Cancel*, options disabled per the matrix. Confirmation
-copy: *"Messages after this point are hidden from the conversation (kept in the
-audit trail). Files return to their state after turn N. Commands with external
-effects can't be undone."* On success: turns collapse via the epoch repaint, the
-composer prefills with the original prompt, focus lands there. Non-owner viewers
-see no affordance and just repaint. Rewind during streaming is allowed — the
-server interrupts first.
+/ Summarize up to here / Cancel*. **v1 reality:** the degraded-mode matrix is
+enforced server-authoritatively, not client-side — every option is offered, and
+an unavailable mode (no version history, no mapped commit below the target,
+detached) answers with a clear error surfaced in-dialog/banner rather than a
+pre-disabled control. Client-side pre-disable with tooltip reasons, matching the
+matrix, is a fast-follow. Confirmation copy: *"Messages after this point are
+hidden from the conversation (kept in the audit trail). Files return to their
+state after turn N. Commands with external effects can't be undone."* On
+success: turns collapse via the epoch repaint, the composer prefills with the
+original prompt, focus lands there. Non-owner viewers see no affordance and just
+repaint. Rewind during streaming is allowed — the server interrupts first.
 
 ### Failure containment
 
