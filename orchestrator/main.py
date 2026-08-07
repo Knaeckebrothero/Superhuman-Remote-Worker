@@ -29849,6 +29849,59 @@ async def resume_thread(
     return {"status": "created", "thread_id": thread_id}
 
 
+class ThreadRewindRequest(BaseModel):
+    """Body for POST /api/agents/threads/{id}/rewind (detached sessions)."""
+
+    message_id: str
+    mode: str = "conversation"
+
+
+@app.post("/api/agents/threads/{thread_id}/rewind")
+async def rewind_thread_detached(
+    thread_id: str,
+    request: Request,
+    body: ThreadRewindRequest,
+) -> dict[str, Any]:
+    """Rewind a DETACHED session's transcript (auth: owner only).
+
+    docs/features/session_rewind.md §Flow — detached. Conversation mode
+    only: file restore needs the agent that holds the workspace, so live
+    sessions rewind through the session WebSocket instead, and code modes
+    here answer 400 ("resume first"). A bound agent means the in-memory
+    authority is live and a DB-only sweep would diverge it → 409.
+    """
+    user, thread = await require_thread_owner(request, postgres_db, thread_id)
+    if thread.get("agent_id"):
+        raise HTTPException(
+            status_code=409,
+            detail="Session is live — rewind from the session connection",
+        )
+    if body.mode != "conversation":
+        raise HTTPException(
+            status_code=400,
+            detail="File restore needs a running session — resume it first, "
+            "then rewind from the chat",
+        )
+    row = await postgres_db.get_live_thread_message(thread_id, body.message_id)
+    if row is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Message not found (it may already be rewound)",
+        )
+    if row["role"] != "human":
+        raise HTTPException(
+            status_code=400, detail="Rewind targets must be user messages"
+        )
+    result = await postgres_db.apply_thread_rewind(
+        thread_id, from_seq=row["seq"], actor=str(user["id"])
+    )
+    return {
+        "rewind_id": result["rewind_id"],
+        "swept": result["swept"],
+        "prompt": row["content"] or "",
+    }
+
+
 @app.get("/api/persistent/threads/{thread_id}/citations")
 async def get_thread_citations(
     thread_id: str,
