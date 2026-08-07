@@ -144,6 +144,13 @@ _RESOURCE_METHODS = {
     ): "list_namespaced_persistent_volume_claim",
     ("core/v1/persistentvolumes", True): "list_persistent_volume",
 }
+_CUSTOM_RESOURCE_SCOPES = {
+    ("kubevirt.io/v1/virtualmachineinstances", False): (
+        "kubevirt.io",
+        "v1",
+        "virtualmachineinstances",
+    ),
+}
 
 
 class RawKubernetesClient:
@@ -153,27 +160,46 @@ class RawKubernetesClient:
         self,
         core_api: Any,
         *,
+        custom_objects_api: Any | None = None,
         max_page_bytes: int = 8 * 1024 * 1024,
         max_watch_event_bytes: int = 2 * 1024 * 1024,
         request_timeout_seconds: int = 90,
     ) -> None:
         self._core_api = core_api
+        self._custom_objects_api = custom_objects_api
         self._max_page_bytes = max_page_bytes
         self._max_watch_event_bytes = max_watch_event_bytes
         self._request_timeout_seconds = request_timeout_seconds
 
     def _operation(self, scope: InventoryScope) -> tuple[Any, dict[str, Any]]:
         method_name = _RESOURCE_METHODS.get((scope.api_resource, scope.cluster_scoped))
-        if method_name is None:
-            raise ValueError(
-                "RawKubernetesClient accepts namespaced Pod/PVC scopes or "
-                "cluster-scoped PV scopes only"
-            )
-        method = getattr(self._core_api, method_name, None)
-        if not callable(method):
-            raise ValueError("Kubernetes CoreV1 API lacks the requested operation")
-        kwargs = {} if scope.cluster_scoped else {"namespace": scope.namespace}
-        return method, kwargs
+        if method_name is not None:
+            method = getattr(self._core_api, method_name, None)
+            if not callable(method):
+                raise ValueError("Kubernetes CoreV1 API lacks the requested operation")
+            kwargs = {} if scope.cluster_scoped else {"namespace": scope.namespace}
+            return method, kwargs
+
+        custom_scope = _CUSTOM_RESOURCE_SCOPES.get(
+            (scope.api_resource, scope.cluster_scoped)
+        )
+        method = getattr(
+            self._custom_objects_api,
+            "list_namespaced_custom_object",
+            None,
+        )
+        if custom_scope is not None and callable(method):
+            group, version, plural = custom_scope
+            return method, {
+                "group": group,
+                "version": version,
+                "plural": plural,
+                "namespace": scope.namespace,
+            }
+        raise ValueError(
+            "RawKubernetesClient accepts namespaced Pod/PVC/VMI scopes or "
+            "cluster-scoped PV scopes only"
+        )
 
     async def list_resources(
         self,

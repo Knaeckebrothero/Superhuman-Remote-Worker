@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+import hashlib
 import json
 from pathlib import Path
 import re
@@ -14,7 +15,7 @@ from uuid import uuid4
 import asyncpg
 import pytest
 
-from orchestrator.database.migrate import discover
+from orchestrator.database.migrate import discover, run_migrations
 from orchestrator.services.infrastructure_metering.materializer import (
     InfrastructureUsageMaterializer,
     PublicationConflictError,
@@ -95,6 +96,43 @@ APP_REFERENCED_RATE_GUARD_MIGRATION = (
 )
 APP_STORAGE_FOUNDATION_MIGRATION = (
     ROOT / "orchestrator/database/migrations/app/0102_storage_asset_foundations.sql"
+)
+APP_COMPUTE_FOUNDATION_MIGRATION = (
+    ROOT / "orchestrator/database/migrations/app/0103_compute_metering_foundations.sql"
+)
+APP_AGENT_METERING_LOCK_ORDER_MIGRATION = (
+    ROOT / "orchestrator/database/migrations/app/0104_agent_metering_lock_order.sql"
+)
+APP_STORAGE_SOURCE_ACTIVATION_MIGRATION = (
+    ROOT / "orchestrator/database/migrations/app/0105_storage_source_activation.sql"
+)
+APP_COMPUTE_SCOPE_EPOCH_GUARD_MIGRATION = (
+    ROOT / "orchestrator/database/migrations/app/0106_compute_scope_epoch_guard.sql"
+)
+APP_COMPUTE_SCOPE_AUTHORIZATION_MIGRATION = (
+    ROOT / "orchestrator/database/migrations/app/0107_compute_scope_authorization.sql"
+)
+APP_COMPUTE_EXACT_EPOCH_AUTHORITY_MIGRATION = (
+    ROOT / "orchestrator/database/migrations/app/0108_compute_exact_epoch_authority.sql"
+)
+APP_COMPUTE_EXACT_EPOCH_LIFECYCLE_MIGRATION = (
+    ROOT / "orchestrator/database/migrations/app/0109_compute_exact_epoch_lifecycle.sql"
+)
+APP_COMPUTE_EPOCH_ROLLOVER_MIGRATION = (
+    ROOT
+    / "orchestrator/database/migrations/app/0112_compute_epoch_rollover_authority.sql"
+)
+APP_COMPUTE_AUTHORITY_CONFIRMATION_GAP_MIGRATION = (
+    ROOT
+    / "orchestrator/database/migrations/app/0113_compute_authority_confirmation_gap.sql"
+)
+APP_COMPUTE_INTERVAL_EPOCH_SHAPE_REPAIR_MIGRATION = (
+    ROOT
+    / "orchestrator/database/migrations/app/0114_compute_interval_epoch_shape_repair.sql"
+)
+APP_CURRENT_MIGRATION_HEAD = (
+    ROOT
+    / "orchestrator/database/migrations/app/0114_compute_interval_epoch_shape_repair.sql"
 )
 AUDIT_EXPANSION = (
     ROOT
@@ -614,7 +652,7 @@ def test_migration_heads_are_unique_and_snapshots_are_not_the_contract() -> None
     for files in (app_files, audit_files):
         prefixes = [path.name.split("_", 1)[0] for path in files]
         assert len(prefixes) == len(set(prefixes))
-    assert app_files[-1].name == APP_STORAGE_FOUNDATION_MIGRATION.name
+    assert app_files[-1].name == APP_CURRENT_MIGRATION_HEAD.name
     assert audit_files[-1].name == AUDIT_PROJECT_INDEX.name
     assert "schema_current" not in APP_MIGRATION.read_text()
     assert "schema_current" not in APP_INGESTION_MIGRATION.read_text()
@@ -627,7 +665,252 @@ def test_migration_heads_are_unique_and_snapshots_are_not_the_contract() -> None
     assert "schema_current" not in APP_TERMINAL_EVIDENCE_MIGRATION.read_text()
     assert "schema_current" not in APP_REFERENCED_RATE_GUARD_MIGRATION.read_text()
     assert "schema_current" not in APP_STORAGE_FOUNDATION_MIGRATION.read_text()
+    assert "schema_current" not in APP_COMPUTE_FOUNDATION_MIGRATION.read_text()
+    assert "schema_current" not in APP_AGENT_METERING_LOCK_ORDER_MIGRATION.read_text()
+    assert "schema_current" not in APP_STORAGE_SOURCE_ACTIVATION_MIGRATION.read_text()
+    assert "schema_current" not in APP_COMPUTE_SCOPE_EPOCH_GUARD_MIGRATION.read_text()
+    assert "schema_current" not in APP_COMPUTE_SCOPE_AUTHORIZATION_MIGRATION.read_text()
+    assert (
+        "schema_current" not in APP_COMPUTE_EXACT_EPOCH_AUTHORITY_MIGRATION.read_text()
+    )
+    assert (
+        "schema_current" not in APP_COMPUTE_EXACT_EPOCH_LIFECYCLE_MIGRATION.read_text()
+    )
+    assert "schema_current" not in APP_COMPUTE_EPOCH_ROLLOVER_MIGRATION.read_text()
+    assert (
+        "schema_current"
+        not in APP_COMPUTE_AUTHORITY_CONFIRMATION_GAP_MIGRATION.read_text()
+    )
+    assert (
+        "schema_current"
+        not in APP_COMPUTE_INTERVAL_EPOCH_SHAPE_REPAIR_MIGRATION.read_text()
+    )
     assert "audit_schema_current" not in AUDIT_EXPANSION.read_text()
+
+
+def test_compute_foundation_is_immutable_and_lock_fix_is_superseding() -> None:
+    foundation_bytes = APP_COMPUTE_FOUNDATION_MIGRATION.read_bytes()
+    assert hashlib.sha256(foundation_bytes).hexdigest() == (
+        "f08a7adbad52368001fbf3a7a3b332b2d4c6f0ef36d1249b005d04cec7147893"
+    )
+    lock_fix_bytes = APP_AGENT_METERING_LOCK_ORDER_MIGRATION.read_bytes()
+    assert hashlib.sha256(lock_fix_bytes).hexdigest() == (
+        "b18ca34108ae46b7da5cf07a9a9a08a78fba96cebb02f4204165826cb67b6d12"
+    )
+
+    foundation = APP_COMPUTE_FOUNDATION_MIGRATION.read_text()
+    lock_fix = APP_AGENT_METERING_LOCK_ORDER_MIGRATION.read_text()
+    compact_fix = _compact(lock_fix)
+
+    assert "depends-on:    0103_compute_metering_foundations.sql" in lock_fix
+    assert "FOR NO KEY UPDATE OF agent SKIP LOCKED" in foundation
+    assert "FOR NO KEY UPDATE OF agent SKIP LOCKED" not in lock_fix
+    assert "LOCK TABLE agents, jobs, threads IN SHARE ROW EXCLUSIVE MODE" in compact_fix
+    for function_name in (
+        "converge_agent_metering_from_agent_row",
+        "converge_agent_metering_from_job_row",
+        "converge_agent_metering_from_thread_row",
+    ):
+        assert f"CREATE OR REPLACE FUNCTION public.{function_name}()" in lock_fix
+    assert "CREATE TABLE" not in lock_fix
+    assert "CREATE TRIGGER" not in lock_fix
+
+
+def test_compute_epoch_guards_are_immutable_and_0109_is_the_lifecycle_predecessor() -> (
+    None
+):
+    immutable_hashes = {
+        APP_COMPUTE_SCOPE_EPOCH_GUARD_MIGRATION: (
+            "9f15214d2b3b695e33ee168869c9b47e4fcf1992e9d75984b4e4f356d3076540"
+        ),
+        APP_COMPUTE_SCOPE_AUTHORIZATION_MIGRATION: (
+            "eb13dd19aeecc2aafc921a98294fdc4e5759c12107d2f3ec6249ac7aa43e38ef"
+        ),
+        APP_COMPUTE_EXACT_EPOCH_AUTHORITY_MIGRATION: (
+            "9b95a52ba8f319988230ef9c8541d8303dc52a7b02801a21f180ff121ba04757"
+        ),
+    }
+    for path, expected in immutable_hashes.items():
+        assert hashlib.sha256(path.read_bytes()).hexdigest() == expected
+
+    lifecycle = APP_COMPUTE_EXACT_EPOCH_LIFECYCLE_MIGRATION.read_text()
+    compact = _compact(lifecycle)
+    assert "depends-on:    0108_compute_exact_epoch_authority.sql" in lifecycle
+    assert (
+        "LOCK TABLE resource_inventory_scope_epochs, compute_metering_activation"
+        in compact
+    )
+    for superseded in (
+        "resource_intervals_compute_activation_guard",
+        "resource_intervals_compute_scope_epoch_guard",
+        "resource_intervals_compute_exact_epoch_guard",
+    ):
+        assert f"DROP TRIGGER {superseded}" in lifecycle
+    assert (
+        "CREATE TRIGGER resource_intervals_compute_exact_epoch_lifecycle_guard"
+        in lifecycle
+    )
+    assert "BEFORE INSERT OR UPDATE ON resource_intervals" in compact
+    assert lifecycle.index("FOR SHARE OF epoch") < lifecycle.index(
+        "FROM public.compute_metering_activation"
+    )
+    assert "NEW.last_confirmed_at > epoch_retired_at" in lifecycle
+    assert "NEW.materialized_through > epoch_retired_at" in lifecycle
+
+
+def test_compute_epoch_rollover_is_audited_append_only_and_directly_bound() -> None:
+    sql = APP_COMPUTE_EPOCH_ROLLOVER_MIGRATION.read_text()
+    compact = _compact(sql)
+
+    assert "0109_compute_exact_epoch_lifecycle.sql" in sql
+    assert "0111_thread_messages_live_index.notx.sql" in sql
+    assert hashlib.sha256(
+        APP_COMPUTE_EPOCH_ROLLOVER_MIGRATION.read_bytes()
+    ).hexdigest() == (
+        "3112549f0613c96a8012cea6a1f06f4b6249ec43c7b1c4a70161ba27b18af37e"
+    )
+    assert "cannot safely backfill append-only compute epoch authority" in sql
+    assert "CREATE TABLE compute_metering_epoch_promotion_requests" in sql
+    assert "CREATE TABLE compute_metering_epoch_authorities" in sql
+    assert "request_kind IN ('initial-activation', 'recovery-rollover')" in compact
+    assert "compute_epoch_promotion_requests_immutable" in sql
+    assert "compute_metering_epoch_authorities_immutable" in sql
+    assert "compute epoch promotion requests are immutable" in sql
+    assert "compute epoch authorities are append-only" in sql
+    assert "WITH RECURSIVE lineage AS" in sql
+    assert "lineage_reaches_prior" in sql
+    assert "missing_shadow_count" in sql
+    assert "orphan_shadow_count" in sql
+    assert "current_generation IS DISTINCT FROM NEW.proof_generation" in sql
+    assert "ADD COLUMN compute_scope_epoch_id UUID" in sql
+    assert "resource_intervals_compute_scope_epoch_shape_check" in sql
+    assert "resource_intervals_compute_epoch_authority_guard" in sql
+    assert (
+        "NEW.compute_scope_epoch_id IS DISTINCT FROM OLD.compute_scope_epoch_id" in sql
+    )
+    assert "resource_inventory_epochs_compute_retirement" in sql
+    assert "end_reason = 'inventory-epoch-retired'" in sql
+    assert "current_interval_id = NULL" in sql
+    assert "resource_inventory_epochs_recovery_identity_immutable" in sql
+    assert "compute activation requires audited exact epoch authority" in sql
+    assert (
+        "DROP TRIGGER resource_intervals_compute_exact_epoch_lifecycle_guard" in compact
+    )
+
+
+def test_compute_authority_confirmation_gap_supersedes_deployed_rollover() -> None:
+    sql = APP_COMPUTE_AUTHORITY_CONFIRMATION_GAP_MIGRATION.read_text()
+    compact = _compact(sql)
+
+    assert "depends-on:    0112_compute_epoch_rollover_authority.sql" in sql
+    assert hashlib.sha256(
+        APP_COMPUTE_AUTHORITY_CONFIRMATION_GAP_MIGRATION.read_bytes()
+    ).hexdigest() == (
+        "c8b530ada1583b17d81507f4571c6e2b51e82afe17911c4d22db4323ec448466"
+    )
+    assert "CREATE FUNCTION record_compute_authority_confirmation_gap()" in sql
+    assert "CREATE TRIGGER compute_epoch_authority_confirmation_gap" in sql
+    assert "AFTER INSERT ON compute_metering_epoch_authorities" in compact
+    assert "compute-authority-awaiting-confirmation:" in sql
+    assert "authority.authority_sequence = 1" in sql
+    assert "THEN authority.effective_from ELSE predecessor.retired_at END" in compact
+    assert "NEW.authority_sequence = 1" in sql
+    assert "authority_gap_start := NEW.effective_from" in sql
+    assert "backfilled_by_migration', TRUE" in sql
+    assert "predecessor.retired_at IS NULL" in sql
+    assert "0111_thread_messages_live_index.notx.sql" not in sql
+
+
+def test_compute_interval_epoch_shape_repair_closes_sql_null_bypass() -> None:
+    sql = APP_COMPUTE_INTERVAL_EPOCH_SHAPE_REPAIR_MIGRATION.read_text()
+
+    assert "depends-on:    0113_compute_authority_confirmation_gap.sql" in sql
+    assert hashlib.sha256(
+        APP_COMPUTE_INTERVAL_EPOCH_SHAPE_REPAIR_MIGRATION.read_bytes()
+    ).hexdigest() == (
+        "5bbcb4e288e31ed742fde7d6bb5d4a108a0142297ad679a80ac368fc5b5418b1"
+    )
+    assert "DROP CONSTRAINT resource_intervals_compute_scope_epoch_shape_check" in sql
+    assert "ADD CONSTRAINT resource_intervals_compute_scope_epoch_shape_check" in sql
+    assert "COALESCE(details->>'product_class', '') = 'ide-session'" in sql
+    assert "NULL product classes cannot bypass the shape" in sql
+
+
+@pytest.mark.asyncio
+async def test_compute_shape_repair_upgrades_deployed_0112_and_0113_checksums(
+    app_pg_dsn: str,
+    tmp_path: Path,
+) -> None:
+    dbname = f"metering_0114_upgrade_{uuid4().hex[:12]}"
+    admin = await asyncpg.connect(app_pg_dsn)
+    try:
+        await admin.execute(f'CREATE DATABASE "{dbname}"')
+    finally:
+        await admin.close()
+
+    dsn = _swap_db(app_pg_dsn, dbname)
+    pool = await asyncpg.create_pool(dsn, min_size=1, max_size=4)
+    staged_dir = tmp_path / "through-0113"
+    staged_dir.mkdir()
+    try:
+        for path in discover(ROOT / "orchestrator/database/migrations/app"):
+            if path.name > APP_COMPUTE_AUTHORITY_CONFIRMATION_GAP_MIGRATION.name:
+                break
+            (staged_dir / path.name).write_bytes(path.read_bytes())
+
+        await run_migrations(pool, staged_dir)
+        async with pool.acquire() as conn:
+            assert (
+                await conn.fetchval(
+                    "SELECT checksum FROM schema_migrations WHERE filename=$1",
+                    APP_COMPUTE_EPOCH_ROLLOVER_MIGRATION.name,
+                )
+                == "3112549f0613c96a8012cea6a1f06f4b6249ec43c7b1c4a70161ba27b18af37e"
+            )
+            assert (
+                await conn.fetchval(
+                    "SELECT checksum FROM schema_migrations WHERE filename=$1",
+                    APP_COMPUTE_AUTHORITY_CONFIRMATION_GAP_MIGRATION.name,
+                )
+                == "c8b530ada1583b17d81507f4571c6e2b51e82afe17911c4d22db4323ec448466"
+            )
+            assert not await conn.fetchval(
+                "SELECT EXISTS (SELECT 1 FROM schema_migrations WHERE filename=$1)",
+                APP_COMPUTE_INTERVAL_EPOCH_SHAPE_REPAIR_MIGRATION.name,
+            )
+
+        await run_migrations(pool, ROOT / "orchestrator/database/migrations/app")
+        await run_migrations(pool, ROOT / "orchestrator/database/migrations/app")
+        async with pool.acquire() as conn:
+            assert (
+                await conn.fetchval(
+                    "SELECT checksum FROM schema_migrations WHERE filename=$1",
+                    APP_COMPUTE_EPOCH_ROLLOVER_MIGRATION.name,
+                )
+                == "3112549f0613c96a8012cea6a1f06f4b6249ec43c7b1c4a70161ba27b18af37e"
+            )
+            assert await conn.fetchval(
+                "SELECT success FROM schema_migrations WHERE filename=$1",
+                APP_COMPUTE_INTERVAL_EPOCH_SHAPE_REPAIR_MIGRATION.name,
+            )
+            assert await conn.fetchval(
+                "SELECT EXISTS ("
+                "SELECT 1 FROM pg_trigger "
+                "WHERE tgname='compute_epoch_authority_confirmation_gap' "
+                "AND NOT tgisinternal)"
+            )
+            constraint_definition = await conn.fetchval(
+                "SELECT pg_get_constraintdef(oid) FROM pg_constraint "
+                "WHERE conname='resource_intervals_compute_scope_epoch_shape_check'"
+            )
+            assert "COALESCE" in constraint_definition
+    finally:
+        await pool.close()
+        admin = await asyncpg.connect(app_pg_dsn)
+        try:
+            await admin.execute(f'DROP DATABASE "{dbname}" WITH (FORCE)')
+        finally:
+            await admin.close()
 
 
 def test_referenced_rate_range_guard_is_bounded_and_conflict_aware() -> None:

@@ -139,6 +139,22 @@ class InfrastructureMeteringSettings:
     pv_shadow_enabled: bool = False
     pvc_publication_enabled: bool = False
     pv_publication_enabled: bool = False
+    ide_pod_shadow_enabled: bool = False
+    agent_pod_shadow_enabled: bool = False
+    ide_pod_publication_enabled: bool = False
+    agent_pod_publication_enabled: bool = False
+    vm_inventory_enabled: bool = False
+    vm_shadow_enabled: bool = False
+    vm_publication_enabled: bool = False
+    vm_pvc_inventory_enabled: bool = False
+    vm_pv_inventory_enabled: bool = False
+    vm_pvc_shadow_enabled: bool = False
+    vm_pv_shadow_enabled: bool = False
+    vm_pvc_publication_enabled: bool = False
+    vm_pv_publication_enabled: bool = False
+    vm_pv_cluster_wide_rbac_acknowledged: bool = False
+    vm_stable_cluster_id: str = ""
+    vm_namespace: str = ""
     volume_identity_key_version: str = ""
     volume_resource_mappings: tuple[StorageResourceMappingRule, ...] = ()
     stable_cluster_id: str = ""
@@ -146,6 +162,7 @@ class InfrastructureMeteringSettings:
     namespace_allowlist: tuple[str, ...] = ()
     relist_interval_seconds: int = 300
     stale_after_seconds: int = 900
+    max_collector_clock_skew_seconds: int = 300
     list_page_size: int = 500
     scope_concurrency: int = 2
     watch_queue_size: int = 10_000
@@ -201,6 +218,51 @@ class InfrastructureMeteringSettings:
             pv_publication_enabled=_flag(
                 env, "INFRASTRUCTURE_METERING_PV_PUBLICATION_ENABLED"
             ),
+            ide_pod_shadow_enabled=_flag(
+                env, "INFRASTRUCTURE_METERING_IDE_POD_SHADOW_ENABLED"
+            ),
+            agent_pod_shadow_enabled=_flag(
+                env, "INFRASTRUCTURE_METERING_AGENT_POD_SHADOW_ENABLED"
+            ),
+            ide_pod_publication_enabled=_flag(
+                env, "INFRASTRUCTURE_METERING_IDE_POD_PUBLICATION_ENABLED"
+            ),
+            agent_pod_publication_enabled=_flag(
+                env, "INFRASTRUCTURE_METERING_AGENT_POD_PUBLICATION_ENABLED"
+            ),
+            vm_inventory_enabled=_flag(
+                env, "INFRASTRUCTURE_METERING_VM_INVENTORY_ENABLED"
+            ),
+            vm_shadow_enabled=_flag(env, "INFRASTRUCTURE_METERING_VM_SHADOW_ENABLED"),
+            vm_publication_enabled=_flag(
+                env, "INFRASTRUCTURE_METERING_VM_PUBLICATION_ENABLED"
+            ),
+            vm_pvc_inventory_enabled=_flag(
+                env, "INFRASTRUCTURE_METERING_VM_PVC_INVENTORY_ENABLED"
+            ),
+            vm_pv_inventory_enabled=_flag(
+                env, "INFRASTRUCTURE_METERING_VM_PV_INVENTORY_ENABLED"
+            ),
+            vm_pvc_shadow_enabled=_flag(
+                env, "INFRASTRUCTURE_METERING_VM_PVC_SHADOW_ENABLED"
+            ),
+            vm_pv_shadow_enabled=_flag(
+                env, "INFRASTRUCTURE_METERING_VM_PV_SHADOW_ENABLED"
+            ),
+            vm_pvc_publication_enabled=_flag(
+                env, "INFRASTRUCTURE_METERING_VM_PVC_PUBLICATION_ENABLED"
+            ),
+            vm_pv_publication_enabled=_flag(
+                env, "INFRASTRUCTURE_METERING_VM_PV_PUBLICATION_ENABLED"
+            ),
+            vm_pv_cluster_wide_rbac_acknowledged=_flag(
+                env,
+                "INFRASTRUCTURE_METERING_VM_PV_CLUSTER_WIDE_RBAC_ACKNOWLEDGED",
+            ),
+            vm_stable_cluster_id=env.get(
+                "INFRASTRUCTURE_METERING_VM_STABLE_CLUSTER_ID", ""
+            ).strip(),
+            vm_namespace=env.get("INFRASTRUCTURE_METERING_VM_NAMESPACE", "").strip(),
             volume_identity_key_version=env.get(
                 "INFRASTRUCTURE_METERING_VOLUME_IDENTITY_KEY_VERSION", ""
             ).strip(),
@@ -224,6 +286,13 @@ class InfrastructureMeteringSettings:
                 900,
                 minimum=30,
                 maximum=604_800,
+            ),
+            max_collector_clock_skew_seconds=_bounded_int(
+                env,
+                "INFRASTRUCTURE_METERING_MAX_COLLECTOR_CLOCK_SKEW_SECONDS",
+                300,
+                minimum=1,
+                maximum=3_600,
             ),
             list_page_size=_bounded_int(
                 env,
@@ -299,6 +368,18 @@ class InfrastructureMeteringSettings:
             raise ValueError(
                 "infrastructure metering stable cluster id must be 1-128 "
                 "characters using letters, digits, '.', '_', ':', or '-'"
+            )
+        if self.vm_stable_cluster_id and not _STABLE_CLUSTER_ID.fullmatch(
+            self.vm_stable_cluster_id
+        ):
+            raise ValueError(
+                "infrastructure metering VM stable cluster id must be 1-128 "
+                "characters using letters, digits, '.', '_', ':', or '-'"
+            )
+        if self.vm_namespace and not _KUBERNETES_NAMESPACE.fullmatch(self.vm_namespace):
+            raise ValueError(
+                "infrastructure metering VM namespace must be a valid "
+                "Kubernetes namespace"
             )
         if self.volume_identity_key_version and not (
             _VOLUME_IDENTITY_KEY_VERSION.fullmatch(self.volume_identity_key_version)
@@ -377,6 +458,148 @@ class InfrastructureMeteringSettings:
                     "infrastructure metering PV publication requires "
                     + ", ".join(missing)
                 )
+        for label, enabled in (
+            ("IDE Pod", self.ide_pod_shadow_enabled),
+            ("agent Pod", self.agent_pod_shadow_enabled),
+        ):
+            if enabled:
+                missing = []
+                if not self.collector_enabled:
+                    missing.append("collector")
+                if not self.shadow_enabled:
+                    missing.append("global shadow mode")
+                if missing:
+                    raise ValueError(
+                        f"infrastructure metering {label} shadow mode requires "
+                        + ", ".join(missing)
+                    )
+        for label, enabled, shadow_enabled in (
+            (
+                "IDE Pod",
+                self.ide_pod_publication_enabled,
+                self.ide_pod_shadow_enabled,
+            ),
+            (
+                "agent Pod",
+                self.agent_pod_publication_enabled,
+                self.agent_pod_shadow_enabled,
+            ),
+        ):
+            if enabled:
+                missing = []
+                if not self.publication_enabled:
+                    missing.append("global publication")
+                if not shadow_enabled:
+                    missing.append(f"{label} shadow mode")
+                if missing:
+                    raise ValueError(
+                        f"infrastructure metering {label} publication requires "
+                        + ", ".join(missing)
+                    )
+        if self.vm_inventory_enabled:
+            missing = []
+            if not self.collector_enabled:
+                missing.append("collector")
+            if not self.vm_stable_cluster_id:
+                missing.append("VM stable cluster id")
+            if not self.vm_namespace:
+                missing.append("VM namespace")
+            if missing:
+                raise ValueError(
+                    "infrastructure metering VM inventory requires "
+                    + ", ".join(missing)
+                )
+        if self.vm_shadow_enabled:
+            missing = []
+            if not self.vm_inventory_enabled:
+                missing.append("VM inventory")
+            if not self.shadow_enabled:
+                missing.append("global shadow mode")
+            if missing:
+                raise ValueError(
+                    "infrastructure metering VM shadow mode requires "
+                    + ", ".join(missing)
+                )
+        if self.vm_publication_enabled:
+            missing = []
+            if not self.publication_enabled:
+                missing.append("global publication")
+            if not self.vm_shadow_enabled:
+                missing.append("VM shadow mode")
+            if missing:
+                raise ValueError(
+                    "infrastructure metering VM publication requires "
+                    + ", ".join(missing)
+                )
+        if self.vm_pvc_inventory_enabled or self.vm_pv_inventory_enabled:
+            missing = []
+            if not self.collector_enabled:
+                missing.append("collector")
+            if not self.vm_stable_cluster_id:
+                missing.append("VM stable cluster id")
+            if not self.vm_namespace:
+                missing.append("VM namespace")
+            if missing:
+                raise ValueError(
+                    "infrastructure metering VM storage inventory requires "
+                    + ", ".join(missing)
+                )
+        if self.vm_pv_inventory_enabled:
+            missing = []
+            if not self.vm_pv_cluster_wide_rbac_acknowledged:
+                missing.append("explicit cluster-wide PV RBAC acknowledgement")
+            if not self.volume_identity_key_version:
+                missing.append("volume identity key version")
+            if missing:
+                raise ValueError(
+                    "infrastructure metering VM PV inventory requires "
+                    + ", ".join(missing)
+                )
+        if self.vm_pvc_shadow_enabled:
+            missing = []
+            if not self.vm_pvc_inventory_enabled:
+                missing.append("VM PVC inventory")
+            if not self.shadow_enabled:
+                missing.append("global shadow mode")
+            if missing:
+                raise ValueError(
+                    "infrastructure metering VM PVC shadow mode requires "
+                    + ", ".join(missing)
+                )
+        if self.vm_pv_shadow_enabled:
+            missing = []
+            if not self.vm_pv_inventory_enabled:
+                missing.append("VM PV inventory")
+            if not self.shadow_enabled:
+                missing.append("global shadow mode")
+            if missing:
+                raise ValueError(
+                    "infrastructure metering VM PV shadow mode requires "
+                    + ", ".join(missing)
+                )
+        for label, enabled, shadow_enabled in (
+            (
+                "VM PVC",
+                self.vm_pvc_publication_enabled,
+                self.vm_pvc_shadow_enabled,
+            ),
+            (
+                "VM PV",
+                self.vm_pv_publication_enabled,
+                self.vm_pv_shadow_enabled,
+            ),
+        ):
+            if enabled:
+                missing = []
+                if not self.publication_enabled:
+                    missing.append("global publication")
+                if not shadow_enabled:
+                    missing.append(f"{label} shadow mode")
+                if missing:
+                    raise ValueError(
+                        f"infrastructure metering {label} publication requires "
+                        + ", ".join(missing)
+                    )
         if self.collector_enabled and not self.stable_cluster_id:
             raise ValueError(
                 "infrastructure metering collector requires a stable cluster id"

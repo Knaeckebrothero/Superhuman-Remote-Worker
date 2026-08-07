@@ -357,6 +357,232 @@ REQUIRED_SLICE2_VOLUME_APP_CONSTRAINTS = frozenset(
     REQUIRED_SLICE2_VOLUME_APP_CONSTRAINT_RELATIONS
 )
 
+# Slice 3 compute classes share one activation/journal migration, but remain
+# independently gated at runtime. This probe establishes only schema safety;
+# it never implies that any class is in shadow or active state.
+REQUIRED_SLICE3_COMPUTE_APP_TABLES = frozenset(
+    {
+        "agent_metering_binding_events",
+        "agent_metering_pod_identity_state",
+        "compute_metering_activation",
+        "compute_metering_epoch_authorities",
+        "compute_metering_epoch_promotion_requests",
+        "compute_metering_scope_requirements",
+        "compute_shadow_observations",
+    }
+)
+
+REQUIRED_SLICE3_COMPUTE_APP_INDEX_RELATIONS = {
+    "agent_metering_binding_events_pod_time_idx": "agent_metering_binding_events",
+    "agent_metering_binding_events_owner_time_idx": "agent_metering_binding_events",
+    "agent_metering_pod_identity_state_pod_uid_idx": (
+        "agent_metering_pod_identity_state"
+    ),
+    "agent_metering_pod_identity_state_owner_idx": (
+        "agent_metering_pod_identity_state"
+    ),
+    "compute_shadow_observations_latest_idx": "compute_shadow_observations",
+    "compute_shadow_observations_retention_idx": "compute_shadow_observations",
+    "compute_metering_scope_requirements_scope_idx": (
+        "compute_metering_scope_requirements"
+    ),
+    "compute_metering_scope_requirements_epoch_idx": (
+        "compute_metering_scope_requirements"
+    ),
+    "compute_epoch_promotion_requests_activation_idx": (
+        "compute_metering_epoch_promotion_requests"
+    ),
+    "compute_epoch_authorities_current_idx": "compute_metering_epoch_authorities",
+    "compute_epoch_authorities_epoch_idx": "compute_metering_epoch_authorities",
+    "resource_intervals_compute_scope_epoch_idx": "resource_intervals",
+}
+REQUIRED_SLICE3_COMPUTE_APP_INDEXES = frozenset(
+    REQUIRED_SLICE3_COMPUTE_APP_INDEX_RELATIONS
+)
+
+REQUIRED_SLICE3_COMPUTE_APP_TRIGGER_RELATIONS = {
+    "agent_metering_agents_delete": "agents",
+    "agent_metering_agents_insert": "agents",
+    "agent_metering_agents_update": "agents",
+    "agent_metering_binding_events_append_only": "agent_metering_binding_events",
+    "agent_metering_jobs_delete": "jobs",
+    "agent_metering_jobs_insert": "jobs",
+    "agent_metering_jobs_update": "jobs",
+    "agent_metering_pod_identity_state_journal": ("agent_metering_pod_identity_state"),
+    "agent_metering_pod_identity_state_one_way": ("agent_metering_pod_identity_state"),
+    "agent_metering_threads_delete": "threads",
+    "agent_metering_threads_insert": "threads",
+    "agent_metering_threads_update": "threads",
+    "compute_metering_activation_one_way": "compute_metering_activation",
+    "compute_metering_scope_requirements_immutable": (
+        "compute_metering_scope_requirements"
+    ),
+    "compute_shadow_observations_immutable": "compute_shadow_observations",
+    "compute_epoch_promotion_requests_immutable": (
+        "compute_metering_epoch_promotion_requests"
+    ),
+    "compute_metering_epoch_authorities_immutable": (
+        "compute_metering_epoch_authorities"
+    ),
+    "resource_intervals_compute_epoch_authority_guard": "resource_intervals",
+    "resource_inventory_epochs_compute_retirement": ("resource_inventory_scope_epochs"),
+    "resource_inventory_epochs_recovery_identity_immutable": (
+        "resource_inventory_scope_epochs"
+    ),
+}
+REQUIRED_SLICE3_COMPUTE_APP_TRIGGERS = frozenset(
+    REQUIRED_SLICE3_COMPUTE_APP_TRIGGER_RELATIONS
+)
+
+REQUIRED_SLICE3_COMPUTE_APP_CONSTRAINT_RELATIONS = {
+    "agent_metering_binding_events_agent_revision_uq": (
+        "agent_metering_binding_events"
+    ),
+    "agent_metering_binding_events_attribution_check": (
+        "agent_metering_binding_events"
+    ),
+    "agent_metering_binding_events_identity_check": "agent_metering_binding_events",
+    "agent_metering_pod_identity_state_attribution_check": (
+        "agent_metering_pod_identity_state"
+    ),
+    "agent_metering_pod_identity_state_identity_check": (
+        "agent_metering_pod_identity_state"
+    ),
+    "compute_metering_activation_key_check": "compute_metering_activation",
+    "compute_metering_activation_state_check": "compute_metering_activation",
+    "compute_metering_scope_requirements_activation_fkey": (
+        "compute_metering_scope_requirements"
+    ),
+    "compute_metering_scope_requirements_boundary_check": (
+        "compute_metering_scope_requirements"
+    ),
+    "compute_metering_scope_requirements_epoch_scope_fkey": (
+        "compute_metering_scope_requirements"
+    ),
+    "compute_metering_scope_requirements_epoch_uq": (
+        "compute_metering_scope_requirements"
+    ),
+    "compute_metering_scope_requirements_pkey": ("compute_metering_scope_requirements"),
+    "compute_metering_scope_requirements_scope_fkey": (
+        "compute_metering_scope_requirements"
+    ),
+    "compute_shadow_observations_attribution_check": "compute_shadow_observations",
+    "compute_shadow_observations_capacity_check": "compute_shadow_observations",
+    "compute_shadow_observations_identity_check": "compute_shadow_observations",
+    "compute_shadow_observations_item_uq": "compute_shadow_observations",
+    "compute_shadow_observations_snapshot_fkey": "compute_shadow_observations",
+    "compute_epoch_promotion_requests_kind_check": (
+        "compute_metering_epoch_promotion_requests"
+    ),
+    "compute_epoch_promotion_requests_identity_check": (
+        "compute_metering_epoch_promotion_requests"
+    ),
+    "compute_metering_epoch_promotion_requests_pkey": (
+        "compute_metering_epoch_promotion_requests"
+    ),
+    "compute_metering_epoch_promotion_requests_activation_key_fkey": (
+        "compute_metering_epoch_promotion_requests"
+    ),
+    "compute_metering_epoch_authorities_pkey": ("compute_metering_epoch_authorities"),
+    "compute_metering_epoch_authorities_activation_key_fkey": (
+        "compute_metering_epoch_authorities"
+    ),
+    "compute_metering_epoch_authorities_promotion_request_id_fkey": (
+        "compute_metering_epoch_authorities"
+    ),
+    "compute_epoch_authorities_scope_fkey": ("compute_metering_epoch_authorities"),
+    "compute_epoch_authorities_epoch_scope_fkey": (
+        "compute_metering_epoch_authorities"
+    ),
+    "compute_epoch_authorities_predecessor_scope_fkey": (
+        "compute_metering_epoch_authorities"
+    ),
+    "compute_epoch_authorities_proof_epoch_fkey": (
+        "compute_metering_epoch_authorities"
+    ),
+    "compute_epoch_authorities_proof_scope_fkey": (
+        "compute_metering_epoch_authorities"
+    ),
+    "compute_epoch_authorities_id_scope_uq": ("compute_metering_epoch_authorities"),
+    "compute_epoch_authorities_previous_fkey": ("compute_metering_epoch_authorities"),
+    "compute_epoch_authorities_epoch_uq": ("compute_metering_epoch_authorities"),
+    "compute_epoch_authorities_sequence_uq": ("compute_metering_epoch_authorities"),
+    "compute_epoch_authorities_request_scope_uq": (
+        "compute_metering_epoch_authorities"
+    ),
+    "compute_epoch_authorities_sequence_check": ("compute_metering_epoch_authorities"),
+    "resource_inventory_scope_epochs_retirement_check": (
+        "resource_inventory_scope_epochs"
+    ),
+    "resource_intervals_compute_scope_epoch_fkey": "resource_intervals",
+    "resource_intervals_compute_scope_epoch_shape_check": "resource_intervals",
+}
+REQUIRED_SLICE3_COMPUTE_APP_CONSTRAINTS = frozenset(
+    REQUIRED_SLICE3_COMPUTE_APP_CONSTRAINT_RELATIONS
+)
+
+REQUIRED_SLICE3_COMPUTE_APP_COLUMNS = frozenset(
+    {"resource_intervals.compute_scope_epoch_id"}
+)
+
+# Slice 3B adds an exact, immutable set of storage authorities on top of the
+# Slice 2 per-basis master. Remote PVC/PV inventory remains useful without this
+# schema, but shadow reconciliation, lifecycle accrual, and publication must
+# fail closed until every source is independently fenced.
+REQUIRED_SLICE3_STORAGE_APP_TABLES = frozenset(
+    {
+        "storage_metering_source_activations",
+        "storage_metering_source_requirements",
+    }
+)
+
+REQUIRED_SLICE3_STORAGE_APP_INDEX_RELATIONS = {
+    "storage_metering_source_requirements_scope_idx": (
+        "storage_metering_source_requirements"
+    ),
+}
+REQUIRED_SLICE3_STORAGE_APP_INDEXES = frozenset(
+    REQUIRED_SLICE3_STORAGE_APP_INDEX_RELATIONS
+)
+
+REQUIRED_SLICE3_STORAGE_APP_TRIGGER_RELATIONS = {
+    "storage_metering_source_activations_one_way": (
+        "storage_metering_source_activations"
+    ),
+    "storage_metering_source_requirements_immutable": (
+        "storage_metering_source_requirements"
+    ),
+}
+REQUIRED_SLICE3_STORAGE_APP_TRIGGERS = frozenset(
+    REQUIRED_SLICE3_STORAGE_APP_TRIGGER_RELATIONS
+)
+
+REQUIRED_SLICE3_STORAGE_APP_CONSTRAINT_RELATIONS = {
+    "resource_inventory_scopes_source_identity_uq": "resource_inventory_scopes",
+    "storage_metering_source_activations_pkey": ("storage_metering_source_activations"),
+    "storage_metering_source_activations_identity_check": (
+        "storage_metering_source_activations"
+    ),
+    "storage_metering_source_activations_state_check": (
+        "storage_metering_source_activations"
+    ),
+    "storage_metering_source_requirements_pkey": (
+        "storage_metering_source_requirements"
+    ),
+    "storage_metering_source_requirements_activation_fkey": (
+        "storage_metering_source_requirements"
+    ),
+    "storage_metering_source_requirements_scope_fkey": (
+        "storage_metering_source_requirements"
+    ),
+    "storage_metering_source_requirements_role_check": (
+        "storage_metering_source_requirements"
+    ),
+}
+REQUIRED_SLICE3_STORAGE_APP_CONSTRAINTS = frozenset(
+    REQUIRED_SLICE3_STORAGE_APP_CONSTRAINT_RELATIONS
+)
+
 REQUIRED_AUDIT_TRIGGER_RELATIONS = {
     "usage_events_rollup_dirty_days": "usage_events",
     "usage_events_append_only_v2": "usage_events",
@@ -424,6 +650,7 @@ class MeteringSchemaCapabilities:
     append_only_trigger: bool = False
     target_partitions_ready: bool = False
     storage_activation_seed_rows_ready: bool = False
+    compute_activation_seed_rows_ready: bool = False
     storage_identity_key_registered: bool = False
     storage_identity_key_version: str | None = None
 
@@ -490,6 +717,42 @@ class MeteringSchemaCapabilities:
     @property
     def missing_slice2_volume_app_constraints(self) -> frozenset[str]:
         return REQUIRED_SLICE2_VOLUME_APP_CONSTRAINTS - self.app_constraints
+
+    @property
+    def missing_slice3_compute_app_tables(self) -> frozenset[str]:
+        return REQUIRED_SLICE3_COMPUTE_APP_TABLES - self.app_tables
+
+    @property
+    def missing_slice3_compute_app_indexes(self) -> frozenset[str]:
+        return REQUIRED_SLICE3_COMPUTE_APP_INDEXES - self.app_indexes
+
+    @property
+    def missing_slice3_compute_app_triggers(self) -> frozenset[str]:
+        return REQUIRED_SLICE3_COMPUTE_APP_TRIGGERS - self.app_triggers
+
+    @property
+    def missing_slice3_compute_app_constraints(self) -> frozenset[str]:
+        return REQUIRED_SLICE3_COMPUTE_APP_CONSTRAINTS - self.app_constraints
+
+    @property
+    def missing_slice3_compute_app_columns(self) -> frozenset[str]:
+        return REQUIRED_SLICE3_COMPUTE_APP_COLUMNS - self.app_columns
+
+    @property
+    def missing_slice3_storage_app_tables(self) -> frozenset[str]:
+        return REQUIRED_SLICE3_STORAGE_APP_TABLES - self.app_tables
+
+    @property
+    def missing_slice3_storage_app_indexes(self) -> frozenset[str]:
+        return REQUIRED_SLICE3_STORAGE_APP_INDEXES - self.app_indexes
+
+    @property
+    def missing_slice3_storage_app_triggers(self) -> frozenset[str]:
+        return REQUIRED_SLICE3_STORAGE_APP_TRIGGERS - self.app_triggers
+
+    @property
+    def missing_slice3_storage_app_constraints(self) -> frozenset[str]:
+        return REQUIRED_SLICE3_STORAGE_APP_CONSTRAINTS - self.app_constraints
 
     @property
     def missing_app_tables(self) -> frozenset[str]:
@@ -601,6 +864,32 @@ class MeteringSchemaCapabilities:
 
         return self.slice2_volume_schema_ready and self.storage_identity_key_registered
 
+    @property
+    def slice3_compute_inventory_ready(self) -> bool:
+        """Compute activation, shadow, and agent identity journal readiness."""
+
+        return (
+            self.slice1_inventory_ready
+            and not self.missing_slice3_compute_app_tables
+            and not self.missing_slice3_compute_app_indexes
+            and not self.missing_slice3_compute_app_triggers
+            and not self.missing_slice3_compute_app_constraints
+            and not self.missing_slice3_compute_app_columns
+            and self.compute_activation_seed_rows_ready
+        )
+
+    @property
+    def slice3_storage_lifecycle_ready(self) -> bool:
+        """Exact per-source storage shadow/lifecycle/publication contract."""
+
+        return (
+            self.slice2_volume_schema_ready
+            and not self.missing_slice3_storage_app_tables
+            and not self.missing_slice3_storage_app_indexes
+            and not self.missing_slice3_storage_app_triggers
+            and not self.missing_slice3_storage_app_constraints
+        )
+
     def diagnostics(self) -> dict[str, Any]:
         return {
             "slice0_ready": self.slice0_ready,
@@ -645,6 +934,38 @@ class MeteringSchemaCapabilities:
             ),
             "storage_identity_key_registered": self.storage_identity_key_registered,
             "storage_identity_key_version": self.storage_identity_key_version,
+            "slice3_compute_inventory_ready": self.slice3_compute_inventory_ready,
+            "slice3_storage_lifecycle_ready": self.slice3_storage_lifecycle_ready,
+            "compute_activation_seed_rows_ready": (
+                self.compute_activation_seed_rows_ready
+            ),
+            "missing_slice3_compute_app_tables": sorted(
+                self.missing_slice3_compute_app_tables
+            ),
+            "missing_slice3_compute_app_indexes": sorted(
+                self.missing_slice3_compute_app_indexes
+            ),
+            "missing_slice3_compute_app_triggers": sorted(
+                self.missing_slice3_compute_app_triggers
+            ),
+            "missing_slice3_compute_app_constraints": sorted(
+                self.missing_slice3_compute_app_constraints
+            ),
+            "missing_slice3_compute_app_columns": sorted(
+                self.missing_slice3_compute_app_columns
+            ),
+            "missing_slice3_storage_app_tables": sorted(
+                self.missing_slice3_storage_app_tables
+            ),
+            "missing_slice3_storage_app_indexes": sorted(
+                self.missing_slice3_storage_app_indexes
+            ),
+            "missing_slice3_storage_app_triggers": sorted(
+                self.missing_slice3_storage_app_triggers
+            ),
+            "missing_slice3_storage_app_constraints": sorted(
+                self.missing_slice3_storage_app_constraints
+            ),
             "missing_slice2_claim_app_tables": sorted(
                 self.missing_slice2_claim_app_tables
             ),
@@ -814,7 +1135,9 @@ async def probe_schema_capabilities(
         | REQUIRED_SLICE1_APP_TABLES
         | REQUIRED_SLICE1_RUNTIME_APP_TABLES
         | REQUIRED_SLICE2_CLAIM_APP_TABLES
-        | REQUIRED_SLICE2_VOLUME_APP_TABLES,
+        | REQUIRED_SLICE2_VOLUME_APP_TABLES
+        | REQUIRED_SLICE3_COMPUTE_APP_TABLES
+        | REQUIRED_SLICE3_STORAGE_APP_TABLES,
     )
     app_indexes = await _index_names(
         app_pool,
@@ -822,7 +1145,9 @@ async def probe_schema_capabilities(
         | REQUIRED_SLICE1_APP_INDEX_RELATIONS
         | REQUIRED_SLICE1_RUNTIME_APP_INDEX_RELATIONS
         | REQUIRED_SLICE2_CLAIM_APP_INDEX_RELATIONS
-        | REQUIRED_SLICE2_VOLUME_APP_INDEX_RELATIONS,
+        | REQUIRED_SLICE2_VOLUME_APP_INDEX_RELATIONS
+        | REQUIRED_SLICE3_COMPUTE_APP_INDEX_RELATIONS
+        | REQUIRED_SLICE3_STORAGE_APP_INDEX_RELATIONS,
     )
     app_triggers = await _enabled_trigger_names(
         app_pool,
@@ -830,17 +1155,21 @@ async def probe_schema_capabilities(
         | REQUIRED_SLICE1_APP_TRIGGER_RELATIONS
         | REQUIRED_SLICE1_RUNTIME_APP_TRIGGER_RELATIONS
         | REQUIRED_SLICE2_CLAIM_APP_TRIGGER_RELATIONS
-        | REQUIRED_SLICE2_VOLUME_APP_TRIGGER_RELATIONS,
+        | REQUIRED_SLICE2_VOLUME_APP_TRIGGER_RELATIONS
+        | REQUIRED_SLICE3_COMPUTE_APP_TRIGGER_RELATIONS
+        | REQUIRED_SLICE3_STORAGE_APP_TRIGGER_RELATIONS,
     )
     app_columns = await _qualified_column_names(
         app_pool,
-        REQUIRED_SLICE1_RUNTIME_APP_COLUMNS,
+        REQUIRED_SLICE1_RUNTIME_APP_COLUMNS | REQUIRED_SLICE3_COMPUTE_APP_COLUMNS,
     )
     app_constraints = await _validated_constraint_names(
         app_pool,
         REQUIRED_SLICE1_RUNTIME_APP_CONSTRAINT_RELATIONS
         | REQUIRED_SLICE2_CLAIM_APP_CONSTRAINT_RELATIONS
-        | REQUIRED_SLICE2_VOLUME_APP_CONSTRAINT_RELATIONS,
+        | REQUIRED_SLICE2_VOLUME_APP_CONSTRAINT_RELATIONS
+        | REQUIRED_SLICE3_COMPUTE_APP_CONSTRAINT_RELATIONS
+        | REQUIRED_SLICE3_STORAGE_APP_CONSTRAINT_RELATIONS,
     )
     audit_tables = await _table_names(audit_pool, REQUIRED_AUDIT_TABLES)
     audit_indexes = await _index_names(audit_pool, REQUIRED_AUDIT_INDEX_RELATIONS)
@@ -852,6 +1181,7 @@ async def probe_schema_capabilities(
     append_only_trigger = False
     target_partitions_ready = False
     storage_activation_seed_rows_ready = False
+    compute_activation_seed_rows_ready = False
     storage_identity_key_registered = False
     storage_identity_key_version: str | None = None
     if app_pool is not None and not (REQUIRED_APP_TABLES - app_tables):
@@ -883,6 +1213,22 @@ async def probe_schema_capabilities(
         except Exception:
             logger.warning(
                 "metering storage activation seed probe failed", exc_info=True
+            )
+    if app_pool is not None and "compute_metering_activation" in app_tables:
+        try:
+            compute_activation_seed_rows_ready = bool(
+                await app_pool.fetchval(
+                    "SELECT count(*) = 3 "
+                    "AND count(*) FILTER (WHERE activation_key='agent_pod') = 1 "
+                    "AND count(*) FILTER (WHERE activation_key="
+                    "'ide_workspace_pod') = 1 "
+                    "AND count(*) FILTER (WHERE activation_key='workspace_vm') = 1 "
+                    "FROM compute_metering_activation"
+                )
+            )
+        except Exception:
+            logger.warning(
+                "metering compute activation seed probe failed", exc_info=True
             )
     if app_pool is not None and "storage_identity_key_state" in app_tables:
         try:
@@ -958,6 +1304,7 @@ async def probe_schema_capabilities(
         append_only_trigger=append_only_trigger,
         target_partitions_ready=target_partitions_ready,
         storage_activation_seed_rows_ready=storage_activation_seed_rows_ready,
+        compute_activation_seed_rows_ready=compute_activation_seed_rows_ready,
         storage_identity_key_registered=storage_identity_key_registered,
         storage_identity_key_version=storage_identity_key_version,
     )

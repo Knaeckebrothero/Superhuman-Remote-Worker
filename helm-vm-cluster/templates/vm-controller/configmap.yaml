@@ -38,11 +38,16 @@ data:
       labels:
         vm.kubevirt.io/name: agent-vm-${JOB_ID}
         job-id: ${JOB_ID}
+        srw.io/owner-kind: "${OWNER_KIND}"
+        srw.io/owner-id: "${OWNER_ID}"
     spec:
       runStrategy: RerunOnFailure
       dataVolumeTemplates:
         - metadata:
             name: agent-vm-${JOB_ID}-rootdisk
+            labels:
+              srw.io/owner-kind: "${OWNER_KIND}"
+              srw.io/owner-id: "${OWNER_ID}"
           spec:
             storage:
               accessModes:
@@ -59,6 +64,8 @@ data:
           labels:
             vm.kubevirt.io/name: agent-vm-${JOB_ID}
             job-id: ${JOB_ID}
+            srw.io/owner-kind: "${OWNER_KIND}"
+            srw.io/owner-id: "${OWNER_ID}"
             # Selector for the workspace NetworkPolicy. MUST live here
             # (VMI template), not on the top-level VM metadata —
             # only template labels propagate to the virt-launcher pod.

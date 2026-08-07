@@ -36,6 +36,8 @@ def _pvc(**overrides: object) -> dict[str, object]:
             "labels": {
                 "app": "srw-workspace",
                 "srw/job-id": "job-1",
+                "srw.io/owner-kind": "job",
+                "srw.io/owner-id": "job-1",
                 "private.example/token": "must-never-leave-the-normalizer",
             },
             "ownerReferences": [
@@ -128,6 +130,8 @@ def test_pvc_projects_requested_capacity_and_only_safe_classification_fields() -
     assert projected["labels"] == {
         "app": "srw-workspace",
         "srw/job-id": "job-1",
+        "srw.io/owner-id": "job-1",
+        "srw.io/owner-kind": "job",
     }
     assert projected["owner_references"] == [
         {"kind": "DataVolume", "uid": "dv-uid", "name": "root-disk"}

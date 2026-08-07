@@ -17,6 +17,7 @@ from orchestrator.services.infrastructure_metering.ingestion_types import (
     InventoryWatchApply,
     InventoryWatchFinish,
     WatchObservationWire,
+    validate_normalized_vmi_payload,
 )
 
 
@@ -59,6 +60,72 @@ def test_ticket_intents_require_exact_snapshot_or_watch_shape():
             snapshot_id=SNAPSHOT_ID,
             starting_resource_version="rv-1",
         )
+
+
+def test_vmi_payload_validator_accepts_only_consistent_admitted_capacity():
+    payload = {
+        "source_kind": "vmi",
+        "api_version": "kubevirt.io/v1",
+        "namespace": "srw-vms",
+        "name": "vm-one",
+        "uid": "vmi-uid-one",
+        "resource_version": "17",
+        "owner_hint": {"kind": "job", "owner_id": "job-one"},
+        "vm_reference": {"uid": "vm-uid-one", "name": "vm-one"},
+        "root_data_volume": {"name": "vm-one-rootdisk"},
+        "lifecycle": {
+            "state": "active",
+            "scheduled": True,
+            "terminal": False,
+            "accrues": True,
+            "phase": "Running",
+            "node_name": "node-one",
+            "paused": False,
+            "migrating": False,
+            "deletion_requested": False,
+            "creation_timestamp": "2026-08-05T12:00:00.000000Z",
+            "deletion_timestamp": None,
+            "scheduled_transition_timestamp": "2026-08-05T12:00:01.000000Z",
+            "terminal_transition_timestamp": None,
+            "phase_transitions": [
+                {"phase": "Scheduled", "timestamp": "2026-08-05T12:00:01.000000Z"}
+            ],
+        },
+        "capacity": {
+            "cpu_millicores": 8000,
+            "memory_bytes": 16 * 1024**3,
+            "cpu_topology": {
+                "cores": 2,
+                "sockets": 2,
+                "threads": 2,
+                "vcpus": 8,
+            },
+            "memory_evidence": {
+                "original": "16Gi",
+                "decimal_value": str(16 * 1024**3),
+                "normalized_value": 16 * 1024**3,
+                "normalized_unit": "byte",
+            },
+            "cpu_source": "vmi-admitted-topology",
+            "memory_source": "vmi-admitted-guest-memory",
+            "capacity_quality": "exact",
+            "measurement_algorithm": "kubevirt-vmi-current-guest-v2",
+        },
+        "measurement_basis": "guest-provisioned",
+        "measurement_algorithm": "kubevirt-vmi-current-guest-v2",
+        "resource": "workspace_vm",
+        "diagnostics": [],
+        "valid_for_metering": True,
+        "revision_hash": "a" * 64,
+    }
+
+    assert validate_normalized_vmi_payload(payload) is payload
+    with pytest.raises(ValidationError, match="CPU capacity"):
+        validate_normalized_vmi_payload(
+            {**payload, "capacity": {**payload["capacity"], "cpu_millicores": 7000}}
+        )
+    with pytest.raises(ValidationError, match="extra_forbidden"):
+        validate_normalized_vmi_payload({**payload, "annotations": {}})
     with pytest.raises(ValidationError):
         InventoryTicketRequest(
             scope=SCOPE,

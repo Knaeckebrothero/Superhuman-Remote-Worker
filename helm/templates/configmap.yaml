@@ -1,3 +1,58 @@
+{{- $remoteIngress := .Values.infrastructureMetering.remoteIngress | default dict -}}
+{{- $vmPvcInventory := .Values.infrastructureMetering.vmPvcInventoryEnabled | default false -}}
+{{- $vmPvInventory := .Values.infrastructureMetering.vmPvInventoryEnabled | default false -}}
+{{- $remoteInventory := or (.Values.infrastructureMetering.vmInventoryEnabled | default false) $vmPvcInventory $vmPvInventory -}}
+{{- $remoteStorageInventory := or $vmPvcInventory $vmPvInventory -}}
+{{- $primaryIngestionSecretName := .Values.infrastructureMetering.ingestionSecretName | default (printf "%s-infra-ingestion" (include "srw.fullname" .) | trunc 63 | trimSuffix "-") -}}
+{{- $vmLifecycleAuthSecretName := .Values.infrastructureMetering.vmLifecycleAuthSecretName | default "" -}}
+{{- $volumeIdentitySecretName := .Values.infrastructureMetering.volumeIdentitySecretName | default (printf "%s-infra-volume-identity" (include "srw.fullname" .) | trunc 63 | trimSuffix "-") -}}
+{{- if $vmLifecycleAuthSecretName }}
+{{- if eq $vmLifecycleAuthSecretName (include "srw.secretName" .) }}
+{{- fail "infrastructureMetering.vmLifecycleAuthSecretName must be separate from the application Secret" }}
+{{- end }}
+{{- if eq $vmLifecycleAuthSecretName $primaryIngestionSecretName }}
+{{- fail "infrastructureMetering.vmLifecycleAuthSecretName must be separate from ingestionSecretName" }}
+{{- end }}
+{{- if and .Values.infrastructureMetering.vmIngestionSecretName (eq $vmLifecycleAuthSecretName .Values.infrastructureMetering.vmIngestionSecretName) }}
+{{- fail "infrastructureMetering.vmLifecycleAuthSecretName must be separate from vmIngestionSecretName" }}
+{{- end }}
+{{- if and .Values.infrastructureMetering.vmStorageIngestionSecretName (eq $vmLifecycleAuthSecretName .Values.infrastructureMetering.vmStorageIngestionSecretName) }}
+{{- fail "infrastructureMetering.vmLifecycleAuthSecretName must be separate from vmStorageIngestionSecretName" }}
+{{- end }}
+{{- if eq $vmLifecycleAuthSecretName $volumeIdentitySecretName }}
+{{- fail "infrastructureMetering.vmLifecycleAuthSecretName must be separate from volumeIdentitySecretName" }}
+{{- end }}
+{{- if and .Values.infrastructureMetering.vmIngestionSecretName (eq .Values.vmController.lifecycleAuthSecretName .Values.infrastructureMetering.vmIngestionSecretName) }}
+{{- fail "vmController.lifecycleAuthSecretName must be separate from vmIngestionSecretName" }}
+{{- end }}
+{{- if and .Values.infrastructureMetering.vmStorageIngestionSecretName (eq .Values.vmController.lifecycleAuthSecretName .Values.infrastructureMetering.vmStorageIngestionSecretName) }}
+{{- fail "vmController.lifecycleAuthSecretName must be separate from vmStorageIngestionSecretName" }}
+{{- end }}
+{{- if eq .Values.vmController.lifecycleAuthSecretName $volumeIdentitySecretName }}
+{{- fail "vmController.lifecycleAuthSecretName must be separate from volumeIdentitySecretName" }}
+{{- end }}
+{{- end }}
+{{- if .Values.vmController.lifecycleAuthSecretName }}
+{{- if eq .Values.vmController.lifecycleAuthSecretName (include "srw.secretName" .) }}
+{{- fail "vmController.lifecycleAuthSecretName must be separate from the application Secret" }}
+{{- end }}
+{{- if eq .Values.vmController.lifecycleAuthSecretName $primaryIngestionSecretName }}
+{{- fail "vmController.lifecycleAuthSecretName must be separate from infrastructure metering ingestion Secrets" }}
+{{- end }}
+{{- end }}
+{{- if .Values.vmController.enabled }}
+{{- if ne (empty $vmLifecycleAuthSecretName) (empty .Values.vmController.lifecycleAuthSecretName) }}
+{{- fail "vmController.enabled requires infrastructureMetering.vmLifecycleAuthSecretName and vmController.lifecycleAuthSecretName to be both set or both empty" }}
+{{- end }}
+{{- if and $vmLifecycleAuthSecretName .Values.vmController.lifecycleAuthSecretName }}
+{{- if ne $vmLifecycleAuthSecretName .Values.vmController.lifecycleAuthSecretName }}
+{{- fail "co-located vmController lifecycle authentication must use the same Secret name as infrastructureMetering.vmLifecycleAuthSecretName" }}
+{{- end }}
+{{- if ne (.Values.infrastructureMetering.vmLifecycleAuthSecretKey | default "VM_LIFECYCLE_HMAC_SECRET") (.Values.vmController.lifecycleAuthSecretKey | default "VM_LIFECYCLE_HMAC_SECRET") }}
+{{- fail "co-located vmController lifecycle authentication must use the same Secret key as infrastructureMetering.vmLifecycleAuthSecretKey" }}
+{{- end }}
+{{- end }}
+{{- end }}
 {{- if and .Values.infrastructureMetering.shadowEnabled (not .Values.infrastructureMetering.collectorEnabled) }}
 {{- fail "infrastructureMetering.shadowEnabled requires collectorEnabled" }}
 {{- end }}
@@ -52,6 +107,158 @@
 {{- end }}
 {{- if not .Values.infrastructureMetering.pvShadowEnabled }}
 {{- fail "infrastructureMetering.pvPublicationEnabled requires pvShadowEnabled" }}
+{{- end }}
+{{- end }}
+{{- if or .Values.infrastructureMetering.idePodShadowEnabled .Values.infrastructureMetering.agentPodShadowEnabled }}
+{{- if not .Values.infrastructureMetering.collectorEnabled }}
+{{- fail "infrastructureMetering IDE/agent Pod shadow gates require collectorEnabled" }}
+{{- end }}
+{{- if not .Values.infrastructureMetering.shadowEnabled }}
+{{- fail "infrastructureMetering IDE/agent Pod shadow gates require shadowEnabled" }}
+{{- end }}
+{{- end }}
+{{- if .Values.infrastructureMetering.idePodPublicationEnabled }}
+{{- if not .Values.infrastructureMetering.publicationEnabled }}
+{{- fail "infrastructureMetering.idePodPublicationEnabled requires publicationEnabled" }}
+{{- end }}
+{{- if not .Values.infrastructureMetering.idePodShadowEnabled }}
+{{- fail "infrastructureMetering.idePodPublicationEnabled requires idePodShadowEnabled" }}
+{{- end }}
+{{- end }}
+{{- if .Values.infrastructureMetering.agentPodPublicationEnabled }}
+{{- if not .Values.infrastructureMetering.publicationEnabled }}
+{{- fail "infrastructureMetering.agentPodPublicationEnabled requires publicationEnabled" }}
+{{- end }}
+{{- if not .Values.infrastructureMetering.agentPodShadowEnabled }}
+{{- fail "infrastructureMetering.agentPodPublicationEnabled requires agentPodShadowEnabled" }}
+{{- end }}
+{{- end }}
+{{- if .Values.infrastructureMetering.vmInventoryEnabled }}
+{{- if not .Values.infrastructureMetering.collectorEnabled }}
+{{- fail "infrastructureMetering.vmInventoryEnabled requires collectorEnabled" }}
+{{- end }}
+{{- if not .Values.infrastructureMetering.vmStableClusterId }}
+{{- fail "infrastructureMetering.vmInventoryEnabled requires vmStableClusterId" }}
+{{- end }}
+{{- if not .Values.infrastructureMetering.vmNamespace }}
+{{- fail "infrastructureMetering.vmInventoryEnabled requires vmNamespace" }}
+{{- end }}
+{{- if not .Values.infrastructureMetering.vmIngestionSecretName }}
+{{- fail "infrastructureMetering.vmInventoryEnabled requires vmIngestionSecretName" }}
+{{- end }}
+{{- if eq .Values.infrastructureMetering.vmIngestionSecretName (include "srw.secretName" .) }}
+{{- fail "infrastructureMetering.vmIngestionSecretName must be separate from the application Secret" }}
+{{- end }}
+{{- if eq .Values.infrastructureMetering.vmIngestionSecretName $primaryIngestionSecretName }}
+{{- fail "infrastructureMetering.vmIngestionSecretName must be separate from ingestionSecretName" }}
+{{- end }}
+{{- end }}
+{{- if .Values.infrastructureMetering.vmShadowEnabled }}
+{{- if not .Values.infrastructureMetering.vmInventoryEnabled }}
+{{- fail "infrastructureMetering.vmShadowEnabled requires vmInventoryEnabled" }}
+{{- end }}
+{{- if not .Values.infrastructureMetering.shadowEnabled }}
+{{- fail "infrastructureMetering.vmShadowEnabled requires shadowEnabled" }}
+{{- end }}
+{{- end }}
+{{- if .Values.infrastructureMetering.vmPublicationEnabled }}
+{{- if not .Values.infrastructureMetering.publicationEnabled }}
+{{- fail "infrastructureMetering.vmPublicationEnabled requires publicationEnabled" }}
+{{- end }}
+{{- if not .Values.infrastructureMetering.vmShadowEnabled }}
+{{- fail "infrastructureMetering.vmPublicationEnabled requires vmShadowEnabled" }}
+{{- end }}
+{{- if not $vmLifecycleAuthSecretName }}
+{{- fail "infrastructureMetering.vmPublicationEnabled requires vmLifecycleAuthSecretName" }}
+{{- end }}
+{{- end }}
+{{- if $remoteStorageInventory }}
+{{- if not .Values.infrastructureMetering.collectorEnabled }}
+{{- fail "infrastructureMetering remote storage inventory requires collectorEnabled" }}
+{{- end }}
+{{- if not .Values.infrastructureMetering.vmStableClusterId }}
+{{- fail "infrastructureMetering remote storage inventory requires vmStableClusterId" }}
+{{- end }}
+{{- if not .Values.infrastructureMetering.vmNamespace }}
+{{- fail "infrastructureMetering remote storage inventory requires vmNamespace" }}
+{{- end }}
+{{- if not .Values.infrastructureMetering.vmStorageIngestionSecretName }}
+{{- fail "infrastructureMetering remote storage inventory requires vmStorageIngestionSecretName" }}
+{{- end }}
+{{- if eq .Values.infrastructureMetering.vmStorageIngestionSecretName (include "srw.secretName" .) }}
+{{- fail "infrastructureMetering.vmStorageIngestionSecretName must be separate from the application Secret" }}
+{{- end }}
+{{- if eq .Values.infrastructureMetering.vmStorageIngestionSecretName $primaryIngestionSecretName }}
+{{- fail "infrastructureMetering.vmStorageIngestionSecretName must be separate from ingestionSecretName" }}
+{{- end }}
+{{- if and .Values.infrastructureMetering.vmIngestionSecretName (eq .Values.infrastructureMetering.vmStorageIngestionSecretName .Values.infrastructureMetering.vmIngestionSecretName) }}
+{{- fail "infrastructureMetering.vmStorageIngestionSecretName must be separate from vmIngestionSecretName" }}
+{{- end }}
+{{- if and .Values.infrastructureMetering.volumeIdentitySecretName (eq .Values.infrastructureMetering.vmStorageIngestionSecretName .Values.infrastructureMetering.volumeIdentitySecretName) }}
+{{- fail "infrastructureMetering.vmStorageIngestionSecretName must be separate from volumeIdentitySecretName" }}
+{{- end }}
+{{- end }}
+{{- if .Values.infrastructureMetering.vmPvcShadowEnabled }}
+{{- if not $vmPvcInventory }}
+{{- fail "infrastructureMetering.vmPvcShadowEnabled requires vmPvcInventoryEnabled" }}
+{{- end }}
+{{- if not .Values.infrastructureMetering.shadowEnabled }}
+{{- fail "infrastructureMetering.vmPvcShadowEnabled requires shadowEnabled" }}
+{{- end }}
+{{- end }}
+{{- if .Values.infrastructureMetering.vmPvShadowEnabled }}
+{{- if not $vmPvInventory }}
+{{- fail "infrastructureMetering.vmPvShadowEnabled requires vmPvInventoryEnabled" }}
+{{- end }}
+{{- if not .Values.infrastructureMetering.shadowEnabled }}
+{{- fail "infrastructureMetering.vmPvShadowEnabled requires shadowEnabled" }}
+{{- end }}
+{{- end }}
+{{- if .Values.infrastructureMetering.vmPvcPublicationEnabled }}
+{{- if not (.Values.infrastructureMetering.vmPvcShadowEnabled | default false) }}
+{{- fail "infrastructureMetering.vmPvcPublicationEnabled requires vmPvcShadowEnabled" }}
+{{- end }}
+{{- if not (.Values.infrastructureMetering.publicationEnabled | default false) }}
+{{- fail "infrastructureMetering.vmPvcPublicationEnabled requires publicationEnabled" }}
+{{- end }}
+{{- if not $vmLifecycleAuthSecretName }}
+{{- fail "infrastructureMetering.vmPvcPublicationEnabled requires vmLifecycleAuthSecretName" }}
+{{- end }}
+{{- end }}
+{{- if .Values.infrastructureMetering.vmPvPublicationEnabled }}
+{{- if not (.Values.infrastructureMetering.vmPvShadowEnabled | default false) }}
+{{- fail "infrastructureMetering.vmPvPublicationEnabled requires vmPvShadowEnabled" }}
+{{- end }}
+{{- if not (.Values.infrastructureMetering.publicationEnabled | default false) }}
+{{- fail "infrastructureMetering.vmPvPublicationEnabled requires publicationEnabled" }}
+{{- end }}
+{{- if not $vmLifecycleAuthSecretName }}
+{{- fail "infrastructureMetering.vmPvPublicationEnabled requires vmLifecycleAuthSecretName" }}
+{{- end }}
+{{- end }}
+{{- if $vmPvInventory }}
+{{- if not (.Values.infrastructureMetering.vmPvClusterWideRbacAcknowledged | default false) }}
+{{- fail "infrastructureMetering.vmPvInventoryEnabled requires vmPvClusterWideRbacAcknowledged=true because Kubernetes PV reads are cluster-wide" }}
+{{- end }}
+{{- if not .Values.infrastructureMetering.volumeIdentityKeyVersion }}
+{{- fail "infrastructureMetering.vmPvInventoryEnabled requires volumeIdentityKeyVersion" }}
+{{- end }}
+{{- end }}
+{{- if ($remoteIngress.enabled | default false) }}
+{{- if not $remoteInventory }}
+{{- fail "infrastructureMetering.remoteIngress.enabled requires at least one remote VM inventory gate" }}
+{{- end }}
+{{- if not .Values.ingress.enabled }}
+{{- fail "infrastructureMetering.remoteIngress.enabled requires ingress.enabled" }}
+{{- end }}
+{{- if ne (.Values.ingress.className | default "traefik") "traefik" }}
+{{- fail "infrastructureMetering.remoteIngress.enabled currently requires Traefik" }}
+{{- end }}
+{{- if not .Values.ingress.tls.enabled }}
+{{- fail "infrastructureMetering.remoteIngress.enabled requires ingress TLS" }}
+{{- end }}
+{{- if not $remoteIngress.sourceCidrs }}
+{{- fail "infrastructureMetering.remoteIngress.enabled requires sourceCidrs" }}
 {{- end }}
 {{- end }}
 {{- if and .Values.infrastructureMetering.sourceAwareReadsEnabled (not .Values.infrastructureMetering.v2ReadsEnabled) }}
@@ -342,6 +549,22 @@ data:
   INFRASTRUCTURE_METERING_PV_SHADOW_ENABLED: {{ .Values.infrastructureMetering.pvShadowEnabled | default false | quote }}
   INFRASTRUCTURE_METERING_PVC_PUBLICATION_ENABLED: {{ .Values.infrastructureMetering.pvcPublicationEnabled | default false | quote }}
   INFRASTRUCTURE_METERING_PV_PUBLICATION_ENABLED: {{ .Values.infrastructureMetering.pvPublicationEnabled | default false | quote }}
+  INFRASTRUCTURE_METERING_IDE_POD_SHADOW_ENABLED: {{ .Values.infrastructureMetering.idePodShadowEnabled | default false | quote }}
+  INFRASTRUCTURE_METERING_AGENT_POD_SHADOW_ENABLED: {{ .Values.infrastructureMetering.agentPodShadowEnabled | default false | quote }}
+  INFRASTRUCTURE_METERING_IDE_POD_PUBLICATION_ENABLED: {{ .Values.infrastructureMetering.idePodPublicationEnabled | default false | quote }}
+  INFRASTRUCTURE_METERING_AGENT_POD_PUBLICATION_ENABLED: {{ .Values.infrastructureMetering.agentPodPublicationEnabled | default false | quote }}
+  INFRASTRUCTURE_METERING_VM_INVENTORY_ENABLED: {{ .Values.infrastructureMetering.vmInventoryEnabled | default false | quote }}
+  INFRASTRUCTURE_METERING_VM_SHADOW_ENABLED: {{ .Values.infrastructureMetering.vmShadowEnabled | default false | quote }}
+  INFRASTRUCTURE_METERING_VM_PUBLICATION_ENABLED: {{ .Values.infrastructureMetering.vmPublicationEnabled | default false | quote }}
+  INFRASTRUCTURE_METERING_VM_PVC_INVENTORY_ENABLED: {{ .Values.infrastructureMetering.vmPvcInventoryEnabled | default false | quote }}
+  INFRASTRUCTURE_METERING_VM_PV_INVENTORY_ENABLED: {{ .Values.infrastructureMetering.vmPvInventoryEnabled | default false | quote }}
+  INFRASTRUCTURE_METERING_VM_PVC_SHADOW_ENABLED: {{ .Values.infrastructureMetering.vmPvcShadowEnabled | default false | quote }}
+  INFRASTRUCTURE_METERING_VM_PV_SHADOW_ENABLED: {{ .Values.infrastructureMetering.vmPvShadowEnabled | default false | quote }}
+  INFRASTRUCTURE_METERING_VM_PVC_PUBLICATION_ENABLED: {{ .Values.infrastructureMetering.vmPvcPublicationEnabled | default false | quote }}
+  INFRASTRUCTURE_METERING_VM_PV_PUBLICATION_ENABLED: {{ .Values.infrastructureMetering.vmPvPublicationEnabled | default false | quote }}
+  INFRASTRUCTURE_METERING_VM_PV_CLUSTER_WIDE_RBAC_ACKNOWLEDGED: {{ .Values.infrastructureMetering.vmPvClusterWideRbacAcknowledged | default false | quote }}
+  INFRASTRUCTURE_METERING_VM_STABLE_CLUSTER_ID: {{ .Values.infrastructureMetering.vmStableClusterId | default "" | quote }}
+  INFRASTRUCTURE_METERING_VM_NAMESPACE: {{ .Values.infrastructureMetering.vmNamespace | default "" | quote }}
   INFRASTRUCTURE_METERING_VOLUME_IDENTITY_KEY_VERSION: {{ .Values.infrastructureMetering.volumeIdentityKeyVersion | default "" | quote }}
   INFRASTRUCTURE_METERING_VOLUME_RESOURCE_MAPPINGS_JSON: {{ .Values.infrastructureMetering.volumeResourceMappings | default list | toJson | quote }}
   INFRASTRUCTURE_METERING_STABLE_CLUSTER_ID: {{ .Values.infrastructureMetering.stableClusterId | default "" | quote }}
@@ -349,6 +572,7 @@ data:
   INFRASTRUCTURE_METERING_NAMESPACE_ALLOWLIST: {{ concat (list .Release.Namespace) (.Values.infrastructureMetering.namespaceAllowlist | default list) | uniq | join "," | quote }}
   INFRASTRUCTURE_METERING_RELIST_INTERVAL_SECONDS: {{ .Values.infrastructureMetering.relistIntervalSeconds | default 300 | quote }}
   INFRASTRUCTURE_METERING_STALE_AFTER_SECONDS: {{ .Values.infrastructureMetering.staleAfterSeconds | default 900 | quote }}
+  INFRASTRUCTURE_METERING_MAX_COLLECTOR_CLOCK_SKEW_SECONDS: {{ .Values.infrastructureMetering.maxCollectorClockSkewSeconds | default 300 | quote }}
   INFRASTRUCTURE_METERING_LIST_PAGE_SIZE: {{ .Values.infrastructureMetering.listPageSize | default 500 | quote }}
   INFRASTRUCTURE_METERING_SCOPE_CONCURRENCY: {{ .Values.infrastructureMetering.scopeConcurrency | default 2 | quote }}
   INFRASTRUCTURE_METERING_WATCH_QUEUE_SIZE: {{ .Values.infrastructureMetering.watchQueueSize | default 10000 | quote }}

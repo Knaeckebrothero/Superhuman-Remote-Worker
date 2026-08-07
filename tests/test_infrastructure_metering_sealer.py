@@ -10,8 +10,14 @@ from uuid import UUID, uuid4
 
 import pytest
 
+from orchestrator.services.infrastructure_metering.materializer import (
+    StoragePublicationAuthority,
+    StoragePublicationPolicy,
+)
 from orchestrator.services.infrastructure_metering.sealer import (
+    _INTERVAL_BLOCKER_SQL,
     _ITEM_BLOCKER_SQL,
+    _PLAN_BLOCKER_SQL,
     DaySealDisposition,
     DaySealingBlocked,
     DaySealingDisabled,
@@ -30,11 +36,29 @@ EPOCH_ID = UUID("10000000-0000-0000-0000-000000000001")
 SCOPE_ID = UUID("20000000-0000-0000-0000-000000000001")
 
 
+def _storage_policy(
+    *authorities: tuple[str, str, str],
+) -> StoragePublicationPolicy:
+    return StoragePublicationPolicy(
+        authorities=tuple(
+            StoragePublicationAuthority(
+                measurement_basis=basis,
+                collector_id=collector_id,
+                source_cluster=source_cluster,
+            )
+            for basis, collector_id, source_cluster in authorities
+        )
+    )
+
+
 def _epoch(**overrides: Any) -> dict[str, Any]:
     row = {
         "id": EPOCH_ID,
         "scope_id": SCOPE_ID,
         "api_resource": "core/v1/pods",
+        "collector_id": "kubernetes-pods",
+        "source_cluster": "main-dev",
+        "namespace": "srw",
         "required_from": CUTOVER,
         "reliable_from": CUTOVER - timedelta(hours=1),
         "continuous_since": CUTOVER - timedelta(hours=1),
@@ -45,12 +69,32 @@ def _epoch(**overrides: Any) -> dict[str, Any]:
     return row
 
 
+def _storage_requirement(
+    *,
+    measurement_basis: str = "claim-requested",
+    collector_id: str = "kubernetes-pods",
+    source_cluster: str = "main-dev",
+    inventory_scope_id: UUID = SCOPE_ID,
+    requirement_role: str = "quantity",
+    effective_from: datetime = CUTOVER,
+) -> dict[str, Any]:
+    return {
+        "measurement_basis": measurement_basis,
+        "collector_id": collector_id,
+        "source_cluster": source_cluster,
+        "inventory_scope_id": inventory_scope_id,
+        "requirement_role": requirement_role,
+        "effective_from": effective_from,
+    }
+
+
 def _gap(
     *,
     start: datetime,
     end: datetime | None,
     resolution: str,
     gap_id: UUID | None = None,
+    reason: str | None = None,
 ) -> dict[str, Any]:
     return {
         "id": gap_id or uuid4(),
@@ -58,6 +102,7 @@ def _gap(
         "gap_start": start,
         "gap_end": end,
         "resolution": resolution,
+        "reason": reason,
     }
 
 
@@ -136,8 +181,16 @@ class _Connection:
         return _Transaction(self.pool)
 
     async def fetch(self, sql: str, *_args: Any) -> list[dict[str, Any]]:
+        if "infra-seal:compute-epoch-set-lock" in sql:
+            return copy.deepcopy(self.pool.compute_requirements)
+        if "infra-seal:compute-requirements" in sql:
+            return copy.deepcopy(self.pool.compute_requirements)
+        if "infra-seal:compute-activations" in sql:
+            return copy.deepcopy(self.pool.compute_activations)
         if "infra-seal:epochs" in sql:
             return copy.deepcopy(self.pool.epochs)
+        if "infra-seal:storage-requirements" in sql:
+            return copy.deepcopy(self.pool.storage_requirements)
         if "infra-seal:gaps" in sql or "infra-seal:storage-gaps" in sql:
             return copy.deepcopy(self.pool.gaps)
         raise AssertionError(f"unexpected sealer fetch: {sql}")
@@ -249,8 +302,10 @@ class _Connection:
                 }
             )
         if "infra-seal:interval-blocker" in sql:
+            self.pool.interval_query_args = args
             return {"id": uuid4()} if self.pool.interval_blocked else None
         if "infra-seal:plan-blocker" in sql:
+            self.pool.plan_query_args = args
             return {"id": uuid4()} if self.pool.plan_blocked else None
         if "infra-seal:finish" in sql:
             if self.pool.finish_failure == "raise":
@@ -312,6 +367,9 @@ class _AppPool:
         self.cutover_at = CUTOVER
         self.observed_at = OBSERVED_AT
         self.epochs = [_epoch()]
+        self.compute_activations: list[dict[str, Any]] = []
+        self.compute_requirements: list[dict[str, Any]] = []
+        self.storage_requirements: list[dict[str, Any]] = []
         self.gaps: list[dict[str, Any]] = []
         self.snapshots: list[dict[str, Any]] = [
             _snapshot(received_at=DAY_END),
@@ -326,15 +384,25 @@ class _AppPool:
         self.commits = 0
         self.rollbacks = 0
         self.item_query_args: tuple[Any, ...] | None = None
+        self.interval_query_args: tuple[Any, ...] | None = None
+        self.plan_query_args: tuple[Any, ...] | None = None
 
     def acquire(self) -> _Acquire:
         return _Acquire(self)
 
 
-def _sealer(pool: _AppPool, *, enabled: bool = True) -> InfrastructureUsageDaySealer:
+def _sealer(
+    pool: _AppPool,
+    *,
+    enabled: bool = True,
+    enabled_resources: tuple[str, ...] = ("workspace_pod",),
+    storage_publication_policy: StoragePublicationPolicy | None = None,
+) -> InfrastructureUsageDaySealer:
     return InfrastructureUsageDaySealer(
         pool,  # type: ignore[arg-type]
         sealing_enabled=enabled,
+        enabled_resources=enabled_resources,
+        storage_publication_policy=storage_publication_policy,
     )
 
 
@@ -349,6 +417,16 @@ def test_item_blocker_sql_includes_boundary_and_invalid_watch_evidence() -> None
     assert "received_at" in compact
     assert "ORDER BY" in compact
     assert "LIMIT 1" in compact
+
+
+def test_storage_blocker_sql_is_exact_and_conservatively_rejects_wrong_sources():
+    for sql in (_INTERVAL_BLOCKER_SQL, _PLAN_BLOCKER_SQL):
+        compact = " ".join(sql.split())
+        assert "unnest($5::text[], $6::text[], $7::text[])" in compact
+        assert "NOT EXISTS" in compact
+        assert "storage_policy.collector_id = source_scope.collector_id" in compact
+        assert "storage_policy.source_cluster = source_scope.source_cluster" in compact
+        assert "source_scope.source_cluster = interval.source_cluster" in compact
 
 
 @pytest.mark.asyncio
@@ -679,6 +757,145 @@ async def test_retired_epoch_only_requires_materialization_through_retirement() 
     assert result.coverage_status == "complete"
 
 
+def test_compute_seal_rejects_successor_inheritance_after_exact_epoch_retirement() -> (
+    None
+):
+    retirement = DAY_START + timedelta(hours=12)
+    successor_id = UUID("10000000-0000-0000-0000-000000000002")
+    sealer = InfrastructureUsageDaySealer(  # type: ignore[arg-type]
+        object(),
+        enabled_resources=("workspace_pod", "agent_pod"),
+    )
+    activations = (
+        {
+            "activation_key": "agent_pod",
+            "state": "active",
+            "activated_at": DAY_START,
+            "database_time": OBSERVED_AT,
+        },
+    )
+    requirements = (
+        {
+            "activation_key": "agent_pod",
+            "inventory_scope_id": SCOPE_ID,
+            "inventory_scope_epoch_id": EPOCH_ID,
+            "authority_sequence": 1,
+            "authority_effective_from": DAY_START,
+            "reliable_from": DAY_START,
+            "continuous_since": DAY_START,
+            "complete_through": retirement,
+            "retired_at": retirement,
+            "api_resource": "core/v1/pods",
+        },
+    )
+    epochs = (
+        _epoch(required_from=DAY_START, retired_at=retirement),
+        _epoch(
+            id=successor_id,
+            required_from=retirement,
+            reliable_from=retirement,
+            continuous_since=retirement,
+        ),
+    )
+
+    with pytest.raises(
+        DaySealingBlocked,
+        match="required-compute-exact-epoch-retired",
+    ):
+        sealer._validate_compute_requirements(
+            activations,
+            requirements,
+            epochs=epochs,
+            seal_start=DAY_START,
+            day_end=DAY_END,
+        )
+
+
+def test_compute_seal_accepts_audited_successor_and_preserves_gap() -> None:
+    retirement = DAY_START + timedelta(hours=10)
+    promoted_at = retirement + timedelta(minutes=4)
+    successor_id = UUID("10000000-0000-0000-0000-000000000003")
+    sealer = InfrastructureUsageDaySealer(  # type: ignore[arg-type]
+        object(),
+        enabled_resources=("workspace_pod", "agent_pod"),
+    )
+    activations = (
+        {
+            "activation_key": "agent_pod",
+            "state": "active",
+            "activated_at": DAY_START,
+            "database_time": OBSERVED_AT,
+        },
+    )
+    requirements = (
+        {
+            "activation_key": "agent_pod",
+            "inventory_scope_id": SCOPE_ID,
+            "inventory_scope_epoch_id": EPOCH_ID,
+            "authority_sequence": 1,
+            "authority_effective_from": DAY_START,
+            "reliable_from": DAY_START,
+            "continuous_since": DAY_START,
+            "complete_through": retirement,
+            "retired_at": retirement,
+            "api_resource": "core/v1/pods",
+        },
+        {
+            "activation_key": "agent_pod",
+            "inventory_scope_id": SCOPE_ID,
+            "inventory_scope_epoch_id": successor_id,
+            "authority_sequence": 2,
+            "authority_effective_from": promoted_at,
+            "reliable_from": promoted_at,
+            "continuous_since": promoted_at,
+            "complete_through": DAY_END,
+            "retired_at": None,
+            "api_resource": "core/v1/pods",
+        },
+    )
+
+    manifest, missing = sealer._validate_compute_requirements(
+        activations,
+        requirements,
+        epochs=(),
+        seal_start=DAY_START,
+        day_end=DAY_END,
+    )
+
+    assert [entry["authority_sequence"] for entry in manifest] == [1, 2]
+    assert missing == {("agent_pod", str(successor_id)): [(retirement, promoted_at)]}
+
+
+def test_compute_authority_gap_evidence_is_class_scoped() -> None:
+    start = DAY_START + timedelta(hours=4)
+    end = start + timedelta(minutes=3)
+    gap = _gap(
+        start=start,
+        end=end,
+        resolution="waived",
+        reason="compute-authority-awaiting-confirmation:agent_pod",
+    )
+
+    ignored = InfrastructureUsageDaySealer._validate_gaps(
+        (gap,),
+        seal_start=DAY_START,
+        day_end=DAY_END,
+        enabled_compute_keys=frozenset({"ide_workspace_pod"}),
+    )
+    assert ignored == ([], (), {}, {})
+
+    manifest, unknown, generic, compute = InfrastructureUsageDaySealer._validate_gaps(
+        (gap,),
+        seal_start=DAY_START,
+        day_end=DAY_END,
+        enabled_compute_keys=frozenset({"agent_pod"}),
+    )
+    assert manifest[0]["reason"] == gap["reason"]
+    assert unknown == ((start, end),)
+    assert generic == {}
+    assert compute == {("agent_pod", str(EPOCH_ID)): [(start, end)]}
+
+
 @pytest.mark.asyncio
 async def test_waived_ranges_are_clipped_merged_and_partial() -> None:
     app = _AppPool()
@@ -730,6 +947,47 @@ async def test_waiver_can_cover_epoch_watermark_shortfall() -> None:
     ]
 
     result = await _sealer(app).seal_day(DAY, 7)
+
+    assert result.coverage_status == "partial"
+    assert result.unknown_ranges == ((gap_start, DAY_END),)
+
+
+@pytest.mark.asyncio
+async def test_generic_epoch_gap_can_cover_same_compute_authority_shortfall() -> None:
+    app = _AppPool()
+    gap_start = DAY_START + timedelta(hours=1)
+    app.epochs[0]["complete_through"] = gap_start
+    app.snapshots = [_snapshot(received_at=gap_start)]
+    app.compute_activations = [
+        {
+            "activation_key": "agent_pod",
+            "state": "active",
+            "activated_at": DAY_START,
+            "database_time": OBSERVED_AT,
+        }
+    ]
+    app.compute_requirements = [
+        {
+            "activation_key": "agent_pod",
+            "inventory_scope_id": SCOPE_ID,
+            "inventory_scope_epoch_id": EPOCH_ID,
+            "authority_sequence": 1,
+            "authority_effective_from": DAY_START,
+            "reliable_from": CUTOVER - timedelta(hours=1),
+            "continuous_since": CUTOVER - timedelta(hours=1),
+            "complete_through": gap_start,
+            "retired_at": None,
+            "api_resource": "core/v1/pods",
+        }
+    ]
+    app.gaps = [
+        _gap(start=gap_start, end=DAY_END, resolution="waived"),
+    ]
+
+    result = await _sealer(
+        app,
+        enabled_resources=("workspace_pod", "agent_pod"),
+    ).seal_day(DAY, 7)
 
     assert result.coverage_status == "partial"
     assert result.unknown_ranges == ((gap_start, DAY_END),)
@@ -794,18 +1052,247 @@ async def test_required_scope_must_match_enabled_resource_mapping() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "identity_override",
+    (
+        {"collector_id": "kubevirt-storage"},
+        {"source_cluster": "vm-cluster"},
+    ),
+)
+async def test_identical_storage_api_resources_do_not_share_authority(
+    identity_override: dict[str, str],
+) -> None:
+    app = _AppPool()
+    other_epoch = _epoch(
+        id=UUID("10000000-0000-0000-0000-000000000002"),
+        scope_id=UUID("20000000-0000-0000-0000-000000000002"),
+        api_resource="core/v1/persistentvolumeclaims",
+        **identity_override,
+    )
+    app.epochs = [
+        _epoch(api_resource="core/v1/persistentvolumeclaims"),
+        other_epoch,
+    ]
+    app.storage_requirements = [_storage_requirement()]
+    policy = _storage_policy(("claim-requested", "kubernetes-pods", "main-dev"))
+
+    with pytest.raises(DaySealingBlocked) as raised:
+        await _sealer(
+            app,
+            enabled_resources=("workspace_pvc",),
+            storage_publication_policy=policy,
+        ).seal_day(DAY, 7)
+
+    assert raised.value.code == "required-storage-authority-not-enabled"
+    assert app.day_states == {}
+
+
+@pytest.mark.asyncio
+async def test_configured_storage_authority_requires_an_overlapping_epoch() -> None:
+    app = _AppPool()
+    policy = _storage_policy(("claim-requested", "kubevirt-storage", "vm-cluster"))
+    app.storage_requirements = [
+        _storage_requirement(
+            collector_id="kubevirt-storage",
+            source_cluster="vm-cluster",
+            inventory_scope_id=UUID("20000000-0000-0000-0000-000000000010"),
+        )
+    ]
+
+    with pytest.raises(DaySealingBlocked) as raised:
+        await _sealer(
+            app,
+            enabled_resources=("workspace_pod", "workspace_pvc"),
+            storage_publication_policy=policy,
+        ).seal_day(DAY, 7)
+
+    assert raised.value.code == "required-storage-source-missing"
+    assert app.day_states == {}
+
+
+@pytest.mark.asyncio
 async def test_mapped_volume_resource_enables_pv_scope_and_storage_gap_path() -> None:
     app = _AppPool()
-    app.epochs[0]["api_resource"] = "core/v1/persistentvolumes"
+    pvc_scope_id = UUID("20000000-0000-0000-0000-000000000011")
+    pvc_epoch_id = UUID("10000000-0000-0000-0000-000000000011")
+    app.epochs = [
+        _epoch(api_resource="core/v1/persistentvolumes", namespace=None),
+        _epoch(
+            id=pvc_epoch_id,
+            scope_id=pvc_scope_id,
+            api_resource="core/v1/persistentvolumeclaims",
+        ),
+    ]
+    app.storage_requirements = [
+        _storage_requirement(measurement_basis="volume-provisioned"),
+        _storage_requirement(
+            measurement_basis="volume-provisioned",
+            inventory_scope_id=pvc_scope_id,
+            requirement_role="attribution",
+        ),
+    ]
+    pvc_snapshot = _snapshot(received_at=DAY_END)
+    pvc_snapshot["scope_epoch_id"] = pvc_epoch_id
+    app.snapshots.append(pvc_snapshot)
+    policy = _storage_policy(("volume-provisioned", "kubernetes-pods", "main-dev"))
     sealer = InfrastructureUsageDaySealer(
         app,  # type: ignore[arg-type]
         sealing_enabled=True,
         enabled_resources=("workspace_pod", "block_volume_local_path"),
+        storage_publication_policy=policy,
+    )
+    manifest, _missing = sealer._validate_epochs(
+        app.epochs,
+        storage_requirements=app.storage_requirements,
+        seal_start=DAY_START,
+        day_end=DAY_END,
     )
 
     result = await sealer.seal_day(DAY, 7)
 
     assert result.coverage_status == "complete"
+    pvc_manifest = next(
+        row
+        for row in manifest
+        if row["api_resource"] == "core/v1/persistentvolumeclaims"
+    )
+    assert pvc_manifest["measurement_basis"] == "volume-provisioned"
+    assert pvc_manifest["storage_requirements"] == [
+        {
+            "measurement_basis": "volume-provisioned",
+            "requirement_role": "attribution",
+            "effective_from": CUTOVER,
+        }
+    ]
+    assert app.interval_query_args is not None
+    assert app.plan_query_args is not None
+    expected_policy_columns = (
+        ["volume-provisioned"],
+        ["kubernetes-pods"],
+        ["main-dev"],
+    )
+    assert app.interval_query_args[4:] == expected_policy_columns
+    assert app.plan_query_args[4:] == expected_policy_columns
+
+
+@pytest.mark.asyncio
+async def test_pv_seal_fails_closed_without_required_pvc_attribution_epoch() -> None:
+    app = _AppPool()
+    missing_pvc_scope_id = UUID("20000000-0000-0000-0000-000000000012")
+    app.epochs[0].update(
+        {"api_resource": "core/v1/persistentvolumes", "namespace": None}
+    )
+    app.storage_requirements = [
+        _storage_requirement(measurement_basis="volume-provisioned"),
+        _storage_requirement(
+            measurement_basis="volume-provisioned",
+            inventory_scope_id=missing_pvc_scope_id,
+            requirement_role="attribution",
+        ),
+    ]
+    policy = _storage_policy(("volume-provisioned", "kubernetes-pods", "main-dev"))
+
+    with pytest.raises(DaySealingBlocked) as raised:
+        await _sealer(
+            app,
+            enabled_resources=("block_volume_local_path",),
+            storage_publication_policy=policy,
+        ).seal_day(DAY, 7)
+
+    assert raised.value.code == "required-storage-source-missing"
+    assert app.day_states == {}
+
+
+@pytest.mark.asyncio
+async def test_storage_epoch_identity_is_in_deterministic_manifest() -> None:
+    policy = _storage_policy(("claim-requested", "kubernetes-pods", "main-dev"))
+    first_app = _AppPool()
+    second_app = _AppPool()
+    first_app.epochs[0].update(
+        {
+            "api_resource": "core/v1/persistentvolumeclaims",
+            "namespace": "srw-a",
+        }
+    )
+    second_app.epochs[0].update(
+        {
+            "api_resource": "core/v1/persistentvolumeclaims",
+            "namespace": "srw-b",
+        }
+    )
+    first_app.storage_requirements = [_storage_requirement()]
+    second_app.storage_requirements = [_storage_requirement()]
+    first_sealer = _sealer(
+        first_app,
+        enabled_resources=("workspace_pvc",),
+        storage_publication_policy=policy,
+    )
+    manifest, _missing = first_sealer._validate_epochs(
+        first_app.epochs,
+        storage_requirements=first_app.storage_requirements,
+        seal_start=DAY_START,
+        day_end=DAY_END,
+    )
+
+    first = await first_sealer.seal_day(DAY, 7)
+    second = await _sealer(
+        second_app,
+        enabled_resources=("workspace_pvc",),
+        storage_publication_policy=policy,
+    ).seal_day(DAY, 7)
+
+    assert {
+        field: manifest[0][field]
+        for field in (
+            "measurement_basis",
+            "collector_id",
+            "source_cluster",
+            "namespace",
+        )
+    } == {
+        "measurement_basis": "claim-requested",
+        "collector_id": "kubernetes-pods",
+        "source_cluster": "main-dev",
+        "namespace": "srw-a",
+    }
+    assert first.coverage_revision != second.coverage_revision
+
+
+@pytest.mark.asyncio
+async def test_storage_epoch_replacement_preserves_the_exact_day_boundary() -> None:
+    boundary = DAY_START + timedelta(hours=8)
+    replacement_epoch_id = UUID("10000000-0000-0000-0000-000000000003")
+    policy = _storage_policy(("claim-requested", "kubernetes-pods", "main-dev"))
+    app = _AppPool()
+    app.storage_requirements = [_storage_requirement()]
+    app.epochs = [
+        _epoch(
+            api_resource="core/v1/persistentvolumeclaims",
+            retired_at=boundary,
+            complete_through=boundary,
+        ),
+        _epoch(
+            id=replacement_epoch_id,
+            api_resource="core/v1/persistentvolumeclaims",
+            required_from=boundary,
+            complete_through=DAY_END,
+        ),
+    ]
+    replacement_snapshot = _snapshot(received_at=DAY_END)
+    replacement_snapshot["scope_epoch_id"] = replacement_epoch_id
+    app.snapshots = [
+        _snapshot(received_at=boundary),
+        replacement_snapshot,
+    ]
+
+    result = await _sealer(
+        app,
+        enabled_resources=("workspace_pvc",),
+        storage_publication_policy=policy,
+    ).seal_day(DAY, 7)
+
+    assert result.coverage_status == "complete"
+    assert result.required_scopes == 1
 
 
 @pytest.mark.asyncio

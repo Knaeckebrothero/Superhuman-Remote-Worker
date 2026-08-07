@@ -26,6 +26,7 @@ from .collectors.storage_normalization import (
     PV_STORAGE_CAPACITY_ALGORITHM,
     PV_UID_IDENTITY_SCHEME,
 )
+from .collectors.vmi_normalization import VMI_CAPACITY_ALGORITHM
 
 
 _CLUSTER_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
@@ -281,6 +282,137 @@ def validate_normalized_pod_payload(value: dict[str, Any]) -> dict[str, Any]:
     return value
 
 
+class _VMIOwnerHint(_StrictModel):
+    kind: Literal["job", "thread"]
+    owner_id: str = Field(min_length=1, max_length=63)
+
+
+class _VMReference(_StrictModel):
+    uid: str = Field(min_length=1, max_length=256)
+    name: str = Field(min_length=1, max_length=253)
+
+
+class _VMIRootDataVolume(_StrictModel):
+    name: str = Field(min_length=1, max_length=253)
+
+
+class _VMIPhaseTransition(_StrictModel):
+    phase: str = Field(min_length=1, max_length=64)
+    timestamp: str = Field(min_length=1, max_length=64)
+
+
+class _VMILifecycle(_StrictModel):
+    state: Literal["unscheduled", "active", "terminal"]
+    scheduled: bool
+    terminal: bool
+    accrues: bool
+    phase: str | None = Field(default=None, max_length=64)
+    node_name: str | None = Field(default=None, max_length=253)
+    paused: bool
+    migrating: bool
+    deletion_requested: bool
+    creation_timestamp: str | None = Field(default=None, max_length=64)
+    deletion_timestamp: str | None = Field(default=None, max_length=64)
+    scheduled_transition_timestamp: str | None = Field(default=None, max_length=64)
+    terminal_transition_timestamp: str | None = Field(default=None, max_length=64)
+    phase_transitions: list[_VMIPhaseTransition] = Field(max_length=256)
+
+    @model_validator(mode="after")
+    def state_is_consistent(self) -> "_VMILifecycle":
+        if self.state == "terminal":
+            if not self.terminal or self.accrues:
+                raise ValueError("terminal VMI lifecycle is inconsistent")
+        elif self.state == "active":
+            if not self.scheduled or self.terminal or not self.accrues:
+                raise ValueError("active VMI lifecycle is inconsistent")
+        elif self.scheduled or self.terminal or self.accrues:
+            raise ValueError("unscheduled VMI lifecycle is inconsistent")
+        return self
+
+
+class _VMICpuTopology(_StrictModel):
+    cores: int = Field(ge=1, le=2**31 - 1)
+    sockets: int = Field(ge=1, le=2**31 - 1)
+    threads: int = Field(ge=1, le=2**31 - 1)
+    vcpus: int = Field(ge=1, le=2**31 - 1)
+
+    @model_validator(mode="after")
+    def product_matches(self) -> "_VMICpuTopology":
+        if self.cores * self.sockets * self.threads != self.vcpus:
+            raise ValueError("VMI admitted CPU topology is inconsistent")
+        return self
+
+
+class _VMIMemoryEvidence(_StrictModel):
+    original: str = Field(min_length=1, max_length=128)
+    decimal_value: str = Field(min_length=1, max_length=128)
+    normalized_value: int = Field(ge=1, le=2**63 - 1)
+    normalized_unit: Literal["byte"]
+
+
+class _VMICapacity(_StrictModel):
+    cpu_millicores: int = Field(ge=1, le=2**63 - 1)
+    memory_bytes: int = Field(ge=1, le=2**63 - 1)
+    cpu_topology: _VMICpuTopology
+    memory_evidence: _VMIMemoryEvidence
+    cpu_source: Literal["vmi-status-current-topology", "vmi-admitted-topology"]
+    memory_source: Literal["vmi-status-guest-current", "vmi-admitted-guest-memory"]
+    capacity_quality: Literal["exact"]
+    measurement_algorithm: Literal[VMI_CAPACITY_ALGORITHM]
+
+    @model_validator(mode="after")
+    def quantities_match_evidence(self) -> "_VMICapacity":
+        if self.cpu_millicores != self.cpu_topology.vcpus * 1000:
+            raise ValueError("VMI admitted CPU capacity is inconsistent")
+        if self.memory_bytes != self.memory_evidence.normalized_value:
+            raise ValueError("VMI admitted memory capacity is inconsistent")
+        return self
+
+
+class _VMIDiagnostic(_StrictModel):
+    code: str = Field(pattern=r"^[a-z][a-z0-9-]{0,63}$")
+    path: str = Field(min_length=1, max_length=512)
+
+
+class _NormalizedVMIPayload(_StrictModel):
+    source_kind: Literal["vmi"]
+    api_version: Literal["kubevirt.io/v1"]
+    namespace: str = Field(min_length=1, max_length=253)
+    name: str = Field(min_length=1, max_length=253)
+    uid: str = Field(min_length=1, max_length=256)
+    resource_version: str = Field(min_length=1, max_length=1024)
+    owner_hint: _VMIOwnerHint | None
+    vm_reference: _VMReference | None
+    root_data_volume: _VMIRootDataVolume | None
+    lifecycle: _VMILifecycle
+    capacity: _VMICapacity | None
+    measurement_basis: Literal["guest-provisioned"]
+    measurement_algorithm: Literal[VMI_CAPACITY_ALGORITHM]
+    resource: Literal["workspace_vm"]
+    diagnostics: list[_VMIDiagnostic] = Field(max_length=2_000)
+    valid_for_metering: bool
+    revision_hash: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def capacity_matches_validity(self) -> "_NormalizedVMIPayload":
+        if self.valid_for_metering:
+            if self.capacity is None or self.revision_hash is None:
+                raise ValueError("meterable VMI payload lacks capacity or revision")
+        elif self.capacity is not None or self.revision_hash is not None:
+            raise ValueError("invalid VMI payload cannot claim capacity or revision")
+        return self
+
+
+_NORMALIZED_VMI_PAYLOAD = TypeAdapter(_NormalizedVMIPayload)
+
+
+def validate_normalized_vmi_payload(value: dict[str, Any]) -> dict[str, Any]:
+    """Validate the raw-free admitted-VMI projection accepted by ingestion."""
+
+    _NORMALIZED_VMI_PAYLOAD.validate_python(value)
+    return value
+
+
 class _StorageQuantityEvidence(_StrictModel):
     original: str = Field(min_length=1, max_length=128)
     decimal_value: str = Field(min_length=1, max_length=128)
@@ -505,13 +637,21 @@ class InventoryTicketRequest(_StrictModel):
     intent: Literal["snapshot", "watch-session"]
     snapshot_id: UUID | None = None
     starting_resource_version: str | None = Field(default=None, max_length=1024)
+    controller_epoch: str | None = Field(default=None, min_length=1, max_length=256)
+    sequence: int | None = Field(default=None, ge=0)
 
     @model_validator(mode="after")
     def validate_intent(self) -> "InventoryTicketRequest":
+        if (self.controller_epoch is None) != (self.sequence is None):
+            raise ValueError("controller_epoch and sequence must be supplied together")
         if self.intent == "snapshot":
             if self.snapshot_id is None or self.starting_resource_version is not None:
                 raise ValueError("snapshot ticket requires only snapshot_id")
-        elif self.snapshot_id is not None or not self.starting_resource_version:
+        elif (
+            self.snapshot_id is not None
+            or not self.starting_resource_version
+            or self.controller_epoch is not None
+        ):
             raise ValueError("watch ticket requires only a starting cursor")
         if self.starting_resource_version == "0":
             raise ValueError("resource version 0 is not a metering cursor")
@@ -752,4 +892,5 @@ __all__ = [
     "validate_normalized_pod_payload",
     "validate_normalized_pvc_payload",
     "validate_normalized_pv_payload",
+    "validate_normalized_vmi_payload",
 ]

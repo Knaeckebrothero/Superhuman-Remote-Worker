@@ -28,12 +28,13 @@ SRW orchestrators — empty value refuses to publish/subscribe.
 """
 
 import asyncio
+from collections.abc import Mapping
 import json
 import logging
 import os
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 try:
     import nats
@@ -48,6 +49,13 @@ except ImportError:
 from .notification_feed import notification_feed
 from .ssh_helpers import is_tailnet_addr, orchestrator_can_reach
 from .workspace_binding import CANVAS_WORKSPACE_GENERATION_KEY
+from .vm_lifecycle_auth import (
+    AUTH_FIELD,
+    configured_secret,
+    sign_payload,
+    unsigned_payload,
+    verify_payload,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +66,16 @@ def _entity_label(is_thread: Optional[bool]) -> str:
     if is_thread is None:
         return "unknown-entity"
     return "thread" if is_thread else "job"
+
+
+def _provision_generation(value: object) -> str | None:
+    if not isinstance(value, str) or len(value) != 36:
+        return None
+    try:
+        parsed = UUID(value)
+    except (AttributeError, TypeError, ValueError):
+        return None
+    return value if str(parsed) == value else None
 
 
 class NatsBridge:
@@ -89,6 +107,7 @@ class NatsBridge:
         self._db: Optional[Any] = None
         self._on_vm_ready: Optional[Callable] = None
         self._available: bool = False
+        self._lifecycle_hmac_secret = configured_secret()
 
         if not self._url:
             logger.info("NATS_URL not configured. VM lifecycle features disabled.")
@@ -103,6 +122,12 @@ class NatsBridge:
     def is_available(self) -> bool:
         """Check if NATS is connected and available."""
         return self._available
+
+    @property
+    def lifecycle_identity_authenticated(self) -> bool:
+        """Whether controller lifecycle evidence can be authenticated."""
+
+        return self._lifecycle_hmac_secret is not None
 
     def _subj(self, leaf: str) -> Optional[str]:
         """Append our orchestrator id to a vm.lifecycle subject.
@@ -232,6 +257,7 @@ class NatsBridge:
         description: str = "",
         entity_type: str = "job",
         set_provisioning: bool = True,
+        provision_generation: str | None = None,
     ) -> bool:
         """Publish a VM creation request.
 
@@ -255,6 +281,15 @@ class NatsBridge:
         """
         if not self._available:
             return False
+        generation = _provision_generation(provision_generation)
+        if self._lifecycle_hmac_secret is not None and generation is None:
+            logger.error(
+                "Refusing authenticated VM create for %s %s without a current "
+                "provision generation",
+                entity_type,
+                job_id,
+            )
+            return False
 
         subject = self._subj("vm.lifecycle.create")
         if subject is None:
@@ -267,6 +302,7 @@ class NatsBridge:
 
         payload = {
             "job_id": job_id,
+            "entity_type": entity_type,
             "agent_config": agent_config,
             "cpu_cores": cpu_cores,
             "memory": memory,
@@ -274,9 +310,16 @@ class NatsBridge:
             "description": description,
             "orchestrator_id": self._orchestrator_id,
         }
+        if generation is not None:
+            payload["provision_generation"] = generation
         if vm_image:
             payload["vm_image"] = vm_image
-
+        payload = sign_payload(
+            payload,
+            direction="request",
+            operation="create",
+            secret=self._lifecycle_hmac_secret,
+        )
         try:
             await self._nc.publish(
                 subject,
@@ -287,11 +330,21 @@ class NatsBridge:
             # Update context to reflect provisioning state
             if set_provisioning:
                 if entity_type == "thread":
-                    await self._set_thread_vm_context(
-                        job_id, {"status": "provisioning"}
-                    )
+                    if generation is not None:
+                        await self._set_thread_vm_context_if_generation(
+                            job_id, generation, {"status": "provisioning"}
+                        )
+                    else:
+                        await self._set_thread_vm_context(
+                            job_id, {"status": "provisioning"}
+                        )
                 else:
-                    await self._set_vm_context(job_id, {"status": "provisioning"})
+                    if generation is not None:
+                        await self._set_vm_context_if_generation(
+                            job_id, generation, {"status": "provisioning"}
+                        )
+                    else:
+                        await self._set_vm_context(job_id, {"status": "provisioning"})
             return True
         except Exception as e:
             logger.error(
@@ -303,7 +356,13 @@ class NatsBridge:
             )
             return False
 
-    async def request_vm_delete(self, job_id: str, purge_disk: bool = True) -> bool:
+    async def request_vm_delete(
+        self,
+        job_id: str,
+        purge_disk: bool = True,
+        provision_generation: str | None = None,
+        entity_type: str = "job",
+    ) -> bool:
         """Publish a VM deletion request.
 
         Args:
@@ -316,6 +375,14 @@ class NatsBridge:
             True if published, False if NATS unavailable.
         """
         if not self._available:
+            return False
+        generation = _provision_generation(provision_generation)
+        if self._lifecycle_hmac_secret is not None and generation is None:
+            logger.error(
+                "Refusing authenticated VM delete for %s without a current "
+                "provision generation",
+                job_id,
+            )
             return False
 
         subject = self._subj("vm.lifecycle.delete")
@@ -331,20 +398,43 @@ class NatsBridge:
             "orchestrator_id": self._orchestrator_id,
             "purge_disk": purge_disk,
         }
+        if generation is not None:
+            payload["provision_generation"] = generation
+        payload = sign_payload(
+            payload,
+            direction="request",
+            operation="delete",
+            secret=self._lifecycle_hmac_secret,
+        )
         try:
             await self._nc.publish(
                 subject,
                 json.dumps(payload).encode(),
             )
             logger.info("Published %s for job %s", subject, job_id)
-            await self._set_vm_context(job_id, {"status": "deleting"})
+            if generation is not None:
+                if entity_type == "thread":
+                    await self._set_thread_vm_context_if_generation(
+                        job_id, generation, {"status": "deleting"}
+                    )
+                else:
+                    await self._set_vm_context_if_generation(
+                        job_id, generation, {"status": "deleting"}
+                    )
+            elif entity_type == "thread":
+                await self._set_thread_vm_context(job_id, {"status": "deleting"})
+            else:
+                await self._set_vm_context(job_id, {"status": "deleting"})
             return True
         except Exception as e:
             logger.error("Failed to publish %s for job %s: %s", subject, job_id, e)
             return False
 
     async def query_vm_status(
-        self, job_id: str, timeout: float = 5.0
+        self,
+        job_id: str,
+        timeout: float = 5.0,
+        provision_generation: str | None = None,
     ) -> Optional[dict]:
         """Query live VM status via NATS request/reply.
 
@@ -365,8 +455,30 @@ class NatsBridge:
                 job_id,
             )
             return None
+        generation = _provision_generation(provision_generation)
+        if self._lifecycle_hmac_secret is not None and generation is None:
+            logger.error(
+                "Refusing authenticated VM status query for %s without a current "
+                "provision generation",
+                job_id,
+            )
+            return None
 
         payload = {"job_id": job_id, "orchestrator_id": self._orchestrator_id}
+        if generation is not None:
+            payload["provision_generation"] = generation
+        payload = sign_payload(
+            payload,
+            direction="request",
+            operation="status",
+            secret=self._lifecycle_hmac_secret,
+        )
+        request_auth = payload.get(AUTH_FIELD)
+        request_id = (
+            request_auth.get("request_id")
+            if isinstance(request_auth, Mapping)
+            else None
+        )
         try:
             response = await self._nc.request(
                 subject,
@@ -394,7 +506,32 @@ class NatsBridge:
                     data,
                 )
                 return None
-            return data
+            if not isinstance(data, dict) or not verify_payload(
+                data,
+                direction="response",
+                operation="status",
+                secret=self._lifecycle_hmac_secret,
+                expected_correlation_id=request_id,
+            ):
+                logger.warning(
+                    "Dropping unauthenticated VM status response for %s", job_id
+                )
+                return None
+            result = unsigned_payload(data)
+            if self._lifecycle_hmac_secret is not None:
+                if (
+                    result.get("job_id") != job_id
+                    or _provision_generation(result.get("provision_generation"))
+                    != generation
+                ):
+                    logger.warning(
+                        "Dropping VM status response for %s with mismatched "
+                        "identity generation",
+                        job_id,
+                    )
+                    return None
+                result["_identity_authenticated"] = True
+            return result
         except Exception as e:
             logger.debug("VM status query failed for job %s: %s", job_id, e)
             return None
@@ -416,7 +553,18 @@ class NatsBridge:
             logger.error("Refusing vm.lifecycle.list — ORCHESTRATOR_ID unset")
             return None
 
-        payload = {"orchestrator_id": self._orchestrator_id}
+        payload = sign_payload(
+            {"orchestrator_id": self._orchestrator_id},
+            direction="request",
+            operation="list",
+            secret=self._lifecycle_hmac_secret,
+        )
+        request_auth = payload.get(AUTH_FIELD)
+        request_id = (
+            request_auth.get("request_id")
+            if isinstance(request_auth, Mapping)
+            else None
+        )
         try:
             response = await self._nc.request(
                 subject,
@@ -435,6 +583,16 @@ class NatsBridge:
                     data,
                 )
                 return None
+            if not isinstance(data, dict) or not verify_payload(
+                data,
+                direction="response",
+                operation="list",
+                secret=self._lifecycle_hmac_secret,
+                expected_correlation_id=request_id,
+            ):
+                logger.warning("Dropping unauthenticated VM list response")
+                return None
+            data = unsigned_payload(data)
             vms = data.get("vms") if isinstance(data, dict) else None
             return vms if isinstance(vms, list) else None
         except Exception as e:
@@ -478,10 +636,25 @@ class NatsBridge:
     async def _on_vm_lifecycle_status(self, msg) -> None:
         """Handle vm.lifecycle.status — VM controller status updates.
 
-        Payload: {job_id, status, vm_name, namespace, error?}
+        Payload: {job_id, status, vm_name, vm_uid, rootdisk_pvc_uid,
+                  namespace, error?}
         """
         try:
             data = json.loads(msg.data.decode())
+            if not isinstance(data, Mapping):
+                return
+            auth = data.get(AUTH_FIELD)
+            operation = auth.get("operation") if isinstance(auth, Mapping) else "status"
+            if operation not in {"create", "delete", "status"} or not verify_payload(
+                data,
+                direction="response",
+                operation=operation,
+                secret=self._lifecycle_hmac_secret,
+            ):
+                logger.warning("Dropping unauthenticated VM lifecycle status")
+                return
+            identity_authenticated = self._lifecycle_hmac_secret is not None
+            data = unsigned_payload(data)
             job_id = data.get("job_id")
             if not job_id:
                 return
@@ -491,6 +664,53 @@ class NatsBridge:
                 "vm_name": data.get("vm_name"),
                 "namespace": data.get("namespace"),
             }
+            # Slice 3 controllers include the immutable UID from the admitted
+            # VirtualMachine object. Older controllers omit the key during a
+            # rolling upgrade; leave the fresh context's vm_uid=None in that
+            # case so metering records legacy-unknown rather than name-only
+            # ownership. Never clear a known UID on delete/status payloads that
+            # legitimately omit it.
+            identity_updates: dict[str, Any] = {}
+            response_generation = _provision_generation(
+                data.get("provision_generation")
+            )
+            if identity_authenticated and response_generation and "vm_uid" in data:
+                vm_uid = data.get("vm_uid")
+                if (
+                    isinstance(vm_uid, str)
+                    and vm_uid
+                    and vm_uid == vm_uid.strip()
+                    and len(vm_uid) <= 256
+                    and not any(character.isspace() for character in vm_uid)
+                ):
+                    identity_updates["vm_uid"] = vm_uid
+                else:
+                    logger.warning(
+                        "Ignoring invalid VM UID in lifecycle status for %s", job_id
+                    )
+            # The controller reads the admitted root PVC and returns its
+            # immutable UID.  Older controllers omit it; the provisioner's
+            # fresh-context reset leaves the value null, so the metering join
+            # fails closed instead of authenticating a reusable PVC name.
+            if (
+                identity_authenticated
+                and response_generation
+                and "rootdisk_pvc_uid" in data
+            ):
+                rootdisk_pvc_uid = data.get("rootdisk_pvc_uid")
+                if (
+                    isinstance(rootdisk_pvc_uid, str)
+                    and rootdisk_pvc_uid
+                    and rootdisk_pvc_uid == rootdisk_pvc_uid.strip()
+                    and len(rootdisk_pvc_uid) <= 256
+                    and not any(character.isspace() for character in rootdisk_pvc_uid)
+                ):
+                    identity_updates["rootdisk_pvc_uid"] = rootdisk_pvc_uid
+                else:
+                    logger.warning(
+                        "Ignoring invalid rootdisk PVC UID in lifecycle status for %s",
+                        job_id,
+                    )
             if data.get("error"):
                 updates["error"] = data["error"]
             if data.get("pod_ip"):
@@ -537,6 +757,43 @@ class NatsBridge:
                 logger.warning(
                     "Dropping vm.lifecycle.status for %s — not a known thread or "
                     "job; refusing to guess a table.",
+                    job_id,
+                )
+                return
+            if identity_updates:
+                identity_updates.update(
+                    {
+                        "identity_authenticated": True,
+                        "identity_provision_generation": response_generation,
+                    }
+                )
+            if identity_authenticated:
+                if response_generation is None:
+                    logger.warning(
+                        "Dropping authenticated lifecycle status for %s without a "
+                        "canonical provision generation",
+                        job_id,
+                    )
+                    return
+                guarded_updates = {**updates, **identity_updates}
+                if is_thread:
+                    guarded_updates[CANVAS_WORKSPACE_GENERATION_KEY] = None
+                    merged = await self._set_thread_vm_context_if_generation(
+                        job_id,
+                        response_generation,
+                        guarded_updates,
+                    )
+                else:
+                    merged = await self._set_vm_context_if_generation(
+                        job_id,
+                        response_generation,
+                        guarded_updates,
+                    )
+                if merged:
+                    return
+                logger.warning(
+                    "Ignoring lifecycle identity for %s because provision generation "
+                    "is no longer current",
                     job_id,
                 )
                 return
@@ -885,6 +1142,41 @@ class NatsBridge:
             )
         except Exception:
             logger.exception("Error handling daemon status")
+
+    async def _set_vm_context_if_generation(
+        self, job_id: str, generation: str, updates: dict
+    ) -> bool:
+        if not self._db:
+            return False
+        try:
+            return bool(
+                await self._db.merge_vm_context_if_provision_generation(
+                    job_id, generation, updates
+                )
+            )
+        except Exception:
+            logger.exception(
+                "Failed to update generation-guarded VM context for job %s", job_id
+            )
+            return False
+
+    async def _set_thread_vm_context_if_generation(
+        self, thread_id: str, generation: str, updates: dict
+    ) -> bool:
+        if not self._db:
+            return False
+        try:
+            return bool(
+                await self._db.merge_thread_vm_context_if_provision_generation(
+                    thread_id, generation, updates
+                )
+            )
+        except Exception:
+            logger.exception(
+                "Failed to update generation-guarded thread VM context for %s",
+                thread_id,
+            )
+            return False
 
     # =========================================================================
     # Helpers

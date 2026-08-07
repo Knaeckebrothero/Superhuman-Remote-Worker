@@ -25,6 +25,9 @@ PVC_SCOPE = InventoryScope("dev-cluster", "core/v1/persistentvolumeclaims", "srw
 PV_SCOPE = InventoryScope(
     "dev-cluster", "core/v1/persistentvolumes", None, cluster_scoped=True
 )
+VMI_SCOPE = InventoryScope(
+    "vm-cluster", "kubevirt.io/v1/virtualmachineinstances", "srw-vms"
+)
 
 
 class _Response:
@@ -70,6 +73,16 @@ class _CoreApi:
 
     def list_persistent_volume(self, **kwargs):
         self.operations.append("pv")
+        self.calls.append(kwargs)
+        return self.responses.pop(0)
+
+
+class _CustomObjectsApi:
+    def __init__(self, responses: list[_Response]):
+        self.responses = responses
+        self.calls: list[dict[str, Any]] = []
+
+    def list_namespaced_custom_object(self, **kwargs):
         self.calls.append(kwargs)
         return self.responses.pop(0)
 
@@ -199,11 +212,50 @@ async def test_general_raw_client_dispatches_storage_watch_scopes(
 
 
 @pytest.mark.asyncio
+async def test_general_raw_client_dispatches_exact_vmi_list_and_watch_scope():
+    list_body = json.dumps(
+        {"metadata": {"resourceVersion": "17"}, "items": []}
+    ).encode()
+    watch_response = _Response(
+        b"",
+        segments=[
+            b'{"type":"BOOKMARK","object":{"metadata":{"resourceVersion":"18"}}}\n'
+        ],
+    )
+    custom = _CustomObjectsApi([_Response(list_body), watch_response])
+    client = RawKubernetesClient(_CoreApi([]), custom_objects_api=custom)
+
+    page = await client.list_resources(
+        scope=VMI_SCOPE,
+        limit=500,
+        continue_token=None,
+        resource_version=None,
+    )
+    events = [
+        event
+        async for event in client.watch_resources(
+            scope=VMI_SCOPE,
+            resource_version=page.resource_version or "",
+            allow_bookmarks=True,
+            timeout_seconds=30,
+        )
+    ]
+
+    assert custom.calls[0]["group"] == "kubevirt.io"
+    assert custom.calls[0]["version"] == "v1"
+    assert custom.calls[0]["plural"] == "virtualmachineinstances"
+    assert custom.calls[0]["namespace"] == "srw-vms"
+    assert "label_selector" not in custom.calls[0]
+    assert custom.calls[1]["watch"] is True
+    assert [event.resource_version for event in events] == ["18"]
+
+
+@pytest.mark.asyncio
 async def test_general_raw_client_rejects_wrong_scope_for_known_resource() -> None:
     wrong = InventoryScope("dev-cluster", "core/v1/persistentvolumes", "srw")
     client = RawKubernetesClient(_CoreApi([]))
 
-    with pytest.raises(ValueError, match="Pod/PVC scopes"):
+    with pytest.raises(ValueError, match="Pod/PVC/VMI scopes"):
         await client.list_resources(
             scope=wrong,
             limit=500,

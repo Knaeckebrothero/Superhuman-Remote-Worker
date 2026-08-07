@@ -1862,12 +1862,13 @@ jobs:
           # Restore Chart.yaml (don't commit the name override)
           git checkout helm/Chart.yaml
 
-      # -- Publish dev VM-cluster chart (parallel to srw-dev). Same trigger:
-      # any chart-source change OR any image build success. The vm-controller
-      # image build is the most common trigger here. --
+      # -- Publish dev VM-cluster chart (parallel to srw-dev). Re-publish for
+      # chart sources or any image consumed by this chart, including the
+      # independently versioned orchestrator image used by remote collectors. --
       - name: Package and push dev vm-cluster chart
         if: >-
           needs.changes.outputs.chart == 'true' ||
+          needs.build-orchestrator.result == 'success' ||
           needs.build-vm-controller.result == 'success' ||
           needs.build-agent-vm-base.result == 'success'
         run: |
@@ -1898,6 +1899,7 @@ jobs:
       - name: Update vm-cluster fleet.yaml chart version
         if: >-
           needs.changes.outputs.chart == 'true' ||
+          needs.build-orchestrator.result == 'success' ||
           needs.build-vm-controller.result == 'success' ||
           needs.build-agent-vm-base.result == 'success'
         run: >-
@@ -1925,6 +1927,10 @@ jobs:
             .provenance.components.orchestrator.sourceRevision = strenv(COMPONENT_SHA) |
             .provenance.components.orchestrator.releaseVersion = strenv(COMPONENT_VERSION)
           ' deployment/values-experimental.yaml
+          yq -i '
+            .helm.values.image.orchestrator.tag = strenv(COMPONENT_TAG) |
+            .helm.values.image.orchestrator.digest = ""
+          ' deployment-vms/srw-vm-controller/fleet.yaml
 
       - name: Update agent tag
         if: needs.build-agent.result == 'success'

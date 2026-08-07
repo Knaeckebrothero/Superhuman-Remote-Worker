@@ -46,8 +46,28 @@ helm:
     # placeholders; the workflow's image-tag update steps rewrite these
     # in-place via yq.
     image:
+      orchestrator:
+        # Independently-built component identity; CI updates this from
+        # changes.outputs.orchestrator-sha, never the VM chart AppVersion.
+        tag: "sha-95d2a10"
+        digest: ""
       vmController:
         tag: "sha-61ce7db"
+    # Pre-wire the observed private ingestion route while every collector gate
+    # remains dark. These values render no resources until an inventory gate is
+    # explicitly enabled, but preserve api.srw.works as the TLS SNI hostname.
+    infrastructureMetering:
+      vmInventoryEnabled: false
+      pvcInventoryEnabled: false
+      pvInventoryEnabled: false
+      orchestratorUrl: "https://api.srw.works"
+      orchestratorHostAliases:
+        - ip: "10.0.51.11"
+          hostnames:
+            - api.srw.works
+      networkPolicy:
+        orchestratorCidrs:
+          - "10.0.51.11/32"
     vmController:
       defaultVmImage: "ghcr.io/knaeckebrothero/superhuman-remote-worker-agent-vm-base:sha-6ee9037"
       # Golden-image boot acceleration: import the VM base image ONCE into a

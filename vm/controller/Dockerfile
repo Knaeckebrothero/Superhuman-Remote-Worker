@@ -16,7 +16,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY controller.py headscale_client.py ./
+COPY controller.py headscale_client.py lifecycle_auth.py ./
 
 # Non-root user — K8s RBAC handles authorization
 RUN useradd --create-home --no-log-init controller

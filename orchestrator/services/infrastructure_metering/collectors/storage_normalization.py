@@ -50,6 +50,8 @@ ALLOWED_STORAGE_LABELS = frozenset(
         "srw.io/component",
         "srw.io/job-id",
         "srw.io/thread-id",
+        "srw.io/owner-kind",
+        "srw.io/owner-id",
         "srw.io/rootdisk",
         "srw.io/golden-image",
         "srw.io/vm-image",
