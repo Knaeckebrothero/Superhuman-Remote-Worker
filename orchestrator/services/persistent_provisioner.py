@@ -567,6 +567,15 @@ class PersistentProvisioner:
                             {"name": "AGENT_CONFIG", "value": config_name},
                             {"name": "AGENT_PORT", "value": "8001"},
                             {
+                                "name": "POD_UID",
+                                "valueFrom": {
+                                    "fieldRef": {
+                                        "apiVersion": "v1",
+                                        "fieldPath": "metadata.uid",
+                                    }
+                                },
+                            },
+                            {
                                 "name": "MCP_INTERNAL_KEY",
                                 "valueFrom": {
                                     "secretKeyRef": {

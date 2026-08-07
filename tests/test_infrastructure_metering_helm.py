@@ -11,6 +11,78 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def _render_remote_vmi_ingress(*extra: str) -> list[dict]:
+    chart = ROOT / "helm"
+    values = chart / "ci/test-values.yaml"
+    rendered = subprocess.run(
+        [
+            "helm",
+            "template",
+            "metering-remote",
+            str(chart),
+            "-f",
+            str(values),
+            "--set",
+            "infrastructureMetering.collectorEnabled=true",
+            "--set-string",
+            "infrastructureMetering.stableClusterId=dev-cluster",
+            "--set",
+            "infrastructureMetering.networkPolicy.enabled=true",
+            "--set-string",
+            "infrastructureMetering.networkPolicy.apiServerCidrs[0]=10.0.0.1/32",
+            "--set",
+            "infrastructureMetering.vmInventoryEnabled=true",
+            "--set-string",
+            "infrastructureMetering.vmStableClusterId=vm-cluster",
+            "--set-string",
+            "infrastructureMetering.vmNamespace=agent-vms",
+            "--set-string",
+            "infrastructureMetering.vmIngestionSecretName=vmi-metering-key",
+            *extra,
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    return [item for item in yaml.safe_load_all(rendered) if item]
+
+
+def _render_remote_storage_server(*extra: str) -> list[dict]:
+    chart = ROOT / "helm"
+    values = chart / "ci/test-values.yaml"
+    rendered = subprocess.run(
+        [
+            "helm",
+            "template",
+            "metering-remote-storage",
+            str(chart),
+            "-f",
+            str(values),
+            "--set",
+            "infrastructureMetering.collectorEnabled=true",
+            "--set-string",
+            "infrastructureMetering.stableClusterId=dev-cluster",
+            "--set",
+            "infrastructureMetering.networkPolicy.enabled=true",
+            "--set-string",
+            "infrastructureMetering.networkPolicy.apiServerCidrs[0]=10.0.0.1/32",
+            "--set",
+            "infrastructureMetering.vmPvcInventoryEnabled=true",
+            "--set-string",
+            "infrastructureMetering.vmStableClusterId=vm-cluster",
+            "--set-string",
+            "infrastructureMetering.vmNamespace=agent-vms",
+            "--set-string",
+            "infrastructureMetering.vmStorageIngestionSecretName=vm-storage-metering-key",
+            *extra,
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    return [item for item in yaml.safe_load_all(rendered) if item]
+
+
 @pytest.mark.skipif(shutil.which("helm") is None, reason="Helm is not installed")
 def test_dedicated_metering_collector_renders_only_with_scoped_pod_reads():
     chart = ROOT / "helm"
@@ -51,6 +123,12 @@ def test_dedicated_metering_collector_renders_only_with_scoped_pod_reads():
         == "67108864"
     )
     assert (
+        disabled_configmap["data"][
+            "INFRASTRUCTURE_METERING_MAX_COLLECTOR_CLOCK_SKEW_SECONDS"
+        ]
+        == "300"
+    )
+    assert (
         disabled_configmap["data"]["INFRASTRUCTURE_METERING_SOURCE_AWARE_READS_ENABLED"]
         == "false"
     )
@@ -64,6 +142,20 @@ def test_dedicated_metering_collector_renders_only_with_scoped_pod_reads():
         "INFRASTRUCTURE_METERING_PV_SHADOW_ENABLED",
         "INFRASTRUCTURE_METERING_PVC_PUBLICATION_ENABLED",
         "INFRASTRUCTURE_METERING_PV_PUBLICATION_ENABLED",
+        "INFRASTRUCTURE_METERING_IDE_POD_SHADOW_ENABLED",
+        "INFRASTRUCTURE_METERING_AGENT_POD_SHADOW_ENABLED",
+        "INFRASTRUCTURE_METERING_IDE_POD_PUBLICATION_ENABLED",
+        "INFRASTRUCTURE_METERING_AGENT_POD_PUBLICATION_ENABLED",
+        "INFRASTRUCTURE_METERING_VM_INVENTORY_ENABLED",
+        "INFRASTRUCTURE_METERING_VM_SHADOW_ENABLED",
+        "INFRASTRUCTURE_METERING_VM_PUBLICATION_ENABLED",
+        "INFRASTRUCTURE_METERING_VM_PVC_INVENTORY_ENABLED",
+        "INFRASTRUCTURE_METERING_VM_PV_INVENTORY_ENABLED",
+        "INFRASTRUCTURE_METERING_VM_PVC_SHADOW_ENABLED",
+        "INFRASTRUCTURE_METERING_VM_PV_SHADOW_ENABLED",
+        "INFRASTRUCTURE_METERING_VM_PVC_PUBLICATION_ENABLED",
+        "INFRASTRUCTURE_METERING_VM_PV_PUBLICATION_ENABLED",
+        "INFRASTRUCTURE_METERING_VM_PV_CLUSTER_WIDE_RBAC_ACKNOWLEDGED",
     ):
         assert disabled_configmap["data"][key] == "false"
     assert (
@@ -78,6 +170,10 @@ def test_dedicated_metering_collector_renders_only_with_scoped_pod_reads():
         ]
         == "[]"
     )
+    assert (
+        disabled_configmap["data"]["INFRASTRUCTURE_METERING_VM_STABLE_CLUSTER_ID"] == ""
+    )
+    assert disabled_configmap["data"]["INFRASTRUCTURE_METERING_VM_NAMESPACE"] == ""
     assert (
         disabled_env["INFRASTRUCTURE_METERING_INGESTION_KEY"]["valueFrom"][
             "secretKeyRef"
@@ -200,6 +296,197 @@ def test_dedicated_metering_collector_renders_only_with_scoped_pod_reads():
 
 
 @pytest.mark.skipif(shutil.which("helm") is None, reason="Helm is not installed")
+def test_remote_vmi_ingress_is_opt_in_tls_cidr_and_hmac_key_is_distinct():
+    disabled = _render_remote_vmi_ingress()
+    assert not any(
+        item.get("metadata", {}).get("name", "").endswith("remote-infra-metering")
+        for item in disabled
+    )
+
+    enabled = _render_remote_vmi_ingress(
+        "--set",
+        "infrastructureMetering.remoteIngress.enabled=true",
+        "--set-string",
+        "infrastructureMetering.remoteIngress.sourceCidrs[0]=203.0.113.10/32",
+    )
+    middleware = next(
+        item
+        for item in enabled
+        if item["kind"] == "Middleware"
+        and item["metadata"]["name"].endswith("allow-remote-infra-metering")
+    )
+    assert middleware["spec"]["ipWhiteList"]["sourceRange"] == ["203.0.113.10/32"]
+    ingress = next(
+        item
+        for item in enabled
+        if item["kind"] == "Ingress"
+        and item["metadata"]["name"].endswith("api-ingress-remote-infra-metering")
+    )
+    assert ingress["spec"]["tls"]
+    assert ingress["spec"]["rules"][0]["http"]["paths"][0]["path"] == (
+        "/api/internal/infrastructure-metering"
+    )
+    orchestrator = next(
+        item
+        for item in enabled
+        if item["kind"] == "Deployment"
+        and item.get("metadata", {})
+        .get("labels", {})
+        .get("app.kubernetes.io/component")
+        == "orchestrator"
+    )
+    env = {
+        entry["name"]: entry
+        for entry in orchestrator["spec"]["template"]["spec"]["containers"][0]["env"]
+    }
+    assert env["INFRASTRUCTURE_METERING_VMI_INGESTION_KEY"]["valueFrom"][
+        "secretKeyRef"
+    ] == {
+        "name": "vmi-metering-key",
+        "key": "INFRASTRUCTURE_METERING_VMI_INGESTION_KEY",
+        "optional": False,
+    }
+
+
+@pytest.mark.skipif(shutil.which("helm") is None, reason="Helm is not installed")
+def test_remote_storage_server_gates_key_and_ingress_are_independent() -> None:
+    disabled_ingress = _render_remote_storage_server()
+    assert not any(
+        item.get("metadata", {}).get("name", "").endswith("remote-infra-metering")
+        for item in disabled_ingress
+    )
+
+    configmap = next(
+        item
+        for item in disabled_ingress
+        if item["kind"] == "ConfigMap"
+        and "INFRASTRUCTURE_METERING_VM_PVC_INVENTORY_ENABLED" in item.get("data", {})
+    )
+    assert configmap["data"]["INFRASTRUCTURE_METERING_VM_INVENTORY_ENABLED"] == (
+        "false"
+    )
+    assert configmap["data"]["INFRASTRUCTURE_METERING_VM_PVC_INVENTORY_ENABLED"] == (
+        "true"
+    )
+    assert configmap["data"]["INFRASTRUCTURE_METERING_VM_PV_INVENTORY_ENABLED"] == (
+        "false"
+    )
+    for gate in (
+        "INFRASTRUCTURE_METERING_VM_PVC_SHADOW_ENABLED",
+        "INFRASTRUCTURE_METERING_VM_PV_SHADOW_ENABLED",
+        "INFRASTRUCTURE_METERING_VM_PVC_PUBLICATION_ENABLED",
+        "INFRASTRUCTURE_METERING_VM_PV_PUBLICATION_ENABLED",
+        "INFRASTRUCTURE_METERING_VM_PV_CLUSTER_WIDE_RBAC_ACKNOWLEDGED",
+        "INFRASTRUCTURE_METERING_PUBLICATION_ENABLED",
+        "INFRASTRUCTURE_METERING_SOURCE_AWARE_READS_ENABLED",
+        "INFRASTRUCTURE_METERING_V2_READS_ENABLED",
+        "INFRASTRUCTURE_METERING_CUTOVER_ENABLED",
+    ):
+        assert configmap["data"][gate] == "false"
+
+    orchestrator = next(
+        item
+        for item in disabled_ingress
+        if item["kind"] == "Deployment"
+        and item.get("metadata", {})
+        .get("labels", {})
+        .get("app.kubernetes.io/component")
+        == "orchestrator"
+    )
+    env = {
+        entry["name"]: entry
+        for entry in orchestrator["spec"]["template"]["spec"]["containers"][0]["env"]
+    }
+    assert env["INFRASTRUCTURE_METERING_VM_STORAGE_INGESTION_KEY"]["valueFrom"][
+        "secretKeyRef"
+    ] == {
+        "name": "vm-storage-metering-key",
+        "key": "INFRASTRUCTURE_METERING_VM_STORAGE_INGESTION_KEY",
+        "optional": False,
+    }
+    assert (
+        env["INFRASTRUCTURE_METERING_VMI_INGESTION_KEY"]["valueFrom"]["secretKeyRef"][
+            "optional"
+        ]
+        is True
+    )
+
+    enabled_ingress = _render_remote_storage_server(
+        "--set",
+        "infrastructureMetering.remoteIngress.enabled=true",
+        "--set-string",
+        "infrastructureMetering.remoteIngress.sourceCidrs[0]=203.0.113.11/32",
+    )
+    middleware = next(
+        item
+        for item in enabled_ingress
+        if item["kind"] == "Middleware"
+        and item["metadata"]["name"].endswith("allow-remote-infra-metering")
+    )
+    assert middleware["spec"]["ipWhiteList"]["sourceRange"] == ["203.0.113.11/32"]
+
+
+@pytest.mark.skipif(shutil.which("helm") is None, reason="Helm is not installed")
+def test_remote_pv_server_gate_requires_and_exports_cluster_rbac_ack() -> None:
+    objects = _render_remote_storage_server(
+        "--set",
+        "infrastructureMetering.vmPvInventoryEnabled=true",
+        "--set",
+        "infrastructureMetering.vmPvClusterWideRbacAcknowledged=true",
+        "--set-string",
+        "infrastructureMetering.volumeIdentityKeyVersion=storage-v1",
+    )
+    configmap = next(
+        item
+        for item in objects
+        if item["kind"] == "ConfigMap"
+        and "INFRASTRUCTURE_METERING_VM_PV_INVENTORY_ENABLED" in item.get("data", {})
+    )
+
+    assert configmap["data"]["INFRASTRUCTURE_METERING_VM_PV_INVENTORY_ENABLED"] == (
+        "true"
+    )
+    assert (
+        configmap["data"][
+            "INFRASTRUCTURE_METERING_VM_PV_CLUSTER_WIDE_RBAC_ACKNOWLEDGED"
+        ]
+        == "true"
+    )
+    assert configmap["data"]["INFRASTRUCTURE_METERING_VOLUME_IDENTITY_KEY_VERSION"] == (
+        "storage-v1"
+    )
+
+
+@pytest.mark.skipif(shutil.which("helm") is None, reason="Helm is not installed")
+def test_missing_remote_ingress_parent_from_reused_values_defaults_off():
+    """An upgrade from a pre-Slice-3 values set must remain renderable."""
+
+    chart = ROOT / "helm"
+    values = chart / "ci/test-values.yaml"
+    rendered = subprocess.run(
+        [
+            "helm",
+            "template",
+            "metering-old-values",
+            str(chart),
+            "-f",
+            str(values),
+            "--skip-schema-validation",
+            "--set-json",
+            "infrastructureMetering.remoteIngress=null",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    objects = [item for item in yaml.safe_load_all(rendered) if item]
+    assert not any(
+        item.get("metadata", {}).get("name", "").endswith("remote-infra-metering")
+        for item in objects
+    )
+
+
+@pytest.mark.skipif(shutil.which("helm") is None, reason="Helm is not installed")
 def test_experimental_cluster_keeps_storage_inventory_and_publication_dark():
     chart = ROOT / "helm"
     values = ROOT / "deployment/values-experimental.yaml"
@@ -223,6 +510,18 @@ def test_experimental_cluster_keeps_storage_inventory_and_publication_dark():
         "INFRASTRUCTURE_METERING_PV_SHADOW_ENABLED",
         "INFRASTRUCTURE_METERING_PVC_PUBLICATION_ENABLED",
         "INFRASTRUCTURE_METERING_PV_PUBLICATION_ENABLED",
+        "INFRASTRUCTURE_METERING_IDE_POD_SHADOW_ENABLED",
+        "INFRASTRUCTURE_METERING_AGENT_POD_SHADOW_ENABLED",
+        "INFRASTRUCTURE_METERING_IDE_POD_PUBLICATION_ENABLED",
+        "INFRASTRUCTURE_METERING_AGENT_POD_PUBLICATION_ENABLED",
+        "INFRASTRUCTURE_METERING_VM_INVENTORY_ENABLED",
+        "INFRASTRUCTURE_METERING_VM_SHADOW_ENABLED",
+        "INFRASTRUCTURE_METERING_VM_PUBLICATION_ENABLED",
+        "INFRASTRUCTURE_METERING_VM_PVC_INVENTORY_ENABLED",
+        "INFRASTRUCTURE_METERING_VM_PV_INVENTORY_ENABLED",
+        "INFRASTRUCTURE_METERING_VM_PVC_SHADOW_ENABLED",
+        "INFRASTRUCTURE_METERING_VM_PV_SHADOW_ENABLED",
+        "INFRASTRUCTURE_METERING_VM_PV_CLUSTER_WIDE_RBAC_ACKNOWLEDGED",
     ):
         assert configmap["data"][key] == "false"
 
@@ -246,6 +545,140 @@ def test_experimental_cluster_keeps_storage_inventory_and_publication_dark():
         for item in collector["spec"]["template"]["spec"]["containers"][0]["env"]
     }
     assert "INFRASTRUCTURE_METERING_VOLUME_IDENTITY_KEY" not in env_names
+
+
+@pytest.mark.skipif(shutil.which("helm") is None, reason="Helm is not installed")
+@pytest.mark.parametrize(
+    ("arguments", "message"),
+    [
+        (
+            ["--set", "infrastructureMetering.agentPodShadowEnabled=true"],
+            "agent Pod shadow gates require collectorEnabled",
+        ),
+        (
+            ["--set", "infrastructureMetering.vmInventoryEnabled=true"],
+            "vmInventoryEnabled requires collectorEnabled",
+        ),
+        (
+            ["--set", "infrastructureMetering.vmPvcInventoryEnabled=true"],
+            "remote storage inventory requires collectorEnabled",
+        ),
+    ],
+)
+def test_slice3_metering_gates_render_fail_closed(arguments, message):
+    result = subprocess.run(
+        [
+            "helm",
+            "template",
+            "metering-test",
+            str(ROOT / "helm"),
+            "-f",
+            str(ROOT / "helm/ci/test-values.yaml"),
+            *arguments,
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode != 0
+    assert message in result.stderr
+
+
+@pytest.mark.skipif(shutil.which("helm") is None, reason="Helm is not installed")
+def test_remote_storage_server_config_fails_closed() -> None:
+    base = [
+        "helm",
+        "template",
+        "metering-remote-storage",
+        str(ROOT / "helm"),
+        "-f",
+        str(ROOT / "helm/ci/test-values.yaml"),
+        "--set",
+        "infrastructureMetering.collectorEnabled=true",
+        "--set-string",
+        "infrastructureMetering.stableClusterId=dev-cluster",
+        "--set",
+        "infrastructureMetering.networkPolicy.enabled=true",
+        "--set-string",
+        "infrastructureMetering.networkPolicy.apiServerCidrs[0]=10.0.0.1/32",
+        "--set",
+        "infrastructureMetering.vmPvcInventoryEnabled=true",
+        "--set-string",
+        "infrastructureMetering.vmStableClusterId=vm-cluster",
+        "--set-string",
+        "infrastructureMetering.vmNamespace=agent-vms",
+        "--set-string",
+        "infrastructureMetering.vmStorageIngestionSecretName=vm-storage-hmac",
+    ]
+    cases = [
+        (
+            [
+                "--set-string",
+                "infrastructureMetering.vmStorageIngestionSecretName=",
+            ],
+            "requires vmStorageIngestionSecretName",
+        ),
+        (
+            ["--set-string", "infrastructureMetering.vmStableClusterId="],
+            "requires vmStableClusterId",
+        ),
+        (
+            ["--set-string", "infrastructureMetering.vmNamespace="],
+            "requires vmNamespace",
+        ),
+        (
+            ["--set", "infrastructureMetering.vmPvcShadowEnabled=true"],
+            "vmPvcShadowEnabled requires shadowEnabled",
+        ),
+        (
+            ["--set", "infrastructureMetering.vmPvcPublicationEnabled=true"],
+            "vmPvcPublicationEnabled requires vmPvcShadowEnabled",
+        ),
+        (
+            ["--set", "infrastructureMetering.vmPvInventoryEnabled=true"],
+            "requires vmPvClusterWideRbacAcknowledged=true",
+        ),
+        (
+            [
+                "--set",
+                "infrastructureMetering.vmPvInventoryEnabled=true",
+                "--set",
+                "infrastructureMetering.vmPvClusterWideRbacAcknowledged=true",
+            ],
+            "vmPvInventoryEnabled requires volumeIdentityKeyVersion",
+        ),
+        (
+            [
+                "--set-string",
+                "infrastructureMetering.vmStorageIngestionSecretName=test-infra-metering-ingestion",
+            ],
+            "must be separate from ingestionSecretName",
+        ),
+        (
+            [
+                "--set-string",
+                "infrastructureMetering.vmIngestionSecretName=vm-storage-hmac",
+            ],
+            "must be separate from vmIngestionSecretName",
+        ),
+        (
+            [
+                "--set-string",
+                "infrastructureMetering.volumeIdentitySecretName=vm-storage-hmac",
+            ],
+            "must be separate from volumeIdentitySecretName",
+        ),
+    ]
+
+    for extra, message in cases:
+        result = subprocess.run(
+            base + extra,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode != 0, extra
+        assert message in result.stderr, result.stderr
 
 
 @pytest.mark.skipif(shutil.which("helm") is None, reason="Helm is not installed")
@@ -851,3 +1284,164 @@ def test_public_ingress_blocks_internal_metering_path_when_collector_is_enabled(
     assert cockpit_block["spec"]["rules"][0]["http"]["paths"][0]["path"] == (
         "/api/internal/infrastructure-metering"
     )
+
+
+@pytest.mark.skipif(shutil.which("helm") is None, reason="Helm is not installed")
+def test_colocated_vm_lifecycle_auth_is_paired_and_dedicated() -> None:
+    chart = ROOT / "helm"
+    values = chart / "ci/test-values.yaml"
+    output = subprocess.run(
+        [
+            "helm",
+            "template",
+            "vm-lifecycle-test",
+            str(chart),
+            "-f",
+            str(values),
+            "--set",
+            "vmController.enabled=true",
+            "--set-string",
+            "infrastructureMetering.vmLifecycleAuthSecretName=vm-lifecycle",
+            "--set-string",
+            "vmController.lifecycleAuthSecretName=vm-lifecycle",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    objects = [item for item in yaml.safe_load_all(output) if item]
+    deployments = {
+        item["metadata"]["labels"].get("app.kubernetes.io/component"): item
+        for item in objects
+        if item["kind"] == "Deployment"
+    }
+    for component in ("orchestrator", "vm-controller"):
+        env = {
+            entry["name"]: entry
+            for entry in deployments[component]["spec"]["template"]["spec"][
+                "containers"
+            ][0]["env"]
+        }
+        secret_ref = env["VM_LIFECYCLE_HMAC_SECRET"]["valueFrom"]["secretKeyRef"]
+        assert secret_ref == {
+            "name": "vm-lifecycle",
+            "key": "VM_LIFECYCLE_HMAC_SECRET",
+        }
+    assert deployments["vm-controller"]["spec"]["strategy"] == {"type": "Recreate"}
+    vm_role = next(
+        item
+        for item in objects
+        if item["kind"] == "Role"
+        and item.get("metadata", {})
+        .get("labels", {})
+        .get("app.kubernetes.io/component")
+        == "vm-controller"
+    )
+    assert {
+        "apiGroups": ["coordination.k8s.io"],
+        "resources": ["leases"],
+        "verbs": ["get", "list", "create", "delete"],
+    } in vm_role["rules"]
+
+
+@pytest.mark.skipif(shutil.which("helm") is None, reason="Helm is not installed")
+def test_colocated_vm_controller_without_lifecycle_auth_omits_nonce_rbac() -> None:
+    output = subprocess.run(
+        [
+            "helm",
+            "template",
+            "vm-controller-dark-test",
+            str(ROOT / "helm"),
+            "-f",
+            str(ROOT / "helm/ci/test-values.yaml"),
+            "--set",
+            "vmController.enabled=true",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    objects = [item for item in yaml.safe_load_all(output) if item]
+    vm_role = next(
+        item
+        for item in objects
+        if item["kind"] == "Role"
+        and item.get("metadata", {})
+        .get("labels", {})
+        .get("app.kubernetes.io/component")
+        == "vm-controller"
+    )
+
+    assert not any(
+        "coordination.k8s.io" in rule.get("apiGroups", [])
+        or "leases" in rule.get("resources", [])
+        for rule in vm_role["rules"]
+    )
+
+
+@pytest.mark.skipif(shutil.which("helm") is None, reason="Helm is not installed")
+@pytest.mark.parametrize(
+    ("extra", "message"),
+    [
+        (
+            [
+                "--set-string",
+                "infrastructureMetering.vmLifecycleAuthSecretName=vm-lifecycle",
+            ],
+            "both set or both empty",
+        ),
+        (
+            [
+                "--set-string",
+                "infrastructureMetering.vmLifecycleAuthSecretName=vm-lifecycle",
+                "--set-string",
+                "vmController.lifecycleAuthSecretName=another-lifecycle",
+            ],
+            "must use the same Secret name",
+        ),
+        (
+            [
+                "--set-string",
+                "infrastructureMetering.vmLifecycleAuthSecretName=vm-lifecycle",
+                "--set-string",
+                "vmController.lifecycleAuthSecretName=vm-lifecycle",
+                "--set-string",
+                "vmController.lifecycleAuthSecretKey=OTHER_KEY",
+            ],
+            "must use the same Secret key",
+        ),
+        (
+            [
+                "--set-string",
+                "secrets.existingSecret=app-secret",
+                "--set-string",
+                "infrastructureMetering.vmLifecycleAuthSecretName=app-secret",
+                "--set-string",
+                "vmController.lifecycleAuthSecretName=app-secret",
+            ],
+            "must be separate from the application Secret",
+        ),
+    ],
+)
+def test_colocated_vm_lifecycle_auth_miswiring_fails_render(
+    extra: list[str], message: str
+) -> None:
+    result = subprocess.run(
+        [
+            "helm",
+            "template",
+            "vm-lifecycle-test",
+            str(ROOT / "helm"),
+            "-f",
+            str(ROOT / "helm/ci/test-values.yaml"),
+            "--set",
+            "vmController.enabled=true",
+            *extra,
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert message in result.stderr

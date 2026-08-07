@@ -102,6 +102,19 @@ _PVC_SHAPES = (
     ),
 )
 
+_VM_ROOTDISK_PREFIX = "agent-vm-"
+_VM_ROOTDISK_SUFFIX = "-rootdisk"
+_VM_OWNER_ALIAS_KINDS: Mapping[str, Literal["job", "thread"] | None] = {
+    # The VM controller historically used ``job-id`` for both jobs and
+    # threads, so it proves only the identifier, not the owner kind.
+    "job-id": None,
+    "thread-id": "thread",
+    "srw/job-id": "job",
+    "srw/thread-id": "thread",
+    "srw.io/job-id": "job",
+    "srw.io/thread-id": "thread",
+}
+
 
 @dataclass(frozen=True, slots=True)
 class _OwnerHint:
@@ -199,6 +212,15 @@ def _canonical_uuid(value: Any) -> UUID | None:
     return parsed if str(parsed) == value else None
 
 
+def _uuid_value(value: Any) -> UUID | None:
+    if value is None:
+        return None
+    try:
+        return value if isinstance(value, UUID) else UUID(str(value))
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
 def _unknown(reason: str) -> StorageAttribution:
     return StorageAttribution(
         scope="unknown",
@@ -292,17 +314,74 @@ def _classify_pvc(
     thread_label = labels.get("srw/thread-id")
     matched_product_shapes: list[tuple[str, str]] = []
 
-    # VM-controller ownership is deliberately deferred until the DataVolume /
-    # VMI envelope arrives in Slice 3. Do not trust its generic job-id label.
-    if labels.get("srw.io/rootdisk") == "true" or (
-        name.startswith("agent-vm-") and name.endswith("-rootdisk")
+    # A DataVolume is only the provisioning link that created this PVC.  The
+    # claim itself is the single storage asset and carries the explicit owner
+    # hint propagated by CDI.  Labels remain untrusted until the app-DB VM
+    # context is checked by _resolve_vm_rootdisk_owner().
+    rootdisk_marker = labels.get("srw.io/rootdisk")
+    if rootdisk_marker == "true" or (
+        name.startswith(_VM_ROOTDISK_PREFIX) and name.endswith(_VM_ROOTDISK_SUFFIX)
     ):
+        if (
+            rootdisk_marker not in {None, "true"}
+            or labels.get("srw.io/golden-image")
+            or labels.get("srw.io/vm-image")
+        ):
+            return (
+                "vm_rootdisk_claim",
+                None,
+                _unknown("vm-rootdisk-classification-conflict"),
+                "vm-rootdisk-classification-conflict",
+                True,
+            )
+        owner_kind = labels.get("srw.io/owner-kind")
+        raw_owner_id = labels.get("srw.io/owner-id")
+        if owner_kind is None or raw_owner_id is None:
+            return (
+                "vm_rootdisk_claim",
+                None,
+                _unknown("vm-owner-hint-missing"),
+                "vm-owner-hint-missing",
+                True,
+            )
+        owner_id = _canonical_uuid(raw_owner_id)
+        if owner_kind not in {"job", "thread"} or owner_id is None:
+            return (
+                "vm_rootdisk_claim",
+                None,
+                _unknown("vm-owner-hint-invalid"),
+                "vm-owner-hint-invalid",
+                True,
+            )
+        expected_name = f"{_VM_ROOTDISK_PREFIX}{owner_id}{_VM_ROOTDISK_SUFFIX}"
+        if name != expected_name:
+            return (
+                "vm_rootdisk_claim",
+                None,
+                _unknown("vm-rootdisk-name-mismatch"),
+                "vm-rootdisk-name-mismatch",
+                True,
+            )
+        for alias, alias_kind in _VM_OWNER_ALIAS_KINDS.items():
+            alias_owner = labels.get(alias)
+            if alias_owner is None:
+                continue
+            if alias_owner != str(owner_id) or (
+                alias_kind is not None and alias_kind != owner_kind
+            ):
+                return (
+                    "vm_rootdisk_claim",
+                    None,
+                    _unknown("vm-owner-hint-conflict"),
+                    "vm-owner-hint-conflict",
+                    True,
+                )
         return (
             "vm_rootdisk_claim",
+            _OwnerHint(kind=owner_kind, id=owner_id),  # type: ignore[arg-type]
             None,
-            _unknown("vm-owner-awaits-slice3"),
-            "vm-owner-awaits-slice3",
-            True,
+            "vm-rootdisk-owner-hint",
+            False,
         )
 
     if labels.get("srw.io/golden-image") or labels.get("srw.io/vm-image"):
@@ -581,11 +660,44 @@ def _json_details(value: Any) -> Mapping[str, Any]:
     return {}
 
 
-class StorageIntervalReconciler:
-    """Snapshot/WATCH hooks for PVC demand and physical volume assets."""
+_VM_ROOTDISK_JOB_OWNER_SQL = """
+/* infrastructure-metering:resolve-vm-rootdisk-job-owner */
+SELECT 'job'::text AS owner_kind, job.id AS owner_id, job.user_id,
+       job.project_id, job.context->'vm' AS vm_context
+FROM jobs AS job
+WHERE job.id = $1::uuid
+FOR SHARE
+"""
 
-    def __init__(self, *, shadow_enabled: bool = True) -> None:
+_VM_ROOTDISK_THREAD_OWNER_SQL = """
+/* infrastructure-metering:resolve-vm-rootdisk-thread-owner */
+SELECT 'thread'::text AS owner_kind, thread.id AS owner_id, thread.user_id,
+       thread.project_id, thread.metadata->'vm' AS vm_context
+FROM threads AS thread
+WHERE thread.id = $1::uuid
+FOR SHARE
+"""
+
+
+class StorageIntervalReconciler:
+    """Snapshot/WATCH hooks for PVC demand and physical volume assets.
+
+    ``interval_mutations_enabled`` is a one-way runtime fence for inventory
+    authorities that are not eligible for activation or publication. Those
+    authorities still exercise normalization, trusted attribution, shadow
+    evidence, and the durable-volume registry, but can never open a billable
+    resource interval even if another cluster already activated the same
+    measurement basis.
+    """
+
+    def __init__(
+        self,
+        *,
+        shadow_enabled: bool = True,
+        interval_mutations_enabled: bool = True,
+    ) -> None:
         self.shadow_enabled = shadow_enabled
+        self.interval_mutations_enabled = interval_mutations_enabled
 
     @staticmethod
     async def _resolve_volume_mapping(
@@ -626,20 +738,25 @@ class StorageIntervalReconciler:
         """Use the activation boundary only with continuous pre-boundary proof."""
 
         activation = await read_storage_activation(conn, projection.measurement_basis)
-        boundary = activation.activated_at
+        global_boundary = activation.activated_at
         if (
             activation.state != "active"
-            or boundary is None
+            or global_boundary is None
             or activation.database_time is None
-            or activation.database_time < boundary
-            or context.received_at < boundary
+            or activation.database_time < global_boundary
         ):
             raise StorageActivationNotReady("storage basis is not active")
-        receipt_start = await lock_storage_activation(
+        boundary = await lock_storage_activation(
             conn,
             measurement_basis=projection.measurement_basis,
-            observed_started_at=context.received_at,
+            inventory_scope_id=context.inventory_scope_id,
+            observed_started_at=global_boundary,
         )
+        if context.received_at < boundary:
+            raise StorageActivationNotReady(
+                "storage observation predates its source activation"
+            )
+        receipt_start = max(context.received_at, boundary)
         if (
             projection.creation_timestamp is not None
             and projection.creation_timestamp > boundary
@@ -701,11 +818,115 @@ class StorageIntervalReconciler:
         return receipt_start
 
     @staticmethod
+    async def _resolve_vm_rootdisk_owner(
+        conn: asyncpg.Connection, projection: StorageProjection
+    ) -> StorageAttribution:
+        """Authenticate a root-PVC hint against durable application identity.
+
+        The PVC remains present while its VM is suspended or deleted, so VM or
+        VMI liveness is deliberately not part of this join.  The persisted VM
+        name and namespace select the candidate, while the controller-attested
+        immutable PVC UID binds that row to this exact claim incarnation.  A
+        DataVolume is neither queried nor metered.
+        """
+
+        hint = projection.owner_hint
+        if hint is None:
+            return _unknown(projection.classification_reason)
+        sql = (
+            _VM_ROOTDISK_JOB_OWNER_SQL
+            if hint.kind == "job"
+            else _VM_ROOTDISK_THREAD_OWNER_SQL
+        )
+        row = await conn.fetchrow(sql, hint.id)
+        if row is None:
+            return _unknown("owner-row-missing")
+        if row["owner_kind"] != hint.kind or _uuid_value(row["owner_id"]) != hint.id:
+            return _unknown("owner-row-identity-mismatch")
+
+        user_id = _uuid_value(row["user_id"])
+        if user_id is None:
+            return _unknown("owner-user-missing")
+        project_value = row.get("project_id")
+        project_id = _uuid_value(project_value)
+        if project_value is not None and project_id is None:
+            raise InventoryContractError(
+                "VM rootdisk owner snapshot has invalid project identity"
+            )
+
+        vm_context = _json_details(row.get("vm_context"))
+        if not vm_context:
+            return _unknown("vm-context-missing")
+        provision_generation = _canonical_uuid(vm_context.get("provision_generation"))
+        identity_generation = _canonical_uuid(
+            vm_context.get("identity_provision_generation")
+        )
+        if vm_context.get("identity_authenticated") is not True:
+            return _unknown("vm-identity-unauthenticated")
+        if provision_generation is None or identity_generation is None:
+            return _unknown("vm-identity-generation-missing")
+        if identity_generation != provision_generation:
+            return _unknown("vm-identity-generation-mismatch")
+        expected_vm_name = f"{_VM_ROOTDISK_PREFIX}{hint.id}"
+        persisted_vm_name = vm_context.get("vm_name")
+        if persisted_vm_name is None:
+            persisted_vm_name = vm_context.get("name")
+        if persisted_vm_name != expected_vm_name:
+            return _unknown("vm-name-mismatch")
+        if vm_context.get("namespace") != projection.namespace:
+            return _unknown("vm-namespace-mismatch")
+        persisted_pvc_uid_value = vm_context.get("rootdisk_pvc_uid")
+        persisted_pvc_uid = _optional_text(persisted_pvc_uid_value, maximum=256)
+        if persisted_pvc_uid is None:
+            return _unknown(
+                "rootdisk-pvc-uid-missing"
+                if persisted_pvc_uid_value is None
+                else "rootdisk-pvc-uid-invalid"
+            )
+        if persisted_pvc_uid != persisted_pvc_uid.strip() or any(
+            character.isspace() for character in persisted_pvc_uid
+        ):
+            return _unknown("rootdisk-pvc-uid-invalid")
+        if persisted_pvc_uid != projection.source_uid:
+            return _unknown("rootdisk-pvc-uid-mismatch")
+
+        # Current contexts derive identity from their owning row.  If a newer
+        # producer also persists it explicitly, disagreement is a hard hint
+        # conflict rather than a reason to trust the Kubernetes label.
+        persisted_owner_kind = vm_context.get("owner_kind")
+        if persisted_owner_kind is None:
+            persisted_owner_kind = vm_context.get("entity_type")
+        if persisted_owner_kind is not None and persisted_owner_kind != hint.kind:
+            return _unknown("vm-owner-identity-mismatch")
+        persisted_owner_id = vm_context.get("owner_id")
+        if persisted_owner_id is None:
+            persisted_owner_id = vm_context.get("entity_id")
+        if persisted_owner_id is None:
+            persisted_owner_id = vm_context.get("job_id")
+        if persisted_owner_id is not None and str(persisted_owner_id) != str(hint.id):
+            return _unknown("vm-owner-identity-mismatch")
+
+        return StorageAttribution(
+            scope="customer",
+            owner_kind=hint.kind,
+            owner_id=hint.id,
+            user_id=user_id,
+            project_id=project_id,
+            source="app-db-vm-rootdisk-owner-identity",
+            quality="exact",
+            reason_code=f"{hint.kind}-vm-rootdisk-identity",
+        )
+
+    @staticmethod
     async def _resolve_claim_owner(
         conn: asyncpg.Connection, projection: StorageProjection
     ) -> StorageAttribution:
         if projection.static_attribution is not None:
             return projection.static_attribution
+        if projection.resource == "vm_rootdisk_claim":
+            return await StorageIntervalReconciler._resolve_vm_rootdisk_owner(
+                conn, projection
+            )
         hint = projection.owner_hint
         if hint is None:
             return _unknown(projection.classification_reason)
@@ -1132,6 +1353,11 @@ class StorageIntervalReconciler:
             source_cluster=context.source_cluster,
             projection=projection,
         )
+        if not self.interval_mutations_enabled:
+            # Remote VM-cluster storage is currently a dark inventory/shadow
+            # source. Keep the asset/attribution proof above, but never consult
+            # the global storage activation row or create resource_intervals.
+            return None
         if not projection.valid_for_interval:
             await self._close_existing(
                 conn,
@@ -1154,6 +1380,7 @@ class StorageIntervalReconciler:
                 started_at = await lock_storage_activation(
                     conn,
                     measurement_basis=projection.measurement_basis,
+                    inventory_scope_id=context.inventory_scope_id,
                     observed_started_at=context.received_at,
                 )
         except StorageActivationNotReady:
@@ -1428,6 +1655,8 @@ class StorageIntervalReconciler:
     ) -> bool:
         """Freeze physical accrual until backend destruction is proven."""
 
+        if not self.interval_mutations_enabled:
+            return False
         if interval["source_kind"] != "volume":
             return False
         details = _json_details(interval["details"])
@@ -1498,6 +1727,10 @@ class StorageIntervalReconciler:
                 boundary=boundary,
                 reason_code=gap_reason,
             )
+        if not self.interval_mutations_enabled:
+            # Asset disappearance remains durable evidence, but this dark
+            # authority may never close an interval supplied by another path.
+            return WatchMutationAction.ALREADY_ABSENT, None
         if interval is None:
             return WatchMutationAction.ALREADY_ABSENT, None
         closed_id = await self._close_existing(

@@ -11,16 +11,17 @@ tags:
 
 # Application infrastructure allocation metering
 
-**Status:** Slices 0, 1, and 2 are implementation-complete as gated code through
-app migration `0102`. The Slice 1 workspace-Pod path remains as described below.
-Slice 2 adds independent PVC-demand and PV/backend-asset inventory,
-reconciliation, activation, shadow, publication, coverage, and pricing fences.
-Every chart gate still defaults off, the main-dev configuration keeps all six
-storage gates off, no durable production cutover has been performed, and the
-compatibility ledger remains authoritative. Focused code, chart, migration, and
-database verification and the live Slice 2 k3d inventory→shadow→all-off
-exercise have passed. Slice 3 agent/VM collection is the next implementation
-slice. None of these milestones is an automatic billing switch.
+**Status:** Slices 0–3 are implementation-complete behind independent rollout
+gates. Slice 3 adds agent/IDE Pod identity and lifecycle metering, admitted VMI
+compute, authenticated VM lifecycle evidence, remote root-storage collection,
+and exact per-class activation/epoch authority through app migration `0114`.
+The full Slice 3 code, chart, migration, PostgreSQL, and local k3d acceptance
+matrix is green. Every new gate still defaults off; no durable production
+cutover has been performed, publication remains disabled, and the compatibility
+ledger remains authoritative. Main dev is still on image `sha-95d2a10` with app
+migrations through `0102` and Pod inventory only. Operational agent/IDE and
+live-KubeVirt inventory/shadow soaks remain rollout gates; Slice 4 is the next
+implementation slice. None of these milestones is an automatic billing switch.
 
 **Triggered by:** adding public-cloud comparison rate cards exposed that the
 ledger's existing `vcpu-hour` / `gib-hour` arithmetic is sound, but its resource
@@ -39,7 +40,7 @@ application or platform infrastructure cost.
 - [`vm_workspace_persistence_reconciliation.md`](vm_workspace_persistence_reconciliation.md)
   — VM/root-disk lifecycle ownership.
 
-## Current implementation snapshot (2026-08-06)
+## Current implementation snapshot (2026-08-07)
 
 | Layer | Current state |
 |---|---|
@@ -47,10 +48,12 @@ application or platform infrastructure cost.
 | Slice 0 | Typed audit/app schemas, immutable canonical/provider rate versions, decimal-safe `/api/usage/v2`, dimensional Cockpit cards, capability probes, bootstrap state, and independent feature gates are implemented. |
 | Slice 1 | The workspace-Pod collector, authenticated LIST/WATCH ingestion, lifecycle intervals, shadow comparison, strict ordinary/late/correction publication, sealing, typed rollup, source-aware reads, and crash-resumable cutover are implemented through app migration `0101`. |
 | Slice 2 | PVC logical-demand and PV physical-asset collection, separate lifecycle state, retained/backend-unverified gaps, opaque CSI identity, immutable exact resource mapping, operator destruction assertions, activation controls, typed reads/sealing, and publication-plan integration are implemented through app migration `0102`. |
-| Repository deployment posture | Chart defaults keep every base and storage gate off. `deployment/values-experimental.yaml` enables **Pod inventory only** for main dev; PVC/PV inventory, their shadow/publication gates, v2 reads, source-aware reads, cutover, and global publication remain off. |
-| Verification | Slice 1's Python, Helm, schema, race, and k3d inventory→shadow→all-off evidence remains valid. Slice 2 focused Python/Helm tests, PostgreSQL migration/schema replay, and a live k3d PVC/PV inventory→shadow→all-off exercise have passed with publication disabled. |
+| Slice 3 | Agent, persistent-agent, and IDE Pod classification; durable bind/unbind replay; receipt-time lifecycle uncertainty; VMI compute normalization; authenticated VM-controller evidence; remote VMI/PVC/PV collectors; per-source storage activation; and append-only exact compute-epoch authority are implemented through app migration `0114`. |
+| Repository deployment posture | Chart defaults keep every base, storage, and Slice 3 gate off. `deployment/values-experimental.yaml` enables **Pod inventory only** for main dev; PVC/PV, agent/IDE shadow, VM/VMI and remote storage collection, every publication gate, v2/source-aware reads, and cutover remain off. |
+| Deployed state | Main dev remains on image `sha-95d2a10` with app migrations through `0102` and Pod inventory only. The Slice 3 package through `0114` has passed a dark k3d rollout but is not yet deployed to main dev. |
+| Verification | Slice 1 and Slice 2 evidence remains valid. The full Slice 3 Python, remote-controller, migration/PostgreSQL, Helm, formatting, and security/race acceptance matrix passed. A dark k3d upgrade through `0114` was healthy with all publication, cutover, v2/source-aware-read, storage, and Slice 3 collection gates off. |
 | Billing state | No durable cutover has occurred. No infrastructure v2 event publication is enabled, and the new path must not be presented as an invoice or customer charge. |
-| Next | Implement Slice 3 agent/VM metering. Main-dev Pod inventory can continue soaking independently; storage inventory/shadow still requires a deliberate operational rollout. |
+| Next | Deploy the dark Slice 3 package to main dev, then run agent/IDE inventory/shadow and live-KubeVirt VMI/root-storage soaks with publication disabled. Slice 4 shared-platform completeness is the next code slice. |
 
 ### Roadmap checkpoint
 
@@ -59,7 +62,7 @@ application or platform infrastructure cost.
 | 0 — schemas and dimensional UI | **Implemented / dark-launched** | Enable v2 reads only after capability/bootstrap checks and the Slice 1 source transition are ready. |
 | 1 — Kubernetes workspace Pods | **Implementation and local k3d verification complete** | Main-dev inventory soak, then real-workspace shadow reconciliation; publication and one-way cutover still require explicit operator approval. |
 | 2 — PVC claims and PV/CSI volumes | **Implementation and local k3d verification complete / dark-launched** | Run a controlled main-dev inventory/shadow soak before activation. Provider storage rate cards remain Slice 5. |
-| 3 — agents and VMs | **Next to implement** | Add agent identities and authenticated VM-controller lifecycle transport/publication. |
+| 3 — agents and VMs | **Implementation and dark k3d verification complete** | Deploy dark to main dev, then soak real agent/IDE inventory/shadow and live KubeVirt VMI/root PVC/PV sources. Publication remains separately disabled. |
 | 4 — shared platform completeness | **Not implemented** | Classify platform/unknown workload and expose overhead without smearing it across customers. |
 | 5 — provider calculator hardening | **Framework only** | Add occurrence/concurrency/storage-specific calculators and provider fixtures after their resource classes exist. |
 | 6 — actual-utilization overlay | **Not implemented** | Add Prometheus-backed efficiency views while keeping requested allocation canonical. |
@@ -111,10 +114,10 @@ A sandbox workspace requesting 8 vCPU and 16 GiB for one hour emits two rows:
 `8 vcpu-hour` and `16 gib-hour`. A 4 GiB workspace running for one hour emits
 `4 gib-hour` plus its independent CPU quantity.
 
-The following list records the gaps that motivated this design. Slices 0–2 now
-address the UI, live-window, workspace-Pod, and PVC/PV items in dark-launched
-code, but they do not change the serving/billing path while their rollout gates
-remain off:
+The following list records the gaps that motivated this design. Slices 0–3 now
+address the UI, live-window, workspace-Pod, PVC/PV, agent/IDE, and VMI items in
+dark-launched code, but they do not change the serving/billing path while their
+rollout gates remain off:
 
 1. Cockpit adds vCPU-hours and GiB-hours into one "Compute-hours" number. The
    ledger keeps them separate, but the headline and user/project breakdowns are
@@ -1649,10 +1652,13 @@ adding more branches to the legacy workspace file:
 |---|---|
 | `types.py` | Inventory envelopes/items, typed dimensions, health/finality enums |
 | `quantities.py` / `pod_requests.py` | Kubernetes parsing, effective requests, Decimal integration |
-| `collectors/kubernetes.py`, `kubernetes_client.py`, and `collector_runtime.py` | Per-scope bounded LIST/WATCH state machines for Pods, PVCs, and PVs |
+| `collectors/kubernetes.py`, `kubernetes_client.py`, and `collector_runtime.py` | Per-scope bounded LIST/WATCH state machines for Pods, PVCs, PVs, and remote VM-cluster sources |
 | `collectors/storage_normalization.py` | Strict PVC/PV allowlisting, quantity parsing, and HMAC CSI identity derivation without retaining raw handles |
-| `collectors/vm_controller.py` | HTTP/NATS VM snapshot validation and normalization |
+| `collectors/vmi_normalization.py` | Strict admitted-VMI capacity, owner-hint, phase, generation, UID, and root-PVC normalization |
 | `ingestion.py`, `pod_intervals.py`, and `storage_intervals.py` | Transactional snapshot/WATCH reconciliation and basis-specific interval revisions |
+| `agent_intervals.py`, `ide_intervals.py`, and `vmi_intervals.py` | Class-specific attribution, non-publishable shadow evidence, lifecycle heads, and exact-epoch interval revisions |
+| `lifecycle_start.py` | Receipt-time start bounds, continuous absence/unscheduled proof, and bounded remote-clock evidence |
+| `compute_activation.py` | Forward-only per-class activation, exact scope/epoch proof, and append-only recovery promotion authority |
 | `storage_assets.py` | Durable PV assets/incarnations, identity-key registration, activation, backend gaps, and fleet-admin evidence operations |
 | `storage_mapping.py` | Immutable exact operator mappings and forced-unpriced unmapped resolution |
 | `materializer.py` | Day/rate segmentation and strict ledger publication |
@@ -1669,11 +1675,12 @@ Existing integration points and their intended deltas are explicit:
 | `orchestrator/services/usage_rollup.py` | Typed v2 dimensions, dirty-day revisions, seals, and interval/plan handoff |
 | `orchestrator/services/cloud_pricing.py` | Versioned typed selectors/calculators; retain v1 workspace-only adapter during compatibility |
 | `orchestrator/services/leader_election.py` | Allocate/check metering generation and propagate cancellation on lease connection loss |
-| `orchestrator/services/nats_bridge.py` + `vm/controller/controller.py` | Replace one-reply VM listing for metering with authenticated, bounded begin/items/end inventory framing |
+| `orchestrator/services/vm_lifecycle_auth.py` + `vm/controller/lifecycle_auth.py` | Versioned HMAC lifecycle authentication, request identity, replay/clock bounds, and controller-generation fencing |
+| `orchestrator/services/nats_bridge.py` + `vm/controller/controller.py` | Authenticated lifecycle owner/root-PVC evidence and replay-safe controller convergence |
 | `orchestrator/main.py` | Leader-started loops, v2 routes, visibility resolution, and admin waiver operation |
 | Pod/agent/session/VM provisioners | Persist missing stable owner/capacity hints and nudge reconciliation; never write ledger rows independently |
 | `cockpit/src/app/core/services/admin-usage.service.ts` + `cockpit/src/app/views/admin/usage/admin-usage.component.ts` | V2 decimal models, dimensional cards, coverage/finality, current allocation, and estimate quality |
-| `helm/` | Dedicated collector Deployment/ServiceAccount, scoped RBAC, NetworkPolicies, values validation, and scrape/alert rules |
+| `helm/` + `helm-vm-cluster/` | Dedicated local/remote collector Deployments and identities, scoped RBAC, NetworkPolicies, values validation, and scrape/alert rules |
 
 Slice 2's schema lands in app migration
 `0102_storage_asset_foundations.sql`. It adds independent claim/volume
@@ -1682,6 +1689,20 @@ fingerprint, PV asset/incarnation state, backend coverage gaps and destruction
 assertions, and storage shadow observations. `capabilities.py`, `read_model.py`,
 `sealer.py`, and `materializer.py` fail closed unless those contracts and the
 configured identity/mapping provenance agree.
+
+Slice 3's schema starts with app migrations `0103`–`0109`: independent
+agent/IDE/VM activation and shadow state, durable agent binding history,
+per-source storage activation, exact compute scope authorization, and
+interval-to-inventory-epoch guards. The immutable k3d-deployed `0112` migration
+(SHA-256
+`3112549f0613c96a8012cea6a1f06f4b6249ec43c7b1c4a70161ba27b18af37e`)
+adds append-only initial/recovery promotion requests and direct exact-epoch
+authority. It is not edited in place. App `0113` supersedes its rollout proof by
+opening a class-keyed coverage gap until a later complete LIST confirms every
+eligible interval, and app `0114` replaces the interval shape check with a
+NULL-safe predicate so ordinary workspace Pods cannot bypass compute-class
+authority. The unrelated app `0110`/`0111` migrations remain in normal filename
+order between those Slice 3 migrations.
 
 App/audit migrations, both Cockpit i18n files, and the corresponding Python,
 Vitest, transport, chart, and integration tests are in scope. Reference schema
@@ -1867,6 +1888,22 @@ backdating, identity-key mutation, mapping mutation, impossible asset/gap
 lifecycle transitions, and publication before the matching activation boundary.
 Capability probing checks this full contract and the exact configured key
 version before PV shadow/publication can become available.
+
+Slice 3 adds app `0103`–`0109` for compute-class activation/shadow, durable
+agent binding events, source-specific storage activation, authorized compute
+scope sets, and exact inventory-epoch interval guards. Apps `0110` and `0111`
+are unrelated intervening application migrations. The already-deployed app
+`0112` checksum is immutable at
+`3112549f0613c96a8012cea6a1f06f4b6249ec43c7b1c4a70161ba27b18af37e`;
+it adds append-only initial/recovery promotion authority and direct
+interval-to-epoch binding. App `0113` adds the confirmation gap that `0112`
+lacked, so a newly promoted authority stays incomplete until a subsequent
+complete LIST proves it. App `0114` repairs `0112`'s SQL-three-valued interval
+shape predicate with a NULL-safe IDE classification. Fresh install, upgrade
+from the immutable deployed checksums, dual-class behavior, and idempotent
+replay all pass against PostgreSQL. All Slice 3 gates remain off during this
+expansion, so applying these migrations cannot activate collection,
+publication, cutover, or serving reads.
 
 1. **Expand audit first.** Add nullable v2 event fields/checks and create future
    partitions. Existing writers/readers continue to work. A runtime capability
@@ -2123,12 +2160,88 @@ remaining deployment gate, not unfinished Slice 2 code.
 
 ### Slice 3 — agents and VMs
 
-- All agent/persistent/IDE Pod identities and bind/unbind splitting.
-- Complete VM-controller envelope, VMI-incarnation compute, and one root-PVC
-  mapping for jobs and threads.
+**Implementation and dark local verification complete; operational rollout
+remains.** The final implementation through app migration `0114` provides:
 
-Depends on Slice 1 and authenticated VM transport for VM publication. New
-classes remain excluded/unpriced until matching adapters exist.
+- Strict classification for dynamic job/session agents, persistent agents,
+  on-demand IDE Pods, existing workspace Pods, and excluded `virt-launcher`
+  Pods. Agent identity is tied to the admitted Pod UID and authoritative app-DB
+  agent row rather than a mutable label hint.
+- A durable, monotonically ordered agent binding journal. Job/thread bind,
+  unbind, and rebind transitions split only forward; warm/unbound capacity stays
+  shared platform. Complete-LIST absence, WATCH `DELETED`, and terminal WATCH
+  closure replay every binding change after the last Pod receipt before closing
+  the interval, while generic non-agent terminal handling remains unchanged.
+- Evidence-aware lifecycle starts. Local Pod receipt time is the conservative
+  default with explicit uncertainty. A scheduled transition is admitted only
+  when continuous WATCH/LIST evidence proves the earlier unscheduled/absent
+  state, and every start is clamped to the exact compute authority boundary.
+  Remote VMI phase time is exact only inside the configured clock-skew bound.
+- Strict VMI normalization and interval reconciliation. The admitted VMI, not
+  its launcher Pod or requested create-time flavor, supplies guest-provisioned
+  CPU/memory and incarnation identity. Job/thread attribution, VM UID and
+  generation, exact root-PVC ownership, lifecycle evidence source, and
+  uncertainty remain durable interval details; ambiguous identities are visible
+  unknown coverage rather than guessed customer usage.
+- Versioned HMAC authentication for VM lifecycle commands, bounded clock/replay
+  checks, controller-generation and admitted UID fences, exact root-PVC
+  authorization, and Lease-backed replay claims. The VM controller publishes
+  stable owner/root-disk hints; it does not write usage events.
+- Dedicated database-free VM-cluster VMI and root-storage collectors in
+  `helm-vm-cluster/`. VMI and PVC/PV ingestion use separate credentials,
+  independent inventory/shadow/publication gates, source IDs, and scoped RBAC;
+  cluster-wide PV visibility additionally requires an explicit operator
+  acknowledgement. Remote PVC/PV activation is source-specific, so enabling one
+  cluster cannot authorize another source or silently activate local storage.
+- Independent `agent_pod`, `ide_workspace_pod`, and `workspace_vm` activation.
+  Each class freezes the exact authorized scope/epoch set proven by a fresh
+  item-for-item snapshot. Initial activation and recovery rollover use immutable
+  append-only promotion requests/authorities with lineage and generation
+  checks; an authority-confirmation coverage gap remains open until a later
+  complete LIST binds every eligible interval to the promoted epoch.
+- Class-aware materialization, sealing, and reads. Reporting authority remains
+  durable after activation, while current collection/configuration capability
+  independently fails writes closed. Mapping loss, schema/auth failure, or an
+  inventory recovery epoch cannot make previously confirmed quantities vanish
+  or let one compute class inherit another class's activation.
+
+**Migration and verification evidence (2026-08-07):** Slice 3 migrations
+`0103`–`0109`, the immutable deployed `0112` SHA-256
+`3112549f0613c96a8012cea6a1f06f4b6249ec43c7b1c4a70161ba27b18af37e`,
+the `0113` confirmation-gap supersession, and the `0114` NULL-safe interval
+shape repair all pass fresh-install, deployed-upgrade, idempotency, and
+multi-class PostgreSQL tests. The complete infrastructure-metering suite, the
+remote VM/controller/provisioning suite, focused activation/materializer/read/
+sealer coverage, Helm lints/contracts, and Slice 3-scoped Ruff/format/diff checks
+are green.
+
+**Local k3d evidence (2026-08-07):** the application upgraded cleanly through
+`0114` and remained healthy with publication, cutover, v2 reads, source-aware
+reads, all storage gates, and every Slice 3 collection/shadow/publication gate
+off. No compatibility-ledger authority moved and no infrastructure usage was
+published. This k3d cluster has no KubeVirt installation, so it is a dark
+schema/configuration/runtime upgrade gate, not live VMI proof.
+
+**Read-only live-VM evidence (2026-08-07):** normalization of one Running VMI
+produced exactly `8000` millicores and `17179869184` bytes of guest memory. Its
+bound root PVC demand and matching PV provisioned capacity each normalized to
+`22763326669` bytes. The currently deployed VM controller is still the older
+build without
+the new owner hints/lifecycle authentication, and no remote metering collector
+is deployed there. Therefore no live inventory or shadow state was written and
+the real KubeVirt VMI/root-storage shadow gate remains open.
+
+Main dev separately remains on image `sha-95d2a10` with app migrations through
+`0102` and Pod inventory only. The next operational sequence is a dark main-dev
+upgrade through `0114`, agent/IDE inventory then shadow, and a separately
+reviewed VM-cluster collector deployment followed by VMI/root PVC/PV inventory
+then shadow. Publication, cutover, v2 reads, and source-aware reads stay off
+throughout these soaks. New classes remain quantity-only/unpriced until matching
+Slice 5 adapters exist.
+
+Depends on Slice 1 and authenticated VM transport for eventual VM publication.
+The Slice 3 implementation exit has passed; the operational live-source exit
+has not. Slice 4 shared-platform completeness is the next implementation slice.
 
 ### Slice 4 — shared platform completeness
 

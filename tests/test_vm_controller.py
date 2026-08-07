@@ -23,6 +23,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from vm.controller.lifecycle_auth import sign_payload
+
 # ---------------------------------------------------------------------------
 # Project root on sys.path (conftest.py also does this, belt-and-suspenders)
 # ---------------------------------------------------------------------------
@@ -52,6 +54,15 @@ _mock_k8s_client = types.ModuleType("kubernetes.client")
 _mock_k8s_config = types.ModuleType("kubernetes.config")
 _mock_k8s_exc = types.ModuleType("kubernetes.client.exceptions")
 
+LIFECYCLE_SECRET = b"controller-test-lifecycle-secret-at-least-32-bytes"
+PROVISION_GENERATION = "00000000-0000-4000-8000-000000000001"
+
+
+def test_controller_dockerfile_packages_lifecycle_auth_module() -> None:
+    dockerfile = (project_root / "vm/controller/Dockerfile").read_text(encoding="utf-8")
+
+    assert "COPY controller.py headscale_client.py lifecycle_auth.py ./" in dockerfile
+
 
 class _FakeApiException(Exception):
     """Stand-in for kubernetes.client.exceptions.ApiException."""
@@ -65,6 +76,8 @@ class _FakeApiException(Exception):
 _mock_k8s_exc.ApiException = _FakeApiException  # type: ignore[attr-defined]
 _mock_k8s_client.exceptions = _mock_k8s_exc  # type: ignore[attr-defined]
 _mock_k8s_client.CustomObjectsApi = MagicMock  # type: ignore[attr-defined]
+_mock_k8s_client.CoreV1Api = MagicMock  # type: ignore[attr-defined]
+_mock_k8s_client.CoordinationV1Api = MagicMock  # type: ignore[attr-defined]
 _mock_k8s.client = _mock_k8s_client  # type: ignore[attr-defined]
 _mock_k8s.config = _mock_k8s_config  # type: ignore[attr-defined]
 _mock_k8s_config.load_incluster_config = MagicMock()  # type: ignore[attr-defined]
@@ -107,6 +120,7 @@ from vm.controller.controller import (  # noqa: E402
     KUBEVIRT_GROUP,
     KUBEVIRT_PLURAL,
     KUBEVIRT_VERSION,
+    LIFECYCLE_NONCE_GC_PAGE_LIMIT,
     VM_NAMESPACE,
     VMController,
 )
@@ -192,7 +206,6 @@ SAMPLE_JOB_CONFIG = {
     "description": "Build the feature module",
 }
 
-
 # =============================================================================
 # Helpers
 # =============================================================================
@@ -251,6 +264,42 @@ def _make_controller(headscale_available: bool = True) -> VMController:
 
     # Mock K8s client
     ctrl.k8s_client = MagicMock()
+    ctrl.core_api = MagicMock()
+    ctrl.coordination_api = MagicMock()
+    ctrl.coordination_api.create_namespaced_lease.return_value = {}
+    ctrl.coordination_api.list_namespaced_lease.return_value = {"items": []}
+
+    def _read_pvc(**kwargs):
+        name = kwargs["name"]
+        owner_id = name[len("agent-vm-") : -len("-rootdisk")]
+        owner_kind = "thread" if owner_id.startswith("thread-") else "job"
+        return types.SimpleNamespace(
+            metadata=types.SimpleNamespace(
+                name=name,
+                uid=f"root-pvc-uid-{owner_id}",
+                labels={
+                    "srw.io/owner-kind": owner_kind,
+                    "srw.io/owner-id": owner_id,
+                },
+            )
+        )
+
+    ctrl.core_api.read_namespaced_persistent_volume_claim.side_effect = _read_pvc
+
+    def _admit_object(**kwargs):
+        body = kwargs.get("body") or {}
+        metadata = dict(body.get("metadata") or {})
+        if kwargs.get("plural") == KUBEVIRT_PLURAL:
+            metadata["uid"] = "admitted-vm-uid-001"
+        return {**body, "metadata": metadata}
+
+    ctrl.k8s_client.create_namespaced_custom_object.side_effect = _admit_object
+    ctrl.k8s_client.get_namespaced_custom_object.return_value = {
+        "metadata": {
+            "name": f"agent-vm-{SAMPLE_JOB_CONFIG['job_id']}",
+            "uid": "existing-vm-uid-002",
+        }
+    }
 
     ctrl.http_runner = None
 
@@ -350,6 +399,19 @@ class TestRenderTemplate:
 
         assert result["metadata"]["name"] == f"agent-vm-{SAMPLE_JOB_CONFIG['job_id']}"
         assert result["metadata"]["labels"]["job-id"] == SAMPLE_JOB_CONFIG["job_id"]
+        assert result["metadata"]["labels"]["srw.io/owner-kind"] == "job"
+        assert (
+            result["metadata"]["labels"]["srw.io/owner-id"]
+            == SAMPLE_JOB_CONFIG["job_id"]
+        )
+        assert result["spec"]["template"]["metadata"]["labels"] == {
+            "srw.io/owner-kind": "job",
+            "srw.io/owner-id": SAMPLE_JOB_CONFIG["job_id"],
+        }
+        assert result["spec"]["dataVolumeTemplates"][0]["metadata"]["labels"] == {
+            "srw.io/owner-kind": "job",
+            "srw.io/owner-id": SAMPLE_JOB_CONFIG["job_id"],
+        }
 
         spec = result["spec"]["template"]["spec"]
         assert spec["domain"]["cpu"]["cores"] == 4
@@ -487,6 +549,25 @@ class TestRenderTemplate:
         assert isinstance(cores, int)
         assert cores == 8
 
+    def test_render_stamps_thread_owner_on_vm_vmi_and_data_volume(self, controller):
+        config = {**SAMPLE_JOB_CONFIG, "job_id": "thread-123", "entity_type": "thread"}
+
+        result = controller.render_template(config)
+
+        for labels in (
+            result["metadata"]["labels"],
+            result["spec"]["template"]["metadata"]["labels"],
+            result["spec"]["dataVolumeTemplates"][0]["metadata"]["labels"],
+        ):
+            assert labels["srw.io/owner-kind"] == "thread"
+            assert labels["srw.io/owner-id"] == "thread-123"
+
+    def test_render_rejects_unknown_owner_kind(self, controller):
+        config = {**SAMPLE_JOB_CONFIG, "entity_type": "customer"}
+
+        with pytest.raises(ValueError, match="entity_type"):
+            controller.render_template(config)
+
 
 # =============================================================================
 # Tests: init_k8s()
@@ -538,6 +619,46 @@ class TestInitK8s:
             ctrl.init_k8s()
 
         assert ctrl.k8s_client is mock_api
+
+    def test_init_k8s_sets_core_api_for_pvc_identity(self):
+        ctrl = _make_controller()
+        ctrl.core_api = None
+
+        mock_core_api = MagicMock()
+        mock_client = MagicMock()
+        mock_client.CoreV1Api.return_value = mock_core_api
+
+        with patch.dict(
+            "sys.modules",
+            {
+                "kubernetes": MagicMock(client=mock_client, config=MagicMock()),
+                "kubernetes.client": mock_client,
+                "kubernetes.config": MagicMock(),
+            },
+        ):
+            ctrl.init_k8s()
+
+        assert ctrl.core_api is mock_core_api
+
+    def test_init_k8s_sets_coordination_api_for_durable_replay_claims(self):
+        ctrl = _make_controller()
+        ctrl.coordination_api = None
+
+        mock_coordination_api = MagicMock()
+        mock_client = MagicMock()
+        mock_client.CoordinationV1Api.return_value = mock_coordination_api
+
+        with patch.dict(
+            "sys.modules",
+            {
+                "kubernetes": MagicMock(client=mock_client, config=MagicMock()),
+                "kubernetes.client": mock_client,
+                "kubernetes.config": MagicMock(),
+            },
+        ):
+            ctrl.init_k8s()
+
+        assert ctrl.coordination_api is mock_coordination_api
 
 
 # =============================================================================
@@ -638,6 +759,32 @@ class TestHandleCreate:
         payload = json.loads(raw.decode())
         assert payload["status"] == "created"
         assert payload["job_id"] == SAMPLE_JOB_CONFIG["job_id"]
+        assert payload["vm_uid"] == "admitted-vm-uid-001"
+        assert payload["rootdisk_pvc_uid"] == (
+            f"root-pvc-uid-{SAMPLE_JOB_CONFIG['job_id']}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_create_omits_unattested_rootdisk_pvc_uid(self, controller):
+        controller.core_api.read_namespaced_persistent_volume_claim.return_value = (
+            types.SimpleNamespace(
+                metadata=types.SimpleNamespace(
+                    name="agent-vm-spoofed-rootdisk",
+                    uid="spoofed-pvc-uid",
+                    labels={
+                        "srw.io/owner-kind": "job",
+                        "srw.io/owner-id": SAMPLE_JOB_CONFIG["job_id"],
+                    },
+                )
+            )
+        )
+        controller.core_api.read_namespaced_persistent_volume_claim.side_effect = None
+
+        with patch("vm.controller.controller.VM_ROOTDISK_PVC_UID_ATTEMPTS", 1):
+            result = await controller._do_create(SAMPLE_JOB_CONFIG)
+
+        assert result["status"] == "created"
+        assert "rootdisk_pvc_uid" not in result
 
     @pytest.mark.asyncio
     async def test_create_vm_generates_headscale_key(self, controller):
@@ -797,6 +944,28 @@ class TestHandleCreate:
         payload = json.loads(controller.nc.publish.call_args[0][1].decode())
         assert payload["status"] == "created"
         assert payload["vm_name"] == f"agent-vm-{SAMPLE_JOB_CONFIG['job_id']}"
+        assert payload["vm_uid"] == "existing-vm-uid-002"
+        controller.k8s_client.get_namespaced_custom_object.assert_called_once_with(
+            group=KUBEVIRT_GROUP,
+            version=KUBEVIRT_VERSION,
+            namespace=VM_NAMESPACE,
+            plural=KUBEVIRT_PLURAL,
+            name=f"agent-vm-{SAMPLE_JOB_CONFIG['job_id']}",
+        )
+
+    @pytest.mark.asyncio
+    async def test_create_vm_without_admitted_uid_fails_closed(self, controller):
+        controller.k8s_client.create_namespaced_custom_object.side_effect = None
+        controller.k8s_client.create_namespaced_custom_object.return_value = {}
+        controller.k8s_client.get_namespaced_custom_object.return_value = {
+            "metadata": {"name": f"agent-vm-{SAMPLE_JOB_CONFIG['job_id']}"}
+        }
+
+        await controller.handle_create(make_nats_msg(SAMPLE_JOB_CONFIG))
+
+        payload = json.loads(controller.nc.publish.call_args[0][1].decode())
+        assert payload["status"] == "failed"
+        assert "metadata.uid" in payload["error"]
 
     @pytest.mark.asyncio
     async def test_create_vm_malformed_json(self, controller):
@@ -2099,7 +2268,12 @@ class TestDoCreateWaitingGolden:
         # VM create (2nd create call) succeeds.
         controller.k8s_client.create_namespaced_custom_object.side_effect = [
             _FakeApiException(status=500),
-            MagicMock(),
+            {
+                "metadata": {
+                    "name": f"agent-vm-{SAMPLE_JOB_CONFIG['job_id']}",
+                    "uid": "registry-fallback-vm-uid",
+                }
+            },
         ]
         msg = make_nats_msg(SAMPLE_JOB_CONFIG)
         with patch("vm.controller.controller.VM_GOLDEN_IMAGE_ENABLED", True):
@@ -2260,6 +2434,13 @@ def _dv_phase(phase: str | None):
     """
 
     def _get(**kwargs):
+        if kwargs.get("plural") == KUBEVIRT_PLURAL:
+            return {
+                "metadata": {
+                    "name": kwargs.get("name"),
+                    "uid": "persistent-rootdisk-vm-uid",
+                }
+            }
         if phase is None:
             raise _FakeApiException(status=404)
         return {"metadata": {"name": kwargs.get("name")}, "status": {"phase": phase}}
@@ -2326,6 +2507,10 @@ class TestPersistentRootdiskEnabled:
         # Labels drive the GC sweep and the orphan backstop.
         assert dv["metadata"]["labels"]["srw.io/rootdisk"] == "true"
         assert dv["metadata"]["labels"]["job-id"] == SAMPLE_JOB_CONFIG["job_id"]
+        assert dv["metadata"]["labels"]["srw.io/owner-kind"] == "job"
+        assert (
+            dv["metadata"]["labels"]["srw.io/owner-id"] == SAMPLE_JOB_CONFIG["job_id"]
+        )
         # Spec is the template's own — same size, storage class, source.
         assert dv["spec"]["storage"]["storageClassName"]
         assert "registry" in dv["spec"]["source"]
@@ -2333,6 +2518,17 @@ class TestPersistentRootdiskEnabled:
         # it binds on the VM's node (same rule as the golden work).
         annotations = dv["metadata"].get("annotations", {})
         assert "cdi.kubevirt.io/storage.bind.immediate.requested" not in annotations
+
+    @pytest.mark.asyncio
+    async def test_thread_rootdisk_carries_thread_owner_identity(self, controller):
+        controller.k8s_client.get_namespaced_custom_object.side_effect = _dv_phase(None)
+        config = {**SAMPLE_JOB_CONFIG, "job_id": "thread-123", "entity_type": "thread"}
+        with patch("vm.controller.controller.VM_PERSISTENT_ROOTDISK", True):
+            await controller._do_create(config)
+
+        labels = _dv_create_body(controller)["metadata"]["labels"]
+        assert labels["srw.io/owner-kind"] == "thread"
+        assert labels["srw.io/owner-id"] == "thread-123"
 
     @pytest.mark.asyncio
     async def test_golden_clone_source_carries_into_the_standalone_dv(self, controller):
@@ -2522,7 +2718,9 @@ class TestDeletePurgeIntent:
             do_delete.return_value = {"job_id": "job-1", "status": "deleted"}
             await controller.http_delete(request)
 
-        do_delete.assert_awaited_once_with("job-1", purge_disk=False)
+        do_delete.assert_awaited_once_with(
+            "job-1", purge_disk=False, provision_generation=None
+        )
 
     @pytest.mark.asyncio
     async def test_http_delete_defaults_to_purge(self, controller):
@@ -2534,7 +2732,9 @@ class TestDeletePurgeIntent:
             do_delete.return_value = {"job_id": "job-1", "status": "deleted"}
             await controller.http_delete(request)
 
-        do_delete.assert_awaited_once_with("job-1", purge_disk=True)
+        do_delete.assert_awaited_once_with(
+            "job-1", purge_disk=True, provision_generation=None
+        )
 
 
 class TestGcRootdisks:
@@ -2681,3 +2881,463 @@ class TestRootdiskCloneSourceNamespace:
         dv = _dv_create_body(controller)
         assert "registry" in dv["spec"]["source"]
         assert "pvc" not in dv["spec"]["source"]
+
+
+class TestLifecycleAuthenticationReplayGuard:
+    @pytest.mark.asyncio
+    async def test_duplicate_mutating_request_is_rejected(self, controller):
+        controller._do_create = AsyncMock(
+            return_value={
+                "job_id": SAMPLE_JOB_CONFIG["job_id"],
+                "status": "created",
+                "provision_generation": PROVISION_GENERATION,
+            }
+        )
+        controller.nc = AsyncMock()
+        payload = sign_payload(
+            {
+                **SAMPLE_JOB_CONFIG,
+                "provision_generation": PROVISION_GENERATION,
+            },
+            direction="request",
+            operation="create",
+            secret=LIFECYCLE_SECRET,
+        )
+        msg = MagicMock(data=json.dumps(payload).encode())
+
+        with patch("vm.controller.controller.LIFECYCLE_HMAC_SECRET", LIFECYCLE_SECRET):
+            await controller.handle_create(msg)
+            await controller.handle_create(msg)
+
+        controller._do_create.assert_awaited_once()
+        controller.nc.publish.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_old_create_replay_after_delete_is_rejected(self, controller):
+        controller._do_create = AsyncMock(
+            return_value={
+                "job_id": SAMPLE_JOB_CONFIG["job_id"],
+                "status": "created",
+                "provision_generation": PROVISION_GENERATION,
+            }
+        )
+        controller._do_delete = AsyncMock(
+            return_value={
+                "job_id": SAMPLE_JOB_CONFIG["job_id"],
+                "status": "deleted",
+                "provision_generation": PROVISION_GENERATION,
+            }
+        )
+        controller.nc = AsyncMock()
+        create_payload = sign_payload(
+            {
+                **SAMPLE_JOB_CONFIG,
+                "provision_generation": PROVISION_GENERATION,
+            },
+            direction="request",
+            operation="create",
+            secret=LIFECYCLE_SECRET,
+        )
+        delete_payload = sign_payload(
+            {
+                "job_id": SAMPLE_JOB_CONFIG["job_id"],
+                "purge_disk": True,
+                "provision_generation": PROVISION_GENERATION,
+            },
+            direction="request",
+            operation="delete",
+            secret=LIFECYCLE_SECRET,
+        )
+
+        with patch("vm.controller.controller.LIFECYCLE_HMAC_SECRET", LIFECYCLE_SECRET):
+            await controller.handle_create(
+                MagicMock(data=json.dumps(create_payload).encode())
+            )
+            await controller.handle_delete(
+                MagicMock(data=json.dumps(delete_payload).encode())
+            )
+            await controller.handle_create(
+                MagicMock(data=json.dumps(create_payload).encode())
+            )
+
+        controller._do_create.assert_awaited_once()
+        controller._do_delete.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_replay_is_rejected_after_controller_restart(self):
+        claimed: set[str] = set()
+
+        def _claim(*, body, **_kwargs):
+            name = body["metadata"]["name"]
+            if name in claimed:
+                raise _FakeApiException(status=409, body="already claimed")
+            claimed.add(name)
+            return body
+
+        first = _make_controller()
+        restarted = _make_controller()
+        durable_api = MagicMock()
+        durable_api.create_namespaced_lease.side_effect = _claim
+        first.coordination_api = durable_api
+        restarted.coordination_api = durable_api
+        first._do_create = AsyncMock(
+            return_value={"job_id": "restart-replay", "status": "created"}
+        )
+        restarted._do_create = AsyncMock(
+            return_value={"job_id": "restart-replay", "status": "created"}
+        )
+        payload = sign_payload(
+            {
+                **SAMPLE_JOB_CONFIG,
+                "job_id": "restart-replay",
+                "provision_generation": PROVISION_GENERATION,
+            },
+            direction="request",
+            operation="create",
+            secret=LIFECYCLE_SECRET,
+        )
+        message = MagicMock(data=json.dumps(payload).encode())
+
+        with patch("vm.controller.controller.LIFECYCLE_HMAC_SECRET", LIFECYCLE_SECRET):
+            await first.handle_create(message)
+            await restarted.handle_create(message)
+
+        first._do_create.assert_awaited_once()
+        restarted._do_create.assert_not_awaited()
+        assert durable_api.create_namespaced_lease.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_nonce_store_rbac_failure_rejects_mutation(self, controller):
+        controller.coordination_api.create_namespaced_lease.side_effect = (
+            _FakeApiException(status=403, body="forbidden")
+        )
+        controller._do_delete = AsyncMock()
+        payload = sign_payload(
+            {
+                "job_id": "forbidden-delete",
+                "purge_disk": True,
+                "provision_generation": PROVISION_GENERATION,
+            },
+            direction="request",
+            operation="delete",
+            secret=LIFECYCLE_SECRET,
+        )
+
+        with patch("vm.controller.controller.LIFECYCLE_HMAC_SECRET", LIFECYCLE_SECRET):
+            await controller.handle_delete(MagicMock(data=json.dumps(payload).encode()))
+
+        controller._do_delete.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_expired_nonce_leases_are_garbage_collected(self, controller):
+        from datetime import datetime, timedelta, timezone
+
+        old = datetime.now(timezone.utc) - timedelta(hours=1)
+        fresh = datetime.now(timezone.utc)
+        controller.coordination_api.list_namespaced_lease.return_value = {
+            "items": [
+                {
+                    "metadata": {
+                        "name": "srw-vm-lifecycle-old",
+                        "creationTimestamp": old.isoformat(),
+                    }
+                },
+                {
+                    "metadata": {
+                        "name": "srw-vm-lifecycle-fresh",
+                        "creationTimestamp": fresh.isoformat(),
+                    }
+                },
+            ]
+        }
+
+        assert await controller._gc_expired_lifecycle_nonces(now=fresh)
+
+        assert (
+            controller.coordination_api.list_namespaced_lease.call_args.kwargs["limit"]
+            == LIFECYCLE_NONCE_GC_PAGE_LIMIT
+        )
+        controller.coordination_api.delete_namespaced_lease.assert_called_once()
+        assert (
+            controller.coordination_api.delete_namespaced_lease.call_args.kwargs["name"]
+            == "srw-vm-lifecycle-old"
+        )
+
+    @pytest.mark.asyncio
+    async def test_nonce_gc_bounds_list_page_and_deletions(self, controller):
+        from datetime import datetime, timedelta, timezone
+
+        now = datetime.now(timezone.utc)
+        expired = now - timedelta(hours=1)
+        controller.coordination_api.list_namespaced_lease.return_value = {
+            "items": [
+                {
+                    "metadata": {
+                        "name": f"srw-vm-lifecycle-expired-{index}",
+                        "creationTimestamp": expired.isoformat(),
+                    }
+                }
+                for index in range(10)
+            ]
+        }
+
+        with (
+            patch("vm.controller.controller.LIFECYCLE_NONCE_GC_PAGE_LIMIT", 3),
+            patch("vm.controller.controller.LIFECYCLE_NONCE_GC_DELETE_LIMIT", 2),
+        ):
+            assert await controller._gc_expired_lifecycle_nonces(now=now)
+
+        assert (
+            controller.coordination_api.list_namespaced_lease.call_args.kwargs["limit"]
+            == 3
+        )
+        assert controller.coordination_api.delete_namespaced_lease.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_nonce_gc_rotates_through_bounded_pages(self, controller):
+        from datetime import datetime, timezone
+
+        controller.coordination_api.list_namespaced_lease.side_effect = [
+            {"metadata": {"continue": "next-page"}, "items": []},
+            {"metadata": {}, "items": []},
+        ]
+
+        assert await controller._gc_expired_lifecycle_nonces(
+            now=datetime.now(timezone.utc)
+        )
+        assert controller._lifecycle_nonce_gc_continue == "next-page"
+        assert await controller._gc_expired_lifecycle_nonces(
+            now=datetime.now(timezone.utc)
+        )
+        assert controller._lifecycle_nonce_gc_continue is None
+
+        calls = controller.coordination_api.list_namespaced_lease.call_args_list
+        assert "_continue" not in calls[0].kwargs
+        assert calls[1].kwargs["_continue"] == "next-page"
+
+    @pytest.mark.asyncio
+    async def test_nonce_gc_resets_expired_continue_token(self, controller):
+        from datetime import datetime, timezone
+
+        controller._lifecycle_nonce_gc_continue = "expired-page"
+        controller.coordination_api.list_namespaced_lease.side_effect = (
+            _FakeApiException(status=410, body="continue token expired")
+        )
+
+        assert await controller._gc_expired_lifecycle_nonces(
+            now=datetime.now(timezone.utc)
+        )
+        assert controller._lifecycle_nonce_gc_continue is None
+
+    @pytest.mark.asyncio
+    async def test_post_claim_failure_requires_fresh_signed_request(self, controller):
+        claimed: set[str] = set()
+
+        def _claim(*, body, **_kwargs):
+            name = body["metadata"]["name"]
+            if name in claimed:
+                raise _FakeApiException(status=409, body="already claimed")
+            claimed.add(name)
+            return body
+
+        controller.coordination_api.create_namespaced_lease.side_effect = _claim
+        controller.coordination_api.list_namespaced_lease.side_effect = [
+            _FakeApiException(status=500, body="temporary list failure"),
+            {"metadata": {}, "items": []},
+        ]
+        unsigned = {
+            **SAMPLE_JOB_CONFIG,
+            "provision_generation": PROVISION_GENERATION,
+        }
+        first = sign_payload(
+            unsigned,
+            direction="request",
+            operation="create",
+            secret=LIFECYCLE_SECRET,
+        )
+        fresh = sign_payload(
+            unsigned,
+            direction="request",
+            operation="create",
+            secret=LIFECYCLE_SECRET,
+        )
+        assert (
+            first["_lifecycle_auth"]["request_id"]
+            != fresh["_lifecycle_auth"]["request_id"]
+        )
+
+        with (
+            patch("vm.controller.controller.LIFECYCLE_HMAC_SECRET", LIFECYCLE_SECRET),
+            patch("vm.controller.controller.LIFECYCLE_NONCE_GC_INTERVAL", 1),
+        ):
+            assert not await controller._verify_lifecycle_request(
+                first, "create", mutating=True
+            )
+            assert not await controller._verify_lifecycle_request(
+                first, "create", mutating=True
+            )
+            assert await controller._verify_lifecycle_request(
+                fresh, "create", mutating=True
+            )
+
+
+class TestLifecycleIdentityGeneration:
+    @pytest.mark.asyncio
+    async def test_status_recovers_rootdisk_uid_that_missed_create_wait(
+        self, controller
+    ):
+        config = {
+            **SAMPLE_JOB_CONFIG,
+            "provision_generation": PROVISION_GENERATION,
+        }
+        read_pvc = (
+            controller.core_api.read_namespaced_persistent_volume_claim.side_effect
+        )
+        controller.core_api.read_namespaced_persistent_volume_claim.side_effect = (
+            _FakeApiException(status=404, body="not admitted yet")
+        )
+
+        with (
+            patch("vm.controller.controller.LIFECYCLE_HMAC_SECRET", LIFECYCLE_SECRET),
+            patch("vm.controller.controller.VM_ROOTDISK_PVC_UID_ATTEMPTS", 1),
+        ):
+            created = await controller._do_create(config)
+
+        assert "rootdisk_pvc_uid" not in created
+        controller.core_api.read_namespaced_persistent_volume_claim.side_effect = (
+            read_pvc
+        )
+        controller.k8s_client.get_namespaced_custom_object.return_value = {
+            "metadata": {
+                "name": f"agent-vm-{SAMPLE_JOB_CONFIG['job_id']}",
+                "uid": "admitted-vm-uid-001",
+                "annotations": {
+                    "srw.io/provision-generation": PROVISION_GENERATION,
+                },
+                "labels": {
+                    "srw.io/owner-kind": "job",
+                    "srw.io/owner-id": SAMPLE_JOB_CONFIG["job_id"],
+                },
+            },
+            "status": {"printableStatus": "Running"},
+        }
+
+        status = await controller._do_status(SAMPLE_JOB_CONFIG["job_id"])
+
+        assert status["vm_uid"] == "admitted-vm-uid-001"
+        assert status["provision_generation"] == PROVISION_GENERATION
+        assert status["rootdisk_pvc_uid"] == (
+            f"root-pvc-uid-{SAMPLE_JOB_CONFIG['job_id']}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_authenticated_delete_uses_admitted_uid_precondition(
+        self, controller
+    ):
+        job_id = "generation-delete"
+        controller.k8s_client.get_namespaced_custom_object.return_value = {
+            "metadata": {
+                "name": f"agent-vm-{job_id}",
+                "uid": "generation-delete-vm-uid",
+                "annotations": {
+                    "srw.io/provision-generation": PROVISION_GENERATION,
+                },
+            }
+        }
+
+        with patch("vm.controller.controller.LIFECYCLE_HMAC_SECRET", LIFECYCLE_SECRET):
+            result = await controller._do_delete(
+                job_id, provision_generation=PROVISION_GENERATION
+            )
+
+        vm_delete = _calls_for(
+            controller.k8s_client.delete_namespaced_custom_object,
+            KUBEVIRT_PLURAL,
+        )[0]
+        assert vm_delete.kwargs["body"]["preconditions"] == {
+            "uid": "generation-delete-vm-uid"
+        }
+        assert result["provision_generation"] == PROVISION_GENERATION
+        assert result["generation_evidence"] == "admitted-vm-metadata"
+
+    @pytest.mark.asyncio
+    async def test_authenticated_delete_rejects_generation_mismatch(self, controller):
+        job_id = "generation-reused"
+        controller.k8s_client.get_namespaced_custom_object.return_value = {
+            "metadata": {
+                "name": f"agent-vm-{job_id}",
+                "uid": "replacement-vm-uid",
+                "annotations": {
+                    "srw.io/provision-generation": (
+                        "00000000-0000-4000-8000-000000000099"
+                    ),
+                },
+            }
+        }
+
+        with (
+            patch("vm.controller.controller.LIFECYCLE_HMAC_SECRET", LIFECYCLE_SECRET),
+            pytest.raises(RuntimeError, match="another provision generation"),
+        ):
+            await controller._do_delete(
+                job_id, provision_generation=PROVISION_GENERATION
+            )
+
+        controller.k8s_client.delete_namespaced_custom_object.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_uid_precondition_conflict_never_purges_replacement_disk(
+        self, controller
+    ):
+        job_id = "uid-race"
+        controller.k8s_client.get_namespaced_custom_object.return_value = {
+            "metadata": {
+                "name": f"agent-vm-{job_id}",
+                "uid": "old-vm-uid",
+                "annotations": {
+                    "srw.io/provision-generation": PROVISION_GENERATION,
+                },
+            }
+        }
+        controller.k8s_client.delete_namespaced_custom_object.side_effect = (
+            _FakeApiException(status=409, body="UID precondition failed")
+        )
+
+        with (
+            patch("vm.controller.controller.LIFECYCLE_HMAC_SECRET", LIFECYCLE_SECRET),
+            pytest.raises(_FakeApiException),
+        ):
+            await controller._do_delete(
+                job_id, provision_generation=PROVISION_GENERATION
+            )
+
+        assert not _calls_for(
+            controller.k8s_client.delete_namespaced_custom_object, CDI_PLURAL
+        )
+
+    @pytest.mark.asyncio
+    async def test_create_and_delete_for_same_entity_are_serialized(self, controller):
+        create_entered = asyncio.Event()
+        release_create = asyncio.Event()
+        delete_entered = asyncio.Event()
+
+        async def _create(_config):
+            create_entered.set()
+            await release_create.wait()
+            return {"job_id": "locked", "status": "created"}
+
+        async def _delete(_job_id, **_kwargs):
+            delete_entered.set()
+            return {"job_id": "locked", "status": "deleted"}
+
+        controller._do_create_serialized = AsyncMock(side_effect=_create)
+        controller._do_delete_serialized = AsyncMock(side_effect=_delete)
+        create_task = asyncio.create_task(controller._do_create({"job_id": "locked"}))
+        await create_entered.wait()
+        delete_task = asyncio.create_task(controller._do_delete("locked"))
+        await asyncio.sleep(0)
+        assert not delete_entered.is_set()
+
+        release_create.set()
+        await asyncio.gather(create_task, delete_task)
+        assert delete_entered.is_set()

@@ -23,6 +23,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from orchestrator.services.vm_lifecycle_auth import sign_payload
+
 # Add project root to path
 project_root = Path(__file__).parent.parent
 if str(project_root) not in sys.path:
@@ -85,6 +87,8 @@ def mock_db():
     db.merge_thread_vm_context = AsyncMock()
     db.merge_vm_context_if_current = AsyncMock(return_value=True)
     db.merge_thread_vm_context_if_current = AsyncMock(return_value=True)
+    db.merge_vm_context_if_provision_generation = AsyncMock(return_value=True)
+    db.merge_thread_vm_context_if_provision_generation = AsyncMock(return_value=True)
     db.merge_ide_session_context = AsyncMock()
     db.bind_thread_workspace_backing = AsyncMock()
     # VM callbacks resolve thread-vs-job by DB lookup (never process-local
@@ -422,6 +426,7 @@ class TestRequestVmCreate:
 
         payload = json.loads(call_args.args[1].decode())
         assert payload["job_id"] == "test-job-123"
+        assert payload["entity_type"] == "job"
         assert payload["agent_config"] == "scholar"
         assert payload["cpu_cores"] == 4
         assert payload["memory"] == "8Gi"
@@ -441,6 +446,19 @@ class TestRequestVmCreate:
 
         payload = json.loads(mock_nc.publish.call_args.args[1].decode())
         assert payload["vm_image"] == "registry.example.com/vm-base:latest"
+
+    @pytest.mark.asyncio
+    async def test_create_carries_thread_identity_to_controller(
+        self, bridge_with_db, mock_nc
+    ):
+        await bridge_with_db.request_vm_create(
+            job_id="thread-123",
+            entity_type="thread",
+        )
+
+        payload = json.loads(mock_nc.publish.call_args.args[1].decode())
+        assert payload["job_id"] == "thread-123"
+        assert payload["entity_type"] == "thread"
 
     @pytest.mark.asyncio
     async def test_create_excludes_vm_image_when_none(self, bridge_with_db, mock_nc):
@@ -747,6 +765,115 @@ class TestOnVmLifecycleStatus:
                 "namespace": "agent-vms",
             },
         )
+
+    @pytest.mark.asyncio
+    async def test_created_status_persists_admitted_vm_uid(
+        self, bridge_with_db, mock_db
+    ):
+        secret = b"nats-bridge-lifecycle-test-secret-at-least-32-bytes"
+        bridge_with_db._lifecycle_hmac_secret = secret
+        generation = "00000000-0000-4000-8000-000000000001"
+        msg = make_msg(
+            sign_payload(
+                {
+                    "job_id": "job-vm-uid",
+                    "status": "created",
+                    "vm_name": "agent-vm-job-vm-uid",
+                    "vm_uid": "admitted-vm-uid-123",
+                    "rootdisk_pvc_uid": "admitted-root-pvc-uid-456",
+                    "namespace": "agent-vms",
+                    "provision_generation": generation,
+                },
+                direction="response",
+                operation="create",
+                secret=secret,
+            )
+        )
+
+        await bridge_with_db._on_vm_lifecycle_status(msg)
+
+        updates = mock_db.merge_vm_context_if_provision_generation.await_args.args[2]
+        assert updates["vm_uid"] == "admitted-vm-uid-123"
+        assert updates["rootdisk_pvc_uid"] == "admitted-root-pvc-uid-456"
+        assert updates["identity_authenticated"] is True
+        mock_db.merge_vm_context.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_stale_authenticated_status_never_falls_back_to_unguarded_merge(
+        self, bridge_with_db, mock_db
+    ):
+        secret = b"nats-bridge-lifecycle-test-secret-at-least-32-bytes"
+        bridge_with_db._lifecycle_hmac_secret = secret
+        mock_db.merge_vm_context_if_provision_generation.return_value = False
+        payload = sign_payload(
+            {
+                "job_id": "job-stale",
+                "status": "failed",
+                "error": "old failure",
+                "provision_generation": "00000000-0000-4000-8000-000000000001",
+            },
+            direction="response",
+            operation="create",
+            secret=secret,
+        )
+
+        await bridge_with_db._on_vm_lifecycle_status(make_msg(payload))
+
+        mock_db.merge_vm_context_if_provision_generation.assert_awaited_once()
+        mock_db.merge_vm_context.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_authenticated_status_without_generation_is_dropped(
+        self, bridge_with_db, mock_db
+    ):
+        secret = b"nats-bridge-lifecycle-test-secret-at-least-32-bytes"
+        bridge_with_db._lifecycle_hmac_secret = secret
+        payload = sign_payload(
+            {"job_id": "job-no-generation", "status": "failed"},
+            direction="response",
+            operation="create",
+            secret=secret,
+        )
+
+        await bridge_with_db._on_vm_lifecycle_status(make_msg(payload))
+
+        mock_db.merge_vm_context_if_provision_generation.assert_not_awaited()
+        mock_db.merge_vm_context.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_old_or_invalid_status_does_not_overwrite_vm_uid(
+        self, bridge_with_db, mock_db
+    ):
+        await bridge_with_db._on_vm_lifecycle_status(
+            make_msg(
+                {
+                    "job_id": "job-old-controller",
+                    "status": "created",
+                    "vm_name": "agent-vm-job-old-controller",
+                    "namespace": "agent-vms",
+                }
+            )
+        )
+        old_updates = mock_db.merge_vm_context.await_args.args[1]
+        assert "vm_uid" not in old_updates
+        assert "rootdisk_pvc_uid" not in old_updates
+
+        mock_db.merge_vm_context.reset_mock()
+        await bridge_with_db._on_vm_lifecycle_status(
+            make_msg(
+                {
+                    "job_id": "job-invalid-uid",
+                    "status": "created",
+                    "vm_name": "agent-vm-job-invalid-uid",
+                    "vm_uid": "invalid uid",
+                    "rootdisk_pvc_uid": "invalid uid",
+                    "namespace": "agent-vms",
+                }
+            )
+        )
+        invalid_updates = mock_db.merge_vm_context.await_args.args[1]
+        assert "vm_uid" not in invalid_updates
+        assert "rootdisk_pvc_uid" not in invalid_updates
 
     @pytest.mark.asyncio
     async def test_status_with_error(self, bridge_with_db, mock_db):

@@ -16,7 +16,7 @@ import asyncio
 import os
 import sys
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 import yaml
@@ -25,6 +25,8 @@ import yaml
 project_root = Path(__file__).parent.parent
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
+
+PROVISION_GENERATION = "00000000-0000-4000-8000-000000000001"
 
 
 # =============================================================================
@@ -116,6 +118,17 @@ def mock_db():
     """Create a mock PostgresDB instance."""
     db = MagicMock()
     db.merge_vm_context = AsyncMock()
+    db.merge_thread_vm_context = AsyncMock()
+    db.merge_vm_context_if_provision_generation = AsyncMock(return_value=True)
+    db.merge_thread_vm_context_if_provision_generation = AsyncMock(return_value=True)
+    db.get_job = AsyncMock(
+        return_value={"context": {"vm": {"provision_generation": PROVISION_GENERATION}}}
+    )
+    db.get_thread = AsyncMock(
+        return_value={
+            "metadata": {"vm": {"provision_generation": PROVISION_GENERATION}}
+        }
+    )
     return db
 
 
@@ -123,13 +136,28 @@ def mock_db():
 def mock_k8s_api():
     """Create a mock Kubernetes CustomObjectsApi."""
     api = MagicMock()
-    api.create_namespaced_custom_object = MagicMock(
-        return_value={"metadata": {"name": "agent-vm-test"}}
-    )
+
+    def _admit_object(**kwargs):
+        body = kwargs["body"]
+        return {
+            **body,
+            "metadata": {
+                **body.get("metadata", {}),
+                "uid": "direct-admitted-vm-uid",
+            },
+        }
+
+    api.create_namespaced_custom_object = MagicMock(side_effect=_admit_object)
     api.delete_namespaced_custom_object = MagicMock(return_value={"status": "Success"})
     api.get_namespaced_custom_object = MagicMock(
         return_value={
-            "metadata": {"name": "agent-vm-test-job-123"},
+            "metadata": {
+                "name": "agent-vm-test-job-123",
+                "uid": "queried-vm-uid",
+                "annotations": {
+                    "srw.io/provision-generation": PROVISION_GENERATION,
+                },
+            },
             "status": {
                 "printableStatus": "Running",
                 "created": True,
@@ -163,6 +191,25 @@ def provisioner_with_k8s(mock_k8s_api, template_file, mock_db):
 
             prov = VMProvisioner()
             prov._k8s = mock_k8s_api
+            prov._core_k8s = MagicMock()
+
+            def _read_pvc(**kwargs):
+                name = kwargs["name"]
+                owner_id = name[len("agent-vm-") : -len("-rootdisk")]
+                return {
+                    "metadata": {
+                        "name": name,
+                        "uid": f"direct-root-pvc-uid-{owner_id}",
+                        "labels": {
+                            "srw.io/owner-kind": "job",
+                            "srw.io/owner-id": owner_id,
+                        },
+                    }
+                }
+
+            prov._core_k8s.read_namespaced_persistent_volume_claim.side_effect = (
+                _read_pvc
+            )
             prov._k8s_available = True
             prov._db = mock_db
             prov._vm_namespace = "test-ns"
@@ -520,6 +567,16 @@ class TestTemplateRendering:
 
         assert result["metadata"]["name"] == "agent-vm-abc-123"
         assert result["metadata"]["labels"]["job-id"] == "abc-123"
+        assert result["metadata"]["labels"]["srw.io/owner-kind"] == "job"
+        assert result["metadata"]["labels"]["srw.io/owner-id"] == "abc-123"
+        vmi_labels = result["spec"]["template"]["metadata"]["labels"]
+        assert vmi_labels["srw.io/owner-kind"] == "job"
+        assert vmi_labels["srw.io/owner-id"] == "abc-123"
+        data_volume_labels = result["spec"]["dataVolumeTemplates"][0]["metadata"][
+            "labels"
+        ]
+        assert data_volume_labels["srw.io/owner-kind"] == "job"
+        assert data_volume_labels["srw.io/owner-id"] == "abc-123"
         assert result["spec"]["template"]["spec"]["domain"]["cpu"]["cores"] == 4
         assert (
             result["spec"]["template"]["spec"]["domain"]["resources"]["requests"][
@@ -613,6 +670,19 @@ class TestTemplateRendering:
         result = provisioner_with_k8s._render_template(job_config)
         assert "Analyze data" in result["spec"]["config"]["description"]
 
+    def test_render_template_stamps_full_thread_identity(self, provisioner_with_k8s):
+        result = provisioner_with_k8s._render_template(
+            {"job_id": "thread-123", "entity_type": "thread"}
+        )
+
+        for labels in (
+            result["metadata"]["labels"],
+            result["spec"]["template"]["metadata"]["labels"],
+            result["spec"]["dataVolumeTemplates"][0]["metadata"]["labels"],
+        ):
+            assert labels["srw.io/owner-kind"] == "thread"
+            assert labels["srw.io/owner-id"] == "thread-123"
+
 
 # =============================================================================
 # Test: create_vm()
@@ -643,7 +713,9 @@ class TestCreateVm:
             cpu_cores=4,
             memory="8Gi",
             description="Build feature",
+            entity_type="job",
             set_provisioning=True,
+            provision_generation=ANY,
         )
 
     @pytest.mark.asyncio
@@ -669,6 +741,43 @@ class TestCreateVm:
         assert call_kwargs[1]["plural"] == "virtualmachines"
 
     @pytest.mark.asyncio
+    async def test_http_create_carries_thread_owner_kind(self, provisioner_disabled):
+        response = MagicMock()
+        response.raise_for_status = MagicMock()
+        response.json.return_value = {
+            "status": "created",
+            "vm_name": "agent-vm-thread-1",
+            "vm_uid": "http-admitted-vm-uid",
+            "rootdisk_pvc_uid": "http-root-pvc-uid",
+            "namespace": "agent-vms",
+        }
+        provisioner_disabled._set_thread_vm_context = AsyncMock()
+        provisioner_disabled._http_client = MagicMock()
+        provisioner_disabled._http_client.post = AsyncMock(return_value=response)
+
+        assert await provisioner_disabled._create_http(
+            job_id="thread-1",
+            agent_config="worker_base",
+            vm_image=None,
+            cpu_cores=8,
+            memory="16Gi",
+            description="",
+            entity_type="thread",
+        )
+
+        payload = provisioner_disabled._http_client.post.await_args.kwargs["json"]
+        assert payload["job_id"] == "thread-1"
+        assert payload["entity_type"] == "thread"
+        # An unsigned legacy controller response remains operational telemetry,
+        # but its reusable names/UID strings are not authoritative identity.
+        created_updates = provisioner_disabled._set_thread_vm_context.await_args_list[
+            -1
+        ].args[1]
+        assert created_updates["status"] == "created"
+        assert "vm_uid" not in created_updates
+        assert "rootdisk_pvc_uid" not in created_updates
+
+    @pytest.mark.asyncio
     async def test_create_vm_direct_updates_context_on_success(
         self, provisioner_with_k8s, mock_db
     ):
@@ -679,14 +788,16 @@ class TestCreateVm:
                 job_id="job-003",
                 agent_config="defaults",
             )
-        mock_db.merge_vm_context.assert_awaited()
+        mock_db.merge_vm_context_if_provision_generation.assert_awaited()
         # Find the "created" context update
-        calls = mock_db.merge_vm_context.await_args_list
-        created_call = [c for c in calls if c[0][1].get("status") == "created"]
+        calls = mock_db.merge_vm_context_if_provision_generation.await_args_list
+        created_call = [c for c in calls if c.args[2].get("status") == "created"]
         assert len(created_call) == 1
-        ctx = created_call[0][0][1]
+        ctx = created_call[0].args[2]
         assert ctx["provisioned_by"] == "direct"
         assert "vm_name" in ctx
+        assert ctx["vm_uid"] == "direct-admitted-vm-uid"
+        assert ctx["rootdisk_pvc_uid"] == "direct-root-pvc-uid-job-003"
 
     @pytest.mark.asyncio
     async def test_create_vm_direct_updates_context_on_failure(
@@ -704,10 +815,10 @@ class TestCreateVm:
                 agent_config="defaults",
             )
         assert result is False
-        calls = mock_db.merge_vm_context.await_args_list
-        failed_call = [c for c in calls if c[0][1].get("status") == "failed"]
+        calls = mock_db.merge_vm_context_if_provision_generation.await_args_list
+        failed_call = [c for c in calls if c.args[2].get("status") == "failed"]
         assert len(failed_call) == 1
-        ctx = failed_call[0][0][1]
+        ctx = failed_call[0].args[2]
         assert "API server unreachable" in ctx["error"]
         assert ctx["provisioned_by"] == "direct"
 
@@ -798,6 +909,8 @@ class TestFreshProvisionReset:
         assert ctx["ssh_probe_attempts"] == 0
         assert ctx["ssh_probe_error"] is None
         assert ctx["ssh_probe_failed_at"] is None
+        assert ctx["vm_uid"] is None
+        assert ctx["rootdisk_pvc_uid"] is None
         assert ctx["golden_wait_started_at"] is None
         assert isinstance(ctx["provisioned_at"], float)
 
@@ -845,6 +958,9 @@ class TestFreshProvisionReset:
         assert first[0][0] == "reset-thread"
         assert first[0][1]["snapshot_attempts"] == 0
         assert first[0][1]["ssh_host"] is None
+        assert mock_nats_bridge.request_vm_create.await_args.kwargs["entity_type"] == (
+            "thread"
+        )
 
 
 # =============================================================================
@@ -909,7 +1025,10 @@ class TestDeleteVm:
         result = await provisioner_with_nats.delete_vm(job_id="job-del-001")
         assert result is True
         mock_nats_bridge.request_vm_delete.assert_awaited_once_with(
-            "job-del-001", purge_disk=True
+            "job-del-001",
+            purge_disk=True,
+            provision_generation=PROVISION_GENERATION,
+            entity_type="job",
         )
 
     @pytest.mark.asyncio
@@ -925,6 +1044,54 @@ class TestDeleteVm:
         call_kwargs = mock_k8s_api.delete_namespaced_custom_object.call_args
         assert call_kwargs[1]["name"] == "agent-vm-job-del-002"
         assert call_kwargs[1]["namespace"] == "test-ns"
+        assert call_kwargs[1]["body"]["preconditions"] == {"uid": "queried-vm-uid"}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("entity_type", ["job", "thread"])
+    async def test_direct_delete_without_durable_generation_fails_closed(
+        self,
+        entity_type,
+        provisioner_with_k8s,
+        mock_k8s_api,
+        mock_db,
+    ):
+        if entity_type == "thread":
+            mock_db.get_thread.return_value = {"metadata": {"vm": {}}}
+        else:
+            mock_db.get_job.return_value = {"context": {"vm": {}}}
+
+        with patch("orchestrator.services.vm_provisioner.nats_bridge") as nb:
+            nb.is_available = False
+            if entity_type == "thread":
+                result = await provisioner_with_k8s.delete_thread_vm("legacy")
+            else:
+                result = await provisioner_with_k8s.delete_vm("legacy")
+
+        assert result is False
+        mock_k8s_api.get_namespaced_custom_object.assert_not_called()
+        mock_k8s_api.delete_namespaced_custom_object.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("entity_type", ["job", "thread"])
+    async def test_direct_delete_generation_mismatch_fails_closed(
+        self,
+        entity_type,
+        provisioner_with_k8s,
+        mock_k8s_api,
+    ):
+        mock_k8s_api.get_namespaced_custom_object.return_value["metadata"][
+            "annotations"
+        ]["srw.io/provision-generation"] = "00000000-0000-4000-8000-000000000099"
+
+        with patch("orchestrator.services.vm_provisioner.nats_bridge") as nb:
+            nb.is_available = False
+            if entity_type == "thread":
+                result = await provisioner_with_k8s.delete_thread_vm("reused")
+            else:
+                result = await provisioner_with_k8s.delete_vm("reused")
+
+        assert result is False
+        mock_k8s_api.delete_namespaced_custom_object.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_delete_vm_direct_updates_context(
@@ -934,8 +1101,8 @@ class TestDeleteVm:
         with patch("orchestrator.services.vm_provisioner.nats_bridge") as nb:
             nb.is_available = False
             await provisioner_with_k8s.delete_vm(job_id="job-del-003")
-        mock_db.merge_vm_context.assert_awaited_once_with(
-            "job-del-003", {"status": "deleted"}
+        mock_db.merge_vm_context_if_provision_generation.assert_awaited_once_with(
+            "job-del-003", PROVISION_GENERATION, {"status": "deleted"}
         )
 
     @pytest.mark.asyncio
@@ -998,7 +1165,91 @@ class TestQueryStatus:
             job_id="status-001", timeout=3.0
         )
         assert result == expected
-        mock_nats_bridge.query_vm_status.assert_awaited_once_with("status-001", 3.0)
+        mock_nats_bridge.query_vm_status.assert_awaited_once_with(
+            "status-001", 3.0, provision_generation=PROVISION_GENERATION
+        )
+
+    @pytest.mark.asyncio
+    async def test_nats_status_persists_late_rootdisk_identity(
+        self, provisioner_with_nats, mock_nats_bridge, mock_db
+    ):
+        mock_nats_bridge.query_vm_status.return_value = {
+            "job_id": "late-nats",
+            "vm_name": "agent-vm-late-nats",
+            "namespace": "agent-vms",
+            "vm_uid": "late-nats-vm-uid",
+            "rootdisk_pvc_uid": "late-nats-root-pvc-uid",
+            "provision_generation": PROVISION_GENERATION,
+            "_identity_authenticated": True,
+        }
+
+        result = await provisioner_with_nats.query_status("late-nats")
+
+        assert result is not None
+        assert "_identity_authenticated" not in result
+        updates = mock_db.merge_vm_context_if_provision_generation.await_args.args[2]
+        assert updates["vm_uid"] == "late-nats-vm-uid"
+        assert updates["rootdisk_pvc_uid"] == "late-nats-root-pvc-uid"
+        assert updates["identity_authenticated"] is True
+
+    @pytest.mark.asyncio
+    async def test_http_status_persists_late_thread_rootdisk_identity(
+        self, provisioner_disabled, mock_db
+    ):
+        from orchestrator.services.vm_lifecycle_auth import sign_payload
+
+        secret = b"http-lifecycle-status-test-secret-at-least-32-bytes"
+        provisioner_disabled._db = mock_db
+        provisioner_disabled._controller_url = "http://vm-controller:8080"
+        provisioner_disabled._lifecycle_hmac_secret = secret
+        client = MagicMock()
+
+        async def _get(_path, *, params, timeout):
+            response = MagicMock(status_code=200)
+            response.raise_for_status = MagicMock()
+            response.json.return_value = sign_payload(
+                {
+                    "job_id": "late-http-thread",
+                    "vm_name": "agent-vm-late-http-thread",
+                    "namespace": "agent-vms",
+                    "vm_uid": "late-http-vm-uid",
+                    "rootdisk_pvc_uid": "late-http-root-pvc-uid",
+                    "provision_generation": PROVISION_GENERATION,
+                },
+                direction="response",
+                operation="status",
+                secret=secret,
+                correlation_id=params["lifecycle_auth_request_id"],
+            )
+            return response
+
+        client.get = AsyncMock(side_effect=_get)
+        provisioner_disabled._http_client = client
+
+        result = await provisioner_disabled.query_status(
+            "late-http-thread", entity_type="thread"
+        )
+
+        assert result is not None
+        updates = (
+            mock_db.merge_thread_vm_context_if_provision_generation.await_args.args[2]
+        )
+        assert updates["vm_uid"] == "late-http-vm-uid"
+        assert updates["rootdisk_pvc_uid"] == "late-http-root-pvc-uid"
+
+    @pytest.mark.asyncio
+    async def test_direct_status_persists_late_rootdisk_identity(
+        self, provisioner_with_k8s, mock_db
+    ):
+        with patch("orchestrator.services.vm_provisioner.nats_bridge") as nb:
+            nb.is_available = False
+            result = await provisioner_with_k8s.query_status("test-job-123")
+
+        assert result is not None
+        updates = mock_db.merge_vm_context_if_provision_generation.await_args.args[2]
+        assert updates["vm_uid"] == "queried-vm-uid"
+        assert updates["rootdisk_pvc_uid"] == ("direct-root-pvc-uid-test-job-123")
+        assert updates["identity_authenticated"] is True
 
     @pytest.mark.asyncio
     async def test_query_status_direct_backend_ready(
@@ -1096,7 +1347,7 @@ class TestQueryStatus:
         """query_status() uses default 5.0s timeout when not specified."""
         await provisioner_with_nats.query_status(job_id="default-timeout")
         mock_nats_bridge.query_vm_status.assert_awaited_once_with(
-            "default-timeout", 5.0
+            "default-timeout", 5.0, provision_generation=PROVISION_GENERATION
         )
 
     @pytest.mark.asyncio
@@ -1318,8 +1569,8 @@ class TestErrorHandling:
             )
         assert result is False
         # Context should be updated with failure
-        calls = mock_db.merge_vm_context.await_args_list
-        assert any(c[0][1].get("status") == "failed" for c in calls)
+        calls = mock_db.merge_vm_context_if_provision_generation.await_args_list
+        assert any(c.args[2].get("status") == "failed" for c in calls)
 
     @pytest.mark.asyncio
     async def test_delete_direct_k8s_404(self, provisioner_with_k8s, mock_k8s_api):
@@ -1393,8 +1644,8 @@ class TestErrorHandling:
             nb.is_available = False
             await provisioner_with_k8s.delete_vm(job_id="no-ctx-update")
 
-        # merge_vm_context should NOT have been called (delete failure path doesn't update context)
-        mock_db.merge_vm_context.assert_not_awaited()
+        # No lifecycle state is written when Kubernetes rejects the delete.
+        mock_db.merge_vm_context_if_provision_generation.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_query_status_direct_empty_status(
@@ -1617,14 +1868,35 @@ class TestAsyncToThread:
                 "orchestrator.services.vm_provisioner.asyncio.to_thread",
                 new_callable=AsyncMock,
             ) as mock_to_thread:
-                mock_to_thread.return_value = {
-                    "metadata": {"name": "agent-vm-thread-test"}
-                }
+
+                def _thread_result(callable_, *args, **kwargs):
+                    if callable_ == mock_k8s_api.create_namespaced_custom_object:
+                        body = kwargs["body"]
+                        return {
+                            **body,
+                            "metadata": {
+                                **body.get("metadata", {}),
+                                "name": "agent-vm-thread-create",
+                                "uid": "threaded-admitted-vm-uid",
+                            },
+                        }
+                    return {
+                        "metadata": {
+                            "name": "agent-vm-thread-create-rootdisk",
+                            "uid": "threaded-root-pvc-uid",
+                            "labels": {
+                                "srw.io/owner-kind": "job",
+                                "srw.io/owner-id": "thread-create",
+                            },
+                        }
+                    }
+
+                mock_to_thread.side_effect = _thread_result
                 await provisioner_with_k8s.create_vm(job_id="thread-create")
 
-        mock_to_thread.assert_awaited_once()
+        assert mock_to_thread.await_count == 2
         # First arg should be the K8s API method
-        first_arg = mock_to_thread.await_args[0][0]
+        first_arg = mock_to_thread.await_args_list[0].args[0]
         assert first_arg == mock_k8s_api.create_namespaced_custom_object
 
     @pytest.mark.asyncio
@@ -1636,12 +1908,28 @@ class TestAsyncToThread:
                 "orchestrator.services.vm_provisioner.asyncio.to_thread",
                 new_callable=AsyncMock,
             ) as mock_to_thread:
-                mock_to_thread.return_value = {}
+                mock_to_thread.side_effect = [
+                    {
+                        "metadata": {
+                            "uid": "thread-delete-vm-uid",
+                            "annotations": {
+                                "srw.io/provision-generation": PROVISION_GENERATION,
+                            },
+                        }
+                    },
+                    {},
+                ]
                 await provisioner_with_k8s.delete_vm(job_id="thread-delete")
 
-        mock_to_thread.assert_awaited_once()
-        first_arg = mock_to_thread.await_args[0][0]
-        assert first_arg == mock_k8s_api.delete_namespaced_custom_object
+        assert mock_to_thread.await_count == 2
+        assert (
+            mock_to_thread.await_args_list[0].args[0]
+            == mock_k8s_api.get_namespaced_custom_object
+        )
+        assert (
+            mock_to_thread.await_args_list[1].args[0]
+            == mock_k8s_api.delete_namespaced_custom_object
+        )
 
     @pytest.mark.asyncio
     async def test_query_runs_in_thread(self, provisioner_with_k8s, mock_k8s_api):
@@ -1661,8 +1949,8 @@ class TestAsyncToThread:
                 }
                 await provisioner_with_k8s.query_status(job_id="thread-query")
 
-        mock_to_thread.assert_awaited_once()
-        first_arg = mock_to_thread.await_args[0][0]
+        assert mock_to_thread.await_count == 2
+        first_arg = mock_to_thread.await_args_list[0].args[0]
         assert first_arg == mock_k8s_api.get_namespaced_custom_object
 
 
@@ -1837,7 +2125,10 @@ class TestPurgeDiskIntent:
     ):
         await provisioner_with_nats.delete_vm("job-1")
         mock_nats_bridge.request_vm_delete.assert_awaited_once_with(
-            "job-1", purge_disk=True
+            "job-1",
+            purge_disk=True,
+            provision_generation=PROVISION_GENERATION,
+            entity_type="job",
         )
 
     @pytest.mark.asyncio
@@ -1846,7 +2137,10 @@ class TestPurgeDiskIntent:
     ):
         await provisioner_with_nats.delete_vm("job-1", purge_disk=False)
         mock_nats_bridge.request_vm_delete.assert_awaited_once_with(
-            "job-1", purge_disk=False
+            "job-1",
+            purge_disk=False,
+            provision_generation=PROVISION_GENERATION,
+            entity_type="job",
         )
 
     @pytest.mark.asyncio
@@ -1855,7 +2149,10 @@ class TestPurgeDiskIntent:
     ):
         await provisioner_with_nats.delete_thread_vm("tid-1", purge_disk=False)
         mock_nats_bridge.request_vm_delete.assert_awaited_once_with(
-            "tid-1", purge_disk=False
+            "tid-1",
+            purge_disk=False,
+            provision_generation=PROVISION_GENERATION,
+            entity_type="thread",
         )
 
     @pytest.mark.asyncio
@@ -1864,7 +2161,10 @@ class TestPurgeDiskIntent:
         provisioner_with_nats._snapshot_service = None
         await provisioner_with_nats.release_vm("job-1")
         mock_nats_bridge.request_vm_delete.assert_awaited_once_with(
-            "job-1", purge_disk=True
+            "job-1",
+            purge_disk=True,
+            provision_generation=PROVISION_GENERATION,
+            entity_type="job",
         )
 
     @pytest.mark.asyncio
@@ -1872,7 +2172,10 @@ class TestPurgeDiskIntent:
         provisioner_with_nats._snapshot_service = None
         await provisioner_with_nats.release_thread_vm("tid-1")
         mock_nats_bridge.request_vm_delete.assert_awaited_once_with(
-            "tid-1", purge_disk=True
+            "tid-1",
+            purge_disk=True,
+            provision_generation=PROVISION_GENERATION,
+            entity_type="thread",
         )
 
     @pytest.mark.asyncio
@@ -1880,12 +2183,16 @@ class TestPurgeDiskIntent:
         self, provisioner_with_nats
     ):
         client = AsyncMock()
-        client.delete = AsyncMock(return_value=MagicMock(status_code=200))
+        response = MagicMock(status_code=200)
+        response.json.return_value = {"status": "deleted"}
+        response.raise_for_status = MagicMock()
+        client.delete = AsyncMock(return_value=response)
         provisioner_with_nats._http_client = client
 
         await provisioner_with_nats._delete_http("job-1", purge_disk=False)
 
-        assert client.delete.await_args[0][0] == "/vms/job-1?purge_disk=false"
+        assert client.delete.await_args.args[0] == "/vms/job-1"
+        assert client.delete.await_args.kwargs["params"] == {"purge_disk": "false"}
 
     @pytest.mark.asyncio
     async def test_http_delete_omits_the_param_when_purging(
@@ -1893,12 +2200,16 @@ class TestPurgeDiskIntent:
     ):
         """Keeps the request byte-identical against an un-upgraded controller."""
         client = AsyncMock()
-        client.delete = AsyncMock(return_value=MagicMock(status_code=200))
+        response = MagicMock(status_code=200)
+        response.json.return_value = {"status": "deleted"}
+        response.raise_for_status = MagicMock()
+        client.delete = AsyncMock(return_value=response)
         provisioner_with_nats._http_client = client
 
         await provisioner_with_nats._delete_http("job-1")
 
-        assert client.delete.await_args[0][0] == "/vms/job-1"
+        assert client.delete.await_args.args[0] == "/vms/job-1"
+        assert client.delete.await_args.kwargs["params"] == {}
 
     @pytest.mark.asyncio
     async def test_direct_mode_warns_that_keep_is_not_honoured(

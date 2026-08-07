@@ -1,4 +1,4 @@
-"""Dedicated, database-free Kubernetes Pod/PVC/PV inventory runtime.
+"""Dedicated, database-free Kubernetes Pod/PVC/PV/VMI inventory runtime.
 
 The runtime deliberately has only two authorities: namespace-scoped read access
 to the Kubernetes API and an HMAC-authenticated internal HTTP client.  Raw API
@@ -43,6 +43,7 @@ from .collectors import (
 from .collectors.kubernetes_client import RawKubernetesClient
 from .collectors.pod_normalization import PodEffectiveRequest, normalize_pod
 from .collectors.storage_normalization import normalize_pv, normalize_pvc
+from .collectors.vmi_normalization import normalize_vmi
 from .config import InfrastructureMeteringSettings
 from .ingestion_types import (
     InventoryItemWire,
@@ -74,6 +75,13 @@ WATCH_FINISH_PATH = f"{API_PREFIX}/watch/finish"
 POD_API_RESOURCE = "core/v1/pods"
 PVC_API_RESOURCE = "core/v1/persistentvolumeclaims"
 PV_API_RESOURCE = "core/v1/persistentvolumes"
+VMI_API_RESOURCE = "kubevirt.io/v1/virtualmachineinstances"
+PRIMARY_COLLECTOR_ID = "kubernetes-pods"
+VMI_COLLECTOR_ID = "kubevirt-vmis"
+VM_STORAGE_COLLECTOR_ID = "kubevirt-storage"
+_COLLECTOR_IDS = frozenset(
+    {PRIMARY_COLLECTOR_ID, VMI_COLLECTOR_ID, VM_STORAGE_COLLECTOR_ID}
+)
 MAX_RESPONSE_BYTES = 1024 * 1024
 MAX_BATCH_ITEMS = 500
 MAX_FATAL_ERRORS = 1_000
@@ -629,6 +637,7 @@ class KubernetesPodCollectorRuntime:
         kubernetes_client: Any,
         transport: IngestionTransport,
         volume_identity_key: str | bytes | None = None,
+        controller_epoch: str | None = None,
         monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         settings.validate()
@@ -640,15 +649,58 @@ class KubernetesPodCollectorRuntime:
             )
         self._settings = settings
         self._collector_id = collector_id
+        if collector_id not in _COLLECTOR_IDS:
+            raise CollectorConfigurationError(
+                "infrastructure metering collector identity is unsupported"
+            )
+        self._is_vm_collector = collector_id == VMI_COLLECTOR_ID
+        self._is_vm_storage_collector = collector_id == VM_STORAGE_COLLECTOR_ID
         self._client = kubernetes_client
         self._transport = transport
         self._monotonic = monotonic
+        if controller_epoch is not None:
+            controller_epoch = controller_epoch.strip()
+            if (
+                not controller_epoch
+                or len(controller_epoch) > 256
+                or any(character.isspace() for character in controller_epoch)
+            ):
+                raise CollectorConfigurationError(
+                    "collector controller epoch is invalid"
+                )
+        if self._is_vm_collector and not settings.vm_inventory_enabled:
+            raise CollectorConfigurationError(
+                "VMI collector identity requires VM inventory"
+            )
+        if self._is_vm_collector and controller_epoch is None:
+            raise CollectorConfigurationError(
+                "VM inventory requires a controller epoch"
+            )
+        if not self._is_vm_collector and controller_epoch is not None:
+            raise CollectorConfigurationError(
+                "only the VMI collector may carry a controller epoch"
+            )
+        if self._is_vm_storage_collector and not (
+            settings.vm_pvc_inventory_enabled or settings.vm_pv_inventory_enabled
+        ):
+            raise CollectorConfigurationError(
+                "VM storage collector identity requires VM storage inventory"
+            )
+        self._controller_epoch = controller_epoch
+        self._scope_sequences: dict[tuple[str, str, str | None], int] = {}
         if isinstance(volume_identity_key, str):
             volume_identity_key = volume_identity_key.encode("utf-8")
         self._volume_identity_key = (
             None if volume_identity_key is None else bytes(volume_identity_key)
         )
-        if self._settings.pv_inventory_enabled and (
+        pv_inventory_enabled = (
+            self._settings.vm_pv_inventory_enabled
+            if self._is_vm_storage_collector
+            else self._settings.pv_inventory_enabled
+            if not self._is_vm_collector
+            else False
+        )
+        if pv_inventory_enabled and (
             self._volume_identity_key is None or len(self._volume_identity_key) < 32
         ):
             raise CollectorConfigurationError(
@@ -679,6 +731,59 @@ class KubernetesPodCollectorRuntime:
             collector_id=self._collector_id,
             limits=self._limits,
         )
+
+    def _scope_configured(self, scope: InventoryScope) -> bool:
+        if self._is_vm_collector:
+            return (
+                self._settings.vm_inventory_enabled
+                and scope.source_cluster == self._settings.vm_stable_cluster_id
+                and scope.api_resource == VMI_API_RESOURCE
+                and not scope.cluster_scoped
+                and scope.namespace == self._settings.vm_namespace
+            )
+        if self._is_vm_storage_collector:
+            if scope.source_cluster != self._settings.vm_stable_cluster_id:
+                return False
+            if scope.api_resource == PVC_API_RESOURCE:
+                return (
+                    self._settings.vm_pvc_inventory_enabled
+                    and not scope.cluster_scoped
+                    and scope.namespace == self._settings.vm_namespace
+                )
+            if scope.api_resource == PV_API_RESOURCE:
+                return (
+                    self._settings.vm_pv_inventory_enabled
+                    and self._settings.vm_pv_cluster_wide_rbac_acknowledged
+                    and scope.cluster_scoped
+                    and scope.namespace is None
+                )
+            return False
+        if scope.source_cluster != self._settings.stable_cluster_id:
+            return False
+        if scope.api_resource == POD_API_RESOURCE:
+            return (
+                not scope.cluster_scoped
+                and scope.namespace in self._settings.namespace_allowlist
+            )
+        if scope.api_resource == PVC_API_RESOURCE:
+            return (
+                self._settings.pvc_inventory_enabled
+                and not scope.cluster_scoped
+                and scope.namespace in self._settings.namespace_allowlist
+            )
+        if scope.api_resource == PV_API_RESOURCE:
+            return (
+                self._settings.pv_inventory_enabled
+                and scope.cluster_scoped
+                and scope.namespace is None
+            )
+        return False
+
+    def _require_configured_scope(self, scope: InventoryScope) -> None:
+        if not self._scope_configured(scope):
+            raise CollectorConfigurationError(
+                "inventory scope is not configured for this collector identity"
+            )
 
     def _engine(
         self,
@@ -724,6 +829,9 @@ class KubernetesPodCollectorRuntime:
                     identity_key_version=self._settings.volume_identity_key_version,
                 )
 
+        elif scope.api_resource == VMI_API_RESOURCE:
+            normalizer = normalize_vmi
+
         else:
             raise CollectorConfigurationError(
                 "unsupported infrastructure inventory API resource"
@@ -738,13 +846,35 @@ class KubernetesPodCollectorRuntime:
         )
 
     def _scope_shadow_enabled(self, scope: InventoryScope) -> bool:
+        if not self._scope_configured(scope):
+            return False
         if scope.api_resource == POD_API_RESOURCE:
             return self._settings.shadow_enabled
         if scope.api_resource == PVC_API_RESOURCE:
+            if self._is_vm_storage_collector:
+                return self._settings.vm_pvc_shadow_enabled
             return self._settings.pvc_shadow_enabled
         if scope.api_resource == PV_API_RESOURCE:
+            if self._is_vm_storage_collector:
+                return self._settings.vm_pv_shadow_enabled
             return self._settings.pv_shadow_enabled
+        if scope.api_resource == VMI_API_RESOURCE:
+            return self._settings.vm_shadow_enabled
         return False
+
+    def _snapshot_controller_identity(
+        self, scope: InventoryScope
+    ) -> tuple[str | None, int | None]:
+        if scope.api_resource != VMI_API_RESOURCE:
+            return None, None
+        if self._controller_epoch is None:
+            raise CollectorConfigurationError(
+                "VM inventory requires a controller epoch"
+            )
+        key = (scope.source_cluster, scope.api_resource, scope.namespace)
+        sequence = self._scope_sequences.get(key, -1) + 1
+        self._scope_sequences[key] = sequence
+        return self._controller_epoch, sequence
 
     async def _post_model(self, path: str, model: BaseModel) -> bytes:
         return await self._transport.post(path, _model_payload(model))
@@ -756,7 +886,10 @@ class KubernetesPodCollectorRuntime:
         intent: str,
         snapshot_id: UUID | None = None,
         starting_resource_version: str | None = None,
+        controller_epoch: str | None = None,
+        sequence: int | None = None,
     ) -> InventoryTicketResponse:
+        self._require_configured_scope(scope)
         request = _model_from_json(
             InventoryTicketRequest,
             {
@@ -764,6 +897,8 @@ class KubernetesPodCollectorRuntime:
                 "intent": intent,
                 "snapshot_id": str(snapshot_id) if snapshot_id else None,
                 "starting_resource_version": starting_resource_version,
+                "controller_epoch": controller_epoch,
+                "sequence": sequence,
             },
         )
         response = await self._post_model(TICKETS_PATH, request)
@@ -783,12 +918,15 @@ class KubernetesPodCollectorRuntime:
         """LIST one exact scope, spool items, and phase them into ingestion."""
 
         snapshot_id = uuid4()
+        controller_epoch, sequence = self._snapshot_controller_identity(scope)
         # Ticket acquisition precedes the Kubernetes LIST, fencing stale
         # collectors before they spend API-server or spool resources.
         ticket = await self._request_ticket(
             scope=scope,
             intent="snapshot",
             snapshot_id=snapshot_id,
+            controller_epoch=controller_epoch,
+            sequence=sequence,
         )
         with _SnapshotSpool(self._settings.max_snapshot_bytes) as spool:
             pod_scope = scope.api_resource == POD_API_RESOURCE
@@ -825,6 +963,12 @@ class KubernetesPodCollectorRuntime:
                     else None
                 ),
             )
+            if controller_epoch is not None:
+                snapshot = replace(
+                    snapshot,
+                    controller_epoch=controller_epoch,
+                    sequence=sequence,
+                )
             if pod_scope:
                 self._effective_requests.reconcile_list(
                     scope,
@@ -1050,15 +1194,47 @@ class KubernetesPodCollectorRuntime:
         """Run every enabled exact resource scope with bounded concurrency."""
 
         semaphore = asyncio.Semaphore(self._settings.scope_concurrency)
-        scopes = [
-            InventoryScope(
-                self._settings.stable_cluster_id,
-                POD_API_RESOURCE,
-                namespace,
-            )
-            for namespace in self._settings.namespace_allowlist
-        ]
-        if self._settings.pvc_inventory_enabled:
+        if self._is_vm_collector:
+            scopes = [
+                InventoryScope(
+                    self._settings.vm_stable_cluster_id,
+                    VMI_API_RESOURCE,
+                    self._settings.vm_namespace,
+                )
+            ]
+        elif self._is_vm_storage_collector:
+            scopes = []
+            if self._settings.vm_pvc_inventory_enabled:
+                scopes.append(
+                    InventoryScope(
+                        self._settings.vm_stable_cluster_id,
+                        PVC_API_RESOURCE,
+                        self._settings.vm_namespace,
+                    )
+                )
+            if self._settings.vm_pv_inventory_enabled:
+                scopes.append(
+                    InventoryScope(
+                        self._settings.vm_stable_cluster_id,
+                        PV_API_RESOURCE,
+                        None,
+                        cluster_scoped=True,
+                    )
+                )
+        else:
+            scopes = [
+                InventoryScope(
+                    self._settings.stable_cluster_id,
+                    POD_API_RESOURCE,
+                    namespace,
+                )
+                for namespace in self._settings.namespace_allowlist
+            ]
+        if (
+            not self._is_vm_collector
+            and not self._is_vm_storage_collector
+            and self._settings.pvc_inventory_enabled
+        ):
             scopes.extend(
                 InventoryScope(
                     self._settings.stable_cluster_id,
@@ -1067,7 +1243,11 @@ class KubernetesPodCollectorRuntime:
                 )
                 for namespace in self._settings.namespace_allowlist
             )
-        if self._settings.pv_inventory_enabled:
+        if (
+            not self._is_vm_collector
+            and not self._is_vm_storage_collector
+            and self._settings.pv_inventory_enabled
+        ):
             scopes.append(
                 InventoryScope(
                     self._settings.stable_cluster_id,
@@ -1108,7 +1288,7 @@ async def _wait_or_stop(stop: asyncio.Event, delay: float) -> None:
         pass
 
 
-def _load_kubernetes_core_api(deployment_mode: str) -> Any:
+def _load_kubernetes_client_module(deployment_mode: str) -> Any:
     """Load in-cluster auth, with kubeconfig fallback only when explicitly local."""
 
     try:
@@ -1132,7 +1312,35 @@ def _load_kubernetes_core_api(deployment_mode: str) -> Any:
             raise CollectorConfigurationError(
                 "local collector could not load Kubernetes auth"
             ) from fallback_exc
-    return kubernetes_client.CoreV1Api()
+    return kubernetes_client
+
+
+def _load_kubernetes_core_api(deployment_mode: str) -> Any:
+    """Compatibility helper for callers that only require core/v1."""
+
+    return _load_kubernetes_client_module(deployment_mode).CoreV1Api()
+
+
+def _load_kubernetes_apis(deployment_mode: str) -> tuple[Any, Any]:
+    """Load the core and custom-object APIs under one auth decision."""
+
+    kubernetes_client = _load_kubernetes_client_module(deployment_mode)
+    return kubernetes_client.CoreV1Api(), kubernetes_client.CustomObjectsApi()
+
+
+def _new_vm_controller_epoch(pod_uid: str) -> str:
+    """Bind one remote authority epoch to both its Pod and process lifetime."""
+
+    normalized = pod_uid.strip() if isinstance(pod_uid, str) else ""
+    if (
+        not normalized
+        or len(normalized) > 128
+        or any(character.isspace() for character in normalized)
+    ):
+        raise CollectorConfigurationError(
+            "VM inventory requires a valid downward-API POD_UID"
+        )
+    return f"{normalized}:{uuid4()}"
 
 
 def _build_runtime_from_env(
@@ -1145,15 +1353,23 @@ def _build_runtime_from_env(
         "INFRASTRUCTURE_METERING_ORCHESTRATOR_URL", ""
     ).strip()
     ingestion_key = os.environ.get("INFRASTRUCTURE_METERING_INGESTION_KEY", "")
+    pv_inventory_enabled = (
+        settings.vm_pv_inventory_enabled
+        if collector_id == VM_STORAGE_COLLECTOR_ID
+        else settings.pv_inventory_enabled
+        if collector_id == PRIMARY_COLLECTOR_ID
+        else False
+    )
     http_transport = SignedIngestionHttpClient(
         base_url=orchestrator_url,
         collector_id=collector_id,
         ingestion_key=ingestion_key,
     )
     try:
-        core_api = _load_kubernetes_core_api(settings.deployment_mode)
+        core_api, custom_objects_api = _load_kubernetes_apis(settings.deployment_mode)
         raw_client = RawKubernetesClient(
             core_api,
+            custom_objects_api=custom_objects_api,
             max_page_bytes=min(8 * 1024 * 1024, settings.max_snapshot_bytes),
             max_watch_event_bytes=min(2 * 1024 * 1024, settings.max_snapshot_bytes),
         )
@@ -1164,7 +1380,17 @@ def _build_runtime_from_env(
             transport=http_transport,
             volume_identity_key=(
                 os.environ.get("INFRASTRUCTURE_METERING_VOLUME_IDENTITY_KEY", "")
-                if settings.pv_inventory_enabled
+                if pv_inventory_enabled
+                else None
+            ),
+            # A Pod UID alone survives a container restart while the in-memory
+            # WATCH cursor/sequence does not.  Include a per-process nonce so
+            # every restarted collector forces the server's recovery epoch and
+            # records the resulting unknown range instead of reusing sequence 0
+            # under an apparently unchanged authority.
+            controller_epoch=(
+                _new_vm_controller_epoch(os.environ.get("POD_UID", ""))
+                if collector_id == VMI_COLLECTOR_ID
                 else None
             ),
         )

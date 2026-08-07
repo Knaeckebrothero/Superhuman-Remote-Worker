@@ -44,6 +44,7 @@ _MIN_DIAGNOSTIC_RETENTION = timedelta(days=7)
 _MIN_ABANDONED_STAGING_RETENTION = timedelta(hours=24)
 _MAX_PURGE_BATCH = 10_000
 _ABANDONED_WATCH_GAP_REASON = "watch-session-abandoned"
+_CONTROLLER_EPOCH_GAP_REASON = "controller-epoch-changed"
 _WATCH_GAP_REASONS = frozenset(
     {
         "resource-version-expired",
@@ -62,6 +63,7 @@ _RECOVERABLE_COVERAGE_GAP_REASONS = frozenset(
         "list-resource-version-expired",
         "list-resource-version-mismatch",
         _ABANDONED_WATCH_GAP_REASON,
+        _CONTROLLER_EPOCH_GAP_REASON,
         *_WATCH_GAP_REASONS,
     }
 )
@@ -725,7 +727,30 @@ WatchDeletionMutator = Callable[
         WatchDeletionMutationContext,
         asyncpg.Record | None,
     ],
-    Awaitable[tuple[WatchMutationAction, UUID | None]],
+    Awaitable[tuple[WatchMutationAction, UUID | None] | None],
+]
+
+
+@dataclass(frozen=True)
+class WatchTerminalMutationContext:
+    """Resource-specific context for a trusted terminal object observation."""
+
+    scope_epoch_id: UUID
+    inventory_scope_id: UUID
+    source_cluster: str
+    namespace: str | None
+    received_at: datetime
+    source_kind: str
+    source_uid: str
+
+
+WatchTerminalMutator = Callable[
+    [
+        asyncpg.Connection,
+        WatchTerminalMutationContext,
+        asyncpg.Record | None,
+    ],
+    Awaitable[tuple[WatchMutationAction, UUID | None] | None],
 ]
 
 
@@ -2072,6 +2097,107 @@ class InventoryStore:
                     predecessor_retired_at=retired_at,
                 )
 
+    async def start_controller_epoch_recovery(
+        self,
+        broken_scope_epoch_id: UUID,
+        *,
+        scope: InventoryScopeIdentity,
+        transport: TransportNonceClaim,
+    ) -> RecoveryEpochHandle:
+        """Fence a restarted remote controller behind a fresh recovery LIST.
+
+        A new collector process cannot prove what happened between the old
+        process's last committed cursor and its first observation.  Record that
+        uncertainty on the predecessor and create a non-authoritative successor
+        atomically; only the successor's complete LIST can restore coverage.
+        """
+
+        new_epoch_id = uuid4()
+        async with self._pool.acquire() as conn:
+            async with conn.transaction():
+                current = await conn.fetchval(
+                    "SELECT leader_generation FROM infra_metering_control "
+                    "WHERE singleton = TRUE FOR SHARE"
+                )
+                generation = int(current or 0)
+                if generation <= 0:
+                    raise InventoryFenceError("no active metering generation")
+                old = await conn.fetchrow(_EPOCH_SQL, broken_scope_epoch_id)
+                if old is None or old["retired_at"] is not None:
+                    raise InventoryFenceError("controller scope epoch is not active")
+                self._assert_scope(old, scope)
+                await self._claim_transport_nonce(
+                    conn,
+                    transport,
+                    scope_epoch_id=broken_scope_epoch_id,
+                    leader_generation=generation,
+                    request_kind="controller-epoch-change",
+                    collector_id=str(old["collector_id"]),
+                )
+                received_at = await conn.fetchval("SELECT statement_timestamp()")
+                gap_start = next(
+                    (
+                        value
+                        for value in (
+                            old["complete_through"],
+                            old["last_complete_at"],
+                            old["continuous_since"],
+                        )
+                        if value is not None
+                    ),
+                    received_at,
+                )
+                if gap_start > received_at:
+                    gap_start = received_at
+                await conn.execute(
+                    "INSERT INTO resource_inventory_coverage_gaps ("
+                    "scope_epoch_id, gap_start, reason, resolution_details) "
+                    "VALUES ($1, $2, $3, $4::jsonb)",
+                    broken_scope_epoch_id,
+                    gap_start,
+                    _CONTROLLER_EPOCH_GAP_REASON,
+                    _canonical_json({"code": _CONTROLLER_EPOCH_GAP_REASON}),
+                )
+                retired = await conn.fetchval(
+                    "UPDATE resource_inventory_scope_epochs SET "
+                    "retired_at=$2, leader_generation=$3, "
+                    "continuity_health='gap', backend_health='degraded', "
+                    "sanitized_error=$4::jsonb, "
+                    "updated_at=statement_timestamp() "
+                    "WHERE id=$1 AND retired_at IS NULL RETURNING TRUE",
+                    broken_scope_epoch_id,
+                    received_at,
+                    generation,
+                    _canonical_json({"code": _CONTROLLER_EPOCH_GAP_REASON}),
+                )
+                if not retired:
+                    raise InventoryConflictError(
+                        "controller scope epoch lost its active transition"
+                    )
+                await conn.execute(
+                    "INSERT INTO resource_inventory_scope_epochs ("
+                    "id, scope_id, epoch_number, coverage_mode, capture_epoch, "
+                    "leader_generation, recovery_from_epoch_id, "
+                    "require_after_recovery) VALUES ("
+                    "$1, $2, $3, $4, $5, $6, $7, $8)",
+                    new_epoch_id,
+                    old["scope_id"],
+                    int(old["epoch_number"]) + 1,
+                    old["coverage_mode"],
+                    old["capture_epoch"],
+                    generation,
+                    broken_scope_epoch_id,
+                    bool(old["required_for_rollup"]),
+                )
+                return RecoveryEpochHandle(
+                    scope_epoch_id=new_epoch_id,
+                    recovery_from_epoch_id=broken_scope_epoch_id,
+                    inventory_scope_id=old["scope_id"],
+                    epoch_number=int(old["epoch_number"]) + 1,
+                    leader_generation=generation,
+                    predecessor_retired_at=received_at,
+                )
+
     async def begin_snapshot(
         self,
         token: str,
@@ -2970,7 +3096,10 @@ class InventoryStore:
                         "continuity_health=CASE WHEN EXISTS ("
                         "SELECT 1 FROM resource_inventory_coverage_gaps gap "
                         "WHERE gap.scope_epoch_id=$9 "
-                        "AND gap.resolution='unresolved') THEN 'gap' "
+                        "AND gap.resolution='unresolved' "
+                        "AND gap.reason NOT LIKE "
+                        "'compute-authority-awaiting-confirmation:%') "
+                        "THEN 'gap' "
                         "ELSE 'healthy' END, item_health=$7, "
                         "backend_health='healthy', consecutive_failures=0, "
                         "last_item_count=$8, sanitized_error=NULL, "
@@ -3175,6 +3304,8 @@ class InventoryStore:
         transport: TransportNonceClaim,
         interval_mutator: WatchIntervalMutator | None = None,
         deletion_mutator: WatchDeletionMutator | None = None,
+        terminal_mutator: WatchTerminalMutator | None = None,
+        reconcile_intervals: bool = True,
     ) -> WatchCommitResult:
         """Atomically apply one object/BOOKMARK and CAS the opaque cursor."""
         if not _HASH_RE.fullmatch(request_digest):
@@ -3217,6 +3348,19 @@ class InventoryStore:
                         expected_resource_version=expected_resource_version,
                         event=event,
                     )
+                    if not reconcile_intervals and (
+                        stored["affected_interval_id"] is not None
+                        or WatchMutationAction(str(stored["mutation_action"]))
+                        in {
+                            WatchMutationAction.OPEN,
+                            WatchMutationAction.CONFIRM,
+                            WatchMutationAction.REVISE,
+                            WatchMutationAction.CLOSE,
+                        }
+                    ):
+                        raise InventoryConflictError(
+                            "inventory-only watch replay contains an interval mutation"
+                        )
                     return self._watch_result(session, stored, replayed=True)
                 if session["consumed_at"] is not None:
                     raise InventoryTicketError("inventory watch session is consumed")
@@ -3244,6 +3388,10 @@ class InventoryStore:
                         source_kind,
                         source_uid,
                     )
+                    if not reconcile_intervals and interval is not None:
+                        raise InventoryConflictError(
+                            "inventory-only watch scope has an open interval"
+                        )
 
                 affected_interval_id: UUID | None = None
                 if event.event_type is WatchEventKind.BOOKMARK:
@@ -3262,24 +3410,75 @@ class InventoryStore:
                             source_kind=str(source_kind),
                             source_uid=str(source_uid),
                         )
-                        action, affected_interval_id = await deletion_mutator(
+                        deletion_result = await deletion_mutator(
                             conn,
                             deletion_context,
                             interval,
                         )
-                        if action not in {
-                            WatchMutationAction.CLOSE,
-                            WatchMutationAction.ALREADY_ABSENT,
-                        }:
-                            raise InventoryContractError(
-                                "watch deletion mutator returned an invalid action"
+                        if deletion_result is None:
+                            (
+                                action,
+                                affected_interval_id,
+                            ) = await self._close_watch_interval(
+                                conn,
+                                interval,
+                                received_at,
+                                terminal=False,
                             )
-                        if affected_interval_id is not None and not isinstance(
-                            affected_interval_id, UUID
-                        ):
-                            raise InventoryContractError(
-                                "watch deletion mutator returned an invalid interval"
+                        else:
+                            action, affected_interval_id = deletion_result
+                            if action not in {
+                                WatchMutationAction.CLOSE,
+                                WatchMutationAction.ALREADY_ABSENT,
+                            }:
+                                raise InventoryContractError(
+                                    "watch deletion mutator returned an invalid action"
+                                )
+                            if affected_interval_id is not None and not isinstance(
+                                affected_interval_id, UUID
+                            ):
+                                raise InventoryContractError(
+                                    "watch deletion mutator returned an invalid interval"
+                                )
+                    elif event.terminal and terminal_mutator is not None:
+                        terminal_result = await terminal_mutator(
+                            conn,
+                            WatchTerminalMutationContext(
+                                scope_epoch_id=session["scope_epoch_id"],
+                                inventory_scope_id=epoch["scope_id"],
+                                source_cluster=str(epoch["source_cluster"]),
+                                namespace=epoch["namespace"],
+                                received_at=received_at,
+                                source_kind=str(source_kind),
+                                source_uid=str(source_uid),
+                            ),
+                            interval,
+                        )
+                        if terminal_result is None:
+                            (
+                                action,
+                                affected_interval_id,
+                            ) = await self._close_watch_interval(
+                                conn,
+                                interval,
+                                received_at,
+                                terminal=True,
                             )
+                        else:
+                            action, affected_interval_id = terminal_result
+                            if action not in {
+                                WatchMutationAction.CLOSE,
+                                WatchMutationAction.ALREADY_ABSENT,
+                            }:
+                                raise InventoryContractError(
+                                    "watch terminal mutator returned an invalid action"
+                                )
+                            if affected_interval_id is not None and not isinstance(
+                                affected_interval_id, UUID
+                            ):
+                                raise InventoryContractError(
+                                    "watch terminal mutator returned an invalid interval"
+                                )
                     else:
                         action, affected_interval_id = await self._close_watch_interval(
                             conn,
@@ -3338,6 +3537,10 @@ class InventoryStore:
                         affected_interval_id = await interval_mutator(
                             conn, context, event.item
                         )
+                        if not reconcile_intervals and affected_interval_id is not None:
+                            raise InventoryConflictError(
+                                "inventory-only watch mutator returned an interval"
+                            )
                         if affected_interval_id is None:
                             still_open = await conn.fetchval(
                                 "SELECT TRUE FROM resource_intervals "
@@ -3383,6 +3586,30 @@ class InventoryStore:
                                 action = WatchMutationAction.CONFIRM
                             else:
                                 action = WatchMutationAction.REVISE
+
+                if not reconcile_intervals:
+                    if affected_interval_id is not None or action in {
+                        WatchMutationAction.OPEN,
+                        WatchMutationAction.CONFIRM,
+                        WatchMutationAction.REVISE,
+                        WatchMutationAction.CLOSE,
+                    }:
+                        raise InventoryConflictError(
+                            "inventory-only watch attempted an interval mutation"
+                        )
+                    if source_kind is not None and source_uid is not None:
+                        leaked_interval = await conn.fetchval(
+                            "SELECT TRUE FROM resource_intervals "
+                            "WHERE inventory_scope_id=$1 AND source_kind=$2 "
+                            "AND source_uid=$3 AND ended_at IS NULL",
+                            epoch["scope_id"],
+                            source_kind,
+                            source_uid,
+                        )
+                        if leaked_interval:
+                            raise InventoryConflictError(
+                                "inventory-only watch created an interval"
+                            )
 
                 item = event.item
                 ordinal = int(session["committed_events"]) + 1
@@ -3773,6 +4000,8 @@ __all__ = [
     "WatchMutationAction",
     "WatchObjectEvent",
     "WatchSessionGrant",
+    "WatchTerminalMutationContext",
+    "WatchTerminalMutator",
     "canonical_request_digest",
     "inventory_manifest_digest",
 ]

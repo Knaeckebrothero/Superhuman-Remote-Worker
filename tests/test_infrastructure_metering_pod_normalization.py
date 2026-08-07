@@ -283,6 +283,9 @@ def test_projection_keeps_only_allowlisted_metadata_and_request_evidence() -> No
             "annotations": {"private": "annotation-secret"},
             "labels": {
                 "srw/job-id": "job-42",
+                "srw.io/thread-id": "11111111-2222-3333-4444-555555555555",
+                "srw/purpose": "session",
+                "srw/managed-by": "agent-provisioner",
                 "app.kubernetes.io/name": "worker",
                 "private-token": "label-secret",
             },
@@ -318,7 +321,10 @@ def test_projection_keeps_only_allowlisted_metadata_and_request_evidence() -> No
 
     assert result.labels == {
         "app.kubernetes.io/name": "worker",
+        "srw.io/thread-id": "11111111-2222-3333-4444-555555555555",
         "srw/job-id": "job-42",
+        "srw/managed-by": "agent-provisioner",
+        "srw/purpose": "session",
     }
     assert result.owner_references[0].to_dict() == {
         "kind": "ReplicaSet",

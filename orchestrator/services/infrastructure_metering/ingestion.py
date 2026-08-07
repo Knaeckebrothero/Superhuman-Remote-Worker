@@ -12,17 +12,23 @@ from dataclasses import replace
 from datetime import timedelta
 import logging
 import re
-from typing import Any, Literal, TypeVar, cast
+from typing import Any, Literal, Mapping, TypeVar, cast
 import asyncpg
 from pydantic import BaseModel
 from starlette.requests import Request
 
 from .config import InfrastructureMeteringSettings
+from .agent_intervals import AgentPodIntervalReconciler, classify_product_pod
+from .compute_activation import (
+    ComputeActivation,
+    confirm_compute_authority_snapshot,
+)
 from .ingestion_http import (
     AuthenticatedIngestionModel,
     IngestionRequestError,
     authenticate_ingestion_model,
 )
+from .ide_intervals import IdePodIntervalReconciler
 from .ingestion_types import (
     InventoryItemWire,
     InventoryScopeWire,
@@ -40,6 +46,7 @@ from .ingestion_types import (
     validate_normalized_pod_payload,
     validate_normalized_pvc_payload,
     validate_normalized_pv_payload,
+    validate_normalized_vmi_payload,
 )
 from .inventory import (
     InventoryConflictError,
@@ -59,6 +66,8 @@ from .inventory import (
 )
 from .pod_intervals import PodIntervalReconciler
 from .storage_intervals import StorageIntervalReconciler
+from .transport import COLLECTOR_HEADER
+from .vmi_intervals import VMIIntervalReconciler
 
 
 _SAFE_ERROR_CODE = re.compile(r"^[a-z][a-z0-9-]{0,63}$")
@@ -72,6 +81,9 @@ _MAX_CLEANUP_PASSES = 10
 _POD_API_RESOURCE = "core/v1/pods"
 _PVC_API_RESOURCE = "core/v1/persistentvolumeclaims"
 _PV_API_RESOURCE = "core/v1/persistentvolumes"
+_VMI_API_RESOURCE = "kubevirt.io/v1/virtualmachineinstances"
+_VM_COLLECTOR_ID = "kubevirt-vmis"
+_VM_STORAGE_COLLECTOR_ID = "kubevirt-storage"
 
 IngestionOperation = Literal[
     "ticket",
@@ -94,6 +106,8 @@ class InfrastructureIngestionService:
         *,
         ingestion_key: str | bytes,
         collector_id: str = "kubernetes-pods",
+        additional_ingestion_keys: Mapping[str, str | bytes] | None = None,
+        compute_activation_overrides: Mapping[str, ComputeActivation] | None = None,
     ) -> None:
         settings.validate()
         if not settings.collector_enabled:
@@ -105,17 +119,121 @@ class InfrastructureIngestionService:
         )
         if len(key) < 32:
             raise ValueError("infrastructure metering ingestion key must be 32+ bytes")
+        ingestion_keys = {collector_id: key}
+        for additional_id, additional_key in (additional_ingestion_keys or {}).items():
+            if (
+                not isinstance(additional_id, str)
+                or not additional_id
+                or len(additional_id) > 128
+                or additional_id in ingestion_keys
+            ):
+                raise ValueError("additional metering collector id is invalid")
+            encoded = (
+                additional_key.encode()
+                if isinstance(additional_key, str)
+                else bytes(additional_key)
+            )
+            if len(encoded) < 32:
+                raise ValueError(
+                    "infrastructure metering ingestion key must be 32+ bytes"
+                )
+            if encoded in ingestion_keys.values():
+                raise ValueError("metering collector keys must be distinct")
+            ingestion_keys[additional_id] = encoded
         self._pool = pool
         self.store = store
         self.settings = settings
-        self._ingestion_key = key
+        self._ingestion_keys = ingestion_keys
         self._collector_id = collector_id
+        activation_overrides = dict(compute_activation_overrides or {})
+        if set(activation_overrides) - {
+            "agent_pod",
+            "ide_workspace_pod",
+            "workspace_vm",
+        } or any(
+            activation.activation_key != key
+            for key, activation in activation_overrides.items()
+        ):
+            raise ValueError("compute activation override identity is invalid")
         self._pod_reconciler = PodIntervalReconciler(
             shadow_enabled=settings.shadow_enabled
+        )
+        self._agent_pod_reconciler = AgentPodIntervalReconciler(
+            shadow_enabled=settings.agent_pod_shadow_enabled,
+            activation=activation_overrides.get("agent_pod"),
+        )
+        self._ide_pod_reconciler = IdePodIntervalReconciler(
+            shadow_enabled=settings.ide_pod_shadow_enabled,
+            activation=activation_overrides.get("ide_workspace_pod"),
+        )
+        self._vmi_reconciler = VMIIntervalReconciler(
+            shadow_enabled=settings.vm_shadow_enabled,
+            activation=activation_overrides.get("workspace_vm"),
+            max_lifecycle_clock_skew=getattr(
+                store,
+                "max_collector_clock_skew",
+                timedelta(minutes=5),
+            ),
         )
         self._storage_reconciler = StorageIntervalReconciler(
             shadow_enabled=(settings.pvc_shadow_enabled or settings.pv_shadow_enabled)
         )
+        self._vm_storage_reconciler = StorageIntervalReconciler(
+            shadow_enabled=(
+                settings.vm_pvc_shadow_enabled or settings.vm_pv_shadow_enabled
+            ),
+        )
+
+    async def _apply_pod_snapshot(self, conn: Any, context: Any, item: Any) -> Any:
+        classification = classify_product_pod(item)
+        if classification.is_agent:
+            return await self._agent_pod_reconciler.apply_snapshot(conn, context, item)
+        if classification.activation_key == "ide_workspace_pod":
+            return await self._ide_pod_reconciler.apply_snapshot(conn, context, item)
+        return await self._pod_reconciler.apply_snapshot(conn, context, item)
+
+    async def _observe_pod_snapshot(self, conn: Any, context: Any, item: Any) -> None:
+        # The Slice 1 comparison remains one-per-Pod and authoritative for the
+        # existing workspace cutover. Slice 3 writes its independent per-class
+        # proof beside it without changing that legacy count contract.
+        await self._pod_reconciler.observe_snapshot(conn, context, item)
+        if self.settings.agent_pod_shadow_enabled:
+            await self._agent_pod_reconciler.observe_snapshot(conn, context, item)
+        if self.settings.ide_pod_shadow_enabled:
+            await self._ide_pod_reconciler.observe_snapshot(conn, context, item)
+
+    async def _complete_pod_snapshot(self, conn: Any, context: Any) -> None:
+        keys: list[str] = []
+        if self.settings.agent_pod_shadow_enabled:
+            keys.append("agent_pod")
+        if self.settings.ide_pod_shadow_enabled:
+            keys.append("ide_workspace_pod")
+        await confirm_compute_authority_snapshot(
+            conn,
+            activation_keys=tuple(keys),
+            snapshot_id=context.snapshot_id,
+            scope_epoch_id=context.scope_epoch_id,
+            inventory_scope_id=context.inventory_scope_id,
+            received_at=context.received_at,
+        )
+
+    async def _complete_vmi_snapshot(self, conn: Any, context: Any) -> None:
+        await confirm_compute_authority_snapshot(
+            conn,
+            activation_keys=("workspace_vm",),
+            snapshot_id=context.snapshot_id,
+            scope_epoch_id=context.scope_epoch_id,
+            inventory_scope_id=context.inventory_scope_id,
+            received_at=context.received_at,
+        )
+
+    async def _apply_pod_watch(self, conn: Any, context: Any, item: Any) -> Any:
+        classification = classify_product_pod(item)
+        if classification.is_agent:
+            return await self._agent_pod_reconciler.apply_watch(conn, context, item)
+        if classification.activation_key == "ide_workspace_pod":
+            return await self._ide_pod_reconciler.apply_watch(conn, context, item)
+        return await self._pod_reconciler.apply_watch(conn, context, item)
 
     async def _authenticated(
         self,
@@ -125,14 +243,18 @@ class InfrastructureIngestionService:
         request_kind: str,
         maximum_bytes: int,
     ) -> tuple[_M, AuthenticatedIngestionModel]:
+        claimed_collector_id = request.headers.get(COLLECTOR_HEADER, "").strip()
+        key = self._ingestion_keys.get(claimed_collector_id)
+        if key is None:
+            raise IngestionRequestError(401, "invalid collector authentication")
         authenticated = await authenticate_ingestion_model(
             request,
-            key=self._ingestion_key,
+            key=key,
             model_type=model_type,
             request_kind=request_kind,
             maximum_bytes=maximum_bytes,
         )
-        if authenticated.collector_id != self._collector_id:
+        if authenticated.collector_id not in self._ingestion_keys:
             raise IngestionRequestError(401, "invalid collector authentication")
         return cast(_M, authenticated.model), authenticated
 
@@ -140,7 +262,11 @@ class InfrastructureIngestionService:
         self, wire: InventoryScopeWire, collector_id: str
     ) -> InventoryScopeIdentity:
         allowed = False
-        if wire.source_cluster == self.settings.stable_cluster_id:
+        primary_collector_id = getattr(self, "_collector_id", "kubernetes-pods")
+        if (
+            collector_id == primary_collector_id
+            and wire.source_cluster == self.settings.stable_cluster_id
+        ):
             if wire.api_resource == _POD_API_RESOURCE:
                 allowed = (
                     not wire.cluster_scoped
@@ -158,6 +284,33 @@ class InfrastructureIngestionService:
                     and wire.cluster_scoped
                     and wire.namespace is None
                 )
+        elif (
+            collector_id == _VM_COLLECTOR_ID
+            and self.settings.vm_inventory_enabled
+            and wire.source_cluster == self.settings.vm_stable_cluster_id
+        ):
+            allowed = (
+                wire.api_resource == _VMI_API_RESOURCE
+                and not wire.cluster_scoped
+                and wire.namespace == self.settings.vm_namespace
+            )
+        elif (
+            collector_id == _VM_STORAGE_COLLECTOR_ID
+            and wire.source_cluster == self.settings.vm_stable_cluster_id
+        ):
+            if wire.api_resource == _PVC_API_RESOURCE:
+                allowed = (
+                    self.settings.vm_pvc_inventory_enabled
+                    and not wire.cluster_scoped
+                    and wire.namespace == self.settings.vm_namespace
+                )
+            elif wire.api_resource == _PV_API_RESOURCE:
+                allowed = (
+                    self.settings.vm_pv_inventory_enabled
+                    and self.settings.vm_pv_cluster_wide_rbac_acknowledged
+                    and wire.cluster_scoped
+                    and wire.namespace is None
+                )
         if not allowed:
             raise IngestionRequestError(403, "collector scope is not allowed")
         return InventoryScopeIdentity(
@@ -171,10 +324,32 @@ class InfrastructureIngestionService:
         if scope.api_resource == _POD_API_RESOURCE:
             return self.settings.shadow_enabled
         if scope.api_resource == _PVC_API_RESOURCE:
+            if scope.collector_id == _VM_STORAGE_COLLECTOR_ID:
+                return self.settings.vm_pvc_shadow_enabled
             return self.settings.pvc_shadow_enabled
         if scope.api_resource == _PV_API_RESOURCE:
+            if scope.collector_id == _VM_STORAGE_COLLECTOR_ID:
+                return self.settings.vm_pv_shadow_enabled
             return self.settings.pv_shadow_enabled
+        if scope.api_resource == _VMI_API_RESOURCE:
+            return self.settings.vm_shadow_enabled
         return False
+
+    def _storage_reconciler_for_scope(
+        self, scope: InventoryScopeIdentity
+    ) -> StorageIntervalReconciler:
+        if scope.collector_id == _VM_STORAGE_COLLECTOR_ID:
+            return self._vm_storage_reconciler
+        return self._storage_reconciler
+
+    @staticmethod
+    def _scope_interval_mutations_enabled(scope: InventoryScopeIdentity) -> bool:
+        # Every storage authority passes through the database-owned per-source
+        # activation guard. A remote source in disabled/shadow state returns no
+        # interval mutation; it can never inherit another cluster's active
+        # basis. Keeping reconciliation enabled here is necessary for the same
+        # code path to begin lifecycle accrual after its own scheduled boundary.
+        return True
 
     async def _ensure_scope_epoch(
         self, scope: InventoryScopeIdentity
@@ -280,6 +455,9 @@ class InfrastructureIngestionService:
             elif item.scope.api_resource == _PV_API_RESOURCE:
                 validate_normalized_pv_payload(normalized)
                 expected_kind = "volume"
+            elif item.scope.api_resource == _VMI_API_RESOURCE:
+                validate_normalized_vmi_payload(normalized)
+                expected_kind = "vmi"
             else:
                 raise ValueError("unsupported inventory API resource")
         except ValueError as exc:
@@ -371,6 +549,22 @@ class InfrastructureIngestionService:
             # retry obtains a fresh signature and binds its ticket to the new
             # epoch without conflating both side effects.
             raise IngestionRequestError(409, "inventory recovery started; retry")
+        is_vm_scope = scope.api_resource == _VMI_API_RESOURCE
+        if is_vm_scope != (model.controller_epoch is not None):
+            raise IngestionRequestError(
+                400, "collector controller identity does not match its scope"
+            )
+        if is_vm_scope and epoch["controller_epoch"] is not None:
+            if model.controller_epoch != epoch["controller_epoch"]:
+                recovery_claim = replace(claim, request_kind="controller-epoch-change")
+                await self.store.start_controller_epoch_recovery(
+                    epoch["id"], scope=scope, transport=recovery_claim
+                )
+                raise IngestionRequestError(
+                    409, "collector controller recovery started; retry"
+                )
+            if model.sequence is None or model.sequence <= epoch["last_sequence"]:
+                raise IngestionRequestError(409, "collector sequence is stale")
         grant = await self.store.issue_ingest_ticket(
             epoch["id"],
             canonical_request_digest(authenticated.body),
@@ -468,16 +662,37 @@ class InfrastructureIngestionService:
         absence_mutator = None
         if scope_shadow_enabled:
             if scope.api_resource == _POD_API_RESOURCE:
-                interval_mutator = self._pod_reconciler.apply_snapshot
-                observation_hook = self._pod_reconciler.observe_snapshot
+                if (
+                    self.settings.agent_pod_shadow_enabled
+                    or self.settings.ide_pod_shadow_enabled
+                ):
+                    interval_mutator = self._apply_pod_snapshot
+                    observation_hook = self._observe_pod_snapshot
+                    completion_hook = self._complete_pod_snapshot
+                    if self.settings.agent_pod_shadow_enabled:
+                        absence_mutator = self._agent_pod_reconciler.apply_absence
+                else:
+                    interval_mutator = self._pod_reconciler.apply_snapshot
+                    observation_hook = self._pod_reconciler.observe_snapshot
             elif scope.api_resource == _PVC_API_RESOURCE:
-                interval_mutator = self._storage_reconciler.apply_snapshot
-                observation_hook = self._storage_reconciler.observe_snapshot
+                storage_reconciler = self._storage_reconciler_for_scope(scope)
+                observation_hook = storage_reconciler.observe_snapshot
+                if self._scope_interval_mutations_enabled(scope):
+                    interval_mutator = storage_reconciler.apply_snapshot
             elif scope.api_resource == _PV_API_RESOURCE:
-                interval_mutator = self._storage_reconciler.apply_snapshot
-                observation_hook = self._storage_reconciler.observe_snapshot
-                completion_hook = self._storage_reconciler.complete_snapshot
-                absence_mutator = self._storage_reconciler.apply_absence
+                storage_reconciler = self._storage_reconciler_for_scope(scope)
+                observation_hook = storage_reconciler.observe_snapshot
+                completion_hook = storage_reconciler.complete_snapshot
+                if self._scope_interval_mutations_enabled(scope):
+                    interval_mutator = storage_reconciler.apply_snapshot
+                    absence_mutator = storage_reconciler.apply_absence
+            elif scope.api_resource == _VMI_API_RESOURCE:
+                interval_mutator = self._vmi_reconciler.apply_snapshot
+                observation_hook = self._vmi_reconciler.observe_snapshot
+                completion_hook = self._complete_vmi_snapshot
+        require_legacy_shadow_comparison = (
+            scope_shadow_enabled and scope.api_resource != _VMI_API_RESOURCE
+        )
         result = await self.store.finalize_snapshot(
             model.ticket_token,
             model.ticket_id,
@@ -489,8 +704,10 @@ class InfrastructureIngestionService:
             observation_hook=observation_hook,
             completion_hook=completion_hook,
             absence_mutator=absence_mutator,
-            require_shadow_comparison=scope_shadow_enabled,
-            reconcile_intervals=scope_shadow_enabled,
+            require_shadow_comparison=require_legacy_shadow_comparison,
+            reconcile_intervals=(
+                scope_shadow_enabled and self._scope_interval_mutations_enabled(scope)
+            ),
         )
         return {
             "snapshot_id": str(result.snapshot_id),
@@ -552,16 +769,34 @@ class InfrastructureIngestionService:
                 else False
             ),
         )
-        interval_mutator = (
-            self._pod_reconciler.apply_watch
-            if scope.api_resource == _POD_API_RESOURCE
-            else self._storage_reconciler.apply_watch
-        )
-        deletion_mutator = (
-            self._storage_reconciler.apply_deletion
-            if scope.api_resource == _PV_API_RESOURCE
-            else None
-        )
+        if scope.api_resource == _POD_API_RESOURCE:
+            interval_mutator = (
+                self._apply_pod_watch
+                if (
+                    self.settings.agent_pod_shadow_enabled
+                    or self.settings.ide_pod_shadow_enabled
+                )
+                else self._pod_reconciler.apply_watch
+            )
+        elif scope.api_resource in {_PVC_API_RESOURCE, _PV_API_RESOURCE}:
+            storage_reconciler = self._storage_reconciler_for_scope(scope)
+            interval_mutator = storage_reconciler.apply_watch
+        elif scope.api_resource == _VMI_API_RESOURCE:
+            interval_mutator = self._vmi_reconciler.apply_watch
+        else:
+            raise IngestionRequestError(
+                409, "inventory lifecycle adapter is unavailable"
+            )
+        deletion_mutator = None
+        terminal_mutator = None
+        if (
+            scope.api_resource == _POD_API_RESOURCE
+            and self.settings.agent_pod_shadow_enabled
+        ):
+            deletion_mutator = self._agent_pod_reconciler.apply_deletion
+            terminal_mutator = self._agent_pod_reconciler.apply_terminal
+        elif scope.api_resource == _PV_API_RESOURCE:
+            deletion_mutator = storage_reconciler.apply_deletion
         result = await self.store.apply_watch_event(
             model.ticket_token,
             model.ticket_id,
@@ -573,6 +808,8 @@ class InfrastructureIngestionService:
             transport=authenticated.transport_claim,
             interval_mutator=interval_mutator,
             deletion_mutator=deletion_mutator,
+            terminal_mutator=terminal_mutator,
+            reconcile_intervals=self._scope_interval_mutations_enabled(scope),
         )
         return {
             "event_id": str(result.event_id),

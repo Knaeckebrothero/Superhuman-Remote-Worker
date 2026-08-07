@@ -179,6 +179,29 @@
         "pvShadowEnabled": { "type": "boolean" },
         "pvcPublicationEnabled": { "type": "boolean" },
         "pvPublicationEnabled": { "type": "boolean" },
+        "idePodShadowEnabled": { "type": "boolean" },
+        "agentPodShadowEnabled": { "type": "boolean" },
+        "idePodPublicationEnabled": { "type": "boolean" },
+        "agentPodPublicationEnabled": { "type": "boolean" },
+        "vmInventoryEnabled": { "type": "boolean" },
+        "vmShadowEnabled": { "type": "boolean" },
+        "vmPublicationEnabled": { "type": "boolean" },
+        "vmPvcInventoryEnabled": { "type": "boolean" },
+        "vmPvInventoryEnabled": { "type": "boolean" },
+        "vmPvcShadowEnabled": { "type": "boolean" },
+        "vmPvShadowEnabled": { "type": "boolean" },
+        "vmPvcPublicationEnabled": { "type": "boolean" },
+        "vmPvPublicationEnabled": { "type": "boolean" },
+        "vmPvClusterWideRbacAcknowledged": { "type": "boolean" },
+        "vmStableClusterId": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^$|^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+        },
+        "vmNamespace": {
+          "type": "string",
+          "pattern": "^$|^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$"
+        },
         "deploymentMode": {
           "type": "string",
           "enum": ["dedicated", "in-process"]
@@ -193,6 +216,7 @@
         },
         "relistIntervalSeconds": { "type": "integer", "minimum": 15, "maximum": 86400 },
         "staleAfterSeconds": { "type": "integer", "minimum": 30, "maximum": 604800 },
+        "maxCollectorClockSkewSeconds": { "type": "integer", "minimum": 1, "maximum": 3600 },
         "listPageSize": { "type": "integer", "minimum": 1, "maximum": 5000 },
         "scopeConcurrency": { "type": "integer", "minimum": 1, "maximum": 32 },
         "watchQueueSize": { "type": "integer", "minimum": 100, "maximum": 1000000 },
@@ -204,6 +228,24 @@
         "cleanupIntervalSeconds": { "type": "integer", "minimum": 30, "maximum": 3600 },
         "ingestionSecretName": { "type": "string" },
         "ingestionSecretKey": { "type": "string", "minLength": 1 },
+        "vmIngestionSecretName": { "type": "string" },
+        "vmIngestionSecretKey": { "type": "string", "minLength": 1 },
+        "vmStorageIngestionSecretName": { "type": "string" },
+        "vmStorageIngestionSecretKey": { "type": "string", "minLength": 1 },
+        "vmLifecycleAuthSecretName": { "type": "string" },
+        "vmLifecycleAuthSecretKey": { "type": "string", "minLength": 1 },
+        "remoteIngress": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "sourceCidrs": {
+              "type": "array",
+              "items": { "type": "string", "minLength": 1 },
+              "uniqueItems": true
+            }
+          },
+          "additionalProperties": false
+        },
         "volumeIdentitySecretName": { "type": "string" },
         "volumeIdentitySecretKey": { "type": "string", "minLength": 1 },
         "volumeIdentityKeyVersion": {
@@ -669,7 +711,9 @@
       "type": "object",
       "properties": {
         "enabled": { "type": "boolean" },
-        "transport": { "type": "string", "enum": ["http", "nats", "both"] }
+        "transport": { "type": "string", "enum": ["http", "nats", "both"] },
+        "lifecycleAuthSecretName": { "type": "string" },
+        "lifecycleAuthSecretKey": { "type": "string", "minLength": 1 }
       }
     },
     "garage": {

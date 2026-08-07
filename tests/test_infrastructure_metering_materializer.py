@@ -23,6 +23,8 @@ from orchestrator.services.infrastructure_metering.materializer import (
     PublicationContractError,
     PublicationDisabledError,
     PublicationFenceError,
+    StoragePublicationAuthority,
+    StoragePublicationPolicy,
     build_correction_plan,
     build_late_usage_plan,
     build_usage_plan,
@@ -44,6 +46,10 @@ OWNER_ID = UUID("30000000-0000-0000-0000-000000000003")
 USER_ID = UUID("40000000-0000-0000-0000-000000000004")
 PROJECT_ID = UUID("50000000-0000-0000-0000-000000000005")
 PLAN_ID = UUID("60000000-0000-0000-0000-000000000006")
+LOCAL_STORAGE_SCOPE_ID = UUID("70000000-0000-0000-0000-000000000007")
+REMOTE_STORAGE_SCOPE_ID = UUID("80000000-0000-0000-0000-000000000008")
+COMPUTE_SCOPE_ID = UUID("90000000-0000-0000-0000-000000000009")
+COMPUTE_EPOCH_ID = UUID("a0000000-0000-0000-0000-00000000000a")
 
 
 def _interval(**overrides: Any) -> dict[str, Any]:
@@ -114,6 +120,146 @@ def _plan(**kwargs: Any):
     )
     assert plan is not None
     return plan
+
+
+def _compute_interval(activation_key: str) -> dict[str, Any]:
+    if activation_key == "agent_pod":
+        return _interval(
+            inventory_scope_id=COMPUTE_SCOPE_ID,
+            compute_scope_epoch_id=COMPUTE_EPOCH_ID,
+            resource="agent_pod",
+            details={"product_class": "dynamic-agent"},
+        )
+    if activation_key == "ide_workspace_pod":
+        return _interval(
+            inventory_scope_id=COMPUTE_SCOPE_ID,
+            compute_scope_epoch_id=COMPUTE_EPOCH_ID,
+            details={"product_class": "ide-session"},
+        )
+    if activation_key == "workspace_vm":
+        return _interval(
+            inventory_scope_id=COMPUTE_SCOPE_ID,
+            compute_scope_epoch_id=COMPUTE_EPOCH_ID,
+            source_kind="vmi",
+            resource="workspace_vm",
+            measurement_basis="guest-provisioned",
+            resource_class="virtual-machine",
+            capacity_source="vmi-guest-provisioned",
+            details={"product_class": "workspace-vm"},
+        )
+    raise AssertionError(activation_key)
+
+
+def _compute_activation_row(
+    activation_key: str,
+    *,
+    state: str = "active",
+    activated_at: datetime | None = None,
+    database_time: datetime | None = None,
+) -> dict[str, Any]:
+    return {
+        "activation_key": activation_key,
+        "state": state,
+        "activated_at": (
+            START - timedelta(days=1)
+            if state == "active" and activated_at is None
+            else activated_at
+        ),
+        "database_time": (
+            START + timedelta(days=1)
+            if state == "active" and database_time is None
+            else database_time
+        ),
+    }
+
+
+def _compute_exact_epoch_row() -> dict[str, Any]:
+    return {
+        "effective_from": START - timedelta(days=1),
+        "inventory_scope_epoch_id": COMPUTE_EPOCH_ID,
+        "retired_at": None,
+    }
+
+
+def _storage_interval(
+    *,
+    remote: bool = False,
+    measurement_basis: str = "claim-requested",
+    resource: str | None = None,
+) -> dict[str, Any]:
+    is_claim = measurement_basis == "claim-requested"
+    selected_resource = resource
+    if selected_resource is None:
+        if is_claim:
+            selected_resource = "vm_rootdisk_claim" if remote else "workspace_pvc"
+        else:
+            selected_resource = "unmapped_block_volume"
+    return _interval(
+        inventory_scope_id=(
+            REMOTE_STORAGE_SCOPE_ID if remote else LOCAL_STORAGE_SCOPE_ID
+        ),
+        source_cluster="vm-dev" if remote else "main-dev",
+        source_kind="pvc" if is_claim else "volume",
+        source_uid="pvc-uid-1" if is_claim else "volume-digest-1",
+        category="storage",
+        resource=selected_resource,
+        measurement_basis=measurement_basis,
+        cost_domain="workload-allocation" if is_claim else "physical-asset",
+        resource_class=("persistent-volume-claim" if is_claim else "persistent-volume"),
+        cpu_millicores=None,
+        memory_bytes=None,
+        storage_bytes=20 * 1024**3,
+        capacity_source=(
+            "pvc-requested-storage" if is_claim else "pv-provisioned-capacity"
+        ),
+        measurement_algorithm=(
+            "kubernetes-pvc-request-v1" if is_claim else "kubernetes-pv-capacity-v1"
+        ),
+    )
+
+
+def _storage_authority(
+    *,
+    remote: bool = False,
+    measurement_basis: str = "claim-requested",
+) -> StoragePublicationAuthority:
+    return StoragePublicationAuthority(
+        measurement_basis=measurement_basis,
+        collector_id="kubevirt-storage" if remote else "kubernetes-pods",
+        source_cluster="vm-dev" if remote else "main-dev",
+    )
+
+
+def _storage_source_fence(
+    *,
+    remote: bool = False,
+    measurement_basis: str = "claim-requested",
+    requirement_role: str = "quantity",
+    source_state: str = "active",
+    global_state: str = "active",
+    source_activated_at: datetime | None = None,
+    global_activated_at: datetime | None = None,
+    database_time: datetime | None = None,
+) -> dict[str, Any]:
+    return {
+        "collector_id": "kubevirt-storage" if remote else "kubernetes-pods",
+        "source_cluster": "vm-dev" if remote else "main-dev",
+        "requirement_role": requirement_role,
+        "source_state": source_state,
+        "source_activated_at": (
+            START - timedelta(days=1)
+            if source_state == "active" and source_activated_at is None
+            else source_activated_at
+        ),
+        "global_state": global_state,
+        "global_activated_at": (
+            START - timedelta(days=2)
+            if global_state == "active" and global_activated_at is None
+            else global_activated_at
+        ),
+        "database_time": database_time or START + timedelta(days=1),
+        "measurement_basis": measurement_basis,
+    }
 
 
 def test_compute_plan_splits_at_utc_midnight_and_multiplies_capacity() -> None:
@@ -856,6 +1002,12 @@ class _PlanningConnection:
             }
         if "infra-publication:lock-interval" in sql:
             return copy.deepcopy(self.pool.interval)
+        if "infra-publication:compute-activation-fence" in sql:
+            return copy.deepcopy(self.pool.compute_activations.get(str(args[0])))
+        if "infra-publication:storage-source-fence" in sql:
+            return copy.deepcopy(
+                self.pool.storage_source_fences.get((args[0], str(args[1])))
+            )
         if "infra-publication:correction-original" in sql:
             source, source_id, unit, ts, row_hash = args
             for event in self.pool.original_plan.events:
@@ -1018,6 +1170,8 @@ class _PlanningPool:
         self.coverage_sequence = 0
         self.unknown_ranges: list[dict[str, Any]] = []
         self.next_correction_revision = 1
+        self.compute_activations: dict[str, dict[str, Any]] = {}
+        self.storage_source_fences: dict[tuple[UUID, str], dict[str, Any]] = {}
         self.candidate_args: tuple[Any, ...] | None = None
         self.rate_args: tuple[Any, ...] | None = None
         self.inserted_plan: tuple[Any, ...] | None = None
@@ -1035,6 +1189,317 @@ class _PlanningPool:
 
 
 @pytest.mark.asyncio
+async def test_manual_freeze_cannot_bypass_ide_subtype_gate() -> None:
+    interval = _compute_interval("ide_workspace_pod")
+    plan = build_usage_plan(interval, (), creator_generation=7)
+    assert plan is not None
+    app = _PlanningPool()
+    app.interval = interval
+    app.compute_activations["ide_workspace_pod"] = _compute_activation_row(
+        "ide_workspace_pod"
+    )
+    materializer = InfrastructureUsageMaterializer(
+        app,
+        UsageLedger(_AuditPool(), UsageRates(None)),  # type: ignore[arg-type]
+        publication_enabled=True,
+        ide_workspace_pod_enabled=False,
+    )  # type: ignore[arg-type]
+
+    with pytest.raises(PublicationDisabledError, match="IDE workspace Pod"):
+        await materializer.freeze_plan(plan, 7)
+
+    assert app.inserted_plan is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("activation_key", ["agent_pod", "workspace_vm"])
+async def test_manual_freeze_cannot_bypass_compute_class_gate(
+    activation_key: str,
+) -> None:
+    interval = _compute_interval(activation_key)
+    plan = build_usage_plan(interval, (), creator_generation=7)
+    assert plan is not None
+    app = _PlanningPool()
+    app.interval = interval
+    app.compute_activations[activation_key] = _compute_activation_row(activation_key)
+    materializer = InfrastructureUsageMaterializer(
+        app,
+        UsageLedger(_AuditPool(), UsageRates(None)),  # type: ignore[arg-type]
+        publication_enabled=True,
+    )  # type: ignore[arg-type]
+
+    with pytest.raises(PublicationDisabledError, match="source interval.*gate"):
+        await materializer.freeze_plan(plan, 7)
+
+    assert app.inserted_plan is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("overrides", "enabled_resources", "expected"),
+    [
+        (
+            {"resource": "agent_pod", "rate_usd": None},
+            ("workspace_pod",),
+            "publication event resource 'agent_pod'",
+        ),
+        (
+            {"resource": "workspace_vm", "rate_usd": None},
+            ("workspace_pod",),
+            "publication event resource 'workspace_vm'",
+        ),
+        (
+            {"details": {"product_class": "ide-session"}},
+            ("workspace_pod",),
+            "publication event IDE workspace Pod",
+        ),
+    ],
+)
+async def test_reviewed_correction_target_cannot_bypass_compute_class_gate(
+    overrides: dict[str, Any],
+    enabled_resources: tuple[str, ...],
+    expected: str,
+) -> None:
+    original = _plan().events[0]
+    changes_rate_selector = "resource" in overrides
+    correction = build_correction_plan(
+        _interval(),
+        (
+            CorrectionDelta(
+                original=original,
+                quantity=original.event.payload["quantity"],
+                payload_overrides=overrides,
+                inherit_rate=not changes_rate_selector,
+            ),
+        ),
+        correction_reason="reviewed class repair",
+        correction_actor_id=USER_ID,
+        creator_generation=7,
+        plan_revision=1,
+    )
+    app = _PlanningPool()
+    materializer = InfrastructureUsageMaterializer(
+        app,
+        UsageLedger(_AuditPool(), UsageRates(None)),  # type: ignore[arg-type]
+        publication_enabled=True,
+        enabled_resources=enabled_resources,
+    )  # type: ignore[arg-type]
+
+    with pytest.raises(PublicationDisabledError, match=expected):
+        await materializer.freeze_plan(correction, 7)
+
+    assert app.inserted_plan is None
+
+
+def test_storage_candidate_selector_requires_exact_active_quantity_source() -> None:
+    sql = materializer_sql._candidate_intervals_sql(storage_policy_enabled=True)
+    legacy_sql = materializer_sql._candidate_intervals_sql(storage_policy_enabled=False)
+
+    assert "storage_metering_source_requirements" in sql
+    assert "storage_metering_source_activations" in sql
+    assert "requirement_role = 'quantity'" in sql
+    assert "storage_source_activation.state = 'active'" in sql
+    assert "storage_global_activation.state = 'active'" in sql
+    assert "unnest($5::text[], $6::text[], $7::text[])" in sql
+    assert "storage_scope.id = interval.inventory_scope_id" in sql
+    assert "storage_scope.source_cluster = interval.source_cluster" in sql
+    assert "storage_metering_source_requirements" not in legacy_sql
+    assert "storage_metering_source_activations" not in legacy_sql
+    assert "interval.measurement_basis NOT IN" in legacy_sql
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("interval_remote", "policy_remote"),
+    [(True, False), (False, True)],
+)
+async def test_storage_gate_for_one_source_cannot_authorize_the_other(
+    interval_remote: bool,
+    policy_remote: bool,
+) -> None:
+    interval = _storage_interval(remote=interval_remote)
+    plan = build_usage_plan(interval, (), creator_generation=7)
+    assert plan is not None
+    app = _PlanningPool()
+    app.interval = interval
+    app.storage_source_fences[(interval["inventory_scope_id"], "claim-requested")] = (
+        _storage_source_fence(remote=interval_remote)
+    )
+    materializer = InfrastructureUsageMaterializer(
+        app,
+        UsageLedger(_AuditPool(), UsageRates(None)),  # type: ignore[arg-type]
+        publication_enabled=True,
+        enabled_resources=("workspace_pod", interval["resource"]),
+        storage_publication_policy=StoragePublicationPolicy(
+            (_storage_authority(remote=policy_remote),)
+        ),
+    )  # type: ignore[arg-type]
+
+    with pytest.raises(
+        PublicationDisabledError,
+        match="storage source publication gate is disabled",
+    ):
+        await materializer.freeze_plan(plan, 7)
+
+    assert app.inserted_plan is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("remote", [False, True])
+async def test_exact_active_storage_source_can_freeze_and_select_candidates(
+    remote: bool,
+) -> None:
+    interval = _storage_interval(remote=remote)
+    app = _PlanningPool()
+    app.interval = interval
+    app.storage_source_fences[(interval["inventory_scope_id"], "claim-requested")] = (
+        _storage_source_fence(remote=remote)
+    )
+    authority = _storage_authority(remote=remote)
+    materializer = InfrastructureUsageMaterializer(
+        app,
+        UsageLedger(_AuditPool(), UsageRates(None)),  # type: ignore[arg-type]
+        publication_enabled=True,
+        batch_size=3,
+        enabled_resources=("workspace_pod", interval["resource"]),
+        storage_publication_policy=StoragePublicationPolicy((authority,)),
+    )  # type: ignore[arg-type]
+
+    plans = await materializer.plan_batch(7)
+
+    assert len(plans) == 1
+    assert app.candidate_args == (
+        ["workspace_pod", interval["resource"]],
+        START,
+        3,
+        False,
+        ["claim-requested"],
+        [authority.collector_id],
+        [authority.source_cluster],
+    )
+    assert app.inserted_plan is not None
+
+
+@pytest.mark.asyncio
+async def test_storage_plan_cannot_predate_effective_source_boundary() -> None:
+    interval = _storage_interval()
+    plan = build_usage_plan(interval, (), creator_generation=7)
+    assert plan is not None
+    app = _PlanningPool()
+    app.interval = interval
+    app.storage_source_fences[(LOCAL_STORAGE_SCOPE_ID, "claim-requested")] = (
+        _storage_source_fence(source_activated_at=START + timedelta(minutes=1))
+    )
+    materializer = InfrastructureUsageMaterializer(
+        app,
+        UsageLedger(_AuditPool(), UsageRates(None)),  # type: ignore[arg-type]
+        publication_enabled=True,
+        enabled_resources=("workspace_pod", "workspace_pvc"),
+        storage_publication_policy=StoragePublicationPolicy((_storage_authority(),)),
+    )  # type: ignore[arg-type]
+
+    with pytest.raises(PublicationDisabledError, match="predates.*activation"):
+        await materializer.freeze_plan(plan, 7)
+
+    assert app.inserted_plan is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("fence", "expected"),
+    [
+        (None, "lacks an exact quantity activation requirement"),
+        (
+            _storage_source_fence(requirement_role="attribution"),
+            "activation is not active",
+        ),
+        (
+            _storage_source_fence(source_state="shadow"),
+            "activation is not active",
+        ),
+        (
+            _storage_source_fence(remote=True),
+            "does not match its inventory authority",
+        ),
+    ],
+)
+async def test_storage_freeze_rejects_missing_or_wrong_source_activation(
+    fence: dict[str, Any] | None,
+    expected: str,
+) -> None:
+    interval = _storage_interval()
+    plan = build_usage_plan(interval, (), creator_generation=7)
+    assert plan is not None
+    app = _PlanningPool()
+    app.interval = interval
+    if fence is not None:
+        app.storage_source_fences[(LOCAL_STORAGE_SCOPE_ID, "claim-requested")] = fence
+    materializer = InfrastructureUsageMaterializer(
+        app,
+        UsageLedger(_AuditPool(), UsageRates(None)),  # type: ignore[arg-type]
+        publication_enabled=True,
+        enabled_resources=("workspace_pod", "workspace_pvc"),
+        storage_publication_policy=StoragePublicationPolicy((_storage_authority(),)),
+    )  # type: ignore[arg-type]
+
+    with pytest.raises(PublicationDisabledError, match=expected):
+        await materializer.freeze_plan(plan, 7)
+
+    assert app.inserted_plan is None
+
+
+@pytest.mark.asyncio
+async def test_storage_correction_resource_override_cannot_evade_source_gate() -> None:
+    interval = _storage_interval()
+    original_plan = build_usage_plan(interval, (), creator_generation=7)
+    assert original_plan is not None
+    correction = build_correction_plan(
+        interval,
+        (
+            CorrectionDelta(
+                original=original_plan.events[0],
+                quantity=original_plan.events[0].event.payload["quantity"],
+                payload_overrides={
+                    "resource": "vm_rootdisk_claim",
+                    "rate_usd": None,
+                },
+                inherit_rate=False,
+            ),
+        ),
+        correction_reason="reviewed root-disk classification",
+        correction_actor_id=USER_ID,
+        creator_generation=7,
+        plan_revision=1,
+    )
+    app = _PlanningPool()
+    app.interval = interval
+    app.storage_source_fences[(LOCAL_STORAGE_SCOPE_ID, "claim-requested")] = (
+        _storage_source_fence()
+    )
+    materializer = InfrastructureUsageMaterializer(
+        app,
+        UsageLedger(_AuditPool(), UsageRates(None)),  # type: ignore[arg-type]
+        publication_enabled=True,
+        enabled_resources=(
+            "workspace_pod",
+            "workspace_pvc",
+            "vm_rootdisk_claim",
+        ),
+        storage_publication_policy=StoragePublicationPolicy(
+            (_storage_authority(remote=True),)
+        ),
+    )  # type: ignore[arg-type]
+
+    with pytest.raises(
+        PublicationDisabledError,
+        match="storage source publication gate is disabled",
+    ):
+        await materializer.freeze_plan(correction, 7)
+
+    assert app.inserted_plan is None
+
+
+@pytest.mark.asyncio
 async def test_plan_batch_freezes_app_manifest_without_audit_io() -> None:
     app = _PlanningPool()
     audit = _AuditPool()
@@ -1046,7 +1511,7 @@ async def test_plan_batch_freezes_app_manifest_without_audit_io() -> None:
     plans = await materializer.plan_batch(7)
 
     assert len(plans) == 1
-    assert app.candidate_args == (["workspace_pod"], START, 17)
+    assert app.candidate_args == (["workspace_pod"], START, 17, False)
     assert app.rate_args is not None
     assert app.rate_args[5] == ["vcpu-hour", "gib-hour"]
     assert app.inserted_plan is not None
@@ -1740,6 +2205,13 @@ async def test_create_correction_idempotency_replays_exact_frozen_intent() -> No
         correction_actor_id=USER_ID,
         correction_id=correction_id,
     )
+    writes_before_replay = (
+        app.plan_insert_calls,
+        copy.deepcopy(app.inserted_plan),
+        copy.deepcopy(app.inserted_events),
+        audit.insert_calls,
+        copy.deepcopy(audit.rows),
+    )
     replay = await materializer.create_correction(
         7,
         (request,),
@@ -1751,6 +2223,13 @@ async def test_create_correction_idempotency_replays_exact_frozen_intent() -> No
     assert replay.id == first.id == correction_id
     assert replay.event_set_hash == first.event_set_hash
     assert app.plan_insert_calls == 1
+    assert (
+        app.plan_insert_calls,
+        app.inserted_plan,
+        app.inserted_events,
+        audit.insert_calls,
+        audit.rows,
+    ) == writes_before_replay
 
     with pytest.raises(PublicationConflictError, match="changed immutable intent"):
         await materializer.create_correction(
@@ -1823,6 +2302,12 @@ class _AppConnection:
     async def fetch(self, sql: str, *args: Any):
         if "infra-publication:plan-events" in sql:
             return copy.deepcopy(self.pool.events)
+        if "infra-publication:compute-epoch-set-lock" in sql:
+            return [
+                {"activation_key": key, "id": COMPUTE_EPOCH_ID}
+                for key in args[0]
+                if (key, COMPUTE_SCOPE_ID) in self.pool.compute_exact_epochs
+            ]
         raise AssertionError(f"unexpected app fetch: {sql}")
 
     async def fetchrow(self, sql: str, *args: Any):
@@ -1837,6 +2322,25 @@ class _AppConnection:
                 copy.deepcopy(self.pool.plan)
                 if self.pool.plan["state"] == "planned"
                 else None
+            )
+        if "infra-publication:publication-interval-fence" in sql:
+            if args != (
+                self.pool.plan["source_interval_id"],
+                self.pool.plan["source_revision"],
+            ):
+                return None
+            return copy.deepcopy(self.pool.interval)
+        if "infra-publication:compute-activation-fence" in sql:
+            return copy.deepcopy(self.pool.compute_activations.get(str(args[0])))
+        if "infra-publication:compute-exact-epoch-fence" in sql:
+            if args[2] != COMPUTE_EPOCH_ID:
+                return None
+            return copy.deepcopy(
+                self.pool.compute_exact_epochs.get((str(args[0]), args[1]))
+            )
+        if "infra-publication:storage-source-fence" in sql:
+            return copy.deepcopy(
+                self.pool.storage_source_fences.get((args[0], str(args[1])))
             )
         if "infra-publication:lock-plan" in sql:
             return {"state": self.pool.plan["state"]}
@@ -1881,15 +2385,171 @@ class _AppConnection:
 
 
 class _AppPool:
-    def __init__(self, plan: Any):
+    def __init__(self, plan: Any, *, interval: dict[str, Any] | None = None):
         self.plan = _plan_row(plan)
         self.events = _event_rows(plan)
+        self.interval = copy.deepcopy(interval or _interval())
         self.cursor = plan.previous_materialized_through
         self.generation = 7
         self.cutover_state = "active"
+        self.compute_activations: dict[str, dict[str, Any]] = {}
+        self.compute_exact_epochs: dict[tuple[str, UUID], dict[str, Any]] = {}
+        resource = self.interval.get("resource")
+        details = self.interval.get("details") or {}
+        activation_key = (
+            "agent_pod"
+            if resource == "agent_pod"
+            else "workspace_vm"
+            if resource == "workspace_vm"
+            else "ide_workspace_pod"
+            if resource == "workspace_pod"
+            and isinstance(details, dict)
+            and details.get("product_class") == "ide-session"
+            else None
+        )
+        if activation_key is not None:
+            self.compute_exact_epochs[(activation_key, COMPUTE_SCOPE_ID)] = (
+                _compute_exact_epoch_row()
+            )
+        self.storage_source_fences: dict[tuple[UUID, str], dict[str, Any]] = {}
 
     def acquire(self):
         return _Acquire(_AppConnection(self))
+
+
+@pytest.mark.asyncio
+async def test_pending_ide_plan_rechecks_subtype_gate_before_audit() -> None:
+    interval = _compute_interval("ide_workspace_pod")
+    plan = build_usage_plan(interval, (), creator_generation=7)
+    assert plan is not None
+    app = _AppPool(plan, interval=interval)
+    app.compute_activations["ide_workspace_pod"] = _compute_activation_row(
+        "ide_workspace_pod"
+    )
+    audit = _AuditPool()
+    materializer = InfrastructureUsageMaterializer(
+        app,
+        UsageLedger(audit, UsageRates(None)),  # type: ignore[arg-type]
+        publication_enabled=True,
+        ide_workspace_pod_enabled=False,
+    )  # type: ignore[arg-type]
+
+    with pytest.raises(PublicationDisabledError, match="IDE workspace Pod"):
+        await materializer.publish_one(7)
+
+    assert audit.insert_calls == 0
+    assert app.plan["state"] == "planned"
+
+
+@pytest.mark.asyncio
+async def test_pending_storage_plan_rechecks_exact_source_before_audit() -> None:
+    interval = _storage_interval(remote=True)
+    plan = build_usage_plan(interval, (), creator_generation=7)
+    assert plan is not None
+    app = _AppPool(plan, interval=interval)
+    app.storage_source_fences[(REMOTE_STORAGE_SCOPE_ID, "claim-requested")] = (
+        _storage_source_fence(remote=True)
+    )
+    audit = _AuditPool()
+    materializer = InfrastructureUsageMaterializer(
+        app,
+        UsageLedger(audit, UsageRates(None)),  # type: ignore[arg-type]
+        publication_enabled=True,
+        enabled_resources=("workspace_pod", "vm_rootdisk_claim"),
+        storage_publication_policy=StoragePublicationPolicy(
+            (_storage_authority(remote=False),)
+        ),
+    )  # type: ignore[arg-type]
+
+    with pytest.raises(
+        PublicationDisabledError,
+        match="storage source publication gate is disabled",
+    ):
+        await materializer.publish_one(7)
+
+    assert audit.insert_calls == 0
+    assert app.plan["state"] == "planned"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("activation_key", "resource"),
+    [
+        ("agent_pod", "agent_pod"),
+        ("workspace_vm", "workspace_vm"),
+    ],
+)
+async def test_pending_compute_plan_requires_class_gate_and_effective_activation(
+    activation_key: str,
+    resource: str,
+) -> None:
+    interval = _compute_interval(activation_key)
+    plan = build_usage_plan(interval, (), creator_generation=7)
+    assert plan is not None
+
+    gated_app = _AppPool(plan, interval=interval)
+    gated_app.compute_activations[activation_key] = _compute_activation_row(
+        activation_key
+    )
+    gated_audit = _AuditPool()
+    gated = InfrastructureUsageMaterializer(
+        gated_app,
+        UsageLedger(gated_audit, UsageRates(None)),  # type: ignore[arg-type]
+        publication_enabled=True,
+    )  # type: ignore[arg-type]
+    with pytest.raises(PublicationDisabledError, match="publication gate"):
+        await gated.publish_one(7)
+    assert gated_audit.insert_calls == 0
+
+    shadow_app = _AppPool(plan, interval=interval)
+    shadow_app.compute_activations[activation_key] = _compute_activation_row(
+        activation_key,
+        state="shadow",
+    )
+    shadow_audit = _AuditPool()
+    shadow = InfrastructureUsageMaterializer(
+        shadow_app,
+        UsageLedger(shadow_audit, UsageRates(None)),  # type: ignore[arg-type]
+        publication_enabled=True,
+        enabled_resources=("workspace_pod", resource),
+    )  # type: ignore[arg-type]
+    with pytest.raises(PublicationDisabledError, match="activation is not active"):
+        await shadow.publish_one(7)
+    assert shadow_audit.insert_calls == 0
+
+    future_app = _AppPool(plan, interval=interval)
+    future_app.compute_activations[activation_key] = _compute_activation_row(
+        activation_key,
+        activated_at=START + timedelta(minutes=1),
+    )
+    future_audit = _AuditPool()
+    future = InfrastructureUsageMaterializer(
+        future_app,
+        UsageLedger(future_audit, UsageRates(None)),  # type: ignore[arg-type]
+        publication_enabled=True,
+        enabled_resources=("workspace_pod", resource),
+    )  # type: ignore[arg-type]
+    with pytest.raises(PublicationDisabledError, match="predates activation"):
+        await future.publish_one(7)
+    assert future_audit.insert_calls == 0
+
+    active_app = _AppPool(plan, interval=interval)
+    active_app.compute_activations[activation_key] = _compute_activation_row(
+        activation_key
+    )
+    active_audit = _AuditPool()
+    active = InfrastructureUsageMaterializer(
+        active_app,
+        UsageLedger(active_audit, UsageRates(None)),  # type: ignore[arg-type]
+        publication_enabled=True,
+        enabled_resources=("workspace_pod", resource),
+    )  # type: ignore[arg-type]
+
+    result = await active.publish_one(7)
+
+    assert result is not None
+    assert active_audit.insert_calls == 1
+    assert active_app.plan["state"] == "published"
 
 
 @pytest.mark.asyncio

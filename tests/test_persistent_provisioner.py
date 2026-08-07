@@ -298,6 +298,21 @@ class TestPodManifest:
         assert "--port 8001" in cmd
         assert "--host 0.0.0.0" in cmd
 
+    def test_pod_uid_uses_downward_api(self):
+        manifest = self._build()
+        env = manifest["spec"]["containers"][0]["env"]
+
+        pod_uid = next(item for item in env if item["name"] == "POD_UID")
+        assert pod_uid == {
+            "name": "POD_UID",
+            "valueFrom": {
+                "fieldRef": {
+                    "apiVersion": "v1",
+                    "fieldPath": "metadata.uid",
+                }
+            },
+        }
+
     def test_env_from_configmap_and_secret(self):
         m = self._build()
         env_from = m["spec"]["containers"][0]["envFrom"]

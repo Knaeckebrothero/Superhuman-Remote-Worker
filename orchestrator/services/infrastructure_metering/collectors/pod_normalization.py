@@ -36,8 +36,11 @@ ALLOWED_POD_LABELS = frozenset(
     {
         "srw/job-id",
         "srw/thread-id",
+        "srw.io/thread-id",
         "srw/component",
         "srw.io/component",
+        "srw/purpose",
+        "srw/managed-by",
         "app",
         "app.kubernetes.io/name",
         "app.kubernetes.io/instance",

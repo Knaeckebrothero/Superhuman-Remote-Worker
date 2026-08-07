@@ -381,8 +381,8 @@ class InventorySnapshot:
     fatal_errors: tuple[InventoryError, ...] = ()
     item_errors: tuple[InventoryError, ...] = ()
     source_snapshot_at: datetime | None = None
-    controller_epoch: None = None
-    sequence: None = None
+    controller_epoch: str | None = None
+    sequence: int | None = None
 
     def __post_init__(self) -> None:
         _required_text(self.collector_id, "collector_id", maximum=128)
@@ -400,6 +400,20 @@ class InventorySnapshot:
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise ValueError(f"{name} must be a non-negative integer")
+        if (self.controller_epoch is None) != (self.sequence is None):
+            raise ValueError("controller_epoch and sequence must be supplied together")
+        if self.controller_epoch is not None:
+            _required_text(
+                self.controller_epoch,
+                "controller_epoch",
+                maximum=256,
+            )
+            if (
+                isinstance(self.sequence, bool)
+                or not isinstance(self.sequence, int)
+                or self.sequence < 0
+            ):
+                raise ValueError("sequence must be a non-negative integer")
         object.__setattr__(self, "fatal_errors", tuple(self.fatal_errors))
         object.__setattr__(self, "item_errors", tuple(self.item_errors))
         if self.complete:
@@ -447,8 +461,8 @@ class InventorySnapshot:
             "complete": self.complete,
             "snapshot_id": str(self.snapshot_id),
             "leader_generation": self.leader_generation,
-            "controller_epoch": None,
-            "sequence": None,
+            "controller_epoch": self.controller_epoch,
+            "sequence": self.sequence,
             "resource_version": self.resource_version,
             "item_count": self.item_count,
             "item_digest": self.item_digest,

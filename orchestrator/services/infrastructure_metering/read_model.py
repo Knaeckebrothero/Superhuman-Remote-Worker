@@ -29,6 +29,9 @@ from .materializer import (
     CapacityDimension,
     FrozenPublicationPlan,
     PublicationContractError,
+    StorageCoverageRequirement,
+    StoragePublicationAuthority,
+    StoragePublicationPolicy,
     capacity_dimensions,
     capacity_quantity,
 )
@@ -49,6 +52,8 @@ _INFRA_SOURCES = (
 _DEFAULT_ENABLED_RESOURCES = ("workspace_pod",)
 _RESOURCE_API_RESOURCES = {
     "workspace_pod": frozenset({"core/v1/pods"}),
+    "agent_pod": frozenset({"core/v1/pods"}),
+    "workspace_vm": frozenset({"kubevirt.io/v1/virtualmachineinstances"}),
     "workspace_pvc": frozenset({"core/v1/persistentvolumeclaims"}),
     "session_workspace_pvc": frozenset({"core/v1/persistentvolumeclaims"}),
     "session_agent_pvc": frozenset({"core/v1/persistentvolumeclaims"}),
@@ -60,6 +65,16 @@ _RESOURCE_API_RESOURCES = {
     "unmapped_block_volume": frozenset({"core/v1/persistentvolumes"}),
 }
 _MAPPED_VOLUME_RESOURCE_RE = re.compile(r"^block_volume_[a-z0-9_]+$")
+_STORAGE_BASIS_BY_API_RESOURCE = {
+    "core/v1/persistentvolumeclaims": "claim-requested",
+    "core/v1/persistentvolumes": "volume-provisioned",
+}
+_COMPUTE_API_RESOURCE = {
+    "agent_pod": "core/v1/pods",
+    "ide_workspace_pod": "core/v1/pods",
+    "workspace_vm": "kubevirt.io/v1/virtualmachineinstances",
+}
+_COMPUTE_AUTHORITY_GAP_PREFIX = "compute-authority-awaiting-confirmation:"
 
 
 def _resource_api_resources(resource: str) -> frozenset[str] | None:
@@ -68,6 +83,62 @@ def _resource_api_resources(resource: str) -> frozenset[str] | None:
         return mapped
     if _MAPPED_VOLUME_RESOURCE_RE.fullmatch(resource):
         return frozenset({"core/v1/persistentvolumes"})
+    return None
+
+
+def _storage_authority_from_scope(
+    row: Mapping[str, Any],
+    *,
+    basis_field: str = "measurement_basis",
+    measurement_basis: str | None = None,
+) -> StoragePublicationAuthority | None:
+    basis = str(measurement_basis or row.get(basis_field) or "")
+    if basis not in _STORAGE_BASIS_BY_API_RESOURCE.values():
+        return None
+    collector_id = row.get("inventory_collector_id", row.get("collector_id"))
+    source_cluster = row.get(
+        "inventory_source_cluster",
+        row.get("source_cluster"),
+    )
+    if not isinstance(collector_id, str) or not isinstance(source_cluster, str):
+        return None
+    try:
+        return StoragePublicationAuthority(
+            measurement_basis=basis,
+            collector_id=collector_id,
+            source_cluster=source_cluster,
+        )
+    except PublicationContractError:
+        return None
+
+
+def _compute_activation_key_from_interval(row: Mapping[str, Any]) -> str | None:
+    if (
+        row.get("source_kind") == "pod"
+        and row.get("category") == "compute"
+        and row.get("resource") == "agent_pod"
+    ):
+        return "agent_pod"
+    details = row.get("details")
+    if isinstance(details, str):
+        try:
+            details = json.loads(details)
+        except json.JSONDecodeError:
+            details = None
+    if (
+        row.get("source_kind") == "pod"
+        and row.get("category") == "compute"
+        and row.get("resource") == "workspace_pod"
+        and isinstance(details, Mapping)
+        and details.get("product_class") == "ide-session"
+    ):
+        return "ide_workspace_pod"
+    if (
+        row.get("source_kind") == "vmi"
+        and row.get("category") == "compute"
+        and row.get("resource") == "workspace_vm"
+    ):
+        return "workspace_vm"
     return None
 
 
@@ -171,8 +242,10 @@ class AppUsageReadSnapshot:
     plans: tuple[FrozenPublicationPlan, ...]
     rate_rows: tuple[Mapping[str, Any], ...]
     epochs: tuple[Mapping[str, Any], ...]
+    storage_requirements: tuple[Mapping[str, Any], ...]
     gaps: tuple[Mapping[str, Any], ...]
     day_states: tuple[Mapping[str, Any], ...]
+    compute_requirements: tuple[Mapping[str, Any], ...] = ()
 
     @property
     def rolled_cutoff(self) -> datetime | None:
@@ -220,9 +293,31 @@ ORDER BY category, measurement_basis, resource_class, resource, unit,
 
 _INTERVALS_SQL = """
 /* infra-read:intervals */
-SELECT interval.*
+SELECT interval.*,
+       source_scope.collector_id AS inventory_collector_id,
+       source_scope.source_cluster AS inventory_source_cluster,
+       source_scope.namespace AS inventory_namespace
 FROM resource_intervals AS interval
+LEFT JOIN resource_inventory_scopes AS source_scope
+  ON source_scope.id = interval.inventory_scope_id
 WHERE interval.resource = ANY($3::text[])
+  {product_class}
+  AND (
+      interval.measurement_basis NOT IN (
+          'claim-requested', 'volume-provisioned'
+      )
+      OR EXISTS (
+          SELECT 1
+          FROM unnest($4::text[], $5::text[], $6::text[])
+               AS storage_policy(
+                   measurement_basis, collector_id, source_cluster
+               )
+          WHERE storage_policy.measurement_basis = interval.measurement_basis
+            AND storage_policy.collector_id = source_scope.collector_id
+            AND storage_policy.source_cluster = source_scope.source_cluster
+            AND source_scope.source_cluster = interval.source_cluster
+      )
+  )
   AND tstzrange(interval.started_at, interval.ended_at, '[)')
       && tstzrange($1, $2, '[)')
   AND COALESCE(interval.ended_at, interval.last_confirmed_at) > $1
@@ -232,10 +327,34 @@ ORDER BY interval.started_at, interval.id
 
 _PLAN_HEADERS_SQL = """
 /* infra-read:plan-headers */
-SELECT plan.*
+SELECT plan.*,
+       interval.measurement_basis AS source_measurement_basis,
+       interval.source_cluster AS interval_source_cluster,
+       source_scope.collector_id AS inventory_collector_id,
+       source_scope.source_cluster AS inventory_source_cluster,
+       source_scope.namespace AS inventory_namespace
 FROM resource_publication_plans AS plan
 JOIN resource_intervals AS interval ON interval.id = plan.source_interval_id
+LEFT JOIN resource_inventory_scopes AS source_scope
+  ON source_scope.id = interval.inventory_scope_id
 WHERE interval.resource = ANY($3::text[])
+  {product_class}
+  AND (
+      interval.measurement_basis NOT IN (
+          'claim-requested', 'volume-provisioned'
+      )
+      OR EXISTS (
+          SELECT 1
+          FROM unnest($4::text[], $5::text[], $6::text[])
+               AS storage_policy(
+                   measurement_basis, collector_id, source_cluster
+               )
+          WHERE storage_policy.measurement_basis = interval.measurement_basis
+            AND storage_policy.collector_id = source_scope.collector_id
+            AND storage_policy.source_cluster = source_scope.source_cluster
+            AND source_scope.source_cluster = interval.source_cluster
+      )
+  )
   AND plan.plan_kind IN ('usage', 'late-usage')
   AND tstzrange(plan.period_start, plan.period_end, '[)')
       && tstzrange($1, $2, '[)')
@@ -245,10 +364,34 @@ ORDER BY plan.period_start, plan.id
 
 _CORRECTION_PLAN_HEADERS_SQL = """
 /* infra-read:correction-plan-headers */
-SELECT plan.*
+SELECT plan.*,
+       interval.measurement_basis AS source_measurement_basis,
+       interval.source_cluster AS interval_source_cluster,
+       source_scope.collector_id AS inventory_collector_id,
+       source_scope.source_cluster AS inventory_source_cluster,
+       source_scope.namespace AS inventory_namespace
 FROM resource_publication_plans AS plan
 JOIN resource_intervals AS interval ON interval.id = plan.source_interval_id
+LEFT JOIN resource_inventory_scopes AS source_scope
+  ON source_scope.id = interval.inventory_scope_id
 WHERE interval.resource = ANY($3::text[])
+  {product_class}
+  AND (
+      interval.measurement_basis NOT IN (
+          'claim-requested', 'volume-provisioned'
+      )
+      OR EXISTS (
+          SELECT 1
+          FROM unnest($4::text[], $5::text[], $6::text[])
+               AS storage_policy(
+                   measurement_basis, collector_id, source_cluster
+               )
+          WHERE storage_policy.measurement_basis = interval.measurement_basis
+            AND storage_policy.collector_id = source_scope.collector_id
+            AND storage_policy.source_cluster = source_scope.source_cluster
+            AND source_scope.source_cluster = interval.source_cluster
+      )
+  )
   AND plan.plan_kind = 'correction'
   AND tstzrange(plan.period_start, plan.period_end, '[)')
       && tstzrange($1, $2, '[)')
@@ -285,7 +428,8 @@ _EPOCHS_SQL = """
 SELECT epoch.id, epoch.scope_id, epoch.required_from, epoch.retired_at,
        epoch.complete_through, epoch.snapshot_health,
        epoch.continuity_health, epoch.item_health, epoch.backend_health,
-       epoch.publication_health, scope.api_resource
+       epoch.publication_health, scope.api_resource, scope.collector_id,
+       scope.source_cluster, scope.namespace
 FROM resource_inventory_scope_epochs AS epoch
 JOIN resource_inventory_scopes AS scope ON scope.id = epoch.scope_id
 WHERE epoch.required_for_rollup = TRUE
@@ -294,9 +438,75 @@ WHERE epoch.required_for_rollup = TRUE
 ORDER BY epoch.scope_id, epoch.required_from, epoch.epoch_number
 """
 
+_COMPUTE_REQUIREMENTS_SQL = """
+/* infra-read:compute-requirements */
+SELECT activation.activation_key, activation.activated_at,
+       requirement.inventory_scope_id,
+       authority.inventory_scope_epoch_id, authority.authority_sequence,
+       authority.effective_from AS authority_effective_from,
+       epoch.retired_at, epoch.complete_through, epoch.snapshot_health,
+       epoch.continuity_health, epoch.item_health, epoch.backend_health,
+       scope.api_resource, scope.collector_id, scope.source_cluster,
+       scope.namespace
+FROM unnest($1::text[]) AS enabled(activation_key)
+JOIN compute_metering_activation AS activation
+  ON activation.activation_key = enabled.activation_key
+LEFT JOIN compute_metering_scope_requirements AS requirement
+  ON requirement.activation_key = activation.activation_key
+LEFT JOIN compute_metering_epoch_authorities AS authority
+  ON authority.activation_key = requirement.activation_key
+ AND authority.inventory_scope_id = requirement.inventory_scope_id
+LEFT JOIN resource_inventory_scope_epochs AS epoch
+  ON epoch.id = authority.inventory_scope_epoch_id
+ AND epoch.scope_id = authority.inventory_scope_id
+LEFT JOIN resource_inventory_scopes AS scope
+  ON scope.id = requirement.inventory_scope_id
+WHERE activation.state = 'active'
+  AND activation.activated_at IS NOT NULL
+  AND activation.activated_at < $2
+  AND statement_timestamp() >= activation.activated_at
+ORDER BY activation.activation_key, requirement.inventory_scope_id,
+         authority.authority_sequence
+"""
+
+_STORAGE_REQUIREMENTS_SQL = """
+/* infra-read:storage-requirements */
+SELECT requirement.measurement_basis, requirement.collector_id,
+       requirement.source_cluster, requirement.inventory_scope_id,
+       requirement.requirement_role,
+       GREATEST(
+           source_activation.activated_at,
+           global_activation.activated_at
+       ) AS effective_from
+FROM storage_metering_source_requirements AS requirement
+JOIN storage_metering_source_activations AS source_activation
+  ON source_activation.measurement_basis = requirement.measurement_basis
+ AND source_activation.collector_id = requirement.collector_id
+ AND source_activation.source_cluster = requirement.source_cluster
+JOIN storage_metering_activation AS global_activation
+  ON global_activation.measurement_basis = requirement.measurement_basis
+JOIN unnest($1::text[], $2::text[], $3::text[])
+     AS storage_policy(measurement_basis, collector_id, source_cluster)
+  ON storage_policy.measurement_basis = requirement.measurement_basis
+ AND storage_policy.collector_id = requirement.collector_id
+ AND storage_policy.source_cluster = requirement.source_cluster
+WHERE source_activation.state = 'active'
+  AND source_activation.activated_at IS NOT NULL
+  AND global_activation.state = 'active'
+  AND global_activation.activated_at IS NOT NULL
+  AND statement_timestamp() >= GREATEST(
+      source_activation.activated_at,
+      global_activation.activated_at
+  )
+ORDER BY requirement.measurement_basis, requirement.collector_id,
+         requirement.source_cluster, requirement.requirement_role,
+         requirement.inventory_scope_id
+"""
+
 _GAPS_SQL = """
 /* infra-read:gaps */
-SELECT gap.scope_epoch_id, gap.gap_start, gap.gap_end, gap.resolution
+SELECT gap.scope_epoch_id, gap.gap_start, gap.gap_end, gap.resolution,
+       gap.reason
 FROM resource_inventory_coverage_gaps AS gap
 WHERE gap.scope_epoch_id = ANY($1::uuid[])
   AND gap.resolution <> 'backfilled'
@@ -307,7 +517,8 @@ ORDER BY gap.gap_start, gap.id
 
 _STORAGE_GAPS_SQL = """
 /* infra-read:storage-gaps */
-SELECT gap.scope_epoch_id, gap.gap_start, gap.gap_end, gap.resolution
+SELECT gap.scope_epoch_id, gap.gap_start, gap.gap_end, gap.resolution,
+       gap.reason
 FROM resource_inventory_coverage_gaps AS gap
 WHERE gap.scope_epoch_id = ANY($1::uuid[])
   AND gap.resolution <> 'backfilled'
@@ -318,7 +529,8 @@ UNION ALL
 
 SELECT gap.scope_epoch_id, gap.gap_start, gap.gap_end,
        CASE WHEN gap.resolution = 'unresolved' THEN 'unresolved'
-            ELSE 'waived' END AS resolution
+            ELSE 'waived' END AS resolution,
+       NULL::text AS reason
 FROM storage_asset_coverage_gaps AS gap
 WHERE gap.scope_epoch_id = ANY($1::uuid[])
   AND gap.gap_start < $3
@@ -889,6 +1101,8 @@ class SourceAwareUsageReadModel:
         app_pool: asyncpg.Pool,
         *,
         enabled_resources: Sequence[str] = _DEFAULT_ENABLED_RESOURCES,
+        ide_workspace_pod_enabled: bool = False,
+        storage_publication_policy: StoragePublicationPolicy | None = None,
     ) -> None:
         resources = tuple(dict.fromkeys(str(item) for item in enabled_resources))
         if not resources or any(not item for item in resources):
@@ -906,6 +1120,17 @@ class SourceAwareUsageReadModel:
         self._audit = audit_pool
         self._app = app_pool
         self._enabled_resources = resources
+        self._ide_workspace_pod_enabled = bool(ide_workspace_pod_enabled)
+        if storage_publication_policy is None:
+            storage_publication_policy = StoragePublicationPolicy()
+        if not isinstance(storage_publication_policy, StoragePublicationPolicy):
+            raise ValueError(
+                "storage_publication_policy must be a StoragePublicationPolicy"
+            )
+        self._storage_publication_policy = storage_publication_policy
+        self._storage_publication_authorities = frozenset(
+            storage_publication_policy.authorities
+        )
         self._enabled_api_resources = frozenset().union(
             *(
                 _resource_api_resources(resource) or frozenset()
@@ -915,6 +1140,48 @@ class SourceAwareUsageReadModel:
         self._include_storage_asset_gaps = (
             "core/v1/persistentvolumes" in self._enabled_api_resources
         )
+
+    def _ide_interval_filter(self) -> str:
+        if self._ide_workspace_pod_enabled:
+            return ""
+        return (
+            "AND NOT (interval.resource = 'workspace_pod' "
+            "AND COALESCE(interval.details->>'product_class', '') = "
+            "'ide-session')"
+        )
+
+    def _enabled_compute_activation_keys(self) -> tuple[str, ...]:
+        keys: list[str] = []
+        if "agent_pod" in self._enabled_resources:
+            keys.append("agent_pod")
+        if (
+            "workspace_pod" in self._enabled_resources
+            and self._ide_workspace_pod_enabled
+        ):
+            keys.append("ide_workspace_pod")
+        if "workspace_vm" in self._enabled_resources:
+            keys.append("workspace_vm")
+        return tuple(keys)
+
+    def _storage_tail_row_is_authorized(
+        self,
+        row: Mapping[str, Any],
+        *,
+        basis_field: str,
+    ) -> bool:
+        basis = str(row.get(basis_field) or "")
+        if basis not in _STORAGE_BASIS_BY_API_RESOURCE.values():
+            return True
+        authority = _storage_authority_from_scope(row, basis_field=basis_field)
+        if authority is None:
+            return False
+        interval_source_cluster = row.get("interval_source_cluster")
+        if (
+            interval_source_cluster is not None
+            and interval_source_cluster != authority.source_cluster
+        ):
+            return False
+        return authority in self._storage_publication_authorities
 
     async def read_app_snapshot(
         self,
@@ -990,6 +1257,7 @@ class SourceAwareUsageReadModel:
                         tail_start,
                         to_ts,
                         list(self._enabled_resources),
+                        *self._storage_publication_policy.sql_columns(),
                     ]
                     interval_clauses: list[str] = []
                     _append_visibility(
@@ -1002,15 +1270,27 @@ class SourceAwareUsageReadModel:
                         text_ref=True,
                     )
                     interval_visibility = _visibility_fragment(interval_clauses)
-                    intervals = await conn.fetch(
-                        _INTERVALS_SQL.format(visibility=interval_visibility),
+                    fetched_intervals = await conn.fetch(
+                        _INTERVALS_SQL.format(
+                            visibility=interval_visibility,
+                            product_class=self._ide_interval_filter(),
+                        ),
                         *interval_params,
+                    )
+                    intervals = tuple(
+                        row
+                        for row in fetched_intervals
+                        if self._storage_tail_row_is_authorized(
+                            row,
+                            basis_field="measurement_basis",
+                        )
                     )
 
                     plan_params: list[Any] = [
                         tail_start,
                         to_ts,
                         list(self._enabled_resources),
+                        *self._storage_publication_policy.sql_columns(),
                     ]
                     plan_clauses: list[str] = []
                     _append_visibility(
@@ -1024,7 +1304,10 @@ class SourceAwareUsageReadModel:
                     )
                     plan_visibility = _visibility_fragment(plan_clauses)
                     plan_rows = await conn.fetch(
-                        _PLAN_HEADERS_SQL.format(visibility=plan_visibility),
+                        _PLAN_HEADERS_SQL.format(
+                            visibility=plan_visibility,
+                            product_class=self._ide_interval_filter(),
+                        ),
                         *plan_params,
                     )
 
@@ -1032,6 +1315,7 @@ class SourceAwareUsageReadModel:
                         tail_start,
                         to_ts,
                         list(self._enabled_resources),
+                        *self._storage_publication_policy.sql_columns(),
                     ]
                     correction_clauses: list[str] = []
                     _append_payload_visibility(
@@ -1043,11 +1327,19 @@ class SourceAwareUsageReadModel:
                     )
                     correction_rows = await conn.fetch(
                         _CORRECTION_PLAN_HEADERS_SQL.format(
-                            visibility=_visibility_fragment(correction_clauses)
+                            visibility=_visibility_fragment(correction_clauses),
+                            product_class=self._ide_interval_filter(),
                         ),
                         *correction_params,
                     )
-                    plan_rows = (*plan_rows, *correction_rows)
+                    plan_rows = tuple(
+                        row
+                        for row in (*plan_rows, *correction_rows)
+                        if self._storage_tail_row_is_authorized(
+                            row,
+                            basis_field="source_measurement_basis",
+                        )
+                    )
                     plan_ids = [
                         _as_uuid(str(row["id"]), "plan_id") for row in plan_rows
                     ]
@@ -1068,10 +1360,33 @@ class SourceAwareUsageReadModel:
                     rolled_cutoff or from_ts,
                 )
                 epochs: Sequence[Mapping[str, Any]] = ()
+                storage_requirements: Sequence[Mapping[str, Any]] = ()
+                compute_requirements: Sequence[Mapping[str, Any]] = ()
                 gaps: Sequence[Mapping[str, Any]] = ()
                 if coverage_start < to_ts:
                     epochs = await conn.fetch(_EPOCHS_SQL, coverage_start, to_ts)
-                    epoch_ids = [row["id"] for row in epochs]
+                    compute_keys = self._enabled_compute_activation_keys()
+                    if compute_keys:
+                        compute_requirements = await conn.fetch(
+                            _COMPUTE_REQUIREMENTS_SQL,
+                            list(compute_keys),
+                            to_ts,
+                        )
+                    if self._storage_publication_policy.authorities:
+                        storage_requirements = await conn.fetch(
+                            _STORAGE_REQUIREMENTS_SQL,
+                            *self._storage_publication_policy.sql_columns(),
+                        )
+                    epoch_ids = list(
+                        dict.fromkeys(
+                            [row["id"] for row in epochs]
+                            + [
+                                row["inventory_scope_epoch_id"]
+                                for row in compute_requirements
+                                if row.get("inventory_scope_epoch_id") is not None
+                            ]
+                        )
+                    )
                     if epoch_ids:
                         gaps = await conn.fetch(
                             (
@@ -1125,8 +1440,10 @@ class SourceAwareUsageReadModel:
             plans=tuple(plans),
             rate_rows=tuple(dict(row) for row in rate_rows),
             epochs=tuple(dict(row) for row in epochs),
+            storage_requirements=tuple(dict(row) for row in storage_requirements),
             gaps=tuple(dict(row) for row in gaps),
             day_states=tuple(dict(row) for row in day_states),
+            compute_requirements=tuple(dict(row) for row in compute_requirements),
         )
 
     async def summary(
@@ -1310,6 +1627,63 @@ class SourceAwareUsageReadModel:
         interval_by_id = {
             _as_uuid(str(row["id"]), "interval_id"): row for row in snapshot.intervals
         }
+        compute_authority_by_epoch: dict[
+            tuple[str, uuid.UUID, uuid.UUID], Mapping[str, Any]
+        ] = {}
+        for requirement in snapshot.compute_requirements:
+            raw_scope_id = requirement.get("inventory_scope_id")
+            raw_epoch_id = requirement.get("inventory_scope_epoch_id")
+            if raw_scope_id is None or raw_epoch_id is None:
+                continue
+            identity = (
+                str(requirement.get("activation_key") or ""),
+                _as_uuid(str(raw_scope_id), "compute inventory_scope_id"),
+                _as_uuid(str(raw_epoch_id), "compute inventory_scope_epoch_id"),
+            )
+            if identity in compute_authority_by_epoch:
+                raise UsageReadContractError("compute interval authority is duplicated")
+            compute_authority_by_epoch[identity] = requirement
+        compute_authority_end_by_interval: dict[uuid.UUID, datetime | None] = {}
+        for interval_id, interval in interval_by_id.items():
+            activation_key = _compute_activation_key_from_interval(interval)
+            if activation_key is None:
+                continue
+            scope_id = _as_uuid(
+                str(interval["inventory_scope_id"]),
+                "interval inventory_scope_id",
+            )
+            raw_epoch_id = interval.get("compute_scope_epoch_id")
+            if raw_epoch_id is None:
+                raise UsageReadContractError(
+                    "Slice 3 interval lacks its immutable epoch binding"
+                )
+            epoch_id = _as_uuid(
+                str(raw_epoch_id),
+                "interval compute_scope_epoch_id",
+            )
+            requirement = compute_authority_by_epoch.get(
+                (activation_key, scope_id, epoch_id)
+            )
+            if requirement is None:
+                raise UsageReadContractError(
+                    "Slice 3 interval lacks exact class epoch authority"
+                )
+            effective_boundary = max(
+                _aware_utc(requirement["activated_at"], "activated_at"),
+                _aware_utc(
+                    requirement["authority_effective_from"],
+                    "authority_effective_from",
+                ),
+            )
+            if _aware_utc(interval["started_at"], "started_at") < effective_boundary:
+                raise UsageReadContractError(
+                    "Slice 3 interval predates exact class epoch authority"
+                )
+            compute_authority_end_by_interval[interval_id] = (
+                None
+                if requirement.get("retired_at") is None
+                else _aware_utc(requirement["retired_at"], "retired_at")
+            )
         dimensions_by_interval = {
             interval_id: _interval_dimensions(row)
             for interval_id, row in interval_by_id.items()
@@ -1320,6 +1694,13 @@ class SourceAwareUsageReadModel:
         conflict_ranges: list[tuple[datetime, datetime | None]] = []
 
         for plan in snapshot.plans:
+            authority_end = compute_authority_end_by_interval.get(
+                plan.source_interval_id
+            )
+            if authority_end is not None and plan.period_end > authority_end:
+                raise UsageReadContractError(
+                    "Slice 3 publication plan exceeds exact epoch authority"
+                )
             overlap = _clip_range(
                 plan.period_start,
                 plan.period_end,
@@ -1416,6 +1797,11 @@ class SourceAwareUsageReadModel:
                 interval["materialized_through"],
                 "materialized_through",
             )
+            authority_end = compute_authority_end_by_interval.get(interval_id)
+            if authority_end is not None and materialized_through > authority_end:
+                raise UsageReadContractError(
+                    "Slice 3 interval cursor exceeds exact epoch authority"
+                )
             finalized_start = max(started_at, tail_start)
             finalized_end = min(materialized_through, to_ts)
             if finalized_start < finalized_end:
@@ -1440,6 +1826,7 @@ class SourceAwareUsageReadModel:
                 to_ts,
                 last_confirmed_at,
                 ended_at or last_confirmed_at,
+                compute_authority_end_by_interval.get(interval_id) or to_ts,
             )
             if provisional_start >= provisional_end:
                 continue
@@ -1778,9 +2165,76 @@ class SourceAwareUsageReadModel:
             coverage_start,
             rolled_boundary or coverage_start,
         )
+        epochs_by_scope: dict[uuid.UUID, list[Mapping[str, Any]]] = defaultdict(list)
+        for epoch in snapshot.epochs:
+            epochs_by_scope[_as_uuid(str(epoch["scope_id"]), "scope_id")].append(epoch)
+
+        expected_storage_authorities = set(self._storage_publication_policy.authorities)
+        storage_requirements: set[StorageCoverageRequirement] = set()
+        try:
+            for row in snapshot.storage_requirements:
+                requirement = StorageCoverageRequirement.from_mapping(row)
+                if requirement in storage_requirements:
+                    raise UsageReadContractError(
+                        "storage coverage requirement is duplicated"
+                    )
+                if requirement.authority not in expected_storage_authorities:
+                    raise UsageReadContractError(
+                        "storage coverage requirement is outside process policy"
+                    )
+                storage_requirements.add(requirement)
+        except PublicationContractError as exc:
+            raise UsageReadContractError(
+                "storage coverage requirement is invalid"
+            ) from exc
+
+        requirements_by_authority: dict[
+            StoragePublicationAuthority, list[StorageCoverageRequirement]
+        ] = defaultdict(list)
+        for requirement in storage_requirements:
+            requirements_by_authority[requirement.authority].append(requirement)
+
+        missing_storage_authorities: set[StoragePublicationAuthority] = set()
+        for authority in expected_storage_authorities:
+            authority_requirements = requirements_by_authority.get(authority, ())
+            if not authority_requirements:
+                missing_storage_authorities.add(authority)
+                continue
+            roles = {
+                requirement.requirement_role for requirement in authority_requirements
+            }
+            expected_roles = (
+                {"quantity"}
+                if authority.measurement_basis == "claim-requested"
+                else {"quantity", "attribution"}
+            )
+            if roles != expected_roles:
+                raise UsageReadContractError(
+                    "storage authority has an incomplete coverage requirement set"
+                )
+
+        active_storage_requirements = tuple(
+            requirement
+            for requirement in storage_requirements
+            if requirement.effective_from < to_ts
+        )
+        requirements_by_scope: dict[uuid.UUID, list[StorageCoverageRequirement]] = (
+            defaultdict(list)
+        )
+        for requirement in active_storage_requirements:
+            requirements_by_scope[requirement.inventory_scope_id].append(requirement)
+
+        epoch_by_id = {
+            _as_uuid(str(epoch["id"]), "scope_epoch_id"): epoch
+            for epoch in snapshot.epochs
+        }
         gaps_by_epoch: dict[uuid.UUID, list[tuple[datetime, datetime | None]]] = (
             defaultdict(list)
         )
+        compute_gaps_by_authority: dict[
+            tuple[str, uuid.UUID], list[tuple[datetime, datetime | None]]
+        ] = defaultdict(list)
+        enabled_compute_keys = frozenset(self._enabled_compute_activation_keys())
         for gap in snapshot.gaps:
             start = _aware_utc(gap["gap_start"], "gap_start")
             end = (
@@ -1788,28 +2242,216 @@ class SourceAwareUsageReadModel:
                 if gap.get("gap_end") is None
                 else _aware_utc(gap["gap_end"], "gap_end")
             )
-            clipped = _clip_range(start, end, live_start, to_ts)
+            epoch_id = _as_uuid(str(gap["scope_epoch_id"]), "scope_epoch_id")
+            reason = str(gap.get("reason") or "")
+            compute_key: str | None = None
+            if reason.startswith(_COMPUTE_AUTHORITY_GAP_PREFIX):
+                compute_key = reason.removeprefix(_COMPUTE_AUTHORITY_GAP_PREFIX)
+                if compute_key not in enabled_compute_keys:
+                    continue
+            gap_floor = live_start
+            epoch = epoch_by_id.get(epoch_id)
+            if compute_key is None and epoch is not None:
+                scope_id = _as_uuid(str(epoch["scope_id"]), "scope_id")
+                scope_requirements = requirements_by_scope.get(scope_id, ())
+                if scope_requirements:
+                    gap_floor = max(
+                        gap_floor,
+                        min(
+                            requirement.effective_from
+                            for requirement in scope_requirements
+                        ),
+                    )
+            clipped = _clip_range(start, end, gap_floor, to_ts)
             if clipped is None:
                 continue
-            epoch_id = _as_uuid(str(gap["scope_epoch_id"]), "scope_epoch_id")
-            gaps_by_epoch[epoch_id].append(clipped)
+            if compute_key is None:
+                gaps_by_epoch[epoch_id].append(clipped)
+            else:
+                compute_gaps_by_authority[(compute_key, epoch_id)].append(clipped)
             unknown.append(clipped)
-
-        epochs_by_scope: dict[uuid.UUID, list[Mapping[str, Any]]] = defaultdict(list)
-        for epoch in snapshot.epochs:
-            epochs_by_scope[_as_uuid(str(epoch["scope_id"]), "scope_id")].append(epoch)
 
         scope_through: list[datetime] = []
         ok = 0
         total = 0
-        for epochs in epochs_by_scope.values():
+
+        # Stable inventory scope IDs are shared by agent/IDE Pods. Each class
+        # owns an append-only sequence of exact epoch authorities; coverage may
+        # resume after explicit recovery promotion, but the interval between a
+        # predecessor retirement and successor effective time stays unknown.
+        compute_groups: dict[tuple[str, uuid.UUID], list[Mapping[str, Any]]] = (
+            defaultdict(list)
+        )
+        for requirement in snapshot.compute_requirements:
+            activation_key = str(requirement.get("activation_key") or "")
+            if activation_key not in _COMPUTE_API_RESOURCE:
+                raise UsageReadContractError(
+                    "compute coverage requirement has an invalid activation key"
+                )
+            raw_scope_id = requirement.get("inventory_scope_id")
+            activation_boundary = _aware_utc(
+                requirement["activated_at"],
+                f"{activation_key} activated_at",
+            )
+            if raw_scope_id is None:
+                fallback_start = max(live_start, activation_boundary)
+                total += 1
+                scope_through.append(fallback_start)
+                unknown.append((fallback_start, to_ts))
+                continue
+            scope_id = _as_uuid(str(raw_scope_id), "compute inventory_scope_id")
+            compute_groups[(activation_key, scope_id)].append(requirement)
+
+        for (activation_key, scope_id), authorities in sorted(
+            compute_groups.items(), key=lambda item: (item[0][0], str(item[0][1]))
+        ):
+            total += 1
+            expected_api_resource = _COMPUTE_API_RESOURCE[activation_key]
+            activation_boundary = _aware_utc(
+                authorities[0]["activated_at"],
+                f"{activation_key} activated_at",
+            )
+            fallback_start = max(live_start, activation_boundary)
+            scope_ok = True
+            scope_watermark = to_ts
+            coverage_cursor = fallback_start
+            seen_epochs: set[uuid.UUID] = set()
+            ordered = sorted(
+                authorities,
+                key=lambda row: int(row.get("authority_sequence") or 0),
+            )
+            for authority in ordered:
+                if (
+                    _aware_utc(
+                        authority["activated_at"],
+                        f"{activation_key} activated_at",
+                    )
+                    != activation_boundary
+                ):
+                    raise UsageReadContractError(
+                        "compute authority sequence changed activation boundary"
+                    )
+                raw_epoch_id = authority.get("inventory_scope_epoch_id")
+                raw_effective_from = authority.get("authority_effective_from")
+                if raw_epoch_id is None or raw_effective_from is None:
+                    continue
+                epoch_id = _as_uuid(str(raw_epoch_id), "compute scope_epoch_id")
+                if epoch_id in seen_epochs:
+                    raise UsageReadContractError(
+                        "compute epoch authority is duplicated"
+                    )
+                seen_epochs.add(epoch_id)
+                if str(authority.get("api_resource") or "") != expected_api_resource:
+                    raise UsageReadContractError(
+                        "compute epoch authority resource is inconsistent"
+                    )
+                authority_start = max(
+                    fallback_start,
+                    _aware_utc(
+                        raw_effective_from,
+                        f"{activation_key} authority_effective_from",
+                    ),
+                )
+                retired_at = (
+                    None
+                    if authority.get("retired_at") is None
+                    else _aware_utc(
+                        authority["retired_at"],
+                        f"{activation_key} retired_at",
+                    )
+                )
+                authority_end = min(to_ts, retired_at or to_ts)
+                if authority_end <= fallback_start or authority_start >= to_ts:
+                    continue
+                if authority_start > coverage_cursor:
+                    unknown.append((coverage_cursor, authority_start))
+                    scope_ok = False
+                    scope_watermark = min(scope_watermark, coverage_cursor)
+                epoch_gaps = tuple(gaps_by_epoch.get(epoch_id, ())) + tuple(
+                    compute_gaps_by_authority.get((activation_key, epoch_id), ())
+                )
+                if str(authority.get("item_health")) != "healthy" or (
+                    str(authority.get("continuity_health")) != "healthy"
+                    and not epoch_gaps
+                ):
+                    unknown.append((authority_start, authority_end))
+                    scope_ok = False
+                    scope_watermark = min(scope_watermark, authority_start)
+                complete_through = authority.get("complete_through")
+                complete_end = authority_start
+                if complete_through is not None:
+                    complete_end = max(
+                        authority_start,
+                        min(
+                            authority_end,
+                            _aware_utc(complete_through, "complete_through"),
+                        ),
+                    )
+                if complete_end < authority_end:
+                    unknown.append((complete_end, authority_end))
+                    scope_ok = False
+                    scope_watermark = min(scope_watermark, complete_end)
+                for gap_start, _gap_end in epoch_gaps:
+                    if gap_start < authority_end:
+                        scope_ok = False
+                        scope_watermark = min(
+                            scope_watermark,
+                            max(authority_start, gap_start),
+                        )
+                coverage_cursor = max(coverage_cursor, authority_end)
+            if coverage_cursor < to_ts:
+                unknown.append((coverage_cursor, to_ts))
+                scope_ok = False
+                scope_watermark = min(scope_watermark, coverage_cursor)
+            scope_through.append(scope_watermark)
+            if scope_ok:
+                ok += 1
+
+        seen_storage_scopes: set[uuid.UUID] = set()
+        for scope_id, epochs in epochs_by_scope.items():
             scope_ok = True
             scope_watermark = to_ts
             saw_effective_epoch = False
+            scope_requirements = requirements_by_scope.get(scope_id, ())
+            api_resources = {str(epoch.get("api_resource") or "") for epoch in epochs}
+            if len(api_resources) != 1:
+                raise UsageReadContractError(
+                    "inventory scope epochs disagree on api_resource"
+                )
+            api_resource = next(iter(api_resources))
+            is_storage_scope = api_resource in _STORAGE_BASIS_BY_API_RESOURCE
+            storage_requirement_start: datetime | None = None
+            storage_scope_enabled = True
+            if is_storage_scope:
+                storage_scope_enabled = bool(scope_requirements)
+                if scope_requirements:
+                    storage_requirement_start = max(
+                        live_start,
+                        min(
+                            requirement.effective_from
+                            for requirement in scope_requirements
+                        ),
+                    )
+                    for requirement in scope_requirements:
+                        if requirement.expected_api_resource != api_resource:
+                            raise UsageReadContractError(
+                                "storage coverage requirement resource mismatch"
+                            )
+                        quantity_resource = (
+                            requirement.expected_api_resource
+                            if requirement.requirement_role == "quantity"
+                            else "core/v1/persistentvolumes"
+                        )
+                        if quantity_resource not in self._enabled_api_resources:
+                            storage_scope_enabled = False
+                else:
+                    storage_requirement_start = live_start
+
+            coverage_cursor = storage_requirement_start
             for epoch in sorted(epochs, key=lambda row: row["required_from"]):
                 epoch_id = _as_uuid(str(epoch["id"]), "scope_epoch_id")
                 effective_start = max(
-                    live_start,
+                    storage_requirement_start or live_start,
                     _aware_utc(epoch["required_from"], "required_from"),
                 )
                 effective_end = (
@@ -1822,9 +2464,15 @@ class SourceAwareUsageReadModel:
                 )
                 if effective_end <= effective_start:
                     continue
+                if coverage_cursor is not None and effective_start > coverage_cursor:
+                    unknown.append((coverage_cursor, effective_start))
+                    scope_ok = False
+                    scope_watermark = min(scope_watermark, coverage_cursor)
                 saw_effective_epoch = True
                 source_enabled = (
-                    str(epoch.get("api_resource") or "") in self._enabled_api_resources
+                    storage_scope_enabled
+                    if is_storage_scope
+                    else api_resource in self._enabled_api_resources
                 )
                 item_healthy = str(epoch.get("item_health")) == "healthy"
                 continuity_healthy = str(epoch.get("continuity_health")) == "healthy"
@@ -1866,14 +2514,46 @@ class SourceAwareUsageReadModel:
                             max(effective_start, gap_start),
                         )
                         scope_ok = False
+                if coverage_cursor is not None:
+                    coverage_cursor = max(coverage_cursor, effective_end)
+            if coverage_cursor is not None and coverage_cursor < to_ts:
+                unknown.append((coverage_cursor, to_ts))
+                scope_ok = False
+                scope_watermark = min(scope_watermark, coverage_cursor)
             if not saw_effective_epoch:
                 continue
             total += 1
             scope_through.append(scope_watermark)
+            if is_storage_scope and scope_requirements:
+                seen_storage_scopes.add(scope_id)
             if scope_ok:
                 ok += 1
 
         live_required = live_start < to_ts
+        if live_required:
+            missing_storage_scopes = set(requirements_by_scope) - seen_storage_scopes
+            for scope_id in sorted(missing_storage_scopes, key=str):
+                requirement_start = max(
+                    live_start,
+                    min(
+                        requirement.effective_from
+                        for requirement in requirements_by_scope[scope_id]
+                    ),
+                )
+                if requirement_start >= to_ts:
+                    continue
+                total += 1
+                scope_through.append(requirement_start)
+                unknown.append((requirement_start, to_ts))
+            if missing_storage_authorities:
+                # The process policy is the complete approved active source
+                # set, not a loose allowlist. A configured source without its
+                # immutable 0105 requirement set has no completeness proof.
+                total += len(missing_storage_authorities)
+                scope_through.extend(
+                    live_start for _authority in missing_storage_authorities
+                )
+                unknown.append((live_start, to_ts))
         if live_required and total == 0:
             unknown.append((live_start, to_ts))
 
