@@ -11,6 +11,8 @@ import {
     extractClipboardFiles,
     filterRewindCandidates,
     formatPermissionArgs,
+    permissionApproveKey,
+    permissionTitleKey,
     formatRewindStamp,
     HEADER_FOLD_HYSTERESIS_PX,
     HEADER_LEFT_RESERVE_PX,
@@ -265,6 +267,36 @@ describe('pickRunningCommandCard', () => {
  * carries every entry, not just the first, is proven independently in
  * persistent-chat.service.spec.ts.
  */
+/**
+ * The approval card is shared by batch turns and ordinary single-gate turns.
+ * With one pending call, "Approve all" / "run 1 tool(s)" reads as though
+ * something is hidden behind the button — so the copy switches to the
+ * singular form. Pure key-pickers so they stay testable: the component is
+ * never mounted in a spec (viewChild.required + afterNextRender throw NG0951
+ * under this runner).
+ */
+describe('permissionTitleKey', () => {
+    it('uses the singular title for exactly one pending call', () => {
+        expect(permissionTitleKey(1)).toBe('chat.permission.singleTitle');
+    });
+
+    it('uses the counted batch title for more than one', () => {
+        expect(permissionTitleKey(2)).toBe('chat.permission.batchTitle');
+        expect(permissionTitleKey(4)).toBe('chat.permission.batchTitle');
+    });
+});
+
+describe('permissionApproveKey', () => {
+    it('says "Approve" for exactly one pending call, not "Approve all"', () => {
+        expect(permissionApproveKey(1)).toBe('chat.permission.approve');
+    });
+
+    it('says "Approve all" once there is a batch to approve', () => {
+        expect(permissionApproveKey(2)).toBe('chat.permission.approveAll');
+        expect(permissionApproveKey(4)).toBe('chat.permission.approveAll');
+    });
+});
+
 describe('formatPermissionArgs', () => {
     it('renders a single string arg as "key: value"', () => {
         expect(formatPermissionArgs({file_path: 'src/app.ts'})).toBe('file_path: src/app.ts');
