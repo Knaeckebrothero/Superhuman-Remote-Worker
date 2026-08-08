@@ -65,6 +65,8 @@ async def db(pg_dsn):
                 parent_job_id uuid,
                 priority int NOT NULL DEFAULT 0,
                 runner_kind text NOT NULL DEFAULT 'user',
+                -- Gate 1: the legacy dispatcher serves pinned jobs only.
+                execution_lane text NOT NULL DEFAULT 'pinned',
                 branch_name text,
                 context jsonb,
                 created_at timestamptz NOT NULL DEFAULT now(),
@@ -129,12 +131,18 @@ async def test_dispatchable_set_and_ordering(db):
         priority=3,
         context='{"cloud_baseline": {"state": "failed"}}',
     )  # ordinary Mode A seed failure remains best-effort
+    await _insert(
+        db, 11, "created", priority=100, execution_lane="stateless"
+    )  # run_queue owns this row; legacy dispatch must never see it
+    await _insert(
+        db, 12, "paused", priority=200, execution_lane="future-lane"
+    )  # unknown runtime classes fail closed instead of falling back to legacy
 
     got = await db.get_dispatchable_jobs(limit=50)
     ids = [str(r["id"]) for r in got]
 
     assert ids == [str(_u(2)), str(_u(1)), str(_u(8)), str(_u(10))], (
-        "clean jobs and legacy/best-effort cases dispatch in priority order"
+        "clean pinned jobs dispatch in priority order; stateless jobs stay out"
     )
 
 

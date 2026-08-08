@@ -3560,6 +3560,19 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
     job_id = str(job["id"])
     agent_id = str(agent["id"])
 
+    # Defense in depth for callers that bypass get_dispatchable_jobs (notably
+    # the manual admin assignment endpoint). A stateless row must never be
+    # POSTed to a pinned agent; its sole claim authority is run_queue (§5.4.4).
+    # Missing is treated as pinned only for pre-0118/mocked job dictionaries;
+    # the production column is NOT NULL and defaults to pinned.
+    if job.get("execution_lane", "pinned") != "pinned":
+        logger.warning(
+            "Dispatch: refusing pinned start for %s job %s",
+            job.get("execution_lane"),
+            job_id,
+        )
+        return False
+
     if not agent.get("pod_ip"):
         logger.warning(f"Agent {agent_id} has no pod IP — skipping dispatch")
         return False
@@ -4007,6 +4020,16 @@ async def _resume_job_on_agent(job: dict, agent: dict) -> bool:
 
     job_id = str(job["id"])
     agent_id = str(agent["id"])
+
+    # Same coexistence fence as the fresh-start helper. Resume is a direct
+    # POST to a registered pod and therefore belongs exclusively to pinned jobs.
+    if job.get("execution_lane", "pinned") != "pinned":
+        logger.warning(
+            "Resume dispatch: refusing pinned resume for %s job %s",
+            job.get("execution_lane"),
+            job_id,
+        )
+        return False
 
     if not agent.get("pod_ip"):
         logger.warning(f"Agent {agent_id} has no pod IP — skipping resume dispatch")
@@ -20401,6 +20424,15 @@ async def assign_job_to_agent(
         job = await postgres_db.get_job(job_id)
         if not job:
             raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
+
+        if job.get("execution_lane", "pinned") != "pinned":
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Stateless jobs are claimed from the run queue and cannot "
+                    "be assigned directly to a registered agent"
+                ),
+            )
 
         if job["status"] not in ("created", "failed", "paused"):
             raise HTTPException(

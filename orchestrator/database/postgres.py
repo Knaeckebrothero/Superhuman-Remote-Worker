@@ -1298,6 +1298,7 @@ class PostgresDB:
                        j.exported_folder_handle, j.exported_at,
                        j.creation_order, j.worktree_path, j.delegation_context,
                        j.error_message, j.error_details, j.runner_kind,
+                       j.execution_lane,
                        j.created_by_thread_id, j.wake_on_complete,
                        j.created_at, j.updated_at, j.description, j.context,
                        (p.main_cloud_folder_handle IS NOT NULL) AS project_has_cloud_folder
@@ -5036,6 +5037,9 @@ class PostgresDB:
                             updated_at = CURRENT_TIMESTAMP
                         WHERE assigned_agent_id = $1
                           AND status = 'processing'
+                          -- A stateless worker is not coupled to this
+                          -- registered-agent row; run_queue owns its rescue.
+                          AND jobs.execution_lane = 'pinned'
                         """,
                         agent_id,
                     )
@@ -5419,6 +5423,10 @@ class PostgresDB:
                     assigned_agent_id = NULL,
                     updated_at = CURRENT_TIMESTAMP
                 WHERE status = 'processing'
+                  -- Coexistence partition (§5.4.4): the run_queue reaper is
+                  -- the sole rescue authority for stateless worker jobs.
+                  -- Whitelist pinned so unknown future lanes fail closed.
+                  AND jobs.execution_lane = 'pinned'
                   AND (
                       assigned_agent_id IS NULL
                       OR assigned_agent_id IN (
@@ -5441,6 +5449,7 @@ class PostgresDB:
                 SET assigned_agent_id = NULL,
                     updated_at = CURRENT_TIMESTAMP
                 WHERE status = 'waiting'
+                  AND jobs.execution_lane = 'pinned'
                   AND assigned_agent_id IS NOT NULL
                   AND assigned_agent_id IN (
                       SELECT id FROM agents WHERE status = 'offline'
@@ -5459,6 +5468,7 @@ class PostgresDB:
                 SET assigned_agent_id = NULL,
                     updated_at = CURRENT_TIMESTAMP
                 WHERE status = 'paused'
+                  AND jobs.execution_lane = 'pinned'
                   AND assigned_agent_id IS NOT NULL
                   AND assigned_agent_id IN (
                       SELECT id FROM agents WHERE status = 'offline'
@@ -5482,6 +5492,7 @@ class PostgresDB:
                               || jsonb_build_object('last_freeze_data', freeze_data),
                     updated_at = CURRENT_TIMESTAMP
                 WHERE status = 'paused'
+                  AND jobs.execution_lane = 'pinned'
                   AND assigned_agent_id IS NULL
                   AND freeze_data->>'freeze_type' IN (
                       'version_upgrade', 'memory_unavailable',
@@ -5530,6 +5541,9 @@ class PostgresDB:
                        lease_expires_at = NULL,
                        updated_at = CURRENT_TIMESTAMP
                  WHERE status = 'processing'
+                   -- Stateless jobs are recovered only by run_queue's
+                   -- lease-token reaper (§5.4.4), never this jobs-row lease.
+                   AND jobs.execution_lane = 'pinned'
                    AND lease_expires_at IS NOT NULL
                    AND lease_expires_at < NOW()
                 RETURNING id
@@ -5966,6 +5980,9 @@ class PostgresDB:
                        error_details = NULL,
                        updated_at = CURRENT_TIMESTAMP
                  WHERE id = $1
+                   -- One claim authority per job (§5.4.4). Fail closed for
+                   -- unknown lanes instead of handing them to legacy pods.
+                   AND execution_lane = 'pinned'
                    AND assigned_agent_id IS NULL
                    AND status IN ('created', 'paused')
                 RETURNING id
@@ -6906,12 +6923,15 @@ class PostgresDB:
                 SELECT j.id, j.description, j.status, j.config_name,
                        j.config_override, j.assigned_agent_id, j.user_id,
                        j.project_id, j.parent_job_id, j.priority, j.runner_kind,
-                       j.branch_name, j.context, j.created_at
+                       j.execution_lane, j.branch_name, j.context, j.created_at
                 FROM jobs j
                 -- These three terms are the partial index idx_jobs_dispatchable
                 -- (0046). Statuses MUST stay literal (see docstring); the
                 -- ORDER BY priority DESC, created_at ASC is the index key.
                 WHERE j.status IN ('created', 'paused')
+                  -- Coexistence partition (§5.4.4): stateless rows are
+                  -- admitted through worker_batch enqueue, not this dispatcher.
+                  AND j.execution_lane = 'pinned'
                   AND j.assigned_agent_id IS NULL
                   AND j.freeze_data IS NULL
                   -- Mode A: skip jobs whose cloud-folder baseline is still
