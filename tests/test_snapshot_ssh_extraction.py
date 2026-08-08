@@ -1,10 +1,17 @@
-"""Contract tests for streaming snapshot restore (memory-safe extraction).
+"""Contract tests for streaming snapshot restore (memory-safe extraction) and
+the capture-side honest accept gate.
 
 Guards against regressing to "read the whole .tar.zst into RAM, then pass it as
 ``communicate(input=...)``" — the pattern that OOM-killed the orchestrator on
 resume. The helper must stream the local tar file to the child process via its
 stdin file descriptor. The global ``asyncio.create_subprocess_exec`` is patched,
 so no real SSH is spawned.
+
+Also guards the capture-side accept gate (``SnapshotService.capture_vm_snapshot``,
+see docs/features/workspace_durability_tiering.md §C1/C1b): a shell pipeline
+(``tar | zstd``) only surfaces the LAST stage's exit code, so a truncated/failing
+``tar`` upstream is masked and a partial archive gets accepted as good — unless
+the remote command is rewritten to discriminate the two stages via ``PIPESTATUS``.
 """
 
 import sys
@@ -22,6 +29,7 @@ _orchestrator_dir = str(project_root / "orchestrator")
 if _orchestrator_dir not in sys.path:
     sys.path.insert(0, _orchestrator_dir)
 
+from orchestrator.services.snapshot_service import SnapshotService  # noqa: E402
 from orchestrator.services.ssh_helpers import (  # noqa: E402
     EXTRACT_REMOTE_CMD,
     SSHPrivateKeyError,
@@ -196,3 +204,129 @@ class TestStreamExtractSnapshot:
             )
         assert rc == 1
         assert stderr == b"tar: short read"
+
+
+def _fake_capture_proc(returncode=0, chunks=(b"tarball-bytes",), stderr=b""):
+    """Fake asyncio subprocess for the capture-side SSH ``tar | zstd`` pipeline.
+
+    ``stdout.read()`` yields ``chunks`` in order, then an empty ``bytes`` to
+    signal EOF — mirroring the 1 MB chunked read loop in
+    ``SnapshotService.capture_vm_snapshot``. ``returncode`` models the single
+    honest exit code the remote ``bash -c`` wrapper computes from
+    ``PIPESTATUS`` (0 clean, 1 tar-warned, 2 fatal), not a real shell
+    pipeline's raw last-stage code.
+    """
+    proc = MagicMock()
+    proc.returncode = returncode
+    proc.stdout = MagicMock()
+    proc.stdout.read = AsyncMock(side_effect=[*chunks, b""])
+    proc.stderr = MagicMock()
+    proc.stderr.read = AsyncMock(return_value=stderr)
+    proc.wait = AsyncMock(return_value=None)
+    return proc
+
+
+class TestCaptureVmSnapshotAcceptGate:
+    """Capture's accept gate must be honest about a masked pipeline failure.
+
+    A shell pipeline (``tar | zstd``) only reports the LAST stage's exit code,
+    so a truncated/failing ``tar`` upstream is silently masked and a partial
+    archive gets accepted as good. But tar's rc==1 ("file changed as we read
+    it") is a routine warning on a live workspace, not a failure — rejecting
+    every nonzero rc would fail capture constantly. The honest rule: accept
+    rc in {0, 1}; reject rc >= 2 or an empty byte stream. See
+    docs/features/workspace_durability_tiering.md §C1 (C1b block).
+    """
+
+    @pytest.fixture
+    def service(self):
+        """SnapshotService with S3 "available" and its downstream calls
+        (context updates, env-info collection, upload) mocked out, so each
+        test isolates the accept-gate branch without touching S3/DB/SSH.
+        """
+        svc = SnapshotService()
+        svc._available = True
+        svc._set_snapshot_context = AsyncMock()
+        svc._collect_environment_info = AsyncMock(return_value={})
+        svc.upload_snapshot = AsyncMock(return_value=True)
+        return svc
+
+    @staticmethod
+    def _statuses(mock_set_snapshot_context):
+        """Every ``status`` value passed to the mocked ``_set_snapshot_context``."""
+        return [
+            call.args[1].get("status")
+            for call in mock_set_snapshot_context.call_args_list
+        ]
+
+    @pytest.mark.asyncio
+    async def test_remote_command_is_bash_c_with_pipestatus_discrimination(
+        self, service
+    ):
+        fake = _fake_capture_proc(returncode=0)
+        with patch(
+            "asyncio.create_subprocess_exec", new=AsyncMock(return_value=fake)
+        ) as mock_exec:
+            await service.capture_vm_snapshot("job-cmd", "192.0.2.10", 2222)
+
+        remote_cmd = mock_exec.call_args.args[-1]
+        assert remote_cmd.startswith("bash -c '")
+        assert "tar --xattrs" in remote_cmd
+        assert "| zstd -1 -T0" in remote_cmd
+        assert "${PIPESTATUS[0]}" in remote_cmd
+        assert "${PIPESTATUS[1]}" in remote_cmd
+        assert "exit 2" in remote_cmd
+        assert "exit 1" in remote_cmd
+        assert "exit 0" in remote_cmd
+        # The `-c` body is single-quoted: exactly the opening and closing
+        # quote should exist anywhere in the command — a stray single quote
+        # from an exclude/include pattern would prematurely close the
+        # argument and break the remote shell.
+        assert remote_cmd.count("'") == 2
+
+    @pytest.mark.asyncio
+    async def test_rc_2_is_rejected_as_capture_failed(self, service):
+        fake = _fake_capture_proc(returncode=2, stderr=b"tar: fatal error")
+        with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=fake)):
+            result = await service.capture_vm_snapshot("job-rc2", "192.0.2.10", 2222)
+
+        assert result is False
+        assert "capture_failed" in self._statuses(service._set_snapshot_context)
+        service.upload_snapshot.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_rc_1_tar_warning_is_accepted(self, service, caplog):
+        fake = _fake_capture_proc(returncode=1)
+        with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=fake)):
+            with caplog.at_level("WARNING"):
+                result = await service.capture_vm_snapshot(
+                    "job-rc1", "192.0.2.10", 2222
+                )
+
+        assert result is True
+        service.upload_snapshot.assert_awaited_once()
+        assert "capture_failed" not in self._statuses(service._set_snapshot_context)
+        assert any(
+            "rc=1" in record.getMessage() or "files changed" in record.getMessage()
+            for record in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    async def test_rc_0_clean_is_accepted(self, service):
+        fake = _fake_capture_proc(returncode=0)
+        with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=fake)):
+            result = await service.capture_vm_snapshot("job-rc0", "192.0.2.10", 2222)
+
+        assert result is True
+        service.upload_snapshot.assert_awaited_once()
+        assert "capture_failed" not in self._statuses(service._set_snapshot_context)
+
+    @pytest.mark.asyncio
+    async def test_empty_stream_is_rejected_even_with_rc_0(self, service):
+        fake = _fake_capture_proc(returncode=0, chunks=())
+        with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=fake)):
+            result = await service.capture_vm_snapshot("job-empty", "192.0.2.10", 2222)
+
+        assert result is False
+        assert "capture_failed" in self._statuses(service._set_snapshot_context)
+        service.upload_snapshot.assert_not_awaited()
