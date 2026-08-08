@@ -51,8 +51,49 @@ the pod's next flush would collide on the unique index and kill the writer.
 3. Verbs that require a live in-flight turn (`interrupt`) stay out of scope and
    keep their 501.
 
-Remaining work is §3.3 (now shaped as above), §3.4's verification, §3.5, §3.6
-and §3.7 — plus stateless ended-session wake, which the server phase surfaced.
+### 0.1 Scope correction (2026-08-08, second): the snapshot comes first
+
+The "zero cockpit changes" claim in §3.4 was **wrong in one important way**, and
+the audit that found it was right. Send and receive genuinely need no client
+change — but `session.state` is emitted only over the WebSocket
+(`persistent_app.py:3366`, via `_ws_send`) and **has no REST equivalent**. Its
+own comment at `:3352` states the stakes: *"The durable row survives, but REST
+history does not carry it, so without this a reload (or a dropped live stream)
+leaves the approval card unrenderable and the gate unanswerable."*
+
+So on a lane with no socket, a **supervised session becomes unanswerable after
+any reload** — the permission card cannot render, the gate cannot be answered.
+That is a functional dead end, not a cosmetic gap. `session.state` also carries
+the authoritative cold-join signal, the running tool, permission/narration mode
+and turn count.
+
+**Therefore deliverable #1 is a lane-agnostic, transport-independent
+session-state snapshot over REST, serving both lanes** — the same shape as the
+control-verb decision, and for the same reason: the client stays lane-free and
+the per-session WebSocket moves closer to retirement. Also fix the null
+`ws_url` reaching `new WebSocket(null)`; a client-side guard or a sentinel, your
+call, but it must not enter the reconnect ladder.
+
+Then: the REST control inbox (§3.3 as shaped above — note the audit's point that
+a request table alone can strand a control during completion, so it needs queue
+watermarks, pinned-agent fencing and durable journal-write acknowledgement),
+§3.4's verification, §3.5, §3.6, §3.7, and stateless ended-session wake.
+
+### 0.2 When to stop — narrowed
+
+An earlier instruction said to stop whenever something rests on a wrong premise.
+That was too broad and it has now fired on a finding that **resized** the work
+rather than invalidating it. Narrowed rule:
+
+* **Stop** only when a premise is load-bearing *and* there is no reasonable
+  alternative — e.g. "the CAS this depends on does not exist", "this write
+  corrupts the journal allocator". Those were correct stops.
+* **Adapt and continue** when the premise is wrong but the goal survives a
+  different route — build the route, record the deviation in the log, and say
+  what you changed and why. A discovered dependency is scope, not a blocker.
+
+The goal has not changed: a user can drive a stateless-lane session from the
+cockpit exactly like a pinned one, and never learns a lane exists.
 
 **Phase 3 audit result (2026-08-08): §3.4's corrected premise was still
 incomplete, so implementation stopped again.** An already-open active tab can
