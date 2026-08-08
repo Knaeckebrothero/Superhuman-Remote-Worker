@@ -203,6 +203,44 @@ class SnapshotService:
                 ContentType="application/json",
             )
 
+            # Post-upload integrity check (§C2): confirm the canonical
+            # object actually landed with the expected size before
+            # advertising "available" — a truncated/partial multipart
+            # upload must never be trusted. Cheap (HEAD only); the deep
+            # hash re-check is verify_snapshot's job at reclaim time, not a
+            # per-upload cost. "When present": some manifests omit
+            # size_compressed_bytes, and there's nothing to compare
+            # against in that case, so the check is skipped rather than
+            # failing closed on absence.
+            expected_size = manifest.get("size_compressed_bytes")
+            if expected_size:
+                head = await asyncio.to_thread(
+                    self._s3.head_object,
+                    Bucket=self._bucket,
+                    Key=f"{prefix}/env.tar.zst",
+                )
+                actual_size = head["ContentLength"]
+                if actual_size != expected_size:
+                    logger.error(
+                        "Snapshot upload size mismatch for %s %s: s3=%s manifest=%s",
+                        entity_type.rstrip("s"),
+                        job_id,
+                        actual_size,
+                        expected_size,
+                    )
+                    await self._set_snapshot_context(
+                        job_id,
+                        {
+                            "status": "capture_failed",
+                            "error": (
+                                f"post-upload size mismatch (s3={actual_size} "
+                                f"manifest={expected_size})"
+                            ),
+                        },
+                        entity_type=entity_type,
+                    )
+                    return False
+
             # Update entity context
             await self._set_snapshot_context(
                 job_id,
@@ -818,6 +856,86 @@ class SnapshotService:
         return sorted(manifests, key=lambda m: m.get("phase_number", 0))
 
     # =========================================================================
+    # Verify (C2 — reclaim gate)
+    # =========================================================================
+
+    async def verify_snapshot(
+        self,
+        job_id: str,
+        *,
+        entity_type: str = "jobs",
+        deep: Optional[bool] = None,
+    ) -> tuple[bool, str]:
+        """Confirm a snapshot is durably and correctly stored in S3.
+
+        The single gate a later task (C4) calls before the irreversible
+        ``delete_workspace_pvc`` — FAIL-SAFE by design: anything
+        unverifiable (no manifest, missing object, size mismatch, deep
+        verify with no stored checksum, hash mismatch) returns
+        ``(False, reason)``; only an all-good result returns
+        ``(True, "ok")``. A buggy ``True`` here would let a caller destroy
+        the only remaining copy of unrecoverable data.
+
+        Two checks:
+          - size (always, cheap): ``HeadObject`` content-length vs.
+            ``manifest.size_compressed_bytes`` (skipped if the manifest
+            doesn't carry a size).
+          - hash (when ``deep``, default from ``SNAPSHOT_VERIFY_DEEP``): a
+            streamed re-hash of the S3 object compared against
+            ``manifest.checksum_sha256`` — this is the only integrity
+            oracle. Never compare the object's ``ETag``: these archives are
+            multipart-uploaded, so the ETag is
+            ``md5(concat(part-md5s))-N``, not the object's hash.
+
+        Args:
+            job_id: Job or thread UUID.
+            entity_type: S3 prefix namespace ("jobs" or "threads").
+            deep: Force the hash re-check on/off. ``None`` (default) reads
+                ``SNAPSHOT_VERIFY_DEEP`` (default ``"true"``).
+
+        Returns:
+            ``(ok, reason)`` — ``reason`` is always a short human-readable
+            string, e.g. ``"ok"``, ``"no manifest"``, ``"object missing"``.
+        """
+        if not self._available:
+            return False, "s3 unavailable"
+
+        manifest = await self.get_manifest(job_id, entity_type=entity_type)
+        if not manifest:
+            return False, "no manifest"
+
+        want_sha = manifest.get("checksum_sha256")
+        want_size = manifest.get("size_compressed_bytes")
+        key = f"{entity_type}/{job_id}/env.tar.zst"
+
+        try:
+            head = await asyncio.to_thread(
+                self._s3.head_object, Bucket=self._bucket, Key=key
+            )
+        except ClientError:
+            return False, "object missing"
+
+        if want_size and head["ContentLength"] != want_size:
+            return False, (
+                f"size mismatch (s3={head['ContentLength']} manifest={want_size})"
+            )
+
+        if deep is None:
+            deep = os.environ.get("SNAPSHOT_VERIFY_DEEP", "true").lower() == "true"
+
+        if deep:
+            if not want_sha:
+                # FAIL-SAFE: no stored checksum to compare against means
+                # this snapshot can't be proven intact — never treat
+                # "nothing to check" as "checked and fine".
+                return False, "no checksum in manifest (unverifiable)"
+            got = await asyncio.to_thread(self._streaming_sha256_from_s3, key)
+            if got != want_sha:
+                return False, "sha256 mismatch"
+
+        return True, "ok"
+
+    # =========================================================================
     # Delete / GC
     # =========================================================================
 
@@ -1211,6 +1329,24 @@ class SnapshotService:
             for chunk in iter(lambda: f.read(1024 * 1024), b""):
                 sha256.update(chunk)
         return sha256.hexdigest()
+
+    def _streaming_sha256_from_s3(self, key: str) -> str:
+        """SHA-256 of an S3 object, streamed in 1 MB chunks (O(1) memory).
+
+        Synchronous (run via ``asyncio.to_thread``) — mirrors
+        ``_compute_sha256`` but reads the S3 object body instead of a local
+        file, so a possibly multi-GB object is never buffered in memory at
+        once. Backs ``verify_snapshot``'s deep check; never use the
+        object's ``ETag`` in its place — these archives are
+        multipart-uploaded, so the ETag is ``md5(concat(part-md5s))-N``,
+        not the object's hash.
+        """
+        h = hashlib.sha256()
+        resp = self._s3.get_object(Bucket=self._bucket, Key=key)
+        body = resp["Body"]
+        for chunk in iter(lambda: body.read(1024 * 1024), b""):
+            h.update(chunk)
+        return h.hexdigest()
 
 
 # Module-level singleton
