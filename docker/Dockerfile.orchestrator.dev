@@ -60,6 +60,10 @@ COPY orchestrator/ /app/
 COPY src/ /app/src/
 COPY config/ /app/config/
 
+# Keep the metering package and the main entrypoint image-atomic. This import
+# catches selective/stale build contexts before Kubernetes sees the image.
+RUN python -c "import services.infrastructure_metering.compute_activation"
+
 # Marker so get_project_root() finds /app (no .git in container)
 RUN touch /app/pyproject.toml
 
