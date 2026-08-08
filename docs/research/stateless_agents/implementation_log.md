@@ -614,6 +614,24 @@ total=4.78s`. The `stateless-night-baseline` thread
 (`9a756800-1ad2-4ef1-9e39-14ac8b1c312c`) remains the test fixture; it is the
 only thread on `execution_lane='stateless'`.
 
+## Where the whole feature stands
+
+Rolled up into `docs/features/stateless_agents.md` **§9.1 Implementation
+status**, written against the code rather than intent. Headline for anyone
+picking this up: the shared substrate (`run_queue` + lease/fence/completion +
+reaper) is built and genuinely kind-agnostic, so workers need no schema change
+and no new lease semantics — but only the SESSION driver exists. Nothing
+enqueues or claims a `worker_batch`; `jobs` has no `execution_lane`; job
+dispatch is still the legacy `JobStartRequest` POST. S2 is untouched. Within
+S1 the spine is proven and the surround is not: cockpit `/connection`+`/prepare`
+compat, the control-verb REST subset, the provisioning gate, permission-row
+retire, queued-turn UX, `fair_key` rotation, the lite agent-local-state
+inventory, the coalescing tick, metering ingestion and object-store PUT fencing
+are all open, and four acceptance criteria (TTFT, claim-wait under concurrency,
+prompt-cache reuse, live tenant-residue probe) have never been measured. One
+correction found while writing that status: Path-A resume-compaction
+persistence, listed as a §6.5 prerequisite, is already implemented.
+
 ## Follow-ups this session leaves
 
 1. The remaining 13 setup store ops: 3 reads + 3 writes + 3 deletes + 4 listings.
