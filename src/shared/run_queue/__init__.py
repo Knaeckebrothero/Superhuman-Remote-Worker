@@ -22,6 +22,7 @@ Contract summary (full invariants on the functions in ``queries.py``):
 """
 
 from .queries import (
+    AFFINITY_GRACE_SECONDS,
     ENQUEUE_DEDUPED,
     ENQUEUE_INPUT_RECORDED,
     ENQUEUE_INSERTED,
@@ -56,6 +57,7 @@ from .queries import (
 from .types import ClaimedUnit, EnqueueResult, QueueWatermarks, StolenUnit
 
 __all__ = [
+    "AFFINITY_GRACE_SECONDS",
     "ENQUEUE_DEDUPED",
     "ENQUEUE_INPUT_RECORDED",
     "ENQUEUE_INSERTED",
