@@ -149,11 +149,16 @@ infrastructureMetering:
   vmPvClusterWideRbacAcknowledged: false
   stableClusterId: "srw-main-dev"
   ingestionSecretName: "srw-infra-metering-ingestion"
+  vmIngestionSecretName: "srw-infra-metering-vmi-ingestion"
+  vmStorageIngestionSecretName: "srw-infra-metering-vm-storage-ingestion"
+  volumeIdentitySecretName: "srw-infra-metering-volume-identity"
+  volumeIdentityKeyVersion: "storage-v1"
   # Metering credentials will be selected from the existing SRW Vault bundle
-  # into dedicated Kubernetes Secrets. Keep the projection dark until all
-  # named properties and target Secret names have been provisioned.
+  # into dedicated Kubernetes Secrets. Lifecycle authentication remains
+  # intentionally unbound for this credential-only rollout because binding it
+  # changes the active VM command protocol and must be coordinated separately.
   externalSecrets:
-    enabled: false
+    enabled: true
     vaultPath: "homelab/superhuman-remote-worker/srw-secrets"
   networkPolicy:
     enabled: true
