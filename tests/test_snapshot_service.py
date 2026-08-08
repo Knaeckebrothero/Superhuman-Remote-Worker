@@ -19,7 +19,7 @@ import hashlib
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from botocore.exceptions import ClientError
+from botocore.exceptions import ClientError, EndpointConnectionError
 
 from orchestrator.services.snapshot_service import SnapshotService
 
@@ -160,6 +160,43 @@ class TestVerifySnapshot:
         result = await svc.verify_snapshot("job-1")
 
         assert result == (False, "object missing")
+
+    @pytest.mark.asyncio
+    async def test_head_object_connection_reset_is_unverifiable_not_raised(self, svc):
+        """The HEAD's ``except ClientError`` only covers service-error
+        responses (NoSuchKey/404/5xx) — a bubbled ``ConnectionResetError``
+        is a plain ``Exception``, not a ``ClientError``, so it must be
+        caught by a second, wider handler or it escapes the gate,
+        contradicting ``verify_snapshot``'s "never raises" contract.
+        """
+        svc.get_manifest = AsyncMock(return_value=dict(GOOD_MANIFEST))
+        svc._s3.head_object = MagicMock(
+            side_effect=ConnectionResetError("connection reset by peer")
+        )
+
+        ok, reason = await svc.verify_snapshot("job-1")
+
+        assert ok is False
+        assert "verify error" in reason
+
+    @pytest.mark.asyncio
+    async def test_head_object_botocore_endpoint_error_is_unverifiable_not_raised(
+        self, svc
+    ):
+        """Same guard, the specific family named in the review:
+        ``botocore.exceptions.BotoCoreError`` (here, ``EndpointConnectionError``
+        standing in for a connect/read timeout or DNS failure) is not a
+        ``ClientError`` either — it must fail closed, not raise.
+        """
+        svc.get_manifest = AsyncMock(return_value=dict(GOOD_MANIFEST))
+        svc._s3.head_object = MagicMock(
+            side_effect=EndpointConnectionError(endpoint_url="https://s3.example.test")
+        )
+
+        ok, reason = await svc.verify_snapshot("job-1")
+
+        assert ok is False
+        assert "verify error" in reason
 
     @pytest.mark.asyncio
     async def test_size_mismatch_is_unverifiable(self, svc):
