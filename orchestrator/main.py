@@ -18111,7 +18111,9 @@ async def complete_job(
             # here. Pauses awaiting explicit action (vm_upgrade_required,
             # user-feedback freezes) keep their freeze_data untouched.
             if new_status == "paused":
-                from services.completion import AUTO_REDISPATCH_FREEZE_TYPES
+                from src.shared.job_freeze_types import (
+                    AUTO_REDISPATCH_FREEZE_TYPES,
+                )
 
                 fd_row = job.get("freeze_data")
                 if isinstance(fd_row, str):

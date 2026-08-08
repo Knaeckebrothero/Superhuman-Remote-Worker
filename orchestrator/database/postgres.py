@@ -36,6 +36,7 @@ from security.crypto import (
 )
 
 from utils.db_url import build_postgres_url
+from src.shared.job_freeze_types import AUTO_REDISPATCH_FREEZE_TYPES
 
 logger = logging.getLogger(__name__)
 
@@ -5483,7 +5484,9 @@ class PostgresDB:
             # continuity lives in the checkpoint + pushed branch). Covers rows
             # paused by pre-fix code crossing a deploy; /complete now does the
             # same at the source (services/completion.py
-            # AUTO_REDISPATCH_FREEZE_TYPES — keep the two lists in sync).
+            # AUTO_REDISPATCH_FREEZE_TYPES). The shared registry is passed as a
+            # query parameter so this recovery path cannot drift from status
+            # determination when a new continuation freeze is introduced.
             result4 = await conn.execute(
                 """
                 UPDATE jobs
@@ -5494,11 +5497,9 @@ class PostgresDB:
                 WHERE status = 'paused'
                   AND jobs.execution_lane = 'pinned'
                   AND assigned_agent_id IS NULL
-                  AND freeze_data->>'freeze_type' IN (
-                      'version_upgrade', 'memory_unavailable',
-                      'kb_unavailable', 'workspace_upgrade_required'
-                  )
-                """
+                  AND freeze_data->>'freeze_type' = ANY($1::text[])
+                """,
+                sorted(AUTO_REDISPATCH_FREEZE_TYPES),
             )
 
         count = 0
