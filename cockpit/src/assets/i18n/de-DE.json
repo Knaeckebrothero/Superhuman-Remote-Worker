@@ -1525,6 +1525,7 @@
     "permission": {
       "title": "Berechtigung erforderlich",
       "approve": "Genehmigen",
+      "singleTitle": "Der Agent möchte ein Werkzeug ausführen",
       "batchTitle": "Der Agent möchte {{count}} Werkzeugaufruf(e) ausführen",
       "approveAll": "Alle genehmigen",
       "autoAccept": "Auto-akzeptieren",
