@@ -1547,6 +1547,81 @@ describe('PersistentChatService — SSE event dispatch', () => {
         expect(service.pendingPermissions()).toEqual([]);
     });
 
+    it('permission.resolved with decision=expired does not report a denial', async () => {
+        // The backend sweeps un-reached announced gates as "expired" at turn
+        // end. Mapping anything != approved to 'denied' told the user they
+        // refused calls they never saw — the same fabricated-denial class the
+        // backend fix removed. See
+        // docs/issues/supervised_parallel_gates_timeout_fabricates_denial.md
+        const {service, es} = await setup();
+        const dispatched: {decision?: string}[] = [];
+        const origDispatch = (service as any).dispatch.bind(service);
+        (service as any).dispatch = (a: {decision?: string}) => {
+            dispatched.push(a);
+            return origDispatch(a);
+        };
+
+        fireSseMessage(es, {
+            method: 'permission.request_batch',
+            params: {
+                requests: [{id: 'tc-0', approval_id: 'a-0', tool: 'web_search', args: {}}],
+            },
+        }, '1:1');
+        fireSseMessage(es, {
+            method: 'permission.resolved',
+            params: {id: 'tc-0', approval_id: 'a-0', decision: 'expired'},
+        }, '1:2');
+
+        expect(service.pendingPermissions()).toEqual([]);
+        const decisions = dispatched.filter((a) => 'decision' in a).map((a) => a.decision);
+        expect(decisions).toContain('expired');
+        expect(decisions).not.toContain('denied');
+    });
+
+    it('permission.resolved with decision=interrupted is also not a denial', async () => {
+        const {service, es} = await setup();
+        const dispatched: {decision?: string}[] = [];
+        const origDispatch = (service as any).dispatch.bind(service);
+        (service as any).dispatch = (a: {decision?: string}) => {
+            dispatched.push(a);
+            return origDispatch(a);
+        };
+
+        fireSseMessage(es, {
+            method: 'permission.request',
+            params: {id: 'tc-9', approval_id: 'a-9', tool: 'run_command', args: {}},
+        }, '1:1');
+        fireSseMessage(es, {
+            method: 'permission.resolved',
+            params: {id: 'tc-9', approval_id: 'a-9', decision: 'interrupted'},
+        }, '1:2');
+
+        const decisions = dispatched.filter((a) => 'decision' in a).map((a) => a.decision);
+        expect(decisions).not.toContain('denied');
+    });
+
+    it('permission.resolved with decision=denied still reports a real denial', async () => {
+        const {service, es} = await setup();
+        const dispatched: {decision?: string}[] = [];
+        const origDispatch = (service as any).dispatch.bind(service);
+        (service as any).dispatch = (a: {decision?: string}) => {
+            dispatched.push(a);
+            return origDispatch(a);
+        };
+
+        fireSseMessage(es, {
+            method: 'permission.request',
+            params: {id: 'tc-d', approval_id: 'a-d', tool: 'run_command', args: {}},
+        }, '1:1');
+        fireSseMessage(es, {
+            method: 'permission.resolved',
+            params: {id: 'tc-d', approval_id: 'a-d', decision: 'denied'},
+        }, '1:2');
+
+        const decisions = dispatched.filter((a) => 'decision' in a).map((a) => a.decision);
+        expect(decisions).toContain('denied');
+    });
+
     it('permission.resolved removes only its own entry', async () => {
         const {service, es} = await setup();
         fireSseMessage(es, {

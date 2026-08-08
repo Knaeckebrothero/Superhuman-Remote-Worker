@@ -100,7 +100,15 @@ export interface CachedThreadMessage {
   role: string;
   content: string | null;
   tool_calls:
-    | { name: string; args: Record<string, unknown>; id: string; decision?: 'approved' | 'denied' }[]
+    | {
+          name: string;
+          args: Record<string, unknown>;
+          id: string;
+          // 'expired' = the gate was never answered (TTL, or swept at turn
+          // end). Persisted distinctly so a reload cannot re-render it as a
+          // refusal the user never made.
+          decision?: 'approved' | 'denied' | 'expired';
+      }[]
     | null;
   turn_number: number | null;
   tool_call_id?: string | null;

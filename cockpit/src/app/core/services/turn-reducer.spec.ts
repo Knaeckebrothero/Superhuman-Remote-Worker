@@ -750,6 +750,47 @@ describe('turn-reducer — permissions', () => {
         expect(tc.id).toBe('tc-ghost');
     });
 
+    it('permission_decision (expired) marks the call unanswered, NOT denied', () => {
+        // A gate that timed out or was swept at turn end is not a refusal.
+        // Painting it "denied" is the fabricated-denial bug, in the UI:
+        // docs/issues/supervised_parallel_gates_timeout_fabricates_denial.md
+        const state = play([
+            {type: 'turn_started', turnId: 't1', startedAt: 1000},
+            {
+                type: 'permission_request',
+                toolUseId: 'tc1',
+                tool: 'web_search',
+                args: {},
+                timestamp: 1100,
+            },
+            {
+                type: 'permission_decision',
+                toolUseId: 'tc1',
+                decision: 'expired',
+                timestamp: 1200,
+            },
+        ]);
+        const tc = activeTurn(state).events[0] as ToolCallEvent;
+        expect(tc.status).toBe('expired');
+        expect(tc.status).not.toBe('denied');
+        expect(tc.decision).toBe('expired');
+    });
+
+    it('permission_decision (expired) without a prior request fabricates nothing', () => {
+        // The denied path synthesises a marker so a deny-before-start is
+        // visible. An expired gate must NOT invent a row the user never saw.
+        const state = play([
+            {type: 'turn_started', turnId: 't1', startedAt: 1000},
+            {
+                type: 'permission_decision',
+                toolUseId: 'tc-ghost',
+                decision: 'expired',
+                timestamp: 1100,
+            },
+        ]);
+        expect(activeTurn(state).events).toHaveLength(0);
+    });
+
     it('permission_decision (approved) records the decision but does not change a running call', () => {
         const state = play([
             {type: 'turn_started', turnId: 't1', startedAt: 1000},
