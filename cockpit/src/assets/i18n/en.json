@@ -1525,6 +1525,7 @@
     "permission": {
       "title": "Permission required",
       "approve": "Approve",
+      "singleTitle": "The agent wants to run a tool",
       "batchTitle": "The agent wants to run {{count}} tool(s)",
       "approveAll": "Approve all",
       "autoAccept": "Auto-accept",

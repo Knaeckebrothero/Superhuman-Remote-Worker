@@ -427,6 +427,16 @@ export function formatPermissionArgs(args: Record<string, unknown> | null | unde
         .join(', ');
 }
 
+/** Title key for the approval card: singular reads oddly as "1 tool(s)". */
+export function permissionTitleKey(count: number): string {
+    return count === 1 ? 'chat.permission.singleTitle' : 'chat.permission.batchTitle';
+}
+
+/** Approve-button key. "Approve all" on a lone call implies hidden extras. */
+export function permissionApproveKey(count: number): string {
+    return count === 1 ? 'chat.permission.approve' : 'chat.permission.approveAll';
+}
+
 /** The workspace-upgrade card to render, or null when there's nothing to show. */
 export type WorkspaceOfferCard =
     | {state: 'provisioning'; tier: string; elapsed?: number; willContinue: boolean}
@@ -1561,7 +1571,7 @@ export function clearDraft(threadId: string | null): void {
           <div class="mile mile-permission">
             <div class="mile-label">{{ 'chat.permission.title' | transloco }}</div>
             <div class="mile-title">
-              {{ 'chat.permission.batchTitle' | transloco: {count: chat.pendingPermissions().length} }}
+              {{ permissionTitleKey(chat.pendingPermissions().length) | transloco: {count: chat.pendingPermissions().length} }}
             </div>
             <ul class="permission-list">
               @for (perm of chat.pendingPermissions(); track perm.id) {
@@ -1573,7 +1583,7 @@ export function clearDraft(threadId: string | null): void {
               }
             </ul>
             <div class="mile-actions">
-              <app-button variant="success" size="sm" (clicked)="chat.approveAll()">{{ 'chat.permission.approveAll' | transloco }}</app-button>
+              <app-button variant="success" size="sm" (clicked)="chat.approveAll()">{{ permissionApproveKey(chat.pendingPermissions().length) | transloco }}</app-button>
               <app-button variant="info" size="sm" (clicked)="approveAndAutoAccept()">{{ 'chat.permission.autoAccept' | transloco }}</app-button>
               <app-button variant="danger" size="sm" (clicked)="chat.stop()">{{ 'chat.permission.stop' | transloco }}</app-button>
             </div>
@@ -4015,6 +4025,10 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     /** Full argument content so the user can see WHAT each call does before
      *  approving the batch — see formatPermissionArgs (must never truncate:
      *  that's the whole safety model for a destructive call in the batch). */
+    /** Template bridges to the pure key-pickers (see their definitions). */
+    permissionTitleKey = permissionTitleKey;
+    permissionApproveKey = permissionApproveKey;
+
     permissionArgs(perm: PermissionRequest): string {
         return formatPermissionArgs(perm.args);
     }
