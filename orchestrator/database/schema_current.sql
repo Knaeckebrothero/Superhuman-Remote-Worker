@@ -6372,7 +6372,8 @@ CREATE TABLE public.run_queue (
     input_seq bigint,
     consumed_seq bigint,
     queued_at timestamp with time zone DEFAULT now() NOT NULL,
-    enqueue_ord bigint NOT NULL
+    enqueue_ord bigint NOT NULL,
+    last_leased_by text
 );
 
 
@@ -6465,6 +6466,13 @@ COMMENT ON COLUMN public.run_queue.queued_at IS 'Fairness position: reset on com
 --
 
 COMMENT ON COLUMN public.run_queue.enqueue_ord IS 'Insertion-order tiebreak: final ORDER BY key of the claim so equal-timestamp claims are deterministic FIFO. Never reused, never meaningful beyond ordering.';
+
+
+--
+-- Name: COLUMN run_queue.last_leased_by; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.run_queue.last_leased_by IS 'Pod that most recently claimed this unit (set by the claim, never cleared on completion — that is the point). Feeds the affinity grace in the general claim: for affinity_grace_seconds after a unit is queued, only this pod (or any pod, once the grace lapses) may claim it, so the holder of the warm in-process session wins its own re-claims instead of racing cold pods. Soft optimization ONLY — correctness never depends on it, and the grace is bounded so a dead holder delays a unit by at most that window. Cleared by the reaper on a steal.';
 
 
 --
@@ -9786,6 +9794,13 @@ CREATE INDEX idx_projects_network_tier ON public.projects USING btree (network_t
 --
 
 CREATE INDEX idx_projects_status ON public.projects USING btree (status);
+
+
+--
+-- Name: idx_run_queue_affinity; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_run_queue_affinity ON public.run_queue USING btree (last_leased_by, queued_at) WHERE (state = 'queued'::text);
 
 
 --
