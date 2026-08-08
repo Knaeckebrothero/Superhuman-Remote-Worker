@@ -472,6 +472,28 @@ agent:
     app:
       min: "1"
       max: "3"
+  # -- Stateless executor Deployment (docs/features/stateless_agents.md §5.8;
+  # templates/agent/stateless-deployment.yaml). A static pool of generic agent
+  # processes running `--mode stateless` that PULL work units from the
+  # run_queue, replacing per-thread provisioning for queue-lane threads
+  # (threads.execution_lane='stateless'). Coexists with the AgentProvisioner
+  # plane: the pods carry distinct class labels so the agent Service/PDB,
+  # reap/scale sweeps, and per-session routing never touch them.
+  stateless:
+    # -- DEFAULT OFF (prod-safe). The stateless lane is an S1 build in
+    # progress; enable on dev/local overlays only until the executor mode
+    # ships and the lane flag flips.
+    enabled: false
+    # -- Warm floor of executor pods (§5.8: interactive floor ≥ 2). KEDA/HPA
+    # autoscaling is a later, separately-gated addition.
+    replicas: 2
+    # -- Boot config for the executor process. Pool pods boot as workers and
+    # re-resolve per-attach from the claim bundle, mirroring provisioner job
+    # pods (agent.config above).
+    config: "worker_base"
+    # -- Pod resources for the stateless class. Empty = inherit
+    # agent.resources.
+    resources: {}
 
 # =============================================================================
 # Cockpit (Angular frontend)
