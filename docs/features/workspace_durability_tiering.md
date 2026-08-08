@@ -70,6 +70,16 @@ desired.
 migration for already-poisoned threads; and a full session-level reclaim E2E (live suspend→reclaim→resume)
 as a homelab soak. **Push held** (owner's call).
 
+**Dev validation runbook:** [`../../tests/reclaim_on_idle_dev_validation.md`](../../tests/reclaim_on_idle_dev_validation.md)
+— the step-by-step for validating the reclaim cycle on the real (Longhorn) cluster: confirm the flag-off
+deploy, check `verify_snapshot` against real dev S3, then arm the flag and drive suspend→reclaim→resume on a
+**throwaway test session**, asserting a gitignored real-work file survives the round-trip.
+
+**Still design-only (NOT built) — proposals in the sections below, not shipped:** the **§B** layered
+PVC-loss recovery (extract → `git fetch` → `git reset` for node loss), the **§D** PVC-lifecycle hardening
+(the `crossNodeReattach` operator flag, finalizer discipline, `WaitForFirstConsumer`), and **F3** quota
+*enablement* (the mechanism exists; turning it on with a cap is an operator decision).
+
 ---
 
 ## Prior art & rationale (why the decisions below are the right ones)
