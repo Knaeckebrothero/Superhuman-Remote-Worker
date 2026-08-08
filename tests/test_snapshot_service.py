@@ -1,4 +1,5 @@
-"""Tests for the C2 verifiable-capture primitives on ``SnapshotService``:
+"""Tests for the C2/C3 verifiable-capture + no-clobber primitives on
+``SnapshotService``:
 
 - ``verify_snapshot`` — the fail-safe gate a later task (C4) calls before the
   irreversible ``delete_workspace_pvc``. Anything unverifiable (no manifest,
@@ -11,8 +12,14 @@
   deep check. Never buffers the whole (possibly multi-GB) object.
 - The post-upload size check in ``upload_snapshot`` — a truncated/partial
   multipart upload must never advertise ``"available"``.
+- §C3 no-clobber: ``upload_snapshot``'s canonical write now stages, verifies,
+  then promotes (never overwriting canonical in place), keeping the last
+  ``SNAPSHOT_KEEP_GENERATIONS`` generations under ``history/``. These tests
+  use a dict-backed fake S3 (``FakeS3``) rather than a bare ``MagicMock`` so
+  assertions can check the *actual bucket contents* after a bad upload, not
+  just what was called.
 
-See docs/features/workspace_durability_tiering.md §C2.
+See docs/features/workspace_durability_tiering.md §C2/§C3.
 """
 
 import hashlib
@@ -61,6 +68,147 @@ class _FakeS3Body:
         chunk = self._data[self._pos : self._pos + n]
         self._pos += len(chunk)
         return chunk
+
+
+class _FullReadFakeS3Body:
+    """Stand-in for boto3's ``StreamingBody`` supporting a full, unbounded
+    ``read()`` (no size argument) — unlike ``_FakeS3Body`` above (which
+    deliberately *requires* a bounded ``read(n)`` to guard the
+    streaming-hash regression), this backs ``FakeS3.get_object`` for
+    callers like ``get_manifest``/``get_blob`` that correctly read a
+    small object in one shot rather than streaming it.
+    """
+
+    def __init__(self, data: bytes) -> None:
+        self._data = data
+
+    def read(self) -> bytes:
+        return self._data
+
+
+class FakeS3:
+    """Minimal in-memory S3 double, dict-backed so a test can assert on the
+    actual key set a staging -> verify -> promote -> prune sequence leaves
+    behind. A ``MagicMock`` only proves *what was called*; it can't prove
+    *what the bucket looks like afterwards* — exactly the gap the C3
+    no-clobber guarantee needs closed (a bad upload must leave canonical
+    bytes untouched, not just "call head_object once").
+
+    Covers the calls ``upload_snapshot``'s stage/verify/promote/prune path
+    and the read-side methods (``download_snapshot``, ``get_manifest``,
+    ``get_storage_stats``) make: ``upload_file``, ``put_object``, ``copy``,
+    ``head_object``, ``get_object``, ``download_file``, ``delete_object``,
+    and the ``list_objects_v2`` paginator. Not a general boto3 substitute —
+    just enough surface for this file's snapshot flows.
+    """
+
+    def __init__(self) -> None:
+        self.store: dict[str, bytes] = {}
+
+    # -- writes ---------------------------------------------------------
+
+    def upload_file(self, Filename: str, Bucket: str, Key: str) -> None:
+        with open(Filename, "rb") as f:
+            self.store[Key] = f.read()
+
+    def put_object(self, Bucket: str, Key: str, Body: bytes, **kwargs) -> None:
+        self.store[Key] = bytes(Body)
+
+    def copy(self, CopySource: dict, Bucket: str, Key: str, **kwargs) -> None:
+        """Stand-in for boto3's managed, multipart-capable ``copy()``.
+
+        Real S3 PUT/COPY is atomic at the destination key: a copy that
+        raises never leaves a partial object behind, it just leaves
+        whatever was already there. Raising *before* touching ``store``
+        (rather than after) mirrors that — it's what lets a test simulate
+        "the copy itself blew up" and still assert canonical survived.
+        """
+        src_key = CopySource["Key"]
+        if src_key not in self.store:
+            raise _not_found("CopyObject")
+        self.store[Key] = self.store[src_key]
+
+    def delete_object(self, Bucket: str, Key: str) -> None:
+        self.store.pop(Key, None)
+
+    # -- reads ------------------------------------------------------------
+
+    def head_object(self, Bucket: str, Key: str) -> dict:
+        if Key not in self.store:
+            raise _not_found("HeadObject")
+        return {"ContentLength": len(self.store[Key])}
+
+    def get_object(self, Bucket: str, Key: str) -> dict:
+        if Key not in self.store:
+            raise _not_found("GetObject")
+        return {"Body": _FullReadFakeS3Body(self.store[Key])}
+
+    def download_file(self, Bucket: str, Key: str, Filename: str) -> None:
+        if Key not in self.store:
+            raise _not_found("HeadObject")
+        with open(Filename, "wb") as f:
+            f.write(self.store[Key])
+
+    def get_paginator(self, operation_name: str) -> "_FakeListObjectsPaginator":
+        assert operation_name == "list_objects_v2"
+        return _FakeListObjectsPaginator(self)
+
+
+class _FakeListObjectsPaginator:
+    """Stand-in for boto3's ``list_objects_v2`` paginator: a single page,
+    sorted keys, mirroring only the ``Contents[].Key``/``Size`` shape the
+    service code reads.
+    """
+
+    def __init__(self, fake_s3: FakeS3) -> None:
+        self._fake_s3 = fake_s3
+
+    def paginate(self, Bucket: str, Prefix: str = "") -> list:
+        contents = [
+            {"Key": key, "Size": len(data)}
+            for key, data in sorted(self._fake_s3.store.items())
+            if key.startswith(Prefix)
+        ]
+        return [{"Contents": contents}]
+
+
+@pytest.fixture
+def fake_s3() -> FakeS3:
+    return FakeS3()
+
+
+@pytest.fixture
+def fake_svc(fake_s3) -> SnapshotService:
+    """A ``SnapshotService`` wired to the dict-backed ``FakeS3`` double —
+    used by the §C3 staging/promote/prune tests below, which need to
+    assert on real post-upload bucket state rather than mock call args.
+    """
+    s = SnapshotService()
+    s._available = True
+    s._bucket = "test-bucket"
+    s._s3 = fake_s3
+    s._set_snapshot_context = AsyncMock()
+    return s
+
+
+def _write_tar(tmp_path, name: str, data: bytes) -> str:
+    p = tmp_path / name
+    p.write_bytes(data)
+    return str(p)
+
+
+def _history_generations(fake_s3: FakeS3, prefix: str) -> set:
+    """Distinct ``<ts>`` generation ids currently under ``{prefix}/history/``."""
+    history_prefix = f"{prefix}/history/"
+    return {
+        key[len(history_prefix) :].split("/", 1)[0]
+        for key in fake_s3.store
+        if key.startswith(history_prefix)
+    }
+
+
+def _staging_keys(fake_s3: FakeS3, prefix: str) -> list:
+    return [k for k in fake_s3.store if f"{prefix}/env.tar.zst.staging-" in k]
 
 
 @pytest.fixture
@@ -401,6 +549,12 @@ class TestUploadSnapshotPostUploadSizeCheck:
         s._available = True
         s._bucket = "test-bucket"
         s._s3 = MagicMock()
+        # §C3 adds a history-prune pass after every successful promote.
+        # A bare, unconfigured MagicMock's paginator isn't iterable, so
+        # give it an explicit empty page — these tests are about the
+        # size-check gate, not pruning, and should exercise pruning as a
+        # clean no-op rather than an incidentally-swallowed TypeError.
+        s._s3.get_paginator.return_value.paginate.return_value = []
         s._set_snapshot_context = AsyncMock()
         return s
 
@@ -422,9 +576,14 @@ class TestUploadSnapshotPostUploadSizeCheck:
         statuses = self._statuses(svc._set_snapshot_context)
         assert "capture_failed" in statuses
         assert "available" not in statuses
-        svc._s3.head_object.assert_called_once_with(
-            Bucket="test-bucket", Key="jobs/job-1/env.tar.zst"
-        )
+        # §C3: the HEAD-check now runs against the STAGING key, not
+        # canonical directly, so a bad upload never touches canonical —
+        # see TestUploadSnapshotNoClobber for the actual
+        # canonical-survives-a-bad-upload proof against a real fake store.
+        svc._s3.head_object.assert_called_once()
+        called = svc._s3.head_object.call_args
+        assert called.kwargs["Bucket"] == "test-bucket"
+        assert called.kwargs["Key"].startswith("jobs/job-1/env.tar.zst.staging-")
 
     @pytest.mark.asyncio
     async def test_matching_size_proceeds_to_available(self, svc, tar_path):
@@ -452,3 +611,205 @@ class TestUploadSnapshotPostUploadSizeCheck:
 
         assert ok is True
         svc._s3.head_object.assert_not_called()
+
+
+# =============================================================================
+# upload_snapshot — §C3 no-clobber staging -> verify -> promote -> prune
+# =============================================================================
+
+
+class TestUploadSnapshotNoClobber:
+    """The load-bearing C3 guarantee: a bad/truncated capture must never
+    overwrite the last good canonical archive in place.
+    """
+
+    @pytest.mark.asyncio
+    async def test_size_mismatch_leaves_good_canonical_untouched(
+        self, fake_svc, fake_s3, tmp_path
+    ):
+        prefix = "jobs/job-1"
+        fake_s3.store[f"{prefix}/env.tar.zst"] = b"GOOD"
+        fake_s3.store[f"{prefix}/manifest.json"] = b'{"stale": "manifest"}'
+
+        # Real bytes land in staging, but the manifest claims a size that
+        # doesn't match them — simulating a truncated multipart upload
+        # that the staging HEAD-check must catch before canonical is ever
+        # touched.
+        tar_path = _write_tar(tmp_path, "env.tar.zst", b"truncated-bytes")
+        manifest = {"size_compressed_bytes": 999999}
+
+        ok = await fake_svc.upload_snapshot("job-1", tar_path, manifest)
+
+        assert ok is False
+        # The core property: canonical is EXACTLY what it was before.
+        assert fake_s3.store[f"{prefix}/env.tar.zst"] == b"GOOD"
+        assert fake_s3.store[f"{prefix}/manifest.json"] == b'{"stale": "manifest"}'
+        # No leftover staging object and no history generation created.
+        assert _staging_keys(fake_s3, prefix) == []
+        assert _history_generations(fake_s3, prefix) == set()
+
+        statuses = [
+            call.args[1].get("status")
+            for call in fake_svc._set_snapshot_context.call_args_list
+        ]
+        assert statuses == ["capture_failed"]
+
+    @pytest.mark.asyncio
+    async def test_exception_during_promote_leaves_canonical_untouched(
+        self, fake_svc, fake_s3, tmp_path
+    ):
+        """Defense in depth beyond the verify gate: an unexpected failure
+        raised anywhere in the staging->promote block (here, the
+        canonical ``s3.copy`` call itself) must also never leave canonical
+        half-written — it must survive exactly as it was.
+        """
+        prefix = "jobs/job-1"
+        fake_s3.store[f"{prefix}/env.tar.zst"] = b"GOOD"
+
+        tar_path = _write_tar(tmp_path, "env.tar.zst", _TAR_BYTES)
+        manifest = {"size_compressed_bytes": len(_TAR_BYTES)}
+
+        def _raising_copy(CopySource, Bucket, Key, **kwargs):
+            raise ConnectionResetError("connection reset by peer")
+
+        fake_s3.copy = _raising_copy
+
+        ok = await fake_svc.upload_snapshot("job-1", tar_path, manifest)
+
+        assert ok is False
+        assert fake_s3.store[f"{prefix}/env.tar.zst"] == b"GOOD"
+        assert _staging_keys(fake_s3, prefix) == []
+
+        statuses = [
+            call.args[1].get("status")
+            for call in fake_svc._set_snapshot_context.call_args_list
+        ]
+        assert "capture_failed" in statuses
+
+
+class TestUploadSnapshotPromote:
+    """Good-path promote: canonical updated, exactly one new history
+    generation written, staging cleaned up.
+    """
+
+    @pytest.mark.asyncio
+    async def test_good_upload_promotes_canonical_and_writes_one_generation(
+        self, fake_svc, fake_s3, tmp_path
+    ):
+        prefix = "jobs/job-1"
+        tar_path = _write_tar(tmp_path, "env.tar.zst", _TAR_BYTES)
+        manifest = {
+            "size_compressed_bytes": len(_TAR_BYTES),
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "source_type": "vm",
+        }
+
+        ok = await fake_svc.upload_snapshot("job-1", tar_path, manifest)
+
+        assert ok is True
+        assert fake_s3.store[f"{prefix}/env.tar.zst"] == _TAR_BYTES
+
+        generations = _history_generations(fake_s3, prefix)
+        assert len(generations) == 1
+        (generation,) = generations
+        assert fake_s3.store[f"{prefix}/history/{generation}/env.tar.zst"] == _TAR_BYTES
+        assert f"{prefix}/history/{generation}/manifest.json" in fake_s3.store
+
+        assert _staging_keys(fake_s3, prefix) == []
+
+        statuses = [
+            call.args[1].get("status")
+            for call in fake_svc._set_snapshot_context.call_args_list
+        ]
+        assert statuses == ["available"]
+
+
+class TestUploadSnapshotHistoryPruning:
+    """SNAPSHOT_KEEP_GENERATIONS bounds how many old generations survive."""
+
+    @pytest.mark.asyncio
+    async def test_keeps_only_newest_n_generations(
+        self, fake_svc, fake_s3, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("SNAPSHOT_KEEP_GENERATIONS", "2")
+        prefix = "jobs/job-1"
+
+        for day in ("01", "02", "03"):
+            data = f"payload-{day}".encode()
+            tar_path = _write_tar(tmp_path, f"env-{day}.tar.zst", data)
+            manifest = {
+                "size_compressed_bytes": len(data),
+                "created_at": f"2026-01-{day}T00:00:00+00:00",
+            }
+            ok = await fake_svc.upload_snapshot("job-1", tar_path, manifest)
+            assert ok is True
+
+        generations = _history_generations(fake_s3, prefix)
+        assert len(generations) == 2
+        assert not any(g.startswith("2026-01-01T") for g in generations)
+        assert any(g.startswith("2026-01-02T") for g in generations)
+        assert any(g.startswith("2026-01-03T") for g in generations)
+
+        # Canonical always reflects the LAST successful promote.
+        assert fake_s3.store[f"{prefix}/env.tar.zst"] == b"payload-03"
+        assert _staging_keys(fake_s3, prefix) == []
+
+
+class TestUploadSnapshotBackwardCompat:
+    """Restore reads (download_snapshot / get_manifest) are untouched:
+    they still resolve the canonical keys after a §C3 promote.
+    """
+
+    @pytest.mark.asyncio
+    async def test_download_snapshot_and_get_manifest_read_canonical_after_upload(
+        self, fake_svc, fake_s3, tmp_path
+    ):
+        tar_path = _write_tar(tmp_path, "env.tar.zst", _TAR_BYTES)
+        manifest = {
+            "size_compressed_bytes": len(_TAR_BYTES),
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "source_type": "vm",
+        }
+
+        ok = await fake_svc.upload_snapshot("job-1", tar_path, manifest)
+        assert ok is True
+
+        dest = tmp_path / "restored.tar.zst"
+        downloaded = await fake_svc.download_snapshot("job-1", str(dest))
+        assert downloaded is True
+        assert dest.read_bytes() == _TAR_BYTES
+
+        got_manifest = await fake_svc.get_manifest("job-1")
+        assert got_manifest is not None
+        assert got_manifest["size_compressed_bytes"] == len(_TAR_BYTES)
+        assert got_manifest["source_type"] == "vm"
+        assert "checksum_sha256" in got_manifest
+
+
+class TestGetStorageStatsHistoryExclusion:
+    """``history/`` generations must not inflate the snapshot count, but
+    their bytes still consume real storage and must still be counted.
+    """
+
+    @pytest.mark.asyncio
+    async def test_total_snapshots_excludes_history_but_bytes_include_it(
+        self, fake_svc, fake_s3, tmp_path
+    ):
+        prefix = "jobs/job-1"
+        tar_path = _write_tar(tmp_path, "env.tar.zst", _TAR_BYTES)
+        manifest = {
+            "size_compressed_bytes": len(_TAR_BYTES),
+            "created_at": "2026-01-01T00:00:00+00:00",
+        }
+
+        ok = await fake_svc.upload_snapshot("job-1", tar_path, manifest)
+        assert ok is True
+
+        stats = await fake_svc.get_storage_stats()
+
+        assert stats["total_snapshots"] == 1
+        # Canonical tar + canonical manifest + history's own copies of
+        # both — history bytes must still count toward storage even
+        # though they're excluded from the snapshot count.
+        canonical_bytes = len(fake_s3.store[f"{prefix}/env.tar.zst"])
+        assert stats["total_size_bytes"] >= canonical_bytes * 2
