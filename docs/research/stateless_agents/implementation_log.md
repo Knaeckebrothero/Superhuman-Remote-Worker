@@ -654,3 +654,98 @@ was to distrust the first — worth repeating on anything of this shape.
    session is re-claimed after >5 min idle.
 4. Session 1's follow-ups still stand: provisioning gate, cockpit `/prepare`
    compat, live cross-tenant scrub probe, interrupt-on-lane (currently 501).
+
+---
+
+# S3 implementation log — worker jobs on the stateless lane (2026-08-08)
+
+Working branch: `feature/stateless-workers-s3`, created directly from
+`feature/stateless-agents` at `3802d0e2`. No push. The only pre-existing
+working-tree entry was the untracked nested `HomeLab/`, which remains untouched.
+
+## Phase 0 — orientation and pre-change baseline (DONE)
+
+- Read `codex_s3_brief.md` end-to-end and followed its prescribed reading order:
+  design §9.1 first, then §5.1/§5.2/§5.4/§5.4.4/§5.8/§9, this implementation
+  log, the `run_queue` contract docstring, and the complete session executor.
+- Cluster baseline: Tilt resources `(Tiltfile)=ok`, `srw=ok`; stateless agent
+  Deployment `2/2`; both agent pods and the orchestrator pod Running.
+- Verified the running image contents before measuring: both agent pods contain
+  exactly one `turn timing:` marker in `/app/src/api/turn_executor.py`; the
+  orchestrator image uses `/app/main.py` (not `/app/orchestrator/main.py`) and
+  contains one `claim-bundle timing:` marker.
+- Real session-turn baseline through `scripts/stateless-lane-probe.sh turn`:
+  accepted as turn 73, answer observed in **7 s** wall clock. Agent timing was
+  **4.62 s total**: bundle 0.10 s, attach 2.10 s, pending 0.00 s, turn 2.19 s,
+  push 0.18 s, complete 0.05 s. Session setup was 1.99 s (13 remote-store ops,
+  1.76 s). Orchestrator claim-bundle timing was **0.063 s**: lease 0.002 s,
+  credentials 0.013 s, assembly 0.048 s.
+- Branch safety: stopped the confirmed `tilt up` process with SIGINT, switched
+  branches only after it exited, restarted Tilt, then re-verified `srw=ok` and
+  the Deployment at `2/2`. No filesystem branch switch occurred while Tilt was
+  running.
+- Safety state: no `worker_batch` unit has been enqueued. Gate 1 and Gate 2 are
+  still open and therefore continue to forbid a real worker claim.
+
+## Phase 1 / Gate 1 — one claim authority per job (DONE)
+
+Implemented migration `0118_jobs_execution_lane.sql`: `jobs.execution_lane`
+is a NOT NULL, constant-default (`pinned`) runtime-plane class, deliberately
+separate from `runner_kind` (`user|lifecycle|service` grant semantics). The
+legacy plane now fails closed by admitting only `execution_lane='pinned'` in:
+
+- `get_dispatchable_jobs`;
+- `claim_job_for_agent`;
+- all four mutation arms of `recover_orphaned_jobs`;
+- `recover_expired_lease_jobs`;
+- the same-host `register_agent` replacement recovery UPDATE.
+
+The audit found two bypasses beyond the four named in the brief and they were
+closed too: direct manual assignment now returns 409 for a stateless job, and
+both direct `/job/start` and `/job/resume` helpers refuse a non-pinned row before
+network I/O. `get_job()` was then found not to project the new lane; without
+that fix the production guards would default every real stateless row to pinned
+even though the mocks passed. It now returns `execution_lane`, with a real-DB
+assertion for both values.
+
+Migration discipline: app snapshot regenerated from zero; 0118 applied in
+**7 ms** during snapshot replay and **8 ms** on k3d; `schema-snapshot.sh --check
+app` is clean; the migration-head tripwire is 0118. Live DB reports default
+`'pinned'::text`, NOT NULL. The running orchestrator image was checked directly:
+six qualified sweep/re-registration predicates, one claim predicate, one
+dispatcher predicate, two `get_job`/dispatch projections, and both direct helper
+guards are present.
+
+Verification:
+
+- focused real-Postgres dispatcher/claim/manual suites: **33 passed** (including
+  explicit stateless and unknown-future-lane fail-closed cases);
+- full-schema k3d-Postgres sweep suite: **2 passed**, covering expired lease,
+  all four orphan arms, and same-host registration replacement; pinned controls
+  recover while stateless rows remain byte-for-byte owned by run_queue;
+- schema replay/check: clean; targeted Ruff check/format: clean;
+- post-change real session probe: answer observed in **7 s**, agent **4.87 s**
+  total (bundle 0.08, attach 2.05, turn 2.48, push 0.25, complete 0.01), versus
+  pre-change 7 s / 4.62 s. Orchestrator claim bundle was 0.070 s versus 0.063 s.
+  This gate is off the session hot path; the 0.25 s agent delta is normal setup/
+  provider variance, not attributed to the partition.
+
+Failures recorded:
+
+- first test invocation used nonexistent `venv/bin/pytest`; this checkout uses
+  `.venv/bin/pytest` (Python 3.13) for the focused container suites;
+- first Ruff invocation similarly assumed `.venv/bin/ruff`; repository-pinned
+  Ruff 0.14.10 is installed at `/home/ghost/.local/bin/ruff`;
+- first semantic sweep assertion expected zero recovered rows, but its own
+  pinned NULL-lease control correctly matched orphan recovery. The test now
+  asserts exactly one pinned recovery and separately proves all stateless rows
+  remain untouched.
+
+Rollout constraint: worker admission remains OFF until every orchestrator
+replica runs these predicates. Before an orchestrator rollback, disable worker
+admission, drain/fence active stateless work, and convert lanes only after no
+worker queue row is runnable/leased. An old orchestrator cannot understand the
+partition and would otherwise reintroduce dual execution.
+
+Safety state: still no `worker_batch` unit has been enqueued. Gate 2 remains the
+next mandatory prerequisite.

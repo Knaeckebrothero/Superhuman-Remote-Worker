@@ -132,9 +132,9 @@ APP_COMPUTE_INTERVAL_EPOCH_SHAPE_REPAIR_MIGRATION = (
 )
 # Bump this whenever a new app migration lands — the assertion below is the
 # tripwire that says "a migration was added; check the snapshot was regenerated
-# and nothing was renumbered". Head as of the stateless-agents affinity work.
+# and nothing was renumbered". Head as of the stateless worker lane partition.
 APP_CURRENT_MIGRATION_HEAD = (
-    ROOT / "orchestrator/database/migrations/app/0117_run_queue_affinity.sql"
+    ROOT / "orchestrator/database/migrations/app/0118_jobs_execution_lane.sql"
 )
 AUDIT_EXPANSION = (
     ROOT

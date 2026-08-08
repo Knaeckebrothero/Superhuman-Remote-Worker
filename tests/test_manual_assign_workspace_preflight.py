@@ -25,6 +25,7 @@ def _job(status: str, *, workspace_status: str | None = None) -> dict:
     return {
         "id": JOB_ID,
         "status": status,
+        "execution_lane": "pinned",
         "config_override": {"workspace": {"backend": "sandbox"}},
         "context": context,
     }
@@ -54,6 +55,20 @@ def collaborators(monkeypatch):
 
 
 class TestManualAssignWorkspacePreflight:
+    @pytest.mark.asyncio
+    async def test_stateless_job_rejects_direct_assignment(self, collaborators):
+        job = _job("created", workspace_status="ready")
+        job["execution_lane"] = "stateless"
+        main.postgres_db.get_job.return_value = job
+
+        with pytest.raises(main.HTTPException) as exc:
+            await main.assign_job_to_agent(MagicMock(), JOB_ID, AGENT_ID)
+
+        assert exc.value.status_code == 409
+        main.postgres_db.get_agent.assert_not_awaited()
+        main._dispatch_job_to_agent.assert_not_awaited()
+        main._resume_job_on_agent.assert_not_awaited()
+
     @pytest.mark.asyncio
     async def test_created_job_without_workspace_is_queued(self, collaborators):
         main.postgres_db.get_job.return_value = _job("created")
@@ -144,3 +159,17 @@ class TestAssignLaneChoice:
         assert result["status"] == "assigned"
         main._dispatch_job_to_agent.assert_awaited_once()
         main._resume_job_on_agent.assert_not_awaited()
+
+
+class TestPinnedDispatchDefenseInDepth:
+    @pytest.mark.asyncio
+    async def test_fresh_helper_refuses_stateless_job_before_network(self):
+        job = _job("created", workspace_status="ready")
+        job["execution_lane"] = "stateless"
+        assert await main._dispatch_job_to_agent(job, _agent()) is False
+
+    @pytest.mark.asyncio
+    async def test_resume_helper_refuses_stateless_job_before_network(self):
+        job = _job("paused", workspace_status="ready")
+        job["execution_lane"] = "stateless"
+        assert await main._resume_job_on_agent(job, _agent()) is False
