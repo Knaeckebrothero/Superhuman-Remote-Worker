@@ -31,6 +31,15 @@
 >   implemented** (see `docs/features/workspace_pvc_branch_a_implementation.md`).
 > - **Strand 2 (shell-grant loss on re-provision) was NOT re-investigated in this sweep** —
 >   treat it as still open pending a fresh check.
+>
+> **UPDATE 2026-08-08 (durability track).** Strand 1's recommended cure — porting the job
+> path's `.gitignore repos/` to the session `checkout_project_repository` — **shipped** as
+> F1 (`_ensure_checkout_path_ignored` in `src/tools/orchestrator/repositories.py`), so new
+> sessions no longer commit the checkout as a contentless gitlink and it survives every
+> recovery path (PVC or Gitea-fallback). Preventive only: threads whose repo already holds a
+> committed gitlink still need a one-time cleanup migration. **This issue stays OPEN** for
+> **strand 2** (shell-grant persistence, un-investigated) and **strand 3** (model degeneration
+> guards, not built) — do not move to `done/` until those are closed.
 
 **Filed:** 2026-07-24, from a live investigation of persistent thread `b1758f38` ("Hotel
 Rheinland ERP Job Status", project `68137e29` Better Resavio), turn 8 on 2026-07-23
