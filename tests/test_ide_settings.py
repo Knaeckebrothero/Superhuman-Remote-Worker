@@ -934,9 +934,7 @@ class TestSshTarToFileCommandShape:
         assert remote_cmd.count("'") == 2
 
     @pytest.mark.asyncio
-    async def test_remote_path_has_no_single_quote_so_embedding_is_safe(
-        self, tmp_path
-    ):
+    async def test_remote_path_has_no_single_quote_so_embedding_is_safe(self, tmp_path):
         # remote_path is interpolated directly into the single-quoted `-c`
         # body with no shell-escaping — safe only because filesystem paths
         # used here never contain a single quote. Assert that invariant
@@ -1081,7 +1079,9 @@ class TestIdeSettingsHonestRcRealBash:
         def run(tar_rc: int, zstd_rc: int, *, wrapped: bool) -> int:
             pipeline = f"( exit {tar_rc} ) | ( exit {zstd_rc} )"
             script = f"{pipeline}; {tail}" if wrapped else pipeline
-            result = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+            result = subprocess.run(
+                ["bash", "-c", script], capture_output=True, text=True
+            )
             return result.returncode
 
         # (tar_rc, zstd_rc) -> honest verdict: accept tar in {0,1} + clean
@@ -1120,7 +1120,9 @@ class TestIdeSettingsHonestRcRealBash:
         def run(zstd_rc: int, tar_rc: int, *, wrapped: bool) -> int:
             pipeline = f"( exit {zstd_rc} ) | ( exit {tar_rc} )"
             script = f"{pipeline}; {tail}" if wrapped else pipeline
-            result = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+            result = subprocess.run(
+                ["bash", "-c", script], capture_output=True, text=True
+            )
             return result.returncode
 
         # (zstd_rc, tar_rc) -> honest verdict: accept a clean zstd (0) + tar
