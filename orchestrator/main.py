@@ -4460,22 +4460,28 @@ async def _send_session_attach(
         )
 
 
-async def _send_session_attach_locked(
-    agent: dict,
+async def _assemble_session_attach_payload(
     thread_id: str,
+    *,
     config_override: Optional[dict] = None,
-    project_ids: Optional[list] = None,
-    datasources: Optional[list] = None,
     config_name: Optional[str] = None,
-) -> bool:
-    """Send a session attach request to an idle persistent agent.
+) -> Optional[dict[str, Any]]:
+    """Assemble the session-attach payload for a thread — the ONE assembly.
 
-    ``config_name`` is the thread's config — pool pods boot as workers
-    (``worker_base``), so the agent must re-resolve the session base config
-    from this name instead of its boot config
-    (docs/issues/session_config_name_plumbing.md, hole B).
+    Factored out of ``_send_session_attach_locked`` so the stateless-lane
+    claim bundle (``GET /internal/units/{unit_id}/claim-bundle``) and the
+    legacy pinned-lane sender deliver identical attach payloads under
+    identical fail-closed rules: lite workspace config injection, datasource
+    reauthorization (the attach boundary owns the authoritative re-read),
+    and ``_resolve_session_config`` grant/error handling.
 
-    Returns True if the agent accepted the session.
+    ``project_ids``/``datasources`` are deliberately NOT parameters: they are
+    mutable authorization grants recomputed here from the thread's current
+    state, never trusted from callers. Returns the payload dict, or ``None``
+    on ANY refusal — callers must treat ``None`` as "do not attach" and must
+    not distinguish refusal reasons (no enumeration oracle; details go to the
+    server log only). Call under ``postgres_db.thread_datasource_lock`` to
+    serialize with live connector-selection updates.
     """
     # Lite tiers (virtual/none) carry no SSH endpoint. For `virtual` we attach
     # the object-store mounts here — deployment-sourced credentials, in-flight
@@ -4487,7 +4493,7 @@ async def _send_session_attach_locked(
         )
     except LiteWorkspaceConfigError as exc:
         logger.error("Session attach: thread %s lite-config error: %s", thread_id, exc)
-        return False
+        return None
 
     # Orchestrator-resolved config for the warm-pool agent: this is the expert
     # delivery channel the warm path lacked (the 3-minute-stall bug). Re-resolve
@@ -4502,10 +4508,10 @@ async def _send_session_attach_locked(
             "Session attach: failed to load thread %s; refusing (fail closed)",
             thread_id,
         )
-        return False
+        return None
     if not _thread:
         logger.warning("Session attach: thread %s vanished; refusing", thread_id)
-        return False
+        return None
 
     _meta = _thread.get("metadata") or {}
     if isinstance(_meta, str):
@@ -4539,14 +4545,14 @@ async def _send_session_attach_locked(
             "scope is no longer available",
             thread_id,
         )
-        return False
+        return None
     except Exception:
         logger.exception(
             "Session attach: access revalidation failed for thread %s; "
             "refusing (fail closed)",
             thread_id,
         )
-        return False
+        return None
 
     try:
         if _thread:
@@ -4555,7 +4561,7 @@ async def _send_session_attach_locked(
             )
     except GrantDenied as gd:
         logger.warning("Session attach denied for thread %s: %s", thread_id, gd)
-        return False
+        return None
     except Exception:
         logger.exception(
             "Session attach: resolve failed for thread %s; using fallback", thread_id
@@ -4568,10 +4574,9 @@ async def _send_session_attach_locked(
             "Session attach: resolve errored for thread %s; refusing (fail closed)",
             thread_id,
         )
-        return False
+        return None
 
-    agent_url = f"http://{agent['pod_ip']}:{agent['pod_port']}/session/attach"
-    payload = {
+    return {
         "thread_id": thread_id,
         "config_override": None if resolved_config else config_override,
         "resolved_config": resolved_config,
@@ -4579,6 +4584,41 @@ async def _send_session_attach_locked(
         "datasources": datasources,
         "config_name": config_name,
     }
+
+
+async def _send_session_attach_locked(
+    agent: dict,
+    thread_id: str,
+    config_override: Optional[dict] = None,
+    project_ids: Optional[list] = None,
+    datasources: Optional[list] = None,
+    config_name: Optional[str] = None,
+) -> bool:
+    """Send a session attach request to an idle persistent agent.
+
+    ``config_name`` is the thread's config — pool pods boot as workers
+    (``worker_base``), so the agent must re-resolve the session base config
+    from this name instead of its boot config
+    (docs/issues/session_config_name_plumbing.md, hole B).
+
+    ``project_ids``/``datasources`` are accepted for caller compatibility but
+    ignored: the assembly recomputes both from the thread's current state
+    (they are mutable authorization grants — see
+    ``_assemble_session_attach_payload``, which owns the payload build and
+    every fail-closed rule).
+
+    Returns True if the agent accepted the session.
+    """
+    del project_ids, datasources  # recomputed inside the assembly (see docstring)
+    payload = await _assemble_session_attach_payload(
+        thread_id,
+        config_override=config_override,
+        config_name=config_name,
+    )
+    if payload is None:
+        return False
+
+    agent_url = f"http://{agent['pod_ip']}:{agent['pod_port']}/session/attach"
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.post(agent_url, json=payload)
@@ -9974,6 +10014,15 @@ async def lifespan(app: FastAPI):
     thread_events_prune_task = asyncio.create_task(
         thread_events_prune_sweeper(_shutdown_event)
     )
+    # Stateless-lane lease reaper (stateless_agents.md §5.2): leader-gated on
+    # its OWN advisory lock (RUN_QUEUE_REAPER_ID — not run_when_leader, so the
+    # sweep can survive a main-leader handover independently); per-row CAS
+    # steals + turn.interrupted/turn.parked journal frames.
+    from services.run_queue_reaper import run_queue_reaper_loop
+
+    run_queue_reaper_task = asyncio.create_task(
+        run_queue_reaper_loop(postgres_db, _shutdown_event)
+    )
     security_events_prune_task = asyncio.create_task(
         security_events_prune_sweeper(_shutdown_event)
     )
@@ -10220,6 +10269,7 @@ async def lifespan(app: FastAPI):
     await dispatcher_task
     await sudo_sweeper_task
     await thread_events_prune_task
+    await run_queue_reaper_task
     await security_events_prune_task
     await checkpoint_retention_task
     await headless_notify_task
@@ -30784,12 +30834,143 @@ class ThreadInputRequest(BaseModel):
     turn_id: Optional[int] = None
 
 
+async def _load_thread_for_owner(thread_id: str, user: dict) -> dict:
+    """Load a thread under the same owner gate ``_resolve_thread_for_forwarding``
+    applies (404 unknown; fail-closed 403 for orphans and non-owners; admin
+    bypass) — WITHOUT its agent-resolution / workspace-restore side effects.
+
+    Used by the stateless-lane branches: queue-lane threads have no bound
+    agent, so the forwarding resolver's 503 would mask the lane entirely.
+    """
+    thread = await postgres_db.get_thread(thread_id)
+    if not thread:
+        raise HTTPException(status_code=404, detail="Thread not found")
+    if not user.get("is_admin") and str(thread.get("user_id") or "") != str(user["id"]):
+        raise HTTPException(status_code=403, detail="Not your thread")
+    return thread
+
+
+async def _thread_input_stateless(thread: dict, content: str) -> dict[str, Any]:
+    """Admit one user turn for a stateless-lane thread (stateless_agents.md
+    §5.3.1): persist the message, advance the input watermark, and queue the
+    unit — all in ONE transaction, so "message durable ⟺ watermark advanced"
+    can never tear and a signal can never be lost.
+
+    The message row is indistinguishable from the agent's accept-time persist
+    of a plain-text human message (``src/api/persistent_app._accept_user_input``
+    → ``src/database/postgres_db.save_thread_message``): same ``msg_`` id mint
+    with the agent's own uuid5 row-id coercion, ``role='human'``,
+    ``turn_number = total_turns + 1``, all other columns at their NULL
+    defaults, and the same ``threads`` last_activity/total_turns bump.
+
+    Admission is ``record_input_seq`` — the input-during-anything path: it
+    creates a fresh ``'queued'`` row, revives ``'done'``, merges the watermark
+    into ``'queued'``, bumps ONLY the watermark on ``'leased'`` (the running
+    turn's completion re-queues via ``input_seq > consumed_seq``), and records
+    input on ``'parked'`` without reviving it (explicit unpark only). No
+    separate ``enqueue_unit`` call is needed: every branch leaves the unit
+    queued, leased-with-watermark, or deliberately parked.
+    """
+    from src.database.postgres_db import _coerce_row_id
+    from src.shared.run_queue import (
+        UNIT_KIND_SESSION_TURN,
+        queue_depth_for,
+        record_input_seq,
+    )
+
+    thread_id = str(thread["id"])
+    turn_number = int(thread.get("total_turns") or 0) + 1
+    # Mirror the agent's accept-time mint exactly; the row id is the same
+    # deterministic uuid5 the agent-side coercion would derive from this raw
+    # id, so a later executor re-persist upserts onto this row (ON CONFLICT
+    # (id)) instead of duplicating the user bubble.
+    raw_msg_id = f"msg_{uuid4().hex[:24]}"
+    row_id = _coerce_row_id(raw_msg_id)
+    fair_key = str(thread["user_id"]) if thread.get("user_id") else None
+
+    async with postgres_db.acquire() as conn:
+        async with conn.transaction():
+            seq = await conn.fetchval(
+                """
+                INSERT INTO thread_messages (id, thread_id, role, content, turn_number)
+                VALUES ($1, $2, 'human', $3, $4)
+                RETURNING seq
+                """,
+                row_id,
+                thread_id,
+                content,
+                turn_number,
+            )
+            # Same activity bump the agent's save_thread_message performs.
+            await conn.execute(
+                """
+                UPDATE threads
+                SET last_activity = CURRENT_TIMESTAMP,
+                    total_turns   = GREATEST(total_turns, COALESCE($2, 0))
+                WHERE id = $1
+                """,
+                thread_id,
+                turn_number,
+            )
+            state = await record_input_seq(
+                conn,
+                unit_id=thread_id,
+                unit_kind=UNIT_KIND_SESSION_TURN,
+                input_seq=int(seq),
+                fair_key=fair_key,
+            )
+        # Post-commit watermark read (same conn): §5.3.1 response parity —
+        # queue_depth comes from unconsumed watermarks, not a process queue.
+        wm = await queue_depth_for(conn, unit_id=thread_id)
+
+    queue_depth = 1 if (wm is not None and wm.has_pending_input) else 0
+    logger.info(
+        "run_queue enqueue: thread=%s turn=%d input_seq=%d state=%s",
+        thread_id,
+        turn_number,
+        int(seq),
+        state,
+    )
+    return {
+        "accepted": True,
+        "turn_id": turn_number,
+        "queue": {
+            "state": state,
+            "queue_depth": queue_depth,
+            "message_id": raw_msg_id,
+            "input_seq": int(seq),
+        },
+    }
+
+
 @app.post("/api/persistent/threads/{thread_id}/input")
 async def thread_input(
     thread_id: str, body: ThreadInputRequest, request: Request
 ) -> dict[str, Any]:
     """Submit user input to a thread. Per-turn lock returns 409 on dupes."""
+    from src.shared.run_queue import LANE_STATELESS
+
     user = await require_approved_user(request, postgres_db)
+
+    # Stateless-lane admission (stateless_agents.md §5.3.1) resolves BEFORE
+    # agent forwarding — queue-lane threads have no bound agent, so
+    # _resolve_thread_for_forwarding would 503 on them. Owner gate identical
+    # to the resolver's; the pinned path below is untouched (its resolver
+    # re-loads the thread and re-applies the same checks).
+    lane_thread = await _load_thread_for_owner(thread_id, user)
+    if lane_thread.get("execution_lane") == LANE_STATELESS:
+        if not body.content or not isinstance(body.content, str):
+            raise HTTPException(
+                status_code=400, detail="content must be a non-empty string"
+            )
+        # The per-turn in-process lock below is deliberately SKIPPED on this
+        # lane: the run_queue itself serializes turns (input during a leased
+        # turn only advances the watermark; one row per unit dedups the
+        # queue), and the lock dict is per-process state — replica-unsafe
+        # under the 2-replica topology anyway. body.turn_id is ignored: the
+        # queue lane derives the turn number from DB truth (total_turns + 1).
+        return await _thread_input_stateless(lane_thread, body.content)
+
     thread, agent = await _resolve_thread_for_forwarding(thread_id, user)
 
     if not body.content or not isinstance(body.content, str):
@@ -30844,10 +31025,160 @@ async def thread_input(
 async def thread_interrupt(thread_id: str, request: Request) -> dict[str, Any]:
     """Interrupt the in-flight turn. Mode (hard/graceful) is decided by
     the agent based on whether a tool is currently mid-`ainvoke`."""
+    from src.shared.run_queue import LANE_STATELESS
+
     user = await require_approved_user(request, postgres_db)
+    lane_thread = await _load_thread_for_owner(thread_id, user)
+    if lane_thread.get("execution_lane") == LANE_STATELESS:
+        # S1 deferral (implementation log): interrupting a leased turn needs a
+        # control-verb transport to whichever executor holds the lease — the
+        # queue lane has no bound pod to forward to. Deliberate 501, not 503.
+        raise HTTPException(
+            status_code=501,
+            detail="interrupt is not yet supported on the stateless lane (S1)",
+        )
     _, agent = await _resolve_thread_for_forwarding(thread_id, user)
     result = await _forward_to_agent(agent, "/api/interrupt", {})
     return {"accepted": True, "agent": result}
+
+
+@app.get("/internal/units/{unit_id}/claim-bundle")
+async def internal_unit_claim_bundle(
+    unit_id: str, request: Request, lease_token: int
+) -> dict[str, Any]:
+    """Claim bundle for a leased stateless unit — internal (agent executor).
+
+    The stateless turn executor calls this right after ``claim_unit`` to get
+    everything a turn needs: the queue watermarks (skip-if-answered) and the
+    full session-attach payload (config resolution, credentials in-flight,
+    reauthorized datasources) — assembled by the SAME
+    ``_assemble_session_attach_payload`` the pinned-lane sender uses, under
+    the same fail-closed rules.
+
+    Auth is two-layer (stateless_agents.md §5.6): the ``X-Internal-Key``
+    transport guard every agent→orchestrator call carries, PLUS proof of a
+    LIVE lease — (unit_id, lease_token) must match ``state='leased'`` with
+    the exact current token, checked server-side in one SELECT that also
+    reads the watermarks. Credentials therefore flow only to the executor
+    that currently holds the unit; a zombie with a stale token gets the same
+    generic 403 as a guess (no enumeration oracle).
+
+    Errors: 401 bad internal key; 403 token mismatch / not leased (single
+    generic detail); 404 unit row absent; 409 not a session unit, thread not
+    on the stateless lane, or attach assembly refused (generic reason).
+    """
+    await require_internal(request)
+    from src.shared.run_queue import LANE_STATELESS, UNIT_KIND_SESSION_TURN
+
+    try:
+        UUID(str(unit_id))
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=404, detail="Unknown unit") from None
+
+    async with postgres_db.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT unit_kind, state, lease_token, input_seq, consumed_seq "
+            "FROM run_queue WHERE unit_id = $1::uuid",
+            unit_id,
+        )
+    if row is None:
+        raise HTTPException(status_code=404, detail="Unknown unit")
+    if row["state"] != "leased" or int(row["lease_token"]) != int(lease_token):
+        # ONE generic detail for both cases — stale token and not-leased are
+        # deliberately indistinguishable to the caller.
+        raise HTTPException(status_code=403, detail="Lease validation failed")
+    if row["unit_kind"] != UNIT_KIND_SESSION_TURN:
+        raise HTTPException(status_code=409, detail="Unit kind carries no attach")
+
+    # unit_id == thread_id for session_turn units.
+    thread = await postgres_db.get_thread(unit_id)
+    if not thread or thread.get("execution_lane") != LANE_STATELESS:
+        raise HTTPException(
+            status_code=409, detail="Thread is not on the stateless lane"
+        )
+
+    # Derive the assembly inputs exactly the way the resume dispatcher does
+    # (resume_thread._reprovision): the stored override from metadata (secrets
+    # stripped at rest) + in-flight credential re-injection. Secrets travel in
+    # this response only — never persisted to the thread row (§5.6).
+    md = thread.get("metadata") or {}
+    if isinstance(md, str):
+        try:
+            md = json.loads(md)
+        except (json.JSONDecodeError, TypeError):
+            md = {}
+    co = (md.get("config_override") or {}) if isinstance(md, dict) else {}
+    pids = await _thread_project_ids(unit_id)
+    include_kb_profile = await _thread_has_knowledge_scope(
+        project_ids=pids,
+        datasource_ids=(md.get("datasource_ids") if isinstance(md, dict) else None),
+    )
+    co = await _inject_thread_dispatch_credentials(
+        co,
+        user_id=str(thread["user_id"]) if thread.get("user_id") else None,
+        project_id=str(thread["project_id"]) if thread.get("project_id") else None,
+        include_kb_profile=include_kb_profile,
+    )
+    config_name = canonical_config_name(thread.get("config_name") or "session_base")
+
+    # Same serialization the pinned sender takes (_send_session_attach): the
+    # assembly must not race a live connector-selection update.
+    async with postgres_db.thread_datasource_lock(unit_id):
+        attach = await _assemble_session_attach_payload(
+            unit_id, config_override=co, config_name=config_name
+        )
+    if attach is None:
+        # Generic by design — refusal reasons live in the server log only.
+        raise HTTPException(status_code=409, detail="Attach assembly refused")
+
+    return {
+        "unit_id": unit_id,
+        "thread_id": unit_id,
+        "unit_kind": UNIT_KIND_SESSION_TURN,
+        "execution_lane": LANE_STATELESS,
+        "watermarks": {
+            "input_seq": row["input_seq"],
+            "consumed_seq": row["consumed_seq"],
+        },
+        "attach": attach,
+    }
+
+
+@app.get("/api/admin/run-queue")
+async def admin_run_queue_read_model(request: Request) -> dict[str, Any]:
+    """Operator read model for the stateless run_queue (admin only).
+
+    ``src/shared/run_queue.list_active`` passthrough: current leases (with
+    ``lease_remaining_seconds`` — negative means expired, awaiting the
+    reaper) and parked units (the unpark worklist). Diagnostics only; never
+    an input to correctness decisions.
+    """
+    await _require_admin(request)
+    from src.shared.run_queue import list_active
+
+    async with postgres_db.acquire() as conn:
+        return await list_active(conn)
+
+
+@app.post("/api/admin/run-queue/{unit_id}/unpark")
+async def admin_run_queue_unpark(unit_id: str, request: Request) -> dict[str, Any]:
+    """Operator verb: parked → queued, attempts reset, runnable now (admin
+    only). The ONLY path out of 'parked' — neither enqueue nor input recording
+    revives a parked unit (§5.1). 404 when the unit is not currently parked.
+    """
+    await _require_admin(request)
+    from src.shared.run_queue import unpark_unit
+
+    try:
+        UUID(str(unit_id))
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=404, detail="Unit is not parked") from None
+    async with postgres_db.acquire() as conn:
+        ok = await unpark_unit(conn, unit_id=unit_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Unit is not parked")
+    logger.info("run_queue unpark: unit=%s", unit_id)
+    return {"unit_id": unit_id, "state": "queued"}
 
 
 class ThreadApproveRequest(BaseModel):
