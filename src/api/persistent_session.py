@@ -353,21 +353,68 @@ class PersistentSession:
             self.citation_verify_aux = None
             self.citation_verification_prompt = ""
 
+        _steps: Dict[str, float] = {}
+        _t = time.perf_counter()
+
+        try:
+            await self._setup_steps(
+                _steps,
+                _t,
+                llm=llm,
+                auxiliary_llm=auxiliary_llm,
+                postgres_conn=postgres_conn,
+                vector_conn=vector_conn,
+                workspace_override=workspace_override,
+                git_remote_url=git_remote_url,
+                cloud_mount_cfg=cloud_mount_cfg,
+            )
+        finally:
+            # Close the scoped metadata index opened in _setup_workspace, on
+            # every path — a failed setup must not leave a cached view behind
+            # for whatever runs next on this backend object.
+            self._end_backend_read_cache()
+
+    async def _setup_steps(
+        self,
+        _steps: Dict[str, float],
+        _t: float,
+        *,
+        llm: BaseChatModel,
+        auxiliary_llm: Optional[Any],
+        postgres_conn: Optional[Any],
+        vector_conn: Optional[Any],
+        workspace_override: Optional[Dict[str, Any]],
+        git_remote_url: Optional[str],
+        cloud_mount_cfg: Optional[Dict[str, Any]],
+    ) -> None:
+        """The ordered setup steps of :meth:`setup` (see its docstring).
+
+        Split out only so ``setup`` can wrap the whole sequence in the
+        scoped-index try/finally without indenting every step.
+        """
         # 1. Create workspace (with optional remote backend + git)
         await self._setup_workspace(
             workspace_override=workspace_override, git_remote_url=git_remote_url
         )
+        _steps["workspace"] = time.perf_counter() - _t
+        _t = time.perf_counter()
 
         # 2. Set up lazy cloud mounts before shell/tools so `/workspace/cloud`
         #    exists when the agent starts using the workspace.
         await self._setup_cloud_mount(cloud_mount_cfg)
+        _steps["cloud_mount"] = time.perf_counter() - _t
+        _t = time.perf_counter()
 
         # 3. Set up shell manager BEFORE tools so shell tools can detect it
         self._setup_shell_manager()
+        _steps["shell"] = time.perf_counter() - _t
+        _t = time.perf_counter()
 
         # 4. Initialize knowledge base connections BEFORE tools so knowledge
         #    tools can detect them via ToolContext.has_knowledge()
         self._setup_knowledge(vector_conn)
+        _steps["knowledge"] = time.perf_counter() - _t
+        _t = time.perf_counter()
 
         # 4b. Resolve the owning user from the thread row so tools can forward
         #     X-MCP-User-Id on orchestrator calls (fixes the agent's read-job
@@ -386,14 +433,23 @@ class PersistentSession:
                     e,
                 )
 
+        _steps["user_id"] = time.perf_counter() - _t
+        _t = time.perf_counter()
+
         # 5. Create tool context and load tools
         self._setup_tools(postgres_conn)
+        _steps["tools"] = time.perf_counter() - _t
+        _t = time.perf_counter()
 
         # 6. Bind tools to LLM
         self._bind_tools()
+        _steps["bind"] = time.perf_counter() - _t
+        _t = time.perf_counter()
 
         # 7. Create context manager
         self._setup_context_manager()
+        _steps["context"] = time.perf_counter() - _t
+        _t = time.perf_counter()
 
         # 8. Build system prompt (interactive mode has its own prompt files)
         self.system_prompt = get_phase_system_prompt(
@@ -403,16 +459,78 @@ class PersistentSession:
             tool_names=[t.name for t in self.tools] if self.tools else None,
             prompt_type="interactive",
         )
+        _steps["prompt"] = time.perf_counter() - _t
+        _t = time.perf_counter()
 
         # 9. Set up memory (RecallStore) if enabled
         self._setup_memory(postgres_conn, vector_conn)
         self._refresh_runtime_facts()
+        _steps["memory"] = time.perf_counter() - _t
 
         logger.info(
             f"PersistentSession initialized: thread={self.thread_id}, "
             f"tools={len(self.tools or [])}, "
             f"mode={self.permission_mode}"
         )
+        logger.info(
+            "setup steps: %s | store: %s",
+            " ".join(f"{k}={v:.2f}s" for k, v in _steps.items() if v >= 0.01),
+            self._drain_store_stats(),
+        )
+
+    def _unwrapped_backend(self, backend: Any = None) -> Any:
+        """The real backend behind any virtual overlay wrapper."""
+        try:
+            from ..core.backends.overlay import unwrap_backend
+
+            if backend is None:
+                backend = getattr(self.workspace_manager, "backend", None)
+            return unwrap_backend(backend) if backend is not None else None
+        except Exception:
+            return None
+
+    def _begin_backend_read_cache(self, backend: Any = None) -> None:
+        """Open the backend's scoped metadata index, if it has one.
+
+        Only the virtual (object-store) backend implements this — it is the
+        one whose metadata probes are process spawns. Every other backend
+        no-ops, and a failure here is never fatal: the index is an
+        optimization, not a correctness requirement.
+        """
+        target = self._unwrapped_backend(backend)
+        begin = getattr(target, "begin_read_cache", None)
+        if begin is None:
+            return
+        try:
+            begin()
+        except Exception:
+            logger.debug("backend read-cache priming skipped", exc_info=True)
+
+    def _end_backend_read_cache(self, backend: Any = None) -> None:
+        target = self._unwrapped_backend(backend)
+        end = getattr(target, "end_read_cache", None)
+        if end is None:
+            return
+        try:
+            end()
+        except Exception:
+            logger.debug("backend read-cache close failed", exc_info=True)
+
+    def _drain_store_stats(self) -> str:
+        """Object-store op tally for the phase that just ran, if the backend
+        keeps one (rclone-backed virtual workspaces do — every op there is a
+        process spawn, so the count IS the cost)."""
+        try:
+            from ..core.backends.overlay import unwrap_backend
+
+            backend = getattr(self.workspace_manager, "backend", None)
+            if backend is None:
+                return "n/a"
+            store = getattr(unwrap_backend(backend), "_store", None)
+            drain = getattr(store, "drain_op_stats", None)
+            return drain() if drain is not None else "n/a"
+        except Exception:
+            return "n/a"
 
     async def _setup_workspace(
         self,
@@ -451,6 +569,12 @@ class PersistentSession:
             workspace_backend = create_lite_backend(lite_cfg, job_id=self.thread_id)
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(None, workspace_backend.connect)
+            # Setup asks the store "does this exist?" dozens of times about
+            # one small tree (scaffolding, instruction files, skill files,
+            # the legacy-tools sweep) and every ask is an rclone spawn.
+            # Answer them all from one listing; the scope closes at the end
+            # of setup() so tool work is never served from a cache.
+            self._begin_backend_read_cache(workspace_backend)
             self.workspace_manager = WorkspaceManager(
                 job_id=self.thread_id,
                 base_path=base_path,

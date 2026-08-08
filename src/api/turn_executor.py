@@ -86,6 +86,13 @@ IDLE_POLL_SECONDS = 0.5
 IDLE_POLL_BACKOFF_SECONDS = 2.0
 IDLE_POLLS_BEFORE_BACKOFF = 30
 POLL_JITTER = 0.2  # ±20%
+# How long a pod keeps an idle thread's session attached, hoping for the next
+# turn (§5.3.4). The win it buys is the whole attach (measured 7.4s on k3d);
+# the cost is one process's worth of session state — LLM clients, workspace
+# backend, knowledge stores — held for a thread nobody is talking to. Well
+# under the reaper's steal horizon, so an expired warm cache never masks a
+# lease problem.
+WARM_SESSION_IDLE_TTL_SECONDS = 300.0
 CLOUD_PUSH_WAIT_SECONDS = 60.0  # §5.3.5 option (i): the lease covers the push
 TURN_ABORT_GRACE_SECONDS = 15.0  # polite-unwind budget after an interrupt
 COMPLETE_RETRY_ATTEMPTS = 3
@@ -133,9 +140,61 @@ def attach_fingerprint(attach: Dict[str, Any]) -> str:
     project scope forces a re-attach; identical bundles reuse the live
     session. ``default=str`` keeps exotic values (UUIDs, datetimes) stable
     rather than raising.
+
+    Resolution METADATA is excluded before hashing: ``resolved_config
+    .resolved_at`` is a wall-clock stamp minted by every
+    ``serialize_resolved_config`` call and consumed by nothing — hashing it
+    made every claim's bundle unique, which is precisely the measured cause
+    of the never-firing affinity cache (turn 3 of the 2026-08-08 baseline:
+    ``changed_paths=['resolved_config.resolved_at']``). Config CONTENT
+    changes (model, prompts — including their daily ``Current date:`` line —
+    tools, datasources) still change the hash and force the re-attach they
+    should.
     """
+    rc = attach.get("resolved_config")
+    if isinstance(rc, dict) and "resolved_at" in rc:
+        attach = {
+            **attach,
+            "resolved_config": {k: v for k, v in rc.items() if k != "resolved_at"},
+        }
     canonical = json.dumps(attach, sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def fingerprint_diff_paths(
+    old: Any, new: Any, *, max_depth: int = 3, max_paths: int = 20
+) -> List[str]:
+    """Dotted paths (KEYS ONLY — never values; bundles hold secrets) where two
+    attach payloads differ. Diagnostic for affinity misses: answers *which*
+    part of the bundle was volatile without ever logging credential material.
+    """
+    paths: List[str] = []
+
+    def _canon(v: Any) -> str:
+        return json.dumps(v, sort_keys=True, separators=(",", ":"), default=str)
+
+    def _walk(a: Any, b: Any, prefix: str, depth: int) -> None:
+        if len(paths) >= max_paths:
+            return
+        if isinstance(a, dict) and isinstance(b, dict) and depth < max_depth:
+            for key in sorted(set(a) | set(b)):
+                pa_, pb_ = a.get(key), b.get(key)
+                if _canon(pa_) != _canon(pb_):
+                    _walk(
+                        pa_, pb_, f"{prefix}.{key}" if prefix else str(key), depth + 1
+                    )
+        elif isinstance(a, list) and isinstance(b, list) and depth < max_depth:
+            if len(a) != len(b):
+                paths.append(f"{prefix}[len {len(a)}->{len(b)}]")
+                return
+            for i, (ia, ib) in enumerate(zip(a, b)):
+                if _canon(ia) != _canon(ib):
+                    _walk(ia, ib, f"{prefix}[{i}]", depth + 1)
+        else:
+            paths.append(prefix or "<root>")
+
+    _walk(old, new, "", 0)
+    return paths
 
 
 def strip_restored_pending_humans(
@@ -201,6 +260,7 @@ class StatelessTurnExecutor:
         jitter: float = POLL_JITTER,
         cloud_push_wait_seconds: float = CLOUD_PUSH_WAIT_SECONDS,
         abort_grace_seconds: float = TURN_ABORT_GRACE_SECONDS,
+        warm_session_idle_ttl_seconds: float = WARM_SESSION_IDLE_TTL_SECONDS,
     ) -> None:
         self._pod_name = (
             pod_name or os.getenv("POD_NAME") or socket.gethostname() or "agent"
@@ -211,12 +271,18 @@ class StatelessTurnExecutor:
         self._jitter = jitter
         self._cloud_push_wait_seconds = cloud_push_wait_seconds
         self._abort_grace_seconds = abort_grace_seconds
+        self._warm_session_idle_ttl = warm_session_idle_ttl_seconds
+        self._warm_since: Optional[float] = None
 
         # S1 acceptance (zero in-process claim state): everything below is
         # either the soft-affinity hint or plumbing. Correctness never
         # depends on any of it surviving a restart.
         self._prefer_unit_id: Optional[Any] = None  # last thread served
         self._attached_fingerprint: Optional[str] = None
+        # Previous attach payload, kept ONLY for affinity-miss path diffing
+        # (fingerprint_diff_paths — key paths, never values). Same process
+        # that holds the live session's credentials, so no new exposure.
+        self._attached_bundle: Optional[Dict[str, Any]] = None
         self._lease = LeaseHandle()
         self._stop = asyncio.Event()
         self._task: Optional[asyncio.Task] = None
@@ -299,12 +365,43 @@ class StatelessTurnExecutor:
             await asyncio.wait_for(self._stop.wait(), timeout=max(0.0, delay))
 
     def _idle_delay(self, idle_polls: int) -> float:
-        base = (
-            self._idle_backoff_seconds
-            if idle_polls >= self._idle_polls_before_backoff
-            else self._idle_poll_seconds
+        # A pod holding a warm session never enters backoff: the DB-side
+        # affinity grace (AFFINITY_GRACE_SECONDS) is sized for the FAST poll
+        # cadence, and a backed-off warm pod would sleep straight through its
+        # own head start and hand the thread to a cold pod.
+        backed_off = (
+            idle_polls >= self._idle_polls_before_backoff
+            and self._attached_fingerprint is None
         )
+        base = self._idle_backoff_seconds if backed_off else self._idle_poll_seconds
         return base * (1.0 + random.uniform(-self._jitter, self._jitter))
+
+    def _mark_warm(self, claim: ClaimedUnit) -> None:
+        """Record this claim as the affinity hint and (re)start the warm clock.
+
+        Called only where a claim finished cleanly, so the cached session (if
+        any) matches the thread this pod should keep preferring.
+        """
+        self._prefer_unit_id = claim.unit_id
+        self._warm_since = time.monotonic()
+
+    async def _expire_warm_session(self) -> None:
+        """Drop a warm session nobody has come back to (see the TTL constant).
+
+        Only ever runs on the idle path — between claims — so it cannot race
+        a turn, and the next claim for that thread simply attaches fresh.
+        """
+        if self._warm_since is None or self._attached_fingerprint is None:
+            return
+        idle_for = time.monotonic() - self._warm_since
+        if idle_for < self._warm_session_idle_ttl:
+            return
+        logger.info(
+            "warm session expired after %.0fs idle (unit=%s) — detaching",
+            idle_for,
+            self._prefer_unit_id,
+        )
+        await self._detach_cached_session("warm_idle_ttl")
 
     # ------------------------------------------------------------------
     # Main loop
@@ -340,6 +437,7 @@ class StatelessTurnExecutor:
                 continue
             if claim is None:
                 idle_polls += 1
+                await self._expire_warm_session()
                 await self._sleep_interruptible(self._idle_delay(idle_polls))
                 continue
             idle_polls = 0
@@ -420,7 +518,7 @@ class StatelessTurnExecutor:
                 claim.consumed_seq,
                 state,
             )
-            self._prefer_unit_id = claim.unit_id
+            self._mark_warm(claim)
             return
 
         # (c) Independent heartbeat — spawned BEFORE the bundle fetch/attach,
@@ -445,6 +543,8 @@ class StatelessTurnExecutor:
         # release below is a no-op when the lease is genuinely gone (401/403 =
         # "treat as lease lost: release nothing" happens naturally via the
         # WHERE lease_token=$2 AND state='leased' guard in release_unit).
+        timing: Dict[str, float] = {}
+        t0 = time.perf_counter()
         try:
             bundle = await self._fetch_bundle(unit_id, token)
         except ClaimBundleError as e:
@@ -468,6 +568,7 @@ class StatelessTurnExecutor:
             await self._release(claim, reason="bundle_error")
             return
 
+        timing["bundle"] = time.perf_counter() - t0
         attach = bundle.get("attach") or {}
         # Watermarks: the claim's values were read atomically inside the claim
         # statement — they are the authority; the bundle's copy is diagnostics.
@@ -481,6 +582,7 @@ class StatelessTurnExecutor:
             and pa._thread_id == unit_id
             and self._attached_fingerprint == fingerprint
         )
+        t0 = time.perf_counter()
         if reuse:
             # Same thread, unchanged config: reuse the live session. The
             # mutable LeaseHandle repoints every fenced writer (message
@@ -492,13 +594,25 @@ class StatelessTurnExecutor:
                 fingerprint[:12],
             )
         else:
+            if (
+                pa._session is not None
+                and pa._thread_id == unit_id
+                and self._attached_bundle is not None
+            ):
+                # Same thread, changed fingerprint: name WHICH bundle paths
+                # were volatile (§5.3.4 affinity-miss diagnosis; paths only,
+                # never values).
+                changed = fingerprint_diff_paths(self._attached_bundle, attach)
+                logger.info("affinity miss: unit=%s changed_paths=%s", unit_id, changed)
             if pa._session is not None:
                 # Detach BEFORE repointing the lease handle: the old writer's
                 # close/drain must flush under the OLD unit's lease identity,
                 # not this claim's.
                 await self._detach_cached_session("claim_switch")
+            timing["detach"] = time.perf_counter() - t0
             self._scrub_process_residue()
             self._lease.update(unit_id, token)
+            t0 = time.perf_counter()
             try:
                 await pa._attach_session(**attach)
             except Exception as e:
@@ -509,9 +623,12 @@ class StatelessTurnExecutor:
                 await self._release(claim, reason="attach_failed")
                 return
             self._attached_fingerprint = fingerprint
+            self._attached_bundle = attach
             fresh_attach = True
+        timing["attach"] = time.perf_counter() - t0
 
         # (f) Oldest unanswered input.
+        t0 = time.perf_counter()
         try:
             pending = await self._fetch_pending_rows(unit_id, consumed_seq)
         except Exception as e:
@@ -538,7 +655,7 @@ class StatelessTurnExecutor:
                 fallback,
                 state,
             )
-            self._prefer_unit_id = claim.unit_id
+            self._mark_warm(claim)
             return
 
         # (g) Strip restored pending copies — only a fresh attach ran the
@@ -572,8 +689,10 @@ class StatelessTurnExecutor:
                 target["seq"],
                 state,
             )
-            self._prefer_unit_id = claim.unit_id
+            self._mark_warm(claim)
             return
+
+        timing["pending"] = time.perf_counter() - t0
 
         # (h) Inject — the row already exists (accept-time persist is
         # orchestrator-side on this lane), so ONLY the queue put + loop
@@ -593,11 +712,17 @@ class StatelessTurnExecutor:
 
         # (i) Wait for the turn's completion hook (event, not a poll), the
         # lease-lost signal, or the loop dying under us.
+        t0 = time.perf_counter()
         outcome = await self._await_turn(turn_done, loop_task)
+        timing["turn"] = time.perf_counter() - t0
 
         if outcome == "turn_done":
+            t0 = time.perf_counter()
             await self._await_cloud_push(pa)
+            timing["push"] = time.perf_counter() - t0
+            t0 = time.perf_counter()
             state = await self._complete_with_retry(claim, consumed_seq=target["seq"])
+            timing["complete"] = time.perf_counter() - t0
             if state is None:
                 # Fenced out at completion: a steal beat us after the final
                 # persist. The successor's claim decides what still needs
@@ -618,7 +743,22 @@ class StatelessTurnExecutor:
                 target["seq"],
                 state,
             )
-            self._prefer_unit_id = claim.unit_id  # soft affinity for next poll
+            logger.info(
+                "turn timing: unit=%s mode=%s bundle=%.2fs detach=%.2fs "
+                "attach=%.2fs pending=%.2fs turn=%.2fs push=%.2fs "
+                "complete=%.2fs total=%.2fs",
+                unit_id,
+                "reuse" if reuse else "fresh",
+                timing.get("bundle", 0.0),
+                timing.get("detach", 0.0),
+                timing.get("attach", 0.0),
+                timing.get("pending", 0.0),
+                timing.get("turn", 0.0),
+                timing.get("push", 0.0),
+                timing.get("complete", 0.0),
+                sum(timing.values()),
+            )
+            self._mark_warm(claim)  # soft affinity + warm-TTL clock
         elif outcome == "lease_lost":
             # Polite fast path (§5.2): stop the turn the way the graceful
             # interrupt does; further fenced persists would only die at the
@@ -867,7 +1007,9 @@ class StatelessTurnExecutor:
         (client cache-wipe cascade) on the next claim's attach."""
         pa = _pa()
         self._attached_fingerprint = None
+        self._attached_bundle = None
         self._prefer_unit_id = None
+        self._warm_since = None
         pa._turn_complete_external_hook = None
         if pa._session is None:
             # A failed attach can leave _thread_id set with no session
