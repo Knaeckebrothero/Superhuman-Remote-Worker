@@ -4,6 +4,8 @@ Tests the phase alternation graph architecture routing functions and helper util
 LLM-dependent nodes are tested with mocks or integration tests.
 """
 
+import inspect
+
 import pytest
 import tempfile
 import sys
@@ -19,9 +21,11 @@ if str(src_path) not in sys.path:
 
 # Import from src package (requires langgraph in environment)
 from src.core.workspace import WorkspaceManager  # noqa: E402
+from src.core.state import create_initial_state  # noqa: E402
 from src.managers import TodoManager, PlanManager, MemoryManager  # noqa: E402
 from tests._fs_backend import FilesystemTestBackend  # noqa: E402
 from src.graph import (  # noqa: E402
+    WORKER_BATCH_MIN_WALL_SECONDS,
     route_entry,
     route_after_execute,
     route_after_check_todos,
@@ -32,7 +36,10 @@ from src.graph import (  # noqa: E402
     create_archive_phase_node,
     create_check_goal_node,
     create_handle_transition_node,
+    create_audited_tool_node,
+    build_phase_alternation_graph,
     get_managers_from_workspace,
+    worker_batch_boundary_updates,
 )
 from src.core.phase import (  # noqa: E402
     get_initial_strategic_todos,
@@ -261,6 +268,210 @@ class TestCheckTodosNode:
         # Should also export todo state for checkpointing
         assert "todos" in result
         assert result["todos"][0]["status"] == "completed"
+
+    def test_due_batch_freezes_only_at_safe_todo_check(self, managers, mock_config):
+        managers["todo"].add("Task still in progress")
+        node = create_check_todos_node(managers["todo"], mock_config)
+        state = {
+            "job_id": "batch-mid-phase",
+            "iteration": 8,
+            "is_strategic_phase": False,
+            "phase_number": 4,
+            "worker_batch_started_at": 1000.0,
+            "worker_batch_start_iteration": 2,
+            "worker_batch_target_wall_seconds": 300.0,
+            "worker_batch_iteration_cap": None,
+        }
+
+        with patch("src.graph.time.time", return_value=1300.0):
+            result = node(state)
+
+        assert result["should_stop"] is True
+        assert result["phase_complete"] is False
+        assert result["freeze_data"]["freeze_type"] == "batch_boundary"
+        assert result["freeze_data"]["boundary"] == "mid_phase"
+        assert result["freeze_data"]["trigger"] == "wall_clock"
+        assert result["todos"][0]["content"] == "Task still in progress"
+        for field in (
+            "worker_batch_started_at",
+            "worker_batch_start_iteration",
+            "worker_batch_target_wall_seconds",
+            "worker_batch_iteration_cap",
+        ):
+            assert result[field] is None
+
+    def test_replan_request_precedes_due_batch(self, managers, mock_config):
+        managers["todo"].add("Task still in progress")
+        tool_context = MagicMock()
+        tool_context.consume_replan_request.return_value = "the plan changed"
+        node = create_check_todos_node(
+            managers["todo"], mock_config, tool_context=tool_context
+        )
+        state = {
+            "job_id": "batch-replan",
+            "iteration": 8,
+            "worker_batch_started_at": 1000.0,
+            "worker_batch_start_iteration": 2,
+            "worker_batch_target_wall_seconds": 300.0,
+            "worker_batch_iteration_cap": None,
+        }
+
+        with patch("src.graph.time.time", return_value=1300.0):
+            result = node(state)
+
+        assert result["phase_complete"] is True
+        assert result["replan_reason"] == "the plan changed"
+        assert "freeze_data" not in result
+
+    def test_completed_phase_precedes_due_batch(self, managers, mock_config):
+        managers["todo"].add("Finished task")
+        managers["todo"].complete("todo_1")
+        node = create_check_todos_node(managers["todo"], mock_config)
+        state = {
+            "job_id": "batch-complete-phase",
+            "iteration": 8,
+            "worker_batch_started_at": 1000.0,
+            "worker_batch_start_iteration": 2,
+            "worker_batch_target_wall_seconds": 300.0,
+            "worker_batch_iteration_cap": None,
+        }
+
+        with patch("src.graph.time.time", return_value=1300.0):
+            result = node(state)
+
+        assert result["phase_complete"] is True
+        assert "freeze_data" not in result
+
+    def test_empty_tactical_recovery_precedes_due_batch(self, managers, mock_config):
+        node = create_check_todos_node(managers["todo"], mock_config)
+        state = {
+            "job_id": "batch-empty-tactical",
+            "iteration": 8,
+            "is_strategic_phase": False,
+            "worker_batch_started_at": 1000.0,
+            "worker_batch_start_iteration": 2,
+            "worker_batch_target_wall_seconds": 300.0,
+            "worker_batch_iteration_cap": None,
+        }
+
+        with patch("src.graph.time.time", return_value=1300.0):
+            result = node(state)
+
+        assert result["phase_complete"] is True
+        assert "freeze_data" not in result
+
+    def test_drain_intent_precedes_due_midphase_batch(self, managers, mock_config):
+        managers["todo"].add("Task still in progress")
+        node = create_check_todos_node(managers["todo"], mock_config)
+        state = {
+            "job_id": "batch-drain",
+            "iteration": 8,
+            "worker_batch_started_at": 1000.0,
+            "worker_batch_start_iteration": 2,
+            "worker_batch_target_wall_seconds": 300.0,
+            "worker_batch_iteration_cap": None,
+        }
+
+        with (
+            patch("src.graph.time.time", return_value=1300.0),
+            patch("src.graph._is_drain_requested", return_value=True),
+        ):
+            result = node(state)
+
+        assert result["phase_complete"] is False
+        assert "freeze_data" not in result
+
+
+class TestWorkerBatchBudget:
+    @staticmethod
+    def _state(**overrides):
+        state = {
+            "job_id": "batch-budget",
+            "iteration": 20,
+            "is_strategic_phase": False,
+            "phase_number": 3,
+            "worker_batch_started_at": 1000.0,
+            "worker_batch_start_iteration": 10,
+            "worker_batch_target_wall_seconds": 600.0,
+            "worker_batch_iteration_cap": None,
+        }
+        state.update(overrides)
+        return state
+
+    def test_missing_fields_leave_legacy_runs_unarmed(self):
+        assert worker_batch_boundary_updates({"job_id": "legacy"}, now=9999) is None
+
+    def test_initial_state_is_explicitly_unarmed(self):
+        state = create_initial_state("fresh", "/workspace")
+        for field in (
+            "worker_batch_started_at",
+            "worker_batch_start_iteration",
+            "worker_batch_target_wall_seconds",
+            "worker_batch_iteration_cap",
+        ):
+            assert state[field] is None
+        assert worker_batch_boundary_updates(state, now=10_000_000) is None
+
+    def test_budget_check_never_runs_inside_audited_tools(self):
+        assert "worker_batch_boundary_updates(" not in inspect.getsource(
+            create_audited_tool_node
+        )
+        assert 'workflow.add_edge("tools", "check_todos")' in inspect.getsource(
+            build_phase_alternation_graph
+        )
+
+    def test_wall_target_is_not_due_early(self):
+        assert worker_batch_boundary_updates(self._state(), now=1599.999) is None
+        result = worker_batch_boundary_updates(self._state(), now=1600.0)
+        assert result["freeze_data"]["trigger"] == "wall_clock"
+
+    def test_undersized_target_is_clamped_to_five_minutes(self):
+        state = self._state(worker_batch_target_wall_seconds=1.0)
+        assert worker_batch_boundary_updates(state, now=1299.999) is None
+        result = worker_batch_boundary_updates(state, now=1300.0)
+        assert result["freeze_data"]["target_wall_seconds"] == (
+            WORKER_BATCH_MIN_WALL_SECONDS
+        )
+
+    def test_iteration_cap_cannot_fire_before_wall_floor(self):
+        state = self._state(worker_batch_iteration_cap=5)
+        assert worker_batch_boundary_updates(state, now=1299.999) is None
+        result = worker_batch_boundary_updates(state, now=1300.0)
+        assert result["freeze_data"]["trigger"] == "iteration_cap"
+        assert result["freeze_data"]["iteration_delta"] == 10
+
+    def test_wall_clock_wins_when_both_limits_are_due(self):
+        state = self._state(
+            worker_batch_target_wall_seconds=300.0,
+            worker_batch_iteration_cap=5,
+        )
+        result = worker_batch_boundary_updates(state, now=1300.0)
+        assert result["freeze_data"]["trigger"] == "wall_clock"
+
+    @pytest.mark.parametrize(
+        "blocking_state",
+        [
+            {"should_stop": True},
+            {"goal_achieved": True},
+            {"freeze_data": {"freeze_type": "blocking_message"}},
+            {"error": {"message": "existing failure"}},
+        ],
+    )
+    def test_existing_outcome_precedes_batch(self, blocking_state):
+        state = self._state(worker_batch_target_wall_seconds=300.0)
+        state.update(blocking_state)
+        assert worker_batch_boundary_updates(state, now=1300.0) is None
+
+    def test_phase_boundary_can_clear_a_stale_prior_error(self):
+        state = self._state(
+            worker_batch_target_wall_seconds=300.0,
+            error={"message": "stale error from prior node"},
+        )
+        result = worker_batch_boundary_updates(
+            state, now=1300.0, boundary="phase_boundary"
+        )
+        assert result["freeze_data"]["freeze_type"] == "batch_boundary"
+        assert result["error"] is None
 
 
 class TestRestoreTodoStateNode:
@@ -1082,6 +1293,10 @@ class TestHandleTransitionNode:
             # with the drain freeze (else the orchestrator fails instead of
             # pauses — version_upgrade_drain_masked_by_coincident_error).
             "error": {"message": "stale mid-phase error", "type": "job_error"},
+            "worker_batch_started_at": 1000.0,
+            "worker_batch_start_iteration": 2,
+            "worker_batch_target_wall_seconds": 300.0,
+            "worker_batch_iteration_cap": 5,
         }
         with patch("src.graph._is_drain_requested", return_value=True):
             result = await node(state)
@@ -1095,6 +1310,13 @@ class TestHandleTransitionNode:
 
         # The drain branch explicitly clears the stale error.
         assert "error" in result and result["error"] is None
+        for field in (
+            "worker_batch_started_at",
+            "worker_batch_start_iteration",
+            "worker_batch_target_wall_seconds",
+            "worker_batch_iteration_cap",
+        ):
+            assert result[field] is None
 
         # Marker file written for parity with other freeze types.
         marker = managers["workspace"].read_file("output/job_frozen.json")
@@ -1136,6 +1358,91 @@ class TestHandleTransitionNode:
         freeze = result.get("freeze_data")
         if freeze:
             assert freeze.get("freeze_type") != "version_upgrade"
+
+    @pytest.mark.asyncio
+    async def test_due_batch_freezes_at_phase_boundary_without_marker(
+        self, managers, mock_config
+    ):
+        managers["todo"].stage_tactical_todos(
+            [f"Task {i} with enough detail" for i in range(1, 6)],
+            phase_name="Phase 1",
+        )
+        phase_settings = MagicMock()
+        phase_settings.min_todos = 5
+        phase_settings.max_todos = 20
+        mock_config.phase_settings = phase_settings
+        node = create_handle_transition_node(
+            managers["workspace"],
+            managers["todo"],
+            mock_config,
+            min_todos=5,
+            max_todos=20,
+        )
+        state = {
+            "job_id": "test-batch-boundary",
+            "is_strategic_phase": True,
+            "phase_number": 2,
+            "iteration": 12,
+            "worker_batch_started_at": 1000.0,
+            "worker_batch_start_iteration": 2,
+            "worker_batch_target_wall_seconds": 300.0,
+            "worker_batch_iteration_cap": None,
+        }
+
+        with (
+            patch("src.graph._is_drain_requested", return_value=False),
+            patch("src.graph.time.time", return_value=1300.0),
+        ):
+            result = await node(state)
+
+        assert result["should_stop"] is True
+        assert result["error"] is None
+        assert result["freeze_data"]["freeze_type"] == "batch_boundary"
+        assert result["freeze_data"]["boundary"] == "phase_boundary"
+        assert result["freeze_data"]["phase_number"] == 2
+        assert not managers["workspace"].exists("output/job_frozen.json")
+
+    @pytest.mark.asyncio
+    async def test_replan_lands_before_tactical_phase_batch_handoff(
+        self, managers, mock_config
+    ):
+        managers["todo"].add("Completed tactical task")
+        managers["todo"].complete("todo_1")
+        phase_settings = MagicMock()
+        phase_settings.min_todos = 5
+        phase_settings.max_todos = 20
+        mock_config.phase_settings = phase_settings
+        node = create_handle_transition_node(
+            managers["workspace"],
+            managers["todo"],
+            mock_config,
+            min_todos=5,
+            max_todos=20,
+        )
+        state = {
+            "job_id": "test-replan-batch-boundary",
+            "is_strategic_phase": False,
+            "phase_number": 3,
+            "iteration": 12,
+            "replan_reason": "new evidence invalidated the old approach",
+            "worker_batch_started_at": 1000.0,
+            "worker_batch_start_iteration": 2,
+            "worker_batch_target_wall_seconds": 300.0,
+            "worker_batch_iteration_cap": None,
+        }
+
+        with (
+            patch("src.graph._is_drain_requested", return_value=False),
+            patch("src.graph.time.time", return_value=1300.0),
+        ):
+            result = await node(state)
+
+        assert result["freeze_data"]["freeze_type"] == "batch_boundary"
+        assert result["replan_reason"] is None
+        assert any(
+            "[REPLAN REQUESTED]" in getattr(message, "content", "")
+            for message in result.get("messages", [])
+        )
 
 
 # =============================================================================
