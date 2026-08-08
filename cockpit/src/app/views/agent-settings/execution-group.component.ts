@@ -1,8 +1,9 @@
-import {Component, computed, inject, input, output, signal} from '@angular/core';
+import {Component, computed, effect, inject, input, output, signal} from '@angular/core';
 import {FormsModule} from '@angular/forms';
 import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
 import {toSignal} from '@angular/core/rxjs-interop';
 import {AppIconComponent} from '../../ui/icon';
+import {UserService} from '../../core/services/user.service';
 import {
   AUTONOMY_LEVELS,
   CRITIC_ROUND_OPTIONS,
@@ -74,6 +75,39 @@ import type {GrantCatalog} from '../../core/models/api.model';
             }
           </div>
           <span class="field-hint">{{ effectivePermissionDesc() }}</span>
+        </div>
+      }
+
+      <!-- Workspace backend (jobs + session creation). A running session's
+           backend is fixed at provisioning time, so live mode does not offer
+           it — same reason Advanced is hidden there. -->
+      @if (mode() !== 'live') {
+        <div class="field-row" [class.modified]="workspaceBackend() !== null">
+          <label class="field-label">{{ 'agentSettings.execution.workspaceBackend' | transloco }}</label>
+          <div class="field-control">
+            <select
+              class="form-input"
+              [ngModel]="workspaceBackend() ?? resolvedWorkspaceBackend()"
+              appPinOnInteract (pin)="pinValue(workspaceBackend, resolvedWorkspaceBackend())"
+              (ngModelChange)="onWorkspaceBackendChange($event)"
+              [disabled]="disabled()"
+            >
+              <option value="sandbox">{{ 'advanced.options.container' | transloco }}</option>
+              @if (canUseVm()) {
+                <option value="vm">{{ 'advanced.options.vmQemu' | transloco }}</option>
+              }
+              <option value="virtual">{{ 'advanced.options.virtual' | transloco }}</option>
+              <option value="none">{{ 'advanced.options.none' | transloco }}</option>
+            </select>
+            @if (workspaceBackend() !== null) {
+              <button type="button" class="reset-btn" (click)="resetWorkspaceBackend()" [title]="'agentSettings.common.resetToDefault' | transloco">
+                <app-icon size="xs">close</app-icon>
+              </button>
+            }
+          </div>
+          @if (isLiteBackend()) {
+            <span class="field-hint">{{ (isNoneBackend() ? 'advanced.hints.noneBackend' : 'advanced.hints.virtualBackend') | transloco }}</span>
+          }
         </div>
       }
 
@@ -302,9 +336,22 @@ import type {GrantCatalog} from '../../core/models/api.model';
 })
 export class ExecutionGroupComponent {
   private readonly transloco = inject(TranslocoService);
+  private readonly userService = inject(UserService);
   private readonly activeLang = toSignal(this.transloco.langChanges$, {
     initialValue: this.transloco.getActiveLang(),
   });
+
+  constructor() {
+    // Snap ineligible users off 'vm' so the form can't submit a denied backend.
+    // The server is authoritative — this is a UX safeguard.
+    effect(() => {
+      if (this.canUseVm()) return;
+      if (this.effectiveBackend() === 'vm') {
+        this.workspaceBackend.set('sandbox');
+        this.change.emit();
+      }
+    });
+  }
 
   /** Merged expert/framework config. */
   config = input<Record<string, unknown>>({});
@@ -361,6 +408,25 @@ export class ExecutionGroupComponent {
   readonly criticRounds = signal<number | null>(null);
   readonly projectMemory = signal<boolean | null>(null);
   readonly imageQuality = signal<string | null>(null);
+  readonly workspaceBackend = signal<string | null>(null);
+
+  /** Whether the current user is allowed to pick the VM backend. Admins always qualify. */
+  readonly canUseVm = computed(() => {
+    const u = this.userService.currentUser();
+    return !!(u?.is_admin || u?.can_use_vm);
+  });
+
+  /** Effective backend = override → resolved config default. The lite tiers
+   *  (`virtual`/`none`) run with no workspace container, so shell/browser/git
+   *  tools are gated off server-side (no_workspace_agent_mode.md §7); the
+   *  Advanced accordion reads this through its `backendOverride` input to grey
+   *  the matching controls. `none` additionally has no file tools. */
+  readonly effectiveBackend = computed(() => this.workspaceBackend() ?? this.resolvedWorkspaceBackend());
+  readonly isLiteBackend = computed(() => {
+    const b = this.effectiveBackend();
+    return b === 'virtual' || b === 'none';
+  });
+  readonly isNoneBackend = computed(() => this.effectiveBackend() === 'none');
 
   // Resolved defaults from config
   readonly resolvedAutonomy = computed(() =>
@@ -386,6 +452,9 @@ export class ExecutionGroupComponent {
   );
   readonly resolvedImageQuality = computed(() =>
     (readConfigPath(this.config(), 'image_quality') as string) ?? 'standard'
+  );
+  readonly resolvedWorkspaceBackend = computed(() =>
+    (readConfigPath(this.config(), 'workspace.backend') as string) ?? 'sandbox'
   );
 
   readonly effectiveAutonomyDesc = computed(() => {
@@ -427,6 +496,7 @@ export class ExecutionGroupComponent {
     if (this.criticRounds() !== null) count++;
     if (this.projectMemory() !== null) count++;
     if (this.imageQuality() !== null) count++;
+    if (this.workspaceBackend() !== null) count++;
     return count;
   });
 
@@ -481,6 +551,19 @@ export class ExecutionGroupComponent {
     this.change.emit();
   }
 
+  onWorkspaceBackendChange(value: string): void {
+    this.workspaceBackend.set(value);
+    this.change.emit();
+  }
+
+  /** Reset emits, unlike the other rows here: the backend also drives the
+   *  Advanced accordion's greying and the datasource picker's repo filter, so
+   *  hosts have to hear about it. */
+  resetWorkspaceBackend(): void {
+    this.workspaceBackend.set(null);
+    this.change.emit();
+  }
+
   resetCritic(): void {
     this.critic.set(null);
     this.criticRounds.set(null);
@@ -516,6 +599,11 @@ export class ExecutionGroupComponent {
     // agents, so it applies regardless of mode.
     if (this.imageQuality() !== null) o['image_quality'] = this.imageQuality();
 
+    // Workspace backend. The rest of the `workspace` fragment (VM sizing, file
+    // limits, git versioning) stays in the Advanced accordion; the host deep-
+    // merges the two halves.
+    if (this.workspaceBackend() !== null) o['workspace'] = {backend: this.workspaceBackend()};
+
     return o;
   }
 
@@ -529,5 +617,6 @@ export class ExecutionGroupComponent {
     this.criticRounds.set(null);
     this.projectMemory.set(null);
     this.imageQuality.set(null);
+    this.workspaceBackend.set(null);
   }
 }
