@@ -189,6 +189,441 @@ class TestPureInternalEndpoints:
         assert exc.value.status_code == 401
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "thread",
+        [
+            None,
+            {"id": "thread-1", "execution_lane": "stateless", "agent_id": None},
+            {"id": "thread-1", "execution_lane": "future-lane", "agent_id": None},
+        ],
+    )
+    async def test_persistent_registration_refuses_non_pinned_thread(self, thread):
+        """The lane fence runs before a hostname upsert can mutate any row."""
+        import main as orch_main
+
+        reg = orch_main.AgentRegistration(
+            config_name="session_base",
+            pod_ip="10.0.0.1",
+            hostname="agent-1",
+            agent_mode="persistent",
+            thread_id="thread-1",
+        )
+        db = MagicMock()
+        db.register_agent = AsyncMock(
+            return_value={"agent_id": "agent-new", "heartbeat_interval_seconds": 20}
+        )
+        db.get_thread = AsyncMock(return_value=thread)
+        db.delete_agent = AsyncMock()
+        db.update_thread_agent = AsyncMock()
+        lock_cm = AsyncMock()
+        lock_cm.__aenter__.return_value = None
+        lock_cm.__aexit__.return_value = False
+        db.thread_advisory_lock = MagicMock(return_value=lock_cm)
+
+        with (
+            patch.object(orch_main, "require_internal", AsyncMock()),
+            patch.object(orch_main, "postgres_db", db),
+            pytest.raises(HTTPException) as exc,
+        ):
+            await orch_main.register_agent(MagicMock(), reg)
+
+        assert exc.value.status_code == 409
+        db.register_agent.assert_not_awaited()
+        db.delete_agent.assert_not_awaited()
+        db.update_thread_agent.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_persistent_registration_still_binds_pinned_thread(self):
+        import main as orch_main
+
+        reg = orch_main.AgentRegistration(
+            config_name="session_base",
+            pod_ip="10.0.0.1",
+            hostname="agent-1",
+            agent_mode="persistent",
+            thread_id="thread-1",
+        )
+        db = MagicMock()
+        db.register_agent = AsyncMock(
+            return_value={"agent_id": "agent-new", "heartbeat_interval_seconds": 20}
+        )
+        db.get_thread = AsyncMock(
+            return_value={
+                "id": "thread-1",
+                "execution_lane": "pinned",
+                "agent_id": None,
+            }
+        )
+        db.delete_agent = AsyncMock()
+        db.update_thread_agent = AsyncMock()
+        lock_cm = AsyncMock()
+        lock_cm.__aenter__.return_value = None
+        lock_cm.__aexit__.return_value = False
+        db.thread_advisory_lock = MagicMock(return_value=lock_cm)
+
+        with (
+            patch.object(orch_main, "require_internal", AsyncMock()),
+            patch.object(orch_main, "postgres_db", db),
+            patch.object(
+                orch_main,
+                "_bind_registered_persistent_agent",
+                AsyncMock(return_value=True),
+            ) as bind,
+        ):
+            response = await orch_main.register_agent(MagicMock(), reg)
+
+        assert response.agent_id == "agent-new"
+        assert db.register_agent.await_args.kwargs["insert_only"] is True
+        assert db.register_agent.await_args.kwargs["expected_agent_id"] is None
+        bind.assert_awaited_once_with("thread-1", "agent-new", None)
+        db.delete_agent.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_live_persistent_owner_rejects_other_hostname_before_upsert(self):
+        import main as orch_main
+
+        reg = orch_main.AgentRegistration(
+            config_name="session_base",
+            pod_ip="10.0.0.2",
+            hostname="agent-loser",
+            agent_mode="persistent",
+            thread_id="thread-1",
+        )
+        db = MagicMock()
+        db.get_thread = AsyncMock(
+            return_value={
+                "id": "thread-1",
+                "execution_lane": "pinned",
+                "agent_id": "agent-winner",
+            }
+        )
+        db.get_agent = AsyncMock(
+            return_value={
+                "id": "agent-winner",
+                "hostname": "agent-winner-host",
+                "status": "session",
+            }
+        )
+        db.register_agent = AsyncMock()
+        db.delete_agent = AsyncMock()
+        lock_cm = AsyncMock()
+        lock_cm.__aenter__.return_value = None
+        lock_cm.__aexit__.return_value = False
+        db.thread_advisory_lock = MagicMock(return_value=lock_cm)
+
+        with (
+            patch.object(orch_main, "require_internal", AsyncMock()),
+            patch.object(orch_main, "postgres_db", db),
+            pytest.raises(HTTPException) as exc,
+        ):
+            await orch_main.register_agent(MagicMock(), reg)
+
+        assert exc.value.status_code == 409
+        db.register_agent.assert_not_awaited()
+        db.delete_agent.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_same_hostname_restart_targets_exact_live_owner(self):
+        import main as orch_main
+
+        reg = orch_main.AgentRegistration(
+            config_name="session_base",
+            pod_ip="10.0.0.2",
+            hostname="agent-winner-host",
+            agent_mode="persistent",
+            thread_id="thread-1",
+        )
+        db = MagicMock()
+        db.get_thread = AsyncMock(
+            return_value={
+                "id": "thread-1",
+                "execution_lane": "pinned",
+                "agent_id": "agent-winner",
+            }
+        )
+        db.get_agent = AsyncMock(
+            return_value={
+                "id": "agent-winner",
+                "hostname": "agent-winner-host",
+                "status": "session",
+            }
+        )
+        db.register_agent = AsyncMock(
+            return_value={
+                "agent_id": "agent-winner",
+                "heartbeat_interval_seconds": 20,
+            }
+        )
+        db.delete_agent = AsyncMock()
+        lock_cm = AsyncMock()
+        lock_cm.__aenter__.return_value = None
+        lock_cm.__aexit__.return_value = False
+        db.thread_advisory_lock = MagicMock(return_value=lock_cm)
+
+        with (
+            patch.object(orch_main, "require_internal", AsyncMock()),
+            patch.object(orch_main, "postgres_db", db),
+            patch.object(
+                orch_main,
+                "_bind_registered_persistent_agent",
+                AsyncMock(return_value=True),
+            ) as bind,
+        ):
+            response = await orch_main.register_agent(MagicMock(), reg)
+
+        assert response.agent_id == "agent-winner"
+        assert (
+            db.register_agent.await_args.kwargs["expected_agent_id"] == "agent-winner"
+        )
+        assert db.register_agent.await_args.kwargs["insert_only"] is False
+        bind.assert_awaited_once_with("thread-1", "agent-winner", "agent-winner")
+        db.delete_agent.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("owner_status", ["offline", "failed"])
+    async def test_same_hostname_stale_owner_still_targets_exact_row(
+        self, owner_status
+    ):
+        import main as orch_main
+
+        reg = orch_main.AgentRegistration(
+            config_name="session_base",
+            pod_ip="10.0.0.2",
+            hostname="agent-owner-host",
+            agent_mode="persistent",
+            thread_id="thread-1",
+        )
+        db = MagicMock()
+        db.get_thread = AsyncMock(
+            return_value={
+                "id": "thread-1",
+                "execution_lane": "pinned",
+                "agent_id": "agent-owner",
+            }
+        )
+        db.get_agent = AsyncMock(
+            return_value={
+                "id": "agent-owner",
+                "hostname": "agent-owner-host",
+                "status": owner_status,
+            }
+        )
+        db.register_agent = AsyncMock(
+            return_value={
+                "agent_id": "agent-owner",
+                "heartbeat_interval_seconds": 20,
+            }
+        )
+        lock_cm = AsyncMock()
+        lock_cm.__aenter__.return_value = None
+        lock_cm.__aexit__.return_value = False
+        db.thread_advisory_lock = MagicMock(return_value=lock_cm)
+
+        with (
+            patch.object(orch_main, "require_internal", AsyncMock()),
+            patch.object(orch_main, "postgres_db", db),
+            patch.object(
+                orch_main,
+                "_bind_registered_persistent_agent",
+                AsyncMock(return_value=True),
+            ),
+        ):
+            await orch_main.register_agent(MagicMock(), reg)
+
+        assert db.register_agent.await_args.kwargs["expected_agent_id"] == "agent-owner"
+        assert db.register_agent.await_args.kwargs["insert_only"] is False
+
+    @pytest.mark.asyncio
+    async def test_different_hostname_replacement_of_stale_owner_inserts_new_row(self):
+        import main as orch_main
+
+        reg = orch_main.AgentRegistration(
+            config_name="session_base",
+            pod_ip="10.0.0.2",
+            hostname="agent-replacement-host",
+            agent_mode="persistent",
+            thread_id="thread-1",
+        )
+        db = MagicMock()
+        db.get_thread = AsyncMock(
+            return_value={
+                "id": "thread-1",
+                "execution_lane": "pinned",
+                "agent_id": "agent-offline",
+            }
+        )
+        db.get_agent = AsyncMock(
+            return_value={
+                "id": "agent-offline",
+                "hostname": "old-host",
+                "status": "offline",
+            }
+        )
+        db.register_agent = AsyncMock(
+            return_value={
+                "agent_id": "agent-fresh",
+                "heartbeat_interval_seconds": 20,
+            }
+        )
+        lock_cm = AsyncMock()
+        lock_cm.__aenter__.return_value = None
+        lock_cm.__aexit__.return_value = False
+        db.thread_advisory_lock = MagicMock(return_value=lock_cm)
+
+        with (
+            patch.object(orch_main, "require_internal", AsyncMock()),
+            patch.object(orch_main, "postgres_db", db),
+            patch.object(
+                orch_main,
+                "_bind_registered_persistent_agent",
+                AsyncMock(return_value=True),
+            ) as bind,
+        ):
+            await orch_main.register_agent(MagicMock(), reg)
+
+        assert db.register_agent.await_args.kwargs["expected_agent_id"] is None
+        assert db.register_agent.await_args.kwargs["insert_only"] is True
+        bind.assert_awaited_once_with("thread-1", "agent-fresh", "agent-offline")
+
+    @pytest.mark.asyncio
+    async def test_missing_snapshotted_owner_refuses_before_upsert(self):
+        import main as orch_main
+
+        reg = orch_main.AgentRegistration(
+            config_name="session_base",
+            pod_ip="10.0.0.2",
+            hostname="agent-replacement",
+            agent_mode="persistent",
+            thread_id="thread-1",
+        )
+        db = MagicMock()
+        db.get_thread = AsyncMock(
+            return_value={
+                "id": "thread-1",
+                "execution_lane": "pinned",
+                "agent_id": "agent-missing",
+            }
+        )
+        db.get_agent = AsyncMock(return_value=None)
+        db.register_agent = AsyncMock()
+        lock_cm = AsyncMock()
+        lock_cm.__aenter__.return_value = None
+        lock_cm.__aexit__.return_value = False
+        db.thread_advisory_lock = MagicMock(return_value=lock_cm)
+
+        with (
+            patch.object(orch_main, "require_internal", AsyncMock()),
+            patch.object(orch_main, "postgres_db", db),
+            pytest.raises(HTTPException) as exc,
+        ):
+            await orch_main.register_agent(MagicMock(), reg)
+
+        assert exc.value.status_code == 409
+        db.register_agent.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_persistent_registration_refuses_a_lost_final_lane_bind(self):
+        import main as orch_main
+
+        reg = orch_main.AgentRegistration(
+            config_name="session_base",
+            pod_ip="10.0.0.1",
+            hostname="agent-1",
+            agent_mode="persistent",
+            thread_id="thread-1",
+        )
+        db = MagicMock()
+        db.register_agent = AsyncMock(
+            return_value={"agent_id": "agent-new", "heartbeat_interval_seconds": 20}
+        )
+        db.get_thread = AsyncMock(
+            return_value={
+                "id": "thread-1",
+                "execution_lane": "pinned",
+                "agent_id": None,
+            }
+        )
+        lock_cm = AsyncMock()
+        lock_cm.__aenter__.return_value = None
+        lock_cm.__aexit__.return_value = False
+        db.thread_advisory_lock = MagicMock(return_value=lock_cm)
+
+        with (
+            patch.object(orch_main, "require_internal", AsyncMock()),
+            patch.object(orch_main, "postgres_db", db),
+            patch.object(
+                orch_main,
+                "_bind_registered_persistent_agent",
+                AsyncMock(return_value=False),
+            ),
+            pytest.raises(HTTPException) as exc,
+        ):
+            await orch_main.register_agent(MagicMock(), reg)
+
+        assert exc.value.status_code == 409
+        db.register_agent.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_final_persistent_bind_is_lane_qualified_and_clears_exact_agent(self):
+        import main as orch_main
+
+        conn = AsyncMock()
+        conn.execute = AsyncMock(side_effect=["UPDATE 0", "UPDATE 1"])
+        acquire = AsyncMock()
+        acquire.__aenter__.return_value = conn
+        acquire.__aexit__.return_value = False
+        db = MagicMock()
+        db.acquire = MagicMock(return_value=acquire)
+
+        with patch.object(orch_main, "postgres_db", db):
+            bound = await orch_main._bind_registered_persistent_agent(
+                "thread-1", "agent-new", None
+            )
+
+        assert bound is False
+        assert "execution_lane = $3" in conn.execute.await_args_list[0].args[0]
+        assert "agent_id IS NULL" in conn.execute.await_args_list[0].args[0]
+        assert conn.execute.await_args_list[0].args[1:] == (
+            "thread-1",
+            "agent-new",
+            "pinned",
+        )
+        assert (
+            "WHERE id = $1 AND thread_id = $2"
+            in (conn.execute.await_args_list[1].args[0])
+        )
+        assert conn.execute.await_args_list[1].args[1:] == (
+            "agent-new",
+            "thread-1",
+        )
+
+    @pytest.mark.asyncio
+    async def test_final_persistent_bind_cas_matches_the_snapshotted_owner(self):
+        import main as orch_main
+
+        conn = AsyncMock()
+        conn.execute = AsyncMock(return_value="UPDATE 1")
+        acquire = AsyncMock()
+        acquire.__aenter__.return_value = conn
+        acquire.__aexit__.return_value = False
+        db = MagicMock()
+        db.acquire = MagicMock(return_value=acquire)
+
+        with patch.object(orch_main, "postgres_db", db):
+            bound = await orch_main._bind_registered_persistent_agent(
+                "thread-1", "agent-new", "agent-offline-snapshot"
+            )
+
+        assert bound is True
+        assert "agent_id = $4" in conn.execute.await_args.args[0]
+        assert conn.execute.await_args.args[1:] == (
+            "thread-1",
+            "agent-new",
+            "pinned",
+            "agent-offline-snapshot",
+        )
+
+    @pytest.mark.asyncio
     async def test_agent_heartbeat_without_key_401(self, fake_request):
         from main import AgentHeartbeat, agent_heartbeat
 

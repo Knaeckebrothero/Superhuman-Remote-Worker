@@ -4394,6 +4394,60 @@ def _agent_sha_is_current(metadata: dict | None) -> bool:
     return build_sha in expected
 
 
+def _thread_uses_pinned_execution(thread: Any) -> bool:
+    """Whether a thread may bind a registered/persistent agent.
+
+    This is deliberately an exact whitelist. ``execution_lane`` is
+    app-validated rather than CHECK-constrained, so missing, corrupt, or
+    future values must not silently inherit the pinned provisioning plane.
+    """
+    from src.shared.run_queue import LANE_PINNED
+
+    return bool(thread and thread.get("execution_lane") == LANE_PINNED)
+
+
+async def _bind_registered_persistent_agent(
+    thread_id: str,
+    agent_id: str,
+    expected_agent_id: str | None,
+) -> bool:
+    """Lane-qualified final half of persistent-agent registration.
+
+    ``register_agent`` has already written ``agents.thread_id``.  The thread
+    advisory lock serializes sanctioned transitions, while this conditional
+    update also fails closed if an out-of-band lane edit lands between the
+    precheck and the final bind.  A refused bind clears only this exact
+    agent/thread association; it never deletes a possibly pre-existing
+    hostname-upsert row.
+    """
+    async with postgres_db.acquire() as conn:
+        if expected_agent_id is None:
+            bound = await conn.execute(
+                "UPDATE threads SET agent_id = $2 "
+                "WHERE id = $1 AND execution_lane = $3 AND agent_id IS NULL",
+                thread_id,
+                agent_id,
+                "pinned",
+            )
+        else:
+            bound = await conn.execute(
+                "UPDATE threads SET agent_id = $2 "
+                "WHERE id = $1 AND execution_lane = $3 AND agent_id = $4",
+                thread_id,
+                agent_id,
+                "pinned",
+                expected_agent_id,
+            )
+        if bound == "UPDATE 1":
+            return True
+        await conn.execute(
+            "UPDATE agents SET thread_id = NULL WHERE id = $1 AND thread_id = $2",
+            agent_id,
+            thread_id,
+        )
+        return False
+
+
 async def _find_idle_persistent_agent() -> Optional[dict]:
     """Find an idle persistent or dual-mode agent in the pool.
 
@@ -4458,6 +4512,51 @@ async def _send_session_attach(
             datasources=datasources,
             config_name=config_name,
         )
+
+
+async def _reserve_session_attach_binding(agent_id: str, thread_id: str) -> bool:
+    """Atomically reserve both sides of a pinned warm-pool binding.
+
+    Reservation happens before HTTP delivery.  That ordering makes the
+    documented "flip only while detached" transition test atomic: either the
+    lane flip wins while ``agent_id`` is NULL, or this reservation wins while
+    the lane is still pinned.  We never need to tear down an already-started
+    session merely because a post-delivery lane CAS lost.
+    """
+    try:
+        async with postgres_db.acquire() as conn:
+            async with conn.transaction():
+                agent_bound = await conn.execute(
+                    "UPDATE agents SET thread_id = $2, status = 'session' "
+                    "WHERE id = $1 AND thread_id IS NULL "
+                    "AND current_job_id IS NULL AND status = 'ready'",
+                    agent_id,
+                    thread_id,
+                )
+                if agent_bound != "UPDATE 1":
+                    raise RuntimeError("agent is no longer idle")
+
+                thread_bound = await conn.execute(
+                    "UPDATE threads SET agent_id = $2 "
+                    "WHERE id = $1 AND execution_lane = $3 "
+                    "AND agent_id IS NULL",
+                    thread_id,
+                    agent_id,
+                    "pinned",
+                )
+                if thread_bound != "UPDATE 1":
+                    raise RuntimeError(
+                        "thread is no longer detached on the pinned lane"
+                    )
+        return True
+    except Exception as exc:
+        logger.info(
+            "Session attach reservation refused for agent %s / thread %s: %s",
+            agent_id,
+            thread_id,
+            exc,
+        )
+        return False
 
 
 async def _assemble_session_attach_payload(
@@ -4607,15 +4706,30 @@ async def _send_session_attach_locked(
     ``_assemble_session_attach_payload``, which owns the payload build and
     every fail-closed rule).
 
-    Returns True if the agent accepted the session.
+    Returns True once the agent accepted the session *or* delivery became
+    ambiguous after the DB reservation.  Callers must not provision a fallback
+    executor on that outcome.  False means no reservation remains.
     """
     del project_ids, datasources  # recomputed inside the assembly (see docstring)
+    thread = await postgres_db.get_thread(thread_id)
+    if not _thread_uses_pinned_execution(thread):
+        logger.warning(
+            "Session attach: refusing pinned delivery for thread %s on "
+            "execution lane %r",
+            thread_id,
+            thread.get("execution_lane") if thread else None,
+        )
+        return False
     payload = await _assemble_session_attach_payload(
         thread_id,
         config_override=config_override,
         config_name=config_name,
     )
     if payload is None:
+        return False
+
+    agent_id = str(agent["id"])
+    if not await _reserve_session_attach_binding(agent_id, thread_id):
         return False
 
     agent_url = f"http://{agent['pod_ip']}:{agent['pod_port']}/session/attach"
@@ -4630,33 +4744,22 @@ async def _send_session_attach_locked(
                 agent["pod_ip"],
                 agent["pod_port"],
             )
-            # Update both sides of the agent↔thread binding
-            try:
-                async with postgres_db.acquire() as conn:
-                    await conn.execute(
-                        "UPDATE agents SET thread_id = $2 WHERE id = $1",
-                        str(agent["id"]),
-                        thread_id,
-                    )
-                    await conn.execute(
-                        "UPDATE threads SET agent_id = $2 WHERE id = $1",
-                        thread_id,
-                        str(agent["id"]),
-                    )
-            except Exception:
-                logger.warning("Failed to update agent/thread binding in DB")
             return True
-        else:
-            logger.warning(
-                "Persistent agent %s rejected session attach: %s %s",
-                agent["id"],
-                response.status_code,
-                response.text[:200],
-            )
-            return False
+        logger.error(
+            "Persistent agent %s returned ambiguous attach response %s; "
+            "retaining reservation to prevent duplicate execution: %s",
+            agent["id"],
+            response.status_code,
+            response.text[:200],
+        )
+        return True
     except Exception:
-        logger.exception("Failed to send session attach to agent %s", agent["id"])
-        return False
+        logger.exception(
+            "Session attach delivery to agent %s is ambiguous; retaining "
+            "the DB reservation to prevent duplicate execution",
+            agent["id"],
+        )
+        return True
 
 
 class LiteWorkspaceConfigError(Exception):
@@ -24870,7 +24973,7 @@ async def register_agent(
     """
     await require_internal(request)
     try:
-        result = await postgres_db.register_agent(
+        register_kwargs = dict(
             config_name=registration.config_name,
             pod_ip=registration.pod_ip,
             hostname=registration.hostname,
@@ -24882,49 +24985,106 @@ async def register_agent(
             product_provenance=registration.product_provenance.model_dump(mode="json"),
             pod_uid=registration.pod_uid,
         )
-        # Bind persistent agent to its thread. Defense-in-depth against the
-        # double-provisioning race (docs/issues/persistent_thread_double_provisioning_race.md):
-        # take the per-thread advisory lock and refuse the bind if a *different*
-        # live agent already owns this thread — turns a silent overwrite into
-        # a loud 409 the orphan pod can react to by shutting down.
         if registration.agent_mode == "persistent" and registration.thread_id:
-            new_id = str(result["agent_id"])
+            # The lane check must precede the hostname upsert.  Its result ID
+            # may name a pre-existing legitimate row, so "upsert then delete on
+            # refusal" can delete another binding through the FK cascade.
             async with postgres_db.thread_advisory_lock(registration.thread_id):
                 thread = await postgres_db.get_thread(registration.thread_id)
+                if not _thread_uses_pinned_execution(thread):
+                    # Authoritative bind-boundary fence. A dedicated pod can
+                    # start while the row is pinned but register only after an
+                    # operator has moved the detached thread to the queue lane;
+                    # entry-time checks cannot close that boot window.
+                    logger.warning(
+                        "register_agent: refusing persistent bind for thread %s "
+                        "on execution lane %r before agent upsert",
+                        registration.thread_id,
+                        thread.get("execution_lane") if thread else None,
+                    )
+                    raise HTTPException(
+                        status_code=409,
+                        detail="thread execution lane does not accept persistent agents",
+                    )
+
+                # Defense-in-depth against the double-provisioning race
+                # (docs/issues/persistent_thread_double_provisioning_race.md):
+                # refuse a different live owner before the hostname upsert can
+                # pause its jobs, change its binding, or delete it through an
+                # attempted loser rollback. A same-host restart targets that
+                # exact authorized row; every genuinely new binding inserts a
+                # fresh row because hostname is not unique or an ownership
+                # credential.
                 existing_id = thread.get("agent_id") if thread else None
-                if existing_id and str(existing_id) != new_id:
+                expected_upsert_id: str | None = None
+                if existing_id:
                     existing = await postgres_db.get_agent(str(existing_id))
                     existing_status = (existing or {}).get("status")
-                    if existing and existing_status not in (
-                        None,
-                        "offline",
-                        "failed",
-                    ):
+                    if not existing:
                         logger.warning(
-                            "register_agent: duplicate persistent registration "
-                            "for thread %s; winner=%s loser=%s — refusing.",
+                            "register_agent: thread %s references missing agent %s; "
+                            "refusing before agent upsert.",
                             registration.thread_id,
                             existing_id,
-                            new_id,
                         )
-                        try:
-                            await postgres_db.delete_agent(new_id)
-                        except Exception as del_err:
-                            logger.warning(
-                                "register_agent: failed to roll back loser %s: %s",
-                                new_id,
-                                del_err,
-                            )
+                        raise HTTPException(
+                            status_code=409,
+                            detail="thread agent ownership is inconsistent",
+                        )
+                    if (
+                        registration.hostname
+                        and existing.get("hostname") == registration.hostname
+                    ):
+                        expected_upsert_id = str(existing_id)
+                    elif existing_status not in ("offline", "failed"):
+                        logger.warning(
+                            "register_agent: duplicate persistent registration "
+                            "for thread %s; winner=%s hostname=%r — refusing "
+                            "before agent upsert.",
+                            registration.thread_id,
+                            existing_id,
+                            registration.hostname,
+                        )
                         raise HTTPException(
                             status_code=409,
                             detail="thread already bound to another live agent",
                         )
-                try:
-                    await postgres_db.update_thread_agent(
-                        registration.thread_id, new_id
+
+                result = await postgres_db.register_agent(
+                    **register_kwargs,
+                    expected_agent_id=expected_upsert_id,
+                    insert_only=expected_upsert_id is None,
+                )
+                new_id = str(result["agent_id"])
+                if expected_upsert_id is not None and new_id != expected_upsert_id:
+                    logger.warning(
+                        "register_agent: exact persistent restart target changed "
+                        "for thread %s; expected=%s got=%s",
+                        registration.thread_id,
+                        expected_upsert_id,
+                        new_id,
                     )
-                except Exception as bind_err:
-                    logger.warning(f"Thread binding failed (non-fatal): {bind_err}")
+                    raise HTTPException(
+                        status_code=409,
+                        detail="persistent agent identity changed during registration",
+                    )
+                if not await _bind_registered_persistent_agent(
+                    registration.thread_id,
+                    new_id,
+                    str(existing_id) if existing_id else None,
+                ):
+                    logger.warning(
+                        "register_agent: final pinned-lane bind lost for "
+                        "thread %s (agent=%s)",
+                        registration.thread_id,
+                        new_id,
+                    )
+                    raise HTTPException(
+                        status_code=409,
+                        detail="thread execution lane changed before agent binding",
+                    )
+        else:
+            result = await postgres_db.register_agent(**register_kwargs)
         return AgentRegistrationResponse(**result)
     except HTTPException:
         raise
@@ -29936,6 +30096,16 @@ async def resume_thread(
     calling this, where the orchestrator will provision or wait for an agent.
     """
     user, thread = await require_thread_owner(request, postgres_db, thread_id)
+    from src.shared.run_queue import LANE_PINNED
+
+    if thread.get("execution_lane") != LANE_PINNED:
+        # Resume is a pinned-pod provisioning entry.  Queue-served threads do
+        # not bind agents, and unknown future lanes must fail closed instead
+        # of silently inheriting this control plane.
+        raise HTTPException(
+            status_code=409,
+            detail="Session execution lane does not support pinned resume",
+        )
     if thread.get("status") != "ended":
         raise HTTPException(
             status_code=409, detail=f"Thread is already {thread.get('status')}"
@@ -30099,6 +30269,13 @@ async def resume_thread(
             # which the cockpit drives in parallel with this endpoint.
             async with postgres_db.thread_advisory_lock(tid):
                 cur = await postgres_db.get_thread(tid)
+                if not _thread_uses_pinned_execution(cur):
+                    logger.warning(
+                        "Thread %s: resume reprovision refused for execution lane %r",
+                        tid,
+                        cur.get("execution_lane") if cur else None,
+                    )
+                    return
                 if cur and cur.get("agent_id"):
                     logger.info(
                         "Thread %s: already bound to agent %s — "
@@ -30164,6 +30341,27 @@ async def resume_thread(
                         )
                         return
 
+                    # The attach attempt crossed await points.  Do not trust
+                    # the snapshot from before it: a lane transition or a
+                    # sibling bind must suppress the dedicated-pod fallback.
+                    cur = await postgres_db.get_thread(tid)
+                    if not _thread_uses_pinned_execution(cur):
+                        logger.warning(
+                            "Thread %s: resume pod fallback refused for "
+                            "execution lane %r",
+                            tid,
+                            cur.get("execution_lane") if cur else None,
+                        )
+                        return
+                    if cur.get("agent_id"):
+                        logger.info(
+                            "Thread %s: attach reservation lost to agent %s; "
+                            "skipping duplicate pod fallback",
+                            tid,
+                            cur["agent_id"],
+                        )
+                        return
+
                 # No idle agent — create a dedicated session pod.
                 pod_name = await agent_provisioner.provision_agent(
                     purpose="session", thread_id=tid, config_name=cfg
@@ -30179,9 +30377,20 @@ async def resume_thread(
         asyncio.create_task(_reprovision(thread_id, config_name))
     elif persistent_provisioner.is_available:
         config_name = canonical_config_name(thread.get("config_name", "session_base"))
-        asyncio.create_task(
-            persistent_provisioner.create_agent_pod(thread_id, config_name=config_name)
-        )
+
+        async def _reprovision_legacy(tid: str, cfg: str) -> None:
+            cur = await postgres_db.get_thread(tid)
+            if not _thread_uses_pinned_execution(cur):
+                logger.warning(
+                    "Thread %s: legacy resume provisioning refused for "
+                    "execution lane %r",
+                    tid,
+                    cur.get("execution_lane") if cur else None,
+                )
+                return
+            await persistent_provisioner.create_agent_pod(tid, config_name=cfg)
+
+        asyncio.create_task(_reprovision_legacy(thread_id, config_name))
 
     # Ensure the session workspace is provisioned/restored (idempotent): restores
     # a suspended workspace, recreates a failed/missing one. Fire-and-forget so
@@ -31821,6 +32030,14 @@ async def _phase5_wake_if_suspended(thread_id: str) -> None:
         thread = await postgres_db.get_thread(thread_id)
         if not thread:
             return
+        if not _thread_uses_pinned_execution(thread):
+            logger.warning(
+                "magic-link wake: refusing pinned wake for thread %s on "
+                "execution lane %r",
+                thread_id,
+                thread.get("execution_lane"),
+            )
+            return
         metadata = thread.get("metadata") or {}
         if isinstance(metadata, str):
             try:
@@ -32046,7 +32263,7 @@ async def _officer_watchdog_check_one(officer_row: dict, session_wake_svc) -> No
         sleep_max = 60
 
     thread = await postgres_db.get_thread(thread_id)
-    if thread is None or thread.get("status") == "ended":
+    if not _thread_uses_pinned_execution(thread) or thread.get("status") == "ended":
         return
     agent = await session_wake_svc._resolve_live_agent(postgres_db, thread)
     timer = await postgres_db.get_pending_officer_timer(thread_id)

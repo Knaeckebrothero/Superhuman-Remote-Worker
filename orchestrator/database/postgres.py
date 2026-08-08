@@ -4991,11 +4991,17 @@ class PostgresDB:
         build_sha: str | None = None,
         product_provenance: Dict[str, Any] | None = None,
         pod_uid: str | None = None,
+        expected_agent_id: str | None = None,
+        insert_only: bool = False,
     ) -> Dict[str, Any]:
         """Register a new agent or update existing one.
 
         If an agent with the same hostname exists, update its pod_ip instead
         of creating a duplicate. This handles agent restarts with new IPs.
+        ``expected_agent_id`` makes that update target an exact pre-authorized
+        row instead of whichever row a hostname lookup happens to return.
+        ``insert_only`` bypasses hostname reuse for a new pre-authorized
+        binding; hostnames are not unique and are not ownership credentials.
 
         Args:
             config_name: Agent configuration name
@@ -5003,6 +5009,8 @@ class PostgresDB:
             hostname: Optional hostname/pod name
             pod_port: Agent API port (default 8001)
             pid: Optional process ID
+            expected_agent_id: Exact existing row authorized for restart
+            insert_only: Never reuse a row selected only by hostname
 
         Returns:
             Dict with agent_id and heartbeat_interval_seconds
@@ -5016,62 +5024,81 @@ class PostgresDB:
         )
 
         async with self.acquire() as conn:
-            # Check for existing agent with same hostname
-            if hostname:
+            existing = None
+            if expected_agent_id is not None:
+                try:
+                    expected_uuid = UUID(expected_agent_id)
+                except ValueError as exc:
+                    raise ValueError("expected_agent_id must be a UUID") from exc
+                existing = await conn.fetchrow(
+                    "SELECT id FROM agents WHERE id = $1 AND hostname = $2",
+                    expected_uuid,
+                    hostname,
+                )
+                if not existing:
+                    raise RuntimeError(
+                        "expected agent no longer matches registration hostname"
+                    )
+            elif hostname and not insert_only:
                 existing = await conn.fetchrow(
                     "SELECT id FROM agents WHERE hostname = $1",
                     hostname,
                 )
-                if existing:
-                    agent_id = existing["id"]
 
-                    # Pause any processing jobs still assigned to this agent.
-                    # The new instance won't know about them, so they'd be
-                    # stuck in 'processing' forever without this.
-                    await conn.execute(
-                        """
-                        UPDATE jobs
-                        SET status = 'paused',
-                            assigned_agent_id = NULL,
-                            updated_at = CURRENT_TIMESTAMP
-                        WHERE assigned_agent_id = $1
-                          AND status = 'processing'
-                        """,
-                        agent_id,
-                    )
+            if existing:
+                agent_id = existing["id"]
 
-                    # Update existing agent's IP and reset status
-                    await conn.execute(
-                        """
-                        UPDATE agents
-                        SET pod_ip = $1,
-                            pod_port = $2,
-                            pid = $3,
-                            config_name = $4,
-                            status = 'booting',
-                            current_job_id = NULL,
-                            last_heartbeat = CURRENT_TIMESTAMP,
-                            registered_at = CURRENT_TIMESTAMP,
-                            agent_mode    = $6,
-                            thread_id     = $7,
-                            metadata = COALESCE(metadata, '{}') || $8::jsonb,
-                            pod_uid       = COALESCE(NULLIF($9, ''), pod_uid)
-                        WHERE id = $5
-                        """,
-                        pod_ip,
-                        pod_port,
-                        pid,
-                        config_name,
-                        agent_id,
-                        agent_mode,
-                        thread_id,
-                        registration_metadata,
-                        pod_uid,
+                # Pause any processing jobs still assigned to this agent.
+                # The new instance won't know about them, so they'd be
+                # stuck in 'processing' forever without this.
+                await conn.execute(
+                    """
+                    UPDATE jobs
+                    SET status = 'paused',
+                        assigned_agent_id = NULL,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE assigned_agent_id = $1
+                      AND status = 'processing'
+                    """,
+                    agent_id,
+                )
+
+                # Update existing agent's IP and reset status
+                update_result = await conn.execute(
+                    """
+                    UPDATE agents
+                    SET pod_ip = $1,
+                        pod_port = $2,
+                        pid = $3,
+                        config_name = $4,
+                        status = 'booting',
+                        current_job_id = NULL,
+                        last_heartbeat = CURRENT_TIMESTAMP,
+                        registered_at = CURRENT_TIMESTAMP,
+                        agent_mode    = $6,
+                        thread_id     = $7,
+                        metadata = COALESCE(metadata, '{}') || $8::jsonb,
+                        pod_uid       = COALESCE(NULLIF($9, ''), pod_uid)
+                    WHERE id = $5
+                    """,
+                    pod_ip,
+                    pod_port,
+                    pid,
+                    config_name,
+                    agent_id,
+                    agent_mode,
+                    thread_id,
+                    registration_metadata,
+                    pod_uid,
+                )
+                if expected_agent_id is not None and update_result != "UPDATE 1":
+                    raise RuntimeError(
+                        "expected agent disappeared during exact registration update"
                     )
-                    return {
-                        "agent_id": str(agent_id),
-                        "heartbeat_interval_seconds": 60,
-                    }
+                return {
+                    "agent_id": str(agent_id),
+                    "heartbeat_interval_seconds": 60,
+                }
 
             # Create new agent
             row = await conn.fetchrow(

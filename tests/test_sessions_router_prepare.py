@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 
 
 def _install_fake_auth(monkeypatch, user_id: str = "u1") -> None:
@@ -61,6 +62,7 @@ def app(monkeypatch):
     fake_db.get_thread = AsyncMock(
         return_value={
             "id": "t1",
+            "execution_lane": "pinned",
             "user_id": "u1",
             "agent_id": None,
             "config_name": "persistent_defaults",
@@ -114,6 +116,129 @@ def test_prepare_returns_403_when_thread_owned_by_other_user(app):
     assert resp.status_code == 403
 
 
+@pytest.mark.parametrize("execution_lane", ["stateless", "future-lane"])
+def test_prepare_refuses_every_non_pinned_lane(app, execution_lane):
+    """Only the explicit pinned lane may enter pod provisioning."""
+    fastapi_app, fake_db = app
+    fake_db.get_thread.return_value = {
+        "id": "t1",
+        "execution_lane": execution_lane,
+        "user_id": "u1",
+        "agent_id": None,
+    }
+    client = TestClient(fastapi_app)
+
+    resp = client.post("/api/sessions/t1/prepare", json={})
+
+    assert resp.status_code == 409
+    assert "pinned provisioning" in resp.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_do_prepare_refuses_stateless_lane_before_provisioning(monkeypatch):
+    """The background entry re-checks the lane in case it changed after POST."""
+    import sys
+
+    from orchestrator.routers import sessions as sessions_mod
+
+    db = AsyncMock()
+    db.get_thread.return_value = {
+        "id": "t1",
+        "execution_lane": "stateless",
+        "user_id": "u1",
+        "agent_id": None,
+    }
+    lock_cm = AsyncMock()
+    lock_cm.__aenter__.return_value = None
+    lock_cm.__aexit__.return_value = False
+    db.thread_advisory_lock = MagicMock(return_value=lock_cm)
+    monkeypatch.setattr(sessions_mod, "_get_db", lambda: db, raising=False)
+    provision = AsyncMock()
+    monkeypatch.setattr(
+        sessions_mod, "_provision_agent_for_thread", provision, raising=True
+    )
+    monkeypatch.setitem(sys.modules, "main", _fake_main())
+    emitted: list[tuple[str, dict]] = []
+    monkeypatch.setattr(
+        sessions_mod,
+        "lifecycle_emit",
+        lambda _uid, _tid, state, **extra: emitted.append((state, extra)),
+        raising=True,
+    )
+
+    await sessions_mod._do_prepare(
+        thread_id="t1",
+        user_id="u1",
+        config_name="session_base",
+        config_override=None,
+    )
+
+    assert [state for state, _ in emitted] == ["provisioning", "failed"]
+    assert "pinned provisioning" in emitted[-1][1]["reason"]
+    provision.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_provision_helper_refuses_stateless_lane(monkeypatch):
+    """Direct callers cannot bypass the public and background gates."""
+    from orchestrator.routers import sessions as sessions_mod
+
+    db = AsyncMock()
+    db.get_thread.return_value = {
+        "id": "t1",
+        "execution_lane": "stateless",
+        "user_id": "u1",
+    }
+    monkeypatch.setattr(sessions_mod, "_get_db", lambda: db, raising=False)
+
+    with pytest.raises(RuntimeError, match="pinned provisioning"):
+        await sessions_mod._provision_agent_for_thread(
+            thread_id="t1",
+            config_name="session_base",
+            config_override=None,
+        )
+
+
+@pytest.mark.asyncio
+async def test_provision_helper_suppresses_pod_fallback_after_lane_transition(
+    monkeypatch,
+):
+    """A failed warm reservation must not use its stale pinned snapshot."""
+    import sys
+
+    from orchestrator.routers import sessions as sessions_mod
+
+    db = AsyncMock()
+    db.get_thread = AsyncMock(
+        side_effect=[
+            {"id": "t1", "execution_lane": "pinned", "agent_id": None},
+            {"id": "t1", "execution_lane": "stateless", "agent_id": None},
+        ]
+    )
+    monkeypatch.setattr(sessions_mod, "_get_db", lambda: db, raising=False)
+
+    fake_main = _fake_main()
+    fake_main._find_idle_persistent_agent = AsyncMock(
+        return_value={
+            "id": "a1",
+            "pod_ip": "10.0.0.1",
+            "pod_port": 8001,
+        }
+    )
+    fake_main._send_session_attach = AsyncMock(return_value=False)
+    fake_main.agent_provisioner.provision_agent = AsyncMock()
+    monkeypatch.setitem(sys.modules, "main", fake_main)
+
+    with pytest.raises(RuntimeError, match="pinned provisioning"):
+        await sessions_mod._provision_agent_for_thread(
+            thread_id="t1",
+            config_name="session_base",
+            config_override=None,
+        )
+
+    fake_main.agent_provisioner.provision_agent.assert_not_awaited()
+
+
 @pytest.mark.asyncio
 async def test_do_prepare_emits_phases_for_warm_thread(monkeypatch):
     """When the thread already has an agent_id and the pod is ready,
@@ -128,6 +253,7 @@ async def test_do_prepare_emits_phases_for_warm_thread(monkeypatch):
     # Already bound and ready.
     db.get_thread.return_value = {
         "id": "t1",
+        "execution_lane": "pinned",
         "user_id": "u1",
         "agent_id": "agent-xyz",
         "config_name": "persistent_defaults",
@@ -202,6 +328,7 @@ async def test_do_prepare_emits_failed_when_pod_not_ready(monkeypatch):
     db = AsyncMock()
     db.get_thread.return_value = {
         "id": "t1",
+        "execution_lane": "pinned",
         "user_id": "u1",
         "agent_id": "agent-xyz",
         "config_name": "persistent_defaults",
@@ -269,6 +396,7 @@ async def test_do_prepare_waits_when_agent_pod_marker_in_flight(monkeypatch):
         side_effect=[
             {
                 "id": "t1",
+                "execution_lane": "pinned",
                 "user_id": "u1",
                 "agent_id": None,
                 "config_name": "persistent_defaults",
@@ -276,6 +404,7 @@ async def test_do_prepare_waits_when_agent_pod_marker_in_flight(monkeypatch):
             },
             {
                 "id": "t1",
+                "execution_lane": "pinned",
                 "user_id": "u1",
                 "agent_id": "agent-xyz",
                 "config_name": "persistent_defaults",
@@ -357,6 +486,7 @@ async def test_do_prepare_reconciles_workspace_on_cold_start(monkeypatch):
         side_effect=[
             {
                 "id": "t1",
+                "execution_lane": "pinned",
                 "user_id": "u1",
                 "agent_id": None,
                 "config_name": "persistent_defaults",
@@ -364,6 +494,7 @@ async def test_do_prepare_reconciles_workspace_on_cold_start(monkeypatch):
             },
             {
                 "id": "t1",
+                "execution_lane": "pinned",
                 "user_id": "u1",
                 "agent_id": "agent-xyz",
                 "config_name": "persistent_defaults",
@@ -439,6 +570,7 @@ async def test_do_prepare_waits_for_cloud_folder_before_binding_an_agent(monkeyp
         side_effect=[
             {
                 "id": "t1",
+                "execution_lane": "pinned",
                 "user_id": "u1",
                 "agent_id": None,
                 "config_name": "persistent_defaults",
@@ -446,6 +578,7 @@ async def test_do_prepare_waits_for_cloud_folder_before_binding_an_agent(monkeyp
             },
             {
                 "id": "t1",
+                "execution_lane": "pinned",
                 "user_id": "u1",
                 "agent_id": "agent-xyz",
                 "config_name": "persistent_defaults",
@@ -529,6 +662,7 @@ async def test_do_prepare_grant_denied_fails_fast_without_provisioning(monkeypat
     db = AsyncMock()
     db.get_thread.return_value = {
         "id": "t1",
+        "execution_lane": "pinned",
         "user_id": "u1",
         "agent_id": None,
         "config_name": "persistent_defaults",
@@ -599,6 +733,7 @@ def test_connection_returns_ws_url_and_token_when_ready(monkeypatch):
     fake_db = AsyncMock()
     fake_db.get_thread.return_value = {
         "id": "t1",
+        "execution_lane": "pinned",
         "user_id": "u1",
         "agent_id": "agent-xyz",
     }
@@ -638,6 +773,8 @@ def test_connection_returns_ws_url_and_token_when_ready(monkeypatch):
     assert resp.status_code == 200
     body = resp.json()
     assert body["state"] == "ready"
+    assert body["execution_lane"] == "pinned"
+    assert body["control_socket"] == "websocket"
     assert body["ws_url"].startswith("wss://api.test.example/p/t1/ws?t=")
     assert isinstance(body["token"], str) and body["token"]
     assert isinstance(body["expires_at"], int)
@@ -647,6 +784,105 @@ def test_connection_returns_ws_url_and_token_when_ready(monkeypatch):
         pod_name="srw-agent-x",
         pod_uid="k8s-uid-xyz",
     )
+
+
+def test_connection_reports_stateless_ready_without_a_socket(monkeypatch):
+    """A queue-served thread is admission-ready but has no control socket."""
+    from orchestrator.routers import sessions as sessions_mod
+
+    fastapi_app = FastAPI()
+    _install_fake_auth(monkeypatch)
+    fake_db = AsyncMock()
+    fake_db.get_thread.return_value = {
+        "id": "t1",
+        "execution_lane": "stateless",
+        "user_id": "u1",
+        "agent_id": None,
+    }
+    monkeypatch.setattr(sessions_mod, "_get_db", lambda: fake_db, raising=False)
+    fastapi_app.include_router(sessions_mod.router)
+
+    resp = TestClient(fastapi_app).get("/api/sessions/t1/connection")
+
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "state": "ready",
+        "execution_lane": "stateless",
+        "control_socket": "none",
+        "ws_url": None,
+        "token": None,
+        "expires_at": None,
+    }
+    fake_db.get_agent.assert_not_awaited()
+
+
+def test_connection_models_require_their_lane_discriminator_and_socket_shape():
+    from orchestrator.routers.sessions import (
+        PinnedConnectionResponse,
+        StatelessConnectionResponse,
+    )
+
+    for model in (PinnedConnectionResponse, StatelessConnectionResponse):
+        with pytest.raises(ValidationError):
+            model.model_validate({})
+
+
+def test_connection_openapi_is_a_required_discriminated_union():
+    from orchestrator.routers.sessions import router as sessions_router
+
+    fastapi_app = FastAPI()
+    fastapi_app.include_router(sessions_router)
+    openapi = fastapi_app.openapi()
+    response_schema = openapi["paths"]["/api/sessions/{thread_id}/connection"]["get"][
+        "responses"
+    ]["200"]["content"]["application/json"]["schema"]
+
+    assert len(response_schema["oneOf"]) == 2
+    assert response_schema["discriminator"] == {
+        "propertyName": "execution_lane",
+        "mapping": {
+            "pinned": "#/components/schemas/PinnedConnectionResponse",
+            "stateless": "#/components/schemas/StatelessConnectionResponse",
+        },
+    }
+    stateless_required = set(
+        openapi["components"]["schemas"]["StatelessConnectionResponse"]["required"]
+    )
+    assert stateless_required == {
+        "state",
+        "execution_lane",
+        "control_socket",
+        "ws_url",
+        "token",
+        "expires_at",
+    }
+
+
+@pytest.mark.parametrize(
+    ("execution_lane", "agent_id"),
+    [("future-lane", None), ("stateless", "agent-should-not-be-bound")],
+)
+def test_connection_fails_closed_for_unsafe_lane_rows(
+    monkeypatch, execution_lane, agent_id
+):
+    from orchestrator.routers import sessions as sessions_mod
+
+    fastapi_app = FastAPI()
+    _install_fake_auth(monkeypatch)
+    fake_db = AsyncMock()
+    fake_db.get_thread.return_value = {
+        "id": "t1",
+        "execution_lane": execution_lane,
+        "user_id": "u1",
+        "agent_id": agent_id,
+    }
+    monkeypatch.setattr(sessions_mod, "_get_db", lambda: fake_db, raising=False)
+    fastapi_app.include_router(sessions_mod.router)
+
+    resp = TestClient(fastapi_app).get("/api/sessions/t1/connection")
+
+    assert resp.status_code == 409
+    fake_db.get_agent.assert_not_awaited()
 
 
 def test_connection_returns_425_when_thread_unbound(monkeypatch):
@@ -659,7 +895,12 @@ def test_connection_returns_425_when_thread_unbound(monkeypatch):
     _install_fake_auth(monkeypatch)
 
     fake_db = AsyncMock()
-    fake_db.get_thread.return_value = {"id": "t1", "user_id": "u1", "agent_id": None}
+    fake_db.get_thread.return_value = {
+        "id": "t1",
+        "execution_lane": "pinned",
+        "user_id": "u1",
+        "agent_id": None,
+    }
     from orchestrator.routers import sessions as sessions_mod
 
     monkeypatch.setattr(sessions_mod, "_get_db", lambda: fake_db, raising=False)
@@ -723,6 +964,7 @@ def test_connection_returns_409_when_agent_not_ready(monkeypatch):
     fake_db = AsyncMock()
     fake_db.get_thread.return_value = {
         "id": "t1",
+        "execution_lane": "pinned",
         "user_id": "u1",
         "agent_id": "agent-xyz",
     }
@@ -754,6 +996,7 @@ def test_connection_self_heals_425_when_agent_offline(monkeypatch):
     fake_db = AsyncMock()
     fake_db.get_thread.return_value = {
         "id": "t1",
+        "execution_lane": "pinned",
         "user_id": "u1",
         "agent_id": "agent-dead",
     }
@@ -786,6 +1029,7 @@ def test_connection_self_heals_425_when_agent_row_missing(monkeypatch):
     fake_db = AsyncMock()
     fake_db.get_thread.return_value = {
         "id": "t1",
+        "execution_lane": "pinned",
         "user_id": "u1",
         "agent_id": "agent-ghost",
     }
@@ -813,6 +1057,7 @@ def test_connection_keeps_409_and_no_unbind_when_agent_booting(monkeypatch):
     fake_db = AsyncMock()
     fake_db.get_thread.return_value = {
         "id": "t1",
+        "execution_lane": "pinned",
         "user_id": "u1",
         "agent_id": "agent-booting",
     }
@@ -846,6 +1091,7 @@ def test_connection_returns_425_when_pod_not_session_ready(monkeypatch):
     fake_db = AsyncMock()
     fake_db.get_thread.return_value = {
         "id": "t1",
+        "execution_lane": "pinned",
         "user_id": "u1",
         "agent_id": "agent-xyz",
     }
