@@ -70,6 +70,7 @@ async def db(pg_dsn):
                 parent_job_id uuid,
                 priority int DEFAULT 5,
                 runner_kind text,
+                execution_lane text NOT NULL DEFAULT 'pinned',
                 branch_name text,
                 context jsonb,
                 freeze_data jsonb,
