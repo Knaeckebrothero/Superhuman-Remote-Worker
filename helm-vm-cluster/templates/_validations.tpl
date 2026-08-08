@@ -10,9 +10,53 @@ before any resource is rendered.
 {{- $pvInventory := $metering.pvInventoryEnabled | default false -}}
 {{- $storageInventory := or $pvcInventory $pvInventory -}}
 {{- $remoteInventory := or $vmInventory $pvcInventory $pvInventory -}}
+{{- $meteringExternalSecrets := $metering.externalSecrets | default dict -}}
 {{- $orchestratorHostAliases := list -}}
 {{- if hasKey $metering "orchestratorHostAliases" -}}
 {{- $orchestratorHostAliases = get $metering "orchestratorHostAliases" -}}
+{{- end -}}
+
+{{- if ($meteringExternalSecrets.enabled | default false) -}}
+{{- if not .Values.externalSecrets.enabled -}}
+{{- fail "infrastructureMetering.externalSecrets.enabled requires externalSecrets.enabled" -}}
+{{- end -}}
+{{- if not ($meteringExternalSecrets.vaultPath | default "") -}}
+{{- fail "infrastructureMetering.externalSecrets.vaultPath is required when metering secret sync is enabled" -}}
+{{- end -}}
+{{- $meteringSecretTargets := list
+      ($metering.ingestionSecretName | default "")
+      ($metering.storageIngestionSecretName | default "")
+      ($metering.volumeIdentitySecretName | default "")
+      (.Values.vmController.lifecycleAuthSecretName | default "")
+-}}
+{{- $seenMeteringSecretTargets := dict -}}
+{{- range $target := $meteringSecretTargets -}}
+{{- if $target -}}
+{{- if hasKey $seenMeteringSecretTargets $target -}}
+{{- fail (printf "infrastructureMetering external secret targets must be distinct; %s is reused" $target) -}}
+{{- end -}}
+{{- $_ := set $seenMeteringSecretTargets $target true -}}
+{{- end -}}
+{{- end -}}
+{{- if eq (len $seenMeteringSecretTargets) 0 -}}
+{{- fail "infrastructureMetering.externalSecrets.enabled requires at least one metering Secret name" -}}
+{{- end -}}
+{{- $meteringVaultProperties := list
+      ($meteringExternalSecrets.vmiIngestionProperty | default "")
+      ($meteringExternalSecrets.vmStorageIngestionProperty | default "")
+      ($meteringExternalSecrets.volumeIdentityProperty | default "")
+      ($meteringExternalSecrets.vmLifecycleAuthProperty | default "")
+-}}
+{{- $seenMeteringVaultProperties := dict -}}
+{{- range $property := $meteringVaultProperties -}}
+{{- if not (regexMatch "^[-._A-Za-z0-9]+$" $property) -}}
+{{- fail "infrastructureMetering external secret property names must use only letters, digits, '.', '_', or '-'" -}}
+{{- end -}}
+{{- if hasKey $seenMeteringVaultProperties $property -}}
+{{- fail (printf "infrastructureMetering external secret properties must be distinct; %s is reused" $property) -}}
+{{- end -}}
+{{- $_ := set $seenMeteringVaultProperties $property true -}}
+{{- end -}}
 {{- end -}}
 
 {{- /* Static collector-only DNS overrides are security-sensitive. Validate
