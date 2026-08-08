@@ -19,6 +19,7 @@ snapshot), runs the sweeps, and drops the database. Skipped when the env var
 is unset so plain unit-test runs stay hermetic.
 """
 
+import json
 import os
 from pathlib import Path
 from uuid import uuid4
@@ -260,11 +261,17 @@ async def test_job_execution_lease_lifecycle_against_real_postgres():
                 "INSERT INTO jobs (description, status) "
                 "VALUES ('legacy processing', 'processing') RETURNING id"
             )
+            pinned_boundary_id = await conn.fetchval(
+                "INSERT INTO jobs (description, status, freeze_data) "
+                "VALUES ('pinned batch boundary', 'paused', $1::jsonb) "
+                "RETURNING id",
+                '{"freeze_type": "batch_boundary", "reason": "test"}',
+            )
         assert await db.recover_expired_lease_jobs() == []
 
         # The belt-and-suspenders orphan sweep has four mutation arms. Seed
         # one stateless row for every arm and prove all four remain untouched.
-        freeze = '{"freeze_type": "version_upgrade", "reason": "test"}'
+        freeze = '{"freeze_type": "batch_boundary", "reason": "test"}'
         async with db.acquire() as conn:
             await conn.execute(
                 "UPDATE agents SET status = 'offline' WHERE id = $1", agent_id
@@ -284,9 +291,10 @@ async def test_job_execution_lease_lifecycle_against_real_postgres():
                 agent_id,
                 freeze,
             )
-        # The pinned legacy row above is recovered; none of the four stateless
-        # rows may contribute to the count.
-        assert await db.recover_orphaned_jobs() == 1
+        # The pinned legacy row is recovered and the pinned boundary freeze is
+        # cleared through the shared SQL-array registry; none of the four
+        # stateless rows may contribute to the count.
+        assert await db.recover_orphaned_jobs() == 2
         async with db.acquire() as conn:
             assert (
                 await conn.fetchval(
@@ -294,11 +302,20 @@ async def test_job_execution_lease_lifecycle_against_real_postgres():
                 )
                 == "paused"
             )
+            pinned_boundary = await conn.fetchrow(
+                "SELECT freeze_data, context FROM jobs WHERE id = $1",
+                pinned_boundary_id,
+            )
             rows = await conn.fetch(
                 "SELECT description, status, assigned_agent_id, freeze_data "
                 "FROM jobs WHERE id = ANY($1::uuid[]) ORDER BY description",
                 [row["id"] for row in orphan_rows],
             )
+        assert pinned_boundary["freeze_data"] is None
+        pinned_context = pinned_boundary["context"]
+        if isinstance(pinned_context, str):
+            pinned_context = json.loads(pinned_context)
+        assert pinned_context["last_freeze_data"]["freeze_type"] == "batch_boundary"
         by_description = {row["description"]: row for row in rows}
         assert by_description["stateless processing orphan"]["status"] == "processing"
         assert (

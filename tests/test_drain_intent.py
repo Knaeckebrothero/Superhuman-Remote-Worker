@@ -410,6 +410,43 @@ class TestVersionUpgradeFreeze:
         status, _ = determine_job_status(job, result)
         assert status == "paused"
 
+    def test_batch_boundary_pauses_for_next_claim(self):
+        from orchestrator.services.completion import determine_job_status
+
+        job = {"id": "j1", "parent_job_id": None}
+        result = {
+            "should_stop": True,
+            "goal_achieved": False,
+            "freeze_data": {"freeze_type": "batch_boundary"},
+        }
+        assert determine_job_status(job, result) == ("paused", None)
+
+    def test_batch_boundary_with_coincident_error_still_pauses(self):
+        from orchestrator.services.completion import determine_job_status
+
+        job = {"id": "j1", "parent_job_id": None}
+        result = {
+            "should_stop": True,
+            "goal_achieved": False,
+            "error": {"message": "simulated process interruption"},
+            "freeze_data": {"freeze_type": "batch_boundary"},
+        }
+        assert determine_job_status(job, result) == ("paused", None)
+
+    def test_batch_boundary_subjob_with_live_parent_pauses(self):
+        from orchestrator.services.completion import determine_job_status
+
+        job = {"id": "child", "parent_job_id": "parent"}
+        result = {
+            "should_stop": True,
+            "goal_achieved": False,
+            "freeze_data": {"freeze_type": "batch_boundary"},
+        }
+        assert determine_job_status(job, result, parent_status="processing") == (
+            "paused",
+            None,
+        )
+
     def test_existing_freeze_types_unchanged(self):
         # Smoke: the new version_upgrade branch doesn't shadow the
         # previously handled non-completion freeze types.
@@ -1064,6 +1101,24 @@ class TestAutoContinueDrainBackstop:
 
 
 class TestAutoContinueFreezeTypeScope:
+    def test_shared_registry_keeps_semantic_subsets_explicit(self):
+        from src.shared.job_freeze_types import (
+            AUTO_REDISPATCH_FREEZE_TYPES,
+            CONTINUE_AS_NEW_FREEZE_TYPES,
+            ERROR_IMMUNE_FREEZE_TYPES,
+            SUBJOB_REDISPATCH_FREEZE_TYPES,
+        )
+
+        assert CONTINUE_AS_NEW_FREEZE_TYPES == {
+            "version_upgrade",
+            "batch_boundary",
+        }
+        assert CONTINUE_AS_NEW_FREEZE_TYPES <= AUTO_REDISPATCH_FREEZE_TYPES
+        assert AUTO_REDISPATCH_FREEZE_TYPES <= ERROR_IMMUNE_FREEZE_TYPES
+        assert "batch_boundary" in SUBJOB_REDISPATCH_FREEZE_TYPES
+        for freeze_type in ("budget_exceeded", "job_complete", "vm_upgrade_required"):
+            assert freeze_type not in ERROR_IMMUNE_FREEZE_TYPES
+
     def test_auto_continue_set_covers_redispatch_types_only(self):
         from src.agent import _AUTO_CONTINUE_FREEZE_TYPES
 
