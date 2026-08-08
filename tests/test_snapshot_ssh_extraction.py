@@ -14,6 +14,8 @@ see docs/features/workspace_durability_tiering.md §C1/C1b): a shell pipeline
 the remote command is rewritten to discriminate the two stages via ``PIPESTATUS``.
 """
 
+import shutil
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -273,8 +275,15 @@ class TestCaptureVmSnapshotAcceptGate:
         assert remote_cmd.startswith("bash -c '")
         assert "tar --xattrs" in remote_cmd
         assert "| zstd -1 -T0" in remote_cmd
-        assert "${PIPESTATUS[0]}" in remote_cmd
-        assert "${PIPESTATUS[1]}" in remote_cmd
+        # PIPESTATUS must be snapshotted into an array in ONE command before
+        # anything reads it (a bare `__t=${PIPESTATUS[0]}` assignment is
+        # itself a simple command and immediately resets PIPESTATUS, so a
+        # second assignment reading index 1 would see it already clobbered —
+        # see test_pipestatus_discrimination_tail_maps_stage_exits_correctly
+        # for the runtime-behavior regression guard).
+        assert '__ps=("${PIPESTATUS[@]}")' in remote_cmd
+        assert "${__ps[0]}" in remote_cmd
+        assert "${__ps[1]}" in remote_cmd
         assert "exit 2" in remote_cmd
         assert "exit 1" in remote_cmd
         assert "exit 0" in remote_cmd
@@ -330,3 +339,72 @@ class TestCaptureVmSnapshotAcceptGate:
         assert result is False
         assert "capture_failed" in self._statuses(service._set_snapshot_context)
         service.upload_snapshot.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_pipestatus_discrimination_tail_maps_stage_exits_correctly(
+        self, service
+    ):
+        """Executes the actual shipped PIPESTATUS-reading shell logic under
+        real bash with synthetic (tar_rc, zstd_rc) stage exits and asserts
+        the 0/1/2 mapping end to end.
+
+        Every other test in this class mocks ``create_subprocess_exec`` with
+        a hardcoded ``returncode`` — the shell arithmetic that is supposed to
+        *compute* that code has ZERO runtime coverage there. That blind spot
+        is real: a bare assignment (``__t=${PIPESTATUS[0]}``) is itself a
+        simple command and immediately resets ``PIPESTATUS`` to its own exit
+        status, so a second assignment reading index 1 would silently see it
+        already clobbered — re-masking every zstd failure while every
+        mock-returncode test above stays green. This test extracts the real
+        tail from the command the service actually constructs and runs it
+        against real bash, so a regression to the broken form fails here.
+        """
+        if shutil.which("bash") is None:
+            pytest.skip("bash not available")
+
+        fake = _fake_capture_proc(returncode=0)
+        with patch(
+            "asyncio.create_subprocess_exec", new=AsyncMock(return_value=fake)
+        ) as mock_exec:
+            await service.capture_vm_snapshot("job-tail", "192.0.2.10", 2222)
+
+        remote_cmd = mock_exec.call_args.args[-1]
+        assert remote_cmd.startswith("bash -c '")
+        assert remote_cmd.endswith("'")
+        body = remote_cmd[len("bash -c '") : -1]
+        # Isolate the discrimination tail from the tar|zstd pipeline that
+        # precedes it: everything after "| zstd -1 -T0; ". Anchored on the
+        # pipeline's own tail (present regardless of how the discrimination
+        # logic itself reads PIPESTATUS) rather than on a variable name from
+        # the current fix, so a regression to a *different* broken form of
+        # the tail still gets extracted and exercised instead of vanishing
+        # into a substring-not-found error.
+        anchor = "| zstd -1 -T0; "
+        tail = body[body.index(anchor) + len(anchor) :]
+
+        # (tar_rc, zstd_rc) -> honest mapped exit code (0 clean, 1 tar
+        # warned/accept, 2 fatal) per docs/features/workspace_durability_
+        # tiering.md §C1 (C1b): accept tar rc in {0,1}; reject tar rc>=2 or
+        # any zstd failure — zstd failing must dominate regardless of tar's
+        # own code.
+        cases = [
+            (0, 0, 0),
+            (1, 0, 1),
+            (2, 0, 2),
+            (0, 1, 2),
+            (0, 5, 2),
+            (1, 1, 2),
+        ]
+        for tar_rc, zstd_rc, expected in cases:
+            result = subprocess.run(
+                ["bash", "-c", f"( exit {tar_rc} ) | ( exit {zstd_rc} ); {tail}"],
+                capture_output=True,
+                text=True,
+            )
+            assert result.returncode == expected, (
+                f"tar_rc={tar_rc} zstd_rc={zstd_rc}: expected exit {expected}, "
+                f"got {result.returncode} (stderr={result.stderr!r})"
+            )
+            # The correct form never trips a `[: integer expected` usage
+            # error (the symptom of PIPESTATUS having already been clobbered).
+            assert "integer expected" not in result.stderr
