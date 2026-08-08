@@ -264,6 +264,41 @@ is name/path search first, content search only bounded (this is the
 hydration lesson from [[rclone_cloud_mount]] §8 in miniature); single-file
 size guard on reads.
 
+### 5.1 Op count is the cost (measured 2026-08-08)
+
+Every operation on this backend is an **rclone process spawn**, ~0.1–0.5 s
+each. That makes the op *count*, not the byte volume, the performance model —
+and it is easy to write innocent-looking code that spawns dozens. Session
+attach on a `session_base` lite thread measured **51 spawns / 7.2 s**, of
+which 36 were listings, because setup repeatedly asks "does this exist?"
+about one small tree (workspace scaffolding, instruction files, skill files,
+the legacy-tools sweep). Two primitives fix that class of cost:
+
+- **`begin_read_cache()` / `end_read_cache()`** — a *scoped* metadata index.
+  One recursive listing builds a key→size map; `is_file`, `is_dir`,
+  `list_dir`, `walk` and `stat` answer from it. Deliberately **not ambient**:
+  a caller opens it around a known burst of probes and closes it in a
+  `finally` (`PersistentSession.setup` does exactly this), so ordinary tool
+  work always talks to the store and no call site has to reason about
+  staleness. Inside the scope it stays *exact* — local mutations update the
+  map in place, because the backend knows precisely which keys moved. The one
+  documented boundary is another process writing the same prefix mid-scope
+  (a cockpit upload), which the first op after the scope closes picks up.
+  Contract tests pin all of it, including an op-counting store proving 30
+  probes cost one listing and zero heads.
+- **`list_files_with_sizes()`** — `walk()` that keeps sizes, still one store
+  op. Consumed by the cloud-sync layer via duck-typed capability probe, so a
+  sync pass costs one spawn instead of one walk plus one `stat` per file.
+
+`mkdir` is contractually idempotent and scaffolding recreates the same
+directories on every attach; when the index is open the backend can tell for
+free that a directory already exists and skips the write (9 spawns saved).
+Without the index, probing would cost more than the write, so the
+unconditional put remains the uncached behavior.
+
+Result: **13 spawns / 1.5 s** for the same attach. See
+[[stateless_agents]] §5.3.3 for the full turn decomposition this came out of.
+
 **Storage endpoint reality:** prod-private already runs MinIO
 (`minio.minio.svc`, used by the cloud object-store wiring in
 `helm/values.yaml`), so S3 exists where it matters. Local k3d has no MinIO;

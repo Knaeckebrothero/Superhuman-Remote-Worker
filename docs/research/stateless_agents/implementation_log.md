@@ -539,8 +539,27 @@ question with a very different ratio.
   and once with only 2 of 4 log markers. `updateStatus: ok` is not evidence.
   The reliable check is `kubectl exec <pod> -- grep -c <marker> <file>` on
   **every** running pod before trusting a measurement.
+* **`git checkout` while Tilt is up is a DEPLOY of that branch.** Checking out
+  `develop` for a few seconds — to confirm the eleven suite failures were
+  pre-existing — was enough for Tilt to catch the swapped tree and build
+  `srw-agent:tilt-978bb3da`, which then crash-looped with
+  `agent.py: error: argument --mode: invalid choice: 'stateless'`: develop's
+  `agent.py` under the feature branch's Deployment spec. Confusing because the
+  code you are reading is correct; the tell is mismatched `tilt-` image tags
+  across ReplicaSets. Caught in the closing health sweep and rebuilt. To test
+  "was this failing before?", stash only the specific new file
+  (`git stash push -- <path>`) or use a worktree outside Tilt's watch root.
 * **admin-cli `id_token` expiry** (~15 min) shows up as a silent 401 and a turn
   that never appears. `drive_turn.sh` mints one per run.
+* **A container's PID 1 ignores in-namespace SIGKILL.** `kubectl exec … kill -9 1`
+  silently does nothing, which reads as "the fault injection ran and nothing
+  broke". Both sessions rediscovered this independently; now a comment in
+  `kill_test.sh`. Use `kubectl delete pod --force --grace-period=0`, or the
+  cgroup-v2 freezer for a zombie (not a death).
+* **Optimization outran the fault harness.** The first two kill runs proved
+  nothing because turns now finish in <5 s — the pod died after the answer was
+  already persisted. The steal test needs a deliberately long generation and a
+  kill fired the instant the claim appears.
 
 ## Test posture
 
@@ -555,6 +574,45 @@ question with a very different ratio.
   pod claiming immediately after a completion is now graced). Both were updated
   to opt out of the grace with a comment pointing at `TestAffinityGrace`, rather
   than weakening the new contract to keep them green.
+
+**Full-suite gate: 15 013 passed, 107 skipped, 12 failed** (`pytest tests/`),
+`ruff check` + `ruff format --check` clean across `src/ orchestrator/ tests/`.
+Eleven of the twelve failures reproduce on `develop` (Python 3.14 environment
+noise — `mcp_manager`, arxiv/semantic-scholar package contracts,
+`test_connect_disconnect`), consistent with the standing note that the local
+baseline is not zero.
+
+The twelfth was real and **pre-existing on this branch**:
+`test_migration_heads_are_unique_and_snapshots_are_not_the_contract` pins
+`APP_CURRENT_MIGRATION_HEAD`, which session 1 left at `0114` when it added
+0115 and 0116 — so that tripwire had been red since the spine landed and the
+night ended without noticing. It is now `0117` with a comment saying what the
+assertion is for (a migration landed → check the snapshot was regenerated and
+nothing was renumbered). Verified pre-existing by stashing *only* the new
+migration file and re-running, rather than by switching branches — see the
+trap below for why that distinction cost an hour.
+
+## Commits (branch `feature/stateless-agents`, not pushed)
+
+| | |
+|---|---|
+| `c290f525` | `feat(db, run_queue)` — 0117 affinity grace, `last_leased_by`, cleared on release + steal; harness applies 0115+0117; 8 affinity tests; migration-head pin fixed |
+| `3a1a475c` | `perf(cloud-sync)` — `Depth: infinity` PROPFIND primitive with capability fallback; bulk/parallel stat batches; pull/push detail logging |
+| `66806b7f` | `perf(virtual)` — scoped metadata index, idempotent `mkdir` skip, rclone op tally, 11 contract tests |
+| `a2e7fa8d` | `perf(agent, orchestrator)` — fingerprint drops `resolved_at`, duplicate cloud pulls removed on the lane, warm-poll cadence + warm TTL, all instrumentation |
+| `6a360848` | `docs` — feature doc v3.2, this log, BACKLOG session entry |
+
+Session 1's five commits (`e506fdfa`→`af5c38a0`) precede these; ten total on
+the branch, `develop` untouched.
+
+## Final state on the cluster
+
+Two `srw-agent-stateless` pods Running on the branch image, chart flag still
+default-off (only the gitignored `values-local.yaml` enables it). Post-commit
+verification turn: `mode=fresh bundle=0.07s attach=2.40s turn=2.26s push=0.04s
+total=4.78s`. The `stateless-night-baseline` thread
+(`9a756800-1ad2-4ef1-9e39-14ac8b1c312c`) remains the test fixture; it is the
+only thread on `execution_lane='stateless'`.
 
 ## Follow-ups this session leaves
 

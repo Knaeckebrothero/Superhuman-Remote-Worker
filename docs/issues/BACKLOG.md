@@ -721,12 +721,26 @@ from code reading.
 Verified: fault matrix re-run after the claim-SQL change — pod force-deleted
 mid-turn → steal at t+97 s → exactly one answer, epoch +1, affinity hint
 cleared. 81 real-PG run_queue tests (harness now applies 0115 **and** 0117),
-11 new scoped-index tests.
+11 new scoped-index tests. Full gate: **15 013 passed / 12 failed**, ruff
+clean; 11 of the 12 reproduce on `develop` (py3.14 env noise). The 12th was
+real and pre-existing on this branch — `APP_CURRENT_MIGRATION_HEAD` was left
+at `0114` when session 1 added 0115/0116, so that tripwire had been red since
+the spine landed. Fixed to 0117.
+
+Commits `c290f525`→`6a360848` (5), on top of session 1's `e506fdfa`→`af5c38a0`.
+Not pushed; `develop` untouched. Sibling docs updated with the pieces that
+live outside the feature doc: `no_workspace_agent_mode.md` §5.1 (virtual-tier
+op count + scoped metadata index), `cloud_collaboration_model.md` §4 (one
+Depth-infinity PROPFIND per turn boundary; why the lane's attach/teardown
+pulls were removed).
 
 Gotchas re-confirmed: Tilt ships partially-edited images (`updateStatus: ok`
-proves nothing — `kubectl exec … grep` every pod); `kill -9 1` inside a
+proves nothing — `kubectl exec … grep` every pod); **`git checkout` while Tilt
+is up DEPLOYS that branch** — a few seconds on `develop` left a pod
+crash-looping on `--mode: invalid choice: 'stateless'`; `kill -9 1` inside a
 container is ignored, use `kubectl delete pod --force --grace-period=0`;
 admin-cli `id_token` expires in ~15 min and fails as a silent 401.
 
 Left: the remaining 13 setup store ops; `AFFINITY_GRACE_SECONDS` should derive
-from the poll interval if cadences ever diverge; warm-TTL value unmeasured.
+from the poll interval if cadences ever diverge; warm-TTL value unmeasured;
+the fault harness needs a deliberately long turn now that turns are <5 s.
