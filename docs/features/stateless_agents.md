@@ -1,104 +1,333 @@
 # Stateless Agents — Turn Execution as a Deployment
 
-**Status:** DRAFT — design discussion, no implementation. Origin: user proposal 2026-08-06.
-**Related:** `docs/go_rewrite.md` (names this exact flip: "the database drives the graph, pods are stateless turn executors"), `docs/features/agent_lifecycle.md` (the current pod-per-agent model), `docs/features/worker_runtime_strategy.md` (decision: no new runtime — this doc proposes a *driver/deployment* change, not a new engine), `docs/features/session_reliability_and_transport_simplification.md` (P5/P6 converge on the same endpoint), `docs/done/cross_pod_resume_cold_starts_checkpoint_not_replicated.md` (D3 — the enabling substrate, shipped).
+**Status:** v3.1 — **S1 spine IMPLEMENTED and k3d-verified (night 2026-08-07/08)**: run_queue substrate (migration 0115 + `src/shared/run_queue/`, 73 real-PG tests), epoch/seq redesign (0116 + `src/shared/event_journal/`; live epoch-stable reattach), stateless turn executor (`src/api/turn_executor.py`, `--mode stateless`), orchestrator control plane (enqueue-on-input, claim-bundle, leader reaper, admin read model), `agent-stateless` Deployment (chart-gated, default off). Fault-injection matrix PASS (steal ≤105 s + `turn.interrupted`, zombie heartbeat-abort + fence, skip-if-answered, FIFO drain across a steal, exactly-once answers). Build log, per-milestone results, found-and-fixed issues, and the S1 follow-up list (affinity fingerprint, attach-cost decomposition, provisioning gate, cockpit compat): `docs/research/stateless_agents/implementation_log.md`. **Branch: `feature/stateless-agents`.** v1 2026-08-06 (initial proposal); v2 2026-08-07 after an 8-agent research fan-out (4 codebase deep-dives, 4 web sweeps); **v3 same night after a 6-lens adversarial panel** (concurrency, migration/ops, perf/cost, security, product/UX, completeness — 10 critical + 28 major findings folded in; the four sharpest code claims were independently re-verified). Raw research + critic reports with full evidence trails: `docs/research/stateless_agents/`. Largest v2→v3 changes: the queue got its **completion half** (§5.1), the epoch/lease-token unification was **split into two counters** (§5.2/§5.3.2), a **coexistence ruling** for the two lease systems (§5.4.4), a **security threat model** (§5.6), an honest **TTFT/DB-load budget** (§5.5, Appendix), and S1's scope grew a cockpit workstream plus the discovery that **lite sessions carry PVC-backed agent-local state today** (§6.1).
+**Origin:** user proposal — an LLM turn is conversation JSON in, bigger conversation JSON out; so agents can be a Deployment, not pinned pods.
+**Related:** `docs/go_rewrite.md` (names this flip; two sketches inverted by evidence — §5.1, §5.2), `docs/features/job_execution_lease.md` (shipped substrate), `docs/features/session_reliability_and_transport_simplification.md` (P5/P6 converge here; **P5 is blocked-by §5.3.2 — record it there**), `docs/features/worker_runtime_strategy.md` (no-new-runtime decision — this is a driver/deployment change), `docs/done/cross_pod_resume_cold_starts_checkpoint_not_replicated.md` (D3).
 
-## The idea
+## 1. The idea
 
-An LLM turn is a pure function: conversation JSON goes in, a bigger conversation JSON comes out. Everything else — files, shell, git — already lives on an external workspace pod that the agent reaches over SSH. So nothing about an "agent" actually needs to be a long-lived process bound to one conversation.
+A turn is a pure function: `(thread state, input, config) → (new messages, events, effects)`. Files, shell, git live on an external workspace pod reached over SSH; conversation state lives in Postgres. Nothing about an "agent" needs to be a long-lived process bound to one conversation.
 
-Today an agent *is* a pod: provisioned (or claimed from the warm pool) per session or per job, pinned to that thread/job for its lifetime, idle whenever the user is typing or the job is paused, reaped when done. The proposal flips it:
+- Agent pods become a plain **Deployment**. No identity, no registration, no pinning.
+- A user message (or a worker-job continuation) is a **row in a queue**. Any pod claims it under a lease, loads state + config from Postgres, runs the turn exactly as a stateful agent would, executes tools against the workspace pod, persists results, completes, releases.
+- Workers get a **batch budget**: the claiming pod runs to the next phase boundary (or a wall-clock cap), checkpoints, releases; the job re-enters the queue for any pod.
 
-- Agent pods become a plain Kubernetes **Deployment** behind a Service. No identity, no registration, no pinning.
-- A user message (or a job continuation) is routed to **any** pod. The pod reads the thread/job id, loads messages + config + tool bindings from Postgres, runs the turn exactly as a stateful agent would, executes tools against the external workspace pod, persists the new messages back to Postgres, and is free for the next request.
-- For autonomous workers that would run thousands of steps, add a **batch budget**: the pod that claims a job runs up to N supersteps (or to the next phase boundary), checkpoints, releases, and the job re-enters the queue for any pod to continue.
+"Agent" becomes what it always was underneath: a config plus a thread of messages.
 
-"Agent" stops being a pod and becomes what it always was underneath: a config plus a thread of messages.
+## 2. Why
 
-## Why
+**Utilization — honest asymmetry, honestly sized.** Sessions are the prize: duty cycle ~5–20%, yet each pins a ~300–500 MB pod. But sizing is a *latency* problem, not a mean-utilization problem: 50 sessions × 20% duty = 10 erlangs offered — 10 one-turn-per-pod servers at ρ≈1 queue unboundedly. The right claim: **~13–15 pods serve 50 sessions with small P(wait)** (pods ≈ erlangs / 0.6–0.7), still a ~3.5× win over 50 pinned pods, and the HPA floor targets that formula, not average duty. Workers gain little throughput (duty ~100%; 15 jobs on 10 pods is time-slicing) but gain **admission, fairness, and preemption**. New trade to name: a pinned session never waits behind strangers at turn time; a pooled one can — §5.3.7 gives that wait a UX and an acceptance bound.
 
-**Utilization and admission.** Today 10 concurrent conversations require 10 attached agent pods, ~300–500 MB RSS each, idle most of the time (a chat session's duty cycle is maybe 5–20%). A cluster that fits 10 agent pods caps out at 10 conversations regardless of how idle they are. Stateless pods are sized by *concurrent turns*, not by *open conversations*: 10 pods can comfortably serve 30–50 chat sessions. For workers the math is different and more modest — worker duty cycle is ~100%, so 15 jobs through 10 pods is genuine time-slicing at batch granularity: total throughput is still 10 pods' worth, each job runs at ~⅔ speed. The win there is **admission and fairness** (all 15 make progress; nothing waits behind a days-long job), not throughput.
+**The quadrant argument.** The credible alternative is the *hibernating actor* (Cloudflare Durable Objects hibernate at ~10 s idle, WebSockets held open, zero duration cost; Cognition built hypervisor snapshot + power-down at ">1 year of hypervisor engineering"). Pinning isn't wrong; **pinning-without-hibernation is the worst quadrant**, and Kubernetes sells no hibernation for a half-GB Python pod. What the actor model gives up teaches what we must build: its free per-entity serialization becomes our lease (§5.2), its in-memory hot state becomes our soft affinity (§5.3.4).
 
-**Operations.** Scaling becomes `kubectl scale` / HPA on queue depth. Deletes, in the limit: the warm-pool floor (`agent_provisioner.py ensure_warm_pool`), per-session agent provisioning, agent registration + heartbeat + 30s-cooldown matching, orphaned-job detection (a lease TTL replaces it), drain choreography on rolling deploys (a pod finishes its current batch and exits; the replacement picks up from the queue), idle-session reaping of agent pods (nothing to reap).
+**Industry exhibit.** OpenAI deprecated the Assistants API — stateful `threads`+`runs` pinned executions — hard shutdown 2026-08-26, for stateless request/response over a server-side conversation store plus background mode with cursor-resumable streaming. LangGraph Platform runs the same shape (Postgres run queue, worker leases, ≤1 run/thread, resume-from-checkpoint). OpenHands v1 (`step(state) → action` over an event log, sandboxed executor split) is the closest open-source twin.
 
-**Reliability — a bug-class graveyard.** A striking share of our open reliability bugs are structural consequences of pod-per-agent pinning, and dissolve rather than get fixed:
+**Operations.** Scaling becomes replicas/HPA on queue depth. The agent-lifecycle control plane gets deleted **per lane, on lane retirement** — not at flag-flip (§7's delete-when column). The honest steady state during the soak is *dual control planes*, priced in §9.
 
-- Stale-agent-detector SQL crash killing orphan recovery (live on prod) — no agent identity, no orphan detector.
-- Version-upgrade drain stripping k8s workspaces / drain masked by error — no drain choreography.
-- exit-137 resume wedge; agent-drift drain killing idle sessions — pod death becomes a routine, invisible event.
-- Session workspace wiped by idle reaping — agent pods are never reaped *because of a session*; workspace lifecycle decouples fully.
-- `docs/issues/fresh_job_dispatched_as_resume_skips_seeding.md` — the empty-task-brief bug exists **only because there are two lanes** (fresh start assumes state gets seeded; resume assumes state is resident). Stateless has one lane: *every* batch loads everything from the DB. The fresh/resume asymmetry cannot exist.
-- `docs/issues/session_turn_end_cloud_push_blocks_queued_input.md` — queued input lives in agent memory today; statelessness forces it into the DB, where a turn boundary can't block it.
+**Reliability — a bug-class graveyard.** Structural pod-pinning bugs dissolve rather than get fixed: the stale-agent-detector class, drain-strips-workspace, the exit-137 wedge, idle-reap wipes, the fresh-vs-resume seeding asymmetry (one lane: every claim loads everything), and the dead-pod `awaiting_user` trap observed live during the S1 build — a pinned thread whose pod died mid-life is unreachable by both `/input` ("agent unreachable") and `/resume` (409 for any status but 'ended') until something flips its status; a queue-lane thread cannot enter it (no pod to die — the next input just enqueues). Two live replica-unsafe spots get fixed as a side effect: the per-turn input lock dict (`main.py:30385` — "Single-instance orchestrator" is stale; dev runs 2 replicas) and `_threads_suspending`; the bench-sweeper double-submission race is the in-repo proof of unclaimed work under 2 replicas. And the design *forces* fixing a hole that already exists: `thread_messages` writes are unfenced today — the zombie-writer window is live in current session persistence (§5.2).
 
-**UX.** Session creation stops meaning "provision a pod and watch a spinner." A lite/virtual session becomes a DB row; the first turn hits an already-warm deployment. Time-to-first-token on a new session drops from tens of seconds to ~immediate.
+**UX.** Session creation stops meaning "provision a pod, watch a spinner": create-to-*accepted* becomes sub-second; create-to-first-token is budgeted honestly in §5.5 (provider TTFT dominates — "sub-second TTFT" was v2 overclaim).
 
-## How much already exists
+## 3. What the industry converged on (2024–2026)
 
-This is the surprising part: most of the substrate shipped over the last quarters, each piece for its own reason.
+Three consensus lines (OpenAI, LangGraph Platform, Temporal, Restate, Inngest, OpenHands independently): (1) **durable store owns state; stateless executors claim via queue + recorded lease**; (2) **journal results, never re-execute side effects** (nobody replays LLM calls); (3) **streaming = durable journal + sequence cursor** (OpenAI background mode's `sequence_number`+`starting_after` is shape-identical to our `thread_events`; even LangGraph Platform never streams worker→client directly). Two complications absorbed, not dismissed: LangGraph Platform needed Redis *as a ping/fan-out plane only* (data stays in PG — the ping-not-payload split, §5.5); and **warm pools migrate to the sandbox layer rather than vanish** (Cognition's hardest infra is workspace-tier provisioning; industry answer = a pause tier — E2B pause ≈4 s/GiB, resume ≈1 s — §10.7).
 
-1. **Workspaces are already external.** The agent process never touches its own filesystem as the workspace; everything goes over SSH/SFTP to a workspace pod or VM. Shell state survives in tmux *on the workspace pod* (`get_shell_state` reads it back). Tool-side state was externalized from day one.
-2. **Worker graph state is already in shared Postgres.** D3 replaced pod-local `AsyncSqliteSaver` with `AsyncPostgresSaver` keyed by `thread_id=job_id` (`src/agent.py _make_checkpointer`, `CHECKPOINTER_BACKEND=postgres`, chart default). **Cross-pod resume is verified live**: an agent pod was force-killed mid-phase and a *different* pod resumed the job from the PG checkpoint and continued. Retention (delete on terminal) works. The worker's state layer is done.
-3. **Batch limits are a degenerate case of freeze/resume.** The freeze contract (`freeze_data` + `should_stop`, orchestrator as sole status authority) and the dispatcher's re-dispatch of `paused` unassigned jobs already implement "stop here, anyone may continue." A worker batch budget is a freeze with a new type (`batch_boundary`) that skips the heavyweight teardown and immediately re-queues. Phase boundaries — where compaction and archiving already happen — are the natural batch edge.
-4. **Session conversation state is already message-granular in Postgres.** The persistent agent writes `thread_messages` directly after every append (mid-turn, not turn-batched), compaction records a `boundary_seq` cursor, and resume rebuilds context from the summary + message tail (`RESUME_MESSAGE_LIMIT` floor). Sessions have no LangGraph checkpointer to migrate — the DB *is* the state.
-5. **The client transport is already pod-agnostic.** Cockpit SSE is served from the `thread_events` journal in Postgres (epoch + cursor replay); any orchestrator replica can serve it, and reopen is loss-free. The agent writes events through an ordered journal writer. Which pod produced an event is already invisible to the UI.
-6. **Per-request config resolution exists at attach granularity.** Pool-mode `/session/attach` (`src/api/persistent_app.py`) re-resolves the thread's expert config over the pod's boot config — the exact "load config per request" machinery statelessness needs, currently run once per session instead of once per turn.
-7. **Approvals and steering are already data, not process state.** Sudo approvals are DB rows; worker steering rides the heartbeat *response* (a pull); officer guidance is queued in the DB. Nothing about human-in-the-loop assumes a resident process — pausing a turn and re-entering later is the existing model.
+## 4. How much already exists
 
-What the go_rewrite doc sketches as the target architecture is, on the state layer, roughly **built**. What's missing is the control plane and the last in-memory residue.
+1. **Workspaces are external.** SSH to workspace pod/VM; browser executes workspace-side; IDE is code-server *in the workspace pod* behind `ide_proxy.py`; canvas skill files carry a workspace manifest. The v1 "attachment long tail" reduces to canvas presence (§10.8).
+2. **Worker graph state is in shared Postgres** (D3): cross-pod resume live-verified; delete-on-terminal + keep-last-3 retention; checkpoint writes ~11 ms p50 flat; restore ≈600 kB worst.
+3. **A job execution lease shipped** (migration `0054`): claim CAS + 180 s pickup lease (`claim_job_for_agent`), heartbeat-renewed 90 s fenced by `assigned_agent_id`, `recover_expired_lease_jobs` as primary orphan recovery. Missing: pull-claiming, claim-token renewal, the stage-4 completion CAS, batch release (which `PUT /api/jobs/{id}/agent-release` already implements). **Caveat found in review: the real heartbeat is 60 s** (several "5 s beats" docstrings are stale) — one beat >30 s late can expire a healthy lease; §5.2 replaces the transport.
+4. **The batch break half-exists**: workers drive `astream(stream_mode="values")` with a per-superstep cooperative break in production (pause/cancel/preempt/drain); `/complete` already fires `_trigger_dispatch()`.
+5. **Session conversation state is message-granular**, with **accept-time input durability** (user message persisted before the 200). Only the turn-trigger is process memory. `thread_messages.seq` is DB-side BIGSERIAL — the cross-pod-safe allocation pattern the event journal lacks.
+6. **Journal-only token streaming is the shipped path**: per-token `thread_events` rows, batched ordered writer, SSE with `Last-Event-ID` cursor replay, epoch zombie guard, any-replica serving.
+7. **Per-request config resolution is the rule**: sessions re-resolve on every attach ("there is no freeze"); job dispatch ships the frozen `resolved_config` blob (~127 kB); **every resume re-runs credential injection + grant PEP + datasource re-authorization** (`_resume_job_on_agent`).
+8. **Approvals, steering, officer wakes are data** (DB rows + NOTIFY; DB-direct steering pull exists at phase boundaries; officer sleep = durable timer).
+9. **The claim/fencing idioms are house style**: single-statement CAS transitions; SKIP LOCKED in `cron_dispatcher` + infra metering; and the closest template, `datasource_reconciliation.py` — SKIP LOCKED + lease + **never-reused sequence claim token checked on every completion write**. New lock keys go in `lock_ids.py`.
 
-## What's missing
+## 5. Design
 
-### Both modes
+### 5.1 Work queue — full lifecycle, admission, fairness
 
-- **Turn/batch lease.** Two pods must never run the same thread. A `lease` on the thread/job row: claim via `SELECT … FOR UPDATE SKIP LOCKED` (or advisory lock), short TTL, heartbeat extends while the batch runs, expiry re-queues. This *replaces* agent heartbeat/orphan machinery rather than adding to it. Sessions already have an epoch mechanism that can serve as the fencing token.
-- **Routing.** Sessions are push-shaped: orchestrator receives the user message and POSTs a turn request to a pod (it already talks to agent pod IPs today). Workers are pull-shaped: pods claim continuations from a queue (Postgres `LISTEN/NOTIFY` + poll fallback; no new infra). These can be two small code paths over the same lease.
-- **Soft affinity.** Keep a `last_pod` hint per thread; route there first, fall back to any pod. Correctness never depends on it; it just keeps warm caches (SSH connection, resolved config, message tail) hot. Cold cost ≈ SSH handshake (~0.3–0.5 s) + config resolve + state load (worst observed checkpoint load ≈ 600 kB) — amortized over a batch, <5% at batch ≥ ~25 supersteps.
-- **Replay semantics.** Pod dies mid-turn → the turn re-runs from the last persisted point. v1 accepts today's crash-resume semantics (this is exactly what D3-verified resume already does; message-granular persistence keeps the loss window to a partial turn). v2 adds the go_rewrite idea: tool-call UUIDs + workspace-side dedup for at-least-once with safe replay.
-- **Observability.** A job's log now spans pods. Logs must be keyed by thread/job id (the job-log-archive work already leans this way); "which pod" becomes a per-batch annotation.
+One small hot table (Solid Queue's lesson: poll a tiny indexed set — 5.6 M jobs/day at 1300 poll qps, 110 µs/query):
 
-### Sessions
+```sql
+CREATE TABLE run_queue (
+  unit_id       UUID PRIMARY KEY,            -- thread_id | job_id | bg task id (row is DURABLE per unit)
+  unit_kind     TEXT NOT NULL,               -- 'session_turn' | 'worker_batch' | 'bg_task'
+  dedup_key     TEXT,                        -- collapsible bg work, e.g. 'cloud_push:<thread>'
+  state         TEXT NOT NULL DEFAULT 'queued',  -- queued | leased | done | parked
+  priority      INT  NOT NULL DEFAULT 0,
+  fair_key      TEXT,                        -- user id: per-user round-robin for session_turn (§5.3.7)
+  run_after     TIMESTAMPTZ NOT NULL DEFAULT now(),
+  attempts_since_completion INT NOT NULL DEFAULT 0,
+  max_attempts  INT NOT NULL DEFAULT 5,
+  lease_token   BIGINT NOT NULL DEFAULT 0,   -- fencing token: MONOTONIC per unit; bumped on EVERY claim and steal
+  leased_by     TEXT,                        -- pod name: diagnostics only, never correctness
+  leased_until  TIMESTAMPTZ,
+  input_seq     BIGINT,                      -- newest thread_messages.seq enqueued for this unit
+  consumed_seq  BIGINT,                      -- newest seq a COMPLETED turn has answered
+  queued_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX  idx_run_queue_claim  ON run_queue (unit_kind, priority DESC, queued_at) WHERE state='queued';
+CREATE INDEX  idx_run_queue_expiry ON run_queue (leased_until) WHERE state='leased';
+CREATE UNIQUE INDEX idx_run_queue_dedup ON run_queue (unit_kind, dedup_key)
+  WHERE dedup_key IS NOT NULL AND state = 'queued';   -- 'queued' ONLY — see below
+```
 
-- **Queued input and steering into the DB.** Kill the in-memory input queue; a turn request is a row, the next turn drains rows. This is also the structural fix for the cloud-push-blocks-queued-input issue.
-- **Background tasks re-homed.** Turn-end cloud push, memory observer/assembler, aux-LLM tasks currently ride `asyncio.create_task()` in a process assumed to outlive the turn. They become queued work items (same queue, different work type) or run on the pod *after* the lease is released (pod busy, session free). Each needs an inventory pass.
-- **De-globalization — or defer it.** `persistent_app.py` is built around module singletons (`_agent`, `_session`). v1 sidesteps this entirely with **one active turn per pod at a time** (the Deployment scales for concurrency). In-process multiplexing of several turns (asyncio is fine with it; the LLM call dominates) comes later, only if pod count becomes a real bill.
-- **Session-scoped attachments.** Canvas awareness leases, IDE endpoints, browser streams assume a live session pod. Each needs a home: workspace pod, orchestrator, or a leased sidecar. Inventory required; likely the long tail of this project.
+**Rows are durable per unit** (never deleted while the thread/job lives) so `lease_token` stays monotonic — delete-and-reinsert would reset it to 0 and break fencing. The state machine is `queued → leased → {done | queued | parked}`.
 
-### Workers
+**The completion half** (v2's missing quarter; review-critical). An LLM turn is maximally non-idempotent, so the lifecycle needs all four statements, not three:
 
-- **Batch driver.** A superstep counter in the graph run loop; at budget or phase boundary, freeze(`batch_boundary`) with cheap teardown (skip workspace snapshot — the workspace pod persists; the checkpoint is already in PG) and clear the assignment so the queue re-offers it.
-- **Dispatcher simplification.** For the stateless class: drop agent matching, cooldowns, readiness; enqueue instead. The registered-agent path stays for VM-backed and legacy modes during migration.
-- **Long tool calls vs lease TTL.** A tmux command can run 10+ minutes; the lease heartbeat must ride the tool-wait loop.
+- **Complete** — one *fenced* transaction: final message persist + `consumed_seq = input_seq`-as-read-at-claim + `state = CASE WHEN input_seq > $consumed THEN 'queued' ELSE 'done' END` + `attempts_since_completion = 0`. Re-queue-on-completion is how mid-turn input gets its next turn.
+- **Skip-if-answered** — every claim compares `consumed_seq` to `input_seq` *before invoking the LLM*: a steal that lands between the final persist and completion must not re-answer an answered turn (the re-executor holds a *valid* new lease, so the fence alone cannot prevent this — the watermark does).
+- **Voluntary error release** — the pod releases with `state='queued'`, `attempts_since_completion+1`, backoff on `run_after` (today v2 had backoff only in the reaper).
+- **Input during a leased turn** — the input insert updates `input_seq` only (never touches `state`; flipping a leased row breaks the lease). Completion sees `input_seq > consumed_seq` and re-queues. This is the "enqueue" double-texting policy made precise.
 
-## Python now, or wait for Go?
+**Admission — who enqueues** (v2 never said). Every wake path ends in **one shared enqueue helper**, replacing `_trigger_dispatch` for the stateless class: session input POST (same transaction as the message insert); job creation *after* the kept workspace pre-flight — i.e. **the leader dispatcher remains load-bearing as the worker enqueuer** (VM/sandbox provisioning gates stay where they are); automation cron fires; delegation merge (`claim_delegation_resume`'s waiting→paused CAS becomes wake→enqueue); blocking-message reply wake; approval/review resolution; `resume_job_with_feedback`; the llm-outage backoff sweeper. Consistency rule: **a `worker_batch` row exists iff the job is runnable** (`created`-and-workspace-ready or rotation-paused); `waiting`/`waiting_for_reply`/`pending_review` have no row. Queued-row disposition on user pause/cancel/priority change: the same helper CASes the row (`state='done'` on cancel; `run_after`/`priority` update otherwise).
 
-**Python now.** The reasons stack:
+**Ordering and fairness.** Claim order `priority DESC, queued_at ASC` with `queued_at` reset on every release = round-robin within priority (today's `created_at ASC` would let the oldest job win every cycle and starve the newest — a v1 fairness claim that was false without this). `session_turn` claims add a per-`fair_key` dimension so one user's 20 parallel sessions can't starve another user's single turn. `bg_task` never preempts interactive claims (separate `unit_kind` poll, lower priority, or the worker deployment serves it).
 
-1. **There is no framework blocker.** This is LangGraph's native serverless shape: compile the graph once per process, invoke per request with `thread_id`, checkpointer loads/persists state per call — that is how LangGraph Platform itself serves graphs. The persistent loop needs it even less: its state layer is `thread_messages`, already ours. Nothing here waits on LangChain fixing anything.
-2. **Every hard part is language-agnostic.** Leases, queues, state externalization, idempotency, event journals — control-plane work that looks identical in Python and Go. And ~70–80% of the state layer already shipped (D3, message-granular persistence, journal SSE, freeze/resume).
-3. **Doing it in Python *defines the contract the Go rewrite would implement*.** Turn request shape, lease semantics, journal protocol, tool idempotency — once those are real and load-bearing, the Go rewrite shrinks from "re-architect the system" to "swap the turn executor behind the same queue," pursued when its actual justifications bite (per-pod density: 10–30 MB RSS and 50 workers/pod vs. our 300–500 MB and 1; cold start; scale-to-zero). go_rewrite.md itself says *not now* and lists the signals. Statelessness-first inverts the risk: the architecture migrates while the code stays familiar; the language migrates later behind a stable seam.
-4. **It is consistent with the worker-runtime decision** (2026-08-03: no new runtime, evolve by subtraction). The graph, phases, prompts, tools are untouched; what changes is *who drives the loop and for how long* — a driver and deployment change. If anything it continues the subtraction: it deletes the agent lifecycle control plane.
+**Dedup for collapsible tasks is `state='queued'` only.** v2's `('queued','leased')` scope silently *swallowed* signals: a cloud-push enqueued while its predecessor is mid-walk would dedup into a push that may already be past the changed files — the exact silent-staleness class the 08-06 fix closed. With queued-only dedup, one pending + one running may coexist; the per-mount sync-generation fence (§5.3.5, now mandatory) serializes them.
 
-The one honest caveat on Python: with one-turn-per-pod, capacity = replica count, and a Python replica is ~300–500 MB. That is the price of deferring de-globalization, and it's the first thing Go (or asyncio multiplexing) would improve. At current fleet sizes it is not the binding constraint; idle pinning is.
+**Poll-primary dispatch.** Idle pods run the claim every 250 ms–1 s (this **inverts `go_rewrite.md`'s LISTEN/NOTIFY sketch**: NOTIFY takes a global commit-serializing lock — recall.ai took three outages; it's lost to disconnected listeners; broken under PgBouncer transaction pooling). If a ping is ever added: payload-free, per-enqueue, post-commit, dedicated listener connection, never a correctness dependency.
 
-## Batch semantics
+### 5.2 Lease and fencing — two counters, four layers
 
-- **Sessions:** batch = one turn. The existing unit; nothing to invent.
-- **Workers:** batch = min(N supersteps, next phase boundary), N per expert config (e.g. 25–50). Phase boundaries already compact and archive, so they are free batch edges; the amnesia-loop reforms (fewer, bigger phases) point the same direction. In-flight tool calls finish before release (grace period). Preemption and drain fall out: a draining pod just doesn't claim the next batch.
-- **Priority:** interactive turns and worker batches should not share one deployment's queue blindly — separate deployments (or priority lanes) so a user's chat turn never waits behind a 50-step worker batch.
+The lease is **recorded state** (pgmq/SQS visibility-timeout model), never a held lock (advisory locks pin a backend per batch and break under transaction pooling; row locks held for minutes trip idle-in-transaction timeouts and pin vacuum xmin). SKIP LOCKED appears only inside the claim statement.
 
-## Phasing
+**Two counters, deliberately** (v2 tried to unify them and contradicted itself):
 
-- **S0** — this doc; align on acceptance criteria.
-- **S1 — lite/virtual sessions** (no workspace, no SSH: pure conversation + orchestrator tools). Biggest duty-cycle win, smallest blast radius, zero SSH complexity. Acceptance: create-to-first-token < 2 s; M sessions served per pod (M ≫ 1); pod deleted while idle → next turn transparently served by another pod; pod deleted mid-turn → clean client-visible retry, no wedge; queued input survives in DB.
-- **S2 — workspace sessions.** Adds per-turn SSH with affinity cache, DB-queued input/steering, background tasks as queued work, attachment inventory (canvas/IDE/browser).
-- **S3 — workers.** Batch driver + queue dispatch + lease; delete warm pool/heartbeat for the stateless class. Gate with the Job Bench harness: A/B batch-mode vs. baseline-02 on the pinned suite — overhead budget <5% tokens/wall, no completion regression.
-- Rollback at every stage: per-expert/per-mode flag; the pinned-pod path remains intact until the stateless class has soaked.
+- **`lease_token`** — bumped **unconditionally on every claim and every steal**. Not client-visible, so per-turn bumps are free. This is the Kleppmann fencing token every persist checks. Same-pod re-claims get a *new* token — which is what invalidates stragglers from the previous claim (post-release background work may therefore touch **only unfenced stores**: vector DB, audit store, object storage, workspace — never `thread_messages`/`thread_events`/checkpoints/job rows; anything fenced must complete before release).
+- **`threads.events_epoch`** — the **client-visible writer-generation**, bumped **only by the reaper's steal, by rewind, and by nothing else**. A clean handoff (release → claim by a different pod) does **not** bump: with seq DB-allocated and monotonic (§5.3.2), a clean cross-pod handoff is *invisible to the client* — which matters because cross-pod re-claims are routine exactly at the utilization this design is sold on; "bump on writer change" (v2) would have partially re-imported the per-turn cascade under load. The reaper is the only steal-bumper; the post-steal claim must not re-bump. `leased_by` stays diagnostics-only.
 
-## Open questions
+**Claim** (single statement; also CASes the `jobs` row for `worker_batch` in the same transaction — §5.4.4):
 
-1. **Lease TTL vs. long-running tools** — heartbeat from the tool-wait loop, or lease per superstep?
-2. **Streaming terminus** — journal-only (client reads SSE from DB as today) is simplest and already pod-agnostic; is direct pod→client streaming ever needed, or does P5/P6 finish the job?
-3. **Attachment homes** — canvas awareness, IDE proxy, browser streams: workspace pod vs. orchestrator vs. leased sidecar, per attachment.
-4. **Does the workspace pod become the new capacity limit?** Probably yes for workspace-backed sessions — which argues for pushing the lite tier as default and lazy-provisioning workspaces.
-5. **Provider prompt caching across pods** — content-keyed (Anthropic/OpenAI), so pod identity doesn't matter; only batch cadence vs. cache TTL does. Verify for the self-hosted endpoints (vLLM prefix cache is per-endpoint, shared by all pods anyway).
-6. **Where does `--mode`/expert specialization land** — one deployment per expert config (image identical, env differs) vs. one generic deployment resolving config per turn (cleaner; needs the config cache).
+```sql
+WITH c AS (
+  SELECT unit_id FROM run_queue
+  WHERE state='queued' AND unit_kind=$1 AND run_after<=now()
+  ORDER BY priority DESC, queued_at LIMIT 1
+  FOR UPDATE SKIP LOCKED)
+UPDATE run_queue r SET state='leased', lease_token=lease_token+1,
+  leased_by=$2, leased_until=now()+interval '60 seconds',
+  attempts_since_completion=attempts_since_completion+1
+FROM c WHERE r.unit_id=c.unit_id
+RETURNING r.unit_id, r.lease_token, r.input_seq, r.consumed_seq;
+```
+
+**Heartbeat** — an async task per claim, every 20 s (TTL/3), *independent of* the graph loop and tool calls (an astream hook would starve during a 10-minute tmux command — this settles v1's lease-TTL-vs-long-tools question). `UPDATE … WHERE unit_id=$1 AND lease_token=$2 AND state='leased' RETURNING leased_until` — zero rows = lease lost = abort, no further persists. The renewal `RETURNING` also carries job status + pending guidance (§5.4.3).
+
+**Reaper** — a leader-gated 15 s loop, but **per-row SKIP LOCKED form, not one bulk UPDATE**: v2's single UPDATE over all expired rows would block on any in-flight persist's `FOR SHARE` — one wedged persist transaction would stall *every* steal until its timeout. Instead: `SELECT unit_id … WHERE state='leased' AND leased_until < now()-interval '30 seconds' FOR UPDATE SKIP LOCKED`, then per-row: `lease_token+1`, `events_epoch+1` (sessions), `state = CASE WHEN attempts_since_completion>=max_attempts THEN 'parked' ELSE 'queued' END`, backoff-with-jitter on `run_after`, **plus a system-frame journal write** (`turn.interrupted` / `turn.parked` — §5.3.2's system-writer class) so the user never gets silent dead air. Leader election has a documented dual-leader window — the per-row CAS shape is what makes the reaper safe under it, not the election.
+
+**Attempt semantics** — reset **only on full completion**, never on partial persist. v2's "any successful persist resets attempt" built an infinite hot crash-loop for a unit that streams three tokens and then dies at the same tool call forever, burning LLM spend each cycle. Parking keys on `attempts_since_completion`, plus a per-unit wall-clock/cost budget as the second bound. Parked is not a silent state: it emits the terminal journal frame and appears on an operator surface (§7 replacement inventory) with an unpark verb.
+
+**Fencing at persist time.** Every persist *transaction* opens with `SELECT 1 FROM run_queue WHERE unit_id=$1 AND lease_token=$2 AND state='leased' FOR SHARE` — zero rows → abort; `FOR SHARE` blocks a concurrent steal until the persist commits. Two implementation truths v2 glossed:
+1. **The checkpoint lane needs a thin saver subclass**: §5.7's pool is `autocommit=True`, so the stock `AsyncPostgresSaver.aput` has *no transaction to fence* — wrap fence+put in an explicit `conn.transaction()` in a subclass (this corrects §8's "framework: zero work" to "one saver subclass", and the subclass is also where the retry wrapper lives).
+2. **A turn's durable footprint spans multiple fenced transactions** (checkpoint put; message inserts; completion). Each is individually fenced, but a steal *between* them leaves a torn turn. The accepted invariant, per lane: **workers rebuild from the checkpoint alone; sessions rebuild from `thread_messages` + the consumed watermark alone** — a checkpoint-ahead-of-messages tear is converged by the next claim's rebuild, and the skip-if-answered watermark (§5.1) prevents the double-answer. This invariant must be stated in code comments and tested (§9).
+
+**Fencing boundary — two honest limits.** (a) The token protects Postgres only; a zombie's in-flight SSH/tmux side effect is out of DB reach (residual window ≈ grace + one tool call) — that's what v2 idempotency (tool-call UUIDs + workspace-side executed-calls dedup; Restate's `ctx.run` relocated) closes. **For S1's lite tier this is sharper than v2 admitted**: virtual-backend writes are read-modify-write against the object store with *no atomicity* and no workspace pod to host dedup — a zombie's in-flight edit during the grace window can interleave with the successor's writes on the same prefix. S1 must either fence object PUTs (re-check the lease token immediately before each PUT, or a per-prefix generation stamp in object metadata) or document and accept the bounded corruption window — and test the steal-with-writes case. (b) **Fencing is a correctness boundary among cooperating honest pods, not a security boundary** — §5.6.
+
+### 5.3 Sessions
+
+#### 5.3.1 Turn flow
+
+`POST /threads/{id}/input` persists the message (already shipped), updates `input_seq`, and enqueues — all one transaction. The claim returns the input/consumed watermarks; the executor answers everything `> consumed_seq`. Completion follows §5.1. `/input` response parity is kept: `queue_depth` is recomputed from unconsumed rows (`input_seq`-vs-`consumed_seq`), no longer from the in-process asyncio queue.
+
+#### 5.3.2 Epoch, seq, and the system-writer class
+
+The v2 finding stands and got sharper: `events_epoch` bumps **unconditionally on every runtime attach** today, and per-turn attach would fire the client cascade — ~2.0–2.2 s dead-epoch polling, then `gone_beyond_horizon` → **IndexedDB thread-cache wipe → full transcript refetch** → SSE reopen — *every turn*. Required, before any stateless session serves traffic (and **before P5**, whose idle-close otherwise converts the delay into an at-open full reload per turn — record the dependency in the session-reliability doc):
+
+1. **Epoch bumps only on reaper steal and rewind** (§5.2). Clean cross-pod handoffs don't bump *and stay client-invisible* because:
+2. **Seq allocation moves DB-side** — monotonic *across* claims within an epoch. The in-process `_next_seq` global (reset per attach) is what forces epoch-per-attach today. **Implemented (S1) as DB-*seeded*, not per-event-allocated**: attach seeds from `GREATEST(threads.events_seq_hwm, MAX(seq))` — `events_seq_hwm` (migration 0116) is maintained in the writer's flush statement and survives retention pruning of the rows themselves (a bare MAX(seq) seed would drop below cached client cursors after the pruner runs); gap-free, zero per-event cost, sync stamping preserved. Block allocation on the threads row (the alternative above) was not needed at S1 concurrency.
+3. **The journal writer is fenced**: the batch INSERT carries `WHERE threads.events_epoch = $claimed AND run_queue.lease_token = $token` (CTE); zero rows = lost lease, terminal-fail loudly. Today a stale writer inserts into a dead epoch forever.
+4. **A system-writer class exists for non-stream kinds.** The fence rule cannot mean "only the lease holder may ever write the journal": the reaper (`turn.interrupted`, `turn.parked`), outbox workers (`title.updated` — a journal frame today), and P6's orchestrator-journaled control acks all write client-visible frames without holding a turn lease. Designated non-stream kinds may be appended by the orchestrator/outbox under the *current* epoch (epoch-read-and-stamp in the same transaction); token/stream kinds stay lease-fenced.
+5. **Rewind = a fenced lease steal**, specified: one advisory-locked transaction bumps `events_epoch`, resets the run_queue lease (`state='queued'`, token+1), and initializes the seq allocator *above* the `rewind.done` row it writes — the shipped rewind assumes a detached thread and writes `(new_epoch, seq=1)`; without allocator init, the next writer's `seq=1` collides with the UNIQUE index and presents as a phantom lost-lease. A mid-turn rewind must not wait ~90 s for the reaper.
+
+#### 5.3.3 Per-turn load — decompose attach, don't speed it up
+
+Attach-as-built is seconds-class on both edges (MCP `connect_all`, repo clone probes, blocking recursive cloud `pull_all`, workspace-ready polling, officer boot-wake; detach: aux-LLM memory capture, cloud push+pull, git push). Classification:
+
+| Class | Items | When |
+|---|---|---|
+| Per-turn core (~0.3–1 s cold S2; ~50–200 ms lite; **+ provider TTFT on top — it dominates**) | lease claim (1 rt) · config blob hydrate (ms; blob rides the claim like `JobStartRequest`) · LLM/tools/prompt build (~20–100 ms) · message tail (2 rt, ≤1000 rows; token-recount can be 100s of ms on big tails) · SSH `_ensure_connected` (~0.1–0.5 s cold) · journal writer start | every claim |
+| Claim-scoped, affinity-cacheable | MCP connections · datasource clients · resolved config keyed `(thread_id, config_version)` · built graph/tools · SSH transport + tmux | first claim per pod |
+| Edge-triggered | repo clone (needs an idempotent exists-probe) · cloud pull (turn-boundary contract §5.3.5) · workspace-ready (carried in the claim) | workspace lifecycle |
+| Re-homed (§5.3.5) | memory capture · citation verification · cloud push · **llm_requests audit archive** · NATS mirror · title gen | outbox / at release |
+| Deleted | watchdogs · drain choreography · heartbeat · status polling · **officer boot-wake entirely** (its reason — a lazily-started in-process loop that would otherwise park forever — doesn't exist when sleep = no-lease + durable timer; keying it on generation change, as v2 said, would still over-wake officers on every cross-pod re-claim) | — |
+
+**Hidden repeat-cost fixed before S1** (verified): Path-A restore runs `ensure_within_limits(trigger="resume")` — which can invoke a blocking aux-LLM summarization — and **never persists the resulting summary** (only Path B writes a checkpoint row). Under per-turn reload an over-budget tail would re-summarize on *every claim*, seconds + aux tokens each. Fix: persist the resume compaction as a `role='summary'` boundary row exactly as Path B does.
+
+#### 5.3.4 Soft affinity
+
+`last_pod` hint per thread; route there first, any pod on miss. Buys: SSH transport + tmux continuity, resident tail, built objects, hydrated config — ≈0.3–1 s/turn. Correctness never depends on it; provider caches don't need it (§5.6). Gate resumes (§5.3.6) should prefer it *strongly*.
+
+**S1 implementation reality (2026-08-08):** affinity matters far more than the estimate above — on a `session_base` lite thread the full re-attach is ~100 s, not 0.3–1 s, and the v1 warm-session cache **never hits**: the attach fingerprint covers the whole claim bundle, which carries volatile fields (per-attach-minted lite object-store credentials at minimum), and the 0.5 s claim-poll race often hands the turn to the cold pod anyway. Fixes (top S1 follow-up): fingerprint over a stable config subset (the live session holds working clients; credential rotation rides the next cold attach), a short DB-side claim bias toward `last_pod`, then drain-in-lease (completion returns `queued` → answer the next message under the same lease, capped by a fairness budget — the worker batch budget applied to sessions). When idle: release the lease, keep only the warm cache — holding a lease while a user types would reinvent pinning.
+
+#### 5.3.5 Background work, outbox, and the two resident daemons
+
+- **Drain hooks exist**: `MemoryManager.drain_background(timeout)`, `CitationEngine.await_pending_verifications(timeout)` — run before the pod rejoins the pool; post-release work may touch only unfenced stores (§5.2).
+- **Transactional outbox**: follow-up work enqueued in the same transaction as the turn's final persist (turn committed ⟺ follow-up enqueued). Collapsible dedup is queued-only (§5.1).
+- **Cloud-push ordering fence is mandatory** (not "either/or"): a per-mount sync-generation counter the next claim's pull must observe; with queued-only dedup, one running + one pending push serialize through it. Without it S2 reintroduces the concurrent-walk corruption class.
+- **Two daemons cannot be queued work** — they keep *workspace-side* mounts alive: the rclone bearer-token refresh loop (pushes fresh Keycloak tokens over SSH on a TTL schedule) and the protected-overlay ENOTCONN heal loop. They need a resident home: workspace-side refresher, orchestrator cron, or refresh-on-claim + accepted idle rot. S2's hardest inventory item.
+
+#### 5.3.6 Session semantics that must survive the model change
+
+- **Mid-turn settings**: today `mode.set` applies to the *next tool call inside the running turn* (the gate re-reads it per call) and sweeps pending approval cards. "Write override, next turn resolves fresh" (v2) silently regressed the exact moment users reach for the control. Fix: persist mode/narration to the thread row (they're memory-only today — a live revert-on-resume bug) *and* the executor re-reads them at each gate decision (one indexed read per tool call, or piggybacked on the 20 s renewal). Any residual latency (≤ renewal interval) is named and accepted.
+- **Permission gates**: rows already DB+NOTIFY. Decision (was OQ): **release the lease at the gate** — N pending approvals must not pin N pods. The spec that makes it acceptable: approval enqueues the continuation; gate resumes prefer `last_pod` strongly (avoid the cascade — though with §5.3.2 a clean cross-pod resume no longer bumps the epoch anyway); the approval card's row id stays stable across release/resume (no duplicate cards; approved card shows a resuming state); p95 approval-to-visible-resume < 3 s is an S2 acceptance criterion. Lease expiry runs the permission-row retire path (no sweeper exists today — pod death mid-gate strands live cards).
+- **Steal UX contract** (was undefined): the reaper writes `turn.interrupted` so the client renders a state instead of ≤ ~105 s of dead air indistinguishable from a long tool call; the partially-streamed answer **visibly vanishes and regenerates** (dead-epoch deltas are never replayed) — named as accepted behavior; and because sessions gain an *automatic re-run* lane they never had (today a crashed turn just dies and the user resends), S1 constrains retry for side-effectful tools: re-run at most up to the first tool call unless the call is covered by dedup (MCP writes like `create_job` are the sharp case).
+- **Media fidelity**: `_serialize_message_row` flattens list content (images dropped) and restore excludes `thinking`. Per-turn reload makes this the steady state, and **byte-stable re-rendering (§5.6) is impossible for affected turns until fixed**. Either structured-content storage lands with S1, or the degraded option ships *with a visible UI notice* on media past their turn — silent degradation is not an option.
+- **Presence**: `_subscribers` is a load-bearing oracle (permission expiry, `awaiting_user` flip) — re-home to an orchestrator-side attached-clients signal.
+- **Hard interrupt**: route to `leased_by` or NOTIFY into the executor; graceful interrupt = polled DB flag.
+- **Metrics**: the heartbeat's aux-health/RSS payload moves to the lease heartbeat / release report, or admin badges go dark.
+- Small state promotions (all verified memory-only today): SessionTaskManager todos → DB/workspace; memory-extraction interval cursor → persisted (else extraction fires *every* turn); file-undo RAM snapshots → the existing git turn→sha ledger; read-before-write stamps → thread metadata or per-turn re-arm (OQ §10.4).
+
+#### 5.3.7 Capacity UX
+
+A pooled session can wait. The design owes users and operators: a queued-turn client state ("queued, position N" — cheap: accept-time 200 + the turn-request row + a journal frame), per-user fairness (`fair_key`, §5.1), `bg_task` never delaying interactive claims, and a loaded-bench acceptance criterion: **p95 claim-to-first-token under 2× pod-count concurrent turns** (§9/S1). HPA floor per the Erlang sizing in §2.
+
+### 5.4 Workers
+
+#### 5.4.1 The batch edge is an in-graph freeze (Lane A)
+
+Two resume lanes exist with different fidelity — an END-lane (in-graph freeze → `restore_todo_state` rehydrates todos) and a mid-loop lane (app-layer astream break → TodoManager **empty** on the successor, `check_todos` force-ends tactical phases — today's pause bug). The batch driver is a **`batch_boundary` freeze cloned from the `version_upgrade` drain check** at `handle_transition`, keyed on wall-clock/superstep budget in checkpointed state. Mid-phase caps must fire only when transient carriers are empty (`_replan_request` is consumed one superstep after it's set). Companion fix: hydrate TodoManager from checkpoint on *any* resume.
+
+Wiring: four keep-in-sync freeze-type lists — and v3 upgrades this from "bounded edit" to **consolidation requirement**: one shared constants module under `src/shared/` (the `orch_surface` move is the precedent) consumed by agent + `completion.py`, parameterizing the `recover_orphaned_jobs` SQL literals. Reason: the lists span two images that roll separately, and the skew is not benign — **`determine_job_status` maps an unknown freeze type on a *loop* job to `('completed', None)`** ("so the loop advances"; verified) — an agent-first rollout or an orchestrator rollback mid-soak turns every batch boundary on a loop job into a phantom-COMPLETED job whose partial work the RSI loop merges. Hard constraints: **orchestrator (all replicas) understands `batch_boundary` before any agent emits it; disabling batch mode precedes any orchestrator rollback during the soak.** Non-loop jobs skew-fail soft (mass `pending_review`).
+
+#### 5.4.2 Cheap teardown
+
+Skip at batch boundary (verified skippable): `job_frozen.json`, git commit/push (ProgressCommitter owns its clock), todo archive, evidence push. **Conditional: the tmux kill** — `ShellManager.cleanup()` kills the workspace tmux on every job end including pause, so "shell survives in tmux" is false for workers today; deterministic session names make skip-the-kill = free cross-batch continuity. Keep: bounded memory drain, checkpointer/datasource close. Any surviving app-layer break must `await gen.aclose()` (checkpoint flush rides generator close).
+
+#### 5.4.3 Steering, status sub-state, cost
+
+- **Steering consumption must be checkpoint-coupled.** The DB-direct pull exists, but its dedup is the in-process `_delivered_reply_keys` set with a fire-and-forget ack — batch rotation re-opens both windows (re-delivery on the successor; loss when an ack outruns an un-checkpointed injection under `durability="async"`) at *every* boundary instead of once per crash. Fix: ack rows carry the checkpoint id/superstep watermark that absorbed them; consumed only when that checkpoint is durable; dedup set rebuilt from checkpointed state each claim.
+- **`paused` gets a machine sub-state.** Rotation flips status every few minutes; `paused` is a human-actionable state today (resume-with-feedback, config edit gate on it) and the cockpit would flap. Add `paused_reason='batch_rotation'` (surfaced as "running" in user-facing views); human paused-actions CAS on the reason so a user pause and a rotation release are distinguishable.
+- **Cost honesty**: per-claim setup is ~0.5–1.5 s *without* MCP; MCP `connect_all` is seconds-class, and the release→enqueue→claim→`/job/resume` handoff (credential re-injection ≈8–12 rt) adds ~1–5 s of dead time — at the fast end (25 supersteps ≈ 8–10 LLM calls ≈ 45–120 s wall) overhead recomputes to **3–15%, not <2%**. Therefore: **the batch budget is wall-clock-first** (e.g. ≥5 min/batch ⇒ overhead <2% by construction; also the lease-exposure and credential-revocation bound), superstep cap secondary; the Job Bench measures per-claim setup split by MCP-attached vs not, and the handoff, before N is fixed. Batch cadence vs Anthropic 5-min cache TTL: immediate re-queue keeps it warm; queue waits >5 min re-pay full input (consider `ttl:"1h"` at 2× write for long-wait experts).
+- Fairness rotation key + cooldown waiver for batch continuations (§5.1); workspace paused-reap grace (~30 min) must exceed queue wait or `batch_boundary` gets a reap carve-out; retire the pod-local snapshot crash lane (PG checkpoint is strictly better; D3 only works because sweeps flip to `paused` first).
+
+#### 5.4.4 Coexistence ruling — one claim authority per job
+
+v2 stood up `run_queue` next to the shipped jobs-row lease and never said which wins; unpartitioned, the legacy sweeps *will* double-execute (verified chain: stateless pod holds a healthy `run_queue` lease → `recover_expired_lease_jobs` sees the un-renewed `jobs.lease_expires_at` expire → flips the job `paused`+unassigned → the leader dispatcher hands it to a pinned agent → two executors on one `thread_id`). Ruling:
+
+1. **Partition on a job-class column** — but NOT `jobs.runner_kind`: implementation found it exists with *grant* semantics (`user|lifecycle|service`, owner-capability classes) and overloading it would tangle dispatch grants with runtime class. S1 shipped `threads.execution_lane` (`pinned|stateless`, migration 0115) as the session-side partition; S3 adds the jobs-side analog (e.g. `jobs.execution_lane`). `get_dispatchable_jobs`, `claim_job_for_agent`, `recover_expired_lease_jobs`, and `recover_orphaned_jobs` all exclude the stateless class; the run_queue reaper is its sole rescue authority.
+2. **The stateless claim transaction CASes the `jobs` row** (status/assignment marker) atomically with the `run_queue` claim, so job-status readers stay coherent.
+3. **The stage-4 completion CAS keys on `run_queue.lease_token`**, not `assigned_agent_id` — closing the fenced-out-`/complete`-still-wins hole for the stateless class.
+4. The registered-agent plane keeps serving compose/bare-metal, officers, and the rollback path until each lane retires (§7 delete-when).
+
+### 5.5 Streaming — terminus closed; budgets honest
+
+**Journal-only is the terminus** (shipped path + industry contract; statelessness deletes the legacy direct-WS's reason to exist). Three v3 corrections:
+
+- **Write regime, honestly**: the ordered writer drains-what's-queued, and with INSERT RTT (1–5 ms) ≪ inter-token gap (20–50 ms) it degenerates to ~1-row batches — **steady-state commit rate ≈ token rate (~1.5–4 k commits/s at 50–100 active streams)**, not v2's "≤25 INSERTs/s". Fix as an S1 tuning item: a 25–50 ms coalescing tick on the flush, converting it back to real batches for one tick of added latency. The DBOS 60 k/s figure was a dedicated box; ours shares the app PG.
+- **An aggregate DB budget table is required** (Appendix): journal commits + SSE polls (100 streams pinned at 200 ms = 500 qps) + fence lookups (~10–25/turn sessions; ~75/batch workers) + queue polls (pods × 1–4/s) + heartbeats (pods × 3/min) — all on the instance serving ~180 REST endpoints. Cheap individually; the *sum* needs a measured capacity number before S1 exits.
+- **The cross-replica wake was broken as sketched**: "the orchestrator receives the POST and wakes its own pollers" is an in-process signal, and dev runs 2 replicas — the POST and the SSE stream can land on different replicas, leaving the 1 s idle-backoff in the TTFT path. Use **P5's `thread.activity` DB trigger → `pg_notify`** (already designed, inherently replica-safe and stateless-compatible) to pin pollers to the 200 ms tier on turn start — or accept the 200 ms floor as the only guarantee.
+
+**Workers have no journal** — `thread_events` is sessions-only. S3 decision (§10.2): extend the same epoch/seq/cursor contract to job runs, or accept poll-based job UX. Escape hatch unchanged: stay Postgres-only until trigger metrics fire (~10 k rows/s sustained, or poll fan-out load), then NATS JetStream (in-stack) over Redis.
+
+### 5.6 Config, credentials, security — the threat model v2 lacked
+
+**Any-pod-any-thread is a tenancy inversion and must be treated as one.**
+
+- **The pod cannot re-run the resolution pipeline** (v2's category error): credential resolution is orchestrator-side and Vault/DB-backed; `jobs.resolved_config` is stored *redacted*; the agent process has no DB credential hooks. And the only pod↔orchestrator auth is a single shared internal key — "is-an-agent" proof, never "entitled-to-this-tenant" proof. Under naive pull-claim, one compromised pod serially harvests every tenant's credentials. **Design: pods pull *work*; the orchestrator delivers resolved credentials only against proof of the current lease** — `GET /internal/units/{unit_id}/claim-bundle` authenticated by `(unit_id, lease_token)` server-checked against `run_queue`, or a short-lived per-claim token minted at claim. Credential delivery stays orchestrator-mediated exactly as today; only the direction of the first hop changes.
+- **Scrub-on-claim is a v1 requirement, not an S4 nicety.** One-turn-per-pod removes the *concurrency* hazard, not the *sequential residue* hazard: a warm pod serves many tenants in sequence, and the memory-embedding path writes `EMBEDDING_API_KEY` into process-global `os.environ` and **never pops it** (verified; the KB path was deliberately hardened pop-first for pod reuse — the memory path was not): a following tenant whose config omits `env_keys` skips the block and inherits the prior tenant's key + un-reset singleton. Requirement: at every claim, pop all embedding/KB env keys, null both singletons unconditionally, clear guidance inboxes and ToolContext caches. Acceptance: after serving tenant A then claiming for tenant B, no A-secret is reachable in env, singletons, or clients.
+- **Fencing ≠ isolation.** The fence is a voluntary check honest pods run; a compromised pod skips it, and most stores (jobs.context, thread metadata, vector, audit) are unfenced regardless — reads are never gated at all. Real isolation remains the DB role + NetworkPolicy story, which statelessness *widens* routinely (every idle pod scans `run_queue` across all tenants; `dedup_key` enumerates thread ids). Give stateless pods a least-privilege DB role for claim/persist paths, and keep the compromised-pod blast radius in the multi-tenancy doc's terms.
+- **Revocation**: effective at the next claim (the claim-bundle re-runs grant PEP + datasource re-authorization — an improvement over job-lifetime validity), **not mid-batch** — materialized secrets live until release; the wall-clock batch cap is also the revocation bound. Say both halves.
+- **Session JWTs** are deleted only when P6 retires the direct WS (they're the one place a client authenticates to a *specific pod* — the end state is clients authenticate only to the orchestrator; state it, gate it).
+- **Prompt caching** (unchanged from v2, scoped honestly): pod identity affects no provider; set `prompt_cache_key = thread_id/job_id` on the OpenAI path; multi-replica self-hosted endpoints need gateway-side cache-aware routing (orthogonal). **Byte-determinism is a worker-lane + fast-follow-up requirement** — for sessions the marginal loss is bounded by the 5-min TTL against human inter-turn gaps and by compaction rewrites (which zero the cache today too); the system prompt's date is already day-granularity *for exactly this reason*. Message fidelity (§5.3.6) is a hard prerequisite of determinism (lossy restore can never re-render byte-identically). Acceptance re-specified: cache_read > 0 on the second LLM call *within* a turn/batch, and on a <5-min same-thread follow-up served by a *different* pod.
+
+### 5.7 LangGraph mechanics (worker lane)
+
+Batch break: in-graph freeze primary; astream yield counting + explicit `aclose()` for any consumer-side break; default `durability="async"` (crash window ≈ 1 superstep); `pending_writes` bounds sibling re-runs; `recursion_limit` stays a backstop; `interrupt_before` considered and rejected (the freeze contract already carries status authority/redispatch/error-immunity). Connection layer: one process-wide psycopg `AsyncConnectionPool` (`autocommit=True, prepare_threshold=0`) + the **fence-and-retry saver subclass** (§5.2 — this is where both wrap); never `pipeline=True`. Dependency hygiene: pin `langgraph-checkpoint-postgres` 3.x exactly (repo pins `>=1.0.0`; **CVE-2025-64439** RCE in pre-3.0 deserialization) + `LANGGRAPH_STRICT_MSGPACK=true`; treat checkpoint-library bumps like DB migrations (documented cross-version resume breakage; long-paused jobs are our risk shape). Growth: delete-on-terminal + keep-last-3 exist; `ShallowPostgresSaver` is the worker-lane blobs option. Keep `thread_id=job_id` canonical; state msgpack-safe and artifact-free. Compile-once via the Runtime context API is S4 (compiled graphs are officially thread-safe; compile-per-job is our code's shape, not the framework's).
+
+### 5.8 Deployment shape and autoscaling — closed, with the chart reality attached
+
+One generic image; two Deployments (interactive: warm floor ≥ 2 sized per §2's Erlang formula; worker: KEDA `postgresql` scaler on runnable-unit count, `minReplicaCount: 0`, `cooldownPeriod` 300 s). What v2 waved away:
+
+- **The chart has no agent Deployment today** — it was deliberately removed ("`agent.replicas` is no longer honored"); the agent Service/PDB select provisioner pods by shared labels. The new Deployments need **distinct class labels** so the kept `reap_pods` categories and PDB counts don't entangle both classes during coexistence.
+- **KEDA is a new cluster-level dependency** — named as such: Fleet/homelab install, k3d bootstrap step, `TriggerAuthentication` + DB connection secret via Vault/ESO.
+- **Capability dimension on claims**: VM-workspace jobs need the Tailscale-mesh sidecar (the "VM lane is workspace-only" correction stands, but *reaching* a VM workspace is agent-pod mesh infrastructure — and mesh membership per ephemeral scale-to-zero pod churns headscale). Units carry required capabilities (`vm-mesh`); either a third Deployment variant serves them or the worker Deployment ships the sidecar with the tunnel-dark health signal kept for that class.
+- **Tilt**: the agent inner loop currently rebuilds an image for the *next provisioned pod*; with static Deployments it becomes a plain `live_update` target — an inner-loop *improvement* worth claiming, but it must be wired.
+- Drain = preStop stops claiming, finishes the batch/turn, releases.
+
+## 6. Prerequisites (corrected)
+
+1. **Lite sessions have PVC-backed agent-local state — S1's problem, not S2's.** Verified: the provisioner PVC-backs `/workspace` for *all* sessions, and the manifest comment says outright that for lite sessions the agent-local copy "is the only copy… for lite sessions it is the fix." v2's "S1 scopes to lite (no PVC exists)" was false. S1 work item: inventory what lite sessions write under agent-local `/workspace` (uploads staging, memory/KB artifacts, canvas-adjacent files), externalize each to object store/DB or declare it disposable per item — only then does S1 avoid the PVC.
+2. **tmux reattach-if-exists** (backend `_init_shell` kill-recreates; `disconnect()` kills) + tab-state rehydration from `list-windows`, or shell state declared batch-scoped.
+3. **Message fidelity** (§5.3.6) — also a prerequisite of the byte-determinism requirement.
+4. **Epoch/seq/fence redesign** (§5.3.2) before any stateless session traffic and **before P5** (dependency recorded in the session-reliability doc; if P5 lands first, the epoch change must still precede stateless traffic with `/events/head` kept stable).
+5. **Path-A resume-compaction persistence** (§5.3.3) — else per-claim aux-LLM re-summarization.
+6. **Freeze-type registry consolidation** into `src/shared/` (§5.4.1) — else version-skew phantom-completes loop jobs.
+7. **Control-verb transport for S1 sessions**: `mode.set`, `narration.set`, `compact`, `archive`, `undo`, `rewind`, `config.update`, `upgrade-to-workspace` are **control-WS-only today** (verified) and a stateless thread has no pod to socket to. S1 ships the P6 §6a subset as orchestrator REST + journaled acks — this is S1 scope, not P6's someday.
+
+## 7. Deletion ledger — now with delete-when
+
+Format: component → replaced-by → **delete-when**.
+
+- Registration endpoint + `agents` table + duplicate-bind 409 → nothing / lease rows → **after the last lane retires** (bare-metal decision, §10.9 — table-level artifacts cannot be deleted "per class").
+- Heartbeat slot-liveness half → lease renewal → per-class at flag-flip; **keep** the payload channels re-homed (job-status backstop + steering via renewal `RETURNING`; graph-progress stall detector onto the job row; aux-health metrics via release report).
+- `get_available_agents` matching + cooldown + SHA filter + provision-and-wait → queue claim → S3 flag-flip (class-partitioned from day one).
+- `stale_agent_detector` sweeps (except lease-expiry + graph-progress) → run_queue reaper → per-lane retirement.
+- Warm pool / `reap_pods` / `scale_down_idle` / reservation eviction (incl. the warm-pool-vs-scale-down oscillation guard) → Deployment/HPA → per-lane retirement; **reap_pods' label selectors must exclude the new class immediately** (§5.8).
+- Drain-intent choreography → preStop + don't-claim → per-lane.
+- Per-session Service/Ingress + `pod_uid` ownerRefs + 60 s session JWTs → journal SSE + orchestrator REST → **gated on P6 completion** (verify no other JWT consumer).
+- Session pool attach/detach + `_max_sessions_per_process` valve; fresh-vs-resume dispatch lane split; live-settings mutation ladder (with §5.3.6's mid-turn re-read preserved); agent-driven VM/workspace upgrade handlers (→ orchestrator) → S1/S2.
+- **New replacement inventory v2 missed** (each needs a successor before its lane cuts over):
+  - **Metering**: compute attribution resolves pod→agent-row→job; stateless pods become permanently "shared platform capacity." Successor: **lease-interval attribution** — `run_queue` leases are exact (unit, pod, span) records, strictly better; the interval reconciler needs an ingestion path + cutover flag before paying traffic.
+  - **Job-log archive**: sole trigger is orchestrator pod-deletion, attribution via the agents table; Deployment pods are deleted by the ReplicaSet and serve many units. Successor: per-claim log capture at lease release (or preStop upload) stamped from lease history. Acceptance: logs retrievable across N batches / M pods.
+  - **Admin/fleet surface**: cockpit agents view + MCP `list_agents`/`get_agent_stats`/`get_agent_system_info`/`deregister_agent`/`assign_job` → a **leases/queue read model** (active leases: unit, pod, age, renewal health, parked units + unpark verb); `assign_job` deprecated or redefined as a priority/affinity hint.
+- **Keep untouched**: the dispatcher's workspace pre-filter (VM/sandbox state machines — and the leader dispatcher stays load-bearing as the worker *enqueuer*, §5.1); workspace suspension/attention-sleep minus the delete-agent-pod step; freeze-blob shedding; officer fleet notifications (re-sourced from lease-expiry events).
+- **Keep registered-agent plane during migration for**: compose/bare-metal, officer dedicated pods (migrate last; a wake-driven officer is the best stateless fit *later*), rollback.
+
+## 8. Python now — and what the Go rewrite becomes
+
+1. **Framework: one saver subclass, otherwise zero** (fence+retry wrapper — corrected from v2's "zero"). Compiled graphs are officially concurrency-safe; checkpointer-per-invoke is the vendor pattern; the vendor's own platform is this architecture.
+2. **The hard parts are language-agnostic** — lease, fence, epoch, outbox, completion protocol — and most substrate is live (§4).
+3. **De-globalization sized**: model clients = one shared `httpx.AsyncClient` change; app layer = ~15 module globals → SessionRuntime + ContextVar. v1 ships one-turn-per-pod and takes only the **scrub-on-claim** subset (§5.6 — that part is *not* deferrable); full multiplexing is S4.
+4. **Statelessness first defines the contract the Go executor implements** — shrinking the rewrite to "swap the executor behind the same queue." `go_rewrite.md` corrections stand: poll-primary dispatch; recorded lease + persist-time fencing with token-bump-at-steal.
+
+## 9. Phasing
+
+The migration's steady state is **dual control planes** for the whole soak — an operational cost owned here, not a footnote: every dispatch/sweep/provisioning predicate becomes class-aware at S1/S3 flag-flip, and stays so until lane retirements.
+
+- **S0 — this doc.** Align on design + acceptance.
+- **S1 — lite/virtual sessions.** Build: run_queue + claim/heartbeat/reaper/completion protocol + fence (incl. object-store PUT fencing or the documented corruption window); epoch/seq/system-writer redesign; turn-request rows + watermarks; **cockpit workstream** (`/connection`+`/prepare` compat answering ready immediately for stateless threads, composer ungating, provisioning-card bypass) + **control-verb REST subset** (§6.7); persistence promotions (mode/narration, task manager, interval cursor, Path-A summary persist; media-fidelity decision *with UI notice if degraded*); scrub-on-claim; permission-row retire on lease expiry; queued-turn UX + `fair_key`; lite agent-local-state inventory (§6.1); journal-writer coalescing tick; metering lease-interval ingestion (shadow). Acceptance: create-to-*accepted* < 1 s; TTFT p50 < 2 s / p95 < 4 s **including provider TTFT**, and p95 claim-wait bounded at 2× pod-count concurrency; cache_read > 0 on second same-turn call and on a <5-min cross-pod follow-up; pod deleted mid-turn → takeover ≤ ~105 s, `turn.interrupted` rendered, no duplicate answer (watermark), no interleaved histories (fence assert); **zombie's late persist rejected at the fence**; poison unit parks within max_attempts with a user-visible terminal frame + operator unpark; queued input drains FIFO across a steal; zero in-process claim state; epoch bumps ≤1 per steal and 0 per clean handoff; after tenant A → tenant B on one pod, no A-residue (env/singletons/clients).
+- **S2 — workspace sessions.** SSH affinity + tmux reattach; PVC externalization completes; cloud-push sync-generation fence; outbox re-homing (incl. llm_requests archive); resident daemons re-homed; hard-interrupt routing; presence re-home; gate-release flow. Acceptance: push(N)→pull(N+1) ordering holds across a forced pod handoff; tmux state survives handoff; mid-idle rclone token expiry heals on next claim; p95 approval-to-visible-resume < 3 s; canvas presence has no inter-turn flicker (or the flicker is named and accepted).
+- **S3 — workers.** `batch_boundary` + consolidated freeze registry + TodoManager hydration + conditional tmux kill; pull-claim + claim-token renewal + stage-4 CAS keyed on lease_token; **coexistence partition on `runner_kind` everywhere** (§5.4.4); checkpoint-coupled steering acks; `paused_reason` sub-state; wall-clock batch budget; fairness + cooldown waiver; snapshot-lane retirement; job-journal decision executed (§10.2); job-log per-claim capture; deploy-order constraint enforced (orchestrator first; batch-off before rollback). Gate: Job Bench A/B vs pinned baseline — completion parity, tokens/wall within noise, measured overhead (target < 2% at wall-clock-sized batches; measure MCP-attached separately), KV-cache hit rate, **fault injection**: kill -9 mid-batch, steal during a tool call, fenced-out `/complete` rejected, phantom-complete skew test on a loop job.
+- **S4 — optional, bill-driven**: in-process multiplexing; compile-once; workspace pause tier (§10.7); JetStream hatch.
+- **Rollback**: per-class flag at every stage; pinned plane intact until lane retirement decisions (§10.9).
+
+## 10. Open questions
+
+1. **Interrupt-grade steering** — is `enqueue` enough, or do sessions/officers eventually need the Platform's `interrupt` policy (with partial-tool-call cleanup)?
+2. **Job journal** — extend `thread_events`' contract to job runs in S3, or accept poll-based job UX and defer?
+3. ~~Permission-gate parking~~ — **decided release-at-gate**, spec in §5.3.6; remaining question is only the approval-to-resume latency target's final number.
+4. **Read-before-write gates** — persist stamps vs per-turn re-arm (token tax vs behavior change)?
+5. **Media-fidelity scope** — structured-content storage in S1, or degraded-with-UI-notice first?
+6. **Interactive saturation policy** — beyond the queued-turn UX: do interactive claims ever preempt `bg_task` leases, and does the worker deployment lend capacity to session bursts?
+7. **Workspace pause tier** — run→paused→reaped with ~1 s resume (industry benchmark) vs scale-to-zero + PVC; the capacity limit migrates there (Cognition's lesson).
+8. **Canvas presence** — orchestrator-side with the SSE consumers, or a small shared presence service, once P6 retires the per-session WS?
+9. **Bare-metal/Compose**: remains supported? If yes — either it runs the stateless executor as plain polling processes (registration still dies) or registration is permanent and the §7 table-deletes never fully land. Decision needed for the ledger's delete-when column.
+
+## Appendix — key numbers (v3-corrected)
+
+| Item | Value | Basis |
+|---|---|---|
+| resolved_config blob | ~127 kB | measured (OOM postmortem) |
+| Session re-resolve | ~8–12 DB rt + tens of ms | main.py trace |
+| Message tail load | 2 rt, ≤1000 rows, ~1 kB/row (+100s ms recount CPU on big tails) | code + k3d measured |
+| Checkpoint restore / write | ≈600 kB worst / ~11 ms p50, ~3 per superstep | audit doc, D3 probe |
+| SSH cold connect | ~0.1–0.5 s | remote.py trace |
+| Cold turn core: lite / S2 / worker batch | ~50–200 ms / ~0.3–1 s / ~0.5–1.5 s (excl. MCP connect_all: +seconds; excl. provider TTFT) | composed — **measure before gating** |
+| Worker batch overhead | <2% only at wall-clock-sized batches (≥~5 min); 3–15% at 25-superstep fast end | recomputed §5.4.3 |
+| Steal takeover | ≤ ~105 s worst (TTL 60 + grace 30 + reaper 15 + claim poll) | §5.2 parameters |
+| Journal steady-state | commit rate ≈ token rate (~1.5–4 k/s at 50–100 streams) **until the coalescing tick lands** | writer mechanics, recomputed |
+| SSE poll load | 100 pinned streams ≈ 500 qps + idle floor | §5.5 |
+| Fence lookups | ~10–25/turn (sessions), ~75/batch (workers) | §5.5 |
+| Sizing | pods ≈ offered erlangs / 0.6–0.7 → ~13–15 pods per 50 sessions at 20% duty | Erlang-C, §2 |
+| Epoch-cascade cost (steals only, post-§5.3.2) | ~2.0–2.2 s + full refetch + cache wipe | main.py + service.ts trace |
+| Lease TTL / heartbeat / reaper | 60 s / 20 s / 15 s per-row SKIP LOCKED | §5.2 |
+| Agent pod | request 512Mi / limit 2Gi | helm/values.yaml |
+| **S1 live (k3d, 2026-08-08)**: enqueue→claim | < 1 s | M6 run, implementation_log.md |
+| S1 live: turn split on a `session_base` lite thread | 58 s bundle+setup / 42 s attach+restore / 52 s turn (Σ ~152 s) — affinity cache never hits (§5.3.4 note) | M6 turn-5 log timestamps |
+| S1 live: steal takeover (kill −9 / cgroup freeze) | t+88 s / t+82–98 s (bound ≤ ~105 s holds) | M6 fault matrix |
+| S1 live: skip-if-answered completion | < 8 s, no LLM call | M6 |
+| S1 live: epoch bumps | +1 per steal, 0 per clean handoff (4 epochs over 3 steals + 1 terminal-resume) | M6 |

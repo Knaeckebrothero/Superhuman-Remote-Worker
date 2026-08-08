@@ -663,3 +663,34 @@ been observed converging (return → fix → approve). Two live-gate attempts di
 before round 2 on unrelated infrastructure — the second on the silent-push
 defect above, which is now fixed. See
 `verification_fail_closed_followups.md` for what a third run needs.
+
+## Session log 2026-08-08 (stateless agents — S1 spine build night)
+
+Overnight subagent-driven implementation of `docs/features/stateless_agents.md`
+§9/S1, all on branch `feature/stateless-agents` (chart-gated off; lane
+per-thread via `threads.execution_lane`, default `pinned`). Five build
+milestones + a live fault-injection matrix on k3d; full lab notebook in
+`docs/research/stateless_agents/implementation_log.md`.
+
+Shipped: migrations 0115 (`run_queue` + `execution_lane`) / 0116
+(`events_seq_hwm`); `src/shared/run_queue/` (claim/heartbeat/fence/complete/
+reap, 73 real-PG tests) + `src/shared/event_journal/`; conditional epoch
+resolution (reuse unless terminal — kills the reattach cache-wipe cascade for
+the pinned lane too, live-verified); `--mode stateless` turn executor with
+lease-fenced persistence and pop-first embedding-env scrub (closes a live
+cross-tenant residue); orchestrator enqueue-on-input / claim-bundle (lease
+proof) / leader reaper (`turn.interrupted` frames) / admin read model;
+`agent-stateless` helm Deployment. Fault matrix all PASS: steal at t+88 s with
+exactly-once answers, frozen-zombie heartbeat abort (`lease lost` live line),
+skip-if-answered < 8 s, FIFO drain across a steal, epoch +1 per steal / 0 per
+clean handoff. Found+fixed live: NULL consumed-watermark floor re-answered
+pre-queue history → creation now initializes `consumed_seq = input_seq - 1`.
+Final gate 539 + 73 tests green, ruff clean.
+
+**Open (ranked):** (1) affinity fingerprint never matches (volatile bundle
+credentials) → every turn pays the full ~100 s re-attach; fix = stable-subset
+fingerprint + DB-side last-pod claim bias, then drain-in-lease batching.
+(2) attach-cost decomposition/caching per doc §5.3.3. (3) provisioning gate
+(3 recorded locations; `/prepare` needs a cockpit design decision) + cockpit
+compat. (4) live cross-tenant scrub probe (needs a second user identity);
+interrupt on the lane is 501.
