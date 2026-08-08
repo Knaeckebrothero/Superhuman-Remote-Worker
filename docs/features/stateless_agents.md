@@ -1,6 +1,6 @@
 # Stateless Agents — Turn Execution as a Deployment
 
-**Status:** v3.2 — **S1 spine IMPLEMENTED, k3d-verified, and PERFORMANCE-TUNED (2026-08-07/08)**: run_queue substrate (migrations 0115/0117 + `src/shared/run_queue/`, 81 real-PG tests), epoch/seq redesign (0116 + `src/shared/event_journal/`; live epoch-stable reattach), stateless turn executor (`src/api/turn_executor.py`, `--mode stateless`), orchestrator control plane (enqueue-on-input, claim-bundle, leader reaper, admin read model), `agent-stateless` Deployment (chart-gated, default off). Fault-injection matrix PASS (steal ≤105 s + `turn.interrupted`, zombie heartbeat-abort + fence, skip-if-answered, FIFO drain across a steal, exactly-once answers) and **re-verified after the claim-path change** (pod force-delete mid-turn → steal at t+97 s → exactly one answer, epoch +1, affinity hint cleared). **Turn latency 99.6 s → 5.4 s cold / 3.0 s warm** (§5.3.3 measured decomposition, §5.3.4 affinity): the attach-time and teardown cloud pulls were duplicate full-tree walks, `webdav3` listing cost ~2.5 s per directory where one `Depth: infinity` PROPFIND costs ~1 s, and virtual-tier setup spent 51 rclone process spawns answering existence probes that one scoped listing now answers. Build log, per-milestone results, found-and-fixed issues, commit map, and the S1 follow-up list: `docs/research/stateless_agents/implementation_log.md`. **Branch: `feature/stateless-agents`** — 10 commits, `e506fdfa`→`af5c38a0` (spine) and `c290f525`→`6a360848` (performance), not pushed; `develop` untouched. Gate: 15 013 tests pass, ruff clean; the 11 remaining local failures reproduce on `develop` (Python 3.14 env noise). Related implementation docs carrying pieces of this work: `no_workspace_agent_mode.md` §5.1 (op count is the cost — the virtual backend's scoped metadata index), `cloud_collaboration_model.md` §4 (one `Depth: infinity` PROPFIND per turn boundary). v1 2026-08-06 (initial proposal); v2 2026-08-07 after an 8-agent research fan-out (4 codebase deep-dives, 4 web sweeps); **v3 same night after a 6-lens adversarial panel** (concurrency, migration/ops, perf/cost, security, product/UX, completeness — 10 critical + 28 major findings folded in; the four sharpest code claims were independently re-verified). Raw research + critic reports with full evidence trails: `docs/research/stateless_agents/`. Largest v2→v3 changes: the queue got its **completion half** (§5.1), the epoch/lease-token unification was **split into two counters** (§5.2/§5.3.2), a **coexistence ruling** for the two lease systems (§5.4.4), a **security threat model** (§5.6), an honest **TTFT/DB-load budget** (§5.5, Appendix), and S1's scope grew a cockpit workstream plus the discovery that **lite sessions carry PVC-backed agent-local state today** (§6.1).
+**Status:** v3.2 — **S1 spine IMPLEMENTED, k3d-verified, and PERFORMANCE-TUNED (2026-08-07/08)**: run_queue substrate (migrations 0115/0117 + `src/shared/run_queue/`, 81 real-PG tests), epoch/seq redesign (0116 + `src/shared/event_journal/`; live epoch-stable reattach), stateless turn executor (`src/api/turn_executor.py`, `--mode stateless`), orchestrator control plane (enqueue-on-input, claim-bundle, leader reaper, admin read model), `agent-stateless` Deployment (chart-gated, default off). Fault-injection matrix PASS (steal ≤105 s + `turn.interrupted`, zombie heartbeat-abort + fence, skip-if-answered, FIFO drain across a steal, exactly-once answers) and **re-verified after the claim-path change** (pod force-delete mid-turn → steal at t+97 s → exactly one answer, epoch +1, affinity hint cleared). **Turn latency 99.6 s → 5.4 s cold / 3.0 s warm** (§5.3.3 measured decomposition, §5.3.4 affinity): the attach-time and teardown cloud pulls were duplicate full-tree walks, `webdav3` listing cost ~2.5 s per directory where one `Depth: infinity` PROPFIND costs ~1 s, and virtual-tier setup spent 51 rclone process spawns answering existence probes that one scoped listing now answers. Build log, per-milestone results, found-and-fixed issues, commit map, and the S1 follow-up list: `docs/research/stateless_agents/implementation_log.md`. **Branch: `feature/stateless-agents`** — 10 commits, `e506fdfa`→`af5c38a0` (spine) and `c290f525`→`6a360848` (performance), not pushed; `develop` untouched. Gate: 15 013 tests pass, ruff clean; the 11 remaining local failures reproduce on `develop` (Python 3.14 env noise). Related implementation docs carrying pieces of this work: `no_workspace_agent_mode.md` §5.1 (op count is the cost — the virtual backend's scoped metadata index), `cloud_collaboration_model.md` §4 (one `Depth: infinity` PROPFIND per turn boundary). **Where we are and what is left: §9.1 Implementation status** — the substrate is shared and kind-agnostic, but only the session driver exists; workers (S3) and S2 are untouched, and most of S1's surround (cockpit compat, control-verb REST, provisioning gate, metering, queued-turn UX) is still open. v1 2026-08-06 (initial proposal); v2 2026-08-07 after an 8-agent research fan-out (4 codebase deep-dives, 4 web sweeps); **v3 same night after a 6-lens adversarial panel** (concurrency, migration/ops, perf/cost, security, product/UX, completeness — 10 critical + 28 major findings folded in; the four sharpest code claims were independently re-verified). Raw research + critic reports with full evidence trails: `docs/research/stateless_agents/`. Largest v2→v3 changes: the queue got its **completion half** (§5.1), the epoch/lease-token unification was **split into two counters** (§5.2/§5.3.2), a **coexistence ruling** for the two lease systems (§5.4.4), a **security threat model** (§5.6), an honest **TTFT/DB-load budget** (§5.5, Appendix), and S1's scope grew a cockpit workstream plus the discovery that **lite sessions carry PVC-backed agent-local state today** (§6.1).
 **Origin:** user proposal — an LLM turn is conversation JSON in, bigger conversation JSON out; so agents can be a Deployment, not pinned pods.
 **Related:** `docs/go_rewrite.md` (names this flip; two sketches inverted by evidence — §5.1, §5.2), `docs/features/job_execution_lease.md` (shipped substrate), `docs/features/session_reliability_and_transport_simplification.md` (P5/P6 converge here; **P5 is blocked-by §5.3.2 — record it there**), `docs/features/worker_runtime_strategy.md` (no-new-runtime decision — this is a driver/deployment change), `docs/done/cross_pod_resume_cold_starts_checkpoint_not_replicated.md` (D3).
 
@@ -316,6 +316,94 @@ The migration's steady state is **dual control planes** for the whole soak — a
 - **S3 — workers.** `batch_boundary` + consolidated freeze registry + TodoManager hydration + conditional tmux kill; pull-claim + claim-token renewal + stage-4 CAS keyed on lease_token; **coexistence partition on `runner_kind` everywhere** (§5.4.4); checkpoint-coupled steering acks; `paused_reason` sub-state; wall-clock batch budget; fairness + cooldown waiver; snapshot-lane retirement; job-journal decision executed (§10.2); job-log per-claim capture; deploy-order constraint enforced (orchestrator first; batch-off before rollback). Gate: Job Bench A/B vs pinned baseline — completion parity, tokens/wall within noise, measured overhead (target < 2% at wall-clock-sized batches; measure MCP-attached separately), KV-cache hit rate, **fault injection**: kill -9 mid-batch, steal during a tool call, fenced-out `/complete` rejected, phantom-complete skew test on a loop job.
 - **S4 — optional, bill-driven**: in-process multiplexing; compile-once; workspace pause tier (§10.7); JetStream hatch.
 - **Rollback**: per-class flag at every stage; pinned plane intact until lane retirement decisions (§10.9).
+
+### 9.1 Implementation status (2026-08-08)
+
+Written against the code on `feature/stateless-agents`, not against intent. The
+short version: **the shared substrate is built and is genuinely kind-agnostic;
+one of the three drivers exists; most of S1's surround does not.**
+
+#### Is it shared between sessions and workers? The substrate yes, the pools deliberately never.
+
+"Shared" covers three different things in this design, and they landed differently:
+
+| | Design | Built |
+|---|---|---|
+| Queue + lease contract | ONE `run_queue` table discriminated by `unit_kind` (`session_turn`/`worker_batch`/`bg_task`); one claim/heartbeat/fence/completion/reaper semantics | **BUILT, kind-agnostic.** `src/shared/run_queue/` takes `unit_kind` as a parameter everywhere; no SQL in it knows what a session is. The reaper steals any expired lease and only *journals* for sessions, with an explicit `(S3)` skip for other kinds |
+| Pod pools | Deliberately TWO Deployments off ONE image (§5.8): interactive warm floor vs worker KEDA scaler at `minReplicaCount: 0` | **ONE built** — `helm/templates/agent/stateless-deployment.yaml`, session class, chart-gated default off. No worker Deployment; KEDA remains an uninstalled cluster dependency |
+| Drivers | A session driver and a worker driver over the same queue | **Session only** (`src/api/turn_executor.py`) |
+
+So the intent stands and the foundation is real: adding workers needs no schema
+change and no new lease semantics. What is missing is the worker *driver* and
+its coexistence partition — S3, never in this branch's scope. Concretely, today
+nothing enqueues, claims, or completes a `worker_batch` unit; `jobs` has no
+`execution_lane`; and job dispatch is still the legacy `JobStartRequest` POST to
+a pod IP.
+
+#### S1 — spine done and proven, surround largely not
+
+Built and k3d-verified: run_queue + claim/heartbeat/reaper/completion + persist
+fence (0115/0117, 81 real-PG tests); epoch/seq/system-writer redesign (0116,
+which also removes the pinned lane's cache-wipe cascade); turn rows + watermarks
++ skip-if-answered; scrub-on-claim (this fixed a live cross-tenant env leak on
+the *pinned* pool); the flag-gated Deployment; soft affinity + warm-session reuse;
+and the fault matrix (takeover ≤105 s, no duplicate answer, zombie's late persist
+fenced, FIFO drain across a steal, epoch ≤1 bump per steal and 0 per clean
+handoff, zero in-process claim state). Path-A resume-compaction persistence
+(§6.5) is also **done** — `_record_compaction(trigger="resume")` writes its
+`role='summary'` boundary row.
+
+Not built, all of them named in S1's own list above:
+
+- **Cockpit workstream** — `/connection` + `/prepare` compat, composer ungating, provisioning-card bypass.
+- **Control-verb REST subset** (§6.7) — `mode.set`, `narration.set`, `compact`, `archive`, `undo`, `rewind`, `config.update`, `upgrade-to-workspace` are still control-WS-only, and a stateless thread has no socket to reach. Interrupt is a deliberate **501** on the lane.
+- **Provisioning gate** — `execution_lane` is consulted in exactly three places (input admission, interrupt, claim-bundle). Nothing stops `/resume` or `/prepare` on a stateless thread; the operating rule "only flip a detached thread, never resume it" is convention, not code.
+- **Persistence promotions** — mode/narration, session task manager, memory-extraction interval cursor, media-fidelity decision.
+- **Permission-row retire** on lease expiry; **queued-turn UX frame**; **`fair_key` round-robin** (the column and its merge exist; no rotation CTE).
+- **Lite agent-local-state inventory** (§6.1) — the PVC question S1 is supposed to answer is still open.
+- **Journal-writer coalescing tick**; **metering lease-interval ingestion** (shadow); **object-store PUT fencing** (or the documented corruption window).
+
+Acceptance criteria, honestly scored: met are create-to-accepted <1 s, takeover
+≤105 s with no duplicate answer, the fence assert, FIFO-across-steal, the epoch
+bump bounds, zero claim state, and the zombie's rejected persist. **Unmeasured or
+unverified**: TTFT p50/p95 (we measured whole-turn wall time — 3.0 s warm, 5.4 s
+cold — which is a different number and needs streaming instrumentation); p95
+claim-wait under concurrency (never load-tested); `cache_read > 0` on a
+cross-pod follow-up (`cached_tokens` is captured in metrics/audit, but the
+`prompt_cache_key=thread_id` pin OQ5 requires is not set anywhere); the poison
+unit's user-visible terminal frame and operator unpark end to end (parking
+itself is proven in real-PG); and the tenant A→B residue probe, which needs a
+second user identity.
+
+#### S2 / S3 / S4 — untouched
+
+**S2** (workspace sessions): nothing — S1 is lite/virtual only. SSH affinity,
+tmux reattach-if-exists, PVC externalization, cloud-push generation fence,
+outbox re-homing, the two resident daemons, presence re-home all outstanding.
+
+**S3** (workers): nothing beyond the shared substrate. The list is long and
+mostly unstarted: `batch_boundary` freeze + the consolidated freeze registry
+(the phantom-COMPLETE skew hazard in §5.4.1 makes this a *correctness*
+prerequisite, not a nicety), TodoManager hydration on any resume, conditional
+tmux kill, pull-claim + claim-token renewal + stage-4 CAS keyed on
+`lease_token`, `jobs.execution_lane` with all four legacy sweeps excluding the
+class (§5.4.4), checkpoint-coupled steering acks, `paused_reason='batch_rotation'`,
+the wall-clock batch budget, the worker Deployment + KEDA, job-log per-claim
+capture, and the Job Bench A/B gate.
+
+**S4**: not started, by design.
+
+#### One gap that is cheap and not S3
+
+The scoped metadata index (§5.3.3) is wired only into `PersistentSession.setup`.
+Worker jobs construct the same `VirtualWorkspaceBackend` (`src/agent.py`) and
+never open it, so a lite job still pays the full rclone spawn count during
+workspace setup. The primitive is built and contract-tested; closing this needs
+only the same open / `finally`-close pair around the job's setup burst, and it
+is independent of everything else in S3. The cloud-sync speedups are in the
+shared package but have no job-side effect today, because worker jobs do no
+turn-boundary cloud sync at all — `persistent_app` is the package's only
+consumer.
 
 ## 10. Open questions
 
