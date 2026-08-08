@@ -15,7 +15,17 @@ import re
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Awaitable, Callable, Dict, List, NoReturn, Optional, Tuple
+from typing import (
+    Any,
+    Awaitable,
+    Callable,
+    Dict,
+    List,
+    NoReturn,
+    Optional,
+    Set,
+    Tuple,
+)
 
 import httpx
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
@@ -2318,6 +2328,7 @@ async def _terminate_session_inner(reason: str, *, mark_thread: bool = True) -> 
     global _hard_interrupt_event
     global _events_epoch, _next_seq, _tool_inflight, _turn_event_open
     global _event_writer, _cloud_sync_retry_pending
+    global _active_permission_request_id
 
     if not _session:
         return
@@ -2344,6 +2355,24 @@ async def _terminate_session_inner(reason: str, *, mark_thread: bool = True) -> 
     # Cancel self-cleanup watchdogs first — we're about to do the cleanup
     # they would have triggered, no point letting them race the detach.
     _stop_watchdogs()
+
+    # Retire this thread's announced permission rows, then drop the ledger.
+    # The turn-end sweep in _loop_on_turn_complete is the usual owner, but the
+    # cancel above skips it: the graph's `except CancelledError: return` never
+    # reaches on_turn_complete, so a session terminated mid-batch (every
+    # ✕-detach, drain, watchdog, shutdown) leaves its rows 'pending' with
+    # nothing left to reap them. They then re-render as live approval cards
+    # that execute nothing — and, before the ledger was thread-scoped, the
+    # NEXT session's first announce swept them and broadcast
+    # permission.resolved for a thread its clients had never seen.
+    #
+    # The reservations are dropped first, deliberately: the loop task is dead,
+    # so nothing is legitimately holding a gate, and a stale reservation would
+    # make the sweep skip a row we are about to forget about.
+    _gates_in_flight.clear()
+    _active_permission_request_id = None
+    await _retire_announced_permission_rows(f"session terminated ({reason})")
+    _announced_permission_rows.clear()
 
     # B11: final memory capture for ALL terminate reasons — the ✕-button
     # detach (and drain, watchdog, shutdown, …) historically skipped
@@ -4510,15 +4539,31 @@ async def _has_terminal_permission_decision(tool_call_id: str) -> bool:
         return False
 
 
-# tool_call_id -> (permission-row id, tool name) for the batch announced by
-# the turn currently running. Mutated in place (never rebound) so tests and
-# concurrent readers see one dict.
-_announced_permission_rows: Dict[str, Tuple[str, str]] = {}
+# tool_call_id -> (permission-row id, tool name, thread id) for the batch
+# announced by the turn currently running. Mutated in place (never rebound) so
+# tests and concurrent readers see one dict.
+#
+# The thread id is carried per entry, not read from the ambient `_thread_id`,
+# because this module is process-global and a pool agent serves many threads in
+# sequence: an entry that outlived its session (see _terminate_session_inner)
+# must never be swept — and broadcast as resolved — by the NEXT thread, whose
+# clients have never seen those tool_call_ids.
+_announced_permission_rows: Dict[str, Tuple[str, str, str]] = {}
 
 # The row _loop_permission_check is blocked on right now, if any. A sweep must
 # never expire it out from under its own waiter: the waiter would read
 # 'expired', report NO_ANSWER and park a turn the user had just unblocked.
 _active_permission_request_id: Optional[str] = None
+
+# tool_call_ids whose gate is currently *resolving* — from just before the
+# claim SELECT until the gate returns. `_active_permission_request_id` cannot
+# cover that whole span: the row id is not known until after the awaited
+# SELECT, and `async with pool.acquire()` exits through a yield point. A
+# fire-and-forget `mode.set` sweep landing in that window would CAS-expire the
+# very row the gate is about to wait on, and the waiter's re-SELECT would read
+# 'expired' -> NO_ANSWER — parking the turn the user had just unblocked. The
+# reservation is keyed on tool_call_id, which IS known up front.
+_gates_in_flight: Set[str] = set()
 
 
 async def _retire_announced_permission_rows(
@@ -4542,8 +4587,11 @@ async def _retire_announced_permission_rows(
 
     ``mode``: retire only the rows that permission mode would no longer gate
     (a mid-batch downgrade). Omitted ⇒ retire the whole batch, which is what
-    the end of a turn wants. The row an active waiter is holding is never
-    touched.
+    the end of a turn wants. A row whose gate is in flight is never touched:
+    ``_gates_in_flight`` covers the whole resolve span and
+    ``_active_permission_request_id`` the wait itself (belt and braces).
+    Neither is another thread's row — entries are thread-scoped, so a sweep can
+    only ever expire rows announced by the session it is running in.
 
     CAS (``WHERE id = $1 AND status = 'pending'``) so a genuine decision that
     landed a microsecond earlier still wins; only rows this sweep really
@@ -4551,12 +4599,22 @@ async def _retire_announced_permission_rows(
     """
     if not _announced_permission_rows:
         return
+    # Checked BEFORE taking ownership below: with no pool nothing can be
+    # expired, and popping the entries here would delete rows from memory that
+    # were never retired in the DB. Nothing else reaps them (there is no
+    # expires_at sweeper), so they would re-render as phantom approval cards
+    # on every reattach with no way left to resolve them.
+    if _session is None or _session.postgres_conn is None:
+        return
     # Take ownership up front so a second sweep can't double-work the same
-    # rows; anything we fail to reach goes back on the ledger below.
-    doomed: Dict[str, Tuple[str, str]] = {
+    # rows; anything we fail to reach goes back on the ledger below. No await
+    # between this and the pop, so ownership is atomic.
+    doomed: Dict[str, Tuple[str, str, str]] = {
         tool_call_id: entry
         for tool_call_id, entry in _announced_permission_rows.items()
         if (mode is None or not _gate_needed(mode, entry[1]))
+        and entry[2] == _thread_id
+        and tool_call_id not in _gates_in_flight
         and entry[0] != _active_permission_request_id
     }
     if not doomed:
@@ -4564,13 +4622,10 @@ async def _retire_announced_permission_rows(
     for tool_call_id in doomed:
         _announced_permission_rows.pop(tool_call_id, None)
 
-    if _session is None or _session.postgres_conn is None:
-        return
-
     expired: List[Tuple[str, str]] = []
     try:
         async with _session.postgres_conn.acquire() as conn:
-            for tool_call_id, (request_id, _tool) in list(doomed.items()):
+            for tool_call_id, (request_id, _tool, _tid) in list(doomed.items()):
                 row_id = await conn.fetchval(
                     "UPDATE thread_permission_requests "
                     "SET status = 'expired', decided_at = now(), "
@@ -4648,8 +4703,9 @@ async def _loop_announce_permission_batch(tool_calls: List[Dict[str, Any]]) -> N
             continue
         # Own the row until its gate claims it or the turn ends. Without this
         # ledger nothing can tell a row that was answered from one the turn
-        # walked away from.
-        _announced_permission_rows[tool_call_id] = (request_id, tool_name)
+        # walked away from. Stamped with the announcing thread so a later
+        # session in this same process can never sweep it.
+        _announced_permission_rows[tool_call_id] = (request_id, tool_name, _thread_id)
         requests.append(
             {
                 "id": tool_call_id,
@@ -4922,143 +4978,156 @@ async def _loop_permission_check(
             )
             return PermissionOutcome.APPROVED
 
-    # Phase 5 wake path: if this tool_call_id was already resolved (typical
-    # case: user clicked the magic-link approve/deny while the agent was
-    # suspended; on wake LangGraph restores the same tool_call_id from
-    # checkpoint), reuse that decision instead of inserting a fresh
-    # request. We only honor terminal 'approved'/'denied' here — 'expired'
-    # means the prior request timed out without a user response, so the
-    # new attempt deserves a fresh prompt. A 'pending' row means the batch
-    # announce (_loop_announce_permission_batch) already inserted it —
-    # claim that row instead of inserting a second one for the same
-    # tool_call_id (there is no unique constraint to stop a duplicate).
-    claimed_request_id: Optional[str] = None
-    if _session.postgres_conn is not None and _thread_id is not None:
-        try:
-            async with _session.postgres_conn.acquire() as conn:
-                existing = await conn.fetchrow(
-                    "SELECT id, status FROM thread_permission_requests "
-                    "WHERE thread_id = $1 AND tool_call_id = $2 "
-                    "  AND status IN ('approved', 'denied', 'pending') "
-                    "ORDER BY decided_at DESC NULLS LAST, requested_at DESC "
-                    "LIMIT 1",
-                    _thread_id,
+    # Reserve this gate BEFORE the claim SELECT. `async with pool.acquire()`
+    # exits through a yield point and the row id is not known until after the
+    # awaited SELECT, so `_active_permission_request_id` cannot cover the gap:
+    # a fire-and-forget mode.set sweep landing there would CAS-expire the very
+    # row this gate is about to wait on, and the waiter's re-SELECT would read
+    # 'expired' -> NO_ANSWER, parking the turn the user had just unblocked. The
+    # tool_call_id IS known up front. Nothing may await between the add and the
+    # try, and the finally must cover EVERY exit below — including the two
+    # early returns — or the reservation strands a row no sweep will touch.
+    _gates_in_flight.add(tool_call_id)
+    try:
+        # Phase 5 wake path: if this tool_call_id was already resolved (typical
+        # case: user clicked the magic-link approve/deny while the agent was
+        # suspended; on wake LangGraph restores the same tool_call_id from
+        # checkpoint), reuse that decision instead of inserting a fresh
+        # request. We only honor terminal 'approved'/'denied' here — 'expired'
+        # means the prior request timed out without a user response, so the
+        # new attempt deserves a fresh prompt. A 'pending' row means the batch
+        # announce (_loop_announce_permission_batch) already inserted it —
+        # claim that row instead of inserting a second one for the same
+        # tool_call_id (there is no unique constraint to stop a duplicate).
+        claimed_request_id: Optional[str] = None
+        if _session.postgres_conn is not None and _thread_id is not None:
+            try:
+                async with _session.postgres_conn.acquire() as conn:
+                    existing = await conn.fetchrow(
+                        "SELECT id, status FROM thread_permission_requests "
+                        "WHERE thread_id = $1 AND tool_call_id = $2 "
+                        "  AND status IN ('approved', 'denied', 'pending') "
+                        "ORDER BY decided_at DESC NULLS LAST, requested_at DESC "
+                        "LIMIT 1",
+                        _thread_id,
+                        tool_call_id,
+                    )
+                if existing is not None and existing["status"] != "pending":
+                    decision = existing["status"]
+                    _session.tool_decisions[tool_call_id] = decision
+                    logger.info(
+                        "Phase 5 wake: reusing prior %s decision for tool_call %s "
+                        "(tool=%s)",
+                        decision,
+                        tool_call_id,
+                        tool_name,
+                    )
+                    return (
+                        PermissionOutcome.APPROVED
+                        if decision == "approved"
+                        else PermissionOutcome.DECLINED
+                    )
+                if existing is not None:
+                    # A batch announce already inserted this row. Claim it —
+                    # inserting again would orphan a card nobody waits on.
+                    claimed_request_id = str(existing["id"])
+            except Exception as e:
+                # Soft-fail: fall through to the regular INSERT-and-wait path…
+                logger.warning(
+                    "Wake-path SELECT for tool_call %s failed (%s); falling back",
                     tool_call_id,
+                    e,
                 )
-            if existing is not None and existing["status"] != "pending":
-                decision = existing["status"]
-                _session.tool_decisions[tool_call_id] = decision
-                logger.info(
-                    "Phase 5 wake: reusing prior %s decision for tool_call %s "
-                    "(tool=%s)",
-                    decision,
-                    tool_call_id,
-                    tool_name,
-                )
-                return (
-                    PermissionOutcome.APPROVED
-                    if decision == "approved"
-                    else PermissionOutcome.DECLINED
-                )
-            if existing is not None:
-                # A batch announce already inserted this row. Claim it —
-                # inserting again would orphan a card nobody waits on.
-                claimed_request_id = str(existing["id"])
-        except Exception as e:
-            # Soft-fail: fall through to the regular INSERT-and-wait path…
-            logger.warning(
-                "Wake-path SELECT for tool_call %s failed (%s); falling back",
-                tool_call_id,
-                e,
+                # …unless the announce step still remembers the row it created
+                # for this exact tool_call_id. Inserting a SECOND row would hand
+                # the waiter a NEW approval_id while the card keeps showing the
+                # announced one; the user's decision then resolves a row nobody
+                # is listening on and the turn blocks forever with the card gone.
+                remembered = _announced_permission_rows.get(tool_call_id)
+                if remembered is not None:
+                    claimed_request_id = remembered[0]
+
+        # Supervised mode (or shell under auto_accept): ask user via the
+        # durable permission table, then wait on LISTEN/NOTIFY.
+        if claimed_request_id is not None:
+            request_id = claimed_request_id
+        else:
+            request_id = await _insert_permission_request(
+                tool_call_id, tool_name, tool_args
             )
-            # …unless the announce step still remembers the row it created
-            # for this exact tool_call_id. Inserting a SECOND row would hand
-            # the waiter a NEW approval_id while the card keeps showing the
-            # announced one; the user's decision then resolves a row nobody
-            # is listening on and the turn blocks forever with the card gone.
-            remembered = _announced_permission_rows.get(tool_call_id)
-            if remembered is not None:
-                claimed_request_id = remembered[0]
+            if request_id is None:
+                # DB unavailable — conservative deny rather than risk silent
+                # auto-approval. Logged at WARNING by the insert helper. This is a
+                # real DECLINE, not a park: with no durable row there is nothing a
+                # later approval could resolve.
+                if _session is not None:
+                    _session.tool_decisions[tool_call_id] = "denied"
+                return PermissionOutcome.DECLINED
 
-    # Supervised mode (or shell under auto_accept): ask user via the
-    # durable permission table, then wait on LISTEN/NOTIFY.
-    if claimed_request_id is not None:
-        request_id = claimed_request_id
-    else:
-        request_id = await _insert_permission_request(
-            tool_call_id, tool_name, tool_args
-        )
-        if request_id is None:
-            # DB unavailable — conservative deny rather than risk silent
-            # auto-approval. Logged at WARNING by the insert helper. This is a
-            # real DECLINE, not a park: with no durable row there is nothing a
-            # later approval could resolve.
-            if _session is not None:
-                _session.tool_decisions[tool_call_id] = "denied"
-            return PermissionOutcome.DECLINED
+            # Broadcast carries both ids so clients can refer back via either.
+            # Skipped when the row was claimed: the batch frame already
+            # announced it, and a second frame would duplicate the card.
+            _broadcast(
+                "permission.request",
+                {
+                    "id": tool_call_id,
+                    "approval_id": request_id,
+                    "tool": tool_name,
+                    "args": _safe_serialize(tool_args),
+                },
+            )
 
-        # Broadcast carries both ids so clients can refer back via either.
-        # Skipped when the row was claimed: the batch frame already
-        # announced it, and a second frame would duplicate the card.
+        # Phase 5: sudo gate hit untethered is the second natural-pause site.
+        # Flip the thread so the attention-sleep watchdog can fire after the
+        # configured TTL. Idempotent against the _loop_get_user_input write.
+        # Officer sessions never flip (centurion.md §4) — their pending gate
+        # surfaces via the sitrep instead.
+        if (
+            _officer_cfg() is None
+            and not _subscribers
+            and _orchestrator_client is not None
+            and _thread_id is not None
+        ):
+            asyncio.create_task(
+                _safe_set_thread_status("awaiting_user"),
+                name="phase5-flip-awaiting-user-sudo",
+            )
+
+        # Publish the row we are blocked on so a concurrent sweep (mode.set from
+        # the WS task) can't expire it under us and turn a live question into a
+        # parked turn.
+        global _active_permission_request_id
+        _active_permission_request_id = request_id
+        try:
+            final_status = await _wait_for_permission_resolution(request_id)
+        finally:
+            _active_permission_request_id = None
+        # Three-state, deliberately NOT collapsed to a bool: 'expired' means the
+        # question was never answered, which is not the user refusing.
+        if final_status == "approved":
+            outcome = PermissionOutcome.APPROVED
+        elif final_status == "denied":
+            outcome = PermissionOutcome.DECLINED
+        else:  # 'expired' (or any unknown status) — unanswered, so park.
+            outcome = PermissionOutcome.NO_ANSWER
+        if _session is not None:
+            # Record the raw status so audit can tell a timeout from a refusal.
+            _session.tool_decisions[tool_call_id] = final_status
+        # Journal the outcome too: SSE replay-from-cursor re-delivers the
+        # permission.request frame, and without a matching resolution event a
+        # reloading client resurrects an already-decided approval card — whose
+        # re-click then 409s (session_silent_failure_audit.md #10).
         _broadcast(
-            "permission.request",
+            "permission.resolved",
             {
                 "id": tool_call_id,
                 "approval_id": request_id,
-                "tool": tool_name,
-                "args": _safe_serialize(tool_args),
+                "decision": final_status,
             },
         )
-
-    # Phase 5: sudo gate hit untethered is the second natural-pause site.
-    # Flip the thread so the attention-sleep watchdog can fire after the
-    # configured TTL. Idempotent against the _loop_get_user_input write.
-    # Officer sessions never flip (centurion.md §4) — their pending gate
-    # surfaces via the sitrep instead.
-    if (
-        _officer_cfg() is None
-        and not _subscribers
-        and _orchestrator_client is not None
-        and _thread_id is not None
-    ):
-        asyncio.create_task(
-            _safe_set_thread_status("awaiting_user"),
-            name="phase5-flip-awaiting-user-sudo",
-        )
-
-    # Publish the row we are blocked on so a concurrent sweep (mode.set from
-    # the WS task) can't expire it under us and turn a live question into a
-    # parked turn.
-    global _active_permission_request_id
-    _active_permission_request_id = request_id
-    try:
-        final_status = await _wait_for_permission_resolution(request_id)
+        return outcome
     finally:
-        _active_permission_request_id = None
-    # Three-state, deliberately NOT collapsed to a bool: 'expired' means the
-    # question was never answered, which is not the user refusing.
-    if final_status == "approved":
-        outcome = PermissionOutcome.APPROVED
-    elif final_status == "denied":
-        outcome = PermissionOutcome.DECLINED
-    else:  # 'expired' (or any unknown status) — unanswered, so park.
-        outcome = PermissionOutcome.NO_ANSWER
-    if _session is not None:
-        # Record the raw status so audit can tell a timeout from a refusal.
-        _session.tool_decisions[tool_call_id] = final_status
-    # Journal the outcome too: SSE replay-from-cursor re-delivers the
-    # permission.request frame, and without a matching resolution event a
-    # reloading client resurrects an already-decided approval card — whose
-    # re-click then 409s (session_silent_failure_audit.md #10).
-    _broadcast(
-        "permission.resolved",
-        {
-            "id": tool_call_id,
-            "approval_id": request_id,
-            "decision": final_status,
-        },
-    )
-    return outcome
+        _gates_in_flight.discard(tool_call_id)
 
 
 async def _resilient_cloud_sync(op: str, runner, turn_id: int) -> bool:
