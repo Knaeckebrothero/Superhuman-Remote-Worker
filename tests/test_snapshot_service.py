@@ -655,13 +655,23 @@ class TestUploadSnapshotNoClobber:
         assert statuses == ["capture_failed"]
 
     @pytest.mark.asyncio
-    async def test_exception_during_promote_leaves_canonical_untouched(
+    async def test_exception_during_history_copy_leaves_canonical_untouched(
         self, fake_svc, fake_s3, tmp_path
     ):
-        """Defense in depth beyond the verify gate: an unexpected failure
-        raised anywhere in the staging->promote block (here, the
-        canonical ``s3.copy`` call itself) must also never leave canonical
-        half-written — it must survive exactly as it was.
+        """Defense in depth beyond the verify gate, and a direct regression
+        guard for the history-first/canonical-last promote ordering: an
+        unexpected failure raised while writing the ``history/<ts>/``
+        generation (the FIRST promote step) must leave canonical
+        completely untouched.
+
+        The raise is keyed on the destination key containing ``/history/``
+        — not "raise on the first call" — so this test can actually tell
+        the two orderings apart. In the correct (history-first) order, the
+        history copy happens first and canonical is never reached. If
+        promote ever regressed to writing canonical before history,
+        canonical would already hold the NEW bytes by the time this
+        exception fires, and the byte-identical assertion below would
+        catch that half-promoted state.
         """
         prefix = "jobs/job-1"
         fake_s3.store[f"{prefix}/env.tar.zst"] = b"GOOD"
@@ -669,16 +679,25 @@ class TestUploadSnapshotNoClobber:
         tar_path = _write_tar(tmp_path, "env.tar.zst", _TAR_BYTES)
         manifest = {"size_compressed_bytes": len(_TAR_BYTES)}
 
-        def _raising_copy(CopySource, Bucket, Key, **kwargs):
-            raise ConnectionResetError("connection reset by peer")
+        real_copy = fake_s3.copy
 
-        fake_s3.copy = _raising_copy
+        def _raise_on_history_copy(CopySource, Bucket, Key, **kwargs):
+            if "/history/" in Key:
+                raise ConnectionResetError("connection reset by peer")
+            return real_copy(CopySource, Bucket, Key, **kwargs)
+
+        fake_s3.copy = _raise_on_history_copy
 
         ok = await fake_svc.upload_snapshot("job-1", tar_path, manifest)
 
         assert ok is False
+        # The core regression guard: canonical is BYTE-IDENTICAL to the
+        # previously-seeded good object — never touched by the new
+        # (also-good) bytes either, because the history write must fail
+        # before canonical is ever reached.
         assert fake_s3.store[f"{prefix}/env.tar.zst"] == b"GOOD"
         assert _staging_keys(fake_s3, prefix) == []
+        assert _history_generations(fake_s3, prefix) == set()
 
         statuses = [
             call.args[1].get("status")
