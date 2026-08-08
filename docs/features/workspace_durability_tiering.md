@@ -362,13 +362,18 @@ only when `rc≠0 AND bytes==0`; extract `EXTRACT_REMOTE_CMD` `ssh_helpers.py:79
 *Portability guard:* `pipefail`/`PIPESTATUS` are bash/ksh/zsh, not POSIX `sh`/`dash` — verify the agent-host
 login shell in the workspace/VM images; wrap in `bash -c` if any target is dash.
 
-**Implementation scope.** C1b lands the **capture-side** accept first — self-contained in
-`snapshot_service.py`: derive a discriminated remote exit code from `PIPESTATUS` (0/1 accept, ≥2 reject,
-any `zstd` failure reject) and update the accept gate. The **extract-side** `pipefail` (catching a masked
-`zstd -d` decompression failure on restore, where today `tar` exits 0 on empty input and hides it) is a
-separate follow-up **C1c**: it changes `stream_extract_snapshot`'s rc semantics shared by three consumers
-(both restore paths + the shipped C1a) and needs the same tar-rc==1 tolerance for benign `--xattrs/--acls`
-restore warnings, so it warrants its own task + tests.
+**Implementation status.**
+- **C1b (capture-side)** — DONE (`2f747a5f` + `2761d9bd`): a `PIPESTATUS`-discriminated remote exit code
+  (tar rc 0/1 accept, ≥2 or any `zstd` failure reject) + the accept gate, in `snapshot_service.py`.
+- **C1c (extract-side)** — DONE (`9b7dd366`): plain `set -o pipefail` on both EXTRACT commands in
+  `ssh_helpers.py`. **Corrected from the earlier plan** — the extract side needs only `pipefail`, NOT
+  PIPESTATUS and **no consumer changes**: `tar` is the pipeline's *last* stage so its rc already passes
+  through (a benign full-extract `tar` rc==2 on image-provided `/usr/local` stays unchanged, per
+  `ssh_helpers.py:82-88`); `pipefail` only surfaces an otherwise-masked `zstd -d` decompression failure.
+- **C1d (owed)** — `ide_settings.py:_ssh_untar_from_file` (~`:874-903`, IDE settings/extension profile
+  sync) builds its **own** unwrapped `zstd -d | tar -xf - -C /` with the same masking pattern; give it the
+  same `bash -c 'set -o pipefail; …'` wrapper. Found during C1c; a third extract site, out of that task's
+  two-file scope.
 
 **C2 — Verify integrity + completeness before trusting.** Server/S3 checksums only prove *bytes-received
 == bytes-hashed*, **not** that the archive is complete (a truncated tar hashes clean). So the verify has
