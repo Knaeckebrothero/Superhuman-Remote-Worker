@@ -404,15 +404,33 @@ second user identity.
 tmux reattach-if-exists, PVC externalization, cloud-push generation fence,
 outbox re-homing, the two resident daemons, presence re-home all outstanding.
 
-**S3** (workers): nothing beyond the shared substrate, and one precondition is
-already latent in shipped code — §5.4.4's coexistence partition was never
-applied. `get_dispatchable_jobs` *selects* `runner_kind` but filters on nothing,
-and neither lease sweep excludes a class, so the double-execution chain the
-critic pass identified (a healthy `run_queue` lease → `recover_expired_lease_jobs`
-sees the un-renewed `jobs.lease_expires_at` → flips the job `paused` →
-the leader dispatcher hands it to a pinned agent) is unmitigated. Harmless
-today only because no stateless worker exists; it must be closed *before* the
-first `worker_batch` unit is ever enqueued. The rest of the list:
+**S3** (workers): **two of the three safety gates are built** on the parallel
+branch `feature/stateless-workers-s3` (4 commits, unpushed, reviewed 2026-08-08;
+no `worker_batch` unit has ever been enqueued and no job carries a non-pinned
+lane). Migration **0118** adds `jobs.execution_lane` and §5.4.4's coexistence
+partition is applied — `get_dispatchable_jobs`, `claim_job_for_agent`,
+`recover_expired_lease_jobs`, `recover_orphaned_jobs` (four separate predicates)
+and `register_agent` all whitelist `'pinned'` so an unknown future lane fails
+closed, with defense-in-depth refusals on the three direct dispatch paths and
+real-Postgres tests that fail without the partition. `src/shared/job_freeze_types.py`
+consolidates the four keep-in-sync freeze lists, the orphan-recovery SQL now
+takes the set as a parameter so it cannot drift, and `batch_boundary` joins
+`CONTINUE_AS_NEW_FREEZE_TYPES` (non-terminal `paused`). The §5.4.1
+phantom-COMPLETE hazard is **closed**: `determine_job_status` previously mapped
+*any* non-completion stop on a loop job to `completed`; it now does so only when
+no freeze type was declared, and routes an unknown *declared* freeze to
+`pending_review` with an error log. The `batch_boundary` freeze itself exists in
+the graph, **unarmed by construction** (it requires state fields nothing sets),
+wall-clock-first with a 300 s floor, disarming its whole envelope in the same
+checkpoint as the freeze so a resumed job cannot immediately re-freeze.
+
+**Gate 3 is not built and is now known to be a design problem, not a
+predicate** — see §5.4.5. Everything downstream (the worker driver, the pool
+decision, all worker acceptance) is blocked behind it. Also unresolved: a
+pod-local capacity reserve cannot guarantee interactive availability across a
+rollout or pod loss, which is evidence *for* §5.8's two-Deployment split and
+against a single shared pool; and the current Deployment lacks the VM-mesh
+capability §5.8 requires for VM-workspace jobs. The rest of the list:
 `batch_boundary` freeze + the consolidated freeze registry
 (the phantom-COMPLETE skew hazard in §5.4.1 makes this a *correctness*
 prerequisite, not a nicety), TodoManager hydration on any resume, conditional
