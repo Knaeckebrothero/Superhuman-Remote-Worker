@@ -1406,20 +1406,19 @@
     "settingsPane": {
       "title": "Session settings",
       "close": "Close settings",
-      "workspace": "Workspace",
-      "tier": {
-        "virtual": "Lite (no workspace pod)",
-        "sandbox": "Sandbox container",
-        "vm": "Virtual machine",
-        "none": "None",
-        "remote": "Remote container",
-        "docker": "Container"
-      },
-      "upgrading": "Provisioning {{tier}}…",
-      "upgradeSandbox": "Upgrade to sandbox",
-      "upgradeVm": "Upgrade to VM",
-      "workspaceHint": "Upgrades carry your files over and cannot be reversed within the session.",
-      "fixedNote": "Expert and projects are set at session creation and shown in the session list."
+      "fixedNote": "Expert and projects are set at session creation and shown in the session list.",
+      "upgradeConfirm": {
+        "sandbox": {
+          "title": "Upgrade to a container?",
+          "body": "Starts a workspace container and copies your files into it. Adds shell, git and browser tools. Takes about a minute."
+        },
+        "vm": {
+          "title": "Upgrade to a VM?",
+          "body": "Provisions a dedicated virtual machine with root and sudo, and copies your files onto it. A cold start takes 6–25 minutes."
+        },
+        "irreversible": "This can't be undone — the session can't move back down a tier.",
+        "confirm": "Upgrade"
+      }
     },
     "settings": {
       "mode": "Mode",
@@ -2618,7 +2617,15 @@
       "projectMemory": "Project memory",
       "imageQuality": "Image Quality",
       "workspaceBackend": "Workspace",
-      "autonomyDefaultHint": "Controls when the agent pauses for human review"
+      "autonomyDefaultHint": "Controls when the agent pauses for human review",
+      "tierCurrent": "current",
+      "tierHint": "Upgrades carry your files over and cannot be reversed within the session.",
+      "tierUpgrading": "Provisioning {{tier}}…",
+      "tierUnreachable": {
+        "downgrade": "can't move down a tier",
+        "needsApproval": "needs approval",
+        "unsupported": "not available from this tier"
+      }
     },
     "narrationModes": {
       "auto": "Auto",
