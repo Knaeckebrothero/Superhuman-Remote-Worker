@@ -15,6 +15,7 @@ import asyncio
 import logging
 import os
 import tempfile
+import time as _time
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
@@ -198,8 +199,29 @@ class WorkspaceSyncBase(abc.ABC):
             else self._mount_subdir
         )
 
+    async def _list_remote_tree_fast(self) -> Optional[list[dict]]:
+        """Optional transport primitive: the WHOLE mount tree in one shot.
+
+        Return the complete recursive listing (files may include ignored
+        paths and directory entries — the caller filters), or ``None`` when
+        the transport has no such capability (permanently or for this
+        server). The default has none. Motivation: the per-directory walk
+        costs one ``_list_remote_files`` round trip per directory, measured
+        at ~2.5s/dir via webdav3 (2026-08-08 baseline: 39.9s to list 16
+        files); Nextcloud serves the same tree in ONE ``Depth: infinity``
+        PROPFIND (~1s).
+        """
+        return None
+
     async def _list_remote_tree(self) -> list[dict]:
         """Recursively list the mount via per-directory ``_list_remote_files``.
+
+        Tries the transport's one-shot ``_list_remote_tree_fast`` first;
+        falls back to the walk when the transport reports no capability.
+        Fast results pass through the same shaping the walk applies (files
+        only, ignored subtrees dropped, deduped) — ``_should_ignore``'s
+        directory patterns match by path prefix, so per-file filtering
+        subsumes the walk's descend-time pruning.
 
         The old single ``_list_remote_files()`` call was documented as
         recursive but backed by a Depth-1 PROPFIND, which silently limited
@@ -209,7 +231,19 @@ class WorkspaceSyncBase(abc.ABC):
         listed collection itself (WebDAV servers include it) and keeps
         fully-recursive test doubles from double-listing.
         """
-        out: list[dict] = []
+        fast = await self._list_remote_tree_fast()
+        if fast is not None:
+            out: list[dict] = []
+            seen_fast: set[str] = set()
+            for item in fast:
+                path = (item.get("path") or "").strip("/")
+                if not path or item.get("isdir") or _should_ignore(path):
+                    continue
+                if path not in seen_fast:
+                    seen_fast.add(path)
+                    out.append({**item, "path": path})
+            return out
+        out = []
         seen_files: set[str] = set()
         visited: set[str] = set()
         stack: list[str] = [""]
@@ -317,6 +351,109 @@ class WorkspaceSyncBase(abc.ABC):
                         results.append(entry)
         return results
 
+    async def _walk_backend_files_async(self) -> list[str]:
+        """Level-parallel ``_walk_backend_files`` (same semantics, same
+        skip-dir-on-error behavior). One ``list_dir`` per directory is a
+        backend round trip — S3 LIST for virtual workspaces, measured 5.5s
+        serial for a 16-file tree — so directories of a level are listed
+        concurrently under a small semaphore.
+        """
+        results: list[str] = []
+        level = [self._mount_subdir]
+        prefix = f"{self._mount_subdir}/" if self._mount_subdir else ""
+        sem = asyncio.Semaphore(8)
+
+        async def _list(dir_path: str) -> list[str]:
+            async with sem:
+                try:
+                    return await asyncio.to_thread(
+                        self._backend.list_dir,  # type: ignore[union-attr]
+                        dir_path,
+                    )
+                except Exception:
+                    return []
+
+        while level:
+            listings = await asyncio.gather(*[_list(d) for d in level])
+            level = []
+            for entries in listings:
+                for entry in entries:
+                    if entry.endswith("/"):
+                        level.append(entry.rstrip("/"))
+                    elif prefix and entry.startswith(prefix):
+                        results.append(entry[len(prefix) :])
+                    elif not prefix:
+                        results.append(entry)
+        return results
+
+    async def _backend_file_index(self) -> Optional[dict[str, int]]:
+        """Mount-relative path → size for every file under the mount, in ONE
+        backend round trip — when the backend can do that.
+
+        Capability probe by duck typing: :class:`VirtualWorkspaceBackend`
+        exposes ``list_files_with_sizes`` (one recursive object-store list;
+        every individual op there is an rclone subprocess spawn, measured
+        ~0.3–0.6s each — a per-file stat pass costs seconds, this costs one
+        spawn). SSH/remote backends have no such bulk primitive and answer
+        ``None``, which keeps them on the per-file path. ``None`` on failure
+        too — the caller's fallback re-runs the ordinary walk/stat path and
+        surfaces the real error under its own strict rules.
+        """
+        lister = getattr(self._backend, "list_files_with_sizes", None)
+        if lister is None:
+            return None
+        try:
+            raw = await asyncio.to_thread(lister, self._mount_subdir)
+        except Exception as e:
+            logger.debug("Bulk file index failed (%s); per-file path", e)
+            return None
+        prefix = f"{self._mount_subdir}/" if self._mount_subdir else ""
+        out: dict[str, int] = {}
+        for path, size in raw:
+            if prefix and path.startswith(prefix):
+                out[path[len(prefix) :]] = size
+            elif not prefix:
+                out[path] = size
+        return out
+
+    async def _local_sizes(self, paths: list[str]) -> dict[str, Optional[int]]:
+        """``_local_size`` for many paths with bounded concurrency.
+
+        ``_local_size`` never raises (it answers None for anything it cannot
+        stat), so the gather needs no exception shaping.
+        """
+        if not paths:
+            return {}
+        sem = asyncio.Semaphore(8)
+
+        async def _one(path: str) -> tuple[str, Optional[int]]:
+            async with sem:
+                return path, await self._local_size(path)
+
+        return dict(await asyncio.gather(*[_one(p) for p in paths]))
+
+    async def _backend_stats(self, paths: list[str]) -> dict[str, object]:
+        """Backend ``stat`` for many paths with bounded concurrency.
+
+        Failures are returned as the exception object (not raised) so the
+        caller can honor its own strict/lenient per-file policy.
+        """
+        if not paths:
+            return {}
+        sem = asyncio.Semaphore(8)
+
+        async def _one(path: str) -> tuple[str, object]:
+            async with sem:
+                try:
+                    return path, await asyncio.to_thread(
+                        self._backend.stat,  # type: ignore[union-attr]
+                        self._backend_path(path),
+                    )
+                except Exception as e:
+                    return path, e
+
+        return dict(await asyncio.gather(*[_one(p) for p in paths]))
+
     async def push(self, *, strict: bool = False) -> list[str]:
         """Push locally modified/new files to the cloud.
 
@@ -344,7 +481,33 @@ class WorkspaceSyncBase(abc.ABC):
     async def _push_via_backend(self, *, strict: bool = False) -> list[str]:
         """Push files from a remote workspace backend. Uses size-based dedup."""
         pushed: list[str] = []
-        files = await asyncio.to_thread(self._walk_backend_files)
+        _t0 = _time.perf_counter()
+        # One bulk walk-with-sizes when the backend supports it (virtual/S3:
+        # a single rclone spawn replaces the per-dir walk AND every per-file
+        # size check). Fallback: level-parallel walk + batched stats.
+        index = await self._backend_file_index()
+        if index is not None:
+            files = list(index)
+            stat_results: dict[str, object] = dict(index)
+            _n_stats = 0
+        else:
+            files = await self._walk_backend_files_async()
+            # stat() is one round-trip with no payload — read the (possibly
+            # large) file only when its size moved. All size-checks run up
+            # front with bounded concurrency (measured 2.2s serial for 16
+            # files on the virtual/S3 backend). stat() reports 0 for
+            # vanished paths, which mismatches any tracked nonzero size and
+            # falls through to the read; that read's failure is the per-file
+            # skip below. A failed stat re-raises inside the per-file try so
+            # the strict/lenient policy stays exactly per-file.
+            tracked = [
+                p
+                for p in files
+                if not _should_ignore(p) and self._pushed_sizes.get(p) is not None
+            ]
+            stat_results = await self._backend_stats(tracked)
+            _n_stats = len(tracked)
+        _t_walk = _time.perf_counter() - _t0
 
         for rel_path in files:
             if _should_ignore(rel_path):
@@ -352,15 +515,9 @@ class WorkspaceSyncBase(abc.ABC):
             try:
                 prev_size = self._pushed_sizes.get(rel_path)
                 if prev_size is not None:
-                    # stat() is one round-trip with no payload — read the
-                    # (possibly large) file only when its size moved. stat()
-                    # reports 0 for vanished paths, which mismatches any
-                    # tracked nonzero size and falls through to the read;
-                    # that read's failure is the per-file skip below.
-                    cur_size = await asyncio.to_thread(
-                        self._backend.stat,  # type: ignore[union-attr]
-                        self._backend_path(rel_path),
-                    )
+                    cur_size = stat_results.get(rel_path)
+                    if isinstance(cur_size, Exception):
+                        raise cur_size
                     if cur_size == prev_size:
                         continue
                 content = await asyncio.to_thread(
@@ -393,6 +550,15 @@ class WorkspaceSyncBase(abc.ABC):
                 if strict:
                     raise
                 logger.debug("Push failed for %s: %s", rel_path, e)
+        logger.info(
+            "push detail: mount=%s walk=%.2fs files=%d stats=%d uploads=%d total=%.2fs",
+            self._mount_subdir or "<root>",
+            _t_walk,
+            len(files),
+            _n_stats,
+            len(pushed),
+            _time.perf_counter() - _t0,
+        )
         return pushed
 
     async def _push_local(self, *, strict: bool = False) -> list[str]:
@@ -440,6 +606,9 @@ class WorkspaceSyncBase(abc.ABC):
         turn boundaries.
         """
         pulled: list[str] = []
+        _t0 = _time.perf_counter()
+        _t_list = 0.0
+        _n_stats = 0
         try:
             await self._ensure_ready()
             try:
@@ -449,9 +618,35 @@ class WorkspaceSyncBase(abc.ABC):
                     raise
                 # Folder doesn't exist yet — nothing to pull
                 return pulled
+            _t_list = _time.perf_counter() - _t0
             # A successful listing doubles as the dedup seed (the reconcile
             # below records sizes/etags), so a later push needn't re-list.
             self._remote_seeded = True
+
+            # First-sighting local size checks are one backend round trip
+            # each (an rclone subprocess spawn on virtual workspaces;
+            # measured 1.9s serial / 4.0s under thread contention for 16
+            # files) — prefer ONE bulk walk-with-sizes, else resolve them
+            # with bounded concurrency.
+            _stat_paths = [
+                item.get("path", "")
+                for item in remote_files
+                if item.get("path")
+                and not item.get("isdir")
+                and not _should_ignore(item.get("path", ""))
+                and not self._remote_state.get(item.get("path", ""))
+                and isinstance(item.get("size"), int)
+                and item.get("size", -1) >= 0
+            ]
+            _index = await self._backend_file_index() if _stat_paths else None
+            if _index is not None:
+                _local_sizes: dict[str, Optional[int]] = {
+                    p: _index.get(p) for p in _stat_paths
+                }
+                _n_stats = 1
+            else:
+                _local_sizes = await self._local_sizes(_stat_paths)
+                _n_stats = len(_stat_paths)
 
             for item in remote_files:
                 path = item.get("path", "")
@@ -474,7 +669,7 @@ class WorkspaceSyncBase(abc.ABC):
                     # the same heuristic push dedup has always used.
                     size = item.get("size")
                     if isinstance(size, int) and size >= 0:
-                        local_size = await self._local_size(path)
+                        local_size = _local_sizes.get(path)
                         if local_size == size:
                             self._remote_state[path] = etag
                             self._pushed_sizes[path] = size
@@ -500,6 +695,17 @@ class WorkspaceSyncBase(abc.ABC):
 
             if pulled:
                 logger.info("Pulled %d file(s) from cloud", len(pulled))
+            logger.info(
+                "pull detail: mount=%s list=%.2fs files=%d reconcile=%.2fs "
+                "stats=%d downloads=%d total=%.2fs",
+                self._mount_subdir or "<root>",
+                _t_list,
+                len(remote_files),
+                _time.perf_counter() - _t0 - _t_list,
+                _n_stats,
+                len(pulled),
+                _time.perf_counter() - _t0,
+            )
         except Exception as e:
             if strict:
                 raise
