@@ -896,11 +896,22 @@ class SnapshotService:
         Returns:
             ``(ok, reason)`` — ``reason`` is always a short human-readable
             string, e.g. ``"ok"``, ``"no manifest"``, ``"object missing"``.
+
+        Never raises: this is the gate a caller uses to authorize an
+        irreversible PVC delete, so it must own every failure itself
+        (manifest lookup errors, and any S3/network error during the deep
+        re-hash — e.g. a TOCTOU delete between the HEAD and the GET, or a
+        transient 5xx/timeout/reset) rather than let it escape to a
+        possibly-unguarded caller. Any such exception is treated as
+        unverifiable, same as every other failure branch here.
         """
         if not self._available:
             return False, "s3 unavailable"
 
-        manifest = await self.get_manifest(job_id, entity_type=entity_type)
+        try:
+            manifest = await self.get_manifest(job_id, entity_type=entity_type)
+        except Exception as e:
+            return False, f"verify error: {e}"
         if not manifest:
             return False, "no manifest"
 
@@ -921,7 +932,12 @@ class SnapshotService:
             )
 
         if deep is None:
-            deep = os.environ.get("SNAPSHOT_VERIFY_DEEP", "true").lower() == "true"
+            deep = os.environ.get("SNAPSHOT_VERIFY_DEEP", "true").strip().lower() in (
+                "true",
+                "1",
+                "yes",
+                "on",
+            )
 
         if deep:
             if not want_sha:
@@ -929,7 +945,13 @@ class SnapshotService:
                 # this snapshot can't be proven intact — never treat
                 # "nothing to check" as "checked and fine".
                 return False, "no checksum in manifest (unverifiable)"
-            got = await asyncio.to_thread(self._streaming_sha256_from_s3, key)
+            try:
+                got = await asyncio.to_thread(self._streaming_sha256_from_s3, key)
+            except Exception as e:
+                # Covers both a TOCTOU ClientError (object vanished between
+                # the HEAD above and this GET) and any other transient S3
+                # failure — either way, unverifiable, never a raise.
+                return False, f"verify error: {e}"
             if got != want_sha:
                 return False, "sha256 mismatch"
 

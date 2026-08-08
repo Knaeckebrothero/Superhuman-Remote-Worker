@@ -138,6 +138,21 @@ class TestVerifySnapshot:
         assert result == (False, "no manifest")
 
     @pytest.mark.asyncio
+    async def test_get_manifest_raising_is_unverifiable_not_raised(self, svc):
+        """``get_manifest`` wraps ``ClientError`` internally, but a
+        non-ClientError (e.g. a corrupt-JSON decode error, or a transient
+        connection failure) could still escape it. The gate must still
+        return a verdict rather than propagate — a caller authorizing a
+        PVC delete on this result must never have to handle a raise itself.
+        """
+        svc.get_manifest = AsyncMock(side_effect=ValueError("bad manifest json"))
+
+        ok, reason = await svc.verify_snapshot("job-1")
+
+        assert ok is False
+        assert "verify error" in reason
+
+    @pytest.mark.asyncio
     async def test_missing_object_is_unverifiable(self, svc):
         svc.get_manifest = AsyncMock(return_value=dict(GOOD_MANIFEST))
         svc._s3.head_object = MagicMock(side_effect=_not_found())
@@ -190,6 +205,45 @@ class TestVerifySnapshot:
         result = await svc.verify_snapshot("job-1", deep=True)
 
         assert result == (False, "sha256 mismatch")
+
+    @pytest.mark.asyncio
+    async def test_deep_verify_streaming_hash_client_error_is_unverifiable_not_raised(
+        self, svc
+    ):
+        """TOCTOU guard: the object can vanish between the HEAD and the GET
+        (e.g. a concurrent GC purge). The deep re-hash must fail closed —
+        return ``(False, reason)`` — rather than let the ClientError escape
+        the gate. A later task authorizes deleting a PVC on this verdict;
+        an unhandled raise here would defer that safety decision to an
+        unwritten caller.
+        """
+        svc.get_manifest = AsyncMock(return_value=dict(GOOD_MANIFEST))
+        svc._s3.head_object = MagicMock(return_value={"ContentLength": len(_BIG_BYTES)})
+        svc._streaming_sha256_from_s3 = MagicMock(side_effect=_not_found("GetObject"))
+
+        ok, reason = await svc.verify_snapshot("job-1", deep=True)
+
+        assert ok is False
+        assert "verify error" in reason
+
+    @pytest.mark.asyncio
+    async def test_deep_verify_streaming_hash_generic_exception_is_unverifiable_not_raised(
+        self, svc
+    ):
+        """Same guard, non-ClientError case: any transient S3 5xx/timeout/
+        connection-reset during the deep re-hash must also fail closed
+        instead of raising out of the gate.
+        """
+        svc.get_manifest = AsyncMock(return_value=dict(GOOD_MANIFEST))
+        svc._s3.head_object = MagicMock(return_value={"ContentLength": len(_BIG_BYTES)})
+        svc._streaming_sha256_from_s3 = MagicMock(
+            side_effect=ConnectionResetError("connection reset by peer")
+        )
+
+        ok, reason = await svc.verify_snapshot("job-1", deep=True)
+
+        assert ok is False
+        assert "verify error" in reason
 
     @pytest.mark.asyncio
     async def test_all_good_deep_true_is_ok(self, svc):
@@ -257,6 +311,23 @@ class TestVerifySnapshot:
 
         assert result == (True, "ok")
         svc._s3.get_object.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("value", ["1", "yes", "on", "YES", "On"])
+    async def test_env_var_accepts_common_truthy_tokens(self, svc, monkeypatch, value):
+        """An operator setting ``SNAPSHOT_VERIFY_DEEP=1`` (or ``yes``/``on``,
+        any case) intends "enable" — treating it as falsy would silently
+        disable deep verification and weaken a data-safety gate.
+        """
+        monkeypatch.setenv("SNAPSHOT_VERIFY_DEEP", value)
+        svc.get_manifest = AsyncMock(return_value=dict(GOOD_MANIFEST))
+        svc._s3.head_object = MagicMock(return_value={"ContentLength": len(_BIG_BYTES)})
+        svc._s3.get_object = MagicMock(return_value={"Body": _FakeS3Body(_BIG_BYTES)})
+
+        result = await svc.verify_snapshot("job-1")  # deep omitted
+
+        assert result == (True, "ok")
+        svc._s3.get_object.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_entity_type_threads_changes_object_key(self, svc):
