@@ -16,6 +16,46 @@ track; see §7).
 
 ---
 
+## 0. Phase 2 — where this stands (2026-08-08)
+
+The **server half is built and verified** on `feature/stateless-sessions-s1-completion`
+(commits `504b153f`, `fe436783`): the provisioning gates (more sites than §3.1
+originally named — create-time provisioning, warm attach, late agent
+registration, permission wake and officer respawn were also holes), a
+discriminated `/connection`, a transactional warm-agent reservation, and
+registration that no longer treats hostname as an ownership credential. Full
+suite at the known baseline; real-Postgres probes green.
+
+Work stopped at the control-verb step for a correct reason: **an
+orchestrator-written journal frame collides with the stateless executor's
+in-process seq allocator.** The writer seeds `_next_seq` once at attach and
+allocates in memory, while `append_system_frame` allocates from the DB
+high-water mark. Those coexist only when no pod holds the session — which is
+what that helper was written for (rewind on a detached thread, the reaper's
+post-steal frames). Warm affinity now keeps a pod attached for up to 300 s of
+idle, so an orchestrator ack would take a seq the pod doesn't know about and
+the pod's next flush would collide on the unique index and kill the writer.
+
+**The design decision that unblocks it is made — do not re-litigate it:**
+
+1. **Control verbs go over orchestrator REST for BOTH lanes**, not "REST if
+   stateless, WebSocket if pinned". See the corrected §3.4: the client must
+   never learn what a lane is, and this advances §7's plan to retire the
+   per-session WebSocket rather than cutting against it.
+2. **The orchestrator never writes the journal frame.** A verb becomes a
+   durable, commit-ordered **control request** row (migration **0119**), and
+   the **lease owner consumes it** — the pod applies the verb and journals the
+   result with its own allocator. The executor already drains pending input at
+   claim time (`turn_executor.py:633`); this is the same shape, and
+   `thread_permission_requests` is a table precedent to mirror.
+3. Verbs that require a live in-flight turn (`interrupt`) stay out of scope and
+   keep their 501.
+
+Remaining work is §3.3 (now shaped as above), §3.4's verification, §3.5, §3.6
+and §3.7 — plus stateless ended-session wake, which the server phase surfaced.
+
+---
+
 ## 1. Read first
 
 1. `docs/features/stateless_agents.md` — **§9.1 Implementation status** tells you
