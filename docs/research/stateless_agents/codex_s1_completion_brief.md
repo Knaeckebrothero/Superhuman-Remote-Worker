@@ -98,14 +98,35 @@ detached-thread REST equivalents — check before building
 a control path to the pod holding the lease, which is a different problem —
 leave the 501 unless you solve it properly, and say so.
 
-### 3.4 Cockpit
+### 3.4 Cockpit — **the lane must stay invisible to the client**
 
-Teach it the lane. It currently has zero occurrences of `execution_lane` or
-`stateless`. Skip the WS ladder when the thread reports "ready, no socket",
-ungate the composer on that signal, bypass the provisioning card, and route
-control verbs to REST. The SSE/journal receive path is already the primary
-channel and should need little change — verify that claim rather than assuming
-it.
+**Corrected 2026-08-08.** An earlier version of this section said "teach it the
+lane". That was wrong, and the correction matters: a user does not care which
+agent serves their request, so `execution_lane` must not appear in the cockpit
+at all. Two client paths keyed on a server-side execution model is exactly the
+kind of leak that rots.
+
+Read the client before writing any of it — the gap is much smaller than it
+looks:
+
+* The composer ungates on `connection.state === 'ready'`
+  (`persistent-chat.service.ts:1789`), **not** on the socket opening.
+* The control-WS open is already best-effort and its failure is swallowed
+  (`:1792–1795`); the comment there states the SSE receive path is primary.
+* Turn output already streams over the journal/SSE, which is transport-
+  independent and demonstrably works on this lane today.
+
+So with §3.2's `/connection` answering ready, **send and receive should need
+zero cockpit changes.** Verify that (including that a null `ws_url` does not
+cause a reconnect storm through `_ensureControlWs`) rather than assuming it.
+
+The one real gap is the **control verbs**. They go through `_sendControl` →
+`controlOutbox` → the WebSocket (`:2082`), so with no socket the buttons queue
+forever and silently do nothing. Fix it **lane-agnostically: route control
+verbs over orchestrator REST for BOTH lanes.** That way the client gets
+simpler rather than more conditional, nothing in it knows what a lane is, and
+it advances §7's plan to retire the per-session WebSocket instead of cutting
+against it. Do not build a "if stateless use REST, else use WS" fork.
 
 ### 3.5 Queued-turn UX (§5.3.7)
 
