@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import re
+import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime
@@ -2034,6 +2035,7 @@ async def _attach_session(
         )
         mcp_manager = datasources_dict.get("mcp")
         if mcp_manager is not None:
+            _t_step = time.perf_counter()
             try:
                 await mcp_manager.connect_all()
             except Exception as e:
@@ -2042,6 +2044,9 @@ async def _attach_session(
                     type(e).__name__,
                 )
             mcp_manager.annotate_configs()
+            logger.info(
+                "attach step: mcp connect_all %.2fs", time.perf_counter() - _t_step
+            )
 
         # Inject datasource tool categories so the correct tools are loaded
         # when config is resolved below. Shared map with the orchestrator's
@@ -2283,6 +2288,7 @@ async def _attach_session(
     git_remote_url = (
         workspace_override.get("git_remote_url") if workspace_override else None
     )
+    _t_step = time.perf_counter()
     await _session.setup(
         llm=llm,
         auxiliary_llm=auxiliary_llm,
@@ -2292,6 +2298,7 @@ async def _attach_session(
         git_remote_url=git_remote_url,
         cloud_mount_cfg=cloud_mount_cfg,
     )
+    logger.info("attach step: session.setup %.2fs", time.perf_counter() - _t_step)
 
     # Live citation-verdict push: let the engine's background verifier broadcast
     # pending→verified/failed so the cockpit citations panel updates in place
@@ -2447,7 +2454,28 @@ async def _attach_session(
                 # the agent starts its first turn — and raise immediately if
                 # any mount is broken, so the operator sees it before any
                 # actual work is committed.
-                await _session.workspace_sync.pull_all()
+                #
+                # Stateless executor: SKIP this pull. Every claimed turn runs
+                # the same full pull at turn start (_run_persistent_turn's
+                # turn-boundary sync) seconds after this attach, so the
+                # attach-time pull is a duplicate full-mount walk on the
+                # claim's critical path (measured 41s of the 49s attach,
+                # 2026-08-08 baseline). Broken-mount surfacing moves to the
+                # turn's _resilient_cloud_sync path, which broadcasts
+                # workspace_sync.error and flags degradation — same operator
+                # visibility, one walk instead of two.
+                if _stateless_mode():
+                    logger.info(
+                        "attach step: initial cloud pull_all skipped "
+                        "(stateless — turn-start pull covers seeding)"
+                    )
+                else:
+                    _t_step = time.perf_counter()
+                    await _session.workspace_sync.pull_all()
+                    logger.info(
+                        "attach step: initial cloud pull_all %.2fs",
+                        time.perf_counter() - _t_step,
+                    )
                 logger.info(
                     "Cloud workspace sync coordinator started (%d mount(s))",
                     len(_session.workspace_sync),
@@ -2497,7 +2525,9 @@ async def _attach_session(
         _cloud_sync_retry_pending = True
 
     # Restore message history from DB (for session resume)
+    _t_step = time.perf_counter()
     await _restore_session_messages()
+    logger.info("attach step: message restore %.2fs", time.perf_counter() - _t_step)
 
     # Mark thread as active
     await _update_thread_status("active")
@@ -2664,7 +2694,15 @@ async def _terminate_session_inner(reason: str, *, mark_thread: bool = True) -> 
         try:
             await _await_pending_cloud_push()
             await _session.workspace_sync.push_all()
-            await _session.workspace_sync.pull_all()
+            # The final PULL is skipped in stateless mode: it refreshes a
+            # workspace whose next consumer (the next claim's turn) always
+            # pulls first anyway, and it sat on the claim-switch critical
+            # path as a full remote-tree walk (measured 41s of the 51s
+            # detach, 2026-08-08 baseline). Pinned-lane teardown keeps it —
+            # its workspace may be browsed after detach without another
+            # attach ever running.
+            if not _stateless_mode():
+                await _session.workspace_sync.pull_all()
         except Exception as e:
             logger.warning(f"Final cloud sync failed (non-fatal): {e}")
         try:
