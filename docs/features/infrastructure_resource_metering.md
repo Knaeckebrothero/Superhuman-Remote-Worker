@@ -1732,6 +1732,13 @@ infrastructureMetering:
   pvcPublicationEnabled: false
   pvPublicationEnabled: false
   volumeIdentityKeyVersion: ""
+  externalSecrets:
+    enabled: false
+    vaultPath: ""
+    vmiIngestionProperty: METERING_VMI_INGESTION_KEY
+    vmStorageIngestionProperty: METERING_VM_STORAGE_INGESTION_KEY
+    volumeIdentityProperty: METERING_VOLUME_IDENTITY_KEY
+    vmLifecycleAuthProperty: METERING_VM_LIFECYCLE_HMAC_SECRET
   volumeResourceMappings: []
   relistIntervalSeconds: 300
   staleAfterSeconds: 900
@@ -1756,6 +1763,28 @@ The stable cluster ID is operator-configured, bound to authenticated source
 identity, and survives endpoint/credential rotation. Values validate that
 publication cannot start without collectors, non-empty cluster identity,
 migrated audit capability, and at least one complete required snapshot.
+
+Main dev stores the four cross-cluster metering credentials as distinct
+properties in the existing
+`homelab/superhuman-remote-worker/srw-secrets` Vault record. The Vault-facing
+properties intentionally omit the runtime-only `INFRASTRUCTURE_` prefix:
+
+| Vault property | Dedicated Kubernetes Secret key |
+|---|---|
+| `METERING_VMI_INGESTION_KEY` | `INFRASTRUCTURE_METERING_VMI_INGESTION_KEY` |
+| `METERING_VM_STORAGE_INGESTION_KEY` | `INFRASTRUCTURE_METERING_VM_STORAGE_INGESTION_KEY` |
+| `METERING_VOLUME_IDENTITY_KEY` | `INFRASTRUCTURE_METERING_VOLUME_IDENTITY_KEY` |
+| `METERING_VM_LIFECYCLE_HMAC_SECRET` | `VM_LIFECYCLE_HMAC_SECRET` |
+
+The main and VM-cluster charts use explicit ESO `remoteRef.property` mappings
+to project those values into four distinct Kubernetes Secrets; the VM cluster
+never bulk-extracts the application bundle. Metering secret synchronization is
+independently dark by default and must not be enabled until every referenced
+Vault property and target Secret name exists. The current main-cluster
+application ExternalSecret still bulk-extracts its `srw-secrets` record, so the
+properties are also present in the general `srw` Secret there; workloads must
+continue to reference only explicitly named keys, and metering consumers are
+forbidden from using that general Secret as their target.
 
 PVC and PV inventory, shadow reconciliation, and publication are independently
 gated in addition to their global master gates. Physical-volume inventory also

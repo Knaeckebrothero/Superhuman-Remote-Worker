@@ -312,6 +312,17 @@ infrastructureMetering:
   volumeIdentitySecretName: ""
   volumeIdentitySecretKey: INFRASTRUCTURE_METERING_VOLUME_IDENTITY_KEY
   volumeIdentityKeyVersion: ""
+  # Optional ESO projections for metering credentials stored alongside the
+  # existing application bundle. Vault-facing property names stay concise,
+  # while each value is projected into a dedicated Kubernetes Secret under
+  # the canonical runtime key expected by the collectors/controllers.
+  externalSecrets:
+    enabled: false
+    vaultPath: ""
+    vmiIngestionProperty: METERING_VMI_INGESTION_KEY
+    vmStorageIngestionProperty: METERING_VM_STORAGE_INGESTION_KEY
+    volumeIdentityProperty: METERING_VOLUME_IDENTITY_KEY
+    vmLifecycleAuthProperty: METERING_VM_LIFECYCLE_HMAC_SECRET
   # Exact, operator-owned PV pricing classifications. These rules are stored
   # immutably by the orchestrator; collector labels and StorageClass parameters
   # can never select a priced resource. Empty means quantity-only/unpriced.

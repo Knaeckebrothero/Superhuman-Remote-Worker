@@ -149,6 +149,12 @@ infrastructureMetering:
   vmPvClusterWideRbacAcknowledged: false
   stableClusterId: "srw-main-dev"
   ingestionSecretName: "srw-infra-metering-ingestion"
+  # Metering credentials will be selected from the existing SRW Vault bundle
+  # into dedicated Kubernetes Secrets. Keep the projection dark until all
+  # named properties and target Secret names have been provisioned.
+  externalSecrets:
+    enabled: false
+    vaultPath: "homelab/superhuman-remote-worker/srw-secrets"
   networkPolicy:
     enabled: true
     allowUnrestrictedEgress: false
