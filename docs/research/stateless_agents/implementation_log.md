@@ -654,3 +654,268 @@ was to distrust the first — worth repeating on anything of this shape.
    session is re-claimed after >5 min idle.
 4. Session 1's follow-ups still stand: provisioning gate, cockpit `/prepare`
    compat, live cross-tenant scrub probe, interrupt-on-lane (currently 501).
+
+---
+
+# Session 3 — S1 completion pickup (2026-08-08)
+
+Branch: `feature/stateless-sessions-s1-completion`, forked from
+`feature/stateless-agents`; not pushed. The S3 worker branch was not used as a
+base and no `worker_batch` unit was enqueued.
+
+## Baseline and order
+
+Read the completion brief in full, then the feature-doc sections, both prior
+implementation sessions (including every trap), and `turn_executor.py` before
+editing. Baseline focused server suite:
+`tests/test_sessions_router_prepare.py` + resume neighbors = **93 passed in
+0.53 s**. Tilt and the `srw` resource both reported `updateStatus: ok`, but the
+orchestrator rollout was already unhealthy; see the operational failure below.
+
+## Provisioning gate — DONE, focused tests + k3d verified
+
+The brief named four entries (`resume_thread`, `_do_prepare`,
+`_provision_agent_for_thread`, `get_connection`). Exact pinned whitelists landed
+at all four, before provisioning mutations, with owner/auth checks retained
+before lane-specific responses.
+
+The call-site audit showed the brief's list was incomplete and an entry-only
+check would still permit the same two-executor corruption:
+
+- create-thread's fire-and-forget `provision_or_assign` refetch could attach a
+  warm agent or spawn a pod after a lane change;
+- resume's background `_reprovision` refetched under the advisory lock but did
+  not recheck the lane;
+- `_send_session_attach_locked` was the actual warm-pool delivery/bind boundary;
+- a dedicated pod can start while pinned, remain `agent_id IS NULL`, then
+  register after the row is flipped. `register_agent` was the authoritative
+  late bind and had no lane check;
+- permission-link wake and officer watchdog could recreate persistent pods.
+
+All now whitelist exactly `'pinned'`. A final adversarial review caught that the
+first warm-attach fix was itself unsafe: it delivered HTTP first, then on a
+lost lane CAS called ordinary `/session/detach`. That endpoint marks the thread
+ended, and the dual app returns from attach before its background setup exists
+to detach. The first registration fix likewise upserted by hostname before its
+lane check, then deleted the returned ID; that ID can identify a pre-existing
+legitimate row. Neither version was committed.
+
+The landed shape reserves warm ownership **before** HTTP with two CASes in one
+transaction: agent must be ready/unbound/not working, and thread must be
+pinned/unbound. After reservation, only HTTP 200 is confirmed acceptance.
+Every non-200 response—including 409—and every transport exception retains the
+reservation and returns a non-fallback outcome; stranding is recoverable,
+provisioning a second executor is corrupting. This was a second adversarial
+correction: `mark_stuck_session_agents_ready` can make a still-live pod look
+idle during resume, and that pod legitimately returns 409 “already attached to
+this same thread.” Releasing then would launch a rival. All three fresh-pod
+fallback callers re-read lane and binding after a pre-reservation refusal.
+
+Persistent registration now acquires the thread advisory lock and checks the
+authoritative lane before any agent mutation. Hostname is not UNIQUE and is not
+an ownership credential: a same-host restart targets only the exact
+snapshotted owner (`expected_agent_id`); a genuinely new or different-host
+replacement uses `insert_only` and cannot reuse an arbitrary hostname row; a
+different live owner and a missing referenced owner fail before mutation. It
+finishes with a checked lane-qualified CAS against the snapshotted
+`thread.agent_id` (including NULL). That owner predicate is load-bearing: a
+warm reservation does not take the registration advisory lock, so it can
+otherwise land between registration's read and write and be overwritten. A
+final bind miss clears only the exact agent/thread association and returns 409;
+lane refusal never deletes an agent row.
+
+The create, resume-refetch, permission-wake, and officer paths return before
+pool lookup or pod creation when their authoritative read is non-pinned. A raw
+lane edit can still land after one of those reads and waste a pod, but the warm
+reservation or final registration fence prevents that pod from becoming a
+second executor.
+
+Decision/deviation: there is still no sanctioned application lane-transition
+verb; current flips are operator SQL. A future transition must take the same
+thread advisory lock and require both no binding and no in-flight pod marker.
+`agent_id IS NULL` alone is not detachment while a pod is booting. Raw SQL can
+always violate application invariants; the final registration check makes a
+correctly quiesced operator flip converge safely instead of binding late.
+
+Deferred transition-UX caveat: `_do_prepare` emits `provisioning -> failed` if
+a pinned request is scheduled and an operator flips it to stateless before the
+background lock/refetch. `provision_or_assign` can similarly leave one stale
+`provisioning` event if raw SQL lands during its warm-attach window. These are
+ephemeral SSE events, not durable state, and both paths stop before a second
+executor; `/connection` remains authoritative. A sanctioned lane-transition
+API must add lane-aware lifecycle cancellation while taking the same advisory
+lock and rejecting the in-flight pod marker.
+
+## Honest connection contract — DONE server-side, k3d verified
+
+`GET /api/sessions/{thread_id}/connection` is now a discriminated contract:
+
+- pinned: `execution_lane='pinned'`, `control_socket='websocket'`, non-null
+  `ws_url`, token, and expiry (existing readiness ladder unchanged);
+- detached stateless: immediate `200 ready`, `control_socket='none'`, null
+  socket fields;
+- stateless with an incompatible agent binding, missing/corrupt lane, or future
+  lane: fail closed 409.
+
+Every marker and null socket field is required. The response model is an
+OpenAPI `oneOf` discriminated by `execution_lane`; neither `{}` nor an
+incoherent lane/socket combination validates as ready.
+
+`POST /prepare` returns a clear 409 for every non-pinned lane, matching the
+brief's definition-of-done wording. Internal/background callers independently
+recheck rather than trusting the public request snapshot.
+
+`control_socket` is intentionally not called `control_transport`: the server
+has no replacement REST control path. Here `ready` means a turn can be admitted
+to the queue, not that every pinned-session capability is available.
+
+Live existing stateless fixture `9a756800`: the initial probe returned the
+earlier `control_transport='rest'` draft; `/prepare` and `/resume` both returned
+409; its row stayed `agent_id IS NULL`, queue `done`. That marker was corrected
+after review because it advertised an unbuilt transport. A synthetic persistent
+registration against that row returned 409, left **0** probe agent rows, and
+left the thread unbound. Final-image re-verification of `control_socket='none'`
+is recorded below.
+
+Pinned regression: created a fresh `session_base` virtual thread through the
+orchestrator, reached `ready/websocket` in **12 s**, submitted
+`PINNED-S1-GATE-OK`, and observed the exact AI row by **17 s** from create. The
+test thread was permanently deleted afterward.
+
+## Control REST step — STOP, NOT DONE (design premises disproved)
+
+The next dependency in the brief says the orchestrator can accept a verb and
+write a journaled ack while no pod owns the thread. That is not safe with the
+built journal allocator. `append_system_frame` explicitly excludes a live
+in-process writer; the stateless executor retains exactly such a writer in its
+300 s warm cache after completing a claim. An orchestrator system write can
+allocate the same `(epoch, seq)` as the warm writer's local `_next_seq`, killing
+the writer. `run_queue.state='done'` is therefore not a no-writer signal.
+
+Further call-site findings invalidate verb-level assumptions:
+
+- detached conversation rewind admits stateless rows because `agent_id` is
+  null, but it bumps only `events_epoch`, not `run_queue.lease_token/state`; an
+  active claimant remains authorized after the transcript sweep;
+- there is no detached compact endpoint. Boundary compact matches in-memory
+  message IDs, while restore mints new IDs and does not select the persisted
+  ID;
+- undo's file originals exist only in `PersistentSession.file_checkpoints`
+  RAM;
+- workspace upgrade must keep both backends live during seed/swap and would
+  move S1 into the explicitly unbuilt S2 workspace lane;
+- archive has a multi-side-effect, non-idempotent finalization path;
+- config persistence can succeed before live apply later rejects model fit.
+
+The smallest credible replacement design starts with migration **0119** and a
+durable `thread_control_requests` inbox. Human and control admission need one
+commit-ordered per-thread sequence (the current human path also lacks an
+admission lock); the lease-owning executor consumes the oldest item, emits the
+ack through its own writer, awaits durable flush, fenced-CASes the request, and
+completes at that sequence. `mode.set`/`narration.set` are the first plausible
+subset. Rewind needs an atomic lease steal; undo and upgrade remain explicit
+501. This needs adversarial design review before implementation, so no REST
+control route, migration, or cockpit routing was scaffolded.
+
+Cockpit audit corrections recorded for that review: accepted-send waiting UX
+already exists (`pendingTurnCount`/spinner), so the missing queued UX is durable
+queue position/reload/multi-tab state rather than literally no feedback; the
+initial `session.state` snapshot is WS-only even though incremental journal SSE
+is shared; ended stateless threads currently take `/resume` and would strand;
+and interrupt/canvas/upgrade controls require explicit lane behavior.
+
+## Verification and failures
+
+- First focused post-change suite: **187 passed in 1.02 s**. After the
+  adversarial bind-boundary corrections: **434 passed in 1.50 s** / **4.44 s
+  wall** (four pre-existing AsyncMock resource warnings in
+  `test_internal_auth.py`). Contract-hardening slice: **28 passed in 0.12 s**;
+  final bind/connection-focused slice: **185 passed in 0.87 s** / **3.91 s
+  wall**. After the final 409/hostname-identity audit, the stable changed-file
+  suite was **460 passed in 1.61 s** / **4.66 s wall**.
+- Full `ruff check src/ orchestrator/ tests/`, `ruff format --check` (**1,038
+  files**), and `git diff --check`: clean.
+- Running orchestrator source before the first live probes had the draft
+  registration fence and REST marker. Agent containers do not carry
+  orchestrator source, so those paths are not applicable there. The corrected
+  source/image grep and no-socket response are recorded in the final probe
+  entry below.
+- Final k3d image proof, after all adversarial corrections: the one running
+  orchestrator pod had count **1** for each of the discriminated no-socket
+  response, insert-only thread registration, exact expected-owner bind,
+  hostname-upsert bypass, and ambiguous non-200 attach handling. The first
+  grep attempt used repository paths (`/app/orchestrator/...`) and failed;
+  this image flattens that directory, so the successful proof used
+  `/app/routers/sessions.py`, `/app/main.py`, and `/app/database/postgres.py`.
+  Its live OpenAPI response exposed two `oneOf` branches with
+  `discriminator.propertyName=execution_lane`. On that exact image the
+  stateless fixture returned
+  `{state: ready, execution_lane: stateless, control_socket: none, ws_url:
+  null, token: null, expires_at: null}`; `/prepare` and `/resume` were both
+  **409**. A persistent-registration probe was **409 before upsert**: agent
+  rows for its hostname stayed **0 -> 0** and the thread stayed unbound.
+- Final pinned regression on the same image: a fresh `session_base` virtual
+  thread reached `ready` in **14.43 s** with
+  `execution_lane='pinned'`, `control_socket='websocket'`, and all three socket
+  fields non-null. One input produced exactly one
+  `PINNED-S1-FINAL-REGISTRATION-20260808` AI row by **17.48 s** from create. The
+  first DELETE was the documented soft end (200); the follow-up
+  `?permanent=true` DELETE returned 200 and left **0** thread rows.
+- Real-Postgres helper probe on that image: forced the agent half of a warm
+  reservation to succeed and the thread half to fail, then verified transaction
+  rollback restored the candidate to ready/unbound. In the final-bind race, a
+  real warm reservation won after registration's NULL-owner snapshot; the
+  exact-owner CAS preserved that winner and cleared only the loser association.
+  Result: `reserve_rollback=1 owner_cas=1 residual=0`.
+- Real-Postgres registration probe: a new thread registered with a hostname
+  already owned by another thread and received a fresh row while the old
+  thread/agent/IP stayed unchanged (`insert_only_no_hijack=1`); an offline
+  same-host restart returned the exact original ID (`exact_restart=1`). Cleanup
+  left **0** probe rows.
+- Final stateless timing harness: accepted at queue depth 1, answered in **10 s
+  wall**; agent line `mode=fresh bundle=0.12s attach=2.63s turn=2.82s
+  push=0.09s complete=0.01s total=5.67s`; orchestrator claim bundle
+  `lease=0.002s creds=0.015s assemble=0.083s total=0.100s`. Exactly one
+  `STATELESS-S1-FINAL-20260808` AI row persisted.
+- Worker isolation check after all live probes: **0** `worker_batch` queue
+  rows. No worker unit was enqueued or claimed.
+- Operational failure: the shared k3d DB has the parallel S3 migration
+  `0118_jobs_execution_lane.sql` applied, while this branch correctly starts at
+  0119 and lacks that file. The new orchestrator refused startup with
+  `applied but missing on disk`. For live verification only, the exact 0118
+  file from `feature/stateless-workers-s3` was materialized as an untracked
+  shim, every live check above was run on the healthy new pod after source
+  greps, then the shim was deleted and never staged. No S3 code or traffic was
+  exercised. Terminal cluster state after removal: Tilt `updateStatus=ok`,
+  `runtimeStatus=pending`; the source-verified pod remains Ready, while its
+  replacement fails startup with the same explicit 0118 error. This is shared
+  cluster migration residue, not a deployable state claimed for this branch.
+- First full `pytest tests/ -q --tb=short`: **15,031 passed, 14 failed, 107
+  skipped in 964.37 s**. Eleven failures were the documented environment
+  baseline (Postgres, MCP/Python 3.14, and missing arxiv); three were real stale
+  `/prepare` fixtures that lacked `execution_lane` and therefore hit the new
+  fail-closed 409. Those fixtures now explicitly describe pinned rows.
+- An intermediate full run was intentionally interrupted after a schema audit
+  found defaulted response markers could turn `{}` into a ready stateless
+  response: **7,174 passed, 1 known-baseline failure, 18 skipped in 411.78 s**.
+  A later run was intentionally interrupted at **947 passed, 6 skipped in
+  83.34 s** when the transaction audit found the offline/same-host identity
+  gap. The final model requires every response field and emits an explicit
+  discriminator; the registration path now has exact-ID and insert-only modes.
+- Complete stable-tree gate: **15,060 passed, 11 failed, 107 skipped in 957.30
+  s** / **962.70 s wall**. All eleven failures are the known local environment
+  baseline: one absent localhost Postgres, seven Python-3.14/MCP transport
+  incompatibilities, and three missing-arxiv contract failures. No changed-path
+  failure remained.
+- Probe failures retained for reproducibility: the first final `/prepare` call
+  omitted its required `{}` request body and therefore measured validation 422,
+  not the lane gate; the corrected call returned 409. The first in-pod Python
+  HTTP probe omitted `kubectl exec -i`, so stdin never reached Python and no
+  request ran; it was rerun with `-i`. Neither changed data.
+
+## Phase boundary
+
+Provisioning safety + the honest server connection contract are DONE and
+verified. Cockpit consumption, control verbs, queued durability, permission
+retire, and Path-A compaction persistence remain unbuilt. Stop here rather than
+build control transport on the disproved live-journal-writer premise.
