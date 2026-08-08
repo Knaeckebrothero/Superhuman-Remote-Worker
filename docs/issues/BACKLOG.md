@@ -694,3 +694,39 @@ fingerprint + DB-side last-pod claim bias, then drain-in-lease batching.
 (3 recorded locations; `/prepare` needs a cockpit design decision) + cockpit
 compat. (4) live cross-tenant scrub probe (needs a second user identity);
 interrupt on the lane is 501.
+
+## Session log 2026-08-08 (stateless agents — S1 performance tuning)
+
+**Turn latency 99.6 s → 5.4 s cold / 3.0 s warm** on the same k3d thread, all
+numbers from running pods. Branch `feature/stateless-agents`.
+
+Shipped: attach-time + teardown cloud `pull_all` skipped on the stateless lane
+(duplicate full-tree walks, 41 s each); one `Depth: infinity` PROPFIND replaces
+the `webdav3` per-directory walk (39.9 s → 0.55 s, capability-probed with a
+permanent fallback); bulk `list_files_with_sizes` + parallel stat batches;
+attach fingerprint excludes `resolved_config.resolved_at` (the sole volatile
+field, and the reason the warm cache never hit); **migration 0117**
+`run_queue.last_leased_by` + a 2 s affinity grace in the general claim, cleared
+on release and reaper steal; executor stays in fast poll cadence while warm and
+drops a warm session after 300 s idle; scoped metadata index on the virtual
+backend (setup 51 rclone spawns / 7.2 s → 13 / 1.5 s) plus idempotent `mkdir`.
+
+Measured and deliberately NOT built: a persisted resolved-config cache (server
+resolution is **70 ms**/claim) and drain-in-lease (with affinity working, a
+3-message burst drains on one pod in 11 s with `attach=0.00s`; the only saving
+left is the 0.05–0.09 s bundle fetch). Both recorded with their numbers in
+`docs/features/stateless_agents.md` §5.3.3/§5.3.4 so neither gets re-proposed
+from code reading.
+
+Verified: fault matrix re-run after the claim-SQL change — pod force-deleted
+mid-turn → steal at t+97 s → exactly one answer, epoch +1, affinity hint
+cleared. 81 real-PG run_queue tests (harness now applies 0115 **and** 0117),
+11 new scoped-index tests.
+
+Gotchas re-confirmed: Tilt ships partially-edited images (`updateStatus: ok`
+proves nothing — `kubectl exec … grep` every pod); `kill -9 1` inside a
+container is ignored, use `kubectl delete pod --force --grace-period=0`;
+admin-cli `id_token` expires in ~15 min and fails as a silent 401.
+
+Left: the remaining 13 setup store ops; `AFFINITY_GRACE_SECONDS` should derive
+from the poll interval if cadences ever diverge; warm-TTL value unmeasured.

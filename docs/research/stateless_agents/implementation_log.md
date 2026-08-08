@@ -134,7 +134,7 @@ tests). Post-M6 substrate fix folded in: creation initializes
 `consumed_seq = input_seq - 1` (see M6 finding 1).
 Results: _pending_.
 
-### M2 — epoch/seq/system-writer (in progress)
+### M2 — epoch/seq/system-writer (done)
 Pre-spec code audit (done inline, main context) found two constraints the doc's
 §5.3.2 sketch didn't know about:
 1. **The cockpit's resume guard depends on epoch bumps.**
@@ -388,3 +388,181 @@ non-admin test user); the 200 path rests on unit tests.
   its own column; §5.1/§9: `threads.execution_lane` is the S1 partition.
 - §5.3.2: seq design — MAX-seed (gap-free) chosen over block allocation
   (update the alternative note once verified).
+
+---
+
+# Session 2 — performance (2026-08-08, morning)
+
+**Mandate:** "continue testing on k3d; the goal is to get everything faster and
+more streamlined." The user's specific hypothesis: don't re-resolve the config
+on every request — persist the resolved config and reload it, re-resolving only
+when settings change.
+
+**Result: 99.6 s → 5.4 s cold, 3.0 s warm** on the same thread and cluster.
+The user's hypothesis turned out to be right about the *symptom* and wrong
+about the *cost*, which is exactly why the first thing built was instrumentation.
+
+## Method
+
+Same loop every time, no exceptions: instrument → deploy via Tilt → drive a real
+turn on k3d → read the numbers → change one thing → re-measure. Every claim in
+this section is a log line from a running pod, not a reading of the code.
+
+Two harnesses in the scratchpad (reusable):
+* `drive_turn.sh "<message>"` — mints a fresh admin-cli `id_token` (they expire
+  in ~15 min, so per-run), posts one message, waits for the `ai` row, then
+  prints the timing lines from both planes.
+* `burst.sh N` — fires N messages back-to-back and reports the drain: order,
+  wall time, and which pod served each.
+
+Instrumentation added (kept — it is how the next regression gets found):
+* `turn timing:` in the executor — bundle / detach / attach / pending / turn /
+  push / complete / total, tagged `mode=fresh|reuse`.
+* `claim-bundle timing:` in the orchestrator — lease check / credential
+  injection / assembly.
+* `attach step:` and `setup steps:` — the phases inside attach and inside
+  `PersistentSession.setup`.
+* `pull detail:` / `push detail:` in cloud sync — list vs reconcile vs
+  downloads, with counts.
+* `affinity miss: ... changed_paths=[...]` — **key paths only, never values**
+  (claim bundles carry credentials). This one line diagnosed the whole affinity
+  problem in a single turn.
+* rclone op tally (`N ops Xs [verbx36=Ys ...]`), drained per setup.
+
+## What the numbers said
+
+Baseline, turn 1 (cold): `bundle=0.08s attach=49.09s turn=42.41s push=8.01s
+total=99.64s`.
+
+**The config re-resolution the user suspected costs 70 ms** — 1 ms lease check,
+10 ms credential injection, 60 ms assembly. A persisted-resolved-config cache
+would have optimized 0.07 % of the turn. It was not built, and the doc now
+records that with the measurement, so nobody re-proposes it from code reading.
+
+But the hypothesis pointed at the right *place*. Re-resolution produced a fresh
+`resolved_config.resolved_at` timestamp on every claim — and the attach
+fingerprint hashed it. That single volatile field is why the warm-session cache
+never hit. Excluding resolution metadata from the fingerprint is the cheap,
+correct version of "load the same config instead of resolving it again."
+
+Where the time actually was:
+
+| Cost | Baseline | After | Cause |
+|---|---|---|---|
+| Attach-time cloud `pull_all` | 41 s | 0 s | Full remote-tree walk on the claim critical path, duplicating the turn-start pull seconds later |
+| Teardown cloud `pull_all` | 41 s | 0 s | Same walk again on claim-switch, refreshing a workspace whose next consumer pulls first |
+| Remote tree listing | 39.9 s | 0.55 s | `webdav3.list()` runs a probe PROPFIND before the real one, ~2.5 s/dir; one `Depth: infinity` PROPFIND returns the tree in ~1 s |
+| Backend walk + stats (push) | 7.8 s | 0.20 s | Per-file `stat` over an object store; the virtual backend can return the whole tree with sizes in one op |
+| Session setup | 7.2 s / 51 rclone spawns | 1.5 s / 13 | 36 of the 51 were listings — setup asking "does this exist?" about one small tree |
+
+## Changes, in the order they were made and measured
+
+1. **Skip the attach-time and teardown cloud pulls in stateless mode.** Both
+   duplicate a pull that runs anyway. Broken-mount surfacing moves to the
+   turn's `_resilient_cloud_sync`, which already broadcasts
+   `workspace_sync.error` and flags degradation — same operator visibility,
+   one walk instead of three. The pinned lane keeps both (its workspace can be
+   browsed after detach without another attach ever running).
+   → 99.6 s → 59.3 s.
+
+2. **`Depth: infinity` PROPFIND** as an optional transport primitive
+   (`_list_remote_tree_fast`, default `None` = "walk as before"). Nextcloud
+   gates the feature behind `dav.propfind.depth_infinity`; any non-207 flips a
+   per-instance flag and the per-directory walk takes over permanently, so an
+   unsupported server pays one probe, once. Plus parallel stat batches and a
+   bulk `list_files_with_sizes` on the virtual backend (one rclone spawn
+   instead of one per file).
+   → 59.3 s → 11.0 s.
+
+3. **Fingerprint excludes `resolved_config.resolved_at`.**
+   → warm reuse becomes *possible*.
+
+4. **Affinity grace (migration 0117).** Possible wasn't enough: both pods poll
+   at ~0.5 s, so the cold one won about half the races and paid a full attach.
+   `run_queue.last_leased_by` records the last holder; the general claim hides
+   a freshly queued unit from everyone else for `AFFINITY_GRACE_SECONDS` (2 s).
+   The executor also refuses poll backoff while warm, so it is always in the
+   fast cadence to spend its head start, and drops a warm session after 300 s
+   idle so a pod doesn't hold clients for a thread nobody is using.
+   → warm turns 3.0 s, `attach=0.00s`, three consecutive turns on one pod.
+
+   Two failover rules fell out of writing the tests, and both are now in the
+   SQL: **release** and **reaper steal** clear `last_leased_by`. A pod that
+   said it cannot serve, or that missed its heartbeats, must not make every
+   other pod wait out a grace window before taking over.
+
+5. **Scoped metadata index on the virtual backend.** Every metadata probe there
+   is an rclone process spawn. `begin_read_cache()` / `end_read_cache()` build
+   a key→size map in one op and serve `is_file`/`is_dir`/`list_dir`/`walk`/
+   `stat` from it. Deliberately **not ambient**: setup opens it and a `finally`
+   closes it, so tool work never reads through a cache and no caller has to
+   reason about staleness. Local mutations update the map in place (the backend
+   knows exactly which keys moved), so it stays exact inside the scope. Also
+   made `mkdir` skip re-writing markers that already exist — scaffolding
+   recreates the same directories every attach, 9 spawns for nothing.
+   → cold attach 7.4 s → 2.2 s; cold turn 5.4 s.
+
+## Drain-in-lease: designed, measured, not built
+
+The user's second idea — let the pod answer several queued messages under one
+lease instead of releasing and re-claiming. With affinity working, `burst.sh 3`
+drains 3 messages on one pod in 11 s, every turn `mode=reuse` with
+`attach=0.00s`, FIFO preserved. The executor re-claims *immediately* after
+completing (the loop only sleeps when the queue is empty), so the sole cost
+drain-in-lease removes is the claim-bundle fetch: **0.05–0.09 s of a ~2.9 s
+turn**. A second completion path through the exactly-once core is not worth
+2–3 %. Recorded rather than discarded — S3's worker batches face the same
+question with a very different ratio.
+
+## Fault matrix re-verified (the claim SQL changed, so the proofs had to be redone)
+
+* Pod force-deleted mid-turn → reaper steal at **t+97 s** (TTL 60 + grace 30 +
+  tick, inside the ≤105 s bound) → answer regenerated **exactly once** →
+  `events_epoch` +1 → `last_leased_by` NULL after the steal → attempts reset to
+  0 on completion.
+* An accidental fault gave a free extra test: a partially-built image (see
+  below) made attach raise on every claim. The unit released, backed off
+  linearly, retried 13 times without ever double-answering, and completed
+  cleanly the moment the fix landed — the release/backoff/retry path working on
+  a real bug rather than an injected one.
+* `kill -9 1` inside the container **does nothing** — a container PID 1 with no
+  handler is protected from in-namespace fatal signals. Use
+  `kubectl delete pod --force --grace-period=0` (or the cgroup freezer, as in
+  session 1). Both sessions independently rediscovered this; it is now a comment
+  in `kill_test.sh`.
+
+## Traps hit (both already in memory, both hit anyway)
+
+* **Tilt builds partial edits.** Twice a build was triggered mid-edit and
+  produced an image with a call site but not its method definition
+  (`'PersistentSession' object has no attribute '_end_backend_read_cache'`),
+  and once with only 2 of 4 log markers. `updateStatus: ok` is not evidence.
+  The reliable check is `kubectl exec <pod> -- grep -c <marker> <file>` on
+  **every** running pod before trusting a measurement.
+* **admin-cli `id_token` expiry** (~15 min) shows up as a silent 401 and a turn
+  that never appears. `drive_turn.sh` mints one per run.
+
+## Test posture
+
+* `tests/test_run_queue.py` now applies **0115 + 0117** (the harness applied one
+  migration file; a column the SQL contract depends on could have passed here
+  and failed on a real cluster). 8 new affinity tests → **81 real-PG tests**.
+* `tests/test_virtual_workspace_backend.py` gained 11 scoped-index tests: the
+  index must be invisible (identical answers to the uncached backend), exact
+  across local mutations, gone when the scope closes, and prefix-isolated —
+  plus an op-counting store proving 30 probes cost one listing and zero heads.
+* Two pre-existing run_queue tests changed behavior legitimately (a *different*
+  pod claiming immediately after a completion is now graced). Both were updated
+  to opt out of the grace with a comment pointing at `TestAffinityGrace`, rather
+  than weakening the new contract to keep them green.
+
+## Follow-ups this session leaves
+
+1. The remaining 13 setup store ops: 3 reads + 3 writes + 3 deletes + 4 listings.
+   Worth one more look at what is being deleted and rewritten every attach.
+2. `AFFINITY_GRACE_SECONDS` is a constant; if pods ever poll on a different
+   cadence it should derive from the poll interval.
+3. The warm-session TTL (300 s) is unmeasured — no data yet on how often a
+   session is re-claimed after >5 min idle.
+4. Session 1's follow-ups still stand: provisioning gate, cockpit `/prepare`
+   compat, live cross-tenant scrub probe, interrupt-on-lane (currently 501).
