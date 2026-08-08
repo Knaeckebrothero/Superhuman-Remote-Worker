@@ -12,6 +12,8 @@ import {
   readConfigPath,
   pinResolvedValue,
   SettingsMode,
+  TierReachability,
+  WORKSPACE_BACKENDS,
 } from './agent-settings.types';
 import {PinOnInteractDirective} from './pin-on-interact.directive';
 import {allowedEnumOptions} from './capability-gates';
@@ -78,9 +80,43 @@ import type {GrantCatalog} from '../../core/models/api.model';
         </div>
       }
 
-      <!-- Workspace backend (jobs + session creation). A running session's
-           backend is fixed at provisioning time, so live mode does not offer
-           it — same reason Advanced is hidden there. -->
+      <!-- Workspace backend. In job/session creation this is an ordinary
+           setting. On a live session it is a launcher for the upgrade verb,
+           not a setting: it always displays the running tier, unreachable
+           tiers carry their reason, and picking one emits intent for the host
+           to confirm and dispatch. -->
+      @if (mode() === 'live' && liveTier()) {
+        <div class="field-row">
+          <label class="field-label">{{ 'agentSettings.execution.workspaceBackend' | transloco }}</label>
+          @if (anyTierReachable()) {
+            <div class="field-control">
+              <select
+                class="form-input"
+                (change)="onLiveTierPick($event)"
+                [disabled]="disabled() || upgradeInProgress() !== null"
+              >
+                @for (t of liveTierOptions(); track t.value) {
+                  <option [value]="t.value" [disabled]="t.disabled" [selected]="t.value === liveTier()">{{ t.label }}</option>
+                }
+              </select>
+            </div>
+          } @else {
+            <!-- Nothing is reachable (a none-tier session): a select whose
+                 every option is refused is worse than no select. -->
+            <span class="static-value">{{ currentTierLabel() }}</span>
+          }
+          @if (upgradeInProgress(); as prog) {
+            <span class="field-hint upgrading">
+              <span class="progress-spinner"></span>
+              {{ 'agentSettings.execution.tierUpgrading' | transloco:{ tier: tierLabel(prog.tier) } }}
+              @if (prog.elapsed) { ({{ prog.elapsed }}s) }
+            </span>
+          } @else {
+            <span class="field-hint">{{ 'agentSettings.execution.tierHint' | transloco }}</span>
+          }
+        </div>
+      }
+
       @if (mode() !== 'live') {
         <div class="field-row" [class.modified]="workspaceBackend() !== null">
           <label class="field-label">{{ 'agentSettings.execution.workspaceBackend' | transloco }}</label>
@@ -92,12 +128,11 @@ import type {GrantCatalog} from '../../core/models/api.model';
               (ngModelChange)="onWorkspaceBackendChange($event)"
               [disabled]="disabled()"
             >
-              <option value="sandbox">{{ 'advanced.options.container' | transloco }}</option>
-              @if (canUseVm()) {
-                <option value="vm">{{ 'advanced.options.vmQemu' | transloco }}</option>
+              @for (b of workspaceBackends; track b.value) {
+                @if (b.value !== 'vm' || canUseVm()) {
+                  <option [value]="b.value">{{ 'advanced.options.' + b.i18nKey | transloco }}</option>
+                }
               }
-              <option value="virtual">{{ 'advanced.options.virtual' | transloco }}</option>
-              <option value="none">{{ 'advanced.options.none' | transloco }}</option>
             </select>
             @if (workspaceBackend() !== null) {
               <button type="button" class="reset-btn" (click)="resetWorkspaceBackend()" [title]="'agentSettings.common.resetToDefault' | transloco">
@@ -332,6 +367,27 @@ import type {GrantCatalog} from '../../core/models/api.model';
       color: var(--text-muted);
       margin-top: 2px;
     }
+    .static-value {
+      display: block;
+      font-size: 13px;
+      font-weight: 500;
+      color: var(--text-primary, var(--text-primary));
+    }
+    .field-hint.upgrading {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .progress-spinner {
+      width: 10px;
+      height: 10px;
+      border: 2px solid var(--border-color);
+      border-top-color: var(--accent-color);
+      border-radius: 50%;
+      animation: execution-group-spin 0.8s linear infinite;
+      flex-shrink: 0;
+    }
+    @keyframes execution-group-spin { to { transform: rotate(360deg); } }
   `],
 })
 export class ExecutionGroupComponent {
@@ -344,7 +400,11 @@ export class ExecutionGroupComponent {
   constructor() {
     // Snap ineligible users off 'vm' so the form can't submit a denied backend.
     // The server is authoritative — this is a UX safeguard.
+    //
+    // Creation forms only: a live session already running on a VM is a fact,
+    // not a proposal, and the form has no business second-guessing it.
     effect(() => {
+      if (this.mode() === 'live') return;
       if (this.canUseVm()) return;
       if (this.effectiveBackend() === 'vm') {
         this.workspaceBackend.set('sandbox');
@@ -364,7 +424,20 @@ export class ExecutionGroupComponent {
   /** Capability catalog (supplies the enum `order` for ceiling filtering). */
   catalog = input<GrantCatalog>({});
 
+  // --- Live-session workspace tier (live mode only) ---
+  /** The running session's tier. Null outside live mode, or before it is
+   *  known — the row hides rather than guessing. */
+  liveTier = input<string | null>(null);
+  /** Per-tier reachability, decided by the host. Absent entries read as
+   *  `unsupported`. */
+  tierReachability = input<Record<string, TierReachability>>({});
+  /** Non-null while an upgrade is running, which disables the control. */
+  upgradeInProgress = input<{tier: string; elapsed?: number} | null>(null);
+
   change = output<void>();
+  /** A live tier the user picked. Intent only — the host confirms and
+   *  dispatches the upgrade verb; this component never mutates tier state. */
+  tierChangeRequested = output<string>();
 
   // Constants
   readonly autonomyLevels = AUTONOMY_LEVELS;
@@ -409,6 +482,52 @@ export class ExecutionGroupComponent {
   readonly projectMemory = signal<boolean | null>(null);
   readonly imageQuality = signal<string | null>(null);
   readonly workspaceBackend = signal<string | null>(null);
+  readonly workspaceBackends = WORKSPACE_BACKENDS;
+
+  /** Label for a tier, from the shared `advanced.options.*` vocabulary. An
+   *  unrecognised tier renders its raw value rather than vanishing — better a
+   *  bare string than silently re-labelling the session as something else. */
+  tierLabel(tier: string): string {
+    this.activeLang();
+    const known = WORKSPACE_BACKENDS.find((b) => b.value === tier);
+    return known ? this.transloco.translate(`advanced.options.${known.i18nKey}`) : tier;
+  }
+
+  readonly currentTierLabel = computed(() => this.tierLabel(this.liveTier() ?? ''));
+
+  /** Reachability of a tier from the running one. Anything the host did not
+   *  speak to is refused — fail closed, the server gates this anyway. */
+  private tierState(tier: string): TierReachability {
+    if (tier === this.liveTier()) return 'current';
+    return this.tierReachability()[tier] ?? 'unsupported';
+  }
+
+  /** Every tier, each carrying its own reason when it cannot be picked. */
+  readonly liveTierOptions = computed(() => {
+    this.activeLang();
+    const current = this.liveTier();
+    const values: string[] = WORKSPACE_BACKENDS.map((b) => b.value);
+    if (current && !values.includes(current)) values.unshift(current);
+    return values.map((value) => {
+      const state = this.tierState(value);
+      const base = this.tierLabel(value);
+      const suffix =
+        state === 'current' ? this.transloco.translate('agentSettings.execution.tierCurrent')
+        : state === 'ok' ? ''
+        : this.transloco.translate(`agentSettings.execution.tierUnreachable.${state}`);
+      return {
+        value,
+        label: suffix ? `${base} — ${suffix}` : base,
+        // The running tier stays selectable: it is what the select displays.
+        disabled: state !== 'ok' && state !== 'current',
+      };
+    });
+  });
+
+  /** False when every tier is refused (a `none` session today). */
+  readonly anyTierReachable = computed(() =>
+    this.liveTierOptions().some((t) => !t.disabled && t.value !== this.liveTier()),
+  );
 
   /** Whether the current user is allowed to pick the VM backend. Admins always qualify. */
   readonly canUseVm = computed(() => {
@@ -564,6 +683,18 @@ export class ExecutionGroupComponent {
     this.change.emit();
   }
 
+  /** Live mode: a pick is a request, not a value.
+   *
+   *  The select displays the running tier and never holds a pending one — it
+   *  snaps straight back, so a cancelled confirmation leaves nothing stale and
+   *  a successful upgrade moves the row by changing `liveTier`. */
+  onLiveTierPick(event: Event): void {
+    const el = event.target as HTMLSelectElement;
+    const picked = el.value;
+    el.value = this.liveTier() ?? '';
+    if (picked && picked !== this.liveTier()) this.tierChangeRequested.emit(picked);
+  }
+
   resetCritic(): void {
     this.critic.set(null);
     this.criticRounds.set(null);
@@ -602,7 +733,13 @@ export class ExecutionGroupComponent {
     // Workspace backend. The rest of the `workspace` fragment (VM sizing, file
     // limits, git versioning) stays in the Advanced accordion; the host deep-
     // merges the two halves.
-    if (this.workspaceBackend() !== null) o['workspace'] = {backend: this.workspaceBackend()};
+    //
+    // Never in live mode: there the tier moves through the upgrade verb, and
+    // letting it ride the pane's debounced config.update would be a second,
+    // silent writer of the same fact.
+    if (this.mode() !== 'live' && this.workspaceBackend() !== null) {
+      o['workspace'] = {backend: this.workspaceBackend()};
+    }
 
     return o;
   }
