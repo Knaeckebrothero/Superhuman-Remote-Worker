@@ -487,6 +487,56 @@ export function pickRewindCandidates(turns: readonly Turn[], outboxIds: Readonly
     return users.reverse();
 }
 
+/** Show the picker's filter input only when the list is long enough that
+ *  scanning beats scrolling; short sessions keep the plain hint line. */
+export const REWIND_FILTER_MIN_CANDIDATES = 6;
+
+/** Case-insensitive substring filter over picker candidates. An empty or
+ *  whitespace query keeps everything. */
+export function filterRewindCandidates(candidates: readonly UserTurn[], query: string): UserTurn[] {
+    const q = query.trim().toLowerCase();
+    if (!q) return [...candidates];
+    return candidates.filter((t) => t.content.toLowerCase().includes(q));
+}
+
+/**
+ * Date-aware timestamp for the rewind surfaces. Sessions span days, so a bare
+ * clock time ("19:08") is ambiguous there: today stays time-only, yesterday is
+ * labeled (caller passes the localized word), older dates get a short
+ * localized date — with the year only once it differs.
+ */
+export function formatRewindStamp(ts: number, now: number, locale: string, yesterdayLabel: string): string {
+    const d = new Date(ts);
+    const n = new Date(now);
+    const hm = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+    const sameDay = (a: Date, b: Date) =>
+        a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth() && a.getDate() === b.getDate();
+    if (sameDay(d, n)) return hm;
+    const yesterday = new Date(n);
+    yesterday.setDate(n.getDate() - 1);
+    if (sameDay(d, yesterday)) return `${yesterdayLabel} ${hm}`;
+    const opts: Intl.DateTimeFormatOptions = {month: 'short', day: 'numeric'};
+    if (d.getFullYear() !== n.getFullYear()) opts.year = 'numeric';
+    return `${new Intl.DateTimeFormat(locale || undefined, opts).format(d)}, ${hm}`;
+}
+
+/**
+ * How many visible messages (user + assistant turns; system lines and
+ * compaction markers don't read as "messages") come after the target — what a
+ * conversation rewind hides besides returning the target prompt itself to the
+ * composer. -1 when the target isn't in the loaded window.
+ */
+export function countTurnsAfter(turns: readonly Turn[], targetId: string): number {
+    const at = turns.findIndex((t) => t.id === targetId);
+    if (at === -1) return -1;
+    let count = 0;
+    for (let i = at + 1; i < turns.length; i++) {
+        const kind = turns[i].kind;
+        if (kind === 'user' || kind === 'assistant') count++;
+    }
+    return count;
+}
+
 /**
  * Decide whether the IDE button should open code-server, and to which URL.
  * Returns the code-server URL only when the workspace is active; null
@@ -2013,17 +2063,34 @@ export function clearDraft(threadId: string | null): void {
         [open]="rewindPickerOpen()"
         (closed)="closeRewindPicker()"
         [title]="'chat.rewind.pickerTitle' | transloco"
-        size="sm">
+        size="md">
         @if (rewindCandidates().length === 0) {
           <p class="rewind-picker-empty">{{ 'chat.rewind.pickerEmpty' | transloco }}</p>
         } @else {
-          <p class="rewind-picker-hint">{{ 'chat.rewind.pickerHint' | transloco }}</p>
-          <div class="rewind-picker-list">
-            @for (turn of rewindCandidates(); track turn.id) {
-              <button type="button" class="rewind-picker-item" (click)="pickRewindTarget(turn)">
-                <span class="rewind-picker-time">{{ formatTime(turn.timestamp) }}</span>
-                <span class="rewind-picker-text">{{ turn.content }}</span>
-              </button>
+          <div class="rewind-picker" (keydown)="onRewindPickerKeydown($event)">
+            @if (rewindCandidates().length >= rewindFilterMin) {
+              <input
+                class="rewind-picker-filter"
+                type="text"
+                [placeholder]="'chat.rewind.pickerFilter' | transloco"
+                [attr.aria-label]="'chat.rewind.pickerFilter' | transloco"
+                (input)="rewindPickerQuery.set($any($event.target).value)" />
+            } @else {
+              <p class="rewind-picker-hint">{{ 'chat.rewind.pickerHint' | transloco }}</p>
+            }
+            @if (filteredRewindCandidates().length === 0) {
+              <p class="rewind-picker-empty">{{ 'chat.rewind.pickerNoMatches' | transloco }}</p>
+            } @else {
+              <div class="rewind-picker-list">
+                @for (turn of filteredRewindCandidates(); track turn.id) {
+                  <button type="button" class="rewind-picker-item"
+                          [title]="turn.content"
+                          (click)="pickRewindTarget(turn)">
+                    <span class="rewind-picker-time">{{ rewindStamp(turn.timestamp) }}</span>
+                    <span class="rewind-picker-text">{{ turn.content }}</span>
+                  </button>
+                }
+              </div>
             }
           </div>
         }
@@ -2039,8 +2106,14 @@ export function clearDraft(threadId: string | null): void {
         [open]="rewindTarget() !== null"
         (closed)="closeRewindSheet()"
         [title]="'chat.rewind.title' | transloco"
-        size="sm">
+        size="md">
         <p class="rewind-quote">"{{ rewindQuote() }}"</p>
+        <p class="rewind-target-meta">
+          {{ rewindTargetStamp() }}
+          @if (rewindHiddenCount() > 0) {
+            <span> · {{ (rewindHiddenCount() === 1 ? 'chat.rewind.hidesOne' : 'chat.rewind.hidesMany') | transloco: {count: rewindHiddenCount()} }}</span>
+          }
+        </p>
         <div class="rewind-options">
           <button type="button" class="rewind-option"
                   [disabled]="chat.rewindInFlight()"
@@ -2080,6 +2153,7 @@ export function clearDraft(threadId: string | null): void {
             </span>
           </button>
         </div>
+        <p class="rewind-caveat">{{ 'chat.rewind.refillHint' | transloco }}</p>
         <p class="rewind-caveat">{{ 'chat.rewind.caveat' | transloco }}</p>
         <ng-container appDialogActions>
           <app-button variant="ghost" size="sm" (clicked)="closeRewindSheet()">
@@ -3358,12 +3432,27 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
      *  the inline hover button: only historical turns that aren't still in
      *  the send outbox can anchor a rewind. */
     readonly rewindPickerOpen = signal(false);
+    readonly rewindPickerQuery = signal('');
+    readonly rewindFilterMin = REWIND_FILTER_MIN_CANDIDATES;
 
     readonly rewindCandidates = computed<UserTurn[]>(() =>
         pickRewindCandidates(this.chat.visibleTurns(), this.chat.outboxIds()));
 
+    readonly filteredRewindCandidates = computed<UserTurn[]>(() =>
+        filterRewindCandidates(this.rewindCandidates(), this.rewindPickerQuery()));
+
     openRewindPicker(): void {
+        this.rewindPickerQuery.set('');
         this.rewindPickerOpen.set(true);
+        // The dialog's focus trap auto-captures onto its close button; move
+        // initial focus where the interaction starts — the filter when it's
+        // shown, the newest prompt otherwise. Delayed so it runs after the
+        // trap's own deferred capture.
+        setTimeout(() => {
+            document
+                .querySelector<HTMLElement>('.rewind-picker-filter, .rewind-picker-item')
+                ?.focus();
+        }, 50);
     }
 
     closeRewindPicker(): void {
@@ -3373,6 +3462,51 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     pickRewindTarget(turn: UserTurn): void {
         this.rewindPickerOpen.set(false);
         this.openRewindSheet(turn);
+    }
+
+    /** Arrow-key navigation across picker rows; ArrowDown from the filter
+     *  input drops into the list. Enter activates the focused row natively. */
+    onRewindPickerKeydown(event: KeyboardEvent): void {
+        const key = event.key;
+        if (key !== 'ArrowDown' && key !== 'ArrowUp' && key !== 'Home' && key !== 'End') return;
+        const items = Array.from(document.querySelectorAll<HTMLElement>('.rewind-picker-item'));
+        if (items.length === 0) return;
+        const active = document.activeElement as HTMLElement | null;
+        // Leave Home/End alone inside the filter input — they mean caret jumps there.
+        const inFilter = active?.classList.contains('rewind-picker-filter') ?? false;
+        if (inFilter && (key === 'Home' || key === 'End')) return;
+        event.preventDefault();
+        const idx = active ? items.indexOf(active) : -1;
+        let next: number;
+        if (key === 'Home') next = 0;
+        else if (key === 'End') next = items.length - 1;
+        else if (idx === -1) next = key === 'ArrowDown' ? 0 : items.length - 1;
+        else next = Math.min(items.length - 1, Math.max(0, idx + (key === 'ArrowDown' ? 1 : -1)));
+        items[next]?.focus();
+        items[next]?.scrollIntoView({block: 'nearest'});
+    }
+
+    rewindStamp(ts: number): string {
+        return formatRewindStamp(
+            ts,
+            Date.now(),
+            this.transloco.getActiveLang(),
+            this.transloco.translate('chat.rewind.yesterday'),
+        );
+    }
+
+    /** Meta line under the action-sheet quote: when the target was sent, and
+     *  how many later messages a conversation rewind hides (omitted at 0 —
+     *  "hides 0 messages" reads worse than saying nothing). */
+    rewindTargetStamp(): string {
+        const target = this.rewindTarget();
+        return target ? this.rewindStamp(target.timestamp) : '';
+    }
+
+    rewindHiddenCount(): number {
+        const target = this.rewindTarget();
+        if (!target) return 0;
+        return Math.max(0, countTurnsAfter(this.chat.visibleTurns(), target.id));
     }
 
     confirmRewind(mode: 'both' | 'conversation' | 'code'): void {

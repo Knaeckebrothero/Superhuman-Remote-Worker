@@ -6,9 +6,12 @@ import {
     clearDraft,
     cloudBadgeVisible,
     composeDenyPrefill,
+    countTurnsAfter,
     draftKey,
     extractClipboardFiles,
+    filterRewindCandidates,
     formatPermissionArgs,
+    formatRewindStamp,
     HEADER_FOLD_HYSTERESIS_PX,
     HEADER_LEFT_RESERVE_PX,
     isMicMode,
@@ -790,5 +793,79 @@ describe('pickRewindCandidates', () => {
 
     it('returns empty for an empty transcript', () => {
         expect(pickRewindCandidates([], new Set())).toEqual([]);
+    });
+});
+
+describe('filterRewindCandidates', () => {
+    const turn = (id: string, content: string): UserTurn =>
+        ({kind: 'user', id, content, timestamp: 0, historical: true});
+    const all = [turn('u1', 'Fix the login bug'), turn('u2', 'write STORY.txt'), turn('u3', 'deploy it')];
+
+    it('keeps everything on an empty or whitespace query', () => {
+        expect(filterRewindCandidates(all, '')).toEqual(all);
+        expect(filterRewindCandidates(all, '   ')).toEqual(all);
+    });
+
+    it('matches substrings case-insensitively', () => {
+        expect(filterRewindCandidates(all, 'story').map((t) => t.id)).toEqual(['u2']);
+        expect(filterRewindCandidates(all, 'THE LOGIN').map((t) => t.id)).toEqual(['u1']);
+    });
+
+    it('returns empty when nothing matches', () => {
+        expect(filterRewindCandidates(all, 'zebra')).toEqual([]);
+    });
+});
+
+describe('formatRewindStamp', () => {
+    const at = (y: number, mo: number, d: number, h: number, mi: number) =>
+        new Date(y, mo, d, h, mi).getTime();
+
+    it('stays time-only for a same-day message', () => {
+        expect(formatRewindStamp(at(2026, 7, 8, 19, 8), at(2026, 7, 8, 22, 0), 'en', 'Yesterday')).toBe('19:08');
+    });
+
+    it('labels yesterday with the localized word', () => {
+        expect(formatRewindStamp(at(2026, 7, 7, 19, 8), at(2026, 7, 8, 22, 0), 'en', 'Yesterday')).toBe('Yesterday 19:08');
+    });
+
+    it('handles yesterday across a month boundary', () => {
+        expect(formatRewindStamp(at(2026, 6, 31, 9, 0), at(2026, 7, 1, 12, 0), 'en', 'Yesterday')).toBe('Yesterday 09:00');
+    });
+
+    it('handles yesterday across a year boundary', () => {
+        expect(formatRewindStamp(at(2025, 11, 31, 10, 0), at(2026, 0, 1, 9, 0), 'en', 'Yesterday')).toBe('Yesterday 10:00');
+    });
+
+    it('shows a short date without the year within the same year', () => {
+        const s = formatRewindStamp(at(2026, 0, 15, 9, 30), at(2026, 7, 8, 12, 0), 'en', 'Yesterday');
+        expect(s).toContain('Jan');
+        expect(s).toContain('09:30');
+        expect(s).not.toContain('2026');
+    });
+
+    it('adds the year once it differs', () => {
+        const s = formatRewindStamp(at(2025, 10, 3, 14, 5), at(2026, 7, 8, 12, 0), 'en', 'Yesterday');
+        expect(s).toContain('2025');
+        expect(s).toContain('14:05');
+    });
+});
+
+describe('countTurnsAfter', () => {
+    const user = (id: string): Turn => ({kind: 'user', id, content: '', timestamp: 0, historical: true});
+    const assistant = (id: string): Turn =>
+        ({kind: 'assistant', id, events: [], status: 'complete', startedAt: 0} as Turn);
+    const system = (id: string): Turn => ({kind: 'system', id} as unknown as Turn);
+
+    it('counts user and assistant turns after the target, skipping system lines', () => {
+        const turns = [user('u1'), assistant('a1'), system('s1'), user('u2'), assistant('a2')];
+        expect(countTurnsAfter(turns, 'u1')).toBe(3);
+    });
+
+    it('returns 0 when the target is the last turn', () => {
+        expect(countTurnsAfter([user('u1'), user('u2')], 'u2')).toBe(0);
+    });
+
+    it('returns -1 when the target is not in the loaded window', () => {
+        expect(countTurnsAfter([user('u1')], 'nope')).toBe(-1);
     });
 });

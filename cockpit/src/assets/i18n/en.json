@@ -1388,7 +1388,13 @@
       "summarizeDesc": "Compact everything up to this point into a summary",
       "pickerTitle": "Rewind to…",
       "pickerHint": "Pick a message to rewind to:",
-      "pickerEmpty": "No previous messages to rewind to yet."
+      "pickerEmpty": "No previous messages to rewind to yet.",
+      "pickerFilter": "Type to filter messages…",
+      "pickerNoMatches": "No messages match.",
+      "yesterday": "Yesterday",
+      "hidesOne": "hides 1 later message",
+      "hidesMany": "hides {{count}} later messages",
+      "refillHint": "Your message returns to the composer so you can edit and resend it."
     },
     "diff": {
       "replace": "Diff",

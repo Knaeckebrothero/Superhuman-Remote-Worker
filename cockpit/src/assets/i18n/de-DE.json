@@ -1388,7 +1388,13 @@
       "summarizeDesc": "Alles bis zu diesem Punkt zu einer Zusammenfassung verdichten",
       "pickerTitle": "Zurückspulen zu …",
       "pickerHint": "Nachricht auswählen, zu der zurückgespult werden soll:",
-      "pickerEmpty": "Noch keine früheren Nachrichten zum Zurückspulen."
+      "pickerEmpty": "Noch keine früheren Nachrichten zum Zurückspulen.",
+      "pickerFilter": "Tippen, um Nachrichten zu filtern …",
+      "pickerNoMatches": "Keine Nachrichten passen.",
+      "yesterday": "Gestern",
+      "hidesOne": "blendet 1 spätere Nachricht aus",
+      "hidesMany": "blendet {{count}} spätere Nachrichten aus",
+      "refillHint": "Die Nachricht kehrt zum Bearbeiten in das Eingabefeld zurück."
     },
     "diff": {
       "replace": "Diff",
