@@ -55,11 +55,15 @@ fixed *and* verified on a deployment — the closest sibling,
 [[session_tool_group_checkbox_disagrees_with_the_agent]], names its commit, its
 `sha-*` image and the dev session it was live-verified on — and none of this is
 pushed, so `develop` is not what any deployment is running.
-Two of the four also have genuinely open content on their own terms:
-[[registered_tools_no_config_can_grant]] items 1/2/5 are unshipped, and
-[[session_uploads_never_extract_archives]] has no live gate at all. The move to
-`docs/done/` is a single commit once dev is running this code and the gates
-re-pass there.
+One of the four still has genuinely open content on its own terms:
+[[registered_tools_no_config_can_grant]] items 1/2/5 are unshipped.
+
+~~[[session_uploads_never_extract_archives]] has no live gate at all.~~ **Closed
+2026-08-08:** it has moved to `docs/done/`, and the owner confirmed on dev that an
+uploaded `.zip` extracts automatically. That was the **motivating incident** of
+this entire series — session `1930dec9`, an agent that could not open an attached
+archive and had no shell to fall back on — so the series' first defect is now the
+last one verified, and verified by use rather than by a harness.
 
 - Gate evidence, with the numbers: [[tool_configuration_live_gates_2026-08-03]]
 - Everything triaged as deferred, plus what was settled and must not be
