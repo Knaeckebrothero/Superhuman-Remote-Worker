@@ -160,7 +160,7 @@ export interface ToolCallInfo {
     tool: string;
     args: Record<string, unknown>;
     result?: string;
-    status: 'pending' | 'running' | 'completed' | 'denied' | 'error';
+    status: 'pending' | 'running' | 'completed' | 'denied' | 'error' | 'expired';
     /** Tool category from the registry (e.g. workspace, git, research). */
     category?: string;
     /**
@@ -168,7 +168,7 @@ export interface ToolCallInfo {
      * gate. Persisted on the backend so it survives history reload.
      * Absent for autonomous / auto-accepted calls.
      */
-    decision?: 'approved' | 'denied';
+    decision?: 'approved' | 'denied' | 'expired';
 }
 
 /**
@@ -3325,8 +3325,18 @@ export class PersistentChatService {
                 // an already-decided approval card, whose re-click then
                 // 409'd (session_silent_failure_audit.md #10).
                 const resolvedId = (params['id'] as string) || '';
+                // Three-way, deliberately not a boolean: the backend
+                // sweeps un-reached gates as 'expired' (and 'interrupted' on
+                // Stop). Neither is a refusal — reporting them as 'denied'
+                // recreates the fabricated-denial bug in the UI. See
+                // docs/issues/supervised_parallel_gates_timeout_fabricates_denial.md
+                const rawDecision = params['decision'];
                 const decision =
-                    params['decision'] === 'approved' ? 'approved' : 'denied';
+                    rawDecision === 'approved'
+                        ? 'approved'
+                        : rawDecision === 'denied'
+                          ? 'denied'
+                          : ('expired' as const);
                 this.pendingPermissions.update((list) =>
                     list.filter((p) => p.id !== resolvedId),
                 );
@@ -4227,7 +4237,7 @@ interface HistoryMessage {
      * for unknown/renamed tools, in which case the folded-chip summary buckets
      * the call as "other".
      */
-    tool_calls: { name: string; args: Record<string, unknown>; id: string; decision?: 'approved' | 'denied'; category?: string }[] | null;
+    tool_calls: { name: string; args: Record<string, unknown>; id: string; decision?: 'approved' | 'denied' | 'expired'; category?: string }[] | null;
     turn_number: number | null;
     /** Set only on role='tool' rows — points to the AI message's tool_calls[].id. */
     tool_call_id?: string | null;
