@@ -340,7 +340,7 @@ the extract fails. The IDE **browse** path (`_extract_snapshot_to_k8s_pod`) keep
 policy and is deliberately NOT used by any reclaim/resume path; the best-effort IDE-*start* VM caller
 (`ide_session.py:580`) intentionally ignores the new `bool`.
 
-**C1b (capture-side `pipefail` + honest capture accept) — NOT YET IMPLEMENTED; spec corrected here.** The
+**C1b (capture-side honest capture accept) — DONE (commits `2f747a5f` + `2761d9bd`, 2026-08-08); the corrected rule below is what shipped.** The
 remote pipelines have **no `set -o pipefail`**, so a failing `tar`/`zstd` upstream is masked by the
 downstream stage's `0` (capture `tar_cmd` `snapshot_service.py:460-464`, accept gate `:525` currently fails
 only when `rc≠0 AND bytes==0`; extract `EXTRACT_REMOTE_CMD` `ssh_helpers.py:79`, `EXTRACT_HOME_REMOTE_CMD`
