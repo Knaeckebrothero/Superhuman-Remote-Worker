@@ -102,6 +102,7 @@ const SLASH_COMMANDS: SlashCommand[] = [
     {command: '/compact', descriptionKey: 'chat.slash.compact'},
     {command: '/done', descriptionKey: 'chat.slash.done'},
     {command: '/undo', descriptionKey: 'chat.slash.undo'},
+    {command: '/rewind', descriptionKey: 'chat.slash.rewind'},
     {command: '/auto', descriptionKey: 'chat.slash.auto'},
     {command: '/supervised', descriptionKey: 'chat.slash.supervised'},
     {command: '/autonomous', descriptionKey: 'chat.slash.autonomous'},
@@ -462,6 +463,28 @@ export function pickWorkspaceOfferCard(
  */
 export function composeDenyPrefill(existingText: string, starter: string): string {
     return existingText.trim().length > 0 ? existingText : starter;
+}
+
+/** True when the composer text is the /rewind command (any casing, with or
+ *  without trailing arguments — arguments are ignored, the picker decides). */
+export function isRewindCommand(text: string): boolean {
+    return text.toLowerCase().split(/\s+/)[0] === '/rewind';
+}
+
+/**
+ * User turns eligible as rewind targets, newest first — the /rewind picker's
+ * list. Same gate as the inline hover button: only historical turns (already
+ * persisted server-side) that are not still queued in the send outbox can
+ * anchor a rewind.
+ */
+export function pickRewindCandidates(turns: readonly Turn[], outboxIds: ReadonlySet<string>): UserTurn[] {
+    const users: UserTurn[] = [];
+    for (const turn of turns) {
+        if (turn.kind === 'user' && turn.historical && !outboxIds.has(turn.id)) {
+            users.push(turn);
+        }
+    }
+    return users.reverse();
 }
 
 /**
@@ -1985,6 +2008,32 @@ export function clearDraft(threadId: string | null): void {
         }
       </app-dialog>
 
+      <!-- /rewind target picker -->
+      <app-dialog
+        [open]="rewindPickerOpen()"
+        (closed)="closeRewindPicker()"
+        [title]="'chat.rewind.pickerTitle' | transloco"
+        size="sm">
+        @if (rewindCandidates().length === 0) {
+          <p class="rewind-picker-empty">{{ 'chat.rewind.pickerEmpty' | transloco }}</p>
+        } @else {
+          <p class="rewind-picker-hint">{{ 'chat.rewind.pickerHint' | transloco }}</p>
+          <div class="rewind-picker-list">
+            @for (turn of rewindCandidates(); track turn.id) {
+              <button type="button" class="rewind-picker-item" (click)="pickRewindTarget(turn)">
+                <span class="rewind-picker-time">{{ formatTime(turn.timestamp) }}</span>
+                <span class="rewind-picker-text">{{ turn.content }}</span>
+              </button>
+            }
+          </div>
+        }
+        <ng-container appDialogActions>
+          <app-button variant="ghost" size="sm" (clicked)="closeRewindPicker()">
+            {{ 'common.cancel' | transloco }}
+          </app-button>
+        </ng-container>
+      </app-dialog>
+
       <!-- Rewind action dialog -->
       <app-dialog
         [open]="rewindTarget() !== null"
@@ -1992,28 +2041,47 @@ export function clearDraft(threadId: string | null): void {
         [title]="'chat.rewind.title' | transloco"
         size="sm">
         <p class="rewind-quote">"{{ rewindQuote() }}"</p>
-        <p>{{ 'chat.rewind.body' | transloco }}</p>
+        <div class="rewind-options">
+          <button type="button" class="rewind-option"
+                  [disabled]="chat.rewindInFlight()"
+                  (click)="confirmRewind('both')">
+            <app-icon size="sm" class="rewind-option-icon">history</app-icon>
+            <span class="rewind-option-text">
+              <span class="rewind-option-title">{{ 'chat.rewind.both' | transloco }}</span>
+              <span class="rewind-option-desc">{{ 'chat.rewind.bothDesc' | transloco }}</span>
+            </span>
+          </button>
+          <button type="button" class="rewind-option"
+                  [disabled]="chat.rewindInFlight()"
+                  (click)="confirmRewind('conversation')">
+            <app-icon size="sm" class="rewind-option-icon">chat_bubble</app-icon>
+            <span class="rewind-option-text">
+              <span class="rewind-option-title">{{ 'chat.rewind.conversation' | transloco }}</span>
+              <span class="rewind-option-desc">{{ 'chat.rewind.conversationDesc' | transloco }}</span>
+            </span>
+          </button>
+          <button type="button" class="rewind-option"
+                  [disabled]="chat.rewindInFlight()"
+                  (click)="confirmRewind('code')">
+            <app-icon size="sm" class="rewind-option-icon">folder</app-icon>
+            <span class="rewind-option-text">
+              <span class="rewind-option-title">{{ 'chat.rewind.code' | transloco }}</span>
+              <span class="rewind-option-desc">{{ 'chat.rewind.codeDesc' | transloco }}</span>
+            </span>
+          </button>
+        </div>
+        <div class="rewind-options rewind-options-secondary">
+          <button type="button" class="rewind-option"
+                  (click)="confirmSummarizeUpTo()">
+            <app-icon size="sm" class="rewind-option-icon">compress</app-icon>
+            <span class="rewind-option-text">
+              <span class="rewind-option-title">{{ 'chat.rewind.summarize' | transloco }}</span>
+              <span class="rewind-option-desc">{{ 'chat.rewind.summarizeDesc' | transloco }}</span>
+            </span>
+          </button>
+        </div>
         <p class="rewind-caveat">{{ 'chat.rewind.caveat' | transloco }}</p>
         <ng-container appDialogActions>
-          <app-button variant="warning" size="sm"
-                      [disabled]="chat.rewindInFlight()"
-                      (clicked)="confirmRewind('both')">
-            {{ 'chat.rewind.both' | transloco }}
-          </app-button>
-          <app-button variant="warning" size="sm"
-                      [disabled]="chat.rewindInFlight()"
-                      (clicked)="confirmRewind('conversation')">
-            {{ 'chat.rewind.conversation' | transloco }}
-          </app-button>
-          <app-button variant="info" size="sm"
-                      [disabled]="chat.rewindInFlight()"
-                      (clicked)="confirmRewind('code')">
-            {{ 'chat.rewind.code' | transloco }}
-          </app-button>
-          <app-button variant="info" size="sm"
-                      (clicked)="confirmSummarizeUpTo()">
-            {{ 'chat.rewind.summarize' | transloco }}
-          </app-button>
           <app-button variant="ghost" size="sm" (clicked)="closeRewindSheet()">
             {{ 'common.cancel' | transloco }}
           </app-button>
@@ -2834,6 +2902,14 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
 
         const threadId = this.chat.threadId();
         this.showSlashMenu.set(false);
+        // /rewind is pure UI — open the target picker instead of handing the
+        // text to the service, which would send it to the agent as chat.
+        if (isRewindCommand(text)) {
+            this.inputText = '';
+            clearDraft(threadId);
+            this.openRewindPicker();
+            return;
+        }
         // Mobile: dismiss the on-screen keyboard now the message is on its way,
         // so the reply renders into the reclaimed height. The keyboard collapse
         // grows .messages, which the ResizeObserver catches and re-pins
@@ -3276,6 +3352,27 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
 
     closeRewindSheet(): void {
         this.rewindTarget.set(null);
+    }
+
+    /** /rewind target picker (newest prompt first). Same eligibility gate as
+     *  the inline hover button: only historical turns that aren't still in
+     *  the send outbox can anchor a rewind. */
+    readonly rewindPickerOpen = signal(false);
+
+    readonly rewindCandidates = computed<UserTurn[]>(() =>
+        pickRewindCandidates(this.chat.visibleTurns(), this.chat.outboxIds()));
+
+    openRewindPicker(): void {
+        this.rewindPickerOpen.set(true);
+    }
+
+    closeRewindPicker(): void {
+        this.rewindPickerOpen.set(false);
+    }
+
+    pickRewindTarget(turn: UserTurn): void {
+        this.rewindPickerOpen.set(false);
+        this.openRewindSheet(turn);
     }
 
     confirmRewind(mode: 'both' | 'conversation' | 'code'): void {

@@ -1377,12 +1377,18 @@
     "rewind": {
       "button": "Rewind to here",
       "title": "Rewind session",
-      "body": "Go back to before this message? Messages after this point are hidden from the conversation (kept in the audit trail). Files return to their state at that point.",
       "caveat": "Commands with external effects (network calls, deployments) can't be undone.",
       "both": "Restore conversation and files",
+      "bothDesc": "Hide later messages and revert files to this point",
       "conversation": "Restore conversation only",
+      "conversationDesc": "Files keep their current state",
       "code": "Restore files only",
-      "summarize": "Summarize up to here"
+      "codeDesc": "The conversation stays intact",
+      "summarize": "Summarize up to here",
+      "summarizeDesc": "Compact everything up to this point into a summary",
+      "pickerTitle": "Rewind to…",
+      "pickerHint": "Pick a message to rewind to:",
+      "pickerEmpty": "No previous messages to rewind to yet."
     },
     "diff": {
       "replace": "Diff",
@@ -1623,6 +1629,7 @@
       "compact": "Compress conversation history to free up context",
       "done": "End session — extract memories and archive",
       "undo": "Undo file changes from the last turn",
+      "rewind": "Rewind to an earlier message",
       "auto": "Switch to auto-accept mode (approve all except shell)",
       "supervised": "Switch to supervised mode (approve all writes)",
       "autonomous": "Switch to autonomous mode (approve nothing)",
