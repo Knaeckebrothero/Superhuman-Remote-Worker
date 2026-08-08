@@ -191,7 +191,7 @@ def test_metering_credentials_select_short_properties_from_srw_secret_bundle():
         ]
 
 
-def test_development_metering_vault_sources_are_prewired_but_dark():
+def test_development_metering_vault_sources_project_collector_credentials_only():
     expected_path = "homelab/superhuman-remote-worker/srw-secrets"
     expected_properties = {
         "vmiIngestionProperty": "METERING_VMI_INGESTION_KEY",
@@ -217,9 +217,33 @@ def test_development_metering_vault_sources_are_prewired_but_dark():
 
     main_sync = main_values["infrastructureMetering"]["externalSecrets"]
     vm_sync = vm_fleet["helm"]["values"]["infrastructureMetering"]["externalSecrets"]
-    assert main_sync == {"enabled": False, "vaultPath": expected_path}
-    assert vm_sync == {"enabled": False, "vaultPath": expected_path}
+    assert main_sync == {"enabled": True, "vaultPath": expected_path}
+    assert vm_sync == {"enabled": True, "vaultPath": expected_path}
     assert main_values["externalSecrets"]["vaultPath"] == expected_path
+
+    expected_main_targets = {
+        "vmIngestionSecretName": "srw-infra-metering-vmi-ingestion",
+        "vmStorageIngestionSecretName": "srw-infra-metering-vm-storage-ingestion",
+        "volumeIdentitySecretName": "srw-infra-metering-volume-identity",
+        "volumeIdentityKeyVersion": "storage-v1",
+    }
+    expected_vm_targets = {
+        "ingestionSecretName": "srw-infra-metering-vmi-ingestion",
+        "storageIngestionSecretName": "srw-infra-metering-vm-storage-ingestion",
+        "volumeIdentitySecretName": "srw-infra-metering-volume-identity",
+        "volumeIdentityKeyVersion": "storage-v1",
+    }
+    assert {
+        key: main_values["infrastructureMetering"][key] for key in expected_main_targets
+    } == expected_main_targets
+    vm_metering = vm_fleet["helm"]["values"]["infrastructureMetering"]
+    assert {key: vm_metering[key] for key in expected_vm_targets} == expected_vm_targets
+    assert "vmLifecycleAuthSecretName" not in main_values["infrastructureMetering"]
+    assert (
+        not vm_fleet["helm"]["values"]
+        .get("vmController", {})
+        .get("lifecycleAuthSecretName")
+    )
 
     for defaults in (chart_defaults, vm_chart_defaults):
         sync_defaults = defaults["infrastructureMetering"]["externalSecrets"]
