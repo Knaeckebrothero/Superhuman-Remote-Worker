@@ -224,7 +224,8 @@ repaint. Rewind during streaming is allowed — the server interrupts first.
 ### UX fast-follow (2026-08-08) — `/rewind` command + dialog redesign
 
 Owner-requested after first live use ("the current version needs to be
-improved visually"):
+improved visually"). Commits: `18bdb8fa` (command + picker + redesign),
+`9e32aa75` (usability pass below).
 
 - **`/rewind` composer command** — added to the slash menu. Opens a target
   picker (user prompts newest first, time + first line, scrollable) instead of
