@@ -773,11 +773,11 @@ def test_connection_returns_ws_url_and_token_when_ready(monkeypatch):
     assert resp.status_code == 200
     body = resp.json()
     assert body["state"] == "ready"
-    assert body["execution_lane"] == "pinned"
     assert body["control_socket"] == "websocket"
     assert body["ws_url"].startswith("wss://api.test.example/p/t1/ws?t=")
     assert isinstance(body["token"], str) and body["token"]
     assert isinstance(body["expires_at"], int)
+    assert "execution_lane" not in body
     # ensure_route is called idempotently on every /connection.
     fake_main.session_router.ensure_route.assert_called_once_with(
         thread_id="t1",
@@ -807,7 +807,6 @@ def test_connection_reports_stateless_ready_without_a_socket(monkeypatch):
     assert resp.status_code == 200
     assert resp.json() == {
         "state": "ready",
-        "execution_lane": "stateless",
         "control_socket": "none",
         "ws_url": None,
         "token": None,
@@ -816,7 +815,7 @@ def test_connection_reports_stateless_ready_without_a_socket(monkeypatch):
     fake_db.get_agent.assert_not_awaited()
 
 
-def test_connection_models_require_their_lane_discriminator_and_socket_shape():
+def test_connection_models_require_their_transport_discriminator_and_socket_shape():
     from orchestrator.routers.sessions import (
         PinnedConnectionResponse,
         StatelessConnectionResponse,
@@ -839,10 +838,10 @@ def test_connection_openapi_is_a_required_discriminated_union():
 
     assert len(response_schema["oneOf"]) == 2
     assert response_schema["discriminator"] == {
-        "propertyName": "execution_lane",
+        "propertyName": "control_socket",
         "mapping": {
-            "pinned": "#/components/schemas/PinnedConnectionResponse",
-            "stateless": "#/components/schemas/StatelessConnectionResponse",
+            "websocket": "#/components/schemas/PinnedConnectionResponse",
+            "none": "#/components/schemas/StatelessConnectionResponse",
         },
     }
     stateless_required = set(
@@ -850,7 +849,6 @@ def test_connection_openapi_is_a_required_discriminated_union():
     )
     assert stateless_required == {
         "state",
-        "execution_lane",
         "control_socket",
         "ws_url",
         "token",
