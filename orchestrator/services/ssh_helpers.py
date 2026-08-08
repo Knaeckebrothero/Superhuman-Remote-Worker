@@ -76,7 +76,22 @@ def workspace_private_key_fingerprint(key_path: Optional[str]) -> str:
 # --xattrs/--acls so fuse-overlayfs opaque-dir xattrs + whiteouts round-trip
 # (protected cloud mode, design §11.3). char(0,0) whiteouts survive without
 # them on emptyDir, but opaque markers and some rootfs variants need them.
-EXTRACT_REMOTE_CMD = "zstd -d | tar --xattrs --xattrs-include='*' --acls -xf - -C /"
+# `bash -c 'set -o pipefail; ...'` so a masked `zstd -d` decompression
+# failure on a corrupt/truncated archive is no longer hidden by `tar` (the
+# last stage) exiting 0 — see docs/features/workspace_durability_tiering.md
+# §C1 (C1c). `tar` is already the last stage, so its own rc handling is
+# unchanged (including the benign full-extract rc==2 below); `pipefail` only
+# adds "an earlier stage failing also fails the pipeline." Plain `pipefail`
+# is deliberate here, not PIPESTATUS discrimination — unlike capture's
+# `tar | zstd` (C1b), there is no tar-rc==1-style benign code from an
+# earlier stage to tolerate. `bash -c` guarantees `pipefail` support
+# regardless of the agent-host login shell (`pipefail` is bash/ksh/zsh, not
+# POSIX sh/dash). The `-c` body is single-quoted, so `--xattrs-include`
+# switches to double quotes to still reach tar as a literal `*`.
+EXTRACT_REMOTE_CMD = (
+    "bash -c 'set -o pipefail; "
+    'zstd -d | tar --xattrs --xattrs-include="*" --acls -xf - -C /\''
+)
 
 # Scoped variant for in-cluster IDE pods: extract only the agent-host home.
 # Snapshots also carry /usr/local (VM restores need it), but in a
@@ -84,8 +99,11 @@ EXTRACT_REMOTE_CMD = "zstd -d | tar --xattrs --xattrs-include='*' --acls -xf - -
 # extracting them as agent-host yields per-file "Cannot open: File exists"
 # noise and tar rc=2 while the home content extracts fine. Members are
 # archived without a leading slash (tar strips it at capture), so the
-# member pattern is ``home/agent-host``.
-EXTRACT_HOME_REMOTE_CMD = "zstd -d | tar -xf - -C / home/agent-host"
+# member pattern is ``home/agent-host``. Same `pipefail` wrapper as
+# EXTRACT_REMOTE_CMD above, for the same masked-zstd-failure reason.
+EXTRACT_HOME_REMOTE_CMD = (
+    "bash -c 'set -o pipefail; zstd -d | tar -xf - -C / home/agent-host'"
+)
 
 # Headscale/Tailscale mesh address space (CGNAT range). VM workspaces get
 # their SSH host from this range; only tailnet members (agent-pod sidecars)

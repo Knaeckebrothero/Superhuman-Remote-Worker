@@ -12,6 +12,13 @@ see docs/features/workspace_durability_tiering.md §C1/C1b): a shell pipeline
 (``tar | zstd``) only surfaces the LAST stage's exit code, so a truncated/failing
 ``tar`` upstream is masked and a partial archive gets accepted as good — unless
 the remote command is rewritten to discriminate the two stages via ``PIPESTATUS``.
+
+Also guards the extract-side ``pipefail`` guard (§C1/C1c): the restore pipeline
+(``zstd -d | tar ...``) already returns ``tar``'s (last stage's) own exit code
+unchanged, but a ``zstd -d`` decompression failure on a corrupt/truncated
+archive is masked whenever ``tar`` still exits 0 — plain ``set -o pipefail``
+(no PIPESTATUS discrimination) fixes this without altering tar's own rc
+handling, including the benign full-extract tar rc==2 case.
 """
 
 import shutil
@@ -33,6 +40,7 @@ if _orchestrator_dir not in sys.path:
 
 from orchestrator.services.snapshot_service import SnapshotService  # noqa: E402
 from orchestrator.services.ssh_helpers import (  # noqa: E402
+    EXTRACT_HOME_REMOTE_CMD,
     EXTRACT_REMOTE_CMD,
     SSHPrivateKeyError,
     build_agent_ssh_cmd,
@@ -191,10 +199,12 @@ class TestStreamExtractSnapshot:
         assert "StrictHostKeyChecking=no" in argv
         assert "agent-host@10.0.0.9" in argv
         assert argv[-1] == EXTRACT_REMOTE_CMD
-        # Verify extract command includes xattrs/acls for overlay whiteout round-trip
-        assert (
-            EXTRACT_REMOTE_CMD
-            == "zstd -d | tar --xattrs --xattrs-include='*' --acls -xf - -C /"
+        # Verify extract command includes xattrs/acls for overlay whiteout
+        # round-trip, wrapped in the `pipefail` guard that surfaces a masked
+        # zstd decompression failure on restore (C1c).
+        assert EXTRACT_REMOTE_CMD == (
+            "bash -c 'set -o pipefail; "
+            'zstd -d | tar --xattrs --xattrs-include="*" --acls -xf - -C /\''
         )
 
     @pytest.mark.asyncio
@@ -206,6 +216,91 @@ class TestStreamExtractSnapshot:
             )
         assert rc == 1
         assert stderr == b"tar: short read"
+
+
+class TestExtractRemoteCmdPipefail:
+    """Extract-side ``set -o pipefail`` guard (§C1c).
+
+    Restore runs ``zstd -d | tar ...`` (see ``EXTRACT_REMOTE_CMD`` /
+    ``EXTRACT_HOME_REMOTE_CMD`` above). A shell pipeline only reports the
+    LAST stage's exit code; ``tar`` is already the last stage here, so
+    today's pipeline correctly returns tar's own rc — but a ``zstd -d``
+    failure on a corrupt/truncated archive is invisible whenever ``tar``
+    still exits 0 (e.g. it received a short or empty stream and didn't
+    itself error), so the restore is reported as a success on a partial or
+    empty extract.
+
+    Unlike C1b's capture pipeline (``tar | zstd``, zstd last, where tar's
+    benign rc==1 "file changed" warning had to be tolerated via a
+    PIPESTATUS-discriminating rewrite), here plain ``set -o pipefail`` is
+    the correct, minimal fix: it only adds "an earlier stage failing also
+    fails the pipeline" — it does not touch tar's own rc handling,
+    including the benign full-extract tar rc==2 (see the comment above
+    ``EXTRACT_REMOTE_CMD``). No PIPESTATUS, no consumer changes.
+    """
+
+    def test_both_constants_are_wrapped_in_bash_c_pipefail(self):
+        for cmd in (EXTRACT_REMOTE_CMD, EXTRACT_HOME_REMOTE_CMD):
+            assert cmd.startswith("bash -c 'set -o pipefail; ")
+            assert "zstd -d | tar" in cmd
+
+    def test_extract_remote_cmd_keeps_literal_star_and_valid_quoting(self):
+        # The `-c` body is single-quoted (see startswith check above), so
+        # the xattrs-include pattern must switch to double quotes to avoid
+        # prematurely closing the argument, while still reaching tar as a
+        # literal `*` (no local glob expansion). Exactly the opening and
+        # closing single quote should exist anywhere in the command — a
+        # stray single quote would prematurely close the `-c` argument and
+        # break the remote shell.
+        assert '--xattrs-include="*"' in EXTRACT_REMOTE_CMD
+        assert EXTRACT_REMOTE_CMD.count("'") == 2
+
+    def test_extract_home_remote_cmd_has_valid_quoting(self):
+        assert EXTRACT_HOME_REMOTE_CMD.count("'") == 2
+
+    def test_pipefail_surfaces_masked_zstd_failure_under_real_bash(self):
+        """Runs the actual pipeline SHAPE (``set -o pipefail; <stage0> |
+        <stage1>``) under real bash with synthetic stage exit codes standing
+        in for zstd (stage 0) and tar (stage 1) — mocked-subprocess tests
+        can't catch shell bugs (the C1b lesson at
+        ``test_pipestatus_discrimination_tail_maps_stage_exits_correctly``
+        above), so this proves bash's real ``pipefail`` semantics instead of
+        trusting the string shape asserted above.
+        """
+        if shutil.which("bash") is None:
+            pytest.skip("bash not available")
+
+        def run(zstd_rc: int, tar_rc: int, *, pipefail: bool) -> int:
+            prefix = "set -o pipefail; " if pipefail else ""
+            result = subprocess.run(
+                ["bash", "-c", f"{prefix}( exit {zstd_rc} ) | ( exit {tar_rc} )"],
+                capture_output=True,
+                text=True,
+            )
+            return result.returncode
+
+        # zstd succeeds: tar's own rc passes through completely unchanged
+        # with pipefail enabled — including the benign full-extract tar
+        # rc==2 (see class docstring). This is the "must stay exactly as it
+        # is today" guarantee from the design doc.
+        assert run(0, 0, pipefail=True) == 0
+        assert run(0, 2, pipefail=True) == 2
+
+        # zstd fails (the masked corrupt-archive case): the pipeline must no
+        # longer report success regardless of tar's own rc. The exact
+        # surfaced code is not the contract here — only that it stops being
+        # a false 0 / false benign-2.
+        assert run(1, 0, pipefail=True) != 0
+        assert run(1, 2, pipefail=True) != 0
+
+        # The load-bearing contrast proving `pipefail` is what matters: the
+        # very same (zstd=1, tar=0) masking case reports SUCCESS without
+        # pipefail (today's bug: a corrupt archive's zstd failure hidden by
+        # tar's benign exit 0)...
+        assert run(1, 0, pipefail=False) == 0
+        # ...and only fails once pipefail is enabled — this is exactly the
+        # fix C1c makes.
+        assert run(1, 0, pipefail=True) != 0
 
 
 def _fake_capture_proc(returncode=0, chunks=(b"tarball-bytes",), stderr=b""):
