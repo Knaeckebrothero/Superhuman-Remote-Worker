@@ -23,6 +23,24 @@ from services.workspace_lifecycle import WorkspaceOwner
 logger = logging.getLogger(__name__)
 
 
+def _reclaim_on_idle_enabled() -> bool:
+    """Opt-in gate for dropping a session's hot-cache PVC on idle-suspend.
+
+    Default OFF: today's retain-on-idle behavior (snapshot + delete pod, keep
+    the PVC) is unchanged unless an operator turns this on. When enabled, the
+    PVC is dropped only after ``verify_snapshot`` confirms the S3 archive is
+    restorable — see the call site in ``suspend_thread_workspace``.
+    Truthy-token parsing mirrors ``canvas_snapshots.snapshots_enabled()``.
+    See docs/features/workspace_durability_tiering.md §D3.
+    """
+    return os.environ.get("WORKSPACE_RECLAIM_ON_IDLE", "false").strip().lower() in (
+        "true",
+        "1",
+        "yes",
+        "on",
+    )
+
+
 def _thread_is_vm_tier(metadata: dict, ws_ctx: dict, vm_ctx: dict) -> bool:
     """Is this THREAD's workspace a VM rather than a container?
 
@@ -718,9 +736,66 @@ class WorkspaceSuspensionService:
                     suspended_ctx["rootdisk"] = "kept"
                 await self._db.merge_thread_vm_context(thread_id, suspended_ctx)
             else:
-                await self._container_provisioner.delete_workspace(
-                    WorkspaceOwner.session(thread_id)
-                )
+                owner = WorkspaceOwner.session(thread_id)
+                await self._container_provisioner.delete_workspace(owner)
+                # Reclaim-on-idle (opt-in, fail-safe): drop the hot-cache PVC
+                # once the snapshot is confirmed restorable, so idle sessions
+                # stop pinning volumes (docs/features/
+                # workspace_durability_tiering.md §D3). If the archive can't
+                # be verified, KEEP the PVC — deleting it would risk the only
+                # copy of the live working tree. A delete failure (return
+                # False, or a raised exception from the provisioner) must
+                # not fail the suspend either: the session stays resumable
+                # off the retained volume either way.
+                #
+                # This does NOT reclaim the session's separate AGENT-pod PVC
+                # (`pvc-agent-s-<id>`, created by AgentProvisioner): the type
+                # actually wired into ``self._agent_provisioner`` (see
+                # orchestrator/main.py) exposes no PVC-delete method at all.
+                # Only the different, unwired ``PersistentProvisioner`` class
+                # has ``delete_agent_pvc``, and it manages a differently-named
+                # legacy claim (`pvc-persistent-<id>`). Follow-up, not in
+                # scope here — the workspace PVC is the primary/larger
+                # consumer.
+                if _reclaim_on_idle_enabled() and self._snapshot_service:
+                    v_ok, reason = await self._snapshot_service.verify_snapshot(
+                        thread_id, entity_type="threads"
+                    )
+                    if v_ok:
+                        try:
+                            reclaimed = (
+                                await self._container_provisioner.delete_workspace_pvc(
+                                    owner
+                                )
+                            )
+                        except Exception:
+                            logger.exception(
+                                "Reclaim-on-idle: PVC delete raised for thread "
+                                "%s — keeping session resumable off the "
+                                "retained volume",
+                                thread_id,
+                            )
+                            reclaimed = False
+                        if reclaimed:
+                            suspended_ctx["volume_reclaimed"] = True
+                            logger.info(
+                                "Reclaim-on-idle: snapshot verified, PVC "
+                                "reclaimed for thread %s",
+                                thread_id,
+                            )
+                        else:
+                            logger.warning(
+                                "Reclaim-on-idle: PVC delete did not succeed "
+                                "for thread %s — keeping PVC",
+                                thread_id,
+                            )
+                    else:
+                        logger.warning(
+                            "Reclaim-on-idle: snapshot unverified (%s) — "
+                            "keeping PVC for thread %s",
+                            reason,
+                            thread_id,
+                        )
                 suspended_ctx.update({"pod_ip": None, "pod_name": None})
                 await self._db.merge_thread_workspace_context(thread_id, suspended_ctx)
 

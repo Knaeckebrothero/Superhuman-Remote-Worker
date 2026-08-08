@@ -792,6 +792,10 @@
         "pvcSize": { "type": "string" },
         "reattachReadyTimeout": { "type": "integer", "minimum": 1 },
         "freshFallback": { "type": "boolean" },
+        "reclaimOnIdle": {
+          "type": "boolean",
+          "description": "Drop a session's workspace PVC on idle-suspend once its S3 snapshot verifies restorable, instead of retaining it. Default false = retain-on-idle (today's behavior)."
+        },
         "resourceQuota": {
           "type": "object",
           "properties": {
