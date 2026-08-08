@@ -54,6 +54,18 @@ the pod's next flush would collide on the unique index and kill the writer.
 Remaining work is §3.3 (now shaped as above), §3.4's verification, §3.5, §3.6
 and §3.7 — plus stateless ended-session wake, which the server phase surfaced.
 
+**Phase 3 audit result (2026-08-08): §3.4's corrected premise was still
+incomplete, so implementation stopped again.** An already-open active tab can
+send over REST and receive turn frames over journal/SSE, but a reload cannot:
+`session.state` is WebSocket-direct and carries load-bearing state that neither
+thread metadata nor the journal replaces (`turn_in_flight` reconciliation,
+running tool, pending permission rows, modes and model settings). In addition,
+the no-socket response reaches `new WebSocket(null)` and the reconnect ladder.
+The next phase starts with a lane-agnostic, transport-independent session-state
+snapshot for both lanes. Migration 0119 remains unused; no control-inbox code
+was retained. See implementation-log Session 4 for exact evidence and further
+wrong-premise findings in permission retirement and ended-session wake.
+
 ---
 
 ## 1. Read first
@@ -156,9 +168,24 @@ looks:
 * Turn output already streams over the journal/SSE, which is transport-
   independent and demonstrably works on this lane today.
 
-So with §3.2's `/connection` answering ready, **send and receive should need
-zero cockpit changes.** Verify that (including that a null `ws_url` does not
-cause a reconnect storm through `_ensureControlWs`) rather than assuming it.
+The requested verification was run and the zero-change claim is **false beyond
+an already-open active tab**. `ConnectionPayload` still types `ws_url` as a
+string and `_openControlWs` / `_reopenWithFreshToken` unconditionally install
+it; null therefore reaches the WebSocket constructor and retry ladder.
+`_ensureControlWs` can reset that ladder on focus and SSE recovery.
+
+More importantly, `session.state` is sent directly over the control WebSocket,
+not the journal. The client uses it to reconcile a cached in-flight prefix with
+cursor-replayed deltas and to restore `running_tool`, pending permission cards,
+permission/narration modes, turn count, model and temperature. A null-socket
+guard alone would make the composer look ready while reload/multi-tab state is
+wrong. Build one authenticated, owner-gated, lane-agnostic state snapshot for
+**both** lanes (REST or an equivalent current-state SSE contract), feed it
+through the existing `session.state` reducer, and prove mid-turn and pending-
+permission reload before claiming send/receive parity. Discriminate transport
+with `control_socket`, never with `execution_lane`; if lane invisibility is a
+literal wire-contract requirement, the server response must also stop exposing
+`execution_lane` to the Cockpit.
 
 The one real gap is the **control verbs**. They go through `_sendControl` →
 `controlOutbox` → the WebSocket (`:2082`), so with no socket the buttons queue

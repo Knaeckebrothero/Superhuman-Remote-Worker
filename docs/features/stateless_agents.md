@@ -508,22 +508,59 @@ Not built, all of them named in S1's own list above:
 
 - **Cockpit workstream** — the server `/connection` contract is built, but the
   cockpit does not consume it yet: it will still try `new WebSocket(null)`
-  for the no-socket marker. Composer ungating, provisioning-card bypass,
-  lane-aware ended-session wake, and REST control routing remain unbuilt.
-- **Control-verb REST subset** (§6.7) — **BLOCKED on a corrected design, not
-  scaffolded.** The proposed orchestrator `append_system_frame` ack is unsafe:
+  for the no-socket marker and enter the reconnect ladder. The later claim
+  that send/receive otherwise needed zero Cockpit changes was disproved:
+  `session.state` is WebSocket-direct and is load-bearing on reload for
+  in-flight-turn reconciliation, running-tool state, pending permission cards,
+  modes and model settings. A lane-agnostic, transport-independent state
+  snapshot for **both** lanes must precede the null-socket guard and REST
+  control routing. Durable queued state, stateless ended-session wake, and all
+  control routing remain unbuilt; the client still must not branch on
+  `execution_lane`.
+- **Control-verb REST subset** (§6.7) — **the transport decision is made, but
+  nothing is scaffolded.** The proposed orchestrator `append_system_frame` ack is unsafe:
   a stateless pod keeps a warm attached journal writer for 300 s after a claim,
   and the system-writer helper explicitly forbids concurrent live-epoch writes
   because its DB seq allocation can collide with that writer's process-local
-  `_next_seq`. A correct path needs durable control requests consumed and
-  acknowledged by a lease-owning claimant (plus commit-ordered admission), or a
-  journal allocator redesign. Verb assumptions also fail independently:
+  `_next_seq`. The chosen replacement is migration 0119 with durable,
+  commit-ordered control requests consumed and journaled by the serving owner;
+  controls enter orchestrator REST for both lanes. It is gated first on the
+  transport-independent `session.state` snapshot above. The transaction audit
+  adds two non-optional details: stateless terminal acceptance fences on the
+  current lease token while pinned acceptance fences on the exact current
+  `threads.agent_id`; and `run_queue` needs control watermarks (or an equivalent
+  unified cursor) because completion currently requeues only for newer human
+  input and can otherwise strand a control committed during a lease. A terminal
+  request CAS also needs proof that its result frame was durably flushed, not
+  merely handed to `_broadcast`. Verb assumptions fail independently:
   detached rewind does not steal/fence `run_queue`; compact has no detached REST
-  route and boundary IDs do not survive restore; undo state is RAM-only; and
-  upgrade enters unbuilt S2 workspace semantics. Interrupt remains a deliberate
-  **501** on the lane.
+  route and boundary IDs do not survive restore; attached rewind rebuilds the
+  writer without the stateless lease; undo state is RAM-only; archive lacks an
+  idempotent terminal finalizer; config mutation is not transactionally fenced;
+  and upgrade enters unbuilt S2 workspace semantics. The safe initial subset is
+  idempotent `mode.set` / `narration.set`, after mode is moved from memory-only
+  mutation to grant-checked persistence. Interrupt remains a deliberate **501**
+  on the lane.
 - **Persistence promotions** — mode/narration, session task manager, memory-extraction interval cursor, media-fidelity decision, and Path-A resume-summary persistence (see the correction above).
-- **Permission-row retire** on lease expiry — nothing sweeps `thread_permission_requests`. **Durable queued-turn UX** — the Cockpit already renders an accepted-send spinner via `pendingTurnCount`, but there is no journaled `turn.queued`/queue-position state that survives reload or synchronizes across tabs; only the reaper's `turn.interrupted`/`turn.parked` exists. **`fair_key` round-robin** — the column and its merge exist; no rotation CTE.
+- **Permission-row retire** on lease expiry — nothing sweeps
+  `thread_permission_requests`, and a blanket thread-wide reaper UPDATE is
+  unsafe: rows carry no lease identity, so post-steal cleanup can expire a
+  successor's new gate. The steal commits before its contained journal step,
+  so cleanup also needs a durable reaped-token retry source rather than a
+  one-shot side effect. Implementation reality also differs from §5.3.6's
+  target state: today's stateless executor keeps heartbeating and holds the
+  lease while permission resolution waits; release-at-gate is not built, and
+  agent-local `_subscribers` cannot see stateless SSE viewers. **Durable
+  queued-turn UX** — the Cockpit already renders
+  an accepted-send spinner via RAM-only `pendingTurnCount`, but it disappears on
+  reload and other tabs see nothing. An orchestrator-written journal frame is
+  forbidden by the live-writer collision; use a DB-authoritative queue snapshot
+  plus current-state notification. Exact global “position N” is not truthful
+  before `fair_key` rotation exists. **Stateless ended-session/system wake** is
+  also not a status flip: current durable wakes persist `role='event'`, while
+  the executor selects only `role='human'`; a safe wake needs stable-id atomic
+  message+watermark admission and role-preserving restore/injection. **`fair_key`
+  round-robin** — the column and its merge exist; no rotation CTE.
 - **Lite agent-local-state inventory** (§6.1) — the PVC question S1 is supposed to answer is still open.
 - **Journal-writer coalescing tick**; **object-store PUT fencing** (or the documented corruption window).
 - **Metering lease-interval attribution** — not merely unbuilt, actively routed around: `stateless-deployment.yaml` labels the class `app: srw-agent-stateless` precisely so `classify_product_pod` won't claim it, which means **stateless pods are currently unattributed compute** ("shared platform capacity"). Any real traffic on this lane is unbilled until the interval reconciler lands.
