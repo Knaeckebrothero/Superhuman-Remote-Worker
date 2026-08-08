@@ -843,19 +843,21 @@ describe('SettingsPaneComponent workspace tier', () => {
       grants: {vm_workspace: true},
     });
     expect(component.workspaceTier()).toBe('sandbox');
-    expect(component.canUpgradeToSandbox()).toBe(false);
-    expect(component.canUpgradeToVm()).toBe(true);
+    // Already there, so `sandbox` is absent from the map — the row labels the
+    // running tier itself; only the moves away from it are described here.
+    expect(component.tierReachability()['sandbox']).toBeUndefined();
+    expect(component.tierReachability()['vm']).toBe('ok');
   });
 
   it('denies the VM upgrade without the vm grant; admin (null grants) allows', () => {
     const {component} = createPane({grants: {vm_workspace: false}});
     expect(component.workspaceTier()).toBe('virtual');
-    expect(component.canUpgradeToSandbox()).toBe(true);
-    expect(component.canUpgradeToVm()).toBe(false);
+    expect(component.tierReachability()['sandbox']).toBe('ok');
+    expect(component.tierReachability()['vm']).toBe('needsApproval');
 
     TestBed.resetTestingModule();
     const {component: admin} = createPane({grants: null});
-    expect(admin.canUpgradeToVm()).toBe(true);
+    expect(admin.tierReachability()['vm']).toBe('ok');
   });
 
   it('vm tier offers no further upgrades (upgrade-only, no downgrades)', () => {
@@ -863,7 +865,70 @@ describe('SettingsPaneComponent workspace tier', () => {
       override: {workspace: {backend: 'vm'}},
       grants: null,
     });
-    expect(component.canUpgradeToSandbox()).toBe(false);
-    expect(component.canUpgradeToVm()).toBe(false);
+    // Every other tier is refused, and says why rather than going missing.
+    expect(component.tierReachability()).toEqual({
+      sandbox: 'downgrade',
+      virtual: 'downgrade',
+      none: 'downgrade',
+    });
+  });
+
+  it('a none-tier session can reach nothing at all', () => {
+    // No durable anchor to seed from (workspace_tier_upgrade.md non-goals).
+    const {component} = createPane({
+      override: {workspace: {backend: 'none'}},
+      grants: null,
+    });
+    expect(component.tierReachability()).toEqual({});
+  });
+});
+
+describe('SettingsPaneComponent tier upgrade confirmation', () => {
+  afterEach(() => TestBed.resetTestingModule());
+
+  it('a reachable pick opens the dialog instead of dispatching', () => {
+    const {component, chat} = createPane({grants: null});
+    component.onTierPicked('sandbox');
+
+    expect(component.pendingTier()).toBe('sandbox');
+    expect(chat.upgradeWorkspace).not.toHaveBeenCalled();
+  });
+
+  it('confirming dispatches the upgrade verb and closes', () => {
+    const {component, chat} = createPane({grants: null});
+    component.onTierPicked('vm');
+    component.confirmUpgrade();
+
+    expect(chat.upgradeWorkspace).toHaveBeenCalledExactlyOnceWith('vm');
+    expect(component.pendingTier()).toBeNull();
+  });
+
+  it('dismissing dispatches nothing — the tier is unchanged', () => {
+    const {component, chat} = createPane({grants: null});
+    component.onTierPicked('sandbox');
+    component.pendingTier.set(null); // what (closed) and Cancel both do
+
+    expect(chat.upgradeWorkspace).not.toHaveBeenCalled();
+    expect(component.workspaceTier()).toBe('virtual');
+  });
+
+  // The row is a view; this is the gate. An unreachable tier can only arrive
+  // through a stale render or a disabled option that slipped through.
+  it('refuses an unreachable pick outright', () => {
+    const {component, chat} = createPane({grants: {vm_workspace: false}});
+    component.onTierPicked('vm'); // needsApproval
+    component.onTierPicked('none'); // downgrade
+
+    expect(component.pendingTier()).toBeNull();
+    expect(chat.upgradeWorkspace).not.toHaveBeenCalled();
+  });
+
+  it('refuses a second pick while an upgrade is already running', () => {
+    const {component, chat} = createPane({grants: null});
+    chat.workspaceUpgradeInProgress.set({tier: 'sandbox'});
+    component.onTierPicked('vm');
+
+    expect(component.pendingTier()).toBeNull();
+    expect(chat.upgradeWorkspace).not.toHaveBeenCalled();
   });
 });

@@ -1406,20 +1406,19 @@
     "settingsPane": {
       "title": "Sitzungseinstellungen",
       "close": "Einstellungen schließen",
-      "workspace": "Arbeitsbereich",
-      "tier": {
-        "virtual": "Lite (kein Workspace-Pod)",
-        "sandbox": "Sandbox-Container",
-        "vm": "Virtuelle Maschine",
-        "none": "Keiner",
-        "remote": "Remote-Container",
-        "docker": "Container"
-      },
-      "upgrading": "{{tier}} wird bereitgestellt…",
-      "upgradeSandbox": "Auf Sandbox upgraden",
-      "upgradeVm": "Auf VM upgraden",
-      "workspaceHint": "Upgrades übernehmen Ihre Dateien und können innerhalb der Sitzung nicht rückgängig gemacht werden.",
-      "fixedNote": "Experte und Projekte werden beim Erstellen der Sitzung festgelegt und in der Sitzungsliste angezeigt."
+      "fixedNote": "Experte und Projekte werden beim Erstellen der Sitzung festgelegt und in der Sitzungsliste angezeigt.",
+      "upgradeConfirm": {
+        "sandbox": {
+          "title": "Auf Container upgraden?",
+          "body": "Startet einen Workspace-Container und kopiert deine Dateien hinein. Ergänzt Shell-, Git- und Browser-Tools. Dauert etwa eine Minute."
+        },
+        "vm": {
+          "title": "Auf VM upgraden?",
+          "body": "Stellt eine dedizierte virtuelle Maschine mit root und sudo bereit und kopiert deine Dateien darauf. Ein Kaltstart dauert 6–25 Minuten."
+        },
+        "irreversible": "Das lässt sich nicht rückgängig machen — die Sitzung kann nicht auf eine niedrigere Stufe zurück.",
+        "confirm": "Upgraden"
+      }
     },
     "settings": {
       "mode": "Modus",
@@ -2618,7 +2617,15 @@
       "imageQuality": "Bildqualität",
       "workspaceBackend": "Arbeitsbereich",
       "autonomyDefaultHint": "Legt fest, wann der Agent für eine manuelle Prüfung pausiert",
-      "narration": "Erzählmodus"
+      "narration": "Erzählmodus",
+      "tierCurrent": "aktuell",
+      "tierHint": "Beim Upgrade werden deine Dateien übernommen; innerhalb der Sitzung ist es nicht umkehrbar.",
+      "tierUpgrading": "{{tier}} wird bereitgestellt…",
+      "tierUnreachable": {
+        "downgrade": "Herunterstufen nicht möglich",
+        "needsApproval": "Freigabe erforderlich",
+        "unsupported": "von dieser Stufe aus nicht verfügbar"
+      }
     },
     "autonomy": {
       "full": {

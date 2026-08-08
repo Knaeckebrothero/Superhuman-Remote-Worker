@@ -6,7 +6,7 @@ import type {
     SessionToolCategory,
     SessionToolGroupsResponse,
 } from '../../core/services/api.service';
-import {SettingsMode} from './agent-settings.types';
+import {SettingsMode, TierReachability} from './agent-settings.types';
 import {ExecutionGroupComponent} from './execution-group.component';
 import {ModelGroupComponent} from './model-group.component';
 import {ToolsGroupComponent} from './tools-group.component';
@@ -79,7 +79,11 @@ type AgentSettingsTab = 'settings' | 'instructions' | 'advanced' | 'resolved';
             [disabled]="disabled()"
             [showProjectMemory]="showProjectMemory()"
             [gatedCapabilities]="gatedCapabilities()"
+            [liveTier]="liveTier()"
+            [tierReachability]="tierReachability()"
+            [upgradeInProgress]="upgradeInProgress()"
             (change)="onChange()"
+            (tierChangeRequested)="tierChangeRequested.emit($event)"
           />
           <app-model-group
             [config]="config()"
@@ -283,12 +287,21 @@ export class AgentSettingsComponent {
   /** Live mode: whether the session runs a lite backend (virtual/none) — the
    *  Advanced accordion that normally derives this is hidden in live mode. */
   liteBackend = input(false);
+  /** Live mode: the running session's workspace tier, and which tiers it can
+   *  move to. Forwarded to the execution group, which renders the tier row as
+   *  a launcher for the upgrade verb rather than as a setting. */
+  liveTier = input<string | null>(null);
+  tierReachability = input<Record<string, TierReachability>>({});
+  upgradeInProgress = input<{tier: string; elapsed?: number} | null>(null);
   /** Expert detail loading state. */
   loadingExpert = input(false);
 
   /** Emitted whenever any setting changes. */
   change = output<void>();
   retryDatasources = output<void>();
+  /** Live mode: a workspace tier the user picked. The host confirms it and
+   *  dispatches the upgrade verb — this surface only reports the intent. */
+  tierChangeRequested = output<string>();
   /** Emitted when instructions content changes. */
   instructionsChange = output<string | null>();
 
