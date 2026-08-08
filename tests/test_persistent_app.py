@@ -4669,18 +4669,32 @@ class TestAttachSessionRebinds:
         assert "auxiliary_llm=auxiliary_llm" in src
 
     def test_attach_resets_embedding_singleton_when_env_changes(self):
+        """M3 scrub-on-claim (§5.6) moved the embedding-override block into
+        the pop-first helper ``_apply_session_embedding_env``; the attach path
+        must still route through it, and the helper must reset the singleton
+        and own all four memory-embedding keys."""
         from inspect import getsource
-        from src.api.persistent_app import _attach_session
+        from src.api.persistent_app import (
+            MEMORY_EMBEDDING_ENV_KEYS,
+            _apply_session_embedding_env,
+            _attach_session,
+        )
 
-        src = getsource(_attach_session)
-        assert "_embedding_module._embedding_service = None" in src
-        for key in (
+        attach_src = getsource(_attach_session)
+        assert "_apply_session_embedding_env(_env_keys_src)" in attach_src
+
+        helper_src = getsource(_apply_session_embedding_env)
+        assert "_embedding_module._embedding_service = None" in helper_src
+        assert set(MEMORY_EMBEDDING_ENV_KEYS) == {
             "EMBEDDING_PROVIDER",
             "EMBEDDING_MODEL",
             "EMBEDDING_BASE_URL",
             "EMBEDDING_API_KEY",
-        ):
-            assert key in src
+        }
+        # Pop-first: the scrub precedes any re-application of new env values.
+        assert helper_src.index("os.environ.pop") < helper_src.index(
+            "os.environ[k] = str(value)"
+        )
 
 
 # ---------------------------------------------------------------------------
