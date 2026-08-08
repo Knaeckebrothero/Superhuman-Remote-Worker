@@ -235,6 +235,105 @@ v2 stood up `run_queue` next to the shipped jobs-row lease and never said which 
 3. **The stage-4 completion CAS keys on `run_queue.lease_token`**, not `assigned_agent_id` — closing the fenced-out-`/complete`-still-wins hole for the stateless class.
 4. The registered-agent plane keeps serving compose/bare-metal, officers, and the rollback path until each lane retires (§7 delete-when).
 
+#### 5.4.5 Completion is a command, not a call (Gate 3)
+
+**Status: design, 2026-08-08. Blocks the entire worker lane** — no `worker_batch`
+unit can be claimed safely until this lands. Evidence base:
+`docs/research/stateless_agents/completion_path_side_effect_inventory.md`.
+
+##### What we thought this was, and what it is
+
+§5.4.4 point 3 above says "the stage-4 completion CAS keys on
+`run_queue.lease_token`, not `assigned_agent_id`", which reads like a predicate
+change. **There is no completion CAS.** `assigned_agent_id` is not a guard
+anywhere in the path. `POST /api/jobs/{job_id}/complete` is **1046 lines with 29
+database awaits**, and it is the agent's single report-out for *every* stop, not
+just goal-achieved — so on the stateless lane **every batch rotation runs it**.
+
+Three structural facts make a guard insufficient:
+
+1. **There is not one explicit transaction in the handler.** Every write
+   autocommits; a simple job commits 8–12 times, a loop job with cloud delivery
+   20–30, interleaved with unbounded WebDAV writes. There is no point at which
+   the job is atomically "completed".
+2. **The status write (`main.py:18060`) is a one-way door.** It puts the job in a
+   state the early late-callback guard treats as already handled, so a crash
+   anywhere after it permanently orphans `completed_at`, the graft, the critic
+   verdict, the verification spawn, the loop advance, the terminal merge, the
+   change record **and the workspace archive**.
+3. **Every "already done?" check is check-then-act across seconds-to-minutes of
+   external I/O** — critic spawn, subjob graft, cloud apply, terminal merge.
+
+A fence at the entry protects only the entry: pod A can enter with a valid
+lease, lose it to a reaper steal mid-way, and still run every effect. A final CAS
+rejects A's last write and leaves everything before it applied.
+
+##### This is not only a stateless prerequisite
+
+Several of these are reachable **today on the pinned lane**; per-turn claiming
+only raises their frequency. A crash between the status write and the archive
+leaks the pod, PVC and VM with nothing recording it, and the replay guard
+prevents recovery. A `completed` job can carry `completed_at IS NULL` forever.
+The duplicate-critic race can drop a blocking finding and approve work that
+should have been returned. Treat Gate 3 as repairing a fragile path, not as
+paying a stateless tax.
+
+##### The protocol
+
+**Accept.** The agent's report becomes a durable *command row* written in one
+transaction under the lease fence, keyed `(job_id, lease_token, stop_identity)`,
+with `ON CONFLICT DO NOTHING`. Accept returns 202 immediately. A stolen
+predecessor and its successor carry different lease tokens, so both reports are
+recorded and the **finalizer**, not the HTTP handler, decides which is
+authoritative — the one whose token matches the row's current lease. The loser is
+retained as the audit trail of a steal. This also removes the 1–5 s handoff dead
+time §5.4.3 charges against the batch budget, since the agent no longer waits out
+the pipeline.
+
+**Finalize.** A leader-elected finalizer drains commands and executes the
+effects, mirroring `run_queue_reaper`'s shape: the advisory lock avoids duplicate
+*work*, correctness comes from a per-command CAS, so the dual-leader window is
+safe by construction. Each effect advances a progress marker **in the same
+transaction as the effect it records**, so a crash resumes at the next
+unexecuted effect rather than replaying from the top. Because
+`report_completion` does not retry (it logs and returns `False`), the finalizer
+is also the first thing that makes a crashed completion recoverable at all.
+
+**Order.** The job's user-visible status flips **last**, not in the middle. Until
+then the command row is the source of truth for "this job is finishing".
+
+##### Effect taxonomy — what each class needs
+
+The inventory classifies all ~37 effects; they reduce to four treatments.
+
+| Class | Examples | Treatment |
+|---|---|---|
+| Already idempotent | change record (PK + `ON CONFLICT`), session wake (partial unique dedup index), `pause_job`/`claim_delegation_resume`/loop barrier (real CAS) | leave alone — **these are the house patterns to extend, not replace** |
+| Blind writes, value-idempotent | status, `completed_at`, freeze stash, merge status | add the missing predicate; `completed_at` needs `COALESCE` like `failed_at` already has |
+| Counters | `infra_transient.attempts`, `recovery_attempts`, gate `bounces`, `auto_continue_drains`, memory/LLM-outage attempts, KB TTL | key on the **completion attempt**, not the invocation. Today every replay silently consumes retry budget and enough replays turn a recoverable job into a terminal failure |
+| Non-idempotent external effects | critic spawn, subjob graft, cloud apply, terminal merge, VM/pod/PVC delete, S3 snapshot, notifications | **write-ahead intent**: record `(job_id, effect_kind, attempt)` *before* doing it, so a crash between intent and effect is detectable and the effect is claimable exactly once. For spawns, prefer a natural unique key — a unique index on `(parent_job_id, verification_round)` would close the duplicate-critic hole outright |
+
+##### Coexistence with the pinned lane
+
+Not a flag day. The accept step writes the command for both lanes; for pinned
+jobs the finalizer runs **inline and synchronously**, preserving today's
+behavior, while stateless jobs let the background finalizer drain it. One
+implementation, two execution timings, and the pinned lane gets crash recovery
+as a side effect.
+
+##### Acceptance
+
+- Kill the orchestrator at each of the named windows (after the status write;
+  between cloud apply and its stamp; between graft commit and marker; between
+  merge and stamp; between barrier drain and write-back). The job reaches the
+  same terminal state on restart, with **no duplicated subjob, graft, merge,
+  cloud apply, or dispatch, and no leaked workspace**.
+- Steal a lease mid-handler: exactly one report is authoritative, the loser is
+  recorded and not executed.
+- Replay one command row N times: every effect happens exactly once and **no
+  retry counter advances**.
+- A pinned job's completion is behaviorally identical to today's.
+
 ### 5.5 Streaming — terminus closed; budgets honest
 
 **Journal-only is the terminus** (shipped path + industry contract; statelessness deletes the legacy direct-WS's reason to exist). Three v3 corrections:
