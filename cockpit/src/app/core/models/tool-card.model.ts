@@ -11,7 +11,7 @@ import {DiffLine} from '../util/line-diff';
  * `core/tools/tool-descriptors.ts`. Design: `docs/features/unified_tool_cards.md`.
  */
 
-export type ToolCardStatus = 'pending' | 'running' | 'ok' | 'error' | 'denied';
+export type ToolCardStatus = 'pending' | 'running' | 'ok' | 'error' | 'denied' | 'expired';
 
 /** How a result/param body should be presented. */
 export type ToolResultKind =

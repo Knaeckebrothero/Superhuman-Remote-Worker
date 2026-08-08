@@ -9,7 +9,8 @@
       "running": "läuft",
       "ok": "abgeschlossen",
       "error": "Fehler",
-      "denied": "abgelehnt"
+      "denied": "abgelehnt",
+      "expired": "nicht ausgeführt"
     },
     "diff": {
       "replace": "Diff",

@@ -80,7 +80,7 @@ export type ReducerAction =
     | {
         type: 'permission_decision';
         toolUseId: string;
-        decision: 'approved' | 'denied';
+        decision: 'approved' | 'denied' | 'expired';
         timestamp: number;
     }
     | { type: 'remove_turn'; id: string }
@@ -455,10 +455,18 @@ export function reduce(state: ConversationState, action: ReducerAction): Convers
                     return turn;
                 }
                 const existing = turn.events[idx] as ToolCallEvent;
+                // 'expired' = the gate was never answered (TTL, or swept at
+                // turn end). The call did not run and the user did not refuse
+                // — it must not render as a denial, and must not keep
+                // spinning as 'pending' either.
                 const newStatus =
-                    action.decision === 'denied' && existing.status === 'pending'
-                        ? ('denied' as const)
-                        : existing.status;
+                    existing.status !== 'pending'
+                        ? existing.status
+                        : action.decision === 'denied'
+                          ? ('denied' as const)
+                          : action.decision === 'expired'
+                            ? ('expired' as const)
+                            : existing.status;
                 const updated: ToolCallEvent = {
                     ...existing,
                     decision: action.decision,

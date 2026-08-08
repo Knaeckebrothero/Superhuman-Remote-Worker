@@ -4170,15 +4170,15 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     }
 
     hasCompletedTools(calls: ToolCallInfo[]): boolean {
-        return calls.some(tc => tc.status === 'completed' || tc.status === 'denied' || tc.status === 'error');
+        return calls.some(tc => tc.status === 'completed' || tc.status === 'denied' || tc.status === 'error' || tc.status === 'expired');
     }
 
     completedOnly(calls: ToolCallInfo[]): ToolCallInfo[] {
-        return calls.filter(tc => tc.status === 'completed' || tc.status === 'denied' || tc.status === 'error');
+        return calls.filter(tc => tc.status === 'completed' || tc.status === 'denied' || tc.status === 'error' || tc.status === 'expired');
     }
 
     completedToolCount(calls: ToolCallInfo[]): number {
-        return calls.filter(tc => tc.status === 'completed' || tc.status === 'denied' || tc.status === 'error').length;
+        return calls.filter(tc => tc.status === 'completed' || tc.status === 'denied' || tc.status === 'error' || tc.status === 'expired').length;
     }
 
     currentToolLabel(calls: ToolCallInfo[]): string {
