@@ -68,6 +68,14 @@ HEARTBEAT_INTERVAL_SECONDS = 20  # TTL/3: ~2 missed beats tolerated
 REAPER_GRACE_SECONDS = 30  # steal at expiry + grace ⇒ ≥1.5 missed beats
 REAPER_INTERVAL_SECONDS = 15
 
+# Warm-pod affinity grace (§5.3.4). A freshly queued unit is claimable only by
+# its last holder for this long. Sized to cover one idle poll of a warm pod
+# (0.5s ± 20% jitter) with slack for scheduling and DB latency; the executor
+# additionally refuses to enter poll backoff while it holds a warm session, so
+# the warm pod is always in the fast poll cadence. The cost when the last
+# holder is gone is exactly this window, once.
+AFFINITY_GRACE_SECONDS = 2.0
+
 # --- Unit-kind / lane vocabulary (app-validated; no CHECK constraints) -------
 
 UNIT_KIND_SESSION_TURN = "session_turn"
@@ -194,6 +202,7 @@ UPDATE run_queue r SET
     state = 'leased',
     lease_token = lease_token + 1,
     leased_by = $2::text,
+    last_leased_by = $2::text,
     leased_until = now() + make_interval(secs => $3::float8),
     attempts_since_completion = attempts_since_completion + 1
 FROM c
@@ -202,11 +211,21 @@ RETURNING r.unit_id, r.unit_kind, r.fair_key, r.lease_token, r.input_seq,
           r.consumed_seq, r.attempts_since_completion, r.leased_until
 """
 
+# General claim. The affinity grace ($4) hides a freshly queued unit from
+# every pod EXCEPT the one that last held it, for a bounded window (§5.3.4):
+# the last holder may still have the thread's session attached in-process,
+# and a cold winner pays a full re-attach the warm one skips. Purely an
+# optimization — after the grace any pod claims normally, so a dead holder
+# costs at most one grace window, and `last_leased_by IS NULL` (never-claimed
+# units) is unaffected.
 _CLAIM_SQL = (
     """
 WITH c AS (
     SELECT unit_id FROM run_queue
     WHERE state = 'queued' AND unit_kind = $1::text AND run_after <= now()
+      AND (last_leased_by IS NULL
+           OR last_leased_by = $2::text
+           OR queued_at <= now() - make_interval(secs => $4::float8))
     ORDER BY priority DESC, queued_at, enqueue_ord
     LIMIT 1
     FOR UPDATE SKIP LOCKED
@@ -217,6 +236,7 @@ WITH c AS (
 
 # Affinity variant: same statement constrained to one unit (soft affinity —
 # the pod continuing its own thread). Tried FIRST, before the general claim.
+# No grace predicate: this IS the warm holder claiming its own unit.
 _CLAIM_PREFER_SQL = (
     """
 WITH c AS (
@@ -258,6 +278,11 @@ _RELEASE_SQL = """
 UPDATE run_queue SET
     state = 'queued',
     leased_by = NULL,
+    -- A release is the pod saying "I cannot serve this" (bundle refused,
+    -- attach failed, loop died, shutting down). Keeping it as the affinity
+    -- holder would make every other pod wait out the grace before failing
+    -- over to a pod that can. Same reasoning as the reaper steal.
+    last_leased_by = NULL,
     leased_until = NULL,
     queued_at = now(),
     run_after = now() + make_interval(secs =>
@@ -343,6 +368,10 @@ UPDATE run_queue SET
     state = CASE WHEN attempts_since_completion >= max_attempts
                  THEN 'parked' ELSE 'queued' END,
     leased_by = NULL,
+    -- The holder missed its heartbeats: it is dead, wedged, or partitioned.
+    -- Clearing the affinity hint keeps the grace window from delaying the
+    -- successor's claim on behalf of a pod that will never come back.
+    last_leased_by = NULL,
     leased_until = NULL,
     queued_at = now(),
     run_after = now() + make_interval(secs => $3::float8)
@@ -513,6 +542,7 @@ async def claim_unit(
     pod_name: str,
     prefer_unit_id: UUID | str | None = None,
     lease_ttl_seconds: float = LEASE_TTL_SECONDS,
+    affinity_grace_seconds: float = AFFINITY_GRACE_SECONDS,
 ) -> ClaimedUnit | None:
     """Claim the next runnable unit (§5.2 claim CTE) — or None if idle.
 
@@ -524,10 +554,19 @@ async def claim_unit(
     equal-timestamp claims deterministic FIFO. Rows with ``run_after`` in the
     future are invisible.
 
-    ``prefer_unit_id`` (soft affinity, §5.3.4) is tried FIRST regardless of
-    queue order — it is the same pod continuing its own thread; correctness
-    never depends on it. On miss (not queued / backed off / locked) the
-    general claim runs.
+    Affinity is TWO cooperating mechanisms, both soft (§5.3.4):
+
+    * ``prefer_unit_id`` is tried FIRST regardless of queue order — the pod
+      asking for the thread it just served. On miss (not queued / backed off
+      / locked) the general claim runs.
+    * ``affinity_grace_seconds`` then hides a freshly queued unit from OTHER
+      pods for that window, so the last holder's next poll wins even when a
+      cold pod polls first. Without it the prefer-path lost the 0.5s poll
+      race about half the time on k3d, and every loss paid a full re-attach.
+
+    Correctness never depends on either: after the grace any pod claims the
+    unit, and the rebuild-from-Postgres path is what makes a cold winner
+    correct anyway.
 
     The claim bumps ``lease_token`` (fencing: same-pod re-claims get a new
     token, invalidating stragglers of the previous claim) and increments
@@ -545,7 +584,9 @@ async def claim_unit(
         )
         if row is not None:
             return ClaimedUnit(**dict(row))
-    row = await conn.fetchrow(_CLAIM_SQL, unit_kind, pod_name, lease_ttl_seconds)
+    row = await conn.fetchrow(
+        _CLAIM_SQL, unit_kind, pod_name, lease_ttl_seconds, affinity_grace_seconds
+    )
     if row is None:
         return None
     return ClaimedUnit(**dict(row))

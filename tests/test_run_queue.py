@@ -70,14 +70,20 @@ pytestmark = [
     ),
 ]
 
-MIGRATION_FILE = (
+_MIGRATIONS_DIR = (
     Path(__file__).resolve().parents[1]
     / "orchestrator"
     / "database"
     / "migrations"
     / "app"
-    / "0115_run_queue.sql"
 )
+# Every migration that shapes run_queue, applied in order — the tests run
+# against the SAME DDL production does, so a column the SQL contract depends
+# on (e.g. 0117's last_leased_by) cannot pass here and fail on a real cluster.
+MIGRATION_FILES = [
+    _MIGRATIONS_DIR / "0115_run_queue.sql",
+    _MIGRATIONS_DIR / "0117_run_queue_affinity.sql",
+]
 
 SESSION = UNIT_KIND_SESSION_TURN
 WORKER = UNIT_KIND_WORKER_BATCH
@@ -109,14 +115,15 @@ async def _apply_schema() -> None:
         # src/shared/run_queue touches threads — the stub exists only so the
         # migration file applies verbatim.
         await conn.execute("CREATE TABLE threads (id UUID PRIMARY KEY)")
-        await conn.execute(MIGRATION_FILE.read_text())
+        for migration in MIGRATION_FILES:
+            await conn.execute(migration.read_text())
     finally:
         await conn.close()
 
 
 @pytest.fixture(scope="session")
 def schema():
-    """Apply 0115 to the scratch DB once per test session (drop + recreate)."""
+    """Apply the run_queue migrations to the scratch DB once per session."""
     _assert_scratch_dsn()
     asyncio.run(_apply_schema())
     yield
@@ -407,7 +414,13 @@ class TestClaimOrder:
         assert await record_input_seq(
             conn, unit_id=u, unit_kind=SESSION, input_seq=9
         ) == (STATE_QUEUED)
-        again = await claim_unit(conn, unit_kind=SESSION, pod_name="p2")
+        # A DIFFERENT pod picking the unit up is the scenario under test
+        # (watermark handoff), so opt out of the affinity window that would
+        # otherwise reserve the unit for p1 — that contract has its own
+        # class, TestAffinityGrace.
+        again = await claim_unit(
+            conn, unit_kind=SESSION, pod_name="p2", affinity_grace_seconds=0.0
+        )
         assert (again.input_seq, again.consumed_seq) == (9, 5)
         assert again.consumed_seq < again.input_seq  # caller's skip-if-answered check
 
@@ -461,23 +474,32 @@ class TestFairness:
 
 class TestLeaseToken:
     async def test_strictly_monotonic_across_lifecycle(self, conn):
+        """Token monotonicity across pods — affinity grace opted out (0.0) so
+        each hop lands on the next pod immediately; the grace is a scheduling
+        preference and has no bearing on fencing (see TestAffinityGrace)."""
         u = uuid4()
         await enqueue_unit(conn, unit_id=u, unit_kind=SESSION)
         tokens = []
 
-        c1 = await claim_unit(conn, unit_kind=SESSION, pod_name="p1")
+        c1 = await claim_unit(
+            conn, unit_kind=SESSION, pod_name="p1", affinity_grace_seconds=0.0
+        )
         tokens.append(c1.lease_token)
         await release_unit(conn, unit_id=u, lease_token=c1.lease_token)
         await enqueue_unit(conn, unit_id=u, unit_kind=SESSION)  # merge: no token write
 
-        c2 = await claim_unit(conn, unit_kind=SESSION, pod_name="p2")
+        c2 = await claim_unit(
+            conn, unit_kind=SESSION, pod_name="p2", affinity_grace_seconds=0.0
+        )
         tokens.append(c2.lease_token)
         await _expire(conn, u)
         stolen = await reap_expired(conn, grace_seconds=0.0)
         tokens.append(stolen[0].lease_token)
         await _clear_backoff(conn, u)
 
-        c3 = await claim_unit(conn, unit_kind=SESSION, pod_name="p3")
+        c3 = await claim_unit(
+            conn, unit_kind=SESSION, pod_name="p3", affinity_grace_seconds=0.0
+        )
         tokens.append(c3.lease_token)
         await complete_unit(
             conn, unit_id=u, lease_token=c3.lease_token, consumed_seq=None
@@ -485,7 +507,9 @@ class TestLeaseToken:
         await enqueue_unit(conn, unit_id=u, unit_kind=SESSION)
         assert (await _row(conn, u))["lease_token"] == c3.lease_token  # no reset
 
-        c4 = await claim_unit(conn, unit_kind=SESSION, pod_name="p4")
+        c4 = await claim_unit(
+            conn, unit_kind=SESSION, pod_name="p4", affinity_grace_seconds=0.0
+        )
         tokens.append(c4.lease_token)
 
         assert tokens == sorted(tokens)
@@ -1037,6 +1061,123 @@ class TestClaimAffinity:
             conn, unit_kind=SESSION, pod_name="p1", prefer_unit_id=target
         )
         assert claimed.unit_id == other  # backed-off affinity target not claimable
+
+
+# =============================================================================
+# Affinity grace (§5.3.4) — the DB half of warm-pod reuse: a freshly queued
+# unit belongs to its last holder for a bounded window, so the pod that may
+# still hold the attached session wins its own re-claim instead of racing.
+# =============================================================================
+
+
+class TestAffinityGrace:
+    async def test_claim_records_last_holder(self, conn):
+        u = uuid4()
+        await enqueue_unit(conn, unit_id=u, unit_kind=SESSION, input_seq=1)
+        claimed = await claim_unit(conn, unit_kind=SESSION, pod_name="pod-a")
+        row = await _row(conn, u)
+        assert row["last_leased_by"] == "pod-a"
+        # Survives completion — that is the whole point (leased_by does not).
+        await complete_unit(
+            conn, unit_id=u, lease_token=claimed.lease_token, consumed_seq=1
+        )
+        row = await _row(conn, u)
+        assert row["leased_by"] is None
+        assert row["last_leased_by"] == "pod-a"
+
+    async def test_other_pod_cannot_claim_inside_grace(self, conn):
+        u = uuid4()
+        await enqueue_unit(conn, unit_id=u, unit_kind=SESSION, input_seq=1)
+        first = await claim_unit(conn, unit_kind=SESSION, pod_name="pod-a")
+        # More input arrives during the turn → completion re-queues the unit.
+        await record_input_seq(conn, unit_id=u, unit_kind=SESSION, input_seq=2)
+        state = await complete_unit(
+            conn, unit_id=u, lease_token=first.lease_token, consumed_seq=1
+        )
+        assert state == STATE_QUEUED
+        # A cold pod polling first inside the grace sees nothing...
+        assert await claim_unit(conn, unit_kind=SESSION, pod_name="pod-b") is None
+        # ...while the warm holder claims it through the general path.
+        claimed = await claim_unit(conn, unit_kind=SESSION, pod_name="pod-a")
+        assert claimed is not None and claimed.unit_id == u
+
+    async def test_other_pod_claims_after_grace_lapses(self, conn):
+        u = uuid4()
+        await enqueue_unit(conn, unit_id=u, unit_kind=SESSION, input_seq=1)
+        first = await claim_unit(conn, unit_kind=SESSION, pod_name="pod-a")
+        await record_input_seq(conn, unit_id=u, unit_kind=SESSION, input_seq=2)
+        await complete_unit(
+            conn, unit_id=u, lease_token=first.lease_token, consumed_seq=1
+        )
+        # The warm pod never came back (crashed, scaled away): a dead holder
+        # costs exactly one grace window, not the unit.
+        await conn.execute(
+            "UPDATE run_queue SET queued_at = now() - interval '1 hour' "
+            "WHERE unit_id = $1",
+            u,
+        )
+        claimed = await claim_unit(conn, unit_kind=SESSION, pod_name="pod-b")
+        assert claimed is not None and claimed.unit_id == u
+
+    async def test_grace_is_caller_tunable(self, conn):
+        u = uuid4()
+        await enqueue_unit(conn, unit_id=u, unit_kind=SESSION, input_seq=1)
+        first = await claim_unit(conn, unit_kind=SESSION, pod_name="pod-a")
+        await record_input_seq(conn, unit_id=u, unit_kind=SESSION, input_seq=2)
+        await complete_unit(
+            conn, unit_id=u, lease_token=first.lease_token, consumed_seq=1
+        )
+        # Grace 0 = no affinity window at all (the pre-0117 behavior).
+        claimed = await claim_unit(
+            conn, unit_kind=SESSION, pod_name="pod-b", affinity_grace_seconds=0.0
+        )
+        assert claimed is not None and claimed.unit_id == u
+
+    async def test_never_claimed_unit_is_not_graced(self, conn):
+        u = uuid4()
+        await enqueue_unit(conn, unit_id=u, unit_kind=SESSION, input_seq=1)
+        # last_leased_by IS NULL → no holder to protect → claimable at once.
+        claimed = await claim_unit(conn, unit_kind=SESSION, pod_name="pod-b")
+        assert claimed is not None and claimed.unit_id == u
+
+    async def test_grace_does_not_block_prefer_path(self, conn):
+        u = uuid4()
+        await enqueue_unit(conn, unit_id=u, unit_kind=SESSION, input_seq=1)
+        first = await claim_unit(conn, unit_kind=SESSION, pod_name="pod-a")
+        await record_input_seq(conn, unit_id=u, unit_kind=SESSION, input_seq=2)
+        await complete_unit(
+            conn, unit_id=u, lease_token=first.lease_token, consumed_seq=1
+        )
+        claimed = await claim_unit(
+            conn, unit_kind=SESSION, pod_name="pod-a", prefer_unit_id=u
+        )
+        assert claimed is not None and claimed.unit_id == u
+
+    async def test_reaper_steal_clears_affinity(self, conn):
+        u = uuid4()
+        await enqueue_unit(conn, unit_id=u, unit_kind=SESSION, input_seq=1)
+        await claim_unit(conn, unit_kind=SESSION, pod_name="pod-a")
+        await _expire(conn, u)
+        stolen = await reap_expired(conn, unit_kind=SESSION)
+        assert len(stolen) == 1
+        assert (await _row(conn, u))["last_leased_by"] is None
+        # A provably-dead holder must not delay the successor by a grace window.
+        await _clear_backoff(conn, u)
+        claimed = await claim_unit(conn, unit_kind=SESSION, pod_name="pod-b")
+        assert claimed is not None and claimed.unit_id == u
+
+    async def test_grace_does_not_starve_other_units(self, conn):
+        """A graced unit must not hide unrelated work from a cold pod."""
+        held, free = uuid4(), uuid4()
+        await enqueue_unit(conn, unit_id=held, unit_kind=SESSION, input_seq=1)
+        first = await claim_unit(conn, unit_kind=SESSION, pod_name="pod-a")
+        await record_input_seq(conn, unit_id=held, unit_kind=SESSION, input_seq=2)
+        await complete_unit(
+            conn, unit_id=held, lease_token=first.lease_token, consumed_seq=1
+        )
+        await enqueue_unit(conn, unit_id=free, unit_kind=SESSION, input_seq=1)
+        claimed = await claim_unit(conn, unit_kind=SESSION, pod_name="pod-b")
+        assert claimed is not None and claimed.unit_id == free
 
 
 # =============================================================================
