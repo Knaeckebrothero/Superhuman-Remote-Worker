@@ -628,9 +628,21 @@ compat, the control-verb REST subset, the provisioning gate, permission-row
 retire, queued-turn UX, `fair_key` rotation, the lite agent-local-state
 inventory, the coalescing tick, metering ingestion and object-store PUT fencing
 are all open, and four acceptance criteria (TTFT, claim-wait under concurrency,
-prompt-cache reuse, live tenant-residue probe) have never been measured. One
-correction found while writing that status: Path-A resume-compaction
-persistence, listed as a §6.5 prerequisite, is already implemented.
+prompt-cache reuse, live tenant-residue probe) have never been measured.
+
+**Correction to an earlier claim in this file:** a first pass at that status
+said Path-A resume-compaction persistence was already implemented. It is NOT.
+The grep behind that claim matched `ensure_within_limits(trigger="resume")`,
+not `_record_compaction(trigger="resume")` — Path B persists
+(`persistent_app.py:6552`), Path A calls `ensure_within_limits` at `:6441` and
+returns at `:6473` without persisting, and the comment at `:6543` states that
+deliberately (it avoids a banner double-render). So the §6.5 prerequisite
+stands, and on the stateless lane it is the one live functional bug in the
+shipped path: any thread that has ever compacted takes Path A, and if its
+post-boundary tail is over budget it pays a blocking aux-LLM summarization per
+CLAIM and discards it. Invisible in this session's numbers because the test
+thread's tail is under budget. Caught by a second audit pass whose whole job
+was to distrust the first — worth repeating on anything of this shape.
 
 ## Follow-ups this session leaves
 

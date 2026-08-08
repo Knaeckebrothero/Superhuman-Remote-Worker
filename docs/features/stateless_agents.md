@@ -329,8 +329,9 @@ one of the three drivers exists; most of S1's surround does not.**
 
 | | Design | Built |
 |---|---|---|
-| Queue + lease contract | ONE `run_queue` table discriminated by `unit_kind` (`session_turn`/`worker_batch`/`bg_task`); one claim/heartbeat/fence/completion/reaper semantics | **BUILT, kind-agnostic.** `src/shared/run_queue/` takes `unit_kind` as a parameter everywhere; no SQL in it knows what a session is. The reaper steals any expired lease and only *journals* for sessions, with an explicit `(S3)` skip for other kinds |
-| Pod pools | Deliberately TWO Deployments off ONE image (§5.8): interactive warm floor vs worker KEDA scaler at `minReplicaCount: 0` | **ONE built** — `helm/templates/agent/stateless-deployment.yaml`, session class, chart-gated default off. No worker Deployment; KEDA remains an uninstalled cluster dependency |
+| Queue + lease contract | ONE `run_queue` table discriminated by `unit_kind` (`session_turn`/`worker_batch`/`bg_task`); one claim/heartbeat/fence/completion/reaper semantics | **BUILT, kind-agnostic.** `src/shared/run_queue/` takes `unit_kind` as a parameter everywhere — claim, fence, completion, release, heartbeat, steal, unpark, read models — and no SQL in it knows what a session is. The reaper steals any expired lease and only *journals* for sessions, with an explicit `(S3)` skip. Only soft coupling: `consumed_seq = input_seq - 1` at row creation assumes a monotonic input counter, which a worker lane without an input stream would simply leave unused |
+| Event journal | (implied shared) | **NOT shared — session-only by construction.** `src/shared/event_journal/` hardcodes `threads` and `thread_events` and keys on `thread_id`. Workers have no journal at all; that is the §10.2 job-journal decision, still open. The `src/shared/` path is about who *imports* it (agent + orchestrator), not about unit kinds |
+| Pod pools | Deliberately TWO Deployments off ONE image (§5.8): interactive warm floor vs worker KEDA scaler at `minReplicaCount: 0` | **ONE built** — `helm/templates/agent/stateless-deployment.yaml`, session class, chart-gated default off, static `replicas: 2`. No worker Deployment; KEDA remains an uninstalled cluster dependency with no `ScaledObject` anywhere. Note the comparison is not Deployment-vs-Deployment: there is no pinned-pool Deployment either — pinned agents are one-shot Pods built imperatively by `agent_provisioner._build_pod_manifest`, which is why §5.8 says "the chart has no agent Deployment today" |
 | Drivers | A session driver and a worker driver over the same queue | **Session only** (`src/api/turn_executor.py`) |
 
 So the intent stands and the foundation is real: adding workers needs no schema
@@ -349,19 +350,41 @@ which also removes the pinned lane's cache-wipe cascade); turn rows + watermarks
 the *pinned* pool); the flag-gated Deployment; soft affinity + warm-session reuse;
 and the fault matrix (takeover ≤105 s, no duplicate answer, zombie's late persist
 fenced, FIFO drain across a steal, epoch ≤1 bump per steal and 0 per clean
-handoff, zero in-process claim state). Path-A resume-compaction persistence
-(§6.5) is also **done** — `_record_compaction(trigger="resume")` writes its
-`role='summary'` boundary row.
+handoff, zero in-process claim state).
+
+**Correction (same day, caught by a second audit pass): Path-A
+resume-compaction persistence (§6.5) is NOT done, and it is the one live
+functional bug in the shipped path.** An earlier version of this section
+claimed otherwise on the strength of a grep that matched
+`ensure_within_limits(trigger="resume")` rather than
+`_record_compaction(trigger="resume")` — a lesson in reading the call, not the
+keyword. What the code actually does: Path B (full load, no checkpoint)
+persists its resume compaction (`persistent_app.py:6552`); **Path A
+(checkpoint restore) calls `ensure_within_limits(..., trigger="resume")` at
+`:6441` and returns at `:6473` without persisting**, and the comment at `:6543`
+says so deliberately — Path A skips the write to avoid a live/history banner
+double-render. That reasoning is about the *banner*; the discarded
+*summarization work* is the problem. Any thread that has ever compacted takes
+Path A, so if its post-boundary tail is over budget it pays a blocking
+aux-LLM summarization **on every claim** and throws the result away. On the
+pinned lane that was one call per pod restart; per-turn attach turns it into
+one per turn. It did not show up in this session's measurements because the
+test thread's tail sits under budget. The fix is not a blind copy of Path B's
+call — it has to advance the boundary row without reintroducing the double
+render.
 
 Not built, all of them named in S1's own list above:
 
 - **Cockpit workstream** — `/connection` + `/prepare` compat, composer ungating, provisioning-card bypass.
 - **Control-verb REST subset** (§6.7) — `mode.set`, `narration.set`, `compact`, `archive`, `undo`, `rewind`, `config.update`, `upgrade-to-workspace` are still control-WS-only, and a stateless thread has no socket to reach. Interrupt is a deliberate **501** on the lane.
 - **Provisioning gate** — `execution_lane` is consulted in exactly three places (input admission, interrupt, claim-bundle). Nothing stops `/resume` or `/prepare` on a stateless thread; the operating rule "only flip a detached thread, never resume it" is convention, not code.
-- **Persistence promotions** — mode/narration, session task manager, memory-extraction interval cursor, media-fidelity decision.
-- **Permission-row retire** on lease expiry; **queued-turn UX frame**; **`fair_key` round-robin** (the column and its merge exist; no rotation CTE).
+- **Persistence promotions** — mode/narration, session task manager, memory-extraction interval cursor, media-fidelity decision, and Path-A resume-summary persistence (see the correction above).
+- **Permission-row retire** on lease expiry — nothing sweeps `thread_permission_requests`. **Queued-turn UX frame** — no `turn.queued` kind exists anywhere; only the reaper's `turn.interrupted`/`turn.parked`, so a user queued behind a busy pool sees nothing. **`fair_key` round-robin** — the column and its merge exist; no rotation CTE.
 - **Lite agent-local-state inventory** (§6.1) — the PVC question S1 is supposed to answer is still open.
-- **Journal-writer coalescing tick**; **metering lease-interval ingestion** (shadow); **object-store PUT fencing** (or the documented corruption window).
+- **Journal-writer coalescing tick**; **object-store PUT fencing** (or the documented corruption window).
+- **Metering lease-interval attribution** — not merely unbuilt, actively routed around: `stateless-deployment.yaml` labels the class `app: srw-agent-stateless` precisely so `classify_product_pod` won't claim it, which means **stateless pods are currently unattributed compute** ("shared platform capacity"). Any real traffic on this lane is unbilled until the interval reconciler lands.
+- **Job-log capture per claim** — the only capture path is `_capture_agent_logs_before_reap`, triggered by *provisioner* pod-reap. A ReplicaSet-deleted stateless pod's logs are unrecoverable.
+- **Admin/fleet read model** — PARTIAL. The queue half exists (`GET /api/admin/run-queue` + unpark), but API-only: no cockpit view, no MCP tool, and the registration surface it is meant to replace (`list_agents`, `get_agent_stats`, `deregister_agent`, `assign_job`) is untouched.
 
 Acceptance criteria, honestly scored: met are create-to-accepted <1 s, takeover
 ≤105 s with no duplicate answer, the fence assert, FIFO-across-steal, the epoch
@@ -381,8 +404,16 @@ second user identity.
 tmux reattach-if-exists, PVC externalization, cloud-push generation fence,
 outbox re-homing, the two resident daemons, presence re-home all outstanding.
 
-**S3** (workers): nothing beyond the shared substrate. The list is long and
-mostly unstarted: `batch_boundary` freeze + the consolidated freeze registry
+**S3** (workers): nothing beyond the shared substrate, and one precondition is
+already latent in shipped code — §5.4.4's coexistence partition was never
+applied. `get_dispatchable_jobs` *selects* `runner_kind` but filters on nothing,
+and neither lease sweep excludes a class, so the double-execution chain the
+critic pass identified (a healthy `run_queue` lease → `recover_expired_lease_jobs`
+sees the un-renewed `jobs.lease_expires_at` → flips the job `paused` →
+the leader dispatcher hands it to a pinned agent) is unmitigated. Harmless
+today only because no stateless worker exists; it must be closed *before* the
+first `worker_batch` unit is ever enqueued. The rest of the list:
+`batch_boundary` freeze + the consolidated freeze registry
 (the phantom-COMPLETE skew hazard in §5.4.1 makes this a *correctness*
 prerequisite, not a nicety), TodoManager hydration on any resume, conditional
 tmux kill, pull-claim + claim-token renewal + stage-4 CAS keyed on
