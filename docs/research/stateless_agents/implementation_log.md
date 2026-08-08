@@ -904,3 +904,123 @@ ReplicaSet.
 Safety state: Gates 1 and 2 are DONE and verified. Boundary code exists in the
 agent image but no production path can arm it. No real worker work has been
 queued. Gate 3 remains closed.
+
+## Phase 3 / Gate 3 — completion ownership audit (STOP boundary; NOT DONE)
+
+The implementation was stopped before the worker driver after three independent
+read-only audits reached the same no-go conclusion: the brief's statement that
+stage-4 completion currently CASes on `assigned_agent_id` is not true in this
+checkout. `JobCompleteRequest` contains no agent identity or lease token, and
+`PostgresDatabase.update_job_status()` ends in `UPDATE jobs ... WHERE id = ?`.
+There is therefore no small existing CAS to switch from agent id to queue token.
+
+More importantly, `/api/jobs/{job_id}/complete` is a long, multi-autocommit
+workflow rather than one terminal write. Before and around the ordinary status
+update it can persist freeze/context state, increment infra/memory/LLM and
+deliverable retry counters, pause or recover workspaces, and deliver loop output
+to cloud storage. Afterward it can graft subjob output, handle critic/scholar/
+delegation results, spawn verification/curation work, advance loops, write
+terminal records, enqueue session wakes, notify users, and archive/delete the
+workspace. Several operations are external and several are not idempotent.
+The terminal job status is written before some of those hooks; a crash followed
+by a retry can hit the route's terminal early-return and permanently skip the
+remaining work.
+
+Consequences for the three obvious fencing shapes:
+
+- an entry-time `fence_lease()` can succeed and commit, then the reaper can
+  steal while the stale handler continues mutating state;
+- a final `UPDATE ... WHERE lease_token = ?` rejects too late, after stale
+  mutations and external effects have already happened;
+- holding the `run_queue` row lock across the whole route would hold a database
+  transaction across seconds-class network/VM/archive work and block the
+  queue's reaper contract.
+
+The required Gate 3 design is durable accepted-command ownership:
+
+1. Pinned completion remains tokenless on its existing path. A stateless report
+   requires a strictly positive `lease_token`; a token on a pinned job, no token
+   on a stateless job, an unknown lane, or an unaccepted stale token fails closed.
+2. One short transaction uses global lock order `run_queue -> jobs -> completion
+   command`, verifies the leased `worker_batch` token, records an immutable
+   command keyed by `(job_id, lease_token)` with its canonical payload, and
+   consumes the queue lease. Exact retries return the recorded state/result;
+   the same key with a different payload is a conflict.
+3. `batch_boundary` is the bounded DB-only case: in that transaction, set the
+   job to rotation-paused, clear legacy assignment/lease metadata, stash and
+   clear the freeze, reset/requeue the durable queue row, and finish the command.
+   It returns before generic graft/delivery/verification/cleanup hooks.
+4. Terminal reports leave a durable accepted obligation and a non-runnable
+   queue row. A separately claimed, visibility-timeout finalizer owns recovery.
+   Its core mutation and every retry/finish write are command-token CASes;
+   irreversible/external effects need deterministic idempotency keys or durable
+   per-step markers. A `core_applied` retry resumes outstanding hooks rather
+   than re-running status determination or hitting the legacy terminal guard.
+
+An intake table plus the atomic boundary disposition would be a safe Gate 3A
+slice, but it would not support terminal reports and therefore would not finish
+Gate 3 or authorize a driver. No migration, request field, intake scaffold, or
+worker-only partial path was landed: doing so would create a misleading
+"lease-token fenced" surface while the corrupting race remained. The next
+implementation should include real-Postgres acceptance/reaper races,
+same-token exact/divergent replay tests, rollback injection, finalizer visibility
+timeout fencing, crash-after-intake and crash-after-core convergence, and
+once-only assertions for counters, grafts, verification/loop hooks, delivery,
+and cleanup. Existing pinned completion behavior must remain unchanged.
+
+## Shared-pool decision at the stop boundary
+
+The requested one-Deployment experiment is **NO-SHIP at this boundary**. This is
+not a measured starvation failure: safety correctly prevented any worker claim,
+so no concurrent session/worker load result exists. The architecture audit did
+find two prerequisites absent from the proposed pod-local reservation:
+
+- a pod refusing a worker when its own slot is reserved does not guarantee a
+  pool-wide interactive executor; a static two-replica Deployment can lose the
+  reserve during rollout, pod failure, or executor unavailability without a
+  coordinator-visible presence/capacity contract;
+- the built stateless Deployment intentionally has no Tailscale/VM-mesh sidecar,
+  so it cannot serve the full existing worker capability set as one generic
+  pool.
+
+The design doc now retains two Deployments as the production default. A future
+one-pool experiment must first provide a failure-aware interactive reservation,
+capability-aware claims, and then pass the p95 session claim-wait benchmark
+under worker load. Gate 3 must be complete before that traffic is legal.
+
+Safety state at the boundary: the running DB still has zero `worker_batch` rows;
+the only deployed driver remains the session driver. Gates 1 and 2 are DONE.
+Gate 3, TodoManager resume hydration, generator-close cleanup, real tmux
+reattach, the worker driver, shared-pool guard, two-pod batch handoff, fault
+injection, and Job Bench parity/performance remain unverified.
+
+## Final verification of the stop boundary
+
+- Full repository run: **15,026 passed, 113 skipped, 23 failed** in 975.45 s.
+  Twenty-two failures are the current environment's missing-`asyncssh` canvas
+  transport group (15) and MCP 1.26 contract group (7); the exact same 22
+  failures reproduced from untouched base commit `3802d0e2` in a temporary
+  worktree outside Tilt's watch root. The remaining failure is the brief-listed
+  `test_connect_disconnect` localhost-Postgres assumption; it independently
+  fails with connection refused on port 5432, and neither its test nor
+  `src/database/postgres_db.py` differs from the base commit. No S3-focused or
+  queue test failed.
+- Repository Ruff check: clean. Ruff format check: all **1,039 files** already
+  formatted. `git diff --check`: clean.
+- Schema replay/drift check: clean through migration 0118. The first two final
+  invocations failed before replay because the script changes into
+  `orchestrator/` and a relative/absent `PYTHONPATH` could not import the new
+  root-level shared module. This was a real Gate-2 tooling integration defect,
+  not left as an invocation workaround: `schema-snapshot.sh` now explicitly
+  carries `REPO_ROOT` in the migration runner's `PYTHONPATH` while retaining the
+  orchestrator working directory. `bash -n` is clean and the ordinary command
+  `scripts/schema-snapshot.sh --check app` now passes without caller-provided
+  environment; 0118 replayed in **4 ms** on that final run.
+- Tilt reports `(Tiltfile)=ok`, `srw=ok`; `agent-stateless` is **2/2** and the
+  orchestrator is **1/1**. Every running agent container contains exactly one
+  boundary timing marker, exactly one 300 s floor definition, and exactly one
+  default-unarmed target initializer. The running orchestrator contains exactly
+  one unknown-freeze corruption guard, six legacy-lane recovery predicates, and
+  exactly one shared `batch_boundary` registry definition.
+- Final live SQL invariant: **0 `worker_batch` rows**. No worker workload was
+  used for a test or measurement.
