@@ -1377,12 +1377,18 @@
     "rewind": {
       "button": "Bis hierher zurückspulen",
       "title": "Sitzung zurückspulen",
-      "body": "Zur Zeit vor dieser Nachricht zurückkehren? Nachrichten nach diesem Punkt werden aus der Unterhaltung ausgeblendet (bleiben im Audit-Protokoll erhalten). Dateien kehren zu ihrem damaligen Stand zurück.",
       "caveat": "Befehle mit externen Auswirkungen (Netzwerkaufrufe, Deployments) lassen sich nicht rückgängig machen.",
       "both": "Unterhaltung und Dateien wiederherstellen",
+      "bothDesc": "Spätere Nachrichten ausblenden und Dateien auf diesen Stand zurücksetzen",
       "conversation": "Nur Unterhaltung wiederherstellen",
+      "conversationDesc": "Dateien behalten ihren aktuellen Stand",
       "code": "Nur Dateien wiederherstellen",
-      "summarize": "Bis hierher zusammenfassen"
+      "codeDesc": "Die Unterhaltung bleibt unverändert",
+      "summarize": "Bis hierher zusammenfassen",
+      "summarizeDesc": "Alles bis zu diesem Punkt zu einer Zusammenfassung verdichten",
+      "pickerTitle": "Zurückspulen zu …",
+      "pickerHint": "Nachricht auswählen, zu der zurückgespult werden soll:",
+      "pickerEmpty": "Noch keine früheren Nachrichten zum Zurückspulen."
     },
     "diff": {
       "replace": "Diff",
@@ -1623,6 +1629,7 @@
       "compact": "Unterhaltungsverlauf komprimieren, um Kontext freizugeben",
       "done": "Sitzung beenden — Erinnerungen extrahieren und archivieren",
       "undo": "Dateiänderungen des letzten Zugs rückgängig machen",
+      "rewind": "Zu einer früheren Nachricht zurückspulen",
       "auto": "Zu Auto-Akzeptieren wechseln (alles außer Shell genehmigen)",
       "supervised": "Zu Beaufsichtigt wechseln (alle Schreibvorgänge genehmigen)",
       "autonomous": "Zu Autonom wechseln (nichts genehmigen)",

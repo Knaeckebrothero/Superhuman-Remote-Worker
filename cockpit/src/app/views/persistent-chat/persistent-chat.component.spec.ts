@@ -13,12 +13,14 @@ import {
     HEADER_LEFT_RESERVE_PX,
     isMicMode,
     isNearBottom,
+    isRewindCommand,
     isStartupBannerVisible,
     loadDraft,
     NEAR_BOTTOM_PX,
     pinTarget,
     pickCodeServerUrlToOpen,
     pickCurrentStartupStep,
+    pickRewindCandidates,
     pickRunningCommandCard,
     pickWorkspaceOfferCard,
     PersistentChatComponent,
@@ -30,7 +32,7 @@ import {
     shouldSendOnEnter,
     textSizeToCss,
 } from './persistent-chat.component';
-import {AssistantTurn, MIN_FOLD_RUN} from '../../core/models/turn.model';
+import {AssistantTurn, MIN_FOLD_RUN, Turn, UserTurn} from '../../core/models/turn.model';
 
 /**
  * Build a minimal DataTransferItem stand-in. The real DataTransferItemList
@@ -743,5 +745,50 @@ describe('composeDenyPrefill', () => {
 
     it('never clobbers what the user already typed', () => {
         expect(composeDenyPrefill('half a thought', starter)).toBe('half a thought');
+    });
+});
+
+describe('isRewindCommand', () => {
+    it('matches the bare command, any casing', () => {
+        expect(isRewindCommand('/rewind')).toBe(true);
+        expect(isRewindCommand('/REWIND')).toBe(true);
+    });
+
+    it('ignores trailing arguments — the picker decides the target', () => {
+        expect(isRewindCommand('/rewind to the banana one')).toBe(true);
+    });
+
+    it('never matches other commands, prefixed text, or plain chat', () => {
+        expect(isRewindCommand('/rewindx')).toBe(false);
+        expect(isRewindCommand('/undo')).toBe(false);
+        expect(isRewindCommand('rewind')).toBe(false);
+        expect(isRewindCommand('please /rewind')).toBe(false);
+        expect(isRewindCommand('')).toBe(false);
+    });
+});
+
+describe('pickRewindCandidates', () => {
+    const user = (id: string, historical = true): UserTurn =>
+        ({kind: 'user', id, content: `msg ${id}`, timestamp: 0, historical});
+    const assistant = (id: string): Turn =>
+        ({kind: 'assistant', id, events: [], status: 'complete', startedAt: 0, historical: true} as Turn);
+
+    it('lists only historical user turns, newest first', () => {
+        const turns: Turn[] = [user('u1'), assistant('a1'), user('u2'), assistant('a2')];
+        expect(pickRewindCandidates(turns, new Set()).map((t) => t.id)).toEqual(['u2', 'u1']);
+    });
+
+    it('excludes optimistic bubbles the server has not persisted yet', () => {
+        const turns: Turn[] = [user('u1'), user('u2', false)];
+        expect(pickRewindCandidates(turns, new Set()).map((t) => t.id)).toEqual(['u1']);
+    });
+
+    it('excludes turns still queued in the send outbox', () => {
+        const turns: Turn[] = [user('u1'), user('u2')];
+        expect(pickRewindCandidates(turns, new Set(['u2'])).map((t) => t.id)).toEqual(['u1']);
+    });
+
+    it('returns empty for an empty transcript', () => {
+        expect(pickRewindCandidates([], new Set())).toEqual([]);
     });
 });
