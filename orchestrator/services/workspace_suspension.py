@@ -16,7 +16,11 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 
 from services import resolve_ssh_key_path
-from services.ssh_helpers import stream_extract_snapshot
+from services.ssh_helpers import (
+    EXTRACT_HOME_REMOTE_CMD,
+    EXTRACT_REMOTE_CMD,
+    stream_extract_snapshot,
+)
 from services.vm_provisioner import vm_persistent_rootdisk_enabled
 from services.workspace_lifecycle import WorkspaceOwner
 
@@ -424,8 +428,15 @@ class WorkspaceSuspensionService:
 
         try:
             ssh_host = None
+            # Pod vs VM decides the extract scope below: a pod extract runs as
+            # the unprivileged agent-host user and must NOT try to overwrite the
+            # image-provided, root-owned /usr/local (scoped_home), while a VM
+            # extract (root, the snapshot IS the disk) restores the whole tree.
+            restoring_vm = bool(
+                vm_ctx and self._vm_provisioner and self._vm_provisioner.is_available
+            )
 
-            if vm_ctx and self._vm_provisioner and self._vm_provisioner.is_available:
+            if restoring_vm:
                 # VM: create a fresh VM
                 ok = await self._vm_provisioner.create_vm(job_id)
                 if not ok:
@@ -479,7 +490,9 @@ class WorkspaceSuspensionService:
             # 'ready' over it hands the dispatcher a blank tree that looks
             # healthy. Fail visibly instead and let the caller decide.
             ssh_port = _resolve_ssh_port(ws_ctx, vm_ctx)
-            if not await self._extract_snapshot(job_id, ssh_host, ssh_port=ssh_port):
+            if not await self._extract_snapshot(
+                job_id, ssh_host, ssh_port=ssh_port, scoped_home=not restoring_vm
+            ):
                 error_msg = "snapshot extraction failed on restore"
                 logger.error("%s (job %s)", error_msg, job_id)
                 if ws_ctx:
@@ -527,10 +540,23 @@ class WorkspaceSuspensionService:
         ssh_host: str,
         ssh_port: int = 22,
         entity_type: str = "jobs",
+        *,
+        scoped_home: bool = False,
     ) -> bool:
         """Download snapshot from S3 and extract into the pod via SSH.
 
         Mirrors ide_session.py:_extract_snapshot_to_vm (lines 782-836).
+
+        ``scoped_home`` selects the extract command. A snapshot carries both
+        ``/home/agent-host`` and ``/usr/local``; for a **container/pod** target
+        the extract runs as the unprivileged ``agent-host`` user, which cannot
+        overwrite the image-provided, root-owned ``/usr/local`` files — the full
+        extract then exits rc=2 and the restore is (correctly) reported failed,
+        so pod restore-from-S3 silently never worked. Pods pass
+        ``scoped_home=True`` to extract only ``home/agent-host`` (the pod image
+        already supplies ``/usr/local``), matching the proven
+        ``ide_session`` k8s-pod path. VMs (root, the snapshot IS the disk) keep
+        the full extract. See docs/features/workspace_durability_tiering.md §C1.
 
         Returns:
             True when the snapshot was downloaded AND unpacked cleanly; False
@@ -564,7 +590,13 @@ class WorkspaceSuspensionService:
                     entity_id,
                 )
             rc, stderr = await stream_extract_snapshot(
-                ssh_host, ssh_port, tar_path, key_path=key_path
+                ssh_host,
+                ssh_port,
+                tar_path,
+                key_path=key_path,
+                remote_cmd=(
+                    EXTRACT_HOME_REMOTE_CMD if scoped_home else EXTRACT_REMOTE_CMD
+                ),
             )
 
             if rc != 0:
@@ -986,7 +1018,11 @@ class WorkspaceSuspensionService:
                     reattach_reason,
                 )
             elif not await self._extract_snapshot(
-                thread_id, ssh_host, ssh_port=ssh_port, entity_type="threads"
+                thread_id,
+                ssh_host,
+                ssh_port=ssh_port,
+                entity_type="threads",
+                scoped_home=not is_vm,
             ):
                 # Same reasoning as the job path: a workspace that failed to
                 # restore must not advertise itself as ready.
