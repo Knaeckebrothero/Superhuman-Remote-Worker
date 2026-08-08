@@ -326,8 +326,11 @@ def test_rewind_resweeps_after_truncate_before_epoch_bump(monkeypatch):
         order.append("epoch_bump")
         return 7
 
+    # Rewind is a deliberate bump: it calls _bump_event_journal_epoch (the
+    # attach-time _resolve_event_journal_epoch now REUSES live epochs and is
+    # no longer on the rewind path — doc §5.3.2).
     monkeypatch.setattr(
-        app_mod, "_resolve_event_journal_epoch", AsyncMock(side_effect=_epoch_bump)
+        app_mod, "_bump_event_journal_epoch", AsyncMock(side_effect=_epoch_bump)
     )
 
     _run_rewind(

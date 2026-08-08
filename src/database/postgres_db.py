@@ -54,6 +54,57 @@ def _coerce_row_id(raw_id: Optional[str]) -> str:
         return str(uuid.uuid5(_THREAD_MSG_ID_NS, str(raw_id)))
 
 
+def _active_run_queue_lease():
+    """``(unit_id, lease_token)`` when a stateless-executor lease is active.
+
+    Pinned-lane processes never set the lease ContextVar, so this returns
+    ``None`` and every fenced code path below keeps today's exact behavior.
+    Imported lazily: ``src.api.lease_context`` is stdlib-only, but importing
+    it at module scope from here would couple import order to ``src.api``'s
+    package init (which pulls the full app tree).
+    """
+    try:
+        from src.api.lease_context import get_current_lease
+    except Exception:  # pragma: no cover - defensive (partial installs)
+        return None
+    return get_current_lease()
+
+
+async def _require_run_queue_fence(conn, lease) -> None:
+    """§5.2 persist fence: first statement of a fenced persist transaction.
+
+    ``FOR SHARE`` on the run_queue row blocks a concurrent reaper steal until
+    this transaction commits, so check-then-write cannot interleave with a
+    steal. Zero rows ⇒ the lease is lost ⇒ raise :class:`LeaseLostError` so
+    the enclosing transaction rolls back and nothing lands.
+
+    Torn-turn invariant (stateless_agents.md §5.2): a turn's durable footprint
+    spans multiple fenced transactions (per-append message rows, the turn-end
+    reconcile, the compaction checkpoint row, completion). Each is fenced
+    individually; a steal BETWEEN them leaves a torn turn, and that is
+    accepted because sessions rebuild from ``thread_messages`` + the consumed
+    watermark alone — a checkpoint-ahead-of-messages tear is converged by the
+    next claim's rebuild, and the claim-time skip-if-answered watermark
+    prevents the double-answer.
+    """
+    from src.api.lease_context import LeaseLostError, mark_current_lease_lost
+    from src.shared.run_queue import fence_lease
+
+    unit_id, lease_token = lease
+    ok = await fence_lease(conn, unit_id=unit_id, lease_token=lease_token)
+    if not ok:
+        mark_current_lease_lost()
+        logger.error(
+            "run_queue fence rejected: unit=%s token=%s — lease lost, "
+            "aborting thread_messages persist",
+            unit_id,
+            lease_token,
+        )
+        raise LeaseLostError(
+            f"run_queue lease lost for unit {unit_id} (token {lease_token})"
+        )
+
+
 class PostgresDB:
     """PostgreSQL database manager with async connection pooling.
 
@@ -679,6 +730,42 @@ class PostgresDB:
             before_seq,
         )
 
+    # Shared by the single-row upsert (RETURNING id, seq) and the turn-complete
+    # reconcile batch (same statement minus RETURNING — executemany discards
+    # results). Keep the column set in lockstep with the orchestrator's writer.
+    _THREAD_MESSAGE_UPSERT_SQL = """
+        INSERT INTO thread_messages
+            (id, thread_id, role, content, tool_calls, turn_number,
+             metrics, tool_call_id, thinking,
+             reasoning, tool_results, provider, provider_raw,
+             additional_kwargs, response_metadata)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
+                $14, $15)
+        ON CONFLICT (id) DO UPDATE SET
+            content           = EXCLUDED.content,
+            tool_calls        = EXCLUDED.tool_calls,
+            turn_number       = EXCLUDED.turn_number,
+            metrics           = EXCLUDED.metrics,
+            tool_call_id      = EXCLUDED.tool_call_id,
+            thinking          = EXCLUDED.thinking,
+            reasoning         = EXCLUDED.reasoning,
+            tool_results      = EXCLUDED.tool_results,
+            provider          = EXCLUDED.provider,
+            provider_raw      = EXCLUDED.provider_raw,
+            additional_kwargs = EXCLUDED.additional_kwargs,
+            response_metadata = EXCLUDED.response_metadata
+        RETURNING id, seq
+    """
+    _THREAD_MESSAGE_UPSERT_BATCH_SQL = _THREAD_MESSAGE_UPSERT_SQL.replace(
+        "RETURNING id, seq", ""
+    )
+    _THREAD_ACTIVITY_BUMP_SQL = """
+        UPDATE threads
+        SET last_activity = CURRENT_TIMESTAMP,
+            total_turns   = GREATEST(total_turns, COALESCE($2, 0))
+        WHERE id = $1
+    """
+
     async def save_thread_message(
         self,
         thread_id: str,
@@ -725,63 +812,48 @@ class PostgresDB:
         its ``ON CONFLICT`` target arrived in migration 0023.
         """
         msg_id = _coerce_row_id(id)
-        async with self.acquire() as conn:
-            row = await conn.fetchrow(
-                """
-                INSERT INTO thread_messages
-                    (id, thread_id, role, content, tool_calls, turn_number,
-                     metrics, tool_call_id, thinking,
-                     reasoning, tool_results, provider, provider_raw,
-                     additional_kwargs, response_metadata)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
-                        $14, $15)
-                ON CONFLICT (id) DO UPDATE SET
-                    content           = EXCLUDED.content,
-                    tool_calls        = EXCLUDED.tool_calls,
-                    turn_number       = EXCLUDED.turn_number,
-                    metrics           = EXCLUDED.metrics,
-                    tool_call_id      = EXCLUDED.tool_call_id,
-                    thinking          = EXCLUDED.thinking,
-                    reasoning         = EXCLUDED.reasoning,
-                    tool_results      = EXCLUDED.tool_results,
-                    provider          = EXCLUDED.provider,
-                    provider_raw      = EXCLUDED.provider_raw,
-                    additional_kwargs = EXCLUDED.additional_kwargs,
-                    response_metadata = EXCLUDED.response_metadata
-                RETURNING id, seq
-                """,
-                msg_id,
-                thread_id,
-                role,
-                content,
-                json.dumps(tool_calls) if tool_calls is not None else None,
-                turn_number,
-                json.dumps(metrics) if metrics is not None else None,
-                tool_call_id,
-                thinking,
-                json.dumps(reasoning) if reasoning is not None else None,
-                json.dumps(tool_results) if tool_results is not None else None,
-                provider,
-                json.dumps(provider_raw) if provider_raw is not None else None,
-                json.dumps(additional_kwargs)
-                if additional_kwargs is not None
-                else None,
-                json.dumps(response_metadata)
-                if response_metadata is not None
-                else None,
-            )
+        insert_args = (
+            msg_id,
+            thread_id,
+            role,
+            content,
+            json.dumps(tool_calls) if tool_calls is not None else None,
+            turn_number,
+            json.dumps(metrics) if metrics is not None else None,
+            tool_call_id,
+            thinking,
+            json.dumps(reasoning) if reasoning is not None else None,
+            json.dumps(tool_results) if tool_results is not None else None,
+            provider,
+            json.dumps(provider_raw) if provider_raw is not None else None,
+            json.dumps(additional_kwargs) if additional_kwargs is not None else None,
+            json.dumps(response_metadata) if response_metadata is not None else None,
+        )
+
+        async def _write(conn):
+            row = await conn.fetchrow(self._THREAD_MESSAGE_UPSERT_SQL, *insert_args)
             # Bump thread activity + turn count (mirrors the orchestrator path so
             # going direct doesn't regress last_activity / total_turns tracking).
             await conn.execute(
-                """
-                UPDATE threads
-                SET last_activity = CURRENT_TIMESTAMP,
-                    total_turns   = GREATEST(total_turns, COALESCE($2, 0))
-                WHERE id = $1
-                """,
+                self._THREAD_ACTIVITY_BUMP_SQL,
                 thread_id,
                 turn_number,
             )
+            return row
+
+        lease = _active_run_queue_lease()
+        async with self.acquire() as conn:
+            if lease is None:
+                # Pinned lane: today's exact behavior (autocommit statements).
+                row = await _write(conn)
+            else:
+                # Stateless lane (§5.2): the persist transaction opens with the
+                # run_queue fence; a rejected fence raises LeaseLostError and
+                # nothing lands. FOR SHARE inside the fence holds off a
+                # concurrent steal until this commit.
+                async with conn.transaction():
+                    await _require_run_queue_fence(conn, lease)
+                    row = await _write(conn)
         return {"id": str(row["id"]), "seq": row["seq"]}
 
     async def save_thread_messages(
@@ -834,44 +906,21 @@ class PostgresDB:
                 )
             )
 
+        lease = _active_run_queue_lease()
         async with self.acquire() as conn:
             async with conn.transaction():
+                # Stateless lane (§5.2): the reconcile transaction opens with
+                # the run_queue fence. Pinned lane (no lease context) keeps
+                # today's exact transaction shape.
+                if lease is not None:
+                    await _require_run_queue_fence(conn, lease)
                 # Same upsert as save_thread_message, minus RETURNING. Each
                 # execution's ON CONFLICT is independent (executemany runs N
                 # separate commands), so distinct-id rows never collide.
-                await conn.executemany(
-                    """
-                    INSERT INTO thread_messages
-                        (id, thread_id, role, content, tool_calls, turn_number,
-                         metrics, tool_call_id, thinking,
-                         reasoning, tool_results, provider, provider_raw,
-                         additional_kwargs, response_metadata)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
-                            $13, $14, $15)
-                    ON CONFLICT (id) DO UPDATE SET
-                        content           = EXCLUDED.content,
-                        tool_calls        = EXCLUDED.tool_calls,
-                        turn_number       = EXCLUDED.turn_number,
-                        metrics           = EXCLUDED.metrics,
-                        tool_call_id      = EXCLUDED.tool_call_id,
-                        thinking          = EXCLUDED.thinking,
-                        reasoning         = EXCLUDED.reasoning,
-                        tool_results      = EXCLUDED.tool_results,
-                        provider          = EXCLUDED.provider,
-                        provider_raw      = EXCLUDED.provider_raw,
-                        additional_kwargs = EXCLUDED.additional_kwargs,
-                        response_metadata = EXCLUDED.response_metadata
-                    """,
-                    args,
-                )
+                await conn.executemany(self._THREAD_MESSAGE_UPSERT_BATCH_SQL, args)
                 # One activity/turn bump for the whole batch (was per-message).
                 await conn.execute(
-                    """
-                    UPDATE threads
-                    SET last_activity = CURRENT_TIMESTAMP,
-                        total_turns   = GREATEST(total_turns, COALESCE($2, 0))
-                    WHERE id = $1
-                    """,
+                    self._THREAD_ACTIVITY_BUMP_SQL,
                     thread_id,
                     max_turn,
                 )

@@ -47,6 +47,8 @@ from ..core.tool_policy import (
     validate_tool_override_fragment,
 )
 from ..core.workspace_backend import WorkspaceUnavailableError
+from .lease_context import current_lease as _current_lease_var
+from ..shared import event_journal as _event_journal
 from ..agent import UniversalAgent
 from ..llm.reasoning_chat import extract_reasoning_text_from_block
 from ..persistent_graph import (
@@ -248,10 +250,22 @@ _cloud_sync_retry_pending: bool = False
 # docs/issues/session_turn_end_cloud_push_blocks_queued_input.md
 _pending_cloud_push_task: Optional[asyncio.Task] = None
 
+# M3 turn-completion seam for the stateless executor (turn_executor.py): a
+# synchronous callable invoked at the END of _loop_on_turn_complete — after the
+# turn-end reconcile has been awaited and the background cloud push (if any)
+# has been spawned. The executor installs a closure that sets an asyncio.Event
+# per claim; the pinned lane leaves this None. Invoked in a finally so a
+# teardown race (session nulled mid-callback) can never strand the executor's
+# turn wait.
+_turn_complete_external_hook: Optional[Callable[[int], None]] = None
+
 # Phase 2 event-log cursor. Allocated synchronously by _broadcast, then queued
 # through one ordered writer so a later sequence can never become visible in
 # Postgres before an earlier queued sequence. Each DB-backed runtime attach
-# atomically allocates a fresh epoch; teardown clears the process-local cursor.
+# resolves (epoch, seq seed) via _resolve_event_journal_epoch — REUSING the
+# thread's current epoch on clean reattaches and bumping only when the prior
+# session life is terminal (doc §5.3.2); teardown clears the process-local
+# cursor.
 _events_epoch: int = 0
 _next_seq: int = 0
 _event_writer: Optional["_OrderedPersistentEventWriter"] = None
@@ -308,6 +322,34 @@ _NOTIFICATION_METHODS = frozenset(
 # NetworkPolicy is egress-only). An arbitrary role would let anything that can
 # reach the pod forge 'ai' or 'system' rows in the transcript.
 _ACCEPTED_INPUT_ROLES = frozenset({"human", "event"})
+
+
+def _stateless_mode() -> bool:
+    """True when this process runs as the M3 stateless turn executor.
+
+    Set via ``STATELESS_EXECUTOR=1`` (agent.py ``--mode stateless`` exports
+    it). In this mode the pod claims ``session_turn`` units from the shared
+    ``run_queue`` (``src/api/turn_executor.py``) instead of being registered,
+    heartbeated, watched and driven over WS/REST: registration, the
+    orchestrator heartbeat loop, the boot-WS/status watchdogs, and the
+    direct input/attach surface are all disabled. Read per call (not cached
+    at import) so tests can flip it with monkeypatch.setenv.
+    """
+    return os.environ.get("STATELESS_EXECUTOR", "").strip() == "1"
+
+
+def _stateless_reject() -> JSONResponse:
+    """409 for direct-session verbs on a stateless executor pod."""
+    return JSONResponse(
+        {
+            "error": (
+                "stateless executor: this pod serves queued turns from the "
+                "run_queue (threads.execution_lane='stateless'); direct "
+                "session attach/input is not accepted here"
+            )
+        },
+        status_code=409,
+    )
 
 
 class WorkspaceNotReady(RuntimeError):
@@ -825,6 +867,14 @@ def _start_watchdogs() -> None:
     """Start watchdog tasks for the active session. Safe to call repeatedly."""
     global _ws_connected_event, _watchdog_tasks
 
+    # Stateless executor (M3): no boot-WS ever arrives (input rides the run
+    # queue) and thread status is orchestrator-owned — both watchdogs would
+    # tear down healthy cached sessions. The run_queue lease/reaper plays
+    # their abandoned-pod role in this mode.
+    if _stateless_mode():
+        logger.debug("Stateless executor mode: session watchdogs disabled")
+        return
+
     # Stop any prior watchdogs (defensive — should already be cleared).
     for task in _watchdog_tasks:
         if not task.done():
@@ -1064,11 +1114,19 @@ async def lifespan(app: FastAPI):
         _thread_id
 
     _started_at = datetime.now()
+    stateless = _stateless_mode()
     pool_mode = _thread_id is None
-    logger.info(
-        f"Starting persistent agent: config={_config_path}, "
-        f"thread={_thread_id or '(pool mode — waiting for assignment)'}"
-    )
+    if stateless:
+        logger.info(
+            f"Starting stateless turn executor agent: config={_config_path} "
+            "(no registration, no heartbeat, no watchdogs — work arrives via "
+            "run_queue claims)"
+        )
+    else:
+        logger.info(
+            f"Starting persistent agent: config={_config_path}, "
+            f"thread={_thread_id or '(pool mode — waiting for assignment)'}"
+        )
 
     # 1. Create and initialize UniversalAgent (singleton layer)
     _agent = UniversalAgent.from_config(_config_path)
@@ -1077,7 +1135,27 @@ async def lifespan(app: FastAPI):
     # 2. Connect to orchestrator
     orchestrator_url = os.getenv("ORCHESTRATOR_URL", "http://localhost:8085")
     dedicated_register_ok = True
-    if orchestrator_url:
+    if stateless:
+        # M3 stateless executor: the orchestrator client exists ONLY for the
+        # claim-bundle fetch and the attach-path reads (get_thread_workspace,
+        # status writes). No registration, no heartbeat loop — liveness is the
+        # run_queue lease, and the reaper replaces the watchdog/sweep roles.
+        if orchestrator_url:
+            try:
+                _orchestrator_client = create_orchestrator_client_from_env(
+                    _agent.config.agent_id
+                )
+                await _orchestrator_client.connect()
+            except Exception as e:
+                logger.warning(
+                    f"Orchestrator client init failed (stateless mode, "
+                    f"non-fatal — claims will release until it recovers): {e}"
+                )
+                _orchestrator_client = None
+        from .turn_executor import start_stateless_executor
+
+        await start_stateless_executor()
+    elif orchestrator_url:
         try:
             _orchestrator_client = create_orchestrator_client_from_env(
                 _agent.config.agent_id
@@ -1199,6 +1277,11 @@ async def lifespan(app: FastAPI):
             "registration.",
             _thread_id,
         )
+    elif stateless:
+        logger.info(
+            "Stateless executor: claim loop running — sessions attach only "
+            "under run_queue leases"
+        )
     else:
         logger.info(
             "Pool mode: waiting for session assignment via POST /session/attach"
@@ -1209,20 +1292,31 @@ async def lifespan(app: FastAPI):
     # --- Shutdown ---
     logger.info("Shutting down persistent agent")
 
-    # Detach any active session
+    if stateless:
+        # SIGTERM/preStop contract (M3): stop claiming; a mid-flight turn
+        # finishes under its lease (bounded) and completes/releases before
+        # the session teardown below. Exit stays 0.
+        from .turn_executor import stop_stateless_executor
+
+        await stop_stateless_executor()
+
+    # Detach any active session. Stateless lane: never mark the thread ended —
+    # thread lifecycle belongs to the orchestrator, and the next claim (on any
+    # pod) picks the thread back up from thread_messages.
     if _session:
-        await _terminate_session("shutdown")
+        await _terminate_session("shutdown", mark_thread=not stateless)
 
     if _orchestrator_client:
         try:
-            _orchestrator_client.stop_heartbeat()
-            if _heartbeat_task:
-                _heartbeat_task.cancel()
-                try:
-                    await _heartbeat_task
-                except asyncio.CancelledError:
-                    pass
-            await _orchestrator_client.deregister()
+            if not stateless:
+                _orchestrator_client.stop_heartbeat()
+                if _heartbeat_task:
+                    _heartbeat_task.cancel()
+                    try:
+                        await _heartbeat_task
+                    except asyncio.CancelledError:
+                        pass
+                await _orchestrator_client.deregister()
             await _orchestrator_client.close()
         except Exception as e:
             logger.warning(f"Orchestrator cleanup error: {e}")
@@ -1473,41 +1567,198 @@ def _sanitize_live_session_config_override(
     return sanitized
 
 
-async def _resolve_event_journal_epoch(postgres_conn: Any, thread_id: str) -> int:
-    """Atomically allocate a new event generation for this runtime attach.
+# Thread statuses that mark the previous session life as over. Only 'ended'
+# is terminal in the vocabulary enforced by valid_thread_status (created /
+# active / idle / awaiting_user / suspended / ended): 'suspended' threads are
+# live-resumable (drain-suspend, attention-sleep) and their reattach is
+# exactly the clean-handoff case that must REUSE the epoch.
+_TERMINAL_THREAD_STATUSES: frozenset = frozenset({"ended"})
 
-    Allocation is unconditional: an empty current epoch may be genuinely new,
-    fully pruned, or left by a failed runtime. Reusing it can strand a cached
-    SSE cursor ahead of every newly allocated sequence. The existing SSE
-    mid-stream epoch-change path safely re-anchors provisioning clients that
-    opened against the pre-attach generation.
+# Journal kinds that render a session life terminal client-side. Keep in
+# lockstep with the cockpit's terminal-lifecycle handlers and its
+# _isSupersededLifecycleFrame guard (persistent-chat.service.ts), which
+# swallows exactly these kinds at epoch <= resumedFromEpoch: a resume that
+# REUSED the epoch would have its genuine future terminal frames swallowed
+# forever, so an epoch that already carries one of these must bump on the
+# next attach. 'session.suspended' is deliberately absent — the cockpit
+# treats it as live-resumable, not terminal.
+_TERMINAL_LIFECYCLE_EVENT_KINDS: tuple = ("session.ended", "session.idle_timeout")
+
+
+async def _resolve_event_journal_epoch(
+    postgres_conn: Any, thread_id: str
+) -> Tuple[int, int]:
+    """Resolve ``(events_epoch, seq_seed)`` for this runtime attach.
+
+    REUSE by default, bump only when the previous session life is provably
+    over (doc §5.3.2). The old contract here allocated a new epoch on every
+    attach; that made every reattach fire the client cascade — ~2s of
+    dead-epoch polling, then ``gone_beyond_horizon`` → IndexedDB thread-cache
+    wipe → full transcript refetch → SSE reopen — and is the #1 blocker for
+    per-turn (stateless) attaches, where it would fire every turn. With seq
+    seeded monotonic (below), a clean reattach on the same epoch is invisible
+    to clients: their cached cursors stay valid and replay continues.
+
+    BUMP iff any of:
+      - thread status is terminal (``_TERMINAL_THREAD_STATUSES``);
+      - the current epoch already carries a terminal lifecycle frame
+        (``_TERMINAL_LIFECYCLE_EVENT_KINDS``): the cockpit's
+        ``resumedFromEpoch`` guard swallows terminal frames at
+        ``epoch <= resumedFromEpoch``, so a resumed life must move to a
+        higher epoch for its own eventual terminal frames to render;
+      - the epoch is non-virgin yet has no surviving rows (retention pruned
+        it, or the 0116 backfill found it already pruned): every cursor a
+        client could hold predates retention, so a bump costs nothing, while
+        reuse could seed below a cached cursor (dead poll) and re-trips the
+        resume-guard hazard above;
+      - the seed probe itself fails (safety fallback: never reuse an epoch
+        we could not read).
+
+    On REUSE the seed is ``GREATEST(events_seq_hwm, MAX(seq))``:
+    ``events_seq_hwm`` (0116) survives retention pruning of the rows
+    themselves, so the seed stays above every seq ever served even when
+    ``MAX(seq)`` shrank; MAX is belt-and-braces for rows written before the
+    hwm existed (the UNIQUE (thread_id, epoch, seq) index backs it). The
+    caller sets ``_next_seq = seq_seed`` — ``_broadcast`` pre-increments, so
+    the first frame lands at seed + 1.
     """
 
-    sql = """
-        UPDATE threads
-        SET events_epoch = events_epoch + 1
-        WHERE id = $1
-        RETURNING events_epoch
-    """
     try:
         async with postgres_conn.acquire() as conn:
-            row = await conn.fetchrow(sql, thread_id)
+            row = await conn.fetchrow(
+                "SELECT events_epoch, events_seq_hwm, status "
+                "FROM threads WHERE id = $1",
+                thread_id,
+            )
+            if row is None:
+                raise EventJournalUnavailable(
+                    "Persistent event journal thread does not exist"
+                )
+            try:
+                epoch = int(row["events_epoch"])
+                hwm = int(row["events_seq_hwm"] or 0)
+            except (KeyError, TypeError, ValueError) as exc:
+                raise EventJournalUnavailable(
+                    "Persistent event journal returned an invalid generation"
+                ) from exc
+            status = row["status"]
+
+            bump_reason: Optional[str] = None
+            max_seq = 0
+            if status in _TERMINAL_THREAD_STATUSES:
+                bump_reason = f"terminal_status:{status}"
+            else:
+                try:
+                    has_terminal_frame = await conn.fetchval(
+                        "SELECT EXISTS ("
+                        "  SELECT 1 FROM thread_events "
+                        "  WHERE thread_id = $1 AND epoch = $2 "
+                        "    AND kind = ANY($3::text[])"
+                        ")",
+                        thread_id,
+                        epoch,
+                        list(_TERMINAL_LIFECYCLE_EVENT_KINDS),
+                    )
+                    if has_terminal_frame:
+                        bump_reason = "terminal_lifecycle_frame"
+                    else:
+                        max_seq_raw = await conn.fetchval(
+                            "SELECT MAX(seq) FROM thread_events "
+                            "WHERE thread_id = $1 AND epoch = $2",
+                            thread_id,
+                            epoch,
+                        )
+                        if max_seq_raw is None and (hwm > 0 or epoch > 0):
+                            # Non-virgin epoch with zero surviving rows: its
+                            # entire history is beyond retention (hwm > 0), or
+                            # it predates 0116 and was backfilled to 0 after
+                            # the prune already ran (epoch > 0). Either way no
+                            # client cursor for it can still be served.
+                            bump_reason = "epoch_beyond_retention"
+                        else:
+                            max_seq = int(max_seq_raw or 0)
+                except Exception as probe_exc:
+                    bump_reason = f"seed_probe_failed:{type(probe_exc).__name__}"
+                    logger.warning(
+                        "Event journal seed probe failed for thread %s — "
+                        "falling back to an epoch bump: %s",
+                        thread_id,
+                        probe_exc,
+                    )
+
+            if bump_reason is None:
+                seq_seed = max(hwm, max_seq)
+                if seq_seed > hwm:
+                    # Persist the correction so the mark is authoritative for
+                    # the fenced flush and any system-frame allocation.
+                    await conn.execute(
+                        "UPDATE threads SET events_seq_hwm = $2 "
+                        "WHERE id = $1 AND events_seq_hwm < $2",
+                        thread_id,
+                        seq_seed,
+                    )
+                logger.info(
+                    "Reusing events_epoch %d for thread %s "
+                    "(seq_seed=%d hwm=%d max_seq=%d status=%s)",
+                    epoch,
+                    thread_id,
+                    seq_seed,
+                    hwm,
+                    max_seq,
+                    status,
+                )
+                return epoch, seq_seed
+
+            new_epoch = await _event_journal.bump_epoch(conn, thread_id=thread_id)
+            logger.info(
+                "Bumped events_epoch %d -> %d for thread %s (reason=%s)",
+                epoch,
+                new_epoch,
+                thread_id,
+                bump_reason,
+            )
+            return new_epoch, 0
+    except EventJournalUnavailable:
+        raise
+    except LookupError as exc:
+        # bump_epoch: the thread row vanished between statements.
+        raise EventJournalUnavailable(
+            "Persistent event journal thread does not exist"
+        ) from exc
     except Exception as exc:
         raise EventJournalUnavailable(
             "Persistent event journal initialization failed"
         ) from exc
 
-    if row is None:
-        raise EventJournalUnavailable("Persistent event journal thread does not exist")
-    try:
-        epoch = int(row["events_epoch"])
-    except (KeyError, TypeError, ValueError) as exc:
-        raise EventJournalUnavailable(
-            "Persistent event journal returned an invalid generation"
-        ) from exc
 
-    logger.info("Allocated events_epoch %d for thread %s", epoch, thread_id)
-    return epoch
+async def _bump_event_journal_epoch(postgres_conn: Any, thread_id: str) -> int:
+    """Force a new event generation: epoch + 1, seq high-water mark to 0.
+
+    The deliberate-bump half of the epoch contract — rewind (its caller here)
+    and the reaper's steal (M4, importing ``src.shared.event_journal``
+    directly) are the only legitimate bumpers; attach resolution reuses live
+    epochs (``_resolve_event_journal_epoch``). Wraps the shared
+    single-statement implementation with this app's pool acquire and failure
+    taxonomy.
+    """
+
+    try:
+        async with postgres_conn.acquire() as conn:
+            new_epoch = await _event_journal.bump_epoch(conn, thread_id=thread_id)
+    except LookupError as exc:
+        raise EventJournalUnavailable(
+            "Persistent event journal thread does not exist"
+        ) from exc
+    except Exception as exc:
+        raise EventJournalUnavailable(
+            "Persistent event journal epoch bump failed"
+        ) from exc
+    logger.info(
+        "Bumped events_epoch to %d for thread %s (deliberate bump)",
+        new_epoch,
+        thread_id,
+    )
+    return new_epoch
 
 
 async def _cleanup_failed_event_journal_attach(thread_id: str) -> None:
@@ -1559,6 +1810,56 @@ async def _cleanup_failed_event_journal_attach(thread_id: str) -> None:
     _loop_last_user_content = [""]
     _clear_all_canvas_awareness()
     _subscribers.clear()
+
+
+# Memory-path embedding routing keys. EmbeddingService is a process-wide
+# singleton built from these EMBEDDING_* env vars at first call.
+MEMORY_EMBEDDING_ENV_KEYS = (
+    "EMBEDDING_PROVIDER",
+    "EMBEDDING_MODEL",
+    "EMBEDDING_BASE_URL",
+    "EMBEDDING_API_KEY",
+)
+
+
+def _apply_session_embedding_env(env_keys: Optional[Dict[str, Any]]) -> None:
+    """Replace the process embedding profile with this attach's snapshot.
+
+    Scrub-on-claim (stateless_agents.md §5.6 — M3 deliverable D, and a live
+    pinned-lane pod-reuse leak): the KB path (``apply_kb_embedding_env``) was
+    deliberately hardened pop-first for pod reuse; the memory path was not —
+    it pushed ``EMBEDDING_API_KEY`` into process-global ``os.environ`` and
+    never popped it, so a following tenant whose config omitted ``env_keys``
+    skipped the block and inherited the prior tenant's key + un-reset
+    singleton. Symmetric now: at EVERY attach, unconditionally pop all
+    memory-embedding keys and null the memory-embedding singleton BEFORE
+    applying the new ``env_keys`` (which then re-set them only if provided).
+
+    Acceptance (tests/test_turn_executor.py scrub matrix): after an attach
+    with tenant-A env_keys followed by an attach with tenant-B env_keys
+    absent, ``os.environ`` carries no A values and the singleton is None.
+    """
+    for k in MEMORY_EMBEDDING_ENV_KEYS:
+        os.environ.pop(k, None)
+    from ..services import embedding_service as _embedding_module
+
+    _embedding_module._embedding_service = None
+    # KB path: already a complete pop-first attach-time snapshot.
+    _embedding_module.apply_kb_embedding_env(env_keys)
+    if env_keys:
+        for k in MEMORY_EMBEDDING_ENV_KEYS:
+            value = env_keys.get(k)
+            if value is not None:
+                os.environ[k] = str(value)
+        if any(
+            k in env_keys
+            for k in MEMORY_EMBEDDING_ENV_KEYS + _embedding_module.KB_EMBEDDING_ENV_KEYS
+        ):
+            logger.info(
+                "Embedding overrides applied: memory_model=%s, kb_model=%s",
+                os.environ.get("EMBEDDING_MODEL"),
+                os.environ.get("KB_EMBEDDING_MODEL"),
+            )
 
 
 async def _attach_session(
@@ -1948,49 +2249,16 @@ async def _attach_session(
             aux_cfg.base_url or "default",
         )
 
-    # Embedding override. EmbeddingService is a process-wide singleton built
-    # from EMBEDDING_* env vars at first call. When the orchestrator supplies
-    # env_keys carrying embedding routing, push them onto os.environ and
-    # clear the singleton so the next get_embedding_service() rebuilds with
-    # the right base_url + api_key. Without this the singleton stays bound
-    # to whatever was set at boot.
+    # Embedding override + scrub-on-claim (§5.6): replace the process-wide
+    # embedding profile (memory + KB) with this attach's snapshot — pop-first
+    # on BOTH paths, singleton nulled unconditionally. Extracted to a helper
+    # so the tenant-A→tenant-B residue acceptance is unit-testable.
     _env_keys_src = (
         (effective_config.extra or {}).get("env_keys")
         if _hydrated
         else (config_override.get("env_keys") if config_override else None)
     )
-    from ..services.embedding_service import (
-        KB_EMBEDDING_ENV_KEYS,
-        apply_kb_embedding_env,
-    )
-
-    # Pool agents are reused across threads. Treat the dedicated KB profile as
-    # a complete attach-time snapshot: clear the previous thread's transport
-    # even when this attach has no knowledge scope or the new provider omits a
-    # base URL/key that the previous endpoint needed.
-    apply_kb_embedding_env(_env_keys_src)
-    if _env_keys_src:
-        env_keys = _env_keys_src
-        memory_embedding_keys = (
-            "EMBEDDING_PROVIDER",
-            "EMBEDDING_MODEL",
-            "EMBEDDING_BASE_URL",
-            "EMBEDDING_API_KEY",
-        )
-        embedding_keys = memory_embedding_keys + KB_EMBEDDING_ENV_KEYS
-        if any(k in env_keys for k in embedding_keys):
-            for k in memory_embedding_keys:
-                if k in env_keys and env_keys[k] is not None:
-                    os.environ[k] = str(env_keys[k])
-            from ..services import embedding_service as _embedding_module
-
-            if any(k in env_keys for k in memory_embedding_keys):
-                _embedding_module._embedding_service = None
-            logger.info(
-                "Embedding overrides applied: memory_model=%s, kb_model=%s",
-                os.environ.get("EMBEDDING_MODEL"),
-                os.environ.get("KB_EMBEDDING_MODEL"),
-            )
+    _apply_session_embedding_env(_env_keys_src)
 
     from ..services.knowledge.bindings import build_knowledge_bindings
 
@@ -2033,24 +2301,32 @@ async def _attach_session(
         _session.tool_context.citation_verdict_callback = _emit_citation_verdict
         _session.tool_context.canvas_event_callback = _emit_canvas_event
 
-    # Allocate one authoritative generation per runtime attach before the first
-    # broadcast. This is unconditional even when the previous generation has no
-    # rows: retention may have pruned it while clients still cache a high
-    # cursor. A provisioning SSE opened against the pre-attach generation uses
-    # the existing mid-stream epoch-change reconciliation path.
+    # Resolve the authoritative (generation, seq seed) before the first
+    # broadcast. Clean reattaches REUSE the thread's current epoch with the
+    # seq counter seeded above every previously served frame, so cached client
+    # cursors stay valid and no cache-wipe cascade fires; the epoch bumps only
+    # when the previous session life is terminal (see
+    # _resolve_event_journal_epoch). A provisioning SSE opened against a
+    # pre-bump generation uses the existing mid-stream epoch-change
+    # reconciliation path.
     _tool_inflight = False
     _turn_event_open = False
     _events_epoch = 0
     _next_seq = 0
     if _session is not None and _session.postgres_conn is not None:
         try:
-            _events_epoch = await _resolve_event_journal_epoch(
+            _events_epoch, _next_seq = await _resolve_event_journal_epoch(
                 _session.postgres_conn, _thread_id
             )
             writer = _OrderedPersistentEventWriter(
                 postgres_conn=_session.postgres_conn,
                 thread_id=_thread_id,
+                epoch=_events_epoch,
                 on_terminal_failure=_event_persistence_failed,
+                # Stateless executor attach: fence every flush on the live
+                # claim (the executor set the LeaseHandle before attaching).
+                # Pinned lane: ContextVar default None → today's statement.
+                lease=_current_lease_var.get(),
             )
             writer.start()
             _event_writer = writer
@@ -2247,7 +2523,13 @@ async def _attach_session(
     # readable in the very first turn. Gated on the loop not already running:
     # a re-attach (e.g. a retried /session/attach POST) must not inject a
     # second boot wake — the k3d smoke produced exactly that duplicate.
-    if _officer_cfg() is not None and (_loop_task is None or _loop_task.done()):
+    # Stateless executor pods never self-wake: turns run only under a
+    # run_queue lease (officer threads stay on the pinned lane in S1).
+    if (
+        _officer_cfg() is not None
+        and not _stateless_mode()
+        and (_loop_task is None or _loop_task.done())
+    ):
         _ensure_persistent_loop_started("officer_boot")
         await _accept_user_input(
             "[wake: session started/restarted] You are the project officer "
@@ -2506,7 +2788,7 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
                 "status": (
                     "healthy" if app_guide.get("state") == "ready" else "degraded"
                 ),
-                "mode": "persistent",
+                "mode": "stateless" if _stateless_mode() else "persistent",
                 "thread_id": _thread_id,
                 "uptime_seconds": (datetime.now() - _started_at).total_seconds()
                 if _started_at
@@ -2517,6 +2799,16 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
 
     @app.get("/ready")
     async def ready():
+        if _stateless_mode():
+            # A stateless executor is "ready" when its claim loop is alive —
+            # there is no session/WS surface to gate on (k8s probes, M5).
+            from .turn_executor import executor_running
+
+            is_ready = executor_running()
+            return JSONResponse(
+                {"ready": is_ready, "mode": "stateless", "thread_id": _thread_id},
+                status_code=200 if is_ready else 503,
+            )
         is_ready = _session_ready()
         return JSONResponse(
             {"ready": is_ready, "mode": "persistent", "thread_id": _thread_id},
@@ -2577,6 +2869,11 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
                 base instead of this pod's boot config (pool pods boot as
                 workers; see docs/issues/session_config_name_plumbing.md)
         """
+        if _stateless_mode():
+            # The executor owns attach/detach on this pod — an out-of-band
+            # attach would corrupt its session cache and run outside a lease.
+            return _stateless_reject()
+
         thread_id = request.get("thread_id")
         if not thread_id:
             return JSONResponse({"error": "thread_id is required"}, status_code=400)
@@ -2631,6 +2928,10 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
         Called by the orchestrator when a thread ends, or by the agent
         itself on idle timeout.  Tears down the PersistentSession.
         """
+        if _stateless_mode():
+            # A detach mid-lease would kill a claimed turn out-of-band; the
+            # executor detaches its own cached session between claims.
+            return _stateless_reject()
         if _session is None:
             return JSONResponse({"status": "already_idle", "thread_id": None})
 
@@ -2823,6 +3124,8 @@ async def handle_api_input(request: Request) -> JSONResponse:
     running, and the orchestrator falls back to writing the notice durably for
     the next resume.
     """
+    if _stateless_mode():
+        return _stateless_reject()
     if _session is None or _loop_user_queue is None:
         return JSONResponse({"error": "Session not active"}, status_code=503)
     try:
@@ -2858,6 +3161,8 @@ async def handle_api_interrupt() -> JSONResponse:
     """Signal the loop to stop. Mode is hard vs graceful based on
     whether a tool call is currently in flight."""
     global _loop_interrupt_flag
+    if _stateless_mode():
+        return _stateless_reject()
     if _session is None:
         return JSONResponse({"error": "Session not active"}, status_code=503)
     mode = "graceful" if _tool_inflight else "hard"
@@ -2882,6 +3187,8 @@ async def handle_api_approve(request: Request) -> JSONResponse:
     row for this thread is resolved (legacy single-pending-at-a-time
     contract). The DB trigger emits NOTIFY → agent's permission_check
     wakes up."""
+    if _stateless_mode():
+        return _stateless_reject()
     if _session is None:
         return JSONResponse({"error": "Session not active"}, status_code=503)
     try:
@@ -2951,6 +3258,26 @@ async def handle_persistent_websocket(ws: WebSocket) -> None:
     import uuid
 
     await ws.accept()
+
+    # Stateless executor (M3): sessions on this pod are driven exclusively by
+    # run_queue claims — there is no live WS surface. Mirror the REST 409.
+    if _stateless_mode():
+        try:
+            await ws.send_json(
+                {
+                    "method": "error",
+                    "params": {
+                        "message": (
+                            "stateless executor: this pod serves queued turns; "
+                            "no direct session WebSocket is available"
+                        )
+                    },
+                }
+            )
+        except Exception:
+            pass
+        await ws.close(code=4409, reason="stateless executor")
+        return
 
     # Signal the boot-WS watchdog that a connection arrived. Done before
     # the readiness check so even a failed-to-be-ready connection counts:
@@ -3355,35 +3682,95 @@ class _OrderedPersistentEventWriter:
     writer for the attached runtime. A single INSERT persists each batch in
     queue order, eliminating the old one-task-per-frame visibility race.
 
+    The writer OWNS the epoch it attached under (constructor argument, not
+    inferred from events) and every flush is fenced on it: rows land only
+    while ``threads.events_epoch`` still equals that epoch. A fenced-out
+    flush (another runtime, a rewind, or the reaper moved the generation) is
+    terminal — the writer stops rather than keep inserting into a dead epoch
+    forever, which is exactly what the unfenced INSERT used to do.
+
     Ordinary streaming frames get one best-effort write. State invalidations
     receive bounded retries. Queue overflow and terminal write failure are
     reported through ``on_terminal_failure`` so callers can force an
     authoritative-state reconciliation without recursively journaling it.
     """
 
-    _INSERT_BATCH_SQL = """
-        INSERT INTO thread_events (thread_id, epoch, seq, kind, payload)
-        SELECT
-            $1,
-            (queued.value->>'epoch')::integer,
-            (queued.value->>'seq')::bigint,
-            queued.value->>'kind',
-            queued.value->'payload'
-        FROM jsonb_array_elements($2::jsonb) WITH ORDINALITY
-            AS queued(value, ordinal)
-        ORDER BY queued.ordinal
+    # One guarded round-trip (autocommit-safe): the INSERT is gated on the
+    # threads row still being on this writer's epoch ($3), each unnested row
+    # is belt-checked against the same epoch, and the thread's seq high-water
+    # mark advances to the batch tail in the same statement (guarded on rows
+    # actually inserted). The final SELECT returns the inserted count — 0 on
+    # a non-empty batch means the epoch (or, stateless lane, the run_queue
+    # lease) moved underneath us.
+    #
+    # M3 (stateless lane): when the writer is constructed with a lease, the
+    # {lease_fence} slot carries a second EXISTS against run_queue —
+    # token-equality only, deliberately WITHOUT ``state='leased'``: trailing
+    # flushes between complete_unit (which does not bump the token) and the
+    # next claim must still land, while any later claim/steal bumps the token
+    # and fences stragglers out (§5.2 — "stragglers are invalidated by the
+    # NEXT claim"). FOR SHARE holds the queue row against a concurrent
+    # claim/steal for the duration of this single statement, so a flush can
+    # never interleave with the token bump that should have fenced it.
+    _INSERT_BATCH_SQL_TEMPLATE = """
+        WITH queued_rows AS (
+            SELECT
+                (queued.value->>'epoch')::integer AS epoch,
+                (queued.value->>'seq')::bigint    AS seq,
+                queued.value->>'kind'             AS kind,
+                queued.value->'payload'           AS payload,
+                queued.ordinal                    AS ordinal
+            FROM jsonb_array_elements($2::jsonb) WITH ORDINALITY
+                AS queued(value, ordinal)
+        ),
+        inserted AS (
+            INSERT INTO thread_events (thread_id, epoch, seq, kind, payload)
+            SELECT $1, queued_rows.epoch, queued_rows.seq,
+                   queued_rows.kind, queued_rows.payload
+            FROM queued_rows
+            WHERE EXISTS (
+                    SELECT 1 FROM threads
+                    WHERE threads.id = $1
+                      AND threads.events_epoch = $3
+                  )
+              AND queued_rows.epoch = $3{lease_fence}
+            ORDER BY queued_rows.ordinal
+            RETURNING seq
+        ),
+        hwm_update AS (
+            UPDATE threads
+            SET events_seq_hwm = GREATEST(
+                    events_seq_hwm,
+                    (SELECT MAX(seq) FROM inserted)
+                )
+            WHERE id = $1
+              AND EXISTS (SELECT 1 FROM inserted)
+            RETURNING 1
+        )
+        SELECT COUNT(*)::bigint FROM inserted
     """
+    _LEASE_FENCE_SQL = """
+              AND EXISTS (
+                    SELECT 1 FROM run_queue
+                    WHERE run_queue.unit_id = $4::uuid
+                      AND run_queue.lease_token = $5::bigint
+                    FOR SHARE
+                  )"""
+    # Pinned lane keeps the exact pre-M3 statement (and its 4-arg call shape).
+    _INSERT_BATCH_SQL = _INSERT_BATCH_SQL_TEMPLATE.format(lease_fence="")
 
     def __init__(
         self,
         *,
         postgres_conn: Any,
         thread_id: str,
+        epoch: int,
         on_terminal_failure: Callable[[list[_QueuedPersistentEvent], str], None],
         queue_maxsize: int = _EVENT_WRITER_QUEUE_MAXSIZE,
         batch_size: int = _EVENT_WRITER_BATCH_SIZE,
         state_max_attempts: int = _EVENT_WRITER_STATE_MAX_ATTEMPTS,
         retry_base_s: float = _EVENT_WRITER_RETRY_BASE_S,
+        lease: Any = None,
     ) -> None:
         if queue_maxsize < 1:
             raise ValueError("event writer queue_maxsize must be positive")
@@ -3391,9 +3778,25 @@ class _OrderedPersistentEventWriter:
             raise ValueError("event writer batch_size must be positive")
         if state_max_attempts < 1:
             raise ValueError("event writer state_max_attempts must be positive")
+        if int(epoch) < 0:
+            raise ValueError("event writer epoch must be non-negative")
 
         self.postgres_conn = postgres_conn
         self.thread_id = thread_id
+        self.epoch = int(epoch)
+        # Stateless lane: a live LeaseHandle (src/api/lease_context.py). The
+        # flush reads unit_id/lease_token AT FLUSH TIME, so an affinity
+        # re-claim of the same thread (new token, same writer) keeps flushing
+        # under the current claim without a writer swap. None = pinned lane =
+        # the exact pre-M3 statement and call shape.
+        self._lease = lease
+        self._insert_sql = (
+            self._INSERT_BATCH_SQL
+            if lease is None
+            else self._INSERT_BATCH_SQL_TEMPLATE.format(
+                lease_fence=self._LEASE_FENCE_SQL
+            )
+        )
         self._on_terminal_failure = on_terminal_failure
         self._queue: asyncio.Queue[_QueuedPersistentEvent] = asyncio.Queue(
             maxsize=queue_maxsize
@@ -3527,6 +3930,25 @@ class _OrderedPersistentEventWriter:
                     self._queue.task_done()
 
     async def _write_with_retry(self, batch: list[_QueuedPersistentEvent]) -> None:
+        # The writer owns one epoch; a frame stamped with any other epoch in
+        # its stream is a sequencing bug (the rewind path swaps writers around
+        # its bump precisely so this cannot happen legitimately). Fail loudly
+        # and stop — a writer that cannot trust its stream must not keep
+        # writing.
+        if any(event.epoch != self.epoch for event in batch):
+            self._closing = True
+            logger.error(
+                "thread_events batch spans epochs — writer owns %d, saw %s; "
+                "stopping writer (thread=%s first_seq=%d last_seq=%d)",
+                self.epoch,
+                sorted({event.epoch for event in batch}),
+                self.thread_id,
+                batch[0].seq,
+                batch[-1].seq,
+            )
+            self._notify_terminal_failure(batch, "epoch_mismatch")
+            return
+
         attempts = (
             self._state_max_attempts
             if any(_requires_bounded_event_retry(event.kind) for event in batch)
@@ -3534,8 +3956,7 @@ class _OrderedPersistentEventWriter:
         )
         for attempt in range(1, attempts + 1):
             try:
-                await self._write_batch(batch)
-                return
+                inserted = await self._write_batch(batch)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -3564,8 +3985,41 @@ class _OrderedPersistentEventWriter:
                     exc,
                 )
                 self._notify_terminal_failure(batch, "write_failed")
+                return
 
-    async def _write_batch(self, batch: list[_QueuedPersistentEvent]) -> None:
+            if inserted < len(batch):
+                # The fence rejected the batch: threads.events_epoch moved
+                # past this writer (rewind, reaper steal, or a competing
+                # runtime) — or, stateless lane, the run_queue lease token
+                # moved (a successor claimed the unit). Deterministic, not
+                # retryable — stop the writer so a superseded runtime can
+                # never keep appending into a dead (or worse, the
+                # successor's) generation.
+                self._closing = True
+                logger.error(
+                    "thread_events writer fenced out — fence rejected the "
+                    "flush (events_epoch or run_queue lease moved past this "
+                    "writer); stopping "
+                    "(thread=%s writer_epoch=%d inserted=%d batch=%d "
+                    "first_seq=%d last_seq=%d lease=%s)",
+                    self.thread_id,
+                    self.epoch,
+                    inserted,
+                    len(batch),
+                    batch[0].seq,
+                    batch[-1].seq,
+                    (
+                        f"{self._lease.unit_id}:{self._lease.lease_token}"
+                        if self._lease is not None
+                        else "none"
+                    ),
+                )
+                self._notify_terminal_failure(batch, "epoch_fenced")
+            return
+
+    async def _write_batch(self, batch: list[_QueuedPersistentEvent]) -> int:
+        """Flush one batch through the fenced statement; return inserted count."""
+
         rows = [
             {
                 "epoch": event.epoch,
@@ -3575,12 +4029,14 @@ class _OrderedPersistentEventWriter:
             }
             for event in batch
         ]
+        args: list[Any] = [self.thread_id, json.dumps(rows), self.epoch]
+        if self._lease is not None:
+            # Read the CURRENT claim's identity at flush time (mutable
+            # LeaseHandle): an affinity re-claim updates the handle in place.
+            args.extend([self._lease.unit_id, self._lease.lease_token])
         async with self.postgres_conn.acquire() as conn:
-            await conn.execute(
-                self._INSERT_BATCH_SQL,
-                self.thread_id,
-                json.dumps(rows),
-            )
+            inserted = await conn.fetchval(self._insert_sql, *args)
+        return int(inserted or 0)
 
     def _notify_terminal_failure(
         self, events: list[_QueuedPersistentEvent], reason: str
@@ -5341,6 +5797,27 @@ async def _loop_on_turn_complete(turn_id: int, metrics: Optional[dict] = None) -
     # a reattach during turn-end persistence never reopens an already-completed
     # assistant bubble merely because the broader loop is not parked yet.
     _turn_event_open = False
+    try:
+        await _loop_on_turn_complete_body(turn_id, metrics)
+    finally:
+        # M3 stateless seam: signal the turn executor AFTER the turn-end
+        # reconcile has been awaited (and the background cloud push, if any,
+        # was spawned). In a finally so a teardown race inside the body can
+        # never strand the executor's completion wait.
+        hook = _turn_complete_external_hook
+        if hook is not None:
+            try:
+                hook(turn_id)
+            except Exception:
+                logger.warning(
+                    "External turn-complete hook failed (non-fatal)",
+                    exc_info=True,
+                )
+
+
+async def _loop_on_turn_complete_body(
+    turn_id: int, metrics: Optional[dict] = None
+) -> None:
     # Runs on EVERY turn exit — completed, parked on an unanswered gate,
     # interrupted, or errored (run_persistent_loop catches and still calls
     # this). Announced rows no gate ever claimed must die with the turn, or
@@ -5689,6 +6166,15 @@ async def _loop_completion_handler(loop_task: asyncio.Task) -> None:
         await loop_task
     except IdleTimeoutError:
         logger.info("Persistent loop exited via idle timeout")
+        if _stateless_mode():
+            # Stateless lane: the pod-side idle timer must never end the
+            # THREAD — thread lifecycle is orchestrator-owned, and an
+            # 'ended' status (or the session.ended frame the archive
+            # broadcasts) would force an epoch bump on the next claim's
+            # attach (client cache-wipe cascade). Just drop the cached
+            # session; the next claim rebuilds from thread_messages.
+            await _terminate_session("idle_timeout", mark_thread=False)
+            return
         try:
             await _handle_idle_archive()
         except Exception as e:
@@ -5700,10 +6186,10 @@ async def _loop_completion_handler(loop_task: asyncio.Task) -> None:
         raise
     except Exception as e:
         logger.warning(f"Persistent loop crashed: {e}", exc_info=True)
-        await _terminate_session("loop_crash")
+        await _terminate_session("loop_crash", mark_thread=not _stateless_mode())
     else:
         logger.info("Persistent loop completed cleanly")
-        await _terminate_session("loop_complete")
+        await _terminate_session("loop_complete", mark_thread=not _stateless_mode())
 
 
 def _safe_serialize(obj: Any) -> Any:
@@ -6278,7 +6764,7 @@ async def _handle_rewind(ws: WebSocket, data: Dict[str, Any]) -> None:
     guarantees the initiator always gets a terminal frame — the DB write may
     already be committed by the time anything fails.
     """
-    global _loop_interrupt_flag, _events_epoch, _next_seq
+    global _loop_interrupt_flag, _events_epoch, _next_seq, _event_writer
 
     request_id = data.get("request_id")
 
@@ -6477,15 +6963,58 @@ async def _handle_rewind(ws: WebSocket, data: Dict[str, Any]) -> None:
 
                 # 7. New event generation → every SSE viewer takes the
                 #    existing gone_beyond_horizon repaint against the
-                #    filtered history.
+                #    filtered history. Rewind is one of the two legitimate
+                #    deliberate bumpers (reaper steal is the other — doc
+                #    §5.3.2), so this must ALWAYS bump, never reuse-resolve.
+                #    Order matters: drain+close the old writer first so any
+                #    straggler frames flush under the epoch they are stamped
+                #    with (the fenced flush would reject them post-bump and
+                #    stop the writer); then bump (epoch+1, hwm=0); then start
+                #    a fresh writer owning the new epoch. The subsequent
+                #    rewind.done broadcast lands at (new_epoch, 1) and the
+                #    fenced flush pushes events_seq_hwm to 1 — which IS the
+                #    doc §5.3.2 item 5 allocator init above the rewind.done
+                #    row: the next attach seeds from GREATEST(hwm, MAX(seq))
+                #    and can never collide with it.
                 try:
-                    _events_epoch = await _resolve_event_journal_epoch(conn, _thread_id)
+                    old_writer = _event_writer
+                    if old_writer is not None:
+                        _event_writer = None
+                        await old_writer.close()
+                    _events_epoch = await _bump_event_journal_epoch(conn, _thread_id)
                     _next_seq = 0
+                    new_writer = _OrderedPersistentEventWriter(
+                        postgres_conn=conn,
+                        thread_id=_thread_id,
+                        epoch=_events_epoch,
+                        on_terminal_failure=_event_persistence_failed,
+                    )
+                    new_writer.start()
+                    _event_writer = new_writer
                 except Exception:
                     logger.warning(
                         "Rewind epoch bump failed — viewers repaint on next attach",
                         exc_info=True,
                     )
+                    if _event_writer is None and _thread_id is not None:
+                        # Keep journaling alive under the still-current epoch
+                        # rather than leaving the rest of the session
+                        # unjournaled because the bump failed.
+                        try:
+                            recovery_writer = _OrderedPersistentEventWriter(
+                                postgres_conn=conn,
+                                thread_id=_thread_id,
+                                epoch=_events_epoch,
+                                on_terminal_failure=_event_persistence_failed,
+                            )
+                            recovery_writer.start()
+                            _event_writer = recovery_writer
+                        except Exception:
+                            logger.warning(
+                                "Rewind writer recovery failed — journal "
+                                "frames will be dropped until reattach",
+                                exc_info=True,
+                            )
 
                 if rehydrate_failed:
                     # The DB sweep is already committed and durable — other
