@@ -737,8 +737,8 @@ async def _ssh_tar_to_file(
     # byte stream to stdout is unchanged — only the exit code's meaning is.
     remote = (
         "bash -c 'tar -cf - " + remote_path + " 2>/dev/null | zstd -1 -T0; "
-        "__ps=(\"${PIPESTATUS[@]}\"); "
-        "if [ \"${__ps[1]}\" -ne 0 ] || [ \"${__ps[0]}\" -ge 2 ]; then exit 1; else exit 0; fi'"
+        '__ps=("${PIPESTATUS[@]}"); '
+        'if [ "${__ps[1]}" -ne 0 ] || [ "${__ps[0]}" -ge 2 ]; then exit 1; else exit 0; fi\''
     )
     cmd = [
         "ssh",
@@ -910,8 +910,8 @@ async def _ssh_untar_from_file(
     # any zstd failure. stdin/stdout data flow is unchanged.
     remote = (
         "bash -c 'zstd -d | tar -xf - -C /; "
-        "__ps=(\"${PIPESTATUS[@]}\"); "
-        "if [ \"${__ps[0]}\" -ne 0 ] || [ \"${__ps[1]}\" -ge 2 ]; then exit 1; else exit 0; fi'"
+        '__ps=("${PIPESTATUS[@]}"); '
+        'if [ "${__ps[0]}" -ne 0 ] || [ "${__ps[1]}" -ge 2 ]; then exit 1; else exit 0; fi\''
     )
     cmd = [
         "ssh",

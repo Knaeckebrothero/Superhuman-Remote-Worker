@@ -429,9 +429,7 @@ async def test_restore_snapshot_for_resume_returns_false_when_extract_fails(
     svc._extract_snapshot_to_vm = AsyncMock(return_value=False)
 
     with caplog.at_level(logging.INFO, logger="orchestrator.services.ide_session"):
-        result = await svc.restore_snapshot_for_resume(
-            "job-0016", "10.0.0.10", 30022
-        )
+        result = await svc.restore_snapshot_for_resume("job-0016", "10.0.0.10", 30022)
 
     assert result is False
     assert "Snapshot restored for job resume" not in caplog.text
