@@ -808,6 +808,7 @@ async def test_resume_revalidates_datasources_before_mutating_thread_status():
     datasource_id = UUID("11111111-2222-3333-4444-555555555555")
     thread = {
         "id": "thread-1",
+        "execution_lane": "pinned",
         "user_id": UUID("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"),
         "status": "ended",
         "metadata": {"datasource_ids": [str(datasource_id)]},
@@ -843,6 +844,7 @@ async def test_resume_blocks_revoked_native_project_scope_before_status_mutation
     project_id = "99999999-2222-3333-4444-555555555555"
     thread = {
         "id": "thread-1",
+        "execution_lane": "pinned",
         "user_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
         "status": "ended",
         "metadata": {},

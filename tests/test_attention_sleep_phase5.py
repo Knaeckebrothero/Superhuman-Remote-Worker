@@ -535,12 +535,41 @@ class TestPhase5WakeIfSuspended:
         om.persistent_provisioner = self._orig_prov
 
     @pytest.mark.asyncio
+    async def test_non_pinned_lane_never_restores_or_spawns(self):
+        import orchestrator.main as om
+
+        thread = {
+            "id": "thread-abc",
+            "execution_lane": "stateless",
+            "agent_id": None,
+            "metadata": {"workspace_container": {"status": "suspended"}},
+        }
+        db = MagicMock()
+        db.get_thread = AsyncMock(return_value=thread)
+        db.acquire = _make_db().acquire
+        om.postgres_db = db
+        svc = MagicMock()
+        svc.is_enabled = True
+        svc.restore_thread_workspace = AsyncMock(return_value=True)
+        om.workspace_suspension_service = svc
+        prov = MagicMock()
+        prov.create_agent_pod = AsyncMock(return_value=True)
+        om.persistent_provisioner = prov
+
+        await om._phase5_wake_if_suspended("thread-abc")
+        await asyncio.sleep(0)
+
+        svc.restore_thread_workspace.assert_not_awaited()
+        prov.create_agent_pod.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_restores_when_workspace_suspended(self):
         import orchestrator.main as om
 
         # get_thread returns metadata with suspended workspace.
         thread = {
             "id": "thread-abc",
+            "execution_lane": "pinned",
             "agent_id": None,
             "config_name": "persistent_defaults",
             "metadata": {"workspace_container": {"status": "suspended"}},
@@ -577,6 +606,7 @@ class TestPhase5WakeIfSuspended:
 
         thread = {
             "id": "thread-abc",
+            "execution_lane": "pinned",
             "agent_id": "agent-1",
             "metadata": {"workspace_container": {"status": "ready"}},
         }

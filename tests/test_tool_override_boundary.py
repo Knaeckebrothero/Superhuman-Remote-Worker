@@ -963,6 +963,7 @@ class TestPrepareBoundary:
                         "user_id": "u1",
                         "agent_id": None,
                         "config_name": "session_base",
+                        "execution_lane": "pinned",
                     }
                 )
             ),

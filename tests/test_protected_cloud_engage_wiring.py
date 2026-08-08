@@ -322,12 +322,149 @@ async def test_build_agent_cloud_mount_poll_finds_row_before_cap(monkeypatch):
 def _resume_thread_row(**overrides) -> dict:
     thread = {
         "id": "thread-1",
+        "execution_lane": "pinned",
         "user_id": "user-1",
         "status": "ended",
         "metadata": {"protected_cloud": True},
     }
     thread.update(overrides)
     return thread
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("execution_lane", ["stateless", "future-lane"])
+async def test_resume_refuses_every_non_pinned_lane(execution_lane):
+    """Resume must never provision a pinned executor under a queue lane."""
+    from main import resume_thread
+
+    thread = _resume_thread_row(execution_lane=execution_lane)
+    db = AsyncMock()
+    db.resume_thread = AsyncMock()
+
+    with (
+        patch(
+            "main.require_thread_owner",
+            AsyncMock(return_value=({"id": "user-1"}, thread)),
+        ),
+        patch("main.postgres_db", db),
+        pytest.raises(main.HTTPException) as exc,
+    ):
+        await resume_thread("thread-1", object())
+
+    assert exc.value.status_code == 409
+    db.resume_thread.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_resume_refetch_refuses_lane_changed_while_task_was_scheduled():
+    """A pinned entry snapshot is not authority for the background bind."""
+    from main import resume_thread
+
+    thread = _resume_thread_row(
+        metadata={},
+        main_cloud_session_handle="existing-session-folder",
+        main_cloud_share_handle="existing-share",
+    )
+    user = {"id": "user-1"}
+    db = MagicMock()
+    db.resume_thread = AsyncMock()
+    db.list_thread_mounts = AsyncMock(return_value=[])
+    db.get_thread = AsyncMock(
+        return_value={
+            **thread,
+            "execution_lane": "stateless",
+            "status": "created",
+            "agent_id": None,
+        }
+    )
+    lock_cm = AsyncMock()
+    lock_cm.__aenter__.return_value = None
+    lock_cm.__aexit__.return_value = False
+    db.thread_advisory_lock = MagicMock(return_value=lock_cm)
+    provisioner = MagicMock(is_available=True)
+    provisioner.provision_agent = AsyncMock()
+    find_idle = AsyncMock()
+    attach = AsyncMock()
+    ensure_workspace = AsyncMock()
+
+    with (
+        patch("main.require_thread_owner", AsyncMock(return_value=(user, thread))),
+        patch("main.postgres_db", db),
+        patch("main._thread_project_ids", AsyncMock(return_value=[])),
+        patch("main._revalidate_thread_project_ids", AsyncMock(return_value=[])),
+        patch("main._revalidate_thread_datasource_ids", AsyncMock(return_value=[])),
+        patch("main._is_protected_cloud_mode_enabled", return_value=False),
+        patch("main.agent_provisioner", provisioner),
+        patch("main.persistent_provisioner", MagicMock(is_available=False)),
+        patch("main._find_idle_persistent_agent", find_idle),
+        patch("main._send_session_attach", attach),
+        patch("main._await_late_cloud_setup", AsyncMock()),
+        patch("main.ensure_session_workspace", ensure_workspace),
+    ):
+        result = await resume_thread("thread-1", object())
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+    assert result == {"status": "created", "thread_id": "thread-1"}
+    find_idle.assert_not_awaited()
+    attach.assert_not_awaited()
+    provisioner.provision_agent.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_resume_refetches_lane_after_failed_pool_reservation():
+    """A warm-attach refusal cannot fall through after a concurrent flip."""
+    from main import resume_thread
+
+    thread = _resume_thread_row(
+        metadata={},
+        main_cloud_session_handle="existing-session-folder",
+        main_cloud_share_handle="existing-share",
+    )
+    user = {"id": "user-1"}
+    pinned = {**thread, "status": "created", "agent_id": None}
+    stateless = {**pinned, "execution_lane": "stateless"}
+    db = MagicMock()
+    db.resume_thread = AsyncMock()
+    db.list_thread_mounts = AsyncMock(return_value=[])
+    db.get_thread = AsyncMock(side_effect=[pinned, stateless])
+    lock_cm = AsyncMock()
+    lock_cm.__aenter__.return_value = None
+    lock_cm.__aexit__.return_value = False
+    db.thread_advisory_lock = MagicMock(return_value=lock_cm)
+    provisioner = MagicMock(is_available=True)
+    provisioner.provision_agent = AsyncMock()
+    idle = {
+        "id": "agent-pool",
+        "hostname": "pool-1",
+        "pod_ip": "10.0.0.5",
+        "pod_port": 8001,
+    }
+    attach = AsyncMock(return_value=False)
+
+    with (
+        patch("main.require_thread_owner", AsyncMock(return_value=(user, thread))),
+        patch("main.postgres_db", db),
+        patch("main._thread_project_ids", AsyncMock(return_value=[])),
+        patch("main._revalidate_thread_project_ids", AsyncMock(return_value=[])),
+        patch("main._revalidate_thread_datasource_ids", AsyncMock(return_value=[])),
+        patch("main._thread_has_knowledge_scope", AsyncMock(return_value=False)),
+        patch("main._inject_thread_dispatch_credentials", AsyncMock(return_value={})),
+        patch("main._is_protected_cloud_mode_enabled", return_value=False),
+        patch("main.agent_provisioner", provisioner),
+        patch("main.persistent_provisioner", MagicMock(is_available=False)),
+        patch("main._find_idle_persistent_agent", AsyncMock(return_value=idle)),
+        patch("main._send_session_attach", attach),
+        patch("main._await_late_cloud_setup", AsyncMock()),
+        patch("main.ensure_session_workspace", AsyncMock()),
+    ):
+        result = await resume_thread("thread-1", object())
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+    assert result == {"status": "created", "thread_id": "thread-1"}
+    attach.assert_awaited_once()
+    provisioner.provision_agent.assert_not_awaited()
 
 
 @pytest.mark.asyncio
