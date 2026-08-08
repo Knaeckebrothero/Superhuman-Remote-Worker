@@ -59,6 +59,22 @@ class ThreadConfigUpdateDenied(Exception):
         super().__init__(f"Thread config update denied ({status_code}): {detail}")
 
 
+class ClaimBundleError(Exception):
+    """Non-200 from the claim-bundle endpoint (M3 pinned contract).
+
+    Carries the status code so the stateless turn executor can branch:
+    401/403 → treat as lease lost (its token-guarded release no-ops), 404 →
+    the unit vanished (drop the claim), 409 → not leased / wrong lane (drop
+    and re-poll). Network errors are NOT wrapped — they propagate as httpx
+    exceptions and the executor releases with backoff.
+    """
+
+    def __init__(self, status_code: int, detail: str = "") -> None:
+        self.status_code = status_code
+        self.detail = detail
+        super().__init__(f"claim-bundle {status_code}: {detail[:200]}")
+
+
 class VerdictRecordingError(Exception):
     """The verdict could not be durably recorded.
 
@@ -645,6 +661,35 @@ class OrchestratorClient:
         except Exception as e:
             logger.debug(f"Failed to get thread workspace: {e}")
             return None
+
+    async def get_claim_bundle(self, unit_id: str, lease_token: int) -> dict:
+        """Fetch the resolved attach payload for a claimed run_queue unit.
+
+        M3 pinned contract (stateless_agents.md §5.6 — credentials are
+        delivered only against proof of the CURRENT lease):
+        ``GET {orchestrator}/internal/units/{unit_id}/claim-bundle?lease_token=N``,
+        authenticated exactly like every other internal call on this client
+        (``X-Internal-Key`` attached by :meth:`connect`). The 200 body carries
+        ``unit_id``/``thread_id``/``unit_kind``/``execution_lane``, the
+        ``watermarks`` pair, and the ``attach`` object — the existing
+        ``/session/attach`` body, fed to ``_attach_session`` unchanged.
+
+        Raises :class:`ClaimBundleError` on any non-200; network errors
+        propagate as httpx exceptions (the caller treats both as bundle
+        failure and releases its claim, token-guarded).
+        """
+        if not self._client:
+            await self.connect()
+        url = f"{self.orchestrator_url}/internal/units/{unit_id}/claim-bundle"
+        response = await self._client.get(url, params={"lease_token": int(lease_token)})
+        if response.status_code == 200:
+            return response.json()
+        detail = ""
+        try:
+            detail = response.text or ""
+        except Exception:
+            pass
+        raise ClaimBundleError(response.status_code, detail)
 
     async def get_thread_canvas(self, thread_id: str) -> dict[str, Any] | None:
         """Fetch the delegated user's logical ``main`` Canvas state.

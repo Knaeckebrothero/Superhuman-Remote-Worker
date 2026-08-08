@@ -41,22 +41,37 @@ class TestEventJournalEpochAllocation:
         return pool
 
     @pytest.mark.asyncio
-    async def test_unconditionally_allocates_a_new_runtime_generation(self):
-        """An empty/pruned prior epoch must never be reused on reattach."""
+    async def test_reuses_live_epoch_and_seeds_seq_on_clean_reattach(self):
+        """New contract (doc §5.3.2): a live epoch with surviving rows is
+        REUSED on reattach — seq seeds at GREATEST(hwm, MAX(seq)) so cached
+        client cursors stay valid and no gone_beyond_horizon cascade fires.
+        The full bump/reuse matrix lives in test_event_journal_epoch.py; this
+        asserts the attach-path default is reuse."""
         import src.api.persistent_app as mod
 
         conn = MagicMock()
-        conn.fetchrow = AsyncMock(return_value={"events_epoch": 8})
+        conn.fetchrow = AsyncMock(
+            return_value={
+                "events_epoch": 8,
+                "events_seq_hwm": 41,
+                "status": "active",
+            }
+        )
+        # Probe order: terminal-frame EXISTS → False, MAX(seq) → 37 (< hwm).
+        conn.fetchval = AsyncMock(side_effect=[False, 37])
+        conn.execute = AsyncMock()
 
-        epoch = await mod._resolve_event_journal_epoch(
-            self._pool(conn), "thread-pruned"
+        epoch, seq_seed = await mod._resolve_event_journal_epoch(
+            self._pool(conn), "thread-live"
         )
 
-        assert epoch == 8
+        assert (epoch, seq_seed) == (8, 41)
+        # hwm already covers max_seq → no correction UPDATE.
+        conn.execute.assert_not_awaited()
         sql, thread_id = conn.fetchrow.await_args.args
-        assert "events_epoch = events_epoch + 1" in " ".join(sql.split())
-        assert "MAX(seq)" not in sql
-        assert thread_id == "thread-pruned"
+        assert "events_seq_hwm" in sql
+        assert "events_epoch + 1" not in sql
+        assert thread_id == "thread-live"
 
     @pytest.mark.asyncio
     async def test_missing_thread_fails_closed(self):
@@ -147,12 +162,14 @@ class TestBroadcastCursor:
         """A DB-backed session routes broadcast persistence through its writer."""
         import src.api.persistent_app as mod
 
-        # Fake session with a no-op acquire that records the call.
+        # Fake session with a no-op acquire that records the fenced flush
+        # (fetchval returning the inserted count — the epoch-guard contract).
         recorded = []
 
         class _FakeConn:
-            async def execute(self, *args, **kwargs):
+            async def fetchval(self, *args, **kwargs):
                 recorded.append(args)
+                return len(json.loads(args[2]))
 
         class _Acquire:
             async def __aenter__(self):
@@ -172,6 +189,7 @@ class TestBroadcastCursor:
         writer = mod._OrderedPersistentEventWriter(
             postgres_conn=fake_conn,
             thread_id="thread-xyz",
+            epoch=0,
             on_terminal_failure=mod._event_persistence_failed,
         )
         writer.start()
@@ -181,13 +199,15 @@ class TestBroadcastCursor:
         await writer.close()
         mod._event_writer = None
 
-        assert recorded, "expected the ordered writer to call execute()"
-        # First arg is the INSERT SQL; subsequent args bind values.
+        assert recorded, "expected the ordered writer to call fetchval()"
+        # Args: (SQL, thread_id, rows_json, writer_epoch).
         sql = recorded[0][0]
         assert "INSERT INTO thread_events" in sql
         assert "ON CONFLICT" not in sql
+        assert "events_epoch = $3" in sql  # fenced on the writer's epoch
         rows = json.loads(recorded[0][2])
         assert [(row["seq"], row["kind"]) for row in rows] == [(1, "token")]
+        assert recorded[0][3] == 0
 
 
 class TestOrderedPersistentEventWriter:
@@ -217,9 +237,10 @@ class TestOrderedPersistentEventWriter:
         max_active = 0
 
         class _Conn:
-            async def execute(self, _sql, _thread_id, rows_json):
+            async def fetchval(self, _sql, _thread_id, rows_json, _epoch):
                 nonlocal active, max_active
-                seqs = [row["seq"] for row in json.loads(rows_json)]
+                rows = json.loads(rows_json)
+                seqs = [row["seq"] for row in rows]
                 started.append(seqs)
                 active += 1
                 max_active = max(max_active, active)
@@ -228,11 +249,13 @@ class TestOrderedPersistentEventWriter:
                     await release_first.wait()
                 completed.append(seqs)
                 active -= 1
+                return len(rows)
 
         failures = []
         writer = mod._OrderedPersistentEventWriter(
             postgres_conn=self._pool(_Conn()),
             thread_id="thread-ordered",
+            epoch=0,
             on_terminal_failure=lambda events, reason: failures.append(
                 (events, reason)
             ),
@@ -268,12 +291,15 @@ class TestOrderedPersistentEventWriter:
         calls = []
 
         class _Conn:
-            async def execute(self, _sql, _thread_id, rows_json):
-                calls.append(json.loads(rows_json))
+            async def fetchval(self, _sql, _thread_id, rows_json, _epoch):
+                rows = json.loads(rows_json)
+                calls.append(rows)
+                return len(rows)
 
         writer = mod._OrderedPersistentEventWriter(
             postgres_conn=self._pool(_Conn()),
             thread_id="thread-batch",
+            epoch=4,
             on_terminal_failure=lambda _events, _reason: None,
             batch_size=10,
         )
@@ -295,7 +321,7 @@ class TestOrderedPersistentEventWriter:
         attempts = 0
 
         class _Conn:
-            async def execute(self, _sql, _thread_id, _rows_json):
+            async def fetchval(self, _sql, _thread_id, _rows_json, _epoch):
                 nonlocal attempts
                 attempts += 1
                 raise RuntimeError("database unavailable")
@@ -306,6 +332,7 @@ class TestOrderedPersistentEventWriter:
             writer = mod._OrderedPersistentEventWriter(
                 postgres_conn=self._pool(_Conn()),
                 thread_id="thread-canvas",
+                epoch=2,
                 on_terminal_failure=mod._event_persistence_failed,
                 state_max_attempts=3,
                 retry_base_s=0,
@@ -334,8 +361,8 @@ class TestOrderedPersistentEventWriter:
         import src.api.persistent_app as mod
 
         class _Conn:
-            async def execute(self, _sql, _thread_id, _rows_json):
-                return None
+            async def fetchval(self, _sql, _thread_id, rows_json, _epoch):
+                return len(json.loads(rows_json))
 
         mod._subscribers.clear()
         with patch.object(mod, "_orchestrator_client", None):
@@ -343,6 +370,7 @@ class TestOrderedPersistentEventWriter:
             writer = mod._OrderedPersistentEventWriter(
                 postgres_conn=self._pool(_Conn()),
                 thread_id="thread-overflow",
+                epoch=1,
                 on_terminal_failure=mod._event_persistence_failed,
                 queue_maxsize=1,
             )
