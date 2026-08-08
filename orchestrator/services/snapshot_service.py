@@ -9,6 +9,9 @@ Architecture:
     (``entity_type`` is ``jobs`` or ``threads``)
   - Phase-boundary snapshots are stored per-phase under ``phases/phase_<n>/``
   - The top-level ``manifest.json`` + ``env.tar.zst`` always point to the latest
+  - ``history/<ts>/`` holds the last ``SNAPSHOT_KEEP_GENERATIONS`` prior
+    canonical generations (§C3 no-clobber: the canonical write is staged,
+    verified, then promoted — never overwritten in place)
 
 Selection logic:
   - S3_ENDPOINT configured → S3 features enabled
@@ -20,6 +23,7 @@ import hashlib
 import json
 import logging
 import os
+import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
@@ -145,6 +149,16 @@ class SnapshotService:
     ) -> bool:
         """Upload a snapshot tarball + manifest to S3.
 
+        The canonical write is staged (§C3, no-clobber): the tarball lands
+        at a unique ``env.tar.zst.staging-<uuid>`` key first and is
+        verified there (the §C2 size check); only a verified upload is
+        promoted onto the canonical ``env.tar.zst`` and a new
+        ``history/<ts>/`` generation (pruned to
+        ``SNAPSHOT_KEEP_GENERATIONS``). A bad or truncated capture is
+        therefore never able to overwrite the last known-good canonical
+        archive in place — see
+        docs/features/workspace_durability_tiering.md §C3.
+
         Args:
             job_id: Job or thread UUID.
             tar_path: Local path to the env.tar.zst file.
@@ -188,58 +202,122 @@ class SnapshotService:
                     ContentType="application/json",
                 )
 
-            # Always update top-level (latest) snapshot
+            # §C3 no-clobber: upload the tarball to a UNIQUE STAGING key
+            # first, verify it there, and only promote a verified upload
+            # onto canonical. Nothing below this point writes to
+            # `{prefix}/env.tar.zst` until the staged bytes are already
+            # known-good — a truncated/partial multipart upload can no
+            # longer clobber the last good archive the way a direct
+            # canonical write followed by a post-hoc check could.
+            staging_uuid = uuid.uuid4().hex
+            staging_key = f"{prefix}/env.tar.zst.staging-{staging_uuid}"
+            canonical_key = f"{prefix}/env.tar.zst"
+
             await asyncio.to_thread(
                 self._s3.upload_file,
                 tar_path,
                 self._bucket,
-                f"{prefix}/env.tar.zst",
-            )
-            await asyncio.to_thread(
-                self._s3.put_object,
-                Bucket=self._bucket,
-                Key=f"{prefix}/manifest.json",
-                Body=manifest_bytes,
-                ContentType="application/json",
+                staging_key,
             )
 
-            # Post-upload integrity check (§C2): confirm the canonical
-            # object actually landed with the expected size before
-            # advertising "available" — a truncated/partial multipart
-            # upload must never be trusted. Cheap (HEAD only); the deep
-            # hash re-check is verify_snapshot's job at reclaim time, not a
-            # per-upload cost. "When present": some manifests omit
-            # size_compressed_bytes, and there's nothing to compare
-            # against in that case, so the check is skipped rather than
-            # failing closed on absence.
-            expected_size = manifest.get("size_compressed_bytes")
-            if expected_size:
-                head = await asyncio.to_thread(
-                    self._s3.head_object,
-                    Bucket=self._bucket,
-                    Key=f"{prefix}/env.tar.zst",
+            try:
+                # Verify the STAGING object (§C2's check), before any
+                # canonical write. "When present": some manifests omit
+                # size_compressed_bytes, and there's nothing to compare
+                # against in that case, so the check is skipped rather
+                # than failing closed on absence.
+                expected_size = manifest.get("size_compressed_bytes")
+                if expected_size:
+                    head = await asyncio.to_thread(
+                        self._s3.head_object,
+                        Bucket=self._bucket,
+                        Key=staging_key,
+                    )
+                    actual_size = head["ContentLength"]
+                    if actual_size != expected_size:
+                        logger.error(
+                            "Snapshot upload size mismatch for %s %s: s3=%s manifest=%s",
+                            entity_type.rstrip("s"),
+                            job_id,
+                            actual_size,
+                            expected_size,
+                        )
+                        await self._set_snapshot_context(
+                            job_id,
+                            {
+                                "status": "capture_failed",
+                                "error": (
+                                    f"post-upload size mismatch (s3={actual_size} "
+                                    f"manifest={expected_size})"
+                                ),
+                            },
+                            entity_type=entity_type,
+                        )
+                        # Canonical is untouched — nothing above this
+                        # point ever wrote to it. `finally` below deletes
+                        # the bad staging object.
+                        return False
+
+                # Promote (size-safe copy). Use the MANAGED `s3.copy` —
+                # never `copy_object`: that's a single-part CopyObject API
+                # call capped at 5 GB, and snapshots can reach
+                # SNAPSHOT_MAX_SIZE_GB (default 10 GB). `.copy()` is
+                # backed by boto3's TransferManager, which switches to a
+                # multipart copy automatically above its threshold. The
+                # staged bytes are already verified by this point, so
+                # copying them onto canonical only ever replaces it with
+                # an equally-good object — S3 PUT/COPY is atomic at the
+                # destination key, so a failure here (raised exception)
+                # leaves whatever was already there, never a
+                # half-written object.
+                ts = self._history_generation_stamp(manifest, staging_uuid)
+                history_prefix = f"{prefix}/history/{ts}"
+                copy_source = {"Bucket": self._bucket, "Key": staging_key}
+
+                await asyncio.to_thread(
+                    self._s3.copy, copy_source, self._bucket, canonical_key
                 )
-                actual_size = head["ContentLength"]
-                if actual_size != expected_size:
-                    logger.error(
-                        "Snapshot upload size mismatch for %s %s: s3=%s manifest=%s",
-                        entity_type.rstrip("s"),
-                        job_id,
-                        actual_size,
-                        expected_size,
-                    )
-                    await self._set_snapshot_context(
-                        job_id,
-                        {
-                            "status": "capture_failed",
-                            "error": (
-                                f"post-upload size mismatch (s3={actual_size} "
-                                f"manifest={expected_size})"
-                            ),
-                        },
-                        entity_type=entity_type,
-                    )
-                    return False
+                await asyncio.to_thread(
+                    self._s3.copy,
+                    copy_source,
+                    self._bucket,
+                    f"{history_prefix}/env.tar.zst",
+                )
+                await asyncio.to_thread(
+                    self._s3.put_object,
+                    Bucket=self._bucket,
+                    Key=f"{prefix}/manifest.json",
+                    Body=manifest_bytes,
+                    ContentType="application/json",
+                )
+                await asyncio.to_thread(
+                    self._s3.put_object,
+                    Bucket=self._bucket,
+                    Key=f"{history_prefix}/manifest.json",
+                    Body=manifest_bytes,
+                    ContentType="application/json",
+                )
+            finally:
+                # Staging is single-use scaffolding: gone whether promote
+                # succeeded or failed. On the failure path this also
+                # completes the no-clobber guarantee — no `.staging-`
+                # object is left behind masquerading as a real generation.
+                await self._delete_staging_best_effort(staging_key)
+
+            # Prune history to the newest SNAPSHOT_KEEP_GENERATIONS.
+            # Best-effort: a prune hiccup must never undo an
+            # already-durable promote — the new snapshot (canonical + its
+            # own history generation) is safe regardless of whether old
+            # generations get swept this round or the next.
+            try:
+                await self._prune_history(prefix, self._keep_generations())
+            except Exception:
+                logger.exception(
+                    "History prune failed for %s %s (canonical + new "
+                    "generation are unaffected)",
+                    entity_type.rstrip("s"),
+                    job_id,
+                )
 
             # Update entity context
             await self._set_snapshot_context(
@@ -1305,13 +1383,18 @@ class SnapshotService:
         try:
             paginator = self._s3.get_paginator("list_objects_v2")
 
-            # Count active snapshots
+            # Count active snapshots. §C3: history/ generations are prior
+            # rollback copies of the SAME snapshot, not additional ones —
+            # excluded here so they don't inflate the count, but their
+            # bytes still consume real storage (counted unconditionally
+            # below).
             pages = paginator.paginate(Bucket=self._bucket, Prefix="jobs/")
             for page in await asyncio.to_thread(lambda: list(pages)):
                 for obj in page.get("Contents", []):
                     if (
                         obj["Key"].endswith("/manifest.json")
                         and "/phases/" not in obj["Key"]
+                        and "/history/" not in obj["Key"]
                     ):
                         stats["total_snapshots"] += 1
                     stats["total_size_bytes"] += obj.get("Size", 0)
@@ -1378,6 +1461,85 @@ class SnapshotService:
         for chunk in iter(lambda: body.read(1024 * 1024), b""):
             h.update(chunk)
         return h.hexdigest()
+
+    @staticmethod
+    def _keep_generations() -> int:
+        """``SNAPSHOT_KEEP_GENERATIONS`` (default 3), read once per upload
+        and clamped to at least 1 — 0 or negative would prune away the
+        generation the same upload just promoted.
+        """
+        return max(1, int(os.environ.get("SNAPSHOT_KEEP_GENERATIONS", "3")))
+
+    @staticmethod
+    def _history_generation_stamp(manifest: dict[str, Any], unique_suffix: str) -> str:
+        """Build a lexically-sortable, filesystem-safe ``history/`` generation id.
+
+        Derived from the manifest's ``created_at`` (falling back to "now"
+        when absent) with ``:``/``+`` sanitized out — S3 keys tolerate
+        both characters, but ``:`` reads awkwardly in tooling and ``+``
+        gets URL-decoded to a space by some clients/proxies. A short
+        unique suffix (the staging upload's own uuid) is always appended
+        so two generations can never collide even when ``created_at``
+        repeats (clock resolution) or is absent from the manifest
+        entirely.
+        """
+        created_at = (
+            manifest.get("created_at") or datetime.now(timezone.utc).isoformat()
+        )
+        sanitized = str(created_at).replace(":", "-").replace("+", "_")
+        return f"{sanitized}-{unique_suffix[:8]}"
+
+    async def _delete_staging_best_effort(self, key: str) -> None:
+        """Delete a staging object, swallowing failures.
+
+        Called from a ``finally`` around the verify/promote block in
+        ``upload_snapshot`` — a stray ``.staging-*`` object is inert
+        clutter (no other code path ever reads it), so a delete failure
+        here must never shadow the upload's real success/failure outcome.
+        """
+        try:
+            await asyncio.to_thread(
+                self._s3.delete_object, Bucket=self._bucket, Key=key
+            )
+        except Exception:
+            logger.warning("Failed to delete staging object %s (non-fatal)", key)
+
+    async def _prune_history(self, prefix: str, keep: int) -> None:
+        """Delete all but the newest ``keep`` generations under ``{prefix}/history/``.
+
+        Each generation is named ``<ts>`` (see
+        ``_history_generation_stamp``) and holds exactly ``env.tar.zst`` +
+        ``manifest.json``. Generation ids sort lexically oldest-first, so
+        the newest ``keep`` are simply the tail of a plain sort. Called
+        only after a successful promote; the caller treats this as
+        best-effort — a prune failure must never undo an already-durable
+        capture.
+        """
+        history_prefix = f"{prefix}/history/"
+        paginator = self._s3.get_paginator("list_objects_v2")
+        pages = paginator.paginate(Bucket=self._bucket, Prefix=history_prefix)
+
+        generations: set[str] = set()
+        for page in await asyncio.to_thread(lambda: list(pages)):
+            for obj in page.get("Contents", []):
+                rest = obj["Key"][len(history_prefix) :]
+                generation = rest.split("/", 1)[0]
+                if generation:
+                    generations.add(generation)
+
+        if len(generations) <= keep:
+            return
+
+        stale = sorted(generations)[: len(generations) - keep]
+        for generation in stale:
+            for name in ("env.tar.zst", "manifest.json"):
+                key = f"{history_prefix}{generation}/{name}"
+                try:
+                    await asyncio.to_thread(
+                        self._s3.delete_object, Bucket=self._bucket, Key=key
+                    )
+                except Exception:
+                    logger.warning("Failed to prune history object %s", key)
 
 
 # Module-level singleton
