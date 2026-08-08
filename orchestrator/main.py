@@ -31075,6 +31075,7 @@ async def internal_unit_claim_bundle(
     except (ValueError, TypeError):
         raise HTTPException(status_code=404, detail="Unknown unit") from None
 
+    _t_start = time.perf_counter()
     async with postgres_db.acquire() as conn:
         row = await conn.fetchrow(
             "SELECT unit_kind, state, lease_token, input_seq, consumed_seq "
@@ -31089,6 +31090,7 @@ async def internal_unit_claim_bundle(
         raise HTTPException(status_code=403, detail="Lease validation failed")
     if row["unit_kind"] != UNIT_KIND_SESSION_TURN:
         raise HTTPException(status_code=409, detail="Unit kind carries no attach")
+    _t_lease = time.perf_counter()
 
     # unit_id == thread_id for session_turn units.
     thread = await postgres_db.get_thread(unit_id)
@@ -31120,6 +31122,7 @@ async def internal_unit_claim_bundle(
         include_kb_profile=include_kb_profile,
     )
     config_name = canonical_config_name(thread.get("config_name") or "session_base")
+    _t_creds = time.perf_counter()
 
     # Same serialization the pinned sender takes (_send_session_attach): the
     # assembly must not race a live connector-selection update.
@@ -31130,6 +31133,16 @@ async def internal_unit_claim_bundle(
     if attach is None:
         # Generic by design — refusal reasons live in the server log only.
         raise HTTPException(status_code=409, detail="Attach assembly refused")
+    _t_end = time.perf_counter()
+    logger.info(
+        "claim-bundle timing: unit=%s lease=%.3fs creds=%.3fs assemble=%.3fs "
+        "total=%.3fs",
+        unit_id,
+        _t_lease - _t_start,
+        _t_creds - _t_lease,
+        _t_end - _t_creds,
+        _t_end - _t_start,
+    )
 
     return {
         "unit_id": unit_id,
