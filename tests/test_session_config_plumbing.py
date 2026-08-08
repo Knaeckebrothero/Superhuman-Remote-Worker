@@ -18,7 +18,7 @@ step 1 (2026-06-11):
 import asyncio
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi import HTTPException
@@ -31,6 +31,7 @@ from src.core.tool_policy import ToolPolicyError, validate_tool_override_fragmen
 class _FakeResponse:
     def __init__(self, status_code: int = 200):
         self.status_code = status_code
+        self.text = ""
 
 
 class _FakeAsyncClient:
@@ -75,6 +76,22 @@ def _patch_thread_datasource_delivery_lock():
         orch_main.postgres_db,
         "thread_datasource_lock",
         side_effect=lambda _thread_id: _noop_thread_datasource_lock(),
+    ):
+        yield
+
+
+_REAL_RESERVE_SESSION_ATTACH_BINDING = orch_main._reserve_session_attach_binding
+
+
+@pytest.fixture(autouse=True)
+def _patch_session_attach_reservation():
+    """Payload-focused tests do not need a live DB reservation."""
+    with (
+        patch.object(
+            orch_main,
+            "_reserve_session_attach_binding",
+            AsyncMock(return_value=True),
+        ),
     ):
         yield
 
@@ -444,6 +461,259 @@ class TestSendSessionAttachPayload:
     """Hole B, orchestrator side: the attach payload carries config_name."""
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("execution_lane", ["stateless", "future-lane"])
+    async def test_attach_refuses_every_non_pinned_lane_before_http(
+        self, execution_lane
+    ):
+        thread = {
+            "id": "tid-1",
+            "execution_lane": execution_lane,
+            "user_id": None,
+            "metadata": {},
+        }
+        with patch.object(
+            orch_main.postgres_db,
+            "get_thread",
+            AsyncMock(return_value=thread),
+        ):
+            ok = await orch_main._send_session_attach(
+                {"id": "a1", "pod_ip": "10.0.0.1", "pod_port": 8001},
+                "tid-1",
+            )
+
+        assert ok is False
+        assert _FakeAsyncClient.calls == []
+
+    @pytest.mark.asyncio
+    async def test_attach_reservation_miss_never_reaches_http(self):
+        """A lost lane/detachment CAS cannot start an agent-side attach."""
+        thread = {
+            "id": "tid-1",
+            "execution_lane": "pinned",
+            "user_id": None,
+            "metadata": {},
+        }
+        with (
+            patch.object(
+                orch_main.postgres_db,
+                "get_thread",
+                AsyncMock(return_value=thread),
+            ),
+            patch.object(
+                orch_main,
+                "_assemble_session_attach_payload",
+                AsyncMock(return_value={"thread_id": "tid-1"}),
+            ),
+            patch.object(
+                orch_main,
+                "_reserve_session_attach_binding",
+                AsyncMock(return_value=False),
+            ) as reserve,
+            patch.object(orch_main.httpx, "AsyncClient", _FakeAsyncClient),
+        ):
+            ok = await orch_main._send_session_attach(
+                {"id": "a1", "pod_ip": "10.0.0.1", "pod_port": 8001},
+                "tid-1",
+            )
+
+        assert ok is False
+        reserve.assert_awaited_once_with("a1", "tid-1")
+        assert _FakeAsyncClient.calls == []
+
+    @pytest.mark.asyncio
+    async def test_agent_reservation_cas_miss_rolls_back_before_thread_or_http(self):
+        conn = AsyncMock()
+        conn.execute = AsyncMock(return_value="UPDATE 0")
+        tx = AsyncMock()
+        tx.__aenter__.return_value = None
+        tx.__aexit__.return_value = False
+        conn.transaction = MagicMock(return_value=tx)
+        acquire = AsyncMock()
+        acquire.__aenter__.return_value = conn
+        acquire.__aexit__.return_value = False
+
+        with patch.object(
+            orch_main.postgres_db,
+            "acquire",
+            MagicMock(return_value=acquire),
+        ):
+            reserved = await _REAL_RESERVE_SESSION_ATTACH_BINDING("a1", "tid-1")
+
+        assert reserved is False
+        assert conn.execute.await_count == 1
+        assert "current_job_id IS NULL" in conn.execute.await_args.args[0]
+        assert "status = 'ready'" in conn.execute.await_args.args[0]
+
+    @pytest.mark.asyncio
+    async def test_thread_lane_cas_is_inside_the_same_reservation_transaction(self):
+        conn = AsyncMock()
+        conn.execute = AsyncMock(side_effect=["UPDATE 1", "UPDATE 0"])
+        tx = AsyncMock()
+        tx.__aenter__.return_value = None
+        tx.__aexit__.return_value = False
+        conn.transaction = MagicMock(return_value=tx)
+        acquire = AsyncMock()
+        acquire.__aenter__.return_value = conn
+        acquire.__aexit__.return_value = False
+
+        with patch.object(
+            orch_main.postgres_db,
+            "acquire",
+            MagicMock(return_value=acquire),
+        ):
+            reserved = await _REAL_RESERVE_SESSION_ATTACH_BINDING("a1", "tid-1")
+
+        assert reserved is False
+        assert conn.execute.await_count == 2
+        assert "execution_lane = $3" in conn.execute.await_args_list[1].args[0]
+        tx.__aexit__.assert_awaited_once()
+        assert tx.__aexit__.await_args.args[0] is RuntimeError
+
+    @pytest.mark.asyncio
+    async def test_successful_reservation_precedes_http_delivery(self):
+        thread = {
+            "id": "tid-1",
+            "execution_lane": "pinned",
+            "user_id": None,
+            "metadata": {},
+        }
+        order: list[str] = []
+
+        async def reserve(*_args):
+            order.append("reserve")
+            return True
+
+        async def post(_self, url, json=None):
+            assert order == ["reserve"]
+            order.append("http")
+            _FakeAsyncClient.calls.append({"url": url, "json": json})
+            return _FakeResponse(200)
+
+        with (
+            patch.object(
+                orch_main.postgres_db,
+                "get_thread",
+                AsyncMock(return_value=thread),
+            ),
+            patch.object(
+                orch_main,
+                "_assemble_session_attach_payload",
+                AsyncMock(return_value={"thread_id": "tid-1"}),
+            ),
+            patch.object(
+                orch_main,
+                "_reserve_session_attach_binding",
+                AsyncMock(side_effect=reserve),
+            ),
+            patch.object(_FakeAsyncClient, "post", post),
+            patch.object(orch_main.httpx, "AsyncClient", _FakeAsyncClient),
+        ):
+            ok = await orch_main._send_session_attach(
+                {"id": "a1", "pod_ip": "10.0.0.1", "pod_port": 8001},
+                "tid-1",
+            )
+
+        assert ok is True
+        assert order == ["reserve", "http"]
+
+    @pytest.mark.asyncio
+    async def test_409_retains_reservation_because_same_thread_is_ambiguous(self):
+        thread = {
+            "id": "tid-1",
+            "execution_lane": "pinned",
+            "user_id": None,
+            "metadata": {},
+        }
+        _FakeAsyncClient.response_status = 409
+        with (
+            patch.object(
+                orch_main.postgres_db,
+                "get_thread",
+                AsyncMock(return_value=thread),
+            ),
+            patch.object(
+                orch_main,
+                "_assemble_session_attach_payload",
+                AsyncMock(return_value={"thread_id": "tid-1"}),
+            ),
+            patch.object(orch_main.httpx, "AsyncClient", _FakeAsyncClient),
+            patch.object(
+                orch_main,
+                "_reserve_session_attach_binding",
+                AsyncMock(return_value=True),
+            ) as reserve,
+        ):
+            ok = await orch_main._send_session_attach(
+                {"id": "a1", "pod_ip": "10.0.0.1", "pod_port": 8001},
+                "tid-1",
+            )
+
+        assert ok is True
+        reserve.assert_awaited_once_with("a1", "tid-1")
+        assert [call["url"] for call in _FakeAsyncClient.calls] == [
+            "http://10.0.0.1:8001/session/attach"
+        ]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("status_code", [422, 500])
+    async def test_ambiguous_http_failure_retains_reservation(self, status_code):
+        thread = {
+            "id": "tid-1",
+            "execution_lane": "pinned",
+            "user_id": None,
+            "metadata": {},
+        }
+        _FakeAsyncClient.response_status = status_code
+        with (
+            patch.object(
+                orch_main.postgres_db,
+                "get_thread",
+                AsyncMock(return_value=thread),
+            ),
+            patch.object(
+                orch_main,
+                "_assemble_session_attach_payload",
+                AsyncMock(return_value={"thread_id": "tid-1"}),
+            ),
+            patch.object(orch_main.httpx, "AsyncClient", _FakeAsyncClient),
+        ):
+            ok = await orch_main._send_session_attach(
+                {"id": "a1", "pod_ip": "10.0.0.1", "pod_port": 8001},
+                "tid-1",
+            )
+
+        assert ok is True
+
+    @pytest.mark.asyncio
+    async def test_transport_failure_retains_reservation(self):
+        thread = {
+            "id": "tid-1",
+            "execution_lane": "pinned",
+            "user_id": None,
+            "metadata": {},
+        }
+        _FakeAsyncClient.raise_on_post = TimeoutError("response lost")
+        with (
+            patch.object(
+                orch_main.postgres_db,
+                "get_thread",
+                AsyncMock(return_value=thread),
+            ),
+            patch.object(
+                orch_main,
+                "_assemble_session_attach_payload",
+                AsyncMock(return_value={"thread_id": "tid-1"}),
+            ),
+            patch.object(orch_main.httpx, "AsyncClient", _FakeAsyncClient),
+        ):
+            ok = await orch_main._send_session_attach(
+                {"id": "a1", "pod_ip": "10.0.0.1", "pod_port": 8001},
+                "tid-1",
+            )
+
+        assert ok is True
+
+    @pytest.mark.asyncio
     async def test_detach_save_cannot_finish_before_inflight_delivery(self):
         gate = asyncio.Lock()
         delivery_started = asyncio.Event()
@@ -496,8 +766,13 @@ class TestSendSessionAttachPayload:
 
     @pytest.mark.asyncio
     async def test_payload_carries_config_name(self):
-        _FakeAsyncClient.response_status = 500  # skip the DB-binding branch
-        thread = {"id": "tid-1", "user_id": None, "metadata": {}}
+        _FakeAsyncClient.response_status = 500
+        thread = {
+            "id": "tid-1",
+            "execution_lane": "pinned",
+            "user_id": None,
+            "metadata": {},
+        }
         with (
             patch.object(
                 orch_main.postgres_db,
@@ -520,7 +795,7 @@ class TestSendSessionAttachPayload:
                 datasources=None,
                 config_name="session_base",
             )
-        assert ok is False
+        assert ok is True
         assert len(_FakeAsyncClient.calls) == 1
         call = _FakeAsyncClient.calls[0]
         assert call["url"] == "http://10.0.0.1:8001/session/attach"
@@ -532,6 +807,7 @@ class TestSendSessionAttachPayload:
         datasource_id = "11111111-2222-3333-4444-555555555555"
         thread = {
             "id": "tid-1",
+            "execution_lane": "pinned",
             "user_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
             "metadata": {"datasource_ids": [datasource_id]},
         }
@@ -585,6 +861,7 @@ class TestSendSessionAttachPayload:
         project_id = "99999999-2222-3333-4444-555555555555"
         thread = {
             "id": "tid-1",
+            "execution_lane": "pinned",
             "user_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
             "metadata": {},
         }
@@ -636,6 +913,7 @@ class TestSendSessionAttachPayload:
         project_id = "99999999-2222-4333-8444-555555555555"
         thread = {
             "id": "tid-1",
+            "execution_lane": "pinned",
             "user_id": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
             "metadata": {"datasource_ids": [current_id]},
         }
@@ -691,7 +969,7 @@ class TestSendSessionAttachPayload:
                 config_name="persistent_defaults",
             )
 
-        assert ok is False
+        assert ok is True
         resolver.assert_awaited_once_with(
             datasource_ids=[current_id],
             project_ids=[project_id],
@@ -721,6 +999,7 @@ class TestColdSessionDatasourceDelivery:
             # the writer replaces the canonical metadata with [].
             return {
                 "id": "tid-1",
+                "execution_lane": "pinned",
                 "user_id": None,
                 "project_id": None,
                 "metadata": {"datasource_ids": list(state["datasource_ids"])},
@@ -788,7 +1067,12 @@ class TestColdSessionDatasourceDelivery:
     @pytest.mark.asyncio
     async def test_attach_discards_stale_payload_after_detach_all(self):
         stale_id = "11111111-2222-4333-8444-555555555555"
-        thread = {"id": "tid-1", "user_id": None, "metadata": {"datasource_ids": []}}
+        thread = {
+            "id": "tid-1",
+            "execution_lane": "pinned",
+            "user_id": None,
+            "metadata": {"datasource_ids": []},
+        }
 
         _FakeAsyncClient.response_status = 500
         with (
@@ -819,7 +1103,7 @@ class TestColdSessionDatasourceDelivery:
                 config_name="persistent_defaults",
             )
 
-        assert ok is False
+        assert ok is True
         assert _FakeAsyncClient.calls[0]["json"]["datasources"] is None
 
     def test_warm_resume_uses_canonical_thread_mount_projects(self):
