@@ -75,6 +75,30 @@ as a homelab soak. **Push held** (owner's call).
 deploy, check `verify_snapshot` against real dev S3, then arm the flag and drive suspend→reclaim→resume on a
 **throwaway test session**, asserting a gitignored real-work file survives the round-trip.
 
+**Dev-cluster E2E (2026-08-08) — ran the runbook manually; it found + fixed two blocking bugs (commit
+`91f68129`, tests included).** The k3d validation never exercised `tar` running as the unprivileged
+`agent-host` user over a real **ext4 PVC** carrying `/usr/local`, so two rc=2 failures slipped through to
+the dev cluster:
+
+1. **Capture hit the ext4 `lost+found`.** An ext4-formatted PVC mounts a root-owned `0700 lost+found` at
+   its volume root (== `/home/agent-host`); the capture `tar` runs as `agent-host`, can't open it, exits
+   rc≥2 — which C1b now (correctly) rejects. So **every** PVC-backed capture failed → idle-suspend never
+   completed → reclaim could never fire (C1b turned a previously-masked, benign error into a hard failure).
+   Fix: `--exclude=*/lost+found` (an fsck artifact, never workspace data).
+2. **Pod restore extracted `/usr/local` as `agent-host`.** `_extract_snapshot` used the full
+   `EXTRACT_REMOTE_CMD`; extracting the image-provided, root-owned `/usr/local` as `agent-host` exits rc=2,
+   so pod restore-from-S3 silently never worked. Fix: pods pass `scoped_home=True` →
+   `EXTRACT_HOME_REMOTE_CMD` (home-only, matching the already-correct `ide_session` k8s-pod path); VMs keep
+   the full extract.
+
+**Validated live** (real ext4 PVC, real `agent-host` SSH, real garage S3), isolating one variable at a time:
+Phase 0 markers + flag-off on both HA replicas; `verify_snapshot` good/sha/size/missing verdicts against
+real S3; the C3 no-clobber upload writing canonical + a `history/` generation + manifest and
+`verify_snapshot`→`(True,'ok')`; the reclaim decision correctly re-provisioning a **fresh PVC (new UID)** and
+taking the extract-not-reattach branch; and — with both fixes — a byte-identical capture→home-extract
+round-trip (rc=0/rc=0). Still owed: the **automated** end-to-end (drive the real suspend endpoint with the
+flag armed) once `91f68129` is deployed.
+
 **Still design-only (NOT built) — proposals in the sections below, not shipped:** the **§B** layered
 PVC-loss recovery (extract → `git fetch` → `git reset` for node loss), the **§D** PVC-lifecycle hardening
 (the `crossNodeReattach` operator flag, finalizer discipline, `WaitForFirstConsumer`), and **F3** quota
