@@ -424,10 +424,9 @@ async def _provision_agent_for_thread(
 
 
 class PinnedConnectionResponse(BaseModel):
-    """Connection coordinates for the legacy pod-bound session lane."""
+    """Connection coordinates when a per-session control socket exists."""
 
     state: Literal["ready"]
-    execution_lane: Literal["pinned"]
     control_socket: Literal["websocket"]
     ws_url: str
     token: str
@@ -435,10 +434,9 @@ class PinnedConnectionResponse(BaseModel):
 
 
 class StatelessConnectionResponse(BaseModel):
-    """Admission readiness for a queue-served session with no control socket."""
+    """Admission readiness when no per-session control socket exists."""
 
     state: Literal["ready"]
-    execution_lane: Literal["stateless"]
     control_socket: Literal["none"]
     ws_url: None
     token: None
@@ -447,7 +445,7 @@ class StatelessConnectionResponse(BaseModel):
 
 ConnectionResponse = Annotated[
     PinnedConnectionResponse | StatelessConnectionResponse,
-    Field(discriminator="execution_lane"),
+    Field(discriminator="control_socket"),
 ]
 
 
@@ -459,12 +457,13 @@ async def get_connection(
     request: Request,
     thread_id: str,
 ):
-    """Return the connection shape for this session lane.
+    """Return the lane-free control transport available for this session.
 
     Pinned cold-start and warm reconnect share one WebSocket token-mint path.
-    Stateless sessions bind no agent and can accept queued turns immediately,
-    so they return ``control_socket='none'`` and null socket fields. This does
-    not claim a replacement control transport exists. Unknown lanes fail closed.
+    Queue-served sessions bind no agent and can accept turns immediately, so
+    they return ``control_socket='none'`` and null socket fields. Execution
+    topology remains an internal server concern. This does not claim a
+    replacement control transport exists. Unknown lanes fail closed.
     """
     db = _get_db()
     user = await require_approved_user(request, db)
@@ -490,7 +489,6 @@ async def get_connection(
         # does not advertise a REST control plane that has not been built.
         return StatelessConnectionResponse(
             state="ready",
-            execution_lane="stateless",
             control_socket="none",
             ws_url=None,
             token=None,
@@ -563,7 +561,6 @@ async def get_connection(
 
     return PinnedConnectionResponse(
         state="ready",
-        execution_lane="pinned",
         control_socket="websocket",
         ws_url=ws_url,
         token=token,
