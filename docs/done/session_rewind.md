@@ -245,6 +245,22 @@ improved visually"):
 - Plumbing unchanged: rows call the same `confirmRewind(mode)` /
   `confirmSummarizeUpTo()` as before.
 
+**Usability pass (same day, owner: "the /rewind menu is very small"):** both
+rewind dialogs went `sm`(320px)→`md`(480px). Picker: two-line message preview
+(`-webkit-line-clamp`, full text via `title`), date-aware stamps
+(`formatRewindStamp`: time-only today, localized "Yesterday HH:MM", short date
+beyond — year only when it differs), type-to-filter input shown at
+≥`REWIND_FILTER_MIN_CANDIDATES` (6) prompts (`filterRewindCandidates`,
+substring, case-insensitive), initial focus lands in filter/first row past the
+dialog's close-button auto-capture (50ms defer), Arrow/Home/End roving
+(`onRewindPickerKeydown`; ArrowDown from the filter drops into the list), list
+grows to `min(55vh, 460px)`. Action sheet: meta line under the quote —
+target's stamp `· hides N later messages` (`countTurnsAfter`: user+assistant
+turns after target in the loaded window; clause omitted at 0) — plus a
+composer-refill hint line before the caveat. 12 more vitest cases on the new
+pure helpers; verified live on k3d both themes incl. a 7-prompt seeded fixture
+thread (`bbbbbbbb-1111-…`, local DB only) exercising filter + stamp variants.
+
 ### Failure containment
 
 - Git-fail → abort pre-sweep; state unchanged (snapshot commit is harmless).
