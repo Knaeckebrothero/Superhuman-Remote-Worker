@@ -43,6 +43,14 @@ spec:
         - podSelector:
             matchLabels:
               {{- include "srw.componentSelectorLabels" (dict "context" . "component" "agent") | nindent 14 }}
+        {{- if .Values.agent.stateless.enabled }}
+        # Stateless executor class — deliberately NOT component=agent (that
+        # label pair would put it behind the agent Service/PDB), so it needs
+        # its own ingress allowance.
+        - podSelector:
+            matchLabels:
+              {{- include "srw.componentSelectorLabels" (dict "context" . "component" "agent-stateless") | nindent 14 }}
+        {{- end }}
         - podSelector:
             matchLabels:
               {{- include "srw.componentSelectorLabels" (dict "context" . "component" "llm-seed") | nindent 14 }}
@@ -78,6 +86,12 @@ spec:
         - podSelector:
             matchLabels:
               {{- include "srw.componentSelectorLabels" (dict "context" . "component" "agent") | nindent 14 }}
+        {{- if .Values.agent.stateless.enabled }}
+        # Stateless executor class — see the postgres policy above.
+        - podSelector:
+            matchLabels:
+              {{- include "srw.componentSelectorLabels" (dict "context" . "component" "agent-stateless") | nindent 14 }}
+        {{- end }}
         {{- if .Values.pgadmin.enabled }}
         # Optional pgAdmin UI administers all three app DBs.
         - podSelector:
@@ -112,6 +126,12 @@ spec:
         - podSelector:
             matchLabels:
               {{- include "srw.componentSelectorLabels" (dict "context" . "component" "agent") | nindent 14 }}
+        {{- if .Values.agent.stateless.enabled }}
+        # Stateless executor class — see the postgres policy above.
+        - podSelector:
+            matchLabels:
+              {{- include "srw.componentSelectorLabels" (dict "context" . "component" "agent-stateless") | nindent 14 }}
+        {{- end }}
         {{- if .Values.pgadmin.enabled }}
         # Optional pgAdmin UI administers all three app DBs.
         - podSelector:
@@ -145,6 +165,12 @@ spec:
         - podSelector:
             matchLabels:
               {{- include "srw.componentSelectorLabels" (dict "context" . "component" "agent") | nindent 14 }}
+        {{- if .Values.agent.stateless.enabled }}
+        # Stateless executor class — see the postgres policy above.
+        - podSelector:
+            matchLabels:
+              {{- include "srw.componentSelectorLabels" (dict "context" . "component" "agent-stateless") | nindent 14 }}
+        {{- end }}
       ports:
         - port: 7474
           protocol: TCP

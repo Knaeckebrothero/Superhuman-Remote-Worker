@@ -43,6 +43,12 @@ spec:
         values:
           - srw-agent
           - srw-persistent-agent
+          {{- if .Values.agent.stateless.enabled }}
+          # Stateless executor class (agent/stateless-deployment.yaml) — same
+          # process, same credential surface once a claim bundle lands, so it
+          # gets the identical egress envelope.
+          - srw-agent-stateless
+          {{- end }}
   policyTypes:
     - Egress
   egress:
