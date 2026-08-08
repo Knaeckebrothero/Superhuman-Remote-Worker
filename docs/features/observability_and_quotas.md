@@ -42,16 +42,19 @@ Slices 0–3 are implementation-complete in the repository through app migration
 `0114`. In addition to the typed v2 ledger/read model, workspace-Pod path, and
 separate PVC/PV lifecycles, Slice 3 adds gated agent/IDE Pod intervals,
 authenticated VM/VMI lifecycle capture, exact root-storage attribution, and
-per-source activation/recovery controls. A dark k3d upgrade passed with every
-publication, cutover, v2-read, source-aware-read, storage, and Slice 3 gate off.
-The compatibility ledger remains authoritative, and main dev remains on
-`sha-95d2a10` with migrations through `0102` and Pod inventory only. Live VM
-objects have been normalized read-only, but the live VM cluster's old controller
-and absent collector mean the agent/IDE/VMI/root-storage rollout and shadow
-approval are still pending. Shared-platform coverage is Slice 4; provider
-adapters are incomplete Slice 5 work; utilization is Slice 6. This
-infrastructure Slice 3 must not be confused with this document's still-deferred
-**Slice 3 query /
+per-source activation/recovery controls. Tilt now bakes metering-package changes
+atomically, both orchestrator Dockerfiles enforce a build-time Slice 3 import,
+and the repeated dark k3d rollout is healthy. Configured
+collection/publication gates remain off, although prior local tests left durable
+activation rows in `shadow`. The compatibility ledger remains authoritative.
+The Slice 3 source is merged on `develop`, while observed main dev remains on
+`sha-a4d1fab` with migrations through `0102` and Pod inventory only; its
+agent/IDE rollout and shadow approval remain pending. Live VM objects have been
+normalized read-only, but the VM cluster's old controller and absent collector
+leave VMI/root-storage rollout and shadow approval pending. Shared-platform
+coverage is Slice 4; provider adapters are incomplete Slice 5 work; utilization
+is Slice 6. This infrastructure Slice 3 must not be confused with this
+document's still-deferred **Slice 3 query /
 utility metering**.
 
 **Triggered by:** Approaching enterprise/SaaS readiness. Before plans/billing exist we
@@ -244,14 +247,16 @@ double-count on the next sweep.
 > Cockpit view are built. The repository's typed successor is implemented
 > through infrastructure-metering Slice 3/app `0114`: workspace and agent/IDE
 > Pods, separate PVC/PV assets, VM/VMI lifecycles, and exact root storage. Its
-> all-off k3d dark upgrade passed, but it has not crossed durable cutover. Main
-> dev remains on `sha-95d2a10`/`0102` with Pod inventory only, while the live VM
-> rollout and source shadow approval remain pending. **Deferred here:** this
-> document's query metering, soft-quota alerts, infrastructure source rollout and
-> publication, Slice 4 shared-platform coverage, incomplete Slice 5 provider
-> adapters, and utilization overlays. The slice text below is the original
-> design record; its Slice 3 name refers to query/utility metering, not the
-> successor's agent/VM Slice 3.
+> repaired dev and production images pass the Slice 3 packaging/import contract,
+> and the repeated dark k3d rollout is healthy; no durable cutover occurred.
+> Main dev remains on `sha-a4d1fab`/`0102` with Pod inventory only, while
+> agent/IDE and live-VM source rollout/shadow approval remain pending.
+> **Deferred here:**
+> this document's query metering, soft-quota alerts, infrastructure source
+> rollout and publication, Slice 4 shared-platform coverage, incomplete Slice 5
+> provider adapters, and utilization overlays. The slice text below is the
+> original design record; its Slice 3 name refers to query/utility metering, not
+> the successor's agent/VM Slice 3.
 
 Each metering slice ships with at least a raw read endpoint so numbers can be verified;
 the polished dashboard is its own slice.
@@ -318,10 +323,10 @@ the requests we bill on.
 > [`infrastructure_resource_metering.md`](infrastructure_resource_metering.md).
 > PVC/PV collection, lifecycle, activation, read/seal, and publication code is
 > implementation-complete behind Slice 2 dark-launch gates, while Slice 3 adds
-> exact VM root-storage capture behind independent source gates. The all-off k3d
-> dark upgrade passed, main dev remains on `sha-95d2a10`/`0102` with every
-> storage gate off, live VM rollout/shadow validation is pending, and no storage
-> event has become billing-authoritative.
+> exact VM root-storage capture behind independent source gates. The repaired
+> image packaging and repeated dark k3d rollout passed. Main dev remains on
+> `sha-a4d1fab`/`0102` with every storage gate off, live VM rollout/shadow
+> validation is pending, and no storage event has become billing-authoritative.
 > Whether storage becomes a customer charge remains conditional on the hosting
 > model; truthful allocation visibility does not.
 

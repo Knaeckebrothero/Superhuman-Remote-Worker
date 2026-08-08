@@ -45,16 +45,19 @@ continues to serve the v1 compatibility data while the v2-read gate is off.
 The repository's infrastructure-metering Slices 1–3 are implementation-complete
 through app migration `0114`, including workspace and agent/IDE Pod intervals,
 PVC/PV lifecycles, authenticated VM/VMI capture, and exact root-storage
-attribution. Its all-off k3d dark upgrade passed without enabling publication,
-cutover, v2 reads, source-aware reads, storage, or Slice 3 sources. Main dev has
-not received that package: it still runs `sha-95d2a10`, has migrations through
-`0102`, and enables Pod inventory only. Live VM object normalizers passed
-read-only validation, but the live VM cluster's old controller and absent
-collector leave the VMI/root-storage rollout and shadow approval pending.
+attribution. The repaired dev and production image packages pass the Slice 3
+import contract, and the repeated dark k3d rollout is healthy without publishing
+usage. Configured collection/publication gates are off there, although earlier
+tests left durable activation rows in `shadow`. The source is merged on
+`develop`, but main dev has not received its image/chart package: it still runs
+`sha-a4d1fab`, has migrations through `0102`, and enables Pod inventory only.
+Main-dev agent/IDE rollout and shadow approval remain pending. Live VM object
+normalizers passed read-only validation, but the VM cluster's old controller and
+absent collector leave VMI/root-storage rollout and shadow approval pending.
 Compatibility `/api/usage`, its ledger, and v1 cards therefore remain
 authoritative; the typed agent/VM and claim/volume cards stay off the serving
-path until each
-source is deliberately shadow-approved and publication/read gates are enabled.
+path until each source is deliberately shadow-approved and publication/read
+gates are enabled.
 
 **Driver:** Two things converged. (1) The Slice-4 page shows only a
 category×unit rollup, while the ledger records per-row `user_id`, `project_id`,

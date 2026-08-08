@@ -2,10 +2,11 @@
 
 Status: v1 implemented and deployed. The repository's typed infrastructure
 successor is implementation-complete through Slice 3/app migration `0114` and
-has passed a dark k3d upgrade, but remains dark-launched. Main dev still runs
-`sha-95d2a10` with app migrations through `0102` and Pod inventory only; the
-serving cloud cards still price only the active v1 aggregate workspace
-quantities.
+the repaired dev and production image packages pass their Slice 3 import
+contract. A fresh dark k3d rollout is healthy. The Slice 3 source is merged on
+`develop`; observed main dev still runs `sha-a4d1fab` with app migrations through
+`0102` and Pod inventory only. The serving cloud cards still price only the
+active v1 aggregate workspace quantities.
 
 ## Why
 
@@ -126,17 +127,21 @@ adapter is tested for that exact resource class.
 
 **Current integration state (2026-08-07):** `/api/usage`, the compatibility
 ledger, and the v1 cards remain authoritative. Repository code and local k3d
-validation now cover the typed API/calculator substrate plus Slices 1–3 through
-app migration `0114`. The k3d dark upgrade passed with every publication,
-cutover, v2-read, source-aware-read, storage, and Slice 3 gate off, so it emitted
-no new authoritative quantities. Main dev has not received that package: it
-still runs `sha-95d2a10`, has app migrations through `0102`, and enables Pod
-inventory only. Live VM objects have been normalized read-only, but the live VM
-cluster still has its old controller and no collector; its agent/IDE/VMI/root
-storage rollout and shadow approval remain pending. Slice 2's immutable operator
-registry continues to admit only exact `(cluster, StorageClass, CSI driver,
-volume mode)` selectors; unmapped volumes are unpriced. Provider storage and VM
-rate adapters/fixtures remain incomplete Slice 5 work.
+validation cover the typed API/calculator substrate plus Slices 1–3 through app
+migration `0114`. Tilt now bakes the complete metering package for package
+changes, both orchestrator Dockerfiles enforce the Slice 3 import at build time,
+and a fresh dark k3d rollout is healthy. Configured collection/publication gates
+are off, although prior k3d tests left durable activation rows in `shadow`; no
+authoritative quantities were emitted. The source is merged, but main dev has
+not yet received its image/chart package: it runs `sha-a4d1fab`, has app
+migrations through `0102`, and enables Pod inventory only. Main-dev agent/IDE
+rollout and shadow approval therefore remain pending. Separately, live VM
+objects have been normalized read-only, but the VM cluster still has its old
+controller and no collector, so VMI/root-storage rollout and shadow approval
+remain pending. Slice 2's immutable operator registry continues to admit only
+exact `(cluster, StorageClass, CSI driver, volume mode)` selectors; unmapped
+volumes are unpriced. Provider storage and VM rate adapters/fixtures remain
+incomplete Slice 5 work.
 
 ## Exclusions and follow-ups
 
