@@ -21,6 +21,7 @@ archive is masked whenever ``tar`` still exits 0 — plain ``set -o pipefail``
 handling, including the benign full-extract tar rc==2 case.
 """
 
+import os
 import shutil
 import subprocess
 import sys
@@ -503,3 +504,63 @@ class TestCaptureVmSnapshotAcceptGate:
             # The correct form never trips a `[: integer expected` usage
             # error (the symptom of PIPESTATUS having already been clobbered).
             assert "integer expected" not in result.stderr
+
+    @pytest.mark.asyncio
+    async def test_capture_excludes_ext4_lost_found(self, service):
+        """The capture tar must exclude the ext4 ``lost+found`` artifact.
+
+        An ext4-formatted PVC mounts a root-owned 0700 ``lost+found`` at the
+        volume root — which, for a session/job workspace, IS
+        ``/home/agent-host``. The capture tar runs as the unprivileged
+        ``agent-host`` SSH user and cannot open it, so without this exclude the
+        whole ``tar`` exits rc>=2 and the C1b accept gate (correctly) rejects
+        the archive — breaking EVERY PVC-backed capture, so idle-suspend can
+        never complete and reclaim-on-idle can never fire. Confirmed on the dev
+        cluster: ``tar: /home/agent-host/lost+found: Cannot open: Permission
+        denied`` was the sole cause of a real capture rc=2. See
+        docs/features/workspace_durability_tiering.md §C1.
+        """
+        fake = _fake_capture_proc(returncode=0)
+        with patch(
+            "asyncio.create_subprocess_exec", new=AsyncMock(return_value=fake)
+        ) as mock_exec:
+            await service.capture_vm_snapshot("job-lostfound", "192.0.2.10", 2222)
+
+        remote_cmd = mock_exec.call_args.args[-1]
+        assert "--exclude=*/lost+found" in remote_cmd
+
+    def test_lost_found_exclude_lets_real_tar_skip_unreadable_dir(self, tmp_path):
+        """A real ``tar`` over a workspace containing an unreadable subdir exits
+        rc>=2 (fatal, which the C1b gate rejects) UNLESS that subdir is
+        excluded — the exact ext4 ``lost+found`` situation. Mocked-subprocess
+        tests can't catch this (the C1b lesson): the exclude only helps if
+        tar's real argument matching skips the entry before ever opening it,
+        so prove it against real tar rather than trusting the string shape.
+        """
+        if shutil.which("tar") is None:
+            pytest.skip("tar not available")
+        if os.geteuid() == 0:
+            pytest.skip("root bypasses filesystem permission checks")
+
+        home = tmp_path / "home"
+        home.mkdir()
+        (home / "keep.txt").write_text("workspace data\n")
+        lost = home / "lost+found"
+        lost.mkdir()
+        (lost / "orphan").write_text("x")
+        os.chmod(lost, 0o000)  # mimic the root-owned 0700 dir: owner can't read
+        try:
+
+            def run_tar(*excludes: str) -> int:
+                return subprocess.run(
+                    ["tar", "-cf", os.devnull, *excludes, "-C", str(tmp_path), "home"],
+                    capture_output=True,
+                    text=True,
+                ).returncode
+
+            # Unreadable dir present -> tar cannot open it -> fatal rc>=2.
+            assert run_tar() >= 2
+            # Excluded (the fix) -> tar never opens it -> clean exit.
+            assert run_tar("--exclude=*/lost+found") == 0
+        finally:
+            os.chmod(lost, 0o755)  # allow tmp_path teardown to remove it

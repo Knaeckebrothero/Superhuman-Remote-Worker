@@ -24,6 +24,10 @@ if _orchestrator_dir not in sys.path:
     sys.path.insert(0, _orchestrator_dir)
 
 from orchestrator.services.workspace_suspension import WorkspaceSuspensionService  # noqa: E402
+from orchestrator.services.ssh_helpers import (  # noqa: E402
+    EXTRACT_HOME_REMOTE_CMD,
+    EXTRACT_REMOTE_CMD,
+)
 from services.workspace_lifecycle import WorkspaceOwner  # noqa: E402
 
 
@@ -312,8 +316,13 @@ class TestRestoreWorkspace:
 
         assert result is True
         svc._container_provisioner.create_workspace.assert_awaited_once()
+        # Pod (not VM) restore extracts home-only: the extract runs as
+        # agent-host and must not try to overwrite root-owned /usr/local.
         mock_extract.assert_awaited_once_with(
-            "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", "10.0.0.99", ssh_port=30022
+            "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            "10.0.0.99",
+            ssh_port=30022,
+            scoped_home=True,
         )
         # Status transitions: restoring → ready
         calls = svc._db.merge_workspace_container_context.call_args_list
@@ -356,6 +365,63 @@ class TestRestoreWorkspace:
         result = await svc.restore_workspace("some-id")
 
         assert result is False
+
+
+# =============================================================================
+# Test: _extract_snapshot command selection (pod home-only vs VM full)
+# =============================================================================
+
+
+class TestExtractSnapshotScopedHome:
+    """``_extract_snapshot`` selects the extract command by target kind.
+
+    A snapshot carries both ``/home/agent-host`` and ``/usr/local``. A **pod**
+    extract runs as the unprivileged agent-host user and cannot overwrite the
+    image-provided, root-owned ``/usr/local`` — the full extract then exits
+    rc=2 and restore is (correctly) reported failed, so pod restore-from-S3
+    silently never worked (confirmed on the dev cluster). Pods must extract
+    home-only (``scoped_home=True`` -> ``EXTRACT_HOME_REMOTE_CMD``, matching the
+    proven ``ide_session`` k8s-pod path); VMs (root, the snapshot IS the disk)
+    keep the full extract. See docs/features/workspace_durability_tiering.md §C1.
+    """
+
+    @pytest.mark.asyncio
+    async def test_pod_extract_uses_home_only_command(self):
+        svc = make_service()
+        with patch(
+            "orchestrator.services.workspace_suspension.stream_extract_snapshot",
+            new=AsyncMock(return_value=(0, b"")),
+        ) as mock_stream:
+            ok = await svc._extract_snapshot("id-pod", "10.0.0.9", scoped_home=True)
+
+        assert ok is True
+        assert mock_stream.call_args.kwargs["remote_cmd"] == EXTRACT_HOME_REMOTE_CMD
+
+    @pytest.mark.asyncio
+    async def test_vm_extract_uses_full_command(self):
+        svc = make_service()
+        with patch(
+            "orchestrator.services.workspace_suspension.stream_extract_snapshot",
+            new=AsyncMock(return_value=(0, b"")),
+        ) as mock_stream:
+            ok = await svc._extract_snapshot("id-vm", "10.0.0.9", scoped_home=False)
+
+        assert ok is True
+        assert mock_stream.call_args.kwargs["remote_cmd"] == EXTRACT_REMOTE_CMD
+
+    @pytest.mark.asyncio
+    async def test_default_preserves_full_command(self):
+        """Omitting ``scoped_home`` keeps the legacy full extract, so only the
+        explicitly-pod callers change behavior."""
+        svc = make_service()
+        with patch(
+            "orchestrator.services.workspace_suspension.stream_extract_snapshot",
+            new=AsyncMock(return_value=(0, b"")),
+        ) as mock_stream:
+            ok = await svc._extract_snapshot("id-default", "10.0.0.9")
+
+        assert ok is True
+        assert mock_stream.call_args.kwargs["remote_cmd"] == EXTRACT_REMOTE_CMD
 
 
 # =============================================================================
@@ -827,8 +893,11 @@ class TestSuspendRestoreRoundTrip:
             WorkspaceOwner.job(job_id)
         )
 
-        # Snapshot extracted to new pod IP
-        mock_extract.assert_awaited_once_with(job_id, "10.0.0.99", ssh_port=30022)
+        # Snapshot extracted to new pod IP — home-only for a pod (agent-host
+        # can't overwrite root-owned /usr/local).
+        mock_extract.assert_awaited_once_with(
+            job_id, "10.0.0.99", ssh_port=30022, scoped_home=True
+        )
 
         # Final status is ready
         calls = svc._db.merge_workspace_container_context.call_args_list
