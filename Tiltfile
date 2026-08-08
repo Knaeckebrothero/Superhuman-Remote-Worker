@@ -52,8 +52,9 @@ default_registry('localhost:5005', host_from_cluster='srw-registry:5000')
 
 # -----------------------------------------------------------------------------
 # Orchestrator — uvicorn --reload picks up sync'd Python files without a
-# container restart. fall_back_on triggers a full image rebuild only when the
-# Dockerfile or requirements.txt change.
+# container restart. fall_back_on triggers a full image rebuild for dependency,
+# migration, and metering-package changes that must be present in every new
+# replica rather than only in Tilt's current live-sync target.
 # -----------------------------------------------------------------------------
 docker_build(
     'srw-orchestrator',
@@ -69,6 +70,11 @@ docker_build(
             # a Reloader bounce) fails startup with "applied but missing on
             # disk" and crash-loops (2026-06-11, 0025_security_events).
             'orchestrator/database/migrations/',
+            # A package change can add a module imported by main.py. Live sync
+            # targets the currently selected Pod, so during a rolling update an
+            # older baked image can receive main.py without receiving the new
+            # module. Bake this package atomically into a new image instead.
+            'orchestrator/services/infrastructure_metering/',
         ]),
         # orchestrator/ contents are flattened into /app/ to match the prod
         # Dockerfile's layout (so `from services.foo import bar` resolves).

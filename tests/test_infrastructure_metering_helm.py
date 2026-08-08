@@ -11,6 +11,28 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def test_orchestrator_images_bake_slice3_metering_package_atomically():
+    import_check = (
+        'RUN python -c "import services.infrastructure_metering.compute_activation"'
+    )
+    for relative_path in (
+        "docker/Dockerfile.orchestrator",
+        "docker/Dockerfile.orchestrator.dev",
+    ):
+        dockerfile = (ROOT / relative_path).read_text(encoding="utf-8")
+        assert import_check in dockerfile
+
+    tiltfile = (ROOT / "Tiltfile").read_text(encoding="utf-8")
+    orchestrator_build = tiltfile.split("docker_build(\n    'srw-orchestrator'", 1)[
+        1
+    ].split(
+        "# -----------------------------------------------------------------------------",
+        1,
+    )[0]
+    fallback_paths = orchestrator_build.split("fall_back_on([", 1)[1].split("]),", 1)[0]
+    assert "'orchestrator/services/infrastructure_metering/'" in fallback_paths
+
+
 def _render_remote_vmi_ingress(*extra: str) -> list[dict]:
     chart = ROOT / "helm"
     values = chart / "ci/test-values.yaml"

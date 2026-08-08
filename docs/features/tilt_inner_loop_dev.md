@@ -156,7 +156,7 @@ prerequisite.
 
 | Component | Strategy | Rebuild trigger | Expected loop |
 |-----------|----------|-----------------|---------------|
-| Orchestrator | `uvicorn --reload --reload-dir /app/orchestrator` + `live_update` sync | `orchestrator/requirements.txt`, Dockerfile | ~2–5 s |
+| Orchestrator | `uvicorn --reload --reload-dir /app/orchestrator` + `live_update` sync | `orchestrator/requirements.txt`, migrations, Dockerfile, or the infrastructure-metering package | ~2–5 s sync; full rebuild for baked-state paths |
 | Cockpit | Separate `Dockerfile.cockpit.dev` running `ng serve --host 0.0.0.0 --port 80 --poll 2000` + `live_update` sync | `cockpit/package*.json`, `angular.json`, Dockerfile | ~1–3 s (HMR) |
 | Agent | Full image rebuild on save + orchestrator restart | `requirements.txt` (top-level), Dockerfile, anything outside `src/` `config/` `agent.py` | ~30–60 s |
 | MCP | `live_update` sync + `restart_container` | `orchestrator/mcp/requirements.txt`, Dockerfile | ~3–5 s |
@@ -168,6 +168,13 @@ prerequisite.
 changed modules, full app boot cost is paid once. `restart_container()`
 is deprecated for k8s; the replacement `restart_process` extension is
 viable but slower for our boot profile (`github.com/tilt-dev/tilt-extensions/tree/master/restart_process`).
+
+Migrations and `orchestrator/services/infrastructure_metering/` are deliberate
+exceptions to the ordinary live-sync path. They force a full image rebuild so a
+rolling Pod cannot receive an importer without the newly added migration or
+module. Both dev and production orchestrator Dockerfiles also import-check the
+Slice 3 compute-activation module during the build, making an incomplete build
+fail before deployment.
 
 **Cockpit**: a separate `Dockerfile.cockpit.dev` based on `node:22-alpine`
 that runs `npm start` (which is already `ng serve --host 0.0.0.0` in

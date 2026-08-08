@@ -15,13 +15,18 @@ tags:
 gates. Slice 3 adds agent/IDE Pod identity and lifecycle metering, admitted VMI
 compute, authenticated VM lifecycle evidence, remote root-storage collection,
 and exact per-class activation/epoch authority through app migration `0114`.
-The full Slice 3 code, chart, migration, PostgreSQL, and local k3d acceptance
-matrix is green. Every new gate still defaults off; no durable production
+The Slice 3 code, chart, migration, PostgreSQL, Helm, and focused test matrix is
+green. Image packaging is now fail-closed: Tilt bakes metering-package changes
+instead of live-syncing them across a rollout, and both dev and production
+Dockerfiles import-check the Slice 3 activation module during the build. A fresh
+dark k3d rollout of image `tilt-3501fd81793b01b8` is healthy through app
+migration `0114`. Every new production gate defaults off; no durable production
 cutover has been performed, publication remains disabled, and the compatibility
-ledger remains authoritative. Main dev is still on image `sha-95d2a10` with app
-migrations through `0102` and Pod inventory only. Operational agent/IDE and
-live-KubeVirt inventory/shadow soaks remain rollout gates; Slice 4 is the next
-implementation slice. None of these milestones is an automatic billing switch.
+ledger remains authoritative. The Slice 3 source is merged on `develop`, but the
+observed main-dev deployment still runs image `sha-a4d1fab` with app migrations
+through `0102` and Pod inventory only. Operational agent/IDE and live-KubeVirt
+inventory/shadow soaks remain rollout gates. Slice 4 is the next implementation
+slice. None of these milestones is an automatic billing switch.
 
 **Triggered by:** adding public-cloud comparison rate cards exposed that the
 ledger's existing `vcpu-hour` / `gib-hour` arithmetic is sound, but its resource
@@ -50,19 +55,19 @@ application or platform infrastructure cost.
 | Slice 2 | PVC logical-demand and PV physical-asset collection, separate lifecycle state, retained/backend-unverified gaps, opaque CSI identity, immutable exact resource mapping, operator destruction assertions, activation controls, typed reads/sealing, and publication-plan integration are implemented through app migration `0102`. |
 | Slice 3 | Agent, persistent-agent, and IDE Pod classification; durable bind/unbind replay; receipt-time lifecycle uncertainty; VMI compute normalization; authenticated VM-controller evidence; remote VMI/PVC/PV collectors; per-source storage activation; and append-only exact compute-epoch authority are implemented through app migration `0114`. |
 | Repository deployment posture | Chart defaults keep every base, storage, and Slice 3 gate off. `deployment/values-experimental.yaml` enables **Pod inventory only** for main dev; PVC/PV, agent/IDE shadow, VM/VMI and remote storage collection, every publication gate, v2/source-aware reads, and cutover remain off. |
-| Deployed state | Main dev remains on image `sha-95d2a10` with app migrations through `0102` and Pod inventory only. The Slice 3 package through `0114` has passed a dark k3d rollout but is not yet deployed to main dev. |
-| Verification | Slice 1 and Slice 2 evidence remains valid. The full Slice 3 Python, remote-controller, migration/PostgreSQL, Helm, formatting, and security/race acceptance matrix passed. A dark k3d upgrade through `0114` was healthy with all publication, cutover, v2/source-aware-read, storage, and Slice 3 collection gates off. |
+| Deployed state | The Slice 3 source is merged on `develop`, while main dev currently runs image `sha-a4d1fab` with app migrations through `0102` and Pod inventory only. k3d runs the rebuilt orchestrator image `tilt-3501fd81793b01b8` with one ready replica, zero restarts, and the app database through `0114`. The Slice 3 image/chart package has not reached main dev. |
+| Verification | Slice 1 and Slice 2 evidence remains valid. Main-dev Pod inventory continues completing five-minute snapshots, with no publication plans or plan events observed. The Slice 3 Python, remote-controller, migration/PostgreSQL, Helm, formatting, and security/race test matrix passed. Dev and production images passed the build-time Slice 3 import contract, and the repeated dark k3d rollout is healthy. Configured collection/publication gates are off there, although prior local tests durably advanced agent/IDE and storage activation rows to `shadow`; no infrastructure intervals, publication plans/events, or v2 audit source were observed. |
 | Billing state | No durable cutover has occurred. No infrastructure v2 event publication is enabled, and the new path must not be presented as an invoice or customer charge. |
-| Next | Deploy the dark Slice 3 package to main dev, then run agent/IDE inventory/shadow and live-KubeVirt VMI/root-storage soaks with publication disabled. Slice 4 shared-platform completeness is the next code slice. |
+| Next | Roll the repaired Slice 3 package through `0114` to main dev with every new gate off, then run agent/IDE inventory/shadow and live-KubeVirt VMI/root-storage soaks with publication disabled. Slice 4 shared-platform completeness is the next code slice. |
 
 ### Roadmap checkpoint
 
 | Delivery slice | State | Remaining gate |
 |---|---|---|
 | 0 — schemas and dimensional UI | **Implemented / dark-launched** | Enable v2 reads only after capability/bootstrap checks and the Slice 1 source transition are ready. |
-| 1 — Kubernetes workspace Pods | **Implementation and local k3d verification complete** | Main-dev inventory soak, then real-workspace shadow reconciliation; publication and one-way cutover still require explicit operator approval. |
+| 1 — Kubernetes workspace Pods | **Implementation and local k3d verification complete** | Main-dev Pod inventory is active; continue/complete the soak, then run real-workspace shadow reconciliation. Publication and one-way cutover still require explicit operator approval. |
 | 2 — PVC claims and PV/CSI volumes | **Implementation and local k3d verification complete / dark-launched** | Run a controlled main-dev inventory/shadow soak before activation. Provider storage rate cards remain Slice 5. |
-| 3 — agents and VMs | **Implementation and dark k3d verification complete** | Deploy dark to main dev, then soak real agent/IDE inventory/shadow and live KubeVirt VMI/root PVC/PV sources. Publication remains separately disabled. |
+| 3 — agents and VMs | **Implementation and dark k3d verification complete** | Roll the repaired package dark to main dev, then soak real agent/IDE inventory/shadow and live KubeVirt VMI/root PVC/PV sources. Publication remains separately disabled. |
 | 4 — shared platform completeness | **Not implemented** | Classify platform/unknown workload and expose overhead without smearing it across customers. |
 | 5 — provider calculator hardening | **Framework only** | Add occurrence/concurrency/storage-specific calculators and provider fixtures after their resource classes exist. |
 | 6 — actual-utilization overlay | **Not implemented** | Add Prometheus-backed efficiency views while keeping requested allocation canonical. |
@@ -1892,8 +1897,8 @@ version before PV shadow/publication can become available.
 Slice 3 adds app `0103`–`0109` for compute-class activation/shadow, durable
 agent binding events, source-specific storage activation, authorized compute
 scope sets, and exact inventory-epoch interval guards. Apps `0110` and `0111`
-are unrelated intervening application migrations. The already-deployed app
-`0112` checksum is immutable at
+are unrelated intervening application migrations. The previously k3d-deployed
+app `0112` checksum is immutable at
 `3112549f0613c96a8012cea6a1f06f4b6249ec43c7b1c4a70161ba27b18af37e`;
 it adds append-only initial/recovery promotion authority and direct
 interval-to-epoch binding. App `0113` adds the confirmation gap that `0112`
@@ -2206,7 +2211,7 @@ remains.** The final implementation through app migration `0114` provides:
   or let one compute class inherit another class's activation.
 
 **Migration and verification evidence (2026-08-07):** Slice 3 migrations
-`0103`–`0109`, the immutable deployed `0112` SHA-256
+`0103`–`0109`, the immutable k3d-deployed `0112` SHA-256
 `3112549f0613c96a8012cea6a1f06f4b6249ec43c7b1c4a70161ba27b18af37e`,
 the `0113` confirmation-gap supersession, and the `0114` NULL-safe interval
 shape repair all pass fresh-install, deployed-upgrade, idempotency, and
@@ -2215,29 +2220,44 @@ remote VM/controller/provisioning suite, focused activation/materializer/read/
 sealer coverage, Helm lints/contracts, and Slice 3-scoped Ruff/format/diff checks
 are green.
 
-**Local k3d evidence (2026-08-07):** the application upgraded cleanly through
-`0114` and remained healthy with publication, cutover, v2 reads, source-aware
-reads, all storage gates, and every Slice 3 collection/shadow/publication gate
-off. No compatibility-ledger authority moved and no infrastructure usage was
-published. This k3d cluster has no KubeVirt installation, so it is a dark
-schema/configuration/runtime upgrade gate, not live VMI proof.
+**Local k3d evidence (2026-08-07):** a stale Tilt image previously received a
+live-synced `main.py` without the newly imported Slice 3 module and failed its
+rollout. Tilt now forces a full baked rebuild for changes under
+`orchestrator/services/infrastructure_metering/`, while both orchestrator
+Dockerfiles fail their build unless
+`services.infrastructure_metering.compute_activation` imports successfully.
+The rebuilt image `tilt-3501fd81793b01b8` passed that contract, rolled out with
+one ready replica and zero restarts, returned a healthy API, and imported the
+agent, IDE, VMI, and compute-activation modules inside the running Pod. The
+production Dockerfile passed the same packaged-module smoke test.
+
+The application database remains through `0114`. Configured collection,
+publication, cutover, v2/source-aware-read, storage, and Slice 3 gates are off;
+prior tests irreversibly left the local agent/IDE and storage activation rows in
+`shadow`. No infrastructure intervals, publication plans/events, or v2 audit
+source were observed. No compatibility-ledger authority moved and no
+infrastructure usage was published. This k3d cluster has no KubeVirt
+installation, so this is a dark schema/configuration/runtime gate, not live VMI
+proof.
 
 **Read-only live-VM evidence (2026-08-07):** normalization of one Running VMI
 produced exactly `8000` millicores and `17179869184` bytes of guest memory. Its
 bound root PVC demand and matching PV provisioned capacity each normalized to
 `22763326669` bytes. The currently deployed VM controller is still the older
-build without
-the new owner hints/lifecycle authentication, and no remote metering collector
-is deployed there. Therefore no live inventory or shadow state was written and
-the real KubeVirt VMI/root-storage shadow gate remains open.
+build without the new owner hints/lifecycle authentication, and no remote
+metering collector is deployed there. Therefore no live inventory or shadow
+state was written and the real KubeVirt VMI/root-storage shadow gate remains
+open.
 
-Main dev separately remains on image `sha-95d2a10` with app migrations through
-`0102` and Pod inventory only. The next operational sequence is a dark main-dev
-upgrade through `0114`, agent/IDE inventory then shadow, and a separately
-reviewed VM-cluster collector deployment followed by VMI/root PVC/PV inventory
-then shadow. Publication, cutover, v2 reads, and source-aware reads stay off
-throughout these soaks. New classes remain quantity-only/unpriced until matching
-Slice 5 adapters exist.
+The Slice 3 source is merged on `develop`, but main dev separately remains on
+image `sha-a4d1fab` with app migrations through `0102` and Pod inventory only.
+Its five-minute Pod inventory snapshots continue successfully, with no
+publication plans or plan events observed. The next operational sequence is a
+dark main-dev rollout through `0114`, agent/IDE inventory then shadow, and a
+separately reviewed VM-cluster collector deployment followed by VMI/root PVC/PV
+inventory then shadow. Publication, cutover, v2 reads, and source-aware reads
+stay off throughout these soaks. New classes remain quantity-only/unpriced until
+matching Slice 5 adapters exist.
 
 Depends on Slice 1 and authenticated VM transport for eventual VM publication.
 The Slice 3 implementation exit has passed; the operational live-source exit
