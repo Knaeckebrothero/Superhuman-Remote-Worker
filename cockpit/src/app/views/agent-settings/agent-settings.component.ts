@@ -113,7 +113,7 @@ type AgentSettingsTab = 'settings' | 'instructions' | 'advanced' | 'resolved';
             [error]="datasourceLoadError()"
             [contextKey]="datasourceContextKey()"
             [disabled]="disabled()"
-            [isLiteBackend]="mode() === 'live' ? liteBackend() : (advancedAccordion?.isLiteBackend() ?? false)"
+            [isLiteBackend]="mode() === 'live' ? liteBackend() : (executionGroup?.isLiteBackend() ?? false)"
             [initialSelectedIds]="mode() === 'live' ? initialDatasourceIds() : null"
             [datasourceDefaultsEnabled]="datasourceDefaultsEnabled()"
             [lockedIds]="lockedDatasourceIds()"
@@ -152,6 +152,7 @@ type AgentSettingsTab = 'settings' | 'instructions' | 'advanced' | 'resolved';
               [strategicModelOverride]="modelGroup?.strategicModel() ?? null"
               [tacticalModelOverride]="modelGroup?.tacticalModel() ?? null"
               [sessionModelOverride]="modelGroup?.sessionModel() ?? null"
+              [backendOverride]="executionGroup?.workspaceBackend() ?? null"
               (change)="onChange()"
             />
           </div>

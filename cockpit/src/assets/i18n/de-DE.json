@@ -2372,7 +2372,6 @@
       "compactOnArchive": "Beim Archivieren komprimieren",
       "keepRecentToolResults": "Letzte Tool-Ergebnisse behalten",
       "keepRecentMessages": "Letzte Nachrichten behalten",
-      "backend": "Backend",
       "vmCpuCores": "VM-CPU-Kerne",
       "vmMemory": "VM-Arbeitsspeicher",
       "maxReadWords": "Max. Lese-Wörter",
@@ -2604,6 +2603,7 @@
       "critic": "Critic (Verifikation)",
       "projectMemory": "Projektgedächtnis",
       "imageQuality": "Bildqualität",
+      "workspaceBackend": "Arbeitsbereich",
       "autonomyDefaultHint": "Legt fest, wann der Agent für eine manuelle Prüfung pausiert",
       "narration": "Erzählmodus"
     },
