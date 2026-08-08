@@ -47,6 +47,8 @@ POST   /api/admin/providers/models                                              
 DELETE /api/admin/providers/models/{catalog_id}                                         admin:_require_admin
 PATCH  /api/admin/providers/models/{catalog_id}                                         admin:_require_admin
 POST   /api/admin/providers/models/{catalog_id}/test                                    admin:_require_admin
+GET    /api/admin/run-queue                                                             admin:_require_admin
+POST   /api/admin/run-queue/{unit_id}/unpark                                            admin:_require_admin
 GET    /api/admin/security-events                                                       admin:_require_admin
 DELETE /api/admin/system-settings/main_cloud                                            admin:_require_admin
 GET    /api/admin/system-settings/main_cloud                                            admin:_require_admin

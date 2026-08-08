@@ -7926,7 +7926,17 @@ class PostgresDB:
         the swept rows). Writing thread_events here is safe precisely
         because the thread is detached: there is no agent event-writer to
         collide with.
+
+        Epoch bump + frame go through the shared ``src.shared.event_journal``
+        helpers (single implementation with the agent runtime and the
+        run_queue reaper): ``bump_epoch`` also resets ``events_seq_hwm`` —
+        which the pre-0116 inline SQL here didn't, leaving the next attach to
+        seed its seq counter from the OLD life's high-water mark — and
+        ``append_system_frame`` allocates the frame at (new_epoch, 1) from
+        the reset mark, preserving the previous on-disk shape exactly.
         """
+        from src.shared.event_journal import append_system_frame, bump_epoch
+
         async with self.acquire() as conn:
             async with conn.transaction():
                 await conn.execute(
@@ -7970,23 +7980,12 @@ class PostgresDB:
                     """,
                     thread_id,
                 )
-                new_epoch = await conn.fetchval(
-                    """
-                    UPDATE threads
-                    SET events_epoch = events_epoch + 1
-                    WHERE id = $1
-                    RETURNING events_epoch
-                    """,
-                    thread_id,
-                )
-                await conn.execute(
-                    """
-                    INSERT INTO thread_events (thread_id, epoch, seq, kind, payload)
-                    VALUES ($1, $2, 1, 'rewind.done',
-                            jsonb_build_object('mode', 'conversation'))
-                    """,
-                    thread_id,
-                    new_epoch,
+                await bump_epoch(conn, thread_id=thread_id)
+                await append_system_frame(
+                    conn,
+                    thread_id=thread_id,
+                    kind="rewind.done",
+                    payload={"mode": "conversation"},
                 )
         return {
             "rewind_id": str(row["id"]),
