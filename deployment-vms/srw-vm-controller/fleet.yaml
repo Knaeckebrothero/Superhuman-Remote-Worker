@@ -60,6 +60,12 @@ helm:
       vmInventoryEnabled: false
       pvcInventoryEnabled: false
       pvInventoryEnabled: false
+      # Select only metering properties from the shared SRW Vault record into
+      # dedicated VM-cluster Secrets; never extract the full application bundle
+      # into this cluster. Enable after the properties and target names exist.
+      externalSecrets:
+        enabled: false
+        vaultPath: "homelab/superhuman-remote-worker/srw-secrets"
       orchestratorUrl: "https://api.srw.works"
       orchestratorHostAliases:
         - ip: "10.0.51.11"
