@@ -38,6 +38,40 @@ Prior art this builds on — do not re-derive:
 
 ---
 
+## Shipped (2026-08-08) — implemented, reviewed, k3d-validated
+
+The honest-exit-code + verifiable-capture + reclaim-on-idle work is BUILT on `develop` (unpushed), each
+task TDD'd, per-task reviewed (Opus for the shell/data-destructive ones), and validated on the k3d dev
+cluster:
+
+| Piece | Commits | k3d validation |
+|---|---|---|
+| **F1** checkout gitignore cure | `8e7998d0` | deployed helper + real `git`: baseline gitlink reproduced, fix prevents it |
+| **C1a** IDE-VM extract honest rc | `7a9bd5d8` | unit |
+| **C1b** capture honest accept (PIPESTATUS) | `2f747a5f`, `2761d9bd` | runtime bash 5.2 matrix + real `tar`/`zstd` capture/restore round-trip |
+| **C1c** extract `set -o pipefail` | `9b7dd366` | runtime bash 5.2 matrix + real corrupt-archive reject |
+| **C1d** `ide_settings` capture+extract | `f8a6b297` | runtime bash 5.2 collapse-verdict matrix |
+| **C2** `verify_snapshot` (fail-safe) | `06b3ab6c`, `b6519630`, `3a945619` | **real garage S3**: good→`ok`; sha/size/missing→reject |
+| **reclaim-on-idle** (flag + verify gated) | `0a63a091` | flag-off default in deployed env; verify vs real garage |
+| **C3** no-clobber upload (staging→verify→promote, keep-N) | `85b2fafe`, `bf2def54` | **real garage**: bad upload can't clobber canonical; good promotes + verifies |
+
+**Reclaim-on-idle** (§D3) is the capacity fix: opt-in `WORKSPACE_RECLAIM_ON_IDLE` (default **off**); on
+idle-suspend, once `verify_snapshot` confirms the archive restorable, the workspace PVC is deleted
+(fail-safe — a verify failure keeps it). Enable it as a soak on the real (Longhorn) cluster before broad
+rollout.
+
+**F3 (quota)** — the per-class `ResourceQuota` mechanism already exists (default-off); with reclaim-on-idle
+now the primary bound, F3 is a fail-closed *backstop* the operator enables with a cluster-specific cap when
+desired.
+
+**Owed follow-ups** (all non-blocking): also reclaim the session **agent PVC** (`pvc-agent-s-*` —
+`AgentProvisioner` needs a delete method); clear the write-only `volume_reclaimed` marker;
+`_soft_delete_snapshot` still uses single-part `copy_object` on `env.tar.zst` (>5 GB cap); the F1 cleanup
+migration for already-poisoned threads; and a full session-level reclaim E2E (live suspend→reclaim→resume)
+as a homelab soak. **Push held** (owner's call).
+
+---
+
 ## Prior art & rationale (why the decisions below are the right ones)
 
 Distilled from a survey of Codespaces, Gitpod, Coder, E2B, Daytona, Modal, Replit, CodeSandbox,
