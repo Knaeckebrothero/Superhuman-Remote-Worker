@@ -457,10 +457,29 @@ class SnapshotService:
             # design §11.3). The capture roots already EXCLUDE the merged overlay
             # mount (it lives at /cloud/merged, outside /home/agent-host) and
             # INCLUDE the upperdir at /home/agent-host/.overlay/upper.
+            pipeline = (
+                'tar --xattrs --xattrs-include="*" --acls -cf - '
+                f"{' '.join(exclude_patterns)} {' '.join(include_dirs)} 2>/dev/null "
+                "| zstd -1 -T0"
+            )
+            # A shell pipeline's exit code is only the LAST stage's (zstd) —
+            # a failing/truncated tar upstream would be masked and a partial
+            # archive accepted as good. bash -c makes PIPESTATUS available
+            # (pipefail alone can't distinguish tar rc==1 from rc>=2) so both
+            # stage codes collapse to one honest code: 0 = clean, 1 = tar
+            # warned ("file changed as we read it" — routine on a live
+            # workspace, NOT a failure), 2 = fatal (truncated tar or any
+            # zstd failure). The -c body is single-quoted, so
+            # --xattrs-include uses \"*\" (double quotes still block glob
+            # expansion — tar still receives the literal '*'). The exclude/
+            # include lists must never contain a single quote — the
+            # command-shape test asserts this by counting quotes in the
+            # final command.
             tar_cmd = (
-                f"tar --xattrs --xattrs-include='*' --acls -cf - "
-                f"{' '.join(exclude_patterns)} {' '.join(include_dirs)} 2>/dev/null"
-                " | zstd -1 -T0"
+                "bash -c '" + pipeline + "; "
+                "__t=${PIPESTATUS[0]}; __z=${PIPESTATUS[1]}; "
+                'if [ "$__z" -ne 0 ] || [ "$__t" -ge 2 ]; then exit 2; '
+                'elif [ "$__t" -eq 1 ]; then exit 1; else exit 0; fi\''
             )
             key_path = resolve_ssh_key_path()
             if not key_path:
@@ -522,23 +541,37 @@ class SnapshotService:
 
             await process.wait()
 
-            if process.returncode != 0 and total_bytes == 0:
+            # Honest accept gate: tar rc==1 ("file changed as we read it") is
+            # a routine warning on a live workspace, not a failure — only
+            # rc>=2 (fatal tar error or any zstd failure, per the PIPESTATUS
+            # discrimination above) or a totally empty stream mean the
+            # archive is not trustworthy.
+            if process.returncode >= 2 or total_bytes == 0:
                 stderr = (await process.stderr.read()).decode(errors="replace")
                 logger.error(
-                    "SSH tar failed for %s %s: %s",
+                    "Snapshot capture failed for %s %s (rc=%d, bytes=%d): %s",
                     entity_type.rstrip("s"),
                     job_id,
+                    process.returncode,
+                    total_bytes,
                     stderr[:500],
                 )
                 await self._set_snapshot_context(
                     job_id,
                     {
                         "status": "capture_failed",
-                        "error": f"SSH tar failed (rc={process.returncode})",
+                        "error": f"SSH tar/zstd failed (rc={process.returncode})",
                     },
                     entity_type=entity_type,
                 )
                 return False
+            if process.returncode == 1:
+                logger.warning(
+                    "Snapshot capture for %s %s: tar reported files changed "
+                    "during read (rc=1) — archive is complete, accepting",
+                    entity_type.rstrip("s"),
+                    job_id,
+                )
 
             # Collect package manifests via SSH
             env_info = await self._collect_environment_info(ssh_host, ssh_port)
