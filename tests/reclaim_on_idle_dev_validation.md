@@ -13,14 +13,19 @@ this runbook re-confirms the deploy and drives the destructive-but-fail-safe cyc
 > 2. **Pod restore** failed rc=2 extracting root-owned `/usr/local` as `agent-host` → fixed by using the
 >    home-only `EXTRACT_HOME_REMOTE_CMD` for pod (non-VM) restores.
 >
-> Manually validated live (isolating each variable): Phase 0/1 below, the C3 no-clobber upload, the
-> reclaim decision re-provisioning a fresh PVC and taking the extract branch, and a byte-identical
-> capture→home-extract round-trip. **What remains is Phase 2 as written — the *automated* suspend→reclaim→
-> resume cycle — which needs `91f68129` deployed** (the running image `sha-bf2def5` predates it). Until
-> then, driving the real suspend endpoint on a sandbox session returns `snapshot_failed` (the fail-safe).
-> Note: new dev sessions default to the **`virtual` (lite) tier**, which has no workspace PVC and is *not*
-> subject to reclaim-on-idle; create a **sandbox**-backend session (`config_override.workspace.backend =
-> "sandbox"`) to exercise this path.
+> **Phase 2 automated — PASSED (2026-08-08, image `sha-5086d48`).** With the fixes deployed, the full
+> integrated cycle was driven on a sandbox session over a real ext4 PVC: capture succeeded past `lost+found`
+> (Fix 1) → snapshot verified → **PVC reclaimed** (`volume_reclaimed=True`) → resume re-provisioned a fresh
+> PVC and **extracted from S3** (Fix 2) → seeded content round-tripped byte-for-byte. Reclaim-on-idle works
+> end to end; enabling it is now just the operator flag `WORKSPACE_RECLAIM_ON_IDLE=true`.
+>
+> Two gotchas worth keeping: (1) new dev sessions default to the **`virtual` (lite) tier** — no workspace
+> PVC, *not* subject to reclaim; create a **sandbox**-backend session
+> (`config_override.workspace.backend = "sandbox"` via `POST /api/persistent/threads`) to exercise this
+> path. (2) To fire the integrated reclaim branch without arming the cluster-wide flag (which would also
+> expose other idle sessions to the sweeper), run `suspend_thread_workspace` in an **isolated in-pod
+> process** that sets `os.environ["WORKSPACE_RECLAIM_ON_IDLE"]="true"` and replicates the startup
+> `.connect()` wiring — the live orchestrator keeps the flag off, so only the test session is affected.
 
 **Feature under test.** `WORKSPACE_RECLAIM_ON_IDLE` (default **off**): on idle-suspend of a session, once
 `verify_snapshot` confirms the S3 archive is restorable, the workspace PVC (`pvc-ws-thread-<id>`) is

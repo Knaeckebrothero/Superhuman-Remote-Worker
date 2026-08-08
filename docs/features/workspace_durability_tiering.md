@@ -96,8 +96,16 @@ Phase 0 markers + flag-off on both HA replicas; `verify_snapshot` good/sha/size/
 real S3; the C3 no-clobber upload writing canonical + a `history/` generation + manifest and
 `verify_snapshot`→`(True,'ok')`; the reclaim decision correctly re-provisioning a **fresh PVC (new UID)** and
 taking the extract-not-reattach branch; and — with both fixes — a byte-identical capture→home-extract
-round-trip (rc=0/rc=0). Still owed: the **automated** end-to-end (drive the real suspend endpoint with the
-flag armed) once `91f68129` is deployed.
+round-trip (rc=0/rc=0).
+
+**Automated E2E — PASSED (2026-08-08, image `sha-5086d48`).** With the fixes deployed, drove the **real
+integrated `suspend_thread_workspace`** with reclaim armed (in an isolated in-pod process so only the test
+session is affected — the live orchestrator + idle sweeper keep the flag off, zero collateral). Full chain
+verified on a sandbox session over a real ext4 PVC: capture succeeded *past* the root-only `lost+found`
+(Fix 1) → snapshot uploaded + verified → pod deleted → **PVC reclaimed** (`volume_reclaimed=True`); resume
+via the real `/input` endpoint re-provisioned a **fresh PVC (new UID)** and **extracted from S3** (Fix 2,
+home-only) → both seeded snapshot-only files round-tripped byte-for-byte. Reclaim-on-idle works end to end;
+enabling it in an environment is now purely the operator flag (`WORKSPACE_RECLAIM_ON_IDLE=true`).
 
 **Still design-only (NOT built) — proposals in the sections below, not shipped:** the **§B** layered
 PVC-loss recovery (extract → `git fetch` → `git reset` for node loss), the **§D** PVC-lifecycle hardening
