@@ -749,3 +749,65 @@ partition and would otherwise reintroduce dual execution.
 
 Safety state: still no `worker_batch` unit has been enqueued. Gate 2 remains the
 next mandatory prerequisite.
+
+## Phase 2 / Gate 2A — freeze contract deployed orchestrator-first (DONE)
+
+The freeze taxonomy now lives in the stdlib-only
+`src/shared/job_freeze_types.py`. It exposes separate semantic subsets for
+Continue-as-New, legacy auto-redispatch, coincident-error immunity, agent END
+resume, and subjob redispatch rather than one over-broad allowlist.
+`batch_boundary` is in every continuation subset, but remains absent from the
+agent emitter in this rollout slice.
+
+Orchestrator completion now resolves both `version_upgrade` and
+`batch_boundary` to `paused`, including live-parent subjobs and reports carrying
+a coincident interrupt error. The dangerous loop fallback is narrowed:
+
+- a loop stop with no declared freeze still maps to `completed`, preserving the
+  weak-model escape hatch;
+- a loop stop with any unknown non-null freeze maps to visible
+  `pending_review`, never `completed`.
+
+The legacy paused-job sweep no longer duplicates freeze literals in SQL. It
+binds the deterministic shared registry as `ANY($1::text[])`, still qualified
+by `execution_lane='pinned'`. A real-Postgres semantic case proves a pinned
+`batch_boundary` freeze is cleared/stashed while the same freeze on the
+stateless lane remains untouched.
+
+Verification:
+
+- focused status/registry regression: **21 passed**;
+- full drain + loop suites: **144 passed**;
+- full-schema k3d-Postgres sweep suite: **2 passed** in 17.37 s;
+- targeted Ruff format/check and `git diff --check`: clean;
+- after Tilt rollout, the sole running orchestrator was inspected directly:
+  `/app/services/completion.py` contains the unknown-freeze guard,
+  `/app/database/postgres.py` contains the bound text-array predicate, and
+  `/app/src/shared/job_freeze_types.py` contains the batch constant;
+- an in-process assertion inside that running container proved loop +
+  `batch_boundary` → `paused`, loop + unknown declared freeze →
+  `pending_review`, and loop + no freeze → `completed`.
+
+Post-slice session measurement (after verifying both running agent images still
+contained the timing marker): turn 77 answered in **11 s**, agent **7.96 s**
+total (bundle 0.08, attach 2.37, turn 5.30, push 0.19, complete 0.02), versus
+Gate-1's 7 s / 4.87 s. Orchestrator claim bundle was **0.060 s** versus 0.070 s.
+The 2.82 s increase is entirely in provider/turn execution; attach and queue
+overhead remained close, so it is not attributed to the status-only change.
+
+Failures recorded:
+
+- the first real-Postgres invocation used the example `postgres/postgres`
+  credentials, but the k3d cluster has a different role; the rerun consumed
+  the existing Kubernetes Secret without printing it;
+- the first semantic assertion treated asyncpg's unregistered JSONB result as a
+  dict. This test connection returns it as text, so the assertion now decodes
+  either representation before inspecting `last_freeze_data`;
+- Ruff is not present inside `.venv`; as in Gate 1, the repository's installed
+  Ruff binary is `/home/ghost/.local/bin/ruff`.
+
+Rollout decision: Gate 2 is split deliberately. This orchestrator-first slice
+is verified before any agent-side boundary code exists. Rollback must disable
+batch emission first; worker admission remains OFF and no `worker_batch` unit
+has been enqueued. Gate 2B (default-unarmed graph boundary and agent resume
+contract) is next.
