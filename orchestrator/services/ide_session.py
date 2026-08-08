@@ -575,7 +575,9 @@ class IdeSessionService:
             )
             return
 
-        # Extract snapshot into the VM
+        # Extract snapshot into the VM. Best-effort by design: a populated
+        # tree beats a hard error here, so the bool return is intentionally
+        # ignored (mirrors _extract_snapshot_to_k8s_pod's soft policy).
         if source == "snapshot":
             await self._extract_snapshot_to_vm(job_id, ssh_host, ssh_port)
         elif source == "gitea":
@@ -1170,12 +1172,23 @@ class IdeSessionService:
 
     async def _extract_snapshot_to_vm(
         self, job_id: str, ssh_host: str, ssh_port: int
-    ) -> None:
-        """Download snapshot from S3 and extract into the VM via SSH."""
+    ) -> bool:
+        """Download snapshot from S3 and extract into the VM via SSH.
+
+        Mirrors workspace_suspension.py:_extract_snapshot (lines 506-562).
+
+        Returns:
+            True when the snapshot was downloaded AND unpacked cleanly; False
+            when there is no snapshot service, the download failed, or tar
+            exited non-zero. Callers MUST NOT report the workspace restored
+            on False — this used to return None on every path, so a failed
+            restore still reported success and the agent resumed on an empty
+            or half-populated tree.
+        """
         import tempfile
 
         if not self._snapshot_service:
-            return
+            return False
 
         with tempfile.NamedTemporaryFile(
             suffix=".tar.zst", delete=True, prefix=f"restore_{job_id[:8]}_"
@@ -1186,7 +1199,7 @@ class IdeSessionService:
             ok = await self._snapshot_service.download_snapshot(job_id, tar_path)
             if not ok:
                 logger.warning("Failed to download snapshot for job %s", job_id)
-                return
+                return False
 
             # Extract into VM via SSH
             key_path = resolve_ssh_key_path()
@@ -1206,6 +1219,9 @@ class IdeSessionService:
                     rc,
                     stderr.decode(errors="replace")[:500],
                 )
+                return False
+
+            return True
 
     async def _clone_gitea_to_vm(
         self, job_id: str, job: dict, ssh_host: str, ssh_port: int
@@ -1299,7 +1315,13 @@ class IdeSessionService:
             return False
 
         try:
-            await self._extract_snapshot_to_vm(job_id, ssh_host, ssh_port)
+            ok = await self._extract_snapshot_to_vm(job_id, ssh_host, ssh_port)
+            if not ok:
+                logger.error(
+                    "Snapshot restore FAILED for resume of job %s (extract failed)",
+                    job_id,
+                )
+                return False
             logger.info("Snapshot restored for job resume: %s", job_id)
             return True
         except Exception as e:
