@@ -380,6 +380,7 @@ interface EditorForm {
           [strategicModelOverride]="form.strategicModel || null"
           [tacticalModelOverride]="form.tacticalModel || null"
           [sessionModelOverride]="form.sessionModel || null"
+          [backendOverride]="execBackendOverride()"
         />
       </section>
 
@@ -512,6 +513,11 @@ export class ExpertEditorComponent implements OnInit {
   private execGroup = viewChild(ExecutionGroupComponent);
   private toolsGroup = viewChild(ToolsGroupComponent);
   private advancedGroup = viewChild(AdvancedAccordionComponent);
+
+  /** The backend picked in the Execution card, fed to the Advanced accordion so
+   *  it greys the tools a lite tier cannot run. The selector is a level-1
+   *  control; only the tuning that hangs off it stays under Advanced. */
+  protected readonly execBackendOverride = computed(() => this.execGroup()?.workspaceBackend() ?? null);
 
   editingId = signal<string | null>(null);
   saving = signal(false);

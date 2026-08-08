@@ -1,4 +1,4 @@
-import {Component, computed, effect, inject, input, output, signal} from '@angular/core';
+import {Component, computed, inject, input, output, signal} from '@angular/core';
 import {FormsModule} from '@angular/forms';
 import {TranslocoPipe} from '@jsverse/transloco';
 import {AppIconComponent} from '../../ui/icon';
@@ -6,7 +6,6 @@ import {AppTooltipDirective} from '../../ui/tooltip';
 import {pinResolvedValue, readConfigPath, resolveMatrixForModel, SettingsMode} from './agent-settings.types';
 import {PinOnInteractDirective} from './pin-on-interact.directive';
 import {reasoningOptionsForModel} from './reasoning-options';
-import {UserService} from '../../core/services/user.service';
 import {ModelService} from '../../core/services/model.service';
 
 /**
@@ -385,30 +384,13 @@ import {ModelService} from '../../core/services/model.service';
         </button>
         @if (expanded().has('workspace')) {
           <div class="accordion-body">
-            <div class="field-row" [class.modified]="workspaceBackend() !== null">
-              <label class="field-label">{{ 'advanced.labels.backend' | transloco }}</label>
-              <div class="field-control">
-                <select class="form-input"
-                  [ngModel]="workspaceBackend() ?? resolvedWorkspaceBackend()"
-                  appPinOnInteract (pin)="pinValue(workspaceBackend, resolvedWorkspaceBackend())"
-                  (ngModelChange)="workspaceBackend.set($event); emitChange()"
-                  [disabled]="disabled()">
-                  <option value="sandbox">{{ 'advanced.options.container' | transloco }}</option>
-                  @if (canUseVm()) {
-                    <option value="vm">{{ 'advanced.options.vmQemu' | transloco }}</option>
-                  }
-                  <option value="virtual">{{ 'advanced.options.virtual' | transloco }}</option>
-                  <option value="none">{{ 'advanced.options.none' | transloco }}</option>
-                </select>
-                @if (workspaceBackend() !== null) {
-                  <button type="button" class="reset-btn" (click)="workspaceBackend.set(null); vmCpuCores.set(null); vmMemory.set(null); emitChange()"><app-icon size="xs">close</app-icon></button>
-                }
-              </div>
-            </div>
+            <!-- The backend selector itself is a level-1 control, in the
+                 Settings tab's EXECUTION group. This section keeps the tuning
+                 that hangs off it and explains the greying below. -->
             @if (isLiteBackend()) {
               <p class="field-hint lite-hint">{{ (isNoneBackend() ? 'advanced.hints.noneBackend' : 'advanced.hints.virtualBackend') | transloco }}</p>
             }
-            @if ((workspaceBackend() ?? resolvedWorkspaceBackend()) === 'vm') {
+            @if (effectiveBackend() === 'vm') {
               <div class="field-row" [class.modified]="vmCpuCores() !== null">
                 <label class="field-label">{{ 'advanced.labels.vmCpuCores' | transloco }}</label>
                 <div class="field-control">
@@ -881,6 +863,11 @@ export class AdvancedAccordionComponent {
   strategicModelOverride = input<string | null>(null);
   tacticalModelOverride = input<string | null>(null);
   sessionModelOverride = input<string | null>(null);
+  /** The workspace backend chosen in the Settings tab's EXECUTION group, or
+   *  null when it is unset there. The selector is a level-1 control and lives
+   *  in ExecutionGroupComponent; this section reads it to grey the tools a lite
+   *  tier cannot run and to scope what its own `getOverrides()` emits. */
+  backendOverride = input<string | null>(null);
 
   change = output<void>();
 
@@ -917,14 +904,7 @@ export class AdvancedAccordionComponent {
   readonly keepRecentMessages = signal<number | null>(null);
 
   // --- Workspace ---
-  private readonly userService = inject(UserService);
   private readonly modelService = inject(ModelService);
-  /** Whether the current user is allowed to pick the VM backend. Admins always qualify. */
-  readonly canUseVm = computed(() => {
-    const u = this.userService.currentUser();
-    return !!(u?.is_admin || u?.can_use_vm);
-  });
-  readonly workspaceBackend = signal<string | null>(null);
   readonly vmCpuCores = signal<number | null>(null);
   readonly vmMemory = signal<string | null>(null);
   readonly maxReadWords = signal<number | null>(null);
@@ -1022,11 +1002,12 @@ export class AdvancedAccordionComponent {
     return (v ?? (this.mode() === 'job')) as boolean;
   });
 
-  // Effective backend = override → resolved config default. The lite tiers
-  // (`virtual`/`none`) run with no workspace container, so shell/browser/git
-  // tools are gated off server-side (no_workspace_agent_mode.md §7) and the
-  // form greys the matching controls. `none` additionally has no file tools.
-  readonly effectiveBackend = computed(() => this.workspaceBackend() ?? this.resolvedWorkspaceBackend());
+  // Effective backend = the Execution group's override → resolved config
+  // default. The lite tiers (`virtual`/`none`) run with no workspace container,
+  // so shell/browser/git tools are gated off server-side
+  // (no_workspace_agent_mode.md §7) and the form greys the matching controls.
+  // `none` additionally has no file tools.
+  readonly effectiveBackend = computed(() => this.backendOverride() ?? this.resolvedWorkspaceBackend());
   readonly isLiteBackend = computed(() => {
     const b = this.effectiveBackend();
     return b === 'virtual' || b === 'none';
@@ -1093,21 +1074,6 @@ export class AdvancedAccordionComponent {
       next.add(section);
     }
     this.expanded.set(next);
-  }
-
-  constructor() {
-    // Snap ineligible users off 'vm' so the form can't submit a denied backend.
-    // The server is authoritative — this is a UX safeguard.
-    effect(() => {
-      if (this.canUseVm()) return;
-      const effective = this.workspaceBackend() ?? this.resolvedWorkspaceBackend();
-      if (effective === 'vm') {
-        this.workspaceBackend.set('sandbox');
-        this.vmCpuCores.set(null);
-        this.vmMemory.set(null);
-        this.emitChange();
-      }
-    });
   }
 
   emitChange(): void { this.change.emit(); }
@@ -1198,10 +1164,11 @@ export class AdvancedAccordionComponent {
     // tool categories' settings aren't emitted (no_workspace_agent_mode.md §7):
     // git is forced off for any lite tier, file-size limits drop for `none`
     // (no file tools), and the whole shell/browser fragments are skipped.
+    // `backend` itself is emitted by ExecutionGroupComponent, which owns the
+    // selector; the host deep-merges the two `workspace` fragments.
     const lite = this.isLiteBackend();
     const ws: Record<string, unknown> = {};
-    if (this.workspaceBackend() !== null) ws['backend'] = this.workspaceBackend();
-    if (this.workspaceBackend() === 'vm') {
+    if (this.effectiveBackend() === 'vm') {
       const vm: Record<string, unknown> = {};
       if (this.vmCpuCores() !== null) vm['cpu_cores'] = this.vmCpuCores();
       if (this.vmMemory() !== null) vm['memory'] = this.vmMemory();
@@ -1288,7 +1255,6 @@ export class AdvancedAccordionComponent {
     this.compactOnArchive.set(null);
     this.keepRecentToolResults.set(null);
     this.keepRecentMessages.set(null);
-    this.workspaceBackend.set(null);
     this.vmCpuCores.set(null);
     this.vmMemory.set(null);
     this.maxReadWords.set(null);

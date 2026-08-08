@@ -2372,7 +2372,6 @@
       "compactOnArchive": "Compact on archive",
       "keepRecentToolResults": "Keep recent tool results",
       "keepRecentMessages": "Keep recent messages",
-      "backend": "Backend",
       "vmCpuCores": "VM CPU cores",
       "vmMemory": "VM memory",
       "maxReadWords": "Max read words",
@@ -2605,6 +2604,7 @@
       "critic": "Critic (verification)",
       "projectMemory": "Project memory",
       "imageQuality": "Image Quality",
+      "workspaceBackend": "Workspace",
       "autonomyDefaultHint": "Controls when the agent pauses for human review"
     },
     "narrationModes": {
