@@ -919,3 +919,121 @@ Provisioning safety + the honest server connection contract are DONE and
 verified. Cockpit consumption, control verbs, queued durability, permission
 retire, and Path-A compaction persistence remain unbuilt. Stop here rather than
 build control transport on the disproved live-journal-writer premise.
+
+---
+
+# Session 4 — durable controls and S1 completion (2026-08-08)
+
+Branch: `feature/stateless-sessions-s1-completion`; not pushed. Continued from
+the reviewed server boundary (`504b153f`, `fe436783`) after re-reading the
+updated completion brief, its required feature-doc sections, the full prior
+implementation log, and `turn_executor.py`. The worker lane remains out of
+scope; no `worker_batch` unit was enqueued.
+
+## Baseline before the control-inbox phase
+
+The cluster started healthy (`Tilt srw: ok/ok`; two stateless agents and one
+orchestrator Ready). The first image-proof attempt used the wrong agent path
+(`/app/api/turn_executor.py`) and failed. Agent source is not flattened the way
+orchestrator source is: the correct path is `/app/src/api/turn_executor.py`.
+After proving `turn timing: unit=` exactly once in **both** serving agent pods
+and `_thread_input_stateless` twice in the sole orchestrator pod, a stateless
+turn completed in **5 s wall** with:
+
+`mode=reuse bundle=0.05s attach=0.00s pending=0.00s turn=3.12s push=0.08s complete=0.01s total=3.26s`
+
+The orchestrator claim bundle was **0.046 s** (`lease=0.001s`, `creds=0.009s`,
+`assemble=0.037s`). The immediately preceding cold observation, retained only
+as a diagnostic because its source proof came afterward, was **4.99 s** agent
+total / **6 s** wall (`attach=2.43s`).
+
+## Cockpit verification gate — STOP, NOT DONE (corrected premise still false)
+
+The requested read-before-build check disproved §3.4's remaining “zero Cockpit
+changes for send and receive” premise. The active-tab happy path is close, but
+reload/multi-tab correctness is not:
+
+- `ConnectionPayload` declares `ws_url: string`, `_openControlWs` marks the
+  session ready and then unconditionally calls `_installControlWs(threadId,
+  connection.ws_url)`. A stateless response supplies null, so this reaches
+  `new WebSocket(null)` and its failure/close enters the eight-attempt reconnect
+  ladder. `_ensureControlWs` can reset that ladder on focus, SSE recovery and
+  user actions. The null socket therefore is not currently a quiet no-op.
+- `session.state` is sent directly by the control WebSocket and is not in the
+  journal. It carries load-bearing reload state: permission/narration modes,
+  `turn_in_flight` + turn-count reconciliation (which joins a REST-restored
+  partial turn to its cursor-replayed suffix), the running tool, and pending
+  permission rows. A stateless reload gets none of it. A null-WS guard alone
+  can split a live turn or make a permission card disappear permanently.
+
+This is the fifth wrong premise caught by reading the call site. Per the brief's
+explicit instruction, implementation stopped instead of building the durable
+control inbox on top of an incomplete client-state transport. A draft 0119
+migration and shared helper had just been materialized when the parallel audit
+reported the issue; both were deleted immediately and were never staged or
+committed. Tilt had already built the partially edited snapshot and applied the
+empty draft table, however. Once the file disappeared, a replacement
+orchestrator correctly refused startup because its migration ledger contained
+an applied migration missing from the image; the preceding pod remained Ready.
+The draft table contained zero rows. In one explicit transaction, the exact
+`0119_thread_control_requests.sql` ledger row, `thread_control_requests` table,
+and `notify_thread_control_request()` function were removed, then the failed pod
+was recycled. Final live checks showed all pods Ready, ledger count zero, both
+objects absent, and `worker_batch` count zero. Migration 0119 remains unused in
+both the branch and the dev database. This is the partial-snapshot Tilt trap the
+brief warned about, and is retained here as a failure rather than elided.
+
+The revised dependency is: first design a lane-agnostic, transport-independent
+`session.state` snapshot (REST or journal/SSE-safe equivalent) for **both**
+lanes, including an ownership/freshness contract for in-flight and permission
+state. Only then land 0119 control admission/consumption and route Cockpit
+controls to REST. No worker traffic was created.
+
+### Read-only audits retained at the stop boundary
+
+The control transaction audit found that “lease owner” is incomplete for the
+pinned lane: its equivalent fence is the exact current `threads.agent_id`
+binding. A request table alone is also insufficient. `complete_unit` currently
+requeues only on `input_seq > consumed_seq`, so a control committed during a
+lease can be stranded when completion writes `done`; 0119 needs control
+watermarks (or a rigorously unified admission cursor) updated under the same
+queue-row serialization as completion. The executor's pre-attach
+skip-if-answered and no-pending-input branches would otherwise discard a
+control-only claim. Terminal request CAS must fence on lease token (stateless)
+or exact binding (pinned), and `_broadcast()` is not proof of durable journal
+acceptance — a writer receipt/flush seam or journaled-request recovery is
+required before terminalizing the row.
+
+The safe first verb subset is smaller than §3.3 implies. `mode.set` and
+`narration.set` are idempotent assignments, though mode must move off its
+current memory-only WS behavior and through grant-checked persistence. Plain
+compact can follow only with a durable receipt; boundary compact cannot resolve
+restored message IDs today. Stateless rewind has two additional defects: the
+detached route does not fence `run_queue`, and attached `_handle_rewind`
+replaces the writer without carrying the stateless lease. Undo is RAM-only;
+upgrade enters unbuilt S2; archive needs a terminal finalizer; config mutation
+is not transactionally fenced. Those verbs cannot safely share one blanket
+`_sendControl -> POST` implementation.
+
+The lifecycle audit found two more non-mechanical items:
+
+- Permission rows carry no lease identity. A thread-wide post-steal sweep can
+  expire a successor's fresh gate, while the current steal commits before its
+  contained journal side effect and has no durable retry marker. Safe retirement
+  needs a request stamped under the current fence and durable reaped-token
+  evidence. The current executor also **does not** release its lease at a gate,
+  despite the feature doc's future-state wording, and stateless SSE viewers are
+  absent from the agent-local `_subscribers` oracle.
+- Durable session wake writes `role='event'`, but the stateless executor fetches
+  only `role='human'`. Merely flipping an ended status would therefore settle
+  the wake without ever running a turn. Safe wake admission needs a stable event
+  id plus message/status/watermark in one transaction, role-preserving restore
+  and injection, and an explicit parked-unit rule.
+
+Path-A resume compaction remains the smallest independent next phase, but its
+fix is not a copied `_record_compaction` call. Restore does not project the DB
+message id/seq and mints new UUIDs; the boundary lookup would stay null.
+Persistence must be split from banner emission, restore must preserve the
+persisted boundary identity, and Path A must detect a real compaction and set
+`turn_count` before writing a persist-only checkpoint. This was not changed in
+this stopped session.
