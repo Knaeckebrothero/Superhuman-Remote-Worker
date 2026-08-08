@@ -6353,6 +6353,135 @@ COMMENT ON TABLE public.rollup_state IS 'Rollup watermarks — one row per named
 
 
 --
+-- Name: run_queue; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.run_queue (
+    unit_id uuid NOT NULL,
+    unit_kind text NOT NULL,
+    dedup_key text,
+    state text DEFAULT 'queued'::text NOT NULL,
+    priority integer DEFAULT 0 NOT NULL,
+    fair_key text,
+    run_after timestamp with time zone DEFAULT now() NOT NULL,
+    attempts_since_completion integer DEFAULT 0 NOT NULL,
+    max_attempts integer DEFAULT 5 NOT NULL,
+    lease_token bigint DEFAULT 0 NOT NULL,
+    leased_by text,
+    leased_until timestamp with time zone,
+    input_seq bigint,
+    consumed_seq bigint,
+    queued_at timestamp with time zone DEFAULT now() NOT NULL,
+    enqueue_ord bigint NOT NULL
+);
+
+
+--
+-- Name: TABLE run_queue; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.run_queue IS 'Work queue + recorded lease for stateless execution (docs/features/stateless_agents.md §5.1/§5.2). One DURABLE row per unit (thread, job, or bg task): rows are never deleted while the unit lives, so lease_token stays monotonic — delete-and-reinsert would reset it and break fencing. State machine: queued -> leased -> {done | queued | parked}; states are app-validated by design (no CHECK), values: queued, leased, done, parked. All writes go through src/shared/run_queue/.';
+
+
+--
+-- Name: COLUMN run_queue.unit_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.run_queue.unit_id IS 'Polymorphic unit id: thread_id (session_turn), job_id (worker_batch), or a fresh task id (bg_task). Deliberately NO foreign key — the queue outlives and predates its referents across kinds.';
+
+
+--
+-- Name: COLUMN run_queue.unit_kind; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.run_queue.unit_kind IS 'session_turn | worker_batch | bg_task (app-validated). Claims filter on kind so bg work never starves interactive claims.';
+
+
+--
+-- Name: COLUMN run_queue.dedup_key; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.run_queue.dedup_key IS 'Collapse key for collapsible bg work (e.g. cloud_push:<thread>). Dedup is QUEUED-ONLY (partial unique index below): one pending and one running instance may coexist; a signal arriving mid-run must produce a new pending row, never be swallowed (§5.1).';
+
+
+--
+-- Name: COLUMN run_queue.fair_key; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.run_queue.fair_key IS 'Per-user fairness dimension for session_turn claims (user id). The column ships with S1; the per-key round-robin CTE follows (§5.3.7).';
+
+
+--
+-- Name: COLUMN run_queue.run_after; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.run_queue.run_after IS 'Not claimable before this instant: scheduling + retry backoff. Reset by completion; pushed out by error release and reaper steals.';
+
+
+--
+-- Name: COLUMN run_queue.attempts_since_completion; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.run_queue.attempts_since_completion IS 'Claims since the last successful completion (incremented at claim, not at release). Reset to 0 only by complete_unit and unpark_unit. The reaper parks the unit when it reaches max_attempts.';
+
+
+--
+-- Name: COLUMN run_queue.lease_token; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.run_queue.lease_token IS 'Kleppmann fencing token: MONOTONIC per unit, bumped on EVERY claim and EVERY reaper steal, NEVER reset by enqueue/complete/release. Every persist transaction fences on it (fence_lease, FOR SHARE); a zombie writer holding a stale token is rejected at persist time.';
+
+
+--
+-- Name: COLUMN run_queue.leased_by; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.run_queue.leased_by IS 'Pod name. Diagnostics only — never correctness; ownership is proven by lease_token alone.';
+
+
+--
+-- Name: COLUMN run_queue.input_seq; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.run_queue.input_seq IS 'Newest thread_messages.seq enqueued for this unit (input watermark). Input arriving during a leased turn bumps ONLY this column — flipping a leased row''s state would break the lease.';
+
+
+--
+-- Name: COLUMN run_queue.consumed_seq; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.run_queue.consumed_seq IS 'Newest seq a COMPLETED turn has answered (consumed watermark). Completion re-queues when input_seq is ahead; every claim compares the two watermarks BEFORE invoking the LLM (skip-if-answered) so a steal landing between final persist and completion cannot double-answer.';
+
+
+--
+-- Name: COLUMN run_queue.queued_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.run_queue.queued_at IS 'Fairness position: reset on completion, voluntary release and steal, so claim order (priority DESC, queued_at) round-robins within a priority class instead of letting the oldest unit win every cycle.';
+
+
+--
+-- Name: COLUMN run_queue.enqueue_ord; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.run_queue.enqueue_ord IS 'Insertion-order tiebreak: final ORDER BY key of the claim so equal-timestamp claims are deterministic FIFO. Never reused, never meaningful beyond ordering.';
+
+
+--
+-- Name: run_queue_enqueue_ord_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+ALTER TABLE public.run_queue ALTER COLUMN enqueue_ord ADD GENERATED ALWAYS AS IDENTITY (
+    SEQUENCE NAME public.run_queue_enqueue_ord_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1
+);
+
+
+--
 -- Name: schema_migrations; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -7270,6 +7399,8 @@ CREATE TABLE public.threads (
     events_epoch integer DEFAULT 0 NOT NULL,
     awaiting_user_since timestamp with time zone,
     extend_count integer DEFAULT 0 NOT NULL,
+    execution_lane text DEFAULT 'pinned'::text NOT NULL,
+    events_seq_hwm bigint DEFAULT 0 NOT NULL,
     CONSTRAINT valid_permission_mode CHECK (((permission_mode)::text = ANY ((ARRAY['supervised'::character varying, 'auto_accept'::character varying, 'autonomous'::character varying])::text[]))),
     CONSTRAINT valid_thread_status CHECK (((status)::text = ANY ((ARRAY['created'::character varying, 'active'::character varying, 'idle'::character varying, 'awaiting_user'::character varying, 'suspended'::character varying, 'ended'::character varying])::text[])))
 );
@@ -7279,7 +7410,7 @@ CREATE TABLE public.threads (
 -- Name: COLUMN threads.events_epoch; Type: COMMENT; Schema: public; Owner: -
 --
 
-COMMENT ON COLUMN public.threads.events_epoch IS 'Current event-log runtime generation. The agent allocates a new epoch on every DB-backed runtime attach; older client cursors trigger authoritative re-sync.';
+COMMENT ON COLUMN public.threads.events_epoch IS 'Current event-log writer generation (client-visible). Bumped only deliberately: rewind, a reaper/steal takeover, or an attach that finds the previous session life terminal (terminal thread status, a terminal lifecycle frame in the epoch, or the epoch wholly beyond retention). Clean reattaches REUSE the epoch so cached client cursors stay valid; an older-epoch cursor triggers authoritative re-sync (gone_beyond_horizon). See docs/features/stateless_agents.md §5.3.2.';
 
 
 --
@@ -7294,6 +7425,20 @@ COMMENT ON COLUMN public.threads.awaiting_user_since IS 'Set by the agent when i
 --
 
 COMMENT ON COLUMN public.threads.extend_count IS 'Number of magic-link extend-window clicks since this awaiting_user session began. Capped at 4 (= 4h ceiling at default 60min/extend).';
+
+
+--
+-- Name: COLUMN threads.execution_lane; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.threads.execution_lane IS 'Which execution plane serves this thread: ''pinned'' (registered-agent pod, the default) or ''stateless'' (run_queue claim by any pod). App-validated by design — no CHECK. See docs/features/stateless_agents.md §5.4.4.';
+
+
+--
+-- Name: COLUMN threads.events_seq_hwm; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.threads.events_seq_hwm IS 'Highest seq ever allocated in the CURRENT events_epoch. Survives retention pruning of the thread_events rows themselves; reset to 0 atomically on every epoch bump. Maintained by the agent journal writer''s fenced flush (GREATEST over the batch in the same statement) and pre-incremented by the system-frame allocator (src/shared/event_journal). Attach seeds its in-process counter from GREATEST(events_seq_hwm, MAX(seq) of the epoch). See docs/features/stateless_agents.md §5.3.2.';
 
 
 --
@@ -8547,6 +8692,14 @@ ALTER TABLE ONLY public.rollup_state
 
 
 --
+-- Name: run_queue run_queue_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.run_queue
+    ADD CONSTRAINT run_queue_pkey PRIMARY KEY (unit_id);
+
+
+--
 -- Name: schema_migrations schema_migrations_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -9633,6 +9786,27 @@ CREATE INDEX idx_projects_network_tier ON public.projects USING btree (network_t
 --
 
 CREATE INDEX idx_projects_status ON public.projects USING btree (status);
+
+
+--
+-- Name: idx_run_queue_claim; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_run_queue_claim ON public.run_queue USING btree (unit_kind, priority DESC, queued_at, enqueue_ord) WHERE (state = 'queued'::text);
+
+
+--
+-- Name: idx_run_queue_dedup; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX idx_run_queue_dedup ON public.run_queue USING btree (unit_kind, dedup_key) WHERE ((dedup_key IS NOT NULL) AND (state = 'queued'::text));
+
+
+--
+-- Name: idx_run_queue_expiry; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_run_queue_expiry ON public.run_queue USING btree (leased_until) WHERE (state = 'leased'::text);
 
 
 --
