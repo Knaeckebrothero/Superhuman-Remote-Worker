@@ -720,12 +720,26 @@ async def _ssh_tar_to_file(
     timeout: int = 120,
 ) -> bool:
     """Stream ``ssh agent-host@host 'tar -cf - <remote_path> | zstd' > local`` —
-    the snapshot_service transport, narrowed to one path. Returns False on error.
+    the snapshot_service transport, narrowed to one path. The remote command is
+    wrapped in ``bash -c`` with a PIPESTATUS-discriminated verdict so a masked
+    upstream ``tar`` failure can't hide behind ``zstd``'s own exit code (see
+    docs/features/workspace_durability_tiering.md §C1d). Returns False on error.
     """
     from services import resolve_ssh_key_path
 
     kp = key_path if key_path is not None else resolve_ssh_key_path()
-    remote = f"tar -cf - {remote_path} 2>/dev/null | zstd -1 -T0"
+    # tar | zstd only reports the LAST stage's exit code, so a fatal tar
+    # failure upstream of zstd is masked. Wrap in `bash -c` (guarantees
+    # PIPESTATUS regardless of the agent-host login shell) and collapse to
+    # an honest accept/reject verdict: accept tar rc in {0, 1} (rc==1 is the
+    # benign "file changed as we read it" warning on a live workspace) with
+    # a clean zstd; reject tar rc>=2 or any zstd failure. The `.tar.zst`
+    # byte stream to stdout is unchanged — only the exit code's meaning is.
+    remote = (
+        "bash -c 'tar -cf - " + remote_path + " 2>/dev/null | zstd -1 -T0; "
+        "__ps=(\"${PIPESTATUS[@]}\"); "
+        "if [ \"${__ps[1]}\" -ne 0 ] || [ \"${__ps[0]}\" -ge 2 ]; then exit 1; else exit 0; fi'"
+    )
     cmd = [
         "ssh",
         *(["-i", kp] if kp else []),
@@ -882,11 +896,23 @@ async def _ssh_untar_from_file(
     """Reverse of :func:`_ssh_tar_to_file`: stream a local ``.tar.zst`` into the
     workspace via ``ssh ... 'zstd -d | tar -xf - -C /'``. The archive was created
     with absolute paths (e.g. ``/var/lib/code-server/User/globalStorage``) so it
-    extracts back to the same location. Returns False on error."""
+    extracts back to the same location. Wrapped in ``bash -c`` with the same
+    PIPESTATUS verdict as the capture side above, so a masked ``zstd -d``
+    decompression failure on a corrupt archive can't hide behind tar's own rc
+    (§C1d). Returns False on error."""
     from services import resolve_ssh_key_path
 
     kp = key_path if key_path is not None else resolve_ssh_key_path()
-    remote = "zstd -d | tar -xf - -C /"
+    # zstd -d | tar only reports the LAST stage's (tar's) exit code, masking
+    # a corrupt/truncated archive's decompression failure — the same pattern
+    # C1c fixed for the shared ssh_helpers extract commands. Same verdict
+    # shape as the capture side: accept tar rc in {0, 1}; reject tar rc>=2 or
+    # any zstd failure. stdin/stdout data flow is unchanged.
+    remote = (
+        "bash -c 'zstd -d | tar -xf - -C /; "
+        "__ps=(\"${PIPESTATUS[@]}\"); "
+        "if [ \"${__ps[0]}\" -ne 0 ] || [ \"${__ps[1]}\" -ge 2 ]; then exit 1; else exit 0; fi'"
+    )
     cmd = [
         "ssh",
         *(["-i", kp] if kp else []),
