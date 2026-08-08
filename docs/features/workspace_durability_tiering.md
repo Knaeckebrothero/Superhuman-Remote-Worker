@@ -370,10 +370,12 @@ login shell in the workspace/VM images; wrap in `bash -c` if any target is dash.
   PIPESTATUS and **no consumer changes**: `tar` is the pipeline's *last* stage so its rc already passes
   through (a benign full-extract `tar` rc==2 on image-provided `/usr/local` stays unchanged, per
   `ssh_helpers.py:82-88`); `pipefail` only surfaces an otherwise-masked `zstd -d` decompression failure.
-- **C1d (owed)** — `ide_settings.py:_ssh_untar_from_file` (~`:874-903`, IDE settings/extension profile
-  sync) builds its **own** unwrapped `zstd -d | tar -xf - -C /` with the same masking pattern; give it the
-  same `bash -c 'set -o pipefail; …'` wrapper. Found during C1c; a third extract site, out of that task's
-  two-file scope.
+- **C1d** — DONE (commit `f8a6b297`, k3d-verified on bash 5.2). `ide_settings.py` had **two** unwrapped
+  sites — capture `_ssh_tar_to_file:728` (`tar | zstd`) **and** extract `_ssh_untar_from_file:889`
+  (`zstd -d | tar`). Both now `bash -c`-wrapped with a `PIPESTATUS` **collapse-to-bool** verdict (accept
+  `tar` rc≤1 + upstream stage OK → exit 0; reject → exit 1), matching the two callers' `rc == 0` contract.
+  (Collapse, not plain `pipefail`, because these best-effort callers want a bool and benefit from the
+  tar-rc==1 tolerance.)
 
 **C2 — Verify integrity + completeness before trusting.** Server/S3 checksums only prove *bytes-received
 == bytes-hashed*, **not** that the archive is complete (a truncated tar hashes clean). So the verify has
