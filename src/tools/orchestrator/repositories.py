@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -11,6 +12,8 @@ from langchain_core.tools import tool
 
 from ..context import ToolContext
 from .jobs import _get_client, _get_orchestrator_url, _truncate
+
+logger = logging.getLogger(__name__)
 
 REPOSITORY_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
     "list_project_repositories": {
@@ -128,6 +131,32 @@ def _safe_checkout_path(repo: Dict[str, Any], target_path: Optional[str]) -> str
     if path.startswith("/") or any(part == ".." for part in Path(path).parts):
         raise ValueError("target_path must be a relative path inside the workspace.")
     return path
+
+
+def _ensure_checkout_path_ignored(backend, checkout_path: str) -> None:
+    """Gitignore the freshly cloned nested repo so the per-turn `git add -A`
+    doesn't stage it as a contentless gitlink (bug b1758f38). Mirrors the job
+    path (src/core/workspace.py:800-813) but derives the entry from the
+    ACTUAL checkout_path (target_path is caller-configurable), not a
+    hardcoded repos/. Writes the session workspace ROOT .gitignore.
+    Idempotent. Never raises.
+    """
+    # Leading '/' anchors the entry to the root .gitignore's directory;
+    # trailing '/' restricts the match to a directory.
+    entry = f"/{checkout_path}/"
+    header = "# Cloned project repositories (working-tree only; never versioned)"
+    try:
+        if backend.exists(".gitignore"):
+            content = backend.read_file(".gitignore")
+            if isinstance(content, bytes):
+                content = content.decode("utf-8", "replace")
+            if entry in {line.strip() for line in content.splitlines()}:
+                return
+            backend.append_file(".gitignore", f"\n{entry}\n")
+        else:
+            backend.write_file(".gitignore", f"{header}\n{entry}\n")
+    except Exception as e:
+        logger.warning("Failed to gitignore checkout path %s: %s", checkout_path, e)
 
 
 async def _fetch_public_repositories(
@@ -333,6 +362,7 @@ def create_repository_tools(context: ToolContext) -> List[Any]:
             branch = repo.get("branch") or "main"
             if branch and branch != "main":
                 git_mgr.checkout_branch(branch)
+            _ensure_checkout_path_ignored(backend, checkout_path)
             return (
                 "Repository checked out.\n"
                 f"Project ID: {effective_project_id}\n"
