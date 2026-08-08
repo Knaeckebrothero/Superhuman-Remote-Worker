@@ -213,14 +213,20 @@ class SnapshotService:
             staging_key = f"{prefix}/env.tar.zst.staging-{staging_uuid}"
             canonical_key = f"{prefix}/env.tar.zst"
 
-            await asyncio.to_thread(
-                self._s3.upload_file,
-                tar_path,
-                self._bucket,
-                staging_key,
-            )
-
             try:
+                # The staging upload itself is INSIDE this guarded block:
+                # if it raises after having created a partial object
+                # (e.g. an aborted multipart upload that still left
+                # something HEAD-able), `finally` below still deletes
+                # `staging_key` — no leaked scaffolding on that path
+                # either.
+                await asyncio.to_thread(
+                    self._s3.upload_file,
+                    tar_path,
+                    self._bucket,
+                    staging_key,
+                )
+
                 # Verify the STAGING object (§C2's check), before any
                 # canonical write. "When present": some manifests omit
                 # size_compressed_bytes, and there's nothing to compare
@@ -265,18 +271,30 @@ class SnapshotService:
                 # backed by boto3's TransferManager, which switches to a
                 # multipart copy automatically above its threshold. The
                 # staged bytes are already verified by this point, so
-                # copying them onto canonical only ever replaces it with
-                # an equally-good object — S3 PUT/COPY is atomic at the
-                # destination key, so a failure here (raised exception)
-                # leaves whatever was already there, never a
+                # every write below only ever replaces its destination
+                # with an equally-good object — S3 PUT/COPY is atomic at
+                # the destination key, so a failure here (raised
+                # exception) leaves whatever was already there, never a
                 # half-written object.
+                #
+                # Order matters: history FIRST, canonical LAST. Canonical
+                # is the object every reader (restore, verify_snapshot)
+                # trusts, so it must be the last thing touched — a
+                # failure anywhere in the history write (steps 1-2) then
+                # leaves canonical entirely untouched (previous good
+                # intact), instead of a half-promoted canonical whose tar
+                # was already replaced but whose manifest wasn't. The
+                # canonical tar+manifest pair still can't be updated as a
+                # single atomic unit (separate S3 objects — no
+                # cross-object transactions), so a failure between steps
+                # 3 and 4 remains possible; that residual one-op gap is
+                # fail-safe (verify_snapshot's deep hash catches a
+                # tar/manifest mismatch) and recoverable from the
+                # history/<ts>/ generation just written.
                 ts = self._history_generation_stamp(manifest, staging_uuid)
                 history_prefix = f"{prefix}/history/{ts}"
                 copy_source = {"Bucket": self._bucket, "Key": staging_key}
 
-                await asyncio.to_thread(
-                    self._s3.copy, copy_source, self._bucket, canonical_key
-                )
                 await asyncio.to_thread(
                     self._s3.copy,
                     copy_source,
@@ -286,14 +304,17 @@ class SnapshotService:
                 await asyncio.to_thread(
                     self._s3.put_object,
                     Bucket=self._bucket,
-                    Key=f"{prefix}/manifest.json",
+                    Key=f"{history_prefix}/manifest.json",
                     Body=manifest_bytes,
                     ContentType="application/json",
                 )
                 await asyncio.to_thread(
+                    self._s3.copy, copy_source, self._bucket, canonical_key
+                )
+                await asyncio.to_thread(
                     self._s3.put_object,
                     Bucket=self._bucket,
-                    Key=f"{history_prefix}/manifest.json",
+                    Key=f"{prefix}/manifest.json",
                     Body=manifest_bytes,
                     ContentType="application/json",
                 )
