@@ -584,6 +584,19 @@ class SnapshotService:
                 "--exclude=__pycache__",
                 "--exclude=node_modules/.cache",
                 "--exclude=.git/objects",
+                # An ext4-formatted PVC mounts a root-owned 0700 ``lost+found``
+                # at its volume root — which, for a session/job workspace, IS
+                # ``/home/agent-host``. The capture tar runs as the unprivileged
+                # ``agent-host`` SSH user and cannot open that directory, so
+                # WITHOUT this exclude the whole ``tar`` exits rc>=2 and the C1b
+                # accept gate (correctly) rejects the archive — breaking EVERY
+                # PVC-backed capture, so idle-suspend can never complete and
+                # reclaim-on-idle can never fire. ``lost+found`` is an fsck
+                # artifact, never workspace data. Confirmed on the dev cluster:
+                # ``tar: /home/agent-host/lost+found: Cannot open: Permission
+                # denied`` was the sole cause of a real capture rc=2. See
+                # docs/features/workspace_durability_tiering.md §C1.
+                "--exclude=*/lost+found",
                 # Workspace content re-cloned/regenerated on restore
                 "--exclude=*/repos/*",
                 "--exclude=*/node_modules/*",
