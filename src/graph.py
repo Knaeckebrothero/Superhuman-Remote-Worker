@@ -45,6 +45,7 @@ Phase Alternation:
 
 import json
 import logging
+import math
 import re
 import asyncio
 import time
@@ -135,8 +136,137 @@ from .services.image_content import (
     make_multimodal_user_message,
     resolve_image_max_edge,
 )
+from .shared.job_freeze_types import FREEZE_TYPE_BATCH_BOUNDARY
 from .tools.context import ToolContext
 from .utils.db_url import checkpointer_backend
+
+
+# Worker rotation is wall-clock-first. A caller may request a longer batch, but
+# no iteration cap or undersized target may rotate sooner than five minutes;
+# otherwise setup/handoff overhead dominates and prompt-cache continuity is
+# needlessly disrupted (stateless_agents.md §5.4.3).
+WORKER_BATCH_MIN_WALL_SECONDS = 300.0
+
+_WORKER_BATCH_ARMING_FIELDS = (
+    "worker_batch_started_at",
+    "worker_batch_start_iteration",
+    "worker_batch_target_wall_seconds",
+    "worker_batch_iteration_cap",
+)
+
+
+def _finite_number(value: Any) -> Optional[float]:
+    """Return a finite float for numeric checkpoint values, else None."""
+    if isinstance(value, bool):
+        return None
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    return result if math.isfinite(result) else None
+
+
+def _worker_batch_disarm_updates() -> Dict[str, None]:
+    """Clear claim-local budget state before any Continue-as-New handoff."""
+    return {field: None for field in _WORKER_BATCH_ARMING_FIELDS}
+
+
+def worker_batch_boundary_updates(
+    state: UniversalAgentState,
+    *,
+    now: Optional[float] = None,
+    boundary: Literal["mid_phase", "phase_boundary"] = "mid_phase",
+) -> Optional[Dict[str, Any]]:
+    """Build a clean ``batch_boundary`` stop when an armed budget is due.
+
+    Missing or invalid arming fields disable the boundary, which is the
+    compatibility contract for pinned jobs, sessions, and old checkpoints.
+    The wall target is clamped to five minutes. The optional iteration cap is
+    secondary and cannot fire before the same wall-clock floor.
+    """
+    if (
+        state.get("should_stop")
+        or state.get("goal_achieved")
+        or state.get("freeze_data") is not None
+        or (state.get("error") and boundary == "mid_phase")
+    ):
+        return None
+
+    started_at = _finite_number(state.get("worker_batch_started_at"))
+    target = _finite_number(state.get("worker_batch_target_wall_seconds"))
+    if started_at is None or target is None or target <= 0:
+        return None
+
+    current_time = _finite_number(time.time() if now is None else now)
+    if current_time is None:
+        return None
+    elapsed = max(0.0, current_time - started_at)
+    target = max(target, WORKER_BATCH_MIN_WALL_SECONDS)
+    wall_due = elapsed >= target
+
+    iteration = _finite_number(state.get("iteration"))
+    start_iteration = _finite_number(state.get("worker_batch_start_iteration"))
+    iteration_cap = _finite_number(state.get("worker_batch_iteration_cap"))
+    iteration_delta: Optional[float] = None
+    iteration_due = False
+    if (
+        iteration is not None
+        and start_iteration is not None
+        and iteration_cap is not None
+        and iteration_cap > 0
+    ):
+        iteration_delta = max(0.0, iteration - start_iteration)
+        iteration_due = (
+            elapsed >= WORKER_BATCH_MIN_WALL_SECONDS
+            and iteration_delta >= iteration_cap
+        )
+
+    if not (wall_due or iteration_due):
+        return None
+
+    phase = "strategic" if state.get("is_strategic_phase", True) else "tactical"
+    trigger = "wall_clock" if wall_due else "iteration_cap"
+    freeze_data: Dict[str, Any] = {
+        "freeze_type": FREEZE_TYPE_BATCH_BOUNDARY,
+        "boundary": boundary,
+        "phase": phase,
+        "phase_number": state.get("phase_number", 0),
+        "reason": f"stateless worker batch {trigger} budget reached",
+        "trigger": trigger,
+        "elapsed_seconds": round(elapsed, 3),
+        "target_wall_seconds": target,
+    }
+    if iteration_delta is not None and iteration_cap is not None:
+        freeze_data["iteration_delta"] = int(iteration_delta)
+        freeze_data["iteration_cap"] = int(iteration_cap)
+
+    # Clear the entire arming envelope in the same checkpoint as the freeze. A
+    # successor must deliberately stamp a fresh claim budget; stale state can
+    # never immediately re-freeze a resumed job.
+    updates: Dict[str, Any] = {
+        "freeze_data": freeze_data,
+        "should_stop": True,
+        "error": None,
+    }
+    updates.update(_worker_batch_disarm_updates())
+    return updates
+
+
+def _log_worker_batch_boundary(job_id: str, updates: Dict[str, Any]) -> None:
+    """Emit the tuning line consumed by worker batch probes."""
+    freeze = updates["freeze_data"]
+    logger.info(
+        "[%s] worker_batch_boundary: boundary=%s trigger=%s elapsed=%.3fs "
+        "target=%.3fs iteration_delta=%s iteration_cap=%s",
+        job_id,
+        freeze["boundary"],
+        freeze["trigger"],
+        freeze["elapsed_seconds"],
+        freeze["target_wall_seconds"],
+        freeze.get("iteration_delta", "-"),
+        freeze.get("iteration_cap", "-"),
+    )
+
 
 logger = logging.getLogger(__name__)
 
@@ -2749,6 +2879,26 @@ def create_check_todos_node(
                 "todo_next_id": todo_state["next_id"],
             }
 
+        # Mid-phase rotation is allowed only on the pending-todos path at this
+        # natural graph break. audited_tools has drained memory/freeze/reply
+        # carriers, the one-superstep-delayed replan request was consumed above,
+        # and completed/empty phases retained their normal transition/recovery
+        # routing. Never interrupt audited_tools or an in-flight tool effect.
+        # A version drain remains higher priority and owns the next clean phase
+        # boundary rather than being relabeled as an ordinary batch rotation.
+        batch_updates = worker_batch_boundary_updates(state)
+        if batch_updates is not None and not _is_drain_requested():
+            batch_updates.update(
+                {
+                    "phase_complete": False,
+                    "todos": todo_state["todos"],
+                    "staged_todos": todo_state["staged_todos"],
+                    "todo_next_id": todo_state["next_id"],
+                }
+            )
+            _log_worker_batch_boundary(job_id, batch_updates)
+            return batch_updates
+
         return {
             "phase_complete": False,
             "todos": todo_state["todos"],
@@ -3579,10 +3729,27 @@ def create_handle_transition_node(
             # orchestrator to fail (instead of pause) this re-dispatchable job.
             # docs/done/version_upgrade_drain_masked_by_coincident_error.md
             updates["error"] = None
+            updates.update(_worker_batch_disarm_updates())
             logger.info(
                 f"[{job_id}] Drain intent at phase boundary — "
                 f"freezing for version_upgrade re-dispatch"
             )
+        elif not (
+            updates.get("should_stop")
+            or updates.get("goal_achieved")
+            or updates.get("freeze_data") is not None
+            or updates.get("error")
+        ):
+            # Normal phase boundaries are the preferred rotation point: the
+            # transition and any pending replan have already been checkpointed.
+            # Drain intent wins above, and completion/human/error freezes from
+            # the transition win through this guard.
+            batch_updates = worker_batch_boundary_updates(
+                state, boundary="phase_boundary"
+            )
+            if batch_updates is not None:
+                updates.update(batch_updates)
+                _log_worker_batch_boundary(job_id, batch_updates)
         return updates
 
     return handle_transition

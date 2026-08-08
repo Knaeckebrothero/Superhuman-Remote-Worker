@@ -809,5 +809,98 @@ Failures recorded:
 Rollout decision: Gate 2 is split deliberately. This orchestrator-first slice
 is verified before any agent-side boundary code exists. Rollback must disable
 batch emission first; worker admission remains OFF and no `worker_batch` unit
-has been enqueued. Gate 2B (default-unarmed graph boundary and agent resume
-contract) is next.
+has been enqueued. Gate 2B (default-unarmed graph boundary and agent registry
+consumption) is next.
+
+## Phase 2 / Gate 2B — checkpointed batch boundary (DONE, default-unarmed)
+
+The shared registry is now consumed by the agent as well as the orchestrator;
+the former private `_AUTO_CONTINUE_FREEZE_TYPES` duplicate is gone.
+`UniversalAgentState` carries four checkpointed, claim-local budget fields:
+
+- `worker_batch_started_at`;
+- `worker_batch_start_iteration`;
+- `worker_batch_target_wall_seconds`;
+- `worker_batch_iteration_cap`.
+
+All four default to `None`, so existing pinned jobs, session turns, old
+checkpoints, and every currently deployed driver are incapable of emitting a
+boundary. A future worker claim must arm them explicitly.
+
+`worker_batch_boundary_updates()` implements wall-clock-first rotation. It
+requires finite arming values, clamps any target to a hard **300 s minimum**,
+and allows the secondary iteration cap only after the same 300 s floor. When
+both are due, wall clock wins. The existing `iteration` field is an
+execute/LLM-iteration counter, not a literal LangGraph superstep counter; this
+is an explicit deviation from the design doc's terminology and is named and
+reported honestly rather than pretending to have a counter the graph lacks.
+
+Safe boundary placement and priority are now enforced:
+
+1. existing completion/human/error outcomes;
+2. version drain intent;
+3. a consumed replan request and its completed phase transition;
+4. batch rotation.
+
+Mid-phase rotation exists only on `check_todos`' pending-todos path, after the
+tool node has drained its transient carriers and after `_replan_request` has
+been consumed. It cannot intercept empty-manager recovery, a completed phase,
+or `audited_tools`, and a pending version drain suppresses it. The preferred
+phase-boundary path runs after transition, replan-message injection, and reply
+drain. Both paths checkpoint todos, emit `batch_boundary` with
+`should_stop=True`/`error=None`, and clear all four arming fields. The existing
+`version_upgrade` handoff now also disarms them, preventing an expired claim
+start from immediately re-freezing its successor. Batch rotation does **not**
+write `output/job_frozen.json`.
+
+Added the stable tuning line
+`worker_batch_boundary: boundary=... trigger=... elapsed=... target=...` with
+iteration delta/cap. Tests pin default-unarmed behavior, the 300 s floor,
+wall-clock tie-break, iteration gating, all priority rules, todo persistence,
+empty tactical recovery, replan semantics through the next boundary, stale
+error handling, field disarming, absence from `audited_tools`, and the
+unconditional `tools -> check_todos` edge.
+
+Verification:
+
+- graph/drain/loop/Todo/replan suites: **326 passed** in 5.02 s;
+- targeted Ruff check + format check and `git diff --check`: clean;
+- after the final Tilt rollout and termination of every intermediate pod, both
+  running agent containers were inspected directly. Each contains one
+  `worker_batch_boundary:` timing marker, one 300 s floor definition, the
+  phase-transition goal guard, and the shared auto-continue import;
+- a pure assertion inside **each** running agent proved initial state is
+  unarmed, an undersized target cannot fire at 299.9 s, it fires as
+  `batch_boundary` at 300 s, and the arming state is cleared;
+- the running orchestrator still contains its unknown-freeze fail-soft guard;
+- live DB query after verification: **0 `worker_batch` rows**.
+
+Final post-change session probe (turn 81): answer observed in **11 s**, agent
+**7.16 s total** (bundle 0.20, attach 2.62, turn 4.24, push 0.09, complete
+0.01). Orchestrator claim bundle was **0.170 s**. The immediately preceding
+Gate-2B probe was 9 s / 4.86 s (bundle 0.19, attach 2.48, turn 2.00, push 0.17,
+complete 0.01; orchestrator 0.167 s). The variance is provider/turn time (2.24
+s) plus normal attach variation (0.14 s); no worker graph executes on a session
+turn and no hot-path regression is attributed to the default-unarmed fields.
+
+Audit-driven corrections made before declaring DONE:
+
+- moved the mid-phase check below empty-todo recovery and completed-phase
+  handling, avoiding a freeze that would preserve a stale `phase_complete` or
+  mask the known empty-manager recovery path;
+- added explicit `phase_complete=False` to a mid-phase freeze checkpoint;
+- made drain intent suppress mid-phase rotation and disarm claim budget state;
+- allowed only a true phase boundary to clear a stale prior error;
+- ensured transition-produced `goal_achieved`, freeze, stop, or error state
+  cannot be replaced by a batch boundary;
+- split the replan test into the reachable tactical→strategic shape rather than
+  accepting an impossible strategic request-replan state.
+
+Operational note: Tilt built several intermediate snapshots while this ordered
+edit was in progress. No measurement trusted them. Verification waited until
+all terminating pods were gone and then checked every container in the final
+ReplicaSet.
+
+Safety state: Gates 1 and 2 are DONE and verified. Boundary code exists in the
+agent image but no production path can arm it. No real worker work has been
+queued. Gate 3 remains closed.

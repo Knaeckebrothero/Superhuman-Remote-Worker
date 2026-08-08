@@ -1120,7 +1120,7 @@ class TestAutoContinueFreezeTypeScope:
             assert freeze_type not in ERROR_IMMUNE_FREEZE_TYPES
 
     def test_auto_continue_set_covers_redispatch_types_only(self):
-        from src.agent import _AUTO_CONTINUE_FREEZE_TYPES
+        from src.shared.job_freeze_types import AUTO_CONTINUE_FREEZE_TYPES
 
         for ft in (
             "version_upgrade",
@@ -1129,7 +1129,8 @@ class TestAutoContinueFreezeTypeScope:
             "kb_unavailable",
             "workspace_upgrade_required",
         ):
-            assert ft in _AUTO_CONTINUE_FREEZE_TYPES
+            assert ft in AUTO_CONTINUE_FREEZE_TYPES
+        assert "batch_boundary" in AUTO_CONTINUE_FREEZE_TYPES
         # Human-review / terminal stops must NOT be auto-cleared on resume.
         for ft in ("budget_exceeded", "job_complete", "vm_upgrade_required"):
-            assert ft not in _AUTO_CONTINUE_FREEZE_TYPES
+            assert ft not in AUTO_CONTINUE_FREEZE_TYPES
