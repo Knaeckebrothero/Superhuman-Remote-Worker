@@ -475,9 +475,16 @@ class SnapshotService:
             # include lists must never contain a single quote — the
             # command-shape test asserts this by counting quotes in the
             # final command.
+            # PIPESTATUS must be snapshotted into an array in ONE command
+            # before anything reads it: a bare assignment (e.g.
+            # `__t=${PIPESTATUS[0]}`) is itself a simple command and
+            # immediately resets PIPESTATUS to its own exit status, so a
+            # second assignment reading PIPESTATUS[1] would see it already
+            # clobbered (silently re-masking every zstd failure). Capturing
+            # `"${PIPESTATUS[@]}"` into `__ps` first avoids that.
             tar_cmd = (
                 "bash -c '" + pipeline + "; "
-                "__t=${PIPESTATUS[0]}; __z=${PIPESTATUS[1]}; "
+                '__ps=("${PIPESTATUS[@]}"); __t=${__ps[0]}; __z=${__ps[1]}; '
                 'if [ "$__z" -ne 0 ] || [ "$__t" -ge 2 ]; then exit 2; '
                 'elif [ "$__t" -eq 1 ]; then exit 1; else exit 0; fi\''
             )
