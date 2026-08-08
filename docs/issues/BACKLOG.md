@@ -55,6 +55,7 @@ hydration; critic verdict survived via the checkpointed mirror + ledger.)*
 
 | doc | status |
 |---|---|
+| [live_permission_mode_change_never_persisted](live_permission_mode_change_never_persisted.md) | Open, found 2026-08-08 on the k3d tier-row gate. Live permission-mode changes apply to the running agent but never reach `threads.permission_mode`; survives a page reload (agent reports in-memory state), so it silently reverts on pod restart. Pre-existing — reproduced on the pre-change build. Transport is fine; only the "top-level column sync" is missing. |
 | [bench_infra_exclusion_misses_midflight_outages](bench_infra_exclusion_misses_midflight_outages.md) | Open, analysis-level workaround exists. Found 2026-08-05 during |
 | [project_scoped_memory_deadlocks_under_parallel_jobs](project_scoped_memory_deadlocks_under_parallel_jobs.md) | Containment tier **SHIPPED 08-06 (batch #2)** — ordered locking + contained/retried access stats + heartbeat telemetry. OPEN: the semantic per-consumer TTL model (criterion 3) and pinned-budget share (criterion 5). |
 | [phase_boundary_tags_are_moved_then_rejected_by_remote](phase_boundary_tags_are_moved_then_rejected_by_remote.md) | Core **FIXED 08-06 (batch #2)**; duplicate phase-completion transition **CLOSED 08-06 (batch #3)** — archive_phase exactly-once guard on the checkpointed instance key. Last residual: tag-independent review evidence (direction 5). |
