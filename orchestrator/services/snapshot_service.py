@@ -925,6 +925,15 @@ class SnapshotService:
             )
         except ClientError:
             return False, "object missing"
+        except Exception as e:
+            # ClientError only covers service-error responses (NoSuchKey/
+            # 404/5xx) — BotoCoreError (EndpointConnectionError,
+            # ConnectTimeoutError, ReadTimeoutError, ConnectionClosedError)
+            # and a bubbled ConnectionResetError are plain Exceptions, not
+            # ClientErrors, and must be owned here too. Order matters:
+            # ClientError above keeps NoSuchKey's precise "object missing"
+            # reason; this is the catch-all for everything else.
+            return False, f"verify error: {e}"
 
         if want_size and head["ContentLength"] != want_size:
             return False, (
