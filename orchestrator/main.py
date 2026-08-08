@@ -180,6 +180,9 @@ from services.session_wake import (  # noqa: E402
     notify_officer,
     session_wake_sweeper_loop,
 )
+from services.session_state_snapshot import (  # noqa: E402
+    build_session_state_snapshot,
+)
 from services.stale_verification_sweeper import (  # noqa: E402
     stale_verification_sweeper_loop,
 )
@@ -29211,6 +29214,71 @@ async def get_thread(thread_id: str, request: Request) -> dict[str, Any]:
         if m.get("mount_kind") == "project" and m.get("source_ref")
     ]
     return result
+
+
+@app.get("/api/persistent/threads/{thread_id}/state")
+async def get_thread_session_state(
+    thread_id: str, request: Request, response: Response
+) -> dict[str, Any]:
+    """Lane-agnostic, owner-gated current state for a session Cockpit.
+
+    This is the REST twin of the agent's direct ``session.state`` welcome
+    frame.  It intentionally reads durable state for *both* execution lanes;
+    no lane or pod identity crosses the wire.  Journal-derived fields are
+    point-in-time values at ``event_cursor``.  A client must apply the snapshot
+    before replaying the journal from ``replay_cursor`` so the latest logical
+    turn is rebuilt before any not-yet-flushed agent edge advances it.
+    """
+
+    started = time.perf_counter()
+    _user, _thread = await require_thread_owner(request, postgres_db, thread_id)
+    auth_done = time.perf_counter()
+
+    # Model/temperature/narration are not all first-class thread columns yet.
+    # Resolve from the exact thread row captured inside the snapshot's
+    # repeatable-read transaction. A later config write then lands above the
+    # returned event cursor and SSE replays it, instead of the cursor hiding a
+    # scalar resolved from a different metadata revision.
+    config_seconds = 0.0
+
+    async def _resolve_snapshot_config(
+        snapshot_thread: dict[str, Any], snapshot_metadata: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        nonlocal config_seconds
+        config_started = time.perf_counter()
+        try:
+            return await _resolve_session_config(snapshot_thread, snapshot_metadata)
+        except GrantDenied:
+            logger.warning(
+                "Session-state config resolve denied for thread %s; using stored "
+                "display fields",
+                thread_id,
+            )
+            return None
+        finally:
+            config_seconds += time.perf_counter() - config_started
+
+    snapshot = await build_session_state_snapshot(
+        postgres_db,
+        thread_id,
+        config_resolver=_resolve_snapshot_config,
+    )
+    if snapshot is None:
+        raise HTTPException(status_code=404, detail="Thread not found")
+    # Pending permissions include tool arguments. Never let a browser or an
+    # intermediary retain one user's current control state for another read.
+    response.headers["Cache-Control"] = "private, no-store"
+    finished = time.perf_counter()
+    logger.info(
+        "session-state timing: thread=%s auth=%.3fs config=%.3fs "
+        "snapshot=%.3fs total=%.3fs",
+        thread_id,
+        auth_done - started,
+        config_seconds,
+        max(0.0, finished - auth_done - config_seconds),
+        finished - started,
+    )
+    return snapshot
 
 
 async def _session_tool_grants(thread: dict[str, Any]) -> dict[str, Any] | None:

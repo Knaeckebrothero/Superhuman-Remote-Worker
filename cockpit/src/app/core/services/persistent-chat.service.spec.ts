@@ -238,6 +238,38 @@ function createService(opts: {
     };
 }
 
+/** One internally consistent response object for older tests that mock every
+ * connect-time GET with one function. Each endpoint reads only its own fields. */
+function activeSessionGet(url: string) {
+    const threadId =
+        url.match(/\/(?:persistent\/threads|sessions)\/([^/?]+)/)?.[1] ?? 'thread';
+    return of({
+        status: 'active',
+        total_turns: 0,
+        messages: [],
+        total: 0,
+        citations: [],
+        thread_id: threadId,
+        permission_mode: 'supervised',
+        narration_mode: 'auto',
+        turn_count: 0,
+        turn_in_flight: false,
+        message_count: 0,
+        model: null,
+        temperature: null,
+        running_tool: null,
+        pending_permissions: [],
+        event_cursor: {epoch: 0, seq: 0},
+        replay_cursor: {epoch: 0, seq: 0},
+        snapshot_source: 'durable_journal',
+        state: 'ready',
+        control_socket: 'websocket',
+        ws_url: 'ws://agent.test',
+        token: 'test-token',
+        expires_at: 0,
+    });
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -768,7 +800,7 @@ describe('PersistentChatService — connect()', () => {
 
     it('flips connectionState to connected on SSE open', async () => {
         const {service, mockHttp, sseInstances} = createService();
-        mockHttp.get.mockImplementation(() => of({status: 'active', total_turns: 0, messages: [], total: 0}));
+        mockHttp.get.mockImplementation(activeSessionGet);
 
         await service.connect('thread-D');
         expect(service.connectionState()).toBe('connecting');
@@ -966,9 +998,7 @@ describe('PersistentChatService — connect()', () => {
 
     it('keeps Canvas control sending on the existing thread WebSocket owner', async () => {
         const {service, mockHttp, wsInstances, threadTransport} = createService();
-        mockHttp.get.mockImplementation(() =>
-            of({status: 'active', total_turns: 0, messages: [], total: 0}),
-        );
+        mockHttp.get.mockImplementation(activeSessionGet);
         await service.connect('thread-canvas');
 
         const accepted = threadTransport.sendCanvasControl('thread-canvas', {
@@ -1005,9 +1035,7 @@ describe('PersistentChatService — connect()', () => {
 
     it('sends a committed presentation invalidation without file identity', async () => {
         const {service, mockHttp, wsInstances, threadTransport} = createService();
-        mockHttp.get.mockImplementation(() =>
-            of({status: 'active', total_turns: 0, messages: [], total: 0}),
-        );
+        mockHttp.get.mockImplementation(activeSessionGet);
         await service.connect('thread-canvas');
 
         const accepted = threadTransport.sendCanvasControl('thread-canvas', {
@@ -1084,9 +1112,7 @@ describe('PersistentChatService — connect()', () => {
 
     it('forwards a direct reconcile-required control frame without an SSE sequence', async () => {
         const {service, mockHttp, wsInstances, threadTransport} = createService();
-        mockHttp.get.mockImplementation(() =>
-            of({status: 'active', total_turns: 0, messages: [], total: 0}),
-        );
+        mockHttp.get.mockImplementation(activeSessionGet);
         const invalidations: unknown[] = [];
         threadTransport.canvasInvalidations$.subscribe((event) => invalidations.push(event));
         await service.connect('thread-canvas');
@@ -1403,6 +1429,52 @@ describe('PersistentChatService — SSE event dispatch', () => {
         expect(service.pendingPermissions()[0]?.id).toBe('tc-live');
     });
 
+    it('clears stale pendingPermissions when session.state explicitly sends an empty list', async () => {
+        const {service, es} = await setup();
+        (service as any).pendingPermissions.set([{
+            id: 'tc-resolved',
+            approvalId: 'approval-resolved',
+            tool: 'run_command',
+            args: {cmd: 'ls'},
+        }]);
+        fireSseMessage(es, {
+            method: 'session.state',
+            params: {pending_permissions: []},
+        }, '1:2');
+        expect(service.pendingPermissions()).toEqual([]);
+    });
+
+    it('keeps the newest approval row when a snapshot contains a duplicate tool call', async () => {
+        const {service, es} = await setup();
+        fireSseMessage(es, {
+            method: 'session.state',
+            params: {
+                snapshot_source: 'durable_journal',
+                pending_permissions: [
+                    {
+                        id: 'tc-duplicate',
+                        approval_id: 'approval-stale',
+                        tool: 'run_command',
+                        args: {cmd: 'old'},
+                    },
+                    {
+                        id: 'tc-duplicate',
+                        approval_id: 'approval-waiter-owns',
+                        tool: 'run_command',
+                        args: {cmd: 'new'},
+                    },
+                ],
+            },
+        }, '1:2');
+
+        expect(service.pendingPermissions()).toEqual([{
+            id: 'tc-duplicate',
+            approvalId: 'approval-waiter-owns',
+            tool: 'run_command',
+            args: {cmd: 'new'},
+        }]);
+    });
+
     it('promotes ready event to sessionReady=true and flushes the outbox', async () => {
         const {service, es, mockHttp} = await setup();
         // Queue a send as if the user typed while the session wasn't ready.
@@ -1544,6 +1616,15 @@ describe('PersistentChatService — SSE event dispatch', () => {
         const urls = mockHttp.post.mock.calls.map((c: unknown[]) => c[0] as string);
         expect(urls.some((u) => u.endsWith('/approve/a-0'))).toBe(true);
         expect(urls.some((u) => u.endsWith('/approve/a-1'))).toBe(true);
+        expect(service.pendingPermissions().map((p) => p.id)).toEqual(['tc-0', 'tc-1']);
+        fireSseMessage(es, {
+            method: 'permission.resolved',
+            params: {id: 'tc-0', decision: 'approved'},
+        }, '1:2');
+        fireSseMessage(es, {
+            method: 'permission.resolved',
+            params: {id: 'tc-1', decision: 'approved'},
+        }, '1:3');
         expect(service.pendingPermissions()).toEqual([]);
     });
 
@@ -2389,9 +2470,7 @@ describe('PersistentChatService — resume re-validation (visibility/online)', (
 
     async function connectOpen(threadId: string) {
         const ctx = createService();
-        ctx.mockHttp.get.mockImplementation(() =>
-            of({status: 'active', total_turns: 0, messages: [], total: 0}),
-        );
+        ctx.mockHttp.get.mockImplementation(activeSessionGet);
         await ctx.service.connect(threadId);
         await new Promise((r) => setTimeout(r, 0));
         fireSseOpen(ctx.sseInstances[0]);
@@ -2470,9 +2549,7 @@ describe('PersistentChatService — control WS (slash commands + permissions)', 
 
     async function readySession() {
         const ctx = createService();
-        ctx.mockHttp.get.mockImplementation(() =>
-            of({status: 'active', total_turns: 0, messages: [], total: 0}),
-        );
+        ctx.mockHttp.get.mockImplementation(activeSessionGet);
         await ctx.service.connect('thread-c');
         fireSseOpen(ctx.sseInstances[0]);
         fireSseMessage(ctx.sseInstances[0], {method: 'ready', params: {}}, '1:1');
@@ -2512,6 +2589,15 @@ describe('PersistentChatService — control WS (slash commands + permissions)', 
             {decision: 'approve'},
         );
         expect(ctx.wsInstances[0].send).not.toHaveBeenCalled();
+        expect(ctx.service.pendingPermissions()).toHaveLength(1);
+        fireSseMessage(
+            ctx.sseInstances[0],
+            {
+                method: 'permission.resolved',
+                params: {id: 'tc-rest', decision: 'approved'},
+            },
+            '1:2',
+        );
         expect(ctx.service.pendingPermissions()).toEqual([]);
     });
 
@@ -2533,7 +2619,46 @@ describe('PersistentChatService — control WS (slash commands + permissions)', 
             {decision: 'deny'},
         );
         expect(ctx.wsInstances[0].send).not.toHaveBeenCalled();
+        expect(ctx.service.pendingPermissions()).toHaveLength(1);
+        fireSseMessage(
+            ctx.sseInstances[0],
+            {
+                method: 'permission.resolved',
+                params: {id: 'tc-deny-rest', decision: 'denied'},
+            },
+            '1:2',
+        );
         expect(ctx.service.pendingPermissions()).toEqual([]);
+    });
+
+    it('does not resurrect a durable card when journal resolution beats a masked POST error', async () => {
+        const ctx = await readySession();
+        const response = new Subject<Record<string, unknown>>();
+        ctx.mockHttp.post.mockReturnValue(response.asObservable());
+        ctx.wsInstances[0].send.mockClear();
+        (ctx.service as any).pendingPermissions.set([{
+            id: 'tc-masked',
+            approvalId: 'approval-masked',
+            tool: 'run_command',
+            args: {},
+        }]);
+
+        ctx.service.approveAll();
+        expect(ctx.service.pendingPermissions()).toHaveLength(1);
+        fireSseMessage(
+            ctx.sseInstances[0],
+            {
+                method: 'permission.resolved',
+                params: {id: 'tc-masked', decision: 'approved'},
+            },
+            '1:2',
+        );
+        response.error({status: 0});
+
+        expect(ctx.service.pendingPermissions()).toEqual([]);
+        expect(ctx.service.error()).toBeNull();
+        expect(ctx.wsInstances[0].send).not.toHaveBeenCalled();
+        expect((ctx.service as any).controlOutbox).toEqual([]);
     });
 
     it('denyAll() sends {method: "deny"} and seeds the denied tool call in the active turn', async () => {
@@ -2643,11 +2768,12 @@ describe('PersistentChatService — control WS frame filtering', () => {
 
     async function readySession() {
         const ctx = createService();
-        ctx.mockHttp.get.mockImplementation(() =>
-            of({status: 'active', total_turns: 0, messages: [], total: 0}),
-        );
+        ctx.mockHttp.get.mockImplementation(activeSessionGet);
         await ctx.service.connect('thread-status');
         fireSseOpen(ctx.sseInstances[0]);
+        // These tests isolate whether a direct WS frame flips readiness. The
+        // valid REST snapshot + /connection normally set it during connect.
+        ctx.service.sessionReady.set(false);
         return ctx;
     }
 
@@ -2753,9 +2879,16 @@ describe('PersistentChatService — direct session WS (prepare + connection)', (
         connectionResponses?: any[];  // array of values/errors to return on successive /connection calls
         threadMeta?: Record<string, unknown>;
         messages?: any[];
+        sessionState?: Record<string, unknown>;
     } = {}) {
         const connectionResponses = opts.connectionResponses ?? [
-            of({state: 'ready', ws_url: 'wss://api.example.com/p/t/ws?t=jwt', token: 'jwt', expires_at: 0}),
+            of({
+                state: 'ready',
+                control_socket: 'websocket',
+                ws_url: 'wss://api.example.com/p/t/ws?t=jwt',
+                token: 'jwt',
+                expires_at: 0,
+            }),
         ];
         let connectionCallIdx = 0;
         return (url: string) => {
@@ -2766,6 +2899,25 @@ describe('PersistentChatService — direct session WS (prepare + connection)', (
             }
             if (url.endsWith('/messages')) {
                 return of({messages: opts.messages ?? [], total: 0});
+            }
+            if (url.endsWith('/state')) {
+                const segments = url.split('/');
+                const threadId = segments[segments.length - 2];
+                return of(opts.sessionState ?? {
+                    thread_id: threadId,
+                    permission_mode: 'supervised',
+                    narration_mode: 'auto',
+                    turn_count: 0,
+                    turn_in_flight: false,
+                    message_count: 0,
+                    model: null,
+                    temperature: null,
+                    running_tool: null,
+                    pending_permissions: [],
+                    event_cursor: {epoch: 0, seq: 0},
+                    replay_cursor: {epoch: 0, seq: 0},
+                    snapshot_source: 'durable_journal',
+                });
             }
             return of(opts.threadMeta ?? {status: 'active', total_turns: 0});
         };
@@ -2778,6 +2930,7 @@ describe('PersistentChatService — direct session WS (prepare + connection)', (
                 connectionResponses: [
                     of({
                         state: 'ready',
+                        control_socket: 'websocket',
                         ws_url: 'wss://api.example.com/p/t1/ws?t=tok-warm',
                         token: 'tok-warm',
                         expires_at: 0,
@@ -2804,6 +2957,796 @@ describe('PersistentChatService — direct session WS (prepare + connection)', (
         expect(ctx.service.sessionReady()).toBe(true);
     });
 
+    it('accepts an older orchestrator pinned response during a rolling deploy', async () => {
+        const ctx = createService();
+        ctx.mockHttp.get.mockImplementation(
+            connectGetMock({
+                connectionResponses: [of({
+                    state: 'ready',
+                    ws_url: 'wss://api.example.com/p/legacy/ws?t=old-token',
+                    token: 'old-token',
+                    expires_at: 0,
+                })],
+            }),
+        );
+
+        await ctx.service.connect('legacy-pinned');
+
+        expect(ctx.wsInstances).toHaveLength(1);
+        expect(ctx.wsInstances[0].url).toBe(
+            'wss://api.example.com/p/legacy/ws?t=old-token',
+        );
+        expect((ctx.service as any).controlSocket).toBe('websocket');
+    });
+
+    it('treats a null control socket as ready without constructing or retrying a WebSocket', async () => {
+        const ctx = createService();
+        ctx.mockHttp.get.mockImplementation(
+            connectGetMock({
+                connectionResponses: [
+                    of({
+                        state: 'ready',
+                        control_socket: 'none',
+                        ws_url: null,
+                        token: null,
+                        expires_at: null,
+                    }),
+                ],
+                threadMeta: {
+                    status: 'active',
+                    total_turns: 3,
+                    config_name: 'session_base',
+                },
+                sessionState: {
+                    thread_id: 'socketless',
+                    permission_mode: 'supervised',
+                    narration_mode: 'verbose',
+                    turn_count: 3,
+                    turn_in_flight: false,
+                    message_count: 6,
+                    model: null,
+                    temperature: 0.2,
+                    running_tool: null,
+                    pending_permissions: [],
+                    event_cursor: {epoch: 2, seq: 19},
+                    replay_cursor: {epoch: 2, seq: 18},
+                    snapshot_source: 'durable_journal',
+                },
+            }),
+        );
+
+        await ctx.service.connect('socketless');
+        fireSseOpen(ctx.sseInstances[0]);
+        (ctx.service as any)._ensureControlWs();
+        (ctx.service as any)._revalidateConnection();
+
+        expect(ctx.service.sessionReady()).toBe(true);
+        expect(ctx.service.permissionMode()).toBe('supervised');
+        expect(ctx.service.narrationMode()).toBe('verbose');
+        // An expert profile is not a model name; an unresolved model stays
+        // unknown instead of rendering `session_base` as though it were one.
+        expect(ctx.service.modelName()).toBeNull();
+        expect(ctx.wsInstances).toHaveLength(0);
+        expect((ctx.service as any).controlWsReconnectAttempt).toBe(0);
+        expect((ctx.service as any).controlWsReconnectTimer).toBeNull();
+        const connectionGets = ctx.mockHttp.get.mock.calls.filter((c: any) =>
+            String(c[0]).endsWith('/api/sessions/socketless/connection'),
+        );
+        expect(connectionGets).toHaveLength(1);
+    });
+
+    it('keeps a socketless session unready when its REST state cannot be loaded', async () => {
+        const ctx = createService();
+        const get = connectGetMock({
+            connectionResponses: [
+                of({
+                    state: 'ready',
+                    control_socket: 'none',
+                    ws_url: null,
+                    token: null,
+                    expires_at: null,
+                }),
+            ],
+        });
+        ctx.mockHttp.get.mockImplementation((url: string) =>
+            url.endsWith('/state')
+                ? throwError(() => ({status: 503}))
+                : get(url),
+        );
+
+        await ctx.service.connect('state-unavailable');
+        fireSseOpen(ctx.sseInstances[0]);
+        (ctx.service as any)._ensureControlWs();
+        (ctx.service as any)._revalidateConnection(true);
+        fireSseOpen(ctx.sseInstances[ctx.sseInstances.length - 1]);
+
+        expect(ctx.service.sessionReady()).toBe(false);
+        expect(ctx.service.error()).toBe('Session state unavailable');
+        expect(ctx.wsInstances).toHaveLength(0);
+        expect((ctx.service as any).controlWsReconnectTimer).toBeNull();
+    });
+
+    it('retries a failed socketless snapshot on explicit reconnect', async () => {
+        const ctx = createService();
+        const get = connectGetMock({
+            connectionResponses: [of({
+                state: 'ready',
+                control_socket: 'none',
+                ws_url: null,
+                token: null,
+                expires_at: null,
+            })],
+        });
+        let stateReads = 0;
+        ctx.mockHttp.get.mockImplementation((url: string) => {
+            if (url.endsWith('/state') && stateReads++ === 0) {
+                return throwError(() => ({status: 503}));
+            }
+            return get(url);
+        });
+
+        await ctx.service.connect('state-recovers');
+        expect(ctx.service.sessionReady()).toBe(false);
+        expect(ctx.service.error()).toBe('Session state unavailable');
+
+        ctx.service.reconnectNow();
+        await new Promise((resolve) => setTimeout(resolve, 0));
+
+        expect(stateReads).toBe(2);
+        expect(ctx.sseInstances).toHaveLength(2);
+        expect(ctx.service.sessionReady()).toBe(true);
+        expect(ctx.service.error()).toBeNull();
+        expect(ctx.wsInstances).toHaveLength(0);
+    });
+
+    it('re-gates an already-ready socketless session when snapshot refresh fails', async () => {
+        const ctx = createService();
+        const get = connectGetMock({
+            connectionResponses: [of({
+                state: 'ready',
+                control_socket: 'none',
+                ws_url: null,
+                token: null,
+                expires_at: null,
+            })],
+        });
+        ctx.mockHttp.get.mockImplementation(get);
+        await ctx.service.connect('state-refresh-fails');
+        expect(ctx.service.sessionReady()).toBe(true);
+
+        ctx.mockHttp.get.mockImplementation((url: string) =>
+            url.endsWith('/state')
+                ? throwError(() => ({status: 503}))
+                : get(url),
+        );
+        await (ctx.service as any)._loadSessionState(
+            'state-refresh-fails',
+            (ctx.service as any).connectGeneration,
+        );
+
+        expect(ctx.service.sessionReady()).toBe(false);
+        expect(ctx.service.error()).toBe('Session state unavailable');
+        expect((ctx.service as any).controlSocket).toBe('none');
+    });
+
+    it.each([
+        {
+            label: 'declared websocket',
+            connection: {
+                state: 'ready',
+                control_socket: 'websocket',
+                ws_url: null,
+                token: null,
+                expires_at: null,
+            },
+        },
+        {
+            label: 'legacy response without a discriminator',
+            connection: {
+                state: 'ready',
+                ws_url: null,
+                token: null,
+                expires_at: null,
+            },
+        },
+    ])('normalizes a null ws_url from $label to stable socketless transport', async ({connection}) => {
+        const ctx = createService();
+        ctx.mockHttp.get.mockImplementation(
+            connectGetMock({
+                connectionResponses: [of(connection)],
+            }),
+        );
+
+        await ctx.service.connect('null-ws-version-skew');
+        (ctx.service as any)._ensureControlWs();
+        (ctx.service as any)._revalidateConnection();
+
+        expect(ctx.service.sessionReady()).toBe(true);
+        expect(ctx.wsInstances).toHaveLength(0);
+        expect((ctx.service as any).controlSocket).toBe('none');
+        expect((ctx.service as any).controlWsReconnectTimer).toBeNull();
+    });
+
+    it('does not require IndexedDB when the durable snapshot is available', async () => {
+        const ctx = createService();
+        ctx.mockCache.getThreadCursor.mockRejectedValue(new Error('IDB unavailable'));
+        ctx.mockHttp.get.mockImplementation(
+            connectGetMock({
+                connectionResponses: [of({
+                    state: 'ready',
+                    control_socket: 'none',
+                    ws_url: null,
+                    token: null,
+                    expires_at: null,
+                })],
+            }),
+        );
+
+        await ctx.service.connect('no-idb');
+
+        expect(ctx.service.sessionReady()).toBe(true);
+        expect(ctx.sseInstances).toHaveLength(1);
+        expect(ctx.sseInstances[0].url).toContain('last_event_id=0%3A0');
+        expect(ctx.wsInstances).toHaveLength(0);
+    });
+
+    it('hydrates a socketless pending gate and running tool from REST state', async () => {
+        const ctx = createService({cursor: {epoch: 5, seq: 80}});
+        ctx.mockHttp.get.mockImplementation(
+            connectGetMock({
+                connectionResponses: [of({
+                    state: 'ready',
+                    control_socket: 'none',
+                    ws_url: null,
+                    token: null,
+                    expires_at: null,
+                })],
+                sessionState: {
+                    thread_id: 'stateful',
+                    permission_mode: 'supervised',
+                    narration_mode: 'auto',
+                    turn_count: 8,
+                    turn_in_flight: true,
+                    message_count: 17,
+                    model: 'claude-sonnet-4-6',
+                    temperature: 0.4,
+                    running_tool: {id: 'tool-live', tool: 'run_command', args: {cmd: 'make'}},
+                    pending_permissions: [{
+                        id: 'tool-gated',
+                        approval_id: 'approval-gated',
+                        tool: 'write_file',
+                        args: {path: 'README.md'},
+                    }],
+                    event_cursor: {epoch: 5, seq: 82},
+                    replay_cursor: {epoch: 5, seq: 78},
+                    snapshot_source: 'durable_journal',
+                },
+            }),
+        );
+
+        await ctx.service.connect('stateful');
+
+        // Replay begins at the server's tab-local floor, not at the shared
+        // IndexedDB cursor. These covered frames reconstruct transcript order
+        // without replacing the snapshot's authoritative pending list.
+        ctx.mockCache.getThreadCursor.mockResolvedValue({epoch: 5, seq: 999});
+        fireSseMessage(ctx.sseInstances[0], {method: 'ready', params: {}}, '5:79');
+        fireSseMessage(
+            ctx.sseInstances[0],
+            {method: 'turn.started', params: {turn_id: 8}},
+            '5:80',
+        );
+        fireSseMessage(
+            ctx.sseInstances[0],
+            {
+                method: 'permission.request',
+                params: {
+                    id: 'tool-gated',
+                    approval_id: 'approval-gated',
+                    tool: 'write_file',
+                    args: {path: 'README.md'},
+                },
+            },
+            '5:81',
+        );
+
+        expect(ctx.service.runningTool()).toEqual({
+            id: 'tool-live', tool: 'run_command', args: {cmd: 'make'},
+        });
+        expect(ctx.service.pendingPermissions()).toEqual([{
+            id: 'tool-gated',
+            approvalId: 'approval-gated',
+            tool: 'write_file',
+            args: {path: 'README.md'},
+        }]);
+        expect(ctx.service.isStreaming()).toBe(true);
+        expect(ctx.wsInstances).toHaveLength(0);
+        expect(ctx.sseInstances[0].url).toContain('last_event_id=5%3A78');
+        expect(ctx.mockCache.getThreadCursor).not.toHaveBeenCalled();
+        const liveTurns = ctx.service.turns().filter(isAssistantTurn) as AssistantTurn[];
+        expect(liveTurns).toHaveLength(1);
+        expect(liveTurns[0].id).toBe('8');
+        expect(liveTurns[0].events).toEqual([
+            expect.objectContaining({kind: 'tool_call', id: 'tool-gated', status: 'pending'}),
+        ]);
+
+        // A second tab has advanced the shared cursor to 999, but this tab has
+        // only folded through 81. Focus recovery must resume from 81 so the
+        // resolution at 83 cannot be skipped.
+        (ctx.service as any)._revalidateConnection(true);
+        expect(ctx.sseInstances[1].url).toContain('last_event_id=5%3A81');
+        fireSseMessage(
+            ctx.sseInstances[1],
+            {
+                method: 'permission.resolved',
+                params: {id: 'tool-gated', decision: 'approved'},
+            },
+            '5:83',
+        );
+        expect(ctx.service.pendingPermissions()).toEqual([]);
+    });
+
+    it('restores a socketless approval card when its durable REST decision fails', async () => {
+        const ctx = createService();
+        ctx.mockHttp.get.mockImplementation(
+            connectGetMock({
+                connectionResponses: [of({
+                    state: 'ready',
+                    control_socket: 'none',
+                    ws_url: null,
+                    token: null,
+                    expires_at: null,
+                })],
+                sessionState: {
+                    thread_id: 'approval-retry',
+                    permission_mode: 'supervised',
+                    narration_mode: 'auto',
+                    turn_count: 3,
+                    turn_in_flight: true,
+                    message_count: 1,
+                    model: 'gpt-5.4',
+                    temperature: 0.2,
+                    running_tool: null,
+                    pending_permissions: [{
+                        id: 'tool-retry',
+                        approval_id: 'approval-retry-id',
+                        tool: 'run_command',
+                        args: {cmd: 'make test'},
+                    }],
+                    event_cursor: {epoch: 3, seq: 2},
+                    replay_cursor: {epoch: 3, seq: 0},
+                    snapshot_source: 'durable_journal',
+                },
+            }),
+        );
+        ctx.mockHttp.post.mockImplementation((url: string) =>
+            url.includes('/approve/')
+                ? throwError(() => ({status: 503}))
+                : of({}),
+        );
+
+        await ctx.service.connect('approval-retry');
+        fireSseMessage(
+            ctx.sseInstances[0],
+            {method: 'turn.started', params: {turn_id: 3}},
+            '3:1',
+        );
+        fireSseMessage(
+            ctx.sseInstances[0],
+            {
+                method: 'permission.request',
+                params: {
+                    id: 'tool-retry',
+                    approval_id: 'approval-retry-id',
+                    tool: 'run_command',
+                    args: {cmd: 'make test'},
+                },
+            },
+            '3:2',
+        );
+
+        ctx.service.approveAll();
+
+        expect(ctx.service.pendingPermissions()).toEqual([{
+            id: 'tool-retry',
+            approvalId: 'approval-retry-id',
+            tool: 'run_command',
+            args: {cmd: 'make test'},
+        }]);
+        expect((ctx.service as any).controlOutbox).toEqual([]);
+        expect(ctx.wsInstances).toHaveLength(0);
+        expect(ctx.service.error()).toContain('still pending');
+        const assistant = ctx.service.turns().find(isAssistantTurn) as AssistantTurn;
+        const toolEvent = assistant.events.find((event) => event.id === 'tool-retry');
+        expect(toolEvent).toEqual(expect.objectContaining({
+            kind: 'tool_call',
+            id: 'tool-retry',
+            status: 'pending',
+        }));
+        expect((toolEvent as ToolCallEvent).decision).toBeUndefined();
+
+        // A masked commit or another tab can resolve after the error. That
+        // proof clears both the card and the now-stale retry banner.
+        fireSseMessage(
+            ctx.sseInstances[0],
+            {
+                method: 'permission.resolved',
+                params: {id: 'tool-retry', decision: 'approved'},
+            },
+            '3:3',
+        );
+        expect(ctx.service.pendingPermissions()).toEqual([]);
+        expect(ctx.service.error()).toBeNull();
+    });
+
+    it('applies REST state before cursor replay so a mid-turn prefix stays one bubble', async () => {
+        const ctx = createService({cursor: {epoch: 2, seq: 40}});
+        ctx.mockHttp.get.mockImplementation(
+            connectGetMock({
+                messages: [
+                    {
+                        id: 'u7',
+                        role: 'human',
+                        content: 'Revise the draft',
+                        tool_calls: null,
+                        turn_number: 7,
+                        created_at: '2026-08-05T14:00:00Z',
+                    },
+                    {
+                        id: 'a7-prefix',
+                        role: 'ai',
+                        content: 'I will apply those revisions now.',
+                        tool_calls: null,
+                        turn_number: 7,
+                        created_at: '2026-08-05T14:00:01Z',
+                    },
+                ],
+                connectionResponses: [of({
+                    state: 'ready',
+                    control_socket: 'none',
+                    ws_url: null,
+                    token: null,
+                    expires_at: null,
+                })],
+                sessionState: {
+                    thread_id: 'midturn-rest',
+                    permission_mode: 'supervised',
+                    narration_mode: 'auto',
+                    turn_count: 7,
+                    turn_in_flight: true,
+                    message_count: 2,
+                    model: 'gpt-5.4',
+                    temperature: 0.2,
+                    running_tool: null,
+                    pending_permissions: [],
+                    event_cursor: {epoch: 2, seq: 40},
+                    replay_cursor: {epoch: 2, seq: 38},
+                    snapshot_source: 'durable_journal',
+                },
+            }),
+        );
+
+        await ctx.service.connect('midturn-rest');
+        fireSseMessage(
+            ctx.sseInstances[0],
+            {method: 'turn.started', params: {turn_id: 7}},
+            '2:39',
+        );
+        fireSseMessage(
+            ctx.sseInstances[0],
+            {method: 'token', params: {content: 'I will apply those revisions now.'}},
+            '2:40',
+        );
+        fireSseMessage(
+            ctx.sseInstances[0],
+            {method: 'token', params: {content: 'The matrix is updated.'}},
+            '2:41',
+        );
+        (ctx.service as any)._flushDeltas();
+
+        const assistants = ctx.service.turns().filter(isAssistantTurn) as AssistantTurn[];
+        expect(assistants).toHaveLength(1);
+        expect(assistants[0].id).toBe('7');
+        expect(assistants[0].status).toBe('streaming');
+        // Adjacent token frames are coalesced, but the persisted prefix is
+        // rebuilt exactly once before the live suffix.
+        expect(assistants[0].events.map((event) => (event as TextEvent).content)).toEqual([
+            'I will apply those revisions now.The matrix is updated.',
+        ]);
+        expect(ctx.service.turnCount()).toBe(7);
+    });
+
+    it('resumes a same-thread reconnect from this tab cursor without replaying its prefix', async () => {
+        const ctx = createService();
+        ctx.mockHttp.get.mockImplementation((url: string) => {
+            if (url.endsWith('/messages')) return of({messages: [], total: 0});
+            if (url.endsWith('/state')) {
+                return of({
+                    thread_id: 'same-thread-live',
+                    permission_mode: 'supervised',
+                    narration_mode: 'auto',
+                    turn_count: 7,
+                    turn_in_flight: true,
+                    message_count: 1,
+                    model: 'gpt-5.4',
+                    temperature: 0.2,
+                    running_tool: null,
+                    pending_permissions: [],
+                    event_cursor: {epoch: 2, seq: 40},
+                    replay_cursor: {epoch: 2, seq: 38},
+                    snapshot_source: 'durable_journal',
+                });
+            }
+            if (url.endsWith('/connection')) {
+                return of({
+                    state: 'ready',
+                    control_socket: 'none',
+                    ws_url: null,
+                    token: null,
+                    expires_at: null,
+                });
+            }
+            if (url.endsWith('/citations')) return of({citations: []});
+            return of({status: 'active', total_turns: 7});
+        });
+
+        await ctx.service.connect('same-thread-live');
+        fireSseMessage(
+            ctx.sseInstances[0],
+            {method: 'turn.started', params: {turn_id: 7}},
+            '2:39',
+        );
+        fireSseMessage(
+            ctx.sseInstances[0],
+            {method: 'token', params: {content: 'prefix'}},
+            '2:40',
+        );
+        (ctx.service as any)._flushDeltas();
+
+        await ctx.service.connect('same-thread-live');
+
+        expect(ctx.sseInstances[1].url).toContain('last_event_id=2%3A40');
+        fireSseMessage(
+            ctx.sseInstances[1],
+            {method: 'token', params: {content: '-suffix'}},
+            '2:41',
+        );
+        (ctx.service as any)._flushDeltas();
+
+        const assistants = ctx.service.turns().filter(isAssistantTurn) as AssistantTurn[];
+        expect(assistants).toHaveLength(1);
+        expect(assistants[0].status).toBe('streaming');
+        expect(
+            assistants[0].events.map((event) => (event as TextEvent).content).join(''),
+        ).toBe('prefix-suffix');
+        expect(ctx.mockCache.getThreadCursor).not.toHaveBeenCalled();
+    });
+
+    it('cold-repaints retained same-thread state when the journal epoch changed', async () => {
+        const ctx = createService();
+        let stateRead = 0;
+        ctx.mockHttp.get.mockImplementation((url: string) => {
+            if (url.includes('/messages')) return of({messages: [], total: 0});
+            if (url.endsWith('/state')) {
+                stateRead += 1;
+                const epoch = stateRead === 1 ? 1 : 2;
+                return of({
+                    thread_id: 'same-thread-new-epoch',
+                    permission_mode: 'supervised',
+                    narration_mode: 'auto',
+                    turn_count: 1,
+                    turn_in_flight: true,
+                    message_count: 1,
+                    model: 'gpt-5.4',
+                    temperature: 0.2,
+                    running_tool: null,
+                    pending_permissions: [],
+                    event_cursor: {epoch, seq: 2},
+                    replay_cursor: {epoch, seq: 0},
+                    snapshot_source: 'durable_journal',
+                });
+            }
+            if (url.endsWith('/connection')) {
+                return of({
+                    state: 'ready',
+                    control_socket: 'none',
+                    ws_url: null,
+                    token: null,
+                    expires_at: null,
+                });
+            }
+            if (url.endsWith('/citations')) return of({citations: []});
+            return of({status: 'active', total_turns: 1});
+        });
+
+        await ctx.service.connect('same-thread-new-epoch');
+        fireSseMessage(
+            ctx.sseInstances[0],
+            {method: 'turn.started', params: {turn_id: 1}},
+            '1:1',
+        );
+        fireSseMessage(
+            ctx.sseInstances[0],
+            {method: 'token', params: {content: 'old epoch'}},
+            '1:2',
+        );
+        (ctx.service as any)._flushDeltas();
+
+        await ctx.service.connect('same-thread-new-epoch');
+
+        expect(ctx.mockCache.clearThreadMessages).toHaveBeenCalledWith(
+            'same-thread-new-epoch',
+        );
+        expect(ctx.mockCache.deleteThreadCursor).toHaveBeenCalledWith(
+            'same-thread-new-epoch',
+        );
+        expect(ctx.sseInstances[1].url).toContain('last_event_id=2%3A0');
+        fireSseMessage(
+            ctx.sseInstances[1],
+            {method: 'turn.started', params: {turn_id: 1}},
+            '2:1',
+        );
+        fireSseMessage(
+            ctx.sseInstances[1],
+            {method: 'token', params: {content: 'new epoch'}},
+            '2:2',
+        );
+        (ctx.service as any)._flushDeltas();
+
+        const assistants = ctx.service.turns().filter(isAssistantTurn) as AssistantTurn[];
+        expect(assistants).toHaveLength(1);
+        expect(
+            assistants[0].events.map((event) => (event as TextEvent).content).join(''),
+        ).toBe('new epoch');
+    });
+
+    it('cold-repaints when a same-epoch retained cursor fell behind the replay floor', async () => {
+        const ctx = createService();
+        let stateRead = 0;
+        let messageRead = 0;
+        ctx.mockHttp.get.mockImplementation((url: string) => {
+            if (url.includes('/messages')) {
+                messageRead += 1;
+                if (messageRead === 1) return of({messages: [], total: 0});
+                return of({
+                    messages: [{
+                        id: 'a9-history',
+                        role: 'ai',
+                        content: 'completed in another tab',
+                        tool_calls: null,
+                        turn_number: 9,
+                        created_at: '2026-08-08T20:00:00Z',
+                    }],
+                    total: 1,
+                });
+            }
+            if (url.endsWith('/state')) {
+                stateRead += 1;
+                const advanced = stateRead > 1;
+                return of({
+                    thread_id: 'same-epoch-gap',
+                    permission_mode: 'supervised',
+                    narration_mode: 'auto',
+                    turn_count: advanced ? 10 : 1,
+                    turn_in_flight: true,
+                    message_count: advanced ? 10 : 1,
+                    model: 'gpt-5.4',
+                    temperature: 0.2,
+                    running_tool: null,
+                    pending_permissions: [],
+                    event_cursor: {epoch: 2, seq: advanced ? 102 : 2},
+                    replay_cursor: {epoch: 2, seq: advanced ? 99 : 0},
+                    snapshot_source: 'durable_journal',
+                });
+            }
+            if (url.endsWith('/connection')) {
+                return of({
+                    state: 'ready',
+                    control_socket: 'none',
+                    ws_url: null,
+                    token: null,
+                    expires_at: null,
+                });
+            }
+            if (url.endsWith('/citations')) return of({citations: []});
+            return of({status: 'active', total_turns: stateRead > 1 ? 10 : 1});
+        });
+
+        await ctx.service.connect('same-epoch-gap');
+        fireSseMessage(
+            ctx.sseInstances[0],
+            {method: 'turn.started', params: {turn_id: 1}},
+            '2:1',
+        );
+        fireSseMessage(
+            ctx.sseInstances[0],
+            {method: 'token', params: {content: 'old local turn'}},
+            '2:2',
+        );
+        (ctx.service as any)._flushDeltas();
+
+        await ctx.service.connect('same-epoch-gap');
+
+        expect(ctx.mockCache.clearThreadMessages).toHaveBeenCalledWith('same-epoch-gap');
+        expect(ctx.sseInstances[1].url).toContain('last_event_id=2%3A99');
+        expect(
+            (ctx.service.turns().find(isAssistantTurn) as AssistantTurn).events
+                .map((event) => (event as TextEvent).content)
+                .join(''),
+        ).toBe('completed in another tab');
+
+        fireSseMessage(
+            ctx.sseInstances[1],
+            {method: 'turn.started', params: {turn_id: 10}},
+            '2:100',
+        );
+        fireSseMessage(
+            ctx.sseInstances[1],
+            {method: 'token', params: {content: 'latest live turn'}},
+            '2:101',
+        );
+        (ctx.service as any)._flushDeltas();
+
+        const assistants = ctx.service.turns().filter(isAssistantTurn) as AssistantTurn[];
+        expect(assistants).toHaveLength(2);
+        expect(
+            assistants.map((turn) =>
+                turn.events.map((event) => (event as TextEvent).content).join(''),
+            ),
+        ).toEqual(['completed in another tab', 'latest live turn']);
+    });
+
+    it.each([
+        {method: 'ready', params: {}},
+        {method: 'turn.error', params: {message: 'covered failure', turn_id: 7}},
+    ])('uses a covered $method frame as a transcript terminal boundary', async (terminal) => {
+        const ctx = createService();
+        ctx.mockHttp.get.mockImplementation(
+            connectGetMock({
+                connectionResponses: [of({
+                    state: 'ready',
+                    control_socket: 'none',
+                    ws_url: null,
+                    token: null,
+                    expires_at: null,
+                })],
+                sessionState: {
+                    thread_id: 'covered-terminal',
+                    permission_mode: 'supervised',
+                    narration_mode: 'auto',
+                    turn_count: 7,
+                    turn_in_flight: false,
+                    message_count: 1,
+                    model: null,
+                    temperature: null,
+                    running_tool: null,
+                    pending_permissions: [],
+                    event_cursor: {epoch: 2, seq: 42},
+                    replay_cursor: {epoch: 2, seq: 38},
+                    snapshot_source: 'durable_journal',
+                },
+            }),
+        );
+
+        await ctx.service.connect('covered-terminal');
+        fireSseMessage(
+            ctx.sseInstances[0],
+            {method: 'turn.started', params: {turn_id: 7}},
+            '2:39',
+        );
+        fireSseMessage(
+            ctx.sseInstances[0],
+            {method: 'token', params: {content: 'partial'}},
+            '2:40',
+        );
+        fireSseMessage(ctx.sseInstances[0], terminal, '2:41');
+        (ctx.service as any)._flushDeltas();
+
+        expect(ctx.service.isStreaming()).toBe(false);
+        const assistant = ctx.service.turns().find(isAssistantTurn) as AssistantTurn;
+        expect(assistant.status).not.toBe('streaming');
+    });
+
     it('cold start (425 → prepare → poll /connection until ready): WS opens at final ws_url', async () => {
         const ctx = createService();
 
@@ -2815,6 +3758,7 @@ describe('PersistentChatService — direct session WS (prepare + connection)', (
                     throwError(() => ({status: 425})),
                     of({
                         state: 'ready',
+                        control_socket: 'websocket',
                         ws_url: 'wss://api.example.com/p/t2/ws?t=tok-cold',
                         token: 'tok-cold',
                         expires_at: 0,
@@ -2981,9 +3925,7 @@ describe('PersistentChatService — disconnect()', () => {
 
     it('closes both SSE and control WS, resets signals', async () => {
         const ctx = createService();
-        ctx.mockHttp.get.mockImplementation(() =>
-            of({status: 'active', total_turns: 0, messages: [], total: 0}),
-        );
+        ctx.mockHttp.get.mockImplementation(activeSessionGet);
         await ctx.service.connect('thread-d');
         fireSseOpen(ctx.sseInstances[0]);
 
@@ -3013,9 +3955,7 @@ describe('PersistentChatService — endSession()', () => {
 
     it('DELETEs the thread, tears down SSE/WS, resets state', async () => {
         const ctx = createService();
-        ctx.mockHttp.get.mockImplementation(() =>
-            of({status: 'active', total_turns: 0, messages: [], total: 0}),
-        );
+        ctx.mockHttp.get.mockImplementation(activeSessionGet);
         await ctx.service.connect('thread-e');
         fireSseOpen(ctx.sseInstances[0]);
 
@@ -3511,9 +4451,7 @@ describe('PersistentChatService — inline workspace upgrade offer', () => {
     /** Connected + agent-ready, so sendMessage POSTs instead of queueing. */
     async function readySession() {
         const ctx = createService();
-        ctx.mockHttp.get.mockImplementation(() =>
-            of({status: 'active', total_turns: 0, messages: [], total: 0}),
-        );
+        ctx.mockHttp.get.mockImplementation(activeSessionGet);
         await ctx.service.connect('thread-wo');
         fireSseOpen(ctx.sseInstances[0]);
         fireSseMessage(ctx.sseInstances[0], {method: 'ready', params: {}}, '1:1');

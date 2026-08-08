@@ -286,6 +286,7 @@ POST   /api/persistent/threads/{thread_id}/interrupt                            
 GET    /api/persistent/threads/{thread_id}/logs                                         gated:require_thread_owner
 GET    /api/persistent/threads/{thread_id}/messages                                     gated:require_thread_owner
 POST   /api/persistent/threads/{thread_id}/resume                                       gated:require_thread_owner
+GET    /api/persistent/threads/{thread_id}/state                                        gated:require_thread_owner
 GET    /api/persistent/threads/{thread_id}/stream                                       gated:require_thread_owner
 GET    /api/persistent/threads/{thread_id}/tool-groups                                  gated:require_thread_owner
 POST   /api/persistent/threads/{thread_id}/transcribe                                   gated:require_thread_owner

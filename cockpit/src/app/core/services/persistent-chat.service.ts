@@ -304,17 +304,38 @@ export interface CompactionProgressState {
     startedAt: number;
 }
 
-/**
- * Response payload for ``GET /api/sessions/{thread_id}/connection`` — the
- * canonical WS URL + JWT for a bound session. The cockpit dials the WS at
- * `ws_url` directly (routed to the agent pod by the orchestrator's edge
- * proxy). See orchestrator/routers/sessions.py for the response shape.
- */
-interface ConnectionPayload {
+/** Lane-free control-socket discovery. The server may carry additional
+ * execution details, but the Cockpit discriminates only on transport. */
+type ConnectionPayload = {
     state: 'ready';
+    control_socket: 'websocket';
     ws_url: string;
     token: string;
     expires_at: number;
+} | {
+    state: 'ready';
+    control_socket: 'none';
+    ws_url: null;
+    token: null;
+    expires_at: null;
+};
+
+/** Durable REST twin of the agent's direct ``session.state`` welcome frame. */
+interface SessionStateSnapshot extends Record<string, unknown> {
+    thread_id: string;
+    permission_mode: PermissionMode;
+    narration_mode: NarrationMode;
+    turn_count: number;
+    turn_in_flight: boolean;
+    message_count: number;
+    model: string | null;
+    temperature: number | null;
+    running_tool: RunningToolInfo | null;
+    pending_permissions: unknown[];
+    event_cursor: {epoch: number; seq: number};
+    /** Exclusive journal floor that reconstructs the latest logical turn. */
+    replay_cursor: {epoch: number; seq: number};
+    snapshot_source: 'durable_journal';
 }
 
 /**
@@ -605,6 +626,7 @@ export class PersistentChatService {
      *  all of its calls here at once so one card can list them —
      *  docs/superpowers/specs/2026-08-01-batch-tool-approval-design.md. */
     readonly pendingPermissions = signal<PermissionRequest[]>([]);
+    private readonly permissionResolutionFailures = new Set<string>();
 
     // --- Running-command snapshot ---
     // Set from the session.state welcome frame on (re)attach when the loop is
@@ -836,11 +858,30 @@ export class PersistentChatService {
     // refreshed with zero real data in exactly the zombie-stream case, so the
     // send-kickstart must key off this clean data-only clock.
     private sseDataLastAt = 0;
-    // True for the current explicit SSE open when replay starts from the
-    // browser's cached cursor. Only that shape has a suffix to join onto REST
-    // history; a no-cursor cold attach replays the whole in-flight turn and
-    // must not concatenate that full copy onto its persisted prefix.
+    // True for the current explicit SSE open when replay starts from a cursor.
+    // The durable snapshot supplies a full-turn replay floor; the legacy
+    // pinned fallback can still use a browser cursor and join only its suffix.
     private sseOpenedWithCursor = false;
+    // The DB-authoritative REST snapshot was applied for this connection.
+    // A socketless /connection response may unblock the composer only after
+    // this is true; otherwise a supervised gate could be live but invisible.
+    private sessionSnapshotLoaded = false;
+    private sessionSnapshotFailed = false;
+    // Journal high-water covered by the durable snapshot. Replay starts from
+    // its turn-boundary floor, but stateful frames at/below this cursor must
+    // not overwrite the newer permission/runtime scalars we just hydrated.
+    private sessionSnapshotCursor: {epoch: number; seq: number} | null = null;
+    // Same-thread reconnects retain their already-rendered live turn. When the
+    // tab's own cursor is newer than the snapshot's turn-boundary floor, the
+    // snapshot reopens that retained turn and SSE resumes after the tab's last
+    // folded frame instead of replaying/doubling the prefix.
+    private snapshotJoinsPreservedTurn = false;
+    // Tab-local resume point. IndexedDB is shared by every tab, so consulting
+    // it again after the snapshot lets another tab advance us past a state
+    // change this tab has not applied. `undefined` means no snapshot supplied
+    // a floor and _openSse should best-effort fall back to IndexedDB; `null`
+    // deliberately opens with the server's no-cursor behavior.
+    private sseReplayCursor: {epoch: number; seq: number} | null | undefined;
     // Single-flight generation for _openSse. Bumped at every open attempt and in
     // disconnect(); an open whose generation is stale after its async cursor
     // fetch bails instead of installing a resurrected EventSource on a
@@ -865,6 +906,10 @@ export class PersistentChatService {
     private deltaFlushTimer: ReturnType<typeof setTimeout> | null = null;
     private static readonly DELTA_FLUSH_MS = 80;
     private controlWs: WebSocket | null = null;
+    // Transport capability discovered from /connection. ``none`` is a stable
+    // ready state, not a failed WebSocket open; remember it so focus/SSE
+    // recovery and user actions cannot restart the reconnect ladder.
+    private controlSocket: 'unknown' | 'websocket' | 'none' = 'unknown';
     private controlWsReconnectTimer: ReturnType<typeof setTimeout> | null = null;
     private controlWsReconnectAttempt = 0;
     private controlWsLastMessageAt = 0;
@@ -920,6 +965,7 @@ export class PersistentChatService {
         opts: { carryOutbox?: boolean } = {},
     ): Promise<void> {
         const sameThread = this.threadId() === threadId && this.historyLoaded();
+        const preservedReplayCursor = sameThread ? this.sseReplayCursor : undefined;
         this.disconnect();
         const generation = this.connectGeneration;
         this.isDraftSession.set(false);
@@ -992,6 +1038,13 @@ export class PersistentChatService {
         }
 
         this.intentionalClose = false;
+        await this._loadSessionState(
+            threadId,
+            generation,
+            preservedReplayCursor,
+            sameThread,
+        );
+        if (!this._isCurrentConnect(threadId, generation)) return;
         await this._openSse(threadId);
         if (!this._isCurrentConnect(threadId, generation)) return;
         await this._openControlWs(threadId);
@@ -1317,7 +1370,10 @@ export class PersistentChatService {
             if (!this._isCurrentThreadRequest(threadId, generation)) return;
             this.sessionTitle.set(thread.title || null);
             const model = thread.metadata?.config_override?.llm?.model;
-            this.modelName.set(model || thread.config_name || null);
+            // `config_name` is an expert profile (normally `session_base`),
+            // not an LLM model.  Leave the display unknown until the resolved
+            // session-state snapshot supplies the effective model.
+            this.modelName.set(model || null);
             const temperature = thread.metadata?.config_override?.llm?.temperature;
             if (temperature != null) {
                 this.temperature.set(temperature);
@@ -1333,6 +1389,117 @@ export class PersistentChatService {
             }
         } catch {
             // Non-fatal — UI will show fallback values
+        }
+    }
+
+    /**
+     * Hydrate the lane-free durable state before opening SSE. The server
+     * returns a snapshot-consistent replay floor just before the latest turn;
+     * replay rebuilds that logical turn, closes the REST-history/completion
+     * race, then applies frames newer than event_cursor normally.
+     */
+    private async _loadSessionState(
+        threadId: string,
+        generation?: number,
+        preservedReplayCursor?: {epoch: number; seq: number} | null,
+        retainedConversation = false,
+    ): Promise<void> {
+        this.sessionSnapshotLoaded = false;
+        this.sessionSnapshotFailed = false;
+        this.sessionSnapshotCursor = null;
+        this.snapshotJoinsPreservedTurn = false;
+        this.sseReplayCursor = undefined;
+        try {
+            const snapshot = await firstValueFrom(
+                this.http.get<SessionStateSnapshot>(
+                    `${environment.apiUrl}/persistent/threads/${threadId}/state`,
+                ),
+            );
+            if (!this._isCurrentThreadRequest(threadId, generation)) return;
+            // A mismatched payload is never allowed to paint the current tab,
+            // even if an intermediary returned a cached 200 for another URL.
+            if (snapshot.thread_id !== threadId) {
+                throw new Error('session-state thread mismatch');
+            }
+            const eventCursor = snapshot.event_cursor;
+            const replayCursor = snapshot.replay_cursor;
+            if (
+                !eventCursor ||
+                !Number.isFinite(eventCursor.epoch) ||
+                !Number.isFinite(eventCursor.seq) ||
+                !replayCursor ||
+                !Number.isFinite(replayCursor.epoch) ||
+                !Number.isFinite(replayCursor.seq) ||
+                replayCursor.epoch !== eventCursor.epoch ||
+                replayCursor.seq > eventCursor.seq
+            ) {
+                throw new Error('invalid session-state cursor contract');
+            }
+            const hasPreservedCursor = !!(
+                preservedReplayCursor &&
+                Number.isFinite(preservedReplayCursor.epoch) &&
+                Number.isFinite(preservedReplayCursor.seq)
+            );
+            const canPreserveCursor = !!(
+                hasPreservedCursor &&
+                preservedReplayCursor!.epoch === eventCursor.epoch &&
+                preservedReplayCursor!.seq >= replayCursor.seq &&
+                preservedReplayCursor!.seq <= eventCursor.seq
+            );
+            if (retainedConversation && !canPreserveCursor) {
+                // An epoch change invalidates both the retained live turn and
+                // the append-only message cache (rewind is one bump source).
+                // A same-epoch cursor older than replay_cursor is unsafe too:
+                // another tab may have completed whole turns since this tab's
+                // last frame, and latest-turn replay would skip that history.
+                // Repaint before replay so neither shape leaves a gap or mixes
+                // two session lives.
+                this.dispatch({type: 'reset', threadId});
+                this.historyLoaded.set(false);
+                try {
+                    await this.cache.clearThreadMessages(threadId);
+                } catch {
+                    // IndexedDB is optional; the REST full load below remains
+                    // authoritative even when local cache cleanup fails.
+                }
+                try {
+                    await this.cache.deleteThreadCursor(threadId);
+                } catch {
+                    // Same as above: never block recovery on local storage.
+                }
+                if (!this._isCurrentThreadRequest(threadId, generation)) return;
+                await this.loadHistory(threadId, generation);
+                if (!this._isCurrentThreadRequest(threadId, generation)) return;
+                this._redispatchOutboxBubbles(true);
+            }
+            // Cold tabs rebuild the latest turn from the server floor. A
+            // same-thread reconnect keeps the conversation it already folded,
+            // so its own tab-local cursor is safe when it lies within this
+            // snapshot and at/after the floor. Shared IndexedDB is never used
+            // for this choice: another tab may have observed frames we did not.
+            const selectedReplayCursor = canPreserveCursor
+                ? preservedReplayCursor!
+                : replayCursor;
+            this.snapshotJoinsPreservedTurn = !!(
+                canPreserveCursor && selectedReplayCursor.seq > replayCursor.seq
+            );
+            this.sseOpenedWithCursor = true;
+            this.sseReplayCursor = selectedReplayCursor;
+            this.sessionSnapshotCursor = snapshot.event_cursor;
+            this._handleEvent(
+                {method: 'session.state', params: snapshot},
+                false,
+            );
+            this.sessionSnapshotLoaded = true;
+            if (this.error() === 'Session state unavailable') this.error.set(null);
+        } catch {
+            if (!this._isCurrentThreadRequest(threadId, generation)) return;
+            // Pinned sessions can still recover their exact state over the
+            // coexistence WebSocket. A socketless session stays unready: making
+            // its composer look usable while a gate is unrenderable is unsafe.
+            this.sessionSnapshotFailed = true;
+            if (this.controlSocket === 'none') this.sessionReady.set(false);
+            this.error.set('Session state unavailable');
         }
     }
 
@@ -1402,12 +1569,22 @@ export class PersistentChatService {
         // resurrect a stream on a closed or replaced session.
         const generation = ++this.sseGeneration;
 
-        const cursor = await this.cache.getThreadCursor(threadId);
+        let cursor = this.sseReplayCursor;
+        if (cursor === undefined) {
+            try {
+                cursor = await this.cache.getThreadCursor(threadId);
+            } catch {
+                // IndexedDB is an optimization, never a prerequisite for the
+                // live receive path (private mode/quota/corruption can reject).
+                cursor = null;
+            }
+        }
         if (
             generation !== this.sseGeneration ||
             this.intentionalClose ||
             this.threadId() !== threadId
         ) return;
+        this.sseReplayCursor = cursor;
         this.sseOpenedWithCursor = cursor != null;
 
         // ngsw-bypass keeps the Angular service worker out of the SSE path. Its
@@ -1435,7 +1612,7 @@ export class PersistentChatService {
             this.zone.run(() => {
                 const wasReconnecting = this.connectionState() !== 'connected';
                 this.connectionState.set('connected');
-                this.error.set(null);
+                if (!this.sessionSnapshotFailed) this.error.set(null);
                 this.reconnectAttempt.set(0);
                 this.reconnectGaveUp.set(false);
                 this._startSseWatchdog(threadId);
@@ -1586,6 +1763,7 @@ export class PersistentChatService {
         // tolerates re-receiving the same seq (it'll just be a no-op given
         // the seq > $3 guard server-side).
         this.currentFrameEpoch = null;
+        let currentFrameSeq: number | null = null;
         if (event.lastEventId) {
             const tid = this.threadId();
             if (tid) this._saveCursor(tid, event.lastEventId);
@@ -1593,6 +1771,8 @@ export class PersistentChatService {
             if (colon > 0) {
                 const parsed = Number(event.lastEventId.slice(0, colon));
                 if (Number.isFinite(parsed)) this.currentFrameEpoch = parsed;
+                const parsedSeq = Number(event.lastEventId.slice(colon + 1));
+                if (Number.isFinite(parsedSeq)) currentFrameSeq = parsedSeq;
             }
         }
 
@@ -1607,7 +1787,14 @@ export class PersistentChatService {
         // deliberately don't touch this (they flow even when the receive path is
         // a zombie polling a dead epoch).
         this.sseDataLastAt = Date.now();
-        this._handleEvent(frame);
+        const snapshotCursor = this.sessionSnapshotCursor;
+        const coveredBySnapshot = !!(
+            snapshotCursor &&
+            this.currentFrameEpoch === snapshotCursor.epoch &&
+            currentFrameSeq != null &&
+            currentFrameSeq <= snapshotCursor.seq
+        );
+        this._handleEvent(frame, true, coveredBySnapshot);
     }
 
     /**
@@ -1676,6 +1863,8 @@ export class PersistentChatService {
         // above restores the transcript but never touches thread meta).
         await this.loadThreadMeta(tid, generation);
         if (!this._isCurrentConnect(tid, generation)) return;
+        await this._loadSessionState(tid, generation);
+        if (!this._isCurrentConnect(tid, generation)) return;
         await this._openSse(tid);
     }
 
@@ -1734,6 +1923,17 @@ export class PersistentChatService {
         const epoch = Number(lastEventId.slice(0, colon));
         const seq = Number(lastEventId.slice(colon + 1));
         if (!Number.isFinite(epoch) || !Number.isFinite(seq)) return;
+        const current = this.sseReplayCursor;
+        if (
+            current == null ||
+            epoch > current.epoch ||
+            (epoch === current.epoch && seq > current.seq)
+        ) {
+            // Advance synchronously for this tab before the best-effort shared
+            // persistence write. A focus reconnect must never borrow another
+            // tab's later cursor and skip a frame this service has not folded.
+            this.sseReplayCursor = {epoch, seq};
+        }
         // Fire-and-forget; cursor staleness is recoverable.
         void this.cache.setThreadCursor(threadId, epoch, seq);
     }
@@ -1786,10 +1986,14 @@ export class PersistentChatService {
             // readiness is enough to unblock the composer; the control WS
             // session.state frame remains a useful reconciliation signal, but
             // must not be the only way to clear the startup card.
-            if (connection.state === 'ready') {
+            const hasControlSocket = this._connectionHasWebSocket(connection);
+            if (
+                connection.state === 'ready' &&
+                (hasControlSocket || this.sessionSnapshotLoaded)
+            ) {
                 this.markSessionReady();
             }
-            this._installControlWs(threadId, connection.ws_url);
+            this._installControlTransport(threadId, connection);
         } catch {
             // Resolution failed — leave controlWs null; _ensureControlWs
             // (driven by user clicks) or the reconnect loop will retry.
@@ -1872,6 +2076,39 @@ export class PersistentChatService {
             this.http.get<ConnectionPayload>(
                 `${environment.apiUrl}/sessions/${threadId}/connection`,
             ),
+        );
+    }
+
+    private _installControlTransport(
+        threadId: string,
+        connection: ConnectionPayload,
+    ): void {
+        if (!this._connectionHasWebSocket(connection)) {
+            this.controlSocket = 'none';
+            this.controlWsReconnectAttempt = 0;
+            if (this.controlWsReconnectTimer) {
+                clearTimeout(this.controlWsReconnectTimer);
+                this.controlWsReconnectTimer = null;
+            }
+            this._stopControlWsWatchdog();
+            return;
+        }
+        this.controlSocket = 'websocket';
+        this._installControlWs(threadId, connection.ws_url);
+    }
+
+    private _connectionHasWebSocket(
+        connection: ConnectionPayload,
+    ): connection is Extract<ConnectionPayload, {control_socket: 'websocket'}> {
+        // The static union protects our own callers, not a rolling deploy.
+        // During rollout an older orchestrator has no discriminator but still
+        // returns a valid pinned ws_url, so accept that legacy shape. An
+        // explicit `none` always wins, and null/empty coordinates never reach
+        // the browser's WebSocket constructor or reconnect ladder.
+        return (
+            connection?.control_socket !== 'none' &&
+            typeof connection.ws_url === 'string' &&
+            connection.ws_url.trim().length > 0
         );
     }
 
@@ -1979,7 +2216,13 @@ export class PersistentChatService {
                 this.intentionalClose ||
                 this.threadId() !== threadId
             ) return;
-            this._installControlWs(threadId, connection.ws_url);
+            if (
+                this._connectionHasWebSocket(connection) ||
+                this.sessionSnapshotLoaded
+            ) {
+                this.markSessionReady();
+            }
+            this._installControlTransport(threadId, connection);
         } catch {
             if (
                 openingGeneration === this.controlWsOpeningGeneration &&
@@ -2023,6 +2266,7 @@ export class PersistentChatService {
     }
 
     private _scheduleControlWsReconnect(threadId: string): void {
+        if (this.controlSocket === 'none') return;
         if (this.controlWsReconnectAttempt >= CONTROL_WS_RECONNECT_MAX_ATTEMPTS) {
             // Give up silently; user actions that need the WS will reopen
             // on demand via _ensureControlWs.
@@ -2045,6 +2289,7 @@ export class PersistentChatService {
     private _ensureControlWs(): void {
         const tid = this.threadId();
         if (!tid) return;
+        if (this.controlSocket === 'none') return;
         if (this.controlWs?.readyState === WebSocket.OPEN) return;
         if (this.controlWs?.readyState === WebSocket.CONNECTING) return;
         if (this.controlWsOpening) return;
@@ -2180,7 +2425,35 @@ export class PersistentChatService {
             this.sse = null;
         }
         this.connectionState.set('connecting');
-        void this._openSse(tid);
+        if (this.sessionSnapshotFailed) {
+            const generation = this.connectGeneration;
+            const preservedReplayCursor = this.sseReplayCursor;
+            void this._retrySnapshotAndOpenSse(
+                tid,
+                generation,
+                preservedReplayCursor,
+            );
+        } else {
+            void this._openSse(tid);
+        }
+    }
+
+    private async _retrySnapshotAndOpenSse(
+        threadId: string,
+        generation: number,
+        preservedReplayCursor: {epoch: number; seq: number} | null | undefined,
+    ): Promise<void> {
+        await this._loadSessionState(
+            threadId,
+            generation,
+            preservedReplayCursor,
+            true,
+        );
+        if (!this._isCurrentConnect(threadId, generation) || this.intentionalClose) return;
+        if (this.sessionSnapshotLoaded && this.controlSocket === 'none') {
+            this.markSessionReady();
+        }
+        await this._openSse(threadId);
     }
 
     /** Disconnect from the session. */
@@ -2192,6 +2465,12 @@ export class PersistentChatService {
         // async resolver observes its invalidated generation before install.
         this.controlWsOpeningGeneration++;
         this.controlWsOpening = false;
+        this.controlSocket = 'unknown';
+        this.sessionSnapshotLoaded = false;
+        this.sessionSnapshotFailed = false;
+        this.sessionSnapshotCursor = null;
+        this.snapshotJoinsPreservedTurn = false;
+        this.sseReplayCursor = undefined;
         this.intentionalClose = true;
         this.isCreating.set(false);
         // An accepted send may still be running server-side, but with the
@@ -2258,6 +2537,7 @@ export class PersistentChatService {
         // destroy queued sends — that was the root of the "Creating thread"
         // swallow. Only a genuine thread switch (connect() cold path) clears it.
         this.pendingPermissions.set([]);
+        this.permissionResolutionFailures.clear();
         this.compaction.set(null);
         // The workspace-upgrade signals are per-thread and must not bleed across
         // a switch. workspaceUpgradeInProgress especially: disconnect() closes
@@ -2804,18 +3084,27 @@ export class PersistentChatService {
      *  and `permission.request_batch` — an unmapped `approvalId` silently
      *  degrades every decision to "most-recent-pending" REST resolution. */
     private _toPermissionRequests(raw: unknown): PermissionRequest[] {
-        const list = (raw as Record<string, unknown>[]) || [];
-        return list
-            .filter((r) => typeof r?.['id'] === 'string' && r['id'])
-            .map((r) => {
-                const approvalId = r['approval_id'] as string | undefined;
-                return {
-                    id: r['id'] as string,
-                    ...(approvalId ? {approvalId} : {}),
-                    tool: (r['tool'] as string) || '',
-                    args: (r['args'] as Record<string, unknown>) || {},
-                };
+        const list = Array.isArray(raw) ? raw : [];
+        const newestByToolCall = new Map<string, PermissionRequest>();
+        for (const entry of list) {
+            const r = entry as Record<string, unknown>;
+            if (typeof r?.['id'] !== 'string' || !r['id']) continue;
+            const id = r['id'] as string;
+            const approvalId = r['approval_id'] as string | undefined;
+            // Snapshot queries are oldest-first. A failed claim lookup can
+            // leave two pending rows for one tool call; the waiter owns the
+            // newer approval_id, so last-wins prevents a stale, unanswerable
+            // duplicate card. Delete first so ordering also follows the row
+            // that won.
+            newestByToolCall.delete(id);
+            newestByToolCall.set(id, {
+                id,
+                ...(approvalId ? {approvalId} : {}),
+                tool: (r['tool'] as string) || '',
+                args: (r['args'] as Record<string, unknown>) || {},
             });
+        }
+        return [...newestByToolCall.values()];
     }
 
     /** Approve every pending gate. Each decision carries its own approval_id:
@@ -2823,8 +3112,17 @@ export class PersistentChatService {
      *  wrong gate when a batch is open. */
     approveAll(): void {
         const pending = this.pendingPermissions();
-        this.pendingPermissions.set([]);
         for (const req of pending) {
+            if (req.approvalId) {
+                // Durable REST decisions are ack-driven: keep the card until
+                // permission.resolved proves which decision won (another tab
+                // may race us, or a committed response may be masked).
+                this._resolvePermission(req, 'approve');
+                continue;
+            }
+            this.pendingPermissions.update((list) =>
+                list.filter((item) => item.id !== req.id),
+            );
             this.dispatch({
                 type: 'permission_decision',
                 toolUseId: req.id,
@@ -2838,8 +3136,14 @@ export class PersistentChatService {
     /** Deny every pending gate. */
     denyAll(): void {
         const pending = this.pendingPermissions();
-        this.pendingPermissions.set([]);
         for (const req of pending) {
+            if (req.approvalId) {
+                this._resolvePermission(req, 'deny');
+                continue;
+            }
+            this.pendingPermissions.update((list) =>
+                list.filter((item) => item.id !== req.id),
+            );
             this.dispatch({
                 type: 'permission_decision',
                 toolUseId: req.id,
@@ -2856,26 +3160,67 @@ export class PersistentChatService {
     ): void {
         const threadId = this.threadId();
         if (threadId && pending?.approvalId) {
+            this._clearPermissionResolutionFailure(pending.id);
             const url =
                 `${environment.apiUrl}/persistent/threads/${threadId}` +
                 `/approve/${pending.approvalId}`;
             this.http.post(url, {decision}).subscribe({
                 error: (err: unknown) => {
                     const status = (err as {status?: number})?.status;
-                    if (status === 409) {
-                        // Already decided — a stale card from SSE replay or a
-                        // double-click (session_silent_failure_audit.md #10).
-                        // The permission.resolved event reconciles the card;
-                        // just tell the user instead of re-sending over WS.
-                        this._systemMessage('This permission request was already decided.');
+                    if (status === 404 || status === 409) {
+                        // Gone/already decided — a stale card from replay or a
+                        // double-click. No live waiter can be helped by putting
+                        // it back, and the permission.resolved event normally
+                        // supplies the matching transcript outcome.
+                        this._systemMessage(
+                            status === 409
+                                ? 'This permission request was already decided.'
+                                : 'This permission request is no longer available.',
+                        );
+                        this.pendingPermissions.update((list) =>
+                            list.filter(
+                                (item) =>
+                                    item.approvalId !== pending.approvalId &&
+                                    item.id !== pending.id,
+                                ),
+                        );
+                        this._clearPermissionResolutionFailure(pending.id);
                         return;
                     }
-                    this._sendControl({method: decision, approval_id: pending.approvalId});
+                    if (this.threadId() !== threadId) return;
+                    // The REST outcome is unknown or failed. A durable-id
+                    // request must never fall back to a socket: socketless
+                    // sessions would queue it forever, while a masked REST
+                    // commit is safely idempotent on the next click (409).
+                    const stillPending = this.pendingPermissions().some(
+                        (item) =>
+                            item.approvalId === pending.approvalId ||
+                            item.id === pending.id,
+                    );
+                    // A permission.resolved frame may have beaten this error
+                    // callback after a masked commit. Never resurrect it or
+                    // replace the successful outcome with a retry banner.
+                    if (!stillPending) return;
+                    this.permissionResolutionFailures.add(pending.id);
+                    this.error.set(
+                        `Couldn't ${decision === 'approve' ? 'approve' : 'deny'} ` +
+                        'that request. It is still pending; try again.',
+                    );
                 },
             });
             return;
         }
         this._sendControl({method: decision});
+    }
+
+    private _clearPermissionResolutionFailure(toolCallId: string): void {
+        this.permissionResolutionFailures.delete(toolCallId);
+        if (
+            this.permissionResolutionFailures.size === 0 &&
+            this.error()?.endsWith('It is still pending; try again.')
+        ) {
+            this.error.set(null);
+        }
     }
 
     /** Interrupt the current turn — REST POST. */
@@ -3086,7 +3431,11 @@ export class PersistentChatService {
 
     // ── Event handling (shared by SSE and historical WS path) ───────────
 
-    private _handleEvent(data: { method: string; params?: Record<string, unknown> }): void {
+    private _handleEvent(
+        data: { method: string; params?: Record<string, unknown> },
+        allowSessionReady = true,
+        coveredBySnapshot = false,
+    ): void {
         const params = data.params ?? {};
         const now = Date.now();
 
@@ -3114,7 +3463,22 @@ export class PersistentChatService {
         this.agentLastEventAt = now;
 
         switch (data.method) {
-            case 'session.state':
+            case 'session.state': {
+                const durableSnapshot = params['snapshot_source'] === 'durable_journal';
+                if (!durableSnapshot) {
+                    // A pinned agent's exact in-memory welcome frame heals a
+                    // failed durable read during coexistence. It also proves
+                    // a prior startup "Agent not ready" response is stale,
+                    // even when REST readiness already flipped the latch.
+                    const recoveredSnapshot = this.sessionSnapshotFailed;
+                    this.sessionSnapshotFailed = false;
+                    if (
+                        (recoveredSnapshot && this.error() === 'Session state unavailable') ||
+                        this.error() === 'Agent not ready'
+                    ) {
+                        this.error.set(null);
+                    }
+                }
                 if (params['permission_mode']) {
                     this.permissionMode.set(params['permission_mode'] as PermissionMode);
                 }
@@ -3124,13 +3488,16 @@ export class PersistentChatService {
                 if (params['turn_count'] != null) {
                     this.turnCount.set(params['turn_count'] as number);
                 }
-                // A hard refresh rebuilds an in-flight turn's durable prefix
-                // from REST as historical/done, while cursor replay continues
-                // its suffix live. The direct welcome frame is authoritative
-                // about whether that logical turn is still running; reconcile
-                // the two halves before permission snapshots append events.
+                // Legacy pinned fallback: without a durable snapshot floor,
+                // join REST's historical prefix to the suffix replayed from a
+                // browser cursor. With a durable snapshot, turn.started is
+                // deliberately replayed and rebuilds the prefix from scratch.
                 if (
                     this.sseOpenedWithCursor &&
+                    (
+                        (durableSnapshot && this.snapshotJoinsPreservedTurn) ||
+                        (!durableSnapshot && !this.sessionSnapshotLoaded)
+                    ) &&
                     params['turn_in_flight'] === true &&
                     params['turn_count'] != null
                 ) {
@@ -3157,8 +3524,15 @@ export class PersistentChatService {
                 // running_tool. See the backend welcome frame.
                 if ('pending_permissions' in params) {
                     const list = this._toPermissionRequests(params['pending_permissions']);
-                    if (list.length > 0) {
-                        this.pendingPermissions.set(list);
+                    // Presence is authoritative, including an explicit empty
+                    // list. Without the empty write, a horizon refresh can
+                    // leave a resolved approval card stuck on screen forever.
+                    this.pendingPermissions.set(list);
+                    // A durable REST snapshot arrives before replayed
+                    // turn.started. Keep its list authoritative, but let the
+                    // journal reconstruct transcript placement in seq order;
+                    // dispatching here would create a stray recovered bubble.
+                    if (!durableSnapshot) {
                         for (const req of list) {
                             this.dispatch({
                                 type: 'permission_request',
@@ -3170,8 +3544,9 @@ export class PersistentChatService {
                         }
                     }
                 }
-                this.markSessionReady();
+                if (allowSessionReady) this.markSessionReady();
                 break;
+            }
 
             case 'greeting': {
                 // Synthetic single-turn assistant message — agent welcome line.
@@ -3191,7 +3566,9 @@ export class PersistentChatService {
                 this.isWaitingForInput.set(true);
                 // If a turn is still open (race with turn.completed dropped), close it.
                 this._closeActiveTurnIfAny('turn_completed');
-                this.markSessionReady();
+                // A covered frame is still a transcript boundary; only its
+                // readiness side effect is redundant with /connection.
+                if (!coveredBySnapshot) this.markSessionReady();
                 break;
 
             case 'turn.started': {
@@ -3200,7 +3577,15 @@ export class PersistentChatService {
                 // accept (other tab, injected input, reload mid-queue).
                 this.pendingTurnCount.update((c) => Math.max(0, c - 1));
                 const turnId = String(params['turn_id'] ?? makeLocalId('turn'));
-                this.turnCount.update((c) => c + 1);
+                const reportedTurn = Number(params['turn_id']);
+                // Replay may start behind the REST snapshot's event_cursor.
+                // Numeric turn ids are authoritative, so max() advances a live
+                // edge but cannot count an older replayed start twice.
+                this.turnCount.update((c) =>
+                    Number.isFinite(reportedTurn)
+                        ? Math.max(c, reportedTurn)
+                        : c + 1,
+                );
                 this.dispatch({
                     type: 'turn_started',
                     turnId,
@@ -3264,7 +3649,7 @@ export class PersistentChatService {
             case 'permission.request_batch': {
                 const list = this._toPermissionRequests(params['requests']);
                 if (list.length > 0) {
-                    this.pendingPermissions.set(list);
+                    if (!coveredBySnapshot) this.pendingPermissions.set(list);
                     for (const req of list) {
                         this.dispatch({
                             type: 'permission_request',
@@ -3297,17 +3682,19 @@ export class PersistentChatService {
                     // the only id the waiter filters NOTIFY on. Keeping the
                     // stale announced id would resolve a row nobody waits on:
                     // the card vanishes and the agent blocks forever.
-                    this.pendingPermissions.update((list) => {
-                        const idx = list.findIndex(
-                            (p) =>
-                                p.id === id ||
-                                (!!approvalId && p.approvalId === approvalId),
-                        );
-                        if (idx < 0) return [...list, entry];
-                        const next = [...list];
-                        next[idx] = {...next[idx], ...entry};
-                        return next;
-                    });
+                    if (!coveredBySnapshot) {
+                        this.pendingPermissions.update((list) => {
+                            const idx = list.findIndex(
+                                (p) =>
+                                    p.id === id ||
+                                    (!!approvalId && p.approvalId === approvalId),
+                            );
+                            if (idx < 0) return [...list, entry];
+                            const next = [...list];
+                            next[idx] = {...next[idx], ...entry};
+                            return next;
+                        });
+                    }
                 }
                 this.dispatch({
                     type: 'permission_request',
@@ -3327,9 +3714,12 @@ export class PersistentChatService {
                 const resolvedId = (params['id'] as string) || '';
                 const decision =
                     params['decision'] === 'approved' ? 'approved' : 'denied';
-                this.pendingPermissions.update((list) =>
-                    list.filter((p) => p.id !== resolvedId),
-                );
+                this._clearPermissionResolutionFailure(resolvedId);
+                if (!coveredBySnapshot) {
+                    this.pendingPermissions.update((list) =>
+                        list.filter((p) => p.id !== resolvedId),
+                    );
+                }
                 if (resolvedId) {
                     this.dispatch({
                         type: 'permission_decision',
@@ -3369,8 +3759,10 @@ export class PersistentChatService {
                 if (turnId) {
                     this.dispatch({type: 'turn_completed', turnId, finishedAt: now});
                 }
-                this.isInterrupting.set(false);
-                this.runningTool.set(null);
+                if (!coveredBySnapshot) {
+                    this.isInterrupting.set(false);
+                    this.runningTool.set(null);
+                }
                 // A compaction never outlives its turn — clear a stale block
                 // (e.g. the pod died mid-fold and the turn was closed).
                 this.compaction.set(null);
@@ -3386,6 +3778,15 @@ export class PersistentChatService {
             }
 
             case 'turn.error': {
+                if (coveredBySnapshot) {
+                    // The snapshot owns current scalars/banner state, but this
+                    // remains a replayable terminal boundary. Without the
+                    // close, a dropped turn.completed followed by a durable
+                    // error/ready frame reopens a forever-streaming bubble.
+                    this._closeActiveTurnIfAny('turn_interrupted');
+                    this.compaction.set(null);
+                    break;
+                }
                 // A failed turn used to leave the assistant bubble spinning
                 // forever (no turn.completed on the error path) with only the
                 // transient banner as a signal. Close the turn and append a
@@ -3411,21 +3812,23 @@ export class PersistentChatService {
                 break;
 
             case 'mode.changed':
+                if (coveredBySnapshot) break;
                 this.permissionMode.set((params['mode'] as PermissionMode) || 'supervised');
                 break;
 
             case 'narration.changed':
+                if (coveredBySnapshot) break;
                 this.narrationMode.set((params['mode'] as NarrationMode) || 'auto');
                 break;
 
             case 'config.changed': {
-                if (params['model']) {
+                if (!coveredBySnapshot && params['model']) {
                     this.modelName.set(params['model'] as string);
                 }
-                if (params['temperature'] != null) {
+                if (!coveredBySnapshot && params['temperature'] != null) {
                     this.temperature.set(params['temperature'] as number);
                 }
-                if (params['permission_mode']) {
+                if (!coveredBySnapshot && params['permission_mode']) {
                     this.permissionMode.set(params['permission_mode'] as PermissionMode);
                 }
                 // Transcript stamp (live_session_settings.md, principle 5):

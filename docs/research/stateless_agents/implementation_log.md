@@ -1037,3 +1037,228 @@ Persistence must be split from banner emission, restore must preserve the
 persisted boundary identity, and Path A must detect a real compaction and set
 `turn_count` before writing a persist-only checkpoint. This was not changed in
 this stopped session.
+
+# Session 5 — transport-independent session state (2026-08-08)
+
+Branch: `feature/stateless-sessions-s1-completion`; not pushed. This session
+re-read the updated completion brief and absorbed its corrected scope. The
+reasonable route around the WebSocket-only `session.state` dependency was to
+build the same current-state contract over REST for both lanes, not to proceed
+directly to controls and not to expose a lane to the browser. This phase lands
+that prerequisite only. Migration 0119 remains unused; no control-inbox object
+exists and no `worker_batch` unit was enqueued.
+
+## Snapshot contract — DONE, focused tests + k3d verified
+
+`GET /api/persistent/threads/{thread_id}/state` is authenticated with the
+existing exact thread-owner gate and returns `Cache-Control: private,
+no-store`. One repeatable-read transaction captures the whole thread row,
+current journal high-water mark, durable message count, latest turn lifecycle,
+unmatched running tool, current `run_queue` state and pending permission rows.
+Only after that read does config resolution run, against the exact captured
+thread row; the response projects safe display scalars rather than returning
+metadata, a resolved config blob, credentials, lane or agent identity.
+
+The 13-key response is deliberately `session.state`-compatible rather than a
+claim to be identical to agent RAM:
+
+`thread_id`, `permission_mode`, `narration_mode`, `turn_count`,
+`turn_in_flight`, `message_count`, `model`, `temperature`, `running_tool`,
+`pending_permissions`, `event_cursor`, `replay_cursor`, `snapshot_source`.
+
+`turn_in_flight` and `running_tool` mean “durably observed as of
+`event_cursor`”; the ordered writer can still have an edge in memory. A known
+idle stateless queue state corrects a dropped terminal edge, but a stale pinned
+queue row cannot do so and unknown queue/lifecycle states fail closed. Turn
+count comes from the latest lifecycle event, with a fallback that excludes
+admitted human/event rows so queued future inputs cannot masquerade as the turn
+currently executing. `message_count` is the count of live durable message rows,
+not `len(agent_session.messages)`. A pinned socket can still deliver its later,
+exact in-process welcome frame.
+
+The crucial addition to the original snapshot idea is `replay_cursor`: it is an
+exclusive floor immediately before the latest surviving `turn.started`, while
+`event_cursor` marks the scalars' high-water. The client applies the snapshot
+first and replays the full latest logical turn. That closes all three races the
+simple high-water design missed: REST history racing turn completion, a cached
+cursor landing in the middle of a token stream, and a terminal frame covered
+by the snapshot that must still close a reconstructed transcript turn.
+
+## Cockpit transport and replay — DONE for the snapshot slice
+
+The public `/connection` union is now discriminated by transport:
+`control_socket='websocket' | 'none'`. `execution_lane` is absent from both
+responses and from the Cockpit type. During rolling version skew, a non-empty
+legacy `ws_url` remains usable, but an explicit no-socket marker, null URL or
+missing URL normalizes to a stable no-socket connection. It never calls
+`new WebSocket(null)` and focus/online/SSE recovery cannot put it into the
+control-socket reconnect ladder.
+
+The Cockpit loads the state snapshot after REST history/metadata and before
+journal SSE. A cursor retained by this tab may resume incrementally only when
+it is in the same epoch and between the latest-turn replay floor and snapshot
+high-water. Otherwise the tab repaints history and replays the whole latest
+turn. The shared IndexedDB cursor is now cold fallback only: rereading a cursor
+advanced by another tab could skip frames this tab never applied, so each live
+tab owns and advances its cursor synchronously. Epoch changes, a cursor behind
+the latest-turn floor, retention resets and IndexedDB failures all take the
+safe repaint path.
+
+A state-read failure keeps a known socketless session not-ready rather than
+presenting an enabled composer with missing approval state. Reconnect,
+focus/online and stream-horizon recovery retry the snapshot; there is no
+independent polling timer. Pinned sessions can heal via their exact WebSocket
+state. Pending permission rows are authoritative even when the list is empty,
+but snapshot hydration is kept separate from transcript replay so it does not
+invent a tool card before `turn.started`. Duplicate durable rows are folded
+latest-wins by tool-call id because the newer waiter owns the answerable
+approval id.
+
+The approval action was also made durable-ack-driven. For a row carrying an
+`approval_id`, the client calls the existing orchestrator REST endpoint for
+both connection shapes and leaves the card visible until the lease owner emits
+`permission.resolved`; it never falls back to WebSocket after an ambiguous REST
+failure. A resolution racing a 5xx cannot resurrect the card, a later
+resolution clears its keyed retry banner, and 404/409 retires an already
+terminal/stale card. The no-`approval_id` legacy shape keeps the old WebSocket
+compatibility path. This is snapshot usability, not the migration-0119 control
+inbox: all other control verbs remain untouched.
+
+## Measurements — before and after the code change
+
+The before turn was measured on the synced pre-snapshot image, then the after
+turn was measured only after grepping the new source in the running pods.
+
+| | Before | After |
+|---|---:|---:|
+| End-to-end wall | 9 s | 6 s |
+| Agent mode | fresh | fresh |
+| Bundle | 0.12 s | 0.05 s |
+| Attach | 2.66 s | 2.38 s |
+| Pending-input drain | 0.00 s | 0.00 s |
+| Turn | 2.67 s | 3.18 s |
+| Push | 0.14 s | 0.04 s |
+| Complete | 0.06 s | 0.01 s |
+| Agent total | **5.64 s** | **5.66 s** |
+| Orchestrator claim bundle | 0.103 s | 0.037 s |
+
+The meaningful comparison is the agent total: **5.64 → 5.66 s**, no measurable
+turn-path regression. The 9 → 6 s wall improvement and provider portion moved
+in opposite directions and are cluster/provider noise, not a claimed speedup.
+The after probe persisted exactly one human and one AI response containing the
+unique marker, with one completed lifecycle. Its input API reported turn 94
+while the durable message/lifecycle rows reported 95; this appears to be a
+pre-existing accepted-response counter mismatch and was recorded rather than
+silently rationalized. Snapshot `turn_count=95` matched the durable lifecycle.
+
+There is no pre-change endpoint to compare with `/state`. The first manual live
+read was **95 ms server total** (`auth=.012`, `config=.072`, snapshot=.011).
+Warm curl observations were **35–102 ms server total**, with config resolution
+dominating. In the final browser proof the three server timing lines were:
+
+- initial: `auth=.001s config=.027s snapshot=.004s total=.032s`
+- cache-cleared reload: `auth=.001s config=.038s snapshot=.003s total=.042s`
+- second tab: `auth=.001s config=.029s snapshot=.003s total=.033s`
+
+These are observations, not percentiles. Snapshot construction itself was
+3–4 ms in that proof, but endpoint cost includes config resolution.
+
+## Verification
+
+- Focused backend/router/journal/security gate: **88 passed in 1.29 s**.
+  Relevant Ruff checks passed.
+- Full Python suite: **15,076 passed / 11 failed / 107 skipped in 960.51 s**.
+  The same 11 environment failures are the established baseline (local
+  PostgreSQL absent, Python-3.14 MCP subprocess behavior, and the optional
+  `arxiv` package); this slice adds 16 passing tests and no new failure.
+- Focused Cockpit state/replay/control tests: **266/266 passed**. Full Cockpit:
+  **1,790/1,790 passed in 8.47 s**. Production build passed in **13.04 s** with
+  only the existing bundle/CommonJS budget warnings.
+- Actual running-image proof, after the last code edit: the orchestrator pod had
+  one `session-state timing:` marker, two `replay_cursor` markers in the new
+  service, one `control_socket` discriminator and no lane discriminator. The
+  Cockpit pod had the durable-snapshot/replay markers and zero
+  `execution_lane`. An earlier grep failed because it assumed the orchestrator
+  package lived at `/app/orchestrator/...`; Tilt flattens it under `/app/...`.
+  The failed path is retained here because “source exists locally” was not used
+  as image proof.
+- The real state response returned exactly the 13 safe keys, `private,
+  no-store`, epoch/cursor values, and no lane, agent, metadata, config or token.
+  The final `/connection` response returned exactly `state`, `control_socket`,
+  `ws_url`, `token`, `expires_at`, with `control_socket=none`, null socket
+  fields and no lane.
+- Browser proof with injected owner bearer auth: initial load, a cache-cleared
+  hard reload and a second tab enabled the composer in **822/496/575 ms**.
+  Each made exactly one state read (38/48/37 ms client-observed) and one
+  connection read (7/6/4 ms). After six seconds of focus switching there were
+  still exactly three of each, no application WebSocket (only Angular HMR), no
+  mutation, page error, console error or unexpected request failure.
+- A real supervised gate was also reached with a concretely bound, read-only
+  `list_files(path="", pattern="*", depth=0)` call. The durable row and approval
+  card were visible, denial through the canonical REST route returned 200, and
+  the lease owner journaled the matching `permission.resolved`; the tool never
+  executed. The probe's combined text locator failed before the planned hard
+  reload, so its fail-safe denied immediately. A subsequent exact prompt
+  produced no tool call and therefore no row. No row was synthesized and the
+  pending-card **reload/multi-tab browser case remains unproven live**; its
+  snapshot/replay/ack ordering is covered by the focused tests.
+- The timed post-change turn answered once. Final read-only closeout found all
+  16 `srw` pods Running/Ready with zero restarts; the fixture queue was `done`,
+  `input_seq=consumed_seq=2370`, with no lease owner and zero pending
+  permissions. `worker_batch` remained at zero. Migration 0119 still has no
+  file, ledger row, table or function.
+
+## Failures and deviations that changed the implementation
+
+1. The brief's zero-client-change premise was a scope error, not a dead end.
+   The alternative is the durable snapshot plus replay contract above.
+2. The first server iteration still returned `execution_lane` as the OpenAPI
+   discriminator. A live response audit caught the topology leak; the contract
+   now discriminates `control_socket` and current pod source/response were
+   re-proved.
+3. A shared IndexedDB replay cursor is not a multi-tab cursor. The client now
+   treats it as cold fallback and uses a per-tab live cursor, with tests for a
+   second tab advancing storage behind the first.
+4. A snapshot high-water alone loses reconstruction races. The endpoint now
+   supplies both the state high-water and a full-latest-turn replay floor;
+   covered terminal frames close transcript state without rolling back newer
+   snapshot scalars.
+5. Optimistically removing a durable approval on REST 200 can hide a committed
+   but not-yet-journaled gate, while falling back to WebSocket after a 5xx can
+   execute the decision twice. Cards are now owner-journal-ack-driven and the
+   ambiguous cases have explicit tests.
+6. One full-suite run during active edits reported 15,065 pass / 15 fail. Four
+   failures were stale `/connection`/endpoint-inventory expectations observed
+   while files were changing, so it was discarded rather than called a
+   baseline. The settled run above has exactly the known 11 failures.
+7. The first live permission prompt asked for `run_command`, but the model
+   emitted the unbound alias `shell_execute`; the runtime correctly rejected it
+   before the gate. The next probe first established `list_files` from both
+   claim logs and `/tool-groups`, then produced a genuine row. Its browser text
+   assertion—not the product selector—was brittle, so safety cleanup took
+   precedence over preserving the row. The later no-tool response shows why a
+   model-driven permission fixture is not deterministic enough to hide this
+   gap or justify a synthetic database row.
+8. A redundant manual closeout query lost its SQL string quotes through nested
+   local/remote shell quoting and failed read-only with a syntax error. It
+   exposed no credential and changed nothing; the independent closeout above
+   supplied the exact DB state instead.
+
+## Honest boundary and remaining unverified work
+
+This is a clean, committed snapshot phase boundary, not S1 completion. Live
+idle reload/concurrent-tab transport is proven. Mid-turn reconstruction,
+retention/epoch races, snapshot failure recovery, running-tool restoration and
+permission ordering are extensively simulated in Vitest; the pending card was
+seen live and safely denied, but its reload/multi-tab state was not captured.
+These are not all real-cluster fault injections. The browser proof injected a bearer token into
+safe requests, so normal BFF-cookie login remains unverified. Durable approval
+cards depend on the owner eventually journaling `permission.resolved`; an owner
+crash in that interval can leave an already-open tab stale until its next
+snapshot/reconnect.
+
+Next is migration 0119 and the REST control inbox, with the already-recorded
+non-optional queue control watermarks, exact pinned-agent fence and durable
+journal-write receipt. After that remain durable queued-turn UX, permission-row
+retirement, stateless ended-session wake, Path-A compaction persistence and the
+other S1 surrounds. None was scaffolded in this slice.

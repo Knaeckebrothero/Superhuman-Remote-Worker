@@ -418,7 +418,11 @@ export function reduce(state: ConversationState, action: ReducerAction): Convers
                 );
                 if (idx >= 0) {
                     const existing = turn.events[idx] as ToolCallEvent;
-                    const updated: ToolCallEvent = {...existing, status: 'pending'};
+                    const updated: ToolCallEvent = {
+                        ...existing,
+                        status: 'pending',
+                        decision: undefined,
+                    };
                     return {...turn, events: replaceAt(turn.events, idx, updated)};
                 }
                 const newCall: ToolCallEvent = {
