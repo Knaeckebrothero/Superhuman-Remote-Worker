@@ -215,14 +215,49 @@ async def test_non_lite_workspace_refused_before_attach_assembly(monkeypatch, ba
         run_queue_row=dict(LEASED_ROW),
         thread=_thread(metadata=metadata),
     )
-    _inject, assembly = _patch(monkeypatch, orch_main, db)
+    inject, assembly = _patch(monkeypatch, orch_main, db)
 
     with pytest.raises(HTTPException) as exc:
         await orch_main.internal_unit_claim_bundle(UNIT_ID, MagicMock(), 7)
 
     assert exc.value.status_code == 409
     assert "virtual/none" in str(exc.value.detail)
+    inject.assert_not_awaited()
     assembly.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "physical_evidence",
+    [
+        {"workspace_container": {"status": "ready", "pod_ip": "10.0.0.8"}},
+        {"vm": {"status": "provisioning", "provision_generation": "g1"}},
+    ],
+    ids=["sandbox-upgrade", "vm-upgrade"],
+)
+async def test_upgraded_lite_claim_refused_before_credentials_or_assembly(
+    monkeypatch, physical_evidence
+):
+    from orchestrator import main as orch_main
+
+    metadata = {
+        "config_override": {"workspace": {"backend": "virtual"}},
+        **physical_evidence,
+    }
+    db = FakeDB(
+        run_queue_row=dict(LEASED_ROW),
+        thread=_thread(metadata=metadata),
+    )
+    inject, assembly = _patch(monkeypatch, orch_main, db)
+
+    with pytest.raises(HTTPException) as exc:
+        await orch_main.internal_unit_claim_bundle(UNIT_ID, MagicMock(), 7)
+
+    assert exc.value.status_code == 409
+    assert "virtual/none" in str(exc.value.detail)
+    inject.assert_not_awaited()
+    assembly.assert_not_awaited()
+    assert db.datasource_lock_calls == []
 
 
 @pytest.mark.asyncio

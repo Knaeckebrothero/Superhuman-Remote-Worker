@@ -189,6 +189,10 @@ from services.thread_control_inbox import (  # noqa: E402
     admit_thread_control,
     find_existing_thread_control,
 )
+from services.stateless_workspace_gate import (  # noqa: E402
+    declared_thread_workspace_backend,
+    stateless_lite_workspace_check,
+)
 from services.stale_verification_sweeper import (  # noqa: E402
     stale_verification_sweeper_loop,
 )
@@ -4858,17 +4862,7 @@ def _thread_workspace_backend(thread: Any) -> Optional[str]:
     Used by the session-start paths to size the readiness budget for a VM-backed
     thread on resume, where the caller may not carry the config_override.
     """
-    if not isinstance(thread, dict):
-        return None
-    metadata = thread.get("metadata") or {}
-    if isinstance(metadata, str):
-        try:
-            metadata = json.loads(metadata)
-        except (json.JSONDecodeError, TypeError):
-            return None
-    if not isinstance(metadata, dict):
-        return None
-    return _backend_from_override(metadata.get("config_override"))
+    return declared_thread_workspace_backend(thread)
 
 
 def _require_stateless_lite_workspace(thread: dict[str, Any]) -> str:
@@ -4882,15 +4876,17 @@ def _require_stateless_lite_workspace(thread: dict[str, Any]) -> str:
     until S2's tmux, sync-ordering and agent-local-state gates have passed.
 
     Keep this as an exact whitelist: missing, malformed and future backend
-    values must not inherit the lite path by accident.
+    values, plus stale declarations with physical workspace evidence, must not
+    inherit the lite path by accident.
     """
-    backend = _thread_workspace_backend(thread)
-    if backend not in LITE_BACKENDS:
+    backend, refusal_reason = stateless_lite_workspace_check(thread)
+    if refusal_reason is not None:
         logger.warning(
             "Stateless session refused before attach: thread=%s "
-            "workspace_backend=%r (S2 lite-only gate)",
+            "workspace_backend=%r reason=%s (S2 lite-only gate)",
             thread.get("id"),
             backend,
+            refusal_reason,
         )
         raise HTTPException(
             status_code=409,
@@ -26842,6 +26838,25 @@ async def _apply_thread_config_update(
     (``actor`` is the resolved caller for owner-facing requests, None for
     internal ones — the recorded path distinguishes the two).
     """
+    if thread_row and thread_row.get("execution_lane") == "stateless":
+        # S2 safety gate: generic config mutation is not the workspace-upgrade
+        # protocol. Preserve lite-only admission and refuse an already-drifted
+        # row before any config/datasource write below.
+        _require_stateless_lite_workspace(thread_row)
+        if "workspace" in config_override:
+            workspace_patch = config_override.get("workspace")
+            if not isinstance(workspace_patch, dict) or (
+                "backend" in workspace_patch
+                and workspace_patch.get("backend") not in LITE_BACKENDS
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Stateless execution currently supports only lite "
+                        "workspace backends (virtual/none)"
+                    ),
+                )
+
     interactive = config_override.get("interactive")
     if isinstance(interactive, dict) and {
         "permission_mode",
@@ -27133,6 +27148,13 @@ async def agent_upgrade_thread_to_vm(
     thread = await postgres_db.get_thread(thread_id)
     if not thread:
         raise HTTPException(status_code=404, detail="Thread not found")
+    from src.shared.run_queue import LANE_PINNED
+
+    if thread.get("execution_lane") != LANE_PINNED:
+        raise HTTPException(
+            status_code=409,
+            detail="Workspace upgrades are not yet supported on the stateless lane",
+        )
 
     # Sec-1 — authorize BEFORE provisioning (fail-closed). This endpoint is the
     # target of both the sandbox→VM sudo path and the lite→vm delegation from
@@ -27262,6 +27284,13 @@ async def agent_upgrade_thread_to_workspace(
     thread = await postgres_db.get_thread(thread_id)
     if not thread:
         raise HTTPException(status_code=404, detail="Thread not found")
+    from src.shared.run_queue import LANE_PINNED
+
+    if thread.get("execution_lane") != LANE_PINNED:
+        raise HTTPException(
+            status_code=409,
+            detail="Workspace upgrades are not yet supported on the stateless lane",
+        )
 
     # Sec-1 — authorize the upgrade against the owner's capability grants BEFORE
     # provisioning (fail-closed). sandbox passes by default; a shell-restricted
@@ -31490,6 +31519,7 @@ async def _thread_input_stateless(thread: dict, content: str) -> dict[str, Any]:
     """
     from src.database.postgres_db import _coerce_row_id
     from src.shared.run_queue import (
+        LANE_STATELESS,
         UNIT_KIND_SESSION_TURN,
         queue_depth_for,
         record_input_seq,
@@ -31501,17 +31531,37 @@ async def _thread_input_stateless(thread: dict, content: str) -> dict[str, Any]:
     _require_stateless_lite_workspace(thread)
 
     thread_id = str(thread["id"])
-    turn_number = int(thread.get("total_turns") or 0) + 1
     # Mirror the agent's accept-time mint exactly; the row id is the same
     # deterministic uuid5 the agent-side coercion would derive from this raw
     # id, so a later executor re-persist upserts onto this row (ON CONFLICT
     # (id)) instead of duplicating the user bubble.
     raw_msg_id = f"msg_{uuid4().hex[:24]}"
     row_id = _coerce_row_id(raw_msg_id)
-    fair_key = str(thread["user_id"]) if thread.get("user_id") else None
 
     async with postgres_db.acquire() as conn:
         async with conn.transaction():
+            locked_thread = await conn.fetchrow(
+                "SELECT id, user_id, execution_lane, agent_id, status, "
+                "       total_turns, metadata "
+                "FROM threads WHERE id = $1 FOR UPDATE",
+                thread_id,
+            )
+            if (
+                locked_thread is None
+                or str(locked_thread["execution_lane"] or "") != LANE_STATELESS
+                or locked_thread["agent_id"] is not None
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail="Thread is no longer eligible for stateless admission",
+                )
+            _require_stateless_lite_workspace(dict(locked_thread))
+            turn_number = int(locked_thread["total_turns"] or 0) + 1
+            fair_key = (
+                str(locked_thread["user_id"])
+                if locked_thread["user_id"] is not None
+                else None
+            )
             seq = await conn.fetchval(
                 """
                 INSERT INTO thread_messages (id, thread_id, role, content, turn_number)
