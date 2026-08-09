@@ -6,6 +6,14 @@ transmit an ``acknowledge`` list when the caller supplies one, and must leave
 ordinary 200 and non-428-error handling unchanged. See
 docs/features/session_config_drift_resume.md §4.6.
 
+``str(error)`` must carry the raw ids (not just labels) and a literal,
+copy-pasteable ``acknowledge=[...]`` list, because the MCP tool path renders
+only ``str(error)`` (via ``_format_action_error`` -> plain ``str()``) and has
+no other way to hand the ids back to the caller. A malformed 428 body (a
+non-list ``drift``, a missing ``detail`` key, or a non-JSON body) must
+degrade to an empty ``.drift``/``.ids`` instead of raising AttributeError or
+TypeError while building the message.
+
 This repo has no ``httpx_mock``/pytest-httpx fixture; existing orch_surface
 client tests (tests/test_mcp_client_contracts.py, tests/test_mcp_client_safety.py)
 stub the transport directly with ``httpx.MockTransport``, so these tests follow
@@ -72,6 +80,96 @@ async def test_428_raises_a_drift_error_naming_the_items() -> None:
             "label": "KurortEngine",
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_error_message_carries_ids_and_a_literal_acknowledge_list() -> None:
+    """The MCP tool path renders only str(error) -- it must be self-sufficient.
+
+    A caller reading only the message text (no .drift access) still needs to
+    learn the raw id, not just the human label, to build its next call.
+    """
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            428,
+            json={
+                "detail": {
+                    "code": "config_drift",
+                    "drift": [
+                        {
+                            "id": "connector:abc",
+                            "kind": "connector",
+                            "reason": "deleted",
+                            "label": "KurortEngine",
+                        }
+                    ],
+                }
+            },
+        )
+
+    client = _client(handler)
+    try:
+        with pytest.raises(SessionConfigDriftError) as excinfo:
+            await client.resume_persistent_thread("t1")
+    finally:
+        await client.close()
+
+    message = str(excinfo.value)
+    assert "connector:abc" in message
+    assert "acknowledge=['connector:abc']" in message
+    assert excinfo.value.ids == ["connector:abc"]
+
+
+@pytest.mark.asyncio
+async def test_428_with_non_list_drift_degrades_without_crashing() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            428,
+            json={"detail": {"code": "config_drift", "drift": "not-a-list"}},
+        )
+
+    client = _client(handler)
+    try:
+        with pytest.raises(SessionConfigDriftError) as excinfo:
+            await client.resume_persistent_thread("t1")
+    finally:
+        await client.close()
+
+    assert excinfo.value.drift == []
+    assert excinfo.value.ids == []
+
+
+@pytest.mark.asyncio
+async def test_428_with_no_detail_key_degrades_without_crashing() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(428, json={"code": "config_drift"})
+
+    client = _client(handler)
+    try:
+        with pytest.raises(SessionConfigDriftError) as excinfo:
+            await client.resume_persistent_thread("t1")
+    finally:
+        await client.close()
+
+    assert excinfo.value.drift == []
+    assert excinfo.value.ids == []
+
+
+@pytest.mark.asyncio
+async def test_428_with_non_json_body_degrades_without_crashing() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(428, content=b"not json at all")
+
+    client = _client(handler)
+    try:
+        with pytest.raises(SessionConfigDriftError) as excinfo:
+            await client.resume_persistent_thread("t1")
+    finally:
+        await client.close()
+
+    assert excinfo.value.drift == []
+    assert excinfo.value.ids == []
 
 
 @pytest.mark.asyncio

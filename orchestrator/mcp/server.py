@@ -3231,8 +3231,9 @@ async def resume_persistent_thread(
     in 'ended' status.
 
     If the session's config has drifted (deleted connector, revoked
-    project, withdrawn grant), this returns the drifted items; call again
-    with `acknowledge` set to their ids to resume without them.
+    project, withdrawn grant), this returns the drifted items and their
+    ids; call again with `acknowledge` set to those ids to resume without
+    them.
 
     Args:
         thread_id: Thread UUID to resume
