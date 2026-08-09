@@ -27,6 +27,8 @@ import json
 from decimal import Decimal
 from typing import Any, Awaitable, Callable
 
+from src.shared.thread_controls import applied_control_scalar
+
 
 _TURN_LIFECYCLE_KINDS = (
     "turn.started",
@@ -218,6 +220,32 @@ async def build_session_state_snapshot(
                 """,
                 thread_id,
             )
+            # Normally owner finalization has already copied each applied
+            # control into the first-class thread scalar. There is one
+            # intentional crash window after the owner-fenced result event
+            # commits and before that finalization transaction. Fold only
+            # matching, still-pending receipts into this same repeatable-read
+            # snapshot. Finalized historical events must never overwrite a
+            # newer scalar, and malformed/version-skewed receipts fail closed.
+            pending_control_receipts = await conn.fetch(
+                """
+                SELECT request.id AS request_id,
+                       request.client_request_id,
+                       request.request_seq,
+                       request.verb,
+                       request.payload AS request_payload,
+                       event.kind AS event_kind,
+                       event.payload AS event_payload
+                FROM thread_control_requests AS request
+                JOIN thread_events AS event
+                  ON event.thread_id = request.thread_id
+                 AND event.control_request_id = request.id
+                WHERE request.thread_id = $1
+                  AND request.outcome IS NULL
+                ORDER BY request.request_seq ASC
+                """,
+                thread_id,
+            )
 
     metadata = _json_object(thread_source.get("metadata"))
     if config_resolver is not None:
@@ -284,10 +312,28 @@ async def build_session_state_snapshot(
         or "supervised"
     )
     narration_mode = (
-        resolved_interactive.get("narration_mode")
+        thread_source.get("narration_mode")
+        or resolved_interactive.get("narration_mode")
         or stored_interactive.get("narration_mode")
         or "auto"
     )
+    for receipt in pending_control_receipts:
+        scalar = applied_control_scalar(
+            request_id=receipt["request_id"],
+            client_request_id=receipt["client_request_id"],
+            request_seq=int(receipt["request_seq"]),
+            verb=str(receipt["verb"]),
+            request_payload=receipt["request_payload"],
+            event_kind=str(receipt["event_kind"]),
+            event_payload=receipt["event_payload"],
+        )
+        if scalar is None:
+            continue
+        column, value = scalar
+        if column == "permission_mode":
+            permission_mode = value
+        elif column == "narration_mode":
+            narration_mode = value
     model = resolved_llm.get("model") or stored_llm.get("model")
     temperature = _temperature(
         resolved_llm.get("temperature", stored_llm.get("temperature"))

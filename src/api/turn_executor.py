@@ -141,21 +141,55 @@ def attach_fingerprint(attach: Dict[str, Any]) -> str:
     session. ``default=str`` keeps exotic values (UUIDs, datetimes) stable
     rather than raising.
 
-    Resolution METADATA is excluded before hashing: ``resolved_config
-    .resolved_at`` is a wall-clock stamp minted by every
-    ``serialize_resolved_config`` call and consumed by nothing — hashing it
-    made every claim's bundle unique, which is precisely the measured cause
-    of the never-firing affinity cache (turn 3 of the 2026-08-08 baseline:
-    ``changed_paths=['resolved_config.resolved_at']``). Config CONTENT
-    changes (model, prompts — including their daily ``Current date:`` line —
-    tools, datasources) still change the hash and force the re-attach they
-    should.
+    Two classes of delivery-only values are excluded before hashing:
+
+    * ``resolved_config.resolved_at`` is a wall-clock stamp minted by every
+      resolver call and consumed by nothing.
+    * ``interactive.permission_mode`` / ``narration_mode`` are first-class
+      control-inbox scalars. A cold attach must receive them for crash/handoff
+      convergence, but a warm owner applies their ordered pending request in
+      place. Hashing them forced a full detach/attach before that drain (9–11s
+      measured on k3d for a scalar whose journal write took ~10ms).
+
+    Every other config-content change (model, prompts, tools, datasources and
+    other interactive settings) still changes the hash and forces the attach
+    it should.
     """
+
+    def _without_control_scalars(config: Any) -> Any:
+        if not isinstance(config, dict):
+            return config
+        interactive = config.get("interactive")
+        if not isinstance(interactive, dict):
+            return config
+        filtered = {
+            key: value
+            for key, value in interactive.items()
+            if key not in {"permission_mode", "narration_mode"}
+        }
+        result = dict(config)
+        if filtered:
+            result["interactive"] = filtered
+        else:
+            result.pop("interactive", None)
+        return result
+
     rc = attach.get("resolved_config")
-    if isinstance(rc, dict) and "resolved_at" in rc:
+    override = attach.get("config_override")
+    if isinstance(rc, dict):
+        rc = dict(rc)
+        rc.pop("resolved_at", None)
+        agent = rc.get("agent")
+        if isinstance(agent, dict):
+            rc["agent"] = _without_control_scalars(agent)
         attach = {
             **attach,
-            "resolved_config": {k: v for k, v in rc.items() if k != "resolved_at"},
+            "resolved_config": rc,
+        }
+    if isinstance(override, dict):
+        attach = {
+            **attach,
+            "config_override": _without_control_scalars(override),
         }
     canonical = json.dumps(attach, sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
@@ -487,13 +521,16 @@ class StatelessTurnExecutor:
         token = claim.lease_token
         logger.info(
             "run_queue claim: unit=%s kind=%s token=%d attempts=%d "
-            "input_seq=%s consumed_seq=%s pod=%s",
+            "input_seq=%s consumed_seq=%s control_input_seq=%s "
+            "control_consumed_seq=%s pod=%s",
             unit_id,
             claim.unit_kind,
             token,
             claim.attempts_since_completion,
             claim.input_seq,
             claim.consumed_seq,
+            claim.control_input_seq,
+            claim.control_consumed_seq,
             self._pod_name,
         )
 
@@ -504,6 +541,7 @@ class StatelessTurnExecutor:
             claim.consumed_seq is not None
             and claim.input_seq is not None
             and claim.consumed_seq >= claim.input_seq
+            and claim.control_consumed_seq >= claim.control_input_seq
         ):
             state = await complete_unit(
                 self._db,
@@ -531,6 +569,11 @@ class StatelessTurnExecutor:
         try:
             await self._serve_claim_inner(pa, claim, unit_id, token)
         finally:
+            # Belt for every exception/cancellation path. Normal completion
+            # and release paths stop it earlier, before mutating the queue;
+            # this prevents a lease-scoped consumer leaking into warm idle.
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await pa._stop_thread_control_watcher()
             heartbeat_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await heartbeat_task
@@ -627,6 +670,37 @@ class StatelessTurnExecutor:
             fresh_attach = True
         timing["attach"] = time.perf_counter() - t0
 
+        # Controls are consumed only by the exact serving owner. The initial
+        # drain is synchronous so a control-only claim cannot take either
+        # no-input completion edge; the watcher then stays live for mid-turn
+        # mode changes until we stop it immediately before complete/release.
+        t0 = time.perf_counter()
+        try:
+            drained_controls = await pa._start_thread_control_watcher(lease_token=token)
+        except Exception as e:
+            logger.warning(
+                "control-inbox attach failed for unit %s; request remains "
+                "pending for retry: %s",
+                unit_id,
+                e,
+                exc_info=True,
+            )
+            # A strict journal fence can terminally close the attached writer.
+            # Never leave that dead writer in the affinity cache for the next
+            # claim; detach while the handle still carries this claim's token.
+            await self._detach_cached_session("control_inbox_failed")
+            await self._release(claim, reason="control_inbox_failed")
+            return
+        timing["controls"] = time.perf_counter() - t0
+        if drained_controls:
+            logger.info(
+                "session-control claim drain: unit=%s token=%d count=%d total=%.3fs",
+                unit_id,
+                token,
+                drained_controls,
+                timing["controls"],
+            )
+
         # (f) Oldest unanswered input.
         t0 = time.perf_counter()
         try:
@@ -642,6 +716,7 @@ class StatelessTurnExecutor:
                 if claim.input_seq is not None
                 else (consumed_seq if consumed_seq is not None else 0)
             )
+            await pa._stop_thread_control_watcher()
             state = await complete_unit(
                 self._db,
                 unit_id=claim.unit_id,
@@ -676,6 +751,7 @@ class StatelessTurnExecutor:
         if not target["content"]:
             # An empty row can never produce a turn (the loop skips empty
             # input, and the completion hook would never fire) — consume it.
+            await pa._stop_thread_control_watcher()
             state = await complete_unit(
                 self._db,
                 unit_id=claim.unit_id,
@@ -720,6 +796,10 @@ class StatelessTurnExecutor:
             t0 = time.perf_counter()
             await self._await_cloud_push(pa)
             timing["push"] = time.perf_counter() - t0
+            # Close the owner-consumption window before completion. A control
+            # committed after this point advances control_input_seq; the
+            # completion statement observes it and requeues atomically.
+            await pa._stop_thread_control_watcher()
             t0 = time.perf_counter()
             state = await self._complete_with_retry(claim, consumed_seq=target["seq"])
             timing["complete"] = time.perf_counter() - t0
@@ -745,13 +825,14 @@ class StatelessTurnExecutor:
             )
             logger.info(
                 "turn timing: unit=%s mode=%s bundle=%.2fs detach=%.2fs "
-                "attach=%.2fs pending=%.2fs turn=%.2fs push=%.2fs "
+                "attach=%.2fs controls=%.2fs pending=%.2fs turn=%.2fs push=%.2fs "
                 "complete=%.2fs total=%.2fs",
                 unit_id,
                 "reuse" if reuse else "fresh",
                 timing.get("bundle", 0.0),
                 timing.get("detach", 0.0),
                 timing.get("attach", 0.0),
+                timing.get("controls", 0.0),
                 timing.get("pending", 0.0),
                 timing.get("turn", 0.0),
                 timing.get("push", 0.0),
@@ -769,6 +850,7 @@ class StatelessTurnExecutor:
                 unit_id,
                 token,
             )
+            await pa._stop_thread_control_watcher()
             self._abort_turn_politely(pa)
             await self._wait_turn_unwind(turn_done, loop_task)
             # The aborted turn's in-memory tail may hold messages the fence
@@ -965,6 +1047,10 @@ class StatelessTurnExecutor:
     async def _release(self, claim: ClaimedUnit, *, reason: str) -> None:
         """Voluntary error release (§5.1): default linear backoff, token-
         guarded (a genuinely lost lease makes this a recorded no-op)."""
+        # Exact lifecycle boundary: no consumer may survive the state change
+        # from leased back to queued, even on an error path.
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await _pa()._stop_thread_control_watcher()
         try:
             state = await release_unit(
                 self._db,

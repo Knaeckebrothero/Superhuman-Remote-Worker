@@ -10,6 +10,7 @@ same split the attention-sleep suite uses.
 """
 
 import asyncio
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -20,6 +21,45 @@ from src.core.loader import OfficerConfig, _parse_officer_config
 from src.persistent_graph import TurnResult
 from src.tools.context import ToolContext
 from src.tools.core.officer import OFFICER_TOOLS_METADATA, create_officer_tools
+
+
+@pytest.mark.asyncio
+async def test_officer_respawn_closes_stale_control_admission(monkeypatch):
+    """Reactivating a dead officer cannot revive its prior owner credential."""
+    from orchestrator import main as orch_main
+
+    thread = {
+        "id": "11111111-1111-4111-8111-111111111111",
+        "status": "suspended",
+        "execution_lane": "pinned",
+        "config_name": "session_base",
+        "metadata": {"config_override": {"officer": {"enabled": True}}},
+    }
+    conn = AsyncMock()
+
+    @asynccontextmanager
+    async def acquire():
+        yield conn
+
+    db = MagicMock()
+    db.get_thread = AsyncMock(return_value=thread)
+    db.get_pending_officer_timer = AsyncMock(return_value=None)
+    db.merge_thread_config_override = AsyncMock()
+    db.acquire = acquire
+    wake = MagicMock()
+    wake._resolve_live_agent = AsyncMock(return_value=None)
+    provisioner = MagicMock()
+    provisioner.create_agent_pod = AsyncMock(return_value=True)
+    monkeypatch.setattr(orch_main, "postgres_db", db)
+    monkeypatch.setattr(orch_main, "persistent_provisioner", provisioner)
+
+    await orch_main._officer_watchdog_check_one(thread, wake)
+
+    sql = " ".join(conn.execute.await_args.args[0].split())
+    assert "agent_id = NULL" in sql
+    assert "status = 'active'" in sql
+    assert "control_admission_agent_id = NULL" in sql
+    provisioner.create_agent_pod.assert_awaited_once()
 
 
 # ---------------------------------------------------------------------------

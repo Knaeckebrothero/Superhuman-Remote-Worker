@@ -43,6 +43,8 @@ def make_claim(
     token: int = 3,
     input_seq: Optional[int] = 10,
     consumed_seq: Optional[int] = None,
+    control_input_seq: int = 0,
+    control_consumed_seq: int = 0,
     attempts: int = 1,
 ) -> ClaimedUnit:
     return ClaimedUnit(
@@ -54,6 +56,8 @@ def make_claim(
         consumed_seq=consumed_seq,
         attempts_since_completion=attempts,
         leased_until=datetime.now(timezone.utc),
+        control_input_seq=control_input_seq,
+        control_consumed_seq=control_consumed_seq,
     )
 
 
@@ -87,6 +91,8 @@ class Harness:
             "bundle": [],
             "attach": [],
             "terminate": [],
+            "control_start": [],
+            "control_stop": [],
         }
         self.consumed: List[Dict[str, Any]] = []
         self.db = FakeDB(pending_rows)
@@ -193,9 +199,24 @@ class Harness:
                 harness._fake_loop_tasks.append(pa._loop_task)
             return True
 
+        async def fake_start_control_watcher(*, lease_token=None, agent_id=None):
+            harness.calls["control_start"].append(
+                {"lease_token": lease_token, "agent_id": agent_id}
+            )
+            return 0
+
+        async def fake_stop_control_watcher():
+            harness.calls["control_stop"].append({})
+
         monkeypatch.setattr(pa, "_attach_session", fake_attach)
         monkeypatch.setattr(pa, "_terminate_session", fake_terminate)
         monkeypatch.setattr(pa, "_ensure_persistent_loop_started", fake_ensure)
+        monkeypatch.setattr(
+            pa, "_start_thread_control_watcher", fake_start_control_watcher
+        )
+        monkeypatch.setattr(
+            pa, "_stop_thread_control_watcher", fake_stop_control_watcher
+        )
 
         self.executor = te.StatelessTurnExecutor(
             pod_name="test-pod", abort_grace_seconds=0.05
@@ -344,6 +365,31 @@ class TestSkipIfAnswered:
         assert not harness.calls["attach"]
         assert not harness.consumed
         assert harness.executor._prefer_unit_id == unit
+
+    @pytest.mark.asyncio
+    async def test_pending_control_bypasses_skip_and_claims_without_human_input(
+        self, harness
+    ):
+        unit = uuid4()
+        harness.db.pending_rows = []
+        claim = make_claim(
+            unit_id=unit,
+            token=5,
+            input_seq=7,
+            consumed_seq=7,
+            control_input_seq=2,
+            control_consumed_seq=1,
+        )
+
+        await harness.executor._serve_claim(claim)
+        await _finish(harness)
+
+        assert harness.calls["bundle"]
+        assert harness.calls["attach"]
+        assert harness.calls["control_start"] == [{"lease_token": 5, "agent_id": None}]
+        assert harness.calls["complete"] == [
+            {"unit_id": unit, "lease_token": 5, "consumed_seq": 7}
+        ]
 
 
 # ---------------------------------------------------------------------------
@@ -599,6 +645,75 @@ class TestScrubOnClaim:
 
 
 class TestAffinity:
+    def test_fingerprint_ignores_only_inbox_owned_interactive_scalars(self):
+        base = {
+            "thread_id": "t1",
+            "resolved_config": {
+                "resolved_at": "first",
+                "agent": {
+                    "interactive": {
+                        "permission_mode": "supervised",
+                        "narration_mode": "auto",
+                        "idle_timeout_minutes": 30,
+                    },
+                    "llm": {"model": "m"},
+                },
+            },
+        }
+        changed_controls = {
+            "thread_id": "t1",
+            "resolved_config": {
+                "resolved_at": "second",
+                "agent": {
+                    "interactive": {
+                        "permission_mode": "autonomous",
+                        "narration_mode": "verbose",
+                        "idle_timeout_minutes": 30,
+                    },
+                    "llm": {"model": "m"},
+                },
+            },
+        }
+        changed_runtime_config = {
+            **changed_controls,
+            "resolved_config": {
+                **changed_controls["resolved_config"],
+                "agent": {
+                    **changed_controls["resolved_config"]["agent"],
+                    "interactive": {
+                        **changed_controls["resolved_config"]["agent"]["interactive"],
+                        "idle_timeout_minutes": 60,
+                    },
+                },
+            },
+        }
+
+        assert te.attach_fingerprint(base) == te.attach_fingerprint(changed_controls)
+        assert te.attach_fingerprint(base) != te.attach_fingerprint(
+            changed_runtime_config
+        )
+
+    def test_fingerprint_ignores_fallback_control_scalars(self):
+        first = {
+            "thread_id": "t1",
+            "config_override": {
+                "interactive": {
+                    "permission_mode": "supervised",
+                    "narration_mode": "auto",
+                }
+            },
+        }
+        second = {
+            "thread_id": "t1",
+            "config_override": {
+                "interactive": {
+                    "permission_mode": "auto_accept",
+                    "narration_mode": "silent",
+                }
+            },
+        }
+        assert te.attach_fingerprint(first) == te.attach_fingerprint(second)
+
     @pytest.mark.asyncio
     async def test_same_thread_same_fingerprint_skips_reattach(self, harness):
         unit = uuid4()
@@ -620,6 +735,52 @@ class TestAffinity:
         # The lease handle was repointed at the NEW claim's token.
         assert harness.executor._lease.lease_token == 2
         assert len(harness.calls["complete"]) == 2
+
+    @pytest.mark.asyncio
+    async def test_control_scalar_bundle_change_reuses_warm_session(self, harness):
+        unit = uuid4()
+        base = harness.attach_for(str(unit))
+        first = {
+            **base,
+            "resolved_config": {
+                **base["resolved_config"],
+                "agent": {
+                    **base["resolved_config"]["agent"],
+                    "interactive": {
+                        "permission_mode": "supervised",
+                        "narration_mode": "auto",
+                    },
+                },
+            },
+        }
+        harness.set_attach(str(unit), first)
+        harness.db.pending_rows = [{"id": str(uuid4()), "seq": 1, "content": "one"}]
+        await harness.executor._serve_claim(
+            make_claim(unit_id=unit, token=1, input_seq=1)
+        )
+
+        second = {
+            **first,
+            "resolved_config": {
+                **first["resolved_config"],
+                "agent": {
+                    **first["resolved_config"]["agent"],
+                    "interactive": {
+                        "permission_mode": "autonomous",
+                        "narration_mode": "verbose",
+                    },
+                },
+            },
+        }
+        harness.set_attach(str(unit), second)
+        harness.db.pending_rows = [{"id": str(uuid4()), "seq": 2, "content": "two"}]
+        await harness.executor._serve_claim(
+            make_claim(unit_id=unit, token=2, input_seq=2)
+        )
+        await _finish(harness)
+
+        assert len(harness.calls["attach"]) == 1
+        assert not harness.calls["terminate"]
 
     @pytest.mark.asyncio
     async def test_different_thread_detaches_then_attaches(self, harness):

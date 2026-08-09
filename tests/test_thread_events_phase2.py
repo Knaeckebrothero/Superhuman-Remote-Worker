@@ -15,10 +15,19 @@ Covers:
 """
 
 import asyncio
+import inspect
 import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+
+
+def test_pruner_preserves_receipts_until_control_request_is_terminal():
+    import orchestrator.main as om
+
+    source = inspect.getsource(om.thread_events_prune_sweeper)
+    assert source.count("request.id = thread_events.control_request_id") == 2
+    assert source.count("request.outcome IS NULL") == 2
 
 
 # ---------------------------------------------------------------------------
@@ -208,6 +217,94 @@ class TestBroadcastCursor:
         rows = json.loads(recorded[0][2])
         assert [(row["seq"], row["kind"]) for row in rows] == [(1, "token")]
         assert recorded[0][3] == 0
+
+    @pytest.mark.asyncio
+    async def test_durable_broadcast_waits_for_commit_and_links_request(self):
+        import src.api.persistent_app as mod
+
+        write_started = asyncio.Event()
+        allow_commit = asyncio.Event()
+        recorded = []
+
+        class _FakeConn:
+            def transaction(self):
+                return self
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return None
+
+            async def fetchval(self, *args):
+                recorded.append(args)
+                if "INSERT INTO thread_events" in args[0]:
+                    write_started.set()
+                    await allow_commit.wait()
+                    return len(json.loads(args[2]))
+                return 1
+
+        class _Acquire:
+            async def __aenter__(self):
+                return _FakeConn()
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return None
+
+        pool = MagicMock()
+        pool.acquire = lambda: _Acquire()
+        session = MagicMock()
+        session.postgres_conn = pool
+        request_id = "77777777-7777-4777-8777-777777777777"
+        agent_id = "88888888-8888-4888-8888-888888888888"
+        mod._session = session
+        mod._thread_id = "99999999-9999-4999-8999-999999999999"
+        mod._events_epoch = 3
+        mod._next_seq = 10
+        live = mod._subscribe("durable-control")
+        writer = mod._OrderedPersistentEventWriter(
+            postgres_conn=pool,
+            thread_id=mod._thread_id,
+            epoch=3,
+            on_terminal_failure=lambda _events, _reason: None,
+            pinned_agent_id=agent_id,
+        )
+        writer.start()
+        mod._event_writer = writer
+
+        durable = asyncio.create_task(
+            mod._broadcast_durable(
+                "mode.changed",
+                {
+                    "mode": "autonomous",
+                    "request_id": request_id,
+                    "request_seq": 1,
+                    "method": "mode.set",
+                },
+                control_request_id=request_id,
+                lease_token=None,
+                agent_id=agent_id,
+            )
+        )
+        await asyncio.wait_for(write_started.wait(), timeout=1)
+        assert not durable.done()
+        assert live.empty()
+        allow_commit.set()
+        assert await durable == (3, 11)
+        await asyncio.sleep(0)
+        assert live.get_nowait()["params"]["_seq"] == [3, 11]
+        await writer.close()
+        mod._event_writer = None
+
+        assert "execution_lane = 'pinned'" in recorded[0][0]
+        assert "FROM agents" in recorded[1][0]
+        assert "thread_control_requests" in recorded[2][0]
+        insert = next(
+            call for call in recorded if "INSERT INTO thread_events" in call[0]
+        )
+        rows = json.loads(insert[2])
+        assert rows[0]["control_request_id"] == request_id
+        assert recorded[0][2] == agent_id
 
 
 class TestOrderedPersistentEventWriter:

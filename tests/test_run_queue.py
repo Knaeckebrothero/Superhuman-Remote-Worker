@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -56,9 +57,15 @@ from src.shared.run_queue import (
     list_active,
     queue_depth_for,
     reap_expired,
+    record_control_seq,
     record_input_seq,
     release_unit,
     unpark_unit,
+)
+from src.shared.thread_controls import (
+    adopt_next_pinned_control_request,
+    fetch_next_control_request,
+    finalize_control_request,
 )
 
 DSN = os.environ.get("RUN_QUEUE_TEST_DSN", "")
@@ -83,6 +90,9 @@ _MIGRATIONS_DIR = (
 MIGRATION_FILES = [
     _MIGRATIONS_DIR / "0115_run_queue.sql",
     _MIGRATIONS_DIR / "0117_run_queue_affinity.sql",
+    _MIGRATIONS_DIR / "0119_thread_control_inbox.sql",
+    _MIGRATIONS_DIR / "0120_thread_control_receipt_idx.notx.sql",
+    _MIGRATIONS_DIR / "0121_thread_control_validate_constraints.sql",
 ]
 
 SESSION = UNIT_KIND_SESSION_TURN
@@ -109,12 +119,30 @@ def _assert_scratch_dsn() -> None:
 async def _apply_schema() -> None:
     conn = await asyncpg.connect(DSN, timeout=10)
     try:
+        await conn.execute("DROP TABLE IF EXISTS thread_events CASCADE")
+        await conn.execute("DROP TABLE IF EXISTS thread_control_requests CASCADE")
         await conn.execute("DROP TABLE IF EXISTS run_queue CASCADE")
         await conn.execute("DROP TABLE IF EXISTS threads CASCADE")
-        # Minimal prerequisite stub: 0115 ALTERs threads. Nothing in
-        # src/shared/run_queue touches threads — the stub exists only so the
-        # migration file applies verbatim.
-        await conn.execute("CREATE TABLE threads (id UUID PRIMARY KEY)")
+        await conn.execute("DROP TABLE IF EXISTS agents CASCADE")
+        await conn.execute('CREATE EXTENSION IF NOT EXISTS "uuid-ossp"')
+        # Minimal prerequisite stubs: 0115 ALTERs threads and 0119 ALTERs
+        # thread_events. The queue API does not otherwise touch either table;
+        # they exist here only so the queue-shaping migrations apply verbatim.
+        await conn.execute("CREATE TABLE agents (id UUID PRIMARY KEY, thread_id UUID)")
+        await conn.execute(
+            "CREATE TABLE threads ("
+            "id UUID PRIMARY KEY, user_id UUID, agent_id UUID, "
+            "status TEXT NOT NULL DEFAULT 'active', "
+            "permission_mode TEXT NOT NULL DEFAULT 'supervised', "
+            "metadata JSONB NOT NULL DEFAULT '{}'::jsonb"
+            ")"
+        )
+        await conn.execute(
+            "CREATE TABLE thread_events ("
+            "id BIGSERIAL PRIMARY KEY, thread_id UUID, epoch INTEGER, "
+            "seq BIGINT, kind TEXT, payload JSONB"
+            ")"
+        )
         for migration in MIGRATION_FILES:
             await conn.execute(migration.read_text())
     finally:
@@ -133,7 +161,10 @@ def schema():
 async def conn(schema):
     """A fresh connection with an empty run_queue (enqueue_ord restarted)."""
     c = await asyncpg.connect(DSN, timeout=10)
-    await c.execute("TRUNCATE run_queue RESTART IDENTITY")
+    await c.execute(
+        "TRUNCATE thread_events, thread_control_requests, run_queue, "
+        "agents, threads RESTART IDENTITY CASCADE"
+    )
     try:
         yield c
     finally:
@@ -585,6 +616,524 @@ class TestInputDuringLease:
             )
             == STATE_DONE
         )
+
+
+# =============================================================================
+# Control watermarks (migration 0119)
+# =============================================================================
+
+
+class TestControlWatermarks:
+    async def test_existing_idle_queue_baselines_prior_lane_control_sequence(
+        self, conn
+    ):
+        u = uuid4()
+        await enqueue_unit(conn, unit_id=u, unit_kind=SESSION, input_seq=8)
+        row = await _row(conn, u)
+        assert (row["control_input_seq"], row["control_consumed_seq"]) == (0, 0)
+
+        await record_control_seq(
+            conn,
+            unit_id=u,
+            unit_kind=SESSION,
+            control_seq=4,
+            baseline_input_seq=8,
+        )
+        row = await _row(conn, u)
+        assert (row["control_input_seq"], row["control_consumed_seq"]) == (4, 3)
+
+    async def test_existing_pending_control_is_never_skipped_by_new_baseline(
+        self, conn
+    ):
+        u = uuid4()
+        await record_control_seq(
+            conn,
+            unit_id=u,
+            unit_kind=SESSION,
+            control_seq=1,
+            baseline_input_seq=8,
+        )
+        await record_control_seq(
+            conn,
+            unit_id=u,
+            unit_kind=SESSION,
+            control_seq=4,
+            baseline_input_seq=8,
+        )
+        row = await _row(conn, u)
+        assert (row["control_input_seq"], row["control_consumed_seq"]) == (4, 0)
+
+    async def test_control_committed_during_lease_forces_completion_requeue(self, conn):
+        """A committed control cannot be stranded by a racing completion."""
+        u = uuid4()
+        await enqueue_unit(conn, unit_id=u, unit_kind=SESSION, input_seq=7)
+        claimed = await claim_unit(conn, unit_kind=SESSION, pod_name="p1")
+
+        state = await record_control_seq(
+            conn,
+            unit_id=u,
+            unit_kind=SESSION,
+            control_seq=1,
+            baseline_input_seq=7,
+        )
+        assert state == STATE_LEASED
+
+        state = await complete_unit(
+            conn,
+            unit_id=u,
+            lease_token=claimed.lease_token,
+            consumed_seq=7,
+        )
+        assert state == STATE_QUEUED
+        row = await _row(conn, u)
+        assert (row["control_input_seq"], row["control_consumed_seq"]) == (1, 0)
+        assert row["leased_by"] is None and row["leased_until"] is None
+
+    async def test_control_committed_after_completion_revives_done(self, conn):
+        u = uuid4()
+        await enqueue_unit(conn, unit_id=u, unit_kind=SESSION, input_seq=11)
+        claimed = await claim_unit(conn, unit_kind=SESSION, pod_name="p1")
+        assert (
+            await complete_unit(
+                conn,
+                unit_id=u,
+                lease_token=claimed.lease_token,
+                consumed_seq=11,
+            )
+            == STATE_DONE
+        )
+
+        state = await record_control_seq(
+            conn,
+            unit_id=u,
+            unit_kind=SESSION,
+            control_seq=1,
+            baseline_input_seq=11,
+            fair_key="owner-1",
+        )
+        assert state == STATE_QUEUED
+        row = await _row(conn, u)
+        assert row["state"] == STATE_QUEUED
+        assert row["fair_key"] == "owner-1"
+        assert (row["control_input_seq"], row["control_consumed_seq"]) == (1, 0)
+
+    async def test_control_only_admission_maps_claim_and_read_model_watermarks(
+        self, conn
+    ):
+        """The migration columns reach both public result dataclasses."""
+        u = uuid4()
+        state = await record_control_seq(
+            conn,
+            unit_id=u,
+            unit_kind=SESSION,
+            control_seq=4,
+            baseline_input_seq=23,
+        )
+        assert state == STATE_QUEUED
+
+        before_claim = await queue_depth_for(conn, unit_id=u)
+        assert before_claim is not None
+        assert (before_claim.input_seq, before_claim.consumed_seq) == (23, 23)
+        assert before_claim.has_pending_input is False
+        assert (
+            before_claim.control_input_seq,
+            before_claim.control_consumed_seq,
+            before_claim.has_pending_control,
+        ) == (4, 3, True)
+
+        claimed = await claim_unit(conn, unit_kind=SESSION, pod_name="p1")
+        assert claimed is not None and claimed.unit_id == u
+        assert (claimed.input_seq, claimed.consumed_seq) == (23, 23)
+        assert (claimed.control_input_seq, claimed.control_consumed_seq) == (4, 3)
+
+
+class TestControlFinalization:
+    async def _stateless_request_with_receipt(self, conn):
+        thread_id = uuid4()
+        owner_id = uuid4()
+        request_id = uuid4()
+        client_request_id = uuid4()
+        await conn.execute(
+            "INSERT INTO threads (id, user_id, execution_lane) VALUES ($1, $2, $3)",
+            thread_id,
+            owner_id,
+            "stateless",
+        )
+        await record_control_seq(
+            conn,
+            unit_id=thread_id,
+            unit_kind=SESSION,
+            control_seq=1,
+            baseline_input_seq=12,
+            fair_key=str(owner_id),
+        )
+        claim = await claim_unit(conn, unit_kind=SESSION, pod_name="owner-pod")
+        await conn.execute(
+            "INSERT INTO thread_control_requests ("
+            "id, thread_id, request_seq, client_request_id, verb, payload, "
+            "requested_by"
+            ") VALUES ($1, $2, 1, $3, 'mode.set', $4::jsonb, 'owner')",
+            request_id,
+            thread_id,
+            client_request_id,
+            '{"mode":"autonomous"}',
+        )
+        await conn.execute(
+            "INSERT INTO thread_events ("
+            "thread_id, epoch, seq, kind, payload, control_request_id"
+            ") VALUES ($1, 3, 9, 'mode.changed', $2::jsonb, $3)",
+            thread_id,
+            json.dumps(
+                {
+                    "request_id": str(request_id),
+                    "client_request_id": str(client_request_id),
+                    "request_seq": 1,
+                    "method": "mode.set",
+                    "mode": "autonomous",
+                }
+            ),
+            request_id,
+        )
+        return thread_id, request_id, claim
+
+    async def test_receipt_finalization_advances_watermark_atomically(self, conn):
+        thread_id, request_id, claim = await self._stateless_request_with_receipt(conn)
+
+        async with conn.transaction():
+            result = await finalize_control_request(
+                conn,
+                request_id=request_id,
+                lease_token=claim.lease_token,
+            )
+        assert result == "applied"
+        request = await conn.fetchrow(
+            "SELECT outcome, journal_epoch, journal_seq, applied_lease_token "
+            "FROM thread_control_requests WHERE id = $1",
+            request_id,
+        )
+        assert tuple(request.values()) == ("applied", 3, 9, claim.lease_token)
+        queue = await _row(conn, thread_id)
+        assert (queue["control_input_seq"], queue["control_consumed_seq"]) == (1, 1)
+        assert (
+            await conn.fetchval(
+                "SELECT permission_mode FROM threads WHERE id = $1", thread_id
+            )
+            == "autonomous"
+        )
+        assert (
+            await complete_unit(
+                conn,
+                unit_id=thread_id,
+                lease_token=claim.lease_token,
+                consumed_seq=12,
+            )
+            == STATE_DONE
+        )
+
+    async def test_control_receipt_is_unique_and_constraints_are_validated(self, conn):
+        thread_id, request_id, _claim = await self._stateless_request_with_receipt(conn)
+
+        with pytest.raises(asyncpg.UniqueViolationError):
+            await conn.execute(
+                "INSERT INTO thread_events ("
+                "thread_id, epoch, seq, kind, payload, control_request_id"
+                ") VALUES ($1, 3, 10, 'mode.changed', '{}'::jsonb, $2)",
+                thread_id,
+                request_id,
+            )
+
+        constraints = {
+            row["conname"]: row["convalidated"]
+            for row in await conn.fetch(
+                "SELECT conname, convalidated FROM pg_constraint "
+                "WHERE conname = ANY($1::text[])",
+                [
+                    "valid_narration_mode",
+                    "thread_events_control_request_thread_fkey",
+                ],
+            )
+        }
+        assert constraints == {
+            "valid_narration_mode": True,
+            "thread_events_control_request_thread_fkey": True,
+        }
+        index = await conn.fetchrow(
+            "SELECT indisunique, indisvalid FROM pg_index "
+            "WHERE indexrelid = 'idx_thread_events_control_request'::regclass"
+        )
+        assert tuple(index.values()) == (True, True)
+
+    async def test_pinned_control_capability_defaults_closed(self, conn):
+        thread_id = uuid4()
+        await conn.execute(
+            "INSERT INTO threads (id, execution_lane) VALUES ($1, 'pinned')",
+            thread_id,
+        )
+        assert (
+            await conn.fetchval(
+                "SELECT control_admission_agent_id FROM threads WHERE id = $1",
+                thread_id,
+            )
+            is None
+        )
+
+    async def test_old_lease_cannot_finalize_committed_receipt(self, conn):
+        thread_id, request_id, claim = await self._stateless_request_with_receipt(conn)
+        await conn.execute(
+            "UPDATE run_queue SET lease_token = lease_token + 1 WHERE unit_id = $1",
+            thread_id,
+        )
+
+        async with conn.transaction():
+            result = await finalize_control_request(
+                conn,
+                request_id=request_id,
+                lease_token=claim.lease_token,
+            )
+        assert result == "lost_owner"
+        assert (
+            await conn.fetchval(
+                "SELECT outcome FROM thread_control_requests WHERE id = $1",
+                request_id,
+            )
+            is None
+        )
+        assert (await _row(conn, thread_id))["control_consumed_seq"] == 0
+
+    async def test_scalar_request_and_watermark_roll_back_together(self, conn):
+        thread_id, request_id, claim = await self._stateless_request_with_receipt(conn)
+
+        transaction = conn.transaction()
+        await transaction.start()
+        assert (
+            await finalize_control_request(
+                conn,
+                request_id=request_id,
+                lease_token=claim.lease_token,
+            )
+            == "applied"
+        )
+        assert (
+            await conn.fetchval(
+                "SELECT permission_mode FROM threads WHERE id = $1", thread_id
+            )
+            == "autonomous"
+        )
+        assert (await _row(conn, thread_id))["control_consumed_seq"] == 1
+        await transaction.rollback()
+
+        assert (
+            await conn.fetchval(
+                "SELECT permission_mode FROM threads WHERE id = $1", thread_id
+            )
+            == "supervised"
+        )
+        assert (
+            await conn.fetchval(
+                "SELECT outcome FROM thread_control_requests WHERE id = $1",
+                request_id,
+            )
+            is None
+        )
+        assert (await _row(conn, thread_id))["control_consumed_seq"] == 0
+
+    async def test_pinned_rebind_rejects_former_exact_agent(self, conn):
+        thread_id = uuid4()
+        owner_id = uuid4()
+        old_agent = uuid4()
+        new_agent = uuid4()
+        request_id = uuid4()
+        client_request_id = uuid4()
+        await conn.execute(
+            "INSERT INTO agents (id, thread_id) VALUES ($1, $2), ($3, $2)",
+            old_agent,
+            thread_id,
+            new_agent,
+        )
+        await conn.execute(
+            "INSERT INTO threads (id, user_id, agent_id, execution_lane) "
+            "VALUES ($1, $2, $3, 'pinned')",
+            thread_id,
+            owner_id,
+            new_agent,
+        )
+        await conn.execute(
+            "INSERT INTO thread_control_requests ("
+            "id, thread_id, request_seq, client_request_id, verb, payload, "
+            "requested_by, accepted_agent_id"
+            ") VALUES ($1, $2, 1, $3, 'narration.set', $4::jsonb, 'owner', $5)",
+            request_id,
+            thread_id,
+            client_request_id,
+            '{"mode":"silent"}',
+            old_agent,
+        )
+        await conn.execute(
+            "INSERT INTO thread_events ("
+            "thread_id, epoch, seq, kind, payload, control_request_id"
+            ") VALUES ($1, 1, 2, 'narration.changed', $2::jsonb, $3)",
+            thread_id,
+            json.dumps(
+                {
+                    "request_id": str(request_id),
+                    "client_request_id": str(client_request_id),
+                    "request_seq": 1,
+                    "method": "narration.set",
+                    "mode": "silent",
+                }
+            ),
+            request_id,
+        )
+
+        async with conn.transaction():
+            result = await finalize_control_request(
+                conn,
+                request_id=request_id,
+                agent_id=old_agent,
+            )
+        assert result == "lost_owner"
+        assert (
+            await conn.fetchval(
+                "SELECT outcome FROM thread_control_requests WHERE id = $1",
+                request_id,
+            )
+            is None
+        )
+
+        # The committed receipt proves the old exact binding applied it. The
+        # new exact owner may finish durable convergence without re-journaling;
+        # attribution remains with the old writer.
+        async with conn.transaction():
+            result = await finalize_control_request(
+                conn,
+                request_id=request_id,
+                agent_id=new_agent,
+            )
+        assert result == "applied"
+        terminal = await conn.fetchrow(
+            "SELECT outcome, applied_agent_id FROM thread_control_requests "
+            "WHERE id = $1",
+            request_id,
+        )
+        assert tuple(terminal.values()) == ("applied", old_agent)
+        assert (
+            await conn.fetchval(
+                "SELECT narration_mode FROM threads WHERE id = $1", thread_id
+            )
+            == "silent"
+        )
+
+    async def test_pinned_rebind_adopts_oldest_unreceipted_without_overtaking(
+        self, conn
+    ):
+        thread_id = uuid4()
+        owner_id = uuid4()
+        old_agent = uuid4()
+        new_agent = uuid4()
+        await conn.execute(
+            "INSERT INTO agents (id, thread_id) VALUES ($1, $2), ($3, $2)",
+            old_agent,
+            thread_id,
+            new_agent,
+        )
+        await conn.execute(
+            "INSERT INTO threads (id, user_id, agent_id, execution_lane) "
+            "VALUES ($1, $2, $3, 'pinned')",
+            thread_id,
+            owner_id,
+            new_agent,
+        )
+        first_id = uuid4()
+        second_id = uuid4()
+        await conn.execute(
+            "INSERT INTO thread_control_requests ("
+            "id, thread_id, request_seq, client_request_id, verb, payload, "
+            "requested_by, accepted_agent_id"
+            ") VALUES "
+            "($1, $3, 1, $4, 'mode.set', $5::jsonb, 'owner', $6), "
+            "($2, $3, 2, $7, 'narration.set', $8::jsonb, 'owner', $9)",
+            first_id,
+            second_id,
+            thread_id,
+            uuid4(),
+            '{"mode":"autonomous"}',
+            old_agent,
+            uuid4(),
+            '{"mode":"silent"}',
+            new_agent,
+        )
+
+        # Global order wins over per-agent filtering: seq2 is not visible
+        # while the older handoff request still belongs to the dead owner.
+        assert (
+            await fetch_next_control_request(
+                conn, thread_id=thread_id, agent_id=new_agent
+            )
+            is None
+        )
+        async with conn.transaction():
+            assert await adopt_next_pinned_control_request(
+                conn, thread_id=thread_id, agent_id=new_agent
+            )
+        first = await fetch_next_control_request(
+            conn, thread_id=thread_id, agent_id=new_agent
+        )
+        assert first is not None
+        assert first.id == first_id
+        assert first.request_seq == 1
+        assert first.accepted_agent_id == new_agent
+
+    async def test_control_receipt_cannot_link_across_threads(self, conn):
+        owner_id = uuid4()
+        request_thread = uuid4()
+        event_thread = uuid4()
+        request_id = uuid4()
+        await conn.execute(
+            "INSERT INTO threads (id, user_id, execution_lane) "
+            "VALUES ($1, $3, 'stateless'), ($2, $3, 'stateless')",
+            request_thread,
+            event_thread,
+            owner_id,
+        )
+        await conn.execute(
+            "INSERT INTO thread_control_requests ("
+            "id, thread_id, request_seq, client_request_id, verb, payload, "
+            "requested_by"
+            ") VALUES ($1, $2, 1, $3, 'mode.set', $4::jsonb, 'owner')",
+            request_id,
+            request_thread,
+            uuid4(),
+            '{"mode":"supervised"}',
+        )
+
+        with pytest.raises(asyncpg.ForeignKeyViolationError):
+            await conn.execute(
+                "INSERT INTO thread_events ("
+                "thread_id, epoch, seq, kind, payload, control_request_id"
+                ") VALUES ($1, 1, 1, 'mode.changed', $2::jsonb, $3)",
+                event_thread,
+                json.dumps(
+                    {
+                        "request_id": str(request_id),
+                        "request_seq": 1,
+                        "method": "mode.set",
+                        "mode": "supervised",
+                    }
+                ),
+                request_id,
+            )
+
+    async def test_narration_mode_database_vocabulary_is_closed(self, conn):
+        thread_id = uuid4()
+        await conn.execute(
+            "INSERT INTO threads (id, execution_lane) VALUES ($1, 'stateless')",
+            thread_id,
+        )
+        with pytest.raises(asyncpg.CheckViolationError):
+            await conn.execute(
+                "UPDATE threads SET narration_mode = 'future-mode' WHERE id = $1",
+                thread_id,
+            )
 
 
 # =============================================================================

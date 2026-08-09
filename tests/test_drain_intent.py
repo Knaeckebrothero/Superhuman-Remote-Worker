@@ -279,7 +279,9 @@ class TestPersistentDrainHandler:
         ):
             await persistent_app._terminate_session("drain", mark_thread=False)
 
-        # The re-entrant loop_complete call must NOT have written 'ended'.
+        # Admission closes before the watcher stops. The orchestrator-owned
+        # suspend happens after this inner teardown; neither the outer drain
+        # nor the re-entrant loop_complete may write a lifecycle value here.
         assert status_writes == []
         assert persistent_app._session is None
         assert persistent_app._terminating is False
@@ -303,6 +305,73 @@ class TestPersistentDrainHandler:
         detach.assert_not_awaited()
         exit_.assert_not_called()
         assert persistent_app._drain_intent_handled is False
+
+
+class TestOrchestratorInactiveCapabilityFence:
+    """Orchestrator-owned shutdown paths close pinned control admission."""
+
+    @staticmethod
+    def _db(*, status: str = "active"):
+        conn = AsyncMock()
+        conn.fetchval = AsyncMock(return_value="tid-drain-1")
+        acquire = AsyncMock()
+        acquire.__aenter__.return_value = conn
+        acquire.__aexit__.return_value = False
+        db = MagicMock()
+        db.get_thread = AsyncMock(return_value={"id": "tid-drain-1", "status": status})
+        db.acquire = MagicMock(return_value=acquire)
+        return db, conn
+
+    @pytest.mark.asyncio
+    async def test_drain_suspend_closes_control_admission(self):
+        from orchestrator import main as orch_main
+
+        db, conn = self._db()
+        suspension = MagicMock()
+        suspension.is_enabled = True
+        suspension.suspend_thread_workspace = AsyncMock(return_value=True)
+        with (
+            patch.object(orch_main, "require_internal", AsyncMock()),
+            patch.object(orch_main, "postgres_db", db),
+            patch.object(orch_main, "workspace_suspension_service", suspension),
+        ):
+            result = await orch_main.agent_suspend_thread(object(), "tid-drain-1")
+
+        assert result == {"suspended": True, "status": "suspended"}
+        sql = " ".join(conn.fetchval.await_args.args[0].split())
+        assert "status = 'suspended'" in sql
+        assert "agent_id = NULL" in sql
+        assert "control_admission_agent_id = NULL" in sql
+
+    @pytest.mark.asyncio
+    async def test_legacy_agent_end_closes_control_admission(self):
+        from orchestrator import main as orch_main
+
+        db, conn = self._db()
+        db.get_thread = AsyncMock(
+            return_value={"id": "tid-drain-1", "status": "active", "metadata": {}}
+        )
+        suspend_resources = AsyncMock()
+        conclude = AsyncMock()
+        with (
+            patch.object(orch_main, "require_internal", AsyncMock()),
+            patch.object(orch_main, "postgres_db", db),
+            patch.object(orch_main, "_suspend_thread_resources", suspend_resources),
+            patch.object(orch_main, "_conclude_conference_if_any", conclude),
+        ):
+            result = await orch_main.agent_update_thread_status(
+                object(),
+                "tid-drain-1",
+                orch_main.AgentThreadStatusRequest(status="ended"),
+            )
+            await asyncio.sleep(0)
+
+        assert result == {"status": "ended"}
+        sql = " ".join(conn.fetchval.await_args.args[0].split())
+        assert "status = 'ended'" in sql
+        assert "control_admission_agent_id = NULL" in sql
+        suspend_resources.assert_awaited_once_with("tid-drain-1")
+        conclude.assert_awaited_once()
 
 
 # =============================================================================

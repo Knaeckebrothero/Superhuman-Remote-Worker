@@ -31,6 +31,8 @@ class ClaimedUnit:
     consumed_seq: int | None
     attempts_since_completion: int
     leased_until: datetime
+    control_input_seq: int = 0
+    control_consumed_seq: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -81,3 +83,6 @@ class QueueWatermarks:
     input_seq: int | None
     consumed_seq: int | None
     has_pending_input: bool
+    control_input_seq: int = 0
+    control_consumed_seq: int = 0
+    has_pending_control: bool = False

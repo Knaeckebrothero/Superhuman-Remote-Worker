@@ -1519,6 +1519,11 @@
       "autoAccept": "Auto-accept",
       "stop": "Stop"
     },
+    "control": {
+      "backpressure": "Too many session setting changes are waiting. Try again shortly.",
+      "admissionFailed": "The session setting could not be changed. Try again.",
+      "ownerRejected": "The serving agent rejected this session setting. Reload and try again."
+    },
     "workspaceOffer": {
       "title": "Workspace upgrade requested",
       "detail": "The agent asked for a {{tier}} workspace.",

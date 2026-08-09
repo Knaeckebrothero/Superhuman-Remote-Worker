@@ -31,6 +31,7 @@ class _SnapshotConn:
         lifecycle: dict | None = None,
         running: dict | None = None,
         permissions: list[dict] | None = None,
+        control_receipts: list[dict] | None = None,
         message_count: int = 0,
         live_turn_count: int = 0,
     ) -> None:
@@ -38,6 +39,7 @@ class _SnapshotConn:
         self.lifecycle = lifecycle
         self.running = running
         self.permissions = permissions or []
+        self.control_receipts = control_receipts or []
         self.message_count = message_count
         self.live_turn_count = live_turn_count
         self.calls: list[tuple[str, tuple]] = []
@@ -66,8 +68,19 @@ class _SnapshotConn:
 
     async def fetch(self, sql: str, *args):
         self.calls.append((sql, args))
-        assert "FROM thread_permission_requests" in sql
-        return self.permissions
+        if "FROM thread_permission_requests" in sql:
+            return self.permissions
+        if "FROM thread_control_requests" in sql:
+            # Model the query's partial read rather than handing finalized
+            # history to the snapshot builder. Keeping ``outcome`` on these
+            # fixture rows also lets tests pin the SQL predicate explicitly.
+            assert "request.outcome IS NULL" in sql
+            return [
+                receipt
+                for receipt in self.control_receipts
+                if receipt.get("outcome") is None
+            ]
+        raise AssertionError(f"unexpected fetch query: {sql}")
 
 
 class _SnapshotDB:
@@ -91,6 +104,44 @@ def _thread(**overrides):
     }
     row.update(overrides)
     return row
+
+
+def _control_receipt(
+    *,
+    request_id: str,
+    request_seq: int,
+    verb: str,
+    mode: str,
+    event_kind: str | None = None,
+    event_mode: str | None = None,
+    event_method: str | None = None,
+    event_epoch: int = 2,
+    outcome: str | None = None,
+) -> dict:
+    client_request_id = f"00000000-0000-4000-8000-{request_seq:012d}"
+    expected_kind = {
+        "mode.set": "mode.changed",
+        "narration.set": "narration.changed",
+    }.get(verb, "control.rejected")
+    return {
+        "request_id": request_id,
+        "client_request_id": client_request_id,
+        "request_seq": request_seq,
+        "verb": verb,
+        "request_payload": {"mode": mode},
+        "event_kind": event_kind or expected_kind,
+        "event_payload": {
+            "request_id": request_id,
+            "client_request_id": client_request_id,
+            "request_seq": request_seq,
+            "method": event_method or verb,
+            "mode": event_mode or mode,
+        },
+        # The production SELECT intentionally does not constrain event epoch:
+        # a receipt can survive the owner's crash and a later epoch bump.
+        "event_epoch": event_epoch,
+        "outcome": outcome,
+    }
 
 
 @pytest.mark.asyncio
@@ -201,6 +252,129 @@ async def test_snapshot_has_full_lane_free_shape_and_normalizes_durable_rows():
         "turn.parked",
         "ready",
     ]
+
+
+@pytest.mark.asyncio
+async def test_valid_pending_prior_epoch_receipt_overlays_old_thread_scalar():
+    receipt = _control_receipt(
+        request_id="11111111-1111-4111-8111-111111111111",
+        request_seq=7,
+        verb="mode.set",
+        mode="autonomous",
+        event_epoch=2,
+    )
+    conn = _SnapshotConn(
+        thread=_thread(
+            permission_mode="supervised",
+            narration_mode="auto",
+            events_epoch=3,
+        ),
+        control_receipts=[receipt],
+    )
+
+    result = await build_session_state_snapshot(_SnapshotDB(conn), "thread-1")
+
+    assert result is not None
+    assert result["permission_mode"] == "autonomous"
+    assert result["narration_mode"] == "auto"
+    assert result["event_cursor"]["epoch"] == 3
+    control_sql = next(
+        sql for sql, _args in conn.calls if "FROM thread_control_requests" in sql
+    )
+    assert "event.epoch =" not in " ".join(control_sql.split())
+
+
+@pytest.mark.asyncio
+async def test_finalized_historical_receipt_does_not_overlay_newer_thread_scalar():
+    historical = _control_receipt(
+        request_id="22222222-2222-4222-8222-222222222222",
+        request_seq=4,
+        verb="mode.set",
+        mode="autonomous",
+        event_epoch=1,
+        outcome="applied",
+    )
+    conn = _SnapshotConn(
+        thread=_thread(
+            permission_mode="supervised",
+            narration_mode="verbose",
+        ),
+        control_receipts=[historical],
+    )
+
+    result = await build_session_state_snapshot(_SnapshotDB(conn), "thread-1")
+
+    assert result is not None
+    assert result["permission_mode"] == "supervised"
+    assert result["narration_mode"] == "verbose"
+    control_sql = next(
+        sql for sql, _args in conn.calls if "FROM thread_control_requests" in sql
+    )
+    assert "request.outcome IS NULL" in control_sql
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "receipt_override",
+    [
+        pytest.param(
+            {"event_kind": "narration.changed"},
+            id="mismatched-kind",
+        ),
+        pytest.param(
+            {"event_mode": "supervised"},
+            id="mismatched-mode",
+        ),
+        pytest.param(
+            {"event_method": "narration.set"},
+            id="mismatched-method",
+        ),
+    ],
+)
+async def test_mismatched_pending_control_receipt_is_ignored(receipt_override):
+    receipt = _control_receipt(
+        request_id="33333333-3333-4333-8333-333333333333",
+        request_seq=9,
+        verb="mode.set",
+        mode="autonomous",
+        **receipt_override,
+    )
+    conn = _SnapshotConn(
+        thread=_thread(permission_mode="supervised", narration_mode="auto"),
+        control_receipts=[receipt],
+    )
+
+    result = await build_session_state_snapshot(_SnapshotDB(conn), "thread-1")
+
+    assert result is not None
+    assert result["permission_mode"] == "supervised"
+    assert result["narration_mode"] == "auto"
+
+
+@pytest.mark.asyncio
+async def test_pending_permission_and_narration_receipts_overlay_independently():
+    narration = _control_receipt(
+        request_id="44444444-4444-4444-8444-444444444444",
+        request_seq=10,
+        verb="narration.set",
+        mode="silent",
+    )
+    permission = _control_receipt(
+        request_id="55555555-5555-4555-8555-555555555555",
+        request_seq=11,
+        verb="mode.set",
+        mode="auto_accept",
+    )
+    conn = _SnapshotConn(
+        thread=_thread(permission_mode="supervised", narration_mode="verbose"),
+        control_receipts=[narration, permission],
+    )
+
+    result = await build_session_state_snapshot(_SnapshotDB(conn), "thread-1")
+
+    assert result is not None
+    assert result["permission_mode"] == "auto_accept"
+    assert result["narration_mode"] == "silent"
 
 
 @pytest.mark.asyncio

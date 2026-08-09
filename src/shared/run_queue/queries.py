@@ -208,7 +208,8 @@ UPDATE run_queue r SET
 FROM c
 WHERE r.unit_id = c.unit_id
 RETURNING r.unit_id, r.unit_kind, r.fair_key, r.lease_token, r.input_seq,
-          r.consumed_seq, r.attempts_since_completion, r.leased_until
+          r.consumed_seq, r.control_input_seq, r.control_consumed_seq,
+          r.attempts_since_completion, r.leased_until
 """
 
 # General claim. The affinity grace ($4) hides a freshly queued unit from
@@ -259,13 +260,17 @@ RETURNING leased_until
 # §5.1 completion half, one fenced statement. NULL-safe watermark CASE: any
 # recorded input is "ahead" of a NULL consumed watermark, so input that
 # arrived during a turn whose claim carried no watermark still re-queues.
+# A control committed during the lease is an independent reason to requeue:
+# without this second watermark a control-only edge can be stranded in a row
+# that completion just changed to ``done``.
 _COMPLETE_SQL = """
 UPDATE run_queue SET
     consumed_seq = $3::bigint,
     attempts_since_completion = 0,
     queued_at = now(),
-    state = CASE WHEN input_seq IS NOT NULL
-                      AND ($3::bigint IS NULL OR input_seq > $3::bigint)
+    state = CASE WHEN (input_seq IS NOT NULL
+                       AND ($3::bigint IS NULL OR input_seq > $3::bigint))
+                      OR control_input_seq > control_consumed_seq
                  THEN 'queued' ELSE 'done' END,
     leased_by = NULL,
     leased_until = NULL,
@@ -324,6 +329,74 @@ ins AS (
     WHERE NOT EXISTS (SELECT 1 FROM cur)
     ON CONFLICT (unit_id) DO UPDATE SET
         input_seq = GREATEST(run_queue.input_seq, EXCLUDED.input_seq)
+    RETURNING state AS new_state
+)
+SELECT new_state FROM upd
+UNION ALL
+SELECT new_state FROM ins
+"""
+
+# Control admission mirrors record_input_seq, but does not disturb the human
+# watermark. ``baseline_input_seq`` initializes human history only when a queue
+# row is first created. The control baseline also advances whenever the row has
+# no pending controls, because request_seq is thread-global and can include
+# terminal controls from an earlier pinned generation. A parked unit remains
+# parked; the public admission transaction rejects that outcome and rolls its
+# request insert back rather than silently stranding a command.
+_RECORD_CONTROL_SQL = """
+WITH cur AS (
+    SELECT unit_id, state AS old_state,
+           control_input_seq AS old_control_input_seq,
+           control_consumed_seq AS old_control_consumed_seq
+    FROM run_queue
+    WHERE unit_id = $1::uuid
+    FOR UPDATE
+),
+upd AS (
+    UPDATE run_queue r SET
+        control_input_seq = GREATEST(r.control_input_seq, $3::bigint),
+        -- request_seq is thread-global across lane changes. When this queue
+        -- has no pending control, earlier terminal pinned requests are the
+        -- stateless baseline rather than a gap this lane must consume.
+        control_consumed_seq = CASE
+            WHEN cur.old_control_input_seq = cur.old_control_consumed_seq
+            THEN GREATEST(r.control_consumed_seq, $3::bigint - 1)
+            ELSE r.control_consumed_seq
+        END,
+        state     = CASE WHEN cur.old_state = 'done' THEN 'queued'
+                         ELSE r.state END,
+        queued_at = CASE WHEN cur.old_state = 'done' THEN now()
+                         ELSE r.queued_at END,
+        run_after = CASE WHEN cur.old_state = 'done' THEN now()
+                         ELSE r.run_after END,
+        fair_key  = CASE WHEN cur.old_state IN ('done', 'queued')
+                         THEN COALESCE($4::text, r.fair_key)
+                         ELSE r.fair_key END
+    FROM cur
+    WHERE r.unit_id = cur.unit_id
+    RETURNING r.state AS new_state
+),
+ins AS (
+    INSERT INTO run_queue (
+        unit_id, unit_kind, fair_key, input_seq, consumed_seq,
+        control_input_seq, control_consumed_seq
+    )
+    SELECT $1::uuid, $2::text, $4::text, $5::bigint, $5::bigint,
+           $3::bigint, $3::bigint - 1
+    WHERE NOT EXISTS (SELECT 1 FROM cur)
+    ON CONFLICT (unit_id) DO UPDATE SET
+        control_input_seq = GREATEST(
+            run_queue.control_input_seq, EXCLUDED.control_input_seq
+        ),
+        control_consumed_seq = CASE
+            WHEN run_queue.control_input_seq = run_queue.control_consumed_seq
+            THEN GREATEST(
+                run_queue.control_consumed_seq,
+                EXCLUDED.control_input_seq - 1
+            )
+            ELSE run_queue.control_consumed_seq
+        END,
+        fair_key = COALESCE(EXCLUDED.fair_key, run_queue.fair_key)
     RETURNING state AS new_state
 )
 SELECT new_state FROM upd
@@ -395,7 +468,7 @@ RETURNING state
 _LIST_LEASED_SQL = """
 SELECT unit_id, unit_kind, fair_key, leased_by, leased_until, lease_token,
        attempts_since_completion, max_attempts, queued_at,
-       input_seq, consumed_seq,
+       input_seq, consumed_seq, control_input_seq, control_consumed_seq,
        EXTRACT(EPOCH FROM (leased_until - now()))::float8 AS lease_remaining_seconds
 FROM run_queue
 WHERE state = 'leased' AND ($1::text IS NULL OR unit_kind = $1::text)
@@ -405,14 +478,15 @@ ORDER BY leased_until
 _LIST_PARKED_SQL = """
 SELECT unit_id, unit_kind, fair_key, lease_token,
        attempts_since_completion, max_attempts, queued_at, run_after,
-       input_seq, consumed_seq
+       input_seq, consumed_seq, control_input_seq, control_consumed_seq
 FROM run_queue
 WHERE state = 'parked' AND ($1::text IS NULL OR unit_kind = $1::text)
 ORDER BY queued_at
 """
 
 _WATERMARKS_SQL = """
-SELECT state, input_seq, consumed_seq FROM run_queue WHERE unit_id = $1::uuid
+SELECT state, input_seq, consumed_seq, control_input_seq, control_consumed_seq
+FROM run_queue WHERE unit_id = $1::uuid
 """
 
 
@@ -527,6 +601,35 @@ async def record_input_seq(
     """
     return await conn.fetchval(
         _RECORD_INPUT_SQL, _uuid(unit_id), unit_kind, input_seq, fair_key
+    )
+
+
+async def record_control_seq(
+    conn: Executor,
+    *,
+    unit_id: UUID | str,
+    unit_kind: str,
+    control_seq: int,
+    baseline_input_seq: int,
+    fair_key: str | None = None,
+) -> str:
+    """Record a stateless control admission in the queue transaction.
+
+    A missing/done row becomes runnable; a queued row keeps its FIFO position;
+    a leased row advances only the control watermark so completion performs the
+    requeue; and a parked row stays parked. ``lease_token`` is never changed.
+
+    Call this in the same transaction as ``thread_control_requests`` INSERT so
+    request durability and wake durability are one commit. Public admission
+    rejects the returned ``parked`` state by raising inside that transaction.
+    """
+    return await conn.fetchval(
+        _RECORD_CONTROL_SQL,
+        _uuid(unit_id),
+        unit_kind,
+        int(control_seq),
+        fair_key,
+        int(baseline_input_seq),
     )
 
 
@@ -817,10 +920,10 @@ async def queue_depth_for(
 ) -> QueueWatermarks | None:
     """The unit's watermarks + an honest pending flag; ``None`` if no row.
 
-    ``has_pending_input`` is watermark arithmetic (``input_seq`` ahead of
-    ``consumed_seq``, NULL-aware), NOT a message count — seqs are not dense
-    per unit, so callers needing an exact depth must count
-    ``thread_messages`` rows above the consumed watermark themselves.
+    ``has_pending_input`` and ``has_pending_control`` are independent watermark
+    comparisons. The former is NOT a message count — seqs are not dense per
+    unit, so callers needing an exact depth must count ``thread_messages`` rows
+    above the consumed watermark themselves.
     """
     row = await conn.fetchrow(_WATERMARKS_SQL, _uuid(unit_id))
     if row is None:
@@ -830,9 +933,14 @@ async def queue_depth_for(
     has_pending = input_seq is not None and (
         consumed_seq is None or input_seq > consumed_seq
     )
+    control_input_seq = int(row["control_input_seq"] or 0)
+    control_consumed_seq = int(row["control_consumed_seq"] or 0)
     return QueueWatermarks(
         state=row["state"],
         input_seq=input_seq,
         consumed_seq=consumed_seq,
         has_pending_input=has_pending,
+        control_input_seq=control_input_seq,
+        control_consumed_seq=control_consumed_seq,
+        has_pending_control=control_input_seq > control_consumed_seq,
     )
