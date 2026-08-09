@@ -428,11 +428,14 @@ async def test_update_validates_preserved_token_against_changed_transport():
 @pytest.mark.asyncio
 async def test_delete_uses_coordinated_kb_index_and_app_row_cleanup():
     datasource_id = "11111111-2222-3333-4444-555555555555"
+    actor_id = "99999999-8888-7777-6666-555555555555"
     db = MagicMock()
     db.list_datasource_projects = AsyncMock(return_value=[])
     db.delete_datasource = AsyncMock(return_value=True)
     cleanup = AsyncMock(return_value=True)
-    gate = AsyncMock(return_value=({}, {"id": datasource_id, "type": "kb"}))
+    gate = AsyncMock(
+        return_value=({"id": actor_id}, {"id": datasource_id, "type": "kb"})
+    )
 
     with (
         patch("main.require_datasource_owner", gate),
@@ -442,9 +445,13 @@ async def test_delete_uses_coordinated_kb_index_and_app_row_cleanup():
         result = await delete_datasource(object(), datasource_id)
 
     assert result == {"status": "deleted"}
+    # deleted_by is the SAME authenticated caller the non-kb branch already
+    # attributes tombstones to (Task 12 item C) — the kb branch must not be
+    # a silent NULL-forever exception to that.
     cleanup.assert_awaited_once_with(
         datasource_id,
         authority_project_scope_id=None,
+        deleted_by=actor_id,
     )
     db.delete_datasource.assert_not_awaited()
 
