@@ -1248,6 +1248,127 @@ describe('PersistentChatService — resume navigation safety', () => {
         expect(sseInstances).toHaveLength(1);
         expect(sseInstances[0].url).toContain('/persistent/threads/thread-B/stream');
     });
+
+    it('does not surface error or pendingDrift for a resume failure on an abandoned thread', async () => {
+        // Fix round 1, Finding 1: a late failure for a thread the user has
+        // already navigated away from must not mutate the shared
+        // error/pendingDrift signals — they are current-thread-scoped.
+        // Reachable by ordinary navigation: click Resume on thread A,
+        // immediately click thread B, thread A's request 403/428s late.
+        // Without the currency guard at the top of the catch, thread-B's
+        // view would show a resume error/dialog for a session it never
+        // touched.
+        const {service, mockHttp, sseInstances} = createService();
+        const resumeResponse = new Subject<Record<string, never>>();
+        service.threadId.set('thread-A');
+        mockHttp.post.mockImplementation((url: string) =>
+            url.endsWith('/persistent/threads/thread-A/resume')
+                ? resumeResponse.asObservable()
+                : of({}),
+        );
+        mockHttp.get.mockImplementation((url: string) => {
+            if (url.endsWith('/messages')) return of({messages: [], total: 0});
+            if (url.endsWith('/persistent/threads/thread-B')) {
+                return of({status: 'active', title: 'Thread B', total_turns: 0});
+            }
+            if (url.endsWith('/sessions/thread-B/connection')) {
+                return of({state: 'ready', ws_url: 'ws://thread-B'});
+            }
+            if (url.endsWith('/citations')) return of({citations: []});
+            return of({status: 'active'});
+        });
+
+        const resume = service.resumeSession();
+        await service.connect('thread-B'); // user navigates away mid-resume
+        resumeResponse.error({
+            status: 428,
+            error: {
+                detail: {
+                    code: 'config_drift',
+                    drift: [{id: 'connector:abc', kind: 'connector',
+                             reason: 'deleted', label: 'KurortEngine'}],
+                },
+            },
+        });
+        await resume;
+
+        expect(service.pendingDrift()).toBeNull();
+        expect(service.error()).toBeNull();
+        // Thread B's own connect must be unaffected by A's stale failure.
+        expect(service.threadId()).toBe('thread-B');
+        expect(sseInstances).toHaveLength(1);
+        expect(sseInstances[0].url).toContain('/persistent/threads/thread-B/stream');
+    });
+});
+
+describe('PersistentChatService — resume config drift', () => {
+    it('sets pendingDrift from a 428 on the current thread and does not connect', async () => {
+        const {service, mockHttp, sseInstances} = createService();
+        service.threadId.set('thread-A');
+        mockHttp.post.mockImplementation((url: string) =>
+            url.endsWith('/persistent/threads/thread-A/resume')
+                ? throwError(() => ({
+                      status: 428,
+                      error: {
+                          detail: {
+                              code: 'config_drift',
+                              drift: [{id: 'connector:abc', kind: 'connector',
+                                       reason: 'deleted', label: 'KurortEngine'}],
+                          },
+                      },
+                  }))
+                : of({}),
+        );
+
+        await service.resumeSession();
+
+        expect(service.pendingDrift()).toEqual([
+            {id: 'connector:abc', kind: 'connector', reason: 'deleted', label: 'KurortEngine'},
+        ]);
+        expect(service.error()).toBeNull();
+        // connect() must not run against a still-ended thread when drift blocks it.
+        expect(sseInstances).toHaveLength(0);
+    });
+
+    it('falls through to connect() on a 409 without setting error or drift', async () => {
+        const {service, mockHttp, sseInstances} = createService();
+        service.threadId.set('thread-A');
+        mockHttp.post.mockImplementation((url: string) =>
+            url.endsWith('/persistent/threads/thread-A/resume')
+                ? throwError(() => ({status: 409}))
+                : of({}),
+        );
+        mockHttp.get.mockImplementation((url: string) => {
+            if (url.endsWith('/messages')) return of({messages: [], total: 0});
+            if (url.endsWith('/persistent/threads/thread-A')) {
+                return of({status: 'active', title: 'Thread A', total_turns: 0});
+            }
+            if (url.endsWith('/sessions/thread-A/connection')) {
+                return of({state: 'ready', ws_url: 'ws://thread-A'});
+            }
+            if (url.endsWith('/citations')) return of({citations: []});
+            return of({status: 'active'});
+        });
+
+        await service.resumeSession();
+
+        expect(service.error()).toBeNull();
+        expect(service.pendingDrift()).toBeNull();
+        // 409 is benign (double-click) — falls through to a real connect().
+        expect(sseInstances).toHaveLength(1);
+        expect(sseInstances[0].url).toContain('/persistent/threads/thread-A/stream');
+    });
+
+    it('disconnect() clears a pending drift', () => {
+        const {service} = createService();
+        service.pendingDrift.set([
+            {id: 'connector:abc', kind: 'connector', reason: 'deleted', label: 'KurortEngine'},
+        ]);
+
+        service.disconnect();
+
+        expect(service.pendingDrift()).toBeNull();
+    });
 });
 
 describe('PersistentChatService — SSE event dispatch', () => {
