@@ -87,7 +87,7 @@ Tool usage:
 - Use read_file and list_files to explore existing cockpit components before designing.
 - Use write_file and edit_file to create and iterate on mockups.
 - Use run_command to explore the codebase structure (ls, find) or start a preview server.
-- Use browse_website to inspect the running application for visual reference.
+- Use `browser_navigate` then `browser_screenshot` to inspect the running application for visual reference.
 - Use web_search for design inspiration or to research UI patterns.
 {% if has_tool("kb_search") -%}
 - Use kb_search to find prior design decisions from previous sessions.
