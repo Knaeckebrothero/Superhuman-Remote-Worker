@@ -796,6 +796,52 @@ async def test_workspace_tier_verdict_is_not_drift():
 
 
 @pytest.mark.asyncio
+async def test_corrupt_revision_verdict_is_not_drift():
+    """Corruption is not drift: no acknowledgment can make a bad
+    policy_revision safe, so it must keep failing closed."""
+    items = await collect_config_drift(
+        None,
+        {},
+        owner={"id": "u1"},
+        project_ids=[],
+        datasource_ids=[ItemVerdict(DS_OK, True, "corrupt_revision")],
+        grant_violations=[],
+    )
+    assert items == []
+
+
+@pytest.mark.asyncio
+async def test_undenied_connector_is_not_drift_even_with_an_ack_reason():
+    """Pins the `denied` half of the guard INDEPENDENTLY of the reason half.
+    Without this, dropping `not verdict.denied` from the guard passes every
+    other test in this file — the no-drift cases all reach their empty result
+    through the reason check alone."""
+    items = await collect_config_drift(
+        None,
+        {},
+        owner={"id": "u1"},
+        project_ids=[],
+        datasource_ids=[ItemVerdict(DS_OK, False, "deleted")],
+        grant_violations=[],
+        tombstones={DS_OK: "Should Not Appear"},
+    )
+    assert items == []
+
+
+@pytest.mark.asyncio
+async def test_undenied_project_is_not_drift_even_with_an_ack_reason():
+    items = await collect_config_drift(
+        None,
+        {},
+        owner={"id": "u1"},
+        project_ids=[_ProjectVerdict(PROJECT_GONE, False, "deleted")],
+        datasource_ids=[],
+        grant_violations=[],
+    )
+    assert items == []
+
+
+@pytest.mark.asyncio
 async def test_deleted_project_reported():
     items = await collect_config_drift(
         None,
@@ -1025,7 +1071,7 @@ def drift_labels(items: list[DriftItem]) -> list[dict[str, Any]]:
 - [ ] **Step 4: Run the tests**
 
 Run: `python -m pytest tests/test_config_drift.py -v`
-Expected: PASS (10 tests)
+Expected: PASS (13 tests)
 
 - [ ] **Step 5: Commit**
 
@@ -1390,11 +1436,24 @@ async def _thread_config_drift(
     try:
         await _resolve_session_config(thread, metadata, status=status)
     except GrantDenied:
+        # Expected: this is exactly the signal we came here to harvest.
         pass
-    except Exception:
+    except Exception as exc:
+        # We could not determine whether grants drifted. Continuing with an
+        # empty list would report "no grant drift" when the truth is "unknown",
+        # letting the session resume on an unverified state — §7 requires
+        # failing closed instead. `_is_experts_db_enabled` and
+        # `_user_experts_enabled` run BEFORE _resolve_session_config's own
+        # internal try, so a transient settings-read error lands here.
         logger.exception(
-            "Thread %s: grant probe failed during drift collection", thread_id
+            "Thread %s: grant probe failed during drift collection; "
+            "refusing to resume on an unknown state",
+            thread_id,
         )
+        raise HTTPException(
+            status_code=403,
+            detail="Session configuration could not be verified",
+        ) from exc
     grant_violations = status.get("grant_violations") or []
 
     deleted_ids = [
@@ -1538,10 +1597,12 @@ Without this, "resume without them" succeeds and the session then dies at attach
 - Consumes: `metadata.config_drift_ack` written by Task 6.
 - Produces:
   ```python
-  def acknowledged_drift_ids(metadata: dict[str, Any]) -> set[str]
+  def acknowledged_drift_ids(metadata: Any) -> set[str]
   def strip_acknowledged(ids: list[str], ack: set[str], *, prefix: str) -> list[str]
+  def acknowledged_grant_keys(metadata: Any) -> set[str]
   ```
-  Both in `orchestrator/services/config_drift.py`.
+  All three in `orchestrator/services/config_drift.py`, plus
+  `_apply_acknowledged_grant_drift` in `orchestrator/main.py`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1590,6 +1651,82 @@ def test_strip_acknowledged_removes_only_acked_ids():
 def test_strip_acknowledged_leaves_unacked_ids_in_place():
     result = strip_acknowledged([DS_OK, DS_GONE], set(), prefix="connector")
     assert result == [DS_OK, DS_GONE]
+
+
+def test_acknowledged_grant_keys_unprefixes_only_grants():
+    metadata = {
+        "config_drift_ack": {
+            "grant:shell_tools": "revoked",
+            f"connector:{DS_GONE}": "deleted",
+        }
+    }
+    assert acknowledged_grant_keys(metadata) == {"shell_tools"}
+```
+
+And the partition rule, which is the security-relevant half — add to
+`tests/test_attach_honors_drift_ack.py`:
+
+```python
+@pytest.mark.asyncio
+async def test_unacknowledged_grant_violation_is_not_stripped():
+    """Acknowledging ONE grant must never smuggle a different one through.
+    With shell_tools acked but vm_workspace also violating, the fragment must
+    come back untouched so the dispatch PEP still denies."""
+    merged = {"tools": {"shell": True}, "workspace": {"backend": "vm"}}
+    grants = {"shell_tools": False, "vm_workspace": False}
+
+    with patch(
+        "orchestrator.main._resolve_runner_grants",
+        AsyncMock(return_value=grants),
+    ):
+        result = await _apply_acknowledged_grant_drift(
+            merged,
+            acknowledged={"shell_tools"},
+            runner_user_id="u1",
+            project_ids=[],
+        )
+
+    assert result == merged
+
+
+@pytest.mark.asyncio
+async def test_fully_acknowledged_grant_violations_are_stripped():
+    merged = {"tools": {"shell": True}, "workspace": {"backend": "vm"}}
+    grants = {"shell_tools": False, "vm_workspace": False}
+
+    with patch(
+        "orchestrator.main._resolve_runner_grants",
+        AsyncMock(return_value=grants),
+    ):
+        result = await _apply_acknowledged_grant_drift(
+            merged,
+            acknowledged={"shell_tools", "vm_workspace"},
+            runner_user_id="u1",
+            project_ids=[],
+        )
+
+    assert "shell" not in result.get("tools", {})
+    assert "backend" not in result.get("workspace", {})
+    # The original must not be mutated in place — callers reuse it.
+    assert merged["tools"]["shell"] is True
+
+
+@pytest.mark.asyncio
+async def test_admin_bypass_returns_the_fragment_untouched():
+    merged = {"tools": {"shell": True}}
+
+    with patch(
+        "orchestrator.main._resolve_runner_grants",
+        AsyncMock(return_value=None),
+    ):
+        result = await _apply_acknowledged_grant_drift(
+            merged,
+            acknowledged={"shell_tools"},
+            runner_user_id="u1",
+            project_ids=[],
+        )
+
+    assert result == merged
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
@@ -1627,6 +1764,16 @@ def acknowledged_drift_ids(metadata: Any) -> set[str]:
 def strip_acknowledged(ids: list[str], ack: set[str], *, prefix: str) -> list[str]:
     """Drop ids whose namespaced drift key was acknowledged."""
     return [value for value in ids if f"{prefix}:{value}" not in ack]
+
+
+def acknowledged_grant_keys(metadata: Any) -> set[str]:
+    """Acknowledged grant keys, unprefixed, ready to compare against the keys
+    ``evaluate()`` puts in front of each violation string."""
+    return {
+        key[len("grant:") :]
+        for key in acknowledged_drift_ids(metadata)
+        if key.startswith("grant:")
+    }
 ```
 
 - [ ] **Step 4: Apply the ack at attach**
@@ -1655,43 +1802,182 @@ In the attach path (`orchestrator/main.py:~4527`), narrow the project list the s
         project_ids = await _revalidate_thread_project_ids(_thread, current_project_ids)
 ```
 
-For grants, neutralize acknowledged keys in the merged fragment. In `_resolve_session_config`, immediately before the `_enforce_dispatch_grants` call at line ~2529:
+For grants, **reuse the canonical stripper — do not write a path map.**
+`src/core/capability_grants.py` already exports
+`strip_to_grants(fragment, grants) -> tuple[dict, list[str]]`, whose docstring
+states it is *"one-for-one with `evaluate`'s nine rules, and kept beside it
+(rather than a second, route-side implementation) so the two cannot drift."* A
+hand-written `{grant_key: config_path}` map in `main.py` would be exactly that
+forbidden second implementation, and would silently miss `browser`,
+`catalog_authoring`, `model_selection`, `autonomy_ceiling`, `permission_mode`,
+and `delegation`'s second path (`tools.delegation` *and* `delegation.enabled`).
+An unmapped key strips nothing, so the user acknowledges, resume succeeds, and
+attach dies anyway — the precise failure this feature exists to prevent.
+
+The one thing `strip_to_grants` must NOT do here is strip violations the user
+never acknowledged. Partition first, then strip only when every live violation
+is covered. Add near `_enforce_dispatch_grants`:
 
 ```python
-        # An acknowledged grant cannot be "dropped" the way a connector can —
-        # you cannot run without a workspace. Neutralize the offending key so
-        # the config falls back to the platform default.
-        for grant_key in acknowledged_drift_ids(metadata):
-            if grant_key.startswith("grant:"):
-                _neutralize_grant_key(
-                    _cap["merged_fragment"], grant_key.removeprefix("grant:")
-                )
+async def _apply_acknowledged_grant_drift(
+    merged: dict[str, Any],
+    *,
+    acknowledged: set[str],
+    runner_user_id: str | None,
+    project_ids: list[str],
+) -> dict[str, Any]:
+    """Strip acknowledged grant violations out of a merged config.
+
+    Returns the fragment to enforce against. A violation the user did NOT
+    acknowledge is left in place, so ``_enforce_dispatch_grants`` still denies
+    exactly as it does today — acknowledging one grant must never smuggle a
+    different one through.
+
+    ``strip_to_grants`` is advisory by contract; the authoritative re-check is
+    the ``_enforce_dispatch_grants`` call that immediately follows, which
+    re-runs ``evaluate`` on whatever this returns.
+    """
+    if not acknowledged:
+        return merged
+    from src.core.capability_grants import evaluate, strip_to_grants
+
+    grants = await _resolve_runner_grants(
+        runner_user_id=runner_user_id, project_ids=project_ids
+    )
+    if grants is None:  # admin bypass — nothing to strip
+        return merged
+    violations = evaluate(merged, grants)
+    if not violations:
+        return merged
+    flagged = {v.split(":", 1)[0] for v in violations}
+    if not flagged <= acknowledged:
+        # Something drifted that was never acknowledged. Leave the fragment
+        # untouched and let the dispatch PEP fail closed on all of it.
+        return merged
+    stripped, _dropped = strip_to_grants(merged, grants)
+    return stripped
 ```
 
-And add the neutralizer near `_enforce_dispatch_grants`:
+**Where the strip must land — this is the whole difficulty.** It is NOT enough
+to strip `_cap["merged_fragment"]`. That dict is a detached
+`copy.deepcopy(data)` taken by `resolve_config`
+(`orchestrator/services/config_resolver.py:184`) purely so the dispatch PDP has
+something to evaluate; the blob actually delivered to the agent is built from
+`data` *afterwards* via `load_agent_config_from_dict` +
+`serialize_resolved_config`, and `inject_blob_credentials` never touches
+`tools`/`workspace`. Stripping only the capture therefore **silences the grant
+check while still shipping the capability** — a privilege escalation, and the
+exact opposite of the "never deliver the unvetted override" comment sitting
+above that call.
+
+Nor can the blob be stripped after the fact: it is a serialized shape
+(`blob["prompts"]`, `blob["skills"]`, …), not the merged fragment
+`strip_to_grants` understands.
+
+So the strip must be applied to `data` *before* the capture and before
+serialization, so the capture and the delivered blob derive from the same
+stripped config. Give `resolve_config` an optional hook — it is sync, so the
+caller resolves grants first and passes a closure. Defaulting to `None` leaves
+its other seven callers untouched:
 
 ```python
-#: Which config path each grant gates. Keys mirror ``evaluate()`` in
-#: src/core/capability_grants.py — keep the two in sync.
-_GRANT_CONFIG_PATHS: dict[str, tuple[str, ...]] = {
-    "vm_workspace": ("workspace", "backend"),
-    "shell_tools": ("tools", "shell"),
-    "delegation": ("tools", "delegation"),
-}
+def resolve_config(
+    *,
+    ...,
+    skills: Optional[dict] = None,
+    grant_strip: Optional[Callable[[dict], dict]] = None,
+) -> dict:
+```
 
+and, in the body, immediately before the existing capture write:
 
-def _neutralize_grant_key(fragment: dict[str, Any], grant_key: str) -> None:
-    """Remove the config key a revoked grant gates, so the merged config falls
-    back to the platform default instead of failing closed."""
-    path = _GRANT_CONFIG_PATHS.get(grant_key)
-    if not path:
-        return
-    node = fragment
-    for part in path[:-1]:
-        node = node.get(part)
-        if not isinstance(node, dict):
-            return
-    node.pop(path[-1], None)
+```python
+    data = normalize_tool_policy(data)
+
+    # Applied HERE so the capture the PDP evaluates and the blob the agent
+    # hydrates are the same stripped config. Stripping only the capture would
+    # silence the check while still delivering the capability.
+    if grant_strip is not None:
+        data = grant_strip(data)
+
+    if capture is not None:
+```
+
+In `main.py`, resolve the grants and the acknowledgment BEFORE calling
+`resolve_config`, then pass the closure:
+
+```python
+        _ack_grant_keys = acknowledged_grant_keys(metadata)
+        _grants_for_strip = (
+            await _resolve_runner_grants(
+                runner_user_id=user_id,
+                project_ids=[project_id] if project_id else [],
+            )
+            if _ack_grant_keys
+            else None
+        )
+        resolved = resolve_config(
+            ...,
+            capture=_cap,
+            skills=_skills_payload,
+            grant_strip=(
+                (lambda fragment: _strip_acknowledged_grants(
+                    fragment, _grants_for_strip, _ack_grant_keys
+                ))
+                if _grants_for_strip is not None
+                else None
+            ),
+        )
+```
+
+`_resolve_runner_grants` returns `None` for admins (bypass), which correctly
+disables the hook — an admin has nothing to strip.
+
+`_apply_acknowledged_grant_drift` above therefore becomes a **sync, pure**
+helper, since the grants are already resolved by the caller:
+
+```python
+def _strip_acknowledged_grants(
+    fragment: dict[str, Any], grants: dict[str, Any], acknowledged: set[str]
+) -> dict[str, Any]:
+    """Drop acknowledged grant violations from a merged config fragment.
+
+    A violation the user did NOT acknowledge is left in place, so
+    ``_enforce_dispatch_grants`` still denies on all of it — acknowledging one
+    grant must never smuggle a different one through.
+
+    ``strip_to_grants`` is advisory by contract; the authoritative re-check is
+    the ``_enforce_dispatch_grants`` call that runs on the resulting capture.
+    """
+    from src.core.capability_grants import evaluate, strip_to_grants
+
+    violations = evaluate(fragment, grants)
+    if not violations:
+        return fragment
+    flagged = {v.split(":", 1)[0] for v in violations}
+    if not flagged <= acknowledged:
+        return fragment
+    stripped, _dropped = strip_to_grants(fragment, grants)
+    return stripped
+```
+
+Leave the `_enforce_dispatch_grants` call exactly where it is. It now runs on
+the stripped capture and is the authoritative re-check.
+
+**A test that would have caught this is mandatory.** Every grant test so far
+calls the helper in isolation, which is precisely why the leak went unnoticed.
+Add one that drives `_resolve_session_config` end to end and asserts on the
+DELIVERED blob:
+
+```python
+@pytest.mark.asyncio
+async def test_acknowledged_grant_is_stripped_from_the_DELIVERED_blob():
+    """The capture the PDP sees and the blob the agent hydrates must be the
+    same stripped config. Asserting only on the capture passes even when the
+    capability is still shipped."""
+    # thread metadata acknowledges shell_tools; grants deny shell_tools.
+    # Drive _resolve_session_config and assert the returned blob does NOT
+    # carry tools.shell, in addition to the call not raising GrantDenied.
 ```
 
 - [ ] **Step 5: Run the tests**
@@ -1994,6 +2280,14 @@ In `persistent-chat.service.ts`, add `pendingDrift = signal<ConfigDriftItem[] | 
                 );
                 this.pendingDrift.set(null);
             } catch (err) {
+                // Currency FIRST. A resume POST can still be in flight when the
+                // user navigates away, and `error`/`pendingDrift` are
+                // current-thread-scoped singletons. Acting on a late failure
+                // for an abandoned thread would surface thread A's error while
+                // the user is looking at thread B — and, once the Task 10
+                // dialog exists, would let an acknowledgment built from thread
+                // A's drift POST against thread B's /resume.
+                if (!this._isCurrentConnect(threadId, generation)) return;
                 const outcome = classifyResumeError(err);
                 if (outcome.kind === 'drift') {
                     // Surface the dialog and stop: connect() against a still-
@@ -2011,6 +2305,12 @@ In `persistent-chat.service.ts`, add `pendingDrift = signal<ConfigDriftItem[] | 
 ```
 
 Change the method signature to `async resumeSession(acknowledge?: string[]): Promise<void>` and import `classifyResumeError` and `ConfigDriftItem`.
+
+`pendingDrift` is per-thread state, so clear it wherever the service already
+resets per-thread state — `connect()`'s cold-path reset block (beside
+`resumedFromEpoch` / `rewindPrefill` / `tasks`) and `disconnect()`. Nothing
+clears it otherwise, and a drift list that survives a thread switch would let
+Task 10's dialog acknowledge one session's items against another's.
 
 - [ ] **Step 6: Typecheck and commit**
 
