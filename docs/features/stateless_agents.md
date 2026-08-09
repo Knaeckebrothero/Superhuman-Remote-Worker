@@ -943,7 +943,16 @@ One generic image; two Deployments (interactive: warm floor ≥ 2 sized per §2'
 
 ## 6. Prerequisites (corrected)
 
-1. **Lite sessions have PVC-backed agent-local state — S1's problem, not S2's.** Verified: the provisioner PVC-backs `/workspace` for *all* sessions, and the manifest comment says outright that for lite sessions the agent-local copy "is the only copy… for lite sessions it is the fix." v2's "S1 scopes to lite (no PVC exists)" was false. S1 work item: inventory what lite sessions write under agent-local `/workspace` (uploads staging, memory/KB artifacts, canvas-adjacent files), externalize each to object store/DB or declare it disposable per item — only then does S1 avoid the PVC.
+1. **Agent-local `/workspace` is not the persistent-session authority.** The
+   S2 §6.1 inventory and two-pod live inspection corrected the earlier PVC
+   premise: both stateless containers had an empty `/workspace`, while virtual
+   files already live in object storage and sandbox/VM files and shells live on
+   the remote workspace. The one session-path local file is a recomputable
+   vision cache. The real gaps are process-local task/undo/extraction/anchor
+   state and three tools that bypass the backend abstraction. Those must move
+   to DB/object storage or become explicitly disposable; an agent PVC would not
+   repair them. Full inventory and per-item decisions are in the implementation
+   log; remediation is not DONE.
 2. **tmux reattach-if-exists** (backend `_init_shell` kill-recreates; `disconnect()` kills) + tab-state rehydration from `list-windows`, or shell state declared batch-scoped.
 3. **Message fidelity** (§5.3.6) — also a prerequisite of the byte-determinism requirement.
 4. **Epoch/seq/fence redesign** (§5.3.2) before any stateless session traffic and **before P5** (dependency recorded in the session-reliability doc; if P5 lands first, the epoch change must still precede stateless traffic with `/events/head` kept stable).
@@ -983,7 +992,15 @@ The migration's steady state is **dual control planes** for the whole soak — a
 
 - **S0 — this doc.** Align on design + acceptance.
 - **S1 — lite/virtual sessions.** Build: run_queue + claim/heartbeat/reaper/completion protocol + fence (incl. object-store PUT fencing or the documented corruption window); epoch/seq/system-writer redesign; turn-request rows + watermarks; **cockpit workstream** (`/connection`+`/prepare` compat answering ready immediately for stateless threads, composer ungating, provisioning-card bypass) + **control-verb REST subset** (§6.7); persistence promotions (mode/narration, task manager, interval cursor, Path-A summary persist; media-fidelity decision *with UI notice if degraded*); scrub-on-claim; permission-row retire on lease expiry; queued-turn UX + `fair_key`; lite agent-local-state inventory (§6.1); journal-writer coalescing tick; metering lease-interval ingestion (shadow). Acceptance: create-to-*accepted* < 1 s; TTFT p50 < 2 s / p95 < 4 s **including provider TTFT**, and p95 claim-wait bounded at 2× pod-count concurrency; cache_read > 0 on second same-turn call and on a <5-min cross-pod follow-up; pod deleted mid-turn → takeover ≤ ~105 s, `turn.interrupted` rendered, no duplicate answer (watermark), no interleaved histories (fence assert); **zombie's late persist rejected at the fence**; poison unit parks within max_attempts with a user-visible terminal frame + operator unpark; queued input drains FIFO across a steal; zero in-process claim state; epoch bumps ≤1 per steal and 0 per clean handoff; after tenant A → tenant B on one pod, no A-residue (env/singletons/clients).
-- **S2 — workspace sessions.** SSH affinity + tmux reattach; PVC externalization completes; cloud-push sync-generation fence; outbox re-homing (incl. llm_requests archive); resident daemons re-homed; hard-interrupt routing; presence re-home; gate-release flow. Acceptance: push(N)→pull(N+1) ordering holds across a forced pod handoff; tmux state survives handoff; mid-idle rclone token expiry heals on next claim; p95 approval-to-visible-resume < 3 s; canvas presence has no inter-turn flicker (or the flicker is named and accepted).
+- **S2 — workspace sessions.** SSH affinity + tmux reattach; §6.1's
+  process-local state and backend-path bypasses are externalized or explicitly
+  retired (the corrected inventory requires no agent PVC); cloud-push
+  sync-generation fence; outbox re-homing (incl. llm_requests archive);
+  resident daemons re-homed; hard-interrupt routing; presence re-home;
+  gate-release flow. Acceptance: push(N)→pull(N+1) ordering holds across a
+  forced pod handoff; tmux state survives handoff; mid-idle rclone token expiry
+  heals on next claim; p95 approval-to-visible-resume < 3 s; canvas presence has
+  no inter-turn flicker (or the flicker is named and accepted).
 - **S3 — workers.** `batch_boundary` + consolidated freeze registry + TodoManager hydration + conditional tmux kill; pull-claim + claim-token renewal + durable completion acceptance/finalization keyed on `lease_token`; **coexistence partition on `jobs.execution_lane` everywhere** (§5.4.4); checkpoint-coupled steering acks; `paused_reason` sub-state; wall-clock batch budget; fairness + cooldown waiver; snapshot-lane retirement; job-journal decision executed (§10.2); job-log per-claim capture; deploy-order constraint enforced (orchestrator first; batch-off before rollback). Gate: Job Bench A/B vs pinned baseline — completion parity, tokens/wall within noise, measured overhead (target < 2% at wall-clock-sized batches; measure MCP-attached separately), KV-cache hit rate, **fault injection**: kill -9 mid-batch, steal during a tool call, fenced-out `/complete` rejected, crash/retry convergence of the completion finalizer, and the phantom-complete skew test on a loop job.
 - **S4 — optional, bill-driven**: in-process multiplexing; compile-once; workspace pause tier (§10.7); JetStream hatch.
 - **Rollback**: per-class flag at every stage; pinned plane intact until lane retirement decisions (§10.9).
@@ -1068,7 +1085,7 @@ journal-acknowledged, and the tool never executed.
 ended-session wake; Path-A resume-compaction persistence (a live bug — see
 §5.3.3); durable queued-turn UX; control verbs beyond the two scalars;
 metering lease-interval ingestion; the journal coalescing tick; object-store PUT
-fencing; and the lite agent-local-state (PVC) inventory of §6.1.
+fencing; and the §6.1 inventory's durable task/undo/extraction/anchor fixes.
 
 **Acceptance — met**: create-to-accepted <1 s; takeover ≤105 s with no duplicate
 answer; the fence assert; FIFO drain across a steal; epoch bump bounds; zero
@@ -1085,13 +1102,18 @@ control inbox, which is unit-tested rather than cluster-proven.
 
 **S2** (workspace sessions): the mandatory first fail-closed gate is built and
 k3d-verified. Stateless human input, new durable controls and the internal
-claim-bundle credential boundary admit only the exact lite tiers
-(`virtual`/`none`); sandbox, VM, missing and future tiers return 409 before an
-attach, and the public paths write no message/control/queue row. The gate stays
-until S2 acceptance passes. SSH affinity, tmux reattach-if-exists, the §6.1
-agent-local-state inventory/externalization, the cloud-push generation fence,
-outbox re-homing, the two resident daemons and presence re-home are all
-outstanding.
+claim-bundle credential boundary admit only exact lite declarations
+(`virtual`/`none`) with no physical sandbox/VM evidence. Admission is rechecked
+on the locked thread row in the same message/control transaction; stale lite
+declarations carrying `workspace_container`, `vm`, or a remote workspace
+binding fail closed. Live workspace/VM upgrades and generic backend mutation
+also refuse stateless rows before provisioning or persistence. A live
+declared-virtual/physically-remote probe returned 409 for input and control with
+message/control/queue counts unchanged. The gate stays until S2 acceptance
+passes. The §6.1 inventory is recorded and corrects the agent-PVC premise, but
+its RAM/path-bypass remediations are not built. SSH affinity,
+tmux reattach-if-exists, cloud-push generation fencing, outbox re-homing, the
+two resident daemons and presence re-home are outstanding.
 
 **S3** (workers): **Gates 1 and 2 are built and merged**; worker admission stays
 closed. No `worker_batch` unit has ever been enqueued and no job carries a

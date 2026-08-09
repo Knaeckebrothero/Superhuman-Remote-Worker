@@ -143,6 +143,7 @@ def _thread(**overrides: Any) -> dict[str, Any]:
         "execution_lane": "stateless",
         "control_seq_hwm": 4,
         "control_admission_agent_id": None,
+        "metadata": {"config_override": {"workspace": {"backend": "virtual"}}},
     }
     row.update(overrides)
     return row
@@ -661,6 +662,38 @@ async def test_admission_rechecks_owner_under_thread_lock_before_idempotency_loo
         )
 
     assert not _calls(conn, "fetchrow", "FROM thread_control_requests")
+    assert not [call for call in conn.calls if call[0] in {"execute", "fetchval"}]
+
+
+@pytest.mark.asyncio
+async def test_locked_stateless_workspace_refusal_precedes_every_admission_write():
+    """The locked row, not the route's earlier snapshot, owns tier admission."""
+    conn = _ControlConn(
+        thread=_thread(
+            metadata={
+                "config_override": {"workspace": {"backend": "virtual"}},
+                "workspace_container": {"status": "ready", "pod_ip": "10.0.0.9"},
+            }
+        ),
+        queue_state="done",
+    )
+
+    with pytest.raises(ControlAdmissionError, match="virtual/none"):
+        await admit_thread_control(
+            _ControlDB(conn),
+            thread_id=THREAD_ID,
+            owner_user_id=OWNER_ID,
+            client_request_id=CLIENT_REQUEST_ID,
+            verb="narration.set",
+            payload={"mode": "verbose"},
+            requested_by=str(OWNER_ID),
+        )
+
+    locked_read = _calls(conn, "fetchrow", "FROM threads WHERE id")
+    assert len(locked_read) == 1
+    assert "metadata" in locked_read[0][1]
+    assert "FOR UPDATE" in locked_read[0][1]
+    assert not _calls(conn, "fetchrow", "FROM run_queue")
     assert not [call for call in conn.calls if call[0] in {"execute", "fetchval"}]
 
 
