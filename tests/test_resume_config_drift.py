@@ -36,6 +36,7 @@ from fastapi import HTTPException
 from orchestrator.services.config_drift import DriftItem, drift_labels
 
 DS_GONE = "d7555d5d-ce46-49e2-b1fa-8235d720badc"
+DS_CORRUPT = "c1c1c1c1-c1c1-4c1c-8c1c-c1c1c1c1c1c1"
 
 
 def _patch_caller_and_db(user: dict, db):
@@ -217,6 +218,72 @@ class TestResumeConfigDrift:
         )
 
     @pytest.mark.asyncio
+    async def test_stored_ack_is_honored_without_a_body(
+        self, user_a, thread_a, fake_db, fake_request
+    ):
+        """A: a prior resume's ack is persisted to
+        ``metadata.config_drift_ack`` (see ``test_full_acknowledgment_resumes``
+        above) but was never read back — so an item the user already
+        accepted losing was re-reported as outstanding, and re-acknowledging
+        with no body still 428'd. The stored ack must be honored on its own,
+        with no ``acknowledge`` in this request at all.
+        """
+        from main import resume_thread
+
+        thread = _ended_thread(thread_a)
+        thread_id = str(thread["id"])
+        thread["metadata"] = {
+            "config_drift_ack": {f"connector:{DS_GONE}": "deleted"}
+        }
+        drift = [
+            DriftItem(f"connector:{DS_GONE}", "connector", "deleted", "KurortEngine")
+        ]
+
+        with _patch_caller_and_db(user_a, fake_db):
+            with patch("main._thread_config_drift", _fake_drift(drift)):
+                result = await resume_thread(thread_id, fake_request)
+
+        assert result == {"status": "created", "thread_id": thread_id}
+        fake_db.resume_thread.assert_awaited_once_with(thread_id)
+
+    @pytest.mark.asyncio
+    async def test_stored_ack_does_not_cover_a_different_new_drift(
+        self, user_a, thread_a, fake_db, fake_request
+    ):
+        """A, converse: a stored ack narrows only the id it names. An item
+        that drifts for the FIRST time is in neither the request body nor
+        the stored ack, so it must still block with a 428 naming it — the
+        union must never let brand-new drift through."""
+        from main import resume_thread
+
+        thread = _ended_thread(thread_a)
+        thread_id = str(thread["id"])
+        acked_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        thread["metadata"] = {
+            "config_drift_ack": {f"connector:{acked_id}": "deleted"}
+        }
+        drift = [
+            DriftItem(f"connector:{DS_GONE}", "connector", "deleted", "KurortEngine")
+        ]
+
+        with _patch_caller_and_db(user_a, fake_db):
+            with patch("main._thread_config_drift", _fake_drift(drift)):
+                with pytest.raises(HTTPException) as exc:
+                    await resume_thread(thread_id, fake_request)
+
+        assert exc.value.status_code == 428
+        assert exc.value.detail["drift"] == [
+            {
+                "id": f"connector:{DS_GONE}",
+                "kind": "connector",
+                "reason": "deleted",
+                "label": "KurortEngine",
+            }
+        ]
+        fake_db.resume_thread.assert_not_awaited()
+        fake_db.record_thread_config_drift_ack.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_no_drift_resumes_exactly_as_before(
         self, user_a, thread_a, fake_db, fake_request
     ):
@@ -349,5 +416,52 @@ class TestResumeConfigDrift:
                 "label": "a project you no longer have access to",
             }
         ]
+        fake_db.resume_thread.assert_not_awaited()
+        fake_db.record_thread_config_drift_ack.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_corrupt_revision_refuses_at_resume_with_403(
+        self, user_a, thread_a, fake_db, fake_request
+    ):
+        """B: ``workspace_tier`` / ``corrupt_revision`` are deliberately
+        excluded from ``ACKNOWLEDGEABLE_REASONS``, so ``collect_config_drift``
+        never turns either into a ``DriftItem`` — without a dedicated check,
+        resume would see NO drift, return 200, and flip the thread to
+        'created'. Attach then denies: the silent "Connecting..." hang this
+        whole feature exists to remove. Uses the REAL ``_thread_config_drift``
+        (only the grant probe is stubbed inert) so the blocking check is
+        genuinely exercised, not assumed away by a mock.
+        """
+        from main import resume_thread
+
+        thread = _ended_thread(thread_a)
+        thread_id = str(thread["id"])
+        thread["metadata"] = {"datasource_ids": [DS_CORRUPT]}
+
+        fake_db.get_user = AsyncMock(return_value=user_a)
+        fake_db.get_datasource_tombstones = AsyncMock(return_value={})
+        fake_db.get_datasource_policy_rows = AsyncMock(
+            return_value=[
+                {
+                    "id": DS_CORRUPT,
+                    "type": "generic",
+                    "scope_mode": "all",
+                    "is_global": True,
+                    "created_by": None,
+                    "policy_revision": 0,
+                }
+            ]
+        )
+
+        with _patch_caller_and_db(user_a, fake_db):
+            with patch(
+                "main._resolve_session_config", AsyncMock(return_value=None)
+            ):
+                with pytest.raises(HTTPException) as exc:
+                    await resume_thread(thread_id, fake_request)
+
+        assert exc.value.status_code == 403
+        # Non-enumerating: the response must not name which item is invalid.
+        assert DS_CORRUPT not in str(exc.value.detail)
         fake_db.resume_thread.assert_not_awaited()
         fake_db.record_thread_config_drift_ack.assert_not_awaited()

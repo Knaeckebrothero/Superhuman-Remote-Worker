@@ -130,6 +130,25 @@ def drift_labels(items: list[DriftItem]) -> list[dict[str, Any]]:
     return list(grouped.values())
 
 
+def blocking_denials(
+    datasource_verdicts: list[Any], project_verdicts: list[Any]
+) -> list[str]:
+    """Denials no acknowledgment can clear — corruption and tier conflicts.
+
+    These must refuse at resume rather than fall through to a 200: they deny
+    at attach regardless, and a session that resumes and then cannot attach
+    is the silent hang this feature exists to remove.
+    """
+    blocking: list[str] = []
+    for verdict in datasource_verdicts:
+        if verdict.denied and verdict.reason not in ACKNOWLEDGEABLE_REASONS:
+            blocking.append(f"connector:{verdict.datasource_id}")
+    for verdict in project_verdicts:
+        if verdict.denied and verdict.reason not in ACKNOWLEDGEABLE_REASONS:
+            blocking.append(f"project:{verdict.project_id}")
+    return blocking
+
+
 def acknowledged_drift_ids(metadata: Any) -> set[str]:
     """Drift ids the owner already accepted losing.
 
