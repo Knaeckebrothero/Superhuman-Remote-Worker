@@ -76,6 +76,7 @@ import {AppSelectComponent} from '../../ui/select';
 import {AppIconComponent} from '../../ui/icon';
 import {AppDialogComponent} from '../../ui/dialog';
 import {AppToolCardComponent} from '../../ui/tool-card';
+import {JobBatchCardComponent} from '../../ui/tool-card/job-batch-card.component';
 import {AppReadAloudComponent} from '../../ui/read-aloud';
 import {AppInlineEditableTextComponent} from '../../ui/inline-editable-text';
 import {AppToastService} from '../../ui/toast';
@@ -766,6 +767,7 @@ export function clearDraft(threadId: string | null): void {
         AppIconComponent,
         AppDialogComponent,
         AppToolCardComponent,
+        JobBatchCardComponent,
         AppReadAloudComponent,
         AppInlineEditableTextComponent,
         CitationsPanelComponent,
@@ -1383,6 +1385,15 @@ export function clearDraft(threadId: string | null): void {
                             }
                           }
                         }
+                      } @else if (group.kind === 'job_batch') {
+                        <!-- A fan-out: one card, a row per job. Job calls never
+                             fold (they carry live status and review actions), so
+                             without this a three-job dispatch rendered a "2×
+                             tool calls" chip plus one card. -->
+                        <div class="event-tool">
+                          <app-job-batch-card [views]="jobBatchViews(group)"
+                                              (diffRequested)="openJobDiff($event)" />
+                        </div>
                       } @else {
                         @switch (group.event.kind) {
                           @case ('tool_call') {
@@ -3871,6 +3882,25 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         const view = toolCardViewFromEvent(tc);
         this.toolViewCache.set(tc, view);
         return view;
+    }
+
+    /**
+     * Views for a job fan-out, memoized per group object.
+     *
+     * Memoized for the same reason as {@link toolView}: `<app-job-batch-card>`
+     * is OnPush with an array input, so building a fresh array each change
+     * detection would defeat it. The key is safe because `groupedEvents()` is
+     * itself memoized per turn — a group object is stable until the turn changes,
+     * and a changed turn produces new groups.
+     */
+    private readonly jobBatchViewsCache = new WeakMap<object, ToolCardView[]>();
+
+    jobBatchViews(group: EventGroup & {kind: 'job_batch'}): ToolCardView[] {
+        const cached = this.jobBatchViewsCache.get(group);
+        if (cached) return cached;
+        const views = group.events.map((e) => this.toolView(e));
+        this.jobBatchViewsCache.set(group, views);
+        return views;
     }
 
     /**
