@@ -57,19 +57,22 @@ class TestCiRunnerPolicy:
             f"  - {e}" for e in errors
         )
 
-    def test_runtime_guard_is_present(self, checker):
-        """The half a pull request cannot edit must still be there.
+    def test_runtime_guard_contract_is_documented(self, checker):
+        """The run-time half must stay documented here.
 
-        check() covers this too, but calling it out separately means a deleted
-        guard reads as its own failure rather than one line inside a list.
+        The guard itself lives in Scripts-and-Notebooks
+        (devops/github-actions-runner/) — outside every repository it protects,
+        which is what makes it uneditable by a pull request. So this repo can
+        only check that the contract is still written down, not that it is still
+        enforced; the enforcement proof runs against the built image and gates
+        its push. check() covers this too, but calling it out separately means a
+        vanished contract reads as its own failure rather than one line in a list.
         """
-        hook = REPO_ROOT / "docker" / "ci-runner" / "job-started-guard.sh"
-        dockerfile = REPO_ROOT / "docker" / "Dockerfile.ci-runner"
-        assert hook.is_file(), f"{hook} is missing — the run-time fork guard is gone"
-        assert dockerfile.is_file(), f"{dockerfile} is missing"
-        assert "ACTIONS_RUNNER_HOOK_JOB_STARTED" in dockerfile.read_text(
-            encoding="utf-8"
-        ), "the guard is present but the image never invokes it"
+        doc = REPO_ROOT / "docs" / "ci_self_hosted_runners.md"
+        assert doc.is_file(), f"{doc} is missing — the runner contract is undocumented"
+        text = doc.read_text(encoding="utf-8")
+        missing = [n for n in checker.RUNNER_CONTRACT if n not in text]
+        assert not missing, f"runner contract drifted; doc no longer mentions {missing}"
 
     def test_every_workflow_is_registered(self, checker):
         """A new workflow file must be a deliberate routing decision."""
