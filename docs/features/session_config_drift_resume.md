@@ -406,46 +406,51 @@ Worth recording, because each was correct-looking code with passing tests:
   `sessions-page.component.ts` has its own `/resume` call, which dead-ended with
   a generic toast. It now classifies the 428 and hands off to the chat page.
 
-### Known open, deliberately deferred
+### Known open
 
 - **Live gate unrun.** §9's dev verification against thread `1930dec9` has not
-  been executed — it needs a push and a deploy. The admin-vs-owner defect above
-  would not have surfaced in any unit suite, so this gate is worth running
-  before trusting the feature.
-- **Two-click handoff from the sessions list.** The 428 precedes the status
-  flip, so the chat page renders its generic ended-card with no indication a
-  resume already ran; the second click surfaces the dialog. Recoverable, but
-  the first click gives no feedback.
-- **Acked items re-prompt on later resumes.** Attach reads
-  `config_drift_ack`, but `_thread_config_drift` still classifies raw
-  `metadata.datasource_ids`, so an acknowledged connector re-prompts on each
-  subsequent resume. One extra dialog, not a dead end.
-- **`corrupt_revision` / `workspace_tier`** are excluded from acknowledgement by
-  design, but still deny at attach — so they resume 200 and then hang, the
-  failure shape this feature exists to remove. Rare; §7 does not cover it.
-- **`deleted_by`** exists in migration 0115 but is never written.
-- **No prefill** on "Start a new session" (§8.3): `session-create` reads no
-  query parameter, so it navigates plainly.
+  been executed — it needs a push and a deploy. The admin-vs-owner defect below
+  did not surface in any unit suite, so this gate is worth running before
+  trusting the feature.
+- **Prefilling the model writes it to `localStorage`.** "Start a new session"
+  routes the prefilled model through the same path a manual pick takes, so
+  merely landing on the prefilled form rewrites the user's "last picked" model
+  for unrelated future sessions, without picking or submitting. Pre-existing
+  path, newly reachable with zero clicks. The fix lives in model-group
+  internals; judged not worth the risk at this stage.
 - **`_schedule_protected_engage`** attributes the RO-mount grant to the caller
-  rather than the thread owner — same shape as the admin defect above, but
-  **pre-existing** (blame: `07b9c6b3`, 2026-07-11), untouched by this work.
-  Worth its own ticket.
+  rather than the thread owner — the same shape as the admin defect fixed here,
+  but **pre-existing** (blame `07b9c6b3`, 2026-07-11) and untouched by this
+  work. Filed separately as
+  `docs/issues/protected_mount_attributed_to_caller_not_owner.md`.
+- **`_revalidate_thread_project_ids` patches** in
+  `tests/test_protected_cloud_engage_wiring.py` look vacuous by the same
+  argument that retired the datasource sibling, but need their own
+  caller/coverage audit before removal.
 
-### Resolved cleanups (Task 13)
+### Closed after the first pass
 
-- **`summary` removed from the 428 body.** `drift_labels` shipped a collapsed
-  summary alongside `drift`, but the cockpit already re-implements the same
-  collapse client-side in `groupDriftForDisplay` and never read `summary` —
-  confirmed by grepping `cockpit/src/app` before deleting. One rule, one
-  implementation now; `drift_labels` is gone from
-  `orchestrator/services/config_drift.py`, and the raw `drift` array (the
-  field every consumer actually reads) is unchanged.
-- **`_revalidate_thread_datasource_ids` deleted.** It had no production
-  caller — `_thread_config_drift` calls `classify_datasource_selection`
-  directly, not this wrapper. Its three patches in
-  `tests/test_protected_cloud_engage_wiring.py` were confirmed vacuous (the
-  file passes identically with them removed) before deletion; the two
-  direct-call tests in `tests/test_kb_datasource_api.py` that exercised real
-  global/system revalidation behavior were redirected to
-  `_revalidate_thread_datasource_selection`, which remains live underneath
-  `_resolve_authorized_thread_datasources`.
+Everything below was deferred at first and then completed before the branch was
+considered done:
+
+- Stored acknowledgments are now read back at resume, so an acknowledged loss
+  no longer re-prompts on every later resume.
+- `corrupt_revision` / `workspace_tier` now refuse at resume with a
+  non-enumerating 403 instead of returning 200 and hanging at attach — that
+  silent hang was the exact failure shape this feature exists to remove.
+- `deleted_by` is written on both the ordinary and the KB delete paths.
+- A translation gap that turned a 403 into a 500 on one endpoint is closed.
+- The sessions-list handoff now shows an informational toast before navigating,
+  so the first click is no longer silent.
+- "Start a new session" prefills project, expert, model and the surviving
+  connectors. Connectors are prefilled by intersecting the source thread's ids
+  with the create form's eligible list, so drifted ones drop out without the
+  create page knowing anything about drift.
+- `summary` / `drift_labels` removed from the 428 body — the cockpit already
+  implemented the same collapse, and one rule should have one implementation.
+- `_revalidate_thread_datasource_ids` deleted; its three direct tests were
+  redirected to the live `_revalidate_thread_datasource_selection` (and
+  strengthened with policy-revision assertions), and three vacuous patches of
+  it were removed after proving them vacuous both structurally and empirically.
+- The migration-head tripwire and the CI schema snapshot were updated for
+  migration `0115`. Both would otherwise have turned CI red on push.
