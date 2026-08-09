@@ -2359,7 +2359,10 @@ export class PersistentChatService {
                         acknowledge ? {acknowledge} : {},
                     ),
                 );
-                this.pendingDrift.set(null);
+                // A late success for a thread the user has already navigated
+                // away from must not clear the CURRENT thread's just-shown
+                // drift dialog — same currency guard as the catch below.
+                if (this._isCurrentConnect(threadId, generation)) this.pendingDrift.set(null);
             } catch (err) {
                 // A late failure for a thread the user has already navigated
                 // away from must not mutate the shared error/drift signals —

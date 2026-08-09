@@ -557,6 +557,28 @@
       "createSession": "Sitzung erstellen",
       "protectedCloud": "Geschützte Cloud — Agenten-Änderungen werden zur Überprüfung bereitgestellt",
       "protectedCloudHint": "Der Agent erhält schreibgeschützten Cloud-Zugriff; seine Änderungen warten im Prüfbereich auf Ihre Freigabe."
+    },
+    "configDrift": {
+      "title": "Ein Teil der Einrichtung dieser Sitzung ist nicht mehr vorhanden",
+      "intro": "Teile der Konfiguration dieser Sitzung sind nicht mehr verfügbar:",
+      "resumeAnyway": "Trotzdem fortsetzen",
+      "startNew": "Neue Sitzung starten",
+      "connector": {
+        "deleted": "Gelöschter Konnektor — {{label}}",
+        "revoked": "Widerrufener Konnektor — {{label}}",
+        "out_of_scope": "Widerrufener Konnektor — {{label}}"
+      },
+      "project": {
+        "deleted": "Gelöschtes Projekt — {{label}}",
+        "revoked": "Widerrufenes Projekt — {{label}}",
+        "out_of_scope": "Widerrufenes Projekt — {{label}}"
+      },
+      "grant": {
+        "deleted": "Fehlende Freigabe — {{label}}",
+        "revoked": "Fehlende Freigabe — {{label}}",
+        "out_of_scope": "Fehlende Freigabe — {{label}}"
+      },
+      "countSuffix": " (×{{count}})"
     }
   },
   "jobs": {
