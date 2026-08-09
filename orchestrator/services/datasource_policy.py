@@ -226,8 +226,9 @@ async def classify_datasource_selection(
             policy_revision = int(row["policy_revision"])
             if policy_revision < 1:
                 raise ValueError
-        except (KeyError, TypeError, ValueError) as exc:
-            raise DatasourceUnavailableError() from exc
+        except (KeyError, TypeError, ValueError):
+            verdicts.append(ItemVerdict(datasource_id, True, "corrupt_revision"))
+            continue
         revisions[datasource_id] = policy_revision
         verdicts.append(ItemVerdict(datasource_id, False, None))
     return verdicts, revisions
@@ -264,15 +265,20 @@ async def authorize_datasource_selection(
         trusted_system_inheritance=trusted_system_inheritance,
         legacy_job_id=legacy_job_id,
     )
-    # Precedence is load-bearing: the pre-refactor code raised on the count
-    # mismatch before the per-item loop, so an unavailable id always beat a
-    # workspace-tier conflict from a later id. Preserve that ordering.
-    if any(v.denied and v.reason != "workspace_tier" for v in verdicts):
+    # Missing rows were rejected by a len() check that ran BEFORE the per-item
+    # loop, so "deleted" is position-independent and outranks everything else.
+    if any(v.reason == "deleted" for v in verdicts):
         raise DatasourceUnavailableError()
-    if any(v.reason == "workspace_tier" for v in verdicts):
-        raise DatasourceWorkspaceTierError(
-            "Repository connectors require a workspace with filesystem support"
-        )
+    # Every other failure raised from inside that loop, so it is strictly
+    # first-in-list-order: the first denied item decides which error surfaces.
+    for verdict in verdicts:
+        if not verdict.denied:
+            continue
+        if verdict.reason == "workspace_tier":
+            raise DatasourceWorkspaceTierError(
+                "Repository connectors require a workspace with filesystem support"
+            )
+        raise DatasourceUnavailableError()
     return [v.datasource_id for v in verdicts], revisions
 
 
