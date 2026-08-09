@@ -92,7 +92,8 @@
     },
     "jobBatch": {
       "title": "{{count}} jobs dispatched",
-      "done": "{{done}}/{{total}} done",
+      "finished": "{{done}}/{{total}} finished",
+      "failed": "{{count}} failed",
       "review": "{{count}} awaiting review",
       "notCreated": "Job was not created"
     },
@@ -604,6 +605,7 @@
       "paused": "Paused",
       "failed": "Failed",
       "cancelled": "Cancelled",
+      "waiting_for_reply": "Waiting for reply",
       "waiting_approval": "Waiting · approval"
     },
     "action": {

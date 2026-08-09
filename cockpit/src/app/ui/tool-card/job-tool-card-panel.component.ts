@@ -18,6 +18,7 @@ import {ApiService} from '../../core/services/api.service';
 import {
     asRecord,
     canResumeJobStatus,
+    jobStatusLabelKey,
     isRunningJobStatus,
     isTerminalJobStatus,
     jobStatusTone,
@@ -65,7 +66,14 @@ import {
     @if (job()) {
       <div class="jc">
         <div class="jc__row">
-          <app-badge [tone]="tone()" size="xs">{{ statusLabel() }}</app-badge>
+          <!-- The status in the product's words ("Pending Review"), not the
+               database enum. jobs.status.* already existed and is what the Jobs
+               page shows; this card was printing the raw value for the same row.
+               Unknown statuses fall back to the raw value rather than to a bare
+               i18n key. -->
+          <app-badge [tone]="tone()" size="xs">
+            {{ statusKey() ? (statusKey()! | transloco) : rawStatus() }}
+          </app-badge>
           <span class="jc__id" [title]="entity().id">{{ shortId() }}</span>
           @if (running()) {
             <app-icon size="xs" class="jc__spin">progress_activity</app-icon>
@@ -151,21 +159,37 @@ import {
     .jc__input {
       width: 100%; box-sizing: border-box; resize: vertical;
       padding: 6px 8px; font: inherit; font-size: 12px; line-height: 1.45;
-      border-radius: 5px; color: inherit;
-      border: 1px solid var(--border-color, rgba(127,127,127,0.3));
-      background: var(--input-bg, rgba(127,127,127,0.06));
+      border-radius: var(--radius-control); color: inherit;
+      border: 1px solid var(--border-color);
+      background: var(--surface-0);
     }
     .jc__input:focus { outline: 1px solid var(--accent-color); outline-offset: -1px; }
     .jc__input:disabled { opacity: 0.5; }
     .jc__btn {
-      padding: 3px 10px; font-size: 11.5px; border-radius: 5px; cursor: pointer;
-      border: 1px solid var(--border-color, rgba(127,127,127,0.3));
+      padding: 4px 10px; min-height: 24px; font-size: 11.5px;
+      border-radius: var(--radius-control); cursor: pointer;
+      border: 1px solid var(--border-color);
       background: transparent; color: inherit;
     }
-    .jc__btn:hover:not(:disabled) { background: rgba(127,127,127,0.12); }
+    .jc__btn:hover:not(:disabled) { background: var(--hover); }
     .jc__btn:disabled { opacity: 0.5; cursor: default; }
-    .jc__btn--primary { border-color: var(--accent-color); color: var(--accent-color); }
-    .jc__btn--danger { border-color: var(--danger-color, #e5534b); color: var(--danger-color, #e5534b); }
+    /* Primary is FILLED and destructive is TINTED, rather than both being
+       outlines in different hues. Two reasons: it gives the row an actual
+       hierarchy (the recommended action reads as the recommended action), and
+       --danger === --accent-color in the Roman themes, so hue alone cannot tell
+       Approve from Cancel job. Weight can. Mirrors the shared button component's
+       'primary' and 'warning' variants. */
+    .jc__btn--primary {
+      background: var(--accent-color); color: var(--on-accent);
+      border-color: var(--accent-color);
+    }
+    .jc__btn--danger {
+      background: var(--danger-tint); color: var(--danger); border-color: transparent;
+    }
+    /* Filled/tinted buttons keep their own background on hover — the generic
+       .jc__btn:hover above would repaint them with the neutral --hover. */
+    .jc__btn--primary:hover:not(:disabled) { background: var(--accent-color); filter: brightness(1.08); }
+    .jc__btn--danger:hover:not(:disabled) { background: var(--danger-tint); filter: brightness(1.08); }
   `,
 })
 export class JobToolCardPanelComponent {
@@ -198,7 +222,20 @@ export class JobToolCardPanelComponent {
 
     protected readonly shortId = computed(() => this.entity().id.slice(0, 8));
     protected readonly tone = computed(() => jobStatusTone(this.job()?.status ?? ''));
-    protected readonly statusLabel = computed(() => this.job()?.status ?? '');
+
+    /**
+     * The status in the product's own words — "Pending Review", not
+     * `pending_review`.
+     *
+     * `jobs.status.*` already exists in both locales and is what the Jobs page
+     * shows; this card was rendering the raw database enum, underscore and all,
+     * for the same row. Falls back to the raw value when a status has no
+     * translation — `waiting_for_reply` is in the DB CHECK constraint but not in
+     * the locale files, so that gap is real and shows up as `waiting_for_reply`
+     * rather than as a bare i18n key.
+     */
+    protected readonly statusKey = computed(() => jobStatusLabelKey(this.job()?.status));
+    protected readonly rawStatus = computed(() => this.job()?.status ?? '');
     protected readonly running = computed(() => isRunningJobStatus(this.job()?.status));
 
     /**
