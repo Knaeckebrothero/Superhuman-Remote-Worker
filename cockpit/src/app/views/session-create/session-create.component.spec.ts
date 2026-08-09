@@ -823,11 +823,17 @@ describe('SessionCreateComponent "Start a new session" prefill (session_config_d
     fixture.detectChanges(); // runs the constructor's effect() + ngOnInit
     attachAgentSettingsStub(component, setSessionModelOverride);
 
-    // Everything else settles first: the ordinary defaults land and are
-    // visibly in effect — proving there is no premature guess baked in that
-    // the later prefill would have to fight.
+    // Everything else settles first. Fix round 1: NEITHER field guesses
+    // early — project already didn't (its guard predates this fix); expert
+    // now matches it. Before the fix, this is exactly where the ordinary
+    // default expert got auto-selected and fetched, calling
+    // agentSettings.prefillFromConfig — the unconditional reset (no
+    // hasToolEdits() guard) that would go on to fire AGAIN when the prefill
+    // corrected the selection below, silently wiping anything a user edited
+    // in between. Deferring removes the window a concurrent edit could be
+    // lost in, rather than merely converging past it.
     drainAll(http);
-    expect(component.selectedExpert()?.id).toBe('expert-1');
+    expect(component.selectedExpert()).toBeNull(); // NOT yet defaulted — waiting on the source-thread fetch
     expect(component.selectedProjectIds()).toEqual(new Set()); // NOT yet defaulted — waiting on the source-thread fetch
     expect(setSessionModelOverride).not.toHaveBeenCalled();
 
@@ -843,6 +849,52 @@ describe('SessionCreateComponent "Start a new session" prefill (session_config_d
     expect(component.selectedExpert()?.id).toBe('expert-2');
     expect(component.prefillDatasourceIds()).toEqual(['ds-1']);
     expect(setSessionModelOverride).toHaveBeenCalledWith('gpt-5.6-sol');
+  });
+
+  // Fix round 1 — the reviewer's specific gap: the two tests above prove the
+  // FINAL state converges either way, not that a user's own edit made
+  // DURING the window survives. `agentSettings.prefillFromConfig` is the
+  // mechanism that would destroy it (AgentSettingsComponent.prefillFromConfig
+  // resets modelGroup/toolsGroup/executionGroup unconditionally — no
+  // hasToolEdits() check, unlike loadToolPreview's re-anchor), so the
+  // load-bearing assertion is how many times it fires and with what: once,
+  // for the correct expert, never for a discarded intermediate one.
+  it('a tool edit made while the source-thread fetch is still in flight survives the prefill landing', () => {
+    const subject = new Subject<Record<string, unknown> | null>();
+    const {fixture, component, http, setSessionModelOverride} = setup('thread-77', subject.asObservable());
+    fixture.detectChanges();
+    attachAgentSettingsStub(component, setSessionModelOverride);
+    const prefillFromConfig = (
+      component.agentSettings as unknown as {prefillFromConfig: ReturnType<typeof vi.fn>}
+    ).prefillFromConfig;
+
+    // Settle every OTHER load while the thread fetch is still pending. Before
+    // fix round 1, this alone auto-selected and fetched the ordinary default
+    // expert, calling prefillFromConfig and rendering its config into the
+    // form — precisely the moment a user could open the tools tab and flip a
+    // switch. Post-fix, nothing is selected yet, so there is nothing loaded
+    // for an edit to race against in the first place.
+    drainAll(http);
+    expect(component.selectedExpert()).toBeNull();
+    expect(prefillFromConfig).not.toHaveBeenCalled();
+
+    // The user's edit would happen here, against a form that has rendered
+    // no expert config at all — there is no in-flight state for it to lose
+    // to a later reset.
+
+    // The source-thread fetch settles late and selects/fetches expert-2 —
+    // the only expert this session ever renders.
+    subject.next(THREAD);
+    subject.complete();
+    drainAll(http);
+
+    expect(component.selectedExpert()?.id).toBe('expert-2');
+    // Called exactly once. Two calls (once for a discarded expert-1, once
+    // for the real expert-2) is exactly the shape that would have silently
+    // clobbered an edit made in between — this is what fails without the
+    // round-1 fix (temporarily reverting it reproduces `toHaveBeenCalledTimes(2)`).
+    expect(prefillFromConfig).toHaveBeenCalledTimes(1);
+    expect(prefillFromConfig).toHaveBeenCalledWith({llm: {}});
   });
 
   it('a failed source-thread fetch leaves the form open and usable, applying the ordinary defaults instead', () => {
