@@ -68,9 +68,7 @@ async def test_delete_writes_tombstone_and_scrubs_thread_references(db):
     doomed_row = await db.create_datasource(name=doomed_name, ds_type="generic")
     doomed_id = str(doomed_row["id"])
 
-    thread_id = await _make_thread(
-        db, datasource_ids=[doomed_id, survivor_id]
-    )
+    thread_id = await _make_thread(db, datasource_ids=[doomed_id, survivor_id])
 
     try:
         assert await db.delete_datasource(doomed_id) is True

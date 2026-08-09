@@ -453,9 +453,7 @@ class TestAcknowledgedGrantDriftReportedNotJustEnforced:
     ):
         thread = _thread(
             metadata={
-                "config_override": {
-                    "tools": {"catalog_authoring": ["create_expert"]}
-                },
+                "config_override": {"tools": {"catalog_authoring": ["create_expert"]}},
                 "config_drift_ack": {"grant:catalog_authoring": "revoked"},
             }
         )
@@ -484,9 +482,7 @@ class TestAcknowledgedGrantDriftReportedNotJustEnforced:
         report correctly rather than blanket-hiding the category."""
         thread = _thread(
             metadata={
-                "config_override": {
-                    "tools": {"catalog_authoring": ["create_expert"]}
-                },
+                "config_override": {"tools": {"catalog_authoring": ["create_expert"]}},
             }
         )
         fake_db.get_user = AsyncMock(
