@@ -557,3 +557,56 @@ async def test_authorize_still_raises_generic_error_for_missing_row():
         )
 
     assert str(excinfo.value) == "One or more selected connectors are unavailable"
+
+
+@pytest.mark.asyncio
+async def test_tier_error_wins_when_the_repository_comes_first():
+    db = _db([
+        _row(DS_REPOSITORY, ds_type="repository"),
+        _row(DS_OWNED, scope="projects", projects=(PROJECT_B,)),
+    ])
+
+    with pytest.raises(DatasourceWorkspaceTierError):
+        await authorize_datasource_selection(
+            db,
+            {"id": OWNER, "is_admin": False},
+            OWNER,
+            [DS_REPOSITORY, DS_OWNED],
+            [PROJECT_A],
+            "virtual",
+        )
+
+
+@pytest.mark.asyncio
+async def test_out_of_scope_wins_when_it_comes_first():
+    db = _db([
+        _row(DS_OWNED, scope="projects", projects=(PROJECT_B,)),
+        _row(DS_REPOSITORY, ds_type="repository"),
+    ])
+
+    with pytest.raises(DatasourceUnavailableError):
+        await authorize_datasource_selection(
+            db,
+            {"id": OWNER, "is_admin": False},
+            OWNER,
+            [DS_OWNED, DS_REPOSITORY],
+            [PROJECT_A],
+            "virtual",
+        )
+
+
+@pytest.mark.asyncio
+async def test_deleted_outranks_tier_error_even_when_it_comes_second():
+    """The one position-independent case: the pre-refactor len() check ran
+    before the loop, so a missing id wins from any position."""
+    db = _db([_row(DS_REPOSITORY, ds_type="repository")])
+
+    with pytest.raises(DatasourceUnavailableError):
+        await authorize_datasource_selection(
+            db,
+            {"id": OWNER, "is_admin": False},
+            OWNER,
+            [DS_REPOSITORY, DS_SHARED],
+            [],
+            "virtual",
+        )
