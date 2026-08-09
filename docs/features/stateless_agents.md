@@ -2,7 +2,7 @@
 
 **Status:** v3.3 — **CONSOLIDATED 2026-08-09.** All three work streams are now on `feature/stateless-agents` (the session spine, its performance work, the S1 session-lane completion, and the S3 worker safety gates). Nothing is pushed; `develop` is untouched. **Where things stand is §9.1 Implementation status**, written against the code rather than intent.
 
-In one paragraph: the shared queue/lease substrate is built, k3d-verified and genuinely kind-agnostic; **the session lane is functionally complete** — turns queue and run on any pod, survive a mid-generation kill, never double-answer, reconnect with no socket, and take durable control verbs, all without the cockpit ever learning a lane exists; **the worker lane is not enabled** — two of its three safety gates are built but Gate 3 (§5.4.5) is a design problem that blocks any worker traffic. Turn latency went 99.6 s → 5.4 s cold / 3.0 s warm (§5.3.3, §5.3.4). Build history, measurements and failures: `docs/research/stateless_agents/implementation_log.md`; the completion-path evidence base is `docs/research/stateless_agents/completion_path_side_effect_inventory.md`.
+In one paragraph: the shared queue/lease substrate is built, k3d-verified and genuinely kind-agnostic; **the session lane is functionally complete** — turns queue and run on any pod, survive a mid-generation kill, never double-answer, reconnect with no socket, and take durable control verbs, all without the cockpit ever learning a lane exists; **the worker lane is not enabled** — two of its three safety gates are built, and Gate 3 (§5.4.5) is now designed down to DDL and a six-step rollout but not implemented, so no worker traffic can be admitted. Turn latency went 99.6 s → 5.4 s cold / 3.0 s warm (§5.3.3, §5.3.4). Build history, measurements and failures: `docs/research/stateless_agents/implementation_log.md`; the completion-path evidence base is `docs/research/stateless_agents/completion_path_side_effect_inventory.md`.
 
 v1 2026-08-06 (initial proposal); v2 2026-08-07 after an 8-agent research fan-out; **v3 same night after a 6-lens adversarial panel** (10 critical + 28 major findings folded in). Raw research and critic reports: `docs/research/stateless_agents/`. Related implementation docs carrying pieces of this work: `no_workspace_agent_mode.md` §5.1 (op count is the cost — the virtual backend's scoped metadata index) and `cloud_collaboration_model.md` §4 (one `Depth: infinity` PROPFIND per turn boundary).
 **Origin:** user proposal — an LLM turn is conversation JSON in, bigger conversation JSON out; so agents can be a Deployment, not pinned pods.
@@ -338,48 +338,204 @@ as a side effect.
   retry counter advances**.
 - A pinned job's completion is behaviorally identical to today's.
 
-##### Open design questions — what Gate 3 still has to settle
+##### Settled design (2026-08-09)
 
-The shape above is agreed; these are the decisions that turn it into something
-implementable. Recorded so the design can be resumed without re-deriving it.
+The seven open questions are answered below, against the code as it stands after
+the consolidation. An eighth decision the questions missed is recorded as **(6)**
+— it is load-bearing, and moving the status write last is unsafe without it.
 
-1. **Where the command row lives.** A new table, or an extension of
-   `run_queue`? It needs the full report payload, a deterministic key, and a
-   per-effect progress marker. A separate table probably wins — `run_queue`'s
-   contract is deliberately narrow ("this module touches ONLY run_queue") and
-   worker batches are not the only producer.
-2. **What `stop_identity` actually is.** `(job_id, lease_token)` may be
-   sufficient, since one lease serves one turn or batch. But an *exact* retry
-   must return the stored result while a *divergent* payload under the same key
-   must fail closed — so the key needs a payload digest, or the row needs to
-   store one for comparison.
-3. **Who runs the finalizer, and when.** Leader-elected loop on the reaper's
-   pattern (advisory lock for work-dedup, per-row CAS for correctness) for the
-   stateless lane, inline and synchronous for pinned so its behaviour is
-   unchanged. Needs the concrete retry/visibility-timeout semantics — mirror
-   `run_queue`'s own TTL/attempts/park rather than inventing a second dialect.
-4. **Per-effect keys.** One intent table keyed `(job_id, effect_kind, attempt)`,
-   or natural unique keys per effect? Some effects already have the right key
-   (`job_change_records.job_id`); the critic spawn wants a unique index on
-   `(parent_job_id, verification_round)`, which would close that hole outright
-   and is arguably worth doing on its own merits.
-5. **What replaces the status-based replay guard.** Moving the status write last
-   is necessary, but the current early-return guard *is* the replay defence.
-   Something has to take that role — most likely the command row's own state,
-   which is the point of having one.
-6. **Rollout order.** Pinned adopting the same path is the better end state (it
-   fixes the crash-mid-handler hole for pinned jobs too), but it must not be a
-   flag day. Sequence it.
-7. **Whether the live pinned-lane bugs are fixed here or sooner.** The inventory
-   found three that exist today: the workspace leak when a crash lands between
-   the status write and the archive, `completed` rows with `completed_at IS
-   NULL`, and the duplicate-critic race that can drop a blocking finding and
-   produce an unwarranted approval. The last one is a correctness hole in the
-   review system and does not need Gate 3 to fix.
+**(1) The command row is its own table**, `job_completion_commands`, modelled on
+`thread_control_requests` (migration 0119) rather than on `run_queue`. Three
+reasons, in order of weight. `run_queue`'s module contract is explicitly "this
+module touches ONLY run_queue" (`queries.py:849`) and its rows are *one per unit,
+durable for the unit's life* precisely so `lease_token` stays monotonic — a
+report is many-per-job, so the cardinality is wrong. And the session control
+inbox (0119/0120/0121) already solved this exact problem on this branch: a
+durable commit-ordered command, applied once by a fenced owner, with a
+terminal-shape CHECK that makes half-written states unrepresentable. Extending a
+pattern that is already proven here beats importing a new one.
+
+```sql
+CREATE TABLE job_completion_commands (
+    id                   UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    job_id               UUID NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+    report_seq           BIGINT NOT NULL,        -- commit-ordered, see (2)
+    client_report_id     UUID   NOT NULL,        -- agent-supplied idempotency key
+    payload              JSONB  NOT NULL,        -- the JobCompleteRequest, verbatim
+    payload_digest       TEXT   NOT NULL,        -- sha256 of canonical payload
+    reported_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+    accepted_lease_token BIGINT,                 -- stateless fence   } exactly
+    accepted_agent_id    UUID,                   -- pinned fence      } one
+
+    state                TEXT NOT NULL DEFAULT 'pending',
+    attempts             INT  NOT NULL DEFAULT 0,
+    max_attempts         INT  NOT NULL DEFAULT 5,
+    run_after            TIMESTAMPTZ NOT NULL DEFAULT now(),
+    finalizing_until     TIMESTAMPTZ,
+    finalizing_by        TEXT,
+
+    effect_log           JSONB NOT NULL DEFAULT '{}'::jsonb,
+    outcome              JSONB,
+    finalized_at         TIMESTAMPTZ,
+    error_code           TEXT,
+
+    CONSTRAINT uq_job_completion_seq    UNIQUE (job_id, report_seq),
+    CONSTRAINT uq_job_completion_client UNIQUE (job_id, client_report_id),
+    CONSTRAINT job_completion_fence_exactly_one CHECK (
+        (accepted_lease_token IS NOT NULL AND accepted_agent_id IS NULL)
+     OR (accepted_lease_token IS NULL AND accepted_agent_id IS NOT NULL)),
+    CONSTRAINT job_completion_terminal_shape CHECK (
+        state <> 'done' OR (outcome IS NOT NULL AND finalized_at IS NOT NULL))
+);
+```
+
+States are `pending | finalizing | done | parked | superseded`, app-validated (no
+CHECK), matching `run_queue`'s convention. `effect_log` is the per-effect
+progress marker — see (4).
+
+**(2) `stop_identity` was conflating three things**, which is why it resisted
+definition. They separate cleanly:
+
+- **Identity** — `(job_id, client_report_id)`, a UUID the agent derives from the
+  *stop* and stores alongside `freeze_data`, so an HTTP retry reuses it. Accept
+  is `ON CONFLICT (job_id, client_report_id) DO NOTHING`; on conflict it compares
+  `payload_digest`. Equal ⇒ return the recorded outcome (the exact-retry
+  contract). Different ⇒ **409, fail closed** — a divergent payload under a
+  reused key is a bug, not a retry.
+- **Fence** — `accepted_lease_token` XOR `accepted_agent_id`, the same
+  discriminated pair `thread_control_requests` uses, because the two lanes prove
+  ownership differently and neither should be forced into the other's shape.
+  Checked *at accept*, which is what makes it a real fence: the report is
+  admitted or rejected in one short transaction, not after 1046 lines.
+- **Order** — `report_seq`, allocated by incrementing `jobs.completion_seq_hwm`
+  under the jobs-row lock, never from an IDENTITY. This is the control inbox's
+  rule and it exists for a reason: an IDENTITY value can be allocated by a later
+  transaction that commits first, so it does not order commits. Authority when
+  two reports race is the highest `report_seq` whose fence still validates.
+
+`(job_id, lease_token)` alone is insufficient, which the original question
+suspected but did not pin down: pinned jobs have no run_queue lease at all, so
+every pinned report for a job would collapse onto one key.
+
+**(3) The finalizer speaks `run_queue`'s dialect verbatim** — `attempts` /
+`max_attempts` / `run_after` backoff / `parked`, with the same `5s × attempts ×
+(1 + U(0, 0.2))` scale and the same per-row CAS. `finalizing_until` is the
+visibility timeout, `finalizing_by` is diagnostics-only, and the leader gate is a
+new session-scoped advisory lock in `lock_ids.py` (`COMPLETION_FINALIZER_ID`,
+"SRW_FINL"). As with the reaper, the lock dedups *work* and the per-row CAS
+provides *correctness*, so the dual-leader window is safe by construction rather
+than by the election. `parked` is an operator worklist with an `unpark` verb,
+same as `run_queue`. Deliberately one dialect, not two: an operator who has
+learned the queue's semantics already knows the finalizer's.
+
+Pinned jobs run the finalizer **inline in the request**, so the agent still gets
+its `200` with `actions`. Stateless jobs get `202` and the background drain.
+This means `report_completion` must learn that `202` is success — a one-line
+agent change that is a hard ordering constraint in (7).
+
+**(4) Per-effect keys split three ways, not one intent table.** The inventory's
+own finding was that the codebase already has the right patterns and the failures
+are where they were not applied; a universal intent table would be a fourth style
+competing with three existing ones.
+
+- *Already keyed* — change record, session wake, `claim_delegation_resume`, the
+  loop barrier. Untouched. These are the reference implementations.
+- *Cheaply keyable* — give the effect a natural unique key and the hole closes
+  for both lanes with no protocol at all. The critic spawn is the case that
+  matters, and it is viable: the child already carries `verification_round` in
+  its context (`main.py:15905`), so a partial unique index on
+  `jobs (parent_job_id, (context->>'verification_round'))
+  WHERE context->>'verification_target' IS NOT NULL
+    AND status NOT IN ('failed','cancelled')`
+  makes the duplicate-critic race a constraint violation instead of an
+  unwarranted approval. **Known constraint:** a critic that reached `completed`
+  without recording a round would block a respawn of that round. Verified not to
+  be a live spawn path — `unstick_reviewing_parents` moves the target to
+  `pending_review` rather than respawning — and the escape hatch is to cancel the
+  dead critic, which drops it out of the partial index.
+- *Genuinely external and unkeyable* — cloud apply, terminal merge, subjob graft,
+  VM/pod/PVC delete, S3 snapshot, notifications. These use `effect_log` on the
+  command row: intent written before, completion written after, both in the
+  command's own transaction. A crash between them is therefore *detectable*, and
+  resume runs a **reconcile probe** rather than blindly replaying. Naming that
+  probe is part of implementing each effect, and the four hard ones are:
+  terminal merge → does the merge commit exist on `main`; graft → does the commit
+  exist on the parent branch under this ordinal; cloud apply → compare the
+  manifest against the recorded intent rather than treating our own writes as
+  external divergence (which is today's `cloud-conflict` park); workspace
+  teardown → does the pod/PVC still exist. An effect whose probe cannot be
+  written does not get to be replayed automatically; it parks for an operator.
+
+**(5) The fence replaces the status guard, and is strictly stronger.** Today's
+early return keys on a status the handler is itself about to change, which is why
+it doubles as the thing that makes a crash unrecoverable. After Gate 3, a genuine
+late callback — the k3d-reproduced case at `main.py:17595`, where a dead agent's
+trailing `llm_unavailable` flipped `completed` → `paused` 15 s later — arrives
+with a *stale fence* and is rejected at accept, on ownership rather than on
+status. The status check stays during coexistence as a compatibility belt, with
+its role downgraded from replay defence to lane-A behaviour preservation, and
+retires when pinned adopts the command path.
+
+**(6) The orphan sweeps must learn about pending commands.** This is the decision
+the seven questions missed. Moving the status write last means a job sits in
+`processing` with its agent already gone — which is precisely what
+`recover_orphaned_jobs` hunts ("assigned agent is online but NOT working on this
+job", `postgres.py:5439–5476`). Without a predicate change it would pause and
+re-dispatch a job that is mid-finalization, re-executing the work the command was
+about to record. So `recover_orphaned_jobs`, `recover_expired_lease_jobs` and the
+stale-agent detector all gain `AND NOT EXISTS (SELECT 1 FROM
+job_completion_commands WHERE job_id = jobs.id AND state IN
+('pending','finalizing'))`, served by a partial index on `(job_id)`. This applies
+to the **pinned** lane too — it is not covered by the `execution_lane = 'pinned'`
+partition, because the reordering is what pinned adopts in step 4 below.
+
+**(7) Rollout — six steps, each independently revertible.**
+
+1. **0130** — the two standalone fixes. `completed_at` gains `COALESCE` (S21),
+   and the critic-spawn partial unique index lands (S30). No protocol, no
+   coexistence risk, and they fix live pinned-lane bugs today.
+2. **0131** — the command table, `jobs.completion_seq_hwm`, and the sweep-
+   exclusion index. Dead schema; zero behaviour change.
+3. Accept writes the command for **both** lanes; the finalizer runs **inline**
+   for both. Behaviour is identical to today, but every report is now durably
+   recorded. This is the step that carries real risk — soak it behind a flag.
+4. The status write moves last, inside the inline finalizer, together with (6)'s
+   sweep predicates. Pinned gains crash recovery here.
+5. Background finalizer enabled for stateless units only.
+6. Stateless worker admission opens.
+
+The agent-side `client_report_id` must be **optional** with a server-side
+fallback (synthesize from `(job_id, report_seq)`), so an orchestrator that
+understands the field can run against an agent image that does not yet send it.
+The `202` acceptance in `report_completion`, conversely, must ship in the agent
+**before** any orchestrator returns `202` — the same "orchestrator understands it
+first, agent emits it second" discipline §5.4.1 imposes on freeze types, in the
+one direction where it inverts.
+
+**(8) The live pinned-lane bugs are fixed sooner, not here** — with two
+exceptions that genuinely need the protocol. The duplicate critic (S30) and
+`completed_at IS NULL` (S21) are step 1 above and should not wait for Gate 3: the
+first is a correctness hole in the review system that can approve work which
+should have been returned. The workspace leak (S36) *is* the one-way-door problem
+and needs Gate 3 proper — but the bleeding can be stopped independently with a
+reconciler sweep over terminal jobs with un-archived workspaces, which is worth
+building regardless because the finalizer needs exactly that backstop anyway. The
+S8 VM-recovery wedge and the S19 dispatcher-invisible window are fixed properly by
+the command's atomicity; each also has a cheap sweeper backstop if they bite
+before then.
 
 **Migration numbering:** S2 has been allocated **0122–0129**; Gate 3 starts at
 **0130**. This is deliberate range allocation — the earlier dev-cluster wedge
 came from two tracks numbering independently against one shared database.
+
+**Still unsettled, deliberately.** Two things are left to implementation because
+the answer depends on measurements that do not exist yet: the finalizer's poll
+cadence and batch size (it joins the aggregate DB budget in §5.5, which is
+itself unmeasured), and whether `payload` should be pruned or archived after
+`done` — a loop job's `freeze_data` is not small and this table grows once per
+batch rotation, so it needs a retention rule before the worker lane runs at
+volume.
 
 ##### Independent confirmation from the S3 track
 
@@ -475,7 +631,7 @@ Written against the code on the consolidated `feature/stateless-agents`, not aga
 intent. The short version: **the shared substrate is built and genuinely
 kind-agnostic; the session lane is functionally complete; the worker lane has two
 of three safety gates and is not enabled, because Gate 3 (§5.4.5) is a design
-problem rather than a predicate change.**
+problem rather than a predicate change — now designed, not yet built.**
 
 #### Is it shared between sessions and workers? The substrate yes; a shared pool has not passed its gates.
 
@@ -595,13 +751,16 @@ wall-clock-first with a 300 s floor, correctly placed at both phase and
 mid-phase boundaries, and it clears its whole arming envelope in the same
 checkpoint as the freeze so a resumed job cannot immediately re-freeze.
 
-*Gate 3 — not built, and now known to be a design problem rather than a
-predicate change (§5.4.5).* Two independent audits reached the same conclusion:
-there is no assigned-agent completion CAS to re-key, and adding a token check
-around today's completion route would still permit steal-during-handler
-mutations, because that route is 1046 lines with 29 database awaits, no explicit
-transaction, and external effects with no rollback. The next safe slice is
-durable completion-command intake plus a crash-recoverable finalizer.
+*Gate 3 — designed 2026-08-09, not built (§5.4.5).* Two independent audits
+reached the same conclusion: there is no assigned-agent completion CAS to re-key,
+and adding a token check around today's completion route would still permit
+steal-during-handler mutations, because that route is 1046 lines with 29 database
+awaits, no explicit transaction, and external effects with no rollback. The
+design is now settled to DDL: a `job_completion_commands` table modelled on the
+control inbox (0119), identity/fence/order separated, a finalizer speaking
+`run_queue`'s retry dialect, three classes of per-effect key, and a six-step
+rollout whose first step is two standalone fixes for live pinned-lane bugs.
+Implementation has not started; migrations begin at 0130.
 
 **Everything downstream of Gate 3 is blocked**: the worker driver, TodoManager
 hydration on any resume, conditional tmux kill, generator-close discipline,
