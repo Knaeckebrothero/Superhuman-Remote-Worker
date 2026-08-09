@@ -7210,6 +7210,32 @@ class PostgresDB:
                 thread_id,
             )
 
+    async def record_thread_config_drift_ack(
+        self, thread_id: str, ack: dict[str, str]
+    ) -> None:
+        """Merge acknowledged drift items into metadata.config_drift_ack.
+
+        Merged, never replaced: an older acknowledgment stays valid so a
+        previously accepted loss does not re-prompt.
+        """
+        if not ack:
+            return
+        async with self.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE threads
+                SET metadata = jsonb_set(
+                        COALESCE(metadata, '{}'::jsonb),
+                        '{config_drift_ack}',
+                        COALESCE(metadata->'config_drift_ack', '{}'::jsonb)
+                            || $2::jsonb
+                    )
+                WHERE id = $1
+                """,
+                UUID(thread_id),
+                json.dumps(ack),
+            )
+
     async def delete_thread(self, thread_id: str) -> None:
         """Permanently delete a thread and its messages."""
         try:

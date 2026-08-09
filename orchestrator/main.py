@@ -197,6 +197,12 @@ from services.dispatch_guards import (  # noqa: E402
     resume_lane_applies,
     vm_provisioning_decision,
 )
+from services.config_drift import (  # noqa: E402
+    DriftItem,
+    collect_config_drift,
+    drift_labels,
+)
+from services.datasource_policy import classify_datasource_selection  # noqa: E402
 from services.audit_usage import materialize_llm_usage_from_audit  # noqa: E402
 from services.cloud_pricing import (  # noqa: E402
     CloudCostEstimator,
@@ -29907,16 +29913,86 @@ async def _await_late_cloud_setup(thread_id: str) -> None:
         )
 
 
+class ThreadResumeRequest(BaseModel):
+    """Optional body for POST /resume. ``acknowledge`` carries the drift item
+    ids the user accepted losing."""
+
+    acknowledge: list[str] | None = None
+
+
+async def _thread_config_drift(
+    thread: dict[str, Any],
+    metadata: dict[str, Any],
+    *,
+    owner: dict[str, Any],
+) -> list[DriftItem]:
+    """Everything in this thread's stored config that is no longer usable.
+
+    Runs the same classifiers the enforcers wrap, so the dialog can never
+    promise something different from what attach will do.
+    """
+    thread_id = str(thread["id"])
+    project_ids = await _thread_project_ids(thread_id)
+    project_verdicts = await _classify_thread_project_ids(owner, project_ids)
+    allowed_project_ids = [v.project_id for v in project_verdicts if not v.denied]
+
+    datasource_verdicts, _revisions = await classify_datasource_selection(
+        postgres_db,
+        owner,
+        str(owner["id"]),
+        metadata.get("datasource_ids"),
+        allowed_project_ids,
+        None,
+        allow_admin_explicit_override=True,
+    )
+
+    # Grants are enforced inside the session resolve; run it purely to harvest
+    # the violations it would raise at attach.
+    status: dict[str, Any] = {}
+    try:
+        await _resolve_session_config(thread, metadata, status=status)
+    except GrantDenied:
+        pass
+    except Exception:
+        logger.exception(
+            "Thread %s: grant probe failed during drift collection", thread_id
+        )
+    grant_violations = status.get("grant_violations") or []
+
+    deleted_ids = [
+        v.datasource_id
+        for v in datasource_verdicts
+        if v.denied and v.reason == "deleted"
+    ]
+    tombstones = await postgres_db.get_datasource_tombstones(deleted_ids)
+
+    return await collect_config_drift(
+        postgres_db,
+        thread,
+        owner=owner,
+        project_ids=project_verdicts,
+        datasource_ids=datasource_verdicts,
+        grant_violations=grant_violations,
+        tombstones=tombstones,
+    )
+
+
 @app.post("/api/persistent/threads/{thread_id}/resume")
 async def resume_thread(
     thread_id: str,
     request: Request,
+    body: ThreadResumeRequest | None = None,
 ) -> dict[str, Any]:
     """Resume an ended thread (auth: owner only).
 
     Resets thread status to 'created' and clears the stale agent_id so that
     a new agent can pick it up. The frontend navigates to the chat page after
     calling this, where the orchestrator will provision or wait for an agent.
+
+    Drifted config (deleted/revoked connectors or projects, withdrawn grants)
+    is reported as 428 rather than silently denied; the caller re-POSTs with
+    ``acknowledge`` naming the drift ids it accepts losing. See
+    docs/features/session_config_drift_resume.md.
     """
     user, thread = await require_thread_owner(request, postgres_db, thread_id)
     if thread.get("status") != "ended":
@@ -29930,12 +30006,40 @@ async def resume_thread(
             metadata = json.loads(metadata)
         except (json.JSONDecodeError, TypeError):
             metadata = {}
-    # Validate before mutating the thread back to ``created``. A user should get
-    # one generic denial (rather than a half-resumed session that later fails to
-    # bind), and missing/private datasource/project UUIDs remain
-    # indistinguishable.
-    await _revalidate_thread_project_ids(thread, await _thread_project_ids(thread_id))
-    await _revalidate_thread_datasource_ids(thread, metadata.get("datasource_ids"))
+    # Validation stays ahead of mutation: a thread that cannot resume must not
+    # be left half-resumed. Compute drift and raise 428 BEFORE touching the
+    # thread's status, same discipline the old revalidate-and-raise calls had.
+    drift = await _thread_config_drift(thread, metadata, owner=user)
+    acknowledged = set(body.acknowledge or []) if body else set()
+    outstanding = {item.id for item in drift} - acknowledged
+    if outstanding:
+        # Subset, not equality: an item that RECOVERED between prompt and
+        # confirm must not force a pointless re-prompt, while an item that
+        # newly drifted is never silently acknowledged.
+        raise HTTPException(
+            status_code=428,
+            detail={
+                "code": "config_drift",
+                "detail": (
+                    "Parts of this session's configuration are no longer available"
+                ),
+                "drift": [
+                    {
+                        "id": item.id,
+                        "kind": item.kind,
+                        "reason": item.reason,
+                        "label": item.label,
+                    }
+                    for item in drift
+                ],
+                "summary": drift_labels(drift),
+            },
+        )
+
+    if drift:
+        await postgres_db.record_thread_config_drift_ack(
+            thread_id, {item.id: item.reason for item in drift}
+        )
 
     await postgres_db.resume_thread(thread_id)
 
