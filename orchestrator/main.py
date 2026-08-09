@@ -2550,9 +2550,13 @@ async def _resolve_session_config(
         if status is not None:
             status["state"] = "ok"
         return delivered
-    except GrantDenied:
+    except GrantDenied as gd:
         if status is not None:
             status["state"] = "denied"
+            # The drift collector reads these rather than re-merging the config
+            # itself — one merge implementation, so the dialog can never promise
+            # something different from what attach enforces.
+            status["grant_violations"] = list(gd.violations)
         raise
     except Exception:
         logger.exception(
