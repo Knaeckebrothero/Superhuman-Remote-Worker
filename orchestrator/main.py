@@ -70,7 +70,7 @@ configure_logging(
 from dataclasses import dataclass, replace  # noqa: E402
 from datetime import date, datetime, timedelta, timezone  # noqa: E402
 from decimal import Decimal  # noqa: E402
-from collections.abc import Coroutine, Mapping  # noqa: E402
+from collections.abc import Callable, Coroutine, Mapping  # noqa: E402
 from typing import Any, Literal, NamedTuple, Optional  # noqa: E402
 from uuid import UUID, uuid4  # noqa: E402
 
@@ -2447,6 +2447,39 @@ async def _account_defaults_layer(
     return await _resolve_default_models(user_id)
 
 
+async def _acknowledged_grant_strip(
+    metadata: dict[str, Any],
+    *,
+    user_id: str | None,
+    project_id: str | None,
+) -> Callable[[dict], dict] | None:
+    """Build ``resolve_config``'s ``grant_strip`` hook from a thread's
+    acknowledged grant drift, or ``None`` when there is nothing to strip (no
+    acknowledgment, or ``_resolve_runner_grants`` says admin bypass).
+
+    Shared by :func:`_resolve_session_config` (the delivered blob) and
+    :func:`_merged_session_tool_policy` (the tool-groups report), so the two
+    can never disagree about which acknowledged grants are currently still
+    violated — before this helper existed, the report used a bare
+    ``resolve_config`` call with no strip at all, so an acknowledged
+    ``catalog_authoring`` violation (say) still read "on" in the settings
+    view after the delivered blob had already dropped it. See
+    docs/features/session_config_drift_resume.md §3.3.
+    """
+    ack_grant_keys = acknowledged_grant_keys(metadata)
+    if not ack_grant_keys:
+        return None
+    grants_for_strip = await _resolve_runner_grants(
+        runner_user_id=user_id,
+        project_ids=[project_id] if project_id else [],
+    )
+    if grants_for_strip is None:
+        return None
+    return lambda fragment: _strip_acknowledged_grants(
+        fragment, grants_for_strip, ack_grant_keys
+    )
+
+
 async def _resolve_session_config(
     thread: dict[str, Any],
     metadata: dict[str, Any],
@@ -2513,23 +2546,9 @@ async def _resolve_session_config(
         # only the capture leaves the delivered blob carrying the very
         # capability the grant revoked (round-1 finding). None when there is
         # nothing acknowledged, or when _resolve_runner_grants says admin.
-        _ack_grant_keys = acknowledged_grant_keys(metadata)
-        _grants_for_strip = (
-            await _resolve_runner_grants(
-                runner_user_id=user_id,
-                project_ids=[project_id] if project_id else [],
-            )
-            if _ack_grant_keys
-            else None
-        )
-        _grant_strip = (
-            (
-                lambda fragment: _strip_acknowledged_grants(
-                    fragment, _grants_for_strip, _ack_grant_keys
-                )
-            )
-            if _grants_for_strip is not None
-            else None
+        # Shared with the tool-groups report — see _acknowledged_grant_strip.
+        _grant_strip = await _acknowledged_grant_strip(
+            metadata, user_id=user_id, project_id=project_id
         )
         resolved = resolve_config(
             base_config_name=base,
@@ -2662,6 +2681,19 @@ def _merged_session_tool_groups(
       one only by ``workspace.*`` and datasource categories
       (``graph``/``sql``/``mongodb``/``webdav``/``email``/``mcp``) — disjoint
       from these four groups.
+    - ``grant_strip`` — the acknowledged-grant-downgrade hook
+      ``_resolve_session_config`` passes to ``resolve_config`` — is skipped
+      HERE too, and it does NOT belong on the "safe to skip" side of this
+      ledger the way the entries above do: an acknowledged grant violation
+      CAN delete a closed group's only enabling key (``catalog_authoring`` is
+      both a closed session tool group and a key ``strip_to_grants`` drops).
+      This function has no caller today that carries a thread/metadata to
+      build the hook from, so it is left unthreaded rather than faked.
+      :func:`_merged_session_tool_policy` — whose two HTTP callers DO have a
+      thread — accepts and forwards ``grant_strip`` instead; see
+      ``_acknowledged_grant_strip``. If this function grows a caller that
+      needs a drift-aware answer, thread it through the same way rather than
+      silently reporting the pre-strip merge.
 
     Kept, because each CAN set ``tools.*``: the base config name, the expert
     row, the project-expert link override, and the request override (which is
@@ -2683,11 +2715,17 @@ def _merged_session_tool_policy(
     project_overrides: dict[str, Any] | None,
     request_override: dict[str, Any] | None,
     expert_type: str = "session",
+    grant_strip: Callable[[dict], dict] | None = None,
 ) -> tuple[dict[str, list[str]], dict[str, str]]:
     """``(merged tools mapping, category -> deciding layer)``.
 
     SYNCHRONOUS — see :func:`_merged_session_tool_groups`, whose skip ledger
-    this shares because it runs the same resolve.
+    this shares because it runs the same resolve, with ONE exception:
+    ``grant_strip`` is NOT skipped here. A caller that holds a thread and its
+    metadata (the two tool-groups HTTP endpoints) can build the identical
+    hook ``_resolve_session_config`` passes to ``resolve_config`` — see
+    ``_acknowledged_grant_strip`` — so an acknowledged grant's downgrade
+    shows up in the reported policy instead of only in the delivered blob.
 
     This is a *prediction* and is only ever served as one. It cannot see the
     agent's runtime injection layer or its backend capability gate, so it is
@@ -2711,6 +2749,7 @@ def _merged_session_tool_policy(
         request_override=request_override,
         expert_type=expert_type,
         capture=capture,
+        grant_strip=grant_strip,
     )
     merged_fragment = capture.get("merged_fragment") or {}
     merged = merged_fragment.get("tools")
@@ -4563,11 +4602,14 @@ async def _send_session_attach_locked(
     # that same result. The generic denial deliberately avoids an enumeration
     # oracle; datasource credentials never reach this log path.
     try:
-        ack = acknowledged_drift_ids(_meta)
-        current_project_ids = strip_acknowledged(
-            await _thread_project_ids(thread_id), ack, prefix="project"
+        # Acknowledged-but-still-unavailable project drift is narrowed out
+        # INSIDE _revalidate_thread_project_ids now (only while it stays
+        # denied), so an already-acknowledged revoked/deleted project does
+        # not spuriously 403 here — while a RECOVERED acknowledged project
+        # returns automatically (spec §3.2).
+        project_ids = await _revalidate_thread_project_ids(
+            _thread, await _thread_project_ids(thread_id)
         )
-        project_ids = await _revalidate_thread_project_ids(_thread, current_project_ids)
         resolved_datasources = await _resolve_authorized_thread_datasources(
             _thread,
             _meta.get("datasource_ids"),
@@ -10905,14 +10947,12 @@ async def _resolve_internal_job_creation_scope(
             column_project = thread.get("project_id")
             if column_project and str(column_project) not in thread_projects:
                 thread_projects.insert(0, str(column_project))
-            # Acknowledged project drift is narrowed out before revalidation,
-            # same as the warm-attach and cold-workspace call sites, so an
+            # Acknowledged-but-still-unavailable project drift is narrowed
+            # out INSIDE _revalidate_thread_project_ids now, same as the
+            # warm-attach and cold-workspace call sites, so an
             # already-acknowledged revoked/deleted project does not
-            # spuriously 403 an internal job scoped off this thread.
-            ack = acknowledged_drift_ids(thread.get("metadata"))
-            thread_projects = strip_acknowledged(
-                thread_projects, ack, prefix="project"
-            )
+            # spuriously 403 an internal job scoped off this thread — while a
+            # RECOVERED acknowledged project returns automatically.
             thread_projects = await _revalidate_thread_project_ids(
                 thread, thread_projects
             )
@@ -25546,14 +25586,14 @@ async def _agent_get_thread_workspace_locked(thread_id: str) -> dict[str, Any]:
         canvas_shared_browser_available,
     ) = _agent_canvas_workspace_capabilities(metadata, ws, vm)
     # Phase 1: project attachment + cloud mounts now live on thread_mounts.
-    # Acknowledged project drift is narrowed out before revalidation, same as
-    # the warm-attach call site — otherwise a cold-started session dies here
-    # on exactly the drift the owner already acknowledged at resume.
-    _ack = acknowledged_drift_ids(metadata)
-    current_project_ids = strip_acknowledged(
-        await _thread_project_ids(thread_id), _ack, prefix="project"
+    # Acknowledged-but-still-unavailable project drift is narrowed out
+    # INSIDE _revalidate_thread_project_ids now, same as the warm-attach
+    # call site — otherwise a cold-started session dies here on exactly the
+    # drift the owner already acknowledged at resume — while a RECOVERED
+    # acknowledged project returns automatically (spec §3.2).
+    project_ids = await _revalidate_thread_project_ids(
+        thread, await _thread_project_ids(thread_id)
     )
-    project_ids = await _revalidate_thread_project_ids(thread, current_project_ids)
     datasources_payload = await _resolve_thread_datasources(
         thread, metadata, project_ids=project_ids
     )
@@ -27552,6 +27592,53 @@ async def _authorize_thread_datasource_ids(
     return selected
 
 
+async def _strip_still_denied_ack(
+    thread: dict[str, Any],
+    selected: list[str],
+    *,
+    actor: dict[str, Any] | None,
+    effective_work_owner_id: str | None,
+    project_ids: list[str],
+    trusted_system_inheritance: bool = False,
+) -> list[str]:
+    """Drop acknowledged connector ids that are CURRENTLY still unavailable.
+
+    Spec §3.2: "If the connector is recreated or the grant re-issued, the
+    item returns automatically on the next attach — no repair step." Dropping
+    an id purely because its namespaced key is IN the ack map (as this used
+    to do) breaks that promise forever, since nothing ever prunes the map.
+
+    ``strip_acknowledged`` itself stays a pure, unconditional set-difference
+    (see tests/test_attach_honors_drift_ack.py). The "only while it's still
+    denied" condition lives here, at the call site, mirroring
+    ``_strip_acknowledged_grants``'s re-evaluate-before-strip discipline:
+    classify current status first, then narrow. A recreated/re-scoped
+    connector keeps a clean verdict and is left in ``selected``, so it
+    authorizes normally and is used again automatically; a still-denied
+    acknowledged id is dropped exactly as before. Anything denied and NEVER
+    acknowledged is also left in place, so the authorize call downstream
+    still fails the whole selection closed on it — fail-closed is unchanged.
+    """
+    ack = acknowledged_drift_ids(thread.get("metadata"))
+    if not ack:
+        return selected
+    verdicts, _revisions = await classify_datasource_selection(
+        postgres_db,
+        actor,
+        effective_work_owner_id,
+        selected,
+        project_ids,
+        None,
+        trusted_system_inheritance=trusted_system_inheritance,
+    )
+    still_denied_ack = {
+        f"connector:{v.datasource_id}"
+        for v in verdicts
+        if v.denied and f"connector:{v.datasource_id}" in ack
+    }
+    return strip_acknowledged(selected, still_denied_ack, prefix="connector")
+
+
 async def _revalidate_thread_datasource_selection(
     thread: dict[str, Any],
     datasource_ids: list[str] | None,
@@ -27571,14 +27658,11 @@ async def _revalidate_thread_datasource_selection(
     naturally omitted by ``resolve_datasources_for_thread``. A non-system thread
     whose owner row vanished fails closed with the same generic detail used at
     create time, avoiding a datasource-enumeration oracle.
+
+    Acknowledged ids are narrowed out only while still denied — see
+    :func:`_strip_still_denied_ack`.
     """
     selected = list(dict.fromkeys(str(value) for value in datasource_ids or []))
-    # Acknowledged losses are dropped rather than denied. Narrowing BEFORE
-    # authorization keeps _require_exact_datasource_resolution's fail-closed
-    # comparison intact — it compares resolution against this same list.
-    ack = acknowledged_drift_ids(thread.get("metadata"))
-    if ack:
-        selected = strip_acknowledged(selected, ack, prefix="connector")
     if not selected:
         return [], {}
 
@@ -27590,6 +27674,16 @@ async def _revalidate_thread_datasource_selection(
 
     owner_id = thread.get("user_id")
     if not owner_id:
+        selected = await _strip_still_denied_ack(
+            thread,
+            selected,
+            actor=None,
+            effective_work_owner_id=None,
+            project_ids=project_ids,
+            trusted_system_inheritance=True,
+        )
+        if not selected:
+            return [], {}
         return await _authorize_thread_datasource_selection(
             None,
             selected,
@@ -27604,6 +27698,16 @@ async def _revalidate_thread_datasource_selection(
             status_code=403,
             detail="One or more selected connectors are unavailable",
         )
+
+    selected = await _strip_still_denied_ack(
+        thread,
+        selected,
+        actor=owner,
+        effective_work_owner_id=str(owner_id),
+        project_ids=project_ids,
+    )
+    if not selected:
+        return [], {}
 
     # workspace_backend=None intentionally skips the create-time lite/repository
     # compatibility rule. Revalidation is only an access check and must not
@@ -27656,6 +27760,13 @@ async def _revalidate_thread_project_ids(
     revoked membership must take effect on the next attach/resume. Userless
     internal/system threads retain their existing trusted behavior, and admins
     retain the platform's normal all-project visibility.
+
+    Acknowledged ids are dropped only while they remain unavailable (spec
+    §3.2: a restored membership returns automatically, no repair step).
+    Classify current status first, narrow out only the acknowledged ids that
+    are STILL denied, and let :func:`_authorize_thread_project_ids` fail the
+    whole selection closed on anything denied that was never acknowledged —
+    mirrors the connector counterpart, :func:`_strip_still_denied_ack`.
     """
     owner_id = thread.get("user_id")
     if not owner_id:
@@ -27667,7 +27778,19 @@ async def _revalidate_thread_project_ids(
             status_code=403,
             detail="One or more attached projects are unavailable",
         )
-    return await _authorize_thread_project_ids(owner, project_ids)
+
+    selected = list(dict.fromkeys(str(value) for value in project_ids or []))
+    ack = acknowledged_drift_ids(thread.get("metadata"))
+    if ack and selected:
+        verdicts = await _classify_thread_project_ids(owner, selected)
+        still_denied_ack = {
+            f"project:{v.project_id}"
+            for v in verdicts
+            if v.denied and f"project:{v.project_id}" in ack
+        }
+        selected = strip_acknowledged(selected, still_denied_ack, prefix="project")
+
+    return await _authorize_thread_project_ids(owner, selected)
 
 
 @dataclass(frozen=True)
@@ -29260,12 +29383,22 @@ async def get_thread_tool_groups(thread_id: str, request: Request) -> dict[str, 
                     project_overrides = link.get("config_override") or None
                     if isinstance(project_overrides, str):
                         project_overrides = json.loads(project_overrides)
+            # Owner-correct, same as _session_tool_grants below: an admin
+            # viewing another user's thread must see THAT owner's
+            # acknowledged grants, not their own (see _acknowledged_grant_strip
+            # and the resume-time owner-vs-caller fix it mirrors).
+            grant_strip = await _acknowledged_grant_strip(
+                metadata,
+                user_id=str(thread["user_id"]) if thread.get("user_id") else None,
+                project_id=project_id,
+            )
             configured, provenance = await asyncio.to_thread(
                 _merged_session_tool_policy,
                 base_config_name=base,
                 expert_row=expert_row,
                 project_overrides=project_overrides,
                 request_override=request_override,
+                grant_strip=grant_strip,
             )
         except Exception:
             logger.exception("Tool-group resolve failed for thread %s", thread_id)
@@ -29377,6 +29510,11 @@ async def preview_tool_groups(
                 _legacy_session_tool_policy, base, body.config_override or None
             )
         else:
+            # No grant_strip here: this is a not-yet-created session, so
+            # there is no thread and no metadata.config_drift_ack to have
+            # acknowledged anything against — unlike the thread endpoint
+            # above, omitting it is not a gap to close, it is the correct
+            # answer for a config that cannot yet have drifted.
             configured, provenance = await asyncio.to_thread(
                 _merged_session_tool_policy,
                 base_config_name=base,
@@ -30011,14 +30149,28 @@ async def _thread_config_drift(
     thread: dict[str, Any],
     metadata: dict[str, Any],
     *,
-    owner: dict[str, Any],
+    owner: dict[str, Any] | None,
 ) -> list[DriftItem]:
     """Everything in this thread's stored config that is no longer usable.
 
     Runs the same classifiers the enforcers wrap, so the dialog can never
     promise something different from what attach will do.
+
+    ``owner`` MUST be the thread's own owner row (looked up from
+    ``thread["user_id"]``), never the caller. ``require_thread_owner`` lets
+    admins act on threads they do not own, and admins pass every classify_*
+    check — passing the caller through would silently report no drift for
+    someone else's drifted thread, resume it anyway with no ack recorded,
+    and leave the real owner permanently stuck (attach enforces against the
+    true owner and refuses, and the cockpit only offers Resume while status
+    is ``ended``). ``None`` means a userless internal/system thread: trusted
+    exactly like :func:`_revalidate_thread_project_ids` /
+    :func:`_revalidate_thread_datasource_selection` treat one, since there is
+    no per-user membership or grant that could have drifted.
     """
     thread_id = str(thread["id"])
+    if owner is None:
+        return []
     project_ids = await _thread_project_ids(thread_id)
     project_verdicts = await _classify_thread_project_ids(owner, project_ids)
     allowed_project_ids = [v.project_id for v in project_verdicts if not v.denied]
@@ -30103,10 +30255,25 @@ async def resume_thread(
             metadata = json.loads(metadata)
         except (json.JSONDecodeError, TypeError):
             metadata = {}
+    # Drift must be computed as the THREAD OWNER, never the caller (`user`):
+    # require_thread_owner lets admins through for threads they do not own,
+    # and admins pass every classify_* check — see _thread_config_drift's
+    # docstring for the failure this produced. Same owner lookup and
+    # fail-closed-on-missing-row as _revalidate_thread_project_ids.
+    owner_id = thread.get("user_id")
+    if owner_id:
+        owner = await postgres_db.get_user(str(owner_id))
+        if owner is None:
+            raise HTTPException(
+                status_code=403,
+                detail="Session configuration could not be verified",
+            )
+    else:
+        owner = None
     # Validation stays ahead of mutation: a thread that cannot resume must not
     # be left half-resumed. Compute drift and raise 428 BEFORE touching the
     # thread's status, same discipline the old revalidate-and-raise calls had.
-    drift = await _thread_config_drift(thread, metadata, owner=user)
+    drift = await _thread_config_drift(thread, metadata, owner=owner)
     acknowledged = set(body.acknowledge or []) if body else set()
     outstanding = {item.id for item in drift} - acknowledged
     if outstanding:

@@ -835,6 +835,12 @@ async def test_resume_revalidates_datasources_before_mutating_thread_status():
     db = MagicMock()
     db.resume_thread = AsyncMock()
     db.record_thread_config_drift_ack = AsyncMock()
+    # resume_thread resolves drift as the THREAD OWNER, not the caller (a
+    # caller can be an admin acting on someone else's thread) — it reads the
+    # owner row via get_user(thread["user_id"]) before calling
+    # _thread_config_drift. Here the caller already stands in as the owner
+    # (same id), so the same dict is the right stand-in for that row.
+    db.get_user = AsyncMock(return_value=user)
     drift = [
         DriftItem(f"connector:{datasource_id}", "connector", "deleted", "gone")
     ]
@@ -875,6 +881,10 @@ async def test_resume_blocks_revoked_native_project_scope_before_status_mutation
     db = MagicMock()
     db.resume_thread = AsyncMock()
     db.record_thread_config_drift_ack = AsyncMock()
+    # See the datasource test above: resume_thread now reads the owner row
+    # via get_user(thread["user_id"]) before computing drift. The caller
+    # already stands in as the owner here (same id).
+    db.get_user = AsyncMock(return_value=user)
     drift = [DriftItem(f"project:{project_id}", "project", "revoked", "gone")]
 
     with (

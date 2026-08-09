@@ -429,3 +429,75 @@ class TestFailureModes:
 
         assert exc.value.status_code == 403
         sentinel.assert_not_called()
+
+
+# =============================================================================
+# Acknowledged grant drift must be reflected, not just enforced silently
+# =============================================================================
+
+
+class TestAcknowledgedGrantDriftReportedNotJustEnforced:
+    """Round-2 finding: ``_merged_session_tool_policy`` used to call
+    ``resolve_config`` WITHOUT the ``grant_strip`` hook
+    ``_resolve_session_config`` applies, so this endpoint reported the
+    PRE-strip merge. ``catalog_authoring`` is both a closed session tool
+    group and a key ``strip_to_grants`` deletes, so once a user acknowledged
+    losing that grant, the settings checkbox kept reading "on" even though
+    the delivered agent blob no longer carried it — the report disagreed
+    with what the session actually got.
+    """
+
+    @pytest.mark.asyncio
+    async def test_acknowledged_catalog_authoring_reports_unavailable_not_on(
+        self, user_a, fake_db, fake_request
+    ):
+        thread = _thread(
+            metadata={
+                "config_override": {
+                    "tools": {"catalog_authoring": ["create_expert"]}
+                },
+                "config_drift_ack": {"grant:catalog_authoring": "revoked"},
+            }
+        )
+        # A real (non-admin) owner row, so _resolve_runner_grants actually
+        # resolves grants instead of admin-bypassing to None.
+        fake_db.get_user = AsyncMock(
+            return_value={"id": str(user_a["id"]), "is_admin": False}
+        )
+
+        with patch(
+            "main._resolve_runner_grants",
+            AsyncMock(return_value={"catalog_authoring": False}),
+        ):
+            result = await _call(user_a, fake_db, thread, fake_request)
+
+        assert result["categories"]["catalog_authoring"]["state"] == "unavailable"
+        assert result["tool_groups"]["catalog_authoring"] is False
+
+    @pytest.mark.asyncio
+    async def test_unacknowledged_catalog_authoring_still_reports_on(
+        self, user_a, fake_db, fake_request
+    ):
+        """Control case: with NOTHING acknowledged, grant_strip has nothing
+        to strip (acknowledged_grant_keys is empty), so the merged config's
+        own value still decides — pinning that the fix above narrows the
+        report correctly rather than blanket-hiding the category."""
+        thread = _thread(
+            metadata={
+                "config_override": {
+                    "tools": {"catalog_authoring": ["create_expert"]}
+                },
+            }
+        )
+        fake_db.get_user = AsyncMock(
+            return_value={"id": str(user_a["id"]), "is_admin": False}
+        )
+
+        with patch(
+            "main._resolve_runner_grants",
+            AsyncMock(return_value={"catalog_authoring": True}),
+        ):
+            result = await _call(user_a, fake_db, thread, fake_request)
+
+        assert result["categories"]["catalog_authoring"]["state"] == "on"
+        assert result["tool_groups"]["catalog_authoring"] is True
