@@ -29952,11 +29952,21 @@ async def _thread_config_drift(
     try:
         await _resolve_session_config(thread, metadata, status=status)
     except GrantDenied:
+        # Expected: this is exactly the signal we came here to harvest.
         pass
-    except Exception:
+    except Exception as exc:
+        # We could not determine whether grants drifted. Reporting "no drift"
+        # would let the session resume on an unknown state; fail closed with
+        # the same generic denial the endpoint used before this feature.
         logger.exception(
-            "Thread %s: grant probe failed during drift collection", thread_id
+            "Thread %s: grant probe failed during drift collection; "
+            "refusing to resume on an unknown state",
+            thread_id,
         )
+        raise HTTPException(
+            status_code=403,
+            detail="Session configuration could not be verified",
+        ) from exc
     grant_violations = status.get("grant_violations") or []
 
     deleted_ids = [
