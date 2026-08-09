@@ -1299,6 +1299,56 @@ describe('PersistentChatService — resume navigation safety', () => {
         expect(sseInstances).toHaveLength(1);
         expect(sseInstances[0].url).toContain('/persistent/threads/thread-B/stream');
     });
+
+    it('does not clear the current thread\'s pendingDrift when an abandoned resume succeeds late', async () => {
+        // Fix round 1, Finding 2: the SUCCESS branch of resumeSession() used
+        // to call pendingDrift.set(null) unconditionally, with no currency
+        // guard, while the catch branch (test above) already had one. The
+        // sibling success-path test above ('does not reconnect...') never
+        // seeds pendingDrift, so it passes with or without this guard — this
+        // test seeds it, so a regression back to the unconditional clear
+        // fails it: a late SUCCESS for thread-A (abandoned) must not wipe
+        // the drift dialog thread-B (current) is showing for its own,
+        // unrelated resume.
+        const {service, mockHttp, sseInstances} = createService();
+        const resumeResponse = new Subject<Record<string, never>>();
+        service.threadId.set('thread-A');
+        mockHttp.post.mockImplementation((url: string) =>
+            url.endsWith('/persistent/threads/thread-A/resume')
+                ? resumeResponse.asObservable()
+                : of({}),
+        );
+        mockHttp.get.mockImplementation((url: string) => {
+            if (url.endsWith('/messages')) return of({messages: [], total: 0});
+            if (url.endsWith('/persistent/threads/thread-B')) {
+                return of({status: 'active', title: 'Thread B', total_turns: 0});
+            }
+            if (url.endsWith('/sessions/thread-B/connection')) {
+                return of({state: 'ready', ws_url: 'ws://thread-B'});
+            }
+            if (url.endsWith('/citations')) return of({citations: []});
+            return of({status: 'active'});
+        });
+
+        const resume = service.resumeSession();
+        await service.connect('thread-B'); // user navigates away mid-resume
+        // Thread B has its own, unrelated drift dialog up (connect()'s
+        // cold-path reset already cleared the null it inherited from the
+        // switch — this is thread-B's own, separately-populated state).
+        const currentThreadsDrift = [
+            {id: 'grant:shell_tools', kind: 'grant' as const, reason: 'revoked' as const,
+             label: 'shell tools'},
+        ];
+        service.pendingDrift.set(currentThreadsDrift);
+        resumeResponse.next({}); // thread-A's abandoned resume now succeeds
+        resumeResponse.complete();
+        await resume;
+
+        expect(service.pendingDrift()).toEqual(currentThreadsDrift);
+        expect(service.threadId()).toBe('thread-B');
+        expect(sseInstances).toHaveLength(1);
+        expect(sseInstances[0].url).toContain('/persistent/threads/thread-B/stream');
+    });
 });
 
 describe('PersistentChatService — resume config drift', () => {
