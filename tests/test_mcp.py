@@ -852,9 +852,27 @@ class TestMcpPersistentThreadTools:
 
         result = await resume_persistent_thread("tid-1")
 
-        mock_client.resume_persistent_thread.assert_awaited_once_with("tid-1")
+        mock_client.resume_persistent_thread.assert_awaited_once_with(
+            "tid-1", acknowledge=None
+        )
         assert "created" in result
         assert "resume_thread" in result
+
+    @pytest.mark.asyncio
+    async def test_resume_persistent_thread_forwards_acknowledge(self, mock_client):
+        resume_persistent_thread = _mcp_server_mod.resume_persistent_thread
+
+        mock_client.resume_persistent_thread.return_value = {
+            "status": "created",
+            "thread_id": "tid-1",
+        }
+
+        result = await resume_persistent_thread("tid-1", acknowledge=["connector:abc"])
+
+        mock_client.resume_persistent_thread.assert_awaited_once_with(
+            "tid-1", acknowledge=["connector:abc"]
+        )
+        assert "created" in result
 
     @pytest.mark.asyncio
     async def test_resume_persistent_thread_error(self, mock_client):
