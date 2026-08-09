@@ -17,7 +17,7 @@ from main import (
     _authorize_thread_project_ids,
     _build_datasources_payload,
     _normalize_kb_config,
-    _revalidate_thread_datasource_ids,
+    _revalidate_thread_datasource_selection,
     _revalidate_thread_project_ids,
     _thread_has_knowledge_scope,
     _thread_creation_project_ids,
@@ -646,7 +646,7 @@ async def test_persisted_thread_datasource_is_denied_after_access_revocation():
         patch("main._thread_project_ids", AsyncMock(return_value=[])),
         pytest.raises(HTTPException) as exc,
     ):
-        await _revalidate_thread_datasource_ids(
+        await _revalidate_thread_datasource_selection(
             {"id": "thread-1", "user_id": owner_id},
             [str(datasource_id)],
         )
@@ -681,17 +681,23 @@ async def test_persisted_thread_revalidation_preserves_global_and_system_semanti
         patch("main.postgres_db", db),
         patch("main._thread_project_ids", AsyncMock(return_value=[])),
     ):
-        global_selection = await _revalidate_thread_datasource_ids(
-            {"id": "thread-user", "user_id": owner_id},
-            [str(datasource_id)],
+        global_selection, global_revisions = (
+            await _revalidate_thread_datasource_selection(
+                {"id": "thread-user", "user_id": owner_id},
+                [str(datasource_id)],
+            )
         )
-        system_selection = await _revalidate_thread_datasource_ids(
-            {"id": "thread-system", "user_id": None},
-            [str(datasource_id), str(datasource_id)],
+        system_selection, system_revisions = (
+            await _revalidate_thread_datasource_selection(
+                {"id": "thread-system", "user_id": None},
+                [str(datasource_id), str(datasource_id)],
+            )
         )
 
     assert global_selection == [str(datasource_id)]
     assert system_selection == [str(datasource_id)]
+    assert global_revisions == {str(datasource_id): 1}
+    assert system_revisions == {str(datasource_id): 1}
     assert db.get_user.await_count == 2
     db.get_user.assert_awaited_with(str(owner_id))
 
@@ -817,12 +823,16 @@ async def test_resume_revalidates_datasources_before_mutating_thread_status():
     is resolved.
 
     Round-1 diagnosis (this test regressed under Task 6, commit a6e073e3):
-    this pinned a synchronous 403 raised by ``_revalidate_thread_datasource_ids``
-    — a helper ``resume_thread`` no longer calls at all. Task 6
-    (docs/features/session_config_drift_resume.md) deliberately replaced that
-    dead-end 403 with an acknowledgeable 428 listing every drifted item (a
-    revoked/deleted datasource no longer permanently strands the session) —
-    an intentional, already-shipped contract change, not a bug. This is a
+    this pinned a synchronous 403 raised by the old
+    ``_revalidate_thread_datasource_ids`` helper — one ``resume_thread`` no
+    longer called, and which Task 13 later deleted outright once its only
+    remaining callers (direct tests) were redirected to the selection
+    function it had wrapped, ``_revalidate_thread_datasource_selection``.
+    Task 6 (docs/features/session_config_drift_resume.md) deliberately
+    replaced that dead-end 403 with an acknowledgeable 428 listing every
+    drifted item (a revoked/deleted datasource no longer permanently
+    strands the session) — an intentional, already-shipped contract
+    change, not a bug. This is a
     genuine (ii): the old mock (`user={}`, the old helper patched) doesn't
     match resume_thread's real current collaborator (`_thread_config_drift`),
     which is why it crashed with a raw ``KeyError`` rather than failing its
@@ -872,10 +882,13 @@ async def test_resume_blocks_revoked_native_project_scope_before_status_mutation
 
     Round-1 diagnosis: same (ii) as above — a synchronous 403 from
     ``_revalidate_thread_project_ids`` is now an acknowledgeable 428 (Task 6).
-    ``_revalidate_thread_datasource_ids`` is no longer on resume_thread's call
-    path at all (``_thread_config_drift`` computes drift directly), so a mock
-    of it proves nothing here and has been dropped rather than kept as dead
-    weight.
+    The old ``_revalidate_thread_datasource_ids`` was never on
+    resume_thread's call path either (``_thread_config_drift`` computes
+    drift directly), so a mock of it proved nothing here and was dropped
+    rather than kept as dead weight; Task 13 later deleted the function
+    itself, its last callers having been direct tests in
+    tests/test_kb_datasource_api.py, since redirected to
+    ``_revalidate_thread_datasource_selection``.
     """
     project_id = "99999999-2222-3333-4444-555555555555"
     thread = {

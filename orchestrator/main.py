@@ -203,7 +203,6 @@ from services.config_drift import (  # noqa: E402
     acknowledged_grant_keys,
     blocking_denials,
     collect_config_drift,
-    drift_labels,
     strip_acknowledged,
 )
 from services.datasource_policy import classify_datasource_selection  # noqa: E402
@@ -27740,16 +27739,6 @@ async def _revalidate_thread_datasource_selection(
     )
 
 
-async def _revalidate_thread_datasource_ids(
-    thread: dict[str, Any], datasource_ids: list[str] | None
-) -> list[str]:
-    """Compatibility wrapper for delivery paths that need IDs only."""
-    selected, _revisions = await _revalidate_thread_datasource_selection(
-        thread, datasource_ids
-    )
-    return selected
-
-
 async def _resolve_authorized_thread_datasources(
     thread: dict[str, Any],
     datasource_ids: list[str] | None,
@@ -30339,7 +30328,6 @@ async def resume_thread(
                     }
                     for item in drift
                 ],
-                "summary": drift_labels(drift),
             },
         )
 
