@@ -148,7 +148,7 @@ def _format_action_error(action: str, target: str, error: Exception) -> str:
 # to distinguish from a cached/deployed schema. Build provenance says which
 # source produced the pod; this small contract revision says which tool surface
 # that source promises.
-MCP_TOOL_SCHEMA_REVISION = "6"
+MCP_TOOL_SCHEMA_REVISION = "7"
 _tool_schema_cache: tuple[list[dict[str, Any]], str] | None = None
 
 
@@ -3221,22 +3221,31 @@ async def end_persistent_thread(thread_id: str, permanent: bool = False) -> str:
 
 
 @mcp_tool
-async def resume_persistent_thread(thread_id: str) -> str:
+async def resume_persistent_thread(
+    thread_id: str, acknowledge: list[str] | None = None
+) -> str:
     """Resume an ended persistent thread.
 
     MUTATION: Resets the thread status to 'created', clears the stale
     agent binding, and re-provisions the agent pod. The thread must be
     in 'ended' status.
 
+    If the session's config has drifted (deleted connector, revoked
+    project, withdrawn grant), this returns the drifted items; call again
+    with `acknowledge` set to their ids to resume without them.
+
     Args:
         thread_id: Thread UUID to resume
+        acknowledge: Drift item ids to resume without (optional)
 
     Returns:
         Action result with new status
     """
     client = _get_client()
     try:
-        result = await client.resume_persistent_thread(thread_id)
+        result = await client.resume_persistent_thread(
+            thread_id, acknowledge=acknowledge
+        )
         return fmt.format_thread_action_result("resume_thread", thread_id, result)
     except Exception as e:
         return _format_action_error("resume_thread", thread_id, e)
