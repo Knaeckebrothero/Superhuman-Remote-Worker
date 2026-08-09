@@ -28,6 +28,7 @@ from orchestrator.services.config_drift import (
 
 DS_GONE = "d7555d5d-ce46-49e2-b1fa-8235d720badc"
 DS_OK = "2991589e-249d-4cca-98ce-780db69b2520"
+OWNER = "11111111-1111-4111-8111-111111111111"
 
 
 def test_acknowledged_drift_ids_reads_metadata():
@@ -152,3 +153,108 @@ async def test_resolve_session_config_strips_the_delivered_blob_not_just_the_cap
 
     assert delivered is not None
     assert not delivered["agent"]["tools"].get("shell")
+
+
+def _ds_row(ds_id: str, *, owner: str = OWNER) -> dict:
+    return {
+        "id": ds_id,
+        "type": "postgresql",
+        "created_by": owner,
+        "is_global": False,
+        "scope_mode": "all",
+        "policy_revision": 1,
+        "job_id": None,
+        "project_ids": [],
+        "config": {},
+    }
+
+
+def _owner_row(owner: str = OWNER) -> dict:
+    return {"id": owner, "is_admin": False, "is_approved": True}
+
+
+class TestConnectorStripIsConditionalOnCurrentAvailability:
+    """Round-2 finding: ``strip_acknowledged`` used to run unconditionally at
+    the attach sites, so an acknowledged connector id was dropped FOREVER —
+    even after the row came back — because nothing ever prunes
+    ``config_drift_ack``. Spec §3.2 explicitly promises the opposite: "If the
+    connector is recreated or the grant re-issued, the item returns
+    automatically on the next attach — no repair step." Grants already
+    behaved this way (``_strip_acknowledged_grants`` re-evaluates violations
+    first); these two tests pin the same discipline for connectors, applied
+    where the strip now actually happens: :func:`_strip_still_denied_ack`,
+    called from ``_revalidate_thread_datasource_selection``.
+    """
+
+    @pytest.mark.asyncio
+    async def test_recovered_acknowledged_connector_is_used_again(self):
+        from orchestrator.main import _revalidate_thread_datasource_selection
+
+        thread = {
+            "id": "22222222-2222-4222-8222-222222222222",
+            "user_id": OWNER,
+            "metadata": {"config_drift_ack": {f"connector:{DS_OK}": "deleted"}},
+        }
+        db = AsyncMock()
+        db.get_user = AsyncMock(return_value=_owner_row())
+        db.get_datasource_policy_rows = AsyncMock(return_value=[_ds_row(DS_OK)])
+
+        with patch("orchestrator.main.postgres_db", db):
+            selected, revisions = await _revalidate_thread_datasource_selection(
+                thread, [DS_OK], target_project_ids=[]
+            )
+
+        assert selected == [DS_OK]
+        assert revisions == {DS_OK: 1}
+
+    @pytest.mark.asyncio
+    async def test_still_unavailable_acknowledged_connector_is_still_dropped(self):
+        """The converse, guarding against weakening fail-closed: an
+        acknowledged id that is STILL unavailable must still be dropped
+        (not silently kept forever, and not silently denying the rest of
+        the selection either)."""
+        from orchestrator.main import _revalidate_thread_datasource_selection
+
+        thread = {
+            "id": "22222222-2222-4222-8222-222222222222",
+            "user_id": OWNER,
+            "metadata": {"config_drift_ack": {f"connector:{DS_GONE}": "deleted"}},
+        }
+        db = AsyncMock()
+        db.get_user = AsyncMock(return_value=_owner_row())
+        db.get_datasource_policy_rows = AsyncMock(return_value=[])  # still gone
+
+        with patch("orchestrator.main.postgres_db", db):
+            selected, revisions = await _revalidate_thread_datasource_selection(
+                thread, [DS_GONE], target_project_ids=[]
+            )
+
+        assert selected == []
+        assert revisions == {}
+
+    @pytest.mark.asyncio
+    async def test_unacknowledged_denial_still_fails_the_whole_selection(self):
+        """Fail-closed sanity check: a denied id that was NEVER acknowledged
+        must still deny the whole call, even alongside a fine, unrelated id —
+        the new per-item classify-then-narrow step must not turn this into a
+        silent partial selection."""
+        from fastapi import HTTPException
+
+        from orchestrator.main import _revalidate_thread_datasource_selection
+
+        thread = {
+            "id": "22222222-2222-4222-8222-222222222222",
+            "user_id": OWNER,
+            "metadata": {},
+        }
+        db = AsyncMock()
+        db.get_user = AsyncMock(return_value=_owner_row())
+        db.get_datasource_policy_rows = AsyncMock(return_value=[_ds_row(DS_OK)])
+
+        with patch("orchestrator.main.postgres_db", db):
+            with pytest.raises(HTTPException) as exc:
+                await _revalidate_thread_datasource_selection(
+                    thread, [DS_OK, DS_GONE], target_project_ids=[]
+                )
+
+        assert exc.value.status_code == 403
