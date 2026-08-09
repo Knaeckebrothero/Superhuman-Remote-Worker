@@ -90,6 +90,12 @@
       "feedbackDismiss": "Dismiss",
       "diffTitle": "Job {{id}} — changes"
     },
+    "jobBatch": {
+      "title": "{{count}} jobs dispatched",
+      "done": "{{done}}/{{total}} done",
+      "review": "{{count}} awaiting review",
+      "notCreated": "Job was not created"
+    },
     "view": {
       "rendered": "Rendered",
       "raw": "Raw"

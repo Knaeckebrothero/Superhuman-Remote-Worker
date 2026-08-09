@@ -1,5 +1,5 @@
 import {ChatAttachment, ToolCallInfo} from '../services/persistent-chat.service';
-import {NOTIFY_USER_TOOL} from './tool-card.model';
+import {JOB_TOOL, NOTIFY_USER_TOOL} from './tool-card.model';
 
 /**
  * Turn-based conversation model for the persistent chat UI.
@@ -378,7 +378,13 @@ export type FoldableEvent = ToolCallEvent | ThoughtEvent;
  */
 export type EventGroup =
     | {kind: 'single'; id: string; event: TurnEvent}
-    | {kind: 'folded'; id: string; events: FoldableEvent[]};
+    | {kind: 'folded'; id: string; events: FoldableEvent[]}
+    /**
+     * A fan-out: contiguous `create_worker_job` calls from one turn, rendered as
+     * one card with a row per job instead of N stacked cards. Client-side only —
+     * there is no `batch_id` and no backend concept behind this.
+     */
+    | {kind: 'job_batch'; id: string; events: ToolCallEvent[]};
 
 /**
  * Below this many foldable events in a row, render them as plain cards instead
@@ -387,11 +393,31 @@ export type EventGroup =
  */
 export const MIN_FOLD_RUN = 2;
 
+/**
+ * Below this many contiguous job calls, render them as ordinary cards. One job
+ * in a "batch" is just a card with a redundant header.
+ */
+export const MIN_JOB_BATCH = 2;
+
 export function isFoldable(e: TurnEvent): e is FoldableEvent {
     if (e.kind === 'thought') return true;
+    if (e.kind !== 'tool_call') return false;
     // notify_user is a message addressed to the user, not work — like text,
     // it never disappears into a "N× tool calls" chip.
-    return e.kind === 'tool_call' && e.tool !== NOTIFY_USER_TOOL;
+    //
+    // create_worker_job is excluded for a stronger reason: its card is a live
+    // handle with Approve / Continue-with-feedback / Cancel on it, so folding
+    // would hide work that is *waiting on the user* behind a counter. Before
+    // this, a three-job fan-out rendered as a "2× tool calls" chip plus one
+    // inline card, because pinnedEventIds() pins only the turn's LAST call —
+    // two of the three job cards were invisible until you expanded a chip that
+    // gave no hint they were there. They group into a job_batch instead.
+    return e.tool !== NOTIFY_USER_TOOL && e.tool !== JOB_TOOL;
+}
+
+/** A `create_worker_job` call — the only event that forms a `job_batch`. */
+export function isJobCall(e: TurnEvent): e is ToolCallEvent {
+    return e.kind === 'tool_call' && e.tool === JOB_TOOL;
 }
 
 /**
@@ -458,7 +484,42 @@ export function groupEvents(events: TurnEvent[]): EventGroup[] {
         }
     }
     flush();
-    return groups;
+    return batchJobCalls(groups);
+}
+
+/**
+ * Merge contiguous job-call singles into one `job_batch`.
+ *
+ * A post-pass over the finished groups rather than a branch inside the loop
+ * above, because it must merge *across* whatever the fold pass produced while
+ * preserving order exactly: a job call is never foldable, so it always arrives
+ * here as its own `single`, and anything between two job calls (text, a folded
+ * chip, a thought) breaks the run — which is what you want, since it means the
+ * agent said or did something between the two dispatches.
+ */
+function batchJobCalls(groups: EventGroup[]): EventGroup[] {
+    if (!groups.some((g) => g.kind === 'single' && isJobCall(g.event))) return groups;
+    const out: EventGroup[] = [];
+    let run: ToolCallEvent[] = [];
+    const flush = () => {
+        if (run.length === 0) return;
+        if (run.length < MIN_JOB_BATCH) {
+            for (const e of run) out.push({kind: 'single', id: e.id, event: e});
+        } else {
+            out.push({kind: 'job_batch', id: run[0].id, events: run});
+        }
+        run = [];
+    };
+    for (const g of groups) {
+        if (g.kind === 'single' && isJobCall(g.event)) {
+            run.push(g.event);
+        } else {
+            flush();
+            out.push(g);
+        }
+    }
+    flush();
+    return out;
 }
 
 /**

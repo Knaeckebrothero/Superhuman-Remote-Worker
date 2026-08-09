@@ -90,6 +90,12 @@
       "feedbackDismiss": "Verwerfen",
       "diffTitle": "Job {{id}} — Änderungen"
     },
+    "jobBatch": {
+      "title": "{{count}} Jobs gestartet",
+      "done": "{{done}}/{{total}} fertig",
+      "review": "{{count}} zur Prüfung",
+      "notCreated": "Job wurde nicht erstellt"
+    },
     "view": {
       "rendered": "Gerendert",
       "raw": "Quelltext"
