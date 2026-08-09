@@ -10,8 +10,10 @@ from fastapi import HTTPException
 from orchestrator.services.datasource_policy import (
     DatasourceUnavailableError,
     DatasourceWorkspaceTierError,
+    ItemVerdict,
     authorize_datasource_ids,
     authorize_datasource_selection,
+    classify_datasource_selection,
     default_datasource_ids,
     default_datasource_selection,
 )
@@ -468,3 +470,90 @@ async def test_exact_legacy_job_binding_remains_reauthorizable_only_for_that_job
             "sandbox",
             legacy_job_id=OTHER_JOB,
         )
+
+
+@pytest.mark.asyncio
+async def test_classify_reports_missing_row_as_deleted():
+    db = _db([_row(DS_OWNED)])
+
+    verdicts, _revisions = await classify_datasource_selection(
+        db,
+        {"id": OWNER, "is_admin": False},
+        OWNER,
+        [DS_OWNED, DS_SHARED],
+        [],
+        None,
+    )
+
+    assert verdicts == [
+        ItemVerdict(DS_OWNED, False, None),
+        ItemVerdict(DS_SHARED, True, "deleted"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_classify_reports_unauthorized_row_as_revoked():
+    db = _db([_row(DS_SHARED, owner=OTHER)])
+
+    verdicts, _revisions = await classify_datasource_selection(
+        db,
+        {"id": OWNER, "is_admin": False},
+        OWNER,
+        [DS_SHARED],
+        [],
+        None,
+    )
+
+    assert verdicts == [ItemVerdict(DS_SHARED, True, "revoked")]
+
+
+@pytest.mark.asyncio
+async def test_classify_reports_scope_mismatch_as_out_of_scope():
+    db = _db([_row(DS_OWNED, scope="projects", projects=(PROJECT_B,))])
+
+    verdicts, _revisions = await classify_datasource_selection(
+        db,
+        {"id": OWNER, "is_admin": False},
+        OWNER,
+        [DS_OWNED],
+        [PROJECT_A],
+        None,
+    )
+
+    assert verdicts == [ItemVerdict(DS_OWNED, True, "out_of_scope")]
+
+
+@pytest.mark.asyncio
+async def test_deleted_row_still_beats_workspace_tier_error():
+    """Precedence guard: a missing id must raise 403-unavailable, never the
+    400-tier error from a later id. The pre-refactor code raised on the count
+    mismatch before the loop, so this ordering is load-bearing."""
+    db = _db([_row(DS_REPOSITORY, ds_type="repository")])
+
+    with pytest.raises(DatasourceUnavailableError):
+        await authorize_datasource_selection(
+            db,
+            {"id": OWNER, "is_admin": False},
+            OWNER,
+            [DS_SHARED, DS_REPOSITORY],
+            [],
+            "virtual",
+        )
+
+
+@pytest.mark.asyncio
+async def test_authorize_still_raises_generic_error_for_missing_row():
+    """The non-enumeration property create/PATCH depend on."""
+    db = _db([_row(DS_OWNED)])
+
+    with pytest.raises(DatasourceUnavailableError) as excinfo:
+        await authorize_datasource_selection(
+            db,
+            {"id": OWNER, "is_admin": False},
+            OWNER,
+            [DS_OWNED, DS_SHARED],
+            [],
+            None,
+        )
+
+    assert str(excinfo.value) == "One or more selected connectors are unavailable"
