@@ -418,11 +418,9 @@ Decisions worth keeping:
 
 **Deliberately not built** (each is separable, none blocks the above):
 
-- **Turn-level batch grouping.** The audit found the seam (`groupEvents`) but
-  also that `pinnedEventIds()` always pins a turn's last tool call, so job calls
-  must be exempted from `isFoldable`/pinning *before* the grouping pass — a real
-  edit to a load-bearing function with 53 tests. That is a separate change from
-  the card itself, and it only matters for fan-outs.
+- ~~**Turn-level batch grouping.**~~ **Built 2026-08-09** — see below. The
+  audit's warning was right about the mechanism and wrong about the stakes: this
+  was not cosmetic, it was hiding actionable cards.
 - ~~**Resume-with-feedback.**~~ **Built 2026-08-09** — see below. Deferring it
   turned out to be wrong: Approve + Cancel is "ship it" or "kill it", and the
   usual answer to a job that stopped for review is neither.
@@ -607,6 +605,73 @@ provisioned a fresh agent + workspace pod within a minute. Both were deleted and
 the job row restored (`completed`, `queued_feedback` cleared) — worth knowing if
 you repeat this, because the side effect is a live job run, not a status flip.
 
+### Slice 4 follow-up — batch grouping (2026-08-09)
+
+**This was filed as cosmetic. It wasn't — it was a visibility bug.**
+
+Job calls were foldable, and `pinnedEventIds()` pins only a turn's *last* tool
+call. So a three-job fan-out rendered as a **"2× tool calls" chip plus one
+inline card**: two live cards, each carrying Approve / Continue-with-feedback /
+Cancel, were hidden behind a counter that gave no hint they existed. Work
+waiting on the user was one unexplained click away from invisible. The
+deferral note called this "only matters for fan-outs", which is true and misses
+that a fan-out is exactly when you have the most to review.
+
+| Piece | Where |
+|---|---|
+| `JOB_TOOL` — one constant, was a literal in 2 places | `core/models/tool-card.model.ts` |
+| `isFoldable()` excludes job calls; `isJobCall()`; `MIN_JOB_BATCH` | `core/models/turn.model.ts` |
+| `{kind: 'job_batch'}` + the `batchJobCalls()` post-pass | same |
+| `<app-job-batch-card>` — header + a row per job | `ui/tool-card/job-batch-card.component.ts` |
+| `jobBatchViews()`, memoized per group | `views/persistent-chat/persistent-chat.component.ts` |
+| 4 i18n keys × 2 locales; 8 + 7 tests | — |
+
+Decisions:
+
+- **A post-pass, not a branch in the fold loop.** A job call is never foldable,
+  so it always reaches the post-pass as its own `single`; merging there keeps
+  order exact and means anything between two dispatches (text, a folded chip, a
+  thought) breaks the batch — which is right, because it means the agent said or
+  did something in between.
+- **Two deviations from the `Delegate-A` mockup, both forced.** It shows
+  per-agent role, step counts, token counts and elapsed time; a worker job has
+  none of those, so the row shows status + description + the real actions
+  instead of inventing metrics. And it shows *collapsed* as the resting state —
+  this defaults to **open**, because auto-collapsing would recreate the exact
+  bug above. Collapse is manual and never automatic: a card that shut itself
+  when the last job completed would slam closed under someone mid-read.
+- **A failed dispatch says so.** `parseJobEntity` yields no entity for a call
+  that errored, so that row renders the error rather than an empty panel
+  polling nothing.
+- **The header counts only rows it has seen.** Not-yet-polled is neither done
+  nor in review; the panels own the polling, so the header can never start a
+  poller for a job no row is rendering.
+
+**Verification:** 15 new tests (8 grouping, 7 card), **all 53 pre-existing
+`groupEvents` tests still green** — the load-bearing edit changed no existing
+behaviour; full suite 1854 passing; i18n parity green; `tsc -p tsconfig.app.json`
+and `ng build --configuration production` clean at 2.68 MB.
+
+#### Live gate on local k3d (2026-08-09) — PASSED
+
+Playwright on `https://localhost`. A real fan-out needs one assistant message
+with N `create_worker_job` calls, so the fixture was three `thread_messages`
+rows (one `ai` with a 3-call `tool_calls` array + three `tool` results) pointing
+at three **real** jobs in differing states. Deleted afterwards; thread back to
+its original 10 rows.
+
+| Check | Result |
+|---|---|
+| **No fold chip anywhere in the transcript** | `.tool-group-label` count = 0 — the defect is gone |
+| One card, three rows | `3 jobs dispatched` · `3/3 done` |
+| Row labels are the dispatch descriptions | "survey the corpus" / "draft the brief" / "catalogue the sources" |
+| Rows carry live per-job status | badges `completed`, `failed`, `cancelled` — three different rows, three different states |
+| Actions still gated per row | only the `failed` row offered `Continue with feedback`; the terminal ones offered nothing |
+| Two-job case | renders a batch too (`2 jobs dispatched`, `2/2 done`) |
+| Collapse | `aria-expanded` false, rows 0, header still reads `3 jobs dispatched · 3/3 done` |
+| Layout | no horizontal overflow |
+| Console | zero errors |
+
 ### Open questions (slice 4)
 
 - ~~**Who is speaking when a job reports back?**~~ **Resolved elsewhere, and
@@ -630,7 +695,7 @@ you repeat this, because the side effect is a live job run, not a status flip.
 1. **Slice 1 (this change)** — schema + registry + chat adapter + `<app-tool-card>` + wire into `persistent-chat.component.ts` (replace the `#toolDetails` card body; keep the run-fold/grouping around it). Ship + verify on k3d.
 2. **Slice 2 (follow-up)** — audit adapter (`toolCardViewFromAudit`) is written and unit-tested in slice 1 to prove the schema is source-agnostic; slice 2 points `agent-activity.component.ts`'s tool step at `<app-tool-card>` and deletes its bespoke tool rendering.
 3. **Slice 3 (polish)** — Prism syntax highlighting for `code` results (deps already present: `prismjs`); `chat-history.component.ts` as a third consumer; delete the now-dead SCSS/helpers in persistent-chat.
-4. **Slice 4 (the job card) — BUILT 2026-07-29, live-gated 2026-08-08 and 2026-08-09.** `entity` on the schema, a `create_worker_job` descriptor, live status + Approve / Open-diff / Cancel, and **resume-with-feedback**. All four actions are now gated live. Batch grouping and the proposed state stay deferred; see [what shipped](#slice-4--what-shipped-2026-07-29).
+4. **Slice 4 (the job card) — BUILT 2026-07-29, live-gated 2026-08-08 and 2026-08-09.** `entity` on the schema, a `create_worker_job` descriptor, live status + Approve / Open-diff / Cancel, **resume-with-feedback**, and **batch grouping** for fan-outs. All four actions and the batch card are gated live. Only the proposed state stays deferred, by design; see [what shipped](#slice-4--what-shipped-2026-07-29).
 
 ## Acceptance (slice 1)
 
