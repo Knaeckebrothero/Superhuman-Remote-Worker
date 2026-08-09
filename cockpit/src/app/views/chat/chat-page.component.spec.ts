@@ -7,6 +7,7 @@ import {CanvasService} from '../../core/services/canvas.service';
 import {BrowserCapability, CanvasState} from '../../core/models/canvas.model';
 import {ErrorMessageService} from '../../core/services/error-message.service';
 import {PersistentChatService} from '../../core/services/persistent-chat.service';
+import type {ConfigDriftItem} from '../../core/services/resume-error';
 import {ViewportService} from '../../core/services/viewport.service';
 import {AppToastService} from '../../ui/toast';
 import {
@@ -21,6 +22,7 @@ function createFixture(options: {draft?: boolean; threadId?: string} = {}): {
     threadId: ReturnType<typeof signal<string | null>>;
     isConnected: ReturnType<typeof signal<boolean>>;
     isStartingSession: ReturnType<typeof signal<boolean>>;
+    pendingDrift: ReturnType<typeof signal<ConfigDriftItem[] | null>>;
     connect: ReturnType<typeof vi.fn>;
     enterDraftSession: ReturnType<typeof vi.fn>;
     createAndConnect: ReturnType<typeof vi.fn>;
@@ -48,6 +50,7 @@ function createFixture(options: {draft?: boolean; threadId?: string} = {}): {
     threadId: signal<string | null>(null),
     isConnected: signal(false),
     isStartingSession: signal(false),
+    pendingDrift: signal<ConfigDriftItem[] | null>(null),
     connect: vi.fn().mockResolvedValue(undefined),
     enterDraftSession: vi.fn(),
     createAndConnect: vi.fn().mockResolvedValue('created-thread'),
@@ -462,6 +465,47 @@ describe('ChatPageComponent Canvas route selection', () => {
     expect(component.browserActionTooltipKey()).toBe(
       'canvas.browser.reason.workspace_required',
     );
+  });
+});
+
+// Task 14, item B (session_config_drift_resume.md §8.3): "Start a new
+// session" used to navigate with nothing carried over. It now hands off a
+// single `from=<threadId>` query param — never a list of surviving ids, so
+// session-create can re-derive what's still valid at load time instead of
+// trusting a snapshot baked into the URL.
+describe('ChatPageComponent onStartNewSession', () => {
+  afterEach(() => TestBed.resetTestingModule());
+
+  it('navigates to session-create with the current thread as ?from=', () => {
+    const {component, chat, router} = createFixture({threadId: 'thread-1'});
+    component.ngOnInit();
+    TestBed.tick();
+    // The mocked `connect()` has no side effect on `chat.threadId` the way
+    // the real PersistentChatService does once attached — set it explicitly
+    // to reproduce an actually-connected session.
+    chat.threadId.set('thread-1');
+    chat.pendingDrift.set([
+      {id: 'connector:abc', kind: 'connector', reason: 'deleted', label: 'KurortEngine'},
+    ]);
+
+    component.onStartNewSession();
+
+    expect(router.navigate).toHaveBeenCalledWith(
+      ['/sessions/new'],
+      {queryParams: {from: 'thread-1'}},
+    );
+    expect(chat.pendingDrift()).toBeNull();
+  });
+
+  it('falls back to a plain navigation if there is somehow no current thread', () => {
+    const {component, chat, router} = createFixture({draft: true});
+    component.ngOnInit();
+    TestBed.tick();
+    expect(chat.threadId()).toBeNull();
+
+    component.onStartNewSession();
+
+    expect(router.navigate).toHaveBeenCalledWith(['/sessions/new'], undefined);
   });
 });
 

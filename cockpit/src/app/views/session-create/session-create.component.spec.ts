@@ -2,8 +2,8 @@ import {provideHttpClient} from '@angular/common/http';
 import {HttpTestingController, provideHttpClientTesting} from '@angular/common/http/testing';
 import {Injector, runInInjectionContext, signal} from '@angular/core';
 import {TestBed} from '@angular/core/testing';
-import {Router} from '@angular/router';
-import {of} from 'rxjs';
+import {ActivatedRoute, convertToParamMap, Router} from '@angular/router';
+import {Observable, of, Subject} from 'rxjs';
 import {TranslocoService} from '@jsverse/transloco';
 import {afterEach, describe, expect, it, vi} from 'vitest';
 import {CapabilitiesService} from '../../core/services/capabilities.service';
@@ -12,7 +12,12 @@ import {ModelService} from '../../core/services/model.service';
 import {UserService} from '../../core/services/user.service';
 import {ApiService} from '../../core/services/api.service';
 import {ModelGroupComponent} from '../agent-settings/model-group.component';
-import {protectedCloudToggleVisible, SessionCreateComponent} from './session-create.component';
+import {
+  keepEligibleIds,
+  mapThreadToPrefill,
+  protectedCloudToggleVisible,
+  SessionCreateComponent,
+} from './session-create.component';
 
 /**
  * The tool-groups preview is the only thing the form uses ApiService for, and
@@ -20,9 +25,30 @@ import {protectedCloudToggleVisible, SessionCreateComponent} from './session-cre
  * HttpTestingController expectations and a real ApiService would drag the
  * whole transloco provider tree in behind it. The preview wiring gets its own
  * describe at the bottom, where the stub IS the subject.
+ *
+ * `thread` backs `getPersistentThread` — the "Start a new session" prefill's
+ * own describe block below is where it matters; every other describe passes
+ * no `from` query param, so ngOnInit never calls it at all.
  */
-function stubApi(preview: unknown = null) {
-  return {previewToolGroups: vi.fn().mockReturnValue(of(preview))};
+function stubApi(
+  preview: unknown = null,
+  thread: Observable<Record<string, unknown> | null> = of(null),
+) {
+  return {
+    previewToolGroups: vi.fn().mockReturnValue(of(preview)),
+    getPersistentThread: vi.fn().mockReturnValue(thread),
+  };
+}
+
+/** `from` present or absent, matching how `route.snapshot.queryParamMap.get`
+ *  is actually read (session-create.component.ts's `route` injection is
+ *  `{optional: true}` — most describes below omit this provider entirely,
+ *  exactly as they did before this prefill existed, to prove that path is
+ *  unaffected). */
+function activatedRouteWithFrom(from: string) {
+  return {
+    snapshot: {queryParamMap: convertToParamMap({from})},
+  };
 }
 
 describe('protectedCloudToggleVisible', () => {
@@ -40,6 +66,78 @@ describe('protectedCloudToggleVisible', () => {
       { is_default: true, main_cloud_backend: 'nextcloud' },
       { is_default: false, main_cloud_backend: 'nextcloud' },
     ])).toBe(true);
+  });
+});
+
+// Task 14, item B (session_config_drift_resume.md §8.3): pure mapping/filter
+// functions behind the "Start a new session" prefill. Kept separate from
+// SessionCreateComponent so they're testable without mounting the form.
+describe('mapThreadToPrefill', () => {
+  it('a null thread (failed fetch) maps to null', () => {
+    expect(mapThreadToPrefill(null)).toBeNull();
+  });
+
+  it('extracts project_ids, metadata.expert_id, metadata.config_override.llm.model, and metadata.datasource_ids', () => {
+    const thread = {
+      project_ids: ['proj-1', 'proj-2'],
+      metadata: {
+        expert_id: 'expert-9',
+        datasource_ids: ['ds-1', 'ds-2'],
+        config_override: {llm: {model: 'gpt-5.6-sol'}},
+      },
+    };
+    expect(mapThreadToPrefill(thread)).toEqual({
+      projectIds: ['proj-1', 'proj-2'],
+      expertId: 'expert-9',
+      model: 'gpt-5.6-sol',
+      datasourceIds: ['ds-1', 'ds-2'],
+    });
+  });
+
+  it('a thread with none of these fields maps to an all-empty object, not null — a real answer, just an empty one', () => {
+    expect(mapThreadToPrefill({})).toEqual({
+      projectIds: [],
+      expertId: null,
+      model: null,
+      datasourceIds: [],
+    });
+  });
+
+  it('missing metadata/config_override/llm at any level degrades to the empty case rather than throwing', () => {
+    expect(mapThreadToPrefill({project_ids: ['p1'], metadata: {}})).toEqual({
+      projectIds: ['p1'],
+      expertId: null,
+      model: null,
+      datasourceIds: [],
+    });
+  });
+
+  it('stringifies non-string array entries defensively, matching settings-pane.component.ts\'s .map(String) precedent', () => {
+    const thread = {project_ids: [42], metadata: {datasource_ids: [true]}};
+    expect(mapThreadToPrefill(thread)).toEqual({
+      projectIds: ['42'],
+      expertId: null,
+      model: null,
+      datasourceIds: ['true'],
+    });
+  });
+});
+
+describe('keepEligibleIds', () => {
+  it('drops ids not present in the eligible list — the drift-dropping rule', () => {
+    expect(keepEligibleIds(['a', 'b', 'c'], [{id: 'a'}, {id: 'c'}])).toEqual(['a', 'c']);
+  });
+
+  it('keeps every id when all of them survive', () => {
+    expect(keepEligibleIds(['x', 'y'], [{id: 'y'}, {id: 'x'}])).toEqual(['x', 'y']);
+  });
+
+  it('empty ids stays empty regardless of what is eligible', () => {
+    expect(keepEligibleIds([], [{id: 'a'}])).toEqual([]);
+  });
+
+  it('an empty eligible list drops everything', () => {
+    expect(keepEligibleIds(['a', 'b'], [])).toEqual([]);
   });
 });
 
@@ -559,5 +657,226 @@ describe('SessionCreateComponent tool preview', () => {
 
     expect(component.toolPreview()).toBeNull();
     expect(prefill).not.toHaveBeenCalled();
+  });
+});
+
+// Task 14, item B (session_config_drift_resume.md §8.3): "Start a new
+// session" prefills project/expert/model/connectors from the source thread
+// named by `?from=`. The design point under test is that none of the four
+// depend on network ordering between the source-thread fetch and this form's
+// own loads (experts, projects, eligible datasources) — whichever settles
+// second is what decides, so both orderings must converge on the same answer.
+describe('SessionCreateComponent "Start a new session" prefill (session_config_drift_resume.md §8.3)', () => {
+  afterEach(() => TestBed.resetTestingModule());
+
+  const THREAD = {
+    project_ids: ['proj-1'],
+    metadata: {
+      expert_id: 'expert-2',
+      // ds-2 is deliberately NOT in DATASOURCES below — it drifted (deleted/
+      // revoked) between the source thread and this page.
+      datasource_ids: ['ds-1', 'ds-2'],
+      config_override: {llm: {model: 'gpt-5.6-sol'}},
+    },
+  };
+  const PROJECTS = [{id: 'proj-1', name: 'Proj One', status: 'active', is_default: true}];
+  const EXPERTS = [
+    {id: 'expert-1', display_name: 'Default', description: '', icon: 'x', color: '#fff', tags: []},
+    {id: 'expert-2', display_name: 'Prefilled', description: '', icon: 'x', color: '#fff', tags: []},
+  ];
+  const DATASOURCES = [
+    {
+      id: 'ds-1', name: 'DS1', description: null, type: 'kb', connection_url: null,
+      cli_hint: null, default_branch: null, job_id: null, created_at: '', updated_at: '',
+      default_selected: false,
+    },
+  ];
+  // The ordinary effective-default expert (expert-1) — deliberately DIFFERENT
+  // from the thread's expert-2, so a test can tell "the prefill won" apart
+  // from "the normal default happened to match".
+  const EXPERT_DEFAULTS = {
+    personal_defaults_allowed: true,
+    defaults: {
+      worker: {application: null, personal: null, effective: null, source: 'application'},
+      session: {application: {id: 'expert-1'}, personal: null, effective: {id: 'expert-1'}, source: 'application'},
+    },
+  };
+
+  function setup(from: string | undefined, threadSource: Observable<Record<string, unknown> | null>) {
+    const navigate = vi.fn().mockResolvedValue(true);
+    const api = stubApi(null, threadSource);
+    const providers: unknown[] = [
+      provideHttpClient(),
+      provideHttpClientTesting(),
+      {provide: Router, useValue: {navigate}},
+      {provide: UserService, useValue: {currentUserId: signal<string | null>('user-1')}},
+      {provide: ModelService, useValue: {load: vi.fn()}},
+      {provide: ErrorMessageService, useValue: {translate: (_e: unknown, f: string) => f}},
+      {
+        provide: CapabilitiesService,
+        useValue: {protectedCloudAvailable: signal(false), grants: signal(null)},
+      },
+      {provide: ApiService, useValue: api},
+    ];
+    if (from !== undefined) {
+      providers.push({provide: ActivatedRoute, useValue: activatedRouteWithFrom(from)});
+    }
+    TestBed.configureTestingModule({providers});
+    TestBed.overrideComponent(SessionCreateComponent, {set: {imports: [], template: ''}});
+    const fixture = TestBed.createComponent(SessionCreateComponent);
+    const http = TestBed.inject(HttpTestingController);
+    const component = fixture.componentInstance;
+    const setSessionModelOverride = vi.fn();
+    return {fixture, component, http, navigate, api, setSessionModelOverride};
+  }
+
+  /**
+   * The real AgentSettingsComponent isn't mounted (template overridden away,
+   * same as every other describe in this file) — stub exactly the surface
+   * this component's prefill logic calls on it.
+   *
+   * Must run AFTER `fixture.detectChanges()`, not before: `agentSettings` is
+   * an `@ViewChild`, and Angular's own view-query resolution — which runs
+   * as part of change detection — finds no matching element against the
+   * empty overridden template and overwrites the field back to `undefined`,
+   * clobbering an earlier assignment. Every other describe in this file that
+   * stubs `agentSettings` follows the same order for the same reason.
+   */
+  function attachAgentSettingsStub(
+    component: SessionCreateComponent,
+    setSessionModelOverride: ReturnType<typeof vi.fn>,
+  ): void {
+    component.agentSettings = {
+      prefillFromConfig: vi.fn(),
+      toolsGroup: {prefillFromConfig: vi.fn()},
+      setSessionModelOverride,
+      hasToolEdits: () => false,
+      prefillFromResolvedToolset: vi.fn(),
+    } as never;
+  }
+
+  /** Flush every currently-pending request with a canned response chosen by
+   *  URL, repeating until nothing is left pending (flushing one can
+   *  synchronously spawn another — e.g. selecting a project re-fires
+   *  eligible-datasources and expert-defaults). Tolerates any interleaving
+   *  and any number of duplicate calls to the same endpoint, which is the
+   *  point: these tests care about the FINAL converged state, not the exact
+   *  request count for any one ordering. */
+  function drainAll(http: HttpTestingController): void {
+    for (let round = 0; round < 20; round++) {
+      const pending = http.match(() => true);
+      if (pending.length === 0) return;
+      for (const req of pending) {
+        const url = req.request.url;
+        if (url.includes('/experts?type=session')) {
+          req.flush(EXPERTS);
+        } else if (url.includes('/expert-defaults')) {
+          req.flush(EXPERT_DEFAULTS);
+        } else if (url.includes('/datasources/eligible')) {
+          req.flush(DATASOURCES);
+        } else if (url.includes('/experts/session_base')) {
+          req.flush({config: {}});
+        } else if (url.includes('/projects?user_id=')) {
+          req.flush(PROJECTS);
+        } else if (/\/experts\/(expert-\d)\?/.test(url)) {
+          const id = url.match(/\/experts\/(expert-\d)\?/)![1];
+          req.flush({...EXPERTS.find((e) => e.id === id), config: {llm: {}}, id});
+        } else {
+          req.flush(null);
+        }
+      }
+    }
+    throw new Error('drainAll: requests kept spawning past the round cap');
+  }
+
+  it('with no `from`, the source-thread fetch never happens and the ordinary defaults apply unchanged', () => {
+    const {fixture, component, http, api, setSessionModelOverride} = setup(undefined, of(null));
+    fixture.detectChanges(); // runs the constructor's effect() + ngOnInit
+    attachAgentSettingsStub(component, setSessionModelOverride);
+    drainAll(http);
+
+    expect(api.getPersistentThread).not.toHaveBeenCalled();
+    expect(component.selectedProjectIds()).toEqual(new Set(['proj-1'])); // account default
+    expect(component.selectedExpert()?.id).toBe('expert-1'); // ordinary effective default
+    expect(component.prefillDatasourceIds()).toBeNull(); // picker keeps server default_selected
+  });
+
+  it('all four prefills apply when the source-thread fetch settles BEFORE this form\'s own loads', () => {
+    const subject = new Subject<Record<string, unknown> | null>();
+    const {fixture, component, http, setSessionModelOverride} = setup('thread-77', subject.asObservable());
+    fixture.detectChanges(); // runs the constructor's effect() + ngOnInit
+    attachAgentSettingsStub(component, setSessionModelOverride);
+
+    subject.next(THREAD);
+    subject.complete();
+    drainAll(http);
+
+    expect(component.selectedProjectIds()).toEqual(new Set(['proj-1']));
+    expect(component.selectedExpert()?.id).toBe('expert-2'); // prefill won over the ordinary default (expert-1)
+    expect(component.prefillDatasourceIds()).toEqual(['ds-1']); // ds-2 dropped — drifted
+    expect(setSessionModelOverride).toHaveBeenCalledWith('gpt-5.6-sol');
+  });
+
+  it('all four prefills STILL apply, identically, when the source-thread fetch settles AFTER this form\'s own loads', () => {
+    const subject = new Subject<Record<string, unknown> | null>();
+    const {fixture, component, http, setSessionModelOverride} = setup('thread-77', subject.asObservable());
+    fixture.detectChanges(); // runs the constructor's effect() + ngOnInit
+    attachAgentSettingsStub(component, setSessionModelOverride);
+
+    // Everything else settles first: the ordinary defaults land and are
+    // visibly in effect — proving there is no premature guess baked in that
+    // the later prefill would have to fight.
+    drainAll(http);
+    expect(component.selectedExpert()?.id).toBe('expert-1');
+    expect(component.selectedProjectIds()).toEqual(new Set()); // NOT yet defaulted — waiting on the source-thread fetch
+    expect(setSessionModelOverride).not.toHaveBeenCalled();
+
+    // The source-thread fetch settles late and corrects both fields, and
+    // whatever new requests that spawns (a fresh fetchExpertDetail for
+    // expert-2, a re-scoped eligible-datasources/expert-defaults call) get
+    // drained too.
+    subject.next(THREAD);
+    subject.complete();
+    drainAll(http);
+
+    expect(component.selectedProjectIds()).toEqual(new Set(['proj-1']));
+    expect(component.selectedExpert()?.id).toBe('expert-2');
+    expect(component.prefillDatasourceIds()).toEqual(['ds-1']);
+    expect(setSessionModelOverride).toHaveBeenCalledWith('gpt-5.6-sol');
+  });
+
+  it('a failed source-thread fetch leaves the form open and usable, applying the ordinary defaults instead', () => {
+    // ApiService.getPersistentThread never throws (it catchErrors to `of(null)`
+    // internally) — a failed fetch and "no `from`" are the same signal here.
+    const subject = new Subject<Record<string, unknown> | null>();
+    const {fixture, component, http, setSessionModelOverride} = setup('thread-dead', subject.asObservable());
+    fixture.detectChanges(); // runs the constructor's effect() + ngOnInit
+    attachAgentSettingsStub(component, setSessionModelOverride);
+
+    subject.next(null);
+    subject.complete();
+    drainAll(http);
+
+    expect(component.createError()).toBeNull();
+    expect(component.selectedProjectIds()).toEqual(new Set(['proj-1'])); // account default, unaffected
+    expect(component.selectedExpert()?.id).toBe('expert-1');
+    expect(component.prefillDatasourceIds()).toBeNull();
+    expect(setSessionModelOverride).not.toHaveBeenCalled();
+  });
+
+  it('a project the source thread had, but this account can no longer see, is dropped rather than falling back to the account default', () => {
+    const subject = new Subject<Record<string, unknown> | null>();
+    const {fixture, component, http} = setup('thread-77', subject.asObservable());
+    fixture.detectChanges(); // runs the constructor's effect() + ngOnInit
+
+    subject.next({...THREAD, project_ids: ['proj-drifted']}); // not in PROJECTS
+    subject.complete();
+    drainAll(http);
+
+    // PROJECTS' one entry is marked is_default: true — if this were empty
+    // because the prefill logic had fallen through to it, the test above
+    // ("no `from`") would look identical and this assertion would be
+    // meaningless. It stays empty on purpose.
+    expect(component.selectedProjectIds()).toEqual(new Set());
   });
 });

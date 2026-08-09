@@ -526,14 +526,19 @@ export class ChatPageComponent implements OnInit, OnDestroy {
     }
 
     /** "Start a new session": leaves this thread ended and hands off to
-     *  session-create. session-create does not read a prefill/`from` query
-     *  param today (confirmed by reading session-create.component.ts — its
-     *  ngOnInit never touches ActivatedRoute), so this is a plain navigation;
-     *  the user rebuilds the setup by hand rather than the form pre-seeding
-     *  from what still worked on this thread. */
+     *  session-create with a single `from=<threadId>` query param (§8.3).
+     *  session-create fetches that thread itself and prefills project/expert/
+     *  model/connectors from whatever of its config still resolves —
+     *  deliberately NOT a list of surviving ids in the URL, so a connector
+     *  that drifts between this click and the create page loading is still
+     *  dropped correctly. */
     onStartNewSession(): void {
         this.chat.pendingDrift.set(null);
-        void this.router.navigate(['/sessions/new']);
+        const threadId = this.chat.threadId();
+        void this.router.navigate(
+            ['/sessions/new'],
+            threadId ? {queryParams: {from: threadId}} : undefined,
+        );
     }
 
     private startSharedBrowser(expectedPresentationRevision?: number): void {

@@ -561,6 +561,7 @@
     "configDrift": {
       "title": "Ein Teil der Einrichtung dieser Sitzung ist nicht mehr vorhanden",
       "intro": "Teile der Konfiguration dieser Sitzung sind nicht mehr verfügbar:",
+      "attentionNeeded": "Die Einrichtung dieser Sitzung erfordert Aufmerksamkeit. Sie wird jetzt geöffnet …",
       "resumeAnyway": "Trotzdem fortsetzen",
       "startNew": "Neue Sitzung starten",
       "connector": {
