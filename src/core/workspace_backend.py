@@ -573,6 +573,7 @@ class WorkspaceBackend(ABC):
         text: str,
         enter: bool = True,
         working_dir: Optional[str] = None,
+        allow_busy: bool = False,
     ) -> str:
         """Send keystrokes to a tab.
 
@@ -582,6 +583,9 @@ class WorkspaceBackend(ABC):
             enter: Whether to press Enter after sending.
             working_dir: Optional workspace-relative directory for a command.
                 Backends must not apply it to raw keystrokes.
+            allow_busy: Permit input to an already-running foreground process.
+                This is for explicit keystroke/input mode, never a new async
+                command.
 
         Returns:
             Confirmation message.
@@ -679,6 +683,16 @@ class WorkspaceBackend(ABC):
 
     def shell_cleanup(self) -> None:
         """Kill the entire shell session."""
+        raise NotImplementedError("Shell operations not supported by this backend")
+
+    def shell_reset_after_timeout(self) -> None:
+        """Synchronously stop an owned timed-out shell before reconnecting.
+
+        Unlike transport-only ``disconnect()``, this must prove that the exact
+        owned shell was stopped before it returns. Implementations with durable
+        ownership fences must preserve those fences while creating a clean
+        shell generation for the same owner.
+        """
         raise NotImplementedError("Shell operations not supported by this backend")
 
     def shell_is_alive(self) -> bool:

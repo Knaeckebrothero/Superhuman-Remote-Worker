@@ -167,6 +167,7 @@ class SubdirBackend:
         text: str,
         enter: bool = True,
         working_dir=None,
+        allow_busy: bool = False,
     ):
         wd = self._p(working_dir) if working_dir else None
         return self._parent.shell_send(
@@ -174,6 +175,7 @@ class SubdirBackend:
             text,
             enter=enter,
             working_dir=wd,
+            allow_busy=allow_busy,
         )
 
     def shell_read(self, name: str, *args, **kwargs):

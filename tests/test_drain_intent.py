@@ -89,10 +89,22 @@ class TestPersistentDrainHandler:
         from src.api import persistent_app
 
         client = self._attach_parked_session(persistent_app)
+        order = []
+
+        async def terminate(*_args, **_kwargs):
+            order.append("terminate")
+
+        async def suspend(*_args, **_kwargs):
+            order.append("suspend")
+            return True
+
+        client.suspend_thread.side_effect = suspend
 
         with (
             patch.object(
-                persistent_app, "_terminate_session", new=AsyncMock()
+                persistent_app,
+                "_terminate_session",
+                new=AsyncMock(side_effect=terminate),
             ) as detach,
             patch.object(persistent_app, "_broadcast") as broadcast,
             patch.object(persistent_app, "_schedule_exit") as exit_,
@@ -103,8 +115,13 @@ class TestPersistentDrainHandler:
 
         # Clean suspend: teardown WITHOUT the 'ended' write, orchestrator
         # suspend confirmed, no fallback status write, pod exit scheduled.
-        detach.assert_awaited_once_with("drain", mark_thread=False)
+        detach.assert_awaited_once_with(
+            "drain",
+            mark_thread=False,
+            preserve_shell=False,
+        )
         client.suspend_thread.assert_awaited_once_with("tid-drain-1")
+        assert order == ["terminate", "suspend"]
         client.update_thread_status.assert_not_awaited()
         exit_.assert_called_once()
         assert broadcast.call_args[0][0] == "session.suspended"

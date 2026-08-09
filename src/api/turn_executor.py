@@ -416,6 +416,13 @@ class StatelessTurnExecutor:
         Called only where a claim finished cleanly, so the cached session (if
         any) matches the thread this pod should keep preferring.
         """
+        session = _pa()._session
+        if session is None or not session.stateless_warm_reuse_safe:
+            # Physical workspace state is retired under the claim before the
+            # queue transition. Only lite sessions may remain resident/warm.
+            self._prefer_unit_id = None
+            self._warm_since = None
+            return
         self._prefer_unit_id = claim.unit_id
         self._warm_since = time.monotonic()
 
@@ -543,6 +550,7 @@ class StatelessTurnExecutor:
             and claim.consumed_seq >= claim.input_seq
             and claim.control_consumed_seq >= claim.control_input_seq
         ):
+            await self._detach_physical_before_transition("skip_if_answered")
             state = await complete_unit(
                 self._db,
                 unit_id=claim.unit_id,
@@ -624,12 +632,15 @@ class StatelessTurnExecutor:
             pa._session is not None
             and pa._thread_id == unit_id
             and self._attached_fingerprint == fingerprint
+            and pa._session.stateless_warm_reuse_safe
         )
         t0 = time.perf_counter()
         if reuse:
-            # Same thread, unchanged config: reuse the live session. The
+            # Same lite thread, unchanged config: reuse the live session. The
             # mutable LeaseHandle repoints every fenced writer (message
             # persists, journal flushes) at THIS claim's token in place.
+            # Physical sessions deliberately miss this path: detach retires
+            # their old backend before a fresh object receives the new token.
             self._lease.update(unit_id, token)
             logger.info(
                 "session reuse (affinity): unit=%s fingerprint=%s",
@@ -669,6 +680,13 @@ class StatelessTurnExecutor:
             self._attached_bundle = attach
             fresh_attach = True
         timing["attach"] = time.perf_counter() - t0
+
+        # Bind every remote tmux mutation to this monotonic queue token before
+        # controls or user input can start tool work. Reuse invalidates the
+        # previous claim's local tab cache; fresh attach records the token for
+        # the first lazy shell initialization.
+        if pa._session is not None:
+            pa._session.set_shell_owner_token(token)
 
         # Controls are consumed only by the exact serving owner. The initial
         # drain is synchronous so a control-only claim cannot take either
@@ -717,6 +735,7 @@ class StatelessTurnExecutor:
                 else (consumed_seq if consumed_seq is not None else 0)
             )
             await pa._stop_thread_control_watcher()
+            await self._detach_physical_before_transition("no_pending_complete")
             state = await complete_unit(
                 self._db,
                 unit_id=claim.unit_id,
@@ -752,6 +771,7 @@ class StatelessTurnExecutor:
             # An empty row can never produce a turn (the loop skips empty
             # input, and the completion hook would never fire) — consume it.
             await pa._stop_thread_control_watcher()
+            await self._detach_physical_before_transition("empty_input_complete")
             state = await complete_unit(
                 self._db,
                 unit_id=claim.unit_id,
@@ -801,6 +821,9 @@ class StatelessTurnExecutor:
             # completion statement observes it and requeues atomically.
             await pa._stop_thread_control_watcher()
             t0 = time.perf_counter()
+            await self._detach_physical_before_transition("turn_complete")
+            timing["detach_final"] = time.perf_counter() - t0
+            t0 = time.perf_counter()
             state = await self._complete_with_retry(claim, consumed_seq=target["seq"])
             timing["complete"] = time.perf_counter() - t0
             if state is None:
@@ -826,7 +849,7 @@ class StatelessTurnExecutor:
             logger.info(
                 "turn timing: unit=%s mode=%s bundle=%.2fs detach=%.2fs "
                 "attach=%.2fs controls=%.2fs pending=%.2fs turn=%.2fs push=%.2fs "
-                "complete=%.2fs total=%.2fs",
+                "detach_final=%.2fs complete=%.2fs total=%.2fs",
                 unit_id,
                 "reuse" if reuse else "fresh",
                 timing.get("bundle", 0.0),
@@ -836,10 +859,12 @@ class StatelessTurnExecutor:
                 timing.get("pending", 0.0),
                 timing.get("turn", 0.0),
                 timing.get("push", 0.0),
+                timing.get("detach_final", 0.0),
                 timing.get("complete", 0.0),
                 sum(timing.values()),
             )
-            self._mark_warm(claim)  # soft affinity + warm-TTL clock
+            if state != "error":
+                self._mark_warm(claim)  # lite-only affinity + warm-TTL clock
         elif outcome == "lease_lost":
             # Polite fast path (§5.2): stop the turn the way the graceful
             # interrupt does; further fenced persists would only die at the
@@ -1051,6 +1076,7 @@ class StatelessTurnExecutor:
         # from leased back to queued, even on an error path.
         with contextlib.suppress(asyncio.CancelledError, Exception):
             await _pa()._stop_thread_control_watcher()
+        await self._detach_physical_before_transition(f"release_{reason}")
         try:
             state = await release_unit(
                 self._db,
@@ -1084,6 +1110,13 @@ class StatelessTurnExecutor:
                 state,
             )
 
+    async def _detach_physical_before_transition(self, reason: str) -> None:
+        """Retire physical owner state while this claim is still exclusive."""
+        session = _pa()._session
+        if session is None or session.stateless_warm_reuse_safe:
+            return
+        await self._detach_cached_session(reason)
+
     async def _detach_cached_session(self, reason: str) -> None:
         """Drop the cached session (and the affinity that pointed at it).
 
@@ -1102,14 +1135,28 @@ class StatelessTurnExecutor:
             # (dual_app precedent) — clear it so the next claim starts clean.
             pa._thread_id = None
             return
+        session = pa._session
         try:
-            await pa._terminate_session(reason, mark_thread=False)
+            await pa._terminate_session(
+                reason,
+                mark_thread=False,
+                preserve_shell=True,
+            )
         except Exception:
             logger.warning(
                 "session detach (%s) failed — force-clearing session globals",
                 reason,
                 exc_info=True,
             )
+            # A teardown exception must not leave a cancelled sync tool holding
+            # an admitted/reconnectable physical backend after the queue moves.
+            with contextlib.suppress(Exception):
+                session.retire_shell_owner()
+            with contextlib.suppress(Exception):
+                backend = session._unwrapped_backend()
+                retire = getattr(backend, "retire", None)
+                if retire is not None:
+                    retire()
             # Last resort: never let a wedged teardown brick the claim loop.
             pa._session = None
             pa._thread_id = None

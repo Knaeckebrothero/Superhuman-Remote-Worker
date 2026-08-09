@@ -17,6 +17,7 @@ import os
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
+from unittest.mock import patch
 from uuid import uuid4
 
 import pytest
@@ -74,9 +75,22 @@ class FakeDB:
 
 
 class FakeSession:
-    def __init__(self):
+    def __init__(
+        self,
+        shell_owner_tokens: Optional[List[int]] = None,
+        *,
+        stateless_warm_reuse_safe: bool = True,
+    ):
         self.messages: List[Any] = []
         self.postgres_conn = None
+        self._shell_owner_tokens = shell_owner_tokens
+        self.shell_owner_tokens: List[int] = []
+        self.stateless_warm_reuse_safe = stateless_warm_reuse_safe
+
+    def set_shell_owner_token(self, token: int) -> None:
+        self.shell_owner_tokens.append(token)
+        if self._shell_owner_tokens is not None:
+            self._shell_owner_tokens.append(token)
 
 
 class Harness:
@@ -93,6 +107,7 @@ class Harness:
             "terminate": [],
             "control_start": [],
             "control_stop": [],
+            "shell_owner_token": [],
         }
         self.consumed: List[Dict[str, Any]] = []
         self.db = FakeDB(pending_rows)
@@ -100,6 +115,8 @@ class Harness:
         self.heartbeat_result: Any = datetime.now(timezone.utc)
         self.bundle_error: Optional[Exception] = None
         self.attach_error: Optional[Exception] = None
+        self.stateless_warm_reuse_safe = True
+        self.sessions: List[FakeSession] = []
         self._fake_loop_tasks: List[asyncio.Task] = []
 
         pa._agent = SimpleNamespace(postgres_conn=self.db)
@@ -173,13 +190,21 @@ class Harness:
             harness.calls["attach"].append(kwargs)
             if harness.attach_error is not None:
                 raise harness.attach_error
-            pa._session = FakeSession()
+            pa._session = FakeSession(
+                harness.calls["shell_owner_token"],
+                stateless_warm_reuse_safe=harness.stateless_warm_reuse_safe,
+            )
+            harness.sessions.append(pa._session)
             pa._thread_id = kwargs.get("thread_id")
             pa._loop_user_queue = asyncio.Queue()
 
-        async def fake_terminate(reason, *, mark_thread=True):
+        async def fake_terminate(reason, *, mark_thread=True, preserve_shell=None):
             harness.calls["terminate"].append(
-                {"reason": reason, "mark_thread": mark_thread}
+                {
+                    "reason": reason,
+                    "mark_thread": mark_thread,
+                    "preserve_shell": preserve_shell,
+                }
             )
             task = pa._loop_task
             if task is not None and not task.done():
@@ -326,6 +351,7 @@ class TestHappyPath:
         assert get_current_lease() is None  # var only set inside run()
         assert harness.executor._lease.unit_id == str(unit)
         assert harness.executor._lease.lease_token == 7
+        assert harness.calls["shell_owner_token"] == [7]
 
     @pytest.mark.asyncio
     async def test_no_pending_input_completes_with_fallback(self, harness):
@@ -364,7 +390,8 @@ class TestSkipIfAnswered:
         assert not harness.calls["bundle"]
         assert not harness.calls["attach"]
         assert not harness.consumed
-        assert harness.executor._prefer_unit_id == unit
+        # There is no attached session to keep warm on this no-LLM path.
+        assert harness.executor._prefer_unit_id is None
 
     @pytest.mark.asyncio
     async def test_pending_control_bypasses_skip_and_claims_without_human_input(
@@ -442,6 +469,34 @@ class TestBundleFailures:
 
 class TestTurnError:
     @pytest.mark.asyncio
+    async def test_physical_session_detaches_before_queue_release(self, harness):
+        unit = uuid4()
+        claim = make_claim(unit_id=unit, token=31, input_seq=1)
+        pa._session = FakeSession(stateless_warm_reuse_safe=False)
+        order = []
+
+        async def detach(reason):
+            order.append(("detach", reason))
+            pa._session = None
+
+        async def release(*_args, **_kwargs):
+            order.append(("release", None))
+            return "queued"
+
+        with (
+            patch.object(
+                harness.executor, "_detach_cached_session", side_effect=detach
+            ),
+            patch.object(te, "release_unit", side_effect=release),
+        ):
+            await harness.executor._release(claim, reason="turn_error")
+
+        assert order == [
+            ("detach", "release_turn_error"),
+            ("release", None),
+        ]
+
+    @pytest.mark.asyncio
     async def test_loop_death_releases_with_error(self, harness):
         harness.loop_behavior = "die"
         unit = uuid4()
@@ -462,6 +517,7 @@ class TestTurnError:
         # Broken session was detached, never marking the thread.
         assert harness.calls["terminate"]
         assert all(t["mark_thread"] is False for t in harness.calls["terminate"])
+        assert all(t["preserve_shell"] is True for t in harness.calls["terminate"])
 
     @pytest.mark.asyncio
     async def test_attach_failure_releases_and_clears(self, harness):
@@ -504,6 +560,7 @@ class TestLeaseLost:
         assert pa._loop_interrupt_flag in ("hard", "graceful")
         assert harness.calls["terminate"]
         assert harness.calls["terminate"][-1]["mark_thread"] is False
+        assert harness.calls["terminate"][-1]["preserve_shell"] is True
         # Affinity dropped: the discarded session must not be preferred.
         assert harness.executor._prefer_unit_id is None
         assert harness.executor._attached_fingerprint is None
@@ -645,6 +702,22 @@ class TestScrubOnClaim:
 
 
 class TestAffinity:
+    @pytest.mark.parametrize(
+        ("supports_shell", "expected"),
+        ((False, True), (True, False)),
+    )
+    def test_persistent_session_reuse_capability_follows_backend(
+        self, supports_shell, expected
+    ):
+        from src.api.persistent_session import PersistentSession
+
+        session = object.__new__(PersistentSession)
+        session.workspace_manager = SimpleNamespace(
+            backend=SimpleNamespace(supports_shell=supports_shell)
+        )
+
+        assert session.stateless_warm_reuse_safe is expected
+
     def test_fingerprint_ignores_only_inbox_owned_interactive_scalars(self):
         base = {
             "thread_id": "t1",
@@ -715,7 +788,7 @@ class TestAffinity:
         assert te.attach_fingerprint(first) == te.attach_fingerprint(second)
 
     @pytest.mark.asyncio
-    async def test_same_thread_same_fingerprint_skips_reattach(self, harness):
+    async def test_lite_same_thread_same_fingerprint_skips_reattach(self, harness):
         unit = uuid4()
         harness.db.pending_rows = [{"id": str(uuid4()), "seq": 1, "content": "one"}]
         await harness.executor._serve_claim(
@@ -735,6 +808,46 @@ class TestAffinity:
         # The lease handle was repointed at the NEW claim's token.
         assert harness.executor._lease.lease_token == 2
         assert len(harness.calls["complete"]) == 2
+        assert harness.calls["shell_owner_token"] == [1, 2]
+        assert harness.sessions[0].shell_owner_tokens == [1, 2]
+
+    @pytest.mark.asyncio
+    async def test_shell_backend_reattaches_before_next_lease_token(self, harness):
+        unit = uuid4()
+        harness.stateless_warm_reuse_safe = False
+        harness.db.pending_rows = [{"id": str(uuid4()), "seq": 1, "content": "one"}]
+        await harness.executor._serve_claim(
+            make_claim(unit_id=unit, token=1, input_seq=1)
+        )
+        first_session = harness.sessions[0]
+        # Physical ownership is retired while claim 1 is still exclusive,
+        # before the queue completion transition.
+        assert pa._session is None
+
+        harness.db.pending_rows = [{"id": str(uuid4()), "seq": 2, "content": "two"}]
+        await harness.executor._serve_claim(
+            make_claim(unit_id=unit, token=2, input_seq=2)
+        )
+        await _finish(harness)
+
+        assert len(harness.calls["attach"]) == 2
+        assert harness.calls["terminate"] == [
+            {
+                "reason": "turn_complete",
+                "mark_thread": False,
+                "preserve_shell": True,
+            },
+            {
+                "reason": "turn_complete",
+                "mark_thread": False,
+                "preserve_shell": True,
+            },
+        ]
+        assert first_session is harness.sessions[0]
+        assert pa._session is None
+        assert first_session is not harness.sessions[1]
+        assert harness.sessions[0].shell_owner_tokens == [1]
+        assert harness.sessions[1].shell_owner_tokens == [2]
 
     @pytest.mark.asyncio
     async def test_control_scalar_bundle_change_reuses_warm_session(self, harness):
@@ -800,6 +913,7 @@ class TestAffinity:
         # Old session detached first, thread never marked.
         assert len(harness.calls["terminate"]) == 1
         assert harness.calls["terminate"][0]["mark_thread"] is False
+        assert harness.calls["terminate"][0]["preserve_shell"] is True
 
     @pytest.mark.asyncio
     async def test_same_thread_changed_config_reattaches(self, harness):
