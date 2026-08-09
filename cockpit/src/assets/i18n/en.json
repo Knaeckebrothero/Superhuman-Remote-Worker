@@ -84,6 +84,10 @@
       "approve": "Approve",
       "openDiff": "Open diff",
       "cancel": "Cancel job",
+      "resumeWithFeedback": "Continue with feedback",
+      "feedbackPlaceholder": "What should it do differently?",
+      "feedbackSubmit": "Send & continue",
+      "feedbackDismiss": "Dismiss",
       "diffTitle": "Job {{id}} — changes"
     },
     "view": {
