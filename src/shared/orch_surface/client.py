@@ -57,6 +57,22 @@ class MutationOutcomeUnknown(RuntimeError):
         self.path = path
 
 
+class SessionConfigDriftError(Exception):
+    """Resume refused: parts of the session's stored config are unavailable.
+
+    Carries the structured items so a caller can decide whether to re-resume
+    with ``acknowledge`` set.
+    """
+
+    def __init__(self, drift: list[dict[str, Any]]):
+        self.drift = drift
+        labels = ", ".join(item.get("label", item.get("id", "?")) for item in drift)
+        super().__init__(
+            f"Session config is no longer fully available: {labels}. "
+            "Resume again with acknowledge=[...] to continue without them."
+        )
+
+
 class _RequestScopeAuth(httpx.Auth):
     """Copy the current task's MCP identity onto one outgoing request.
 
@@ -2775,15 +2791,27 @@ class AsyncCockpitClient:
         resp.raise_for_status()
         return resp.json()
 
-    async def resume_persistent_thread(self, thread_id: str) -> dict[str, Any]:
+    async def resume_persistent_thread(
+        self, thread_id: str, acknowledge: list[str] | None = None
+    ) -> dict[str, Any]:
         """Resume an ended persistent thread.
+
+        Raises ``SessionConfigDriftError`` when the session references
+        connectors, projects, or grants that are no longer available. Pass
+        their ids back as ``acknowledge`` to resume without them.
 
         Returns:
             Dict with ``status`` and ``thread_id``.
         """
+        payload: dict[str, Any] = {}
+        if acknowledge is not None:
+            payload["acknowledge"] = acknowledge
         resp = await self._mutation_request(
-            "POST", f"/api/persistent/threads/{thread_id}/resume"
+            "POST", f"/api/persistent/threads/{thread_id}/resume", json=payload
         )
+        if resp.status_code == 428:
+            detail = (resp.json() or {}).get("detail") or {}
+            raise SessionConfigDriftError(detail.get("drift") or [])
         resp.raise_for_status()
         return resp.json()
 
