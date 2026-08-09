@@ -744,3 +744,29 @@ admin-cli `id_token` expires in ~15 min and fails as a silent 401.
 Left: the remaining 13 setup store ops; `AFFINITY_GRACE_SECONDS` should derive
 from the poll interval if cadences ever diverge; warm-TTL value unmeasured;
 the fault harness needs a deliberately long turn now that turns are <5 s.
+
+## Session log 2026-08-09 (stateless agents — consolidation)
+
+Three branches merged back to one: `feature/stateless-agents` (unpushed,
+`develop` untouched). `feature/stateless-sessions-s1-completion` fast-forwarded
+in; `feature/stateless-workers-s3` merged with four conflicts; both topic
+branches safe-deleted after verifying they were fully merged.
+
+The conflict worth remembering: S1 restructured `register_agent` so hostname is
+no longer an ownership credential, which moved the job-pause block out of the
+`if existing:` branch, while S3 had added the `execution_lane='pinned'`
+predicate to that same query. Taking either side alone silently drops the
+other's fix. `schema_current.sql` auto-merged and was regenerated from the
+merged migration set to confirm rather than assume — no diff.
+
+Gate: 15,180 passed against the same 11 environment failures, ruff clean,
+migrations 0115–0121 all applied on k3d, a turn answers end to end, worker lane
+still off (zero `worker_batch` rows, zero non-pinned jobs).
+
+Docs de-staled: §9.1's S1 and S2/S3/S4 sections rewritten as one current picture
+(they had become layered dated appendices from three work streams); both Codex
+briefs bannered as historical with what is still open; the completion-path
+inventory's line numbers marked as drifted anchors post-merge.
+
+Status of record is `docs/features/stateless_agents.md` §9.1. Session lane
+functionally complete; worker lane blocked on Gate 3 (§5.4.5).

@@ -1,3 +1,20 @@
+> **STATUS 2026-08-09 — LARGELY EXECUTED; HISTORICAL.** Everything in §3.1–§3.4
+> is built and merged onto `feature/stateless-agents`; the branches this brief
+> names (`feature/stateless-sessions-s1-completion`,
+> `feature/stateless-workers-s3`) were consolidated and deleted. **For current
+> status read `docs/features/stateless_agents.md` §9.1, not this file.**
+>
+> Still open from this brief: permission-row retirement on lease expiry (§3.6),
+> durable queued-turn UX (§3.5), Path-A resume-compaction persistence (§3.7),
+> stateless ended-session wake, and control verbs beyond `mode.set` /
+> `narration.set`.
+>
+> Kept because it records what was asked and — more usefully — three premises in
+> it that turned out to be wrong when checked against the code: the four-entry
+> provisioning gate (there were ten), "teach the cockpit the lane" (the lane must
+> stay invisible), and "zero cockpit changes" (`session.state` had no REST
+> transport, which made supervised sessions unanswerable after a reload).
+
 # Codex brief — finish S1: make the stateless session lane usable by a human
 
 The stateless session lane works. A turn is claimed from a DB queue, runs on any
