@@ -454,173 +454,70 @@ unknown declared loop freezes cannot complete a job. Nothing yet enqueues,
 claims, or completes a `worker_batch`, because the completion ownership gate is
 still open. Legacy job dispatch remains `JobStartRequest` POST to a pod IP.
 
-#### S1 — spine done and proven, surround largely not
+#### S1 — session lane functionally complete
 
-Built and k3d-verified: run_queue + claim/heartbeat/reaper/completion + persist
-fence (0115/0117, 81 real-PG tests); epoch/seq/system-writer redesign (0116,
-which also removes the pinned lane's cache-wipe cascade); turn rows + watermarks
-+ skip-if-answered; scrub-on-claim (this fixed a live cross-tenant env leak on
-the *pinned* pool); the flag-gated Deployment; soft affinity + warm-session reuse;
-and the fault matrix (takeover ≤105 s, no duplicate answer, zombie's late persist
-fenced, FIFO drain across a steal, epoch ≤1 bump per steal and 0 per clean
-handoff, zero in-process claim state).
+Rewritten 2026-08-09 at consolidation as one current picture, replacing the
+layered dated appendices this section had accumulated. Everything below is on
+`feature/stateless-agents` and k3d-verified unless marked otherwise.
 
-**S1 completion pickup (2026-08-08,
-`feature/stateless-sessions-s1-completion`): the server-side provisioning and
-transport-discovery gate is now BUILT and live-verified.** `/resume` and
-`/prepare` whitelist `execution_lane='pinned'`; a detached stateless thread's
-`/connection` returns `200` with `state='ready'`,
-`control_socket='none'`, and null socket fields. The public union is now
-discriminated by `control_socket`; neither socket branch exposes
-`execution_lane`. This reports admission readiness only; it deliberately does
-**not** claim that a REST control plane has been built. Unknown future lanes
-fail closed. Reading beyond the brief's named entries found that list was not a
-complete safety boundary: create-thread provisioning, the resume background
-refetch, warm-pool attach, slow dedicated-pod registration, permission-link
-wake, and officer respawn could all still bind or spawn a pinned executor.
-Those paths now whitelist pinned too.
+**The substrate.** `run_queue` with claim / heartbeat / reaper / completion and
+the persist fence (0115/0117, 81 real-Postgres tests); the epoch/seq/
+system-writer redesign (0116), which also removed the *pinned* lane's
+cache-wipe cascade; turn rows, watermarks and skip-if-answered; scrub-on-claim,
+which fixed a live cross-tenant env leak on the pinned pool; the flag-gated
+Deployment; soft affinity with warm-session reuse. Fault matrix passed and was
+re-verified after the claim path changed: takeover ≤105 s, no duplicate answer,
+the zombie's late persist fenced out, FIFO drain across a steal, epoch bumps
+≤1 per steal and 0 per clean handoff, zero in-process claim state.
 
-Warm-pool attach reserves both sides before HTTP in one transaction: a
-ready/unbound agent CAS plus a pinned/unbound thread CAS. After that reservation,
-only HTTP 200 proves acceptance; **every** non-200 response (including 409) and
-every transport failure is ambiguous and retains ownership, preferring a
-recoverable stranded binding to a second executor. A same-thread 409 is real:
-the ended-session sweeper can advertise a still-attached pod as ready during a
-resume window.
-Every pod fallback re-reads the lane after a failed warm reservation.
-Persistent-agent registration checks the lane under the thread advisory lock
-before mutation. A same-host restart updates only the exact snapshotted owner;
-a genuinely new/replacement binding uses insert-only registration because
-hostname is neither unique nor an ownership credential. Missing or different
-live owners fail before mutation. The final bind is a checked lane-qualified
-CAS against the snapshotted owner; lane rejection never deletes a possibly
-pre-existing agent row. Live
-probes: stateless connection ready + prepare/resume 409; synthetic persistent
-registration 409 with zero surviving agent rows and no thread binding; fresh
-pinned session ready in 14.43 s and one exact reply persisted by 17.48 s.
+**Performance.** Turn latency 99.6 s → **5.4 s cold / 3.0 s warm** (§5.3.3 for
+the measured decomposition, §5.3.4 for affinity). The wins were duplicated work,
+not algorithmic: two cloud pulls per turn were redundant full-tree walks, the
+WebDAV listing cost ~2.5 s per directory where one `Depth: infinity` PROPFIND
+costs ~1 s, and virtual-tier setup spent 51 rclone process spawns on existence
+probes that one scoped listing now answers.
 
-**Transport-independent state/Cockpit reconnect slice (same branch): BUILT and
-live-verified.** Owner-gated `GET /api/persistent/threads/{thread_id}/state`
-serves both lanes from one repeatable-read durable snapshot, with the
-`session.state`-compatible scalars and pending gates plus an `event_cursor` and
-a replay floor immediately before the latest surviving turn. It is
-`Cache-Control: private, no-store` and returns neither lane, pod identity,
-metadata, resolved config, nor credentials. Its runtime fields are explicitly
-"durably observed as of the cursor", not a claim about agent RAM; a pinned
-control socket may subsequently refine them. The Cockpit applies the snapshot
-before SSE, resumes from a tab-local cursor when safe, otherwise repaints from
-REST history plus the full latest-turn replay, and keeps socketless readiness
-closed when the snapshot fails. A null or absent legacy socket URL normalizes
-to stable `control_socket='none'`: it never reaches `new WebSocket(null)` or the
-reconnect ladder. Initial load, cache-cleared reload and a concurrent second tab
-were exercised on k3d with the composer enabled, three state/connection 200s,
-and no application WebSocket; cursor/terminal/gate races are additionally
-covered by the client tests. Session 5 of the implementation log carries the
-exact contract, timings, limits and proof.
+**Admission safety.** `/resume`, `/prepare`, create-thread provisioning, the
+resume background refetch, warm-pool attach, slow dedicated-pod registration,
+permission-link wake and officer respawn all whitelist `execution_lane='pinned'`
+— unknown future lanes fail closed. The original brief named four entries; six
+more were found by reading, and every one of them could otherwise have bound or
+spawned a pinned executor against a queue-served thread. Warm-pool attach now
+reserves both sides in one transaction before any HTTP, and treats **every**
+non-200 (including 409) as ambiguous, retaining ownership rather than risking a
+second executor. Registration no longer treats hostname as an ownership
+credential.
 
-**Durable scalar-control inbox (same branch): BUILT and live-verified on both
-lanes.** Migration 0119 adds commit-ordered per-thread requests, exact pinned
-admission capability, and independent queue control watermarks; 0120 builds the
-one-receipt index concurrently and 0121 backfills/validates existing-table
-constraints. The orchestrator admits `mode.set`/`narration.set` over one
-owner-gated REST route for both lanes and never writes their journal frames.
-The current lease owner or exact reciprocal pinned agent validates the request,
-writes the result through its own ordered allocator, awaits the actual database
-commit receipt, then transactionally publishes the first-class scalar,
-terminal request and stateless consumed watermark under its owner fence. A
-receipt link makes crash recovery indexed and idempotent; writer batches isolate
-control frames from ordinary frames. A control committed during a stateless
-lease keeps completion queued until its control watermark is consumed.
-Every inactive transition, reactivation, bind and agent-row deletion closes the
-exact pinned capability; deletion locks affected threads before agents so FK
-cleanup cannot invert admission's lock order.
+**Client-facing transport, with the lane invisible.** A lane-agnostic
+`GET /api/persistent/threads/{id}/state` returns a durable, owner-gated snapshot
+(explicit allow-list — no config or credential surface) plus event and replay
+cursors, so a cold load, a hard reload and a second tab all reconstruct state
+without a socket. `/connection` is discriminated by `control_socket`, never by
+lane. Control verbs (`mode.set`, `narration.set`) go over REST **for both
+lanes**, through a durable commit-ordered inbox (0119–0121) whose requests are
+consumed by the lease owner, which applies them and writes the journal receipt
+with its own allocator — the orchestrator never writes the journal, which would
+collide with a warm pod's in-process seq counter. `execution_lane` appears
+nowhere in the cockpit. Verified under real BFF-cookie login: a supervised gate
+survived a hard reload and a second tab, was denied over REST, was
+journal-acknowledged, and the tool never executed.
 
-The Cockpit remains lane-free: one bounded single-flight FIFO sends UUID-keyed
-REST requests and changes visible scalar state only on the owner-written SSE
-ack. Ambiguous failures and 425 owner-readiness refusals retry the same UUID;
-semantic 409s remain terminal. A cold pinned live proof returned four 425s
-while registration kept capability closed, reused one UUID for all retries,
-then admitted exactly one request after the capable owner opened. Stateless and
-pinned proofs each changed narration, hard-reloaded the changed value, restored
-it, and verified same-UUID dedup. Every request had one matching durable
-receipt; stateless queue watermarks converged, pinned applied-agent identity
-matched its accepted agent, soft end cleared capability, and no worker unit was
-created. Session 6 of the implementation log carries timings and failures.
+**Still open in S1**: permission-row retirement on lease expiry; stateless
+ended-session wake; Path-A resume-compaction persistence (a live bug — see
+§5.3.3); durable queued-turn UX; control verbs beyond the two scalars;
+metering lease-interval ingestion; the journal coalescing tick; object-store PUT
+fencing; and the lite agent-local-state (PVC) inventory of §6.1.
 
-**Correction (same day, caught by a second audit pass): Path-A
-resume-compaction persistence (§6.5) is NOT done, and it is the one live
-functional bug in the shipped path.** An earlier version of this section
-claimed otherwise on the strength of a grep that matched
-`ensure_within_limits(trigger="resume")` rather than
-`_record_compaction(trigger="resume")` — a lesson in reading the call, not the
-keyword. What the code actually does: Path B (full load, no checkpoint)
-persists its resume compaction (`persistent_app.py:6552`); **Path A
-(checkpoint restore) calls `ensure_within_limits(..., trigger="resume")` at
-`:6441` and returns at `:6473` without persisting**, and the comment at `:6543`
-says so deliberately — Path A skips the write to avoid a live/history banner
-double-render. That reasoning is about the *banner*; the discarded
-*summarization work* is the problem. Any thread that has ever compacted takes
-Path A, so if its post-boundary tail is over budget it pays a blocking
-aux-LLM summarization **on every claim** and throws the result away. On the
-pinned lane that was one call per pod restart; per-turn attach turns it into
-one per turn. It did not show up in this session's measurements because the
-test thread's tail sits under budget. The fix is not a blind copy of Path B's
-call — it has to advance the boundary row without reintroducing the double
-render.
-
-Not built, all of them named in S1's own list above:
-
-- **Remaining Cockpit workstream** — the lane-free `/connection` consumption,
-  REST state snapshot, null-socket guard, and reload/concurrent-tab restoration
-  are built as described above, as is scalar control routing. Durable queued
-  state and stateless ended-session wake remain unbuilt; the client still does
-  not and must not branch on `execution_lane`.
-- **Broader control verbs** (§6.7) — the safe initial `mode.set` /
-  `narration.set` subset is built. Detached rewind still does not steal/fence
-  `run_queue`; compact has no detached REST route and boundary IDs do not
-  survive restore; attached rewind rebuilds the writer without the stateless
-  lease; undo state is RAM-only; archive lacks an idempotent terminal finalizer;
-  config mutation is not transactionally fenced; and upgrade enters unbuilt S2
-  workspace semantics. Interrupt remains a deliberate **501** on the lane.
-- **Persistence promotions** — permission/narration scalars are built; session
-  task manager, memory-extraction interval cursor, media-fidelity decision, and
-  Path-A resume-summary persistence (see the correction above) remain.
-- **Permission-row retire** on lease expiry — nothing sweeps
-  `thread_permission_requests`, and a blanket thread-wide reaper UPDATE is
-  unsafe: rows carry no lease identity, so post-steal cleanup can expire a
-  successor's new gate. The steal commits before its contained journal step,
-  so cleanup also needs a durable reaped-token retry source rather than a
-  one-shot side effect. Implementation reality also differs from §5.3.6's
-  target state: today's stateless executor keeps heartbeating and holds the
-  lease while permission resolution waits; release-at-gate is not built, and
-  agent-local `_subscribers` cannot see stateless SSE viewers. **Durable
-  queued-turn UX** — the Cockpit already renders
-  an accepted-send spinner via RAM-only `pendingTurnCount`, but it disappears on
-  reload and other tabs see nothing. An orchestrator-written journal frame is
-  forbidden by the live-writer collision; use a DB-authoritative queue snapshot
-  plus current-state notification. Exact global “position N” is not truthful
-  before `fair_key` rotation exists. **Stateless ended-session/system wake** is
-  also not a status flip: current durable wakes persist `role='event'`, while
-  the executor selects only `role='human'`; a safe wake needs stable-id atomic
-  message+watermark admission and role-preserving restore/injection. **`fair_key`
-  round-robin** — the column and its merge exist; no rotation CTE.
-- **Lite agent-local-state inventory** (§6.1) — the PVC question S1 is supposed to answer is still open.
-- **Journal-writer coalescing tick**; **object-store PUT fencing** (or the documented corruption window).
-- **Metering lease-interval attribution** — not merely unbuilt, actively routed around: `stateless-deployment.yaml` labels the class `app: srw-agent-stateless` precisely so `classify_product_pod` won't claim it, which means **stateless pods are currently unattributed compute** ("shared platform capacity"). Any real traffic on this lane is unbilled until the interval reconciler lands.
-- **Job-log capture per claim** — the only capture path is `_capture_agent_logs_before_reap`, triggered by *provisioner* pod-reap. A ReplicaSet-deleted stateless pod's logs are unrecoverable.
-- **Admin/fleet read model** — PARTIAL. The queue half exists (`GET /api/admin/run-queue` + unpark), but API-only: no cockpit view, no MCP tool, and the registration surface it is meant to replace (`list_agents`, `get_agent_stats`, `deregister_agent`, `assign_job`) is untouched.
-
-Acceptance criteria, honestly scored: met are create-to-accepted <1 s, takeover
-≤105 s with no duplicate answer, the fence assert, FIFO-across-steal, the epoch
-bump bounds, zero claim state, and the zombie's rejected persist. **Unmeasured or
-unverified**: TTFT p50/p95 (we measured whole-turn wall time — 3.0 s warm, 5.4 s
-cold — which is a different number and needs streaming instrumentation); p95
-claim-wait under concurrency (never load-tested); `cache_read > 0` on a
-cross-pod follow-up (`cached_tokens` is captured in metrics/audit, but the
-`prompt_cache_key=thread_id` pin OQ5 requires is not set anywhere); the poison
-unit's user-visible terminal frame and operator unpark end to end (parking
-itself is proven in real-PG); and the tenant A→B residue probe, which needs a
-second user identity.
+**Acceptance — met**: create-to-accepted <1 s; takeover ≤105 s with no duplicate
+answer; the fence assert; FIFO drain across a steal; epoch bump bounds; zero
+in-process claim state; the zombie's rejected persist. **Unmeasured or
+unverified**: TTFT p50/p95 (whole-turn wall time is a different number and needs
+streaming instrumentation); p95 claim-wait under concurrency (never load-tested);
+`cache_read > 0` on a cross-pod follow-up (`cached_tokens` is captured but the
+`prompt_cache_key` pin OQ5 requires is set nowhere); the poison-unit terminal
+frame and operator unpark end to end; the tenant A→B residue probe, which needs
+a second user identity; and live mid-turn/retention fault injection for the
+control inbox, which is unit-tested rather than cluster-proven.
 
 #### S2 / S4 untouched; S3 stopped after its safety foundation
 
