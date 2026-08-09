@@ -46,14 +46,31 @@ outside collaborators* → **Require approval for all external contributors**. T
 public-repo default only requires approval for *first-time* contributors: one
 merged trivial PR and a contributor is auto-approved forever.
 
-**Layer 1** — `docker/ci-runner/job-started-guard.sh`, wired up through
+**Layer 1** — `job-started-guard.sh`, wired up through
 `ACTIONS_RUNNER_HOOK_JOB_STARTED`. The runner executes it before the job's first
 step — before `actions/checkout`, so nothing from the triggering ref has been
-fetched when it decides. Four independent checks: repository match, an event
+fetched when it decides. Four independent checks: repository allowlist, an event
 **allowlist** (`push`/`schedule`/`workflow_dispatch`), a ref cross-check so a
-laundered event name cannot pass, and a best-effort payload check. It is tested,
-not reviewed: `ci-runner-image.yml` runs 10 accept/refuse cases against the built
-image and **the image is only pushed if all 10 pass.**
+laundered event name cannot pass, and a best-effort payload check.
+
+**It does not live in this repository, and that is the point.** It ships inside
+the runner image, built from `devops/github-actions-runner/` in the
+**Scripts-and-Notebooks** repo and published as
+`ghcr.io/knaeckebrothero/github-actions-runner` (plus `-kvm`). A control that a
+pull request could edit is not a control; keeping it outside every repo it
+protects is what makes it one. That placement also avoids a bootstrap cycle — a
+broken image push must not leave you without a working runner to build the fix.
+
+It is tested, not reviewed: the image workflow runs **13 accept/refuse cases
+against the built image and gates `docker push` on them**, so a regressed guard
+cannot reach the registry. Pull requests there run the same proof without
+pushing.
+
+The repository allowlist is `ARC_ALLOWED_REPOSITORY`, supplied by the runner
+**pod spec** (the ARC scale-set values in the HomeLab repo) rather than baked in
+— equally out of a pull request's reach, but it keeps one image usable across
+repos. Exact match, comma-separated, no globs; **unset or empty refuses
+everything**, so a misconfigured scale set serves nothing rather than everything.
 
 ## The three legal `runs-on` lines
 
@@ -96,7 +113,8 @@ runner of any kind gets work then. It helps with hosted-capacity saturation (fli
 
 ## What `ubuntu-latest` was silently providing
 
-These are baked into `docker/Dockerfile.ci-runner` because jobs assumed them:
+These are baked into the runner image (Scripts-and-Notebooks,
+`devops/github-actions-runner/Dockerfile`) because jobs assumed them:
 
 | Tool | Used by | Failure mode without it |
 |---|---|---|
@@ -144,21 +162,30 @@ of `docs/branch_protection_setup.md`.
 
 ### Prove the guard fails
 
-A guard nobody has watched fail is not a guard. Both halves have negative tests:
-`ci-runner-image.yml` exercises the runtime hook on 10 cases, and the routing
-policy has been verified to reject a missing `|| 'ubuntu-latest'` fallback, a
-semantically-equivalent rewording, a literal label, an unregistered workflow,
-`pull_request_target`, a deleted or gutted hook, a Dockerfile that stops invoking
-it, a smuggled label, and a duplicate-key parser differential.
+A guard nobody has watched fail is not a guard. Both halves have negative tests.
+
+The runtime hook is exercised on **13 cases** by the image workflow in
+Scripts-and-Notebooks — including an unset and an empty `ARC_ALLOWED_REPOSITORY`
+(both must refuse, not wildcard), a glob allowlist (must not be honoured), a
+foreign repository, and an event name laundered to `push` while the ref still
+says `refs/pull/1/merge`.
+
+The routing policy has been verified to reject a missing `|| 'ubuntu-latest'`
+fallback, a semantically-equivalent rewording, a literal label, an unregistered
+workflow, `pull_request_target`, a hosted-only workflow routed to self-hosted, a
+label smuggled into a non-`runs-on` value, a duplicate-key parser differential,
+and a vanished contract doc.
 
 ## What stays hosted permanently
 
 - `ci-policy.yml` — it verifies nothing else is misrouted, so it can never run on
   the machines it protects.
-- `ci-runner-image.yml` — bootstrap cycle: a bad image push must not make the fix
-  unbuildable.
 - `codeql` ×2 — ~1 GB bundle per run, hosted-specific tool-cache behaviour,
   already `continue-on-error`, and the only job holding `security-events: write`.
+
+(The runner image build used to be on this list. It now lives in
+Scripts-and-Notebooks, so the bootstrap cycle it guarded against no longer
+exists here.)
 
 **Recommended to stay hosted**: `lint` ×2, `license-inventory`,
 `resolve-version`, `deploy-experimental`, `release-chart`. Each holds
