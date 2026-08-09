@@ -81,7 +81,9 @@ class Chart:
 # cross-cluster one.
 CHARTS = [
     Chart("helm", "helm", "helm/ci/vm-values.yaml"),
-    Chart("helm-vm-cluster", "helm-vm-cluster", "helm-vm-cluster/ci/default-values.yaml"),
+    Chart(
+        "helm-vm-cluster", "helm-vm-cluster", "helm-vm-cluster/ci/default-values.yaml"
+    ),
 ]
 
 
@@ -97,7 +99,14 @@ def attempt_render(chart: Chart, *overrides: str) -> subprocess.CompletedProcess
     fail-fast on missing required input is better than emitting a broken VM —
     so those tests need the raw result rather than an assertion.
     """
-    cmd = ["helm", "template", "t", str(ROOT / chart.path), "-f", str(ROOT / chart.values)]
+    cmd = [
+        "helm",
+        "template",
+        "t",
+        str(ROOT / chart.path),
+        "-f",
+        str(ROOT / chart.values),
+    ]
     for override in overrides:
         cmd += ["--set", override]
     return subprocess.run(cmd, capture_output=True, text=True, timeout=120)
@@ -209,7 +218,9 @@ def daemon_required_env() -> set[str]:
         if required:
             return required
 
-    raise AssertionError("could not locate the required-env guard in management-daemon.py")
+    raise AssertionError(
+        "could not locate the required-env guard in management-daemon.py"
+    )
 
 
 def _replacements_in(source: Path) -> set[str]:
@@ -310,9 +321,9 @@ def test_vault_key_branch_emits_no_unsubstituted_placeholder() -> None:
         "ssh.publicKey=",
         "ssh.publicKeyVaultPath=secret/data/srw/vm-ssh",
     )
-    unsubstituted = placeholders(
-        yaml.safe_dump(vm_template(rendered))
-    ) - controller_replacements()
+    unsubstituted = (
+        placeholders(yaml.safe_dump(vm_template(rendered))) - controller_replacements()
+    )
 
     assert not unsubstituted, (
         f"{chart} on the Vault-key branch emits {sorted(unsubstituted)}, which "
