@@ -4871,6 +4871,38 @@ def _thread_workspace_backend(thread: Any) -> Optional[str]:
     return _backend_from_override(metadata.get("config_override"))
 
 
+def _require_stateless_lite_workspace(thread: dict[str, Any]) -> str:
+    """Fail closed while S2 workspace-session support is incomplete.
+
+    A stateless claimant currently tears down ``RemoteBackend`` at every claim
+    edge.  Admitting a sandbox/VM thread would therefore appear to work while
+    silently destroying its deterministic tmux session.  Thread creation
+    materializes the effective physical workspace backend in
+    ``metadata.config_override``; accept only the two no-workspace-pod tiers
+    until S2's tmux, sync-ordering and agent-local-state gates have passed.
+
+    Keep this as an exact whitelist: missing, malformed and future backend
+    values must not inherit the lite path by accident.
+    """
+    backend = _thread_workspace_backend(thread)
+    if backend not in LITE_BACKENDS:
+        logger.warning(
+            "Stateless session refused before attach: thread=%s "
+            "workspace_backend=%r (S2 lite-only gate)",
+            thread.get("id"),
+            backend,
+        )
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Stateless execution currently supports only lite workspace "
+                "backends (virtual/none); this session's workspace tier is "
+                "not yet supported"
+            ),
+        )
+    return backend
+
+
 def _session_ready_timeout_s(backend: Optional[str]) -> int:
     """Readiness-probe budget for the session-start paths (``provision_or_assign``
     and ``_do_prepare``'s ``wait_for_ready``).
@@ -29485,6 +29517,7 @@ async def submit_thread_control(
     nor a journal frame: the current lease owner (or exact reciprocal pinned
     binding) applies the request and journals the result with its own allocator.
     """
+    from src.shared.run_queue import LANE_STATELESS
 
     started = time.perf_counter()
     user, thread = await require_thread_owner(request, postgres_db, thread_id)
@@ -29502,6 +29535,13 @@ async def submit_thread_control(
         )
     except ControlAdmissionError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    # S2 safety gate: a new stateless control can create a control-only queue
+    # claim just like human input.  Refuse non-lite workspaces before that
+    # durable admission can wake an executor.  Exact idempotent retries remain
+    # observable even if the thread's lane/tier changed after their commit.
+    if existing is None and thread.get("execution_lane") == LANE_STATELESS:
+        _require_stateless_lite_workspace(thread)
 
     if body.method == "mode.set" and existing is None:
         # Same PDP as create/attach/config.update. A stale or direct client
@@ -31455,6 +31495,11 @@ async def _thread_input_stateless(thread: dict, content: str) -> dict[str, Any]:
         record_input_seq,
     )
 
+    # S2 safety gate must precede every write below.  A sandbox/VM thread can
+    # be moved onto the lane by an operator edit today; queueing it would let
+    # the current attach/detach path silently destroy its remote tmux state.
+    _require_stateless_lite_workspace(thread)
+
     thread_id = str(thread["id"])
     turn_number = int(thread.get("total_turns") or 0) + 1
     # Mirror the agent's accept-time mint exactly; the row id is the same
@@ -31675,6 +31720,12 @@ async def internal_unit_claim_bundle(
         raise HTTPException(
             status_code=409, detail="Thread is not on the stateless lane"
         )
+
+    # Defense at the credential/attach boundary for already-queued legacy
+    # rows and direct DB/operator mistakes.  Public input/control admission
+    # performs the same check before writing, but correctness cannot depend on
+    # every producer having done so.
+    _require_stateless_lite_workspace(thread)
 
     # Derive the assembly inputs exactly the way the resume dispatcher does
     # (resume_thread._reprovision): the stored override from metadata (secrets

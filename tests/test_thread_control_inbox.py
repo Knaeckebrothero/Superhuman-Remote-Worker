@@ -237,6 +237,7 @@ async def test_control_endpoint_admits_owner_request_without_exposing_lane():
         "project_id": PROJECT_ID,
         # Server-side routing fact must not reach the response.
         "execution_lane": "stateless",
+        "metadata": {"config_override": {"workspace": {"backend": "virtual"}}},
     }
     owner = AsyncMock(return_value=(user, thread))
     enforce = AsyncMock()
@@ -300,6 +301,47 @@ async def test_control_endpoint_admits_owner_request_without_exposing_lane():
         requested_by=str(OWNER_ID),
     )
     audit.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_control_endpoint_refuses_new_non_lite_stateless_request():
+    import main as orchestrator_main
+
+    thread = {
+        "id": THREAD_ID,
+        "user_id": OWNER_ID,
+        "project_id": None,
+        "execution_lane": "stateless",
+        "metadata": {"config_override": {"workspace": {"backend": "sandbox"}}},
+    }
+    admit = AsyncMock()
+    with (
+        patch.object(
+            orchestrator_main,
+            "require_thread_owner",
+            AsyncMock(return_value=({"id": OWNER_ID}, thread)),
+        ),
+        patch.object(
+            orchestrator_main,
+            "find_existing_thread_control",
+            AsyncMock(return_value=None),
+        ),
+        patch.object(orchestrator_main, "admit_thread_control", admit),
+    ):
+        with pytest.raises(HTTPException) as exc:
+            await orchestrator_main.submit_thread_control(
+                str(THREAD_ID),
+                orchestrator_main.ThreadControlRequest(
+                    client_request_id=CLIENT_REQUEST_ID,
+                    method="narration.set",
+                    mode="verbose",
+                ),
+                MagicMock(),
+            )
+
+    assert exc.value.status_code == 409
+    assert "virtual/none" in str(exc.value.detail)
+    admit.assert_not_awaited()
 
 
 @pytest.mark.asyncio
