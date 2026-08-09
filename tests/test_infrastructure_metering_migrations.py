@@ -131,8 +131,7 @@ APP_COMPUTE_INTERVAL_EPOCH_SHAPE_REPAIR_MIGRATION = (
     / "orchestrator/database/migrations/app/0114_compute_interval_epoch_shape_repair.sql"
 )
 APP_CURRENT_MIGRATION_HEAD = (
-    ROOT
-    / "orchestrator/database/migrations/app/0114_compute_interval_epoch_shape_repair.sql"
+    ROOT / "orchestrator/database/migrations/app/0115_datasource_tombstones.sql"
 )
 AUDIT_EXPANSION = (
     ROOT

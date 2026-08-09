@@ -21495,6 +21495,7 @@ async def delete_datasource(request: Request, datasource_id: str) -> dict[str, s
                 authority_project_scope_id=(
                     str(scope_project_id) if scope_project_id else None
                 ),
+                deleted_by=str(user["id"]),
             )
         else:
             success = await postgres_db.delete_datasource(
@@ -40480,6 +40481,7 @@ async def _delete_kb_datasource_with_index(
     datasource_id: str,
     *,
     authority_project_scope_id: str | None = None,
+    deleted_by: str | None = None,
 ) -> bool:
     """Order datasource deletion after every writer of its disposable index.
 
@@ -40488,6 +40490,10 @@ async def _delete_kb_datasource_with_index(
     vector cleanup and app-row deletion supplies the required ordering. A
     stale sweeper that captured the row earlier subsequently fails its
     under-lock liveness check and cannot recreate notes or a watermark.
+
+    ``deleted_by`` is passed straight through to the app-row delete's
+    tombstone write (Task 12 item C) — this is the KB half of the same
+    endpoint the non-kb branch already attributes, not a separate decision.
     """
     from src.services.knowledge_store import KnowledgeStore
 
@@ -40501,6 +40507,7 @@ async def _delete_kb_datasource_with_index(
         return await postgres_db.delete_datasource(
             datasource_id,
             authority_project_scope_id=authority_project_scope_id,
+            deleted_by=deleted_by,
         )
 
 
