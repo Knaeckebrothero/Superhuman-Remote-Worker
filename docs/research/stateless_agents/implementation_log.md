@@ -1902,3 +1902,46 @@ injection, and Job Bench parity/performance remain unverified.
   exactly one shared `batch_boundary` registry definition.
 - Final live SQL invariant: **0 `worker_batch` rows**. No worker workload was
   used for a test or measurement.
+
+
+---
+
+# Consolidation — 2026-08-09
+
+All three branches merged back onto `feature/stateless-agents`:
+
+* `feature/stateless-sessions-s1-completion` fast-forwarded in (it already
+  contained every commit on `feature/stateless-agents`).
+* `feature/stateless-workers-s3` merged with four conflicts, all resolved by
+  keeping both sides' intent:
+  - **`postgres.py`** — the sharpest one. S1 restructured `register_agent` so
+    hostname is no longer an ownership credential, which moved the job-pause
+    block out of the `if existing:` branch; S3 had added the
+    `execution_lane = 'pinned'` predicate to that same query. Taking either
+    side alone would have silently dropped the other's fix. Kept the
+    restructure, re-applied the predicate, verified all eight lane predicates
+    survive.
+  - **`test_infrastructure_metering_migrations.py`** — both branches advanced
+    `APP_CURRENT_MIGRATION_HEAD` to their own tip. Head is now the true max
+    (0121) with named constants retained for 0118 and 0119.
+  - **Both docs** — stale-status collisions, rewritten fresh rather than
+    resolved mechanically. `§9.1`'s S1 section had accumulated layered dated
+    appendices; it is now one current picture. This log keeps both tracks'
+    history under their own headings, because it is append-only history.
+
+`schema_current.sql` auto-merged. Rather than trust that, it was regenerated
+from the merged migration set — **no diff**, which confirms the merge instead of
+assuming it. The snapshot carries both branches' schema (`execution_lane` on
+`jobs` and `threads`, the `thread_control` inbox).
+
+On the cluster: migration 0118 re-applied automatically after the merge (it had
+been rolled back earlier so the S1 branch could run against the shared dev DB),
+all seven migrations 0115–0121 are applied, all pods Ready, a turn answers end to
+end, and the worker lane remains off — zero `worker_batch` rows, zero non-pinned
+jobs. The turn timing line now carries `controls=0.02s`, the control-inbox drain.
+
+**Migration numbering note for the future:** the collision that wedged the dev
+database came from two topic branches numbering migrations independently against
+one shared cluster. Now that both are on one branch the problem is gone, but if
+the tracks fork again, either range-allocate numbers up front or land shared
+safety migrations on the integration branch first.
