@@ -27825,9 +27825,7 @@ async def _classify_thread_project_ids(
         if user.get("is_admin"):
             verdicts.append(ProjectVerdict(project_id, False, None))
             continue
-        role = await postgres_db.get_user_role_in_project(
-            project_id, str(user["id"])
-        )
+        role = await postgres_db.get_user_role_in_project(project_id, str(user["id"]))
         if not role:
             verdicts.append(ProjectVerdict(project_id, True, "revoked"))
             continue

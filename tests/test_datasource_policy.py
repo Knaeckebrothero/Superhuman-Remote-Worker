@@ -561,10 +561,12 @@ async def test_authorize_still_raises_generic_error_for_missing_row():
 
 @pytest.mark.asyncio
 async def test_tier_error_wins_when_the_repository_comes_first():
-    db = _db([
-        _row(DS_REPOSITORY, ds_type="repository"),
-        _row(DS_OWNED, scope="projects", projects=(PROJECT_B,)),
-    ])
+    db = _db(
+        [
+            _row(DS_REPOSITORY, ds_type="repository"),
+            _row(DS_OWNED, scope="projects", projects=(PROJECT_B,)),
+        ]
+    )
 
     with pytest.raises(DatasourceWorkspaceTierError):
         await authorize_datasource_selection(
@@ -579,10 +581,12 @@ async def test_tier_error_wins_when_the_repository_comes_first():
 
 @pytest.mark.asyncio
 async def test_out_of_scope_wins_when_it_comes_first():
-    db = _db([
-        _row(DS_OWNED, scope="projects", projects=(PROJECT_B,)),
-        _row(DS_REPOSITORY, ds_type="repository"),
-    ])
+    db = _db(
+        [
+            _row(DS_OWNED, scope="projects", projects=(PROJECT_B,)),
+            _row(DS_REPOSITORY, ds_type="repository"),
+        ]
+    )
 
     with pytest.raises(DatasourceUnavailableError):
         await authorize_datasource_selection(
@@ -616,10 +620,12 @@ async def test_deleted_outranks_tier_error_even_when_it_comes_second():
 async def test_corrupt_policy_revision_denies_in_list_order():
     """A corrupt revision is denied like any other in-loop failure, so an
     EARLIER lite-tier repository still wins."""
-    db = _db([
-        _row(DS_REPOSITORY, ds_type="repository"),
-        _row(DS_OWNED, revision=0),
-    ])
+    db = _db(
+        [
+            _row(DS_REPOSITORY, ds_type="repository"),
+            _row(DS_OWNED, revision=0),
+        ]
+    )
 
     with pytest.raises(DatasourceWorkspaceTierError):
         await authorize_datasource_selection(
