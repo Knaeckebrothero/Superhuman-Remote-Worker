@@ -60,16 +60,29 @@ class MutationOutcomeUnknown(RuntimeError):
 class SessionConfigDriftError(Exception):
     """Resume refused: parts of the session's stored config are unavailable.
 
-    Carries the structured items so a caller can decide whether to re-resume
-    with ``acknowledge`` set.
+    The message carries each item's ID as well as its label, because callers
+    that render only ``str(error)`` (the MCP tool path) would otherwise have
+    no way to build the ``acknowledge`` list the message tells them to send.
     """
 
     def __init__(self, drift: list[dict[str, Any]]):
         self.drift = drift
-        labels = ", ".join(item.get("label", item.get("id", "?")) for item in drift)
+        self.ids = [
+            str(item.get("id"))
+            for item in drift
+            if isinstance(item, dict) and item.get("id")
+        ]
+        described = (
+            ", ".join(
+                f"{item.get('label') or item.get('id') or '?'} ({item.get('id')})"
+                for item in drift
+                if isinstance(item, dict)
+            )
+            or "unknown items"
+        )
         super().__init__(
-            f"Session config is no longer fully available: {labels}. "
-            "Resume again with acknowledge=[...] to continue without them."
+            f"Session config is no longer fully available: {described}. "
+            f"Resume again with acknowledge={self.ids!r} to continue without them."
         )
 
 
@@ -2810,8 +2823,14 @@ class AsyncCockpitClient:
             "POST", f"/api/persistent/threads/{thread_id}/resume", json=payload
         )
         if resp.status_code == 428:
-            detail = (resp.json() or {}).get("detail") or {}
-            raise SessionConfigDriftError(detail.get("drift") or [])
+            try:
+                body = resp.json() if resp.content else {}
+            except ValueError:
+                body = {}
+            detail = body.get("detail") if isinstance(body, dict) else None
+            detail = detail if isinstance(detail, dict) else {}
+            items = detail.get("drift")
+            raise SessionConfigDriftError(items if isinstance(items, list) else [])
         resp.raise_for_status()
         return resp.json()
 
