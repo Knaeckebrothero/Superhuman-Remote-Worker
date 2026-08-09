@@ -201,6 +201,7 @@ from services.config_drift import (  # noqa: E402
     DriftItem,
     acknowledged_drift_ids,
     acknowledged_grant_keys,
+    blocking_denials,
     collect_config_drift,
     drift_labels,
     strip_acknowledged,
@@ -21501,6 +21502,7 @@ async def delete_datasource(request: Request, datasource_id: str) -> dict[str, s
                 authority_project_scope_id=(
                     str(scope_project_id) if scope_project_id else None
                 ),
+                deleted_by=str(user["id"]),
             )
         if not success:
             raise HTTPException(
@@ -27618,19 +27620,35 @@ async def _strip_still_denied_ack(
     acknowledged id is dropped exactly as before. Anything denied and NEVER
     acknowledged is also left in place, so the authorize call downstream
     still fails the whole selection closed on it — fail-closed is unchanged.
+
+    A malformed stored id or a vanished/unapproved owner makes
+    ``classify_datasource_selection`` raise ``DatasourceUnavailableError``
+    directly — those checks run BEFORE its per-item loop, so no verdict list
+    is ever returned. Translate that the same way the sibling authorizer
+    (:func:`_authorize_thread_datasource_selection`) does, so this call
+    site's behavior is unchanged from before the ack feature existed: a 403,
+    never an unhandled exception reaching the ASGI layer as a 500.
     """
     ack = acknowledged_drift_ids(thread.get("metadata"))
     if not ack:
         return selected
-    verdicts, _revisions = await classify_datasource_selection(
-        postgres_db,
-        actor,
-        effective_work_owner_id,
-        selected,
-        project_ids,
-        None,
-        trusted_system_inheritance=trusted_system_inheritance,
-    )
+    from services.datasource_policy import DatasourceUnavailableError
+
+    try:
+        verdicts, _revisions = await classify_datasource_selection(
+            postgres_db,
+            actor,
+            effective_work_owner_id,
+            selected,
+            project_ids,
+            None,
+            trusted_system_inheritance=trusted_system_inheritance,
+        )
+    except DatasourceUnavailableError as exc:
+        raise HTTPException(
+            status_code=403,
+            detail="One or more selected connectors are unavailable",
+        ) from exc
     still_denied_ack = {
         f"connector:{v.datasource_id}"
         for v in verdicts
@@ -30185,6 +30203,23 @@ async def _thread_config_drift(
         allow_admin_explicit_override=True,
     )
 
+    # workspace_tier / corrupt_revision cannot be acknowledged away (no user
+    # action makes either safe), so collect_config_drift below never turns
+    # either into a DriftItem — but both still deny at attach. Resuming past
+    # them would return 200 and hang at attach, the exact failure shape this
+    # feature exists to remove. Refuse here, before any grant probing or
+    # status mutation, and without naming which item (same non-enumeration
+    # reasoning as the generic denial raised elsewhere on this path).
+    if blocking_denials(datasource_verdicts, project_verdicts):
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "This session's configuration cannot be verified and cannot "
+                "be resumed. Its connector or project data is invalid rather "
+                "than merely unavailable."
+            ),
+        )
+
     # Grants are enforced inside the session resolve; run it purely to harvest
     # the violations it would raise at attach.
     status: dict[str, Any] = {}
@@ -30274,7 +30309,14 @@ async def resume_thread(
     # be left half-resumed. Compute drift and raise 428 BEFORE touching the
     # thread's status, same discipline the old revalidate-and-raise calls had.
     drift = await _thread_config_drift(thread, metadata, owner=owner)
-    acknowledged = set(body.acknowledge or []) if body else set()
+    # The ack is durable (spec §3.2): a PRIOR resume already persisted it to
+    # metadata.config_drift_ack (below), so it must count here too, not just
+    # whatever this particular request body happens to carry — otherwise an
+    # item the user already accepted losing is re-reported as outstanding on
+    # every subsequent resume. Union, never replace: a genuinely NEW drift
+    # id is in neither set, so it still blocks.
+    stored_ack = acknowledged_drift_ids(thread.get("metadata"))
+    acknowledged = (set(body.acknowledge or []) if body else set()) | stored_ack
     outstanding = {item.id for item in drift} - acknowledged
     if outstanding:
         # Subset, not equality: an item that RECOVERED between prompt and

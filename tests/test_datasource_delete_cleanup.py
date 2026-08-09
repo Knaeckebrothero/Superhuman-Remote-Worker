@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import json
 import os
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 import pytest_asyncio
@@ -186,3 +186,58 @@ async def test_delete_leaves_non_array_and_unrelated_metadata_untouched(db):
 async def test_get_datasource_tombstones_empty_and_invalid_ids(db):
     assert await db.get_datasource_tombstones([]) == {}
     assert await db.get_datasource_tombstones(["not-a-uuid"]) == {}
+
+
+async def _tombstone_deleted_by(database: PostgresDB, doomed_id: str):
+    async with database.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT deleted_by FROM datasource_tombstones WHERE id = $1",
+            UUID(doomed_id),
+        )
+    return row["deleted_by"] if row else None
+
+
+async def test_delete_with_actor_records_deleted_by(db):
+    """C: migration 0115 defines ``deleted_by`` and spec §5.1 lists it as
+    tombstone content, but until now nothing ever wrote it — every row was
+    NULL regardless of who deleted it."""
+    doomed_id = await _make_datasource(db, label="ActorRecorded")
+    actor_id = str(uuid4())
+
+    assert await db.delete_datasource(doomed_id, deleted_by=actor_id) is True
+
+    recorded = await _tombstone_deleted_by(db, doomed_id)
+    assert str(recorded) == actor_id
+
+
+async def test_delete_without_actor_records_null_deleted_by(db):
+    """The converse: an internal/system delete that passes no actor must
+    record NULL, not a fabricated id."""
+    doomed_id = await _make_datasource(db, label="NoActor")
+
+    assert await db.delete_datasource(doomed_id) is True
+
+    assert await _tombstone_deleted_by(db, doomed_id) is None
+
+
+async def test_delete_preserves_survivor_order_with_multiple_survivors(db):
+    """E: every prior test of the scrub left exactly ONE surviving id, so the
+    promise to preserve survivor ORDER rested on jsonb_agg semantics rather
+    than on a test. Seed four ids, delete the second, and assert the
+    remaining three keep their original relative order."""
+    ids = [await _make_datasource(db, label=f"Order{i}") for i in range(4)]
+    thread_id = await _make_thread(db, datasource_ids=ids)
+
+    try:
+        assert await db.delete_datasource(ids[1]) is True
+
+        row = await db.get_thread(thread_id)
+        metadata = row["metadata"]
+        if isinstance(metadata, str):
+            metadata = json.loads(metadata)
+        assert metadata["datasource_ids"] == [ids[0], ids[2], ids[3]]
+    finally:
+        async with db.acquire() as conn:
+            await conn.execute("DELETE FROM threads WHERE id = $1", thread_id)
+        for remaining_id in (ids[0], ids[2], ids[3]):
+            await db.delete_datasource(remaining_id)
