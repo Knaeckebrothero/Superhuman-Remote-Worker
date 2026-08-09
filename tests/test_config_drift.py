@@ -187,9 +187,7 @@ async def test_grant_violation_parsed_into_item():
         owner={"id": "u1"},
         project_ids=[],
         datasource_ids=[],
-        grant_violations=[
-            "shell_tools: tools.shell requires the shell_tools grant"
-        ],
+        grant_violations=["shell_tools: tools.shell requires the shell_tools grant"],
     )
     assert items == [
         DriftItem(

@@ -232,9 +232,7 @@ class TestResumeConfigDrift:
 
         thread = _ended_thread(thread_a)
         thread_id = str(thread["id"])
-        thread["metadata"] = {
-            "config_drift_ack": {f"connector:{DS_GONE}": "deleted"}
-        }
+        thread["metadata"] = {"config_drift_ack": {f"connector:{DS_GONE}": "deleted"}}
         drift = [
             DriftItem(f"connector:{DS_GONE}", "connector", "deleted", "KurortEngine")
         ]
@@ -259,9 +257,7 @@ class TestResumeConfigDrift:
         thread = _ended_thread(thread_a)
         thread_id = str(thread["id"])
         acked_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
-        thread["metadata"] = {
-            "config_drift_ack": {f"connector:{acked_id}": "deleted"}
-        }
+        thread["metadata"] = {"config_drift_ack": {f"connector:{acked_id}": "deleted"}}
         drift = [
             DriftItem(f"connector:{DS_GONE}", "connector", "deleted", "KurortEngine")
         ]
@@ -400,9 +396,7 @@ class TestResumeConfigDrift:
                     "main._thread_project_ids",
                     AsyncMock(return_value=[project_id]),
                 ),
-                patch(
-                    "main._resolve_session_config", AsyncMock(return_value=None)
-                ),
+                patch("main._resolve_session_config", AsyncMock(return_value=None)),
             ):
                 with pytest.raises(HTTPException) as exc:
                     await resume_thread(thread_id, fake_request)
@@ -454,9 +448,7 @@ class TestResumeConfigDrift:
         )
 
         with _patch_caller_and_db(user_a, fake_db):
-            with patch(
-                "main._resolve_session_config", AsyncMock(return_value=None)
-            ):
+            with patch("main._resolve_session_config", AsyncMock(return_value=None)):
                 with pytest.raises(HTTPException) as exc:
                     await resume_thread(thread_id, fake_request)
 

@@ -85,9 +85,7 @@ def test_fully_acknowledged_grant_violations_are_stripped():
     merged = {"tools": {"shell": True}, "workspace": {"backend": "vm"}}
     grants = {"shell_tools": False, "vm_workspace": False}
 
-    result = _strip_acknowledged_grants(
-        merged, grants, {"shell_tools", "vm_workspace"}
-    )
+    result = _strip_acknowledged_grants(merged, grants, {"shell_tools", "vm_workspace"})
 
     assert "shell" not in result.get("tools", {})
     assert "backend" not in result.get("workspace", {})
@@ -125,16 +123,12 @@ async def test_resolve_session_config_strips_the_delivered_blob_not_just_the_cap
 
     with (
         patch("orchestrator.main._is_experts_db_enabled", return_value=True),
-        patch(
-            "orchestrator.main._user_experts_enabled", AsyncMock(return_value=True)
-        ),
+        patch("orchestrator.main._user_experts_enabled", AsyncMock(return_value=True)),
         patch(
             "orchestrator.main._resolve_session_account_defaults",
             AsyncMock(return_value={}),
         ),
-        patch(
-            "orchestrator.main._gather_in_scope_skills", AsyncMock(return_value={})
-        ),
+        patch("orchestrator.main._gather_in_scope_skills", AsyncMock(return_value={})),
         patch("orchestrator.main._thread_project_ids", AsyncMock(return_value=[])),
         patch(
             "orchestrator.main._resolve_runner_grants",

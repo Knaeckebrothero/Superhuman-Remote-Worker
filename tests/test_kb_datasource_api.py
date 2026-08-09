@@ -681,17 +681,19 @@ async def test_persisted_thread_revalidation_preserves_global_and_system_semanti
         patch("main.postgres_db", db),
         patch("main._thread_project_ids", AsyncMock(return_value=[])),
     ):
-        global_selection, global_revisions = (
-            await _revalidate_thread_datasource_selection(
-                {"id": "thread-user", "user_id": owner_id},
-                [str(datasource_id)],
-            )
+        (
+            global_selection,
+            global_revisions,
+        ) = await _revalidate_thread_datasource_selection(
+            {"id": "thread-user", "user_id": owner_id},
+            [str(datasource_id)],
         )
-        system_selection, system_revisions = (
-            await _revalidate_thread_datasource_selection(
-                {"id": "thread-system", "user_id": None},
-                [str(datasource_id), str(datasource_id)],
-            )
+        (
+            system_selection,
+            system_revisions,
+        ) = await _revalidate_thread_datasource_selection(
+            {"id": "thread-system", "user_id": None},
+            [str(datasource_id), str(datasource_id)],
         )
 
     assert global_selection == [str(datasource_id)]
@@ -858,9 +860,7 @@ async def test_resume_revalidates_datasources_before_mutating_thread_status():
     # _thread_config_drift. Here the caller already stands in as the owner
     # (same id), so the same dict is the right stand-in for that row.
     db.get_user = AsyncMock(return_value=user)
-    drift = [
-        DriftItem(f"connector:{datasource_id}", "connector", "deleted", "gone")
-    ]
+    drift = [DriftItem(f"connector:{datasource_id}", "connector", "deleted", "gone")]
 
     with (
         patch("main.require_thread_owner", AsyncMock(return_value=(user, thread))),
