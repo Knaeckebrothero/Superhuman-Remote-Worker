@@ -54,6 +54,7 @@ from .core.workspace import (
 )
 from .graph import build_phase_alternation_graph, run_graph_with_streaming
 from .managers import TodoManager
+from .shared.job_freeze_types import AUTO_CONTINUE_FREEZE_TYPES
 from .tools import ToolContext, load_tools, apply_instruction_enforcement
 from .tools.description_manager import apply_description_overrides
 from .utils.db_url import checkpointer_backend, resolve_checkpoint_url
@@ -62,27 +63,6 @@ from .utils.db_url import checkpointer_backend, resolve_checkpoint_url
 # ensured. AsyncPostgresSaver.setup() is idempotent, but there's no need to run
 # it on every job.
 _PG_CHECKPOINT_SCHEMA_READY = False
-
-# Freeze types that mean "pause, then auto-continue the SAME job" — mirrors the
-# orchestrator's AUTO_REDISPATCH_FREEZE_TYPES plus llm_unavailable (which the
-# outage sweeper re-dispatches). Each of these freezes inside the graph with
-# should_stop=True, so the run reaches END and the checkpoint persists
-# should_stop=True. On a graceful resume with no feedback/delegation, that
-# persisted flag must be cleared BEFORE ainvoke — otherwise ainvoke(None) on an
-# ended thread runs zero nodes and returns the terminal frozen state, wedging the
-# job in an invisible re-freeze loop. See
-# docs/issues/version_upgrade_drain_livelock.md. Human-review stops
-# (budget_exceeded → pending_review, genuine completions) are intentionally NOT
-# in this set, so they stay stopped.
-_AUTO_CONTINUE_FREEZE_TYPES = frozenset(
-    {
-        "version_upgrade",
-        "llm_unavailable",
-        "memory_unavailable",
-        "kb_unavailable",
-        "workspace_upgrade_required",
-    }
-)
 
 # >>> TEMPORARY QUICKFIX (2026-07-30) — delete with the upstream fix.
 # docs/done/codex_stream_disconnect_shape_nudge.md
@@ -1133,7 +1113,7 @@ class UniversalAgent:
                     )
                     if (
                         values.get("should_stop")
-                        and freeze_type in _AUTO_CONTINUE_FREEZE_TYPES
+                        and freeze_type in AUTO_CONTINUE_FREEZE_TYPES
                     ):
                         await self._graph.aupdate_state(
                             thread_config,

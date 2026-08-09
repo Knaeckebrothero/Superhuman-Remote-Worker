@@ -132,7 +132,11 @@ APP_COMPUTE_INTERVAL_EPOCH_SHAPE_REPAIR_MIGRATION = (
 )
 # Bump this whenever a new app migration lands — the assertion below is the
 # tripwire that says "a migration was added; check the snapshot was regenerated
-# and nothing was renumbered". Head as of the durable session-control inbox.
+# and nothing was renumbered". Head as of the merged stateless work: the S3
+# worker-lane partition (0118) plus the session control inbox (0119-0121).
+APP_JOBS_EXECUTION_LANE_MIGRATION = (
+    ROOT / "orchestrator/database/migrations/app/0118_jobs_execution_lane.sql"
+)
 APP_THREAD_CONTROL_INBOX_MIGRATION = (
     ROOT / "orchestrator/database/migrations/app/0119_thread_control_inbox.sql"
 )
