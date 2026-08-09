@@ -610,3 +610,38 @@ async def test_deleted_outranks_tier_error_even_when_it_comes_second():
             [],
             "virtual",
         )
+
+
+@pytest.mark.asyncio
+async def test_corrupt_policy_revision_denies_in_list_order():
+    """A corrupt revision is denied like any other in-loop failure, so an
+    EARLIER lite-tier repository still wins."""
+    db = _db([
+        _row(DS_REPOSITORY, ds_type="repository"),
+        _row(DS_OWNED, revision=0),
+    ])
+
+    with pytest.raises(DatasourceWorkspaceTierError):
+        await authorize_datasource_selection(
+            db,
+            {"id": OWNER, "is_admin": False},
+            OWNER,
+            [DS_REPOSITORY, DS_OWNED],
+            [],
+            "virtual",
+        )
+
+
+@pytest.mark.asyncio
+async def test_corrupt_policy_revision_alone_is_a_generic_denial():
+    db = _db([_row(DS_OWNED, revision=0)])
+
+    with pytest.raises(DatasourceUnavailableError):
+        await authorize_datasource_selection(
+            db,
+            {"id": OWNER, "is_admin": False},
+            OWNER,
+            [DS_OWNED],
+            [],
+            None,
+        )
