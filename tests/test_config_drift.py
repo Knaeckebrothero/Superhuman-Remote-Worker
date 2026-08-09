@@ -39,6 +39,35 @@ async def test_no_drift_returns_empty():
 
 
 @pytest.mark.asyncio
+async def test_undenied_connector_is_not_drift_even_with_an_ack_reason():
+    """Pins the `denied` half of the guard independently of the reason half:
+    a reason string alone must never produce an item."""
+    items = await collect_config_drift(
+        None,
+        {},
+        owner={"id": "u1"},
+        project_ids=[],
+        datasource_ids=[ItemVerdict(DS_OK, False, "deleted")],
+        grant_violations=[],
+        tombstones={DS_OK: "Should Not Appear"},
+    )
+    assert items == []
+
+
+@pytest.mark.asyncio
+async def test_undenied_project_is_not_drift_even_with_an_ack_reason():
+    items = await collect_config_drift(
+        None,
+        {},
+        owner={"id": "u1"},
+        project_ids=[_ProjectVerdict(PROJECT_GONE, False, "deleted")],
+        datasource_ids=[],
+        grant_violations=[],
+    )
+    assert items == []
+
+
+@pytest.mark.asyncio
 async def test_deleted_connector_named_from_tombstone():
     items = await collect_config_drift(
         None,
@@ -109,6 +138,22 @@ async def test_workspace_tier_verdict_is_not_drift():
         owner={"id": "u1"},
         project_ids=[],
         datasource_ids=[ItemVerdict(DS_OK, True, "workspace_tier")],
+        grant_violations=[],
+    )
+    assert items == []
+
+
+@pytest.mark.asyncio
+async def test_corrupt_revision_verdict_is_not_drift():
+    """Corruption is not drift: no acknowledgment can make a bad
+    policy_revision safe, so it must keep failing closed rather than
+    appearing as a dismissible item."""
+    items = await collect_config_drift(
+        None,
+        {},
+        owner={"id": "u1"},
+        project_ids=[],
+        datasource_ids=[ItemVerdict(DS_OK, True, "corrupt_revision")],
         grant_violations=[],
     )
     assert items == []
