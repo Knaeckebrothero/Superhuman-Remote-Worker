@@ -2507,6 +2507,30 @@ async def _resolve_session_config(
         request_override = await _seed_registry_model_overrides(
             request_override, user_id=user_id
         )
+        # Grants resolved BEFORE resolve_config (not after) so the strip can run
+        # as its grant_strip hook, on the SAME `data` the delivered blob is built
+        # from — not just on the detached capture the PDP evaluates. Stripping
+        # only the capture leaves the delivered blob carrying the very
+        # capability the grant revoked (round-1 finding). None when there is
+        # nothing acknowledged, or when _resolve_runner_grants says admin.
+        _ack_grant_keys = acknowledged_grant_keys(metadata)
+        _grants_for_strip = (
+            await _resolve_runner_grants(
+                runner_user_id=user_id,
+                project_ids=[project_id] if project_id else [],
+            )
+            if _ack_grant_keys
+            else None
+        )
+        _grant_strip = (
+            (
+                lambda fragment: _strip_acknowledged_grants(
+                    fragment, _grants_for_strip, _ack_grant_keys
+                )
+            )
+            if _grants_for_strip is not None
+            else None
+        )
         resolved = resolve_config(
             base_config_name=base,
             base_defaults=base_defaults,
@@ -2516,6 +2540,7 @@ async def _resolve_session_config(
             expert_type="session",
             capture=_cap,
             skills=_skills_payload,
+            grant_strip=_grant_strip,
         )
         # Bound skills are delivered deterministically (instructions channel);
         # strip them from the model-invoked catalog so they aren't double-offered.
@@ -2535,12 +2560,9 @@ async def _resolve_session_config(
         # interactive.permission_mode and any persistent_agent keys baked into
         # config_override — must fit the runner's grants. GrantDenied escapes the
         # generic except below (fail closed: never deliver the unvetted override).
-        _cap["merged_fragment"] = await _apply_acknowledged_grant_drift(
-            _cap["merged_fragment"],
-            acknowledged=acknowledged_grant_keys(metadata),
-            runner_user_id=user_id,
-            project_ids=[project_id] if project_id else [],
-        )
+        # _cap["merged_fragment"] already reflects the grant_strip hook above
+        # (same `data` the delivered blob was built from); this re-check stays
+        # authoritative — it re-runs evaluate() on whatever that hook returned.
         await _enforce_dispatch_grants(
             _cap["merged_fragment"],
             runner_user_id=user_id,
@@ -6278,42 +6300,37 @@ async def _enforce_dispatch_grants(
         raise GrantDenied(violations)
 
 
-async def _apply_acknowledged_grant_drift(
-    merged: dict[str, Any],
-    *,
-    acknowledged: set[str],
-    runner_user_id: str | None,
-    project_ids: list[str],
+def _strip_acknowledged_grants(
+    fragment: dict[str, Any], grants: dict[str, Any], acknowledged: set[str]
 ) -> dict[str, Any]:
-    """Strip acknowledged grant violations out of a merged config.
+    """Drop acknowledged grant violations from a merged config fragment.
 
-    Returns the fragment to enforce against. A violation the user did NOT
-    acknowledge is left in place, so ``_enforce_dispatch_grants`` still denies
-    exactly as it does today — acknowledging one grant must never smuggle a
-    different one through.
+    A violation the user did NOT acknowledge is left in place, so
+    ``_enforce_dispatch_grants`` still denies on all of it — acknowledging one
+    grant must never smuggle a different one through.
 
     ``strip_to_grants`` is advisory by contract; the authoritative re-check is
-    the ``_enforce_dispatch_grants`` call that immediately follows, which
-    re-runs ``evaluate`` on whatever this returns.
+    the ``_enforce_dispatch_grants`` call that runs on the resulting capture.
+
+    Sync and pure (no grant resolution here) so it can run as
+    ``resolve_config``'s ``grant_strip`` hook, applied to the fully-merged
+    ``data`` before the delivered blob is built from it — not just to the
+    detached ``capture["merged_fragment"]`` copy the PDP evaluates. Stripping
+    only the capture leaves the delivered blob carrying the very capability
+    the grant revoked (round-1 finding: acknowledging ``shell_tools`` stopped
+    the denial but the agent still hydrated ``tools.shell=True``).
     """
-    if not acknowledged:
-        return merged
     from src.core.capability_grants import evaluate, strip_to_grants
 
-    grants = await _resolve_runner_grants(
-        runner_user_id=runner_user_id, project_ids=project_ids
-    )
-    if grants is None:  # admin bypass — nothing to strip
-        return merged
-    violations = evaluate(merged, grants)
+    violations = evaluate(fragment, grants)
     if not violations:
-        return merged
+        return fragment
     flagged = {v.split(":", 1)[0] for v in violations}
     if not flagged <= acknowledged:
         # Something drifted that was never acknowledged. Leave the fragment
         # untouched and let the dispatch PEP fail closed on all of it.
-        return merged
-    stripped, _dropped = strip_to_grants(merged, grants)
+        return fragment
+    stripped, _dropped = strip_to_grants(fragment, grants)
     return stripped
 
 
@@ -10888,6 +10905,14 @@ async def _resolve_internal_job_creation_scope(
             column_project = thread.get("project_id")
             if column_project and str(column_project) not in thread_projects:
                 thread_projects.insert(0, str(column_project))
+            # Acknowledged project drift is narrowed out before revalidation,
+            # same as the warm-attach and cold-workspace call sites, so an
+            # already-acknowledged revoked/deleted project does not
+            # spuriously 403 an internal job scoped off this thread.
+            ack = acknowledged_drift_ids(thread.get("metadata"))
+            thread_projects = strip_acknowledged(
+                thread_projects, ack, prefix="project"
+            )
             thread_projects = await _revalidate_thread_project_ids(
                 thread, thread_projects
             )
@@ -25521,9 +25546,14 @@ async def _agent_get_thread_workspace_locked(thread_id: str) -> dict[str, Any]:
         canvas_shared_browser_available,
     ) = _agent_canvas_workspace_capabilities(metadata, ws, vm)
     # Phase 1: project attachment + cloud mounts now live on thread_mounts.
-    project_ids = await _revalidate_thread_project_ids(
-        thread, await _thread_project_ids(thread_id)
+    # Acknowledged project drift is narrowed out before revalidation, same as
+    # the warm-attach call site — otherwise a cold-started session dies here
+    # on exactly the drift the owner already acknowledged at resume.
+    _ack = acknowledged_drift_ids(metadata)
+    current_project_ids = strip_acknowledged(
+        await _thread_project_ids(thread_id), _ack, prefix="project"
     )
+    project_ids = await _revalidate_thread_project_ids(thread, current_project_ids)
     datasources_payload = await _resolve_thread_datasources(
         thread, metadata, project_ids=project_ids
     )

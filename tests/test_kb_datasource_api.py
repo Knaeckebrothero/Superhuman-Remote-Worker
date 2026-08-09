@@ -30,6 +30,7 @@ from main import (
     resume_thread,
     update_datasource,
 )
+from orchestrator.services.config_drift import DriftItem
 from orchestrator.services.kb_datasources import (
     index_status_payload,
     reindex_kb_datasource,
@@ -805,6 +806,24 @@ async def test_thread_project_authorization_preserves_admin_access():
 
 @pytest.mark.asyncio
 async def test_resume_revalidates_datasources_before_mutating_thread_status():
+    """resume_thread must not flip a thread's status before its config drift
+    is resolved.
+
+    Round-1 diagnosis (this test regressed under Task 6, commit a6e073e3):
+    this pinned a synchronous 403 raised by ``_revalidate_thread_datasource_ids``
+    — a helper ``resume_thread`` no longer calls at all. Task 6
+    (docs/features/session_config_drift_resume.md) deliberately replaced that
+    dead-end 403 with an acknowledgeable 428 listing every drifted item (a
+    revoked/deleted datasource no longer permanently strands the session) —
+    an intentional, already-shipped contract change, not a bug. This is a
+    genuine (ii): the old mock (`user={}`, the old helper patched) doesn't
+    match resume_thread's real current collaborator (`_thread_config_drift`),
+    which is why it crashed with a raw ``KeyError`` rather than failing its
+    assertion. Classification correctness (deleted/revoked/out_of_scope) is
+    unit tested on its own in tests/test_config_drift.py and
+    tests/test_resume_config_drift.py; this test only pins resume_thread's
+    ordering guarantee, unchanged: no status mutation before drift resolves.
+    """
     datasource_id = UUID("11111111-2222-3333-4444-555555555555")
     thread = {
         "id": "thread-1",
@@ -812,34 +831,39 @@ async def test_resume_revalidates_datasources_before_mutating_thread_status():
         "status": "ended",
         "metadata": {"datasource_ids": [str(datasource_id)]},
     }
+    user = {"id": str(thread["user_id"])}
     db = MagicMock()
     db.resume_thread = AsyncMock()
-    db.list_thread_mounts = AsyncMock(return_value=[])
-    db.get_thread = AsyncMock(return_value=thread)
-    denied = HTTPException(
-        status_code=403,
-        detail="One or more selected connectors are unavailable",
-    )
+    db.record_thread_config_drift_ack = AsyncMock()
+    drift = [
+        DriftItem(f"connector:{datasource_id}", "connector", "deleted", "gone")
+    ]
 
     with (
-        patch("main.require_thread_owner", AsyncMock(return_value=({}, thread))),
+        patch("main.require_thread_owner", AsyncMock(return_value=(user, thread))),
         patch("main.postgres_db", db),
-        patch(
-            "main._revalidate_thread_datasource_ids",
-            AsyncMock(side_effect=denied),
-        ),
-        patch("main._thread_project_ids", AsyncMock(return_value=[])),
-        patch("main._revalidate_thread_project_ids", AsyncMock(return_value=[])),
+        patch("main._thread_config_drift", AsyncMock(return_value=drift)),
         pytest.raises(HTTPException) as exc,
     ):
         await resume_thread("thread-1", object())
 
-    assert exc.value.status_code == 403
+    assert exc.value.status_code == 428
+    assert exc.value.detail["drift"][0]["id"] == f"connector:{datasource_id}"
     db.resume_thread.assert_not_awaited()
 
 
 @pytest.mark.asyncio
 async def test_resume_blocks_revoked_native_project_scope_before_status_mutation():
+    """Same ordering guarantee as the datasource test above, for a revoked
+    project membership.
+
+    Round-1 diagnosis: same (ii) as above — a synchronous 403 from
+    ``_revalidate_thread_project_ids`` is now an acknowledgeable 428 (Task 6).
+    ``_revalidate_thread_datasource_ids`` is no longer on resume_thread's call
+    path at all (``_thread_config_drift`` computes drift directly), so a mock
+    of it proves nothing here and has been dropped rather than kept as dead
+    weight.
+    """
     project_id = "99999999-2222-3333-4444-555555555555"
     thread = {
         "id": "thread-1",
@@ -847,31 +871,23 @@ async def test_resume_blocks_revoked_native_project_scope_before_status_mutation
         "status": "ended",
         "metadata": {},
     }
+    user = {"id": thread["user_id"]}
     db = MagicMock()
     db.resume_thread = AsyncMock()
-    denied = HTTPException(
-        status_code=403,
-        detail="One or more attached projects are unavailable",
-    )
+    db.record_thread_config_drift_ack = AsyncMock()
+    drift = [DriftItem(f"project:{project_id}", "project", "revoked", "gone")]
 
     with (
-        patch("main.require_thread_owner", AsyncMock(return_value=({}, thread))),
+        patch("main.require_thread_owner", AsyncMock(return_value=(user, thread))),
         patch("main.postgres_db", db),
-        patch("main._thread_project_ids", AsyncMock(return_value=[project_id])),
-        patch(
-            "main._revalidate_thread_project_ids",
-            AsyncMock(side_effect=denied),
-        ),
-        patch(
-            "main._revalidate_thread_datasource_ids", AsyncMock(return_value=[])
-        ) as datasource_check,
+        patch("main._thread_config_drift", AsyncMock(return_value=drift)),
         pytest.raises(HTTPException) as exc,
     ):
         await resume_thread("thread-1", object())
 
-    assert exc.value.status_code == 403
+    assert exc.value.status_code == 428
+    assert exc.value.detail["drift"][0]["id"] == f"project:{project_id}"
     db.resume_thread.assert_not_awaited()
-    datasource_check.assert_not_awaited()
 
 
 @pytest.mark.asyncio
