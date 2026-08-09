@@ -420,11 +420,6 @@ Worth recording, because each was correct-looking code with passing tests:
   `config_drift_ack`, but `_thread_config_drift` still classifies raw
   `metadata.datasource_ids`, so an acknowledged connector re-prompts on each
   subsequent resume. One extra dialog, not a dead end.
-- **`summary` is unconsumed.** `drift_labels` ships in the 428 body but the
-  cockpit re-implements the same collapse in `groupDriftForDisplay` — one rule,
-  two implementations.
-- **`_revalidate_thread_datasource_ids` is dead**, and three patches of it in
-  `tests/test_protected_cloud_engage_wiring.py` are now vacuous.
 - **`corrupt_revision` / `workspace_tier`** are excluded from acknowledgement by
   design, but still deny at attach — so they resume 200 and then hang, the
   failure shape this feature exists to remove. Rare; §7 does not cover it.
@@ -435,3 +430,22 @@ Worth recording, because each was correct-looking code with passing tests:
   rather than the thread owner — same shape as the admin defect above, but
   **pre-existing** (blame: `07b9c6b3`, 2026-07-11), untouched by this work.
   Worth its own ticket.
+
+### Resolved cleanups (Task 13)
+
+- **`summary` removed from the 428 body.** `drift_labels` shipped a collapsed
+  summary alongside `drift`, but the cockpit already re-implements the same
+  collapse client-side in `groupDriftForDisplay` and never read `summary` —
+  confirmed by grepping `cockpit/src/app` before deleting. One rule, one
+  implementation now; `drift_labels` is gone from
+  `orchestrator/services/config_drift.py`, and the raw `drift` array (the
+  field every consumer actually reads) is unchanged.
+- **`_revalidate_thread_datasource_ids` deleted.** It had no production
+  caller — `_thread_config_drift` calls `classify_datasource_selection`
+  directly, not this wrapper. Its three patches in
+  `tests/test_protected_cloud_engage_wiring.py` were confirmed vacuous (the
+  file passes identically with them removed) before deletion; the two
+  direct-call tests in `tests/test_kb_datasource_api.py` that exercised real
+  global/system revalidation behavior were redirected to
+  `_revalidate_thread_datasource_selection`, which remains live underneath
+  `_resolve_authorized_thread_datasources`.

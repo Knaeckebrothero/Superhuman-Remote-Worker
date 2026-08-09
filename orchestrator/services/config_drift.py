@@ -106,30 +106,6 @@ async def collect_config_drift(
     return items
 
 
-def drift_labels(items: list[DriftItem]) -> list[dict[str, Any]]:
-    """Collapse items sharing a label into one row with a count.
-
-    Revoked items all render the same generic string, so two of them would
-    otherwise produce two identical lines. Every id is preserved, because the
-    acknowledgment stays per-item.
-    """
-    grouped: dict[str, dict[str, Any]] = {}
-    for item in items:
-        row = grouped.get(item.label)
-        if row is None:
-            grouped[item.label] = {
-                "label": item.label,
-                "count": 1,
-                "kind": item.kind,
-                "reason": item.reason,
-                "ids": [item.id],
-            }
-            continue
-        row["count"] += 1
-        row["ids"].append(item.id)
-    return list(grouped.values())
-
-
 def blocking_denials(
     datasource_verdicts: list[Any], project_verdicts: list[Any]
 ) -> list[str]:

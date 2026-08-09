@@ -4,11 +4,12 @@ A session's stored config (connector selection, project mounts, capability
 grants) can drift out from under it while it is ended — a connector deleted, a
 project membership revoked, a grant withdrawn. Before this, ``resume_thread``
 ran the plain authorize-or-403 helpers (``_revalidate_thread_project_ids`` /
-``_revalidate_thread_datasource_ids``), so a single drifted item made the
-session permanently un-resumable with no way back (the live incident behind
-docs/features/session_config_drift_resume.md). Now it reports every drifted
-item as 428 and accepts an ``acknowledge`` list naming the ids the caller
-accepts losing.
+``_revalidate_thread_datasource_ids``, the latter deleted outright by Task 13
+once this feature left it with no production caller), so a single drifted
+item made the session permanently un-resumable with no way back (the live
+incident behind docs/features/session_config_drift_resume.md). Now it
+reports every drifted item as 428 and accepts an ``acknowledge`` list naming
+the ids the caller accepts losing.
 
 This repo has no HTTP test client for these routes. Mirrors the
 patch-the-auth-resolver pattern from tests/test_thread_rename.py: call the
@@ -33,7 +34,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from fastapi import HTTPException
 
-from orchestrator.services.config_drift import DriftItem, drift_labels
+from orchestrator.services.config_drift import DriftItem
 
 DS_GONE = "d7555d5d-ce46-49e2-b1fa-8235d720badc"
 DS_CORRUPT = "c1c1c1c1-c1c1-4c1c-8c1c-c1c1c1c1c1c1"
@@ -114,7 +115,6 @@ class TestResumeConfigDrift:
                 "label": "KurortEngine",
             }
         ]
-        assert body["summary"] == drift_labels(drift)
         # Nothing was mutated: no write ever reached the thread.
         fake_db.resume_thread.assert_not_awaited()
         fake_db.record_thread_config_drift_ack.assert_not_awaited()
