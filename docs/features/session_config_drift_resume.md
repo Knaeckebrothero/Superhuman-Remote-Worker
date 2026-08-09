@@ -17,7 +17,8 @@ related:
 
 # Session config drift on resume
 
-**Status:** Designed 2026-08-09. Not implemented.
+**Status:** Implemented 2026-08-09 on `develop` (unpushed). Live gate NOT run —
+see §11.
 **Origin:** Live incident on dev — session `1930dec9` returned 403 on every resume
 and the button appeared dead.
 
@@ -372,3 +373,65 @@ non-acknowledged drift still fails closed.
   rather than a rewrite.
 - Repairing the 24 existing threads by hand. They are fixed by the same flow
   once it ships, which is the point of testing against `1930dec9`.
+
+## 11. Implementation outcome (2026-08-09)
+
+Implemented across 19 commits on `develop`, `7b8faddf..6067e0e3`, **unpushed**.
+Every task passed a scoped review; a final whole-branch review found three
+further defects that per-task reviews structurally could not see, all fixed in
+one wave (`6067e0e3`).
+
+### What the reviews caught that the tests did not
+
+Worth recording, because each was correct-looking code with passing tests:
+
+- **Privilege escalation.** The acknowledged-grant strip was applied to
+  `_cap["merged_fragment"]` — a detached `copy.deepcopy(data)` that exists only
+  so the dispatch PDP has something to read. The blob the agent hydrates is
+  built from `data` afterwards, so acknowledging a revoked grant silenced the
+  check while still shipping the capability. Fixed by moving the strip onto
+  `data` via `resolve_config`'s new `grant_strip` hook, before both the capture
+  and serialization.
+- **A dead end worse than the bug.** Drift was computed as the *caller* but
+  enforced as the *thread owner*. Since `require_thread_owner` lets admins
+  through, an admin resuming another user's drifted thread saw no drift,
+  returned 200, flipped `ended`→`created` with no acknowledgment, and attach
+  then refused — and the cockpit only offers the resume card while `ended`, so
+  the owner could never reach the dialog again.
+- **A broken promise.** §3.2 states a restored connector returns automatically.
+  The acknowledged-id strip was unconditional and the ack map was never pruned,
+  so connectors and projects were dropped forever once acknowledged. Grants
+  already self-healed; connectors and projects now do too.
+- **Two resume buttons.** This document only accounted for the chat page.
+  `sessions-page.component.ts` has its own `/resume` call, which dead-ended with
+  a generic toast. It now classifies the 428 and hands off to the chat page.
+
+### Known open, deliberately deferred
+
+- **Live gate unrun.** §9's dev verification against thread `1930dec9` has not
+  been executed — it needs a push and a deploy. The admin-vs-owner defect above
+  would not have surfaced in any unit suite, so this gate is worth running
+  before trusting the feature.
+- **Two-click handoff from the sessions list.** The 428 precedes the status
+  flip, so the chat page renders its generic ended-card with no indication a
+  resume already ran; the second click surfaces the dialog. Recoverable, but
+  the first click gives no feedback.
+- **Acked items re-prompt on later resumes.** Attach reads
+  `config_drift_ack`, but `_thread_config_drift` still classifies raw
+  `metadata.datasource_ids`, so an acknowledged connector re-prompts on each
+  subsequent resume. One extra dialog, not a dead end.
+- **`summary` is unconsumed.** `drift_labels` ships in the 428 body but the
+  cockpit re-implements the same collapse in `groupDriftForDisplay` — one rule,
+  two implementations.
+- **`_revalidate_thread_datasource_ids` is dead**, and three patches of it in
+  `tests/test_protected_cloud_engage_wiring.py` are now vacuous.
+- **`corrupt_revision` / `workspace_tier`** are excluded from acknowledgement by
+  design, but still deny at attach — so they resume 200 and then hang, the
+  failure shape this feature exists to remove. Rare; §7 does not cover it.
+- **`deleted_by`** exists in migration 0115 but is never written.
+- **No prefill** on "Start a new session" (§8.3): `session-create` reads no
+  query parameter, so it navigates plainly.
+- **`_schedule_protected_engage`** attributes the RO-mount grant to the caller
+  rather than the thread owner — same shape as the admin defect above, but
+  **pre-existing** (blame: `07b9c6b3`, 2026-07-11), untouched by this work.
+  Worth its own ticket.
