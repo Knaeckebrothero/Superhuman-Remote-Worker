@@ -1364,7 +1364,7 @@ describe('PersistentChatService — SSE event dispatch', () => {
         // A dropped live stream (or a reload) must not strand a gate that is
         // still waiting on the user — otherwise it can never be answered and
         // times out. See
-        // docs/issues/supervised_parallel_gates_timeout_fabricates_denial.md.
+        // docs/done/supervised_parallel_gates_timeout_fabricates_denial.md.
         const {service, es} = await setup();
         fireSseMessage(es, {
             method: 'session.state',
@@ -1552,7 +1552,7 @@ describe('PersistentChatService — SSE event dispatch', () => {
         // end. Mapping anything != approved to 'denied' told the user they
         // refused calls they never saw — the same fabricated-denial class the
         // backend fix removed. See
-        // docs/issues/supervised_parallel_gates_timeout_fabricates_denial.md
+        // docs/done/supervised_parallel_gates_timeout_fabricates_denial.md
         const {service, es} = await setup();
         const dispatched: {decision?: string}[] = [];
         const origDispatch = (service as any).dispatch.bind(service);

@@ -3017,7 +3017,7 @@ async def handle_persistent_websocket(ws: WebSocket) -> None:
     # waiting on an answer. The durable row survives, but REST history does
     # not carry it, so without this a reload (or a dropped live stream) leaves
     # the approval card unrenderable and the gate unanswerable — the failure
-    # in docs/issues/supervised_parallel_gates_timeout_fabricates_denial.md.
+    # in docs/done/supervised_parallel_gates_timeout_fabricates_denial.md.
     running_tool = inflight_tool_call(_session.messages) if _tool_inflight else None
     if running_tool is not None:
         running_tool = {
@@ -4727,7 +4727,7 @@ async def _pending_permission_requests() -> List[Dict[str, Any]]:
     re-render an approval card it never received — or received and then lost
     when the live stream dropped. REST history does not carry pending gates,
     so without this a reload leaves the gate stranded and the user has no way
-    to answer it (docs/issues/supervised_parallel_gates_timeout_fabricates_denial.md).
+    to answer it (docs/done/supervised_parallel_gates_timeout_fabricates_denial.md).
 
     Soft-fails to ``[]``: a welcome frame must still go out if this lookup
     breaks.
@@ -4789,7 +4789,7 @@ async def _wait_for_permission_resolution(
     run). Only when untethered — nobody is there to answer — does the slice
     CAS-expire the row so the loop can't hang on a client that isn't coming
     back. A hard interrupt (Stop) always breaks the wait promptly.
-    See docs/issues/supervised_parallel_gates_timeout_fabricates_denial.md.
+    See docs/done/supervised_parallel_gates_timeout_fabricates_denial.md.
     """
     if _session is None or _session.postgres_conn is None:
         return "denied"
@@ -4943,7 +4943,7 @@ async def _loop_permission_check(
                   gone / the DB can't hold a gate), so the call really is off.
       NO_ANSWER — the gate was never answered. NOT a refusal: the loop parks
                   the turn instead of telling the model the user denied it
-                  (docs/issues/supervised_parallel_gates_timeout_fabricates_denial.md).
+                  (docs/done/supervised_parallel_gates_timeout_fabricates_denial.md).
 
     The race-fix from commit 3a1d265: if _terminate_session nulled _session
     while permission_check was being scheduled, this DECLINEs — the session is
