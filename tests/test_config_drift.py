@@ -6,6 +6,7 @@ import pytest
 
 from orchestrator.services.config_drift import (
     DriftItem,
+    blocking_denials,
     collect_config_drift,
     drift_labels,
 )
@@ -242,3 +243,45 @@ def test_drift_labels_collapses_duplicate_labels_with_a_count():
             "ids": ["grant:shell_tools"],
         },
     ]
+
+
+def test_blocking_denials_flags_workspace_tier_and_corrupt_revision():
+    """B: no acknowledgment can make either safe, so both must refuse at
+    resume rather than silently vanish the way collect_config_drift treats
+    them (see test_workspace_tier_verdict_is_not_drift /
+    test_corrupt_revision_verdict_is_not_drift above)."""
+    ids = blocking_denials(
+        [
+            ItemVerdict(DS_OK, True, "workspace_tier"),
+            ItemVerdict(DS_GONE, True, "corrupt_revision"),
+        ],
+        [],
+    )
+    assert ids == [f"connector:{DS_OK}", f"connector:{DS_GONE}"]
+
+
+def test_blocking_denials_ignores_acknowledgeable_and_undenied_verdicts():
+    ids = blocking_denials(
+        [
+            ItemVerdict(DS_GONE, True, "deleted"),
+            ItemVerdict(DS_REVOKED, True, "revoked"),
+            ItemVerdict(DS_OK, True, "out_of_scope"),
+            ItemVerdict(DS_OK, False, None),
+        ],
+        [
+            _ProjectVerdict(PROJECT_GONE, True, "deleted"),
+            _ProjectVerdict(PROJECT_GONE, True, "revoked"),
+            _ProjectVerdict(PROJECT_GONE, False, None),
+        ],
+    )
+    assert ids == []
+
+
+def test_blocking_denials_also_flags_project_verdicts():
+    """The project half of the same generic rule, in case a project verdict
+    ever carries a non-acknowledgeable reason — the function must not be
+    silently connector-only."""
+    ids = blocking_denials(
+        [], [_ProjectVerdict(PROJECT_GONE, True, "corrupt_revision")]
+    )
+    assert ids == [f"project:{PROJECT_GONE}"]

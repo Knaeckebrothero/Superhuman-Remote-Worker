@@ -258,3 +258,38 @@ class TestConnectorStripIsConditionalOnCurrentAvailability:
                 )
 
         assert exc.value.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_strip_still_denied_ack_translates_unavailable_to_403():
+    """D: ``classify_datasource_selection`` can raise
+    ``DatasourceUnavailableError`` directly — a malformed stored id, or a
+    vanished/unapproved owner — rather than returning a per-item verdict,
+    because those checks run BEFORE the per-item loop.
+    ``_strip_still_denied_ack`` called it unwrapped, so with a non-empty ack
+    map that path raised past every FastAPI handler and reached the ASGI
+    layer as an unhandled 500 where every sibling authorizer 403s. This
+    reproduces it with the ack map non-empty (so the call is even reached at
+    all — see the early-return in _strip_still_denied_ack) and a malformed
+    id inside the STORED selection being revalidated.
+    """
+    from fastapi import HTTPException
+
+    from orchestrator.main import _revalidate_thread_datasource_selection
+
+    thread = {
+        "id": "22222222-2222-4222-8222-222222222222",
+        "user_id": OWNER,
+        "metadata": {"config_drift_ack": {f"connector:{DS_OK}": "deleted"}},
+    }
+    db = AsyncMock()
+    db.get_user = AsyncMock(return_value=_owner_row())
+
+    with patch("orchestrator.main.postgres_db", db):
+        with pytest.raises(HTTPException) as exc:
+            await _revalidate_thread_datasource_selection(
+                thread, ["not-a-uuid"], target_project_ids=[]
+            )
+
+    assert exc.value.status_code == 403
+    assert exc.value.detail == "One or more selected connectors are unavailable"

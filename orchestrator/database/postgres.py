@@ -9303,11 +9303,15 @@ class PostgresDB:
         datasource_id: str,
         *,
         authority_project_scope_id: str | None = None,
+        deleted_by: str | None = None,
     ) -> bool:
         """Delete a datasource.
 
         Args:
             datasource_id: Datasource UUID
+            deleted_by: Acting user's id, recorded on the tombstone for
+                audit (migration 0115). ``None`` for internal/system-
+                initiated deletes — never invent an actor for those.
 
         Returns:
             True if deleted, False if not found
@@ -9326,6 +9330,12 @@ class PostgresDB:
             raise DatasourceScopeAuthorizationError(
                 "Connector mutation exceeds the caller's project scope"
             ) from exc
+        try:
+            deleted_by_uuid = UUID(str(deleted_by)) if deleted_by else None
+        except (TypeError, ValueError):
+            # A malformed actor id is an audit-trail cosmetic, not grounds to
+            # block a legitimate delete — record no attribution instead.
+            deleted_by_uuid = None
 
         async with self.acquire() as conn:
             async with _transaction_if(conn, authority_scope_uuid is not None):
@@ -9374,14 +9384,19 @@ class PostgresDB:
                     if result == "DELETE 1":
                         # A deleted row cannot supply its own name later, so
                         # keep one for sessions that still reference it.
+                        # deleted_by_uuid is cast explicitly: an untyped $n
+                        # used only where it can be NULL makes asyncpg's
+                        # PREPARE fail on every call in this codebase.
                         await conn.execute(
                             """
-                            INSERT INTO datasource_tombstones (id, name)
-                            VALUES ($1, $2)
+                            INSERT INTO datasource_tombstones
+                                (id, name, deleted_by)
+                            VALUES ($1, $2, $3::uuid)
                             ON CONFLICT (id) DO NOTHING
                             """,
                             uuid_val,
                             (doomed or {}).get("name") or str(uuid_val),
+                            deleted_by_uuid,
                         )
                         # Scrub the reference so new dangling ids stop
                         # accumulating. Sessions already carrying one are
