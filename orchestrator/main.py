@@ -67,7 +67,7 @@ configure_logging(
     disable_uvicorn_access=True,
 )
 
-from dataclasses import replace  # noqa: E402
+from dataclasses import dataclass, replace  # noqa: E402
 from datetime import date, datetime, timedelta, timezone  # noqa: E402
 from decimal import Decimal  # noqa: E402
 from collections.abc import Coroutine, Mapping  # noqa: E402
@@ -25088,9 +25088,12 @@ async def _thread_project_ids(thread_id: str) -> list[str]:
     """Derive the project-attachment list for a thread from ``thread_mounts``.
 
     Replaces the legacy ``threads.metadata.project_ids`` JSONB read. Phase 1
-    of cloud_collaboration_model.md §9. Only ``mount_kind='project'`` rows
-    contribute — ``project_default`` and ``repo`` rows are different shapes
-    on the agent side.
+    of cloud_collaboration_model.md §9. Both ``mount_kind='project'`` and
+    ``project_default`` rows contribute — see ``_project_ids_from_mounts``,
+    which is what actually filters; ``repo`` rows are the shape excluded here.
+    (This line used to claim ``project_default`` was excluded too. It never
+    was, and reading it that way sends you looking for a bug that isn't there
+    — see docs/issues/session_contacts_never_register_on_default_project.md.)
 
     **Lazy backfill (transitional):** threads that predate the migration
     have ``metadata.project_ids`` set but no ``thread_mounts`` rows. Newer
@@ -27570,6 +27573,40 @@ async def _revalidate_thread_project_ids(
     return await _authorize_thread_project_ids(owner, project_ids)
 
 
+@dataclass(frozen=True)
+class ProjectVerdict:
+    """One project attachment's availability decision."""
+
+    project_id: str
+    denied: bool
+    reason: str | None = None
+
+
+async def _classify_thread_project_ids(
+    user: dict[str, Any], project_ids: list[str] | None
+) -> list[ProjectVerdict]:
+    """Per-item project verdicts. Reporting half of
+    :func:`_authorize_thread_project_ids`, which wraps this."""
+    selected = list(dict.fromkeys(str(value) for value in project_ids or []))
+    verdicts: list[ProjectVerdict] = []
+    for project_id in selected:
+        project = await postgres_db.get_project(project_id)
+        if not project:
+            verdicts.append(ProjectVerdict(project_id, True, "deleted"))
+            continue
+        if user.get("is_admin"):
+            verdicts.append(ProjectVerdict(project_id, False, None))
+            continue
+        role = await postgres_db.get_user_role_in_project(
+            project_id, str(user["id"])
+        )
+        if not role:
+            verdicts.append(ProjectVerdict(project_id, True, "revoked"))
+            continue
+        verdicts.append(ProjectVerdict(project_id, False, None))
+    return verdicts
+
+
 async def _authorize_thread_project_ids(
     user: dict[str, Any], project_ids: list[str] | None
 ) -> list[str]:
@@ -27577,20 +27614,12 @@ async def _authorize_thread_project_ids(
     selected = list(dict.fromkeys(str(value) for value in project_ids or []))
     if not selected:
         return []
-
-    for project_id in selected:
-        project = await postgres_db.get_project(project_id)
-        allowed = bool(project) and bool(user.get("is_admin"))
-        if project and not allowed:
-            role = await postgres_db.get_user_role_in_project(
-                project_id, str(user["id"])
-            )
-            allowed = bool(role)
-        if not allowed:
-            raise HTTPException(
-                status_code=403,
-                detail="One or more attached projects are unavailable",
-            )
+    verdicts = await _classify_thread_project_ids(user, selected)
+    if any(v.denied for v in verdicts):
+        raise HTTPException(
+            status_code=403,
+            detail="One or more attached projects are unavailable",
+        )
     return selected
 
 
