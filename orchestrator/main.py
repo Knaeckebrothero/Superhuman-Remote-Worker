@@ -199,8 +199,11 @@ from services.dispatch_guards import (  # noqa: E402
 )
 from services.config_drift import (  # noqa: E402
     DriftItem,
+    acknowledged_drift_ids,
+    acknowledged_grant_keys,
     collect_config_drift,
     drift_labels,
+    strip_acknowledged,
 )
 from services.datasource_policy import classify_datasource_selection  # noqa: E402
 from services.audit_usage import materialize_llm_usage_from_audit  # noqa: E402
@@ -2532,6 +2535,12 @@ async def _resolve_session_config(
         # interactive.permission_mode and any persistent_agent keys baked into
         # config_override — must fit the runner's grants. GrantDenied escapes the
         # generic except below (fail closed: never deliver the unvetted override).
+        _cap["merged_fragment"] = await _apply_acknowledged_grant_drift(
+            _cap["merged_fragment"],
+            acknowledged=acknowledged_grant_keys(metadata),
+            runner_user_id=user_id,
+            project_ids=[project_id] if project_id else [],
+        )
         await _enforce_dispatch_grants(
             _cap["merged_fragment"],
             runner_user_id=user_id,
@@ -4532,7 +4541,10 @@ async def _send_session_attach_locked(
     # that same result. The generic denial deliberately avoids an enumeration
     # oracle; datasource credentials never reach this log path.
     try:
-        current_project_ids = await _thread_project_ids(thread_id)
+        ack = acknowledged_drift_ids(_meta)
+        current_project_ids = strip_acknowledged(
+            await _thread_project_ids(thread_id), ack, prefix="project"
+        )
         project_ids = await _revalidate_thread_project_ids(_thread, current_project_ids)
         resolved_datasources = await _resolve_authorized_thread_datasources(
             _thread,
@@ -6264,6 +6276,45 @@ async def _enforce_dispatch_grants(
     violations = evaluate(merged, grants)
     if violations:
         raise GrantDenied(violations)
+
+
+async def _apply_acknowledged_grant_drift(
+    merged: dict[str, Any],
+    *,
+    acknowledged: set[str],
+    runner_user_id: str | None,
+    project_ids: list[str],
+) -> dict[str, Any]:
+    """Strip acknowledged grant violations out of a merged config.
+
+    Returns the fragment to enforce against. A violation the user did NOT
+    acknowledge is left in place, so ``_enforce_dispatch_grants`` still denies
+    exactly as it does today — acknowledging one grant must never smuggle a
+    different one through.
+
+    ``strip_to_grants`` is advisory by contract; the authoritative re-check is
+    the ``_enforce_dispatch_grants`` call that immediately follows, which
+    re-runs ``evaluate`` on whatever this returns.
+    """
+    if not acknowledged:
+        return merged
+    from src.core.capability_grants import evaluate, strip_to_grants
+
+    grants = await _resolve_runner_grants(
+        runner_user_id=runner_user_id, project_ids=project_ids
+    )
+    if grants is None:  # admin bypass — nothing to strip
+        return merged
+    violations = evaluate(merged, grants)
+    if not violations:
+        return merged
+    flagged = {v.split(":", 1)[0] for v in violations}
+    if not flagged <= acknowledged:
+        # Something drifted that was never acknowledged. Leave the fragment
+        # untouched and let the dispatch PEP fail closed on all of it.
+        return merged
+    stripped, _dropped = strip_to_grants(merged, grants)
+    return stripped
 
 
 async def _enforce_session_create_grants(
@@ -27492,6 +27543,12 @@ async def _revalidate_thread_datasource_selection(
     create time, avoiding a datasource-enumeration oracle.
     """
     selected = list(dict.fromkeys(str(value) for value in datasource_ids or []))
+    # Acknowledged losses are dropped rather than denied. Narrowing BEFORE
+    # authorization keeps _require_exact_datasource_resolution's fail-closed
+    # comparison intact — it compares resolution against this same list.
+    ack = acknowledged_drift_ids(thread.get("metadata"))
+    if ack:
+        selected = strip_acknowledged(selected, ack, prefix="connector")
     if not selected:
         return [], {}
 
