@@ -688,9 +688,25 @@ export class SessionCreateComponent implements OnInit {
    * selected: a session always runs with *some* expert config, so an empty
    * expert grid would read as broken rather than as an intentional "none",
    * the way an empty project or connector selection reads.
+   *
+   * Fix round 1: gated on `threadPrefill === undefined`, matching its
+   * sibling exactly, for a reason that only shows up under a slow `from`
+   * fetch. Without this guard, a call landing before the thread-prefill
+   * settles falls through to the ORDINARY default (below) and selects and
+   * fetches it — and `fetchExpertDetail`'s `agentSettings.prefillFromConfig`
+   * has no `hasToolEdits()` guard, unlike `loadToolPreview`'s re-anchor, so
+   * it unconditionally resets the tools/model/execution groups. If the
+   * thread-prefill then resolves late and names a DIFFERENT expert, this
+   * function runs again, reselects, and fetches THAT expert too —
+   * triggering a second `prefillFromConfig` that silently wipes whatever the
+   * user touched in the gap between the two. Deferring the ordinary default
+   * the same way the project prefill already does removes the window
+   * entirely: no expert (right or wrong) is selected until we know whether
+   * there's a prefill to prefer. See task-14-report.md, "Fix round 1".
    */
   private applyEffectiveDefault(): void {
     if (this.expertSelectionTouched) return;
+    if (this.threadPrefill === undefined) return; // source-thread fetch (if any) still in flight
     const prefillId = this.threadPrefill?.expertId;
     if (prefillId) {
       const prefillExpert = this.experts().find(e => e.id === prefillId);
