@@ -718,10 +718,15 @@ frame and operator unpark end to end; the tenant A→B residue probe, which need
 a second user identity; and live mid-turn/retention fault injection for the
 control inbox, which is unit-tested rather than cluster-proven.
 
-#### S2 untouched; S3 has its safety foundation but is not enabled
+#### S2 safety gate landed; S3 has its safety foundation but is not enabled
 
-**S2** (workspace sessions): nothing — S1 is lite/virtual only. SSH affinity,
-tmux reattach-if-exists, PVC externalization, the cloud-push generation fence,
+**S2** (workspace sessions): the mandatory first fail-closed gate is built and
+k3d-verified. Stateless human input, new durable controls and the internal
+claim-bundle credential boundary admit only the exact lite tiers
+(`virtual`/`none`); sandbox, VM, missing and future tiers return 409 before an
+attach, and the public paths write no message/control/queue row. The gate stays
+until S2 acceptance passes. SSH affinity, tmux reattach-if-exists, the §6.1
+agent-local-state inventory/externalization, the cloud-push generation fence,
 outbox re-homing, the two resident daemons and presence re-home are all
 outstanding.
 
