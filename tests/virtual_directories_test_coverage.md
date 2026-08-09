@@ -182,11 +182,26 @@ contract's tested-but-unused half is not mistaken for dead code.
 
 ---
 
-## 3. Gate findings (open)
+## 3. Gate findings
 
-### 3.1 Session `contacts/` never registers on the "Default project" path — **Medium**
+Both are now **closed**; kept here because they are the only two defects this
+feature's live gates found, and because §3.1 is a case study in a bug being
+fixed by a commit aimed at something else.
 
-Full write-up: `docs/issues/session_contacts_never_register_on_default_project.md`.
+### 3.1 Session `contacts/` never registers on the "Default project" path — **Medium, RESOLVED on develop**
+
+Fixed by `4f54f599` (2026-08-05), which widened `_thread_project_ids`' backfill
+to consult `threads.project_id` — not by any change to the client guard.
+Re-verified live on local k3d 2026-08-09 (session `da1995b3`, Playwright through
+Cockpit): mount row present, `Registered virtual provider: contacts`, `contacts/`
+listed, and `contacts/README.md` reading back the linked contact. **Still present
+on `main`/prod** — `4f54f599` is develop-only and untagged.
+
+Full write-up, including the measured before/after table and the wider blast
+radius (the same empty `project_ids` also disabled the knowledge store and graph
+tier): `docs/issues/session_contacts_never_register_on_default_project.md`.
+
+The description below is kept as the original finding.
 
 The client-side registration guard in `src/api/persistent_session.py` reads
 `self.project_id` → `project_ids[0]`, which the orchestrator derives **only** from
@@ -200,7 +215,10 @@ No unit test can catch this — it depends on which of two tables a given Cockpi
 flow wrote. Closing it needs either the client guard widened / removed (letting
 the server decide, as it already can) or the two creation paths reconciled.
 
-### 3.2 Dead `tools/` scaffolding — minor
+### 3.2 Dead `tools/` scaffolding — minor, **FIXED 2026-08-07**
+
+`tools/` was dropped from `structure` in `config/worker_base.yaml`, which now
+carries a comment explaining why the prefix must not be listed. Original finding:
 
 `config/worker_base.yaml:50` still lists `tools/` in the workspace `structure`,
 so `WorkspaceManager.initialize()` creates an **empty real `tools/` directory**
