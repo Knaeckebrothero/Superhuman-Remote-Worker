@@ -289,3 +289,65 @@ class TestResumeConfigDrift:
         assert exc.value.status_code == 403
         fake_db.resume_thread.assert_not_awaited()
         fake_db.record_thread_config_drift_ack.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_admin_resuming_another_users_thread_sees_owner_drift(
+        self, user_admin, user_a, thread_a, fake_db, fake_request
+    ):
+        """Regression guard: an admin resuming SOMEONE ELSE's drifted thread
+        must get the OWNER's drift, never a silent 200.
+
+        Before the fix, resume_thread computed drift with ``owner=user`` —
+        the CALLER — and require_thread_owner lets admins through for
+        threads they do not own. Admins pass every classify_* check, so
+        ``_thread_config_drift(..., owner=admin)`` found no drift regardless
+        of what the real owner's config looked like: resume returned 200
+        with NO ack recorded, and the thread flipped ended -> created.
+        Attach then enforces against the REAL owner and refuses — and since
+        the cockpit only offers the resume dialog while status is 'ended',
+        the session became a permanent dead end, strictly worse than the
+        blanket 403 this feature replaced.
+
+        Uses the REAL (unmocked) ``_thread_config_drift`` — mocking it would
+        hide the exact defect, since a stand-in returns the same drift
+        regardless of which owner it is handed. Only the project family is
+        exercised (no ``datasource_ids`` on the thread), which is enough to
+        discriminate: user_a is not a member of ``project_id`` (revoked),
+        while an admin passes ``_classify_thread_project_ids``'s is_admin
+        bypass and sees nothing wrong.
+        """
+        from main import resume_thread
+
+        thread = _ended_thread(thread_a)
+        thread_id = str(thread["id"])
+        project_id = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"
+
+        fake_db.get_user = AsyncMock(return_value=user_a)
+        fake_db.get_project = AsyncMock(return_value={"id": project_id})
+        fake_db.get_user_role_in_project = AsyncMock(return_value=None)
+        fake_db.get_datasource_tombstones = AsyncMock(return_value={})
+
+        with _patch_caller_and_db(user_admin, fake_db):
+            with (
+                patch(
+                    "main._thread_project_ids",
+                    AsyncMock(return_value=[project_id]),
+                ),
+                patch(
+                    "main._resolve_session_config", AsyncMock(return_value=None)
+                ),
+            ):
+                with pytest.raises(HTTPException) as exc:
+                    await resume_thread(thread_id, fake_request)
+
+        assert exc.value.status_code == 428
+        assert exc.value.detail["drift"] == [
+            {
+                "id": f"project:{project_id}",
+                "kind": "project",
+                "reason": "revoked",
+                "label": "a project you no longer have access to",
+            }
+        ]
+        fake_db.resume_thread.assert_not_awaited()
+        fake_db.record_thread_config_drift_ack.assert_not_awaited()
