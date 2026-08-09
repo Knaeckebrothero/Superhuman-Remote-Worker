@@ -562,7 +562,7 @@ After generating each mockup, you MUST self-review before marking the todo compl
 
 ### Step 1: Visual Validation
 
-If `browse_website` is available and a file server is running, open the mockup in the browser and visually inspect it. If not, re-read the generated HTML carefully and mentally render it.
+If the `browser_*` tools are available and a file server is running, use `browser_navigate` to open the mockup and `browser_screenshot` to visually inspect it. If not, re-read the generated HTML carefully and mentally render it.
 
 Check for:
 - Does the layout structure match the intent? (sidebar where expected, content flowing correctly)
