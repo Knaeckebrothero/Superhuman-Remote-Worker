@@ -1074,6 +1074,27 @@ $$;
 
 
 --
+-- Name: notify_thread_control_request(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.notify_thread_control_request() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    PERFORM pg_notify(
+        'thread_control_requests',
+        json_build_object(
+            'id', NEW.id,
+            'thread_id', NEW.thread_id,
+            'request_seq', NEW.request_seq
+        )::text
+    );
+    RETURN NEW;
+END;
+$$;
+
+
+--
 -- Name: notify_thread_permission_update(); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -6373,7 +6394,9 @@ CREATE TABLE public.run_queue (
     consumed_seq bigint,
     queued_at timestamp with time zone DEFAULT now() NOT NULL,
     enqueue_ord bigint NOT NULL,
-    last_leased_by text
+    last_leased_by text,
+    control_input_seq bigint DEFAULT 0 NOT NULL,
+    control_consumed_seq bigint DEFAULT 0 NOT NULL
 );
 
 
@@ -6473,6 +6496,20 @@ COMMENT ON COLUMN public.run_queue.enqueue_ord IS 'Insertion-order tiebreak: fin
 --
 
 COMMENT ON COLUMN public.run_queue.last_leased_by IS 'Pod that most recently claimed this unit (set by the claim, never cleared on completion — that is the point). Feeds the affinity grace in the general claim: for affinity_grace_seconds after a unit is queued, only this pod (or any pod, once the grace lapses) may claim it, so the holder of the warm in-process session wins its own re-claims instead of racing cold pods. Soft optimization ONLY — correctness never depends on it, and the grace is bounded so a dead holder delays a unit by at most that window. Cleared by the reaper on a steal.';
+
+
+--
+-- Name: COLUMN run_queue.control_input_seq; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.run_queue.control_input_seq IS 'Newest control request_seq admitted for this stateless unit. Admission advances it without disturbing a live lease; completion requeues while it is ahead of control_consumed_seq.';
+
+
+--
+-- Name: COLUMN run_queue.control_consumed_seq; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.run_queue.control_consumed_seq IS 'Newest contiguous control request_seq whose owner-written journal result is durable and whose request row has been terminalized under the current lease fence.';
 
 
 --
@@ -7045,6 +7082,49 @@ CREATE TABLE public.system_settings (
 
 
 --
+-- Name: thread_control_requests; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.thread_control_requests (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    thread_id uuid NOT NULL,
+    request_seq bigint NOT NULL,
+    client_request_id uuid NOT NULL,
+    verb text NOT NULL,
+    payload jsonb DEFAULT '{}'::jsonb NOT NULL,
+    requested_by text NOT NULL,
+    requested_at timestamp with time zone DEFAULT now() NOT NULL,
+    accepted_agent_id uuid,
+    outcome text,
+    result jsonb,
+    applied_at timestamp with time zone,
+    applied_lease_token bigint,
+    applied_agent_id uuid,
+    journal_epoch integer,
+    journal_seq bigint,
+    acknowledged_at timestamp with time zone,
+    error_code text,
+    CONSTRAINT thread_control_outcome_value CHECK (((outcome IS NULL) OR (outcome = ANY (ARRAY['applied'::text, 'rejected'::text])))),
+    CONSTRAINT thread_control_payload_object CHECK ((jsonb_typeof(payload) = 'object'::text)),
+    CONSTRAINT thread_control_terminal_shape CHECK ((((outcome IS NULL) AND (result IS NULL) AND (applied_at IS NULL) AND (applied_lease_token IS NULL) AND (applied_agent_id IS NULL) AND (journal_epoch IS NULL) AND (journal_seq IS NULL) AND (acknowledged_at IS NULL) AND (error_code IS NULL)) OR ((outcome IS NOT NULL) AND (result IS NOT NULL) AND (applied_at IS NOT NULL) AND (((applied_lease_token IS NOT NULL) AND (applied_agent_id IS NULL)) OR ((applied_lease_token IS NULL) AND (applied_agent_id IS NOT NULL))) AND (journal_epoch IS NOT NULL) AND (journal_seq IS NOT NULL) AND (acknowledged_at IS NOT NULL))))
+);
+
+
+--
+-- Name: TABLE thread_control_requests; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.thread_control_requests IS 'Durable session control inbox shared by pinned and stateless lanes. The orchestrator admits an owner-authorized request; only the exact serving owner applies it and writes its journal result. outcome remains NULL until the result event is durably committed and terminalization proves the current lease token or exact pinned agent binding.';
+
+
+--
+-- Name: COLUMN thread_control_requests.accepted_agent_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.thread_control_requests.accepted_agent_id IS 'Exact pinned journal-writer credential. Captured under the admission row lock and transferable only to a reciprocal successor before any receipt; NULL for stateless requests. Hostname, IP and pod name are not ownership credentials.';
+
+
+--
 -- Name: thread_events; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -7055,7 +7135,8 @@ CREATE TABLE public.thread_events (
     seq bigint NOT NULL,
     kind text NOT NULL,
     payload jsonb NOT NULL,
-    created_at timestamp with time zone DEFAULT now() NOT NULL
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    control_request_id uuid
 );
 
 
@@ -7085,6 +7166,13 @@ COMMENT ON COLUMN public.thread_events.seq IS 'Monotonic per (thread_id, epoch).
 --
 
 COMMENT ON COLUMN public.thread_events.kind IS 'Frame method: token, thinking, tool.started, tool.completed, turn.started, turn.completed, permission.request, ready, error, session.ended, etc. Same vocabulary as the legacy WS frames.';
+
+
+--
+-- Name: COLUMN thread_events.control_request_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.thread_events.control_request_id IS 'Durable receipt link for an owner-written control result frame. A pending request with this event already committed is validated and finalized without emitting a duplicate frame; the current owner then converges its in-memory scalar from the validated result.';
 
 
 --
@@ -7409,6 +7497,10 @@ CREATE TABLE public.threads (
     extend_count integer DEFAULT 0 NOT NULL,
     execution_lane text DEFAULT 'pinned'::text NOT NULL,
     events_seq_hwm bigint DEFAULT 0 NOT NULL,
+    control_seq_hwm bigint DEFAULT 0 NOT NULL,
+    control_admission_agent_id uuid,
+    narration_mode text,
+    CONSTRAINT valid_narration_mode CHECK ((narration_mode = ANY (ARRAY['silent'::text, 'verbose'::text, 'auto'::text]))),
     CONSTRAINT valid_permission_mode CHECK (((permission_mode)::text = ANY ((ARRAY['supervised'::character varying, 'auto_accept'::character varying, 'autonomous'::character varying])::text[]))),
     CONSTRAINT valid_thread_status CHECK (((status)::text = ANY ((ARRAY['created'::character varying, 'active'::character varying, 'idle'::character varying, 'awaiting_user'::character varying, 'suspended'::character varying, 'ended'::character varying])::text[])))
 );
@@ -7447,6 +7539,27 @@ COMMENT ON COLUMN public.threads.execution_lane IS 'Which execution plane serves
 --
 
 COMMENT ON COLUMN public.threads.events_seq_hwm IS 'Highest seq ever allocated in the CURRENT events_epoch. Survives retention pruning of the thread_events rows themselves; reset to 0 atomically on every epoch bump. Maintained by the agent journal writer''s fenced flush (GREATEST over the batch in the same statement) and pre-incremented by the system-frame allocator (src/shared/event_journal). Attach seeds its in-process counter from GREATEST(events_seq_hwm, MAX(seq) of the epoch). See docs/features/stateless_agents.md §5.3.2.';
+
+
+--
+-- Name: COLUMN threads.control_seq_hwm; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.threads.control_seq_hwm IS 'Highest commit-ordered thread_control_requests.request_seq allocated for this thread. Admission increments it while holding the threads row lock; never allocate request order from an IDENTITY/sequence.';
+
+
+--
+-- Name: COLUMN threads.control_admission_agent_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.threads.control_admission_agent_id IS 'Exact pinned-owner capability and teardown fence. NULL is closed. An inbox-capable reciprocal owner writes its own agent UUID after attach and clears it before its final drain. A stale credential never transfers to a different owner generation.';
+
+
+--
+-- Name: COLUMN threads.narration_mode; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.threads.narration_mode IS 'Durable interactive narration mode (silent | verbose | auto). NULL means the thread still inherits its resolved config; creation and the serving control owner materialize an explicit value.';
 
 
 --
@@ -8964,6 +9077,14 @@ ALTER TABLE ONLY public.system_settings
 
 
 --
+-- Name: thread_control_requests thread_control_requests_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.thread_control_requests
+    ADD CONSTRAINT thread_control_requests_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: thread_events thread_events_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -9057,6 +9178,30 @@ ALTER TABLE ONLY public.experts
 
 ALTER TABLE ONLY public.models
     ADD CONSTRAINT uq_model_provider_v2 UNIQUE (provider_kind, provider_ref, model_id);
+
+
+--
+-- Name: thread_control_requests uq_thread_control_client_request; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.thread_control_requests
+    ADD CONSTRAINT uq_thread_control_client_request UNIQUE (thread_id, client_request_id);
+
+
+--
+-- Name: thread_control_requests uq_thread_control_identity; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.thread_control_requests
+    ADD CONSTRAINT uq_thread_control_identity UNIQUE (id, thread_id);
+
+
+--
+-- Name: thread_control_requests uq_thread_control_request_seq; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.thread_control_requests
+    ADD CONSTRAINT uq_thread_control_request_seq UNIQUE (thread_id, request_seq);
 
 
 --
@@ -9920,6 +10065,20 @@ CREATE INDEX idx_sudo_pending ON public.sudo_approval_requests USING btree (stat
 --
 
 CREATE INDEX idx_sudo_rules_active ON public.sudo_auto_rules USING btree (priority) WHERE (enabled = true);
+
+
+--
+-- Name: idx_thread_control_pending; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_thread_control_pending ON public.thread_control_requests USING btree (thread_id, request_seq) WHERE (outcome IS NULL);
+
+
+--
+-- Name: idx_thread_events_control_request; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX idx_thread_events_control_request ON public.thread_events USING btree (control_request_id) WHERE (control_request_id IS NOT NULL);
 
 
 --
@@ -11085,6 +11244,13 @@ CREATE TRIGGER storage_volume_incarnations_lifecycle_guard BEFORE DELETE OR UPDA
 
 
 --
+-- Name: thread_control_requests thread_control_request_notify_trigger; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER thread_control_request_notify_trigger AFTER INSERT ON public.thread_control_requests FOR EACH ROW EXECUTE FUNCTION public.notify_thread_control_request();
+
+
+--
 -- Name: thread_permission_requests thread_permission_notify_trigger; Type: TRIGGER; Schema: public; Owner: -
 --
 
@@ -12239,6 +12405,22 @@ ALTER TABLE ONLY public.storage_volume_incarnations
 
 ALTER TABLE ONLY public.sudo_approval_requests
     ADD CONSTRAINT sudo_approval_requests_job_id_fkey FOREIGN KEY (job_id) REFERENCES public.jobs(id) ON DELETE CASCADE;
+
+
+--
+-- Name: thread_control_requests thread_control_requests_thread_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.thread_control_requests
+    ADD CONSTRAINT thread_control_requests_thread_id_fkey FOREIGN KEY (thread_id) REFERENCES public.threads(id) ON DELETE CASCADE;
+
+
+--
+-- Name: thread_events thread_events_control_request_thread_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.thread_events
+    ADD CONSTRAINT thread_events_control_request_thread_fkey FOREIGN KEY (control_request_id, thread_id) REFERENCES public.thread_control_requests(id, thread_id);
 
 
 --

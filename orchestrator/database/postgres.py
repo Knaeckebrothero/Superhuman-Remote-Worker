@@ -5386,10 +5386,19 @@ class PostgresDB:
             return False
 
         async with self.acquire() as conn:
-            result = await conn.execute(
-                "DELETE FROM agents WHERE id = $1",
-                uuid_val,
-            )
+            async with conn.transaction():
+                # ``threads.agent_id`` has ON DELETE SET NULL, but the exact
+                # control capability intentionally has no FK. Close it before
+                # deleting the credential row so no stale owner token remains.
+                await conn.execute(
+                    "UPDATE threads SET control_admission_agent_id = NULL "
+                    "WHERE agent_id = $1 OR control_admission_agent_id = $1",
+                    uuid_val,
+                )
+                result = await conn.execute(
+                    "DELETE FROM agents WHERE id = $1",
+                    uuid_val,
+                )
 
         return result == "DELETE 1"
 
@@ -7030,6 +7039,7 @@ class PostgresDB:
         project_id: str | None = None,
         config_name: str = "session_base",
         permission_mode: str = "supervised",
+        narration_mode: str = "auto",
         title: str = "Untitled Session",
         datasource_ids: list[str] | None = None,
         datasource_selection_provenance: Dict[str, Any] | None = None,
@@ -7085,15 +7095,16 @@ class PostgresDB:
                 row = await conn.fetchrow(
                     """
                     INSERT INTO threads (
-                        user_id, project_id, config_name, permission_mode, title,
-                        metadata
+                        user_id, project_id, config_name, permission_mode,
+                        narration_mode, title, metadata
                     )
-                    VALUES ($1, $2, $3, $4, $5, $6::jsonb) RETURNING id
+                    VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb) RETURNING id
                     """,
                     user_id,
                     project_id,
                     config_name,
                     permission_mode,
+                    narration_mode,
                     title,
                     json.dumps(metadata),
                 )
@@ -7216,7 +7227,8 @@ class PostgresDB:
                 """
                 UPDATE threads
                 SET status   = 'ended',
-                    ended_at = CURRENT_TIMESTAMP
+                    ended_at = CURRENT_TIMESTAMP,
+                    control_admission_agent_id = NULL
                 WHERE id = $1
                 """,
                 thread_id,
@@ -7230,6 +7242,7 @@ class PostgresDB:
                 UPDATE threads
                 SET status        = 'created',
                     agent_id      = NULL,
+                    control_admission_agent_id = NULL,
                     ended_at      = NULL,
                     last_activity = CURRENT_TIMESTAMP
                 WHERE id = $1
@@ -7276,7 +7289,11 @@ class PostgresDB:
                 """
                 UPDATE threads
                 SET status        = $2,
-                    last_activity = CURRENT_TIMESTAMP
+                    last_activity = CURRENT_TIMESTAMP,
+                    control_admission_agent_id = CASE
+                        WHEN $2 IN ('ended', 'suspended') THEN NULL
+                        ELSE control_admission_agent_id
+                    END
                 WHERE id = $1
                 """,
                 thread_id,
@@ -7514,7 +7531,8 @@ class PostgresDB:
                 UPDATE threads
                 SET status        = 'ended',
                     ended_at      = CURRENT_TIMESTAMP,
-                    last_activity = CURRENT_TIMESTAMP
+                    last_activity = CURRENT_TIMESTAMP,
+                    control_admission_agent_id = NULL
                 WHERE status IN ('created', 'active')
                   AND agent_id IS NOT NULL
                   AND agent_id IN (SELECT id
@@ -7560,7 +7578,8 @@ class PostgresDB:
                 UPDATE threads
                 SET status        = 'suspended',
                     agent_id      = NULL,
-                    last_activity = CURRENT_TIMESTAMP
+                    last_activity = CURRENT_TIMESTAMP,
+                    control_admission_agent_id = NULL
                 WHERE status IN ('awaiting_user', 'suspended')
                   AND agent_id IS NOT NULL
                   AND agent_id IN (SELECT id
@@ -7766,14 +7785,41 @@ class PostgresDB:
             Number of agent rows deleted.
         """
         async with self.acquire() as conn:
-            result = await conn.execute(
-                """
-                DELETE FROM agents
-                WHERE status = 'offline'
-                  AND last_heartbeat < NOW() - ($1 || ' hours')::INTERVAL
-                """,
-                str(retention_hours),
-            )
+            async with conn.transaction():
+                candidates = await conn.fetch(
+                    """
+                    SELECT id FROM agents
+                    WHERE status = 'offline'
+                      AND last_heartbeat < NOW() - ($1 || ' hours')::INTERVAL
+                    """,
+                    str(retention_hours),
+                )
+                candidate_ids = [row["id"] for row in candidates]
+                if not candidate_ids:
+                    return 0
+                # Preserve admission's thread -> agent lock order. Capturing
+                # the IDs first also prevents a newly-offline agent from being
+                # deleted by a second predicate evaluation before its
+                # non-FK capability was cleared.
+                await conn.execute(
+                    """
+                    UPDATE threads
+                    SET control_admission_agent_id = NULL
+                    WHERE agent_id = ANY($1::uuid[])
+                       OR control_admission_agent_id = ANY($1::uuid[])
+                    """,
+                    candidate_ids,
+                )
+                result = await conn.execute(
+                    """
+                    DELETE FROM agents
+                    WHERE id = ANY($1::uuid[])
+                      AND status = 'offline'
+                      AND last_heartbeat < NOW() - ($2 || ' hours')::INTERVAL
+                    """,
+                    candidate_ids,
+                    str(retention_hours),
+                )
         if result.startswith("DELETE "):
             return int(result.split()[1])
         return 0
@@ -7782,7 +7828,8 @@ class PostgresDB:
         """Bind an agent to a thread."""
         async with self.acquire() as conn:
             await conn.execute(
-                "UPDATE threads SET agent_id = $2 WHERE id = $1",
+                "UPDATE threads SET agent_id = $2, "
+                "control_admission_agent_id = NULL WHERE id = $1",
                 thread_id,
                 agent_id,
             )

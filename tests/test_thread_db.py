@@ -88,6 +88,7 @@ class TestCreateThread:
             project_id=project_id,
             config_name="persistent_defaults",
             permission_mode="autonomous",
+            narration_mode="silent",
             title="My Session",
         )
 
@@ -97,7 +98,8 @@ class TestCreateThread:
         assert call_args[0][2] == project_id  # project_id
         assert call_args[0][3] == "persistent_defaults"  # config_name
         assert call_args[0][4] == "autonomous"  # permission_mode
-        assert call_args[0][5] == "My Session"  # title
+        assert call_args[0][5] == "silent"  # narration_mode
+        assert call_args[0][6] == "My Session"  # title
 
     @pytest.mark.asyncio
     async def test_optional_params_default_none(self):
@@ -126,7 +128,8 @@ class TestCreateThread:
         call_args = conn.fetchrow.call_args
         assert call_args[0][3] == "session_base"  # config_name
         assert call_args[0][4] == "supervised"  # permission_mode
-        assert call_args[0][5] == "Untitled Session"  # title
+        assert call_args[0][5] == "auto"  # narration_mode
+        assert call_args[0][6] == "Untitled Session"  # title
 
 
 # =============================================================================
@@ -265,6 +268,7 @@ class TestEndThread:
         sql = " ".join(conn.execute.call_args[0][0].split())
         assert "status = 'ended'" in sql
         assert "ended_at = CURRENT_TIMESTAMP" in sql
+        assert "control_admission_agent_id = NULL" in sql
         assert conn.execute.call_args[0][1] == "tid-1"
 
     @pytest.mark.asyncio
@@ -275,6 +279,47 @@ class TestEndThread:
 
         # Should not raise
         await db.end_thread("nonexistent")
+
+    @pytest.mark.asyncio
+    async def test_resume_clears_agent_and_control_capability(self):
+        conn = _mock_conn()
+        db = _make_db_with_conn(conn)
+
+        await db.resume_thread("tid-1")
+
+        sql = " ".join(conn.execute.call_args[0][0].split())
+        assert "status = 'created'" in sql
+        assert "agent_id = NULL" in sql
+        assert "control_admission_agent_id = NULL" in sql
+
+
+class TestInactiveThreadControlCapability:
+    """Every reaper-owned inactive transition closes pinned admission."""
+
+    @pytest.mark.asyncio
+    async def test_orphan_end_closes_control_admission(self):
+        conn = _mock_conn()
+        conn.fetch = AsyncMock(return_value=[])
+        db = _make_db_with_conn(conn)
+
+        await db.mark_orphaned_threads_ended()
+
+        sql = " ".join(conn.fetch.call_args[0][0].split())
+        assert "status = 'ended'" in sql
+        assert "control_admission_agent_id = NULL" in sql
+
+    @pytest.mark.asyncio
+    async def test_orphan_suspend_closes_control_admission(self):
+        conn = _mock_conn()
+        conn.fetch = AsyncMock(return_value=[])
+        db = _make_db_with_conn(conn)
+
+        await db.mark_orphaned_threads_suspended()
+
+        sql = " ".join(conn.fetch.call_args[0][0].split())
+        assert "status = 'suspended'" in sql
+        assert "agent_id = NULL" in sql
+        assert "control_admission_agent_id = NULL" in sql
 
 
 # =============================================================================
@@ -295,8 +340,65 @@ class TestUpdateThreadStatus:
         sql = " ".join(conn.execute.call_args[0][0].split())
         assert "status = $2" in sql
         assert "last_activity = CURRENT_TIMESTAMP" in sql
+        assert "WHEN $2 IN ('ended', 'suspended') THEN NULL" in sql
         assert conn.execute.call_args[0][1] == "tid-1"
         assert conn.execute.call_args[0][2] == "idle"
+
+
+class TestAgentDeletionControlCapability:
+    """Agent-row deletion cannot strand its non-FK control credential."""
+
+    @staticmethod
+    def _transactional_conn(*responses: str):
+        conn = _mock_conn()
+        conn.execute = AsyncMock(side_effect=responses)
+        tx = AsyncMock()
+        tx.__aenter__.return_value = None
+        tx.__aexit__.return_value = False
+        conn.transaction = MagicMock(return_value=tx)
+        return conn
+
+    @pytest.mark.asyncio
+    async def test_delete_agent_closes_exact_capability_before_delete(self):
+        conn = self._transactional_conn("UPDATE 1", "DELETE 1")
+        db = _make_db_with_conn(conn)
+
+        deleted = await db.delete_agent("11111111-1111-4111-8111-111111111111")
+
+        assert deleted is True
+        assert conn.execute.await_count == 2
+        assert (
+            "control_admission_agent_id = NULL"
+            in conn.execute.await_args_list[0].args[0]
+        )
+        assert (
+            "agent_id = $1 OR control_admission_agent_id = $1"
+            in (conn.execute.await_args_list[0].args[0])
+        )
+        assert "DELETE FROM agents" in conn.execute.await_args_list[1].args[0]
+
+    @pytest.mark.asyncio
+    async def test_offline_gc_closes_capabilities_in_same_transaction(self):
+        conn = self._transactional_conn("UPDATE 2", "DELETE 2")
+        conn.fetch = AsyncMock(
+            return_value=[
+                {"id": UUID("11111111-1111-4111-8111-111111111111")},
+                {"id": UUID("22222222-2222-4222-8222-222222222222")},
+            ]
+        )
+        db = _make_db_with_conn(conn)
+
+        deleted = await db.gc_offline_agents(retention_hours=24)
+
+        assert deleted == 2
+        assert conn.execute.await_count == 2
+        close_sql = conn.execute.await_args_list[0].args[0]
+        delete_sql = conn.execute.await_args_list[1].args[0]
+        assert "control_admission_agent_id = NULL" in close_sql
+        assert "agent_id = ANY($1::uuid[])" in close_sql
+        assert "ANY($1::uuid[])" in close_sql
+        assert "DELETE FROM agents" in delete_sql
+        assert "status = 'offline'" in delete_sql
 
 
 # =============================================================================

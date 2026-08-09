@@ -2,7 +2,7 @@ import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest';
 import {NgZone, signal} from '@angular/core';
 import {TestBed} from '@angular/core/testing';
 import {HttpClient} from '@angular/common/http';
-import {of, Subject, throwError} from 'rxjs';
+import {NEVER, of, Subject, throwError} from 'rxjs';
 import {TranslocoService} from '@jsverse/transloco';
 import {
     PersistentChatService,
@@ -2532,7 +2532,7 @@ describe('PersistentChatService — resume re-validation (visibility/online)', (
     });
 });
 
-describe('PersistentChatService — control WS (slash commands + permissions)', () => {
+describe('PersistentChatService — control commands', () => {
     let originalEs: any;
     let originalWs: any;
 
@@ -2719,20 +2719,373 @@ describe('PersistentChatService — control WS (slash commands + permissions)', 
         expect(sent).toContainEqual({method: 'upgrade-to-workspace', target_tier: 'vm'});
     });
 
-    it('setMode mutates the signal and sends mode.set', async () => {
+    it('setMode uses the lane-agnostic REST inbox and never the control WS', async () => {
         const ctx = await readySession();
+        ctx.mockHttp.post.mockClear();
         ctx.service.setMode('auto_accept');
-        expect(ctx.service.permissionMode()).toBe('auto_accept');
-        const sent = ctx.wsInstances[0].send.mock.calls.map((c: any) => JSON.parse(c[0]));
-        expect(sent).toContainEqual({method: 'mode.set', mode: 'auto_accept'});
+        expect(ctx.mockHttp.post).toHaveBeenCalledWith(
+            expect.stringMatching(/\/persistent\/threads\/thread-c\/controls$/),
+            {
+                method: 'mode.set',
+                mode: 'auto_accept',
+                client_request_id: expect.any(String),
+            },
+        );
+        expect(ctx.wsInstances[0].send).not.toHaveBeenCalled();
     });
 
-    it('setNarrationMode mutates the signal and sends narration.set', async () => {
+    it('setNarrationMode uses the same REST inbox and never the control WS', async () => {
         const ctx = await readySession();
+        ctx.mockHttp.post.mockClear();
         ctx.service.setNarrationMode('silent');
+        expect(ctx.mockHttp.post).toHaveBeenCalledWith(
+            expect.stringMatching(/\/persistent\/threads\/thread-c\/controls$/),
+            {
+                method: 'narration.set',
+                mode: 'silent',
+                client_request_id: expect.any(String),
+            },
+        );
+        expect(ctx.wsInstances[0].send).not.toHaveBeenCalled();
+    });
+
+    it('submits a setting when the session has no control socket', async () => {
+        const ctx = createService();
+        ctx.mockHttp.get.mockImplementation((url: string) =>
+            url.endsWith('/connection')
+                ? of({state: 'ready', control_socket: 'none'})
+                : activeSessionGet(url),
+        );
+        await ctx.service.connect('thread-socketless-control');
+        fireSseOpen(ctx.sseInstances[0]);
+        ctx.mockHttp.post.mockClear();
+
+        ctx.service.setMode('autonomous');
+
+        expect(ctx.wsInstances).toHaveLength(0);
+        expect(ctx.mockHttp.post).toHaveBeenCalledWith(
+            expect.stringMatching(
+                /\/persistent\/threads\/thread-socketless-control\/controls$/,
+            ),
+            expect.objectContaining({method: 'mode.set', mode: 'autonomous'}),
+        );
+    });
+
+    it('treats HTTP success as admission only and applies the journal result', async () => {
+        const ctx = await readySession();
+        ctx.mockHttp.post.mockClear();
+        ctx.mockHttp.post.mockReturnValue(of({
+            accepted: true,
+            method: 'mode.set',
+            // A response-body scalar must never masquerade as the owner ack.
+            mode: 'autonomous',
+        }));
+
+        ctx.service.setMode('auto_accept');
+        // Neither the optimistic click nor the HTTP response is authority.
+        expect(ctx.service.permissionMode()).toBe('supervised');
+        const requestId = ctx.mockHttp.post.mock.calls[0][1].client_request_id;
+
+        fireSseMessage(ctx.sseInstances[0], {
+            method: 'mode.changed',
+            params: {mode: 'autonomous', client_request_id: requestId},
+        }, '1:2');
+        expect(ctx.service.permissionMode()).toBe('autonomous');
+    });
+
+    it('correlates an owner acknowledgement that beats the HTTP 202', async () => {
+        const ctx = await readySession();
+        const delayedAdmission = new Subject<Record<string, unknown>>();
+        ctx.mockHttp.post.mockClear();
+        ctx.mockHttp.post.mockReturnValue(delayedAdmission.asObservable());
+
+        ctx.service.setMode('auto_accept');
+        const requestId = ctx.mockHttp.post.mock.calls[0][1].client_request_id;
+        expect((ctx.service as any).durableControlAwaitingAck.size).toBe(1);
+
+        fireSseMessage(ctx.sseInstances[0], {
+            method: 'mode.changed',
+            params: {mode: 'auto_accept', client_request_id: requestId},
+        }, '1:2');
+        expect((ctx.service as any).durableControlAwaitingAck.size).toBe(0);
+
+        delayedAdmission.next({accepted: true});
+        delayedAdmission.complete();
+        expect((ctx.service as any).durableControlAwaitingAck.size).toBe(0);
+        expect(ctx.service.permissionMode()).toBe('auto_accept');
+    });
+
+    it('serializes REST controls so a later setting cannot overtake admission', async () => {
+        const ctx = await readySession();
+        const firstAdmission = new Subject<Record<string, unknown>>();
+        ctx.mockHttp.post.mockClear();
+        ctx.mockHttp.post
+            .mockReturnValueOnce(firstAdmission.asObservable())
+            .mockReturnValueOnce(of({accepted: true}));
+
+        ctx.service.setMode('auto_accept');
+        ctx.service.setNarrationMode('silent');
+
+        expect(ctx.mockHttp.post).toHaveBeenCalledTimes(1);
+        expect(ctx.mockHttp.post.mock.calls[0][1]).toMatchObject({method: 'mode.set'});
+
+        firstAdmission.next({accepted: true});
+
+        expect(ctx.mockHttp.post).toHaveBeenCalledTimes(2);
+        expect(ctx.mockHttp.post.mock.calls[1][1]).toMatchObject({
+            method: 'narration.set',
+        });
+    });
+
+    it('coalesces only unsent controls of the same scalar without reordering the other scalar', async () => {
+        const ctx = await readySession();
+        const firstAdmission = new Subject<Record<string, unknown>>();
+        ctx.mockHttp.post.mockClear();
+        ctx.mockHttp.post
+            .mockReturnValueOnce(firstAdmission.asObservable())
+            .mockReturnValue(of({accepted: true}));
+
+        ctx.service.setMode('auto_accept');
+        ctx.service.setNarrationMode('silent');
+        ctx.service.setMode('autonomous');
+        ctx.service.setMode('supervised');
+
+        expect(ctx.mockHttp.post).toHaveBeenCalledTimes(1);
+        const queued = (ctx.service as any).durableControlOutbox.map(
+            (item: any) => item.request,
+        );
+        expect(queued.map((request: any) => request.method)).toEqual([
+            'mode.set',
+            'narration.set',
+            'mode.set',
+        ]);
+        expect(queued.map((request: any) => request.mode)).toEqual([
+            'auto_accept',
+            'silent',
+            'supervised',
+        ]);
+
+        firstAdmission.next({accepted: true});
+
+        expect(ctx.mockHttp.post).toHaveBeenCalledTimes(3);
+        expect(ctx.mockHttp.post.mock.calls.map((call: any[]) => call[1].mode)).toEqual([
+            'auto_accept',
+            'silent',
+            'supervised',
+        ]);
+    });
+
+    it('caps the durable control outbox and reports backpressure', async () => {
+        const ctx = await readySession();
+        ctx.mockHttp.post.mockClear();
+        (ctx.service as any).durableControlOutbox = Array.from(
+            {length: 32},
+            (_, index) => ({
+                threadId: `other-thread-${index}`,
+                request: {
+                    method: 'mode.set',
+                    mode: 'supervised',
+                    client_request_id: `existing-${index}`,
+                },
+                attempts: 0,
+            }),
+        );
+
+        ctx.service.setMode('auto_accept');
+
+        expect(ctx.mockHttp.post).not.toHaveBeenCalled();
+        expect((ctx.service as any).durableControlOutbox).toHaveLength(32);
+        expect(ctx.service.error()).toBe('chat.control.backpressure');
+    });
+
+    it('retries an ambiguous admission with the same UUID before later controls', async () => {
+        vi.useFakeTimers();
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+        const ctx = await readySession();
+        try {
+            ctx.mockHttp.post.mockClear();
+            ctx.mockHttp.post
+                .mockReturnValueOnce(throwError(() => ({status: 0})))
+                .mockReturnValueOnce(of({accepted: true, duplicate: true}))
+                .mockReturnValueOnce(of({accepted: true}));
+
+            ctx.service.setMode('auto_accept');
+            ctx.service.setNarrationMode('verbose');
+
+            expect(ctx.mockHttp.post).toHaveBeenCalledTimes(1);
+            await vi.advanceTimersByTimeAsync(250);
+
+            expect(ctx.mockHttp.post).toHaveBeenCalledTimes(3);
+            const requests = ctx.mockHttp.post.mock.calls.map((call: any[]) => call[1]);
+            expect(requests.map((request: any) => request.method)).toEqual([
+                'mode.set',
+                'mode.set',
+                'narration.set',
+            ]);
+            expect(requests[1].client_request_id).toBe(requests[0].client_request_id);
+            expect(requests[2].client_request_id).not.toBe(requests[0].client_request_id);
+        } finally {
+            ctx.service.disconnect();
+            warn.mockRestore();
+            vi.useRealTimers();
+        }
+    });
+
+    it('retries a 425 owner-not-ready response with the same UUID', async () => {
+        vi.useFakeTimers();
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+        const ctx = await readySession();
+        try {
+            ctx.mockHttp.post.mockClear();
+            ctx.mockHttp.post
+                .mockReturnValueOnce(throwError(() => ({status: 425})))
+                .mockReturnValueOnce(of({accepted: true}));
+
+            ctx.service.setNarrationMode('verbose');
+            const firstRequest = ctx.mockHttp.post.mock.calls[0][1];
+            await vi.advanceTimersByTimeAsync(250);
+
+            expect(ctx.mockHttp.post).toHaveBeenCalledTimes(2);
+            expect(ctx.mockHttp.post.mock.calls[1][1]).toEqual(firstRequest);
+        } finally {
+            ctx.service.disconnect();
+            warn.mockRestore();
+            vi.useRealTimers();
+        }
+    });
+
+    it('never replaces an ambiguous retry head with a newer same-scalar UUID', async () => {
+        vi.useFakeTimers();
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+        const ctx = await readySession();
+        try {
+            ctx.mockHttp.post.mockClear();
+            ctx.mockHttp.post
+                .mockReturnValueOnce(throwError(() => ({status: 0})))
+                .mockReturnValueOnce(of({accepted: true, duplicate: true}))
+                .mockReturnValueOnce(of({accepted: true}));
+
+            ctx.service.setMode('auto_accept');
+            const ambiguous = ctx.mockHttp.post.mock.calls[0][1];
+            ctx.service.setMode('autonomous');
+
+            const queued = (ctx.service as any).durableControlOutbox.map(
+                (item: any) => item.request,
+            );
+            expect(queued.map((request: any) => request.mode)).toEqual([
+                'auto_accept',
+                'autonomous',
+            ]);
+            expect(queued[0].client_request_id).toBe(ambiguous.client_request_id);
+
+            await vi.advanceTimersByTimeAsync(250);
+
+            expect(ctx.mockHttp.post).toHaveBeenCalledTimes(3);
+            const requests = ctx.mockHttp.post.mock.calls.map((call: any[]) => call[1]);
+            expect(requests.map((request: any) => request.mode)).toEqual([
+                'auto_accept',
+                'auto_accept',
+                'autonomous',
+            ]);
+            expect(requests[1].client_request_id).toBe(ambiguous.client_request_id);
+            expect(requests[2].client_request_id).not.toBe(ambiguous.client_request_id);
+        } finally {
+            ctx.service.disconnect();
+            warn.mockRestore();
+            vi.useRealTimers();
+        }
+    });
+
+    it('times out a hung admission and retries it with the same UUID', async () => {
+        vi.useFakeTimers();
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+        const ctx = await readySession();
+        try {
+            ctx.mockHttp.post.mockClear();
+            ctx.mockHttp.post
+                .mockReturnValueOnce(NEVER)
+                .mockReturnValueOnce(of({accepted: true, duplicate: true}));
+
+            ctx.service.setMode('auto_accept');
+            const firstRequest = ctx.mockHttp.post.mock.calls[0][1];
+
+            await vi.advanceTimersByTimeAsync(14_999);
+            expect(ctx.mockHttp.post).toHaveBeenCalledTimes(1);
+
+            await vi.advanceTimersByTimeAsync(1);
+            expect(ctx.mockHttp.post).toHaveBeenCalledTimes(1);
+
+            await vi.advanceTimersByTimeAsync(250);
+            expect(ctx.mockHttp.post).toHaveBeenCalledTimes(2);
+            const retryRequest = ctx.mockHttp.post.mock.calls[1][1];
+            expect(retryRequest.client_request_id).toBe(firstRequest.client_request_id);
+            expect(retryRequest).toMatchObject({method: 'mode.set', mode: 'auto_accept'});
+        } finally {
+            ctx.service.disconnect();
+            warn.mockRestore();
+            vi.useRealTimers();
+        }
+    });
+
+    it('surfaces an owner control rejection from the durable journal', async () => {
+        const ctx = await readySession();
+
+        fireSseMessage(ctx.sseInstances[0], {
+            method: 'control.rejected',
+            params: {method: 'mode.set', error_code: 'stale_owner'},
+        }, '1:2');
+
+        expect(ctx.service.error()).toBe('chat.control.ownerRejected');
+    });
+
+    it('only a newer same-scalar acknowledgement clears a local admission error', async () => {
+        const ctx = await readySession();
+        ctx.mockHttp.post.mockClear();
+        ctx.mockHttp.post
+            .mockReturnValueOnce(of({accepted: true}))
+            .mockReturnValueOnce(throwError(() => ({status: 409})))
+            .mockReturnValueOnce(of({accepted: true}));
+
+        ctx.service.setMode('auto_accept');
+        const olderRequestId = ctx.mockHttp.post.mock.calls[0][1].client_request_id;
+        ctx.service.setMode('autonomous');
+        expect(ctx.service.error()).toBe('chat.control.admissionFailed');
+
+        fireSseMessage(ctx.sseInstances[0], {
+            method: 'mode.changed',
+            params: {mode: 'auto_accept', client_request_id: olderRequestId},
+        }, '1:2');
+        expect(ctx.service.permissionMode()).toBe('auto_accept');
+        expect(ctx.service.error()).toBe('chat.control.admissionFailed');
+
+        ctx.service.setMode('supervised');
+        const newerRequestId = ctx.mockHttp.post.mock.calls[2][1].client_request_id;
+        fireSseMessage(ctx.sseInstances[0], {
+            method: 'mode.changed',
+            params: {mode: 'supervised', client_request_id: newerRequestId},
+        }, '1:3');
+        expect(ctx.service.permissionMode()).toBe('supervised');
+        expect(ctx.service.error()).toBeNull();
+    });
+
+    it('does not clear a mode failure for an unrelated narration acknowledgement', async () => {
+        const ctx = await readySession();
+        ctx.mockHttp.post.mockClear();
+        ctx.mockHttp.post
+            .mockReturnValueOnce(throwError(() => ({status: 409})))
+            .mockReturnValueOnce(of({accepted: true}));
+
+        ctx.service.setMode('autonomous');
+        expect(ctx.service.error()).toBe('chat.control.admissionFailed');
+        ctx.service.setNarrationMode('silent');
+        const narrationId = ctx.mockHttp.post.mock.calls[1][1].client_request_id;
+        fireSseMessage(ctx.sseInstances[0], {
+            method: 'narration.changed',
+            params: {mode: 'silent', client_request_id: narrationId},
+        }, '1:2');
+
         expect(ctx.service.narrationMode()).toBe('silent');
-        const sent = ctx.wsInstances[0].send.mock.calls.map((c: any) => JSON.parse(c[0]));
-        expect(sent).toContainEqual({method: 'narration.set', mode: 'silent'});
+        expect(ctx.service.error()).toBe('chat.control.admissionFailed');
     });
 
     it('updateConfig forwards the config object over the WS with a request_id', async () => {

@@ -974,7 +974,13 @@ class OrchestratorClient:
             logger.error(f"Unexpected error during deregistration: {e}")
             return False
 
-    async def update_thread_status(self, thread_id: str, status: str) -> bool:
+    async def update_thread_status(
+        self,
+        thread_id: str,
+        status: str,
+        *,
+        pinned_agent_id: Optional[str] = None,
+    ) -> bool:
         """Update thread status via orchestrator REST.
 
         Args:
@@ -989,7 +995,10 @@ class OrchestratorClient:
             return False
         url = f"{self.orchestrator_url}/api/agents/threads/{thread_id}/status"
         try:
-            r = await self._client.put(url, json={"status": status})
+            body = {"status": status}
+            if pinned_agent_id is not None:
+                body["agent_id"] = pinned_agent_id
+            r = await self._client.put(url, json=body)
             return r.status_code == 200
         except Exception as e:
             logger.warning(f"Thread status update failed (non-fatal): {e}")
