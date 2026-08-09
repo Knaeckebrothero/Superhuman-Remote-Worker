@@ -96,6 +96,30 @@ export function asRecord(value: unknown): Record<string, unknown> | null {
     return null;
 }
 
+/**
+ * Job statuses that have a `jobs.status.*` label in the locale files.
+ *
+ * Mirrors the `valid_status` CHECK constraint on `jobs`
+ * (`0001_initial.sql:557`) — keep the two in step, and add the locale entry in
+ * BOTH `en.json` and `de-DE.json` when the server gains a status, or the badge
+ * silently degrades to the raw enum.
+ *
+ * Exists so the label can be resolved by the `transloco` pipe (which handles
+ * catalogue loading and language switches) while still falling back to the raw
+ * value for an unknown status. Resolving it with `TranslocoService.translate()`
+ * inside a `computed()` looks simpler and is wrong: the call emits a transloco
+ * event, and emitting during template evaluation trips NG0600.
+ */
+const LABELLED_JOB_STATUSES: ReadonlySet<string> = new Set([
+    'created', 'processing', 'completed', 'failed', 'cancelled',
+    'pending_review', 'paused', 'reviewing', 'waiting', 'waiting_for_reply',
+]);
+
+/** i18n key for a job status, or null when it has no label to fall back from. */
+export function jobStatusLabelKey(status: string | null | undefined): string | null {
+    return status && LABELLED_JOB_STATUSES.has(status) ? `jobs.status.${status}` : null;
+}
+
 /** Badge tone for a job status. Single source of truth for all three surfaces. */
 export function jobStatusTone(status: string): BadgeTone {
     switch (status) {

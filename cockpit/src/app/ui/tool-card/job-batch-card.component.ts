@@ -48,9 +48,12 @@ import {JobToolCardPanelComponent} from './job-tool-card-panel.component';
         <app-icon size="sm" class="jb__chevron">{{ open() ? 'expand_more' : 'chevron_right' }}</app-icon>
         <app-icon size="sm" class="jb__icon">rocket_launch</app-icon>
         <span class="jb__title">{{ 'toolCard.jobBatch.title' | transloco:{count: total()} }}</span>
-        <span class="jb__meta">{{ 'toolCard.jobBatch.done' | transloco:{done: doneCount(), total: total()} }}</span>
+        <span class="jb__meta">{{ 'toolCard.jobBatch.finished' | transloco:{done: finishedCount(), total: total()} }}</span>
         @if (reviewCount(); as n) {
-          <span class="jb__review">{{ 'toolCard.jobBatch.review' | transloco:{count: n} }}</span>
+          <span class="jb__chip jb__review">{{ 'toolCard.jobBatch.review' | transloco:{count: n} }}</span>
+        }
+        @if (failedCount(); as n) {
+          <span class="jb__chip jb__failedChip">{{ 'toolCard.jobBatch.failed' | transloco:{count: n} }}</span>
         }
       </button>
 
@@ -68,7 +71,7 @@ import {JobToolCardPanelComponent} from './job-tool-card-panel.component';
                 <!-- The call never returned an id: it failed, or was denied.
                      There is no row to watch, so say so instead of rendering an
                      empty panel that polls nothing. -->
-                <div class="jb__failed">
+                <div class="jb__notCreated">
                   <app-icon size="xs">error</app-icon>
                   <span>{{ v.error || ('toolCard.jobBatch.notCreated' | transloco) }}</span>
                 </div>
@@ -82,31 +85,40 @@ import {JobToolCardPanelComponent} from './job-tool-card-panel.component';
     styles: `
     :host { display: block; }
     .jb {
-      border: 1px solid var(--border-color, rgba(127,127,127,0.3));
-      border-radius: 7px; overflow: hidden;
+      border: 1px solid var(--border-color);
+      border-radius: var(--radius-surface); overflow: hidden;
     }
     .jb__head {
       display: flex; align-items: center; gap: 6px; width: 100%;
       padding: 6px 8px; background: transparent; border: 0; color: inherit;
       font: inherit; font-size: 12px; text-align: left; cursor: pointer;
     }
-    .jb__head:hover { background: rgba(127,127,127,0.08); }
+    .jb__head:hover { background: var(--hover); }
     .jb__chevron, .jb__icon { opacity: 0.7; flex: none; }
     .jb__title { font-weight: 600; }
-    .jb__meta { opacity: 0.65; font-size: 11.5px; }
-    .jb__review { color: var(--warning-color, #c79a3a); font-size: 11.5px; }
+    .jb__meta { color: var(--text-secondary); font-size: 11.5px; }
+    /* Tinted pills, not bare coloured text. --warning on this surface is 2.7:1 —
+       below AA, and it was carrying the one signal in the card that means
+       "something needs you". A tint block is the shared badge/button treatment
+       and reads as a status, not as decoration. */
+    .jb__chip {
+      font-size: 11px; line-height: 1.5; padding: 0 6px;
+      border-radius: var(--radius-pill); white-space: nowrap;
+    }
+    .jb__review { background: var(--warning-tint); color: var(--warning); }
+    .jb__failedChip { background: var(--danger-tint); color: var(--danger); }
     .jb__rows { display: flex; flex-direction: column; }
     .jb__row {
       padding: 6px 8px 8px;
-      border-top: 1px solid var(--border-color, rgba(127,127,127,0.18));
+      border-top: 1px solid var(--border-color);
     }
     .jb__label {
       font-size: 12px; line-height: 1.4; margin-bottom: 2px;
       overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
     }
-    .jb__failed {
+    .jb__notCreated {
       display: flex; align-items: center; gap: 4px;
-      font-size: 11.5px; color: var(--danger-color, #e5534b);
+      font-size: 11.5px; color: var(--danger);
     }
   `,
 })
@@ -134,10 +146,23 @@ export class JobBatchCardComponent {
     });
 
     protected readonly total = computed(() => this.views().length);
-    protected readonly doneCount = computed(
+
+    /**
+     * "Finished", not "done".
+     *
+     * This counter includes `failed` and `cancelled` — a job that failed has
+     * stopped, but calling it done implies it succeeded. A batch of one
+     * completed, one failed and one cancelled job read "2/3 done", which is a
+     * lie about the outcome. {@link failedCount} carries the bad news
+     * separately so the header states the outcome instead of averaging it away.
+     */
+    protected readonly finishedCount = computed(
         () => this.jobs().filter((j) => j && isTerminalJobStatus(j.status)).length,
     );
     protected readonly reviewCount = computed(
         () => this.jobs().filter((j) => j?.status === 'pending_review').length,
+    );
+    protected readonly failedCount = computed(
+        () => this.jobs().filter((j) => j?.status === 'failed').length,
     );
 }

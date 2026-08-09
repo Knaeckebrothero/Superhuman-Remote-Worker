@@ -71,7 +71,8 @@ describe('JobBatchCardComponent', () => {
                             toolCard: {
                                 jobBatch: {
                                     title: '{{count}} jobs dispatched',
-                                    done: '{{done}}/{{total}} done',
+                                    finished: '{{done}}/{{total}} finished',
+                                    failed: '{{count}} failed',
                                     review: '{{count}} awaiting review',
                                     notCreated: 'Job was not created',
                                 },
@@ -106,20 +107,24 @@ describe('JobBatchCardComponent', () => {
         // b/c never polled -> null. The header must not claim they are done.
         await render([view('a'), view('b'), view('c')], [['a', 'completed']]);
         expect(text('.jb__title')).toBe('3 jobs dispatched');
-        expect(text('.jb__meta')).toBe('1/3 done');
+        expect(text('.jb__meta')).toBe('1/3 finished');
         expect(root().querySelector('.jb__review')).toBeNull();
     });
 
-    it('counts cancelled and failed as done — the batch is finished either way', async () => {
+    it('says finished, not done, and names the failures separately', async () => {
+        // "2/2 done" for one failed and one cancelled job is a lie about the
+        // outcome. Finished is true of all three terminal states; the failure
+        // count carries the bad news instead of averaging it away.
         await render([view('a'), view('b')], [['a', 'failed'], ['b', 'cancelled']]);
-        expect(text('.jb__meta')).toBe('2/2 done');
+        expect(text('.jb__meta')).toBe('2/2 finished');
+        expect(text('.jb__failedChip')).toBe('1 failed');
     });
 
     it('calls out jobs waiting on the user', async () => {
         await render([view('a'), view('b')], [['a', 'pending_review'], ['b', 'completed']]);
         expect(text('.jb__review')).toBe('1 awaiting review');
         // pending_review is not terminal, so it is not counted as done.
-        expect(text('.jb__meta')).toBe('1/2 done');
+        expect(text('.jb__meta')).toBe('1/2 finished');
     });
 
     it('renders one row per call, with the dispatch description', async () => {
@@ -132,12 +137,12 @@ describe('JobBatchCardComponent', () => {
     it('says so when a dispatch never produced a job, instead of an empty panel', async () => {
         await render([view('a'), view(null, 'denied one', 'Grant denied')]);
         expect(root().querySelectorAll('app-job-tool-card-panel')).toHaveLength(1);
-        expect(text('.jb__failed')).toContain('Grant denied');
+        expect(text('.jb__notCreated')).toContain('Grant denied');
     });
 
     it('falls back to a generic line when the failed call carries no error text', async () => {
         await render([view('a'), view(null, 'nameless')]);
-        expect(text('.jb__failed')).toContain('Job was not created');
+        expect(text('.jb__notCreated')).toContain('Job was not created');
     });
 
     it('opens by default and collapses on demand — never the other way round', async () => {
