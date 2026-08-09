@@ -144,9 +144,12 @@ async def classify_datasource_selection(
     """Per-item availability verdicts plus the policy snapshot of allowed rows.
 
     The reporting half of :func:`authorize_datasource_selection`, which is now a
-    thin wrapper over this. Conditions that mean *corruption* rather than drift
-    — malformed uuids, a vanished owner row, an unreadable policy_revision —
-    still raise here, because no acknowledgment can make them safe.
+    thin wrapper over this. Malformed uuids and a vanished owner row still raise
+    here because both were checked BEFORE the per-item loop pre-refactor, so
+    raising early is faithful. An unreadable ``policy_revision`` is reported as
+    a ``corrupt_revision`` verdict instead, preserving list order; the wrapper
+    turns it into the same generic denial the original raised. Corruption is not
+    drift — it is not an acknowledgeable reason.
 
     ``workspace_tier`` is returned as a verdict rather than raised so the caller
     controls precedence; see the wrapper.
