@@ -183,6 +183,12 @@ from services.session_wake import (  # noqa: E402
 from services.session_state_snapshot import (  # noqa: E402
     build_session_state_snapshot,
 )
+from services.thread_control_inbox import (  # noqa: E402
+    ControlAdmissionError,
+    ControlAdmissionNotReady,
+    admit_thread_control,
+    find_existing_thread_control,
+)
 from services.stale_verification_sweeper import (  # noqa: E402
     stale_verification_sweeper_loop,
 )
@@ -4426,7 +4432,8 @@ async def _bind_registered_persistent_agent(
     async with postgres_db.acquire() as conn:
         if expected_agent_id is None:
             bound = await conn.execute(
-                "UPDATE threads SET agent_id = $2 "
+                "UPDATE threads SET agent_id = $2, "
+                "control_admission_agent_id = NULL "
                 "WHERE id = $1 AND execution_lane = $3 AND agent_id IS NULL",
                 thread_id,
                 agent_id,
@@ -4434,7 +4441,8 @@ async def _bind_registered_persistent_agent(
             )
         else:
             bound = await conn.execute(
-                "UPDATE threads SET agent_id = $2 "
+                "UPDATE threads SET agent_id = $2, "
+                "control_admission_agent_id = NULL "
                 "WHERE id = $1 AND execution_lane = $3 AND agent_id = $4",
                 thread_id,
                 agent_id,
@@ -4529,18 +4537,12 @@ async def _reserve_session_attach_binding(agent_id: str, thread_id: str) -> bool
     try:
         async with postgres_db.acquire() as conn:
             async with conn.transaction():
-                agent_bound = await conn.execute(
-                    "UPDATE agents SET thread_id = $2, status = 'session' "
-                    "WHERE id = $1 AND thread_id IS NULL "
-                    "AND current_job_id IS NULL AND status = 'ready'",
-                    agent_id,
-                    thread_id,
-                )
-                if agent_bound != "UPDATE 1":
-                    raise RuntimeError("agent is no longer idle")
-
+                # Match control admission's lock order: threads -> agents.
+                # Taking these in the opposite order creates a deterministic
+                # deadlock when a control is admitted during a warm bind.
                 thread_bound = await conn.execute(
-                    "UPDATE threads SET agent_id = $2 "
+                    "UPDATE threads SET agent_id = $2, "
+                    "control_admission_agent_id = NULL "
                     "WHERE id = $1 AND execution_lane = $3 "
                     "AND agent_id IS NULL",
                     thread_id,
@@ -4551,6 +4553,16 @@ async def _reserve_session_attach_binding(agent_id: str, thread_id: str) -> bool
                     raise RuntimeError(
                         "thread is no longer detached on the pinned lane"
                     )
+
+                agent_bound = await conn.execute(
+                    "UPDATE agents SET thread_id = $2, status = 'session' "
+                    "WHERE id = $1 AND thread_id IS NULL "
+                    "AND current_job_id IS NULL AND status = 'ready'",
+                    agent_id,
+                    thread_id,
+                )
+                if agent_bound != "UPDATE 1":
+                    raise RuntimeError("agent is no longer idle")
         return True
     except Exception as exc:
         logger.info(
@@ -4677,6 +4689,29 @@ async def _assemble_session_attach_payload(
             thread_id,
         )
         return None
+
+    # Control-inbox scalar persistence is first-class on ``threads``. Overlay
+    # materialized values at the final delivery edge for BOTH resolution modes
+    # so a handoff cannot resurrect an older config value. Narration remains
+    # NULL for legacy rows whose value is inherited through an expert/account
+    # layer that migration SQL cannot resolve; those rows keep the resolved
+    # value until creation/control materializes one.
+    interactive_scalars = {
+        "permission_mode": str(_thread.get("permission_mode") or "supervised"),
+    }
+    if _thread.get("narration_mode") is not None:
+        interactive_scalars["narration_mode"] = str(_thread["narration_mode"])
+    if resolved_config is not None:
+        resolved_config = dict(resolved_config)
+        resolved_agent = dict(resolved_config.get("agent") or {})
+        resolved_interactive = dict(resolved_agent.get("interactive") or {})
+        resolved_interactive.update(interactive_scalars)
+        resolved_agent["interactive"] = resolved_interactive
+        resolved_config["agent"] = resolved_agent
+    else:
+        config_override = _deep_merge_dicts(
+            dict(config_override or {}), {"interactive": interactive_scalars}
+        )
 
     return {
         "thread_id": thread_id,
@@ -25160,6 +25195,9 @@ async def agent_create_thread(
             capture=create_capture,
         )
         effective_backend = _backend_from_override(create_capture["merged_fragment"])
+        effective_narration_mode = (
+            create_capture["merged_fragment"].get("interactive") or {}
+        ).get("narration_mode") or "auto"
         config_override: dict[str, Any] = {}
         if effective_backend:
             config_override = {"workspace": {"backend": effective_backend}}
@@ -25168,6 +25206,7 @@ async def agent_create_thread(
             user_id=None,
             config_name=config_name,
             permission_mode=body.permission_mode,
+            narration_mode=effective_narration_mode,
             title=body.title,
             datasource_ids=[],
             datasource_selection_provenance={
@@ -25888,6 +25927,10 @@ async def agent_get_thread_lifecycle(
 
 class AgentThreadStatusRequest(BaseModel):
     status: str
+    # Optional exact owner credential for pinned teardown. Stateless callers
+    # and legacy status writes omit it; when supplied, the status transition is
+    # serialized with the reciprocal thread/agent binding.
+    agent_id: UUID | None = None
 
 
 class OfficerWakeRequest(BaseModel):
@@ -26413,6 +26456,83 @@ async def agent_update_thread_status(
             status_code=400,
             detail=f"Status must be one of: {valid_statuses}",
         )
+    if body.agent_id is not None:
+        if body.status != "ended":
+            raise HTTPException(
+                status_code=400,
+                detail="Exact pinned-owner fencing is supported only for ended",
+            )
+        agent_id = body.agent_id
+        async with postgres_db.acquire() as conn:
+            async with conn.transaction():
+                thread_record = await conn.fetchrow(
+                    "SELECT id, agent_id, execution_lane, status, metadata, "
+                    "project_id, title "
+                    "FROM threads WHERE id = $1::uuid FOR UPDATE",
+                    thread_id,
+                )
+                if (
+                    thread_record is None
+                    or str(thread_record["execution_lane"] or "") != "pinned"
+                    or thread_record["agent_id"] != agent_id
+                ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Pinned session ownership changed before teardown",
+                    )
+                reciprocal = await conn.fetchval(
+                    "SELECT 1 FROM agents WHERE id = $1::uuid "
+                    "AND thread_id = $2::uuid FOR SHARE",
+                    agent_id,
+                    thread_id,
+                )
+                if reciprocal is None:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Pinned session ownership is not reciprocal",
+                    )
+
+                thread_row = dict(thread_record)
+                officer = _officer_meta_enabled(_thread_officer_meta(thread_row))
+                if officer:
+                    updated = await conn.fetchval(
+                        "UPDATE threads "
+                        "SET status = 'suspended', agent_id = NULL, "
+                        "    control_admission_agent_id = NULL, "
+                        "    awaiting_user_since = NULL "
+                        "WHERE id = $1::uuid AND agent_id = $2::uuid "
+                        "RETURNING id",
+                        thread_id,
+                        agent_id,
+                    )
+                    result_status = "suspended"
+                else:
+                    updated = await conn.fetchval(
+                        "UPDATE threads "
+                        "SET status = 'ended', ended_at = CURRENT_TIMESTAMP, "
+                        "    control_admission_agent_id = NULL "
+                        "WHERE id = $1::uuid AND agent_id = $2::uuid "
+                        "AND status <> 'suspended' RETURNING id",
+                        thread_id,
+                        agent_id,
+                    )
+                    result_status = "ended"
+                if updated is None:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Pinned session ownership changed before teardown",
+                    )
+
+        if result_status == "suspended":
+            logger.info(
+                "Officer thread %s: exact-owner agent 'ended' mapped to "
+                "'suspended' (watchdog will respawn)",
+                thread_id[:8],
+            )
+        else:
+            asyncio.create_task(_suspend_thread_resources(thread_id))
+            await _conclude_conference_if_any(thread_row)
+        return {"status": result_status}
     try:
         if body.status == "ended":
             # Officer sessions (centurion.md §4): an agent-side 'ended' is a
@@ -26433,6 +26553,7 @@ async def agent_update_thread_status(
                     await conn.execute(
                         "UPDATE threads "
                         "SET status = 'suspended', agent_id = NULL, "
+                        "    control_admission_agent_id = NULL, "
                         "    awaiting_user_since = NULL "
                         "WHERE id = $1 AND status <> 'ended'",
                         thread_id,
@@ -26451,7 +26572,8 @@ async def agent_update_thread_status(
             async with postgres_db.acquire() as conn:
                 updated = await conn.fetchval(
                     "UPDATE threads "
-                    "SET status = 'ended', ended_at = CURRENT_TIMESTAMP "
+                    "SET status = 'ended', ended_at = CURRENT_TIMESTAMP, "
+                    "    control_admission_agent_id = NULL "
                     "WHERE id = $1 AND status <> 'suspended' "
                     "RETURNING id",
                     thread_id,
@@ -26559,7 +26681,8 @@ async def agent_suspend_thread(request: Request, thread_id: str) -> dict[str, An
     async with postgres_db.acquire() as conn:
         updated = await conn.fetchval(
             "UPDATE threads "
-            "SET status = 'suspended', agent_id = NULL "
+            "SET status = 'suspended', agent_id = NULL, "
+            "    control_admission_agent_id = NULL "
             "WHERE id = $1 AND status IN ('created', 'active', 'awaiting_user') "
             "RETURNING id",
             thread_id,
@@ -26653,6 +26776,19 @@ async def _apply_thread_config_update(
     (``actor`` is the resolved caller for owner-facing requests, None for
     internal ones — the recorded path distinguishes the two).
     """
+    interactive = config_override.get("interactive")
+    if isinstance(interactive, dict) and {
+        "permission_mode",
+        "narration_mode",
+    }.intersection(interactive):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "permission_mode and narration_mode must use the ordered "
+                "session control endpoint"
+            ),
+        )
+
     if "tools" in config_override:
         # Runtime updates use the same registry vocabulary as session creation
         # and job creation.  A fragment this boundary will not honour is a 400
@@ -26838,16 +26974,6 @@ async def _apply_thread_config_update(
     if not ok:
         raise HTTPException(status_code=404, detail="Thread not found")
 
-    # Keep top-level permission_mode column in sync
-    pm = (config_override.get("interactive") or {}).get("permission_mode")
-    if pm and pm in ("supervised", "auto_accept", "autonomous"):
-        async with postgres_db.acquire() as conn:
-            await conn.execute(
-                "UPDATE threads SET permission_mode = $1 WHERE id = $2",
-                pm,
-                thread_id,
-            )
-
     # Persist the accepted selection only after every check above passed.
     # The category flip is NOT merged into config_override — the closed
     # session tools vocabulary would drop it anyway; the agent re-fetches
@@ -26898,9 +27024,8 @@ async def agent_update_thread_config(
     requires ``X-Internal-Key``. Ingress strips this path.
 
     Deep-merges the provided config_override into the existing
-    ``threads.metadata.config_override``.  If the override includes
-    ``interactive.permission_mode``, the top-level ``permission_mode``
-    column is updated as well for query consistency.
+    ``threads.metadata.config_override``. Ordered permission/narration
+    scalars are rejected here and must use the durable control inbox.
 
     Returns the enriched ``config_override`` so the agent can rebuild its
     LLM with the resolved ``base_url``/``api_key`` instead of sending the
@@ -28117,12 +28242,16 @@ async def create_thread(
         effective_permission_mode = (
             effective_create_config.get("interactive") or {}
         ).get("permission_mode") or "supervised"
+        effective_narration_mode = (
+            effective_create_config.get("interactive") or {}
+        ).get("narration_mode") or "auto"
 
         thread_id = await postgres_db.create_thread(
             user_id=str(user["id"]),
             project_id=primary_project_id,
             config_name=config_name,
             permission_mode=effective_permission_mode,
+            narration_mode=effective_narration_mode,
             title=request_body.title,
             datasource_ids=selected_thread_datasource_ids,
             datasource_selection_provenance=thread_selection_provenance,
@@ -29279,6 +29408,143 @@ async def get_thread_session_state(
         finished - started,
     )
     return snapshot
+
+
+class ThreadControlRequest(BaseModel):
+    """Strict public envelope for the first durable control-inbox subset."""
+
+    client_request_id: UUID
+    method: Literal["mode.set", "narration.set"]
+    mode: Literal[
+        "supervised",
+        "auto_accept",
+        "autonomous",
+        "silent",
+        "verbose",
+        "auto",
+    ]
+
+    @model_validator(mode="after")
+    def validate_method_mode_pair(self) -> "ThreadControlRequest":
+        permission_modes = {"supervised", "auto_accept", "autonomous"}
+        narration_modes = {"silent", "verbose", "auto"}
+        if self.method == "mode.set" and self.mode not in permission_modes:
+            raise ValueError("mode.set requires a permission mode")
+        if self.method == "narration.set" and self.mode not in narration_modes:
+            raise ValueError("narration.set requires a narration mode")
+        return self
+
+
+@app.post(
+    "/api/persistent/threads/{thread_id}/controls",
+    status_code=202,
+)
+async def submit_thread_control(
+    thread_id: str,
+    body: ThreadControlRequest,
+    request: Request,
+) -> dict[str, Any]:
+    """Admit an owner-authorized control for the exact serving owner.
+
+    This endpoint serves both execution lanes and deliberately exposes neither
+    one. It persists a commit-ordered request, but neither the desired scalar
+    nor a journal frame: the current lease owner (or exact reciprocal pinned
+    binding) applies the request and journals the result with its own allocator.
+    """
+
+    started = time.perf_counter()
+    user, thread = await require_thread_owner(request, postgres_db, thread_id)
+    thread_owner_id = thread.get("user_id")
+    policy_user_id = str(thread_owner_id or user["id"])
+
+    try:
+        existing = await find_existing_thread_control(
+            postgres_db,
+            thread_id=thread_id,
+            owner_user_id=thread_owner_id,
+            client_request_id=body.client_request_id,
+            verb=body.method,
+            payload={"mode": body.mode},
+        )
+    except ControlAdmissionError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    if body.method == "mode.set" and existing is None:
+        # Same PDP as create/attach/config.update. A stale or direct client
+        # cannot persist a permission mode above the owner's current ceiling.
+        # A retry of an already committed UUID bypasses mutable policy: a lost
+        # 202 must stay observable even if grants changed afterward.
+        try:
+            await _enforce_session_create_grants(
+                {"interactive": {"permission_mode": body.mode}},
+                user_id=policy_user_id,
+                project_ids=(
+                    [str(thread["project_id"])] if thread.get("project_id") else []
+                ),
+            )
+        except HTTPException:
+            # Close the concurrent masked-commit race between the preflight
+            # and PDP without weakening authorization for a genuinely new id.
+            try:
+                existing = await find_existing_thread_control(
+                    postgres_db,
+                    thread_id=thread_id,
+                    owner_user_id=thread_owner_id,
+                    client_request_id=body.client_request_id,
+                    verb=body.method,
+                    payload={"mode": body.mode},
+                )
+            except ControlAdmissionError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            if existing is None:
+                raise
+
+    actor_id = str(user.get("id") or user.get("sub") or "rest_client")
+    try:
+        admitted = await admit_thread_control(
+            postgres_db,
+            thread_id=thread_id,
+            owner_user_id=thread_owner_id,
+            client_request_id=body.client_request_id,
+            verb=body.method,
+            payload={"mode": body.mode},
+            requested_by=actor_id,
+        )
+    except ControlAdmissionNotReady as exc:
+        # Registration intentionally keeps the exact pinned-owner capability
+        # closed until its writer and first inbox drain are ready.  A control
+        # clicked during that window is not a semantic conflict: 425 tells the
+        # lane-free client to retry the same UUID after its bounded backoff.
+        raise HTTPException(status_code=425, detail=str(exc)) from exc
+    except ControlAdmissionError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    await log_security_event(
+        postgres_db,
+        resource_type="thread",
+        event_type="session_control_requested",
+        user=user,
+        resource_id=thread_id,
+        detail=f"verb={body.method} request_seq={admitted.request_seq}",
+        request=request,
+    )
+    logger.info(
+        "session-control admission: thread=%s verb=%s seq=%d duplicate=%s total=%.3fs",
+        thread_id,
+        body.method,
+        admitted.request_seq,
+        admitted.duplicate,
+        time.perf_counter() - started,
+    )
+    return {
+        "accepted": True,
+        "request_id": str(admitted.id),
+        "client_request_id": str(admitted.client_request_id),
+        "request_seq": admitted.request_seq,
+        "method": admitted.verb,
+        "state": admitted.state,
+        "duplicate": admitted.duplicate,
+    }
 
 
 async def _session_tool_grants(thread: dict[str, Any]) -> dict[str, Any] | None:
@@ -31563,6 +31829,8 @@ async def thread_events_prune_sweeper(
     Runs every THREAD_EVENTS_PRUNE_INTERVAL_S (default 300s). Two queries:
       - DELETE rows for threads in 'ended' status older than 24h.
       - DELETE rows for threads NOT in 'ended' older than 7 days.
+      - Preserve any event that is still the only durable receipt for a
+        pending session-control request; crash recovery terminalizes it first.
 
     Best-effort. Survives transient DB errors by logging and continuing.
     """
@@ -31578,6 +31846,11 @@ async def thread_events_prune_sweeper(
                     "    SELECT id FROM threads WHERE status = 'ended'"
                     "  ) "
                     "  AND created_at < now() - interval '24 hours' "
+                    "  AND NOT EXISTS ("
+                    "    SELECT 1 FROM thread_control_requests request "
+                    "    WHERE request.id = thread_events.control_request_id "
+                    "      AND request.outcome IS NULL"
+                    "  ) "
                     "  RETURNING 1"
                     ") SELECT COUNT(*) FROM deleted"
                 )
@@ -31588,6 +31861,11 @@ async def thread_events_prune_sweeper(
                     "    SELECT id FROM threads WHERE status <> 'ended'"
                     "  ) "
                     "  AND created_at < now() - interval '7 days' "
+                    "  AND NOT EXISTS ("
+                    "    SELECT 1 FROM thread_control_requests request "
+                    "    WHERE request.id = thread_events.control_request_id "
+                    "      AND request.outcome IS NULL"
+                    "  ) "
                     "  RETURNING 1"
                     ") SELECT COUNT(*) FROM deleted"
                 )
@@ -32135,7 +32413,8 @@ async def _phase5_wake_if_suspended(thread_id: str) -> None:
                     "UPDATE threads "
                     "SET status = 'active', "
                     "    awaiting_user_since = NULL, "
-                    "    extend_count = 0 "
+                    "    extend_count = 0, "
+                    "    control_admission_agent_id = NULL "
                     "WHERE id = $1 AND status IN ('suspended', 'awaiting_user')",
                     thread_id,
                 )
@@ -32435,7 +32714,8 @@ async def _officer_watchdog_check_one(officer_row: dict, session_wake_svc) -> No
         await conn.execute(
             "UPDATE threads "
             "SET agent_id = NULL, status = 'active', "
-            "    awaiting_user_since = NULL "
+            "    awaiting_user_since = NULL, "
+            "    control_admission_agent_id = NULL "
             "WHERE id = $1 AND status IN ('active', 'suspended')",
             thread_id,
         )
@@ -32588,7 +32868,8 @@ async def attention_sleep_sweeper(shutdown_event: asyncio.Event) -> None:
                         async with postgres_db.acquire() as conn:
                             updated = await conn.fetchval(
                                 "UPDATE threads "
-                                "SET status = 'suspended' "
+                                "SET status = 'suspended', "
+                                "    control_admission_agent_id = NULL "
                                 "WHERE id = $1 AND status = 'awaiting_user' "
                                 "RETURNING id",
                                 thread_id,

@@ -13,7 +13,7 @@ import logging
 import os
 import re
 import time
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Awaitable, Callable, Dict, List, NoReturn, Optional, Tuple
@@ -271,6 +271,20 @@ _events_epoch: int = 0
 _next_seq: int = 0
 _event_writer: Optional["_OrderedPersistentEventWriter"] = None
 
+# Durable control-inbox consumer. Pinned agents own this for their whole
+# attach; stateless agents own it only while turn_executor holds a live lease.
+# The task is deliberately separate from the persistent loop so a control can
+# change the next permission gate while an LLM turn is already running.
+_control_watcher_task: Optional[asyncio.Task] = None
+_control_watcher_stop: Optional[asyncio.Event] = None
+_control_owner_lease_token: Optional[int] = None
+_control_owner_agent_id: Optional[str] = None
+_control_drain_lock: asyncio.Lock = asyncio.Lock()
+
+_CONTROL_NOTIFY_CHANNEL = "thread_control_requests"
+_CONTROL_POLL_SECONDS = 5.0
+_CONTROL_STOP_GRACE_SECONDS = 1.0
+
 _EVENT_WRITER_QUEUE_MAXSIZE: int = int(
     os.environ.get("THREAD_EVENT_WRITER_QUEUE_MAXSIZE", "10000")
 )
@@ -364,6 +378,10 @@ class WorkspaceNotReady(RuntimeError):
 
 class EventJournalUnavailable(RuntimeError):
     """The persistent event generation could not be resolved authoritatively."""
+
+
+class ControlInboxBlocked(EventJournalUnavailable):
+    """The oldest control cannot be safely consumed by this runtime owner."""
 
 
 async def _ensure_nats_client():
@@ -920,7 +938,7 @@ def _get_agent_metrics() -> Optional[Dict[str, Any]]:
         if tool_context is not None:
             graph_progress = tool_context.get_graph_progress()
             metrics["graph_progress"] = graph_progress
-    except Exception:
+    except BaseException:
         pass
 
     try:
@@ -1559,6 +1577,14 @@ def _sanitize_live_session_config_override(
     if not isinstance(config_override, dict):
         raise ValueError("Session config override must be an object")
     sanitized = dict(config_override)
+    interactive = sanitized.get("interactive")
+    if isinstance(interactive, dict) and {
+        "permission_mode",
+        "narration_mode",
+    }.intersection(interactive):
+        raise ValueError(
+            "permission_mode and narration_mode use the session control endpoint"
+        )
     if "tools" in sanitized:
         accepted_tools = validate_tool_override_fragment(sanitized)
         if accepted_tools:
@@ -1769,6 +1795,8 @@ async def _cleanup_failed_event_journal_attach(thread_id: str) -> None:
     global _events_epoch, _next_seq, _tool_inflight, _turn_event_open
     global _loop_user_queue, _loop_interrupt_flag, _hard_interrupt_event
     global _loop_last_user_content
+
+    await _stop_thread_control_watcher()
 
     writer = _event_writer
     if writer is not None:
@@ -2325,6 +2353,10 @@ async def _attach_session(
             _events_epoch, _next_seq = await _resolve_event_journal_epoch(
                 _session.postgres_conn, _thread_id
             )
+            live_lease = _current_lease_var.get()
+            pinned_agent_id = (
+                _registered_pinned_agent_id() if live_lease is None else None
+            )
             writer = _OrderedPersistentEventWriter(
                 postgres_conn=_session.postgres_conn,
                 thread_id=_thread_id,
@@ -2333,10 +2365,13 @@ async def _attach_session(
                 # Stateless executor attach: fence every flush on the live
                 # claim (the executor set the LeaseHandle before attaching).
                 # Pinned lane: ContextVar default None → today's statement.
-                lease=_current_lease_var.get(),
+                lease=live_lease,
+                pinned_agent_id=pinned_agent_id,
             )
             writer.start()
             _event_writer = writer
+            if live_lease is None and pinned_agent_id is not None:
+                await _start_thread_control_watcher(agent_id=pinned_agent_id)
         except Exception as exc:
             logger.error(
                 "Event journal initialization failed; aborting session attach "
@@ -2657,6 +2692,67 @@ async def _terminate_session_inner(reason: str, *, mark_thread: bool = True) -> 
     # they would have triggered, no point letting them race the detach.
     _stop_watchdogs()
 
+    # Close public admission before stopping a pinned owner. The dedicated
+    # gate is needed for drain-suspend: the general agent status route forbids
+    # writing ``suspended``, and marking ``ended`` would prevent the snapshot
+    # transition that follows teardown. The thread-row update serializes with
+    # admission; one last exact-owner drain then consumes every request that
+    # committed before closure. A lost binding means a successor owns that
+    # work, so this runtime must not adopt it.
+    pinned_control_owner = (
+        None
+        if _stateless_mode()
+        else (_control_owner_agent_id or _registered_pinned_agent_id())
+    )
+    admission_closed = True
+    if pinned_control_owner is not None:
+        admission_closed = await _close_pinned_control_inbox(
+            agent_id=pinned_control_owner
+        )
+        if not admission_closed:
+            logger.info(
+                "Pinned control admission close skipped: exact binding moved "
+                "(thread=%s agent=%s)",
+                thread_id,
+                pinned_control_owner,
+            )
+
+    if mark_thread:
+        if pinned_control_owner is not None and not admission_closed:
+            logger.info(
+                "Pinned lifecycle close skipped after ownership moved "
+                "(thread=%s agent=%s)",
+                thread_id,
+                pinned_control_owner,
+            )
+        elif not await _update_thread_status(
+            "ended",
+            pinned_agent_id=pinned_control_owner,
+        ):
+            if (
+                pinned_control_owner is not None
+                and not await _set_pinned_control_admission(
+                    agent_id=pinned_control_owner,
+                    open_for_admission=False,
+                )
+            ):
+                logger.info(
+                    "Pinned lifecycle close lost ownership before status CAS "
+                    "(thread=%s agent=%s)",
+                    thread_id,
+                    pinned_control_owner,
+                )
+            else:
+                raise EventJournalUnavailable(
+                    "cannot durably close thread lifecycle during teardown: "
+                    f"{thread_id}"
+                )
+
+    # A pinned consumer owns the attach lifetime; a stateless consumer owns
+    # the active lease. In both cases it must be fully stopped before the
+    # journal writer drains or ownership is released.
+    await _stop_thread_control_watcher()
+
     # B11: final memory capture for ALL terminate reasons — the ✕-button
     # detach (and drain, watchdog, shutdown, …) historically skipped
     # extraction entirely. Manager-mode only; the flag-off path keeps
@@ -2679,12 +2775,6 @@ async def _terminate_session_inner(reason: str, *, mark_thread: bool = True) -> 
             logger.info("Terminate(%s): final memory capture complete", reason)
         except Exception as e:
             logger.warning(f"Terminate memory capture failed (non-fatal): {e}")
-
-    # Mark thread as ended (still resumable — `ended` is the only inactive
-    # state). The drain-suspend path passes mark_thread=False: the
-    # orchestrator flips the thread to 'suspended' right after this teardown.
-    if mark_thread:
-        await _update_thread_status("ended")
 
     # Final cloud sync + drop secrets. No more background polling to stop:
     # Phase 1 moved sync to turn boundaries via the coordinator. The last
@@ -3361,13 +3451,17 @@ async def handle_persistent_websocket(ws: WebSocket) -> None:
             "tool": running_tool["tool"],
             "args": _safe_serialize(running_tool["args"]),
         }
+    (
+        durable_permission_mode,
+        durable_narration_mode,
+    ) = await _durable_session_control_modes()
     await _ws_send(
         ws,
         "session.state",
         {
             "thread_id": _thread_id,
-            "permission_mode": _session.permission_mode,
-            "narration_mode": _session.narration_mode,
+            "permission_mode": durable_permission_mode,
+            "narration_mode": durable_narration_mode,
             "turn_count": _session.turn_count,
             # Authoritative join signal for a cold Cockpit reattach. REST can
             # already contain an incrementally persisted prefix of this turn;
@@ -3451,57 +3545,19 @@ async def handle_persistent_websocket(ws: WebSocket) -> None:
                 await _ws_send(ws, "interrupt.ack", {"mode": mode})
                 logger.info("Interrupt acknowledged (mode=%s)", mode)
 
-            elif method == "mode.set":
-                new_mode = data.get("mode", "supervised")
-                if new_mode in ("supervised", "auto_accept", "autonomous"):
-                    if _session is None:
-                        await _ws_send(
-                            ws,
-                            "error",
-                            {"message": "Session no longer active"},
-                        )
-                        continue
-                    _session.permission_mode = new_mode
-                    if new_mode in ("auto_accept", "autonomous"):
-                        # Rows announced under the stricter mode that the new
-                        # one auto-approves will never reach a gate — retire
-                        # them now so the card shrinks instead of stranding
-                        # entries nobody waits on. The row an active waiter
-                        # holds is deliberately left alone.
-                        asyncio.create_task(
-                            _retire_announced_permission_rows(
-                                f"mode.set {new_mode}", new_mode
-                            ),
-                            name="retire-announced-on-mode-downgrade",
-                        )
-                    await _ws_send(ws, "mode.changed", {"mode": new_mode})
-                    logger.info(f"Permission mode changed to: {new_mode}")
-                else:
-                    await _ws_send(
-                        ws,
-                        "error",
-                        {"message": f"Invalid mode: {new_mode}"},
-                    )
-
-            elif method == "narration.set":
-                new_mode = data.get("mode", "auto")
-                if new_mode in ("silent", "verbose", "auto"):
-                    if _session is None:
-                        await _ws_send(
-                            ws,
-                            "error",
-                            {"message": "Session no longer active"},
-                        )
-                        continue
-                    _session.narration_mode = new_mode
-                    await _ws_send(ws, "narration.changed", {"mode": new_mode})
-                    logger.info(f"Narration mode changed to: {new_mode}")
-                else:
-                    await _ws_send(
-                        ws,
-                        "error",
-                        {"message": f"Invalid narration mode: {new_mode}"},
-                    )
+            elif method in {"mode.set", "narration.set"}:
+                # These verbs are lane-agnostic orchestrator REST controls.
+                # Keeping a second live-only mutation path here would let an
+                # old client change RAM without the desired scalar, inbox
+                # order, durable result receipt, or owner fence.
+                await _ws_send(
+                    ws,
+                    "error",
+                    {
+                        "code": "control_transport_retired",
+                        "message": "Use the session control REST endpoint",
+                    },
+                )
 
             elif method == "config.update":
                 config_override = data.get("config", {})
@@ -3699,6 +3755,10 @@ class _QueuedPersistentEvent:
     seq: int
     kind: str
     payload: Any
+    control_request_id: Optional[str] = None
+    control_lease_token: Optional[int] = None
+    control_agent_id: Optional[str] = None
+    receipt: Optional[asyncio.Future] = None
 
 
 def _requires_bounded_event_retry(kind: str) -> bool:
@@ -3757,14 +3817,19 @@ class _OrderedPersistentEventWriter:
                 (queued.value->>'seq')::bigint    AS seq,
                 queued.value->>'kind'             AS kind,
                 queued.value->'payload'           AS payload,
+                NULLIF(queued.value->>'control_request_id', '')::uuid
+                                                    AS control_request_id,
                 queued.ordinal                    AS ordinal
             FROM jsonb_array_elements($2::jsonb) WITH ORDINALITY
                 AS queued(value, ordinal)
         ),
         inserted AS (
-            INSERT INTO thread_events (thread_id, epoch, seq, kind, payload)
+            INSERT INTO thread_events (
+                thread_id, epoch, seq, kind, payload, control_request_id
+            )
             SELECT $1, queued_rows.epoch, queued_rows.seq,
-                   queued_rows.kind, queued_rows.payload
+                   queued_rows.kind, queued_rows.payload,
+                   queued_rows.control_request_id
             FROM queued_rows
             WHERE EXISTS (
                     SELECT 1 FROM threads
@@ -3794,6 +3859,49 @@ class _OrderedPersistentEventWriter:
                       AND run_queue.lease_token = $5::bigint
                     FOR SHARE
                   )"""
+    # Durable control batches use an explicit transaction and acquire these
+    # locks in the same threads -> queue/agent -> request order as admission.
+    # The ordinary stateless writer intentionally keeps its relaxed trailing
+    # flush fence; only control results require a live leased state.
+    _LOCK_STATELESS_CONTROL_THREAD_SQL = """
+        SELECT 1 FROM threads
+        WHERE id = $1::uuid
+          AND execution_lane = 'stateless'
+          AND agent_id IS NULL
+        FOR SHARE
+    """
+    _LOCK_PINNED_CONTROL_THREAD_SQL = """
+        SELECT 1 FROM threads
+        WHERE id = $1::uuid
+          AND execution_lane = 'pinned'
+          AND agent_id = $2::uuid
+        FOR SHARE
+    """
+    _LOCK_STATELESS_CONTROL_QUEUE_SQL = """
+        SELECT 1 FROM run_queue
+        WHERE unit_id = $1::uuid
+          AND unit_kind = 'session_turn'
+          AND state = 'leased'
+          AND lease_token = $2::bigint
+        FOR SHARE
+    """
+    _LOCK_PINNED_CONTROL_AGENT_SQL = """
+        SELECT 1 FROM agents
+        WHERE id = $1::uuid AND thread_id = $2::uuid
+        FOR SHARE
+    """
+    _LOCK_CONTROL_REQUESTS_SQL = """
+        SELECT COUNT(*)::bigint
+        FROM (
+            SELECT request.id
+            FROM thread_control_requests request
+            WHERE request.id = ANY($1::uuid[])
+              AND request.thread_id = $2::uuid
+              AND request.accepted_agent_id IS NOT DISTINCT FROM $3::uuid
+              AND request.outcome IS NULL
+            FOR SHARE
+        ) locked_requests
+    """
     # Pinned lane keeps the exact pre-M3 statement (and its 4-arg call shape).
     _INSERT_BATCH_SQL = _INSERT_BATCH_SQL_TEMPLATE.format(lease_fence="")
 
@@ -3809,6 +3917,7 @@ class _OrderedPersistentEventWriter:
         state_max_attempts: int = _EVENT_WRITER_STATE_MAX_ATTEMPTS,
         retry_base_s: float = _EVENT_WRITER_RETRY_BASE_S,
         lease: Any = None,
+        pinned_agent_id: Optional[str] = None,
     ) -> None:
         if queue_maxsize < 1:
             raise ValueError("event writer queue_maxsize must be positive")
@@ -3828,6 +3937,7 @@ class _OrderedPersistentEventWriter:
         # under the current claim without a writer swap. None = pinned lane =
         # the exact pre-M3 statement and call shape.
         self._lease = lease
+        self._pinned_agent_id = pinned_agent_id
         self._insert_sql = (
             self._INSERT_BATCH_SQL
             if lease is None
@@ -3846,6 +3956,7 @@ class _OrderedPersistentEventWriter:
         self._closing = False
         self._last_enqueued_cursor: Optional[tuple[int, int]] = None
         self._active_batch: tuple[_QueuedPersistentEvent, ...] = ()
+        self._deferred_event: Optional[_QueuedPersistentEvent] = None
 
     def start(self) -> None:
         if self._task is not None:
@@ -3860,6 +3971,7 @@ class _OrderedPersistentEventWriter:
 
         if self._task is None or self._closing or self._task.done():
             self._notify_terminal_failure([event], "writer_unavailable")
+            self._fail_receipt(event, "writer_unavailable")
             return False
 
         cursor = (event.epoch, event.seq)
@@ -3876,6 +3988,7 @@ class _OrderedPersistentEventWriter:
                 event.kind,
             )
             self._notify_terminal_failure([event], "non_monotonic_cursor")
+            self._fail_receipt(event, "non_monotonic_cursor")
             return False
         self._last_enqueued_cursor = cursor
 
@@ -3896,6 +4009,7 @@ class _OrderedPersistentEventWriter:
                 event.kind,
             )
             self._notify_terminal_failure([event], "queue_overflow")
+            self._fail_receipt(event, "queue_overflow")
             return False
 
     async def close(self, timeout_s: float = _EVENT_WRITER_CLOSE_TIMEOUT_S) -> None:
@@ -3924,6 +4038,10 @@ class _OrderedPersistentEventWriter:
                 await task
             except asyncio.CancelledError:
                 pass
+            if self._deferred_event is not None:
+                failed_on_shutdown.append(self._deferred_event)
+                self._deferred_event = None
+                self._queue.task_done()
             while True:
                 try:
                     failed_on_shutdown.append(self._queue.get_nowait())
@@ -3940,6 +4058,8 @@ class _OrderedPersistentEventWriter:
                 self._notify_terminal_failure(
                     failed_on_shutdown, "writer_shutdown_timeout"
                 )
+                for event in failed_on_shutdown:
+                    self._fail_receipt(event, "writer_shutdown_timeout")
         else:
             task.cancel()
             try:
@@ -3951,23 +4071,43 @@ class _OrderedPersistentEventWriter:
 
     async def _run(self) -> None:
         while True:
-            first = await self._queue.get()
+            if self._deferred_event is not None:
+                first = self._deferred_event
+                self._deferred_event = None
+            else:
+                first = await self._queue.get()
             batch = [first]
-            while len(batch) < self._batch_size:
-                try:
-                    batch.append(self._queue.get_nowait())
-                except asyncio.QueueEmpty:
-                    break
+            # A strict owner-fenced control result must never share a database
+            # batch with ordinary trailing journal frames. If its live lease
+            # fence fails, only that acknowledgement may fail; ordinary frames
+            # retain the established epoch/token trailing-flush contract.
+            if first.control_request_id is None:
+                while len(batch) < self._batch_size:
+                    try:
+                        candidate = self._queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+                    if candidate.control_request_id is not None:
+                        self._deferred_event = candidate
+                        break
+                    batch.append(candidate)
 
             self._active_batch = tuple(batch)
             try:
-                await self._write_with_retry(batch)
+                failure = await self._write_with_retry(batch)
+                for event in batch:
+                    if failure is None:
+                        self._resolve_receipt(event)
+                    else:
+                        self._fail_receipt(event, failure)
             finally:
                 self._active_batch = ()
                 for _event in batch:
                     self._queue.task_done()
 
-    async def _write_with_retry(self, batch: list[_QueuedPersistentEvent]) -> None:
+    async def _write_with_retry(
+        self, batch: list[_QueuedPersistentEvent]
+    ) -> Optional[str]:
         # The writer owns one epoch; a frame stamped with any other epoch in
         # its stream is a sequencing bug (the rewind path swaps writers around
         # its bump precisely so this cannot happen legitimately). Fail loudly
@@ -3985,7 +4125,7 @@ class _OrderedPersistentEventWriter:
                 batch[-1].seq,
             )
             self._notify_terminal_failure(batch, "epoch_mismatch")
-            return
+            return "epoch_mismatch"
 
         attempts = (
             self._state_max_attempts
@@ -4023,7 +4163,7 @@ class _OrderedPersistentEventWriter:
                     exc,
                 )
                 self._notify_terminal_failure(batch, "write_failed")
-                return
+                return "write_failed"
 
             if inserted < len(batch):
                 # The fence rejected the batch: threads.events_epoch moved
@@ -4053,7 +4193,8 @@ class _OrderedPersistentEventWriter:
                     ),
                 )
                 self._notify_terminal_failure(batch, "epoch_fenced")
-            return
+                return "epoch_fenced"
+            return None
 
     async def _write_batch(self, batch: list[_QueuedPersistentEvent]) -> int:
         """Flush one batch through the fenced statement; return inserted count."""
@@ -4064,17 +4205,119 @@ class _OrderedPersistentEventWriter:
                 "seq": event.seq,
                 "kind": event.kind,
                 "payload": event.payload,
+                "control_request_id": event.control_request_id,
             }
             for event in batch
         ]
         args: list[Any] = [self.thread_id, json.dumps(rows), self.epoch]
-        if self._lease is not None:
-            # Read the CURRENT claim's identity at flush time (mutable
-            # LeaseHandle): an affinity re-claim updates the handle in place.
-            args.extend([self._lease.unit_id, self._lease.lease_token])
+        control_events = [
+            event for event in batch if event.control_request_id is not None
+        ]
+        control_agent_id: Optional[str] = None
+        control_lease_token: Optional[int] = None
+        if control_events and self._lease is not None:
+            control_tokens = {event.control_lease_token for event in control_events}
+            if (
+                None in control_tokens
+                or len(control_tokens) != 1
+                or any(event.control_agent_id is not None for event in control_events)
+            ):
+                return 0
+            # A control acknowledgement is fenced on the immutable token held
+            # when the owner consumed the request, never the mutable warm
+            # LeaseHandle a successor may already have refreshed by flush time.
+            control_lease_token = control_tokens.pop()
+        elif control_events:
+            control_agents = {event.control_agent_id for event in control_events}
+            if (
+                None in control_agents
+                or len(control_agents) != 1
+                or self._pinned_agent_id not in control_agents
+                or any(
+                    event.control_lease_token is not None for event in control_events
+                )
+            ):
+                return 0
+            control_agent_id = control_agents.pop()
+
         async with self.postgres_conn.acquire() as conn:
-            inserted = await conn.fetchval(self._insert_sql, *args)
+            if control_events:
+                request_ids = [
+                    str(event.control_request_id) for event in control_events
+                ]
+                if len(set(request_ids)) != len(request_ids):
+                    return 0
+                async with conn.transaction():
+                    if control_lease_token is not None:
+                        thread_fenced = await conn.fetchval(
+                            self._LOCK_STATELESS_CONTROL_THREAD_SQL,
+                            self.thread_id,
+                        )
+                        if thread_fenced is None:
+                            return 0
+                        queue_fenced = await conn.fetchval(
+                            self._LOCK_STATELESS_CONTROL_QUEUE_SQL,
+                            self.thread_id,
+                            control_lease_token,
+                        )
+                        if queue_fenced is None:
+                            return 0
+                        accepted_agent_id = None
+                    else:
+                        if control_agent_id is None:
+                            return 0
+                        thread_fenced = await conn.fetchval(
+                            self._LOCK_PINNED_CONTROL_THREAD_SQL,
+                            self.thread_id,
+                            control_agent_id,
+                        )
+                        if thread_fenced is None:
+                            return 0
+                        agent_fenced = await conn.fetchval(
+                            self._LOCK_PINNED_CONTROL_AGENT_SQL,
+                            control_agent_id,
+                            self.thread_id,
+                        )
+                        if agent_fenced is None:
+                            return 0
+                        accepted_agent_id = control_agent_id
+                    locked_requests = int(
+                        await conn.fetchval(
+                            self._LOCK_CONTROL_REQUESTS_SQL,
+                            request_ids,
+                            self.thread_id,
+                            accepted_agent_id,
+                        )
+                        or 0
+                    )
+                    if locked_requests != len(request_ids):
+                        return 0
+                    inserted = await conn.fetchval(self._INSERT_BATCH_SQL, *args)
+            else:
+                insert_sql = self._insert_sql
+                ordinary_args = list(args)
+                if self._lease is not None:
+                    # Ordinary trailing journal frames retain the M3 rule:
+                    # read the warm handle's current token at flush time.
+                    ordinary_args.extend([self._lease.unit_id, self._lease.lease_token])
+                inserted = await conn.fetchval(insert_sql, *ordinary_args)
         return int(inserted or 0)
+
+    @staticmethod
+    def _resolve_receipt(event: _QueuedPersistentEvent) -> None:
+        receipt = event.receipt
+        if receipt is not None and not receipt.done():
+            receipt.set_result((event.epoch, event.seq))
+
+    @staticmethod
+    def _fail_receipt(event: _QueuedPersistentEvent, reason: str) -> None:
+        receipt = event.receipt
+        if receipt is not None and not receipt.done():
+            receipt.set_exception(
+                EventJournalUnavailable(
+                    f"control result journal persistence failed: {reason}"
+                )
+            )
 
     def _notify_terminal_failure(
         self, events: list[_QueuedPersistentEvent], reason: str
@@ -4144,12 +4387,22 @@ def _event_persistence_failed(
     )
 
 
-def _broadcast(method: str, params: Dict[str, Any]) -> None:
-    """Enqueue a frame onto every subscriber queue, persist to event log.
+def _broadcast_frame(
+    method: str,
+    params: Dict[str, Any],
+    *,
+    control_request_id: Optional[str] = None,
+    control_lease_token: Optional[int] = None,
+    control_agent_id: Optional[str] = None,
+    durable_receipt: bool = False,
+) -> Optional[asyncio.Future]:
+    """Fan out one frame and enqueue its ordered journal write.
 
-    Non-blocking. On a full subscriber queue, drops the oldest frame to make
-    room for the new one — token-stream pacing semantics. We'd rather lose an
-    old chunk than block the loop on a stuck consumer.
+    The ordinary broadcast path stays non-blocking and best-effort. A control
+    result asks for a receipt future and is not acknowledged in its inbox
+    until the ordered writer resolves that future after the INSERT commits.
+    Both paths allocate through this one function, so an inbox result can
+    never race a second sequence allocator.
 
     Phase 2 (event log): allocates the next seq synchronously and stamps
     `(_events_epoch, seq)` into the frame's params under `_seq`. One
@@ -4157,6 +4410,9 @@ def _broadcast(method: str, params: Dict[str, Any]) -> None:
     past an earlier event whose independent write is still in flight.
     """
     global _next_seq
+    receipt: Optional[asyncio.Future] = None
+    if durable_receipt:
+        receipt = asyncio.get_running_loop().create_future()
     _next_seq += 1
     seq = _next_seq
     epoch = _events_epoch
@@ -4165,13 +4421,31 @@ def _broadcast(method: str, params: Dict[str, Any]) -> None:
     # consistent under reconnect.
     params_with_cursor = {**params, "_seq": [epoch, seq]}
     frame = {"method": method, "params": params_with_cursor}
-    _fan_out_live_frame(frame)
 
-    # Mirror notification-worthy events to NATS so the orchestrator's
-    # bridge can fan them out to the SSE notification feed. Non-blocking,
-    # non-fatal on failure.
-    if method in _NOTIFICATION_METHODS:
-        asyncio.create_task(emit_session_event(method, params))
+    def _publish_live() -> None:
+        _fan_out_live_frame(frame)
+        # Mirror notification-worthy events to NATS so the orchestrator's
+        # bridge can fan them out to the SSE notification feed. Non-blocking,
+        # non-fatal on failure.
+        if method in _NOTIFICATION_METHODS:
+            asyncio.create_task(emit_session_event(method, params))
+
+    if receipt is None:
+        _publish_live()
+    else:
+        # A durable control acknowledgement is authoritative only after its
+        # journal INSERT commits. Do not let a live subscriber observe a frame
+        # that a failed writer would be unable to replay after reload.
+        def _publish_committed(done: asyncio.Future) -> None:
+            if done.cancelled():
+                return
+            try:
+                done.result()
+            except Exception:
+                return
+            _publish_live()
+
+        receipt.add_done_callback(_publish_committed)
 
     # Queue one immutable journal snapshot. The loop stays non-blocking, while
     # the sole writer serializes database visibility for every sequence.
@@ -4181,6 +4455,10 @@ def _broadcast(method: str, params: Dict[str, Any]) -> None:
             seq=seq,
             kind=method,
             payload=json.loads(json.dumps(_safe_serialize(params))),
+            control_request_id=control_request_id,
+            control_lease_token=control_lease_token,
+            control_agent_id=control_agent_id,
+            receipt=receipt,
         )
         writer = _event_writer
         if writer is None or writer.thread_id != _thread_id:
@@ -4192,8 +4470,768 @@ def _broadcast(method: str, params: Dict[str, Any]) -> None:
                 method,
             )
             _event_persistence_failed([event], "writer_unavailable")
+            _OrderedPersistentEventWriter._fail_receipt(event, "writer_unavailable")
         else:
             writer.enqueue(event)
+    elif receipt is not None:
+        receipt.set_exception(
+            EventJournalUnavailable(
+                "control result journal persistence failed: session_unavailable"
+            )
+        )
+    return receipt
+
+
+def _broadcast(method: str, params: Dict[str, Any]) -> None:
+    """Non-blocking live fanout plus best-effort ordered journal persistence."""
+
+    _broadcast_frame(method, params)
+
+
+async def _broadcast_durable(
+    method: str,
+    params: Dict[str, Any],
+    *,
+    control_request_id: str,
+    lease_token: Optional[int],
+    agent_id: Optional[str],
+) -> tuple[int, int]:
+    """Broadcast and wait until the owner-fenced journal INSERT commits."""
+
+    if (lease_token is None) == (agent_id is None):
+        raise ValueError("exactly one durable control owner is required")
+
+    receipt = _broadcast_frame(
+        method,
+        params,
+        control_request_id=control_request_id,
+        control_lease_token=lease_token,
+        control_agent_id=agent_id,
+        durable_receipt=True,
+    )
+    if receipt is None:  # pragma: no cover - defensive; durable always creates one
+        raise EventJournalUnavailable("control result receipt was not created")
+    return await receipt
+
+
+async def _durable_session_control_modes() -> tuple[str, str]:
+    """Read journal-authoritative welcome scalars for a pinned WS client.
+
+    A second tab can connect while a control result is between journal commit
+    and request finalization. Start with the first-class columns and overlay
+    only fully matching pending receipts, exactly like the orchestrator REST
+    snapshot. Falling back to RAM is safe because RAM changes only after
+    durable finalization.
+    """
+
+    if _session is None:
+        return "supervised", "auto"
+    fallback = (_session.permission_mode, _session.narration_mode)
+    if _session.postgres_conn is None or _thread_id is None:
+        return fallback
+
+    from ..shared.thread_controls import applied_control_scalar
+
+    try:
+        async with _session.postgres_conn.acquire() as conn:
+            async with conn.transaction(isolation="repeatable_read", readonly=True):
+                row = await conn.fetchrow(
+                    "SELECT permission_mode, narration_mode FROM threads "
+                    "WHERE id = $1::uuid",
+                    _thread_id,
+                )
+                if row is None:
+                    return fallback
+                permission_mode = str(row["permission_mode"] or "supervised")
+                narration_mode = (
+                    str(row["narration_mode"])
+                    if row["narration_mode"] is not None
+                    else fallback[1]
+                )
+                receipts = await conn.fetch(
+                    "SELECT request.id AS request_id, request.client_request_id, "
+                    "request.request_seq, "
+                    "request.verb, request.payload AS request_payload, "
+                    "event.kind AS event_kind, event.payload AS event_payload "
+                    "FROM thread_control_requests request "
+                    "JOIN thread_events event "
+                    "ON event.thread_id = request.thread_id "
+                    "AND event.control_request_id = request.id "
+                    "WHERE request.thread_id = $1::uuid "
+                    "AND request.outcome IS NULL "
+                    "ORDER BY request.request_seq",
+                    _thread_id,
+                )
+        for receipt in receipts:
+            scalar = applied_control_scalar(
+                request_id=receipt["request_id"],
+                client_request_id=receipt["client_request_id"],
+                request_seq=int(receipt["request_seq"]),
+                verb=str(receipt["verb"]),
+                request_payload=receipt["request_payload"],
+                event_kind=str(receipt["event_kind"]),
+                event_payload=receipt["event_payload"],
+            )
+            if scalar is None:
+                continue
+            column, value = scalar
+            if column == "permission_mode":
+                permission_mode = value
+            elif column == "narration_mode":
+                narration_mode = value
+        return permission_mode, narration_mode
+    except Exception:
+        logger.warning(
+            "durable control scalar read failed for WS welcome; using "
+            "post-finalization RAM",
+            exc_info=True,
+        )
+        return fallback
+
+
+def _registered_pinned_agent_id() -> Optional[str]:
+    """Return the orchestrator-issued DB identity, never a hostname/config id."""
+
+    if _orchestrator_client is None or _orchestrator_client.agent_id is None:
+        return None
+    try:
+        from uuid import UUID
+
+        return str(UUID(str(_orchestrator_client.agent_id)))
+    except (TypeError, ValueError, AttributeError):
+        return None
+
+
+def _control_receipt_matches(request: Any, receipt: Any) -> bool:
+    """Reject a malformed/cross-linked receipt instead of phantom-applying it."""
+
+    from ..shared.thread_controls import control_receipt_result
+
+    return (
+        control_receipt_result(
+            request_id=request.id,
+            client_request_id=request.client_request_id,
+            request_seq=request.request_seq,
+            verb=request.verb,
+            request_payload=request.payload,
+            event_kind=receipt.kind,
+            event_payload=receipt.payload,
+        )
+        is not None
+    )
+
+
+def _describe_control_request(request: Any) -> tuple[str, str, Optional[str]]:
+    """Validate one request without mutating RAM or any durable state."""
+
+    mode = str(request.payload.get("mode") or "")
+    if request.verb == "mode.set" and mode in {
+        "supervised",
+        "auto_accept",
+        "autonomous",
+    }:
+        return "mode.changed", "applied", None
+    if request.verb == "narration.set" and mode in {"silent", "verbose", "auto"}:
+        return "narration.changed", "applied", None
+    return "control.rejected", "rejected", "unsupported_control"
+
+
+async def _finalize_durable_control(
+    request: Any,
+    *,
+    lease_token: Optional[int],
+    agent_id: Optional[str],
+    outcome: str,
+    error_code: Optional[str] = None,
+) -> str:
+    """Atomically terminalize a receipt and its stateless consumed watermark."""
+
+    from ..shared.thread_controls import finalize_control_request
+
+    if _session is None or _session.postgres_conn is None:
+        raise EventJournalUnavailable("control finalization lost its session")
+    async with _session.postgres_conn.acquire() as conn:
+        async with conn.transaction():
+            return await finalize_control_request(
+                conn,
+                request_id=request.id,
+                lease_token=lease_token,
+                agent_id=agent_id,
+                outcome=outcome,
+                error_code=error_code,
+            )
+
+
+async def _reconcile_durable_control_scalars(
+    *,
+    lease_token: Optional[int],
+    agent_id: Optional[str],
+) -> None:
+    """Converge RAM from first-class scalars under the current owner fence.
+
+    This closes the ambiguous-finalizer window: PostgreSQL may commit the
+    scalar/request/watermark transaction just as the awaiting task is
+    cancelled. A warm affinity reuse must not keep the old in-process mode
+    merely because the now-terminal request no longer appears in the inbox.
+    """
+
+    from ..shared.thread_controls import owner_fence_current
+
+    if (lease_token is None) == (agent_id is None):
+        raise ValueError("exactly one control owner credential is required")
+    if _session is None or _session.postgres_conn is None or _thread_id is None:
+        raise EventJournalUnavailable("control scalar reconciliation lost session")
+
+    async with _session.postgres_conn.acquire() as conn:
+        async with conn.transaction():
+            fenced = await owner_fence_current(
+                conn,
+                thread_id=_thread_id,
+                lease_token=lease_token,
+                agent_id=agent_id,
+            )
+            if not fenced:
+                raise ControlInboxBlocked(
+                    "control scalar reconciliation lost current owner"
+                )
+            row = await conn.fetchrow(
+                "SELECT permission_mode, narration_mode FROM threads "
+                "WHERE id = $1::uuid",
+                _thread_id,
+            )
+    if row is None or _session is None:
+        raise ControlInboxBlocked("control scalar reconciliation lost thread")
+    _session.permission_mode = str(row["permission_mode"] or "supervised")
+    # NULL is the migration sentinel for a legacy inherited narration value;
+    # retain the mode already loaded from resolved config until a control (or
+    # creation-time materialization) writes a first-class value.
+    if row["narration_mode"] is not None:
+        _session.narration_mode = str(row["narration_mode"])
+
+
+async def _set_pinned_control_admission(
+    *, agent_id: str, open_for_admission: bool
+) -> bool:
+    """Set the durable admission credential under the reciprocal binding.
+
+    Teardown closes this before its last drain, serializing with orchestrator
+    admission on the threads row. A new pinned owner reopens it only after its
+    writer/session are attached. ``False`` means this runtime no longer owns
+    the binding; database failures raise and must not be treated as closure.
+    """
+
+    if _session is None or _session.postgres_conn is None or _thread_id is None:
+        raise EventJournalUnavailable("control admission gate lost session")
+    async with _session.postgres_conn.acquire() as conn:
+        async with conn.transaction():
+            thread = await conn.fetchrow(
+                "SELECT agent_id, execution_lane, status FROM threads "
+                "WHERE id = $1::uuid FOR UPDATE",
+                _thread_id,
+            )
+            if (
+                thread is None
+                or str(thread["execution_lane"] or "") != "pinned"
+                or str(thread["agent_id"] or "") != str(agent_id)
+                or (
+                    open_for_admission
+                    and str(thread["status"] or "") in {"ended", "suspended"}
+                )
+            ):
+                return False
+            reciprocal = await conn.fetchval(
+                "SELECT 1 FROM agents WHERE id = $1::uuid "
+                "AND thread_id = $2::uuid FOR SHARE",
+                agent_id,
+                _thread_id,
+            )
+            if reciprocal is None:
+                return False
+            updated = await conn.fetchval(
+                "UPDATE threads SET control_admission_agent_id = "
+                "CASE WHEN $3::boolean THEN $2::uuid ELSE NULL END "
+                "WHERE id = $1::uuid AND agent_id = $2::uuid RETURNING id",
+                _thread_id,
+                agent_id,
+                bool(open_for_admission),
+            )
+            return updated is not None
+
+
+async def _close_pinned_control_inbox(*, agent_id: str) -> bool:
+    """Close admission and drain controls without trapping a stale owner.
+
+    The binding can move after the first close transaction commits but before
+    the final drain locks its first request.  In that case the successor owns
+    the request and this process must continue local cleanup without attempting
+    the lifecycle CAS.  A drain failure while the binding is still ours stays
+    fatal: otherwise a real journal/finalization failure could strand work.
+    """
+
+    if not await _set_pinned_control_admission(
+        agent_id=agent_id,
+        open_for_admission=False,
+    ):
+        return False
+    try:
+        await _drain_thread_controls(agent_id=agent_id)
+    except ControlInboxBlocked:
+        if await _set_pinned_control_admission(
+            agent_id=agent_id,
+            open_for_admission=False,
+        ):
+            raise
+        logger.info(
+            "Pinned control owner moved during final drain (thread=%s agent=%s)",
+            _thread_id,
+            agent_id,
+        )
+        return False
+    return True
+
+
+def _apply_control_request(request: Any) -> tuple[str, str, Optional[str]]:
+    """Converge RAM after durable owner-fenced terminalization.
+
+    Validation is intentionally side-effect free and happens before the
+    journal write. This function is called only after finalization proves the
+    immutable journal owner and publishes the first-class DB scalar.
+    """
+
+    if _session is None:
+        raise EventJournalUnavailable("control apply lost its session")
+
+    event_kind, outcome, error_code = _describe_control_request(request)
+    if outcome != "applied":
+        return event_kind, outcome, error_code
+
+    mode = str(request.payload.get("mode") or "")
+    if request.verb == "mode.set":
+        _session.permission_mode = mode
+        # Permission-card retirement stays owned by the existing gate/turn
+        # cleanup path. It is not part of this control acknowledgement:
+        # rows have no lease identity yet, so sweeping them here cannot be
+        # made crash-recoverable without risking a successor's active gate.
+    elif request.verb == "narration.set":
+        _session.narration_mode = mode
+    return event_kind, outcome, error_code
+
+
+async def _drain_thread_controls(
+    *,
+    lease_token: Optional[int] = None,
+    agent_id: Optional[str] = None,
+) -> int:
+    """Drain the exact owner's pending inbox in request_seq order.
+
+    There is no durable ``claimed`` state. Idempotent scalar assignments may
+    safely repeat after a crash before the result write. If the result write
+    committed but finalization did not, the unique journal receipt is found
+    first. The current owner validates and finalizes it, then idempotently
+    re-converges RAM without allocating another event sequence.
+    """
+
+    from ..shared.thread_controls import (
+        adopt_next_pinned_control_request,
+        control_receipt_result,
+        fetch_control_receipt,
+        fetch_next_control_request,
+        owner_fence_current,
+    )
+
+    if (lease_token is None) == (agent_id is None):
+        raise ValueError("exactly one control owner credential is required")
+
+    applied = 0
+    async with _control_drain_lock:
+        while True:
+            if _session is None or _session.postgres_conn is None or _thread_id is None:
+                return applied
+            if lease_token is not None:
+                handle = _current_lease_var.get()
+                if (
+                    handle is None
+                    or handle.unit_id != str(_thread_id)
+                    or handle.lease_token != int(lease_token)
+                    or handle.lost.is_set()
+                ):
+                    if handle is not None:
+                        handle.lost.set()
+                    raise ControlInboxBlocked(f"control owner lost lease {lease_token}")
+
+            started = time.perf_counter()
+            async with _session.postgres_conn.acquire() as conn:
+                async with conn.transaction():
+                    owns_thread = await owner_fence_current(
+                        conn,
+                        thread_id=_thread_id,
+                        lease_token=lease_token,
+                        agent_id=agent_id,
+                    )
+                    if not owns_thread:
+                        if lease_token is not None:
+                            handle = _current_lease_var.get()
+                            if handle is not None:
+                                handle.lost.set()
+                        raise ControlInboxBlocked(
+                            "control owner fence is no longer current"
+                        )
+                    if agent_id is not None:
+                        await adopt_next_pinned_control_request(
+                            conn,
+                            thread_id=_thread_id,
+                            agent_id=agent_id,
+                        )
+                    request = await fetch_next_control_request(
+                        conn,
+                        thread_id=_thread_id,
+                        lease_token=lease_token,
+                        agent_id=agent_id,
+                    )
+                    if request is None:
+                        return applied
+                    receipt = await fetch_control_receipt(
+                        conn,
+                        thread_id=_thread_id,
+                        request_id=request.id,
+                    )
+
+            if receipt is not None:
+                receipt_result = control_receipt_result(
+                    request_id=request.id,
+                    client_request_id=request.client_request_id,
+                    request_seq=request.request_seq,
+                    verb=request.verb,
+                    request_payload=request.payload,
+                    event_kind=receipt.kind,
+                    event_payload=receipt.payload,
+                )
+                if receipt_result is None:
+                    raise ControlInboxBlocked(
+                        "control receipt does not match its durable request: "
+                        f"{request.id}"
+                    )
+                outcome, error_code, _scalar = receipt_result
+                result = await _finalize_durable_control(
+                    request,
+                    lease_token=lease_token,
+                    agent_id=agent_id,
+                    outcome=outcome,
+                    error_code=error_code,
+                )
+                if result not in {outcome, "already_terminal"}:
+                    if result == "lost_owner" and lease_token is not None:
+                        handle = _current_lease_var.get()
+                        if handle is not None:
+                            handle.lost.set()
+                    raise ControlInboxBlocked(
+                        "control receipt recovery failed: "
+                        f"request={request.id} result={result}"
+                    )
+                if result == outcome:
+                    _apply_control_request(request)
+                else:
+                    await _reconcile_durable_control_scalars(
+                        lease_token=lease_token,
+                        agent_id=agent_id,
+                    )
+                applied += 1
+                logger.info(
+                    "session-control timing: thread=%s verb=%s seq=%d "
+                    "recovered_receipt=true total=%.3fs",
+                    _thread_id,
+                    request.verb,
+                    request.request_seq,
+                    time.perf_counter() - started,
+                )
+                continue
+
+            event_kind, outcome, error_code = _describe_control_request(request)
+            params: Dict[str, Any] = {
+                "request_id": str(request.id),
+                "client_request_id": str(request.client_request_id),
+                "request_seq": request.request_seq,
+                "method": request.verb,
+            }
+            if outcome == "applied":
+                params["mode"] = str(request.payload.get("mode") or "")
+            else:
+                params["error_code"] = error_code
+
+            journal_started = time.perf_counter()
+            try:
+                epoch, seq = await _broadcast_durable(
+                    event_kind,
+                    params,
+                    control_request_id=str(request.id),
+                    lease_token=lease_token,
+                    agent_id=agent_id,
+                )
+            except EventJournalUnavailable as exc:
+                raise ControlInboxBlocked(
+                    f"control journal acknowledgement failed: {request.id}"
+                ) from exc
+            journal_seconds = time.perf_counter() - journal_started
+            result = await _finalize_durable_control(
+                request,
+                lease_token=lease_token,
+                agent_id=agent_id,
+                outcome=outcome,
+                error_code=error_code,
+            )
+            if result not in {outcome, "already_terminal"}:
+                if result == "lost_owner" and lease_token is not None:
+                    handle = _current_lease_var.get()
+                    if handle is not None:
+                        handle.lost.set()
+                raise ControlInboxBlocked(
+                    "control finalization failed: "
+                    f"request={request.id} journal={epoch}/{seq} result={result}"
+                )
+            if result == outcome:
+                _apply_control_request(request)
+            else:
+                await _reconcile_durable_control_scalars(
+                    lease_token=lease_token,
+                    agent_id=agent_id,
+                )
+            applied += 1
+            logger.info(
+                "session-control timing: thread=%s verb=%s seq=%d "
+                "recovered_receipt=false journal=%.3fs total=%.3fs",
+                _thread_id,
+                request.verb,
+                request.request_seq,
+                journal_seconds,
+                time.perf_counter() - started,
+            )
+
+
+async def _drain_current_thread_controls() -> int:
+    """Authoritative pre-gate drain for whichever owner currently serves."""
+
+    if _control_owner_lease_token is not None:
+        await _reconcile_durable_control_scalars(
+            lease_token=_control_owner_lease_token,
+            agent_id=None,
+        )
+        return await _drain_thread_controls(
+            lease_token=_control_owner_lease_token,
+        )
+    if _control_owner_agent_id is not None:
+        await _reconcile_durable_control_scalars(
+            lease_token=None,
+            agent_id=_control_owner_agent_id,
+        )
+        return await _drain_thread_controls(agent_id=_control_owner_agent_id)
+    return 0
+
+
+async def _control_watcher_loop(
+    *,
+    postgres_conn: Any,
+    thread_id: str,
+    stop: asyncio.Event,
+    lease_token: Optional[int],
+    agent_id: Optional[str],
+) -> None:
+    """LISTEN for latency, with a bounded poll so delivery is never correctness."""
+
+    wake = asyncio.Event()
+
+    def _on_notify(_conn: Any, _pid: int, _channel: str, payload: str) -> None:
+        try:
+            notice = json.loads(payload)
+        except Exception:
+            return
+        if str(notice.get("thread_id") or "") == thread_id:
+            wake.set()
+
+    try:
+        async with postgres_conn.acquire() as listener:
+            await listener.add_listener(_CONTROL_NOTIFY_CHANNEL, _on_notify)
+            try:
+                # Register first, then drain: a request committed in the
+                # start-up window is either visible to this read or wakes the
+                # following one.
+                while not stop.is_set():
+                    try:
+                        await _drain_thread_controls(
+                            lease_token=lease_token,
+                            agent_id=agent_id,
+                        )
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        logger.warning(
+                            "session-control drain failed; request remains pending "
+                            "for retry (thread=%s)",
+                            thread_id,
+                            exc_info=True,
+                        )
+                    wake.clear()
+                    if stop.is_set():
+                        break
+                    # Stop is a first-class waiter, not just a flag checked
+                    # after the five-second poll.  Stateless control-only
+                    # claims start and stop this watcher back-to-back; direct
+                    # task cancellation while asyncpg is entering LISTEN can
+                    # leave its connection-lost future unobserved.  A normal
+                    # stop now lets the listener unregister and return its
+                    # connection cooperatively.
+                    wake_waiter = asyncio.create_task(wake.wait())
+                    stop_waiter = asyncio.create_task(stop.wait())
+                    waiters = {wake_waiter, stop_waiter}
+                    try:
+                        await asyncio.wait(
+                            waiters,
+                            timeout=_CONTROL_POLL_SECONDS,
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                    finally:
+                        for waiter in waiters:
+                            if not waiter.done():
+                                waiter.cancel()
+                        await asyncio.gather(*waiters, return_exceptions=True)
+            finally:
+                with suppress(Exception):
+                    await listener.remove_listener(_CONTROL_NOTIFY_CHANNEL, _on_notify)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        # A listener connection is only a latency optimization. Fall back to
+        # bounded polling on fresh pool connections until the owner stops.
+        logger.warning(
+            "session-control LISTEN unavailable; polling (thread=%s)",
+            thread_id,
+            exc_info=True,
+        )
+        while not stop.is_set():
+            try:
+                await _drain_thread_controls(
+                    lease_token=lease_token,
+                    agent_id=agent_id,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning(
+                    "session-control poll failed (thread=%s)",
+                    thread_id,
+                    exc_info=True,
+                )
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=_CONTROL_POLL_SECONDS)
+            except asyncio.TimeoutError:
+                pass
+
+
+async def _start_thread_control_watcher(
+    *,
+    lease_token: Optional[int] = None,
+    agent_id: Optional[str] = None,
+) -> int:
+    """Take ownership, synchronously drain, then watch for later admissions."""
+
+    global _control_watcher_task, _control_watcher_stop
+    global _control_owner_lease_token, _control_owner_agent_id
+
+    if (lease_token is None) == (agent_id is None):
+        raise ValueError("exactly one control owner credential is required")
+    # A restart/re-attach may enter with the same exact binding while the old
+    # watcher still advertised capability. Close first, before cancelling that
+    # watcher, so a failed initial drain cannot leave public admission open
+    # with no consumer. A different successor credential is unaffected.
+    if agent_id is not None:
+        await _set_pinned_control_admission(
+            agent_id=str(agent_id),
+            open_for_admission=False,
+        )
+    await _stop_thread_control_watcher()
+    if _session is None or _session.postgres_conn is None or _thread_id is None:
+        raise EventJournalUnavailable("cannot start control owner without a session")
+
+    _control_owner_lease_token = int(lease_token) if lease_token is not None else None
+    _control_owner_agent_id = str(agent_id) if agent_id is not None else None
+    try:
+        if _control_owner_agent_id is not None:
+            # Existing work can be consumed while the public gate is closed.
+            # Only an inbox-capable owner that completed this first drain
+            # advertises readiness to new REST admissions. Drain again after
+            # opening to cover the commit window before LISTEN registration.
+            drained = await _drain_current_thread_controls()
+            if not await _set_pinned_control_admission(
+                agent_id=_control_owner_agent_id,
+                open_for_admission=True,
+            ):
+                raise ControlInboxBlocked(
+                    "cannot reopen control admission without the exact pinned owner"
+                )
+            drained += await _drain_current_thread_controls()
+        else:
+            drained = await _drain_current_thread_controls()
+    except BaseException:
+        if _control_owner_agent_id is not None:
+            with suppress(BaseException):
+                await _set_pinned_control_admission(
+                    agent_id=_control_owner_agent_id,
+                    open_for_admission=False,
+                )
+        _control_owner_lease_token = None
+        _control_owner_agent_id = None
+        raise
+
+    stop = asyncio.Event()
+    _control_watcher_stop = stop
+    _control_watcher_task = asyncio.create_task(
+        _control_watcher_loop(
+            postgres_conn=_session.postgres_conn,
+            thread_id=str(_thread_id),
+            stop=stop,
+            lease_token=_control_owner_lease_token,
+            agent_id=_control_owner_agent_id,
+        ),
+        name=f"thread-control-watcher-{str(_thread_id)[:8]}",
+    )
+    return drained
+
+
+async def _stop_thread_control_watcher() -> None:
+    """Stop and await the owner consumer before lease completion/release."""
+
+    global _control_watcher_task, _control_watcher_stop
+    global _control_owner_lease_token, _control_owner_agent_id
+
+    task = _control_watcher_task
+    stop = _control_watcher_stop
+    # This helper is also used by partial-attach cleanup. Never cancel the
+    # only pinned consumer while its public capability is still advertised;
+    # teardown's earlier close+final-drain makes this an idempotent second
+    # close on the normal path.
+    if _control_owner_agent_id is not None:
+        await _set_pinned_control_admission(
+            agent_id=_control_owner_agent_id,
+            open_for_admission=False,
+        )
+    if stop is not None:
+        stop.set()
+    if task is not None:
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(task), timeout=_CONTROL_STOP_GRACE_SECONDS
+            )
+        except asyncio.CancelledError:
+            if not task.cancelled():
+                raise
+        except asyncio.TimeoutError:
+            # A wedged DB/listener must not pin lease completion forever.
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+    _control_watcher_task = None
+    _control_watcher_stop = None
+    _control_owner_lease_token = None
+    _control_owner_agent_id = None
 
 
 def _emit_citation_verdict(citation_id: int, verification_status: str) -> None:
@@ -5112,6 +6150,12 @@ async def _loop_announce_permission_batch(tool_calls: List[Dict[str, Any]]) -> N
     """
     if _session is None or _thread_id is None:
         return
+    # A mode control can commit while the LLM is producing its tool batch.
+    # Drain under the exact current owner immediately before deciding which
+    # rows to announce; LISTEN is latency-only and may have missed a notice.
+    await _drain_current_thread_controls()
+    if _session is None:
+        return
     # Belt-and-braces against a turn that ended without its cleanup hook
     # (e.g. the loop task cancelled outright): never let a previous batch's
     # rows sit pending behind a fresh one.
@@ -5392,6 +6436,13 @@ async def _loop_permission_check(
             "permission_check fired with _session=None for tool %s — declining",
             tool_name,
         )
+        return PermissionOutcome.DECLINED
+
+    # Same authoritative edge as batch announcement, repeated for each gate:
+    # a committed mid-turn mode change must affect the very next tool call,
+    # even if DB NOTIFY delivery was delayed or lost.
+    await _drain_current_thread_controls()
+    if _session is None:
         return PermissionOutcome.DECLINED
 
     mode = _session.permission_mode
@@ -7026,6 +8077,7 @@ async def _handle_rewind(ws: WebSocket, data: Dict[str, Any]) -> None:
                         thread_id=_thread_id,
                         epoch=_events_epoch,
                         on_terminal_failure=_event_persistence_failed,
+                        pinned_agent_id=_registered_pinned_agent_id(),
                     )
                     new_writer.start()
                     _event_writer = new_writer
@@ -7044,6 +8096,7 @@ async def _handle_rewind(ws: WebSocket, data: Dict[str, Any]) -> None:
                                 thread_id=_thread_id,
                                 epoch=_events_epoch,
                                 on_terminal_failure=_event_persistence_failed,
+                                pinned_agent_id=_registered_pinned_agent_id(),
                             )
                             recovery_writer.start()
                             _event_writer = recovery_writer
@@ -7918,33 +8971,87 @@ async def _handle_archive(ws: WebSocket) -> None:
             except Exception as e:
                 logger.warning(f"Title generation failed (non-fatal): {e}")
 
-            # 3. Mark thread as ended
-            try:
-                await _session.postgres_conn.end_thread(_thread_id)
-            except Exception as e:
-                logger.warning(f"Thread end update failed: {e}")
-
-        await _ws_send(ws, "session.ended", {"thread_id": _thread_id})
-        logger.info(f"Session archived: thread={_thread_id}")
+        archived_thread_id = _thread_id
+        await _ws_send(ws, "session.ended", {"thread_id": archived_thread_id})
+        # Common teardown closes control admission, performs the final owner
+        # drain, and uses the exact pinned-agent status CAS. A direct
+        # ``end_thread`` here could race a successor binding.
+        await _terminate_session("archive")
+        logger.info(f"Session archived: thread={archived_thread_id}")
     except Exception as e:
         logger.warning(f"Archive failed: {e}")
         await _ws_send(ws, "error", {"message": f"Archive failed: {e}"})
 
 
-async def _update_thread_status(status: str) -> None:
-    """Update thread status via orchestrator REST (preferred) or direct DB."""
+async def _update_thread_status(
+    status: str,
+    *,
+    pinned_agent_id: Optional[str] = None,
+) -> bool:
+    """Durably update status via REST, falling back when REST says ``False``."""
     if _orchestrator_client and _thread_id:
         try:
-            await _orchestrator_client.update_thread_status(_thread_id, status)
-            return
+            if pinned_agent_id is None:
+                updated = await _orchestrator_client.update_thread_status(
+                    _thread_id,
+                    status,
+                )
+            else:
+                updated = await _orchestrator_client.update_thread_status(
+                    _thread_id,
+                    status,
+                    pinned_agent_id=pinned_agent_id,
+                )
+            if updated:
+                return True
         except Exception:
             pass
     # Fallback to direct DB
     if _session and _session.postgres_conn and _thread_id:
         try:
-            await _session.postgres_conn.update_thread_status(_thread_id, status)
+            if pinned_agent_id is not None:
+                if status != "ended":
+                    return False
+                async with _session.postgres_conn.acquire() as conn:
+                    async with conn.transaction():
+                        thread = await conn.fetchrow(
+                            "SELECT agent_id, execution_lane FROM threads "
+                            "WHERE id = $1::uuid FOR UPDATE",
+                            _thread_id,
+                        )
+                        if (
+                            thread is None
+                            or str(thread["execution_lane"] or "") != "pinned"
+                            or str(thread["agent_id"] or "") != str(pinned_agent_id)
+                        ):
+                            return False
+                        reciprocal = await conn.fetchval(
+                            "SELECT 1 FROM agents WHERE id = $1::uuid "
+                            "AND thread_id = $2::uuid FOR SHARE",
+                            pinned_agent_id,
+                            _thread_id,
+                        )
+                        if reciprocal is None:
+                            return False
+                        updated = await conn.fetchval(
+                            "UPDATE threads "
+                            "SET status = 'ended', "
+                            "    ended_at = CURRENT_TIMESTAMP, "
+                            "    control_admission_agent_id = NULL "
+                            "WHERE id = $1::uuid AND agent_id = $2::uuid "
+                            "AND status <> 'suspended' RETURNING id",
+                            _thread_id,
+                            pinned_agent_id,
+                        )
+                        return updated is not None
+            if status == "ended":
+                await _session.postgres_conn.end_thread(_thread_id)
+            else:
+                await _session.postgres_conn.update_thread_status(_thread_id, status)
+            return True
         except Exception as e:
             logger.warning(f"Failed to update thread status to {status}: {e}")
+    return False
 
 
 async def _handle_idle_archive(ws: Optional[WebSocket] = None) -> None:
@@ -8015,10 +9122,9 @@ async def _handle_idle_archive(ws: Optional[WebSocket] = None) -> None:
             except Exception as e:
                 logger.warning(f"Idle title generation failed: {e}")
 
-        # 3. Set thread to 'ended' (still resumable — `ended` is the only inactive state).
-        await _update_thread_status("ended")
-
-        # 4. Git commit + push
+        # 3. Git commit + push. The caller immediately enters common teardown,
+        # which alone closes admission, drains controls, and performs the exact
+        # pinned-owner lifecycle CAS.
         if _session.workspace_manager:
             git_mgr = getattr(_session.workspace_manager, "git_manager", None)
             if git_mgr and git_mgr.is_active:

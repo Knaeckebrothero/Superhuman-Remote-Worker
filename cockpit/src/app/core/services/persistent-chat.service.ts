@@ -1,7 +1,7 @@
 import {computed, DestroyRef, effect, inject, Injectable, NgZone, signal, untracked} from '@angular/core';
 import {takeUntilDestroyed} from '@angular/core/rxjs-interop';
 import {HttpClient} from '@angular/common/http';
-import {firstValueFrom} from 'rxjs';
+import {firstValueFrom, Observable, Subscription, timeout} from 'rxjs';
 import {environment} from '../environment';
 import {Project, ThreadCloudDiffSummary, ThreadStatus} from '../models/api.model';
 import {FilePreview, ThreadUploadedFile, UploadStatus} from '../models/file.model';
@@ -44,15 +44,12 @@ import {CapabilitiesService} from './capabilities.service';
  *  • Client → server: POST /api/persistent/threads/{id}/input (messages) and
  *    POST /api/persistent/threads/{id}/interrupt (interrupt). Canonical REST.
  *
- *  • Control plane: the agent's existing WebSocket handler is retained for the
- *    smaller verbs — approve/deny, slash commands, mode + narration + config
- *    updates, vm-upgrade. Reason: these only fire while the user is actively
- *    in the cockpit. A future PR can fold them into a generic
- *    POST /control endpoint, but doing so requires invasive refactoring of
- *    the agent's WS dispatch (moving its `_ws_send` error returns over to
- *    proper HTTP semantics + broadcasting success notifications via
- *    `_broadcast` so SSE consumers see them too). Out of scope for the
- *    migration that gets browser-close-survival to users.
+ *  • Control plane: mode + narration assignments use the orchestrator's
+ *    durable REST inbox for every session. Their result still arrives through
+ *    the journal/SSE after the serving owner applies it. The agent's existing
+ *    WebSocket handler remains for the smaller verbs that have not yet gained
+ *    a safe durable contract — approve/deny, slash commands, config updates
+ *    and vm-upgrade.
  *
  * `gone_beyond_horizon`: the server emits this single named event when the
  * cursor is outside replay range (epoch mismatch or seq older than retention).
@@ -205,6 +202,26 @@ export interface SessionTask {
 type ConnectionState = 'disconnected' | 'connecting' | 'connected' | 'error';
 export type PermissionMode = 'supervised' | 'auto_accept' | 'autonomous';
 export type NarrationMode = 'silent' | 'verbose' | 'auto';
+
+type DurableScalarControl =
+    | {method: 'mode.set'; mode: PermissionMode}
+    | {method: 'narration.set'; mode: NarrationMode};
+
+interface DurableControlOutboxItem {
+    threadId: string;
+    request: DurableScalarControl & {client_request_id: string};
+    attempts: number;
+    ordinal: number;
+}
+
+interface DurableControlMarker {
+    method: DurableScalarControl['method'] | null;
+    ordinal: number;
+}
+
+interface DurableControlError extends DurableControlMarker {
+    message: string;
+}
 
 /** Human-readable labels for the closed session tool groups (transcript stamps). */
 const TOOL_GROUP_LABELS: Record<string, string> = {
@@ -930,6 +947,22 @@ export class PersistentChatService {
     /** Depth cap for `controlOutbox`. These are user clicks, so the realistic
      *  depth is 1–2; the cap only stops a wedged socket growing it forever. */
     private static readonly CONTROL_OUTBOX_MAX = 32;
+    /**
+     * REST controls are serialized separately from the WebSocket outbox. A
+     * transient/ambiguous failure keeps the head in place and retries the same
+     * client_request_id, so a later setting cannot overtake a request that may
+     * already have committed server-side.
+     */
+    private durableControlOutbox: DurableControlOutboxItem[] = [];
+    private durableControlInFlight: DurableControlOutboxItem | null = null;
+    private durableControlSubscription: Subscription | null = null;
+    private durableControlRetryTimer: ReturnType<typeof setTimeout> | null = null;
+    private static readonly DURABLE_CONTROL_RETRY_DELAYS_MS = [250, 1000, 2000, 4000];
+    private static readonly DURABLE_CONTROL_RESPONSE_TIMEOUT_MS = 15_000;
+    private static readonly DURABLE_CONTROL_OUTBOX_MAX = 32;
+    private durableControlOrdinal = 0;
+    private durableControlAwaitingAck = new Map<string, DurableControlMarker>();
+    private durableControlError: DurableControlError | null = null;
     private intentionalClose = false;
     /**
      * Guard against double-opening the control WS while an async
@@ -2297,6 +2330,241 @@ export class PersistentChatService {
         void this._openControlWs(tid);
     }
 
+    /** Admit one of the deliberately small durable-control subset over REST.
+     *
+     * There is no lane branch here: pinned and stateless sessions share the
+     * same endpoint. The HTTP 202 means only that the orchestrator committed
+     * the request. It must not synthesize the resulting mode.changed /
+     * narration.changed frame; the serving owner writes that acknowledgement
+     * through its journal allocator and the normal SSE reducer applies it.
+     */
+    private _sendDurableControl(control: DurableScalarControl): void {
+        const threadId = this.threadId();
+        if (!threadId || this.intentionalClose) return;
+        const ordinal = ++this.durableControlOrdinal;
+        // Keep an ambiguous/in-flight head exactly where it is, but collapse
+        // later unsubmitted assignments of the same scalar to the user's
+        // newest intent. Removing then appending preserves order relative to
+        // the other scalar.
+        for (let index = this.durableControlOutbox.length - 1; index >= 0; index--) {
+            const queued = this.durableControlOutbox[index];
+            const ambiguousRetryHead =
+                this.durableControlRetryTimer !== null &&
+                queued === this.durableControlOutbox[0];
+            if (
+                queued !== this.durableControlInFlight &&
+                !ambiguousRetryHead &&
+                queued.threadId === threadId &&
+                queued.request.method === control.method
+            ) {
+                this.durableControlAwaitingAck.delete(
+                    queued.request.client_request_id,
+                );
+                this.durableControlOutbox.splice(index, 1);
+                break;
+            }
+        }
+        if (
+            this.durableControlOutbox.length >=
+            PersistentChatService.DURABLE_CONTROL_OUTBOX_MAX
+        ) {
+            this._setDurableControlError(
+                {method: control.method, ordinal},
+                this.transloco.translate('chat.control.backpressure'),
+            );
+            return;
+        }
+        const item: DurableControlOutboxItem = {
+            threadId,
+            request: {
+                ...control,
+                client_request_id: crypto.randomUUID(),
+            },
+            attempts: 0,
+            ordinal,
+        };
+        // Register before the HTTP request starts. The serving owner can
+        // journal the result over SSE before the orchestrator's 202 reaches
+        // this tab (especially on an idempotent retry).
+        this.durableControlAwaitingAck.set(item.request.client_request_id, {
+            method: item.request.method,
+            ordinal: item.ordinal,
+        });
+        this.durableControlOutbox.push(item);
+        this._flushDurableControlOutbox();
+    }
+
+    /** Single-flight FIFO drain. An ambiguous failure leaves the item at the
+     * head and therefore also holds every later setting behind it. Reusing the
+     * UUID makes a masked commit safe: the orchestrator returns the original
+     * admission instead of allocating a second request sequence. */
+    private _flushDurableControlOutbox(): void {
+        if (this.durableControlInFlight || this.durableControlRetryTimer) return;
+
+        let item = this.durableControlOutbox[0];
+        while (
+            item &&
+            (this.intentionalClose || item.threadId !== this.threadId())
+        ) {
+            this.durableControlOutbox.shift();
+            item = this.durableControlOutbox[0];
+        }
+        if (!item) return;
+
+        this.durableControlInFlight = item;
+        item.attempts += 1;
+        let settledSynchronously = false;
+        let response$: Observable<unknown>;
+        try {
+            response$ = this.http.post(
+                `${environment.apiUrl}/persistent/threads/${item.threadId}/controls`,
+                item.request,
+            ).pipe(
+                timeout({first: PersistentChatService.DURABLE_CONTROL_RESPONSE_TIMEOUT_MS}),
+            );
+        } catch (err) {
+            settledSynchronously = true;
+            this._handleDurableControlFailure(item, err);
+            return;
+        }
+
+        const subscription = response$.subscribe({
+            next: () => {
+                settledSynchronously = true;
+                this._finishDurableControlAdmission(item);
+            },
+            error: (err: unknown) => {
+                settledSynchronously = true;
+                this._handleDurableControlFailure(item, err);
+            },
+            // HttpClient normally emits one body and completes. Treat a valid
+            // empty 202 response as admitted too, without relying on a body.
+            complete: () => {
+                settledSynchronously = true;
+                this._finishDurableControlAdmission(item);
+            },
+        });
+        if (!settledSynchronously && this.durableControlInFlight === item) {
+            this.durableControlSubscription = subscription;
+        } else {
+            subscription.unsubscribe();
+        }
+    }
+
+    private _finishDurableControlAdmission(item: DurableControlOutboxItem): void {
+        if (this.durableControlInFlight !== item) return;
+        this.durableControlSubscription?.unsubscribe();
+        this.durableControlSubscription = null;
+        this.durableControlInFlight = null;
+        if (this.durableControlOutbox[0] === item) {
+            this.durableControlOutbox.shift();
+        }
+        // Deliberately ignore the response body. Only the owner's durable
+        // journal acknowledgement is authoritative client state.
+        this._flushDurableControlOutbox();
+    }
+
+    private _handleDurableControlFailure(
+        item: DurableControlOutboxItem,
+        err: unknown,
+    ): void {
+        if (this.durableControlInFlight !== item) return;
+        this.durableControlSubscription?.unsubscribe();
+        this.durableControlSubscription = null;
+        this.durableControlInFlight = null;
+
+        if (
+            this._isRetryableDurableControlFailure(err) &&
+            !this.intentionalClose &&
+            this.threadId() === item.threadId &&
+            this.durableControlOutbox[0] === item
+        ) {
+            const delays = PersistentChatService.DURABLE_CONTROL_RETRY_DELAYS_MS;
+            const delay = delays[Math.min(item.attempts - 1, delays.length - 1)];
+            console.warn(
+                '[persistent-chat] control admission outcome unknown; retrying ' +
+                `${item.request.method} with the same request id`,
+            );
+            this.durableControlRetryTimer = setTimeout(() => {
+                this.durableControlRetryTimer = null;
+                this._flushDurableControlOutbox();
+            }, delay);
+            return;
+        }
+
+        if (this.durableControlOutbox[0] === item) {
+            this.durableControlOutbox.shift();
+        }
+        this.durableControlAwaitingAck.delete(item.request.client_request_id);
+        if (!this.intentionalClose && this.threadId() === item.threadId) {
+            const detail = (err as {error?: {detail?: unknown}; message?: unknown})
+                ?.error?.detail;
+            this._setDurableControlError(
+                {method: item.request.method, ordinal: item.ordinal},
+                typeof detail === 'string'
+                    ? this.sanitizeError(detail)
+                    : this.transloco.translate('chat.control.admissionFailed'),
+            );
+        }
+        this._flushDurableControlOutbox();
+    }
+
+    private _isRetryableDurableControlFailure(err: unknown): boolean {
+        const status = (err as {status?: unknown})?.status;
+        if (typeof status !== 'number') return true;
+        return status === 0 || status === 408 || status === 425 ||
+            status === 429 || status >= 500;
+    }
+
+    private _setDurableControlError(
+        marker: DurableControlMarker,
+        message: string,
+    ): void {
+        this.durableControlError = {...marker, message};
+        this.error.set(message);
+    }
+
+    private _takeDurableControlAck(
+        params: Record<string, unknown>,
+        expectedMethod: DurableScalarControl['method'],
+    ): DurableControlMarker | null {
+        const requestId = params['client_request_id'];
+        if (typeof requestId !== 'string') return null;
+        const marker = this.durableControlAwaitingAck.get(requestId);
+        if (!marker || marker.method !== expectedMethod) return null;
+        this.durableControlAwaitingAck.delete(requestId);
+        return marker;
+    }
+
+    private _clearDurableControlErrorAfter(marker: DurableControlMarker | null): void {
+        const current = this.durableControlError;
+        if (
+            !marker ||
+            !current ||
+            marker.method !== current.method ||
+            marker.ordinal <= current.ordinal
+        ) {
+            return;
+        }
+        if (this.error() === current.message) {
+            this.error.set(null);
+        }
+        this.durableControlError = null;
+    }
+
+    private _clearDurableControlOutbox(): void {
+        if (this.durableControlRetryTimer) {
+            clearTimeout(this.durableControlRetryTimer);
+            this.durableControlRetryTimer = null;
+        }
+        this.durableControlSubscription?.unsubscribe();
+        this.durableControlSubscription = null;
+        this.durableControlInFlight = null;
+        this.durableControlOutbox = [];
+        this.durableControlAwaitingAck.clear();
+        this.durableControlError = null;
+    }
+
     /** Send a control-plane command. If the WS isn't open, queue the frame and
      *  open one; the send goes out as soon as the connection establishes. */
     private _sendControl(data: Record<string, unknown>): void {
@@ -2504,6 +2772,11 @@ export class PersistentChatService {
         // (onclose → _scheduleControlWsReconnect) never routes through
         // disconnect(), so an ordinary drop-and-reconnect still delivers.
         this.controlOutbox = [];
+        // REST setting controls are moment-scoped too. Cancel the browser
+        // request/timer and drop the queue on navigation; a request that had
+        // already committed remains safe because its URL and durable UUID are
+        // tied to the old thread and the owner will journal its result there.
+        this._clearDurableControlOutbox();
         const controlWs = this.controlWs;
         this.controlWs = null;
         if (controlWs) {
@@ -3283,13 +3556,11 @@ export class PersistentChatService {
 
     /** Change permission mode. */
     setMode(mode: PermissionMode): void {
-        this.permissionMode.set(mode);
-        this._sendControl({method: 'mode.set', mode});
+        this._sendDurableControl({method: 'mode.set', mode});
     }
 
     setNarrationMode(mode: NarrationMode): void {
-        this.narrationMode.set(mode);
-        this._sendControl({method: 'narration.set', mode});
+        this._sendDurableControl({method: 'narration.set', mode});
     }
 
     /** Update session config (model, temperature, etc.) at runtime.
@@ -3812,14 +4083,40 @@ export class PersistentChatService {
                 break;
 
             case 'mode.changed':
+                this._clearDurableControlErrorAfter(
+                    this._takeDurableControlAck(params, 'mode.set'),
+                );
                 if (coveredBySnapshot) break;
                 this.permissionMode.set((params['mode'] as PermissionMode) || 'supervised');
                 break;
 
             case 'narration.changed':
+                this._clearDurableControlErrorAfter(
+                    this._takeDurableControlAck(params, 'narration.set'),
+                );
                 if (coveredBySnapshot) break;
                 this.narrationMode.set((params['mode'] as NarrationMode) || 'auto');
                 break;
+
+            case 'control.rejected': {
+                const rejectedMethod =
+                    params['method'] === 'mode.set' ||
+                    params['method'] === 'narration.set'
+                        ? params['method']
+                        : null;
+                const rejectedMarker = rejectedMethod
+                    ? this._takeDurableControlAck(params, rejectedMethod)
+                    : null;
+                if (coveredBySnapshot) break;
+                this._setDurableControlError(
+                    rejectedMarker ?? {
+                        method: rejectedMethod,
+                        ordinal: ++this.durableControlOrdinal,
+                    },
+                    this.transloco.translate('chat.control.ownerRejected'),
+                );
+                break;
+            }
 
             case 'config.changed': {
                 if (!coveredBySnapshot && params['model']) {

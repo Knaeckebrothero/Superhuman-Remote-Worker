@@ -280,6 +280,7 @@ POST   /api/persistent/threads/{thread_id}/canvases/main/view-attachments/{attac
 POST   /api/persistent/threads/{thread_id}/canvases/main/view-attachments/{attachment_id}/renew gated:require_thread_owner
 GET    /api/persistent/threads/{thread_id}/citations                                    gated:require_thread_owner
 PATCH  /api/persistent/threads/{thread_id}/config                                       gated:require_thread_owner
+POST   /api/persistent/threads/{thread_id}/controls                                     gated:require_thread_owner
 GET    /api/persistent/threads/{thread_id}/ide                                          gated:require_thread_owner
 POST   /api/persistent/threads/{thread_id}/input                                        gated:require_approved_user
 POST   /api/persistent/threads/{thread_id}/interrupt                                    gated:require_approved_user

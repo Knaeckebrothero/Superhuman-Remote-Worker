@@ -380,7 +380,8 @@ class PostgresDB:
                 """
                 UPDATE threads
                 SET status   = 'ended',
-                    ended_at = CURRENT_TIMESTAMP
+                    ended_at = CURRENT_TIMESTAMP,
+                    control_admission_agent_id = NULL
                 WHERE id = $1
                 """,
                 thread_id,
@@ -393,7 +394,11 @@ class PostgresDB:
                 """
                 UPDATE threads
                 SET status        = $2,
-                    last_activity = CURRENT_TIMESTAMP
+                    last_activity = CURRENT_TIMESTAMP,
+                    control_admission_agent_id = CASE
+                        WHEN $2 IN ('ended', 'suspended') THEN NULL
+                        ELSE control_admission_agent_id
+                    END
                 WHERE id = $1
                 """,
                 thread_id,

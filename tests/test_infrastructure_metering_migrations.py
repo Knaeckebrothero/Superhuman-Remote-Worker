@@ -132,9 +132,17 @@ APP_COMPUTE_INTERVAL_EPOCH_SHAPE_REPAIR_MIGRATION = (
 )
 # Bump this whenever a new app migration lands — the assertion below is the
 # tripwire that says "a migration was added; check the snapshot was regenerated
-# and nothing was renumbered". Head as of the stateless-agents affinity work.
+# and nothing was renumbered". Head as of the durable session-control inbox.
+APP_THREAD_CONTROL_INBOX_MIGRATION = (
+    ROOT / "orchestrator/database/migrations/app/0119_thread_control_inbox.sql"
+)
+APP_THREAD_CONTROL_RECEIPT_INDEX = (
+    ROOT
+    / "orchestrator/database/migrations/app/0120_thread_control_receipt_idx.notx.sql"
+)
 APP_CURRENT_MIGRATION_HEAD = (
-    ROOT / "orchestrator/database/migrations/app/0117_run_queue_affinity.sql"
+    ROOT
+    / "orchestrator/database/migrations/app/0121_thread_control_validate_constraints.sql"
 )
 AUDIT_EXPANSION = (
     ROOT
@@ -688,6 +696,34 @@ def test_migration_heads_are_unique_and_snapshots_are_not_the_contract() -> None
         not in APP_COMPUTE_INTERVAL_EPOCH_SHAPE_REPAIR_MIGRATION.read_text()
     )
     assert "audit_schema_current" not in AUDIT_EXPANSION.read_text()
+
+
+def test_control_inbox_migration_preserves_and_constrains_narration_receipts() -> None:
+    sql = _compact(APP_THREAD_CONTROL_INBOX_MIGRATION.read_text())
+    index_sql = _compact(APP_THREAD_CONTROL_RECEIPT_INDEX.read_text())
+    validation_sql = _compact(APP_CURRENT_MIGRATION_HEAD.read_text())
+
+    assert "ADD COLUMN narration_mode TEXT" in sql
+    assert "ADD COLUMN control_admission_agent_id UUID" in sql
+    assert "control_admission_open" not in sql
+    assert "narration_mode TEXT NOT NULL" not in sql
+    assert "narration_mode TEXT NOT NULL DEFAULT 'auto'" not in sql
+    assert (
+        "metadata #>> '{config_override,interactive,narration_mode}'" in validation_sql
+    )
+    assert "IN ('silent', 'verbose', 'auto')" in validation_sql
+    assert "CONSTRAINT valid_narration_mode" in sql
+    assert "CHECK (narration_mode IN ('silent', 'verbose', 'auto')) NOT VALID" in sql
+    assert "CONSTRAINT uq_thread_control_identity UNIQUE (id, thread_id)" in sql
+    assert "FOREIGN KEY (control_request_id, thread_id)" in sql
+    assert "REFERENCES thread_control_requests(id, thread_id) NOT VALID" in sql
+    assert "CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS" in index_sql
+    assert "idx_thread_events_control_request" in index_sql
+    assert "VALIDATE CONSTRAINT valid_narration_mode" in validation_sql
+    assert (
+        "VALIDATE CONSTRAINT thread_events_control_request_thread_fkey"
+        in validation_sql
+    )
 
 
 def test_compute_foundation_is_immutable_and_lock_fix_is_superseding() -> None:

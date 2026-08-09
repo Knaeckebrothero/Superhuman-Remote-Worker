@@ -310,6 +310,7 @@ class TestAttentionSleepSweeper:
             if "UPDATE threads" in c.args[0]
         ]
         assert len(update_calls) >= 1
+        assert "control_admission_agent_id = NULL" in update_calls[0].args[0]
 
     @pytest.mark.asyncio
     async def test_skips_when_service_disabled(self):
@@ -599,6 +600,9 @@ class TestPhase5WakeIfSuspended:
         prov.create_agent_pod.assert_called_with(
             "thread-abc", config_name="session_base"
         )
+        wake_sql = " ".join(db_inner._fake_conn.execute.await_args.args[0].split())
+        assert "status = 'active'" in wake_sql
+        assert "control_admission_agent_id = NULL" in wake_sql
 
     @pytest.mark.asyncio
     async def test_skips_when_workspace_not_suspended(self):

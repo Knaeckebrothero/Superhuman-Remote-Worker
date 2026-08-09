@@ -521,7 +521,7 @@ class TestSendSessionAttachPayload:
         assert _FakeAsyncClient.calls == []
 
     @pytest.mark.asyncio
-    async def test_agent_reservation_cas_miss_rolls_back_before_thread_or_http(self):
+    async def test_thread_reservation_cas_miss_rolls_back_before_agent_or_http(self):
         conn = AsyncMock()
         conn.execute = AsyncMock(return_value="UPDATE 0")
         tx = AsyncMock()
@@ -541,11 +541,11 @@ class TestSendSessionAttachPayload:
 
         assert reserved is False
         assert conn.execute.await_count == 1
-        assert "current_job_id IS NULL" in conn.execute.await_args.args[0]
-        assert "status = 'ready'" in conn.execute.await_args.args[0]
+        assert "execution_lane = $3" in conn.execute.await_args.args[0]
+        assert "control_admission_agent_id = NULL" in conn.execute.await_args.args[0]
 
     @pytest.mark.asyncio
-    async def test_thread_lane_cas_is_inside_the_same_reservation_transaction(self):
+    async def test_agent_cas_follows_thread_lock_in_same_reservation_transaction(self):
         conn = AsyncMock()
         conn.execute = AsyncMock(side_effect=["UPDATE 1", "UPDATE 0"])
         tx = AsyncMock()
@@ -565,7 +565,9 @@ class TestSendSessionAttachPayload:
 
         assert reserved is False
         assert conn.execute.await_count == 2
-        assert "execution_lane = $3" in conn.execute.await_args_list[1].args[0]
+        assert "execution_lane = $3" in conn.execute.await_args_list[0].args[0]
+        assert "current_job_id IS NULL" in conn.execute.await_args_list[1].args[0]
+        assert "status = 'ready'" in conn.execute.await_args_list[1].args[0]
         tx.__aexit__.assert_awaited_once()
         assert tx.__aexit__.await_args.args[0] is RuntimeError
 
@@ -763,6 +765,109 @@ class TestSendSessionAttachPayload:
             await save_task
 
         assert order == ["delivery", "save"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("stored_narration", "expected_narration"),
+        [(None, "silent"), ("verbose", "verbose")],
+        ids=["legacy-inherited", "materialized-control-scalar"],
+    )
+    async def test_attach_overlays_first_class_control_scalars_on_resolved_config(
+        self, stored_narration, expected_narration
+    ):
+        thread = {
+            "id": "tid-1",
+            "user_id": "owner-1",
+            "metadata": {},
+            "permission_mode": "autonomous",
+            "narration_mode": stored_narration,
+        }
+        resolved = {
+            "agent": {
+                "interactive": {
+                    "permission_mode": "supervised",
+                    "narration_mode": "silent",
+                }
+            }
+        }
+        with (
+            patch.object(
+                orch_main.postgres_db,
+                "get_thread",
+                AsyncMock(return_value=thread),
+            ),
+            patch.object(
+                orch_main,
+                "_inject_lite_workspace_config",
+                side_effect=lambda value, **_kwargs: value,
+            ),
+            patch.object(orch_main, "_thread_project_ids", AsyncMock(return_value=[])),
+            patch.object(
+                orch_main,
+                "_revalidate_thread_project_ids",
+                AsyncMock(return_value=[]),
+            ),
+            patch.object(
+                orch_main,
+                "_resolve_authorized_thread_datasources",
+                AsyncMock(return_value=[]),
+            ),
+            patch.object(
+                orch_main, "_resolve_session_config", AsyncMock(return_value=resolved)
+            ),
+        ):
+            payload = await orch_main._assemble_session_attach_payload("tid-1")
+
+        interactive = payload["resolved_config"]["agent"]["interactive"]
+        assert interactive == {
+            "permission_mode": "autonomous",
+            "narration_mode": expected_narration,
+        }
+
+    @pytest.mark.asyncio
+    async def test_attach_materializes_scalars_in_legacy_config_fallback(self):
+        thread = {
+            "id": "tid-1",
+            "user_id": "owner-1",
+            "metadata": {},
+            "permission_mode": "auto_accept",
+            "narration_mode": "auto",
+        }
+        with (
+            patch.object(
+                orch_main.postgres_db,
+                "get_thread",
+                AsyncMock(return_value=thread),
+            ),
+            patch.object(
+                orch_main,
+                "_inject_lite_workspace_config",
+                side_effect=lambda value, **_kwargs: value,
+            ),
+            patch.object(orch_main, "_thread_project_ids", AsyncMock(return_value=[])),
+            patch.object(
+                orch_main,
+                "_revalidate_thread_project_ids",
+                AsyncMock(return_value=[]),
+            ),
+            patch.object(
+                orch_main,
+                "_resolve_authorized_thread_datasources",
+                AsyncMock(return_value=[]),
+            ),
+            patch.object(
+                orch_main, "_resolve_session_config", AsyncMock(return_value=None)
+            ),
+        ):
+            payload = await orch_main._assemble_session_attach_payload(
+                "tid-1", config_override={"llm": {"model": "m"}}
+            )
+
+        assert payload["resolved_config"] is None
+        assert payload["config_override"]["interactive"] == {
+            "permission_mode": "auto_accept",
+            "narration_mode": "auto",
+        }
 
     @pytest.mark.asyncio
     async def test_payload_carries_config_name(self):

@@ -1262,3 +1262,268 @@ non-optional queue control watermarks, exact pinned-agent fence and durable
 journal-write receipt. After that remain durable queued-turn UX, permission-row
 retirement, stateless ended-session wake, Path-A compaction persistence and the
 other S1 surrounds. None was scaffolded in this slice.
+
+# Session 6 — REST control inbox (2026-08-09)
+
+Branch: `feature/stateless-sessions-s1-completion`; not pushed. Continued from
+the reviewed snapshot boundary at `49b5b2a0`. The completion brief, its required
+feature-doc sections, the full implementation log and `turn_executor.py` were
+re-read before code. The worker lane remains out of scope and no
+`worker_batch` unit has been enqueued.
+
+## Browser proof debt closed before migration work — DONE
+
+The normal browser authentication path is now exercised rather than simulated:
+Chromium navigated from `https://localhost/sessions/<thread>` through
+`/auth/login`, the Keycloak login form, `/auth/callback`, and back to the
+Cockpit. `/auth/me` returned 200 and the resulting `srw_session` cookie was
+HttpOnly. No bearer header or request interception was installed.
+
+One honest supervised-gate attempt then used the existing stateless fixture and
+the concretely bound read-only call
+`list_files(path="", pattern="*", depth=0)`. The real card rendered with the
+same tool and args in all three places: the originating tab, that tab after a
+hard reload, and a concurrently opened second tab. Clicking the visible Stop
+action denied approval `22fd7e07-a581-45a5-87af-07cc8eade116`; the canonical
+REST decision returned 200, both tabs removed the card after the owner-journaled
+ack, and the next state snapshot contained zero pending permissions. Postgres
+confirmed the row was `denied`, `permission.request_batch` at epoch/seq
+`7/5039`, matching `permission.resolved` at `7/5040`, and no `tool.started` or
+`tool.completed` exists for its tool-call id. The queue settled `done` at
+`input_seq=consumed_seq=2374`, lease token 81.
+
+Harness failure retained: the first attempt matched the Cockpit URL before its
+SPA auth redirect completed and waited for a composer while Keycloak was still
+loading. It sent no input, created no permission row, and cleanup observed zero
+pending rows. The corrected harness raced the actual login form against the
+composer before proceeding; only then was the single real tool prompt sent.
+
+## Durable lane-free scalar controls — DONE, focused tests + k3d verified
+
+The safe initial subset is `mode.set` and `narration.set`; `interrupt` keeps its
+existing 501. Both pinned and stateless clients use the same owner-gated
+`POST /api/persistent/threads/{thread_id}/controls`. The public request and
+response contain no lane or pod identity. The orchestrator performs grant
+checks and admission only: it never allocates or writes a journal sequence and
+never publishes the desired scalar before the serving owner applies it.
+
+Migration 0119 adds `thread_control_requests`, a threads-row-serialized
+`control_seq_hwm`, an exact nullable pinned capability UUID, first-class
+permission/narration scalars, and independent `run_queue` control input/consumed
+watermarks. 0120 is a non-transactional concurrent unique receipt index; 0121
+backfills explicit legacy narration overrides and validates the narration and
+composite receipt constraints after 0119 releases its catalog locks. All three
+existing tables are locked together inside a retryable subtransaction before
+0119 DDL, so a failed later lock does not sleep while holding an earlier lock.
+The final from-zero PG15 replay measured **52 ms / 8 ms / 25 ms** for
+0119/0121/0120 and the checked-in snapshot matched exactly. Squawk 2.59.0
+reported **0 issues in 3 files**.
+
+Narration deliberately differs from the original “default auto” sketch. A
+legacy thread can inherit narration from an expert/account layer that SQL
+cannot resolve, so `NULL` is an explicit “not materialized yet” sentinel.
+Creation stores the resolved value; attach and snapshot fall back to resolved
+config only while the scalar is NULL; the first owner-applied control
+materializes it. This avoids silently changing existing users during migration.
+
+Admission is one transaction: lock the thread, allocate a commit-ordered
+request sequence, insert the idempotency-keyed request, and, for stateless
+threads, advance the control input watermark without disturbing a live lease.
+Pinned admission requires the exact reciprocal agent binding and a capability
+equal to that agent UUID. Every bind/resume path clears the credential; only an
+inbox-capable owner opens it after its writer and first drain are ready, and it
+closes before its final drain. A boolean gate was rejected during review because
+it could transfer truth from owner generation A to B. Internal ownerless admin
+threads remain supported with `IS NOT DISTINCT FROM NULL`; ordinary users still
+pass the normal owner gate.
+
+The lease owner drains at claim time and watches during a turn. It validates
+without mutating RAM, writes one correlated result frame through its own ordered
+writer, waits for the real database commit receipt, then transactionally
+publishes the scalar, terminal request and stateless consumed watermark under
+the current lease token or exact pinned-agent fence. The request/thread
+composite foreign key prevents cross-thread receipt links; one concurrent
+partial unique index prevents duplicate receipts. Recovery of “journal commit,
+finalization crash” reads the indexed receipt and finalizes without emitting a
+second frame. Mixed writer batches split control frames into singleton commits,
+so a lost control fence cannot drop an ordinary frame already queued behind it.
+Warm affinity reconciles RAM from the first-class DB scalars before every drain
+and after an ambiguous already-terminal finalizer.
+
+Completion now treats control watermarks independently from human input: a
+control committed while a stateless lease is live makes completion requeue
+until the owner-written receipt is terminal and the control consumed cursor
+catches up. Event pruning preserves a receipt linked to a pending request.
+Pinned lifecycle teardown uses an exact-owner status update, closes admission,
+drains, then changes status; archive and idle paths route through that common
+teardown rather than writing an unfenced terminal state. Conference teardown's
+exact-owner projection includes metadata, project and title so its hold-release
+wake is not silently lost. If a binding moves between close and final drain,
+the stale process skips lifecycle mutation but continues local cleanup; the
+successor adopts the request. User end and resume also explicitly NULL the
+capability. A stop-responsive LISTEN wait lets back-to-back control-only claims
+release asyncpg cooperatively, with a one-second cancellation backstop.
+
+A final lifecycle audit widened that invariant beyond the successful pinned
+smoke: generic agent end, drain-suspend, attention-sleep, both orphan sweeps,
+magic-link reactivation, officer respawn, both direct-DB terminal setters and
+agent deletion/GC now close the capability too. Agent deletion first locks
+every thread bound to (or carrying the capability of) the captured agent IDs,
+then deletes those exact still-eligible rows in the same transaction. This
+preserves admission's thread-before-agent lock order even when the capability
+was already closed, rather than relying on PostgreSQL to abort an inverted FK
+cleanup as a deadlock.
+
+The Cockpit uses one bounded, single-flight FIFO for both lanes. It registers
+the acknowledgement marker before starting HTTP (the SSE ack may beat 202),
+coalesces only unsent same-scalar assignments, keeps an ambiguous retry head,
+reuses its UUID across timeouts/0/408/425/429/5xx, and applies visible state only
+from the correlated owner-written journal frame. A later same-scalar ack can
+clear an earlier admission error; unrelated or older acks cannot. Snapshot
+overlay plus receipt-aware pruning closes reload/multi-tab recovery without
+inventing an orchestrator journal writer.
+
+## Live control proof and measurements
+
+Before trusting the proof, every running stateless pod returned one match for
+the final cooperative-watcher marker, the orchestrator returned one match for
+the 425 path, and the Cockpit source returned two matches for its durable REST
+timeout marker. The live database matched the exact SHA-256 checksums of
+0119–0121; narration was nullable/no-default, the capability was nullable UUID,
+both constraints were validated, and the receipt index was valid and unique.
+
+On the stateless fixture, a real BFF-cookie browser changed narration
+`auto → verbose`, hard-reloaded with `verbose` rendered, restored `auto`, then
+sent one same-UUID duplicate. The first cold UI acknowledgement took
+**5.713 s** (REST admission **35 ms**; owner result **29 ms**, including
+**15 ms** journal, and the claim drain **46 ms**). Warm restore took
+**1.163 s**; the same-value idempotency probe reached terminal `applied` in
+**574 ms**. Requests 5–7 each had exactly one matching receipt and all payload
+identity fields matched; the queue finished `done`, human input stayed
+`2374/2374`, control watermarks converged **7/7**, no lease owner remained, and
+the fixture scalar was restored to `auto`. Both final agent logs and the
+post-login browser console were error-free.
+
+On the pinned fixture, the browser intentionally clicked during cold resume.
+Registration kept admission closed, so four requests returned lane-free 425
+(**15/1/1/1 ms**) and all four reused client UUID
+`508c94b6-c4b3-4d31-b6fb-b1c02d13c660`. When the exact owner opened, that UUID
+admitted once in **20 ms**; UI acknowledgement arrived **7.808 s** after the
+original click. Reload rendered `verbose`; restore took **636 ms**; the
+same-UUID terminal retry took **191 ms**. Requests 4–6 each had one receipt,
+`applied_agent_id = accepted_agent_id`, no lease token, and matching
+request/client/sequence payload identity. Soft end returned in **157 ms**, left
+the thread ended with narration `auto`, NULL capability and zero pending
+requests, and removed the pinned pod. The nine console resource errors during
+provisioning were the expected connection/control 425s; after the first owner
+ack there were zero page or console errors.
+
+There is no pre-change control endpoint to compare with these timings. The
+important decomposition is that owner journal/finalization is **17–29 ms** and
+claim drains are **27–46 ms**; cold browser latency is provisioning/polling, not
+control processing. No `worker_batch` unit existed before or after either proof.
+
+## Final verification
+
+- Full Python: **15,150 passed / 11 failed / 121 skipped in 969.11 s**. The 11
+  failures are exactly the established environment baseline: no PostgreSQL on
+  localhost:5432, Python-3.14 MCP subprocess/transport behavior, and the
+  optional `arxiv` package absent. No feature test failed.
+- Full Cockpit: **1,803/1,803 passed in 9.44 s**. Both i18n checks passed
+  (**2,454 keys**); the production build completed in **9.681 s** with only the
+  existing initial/persistent-SCSS budget and CommonJS warnings.
+- Final lifecycle-focused set: **219/219 passed**. Queue/control regression set:
+  **53 passed / 95 skipped**. The broader independent runtime audit ran
+  **599 passing Python tests** and the control service audit ran
+  **227/227 Cockpit tests**; three read-only schema/runtime/client audits
+  reported no blocker.
+- Real PostgreSQL after the final lock-order patch: **95/95 queue/control tests
+  in 124.79 s**, plus **2/2 full-schema sweep prepare/bind tests in 17.69 s**.
+  The final scratch PG15 replay matched `schema_current.sql`; that observation
+  applied 0119/0121/0120 in **69/9/39 ms** (the earlier measured replay was
+  52/8/25 ms). The migration SQL was unchanged between them; the difference is
+  scratch-container/catalog timing, not a claimed regression. Squawk remained
+  **0 issues in 3 files**.
+- Ruff check and format-check passed on every touched Python path; the
+  `git diff --check` gate passed. Cockpit lint is represented by its configured
+  i18n and build gates above.
+- Final running-image proof used content digests, not Tilt tags. Both stateless
+  pods (`sha256:5b628c...`) contained the final watcher and direct-DB terminal
+  fence markers; the orchestrator (`sha256:0a1f98...`) contained the final 425
+  class and thread-before-agent delete predicate; the Cockpit
+  (`sha256:c5c997...`) contained the durable REST markers. All 16 namespace
+  pods were Running/Ready with zero restarts, and agent/orchestrator logs since
+  those starts had no matching traceback, unique violation, deadlock or LISTEN
+  cancellation error.
+- The live ledger checksums exactly matched local 0119–0121. Both deferred
+  constraints were validated and the one-receipt index was valid+unique. The
+  stateless fixture was `done`, unleased, human watermarks **2374/2374** and
+  control watermarks **7/7**; all seven stateless and six pinned requests had
+  exactly one receipt. Both fixture capabilities were NULL, the pinned fixture
+  was ended, pending controls were **0/13**, and `worker_batch` rows remained
+  **0**.
+
+## Failures and deviations retained
+
+1. The first stateless restore attempt changed the select before the settings
+   pane's thread + tool-group reads had anchored its diff baseline. The pane
+   correctly swallowed the edit and no request row existed. The harness now
+   waits for both responses; no database row was fabricated.
+2. The first post-migration warm claim logged one unobserved asyncpg
+   `unexpected connection_lost()` future when an immediately-created LISTEN
+   task was cancelled. Requests and watermarks were correct, but the lifecycle
+   warning was real; cooperative stop fixed it and the repeated live path was
+   clean.
+3. The first pinned cold-resume click received 409 while the exact capability
+   was closed, so the client treated a transient refusal as semantic. A narrow
+   `ControlAdmissionNotReady` now maps to lane-free 425 and uses the existing
+   same-UUID retry policy; all other conflicts stay 409. The final cold proof
+   exercised this route rather than waiting around it.
+4. The first successful pinned soft end left its old capability UUID populated.
+   Ended status still rejected admission and rebinding cleared the value, so it
+   could not cross owners, but the documented NULL-is-closed invariant was
+   false. End and resume now clear it explicitly; the repeated proof observed
+   NULL after teardown.
+5. The exact-owner status query initially projected metadata but omitted
+   project/title, making conference conclusion a silent no-op. The final query
+   carries the full helper input and focused officer tests pass.
+6. The shared k3d database contained an earlier draft 0119 checksum/schema.
+   Read-only audit found 10 terminal narration probe requests and their 10
+   linked probe events, zero pending/cross-thread rows, and no worker units. A
+   local-only transaction removed those probes and the one draft ledger row,
+   dropped only the draft 0119 objects, then the normal migration runner applied
+   final 0119–0121. The new orchestrator correctly refused startup both before
+   reconciliation and while the checksum differed. Its reload parent did not
+   retry migrations after startup failure, so the exact failed pod was force
+   deleted per the brief; the replacement applied all three checksums.
+7. A browser console count initially reported three errors, all expected 401
+   bootstrap requests before the Keycloak redirect. The final harness resets
+   diagnostics only after `/auth/me` proves the HttpOnly BFF session; stateless
+   post-login output is zero, and pinned readiness errors are separated from
+   post-ack output.
+8. The first final full-suite attempt exposed two non-environment failures: the
+   old `thread_input_enqueue` fake omitted the new control watermark columns,
+   so the read model raised `KeyError` before its assertions. The fake now
+   models both independent cursors; the focused set passed and the repeated
+   full suite returned to the exact 11-failure baseline. No production change
+   was made to hide the mismatch.
+9. One full-suite run was intentionally interrupted after **917 passed / 6
+   skipped** when the final lock audit found the bound-thread delete predicate.
+   Continuing it while Tilt/source changed would have produced an incoherent
+   number. The predicate was landed first, then the complete 969.11-second run
+   above was started from one stable source snapshot.
+10. The first closeout SQL used a guessed `lease_expires_at` name and a guessed
+    request-side receipt column; both read-only queries failed before returning
+    those projections. The schema uses `leased_until` and the receipt lives on
+    `thread_events.control_request_id`. Corrected queries produced the exact
+    unleased/watermark and one-receipt counts recorded above.
+
+## Phase boundary and remaining work
+
+This is a verified control-inbox phase boundary. Permission-row retirement is
+not hidden inside mode acknowledgement: rows do not carry lease identity, so a
+thread-wide sweep can delete a successor's gate. It still needs the lease-aware
+schema/reaper design already called out in §9.1. Stateless ended-session wake
+and the Path-A resume-compaction persistence bug also remain unverified and
+unbuilt, as do queued-turn durability and the other S1 surrounds. They were not
+scaffolded in this phase.

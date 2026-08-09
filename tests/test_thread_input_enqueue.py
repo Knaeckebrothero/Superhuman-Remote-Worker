@@ -49,6 +49,8 @@ class FakeConn:
             "state": "queued",
             "input_seq": message_seq,
             "consumed_seq": None,
+            "control_input_seq": 0,
+            "control_consumed_seq": 0,
         }
 
     def transaction(self):

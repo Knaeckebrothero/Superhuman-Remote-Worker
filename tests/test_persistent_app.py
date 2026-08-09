@@ -2243,6 +2243,14 @@ class TestHandleCompact:
 
 
 class TestHandleArchive:
+    @pytest.fixture(autouse=True)
+    def _common_teardown(self):
+        with patch(
+            "src.api.persistent_app._terminate_session", new=AsyncMock()
+        ) as teardown:
+            self.teardown = teardown
+            yield
+
     @pytest.mark.asyncio
     async def test_sends_error_when_session_none(self):
         ws = AsyncMock()
@@ -2408,6 +2416,7 @@ class TestHandleArchive:
             if c[0][0].get("method") == "session.ended"
         ]
         assert len(ended_calls) == 1
+        self.teardown.assert_awaited_once_with("archive")
         assert ended_calls[0]["params"]["thread_id"] == "test-thread-id"
 
 
@@ -4341,6 +4350,13 @@ class TestHandleConfigUpdateEnrichmentGate:
             "tools": {"canvas": ["get_canvas"], "shell": ["run_command"]},
         }
         assert original["tools"]["shell"] == ["run_command"]
+
+    @pytest.mark.parametrize("key", ["permission_mode", "narration_mode"])
+    def test_live_config_update_rejects_ordered_control_scalars(self, key):
+        from src.api.persistent_app import _sanitize_live_session_config_override
+
+        with pytest.raises(ValueError, match="session control endpoint"):
+            _sanitize_live_session_config_override({"interactive": {key: "autonomous"}})
 
     @pytest.mark.asyncio
     async def test_live_cross_category_tool_smuggling_never_reloads_tools(
