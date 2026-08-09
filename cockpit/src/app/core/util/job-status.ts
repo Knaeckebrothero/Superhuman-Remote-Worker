@@ -43,6 +43,31 @@ export function isRunningJobStatus(status: string | null | undefined): boolean {
 }
 
 /**
+ * Statuses from which a human can hand the job back with guidance.
+ *
+ * The rule is "stopped, and will not restart itself": the job is waiting on a
+ * person, so replying to it is meaningful.
+ *
+ * Narrower than the server, deliberately. `POST /api/jobs/{id}/resume` accepts
+ * every status except `completed` (main.py:13658), but two of those would be
+ * wrong to offer in a transcript card:
+ *
+ * - **`paused`** is dispatchable-and-unassigned — the dispatcher re-picks it on
+ *   its own, and the card is already showing a spinner for it
+ *   ({@link isRunningJobStatus}). A "continue" button under a spinner reads as
+ *   broken.
+ * - **`processing`/`created`/`waiting`/`reviewing`** are live; the job has not
+ *   asked for anything.
+ *
+ * So: `pending_review` (the frozen-for-review case this exists for), plus
+ * `failed` and `cancelled` (retry with guidance) — the same set the Jobs list
+ * offers plain Resume on, minus `paused` and `created`.
+ */
+export function canResumeJobStatus(status: string | null | undefined): boolean {
+    return status === 'pending_review' || status === 'failed' || status === 'cancelled';
+}
+
+/**
  * Coerce a job's JSONB-backed field into an object.
  *
  * `GET /api/jobs/{id}` returns `context` and `freeze_data` as raw JSON
