@@ -284,6 +284,11 @@ paying a stateless tax.
 
 ##### The protocol
 
+*(This subsection is the shape. The settled design below refines the key —
+`stop_identity` decomposes into three separate things — and replaces the
+advisory lock and the progress-marker mechanics. Where they differ, the settled
+design wins.)*
+
 **Accept.** The agent's report becomes a durable *command row* written in one
 transaction under the lease fence, keyed `(job_id, lease_token, stop_identity)`,
 with `ON CONFLICT DO NOTHING`. Accept returns 202 immediately. A stolen
@@ -295,7 +300,7 @@ time §5.4.3 charges against the batch budget, since the agent no longer waits o
 the pipeline.
 
 **Finalize.** A leader-elected finalizer drains commands and executes the
-effects, mirroring `run_queue_reaper`'s shape: the advisory lock avoids duplicate
+effects, mirroring `run_queue_reaper`'s shape: the election avoids duplicate
 *work*, correctness comes from a per-command CAS, so the dual-leader window is
 safe by construction. Each effect advances a progress marker **in the same
 transaction as the effect it records**, so a crash resumes at the next
@@ -315,7 +320,7 @@ The inventory classifies all ~37 effects; they reduce to four treatments.
 | Already idempotent | change record (PK + `ON CONFLICT`), session wake (partial unique dedup index), `pause_job`/`claim_delegation_resume`/loop barrier (real CAS) | leave alone — **these are the house patterns to extend, not replace** |
 | Blind writes, value-idempotent | status, `completed_at`, freeze stash, merge status | add the missing predicate; `completed_at` needs `COALESCE` like `failed_at` already has |
 | Counters | `infra_transient.attempts`, `recovery_attempts`, gate `bounces`, `auto_continue_drains`, memory/LLM-outage attempts, KB TTL | key on the **completion attempt**, not the invocation. Today every replay silently consumes retry budget and enough replays turn a recoverable job into a terminal failure |
-| Non-idempotent external effects | critic spawn, subjob graft, cloud apply, terminal merge, VM/pod/PVC delete, S3 snapshot, notifications | **write-ahead intent**: record `(job_id, effect_kind, attempt)` *before* doing it, so a crash between intent and effect is detectable and the effect is claimable exactly once. For spawns, prefer a natural unique key — a unique index on `(parent_job_id, verification_round)` would close the duplicate-critic hole outright |
+| External effects | critic spawn, subjob graft, cloud apply, terminal merge, VM/pod/PVC delete, S3 snapshot, notifications | **Superseded by (4) in the settled design below** — these do *not* form one class. Most are naturally idempotent once keyed correctly (k8s UID preconditions, deterministic S3 keys, WebDAV paths); a few genuinely need a reconcile probe; notifications can never be exactly-once and are declared at-least-once. A single universal intent table keyed `(job_id, effect_kind, attempt)` was the first draft's answer and is **not** the design |
 
 ##### Coexistence with the pinned lane
 
@@ -338,11 +343,53 @@ as a side effect.
   retry counter advances**.
 - A pinned job's completion is behaviorally identical to today's.
 
-##### Settled design (2026-08-09)
+Added after the external review — each of these is a failure mode the first
+draft would have shipped:
+
+- **Wedge the finalizer** (SIGSTOP it mid-effect). The job must become
+  rescuable once its lease expires, and must reach a terminal state by
+  `deadline_at`. A job that is stuck *and* matched by no sweep is the
+  stuck-namespace bug and fails this gate.
+- **Kill the leader ungracefully** (no clean shutdown, no lease release).
+  Another finalizer must take over within seconds, not TCP-keepalive minutes.
+- **Delete a workspace pod, recreate one with the same name, then resume the
+  command.** The replacement must survive — this is the ABA case that a
+  name-only delete gets wrong.
+- **Block one effect group indefinitely** (point cloud sync at an unreachable
+  host). Every other group must still complete, and the workspace must still be
+  torn down.
+- **Deploy a finalizer whose effect list changed while commands are in flight.**
+  In-flight rows must either drain first or refuse loudly — never silently skip
+  the wrong effects.
+- **Run the same report twice concurrently** (not sequentially): one 202, one
+  409, exactly one execution.
+
+##### Settled design (2026-08-09, revised same day against external review)
 
 The seven open questions are answered below, against the code as it stands after
 the consolidation. An eighth decision the questions missed is recorded as **(6)**
 — it is load-bearing, and moving the status write last is unsafe without it.
+
+The first draft of this section was then checked against prior art (durable-
+execution engines, the Postgres queue field, per-system idempotency
+guarantees) and one local experiment. **Five things in it were wrong**, and are
+corrected below rather than left for implementation to discover:
+
+1. The progress marker was a JSONB column. Postgres has no partial JSONB
+   update, so 37 sequential effects cost quadratic write volume and TOAST-rewrite
+   the whole value for the back half of every completion. It is now its own table.
+2. The reconcile probe assumed a crashed predecessor. The common case is a
+   *slow* one, still alive — probing it returns "not done" and doubles the effect.
+3. The workspace-teardown probe had an ABA hole: a controller can recreate a pod
+   under the same name, and the probe would authorize deleting the replacement.
+4. The effects were one linear chain, so one wedged effect blocked every later
+   one — including the pod/PVC deletes, turning a customer's cloud outage into
+   our resource leak.
+5. The critic index silently did nothing for rows whose round key is absent,
+   because NULLs are distinct in a unique index. Confirmed by experiment.
+
+The liveness predicate in (6) also survived review only in shape: as first
+written it reproduced Kubernetes' stuck-finalizer failure mode almost exactly.
 
 **(1) The command row is its own table**, `job_completion_commands`, modelled on
 `thread_control_requests` (migration 0119) rather than on `run_queue`. Three
@@ -372,10 +419,11 @@ CREATE TABLE job_completion_commands (
     attempts             INT  NOT NULL DEFAULT 0,
     max_attempts         INT  NOT NULL DEFAULT 5,
     run_after            TIMESTAMPTZ NOT NULL DEFAULT now(),
-    finalizing_until     TIMESTAMPTZ,
-    finalizing_by        TEXT,
+    lease_expires_at     TIMESTAMPTZ,        -- renewable; the liveness signal
+    deadline_at          TIMESTAMPTZ NOT NULL,  -- absolute cap, NEVER extended
+    finalizing_by        TEXT,               -- diagnostics only
+    code_version         TEXT NOT NULL,      -- gates recovery across deploys
 
-    effect_log           JSONB NOT NULL DEFAULT '{}'::jsonb,
     outcome              JSONB,
     finalized_at         TIMESTAMPTZ,
     error_code           TEXT,
@@ -388,11 +436,43 @@ CREATE TABLE job_completion_commands (
     CONSTRAINT job_completion_terminal_shape CHECK (
         state <> 'done' OR (outcome IS NOT NULL AND finalized_at IS NOT NULL))
 );
+
+-- Progress marker: ONE ROW PER EFFECT, never a JSONB log on the command.
+CREATE TABLE job_completion_effects (
+    command_id   UUID NOT NULL REFERENCES job_completion_commands(id) ON DELETE CASCADE,
+    effect_name  TEXT NOT NULL,          -- STABLE NAME, never an ordinal
+    effect_group TEXT NOT NULL,          -- independently retryable unit, see (4)
+    state        TEXT NOT NULL DEFAULT 'pending',
+    attempts     INT  NOT NULL DEFAULT 0,
+    intent_at    TIMESTAMPTZ,            -- written BEFORE the external call
+    complete_by  TIMESTAMPTZ,            -- strictly shorter than the command lease
+    completed_at TIMESTAMPTZ,
+    detail       JSONB NOT NULL DEFAULT '{}'::jsonb,  -- e.g. captured k8s UIDs
+    error_code   TEXT,
+    PRIMARY KEY (command_id, effect_name)
+);
 ```
 
-States are `pending | finalizing | done | parked | superseded`, app-validated (no
-CHECK), matching `run_queue`'s convention. `effect_log` is the per-effect
-progress marker — see (4).
+Command states are `pending | finalizing | done | parked | superseded`,
+app-validated (no CHECK), matching `run_queue`'s convention.
+
+**Why a table and not a JSONB column.** Postgres has no in-place partial update
+of a JSONB value: `jsonb_set` assigns a whole new value and MVCC writes a whole
+new tuple, and once the value passes the ~2 kB TOAST threshold *every* update
+duplicates the entire value plus its WAL. Thirty-seven sequential updates is
+therefore quadratic write volume, TOASTing for the back half of every
+completion. Append-only rows are linear, immutable, and never need reclaiming.
+This is also what DBOS does — `operation_outputs`, one row per step — and DBOS
+is the closest existing analogue to this design (Postgres-backed, no replay,
+skip-already-executed). Four of five surveyed engines are append-only.
+
+**Why a stable name and not an ordinal.** DBOS keys steps by ordinal and has to
+pin recovery to a code version to survive it. With an ordinal key, inserting an
+effect at position 5 silently corrupts every in-flight command on the next
+deploy — the resumed finalizer skips the wrong effects. `code_version` on the
+command row still exists as a backstop, and **the rule for a version mismatch
+must be written down before this ships**: drain-before-deploy, or
+refuse-and-alert. Not left implicit.
 
 **(2) `stop_identity` was conflating three things**, which is why it resisted
 definition. They separate cleanly:
@@ -401,8 +481,16 @@ definition. They separate cleanly:
   *stop* and stores alongside `freeze_data`, so an HTTP retry reuses it. Accept
   is `ON CONFLICT (job_id, client_report_id) DO NOTHING`; on conflict it compares
   `payload_digest`. Equal ⇒ return the recorded outcome (the exact-retry
-  contract). Different ⇒ **409, fail closed** — a divergent payload under a
-  reused key is a bug, not a retry.
+  contract). Divergent payload ⇒ **422**. Same key while the first is still
+  being finalized ⇒ **409**. Those two were collapsed onto 409 in the first
+  draft, which is wrong because they carry *opposite* client retry policies: 409
+  means retry, it will succeed; 422 means never retry, the payload is wrong.
+  This follows `draft-ietf-httpapi-idempotency-key-header-07`, which also names
+  the digest an "idempotency fingerprint". (Stripe uses 400 for the mismatch, so
+  the ecosystem splits; the draft's split is the operationally useful one.) The
+  digest must cover the operation identity, not just the body, and the response
+  carries an `Idempotent-Replayed` marker so a caller can distinguish "I just did
+  this" from "this was already done".
 - **Fence** — `accepted_lease_token` XOR `accepted_agent_id`, the same
   discriminated pair `thread_control_requests` uses, because the two lanes prove
   ownership differently and neither should be forced into the other's shape.
@@ -418,16 +506,63 @@ definition. They separate cleanly:
 suspected but did not pin down: pinned jobs have no run_queue lease at all, so
 every pinned report for a job would collapse onto one key.
 
+**Retention is a correctness property here, not housekeeping.** Stripe prunes
+idempotency keys at 24 h and states that a key reused after pruning produces a
+*brand-new operation* — silently. A command can sit `parked` awaiting an operator
+for days, so **`job_completion_commands` must never be pruned on a timer while
+`pending`, `finalizing` or `parked`**, and retention for `done` rows must exceed
+the maximum crash-to-resume lag. Retain failures far longer than successes
+(River keeps discarded jobs 7 days against 24 h for completed — the asymmetry is
+deliberate and worth copying).
+
 **(3) The finalizer speaks `run_queue`'s dialect verbatim** — `attempts` /
 `max_attempts` / `run_after` backoff / `parked`, with the same `5s × attempts ×
-(1 + U(0, 0.2))` scale and the same per-row CAS. `finalizing_until` is the
-visibility timeout, `finalizing_by` is diagnostics-only, and the leader gate is a
-new session-scoped advisory lock in `lock_ids.py` (`COMPLETION_FINALIZER_ID`,
-"SRW_FINL"). As with the reaper, the lock dedups *work* and the per-row CAS
-provides *correctness*, so the dual-leader window is safe by construction rather
-than by the election. `parked` is an operator worklist with an `unpark` verb,
-same as `run_queue`. Deliberately one dialect, not two: an operator who has
-learned the queue's semantics already knows the finalizer's.
+(1 + U(0, 0.2))` scale and the same per-row CAS. That dialect was checked against
+the field and matches what River and pgmq converged on, down to pgmq keeping the
+CAS guard *inside* the claiming UPDATE with a comment saying it is needed even
+with `SKIP LOCKED`. `parked` is an operator worklist with an `unpark` verb.
+Deliberately one dialect, not two.
+
+Two additions the first draft lacked:
+
+- **`deadline_at` is an absolute cap set once and never extended.** Without it, a
+  finalizer that heartbeats but makes no progress wedges its job permanently and
+  silently — trading a false-positive bug for a liveness bug, which is worse
+  because nothing reports it. Step Functions caps task duration "regardless of
+  the number of `SendTaskHeartbeat` requests received"; SQS caps at 12 h
+  regardless of visibility extensions.
+- **A global retry token bucket.** A mass failure (the Kubernetes API being
+  briefly unavailable) must not let hundreds of parked commands retry-storm the
+  very API that is failing.
+
+**Leader election uses a lease row, not a session advisory lock.** This reverses
+the first draft. A session-scoped `pg_advisory_lock` held by a hard-powered-off
+or partitioned pod is not released until TCP keepalives expire — on Linux
+defaults, **~2 h 11 m**, during which no job in the system completes and nothing
+errors. Postgres defaults every keepalive knob to "OS default" and
+`client_connection_check_interval` to disabled. Session advisory locks are also
+silently broken by PgBouncer in transaction mode (its own matrix says "Never"),
+and they are never replicated, so a replica promotion vaporizes all leader state
+at once. River — solving this exact problem in Postgres — reserves advisory locks
+for a deprecated slow path and uses an expiring `river_leader` row instead:
+elect via `INSERT … ON CONFLICT DO NOTHING`, re-elect via an UPDATE keyed on
+`(leader_id, elected_at)` so an old term cannot renew a newer one, reap via
+`DELETE … WHERE expires_at < now()`. Failover becomes seconds, it survives
+promotion, it works through any pooler, and it is observable with one SELECT.
+
+The correctness argument is unchanged and was confirmed as the recognized one:
+the election dedups *work*, fencing tokens plus per-row CAS provide
+*correctness*. Note that client-go's leader election states outright that it
+"does not guarantee that only one client is acting as a leader (a.k.a.
+fencing)" — so a dual-leader window must be survivable by construction, never
+by assuming the election prevents it.
+
+**Alarm on zero leaders, not just on duplicates.** GitLab shipped an incident
+where a transient disconnect left a component permanently non-leader after its
+lease renewal failed; leader-only work simply stopped, silently. Here that means
+no job completes. The alarms are: zero leaders, and **max age of the oldest
+unfinalized command** — age, not count, because count looks healthy right up
+until it doesn't.
 
 Pinned jobs run the finalizer **inline in the request**, so the agent still gets
 its `200` with `actions`. Stateless jobs get `202` and the background drain.
@@ -444,28 +579,143 @@ competing with three existing ones.
 - *Cheaply keyable* — give the effect a natural unique key and the hole closes
   for both lanes with no protocol at all. The critic spawn is the case that
   matters, and it is viable: the child already carries `verification_round` in
-  its context (`main.py:15905`), so a partial unique index on
-  `jobs (parent_job_id, (context->>'verification_round'))
-  WHERE context->>'verification_target' IS NOT NULL
-    AND status NOT IN ('failed','cancelled')`
-  makes the duplicate-critic race a constraint violation instead of an
-  unwarranted approval. **Known constraint:** a critic that reached `completed`
-  without recording a round would block a respawn of that round. Verified not to
-  be a live spawn path — `unstick_reviewing_parents` moves the target to
-  `pending_review` rather than respawning — and the escape hatch is to cancel the
-  dead critic, which drops it out of the partial index.
-- *Genuinely external and unkeyable* — cloud apply, terminal merge, subjob graft,
-  VM/pod/PVC delete, S3 snapshot, notifications. These use `effect_log` on the
-  command row: intent written before, completion written after, both in the
-  command's own transaction. A crash between them is therefore *detectable*, and
-  resume runs a **reconcile probe** rather than blindly replaying. Naming that
-  probe is part of implementing each effect, and the four hard ones are:
-  terminal merge → does the merge commit exist on `main`; graft → does the commit
-  exist on the parent branch under this ordinal; cloud apply → compare the
-  manifest against the recorded intent rather than treating our own writes as
-  external divergence (which is today's `cloud-conflict` park); workspace
-  teardown → does the pod/PVC still exist. An effect whose probe cannot be
-  written does not get to be replayed automatically; it parks for an operator.
+  its context (`main.py:15905`). The shape has direct production precedent —
+  River enforces unique jobs with a partial unique index over its mutable `state`
+  column — but the first draft's DDL had a hole and needs four fixes. See
+  **"The critic index, in full"** below; it is step 1 of the rollout and is the
+  only part of Gate 3 shipping before the protocol.
+- *Naturally idempotent once keyed correctly* — **most of the external set, which
+  the first draft got wrong by lumping them under "needs a probe".** Under stated
+  conditions these need no probe at all: S3 `PutObject` to a deterministic key
+  (body byte-identical, bucket unversioned — a snapshot embedding mtimes breaks
+  this), S3 `DeleteObject`, WebDAV `PUT`/`DELETE` (idempotent per RFC 9110 §9.2.2,
+  though version history and trash are not — accept that churn), `git push` of an
+  already-pushed ref, `git merge` of an already-merged commit, and cloud VM
+  deletes. Kubernetes deletes belong here too, but only with the right key —
+  see below.
+- *Genuinely needs a probe* — the Gitea PR merge, Gitea branch creation, the
+  subjob graft commit, Nextcloud chunked upload.
+- *Cannot be made exactly-once, and is therefore declared at-least-once* —
+  SMTP and push notifications. RFC 5321 concedes duplicate delivery rather than
+  solving it, and `Message-ID` obliges no MTA to deduplicate. The first draft's
+  rule — "an effect whose probe cannot be written parks for an operator" — is
+  **wrong here**: parking a job because an email might send twice is far worse
+  than the duplicate. Declare them at-least-once, set a deterministic Message-ID
+  as cheap best-effort, and use the command key as ntfy's **sequence ID**, which
+  makes a duplicate publish *replace* the notification rather than stack a second.
+
+**Kubernetes deletes: capture the UID, don't probe.** The first draft's probe
+("does the pod/PVC still exist") has an ABA hole — between crash and resume a
+controller can recreate a Pod or PVC under the identical name, the probe says
+"exists", and the finalizer deletes the *replacement*. Record `metadata.uid` in
+the effect row's `detail` when planning the delete, then pass it as
+`DeleteOptions.preconditions.uid`. All three outcomes are then unambiguous: 2xx
+deleted, 404 already gone, **409 a different object holds the name, so mine is
+already gone**. Note `kubectl delete` cannot do this; it must go through the
+client's `V1Preconditions`. Note also that a 2xx delete means *accepted*, not
+completed — `pvc-protection` holds objects in `Terminating` while a pod mounts
+them, so any effect that depends on "gone" must still poll. Conversely, K8s
+*creates* are natively keyed: `metadata.name` derived from the command key gives
+409 `AlreadyExists`, which is a success signal.
+
+**Probes must be written correctly, and two of the first draft's were not.**
+Terminal merge is *not* "is the commit an ancestor of `main`" — that works for
+merge-commit and fast-forward and **fails for squash and rebase**, where Gitea
+mints new commits the original SHA never becomes an ancestor of. Use
+`GET /repos/{o}/{r}/pulls/{i}/merge` → 204 merged / 404 not merged, and **key on
+the status code, never the body** (that handler writes 204 then falls through, so
+the body can carry a 404 payload). Bare 405 is not usable as "already merged" —
+the same handler returns it for six other causes. For the graft, deterministic
+commit SHAs are too brittle to dedup on, since any unrelated push changes the
+parent and therefore the SHA; put a unique trailer carrying the command key in
+the commit message and probe with `git log --grep`.
+
+**A probe is only legal after the predecessor is provably gone.** This is the
+subtlest correction. A probe assumes the previous attempt is dead; the common
+case is that it is slow or partitioned — alive, and about to complete. Probing a
+live predecessor returns "not done" and doubles the effect. So each effect
+carries `complete_by`, strictly shorter than the command lease, and an executor
+that passes its own `complete_by` **abandons and writes nothing — not even an
+error** (the Scheduler-Agent-Supervisor discipline; writing an error is itself a
+race with the successor). Probing becomes legal only after
+`complete_by + max_clock_skew`.
+
+**Effects are grouped, not chained.** The first draft ran all 37 in one sequence,
+which means one wedged effect blocks every later one. If a customer's Nextcloud
+is down for a week, the pod and PVC deletes never run — their outage becomes our
+resource leak, and because the status write moved last, a user-visible stuck job
+too. Nothing in the domain requires that ordering. `effect_group` partitions the
+set into independently retryable units, each with its own attempts budget and
+terminal state, ordered only where a real dependency exists. Irreversible steps
+go last within their group, after every validation that could still fail.
+
+**Register the compensation before performing the action**, where a compensation
+exists at all. This is Restate's saga rule and it generalizes the intent marker:
+a crash between an action succeeding and its compensation being recorded leaves
+no undo. Compensations must themselves be idempotent and run in reverse order.
+
+##### The critic index, in full
+
+Shipping first and alone (migration 0130), because it fixes a live correctness
+hole — the duplicate-critic race can drop a blocking finding and produce an
+unwarranted approval — and needs none of the protocol above.
+
+**The design question to answer first.** `status NOT IN ('failed','cancelled')`
+means *a failed round frees its slot and can be respawned*. If that is not the
+intent, **drop `status` from the predicate entirely** and every problem below
+except NULL handling evaporates: no surprise constraint violation on status
+transitions, no HOT-update cost, no slow concurrent-build path. Only keep the
+mutable predicate if terminal rows genuinely should free the slot.
+
+**The NULL hole — confirmed by experiment, and fatal as first written.**
+`context->>'verification_round'` is SQL NULL when the key is absent, and NULLs
+are distinct in a unique index, so any row missing the key enters the index and
+collides with nothing. Verified locally: two critics with no round key both
+inserted cleanly. Since the whole point is to close a race caused by a bug, "the
+writer always populates the key" is exactly the assumption that cannot be made.
+Fix with `jsonb_exists(context,'verification_round')` in the predicate (the `?`
+operator collides with psycopg placeholders), or `NULLS NOT DISTINCT`, or
+`COALESCE(…, '')`.
+
+**Mutable predicates do check on UPDATE — verified locally, and it cuts both
+ways.** A row moving *into* the index is uniqueness-checked at that moment:
+
+```
+UPDATE t SET status='created' WHERE id=2;
+ERROR:  duplicate key value violates unique constraint "t_uq"
+```
+
+So the index is stronger than claimed — it blocks reviving a terminal critic into
+a collision, not just duplicate inserts. The cost is that **a status transition
+can now raise `23505` far from the INSERT that created the duplicate**: resume,
+retry, un-cancel and the manual status flip can all fail in a way they never
+could before, and every such path must handle it. A transaction touching two keys
+in this index can also deadlock (`40P01`); insert multi-row spawns in sorted key
+order, and treat both codes as "someone else won, back off and re-read".
+
+**Two mechanical constraints.** `ON CONFLICT` cannot infer a partial index unless
+the statement restates the predicate *exactly* — omit it and you get "no unique
+or exclusion constraint matching". And a partial, expression-based index **can
+never be promoted** to a named constraint via `ADD CONSTRAINT … USING INDEX`
+(that requires a plain b-tree over plain columns), so there is no
+`ON CONFLICT ON CONSTRAINT` and no `DEFERRABLE`. A **generated stored column**
+holding the key, with a plain unique index over it, avoids all of this — it can
+back a named constraint, keeps `ON CONFLICT` simple, preserves HOT on status
+churn, and sidesteps the slower concurrent-build path that partial+expression
+indexes opt into. Prefer it unless there is a reason not to.
+
+**Build safely, and dedupe first.** A failed `CREATE UNIQUE INDEX CONCURRENTLY`
+leaves an INVALID index that is *ignored for queries but still enforces
+uniqueness* — no benefit, live write rejections. A unique index cannot be added
+`NOT VALID`, so pre-existing duplicates must be resolved in an **earlier**
+migration (transition losers to `cancelled`, which removes them from the
+predicate without deleting history). k3d currently has 7 critics with zero
+duplicates and zero missing round keys, which is far too little data to say
+anything about production — the pre-flight query is mandatory regardless. And
+**`CREATE … IF NOT EXISTS` must not be the `.notx.sql` idempotency mechanism**:
+it succeeds against a leftover INVALID index and records the migration green
+while the index is permanently unusable and permanently rejecting writes. Check
+`pg_index.indisvalid` explicitly and drop-then-recreate.
 
 **(5) The fence replaces the status guard, and is strictly stronger.** Today's
 early return keys on a status the handler is itself about to change, which is why
@@ -477,26 +727,106 @@ status. The status check stays during coexistence as a compatibility belt, with
 its role downgraded from replay defence to lane-A behaviour preservation, and
 retires when pinned adopts the command path.
 
+**The terminal status write itself must also CAS on the finalizer's term.** A
+fence at accept protects accept; it does not stop a resurrected attempt-N
+finalizer from clobbering attempt N+1's outcome minutes later. The final write is
+`UPDATE jobs SET status = $new WHERE id = $job AND current_term = $term_held`.
+Checking lease expiry just before writing is explicitly *not* a substitute — a
+process can be paused at exactly the wrong instant between the check and the
+write.
+
 **(6) The orphan sweeps must learn about pending commands.** This is the decision
 the seven questions missed. Moving the status write last means a job sits in
 `processing` with its agent already gone — which is precisely what
 `recover_orphaned_jobs` hunts ("assigned agent is online but NOT working on this
 job", `postgres.py:5439–5476`). Without a predicate change it would pause and
 re-dispatch a job that is mid-finalization, re-executing the work the command was
-about to record. So `recover_orphaned_jobs`, `recover_expired_lease_jobs` and the
-stale-agent detector all gain `AND NOT EXISTS (SELECT 1 FROM
-job_completion_commands WHERE job_id = jobs.id AND state IN
-('pending','finalizing'))`, served by a partial index on `(job_id)`. This applies
-to the **pinned** lane too — it is not covered by the `execution_lane = 'pinned'`
-partition, because the reordering is what pinned adopts in step 4 below.
+about to record. This applies to the **pinned** lane too — it is not covered by
+the `execution_lane = 'pinned'` partition, because the reordering is what pinned
+adopts in step 4 below.
 
-**(7) Rollout — six steps, each independently revertible.**
+**But the obvious predicate is a Kubernetes finalizer, and it ships Kubernetes'
+famous bug.** `AND NOT EXISTS (… state IN ('pending','finalizing'))` gates the
+rescue path on the very thing that may be broken: a wedged finalizer leaves the
+job stuck *and* invisible to the safety net that would have rescued it. That is
+structurally identical to `JobTrackingWithFinalizers`, which cost Kubernetes four
+years of bugs including pods stuck 91 days with no controller left to clear them.
+Two corrections make it safe:
 
-1. **0130** — the two standalone fixes. `completed_at` gains `COALESCE` (S21),
-   and the critic-spawn partial unique index lands (S30). No protocol, no
-   coexistence risk, and they fix live pinned-lane bugs today.
-2. **0131** — the command table, `jobs.completion_seq_hwm`, and the sweep-
-   exclusion index. Dead schema; zero behaviour change.
+**Key on a live lease, not on presence.** The predicate is
+`AND NOT EXISTS (… state IN ('pending','finalizing') AND lease_expires_at > now())`.
+This is the whole fix in one clause — it converts "stuck forever" into "bounded
+delay, then the safety net fires". It is Airflow's
+`or_(Job.state != RUNNING, Job.latest_heartbeat < limit)` in our schema. Lease
+should sit well above heartbeat (Airflow runs ~60×); against our existing 60 s
+agent heartbeat, a 10 s finalizer heartbeat with a 120 s lease is proportionate.
+
+**Route, don't filter.** The sweep now matches two failures needing opposite
+remedies, so a boolean exclusion is the wrong instrument:
+
+| What the sweep sees | Correct action |
+|---|---|
+| agent gone, **no** command row | pause + re-dispatch (today's behaviour) |
+| command row, **live** lease | nothing |
+| command row, **expired** lease | **resume the finalizer from its effect rows** — never re-dispatch the agent |
+| past `deadline_at` or attempts cap | park, alert, operator verb |
+
+Re-dispatching the agent in row three is the catastrophic outcome: it re-runs the
+work *and* races a half-applied effect set. Airflow runs two sweeps at two
+cadences for exactly this reason (worker death vs scheduler death); ours conflates
+them today.
+
+**Define the predicate exactly once** — one view or shared CTE, not replicated
+across `recover_orphaned_jobs`, `recover_expired_lease_jobs` and the stale-agent
+detector. Every bug in the Kubernetes parade is one code path forgetting the
+invariant, and a predicate copied N times decays on the first sweep someone adds.
+
+**The reap action needs its own dedup key**, `(job_id, attempt)`. Airflow has this
+bug twice: the sweep re-fires every interval because nothing records that a reap
+is already in flight, and in one case walked a task to `FAILED` with its retries
+never consumed.
+
+**Ship the redundant safety net on day one.** A second, dumber sweep that finds
+command rows whose job is already terminal, or that never advanced past their
+first effect, and reconciles them. Kubernetes added exactly this in v1.29 —
+"guard against any possible bug where a Job is marked as Finished but not all pod
+finalizers are removed" — after four years of incidents. There is no reason to
+re-earn that lesson.
+
+**The operator force verb must do the opposite of Kubernetes'.** Its `/finalize`
+*skips* cleanup, which is how Red Hat demonstrated an orphaned Secret leaking
+across tenants. Ours abandons the remaining effects but **still writes the
+terminal status**, marks the command `force_resolved`, and records which effects
+were skipped — state recorded, tail explicitly abandoned. Log it as an incident,
+not a routine operation.
+
+**One invariant, testable in CI:** for every job in `processing`, either a live
+agent lease exists, or a live finalizer lease exists, or exactly one sweep
+matches it. A job matched by nothing is the stuck namespace, rebuilt.
+
+**(7) Rollout — one triage, then six steps, each independently revertible.**
+
+**Step 0 is not code: triage the 37.** "Thirty-seven side effects gating a
+user-visible status write" is itself the smell, and the question is not "status
+first or last" but **which effects must land before the status is
+user-visible-correct?** Almost certainly very few — archival, KB indexing,
+notifications and cloud push can all lag. Temporal's answer to the identical
+problem is the inversion: write the terminal status *and* the outbox rows in one
+small transaction, drain the tail asynchronously, and document the lag (it delays
+archival ~5 minutes by default). Kubernetes went the other way in 1.31, delaying
+its terminal condition — but only because premature `Complete` broke downstream
+usage accounting, and it compensated by publishing interim conditions so clients
+could still learn the outcome early. If this triage shrinks the gating set from
+37 to 3, the window shrinks with it and every mitigation above gets cheaper. **Do
+this before building the lease.**
+
+1. **0130** — the standalone fixes. `completed_at` gains `COALESCE` (S21), and
+   the critic index lands (S30) with its dedupe pre-flight as a separate earlier
+   migration. No protocol, no coexistence risk, and they fix live pinned-lane
+   bugs today.
+2. **0131** — the command and effect tables, `jobs.completion_seq_hwm`, the
+   leader lease row, and the sweep predicate view. Dead schema; zero behaviour
+   change.
 3. Accept writes the command for **both** lanes; the finalizer runs **inline**
    for both. Behaviour is identical to today, but every report is now durably
    recorded. This is the step that carries real risk — soak it behind a flag.
@@ -529,13 +859,46 @@ before then.
 **0130**. This is deliberate range allocation — the earlier dev-cluster wedge
 came from two tracks numbering independently against one shared database.
 
-**Still unsettled, deliberately.** Two things are left to implementation because
-the answer depends on measurements that do not exist yet: the finalizer's poll
-cadence and batch size (it joins the aggregate DB budget in §5.5, which is
-itself unmeasured), and whether `payload` should be pruned or archived after
-`done` — a loop job's `freeze_data` is not small and this table grows once per
-batch rotation, so it needs a retention rule before the worker lane runs at
-volume.
+##### Why not adopt a durable-execution engine
+
+Worth stating explicitly, because this design is a hand-rolled workflow engine
+and that deserves a defence rather than a silence.
+
+Temporal and Restate both require a new stateful service — a server cluster, or
+a replicated log with local RocksDB and an object store for snapshots. Not
+proportionate for one endpoint. **DBOS is the one credible incremental option**:
+a library, `pip install`, no infrastructure beyond Postgres, composes with
+FastAPI. But adopting it would not retire the hard problem. Its exactly-once
+guarantee is scoped to steps that are Postgres writes piggybacked onto the
+checkpoint transaction; everything else is explicitly "tried at least once, never
+re-executed after they complete". Thirty-five of our thirty-seven effects are not
+Postgres writes, so DBOS would hand them all back as at-least-once and we would
+still write every probe, intent marker and at-most-once path ourselves. It would
+also stand up a second work queue beside our lease-fenced one, with a second
+dispatcher, a second lease model and a second set of stuck-work alarms.
+
+So: keep the hand-rolled finalizer, and **copy DBOS's schema decisions rather
+than inventing new ones** — one row per effect keyed by stable name, an explicit
+terminal exhausted-attempts state, an attempts counter incremented in the same
+transaction as the effect marker, and a recorded code version that gates
+recovery. That converts "we hand-rolled it" from a risk into a documented choice.
+
+(One piece of folklore deliberately *not* cited here: the "we built our own
+workflow engine and regretted it" retrospective genre has no first-party source —
+it traces to vendor marketing. It is not evidence and should not be used as any.)
+
+**Still unsettled, deliberately.** Three things are left to implementation
+because the answer depends on measurements that do not exist yet. The finalizer's
+poll cadence and batch size join the aggregate DB budget in §5.5, itself
+unmeasured. Whether `payload` is pruned or archived after `done` needs a
+retention rule before the worker lane runs at volume — a loop job's `freeze_data`
+is not small and this table grows once per batch rotation — bounded by the
+never-prune-while-unfinalized rule in (2). And the command table is a high-churn
+status-driven queue living in the shared application database, which is the exact
+structure that degrades when a long-lived transaction elsewhere in the cluster
+holds back dead-tuple reclamation; `SKIP LOCKED` does not immunize against it, so
+long-transaction monitoring is a prerequisite for running this at volume, not an
+afterthought.
 
 ##### Independent confirmation from the S3 track
 
