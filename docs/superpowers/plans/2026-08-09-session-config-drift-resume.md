@@ -50,7 +50,24 @@ Refactor `authorize_datasource_selection` into a wrapper over a new reporting fu
   ) -> tuple[list[ItemVerdict], dict[str, int]]
   ```
 
-**Ordering hazard — read before writing.** The current code raises on the *first* problem it meets, and a missing row raises before the per-item loop runs at all. So a deleted connector always beats a `DatasourceWorkspaceTierError` from a later id. Classifying every item eagerly would let the tier error escape first and turn a 403 into a 400. The wrapper must therefore check denials in the original precedence: any non-tier denial first, tier error only after.
+**Ordering hazard — read before writing.** Precedence has *two* tiers, and
+conflating them is a real regression (it was caught in review on the first
+attempt at this task):
+
+1. A **missing row** was rejected by a `len(by_id) != len(normalized_ids)` check
+   that ran *before* the per-item loop. So `deleted` is **position-independent**
+   and outranks everything.
+2. Every other failure — scope mismatch, not-authorized, lite-tier repository,
+   bad `policy_revision` — raised from *inside* the loop, so it is strictly
+   **first-in-list-order**. `out_of_scope` and `revoked` are on equal footing
+   with `workspace_tier`, **not** senior to it.
+
+Treating all non-tier denials as globally senior turns a 400 into a 403 for
+`[repository-on-lite-tier, out-of-scope]` — an already-shipped create/PATCH
+path. `policy_revision` corruption must therefore also become a verdict rather
+than an in-loop raise, or it jumps the queue the same way. Only
+`_normalized_ids` (malformed uuid) and `_validate_effective_owner` (missing
+owner) keep raising early, because they ran before the loop originally.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -115,10 +132,9 @@ async def test_classify_reports_scope_mismatch_as_out_of_scope():
 
 
 @pytest.mark.asyncio
-async def test_deleted_row_still_beats_workspace_tier_error():
-    """Precedence guard: a missing id must raise 403-unavailable, never the
-    400-tier error from a later id. The pre-refactor code raised on the count
-    mismatch before the loop, so this ordering is load-bearing."""
+async def test_deleted_outranks_tier_error_even_when_it_comes_second():
+    """The one position-independent case: the pre-refactor len() check ran
+    before the loop, so a missing id wins from any position."""
     db = _db([_row(DS_REPOSITORY, ds_type="repository")])
 
     with pytest.raises(DatasourceUnavailableError):
@@ -126,8 +142,48 @@ async def test_deleted_row_still_beats_workspace_tier_error():
             db,
             {"id": OWNER, "is_admin": False},
             OWNER,
-            [DS_SHARED, DS_REPOSITORY],
+            [DS_REPOSITORY, DS_SHARED],
             [],
+            "virtual",
+        )
+
+
+@pytest.mark.asyncio
+async def test_tier_error_wins_when_the_repository_comes_first():
+    """In-loop failures are first-in-order. A `deleted`-only precedence test
+    cannot catch a wrapper that wrongly promotes out_of_scope above tier,
+    because `deleted` is position-independent either way — these two ordered
+    pairs are what actually discriminate."""
+    db = _db([
+        _row(DS_REPOSITORY, ds_type="repository"),
+        _row(DS_OWNED, scope="projects", projects=(PROJECT_B,)),
+    ])
+
+    with pytest.raises(DatasourceWorkspaceTierError):
+        await authorize_datasource_selection(
+            db,
+            {"id": OWNER, "is_admin": False},
+            OWNER,
+            [DS_REPOSITORY, DS_OWNED],
+            [PROJECT_A],
+            "virtual",
+        )
+
+
+@pytest.mark.asyncio
+async def test_out_of_scope_wins_when_it_comes_first():
+    db = _db([
+        _row(DS_OWNED, scope="projects", projects=(PROJECT_B,)),
+        _row(DS_REPOSITORY, ds_type="repository"),
+    ])
+
+    with pytest.raises(DatasourceUnavailableError):
+        await authorize_datasource_selection(
+            db,
+            {"id": OWNER, "is_admin": False},
+            OWNER,
+            [DS_OWNED, DS_REPOSITORY],
+            [PROJECT_A],
             "virtual",
         )
 
@@ -184,12 +240,17 @@ async def classify_datasource_selection(
     """Per-item availability verdicts plus the policy snapshot of allowed rows.
 
     The reporting half of :func:`authorize_datasource_selection`, which is now a
-    thin wrapper over this. Conditions that mean *corruption* rather than drift
-    — malformed uuids, a vanished owner row, an unreadable policy_revision —
-    still raise here, because no acknowledgment can make them safe.
+    thin wrapper over this.
 
-    ``workspace_tier`` is returned as a verdict rather than raised so the caller
-    controls precedence; see the wrapper.
+    Malformed uuids and a vanished owner row still raise from here: both were
+    checked *before* the per-item loop pre-refactor, so raising early is
+    faithful. An unreadable ``policy_revision`` instead becomes a
+    ``corrupt_revision`` verdict, so it keeps its position in list order; the
+    wrapper turns it into the same generic denial the original raised. It is
+    deliberately not an acknowledgeable drift reason — corruption is not drift.
+
+    ``workspace_tier`` is likewise returned as a verdict rather than raised, so
+    the caller controls precedence; see the wrapper.
     """
     normalized_ids = _normalized_ids(datasource_ids)
     normalized_projects = _normalized_ids(target_project_ids)
@@ -266,8 +327,13 @@ async def classify_datasource_selection(
             policy_revision = int(row["policy_revision"])
             if policy_revision < 1:
                 raise ValueError
-        except (KeyError, TypeError, ValueError) as exc:
-            raise DatasourceUnavailableError() from exc
+        except (KeyError, TypeError, ValueError):
+            # A verdict, not a raise: raising here would jump ahead of an
+            # EARLIER item's workspace_tier verdict, which the original never
+            # did. Not an acknowledgeable drift reason — corruption is not
+            # drift — so config_drift.py filters it out.
+            verdicts.append(ItemVerdict(datasource_id, True, "corrupt_revision"))
+            continue
         revisions[datasource_id] = policy_revision
         verdicts.append(ItemVerdict(datasource_id, False, None))
     return verdicts, revisions
@@ -289,15 +355,22 @@ Replace the body of `authorize_datasource_selection` — **keep its existing doc
         trusted_system_inheritance=trusted_system_inheritance,
         legacy_job_id=legacy_job_id,
     )
-    # Precedence is load-bearing: the pre-refactor code raised on the count
-    # mismatch before the per-item loop, so an unavailable id always beat a
-    # workspace-tier conflict from a later id. Preserve that ordering.
-    if any(v.denied and v.reason != "workspace_tier" for v in verdicts):
+    # Missing rows were rejected by a len() check that ran BEFORE the per-item
+    # loop, so "deleted" is position-independent and outranks everything else.
+    if any(v.reason == "deleted" for v in verdicts):
         raise DatasourceUnavailableError()
-    if any(v.reason == "workspace_tier" for v in verdicts):
-        raise DatasourceWorkspaceTierError(
-            "Repository connectors require a workspace with filesystem support"
-        )
+    # Every other failure raised from inside that loop, so it is strictly
+    # first-in-list-order: the first denied item decides which error surfaces.
+    # out_of_scope and revoked are NOT senior to workspace_tier — whichever
+    # item comes first wins.
+    for verdict in verdicts:
+        if not verdict.denied:
+            continue
+        if verdict.reason == "workspace_tier":
+            raise DatasourceWorkspaceTierError(
+                "Repository connectors require a workspace with filesystem support"
+            )
+        raise DatasourceUnavailableError()
     return [v.datasource_id for v in verdicts], revisions
 ```
 
