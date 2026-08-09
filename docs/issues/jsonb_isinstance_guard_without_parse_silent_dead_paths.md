@@ -14,6 +14,10 @@ verification redesign.
 **Status:** Mechanism CONFIRMED in code. 1 of 4 instances fixed (sweep-verified
 at HEAD 2026-08-06): Site 4 (cockpit snapshot status) closed by `0ba7c754`
 (`asRecord()` in `cockpit/src/app/core/util/job-status.ts`, applied + tested).
+**2026-08-09:** root cause of site 4 identified as a *type-level* lie in
+`api.model.ts` and corrected (§4b); a second cockpit instance (job-card summary)
+found on dev and fixed the same way. **~8 further cockpit fields carry the same
+lie and are un-audited** — see §4b.
 Sites 1–3 (VM status 404 at main.py:12183, VM freeze-on-pause at main.py:11060,
 subjob repo provisioning at services/job_provisioning.py:186 — the latter's
 call sites grew from 2 to 4) are byte-for-byte unchanged. A shared coercion
@@ -133,6 +137,40 @@ The established convention for surfacing a JSONB sub-key to the UI is a
 `j.context->'snapshot'->>'status' AS snapshot_status`
 (`orchestrator/database/postgres.py:840`). Note `get_visible_jobs` does not
 select `j.context` at all.
+
+### 4b. The cockpit's TypeScript types were *lying*, which is why site 4 was invisible
+
+Added 2026-08-09, while fixing a second cockpit instance (the job tool card's
+summary, which read `context.summary` and rendered nothing — the same shape as
+site 4, found on dev before it ever reached a user).
+
+Site 4 was not merely an oversight. `Job` in
+`cockpit/src/app/core/models/api.model.ts` declared
+
+```typescript
+context?: Record<string, any> | null;   // and freeze_data was absent entirely
+```
+
+on a field the API ships as a **string**. So `job.context['snapshot']`
+type-checks, compiles, passes review, and returns `undefined` forever. The
+compiler was actively vouching for the bug. Both fields are now
+`Record<string, any> | string | null`, which makes `tsc` reject a bare index and
+forces the `asRecord()` coercion — that type change is what surfaced site 4 on
+its own, without anyone looking for it.
+
+**The remaining surface is un-audited.** A grep of `api.model.ts` shows ~8 more
+fields that are JSONB server-side but typed as objects client-side:
+`metadata` (×2), `config_override` (×2), a second `context` (job-create
+request), `credentials` (×4), `grants`. Each is a candidate for the identical
+silent-undefined bug; none has been checked. Whether they actually ship as
+strings depends on which endpoint serializes them (`main.py:8099` preserves the
+raw shape for jobs — other routes may differ), so this needs a read of each
+endpoint, not a blanket retype.
+
+**Rule going forward:** in the cockpit, a field that is JSONB server-side must
+be typed `… | string | null` and read through `asRecord()`
+(`core/util/job-status.ts`). Trusting an object type on such a field is the
+whole bug.
 
 ## Why not just register a global jsonb codec?
 

@@ -17,6 +17,7 @@ import {JobWatchService} from '../../core/services/job-watch.service';
 import {ApiService} from '../../core/services/api.service';
 import {
     asRecord,
+    canResumeJobStatus,
     isRunningJobStatus,
     isTerminalJobStatus,
     jobStatusTone,
@@ -75,26 +76,62 @@ import {
           <p class="jc__summary">{{ s }}</p>
         }
 
-        <div class="jc__actions">
-          @if (canApprove()) {
-            <button type="button" class="jc__btn jc__btn--primary"
-                    [disabled]="busy()" (click)="approve()">
-              {{ 'toolCard.job.approve' | transloco }}
-            </button>
-          }
-          @if (canOpenDiff()) {
-            <button type="button" class="jc__btn" [disabled]="busy()"
-                    (click)="diffRequested.emit(entity().id)">
-              {{ 'toolCard.job.openDiff' | transloco }}
-            </button>
-          }
-          @if (canCancel()) {
-            <button type="button" class="jc__btn jc__btn--danger"
-                    [disabled]="busy()" (click)="cancel()">
-              {{ 'toolCard.job.cancel' | transloco }}
-            </button>
-          }
-        </div>
+        <!-- Composing replaces the action row rather than sitting under it, so
+             the only "cancel" on screen means "cancel writing" — next to a
+             "Cancel job" button it would be a one-click accident. -->
+        @if (composing()) {
+          <div class="jc__compose">
+            <textarea class="jc__input" rows="3" [value]="feedback()"
+                      [disabled]="busy()"
+                      [placeholder]="'toolCard.job.feedbackPlaceholder' | transloco"
+                      (input)="feedback.set($any($event.target).value)"
+                      (keydown.control.enter)="resumeWithFeedback()"
+                      (keydown.meta.enter)="resumeWithFeedback()"></textarea>
+            <div class="jc__actions">
+              <!-- canResume() again, not just at open time: a poll can land
+                   mid-typing and take the job somewhere unresumable (the agent
+                   approves it). Same rule as every other button here — gated on
+                   the status *now*. The draft stays on screen rather than being
+                   yanked; only the dead action is unclickable. -->
+              <button type="button" class="jc__btn jc__btn--primary"
+                      [disabled]="busy() || !feedback().trim() || !canResume()"
+                      (click)="resumeWithFeedback()">
+                {{ 'toolCard.job.feedbackSubmit' | transloco }}
+              </button>
+              <button type="button" class="jc__btn" [disabled]="busy()"
+                      (click)="composing.set(false)">
+                {{ 'toolCard.job.feedbackDismiss' | transloco }}
+              </button>
+            </div>
+          </div>
+        } @else {
+          <div class="jc__actions">
+            @if (canApprove()) {
+              <button type="button" class="jc__btn jc__btn--primary"
+                      [disabled]="busy()" (click)="approve()">
+                {{ 'toolCard.job.approve' | transloco }}
+              </button>
+            }
+            @if (canResume()) {
+              <button type="button" class="jc__btn" [disabled]="busy()"
+                      (click)="composing.set(true)">
+                {{ 'toolCard.job.resumeWithFeedback' | transloco }}
+              </button>
+            }
+            @if (canOpenDiff()) {
+              <button type="button" class="jc__btn" [disabled]="busy()"
+                      (click)="diffRequested.emit(entity().id)">
+                {{ 'toolCard.job.openDiff' | transloco }}
+              </button>
+            }
+            @if (canCancel()) {
+              <button type="button" class="jc__btn jc__btn--danger"
+                      [disabled]="busy()" (click)="cancel()">
+                {{ 'toolCard.job.cancel' | transloco }}
+              </button>
+            }
+          </div>
+        }
       </div>
     }
   `,
@@ -110,6 +147,16 @@ import {
       white-space: pre-wrap; overflow-wrap: anywhere;
     }
     .jc__actions { display: flex; flex-wrap: wrap; gap: 6px; }
+    .jc__compose { display: flex; flex-direction: column; gap: 6px; }
+    .jc__input {
+      width: 100%; box-sizing: border-box; resize: vertical;
+      padding: 6px 8px; font: inherit; font-size: 12px; line-height: 1.45;
+      border-radius: 5px; color: inherit;
+      border: 1px solid var(--border-color, rgba(127,127,127,0.3));
+      background: var(--input-bg, rgba(127,127,127,0.06));
+    }
+    .jc__input:focus { outline: 1px solid var(--accent-color); outline-offset: -1px; }
+    .jc__input:disabled { opacity: 0.5; }
     .jc__btn {
       padding: 3px 10px; font-size: 11.5px; border-radius: 5px; cursor: pointer;
       border: 1px solid var(--border-color, rgba(127,127,127,0.3));
@@ -130,6 +177,11 @@ export class JobToolCardPanelComponent {
     private readonly api = inject(ApiService);
 
     protected readonly busy = signal(false);
+    /** Whether the feedback composer is open. Collapsed by default — the card
+     *  sits inline in a transcript and a permanently open textarea would make
+     *  every historical job call three lines taller. */
+    protected readonly composing = signal(false);
+    protected readonly feedback = signal('');
 
     constructor() {
         // Subscribe on first render and whenever the card is pointed at a
@@ -182,6 +234,7 @@ export class JobToolCardPanelComponent {
         () => this.job()?.status === 'pending_review',
     );
     protected readonly canCancel = computed(() => !isTerminalJobStatus(this.job()?.status));
+    protected readonly canResume = computed(() => canResumeJobStatus(this.job()?.status));
     protected readonly canOpenDiff = computed(() => {
         const s = this.job()?.diff_status;
         return s === 'pending' || this.job()?.status === 'pending_review';
@@ -196,6 +249,29 @@ export class JobToolCardPanelComponent {
     }
 
     /**
+     * Hand the job back with guidance — the third review outcome.
+     *
+     * Approve and Cancel are "ship it" and "kill it"; the common answer to a
+     * job that stopped for review is neither, it is "close, but do X". Without
+     * this the user has to leave the transcript for the Jobs page, which is the
+     * trip this card exists to remove (docs/features/unified_tool_cards.md).
+     *
+     * The draft survives a failed send. `run()` reports the API's result rather
+     * than swallowing it, so a resume rejected by the resume PEP (403 on a
+     * grant denial, 409 on an unresolvable stored config — main.py:13597) leaves
+     * the composer open with the text still in it. Clearing on failure would
+     * discard what the user wrote and show only a toast.
+     */
+    async resumeWithFeedback(): Promise<void> {
+        const text = this.feedback().trim();
+        if (!text || this.busy() || !this.canResume()) return;
+        const result = await this.run(this.api.resumeJob(this.entity().id, text));
+        if (result === null) return;
+        this.feedback.set('');
+        this.composing.set(false);
+    }
+
+    /**
      * Run one action, then force a refresh so the card settles on the job's real
      * state rather than an optimistic guess.
      *
@@ -207,12 +283,18 @@ export class JobToolCardPanelComponent {
      * dead-button-resurrected-by-history failure the permission path hit cannot
      * arise. The refresh below closes the remaining window — if the agent
      * approved the job a second before the user did, the card corrects itself.
+     *
+     * Returns the call's result (null on failure, since `ApiService` maps errors
+     * to null) so a caller that owns user-entered state can decide whether to
+     * clear it — see {@link resumeWithFeedback}. Buttons that own nothing ignore
+     * it, as before.
      */
-    private async run(call: Observable<unknown>): Promise<void> {
+    private async run(call: Observable<unknown>): Promise<unknown> {
         this.busy.set(true);
         try {
-            await firstValueFrom(call).catch(() => null);
+            const result = await firstValueFrom(call).catch(() => null);
             await this.watcher.refresh(this.entity().id);
+            return result;
         } finally {
             this.busy.set(false);
         }

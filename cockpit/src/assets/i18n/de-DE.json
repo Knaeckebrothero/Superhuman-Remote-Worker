@@ -84,6 +84,10 @@
       "approve": "Freigeben",
       "openDiff": "Änderungen öffnen",
       "cancel": "Job abbrechen",
+      "resumeWithFeedback": "Mit Feedback fortsetzen",
+      "feedbackPlaceholder": "Was soll anders laufen?",
+      "feedbackSubmit": "Senden & fortsetzen",
+      "feedbackDismiss": "Verwerfen",
       "diffTitle": "Job {{id}} — Änderungen"
     },
     "view": {
