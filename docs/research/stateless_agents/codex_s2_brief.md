@@ -11,7 +11,7 @@ stateless lane — shell state survives a cross-pod handoff, cloud sync stays
 ordered, and nothing agent-local is silently lost.**
 
 Branch off `feature/stateless-agents`. Do not push. Do not touch `develop`.
-Migrations start at **0122** (0115–0121 are taken).
+Migrations: you own the range **0122–0129** (0115–0121 are taken; Gate 3 starts at 0130). The range is allocated deliberately — a previous dev-cluster wedge came from two tracks numbering independently against one shared database.
 
 ---
 
