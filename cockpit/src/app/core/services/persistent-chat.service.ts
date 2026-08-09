@@ -17,8 +17,10 @@ import {
 } from '../models/turn.model';
 import {TranslocoService} from '@jsverse/transloco';
 import {ApiService} from './api.service';
+import {ErrorMessageService} from './error-message.service';
 import {IndexedDbService} from './indexed-db.service';
 import {NotificationService} from './notification.service';
+import {classifyResumeError, ConfigDriftItem} from './resume-error';
 import {reduce, ReducerAction} from './turn-reducer';
 import {AppToastService} from '../../ui/toast';
 import {
@@ -357,6 +359,7 @@ export class PersistentChatService {
     private readonly toast = inject(AppToastService);
     private readonly notifications = inject(NotificationService);
     private readonly transloco = inject(TranslocoService);
+    private readonly errors = inject(ErrorMessageService);
     private readonly destroyRef = inject(DestroyRef);
     private readonly threadTransport = inject(PersistentThreadTransportBridge);
     private readonly canvas = inject(CanvasService);
@@ -784,6 +787,15 @@ export class PersistentChatService {
      * the instant the user sends and re-enable a moment later.
      */
     readonly isResuming = signal(false);
+
+    /**
+     * Non-null while a resume is blocked on config drift (a connector,
+     * project, or grant the thread depended on has since disappeared). Set
+     * from the 428 the server returns from POST /resume; consumed by the
+     * drift-acknowledgment dialog (Task 10), which re-calls resumeSession()
+     * with the acknowledged ids once the user confirms.
+     */
+    readonly pendingDrift = signal<ConfigDriftItem[] | null>(null);
 
     // --- Draft session (instant landing at `/`) ---
     // The composer is open but no thread exists yet; the first send creates
@@ -2305,8 +2317,18 @@ export class PersistentChatService {
      * the lifecycle SSE feed. The advisory lock in the orchestrator
      * serialises /resume's reprovision with /prepare's _do_prepare so we
      * don't double-provision (docs/issues/persistent_thread_double_provisioning_race.md).
+     *
+     * /resume can also 428 if a connector/project/grant the thread depended
+     * on has since disappeared (config drift). That surfaces on
+     * `pendingDrift` instead of `connect()`-ing against a still-ended
+     * thread; the caller re-invokes this method with `acknowledge` (the
+     * drift ids the user confirmed) once they've decided. A 409 means the
+     * thread wasn't actually 'ended' (e.g. a double-click) and is benign —
+     * fall through to connect() either way, since its cold-start path is
+     * self-healing. Any other failure (403, 500, ...) used to be swallowed
+     * by the same catch, which is why it used to render as a dead button.
      */
-    async resumeSession(): Promise<void> {
+    async resumeSession(acknowledge?: string[]): Promise<void> {
         const threadId = this.threadId();
         if (!threadId) return;
         const generation = this.connectGeneration;
@@ -2328,12 +2350,26 @@ export class PersistentChatService {
         try {
             try {
                 await firstValueFrom(
-                    this.http.post(`${environment.apiUrl}/persistent/threads/${threadId}/resume`, {})
+                    this.http.post(
+                        `${environment.apiUrl}/persistent/threads/${threadId}/resume`,
+                        acknowledge ? {acknowledge} : {},
+                    ),
                 );
+                this.pendingDrift.set(null);
             } catch (err) {
-                // /resume may 409 if the thread isn't actually 'ended' (e.g. a
-                // double-click). Fall through to connect() either way — its
-                // cold-start path is self-healing.
+                const outcome = classifyResumeError(err);
+                if (outcome.kind === 'drift') {
+                    // Surface the dialog and stop: connect() against a still-
+                    // ended thread would achieve nothing.
+                    this.pendingDrift.set(outcome.items);
+                    return;
+                }
+                if (outcome.kind === 'error') {
+                    this.error.set(this.errors.translate(err, 'errors.sessions.resumeFailed'));
+                    return;
+                }
+                // benign (409): the thread was not actually ended. Fall through
+                // to connect(), whose cold-start path is self-healing.
             }
             if (!this._isCurrentConnect(threadId, generation)) return;
             await this.connect(threadId);
