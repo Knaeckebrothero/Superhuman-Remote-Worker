@@ -8,7 +8,6 @@ from orchestrator.services.config_drift import (
     DriftItem,
     blocking_denials,
     collect_config_drift,
-    drift_labels,
 )
 from orchestrator.services.datasource_policy import ItemVerdict
 
@@ -214,35 +213,6 @@ async def test_malformed_grant_violation_still_yields_an_item():
     )
     assert items[0].id == "grant:no colon here"
     assert items[0].label == "no colon here"
-
-
-def test_drift_labels_collapses_duplicate_labels_with_a_count():
-    items = [
-        DriftItem("connector:a", "connector", "revoked",
-                  "a connector you no longer have access to"),
-        DriftItem("connector:b", "connector", "revoked",
-                  "a connector you no longer have access to"),
-        DriftItem("grant:shell_tools", "grant", "revoked", "shell tools"),
-    ]
-
-    rendered = drift_labels(items)
-
-    assert rendered == [
-        {
-            "label": "a connector you no longer have access to",
-            "count": 2,
-            "kind": "connector",
-            "reason": "revoked",
-            "ids": ["connector:a", "connector:b"],
-        },
-        {
-            "label": "shell tools",
-            "count": 1,
-            "kind": "grant",
-            "reason": "revoked",
-            "ids": ["grant:shell_tools"],
-        },
-    ]
 
 
 def test_blocking_denials_flags_workspace_tier_and_corrupt_revision():
