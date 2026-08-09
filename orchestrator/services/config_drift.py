@@ -128,3 +128,40 @@ def drift_labels(items: list[DriftItem]) -> list[dict[str, Any]]:
         row["count"] += 1
         row["ids"].append(item.id)
     return list(grouped.values())
+
+
+def acknowledged_drift_ids(metadata: Any) -> set[str]:
+    """Drift ids the owner already accepted losing.
+
+    Accepts a raw JSON string as well as a dict: asyncpg returns JSONB columns
+    as strings, and an ``isinstance(x, dict)`` guard without a parse silently
+    turns this feature off.
+    """
+    if isinstance(metadata, str):
+        import json
+
+        try:
+            metadata = json.loads(metadata)
+        except (ValueError, TypeError):
+            return set()
+    if not isinstance(metadata, dict):
+        return set()
+    ack = metadata.get("config_drift_ack") or {}
+    if not isinstance(ack, dict):
+        return set()
+    return {str(key) for key in ack}
+
+
+def strip_acknowledged(ids: list[str], ack: set[str], *, prefix: str) -> list[str]:
+    """Drop ids whose namespaced drift key was acknowledged."""
+    return [value for value in ids if f"{prefix}:{value}" not in ack]
+
+
+def acknowledged_grant_keys(metadata: Any) -> set[str]:
+    """Acknowledged grant keys, unprefixed, ready to compare against the keys
+    ``evaluate()`` puts in front of each violation string."""
+    return {
+        key[len("grant:") :]
+        for key in acknowledged_drift_ids(metadata)
+        if key.startswith("grant:")
+    }
