@@ -428,7 +428,7 @@ class PermissionOutcome(str, Enum):
     distinct state — collapsing it into DECLINED fabricates a refusal the
     user never made (the model then concludes it was denied and abandons
     real work). See
-    docs/issues/supervised_parallel_gates_timeout_fabricates_denial.md.
+    docs/done/supervised_parallel_gates_timeout_fabricates_denial.md.
     """
 
     APPROVED = "approved"
@@ -478,7 +478,7 @@ class PersistentLoopCallbacks:
     # NO_ANSWER is NOT a denial: the gate was never answered (timed out, or
     # the approval card never reached the browser). The loop parks the turn
     # instead of telling the model the user refused — see
-    # docs/issues/supervised_parallel_gates_timeout_fabricates_denial.md.
+    # docs/done/supervised_parallel_gates_timeout_fabricates_denial.md.
     permission_check: Callable[
         [str, Dict[str, Any], str], Awaitable[Union["PermissionOutcome", bool]]
     ]
@@ -2400,7 +2400,7 @@ async def _execute_turn(
             # Permission check. Three-state: an unanswered gate is neither
             # consent nor refusal — never fabricate a decision the user did
             # not make (see
-            # docs/issues/supervised_parallel_gates_timeout_fabricates_denial.md).
+            # docs/done/supervised_parallel_gates_timeout_fabricates_denial.md).
             outcome = PermissionOutcome.coerce(
                 await callbacks.permission_check(tool_name, tool_args, tool_call_id)
             )
