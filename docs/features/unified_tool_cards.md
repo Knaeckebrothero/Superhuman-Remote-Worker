@@ -578,11 +578,34 @@ discoverable from the failure message alone.
 **Verification:** 9 new tests, full cockpit suite 1839 passing, i18n parity
 green, `ng build --configuration production` clean — initial 2.68 MB against a
 2.75 MB hard ceiling, and both warnings (initial > 2.25 MB, and
-`persistent-chat.component.scss` > 36 kB) predate this change. **Live gate
-owed** — the composer has not been driven against a real `pending_review` job.
-That needs a cockpit image rebuild on k3d, and Tilt models the whole stack as
-one resource, so it would also deploy whatever is uncommitted in
-`orchestrator/`.
+`persistent-chat.component.scss` > 36 kB) predate this change.
+
+#### Live gate on local k3d (2026-08-09) — PASSED
+
+Same route as the 08-08 gate: Playwright against `https://localhost`, already
+authenticated as the `test` fixture user. No rebuild was needed — the Tiltfile
+`sync()`s `cockpit/src/` into the running container, so the edit was already
+serving. Driven on the same job (`1998565d` in thread `3b51895c`), flipped to
+`pending_review` for the run and restored afterwards.
+
+| Check | Result |
+|---|---|
+| Button renders with its real i18n string | `Continue with feedback`, not a raw key — alongside Approve / Open diff / Cancel job |
+| Composer replaces the action row | textarea + `Send & continue` / `Dismiss` only; Approve and Cancel job gone |
+| Send disabled on an empty draft | yes |
+| Layout inside the card | textarea 660 px = card width exactly; `document.body` does not scroll horizontally |
+| The request | `POST /api/jobs/{id}/resume` → **200** |
+| **The text reached the server, trimmed** | `context.queued_feedback` = `"Live gate 2026-08-09: add a third line citing the source."` — the leading/trailing spaces typed into the box are gone, so `.trim()` ran on the wire value |
+| Server took the review branch | `queued_feedback_reason` = *"This job was frozen for review; a reviewer resumed it with the feedback below."* |
+| Composer closes on success | yes, and the draft cleared |
+| Card re-gates on the new status | badge `pending_review` → `paused`, buttons collapse to `Cancel job` alone |
+| Console | zero errors |
+
+The resume was **real, not simulated**: the job's workspace had been deleted, so
+the server shed the stale context and re-queued it, and the dispatcher then
+provisioned a fresh agent + workspace pod within a minute. Both were deleted and
+the job row restored (`completed`, `queued_feedback` cleared) — worth knowing if
+you repeat this, because the side effect is a live job run, not a status flip.
 
 ### Open questions (slice 4)
 
@@ -607,7 +630,7 @@ one resource, so it would also deploy whatever is uncommitted in
 1. **Slice 1 (this change)** — schema + registry + chat adapter + `<app-tool-card>` + wire into `persistent-chat.component.ts` (replace the `#toolDetails` card body; keep the run-fold/grouping around it). Ship + verify on k3d.
 2. **Slice 2 (follow-up)** — audit adapter (`toolCardViewFromAudit`) is written and unit-tested in slice 1 to prove the schema is source-agnostic; slice 2 points `agent-activity.component.ts`'s tool step at `<app-tool-card>` and deletes its bespoke tool rendering.
 3. **Slice 3 (polish)** — Prism syntax highlighting for `code` results (deps already present: `prismjs`); `chat-history.component.ts` as a third consumer; delete the now-dead SCSS/helpers in persistent-chat.
-4. **Slice 4 (the job card) — BUILT 2026-07-29, live-gated 2026-08-08.** `entity` on the schema, a `create_worker_job` descriptor, live status + Approve / Open-diff / Cancel, and **resume-with-feedback (2026-08-09, live gate owed)**. Batch grouping and the proposed state stay deferred; see [what shipped](#slice-4--what-shipped-2026-07-29).
+4. **Slice 4 (the job card) — BUILT 2026-07-29, live-gated 2026-08-08 and 2026-08-09.** `entity` on the schema, a `create_worker_job` descriptor, live status + Approve / Open-diff / Cancel, and **resume-with-feedback**. All four actions are now gated live. Batch grouping and the proposed state stay deferred; see [what shipped](#slice-4--what-shipped-2026-07-29).
 
 ## Acceptance (slice 1)
 
