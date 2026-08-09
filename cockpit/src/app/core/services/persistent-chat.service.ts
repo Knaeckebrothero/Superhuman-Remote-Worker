@@ -972,6 +972,9 @@ export class PersistentChatService {
             this.pendingRewindRequestId = null;
             this._clearRewindAckFallback();
             this.isSessionPaused.set(false);
+            // Config-drift dialog state is per-thread; a stale drift list
+            // from the previous thread must not survive a genuine switch.
+            this.pendingDrift.set(null);
             this.runningTool.set(null);
             this.citationsByCid.set(new Map());
             this.citationsLoaded.set(false);
@@ -2294,6 +2297,7 @@ export class PersistentChatService {
         this.pendingRewindRequestId = null;
         this._clearRewindAckFallback();
         this.isSessionPaused.set(false);
+        this.pendingDrift.set(null);
         this._protectedCloud.set(false);
         this.cloudChangesCount.set(0);
         this.protectedMountName.set(null);
@@ -2357,6 +2361,10 @@ export class PersistentChatService {
                 );
                 this.pendingDrift.set(null);
             } catch (err) {
+                // A late failure for a thread the user has already navigated
+                // away from must not mutate the shared error/drift signals —
+                // they are current-thread-scoped.
+                if (!this._isCurrentConnect(threadId, generation)) return;
                 const outcome = classifyResumeError(err);
                 if (outcome.kind === 'drift') {
                     // Surface the dialog and stop: connect() against a still-
