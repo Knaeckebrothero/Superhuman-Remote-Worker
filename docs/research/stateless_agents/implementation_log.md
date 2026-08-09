@@ -1527,3 +1527,378 @@ schema/reaper design already called out in §9.1. Stateless ended-session wake
 and the Path-A resume-compaction persistence bug also remain unverified and
 unbuilt, as do queued-turn durability and the other S1 surrounds. They were not
 scaffolded in this phase.
+
+---
+
+# Parallel track — S3 worker gates (branch `feature/stateless-workers-s3`)
+
+Merged into this log at consolidation. This work ran in parallel with the
+session track above; both are now on `feature/stateless-agents`.
+
+# S3 implementation log — worker jobs on the stateless lane (2026-08-08)
+
+Working branch: `feature/stateless-workers-s3`, created directly from
+`feature/stateless-agents` at `3802d0e2`. No push. The only pre-existing
+working-tree entry was the untracked nested `HomeLab/`, which remains untouched.
+
+## Phase 0 — orientation and pre-change baseline (DONE)
+
+- Read `codex_s3_brief.md` end-to-end and followed its prescribed reading order:
+  design §9.1 first, then §5.1/§5.2/§5.4/§5.4.4/§5.8/§9, this implementation
+  log, the `run_queue` contract docstring, and the complete session executor.
+- Cluster baseline: Tilt resources `(Tiltfile)=ok`, `srw=ok`; stateless agent
+  Deployment `2/2`; both agent pods and the orchestrator pod Running.
+- Verified the running image contents before measuring: both agent pods contain
+  exactly one `turn timing:` marker in `/app/src/api/turn_executor.py`; the
+  orchestrator image uses `/app/main.py` (not `/app/orchestrator/main.py`) and
+  contains one `claim-bundle timing:` marker.
+- Real session-turn baseline through `scripts/stateless-lane-probe.sh turn`:
+  accepted as turn 73, answer observed in **7 s** wall clock. Agent timing was
+  **4.62 s total**: bundle 0.10 s, attach 2.10 s, pending 0.00 s, turn 2.19 s,
+  push 0.18 s, complete 0.05 s. Session setup was 1.99 s (13 remote-store ops,
+  1.76 s). Orchestrator claim-bundle timing was **0.063 s**: lease 0.002 s,
+  credentials 0.013 s, assembly 0.048 s.
+- Branch safety: stopped the confirmed `tilt up` process with SIGINT, switched
+  branches only after it exited, restarted Tilt, then re-verified `srw=ok` and
+  the Deployment at `2/2`. No filesystem branch switch occurred while Tilt was
+  running.
+- Safety state: no `worker_batch` unit has been enqueued. Gate 1 and Gate 2 are
+  still open and therefore continue to forbid a real worker claim.
+
+## Phase 1 / Gate 1 — one claim authority per job (DONE)
+
+Implemented migration `0118_jobs_execution_lane.sql`: `jobs.execution_lane`
+is a NOT NULL, constant-default (`pinned`) runtime-plane class, deliberately
+separate from `runner_kind` (`user|lifecycle|service` grant semantics). The
+legacy plane now fails closed by admitting only `execution_lane='pinned'` in:
+
+- `get_dispatchable_jobs`;
+- `claim_job_for_agent`;
+- all four mutation arms of `recover_orphaned_jobs`;
+- `recover_expired_lease_jobs`;
+- the same-host `register_agent` replacement recovery UPDATE.
+
+The audit found two bypasses beyond the four named in the brief and they were
+closed too: direct manual assignment now returns 409 for a stateless job, and
+both direct `/job/start` and `/job/resume` helpers refuse a non-pinned row before
+network I/O. `get_job()` was then found not to project the new lane; without
+that fix the production guards would default every real stateless row to pinned
+even though the mocks passed. It now returns `execution_lane`, with a real-DB
+assertion for both values.
+
+Migration discipline: app snapshot regenerated from zero; 0118 applied in
+**7 ms** during snapshot replay and **8 ms** on k3d; `schema-snapshot.sh --check
+app` is clean; the migration-head tripwire is 0118. Live DB reports default
+`'pinned'::text`, NOT NULL. The running orchestrator image was checked directly:
+six qualified sweep/re-registration predicates, one claim predicate, one
+dispatcher predicate, two `get_job`/dispatch projections, and both direct helper
+guards are present.
+
+Verification:
+
+- focused real-Postgres dispatcher/claim/manual suites: **33 passed** (including
+  explicit stateless and unknown-future-lane fail-closed cases);
+- full-schema k3d-Postgres sweep suite: **2 passed**, covering expired lease,
+  all four orphan arms, and same-host registration replacement; pinned controls
+  recover while stateless rows remain byte-for-byte owned by run_queue;
+- schema replay/check: clean; targeted Ruff check/format: clean;
+- post-change real session probe: answer observed in **7 s**, agent **4.87 s**
+  total (bundle 0.08, attach 2.05, turn 2.48, push 0.25, complete 0.01), versus
+  pre-change 7 s / 4.62 s. Orchestrator claim bundle was 0.070 s versus 0.063 s.
+  This gate is off the session hot path; the 0.25 s agent delta is normal setup/
+  provider variance, not attributed to the partition.
+
+Failures recorded:
+
+- first test invocation used nonexistent `venv/bin/pytest`; this checkout uses
+  `.venv/bin/pytest` (Python 3.13) for the focused container suites;
+- first Ruff invocation similarly assumed `.venv/bin/ruff`; repository-pinned
+  Ruff 0.14.10 is installed at `/home/ghost/.local/bin/ruff`;
+- first semantic sweep assertion expected zero recovered rows, but its own
+  pinned NULL-lease control correctly matched orphan recovery. The test now
+  asserts exactly one pinned recovery and separately proves all stateless rows
+  remain untouched.
+
+Rollout constraint: worker admission remains OFF until every orchestrator
+replica runs these predicates. Before an orchestrator rollback, disable worker
+admission, drain/fence active stateless work, and convert lanes only after no
+worker queue row is runnable/leased. An old orchestrator cannot understand the
+partition and would otherwise reintroduce dual execution.
+
+Safety state: still no `worker_batch` unit has been enqueued. Gate 2 remains the
+next mandatory prerequisite.
+
+## Phase 2 / Gate 2A — freeze contract deployed orchestrator-first (DONE)
+
+The freeze taxonomy now lives in the stdlib-only
+`src/shared/job_freeze_types.py`. It exposes separate semantic subsets for
+Continue-as-New, legacy auto-redispatch, coincident-error immunity, agent END
+resume, and subjob redispatch rather than one over-broad allowlist.
+`batch_boundary` is in every continuation subset, but remains absent from the
+agent emitter in this rollout slice.
+
+Orchestrator completion now resolves both `version_upgrade` and
+`batch_boundary` to `paused`, including live-parent subjobs and reports carrying
+a coincident interrupt error. The dangerous loop fallback is narrowed:
+
+- a loop stop with no declared freeze still maps to `completed`, preserving the
+  weak-model escape hatch;
+- a loop stop with any unknown non-null freeze maps to visible
+  `pending_review`, never `completed`.
+
+The legacy paused-job sweep no longer duplicates freeze literals in SQL. It
+binds the deterministic shared registry as `ANY($1::text[])`, still qualified
+by `execution_lane='pinned'`. A real-Postgres semantic case proves a pinned
+`batch_boundary` freeze is cleared/stashed while the same freeze on the
+stateless lane remains untouched.
+
+Verification:
+
+- focused status/registry regression: **21 passed**;
+- full drain + loop suites: **144 passed**;
+- full-schema k3d-Postgres sweep suite: **2 passed** in 17.37 s;
+- targeted Ruff format/check and `git diff --check`: clean;
+- after Tilt rollout, the sole running orchestrator was inspected directly:
+  `/app/services/completion.py` contains the unknown-freeze guard,
+  `/app/database/postgres.py` contains the bound text-array predicate, and
+  `/app/src/shared/job_freeze_types.py` contains the batch constant;
+- an in-process assertion inside that running container proved loop +
+  `batch_boundary` → `paused`, loop + unknown declared freeze →
+  `pending_review`, and loop + no freeze → `completed`.
+
+Post-slice session measurement (after verifying both running agent images still
+contained the timing marker): turn 77 answered in **11 s**, agent **7.96 s**
+total (bundle 0.08, attach 2.37, turn 5.30, push 0.19, complete 0.02), versus
+Gate-1's 7 s / 4.87 s. Orchestrator claim bundle was **0.060 s** versus 0.070 s.
+The 2.82 s increase is entirely in provider/turn execution; attach and queue
+overhead remained close, so it is not attributed to the status-only change.
+
+Failures recorded:
+
+- the first real-Postgres invocation used the example `postgres/postgres`
+  credentials, but the k3d cluster has a different role; the rerun consumed
+  the existing Kubernetes Secret without printing it;
+- the first semantic assertion treated asyncpg's unregistered JSONB result as a
+  dict. This test connection returns it as text, so the assertion now decodes
+  either representation before inspecting `last_freeze_data`;
+- Ruff is not present inside `.venv`; as in Gate 1, the repository's installed
+  Ruff binary is `/home/ghost/.local/bin/ruff`.
+
+Rollout decision: Gate 2 is split deliberately. This orchestrator-first slice
+is verified before any agent-side boundary code exists. Rollback must disable
+batch emission first; worker admission remains OFF and no `worker_batch` unit
+has been enqueued. Gate 2B (default-unarmed graph boundary and agent registry
+consumption) is next.
+
+## Phase 2 / Gate 2B — checkpointed batch boundary (DONE, default-unarmed)
+
+The shared registry is now consumed by the agent as well as the orchestrator;
+the former private `_AUTO_CONTINUE_FREEZE_TYPES` duplicate is gone.
+`UniversalAgentState` carries four checkpointed, claim-local budget fields:
+
+- `worker_batch_started_at`;
+- `worker_batch_start_iteration`;
+- `worker_batch_target_wall_seconds`;
+- `worker_batch_iteration_cap`.
+
+All four default to `None`, so existing pinned jobs, session turns, old
+checkpoints, and every currently deployed driver are incapable of emitting a
+boundary. A future worker claim must arm them explicitly.
+
+`worker_batch_boundary_updates()` implements wall-clock-first rotation. It
+requires finite arming values, clamps any target to a hard **300 s minimum**,
+and allows the secondary iteration cap only after the same 300 s floor. When
+both are due, wall clock wins. The existing `iteration` field is an
+execute/LLM-iteration counter, not a literal LangGraph superstep counter; this
+is an explicit deviation from the design doc's terminology and is named and
+reported honestly rather than pretending to have a counter the graph lacks.
+
+Safe boundary placement and priority are now enforced:
+
+1. existing completion/human/error outcomes;
+2. version drain intent;
+3. a consumed replan request and its completed phase transition;
+4. batch rotation.
+
+Mid-phase rotation exists only on `check_todos`' pending-todos path, after the
+tool node has drained its transient carriers and after `_replan_request` has
+been consumed. It cannot intercept empty-manager recovery, a completed phase,
+or `audited_tools`, and a pending version drain suppresses it. The preferred
+phase-boundary path runs after transition, replan-message injection, and reply
+drain. Both paths checkpoint todos, emit `batch_boundary` with
+`should_stop=True`/`error=None`, and clear all four arming fields. The existing
+`version_upgrade` handoff now also disarms them, preventing an expired claim
+start from immediately re-freezing its successor. Batch rotation does **not**
+write `output/job_frozen.json`.
+
+Added the stable tuning line
+`worker_batch_boundary: boundary=... trigger=... elapsed=... target=...` with
+iteration delta/cap. Tests pin default-unarmed behavior, the 300 s floor,
+wall-clock tie-break, iteration gating, all priority rules, todo persistence,
+empty tactical recovery, replan semantics through the next boundary, stale
+error handling, field disarming, absence from `audited_tools`, and the
+unconditional `tools -> check_todos` edge.
+
+Verification:
+
+- graph/drain/loop/Todo/replan suites: **326 passed** in 5.02 s;
+- targeted Ruff check + format check and `git diff --check`: clean;
+- after the final Tilt rollout and termination of every intermediate pod, both
+  running agent containers were inspected directly. Each contains one
+  `worker_batch_boundary:` timing marker, one 300 s floor definition, the
+  phase-transition goal guard, and the shared auto-continue import;
+- a pure assertion inside **each** running agent proved initial state is
+  unarmed, an undersized target cannot fire at 299.9 s, it fires as
+  `batch_boundary` at 300 s, and the arming state is cleared;
+- the running orchestrator still contains its unknown-freeze fail-soft guard;
+- live DB query after verification: **0 `worker_batch` rows**.
+
+Final post-change session probe (turn 81): answer observed in **11 s**, agent
+**7.16 s total** (bundle 0.20, attach 2.62, turn 4.24, push 0.09, complete
+0.01). Orchestrator claim bundle was **0.170 s**. The immediately preceding
+Gate-2B probe was 9 s / 4.86 s (bundle 0.19, attach 2.48, turn 2.00, push 0.17,
+complete 0.01; orchestrator 0.167 s). The variance is provider/turn time (2.24
+s) plus normal attach variation (0.14 s); no worker graph executes on a session
+turn and no hot-path regression is attributed to the default-unarmed fields.
+
+Audit-driven corrections made before declaring DONE:
+
+- moved the mid-phase check below empty-todo recovery and completed-phase
+  handling, avoiding a freeze that would preserve a stale `phase_complete` or
+  mask the known empty-manager recovery path;
+- added explicit `phase_complete=False` to a mid-phase freeze checkpoint;
+- made drain intent suppress mid-phase rotation and disarm claim budget state;
+- allowed only a true phase boundary to clear a stale prior error;
+- ensured transition-produced `goal_achieved`, freeze, stop, or error state
+  cannot be replaced by a batch boundary;
+- split the replan test into the reachable tactical→strategic shape rather than
+  accepting an impossible strategic request-replan state.
+
+Operational note: Tilt built several intermediate snapshots while this ordered
+edit was in progress. No measurement trusted them. Verification waited until
+all terminating pods were gone and then checked every container in the final
+ReplicaSet.
+
+Safety state: Gates 1 and 2 are DONE and verified. Boundary code exists in the
+agent image but no production path can arm it. No real worker work has been
+queued. Gate 3 remains closed.
+
+## Phase 3 / Gate 3 — completion ownership audit (STOP boundary; NOT DONE)
+
+The implementation was stopped before the worker driver after three independent
+read-only audits reached the same no-go conclusion: the brief's statement that
+stage-4 completion currently CASes on `assigned_agent_id` is not true in this
+checkout. `JobCompleteRequest` contains no agent identity or lease token, and
+`PostgresDatabase.update_job_status()` ends in `UPDATE jobs ... WHERE id = ?`.
+There is therefore no small existing CAS to switch from agent id to queue token.
+
+More importantly, `/api/jobs/{job_id}/complete` is a long, multi-autocommit
+workflow rather than one terminal write. Before and around the ordinary status
+update it can persist freeze/context state, increment infra/memory/LLM and
+deliverable retry counters, pause or recover workspaces, and deliver loop output
+to cloud storage. Afterward it can graft subjob output, handle critic/scholar/
+delegation results, spawn verification/curation work, advance loops, write
+terminal records, enqueue session wakes, notify users, and archive/delete the
+workspace. Several operations are external and several are not idempotent.
+The terminal job status is written before some of those hooks; a crash followed
+by a retry can hit the route's terminal early-return and permanently skip the
+remaining work.
+
+Consequences for the three obvious fencing shapes:
+
+- an entry-time `fence_lease()` can succeed and commit, then the reaper can
+  steal while the stale handler continues mutating state;
+- a final `UPDATE ... WHERE lease_token = ?` rejects too late, after stale
+  mutations and external effects have already happened;
+- holding the `run_queue` row lock across the whole route would hold a database
+  transaction across seconds-class network/VM/archive work and block the
+  queue's reaper contract.
+
+The required Gate 3 design is durable accepted-command ownership:
+
+1. Pinned completion remains tokenless on its existing path. A stateless report
+   requires a strictly positive `lease_token`; a token on a pinned job, no token
+   on a stateless job, an unknown lane, or an unaccepted stale token fails closed.
+2. One short transaction uses global lock order `run_queue -> jobs -> completion
+   command`, verifies the leased `worker_batch` token, records an immutable
+   command keyed by `(job_id, lease_token)` with its canonical payload, and
+   consumes the queue lease. Exact retries return the recorded state/result;
+   the same key with a different payload is a conflict.
+3. `batch_boundary` is the bounded DB-only case: in that transaction, set the
+   job to rotation-paused, clear legacy assignment/lease metadata, stash and
+   clear the freeze, reset/requeue the durable queue row, and finish the command.
+   It returns before generic graft/delivery/verification/cleanup hooks.
+4. Terminal reports leave a durable accepted obligation and a non-runnable
+   queue row. A separately claimed, visibility-timeout finalizer owns recovery.
+   Its core mutation and every retry/finish write are command-token CASes;
+   irreversible/external effects need deterministic idempotency keys or durable
+   per-step markers. A `core_applied` retry resumes outstanding hooks rather
+   than re-running status determination or hitting the legacy terminal guard.
+
+An intake table plus the atomic boundary disposition would be a safe Gate 3A
+slice, but it would not support terminal reports and therefore would not finish
+Gate 3 or authorize a driver. No migration, request field, intake scaffold, or
+worker-only partial path was landed: doing so would create a misleading
+"lease-token fenced" surface while the corrupting race remained. The next
+implementation should include real-Postgres acceptance/reaper races,
+same-token exact/divergent replay tests, rollback injection, finalizer visibility
+timeout fencing, crash-after-intake and crash-after-core convergence, and
+once-only assertions for counters, grafts, verification/loop hooks, delivery,
+and cleanup. Existing pinned completion behavior must remain unchanged.
+
+## Shared-pool decision at the stop boundary
+
+The requested one-Deployment experiment is **NO-SHIP at this boundary**. This is
+not a measured starvation failure: safety correctly prevented any worker claim,
+so no concurrent session/worker load result exists. The architecture audit did
+find two prerequisites absent from the proposed pod-local reservation:
+
+- a pod refusing a worker when its own slot is reserved does not guarantee a
+  pool-wide interactive executor; a static two-replica Deployment can lose the
+  reserve during rollout, pod failure, or executor unavailability without a
+  coordinator-visible presence/capacity contract;
+- the built stateless Deployment intentionally has no Tailscale/VM-mesh sidecar,
+  so it cannot serve the full existing worker capability set as one generic
+  pool.
+
+The design doc now retains two Deployments as the production default. A future
+one-pool experiment must first provide a failure-aware interactive reservation,
+capability-aware claims, and then pass the p95 session claim-wait benchmark
+under worker load. Gate 3 must be complete before that traffic is legal.
+
+Safety state at the boundary: the running DB still has zero `worker_batch` rows;
+the only deployed driver remains the session driver. Gates 1 and 2 are DONE.
+Gate 3, TodoManager resume hydration, generator-close cleanup, real tmux
+reattach, the worker driver, shared-pool guard, two-pod batch handoff, fault
+injection, and Job Bench parity/performance remain unverified.
+
+## Final verification of the stop boundary
+
+- Full repository run: **15,026 passed, 113 skipped, 23 failed** in 975.45 s.
+  Twenty-two failures are the current environment's missing-`asyncssh` canvas
+  transport group (15) and MCP 1.26 contract group (7); the exact same 22
+  failures reproduced from untouched base commit `3802d0e2` in a temporary
+  worktree outside Tilt's watch root. The remaining failure is the brief-listed
+  `test_connect_disconnect` localhost-Postgres assumption; it independently
+  fails with connection refused on port 5432, and neither its test nor
+  `src/database/postgres_db.py` differs from the base commit. No S3-focused or
+  queue test failed.
+- Repository Ruff check: clean. Ruff format check: all **1,039 files** already
+  formatted. `git diff --check`: clean.
+- Schema replay/drift check: clean through migration 0118. The first two final
+  invocations failed before replay because the script changes into
+  `orchestrator/` and a relative/absent `PYTHONPATH` could not import the new
+  root-level shared module. This was a real Gate-2 tooling integration defect,
+  not left as an invocation workaround: `schema-snapshot.sh` now explicitly
+  carries `REPO_ROOT` in the migration runner's `PYTHONPATH` while retaining the
+  orchestrator working directory. `bash -n` is clean and the ordinary command
+  `scripts/schema-snapshot.sh --check app` now passes without caller-provided
+  environment; 0118 replayed in **4 ms** on that final run.
+- Tilt reports `(Tiltfile)=ok`, `srw=ok`; `agent-stateless` is **2/2** and the
+  orchestrator is **1/1**. Every running agent container contains exactly one
+  boundary timing marker, exactly one 300 s floor definition, and exactly one
+  default-unarmed target initializer. The running orchestrator contains exactly
+  one unknown-freeze corruption guard, six legacy-lane recovery predicates, and
+  exactly one shared `batch_boundary` registry definition.
+- Final live SQL invariant: **0 `worker_batch` rows**. No worker workload was
+  used for a test or measurement.

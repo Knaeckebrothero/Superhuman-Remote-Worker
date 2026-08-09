@@ -63,6 +63,7 @@ async def db(pg_dsn):
                 id uuid PRIMARY KEY,
                 description text,
                 status text NOT NULL,
+                execution_lane text NOT NULL DEFAULT 'pinned',
                 context jsonb,
                 assigned_agent_id uuid,
                 error_message text,

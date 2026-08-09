@@ -24,6 +24,12 @@ from typing import Any, Callable
 
 import yaml
 
+from src.shared.job_freeze_types import (
+    CONTINUE_AS_NEW_FREEZE_TYPES,
+    ERROR_IMMUNE_FREEZE_TYPES,
+    SUBJOB_REDISPATCH_FREEZE_TYPES,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -328,40 +334,6 @@ def is_late_completion_report(job: dict[str, Any], result: dict[str, Any]) -> bo
 MEMORY_RETRY_CAP = 2
 
 
-# Freeze types whose 'paused' means "park for the AUTO-dispatcher to re-dispatch"
-# — as opposed to pauses awaiting an explicit human/sudo action
-# (vm_upgrade_required) or user feedback. For these, /complete must clear the
-# job row's freeze_data (stashing it in context.last_freeze_data): the
-# dispatcher's get_dispatchable_jobs predicate requires ``freeze_data IS NULL``
-# (partial-index contract, migration 0046), so a kept freeze blob makes the job
-# permanently invisible to auto-resume — the drain-wedge that stalled run-8's
-# iter-6 developer. A stale row-level freeze also poisons the NEXT completion
-# (``_parse_freeze_data`` prefers the DB copy over the request body).
-AUTO_REDISPATCH_FREEZE_TYPES: frozenset[str] = frozenset(
-    {
-        "version_upgrade",
-        "memory_unavailable",
-        "kb_unavailable",
-        "workspace_upgrade_required",
-    }
-)
-
-# Freeze types whose dedicated branch in ``determine_job_status`` must own the
-# pause-vs-fail decision even when a coincident ``error`` rides the same
-# completion report. A drain/outage freeze taken at a clean phase boundary beats
-# a transient interrupt error — the work is checkpointed and re-dispatch resumes
-# it — whereas the bare ``if error`` short-circuit would hard-fail an otherwise
-# re-dispatchable job (observed: a deploy drain racing a SIGTERM-interrupt
-# failing loop iterations instead of pausing them). These freezes' own branches
-# still enforce their fail conditions (memory/KB retry caps, the LLM-outage
-# duration ceiling), so guarding the short-circuit does not turn a genuine give-up into a
-# pause. ``llm_unavailable`` is included alongside the auto-redispatch set (same
-# failure class — the outage sweeper re-dispatches it).
-# docs/done/version_upgrade_drain_masked_by_coincident_error.md
-ERROR_IMMUNE_FREEZE_TYPES: frozenset[str] = AUTO_REDISPATCH_FREEZE_TYPES | frozenset(
-    {"llm_unavailable"}
-)
-
 # Parent statuses that PERMANENTLY block a subjob's re-dispatch. The dispatcher's
 # cascade guard (get_dispatchable_jobs, postgres.py) also blocks on a 'paused'
 # ancestor, but that is temporary — the subjob re-dispatches once the parent
@@ -378,15 +350,8 @@ _PARENT_TERMINAL_BLOCKING: frozenset[str] = frozenset({"failed", "cancelled"})
 # own row), so they apply per-subjob unchanged. All are guarded by
 # _PARENT_TERMINAL_BLOCKING first: a paused subjob under a permanently-dead
 # parent is a silent cascade-guard wedge.
-# docs/features/llm_outage_subjob_resilience.md
-_SUBJOB_REDISPATCH_FREEZE_TYPES: frozenset[str] = frozenset(
-    {
-        "version_upgrade",
-        "memory_unavailable",
-        "kb_unavailable",
-        "llm_unavailable",
-    }
-)
+# docs/features/llm_outage_subjob_resilience.md. Membership is centralized in
+# src.shared.job_freeze_types so independently deployed consumers cannot drift.
 
 # Substrings that mark an error as a workspace/VM *teardown* (connectivity) blip
 # rather than a genuine mid-run failure. On completion the VM is reaped, and a
@@ -1377,7 +1342,7 @@ def determine_job_status(
             )
             or (
                 job.get("parent_job_id") is not None
-                and freeze_type in _SUBJOB_REDISPATCH_FREEZE_TYPES
+                and freeze_type in SUBJOB_REDISPATCH_FREEZE_TYPES
                 and parent_status not in _PARENT_TERMINAL_BLOCKING
             )
         )
@@ -1433,10 +1398,10 @@ def determine_job_status(
         # per-subjob unchanged.
         # docs/done/coincident_infra_error_overrides_reported_job_outcome.md
         # docs/features/llm_outage_subjob_resilience.md
-        if freeze_type in _SUBJOB_REDISPATCH_FREEZE_TYPES:
+        if freeze_type in SUBJOB_REDISPATCH_FREEZE_TYPES:
             if parent_status in _PARENT_TERMINAL_BLOCKING:
                 return ("completed" if goal_achieved else "cancelled", None)
-            if freeze_type == "version_upgrade":
+            if freeze_type in CONTINUE_AS_NEW_FREEZE_TYPES:
                 return ("paused", None)
             # memory/kb/llm: shared branches below own pause-vs-fail.
         else:
@@ -1481,11 +1446,11 @@ def determine_job_status(
         # the happy path this freeze never reaches here — the agent handles it
         # in-process and the job continues without ever reporting the freeze.
         return ("paused", None)
-    if freeze_type == "version_upgrade":
-        # Continue-as-New: agent observed orchestrator-set drain intent,
-        # froze cleanly at a phase boundary, and the same job context
-        # gets re-dispatched to a fresh-version agent by the auto-assign
-        # dispatcher. State preserved through ``freeze_data`` + workspace.
+    if freeze_type in CONTINUE_AS_NEW_FREEZE_TYPES:
+        # Continue-as-New: the agent stopped at a durable checkpoint boundary.
+        # version_upgrade goes to a fresh-version pinned agent; batch_boundary
+        # goes back through the stateless run queue. Both preserve the same
+        # logical job and therefore must remain non-terminal.
         return ("paused", None)
     if freeze_type in ("memory_unavailable", "kb_unavailable"):
         # A memory-required job (e.g. the self-improvement loop) lost its
@@ -1610,7 +1575,7 @@ def determine_job_status(
                     ),
                 )
         return ("paused", None)
-    if is_loop_job:
+    if is_loop_job and freeze_type is None:
         # Non-completion stop with no recognized freeze on an unattended loop
         # job (agent stopped without declaring job_complete — weak-model
         # finishes do this). `completed` keeps the loop advancing; the retro
@@ -1623,6 +1588,16 @@ def determine_job_status(
             freeze_type,
         )
         return ("completed", None)
+    if freeze_type is not None:
+        # Fail visibly on version skew or a misspelled/new freeze type. Mapping
+        # an unknown declared boundary to completed is data corruption for loop
+        # jobs: the RSI loop merges partial work as if the unit had finished.
+        logger.error(
+            "Job %s stopped with unknown freeze_type=%r; routing to "
+            "pending_review rather than guessing a terminal outcome",
+            job.get("id"),
+            freeze_type,
+        )
     return ("pending_review", None)
 
 

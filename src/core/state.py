@@ -59,6 +59,12 @@ class UniversalAgentState(TypedDict):
         should_stop: Flag to signal workflow termination
         consecutive_llm_errors: Count of consecutive LLM failures
 
+        # Stateless worker batch budget (missing/None means unarmed)
+        worker_batch_started_at: Epoch timestamp when this claim began
+        worker_batch_start_iteration: Execute-iteration value at claim start
+        worker_batch_target_wall_seconds: Preferred wall-clock batch duration
+        worker_batch_iteration_cap: Optional execute-iteration delta cap
+
         # Job metadata
         metadata: Job-specific data (document_path, prompt, etc.)
 
@@ -113,6 +119,14 @@ class UniversalAgentState(TypedDict):
     error: Optional[Dict[str, Any]]
     should_stop: bool
     consecutive_llm_errors: int
+
+    # Stateless worker batches are armed explicitly by their claim driver.
+    # Keeping these fields in the checkpoint makes the boundary decision
+    # restart-safe; None preserves legacy/session behavior and old checkpoints.
+    worker_batch_started_at: Optional[float]
+    worker_batch_start_iteration: Optional[int]
+    worker_batch_target_wall_seconds: Optional[float]
+    worker_batch_iteration_cap: Optional[int]
 
     # Job metadata (flexible, agent-type specific)
     # For Creator: document_path, prompt, etc.
@@ -219,6 +233,11 @@ def create_initial_state(
         error=None,
         should_stop=False,
         consecutive_llm_errors=0,
+        # Worker batch budget (default-unarmed)
+        worker_batch_started_at=None,
+        worker_batch_start_iteration=None,
+        worker_batch_target_wall_seconds=None,
+        worker_batch_iteration_cap=None,
         # Metadata
         metadata=metadata or {},
         # Context management

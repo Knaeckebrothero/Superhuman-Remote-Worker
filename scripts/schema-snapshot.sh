@@ -59,7 +59,9 @@ OUT_DIR="orchestrator/database"
 # --- interpreter for the migration runner ----------------------------------
 # The runner imports `security.crypto` / `utils.db_url` assuming orchestrator/
 # is sys.path[0], so we always invoke it as `-m database.migrate` from inside
-# orchestrator/ (mirrors the CI dry-run job's working-directory).
+# orchestrator/ (mirrors the CI dry-run job's working-directory). Database
+# modules also import shared packages from the repository-root `src/` tree, so
+# the migration invocation explicitly carries REPO_ROOT in PYTHONPATH.
 if [[ -z "${PYTHON:-}" ]]; then
   if [[ -x "$REPO_ROOT/venv/bin/python" ]]; then
     PYTHON="$REPO_ROOT/venv/bin/python"
@@ -263,6 +265,7 @@ generate_one() {
 
   # Migrate from zero (real apply — runs .notx.sql CONCURRENTLY files too).
   ( cd orchestrator && \
+    PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}" \
     DATABASE_URL="postgresql://postgres:$PGPASS@localhost:$port/$db" \
     "$PYTHON" -m database.migrate --dir "database/migrations/$subdir" ) >&2
 
