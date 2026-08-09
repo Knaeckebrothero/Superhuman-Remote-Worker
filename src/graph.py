@@ -4515,6 +4515,14 @@ def create_audited_tool_node(
                 "Tool execution timed out and no workspace manager is available"
             )
         backend = tool_context.workspace_manager.backend
+        # Tool cancellation does not stop a synchronous worker thread already
+        # executing inside remote tmux. disconnect() is transport-only so that
+        # claim handoff preserves shell state; timeout recovery is the one path
+        # that must explicitly and synchronously reset the exact owned shell
+        # first. If the fence cannot prove the reset, fail recovery rather than
+        # let a late command mutate the workspace after its timeout result.
+        if backend.supports_shell:
+            backend.shell_reset_after_timeout()
         backend.disconnect()
         backend.connect()
 

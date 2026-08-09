@@ -33,9 +33,9 @@
 #     arrive per-claim from the orchestrator against proof of the current
 #     lease, never as pod env. The shared ConfigMap/Secret below carry only
 #     platform-level configuration, same as every provisioner-built pod.
-#   - No tailscale sidecar and no vm-ssh-key mount: S1 units are lite/virtual
-#     (no SSH workspace, no VM mesh). VM-capable units are a later Deployment
-#     variant (§5.8 capability dimension).
+#   - No tailscale sidecar: sandbox workspaces are reachable over cluster SSH,
+#     so the platform workspace key is mounted below. VM-mesh units still need
+#     a later Deployment variant (§5.8 capability dimension).
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -147,6 +147,10 @@ spec:
           volumeMounts:
             - name: workspace
               mountPath: /workspace
+            - name: vm-ssh-key
+              mountPath: /run/secrets/vm-ssh-key
+              subPath: ssh-privatekey
+              readOnly: true
             - name: tmp
               mountPath: /tmp
             - name: run
@@ -195,6 +199,14 @@ spec:
         - name: workspace
           emptyDir:
             sizeLimit: 10Gi
+        # Platform credential used only to authenticate RemoteBackend to a
+        # claimed sandbox workspace. Match the provisioned persistent-agent
+        # mount: the non-root process must be able to read the projected key,
+        # while Paramiko never needs to modify it.
+        - name: vm-ssh-key
+          secret:
+            secretName: {{ include "srw.vmSshKeySecretName" . }}
+            defaultMode: 0444
         - name: tmp
           emptyDir:
             medium: Memory

@@ -2134,3 +2134,153 @@ answered and completed despite degraded provider egress; a normal-latency
 post-change sample remains unavailable. The temporary gate remains installed
 until full S2 acceptance. Live queue invariant after the probe: **0
 `worker_batch` rows**.
+
+## Phase 1 remote-shell handoff substrate — DONE; sandbox admission remains closed
+
+This phase implemented and verified the remote-shell half of S2 without
+removing the lite-only admission gate. The brief described this as
+"reattach-if-exists", but a plain `tmux has-session` is not a safe ownership
+protocol: an expired claimant can still type into the successor's pane, an
+agent can die between reserving a pane and sending a command, tmux target names
+are prefix-matched by default, and a completed command's captured output can be
+mistaken for an idle prompt. The implementation therefore grew into a durable
+handoff protocol rather than adopting the smaller design literally.
+
+### What landed in this phase
+
+* `RemoteBackend.disconnect()` is transport-only and genuine teardown is an
+  explicit disposition. Queue claim switches preserve the workspace-side tmux
+  session; genuine session end destroys it. A terminally retired backend
+  object cannot reconnect from a cancelled Python worker thread.
+* Stateless claim ownership is bound before workspace, Git or cloud attach can
+  issue a shell command, then eagerly promoted under a workspace-side lock.
+  Physical sessions are never kept in the agent's warm-affinity cache: the old
+  backend is retired and detached while its lease is still held, before the
+  queue unit becomes claimable. Lite affinity remains unchanged.
+* A durable `active | creating | retired` shell-generation record and monotonic
+  lease-token fence serialize create, crash recovery, promotion and teardown.
+  Tmux mutations use the exact full thread id, exact session/pane targets, one
+  managed pane, and compare-and-set pending-command guards. State-changing
+  metadata and `send-keys` happen inside the same workspace-side lock.
+* Commands, including asynchronous commands, carry unique completion records.
+  The parser accepts only an exact sentinel, integer exit status and absolute
+  resulting working directory. Working-directory enter, user command,
+  restoration and the completion record are one guarded command, so a crash
+  cannot expose an unguarded changed cwd. Captured output retains the tail when
+  it exceeds the 5 MiB transport cap.
+* Reattach reconstructs and validates tab type, pane id, setup state, pending
+  command, protocol version and full owner identity. Split panes, malformed or
+  future metadata, incomplete setup and unknown topology fail closed. First
+  pane id `%0` is accepted. Prompt text is not an ownership signal: a real
+  tmux experiment proved that a running Bash command can print `$PS1` while
+  `pane_current_command` remains `bash`.
+* The stateless Deployment now receives the existing platform workspace SSH key
+  through the same read-only Secret mount used by persistent agents. Workspace
+  NetworkPolicy admits `srw-agent-stateless` only to SSH/CDP ports and only when
+  the stateless Deployment is enabled. No Secret payload is copied into chart
+  values or test output.
+
+Pinned sessions deliberately retain their established destructive fresh-init
+behavior. Only a lease-token-bearing stateless backend can adopt an existing
+remote shell. That avoids silently changing pinned resume semantics while the
+separate pinned end/resume teardown race remains unresolved.
+
+### Measurements and live verification
+
+The local baseline was loaded dynamically from `HEAD` without switching the
+Tilt-watched branch. Its first command took **0.560 s**, destructive detach
+took **0.005 s**, and the next init/command took **0.572 s**; exported state did
+not survive. The new protocol took **0.028 s** to create/claim and **1.424 s**
+to initialize/run, then **0.069 s** to promote a successor and **0.686 s** to
+reattach/run. Exported environment and cwd survived, and the old token was
+rejected. A command producing more than 5 MiB of scrollback still found its
+completion record in **1.443 s**. The `$PS1` forgery stayed guarded, a
+colliding command was refused, and explicit cancel recovered the pane.
+
+The k3d proof used a disposable sandbox workspace and the production
+`RemoteBackend` directly from two different stateless Deployment pods; it did
+not change the thread's execution lane or enqueue queue work. Pod A, token
+1001, claimed in **0.253 s** and initialized/ran in **2.479 s**, exporting
+`SRW_HANDOFF=cluster-ok` and changing cwd to `/tmp`. Pod B, token 1005,
+claimed in **0.249 s** and reattached/ran in **1.143 s** with both values intact.
+Pod A's stale token was then rejected. Token 1006 retired only the synthetic
+session and the test marker/lock were removed after every harness process had
+exited. Final cluster invariants were two updated/Ready stateless replicas,
+zero leased queue rows, and zero `worker_batch` rows.
+
+One live failure changed the protocol. Tmux 3.4 rendered the proposed ASCII
+unit separator in `list-windows` output as the literal text `\\037`, so the
+successor saw one malformed field and refused reattach. The delimiter is now
+`|`, which the strict field vocabularies exclude; the images were rebuilt and
+the two-pod proof above then passed. This is why the cluster result differs
+from the initial mocked transport design.
+
+Tilt's first two final rollouts again failed in the unrelated Cockpit
+`npm ci` step because bridge-network egress was unavailable. The previously
+proven temporary Cockpit `network='host'` build override allowed build 150 to
+converge and was removed before staging. Both current stateless pods and the
+orchestrator then matched working-tree hashes and contained the timeout-reset,
+joined-capture, delimiter, durable-fence and destructive-drain markers. This
+image inspection, not Tilt's aggregate status, is the deployment evidence.
+
+The pinned README-path smoke reached a current-image pinned pod and initialized
+one shell/tab in **1.261 s**. Its requested turn then recorded the expected
+durable error after provider `APIConnectionError` retries, so no successful AI
+reply is claimed. The disposable thread was soft-ended and its workspace pod
+removed afterward.
+
+The pre-commit adversarial pass found four regressions outside the successful
+handoff path, so this phase was not marked DONE until they were fixed. Tool
+timeout recovery had still assumed `disconnect()` killed tmux; it now performs
+an exact-owner reset before reconnect and refuses to reconnect if that reset is
+not proven. Pinned drain now explicitly destroys the shell before asking the
+orchestrator to snapshot. Tmux capture uses joined logical lines so a cwd wider
+than the pane cannot strand a strict completion record. Finally, stale
+prompt-looking scrollback is consulted only while a durable pending guard
+exists; it cannot block a new command on an idle pane. A real tmux 3.7b probe at
+width 20 produced **0** strict records without `-J` and **1** with it. A second
+probe killed the exact session during `sleep 2; touch ...`; the late file was
+absent after 2.1 s.
+
+Focused verification covered the ownership state machine, crash boundaries,
+stale-token and prefix-neighbor rejection, exact pane topology, sentinel CAS,
+setup retry, async collision rules, timeout reset, pinned drain ordering,
+terminal retirement and queue-release ordering: **842 passed** with four known
+mock-cleanup warnings. The repository-wide run completed with **15,277 passed,
+11 failed and 121 skipped**. The 11 failures exactly match the established
+environment baseline: no Postgres on localhost, MCP subprocess/loopback
+transport failures, and unavailable external research clients. Restoring the
+two existing public tiktoken assets to `/tmp/data-gym-cache` first prevented a
+network-only inflation of that count; no cache file is part of the change.
+Ruff and format checks pass, Helm lint passes for both supplied values files
+with stateless mode both off and on, and `git diff --check` is clean.
+
+### Boundary and remaining S2 work
+
+This phase is DONE only as a gate-closed shell-handoff substrate. It is not
+authorization to remove the sandbox/VM admission gate, and S2 is not DONE.
+Before a physical thread may enter the lane, all of the following still need a
+durable design and fault-injected proof:
+
+* bind shell ownership to the authoritative workspace backing and runtime
+  incarnation, including planned suspension, container restart, Pod/PVC
+  replacement and split-brain recovery;
+* move the lock/marker authority out of the workload user's writable home (or
+  explicitly accept a cooperative-only threat model); surface terminal
+  retirement failures instead of swallowing them, and make lifecycle
+  completion wait for or reconcile cleanup;
+* implement the cloud push-generation fence. The successor must not pull until
+  the predecessor's exact generation is acknowledged; the current 60-second
+  background-push cutoff and detach-time push cannot provide that guarantee;
+* re-home or explicitly retire the rclone refresh and overlay-heal daemons,
+  post-turn outbox work, hard-interrupt routing and canvas presence;
+* implement the §6.1 RAM/path-bypass decisions: durable task/undo/extraction/
+  cloud-anchor state, backend-aware WebDAV/research/citation paths, and explicit
+  disposal of the remaining cold caches;
+* define pinned-to-stateless cutover and rollback. Marker-absent existing tmux
+  and tokenless access to a stateless marker intentionally fail closed today.
+
+No migration was needed for this slice. The agent-local PVC proposal remains
+rejected: the durable shell and files belong to the remote workspace, while the
+actual agent-local/process residue needs targeted externalization rather than a
+per-thread volume on the shared Deployment.

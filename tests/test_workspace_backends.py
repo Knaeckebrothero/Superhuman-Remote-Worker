@@ -6,8 +6,10 @@ entirely to avoid requiring SSH infrastructure.
 
 import errno
 import io
+import re
 import socket
 import stat as stat_module
+import threading
 from contextlib import contextmanager
 import sys
 from pathlib import Path
@@ -104,10 +106,72 @@ class _WindowedChannel:
 
 def _wire_exec_channel(mock_ssh, channel):
     """Point mock_ssh.exec_command at a (stdin, stdout, stderr) triple
-    whose stdout.channel is the given mock channel."""
-    stdout = MagicMock()
-    stdout.channel = channel
-    mock_ssh.exec_command.return_value = (MagicMock(), stdout, MagicMock())
+    whose stdout.channel is the given mock channel.
+
+    Shell-lifecycle setup has several protocol replies that ordinary operation
+    tests should not each have to recreate: the atomic creator reports
+    ``created``, one pane is discovered, and setup markers are observed by the
+    next capture. All other commands retain the caller-supplied channel.
+    """
+
+    def result_for(selected):
+        stdout = MagicMock()
+        stdout.channel = selected
+        return MagicMock(), stdout, MagicMock()
+
+    ready_marker = None
+
+    def exec_command(command, *args, **kwargs):
+        nonlocal ready_marker
+        marker_match = re.search(r"(__READY_[0-9a-f]+__)", command)
+        if "tmux send-keys" in command and marker_match:
+            ready_marker = marker_match.group(1)
+
+        if "tmux" in command:
+            payload = b""
+            stripped = command.lstrip()
+            if "tmux new-session" in command and (
+                "printf existing" in command or "printf created" in command
+            ):
+                payload = b"created"
+            elif "tmux list-panes" in command:
+                payload = b"%1"
+            elif (
+                stripped.startswith("tmux display-message")
+                and _TMUX_OWNER_ID_OPTION in command
+            ):
+                payload = b""
+            elif (
+                stripped.startswith("tmux display-message")
+                and _TMUX_PROMPT_TOKEN_OPTION in command
+            ):
+                payload = b""
+            elif (
+                stripped.startswith("tmux display-message")
+                and _TMUX_SETUP_OPTION in command
+            ):
+                payload = _TMUX_SETUP_PENDING.encode()
+            elif (
+                stripped.startswith("tmux display-message")
+                and _TMUX_PROTOCOL_OPTION in command
+            ):
+                payload = b""
+            elif "tmux capture-pane" in command and ready_marker is not None:
+                payload = f"{ready_marker} 0 /home/agent-host/workspace\n".encode()
+                ready_marker = None
+            elif "tmux capture-pane" in command or "tmux list-windows" in command:
+                payload = channel._out
+                channel._out = b""
+            elif "tmux has-session" in command and "&& echo yes" in command:
+                return result_for(channel)
+            else:
+                return result_for(_WindowedChannel())
+
+            return result_for(_WindowedChannel(stdout_data=payload))
+
+        return result_for(channel)
+
+    mock_ssh.exec_command.side_effect = exec_command
 
 
 class TestExecDrainLoop:
@@ -162,6 +226,22 @@ class TestExecDrainLoop:
         assert out.endswith("[output truncated at 5 MiB]")
         assert len(out) < 6 * 1024 * 1024
 
+    def test_tail_retention_keeps_completion_data_at_end_of_large_output(
+        self, remote_backend
+    ):
+        backend, mock_ssh, _ = remote_backend
+        backend.connect()
+        big = b"x" * (6 * 1024 * 1024) + b"__SRW_COMPLETION_TAIL__"
+        _wire_exec_channel(mock_ssh, _WindowedChannel(stdout_data=big))
+
+        out, exit_code = backend._exec_with_status(
+            "tmux capture-pane", retain_tail=True
+        )
+
+        assert exit_code == 0
+        assert out.startswith("[output truncated at 5 MiB]")
+        assert out.endswith("__SRW_COMPLETION_TAIL__")
+
 
 class _InfiniteChannel(_WindowedChannel):
     """recv_ready() is always True and never exits — an infinite/fast-enough
@@ -206,14 +286,81 @@ class TestExecDrainLoopDeadline:
 
 from src.core.backends.remote import (  # noqa: E402
     RemoteBackend,
+    _INHERITED_BUSY_SENTINEL,
     _RemoteTab,
+    _TMUX_FIELD_SEPARATOR,
+    _TMUX_GENERATION_OPTION,
+    _TMUX_OWNER_ID_OPTION,
+    _TMUX_OWNER_TOKEN_OPTION,
+    _TMUX_PENDING_SENTINEL_OPTION,
+    _TMUX_PROTOCOL_OPTION,
+    _TMUX_PROMPT_TOKEN_OPTION,
+    _TMUX_SETUP_COMPLETE,
+    _TMUX_SETUP_OPTION,
+    _TMUX_SETUP_PENDING,
+    _TMUX_TAB_TYPE_OPTION,
+    _TMUX_WINDOW_SETUP_OPTION,
     _TCP_KEEPALIVE_COUNT,
     _TCP_KEEPALIVE_IDLE_SECONDS,
     _TCP_KEEPALIVE_INTERVAL_SECONDS,
     _TCP_USER_TIMEOUT_MILLIS,
     _TRANSPORT_KEEPALIVE_SECONDS,
+    _parse_shell_completion_record,
     _validate_private_key,
 )
+
+
+def _tmux_window_row(
+    name: str,
+    tab_type: str,
+    pending: str = "",
+    *,
+    pane_count: str = "1",
+    pane_id: str = "%1",
+    stored_pane_id: str = "%1",
+    prompt_token: str = "",
+    setup_state: str = _TMUX_SETUP_COMPLETE,
+) -> str:
+    return _TMUX_FIELD_SEPARATOR.join(
+        (
+            name,
+            tab_type,
+            pending,
+            pane_count,
+            pane_id,
+            stored_pane_id,
+            prompt_token,
+            setup_state,
+        )
+    )
+
+
+class TestRemoteShellCompletionRecords:
+    _SENTINEL = "__DONE_0123456789ab__"
+
+    @pytest.mark.parametrize(
+        "line",
+        (
+            "printf '__DONE_0123456789ab__ %s %s'",
+            "__DONE_0123456789ab__ %s %s",
+            "prefix __DONE_0123456789ab__ 0 /workspace",
+            "__DONE_0123456789ab__ 0 relative/path",
+            "__DONE_0123456789ab__ 999 /workspace",
+        ),
+    )
+    def test_wrapped_or_malformed_command_echo_never_completes(self, line):
+        assert _parse_shell_completion_record(line, self._SENTINEL) is None
+
+    def test_only_exact_newline_separated_record_completes(self, remote_backend):
+        backend, _, _ = remote_backend
+        command, _ = backend._build_guarded_shell_command(
+            "echo ok", self._SENTINEL, None
+        )
+
+        assert f"printf '\\n{self._SENTINEL}" in command
+        assert _parse_shell_completion_record(
+            f"{self._SENTINEL} 0 /workspace", self._SENTINEL
+        ) == (0, "/workspace")
 
 
 @pytest.fixture(autouse=True)
@@ -529,17 +676,17 @@ class TestRemoteBackendDisconnect:
         assert backend._ssh is None
         assert backend._sftp is None
 
-    def test_disconnect_kills_tmux_session(self, remote_backend):
-        """disconnect() kills the remote tmux session if shell was initialized."""
-        backend, mock_ssh, mock_sftp = remote_backend
+    def test_disconnect_preserves_tmux_session(self, remote_backend):
+        """Transport detach drops local state without destroying remote tmux."""
+        backend, _, _ = remote_backend
         backend.connect()
         backend._shell_initialized = True
         backend._tabs["default"] = MagicMock()
 
-        # Mock exec_command for the tmux kill
-        _wire_exec_channel(mock_ssh, _WindowedChannel())
+        with patch.object(backend, "_exec") as execute:
+            backend.disconnect()
 
-        backend.disconnect()
+        execute.assert_not_called()
         assert backend._shell_initialized is False
         assert len(backend._tabs) == 0
 
@@ -555,6 +702,63 @@ class TestRemoteBackendDisconnect:
         mock_sftp.close.side_effect = Exception("already closed")
         backend.disconnect()  # Should not raise
         assert backend._sftp is None
+
+    def test_retired_backend_cannot_reconnect(self, remote_backend):
+        backend, _, _ = remote_backend
+        backend.connect()
+        backend.retire()
+
+        with patch.object(backend, "_connect_impl") as connect_impl:
+            with pytest.raises(WorkspaceUnavailableError, match="retired"):
+                backend._ensure_connected()
+            with pytest.raises(WorkspaceUnavailableError, match="retired"):
+                backend.connect()
+
+        connect_impl.assert_not_called()
+        assert backend.is_connected() is False
+
+    def test_retire_serializes_behind_inflight_connect(self, remote_backend):
+        backend, _, _ = remote_backend
+        connect_entered = threading.Event()
+        release_connect = threading.Event()
+        retire_finished = threading.Event()
+        errors = []
+
+        def slow_connect():
+            connect_entered.set()
+            if not release_connect.wait(timeout=2):
+                raise AssertionError("test did not release connect barrier")
+
+        def connect_worker():
+            try:
+                backend.connect()
+            except Exception as exc:  # pragma: no cover - asserted below
+                errors.append(exc)
+
+        def retire_worker():
+            try:
+                backend.retire()
+            except Exception as exc:  # pragma: no cover - asserted below
+                errors.append(exc)
+            finally:
+                retire_finished.set()
+
+        with patch.object(backend, "_connect_impl", side_effect=slow_connect):
+            connecting = threading.Thread(target=connect_worker)
+            retiring = threading.Thread(target=retire_worker)
+            connecting.start()
+            assert connect_entered.wait(timeout=1)
+            retiring.start()
+            assert not retire_finished.wait(timeout=0.05)
+            release_connect.set()
+            connecting.join(timeout=1)
+            retiring.join(timeout=1)
+
+        assert errors == []
+        assert retire_finished.is_set()
+        assert backend._retired is True
+        with pytest.raises(WorkspaceUnavailableError, match="retired"):
+            backend._ensure_connected()
 
 
 class TestRemoteBackendIsConnected:
@@ -1448,6 +1652,258 @@ class TestRemoteBackendExec:
             backend._exec("ls")
 
 
+class TestRemoteBackendTmuxFences:
+    """The durable tmux protocol fails closed across owner handoffs."""
+
+    def test_stateless_owner_token_is_immutable_per_backend(self, remote_backend):
+        backend, _, _ = remote_backend
+        backend.set_shell_owner_token(10)
+        backend.set_shell_owner_token(10)
+
+        with pytest.raises(WorkspaceUnavailableError, match="fresh backend"):
+            backend.set_shell_owner_token(11)
+
+        assert backend._shell_owner_token == 10
+
+    def test_stateless_create_command_covers_durable_marker_matrix(
+        self, remote_backend
+    ):
+        backend, _, _ = remote_backend
+        backend.set_shell_owner_token(12)
+
+        with patch.object(
+            backend, "_tmux_exec_checked", return_value="existing"
+        ) as execute:
+            assert backend._stateless_create_or_observe_tmux_session() == "existing"
+
+        command = execute.call_args.args[0]
+        assert "$HOME/.srw/tmux" in command
+        assert "_srw_load_state" in command
+        assert '"$_srw_status" = active' in command
+        assert '"$_srw_status" = creating' in command
+        # The remaining marker state is the retired tombstone branch and must
+        # require a strictly newer claim before creating a new generation.
+        assert '-gt "$_srw_token"' in command
+        assert "tmux has-session" in command
+        assert "exit 79" in command  # active marker + missing/mismatched tmux
+        assert "_srw_write_state creating" in command
+        assert "_srw_write_state active" in command
+        assert _TMUX_GENERATION_OPTION in command
+
+    def test_creating_marker_recovery_resets_partial_tmux_before_create(
+        self, remote_backend
+    ):
+        backend, _, _ = remote_backend
+        backend.set_shell_owner_token(13)
+
+        with patch.object(
+            backend, "_tmux_exec_checked", return_value="created"
+        ) as execute:
+            assert backend._stateless_create_or_observe_tmux_session() == "created"
+
+        command = execute.call_args.args[0]
+        creating_branch = command.index('"$_srw_status" = creating')
+        reset = command.index("tmux kill-session", creating_branch)
+        recreate = command.index("tmux new-session", reset)
+        assert creating_branch < reset < recreate
+
+    def test_stateless_cleanup_writes_tombstone_before_kill(self, remote_backend):
+        backend, _, _ = remote_backend
+        backend.set_shell_owner_token(14)
+
+        with patch.object(backend, "_tmux_exec_checked") as execute:
+            backend.shell_cleanup()
+
+        command = execute.call_args.args[0]
+        tombstone = command.index("_srw_write_state retired")
+        kill = command.index("tmux kill-session", tombstone)
+        assert tombstone < kill
+        assert "$HOME/.srw/tmux" in command
+        assert '"$_srw_token" -le 14' in command
+        assert _TMUX_GENERATION_OPTION in command
+        assert execute.call_args.kwargs["allow_shell_retired"] is True
+
+    def test_exact_tmux_targets_do_not_change_raw_create_name(self, remote_backend):
+        backend, _, _ = remote_backend
+        assert backend._tmux_target() == "=agent_aaaa-bbbb-cc:"
+        assert backend._tmux_target("default") == "=agent_aaaa-bbbb-cc:=default"
+
+        with patch.object(
+            backend, "_tmux_exec_checked", return_value="created"
+        ) as execute:
+            backend._create_or_observe_tmux_session()
+
+        command = execute.call_args.args[0]
+        assert "tmux new-session -d -s agent_aaaa-bbbb-cc" in command
+        assert "new-session -d -s '=agent_aaaa-bbbb-cc:'" not in command
+
+    def test_checked_tmux_nonzero_clears_untrusted_local_state(self, remote_backend):
+        backend, _, _ = remote_backend
+        backend._shell_initialized = True
+        backend._tabs["default"] = _RemoteTab("default", pane_id="%1")
+
+        with patch.object(
+            backend, "_exec_with_status", return_value=("partial output", 75)
+        ):
+            with pytest.raises(WorkspaceUnavailableError, match="exit code 75"):
+                backend._tmux_exec_checked("tmux list-windows", operation="probe")
+
+        assert backend._shell_initialized is False
+        assert backend._tabs == {}
+
+    def test_checked_tmux_requests_bounded_tail_retention(self, remote_backend):
+        backend, _, _ = remote_backend
+        with patch.object(
+            backend, "_exec_with_status", return_value=("tail", 0)
+        ) as execute:
+            assert (
+                backend._tmux_exec_checked("tmux capture-pane", operation="capture")
+                == "tail"
+            )
+        execute.assert_called_once_with("tmux capture-pane", retain_tail=True)
+
+    def test_capture_joins_only_display_wrapped_lines(self, remote_backend):
+        backend, _, _ = remote_backend
+        backend._tabs["default"] = _RemoteTab("default", pane_id="%1")
+
+        with patch.object(
+            backend,
+            "_tmux_exec_checked",
+            return_value="first logical line\nsecond logical line\n",
+        ) as execute:
+            assert backend._tmux_capture("default") == [
+                "first logical line",
+                "second logical line",
+            ]
+
+        command = execute.call_args.args[0]
+        assert "capture-pane -J " in command
+        assert f"-S -{backend._scrollback_limit}" in command
+
+    def test_full_owner_id_mismatch_refuses_truncated_name_collision(
+        self, remote_backend
+    ):
+        backend, _, _ = remote_backend
+        # Both IDs produce the same deterministic 12-character tmux name.
+        assert backend._session_name == "agent_aaaa-bbbb-cc"
+        with (
+            patch.object(
+                backend,
+                "_read_tmux_session_option",
+                return_value="aaaa-bbbb-cccc-successor",
+            ),
+            patch.object(backend, "_set_tmux_session_option") as persist,
+        ):
+            with pytest.raises(WorkspaceUnavailableError, match="owner identity"):
+                backend._attest_tmux_owner()
+        persist.assert_not_called()
+
+    def test_owner_token_promotion_is_monotonic_and_locked(self, remote_backend):
+        backend, _, _ = remote_backend
+        backend.set_shell_owner_token(42)
+
+        with patch.object(backend, "_tmux_exec_checked") as execute:
+            backend._promote_tmux_owner_token()
+
+        execute.assert_called_once()
+        command = execute.call_args.args[0]
+        assert "flock -o -w 30" in command
+        assert _TMUX_OWNER_TOKEN_OPTION in command
+        assert '"$_srw_token" = 42 ] || exit 75' in command
+        assert '"$_srw_tmux_token" = 42 ] || exit 75' in command
+        assert "exit 75" in command
+        assert "@srw_generation" in command
+
+    def test_stale_owner_token_mutation_is_rejected_by_checked_status(
+        self, remote_backend
+    ):
+        backend, _, _ = remote_backend
+        backend.set_shell_owner_token(7)
+        backend._shell_initialized = True
+        backend._tabs["default"] = _RemoteTab("default", pane_id="%1")
+
+        with patch.object(
+            backend, "_exec_with_status", return_value=("", 75)
+        ) as execute:
+            with pytest.raises(WorkspaceUnavailableError, match="exit code 75"):
+                backend._tmux_mutate_checked(
+                    "tmux kill-window -t %1", operation="stale mutation"
+                )
+
+        command = execute.call_args.args[0]
+        assert "flock -o -w 30" in command
+        assert _TMUX_OWNER_TOKEN_OPTION in command
+        assert "= 7 ] || exit 75" in command
+        assert backend._tabs == {}
+
+    def test_atomic_reserve_and_send_is_one_locked_fenced_remote_exec(
+        self, remote_backend
+    ):
+        backend, _, _ = remote_backend
+        backend.set_shell_owner_token(9)
+        backend._tabs["default"] = _RemoteTab("default", pane_id="%17")
+
+        with patch.object(backend, "_tmux_exec_checked") as execute:
+            backend._reserve_and_send_shell_command(
+                "default",
+                expected=None,
+                sentinel="__DONE_0123456789ab__",
+                command="printf 'hello world'",
+            )
+
+        execute.assert_called_once()
+        command = execute.call_args.args[0]
+        assert "flock -o -w 30" in command
+        assert _TMUX_OWNER_TOKEN_OPTION in command
+        assert "= 9 ] || exit 75" in command
+        assert _TMUX_PENDING_SENTINEL_OPTION in command
+        assert '"$_srw_pending" = ' in command
+        assert "__DONE_0123456789ab__" in command
+        assert command.count("tmux send-keys") == 2
+        assert "%17" in command
+        assert backend._tabs["default"].pending_sentinel == "__DONE_0123456789ab__"
+
+    def test_clear_pending_compares_expected_sentinel_before_mutation(
+        self, remote_backend
+    ):
+        backend, _, _ = remote_backend
+        tab = _RemoteTab("default", pane_id="%1")
+        tab.pending_sentinel = "__DONE_bbbbbbbbbbbb__"
+        backend._tabs["default"] = tab
+
+        with patch.object(
+            backend,
+            "_tmux_mutate_checked",
+            side_effect=WorkspaceUnavailableError("CAS mismatch"),
+        ) as mutate:
+            with pytest.raises(WorkspaceUnavailableError, match="CAS mismatch"):
+                backend._clear_tab_pending("default", "__DONE_aaaaaaaaaaaa__")
+
+        command = mutate.call_args.args[0]
+        assert '"$_srw_pending" = __DONE_aaaaaaaaaaaa__' in command
+        assert "|| exit 74" in command
+        # Request A did not locally clear the newer request B either.
+        assert tab.pending_sentinel == "__DONE_bbbbbbbbbbbb__"
+
+    def test_async_shell_send_installs_unique_completion_guard(self, remote_backend):
+        backend, _, _ = remote_backend
+        backend._shell_initialized = True
+        backend._tabs["default"] = _RemoteTab("default", pane_id="%1")
+
+        with patch.object(backend, "_tmux_mutate_checked") as mutate:
+            result = backend.shell_send("default", "npm run dev", enter=True)
+
+        assert result == "Sent to 'default'"
+        mutate.assert_called_once()
+        command = mutate.call_args.args[0]
+        guard = backend._tabs["default"].pending_sentinel
+        assert guard is not None
+        assert re.fullmatch(r"__DONE_[0-9a-f]{12}__", guard)
+        assert guard in command
+        assert "npm run dev" in command
+        assert command.count("tmux send-keys") == 2
+
+
 class TestRemoteBackendCheckBlocked:
     """Tests for RemoteBackend._check_blocked()."""
 
@@ -1564,19 +2020,19 @@ class TestRemoteBackendDetectBlockedTab:
     def test_normal_prompt_not_blocked(self, remote_backend):
         backend, _, _ = remote_backend
         lines = ["some output", "user@host:~$"]
-        result = backend._detect_blocked_tab(lines)
+        result = backend._detect_blocked_tab("default", lines)
         assert result is None
 
     def test_hash_prompt_not_blocked(self, remote_backend):
         backend, _, _ = remote_backend
         lines = ["output", "root@host:#"]
-        result = backend._detect_blocked_tab(lines)
+        result = backend._detect_blocked_tab("default", lines)
         assert result is None
 
     def test_interactive_prompt_blocked(self, remote_backend):
         backend, _, _ = remote_backend
         lines = ["Install packages?", "[y/N]"]
-        result = backend._detect_blocked_tab(lines)
+        result = backend._detect_blocked_tab("default", lines)
         assert result is not None
 
 
@@ -1588,6 +2044,334 @@ class TestRemoteBackendShellOperations:
             mock_ssh,
             _WindowedChannel(stdout_data=output.encode("utf-8"), exit_code=exit_code),
         )
+
+    def test_init_existing_session_rehydrates_without_reset(self, remote_backend):
+        backend, _, _ = remote_backend
+        backend.connect()
+        backend.set_shell_owner_token(1)
+
+        with (
+            patch.object(
+                backend, "_create_or_observe_tmux_session", return_value="existing"
+            ) as observe,
+            patch.object(backend, "_promote_tmux_owner_token"),
+            patch.object(backend, "_attest_tmux_owner"),
+            patch.object(backend, "_ensure_prompt_token"),
+            patch.object(
+                backend,
+                "_read_tmux_session_option",
+                side_effect=lambda option: (
+                    _TMUX_SETUP_COMPLETE if option == _TMUX_SETUP_OPTION else "2"
+                ),
+            ),
+            patch.object(backend, "_rehydrate_tabs") as rehydrate,
+            patch.object(backend, "_send_and_wait") as setup,
+            patch.object(backend, "_tmux_mutate_checked") as mutate,
+        ):
+            backend._init_shell()
+
+        observe.assert_called_once_with()
+        rehydrate.assert_called_once_with()
+        setup.assert_not_called()
+        assert all(
+            "kill-session" not in call_.args[0] for call_ in mutate.call_args_list
+        )
+        assert backend._shell_initialized is True
+
+    def test_stateless_active_session_is_promoted_without_kill(self, remote_backend):
+        backend, _, _ = remote_backend
+        backend.set_shell_owner_token(1)
+
+        with patch.object(
+            backend, "_tmux_exec_checked", return_value="created"
+        ) as execute:
+            assert backend._create_or_observe_tmux_session() == "created"
+
+        command = execute.call_args.args[0]
+        assert "tmux has-session" in command
+        assert "tmux new-session" in command
+        active_branch = command.split('if [ "$_srw_status" = active ]; then', 1)[
+            1
+        ].split('elif [ "$_srw_status" = creating ]; then', 1)[0]
+        assert "printf existing" in active_branch
+        assert "kill-session" not in active_branch
+
+    def test_pinned_create_stays_destructive_and_never_adopts(self, remote_backend):
+        backend, _, _ = remote_backend
+
+        with patch.object(
+            backend, "_tmux_exec_checked", return_value="created"
+        ) as execute:
+            assert backend._create_or_observe_tmux_session() == "created"
+
+        command = execute.call_args.args[0]
+        assert "tmux kill-session" in command
+        assert "tmux new-session" in command
+        assert "printf existing" not in command
+
+    def test_setup_send_and_wait_is_guarded_and_cas_cleared(self, remote_backend):
+        backend, _, _ = remote_backend
+        backend._tabs["default"] = _RemoteTab("default", pane_id="%1")
+        with (
+            patch("src.core.backends.remote.uuid.uuid4") as uuid4,
+            patch.object(backend, "_reserve_and_send_shell_command") as reserve,
+            patch.object(
+                backend,
+                "_tmux_capture",
+                return_value=["__READY_01234567__ 0 /workspace"],
+            ),
+            patch.object(backend, "_clear_tab_pending") as clear,
+        ):
+            uuid4.return_value.hex = "0123456789abcdef"
+            backend._send_and_wait(
+                "default", "export FOO=bar", expected_pending="old-guard"
+            )
+
+        reserve.assert_called_once_with(
+            "default",
+            expected="old-guard",
+            sentinel=_INHERITED_BUSY_SENTINEL,
+            command=(
+                "export FOO=bar; _srw_setup_rc=$?; "
+                "printf '\\n__READY_01234567__ %s %s\\n' "
+                '"$_srw_setup_rc" "$PWD"'
+            ),
+        )
+        clear.assert_called_once_with("default", _INHERITED_BUSY_SENTINEL)
+
+    def test_fresh_session_persists_default_tab_type(self, remote_backend):
+        backend, _, _ = remote_backend
+        backend.connect()
+
+        with (
+            patch.object(
+                backend, "_create_or_observe_tmux_session", return_value="created"
+            ),
+            patch.object(backend, "_promote_tmux_owner_token"),
+            patch.object(backend, "_attest_tmux_owner"),
+            patch.object(backend, "_ensure_prompt_token"),
+            patch.object(
+                backend,
+                "_read_tmux_session_option",
+                side_effect=lambda option: (
+                    _TMUX_SETUP_PENDING if option == _TMUX_SETUP_OPTION else ""
+                ),
+            ),
+            patch.object(backend, "_discover_single_pane", return_value="%1"),
+            patch.object(backend, "_set_tmux_window_option") as set_option,
+            patch.object(backend, "_send_and_wait"),
+            patch.object(backend, "_install_prompt_marker"),
+            patch.object(backend, "_tmux_mutate_checked"),
+        ):
+            backend._init_shell()
+
+        set_option.assert_any_call("default", _TMUX_TAB_TYPE_OPTION, "shell")
+        assert backend._tabs["default"].tab_type == "shell"
+        assert backend._tabs["default"].pane_id == "%1"
+
+    def test_reattach_restores_persisted_tab_type_and_pending_sentinel(
+        self, remote_backend
+    ):
+        backend, _, _ = remote_backend
+        backend._shell_protocol_current = True
+        metadata = "\n".join(
+            (
+                _tmux_window_row(
+                    "default", "shell", "__DONE_0123456789ab__", pane_id="%1"
+                ),
+                _tmux_window_row("console", "repl", pane_id="%2", stored_pane_id="%2"),
+            )
+        )
+
+        with (
+            patch.object(backend, "_tmux_exec_checked", return_value=metadata),
+            patch.object(backend, "_tmux_capture", return_value=["still running"]),
+        ):
+            backend._rehydrate_tabs()
+
+        assert list(backend._tabs) == ["default", "console"]
+        assert backend._tabs["default"].tab_type == "shell"
+        assert backend._tabs["default"].pending_sentinel == "__DONE_0123456789ab__"
+        assert backend._tabs["default"].pane_id == "%1"
+        assert backend._tabs["console"].tab_type == "repl"
+
+    @pytest.mark.parametrize(
+        ("metadata", "message"),
+        (
+            (_tmux_window_row("default", "shell", pane_count="2"), "topology"),
+            (_tmux_window_row("Bad Name", "shell"), "represented safely"),
+            ("default\x1fshell\x1fmissing-fields", "Malformed"),
+        ),
+    )
+    def test_reattach_refuses_split_panes_and_malformed_metadata(
+        self, remote_backend, metadata, message
+    ):
+        backend, _, _ = remote_backend
+        with patch.object(backend, "_tmux_exec_checked", return_value=metadata):
+            with pytest.raises(WorkspaceUnavailableError, match=message):
+                backend._rehydrate_tabs()
+        assert backend._tabs == {}
+
+    def test_reattach_refuses_changed_pane_identity(self, remote_backend):
+        backend, _, _ = remote_backend
+        metadata = _tmux_window_row(
+            "default", "shell", pane_id="%2", stored_pane_id="%1"
+        )
+        with patch.object(backend, "_tmux_exec_checked", return_value=metadata):
+            with pytest.raises(WorkspaceUnavailableError, match="pane identity"):
+                backend._rehydrate_tabs()
+
+    def test_current_protocol_refuses_incomplete_default_window(self, remote_backend):
+        backend, _, _ = remote_backend
+        backend._shell_protocol_current = True
+        metadata = _tmux_window_row("default", "shell", setup_state=_TMUX_SETUP_PENDING)
+
+        with patch.object(backend, "_tmux_exec_checked", return_value=metadata):
+            with pytest.raises(WorkspaceUnavailableError, match="setup is incomplete"):
+                backend._rehydrate_tabs()
+
+    def test_current_protocol_discards_incomplete_nondefault_window(
+        self, remote_backend
+    ):
+        backend, _, _ = remote_backend
+        backend._shell_protocol_current = True
+        metadata = "\n".join(
+            (
+                _tmux_window_row("default", "shell"),
+                _tmux_window_row(
+                    "console",
+                    "repl",
+                    pane_id="%2",
+                    stored_pane_id="%2",
+                    setup_state=_TMUX_SETUP_PENDING,
+                ),
+            )
+        )
+
+        with (
+            patch.object(backend, "_tmux_exec_checked", return_value=metadata),
+            patch.object(backend, "_tmux_capture", return_value=["$", "#"]),
+            patch.object(backend, "_tmux_mutate_checked") as mutate,
+        ):
+            backend._rehydrate_tabs()
+
+        assert list(backend._tabs) == ["default"]
+        assert any(
+            "kill-window" in call_.args[0] and "console" in call_.args[0]
+            for call_ in mutate.call_args_list
+        )
+
+    @pytest.mark.parametrize("tab_type", ("ssh", "repl"))
+    def test_non_shell_window_is_complete_before_initial_command(
+        self, remote_backend, tab_type
+    ):
+        backend, _, _ = remote_backend
+        backend._shell_initialized = True
+        backend._tabs["default"] = _RemoteTab("default", pane_id="%1")
+        lifecycle = MagicMock()
+        with (
+            patch.object(backend, "_tmux_mutate_checked") as mutate,
+            patch.object(backend, "_discover_single_pane", return_value="%2"),
+            patch.object(backend, "_set_tmux_window_option") as set_option,
+            patch.object(backend, "_reserve_and_send_shell_command") as reserve,
+        ):
+            lifecycle.attach_mock(set_option, "option")
+            lifecycle.attach_mock(reserve, "reserve")
+            backend.shell_open_tab("console", command="python", tab_type=tab_type)
+
+        assert _TMUX_WINDOW_SETUP_OPTION in mutate.call_args.args[0]
+        complete = call.option(
+            "console", _TMUX_WINDOW_SETUP_OPTION, _TMUX_SETUP_COMPLETE
+        )
+        assert complete in lifecycle.mock_calls
+        assert lifecycle.mock_calls.index(complete) < next(
+            i
+            for i, recorded in enumerate(lifecycle.mock_calls)
+            if recorded
+            == call.reserve(
+                "console",
+                expected=None,
+                sentinel=_INHERITED_BUSY_SENTINEL,
+                command="python",
+            )
+        )
+
+    def test_legacy_default_without_type_is_adopted_as_opaque_busy_shell(
+        self, remote_backend
+    ):
+        backend, _, _ = remote_backend
+        metadata = _tmux_window_row("default", "")
+
+        with (
+            patch.object(backend, "_tmux_exec_checked", return_value=metadata),
+            patch.object(backend, "_tmux_mutate_checked"),
+            patch.object(
+                backend,
+                "_tmux_capture",
+                return_value=["agent@host:/workspace$"],
+            ) as capture,
+        ):
+            backend._rehydrate_tabs()
+
+        capture.assert_called_once_with("default")
+        assert backend._tabs["default"].tab_type == "shell"
+        assert backend._tabs["default"].pending_sentinel == _INHERITED_BUSY_SENTINEL
+
+    @pytest.mark.parametrize(
+        ("name", "stored_type"),
+        (("default", "future-repl"), ("console", "")),
+    )
+    def test_unknown_or_nondefault_missing_type_is_not_assumed_to_be_shell(
+        self, remote_backend, name, stored_type
+    ):
+        backend, _, _ = remote_backend
+        metadata = _tmux_window_row(name, stored_type)
+
+        with (
+            patch.object(backend, "_tmux_exec_checked", return_value=metadata),
+            patch.object(backend, "_tmux_capture") as capture,
+        ):
+            backend._rehydrate_tabs()
+
+        capture.assert_not_called()
+        assert backend._tabs[name].tab_type == "process"
+        backend._shell_initialized = True
+        with patch.object(backend, "_tmux_send_keys") as send:
+            with pytest.raises(ValueError, match="process"):
+                backend.shell_run("echo must-not-run", tab_name=name)
+        send.assert_not_called()
+
+    @pytest.mark.parametrize("stored_type", ("shell", ""))
+    def test_inherited_unmarked_busy_shell_blocks_colliding_command(
+        self, remote_backend, stored_type
+    ):
+        backend, _, _ = remote_backend
+        metadata = _tmux_window_row("default", stored_type)
+        terminal = ["compiling target ..."]
+
+        with (
+            patch.object(backend, "_tmux_exec_checked", return_value=metadata),
+            patch.object(backend, "_tmux_mutate_checked") as mutate,
+            patch.object(backend, "_tmux_capture", return_value=terminal),
+        ):
+            backend._rehydrate_tabs()
+
+        tab = backend._tabs["default"]
+        assert tab.pending_sentinel == _INHERITED_BUSY_SENTINEL
+        assert any(
+            _TMUX_PENDING_SENTINEL_OPTION in call_.args[0]
+            for call_ in mutate.call_args_list
+        )
+
+        backend._shell_initialized = True
+        with (
+            patch.object(backend, "_tmux_capture", return_value=terminal),
+            patch.object(backend, "_tmux_send_keys") as send,
+        ):
+            result = backend.shell_run("echo must-not-run")
+
+        send.assert_not_called()
+        assert "previous command still running" in result
 
     def test_shell_list_tabs_after_init(self, remote_backend):
         backend, mock_ssh, mock_sftp = remote_backend
@@ -1745,9 +2529,70 @@ class TestRemoteBackendShellOperations:
         assert backend._shell_initialized is False
         assert len(backend._tabs) == 0
 
-    def test_shell_cleanup_not_initialized(self, remote_backend):
+    def test_shell_cleanup_explicitly_destroys_remote_session(self, remote_backend):
         backend, _, _ = remote_backend
-        backend.shell_cleanup()  # Should not raise
+        backend.connect()
+        backend._shell_initialized = True
+        backend._tabs["default"] = _RemoteTab("default", pane_id="%1")
+
+        with patch.object(backend, "_tmux_exec_checked") as execute:
+            backend.shell_cleanup()
+
+        execute.assert_called_once()
+        command = execute.call_args.args[0]
+        assert "flock -o -w 30" in command
+        assert "kill-session" in command
+        assert _TMUX_OWNER_ID_OPTION in command
+        assert execute.call_args.kwargs == {
+            "operation": "kill session",
+            "allow_shell_retired": True,
+        }
+        assert backend._shell_initialized is False
+        assert backend._tabs == {}
+
+    def test_shell_cleanup_without_local_init_still_destroys_inherited_session(
+        self, remote_backend
+    ):
+        backend, _, _ = remote_backend
+
+        with patch.object(backend, "_tmux_exec_checked") as execute:
+            backend.shell_cleanup()
+
+        execute.assert_called_once()
+        assert "tmux has-session" in execute.call_args.args[0]
+        assert "kill-session" in execute.call_args.args[0]
+
+    def test_timeout_reset_requires_exact_pinned_owner_before_kill(
+        self, remote_backend
+    ):
+        backend, _, _ = remote_backend
+        backend._shell_initialized = True
+        backend._tabs["default"] = _RemoteTab("default", pane_id="%1")
+
+        with patch.object(backend, "_tmux_exec_checked") as execute:
+            backend.shell_reset_after_timeout()
+
+        execute.assert_called_once()
+        command = execute.call_args.args[0]
+        owner_check = f'"$_srw_id" = {backend._job_id}'
+        assert owner_check in command
+        assert command.index(owner_check) < command.index("tmux kill-session")
+        assert "tmux has-session" in command
+        assert "|| exit 0" in command
+        assert execute.call_args.kwargs == {
+            "operation": "reset timed-out pinned shell session",
+        }
+        assert backend._shell_initialized is False
+        assert backend._tabs == {}
+
+    def test_timeout_reset_uses_stateless_generation_fence(self, remote_backend):
+        backend, _, _ = remote_backend
+        backend.set_shell_owner_token(17)
+
+        with patch.object(backend, "_reset_stateless_tmux_session") as reset:
+            backend.shell_reset_after_timeout()
+
+        reset.assert_called_once_with()
 
 
 class TestRemoteBackendShellRun:
@@ -1759,11 +2604,147 @@ class TestRemoteBackendShellRun:
     @staticmethod
     def _ready(backend):
         backend._shell_initialized = True
-        backend._tabs["default"] = _RemoteTab("default")
+        backend._tabs["default"] = _RemoteTab("default", pane_id="%1")
 
     @staticmethod
     def _uuid(uuid4):
         uuid4.return_value.hex = "0123456789abcdef"
+
+    def test_pending_sentinel_is_persisted_before_command_and_cleared_afterward(
+        self, remote_backend
+    ):
+        backend, _, _ = remote_backend
+        self._ready(backend)
+        captures = [
+            [f"agent@host:{self._ROOT}$"],
+            [
+                f"agent@host:{self._ROOT}$",
+                f"{self._SENTINEL} 0 {self._ROOT}",
+            ],
+        ]
+
+        def reserve_pending(_tab_name, *, sentinel, **_kwargs):
+            backend._tabs["default"].pending_sentinel = sentinel
+
+        def clear_pending(_tab_name, _expected):
+            backend._tabs["default"].pending_sentinel = None
+
+        with (
+            patch("src.core.backends.remote.uuid.uuid4") as uuid4,
+            patch("src.core.backends.remote.time.sleep"),
+            patch.object(backend, "_tmux_capture", side_effect=captures),
+            patch.object(
+                backend,
+                "_reserve_and_send_shell_command",
+                side_effect=reserve_pending,
+            ) as reserve,
+            patch.object(
+                backend, "_clear_tab_pending", side_effect=clear_pending
+            ) as clear,
+        ):
+            lifecycle = MagicMock()
+            lifecycle.attach_mock(reserve, "reserve")
+            lifecycle.attach_mock(clear, "clear")
+            self._uuid(uuid4)
+            result = backend.shell_run("pwd")
+
+        reserve.assert_called_once_with(
+            "default",
+            expected=None,
+            sentinel=self._SENTINEL,
+            command=reserve.call_args.kwargs["command"],
+        )
+        assert "pwd" in reserve.call_args.kwargs["command"]
+        clear.assert_called_once_with("default", self._SENTINEL)
+        assert lifecycle.mock_calls[0] == call.reserve(
+            "default",
+            expected=None,
+            sentinel=self._SENTINEL,
+            command=reserve.call_args.kwargs["command"],
+        )
+        assert lifecycle.mock_calls[-1] == call.clear("default", self._SENTINEL)
+        assert "Exit code: 0" in result
+
+    def test_long_cwd_completion_survives_tmux_display_wrapping(self, remote_backend):
+        backend, _, _ = remote_backend
+        self._ready(backend)
+        long_cwd = "/workspace/" + "nested-directory/" * 30
+        captures = 0
+
+        def capture(command, *, operation):
+            nonlocal captures
+            assert "capture-pane -J " in command
+            assert operation == "capture pane default"
+            captures += 1
+            if captures == 1:
+                return "$\n"
+            return f"{self._SENTINEL} 0 {long_cwd}\n"
+
+        def reserve(_tab_name, *, sentinel, **_kwargs):
+            backend._tabs["default"].pending_sentinel = sentinel
+
+        def clear(_tab_name, _expected):
+            backend._tabs["default"].pending_sentinel = None
+
+        with (
+            patch("src.core.backends.remote.uuid.uuid4") as uuid4,
+            patch("src.core.backends.remote.time.sleep"),
+            patch.object(backend, "_tmux_exec_checked", side_effect=capture),
+            patch.object(
+                backend, "_reserve_and_send_shell_command", side_effect=reserve
+            ) as send,
+            patch.object(backend, "_clear_tab_pending", side_effect=clear),
+        ):
+            self._uuid(uuid4)
+            result = backend.shell_run("pwd")
+
+        send.assert_called_once()
+        assert f"CWD: {long_cwd}" in result
+        assert backend._tabs["default"].pending_sentinel is None
+
+    def test_idle_guard_ignores_stale_prompt_like_scrollback(self, remote_backend):
+        backend, _, _ = remote_backend
+        self._ready(backend)
+
+        def reserve(_tab_name, *, sentinel, **_kwargs):
+            backend._tabs["default"].pending_sentinel = sentinel
+
+        with (
+            patch("src.core.backends.remote.uuid.uuid4") as uuid4,
+            patch("src.core.backends.remote.time.sleep"),
+            patch.object(
+                backend,
+                "_tmux_capture",
+                side_effect=[
+                    ["old command", "Continue? [y/N]"],
+                    [f"{self._SENTINEL} 0 {self._ROOT}"],
+                ],
+            ),
+            patch.object(
+                backend, "_reserve_and_send_shell_command", side_effect=reserve
+            ) as send,
+            patch.object(backend, "_clear_tab_pending_if_current") as clear,
+        ):
+            self._uuid(uuid4)
+            result = backend.shell_run("echo admitted")
+
+        send.assert_called_once()
+        clear.assert_called_once_with("default", self._SENTINEL)
+        assert "Exit code: 0" in result
+
+    def test_pending_guard_still_reports_genuine_blocking_prompt(self, remote_backend):
+        backend, _, _ = remote_backend
+        self._ready(backend)
+        backend._tabs["default"].pending_sentinel = "__DONE_aaaaaaaaaaaa__"
+
+        with (
+            patch.object(backend, "_tmux_capture", return_value=["Continue? [y/N]"]),
+            patch.object(backend, "_reserve_and_send_shell_command") as send,
+        ):
+            result = backend.shell_run("echo must-not-run")
+
+        send.assert_not_called()
+        assert "blocked by a previous confirmation prompt" in result
 
     def test_working_dir_restores_between_calls(self, remote_backend):
         backend, _, _ = remote_backend
@@ -1779,7 +2760,9 @@ class TestRemoteBackendShellRun:
             patch("src.core.backends.remote.uuid.uuid4") as uuid4,
             patch("src.core.backends.remote.time.sleep"),
             patch.object(backend, "_tmux_capture", side_effect=captures),
+            patch.object(backend, "_reserve_and_send_shell_command") as reserve,
             patch.object(backend, "_tmux_send_keys") as send,
+            patch.object(backend, "_clear_tab_pending"),
         ):
             self._uuid(uuid4)
             first = backend.shell_run(
@@ -1789,15 +2772,10 @@ class TestRemoteBackendShellRun:
 
         assert "CWD: /tmp" in first
         assert f"CWD: {self._ROOT}" in second
-        assert send.call_args_list[0] == call(
-            "default", f"cd {self._ROOT}/.", enter=True
-        )
-        assert '"$PWD"' in send.call_args_list[1].args[1]
-        assert send.call_args_list[2] == call("default", f"cd {self._ROOT}", enter=True)
-        assert send.call_args_list[3] == call(
-            "default", f"cd {self._ROOT}/.", enter=True
-        )
-        assert send.call_args_list[5] == call("default", f"cd {self._ROOT}", enter=True)
+        send.assert_not_called()
+        assert '"$PWD"' in reserve.call_args_list[0].kwargs["command"]
+        assert f"cd {self._ROOT}" in reserve.call_args_list[0].kwargs["command"]
+        assert len(reserve.call_args_list) == 2
 
     def test_without_working_dir_keeps_persistent_cwd_visible(self, remote_backend):
         backend, _, _ = remote_backend
@@ -1813,7 +2791,9 @@ class TestRemoteBackendShellRun:
             patch("src.core.backends.remote.uuid.uuid4") as uuid4,
             patch("src.core.backends.remote.time.sleep"),
             patch.object(backend, "_tmux_capture", side_effect=captures),
+            patch.object(backend, "_reserve_and_send_shell_command") as reserve,
             patch.object(backend, "_tmux_send_keys") as send,
+            patch.object(backend, "_clear_tab_pending"),
         ):
             self._uuid(uuid4)
             first = backend.shell_run("cd /tmp && pwd", tab_name="default")
@@ -1822,6 +2802,7 @@ class TestRemoteBackendShellRun:
         assert "CWD: /tmp" in first
         assert "CWD: /tmp" in second
         assert all(sent.args[1] != f"cd {self._ROOT}" for sent in send.call_args_list)
+        assert len(reserve.call_args_list) == 2
 
 
 class TestRemoteBackendShellSend:
@@ -1854,6 +2835,44 @@ class TestRemoteBackendShellSend:
             with pytest.raises(KeyError, match="not found"):
                 backend.shell_send("ghost", "ls")
 
+    def test_async_command_refuses_to_collide_with_inherited_busy_pane(
+        self, remote_backend
+    ):
+        backend, _, _ = remote_backend
+        backend._shell_initialized = True
+        tab = _RemoteTab("default", pane_id="%1")
+        tab.pending_sentinel = _INHERITED_BUSY_SENTINEL
+        backend._tabs["default"] = tab
+
+        with (
+            patch.object(backend, "_tmux_capture", return_value=["still running"]),
+            patch.object(backend, "_tmux_send_keys") as send,
+            patch.object(backend, "_reserve_and_send_shell_command") as reserve,
+        ):
+            result = backend.shell_send("default", "second command")
+
+        assert "previous command still running" in result
+        send.assert_not_called()
+        reserve.assert_not_called()
+
+    def test_explicit_busy_input_can_feed_foreground_process(self, remote_backend):
+        backend, _, _ = remote_backend
+        backend._shell_initialized = True
+        tab = _RemoteTab("default", pane_id="%1")
+        tab.pending_sentinel = _INHERITED_BUSY_SENTINEL
+        backend._tabs["default"] = tab
+
+        with (
+            patch.object(backend, "_tmux_capture") as capture,
+            patch.object(backend, "_tmux_send_keys") as send,
+        ):
+            result = backend.shell_send("default", "yes", enter=True, allow_busy=True)
+
+        assert result == "Sent to 'default'"
+        capture.assert_not_called()
+        send.assert_called_once_with("default", "yes", enter=True)
+        assert tab.pending_sentinel == _INHERITED_BUSY_SENTINEL
+
     def test_send_blocked_command_with_enter(self, remote_backend):
         backend, mock_ssh, mock_sftp = remote_backend
         backend.connect()
@@ -1884,18 +2903,19 @@ class TestRemoteBackendShellSend:
 
         with patch("time.sleep"):
             backend._init_shell()
-        with patch.object(backend, "_tmux_send_keys") as send:
+        with patch.object(backend, "_reserve_and_send_shell_command") as reserve:
             backend.shell_send(
                 "default",
                 "npm run dev",
                 working_dir="repo",
             )
 
-        sent = send.call_args.args[1]
+        sent = reserve.call_args.kwargs["command"]
         assert sent.startswith(f"cd {backend._sandbox_cwd}/repo && ")
-        assert "printf 'CWD: %s\\n' \"$PWD\"" in sent
-        assert "eval 'npm run dev'" in sent
-        assert sent.endswith(f"; cd {backend._sandbox_cwd}")
+        assert '_srw_cwd="$PWD"' in sent
+        assert "npm run dev" in sent
+        assert f"cd {backend._sandbox_cwd}" in sent
+        assert re.search(r"__DONE_[0-9a-f]{12}__", sent)
 
     def test_working_dir_rejected_for_raw_keystrokes(self, remote_backend):
         backend, mock_ssh, _ = remote_backend
@@ -1914,103 +2934,131 @@ class TestRemoteBackendShellSend:
 
 
 class TestRemoteBackendShellCancel:
-    """RemoteBackend.shell_cancel() sends Ctrl+C to free a wedged tab.
+    """Cancellation is released only by its exact completion probe."""
 
-    Regression coverage for job 9b760af1: a hung foreground command left the
-    stateless 'default' tab busy (pending_sentinel set) with no way to abort.
-    The ladder is: idle no-op -> up to two C-c sends -> reset the tab.
-    """
-
-    def _setup_exec_mock(self, mock_ssh, output: str = "", exit_code: int = 0):
-        _wire_exec_channel(
-            mock_ssh,
-            _WindowedChannel(stdout_data=output.encode("utf-8"), exit_code=exit_code),
-        )
-
-    def _init(self, remote_backend):
-        backend, mock_ssh, _ = remote_backend
-        backend.connect()
-        self._setup_exec_mock(mock_ssh)
-        with patch("time.sleep"):
-            backend._init_shell()
-        return backend, mock_ssh
+    @staticmethod
+    def _ready(remote_backend, pending=None):
+        backend, _, _ = remote_backend
+        backend._shell_initialized = True
+        tab = _RemoteTab("default", pane_id="%1")
+        tab.pending_sentinel = pending
+        backend._tabs["default"] = tab
+        return backend, tab
 
     def test_noop_when_tab_idle(self, remote_backend):
-        """Already at a prompt: no C-c is sent, stale sentinel is cleared."""
-        backend, mock_ssh = self._init(remote_backend)
-        backend._tabs["default"].pending_sentinel = "__DONE_stale__"
-        with (
-            patch("time.sleep"),
-            patch.object(backend, "_tmux_send_keys") as send,
-            patch.object(
-                backend, "_tmux_capture", side_effect=[["agent@host:/workspace$"]]
-            ),
-        ):
+        backend, _ = self._ready(remote_backend)
+        with patch.object(backend, "_cancel_and_probe_shell_command") as cancel:
             result = backend.shell_cancel("default")
-        send.assert_not_called()
-        assert backend._tabs["default"].pending_sentinel is None
+        cancel.assert_not_called()
         assert "nothing" in result.lower()
 
-    def test_single_ctrl_c_frees_tab(self, remote_backend):
-        """One C-c returns the prompt: sentinel cleared, tab reported free."""
-        backend, mock_ssh = self._init(remote_backend)
-        backend._tabs["default"].pending_sentinel = "__DONE_run__"
+    def test_exact_probe_record_frees_tab(self, remote_backend):
+        backend, tab = self._ready(remote_backend, "__DONE_aaaaaaaaaaaa__")
+
+        def install_probe(_name, *, expected, sentinel):
+            assert expected == "__DONE_aaaaaaaaaaaa__"
+            tab.pending_sentinel = sentinel
+
+        def clear_probe(_name, expected):
+            assert expected == "__DONE_bbbbbbbbbbbb__"
+            tab.pending_sentinel = None
+
         with (
-            patch("time.sleep"),
-            patch.object(backend, "_tmux_send_keys") as send,
+            patch("src.core.backends.remote.time.sleep"),
+            patch("src.core.backends.remote.uuid.uuid4") as uuid4,
+            patch.object(
+                backend,
+                "_cancel_and_probe_shell_command",
+                side_effect=install_probe,
+            ) as cancel,
             patch.object(
                 backend,
                 "_tmux_capture",
-                side_effect=[["running pytest ..."], ["agent@host:/workspace$"]],
+                return_value=["__DONE_bbbbbbbbbbbb__ 130 /workspace"],
             ),
+            patch.object(
+                backend, "_clear_tab_pending_if_current", side_effect=clear_probe
+            ) as clear,
         ):
+            uuid4.return_value.hex = "b" * 32
             result = backend.shell_cancel("default")
-        send.assert_called_once_with("default", "C-c", enter=False)
-        assert backend._tabs["default"].pending_sentinel is None
+        cancel.assert_called_once_with(
+            "default",
+            expected="__DONE_aaaaaaaaaaaa__",
+            sentinel="__DONE_bbbbbbbbbbbb__",
+        )
+        clear.assert_called_once_with("default", "__DONE_bbbbbbbbbbbb__")
+        assert tab.pending_sentinel is None
         assert "free" in result.lower()
 
-    def test_double_tap_frees_tab(self, remote_backend):
-        """Some programs need two C-c; the second frees the tab."""
-        backend, mock_ssh = self._init(remote_backend)
-        backend._tabs["default"].pending_sentinel = "__DONE_run__"
+    def test_long_cwd_probe_survives_tmux_display_wrapping(self, remote_backend):
+        backend, tab = self._ready(remote_backend, "__DONE_aaaaaaaaaaaa__")
+        long_cwd = "/workspace/" + "nested-directory/" * 30
+
+        def install_probe(_name, *, expected, sentinel):
+            assert expected == "__DONE_aaaaaaaaaaaa__"
+            tab.pending_sentinel = sentinel
+
+        def capture(command, *, operation):
+            assert "capture-pane -J " in command
+            assert operation == "capture pane default"
+            return f"__DONE_bbbbbbbbbbbb__ 130 {long_cwd}\n"
+
+        def clear(_name, _expected):
+            tab.pending_sentinel = None
+
         with (
-            patch("time.sleep"),
-            patch.object(backend, "_tmux_send_keys") as send,
+            patch("src.core.backends.remote.time.sleep"),
+            patch("src.core.backends.remote.uuid.uuid4") as uuid4,
             patch.object(
                 backend,
-                "_tmux_capture",
-                side_effect=[["busy 1"], ["busy 2"], ["agent@host:/workspace$"]],
+                "_cancel_and_probe_shell_command",
+                side_effect=install_probe,
             ),
+            patch.object(backend, "_tmux_exec_checked", side_effect=capture),
+            patch.object(backend, "_clear_tab_pending_if_current", side_effect=clear),
         ):
+            uuid4.return_value.hex = "b" * 32
             result = backend.shell_cancel("default")
-        assert send.call_count == 2
-        assert backend._tabs["default"].pending_sentinel is None
+
+        assert tab.pending_sentinel is None
         assert "free" in result.lower()
 
-    def test_reset_fallback_when_unresponsive(self, remote_backend):
-        """Process ignores SIGINT: fall back to closing + reopening the tab."""
-        backend, mock_ssh = self._init(remote_backend)
-        backend._tabs["default"].pending_sentinel = "__DONE_hung__"
+    def test_prompt_looking_text_never_frees_cancel_guard(self, remote_backend):
+        backend, tab = self._ready(remote_backend, "__DONE_aaaaaaaaaaaa__")
+
+        def install_probe(_name, *, expected, sentinel):
+            assert expected == tab.pending_sentinel
+            tab.pending_sentinel = sentinel
+
         with (
-            patch("time.sleep"),
-            patch.object(backend, "_tmux_send_keys") as send,
+            patch("src.core.backends.remote.time.sleep"),
+            patch("src.core.backends.remote.uuid.uuid4") as uuid4,
+            patch.object(
+                backend,
+                "_cancel_and_probe_shell_command",
+                side_effect=install_probe,
+            ) as cancel,
             patch.object(
                 backend,
                 "_tmux_capture",
-                side_effect=[["busy 1"], ["busy 2"], ["busy 3"]],
+                side_effect=[["$"], ["#"]],
             ),
             patch.object(backend, "shell_close_tab") as close,
             patch.object(backend, "shell_ensure_tab") as ensure,
         ):
+            uuid4.side_effect = [
+                MagicMock(hex="b" * 32),
+                MagicMock(hex="c" * 32),
+            ]
             result = backend.shell_cancel("default")
-        assert send.call_count == 2
+        assert cancel.call_count == 2
         close.assert_called_once_with("default")
         ensure.assert_called_once_with("default")
         assert "reset" in result.lower()
 
     def test_nonexistent_tab_raises(self, remote_backend):
-        """Cancelling an unknown tab raises KeyError like the other shell ops."""
-        backend, mock_ssh = self._init(remote_backend)
+        backend, _ = self._ready(remote_backend)
         with pytest.raises(KeyError, match="not found"):
             backend.shell_cancel("ghost")
 

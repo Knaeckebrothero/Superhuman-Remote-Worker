@@ -51,7 +51,7 @@ def build_sentinel_command(command: str, sentinel: str) -> Tuple[str, Optional[s
     """
     if "\n" not in command:
         return (
-            f'{command}; printf \'{sentinel} %s %s\\n\' "$?" "$PWD"',
+            f'{command}; printf \'\\n{sentinel} %s %s\\n\' "$?" "$PWD"',
             None,
         )
 
@@ -61,7 +61,7 @@ def build_sentinel_command(command: str, sentinel: str) -> Tuple[str, Optional[s
         f'bash << "{outer_delim}"\n'
         f'echo "{start_marker}"\n'
         f"{command}\n"
-        f'printf "{sentinel} %s %s\\n" "$?" "$PWD"\n'
+        f'printf "\\n{sentinel} %s %s\\n" "$?" "$PWD"\n'
         f"{outer_delim}"
     )
     return full_cmd, start_marker
@@ -429,6 +429,7 @@ class ShellManager:
         text: str,
         enter: bool = True,
         working_dir: Optional[str] = None,
+        allow_busy: bool = False,
     ) -> str:
         """Send keystrokes to a tab.
 
@@ -439,6 +440,9 @@ class ShellManager:
             working_dir: Optional workspace-relative directory for an async
                          command. The backend restores the workspace root when
                          that command exits. Do not use for raw keystrokes.
+            allow_busy: Permit input to an existing foreground process. Set by
+                        explicit keys mode only; async commands must keep this
+                        false so they cannot collide with prior work.
 
         Returns:
             Confirmation message or blocked error
@@ -457,6 +461,7 @@ class ShellManager:
             text,
             enter=enter,
             working_dir=working_dir,
+            allow_busy=allow_busy,
         )
 
     def cancel(self, name: str = "default") -> str:
