@@ -62,7 +62,12 @@ def _thread(**over):
         "project_id": None,
         "execution_lane": "stateless",
         "config_name": "session_base",
-        "metadata": {"config_override": {"llm": {"model": "m"}}},
+        "metadata": {
+            "config_override": {
+                "llm": {"model": "m"},
+                "workspace": {"backend": "virtual"},
+            }
+        },
     }
     thread.update(over)
     return thread
@@ -194,6 +199,30 @@ async def test_wrong_lane_and_non_session_kind_409(monkeypatch):
     with pytest.raises(HTTPException) as exc3:
         await orch_main.internal_unit_claim_bundle(UNIT_ID, MagicMock(), 7)
     assert exc3.value.status_code == 409
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ["sandbox", "vm", "future-tier", None])
+async def test_non_lite_workspace_refused_before_attach_assembly(monkeypatch, backend):
+    from orchestrator import main as orch_main
+
+    metadata = (
+        {"config_override": {"workspace": {"backend": backend}}}
+        if backend is not None
+        else {}
+    )
+    db = FakeDB(
+        run_queue_row=dict(LEASED_ROW),
+        thread=_thread(metadata=metadata),
+    )
+    _inject, assembly = _patch(monkeypatch, orch_main, db)
+
+    with pytest.raises(HTTPException) as exc:
+        await orch_main.internal_unit_claim_bundle(UNIT_ID, MagicMock(), 7)
+
+    assert exc.value.status_code == 409
+    assert "virtual/none" in str(exc.value.detail)
+    assembly.assert_not_awaited()
 
 
 @pytest.mark.asyncio

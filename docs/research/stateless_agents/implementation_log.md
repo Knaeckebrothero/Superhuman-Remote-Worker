@@ -1945,3 +1945,57 @@ database came from two topic branches numbering migrations independently against
 one shared cluster. Now that both are on one branch the problem is gone, but if
 the tracks fork again, either range-allocate numbers up front or land shared
 safety migrations on the integration branch first.
+
+---
+
+# Session 7 — S2 workspace sessions (2026-08-09)
+
+Branch: `feature/stateless-agents`; not pushed. Read the S2 brief in full, then
+its required feature-doc sections, the complete implementation history, and the
+complete stateless executor and remote backend before editing. S3 remains out of
+scope and no `worker_batch` unit was enqueued.
+
+## Phase 0 / S2 fail-closed workspace-tier gate — DONE
+
+Before S2, a sandbox/VM thread could be operator-flipped to the stateless lane,
+accepted by the public input/control routes and attached by a claimant. Both
+ends of that claim killed its deterministic remote tmux session. The lane now
+admits only the exact lite whitelist (`virtual`/`none`) until the rest of S2 is
+verified:
+
+* human input refuses before inserting a message or advancing a queue watermark;
+* a new durable control refuses before inserting a control request or waking a
+  control-only claim (an already-committed idempotent retry stays observable);
+* the internal claim-bundle refuses before credential resolution/attach, which
+  also protects already-queued legacy rows and direct operator/DB mistakes.
+
+The effective physical backend is read from the create-time-materialized
+`metadata.config_override.workspace.backend`. Missing, malformed and unknown
+future values fail closed. The claim-bundle check is the authoritative safety
+boundary; the two public checks make the refusal immediate and avoid leaving a
+poison unit to retry/park.
+
+Verification:
+
+* focused input/claim/control tests: **49 passed**; targeted Ruff check, Ruff
+  format check and `git diff --check`: clean;
+* running-image proof: the serving orchestrator contained exactly one
+  `S2 lite-only gate` marker in `/app/main.py` before any live assertion;
+* live sandbox proof used an ended, detached sandbox thread belonging to the
+  same test owner, changed only its lane for the bounded probe, and restored it
+  via an exit trap. Input and control both returned clear **HTTP 409**. Durable
+  counts stayed exactly **messages 0→0, controls 0→0, queue rows 0→0**;
+* live lite regression: the existing virtual fixture answered exactly once.
+  Before: **9 s wall / 5.73 s agent total** (`bundle=.10`, `attach=1.65`,
+  `controls=.02`, `turn=3.75`, `push=.19`, `complete=.02`). After: **7 s wall /
+  5.88 s agent total** (`bundle=.16`, `attach=1.96`, `controls=.01`,
+  `turn=3.55`, `push=.19`, `complete=.01`). The 0.15 s agent delta is attach/
+  provider variance; the gate is orchestrator-side and adds no served-lite hot
+  path beyond one metadata lookup already in memory.
+
+Failures retained: the first timing-harness invocation omitted its required
+message and exited before mutation; the first read-only sandbox-candidate query
+used nonexistent `threads.updated_at`, then was corrected to `created_at`.
+
+The gate remains in place until the final S2 acceptance run. Next: remote tmux
+reattach/preservation, followed by the §6.1 agent-local `/workspace` inventory.

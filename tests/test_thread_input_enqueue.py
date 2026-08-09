@@ -105,7 +105,7 @@ def _stateless_thread(**over):
         "execution_lane": "stateless",
         "total_turns": 5,
         "status": "active",
-        "metadata": {},
+        "metadata": {"config_override": {"workspace": {"backend": "virtual"}}},
     }
     thread.update(over)
     return thread
@@ -220,6 +220,57 @@ async def test_stateless_input_rejects_empty_content(monkeypatch):
         )
     assert exc.value.status_code == 400
     assert conn.calls == []  # nothing persisted
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ["sandbox", "vm", "future-tier", None])
+async def test_stateless_input_rejects_non_lite_workspace_before_writes(
+    monkeypatch, backend
+):
+    from fastapi import HTTPException
+
+    from orchestrator import main as orch_main
+
+    metadata = (
+        {"config_override": {"workspace": {"backend": backend}}}
+        if backend is not None
+        else {}
+    )
+    conn = FakeConn()
+    db = FakeDB(_stateless_thread(metadata=metadata), conn)
+    _patch_common(monkeypatch, orch_main, db)
+
+    with pytest.raises(HTTPException) as exc:
+        await orch_main.thread_input(
+            THREAD_ID,
+            orch_main.ThreadInputRequest(content="must not queue"),
+            MagicMock(),
+        )
+
+    assert exc.value.status_code == 409
+    assert "virtual/none" in str(exc.value.detail)
+    assert conn.calls == []
+
+
+@pytest.mark.asyncio
+async def test_stateless_input_accepts_none_workspace(monkeypatch):
+    from orchestrator import main as orch_main
+
+    conn = FakeConn()
+    db = FakeDB(
+        _stateless_thread(
+            metadata={"config_override": {"workspace": {"backend": "none"}}}
+        ),
+        conn,
+    )
+    _patch_common(monkeypatch, orch_main, db)
+
+    out = await orch_main.thread_input(
+        THREAD_ID, orch_main.ThreadInputRequest(content="lite"), MagicMock()
+    )
+
+    assert out["accepted"] is True
+    assert conn.txn_enters == 1
 
 
 @pytest.mark.asyncio
