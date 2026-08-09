@@ -561,6 +561,7 @@
     "configDrift": {
       "title": "Some of this session's setup is gone",
       "intro": "Parts of this session's configuration aren't available anymore:",
+      "attentionNeeded": "This session's setup needs attention. Opening it now…",
       "resumeAnyway": "Resume without them",
       "startNew": "Start a new session",
       "connector": {

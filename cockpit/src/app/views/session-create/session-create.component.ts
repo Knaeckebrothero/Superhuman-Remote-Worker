@@ -1,5 +1,5 @@
 import {Component, computed, effect, inject, OnInit, signal, ViewChild} from '@angular/core';
-import {Router} from '@angular/router';
+import {ActivatedRoute, Router} from '@angular/router';
 import {HttpClient} from '@angular/common/http';
 import {firstValueFrom} from 'rxjs';
 import {environment} from '../../core/environment';
@@ -42,6 +42,53 @@ export function protectedCloudToggleVisible(
   return featureOn && selected.some(
     (p) => !p.is_default && p.main_cloud_backend === 'nextcloud',
   );
+}
+
+/**
+ * What "Start a new session" carries forward from a drifted session's source
+ * thread (session_config_drift_resume.md §8.3, chat-page.component.ts's
+ * `onStartNewSession`). Built from the raw `GET /api/persistent/threads/{id}`
+ * response (the same shape settings-pane.component.ts already reads).
+ *
+ * `null` only when the fetch itself failed or returned nothing — every other
+ * field is present-but-possibly-empty, so the caller can tell "there is no
+ * prefill" from "the source thread genuinely had none of this."
+ */
+export interface SessionCreatePrefill {
+  projectIds: string[];
+  expertId: string | null;
+  model: string | null;
+  datasourceIds: string[];
+}
+
+export function mapThreadToPrefill(thread: Record<string, unknown> | null): SessionCreatePrefill | null {
+  if (!thread) return null;
+  const metadata = (thread['metadata'] ?? {}) as Record<string, unknown>;
+  const configOverride = (metadata['config_override'] ?? {}) as Record<string, unknown>;
+  const llm = (configOverride['llm'] ?? {}) as Record<string, unknown>;
+  const rawProjectIds = (thread['project_ids'] as unknown[] | undefined) ?? [];
+  const rawDatasourceIds = (metadata['datasource_ids'] as unknown[] | undefined) ?? [];
+  const expertId = metadata['expert_id'];
+  const model = llm['model'];
+  return {
+    projectIds: rawProjectIds.map(String),
+    expertId: typeof expertId === 'string' && expertId ? expertId : null,
+    model: typeof model === 'string' && model ? model : null,
+    datasourceIds: rawDatasourceIds.map(String),
+  };
+}
+
+/**
+ * Keep only ids the create form currently offers as eligible. Used for both
+ * the project and connector prefill so an id that drifted between the source
+ * thread and this page (deleted, revoked, out of scope) is silently dropped
+ * rather than submitted — the create page never needs to know anything about
+ * *why* an id is gone, only that it isn't in the eligible list it already
+ * loaded for an unrelated reason.
+ */
+export function keepEligibleIds(ids: string[], eligible: Array<{ id: string }>): string[] {
+  const set = new Set(eligible.map((item) => item.id));
+  return ids.filter((id) => set.has(id));
 }
 
 interface Expert {
@@ -179,6 +226,7 @@ interface ExpertDetail extends Expert {
           [datasourceLoadError]="datasourceLoadError()"
           [datasourceContextKey]="datasourceContextKey()"
           [datasourceDefaultsEnabled]="capabilities.datasourceScopeAutoAttachAvailable()"
+          [initialDatasourceIds]="prefillDatasourceIds()"
           [loadingExpert]="loadingExpert()"
           [gatedCapabilities]="capabilities.grants() ?? null"
           (retryDatasources)="loadDatasourcesList()"
@@ -383,6 +431,11 @@ interface ExpertDetail extends Expert {
 export class SessionCreateComponent implements OnInit {
   private readonly http = inject(HttpClient);
   private readonly router = inject(Router);
+  // Optional: this component is constructed without a router context in
+  // several existing bare-TestBed specs that predate the `from` prefill (no
+  // ActivatedRoute provider). Real navigation always supplies one; `route`
+  // being null there is equivalent to "no `from` param".
+  private readonly route = inject(ActivatedRoute, {optional: true});
   private readonly userService = inject(UserService);
   private readonly modelService = inject(ModelService);
   private readonly errorMessages = inject(ErrorMessageService);
@@ -443,6 +496,29 @@ export class SessionCreateComponent implements OnInit {
   });
   private datasourceRequestSerial = 0;
 
+  // --- "Start a new session" prefill (session_config_drift_resume.md §8.3) ---
+  // `undefined` = the source-thread fetch (if any) hasn't settled yet; `null`
+  // = there is no `from` param, or the fetch failed — either way, every
+  // prefill-aware method below behaves exactly as if this feature didn't
+  // exist. A real (possibly all-empty) object = the fetch succeeded, and is
+  // authoritative for the fields it names, per-field, even when a field is
+  // empty (e.g. a standalone source session with no project).
+  private threadPrefill: SessionCreatePrefill | null | undefined = undefined;
+  private projectSelectionTouched = false;
+  private projectsLoaded = false;
+  private modelPrefillApplied = false;
+  private readonly prefillThreadDatasourceIds = signal<string[] | null>(null);
+  /** Null keeps the connector picker's normal server-default behavior; a
+   *  (possibly empty) array means the source thread's surviving connectors
+   *  are authoritative for this field. A `computed()`, not a value copied out
+   *  once, so it stays correct however the source-thread fetch and this
+   *  form's own eligible-connectors load interleave, and if eligibility
+   *  changes again before this is read. */
+  readonly prefillDatasourceIds = computed<string[] | null>(() => {
+    const raw = this.prefillThreadDatasourceIds();
+    return raw === null ? null : keepEligibleIds(raw, this.datasources());
+  });
+
   constructor() {
     effect(() => {
       const userId = this.userService.currentUserId();
@@ -451,6 +527,21 @@ export class SessionCreateComponent implements OnInit {
   }
 
   ngOnInit(): void {
+    const fromThreadId = this.route?.snapshot.queryParamMap.get('from') ?? null;
+    if (fromThreadId) {
+      // Fire this first — its result gates the project/expert prefill below,
+      // so giving it a head start (rather than parallel with everything else
+      // that ALSO starts in this method) improves the odds it settles before
+      // the lists it needs to be reconciled against.
+      this.api.getPersistentThread(fromThreadId).subscribe((thread) => {
+        this.applyThreadPrefillResult(thread);
+      });
+    } else {
+      // No source thread — settle immediately (synchronously, before any of
+      // the loads below even fire) so every prefill-aware method downstream
+      // takes its original, unprefilled branch with zero added latency.
+      this.threadPrefill = null;
+    }
     this.modelService.load();
     this.loadExperts();
     this.loadDatasourcesList();
@@ -479,19 +570,80 @@ export class SessionCreateComponent implements OnInit {
     });
   }
 
+  /**
+   * `GET /api/persistent/threads/{id}` settled — success or failure, since a
+   * failed fetch must never block session creation and is treated identically
+   * to "no `from` at all" (`mapThreadToPrefill(null)` is `null` either way;
+   * `ApiService.getPersistentThread` already logs the failure and resolves to
+   * `null` rather than throwing).
+   *
+   * Re-runs the project/expert resolution now that the prefill target is
+   * known, so whichever of "this" and "the list it needs" settles second is
+   * what actually decides — see `applyProjectPrefillOrDefault` and
+   * `applyEffectiveDefault`.
+   */
+  private applyThreadPrefillResult(thread: Record<string, unknown> | null): void {
+    this.threadPrefill = mapThreadToPrefill(thread);
+    if (this.threadPrefill) {
+      this.prefillThreadDatasourceIds.set(this.threadPrefill.datasourceIds);
+    }
+    this.applyProjectPrefillOrDefault();
+    this.applyEffectiveDefault();
+  }
+
   private loadProjects(userId: string): void {
     this.http.get<Project[]>(`${environment.apiUrl}/projects?user_id=${userId}`).subscribe({
       next: (projects) => {
         this.projects.set(projects);
-        const defaultProject = projects.find(p => p.is_default);
-        if (defaultProject) {
-          this.selectedProjectIds.set(new Set([defaultProject.id]));
-          // Refresh eligible datasources now that a project is selected.
-          this.loadDatasourcesList();
-        }
+        this.projectsLoaded = true;
+        this.applyProjectPrefillOrDefault();
         this.loadEffectiveDefault();
       },
     });
+  }
+
+  /**
+   * Project selection on initial load: prefer the source thread's still-
+   * visible projects ("Start a new session", session_config_drift_resume.md
+   * §8.3) over the account default — the same "intersect with what's
+   * currently offered" rule the connector prefill uses, so a project that
+   * drifted between the two pages (deleted, membership revoked) is silently
+   * dropped rather than submitted. Falls back to the account default exactly
+   * as before this prefill existed, once it's known for certain there is no
+   * usable prefill.
+   *
+   * Called from two places — here, and `applyThreadPrefillResult` once the
+   * source-thread fetch settles — and is a no-op until BOTH the project list
+   * and the prefill target are known, so whichever happens second is what
+   * actually decides; network order can't produce a wrong final answer, only
+   * a briefly-later correct one. Never re-applies once the user has touched a
+   * project chip themselves.
+   */
+  private applyProjectPrefillOrDefault(): void {
+    if (this.projectSelectionTouched) return;
+    if (this.threadPrefill === undefined) return; // source-thread fetch (if any) still in flight
+    if (!this.projectsLoaded) return; // this form's own project list still in flight
+    const projects = this.projects();
+    if (this.threadPrefill) {
+      const survivors = keepEligibleIds(this.threadPrefill.projectIds, projects);
+      if (survivors.length > 0) {
+        this.selectedProjectIds.set(new Set(survivors));
+        this.loadDatasourcesList();
+        this.loadEffectiveDefault();
+        this.loadToolPreview();
+      }
+      // else: the source thread had no project, or none it had are still
+      // accessible here — leave unselected. Faithful to what actually
+      // survived on the source thread, rather than substituting the
+      // unrelated account default.
+      return;
+    }
+    const defaultProject = projects.find(p => p.is_default);
+    if (defaultProject) {
+      this.selectedProjectIds.set(new Set([defaultProject.id]));
+      // Refresh eligible datasources now that a project is selected.
+      this.loadDatasourcesList();
+    }
   }
 
   private loadExperts(): void {
@@ -523,8 +675,49 @@ export class SessionCreateComponent implements OnInit {
     });
   }
 
+  /**
+   * Resolve which expert should be selected: prefer the source thread's
+   * expert ("Start a new session", session_config_drift_resume.md §8.3) over
+   * the ordinary effective-default resolution, whenever it names one that is
+   * currently in the eligible list. Re-checked on every call — not applied
+   * once and left alone — so it stays correct regardless of whether
+   * `experts()` or the source-thread fetch settles first.
+   *
+   * Unlike `applyProjectPrefillOrDefault`, an unresolved or invalid prefill
+   * expert falls through to the normal default rather than leaving nothing
+   * selected: a session always runs with *some* expert config, so an empty
+   * expert grid would read as broken rather than as an intentional "none",
+   * the way an empty project or connector selection reads.
+   */
   private applyEffectiveDefault(): void {
     if (this.expertSelectionTouched) return;
+    const prefillId = this.threadPrefill?.expertId;
+    if (prefillId) {
+      const prefillExpert = this.experts().find(e => e.id === prefillId);
+      if (prefillExpert) {
+        // A successful prefill match settles this field the same way a
+        // deliberate click does: it must not keep re-winning over a project
+        // change the user makes afterward, the way the live
+        // effective-default resolution is designed to.
+        this.expertSelectionTouched = true;
+        if (this.selectedExpert()?.id !== prefillExpert.id) {
+          this.selectedExpert.set(prefillExpert);
+          this.fetchExpertDetail(prefillExpert.id);
+        } else if (this.expertDetail()?.id === prefillExpert.id) {
+          // Already selected AND already fetched — e.g. it happened to be
+          // the ordinary default too, and that fetch landed before the
+          // source-thread fetch did. That fetch's prefillFromConfig already
+          // ran and will not run again for this expert, so it's safe to
+          // layer the model override on right now instead of waiting on a
+          // fetchExpertDetail call that isn't coming.
+          this.applyModelPrefillOnce();
+        }
+        return;
+      }
+      // Named an expert that isn't (yet, or ever) in the eligible list —
+      // fall through and retry on the next call, exactly like the
+      // unresolved-id case below.
+    }
     const id = this.effectiveDefaultExpertId();
     const expert = id ? this.experts().find(item => item.id === id) : undefined;
     if (expert && this.selectedExpert()?.id !== expert.id) {
@@ -560,6 +753,7 @@ export class SessionCreateComponent implements OnInit {
   }
 
   toggleProject(id: string): void {
+    this.projectSelectionTouched = true;
     this.selectedProjectIds.update(current => {
       const next = new Set(current);
       if (next.has(id)) next.delete(id);
@@ -590,11 +784,39 @@ export class SessionCreateComponent implements OnInit {
       next: (detail) => {
         this.expertDetail.set(detail);
         if (detail?.config) this.agentSettings?.prefillFromConfig(detail.config);
+        // Must run AFTER prefillFromConfig: that call resets the model group
+        // to this expert's own config-derived default, and would silently
+        // win over a model override applied before it.
+        this.applyModelPrefillOnce();
         this.loadingExpert.set(false);
       },
       error: () => this.loadingExpert.set(false),
     });
     this.loadToolPreview();
+  }
+
+  /**
+   * Pin the model picker to the source thread's model
+   * (`metadata.config_override.llm.model`, session_config_drift_resume.md
+   * §8.3), once, the first time it's safe to do so without a later
+   * `prefillFromConfig` call silently overwriting it — i.e. right after
+   * *some* expert's own config-driven reset has just run (from
+   * `fetchExpertDetail`'s callback, or from `applyEffectiveDefault` finding
+   * one was already fetched earlier). Guarded so a later, deliberate expert
+   * switch (`toggleExpert`) resets the model to that expert's own default
+   * normally, the same as it would without a prefill in play.
+   *
+   * Known gap, accepted rather than chased further: if no expert is *ever*
+   * resolved (no default session expert configured at all, so the form falls
+   * back to the bare framework config) this never fires, because nothing
+   * else resets the model group in that case either — see the task report.
+   */
+  private applyModelPrefillOnce(): void {
+    if (this.modelPrefillApplied) return;
+    const model = this.threadPrefill?.model;
+    if (!model) return;
+    this.modelPrefillApplied = true;
+    this.agentSettings?.setSessionModelOverride(model);
   }
 
   /**

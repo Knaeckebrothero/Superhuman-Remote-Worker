@@ -750,6 +750,14 @@ export class SessionsPageComponent implements OnInit {
                     this.toast.danger(this.errors.translate(e, 'errors.sessions.resumeFailed'));
                     return;
                 }
+                // The 428 arrives before the thread's status flips, so the
+                // chat page would otherwise render its generic ended-card
+                // with no sign that a resume was already attempted — the
+                // first click looks like it did nothing. An informational
+                // toast (not danger — this isn't an error, it's recoverable
+                // via the in-chat drift dialog on the very next click) is
+                // honest about what happened before navigating there.
+                this.toast.info(this.transloco.translate('sessions.configDrift.attentionNeeded'));
             }
         }
         this.router.navigate(['/sessions', thread.id]);
