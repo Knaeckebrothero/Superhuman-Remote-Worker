@@ -753,7 +753,7 @@ describe('turn-reducer — permissions', () => {
     it('permission_decision (expired) marks the call unanswered, NOT denied', () => {
         // A gate that timed out or was swept at turn end is not a refusal.
         // Painting it "denied" is the fabricated-denial bug, in the UI:
-        // docs/issues/supervised_parallel_gates_timeout_fabricates_denial.md
+        // docs/done/supervised_parallel_gates_timeout_fabricates_denial.md
         const state = play([
             {type: 'turn_started', turnId: 't1', startedAt: 1000},
             {

@@ -3329,7 +3329,7 @@ export class PersistentChatService {
                 // sweeps un-reached gates as 'expired' (and 'interrupted' on
                 // Stop). Neither is a refusal — reporting them as 'denied'
                 // recreates the fabricated-denial bug in the UI. See
-                // docs/issues/supervised_parallel_gates_timeout_fabricates_denial.md
+                // docs/done/supervised_parallel_gates_timeout_fabricates_denial.md
                 const rawDecision = params['decision'];
                 const decision =
                     rawDecision === 'approved'
