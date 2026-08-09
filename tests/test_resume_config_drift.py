@@ -19,7 +19,9 @@ via an ExitStack, reusing the conftest fixtures (``user_a``, ``thread_a``,
 ``_thread_config_drift`` — the real drift assembler that runs the Task 1/2/3/5
 classifiers — is exercised on its own elsewhere; here it is patched per test so
 each case controls exactly what "currently drifted" means without having to
-fake out project/datasource/grant classification end to end.
+fake out project/datasource/grant classification end to end. The one exception
+is ``test_grant_probe_failure_fails_closed``, which runs the real
+``_thread_config_drift`` to pin its internal fail-closed handling.
 """
 
 from __future__ import annotations
@@ -251,3 +253,39 @@ class TestResumeConfigDrift:
         assert exc.value.status_code == 409
         drift_probe.assert_not_awaited()
         fake_db.resume_thread.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_grant_probe_failure_fails_closed(
+        self, user_a, thread_a, fake_db, fake_request
+    ):
+        """The grant probe inside the REAL ``_thread_config_drift`` (not
+        patched out here, unlike every other test in this file) must fail
+        closed: a transient error while harvesting grant violations is not
+        the same as "no grant drift", and reporting it that way would let a
+        session resume on an unknown state. Plan §7: "Drift collection
+        itself throws -> fail closed — 403, as today. Never auto-proceed
+        from an unknown state."
+
+        ``thread_a`` carries no project mounts and no ``datasource_ids``, so
+        ``_thread_project_ids`` / ``_classify_thread_project_ids`` /
+        ``classify_datasource_selection`` all resolve to empty lists without
+        needing any further ``fake_db`` wiring — the ``RuntimeError`` raised
+        by the patched ``_resolve_session_config`` is the only thing that can
+        reach the handler.
+        """
+        from main import resume_thread
+
+        thread = _ended_thread(thread_a)
+        thread_id = str(thread["id"])
+
+        with _patch_caller_and_db(user_a, fake_db):
+            with patch(
+                "main._resolve_session_config",
+                AsyncMock(side_effect=RuntimeError("boom")),
+            ):
+                with pytest.raises(HTTPException) as exc:
+                    await resume_thread(thread_id, fake_request)
+
+        assert exc.value.status_code == 403
+        fake_db.resume_thread.assert_not_awaited()
+        fake_db.record_thread_config_drift_ack.assert_not_awaited()
