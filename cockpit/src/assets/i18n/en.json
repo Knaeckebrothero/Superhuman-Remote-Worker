@@ -557,6 +557,28 @@
       "createSession": "Create Session",
       "protectedCloud": "Protected cloud — agent writes are staged for your review",
       "protectedCloudHint": "The agent gets read-only cloud access; its changes wait for your approval in the review panel."
+    },
+    "configDrift": {
+      "title": "Some of this session's setup is gone",
+      "intro": "Parts of this session's configuration aren't available anymore:",
+      "resumeAnyway": "Resume without them",
+      "startNew": "Start a new session",
+      "connector": {
+        "deleted": "Deleted connector — {{label}}",
+        "revoked": "Revoked connector — {{label}}",
+        "out_of_scope": "Revoked connector — {{label}}"
+      },
+      "project": {
+        "deleted": "Deleted project — {{label}}",
+        "revoked": "Revoked project — {{label}}",
+        "out_of_scope": "Revoked project — {{label}}"
+      },
+      "grant": {
+        "deleted": "Missing grant — {{label}}",
+        "revoked": "Missing grant — {{label}}",
+        "out_of_scope": "Missing grant — {{label}}"
+      },
+      "countSuffix": " (×{{count}})"
     }
   },
   "jobs": {
