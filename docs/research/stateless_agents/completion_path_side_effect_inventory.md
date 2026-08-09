@@ -5,9 +5,12 @@ reading the whole of `POST /api/jobs/{job_id}/complete` and everything it
 dispatches into, on `feature/stateless-agents`. Handler span:
 `orchestrator/main.py:17389–18432` — **1046 lines, 29 database awaits.**
 
-Line numbers are `feature/stateless-agents`. On `feature/stateless-workers-s3`
-the handler is behaviorally identical with **all line numbers +23**; the only
-in-handler delta is the import source for `AUTO_REDISPATCH_FREEZE_TYPES`.
+Line numbers were taken on `feature/stateless-agents` before the 2026-08-09
+consolidation and **will have drifted** — the merge brought in the S3 freeze
+registry, which changed the import source for `AUTO_REDISPATCH_FREEZE_TYPES`,
+and later session work touched `main.py`. Treat the numbers as anchors to
+re-locate, not as coordinates to trust; the effect ORDER and the idempotency
+classifications are what this document is for, and those are unchanged.
 
 > Read this before proposing any completion change. Two design claims in the
 > v3 doc about this path turned out to be wrong when checked against the code

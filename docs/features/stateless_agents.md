@@ -519,72 +519,59 @@ frame and operator unpark end to end; the tenant A→B residue probe, which need
 a second user identity; and live mid-turn/retention fault injection for the
 control inbox, which is unit-tested rather than cluster-proven.
 
-#### S2 / S4 untouched; S3 stopped after its safety foundation
+#### S2 untouched; S3 has its safety foundation but is not enabled
 
 **S2** (workspace sessions): nothing — S1 is lite/virtual only. SSH affinity,
-tmux reattach-if-exists, PVC externalization, cloud-push generation fence,
-outbox re-homing, the two resident daemons, presence re-home all outstanding.
+tmux reattach-if-exists, PVC externalization, the cloud-push generation fence,
+outbox re-homing, the two resident daemons and presence re-home are all
+outstanding.
 
-**S3** (workers): **two of the three safety gates are built** on the parallel
-branch `feature/stateless-workers-s3` (4 commits, unpushed, reviewed 2026-08-08;
-no `worker_batch` unit has ever been enqueued and no job carries a non-pinned
-lane). Migration **0118** adds `jobs.execution_lane` and §5.4.4's coexistence
-partition is applied — `get_dispatchable_jobs`, `claim_job_for_agent`,
-`recover_expired_lease_jobs`, `recover_orphaned_jobs` (four separate predicates)
-and `register_agent` all whitelist `'pinned'` so an unknown future lane fails
-closed, with defense-in-depth refusals on the three direct dispatch paths and
-real-Postgres tests that fail without the partition. `src/shared/job_freeze_types.py`
-consolidates the four keep-in-sync freeze lists, the orphan-recovery SQL now
-takes the set as a parameter so it cannot drift, and `batch_boundary` joins
-`CONTINUE_AS_NEW_FREEZE_TYPES` (non-terminal `paused`). The §5.4.1
-phantom-COMPLETE hazard is **closed**: `determine_job_status` previously mapped
-*any* non-completion stop on a loop job to `completed`; it now does so only when
-no freeze type was declared, and routes an unknown *declared* freeze to
-`pending_review` with an error log. The `batch_boundary` freeze itself exists in
-the graph, **unarmed by construction** (it requires state fields nothing sets),
-wall-clock-first with a 300 s floor, disarming its whole envelope in the same
+**S3** (workers): **Gates 1 and 2 are built and merged**; worker admission stays
+closed. No `worker_batch` unit has ever been enqueued and no job carries a
+non-pinned lane.
+
+*Gate 1 — the coexistence partition (§5.4.4).* Migration **0118** adds
+`jobs.execution_lane NOT NULL DEFAULT 'pinned'`. `get_dispatchable_jobs`,
+`claim_job_for_agent`, `recover_expired_lease_jobs`, `recover_orphaned_jobs`
+(four separate predicates) and `register_agent` all whitelist `'pinned'`, so an
+unknown future lane fails closed rather than inheriting pinned dispatch. The
+three direct dispatch paths — fresh start, resume, manual admin assign — refuse
+defensively on top of that, and real-Postgres tests fail without the partition.
+
+*Gate 2 — the freeze contract (§5.4.1).* `src/shared/job_freeze_types.py`
+consolidates the four keep-in-sync freeze lists that spanned two separately
+rolling images, and the orphan-recovery SQL now takes the set as a parameter so
+it cannot drift from status determination. `batch_boundary` joins
+`CONTINUE_AS_NEW_FREEZE_TYPES`, so it resolves to a non-terminal `paused`. The
+phantom-COMPLETE hazard is **closed**: `determine_job_status` used to map *any*
+non-completion stop on a loop job to `completed`; it now does so only when no
+freeze type was declared, and routes an unknown *declared* freeze to
+`pending_review` with an error log. The `batch_boundary` freeze exists in the
+graph and is **unarmed by construction** — it needs state fields nothing sets —
+wall-clock-first with a 300 s floor, correctly placed at both phase and
+mid-phase boundaries, and it clears its whole arming envelope in the same
 checkpoint as the freeze so a resumed job cannot immediately re-freeze.
 
-**Gate 3 is not built and is now known to be a design problem, not a
-predicate** — see §5.4.5. Everything downstream (the worker driver, the pool
-decision, all worker acceptance) is blocked behind it. Also unresolved: a
+*Gate 3 — not built, and now known to be a design problem rather than a
+predicate change (§5.4.5).* Two independent audits reached the same conclusion:
+there is no assigned-agent completion CAS to re-key, and adding a token check
+around today's completion route would still permit steal-during-handler
+mutations, because that route is 1046 lines with 29 database awaits, no explicit
+transaction, and external effects with no rollback. The next safe slice is
+durable completion-command intake plus a crash-recoverable finalizer.
+
+**Everything downstream of Gate 3 is blocked**: the worker driver, TodoManager
+hydration on any resume, conditional tmux kill, generator-close discipline,
+pull-claim with claim-token renewal, checkpoint-coupled steering acks, atomic
+`paused_reason='batch_rotation'` rotation, the wall-clock batch budget, the
+worker Deployment and KEDA, job-log per-claim capture, and the Job Bench A/B
+gate.
+
+**The single-pool question is also unresolved, with evidence against it.** A
 pod-local capacity reserve cannot guarantee interactive availability across a
-rollout or pod loss, which is evidence *for* §5.8's two-Deployment split and
-against a single shared pool; and the current Deployment lacks the VM-mesh
-capability §5.8 requires for VM-workspace jobs. The rest of the list:
-`batch_boundary` freeze + the consolidated freeze registry
-(the phantom-COMPLETE skew hazard in §5.4.1 makes this a *correctness*
-prerequisite, not a nicety), TodoManager hydration on any resume, conditional
-tmux kill, pull-claim + claim-token renewal + stage-4 CAS keyed on
-`lease_token`, `jobs.execution_lane` with all four legacy sweeps excluding the
-class (§5.4.4), checkpoint-coupled steering acks, `paused_reason='batch_rotation'`,
-the wall-clock batch budget, the worker Deployment + KEDA, job-log per-claim
-capture, and the Job Bench A/B gate.
-
-The worker track's own summary of the same state:
-
-**S3** (workers): Gate 1 and Gate 2 are implemented and verified on branch
-`feature/stateless-workers-s3`. Migration 0118 adds
-`jobs.execution_lane NOT NULL DEFAULT 'pinned'`; dispatcher, claim, recovery,
-same-host replacement, manual assignment, and direct start/resume paths fail
-closed for non-pinned lanes. The agent and orchestrator share one freeze
-registry; orchestrator-first deployment makes `batch_boundary` a pause and maps
-an unknown declared loop freeze to `pending_review`, never `completed`. The
-graph carries a checkpointed, wall-clock-first boundary with a hard 300 s floor,
-safe phase/mid-phase placement, and default-`None` arming fields. It cannot fire
-for any existing caller. No `worker_batch` row has been enqueued.
-
-Gate 3 is deliberately **NOT DONE**. The implementation audit found no
-assigned-agent completion CAS to replace and proved that adding a token check
-around today's long completion route would still allow steal-during-handler
-mutations. The next safe slice is a durable completion-command intake plus a
-crash-recoverable finalizer; terminal effects must be made idempotent or marked
-as durable steps. Only after that may work proceed to the worker driver,
-TodoManager hydration, generator-close discipline, real tmux reattach,
-checkpoint-coupled steering, atomic `paused_reason='batch_rotation'` rotation,
-capability/fairness handling, deployment choice, job logs, and Job Bench/fault
-gates. Landing only a receipt table or the batch disposition would not complete
-Gate 3 and would not authorize worker traffic.
+rollout or pod loss, which argues *for* §5.8's two-Deployment split; and the
+current Deployment lacks the VM-mesh capability §5.8 requires for VM-workspace
+jobs.
 
 **S4**: not started, by design.
 

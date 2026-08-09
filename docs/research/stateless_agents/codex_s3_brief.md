@@ -1,3 +1,19 @@
+> **STATUS 2026-08-09 — PARTIALLY EXECUTED; HISTORICAL.** Gates 1 and 2 from §3
+> are built, verified and merged onto `feature/stateless-agents`; the branch this
+> brief tells you to create was consolidated and deleted. **For current status
+> read `docs/features/stateless_agents.md` §9.1.**
+>
+> **Do not follow §3's plan as written.** Gate 3 is not the predicate change this
+> brief describes — there is no completion CAS to re-key. It is a design problem,
+> specified in §5.4.5 with its evidence base in
+> `completion_path_side_effect_inventory.md`, and everything downstream (the
+> worker driver, Phase 4's single pool, all worker acceptance) is blocked behind
+> it.
+>
+> §5's single-pool goal also has evidence against it now: a pod-local capacity
+> reserve cannot guarantee interactive availability across a rollout or pod loss,
+> which argues for the two-Deployment split the design originally specified.
+
 # Codex brief — S3: worker jobs on the stateless lane, one pool for both
 
 You are picking up a feature mid-flight. The session half is built, proven on
