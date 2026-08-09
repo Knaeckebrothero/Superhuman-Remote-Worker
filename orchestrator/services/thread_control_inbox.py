@@ -25,6 +25,7 @@ from src.shared.run_queue import (
     UNIT_KIND_SESSION_TURN,
     record_control_seq,
 )
+from services.stateless_workspace_gate import stateless_lite_workspace_check
 
 
 @dataclass(frozen=True, slots=True)
@@ -130,7 +131,7 @@ async def admit_thread_control(
         async with conn.transaction():
             thread = await conn.fetchrow(
                 "SELECT id, user_id, agent_id, status, execution_lane, "
-                "       control_seq_hwm, control_admission_agent_id "
+                "       control_seq_hwm, control_admission_agent_id, metadata "
                 "FROM threads WHERE id = $1 FOR UPDATE",
                 tid,
             )
@@ -188,6 +189,15 @@ async def admit_thread_control(
                         "Session is not ready to accept controls"
                     )
             elif lane == LANE_STATELESS:
+                _backend, workspace_refusal = stateless_lite_workspace_check(
+                    dict(thread)
+                )
+                if workspace_refusal is not None:
+                    raise ControlAdmissionError(
+                        "Stateless execution currently supports only lite "
+                        "workspace backends (virtual/none); this session's "
+                        "workspace tier is not yet supported"
+                    )
                 if thread["agent_id"] is not None:
                     raise ControlAdmissionError(
                         "Stateless session has an incompatible agent binding"

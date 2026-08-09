@@ -20,6 +20,7 @@ import pytest
 
 THREAD_ID = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
 USER = {"id": "user-1", "is_admin": False}
+_USE_DB_THREAD = object()
 
 
 class _FakeTxn:
@@ -39,12 +40,20 @@ class _FakeTxn:
 class FakeConn:
     """Scripted asyncpg connection: records (kind, query, args, txn_depth)."""
 
-    def __init__(self, *, message_seq=41, admit_state="queued", watermarks=None):
+    def __init__(
+        self,
+        *,
+        message_seq=41,
+        admit_state="queued",
+        watermarks=None,
+        locked_thread=_USE_DB_THREAD,
+    ):
         self.calls = []
         self.txn_depth = 0
         self.txn_enters = 0
         self._message_seq = message_seq
         self._admit_state = admit_state
+        self._locked_thread = locked_thread
         self._watermarks = watermarks or {
             "state": "queued",
             "input_seq": message_seq,
@@ -70,6 +79,9 @@ class FakeConn:
 
     async def fetchrow(self, q, *a):
         self.calls.append(("fetchrow", q, a, self.txn_depth))
+        if "FROM threads" in q and "FOR UPDATE" in q:
+            assert self.txn_depth == 1
+            return self._locked_thread
         if "FROM run_queue" in q:
             return dict(self._watermarks)
         return None
@@ -79,6 +91,8 @@ class FakeDB:
     def __init__(self, thread, conn):
         self._thread = thread
         self._conn = conn
+        if conn._locked_thread is _USE_DB_THREAD:
+            conn._locked_thread = thread
         self.get_thread_calls = 0
 
     async def get_thread(self, tid):
@@ -103,6 +117,7 @@ def _stateless_thread(**over):
         "id": THREAD_ID,
         "user_id": "user-1",
         "execution_lane": "stateless",
+        "agent_id": None,
         "total_turns": 5,
         "status": "active",
         "metadata": {"config_override": {"workspace": {"backend": "virtual"}}},
@@ -250,6 +265,38 @@ async def test_stateless_input_rejects_non_lite_workspace_before_writes(
     assert exc.value.status_code == 409
     assert "virtual/none" in str(exc.value.detail)
     assert conn.calls == []
+
+
+@pytest.mark.asyncio
+async def test_stateless_input_rechecks_locked_workspace_before_any_write(monkeypatch):
+    """A preflight lite row cannot authorize a sandbox row observed under lock."""
+    from fastapi import HTTPException
+
+    from orchestrator import main as orch_main
+
+    preflight = _stateless_thread()
+    locked = _stateless_thread(
+        metadata={"config_override": {"workspace": {"backend": "sandbox"}}}
+    )
+    conn = FakeConn(locked_thread=locked)
+    db = FakeDB(preflight, conn)
+    _patch_common(monkeypatch, orch_main, db)
+
+    with pytest.raises(HTTPException) as exc:
+        await orch_main.thread_input(
+            THREAD_ID,
+            orch_main.ThreadInputRequest(content="must not race into the queue"),
+            MagicMock(),
+        )
+
+    assert exc.value.status_code == 409
+    assert conn.txn_enters == 1
+    assert len(conn.calls) == 1
+    locked_read = conn.calls[0]
+    assert locked_read[0] == "fetchrow"
+    assert "FROM threads" in locked_read[1]
+    assert "FOR UPDATE" in locked_read[1]
+    assert locked_read[3] == 1
 
 
 @pytest.mark.asyncio

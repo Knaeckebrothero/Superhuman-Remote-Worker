@@ -1999,3 +1999,138 @@ used nonexistent `threads.updated_at`, then was corrected to `created_at`.
 
 The gate remains in place until the final S2 acceptance run. Next: remote tmux
 reattach/preservation, followed by the §6.1 agent-local `/workspace` inventory.
+
+## §6.1 agent-local session-state inventory — audit recorded; fixes NOT DONE
+
+The inventory found a premise error in the original PVC framing. A persistent
+session's logical workspace is backend-owned, not agent-local. `virtual` uses a
+durable object-store prefix, `sandbox`/`vm` uses the remote workspace at
+`/home/agent-host/workspace`, and `none` uses an intentionally disposable
+`/tmp/srw-scratch-*` backend with file tools disabled. `WorkspaceManager`
+delegates session file operations to that backend; its local compatibility path
+does not identify the authoritative copy.
+
+Both live `agent-stateless` pods were inspected. In each container,
+`/workspace` was an empty root with no child entries. The one ordinary
+session-path producer found below it is a recomputable vision-description cache.
+Therefore an agent PVC is not the fix: it would neither preserve backend-owned
+workspace state nor repair RAM-only state or tools which incorrectly treat a
+backend path as a local path. No production fix described in this inventory has
+been implemented or marked DONE.
+
+### Filesystem and externally owned state
+
+| Item / path | Writer and lifecycle | Authoritative or external copy | Survival requirement | Decision (not yet implemented) |
+| --- | --- | --- | --- | --- |
+| Agent-local `/workspace` root | `WorkspaceManager.initialize()` creates the local base directory, but creates configured workspace directories through `backend.mkdir` (`src/core/workspace.py`). | None required; it is not the logical workspace. | None. | Keep it disposable. Both live stateless containers had an empty `/workspace`; do not add a PVC merely for this root. |
+| `/workspace/.vision_cache/<sha256>.txt` | `DescriptionCache` stores content-addressed image/PDF descriptions after visual reads (`src/services/description_cache.py`; callers in `src/tools/workspace/files.py`). | The source image/document remains on its durable workspace backend; the description can be recomputed. | No correctness requirement, but a cold cache repeats vision cost. | Declare disposable and move to an explicitly ephemeral cache location such as `/tmp` or `/home/srw/.cache`. Do not promote it to DB/object storage. |
+| `/workspace/checkpoints`, `/workspace/logs`, `/workspace/phase_snapshots` | No persistent-session writer was found. Their call sites belong to worker/legacy runtimes (`src/agent.py`, `src/api/app.py`, `src/api/dual_app.py`, `src/graph.py`, `src/core/phase_snapshot.py`). | Session conversation, journal, checkpoint and compaction state is in Postgres; application logs use stdout. | Not applicable to persistent sessions. | Do not provision agent storage for these paths. |
+| `/tmp/srw-scratch-<thread>-*` | `ScratchBackend` creates it for backend `none` and removes it on disconnect (`src/core/backends/scratch.py`). | None, by the explicit no-files tier contract; file tools are disabled. | Must not be relied on across claims. | Keep disposable. |
+| Operation-scoped temp files | `WorkspaceManager.local_copy`, cloud sync, research-paper download, document rendering and audio helpers create `NamedTemporaryFile`, `mkstemp`, `/tmp/paper_dl_*`, `/tmp/docrender_*` or `/tmp/audio_chunk_*` staging and clean them in `finally`. | Input and completed output live on the workspace backend, cloud provider or other external service. | Only for the duration of the operation. | Keep disposable; retain deterministic cleanup. |
+| Logical directories `archive/`, `documents/`, `chunks/`, `candidates/`, `requirements/`, `output/` | Workspace initialization and file tools create/write them through `WorkspaceManager` and its backend (`src/core/workspace.py`, `src/tools/workspace/files.py`). | Virtual: object-store objects and directory markers. Sandbox/VM: remote workspace storage. | User workspace state must survive claims and agent-pod loss. | Already externalized. Prove remote workspace preservation and handoff; do not duplicate it onto an agent PVC. |
+| Arbitrary user/tool output | File tools, remote shell, web archival under `documents/external/`, email exports, bibliography generation, KB exports, catalog/workflow exports and messaging attachments all write via the backend. The persistent shell deliberately has no local-agent fallback. | The selected workspace backend is authoritative. | Must survive. | Already externalized; preserve object-store or remote-workspace durability. |
+| `uploads/**` | The orchestrator, not the agent, stages thread uploads: SFTP into a sandbox/VM workspace or object-store objects under the virtual thread prefix. Virtual ZIP extraction occurs in orchestrator memory before members are stored. Backend `none` refuses uploads. | Remote workspace or object store. | Must survive. | Already externalized. The generic job upload staging path is not persistent-session residue. |
+| `skills/<name>/**` and configured instruction files | Persistent-session attach deploys resolved skills/instructions through the workspace backend (`src/api/persistent_session.py`). Ordinary files use first-save-wins semantics so user edits are retained. | Frozen resolved configuration/catalog plus the durable workspace copy. | Workspace copies and user edits must survive. | Already externalized; do not rematerialize over user-edited files. |
+| `skills/present-with-canvas/**` and `skills/present-with-canvas/.srw-managed.json` | The canvas-skill reconciler writes managed assets and a digest ownership manifest through the backend; it deletes only still-owned, digest-matching files. | Durable workspace backend. | Both assets and manifest must survive; losing the manifest weakens the no-clobber ownership rule. | Already externalized; treat the manifest as authoritative session workspace state. |
+| `datasources.md` | Datasource setup and live updates write it through `WorkspaceManager`; regeneration preserves the existing user-controlled prefix. | Mostly derivable from DB datasource payloads, with user-authored content only in the durable workspace copy. | Must survive if user content has been added. | Keep on the durable backend and rematerialize only the managed section. |
+| Virtual `tools/**`, `contacts/**`, `instructions.md`, `task_brief.md` | `VirtualOverlayBackend` providers synthesize these paths; most are read-only and are not physical agent files. | DB/config/provider state. | No agent-local survival requirement. | Leave virtual; do not copy onto `/workspace`. |
+| `.git/`, `.gitignore`, repository files, `repos/<name>/**`, `.worktrees/**`, `.subagents*` | `GitManager`, repository setup and delegation tools operate through the backend/remote shell. Reader-subagent worktrees are cleaned after use; the main tree and delegation manifests are live workspace state. | Live backend workspace is authoritative between successful pushes. Gitea plus the Postgres turn-to-SHA ledger is only an external copy after a successful turn push. Virtual-tier Git is disabled, so its object-store workspace is the only live copy. | Main repositories and manifests must survive; temporary reader worktrees need only survive their call. | Keep authoritative repositories on remote/object storage; clean only explicitly temporary worktrees. Do not assume Gitea has every in-flight change. |
+| Cloud folder-mirror files | `CloudSyncCoordinator` deliberately unwraps to the physical workspace backend; local files are only operation-scoped staging. Its listing/dedup maps are in RAM and reseed from the remote listing on a cold attach. | Cloud provider and workspace backend are external truths. | Mirrored workspace files survive; the cache maps need not. Cross-pod push/pull ordering still needs the separate durable generation fence. | Keep files external and caches disposable. Do not use an agent PVC as an ordering mechanism. |
+| Rclone mount cache/config/log; overlay upper/work directories | Rclone commands run on the workspace pod and store state under that pod's home (including `.cache/srw/rclone/<thread>/<mount>/`); cloud symlinks/backups and protected overlay upper/work dirs are likewise workspace-side, not agent-side. | The cloud is authoritative for an ordinary mount. A protected overlay upperdir contains an unsynced staged diff with no equivalent cloud copy yet. | Ordinary cache is disposable only after flush/clean unmount. Protected overlay diffs must survive or be staged before workspace teardown. | Preserve or explicitly stage protected overlay state as part of the workspace lifecycle; do not copy it to agent `/workspace`. |
+| Memory and knowledge-base artifacts | `RecallStore` uses Postgres/pgvector; optional graph data uses Neo4j; KB writes materialize server-side into the project KB repository rather than agent storage. Explicit KB exports are ordinary backend workspace files. | Postgres/pgvector, optional Neo4j, project KB repository, or durable workspace export. | Must survive. | Already externalized. The deprecated workspace-memory manager is not wired into the persistent-session path. |
+| Canvas source, metadata and published bytes | The canvas tool sends a workspace source pointer to the orchestrator. The source remains on the workspace backend, canvas metadata is in Postgres, and the last published eligible bytes are stored in object storage. Canvas processes/browser state run on the workspace pod. | Workspace source + Postgres canvas row + object-store published snapshot. | Source and metadata must survive; the snapshot is only the last-published fallback. | Already externalized. Preserve the workspace source and managed-skill manifest; no agent PVC is needed. |
+| Session logs | Persistent-session application logs go to stdout/journal; rclone logs are on the workspace pod. | Logging infrastructure, Postgres journal and remote workspace where applicable. | No session correctness dependency on an agent-local log file. | Keep agent-local logs disposable. |
+
+### RAM-only state and backend-path bypasses
+
+These are the actual persistence or correctness gaps found by the inventory.
+They are proposals, not completed fixes.
+
+| Item | Producer / consumer and failure mode | Existing external copy | Survival requirement | Decision (not yet implemented) |
+| --- | --- | --- | --- | --- |
+| `SessionTaskManager._tasks` and `_next_id` | A new in-memory manager is created on every attach; task tools mutate it and emit `tasks.updated`. A handoff loses the user's checklist and ID sequence (`src/managers/session_tasks.py`, `src/api/persistent_session.py`). | None. | Must survive turns, reloads and agent handoffs. | Externalize to Postgres keyed by thread. A workspace JSON file is weaker and cannot support backend `none`. |
+| File-undo checkpoints | Write/edit callbacks place full pre-write contents in `PersistentSession.file_checkpoints`; the undo route consumes this process-local map. | No exact copy. Sandbox/VM may have later Git commits and a Postgres turn-to-SHA ledger; virtual Git is disabled. | Must survive if REST undo remains a product promise. | For sandbox/VM, restore through a proven Git/turn-ledger operation. For virtual, use object-store versioning/snapshots or a durable DB/blob undo store. Otherwise fail closed and explicitly declare undo unsupported for that tier. |
+| Memory-extraction interval cursor | `_last_extraction_turn` starts at zero on each attach and advances only in process. Extracted memory rows survive, but a new claimant can repeat extraction and its auxiliary LLM work once the global turn count exceeds the interval. | Memory rows, but no cursor. | Must survive or be derivable to prevent repeated extraction/writes. | Persist a thread cursor in Postgres or derive the last covered turn from durable memory metadata such as `source_turn_end`. |
+| Read-before-write and instruction stamps | `ToolContext` keeps recent-read hashes, pinned reads and instruction stamps in RAM. A new claimant forgets them and requires a reread. | None. | Correctness does not require survival; forgetting is conservative, but adds tokens and latency. | Explicitly declare disposable per claim and measure cold reread cost. Persist only immutable version stamps if the UX later requires it. |
+| Cloud citation anchors | WebDAV reads register `_cloud_anchors` in `ToolContext`; a later citation consumes them. A handoff between read and cite silently loses provider drift/version metadata. | A citation source/snapshot becomes durable only after citation registration. | Must survive across turns if cloud provenance is promised. | Persist per-thread/path anchor metadata in Postgres or durable workspace metadata. |
+| Cloud-sync listing/dedup caches | `_local_state`, `_remote_state`, `_remote_dirs`, `_pushed_sizes` and `_remote_seeded` are process-local. A cold claimant reseeds them from remote listings. | Cloud provider and workspace backend. | No semantic survival requirement once durable generation fencing is correct. | Declare disposable and measure cold-listing cost. |
+| Other process caches | Citation source registry and delivered-reply dedup state cache durable DB/journal truth or intentionally implement process-local at-least-once behavior. | DB/journal where applicable. | No filesystem persistence requirement. | Keep disposable. Background outbox, presence and interrupt ownership remain separate S2 work rather than `/workspace` residue. |
+| WebDAV local-path bypass | `webdav_read` takes `workspace.get_path("documents")`, calls local `os.makedirs`, and downloads directly there; `webdav_write` tests/uploads a local `workspace.get_path(source)` (`src/tools/webdav/tools.py`). A sandbox path names a directory on the remote workspace pod, while a virtual path is an object key; neither is a valid agent-local path. | Intended destination/source exists only through the workspace backend. | The operation must work correctly; persistence alone cannot repair it. | Stage downloads in `/tmp`, then call `backend.write_file`; upload through `workspace.local_copy`. Preserve the cloud anchor in durable metadata. |
+| Research-paper local-path bypass | Research download code infers remoteness from `backend.host is not None`. A virtual backend has no host, so its object key is treated as an agent-local path, commonly under read-only `/app` (`src/tools/research/workflow.py`, `src/tools/research/papers.py`). | Intended workspace backend. | The completed paper must reach the backend; temporary download need not survive. | Always download to an operation-scoped temp path and write through the backend, or introduce an explicit local-filesystem capability. Do not infer path semantics from `host`. |
+| Citation cloud-snapshot path ambiguity | Citation resolution uses `get_path` during cloud-anchor lookup. It later registers the relative path through backend-aware copying, but the cloud snapshot attempt can still receive a remote-resolved path as though it were local (`src/tools/citation/sources.py`). | Durable citation/source row exists after successful registration. | Provider snapshot/provenance should not silently disappear at a handoff or backend boundary. | Fold this into durable cloud-anchor metadata and make all byte access backend-aware. |
+
+Inventory boundary: the agent-local PVC proposal should be removed from the S2
+solution. The implementable route is to retain backend-owned workspace data,
+move the one true agent cache to an explicitly disposable location, correct the
+three backend-path bypasses, externalize task/undo/extraction/anchor state, and
+document safe cold-start caches as disposable. Remote workspace preservation,
+protected-overlay staging and the broader S2 daemon/outbox/presence work remain
+unverified and are not changed by this audit.
+
+## Phase 0 audit hardening — DONE
+
+The first Phase-0 implementation classified only the materialized declaration
+at `metadata.config_override.workspace.backend`. An adversarial schema audit
+found that insufficient: live upgrades provision a workspace/VM first and only
+then best-effort the declaration update, so old rows can say `virtual` while
+still carrying a real remote binding. The gate was hardened before starting
+tmux work:
+
+* one shared classifier requires an exact `virtual`/`none` declaration, allows
+  only the Gitea repository keys in otherwise-lite workspace context, and
+  refuses any VM context, physical workspace context, remote/malformed binding,
+  missing tier, or future shape;
+* stateless human input re-reads and classifies the authoritative thread row
+  `FOR UPDATE` inside the same message/watermark transaction;
+* control admission includes metadata in its existing locked thread read and
+  classifies before its high-water mark, request, or queue write;
+* claim-bundle retains the final pre-credential defense for legacy/manual rows;
+* both sandbox and VM live-upgrade endpoints require the exact pinned lane
+  before grants or provisioning, and generic config mutation cannot switch a
+  stateless row to a physical backend. `abort-vm-upgrade` deliberately remains
+  callable so cleanup cannot be fenced out;
+* operator unpark remains kind-agnostic and may cause one refused claim/park
+  cycle; the claim-bundle is its safety boundary. Raw SQL lane changes remain
+  an operator responsibility.
+
+Verification:
+
+* focused gate plus config-plumbing suite: **161 passed**; Ruff, format and
+  `git diff --check` clean;
+* the actual running orchestrator contained the shared classifier, locked-row
+  recheck and one `S2 lite-only gate` marker, and no merge marker remained in
+  its database module; both running agent pods contained the turn-timing marker;
+* bounded live proof used the ended sandbox fixture with an existing `remote`
+  binding, changed only its declaration/lane to `virtual`/`stateless`, and
+  restored it via an exit trap. Input and control each returned **409**;
+  message/control/queue counts stayed **0|0|0 → 0|0|0**; final state was
+  **pinned|sandbox|remote**.
+
+Timing evidence remains honest. Before the original gate, the virtual probe was
+**9 s wall / 5.73 s agent** (bundle .10, attach 1.65, controls .02, turn 3.75,
+push .19, complete .02). After that first implementation it was **7 s wall /
+5.88 s agent** (bundle .16, attach 1.96, controls .01, turn 3.55, push .19,
+complete .01). The audit-hardening probe was accepted in **34 ms**, claimed
+with a **.059 s** bundle, and completed exactly once, but cluster egress made it
+an intentionally ugly measurement: **256 s wall / 188.01 s agent** (bundle
+.07, attach 1.83, controls .01, turn 186.03, push .05, complete .01). Repeated
+provider `APIConnectionError` retries account for the turn time; the gate's
+orchestrator-side bundle stayed below both earlier samples. This is useful
+failure evidence, not a claim about normal post-change latency.
+
+Operational failures retained: Tilt restarted from an old partially-edited
+image containing a merge marker even though the working tree was clean; direct
+container inspection caught it. The normal all-image rebuild then failed twice
+because Docker bridge networking could not reach npm (`ENETUNREACH`, masked as
+"Exit handler never called"). A temporary uncommitted Cockpit build
+`network='host'` override let Tilt converge; it is not an S2 change and will be
+removed. Two bounded SQL-probe attempts restored safely but exited before the
+HTTP assertions: one concatenation needed parentheses around JSONB `#>>`, and
+one command substitution retained a newline. Neither left a row changed.
+
+Phase boundary: the foot-gun is closed even for stale upgraded rows and
+sanctioned upgrade/config paths. The lite positive path was accepted, claimed,
+answered and completed despite degraded provider egress; a normal-latency
+post-change sample remains unavailable. The temporary gate remains installed
+until full S2 acceptance. Live queue invariant after the probe: **0
+`worker_batch` rows**.
