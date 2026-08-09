@@ -338,6 +338,49 @@ as a side effect.
   retry counter advances**.
 - A pinned job's completion is behaviorally identical to today's.
 
+##### Open design questions — what Gate 3 still has to settle
+
+The shape above is agreed; these are the decisions that turn it into something
+implementable. Recorded so the design can be resumed without re-deriving it.
+
+1. **Where the command row lives.** A new table, or an extension of
+   `run_queue`? It needs the full report payload, a deterministic key, and a
+   per-effect progress marker. A separate table probably wins — `run_queue`'s
+   contract is deliberately narrow ("this module touches ONLY run_queue") and
+   worker batches are not the only producer.
+2. **What `stop_identity` actually is.** `(job_id, lease_token)` may be
+   sufficient, since one lease serves one turn or batch. But an *exact* retry
+   must return the stored result while a *divergent* payload under the same key
+   must fail closed — so the key needs a payload digest, or the row needs to
+   store one for comparison.
+3. **Who runs the finalizer, and when.** Leader-elected loop on the reaper's
+   pattern (advisory lock for work-dedup, per-row CAS for correctness) for the
+   stateless lane, inline and synchronous for pinned so its behaviour is
+   unchanged. Needs the concrete retry/visibility-timeout semantics — mirror
+   `run_queue`'s own TTL/attempts/park rather than inventing a second dialect.
+4. **Per-effect keys.** One intent table keyed `(job_id, effect_kind, attempt)`,
+   or natural unique keys per effect? Some effects already have the right key
+   (`job_change_records.job_id`); the critic spawn wants a unique index on
+   `(parent_job_id, verification_round)`, which would close that hole outright
+   and is arguably worth doing on its own merits.
+5. **What replaces the status-based replay guard.** Moving the status write last
+   is necessary, but the current early-return guard *is* the replay defence.
+   Something has to take that role — most likely the command row's own state,
+   which is the point of having one.
+6. **Rollout order.** Pinned adopting the same path is the better end state (it
+   fixes the crash-mid-handler hole for pinned jobs too), but it must not be a
+   flag day. Sequence it.
+7. **Whether the live pinned-lane bugs are fixed here or sooner.** The inventory
+   found three that exist today: the workspace leak when a crash lands between
+   the status write and the archive, `completed` rows with `completed_at IS
+   NULL`, and the duplicate-critic race that can drop a blocking finding and
+   produce an unwarranted approval. The last one is a correctness hole in the
+   review system and does not need Gate 3 to fix.
+
+**Migration numbering:** S2 has been allocated **0122–0129**; Gate 3 starts at
+**0130**. This is deliberate range allocation — the earlier dev-cluster wedge
+came from two tracks numbering independently against one shared database.
+
 ##### Independent confirmation from the S3 track
 
 The worker track reached the same conclusion from the other direction, and added detail worth keeping: `JobCompleteRequest` carries no agent identity or lease token, `update_job_status()` ends in `UPDATE jobs ... WHERE id = ?`, and the completion route performs independently committed job mutations plus external delivery, critic/delegation/loop, notification, and workspace-cleanup effects before and after that update. A short entry fence can be stolen immediately after it commits; an end-only CAS permits stale side effects first; holding the queue lock across the route would put network I/O inside a long transaction and block reaping. Stateless reports must instead be accepted as immutable commands keyed by `(job_id, lease_token)` in one short queue-first transaction, then finalized by a durable visibility-timeout/retry worker. Exact retries return the stored command result; divergent payloads or unaccepted stale tokens fail closed. A `batch_boundary` can use a bounded atomic pause/stash/requeue disposition, but terminal stateless admission remains closed until every retry-dangerous completion effect has an idempotent or durably journaled finalization step. Gate 3 is not complete with only the intake table or boundary disposition.
