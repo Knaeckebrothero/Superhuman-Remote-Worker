@@ -6,6 +6,7 @@ import {TranslocoDatePipe} from '@jsverse/transloco-locale';
 import {firstValueFrom} from 'rxjs';
 import {environment} from '../../core/environment';
 import {PersistentChatService} from '../../core/services/persistent-chat.service';
+import {classifyResumeError} from '../../core/services/resume-error';
 import {ModelService} from '../../core/services/model.service';
 import {AppToastService} from '../../ui/toast';
 import {ErrorMessageService} from '../../core/services/error-message.service';
@@ -734,8 +735,21 @@ export class SessionsPageComponent implements OnInit {
                 );
                 thread.status = 'created';
             } catch (e: any) {
-                this.toast.danger(this.errors.translate(e, 'errors.sessions.resumeFailed'));
-                return;
+                // This page has no drift dialog of its own. A config-drift
+                // 428 falling into the generic toast below would show the
+                // same "Failed to resume session" wording a 500 gets and
+                // dead-end here forever — the exact problem this feature
+                // exists to remove, just moved from silence to a toast.
+                // Fall through to the plain navigate instead: the chat page
+                // DOES own the drift dialog (config-drift-dialog.component.ts),
+                // and its in-chat Resume card re-POSTs /resume, which
+                // repopulates PersistentChatService.pendingDrift and surfaces
+                // the real dialog there. Anything else (403/500/...) still
+                // dead-ends here with the toast.
+                if (classifyResumeError(e).kind !== 'drift') {
+                    this.toast.danger(this.errors.translate(e, 'errors.sessions.resumeFailed'));
+                    return;
+                }
             }
         }
         this.router.navigate(['/sessions', thread.id]);

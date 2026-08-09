@@ -35,6 +35,16 @@ export function groupDriftForDisplay(items: ConfigDriftItem[]): DriftRow[] {
     return rows;
 }
 
+/** Every item's id, NOT one per collapsed display row — the acknowledgment is
+ *  per item, and an incomplete list makes the server 428 again forever.
+ *  Extracted the same way `groupDriftForDisplay` is: exported and pure so a
+ *  future edit that quietly rewires `ids` to derive from `rows()` instead of
+ *  `items()` has a test to fail, not just a mounted component nobody can
+ *  mount (NG0951). */
+export function acknowledgeableIds(items: ConfigDriftItem[]): string[] {
+    return items.map((item) => item.id);
+}
+
 /**
  * Shown when POST /resume 428s because a connector, project, or grant this
  * session depended on has since disappeared — resume-error.ts classifies the
@@ -125,6 +135,5 @@ export class ConfigDriftDialogComponent {
     readonly dismissed = output<void>();
 
     readonly rows = computed(() => groupDriftForDisplay(this.items()));
-    /** Every id, not the collapsed rows — the acknowledgment is per-item. */
-    readonly ids = computed(() => this.items().map((item) => item.id));
+    readonly ids = computed(() => acknowledgeableIds(this.items()));
 }
