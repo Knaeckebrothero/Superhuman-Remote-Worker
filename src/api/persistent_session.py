@@ -204,6 +204,9 @@ class PersistentSession:
 
     thread_id: str
     config: AgentConfig
+    # Set only by the stateless executor. It must reach RemoteBackend before
+    # workspace/Git initialization can issue its first tmux command.
+    shell_owner_token: Optional[int] = None
 
     # Permission mode (switchable at runtime)
     permission_mode: str = "supervised"
@@ -629,6 +632,8 @@ class PersistentSession:
                     ),
                     sudo_action=shell_config.get("sudo_action", "freeze"),
                 )
+                if self.shell_owner_token is not None:
+                    workspace_backend.set_shell_owner_token(self.shell_owner_token)
                 # Only the internal attach API can attest that this exact SSH
                 # endpoint is paired to a Canvas generation and pinned host
                 # identity. Direct remote config, VMs, and legacy overrides all
@@ -644,6 +649,14 @@ class PersistentSession:
                 ).get("canvas_shared_browser_available") is True
                 loop = asyncio.get_event_loop()
                 await loop.run_in_executor(None, workspace_backend.connect)
+                if self.shell_owner_token is not None:
+                    # Promotion is eager, not lazy on the first shell tool: as
+                    # soon as claim N+1 attaches, a stale N backend must fail
+                    # even during an LLM-only turn.
+                    await loop.run_in_executor(
+                        None,
+                        workspace_backend.claim_shell_owner,
+                    )
                 logger.info(
                     f"Remote workspace backend connected to {remote_cfg['host']}"
                 )
@@ -2252,6 +2265,42 @@ class PersistentSession:
         except Exception as e:
             logger.warning(f"Failed to initialize ShellManager (non-fatal): {e}")
 
+    def set_shell_owner_token(self, lease_token: Optional[int]) -> None:
+        """Fence remote-shell mutations to the current stateless claim."""
+        if not self.workspace_manager:
+            return
+        from ..core.virtual_dirs import unwrap_backend
+
+        backend = unwrap_backend(self.workspace_manager.backend)
+        setter = getattr(backend, "set_shell_owner_token", None)
+        if setter is not None:
+            setter(lease_token)
+
+    @property
+    def stateless_warm_reuse_safe(self) -> bool:
+        """Whether this Python session may span stateless queue leases.
+
+        A shell-capable backend carries lease-fenced mutable state and may
+        still be referenced by cancelled sync work.  Its owner token must
+        therefore never be repointed in place for a later claim; lite
+        backends have no such agent-local physical-shell state.
+        """
+        backend = self._unwrapped_backend()
+        return backend is not None and not bool(
+            getattr(backend, "supports_shell", False)
+        )
+
+    def retire_shell_owner(self) -> None:
+        """Close this session's local admission to its remote shell."""
+        if not self.workspace_manager:
+            return
+        from ..core.virtual_dirs import unwrap_backend
+
+        backend = unwrap_backend(self.workspace_manager.backend)
+        retire = getattr(backend, "retire_shell_owner", None)
+        if retire is not None:
+            retire()
+
     def _setup_memory(
         self,
         postgres_conn: Optional[Any],
@@ -2469,8 +2518,30 @@ class PersistentSession:
         ):
             new_backend.connect()
 
-        # Disconnect old backend
-        if hasattr(old_backend, "disconnect") and hasattr(old_backend, "is_connected"):
+        # This is a genuine backend retirement, not a queue-claim detach. The
+        # deterministic tmux session belongs to the old workspace and must not
+        # leak after the live tier swap. Destroy it explicitly before the now
+        # transport-only disconnect.
+        if getattr(old_backend, "supports_shell", False):
+            try:
+                retire_shell_owner = getattr(old_backend, "retire_shell_owner", None)
+                if retire_shell_owner is not None:
+                    retire_shell_owner()
+                old_backend.shell_cleanup()
+            except Exception as e:
+                logger.warning(f"Old backend shell cleanup error: {e}")
+
+        # Permanently retire the old Python backend instance. A cancelled sync
+        # tool may still hold it in a worker thread; retirement prevents that
+        # stale object from reconnecting after the swap.
+        if hasattr(old_backend, "retire"):
+            try:
+                old_backend.retire()
+            except Exception as e:
+                logger.warning(f"Old backend retirement error: {e}")
+        elif hasattr(old_backend, "disconnect") and hasattr(
+            old_backend, "is_connected"
+        ):
             try:
                 if old_backend.is_connected():
                     old_backend.disconnect()
@@ -2492,8 +2563,29 @@ class PersistentSession:
             f"({getattr(new_backend, '_host', 'local')})"
         )
 
-    async def cleanup(self) -> None:
-        """Clean up session resources."""
+    async def cleanup(self, *, preserve_shell: bool = False) -> None:
+        """Clean up agent-local resources and disconnect the backend transport.
+
+        ``preserve_shell`` is the queue-claim/ownership handoff disposition:
+        the remote tmux session remains on the workspace for a later claimant.
+        Genuine thread end and backend retirement keep the default destructive
+        shell cleanup.
+        """
+        backend_for_cleanup = None
+        if self.workspace_manager:
+            from ..core.virtual_dirs import unwrap_backend
+
+            backend_for_cleanup = unwrap_backend(self.workspace_manager.backend)
+            retire_shell_owner = getattr(
+                backend_for_cleanup, "retire_shell_owner", None
+            )
+            if retire_shell_owner is not None:
+                # Close shell admission before any potentially slow mount,
+                # datasource, memory or Git teardown. Cancelled sync tool work
+                # may still hold this object in a thread; it must not submit
+                # another tmux command during the handoff.
+                retire_shell_owner()
+
         if self.tool_context is not None:
             self.tool_context.citation_verdict_callback = None
             self.tool_context.canvas_event_callback = None
@@ -2525,11 +2617,16 @@ class PersistentSession:
                 logger.warning(f"Cloud mount cleanup error: {e}")
             self.cloud_mount_manager = None
 
-        if self.shell_manager:
+        if self.shell_manager and not preserve_shell:
             try:
                 self.shell_manager.cleanup()
             except Exception as e:
                 logger.warning(f"Shell cleanup error: {e}")
+        elif self.shell_manager:
+            logger.info(
+                "Preserving remote shell for session handoff: thread=%s",
+                self.thread_id,
+            )
 
         # Close datasource connections
         if self.datasources or self._datasource_clients:
@@ -2548,10 +2645,18 @@ class PersistentSession:
                 logger.warning(f"Error closing knowledge graph: {e}")
             self._knowledge_graph = None
 
-        # Disconnect remote backend if connected
+        # Retire remote backend instances terminally. Merely disconnecting is a
+        # transport reset and would let cancelled sync work reconnect after the
+        # claim/session handoff.
         if self.workspace_manager:
-            backend = self.workspace_manager.backend
-            if hasattr(backend, "disconnect") and hasattr(backend, "is_connected"):
+            backend = backend_for_cleanup
+            if hasattr(backend, "retire"):
+                try:
+                    backend.retire()
+                    logger.info("Remote workspace backend retired")
+                except Exception as e:
+                    logger.warning(f"Backend retirement error: {e}")
+            elif hasattr(backend, "disconnect") and hasattr(backend, "is_connected"):
                 try:
                     if backend.is_connected():
                         backend.disconnect()

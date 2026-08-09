@@ -747,7 +747,11 @@ async def _drain_suspend_session() -> None:
     # makes the SIGTERM shutdown handler a no-op when the orchestrator
     # deletes this pod as part of the suspend.
     try:
-        await _terminate_session("drain", mark_thread=False)
+        await _terminate_session(
+            "drain",
+            mark_thread=False,
+            preserve_shell=False,
+        )
     except Exception as e:
         logger.warning(f"Session teardown during drain-suspend failed: {e}")
 
@@ -1818,7 +1822,10 @@ async def _cleanup_failed_event_journal_attach(thread_id: str) -> None:
             tool_context.citation_verdict_callback = None
             tool_context.canvas_event_callback = None
         try:
-            await failed_session.cleanup()
+            # Attach failure never owns thread lifecycle. In particular, a
+            # successor claimant may need the deterministic remote tmux left by
+            # the previous owner, so partial-attach cleanup is transport-only.
+            await failed_session.cleanup(preserve_shell=True)
         except Exception as exc:
             logger.warning(
                 "Failed to clean partial session after event-journal error "
@@ -2301,9 +2308,19 @@ async def _attach_session(
     )
 
     # Create PersistentSession
+    live_lease = _current_lease_var.get()
+    shell_owner_token = None
+    if live_lease is not None and live_lease.active:
+        if str(live_lease.unit_id) != str(_thread_id):
+            raise RuntimeError(
+                "Stateless lease identity does not match the session being attached"
+            )
+        shell_owner_token = live_lease.lease_token
+
     _session = PersistentSession(
         thread_id=_thread_id,
         config=effective_config,
+        shell_owner_token=shell_owner_token,
         project_ids=project_ids or [],
         datasources=datasources_dict,
         knowledge_bindings=knowledge_bindings,
@@ -2608,7 +2625,12 @@ async def _attach_session(
     logger.info(f"Session attached: thread={_thread_id} events_epoch={_events_epoch}")
 
 
-async def _terminate_session(reason: str, *, mark_thread: bool = True) -> None:
+async def _terminate_session(
+    reason: str,
+    *,
+    mark_thread: bool = True,
+    preserve_shell: Optional[bool] = None,
+) -> None:
     """Tear down the current session and return to idle.
 
     Called by:
@@ -2635,7 +2657,10 @@ async def _terminate_session(reason: str, *, mark_thread: bool = True) -> None:
          uses that to keep status authority with the orchestrator, which
          flips the thread to 'suspended' instead.
       3. Git commit + push.
-      4. Clean up session resources.
+      4. Clean up session resources. ``preserve_shell`` is an independent
+         ownership disposition: true for a claim/pod handoff, false for a
+         genuine thread end. When omitted it follows ``not mark_thread`` for
+         back-compat, but losing an exact pinned binding always forces preserve.
       5. Clear session globals AND headless input primitives + subscribers.
       6. Increment session counter, exit if max reached.
 
@@ -2653,12 +2678,21 @@ async def _terminate_session(reason: str, *, mark_thread: bool = True) -> None:
         return
     _terminating = True
     try:
-        await _terminate_session_inner(reason, mark_thread=mark_thread)
+        await _terminate_session_inner(
+            reason,
+            mark_thread=mark_thread,
+            preserve_shell=preserve_shell,
+        )
     finally:
         _terminating = False
 
 
-async def _terminate_session_inner(reason: str, *, mark_thread: bool = True) -> None:
+async def _terminate_session_inner(
+    reason: str,
+    *,
+    mark_thread: bool = True,
+    preserve_shell: Optional[bool] = None,
+) -> None:
     """Body of _terminate_session — only reached holding the _terminating guard."""
     global _session, _thread_id, _sessions_served, _loop_task
     global _loop_user_queue, _loop_interrupt_flag, _loop_last_user_content
@@ -2670,6 +2704,9 @@ async def _terminate_session_inner(reason: str, *, mark_thread: bool = True) -> 
         return
 
     thread_id = _thread_id
+    preserve_remote_shell = (
+        not mark_thread if preserve_shell is None else preserve_shell
+    )
     logger.info(f"Terminating session: thread={thread_id} reason={reason}")
 
     # Cancel in-flight loop_task FIRST. Out-of-band callers (heartbeat-intent
@@ -2710,6 +2747,10 @@ async def _terminate_session_inner(reason: str, *, mark_thread: bool = True) -> 
             agent_id=pinned_control_owner
         )
         if not admission_closed:
+            # The reciprocal binding is the pinned owner's resource fence. A
+            # stale pod that lost it may close only its own transports; the
+            # successor can already be using the deterministic remote tmux.
+            preserve_remote_shell = True
             logger.info(
                 "Pinned control admission close skipped: exact binding moved "
                 "(thread=%s agent=%s)",
@@ -2736,6 +2777,7 @@ async def _terminate_session_inner(reason: str, *, mark_thread: bool = True) -> 
                     open_for_admission=False,
                 )
             ):
+                preserve_remote_shell = True
                 logger.info(
                     "Pinned lifecycle close lost ownership before status CAS "
                     "(thread=%s agent=%s)",
@@ -2828,8 +2870,14 @@ async def _terminate_session_inner(reason: str, *, mark_thread: bool = True) -> 
         finally:
             _event_writer = None
 
-    # Clean up session resources
-    await _session.cleanup()
+    # Shell ownership is deliberately separate from thread-status authority.
+    # Claim switches preserve by explicit/default disposition; a stale pinned
+    # owner that lost its reciprocal binding is forced to preserve above.
+    # This is deliberately after final Git: GitManager itself delegates through
+    # the remote shell. From here onward cleanup may mutate mount transports but
+    # no new tool/shell command is admitted.
+    _session.retire_shell_owner()
+    await _session.cleanup(preserve_shell=preserve_remote_shell)
 
     # Clear session state
     _session = None

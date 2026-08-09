@@ -3101,8 +3101,18 @@ class TestTerminateSession:
         # Minimal _session double that records when it's torn down.
         fake_session = MagicMock()
         fake_session.workspace_sync = None
-        fake_session.workspace_manager = None
-        fake_session.cleanup = AsyncMock(side_effect=lambda: order.append("cleanup"))
+        git_mgr = MagicMock()
+        git_mgr.is_active = True
+        git_mgr.has_uncommitted_changes.return_value = True
+        git_mgr.commit.side_effect = lambda *_: order.append("git_committed")
+        git_mgr.push.side_effect = lambda: order.append("git_pushed")
+        fake_session.workspace_manager = MagicMock(git_manager=git_mgr)
+        fake_session.cleanup = AsyncMock(
+            side_effect=lambda **_: order.append("cleanup")
+        )
+        fake_session.retire_shell_owner = MagicMock(
+            side_effect=lambda: order.append("shell_retired")
+        )
         mod._session = fake_session
 
         async def close_writer():
@@ -3116,14 +3126,96 @@ class TestTerminateSession:
         fake_writer.close = AsyncMock(side_effect=close_writer)
         mod._event_writer = fake_writer
 
-        with patch.object(mod, "_update_thread_status", new=AsyncMock()):
+        async def stop_controls():
+            order.append("controls_stopped")
+
+        with (
+            patch.object(mod, "_update_thread_status", new=AsyncMock()),
+            patch.object(
+                mod,
+                "_stop_thread_control_watcher",
+                new=AsyncMock(side_effect=stop_controls),
+            ),
+        ):
             await mod._terminate_session("test")
 
-        # Cancel happens first; journal drain precedes cleanup + identity clear.
-        assert order == ["loop_cancelled", "writer_closed", "cleanup"]
+        # Control admission closes first. The journal drains while the captured
+        # identity remains authoritative, then final Git (absent in this
+        # fixture) precedes shell retirement and cleanup.
+        assert order == [
+            "loop_cancelled",
+            "controls_stopped",
+            "git_committed",
+            "git_pushed",
+            "writer_closed",
+            "shell_retired",
+            "cleanup",
+        ]
         assert mod._session is None
         assert mod._loop_task is None
         assert mod._event_writer is None
+        fake_session.cleanup.assert_awaited_once_with(preserve_shell=False)
+
+    @pytest.mark.asyncio
+    async def test_mark_thread_false_preserves_shell_for_ownership_handoff(self):
+        import src.api.persistent_app as mod
+
+        mod._loop_task = None
+        mod._thread_id = "t-handoff"
+        mod._event_writer = None
+        mod._terminating = False
+        mod._max_sessions_per_process = 0
+        fake_session = MagicMock()
+        fake_session.workspace_sync = None
+        fake_session.workspace_manager = None
+        fake_session.cleanup = AsyncMock()
+        mod._session = fake_session
+
+        with patch.object(mod, "_update_thread_status", new=AsyncMock()) as update:
+            await mod._terminate_session("claim_switch", mark_thread=False)
+
+        update.assert_not_awaited()
+        fake_session.retire_shell_owner.assert_called_once_with()
+        fake_session.cleanup.assert_awaited_once_with(preserve_shell=True)
+
+    @pytest.mark.asyncio
+    async def test_moved_pinned_binding_forces_shell_preservation(self):
+        """A stale pinned pod must never destroy its successor's remote tmux."""
+        import src.api.persistent_app as mod
+
+        mod._loop_task = None
+        mod._thread_id = "t-binding-moved"
+        mod._event_writer = None
+        mod._terminating = False
+        mod._max_sessions_per_process = 0
+        fake_session = MagicMock()
+        fake_session.workspace_sync = None
+        fake_session.workspace_manager = None
+        fake_session.memory_service = None
+        fake_session.cleanup = AsyncMock()
+        mod._session = fake_session
+
+        with (
+            patch.object(mod, "_stateless_mode", return_value=False),
+            patch.object(mod, "_control_owner_agent_id", "agent-old"),
+            patch.object(
+                mod,
+                "_close_pinned_control_inbox",
+                new=AsyncMock(return_value=False),
+            ) as close_admission,
+            patch.object(mod, "_update_thread_status", new=AsyncMock()) as update,
+            patch.object(mod, "_stop_thread_control_watcher", new=AsyncMock()),
+        ):
+            await mod._terminate_session(
+                "binding_moved",
+                mark_thread=True,
+                preserve_shell=False,
+            )
+
+        close_admission.assert_awaited_once_with(agent_id="agent-old")
+        update.assert_not_awaited()
+        fake_session.retire_shell_owner.assert_called_once_with()
+        fake_session.cleanup.assert_awaited_once_with(preserve_shell=True)
 
     @pytest.mark.asyncio
     async def test_clears_headless_input_primitives(self):
@@ -3232,7 +3324,7 @@ class TestAttachSessionEventJournalFailure:
                 await mod._attach_session("thread-journal-failure")
 
         assert len(instances) == 1
-        instances[0].cleanup.assert_awaited_once()
+        instances[0].cleanup.assert_awaited_once_with(preserve_shell=True)
         assert instances[0].tool_context.citation_verdict_callback is None
         writer_cls.assert_not_called()
         broadcast.assert_not_called()

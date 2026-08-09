@@ -604,7 +604,12 @@ def create_shell_tools(context: ToolContext) -> List[Any]:
                 is_special = command in TMUX_SPECIAL_KEYS or command.startswith(
                     ("C-", "M-")
                 )
-                result = sm.send(name, command, enter=not is_special)
+                result = sm.send(
+                    name,
+                    command,
+                    enter=not is_special,
+                    allow_busy=True,
+                )
                 # Sudo intercept: trigger freeze for VM upgrade
                 freeze_msg = _check_sudo_freeze(result, command, context)
                 if freeze_msg:

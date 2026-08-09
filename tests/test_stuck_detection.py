@@ -15,7 +15,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
-from unittest.mock import MagicMock, AsyncMock, patch
+from unittest.mock import MagicMock, AsyncMock, call, patch
 
 import pytest
 from langchain_core.messages import AIMessage, ToolMessage, SystemMessage
@@ -913,8 +913,11 @@ class TestToolNodeTimeoutEscalation:
         assert "timed out" in (msgs[0].content or "").lower()
         assert elapsed >= 1.0
         assert elapsed < 2.0
-        backend.disconnect.assert_called_once()
-        backend.connect.assert_called_once()
+        assert backend.method_calls == [
+            call.shell_reset_after_timeout(),
+            call.disconnect(),
+            call.connect(),
+        ]
 
     @pytest.mark.asyncio
     async def test_tool_node_timeout_repeated_raises_workspace_unavailable(self):
@@ -958,6 +961,7 @@ class TestToolNodeTimeoutEscalation:
                     )
                 )
 
+        assert backend.shell_reset_after_timeout.call_count == 1
         assert backend.disconnect.call_count == 1
         assert backend.connect.call_count == 1
 
@@ -1000,8 +1004,57 @@ class TestToolNodeTimeoutEscalation:
                     )
                 )
 
-        backend.disconnect.assert_called_once()
-        backend.connect.assert_called_once()
+        assert backend.method_calls == [
+            call.shell_reset_after_timeout(),
+            call.disconnect(),
+            call.connect(),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_tool_node_timeout_reset_failure_never_reconnects(self):
+        """An unproven shell reset must stop recovery before transport reuse."""
+
+        fake_tool = MagicMock()
+        fake_tool.name = "run_command"
+        cfg = FakeConfig(
+            limits=LimitsConfig(
+                tool_category_timeouts={"default": 1},
+            )
+        )
+
+        async def slow_ainvoke(_):
+            await asyncio.sleep(1.25)
+            return {"messages": [make_tool_result("run_command", "ok", "call_t")]}
+
+        backend = MagicMock()
+        backend.shell_reset_after_timeout.side_effect = RuntimeError("fence moved")
+        ctx = MagicMock()
+        ctx.workspace_manager = MagicMock(backend=backend)
+        ctx.consume_freeze_request.return_value = None
+        ctx.drain_pending_memories.return_value = []
+
+        with patch("src.graph.ToolNode") as MockToolNode:
+            mock_tn = AsyncMock()
+            mock_tn.ainvoke = slow_ainvoke
+            MockToolNode.return_value = mock_tn
+
+            audited = create_audited_tool_node([fake_tool], cfg, tool_context=ctx)
+            with pytest.raises(WorkspaceUnavailableError):
+                await audited(
+                    make_state(
+                        [
+                            make_tool_call(
+                                "run_command",
+                                {"command": "sleep 5"},
+                                "call_t",
+                            )
+                        ]
+                    )
+                )
+
+        backend.shell_reset_after_timeout.assert_called_once_with()
+        backend.disconnect.assert_not_called()
+        backend.connect.assert_not_called()
 
 
 # =============================================================================

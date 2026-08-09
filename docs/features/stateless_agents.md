@@ -953,7 +953,19 @@ One generic image; two Deployments (interactive: warm floor ≥ 2 sized per §2'
    to DB/object storage or become explicitly disposable; an agent PVC would not
    repair them. Full inventory and per-item decisions are in the implementation
    log; remediation is not DONE.
-2. **tmux reattach-if-exists** (backend `_init_shell` kill-recreates; `disconnect()` kills) + tab-state rehydration from `list-windows`, or shell state declared batch-scoped.
+2. **Remote-shell handoff substrate is built, but physical admission remains
+   closed.** `disconnect()` is transport-only, queue handoff preserves tmux,
+   and a successor reconstructs validated tab/pane/setup/pending state. A
+   workspace-side `active | creating | retired` record plus the queue lease
+   token fences create, promotion, command submission and teardown; commands
+   carry strict completion sentinels rather than trusting prompt text. A direct
+   k3d exercise handed exported environment and cwd between two different
+   stateless pods and rejected the stale claimant. This is deliberately more
+   than the old "reattach-if-exists" prerequisite: before enabling sandbox,
+   ownership still must bind to the authoritative workspace/runtime
+   incarnation, lifecycle retirement failures must be reconciled, and the
+   correctness lock/marker must move outside the workload user's writable
+   authority (or that cooperative-only threat boundary must be accepted).
 3. **Message fidelity** (§5.3.6) — also a prerequisite of the byte-determinism requirement.
 4. **Epoch/seq/fence redesign** (§5.3.2) before any stateless session traffic and **before P5** (dependency recorded in the session-reliability doc; if P5 lands first, the epoch change must still precede stateless traffic with `/events/head` kept stable).
 5. **Path-A resume-compaction persistence** (§5.3.3) — else per-claim aux-LLM re-summarization.
@@ -1111,9 +1123,16 @@ also refuse stateless rows before provisioning or persistence. A live
 declared-virtual/physically-remote probe returned 409 for input and control with
 message/control/queue counts unchanged. The gate stays until S2 acceptance
 passes. The §6.1 inventory is recorded and corrects the agent-PVC premise, but
-its RAM/path-bypass remediations are not built. SSH affinity,
-tmux reattach-if-exists, cloud-push generation fencing, outbox re-homing, the
-two resident daemons and presence re-home are outstanding.
+its RAM/path-bypass remediations are not built. The gate-closed SSH/tmux
+handoff substrate is now built and directly k3d-verified across two stateless
+pods: environment and cwd survived, and the stale lease token could not mutate
+the successor. The chart supplies the existing read-only workspace SSH key and
+allows only SSH/CDP workspace ingress for the stateless Deployment. This does
+**not** remove the gate: workspace/runtime-incarnation authority, durable
+terminal-retirement acknowledgement, a control-plane-owned fence, cloud-push
+generation ordering, outbox re-homing, the two resident daemons and presence
+re-home are outstanding. The direct proof did not enqueue a turn or change a
+sandbox thread's lane.
 
 **S3** (workers): **Gates 1 and 2 are built and merged**; worker admission stays
 closed. No `worker_batch` unit has ever been enqueued and no job carries a

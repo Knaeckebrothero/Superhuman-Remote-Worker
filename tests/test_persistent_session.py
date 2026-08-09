@@ -8,7 +8,7 @@ swap_backend(), get_workspace_content(), cleanup().
 
 import uuid
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 
@@ -819,6 +819,42 @@ class TestSetupWorkspace:
         assert mock_remote.supports_canvas_live_apps is False
         assert mock_remote.supports_canvas_shared_browser is False
         assert session.workspace_manager is not None
+
+    @pytest.mark.asyncio
+    async def test_stateless_owner_is_bound_and_promoted_during_remote_attach(self):
+        cfg = _make_config(
+            ws_backend="sandbox",
+            ws_remote={"host": "10.0.0.1", "port": 22, "key_path": "/key"},
+        )
+        session = _make_session(config=cfg)
+        session.shell_owner_token = 23
+        order = []
+        mock_remote = MagicMock()
+        mock_remote.set_shell_owner_token.side_effect = lambda token: order.append(
+            ("token", token)
+        )
+        mock_remote.connect.side_effect = lambda: order.append(("connect", None))
+        mock_remote.claim_shell_owner.side_effect = lambda: order.append(
+            ("claim", None)
+        )
+
+        with (
+            patch("src.api.persistent_session.WorkspaceManager") as MockWM,
+            patch("src.api.persistent_session.WorkspaceManagerConfig"),
+            patch.dict(
+                "sys.modules",
+                {
+                    "src.core.backends.remote": MagicMock(
+                        RemoteBackend=MagicMock(return_value=mock_remote)
+                    )
+                },
+            ),
+        ):
+            MockWM.return_value.path = "/tmp/test"
+            MockWM.return_value.initialize = MagicMock()
+            await session._setup_workspace()
+
+        assert order == [("token", 23), ("connect", None), ("claim", None)]
 
     @pytest.mark.asyncio
     async def test_attested_sandbox_override_enables_canvas_presentation(self):
@@ -2603,6 +2639,19 @@ class TestSetupKnowledge:
 # ---------------------------------------------------------------------------
 
 
+class TestShellOwnerLifecycle:
+    def test_session_forwards_owner_token_and_terminal_retirement(self):
+        session = _make_session()
+        backend = MagicMock()
+        session.workspace_manager = MagicMock(backend=backend)
+
+        session.set_shell_owner_token(17)
+        session.retire_shell_owner()
+
+        backend.set_shell_owner_token.assert_called_once_with(17)
+        backend.retire_shell_owner.assert_called_once_with()
+
+
 class TestSwapBackend:
     def test_raises_when_workspace_manager_none(self):
         """RuntimeError raised when workspace_manager is None."""
@@ -2645,9 +2694,9 @@ class TestSwapBackend:
         new_backend.connect.assert_not_called()
 
     def test_disconnects_old_backend_when_connected(self):
-        """Disconnects old backend when it has disconnect+is_connected and is connected."""
+        """Legacy backends without retire still receive transport disconnect."""
         session = _make_session()
-        old_backend = MagicMock()
+        old_backend = MagicMock(spec=["is_connected", "disconnect"])
         old_backend.is_connected.return_value = True
         old_backend.disconnect = MagicMock()
 
@@ -2663,10 +2712,37 @@ class TestSwapBackend:
 
         old_backend.disconnect.assert_called_once()
 
+    def test_remote_backend_swap_destroys_old_shell_before_retire(self):
+        """A workspace retirement destroys tmux; it is not a claim handoff."""
+        session = _make_session()
+        old_backend = MagicMock()
+        old_backend.supports_shell = True
+        old_backend.is_connected.return_value = True
+        mock_wm = MagicMock()
+        mock_wm.backend = old_backend
+        session.workspace_manager = mock_wm
+
+        new_backend = MagicMock()
+        new_backend.is_connected.return_value = True
+        lifecycle = MagicMock()
+        lifecycle.attach_mock(old_backend.retire_shell_owner, "retire_shell_owner")
+        lifecycle.attach_mock(old_backend.shell_cleanup, "shell_cleanup")
+        lifecycle.attach_mock(old_backend.retire, "retire")
+
+        with patch.object(session, "_setup_shell_manager"):
+            session.swap_backend(new_backend)
+
+        assert lifecycle.mock_calls[:3] == [
+            call.retire_shell_owner(),
+            call.shell_cleanup(),
+            call.retire(),
+        ]
+        old_backend.disconnect.assert_not_called()
+
     def test_old_backend_disconnect_exception_non_fatal(self):
         """Exception during old backend disconnect is non-fatal."""
         session = _make_session()
-        old_backend = MagicMock()
+        old_backend = MagicMock(spec=["is_connected", "disconnect"])
         old_backend.is_connected.return_value = True
         old_backend.disconnect.side_effect = RuntimeError("disconnect failed")
 
@@ -2973,6 +3049,45 @@ class TestCleanup:
         mock_sm.cleanup.assert_called_once()
 
     @pytest.mark.asyncio
+    async def test_cleanup_preserves_shell_but_retires_local_owner_on_handoff(self):
+        session = _make_session()
+        shell_manager = MagicMock()
+        backend = MagicMock()
+        backend.is_connected.return_value = True
+        session.shell_manager = shell_manager
+        session.workspace_manager = MagicMock(backend=backend)
+
+        await session.cleanup(preserve_shell=True)
+
+        shell_manager.cleanup.assert_not_called()
+        backend.retire_shell_owner.assert_called_once_with()
+        backend.retire.assert_called_once_with()
+        backend.disconnect.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_cleanup_destroys_shell_before_backend_retirement_on_genuine_end(
+        self,
+    ):
+        session = _make_session()
+        shell_manager = MagicMock()
+        backend = MagicMock()
+        backend.is_connected.return_value = True
+        session.shell_manager = shell_manager
+        session.workspace_manager = MagicMock(backend=backend)
+        lifecycle = MagicMock()
+        lifecycle.attach_mock(backend.retire_shell_owner, "retire_shell_owner")
+        lifecycle.attach_mock(shell_manager.cleanup, "shell_cleanup")
+        lifecycle.attach_mock(backend.retire, "retire")
+
+        await session.cleanup()
+
+        assert lifecycle.mock_calls[:3] == [
+            call.retire_shell_owner(),
+            call.shell_cleanup(),
+            call.retire(),
+        ]
+
+    @pytest.mark.asyncio
     async def test_shell_cleanup_exception_non_fatal(self):
         """Shell cleanup exception doesn't prevent further cleanup."""
         session = _make_session()
@@ -2986,8 +3101,8 @@ class TestCleanup:
         await session.cleanup()
 
     @pytest.mark.asyncio
-    async def test_cleanup_disconnects_remote_backend(self):
-        """cleanup() disconnects remote backend when connected."""
+    async def test_cleanup_retires_remote_backend(self):
+        """cleanup() terminally retires a remote backend instance."""
         session = _make_session()
         session.shell_manager = None
         mock_backend = MagicMock()
@@ -2998,14 +3113,16 @@ class TestCleanup:
 
         await session.cleanup()
 
-        mock_backend.disconnect.assert_called_once()
+        mock_backend.retire_shell_owner.assert_called_once()
+        mock_backend.retire.assert_called_once()
+        mock_backend.disconnect.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_cleanup_skips_disconnected_backend(self):
         """cleanup() skips disconnect when backend not connected."""
         session = _make_session()
         session.shell_manager = None
-        mock_backend = MagicMock()
+        mock_backend = MagicMock(spec=["is_connected", "disconnect"])
         mock_backend.is_connected.return_value = False
         mock_wm = MagicMock()
         mock_wm.backend = mock_backend
@@ -3020,7 +3137,7 @@ class TestCleanup:
         """Backend disconnect exception is non-fatal."""
         session = _make_session()
         session.shell_manager = None
-        mock_backend = MagicMock()
+        mock_backend = MagicMock(spec=["is_connected", "disconnect"])
         mock_backend.is_connected.return_value = True
         mock_backend.disconnect.side_effect = RuntimeError("disconnect failed")
         mock_wm = MagicMock()
