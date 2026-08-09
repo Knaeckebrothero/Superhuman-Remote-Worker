@@ -20,7 +20,7 @@ related:
 
 > Every agent tool call — in a live session or the debug audit trail — should render through **one** schema-driven card: tool name, input parameters, the result the model saw, and optional execution details. Expanding any card should look the same and tell you the same things, regardless of tool or data source.
 
-**Status:** Slice 1 (schema + registry + `<app-tool-card>` + persistent-chat wiring) shipped + **live-verified on k3d 2026-06-17**. Slices 2–3 pending. **Slice 4 — the job card: BUILT + partially live-gated 2026-07-29** (API contract verified, three bugs found and fixed; visual pass still owed) — see [Slice 4 — what shipped](#slice-4--what-shipped-2026-07-29) and [Live gate](#live-gate-on-dev-2026-07-29--partial-and-it-found-three-bugs). It is the first card that outlives its tool call and the first to carry actions, so it extends the schema rather than just adding a descriptor.
+**Status:** Slice 1 (schema + registry + `<app-tool-card>` + persistent-chat wiring) shipped + **live-verified on k3d 2026-06-17**. Slices 2–3 pending. **Slice 4 — the job card: BUILT + LIVE-GATED.** API contract verified on dev 2026-07-29 (three bugs found and fixed); UI gate passed on local k3d 2026-08-08. See [what shipped](#slice-4--what-shipped-2026-07-29), the [dev gate](#live-gate-on-dev-2026-07-29--partial-and-it-found-three-bugs) and the [UI gate](#ui-gate-on-local-k3d-2026-08-08--passed). Only the Mode-A `Open diff` path is still unexercised. It is the first card that outlives its tool call and the first to carry actions, so it extends the schema rather than just adding a descriptor.
 **Closes:** `session_turn_rendering.md` deferred decision #5 ("whether tool_result content gets its own collapse level inside the tool card or is always visible").
 
 ## Live verification (slice 1, 2026-06-17)
@@ -463,11 +463,36 @@ output (now pinned as a test — note the receipt repeats the id inside a
 `get_worker_job(...)` hint, so label-anchoring matters), and `diff_status` was
 `None` on the test job, so Open-diff correctly stayed hidden.
 
-**Still owed:** the visual pass — card renders with the descriptor title rather
-than the generic fallback, status chip updates live, polling stops at terminal,
-Approve appears only at `pending_review`, Open-diff opens the drawer. Dev
-currently has **no job with `diff_status='pending'`**, so exercising Open-diff
-needs a Mode-A diff job seeded first.
+### UI gate on local k3d (2026-08-08) — PASSED
+
+The remote dev cockpit sits behind Keycloak, and driving that login is not
+something automation should do, so the UI pass ran against the **local k3d
+stack** (`https://localhost`, namespace `srw`, already authenticated as the
+repo's `test` fixture user). Playwright, real session, real job
+(`3b51895c` / `1998565d`).
+
+| Check | Result |
+|---|---|
+| Descriptor, not the generic fallback | title `Schedule job`, hint = the task |
+| Live status while running | badge `processing` + spinner, panel visible **without expanding** the card |
+| It actually polls | repeated `GET /api/jobs/{id}` |
+| Survives history replay | after a full reload the card rebuilt from the persisted tool result, id intact |
+| Actions gated on **fresh** status | running → `Cancel job` only; at `pending_review` → `Approve`, `Open diff`, `Cancel job` |
+| **The `asRecord` fix** | summary rendered: *"Successfully wrote a two-line note about idempotency…"* — impossible before it |
+| Approve end-to-end | click → DB flips to `completed`, `freeze_data` cleared, card refreshes to `completed` with **no** buttons |
+| Summary disappears after approval | correct — approval clears `freeze_data`, as the code comment predicts |
+| **Polling stops at terminal** | 7 polls before, 7 after 2.5 poll intervals |
+| Console | zero card-originated errors |
+
+Two notes for whoever repeats this. A Tilt rebuild landed mid-run and 504'd the
+page; every console error in the transcript is `ERR_NETWORK_CHANGED` on the three
+SSE streams retrying through it, none from `/api/jobs`. That accident produced
+useful evidence: the SSE streams kept retrying while the job poller stayed
+stopped, so the terminal gate is a real predicate and not just a dead network.
+
+**Still unexercised:** `Open diff` was rendered and clickable at
+`pending_review` but the drawer itself was not opened, and no job anywhere has
+`diff_status='pending'`, so the Mode-A diff path remains untested end-to-end.
 
 ### Open questions (slice 4)
 

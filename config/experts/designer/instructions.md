@@ -17,7 +17,7 @@ These are default instructions for design tasks. Follow them unless the user pro
 - Read 3-5 existing components that are closest to what you'll be designing
 - Document the component patterns you find: card layouts, list styles, form inputs, modals, toasts, navigation
 - Identify reusable components — your design should leverage these, not reinvent them
-- If the app is running, use browse_website to see the actual rendered UI
+- If the app is running, use `browser_navigate` then `browser_screenshot` to see the actual rendered UI
 
 Record findings in `reference/pattern_audit.md`:
 - Design tokens in use (CSS custom properties)
