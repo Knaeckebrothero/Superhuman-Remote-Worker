@@ -79,6 +79,7 @@ describe('JobToolCardPanelComponent — resume with feedback', () => {
                 TranslocoTestingModule.forRoot({
                     langs: {
                         en: {
+                            jobs: {status: {pending_review: 'Pending Review', failed: 'Failed'}},
                             toolCard: {
                                 job: {
                                     approve: 'Approve',
@@ -138,6 +139,21 @@ describe('JobToolCardPanelComponent — resume with feedback', () => {
     }
 
     afterEach(() => TestBed.resetTestingModule());
+
+    it('shows the status in the product\'s words, not the database enum', async () => {
+        await render('pending_review');
+        // The harness below translates jobs.status.pending_review; the card used
+        // to print the raw `pending_review`, underscore and all, next to a Jobs
+        // page that said "Pending Review" for the same row.
+        expect(root().querySelector('app-badge')?.textContent?.trim()).toBe('Pending Review');
+    });
+
+    it('falls back to the raw status rather than printing a bare i18n key', async () => {
+        // waiting_for_reply is in the jobs.status CHECK constraint; a status with
+        // no translation must degrade to something a human can still act on.
+        await render('some_new_status');
+        expect(root().querySelector('app-badge')?.textContent?.trim()).toBe('some_new_status');
+    });
 
     it('offers the action on a job frozen for review', async () => {
         await render('pending_review');
