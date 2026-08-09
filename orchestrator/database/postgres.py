@@ -8590,6 +8590,21 @@ class PostgresDB:
 
         return _datasource_row_to_dict(row) if row else None
 
+    async def get_datasource_tombstones(self, ids: list[str]) -> dict[str, str]:
+        """Names of deleted connectors, for labelling drifted session config."""
+        if not ids:
+            return {}
+        try:
+            uuids = [UUID(str(value)) for value in ids]
+        except (TypeError, ValueError):
+            return {}
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT id, name FROM datasource_tombstones WHERE id = ANY($1::uuid[])",
+                uuids,
+            )
+        return {str(row["id"]): row["name"] for row in rows}
+
     async def create_datasource(
         self,
         name: str,
@@ -9315,10 +9330,58 @@ class PostgresDB:
                         raise DatasourceScopeAuthorizationError(
                             "Connector mutation exceeds the caller's project scope"
                         )
-                result = await conn.execute(
-                    "DELETE FROM datasources WHERE id = $1",
-                    uuid_val,
-                )
+
+                # A scoped delete is already inside the transaction opened
+                # above by `_transaction_if`. An unscoped delete is not, so
+                # open one here — otherwise a crash between the DELETE and
+                # the scrub below could delete the connector while leaving
+                # dangling thread references behind.
+                async with _transaction_if(conn, authority_scope_uuid is None):
+                    doomed = await conn.fetchrow(
+                        "SELECT name FROM datasources WHERE id = $1",
+                        uuid_val,
+                    )
+                    result = await conn.execute(
+                        "DELETE FROM datasources WHERE id = $1",
+                        uuid_val,
+                    )
+                    if result == "DELETE 1":
+                        # A deleted row cannot supply its own name later, so
+                        # keep one for sessions that still reference it.
+                        await conn.execute(
+                            """
+                            INSERT INTO datasource_tombstones (id, name)
+                            VALUES ($1, $2)
+                            ON CONFLICT (id) DO NOTHING
+                            """,
+                            uuid_val,
+                            (doomed or {}).get("name") or str(uuid_val),
+                        )
+                        # Scrub the reference so new dangling ids stop
+                        # accumulating. Sessions already carrying one are
+                        # recovered by the acknowledgment flow, not by this.
+                        await conn.execute(
+                            """
+                            UPDATE threads
+                            SET metadata = jsonb_set(
+                                    metadata,
+                                    '{datasource_ids}',
+                                    COALESCE(
+                                        (
+                                            SELECT jsonb_agg(value)
+                                            FROM jsonb_array_elements_text(
+                                                metadata->'datasource_ids'
+                                            ) AS value
+                                            WHERE value <> $1::text
+                                        ),
+                                        '[]'::jsonb
+                                    )
+                                )
+                            WHERE jsonb_typeof(metadata->'datasource_ids') = 'array'
+                              AND metadata->'datasource_ids' ? $1::text
+                            """,
+                            str(uuid_val),
+                        )
 
         return result == "DELETE 1"
 
