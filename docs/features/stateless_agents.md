@@ -1030,12 +1030,13 @@ Sequencing: this lands **after** step 1 below, so the three items S2 has blocked
 behind it (exact `llm_requests` archival, turn-end memory capture, post-callback
 Git turn→SHA ordering) wait on the substrate rather than on all of Gate 3.
 
-**Migration numbering:** S1 used 0115–0121; S2 used **0122–0129** (all consumed);
-**Gate 3 owns 0130–0149**. The wider range is deliberate — S2 was allocated eight
-numbers, used all eight, and stopped partly because it had none left, which was
-an allocation error rather than a design constraint. Range allocation itself
-remains necessary: the earlier dev-cluster wedge came from two tracks numbering
-independently against one shared database.
+**Migration numbering:** S1 used 0115–0121; S2 used **0122–0129** (all
+consumed); Gate 3 step 1 used **0130–0132**; the **worker driver owns
+0133–0139**; **Gate 3 steps 2+ keep 0140–0149**. The wider ranges are deliberate
+— S2 was allocated eight numbers, used all eight, and stopped partly because it
+had none left, which was an allocation error rather than a design constraint.
+Range allocation itself remains necessary: the earlier dev-cluster wedge came
+from two tracks numbering independently against one shared database.
 
 ##### Why not adopt a durable-execution engine
 
