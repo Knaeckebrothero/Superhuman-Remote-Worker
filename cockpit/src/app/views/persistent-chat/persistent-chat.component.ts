@@ -28,6 +28,7 @@ import {CitationRefDirective} from '../../core/markdown/citation-ref.directive';
 import {KatexDirective} from '../../core/markdown/katex.directive';
 import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
 import {ChatAttachment, PermissionRequest, PersistentChatService, RunningToolInfo, ToolCallInfo,} from '../../core/services/persistent-chat.service';
+import {uploadSummary} from '../../core/services/upload-stage';
 import {
     AssistantTurn,
     collapsedAnswer,
@@ -356,6 +357,19 @@ export function cloudBadgeVisible(protectedCloud: boolean, count: number): boole
 
 export function canSendMessage(canCompose: boolean, text: string, attachmentCount: number): boolean {
     return canCompose && (text.trim().length > 0 || attachmentCount > 0);
+}
+
+/**
+ * Which label a queued bubble shows for its send stage. One line, one concept:
+ * the upload and the POST are phases of the same commitment, so the label
+ * changes and the indicator does not. Win32's rule — never reset progress
+ * between phases, never reach 100% before the operation completes.
+ */
+export function uploadStageKey(
+    summary: {done: number; total: number; allDone: boolean} | null,
+): string | null {
+    if (!summary || summary.total === 0) return null;
+    return summary.allDone ? 'chat.upload.sending' : 'chat.upload.stage';
 }
 
 /**
@@ -1207,7 +1221,8 @@ export function clearDraft(threadId: string | null): void {
               <div class="message message-user"
                    [class.historical]="turn.historical"
                    [class.queued]="queued"
-                   [class.stalled]="stalled">
+                   [class.stalled]="stalled"
+                   [attr.aria-busy]="queued ? 'true' : null">
                 <div class="avatar">
                   @if (stalled) {
                     <!-- Not "waiting to send" — the send actually failed. -->
@@ -1249,6 +1264,15 @@ export function clearDraft(threadId: string | null): void {
                         </span>
                       }
                     </div>
+                  }
+                  @if (queued && !stalled) {
+                    @let stage = uploadStage(turn.id);
+                    @if (stage) {
+                      <div class="upload-stage" aria-live="polite">
+                        <app-icon size="sm">upload</app-icon>
+                        <span>{{ stage.key | transloco: stage.params }}</span>
+                      </div>
+                    }
                   }
                   <!-- Stalled queue: the flush has no timed auto-retry, so
                        without these the bubble spins on "sending" forever. -->
@@ -1966,7 +1990,7 @@ export function clearDraft(threadId: string | null): void {
               <button
                 type="button"
                 class="ctrl"
-                [disabled]="!chat.isConnected() || chat.isUploadingAttachments()"
+                [disabled]="!chat.isConnected()"
                 [title]="'chat.composer.attach' | transloco"
                 [class.active]="attachmentMenuOpen()"
                 (click)="attachmentMenuOpen() ? closeAttachmentMenu() : openAttachmentMenu()"
@@ -1996,7 +2020,7 @@ export function clearDraft(threadId: string | null): void {
               <button
                 type="button"
                 class="ctrl"
-                [disabled]="!chat.isConnected() || chat.isUploadingAttachments()"
+                [disabled]="!chat.isConnected()"
                 [title]="'chat.composer.takePhoto' | transloco"
                 (click)="pickCamera()"
               >
@@ -2870,20 +2894,16 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         if (this.chat.isStreaming() || this.chat.isAwaitingTurn()) {
             return this.transloco.translate('chat.input.working');
         }
-        if (this.chat.isUploadingAttachments()) return this.transloco.translate('chat.input.uploading');
         // Mobile keyboards send newline on Enter, so the desktop key hints are wrong there.
         return this.transloco.translate(
             this.viewport.isMobile() ? 'chat.input.defaultMobile' : 'chat.input.default',
         );
     });
 
-    /** True while sends are queued (waiting for readiness / flushing) or files
-     *  are uploading — drives the send-button spinner. */
-    readonly isPendingSend = computed(
-        () =>
-            this.chat.outbox().length > 0 ||
-            this.chat.isUploadingAttachments(),
-    );
+    /** True while sends are queued — waiting for readiness, flushing, or mid
+     *  upload (an item stays in the outbox until every attachment resolves and
+     *  the POST is accepted) — drives the send-button spinner. */
+    readonly isPendingSend = computed(() => this.chat.outbox().length > 0);
 
     // Note: queueing is now supported, so canSend no longer blocks on a pending
     // send — the user can line up a second message while the first is in flight.
@@ -4023,6 +4043,21 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         if (!content) return '';
         const newlineIdx = content.indexOf('\n');
         return newlineIdx === -1 ? content : content.slice(0, newlineIdx);
+    }
+
+    /**
+     * The queued bubble's upload stage line: which i18n key to show and its
+     * interpolation params, or null once there's nothing left to report (no
+     * files on this item, or the item itself is gone — flushed, discarded, or
+     * carried over from a different thread). `params` always includes
+     * `done`/`total` — harmless on `chat.upload.sending`, which ignores them.
+     */
+    uploadStage(localId: string): {key: string; params: {done: number; total: number}} | null {
+        const files = this.chat.outboxItem(localId)?.pendingFiles;
+        if (!files) return null;
+        const summary = uploadSummary(files);
+        const key = uploadStageKey(summary);
+        return key ? {key, params: {done: summary.done, total: summary.total}} : null;
     }
 
     /**

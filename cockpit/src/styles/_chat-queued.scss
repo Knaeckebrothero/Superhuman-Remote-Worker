@@ -54,3 +54,15 @@
     }
   }
 }
+
+/* Upload stage line inside a queued user bubble. Lives here, not in the
+   component sheet, because persistent-chat.component.scss is ~0.5kB under its
+   anyComponentStyle budget (docs/issues/persistent_chat_component_style_budget.md). */
+.message.message-user.queued .message-body .upload-stage {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 6px;
+  font-size: 0.85em;
+  color: var(--text-secondary);
+}
