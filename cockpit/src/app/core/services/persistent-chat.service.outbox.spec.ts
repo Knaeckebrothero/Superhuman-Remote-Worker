@@ -20,7 +20,13 @@ import {IndexedDbService} from './indexed-db.service';
 import {NotificationService} from './notification.service';
 import {AppToastService} from '../../ui/toast';
 import {isUserTurn, UserTurn} from '../models/turn.model';
-import {FilePreview, FileType, ThreadUploadedFile, UploadStatus} from '../models/file.model';
+import {
+    FilePreview,
+    FileType,
+    ThreadUploadedFile,
+    ThreadUploadEvent,
+    UploadStatus,
+} from '../models/file.model';
 
 // --- Minimal transport mocks (mirrors the main service spec's scaffolding) ---
 
@@ -61,7 +67,7 @@ function createService() {
         delete: vi.fn().mockReturnValue(of({})),
     };
     const mockApi: any = {
-        uploadOneToThread: vi.fn().mockReturnValue(of([])),
+        uploadOneToThread: vi.fn().mockReturnValue(of(done())),
         humanizeUploadError: vi.fn().mockReturnValue('upload failed'),
     };
     const mockCache: any = {
@@ -168,6 +174,14 @@ const uploaded = (name: string): ThreadUploadedFile => ({
     mime_type: 'application/pdf',
     path: `uploads/${name}`,
 });
+
+/**
+ * The terminal event of an upload. Since Slice 2 `uploadOneToThread` emits an
+ * event union (progress*, then exactly one done) rather than a bare array, so
+ * every mock here has to speak it — a mock still returning `of([])` would be
+ * filtered out as a non-`done` event and read as an upload that never landed.
+ */
+const done = (...files: ThreadUploadedFile[]): ThreadUploadEvent => ({kind: 'done', files});
 
 describe('PersistentChatService — Phase 3 outbox', () => {
     let originalEs: any;
@@ -397,7 +411,7 @@ describe('PersistentChatService — Phase 3 outbox', () => {
     describe('upload as outbox stage 0', () => {
         it('dispatches the bubble and clears the composer before the upload resolves', async () => {
             const ctx = await readySession();
-            const gate = new Subject<ThreadUploadedFile[]>();
+            const gate = new Subject<ThreadUploadEvent>();
             ctx.mockApi.uploadOneToThread = vi.fn().mockReturnValue(gate);
 
             ctx.service.addAttachments([filePreview('a.pdf')]);
@@ -416,7 +430,7 @@ describe('PersistentChatService — Phase 3 outbox', () => {
             expect(ctx.service.pendingAttachments()).toEqual([]);
             expect(inputPosts(ctx).length).toBe(0);
 
-            gate.next([uploaded('a.pdf')]);
+            gate.next(done(uploaded('a.pdf')));
             gate.complete();
             await flushTick();
 
@@ -426,11 +440,86 @@ describe('PersistentChatService — Phase 3 outbox', () => {
             );
         });
 
+        it('writes upload progress onto the queued file, throttled to ~4 writes a second', async () => {
+            // Users attach 30-90MB PDFs; without this the bubble can only show
+            // an opaque indeterminate label for the whole wait. The throttle is
+            // not cosmetic: every write replaces the outbox array, which
+            // re-renders the bubble and trips the chat view's scroll
+            // ResizeObserver — and that observer re-pins to the bottom
+            // SYNCHRONOUSLY by design, so an unthrottled progress signal
+            // fights a user who scrolls up mid-upload.
+            const ctx = await readySession();
+            const gate = new Subject<ThreadUploadEvent>();
+            ctx.mockApi.uploadOneToThread = vi.fn().mockReturnValue(gate);
+            const t0 = 1_000_000;
+            const now = vi.spyOn(Date, 'now').mockReturnValue(t0);
+
+            ctx.service.addAttachments([filePreview('a.pdf')]);
+            void ctx.service.sendMessage('big one');
+            await flushTick();
+
+            const loaded = () => ctx.service.outbox()[0].pendingFiles![0].loaded;
+
+            // Leading edge: the first event of a burst lands immediately, so
+            // the bar never sits at 0 waiting out an interval.
+            gate.next({kind: 'progress', loaded: 10, total: 100});
+            expect(loaded()).toBe(10);
+
+            // Same 250ms window — dropped, even though the bytes did move.
+            now.mockReturnValue(t0 + 100);
+            gate.next({kind: 'progress', loaded: 20, total: 100});
+            now.mockReturnValue(t0 + 249);
+            gate.next({kind: 'progress', loaded: 30, total: 100});
+            expect(loaded()).toBe(10);
+
+            // Window elapsed — the next one goes through.
+            now.mockReturnValue(t0 + 250);
+            gate.next({kind: 'progress', loaded: 40, total: 100});
+            expect(loaded()).toBe(40);
+            expect(ctx.service.outbox()[0].pendingFiles![0].total).toBe(100);
+
+            // A dropped trailing event is invisible: `done` writes the
+            // terminal state, not the last progress event.
+            now.mockReturnValue(t0 + 260);
+            gate.next({kind: 'progress', loaded: 100, total: 100});
+            gate.next(done(uploaded('a.pdf')));
+            gate.complete();
+            await flushTick();
+
+            expect(ctx.service.outbox().length).toBe(0);
+            expect(inputPosts(ctx).length).toBe(1);
+            now.mockRestore();
+        });
+
+        it('drops a progress event whose item has left the queue', async () => {
+            // Same guard the `done` path gets: writing into a queue the user
+            // has navigated away from is the cross-thread mutation this phase
+            // exists to kill, and progress fires far more often than `done`.
+            const ctx = await readySession('t1');
+            const gate = new Subject<ThreadUploadEvent>();
+            ctx.mockApi.uploadOneToThread = vi.fn().mockReturnValue(gate);
+
+            ctx.service.addAttachments([filePreview('a.pdf')]);
+            void ctx.service.sendMessage('from-t1');
+            await flushTick();
+
+            await ctx.service.connect('t2'); // switch clears t1's queue
+            await ctx.service.sendMessage('from-t2'); // t2 not ready → queued
+            const queueBefore = ctx.service.outbox();
+
+            gate.next({kind: 'progress', loaded: 10, total: 100});
+
+            // Array identity is the observable difference an unguarded write
+            // makes: its .map matches nothing, so the contents are equal but
+            // the reference (and every downstream computed) changes.
+            expect(ctx.service.outbox()).toBe(queueBefore);
+        });
+
         it('patches the server path onto the bubble chip once the upload lands', async () => {
             const ctx = await readySession();
             // The server renamed it (a `_1` collision suffix): the chip must
             // show what actually landed, in place — not a second bubble.
-            ctx.mockApi.uploadOneToThread = vi.fn().mockReturnValue(of([uploaded('a_1.pdf')]));
+            ctx.mockApi.uploadOneToThread = vi.fn().mockReturnValue(of(done(uploaded('a_1.pdf'))));
 
             ctx.service.addAttachments([filePreview('a.pdf')]);
             await ctx.service.sendMessage('here');
@@ -484,7 +573,7 @@ describe('PersistentChatService — Phase 3 outbox', () => {
             const ctx = await readySession();
             const upload = vi
                 .fn()
-                .mockReturnValueOnce(of([uploaded('a.pdf')]))
+                .mockReturnValueOnce(of(done(uploaded('a.pdf'))))
                 .mockReturnValueOnce(throwError(() => new HttpErrorResponse({status: 503})));
             ctx.mockApi.uploadOneToThread = upload;
 
@@ -494,7 +583,7 @@ describe('PersistentChatService — Phase 3 outbox', () => {
             expect(ctx.service.outboxStalled()).toBe(true);
             expect(upload).toHaveBeenCalledTimes(2);
 
-            upload.mockReturnValue(of([uploaded('b.pdf')]));
+            upload.mockReturnValue(of(done(uploaded('b.pdf'))));
             ctx.service.retryQueuedSends();
             await flushTick();
 
@@ -509,7 +598,7 @@ describe('PersistentChatService — Phase 3 outbox', () => {
             // "the guard dropped it" is distinguishable from "connect emptied
             // the queue", and t2's own item must survive untouched.
             const ctx = await readySession('t1');
-            const gate = new Subject<ThreadUploadedFile[]>();
+            const gate = new Subject<ThreadUploadEvent>();
             ctx.mockApi.uploadOneToThread = vi.fn().mockReturnValue(gate);
 
             ctx.service.addAttachments([filePreview('a.pdf')]);
@@ -522,7 +611,7 @@ describe('PersistentChatService — Phase 3 outbox', () => {
 
             // The stale t1 upload resolves now — it must not POST, and must not
             // touch t2's queue.
-            gate.next([uploaded('a.pdf')]);
+            gate.next(done(uploaded('a.pdf')));
             gate.complete();
             await flushTick();
 
@@ -537,7 +626,7 @@ describe('PersistentChatService — Phase 3 outbox', () => {
             // thread must not overtake the stalled head. Both would collide on
             // the default turn_id and the second would be lost behind a 409.
             const ctx = await readySession('t1');
-            const gate = new Subject<ThreadUploadedFile[]>();
+            const gate = new Subject<ThreadUploadEvent>();
             ctx.mockApi.uploadOneToThread = vi.fn().mockReturnValue(gate);
 
             ctx.service.addAttachments([filePreview('a.pdf')]);
@@ -554,7 +643,7 @@ describe('PersistentChatService — Phase 3 outbox', () => {
             ]);
 
             // Upload lands → the queue drains FIFO, head first.
-            gate.next([uploaded('a.pdf')]);
+            gate.next(done(uploaded('a.pdf')));
             gate.complete();
             await flushTick();
 
@@ -572,7 +661,7 @@ describe('PersistentChatService — Phase 3 outbox', () => {
             // lock is per-thread: `turn_id` is per-thread, so two threads can
             // never collide on it.
             const ctx = await readySession('t1');
-            const gate = new Subject<ThreadUploadedFile[]>(); // never resolves
+            const gate = new Subject<ThreadUploadEvent>(); // never resolves
             ctx.mockApi.uploadOneToThread = vi.fn().mockReturnValue(gate);
 
             ctx.service.addAttachments([filePreview('a.pdf')]);
@@ -599,8 +688,8 @@ describe('PersistentChatService — Phase 3 outbox', () => {
             // the dropped item's upload then orphans in t2's workspace — no
             // delete endpoint, no way back.
             const ctx = await readySession('t1');
-            const gate1 = new Subject<ThreadUploadedFile[]>();
-            const gate2 = new Subject<ThreadUploadedFile[]>();
+            const gate1 = new Subject<ThreadUploadEvent>();
+            const gate2 = new Subject<ThreadUploadEvent>();
             ctx.mockApi.uploadOneToThread = vi
                 .fn()
                 .mockReturnValueOnce(gate1)
@@ -621,7 +710,7 @@ describe('PersistentChatService — Phase 3 outbox', () => {
             const queueBefore = ctx.service.outbox();
             const t2LocalId = queueBefore[0].localId;
 
-            gate1.next([uploaded('a.pdf')]); // t1's abandoned upload lands
+            gate1.next(done(uploaded('a.pdf'))); // t1's abandoned upload lands
             gate1.complete();
             await flushTick();
 
@@ -641,7 +730,7 @@ describe('PersistentChatService — Phase 3 outbox', () => {
             // already left would otherwise appear over the one they just
             // opened, attached to nothing they can see.
             const ctx = await readySession('t1');
-            const gate = new Subject<ThreadUploadedFile[]>();
+            const gate = new Subject<ThreadUploadEvent>();
             ctx.mockApi.uploadOneToThread = vi.fn().mockReturnValue(gate);
 
             ctx.service.addAttachments([filePreview('a.pdf')]);
@@ -691,7 +780,7 @@ describe('PersistentChatService — Phase 3 outbox', () => {
 
         it('refuses to discard an item whose upload is in flight', async () => {
             const ctx = await readySession();
-            ctx.mockApi.uploadOneToThread = vi.fn().mockReturnValue(new Subject<ThreadUploadedFile[]>());
+            ctx.mockApi.uploadOneToThread = vi.fn().mockReturnValue(new Subject<ThreadUploadEvent>());
 
             ctx.service.addAttachments([filePreview('a.pdf')]);
             void ctx.service.sendMessage('hi');

@@ -70,7 +70,7 @@ function createService(opts: {
         delete: vi.fn().mockReturnValue(of({})),
     };
     const mockApi: any = {
-        uploadOneToThread: vi.fn().mockReturnValue(of([])),
+        uploadOneToThread: vi.fn().mockReturnValue(of({kind: 'done', files: []})),
         humanizeUploadError: vi.fn().mockReturnValue('upload failed'),
         getEligibleDatasources: vi.fn().mockReturnValue(of(opts.eligible ?? [])),
     };
@@ -302,7 +302,10 @@ describe('PersistentChatService — instant-landing draft sessions', () => {
         // Ready → the upload runs against the thread that now exists, then
         // the message goes out with the hint naming the stored file.
         ctx.mockApi.uploadOneToThread.mockReturnValue(
-            of([{name: 'pasted-image.png', size: shot.size, mime_type: 'image/png', path: 'uploads/pasted-image.png'}]),
+            of({
+                kind: 'done',
+                files: [{name: 'pasted-image.png', size: shot.size, mime_type: 'image/png', path: 'uploads/pasted-image.png'}],
+            }),
         );
         fireSseOpen(ctx.sseInstances[0]);
         fireSseMessage(ctx.sseInstances[0], {method: 'ready', params: {}}, '1:1');

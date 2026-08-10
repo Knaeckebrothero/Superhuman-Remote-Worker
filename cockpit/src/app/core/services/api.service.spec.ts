@@ -1,6 +1,6 @@
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest';
 import {TestBed} from '@angular/core/testing';
-import {HttpErrorResponse, provideHttpClient} from '@angular/common/http';
+import {HttpErrorResponse, HttpEventType, provideHttpClient} from '@angular/common/http';
 import {
   HttpTestingController,
   provideHttpClientTesting,
@@ -10,7 +10,7 @@ import {firstValueFrom} from 'rxjs';
 import {ApiService, SESSION_TOOL_GROUPS_TIMEOUT_MS} from './api.service';
 import {AppToastService} from '../../ui/toast';
 import {ErrorMessageService} from './error-message.service';
-import type {ThreadUploadedFile} from '../models/file.model';
+import type {ThreadUploadedFile, ThreadUploadEvent} from '../models/file.model';
 
 describe('ApiService.transcribeVoice', () => {
   let api: ApiService;
@@ -537,11 +537,17 @@ describe('uploadOneToThread', () => {
 
   afterEach(() => httpMock.verify());
 
+  /** The one `done` event, or undefined if the stream never produced one. */
+  function doneFiles(events: readonly ThreadUploadEvent[]): ThreadUploadedFile[] | undefined {
+    const done = events.find((e) => e.kind === 'done');
+    return done?.kind === 'done' ? done.files : undefined;
+  }
+
   it('posts a single file as multipart and returns its server entries', () => {
     const file = new File(['abc'], 'report.pdf', {type: 'application/pdf'});
-    let got: ThreadUploadedFile[] | undefined;
+    const events: ThreadUploadEvent[] = [];
 
-    api.uploadOneToThread('t1', file).subscribe((files) => (got = files));
+    api.uploadOneToThread('t1', file).subscribe((e) => events.push(e));
 
     const req = httpMock.expectOne((r) => r.url.endsWith('/persistent/threads/t1/uploads'));
     expect(req.request.method).toBe('POST');
@@ -553,16 +559,40 @@ describe('uploadOneToThread', () => {
       files: [{name: 'report.pdf', size: 3, mime_type: 'application/pdf', path: 'uploads/report.pdf'}],
     });
 
-    expect(got).toEqual([
+    expect(doneFiles(events)).toEqual([
       {name: 'report.pdf', size: 3, mime_type: 'application/pdf', path: 'uploads/report.pdf'},
+    ]);
+  });
+
+  it('emits fractional progress then the final files', () => {
+    // The whole reason app.config.ts drops withFetch(): FetchBackend emits no
+    // UploadProgress events, so `reportProgress` there is a silent no-op and a
+    // 90MB PDF would sit at 0% and jump to 100%.
+    const events: unknown[] = [];
+    api.uploadOneToThread('t1', new File(['abc'], 'a.pdf')).subscribe((e) => events.push(e));
+
+    const req = httpMock.expectOne((r) => r.url.endsWith('/persistent/threads/t1/uploads'));
+    expect(req.request.reportProgress).toBe(true);
+
+    req.event({type: HttpEventType.UploadProgress, loaded: 50, total: 100});
+    // `total` absent — the gotcha. HttpUploadProgressEvent.total is optional
+    // (the body length is not always computable) and a consumer that divides
+    // by it unguarded renders NaN.
+    req.event({type: HttpEventType.UploadProgress, loaded: 100});
+    req.flush({thread_id: 't1', files: []});
+
+    expect(events).toEqual([
+      {kind: 'progress', loaded: 50, total: 100},
+      {kind: 'progress', loaded: 100, total: null},
+      {kind: 'done', files: []},
     ]);
   });
 
   it('returns every extracted member when the file is an archive', () => {
     const zip = new File(['x'], 'bundle.zip', {type: 'application/zip'});
-    let got: ThreadUploadedFile[] | undefined;
+    const events: ThreadUploadEvent[] = [];
 
-    api.uploadOneToThread('t1', zip).subscribe((files) => (got = files));
+    api.uploadOneToThread('t1', zip).subscribe((e) => events.push(e));
 
     httpMock.expectOne((r) => r.url.endsWith('/persistent/threads/t1/uploads')).flush({
       thread_id: 't1',
@@ -572,7 +602,7 @@ describe('uploadOneToThread', () => {
       ],
     });
 
-    expect(got?.length).toBe(2);
+    expect(doneFiles(events)?.length).toBe(2);
   });
 
   it('rethrows the HttpErrorResponse so the caller can read status and detail', () => {
