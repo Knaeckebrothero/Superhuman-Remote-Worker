@@ -151,6 +151,60 @@ you build follows from that.
   `tilt trigger srw` — it uninstalls the release.
 - A fresh git worktree fails 19 helm tests spuriously — don't baseline there.
 
+## 6b. CORRECTIONS (2026-08-10, adversarial review — read before §3 decisions)
+
+An adversarial review of the design found errors **in this brief**. These
+override the corresponding text above.
+
+1. **The claim CAS in §3.1.2 is wrong as written.** `created|paused →
+   processing` breaks every reclaim: a mid-batch stateless job is permanently
+   `processing` (the scope correction's own mechanism), so the rotation/steal
+   successor's CAS matches zero rows, the atomic claim aborts, and the unit
+   release-loops into `parked` at `max_attempts`. Correct CAS:
+   `status IN ('created','paused','processing')` with `processing→processing`
+   as an idempotent re-assert — fencing is the queue lease's job, not the
+   status's. And define the mismatch arm: a **terminal** status at claim time
+   means *consume the unit* (`complete_unit` → done), never release-and-retry.
+2. **The rotation verb is now PRESCRIBED, not your choice** (§3.1.5's "pick
+   deliberately" is withdrawn). **Never `release_unit` for a rotation**: release
+   keeps `attempts_since_completion` (only `complete_unit`/`unpark` reset it —
+   a ≥5-batch job would park on its FIRST crash), clears `last_leased_by`
+   (every batch goes cache-cold), and adds `5s × attempts` backoff (re-imports
+   the dead time the scope correction deleted). Correct recipe, existing verbs
+   only: while still leased, advance the input watermark (`enqueue_unit` on a
+   leased row bumps ONLY `input_seq`), then `complete_unit` with the old
+   consumed_seq — its CASE lands the row `'queued'` atomically, resets
+   attempts, preserves affinity, `run_after = now()`. A crash before that
+   statement leaves the unit `leased` → the reaper handles it with honest
+   attempt accounting.
+3. **Condition 4's carrier does not exist yet.** `_HEARTBEAT_SQL` RETURNING
+   carries only `leased_until`, and run_queue is contract-frozen ("touches
+   ONLY run_queue" — your own scope guard). Do NOT extend it. Build a
+   driver-side companion read on the renewal cadence: `jobs.status` via the
+   existing `_check_job_preempted` / `_PREEMPTED_JOB_STATUSES` logic
+   (src/api/dual_app.py:~200). ~15 lines, no contract breach.
+4. **Token transport for the thin fence**: `JobCompleteRequest` carries no
+   lease token — add an optional field (pydantic v2 ignores it on old
+   orchestrators, so agent-first is safe) and send it from the driver's
+   terminal report. Orchestrator-side, the fence is
+   `payload token == unit's current token`, and it must **no-op keyed on
+   `jobs.execution_lane='pinned'`** — NOT on "no run_queue row found" (cancel
+   may remove the row; missing-row must fail closed for stateless, and keying
+   on absence would silently change pinned behavior).
+5. **Terminal ordering prescribed**: report → on 2xx → `complete_unit` with
+   `consumed_seq = input_seq` so the unit lands `done`. Report-first is
+   correct because correction 1 makes a leased-unit-after-death reclaim
+   consume it. Also raise the driver's terminal-report timeout well above
+   report_completion's 60 s default — a stateless terminal completion whose
+   handler exceeds the client timeout is CANCELLED server-side mid-pipeline
+   (starlette cancels on disconnect), and unlike pinned, no jobs sweep rescues
+   this lane. Add to the kill tests: kill the orchestrator handler
+   mid-terminal-completion; the reclaim must consume-or-re-report to a benign
+   late-callback response, never park.
+6. **Future hook, do not build**: the lane-aware resume verb will later gate
+   on pending completion commands (Gate 3 step 2+). Leave a marked TODO at the
+   verb; nothing to implement tonight.
+
 ## 7. Stop rule
 
 Stop only when a premise is load-bearing AND there is no reasonable alternative
