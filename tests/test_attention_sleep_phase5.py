@@ -182,6 +182,34 @@ class TestLoopGetUserInputAwaitingUserFlip:
         for call in client.update_thread_status.await_args_list:
             assert call.args[1] != "awaiting_user"
 
+    @pytest.mark.asyncio
+    async def test_stateless_eager_uses_durable_presence_oracle(self, monkeypatch):
+        import src.api.persistent_app as mod
+        from src.api.lease_context import LeaseHandle
+
+        session, client = _install_agent_session(turn_count=3)
+        session.postgres_conn = MagicMock()
+        mod._loop_user_queue.put_nowait("hi")
+        monkeypatch.setenv("STATELESS_EXECUTOR", "1")
+        durable_pause = AsyncMock(return_value=True)
+        monkeypatch.setattr(mod, "mark_stateless_natural_pause", durable_pause)
+
+        handle = LeaseHandle()
+        handle.update("thread-test-uuid", 17)
+        context_token = mod._current_lease_var.set(handle)
+        try:
+            await mod._loop_get_user_input()
+        finally:
+            mod._current_lease_var.reset(context_token)
+
+        durable_pause.assert_awaited_once_with(
+            session.postgres_conn,
+            thread_id="thread-test-uuid",
+            lease_token=17,
+            require_untethered=True,
+        )
+        client.update_thread_status.assert_not_called()
+
 
 # ===========================================================================
 # Section 2 — Agent: permission_check wake-path select-first guard
@@ -272,12 +300,15 @@ class TestAttentionSleepSweeper:
         # Save the originals so each test restores cleanly.
         self._orig_db = om.postgres_db
         self._orig_svc = om.workspace_suspension_service
+        self._orig_promote = om.promote_expired_stateless_pauses
+        om.promote_expired_stateless_pauses = AsyncMock(return_value=[])
 
     def teardown_method(self):
         import orchestrator.main as om
 
         om.postgres_db = self._orig_db
         om.workspace_suspension_service = self._orig_svc
+        om.promote_expired_stateless_pauses = self._orig_promote
 
     @pytest.mark.asyncio
     async def test_suspends_stale_awaiting_user(self):
@@ -352,6 +383,28 @@ class TestAttentionSleepSweeper:
 
         # suspend was tried but did not produce an UPDATE.
         svc.suspend_thread_workspace.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_presence_failure_does_not_skip_legacy_suspension(self):
+        import orchestrator.main as om
+
+        db = _make_db(fetch=[{"id": "thread-abc"}], fetchval="thread-abc")
+        svc = MagicMock()
+        svc.is_enabled = True
+        svc.suspend_thread_workspace = AsyncMock(return_value=True)
+        om.postgres_db = db
+        om.workspace_suspension_service = svc
+        om.promote_expired_stateless_pauses = AsyncMock(
+            side_effect=RuntimeError("presence table unavailable")
+        )
+
+        shutdown = asyncio.Event()
+        task = asyncio.create_task(om.attention_sleep_sweeper(shutdown))
+        await asyncio.sleep(0.05)
+        shutdown.set()
+        await task
+
+        svc.suspend_thread_workspace.assert_awaited_with("thread-abc")
 
 
 # ===========================================================================

@@ -75,6 +75,12 @@ from src.shared.cloud_sync_generations import (
     encode_cloud_sync_baseline,
     load_cloud_sync_requirements,
 )
+from src.shared.thread_presence import (
+    expire_permission_if_untethered,
+    mark_stateless_natural_pause,
+    promote_expired_stateless_pauses,
+    refresh_thread_presence,
+)
 
 DSN = os.environ.get("RUN_QUEUE_TEST_DSN", "")
 
@@ -96,6 +102,7 @@ _MIGRATIONS_DIR = (
 # against the SAME DDL production does, so a column the SQL contract depends
 # on (e.g. 0117's last_leased_by) cannot pass here and fail on a real cluster.
 MIGRATION_FILES = [
+    _MIGRATIONS_DIR / "0005_thread_permission_requests.sql",
     _MIGRATIONS_DIR / "0115_run_queue.sql",
     _MIGRATIONS_DIR / "0117_run_queue_affinity.sql",
     _MIGRATIONS_DIR / "0119_thread_control_inbox.sql",
@@ -104,6 +111,7 @@ MIGRATION_FILES = [
     _MIGRATIONS_DIR / "0122_thread_cloud_sync_generations.sql",
     _MIGRATIONS_DIR / "0123_thread_cloud_sync_baselines.sql",
     _MIGRATIONS_DIR / "0124_cloud_sync_marker_comment.sql",
+    _MIGRATIONS_DIR / "0125_thread_client_presence.sql",
 ]
 
 SESSION = UNIT_KIND_SESSION_TURN
@@ -131,6 +139,8 @@ async def _apply_schema() -> None:
     conn = await asyncpg.connect(DSN, timeout=10)
     try:
         await conn.execute("DROP TABLE IF EXISTS thread_cloud_sync_generations CASCADE")
+        await conn.execute("DROP TABLE IF EXISTS thread_client_presence CASCADE")
+        await conn.execute("DROP TABLE IF EXISTS thread_permission_requests CASCADE")
         await conn.execute("DROP TABLE IF EXISTS thread_events CASCADE")
         await conn.execute("DROP TABLE IF EXISTS thread_control_requests CASCADE")
         await conn.execute("DROP TABLE IF EXISTS run_queue CASCADE")
@@ -146,7 +156,11 @@ async def _apply_schema() -> None:
             "id UUID PRIMARY KEY, user_id UUID, agent_id UUID, "
             "status TEXT NOT NULL DEFAULT 'active', "
             "permission_mode TEXT NOT NULL DEFAULT 'supervised', "
-            "metadata JSONB NOT NULL DEFAULT '{}'::jsonb"
+            "metadata JSONB NOT NULL DEFAULT '{}'::jsonb, "
+            "total_turns INTEGER NOT NULL DEFAULT 0, "
+            "awaiting_user_since TIMESTAMPTZ, "
+            "extend_count INTEGER NOT NULL DEFAULT 0, "
+            "last_activity TIMESTAMPTZ NOT NULL DEFAULT now()"
             ")"
         )
         await conn.execute(
@@ -174,7 +188,8 @@ async def conn(schema):
     """A fresh connection with an empty run_queue (enqueue_ord restarted)."""
     c = await asyncpg.connect(DSN, timeout=10)
     await c.execute(
-        "TRUNCATE thread_cloud_sync_generations, thread_events, "
+        "TRUNCATE thread_client_presence, thread_permission_requests, "
+        "thread_cloud_sync_generations, thread_events, "
         "thread_control_requests, run_queue, agents, threads "
         "RESTART IDENTITY CASCADE"
     )
@@ -209,6 +224,25 @@ async def extra_conn():
 
 async def _row(conn, unit_id: UUID):
     return await conn.fetchrow("SELECT * FROM run_queue WHERE unit_id = $1", unit_id)
+
+
+class _SingleConnectionPool:
+    """Pool-shaped adapter for shared helpers in scratch-Postgres tests."""
+
+    def __init__(self, connection):
+        self.connection = connection
+
+    def acquire(self):
+        connection = self.connection
+
+        class _Acquire:
+            async def __aenter__(self):
+                return connection
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+        return _Acquire()
 
 
 async def _expire(conn, unit_id: UUID, seconds: float = 3600.0) -> None:
@@ -1926,3 +1960,220 @@ class TestRecordInputSeq:
         state = await record_input_seq(conn, unit_id=u, unit_kind=SESSION, input_seq=5)
         assert state == STATE_QUEUED
         assert (await _row(conn, u))["input_seq"] == 9
+
+
+# =============================================================================
+# Stateless attached-client presence (0125)
+# =============================================================================
+
+
+class TestThreadClientPresence:
+    async def test_multitab_renewal_does_not_clear_polite_pause(self, conn):
+        thread_id = uuid4()
+        await conn.execute(
+            "INSERT INTO threads (id, execution_lane, total_turns) "
+            "VALUES ($1, 'stateless', 1)",
+            thread_id,
+        )
+        pool = _SingleConnectionPool(conn)
+
+        first = await refresh_thread_presence(
+            pool, thread_id=thread_id, ttl_seconds=30, establish=True
+        )
+        assert first.served is True
+        assert first.became_live is True
+
+        # Polite mode may set awaiting_user while the first tab is attached.
+        await conn.execute(
+            "UPDATE threads SET status = 'awaiting_user', "
+            "awaiting_user_since = now() WHERE id = $1",
+            thread_id,
+        )
+        second = await refresh_thread_presence(
+            pool, thread_id=thread_id, ttl_seconds=30, establish=True
+        )
+        assert second.served is True
+        assert second.became_live is False
+        assert (
+            await conn.fetchval("SELECT status FROM threads WHERE id = $1", thread_id)
+            == "awaiting_user"
+        )
+        assert (
+            await conn.fetchval(
+                "SELECT count(*) FROM thread_client_presence WHERE thread_id = $1",
+                thread_id,
+            )
+            == 1
+        )
+
+    async def test_expired_presence_reestablishes_and_disarms_pause(self, conn):
+        thread_id = uuid4()
+        await conn.execute(
+            "INSERT INTO threads (id, execution_lane, status, total_turns, "
+            "awaiting_user_since) "
+            "VALUES ($1, 'stateless', 'awaiting_user', 1, now())",
+            thread_id,
+        )
+        await conn.execute(
+            "INSERT INTO thread_client_presence "
+            "(thread_id, refreshed_at, expires_at) "
+            "VALUES ($1, now() - interval '2 minutes', now() - interval '1 minute')",
+            thread_id,
+        )
+
+        result = await refresh_thread_presence(
+            _SingleConnectionPool(conn),
+            thread_id=thread_id,
+            ttl_seconds=30,
+            establish=True,
+        )
+        assert result.became_live is True
+        row = await conn.fetchrow(
+            "SELECT status, awaiting_user_since FROM threads WHERE id = $1",
+            thread_id,
+        )
+        assert row["status"] == "active"
+        assert row["awaiting_user_since"] is None
+
+    async def test_eager_and_polite_natural_pause_use_durable_presence(self, conn):
+        thread_id = uuid4()
+        await conn.execute(
+            "INSERT INTO threads (id, execution_lane, total_turns) "
+            "VALUES ($1, 'stateless', 1)",
+            thread_id,
+        )
+        await enqueue_unit(conn, unit_id=thread_id, unit_kind=SESSION, input_seq=1)
+        claim = await claim_unit(conn, unit_kind=SESSION, pod_name="presence-pod")
+        assert claim is not None
+        pool = _SingleConnectionPool(conn)
+        await refresh_thread_presence(
+            pool, thread_id=thread_id, ttl_seconds=30, establish=True
+        )
+
+        eager = await mark_stateless_natural_pause(
+            pool,
+            thread_id=thread_id,
+            lease_token=claim.lease_token,
+            require_untethered=True,
+        )
+        assert eager is False
+        assert (
+            await conn.fetchval("SELECT status FROM threads WHERE id = $1", thread_id)
+            == "active"
+        )
+
+        polite = await mark_stateless_natural_pause(
+            pool,
+            thread_id=thread_id,
+            lease_token=claim.lease_token,
+            require_untethered=False,
+        )
+        assert polite is True
+        assert (
+            await conn.fetchval("SELECT status FROM threads WHERE id = $1", thread_id)
+            == "awaiting_user"
+        )
+
+    async def test_expiry_sweep_promotes_only_done_stateless_thread(self, conn):
+        done_id, queued_id, pinned_id = uuid4(), uuid4(), uuid4()
+        await conn.executemany(
+            "INSERT INTO threads (id, execution_lane, total_turns) VALUES ($1, $2, 1)",
+            [
+                (done_id, "stateless"),
+                (queued_id, "stateless"),
+                (pinned_id, "pinned"),
+            ],
+        )
+        for thread_id in (done_id, queued_id, pinned_id):
+            await enqueue_unit(conn, unit_id=thread_id, unit_kind=SESSION, input_seq=1)
+        await conn.execute(
+            "UPDATE run_queue SET state = 'done' WHERE unit_id IN ($1, $2)",
+            done_id,
+            pinned_id,
+        )
+
+        promoted = await promote_expired_stateless_pauses(
+            _SingleConnectionPool(conn), limit=50
+        )
+        assert promoted == [str(done_id)]
+        statuses = {
+            row["id"]: row["status"]
+            for row in await conn.fetch(
+                "SELECT id, status FROM threads WHERE id = ANY($1::uuid[])",
+                [done_id, queued_id, pinned_id],
+            )
+        }
+        assert statuses[done_id] == "awaiting_user"
+        assert statuses[queued_id] == "active"
+        assert statuses[pinned_id] == "active"
+
+    async def test_permission_expiry_serializes_with_presence_refresh(
+        self, conn, extra_conn
+    ):
+        """A renewal holding the thread presence lock wins before expiry.
+
+        This exercises the no-row race: without the shared advisory lock the
+        timeout statement can observe absence and expire while the authorized
+        SSE establishment is already in flight.
+        """
+
+        thread_id, request_id = uuid4(), uuid4()
+        await conn.execute(
+            "INSERT INTO threads (id, execution_lane, total_turns) "
+            "VALUES ($1, 'stateless', 1)",
+            thread_id,
+        )
+        await enqueue_unit(conn, unit_id=thread_id, unit_kind=SESSION, input_seq=1)
+        claim = await claim_unit(conn, unit_kind=SESSION, pod_name="presence-pod")
+        assert claim is not None
+        await conn.execute(
+            "INSERT INTO thread_permission_requests "
+            "(id, thread_id, tool_call_id, tool_name) VALUES ($1, $2, 'tc', 'shell')",
+            request_id,
+            thread_id,
+        )
+
+        refresher = await extra_conn()
+        transaction = refresher.transaction()
+        await transaction.start()
+        committed = False
+        try:
+            await refresher.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))",
+                str(thread_id),
+            )
+            expiry_task = asyncio.create_task(
+                expire_permission_if_untethered(
+                    conn,
+                    thread_id=thread_id,
+                    request_id=request_id,
+                    lease_token=claim.lease_token,
+                )
+            )
+            await asyncio.sleep(0.05)
+            assert not expiry_task.done(), "expiry bypassed the presence lock"
+            await refresher.execute(
+                "INSERT INTO thread_client_presence "
+                "(thread_id, refreshed_at, expires_at) "
+                "VALUES ($1, clock_timestamp(), "
+                "clock_timestamp() + interval '30 seconds')",
+                thread_id,
+            )
+            await transaction.commit()
+            committed = True
+            result = await asyncio.wait_for(expiry_task, timeout=2)
+        finally:
+            if not committed:
+                await transaction.rollback()
+
+        assert result.status == "pending"
+        assert result.owner_live is True
+        assert result.live_for_seconds is not None
+        assert result.live_for_seconds > 0
+        assert (
+            await conn.fetchval(
+                "SELECT status FROM thread_permission_requests WHERE id = $1",
+                request_id,
+            )
+            == "pending"
+        )

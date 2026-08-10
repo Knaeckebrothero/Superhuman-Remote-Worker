@@ -134,7 +134,8 @@ APP_COMPUTE_INTERVAL_EPOCH_SHAPE_REPAIR_MIGRATION = (
 # tripwire that says "a migration was added; check the snapshot was regenerated
 # and nothing was renumbered". Head as of the merged stateless work: the S3
 # worker-lane partition (0118), session control inbox (0119-0121), and the
-# stateless cloud-generation fence and content baseline (0122-0124).
+# stateless cloud-generation fence/content baseline (0122-0124), and durable
+# owner-gated client presence (0125).
 APP_JOBS_EXECUTION_LANE_MIGRATION = (
     ROOT / "orchestrator/database/migrations/app/0118_jobs_execution_lane.sql"
 )
@@ -158,8 +159,11 @@ APP_THREAD_CLOUD_SYNC_BASELINES = (
 APP_CLOUD_SYNC_MARKER_COMMENT = (
     ROOT / "orchestrator/database/migrations/app/0124_cloud_sync_marker_comment.sql"
 )
+APP_THREAD_CLIENT_PRESENCE = (
+    ROOT / "orchestrator/database/migrations/app/0125_thread_client_presence.sql"
+)
 APP_CURRENT_MIGRATION_HEAD = (
-    ROOT / "orchestrator/database/migrations/app/0124_cloud_sync_marker_comment.sql"
+    ROOT / "orchestrator/database/migrations/app/0125_thread_client_presence.sql"
 )
 AUDIT_EXPANSION = (
     ROOT
@@ -760,6 +764,18 @@ def test_stateless_cloud_sync_migrations_keep_resource_and_baseline_fences() -> 
     assert "The resource commit" in marker_comment
     assert "marker binds this digest" in marker_comment
     assert "Resource marker v2" not in marker_comment
+
+
+def test_thread_client_presence_is_ttl_only_and_not_an_authority() -> None:
+    presence = _compact(APP_THREAD_CLIENT_PRESENCE.read_text())
+
+    assert "thread_id UUID PRIMARY KEY" in presence
+    assert "REFERENCES threads(id) ON DELETE CASCADE" in presence
+    assert "CHECK (expires_at > refreshed_at)" in presence
+    assert "idx_thread_client_presence_expires_at" in presence
+    assert "disconnect never deletes it" in presence
+    assert "never authorization, queue ownership" in presence
+    assert "fencing token" in presence
 
 
 def test_compute_foundation_is_immutable_and_lock_fix_is_superseding() -> None:
