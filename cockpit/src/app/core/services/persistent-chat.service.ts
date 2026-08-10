@@ -128,11 +128,20 @@ const SEND_KICKSTART_TIMEOUT_MS = 5000;
 
 /** Attachment chip shown alongside a user message. */
 export interface ChatAttachment {
+    /**
+     * Stable local id (the FilePreview.id it came from). Exists BEFORE the
+     * upload does, which `path` does not — so this is what the bubble's
+     * @for tracks by. Tracking by `path` gave every pre-upload chip the key
+     * `undefined`: duplicate keys (NG0955) with two files, and a full
+     * destroy/recreate of every chip node once the real paths arrived.
+     */
+    id: string;
     name: string;
     size: number;
     mimeType: string;
-    /** Workspace-relative path, e.g. "uploads/photo.jpg". */
-    path: string;
+    /** Workspace-relative path, e.g. "uploads/photo.jpg". Absent until the
+     *  upload resolves. */
+    path?: string;
 }
 
 /**
@@ -2537,6 +2546,12 @@ export class PersistentChatService {
         }
 
         const attachments: ChatAttachment[] = uploaded.map((f) => ({
+            // Transitional placeholder: `uploaded` is a flat ThreadUploadedFile[]
+            // (a .zip can expand to several entries per originating
+            // FilePreview, so there's no clean 1:1 id to reuse here). Task 4
+            // rewrites this block wholesale to carry the real
+            // PendingUpload.id through from the pre-upload chip.
+            id: crypto.randomUUID(),
             name: f.name,
             size: f.size,
             mimeType: f.mime_type,
