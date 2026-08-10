@@ -1601,7 +1601,15 @@
       "endedSendResumes": "Type a message — sending resumes the session"
     },
     "upload": {
-      "slashCommandWithAttachments": "Remove the attached files before running a command."
+      "stage": "Uploading {{done}} of {{total}}…",
+      "sending": "Sending…",
+      "waitingOn": "Waiting for {{name}}…",
+      "failed": "{{name}} could not be uploaded",
+      "removeAndSend": "Remove file and send",
+      "slashCommandWithAttachments": "Remove the attached files before running a command.",
+      "tooLarge": "{{name}} is larger than the 100 MB limit",
+      "tooManyFiles": "You can attach at most 20 files at once",
+      "noWorkspace": "This session has no workspace, so files cannot be attached."
     },
     "composer": {
       "attach": "Attach",

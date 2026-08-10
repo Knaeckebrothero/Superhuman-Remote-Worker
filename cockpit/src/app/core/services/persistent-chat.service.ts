@@ -730,6 +730,11 @@ export class PersistentChatService {
     /** localIds of queued (not-yet-accepted) sends — drives queued-bubble
      *  styling in the template. */
     readonly outboxIds = computed(() => new Set(this.outbox().map((i) => i.localId)));
+    /** One outbox item by its bubble's localId — the template's window into
+     *  `pendingFiles` for the queued bubble's upload stage line (Task 5). */
+    outboxItem(localId: string): OutboxItem | undefined {
+        return this.outbox().find((i) => i.localId === localId);
+    }
     /**
      * True when a flush attempt failed and items are still queued — i.e. the
      * queue is *stalled*, not merely waiting for the session to come up.
@@ -794,17 +799,6 @@ export class PersistentChatService {
 
     // --- Pending attachments (queued in composer before send) ---
     readonly pendingAttachments = signal<FilePreview[]>([]);
-
-    /**
-     * DEPRECATED and deliberately never set since the upload moved into the
-     * outbox flush. It used to gate the composer while bytes moved, which is
-     * precisely the blocked-composer bug this design removes: the send is
-     * committed the moment the user hits send, so the composer must stay
-     * usable. Upload progress belongs on the queued bubble's stage line
-     * (docs/features/session_attachment_send_flow.md §5.2). Kept only because
-     * the component template still binds it; remove with that binding.
-     */
-    readonly isUploadingAttachments = signal(false);
 
     // --- Last upload error (cleared on next successful send) ---
     readonly attachmentError = signal<string | null>(null);
@@ -2869,9 +2863,7 @@ export class PersistentChatService {
     /** The queue's live view of one of an item's files. Never hold the object
      *  across an await — each patch replaces the array it lives in. */
     private _pendingFile(localId: string, fileId: string): PendingUpload | undefined {
-        return this.outbox()
-            .find((i) => i.localId === localId)
-            ?.pendingFiles?.find((f) => f.id === fileId);
+        return this.outboxItem(localId)?.pendingFiles?.find((f) => f.id === fileId);
     }
 
     /** Patch one queued file's upload state through the signal (fresh item,
@@ -2911,7 +2903,7 @@ export class PersistentChatService {
         fileId: string,
         resolved: ChatAttachment[],
     ): void {
-        const item = this.outbox().find((i) => i.localId === localId);
+        const item = this.outboxItem(localId);
         if (!item) return; // drained under us (thread gone / switched)
         const next = (item.attachments ?? []).flatMap((a) =>
             a.id === fileId ? resolved : [a],

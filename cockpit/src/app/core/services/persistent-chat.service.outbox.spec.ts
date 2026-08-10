@@ -202,6 +202,20 @@ describe('PersistentChatService — Phase 3 outbox', () => {
         expect(inputPosts(ctx).length).toBe(0); // nothing POSTed while not ready
     });
 
+    it('outboxItem(localId) looks up a queued item by its bubble id, including pendingFiles', async () => {
+        const ctx = createService();
+        await ctx.service.connect('t1'); // no 'ready' frame → not ready
+        ctx.service.addAttachments([filePreview('a.pdf')]);
+        await ctx.service.sendMessage('with a file');
+
+        const localId = ctx.service.outbox()[0].localId;
+        expect(ctx.service.outboxItem(localId)?.displayContent).toBe('with a file');
+        expect(ctx.service.outboxItem(localId)?.pendingFiles?.map((f) => f.name)).toEqual(['a.pdf']);
+        // Task 5's stage line reads this for an id that has already flushed or
+        // never existed — must resolve to nothing, not throw.
+        expect(ctx.service.outboxItem('no-such-id')).toBeUndefined();
+    });
+
     // --- 2. ownership: disconnect keeps, thread-switch clears, carry re-adds -
 
     it('disconnect() preserves the outbox; connect(other) clears it', async () => {
