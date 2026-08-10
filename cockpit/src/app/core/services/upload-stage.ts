@@ -37,15 +37,27 @@ export function composeAgentContent(text: string, names: readonly string[]): str
 }
 
 /**
+ * A permanent refusal from the `none` workspace tier. Matched on the detail
+ * text because the endpoint returns 409 for this AND for a pod that is merely
+ * still starting (thread_uploads.py:581-588 vs :620-622). The durable fix is a
+ * machine-readable {code, message} body like the TTS endpoint already returns
+ * (main.py:32570) — until then this string is the only discriminator.
+ */
+const NO_WORKSPACE_DETAIL = 'no workspace';
+
+/**
  * Terminal failures will never succeed on retry, so the bubble must offer a way
  * out rather than a Retry button that can only fail again:
  *   400 — too many files, or no files provided
  *   413 — a file exceeds the backend's 100MB cap
+ *   409 — *only* when the detail says the session has no workspace at all
  * Everything else (409 workspace-not-ready, 502/503 transport, 0 offline) is
  * retryable and keeps the item queued.
  */
-export function classifyUploadFailure(status: number): 'terminal' | 'retryable' {
-    return status === 400 || status === 413 ? 'terminal' : 'retryable';
+export function classifyUploadFailure(status: number, detail = ''): 'terminal' | 'retryable' {
+    if (status === 400 || status === 413) return 'terminal';
+    if (status === 409 && detail.toLowerCase().includes(NO_WORKSPACE_DETAIL)) return 'terminal';
+    return 'retryable';
 }
 
 /** Aggregate state of one outbox item's files, for the bubble's stage line. */
