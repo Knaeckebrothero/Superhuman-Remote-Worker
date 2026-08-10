@@ -408,13 +408,15 @@ Worth recording, because each was correct-looking code with passing tests:
 
 ### Known open
 
-- **Live gate partially run** (dev, 2026-08-10). Passing: `POST /resume` on
-  thread `1930dec9` returns **428** where it returned 403, the dialog renders,
-  and deleting a connector on the deployed image writes a tombstone carrying
-  its name and `deleted_by`. Not yet exercised on dev: acknowledge → 200 →
-  attach, and the delete-time reference scrub (the scratch connector was
-  attached to no thread, so its UPDATE matched zero rows). Both are covered by
-  tests against a real Postgres.
+- **Live gate PASSED** (dev, 2026-08-10, thread `1930dec9`). `POST /resume`
+  returned **428** where it had returned 403; the dialog rendered; acknowledging
+  returned **200**; and the acknowledgment persisted as
+  `{"connector:d7555d5d-…": "deleted"}`, so the session no longer re-prompts.
+  Deleting a connector on the deployed image was separately confirmed to write
+  a tombstone carrying its name and `deleted_by`.
+  Still unexercised on dev: the delete-time reference scrub — the scratch
+  connector used for the tombstone check was attached to no thread, so its
+  UPDATE matched zero rows. It is covered by tests against a real Postgres.
 - **Historical deletions can never show a name.** The nine connectors that were
   already dangling were hard-deleted before tombstones existed, so the dialog
   shows their bare uuid. Confirmed unrecoverable on dev: no tombstone, no table
