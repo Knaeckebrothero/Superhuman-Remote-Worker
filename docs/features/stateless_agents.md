@@ -660,12 +660,26 @@ Shipping first and alone (migration 0130), because it fixes a live correctness
 hole — the duplicate-critic race can drop a blocking finding and produce an
 unwarranted approval — and needs none of the protocol above.
 
-**The design question to answer first.** `status NOT IN ('failed','cancelled')`
-means *a failed round frees its slot and can be respawned*. If that is not the
-intent, **drop `status` from the predicate entirely** and every problem below
-except NULL handling evaporates: no surprise constraint violation on status
-transitions, no HOT-update cost, no slow concurrent-build path. Only keep the
-mutable predicate if terminal rows genuinely should free the slot.
+**Decided 2026-08-09: one critic per round, ever — the predicate does not
+reference `status`.** A round's slot is never freed for a re-spawn. This matches
+what the system already does: when a critic dies without recording a verdict,
+`unstick_reviewing_parents` sends the target to `pending_review` rather than
+spawning a replacement, so nothing today depends on the slot reopening. Choosing
+the immutable predicate removes an entire class of problems — rows never enter or
+leave the index, so no status transition can raise a constraint violation, HOT
+updates survive status churn, and the build avoids the slower cross-table wait
+that partial+expression indexes opt into.
+
+```sql
+CREATE UNIQUE INDEX CONCURRENTLY jobs_verification_uniq
+    ON jobs (parent_job_id, (context->>'verification_round'))
+    WHERE context->>'verification_target' IS NOT NULL
+      AND jsonb_exists(context, 'verification_round');
+```
+
+The `jsonb_exists` clause is not decoration — see the NULL hole below. The
+remaining paragraphs on mutable predicates are retained as the *reason* this
+shape was chosen, not as a description of what ships.
 
 **The NULL hole — confirmed by experiment, and fatal as first written.**
 `context->>'verification_round'` is SQL NULL when the key is absent, and NULLs
@@ -806,32 +820,76 @@ matches it. A job matched by nothing is the stuck namespace, rebuilt.
 
 **(7) Rollout — one triage, then six steps, each independently revertible.**
 
-**Step 0 is not code: triage the 37.** "Thirty-seven side effects gating a
-user-visible status write" is itself the smell, and the question is not "status
-first or last" but **which effects must land before the status is
-user-visible-correct?** Almost certainly very few — archival, KB indexing,
-notifications and cloud push can all lag. Temporal's answer to the identical
-problem is the inversion: write the terminal status *and* the outbox rows in one
-small transaction, drain the tail asynchronously, and document the lag (it delays
-archival ~5 minutes by default). Kubernetes went the other way in 1.31, delaying
-its terminal condition — but only because premature `Complete` broke downstream
-usage accounting, and it compensated by publishing interim conditions so clients
-could still learn the outcome early. If this triage shrinks the gating set from
-37 to 3, the window shrinks with it and every mitigation above gets cheaper. **Do
-this before building the lease.**
+**Step 0 — the triage, done 2026-08-09. It changes the shape of the design.**
 
-1. **0130** — the standalone fixes. `completed_at` gains `COALESCE` (S21), and
-   the critic index lands (S30) with its dedupe pre-flight as a separate earlier
-   migration. No protocol, no coexistence risk, and they fix live pinned-lane
-   bugs today.
+The question was not "status first or last" but **which effects must land before
+the status is user-visible-correct?** Working the inventory against that question
+splits the ~37 into four classes, and the result is stronger than expected.
+
+**Class A — same row, same UPDATE. Not "effects" at all.** The status write
+(S17), `completed_at` (S21), the `assigned_agent_id` clear (S18), and the freeze
+stash-then-null (S19) are four separate autocommitted writes **to the same row**.
+`update_job_status` already accepts status, `assigned_agent_id`, `freeze_data`
+and the error fields — it simply does not take `completed_at`, which is the
+entire reason `completed` with `completed_at IS NULL` is reachable. Folding these
+into one UPDATE kills two live bugs outright — the NULL `completed_at` (S21) and
+S19's torn window that leaves a paused job permanently invisible to the
+dispatcher — **with no protocol, no command row, and no finalizer.** This is the
+cheapest correctness win in the whole of Gate 3 and it belongs in step 1.
+
+**Class B — decides *what* the status is; must precede it, and is DB-only.** The
+deliverable-gate outcome (S14), the verification-enabled decision that chooses
+`reviewing` over `completed`, the critic-verdict consequence (S27), and the loop
+barrier claim (S32's CAS). These are cheap decisions, not deliveries, and they
+already run before the write. They join Class A's transaction.
+
+**Class C — must follow, and must be durable. This is what the finalizer is
+for.** Subjob graft (S26), verification critic spawn (S30), loop advance (S32),
+terminal merge (S33), parent unblocks (S28/S29), and workspace archive and
+teardown (S36) — which must *never* precede the status write, since it destroys
+the workspace.
+
+**Class D — may lag arbitrarily, at-least-once, nobody waits.** Notifications
+(S13/S20/S25), the freeze workspace snapshot (S24), session wake (S34/S37), the
+dispatch trigger (S35), KB reindex.
+
+**The finding: the gating set contains no external I/O whatsoever.** Class A is
+one row; Class B is four DB reads. Everything with a Kubernetes call, a Gitea
+call, a WebDAV write or an SMTP send is Class C or D. That makes **Temporal's
+inversion viable after all** — terminal status *and* the command row in one small
+transaction, then drain the tail — which is a materially simpler design than
+"status last", because the command row is the replay guard, so the status no
+longer has to be.
+
+**One honest exception, and it is the reason this is not a pure inversion.** For
+a job whose product is a delivered artifact, `completed` before delivery is a
+lie: the user looks for the output and it is not there. Today that boundary is
+already inconsistent — cloud delivery (S15) precedes the status write while the
+Gitea merge (S33) and graft (S26) follow it. So delivery effects gate the
+*terminal* status; teardown, spawns, loop advance and notifications do not. This
+is also exactly the trap Kubernetes hit in 1.31, where a premature `Complete`
+broke downstream usage accounting; their compensation was interim conditions, and
+ours is the command row, which is already queryable.
+
+**Net effect on the rollout:** step 1 grows to include the Class A merge (a
+strict improvement, no dependencies), and step 4 shrinks from "move the status
+write last" to "move it after Class B and the delivery effects only". The
+window that (6)'s liveness machinery has to defend shrinks with it.
+
+1. **0130** — the standalone fixes, all independent of the protocol and all
+   fixing live pinned-lane bugs today: the **Class A merge** (status,
+   `completed_at`, `assigned_agent_id`, freeze stash/null in one UPDATE — this
+   subsumes the `COALESCE` patch and closes S19's invisibility window), and the
+   critic index with its dedupe pre-flight as a separate earlier migration.
 2. **0131** — the command and effect tables, `jobs.completion_seq_hwm`, the
    leader lease row, and the sweep predicate view. Dead schema; zero behaviour
    change.
 3. Accept writes the command for **both** lanes; the finalizer runs **inline**
    for both. Behaviour is identical to today, but every report is now durably
    recorded. This is the step that carries real risk — soak it behind a flag.
-4. The status write moves last, inside the inline finalizer, together with (6)'s
-   sweep predicates. Pinned gains crash recovery here.
+4. The status write moves after **Class B and the delivery effects only** (not
+   after all 37 — see the step-0 triage), inside the inline finalizer, together
+   with (6)'s sweep predicates. Pinned gains crash recovery here.
 5. Background finalizer enabled for stateless units only.
 6. Stateless worker admission opens.
 
