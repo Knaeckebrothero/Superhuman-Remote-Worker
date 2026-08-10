@@ -204,6 +204,30 @@ override the corresponding text above.
 6. **Future hook, do not build**: the lane-aware resume verb will later gate
    on pending completion commands (Gate 3 step 2+). Leave a marked TODO at the
    verb; nothing to implement tonight.
+7. **Recoverable-error stops NEVER call `/complete` on this lane.** §3.1.7's
+   "a genuine stop calls report_completion exactly as today" is too broad: an
+   `llm_unavailable` / `infra_transient` / `workspace_unavailable` stop (any
+   `error.recoverable` / outage-class freeze) reports `paused` + retry hints —
+   a state whose only automatic consumer is the dispatcher, which never sees
+   this lane. **Release the unit with error backoff instead**; the queue's
+   `attempts`/`parked` IS the retry machinery here. Only terminal stops and
+   human-facing stops (blocking_message, budget review, autonomy pauses,
+   give-up failures) report.
+8. **The failure arm of the terminal report**: report while STILL holding the
+   lease (heartbeat task alive). On 2xx → `complete_unit` (correction 5). On
+   non-2xx/timeout → **release with backoff** — never `complete_unit`, never
+   park — so a successor resumes from the END-state checkpoint and re-reports;
+   the status guard makes the duplicate benign. Add to the kill tests.
+9. **Fence implementation**: token equality against the row's current
+   `lease_token` ONLY. Do **not** reuse `fence_lease`/`state='leased'` — token
+   survives complete/release (never reset), so equality is robust to ordering
+   and correctly rejects a late zombie re-report (successor bumped the token)
+   while letting an exact same-holder retry fall through to the benign status
+   guard.
+10. **Lock order, binding tonight**: any transaction touching both a
+    `run_queue` row and its `jobs` row acquires the **run_queue row first**
+    (the claim's shape forces it; make the resume verb enqueue before its jobs
+    CAS). Opposite orders deadlock against the claim (40P01, ~1 s victim).
 
 ## 7. Stop rule
 
