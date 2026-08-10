@@ -7,6 +7,7 @@ import {
     cloudBadgeVisible,
     composeDenyPrefill,
     countTurnsAfter,
+    describeAttachmentRejection,
     draftKey,
     extractClipboardFiles,
     filterRewindCandidates,
@@ -511,6 +512,42 @@ describe('extractClipboardFiles', () => {
         const blob = new File(['x'], '', {type: ''});
         const out = extractClipboardFiles(itemList([clipItem('file', blob)]), NOW);
         expect(out[0].name).toBe(`pasted-${NOW}-0.bin`);
+    });
+});
+
+describe('describeAttachmentRejection', () => {
+    // The wiring (calling this from onFilesSelected/onPaste/onDrop/the camera
+    // path and pushing the result into chat.attachmentError) is exercised by
+    // Playwright on the dev cluster; here we cover the pure decision of which
+    // key + params to show.
+
+    it('returns null when nothing was rejected', () => {
+        expect(describeAttachmentRejection([])).toBeNull();
+    });
+
+    it('reports an oversize file with its name interpolated', () => {
+        expect(describeAttachmentRejection([{name: 'huge.pdf', reason: 'size'}])).toEqual({
+            key: 'chat.upload.tooLarge',
+            params: {name: 'huge.pdf'},
+        });
+    });
+
+    it('reports a count rejection with no filename (generic cap message)', () => {
+        expect(describeAttachmentRejection([{name: 'f20.txt', reason: 'count'}])).toEqual({
+            key: 'chat.upload.tooManyFiles',
+        });
+    });
+
+    it('prefers the size reason when a selection trips both at once', () => {
+        const rejected = [
+            {name: 'a.txt', reason: 'count' as const},
+            {name: 'huge.pdf', reason: 'size' as const},
+            {name: 'b.txt', reason: 'count' as const},
+        ];
+        expect(describeAttachmentRejection(rejected)).toEqual({
+            key: 'chat.upload.tooLarge',
+            params: {name: 'huge.pdf'},
+        });
     });
 });
 
