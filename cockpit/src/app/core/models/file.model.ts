@@ -46,22 +46,17 @@ export interface FilePreview {
   preview?: string;
   /** Upload progress percentage (0-100) */
   uploadProgress?: number;
-  /** Current upload status */
+  /**
+   * Current upload status. Job creation drives this through its own upload
+   * (job-create.component.ts). The chat composer no longer does: a chat
+   * attachment's upload state lives on the outbox item that carries it
+   * (`PendingUpload.status`), because the file leaves the composer the instant
+   * the user sends. `remoteName`/`uploadedFiles` lived here for the same
+   * reason and were removed with it.
+   */
   uploadStatus: UploadStatus;
   /** Error message if upload failed */
   error?: string;
-  /** Server-assigned filename after upload (for the agent hint) */
-  remoteName?: string;
-  /**
-   * Full server response entries for this file once its upload succeeds — a
-   * .zip expands into one entry per extracted member (thread_uploads.py).
-   * Retained (alongside `uploadStatus: COMPLETED`) so a retry after a later
-   * file's failure can skip re-uploading this one without losing what
-   * already landed: the backend has no delete endpoint or idempotency key,
-   * so a re-upload permanently duplicates the file server-side under a
-   * `_1` suffix.
-   */
-  uploadedFiles?: ThreadUploadedFile[];
 }
 
 /**

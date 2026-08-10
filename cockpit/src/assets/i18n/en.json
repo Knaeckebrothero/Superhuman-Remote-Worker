@@ -1600,6 +1600,9 @@
       "resuming": "Resuming session…",
       "endedSendResumes": "Type a message — sending resumes the session"
     },
+    "upload": {
+      "slashCommandWithAttachments": "Remove the attached files before running a command."
+    },
     "composer": {
       "attach": "Attach",
       "chooseFile": "Choose file",

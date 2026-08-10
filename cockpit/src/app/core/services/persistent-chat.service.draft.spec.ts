@@ -215,7 +215,7 @@ describe('PersistentChatService — instant-landing draft sessions', () => {
         expect(ctx.service.isDraftSession()).toBe(false);
         expect(ctx.service.threadId()).toBe('t-new');
         // The message is queued (not posted) until the session goes ready…
-        expect(ctx.service.outbox().map((i) => i.content)).toEqual(['fix the login bug']);
+        expect(ctx.service.outbox().map((i) => i.displayContent)).toEqual(['fix the login bug']);
         expect(inputPosts(ctx).length).toBe(0);
         // …and the optimistic bubble survived the create/connect reset.
         expect(ctx.service.turns().filter(isUserTurn).length).toBe(1);
@@ -268,6 +268,54 @@ describe('PersistentChatService — instant-landing draft sessions', () => {
         });
     });
 
+    it('a pasted screenshot on the landing page creates the session, then uploads', async () => {
+        // Pre-Task-4 this was an unrecoverable dead end: onPaste attaches with
+        // no connection guard, sendMessage hit the upload block first,
+        // threadId() was null, and it bailed with 'Cannot upload: no active
+        // thread' BEFORE _createFromDraftSession — so the composer was stuck
+        // with a chip it could neither send nor recover from.
+        const ctx = createService({eligible: []});
+        ctx.service.enterDraftSession();
+        await flushTick();
+
+        const shot = new File(['x'], 'pasted-image.png', {type: 'image/png'});
+        ctx.service.addAttachments([{
+            id: 'p1', file: shot, name: 'pasted-image.png', size: shot.size,
+            mimeType: 'image/png', uploadStatus: 'pending',
+        } as any]);
+
+        const ok = await ctx.service.sendMessage('what is this?');
+        await flushTick();
+
+        expect(ok).toBe(true);
+        expect(ctx.service.attachmentError()).toBeNull();
+        expect(createPosts(ctx).length).toBe(1);
+        expect(ctx.service.threadId()).toBe('t-new');
+        // Composer cleared; the file rides the queued item instead.
+        expect(ctx.service.pendingAttachments()).toEqual([]);
+        expect(ctx.service.outbox()[0].pendingFiles?.map((f) => f.name)).toEqual([
+            'pasted-image.png',
+        ]);
+        // Still no upload — there is no ready workspace yet.
+        expect(ctx.mockApi.uploadOneToThread).not.toHaveBeenCalled();
+
+        // Ready → the upload runs against the thread that now exists, then
+        // the message goes out with the hint naming the stored file.
+        ctx.mockApi.uploadOneToThread.mockReturnValue(
+            of([{name: 'pasted-image.png', size: shot.size, mime_type: 'image/png', path: 'uploads/pasted-image.png'}]),
+        );
+        fireSseOpen(ctx.sseInstances[0]);
+        fireSseMessage(ctx.sseInstances[0], {method: 'ready', params: {}}, '1:1');
+        await flushTick();
+
+        expect(ctx.mockApi.uploadOneToThread).toHaveBeenCalledWith('t-new', shot);
+        expect(inputPosts(ctx).length).toBe(1);
+        expect(inputPosts(ctx)[0][1].content).toBe(
+            'what is this?\n\n[Attached files in uploads/: pasted-image.png]',
+        );
+        expect(ctx.service.outbox().length).toBe(0);
+    });
+
     it('a second send while the create is in flight queues without a second create', async () => {
         const ctx = createService();
         ctx.service.enterDraftSession();
@@ -278,7 +326,7 @@ describe('PersistentChatService — instant-landing draft sessions', () => {
         await flushTick();
 
         expect(createPosts(ctx).length).toBe(1);
-        expect(ctx.service.outbox().map((i) => i.content)).toEqual(['one', 'two']);
+        expect(ctx.service.outbox().map((i) => i.displayContent)).toEqual(['one', 'two']);
     });
 
     it('re-enters draft (outbox intact) when the create fails, so send retries it', async () => {
@@ -290,7 +338,7 @@ describe('PersistentChatService — instant-landing draft sessions', () => {
         await flushTick();
 
         expect(ctx.service.isDraftSession()).toBe(true);
-        expect(ctx.service.outbox().map((i) => i.content)).toEqual(['hello']);
+        expect(ctx.service.outbox().map((i) => i.displayContent)).toEqual(['hello']);
         // The optimistic bubble was re-shown on the error state.
         expect(ctx.service.turns().filter(isUserTurn).length).toBe(1);
     });
