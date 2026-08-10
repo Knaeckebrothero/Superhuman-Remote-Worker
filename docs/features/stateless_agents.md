@@ -1198,12 +1198,25 @@ The DB fence is control-plane enforced among honest executors; WebDAV bytes and
 the user-writable resource marker remain cooperative, so a PUT already in
 flight can finish after lease loss without server-side conditional writes.
 
-This does **not** remove the gate. The default `rclone_mount` path still needs
-the §3.4 mid-idle token-expiry/adopt-or-heal proof; outbox, interrupt and
+The §3.4 resident-daemon path is also built and live-verified. Stateless
+physical handoff now retires the claim-scoped token-refresh and overlay-monitor
+controllers while leaving their workspace-side rclone/overlay processes in
+place. The next exact lease owner publishes a fresh bearer, forces a bounded
+non-recursive VFS refresh, and either adopts the healthy resident or performs an
+exact fenced heal. A live token-rotation handoff kept the same rclone PID and
+generation, rejected both local and remote stale-owner writes, and adopted the
+overlay with its upper data intact. A second fault run killed the exact lower
+PID, observed the stale ENOTCONN mount-table entry, and healed in **1.212 s** to
+a new PID and generation while preserving the overlay upperdir. The remote
+resource marker and flock live in the workload user's home and are therefore a
+**cooperative correctness protocol**, not a security boundary against arbitrary
+shell mutation. Pinned cleanup keeps its historical destructive behavior.
+
+This does **not** remove the gate. Outbox, interrupt and attached-client/Canvas
 presence re-homing remain open; workspace/runtime-incarnation authority and
 durable terminal-retirement acknowledgement are incomplete; and the §6.1
-RAM/path-bypass work is deferred to its own pass. Neither direct proof enqueued
-a turn, changed a sandbox thread's lane, or created a worker batch.
+RAM/path-bypass work is deferred to its own pass. None of the direct proofs
+enqueued a turn, changed a sandbox thread's lane, or created a worker batch.
 
 **S3** (workers): **Gates 1 and 2 are built and merged**; worker admission stays
 closed. No `worker_batch` unit has ever been enqueued and no job carries a

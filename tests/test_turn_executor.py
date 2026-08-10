@@ -17,7 +17,7 @@ import os
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
-from unittest.mock import patch
+from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import uuid4
 
 import pytest
@@ -198,12 +198,19 @@ class Harness:
             pa._thread_id = kwargs.get("thread_id")
             pa._loop_user_queue = asyncio.Queue()
 
-        async def fake_terminate(reason, *, mark_thread=True, preserve_shell=None):
+        async def fake_terminate(
+            reason,
+            *,
+            mark_thread=True,
+            preserve_shell=None,
+            preserve_workspace_daemons=False,
+        ):
             harness.calls["terminate"].append(
                 {
                     "reason": reason,
                     "mark_thread": mark_thread,
                     "preserve_shell": preserve_shell,
+                    "preserve_workspace_daemons": preserve_workspace_daemons,
                 }
             )
             task = pa._loop_task
@@ -495,6 +502,36 @@ class TestTurnError:
             ("detach", "release_turn_error"),
             ("release", None),
         ]
+
+    @pytest.mark.asyncio
+    async def test_failed_terminate_still_retires_local_handoff_controllers(
+        self, harness
+    ):
+        backend = MagicMock()
+        session = SimpleNamespace(
+            stateless_warm_reuse_safe=False,
+            cleanup=AsyncMock(),
+            retire_shell_owner=MagicMock(),
+            _unwrapped_backend=MagicMock(return_value=backend),
+        )
+        pa._session = session
+        pa._thread_id = "physical-thread"
+
+        with patch.object(
+            pa,
+            "_terminate_session",
+            new=AsyncMock(side_effect=RuntimeError("journal drain failed")),
+        ):
+            await harness.executor._detach_cached_session("turn_error")
+
+        session.cleanup.assert_awaited_once_with(
+            preserve_shell=True,
+            preserve_workspace_daemons=True,
+        )
+        session.retire_shell_owner.assert_called_once_with()
+        backend.retire.assert_called_once_with()
+        assert pa._session is None
+        assert pa._thread_id is None
 
     @pytest.mark.asyncio
     async def test_loop_death_releases_with_error(self, harness):
@@ -836,11 +873,13 @@ class TestAffinity:
                 "reason": "turn_complete",
                 "mark_thread": False,
                 "preserve_shell": True,
+                "preserve_workspace_daemons": True,
             },
             {
                 "reason": "turn_complete",
                 "mark_thread": False,
                 "preserve_shell": True,
+                "preserve_workspace_daemons": True,
             },
         ]
         assert first_session is harness.sessions[0]

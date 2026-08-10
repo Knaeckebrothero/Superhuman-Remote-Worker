@@ -6,6 +6,8 @@ _setup_context_manager(), _setup_shell_manager(), _setup_memory(),
 swap_backend(), get_workspace_content(), cleanup().
 """
 
+import asyncio
+import time
 import uuid
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, call, patch
@@ -1228,13 +1230,12 @@ def _protected_cloud_mount_cfg() -> dict:
 
 
 class TestSetupCloudMountOverlayFailure:
-    """F-M6 (Task B10): pin the overlay-failure -> RO-lower-teardown branch
-    of ``_setup_cloud_mount``. This is the B9 fail-safe deviation from the
-    original brief (which left the RO lower mounted on overlay failure) —
-    a protected session whose overlay fails to mount must end up with NO
-    cloud access at all (cloud_mount_manager torn down + cleared) rather
-    than a half-protected session that still writes straight to the raw RO
-    lower thinking it's protected."""
+    """Pin lane-specific protected-overlay attach failure cleanup.
+
+    Pinned retains its B9 fail-safe teardown and degraded mode. Stateless
+    fails the attach and retires only its local controller because the lower
+    may be a healthy predecessor resident needed by the successor.
+    """
 
     @pytest.mark.asyncio
     async def test_overlay_failure_tears_down_ro_lower(self):
@@ -1337,6 +1338,163 @@ class TestSetupCloudMountOverlayFailure:
         assert session.cloud_mount_manager is fake_rclone_manager
         assert session.overlay_mount_manager is fake_overlay_manager
         fake_rclone_manager.aclose.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_stateless_overlay_failure_preserves_adopted_lower(self):
+        """An overlay mismatch/failure is an attach failure, not terminal end.
+
+        The lower may have been adopted from the predecessor. Retire this
+        claimant's local controller and fail attach closed; never unmount the
+        workspace resident that a successor can converge.
+        """
+
+        session = _make_session(
+            shell_owner_token=13,
+            workspace_manager=SimpleNamespace(path="/workspace", backend=MagicMock()),
+        )
+        fake_rclone_manager = MagicMock()
+        fake_rclone_manager.start_all = AsyncMock(return_value=None)
+        fake_rclone_manager.mounts = []
+        fake_rclone_manager.detach_for_handoff = AsyncMock(return_value=None)
+        fake_rclone_manager.aclose = AsyncMock(return_value=None)
+
+        fake_overlay_manager = MagicMock()
+        fake_overlay_manager.mount = MagicMock(
+            side_effect=RuntimeError("overlay identity mismatch")
+        )
+
+        with (
+            patch(
+                "src.services.cloud_mount.RcloneMountManager",
+                return_value=fake_rclone_manager,
+            ),
+            patch(
+                "src.services.cloud_overlay.OverlayMountManager",
+                return_value=fake_overlay_manager,
+            ),
+        ):
+            with pytest.raises(RuntimeError, match="identity mismatch"):
+                await session._setup_cloud_mount(_protected_cloud_mount_cfg())
+
+        fake_rclone_manager.detach_for_handoff.assert_awaited_once_with()
+        fake_rclone_manager.aclose.assert_not_awaited()
+        assert session.cloud_mount_manager is None
+        assert session.overlay_mount_manager is None
+
+
+class TestStatelessCloudMountClaimSetup:
+    @pytest.mark.asyncio
+    async def test_adopt_probe_finishes_before_shell_and_tools_are_exposed(self):
+        """The manager's start_all contract includes a real directory probe.
+
+        Pin its position in the complete setup sequence: a claimant cannot
+        construct either the shell manager or tools until adoption/heal and
+        that first workspace read have completed.
+        """
+
+        order = []
+        session = _make_session(shell_owner_token=17)
+
+        async def setup_workspace(**_kwargs):
+            order.append("workspace")
+            session.workspace_manager = SimpleNamespace(
+                path="/workspace",
+                backend=MagicMock(),
+            )
+
+        manager = MagicMock()
+
+        async def adopt_heal_and_probe():
+            order.append("cloud_adopt_heal_probe")
+
+        manager.start_all = AsyncMock(side_effect=adopt_heal_and_probe)
+        manager.mounts = []
+        session._setup_workspace = AsyncMock(side_effect=setup_workspace)
+        session._setup_shell_manager = MagicMock(
+            side_effect=lambda: order.append("shell")
+        )
+        session._setup_knowledge = MagicMock()
+        session._setup_tools = MagicMock(side_effect=lambda _db: order.append("tools"))
+        session._bind_tools = MagicMock()
+        session._setup_context_manager = MagicMock()
+        session._setup_memory = MagicMock()
+        session._refresh_runtime_facts = MagicMock()
+        session._drain_store_stats = MagicMock(return_value="n/a")
+        session.tools = []
+
+        with (
+            patch(
+                "src.services.cloud_mount.RcloneMountManager",
+                return_value=manager,
+            ),
+            patch(
+                "src.api.persistent_session.get_phase_system_prompt",
+                return_value="prompt",
+            ),
+        ):
+            await session._setup_steps(
+                {},
+                time.perf_counter(),
+                llm=MagicMock(),
+                auxiliary_llm=None,
+                postgres_conn=None,
+                vector_conn=None,
+                workspace_override={"backend": "remote"},
+                git_remote_url=None,
+                cloud_mount_cfg={"driver": "rclone", "mounts": []},
+            )
+
+        assert order[:4] == [
+            "workspace",
+            "cloud_adopt_heal_probe",
+            "shell",
+            "tools",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_mount_probe_failure_fails_stateless_setup_closed(self):
+        session = _make_session(
+            shell_owner_token=23,
+            workspace_manager=SimpleNamespace(
+                path="/workspace",
+                backend=MagicMock(),
+            ),
+        )
+        manager = MagicMock()
+        manager.start_all = AsyncMock(
+            side_effect=RuntimeError("first directory probe: ENOTCONN")
+        )
+
+        with patch(
+            "src.services.cloud_mount.RcloneMountManager",
+            return_value=manager,
+        ):
+            with pytest.raises(RuntimeError, match="ENOTCONN"):
+                await session._setup_cloud_mount({"driver": "rclone", "mounts": []})
+
+        assert session.cloud_mount_manager is None
+        assert "ENOTCONN" in session.cloud_mount_error
+
+    @pytest.mark.asyncio
+    async def test_pinned_mount_failure_retains_historical_degraded_mode(self):
+        session = _make_session(
+            shell_owner_token=None,
+            workspace_manager=SimpleNamespace(
+                path="/workspace",
+                backend=MagicMock(),
+            ),
+        )
+        manager = MagicMock()
+        manager.start_all = AsyncMock(side_effect=RuntimeError("mount unavailable"))
+
+        with patch(
+            "src.services.cloud_mount.RcloneMountManager",
+            return_value=manager,
+        ):
+            await session._setup_cloud_mount({"driver": "rclone", "mounts": []})
+
+        assert session.cloud_mount_manager is None
+        assert session.cloud_mount_error == "mount unavailable"
 
 
 # ---------------------------------------------------------------------------
@@ -3063,6 +3221,112 @@ class TestCleanup:
         backend.retire_shell_owner.assert_called_once_with()
         backend.retire.assert_called_once_with()
         backend.disconnect.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_stateless_handoff_retires_local_daemon_controllers_only(self):
+        session = _make_session(shell_owner_token=31)
+        shell_manager = MagicMock()
+        backend = MagicMock()
+        backend.is_connected.return_value = True
+        session.shell_manager = shell_manager
+        session.workspace_manager = MagicMock(backend=backend)
+
+        overlay = MagicMock()
+        cloud = MagicMock()
+        cloud.detach_for_handoff = AsyncMock()
+        cloud.aclose = AsyncMock()
+        session.overlay_mount_manager = overlay
+        session.cloud_mount_manager = cloud
+
+        monitor_started = asyncio.Event()
+
+        async def monitor():
+            monitor_started.set()
+            await asyncio.Event().wait()
+
+        session._cloud_overlay_monitor_task = asyncio.create_task(monitor())
+        await monitor_started.wait()
+
+        await session.cleanup(
+            preserve_shell=True,
+            preserve_workspace_daemons=True,
+        )
+
+        assert session._cloud_overlay_monitor_task is None
+        overlay.detach_local.assert_called_once_with()
+        overlay.unmount.assert_not_called()
+        cloud.detach_for_handoff.assert_awaited_once_with()
+        cloud.aclose.assert_not_awaited()
+        shell_manager.cleanup.assert_not_called()
+        backend.retire.assert_called_once_with()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        (
+            "shell_owner_token",
+            "preserve_shell",
+            "preserve_workspace_daemons",
+        ),
+        [(None, True, True), (41, False, False)],
+        ids=["pinned-rejects-preserve", "stateless-terminal-end"],
+    )
+    async def test_non_handoff_cleanup_unmounts_workspace_daemons(
+        self,
+        shell_owner_token,
+        preserve_shell,
+        preserve_workspace_daemons,
+    ):
+        session = _make_session(shell_owner_token=shell_owner_token)
+        session.workspace_manager = MagicMock(backend=MagicMock(spec=[]))
+        session.shell_manager = MagicMock()
+        overlay = MagicMock()
+        cloud = MagicMock()
+        cloud.detach_for_handoff = AsyncMock()
+        cloud.aclose = AsyncMock()
+        session.overlay_mount_manager = overlay
+        session.cloud_mount_manager = cloud
+
+        await session.cleanup(
+            preserve_shell=preserve_shell,
+            preserve_workspace_daemons=preserve_workspace_daemons,
+        )
+
+        overlay.unmount.assert_called_once_with()
+        overlay.detach_local.assert_not_called()
+        cloud.aclose.assert_awaited_once_with()
+        cloud.detach_for_handoff.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_terminal_resource_teardown_runs_after_shell_admission_closes(self):
+        order = []
+        session = _make_session(shell_owner_token=51)
+        backend = MagicMock()
+        backend.retire_shell_owner.side_effect = lambda: order.append(
+            "shell_admission_closed"
+        )
+        backend.retire.side_effect = lambda: order.append("backend_retired")
+        session.workspace_manager = MagicMock(backend=backend)
+        session.shell_manager = MagicMock()
+        session.shell_manager.cleanup.side_effect = lambda: order.append(
+            "shell_destroyed"
+        )
+
+        overlay = MagicMock()
+        overlay.unmount.side_effect = lambda: order.append("overlay_unmounted")
+        cloud = MagicMock()
+        cloud.aclose = AsyncMock(side_effect=lambda: order.append("rclone_unmounted"))
+        session.overlay_mount_manager = overlay
+        session.cloud_mount_manager = cloud
+
+        await session.cleanup()
+
+        assert order == [
+            "shell_admission_closed",
+            "overlay_unmounted",
+            "rclone_unmounted",
+            "shell_destroyed",
+            "backend_retired",
+        ]
 
     @pytest.mark.asyncio
     async def test_cleanup_destroys_shell_before_backend_retirement_on_genuine_end(

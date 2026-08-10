@@ -354,6 +354,14 @@ class RemoteBackend(WorkspaceBackend):
         # cleanup can therefore retire this backend's shell owner without a
         # stale worker thread passing the check and submitting afterward.
         self._shell_io_lock = threading.RLock()
+        # Resident workspace daemons share the durable tmux token + flock, but
+        # have separate local admission.  Session detach retires shell tools
+        # first; terminal cleanup must still be able to unmount while this
+        # claim owns the queue lease.  The workspace marker/lock are writable
+        # by the workload user, so this is a cooperative correctness fence,
+        # not a security boundary against hostile workspace code.
+        self._claim_resource_io_lock = threading.RLock()
+        self._claim_resource_retired = False
         self._shell_initialized = False
         self._shell_owner_token: Optional[int] = None
         self._shell_generation: Optional[str] = None
@@ -447,6 +455,58 @@ class RemoteBackend(WorkspaceBackend):
             disposition,
             time.perf_counter() - started,
         )
+
+    @property
+    def claim_resource_fenced(self) -> bool:
+        """True when this backend carries an exact stateless lease token."""
+
+        return self._shell_owner_token is not None
+
+    def retire_claim_resource_owner(self) -> None:
+        """Wait out admitted resource I/O, then reject later local callers."""
+
+        with self._claim_resource_io_lock:
+            self._claim_resource_retired = True
+
+    def exec_claim_resource(
+        self,
+        command: str,
+        timeout: int = 30,
+        *,
+        operation: str = "workspace resource mutation",
+    ) -> str:
+        """Run a resident-resource operation under the claim's durable fence.
+
+        Pinned callers execute the original command unchanged.  Stateless
+        callers serialize with tmux ownership promotion under the same
+        workspace-resident flock and validate the marker, full owner,
+        generation, and exact queue token before the command starts.  Unlike
+        tmux tool I/O this deliberately ignores ``_shell_retired``: terminal
+        mount teardown follows shell retirement during session cleanup.
+
+        Both the marker and flock live in the workload user's writable home.
+        This prevents stale cooperating agents from mutating after a handoff;
+        it is not an enforced boundary against hostile workspace processes.
+        """
+
+        if self._shell_owner_token is None:
+            return self.exec_command(command, timeout=timeout)
+        with self._claim_resource_io_lock:
+            if self._claim_resource_retired:
+                raise WorkspaceUnavailableError(
+                    "Workspace claim-resource owner has been retired from this backend"
+                )
+            inner = self._stateless_tmux_fence_shell() + command
+            output, exit_code = self._exec_with_status(
+                self._tmux_lock_command(inner),
+                timeout=timeout,
+                retain_tail=True,
+            )
+            if exit_code != 0:
+                raise WorkspaceUnavailableError(
+                    f"Claim-fenced {operation} failed with exit code {exit_code}"
+                )
+            return output
 
     @property
     def sudo_action(self) -> str:
@@ -701,9 +761,15 @@ class RemoteBackend(WorkspaceBackend):
         call already in progress, so the retired bit prevents that stale call
         from reconnecting and mutating the successor's workspace afterward.
         """
-        with self._connection_lock:
-            self._retired = True
-            self.disconnect()
+        # Match exec_claim_resource's lock order (resource admission before
+        # transport).  A fallback retirement that runs without manager cleanup
+        # waits for any already-admitted mutation, rejects later ones, and only
+        # then tears down SSH/SFTP.
+        with self._claim_resource_io_lock:
+            self._claim_resource_retired = True
+            with self._connection_lock:
+                self._retired = True
+                self.disconnect()
 
     def is_connected(self) -> bool:
         if self._ssh is None:

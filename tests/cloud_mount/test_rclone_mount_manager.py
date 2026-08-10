@@ -1,6 +1,13 @@
 from __future__ import annotations
 
+import copy
+import hashlib
+import os
+import subprocess
+from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 
@@ -13,7 +20,10 @@ class FakeRemoteBackend:
     def __init__(self, *, root: str | None = None) -> None:
         self.files: dict[str, str] = {}
         self.commands: list[tuple[str, int]] = []
+        self.resource_operations: list[str] = []
         self.outputs_by_script: dict[str, str] = {}
+        self.claim_resource_fenced = False
+        self.claim_resource_retired = False
         if root is not None:
             self.root = root
 
@@ -28,9 +38,30 @@ class FakeRemoteBackend:
     def exec_command(self, command: str, timeout: int = 30) -> str:
         self.commands.append((command, timeout))
         for script_name, output in self.outputs_by_script.items():
-            if script_name in command:
+            if f"/{script_name}" in command:
                 return output
         return "__SRW_RCLONE_MOUNT_OK__\n"
+
+    def exec_claim_resource(
+        self,
+        command: str,
+        timeout: int = 30,
+        *,
+        operation: str = "workspace resource mutation",
+    ) -> str:
+        if self.claim_resource_retired:
+            raise RcloneMountError("claim resource retired")
+        self.resource_operations.append(operation)
+        return self.exec_command(command, timeout=timeout)
+
+    def retire_claim_resource_owner(self) -> None:
+        self.claim_resource_retired = True
+
+
+class FakeFencedRemoteBackend(FakeRemoteBackend):
+    def __init__(self, *, root: str | None = None) -> None:
+        super().__init__(root=root)
+        self.claim_resource_fenced = True
 
 
 def _cloud_mount_cfg() -> dict:
@@ -419,7 +450,7 @@ def test_mount_script_requires_prepared_token():
         manager._start_all_sync()
 
 
-def test_push_token_writes_tmp_then_moves_atomically():
+def test_pinned_push_token_preserves_unique_sftp_staging():
     backend = FakeRemoteBackend()
     manager = RcloneMountManager(
         thread_id="thread-12345678",
@@ -433,15 +464,125 @@ def test_push_token_writes_tmp_then_moves_atomically():
 
     manager._push_token_sync(state, "tok-fresh")
 
-    tmp_rel = f"{state.state_rel}/bearer.token.new"
-    assert backend.files[tmp_rel] == "tok-fresh\n"
+    tmp_paths = [path for path in backend.files if "/bearer.token.new." in path]
+    assert len(tmp_paths) == 1
+    assert backend.files[tmp_paths[0]] == "tok-fresh\n"
     last_command, _timeout = backend.commands[-1]
     assert "chmod 600" in last_command
     assert "mv -f" in last_command
     assert state.token_path in last_command
+    assert "tok-fresh" not in last_command
+    assert backend.resource_operations[-1] != "publish bearer token for legacy-session"
 
 
-def test_unmount_script_removes_token_files():
+def test_pinned_push_token_uses_unique_sftp_path_each_time():
+    backend = FakeRemoteBackend()
+    manager = RcloneMountManager(
+        thread_id="thread-12345678",
+        cloud_cfg=_opencloud_mount_cfg(),
+        workspace_backend=backend,
+        workspace_root=Path("/home/agent-host/workspace"),
+    )
+    manager._initial_tokens[0] = "tok-seed"
+    manager._start_all_sync()
+    state = manager.mounts[0]
+
+    manager._push_token_sync(state, "tok-fresh-1")
+    manager._push_token_sync(state, "tok-fresh-2")
+
+    tmp_paths = {path for path in backend.files if "/bearer.token.new." in path}
+    assert len(tmp_paths) == 2
+
+
+def test_stateless_push_token_is_wholly_inside_one_fenced_command():
+    backend = FakeFencedRemoteBackend()
+    manager = RcloneMountManager(
+        thread_id="thread-12345678",
+        cloud_cfg=_opencloud_mount_cfg(),
+        workspace_backend=backend,
+        workspace_root=Path("/home/agent-host/workspace"),
+    )
+    state = manager._state_for_mount(_opencloud_mount_cfg()["mounts"][0], 0)
+
+    manager._push_token_sync(state, "tok-fresh")
+
+    command, _timeout = backend.commands[-1]
+    assert "mktemp" in command
+    assert "base64 -d" in command
+    assert "chmod 600" in command
+    assert "mv -f" in command
+    assert state.token_path in command
+    assert "tok-fresh" not in command
+    assert not any("bearer.token.new" in path for path in backend.files)
+    assert backend.resource_operations == ["publish bearer token for legacy-session"]
+
+
+@pytest.mark.asyncio
+async def test_refreshed_token_is_used_by_later_restart(fake_token_client):
+    backend = FakeRemoteBackend()
+    manager = RcloneMountManager(
+        thread_id="thread-12345678",
+        cloud_cfg=_opencloud_mount_cfg(),
+        workspace_backend=backend,
+        workspace_root=Path("/home/agent-host/workspace"),
+    )
+
+    await manager.start_all()
+    try:
+        await manager._refresh_keycloak_tokens_once()
+        manager.restart_mount("legacy-session")
+
+        mount_script = next(
+            body
+            for path, body in backend.files.items()
+            if path.endswith("mount_srw-thread-1-home.sh")
+        )
+        assert "tok-2" in mount_script
+        assert "tok-1" not in mount_script
+        assert manager._token_for_index(0) == "tok-2"
+    finally:
+        await manager.aclose()
+
+
+@pytest.mark.asyncio
+async def test_partial_multi_mount_start_rolls_back_in_reverse_order():
+    cfg = _cloud_mount_cfg()
+    second = copy.deepcopy(cfg["mounts"][0])
+    second.update(
+        {
+            "mount_id": "second-mount",
+            "target_path": "/cloud/second",
+            "workspace_name": "second",
+        }
+    )
+    cfg["mounts"].append(second)
+    backend = FakeRemoteBackend()
+    backend.outputs_by_script["mount_srw-thread-1-second.sh"] = (
+        "__SRW_RCLONE_MOUNT_FAILED__ rc=1\n"
+    )
+    manager = RcloneMountManager(
+        thread_id="thread-12345678",
+        cloud_cfg=cfg,
+        workspace_backend=backend,
+        workspace_root=Path("/home/agent-host/workspace"),
+    )
+
+    with pytest.raises(RcloneMountError):
+        await manager.start_all()
+
+    commands = [command for command, _timeout in backend.commands]
+    assert len(commands) == 4
+    assert "mount_srw-thread-1-home.sh" in commands[0]
+    assert "mount_srw-thread-1-second.sh" in commands[1]
+    assert "unmount_srw-thread-1-second.sh" in commands[2]
+    assert "unmount_srw-thread-1-home.sh" in commands[3]
+    assert manager.active is False
+    assert manager.mounts == []
+    assert manager._mounts_by_id == {}
+    assert manager._mount_index_by_id == {}
+
+
+def test_pinned_unmount_preserves_historical_unconditional_cleanup():
     backend = FakeRemoteBackend()
     manager = RcloneMountManager(
         thread_id="thread-12345678",
@@ -455,7 +596,202 @@ def test_unmount_script_removes_token_files():
 
     script = manager._unmount_script(state)
 
-    assert f"rm -f {state.token_path} {state.token_helper_path}" in script
+    assert state.token_path in script
+    assert state.token_helper_path in script
+    assert "core/quit" in script
+    assert "resident.identity" not in script
+    assert "kill -9" in script
+    assert "_srw_pid_matches" not in script
+
+
+def test_stateless_unmount_requires_exact_identity_and_pid_cmdline():
+    backend = FakeFencedRemoteBackend()
+    manager = RcloneMountManager(
+        thread_id="thread-12345678",
+        cloud_cfg=_opencloud_mount_cfg(),
+        workspace_backend=backend,
+        workspace_root=Path("/home/agent-host/workspace"),
+    )
+    state = manager._state_for_mount(_opencloud_mount_cfg()["mounts"][0], 0)
+
+    script = manager._unmount_script(state)
+
+    assert state.identity_file in script
+    assert state.resident_spec_digest in script
+    assert state.resident_generation in script
+    assert "_srw_pid_matches" in script
+    assert 'basename "$_srw_exe"' in script
+    assert "timeout 10 rclone rc" in script
+    assert "kill -9" in script
+
+
+def _resident_unmount_runtime(
+    tmp_path: Path, *, resident_pid: int
+) -> tuple[str, dict[str, str]]:
+    backend = FakeFencedRemoteBackend()
+    manager = RcloneMountManager(
+        thread_id="thread-12345678",
+        cloud_cfg=_opencloud_mount_cfg(),
+        workspace_backend=backend,
+        workspace_root=tmp_path / "workspace",
+    )
+    original = manager._state_for_mount(_opencloud_mount_cfg()["mounts"][0], 0)
+    state_dir = tmp_path / "resident"
+    target = tmp_path / "target"
+    state_dir.mkdir()
+    target.mkdir()
+    state = replace(
+        original,
+        state_dir=str(state_dir),
+        target_path=str(target),
+        config_path=str(state_dir / "rclone.conf"),
+        pid_file=str(state_dir / "rclone.pid"),
+        identity_file=str(state_dir / "resident.identity"),
+        token_path=str(state_dir / "bearer.token"),
+        token_helper_path=str(state_dir / "bearer-helper.sh"),
+    )
+    Path(state.identity_file).write_text(
+        "|".join(
+            (
+                "1",
+                state.resident_spec_digest,
+                "active",
+                state.resident_generation,
+                str(resident_pid),
+                state.rc_pass,
+            )
+        )
+        + "\n"
+    )
+    Path(state.pid_file).write_text(f"{resident_pid}\n")
+    Path(state.token_path).write_text("token\n")
+    Path(state.token_helper_path).write_text("helper\n")
+    mounted = tmp_path / "mounted"
+    mounted.touch()
+    events = tmp_path / "events"
+    bash_env = tmp_path / "bash-env"
+    bash_env.write_text(
+        """
+# Model the observed ENOTCONN defect: mountpoint(1) lies because its target
+# stat fails, while the kernel mount table still carries the stale FUSE mount.
+mountpoint() { return 1; }
+findmnt() { [ -e "$SRW_TEST_MOUNTED" ]; }
+fusermount3() {
+  printf 'fusermount3 %s\\n' "$*" >> "$SRW_TEST_EVENTS"
+  rm -f "$SRW_TEST_MOUNTED"
+}
+fusermount() {
+  printf 'fusermount %s\\n' "$*" >> "$SRW_TEST_EVENTS"
+  rm -f "$SRW_TEST_MOUNTED"
+}
+sleep() { :; }
+timeout() { shift; "$@"; }
+export -f mountpoint findmnt fusermount3 fusermount sleep timeout
+"""
+    )
+    script = manager._unmount_script(state)
+    env = {
+        **os.environ,
+        "BASH_ENV": str(bash_env),
+        "SRW_TEST_MOUNTED": str(mounted),
+        "SRW_TEST_EVENTS": str(events),
+    }
+    return script, env
+
+
+def test_stateless_dead_resident_pid_unmounts_stale_target(tmp_path):
+    dead_pid = 2_147_483_647
+    assert not Path(f"/proc/{dead_pid}").exists()
+    script, env = _resident_unmount_runtime(tmp_path, resident_pid=dead_pid)
+    script_path = tmp_path / "unmount-dead.sh"
+    script_path.write_text(script)
+
+    syntax = subprocess.run(
+        ["bash", "-n", str(script_path)], env=env, text=True, capture_output=True
+    )
+    result = subprocess.run(
+        ["bash", str(script_path)], env=env, text=True, capture_output=True
+    )
+
+    assert syntax.returncode == 0, syntax.stderr
+    assert result.returncode == 0, result.stderr
+    assert "__SRW_RCLONE_MOUNT_OK__" in result.stdout
+    assert "fusermount3 -u" in (tmp_path / "events").read_text()
+    assert not (tmp_path / "mounted").exists()
+    assert not (tmp_path / "resident" / "resident.identity").exists()
+
+
+def test_stateless_reused_live_pid_refuses_kill_and_unmount(tmp_path):
+    live_mismatched_pid = os.getpid()
+    assert Path(f"/proc/{live_mismatched_pid}").exists()
+    script, env = _resident_unmount_runtime(tmp_path, resident_pid=live_mismatched_pid)
+    script_path = tmp_path / "unmount-reused.sh"
+    script_path.write_text(script)
+
+    syntax = subprocess.run(
+        ["bash", "-n", str(script_path)], env=env, text=True, capture_output=True
+    )
+    result = subprocess.run(
+        ["bash", str(script_path)], env=env, text=True, capture_output=True
+    )
+
+    assert syntax.returncode == 0, syntax.stderr
+    assert result.returncode == 85
+    assert (tmp_path / "mounted").exists()
+    assert not (tmp_path / "events").exists()
+    assert (tmp_path / "resident" / "resident.identity").exists()
+
+
+def test_stateless_heal_requires_conclusive_unmount_ack_before_remount():
+    backend = FakeFencedRemoteBackend()
+    manager = RcloneMountManager(
+        thread_id="thread-12345678",
+        cloud_cfg=_cloud_mount_cfg(),
+        workspace_backend=backend,
+        workspace_root=Path("/workspace"),
+    )
+    candidate = manager._state_for_mount(_cloud_mount_cfg()["mounts"][0], 0)
+    backend.outputs_by_script["probe_srw-thread-1-home.sh"] = (
+        "__SRW_RCLONE_RESIDENT_HEAL__\t"
+        f"{candidate.resident_spec_digest}\t{'e' * 32}\t999999999\t"
+        "residentPass_123456789012345\n"
+    )
+    backend.outputs_by_script["unmount_srw-thread-1-home.sh"] = (
+        "stale FUSE target remains\n"
+    )
+
+    with pytest.raises(RcloneMountError, match="stale FUSE target remains"):
+        manager._start_all_sync()
+
+    assert not any(
+        operation.endswith("mount_srw-thread-1-home.sh")
+        and not operation.endswith("unmount_srw-thread-1-home.sh")
+        for operation in backend.resource_operations
+    )
+
+
+def test_generated_pinned_and_stateless_unmount_scripts_parse_in_bash(tmp_path):
+    pinned = RcloneMountManager(
+        thread_id="thread-12345678",
+        cloud_cfg=_opencloud_mount_cfg(),
+        workspace_backend=FakeRemoteBackend(),
+        workspace_root=tmp_path,
+    )
+    fenced = RcloneMountManager(
+        thread_id="thread-12345678",
+        cloud_cfg=_opencloud_mount_cfg(),
+        workspace_backend=FakeFencedRemoteBackend(),
+        workspace_root=tmp_path,
+    )
+    for name, manager in (("pinned", pinned), ("stateless", fenced)):
+        state = manager._state_for_mount(_opencloud_mount_cfg()["mounts"][0], 0)
+        result = subprocess.run(
+            ["bash", "-n"],
+            input=manager._unmount_script(state),
+            text=True,
+            capture_output=True,
+        )
+        assert result.returncode == 0, f"{name}: {result.stderr}"
 
 
 def test_skip_workspace_links_omits_symlink_install():
@@ -474,3 +810,374 @@ def test_skip_workspace_links_omits_symlink_install():
     manager._start_all_sync()
     link_scripts = [p for p in backend.files if p.endswith("install_cloud_links.sh")]
     assert link_scripts == []  # overlay owns the symlink in protected mode
+
+
+@pytest.mark.asyncio
+async def test_stateless_successor_adopts_healthy_resident_after_local_detach():
+    first_backend = FakeFencedRemoteBackend()
+    first_backend.outputs_by_script["probe_srw-thread-1-home.sh"] = (
+        "__SRW_RCLONE_RESIDENT_HEAL__\n"
+    )
+    first = RcloneMountManager(
+        thread_id="thread-12345678",
+        cloud_cfg=_cloud_mount_cfg(),
+        workspace_backend=first_backend,
+        workspace_root=Path("/home/agent-host/workspace"),
+    )
+    await first.start_all()
+    resident = first.mounts[0]
+    commands_before_detach = list(first_backend.commands)
+    operations_before_detach = list(first_backend.resource_operations)
+
+    await first.detach_for_handoff()
+
+    assert first_backend.commands == commands_before_detach
+    assert first_backend.resource_operations == operations_before_detach
+    assert first_backend.claim_resource_retired is True
+
+    second_backend = FakeFencedRemoteBackend()
+    second_backend.outputs_by_script["probe_srw-thread-1-home.sh"] = (
+        "__SRW_RCLONE_RESIDENT_ADOPTED__\t"
+        f"{resident.resident_spec_digest}\t{resident.resident_generation}\t"
+        f"321\t{resident.rc_pass}\n"
+    )
+    second = RcloneMountManager(
+        thread_id="thread-12345678",
+        cloud_cfg=_cloud_mount_cfg(),
+        workspace_backend=second_backend,
+        workspace_root=Path("/home/agent-host/workspace"),
+    )
+    await second.start_all()
+    try:
+        assert second.mounts[0].resident_generation == resident.resident_generation
+        assert second.mounts[0].rc_pass == resident.rc_pass
+        assert not any(
+            Path(path).name.startswith("mount_") for path in second_backend.files
+        )
+        probe = next(
+            body
+            for path, body in second_backend.files.items()
+            if path.endswith("probe_srw-thread-1-home.sh")
+        )
+        assert "timeout 15 find" in probe
+        assert "-mindepth 1 -maxdepth 1" in probe
+        assert "_srw_pid_matches" in probe
+    finally:
+        await second.aclose()
+
+
+@pytest.mark.asyncio
+async def test_creating_without_pid_recovers_exact_identity_then_remounts():
+    backend = FakeFencedRemoteBackend()
+    manager = RcloneMountManager(
+        thread_id="thread-12345678",
+        cloud_cfg=_cloud_mount_cfg(),
+        workspace_backend=backend,
+        workspace_root=Path("/home/agent-host/workspace"),
+    )
+    candidate = manager._state_for_mount(_cloud_mount_cfg()["mounts"][0], 0)
+    old_generation = "a" * 32
+    old_pass = "oldResidentPass_1234567890"
+    backend.outputs_by_script["probe_srw-thread-1-home.sh"] = (
+        "__SRW_RCLONE_RESIDENT_HEAL__\t"
+        f"{candidate.resident_spec_digest}\t{old_generation}\t0\t{old_pass}\n"
+    )
+
+    await manager.start_all()
+    try:
+        unmount = next(
+            body
+            for path, body in backend.files.items()
+            if path.endswith("unmount_srw-thread-1-home.sh")
+        )
+        assert f'[ "$_srw_generation" = {old_generation} ]' in unmount
+        assert old_pass in unmount
+        mounted = manager.mounts[0]
+        assert mounted.resident_generation != old_generation
+        mount_script = next(
+            body
+            for path, body in backend.files.items()
+            if Path(path).name == "mount_srw-thread-1-home.sh"
+        )
+        assert "_srw_write_identity creating 0" in mount_script
+        assert "_srw_write_identity active" in mount_script
+    finally:
+        await manager.aclose()
+
+
+def test_resident_spec_excludes_secret_and_basic_rotation_forces_probe_check():
+    old_cfg = _cloud_mount_cfg()
+    new_cfg = copy.deepcopy(old_cfg)
+    new_cfg["mounts"][0]["auth"]["password"] = "rotated-super-secret"
+    backend = FakeFencedRemoteBackend()
+    old_manager = RcloneMountManager(
+        thread_id="thread-12345678",
+        cloud_cfg=old_cfg,
+        workspace_backend=backend,
+        workspace_root=Path("/home/agent-host/workspace"),
+    )
+    new_manager = RcloneMountManager(
+        thread_id="thread-12345678",
+        cloud_cfg=new_cfg,
+        workspace_backend=backend,
+        workspace_root=Path("/home/agent-host/workspace"),
+    )
+    old_state = old_manager._state_for_mount(old_cfg["mounts"][0], 0)
+    new_state = new_manager._state_for_mount(new_cfg["mounts"][0], 0)
+
+    assert old_state.resident_spec_digest == new_state.resident_spec_digest
+    assert hashlib.sha256(b"rotated-super-secret").hexdigest() not in (
+        new_state.resident_spec_digest
+    )
+    probe = new_manager._resident_probe_script(new_cfg["mounts"][0], new_state)
+    assert "rclone reveal" in probe
+    assert "rotated-super-secret" not in probe
+    assert "base64 -d" in probe
+
+
+def test_unknown_secret_config_is_not_hashed_and_forces_conservative_remount():
+    cfg_one = _cloud_mount_cfg()
+    cfg_two = copy.deepcopy(cfg_one)
+    cfg_one["mounts"][0]["source"]["config"]["api_key"] = "first-secret"
+    cfg_two["mounts"][0]["source"]["config"]["api_key"] = "second-secret"
+    manager_one = RcloneMountManager(
+        thread_id="thread-12345678",
+        cloud_cfg=cfg_one,
+        workspace_backend=FakeFencedRemoteBackend(),
+        workspace_root=Path("/workspace"),
+    )
+    manager_two = RcloneMountManager(
+        thread_id="thread-12345678",
+        cloud_cfg=cfg_two,
+        workspace_backend=FakeFencedRemoteBackend(),
+        workspace_root=Path("/workspace"),
+    )
+    state_one = manager_one._state_for_mount(cfg_one["mounts"][0], 0)
+    state_two = manager_two._state_for_mount(cfg_two["mounts"][0], 0)
+
+    assert state_one.resident_spec_digest == state_two.resident_spec_digest
+    assert hashlib.sha256(b"first-secret").hexdigest() != state_one.resident_spec_digest
+    assert manager_one._resident_adoption_safe(cfg_one["mounts"][0]) is False
+    assert manager_two._resident_adoption_safe(cfg_two["mounts"][0]) is False
+
+
+def test_effective_default_ignore_change_rotates_non_secret_spec(monkeypatch):
+    monkeypatch.delenv("SRW_CLOUD_MOUNT_DEFAULT_IGNORES", raising=False)
+    cfg_one = _cloud_mount_cfg()
+    cfg_two = copy.deepcopy(cfg_one)
+    cfg_one["default_ignores"] = ["one/**"]
+    cfg_two["default_ignores"] = ["two/**"]
+    one = RcloneMountManager(
+        thread_id="thread-12345678",
+        cloud_cfg=cfg_one,
+        workspace_backend=FakeFencedRemoteBackend(),
+        workspace_root=Path("/workspace"),
+    )
+    two = RcloneMountManager(
+        thread_id="thread-12345678",
+        cloud_cfg=cfg_two,
+        workspace_backend=FakeFencedRemoteBackend(),
+        workspace_root=Path("/workspace"),
+    )
+
+    assert (
+        one._state_for_mount(cfg_one["mounts"][0], 0).resident_spec_digest
+        != two._state_for_mount(cfg_two["mounts"][0], 0).resident_spec_digest
+    )
+
+
+@pytest.mark.asyncio
+async def test_fresh_bearer_publication_precedes_bounded_rc_refresh(
+    fake_token_client,
+):
+    backend = FakeFencedRemoteBackend()
+    manager = RcloneMountManager(
+        thread_id="thread-12345678",
+        cloud_cfg=_opencloud_mount_cfg(),
+        workspace_backend=backend,
+        workspace_root=Path("/workspace"),
+    )
+    candidate = manager._state_for_mount(_opencloud_mount_cfg()["mounts"][0], 0)
+    backend.outputs_by_script["probe_srw-thread-1-home.sh"] = (
+        "__SRW_RCLONE_RESIDENT_ADOPTED__\t"
+        f"{candidate.resident_spec_digest}\t{'b' * 32}\t321\t"
+        "residentPass_123456789012345\n"
+    )
+
+    await manager.start_all()
+    try:
+        publish_index = backend.resource_operations.index(
+            "publish bearer token for legacy-session"
+        )
+        probe_index = backend.resource_operations.index(
+            "run rclone script probe_srw-thread-1-home.sh"
+        )
+        assert publish_index < probe_index
+        probe = next(
+            body
+            for path, body in backend.files.items()
+            if path.endswith("probe_srw-thread-1-home.sh")
+        )
+        assert "vfs/refresh recursive=false" in probe
+        assert "recursive=true" not in probe
+        assert probe.index("vfs/refresh recursive=false") < probe.index(
+            "timeout 15 find"
+        )
+    finally:
+        await manager.aclose()
+
+
+@pytest.mark.asyncio
+async def test_adopted_mount_is_not_rolled_back_when_later_mount_fails():
+    cfg = _cloud_mount_cfg()
+    second_mount = copy.deepcopy(cfg["mounts"][0])
+    second_mount.update(
+        {
+            "mount_id": "second-mount",
+            "workspace_name": "second",
+            "target_path": "/cloud/second",
+        }
+    )
+    cfg["mounts"].append(second_mount)
+    backend = FakeFencedRemoteBackend()
+    manager = RcloneMountManager(
+        thread_id="thread-12345678",
+        cloud_cfg=cfg,
+        workspace_backend=backend,
+        workspace_root=Path("/workspace"),
+    )
+    first_state = manager._state_for_mount(cfg["mounts"][0], 0)
+    backend.outputs_by_script["probe_srw-thread-1-home.sh"] = (
+        "__SRW_RCLONE_RESIDENT_ADOPTED__\t"
+        f"{first_state.resident_spec_digest}\t{'c' * 32}\t321\t"
+        "residentPass_123456789012345\n"
+    )
+    backend.outputs_by_script["probe_srw-thread-1-second.sh"] = (
+        "__SRW_RCLONE_RESIDENT_HEAL__\n"
+    )
+    backend.outputs_by_script["mount_srw-thread-1-second.sh"] = (
+        "__SRW_RCLONE_MOUNT_FAILED__ rc=1\n"
+    )
+
+    with pytest.raises(RcloneMountError):
+        await manager.start_all()
+
+    assert not any(
+        operation.endswith("unmount_srw-thread-1-home.sh")
+        for operation in backend.resource_operations
+    )
+    assert (
+        sum(
+            operation.endswith("unmount_srw-thread-1-second.sh")
+            for operation in backend.resource_operations
+        )
+        == 2
+    )
+
+
+@pytest.mark.asyncio
+async def test_adopted_mount_is_not_rolled_back_when_link_install_fails():
+    backend = FakeFencedRemoteBackend()
+    manager = RcloneMountManager(
+        thread_id="thread-12345678",
+        cloud_cfg=_cloud_mount_cfg(),
+        workspace_backend=backend,
+        workspace_root=Path("/workspace"),
+    )
+    candidate = manager._state_for_mount(_cloud_mount_cfg()["mounts"][0], 0)
+    backend.outputs_by_script["probe_srw-thread-1-home.sh"] = (
+        "__SRW_RCLONE_RESIDENT_ADOPTED__\t"
+        f"{candidate.resident_spec_digest}\t{'d' * 32}\t321\t"
+        "residentPass_123456789012345\n"
+    )
+    backend.outputs_by_script["install_cloud_links.sh"] = (
+        "__SRW_RCLONE_MOUNT_FAILED__ rc=1\n"
+    )
+
+    with pytest.raises(RcloneMountError):
+        await manager.start_all()
+
+    assert not any("unmount_" in operation for operation in backend.resource_operations)
+
+
+@pytest.mark.asyncio
+async def test_failed_new_generation_rolls_back_with_its_exact_identity():
+    backend = FakeFencedRemoteBackend()
+    manager = RcloneMountManager(
+        thread_id="thread-12345678",
+        cloud_cfg=_cloud_mount_cfg(),
+        workspace_backend=backend,
+        workspace_root=Path("/workspace"),
+    )
+    backend.outputs_by_script["probe_srw-thread-1-home.sh"] = (
+        "__SRW_RCLONE_RESIDENT_HEAL__\n"
+    )
+    backend.outputs_by_script["mount_srw-thread-1-home.sh"] = (
+        "__SRW_RCLONE_MOUNT_FAILED__ rc=1\n"
+    )
+    with (
+        patch(
+            "src.services.cloud_mount.uuid.uuid4",
+            side_effect=[
+                SimpleNamespace(hex="1" * 32),
+                SimpleNamespace(hex="2" * 32),
+            ],
+        ),
+        patch(
+            "src.services.cloud_mount.secrets.token_urlsafe",
+            side_effect=["candidatePass_123456789012", "newPass_123456789012345678"],
+        ),
+    ):
+        with pytest.raises(RcloneMountError):
+            await manager.start_all()
+
+    rollback = next(
+        body
+        for path, body in backend.files.items()
+        if path.endswith("unmount_srw-thread-1-home.sh")
+    )
+    assert "2" * 32 in rollback
+    assert "newPass_123456789012345678" in rollback
+    assert "candidatePass_123456789012" not in rollback
+
+
+def test_pinned_mount_script_has_no_resident_identity_protocol():
+    backend = FakeRemoteBackend()
+    manager = RcloneMountManager(
+        thread_id="thread-12345678",
+        cloud_cfg=_cloud_mount_cfg(),
+        workspace_backend=backend,
+        workspace_root=Path("/workspace"),
+    )
+    state = manager._state_for_mount(_cloud_mount_cfg()["mounts"][0], 0)
+
+    script = manager._mount_script(_cloud_mount_cfg()["mounts"][0], state)
+
+    assert "MOUNT_ARGS=(nohup rclone" in script
+    assert "resident.identity" not in script
+    assert "_srw_write_identity" not in script
+
+
+def test_script_staging_paths_are_controller_unique():
+    one = RcloneMountManager(
+        thread_id="thread-12345678",
+        cloud_cfg=_cloud_mount_cfg(),
+        workspace_backend=FakeRemoteBackend(),
+        workspace_root=Path("/workspace"),
+    )
+    two = RcloneMountManager(
+        thread_id="thread-12345678",
+        cloud_cfg=_cloud_mount_cfg(),
+        workspace_backend=FakeRemoteBackend(),
+        workspace_root=Path("/workspace"),
+    )
+    one._run_remote_script("probe.sh", "echo __SRW_RCLONE_MOUNT_OK__")
+    two._run_remote_script("probe.sh", "echo __SRW_RCLONE_MOUNT_OK__")
+
+    assert one._script_nonce != two._script_nonce
+    assert any(
+        f"/scripts/{one._script_nonce}/" in path for path in one.workspace_backend.files
+    )
+    assert any(
+        f"/scripts/{two._script_nonce}/" in path for path in two.workspace_backend.files
+    )
