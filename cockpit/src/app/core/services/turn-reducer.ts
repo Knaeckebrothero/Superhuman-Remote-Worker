@@ -84,6 +84,7 @@ export type ReducerAction =
         timestamp: number;
     }
     | { type: 'remove_turn'; id: string }
+    | { type: 'update_attachments'; id: string; attachments: ChatAttachment[] }
     | { type: 'add_compaction'; id: string; summary: string; timestamp: number };
 
 export function reduce(state: ConversationState, action: ReducerAction): ConversationState {
@@ -111,6 +112,23 @@ export function reduce(state: ConversationState, action: ReducerAction): Convers
                         timestamp: action.timestamp,
                     },
                 ],
+            };
+
+        case 'update_attachments':
+            // Re-key an already-rendered user bubble's chips as its uploads
+            // resolve: `path` appears, the server may have renamed a file
+            // (`_1` collision suffix), and one .zip expands into several
+            // chips. Patching in place is the only correct shape — a second
+            // `user_message` with the same id would APPEND a duplicate
+            // bubble, and remove+re-add would move it to the foot of the
+            // transcript, below messages the user queued behind it.
+            return {
+                ...state,
+                turns: state.turns.map((t) =>
+                    t.kind === 'user' && t.id === action.id
+                        ? {...t, attachments: action.attachments}
+                        : t,
+                ),
             };
 
         case 'remove_turn':
