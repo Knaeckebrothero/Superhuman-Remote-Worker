@@ -32,6 +32,7 @@ function createService() {
     };
     const mockApi: any = {
         uploadOneToThread: vi.fn().mockReturnValue(of({kind: 'done', files: []})),
+        deleteThreadUpload: vi.fn().mockReturnValue(of(undefined)),
         humanizeUploadError: vi.fn().mockReturnValue('upload failed'),
     };
     const mockCache: any = {

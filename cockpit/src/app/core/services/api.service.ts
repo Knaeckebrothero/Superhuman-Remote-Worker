@@ -243,6 +243,20 @@ export interface SnapshotStorageStats {
 export const SESSION_TOOL_GROUPS_TIMEOUT_MS = 8000;
 
 /**
+ * Percent-encode an `uploads/`-relative path for the delete route's
+ * `{path:path}` segment.
+ *
+ * Per SEGMENT, never wholesale: the route matches a multi-segment path, so the
+ * `/` separators of a zip-extracted member (`bundle/sub/a.txt`) must survive
+ * while everything else is escaped. An unencoded `#` truncates the URL at the
+ * fragment and an unencoded `?` at the query string, both of which would send a
+ * DELETE for a shorter path than the caller asked for.
+ */
+export function encodeUploadPath(name: string): string {
+  return name.split('/').map(encodeURIComponent).join('/');
+}
+
+/**
  * HTTP client service for the cockpit API.
  */
 @Injectable({ providedIn: 'root' })
@@ -1200,6 +1214,33 @@ export class ApiService {
         ),
         catchError((error: HttpErrorResponse) => {
           console.error(`Failed to upload ${file.name} to thread ${threadId}:`, error);
+          return throwError(() => error);
+        }),
+      );
+  }
+
+  /**
+   * Remove one file (or one zip's extracted subtree) from a persistent
+   * thread's `uploads/` directory.
+   *
+   * `name` is the `name` field of a `ThreadUploadedFile` — the path RELATIVE to
+   * `uploads/` (`report.pdf`, `bundle/sub/a.txt`). Passing its `path` field
+   * instead resolves to `uploads/uploads/…` server-side and 404s.
+   *
+   * Exists so eager upload (docs/features/session_attachment_send_flow.md
+   * §5.4) can be cancelled honestly: removing an attachment chip can arrive
+   * after the bytes have already landed, and without this the "cancel" would
+   * be a lie that also litters a directory the agent can list.
+   */
+  deleteThreadUpload(threadId: string, name: string): Observable<void> {
+    return this.http
+      .delete<{deleted: boolean}>(
+        `${this.baseUrl}/persistent/threads/${threadId}/uploads/${encodeUploadPath(name)}`,
+      )
+      .pipe(
+        map(() => undefined),
+        catchError((error: HttpErrorResponse) => {
+          console.error(`Failed to delete upload ${name} from thread ${threadId}:`, error);
           return throwError(() => error);
         }),
       );
