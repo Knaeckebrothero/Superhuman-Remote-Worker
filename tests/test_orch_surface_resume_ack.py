@@ -4,7 +4,7 @@
 response into a ``SessionConfigDriftError`` that names the drifted items, must
 transmit an ``acknowledge`` list when the caller supplies one, and must leave
 ordinary 200 and non-428-error handling unchanged. See
-docs/features/session_config_drift_resume.md §4.6.
+docs/done/session_config_drift_resume.md §4.6.
 
 ``str(error)`` must carry the raw ids (not just labels) and a literal,
 copy-pasteable ``acknowledge=[...]`` list, because the MCP tool path renders

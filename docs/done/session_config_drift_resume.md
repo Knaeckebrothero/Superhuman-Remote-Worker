@@ -17,10 +17,15 @@ related:
 
 # Session config drift on resume
 
-**Status:** Implemented 2026-08-09 on `develop` (unpushed). Live gate NOT run —
-see §11.
-**Origin:** Live incident on dev — session `1930dec9` returned 403 on every resume
-and the button appeared dead.
+**Status:** **SHIPPED — deployed to dev 2026-08-10, LIVE GATE PASSED** on the
+originating session `1930dec9`: `POST /resume` returned **428** where it had
+returned 403, the dialog rendered, acknowledging returned **200**, and the
+acknowledgment persisted so the session stopped re-prompting. Implemented across
+`7b8faddf..c524f023`. Remaining open items and the one thing still unexercised
+on dev are in §11.
+
+**Origin:** Live incident on dev — session `1930dec9` returned 403 on every
+resume and the button appeared dead.
 
 ## 1. The problem
 

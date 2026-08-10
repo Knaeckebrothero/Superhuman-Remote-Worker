@@ -830,7 +830,7 @@ async def test_resume_revalidates_datasources_before_mutating_thread_status():
     longer called, and which Task 13 later deleted outright once its only
     remaining callers (direct tests) were redirected to the selection
     function it had wrapped, ``_revalidate_thread_datasource_selection``.
-    Task 6 (docs/features/session_config_drift_resume.md) deliberately
+    Task 6 (docs/done/session_config_drift_resume.md) deliberately
     replaced that dead-end 403 with an acknowledgeable 428 listing every
     drifted item (a revoked/deleted datasource no longer permanently
     strands the session) — an intentional, already-shipped contract
