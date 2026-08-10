@@ -147,3 +147,49 @@ def test_v2_project_default_at_workspace_root(tmp_path: Path, build_sync_coordin
     [m] = coord.mounts
     assert m.target_path == ""
     assert m.mount_id == "m_home"
+    # Generation rows use a separate logical destination identity, not the
+    # replace-on-edit thread_mounts UUID supplied in the payload. Keeping the
+    # transport id preserves pinned-lane behavior and diagnostics.
+    assert m.generation_id.startswith("mount:")
+
+
+def test_generation_identity_survives_replace_on_edit_mount_uuid(
+    tmp_path: Path, build_sync_coordinator
+):
+    """Replacing thread_mounts deletes/reinserts rows with fresh UUIDs.
+
+    The durable generation identity must therefore be derived from the
+    non-secret logical cloud destination, not ``mount_id`` from either row.
+    """
+    base_mount = {
+        "mount_kind": "project",
+        "target_path": "projects/alpha",
+        **_nc_cfg("project-alpha"),
+    }
+    first = build_sync_coordinator(
+        workspace_path=tmp_path,
+        workspace_backend=None,
+        cloud_cfg={
+            "version": 2,
+            "session_folder": None,
+            "mounts": [{"mount_id": "row-uuid-before", **base_mount}],
+        },
+        thread_id="11111111-1111-4111-8111-111111111111",
+        workspace_generation="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    )
+    replaced = build_sync_coordinator(
+        workspace_path=tmp_path,
+        workspace_backend=None,
+        cloud_cfg={
+            "version": 2,
+            "session_folder": None,
+            "mounts": [{"mount_id": "row-uuid-after", **base_mount}],
+        },
+        thread_id="11111111-1111-4111-8111-111111111111",
+        workspace_generation="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    )
+
+    assert first is not None and replaced is not None
+    assert first.mounts[0].mount_id != replaced.mounts[0].mount_id
+    assert first.mounts[0].generation_id == replaced.mounts[0].generation_id
+    assert first.mounts[0].sync_scope_sha256 == replaced.mounts[0].sync_scope_sha256

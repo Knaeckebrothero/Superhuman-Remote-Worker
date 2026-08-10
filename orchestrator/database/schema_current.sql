@@ -7090,6 +7090,94 @@ CREATE TABLE public.system_settings (
 
 
 --
+-- Name: thread_cloud_sync_generations; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.thread_cloud_sync_generations (
+    thread_id uuid NOT NULL,
+    mount_id text NOT NULL,
+    required_generation bigint DEFAULT 0 NOT NULL,
+    acknowledged_generation bigint DEFAULT 0 NOT NULL,
+    required_lease_token bigint DEFAULT 0 NOT NULL,
+    workspace_generation text NOT NULL,
+    sync_scope_sha256 character(64) NOT NULL,
+    required_at timestamp with time zone DEFAULT now() NOT NULL,
+    acknowledged_at timestamp with time zone,
+    baseline_manifest jsonb DEFAULT '{}'::jsonb NOT NULL,
+    baseline_sha256 character(64) DEFAULT '44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a'::bpchar NOT NULL,
+    CONSTRAINT thread_cloud_sync_baseline_digest_shape CHECK ((baseline_sha256 ~ '^[0-9a-f]{64}$'::text)),
+    CONSTRAINT thread_cloud_sync_baseline_manifest_shape CHECK (((jsonb_typeof(baseline_manifest) = 'object'::text) AND (octet_length((baseline_manifest)::text) <= 4194304))),
+    CONSTRAINT thread_cloud_sync_generation_shape CHECK (((required_generation >= 0) AND (acknowledged_generation >= 0) AND (acknowledged_generation <= required_generation) AND (required_lease_token >= 0) AND ((required_generation = 0) OR (required_lease_token > 0)))),
+    CONSTRAINT thread_cloud_sync_mount_id_nonempty CHECK ((mount_id <> ''::text)),
+    CONSTRAINT thread_cloud_sync_scope_digest_shape CHECK ((sync_scope_sha256 ~ '^[0-9a-f]{64}$'::text)),
+    CONSTRAINT thread_cloud_sync_workspace_generation_nonempty CHECK ((workspace_generation <> ''::text))
+);
+
+
+--
+-- Name: TABLE thread_cloud_sync_generations; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.thread_cloud_sync_generations IS 'Queue-fenced required generation per thread cloud mount. Before a stateless owner starts push(N), it increments required_generation in the same statement that proves its live run_queue lease. The remote cloud marker is the resource-side commit acknowledgement; the DB acknowledgement is an observable mirror, not a substitute for reading that marker on the next claim.';
+
+
+--
+-- Name: COLUMN thread_cloud_sync_generations.mount_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.thread_cloud_sync_generations.mount_id IS 'Stable logical cloud destination key derived from non-secret source/path identity; never the replace-on-edit thread_mounts row UUID. Legacy session folders use the reserved value legacy-session.';
+
+
+--
+-- Name: COLUMN thread_cloud_sync_generations.required_generation; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.thread_cloud_sync_generations.required_generation IS 'Highest push generation a successor must observe committed on the cloud resource before it may pull. Monotonic for the lifetime of the thread.';
+
+
+--
+-- Name: COLUMN thread_cloud_sync_generations.acknowledged_generation; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.thread_cloud_sync_generations.acknowledged_generation IS 'Highest resource marker verified or written by a live lease owner. This may lag after marker-write/DB-ack crash; successors reconcile it from the resource. It never authorizes pull by itself.';
+
+
+--
+-- Name: COLUMN thread_cloud_sync_generations.required_lease_token; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.thread_cloud_sync_generations.required_lease_token IS 'run_queue lease token that reserved required_generation. Diagnostic and recovery evidence; current ownership is always re-proved against run_queue rather than inferred from this value.';
+
+
+--
+-- Name: COLUMN thread_cloud_sync_generations.workspace_generation; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.thread_cloud_sync_generations.workspace_generation IS 'Authoritative orchestrator workspace-binding generation whose durable workspace bytes are being pushed. A pending row may not be recovered against a different runtime incarnation.';
+
+
+--
+-- Name: COLUMN thread_cloud_sync_generations.sync_scope_sha256; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.thread_cloud_sync_generations.sync_scope_sha256 IS 'SHA-256 over the non-secret cloud destination descriptor (thread, mount identity/path/backend/WebDAV URL) plus workspace generation. It binds the counter to one exact source/destination pair without persisting credentials.';
+
+
+--
+-- Name: COLUMN thread_cloud_sync_generations.baseline_manifest; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.thread_cloud_sync_generations.baseline_manifest IS 'Queue-fenced turn-start baseline keyed by mount-relative path. Each entry contains the SHA-256 of durable workspace bytes and the WebDAV ETag observed after pull. A successor compares against this baseline and replays only locally changed/new/deleted paths; it never force-PUTs untouched files over concurrent cloud edits.';
+
+
+--
+-- Name: COLUMN thread_cloud_sync_generations.baseline_sha256; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.thread_cloud_sync_generations.baseline_sha256 IS 'SHA-256 of the canonical compact JSON baseline. The resource commit marker binds this digest so marker-write/DB-ack recovery can acknowledge without replaying the already committed delta.';
+
+
+--
 -- Name: thread_control_requests; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -9085,6 +9173,14 @@ ALTER TABLE ONLY public.system_settings
 
 
 --
+-- Name: thread_cloud_sync_generations thread_cloud_sync_generations_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.thread_cloud_sync_generations
+    ADD CONSTRAINT thread_cloud_sync_generations_pkey PRIMARY KEY (thread_id, mount_id);
+
+
+--
 -- Name: thread_control_requests thread_control_requests_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -10073,6 +10169,13 @@ CREATE INDEX idx_sudo_pending ON public.sudo_approval_requests USING btree (stat
 --
 
 CREATE INDEX idx_sudo_rules_active ON public.sudo_auto_rules USING btree (priority) WHERE (enabled = true);
+
+
+--
+-- Name: idx_thread_cloud_sync_pending; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_thread_cloud_sync_pending ON public.thread_cloud_sync_generations USING btree (thread_id, required_generation) WHERE (acknowledged_generation < required_generation);
 
 
 --
@@ -12413,6 +12516,14 @@ ALTER TABLE ONLY public.storage_volume_incarnations
 
 ALTER TABLE ONLY public.sudo_approval_requests
     ADD CONSTRAINT sudo_approval_requests_job_id_fkey FOREIGN KEY (job_id) REFERENCES public.jobs(id) ON DELETE CASCADE;
+
+
+--
+-- Name: thread_cloud_sync_generations thread_cloud_sync_generations_thread_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.thread_cloud_sync_generations
+    ADD CONSTRAINT thread_cloud_sync_generations_thread_id_fkey FOREIGN KEY (thread_id) REFERENCES public.threads(id) ON DELETE CASCADE;
 
 
 --

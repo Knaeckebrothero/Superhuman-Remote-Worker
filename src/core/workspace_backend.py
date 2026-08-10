@@ -438,6 +438,19 @@ class WorkspaceBackend(ABC):
         """
         ...
 
+    def replace_file(self, src: str, dst: str) -> None:
+        """Atomically replace one exact file target when the backend can.
+
+        Unlike ``move``, an existing destination directory is never treated as
+        a container. Cloud generation pulls use this narrower contract before
+        acknowledging durable bytes; ordinary tool-facing move semantics stay
+        unchanged for pinned and stateless sessions.
+        """
+
+        if self.is_dir(dst):
+            raise ValueError(f"Destination is a directory: {dst}")
+        self.move(src, dst)
+
     @abstractmethod
     def copy(self, src: str, dst: str) -> None:
         """Copy a file within the workspace.
