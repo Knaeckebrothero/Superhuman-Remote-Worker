@@ -52,6 +52,16 @@ export interface FilePreview {
   error?: string;
   /** Server-assigned filename after upload (for the agent hint) */
   remoteName?: string;
+  /**
+   * Full server response entries for this file once its upload succeeds — a
+   * .zip expands into one entry per extracted member (thread_uploads.py).
+   * Retained (alongside `uploadStatus: COMPLETED`) so a retry after a later
+   * file's failure can skip re-uploading this one without losing what
+   * already landed: the backend has no delete endpoint or idempotency key,
+   * so a re-upload permanently duplicates the file server-side under a
+   * `_1` suffix.
+   */
+  uploadedFiles?: ThreadUploadedFile[];
 }
 
 /**
