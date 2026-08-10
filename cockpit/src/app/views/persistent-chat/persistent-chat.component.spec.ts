@@ -36,6 +36,7 @@ import {
     shouldPin,
     shouldSendOnEnter,
     textSizeToCss,
+    uploadStageFor,
     uploadStageKey,
 } from './persistent-chat.component';
 import {AssistantTurn, MIN_FOLD_RUN, Turn, UserTurn} from '../../core/models/turn.model';
@@ -162,6 +163,52 @@ describe('uploadStageKey', () => {
 
     it('reports nothing for an item with no files', () => {
         expect(uploadStageKey(null)).toBeNull();
+    });
+});
+
+describe('uploadStageFor', () => {
+    // Fix round 1: _flushOutbox only ever processes outbox()[0], so a
+    // non-head item's own files sit at 'queued' the whole time it waits —
+    // showing them would read "Uploading 0 of n…" for work that hasn't
+    // started. The honest line names what's actually blocking it: the head's
+    // in-flight file.
+
+    it('names the head\'s blocking file for a non-head item that has its own attachments', () => {
+        // The item's own summary (2 files, neither started) must be ignored
+        // entirely — it is not waiting on itself.
+        const ownSummary = {done: 0, total: 2, allDone: false};
+        expect(uploadStageFor(false, ownSummary, 'big.mp4')).toEqual({
+            key: 'chat.upload.waitingOn',
+            params: {name: 'big.mp4'},
+        });
+    });
+
+    it('names the head\'s blocking file for a non-head item with no attachments of its own', () => {
+        // The commonest case: a plain text message queued behind a big
+        // upload. No own summary at all, but still not swallowed silently.
+        expect(uploadStageFor(false, null, 'big.mp4')).toEqual({
+            key: 'chat.upload.waitingOn',
+            params: {name: 'big.mp4'},
+        });
+    });
+
+    it('falls back to no stage line when the head itself has no files to name', () => {
+        // A plain text send at the head of the queue — nothing honest to
+        // report, so the bubble falls back to its plain queued treatment
+        // rather than inventing a filename.
+        expect(uploadStageFor(false, null, null)).toBeNull();
+    });
+
+    it('leaves the head\'s own upload-progress label unchanged', () => {
+        // Regression guard for the new isHead branch: even with a
+        // (nonsensical, since the head can't be blocked on itself)
+        // headBlockingFileName argument present, the head's own summary
+        // alone must drive the label — exactly uploadStageKey's behaviour.
+        const ownSummary = {done: 1, total: 3, allDone: false};
+        expect(uploadStageFor(true, ownSummary, 'ignored.pdf')).toEqual({
+            key: 'chat.upload.stage',
+            params: {done: 1, total: 3},
+        });
     });
 });
 

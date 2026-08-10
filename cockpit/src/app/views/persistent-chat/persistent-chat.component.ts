@@ -373,6 +373,35 @@ export function uploadStageKey(
 }
 
 /**
+ * The full stage-line decision for a queued bubble, covering both queue
+ * positions the outbox actually produces — `_flushOutbox` only ever touches
+ * `outbox()[0]`, so a non-head item's own files sit untouched at `'queued'`
+ * for as long as it waits.
+ *
+ * The head reports its own progress via `uploadStageKey`, unchanged. A
+ * non-head item's own summary is deliberately never consulted: showing its
+ * files would read "Uploading 0 of n…" for work that has not started and
+ * never lies about being in flight. The honest line names what it is
+ * actually blocked on — the head's first not-yet-`done` file — matching
+ * `docs/features/session_attachment_send_flow.md`'s "Waiting for
+ * Zeugniss.pdf…" example (the Signal #3720 case: a FIFO queue silently
+ * swallowing a message typed behind a big upload). If the head has no files
+ * of its own (a plain text send ahead of it), there is nothing honest to
+ * name, so this falls back to the bubble's plain queued treatment.
+ */
+export function uploadStageFor(
+    isHead: boolean,
+    ownSummary: {done: number; total: number; allDone: boolean} | null,
+    headBlockingFileName: string | null,
+): {key: string; params: Record<string, string | number>} | null {
+    if (isHead) {
+        const key = uploadStageKey(ownSummary);
+        return key && ownSummary ? {key, params: {done: ownSummary.done, total: ownSummary.total}} : null;
+    }
+    return headBlockingFileName ? {key: 'chat.upload.waitingOn', params: {name: headBlockingFileName}} : null;
+}
+
+/**
  * Empty-composer morph (messenger convention): the round action button offers
  * dictation while there is nothing to send yet, and flips to send on the
  * first keystroke or queued attachment. Suppressed while a turn is in flight
@@ -4047,17 +4076,20 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
 
     /**
      * The queued bubble's upload stage line: which i18n key to show and its
-     * interpolation params, or null once there's nothing left to report (no
-     * files on this item, or the item itself is gone — flushed, discarded, or
-     * carried over from a different thread). `params` always includes
-     * `done`/`total` — harmless on `chat.upload.sending`, which ignores them.
+     * interpolation params, or null once there's nothing left to report.
+     * Thin glue over `uploadStageFor` — gathers whether `localId` is the
+     * outbox head, its own upload summary (used only when it is the head),
+     * and the head's first not-yet-done file (used only when it isn't), then
+     * lets the pure function decide. See `uploadStageFor` for why a non-head
+     * item's own files are never shown.
      */
-    uploadStage(localId: string): {key: string; params: {done: number; total: number}} | null {
-        const files = this.chat.outboxItem(localId)?.pendingFiles;
-        if (!files) return null;
-        const summary = uploadSummary(files);
-        const key = uploadStageKey(summary);
-        return key ? {key, params: {done: summary.done, total: summary.total}} : null;
+    uploadStage(localId: string): {key: string; params: Record<string, string | number>} | null {
+        const head = this.chat.outbox()[0];
+        const isHead = head?.localId === localId;
+        const ownFiles = this.chat.outboxItem(localId)?.pendingFiles;
+        const ownSummary = ownFiles ? uploadSummary(ownFiles) : null;
+        const headBlockingFileName = head?.pendingFiles?.find((f) => f.status !== 'done')?.name ?? null;
+        return uploadStageFor(isHead, ownSummary, headBlockingFileName);
     }
 
     /**
