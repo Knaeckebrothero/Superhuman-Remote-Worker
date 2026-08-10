@@ -35,6 +35,10 @@ Three findings from the implementation survey change what is buildable:
    (`@angular/common/fesm2022/_module-chunk.mjs:758-999` has no such emission;
    the only one in the package is `HttpXhrBackend` at `:1206`). `withXhr()` does
    not exist in Angular 21. Any progress bar requires leaving the fetch backend.
+   **Done (Slice 2, 2026-08-10):** `withFetch()` removed app-wide per §9.2. The
+   build still prerenders nothing (`dist/cockpit/prerendered-routes.json` is
+   `{"routes": {}}`, `index.html` ships a bare `<app-root>` with no `ngh`
+   markers), so no `XhrFactory` shim is needed off-browser.
 2. **The current batch upload is one request away from a hard edge failure.**
    All files go in a single multipart POST (`api.service.ts:1151-1156`). The
    deployment traverses a Cloudflare Tunnel, whose plan-level request-body cap
@@ -466,11 +470,17 @@ Indeterminate stage label (`Uploading 2 of 3…`), no percentage yet. **No backe
 change.** Fixes the draft-session dead end and the ended-thread no-resume as a
 side effect.
 
-**Slice 2 — progress.** Leave the fetch backend (globally or via a scoped
-injector), `reportProgress: true` + `observe: 'events'`, determinate aggregate
-bar with the label rules from §5.2, `aria-busy` + polite live region, and a spec
-pinning `ngsw-bypass` on the uploads URL with a comment naming progress as the
-second reason it exists.
+**Slice 2 — progress. IMPLEMENTED 2026-08-10, browser gate not yet run.** Left
+the fetch backend globally (§9.2), `reportProgress: true` + `observe: 'events'`,
+determinate aggregate bar with the label rules from §5.2, `aria-busy` + polite
+live region, and a spec pinning `ngsw-bypass` on the uploads URL with a comment
+naming progress as the second reason it exists. The bar is byte-weighted across
+the item's files and scaled to 90% of its own track, so the remaining 10% is the
+POST and the bar cannot fill before the send is accepted. Progress writes are
+throttled to ~4/s (`PROGRESS_WRITE_INTERVAL_MS`) for the scroll-pin reason in
+§10. The Playwright check in §8 — a production build with the SW active,
+asserting an intermediate value strictly between 0 and 100 — is still OWED and
+is the only real proof that progress works outside the mock backend.
 
 **Slice 3 — eager upload.** Upload on attach, cancel-on-remove with explicit
 intent tracking, thread-switch abort + `pendingAttachments` clearing, dedupe key,
@@ -543,7 +553,7 @@ Options:
 eagerly also ships cleanup, and (a) ships a known defect into a directory the
 agent reads.
 
-### 9.2 How to leave the fetch backend — **RULED 2026-08-10: remove globally**
+### 9.2 How to leave the fetch backend — **RULED 2026-08-10: remove globally** (DONE)
 
 `withFetch()` is removed from `app.config.ts:74`. One line, app-wide;
 `ssr: false` means its usual justification does not apply here. The scoped child

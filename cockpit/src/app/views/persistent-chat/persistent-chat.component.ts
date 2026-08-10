@@ -364,12 +364,43 @@ export function canSendMessage(canCompose: boolean, text: string, attachmentCoun
  * the upload and the POST are phases of the same commitment, so the label
  * changes and the indicator does not. Win32's rule — never reset progress
  * between phases, never reach 100% before the operation completes.
+ *
+ * `percent` picks the percentage-bearing variant. It is absent (or null)
+ * whenever the fraction is unknowable — a file uploading with no computable
+ * body length — and then the plain "Uploading 2 of 3…" line is the honest one.
  */
 export function uploadStageKey(
-    summary: {done: number; total: number; allDone: boolean} | null,
+    summary: {done: number; total: number; allDone: boolean; percent?: number | null} | null,
 ): string | null {
     if (!summary || summary.total === 0) return null;
-    return summary.allDone ? 'chat.upload.sending' : 'chat.upload.stage';
+    if (summary.allDone) return 'chat.upload.sending';
+    return summary.percent == null ? 'chat.upload.stage' : 'chat.upload.stagePercent';
+}
+
+/**
+ * The coarse twin of a stage key: what the polite live region says.
+ *
+ * The visible label updates ~4×/s once a percentage is in it, and a live
+ * region that re-reads "34%… 36%… 39%" is unusable. Stripping the percentage
+ * makes the announced string change only when a file lands or the phase flips,
+ * which is exactly the pace a screen reader wants. The percentage is still
+ * reachable on demand via the progressbar's aria-valuetext.
+ */
+export function uploadStageAnnounceKey(key: string): string {
+    return key === 'chat.upload.stagePercent' ? 'chat.upload.stage' : key;
+}
+
+/** What the queued bubble's stage line needs to render itself. */
+export interface UploadStageView {
+    /** Visible label key — may carry the percentage. */
+    key: string;
+    params: Record<string, string | number>;
+    /** Key for the polite live region: the same line minus the percentage. */
+    announceKey: string;
+    /** Whether THIS item draws the send indicator (only the outbox head does). */
+    bar: boolean;
+    /** Indicator position 0-100, or null for indeterminate. */
+    percent: number | null;
 }
 
 /**
@@ -391,12 +422,20 @@ export function uploadStageKey(
  */
 export function uploadStageFor(
     isHead: boolean,
-    ownSummary: {done: number; total: number; allDone: boolean} | null,
+    ownSummary: {done: number; total: number; allDone: boolean; percent?: number | null} | null,
     headBlockingFileName: string | null,
 ): {key: string; params: Record<string, string | number>} | null {
     if (isHead) {
         const key = uploadStageKey(ownSummary);
-        return key && ownSummary ? {key, params: {done: ownSummary.done, total: ownSummary.total}} : null;
+        if (!key || !ownSummary) return null;
+        const params: Record<string, string | number> = {
+            done: ownSummary.done,
+            total: ownSummary.total,
+        };
+        // Only when a percentage is actually known — the plain key ignores the
+        // param, but shipping a stale one invites a future template to read it.
+        if (ownSummary.percent != null) params['percent'] = ownSummary.percent;
+        return {key, params};
     }
     return headBlockingFileName ? {key: 'chat.upload.waitingOn', params: {name: headBlockingFileName}} : null;
 }
@@ -1316,9 +1355,37 @@ export function clearDraft(threadId: string | null): void {
                   @if (queued && !stalled) {
                     @let stage = uploadStage(turn.id);
                     @if (stage) {
-                      <div class="upload-stage" aria-live="polite">
-                        <app-icon size="sm">upload</app-icon>
-                        <span>{{ stage.key | transloco: stage.params }}</span>
+                      <div class="upload-stage">
+                        <div class="upload-stage-line">
+                          <app-icon size="sm">upload</app-icon>
+                          <!-- Visible label carries the percentage; it changes
+                               ~4×/s, so it is hidden from the a11y tree and the
+                               polite region beside it announces the coarse
+                               phase only (see uploadStageAnnounceKey). -->
+                          <span aria-hidden="true">{{ stage.key | transloco: stage.params }}</span>
+                          <span class="upload-stage-announce"
+                                aria-live="polite">{{ stage.announceKey | transloco: stage.params }}</span>
+                        </div>
+                        @if (stage.bar) {
+                          <!-- ONE indicator spanning the upload AND the POST:
+                               it never resets between the two and never reaches
+                               100%, because the accepted send removes this
+                               bubble instead of filling the bar. No
+                               aria-valuenow => indeterminate; aria-valuetext
+                               carries the phase, since a bare "90%" while
+                               "Sending…" would mislead. progressbar is not a
+                               live region and announces nothing on its own. -->
+                          <div class="upload-bar"
+                               [class.indeterminate]="stage.percent === null"
+                               role="progressbar"
+                               [attr.aria-label]="'chat.upload.progressLabel' | transloco"
+                               aria-valuemin="0"
+                               aria-valuemax="100"
+                               [attr.aria-valuenow]="stage.percent"
+                               [attr.aria-valuetext]="stage.key | transloco: stage.params">
+                            <div class="upload-bar-fill" [style.width.%]="stage.percent"></div>
+                          </div>
+                        }
                       </div>
                     }
                   }
@@ -4116,13 +4183,24 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
      * lets the pure function decide. See `uploadStageFor` for why a non-head
      * item's own files are never shown.
      */
-    uploadStage(localId: string): {key: string; params: Record<string, string | number>} | null {
+    uploadStage(localId: string): UploadStageView | null {
         const head = this.chat.outbox()[0];
         const isHead = head?.localId === localId;
         const ownFiles = this.chat.outboxItem(localId)?.pendingFiles;
         const ownSummary = ownFiles ? uploadSummary(ownFiles) : null;
         const headBlockingFileName = head?.pendingFiles?.find((f) => f.status !== 'done')?.name ?? null;
-        return uploadStageFor(isHead, ownSummary, headBlockingFileName);
+        const line = uploadStageFor(isHead, ownSummary, headBlockingFileName);
+        if (!line) return null;
+        return {
+            ...line,
+            announceKey: uploadStageAnnounceKey(line.key),
+            // ONE indicator per message, and only on the item whose bytes are
+            // actually moving: a queued non-head item is waiting on the head's
+            // upload, so giving it a bar of its own would draw two bars for one
+            // set of bytes.
+            bar: isHead && !!ownSummary && ownSummary.total > 0,
+            percent: isHead ? (ownSummary?.percent ?? null) : null,
+        };
     }
 
     /**

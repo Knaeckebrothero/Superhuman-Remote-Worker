@@ -128,3 +128,15 @@ export interface ThreadUploadResponse {
   thread_id: string;
   files: ThreadUploadedFile[];
 }
+
+/**
+ * What `ApiService.uploadOneToThread` emits: zero or more `progress` events
+ * while the bytes move, then exactly one `done` carrying the server's entries.
+ *
+ * `total` is `null` whenever the browser cannot compute the request body
+ * length — `HttpUploadProgressEvent.total` is optional, so a consumer that
+ * divides by it unguarded renders NaN/Infinity. Indeterminate is a real state.
+ */
+export type ThreadUploadEvent =
+  | {kind: 'progress'; loaded: number; total: number | null}
+  | {kind: 'done'; files: ThreadUploadedFile[]};

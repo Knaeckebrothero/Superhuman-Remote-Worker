@@ -15,7 +15,7 @@ export interface PendingUpload {
     name: string;
     size: number;
     mimeType: string;
-    /** Bytes sent so far; 0 until progress reporting lands (Slice 2). */
+    /** Bytes sent so far, as last reported by an XHR UploadProgress event. */
     loaded: number;
     /** Total bytes, or null when the browser cannot compute it. */
     total: number | null;
@@ -60,11 +60,89 @@ export function classifyUploadFailure(status: number, detail = ''): 'terminal' |
     return 'retryable';
 }
 
+/**
+ * Smallest gap between two writes of a file's `loaded` into the outbox signal.
+ * 250ms ≈ 4 writes/second.
+ *
+ * XHR fires UploadProgress far faster than that on a fast link, and every write
+ * replaces the outbox array, re-renders the queued bubble and therefore trips
+ * the chat view's scroll ResizeObserver — which re-pins to the bottom
+ * SYNCHRONOUSLY by design (persistent-chat.component.ts; deferring it into
+ * rAF/setTimeout is explicitly forbidden there). Unthrottled, that observer
+ * fights a user who scrolls up mid-upload. 4/s is fast enough to read as live
+ * and slow enough to leave the wheel/touch scroll-escape in control.
+ */
+export const PROGRESS_WRITE_INTERVAL_MS = 250;
+
+/**
+ * Leading-edge time gate for progress writes: the first event of a burst goes
+ * through, the rest wait out the interval. Deliberately has no trailing edge —
+ * the terminal state is written by the `done` patch, not by the last progress
+ * event, so a dropped tail is invisible.
+ */
+export function progressWriteDue(
+    lastWriteAt: number,
+    now: number,
+    intervalMs: number = PROGRESS_WRITE_INTERVAL_MS,
+): boolean {
+    return now - lastWriteAt >= intervalMs;
+}
+
+/**
+ * Share of the send indicator's scale owned by the byte upload. The remaining
+ * 10% belongs to the POST that follows, which is not measurable — so the bar
+ * can never reach 100% before the send is accepted, and the accepted send
+ * removes the bubble rather than filling the bar. Win32's progress rule: one
+ * indicator per operation, never reset between phases.
+ */
+export const UPLOAD_SHARE_OF_SCALE = 0.9;
+
+function clamp01(x: number): number {
+    if (!Number.isFinite(x)) return 0;
+    return x < 0 ? 0 : x > 1 ? 1 : x;
+}
+
+/**
+ * Where one outbox item's send indicator sits, 0-100, or `null` when the
+ * fraction is genuinely unknowable and the bar must render indeterminate.
+ *
+ * Byte-weighted, not file-counted: three files of 90MB, 1MB and 1MB would
+ * otherwise jump 33% the moment the two small ones land. `size` is the weight
+ * (always known, straight off the File) while `total` — the on-the-wire body
+ * length including multipart framing — is the only honest denominator for a
+ * partial file. `total` is null whenever the browser cannot compute it, and a
+ * file that is actively uploading with no total makes the whole item
+ * indeterminate rather than silently contributing 0 or NaN.
+ */
+export function sendProgressPercent(files: readonly PendingUpload[]): number | null {
+    if (files.length === 0) return null;
+    let weight = 0;
+    let moved = 0;
+    for (const f of files) {
+        // A 0-byte file still represents one request's worth of work, and a
+        // zero total weight would make the division undefined.
+        const w = Math.max(f.size, 1);
+        weight += w;
+        if (f.status === 'done') {
+            moved += w;
+            continue;
+        }
+        if (f.status === 'uploading') {
+            if (f.total == null || f.total <= 0) return null; // indeterminate
+            moved += w * clamp01(f.loaded / f.total);
+        }
+        // 'queued' and 'failed' have moved nothing that counts.
+    }
+    return Math.round(clamp01(moved / weight) * UPLOAD_SHARE_OF_SCALE * 100);
+}
+
 /** Aggregate state of one outbox item's files, for the bubble's stage line. */
 export function uploadSummary(files: readonly PendingUpload[]): {
     done: number;
     total: number;
     allDone: boolean;
+    /** Send-indicator position 0-100, or null for indeterminate. */
+    percent: number | null;
     firstFailed?: PendingUpload;
 } {
     const done = files.filter((f) => f.status === 'done').length;
@@ -72,6 +150,7 @@ export function uploadSummary(files: readonly PendingUpload[]): {
         done,
         total: files.length,
         allDone: done === files.length,
+        percent: sendProgressPercent(files),
         firstFailed: files.find((f) => f.status === 'failed'),
     };
 }

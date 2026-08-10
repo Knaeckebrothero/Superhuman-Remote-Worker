@@ -127,7 +127,7 @@ function createService(opts: {
     };
 
     const mockApi: any = {
-        uploadOneToThread: vi.fn().mockReturnValue(of([])),
+        uploadOneToThread: vi.fn().mockReturnValue(of({kind: 'done', files: []})),
         humanizeUploadError: vi.fn().mockReturnValue('upload failed'),
     };
 
@@ -2676,7 +2676,7 @@ describe('PersistentChatService — REST sends', () => {
         ctx.mockApi.uploadOneToThread.mockImplementation((_threadId: string, file: File) =>
             file === fileB
                 ? throwError(() => ({status: 413, error: {detail: "File 'huge.bin' exceeds 100MB"}}))
-                : of([{name: file.name, size: file.size, mime_type: file.type, path: `uploads/${file.name}`}]),
+                : of({kind: 'done', files: [{name: file.name, size: file.size, mime_type: file.type, path: `uploads/${file.name}`}]}),
         );
 
         // The send is committed regardless of the upload's fate: bubble,
@@ -2707,7 +2707,7 @@ describe('PersistentChatService — REST sends', () => {
         // Retry the queued item — only the failed file should be re-sent.
         ctx.mockApi.uploadOneToThread.mockClear();
         ctx.mockApi.uploadOneToThread.mockImplementation((_threadId: string, file: File) =>
-            of([{name: file.name, size: file.size, mime_type: file.type, path: `uploads/${file.name}`}]),
+            of({kind: 'done', files: [{name: file.name, size: file.size, mime_type: file.type, path: `uploads/${file.name}`}]}),
         );
 
         ctx.service.retryQueuedSends();
