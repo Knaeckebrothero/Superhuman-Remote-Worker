@@ -491,20 +491,90 @@ describe('PersistentChatService — Phase 3 outbox', () => {
         });
 
         it('drops the resolution when the thread changed mid-upload', async () => {
-            const ctx = await readySession();
+            // Mirrors the POST-path test: the foreign queue is POPULATED, so
+            // "the guard dropped it" is distinguishable from "connect emptied
+            // the queue", and t2's own item must survive untouched.
+            const ctx = await readySession('t1');
             const gate = new Subject<ThreadUploadedFile[]>();
             ctx.mockApi.uploadOneToThread = vi.fn().mockReturnValue(gate);
 
             ctx.service.addAttachments([filePreview('a.pdf')]);
-            void ctx.service.sendMessage('hi');
+            void ctx.service.sendMessage('from-t1');
             await flushTick();
-            await ctx.service.connect('other-thread');
 
+            await ctx.service.connect('t2'); // switch clears t1's queue
+            await ctx.service.sendMessage('from-t2'); // t2 not ready → queued
+            expect(ctx.service.outbox().length).toBe(1);
+
+            // The stale t1 upload resolves now — it must not POST, and must not
+            // touch t2's queue.
             gate.next([uploaded('a.pdf')]);
             gate.complete();
             await flushTick();
 
             expect(inputPosts(ctx).length).toBe(0);
+            expect(ctx.service.outbox().length).toBe(1);
+            expect(ctx.service.outbox()[0].displayContent).toBe('from-t2');
+            expect(ctx.service.outbox()[0].pendingFiles).toBeUndefined();
+        });
+
+        it('stays single-flight WITHIN a thread while an upload is in flight', async () => {
+            // The safety half of the per-thread lock: a second send on the same
+            // thread must not overtake the stalled head. Both would collide on
+            // the default turn_id and the second would be lost behind a 409.
+            const ctx = await readySession('t1');
+            const gate = new Subject<ThreadUploadedFile[]>();
+            ctx.mockApi.uploadOneToThread = vi.fn().mockReturnValue(gate);
+
+            ctx.service.addAttachments([filePreview('a.pdf')]);
+            void ctx.service.sendMessage('with a file');
+            await flushTick();
+
+            await ctx.service.sendMessage('right behind it');
+            await flushTick();
+
+            expect(inputPosts(ctx).length).toBe(0);
+            expect(ctx.service.outbox().map((i) => i.displayContent)).toEqual([
+                'with a file',
+                'right behind it',
+            ]);
+
+            // Upload lands → the queue drains FIFO, head first.
+            gate.next([uploaded('a.pdf')]);
+            gate.complete();
+            await flushTick();
+
+            expect(inputPosts(ctx).map((c: any) => c[1].content)).toEqual([
+                'with a file\n\n[Attached files in uploads/: a.pdf]',
+                'right behind it',
+            ]);
+        });
+
+        it('a thread switch mid-upload does not stall the new thread\'s queue', async () => {
+            // The upload runs INSIDE the flush's single-flight lock and is not
+            // cancelled on a thread switch (Slice 3 owns cancellation). With a
+            // tab-wide lock the newly-opened thread could not POST at all until
+            // the abandoned upload finished — an unbounded silent stall. The
+            // lock is per-thread: `turn_id` is per-thread, so two threads can
+            // never collide on it.
+            const ctx = await readySession('t1');
+            const gate = new Subject<ThreadUploadedFile[]>(); // never resolves
+            ctx.mockApi.uploadOneToThread = vi.fn().mockReturnValue(gate);
+
+            ctx.service.addAttachments([filePreview('a.pdf')]);
+            void ctx.service.sendMessage('from-t1');
+            await flushTick();
+            expect(ctx.mockApi.uploadOneToThread).toHaveBeenCalledTimes(1);
+
+            await ctx.service.connect('t2');
+            fireSseOpen(ctx.sseInstances[1]);
+            fireSseMessage(ctx.sseInstances[1], {method: 'ready', params: {}}, '1:1');
+            await ctx.service.sendMessage('from-t2');
+            await flushTick();
+
+            expect(inputPosts(ctx).length).toBe(1);
+            expect(inputBody(ctx).content).toBe('from-t2');
+            expect(ctx.service.outbox().length).toBe(0);
         });
 
         it('refuses to discard an item whose upload is in flight', async () => {

@@ -756,8 +756,22 @@ export class PersistentChatService {
     readonly isAwaitingTurn = computed(
         () => this.pendingTurnCount() > 0 && !this.isStreaming(),
     );
-    // Single-flight guard for _flushOutbox (one POST in flight per tab).
-    private flushingOutbox = false;
+    /**
+     * Single-flight guard for _flushOutbox — one POST in flight **per thread**,
+     * not per tab. `turn_id` is per-thread, so two different threads can never
+     * collide on it; the lock only has to stop two flushes racing within one
+     * thread.
+     *
+     * Per-tab was equivalent until the upload moved inside the lock. An upload
+     * is not cancelled by a thread switch (Slice 3 owns cancellation), so a
+     * tab-wide lock would be held for the whole remainder of an abandoned
+     * upload — and the thread the user just opened could not POST at all
+     * meanwhile, leaving its sends silently "queued" for an unbounded time.
+     *
+     * The value is an opaque token, not a boolean: a stale flush's `finally`
+     * must only be able to release the lock it actually took.
+     */
+    private flushTokens = new Map<string, object>();
     // localId of the item whose POST is currently in flight (skipped by
     // horizon re-dispatch, since accept-time persistence may already have put
     // its row in the reloaded history).
@@ -2622,8 +2636,13 @@ export class PersistentChatService {
      * not in sendMessage, so the bubble and the composer never wait on them.
      */
     private async _flushOutbox(): Promise<void> {
-        if (this.flushingOutbox) return;
-        this.flushingOutbox = true;
+        // Take the lock for THIS thread. A flush already running for another
+        // thread (typically stuck on an abandoned upload) must not block us.
+        const lockKey = this.threadId();
+        if (!lockKey) return; // nothing is flushable without a thread
+        if (this.flushTokens.has(lockKey)) return;
+        const token = {};
+        this.flushTokens.set(lockKey, token);
         try {
             while (
                 !this.intentionalClose &&
@@ -2737,7 +2756,8 @@ export class PersistentChatService {
                 return;
             }
         } finally {
-            this.flushingOutbox = false;
+            // Only ours: a same-key lock taken by a later flush must survive.
+            if (this.flushTokens.get(lockKey) === token) this.flushTokens.delete(lockKey);
         }
     }
 
@@ -2772,11 +2792,16 @@ export class PersistentChatService {
     ): Promise<{ ok: boolean; status: number }> {
         const files = head.pendingFiles ?? [];
         if (files.every((f) => f.status === 'done')) return {ok: true, status: 200};
+        // Iterate ids, not objects: every _patchPendingFile below replaces the
+        // whole pendingFiles array, so a captured element goes stale the moment
+        // its own status is written. Re-read the live one each turn.
+        const fileIds = files.map((f) => f.id);
 
         this.uploadingItemId = head.localId;
         try {
-            for (const f of files) {
-                if (f.status === 'done') continue;
+            for (const fileId of fileIds) {
+                const f = this._pendingFile(head.localId, fileId);
+                if (!f || f.status === 'done') continue;
                 // The user left this thread mid-batch. Stop pushing bytes into
                 // a workspace they've navigated away from — the flush's
                 // post-stage guard (which runs before any stall bookkeeping)
@@ -2825,6 +2850,14 @@ export class PersistentChatService {
         return {ok: true, status: 200};
     }
 
+    /** The queue's live view of one of an item's files. Never hold the object
+     *  across an await — each patch replaces the array it lives in. */
+    private _pendingFile(localId: string, fileId: string): PendingUpload | undefined {
+        return this.outbox()
+            .find((i) => i.localId === localId)
+            ?.pendingFiles?.find((f) => f.id === fileId);
+    }
+
     /** Patch one queued file's upload state through the signal (fresh item,
      *  fresh file object — the bubble renders off these). */
     private _patchPendingFile(
@@ -2832,6 +2865,11 @@ export class PersistentChatService {
         fileId: string,
         patch: Partial<PendingUpload>,
     ): void {
+        // Same guard as _mergeResolvedAttachments: once the item is gone (thread
+        // switched, queue drained) the .map below matches nothing, and writing
+        // its result would fire a pointless signal change on whatever queue the
+        // tab is showing now.
+        if (!this.outbox().some((i) => i.localId === localId)) return;
         this.outbox.update((q) =>
             q.map((i) =>
                 i.localId === localId
@@ -4253,7 +4291,7 @@ export class PersistentChatService {
         // reattached, /connection 200, and the queued item was still never
         // POSTed). Re-running the flush on every readiness signal costs nothing
         // when the queue is empty (immediate return) and is single-flighted by
-        // `flushingOutbox` when it isn't. It adds no new double-send risk: the
+        // `flushTokens` when it isn't. It adds no new double-send risk: the
         // false→true edge already flushed after a reconnect, so this only
         // covers the case that edge misses.
         void this._flushOutbox();
