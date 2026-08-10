@@ -26,6 +26,7 @@ import {
     UserTurn,
 } from '../models/turn.model';
 import {ThreadCloudDiffSummary} from '../models/api.model';
+import {UploadStatus} from '../models/file.model';
 import {PersistentThreadTransportBridge} from './persistent-thread-transport-bridge.service';
 import {CanvasService} from './canvas.service';
 
@@ -2615,6 +2616,56 @@ describe('PersistentChatService — REST sends', () => {
         );
         expect(intCall).toBeDefined();
         expect(ctx.service.isInterrupting()).toBe(true);
+    });
+
+    it('a mid-loop upload failure keeps the already-uploaded file COMPLETED, and a retry only re-uploads the failed one', async () => {
+        // Regression coverage for the per-file upload loop: file 1 succeeds,
+        // file 2 hits the 100MB cap (413). Pre-fix, the catch block
+        // blanket-marked BOTH files FAILED and discarded file 1's result —
+        // a retry then re-uploaded file 1 too, permanently duplicating it
+        // server-side (no delete endpoint, no idempotency key).
+        const ctx = await readySession();
+
+        const fileA = new File(['a'], 'a.png', {type: 'image/png'});
+        const fileB = new File(['b'], 'huge.bin', {type: 'application/octet-stream'});
+        const previewA: any = {id: '1', file: fileA, name: 'a.png', uploadStatus: UploadStatus.PENDING};
+        const previewB: any = {id: '2', file: fileB, name: 'huge.bin', uploadStatus: UploadStatus.PENDING};
+        ctx.service.addAttachments([previewA, previewB]);
+
+        ctx.mockApi.uploadOneToThread.mockImplementation((_threadId: string, file: File) =>
+            file === fileB
+                ? throwError(() => ({status: 413, error: {detail: "File 'huge.bin' exceeds 100MB"}}))
+                : of([{name: file.name, size: file.size, mime_type: file.type, path: `uploads/${file.name}`}]),
+        );
+
+        const ok1 = await ctx.service.sendMessage('two files');
+
+        expect(ok1).toBe(false);
+        expect(ctx.mockApi.uploadOneToThread).toHaveBeenCalledTimes(2);
+        // File 1 already landed server-side — its COMPLETED status and
+        // server-assigned path must survive the file-2 failure.
+        expect(previewA.uploadStatus).toBe(UploadStatus.COMPLETED);
+        expect(previewA.uploadedFiles).toEqual([
+            {name: 'a.png', size: fileA.size, mime_type: 'image/png', path: 'uploads/a.png'},
+        ]);
+        expect(previewB.uploadStatus).toBe(UploadStatus.FAILED);
+        expect(previewB.error).toBe('upload failed');
+        expect(ctx.service.attachmentError()).toBe('upload failed');
+
+        // Retry from the same composer state (nothing was cleared on
+        // failure) — only the failed file should be re-sent.
+        ctx.mockApi.uploadOneToThread.mockClear();
+        ctx.mockApi.uploadOneToThread.mockImplementation((_threadId: string, file: File) =>
+            of([{name: file.name, size: file.size, mime_type: file.type, path: `uploads/${file.name}`}]),
+        );
+
+        const ok2 = await ctx.service.sendMessage('two files');
+
+        expect(ok2).toBe(true);
+        expect(ctx.mockApi.uploadOneToThread).toHaveBeenCalledTimes(1);
+        expect(ctx.mockApi.uploadOneToThread).toHaveBeenCalledWith('thread-r', fileB);
+        expect(previewA.uploadStatus).toBe(UploadStatus.COMPLETED);
+        expect(previewB.uploadStatus).toBe(UploadStatus.COMPLETED);
     });
 });
 
