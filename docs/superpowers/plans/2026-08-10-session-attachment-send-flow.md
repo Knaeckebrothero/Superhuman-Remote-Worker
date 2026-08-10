@@ -508,7 +508,46 @@ The core change. `sendMessage` becomes synchronous through the dispatch; `_flush
 
 **Interfaces:**
 - Consumes: `PendingUpload`, `composeAgentContent`, `classifyUploadFailure`, `uploadSummary` from Task 1; `uploadOneToThread` from Task 2; `ChatAttachment.id` from Task 3.
-- Produces: `OutboxItem` gains `pendingFiles?: PendingUpload[]`, `threadId: string`, and `content` becomes optional (computed at flush time). A new private `_uploadStage(head): Promise<{ok: boolean; status: number}>`.
+- Produces: `OutboxItem` gains `pendingFiles?: PendingUpload[]`, `threadId: string`, and `content` becomes optional (computed at flush time). A new private `_uploadStage(head, threadId): Promise<{ok: boolean; status: number}>` — the thread id is passed in from the flush's `tidAtPost` rather than read off the item, so the upload and the POST are pinned to the same thread.
+
+**Required amendment to Task 1's helper (do this first).**
+HTTP 409 carries two opposite meanings on this endpoint and a status-only
+signature cannot tell them apart:
+- `thread_uploads.py:620-622` — *"Workspace is not ready — try again in a moment"* → **retryable**, the pod is still coming up.
+- `thread_uploads.py:581-588` — *"This session has no workspace, so files cannot be attached to it…"* → **terminal**, the `none` tier will never accept a file, so a Retry button can only fail forever (spec §5.5).
+
+Widen `classifyUploadFailure` in `cockpit/src/app/core/services/upload-stage.ts` and add the covering tests to `upload-stage.spec.ts`:
+
+```ts
+/**
+ * A permanent refusal from the `none` workspace tier. Matched on the detail
+ * text because the endpoint returns 409 for this AND for a pod that is merely
+ * still starting (thread_uploads.py:581-588 vs :620-622). The durable fix is a
+ * machine-readable {code, message} body like the TTS endpoint already returns
+ * (main.py:32570) — until then this string is the only discriminator.
+ */
+const NO_WORKSPACE_DETAIL = 'no workspace';
+
+export function classifyUploadFailure(status: number, detail = ''): 'terminal' | 'retryable' {
+    if (status === 400 || status === 413) return 'terminal';
+    if (status === 409 && detail.toLowerCase().includes(NO_WORKSPACE_DETAIL)) return 'terminal';
+    return 'retryable';
+}
+```
+
+```ts
+it('treats a not-ready workspace as retryable', () => {
+    expect(classifyUploadFailure(409, 'Workspace is not ready — try again in a moment')).toBe('retryable');
+});
+
+it('treats the none-tier refusal as terminal — retrying it can only fail forever', () => {
+    expect(
+        classifyUploadFailure(409, 'This session has no workspace, so files cannot be attached to it.'),
+    ).toBe('terminal');
+});
+```
+
+The existing single-argument call sites and tests keep working — `detail` defaults to `''`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -758,7 +797,10 @@ Add a private method and call it from `_flushOutbox` before `_postInput`:
      * Returns the same {ok, status} shape as _postInput so the flush's existing
      * terminal-vs-retryable branching applies unchanged.
      */
-    private async _uploadStage(head: OutboxItem): Promise<{ok: boolean; status: number}> {
+    private async _uploadStage(
+        head: OutboxItem,
+        threadId: string,
+    ): Promise<{ok: boolean; status: number}> {
         const files = head.pendingFiles ?? [];
         if (files.every((f) => f.status === 'done')) return {ok: true, status: 200};
 
@@ -769,7 +811,7 @@ Add a private method and call it from `_flushOutbox` before `_postInput`:
                 this._patchPendingFile(head.localId, f.id, {status: 'uploading'});
                 try {
                     const results = await firstValueFrom(
-                        this.api.uploadOneToThread(head.threadId, f.file),
+                        this.api.uploadOneToThread(threadId, f.file),
                     );
                     // A .zip expands to one entry per extracted member, so one
                     // PendingUpload can resolve into several ChatAttachments.
@@ -790,7 +832,7 @@ Add a private method and call it from `_flushOutbox` before `_postInput`:
                     const status = (err as {status?: number})?.status ?? 0;
                     const msg = this.api.humanizeUploadError(err);
                     this._patchPendingFile(head.localId, f.id, {status: 'failed', error: msg});
-                    if (classifyUploadFailure(status) === 'terminal') {
+                    if (classifyUploadFailure(status, msg) === 'terminal') {
                         this.error.set(msg);
                     }
                     return {ok: false, status};
@@ -808,9 +850,16 @@ Add a private method and call it from `_flushOutbox` before `_postInput`:
 In `_flushOutbox`, between `head.attempts += 1` and the `_postInput` call:
 
 ```ts
-                if (!head.threadId) head.threadId = tidAtPost;
+                // A landing-draft item is queued before its thread exists, so
+                // its threadId is ''. Patch it through the signal — never in
+                // place; the bubble reads this item.
+                if (!head.threadId) {
+                    this.outbox.update((q) =>
+                        q.map((i) => (i.localId === head.localId ? {...i, threadId: tidAtPost} : i)),
+                    );
+                }
                 if (head.pendingFiles?.length) {
-                    const up = await this._uploadStage(head);
+                    const up = await this._uploadStage(head, tidAtPost);
                     if (this.threadId() !== tidAtPost) {
                         queueMicrotask(() => void this._flushOutbox());
                         return;
