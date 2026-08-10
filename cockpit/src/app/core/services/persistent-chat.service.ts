@@ -2485,8 +2485,14 @@ export class PersistentChatService {
             this.attachmentError.set(null);
             queued.forEach((p) => (p.uploadStatus = UploadStatus.UPLOADING));
             try {
-                const result = await firstValueFrom(this.api.uploadToThread(threadId, files));
-                uploaded = result.files;
+                // One request per file (not one batched multipart POST) — see
+                // ApiService.uploadOneToThread for why. Sequential and
+                // fail-fast for now; Task 4 moves this into the send outbox
+                // with per-file progress and cancel.
+                for (const file of files) {
+                    const result = await firstValueFrom(this.api.uploadOneToThread(threadId, file));
+                    uploaded.push(...result);
+                }
                 queued.forEach((p) => (p.uploadStatus = UploadStatus.COMPLETED));
             } catch (err) {
                 const msg = this.api.humanizeUploadError(err);
