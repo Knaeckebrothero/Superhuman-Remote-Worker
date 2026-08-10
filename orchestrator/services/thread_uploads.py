@@ -885,6 +885,32 @@ def _virtual_write_files(
 MAX_DELETE_TREE_DEPTH = 64
 
 
+def _entry_mode(attrs: Any) -> int:
+    """Return an SFTP entry's mode, refusing when the server did not report one.
+
+    ``SSH_FILEXFER_ATTR_PERMISSIONS`` is **optional** in the SFTP protocol, so
+    ``SFTPAttributes.st_mode`` is legitimately ``None`` against a server that
+    omits it. The original ``attrs.st_mode or 0`` turned that into ``0``, and
+    ``S_ISLNK(0)`` is False — so every symlink check below passed silently and
+    the whole confinement guard failed **open**. Demonstrated, not inferred:
+    a fixture whose ``lstat`` returns ``st_mode=None`` let
+    ``uploads/escape/authorized_keys`` resolve and delete the key file.
+
+    A guard may only fail closed. An entry whose type we cannot read is one we
+    refuse to walk through, recurse into, or unlink.
+
+    Raises:
+        ThreadUploadError: 409 when the mode is unknown.
+    """
+    mode = getattr(attrs, "st_mode", None)
+    if mode is None:
+        raise ThreadUploadError(
+            status_code=409,
+            detail="Workspace did not report the file type; refusing to delete",
+        )
+    return int(mode)
+
+
 def _sftp_resolve_delete_target(
     sftp: Any, uploads_dir: str, relpath: str
 ) -> str | None:
@@ -913,7 +939,7 @@ def _sftp_resolve_delete_target(
         base = sftp.lstat(uploads_dir)
     except OSError:
         return None  # nothing has ever been uploaded here
-    if stat_module.S_ISLNK(base.st_mode or 0):
+    if stat_module.S_ISLNK(_entry_mode(base)):
         raise ThreadUploadError(
             status_code=409,
             detail="Workspace uploads directory is not a directory",
@@ -927,7 +953,11 @@ def _sftp_resolve_delete_target(
             attrs = sftp.lstat(cursor)
         except OSError:
             return None
-        if index < len(parts) - 1 and stat_module.S_ISLNK(attrs.st_mode or 0):
+        # Read the mode for EVERY component, including the leaf: an entry whose
+        # type the server declines to report is refused outright rather than
+        # defaulted to "not a symlink" (see _entry_mode).
+        mode = _entry_mode(attrs)
+        if index < len(parts) - 1 and stat_module.S_ISLNK(mode):
             raise ThreadUploadError(
                 status_code=409,
                 detail="Upload path traverses a symbolic link",
@@ -957,7 +987,7 @@ def _sftp_delete_tree(sftp: Any, path: str, *, depth: int = 0) -> None:
         attrs = sftp.lstat(path)
     except OSError:
         return  # vanished under us (concurrent delete) — the desired state
-    if stat_module.S_ISDIR(attrs.st_mode or 0):
+    if stat_module.S_ISDIR(_entry_mode(attrs)):
         for entry in sftp.listdir_attr(path):
             _sftp_delete_tree(
                 sftp, posixpath.join(path, entry.filename), depth=depth + 1
@@ -1151,7 +1181,7 @@ async def delete_file_from_thread_workspace(
     relpath: str,
     *,
     destination: _SshTarget | _VirtualTarget | None = None,
-) -> bool:
+) -> str | None:
     """Remove one upload from the thread workspace's ``uploads/`` directory.
 
     ``relpath`` is relative to ``uploads/`` (``UploadedFile.name``, not the
@@ -1175,8 +1205,11 @@ async def delete_file_from_thread_workspace(
             one, 503 for missing config/capacity).
 
     Returns:
-        True when something was removed; False when there was nothing to
-        remove, which the API layer turns into a 404.
+        The **normalized** path that was removed, relative to ``uploads/``
+        (``bundle/sub/../a.txt`` in, ``bundle/a.txt`` out) — so the route can
+        report what it actually deleted instead of echoing the caller's raw
+        string back. None when there was nothing to remove, which the API
+        layer turns into a 404.
     """
     safe_relpath = _safe_upload_relpath(relpath)
     if safe_relpath is None:
@@ -1193,7 +1226,9 @@ async def delete_file_from_thread_workspace(
         # zip stem fans out — so it shares the writer's concurrency ceiling
         # rather than opening an unbounded second source of children.
         async with _virtual_upload_slot():
-            return await asyncio.to_thread(
+            removed = await asyncio.to_thread(
                 _virtual_delete_file, destination, safe_relpath
             )
-    return await asyncio.to_thread(_sftp_delete_file, destination, safe_relpath)
+    else:
+        removed = await asyncio.to_thread(_sftp_delete_file, destination, safe_relpath)
+    return safe_relpath if removed else None
