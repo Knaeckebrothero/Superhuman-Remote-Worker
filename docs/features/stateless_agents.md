@@ -438,18 +438,24 @@ CREATE TABLE job_completion_commands (
 );
 
 -- Progress marker: ONE ROW PER EFFECT, never a JSONB log on the command.
-CREATE TABLE job_completion_effects (
-    command_id   UUID NOT NULL REFERENCES job_completion_commands(id) ON DELETE CASCADE,
-    effect_name  TEXT NOT NULL,          -- STABLE NAME, never an ordinal
-    effect_group TEXT NOT NULL,          -- independently retryable unit, see (4)
-    state        TEXT NOT NULL DEFAULT 'pending',
-    attempts     INT  NOT NULL DEFAULT 0,
-    intent_at    TIMESTAMPTZ,            -- written BEFORE the external call
-    complete_by  TIMESTAMPTZ,            -- strictly shorter than the command lease
-    completed_at TIMESTAMPTZ,
-    detail       JSONB NOT NULL DEFAULT '{}'::jsonb,  -- e.g. captured k8s UIDs
-    error_code   TEXT,
-    PRIMARY KEY (command_id, effect_name)
+-- POLYMORPHIC producer (run_queue's precedent) so the session lane shares this
+-- substrate rather than growing a second one — see "shared with the session
+-- lane" below. Deliberately NO foreign key, for the same reason run_queue has
+-- none: the effect log outlives and predates its referents across kinds. The
+-- cost is that retention is explicit rather than ON DELETE CASCADE.
+CREATE TABLE completion_effects (
+    producer_kind TEXT NOT NULL,         -- 'job_completion' | 'session_turn'
+    producer_id   UUID NOT NULL,         -- command id, or the turn's unit id
+    effect_name   TEXT NOT NULL,         -- STABLE NAME, never an ordinal
+    effect_group  TEXT NOT NULL,         -- independently retryable unit, see (4)
+    state         TEXT NOT NULL DEFAULT 'pending',
+    attempts      INT  NOT NULL DEFAULT 0,
+    intent_at     TIMESTAMPTZ,           -- written BEFORE the external call
+    complete_by   TIMESTAMPTZ,           -- strictly shorter than the owner's lease
+    completed_at  TIMESTAMPTZ,
+    detail        JSONB NOT NULL DEFAULT '{}'::jsonb,  -- e.g. captured k8s UIDs
+    error_code    TEXT,
+    PRIMARY KEY (producer_kind, producer_id, effect_name)
 );
 ```
 
@@ -913,9 +919,42 @@ S8 VM-recovery wedge and the S19 dispatcher-invisible window are fixed properly 
 the command's atomicity; each also has a cheap sweeper backstop if they bite
 before then.
 
-**Migration numbering:** S2 has been allocated **0122–0129**; Gate 3 starts at
-**0130**. This is deliberate range allocation — the earlier dev-cluster wedge
-came from two tracks numbering independently against one shared database.
+##### The finalizer is shared with the session lane (decided 2026-08-09)
+
+S2 stopped before building a generic background-work outbox for sessions,
+correctly: making it safe requires enqueueing the effect inside the final
+message-persist transaction *and* having `complete_unit` block or reconcile on
+it, which is a completion-protocol change. Today the session lane keeps that work
+correct by **holding the lease** instead — `_await_cloud_push` blocks
+`complete_unit` until the push reaches a terminal outcome, because "a live task
+after `complete_unit` has no durable ownership and can race the next claimant".
+An outbox replaces holding with releasing, and that is the same problem Gate 3 is
+already solving.
+
+**Ruling: one substrate, both lanes.** A session turn's background work is
+another effect-group producer, not a second mechanism. Two consequences to build
+in from the start rather than retrofit:
+
+- **The effect table is polymorphic from day one**, following `run_queue`'s
+  precedent (`unit_id` + `unit_kind`, "deliberately NO foreign key — the queue
+  outlives and predates its referents across kinds"). Retrofitting a producer
+  kind later means a migration on a table that is by then hot. The command row
+  keeps its `job_id` FK for the worker lane; the *effects* table does not
+  inherit it.
+- **The fence generalizes cleanly** — a session turn's owner is always a
+  `lease_token`, which is one arm of the `lease_token` XOR `agent_id` pair the
+  command row already carries.
+
+Sequencing: this lands **after** step 1 below, so the three items S2 has blocked
+behind it (exact `llm_requests` archival, turn-end memory capture, post-callback
+Git turn→SHA ordering) wait on the substrate rather than on all of Gate 3.
+
+**Migration numbering:** S1 used 0115–0121; S2 used **0122–0129** (all consumed);
+**Gate 3 owns 0130–0149**. The wider range is deliberate — S2 was allocated eight
+numbers, used all eight, and stopped partly because it had none left, which was
+an allocation error rather than a design constraint. Range allocation itself
+remains necessary: the earlier dev-cluster wedge came from two tracks numbering
+independently against one shared database.
 
 ##### Why not adopt a durable-execution engine
 
