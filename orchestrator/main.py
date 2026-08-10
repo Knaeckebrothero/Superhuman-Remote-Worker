@@ -189,6 +189,12 @@ from services.thread_control_inbox import (  # noqa: E402
     admit_thread_control,
     find_existing_thread_control,
 )
+from src.shared.thread_presence import (  # noqa: E402
+    DEFAULT_PRESENCE_RENEW_SECONDS,
+    DEFAULT_PRESENCE_TTL_SECONDS,
+    promote_expired_stateless_pauses,
+    refresh_thread_presence,
+)
 from services.stateless_workspace_gate import (  # noqa: E402
     declared_thread_workspace_backend,
     stateless_lite_workspace_check,
@@ -31292,6 +31298,24 @@ async def _no_cursor_replay_start(conn, thread_id: str, epoch: int) -> int:
 THREAD_EVENTS_EPOCH_RECHECK_S: float = float(
     os.environ.get("THREAD_EVENTS_EPOCH_RECHECK_S", "2.0")
 )
+THREAD_CLIENT_PRESENCE_RENEW_S: float = max(
+    1.0,
+    float(
+        os.environ.get(
+            "THREAD_CLIENT_PRESENCE_RENEW_S",
+            str(DEFAULT_PRESENCE_RENEW_SECONDS),
+        )
+    ),
+)
+THREAD_CLIENT_PRESENCE_TTL_S: float = max(
+    THREAD_CLIENT_PRESENCE_RENEW_S * 2.0,
+    float(
+        os.environ.get(
+            "THREAD_CLIENT_PRESENCE_TTL_S",
+            str(DEFAULT_PRESENCE_TTL_SECONDS),
+        )
+    ),
+)
 
 
 @app.get("/api/persistent/threads/{thread_id}/stream")
@@ -31307,6 +31331,34 @@ async def thread_event_stream(thread_id: str, request: Request) -> StreamingResp
     mode (200ms poll, adaptive backoff to 1s after 5 empty polls).
     """
     user, thread = await require_thread_owner(request, postgres_db, thread_id)
+
+    # The existing owner-gated SSE connection is the lane-agnostic client
+    # attachment signal. No lane field crosses the wire. Pinned streams keep
+    # their exact behavior; a stateless stream must establish its durable TTL
+    # before the browser can believe it is attached.
+    track_presence = thread.get("execution_lane") == "stateless"
+    if track_presence:
+        try:
+            presence = await refresh_thread_presence(
+                postgres_db,
+                thread_id=thread_id,
+                ttl_seconds=THREAD_CLIENT_PRESENCE_TTL_S,
+                establish=True,
+            )
+        except Exception as exc:
+            logger.warning(
+                "thread_event_stream presence establish failed (thread=%s): %s",
+                thread_id,
+                exc,
+            )
+            raise HTTPException(
+                status_code=503,
+                detail="Session presence is temporarily unavailable",
+            ) from exc
+        if not presence.served:
+            # The row changed lane or disappeared after the owner lookup. A
+            # reconnect re-runs authorization and resolves the current lane.
+            raise HTTPException(status_code=409, detail="Session lane changed")
 
     server_epoch = int(thread.get("events_epoch") or 0)
 
@@ -31345,6 +31397,8 @@ async def thread_event_stream(thread_id: str, request: Request) -> StreamingResp
         # (lines starting with `:`) are ignored by EventSource, so this is
         # side-effect-free on the client.
         yield ": open\n\n"
+
+        next_presence_renew = time.monotonic() + THREAD_CLIENT_PRESENCE_RENEW_S
 
         # Mismatched epoch → force re-sync.
         if cursor_epoch is not None and cursor_epoch != server_epoch:
@@ -31421,6 +31475,29 @@ async def thread_event_stream(thread_id: str, request: Request) -> StreamingResp
             while not cancelled:
                 if await request.is_disconnected():
                     break
+                if track_presence and time.monotonic() >= next_presence_renew:
+                    # A long-lived stream does not retain authorization from
+                    # its opening handshake forever. Re-run the same BFF-cookie
+                    # owner gate before every attested renewal; expiry or an
+                    # ownership change closes the stream and writes no TTL.
+                    _renew_user, renew_thread = await require_thread_owner(
+                        request, postgres_db, thread_id
+                    )
+                    if renew_thread.get("execution_lane") != "stateless":
+                        return
+                    presence = await refresh_thread_presence(
+                        postgres_db,
+                        thread_id=thread_id,
+                        ttl_seconds=THREAD_CLIENT_PRESENCE_TTL_S,
+                        establish=False,
+                    )
+                    if not presence.served:
+                        # Lane change/deletion: close. EventSource reconnects
+                        # through require_thread_owner and current DB truth.
+                        return
+                    next_presence_renew = (
+                        time.monotonic() + THREAD_CLIENT_PRESENCE_RENEW_S
+                    )
                 async with postgres_db.acquire() as conn:
                     rows = await conn.fetch(
                         "SELECT seq, kind, payload "
@@ -33022,6 +33099,23 @@ async def attention_sleep_sweeper(shutdown_event: asyncio.Event) -> None:
 
     while not shutdown_event.is_set():
         try:
+            # A disconnect intentionally leaves a short TTL grace so reloads
+            # and multi-tab handoffs never flicker. If a turn reached its
+            # natural pause inside that grace, converge it once the queue is
+            # durably done and the final client TTL has expired. This is
+            # independent of workspace suspension being enabled.
+            try:
+                promoted = await promote_expired_stateless_pauses(postgres_db, limit=50)
+                if promoted:
+                    logger.info(
+                        "presence expiry promoted %d stateless thread(s) "
+                        "to awaiting_user",
+                        len(promoted),
+                    )
+            except Exception as exc:
+                # Presence convergence is additive. It must never suppress the
+                # pre-existing awaiting_user suspension sweep on the same tick.
+                logger.warning("presence expiry promotion failed: %s", exc)
             if workspace_suspension_service.is_enabled:
                 async with postgres_db.acquire() as conn:
                     # Phase 6: per-thread TTL resolution. Priority order is

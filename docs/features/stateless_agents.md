@@ -1212,9 +1212,23 @@ resource marker and flock live in the workload user's home and are therefore a
 **cooperative correctness protocol**, not a security boundary against arbitrary
 shell mutation. Pinned cleanup keeps its historical destructive behavior.
 
-This does **not** remove the gate. Outbox, interrupt and attached-client/Canvas
-presence re-homing remain open; workspace/runtime-incarnation authority and
-durable terminal-retirement acknowledgement are incomplete; and the §6.1
+The first §3.5 slice is built too. Migration **0125** adds a bounded,
+database-clock attached-client TTL renewed by the existing owner-gated SSE
+stream. The client remains lane-free and uses its normal BFF cookie; every
+renewal revalidates current ownership. Stateless natural-pause and permission
+expiry now consult that durable oracle, with exact queue fencing on the
+irreversible permission CAS and a leader convergence pass after the final
+client's reload grace expires. Pinned WebSocket/subscriber behavior is
+unchanged. Live `expired`/`interrupted` permission outcomes retire the card
+without being fabricated as user denials. A fresh migration replay took
+**16 ms**; exact in-cluster presence renewal measured **22.37 ms cold** and
+**6.47/7.19 ms warm**, and an unauthenticated SSE request returned 401 with no
+presence row written.
+
+This does **not** remove the gate. Outbox, hard interrupt and **Canvas editor**
+presence re-homing remain open; the generic attached-client signal does not
+make socketless Canvas awareness work. Workspace/runtime-incarnation authority
+and durable terminal-retirement acknowledgement are incomplete, and the §6.1
 RAM/path-bypass work is deferred to its own pass. None of the direct proofs
 enqueued a turn, changed a sandbox thread's lane, or created a worker batch.
 

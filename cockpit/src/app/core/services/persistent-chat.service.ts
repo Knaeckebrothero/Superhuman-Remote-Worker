@@ -3983,19 +3983,27 @@ export class PersistentChatService {
                 // an already-decided approval card, whose re-click then
                 // 409'd (session_silent_failure_audit.md #10).
                 const resolvedId = (params['id'] as string) || '';
-                const decision =
-                    params['decision'] === 'approved' ? 'approved' : 'denied';
+                const rawDecision = params['decision'];
                 this._clearPermissionResolutionFailure(resolvedId);
                 if (!coveredBySnapshot) {
                     this.pendingPermissions.update((list) =>
                         list.filter((p) => p.id !== resolvedId),
                     );
                 }
-                if (resolvedId) {
+                // Only literal user decisions belong in the turn model.
+                // `expired` and `interrupted` mean nobody answered; mapping
+                // either to `denied` fabricates a refusal and disagrees with
+                // REST-history replay, which only treats literal `denied` as
+                // denial. The card still retires because it is no longer
+                // actionable.
+                if (
+                    resolvedId &&
+                    (rawDecision === 'approved' || rawDecision === 'denied')
+                ) {
                     this.dispatch({
                         type: 'permission_decision',
                         toolUseId: resolvedId,
-                        decision,
+                        decision: rawDecision,
                         timestamp: now,
                     });
                 }

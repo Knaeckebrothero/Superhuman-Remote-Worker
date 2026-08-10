@@ -2533,3 +2533,110 @@ phase did not run a separate live pinned cloud-mount smoke. The tier gate stays
 closed. §3.5 outbox, interrupt and presence re-homing, workspace-incarnation and
 terminal-retirement authority, and the deferred §6.1 RAM/path-bypass work remain
 unverified. No worker batch was enqueued.
+
+## Phase 4 durable attached-client presence — DONE; Canvas remains separate
+
+Migration **0125** and the generic session-presence slice are implemented on
+`feature/stateless-agents`; nothing was pushed. The existing owner-gated SSE
+stream is now the lane-free client attachment signal. The Cockpit sends no lane
+and gained no new endpoint or heartbeat: a stateless SSE establishment writes
+one database-clock TTL row per thread, renews it only after re-running
+`require_thread_owner` with the current BFF cookie, and leaves the row to expire
+on disconnect. Pinned streams do none of those writes and retain their exact
+process-local `_subscribers` behavior.
+
+One row deliberately means “at least one attached client”, not a refcount.
+Concurrent tabs renew the same row; closing one cannot decrement another;
+reload within the 30-second TTL has no presence/status flicker. A genuine
+expired/absent → live establishment clears `awaiting_user`, but periodic renew
+and a second within-TTL establishment do not. This is necessary for polite
+mode: its `awaiting_user` state is an explicit review pause and must remain so
+while an already-attached viewer watches it.
+
+The two stateless natural-pause sites and permission timeout now read this
+durable oracle. Eager and sudo pause only when the TTL is absent; polite pauses
+regardless. The permission expiry is an exact lease-fenced CAS and returns the
+live TTL remainder, so a tab closing just before the five-minute permission
+slice is reconsidered at presence expiry rather than after another five
+minutes. Unknown presence retains the card. A leader-gated convergence pass
+promotes only stateless, non-officer, post-first-turn threads whose queue is
+durably `done` after the final TTL expires. Its failure has an independent
+exception boundary and cannot suppress the pre-existing awaiting-user
+suspension sweep.
+
+The final client audit found a separate live-rendering mismatch: the Cockpit
+mapped every non-`approved` `permission.resolved` frame to `denied`, even though
+the agent deliberately distinguishes `expired`/`interrupted` as NO_ANSWER and
+REST history treats only literal `denied` as a refusal. The lane-free SSE
+reducer now always retires the no-longer-actionable card but dispatches a turn
+decision only for literal `approved` or `denied`. No execution-lane field or
+new UI copy was introduced.
+
+### Authority and concurrency decisions
+
+Presence is explicitly **cooperative UX state**, never authorization, queue
+ownership, a fencing token, or worker/finalizer liveness. Natural-pause status
+uses the exact current lease predicate but is an advisory lifecycle marker; the
+turn and journal stores retain their stronger persist fences. Taking a queue
+`FOR SHARE` and then the threads row here would invert stateless `/input`'s
+existing threads→queue order and create a deadlock cycle, so that lock was not
+added to the lifecycle update.
+
+Permission expiry is irreversible and therefore does take `run_queue FOR
+SHARE`. It also serializes against SSE refresh with the same per-thread advisory
+lock. The first implementation put both operations in one SQL statement. A real
+Postgres race proved that wrong: a statement which starts and then waits for the
+advisory lock retains its pre-renewal snapshot and expired the card after the
+renewal committed. The final form acquires the advisory lock as statement one,
+then runs the fenced CAS as statement two in the same READ COMMITTED
+transaction, which gets a fresh post-renewal snapshot. The forced race now
+leaves the card pending.
+
+### Verification and measurements
+
+* Fresh PG15 migration replay applied 0125 in **16 ms** and regenerated the
+  12,739-line app snapshot. The k3d ledger reports
+  `0125_thread_client_presence.sql|true`; the table and expiry index exist.
+* The real scratch-PG contract passed **101/101**, including five new presence
+  cases: multi-tab/polite preservation, expired re-establishment, eager versus
+  polite pause, done-only expiry promotion, and the forced renewal/permission
+  advisory-lock race.
+* The affected focused suites passed **121 tests**. Repository-wide pytest
+  returned **15,403 passed / 127 skipped / 11 failed in 793.25 s**. The eleven
+  are exactly the established environment baseline (localhost Postgres, MCP
+  transport and optional arXiv/Semantic Scholar clients).
+* After the final concurrency and client-review fixes, the affected Python
+  suites passed **123/123** and the focused Cockpit service suite passed
+  **229/229**, including both `expired` and `interrupted` live outcomes. The
+  production Cockpit build completed successfully; its pre-existing bundle
+  budget and CommonJS warnings remain warnings only.
+* The running Cockpit pod contains both the exact live-reducer marker and its
+  regression-test marker (**1** match each), rather than merely reporting a
+  successful Tilt update.
+* Repository-wide Ruff check and Ruff format check (**1,055 files**) plus
+  `git diff --check` are clean.
+* Both running stateless pods hash-match the working tree for
+  `persistent_app.py` and `thread_presence.py`; the orchestrator hash-matches
+  `main.py`, the helper and migration 0125. An unauthenticated live SSE request
+  returned **401** and left **0** presence rows, proving the owner gate precedes
+  the write. Exact in-cluster renewal measured **22.37 ms cold, 6.47/7.19 ms
+  warm**; cleanup restored zero rows.
+* Closeout: **0** presence rows, **0** queued/leased units and **0
+  `worker_batch` rows**. The tier gate remains closed.
+
+The first full-suite invocation was stopped after the execution wrapper
+detached its output at 6%; the monitored restart above is the comparable
+result. No test failure was hidden by that harness restart.
+
+### Remaining boundary
+
+This generic attached-client signal fixes the load-bearing `_subscribers`
+oracle, but it is not Canvas editor awareness. Stateless Canvas awareness still
+uses the absent control WebSocket and agent RAM fan-out, so its no-flicker
+acceptance remains unverified and requires a separate design. No live
+BFF-authenticated reload/multi-tab browser exercise or live pinned-session smoke
+was run in this slice; server auth ordering, TTL/multi-tab behavior and the
+pinned split are covered by route tests and real Postgres. Outbox re-homing,
+hard interrupt, gate release, permission-row retirement on lease expiry,
+workspace-incarnation authority and the deferred §6.1 RAM/path bypasses remain
+open. Gate 3 and migrations 0130+ were not touched.

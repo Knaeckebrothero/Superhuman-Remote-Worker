@@ -7090,6 +7090,39 @@ CREATE TABLE public.system_settings (
 
 
 --
+-- Name: thread_client_presence; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.thread_client_presence (
+    thread_id uuid NOT NULL,
+    refreshed_at timestamp with time zone NOT NULL,
+    expires_at timestamp with time zone NOT NULL,
+    CONSTRAINT thread_client_presence_expiry_order CHECK ((expires_at > refreshed_at))
+);
+
+
+--
+-- Name: TABLE thread_client_presence; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.thread_client_presence IS 'Owner-gated SSE attestation that at least one browser is attached to a stateless session. One TTL row per thread deliberately collapses tabs: reload and reconnect renew the same row, and disconnect never deletes it. This is cooperative UX state only, never authorization, queue ownership, a fencing token, or a worker/finalizer liveness signal.';
+
+
+--
+-- Name: COLUMN thread_client_presence.refreshed_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.thread_client_presence.refreshed_at IS 'Database-clock time of the latest successful SSE establishment or renewal.';
+
+
+--
+-- Name: COLUMN thread_client_presence.expires_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.thread_client_presence.expires_at IS 'Database-clock presence deadline. Absence means no row or expires_at at or before clock_timestamp(); rows are retained and overwritten so cardinality remains bounded by threads.';
+
+
+--
 -- Name: thread_cloud_sync_generations; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -9173,6 +9206,14 @@ ALTER TABLE ONLY public.system_settings
 
 
 --
+-- Name: thread_client_presence thread_client_presence_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.thread_client_presence
+    ADD CONSTRAINT thread_client_presence_pkey PRIMARY KEY (thread_id);
+
+
+--
 -- Name: thread_cloud_sync_generations thread_cloud_sync_generations_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -10169,6 +10210,13 @@ CREATE INDEX idx_sudo_pending ON public.sudo_approval_requests USING btree (stat
 --
 
 CREATE INDEX idx_sudo_rules_active ON public.sudo_auto_rules USING btree (priority) WHERE (enabled = true);
+
+
+--
+-- Name: idx_thread_client_presence_expires_at; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_thread_client_presence_expires_at ON public.thread_client_presence USING btree (expires_at);
 
 
 --
@@ -12516,6 +12564,14 @@ ALTER TABLE ONLY public.storage_volume_incarnations
 
 ALTER TABLE ONLY public.sudo_approval_requests
     ADD CONSTRAINT sudo_approval_requests_job_id_fkey FOREIGN KEY (job_id) REFERENCES public.jobs(id) ON DELETE CASCADE;
+
+
+--
+-- Name: thread_client_presence thread_client_presence_thread_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.thread_client_presence
+    ADD CONSTRAINT thread_client_presence_thread_id_fkey FOREIGN KEY (thread_id) REFERENCES public.threads(id) ON DELETE CASCADE;
 
 
 --
