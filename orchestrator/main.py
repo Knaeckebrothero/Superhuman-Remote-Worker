@@ -32563,6 +32563,64 @@ async def upload_files_to_thread(
     }
 
 
+@app.delete("/api/persistent/threads/{thread_id}/uploads/{path:path}")
+async def delete_thread_upload(
+    thread_id: str,
+    path: str,
+    request: Request,
+) -> dict[str, Any]:
+    """Remove one file from a persistent thread workspace's ``uploads/`` dir.
+
+    Exists so the cockpit's *eager* upload can be cancelled honestly. The
+    composer starts transferring the moment a file is attached, before the
+    user commits to sending, so removing an attachment chip can arrive after
+    the bytes have already landed. Without this, cancelling is a lie and
+    attach → remove → re-attach cycles accumulate ``_1``/``_2`` copies in a
+    directory the agent can list and read
+    (``docs/features/session_attachment_send_flow.md`` §9.1).
+
+    ``path`` is relative to ``uploads/`` — i.e. the ``name`` field the upload
+    response returned (``report.pdf``, or ``bundle/sub/a.txt`` for a
+    zip-extracted member), **not** its ``uploads/``-prefixed ``path`` field,
+    which would resolve to ``uploads/uploads/…``. Naming a zip's ``<stem>``
+    directory removes that whole subtree.
+
+    Validation is ``_safe_upload_relpath``, which rejects rather than
+    sanitizes and is never delegated to the remote: SFTP would remove any
+    path the ``agent-host`` user can write, and the thread's object-store
+    prefix is shared with Canvas state and tool files.
+
+    Returns:
+        ``{"thread_id": "...", "path": "uploads/<path>", "deleted": true}``.
+        400 for a path that escapes ``uploads/``, 404 when there is no such
+        upload, and the usual destination taxonomy (409 no/unready workspace,
+        502 unreachable, 503 misconfigured or at capacity) otherwise.
+    """
+    from services.thread_uploads import (
+        ThreadUploadError,
+        delete_file_from_thread_workspace,
+    )
+
+    user, thread = await require_thread_owner(request, postgres_db, thread_id)
+
+    try:
+        deleted = await delete_file_from_thread_workspace(thread, path)
+    except ThreadUploadError as e:
+        logger.warning(
+            "Thread upload delete refused for %s (%r): %d %s",
+            thread_id,
+            path,
+            e.status_code,
+            e.detail,
+        )
+        raise HTTPException(status_code=e.status_code, detail=e.detail) from e
+
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Upload not found")
+
+    return {"thread_id": thread_id, "path": f"uploads/{path}", "deleted": True}
+
+
 # Map a TTS synthesis failure code → HTTP status. Deliberately NEVER 401/403
 # for "auth": the cockpit auth interceptor redirects to login on 401, and a
 # *provider* key problem must not look like the user's own session expiring.
