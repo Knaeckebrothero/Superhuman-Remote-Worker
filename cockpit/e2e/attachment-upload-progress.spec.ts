@@ -212,6 +212,42 @@ test('a real attachment upload reports intermediate progress under an active ser
     );
     await page.locator('button.send').click();
 
+    // ── The bar has to be VISIBLE, not merely correct.
+    //
+    //    `aria-valuenow` is an attribute: Angular writes it whether or not the
+    //    element it is on occupies a single pixel. That blind spot shipped a
+    //    real regression — a `display: flex` in the global queued-bubble sheet
+    //    (`_chat-queued.scss`, specificity (0,5,0)) beat the component's own
+    //    `.upload-stage[_ngcontent]` (0,2,0) and laid the stage out as a ROW,
+    //    so the bar sat beside the label with **width 0** while this spec went
+    //    green on 25 perfectly good readings. Geometry is the only thing that
+    //    can tell those two apart, so measure it while the upload is still
+    //    running.
+    await page.waitForFunction(
+      (ceiling) =>
+        (window.__uploadReadings ?? []).some(
+          (r) => typeof r.value === 'number' && r.value > 0 && r.value < ceiling,
+        ),
+      DONE_PLATEAU,
+      {timeout: 6 * 60_000},
+    );
+    const barBox = await page.locator('.upload-bar').first().boundingBox();
+    const fillBox = await page.locator('.upload-bar-fill').first().boundingBox();
+    const stageBox = await page.locator('.upload-stage').first().boundingBox();
+    const geometry =
+      `bar=${JSON.stringify(barBox)} fill=${JSON.stringify(fillBox)} ` +
+      `stage=${JSON.stringify(stageBox)}`;
+    testInfo.annotations.push({type: 'bar-geometry', description: geometry});
+    console.log(`[gate] mid-upload ${geometry}`);
+    expect(
+      barBox?.width ?? 0,
+      'The progress bar is in the DOM and publishing aria-valuenow, but it has ZERO WIDTH ' +
+        `mid-upload — nothing is drawn (${geometry}). The known cause is a global rule ` +
+        'in src/styles/_chat-queued.scss overriding `display` on `.upload-stage`: the ' +
+        'global selector outranks the component sheet under emulated encapsulation, and a ' +
+        'flex row leaves the bar with no width to fill. `.upload-stage` must stay a block.',
+    ).toBeGreaterThan(0);
+
     const response = await uploadResponse;
     // Snapshot the instant the server answered the upload — everything here is
     // unambiguously *before* the send could be accepted.
