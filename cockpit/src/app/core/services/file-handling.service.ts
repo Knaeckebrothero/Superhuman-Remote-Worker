@@ -18,7 +18,11 @@ export interface FileCaps {
  * over-report:
  *  - persistent-chat's composer uploads into a *live* thread workspace
  *    (`POST /api/persistent/threads/{id}/uploads`, orchestrator/services/
- *    thread_uploads.py) — capped at 100MB / 20 files server-side.
+ *    thread_uploads.py) — 100MB per file is a real server limit that binds
+ *    on every request (thread_uploads.py:69). 20 files is NOT a server
+ *    limit here: it's our own composer policy, because the composer now
+ *    sends one request per file, so the server's per-request file-count cap
+ *    can never be hit by this client (see MAX_FILES below).
  *  - job-create uploads into local orchestrator storage for a not-yet-
  *    running job (`POST /api/uploads`, orchestrator/uploads.py:53-54) —
  *    genuinely capped at 5GB / 100 files server-side, a different order of
