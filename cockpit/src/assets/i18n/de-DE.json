@@ -1609,6 +1609,7 @@
       "failed": "{{name}} konnte nicht hochgeladen werden",
       "removeAndSend": "Datei entfernen und senden",
       "slashCommandWithAttachments": "Entfernen Sie die angehängten Dateien, bevor Sie einen Befehl ausführen.",
+      "duplicateFile": "{{name}} ist bereits angehängt",
       "tooLarge": "{{name}} überschreitet das 100-MB-Limit",
       "tooManyFiles": "Sie können höchstens 20 Dateien gleichzeitig anhängen",
       "noWorkspace": "Diese Sitzung hat keinen Workspace, daher können keine Dateien angehängt werden."

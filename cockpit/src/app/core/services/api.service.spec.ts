@@ -616,4 +616,36 @@ describe('uploadOneToThread', () => {
     expect((err as HttpErrorResponse).status).toBe(413);
     expect(api.humanizeUploadError(err)).toBe("File 'a.pdf' exceeds 100MB");
   });
+
+  it('unsubscribing cancels the upload without surfacing an error', () => {
+    // Chip removal cancels by unsubscribing (§5.4). If that surfaced as an
+    // error the caller could not tell it from an outage — Angular reports both
+    // as status 0 — which is why cancellation is tracked as explicit intent.
+    let errored = false;
+    const sub = api
+      .uploadOneToThread('t1', new File(['abc'], 'a.pdf'))
+      .subscribe({error: () => (errored = true)});
+    const req = httpMock.expectOne((r) => r.url.endsWith('/persistent/threads/t1/uploads'));
+
+    sub.unsubscribe();
+
+    expect(req.cancelled).toBe(true);
+    expect(errored).toBe(false);
+  });
+
+  it('deletes by the uploads-RELATIVE name, encoding each segment', () => {
+    // The {path:path} segment is UploadedFile.name, never its `path` field:
+    // `uploads/bundle/a.txt` would resolve to uploads/uploads/… and 404.
+    // Encoding is per segment so a zip member keeps its separators while a `#`
+    // (which would otherwise truncate the URL at the fragment) does not.
+    api.deleteThreadUpload('t1', 'bundle/sub/re#port ?.txt').subscribe();
+
+    const req = httpMock.expectOne((r) =>
+      r.url.endsWith(
+        '/persistent/threads/t1/uploads/bundle/sub/re%23port%20%3F.txt',
+      ),
+    );
+    expect(req.request.method).toBe('DELETE');
+    req.flush({thread_id: 't1', path: 'uploads/bundle/sub/re#port ?.txt', deleted: true});
+  });
 });

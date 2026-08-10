@@ -128,6 +128,7 @@ function createService(opts: {
 
     const mockApi: any = {
         uploadOneToThread: vi.fn().mockReturnValue(of({kind: 'done', files: []})),
+        deleteThreadUpload: vi.fn().mockReturnValue(of(undefined)),
         humanizeUploadError: vi.fn().mockReturnValue('upload failed'),
     };
 
@@ -2671,13 +2672,17 @@ describe('PersistentChatService — REST sends', () => {
             id: '2', file: fileB, name: 'huge.bin', size: fileB.size,
             mimeType: 'application/octet-stream', uploadStatus: UploadStatus.PENDING,
         };
-        ctx.service.addAttachments([previewA, previewB]);
-
+        // Set BEFORE attaching: since §5.4 the upload starts on attach, so the
+        // default mock would otherwise answer the eager requests.
         ctx.mockApi.uploadOneToThread.mockImplementation((_threadId: string, file: File) =>
             file === fileB
                 ? throwError(() => ({status: 413, error: {detail: "File 'huge.bin' exceeds 100MB"}}))
                 : of({kind: 'done', files: [{name: file.name, size: file.size, mime_type: file.type, path: `uploads/${file.name}`}]}),
         );
+        const sends = (f: File) =>
+            ctx.mockApi.uploadOneToThread.mock.calls.filter((c: any) => c[1] === f).length;
+
+        ctx.service.addAttachments([previewA, previewB]);
 
         // The send is committed regardless of the upload's fate: bubble,
         // queue entry, cleared composer.
@@ -2686,7 +2691,11 @@ describe('PersistentChatService — REST sends', () => {
 
         expect(ok1).toBe(true);
         expect(ctx.service.pendingAttachments()).toEqual([]);
-        expect(ctx.mockApi.uploadOneToThread).toHaveBeenCalledTimes(2);
+        // a.png was uploaded eagerly on attach and ADOPTED by the send, so it
+        // crossed the wire once; huge.bin's eager attempt failed and left no
+        // trace, so the send retried it on the deferred path.
+        expect(sends(fileA)).toBe(1);
+        expect(sends(fileB)).toBe(2);
         // Nothing was POSTed — the queue stalled at stage 0.
         const failedInput = ctx.mockHttp.post.mock.calls.filter((c: any) =>
             String(c[0]).endsWith('/persistent/threads/thread-r/input'),
