@@ -772,16 +772,25 @@ export class PersistentChatService {
      * must only be able to release the lock it actually took.
      */
     private flushTokens = new Map<string, object>();
-    // localId of the item whose POST is currently in flight (skipped by
-    // horizon re-dispatch, since accept-time persistence may already have put
-    // its row in the reloaded history).
-    private flushingHeadId: string | null = null;
-    // localId of the item whose upload stage is running. Separate from
-    // flushingHeadId (which covers only the POST): both windows must refuse a
-    // discard, but for different reasons — an in-flight POST's fate isn't
-    // decided, while dropping a mid-upload item orphans bytes in the workspace
-    // that no endpoint can delete.
-    private uploadingItemId: string | null = null;
+    // localIds whose POST is currently in flight (skipped by horizon
+    // re-dispatch, since accept-time persistence may already have put their row
+    // in the reloaded history).
+    //
+    // SETS, not scalars: per-thread locking means two flushes coexist by design
+    // — one suspended in an upload the user navigated away from, another
+    // draining the thread they just opened. A scalar marker would let whichever
+    // flush finishes first clear the other's, un-refusing a discard whose bytes
+    // or POST are still on the wire. Each flush only ever adds and removes its
+    // own localId, so the two cannot interfere.
+    private postingLocalIds = new Set<string>();
+    // localIds whose upload stage is running. Separate set from the POST's:
+    // both windows must refuse a discard, but for different reasons — an
+    // in-flight POST's fate isn't decided, while dropping a mid-upload item
+    // orphans bytes in the workspace that no endpoint can delete. Only the POST
+    // set gates the horizon re-dispatch, because only a POST can have put a row
+    // in the reloaded history; a mid-upload bubble MUST be re-dispatched or it
+    // disappears.
+    private uploadingLocalIds = new Set<string>();
 
     // --- Pending attachments (queued in composer before send) ---
     readonly pendingAttachments = signal<FilePreview[]>([]);
@@ -2707,12 +2716,12 @@ export class PersistentChatService {
                         q.map((i) => (i.localId === head.localId ? {...i, content} : i)),
                     );
                 }
-                this.flushingHeadId = head.localId;
+                this.postingLocalIds.add(head.localId);
                 let result: { ok: boolean; status: number };
                 try {
                     result = await this._postInput(content);
                 } finally {
-                    this.flushingHeadId = null;
+                    this.postingLocalIds.delete(head.localId);
                 }
                 // The queue's identity may have changed while the POST was in
                 // flight (thread switch, up to the ~30s forward timeout). If so,
@@ -2797,7 +2806,7 @@ export class PersistentChatService {
         // its own status is written. Re-read the live one each turn.
         const fileIds = files.map((f) => f.id);
 
-        this.uploadingItemId = head.localId;
+        this.uploadingLocalIds.add(head.localId);
         try {
             for (const fileId of fileIds) {
                 const f = this._pendingFile(head.localId, fileId);
@@ -2838,14 +2847,21 @@ export class PersistentChatService {
                     // `none`-tier refusal is permanent, and only that one gets
                     // the banner — a retryable failure is already explained by
                     // the queued bubble's retry/discard affordance.
-                    if (classifyUploadFailure(status, msg) === 'terminal') {
+                    //
+                    // Thread-gated: this runs BEFORE the flush's post-stage
+                    // guard, so without it a thread the user has already left
+                    // paints its 413 over the thread they just opened.
+                    if (
+                        this.threadId() === threadId &&
+                        classifyUploadFailure(status, msg) === 'terminal'
+                    ) {
                         this.error.set(msg);
                     }
                     return {ok: false, status};
                 }
             }
         } finally {
-            this.uploadingItemId = null;
+            this.uploadingLocalIds.delete(head.localId);
         }
         return {ok: true, status: 200};
     }
@@ -2925,9 +2941,11 @@ export class PersistentChatService {
     discardQueuedSend(localId: string): void {
         // Refuse while the POST is in flight (its fate isn't decided) or while
         // the upload stage is running (dropping the item would orphan bytes in
-        // the workspace with no way to delete them).
-        if (this.flushingHeadId === localId) return;
-        if (this.uploadingItemId === localId) return;
+        // the workspace with no way to delete them). Membership, not identity:
+        // another thread's flush may be in flight at the same time and must not
+        // be able to answer this question for us.
+        if (this.postingLocalIds.has(localId)) return;
+        if (this.uploadingLocalIds.has(localId)) return;
         if (!this.outbox().some((i) => i.localId === localId)) return;
         this._removeFromOutbox(localId);
         this.dispatch({type: 'remove_turn', id: localId});
@@ -2954,7 +2972,9 @@ export class PersistentChatService {
      */
     private _redispatchOutboxBubbles(skipInFlight = false): void {
         for (const item of this.outbox()) {
-            if (skipInFlight && item.localId === this.flushingHeadId) continue;
+            // POST-only: a mid-upload item has never been POSTed, so it cannot
+            // be in the reloaded history and skipping it would lose its bubble.
+            if (skipInFlight && this.postingLocalIds.has(item.localId)) continue;
             this.dispatch({
                 type: 'user_message',
                 id: item.localId,
