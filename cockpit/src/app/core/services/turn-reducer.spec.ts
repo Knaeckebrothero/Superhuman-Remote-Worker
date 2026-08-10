@@ -8,6 +8,7 @@ import {
     TextEvent,
     ThoughtEvent,
     ToolCallEvent,
+    UserTurn,
 } from '../models/turn.model';
 import {reduce, ReducerAction} from './turn-reducer';
 
@@ -66,6 +67,27 @@ describe('turn-reducer — user_message / system_message', () => {
         expect(state.turns).toEqual([
             {kind: 'system', id: 's1', content: 'Session ended.', timestamp: 200},
         ]);
+    });
+});
+
+describe('user_message attachments before upload', () => {
+    it('keeps distinct ids for attachments that have no server path yet', () => {
+        const state = reduce(EMPTY_CONVERSATION, {
+            type: 'user_message',
+            id: 'user-1',
+            content: 'here',
+            attachments: [
+                {id: 'p1', name: 'a.pdf', size: 1, mimeType: 'application/pdf'},
+                {id: 'p2', name: 'b.pdf', size: 2, mimeType: 'application/pdf'},
+            ],
+            timestamp: 1,
+        });
+
+        const turn = state.turns[state.turns.length - 1];
+        expect(turn.kind).toBe('user');
+        const ids = (turn as UserTurn).attachments?.map((a) => a.id);
+        expect(ids).toEqual(['p1', 'p2']);
+        expect(new Set(ids).size).toBe(2);
     });
 });
 
