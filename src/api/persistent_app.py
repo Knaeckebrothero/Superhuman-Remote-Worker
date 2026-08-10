@@ -1880,7 +1880,18 @@ async def _cleanup_failed_event_journal_attach(thread_id: str) -> None:
             # Attach failure never owns thread lifecycle. In particular, a
             # successor claimant may need the deterministic remote tmux left by
             # the previous owner, so partial-attach cleanup is transport-only.
-            await failed_session.cleanup(preserve_shell=True)
+            await failed_session.cleanup(
+                preserve_shell=True,
+                preserve_workspace_daemons=(
+                    getattr(failed_session, "shell_owner_token", None) is not None
+                    and getattr(
+                        failed_session,
+                        "stateless_warm_reuse_safe",
+                        True,
+                    )
+                    is False
+                ),
+            )
         except Exception as exc:
             logger.warning(
                 "Failed to clean partial session after event-journal error "
@@ -2728,6 +2739,7 @@ async def _terminate_session(
     *,
     mark_thread: bool = True,
     preserve_shell: Optional[bool] = None,
+    preserve_workspace_daemons: bool = False,
 ) -> None:
     """Tear down the current session and return to idle.
 
@@ -2759,6 +2771,9 @@ async def _terminate_session(
          ownership disposition: true for a claim/pod handoff, false for a
          genuine thread end. When omitted it follows ``not mark_thread`` for
          back-compat, but losing an exact pinned binding always forces preserve.
+         ``preserve_workspace_daemons`` is narrower still: only the stateless
+         physical-claim handoff leaves workspace-side rclone/overlay processes
+         resident while retiring their agent-local controllers.
       5. Clear session globals AND headless input primitives + subscribers.
       6. Increment session counter, exit if max reached.
 
@@ -2780,6 +2795,7 @@ async def _terminate_session(
             reason,
             mark_thread=mark_thread,
             preserve_shell=preserve_shell,
+            preserve_workspace_daemons=preserve_workspace_daemons,
         )
     finally:
         _terminating = False
@@ -2790,6 +2806,7 @@ async def _terminate_session_inner(
     *,
     mark_thread: bool = True,
     preserve_shell: Optional[bool] = None,
+    preserve_workspace_daemons: bool = False,
 ) -> None:
     """Body of _terminate_session — only reached holding the _terminating guard."""
     global _session, _thread_id, _sessions_served, _loop_task
@@ -2973,7 +2990,10 @@ async def _terminate_session_inner(
     # the remote shell. From here onward cleanup may mutate mount transports but
     # no new tool/shell command is admitted.
     _session.retire_shell_owner()
-    await _session.cleanup(preserve_shell=preserve_remote_shell)
+    await _session.cleanup(
+        preserve_shell=preserve_remote_shell,
+        preserve_workspace_daemons=preserve_workspace_daemons,
+    )
 
     # Clear session state
     _session = None
