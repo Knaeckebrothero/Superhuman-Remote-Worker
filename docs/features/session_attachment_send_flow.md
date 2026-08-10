@@ -1,6 +1,9 @@
 # Session attachment send flow
 
-Status: **DESIGN — not implemented.** Awaiting rulings on §9.
+Status: **IMPLEMENTED on `develop` (Slices 1–3); live gate RUN and PASSED
+2026-08-10 — see §13.** §9 is ruled: 9.1 → (b) delete endpoint, 9.2 → remove
+`withFetch()` globally (both shipped). Two defects found by the gate remain
+open, both pre-existing and both recorded in §13.4.
 Date: 2026-08-10
 Scope: Cockpit persistent-chat composer, the send outbox, the thread upload
 endpoint, and (optionally) a new delete endpoint for thread uploads.
@@ -672,3 +675,167 @@ misleads — MDN's own example is `aria-valuenow="23" aria-valuetext="23 of 500
 files"`. WCAG 2.1 SC 4.1.3 is the normative hook and warns against being "too
 chatty". There is no Progressbar pattern in the WAI-ARIA APG; the widely-repeated
 "announce every 25%" rule has no normative source.
+
+---
+
+## 13. Live gate results — 2026-08-10
+
+Run against local k3d (`k3d-srw`, namespace `srw`) at `develop` `b9abcbf0`, in
+a real Chromium, on a **production** `npm run build` bundle with the Angular
+service worker proven *controlling the page* (`navigator.serviceWorker
+.controller` → `…/ngsw-worker.js`) before any assertion ran. The k3d cockpit pod
+runs `ng serve` and therefore registers no service worker, so the Task 9 harness
+(`cockpit/e2e/upload-progress/prod-serve.mjs`) served `dist/` and proxied to the
+live backend; the gate extended a scratch copy of it with fault injection at the
+proxy, because a Playwright route intercept answers before the bytes leave the
+page and so cannot produce either "fail while a real body is mid-flight" or
+"the body landed but the response has not".
+
+**Workspace state was verified at the destination, never through the UI.** A
+helper run inside the orchestrator pod loads the thread row, calls the
+production `resolve_thread_upload_destination()`, and then lists what is
+actually there — `RcloneObjectStore.list` for `virtual`, a paramiko SFTP walk
+for `sandbox`. It refuses to report an empty directory when the destination
+cannot be resolved, because "unresolvable" reading as "no files" would have made
+every absence assertion in the gate pass vacuously.
+
+### 13.1 Verdicts
+
+| # | Gate item | Verdict |
+|---|---|---|
+| 1 | ≥50 MB attached: Enter clears text **and** chips together, bubble appears at once with text + chips, queued style | **PASS** |
+| 2 | Generation starts only after the upload lands | **PASS** |
+| 3 | A message typed during a large upload names what it waits on | **PASS** |
+| 4 | Cancel mid-upload: no file, no error banner | **PASS** |
+| 5 | Cancel just after the body is in: no file survives | **PASS** |
+| 6 | Retry after a forced 503 does not duplicate | **PASS** |
+| 7 | Landing-page (draft) attach → send creates the session and uploads | **PASS**, with a defect found alongside it (§13.4a) |
+| 8 | Attachment on an ended thread resumes, then uploads | **PASS** (on `sandbox`, the tier where the bug existed) |
+| 9 | Failed-then-retried connect keeps the chips and deletes nothing | **PASS** |
+| 10 | Pod-tier attach → remove round trip over SFTP | **PASS** — closes the item Task 10 could not run |
+
+### 13.2 Evidence
+
+**1.** 56 MB `reported-bug.pdf`, upload throttled to 4 MiB/s so it was provably
+still in flight. A `requestAnimationFrame` sampler recorded (composer length,
+chip count, queued-bubble count) every frame across the Enter. Text cleared,
+chips cleared and the bubble appeared **in the same frame** — 29.5 ms after the
+keypress in one run, 39.3 ms in another — with the bubble already carrying its
+one attachment chip and zero upload responses received. Computed
+`opacity: 0.65` on `.message-user.queued` confirms the queued treatment. The
+asymmetry in §2 (text at t=0, chips at t=upload-complete) is gone.
+
+**2.** Same run, from the network: upload POST issued at `…959406`, its 200 at
+`…975406` (a 16 s transfer), first `POST …/input` at `…975409` — **3 ms after**
+the upload response, never before it. Both queued messages posted after.
+
+**3.** A second message sent while the first upload was still moving rendered
+`Waiting for reported-bug.pdf…` on its own bubble. Explicitly asserted *not* to
+read `Uploading 0 of …`, and the run asserts the first upload was still in
+flight so the case was genuinely exercised.
+
+**4.** 56 MB attached, ~3 s of real bytes on the wire, then the chip's remove
+button. No `.attachment-error` rendered, and `uploads/` was empty at the
+destination.
+
+**5.** Fault: the proxy forwards the upload, the backend writes the file and
+answers 200, and the proxy **holds** that response. During the hold the gate
+confirmed `uploads/` contained `late-cancel.pdf` — the bytes really were in the
+workspace and uncancellable. The chip was then removed and the response
+released; a real `DELETE …/uploads/late-cancel.pdf` was observed in the browser
+*and* at the proxy, and the directory ended empty, with no error banner.
+
+**6.** A 503 injected once ~35 % of the body was in, twice (the eager upload
+eats the first, the send-stage upload the second). `uploads/` after both
+failures: **empty** — the early failure never reached the backend. The bubble
+stalled with a Retry button; one click and the directory held exactly
+`retry-probe.pdf`, with no `retry-probe_1.pdf`.
+
+**7.** Attached on `/`, typed, Enter: composer text and chips cleared together
+37 ms later, the session was created, the URL became `/sessions/<id>`, the queue
+drained and `uploads/` held exactly `draft-attach.pdf`. The permanent dead end
+in §2 is gone. See §13.4a for what the same run also showed.
+
+**8.** Run on **`sandbox`**, deliberately: on `virtual` the pre-fix upload
+succeeded anyway (durable object storage), so the 409-and-no-resume only ever
+manifested on a pod/VM tier. A sandbox thread was ended (its workspace pod torn
+down), reopened, and a file attached and sent. The session resumed, a new
+workspace pod was provisioned, and `uploads/` on that pod contained exactly
+`ended-thread.pdf` (one upload request, one `/input`).
+
+**9.** The history GET was failed with 503 so the connect left
+`historyLoaded === false`; a file was then staged, the fault cleared, and the
+connect retried **through the router** — sessions list, then back into the
+thread — with a `window` sentinel asserting the SPA never reloaded (an earlier
+attempt used `page.goto`, whose document load dropped the chips for reasons that
+had nothing to do with the guard). The chip survived, no `DELETE` was issued,
+and the file uploaded earlier in that thread was still present.
+
+**10.** `sandbox` thread, real workspace pod `ws-thread-…`, SFTP destination
+confirmed by the lister. Attach → the eager upload landed
+(`uploads/pod-tier.pdf` present over SFTP) → remove the chip → a real DELETE →
+directory empty. Separately, straight against the API: DELETE returns 200 and
+the file disappears, a second DELETE returns 404, and
+`..%2F..%2F.ssh%2Fauthorized_keys` returns 400.
+
+### 13.3 What was *not* exercised
+
+- **Nothing at all touched a VM-tier (`backend: "vm"`) thread.** Item 10 and
+  item 8 both ran on `sandbox`. The SFTP transport is shared, but a VM's
+  `metadata.vm` path, its reachability and its resume timing are unverified
+  here, and `docs/issues/vm_reliability_assessment.md` says VM infra fails 2.2×
+  as often as containers.
+- **No HTTPS / Cloudflare-Tunnel path.** The harness serves the app over
+  plain-HTTP loopback, so the 100 MB edge body cap in §1 finding 2 and the
+  original HTTPS multipart corruption symptom still have a deployed
+  environment as their only arbiter.
+- **No multi-file batch and no `.zip`.** Every item used a single non-archive
+  file. Byte-weighted aggregate progress across files, cross-file `_1`
+  resolution within one send, and the per-request zip-extraction budget in §5.3
+  are untested live.
+- **No reload during an upload**, which §6 already declares a non-goal.
+- **Nothing about the agent's use of the file.** The gate stops at "the bytes
+  are in `uploads/`"; it never asked an agent to read one.
+- **The 409 "no workspace" (`none` tier) terminal branch** of §5.5 was not
+  exercised.
+
+### 13.4 Defects the gate found
+
+**(a) The landing draft still loses the bubble — pre-existing, not from this
+work.** In item 7 the composer cleared correctly but **no queued bubble was
+visible at any frame in the 8 s after Enter** (`bubbleVisibleFrames = 0`), and
+the message only reappears once the session is up. The cause is
+`createAndConnect`, which dispatches `{type: 'reset', threadId: null}`
+synchronously to keep the "Creating thread" card off the previous session's
+turns, and only re-shows queued sends via `_redispatchOutboxBubbles()` after
+`connect()`'s `loadHistory`. `git blame` puts that reset at `b7685d4a7`,
+2026-05-18 — months before this design. So on the landing page the user still
+gets the §1 symptom (no record of what they just sent) for the whole
+session-creation window, which on the dev cluster was **3–5 minutes**. Fixing it
+means re-dispatching the outbox bubbles immediately after the reset instead of
+after the history load.
+
+**(b) A client-observed failure that hides a server-side success duplicates the
+file, and eager upload makes it certain.** Probing beyond the gate's wording: a
+503 *rewritten by the proxy after the backend had already written the file*
+produced `ghost-success.pdf` **and** `ghost-success_1.pdf` before the user
+touched anything — the eager upload wrote the first, the send-stage re-upload
+wrote the second — and one Retry click added `ghost-success_2.pdf`. This is
+exactly the no-idempotency hazard §4.2 predicts, and it is now reachable without
+any user action, because eager upload puts a whole extra attempt in front of
+every send. Any edge that answers after the origin has committed (a Cloudflare
+502/524, a proxy timeout, a dropped response) triggers it. The client-side
+result cache in §5.3 cannot help: it only skips files the client *saw* succeed.
+The durable fix is server-side idempotency — a client-supplied upload key, or
+content-hash dedupe inside `_claim_name`.
+
+### 13.5 Cluster-condition notes (not product findings)
+
+Session provisioning on the local k3d cluster degraded from ~30 s to 3–5 minutes
+as the run accumulated agent pods; three gate runs failed purely on a startup
+budget and were re-run rather than recorded as product failures. The control
+WebSocket (`wss://localhost/p/<id>/ws`) cannot be proxied by this harness and
+errors throughout — it does not block sends, but readiness sometimes only lands
+after a reload, and one early run showed the outbox flush retrying an upload on
+its own where a hand-driven Retry was expected. Both are harness/cluster
+artefacts; neither was treated as evidence.
