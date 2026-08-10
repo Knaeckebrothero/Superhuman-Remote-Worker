@@ -839,3 +839,68 @@ errors throughout — it does not block sends, but readiness sometimes only land
 after a reload, and one early run showed the outbox flush retrying an upload on
 its own where a hand-driven Retry was expected. Both are harness/cluster
 artefacts; neither was treated as evidence.
+
+---
+
+## 14. Open items after the final review — 2026-08-10
+
+The whole-branch review returned two merge-blockers, both fixed in `24a2a0cd`
+and `d74ee577` and re-reviewed clean. What follows is what remains open.
+
+### 14.1 Needs a product ruling
+
+**The original split-state symptom still occurs on the landing page.** Attaching
+on a draft session and pressing Enter leaves no bubble visible for the whole
+session-creation window (measured: 0 visible frames over 8 s; creation takes
+3–5 min). The cause is a different seam from the one this work fixed —
+`createAndConnect` calls a synchronous `reset` that wipes turns and only
+re-dispatches after `loadHistory`. It is **pre-existing**, blame `b7685d4a7`
+(2026-05-18), months before this plan. The reported case was a resumed session,
+which is fixed. Fixing the draft path is separate work.
+
+**Uploads can duplicate with no user action.** A 503 rewritten *after* the
+backend already wrote the file produces a duplicate: the eager upload writes,
+the client sees failure, and the send stage writes again. Measured live —
+`ghost-success.pdf` plus `_1` before any retry, then `_2` on retry. §5.3's
+per-file result cache cannot help, because the client never learns it
+succeeded. **This needs server-side idempotency** (a client-supplied upload key,
+or content-hash dedupe in `_claim_name`). Eager upload made it more likely by
+adding an attempt in front of every send; the new DELETE endpoint makes it
+recoverable rather than permanent.
+
+### 14.2 Tickets
+
+- **Discard after "upload succeeded, POST failed" orphans the bytes** —
+  `persistent-chat.service.ts:3112`. That is precisely when Discard is offered,
+  and `adopt` has already released the registry entry. Delete the resolved
+  attachments on discard.
+- **A never-settling upload wedges the gate.** With `MAX_CONCURRENT_UPLOADS = 2`
+  and no `HttpClient` timeout, two hung requests block uploads page-wide until a
+  thread switch or reload. `HttpRequest.timeout` works on the XHR backend now.
+- **Terminal per-file failures still offer only Retry.** A 413 sets a banner but
+  the bubble's only action can never succeed. `chat.upload.removeAndSend` and
+  `chat.upload.failed` exist, unwired (§5.5).
+- **A→B→A stale flush** — narrowed, not closed. A `connectGeneration` compare is
+  the cure, but it must sit *before* `_postInput`; after it, an accepted
+  resolution would be dropped and the send would double.
+- **`carryOutbox` chips stay pinned to the old thread id**, so `adopt` correctly
+  re-uploads to the new thread but the old registry entry is never released and
+  its bytes orphan.
+- **`_sftp_delete_tree` can 409 mid-walk**, leaving a partial subtree. Matches
+  the writers' posture; the alternative is guessing a file type, which is the
+  failure class this work closed.
+- **Same-thread failed-connect retry still clears the outbox wholesale**
+  (`persistent-chat.service.ts:1016`), so an in-flight flush can POST the text
+  without its attachment hint. The chips half was fixed; this half was not.
+- **The 20-file cap is per call** (`file-handling.service.ts:127`), so two
+  attach actions yield 40 chips.
+- **Dead CSS**: `_chat-queued.scss`'s surviving `font-size`/`color` under
+  `.upload-stage` are overridden by `.upload-stage-line`.
+
+### 14.3 Not exercised
+
+No VM tier. No HTTPS/Cloudflare edge — the e2e gate runs over plain-HTTP
+loopback, so the original multipart-corruption symptom is settled only for
+progress, not for body integrity. No multi-file or zip batch was ever gated
+live; the new concurrency limits are unit-covered only. No `none`-tier 409, and
+no reload-mid-upload.
