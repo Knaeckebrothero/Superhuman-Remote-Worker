@@ -1366,7 +1366,8 @@
       "textCount": "{{count}} Textblöcke",
       "toolCount": "{{count}} Werkzeugaufrufe",
       "foldMore": "+{{count}} weitere",
-      "foldFailed": "⚠ {{count}} fehlgeschlagen"
+      "foldFailed": "⚠ {{count}} fehlgeschlagen",
+      "parked": "Dieser Zug wurde nach wiederholten Executor-Fehlern angehalten und erfordert einen Eingriff durch den Administrator."
     },
     "queued": {
       "notSent": "Nicht gesendet",

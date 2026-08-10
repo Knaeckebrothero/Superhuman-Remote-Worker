@@ -3926,6 +3926,33 @@ class TestHandlePersistentWebsocketReadiness:
             await pa._loop_on_turn_complete(3)
             assert pa._turn_event_open is False
 
+    @pytest.mark.asyncio
+    async def test_stateless_start_hook_finishes_before_turn_started(self):
+        from src.api import persistent_app as pa
+
+        order = []
+        session = SimpleNamespace(turn_count=0, workspace_sync=None)
+
+        async def hook(turn_id):
+            order.append(("hook", turn_id, pa._turn_event_open))
+
+        def broadcast(kind, payload):
+            order.append((kind, payload["turn_id"], pa._turn_event_open))
+
+        with (
+            patch("src.api.persistent_app._session", session),
+            patch("src.api.persistent_app._turn_event_open", False),
+            patch("src.api.persistent_app._turn_start_external_hook", hook),
+            patch("src.api.persistent_app._cloud_sync_retry_pending", False),
+            patch("src.api.persistent_app._broadcast", side_effect=broadcast),
+        ):
+            await pa._loop_on_turn_start(4)
+
+        assert order[:2] == [
+            ("hook", 4, True),
+            ("turn.started", 4, True),
+        ]
+
 
 class TestSessionReadyHelper:
     """_session_ready() is the single source of truth shared by /ready,
@@ -4045,6 +4072,8 @@ class TestHandleApiInterruptHardEvent:
 
         mod._session = None
         mod._tool_inflight = False
+        mod._turn_event_open = False
+        mod._loop_interrupt_flag = None
         mod._hard_interrupt_event = None
 
     @pytest.mark.asyncio
@@ -4076,6 +4105,79 @@ class TestHandleApiInterruptHardEvent:
 
         assert mod._loop_interrupt_flag == "graceful"
         assert mod._hard_interrupt_event.is_set() is False
+
+    @pytest.mark.asyncio
+    async def test_correlated_body_applies_only_to_exact_active_turn(self, monkeypatch):
+        import json
+
+        import src.api.persistent_app as mod
+
+        monkeypatch.delenv("STATELESS_EXECUTOR", raising=False)
+        mod._session = SimpleNamespace(turn_count=7)
+        mod._turn_event_open = True
+        mod._tool_inflight = False
+        mod._hard_interrupt_event = asyncio.Event()
+        request = MagicMock()
+        request.body = AsyncMock(
+            return_value=b'{"client_request_id":"client-1","target_turn_id":7}'
+        )
+
+        response = await mod.handle_api_interrupt(request)
+
+        assert response.status_code == 200
+        assert json.loads(response.body) == {
+            "client_request_id": "client-1",
+            "target_turn_id": 7,
+            "ack": True,
+            "applied": True,
+            "mode": "hard",
+        }
+        assert mod._loop_interrupt_flag == "hard"
+        assert mod._hard_interrupt_event.is_set()
+
+    @pytest.mark.asyncio
+    async def test_correlated_stale_turn_rejects_before_ram_mutation(self, monkeypatch):
+        import json
+
+        import src.api.persistent_app as mod
+
+        monkeypatch.delenv("STATELESS_EXECUTOR", raising=False)
+        mod._session = SimpleNamespace(turn_count=8)
+        mod._turn_event_open = True
+        mod._loop_interrupt_flag = None
+        mod._hard_interrupt_event = asyncio.Event()
+        request = MagicMock()
+        request.body = AsyncMock(
+            return_value=b'{"client_request_id":"client-1","target_turn_id":7}'
+        )
+
+        response = await mod.handle_api_interrupt(request)
+
+        assert response.status_code == 409
+        payload = json.loads(response.body)
+        assert payload["applied"] is False
+        assert payload["error_code"] == "target_turn_not_active"
+        assert payload["target_turn_id"] == 7
+        assert mod._loop_interrupt_flag is None
+        assert not mod._hard_interrupt_event.is_set()
+
+    @pytest.mark.asyncio
+    async def test_correlated_body_requires_positive_integer_target(self, monkeypatch):
+        import json
+
+        import src.api.persistent_app as mod
+
+        monkeypatch.delenv("STATELESS_EXECUTOR", raising=False)
+        mod._session = SimpleNamespace(turn_count=7)
+        request = MagicMock()
+        request.body = AsyncMock(
+            return_value=b'{"client_request_id":"client-1","target_turn_id":true}'
+        )
+
+        response = await mod.handle_api_interrupt(request)
+
+        assert response.status_code == 400
+        assert json.loads(response.body)["error_code"] == "invalid_request"
 
 
 # ---------------------------------------------------------------------------

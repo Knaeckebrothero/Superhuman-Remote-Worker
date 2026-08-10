@@ -136,7 +136,7 @@ APP_COMPUTE_INTERVAL_EPOCH_SHAPE_REPAIR_MIGRATION = (
 # worker-lane partition (0118), session control inbox (0119-0121), and the
 # stateless cloud-generation fence/content baseline (0122-0124), and durable
 # owner-gated client presence (0125), and lane-independent Canvas editor
-# awareness (0126).
+# awareness (0126), and the exact-lease interrupt inbox (0127-0129).
 APP_JOBS_EXECUTION_LANE_MIGRATION = (
     ROOT / "orchestrator/database/migrations/app/0118_jobs_execution_lane.sql"
 )
@@ -166,8 +166,20 @@ APP_THREAD_CLIENT_PRESENCE = (
 APP_CANVAS_EDITOR_AWARENESS = (
     ROOT / "orchestrator/database/migrations/app/0126_canvas_editor_awareness.sql"
 )
+APP_THREAD_INTERRUPT_INBOX = (
+    ROOT / "orchestrator/database/migrations/app/0127_thread_interrupt_inbox.sql"
+)
+APP_THREAD_INTERRUPT_RECEIPT_INDEX = (
+    ROOT
+    / "orchestrator/database/migrations/app/0128_thread_interrupt_receipt_idx.notx.sql"
+)
+APP_THREAD_INTERRUPT_VALIDATION = (
+    ROOT
+    / "orchestrator/database/migrations/app/0129_thread_interrupt_validate_constraints.sql"
+)
 APP_CURRENT_MIGRATION_HEAD = (
-    ROOT / "orchestrator/database/migrations/app/0126_canvas_editor_awareness.sql"
+    ROOT
+    / "orchestrator/database/migrations/app/0129_thread_interrupt_validate_constraints.sql"
 )
 AUDIT_EXPANSION = (
     ROOT
@@ -794,6 +806,37 @@ def test_canvas_editor_awareness_is_monotonic_ttl_courtesy_state() -> None:
     assert "state = 'idle' AND expires_at = refreshed_at" in awareness
     assert "idx_canvas_editor_awareness_expires_at" in awareness
     assert "UX state only, never authorization or execution lease" in awareness
+
+
+def test_interrupt_inbox_is_exact_lease_turn_and_durably_receipted() -> None:
+    inbox = _compact(APP_THREAD_INTERRUPT_INBOX.read_text())
+    index_sql = _compact(APP_THREAD_INTERRUPT_RECEIPT_INDEX.read_text())
+    validation_sql = _compact(APP_THREAD_INTERRUPT_VALIDATION.read_text())
+
+    assert "ADD COLUMN interrupt_admission_lease_token BIGINT" in inbox
+    assert "ADD COLUMN interrupt_admission_turn_id INTEGER" in inbox
+    assert "CONSTRAINT run_queue_interrupt_admission_shape" in inbox
+    assert "interrupt_admission_lease_token = lease_token" in inbox
+    assert "unit_kind = 'session_turn'" in inbox
+    assert "state = 'leased'" in inbox
+    assert "CREATE TABLE thread_interrupt_requests" in inbox
+    assert "UNIQUE (thread_id, client_request_id)" in inbox
+    assert "UNIQUE (id, thread_id)" in inbox
+    assert "UNIQUE (thread_id, accepted_lease_token, target_turn_id)" not in inbox
+    assert "accepted_lease_token BIGINT NOT NULL" in inbox
+    assert "target_turn_id INTEGER NOT NULL" in inbox
+    assert "outcome IN ('applied', 'rejected')" in inbox
+    assert "applied_mode IN ('hard', 'graceful')" in inbox
+    assert "applied_lease_token = accepted_lease_token" in inbox
+    assert "FOREIGN KEY (interrupt_request_id, thread_id)" in inbox
+    assert "REFERENCES thread_interrupt_requests(id, thread_id) NOT VALID" in inbox
+    assert "CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS" in index_sql
+    assert "idx_thread_events_interrupt_request" in index_sql
+    assert "VALIDATE CONSTRAINT run_queue_interrupt_admission_shape" in validation_sql
+    assert (
+        "VALIDATE CONSTRAINT thread_events_interrupt_request_thread_fkey"
+        in validation_sql
+    )
 
 
 def test_compute_foundation_is_immutable_and_lock_fix_is_superseding() -> None:

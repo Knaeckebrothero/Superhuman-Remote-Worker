@@ -390,7 +390,7 @@ async def test_pinned_thread_takes_legacy_forward_with_lock(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_interrupt_on_stateless_lane_returns_501(monkeypatch):
+async def test_uncorrelated_interrupt_on_stateless_lane_returns_422(monkeypatch):
     from fastapi import HTTPException
 
     from orchestrator import main as orch_main
@@ -398,13 +398,16 @@ async def test_interrupt_on_stateless_lane_returns_501(monkeypatch):
     conn = FakeConn()
     db = FakeDB(_stateless_thread(), conn)
     _patch_common(monkeypatch, orch_main, db)
+    monkeypatch.setattr(
+        orch_main,
+        "require_thread_owner",
+        AsyncMock(return_value=(dict(USER), _stateless_thread())),
+    )
 
     with pytest.raises(HTTPException) as exc:
-        await orch_main.thread_interrupt(THREAD_ID, MagicMock())
-    assert exc.value.status_code == 501
-    assert exc.value.detail == (
-        "interrupt is not yet supported on the stateless lane (S1)"
-    )
+        await orch_main.thread_interrupt(THREAD_ID, MagicMock(), None)
+    assert exc.value.status_code == 422
+    assert "target_turn_id" in exc.value.detail
 
 
 @pytest.mark.asyncio
@@ -414,6 +417,11 @@ async def test_interrupt_on_pinned_lane_still_forwards(monkeypatch):
     pinned = _stateless_thread(execution_lane="pinned")
     db = FakeDB(pinned, FakeConn())
     _patch_common(monkeypatch, orch_main, db)
+    monkeypatch.setattr(
+        orch_main,
+        "require_thread_owner",
+        AsyncMock(return_value=(dict(USER), pinned)),
+    )
     agent = {"id": "agent-1", "pod_ip": "10.0.0.9", "pod_port": 8001}
     monkeypatch.setattr(
         orch_main,
@@ -423,6 +431,6 @@ async def test_interrupt_on_pinned_lane_still_forwards(monkeypatch):
     forward_spy = AsyncMock(return_value={"ok": True})
     monkeypatch.setattr(orch_main, "_forward_to_agent", forward_spy)
 
-    out = await orch_main.thread_interrupt(THREAD_ID, MagicMock())
+    out = await orch_main.thread_interrupt(THREAD_ID, MagicMock(), None)
     forward_spy.assert_awaited_once_with(agent, "/api/interrupt", {})
     assert out == {"accepted": True, "agent": {"ok": True}}

@@ -97,7 +97,13 @@ from fastapi.responses import (  # noqa: E402
     StreamingResponse,
 )
 
-from pydantic import BaseModel, Field, field_validator, model_validator  # noqa: E402
+from pydantic import (  # noqa: E402
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_validator,
+)
 
 from database import (  # noqa: E402
     PostgresDB,
@@ -188,6 +194,11 @@ from services.thread_control_inbox import (  # noqa: E402
     ControlAdmissionNotReady,
     admit_thread_control,
     find_existing_thread_control,
+)
+from services.thread_interrupt_inbox import (  # noqa: E402
+    InterruptAdmissionError,
+    admit_thread_interrupt,
+    find_existing_thread_interrupt,
 )
 from src.shared.thread_presence import (  # noqa: E402
     DEFAULT_PRESENCE_RENEW_SECONDS,
@@ -31842,24 +31853,123 @@ async def thread_input(
     }
 
 
-@app.post("/api/persistent/threads/{thread_id}/interrupt")
-async def thread_interrupt(thread_id: str, request: Request) -> dict[str, Any]:
-    """Interrupt the in-flight turn. Mode (hard/graceful) is decided by
-    the agent based on whether a tool is currently mid-`ainvoke`."""
+class ThreadInterruptRequest(BaseModel):
+    """Optional correlated envelope; an empty body is pinned back-compat."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    client_request_id: UUID | None = None
+    target_turn_id: int | None = Field(
+        default=None,
+        ge=1,
+        le=2_147_483_647,
+        strict=True,
+    )
+
+    @model_validator(mode="after")
+    def validate_complete_envelope(self) -> "ThreadInterruptRequest":
+        if (self.client_request_id is None) != (self.target_turn_id is None):
+            raise ValueError(
+                "client_request_id and target_turn_id must be supplied together"
+            )
+        return self
+
+
+@app.post(
+    "/api/persistent/threads/{thread_id}/interrupt",
+    responses={202: {"description": "Stateless interrupt admitted"}},
+)
+async def thread_interrupt(
+    thread_id: str,
+    request: Request,
+    body: ThreadInterruptRequest | None = None,
+) -> Any:
+    """Interrupt one exact in-flight turn without exposing its execution lane.
+
+    Pinned sessions retain their direct agent forward. A correlated client is
+    forwarded intact so the agent can reject a retry aimed at an older turn;
+    the historical empty body remains byte-for-byte ``{}``. Stateless sessions
+    commit an exact-lease request for the serving executor and return admission
+    only — that owner applies the verb and journals the authoritative ack.
+    """
     from src.shared.run_queue import LANE_STATELESS
 
-    user = await require_approved_user(request, postgres_db)
-    lane_thread = await _load_thread_for_owner(thread_id, user)
+    user, lane_thread = await require_thread_owner(request, postgres_db, thread_id)
+    correlated = body is not None and body.client_request_id is not None
+    if correlated and body is not None and body.target_turn_id is not None:
+        try:
+            existing = await find_existing_thread_interrupt(
+                postgres_db,
+                thread_id=thread_id,
+                owner_user_id=lane_thread.get("user_id"),
+                client_request_id=body.client_request_id,
+                target_turn_id=body.target_turn_id,
+            )
+        except InterruptAdmissionError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        if existing is not None:
+            return JSONResponse(
+                status_code=202,
+                content={
+                    "accepted": True,
+                    "request_id": str(existing.id),
+                    "client_request_id": str(existing.client_request_id),
+                    "target_turn_id": existing.target_turn_id,
+                    "state": existing.state,
+                    "duplicate": True,
+                },
+            )
     if lane_thread.get("execution_lane") == LANE_STATELESS:
-        # S1 deferral (implementation log): interrupting a leased turn needs a
-        # control-verb transport to whichever executor holds the lease — the
-        # queue lane has no bound pod to forward to. Deliberate 501, not 503.
-        raise HTTPException(
-            status_code=501,
-            detail="interrupt is not yet supported on the stateless lane (S1)",
+        if not correlated or body is None or body.target_turn_id is None:
+            # Stateless interrupt did not exist for legacy clients. Refuse an
+            # uncorrelated command rather than letting it strike whichever
+            # lease/turn happens to be current.
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "client_request_id and target_turn_id are required for "
+                    "stateless interrupt"
+                ),
+            )
+        try:
+            admitted = await admit_thread_interrupt(
+                postgres_db,
+                thread_id=thread_id,
+                owner_user_id=lane_thread.get("user_id"),
+                client_request_id=body.client_request_id,
+                target_turn_id=body.target_turn_id,
+                requested_by=str(user.get("id") or user.get("sub") or "rest_client"),
+            )
+        except InterruptAdmissionError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+        logger.info(
+            "session-interrupt admission: thread=%s turn=%d token=%d duplicate=%s",
+            thread_id,
+            admitted.target_turn_id,
+            admitted.accepted_lease_token,
+            admitted.duplicate,
         )
+        return JSONResponse(
+            status_code=202,
+            content={
+                "accepted": True,
+                "request_id": str(admitted.id),
+                "client_request_id": str(admitted.client_request_id),
+                "target_turn_id": admitted.target_turn_id,
+                "state": admitted.state,
+                "duplicate": admitted.duplicate,
+            },
+        )
+
     _, agent = await _resolve_thread_for_forwarding(thread_id, user)
-    result = await _forward_to_agent(agent, "/api/interrupt", {})
+    payload: dict[str, Any] = {}
+    if correlated and body is not None and body.target_turn_id is not None:
+        payload = {
+            "client_request_id": str(body.client_request_id),
+            "target_turn_id": body.target_turn_id,
+        }
+    result = await _forward_to_agent(agent, "/api/interrupt", payload)
     return {"accepted": True, "agent": result}
 
 
@@ -32114,7 +32224,8 @@ async def thread_events_prune_sweeper(
       - DELETE rows for threads in 'ended' status older than 24h.
       - DELETE rows for threads NOT in 'ended' older than 7 days.
       - Preserve any event that is still the only durable receipt for a
-        pending session-control request; crash recovery terminalizes it first.
+        pending session-control or exact-turn interrupt request; crash
+        recovery terminalizes it first.
 
     Best-effort. Survives transient DB errors by logging and continuing.
     """
@@ -32135,6 +32246,14 @@ async def thread_events_prune_sweeper(
                     "    WHERE request.id = thread_events.control_request_id "
                     "      AND request.outcome IS NULL"
                     "  ) "
+                    "  AND NOT EXISTS ("
+                    "    SELECT 1 FROM thread_interrupt_requests request "
+                    "    WHERE request.id = thread_events.interrupt_request_id "
+                    "      AND (request.outcome IS NULL "
+                    "           OR (request.outcome = 'applied' "
+                    "               AND NOT (COALESCE(request.result, '{}'::jsonb) "
+                    "                        ? 'consumed_input_seq')))"
+                    "  ) "
                     "  RETURNING 1"
                     ") SELECT COUNT(*) FROM deleted"
                 )
@@ -32149,6 +32268,14 @@ async def thread_events_prune_sweeper(
                     "    SELECT 1 FROM thread_control_requests request "
                     "    WHERE request.id = thread_events.control_request_id "
                     "      AND request.outcome IS NULL"
+                    "  ) "
+                    "  AND NOT EXISTS ("
+                    "    SELECT 1 FROM thread_interrupt_requests request "
+                    "    WHERE request.id = thread_events.interrupt_request_id "
+                    "      AND (request.outcome IS NULL "
+                    "           OR (request.outcome = 'applied' "
+                    "               AND NOT (COALESCE(request.result, '{}'::jsonb) "
+                    "                        ? 'consumed_input_seq')))"
                     "  ) "
                     "  RETURNING 1"
                     ") SELECT COUNT(*) FROM deleted"

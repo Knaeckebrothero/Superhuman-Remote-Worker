@@ -104,6 +104,8 @@ const SSE_WATCHDOG_TIMEOUT_MS = 45000;
 // early-return. If nothing clears it within this window, force an SSE reopen
 // (replay-from-cursor) which re-delivers the durable turn boundary.
 const INTERRUPT_ACK_TIMEOUT_MS = 8000;
+const INTERRUPT_RESPONSE_TIMEOUT_MS = 15_000;
+const INTERRUPT_RETRY_DELAYS_MS = [250, 1000, 2000, 4000];
 
 // A rewind's direct-to-socket ack can legitimately take a while: the backend
 // waits up to 60s server-side for an in-flight turn to interrupt before it
@@ -221,6 +223,13 @@ interface DurableControlMarker {
 
 interface DurableControlError extends DurableControlMarker {
     message: string;
+}
+
+interface PendingInterruptRequest {
+    threadId: string;
+    clientRequestId: string;
+    targetTurnId: number;
+    attempts: number;
 }
 
 /** Human-readable labels for the closed session tool groups (transcript stamps). */
@@ -481,9 +490,15 @@ export class PersistentChatService {
         // lost interrupt.ack/turn.completed frame from wedging the button: any
         // path that drops the active turn also drops "Stopping…".
         effect(() => {
-            if (!this.isStreaming() && untracked(() => this.isInterrupting())) {
-                this.isInterrupting.set(false);
-                this._clearInterruptFallback();
+            if (
+                !this.isStreaming() &&
+                untracked(
+                    () =>
+                        this.isInterrupting() ||
+                        this.pendingInterruptRequest !== null,
+                )
+            ) {
+                this._clearPendingInterruptRequest();
             }
         });
 
@@ -854,6 +869,13 @@ export class PersistentChatService {
     // an interrupt POST (lost ack frame). Armed in interrupt(), cleared by the
     // isInterrupting invariant effect.
     private interruptFallbackTimer: ReturnType<typeof setTimeout> | null = null;
+    /** Exact turn-scoped interrupt admission. Ambiguous HTTP outcomes retry
+     * with this same UUID + target; a late acknowledgement can therefore
+     * never be applied to whichever turn happens to be active later. */
+    private pendingInterruptRequest: PendingInterruptRequest | null = null;
+    private interruptAdmissionInFlight: PendingInterruptRequest | null = null;
+    private interruptAdmissionSubscription: Subscription | null = null;
+    private interruptRetryTimer: ReturnType<typeof setTimeout> | null = null;
     // One-shot fallback: force-clear rewindInFlight if rewind.ack (direct to
     // the initiator's socket only) never arrives. Armed in rewind(), cleared
     // by rewind.ack / rewind.files_restored / a request_id-matching error,
@@ -2772,6 +2794,10 @@ export class PersistentChatService {
         // (onclose → _scheduleControlWsReconnect) never routes through
         // disconnect(), so an ordinary drop-and-reconnect still delivers.
         this.controlOutbox = [];
+        // Interrupt retries carry an exact thread + turn target. Never let a
+        // pending browser timer cross navigation even though a request that
+        // already committed remains safely durable on its original thread.
+        this._clearPendingInterruptRequest();
         // REST setting controls are moment-scoped too. Cancel the browser
         // request/timer and drop the queue on navigation; a request that had
         // already committed remains safe because its URL and durable UUID are
@@ -3500,25 +3526,153 @@ export class PersistentChatService {
     async interrupt(): Promise<void> {
         if (this.isInterrupting()) return;
         const tid = this.threadId();
-        if (!tid) return;
+        const targetTurnId = this.currentTurnId();
+        if (!tid || targetTurnId === null || targetTurnId < 1) return;
+
+        const pending: PendingInterruptRequest = {
+            threadId: tid,
+            clientRequestId: crypto.randomUUID(),
+            targetTurnId,
+            attempts: 0,
+        };
+        // Install correlation before starting HTTP. The exact lease owner can
+        // commit interrupt.ack over SSE before the admission response reaches
+        // this tab, especially when this POST is an idempotent retry.
+        this.pendingInterruptRequest = pending;
         this.isInterrupting.set(true);
-        try {
-            await firstValueFrom(
-                this.http.post(`${environment.apiUrl}/persistent/threads/${tid}/interrupt`, {})
-            );
-        } catch (err: any) {
-            // Interrupt failures are rare and the SSE will surface the next
-            // turn boundary regardless — log and reset the flag.
-            this.isInterrupting.set(false);
-            this._clearInterruptFallback();
-            console.warn('[persistent-chat] interrupt failed:', err);
+        this._postPendingInterrupt(pending);
+    }
+
+    private _postPendingInterrupt(pending: PendingInterruptRequest): void {
+        if (
+            this.pendingInterruptRequest !== pending ||
+            this.intentionalClose ||
+            this.threadId() !== pending.threadId ||
+            this.currentTurnId() !== pending.targetTurnId
+        ) {
+            this._clearPendingInterruptRequest(pending);
             return;
         }
-        // On success the agent emits `interrupt.ack` / `turn.completed` over
-        // SSE and the handlers reset isInterrupting. Arm a fallback in case
-        // that frame never arrives (stalled stream): force a reconnect so the
-        // durable turn boundary replays from cursor and clears "Stopping…".
+
+        this.interruptAdmissionInFlight = pending;
+        pending.attempts += 1;
+        let settledSynchronously = false;
+        let response$: Observable<unknown>;
+        try {
+            response$ = this.http.post(
+                `${environment.apiUrl}/persistent/threads/${pending.threadId}/interrupt`,
+                {
+                    client_request_id: pending.clientRequestId,
+                    target_turn_id: pending.targetTurnId,
+                },
+            ).pipe(
+                timeout({first: INTERRUPT_RESPONSE_TIMEOUT_MS}),
+            );
+        } catch (err) {
+            settledSynchronously = true;
+            this._handleInterruptAdmissionFailure(pending, err);
+            return;
+        }
+
+        const subscription = response$.subscribe({
+            next: () => {
+                settledSynchronously = true;
+                this._finishInterruptAdmission(pending);
+            },
+            error: (err: unknown) => {
+                settledSynchronously = true;
+                this._handleInterruptAdmissionFailure(pending, err);
+            },
+            complete: () => {
+                settledSynchronously = true;
+                this._finishInterruptAdmission(pending);
+            },
+        });
+        if (
+            !settledSynchronously &&
+            this.interruptAdmissionInFlight === pending
+        ) {
+            this.interruptAdmissionSubscription = subscription;
+        } else {
+            subscription.unsubscribe();
+        }
+    }
+
+    private _finishInterruptAdmission(pending: PendingInterruptRequest): void {
+        if (this.interruptAdmissionInFlight !== pending) return;
+        this.interruptAdmissionSubscription?.unsubscribe();
+        this.interruptAdmissionSubscription = null;
+        this.interruptAdmissionInFlight = null;
+        if (this.pendingInterruptRequest !== pending) return;
+        // HTTP success is admission only. The owner-written interrupt.ack or
+        // exact turn.completed remains the client-visible authority.
         this._armInterruptFallback();
+    }
+
+    private _handleInterruptAdmissionFailure(
+        pending: PendingInterruptRequest,
+        err: unknown,
+    ): void {
+        if (this.interruptAdmissionInFlight !== pending) return;
+        this.interruptAdmissionSubscription?.unsubscribe();
+        this.interruptAdmissionSubscription = null;
+        this.interruptAdmissionInFlight = null;
+
+        if (
+            this._isRetryableInterruptFailure(err) &&
+            this.pendingInterruptRequest === pending &&
+            !this.intentionalClose &&
+            this.threadId() === pending.threadId &&
+            this.currentTurnId() === pending.targetTurnId
+        ) {
+            const delay =
+                INTERRUPT_RETRY_DELAYS_MS[
+                    Math.min(
+                        pending.attempts - 1,
+                        INTERRUPT_RETRY_DELAYS_MS.length - 1,
+                    )
+                ];
+            console.warn(
+                '[persistent-chat] interrupt admission outcome unknown; ' +
+                    'retrying the same request id and target turn',
+            );
+            this.interruptRetryTimer = setTimeout(() => {
+                this.interruptRetryTimer = null;
+                this._postPendingInterrupt(pending);
+            }, delay);
+            return;
+        }
+
+        console.warn('[persistent-chat] interrupt failed:', err);
+        this._clearPendingInterruptRequest(pending);
+    }
+
+    private _isRetryableInterruptFailure(err: unknown): boolean {
+        const status = (err as {status?: unknown})?.status;
+        if (typeof status !== 'number') return true;
+        return (
+            status === 0 ||
+            status === 408 ||
+            status === 425 ||
+            status === 429 ||
+            status >= 500
+        );
+    }
+
+    private _clearPendingInterruptRequest(
+        expected?: PendingInterruptRequest,
+    ): void {
+        if (expected && this.pendingInterruptRequest !== expected) return;
+        if (this.interruptRetryTimer) {
+            clearTimeout(this.interruptRetryTimer);
+            this.interruptRetryTimer = null;
+        }
+        this.interruptAdmissionSubscription?.unsubscribe();
+        this.interruptAdmissionSubscription = null;
+        this.interruptAdmissionInFlight = null;
+        this.pendingInterruptRequest = null;
+        this.isInterrupting.set(false);
+        this._clearInterruptFallback();
     }
 
     /** Arm the one-shot stuck-"Stopping…" fallback (see interrupt()). */
@@ -3848,6 +4002,11 @@ export class PersistentChatService {
                 // accept (other tab, injected input, reload mid-queue).
                 this.pendingTurnCount.update((c) => Math.max(0, c - 1));
                 const turnId = String(params['turn_id'] ?? makeLocalId('turn'));
+                const pendingInterrupt = this.pendingInterruptRequest;
+                const pendingWasActive =
+                    pendingInterrupt !== null &&
+                    this.conversation().activeAssistantTurnId ===
+                        String(pendingInterrupt.targetTurnId);
                 const reportedTurn = Number(params['turn_id']);
                 // Replay may start behind the REST snapshot's event_cursor.
                 // Numeric turn ids are authoritative, so max() advances a live
@@ -3863,6 +4022,17 @@ export class PersistentChatService {
                     startedAt: now,
                     model: (params['model'] as string) || undefined,
                 });
+                // A new numeric turn superseding the exact locally-targeted
+                // one is also a terminal boundary when its completion frame
+                // was lost. Retire only that old request; replay of an older
+                // turn.started must not cancel a newer pending interrupt.
+                if (
+                    pendingInterrupt &&
+                    pendingWasActive &&
+                    turnId !== String(pendingInterrupt.targetTurnId)
+                ) {
+                    this._clearPendingInterruptRequest(pendingInterrupt);
+                }
                 break;
             }
 
@@ -4033,14 +4203,80 @@ export class PersistentChatService {
                 break;
             }
 
+            case 'turn.interrupted':
+            case 'turn.parked': {
+                const rawTarget = Number(
+                    params['target_turn_id'] ?? params['turn_id'],
+                );
+                const hasExactTarget =
+                    Number.isSafeInteger(rawTarget) && rawTarget > 0;
+                // Reaper frames without a target predate the correlated
+                // interrupt inbox. They are still an ordered terminal edge in
+                // the current journal epoch, so the active turn is the only
+                // safe fallback. New frames carry target_turn_id and therefore
+                // cannot close a newer turn after replay or cross-tab delay.
+                const targetId = hasExactTarget
+                    ? String(rawTarget)
+                    : !coveredBySnapshot
+                      ? this.conversation().activeAssistantTurnId
+                      : null;
+                if (!targetId) break;
+
+                const closedActive = this._interruptTurnIfSafe(
+                    targetId,
+                    now,
+                    coveredBySnapshot,
+                );
+                if (closedActive) {
+                    this.runningTool.set(null);
+                    this.pendingTurnCount.set(0);
+                    this.isWaitingForInput.set(false);
+                    this.compaction.set(null);
+                }
+
+                const pending = this.pendingInterruptRequest;
+                if (
+                    pending &&
+                    targetId === String(pending.targetTurnId)
+                ) {
+                    this._clearPendingInterruptRequest(pending);
+                }
+
+                const targetWasHandled = this.conversation().turns.some(
+                    (turn) =>
+                        isAssistantTurn(turn) &&
+                        turn.id === targetId &&
+                        turn.status === 'interrupted',
+                );
+                if (data.method === 'turn.parked' && targetWasHandled) {
+                    this.dispatch({
+                        type: 'system_message',
+                        id: `turn-parked-${targetId}`,
+                        content: this.transloco.translate('chat.turn.parked'),
+                        timestamp: now,
+                    });
+                }
+
+                break;
+            }
+
             case 'turn.completed': {
                 const turnId = String(params['turn_id'] ?? this.conversation().activeAssistantTurnId ?? '');
+                const wasActive =
+                    !!turnId &&
+                    this.conversation().activeAssistantTurnId === turnId;
                 if (turnId) {
                     this.dispatch({type: 'turn_completed', turnId, finishedAt: now});
                 }
                 if (!coveredBySnapshot) {
-                    this.isInterrupting.set(false);
-                    this.runningTool.set(null);
+                    const pending = this.pendingInterruptRequest;
+                    if (
+                        pending &&
+                        turnId === String(pending.targetTurnId)
+                    ) {
+                        this._clearPendingInterruptRequest(pending);
+                    }
+                    if (wasActive) this.runningTool.set(null);
                 }
                 // A compaction never outlives its turn — clear a stale block
                 // (e.g. the pod died mid-fold and the turn was closed).
@@ -4083,12 +4319,62 @@ export class PersistentChatService {
                 break;
             }
 
-            case 'interrupt.ack':
-                this._closeActiveTurnIfAny('turn_interrupted');
-                this.isInterrupting.set(false);
-                this.runningTool.set(null);
-                this.pendingTurnCount.set(0);
+            case 'interrupt.ack': {
+                const pending = this.pendingInterruptRequest;
+                const rawTarget = Number(params['target_turn_id']);
+                const hasExactTarget =
+                    Number.isSafeInteger(rawTarget) && rawTarget > 0;
+                // Legacy direct-WS acknowledgements carried no correlation.
+                // They are safe only while this tab still has an exact local
+                // request for the turn that remains active. Otherwise an old
+                // frame must not close a newer assistant turn.
+                const targetTurnId = hasExactTarget
+                    ? rawTarget
+                    : pending &&
+                        this.conversation().activeAssistantTurnId ===
+                            String(pending.targetTurnId)
+                      ? pending.targetTurnId
+                      : null;
+                if (targetTurnId === null) break;
+                if (params['applied'] === false) {
+                    // The exact owner can durably reject a request that lost
+                    // the turn/gate race. This is an acknowledgement of the
+                    // request, not an interruption of the assistant turn. A
+                    // rejection from another tab for the same turn says
+                    // nothing about this tab's independently admitted UUID.
+                    if (
+                        pending &&
+                        targetTurnId === pending.targetTurnId &&
+                        params['client_request_id'] ===
+                            pending.clientRequestId
+                    ) {
+                        this._clearPendingInterruptRequest(pending);
+                    }
+                    break;
+                }
+
+                const targetId = String(targetTurnId);
+                const closedActive = this._interruptTurnIfSafe(
+                    targetId,
+                    now,
+                    coveredBySnapshot,
+                );
+                if (closedActive) {
+                    this.runningTool.set(null);
+                    this.pendingTurnCount.set(0);
+                }
+                // Any exact acknowledgement for this same turn makes a local
+                // duplicate request moot (another tab may have interrupted it
+                // first). Correlation still prevents an old turn's ack from
+                // clearing a request aimed at the new turn.
+                if (
+                    pending &&
+                    targetTurnId === pending.targetTurnId
+                ) {
+                    this._clearPendingInterruptRequest(pending);
+                }
                 break;
+            }
 
             case 'mode.changed':
                 this._clearDurableControlErrorAfter(
@@ -4563,6 +4849,49 @@ export class PersistentChatService {
         const activeId = this.conversation().activeAssistantTurnId;
         if (!activeId) return;
         this.dispatch({type: kind, turnId: activeId, finishedAt: Date.now()});
+    }
+
+    /** Apply an exact interrupt boundary without letting an old replay promote
+     *  and close a newer recovered placeholder turn. Returns true only when
+     *  the active turn was closed (including a safe live placeholder
+     *  promotion); historical exact matches may still be updated. */
+    private _interruptTurnIfSafe(
+        targetId: string,
+        finishedAt: number,
+        coveredBySnapshot: boolean,
+    ): boolean {
+        const state = this.conversation();
+        const activeId = state.activeAssistantTurnId;
+        const directMatch = state.turns.some(
+            (turn) => isAssistantTurn(turn) && turn.id === targetId,
+        );
+        const activeTurn = activeId
+            ? state.turns.find(
+                  (turn): turn is AssistantTurn =>
+                      isAssistantTurn(turn) && turn.id === activeId,
+              )
+            : null;
+        const numericTarget = Number(targetId);
+        const targetIsCurrent =
+            Number.isSafeInteger(numericTarget) &&
+            numericTarget > 0 &&
+            (numericTarget === this.turnCount() ||
+                numericTarget === this.pendingInterruptRequest?.targetTurnId);
+        const promoteRecovered =
+            !coveredBySnapshot &&
+            !directMatch &&
+            activeTurn?.recovered === true &&
+            targetIsCurrent;
+
+        if (!directMatch && activeId !== targetId && !promoteRecovered) {
+            return false;
+        }
+        this.dispatch({
+            type: 'turn_interrupted',
+            turnId: targetId,
+            finishedAt,
+        });
+        return activeId === targetId || promoteRecovered;
     }
 
     /** Apply a reducer action to the conversation state. Streamed deltas
