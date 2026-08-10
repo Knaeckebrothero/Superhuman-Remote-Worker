@@ -2640,3 +2640,131 @@ pinned split are covered by route tests and real Postgres. Outbox re-homing,
 hard interrupt, gate release, permission-row retirement on lease expiry,
 workspace-incarnation authority and the deferred §6.1 RAM/path bypasses remain
 open. Gate 3 and migrations 0130+ were not touched.
+
+# Session 8 — lane-free Canvas editor awareness (2026-08-10)
+
+## Phase 5 durable Canvas awareness — DONE; tier gate remains closed
+
+Migration **0126** replaces the Canvas editor-awareness dependency on the
+per-session control WebSocket with one owner-authenticated transport for both
+lanes. The Cockpit never receives or branches on `execution_lane`. Each browser
+editor writes to
+`PUT /api/persistent/threads/{thread_id}/canvases/main/awareness/{editing_session_id}`
+and every Canvas pane, including the authenticated popout, reads the dedicated
+`GET .../awareness/stream` SSE endpoint with its normal BFF cookie.
+
+The table has one row per `(thread_id, canvas_id, editing_session_id)`, a stable
+server-minted sender id, a client-monotonic sequence, an `editing` lease or
+`idle` tombstone, and database-clock timestamps. Editing heartbeats are
+accepted only against the exact current workspace-file path, presentation
+revision and source version. A later idle mutation may retire that editor's
+exact stored identity after the Canvas itself advances. Lower sequences return
+the current row without mutation; an identical same-sequence retry is
+idempotent and, importantly, does **not** extend its expiry; same-sequence
+payload reuse conflicts; a higher sequence applies. A thread-scoped advisory
+transaction lock serializes cleanup, first insert and the exact **256-row**
+cap across concurrent tabs. Expired leases and tombstones are pruned after a
+bounded **300-second** retention, with a separate limited `SKIP LOCKED` cleanup
+path.
+
+The server TTL is **15 seconds** and the client renews every **5 seconds**. The
+SSE endpoint sends named `canvas_awareness` events containing complete
+snapshots, including an initial or changed empty set. It deliberately sends no
+`id:` line, does not touch `thread_events`, and never allocates a session-journal
+sequence; reconnect simply reads current Postgres state. It re-runs
+`require_thread_owner` every **10 seconds** and closes on authorization loss.
+Idle transport keepalives are comments, separate from snapshots. Cleanup
+failure is isolated from the live snapshot path. Pinned and stateless clients
+now use these same REST/SSE semantics; the old agent-local awareness path is no
+longer the Cockpit transport.
+
+The Cockpit controller owns one single-flight mutation queue, persists its
+monotonic identity/sequence across reload, replaces remote editor state
+atomically from each complete snapshot, filters its own exact identity and
+expires a snapshot locally if the SSE is interrupted. A fresh Canvas popout
+can inherit its opener's `sessionStorage`; it now rotates that copied identity
+once before awareness sync, records a popout marker, and reuses the rotated
+identity on reload. This closes the ordinary popout collision without making
+the editor identity a credential.
+
+### Failure retained: Tilt applied an intermediate migration image
+
+Tilt applied the first complete 0126 bytes while the implementation was still
+being verified. A later, optional attempt to add a JavaScript-safe upper bound
+to the already-applied database constraint changed the migration checksum, so
+the next orchestrator pod correctly refused startup with `checksum changed`.
+The previous pod stayed Ready. The migration was restored byte-for-byte to the
+applied checksum
+`f555070c47f67ca00386ab96edd6e5fa5f9d22e4cfc0e25772e2ebb8f82b414d`;
+the JavaScript-safe bound remains enforced in the API and service instead. The
+schema snapshot was regenerated, Tilt rebuilt naturally, and the Deployment
+recovered to **1/1 updated and Ready**. The local file, running image and
+`schema_migrations` ledger all report the same checksum; no ledger or data
+repair was performed.
+
+### Verification
+
+* The final exact 0126 service/migration contract passed **7 real-Postgres
+  tests** with **101 deselected**: no-TTL-extension idempotency, idle/reordered
+  renewal fencing, exact Canvas identity, concurrent cap serialization,
+  pinned/stateless parity with zero journal rows, bounded cleanup and Canvas
+  cascade.
+* The full scratch-Postgres queue/migration substrate through 0126 passed
+  **108/108**. The broader affected Python group passed **66/66**. The final
+  route/SSE suite passed **8/8** and the focused migration assertions passed
+  **2/2**. An independent focused server run reported **40 passed / 7
+  environment skips**.
+* The final focused Cockpit awareness/controller group passed **39/39**. Full
+  Cockpit Vitest passed **1,815 tests in 119 files**, and the production build
+  passed with only the pre-existing budget/CommonJS warnings.
+* Repository-wide Ruff check and Ruff format check passed for **1,057 files**.
+  `scripts/schema-snapshot.sh --check app` replayed **111 transactional
+  migrations** and reported the generated schema current. `git diff --check`
+  is clean.
+* The comparable repository-wide run under the declared global environment
+  finished with **15,412 passed / 134 skipped / 11 failed in 786.29 s**. The
+  eleven failures are exactly the established localhost-Postgres, MCP
+  transport and optional arXiv/Semantic Scholar environment baseline. A first
+  run under the repository's Python 3.13 `.venv` reported 24 failures: the same
+  environment set plus the already documented 15 missing-`asyncssh` Canvas
+  transport failures and one real stale endpoint-inventory assertion. The
+  inventory was regenerated with both awareness routes classified
+  `require_thread_owner`; its focused assertion then passed.
+* The k3d orchestrator exposed the exact PUT and GET paths in its running
+  OpenAPI document, contained the new service code and matching 0126 bytes,
+  and its database contained the successful ledger row and awareness table.
+  The running Cockpit pod also contained the current source.
+* Two independent Playwright browser contexts authenticated through the real
+  Keycloak/BFF flow; both received HttpOnly `srw_session` cookies. On a
+  stateless DB-only fixture, A's PUT became visible to B through the named SSE
+  in **1040 ms**, B's PUT became visible to A in **649 ms**, and a hard reload
+  renewed the same editor identity at sequence 2 while preserving the server
+  sender id. The server emitted the complete empty snapshot after TTL in
+  **14.897 s**. A pinned fixture used the same API with no lane field and
+  delivered A's editor to B in **916 ms**. The harness removed **3 awareness
+  rows, 2 Canvas rows, 2 threads and 2 BFF sessions**; final harness residue and
+  queue units were zero. This proves the authenticated browser REST/SSE
+  transport, not the complete Monaco/controller rendering path.
+
+### Accepted courtesy-state limits and remaining boundary
+
+An ordinary browser **Duplicate Tab** operation can clone `sessionStorage`
+without the explicit popout marker. Those tabs may therefore collapse onto one
+courtesy row while both remain active and fail to show each other; this affects
+awareness UX only, never authorization or lease ownership, and the row
+disappears after renewals stop plus the 15-second TTL. Browser unload cannot be
+relied on to finish an asynchronous PUT, so unload is not a correctness edge:
+blur/inactivation sends an idle tombstone when possible and a hard close is
+retired by TTL. The authenticated two-context REST/SSE path, hard reload and
+pinned/stateless parity were exercised live; the full rendered Monaco/editor
+UX and native EventSource recovery through a real authentication expiry were
+not. Popout behavior and the local TTL fallback remain covered by tests.
+
+This slice re-homes **ephemeral editor awareness only**. Durable Canvas source
+and presentation mutation invalidations still share the legacy control-socket
+seam and require their own durable mutation/outbox path. Generic session
+outboxes and hard interrupt also remain open, along with
+workspace/runtime-incarnation authority, terminal-retirement acknowledgement
+and the deferred §6.1 RAM/path-bypass work. No completion-path/Gate-3 behavior,
+worker admission or worker queue unit was touched. The S2 sandbox tier gate
+therefore remains **closed**.

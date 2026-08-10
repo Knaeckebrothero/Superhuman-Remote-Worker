@@ -417,6 +417,7 @@ describe('Canvas pane trusted chrome', () => {
         null,
         false,
         false,
+        false,
       );
 
       state.set(null);
