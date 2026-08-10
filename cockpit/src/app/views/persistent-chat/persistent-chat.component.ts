@@ -1237,8 +1237,8 @@ export function clearDraft(threadId: string | null): void {
                   }
                   @if (turn.attachments?.length) {
                     <div class="user-attachments">
-                      @for (att of turn.attachments; track att.path) {
-                        <span class="user-attachment-chip" [title]="att.path">
+                      @for (att of turn.attachments; track att.id) {
+                        <span class="user-attachment-chip" [title]="att.path ?? att.name">
                           <app-icon size="sm">{{
                             att.mimeType.startsWith('image/') ? 'image' :
                             att.mimeType.startsWith('video/') ? 'videocam' :
