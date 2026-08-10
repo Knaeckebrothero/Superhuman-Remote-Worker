@@ -1,6 +1,6 @@
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest';
 import {TestBed} from '@angular/core/testing';
-import {provideHttpClient} from '@angular/common/http';
+import {HttpErrorResponse, provideHttpClient} from '@angular/common/http';
 import {
   HttpTestingController,
   provideHttpClientTesting,
@@ -10,6 +10,7 @@ import {firstValueFrom} from 'rxjs';
 import {ApiService, SESSION_TOOL_GROUPS_TIMEOUT_MS} from './api.service';
 import {AppToastService} from '../../ui/toast';
 import {ErrorMessageService} from './error-message.service';
+import type {ThreadUploadedFile} from '../models/file.model';
 
 describe('ApiService.transcribeVoice', () => {
   let api: ApiService;
@@ -511,5 +512,78 @@ describe('ApiService.getSessionToolGroups', () => {
     await expect(pending).resolves.toBeNull();
     expect(req.cancelled).toBe(true);
     httpMock.verify();
+  });
+});
+
+describe('uploadOneToThread', () => {
+  let api: ApiService;
+  let httpMock: HttpTestingController;
+
+  beforeEach(() => {
+    TestBed.resetTestingModule();
+    TestBed.configureTestingModule({
+      providers: [
+        ApiService,
+        provideHttpClient(),
+        provideHttpClientTesting(),
+        {provide: AppToastService, useValue: {}},
+        {provide: TranslocoService, useValue: {translate: (k: string) => k}},
+        {provide: ErrorMessageService, useValue: {}},
+      ],
+    });
+    api = TestBed.inject(ApiService);
+    httpMock = TestBed.inject(HttpTestingController);
+  });
+
+  afterEach(() => httpMock.verify());
+
+  it('posts a single file as multipart and returns its server entries', () => {
+    const file = new File(['abc'], 'report.pdf', {type: 'application/pdf'});
+    let got: ThreadUploadedFile[] | undefined;
+
+    api.uploadOneToThread('t1', file).subscribe((files) => (got = files));
+
+    const req = httpMock.expectOne((r) => r.url.endsWith('/persistent/threads/t1/uploads'));
+    expect(req.request.method).toBe('POST');
+    const body = req.request.body as FormData;
+    expect(body.getAll('files').length).toBe(1);
+
+    req.flush({
+      thread_id: 't1',
+      files: [{name: 'report.pdf', size: 3, mime_type: 'application/pdf', path: 'uploads/report.pdf'}],
+    });
+
+    expect(got).toEqual([
+      {name: 'report.pdf', size: 3, mime_type: 'application/pdf', path: 'uploads/report.pdf'},
+    ]);
+  });
+
+  it('returns every extracted member when the file is an archive', () => {
+    const zip = new File(['x'], 'bundle.zip', {type: 'application/zip'});
+    let got: ThreadUploadedFile[] | undefined;
+
+    api.uploadOneToThread('t1', zip).subscribe((files) => (got = files));
+
+    httpMock.expectOne((r) => r.url.endsWith('/persistent/threads/t1/uploads')).flush({
+      thread_id: 't1',
+      files: [
+        {name: 'bundle/a.txt', size: 1, mime_type: 'text/plain', path: 'uploads/bundle/a.txt'},
+        {name: 'bundle/b.txt', size: 1, mime_type: 'text/plain', path: 'uploads/bundle/b.txt'},
+      ],
+    });
+
+    expect(got?.length).toBe(2);
+  });
+
+  it('rethrows the HttpErrorResponse so the caller can read status and detail', () => {
+    let err: unknown;
+    api.uploadOneToThread('t1', new File([''], 'a.pdf')).subscribe({error: (e) => (err = e)});
+
+    httpMock
+      .expectOne((r) => r.url.endsWith('/persistent/threads/t1/uploads'))
+      .flush({detail: "File 'a.pdf' exceeds 100MB"}, {status: 413, statusText: 'Payload Too Large'});
+
+    expect((err as HttpErrorResponse).status).toBe(413);
+    expect(api.humanizeUploadError(err)).toBe("File 'a.pdf' exceeds 100MB");
   });
 });
