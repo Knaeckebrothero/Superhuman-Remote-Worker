@@ -32591,7 +32591,10 @@ async def delete_thread_upload(
     prefix is shared with Canvas state and tool files.
 
     Returns:
-        ``{"thread_id": "...", "path": "uploads/<path>", "deleted": true}``.
+        ``{"thread_id": "...", "path": "uploads/<path>", "deleted": true}``,
+        where ``<path>`` is the **normalized** path that was actually removed
+        — ``bundle/sub/../a.txt`` in, ``uploads/bundle/a.txt`` out. Echoing
+        the raw input would report a file that was never touched.
         400 for a path that escapes ``uploads/``, 404 when there is no such
         upload, and the usual destination taxonomy (409 no/unready workspace,
         502 unreachable, 503 misconfigured or at capacity) otherwise.
@@ -32604,7 +32607,7 @@ async def delete_thread_upload(
     user, thread = await require_thread_owner(request, postgres_db, thread_id)
 
     try:
-        deleted = await delete_file_from_thread_workspace(thread, path)
+        removed = await delete_file_from_thread_workspace(thread, path)
     except ThreadUploadError as e:
         logger.warning(
             "Thread upload delete refused for %s (%r): %d %s",
@@ -32615,10 +32618,10 @@ async def delete_thread_upload(
         )
         raise HTTPException(status_code=e.status_code, detail=e.detail) from e
 
-    if not deleted:
+    if removed is None:
         raise HTTPException(status_code=404, detail="Upload not found")
 
-    return {"thread_id": thread_id, "path": f"uploads/{path}", "deleted": True}
+    return {"thread_id": thread_id, "path": f"uploads/{removed}", "deleted": True}
 
 
 # Map a TTS synthesis failure code → HTTP status. Deliberately NEVER 401/403
