@@ -2768,3 +2768,203 @@ workspace/runtime-incarnation authority, terminal-retirement acknowledgement
 and the deferred §6.1 RAM/path-bypass work. No completion-path/Gate-3 behavior,
 worker admission or worker queue unit was touched. The S2 sandbox tier gate
 therefore remains **closed**.
+
+# Session 9 — exact-lease hard interrupt and the §3.5 stop line (2026-08-10)
+
+## Phase 6 hard interrupt — DONE; tier gate remains closed
+
+Migrations **0127–0129** and the lane-free Cockpit/API/runtime path implement a
+durable hard interrupt for stateless sessions without reusing the scalar
+control inbox. The public owner-gated endpoint remains
+`POST /api/persistent/threads/{thread_id}/interrupt`. A current client sends a
+stable `client_request_id` UUID and the exact positive `target_turn_id` it is
+displaying. The client never receives or branches on `execution_lane`.
+
+For stateless execution, admission locks `threads` and then `run_queue`, checks
+the current exact lease token, and requires that owner to have opened
+`interrupt_admission_lease_token` plus `interrupt_admission_turn_id` for the
+same turn. The inbox captures the immutable accepted token/turn and does not
+wake an idle queue unit or update an input/control watermark. Exact UUID retries
+remain observable after the gate closes; reusing the UUID for another turn is a
+conflict. The executor starts and initially drains the interrupt consumer before
+opening admission. Its terminal sequence is close admission, stop and
+shield-join the watcher, then perform one final committed-tail drain before any
+queue transition. The old one-second cancel path was removed after a forced
+race showed it could orphan the durable receipt writer and double-apply a
+request.
+
+Pinned behavior stays on the existing direct-agent route. A legacy missing or
+empty body is still forwarded as `{}`. A current correlated body is forwarded
+unchanged and the pinned agent validates the exact active turn before setting
+its in-process interrupt state. This preserves old clients while preventing an
+ambiguous retry from stopping a newer pinned turn.
+
+### Durable intent, receipts and crash recovery
+
+The request row itself is durable stop intent. A live exact owner sets the RAM
+interrupt synchronously, then writes one linked `interrupt.ack` through its
+existing journal allocator and terminalizes the request. The receipt carries
+the request id, client UUID, target turn, applied/rejected outcome and mode.
+Applied sibling requests for the same target share one
+`result.consumed_input_seq`, so two tabs cannot consume two human messages.
+Settlement selects the exact live human message by `turn_number`, resets
+`attempts_since_completion`, and never infers the target as merely the next row
+above the watermark.
+
+Owner-loss ordering was deliberately changed from the initial rejected-request
+design. If the owner dies after admission but before its receipt is durable,
+the system writer records an applied hard `owner_lost` acknowledgement and
+settles that exact input without signalling successor RAM. Otherwise the turn
+could have observed the stop or performed partial side effects and then be
+silently re-executed. Existing linked receipts remain authoritative. Recovery
+handles both pending rows and old `outcome='applied'` rows missing the consumed
+marker, stamps already-consumed historical rows without advancing a later
+message, and processes every sibling before changing a parked queue state.
+
+The reaper captures the pre-steal admission turn in the same locking statement
+as the lease-token advance. Post-steal journal repair takes the explicit
+`threads -> run_queue -> request` lock order, validates the exact post-steal
+token, rotates the dead event epoch once, and emits one singular
+`turn.interrupted` or `turn.parked` frame per exact target with both
+`target_turn_id` and the snapshot-compatible `turn_id` alias. A claimant which
+wins first makes the old reaper writer stop. Periodic system-writer repair is
+parked-only; queued rows are reconciled by the live claimant so an attached warm
+allocator cannot collide with an out-of-process journal writer.
+
+Fresh-attach pending humans exposed an off-by-one trap: restored `turn_count`
+already included the unanswered human row, while the graph increments before
+opening the interrupt window. After stripping those restored pending messages,
+the executor now rewinds `turn_count` to `target.turn_number - 1` before
+injection. Stale interrupt reconciliation also moved ahead of pending-row
+selection and returns the refreshed consumed watermark, so an owner-loss stop
+cannot settle a row and then run the already-selected copy anyway.
+
+The Cockpit treats HTTP 202 as admission, not completion; it retries ambiguous
+transport results only with the exact same UUID/turn pair. Receipt and lifecycle
+frames are target-correlated, including replay after a snapshot, and an old
+covered receipt cannot promote or close a newer recovered placeholder.
+`turn.completed` preserves an already-interrupted terminal status. Parked state
+uses one stable, replay-idempotent localized operator message rather than
+creating duplicates on reconnect.
+
+The three migration files were applied during development and are frozen at:
+
+* 0127:
+  `ae59b0f15eac8542b7a0af6a62886a92c710b1715aaa281a7e64b3dbd59ab857`;
+* 0128:
+  `f30e60be4bf5be4a38be9950c5ca9601180807a85e67b4bbfd132b8deede8eab`;
+* 0129:
+  `a3de400493cde031e37c695c377d0c3fc64289f5bebbb360930ec3e5ecc6cd1b`.
+
+The non-behavioral 0127 comments say that a successor never applies a request.
+The final protocol is narrower and safer: a successor never signals or
+retargets the request, but may settle the already-admitted exact stop intent
+after owner loss. The applied migration and generated snapshot retain the old
+comment because changing those bytes would violate the migration ledger; this
+log is the status-of-record correction.
+
+### Verification and live fallback
+
+* The frozen integration group passed **502 tests with 116 environment
+  skips**; the runtime consumer/executor owner group passed **65/65**. An
+  independent adversarial review passed **419 tests with the same 116 skips**
+  and returned GO after the lock, recovery, pruning, reaper and client replay
+  audit.
+* Full Cockpit Vitest passed **1,829/1,829 across 119 files**. The production
+  build passed with the established bundle-budget, SCSS and CommonJS warnings.
+  The focused service group passed **295 tests**; English/German translation
+  parity remained **2,455 keys**.
+* The app schema check replayed **113 transactional plus 16
+  non-transactional migrations** and produced the current 13,001-line
+  snapshot. The running database ledger contained the three exact checksums,
+  both new constraints were validated and the receipt index was valid.
+* Repository-wide Ruff check and Ruff format check passed for **1,062 files**;
+  `git diff --check` passed.
+* Repository-wide pytest finished with **15,481 passed / 142 skipped / 11
+  failed in 801.06 s**. The failures are exactly the established baseline: one
+  localhost-Postgres connection test, seven MCP transport/wiring tests and
+  three optional arXiv/Semantic Scholar client tests.
+* Running deployment checks found the orchestrator **1/1 Ready**, stateless
+  agents **2/2 Ready** and Cockpit **1/1 Ready**, with **0 leased queue rows, 0
+  open interrupt gates, 0 interrupt rows and 0 worker-batch rows**. All checked
+  source hashes matched except stateless `persistent_app.py`; a full file diff
+  showed that its only difference was Ruff line wrapping, with the final
+  recovery markers and behavior present. No manual Tilt trigger was used.
+
+The live bounded proof used a disposable virtual/stateless fixture and a real
+Keycloak/BFF-cookie login. A correlated public POST for turn 7 returned **202
+pending in 12.81 ms**. In the writer-exclusion fixture, the deployed production
+system-frame helper plus exact-lease finalizer wrote one linked
+`interrupt.ack` at epoch/sequence **0/1**, applied hard mode and consumed the
+exact input in **51.82 ms**. The exact UUID retry returned **202 applied,
+duplicate=true in 7.55 ms**. A new UUID targeting old turn 7 and the original
+UUID retargeted to turn 8 both returned **409**, while the turn-8 gate remained
+open. Cleanup left zero fixture thread, queue, message, event, interrupt, BFF,
+pre-auth and generated Keycloak-session rows. This proves the authenticated API,
+database exact-target, receipt and replay fences. It does **not** prove a live
+main-process RAM signal/unwind, LISTEN watcher latency or a forced-pod interrupt
+handoff. No live pinned executor existed and one was not provisioned merely for
+this proof; pinned interrupt behavior remains integration-tested rather than
+live-smoked.
+
+## Generic §3.5 outbox — STOPPED at the explicit Gate 3 boundary
+
+The outbox design's required invariant is “turn committed if and only if its
+follow-up effect was enqueued.” The authoritative final message transaction is
+`PostgresDB.save_thread_messages`, reached from `_save_turn_ai_messages` after
+`turn.completed` has already been queued. Today that reconciliation catches its
+own failures, and its caller proceeds after a five-second timeout; the executor
+may then advance `consumed_seq` through `complete_unit`. Adding an outbox INSERT
+inside the database method alone would therefore still allow a completed queue
+unit with neither the final message batch nor the effect row. Making failure
+block/release/reconcile completion is a normal completion-protocol change.
+
+No generic carrier is available in the migration range. `run_queue` has the
+`bg_task` class and dedup key but no effect payload, and the claimed-unit shape
+does not carry that dedup key. `session_wake_events` has payload but is an
+officer-only wake outbox whose claimant consumes every supported source; its
+enqueue also opens its own connection and is not atomic with final persistence.
+Migrations 0122–0129 are consumed and migrations 0130+ belong to Gate 3. Per
+the brief's stop rule, no completion path was modified, no wake table was
+repurposed and no live-epoch independent journal writer was introduced.
+
+Ranked remaining effects from the audit:
+
+1. **Blocked on the generic outbox/completion boundary:** the exact main
+   `llm_requests` archive (untracked task with an unreconstructable prepared
+   request), turn-end memory capture (bare tasks not covered by the existing
+   drain), and post-callback Git commit/push plus turn-to-SHA ordering.
+2. **Independently re-homeable in later authorized slices:** durable Canvas
+   revision snapshots over a dedicated state stream, a pending-citation
+   sweeper with an exact thread-bound verdict callback, and orchestrator-derived
+   notifications from already-durable journal/permission state. These were not
+   started after the generic stop condition triggered.
+3. **Deferred:** title generation is already awaited but blocks release, and
+   protected-cloud staging still crosses two process-local task registries.
+4. **Already closed for this problem class:** cloud generation push is awaited
+   before queue transition; presence, Canvas courtesy awareness and hard
+   interrupt are durable; ordinary same-owner journal trailing flushes are
+   intentionally token-fenced rather than an outbox.
+
+## §6.1 inventory and remaining S2 boundary
+
+The §6.1 audit remains unchanged and deliberately unimplemented in this pass.
+It contains **18 filesystem/external-state rows** and **10 RAM/path-bypass
+rows**. The decisive result is still that the logical workspace is
+backend-owned: the agent-local `/workspace` root is disposable, both inspected
+stateless pods had it empty, and an agent PVC would not repair the actual gaps.
+The 18 filesystem rows separate disposable cache/temp/worker-only paths from
+already-externalized logical directories, user output, uploads, skills,
+datasources, repositories, cloud mirrors/mount state, memory/KB artifacts,
+Canvas bytes and session logs. The 10 real follow-ups are session-task state,
+file undo, the memory-extraction cursor, conservative read/instruction stamps,
+cloud citation anchors, disposable sync/dedup caches, other process caches and
+the WebDAV, research-paper and citation-snapshot backend-path bypasses.
+
+Those fixes remain a separate authorized pass as requested. Durable Canvas
+source/presentation invalidations, the generic outbox, workspace/runtime-
+incarnation authority and terminal-retirement acknowledgement also remain open.
+The live interrupt proof did not exercise a real executor unwind or forced pod
+handoff, and no live pinned interrupt smoke was available. No worker admission,
+worker queue unit, job-completion path, migration 0130+ or sandbox lane was
+touched. The S2 sandbox tier gate remains **closed**.

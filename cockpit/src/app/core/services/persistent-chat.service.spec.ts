@@ -2476,13 +2476,35 @@ describe('PersistentChatService — REST sends', () => {
 
     it('interrupt POSTs to /interrupt', async () => {
         const ctx = await readySession();
+        fireSseMessage(
+            ctx.sseInstances[0],
+            {method: 'turn.started', params: {turn_id: 3}},
+            '1:2',
+        );
         await ctx.service.interrupt();
         const calls = ctx.mockHttp.post.mock.calls;
         const intCall = calls.find((c: any) =>
             String(c[0]).endsWith('/persistent/threads/thread-r/interrupt'),
         );
         expect(intCall).toBeDefined();
+        expect(intCall![1]).toMatchObject({target_turn_id: 3});
+        expect(intCall![1].client_request_id).toMatch(
+            /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
+        );
         expect(ctx.service.isInterrupting()).toBe(true);
+    });
+
+    it('does not create an uncorrelated interrupt without a numeric active turn', async () => {
+        const ctx = await readySession();
+
+        await ctx.service.interrupt();
+
+        expect(
+            ctx.mockHttp.post.mock.calls.some((c: any) =>
+                String(c[0]).endsWith('/persistent/threads/thread-r/interrupt'),
+            ),
+        ).toBe(false);
+        expect(ctx.service.isInterrupting()).toBe(false);
     });
 });
 
@@ -4472,6 +4494,121 @@ describe('PersistentChatService — interrupt self-healing', () => {
         expect(reconnectSpy).not.toHaveBeenCalled();
     });
 
+    it('closes the exact turn on a reaper turn.interrupted frame', async () => {
+        const {service, es, mockHttp} = await setupStreaming();
+        fireSseMessage(
+            es,
+            {
+                method: 'tool.started',
+                params: {id: 'tool-1', tool: 'shell', args: {}},
+            },
+            '1:2',
+        );
+        mockHttp.post.mockClear();
+        await service.interrupt();
+
+        fireSseMessage(
+            es,
+            {
+                method: 'turn.interrupted',
+                params: {target_turn_id: 1, reason: 'lease_expired'},
+            },
+            '2:1',
+        );
+
+        expect(service.isStreaming()).toBe(false);
+        expect(service.currentTurnId()).toBeNull();
+        expect(service.runningTool()).toBeNull();
+        expect(service.isInterrupting()).toBe(false);
+        expect(service.pendingTurnCount()).toBe(0);
+        expect(service.turns().find((turn) => turn.id === '1')).toMatchObject({
+            status: 'interrupted',
+        });
+    });
+
+    it('renders turn.parked as a terminal edge without a successor turn', async () => {
+        const {service, es} = await setupStreaming();
+
+        const frame = {
+            method: 'turn.parked',
+            params: {target_turn_id: 1, reason: 'lease_expired'},
+        };
+        fireSseMessage(es, frame, '2:1');
+        fireSseMessage(es, frame, '2:2');
+
+        expect(service.isStreaming()).toBe(false);
+        expect(service.currentTurnId()).toBeNull();
+        expect(service.pendingTurnCount()).toBe(0);
+        expect(service.turns().find((turn) => turn.id === '1')).toMatchObject({
+            status: 'interrupted',
+        });
+        expect(
+            service
+                .turns()
+                .filter(
+                    (turn) =>
+                        isSystemTurn(turn) && turn.id === 'turn-parked-1',
+                ),
+        ).toHaveLength(1);
+    });
+
+    it('does not let an old reaper terminal frame close a newer turn', async () => {
+        const {service, es} = await setupStreaming();
+        fireSseMessage(
+            es,
+            {method: 'turn.completed', params: {turn_id: 1}},
+            '1:2',
+        );
+        fireSseMessage(
+            es,
+            {method: 'turn.started', params: {turn_id: 2}},
+            '2:1',
+        );
+
+        fireSseMessage(
+            es,
+            {
+                method: 'turn.interrupted',
+                params: {target_turn_id: 1, reason: 'lease_expired'},
+            },
+            '2:2',
+        );
+
+        expect(service.currentTurnId()).toBe(2);
+        expect(service.isStreaming()).toBe(true);
+    });
+
+    it.each(['interrupt.ack', 'turn.interrupted'])(
+        'does not let a covered old %s promote and close a recovered placeholder',
+        async (method) => {
+            const {service} = createService();
+            (service as any)._handleEvent({
+                method: 'token',
+                params: {content: 'new recovered response'},
+            });
+            (service as any)._flushDeltas();
+            const recoveredId = service.conversation().activeAssistantTurnId;
+            expect(recoveredId).toMatch(/^recovered:/);
+
+            (service as any)._handleEvent(
+                {
+                    method,
+                    params: {
+                        target_turn_id: 1,
+                        client_request_id: crypto.randomUUID(),
+                        applied: true,
+                        mode: 'hard',
+                    },
+                },
+                true,
+                true,
+            );
+
+            expect(service.conversation().activeAssistantTurnId).toBe(recoveredId);
+            expect(service.isStreaming()).toBe(true);
+        },
+    );
+
     it('clears a stuck isInterrupting when the connection drops (invariant)', async () => {
         const {service} = await setupStreaming();
 
@@ -4487,6 +4624,237 @@ describe('PersistentChatService — interrupt self-healing', () => {
 
         expect(service.isStreaming()).toBe(false);
         expect(service.isInterrupting()).toBe(false);
+    });
+
+    it('retries an ambiguous admission with the same UUID and target turn', async () => {
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+        const {service, mockHttp} = await setupStreaming();
+        mockHttp.post.mockClear();
+        mockHttp.post
+            .mockReturnValueOnce(throwError(() => ({status: 0})))
+            .mockReturnValueOnce(of({accepted: true, duplicate: true}));
+
+        await service.interrupt();
+        const firstBody = mockHttp.post.mock.calls[0][1];
+        await vi.advanceTimersByTimeAsync(250);
+
+        expect(mockHttp.post).toHaveBeenCalledTimes(2);
+        expect(mockHttp.post.mock.calls[1][1]).toEqual(firstBody);
+        expect(firstBody.target_turn_id).toBe(1);
+        expect(service.isInterrupting()).toBe(true);
+        warn.mockRestore();
+    });
+
+    it('accepts a correlated ack that beats the HTTP admission response', async () => {
+        const {service, es, mockHttp} = await setupStreaming();
+        const response = new Subject<Record<string, unknown>>();
+        mockHttp.post.mockClear();
+        mockHttp.post.mockReturnValue(response.asObservable());
+
+        await service.interrupt();
+        const requestId = mockHttp.post.mock.calls[0][1].client_request_id;
+        fireSseMessage(
+            es,
+            {
+                method: 'interrupt.ack',
+                params: {
+                    client_request_id: requestId,
+                    target_turn_id: 1,
+                    mode: 'hard',
+                },
+            },
+            '1:2',
+        );
+
+        expect(service.isStreaming()).toBe(false);
+        expect(service.isInterrupting()).toBe(false);
+        expect((service as any).pendingInterruptRequest).toBeNull();
+
+        // A late HTTP result cannot resurrect the request or fallback timer.
+        response.next({accepted: true});
+        response.complete();
+        await vi.advanceTimersByTimeAsync(8_001);
+        expect(service.isInterrupting()).toBe(false);
+    });
+
+    it('keeps an acknowledged stop visibly interrupted after turn.completed', async () => {
+        const {service, es, mockHttp} = await setupStreaming();
+        mockHttp.post.mockClear();
+        await service.interrupt();
+        const requestId = mockHttp.post.mock.calls[0][1].client_request_id;
+
+        fireSseMessage(
+            es,
+            {
+                method: 'interrupt.ack',
+                params: {
+                    client_request_id: requestId,
+                    target_turn_id: 1,
+                    applied: true,
+                    mode: 'hard',
+                },
+            },
+            '1:2',
+        );
+        fireSseMessage(
+            es,
+            {method: 'turn.completed', params: {turn_id: 1}},
+            '1:3',
+        );
+
+        expect(service.turns().find((turn) => turn.id === '1')).toMatchObject({
+            status: 'interrupted',
+        });
+    });
+
+    it('does not let an old ack close or settle a newer turn interrupt', async () => {
+        const {service, es, mockHttp} = await setupStreaming();
+        mockHttp.post.mockClear();
+
+        await service.interrupt();
+        const oldRequestId = mockHttp.post.mock.calls[0][1].client_request_id;
+        fireSseMessage(
+            es,
+            {method: 'turn.completed', params: {turn_id: 1}},
+            '1:2',
+        );
+        fireSseMessage(
+            es,
+            {method: 'turn.started', params: {turn_id: 2}},
+            '1:3',
+        );
+        await service.interrupt();
+        const newRequestId = mockHttp.post.mock.calls[1][1].client_request_id;
+        expect(newRequestId).not.toBe(oldRequestId);
+        expect(service.currentTurnId()).toBe(2);
+        expect(service.isInterrupting()).toBe(true);
+
+        fireSseMessage(
+            es,
+            {
+                method: 'interrupt.ack',
+                params: {
+                    client_request_id: oldRequestId,
+                    target_turn_id: 1,
+                    mode: 'hard',
+                },
+            },
+            '1:4',
+        );
+
+        expect(service.currentTurnId()).toBe(2);
+        expect(service.isStreaming()).toBe(true);
+        expect(service.isInterrupting()).toBe(true);
+        expect((service as any).pendingInterruptRequest.clientRequestId).toBe(
+            newRequestId,
+        );
+
+        fireSseMessage(
+            es,
+            {
+                method: 'interrupt.ack',
+                params: {
+                    client_request_id: newRequestId,
+                    target_turn_id: 2,
+                    mode: 'hard',
+                },
+            },
+            '1:5',
+        );
+        expect(service.isStreaming()).toBe(false);
+        expect(service.isInterrupting()).toBe(false);
+    });
+
+    it('does not let an old turn.completed clear a newer interrupt', async () => {
+        const {service, es, mockHttp} = await setupStreaming();
+        fireSseMessage(
+            es,
+            {method: 'turn.completed', params: {turn_id: 1}},
+            '1:2',
+        );
+        fireSseMessage(
+            es,
+            {method: 'turn.started', params: {turn_id: 2}},
+            '1:3',
+        );
+        mockHttp.post.mockClear();
+        await service.interrupt();
+        const requestId = mockHttp.post.mock.calls[0][1].client_request_id;
+
+        fireSseMessage(
+            es,
+            {method: 'turn.completed', params: {turn_id: 1}},
+            '1:4',
+        );
+
+        expect(service.currentTurnId()).toBe(2);
+        expect(service.isStreaming()).toBe(true);
+        expect(service.isInterrupting()).toBe(true);
+        expect((service as any).pendingInterruptRequest.clientRequestId).toBe(
+            requestId,
+        );
+    });
+
+    it('ignores an uncorrelated legacy ack when no local target is pending', async () => {
+        const {service, es} = await setupStreaming();
+
+        fireSseMessage(es, {method: 'interrupt.ack', params: {mode: 'hard'}}, '1:2');
+
+        expect(service.currentTurnId()).toBe(1);
+        expect(service.isStreaming()).toBe(true);
+    });
+
+    it('settles a rejected exact ack without closing the target turn', async () => {
+        const {service, es, mockHttp} = await setupStreaming();
+        mockHttp.post.mockClear();
+        await service.interrupt();
+        const requestId = mockHttp.post.mock.calls[0][1].client_request_id;
+
+        fireSseMessage(
+            es,
+            {
+                method: 'interrupt.ack',
+                params: {
+                    client_request_id: requestId,
+                    target_turn_id: 1,
+                    applied: false,
+                    error_code: 'target_turn_not_active',
+                },
+            },
+            '1:2',
+        );
+
+        expect(service.currentTurnId()).toBe(1);
+        expect(service.isStreaming()).toBe(true);
+        expect(service.isInterrupting()).toBe(false);
+    });
+
+    it('does not let another tab\'s rejection settle this tab\'s request', async () => {
+        const {service, es, mockHttp} = await setupStreaming();
+        mockHttp.post.mockClear();
+        await service.interrupt();
+        const requestId = mockHttp.post.mock.calls[0][1].client_request_id;
+
+        fireSseMessage(
+            es,
+            {
+                method: 'interrupt.ack',
+                params: {
+                    client_request_id: crypto.randomUUID(),
+                    target_turn_id: 1,
+                    applied: false,
+                    error_code: 'target_turn_not_active',
+                },
+            },
+            '1:2',
+        );
+
+        expect(service.currentTurnId()).toBe(1);
+        expect(service.isStreaming()).toBe(true);
+        expect(service.isInterrupting()).toBe(true);
+        expect((service as any).pendingInterruptRequest.clientRequestId).toBe(
+            requestId,
+        );
     });
 });
 

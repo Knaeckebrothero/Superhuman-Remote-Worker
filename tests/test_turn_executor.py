@@ -17,7 +17,7 @@ import os
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 from uuid import uuid4
 
 import pytest
@@ -71,7 +71,11 @@ class FakeDB:
 
     async def fetch(self, sql: str, *args):
         self.fetch_calls.append((sql, args))
-        return list(self.pending_rows)
+        next_turn = int(getattr(pa._session, "turn_count", 0) or 0) + 1
+        return [
+            {**row, "turn_number": row.get("turn_number", next_turn)}
+            for row in self.pending_rows
+        ]
 
 
 class FakeSession:
@@ -86,6 +90,7 @@ class FakeSession:
         self._shell_owner_tokens = shell_owner_tokens
         self.shell_owner_tokens: List[int] = []
         self.stateless_warm_reuse_safe = stateless_warm_reuse_safe
+        self.turn_count = 0
 
     def set_shell_owner_token(self, token: int) -> None:
         self.shell_owner_tokens.append(token)
@@ -107,11 +112,20 @@ class Harness:
             "terminate": [],
             "control_start": [],
             "control_stop": [],
+            "interrupt_start": [],
+            "interrupt_open": [],
+            "interrupt_close": [],
+            "interrupt_stop": [],
+            "interrupt_drain": [],
+            "interrupt_stale": [],
             "shell_owner_token": [],
         }
         self.consumed: List[Dict[str, Any]] = []
+        self.interrupt_order: List[str] = []
         self.db = FakeDB(pending_rows)
         self.loop_behavior = "complete"  # complete | hang | die
+        self.stale_result = (0, None)
+        self.restored_turn_count = 0
         self.heartbeat_result: Any = datetime.now(timezone.utc)
         self.bundle_error: Optional[Exception] = None
         self.attach_error: Optional[Exception] = None
@@ -124,7 +138,12 @@ class Harness:
         pa._thread_id = None
         pa._loop_user_queue = None
         pa._loop_task = None
+        pa._turn_start_external_hook = None
         pa._turn_complete_external_hook = None
+        pa._interrupt_watcher_task = None
+        pa._interrupt_watcher_stop = None
+        pa._interrupt_owner_lease_token = None
+        pa._interrupt_owner_turn_id = None
         pa._tool_inflight = False
         pa._loop_interrupt_flag = None
         pa._hard_interrupt_event = asyncio.Event()
@@ -165,6 +184,31 @@ class Harness:
         monkeypatch.setattr(te, "release_unit", fake_release)
         monkeypatch.setattr(te, "heartbeat_unit", fake_heartbeat)
 
+        async def fake_open_interrupt(db, *, unit_id, lease_token, turn_id):
+            harness.interrupt_order.append("open")
+            harness.calls["interrupt_open"].append(
+                {
+                    "unit_id": unit_id,
+                    "lease_token": lease_token,
+                    "turn_id": turn_id,
+                }
+            )
+            return True
+
+        async def fake_close_interrupt(db, *, unit_id, lease_token, turn_id):
+            harness.interrupt_order.append("close")
+            harness.calls["interrupt_close"].append(
+                {
+                    "unit_id": unit_id,
+                    "lease_token": lease_token,
+                    "turn_id": turn_id,
+                }
+            )
+            return True
+
+        monkeypatch.setattr(te, "open_interrupt_admission", fake_open_interrupt)
+        monkeypatch.setattr(te, "close_interrupt_admission", fake_close_interrupt)
+
         # --- fake orchestrator client -------------------------------------
         class FakeClient:
             async def get_claim_bundle(self, unit_id, lease_token):
@@ -194,6 +238,7 @@ class Harness:
                 harness.calls["shell_owner_token"],
                 stateless_warm_reuse_safe=harness.stateless_warm_reuse_safe,
             )
+            pa._session.turn_count = harness.restored_turn_count
             harness.sessions.append(pa._session)
             pa._thread_id = kwargs.get("thread_id")
             pa._loop_user_queue = asyncio.Queue()
@@ -240,6 +285,33 @@ class Harness:
         async def fake_stop_control_watcher():
             harness.calls["control_stop"].append({})
 
+        async def fake_start_interrupt_watcher(*, lease_token, target_turn_id):
+            harness.interrupt_order.append("start")
+            harness.calls["interrupt_start"].append(
+                {"lease_token": lease_token, "target_turn_id": target_turn_id}
+            )
+            pa._interrupt_owner_lease_token = lease_token
+            pa._interrupt_owner_turn_id = target_turn_id
+            return 0
+
+        async def fake_stop_interrupt_watcher():
+            harness.interrupt_order.append("stop")
+            harness.calls["interrupt_stop"].append({})
+            pa._interrupt_owner_lease_token = None
+            pa._interrupt_owner_turn_id = None
+
+        async def fake_drain_interrupts(*, lease_token, target_turn_id):
+            harness.interrupt_order.append("drain")
+            harness.calls["interrupt_drain"].append(
+                {"lease_token": lease_token, "target_turn_id": target_turn_id}
+            )
+            return 0
+
+        async def fake_reconcile_stale_interrupts(*, lease_token):
+            harness.interrupt_order.append("stale")
+            harness.calls["interrupt_stale"].append({"lease_token": lease_token})
+            return harness.stale_result
+
         monkeypatch.setattr(pa, "_attach_session", fake_attach)
         monkeypatch.setattr(pa, "_terminate_session", fake_terminate)
         monkeypatch.setattr(pa, "_ensure_persistent_loop_started", fake_ensure)
@@ -248,6 +320,18 @@ class Harness:
         )
         monkeypatch.setattr(
             pa, "_stop_thread_control_watcher", fake_stop_control_watcher
+        )
+        monkeypatch.setattr(
+            pa, "_start_thread_interrupt_watcher", fake_start_interrupt_watcher
+        )
+        monkeypatch.setattr(
+            pa, "_stop_thread_interrupt_watcher", fake_stop_interrupt_watcher
+        )
+        monkeypatch.setattr(pa, "_drain_thread_interrupts", fake_drain_interrupts)
+        monkeypatch.setattr(
+            pa,
+            "_reconcile_stale_thread_interrupts",
+            fake_reconcile_stale_interrupts,
         )
 
         self.executor = te.StatelessTurnExecutor(
@@ -274,6 +358,11 @@ class Harness:
         while True:
             item = await pa._loop_user_queue.get()
             self.consumed.append(item)
+            turn_id = int(pa._session.turn_count) + 1
+            pa._session.turn_count = turn_id
+            start_hook = pa._turn_start_external_hook
+            if start_hook is not None:
+                await start_hook(turn_id)
             if self.loop_behavior == "hang":
                 await asyncio.sleep(3600)
             elif self.loop_behavior == "die":
@@ -281,7 +370,7 @@ class Harness:
             else:
                 hook = pa._turn_complete_external_hook
                 if hook is not None:
-                    hook(1)
+                    hook(turn_id)
 
     async def cleanup(self):
         for task in self._fake_loop_tasks:
@@ -298,7 +387,12 @@ _PA_SAVED_ATTRS = (
     "_thread_id",
     "_loop_user_queue",
     "_loop_task",
+    "_turn_start_external_hook",
     "_turn_complete_external_hook",
+    "_interrupt_watcher_task",
+    "_interrupt_watcher_stop",
+    "_interrupt_owner_lease_token",
+    "_interrupt_owner_turn_id",
     "_agent",
     "_orchestrator_client",
     "_tool_inflight",
@@ -359,6 +453,122 @@ class TestHappyPath:
         assert harness.executor._lease.unit_id == str(unit)
         assert harness.executor._lease.lease_token == 7
         assert harness.calls["shell_owner_token"] == [7]
+        assert harness.interrupt_order == [
+            "stale",
+            "start",
+            "open",
+            "drain",
+            "close",
+            "stop",
+            "drain",
+            "stop",  # idempotent claim-finally belt
+        ]
+
+    @pytest.mark.asyncio
+    async def test_recovered_interrupted_input_is_never_injected(self, harness):
+        unit = uuid4()
+        stopped_id = str(uuid4())
+        newer_id = str(uuid4())
+        claim = make_claim(unit_id=unit, token=10, input_seq=9, consumed_seq=1)
+        harness.stale_result = (1, 5)
+        fetch_pending = AsyncMock(
+            return_value=[
+                {
+                    "id": newer_id,
+                    "seq": 9,
+                    "content": "newer",
+                    "turn_number": 1,
+                }
+            ]
+        )
+
+        with patch.object(harness.executor, "_fetch_pending_rows", fetch_pending):
+            await harness.executor._serve_claim(claim)
+        await _finish(harness)
+
+        fetch_pending.assert_awaited_once_with(str(unit), 5)
+        assert harness.consumed == [{"content": "newer", "id": newer_id}]
+        assert all(item["id"] != stopped_id for item in harness.consumed)
+        assert harness.calls["complete"] == [
+            {"unit_id": unit, "lease_token": 10, "consumed_seq": 9}
+        ]
+
+    @pytest.mark.asyncio
+    async def test_fresh_restore_rewinds_pending_turn_before_admission(self, harness):
+        """Admission targets the durable row even if persist never runs."""
+
+        unit = uuid4()
+        row_id = str(uuid4())
+        harness.restored_turn_count = 5
+        harness.db.pending_rows = [
+            {
+                "id": row_id,
+                "seq": 17,
+                "content": "stop-safe",
+                "turn_number": 5,
+            }
+        ]
+
+        await harness.executor._serve_claim(
+            make_claim(unit_id=unit, token=7, input_seq=17, consumed_seq=16)
+        )
+        await _finish(harness)
+
+        assert harness.calls["interrupt_open"] == [
+            {"unit_id": unit, "lease_token": 7, "turn_id": 5}
+        ]
+        assert harness.calls["interrupt_start"] == [
+            {"lease_token": 7, "target_turn_id": 5}
+        ]
+        # The harness loop deliberately never calls persist_message: this is
+        # the admission-before-persist crash window itself.
+        assert harness.sessions[0].turn_count == 5
+
+    @pytest.mark.asyncio
+    async def test_failed_post_open_drain_closes_stops_and_final_drains(self, harness):
+        unit = uuid4()
+        claim = make_claim(unit_id=unit, token=12, input_seq=1)
+        harness.executor._lease.update(unit, 12)
+        drain = AsyncMock(side_effect=[RuntimeError("first drain failed"), 0])
+
+        with patch.object(pa, "_drain_thread_interrupts", drain):
+            with pytest.raises(RuntimeError, match="first drain failed"):
+                await harness.executor._arm_interrupt_window(
+                    pa,
+                    claim,
+                    target_turn_id=3,
+                )
+
+        assert harness.interrupt_order == [
+            "start",
+            "open",
+            "close",
+            "stop",
+        ]
+        assert drain.await_args_list == [
+            call(lease_token=12, target_turn_id=3),
+            call(lease_token=12, target_turn_id=3),
+        ]
+        assert not harness.executor._lease.lost.is_set()
+
+    @pytest.mark.asyncio
+    async def test_failed_final_drain_forces_no_release(self, harness):
+        unit = uuid4()
+        claim = make_claim(unit_id=unit, token=12, input_seq=1)
+        harness.executor._lease.update(unit, 12)
+        drain = AsyncMock(side_effect=RuntimeError("database unavailable"))
+
+        with patch.object(pa, "_drain_thread_interrupts", drain):
+            with pytest.raises(RuntimeError, match="database unavailable"):
+                await harness.executor._arm_interrupt_window(
+                    pa,
+                    claim,
+                    target_turn_id=3,
+                )
+
+        assert harness.executor._lease.lost.is_set()
+        await harness.executor._release(claim, reason="arm_failed")
+        assert not harness.calls["release"]
 
     @pytest.mark.asyncio
     async def test_no_pending_input_completes_with_fallback(self, harness):
@@ -847,6 +1057,44 @@ class TestAffinity:
         assert len(harness.calls["complete"]) == 2
         assert harness.calls["shell_owner_token"] == [1, 2]
         assert harness.sessions[0].shell_owner_tokens == [1, 2]
+        assert [call["turn_id"] for call in harness.calls["interrupt_open"]] == [
+            1,
+            2,
+        ]
+
+    @pytest.mark.asyncio
+    async def test_warm_reuse_refuses_divergent_durable_turn_identity(self, harness):
+        unit = uuid4()
+        harness.db.pending_rows = [
+            {
+                "id": str(uuid4()),
+                "seq": 1,
+                "content": "one",
+                "turn_number": 1,
+            }
+        ]
+        await harness.executor._serve_claim(
+            make_claim(unit_id=unit, token=1, input_seq=1)
+        )
+        assert pa._session is not None
+        pa._session.turn_count = 7
+        harness.db.pending_rows = [
+            {
+                "id": str(uuid4()),
+                "seq": 2,
+                "content": "must-not-run",
+                "turn_number": 2,
+            }
+        ]
+
+        await harness.executor._serve_claim(
+            make_claim(unit_id=unit, token=2, input_seq=2, consumed_seq=1)
+        )
+        await _finish(harness)
+
+        assert len(harness.consumed) == 1
+        assert len(harness.calls["interrupt_open"]) == 1
+        assert harness.calls["release"][-1]["lease_token"] == 2
 
     @pytest.mark.asyncio
     async def test_shell_backend_reattaches_before_next_lease_token(self, harness):

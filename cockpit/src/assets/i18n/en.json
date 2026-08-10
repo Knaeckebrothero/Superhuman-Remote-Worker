@@ -1366,7 +1366,8 @@
       "textCount": "{{count}} text blocks",
       "toolCount": "{{count}} tool calls",
       "foldMore": "+{{count}} more",
-      "foldFailed": "⚠ {{count}} failed"
+      "foldFailed": "⚠ {{count}} failed",
+      "parked": "This turn stopped after repeated executor failures and needs operator intervention."
     },
     "queued": {
       "notSent": "Not sent",

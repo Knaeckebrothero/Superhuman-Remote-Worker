@@ -424,6 +424,27 @@ class TestSharedEventJournal:
         assert args[0] == "t-sys"
         assert args[1] == "turn.interrupted"
         assert json.loads(args[2]) == {"reason": "lease_stolen"}
+        assert args[3] is None
+
+    @pytest.mark.asyncio
+    async def test_append_system_frame_links_interrupt_receipt(self):
+        conn = ScriptedConn()
+        conn.fetchrow_results = [{"epoch": 7, "seq": 3}]
+        request_id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+
+        result = await event_journal.append_system_frame(
+            conn,
+            thread_id="t-sys",
+            kind="interrupt.ack",
+            payload={"applied": False, "error_code": "lease_expired"},
+            interrupt_request_id=request_id,
+        )
+
+        assert result == (7, 3)
+        _method, sql, args = conn.calls[0]
+        assert "interrupt_request_id" in sql
+        assert "$4::uuid" in sql
+        assert args[3] == request_id
 
     @pytest.mark.asyncio
     async def test_append_system_frame_returns_none_for_missing_thread(self):
