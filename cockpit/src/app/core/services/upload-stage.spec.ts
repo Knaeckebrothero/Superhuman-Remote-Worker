@@ -44,6 +44,15 @@ describe('classifyUploadFailure', () => {
 
     it('treats a not-ready workspace as retryable', () => {
         expect(classifyUploadFailure(409)).toBe('retryable');
+        expect(classifyUploadFailure(409, 'Workspace is not ready — try again in a moment')).toBe(
+            'retryable',
+        );
+    });
+
+    it('treats the none-tier refusal as terminal — retrying it can only fail forever', () => {
+        expect(
+            classifyUploadFailure(409, 'This session has no workspace, so files cannot be attached to it.'),
+        ).toBe('terminal');
     });
 
     it('treats transport failures as retryable', () => {
