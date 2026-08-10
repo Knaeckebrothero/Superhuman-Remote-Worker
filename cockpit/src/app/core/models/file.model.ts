@@ -60,6 +60,24 @@ export interface FilePreview {
 }
 
 /**
+ * A file `createFilePreviews()` declined to include in the batch, and why —
+ * so the caller can tell the user instead of the file silently vanishing
+ * (the bug this type exists to close: see file-handling.service.ts).
+ */
+export interface RejectedFile {
+  /** Original filename, for display in the rejection message. */
+  name: string;
+  /** 'size': over the per-file byte cap. 'count': over the per-batch file cap. */
+  reason: 'size' | 'count';
+}
+
+/** Result of `createFilePreviews()`: what was accepted, and what wasn't. */
+export interface FilePreviewResult {
+  previews: FilePreview[];
+  rejected: RejectedFile[];
+}
+
+/**
  * Uploaded file metadata from server.
  */
 export interface UploadedFile {
