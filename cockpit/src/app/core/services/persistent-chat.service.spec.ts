@@ -1725,6 +1725,39 @@ describe('PersistentChatService — SSE event dispatch', () => {
         }, '1:2');
         expect(service.pendingPermissions().map((p) => p.id)).toEqual(['tc-0']);
     });
+
+    it.each(['expired', 'interrupted'])(
+        'retires a %s permission card without fabricating a denial',
+        async (decision) => {
+            const {service, es} = await setup();
+            fireSseMessage(es, {
+                method: 'permission.request',
+                params: {
+                    id: 'tc-unanswered',
+                    approval_id: 'a-unanswered',
+                    tool: 'run_command',
+                    args: {command: 'echo untouched'},
+                },
+            }, '1:1');
+
+            fireSseMessage(es, {
+                method: 'permission.resolved',
+                params: {
+                    id: 'tc-unanswered',
+                    approval_id: 'a-unanswered',
+                    decision,
+                },
+            }, '1:2');
+
+            expect(service.pendingPermissions()).toEqual([]);
+            const tool = service.currentStreamingTurn()?.events.find(
+                (event) => event.kind === 'tool_call' && event.id === 'tc-unanswered',
+            ) as ToolCallEvent | undefined;
+            expect(tool).toBeDefined();
+            expect(tool?.decision).toBeUndefined();
+            expect(tool?.status).not.toBe('denied');
+        },
+    );
 });
 
 describe('PersistentChatService — cursor persistence', () => {

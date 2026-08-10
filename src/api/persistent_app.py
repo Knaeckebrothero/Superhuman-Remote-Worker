@@ -52,6 +52,10 @@ from ..core.workspace_backend import WorkspaceUnavailableError
 from .lease_context import LeaseLostError
 from .lease_context import current_lease as _current_lease_var
 from ..shared import event_journal as _event_journal
+from ..shared.thread_presence import (
+    expire_permission_if_untethered,
+    mark_stateless_natural_pause,
+)
 from ..agent import UniversalAgent
 from ..llm.reasoning_chat import extract_reasoning_text_from_block
 from ..persistent_graph import (
@@ -353,6 +357,53 @@ def _stateless_mode() -> bool:
     at import) so tests can flip it with monkeypatch.setenv.
     """
     return os.environ.get("STATELESS_EXECUTOR", "").strip() == "1"
+
+
+def _current_stateless_lease_token() -> Optional[int]:
+    """Return the exact live claim token for this attached stateless thread."""
+
+    if not _stateless_mode() or _thread_id is None:
+        return None
+    handle = _current_lease_var.get()
+    if (
+        handle is None
+        or not handle.active
+        or handle.lost.is_set()
+        or str(handle.unit_id) != str(_thread_id)
+    ):
+        return None
+    return int(handle.lease_token)
+
+
+async def _safe_mark_stateless_natural_pause(*, require_untethered: bool) -> bool:
+    """Best-effort durable presence oracle for stateless natural pauses."""
+
+    if _session is None or _session.postgres_conn is None or _thread_id is None:
+        return False
+    lease_token = _current_stateless_lease_token()
+    if lease_token is None:
+        logger.warning(
+            "Skipped stateless natural pause without exact lease (thread=%s)",
+            _thread_id,
+        )
+        return False
+    try:
+        return await mark_stateless_natural_pause(
+            _session.postgres_conn,
+            thread_id=_thread_id,
+            lease_token=lease_token,
+            require_untethered=require_untethered,
+        )
+    except Exception as exc:
+        # Lifecycle state is converged by the orchestrator's expired-presence
+        # sweep after run_queue reaches done; never fail a completed turn for
+        # this advisory status write.
+        logger.warning(
+            "Failed stateless natural-pause presence check (thread=%s): %s",
+            _thread_id,
+            exc,
+        )
+        return False
 
 
 def _stateless_reject() -> JSONResponse:
@@ -5892,19 +5943,26 @@ async def _loop_get_user_input() -> str:
     # reclassification against a thread the officer watchdog owns
     # (centurion.md §4). Officer also overrides polite mode: an explicit
     # reply gate after each turn contradicts autonomous cycling.
-    should_flip = (
+    should_consider_flip = (
         officer_cfg is None
         and _session is not None
         and _session.turn_count > 0
         and _orchestrator_client is not None
         and _thread_id is not None
-        and (headless_mode == "polite" or not _subscribers)
     )
-    if should_flip:
-        asyncio.create_task(
-            _safe_set_thread_status("awaiting_user"),
-            name="phase5-flip-awaiting-user",
-        )
+    if should_consider_flip:
+        if _stateless_mode():
+            # SSE presence is durable and replica-independent. Polite mode
+            # still pauses with a viewer; eager mode only pauses untethered.
+            await _safe_mark_stateless_natural_pause(
+                require_untethered=headless_mode != "polite"
+            )
+        elif headless_mode == "polite" or not _subscribers:
+            # Pinned behavior remains the exact process-local subscriber path.
+            asyncio.create_task(
+                _safe_set_thread_status("awaiting_user"),
+                name="phase5-flip-awaiting-user",
+            )
 
     # Parked window for the drain-suspend gate (_session_parked): exactly the
     # span where this coroutine is blocked on the queue. The finally also
@@ -6464,6 +6522,7 @@ async def _wait_for_permission_resolution(
                 if current in ("approved", "denied", "expired"):
                     return str(current)
 
+                wait_timeout = float(timeout)
                 while True:
                     waits = [asyncio.ensure_future(resolved.wait())]
                     if _hard_interrupt_event is not None:
@@ -6473,7 +6532,7 @@ async def _wait_for_permission_resolution(
                     try:
                         await asyncio.wait(
                             waits,
-                            timeout=timeout,
+                            timeout=wait_timeout,
                             return_when=asyncio.FIRST_COMPLETED,
                         )
                     finally:
@@ -6493,6 +6552,67 @@ async def _wait_for_permission_resolution(
 
                     if resolved.is_set():
                         break
+
+                    if _stateless_mode():
+                        lease_token = _current_stateless_lease_token()
+                        if lease_token is None:
+                            # Lease loss is not a user decision. Leave the row
+                            # pending for the successor/retirement path.
+                            logger.info(
+                                "Permission wait lost stateless owner "
+                                "(req=%s) — leaving pending",
+                                request_id,
+                            )
+                            return "interrupted"
+                        try:
+                            expiry = await expire_permission_if_untethered(
+                                conn,
+                                thread_id=str(_thread_id),
+                                request_id=request_id,
+                                lease_token=lease_token,
+                            )
+                        except Exception as exc:
+                            # Unknown presence must retain the card. A broken
+                            # connection may recover; retry on a short bounded
+                            # slice rather than fabricating a denial/expiry.
+                            logger.warning(
+                                "Permission presence check failed (req=%s): %s",
+                                request_id,
+                                exc,
+                            )
+                            wait_timeout = min(float(timeout), 5.0)
+                            continue
+
+                        if expiry.status in ("approved", "denied", "expired"):
+                            return str(expiry.status)
+                        if not expiry.owner_live:
+                            logger.info(
+                                "Permission owner fence rejected (req=%s) "
+                                "— leaving pending",
+                                request_id,
+                            )
+                            return "interrupted"
+                        if expiry.live_for_seconds is not None:
+                            # A tab closed just before this timeout should be
+                            # reconsidered at its short presence deadline, not
+                            # after another full five-minute permission slice.
+                            wait_timeout = min(
+                                float(timeout),
+                                max(0.1, expiry.live_for_seconds + 0.05),
+                            )
+                            continue
+
+                        # A concurrent resolver may have won after the CTE's
+                        # statement snapshot. Re-read before looping.
+                        status_now = await conn.fetchval(
+                            "SELECT status FROM thread_permission_requests "
+                            "WHERE id = $1",
+                            request_id,
+                        )
+                        if status_now in ("approved", "denied", "expired"):
+                            return str(status_now)
+                        wait_timeout = float(timeout)
+                        continue
 
                     if not _subscribers:
                         # Untethered: nobody can answer. CAS-style expire —
@@ -6726,14 +6846,16 @@ async def _loop_permission_check(
     # surfaces via the sitrep instead.
     if (
         _officer_cfg() is None
-        and not _subscribers
         and _orchestrator_client is not None
         and _thread_id is not None
     ):
-        asyncio.create_task(
-            _safe_set_thread_status("awaiting_user"),
-            name="phase5-flip-awaiting-user-sudo",
-        )
+        if _stateless_mode():
+            await _safe_mark_stateless_natural_pause(require_untethered=True)
+        elif not _subscribers:
+            asyncio.create_task(
+                _safe_set_thread_status("awaiting_user"),
+                name="phase5-flip-awaiting-user-sudo",
+            )
 
     # Publish the row we are blocked on so a concurrent sweep (mode.set from
     # the WS task) can't expire it under us and turn a live question into a

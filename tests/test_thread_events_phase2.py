@@ -1130,3 +1130,111 @@ class TestThreadEventStreamEpochRecheck:
         for c in (c1, c2):
             assert "gone_beyond_horizon" not in c
         assert conn.epoch_reads == 0
+
+
+class TestThreadEventStreamPresence:
+    @staticmethod
+    def _owner_row(lane: str) -> tuple[dict, dict]:
+        return ({"id": "user-x"}, {"events_epoch": 3, "execution_lane": lane})
+
+    @pytest.mark.asyncio
+    async def test_stateless_establishes_after_owner_gate(self, monkeypatch):
+        import orchestrator.main as om
+        from src.shared.thread_presence import PresenceRefresh
+
+        auth = AsyncMock(return_value=self._owner_row("stateless"))
+        refresh = AsyncMock(return_value=PresenceRefresh(True, True))
+        monkeypatch.setattr(om, "require_thread_owner", auth)
+        monkeypatch.setattr(om, "refresh_thread_presence", refresh)
+
+        response = await om.thread_event_stream("thread-x", _FakeRequest())
+        assert auth.await_count == 1
+        refresh.assert_awaited_once_with(
+            om.postgres_db,
+            thread_id="thread-x",
+            ttl_seconds=om.THREAD_CLIENT_PRESENCE_TTL_S,
+            establish=True,
+        )
+        iterator = response.body_iterator
+        assert await iterator.__anext__() == ": open\n\n"
+        await iterator.aclose()
+        # Closing is TTL grace, not a destructive presence delete.
+        assert refresh.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_periodic_renewal_reauthorizes_before_touch(self, monkeypatch):
+        import orchestrator.main as om
+        from src.shared.thread_presence import PresenceRefresh
+
+        auth = AsyncMock(
+            side_effect=[
+                self._owner_row("stateless"),
+                self._owner_row("stateless"),
+            ]
+        )
+        refresh = AsyncMock(
+            side_effect=[PresenceRefresh(True, True), RuntimeError("renew failed")]
+        )
+        monkeypatch.setattr(om, "require_thread_owner", auth)
+        monkeypatch.setattr(om, "refresh_thread_presence", refresh)
+        monkeypatch.setattr(om, "THREAD_CLIENT_PRESENCE_RENEW_S", 0.0)
+        fake_db = MagicMock()
+        fake_db.acquire = lambda: _Acquire(_ScriptedConn(epochs=[], min_seq=0))
+        monkeypatch.setattr(om, "postgres_db", fake_db)
+
+        response = await om.thread_event_stream("thread-x", _FakeRequest())
+        iterator = response.body_iterator
+        assert await iterator.__anext__() == ": open\n\n"
+        with pytest.raises(StopAsyncIteration):
+            await iterator.__anext__()
+
+        assert auth.await_count == 2
+        assert refresh.await_count == 2
+        assert refresh.await_args_list[1].kwargs["establish"] is False
+
+    @pytest.mark.asyncio
+    async def test_renewal_auth_failure_closes_without_refresh(self, monkeypatch):
+        import orchestrator.main as om
+        from fastapi import HTTPException
+        from src.shared.thread_presence import PresenceRefresh
+
+        auth = AsyncMock(
+            side_effect=[
+                self._owner_row("stateless"),
+                HTTPException(status_code=401, detail="session expired"),
+            ]
+        )
+        refresh = AsyncMock(return_value=PresenceRefresh(True, True))
+        monkeypatch.setattr(om, "require_thread_owner", auth)
+        monkeypatch.setattr(om, "refresh_thread_presence", refresh)
+        monkeypatch.setattr(om, "THREAD_CLIENT_PRESENCE_RENEW_S", 0.0)
+        fake_db = MagicMock()
+        fake_db.acquire = lambda: _Acquire(_ScriptedConn(epochs=[], min_seq=0))
+        monkeypatch.setattr(om, "postgres_db", fake_db)
+
+        response = await om.thread_event_stream("thread-x", _FakeRequest())
+        iterator = response.body_iterator
+        assert await iterator.__anext__() == ": open\n\n"
+        with pytest.raises(StopAsyncIteration):
+            await iterator.__anext__()
+
+        assert auth.await_count == 2
+        assert refresh.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_pinned_stream_never_touches_presence(self, monkeypatch):
+        import orchestrator.main as om
+
+        monkeypatch.setattr(
+            om,
+            "require_thread_owner",
+            AsyncMock(return_value=self._owner_row("pinned")),
+        )
+        refresh = AsyncMock()
+        monkeypatch.setattr(om, "refresh_thread_presence", refresh)
+
+        response = await om.thread_event_stream("thread-x", _FakeRequest())
+        iterator = response.body_iterator
+        assert await iterator.__anext__() == ": open\n\n"
+        await iterator.aclose()
+        refresh.assert_not_called()
