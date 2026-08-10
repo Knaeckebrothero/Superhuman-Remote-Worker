@@ -2369,7 +2369,7 @@ describe('PersistentChatService — REST sends', () => {
         );
         expect(inputCalls).toHaveLength(0);
         expect(ctx.service.outbox().length).toBe(1);
-        expect(ctx.service.outbox()[0].content).toBe('queued');
+        expect(ctx.service.outbox()[0].displayContent).toBe('queued');
     });
 
     it('sendMessage on an ended thread resumes it and queues the message', async () => {
@@ -2395,7 +2395,39 @@ describe('PersistentChatService — REST sends', () => {
         expect(resumeCalls).toHaveLength(1);
         // Not sent yet — the agent isn't up. It waits in the outbox.
         expect(inputCalls).toHaveLength(0);
-        expect(ctx.service.outbox().map((i) => i.content)).toEqual(['bring it back']);
+        expect(ctx.service.outbox().map((i) => i.displayContent)).toEqual(['bring it back']);
+    });
+
+    it('sendMessage with an attachment on an ended thread resumes FIRST and uploads after', async () => {
+        // Pre-Task-4 the upload ran above the ended-thread branch, so on a
+        // pod/VM-tier ended thread it 409'd against a torn-down workspace,
+        // returned false, and resumeSession() was never reached: attaching a
+        // file to an ended session silently refused to bring it back.
+        const ctx = createService();
+        ctx.mockHttp.get.mockImplementation(() =>
+            of({status: 'ended', total_turns: 0, messages: [], total: 0}),
+        );
+        await ctx.service.connect('thread-e2');
+        ctx.service.threadStatus.set('ended');
+        ctx.mockHttp.post.mockClear();
+        ctx.mockApi.uploadOneToThread.mockClear();
+
+        const file = new File(['a'], 'a.png', {type: 'image/png'});
+        ctx.service.addAttachments([{
+            id: '1', file, name: 'a.png', size: file.size,
+            mimeType: 'image/png', uploadStatus: UploadStatus.PENDING,
+        } as any]);
+
+        const ok = await ctx.service.sendMessage('look at this');
+
+        expect(ok).toBe(true);
+        expect(ctx.mockHttp.post.mock.calls.filter((c: any) =>
+            String(c[0]).endsWith('/persistent/threads/thread-e2/resume'),
+        )).toHaveLength(1);
+        // The bytes wait for the workspace the resume is bringing up.
+        expect(ctx.mockApi.uploadOneToThread).not.toHaveBeenCalled();
+        expect(ctx.service.pendingAttachments()).toEqual([]);
+        expect(ctx.service.outbox()[0].pendingFiles?.map((f) => f.name)).toEqual(['a.png']);
     });
 
     it('opening an ended thread does NOT resume it — only a send does', async () => {
@@ -2618,18 +2650,27 @@ describe('PersistentChatService — REST sends', () => {
         expect(ctx.service.isInterrupting()).toBe(true);
     });
 
-    it('a mid-loop upload failure keeps the already-uploaded file COMPLETED, and a retry only re-uploads the failed one', async () => {
-        // Regression coverage for the per-file upload loop: file 1 succeeds,
-        // file 2 hits the 100MB cap (413). Pre-fix, the catch block
-        // blanket-marked BOTH files FAILED and discarded file 1's result —
-        // a retry then re-uploaded file 1 too, permanently duplicating it
-        // server-side (no delete endpoint, no idempotency key).
+    it('a mid-stage upload failure keeps the landed file done, and a retry only re-uploads the failed one', async () => {
+        // Regression coverage for the per-file upload stage: file 1 succeeds,
+        // file 2 hits the 100MB cap (413). Pre-Task-2 the catch blanket-marked
+        // BOTH files failed and discarded file 1's result — a retry then
+        // re-uploaded file 1 too, permanently duplicating it server-side (no
+        // delete endpoint, no idempotency key). Since Task 4 the per-file
+        // result is cached on the OUTBOX ITEM (the previews are gone from the
+        // composer the moment the user sends), so that is where the
+        // never-re-upload-a-success invariant now has to hold.
         const ctx = await readySession();
 
         const fileA = new File(['a'], 'a.png', {type: 'image/png'});
         const fileB = new File(['b'], 'huge.bin', {type: 'application/octet-stream'});
-        const previewA: any = {id: '1', file: fileA, name: 'a.png', uploadStatus: UploadStatus.PENDING};
-        const previewB: any = {id: '2', file: fileB, name: 'huge.bin', uploadStatus: UploadStatus.PENDING};
+        const previewA: any = {
+            id: '1', file: fileA, name: 'a.png', size: fileA.size,
+            mimeType: 'image/png', uploadStatus: UploadStatus.PENDING,
+        };
+        const previewB: any = {
+            id: '2', file: fileB, name: 'huge.bin', size: fileB.size,
+            mimeType: 'application/octet-stream', uploadStatus: UploadStatus.PENDING,
+        };
         ctx.service.addAttachments([previewA, previewB]);
 
         ctx.mockApi.uploadOneToThread.mockImplementation((_threadId: string, file: File) =>
@@ -2638,34 +2679,50 @@ describe('PersistentChatService — REST sends', () => {
                 : of([{name: file.name, size: file.size, mime_type: file.type, path: `uploads/${file.name}`}]),
         );
 
+        // The send is committed regardless of the upload's fate: bubble,
+        // queue entry, cleared composer.
         const ok1 = await ctx.service.sendMessage('two files');
+        await new Promise((r) => setTimeout(r, 0));
 
-        expect(ok1).toBe(false);
+        expect(ok1).toBe(true);
+        expect(ctx.service.pendingAttachments()).toEqual([]);
         expect(ctx.mockApi.uploadOneToThread).toHaveBeenCalledTimes(2);
-        // File 1 already landed server-side — its COMPLETED status and
+        // Nothing was POSTed — the queue stalled at stage 0.
+        const failedInput = ctx.mockHttp.post.mock.calls.filter((c: any) =>
+            String(c[0]).endsWith('/persistent/threads/thread-r/input'),
+        );
+        expect(failedInput).toHaveLength(0);
+        expect(ctx.service.outboxStalled()).toBe(true);
+        // File 1 already landed server-side — its `done` status and
         // server-assigned path must survive the file-2 failure.
-        expect(previewA.uploadStatus).toBe(UploadStatus.COMPLETED);
-        expect(previewA.uploadedFiles).toEqual([
-            {name: 'a.png', size: fileA.size, mime_type: 'image/png', path: 'uploads/a.png'},
-        ]);
-        expect(previewB.uploadStatus).toBe(UploadStatus.FAILED);
-        expect(previewB.error).toBe('upload failed');
-        expect(ctx.service.attachmentError()).toBe('upload failed');
+        const files1 = ctx.service.outbox()[0].pendingFiles!;
+        expect(files1.map((f) => f.status)).toEqual(['done', 'failed']);
+        expect(files1[0].resolved).toEqual({
+            id: '1', name: 'a.png', size: fileA.size, mimeType: 'image/png', path: 'uploads/a.png',
+        });
+        expect(files1[1].error).toBe('upload failed');
+        // 413 is terminal, so the banner explains rather than just stalling.
+        expect(ctx.service.error()).toBe('upload failed');
 
-        // Retry from the same composer state (nothing was cleared on
-        // failure) — only the failed file should be re-sent.
+        // Retry the queued item — only the failed file should be re-sent.
         ctx.mockApi.uploadOneToThread.mockClear();
         ctx.mockApi.uploadOneToThread.mockImplementation((_threadId: string, file: File) =>
             of([{name: file.name, size: file.size, mime_type: file.type, path: `uploads/${file.name}`}]),
         );
 
-        const ok2 = await ctx.service.sendMessage('two files');
+        ctx.service.retryQueuedSends();
+        await new Promise((r) => setTimeout(r, 0));
 
-        expect(ok2).toBe(true);
         expect(ctx.mockApi.uploadOneToThread).toHaveBeenCalledTimes(1);
         expect(ctx.mockApi.uploadOneToThread).toHaveBeenCalledWith('thread-r', fileB);
-        expect(previewA.uploadStatus).toBe(UploadStatus.COMPLETED);
-        expect(previewB.uploadStatus).toBe(UploadStatus.COMPLETED);
+        const sentInput = ctx.mockHttp.post.mock.calls.filter((c: any) =>
+            String(c[0]).endsWith('/persistent/threads/thread-r/input'),
+        );
+        expect(sentInput).toHaveLength(1);
+        expect(sentInput[0][1].content).toBe(
+            'two files\n\n[Attached files in uploads/: a.png, huge.bin]',
+        );
+        expect(ctx.service.outbox()).toEqual([]);
     });
 });
 
@@ -2861,6 +2918,28 @@ describe('PersistentChatService — control WS (slash commands + permissions)', 
         expect(sent).toContainEqual({method: 'compact', focus: 'recent edits'});
         const systemTurns = ctx.service.turns().filter(isSystemTurn);
         expect(systemTurns.some((t) => /Compacting/.test(String(t.content)))).toBe(false);
+    });
+
+    it('refuses a slash command while files are attached instead of stranding the chips', async () => {
+        // The slash bypass returns before the attachment path, so `/compact`
+        // with a queued file used to run the command and silently leave the
+        // chips in the composer with no message and no error (spec §2).
+        const ctx = await readySession();
+        const file = new File(['a'], 'a.png', {type: 'image/png'});
+        ctx.service.addAttachments([{
+            id: '1', file, name: 'a.png', size: file.size,
+            mimeType: 'image/png', uploadStatus: UploadStatus.PENDING,
+        } as any]);
+
+        const ok = await ctx.service.sendMessage('/compact recent edits');
+
+        expect(ok).toBe(false);
+        expect(ctx.service.attachmentError()).toBe('chat.upload.slashCommandWithAttachments');
+        // Command not run, files not sent, chips still there to be removed.
+        const sent = ctx.wsInstances[0].send.mock.calls.map((c: any) => JSON.parse(c[0]));
+        expect(sent.some((m: any) => m.method === 'compact')).toBe(false);
+        expect(ctx.service.pendingAttachments()).toHaveLength(1);
+        expect(ctx.service.outbox()).toEqual([]);
     });
 
     it('/done sends archive', async () => {

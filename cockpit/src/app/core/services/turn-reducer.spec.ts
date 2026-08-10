@@ -91,6 +91,45 @@ describe('user_message attachments before upload', () => {
     });
 });
 
+describe('turn-reducer — update_attachments', () => {
+    it('patches the chips of an already-rendered bubble in place', () => {
+        const state = play([
+            {
+                type: 'user_message',
+                id: 'user-1',
+                content: 'here',
+                attachments: [{id: 'p1', name: 'a.pdf', size: 1, mimeType: 'application/pdf'}],
+                timestamp: 1,
+            },
+            {type: 'user_message', id: 'user-2', content: 'and this', timestamp: 2},
+            {
+                type: 'update_attachments',
+                id: 'user-1',
+                // The upload resolved: real path, server-renamed on collision.
+                attachments: [
+                    {id: 'p1', name: 'a_1.pdf', size: 1, mimeType: 'application/pdf', path: 'uploads/a_1.pdf'},
+                ],
+            },
+        ]);
+
+        // Patched in place: no duplicate bubble, and the message the user
+        // queued behind it stays behind it.
+        expect(state.turns.map((t) => t.id)).toEqual(['user-1', 'user-2']);
+        expect((state.turns[0] as UserTurn).attachments).toEqual([
+            {id: 'p1', name: 'a_1.pdf', size: 1, mimeType: 'application/pdf', path: 'uploads/a_1.pdf'},
+        ]);
+    });
+
+    it('is a no-op when no turn matches the id', () => {
+        const state = play([
+            {type: 'user_message', id: 'u1', content: 'hi', timestamp: 1},
+            {type: 'update_attachments', id: 'gone', attachments: []},
+        ]);
+        expect(state.turns).toHaveLength(1);
+        expect((state.turns[0] as UserTurn).attachments).toBeUndefined();
+    });
+});
+
 describe('turn-reducer — remove_turn', () => {
     it('removes the turn with the matching id and leaves the others', () => {
         const state = play([

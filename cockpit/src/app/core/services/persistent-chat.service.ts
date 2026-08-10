@@ -4,7 +4,7 @@ import {HttpClient} from '@angular/common/http';
 import {firstValueFrom} from 'rxjs';
 import {environment} from '../environment';
 import {Project, ThreadCloudDiffSummary, ThreadStatus} from '../models/api.model';
-import {FilePreview, ThreadUploadedFile, UploadStatus} from '../models/file.model';
+import {FilePreview} from '../models/file.model';
 import {
     AssistantTurn,
     ConversationState,
@@ -22,6 +22,7 @@ import {IndexedDbService} from './indexed-db.service';
 import {NotificationService} from './notification.service';
 import {classifyResumeError, ConfigDriftItem} from './resume-error';
 import {reduce, ReducerAction} from './turn-reducer';
+import {classifyUploadFailure, composeAgentContent, PendingUpload} from './upload-stage';
 import {AppToastService} from '../../ui/toast';
 import {
     CanvasControl,
@@ -154,13 +155,23 @@ export interface ChatAttachment {
 export interface OutboxItem {
     /** The optimistic user-bubble's makeLocalId('user') — bubble↔queue link. */
     localId: string;
-    /** What gets POSTed to the agent (may include the attachment-hint suffix). */
-    content: string;
+    /** What gets POSTed. Undefined until the upload stage resolves the file
+     *  names that go into the attachment hint; computed in _flushOutbox. */
+    content?: string;
     /** The user's typed text only — used to re-dispatch the bubble faithfully
      *  (without the attachment hint) after a history reload. */
     displayContent: string;
-    /** Attachment chips to re-render on the bubble, if any. */
+    /** Attachment chips to re-render on the bubble. Present from creation for
+     *  the local descriptors; each gains `path` as its upload resolves. */
     attachments?: ChatAttachment[];
+    /** Files still to upload, holding their File handles. Empty/absent once
+     *  every file has resolved. */
+    pendingFiles?: PendingUpload[];
+    /** The thread this item belongs to. The flush already guards the POST
+     *  against a mid-flight thread switch via tidAtPost; the upload stage is a
+     *  second, longer await that needs the same guard, and an eagerly-started
+     *  upload (Slice 3) could otherwise resolve into a foreign queue. */
+    threadId: string;
     /** Flush attempts so far (diagnostic; there is deliberately no auto-retry). */
     attempts: number;
 }
@@ -751,11 +762,25 @@ export class PersistentChatService {
     // horizon re-dispatch, since accept-time persistence may already have put
     // its row in the reloaded history).
     private flushingHeadId: string | null = null;
+    // localId of the item whose upload stage is running. Separate from
+    // flushingHeadId (which covers only the POST): both windows must refuse a
+    // discard, but for different reasons — an in-flight POST's fate isn't
+    // decided, while dropping a mid-upload item orphans bytes in the workspace
+    // that no endpoint can delete.
+    private uploadingItemId: string | null = null;
 
     // --- Pending attachments (queued in composer before send) ---
     readonly pendingAttachments = signal<FilePreview[]>([]);
 
-    // --- Upload state (true while the next send is busy uploading files) ---
+    /**
+     * DEPRECATED and deliberately never set since the upload moved into the
+     * outbox flush. It used to gate the composer while bytes moved, which is
+     * precisely the blocked-composer bug this design removes: the send is
+     * committed the moment the user hits send, so the composer must stay
+     * usable. Upload progress belongs on the queued bubble's stage line
+     * (docs/features/session_attachment_send_flow.md §5.2). Kept only because
+     * the component template still binds it; remove with that binding.
+     */
     readonly isUploadingAttachments = signal(false);
 
     // --- Last upload error (cleared on next successful send) ---
@@ -2460,21 +2485,36 @@ export class PersistentChatService {
      *  If the session isn't ready yet, queues the message and sends it
      *  automatically once the agent signals readiness.
      *
-     *  When ``pendingAttachments`` is non-empty, files are uploaded to the
-     *  thread workspace's ``uploads/`` directory first, then a hint listing
-     *  the uploaded filenames is appended to the message text the agent
-     *  receives. The displayed user message keeps the original text and
-     *  shows uploaded files as separate attachment chips.
+     *  When ``pendingAttachments`` is non-empty the files are NOT uploaded
+     *  here: they ride the outbox item as ``pendingFiles`` and upload as
+     *  stage 0 of the flush (``_uploadStage``), which then appends a hint
+     *  listing the server-confirmed filenames to the text the agent receives.
+     *  The displayed user message keeps the original text and shows the files
+     *  as attachment chips — present from the moment the user hits send, not
+     *  from the moment the bytes land.
      */
     async sendMessage(content: string): Promise<boolean> {
         const trimmed = content.trim();
+        const queued = this.pendingAttachments();
+
+        // Slash commands and attachments don't mix. This sits ABOVE the
+        // bypass, not below it: a *recognized* command (`/compact`) returns
+        // inside the bypass, which used to leave the chips sitting in the
+        // composer with no message and no error — the strand named in
+        // docs/features/session_attachment_send_flow.md §2. Refuse explicitly
+        // instead, so no slash path can silently swallow queued files.
+        if (trimmed.startsWith('/') && queued.length > 0) {
+            this.attachmentError.set(
+                this.transloco.translate('chat.upload.slashCommandWithAttachments'),
+            );
+            return false;
+        }
 
         // Slash commands bypass attachment logic.
         if (trimmed.startsWith('/')) {
             if (this.handleSlashCommand(trimmed)) return true;
         }
 
-        const queued = this.pendingAttachments();
         if (!trimmed && queued.length === 0) return true;
 
         // An editable Office frame owns its current in-memory document. Flush
@@ -2482,89 +2522,27 @@ export class PersistentChatService {
         // committed revision rather than an older workspace snapshot.
         if (!(await this.canvas.prepareOfficeForUserMessage())) return false;
 
-        let uploaded: ThreadUploadedFile[] = [];
-        if (queued.length > 0) {
-            const threadId = this.threadId();
-            if (!threadId) {
-                this.attachmentError.set('Cannot upload: no active thread');
-                return false;
-            }
-            // A prior sendMessage() attempt may have partially succeeded
-            // (e.g. file 2 of 3 hit the 100MB cap): files already marked
-            // COMPLETED are durably written server-side, and the backend
-            // has no delete endpoint or idempotency key, so a retry must
-            // never re-upload them — that would permanently duplicate the
-            // file under a `_1` suffix. Replay their already-known server
-            // results instead of re-sending the bytes.
-            const toUpload = queued.filter(
-                (p) => p.file && p.uploadStatus !== UploadStatus.COMPLETED,
-            );
-            queued
-                .filter((p) => p.uploadStatus === UploadStatus.COMPLETED)
-                .forEach((p) => uploaded.push(...(p.uploadedFiles ?? [])));
-
-            this.isUploadingAttachments.set(true);
-            this.attachmentError.set(null);
-            toUpload.forEach((p) => (p.uploadStatus = UploadStatus.UPLOADING));
-            try {
-                // One request per file (not one batched multipart POST) — see
-                // ApiService.uploadOneToThread for why. Sequential and
-                // fail-fast for now; Task 4 moves this into the send outbox
-                // with per-file progress and cancel.
-                //
-                // Each preview's status/result is committed the moment ITS
-                // request resolves (not in a batch after the loop) so that
-                // if a later file throws, earlier successes in this same
-                // call are already durably COMPLETED and won't be
-                // reclassified as failed below.
-                for (const p of toUpload) {
-                    const result = await firstValueFrom(this.api.uploadOneToThread(threadId, p.file));
-                    p.uploadedFiles = result;
-                    p.remoteName = result[0]?.name;
-                    p.uploadStatus = UploadStatus.COMPLETED;
-                    p.error = undefined;
-                    uploaded.push(...result);
-                }
-            } catch (err) {
-                const msg = this.api.humanizeUploadError(err);
-                // Only the files that didn't make it this round — anything
-                // already flipped to COMPLETED above (this call or a prior
-                // one) keeps that status.
-                toUpload
-                    .filter((p) => p.uploadStatus !== UploadStatus.COMPLETED)
-                    .forEach((p) => {
-                        p.uploadStatus = UploadStatus.FAILED;
-                        p.error = msg;
-                    });
-                this.attachmentError.set(msg);
-                return false;
-            } finally {
-                this.isUploadingAttachments.set(false);
-            }
-            // Successful upload — drop the previews so the composer clears
-            this.clearAttachments();
-        }
-
-        const attachments: ChatAttachment[] = uploaded.map((f) => ({
-            // Transitional placeholder: `uploaded` is a flat ThreadUploadedFile[]
-            // (a .zip can expand to several entries per originating
-            // FilePreview, so there's no clean 1:1 id to reuse here). Task 4
-            // rewrites this block wholesale to carry the real
-            // PendingUpload.id through from the pre-upload chip.
-            id: crypto.randomUUID(),
+        // Local descriptors for the bubble. These exist BEFORE any byte moves —
+        // that is the entire point of this design. `path` fills in per file as
+        // the upload stage resolves it.
+        const pendingFiles: PendingUpload[] = queued
+            .filter((p) => p.file)
+            .map((p) => ({
+                id: p.id,
+                file: p.file,
+                name: p.name,
+                size: p.size,
+                mimeType: p.mimeType,
+                loaded: 0,
+                total: p.size || null,
+                status: 'queued' as const,
+            }));
+        const attachments: ChatAttachment[] = pendingFiles.map((f) => ({
+            id: f.id,
             name: f.name,
             size: f.size,
-            mimeType: f.mime_type,
-            path: f.path,
+            mimeType: f.mimeType,
         }));
-
-        // What the agent sees: text + a plain-language hint about the files.
-        let sendContent = trimmed;
-        if (attachments.length > 0) {
-            const list = attachments.map((a) => a.name).join(', ');
-            const hint = `[Attached files in uploads/: ${list}]`;
-            sendContent = trimmed ? `${trimmed}\n\n${hint}` : hint;
-        }
 
         // The user spoke, so they've resumed the agent themselves — drop any
         // queued auto-continuation rather than stacking a "continue where you
@@ -2573,8 +2551,18 @@ export class PersistentChatService {
         // before calling us.
         this.continueAfterUpgrade.set(false);
 
-        // Add to local conversation — content is the user's typed text
-        // only; uploaded files render as separate attachment chips.
+        // ── One synchronous commit point ────────────────────────────────────
+        // Bubble, queue entry and composer clearing happen together, with no
+        // await between them. Previously the upload sat above this block, so
+        // the text cleared at t=0 and the chips cleared at t=upload-complete,
+        // with no bubble in between. Signal Desktop commits the same way
+        // (register the message Pending, then upload inside the send job).
+        //
+        // Every send goes through the outbox — queued when the session isn't
+        // ready yet, flushed immediately when it is. This serializes to one POST
+        // in flight per tab (so two rapid sends can't collide on the default
+        // turn_id and lose the second behind a 409), and the queue survives
+        // reconnects. Bubble rollback (on 404/410) is the flush's job.
         const localId = makeLocalId('user');
         this.dispatch({
             type: 'user_message',
@@ -2583,22 +2571,22 @@ export class PersistentChatService {
             attachments: attachments.length > 0 ? attachments : undefined,
             timestamp: Date.now(),
         });
-
-        // Every send goes through the outbox — queued when the session isn't
-        // ready yet, flushed immediately when it is. This serializes to one POST
-        // in flight per tab (so two rapid sends can't collide on the default
-        // turn_id and lose the second behind a 409), and the queue survives
-        // reconnects. Bubble rollback (on 404/410) is the flush's job now.
         this.outbox.update((q) => [
             ...q,
             {
                 localId,
-                content: sendContent,
                 displayContent: trimmed,
                 attachments: attachments.length > 0 ? attachments : undefined,
+                pendingFiles: pendingFiles.length > 0 ? pendingFiles : undefined,
+                // '' on the landing draft — no thread exists yet. The flush
+                // pins it to the real id before the first upload.
+                threadId: this.threadId() ?? '',
                 attempts: 0,
             },
         ]);
+        this.clearAttachments();
+        this.attachmentError.set(null);
+        // ────────────────────────────────────────────────────────────────────
         this.isWaitingForInput.set(false);
         if (this.isDraftSession()) {
             // First send from the landing draft: create the session now. The
@@ -2629,6 +2617,9 @@ export class PersistentChatService {
      * so a transient 503 / pod-churn reset can mask an already-accepted send —
      * retrying would double-send. On a non-terminal failure we stop, leave the
      * item queued, and let the next trigger retry.
+     *
+     * Stage 0 of each item is its upload (_uploadStage): the bytes move here,
+     * not in sendMessage, so the bubble and the composer never wait on them.
      */
     private async _flushOutbox(): Promise<void> {
         if (this.flushingOutbox) return;
@@ -2642,11 +2633,65 @@ export class PersistentChatService {
                 const head = this.outbox()[0];
                 const tidAtPost = this.threadId();
                 if (!tidAtPost) break;
-                head.attempts += 1;
+                // Bump the attempt counter and, for a landing-draft item queued
+                // before its thread existed (threadId ''), pin it to the thread
+                // that now exists. Through the signal, never in place: the
+                // bubble and (Slice 2) the stage line read this item.
+                this.outbox.update((q) =>
+                    q.map((i) =>
+                        i.localId === head.localId
+                            ? {
+                                ...i,
+                                attempts: i.attempts + 1,
+                                threadId: i.threadId || tidAtPost,
+                            }
+                            : i,
+                    ),
+                );
+                if (head.pendingFiles?.length) {
+                    const up = await this._uploadStage(head, tidAtPost);
+                    // Same guard the POST gets below: an upload is a much
+                    // longer await, so a thread switch mid-upload is likelier,
+                    // and resolving into a foreign queue is the exact
+                    // cross-thread mutation this phase exists to kill.
+                    if (this.threadId() !== tidAtPost) {
+                        queueMicrotask(() => void this._flushOutbox());
+                        return;
+                    }
+                    if (!up.ok) {
+                        if (up.status === 404 || up.status === 410) {
+                            // Thread gone. Already-uploaded bytes are abandoned
+                            // with it — acceptable, there is nothing to send
+                            // them to (spec §5.5).
+                            this.outboxStalled.set(false);
+                            this._drainOutboxWithRollback();
+                            return;
+                        }
+                        this.outboxStalled.set(true);
+                        return;
+                    }
+                }
+                // Re-read: _uploadStage wrote resolved paths through the signal,
+                // so `head` is a stale snapshot of the attachments by now. Only
+                // files the server confirmed go into the hint.
+                const item = this.outbox().find((i) => i.localId === head.localId);
+                const names = (item?.attachments ?? [])
+                    .filter((a) => a.path)
+                    .map((a) => a.name);
+                const content = composeAgentContent(head.displayContent, names);
+                // Record what we're about to POST on the item itself, so the
+                // queue can be inspected (and a retry compared) without
+                // recomputing. Skipped when unchanged — a retry must not churn
+                // the signal for nothing.
+                if (item && item.content !== content) {
+                    this.outbox.update((q) =>
+                        q.map((i) => (i.localId === head.localId ? {...i, content} : i)),
+                    );
+                }
                 this.flushingHeadId = head.localId;
                 let result: { ok: boolean; status: number };
                 try {
-                    result = await this._postInput(head.content);
+                    result = await this._postInput(content);
                 } finally {
                     this.flushingHeadId = null;
                 }
@@ -2701,6 +2746,129 @@ export class PersistentChatService {
     }
 
     /**
+     * Stage 0 of a flush: upload any files this item still owes, one request
+     * per file, and patch their resolved paths onto the item's attachments.
+     *
+     * Files that already resolved are skipped — the backend has no upload
+     * idempotency (_claim_name resolves collisions with a _1 suffix against a
+     * live listing), so re-uploading a success would silently duplicate it.
+     *
+     * Fail-fast, and files after the failure are left `queued`, NOT `failed`:
+     * they were never attempted, and stamping them with the failing file's
+     * message (what the pre-Task-4 loop did) is a lie the user then has to
+     * debug. `queued` is the honest "not attempted" state.
+     *
+     * The upload goes through ApiService → HttpClient on purpose. A raw
+     * XHR/fetch would miss auth.interceptor's `ngsw-bypass: 1` and the service
+     * worker would corrupt the multipart body
+     * (docs/done/cockpit_service_worker_breaks_file_uploads.md).
+     *
+     * Returns the same {ok, status} shape as _postInput so the flush's existing
+     * terminal-vs-retryable branching applies unchanged.
+     */
+    private async _uploadStage(
+        head: OutboxItem,
+        threadId: string,
+    ): Promise<{ ok: boolean; status: number }> {
+        const files = head.pendingFiles ?? [];
+        if (files.every((f) => f.status === 'done')) return {ok: true, status: 200};
+
+        this.uploadingItemId = head.localId;
+        try {
+            for (const f of files) {
+                if (f.status === 'done') continue;
+                // The user left this thread mid-batch. Stop pushing bytes into
+                // a workspace they've navigated away from — the flush's
+                // post-stage guard (which runs before any stall bookkeeping)
+                // drops this whole resolution anyway.
+                if (this.threadId() !== threadId) return {ok: false, status: 0};
+                this._patchPendingFile(head.localId, f.id, {
+                    status: 'uploading',
+                    error: undefined,
+                });
+                try {
+                    const results = await firstValueFrom(
+                        this.api.uploadOneToThread(threadId, f.file),
+                    );
+                    // A .zip expands to one entry per extracted member, so one
+                    // PendingUpload can resolve into several ChatAttachments.
+                    const resolved: ChatAttachment[] = results.map((r, i) => ({
+                        id: i === 0 ? f.id : `${f.id}-${i}`,
+                        name: r.name,
+                        size: r.size,
+                        mimeType: r.mime_type,
+                        path: r.path,
+                    }));
+                    this._patchPendingFile(head.localId, f.id, {
+                        status: 'done',
+                        loaded: f.size,
+                        resolved: resolved[0],
+                    });
+                    this._mergeResolvedAttachments(head.localId, f.id, resolved);
+                } catch (err) {
+                    const status = (err as { status?: number })?.status ?? 0;
+                    const msg = this.api.humanizeUploadError(err);
+                    this._patchPendingFile(head.localId, f.id, {status: 'failed', error: msg});
+                    // 409 means two opposite things on this endpoint; only the
+                    // `none`-tier refusal is permanent, and only that one gets
+                    // the banner — a retryable failure is already explained by
+                    // the queued bubble's retry/discard affordance.
+                    if (classifyUploadFailure(status, msg) === 'terminal') {
+                        this.error.set(msg);
+                    }
+                    return {ok: false, status};
+                }
+            }
+        } finally {
+            this.uploadingItemId = null;
+        }
+        return {ok: true, status: 200};
+    }
+
+    /** Patch one queued file's upload state through the signal (fresh item,
+     *  fresh file object — the bubble renders off these). */
+    private _patchPendingFile(
+        localId: string,
+        fileId: string,
+        patch: Partial<PendingUpload>,
+    ): void {
+        this.outbox.update((q) =>
+            q.map((i) =>
+                i.localId === localId
+                    ? {
+                        ...i,
+                        pendingFiles: i.pendingFiles?.map((f) =>
+                            f.id === fileId ? {...f, ...patch} : f,
+                        ),
+                    }
+                    : i,
+            ),
+        );
+    }
+
+    /**
+     * Replace one pre-upload chip with what the server actually stored: its
+     * real path, its possibly-renamed name (`_1` collision suffix), and one
+     * chip per extracted member for a .zip. Re-dispatches the bubble's chips
+     * in place — a second `user_message` would append a duplicate bubble.
+     */
+    private _mergeResolvedAttachments(
+        localId: string,
+        fileId: string,
+        resolved: ChatAttachment[],
+    ): void {
+        const item = this.outbox().find((i) => i.localId === localId);
+        if (!item) return; // drained under us (thread gone / switched)
+        const next = (item.attachments ?? []).flatMap((a) =>
+            a.id === fileId ? resolved : [a],
+        );
+        this.outbox.update((q) =>
+            q.map((i) => (i.localId === localId ? {...i, attachments: next} : i)),
+        );
+        this.dispatch({type: 'update_attachments', id: localId, attachments: next});
+    }
+
+    /**
      * User-initiated retry of a stalled queue. The flush deliberately has no
      * timed auto-retry (a masked accept would double-send), so when the
      * transport fails the only ways out are a reconnect or this. Exposed on
@@ -2714,11 +2882,14 @@ export class PersistentChatService {
 
     /**
      * Drop one queued send and its optimistic bubble — the escape hatch for a
-     * message the user no longer wants stuck in the queue. Refuses the item
-     * whose POST is currently in flight: its fate isn't decided yet.
+     * message the user no longer wants stuck in the queue.
      */
     discardQueuedSend(localId: string): void {
+        // Refuse while the POST is in flight (its fate isn't decided) or while
+        // the upload stage is running (dropping the item would orphan bytes in
+        // the workspace with no way to delete them).
         if (this.flushingHeadId === localId) return;
+        if (this.uploadingItemId === localId) return;
         if (!this.outbox().some((i) => i.localId === localId)) return;
         this._removeFromOutbox(localId);
         this.dispatch({type: 'remove_turn', id: localId});

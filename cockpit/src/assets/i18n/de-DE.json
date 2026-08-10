@@ -1600,6 +1600,9 @@
       "resuming": "Sitzung wird fortgesetzt…",
       "endedSendResumes": "Nachricht schreiben — Senden setzt die Sitzung fort"
     },
+    "upload": {
+      "slashCommandWithAttachments": "Entfernen Sie die angehängten Dateien, bevor Sie einen Befehl ausführen."
+    },
     "composer": {
       "attach": "Anhängen",
       "chooseFile": "Datei wählen",

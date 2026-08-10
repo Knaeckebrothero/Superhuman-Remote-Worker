@@ -10,7 +10,7 @@
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest';
 import {signal} from '@angular/core';
 import {TestBed} from '@angular/core/testing';
-import {HttpClient} from '@angular/common/http';
+import {HttpClient, HttpErrorResponse} from '@angular/common/http';
 import {of, throwError, Subject} from 'rxjs';
 import {TranslocoService} from '@jsverse/transloco';
 import {PersistentChatService} from './persistent-chat.service';
@@ -20,6 +20,7 @@ import {IndexedDbService} from './indexed-db.service';
 import {NotificationService} from './notification.service';
 import {AppToastService} from '../../ui/toast';
 import {isUserTurn, UserTurn} from '../models/turn.model';
+import {FilePreview, FileType, ThreadUploadedFile, UploadStatus} from '../models/file.model';
 
 // --- Minimal transport mocks (mirrors the main service spec's scaffolding) ---
 
@@ -145,6 +146,29 @@ async function readySession(threadId = 'thread-a') {
 const inputPosts = (ctx: {mockHttp: any}) =>
     ctx.mockHttp.post.mock.calls.filter((c: any) => isInput(c[0]));
 
+/** The body of the Nth POST /input (mock.calls entries are [url, body]). */
+const inputBody = (ctx: {mockHttp: any}, n = 0) => inputPosts(ctx)[n][1];
+
+function filePreview(name: string): FilePreview {
+    return {
+        id: `preview-${name}`,
+        file: new File(['x'], name),
+        name,
+        size: 1,
+        sizeFormatted: '1 B',
+        type: FileType.DOCUMENT,
+        mimeType: 'application/pdf',
+        uploadStatus: UploadStatus.PENDING,
+    };
+}
+
+const uploaded = (name: string): ThreadUploadedFile => ({
+    name,
+    size: 1,
+    mime_type: 'application/pdf',
+    path: `uploads/${name}`,
+});
+
 describe('PersistentChatService — Phase 3 outbox', () => {
     let originalEs: any;
     let originalWs: any;
@@ -169,7 +193,10 @@ describe('PersistentChatService — Phase 3 outbox', () => {
         await ctx.service.sendMessage('two');
         await ctx.service.sendMessage('three');
 
-        expect(ctx.service.outbox().map((i) => i.content)).toEqual(['one', 'two', 'three']);
+        // `content` (agent-facing, hint included) is only computed when an
+        // item reaches the POST stage; `displayContent` is the typed text and
+        // exists from the moment the user hit send.
+        expect(ctx.service.outbox().map((i) => i.displayContent)).toEqual(['one', 'two', 'three']);
         const bubbles = ctx.service.turns().filter(isUserTurn).map((t) => (t as UserTurn).content);
         expect(bubbles).toEqual(['one', 'two', 'three']);
         expect(inputPosts(ctx).length).toBe(0); // nothing POSTed while not ready
@@ -193,7 +220,7 @@ describe('PersistentChatService — Phase 3 outbox', () => {
     it('connect(id, {carryOutbox}) re-dispatches queued bubbles after load_history', async () => {
         const ctx = createService();
         (ctx.service as any).outbox.set([
-            {localId: 'user-c', content: 'hi', displayContent: 'hi', attempts: 0},
+            {localId: 'user-c', displayContent: 'hi', threadId: 't-new', attempts: 0},
         ]);
         await ctx.service.connect('t-new', {carryOutbox: true});
 
@@ -227,7 +254,7 @@ describe('PersistentChatService — Phase 3 outbox', () => {
         subjects[0].complete();
         await flushTick();
         expect(subjects.length).toBe(2);
-        expect(ctx.service.outbox().map((i) => i.content)).toEqual(['b', 'c']);
+        expect(ctx.service.outbox().map((i) => i.displayContent)).toEqual(['b', 'c']);
 
         subjects[1].next({});
         subjects[1].complete();
@@ -302,7 +329,7 @@ describe('PersistentChatService — Phase 3 outbox', () => {
         s.complete();
         await flushTick();
         expect(ctx.service.outbox().length).toBe(t2Len);
-        expect(ctx.service.outbox()[0].content).toBe('from-t2');
+        expect(ctx.service.outbox()[0].displayContent).toBe('from-t2');
     });
 
     // --- 6. single-flight + horizon re-dispatch ---------------------------
@@ -319,7 +346,7 @@ describe('PersistentChatService — Phase 3 outbox', () => {
             return of({});
         });
         (ctx.service as any).outbox.set([
-            {localId: 'u1', content: 'x', displayContent: 'x', attempts: 0},
+            {localId: 'u1', displayContent: 'x', threadId: 'thread-a', attempts: 0},
         ]);
 
         (ctx.service as any)._flushOutbox();
@@ -349,5 +376,148 @@ describe('PersistentChatService — Phase 3 outbox', () => {
         // (its row may already be in the reloaded history).
         expect(bubbles.filter((c) => c === 'second').length).toBe(1);
         expect(bubbles).not.toContain('head');
+    });
+
+    // --- 7. upload as outbox stage 0 --------------------------------------
+
+    describe('upload as outbox stage 0', () => {
+        it('dispatches the bubble and clears the composer before the upload resolves', async () => {
+            const ctx = await readySession();
+            const gate = new Subject<ThreadUploadedFile[]>();
+            ctx.mockApi.uploadOneToThread = vi.fn().mockReturnValue(gate);
+
+            ctx.service.addAttachments([filePreview('a.pdf')]);
+            void ctx.service.sendMessage('look at this');
+            // The commit block is synchronous, but sendMessage awaits the
+            // office-frame flush gate (a local in-memory commit, not a
+            // network call) one line above it — so drain the microtask queue
+            // before asserting. The gate Subject is still un-emitted here, so
+            // this proves the bubble does not wait on the UPLOAD, which is
+            // the property under test.
+            await flushTick();
+
+            expect(
+                ctx.service.turns().some((t) => isUserTurn(t) && t.content === 'look at this'),
+            ).toBe(true);
+            expect(ctx.service.pendingAttachments()).toEqual([]);
+            expect(inputPosts(ctx).length).toBe(0);
+
+            gate.next([uploaded('a.pdf')]);
+            gate.complete();
+            await flushTick();
+
+            expect(inputPosts(ctx).length).toBe(1);
+            expect(inputBody(ctx).content).toBe(
+                'look at this\n\n[Attached files in uploads/: a.pdf]',
+            );
+        });
+
+        it('patches the server path onto the bubble chip once the upload lands', async () => {
+            const ctx = await readySession();
+            // The server renamed it (a `_1` collision suffix): the chip must
+            // show what actually landed, in place — not a second bubble.
+            ctx.mockApi.uploadOneToThread = vi.fn().mockReturnValue(of([uploaded('a_1.pdf')]));
+
+            ctx.service.addAttachments([filePreview('a.pdf')]);
+            await ctx.service.sendMessage('here');
+            await flushTick();
+
+            const bubbles = ctx.service.turns().filter(isUserTurn);
+            expect(bubbles.length).toBe(1);
+            expect(bubbles[0].attachments).toEqual([
+                {
+                    id: 'preview-a.pdf',
+                    name: 'a_1.pdf',
+                    size: 1,
+                    mimeType: 'application/pdf',
+                    path: 'uploads/a_1.pdf',
+                },
+            ]);
+        });
+
+        it('keeps the bubble and stalls the queue when the upload fails', async () => {
+            const ctx = await readySession();
+            ctx.mockApi.uploadOneToThread = vi
+                .fn()
+                .mockReturnValue(throwError(() => new HttpErrorResponse({status: 503})));
+
+            ctx.service.addAttachments([filePreview('a.pdf')]);
+            await ctx.service.sendMessage('hi');
+            await flushTick();
+
+            expect(ctx.service.turns().some((t) => isUserTurn(t) && t.content === 'hi')).toBe(true);
+            expect(ctx.service.outbox().length).toBe(1);
+            expect(ctx.service.outboxStalled()).toBe(true);
+            expect(inputPosts(ctx).length).toBe(0);
+        });
+
+        it('leaves a file behind a failure queued, not failed with the other file\'s error', async () => {
+            const ctx = await readySession();
+            ctx.mockApi.uploadOneToThread = vi
+                .fn()
+                .mockReturnValue(throwError(() => new HttpErrorResponse({status: 503})));
+
+            ctx.service.addAttachments([filePreview('a.pdf'), filePreview('b.pdf')]);
+            await ctx.service.sendMessage('two files');
+            await flushTick();
+
+            const files = ctx.service.outbox()[0].pendingFiles!;
+            expect(files.map((f) => f.status)).toEqual(['failed', 'queued']);
+            expect(files[1].error).toBeUndefined();
+        });
+
+        it('does not re-upload a file that already succeeded when the queue is retried', async () => {
+            const ctx = await readySession();
+            const upload = vi
+                .fn()
+                .mockReturnValueOnce(of([uploaded('a.pdf')]))
+                .mockReturnValueOnce(throwError(() => new HttpErrorResponse({status: 503})));
+            ctx.mockApi.uploadOneToThread = upload;
+
+            ctx.service.addAttachments([filePreview('a.pdf'), filePreview('b.pdf')]);
+            await ctx.service.sendMessage('two files');
+            await flushTick();
+            expect(ctx.service.outboxStalled()).toBe(true);
+            expect(upload).toHaveBeenCalledTimes(2);
+
+            upload.mockReturnValue(of([uploaded('b.pdf')]));
+            ctx.service.retryQueuedSends();
+            await flushTick();
+
+            // 3 total, NOT 4 — a.pdf is never re-sent. The backend has no
+            // idempotency: a re-upload would land as a_1.pdf.
+            expect(upload).toHaveBeenCalledTimes(3);
+            expect(inputBody(ctx).content).toContain('a.pdf, b.pdf');
+        });
+
+        it('drops the resolution when the thread changed mid-upload', async () => {
+            const ctx = await readySession();
+            const gate = new Subject<ThreadUploadedFile[]>();
+            ctx.mockApi.uploadOneToThread = vi.fn().mockReturnValue(gate);
+
+            ctx.service.addAttachments([filePreview('a.pdf')]);
+            void ctx.service.sendMessage('hi');
+            await flushTick();
+            await ctx.service.connect('other-thread');
+
+            gate.next([uploaded('a.pdf')]);
+            gate.complete();
+            await flushTick();
+
+            expect(inputPosts(ctx).length).toBe(0);
+        });
+
+        it('refuses to discard an item whose upload is in flight', async () => {
+            const ctx = await readySession();
+            ctx.mockApi.uploadOneToThread = vi.fn().mockReturnValue(new Subject<ThreadUploadedFile[]>());
+
+            ctx.service.addAttachments([filePreview('a.pdf')]);
+            void ctx.service.sendMessage('hi');
+            await flushTick();
+
+            const localId = ctx.service.outbox()[0].localId;
+            ctx.service.discardQueuedSend(localId);
+            expect(ctx.service.outbox().length).toBe(1);
+        });
     });
 });
