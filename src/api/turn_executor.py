@@ -1149,11 +1149,13 @@ class StatelessTurnExecutor:
             pa._thread_id = None
             return
         session = pa._session
+        preserve_workspace_daemons = not session.stateless_warm_reuse_safe
         try:
             await pa._terminate_session(
                 reason,
                 mark_thread=False,
                 preserve_shell=True,
+                preserve_workspace_daemons=preserve_workspace_daemons,
             )
         except Exception:
             logger.warning(
@@ -1163,6 +1165,15 @@ class StatelessTurnExecutor:
             )
             # A teardown exception must not leave a cancelled sync tool holding
             # an admitted/reconnectable physical backend after the queue moves.
+            # Retry the session-local cleanup directly so refresh/overlay
+            # controller tasks and Keycloak clients cannot survive a failure
+            # in an earlier terminate step.  The handoff disposition performs
+            # no workspace-side unmount or token write.
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await session.cleanup(
+                    preserve_shell=True,
+                    preserve_workspace_daemons=preserve_workspace_daemons,
+                )
             with contextlib.suppress(Exception):
                 session.retire_shell_owner()
             with contextlib.suppress(Exception):

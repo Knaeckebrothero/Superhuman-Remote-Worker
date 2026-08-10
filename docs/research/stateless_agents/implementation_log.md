@@ -2426,3 +2426,110 @@ resident controllers and post-marker writers have safe ownership, §3.5's
 outbox/interrupt/presence decisions are implemented or explicitly accepted,
 and the remaining workspace-incarnation/terminal-retirement and §6.1 items are
 resolved. No worker batch was enqueued.
+
+## Phase 3 resident cloud-mount controllers — DONE; tier gate remains closed
+
+The two processes named as “resident daemons” in the design are not agent-side
+daemons after this phase. The rclone/FUSE process and protected overlay remain
+resident on the workspace, while the bearer refresh and ENOTCONN monitor are
+claim-scoped controllers. On stateless handoff, the current owner cancels and
+retires only those local controllers and preserves the workspace processes. The
+next exact lease owner publishes a newly minted bearer, forces a bounded root
+`vfs/refresh recursive=false`, performs a real directory read, and either
+adopts the healthy resident or exactly heals it. A sidecar or orchestrator cron
+was rejected because either route would move the long-lived credential client
+or SSH scheduling authority into a broader resident component without buying a
+stronger external fence.
+
+The lifecycle disposition is explicit and separate from shell preservation:
+`preserve_workspace_daemons` is used only for a stateless physical handoff.
+Pinned cleanup and genuine terminal cleanup keep their historical destructive
+unmount behavior. A stateless setup failure detaches inherited controllers
+locally rather than destroying a predecessor's resident resource. Partial
+startup rollback tracks ownership and never unmounts a healthy adopted mount.
+The fresh bearer used by token refresh also becomes the seed for any later
+ENOTCONN restart, fixing the prior path that could reinstall the expired
+attach-time token.
+
+Rclone resident identity is a strict, non-secret digest plus a
+`creating -> active` generation, exact PID/cmdline and RC identity. Token writes,
+probe/heal scripts and terminal mutations run through a separate claim-resource
+primitive that shares the exact remote lease token and durable flock but does
+not depend on a tmux pane or the local shell-admission bit. Script and token
+staging paths are controller-unique. Unknown source keys or provider flags are
+not hashed as a secret-shaped oracle; they conservatively force remount.
+
+Protected overlay has the same claim-aware split. A healthy exact-config
+overlay is adopted, a dead lower is healed once, the upperdir is preserved, and
+the workdir is freshly recreated for every new fuse-overlayfs mount. The
+`creating -> active` marker makes crash recovery explicit. A cancelled or stale
+claim cannot resume an unmount/remount after the successor promotes.
+
+### Authority boundary
+
+The queue lease and exact remote token fence are enforced between honest
+executors. The resource identity and flock themselves live below the workload
+user's `$HOME`, and tmux/rclone options are writable by that same user. This is
+therefore a **cooperative correctness protocol**, not a security boundary
+against a model or user command that deletes, forges or replaces the marker or
+lock. An enforced version would need a root-owned workspace supervisor or an
+external conditional control surface; neither exists in S2.
+
+### Live verification and failures retained
+
+The first complete live attempt was stopped before acceptance evidence because
+the fake bearer proxy was not actually listening; a later generated proxy file
+also had a quoted-newline syntax error. Both failures were harness defects, and
+both runs were fully cleaned without changing the fixture lane or queue.
+
+The corrected checkpointed proof then passed the required expiry/handoff path:
+
+* Pod/controller A cold-mounted a real rclone/FUSE resource and read
+  `alpha-from-webdav`. Controller-only detach took **0.001 s**.
+* The old bearer returned **401** and the fresh bearer **200**. Controller B
+  claimed in **0.502 s**, forced the root VFS refresh in **0.266 s**, and adopted
+  the same PID and resident generation. The retired A object failed locally and
+  a separately constructed old-token backend was rejected by the remote fence
+  without changing the token.
+* The protected overlay was adopted in **0.287 s** and its upper file remained
+  `upper-survives-handoff-and-heal`.
+
+The same run's optional dead-lower fault found a product bug. After the exact
+rclone PID died, `mountpoint -q` could report false while the kernel still held
+an ENOTCONN FUSE entry. Best-effort cleanup then let remount reach `mkdir -p`,
+which failed on the stale target. The stateless exact teardown now checks the
+mount table with `findmnt -C -M`, performs bounded normal and lazy FUSE detach
+with a bounded `sudo -n umount -l` fallback, and returns success only after the
+mount entry is absent and the target directory is accessible. Heal/restart
+requires that success before remount; a live or reused mismatched PID still
+fails closed before mutation. Pinned teardown was not changed.
+
+The final Gate-C-only rerun passed on the exact rebuilt image. Cold rclone mount
+took **1.043 s** and cold overlay mount **0.515 s**. Killing PID `294` left the
+expected stale mount-table entry. Exact heal took **1.212 s**, produced PID
+`623` and a new resident generation, restored the lower read, preserved
+`upper-survives-gate-c-heal`, and used a fresh overlay workdir. No privileged
+fallback was needed in that run.
+
+Every current stateless pod and the orchestrator matched the working-tree hashes
+for all seven touched production files before the measurements. Final cleanup
+removed proof mounts, processes and paths, restored the disposable thread to
+`ended|pinned`, and left **0** fixture queue rows, **0** global leased/queued
+rows and **0** active `worker_batch` rows.
+
+### Verification
+
+* Final focused cloud-mount, RemoteBackend and overlay suite: **353 passed in
+  1.32 s**; generated shell scripts also passed `bash -n`.
+* Final repository-wide comparable run: **15,392 passed, 11 failed, 122 skipped
+  in 805.61 s**. The 11 failures are exactly the established environment
+  baseline: localhost Postgres, MCP subprocess/loopback transport, and optional
+  arXiv/Semantic Scholar clients.
+* Ruff check, repository-wide Ruff format check and `git diff --check` are
+  clean.
+
+Pinned behavior is covered by explicit branch tests and the full suite; this
+phase did not run a separate live pinned cloud-mount smoke. The tier gate stays
+closed. §3.5 outbox, interrupt and presence re-homing, workspace-incarnation and
+terminal-retirement authority, and the deferred §6.1 RAM/path-bypass work remain
+unverified. No worker batch was enqueued.

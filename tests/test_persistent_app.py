@@ -3154,7 +3154,10 @@ class TestTerminateSession:
         assert mod._session is None
         assert mod._loop_task is None
         assert mod._event_writer is None
-        fake_session.cleanup.assert_awaited_once_with(preserve_shell=False)
+        fake_session.cleanup.assert_awaited_once_with(
+            preserve_shell=False,
+            preserve_workspace_daemons=False,
+        )
 
     @pytest.mark.asyncio
     async def test_mark_thread_false_preserves_shell_for_ownership_handoff(self):
@@ -3176,7 +3179,40 @@ class TestTerminateSession:
 
         update.assert_not_awaited()
         fake_session.retire_shell_owner.assert_called_once_with()
-        fake_session.cleanup.assert_awaited_once_with(preserve_shell=True)
+        fake_session.cleanup.assert_awaited_once_with(
+            preserve_shell=True,
+            preserve_workspace_daemons=False,
+        )
+
+    @pytest.mark.asyncio
+    async def test_stateless_physical_handoff_preserves_workspace_daemons(self):
+        import src.api.persistent_app as mod
+
+        mod._loop_task = None
+        mod._thread_id = "t-physical-handoff"
+        mod._event_writer = None
+        mod._terminating = False
+        mod._max_sessions_per_process = 0
+        fake_session = MagicMock()
+        fake_session.workspace_sync = None
+        fake_session.workspace_manager = None
+        fake_session.cleanup = AsyncMock()
+        mod._session = fake_session
+
+        with patch.object(mod, "_update_thread_status", new=AsyncMock()) as update:
+            await mod._terminate_session(
+                "claim_switch",
+                mark_thread=False,
+                preserve_shell=True,
+                preserve_workspace_daemons=True,
+            )
+
+        update.assert_not_awaited()
+        fake_session.retire_shell_owner.assert_called_once_with()
+        fake_session.cleanup.assert_awaited_once_with(
+            preserve_shell=True,
+            preserve_workspace_daemons=True,
+        )
 
     @pytest.mark.asyncio
     async def test_moved_pinned_binding_forces_shell_preservation(self):
@@ -3215,7 +3251,10 @@ class TestTerminateSession:
         close_admission.assert_awaited_once_with(agent_id="agent-old")
         update.assert_not_awaited()
         fake_session.retire_shell_owner.assert_called_once_with()
-        fake_session.cleanup.assert_awaited_once_with(preserve_shell=True)
+        fake_session.cleanup.assert_awaited_once_with(
+            preserve_shell=True,
+            preserve_workspace_daemons=False,
+        )
 
     @pytest.mark.asyncio
     async def test_clears_headless_input_primitives(self):
@@ -3261,6 +3300,34 @@ class TestTerminateSession:
 
 
 class TestAttachSessionEventJournalFailure:
+    @pytest.mark.asyncio
+    async def test_failed_stateless_physical_attach_preserves_resident_daemons(self):
+        import src.api.persistent_app as mod
+
+        session = SimpleNamespace(
+            shell_owner_token=61,
+            stateless_warm_reuse_safe=False,
+            tool_context=SimpleNamespace(
+                citation_verdict_callback=MagicMock(),
+                canvas_event_callback=MagicMock(),
+            ),
+            cleanup=AsyncMock(),
+        )
+        mod._session = session
+        mod._thread_id = "thread-failed-physical-attach"
+        mod._event_writer = None
+        mod._subscribers.clear()
+
+        with patch.object(mod, "_stop_thread_control_watcher", new=AsyncMock()):
+            await mod._cleanup_failed_event_journal_attach(mod._thread_id)
+
+        session.cleanup.assert_awaited_once_with(
+            preserve_shell=True,
+            preserve_workspace_daemons=True,
+        )
+        assert mod._session is None
+        assert mod._thread_id is None
+
     @pytest.mark.asyncio
     async def test_aborts_and_cleans_partial_session_before_any_broadcast(self):
         import src.api.persistent_app as mod
@@ -3324,7 +3391,10 @@ class TestAttachSessionEventJournalFailure:
                 await mod._attach_session("thread-journal-failure")
 
         assert len(instances) == 1
-        instances[0].cleanup.assert_awaited_once_with(preserve_shell=True)
+        instances[0].cleanup.assert_awaited_once_with(
+            preserve_shell=True,
+            preserve_workspace_daemons=False,
+        )
         assert instances[0].tool_context.citation_verdict_callback is None
         writer_cls.assert_not_called()
         broadcast.assert_not_called()

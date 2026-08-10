@@ -1689,6 +1689,92 @@ class TestRemoteBackendExec:
 class TestRemoteBackendTmuxFences:
     """The durable tmux protocol fails closed across owner handoffs."""
 
+    def test_pinned_claim_resource_exec_preserves_plain_command(self, remote_backend):
+        backend, _, _ = remote_backend
+        with patch.object(backend, "exec_command", return_value="ok") as execute:
+            assert (
+                backend.exec_claim_resource(
+                    "touch /tmp/example", timeout=17, operation="test mutation"
+                )
+                == "ok"
+            )
+        execute.assert_called_once_with("touch /tmp/example", timeout=17)
+
+    def test_stateless_resource_fence_is_separate_from_shell_retirement(
+        self, remote_backend
+    ):
+        backend, _, _ = remote_backend
+        backend.set_shell_owner_token(44)
+        backend.retire_shell_owner()
+
+        with patch.object(
+            backend, "_exec_with_status", return_value=("resource-ok", 0)
+        ) as execute:
+            assert (
+                backend.exec_claim_resource(
+                    "touch /cloud/state", timeout=19, operation="cloud mutation"
+                )
+                == "resource-ok"
+            )
+
+        command = execute.call_args.args[0]
+        assert "flock -o -w 30" in command
+        assert '"$_srw_token" = 44 ] || exit 75' in command
+        assert '"$_srw_tmux_token" = 44 ] || exit 75' in command
+        assert "touch /cloud/state" in command
+        assert execute.call_args.kwargs == {"timeout": 19, "retain_tail": True}
+
+    def test_stateless_resource_nonzero_rejects_stale_mutation(self, remote_backend):
+        backend, _, _ = remote_backend
+        backend.set_shell_owner_token(45)
+        with patch.object(backend, "_exec_with_status", return_value=("", 75)):
+            with pytest.raises(WorkspaceUnavailableError, match="exit code 75"):
+                backend.exec_claim_resource("fusermount3 -u /cloud/home")
+
+    def test_backend_retire_waits_for_admitted_resource_and_blocks_later_calls(
+        self, remote_backend
+    ):
+        backend, _, _ = remote_backend
+        backend.set_shell_owner_token(46)
+        entered = threading.Event()
+        release = threading.Event()
+        retired = threading.Event()
+        errors: list[BaseException] = []
+
+        def run_resource(*_args, **_kwargs):
+            entered.set()
+            assert release.wait(timeout=2)
+            return "done", 0
+
+        def mutate():
+            try:
+                backend.exec_claim_resource("touch /cloud/owned")
+            except BaseException as exc:  # pragma: no cover - assertion aid
+                errors.append(exc)
+
+        def retire():
+            backend.retire()
+            retired.set()
+
+        with (
+            patch.object(backend, "_exec_with_status", side_effect=run_resource),
+            patch.object(backend, "disconnect"),
+        ):
+            mutation_thread = threading.Thread(target=mutate)
+            retire_thread = threading.Thread(target=retire)
+            mutation_thread.start()
+            assert entered.wait(timeout=2)
+            retire_thread.start()
+            assert not retired.wait(timeout=0.05)
+            release.set()
+            mutation_thread.join(timeout=2)
+            retire_thread.join(timeout=2)
+
+        assert errors == []
+        assert retired.is_set()
+        with pytest.raises(WorkspaceUnavailableError, match="claim-resource owner"):
+            backend.exec_claim_resource("touch /cloud/stale")
+
     def test_stateless_owner_token_is_immutable_per_backend(self, remote_backend):
         backend, _, _ = remote_backend
         backend.set_shell_owner_token(10)

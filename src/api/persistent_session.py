@@ -802,10 +802,24 @@ class PersistentSession:
     async def _setup_cloud_mount(
         self, cloud_mount_cfg: Optional[Dict[str, Any]]
     ) -> None:
-        """Start the RO rclone lower, then (protected mode) the capture overlay."""
+        """Adopt or start cloud mounts before exposing shell/tools.
+
+        Pinned sessions retain their historical degraded-mode behaviour when a
+        mount cannot be established.  A stateless claim cannot do that: the
+        prior agent may have left workspace-side rclone/overlay processes for
+        this thread, and using the workspace before the new claimant has
+        adopted or healed them would expose stale credentials or a dead FUSE
+        mount.  ``RcloneMountManager.start_all`` therefore includes the first
+        real directory probe and this method propagates failures for stateless
+        claims so :meth:`setup` stops before shell/tool construction.
+        """
         if not cloud_mount_cfg:
             return
         if not self.workspace_manager:
+            if self.shell_owner_token is not None:
+                raise WorkspaceUnavailableError(
+                    "stateless cloud mount requires an attached workspace"
+                )
             return
         try:
             from src.services.cloud_mount import RcloneMountManager
@@ -825,6 +839,8 @@ class PersistentSession:
             self.cloud_mount_error = str(e)
             self.cloud_mount_manager = None
             logger.warning("Failed to start cloud mount manager: %s", e)
+            if self.shell_owner_token is not None:
+                raise
             return
 
         if cloud_mount_cfg.get("protected") and cloud_mount_cfg.get("overlay"):
@@ -850,7 +866,13 @@ class PersistentSession:
                 )
                 # runs the mount script on the workspace pod over SSH
                 loop = asyncio.get_running_loop()
-                await loop.run_in_executor(None, self.overlay_mount_manager.mount)
+                await loop.run_in_executor(
+                    None,
+                    self.overlay_mount_manager.mount,
+                    lambda: self.cloud_mount_manager.restart_mount(
+                        self._protected_mount_id
+                    ),
+                )
                 logger.info(
                     "Capture overlay mounted for protected session %s", self.thread_id
                 )
@@ -865,24 +887,42 @@ class PersistentSession:
                 self.overlay_mount_manager = None
                 self._protected_mount_id = None
                 # Fail-safe: a protected session whose overlay failed to mount
-                # must NOT keep writing to the raw RO lower thinking it's
-                # protected. Tear down the rclone mount too so the session
-                # ends up with NO cloud access rather than a half-protected
-                # (unprotected) one (deviation from the brief's snippet,
-                # which left the lower mounted on overlay failure).
-                logger.warning(
-                    "Failed to mount capture overlay: %s — tearing down RO lower "
-                    "to avoid a half-protected session",
-                    e,
-                )
+                # must NOT keep running against the raw RO lower. Pinned keeps
+                # its historical degraded-mode teardown. Stateless fails the
+                # whole attach closed and locally detaches from an adopted
+                # resident lower without destroying it for the successor.
+                if self.shell_owner_token is not None:
+                    logger.warning(
+                        "Failed to mount capture overlay: %s — retiring this "
+                        "claim's local lower controller; resident lower is "
+                        "left for successor convergence",
+                        e,
+                    )
+                else:
+                    logger.warning(
+                        "Failed to mount capture overlay: %s — tearing down RO "
+                        "lower to avoid a half-protected session",
+                        e,
+                    )
                 try:
-                    await self.cloud_mount_manager.aclose()
+                    if self.shell_owner_token is not None:
+                        # The lower may be a healthy resident adopted from the
+                        # predecessor. Attach failure owns neither terminal
+                        # thread lifecycle nor permission to destroy that
+                        # durable workspace resource. Retire only this claim's
+                        # local refresh/client authority; the next claimant
+                        # converges the overlay.
+                        await self.cloud_mount_manager.detach_for_handoff()
+                    else:
+                        await self.cloud_mount_manager.aclose()
                 except Exception as close_err:
                     logger.warning(
                         "Error tearing down RO lower after overlay failure: %s",
                         close_err,
                     )
                 self.cloud_mount_manager = None
+                if self.shell_owner_token is not None:
+                    raise
 
     async def _cloud_overlay_monitor_loop(self) -> None:
         """ENOTCONN watchdog for the protected overlay (design §11.6 #3).
@@ -912,11 +952,23 @@ class PersistentSession:
                     "cloud overlay unhealthy (ENOTCONN) — healing thread=%s",
                     self.thread_id,
                 )
+                # Capture the exact claim-local controller before entering a
+                # worker thread. Cleanup deliberately clears the session
+                # attributes, but cancelling ``to_thread`` cannot stop an
+                # already-running heal. The captured manager's retired
+                # claim-resource admission is what prevents its later remote
+                # steps from mutating a successor.
+                cloud_mount_manager = self.cloud_mount_manager
+                protected_mount_id = self._protected_mount_id
+                if cloud_mount_manager is None or protected_mount_id is None:
+                    logger.error(
+                        "cloud overlay heal lacks its exact lower mount: thread=%s",
+                        self.thread_id,
+                    )
+                    continue
                 await asyncio.to_thread(
                     overlay.heal,
-                    lambda: self.cloud_mount_manager.restart_mount(
-                        self._protected_mount_id
-                    ),
+                    lambda: cloud_mount_manager.restart_mount(protected_mount_id),
                 )
             except asyncio.CancelledError:
                 raise
@@ -2571,14 +2623,39 @@ class PersistentSession:
             f"({getattr(new_backend, '_host', 'local')})"
         )
 
-    async def cleanup(self, *, preserve_shell: bool = False) -> None:
+    async def cleanup(
+        self,
+        *,
+        preserve_shell: bool = False,
+        preserve_workspace_daemons: bool = False,
+    ) -> None:
         """Clean up agent-local resources and disconnect the backend transport.
 
         ``preserve_shell`` is the queue-claim/ownership handoff disposition:
         the remote tmux session remains on the workspace for a later claimant.
         Genuine thread end and backend retirement keep the default destructive
         shell cleanup.
+
+        ``preserve_workspace_daemons`` is deliberately independent.  It is set
+        only for a stateless physical-claim handoff: the retiring Python owner
+        cancels its overlay monitor and rclone token refresher, closes its
+        Keycloak clients, and retires its mutation fence, while leaving the
+        workspace-side rclone/overlay processes resident for the next claim to
+        adopt or heal.  Pinned detach/drain and genuine thread end keep their
+        historical destructive unmount behaviour.
         """
+        if preserve_workspace_daemons and self.shell_owner_token is None:
+            # Cleanup must remain best-effort and complete, so do not raise in
+            # this late teardown path.  Ignore the invalid disposition and
+            # retain pinned's destructive semantics instead of risking that a
+            # future caller accidentally strands its mounts.
+            logger.error(
+                "Ignoring workspace-daemon preservation for non-stateless "
+                "session: thread=%s",
+                self.thread_id,
+            )
+            preserve_workspace_daemons = False
+
         backend_for_cleanup = None
         if self.workspace_manager:
             from ..core.virtual_dirs import unwrap_backend
@@ -2612,15 +2689,23 @@ class PersistentSession:
 
         if self.overlay_mount_manager is not None:
             try:
-                loop = asyncio.get_running_loop()
-                await loop.run_in_executor(None, self.overlay_mount_manager.unmount)
+                if preserve_workspace_daemons:
+                    # Local state only.  In particular, do not run any remote
+                    # unmount script after a successor may own the workspace.
+                    self.overlay_mount_manager.detach_local()
+                else:
+                    loop = asyncio.get_running_loop()
+                    await loop.run_in_executor(None, self.overlay_mount_manager.unmount)
             except Exception:
-                logger.debug("overlay unmount failed", exc_info=True)
+                logger.debug("overlay cleanup failed", exc_info=True)
             self.overlay_mount_manager = None
 
         if self.cloud_mount_manager:
             try:
-                await self.cloud_mount_manager.aclose()
+                if preserve_workspace_daemons:
+                    await self.cloud_mount_manager.detach_for_handoff()
+                else:
+                    await self.cloud_mount_manager.aclose()
             except Exception as e:
                 logger.warning(f"Cloud mount cleanup error: {e}")
             self.cloud_mount_manager = None

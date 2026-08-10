@@ -551,6 +551,44 @@ class WorkspaceBackend(ABC):
         """
         raise NotImplementedError("exec_command not supported by this backend")
 
+    @property
+    def claim_resource_fenced(self) -> bool:
+        """Whether workspace-resident resource mutations have claim fencing.
+
+        Generic and pinned backends retain their established unfenced
+        behaviour.  A stateless ``RemoteBackend`` overrides this once it has
+        been bound to a queue lease token.
+        """
+
+        return False
+
+    def exec_claim_resource(
+        self,
+        command: str,
+        timeout: int = 30,
+        *,
+        operation: str = "workspace resource mutation",
+    ) -> str:
+        """Execute one claim-scoped workspace resource operation.
+
+        The default intentionally preserves pinned/custom-backend behaviour.
+        Remote stateless workspaces override this with the cooperative durable
+        token fence used by their resident tmux resource.  This primitive is
+        separate from shell admission: retiring local shell tools must not
+        prevent terminal mount cleanup while the claim still owns the lease.
+        """
+
+        del operation
+        return self.exec_command(command, timeout=timeout)
+
+    def retire_claim_resource_owner(self) -> None:
+        """Close local admission for claim-scoped resource operations.
+
+        Backends without a claim resource fence have nothing to retire.
+        """
+
+        return None
+
     # --- Shell operations ---
     #
     # Non-abstract: default to NotImplementedError. Override in backends
